@@ -888,7 +888,7 @@ function buildPanel() {
   function onThinkingTimeout() {
     hideThinking();
     appendSystem(
-      'Claude hasn’t picked this up yet — it reads panel messages when its session checks the inbox. In your Claude terminal, say: "watch the ComfyUI panel".',
+      "Claude hasn’t replied yet — check that comfyui-mcp is connected in your Claude session (/mcp) and that it was started with --channels. It may also just be mid-task.",
     );
   }
 

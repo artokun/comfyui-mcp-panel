@@ -52,7 +52,7 @@ The status pill turns green when both sides are up.
 
 Then either:
 - **talk in your Claude terminal**: "check panel_status, then add a CheckpointLoaderSimple to my graph" — Claude uses the `panel_*` tools and the edits appear live;
-- **or type in the panel**: messages are queued for Claude (`panel_inbox`) and pushed as channel events on hosts that support them. Tell Claude once — "watch the ComfyUI panel and act on what I type there" — and the loop is hands-free.
+- **or type in the panel**: messages are pushed straight into your Claude Code session as channel events — Claude sees them immediately and replies into the panel with `panel_say`. (Hosts without channel support can pull via `panel_inbox`.)
 
 ## What the agent can do to your graph
 
