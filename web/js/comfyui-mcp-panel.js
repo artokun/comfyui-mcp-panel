@@ -59,6 +59,30 @@ function saveBridgeUrl(url) {
   }
 }
 
+// Per-TAB session id: sessionStorage is scoped to the tab and survives
+// reloads, so each ComfyUI tab keeps a stable identity on the bridge while
+// two tabs never collide. (localStorage would be shared across tabs.)
+const TAB_ID_KEY = "comfyui-mcp.panel.tabSessionId";
+function getTabId() {
+  try {
+    let id = window.sessionStorage.getItem(TAB_ID_KEY);
+    if (!id) {
+      id = crypto.randomUUID();
+      window.sessionStorage.setItem(TAB_ID_KEY, id);
+    }
+    return id;
+  } catch {
+    return crypto.randomUUID();
+  }
+}
+
+/** Current workflow title for this tab (shown in panel_status). */
+function getWorkflowTitle() {
+  // document.title is "<name> - ComfyUI" with a leading "*" when unsaved.
+  const t = document.title.replace(/ - ComfyUI$/, "").replace(/^\*/, "").trim();
+  return t || "untitled";
+}
+
 // ---------------------------------------------------------------------------
 // Graph-edit executor — the client side of the agent's panel_* tools.
 //
@@ -276,7 +300,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onLog }) {
+function createBridgeClient({ onStatus, onSay, onLog, onCommand }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -298,6 +322,7 @@ function createBridgeClient({ onStatus, onSay, onLog }) {
       attempt = 0;
       onStatus("connected");
       onLog(`Connected to ${url}`);
+      sendHello();
     });
 
     sock.addEventListener("message", (ev) => {
@@ -326,6 +351,8 @@ function createBridgeClient({ onStatus, onSay, onLog }) {
         } catch {
           // Socket died between receive and reply — agent side times out.
         }
+        // Surface the action in the chat feed as an activity card.
+        onCommand?.(msg.cmd, msg, reply);
         return;
       }
       if (msg && msg.type === "say" && typeof msg.text === "string") {
@@ -346,6 +373,25 @@ function createBridgeClient({ onStatus, onSay, onLog }) {
       // close fires after error; reconnect handled there.
     });
   }
+
+  function sendHello() {
+    if (!sock || sock.readyState !== WebSocket.OPEN) return;
+    try {
+      sock.send(
+        JSON.stringify({ type: "hello", tab_id: getTabId(), title: getWorkflowTitle() }),
+      );
+    } catch {
+      // Reconnect path will retry.
+    }
+  }
+
+  // Re-hello when the workflow title changes (rename / open different file)
+  // so panel_status stays accurate.
+  const titleEl = document.querySelector("title");
+  const titleObserver = titleEl
+    ? new MutationObserver(() => sendHello())
+    : null;
+  titleObserver?.observe(titleEl, { childList: true });
 
   function scheduleReconnect() {
     if (closed || reconnectTimer) return;
@@ -390,6 +436,7 @@ function createBridgeClient({ onStatus, onSay, onLog }) {
     },
     destroy() {
       closed = true;
+      titleObserver?.disconnect();
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -403,76 +450,271 @@ function createBridgeClient({ onStatus, onSay, onLog }) {
 }
 
 // ---------------------------------------------------------------------------
-// Panel DOM. Returns { root, destroy } so the host can mount/unmount.
+// Panel DOM — styled on ComfyUI's own design system. Every color, radius,
+// and font below consumes the PrimeVue semantic tokens (`--p-*`) the native
+// sidebar panels use, with hard fallbacks for older frontends, so the panel
+// tracks the user's theme (light/dark/custom) automatically.
 // ---------------------------------------------------------------------------
-function buildPanel() {
-  const root = document.createElement("div");
-  root.className = "comfyui-mcp-panel";
-  root.style.cssText = `
-    display: flex; flex-direction: column; height: 100%;
-    padding: 8px; gap: 8px; box-sizing: border-box;
-    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    color: var(--input-text, #ddd); background: var(--comfy-menu-bg, #222);
-  `;
 
-  // ---- Header: status pill --------------------------------------------------
+const PANEL_CSS = `
+.cmcp-root {
+  display: flex; flex-direction: column; height: 100%;
+  font-family: var(--font-inter, "Inter", ui-sans-serif, system-ui, sans-serif);
+  font-size: 0.8125rem; line-height: 1.5;
+  color: var(--p-text-color, #fff);
+  background: var(--p-content-background, #18181b);
+}
+.cmcp-header {
+  display: flex; align-items: center; gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--p-content-border-color, #3f3f46);
+}
+.cmcp-title { font-size: 0.9375rem; font-weight: 600; }
+.cmcp-status { display: flex; align-items: center; gap: 0.375rem; margin-left: auto;
+  font-size: 0.6875rem; color: var(--p-text-muted-color, #a1a1aa); }
+.cmcp-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--p-red-400, #f87171); flex: none; }
+.cmcp-dot.connected { background: var(--p-green-400, #4ade80); }
+.cmcp-dot.connecting { background: var(--p-yellow-400, #facc15); animation: cmcp-pulse 1.2s ease-in-out infinite; }
+@keyframes cmcp-pulse { 50% { opacity: 0.3; } }
+
+.cmcp-settings {
+  margin: 0.625rem 0.75rem 0;
+  border: 1px solid var(--p-content-border-color, #3f3f46);
+  border-radius: var(--p-border-radius-lg, 8px);
+  background: var(--p-surface-800, #27272a);
+}
+.cmcp-settings > summary {
+  padding: 0.5rem 0.75rem; cursor: pointer; user-select: none;
+  font-size: 0.75rem; font-weight: 600; color: var(--p-text-muted-color, #a1a1aa);
+  list-style: none; display: flex; align-items: center; gap: 0.375rem;
+}
+.cmcp-settings > summary::before { content: "▸"; transition: transform 0.15s; }
+.cmcp-settings[open] > summary::before { transform: rotate(90deg); }
+.cmcp-settings-body { padding: 0 0.75rem 0.75rem; display: flex; flex-direction: column; gap: 0.5rem; }
+.cmcp-label { font-size: 0.6875rem; color: var(--p-text-muted-color, #a1a1aa); }
+.cmcp-input {
+  width: 100%; box-sizing: border-box;
+  padding: var(--p-form-field-padding-y, 0.5rem) var(--p-form-field-padding-x, 0.75rem);
+  background: var(--p-form-field-background, #09090b);
+  border: 1px solid var(--p-form-field-border-color, #52525b);
+  border-radius: var(--p-border-radius-md, 6px);
+  color: var(--p-form-field-color, #fff);
+  font: inherit; outline: none; transition: border-color 0.15s;
+}
+.cmcp-input:focus { border-color: var(--p-focus-ring-color, #60a5fa); }
+.cmcp-btn {
+  padding: 0.4375rem 0.875rem; cursor: pointer; align-self: flex-start;
+  background: var(--p-button-primary-background, var(--p-primary-color, #60a5fa));
+  color: var(--p-button-primary-color, var(--p-primary-contrast-color, #18181b));
+  border: none; border-radius: var(--p-border-radius-md, 6px);
+  font: inherit; font-weight: 600; transition: opacity 0.15s;
+}
+.cmcp-btn:hover { opacity: 0.85; }
+.cmcp-btn:disabled { opacity: 0.4; cursor: default; }
+.cmcp-help { font-size: 0.6875rem; color: var(--p-text-muted-color, #a1a1aa); line-height: 1.55; }
+.cmcp-cmd {
+  display: block; margin-top: 0.25rem; padding: 0.375rem 0.5rem;
+  background: var(--p-form-field-background, #09090b);
+  border: 1px solid var(--p-content-border-color, #3f3f46);
+  border-radius: var(--p-border-radius-sm, 4px);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.6875rem;
+  user-select: all; cursor: copy; color: var(--p-text-color, #fff);
+  overflow-x: auto; white-space: nowrap;
+}
+
+.cmcp-log {
+  flex: 1 1 auto; overflow-y: auto; padding: 0.75rem;
+  display: flex; flex-direction: column; gap: 0.5rem;
+}
+.cmcp-empty {
+  margin: auto; text-align: center; max-width: 230px;
+  color: var(--p-text-muted-color, #a1a1aa);
+}
+.cmcp-empty .pi { font-size: 1.75rem; display: block; margin-bottom: 0.5rem; opacity: 0.5; }
+.cmcp-empty-title { font-weight: 600; color: var(--p-text-color, #fff); margin-bottom: 0.25rem; }
+
+.cmcp-bubble {
+  padding: 0.5rem 0.75rem; max-width: 92%;
+  border-radius: var(--p-border-radius-lg, 8px);
+  white-space: pre-wrap; word-wrap: break-word;
+  animation: cmcp-in 0.18s ease-out;
+}
+@keyframes cmcp-in { from { opacity: 0; transform: translateY(4px); } }
+.cmcp-bubble.user {
+  align-self: flex-end;
+  background: var(--p-highlight-background, rgba(96,165,250,0.16));
+  border: 1px solid color-mix(in srgb, var(--p-primary-color, #60a5fa), transparent 70%);
+}
+.cmcp-bubble.agent {
+  align-self: flex-start;
+  background: var(--p-surface-800, #27272a);
+  border: 1px solid var(--p-content-border-color, #3f3f46);
+}
+.cmcp-bubble.agent code, .cmcp-bubble.user code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem;
+  background: var(--p-form-field-background, #09090b);
+  padding: 0.0625rem 0.25rem; border-radius: var(--p-border-radius-sm, 4px);
+}
+.cmcp-sys {
+  align-self: center; font-size: 0.6875rem; font-style: italic;
+  color: var(--p-text-muted-color, #a1a1aa);
+  animation: cmcp-in 0.18s ease-out;
+}
+.cmcp-card {
+  align-self: flex-start; max-width: 92%; width: 100%; box-sizing: border-box;
+  padding: 0.5rem 0.625rem;
+  background: var(--p-surface-800, #27272a);
+  border: 1px solid var(--p-content-border-color, #3f3f46);
+  border-left: 3px solid var(--p-primary-color, #60a5fa);
+  border-radius: var(--p-border-radius-md, 6px);
+  font-size: 0.75rem;
+  animation: cmcp-in 0.18s ease-out;
+}
+.cmcp-card.error { border-left-color: var(--p-red-400, #f87171); }
+.cmcp-card-head { display: flex; align-items: center; gap: 0.375rem; font-weight: 600; }
+.cmcp-card-head .pi { font-size: 0.75rem; color: var(--p-primary-color, #60a5fa); }
+.cmcp-card.error .cmcp-card-head .pi { color: var(--p-red-400, #f87171); }
+.cmcp-card-detail {
+  margin-top: 0.25rem; color: var(--p-text-muted-color, #a1a1aa);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.6875rem;
+  overflow-x: auto; white-space: pre-wrap; word-break: break-word;
+  max-height: 7.5rem; overflow-y: auto;
+}
+
+.cmcp-inputrow {
+  display: flex; gap: 0.5rem; padding: 0.75rem;
+  border-top: 1px solid var(--p-content-border-color, #3f3f46);
+}
+.cmcp-textarea {
+  flex: 1; resize: none; min-height: 2.25rem; max-height: 7.5rem;
+  padding: var(--p-form-field-padding-y, 0.5rem) var(--p-form-field-padding-x, 0.75rem);
+  background: var(--p-form-field-background, #09090b);
+  border: 1px solid var(--p-form-field-border-color, #52525b);
+  border-radius: var(--p-border-radius-md, 6px);
+  color: var(--p-form-field-color, #fff);
+  font: inherit; outline: none; transition: border-color 0.15s;
+}
+.cmcp-textarea:focus { border-color: var(--p-focus-ring-color, #60a5fa); }
+.cmcp-send {
+  align-self: flex-end; width: 2.25rem; height: 2.25rem; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--p-button-primary-background, var(--p-primary-color, #60a5fa));
+  color: var(--p-button-primary-color, var(--p-primary-contrast-color, #18181b));
+  border: none; border-radius: var(--p-border-radius-md, 6px); cursor: pointer;
+  transition: opacity 0.15s;
+}
+.cmcp-send:hover { opacity: 0.85; }
+.cmcp-send .pi { font-size: 0.875rem; }
+`;
+
+let styleInjected = false;
+function ensureStyles() {
+  if (styleInjected) return;
+  const tag = document.createElement("style");
+  tag.id = "comfyui-mcp-panel-styles";
+  tag.textContent = PANEL_CSS;
+  document.head.appendChild(tag);
+  styleInjected = true;
+}
+
+/** Human-readable one-liner for an executed agent command. */
+function describeCommand(cmd, msg, reply) {
+  if (!reply.ok) return { icon: "pi-exclamation-triangle", text: `${cmd} failed`, detail: reply.error };
+  const r = reply.result ?? {};
+  switch (cmd) {
+    case "graph_get_state":
+      return { icon: "pi-eye", text: `Read graph — ${r.node_count} node${r.node_count === 1 ? "" : "s"}` };
+    case "graph_add_node":
+      return { icon: "pi-plus-circle", text: `Added ${r.added?.type ?? "node"} (id ${r.added?.id})` };
+    case "graph_remove_node":
+      return { icon: "pi-minus-circle", text: `Removed ${r.removed?.type ?? "node"} (id ${r.removed?.id})` };
+    case "graph_connect":
+      return {
+        icon: "pi-link",
+        text: `Connected ${r.connected?.from?.node_id}.${r.connected?.from?.output} → ${r.connected?.to?.node_id}.${r.connected?.to?.input}`,
+      };
+    case "graph_disconnect":
+      return { icon: "pi-times-circle", text: `Disconnected ${r.disconnected?.node_id}.${r.disconnected?.input}` };
+    case "graph_set_widget":
+      return {
+        icon: "pi-sliders-h",
+        text: `Set ${r.set?.widget} = ${JSON.stringify(r.set?.value)} on node ${r.set?.node_id}`,
+        detail: `was ${JSON.stringify(r.set?.previous)}`,
+      };
+    default:
+      return { icon: "pi-bolt", text: cmd, detail: JSON.stringify(r).slice(0, 300) };
+  }
+}
+
+/** Minimal markdown for agent bubbles: `code` spans + **bold**. textContent-safe. */
+function renderRichText(el, text) {
+  const parts = String(text).split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
+  for (const part of parts) {
+    if (part.startsWith("`") && part.endsWith("`")) {
+      const c = document.createElement("code");
+      c.textContent = part.slice(1, -1);
+      el.appendChild(c);
+    } else if (part.startsWith("**") && part.endsWith("**")) {
+      const b = document.createElement("strong");
+      b.textContent = part.slice(2, -2);
+      el.appendChild(b);
+    } else if (part) {
+      el.appendChild(document.createTextNode(part));
+    }
+  }
+}
+
+function buildPanel() {
+  ensureStyles();
+
+  const root = document.createElement("div");
+  root.className = "cmcp-root";
+
+  // ---- Header: title + status dot ----
   const header = document.createElement("div");
-  header.style.cssText = "display: flex; align-items: center; gap: 8px;";
-  const statusPill = document.createElement("span");
-  statusPill.style.cssText = `
-    padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600;
-    background: #5a2828; color: #fff;
-  `;
-  statusPill.textContent = "disconnected";
-  const headerTitle = document.createElement("span");
-  headerTitle.textContent = "Claude ↔ graph bridge";
-  headerTitle.style.cssText = "opacity: 0.7; font-size: 11px;";
-  header.append(statusPill, headerTitle);
+  header.className = "cmcp-header";
+  const title = document.createElement("span");
+  title.className = "cmcp-title";
+  title.textContent = "Agent";
+  const status = document.createElement("span");
+  status.className = "cmcp-status";
+  const dot = document.createElement("span");
+  dot.className = "cmcp-dot";
+  const statusText = document.createElement("span");
+  statusText.textContent = "disconnected";
+  status.append(dot, statusText);
+  header.append(title, status);
   root.appendChild(header);
 
-  // ---- Settings strip --------------------------------------------------------
+  // ---- Connection settings ----
   const settingsBox = document.createElement("details");
-  settingsBox.style.cssText = "border: 1px solid #444; border-radius: 4px; padding: 6px;";
+  settingsBox.className = "cmcp-settings";
   const settingsSummary = document.createElement("summary");
   settingsSummary.textContent = "Connection";
-  settingsSummary.style.cssText = "cursor: pointer; user-select: none; font-weight: 600;";
-  settingsBox.appendChild(settingsSummary);
+  const settingsBody = document.createElement("div");
+  settingsBody.className = "cmcp-settings-body";
 
-  const urlRow = document.createElement("div");
-  urlRow.style.cssText = "display: flex; flex-direction: column; gap: 2px; margin-top: 6px;";
   const urlLabel = document.createElement("label");
+  urlLabel.className = "cmcp-label";
   urlLabel.textContent = "Bridge URL";
-  urlLabel.style.cssText = "font-size: 11px; opacity: 0.7;";
   const urlInput = document.createElement("input");
+  urlInput.className = "cmcp-input";
   urlInput.type = "text";
   urlInput.value = loadBridgeUrl();
   urlInput.placeholder = DEFAULT_BRIDGE_URL;
-  urlInput.style.cssText = `
-    width: 100%; padding: 4px 6px; border: 1px solid #555; border-radius: 3px;
-    background: var(--comfy-input-bg, #181818); color: inherit; box-sizing: border-box;
-  `;
-  urlRow.append(urlLabel, urlInput);
 
   const saveBtn = document.createElement("button");
+  saveBtn.className = "cmcp-btn";
   saveBtn.type = "button";
   saveBtn.textContent = "Reconnect";
-  saveBtn.style.cssText =
-    "margin-top: 8px; padding: 4px 10px; cursor: pointer; align-self: flex-start;";
 
   const helpDiv = document.createElement("div");
-  helpDiv.style.cssText =
-    "margin-top: 8px; font-size: 11px; opacity: 0.75; line-height: 1.5;";
-  const helpLabel = document.createElement("div");
-  helpLabel.textContent =
-    "This panel is a window into your own Claude Code session — no API keys. " +
-    "Add comfyui-mcp to Claude Code with channels mode:";
+  helpDiv.className = "cmcp-help";
+  helpDiv.textContent =
+    "This panel is a window into your own Claude Code session — no API keys. Add comfyui-mcp with channels mode:";
   const helpCmd = document.createElement("code");
-  helpCmd.textContent = 'claude mcp add comfyui -- npx -y comfyui-mcp --channels';
-  helpCmd.style.cssText = `
-    display: block; margin-top: 4px; padding: 4px 6px; border-radius: 3px;
-    background: var(--comfy-input-bg, #181818); user-select: all; cursor: copy;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  `;
+  helpCmd.className = "cmcp-cmd";
+  helpCmd.textContent = "claude mcp add comfyui -- npx -y comfyui-mcp --channels";
   helpCmd.title = "Click to copy";
   helpCmd.addEventListener("click", () => {
     navigator.clipboard?.writeText(helpCmd.textContent).then(
@@ -480,79 +722,109 @@ function buildPanel() {
       () => {},
     );
   });
-  helpDiv.append(helpLabel, helpCmd);
+  helpDiv.appendChild(helpCmd);
 
-  settingsBox.append(urlRow, saveBtn, helpDiv);
+  settingsBody.append(urlLabel, urlInput, saveBtn, helpDiv);
+  settingsBox.append(settingsSummary, settingsBody);
   root.appendChild(settingsBox);
 
-  // ---- Message log ------------------------------------------------------------
+  // ---- Message log + empty state ----
   const log = document.createElement("div");
-  log.style.cssText = `
-    flex: 1 1 auto; overflow-y: auto; padding: 6px;
-    border: 1px solid #444; border-radius: 4px;
-    display: flex; flex-direction: column; gap: 6px;
-  `;
+  log.className = "cmcp-log";
+  const empty = document.createElement("div");
+  empty.className = "cmcp-empty";
+  const emptyIcon = document.createElement("i");
+  emptyIcon.className = "pi pi-comments";
+  const emptyTitle = document.createElement("div");
+  emptyTitle.className = "cmcp-empty-title";
+  emptyTitle.textContent = "Claude is at your canvas";
+  const emptyBody = document.createElement("div");
+  emptyBody.textContent =
+    "Ask for nodes, connections, or parameter changes — every edit lands live on the graph and undoes with Ctrl+Z.";
+  empty.append(emptyIcon, emptyTitle, emptyBody);
+  log.appendChild(empty);
   root.appendChild(log);
 
-  // ---- Input row ----------------------------------------------------------------
+  function clearEmpty() {
+    if (empty.parentElement) empty.remove();
+  }
+
+  // ---- Input row ----
   const form = document.createElement("form");
-  form.style.cssText = "display: flex; gap: 6px;";
+  form.className = "cmcp-inputrow";
   const input = document.createElement("textarea");
-  input.placeholder = "Message Claude... (Enter to send, Shift+Enter for newline)";
-  input.rows = 2;
-  input.style.cssText = `
-    flex: 1; padding: 6px; border: 1px solid #555; border-radius: 3px;
-    background: var(--comfy-input-bg, #181818); color: inherit; resize: vertical;
-    font: inherit;
-  `;
+  input.className = "cmcp-textarea";
+  input.placeholder = "Message Claude…";
+  input.rows = 1;
   const sendBtn = document.createElement("button");
+  sendBtn.className = "cmcp-send";
   sendBtn.type = "submit";
-  sendBtn.textContent = "Send";
-  sendBtn.style.cssText = "padding: 6px 12px; cursor: pointer;";
+  sendBtn.title = "Send (Enter)";
+  const sendIcon = document.createElement("i");
+  sendIcon.className = "pi pi-send";
+  sendBtn.appendChild(sendIcon);
   form.append(input, sendBtn);
   root.appendChild(form);
 
-  // ---- bubbles --------------------------------------------------------------------
-  function makeBubble(role) {
-    const bubble = document.createElement("div");
-    bubble.style.cssText = `
-      padding: 6px 8px; border-radius: 4px; max-width: 95%;
-      white-space: pre-wrap; word-wrap: break-word;
-    `;
-    if (role === "user") {
-      bubble.style.background = "#2a4d6e";
-      bubble.style.alignSelf = "flex-end";
-    } else if (role === "system") {
-      bubble.style.background = "#3a3a3a";
-      bubble.style.fontStyle = "italic";
-      bubble.style.opacity = "0.8";
-      bubble.style.alignSelf = "center";
-      bubble.style.fontSize = "11px";
-    } else {
-      bubble.style.background = "#333";
-      bubble.style.alignSelf = "flex-start";
-    }
-    log.appendChild(bubble);
+  // ---- feed renderers ----
+  function scrollLog() {
     log.scrollTop = log.scrollHeight;
-    return bubble;
   }
 
   function appendUser(text) {
-    makeBubble("user").textContent = text;
-  }
-  function appendSystem(text) {
-    makeBubble("system").textContent = text;
-  }
-  function appendAgent(text) {
-    makeBubble("assistant").textContent = text;
+    clearEmpty();
+    const b = document.createElement("div");
+    b.className = "cmcp-bubble user";
+    b.textContent = text;
+    log.appendChild(b);
+    scrollLog();
   }
 
-  // ---- bridge wiring -------------------------------------------------------------
+  function appendAgent(text) {
+    clearEmpty();
+    const b = document.createElement("div");
+    b.className = "cmcp-bubble agent";
+    renderRichText(b, text);
+    log.appendChild(b);
+    scrollLog();
+  }
+
+  function appendSystem(text) {
+    const b = document.createElement("div");
+    b.className = "cmcp-sys";
+    b.textContent = text;
+    log.appendChild(b);
+    scrollLog();
+  }
+
+  function appendActivity(cmd, msg, reply) {
+    clearEmpty();
+    const { icon, text, detail } = describeCommand(cmd, msg, reply);
+    const card = document.createElement("div");
+    card.className = "cmcp-card" + (reply.ok ? "" : " error");
+    const head = document.createElement("div");
+    head.className = "cmcp-card-head";
+    const i = document.createElement("i");
+    i.className = `pi ${icon}`;
+    const t = document.createElement("span");
+    t.textContent = text;
+    head.append(i, t);
+    card.appendChild(head);
+    if (detail) {
+      const d = document.createElement("div");
+      d.className = "cmcp-card-detail";
+      d.textContent = detail;
+      card.appendChild(d);
+    }
+    log.appendChild(card);
+    scrollLog();
+  }
+
+  // ---- bridge wiring ----
   const client = createBridgeClient({
     onStatus(state) {
-      statusPill.textContent = state;
-      statusPill.style.background =
-        state === "connected" ? "#2d5a2d" : state === "connecting" ? "#5a4a28" : "#5a2828";
+      statusText.textContent = state;
+      dot.className = "cmcp-dot" + (state === "connected" ? " connected" : state === "connecting" ? " connecting" : "");
       settingsBox.open = state !== "connected";
     },
     onSay(text) {
@@ -560,6 +832,9 @@ function buildPanel() {
     },
     onLog(text) {
       appendSystem(text);
+    },
+    onCommand(cmd, msg, reply) {
+      appendActivity(cmd, msg, reply);
     },
   });
 
@@ -576,10 +851,9 @@ function buildPanel() {
     if (sent) {
       appendUser(text);
       input.value = "";
+      input.style.height = "auto";
     } else {
-      appendSystem(
-        "Not connected — start the bridge (see Connection) and try again.",
-      );
+      appendSystem("Not connected — start the bridge (see Connection) and try again.");
       settingsBox.open = true;
     }
   });
@@ -589,6 +863,11 @@ function buildPanel() {
       ev.preventDefault();
       form.requestSubmit();
     }
+  });
+  // Auto-grow the textarea up to its CSS max-height.
+  input.addEventListener("input", () => {
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 120)}px`;
   });
 
   client.start();
