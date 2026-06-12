@@ -1,0 +1,14 @@
+[project]
+name = "comfyui-mcp-panel"
+description = "AI agent sidebar for ComfyUI - chat with an agent that can edit your graph live. Pairs with the comfyui-mcp npm package."
+version = "0.0.1"
+license = { text = "MIT" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/artokun/comfyui-mcp-panel"
+
+[tool.comfy]
+PublisherId = "artokun"
+DisplayName = "ComfyUI MCP Panel"
+Icon = ""
