@@ -94,4 +94,10 @@ like your own.
 
 ## License
 
-[MIT](./LICENSE)
+[MIT](./LICENSE).
+
+This pack contains **only original code** — no ComfyUI or LiteGraph source is
+copied or bundled. It interoperates with GPL-3.0 ComfyUI at runtime through its
+public extension API (`app.registerExtension`), the same pattern used by other
+MIT/Apache-licensed packs (Crystools, rgthree, ComfyUI-Custom-Scripts). MIT is
+GPL-compatible; the runtime combination on your machine is yours.
