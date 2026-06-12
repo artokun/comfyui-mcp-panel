@@ -2,13 +2,18 @@
 name = "comfyui-mcp-panel"
 description = "AI agent sidebar for ComfyUI - chat with an agent that can edit your graph live. Pairs with the comfyui-mcp npm package."
 version = "0.0.1"
-license = { text = "MIT" }
-dependencies = []
+license = { file = "LICENSE" }
+# UI-only pack: no Python deps. The frontend floor guarantees
+# app.extensionManager.registerSidebarTab exists.
+dependencies = ["comfyui-frontend-package>=1.20.0"]
+classifiers = ["Operating System :: OS Independent"]
 
 [project.urls]
 Repository = "https://github.com/artokun/comfyui-mcp-panel"
+Documentation = "https://comfyui-mcp.artokun.io/docs"
+"Bug Tracker" = "https://github.com/artokun/comfyui-mcp-panel/issues"
 
 [tool.comfy]
 PublisherId = "artokun"
 DisplayName = "ComfyUI MCP Panel"
-Icon = ""
+Icon = "https://raw.githubusercontent.com/artokun/comfyui-mcp-panel/main/assets/icon.png"
