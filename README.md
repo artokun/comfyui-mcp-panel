@@ -1,6 +1,16 @@
 # ComfyUI MCP Panel
 
+> ### 🚧 v0.3 coming soon to ComfyUI-Manager & the [Comfy Registry](https://registry.comfy.org)
+> The polished public release — native ComfyUI design system, live activity cards for every
+> agent edit, and multi-tab support — is in final testing. Watch this repo or the
+> [docs](https://comfyui-mcp.artokun.io/docs/panel) for the launch. (v0.2 is installable today
+> for the adventurous.)
+
 **Your Claude Code session, inside ComfyUI's sidebar — it sees your graph and edits it live.**
+
+Part of the **[comfyui-mcp](https://github.com/artokun/comfyui-mcp)** project — the Claude Code
+plugin + MCP server for ComfyUI (88 tools, 15 AI skills). Full documentation at
+**[comfyui-mcp.artokun.io/docs](https://comfyui-mcp.artokun.io/docs)**.
 
 Type "add a KSampler and wire it to my checkpoint" in the panel (or in your
 Claude terminal) and watch nodes appear on the canvas. Every edit is undoable
