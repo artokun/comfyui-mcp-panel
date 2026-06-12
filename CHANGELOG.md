@@ -34,6 +34,29 @@ The polished public release. In progress:
 - **`graph_clear` command** — wipes every node in a single
   `beforeChange`/`afterChange` pair, so one Ctrl+Z restores the whole graph.
   Exposed as the `panel_clear` MCP tool (comfyui-mcp ≥ 0.12).
+- **Full programmatic graph & app control.** New executor commands (each
+  with a matching `panel_*` MCP tool): `graph_move_node`, `graph_canvas`
+  (fit / center-on-node / pan / zoom), `graph_run` (queue the open workflow,
+  surfacing frontend validation errors), `graph_get_errors` (last
+  `execution_error` event + `lastNodeErrors`), `workflow_save` (Ctrl+S
+  path) and `workflow_save_as` (duplicate to `workflows/<name>.json`).
+- **Subgraph-aware reads.** Executors target the graph you're *viewing*
+  (root or an opened subgraph); `graph_get_state` reports `viewing`, marks
+  subgraph nodes `is_subgraph` with an inner node count (boundary slots +
+  widgets only), and `graph_get_subgraph` drills inside on demand.
+- **Zed-style composer.** Rounded composer card with a context-window ring
+  (radial fill — wired to `agent_status` frames; data source pending host
+  support), model chip, attach button (uploads straight into ComfyUI's
+  `input/` folder and inserts an `@input:` mention), and voice dictation
+  via the browser's speech recognition.
+- **Slash commands & @ mentions.** `/new`, `/fit`, `/run`, `/errors`,
+  `/help` run locally with arrow-key + Enter completion; `@` autocompletes
+  the current workflow, graph nodes, subgraphs, and registered node types.
+  Outgoing messages stamp the workflow + opened subgraph so the agent has
+  the context without asking.
+- **Chat threads.** New-chat and history buttons in the header; threads
+  persist to localStorage (last 20) and replay verbatim, activity cards
+  included.
 
 ## [0.2.0] - 2026-06-12
 

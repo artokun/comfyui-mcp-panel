@@ -59,12 +59,18 @@ Then either:
 | MCP tool | Effect |
 |---|---|
 | `panel_status` | Is the panel connected? |
-| `panel_get_graph` | Read nodes, widget values, connections (read-only) |
+| `panel_get_graph` | Read the graph you're viewing — subgraphs summarized shallowly |
+| `panel_get_subgraph` | Drill into a subgraph node's inner graph |
 | `panel_add_node` | Add a node by class_type |
 | `panel_remove_node` | Remove a node |
+| `panel_move_node` | Move a node to a new canvas position |
 | `panel_clear` | Remove every node — the whole wipe is one Ctrl+Z |
 | `panel_connect` / `panel_disconnect` | Wire / unwire slots (by name or index) |
 | `panel_set_widget` | Change a widget value (steps, cfg, prompts, …) |
+| `panel_canvas` | Fit, center on a node, pan, zoom your view |
+| `panel_run` | Queue the open workflow (same as pressing Queue Prompt) |
+| `panel_get_errors` | Read the last execution error + node validation errors |
+| `panel_save_workflow` | Save (Ctrl+S) or save-as/duplicate the open workflow |
 | `panel_say` | Post a message into this panel's chat feed |
 | `panel_inbox` | Drain messages you typed into the panel |
 

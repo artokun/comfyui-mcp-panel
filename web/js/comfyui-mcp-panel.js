@@ -36,6 +36,22 @@
 // import is the canonical access path. The absolute specifier works from any
 // nesting depth under /extensions/<pack>/.
 import { app } from "/scripts/app.js";
+import { api } from "/scripts/api.js";
+
+// Execution-error capture: listen from module load so graph_get_errors can
+// report the most recent failure even if it predates the agent's question.
+// execution_start clears state for the new run.
+let lastExecutionError = null;
+try {
+  api.addEventListener("execution_error", (ev) => {
+    lastExecutionError = { ...(ev.detail ?? {}), ts: new Date().toISOString() };
+  });
+  api.addEventListener("execution_start", () => {
+    lastExecutionError = null;
+  });
+} catch {
+  // api unavailable — graph_get_errors reports null.
+}
 
 // ---------------------------------------------------------------------------
 // localStorage-backed settings.
@@ -98,12 +114,25 @@ function getWorkflowTitle() {
 const MAX_STATE_NODES = 100;
 
 function getGraphCtx() {
-  const graph = app?.graph;
+  // app.canvas.graph is the graph the user is LOOKING at — the root graph or
+  // an opened subgraph — so reads and edits target what's on screen.
+  const graph = app?.canvas?.graph ?? app?.graph;
   const LG = window.LiteGraph ?? globalThis.LiteGraph;
   if (!app || !graph || !LG) {
     throw new Error("ComfyUI graph is not available (app.graph / LiteGraph missing)");
   }
-  return { app, graph, LG };
+  return { app, graph, rootGraph: app.graph, canvas: app.canvas, LG };
+}
+
+/** Where is the user looking right now — root graph or inside a subgraph? */
+function describeActiveGraph(graph) {
+  if (!app?.graph || graph === app.graph) return { scope: "root" };
+  const owner = (app.graph._nodes ?? []).find((n) => n.subgraph === graph);
+  return {
+    scope: "subgraph",
+    owner_node_id: owner?.id ?? null,
+    title: owner?.title ?? graph?.name ?? "subgraph",
+  };
 }
 
 /** Summarize one LiteGraph node for the agent — id, type, title, widget
@@ -128,7 +157,7 @@ function summarizeNode(node) {
     type: out.type,
     links: out.links?.length ?? 0,
   }));
-  return {
+  const summary = {
     id: node.id,
     type: node.type,
     title: node.title,
@@ -136,6 +165,14 @@ function summarizeNode(node) {
     inputs,
     outputs,
   };
+  // Subgraphs summarize SHALLOWLY — boundary slots + widgets only, plus an
+  // inner node count. Drill in with graph_get_subgraph when needed.
+  if (node.subgraph) {
+    summary.is_subgraph = true;
+    summary.subgraph_node_count =
+      node.subgraph._nodes?.length ?? node.subgraph.nodes?.length ?? 0;
+  }
+  return summary;
 }
 
 function resolveNode(graph, nodeId) {
@@ -177,9 +214,24 @@ const GRAPH_TOOL_EXECUTORS = {
     const { graph } = getGraphCtx();
     const nodes = (graph._nodes ?? []).slice(0, MAX_STATE_NODES).map(summarizeNode);
     return {
+      viewing: describeActiveGraph(graph),
       node_count: graph._nodes?.length ?? 0,
       truncated: (graph._nodes?.length ?? 0) > MAX_STATE_NODES,
       nodes,
+    };
+  },
+
+  graph_get_subgraph({ node_id }) {
+    const { graph } = getGraphCtx();
+    const node = resolveNode(graph, node_id);
+    const sub = node.subgraph;
+    if (!sub) throw new Error(`Node ${node.id} (${node.type}) is not a subgraph`);
+    const inner = [...(sub._nodes ?? sub.nodes ?? [])];
+    return {
+      subgraph_of: { node_id: node.id, title: node.title },
+      node_count: inner.length,
+      truncated: inner.length > MAX_STATE_NODES,
+      nodes: inner.slice(0, MAX_STATE_NODES).map(summarizeNode),
     };
   },
 
@@ -306,6 +358,135 @@ const GRAPH_TOOL_EXECUTORS = {
       set: { node_id: node.id, widget: w.name, previous, value: w.value },
     };
   },
+
+  graph_move_node({ node_id, pos }) {
+    const { graph } = getGraphCtx();
+    const node = resolveNode(graph, node_id);
+    if (!Array.isArray(pos) || pos.length !== 2) throw new Error("pos must be [x, y]");
+    const previous = [node.pos[0], node.pos[1]];
+    graph.beforeChange();
+    try {
+      node.pos = [Number(pos[0]), Number(pos[1])];
+    } finally {
+      graph.afterChange();
+    }
+    graph.setDirtyCanvas(true, true);
+    return { moved: { node_id: node.id, from: previous, to: [node.pos[0], node.pos[1]] } };
+  },
+
+  graph_canvas({ action, node_id, dx, dy, scale }) {
+    const { graph, canvas } = getGraphCtx();
+    if (!canvas?.ds) throw new Error("Canvas is not available");
+    const ds = canvas.ds;
+    switch (action) {
+      case "center_on_node": {
+        const node = resolveNode(graph, node_id);
+        if (typeof canvas.centerOnNode === "function") {
+          canvas.centerOnNode(node);
+        } else {
+          ds.offset[0] =
+            -node.pos[0] - (node.size?.[0] ?? 0) / 2 + canvas.canvas.width / ds.scale / 2;
+          ds.offset[1] =
+            -node.pos[1] - (node.size?.[1] ?? 0) / 2 + canvas.canvas.height / ds.scale / 2;
+        }
+        break;
+      }
+      case "fit": {
+        const nodes = graph._nodes ?? [];
+        if (!nodes.length) throw new Error("Graph is empty — nothing to fit");
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        for (const n of nodes) {
+          minX = Math.min(minX, n.pos[0]);
+          minY = Math.min(minY, n.pos[1] - 30); // title bar renders above pos
+          maxX = Math.max(maxX, n.pos[0] + (n.size?.[0] ?? 200));
+          maxY = Math.max(maxY, n.pos[1] + (n.size?.[1] ?? 100));
+        }
+        const pad = 60;
+        const el = canvas.canvas;
+        const w = maxX - minX + pad * 2;
+        const h = maxY - minY + pad * 2;
+        const next = Math.min(el.width / w, el.height / h, 1.5);
+        ds.scale = next;
+        ds.offset[0] = -minX + pad + (el.width / next - w) / 2;
+        ds.offset[1] = -minY + pad + (el.height / next - h) / 2;
+        break;
+      }
+      case "pan":
+        ds.offset[0] += Number(dx ?? 0);
+        ds.offset[1] += Number(dy ?? 0);
+        break;
+      case "zoom": {
+        const s = Number(scale);
+        if (!(s > 0.05 && s <= 4)) throw new Error("scale must be in (0.05, 4]");
+        ds.scale = s;
+        break;
+      }
+      default:
+        throw new Error(`Unknown canvas action "${action}"`);
+    }
+    canvas.setDirty(true, true);
+    return {
+      canvas: { action, scale: ds.scale, offset: [ds.offset[0], ds.offset[1]] },
+    };
+  },
+
+  async graph_run({ batch_count }) {
+    const { app } = getGraphCtx();
+    if (typeof app.queuePrompt !== "function") {
+      throw new Error("app.queuePrompt is unavailable on this frontend");
+    }
+    const batch = Number(batch_count ?? 1);
+    await app.queuePrompt(0, batch);
+    // queuePrompt swallows validation failures into lastNodeErrors.
+    const nodeErrors =
+      app.lastNodeErrors && Object.keys(app.lastNodeErrors).length ? app.lastNodeErrors : null;
+    if (nodeErrors) return { queued: false, node_errors: nodeErrors };
+    return { queued: true, batch_count: batch };
+  },
+
+  graph_get_errors() {
+    const { app } = getGraphCtx();
+    const nodeErrors =
+      app.lastNodeErrors && Object.keys(app.lastNodeErrors).length ? app.lastNodeErrors : null;
+    return {
+      last_execution_error: lastExecutionError,
+      node_errors: nodeErrors,
+      ...(lastExecutionError || nodeErrors
+        ? {}
+        : { note: "no errors recorded since the last execution start" }),
+    };
+  },
+
+  async workflow_save() {
+    // Same path as Ctrl+S, including the save-as dialog for never-saved
+    // workflows.
+    const mgr = app?.extensionManager;
+    if (!mgr?.command?.execute) {
+      throw new Error("Save command unavailable on this frontend — use workflow_save_as with a name");
+    }
+    await mgr.command.execute("Comfy.SaveWorkflow");
+    return { saved: true, workflow: getWorkflowTitle() };
+  },
+
+  async workflow_save_as({ name }) {
+    if (!name || typeof name !== "string") throw new Error("name (string) is required");
+    const { rootGraph } = getGraphCtx();
+    const clean = name.replace(/\.json$/i, "");
+    const data = rootGraph.serialize();
+    const res = await api.fetchApi(
+      `/userdata/${encodeURIComponent(`workflows/${clean}.json`)}?overwrite=true`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      },
+    );
+    if (res.status !== 200) throw new Error(`save failed: HTTP ${res.status}`);
+    return { saved_as: `workflows/${clean}.json`, node_count: data.nodes?.length ?? 0 };
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -315,7 +496,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onLog, onCommand }) {
+function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAgentStatus }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -340,7 +521,7 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand }) {
       sendHello();
     });
 
-    sock.addEventListener("message", (ev) => {
+    sock.addEventListener("message", async (ev) => {
       let msg;
       try {
         msg = JSON.parse(typeof ev.data === "string" ? ev.data : "");
@@ -349,11 +530,12 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand }) {
       }
       if (msg && typeof msg.rid === "string" && typeof msg.cmd === "string") {
         // Agent command — execute against the graph, reply with the rid.
+        // Executors may be async (run, save) — await uniformly.
         let reply;
         try {
           const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];
           if (!executor) throw new Error(`Unknown command "${msg.cmd}"`);
-          reply = { rid: msg.rid, ok: true, result: executor(msg) };
+          reply = { rid: msg.rid, ok: true, result: await executor(msg) };
         } catch (err) {
           reply = {
             rid: msg.rid,
@@ -372,6 +554,10 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand }) {
       }
       if (msg && msg.type === "say" && typeof msg.text === "string") {
         onSay(msg.text);
+      }
+      // Optional agent-side status (context window fill, model name).
+      if (msg && msg.type === "agent_status") {
+        onAgentStatus?.(msg);
       }
       // "echo" frames are ignored — we render the user bubble locally on send.
     });
@@ -423,10 +609,12 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand }) {
       closed = false;
       connect();
     },
-    sendUserMessage(text) {
+    sendUserMessage(text, context) {
       if (!sock || sock.readyState !== WebSocket.OPEN) return false;
       try {
-        sock.send(JSON.stringify({ type: "user_message", text }));
+        sock.send(
+          JSON.stringify({ type: "user_message", text, ...(context ? { context } : {}) }),
+        );
         return true;
       } catch {
         return false;
@@ -618,30 +806,64 @@ const PANEL_CSS = `
   30% { opacity: 1; transform: translateY(-3px); }
 }
 
-.cmcp-inputrow {
-  display: flex; gap: 0.5rem; padding: 0.75rem;
-  border-top: 1px solid var(--p-content-border-color, #3f3f46);
-}
-.cmcp-textarea {
-  flex: 1; resize: none; min-height: 2.25rem; max-height: 7.5rem;
-  padding: var(--p-form-field-padding-y, 0.5rem) var(--p-form-field-padding-x, 0.75rem);
+.cmcp-composer {
+  position: relative; margin: 0.625rem 0.75rem 0.75rem; flex: none;
+  display: flex; flex-direction: column;
   background: var(--p-form-field-background, #09090b);
   border: 1px solid var(--p-form-field-border-color, #52525b);
-  border-radius: var(--p-border-radius-md, 6px);
-  color: var(--p-form-field-color, #fff);
-  font: inherit; outline: none; transition: border-color 0.15s;
+  border-radius: var(--p-border-radius-xl, 12px);
+  transition: border-color 0.15s;
 }
-.cmcp-textarea:focus { border-color: var(--p-focus-ring-color, #60a5fa); }
-.cmcp-send {
-  align-self: flex-end; width: 2.25rem; height: 2.25rem; flex: none;
+.cmcp-composer:focus-within { border-color: var(--p-focus-ring-color, #60a5fa); }
+.cmcp-composer-input {
+  width: 100%; box-sizing: border-box; resize: none; border: none; outline: none;
+  background: transparent; color: var(--p-form-field-color, #fff);
+  font: inherit; padding: 0.625rem 0.75rem 0.25rem;
+  min-height: 2.25rem; max-height: 7.5rem;
+}
+.cmcp-composer-row { display: flex; align-items: center; gap: 0.25rem; padding: 0.25rem 0.5rem 0.5rem; }
+.cmcp-spacer { flex: 1; }
+.cmcp-iconbtn {
+  width: 1.75rem; height: 1.75rem; flex: none;
   display: flex; align-items: center; justify-content: center;
-  background: var(--p-button-primary-background, var(--p-primary-color, #60a5fa));
-  color: var(--p-button-primary-color, var(--p-primary-contrast-color, #18181b));
-  border: none; border-radius: var(--p-border-radius-md, 6px); cursor: pointer;
-  transition: opacity 0.15s;
+  background: transparent; border: none; cursor: pointer;
+  border-radius: var(--p-border-radius-sm, 4px);
+  color: var(--p-text-muted-color, #a1a1aa);
+  transition: background 0.15s, color 0.15s;
 }
-.cmcp-send:hover { opacity: 0.85; }
-.cmcp-send .pi { font-size: 0.875rem; }
+.cmcp-iconbtn:hover { background: var(--p-surface-700, #3f3f46); color: var(--p-text-color, #fff); }
+.cmcp-iconbtn:disabled { opacity: 0.35; cursor: default; }
+.cmcp-iconbtn.active { color: var(--p-red-400, #f87171); }
+.cmcp-iconbtn .pi { font-size: 0.875rem; }
+.cmcp-chip {
+  display: flex; align-items: center; gap: 0.25rem;
+  border: none; background: transparent; cursor: pointer;
+  color: var(--p-text-muted-color, #a1a1aa); font: inherit; font-size: 0.6875rem;
+  padding: 0.125rem 0.375rem; border-radius: var(--p-border-radius-sm, 4px);
+}
+.cmcp-chip:hover { background: var(--p-surface-700, #3f3f46); }
+.cmcp-ring { flex: none; margin: 0 0.125rem; transform: rotate(-90deg); }
+.cmcp-ring .bg { stroke: var(--p-surface-600, #52525b); }
+.cmcp-ring .fg { stroke: var(--p-primary-color, #60a5fa); transition: stroke-dashoffset 0.3s; }
+.cmcp-popover {
+  position: absolute; bottom: calc(100% + 6px); left: 0; right: 0; z-index: 40;
+  background: var(--p-surface-800, #27272a);
+  border: 1px solid var(--p-content-border-color, #3f3f46);
+  border-radius: var(--p-border-radius-lg, 8px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  max-height: 14rem; overflow-y: auto; padding: 0.25rem;
+}
+.cmcp-popover--down { bottom: auto; top: calc(100% + 4px); left: 0.5rem; right: 0.5rem; }
+.cmcp-popover-item {
+  display: flex; align-items: center; gap: 0.5rem; width: 100%; box-sizing: border-box;
+  padding: 0.375rem 0.5rem; border: none; background: transparent; cursor: pointer;
+  text-align: left; color: var(--p-text-color, #fff); font: inherit; font-size: 0.75rem;
+  border-radius: var(--p-border-radius-sm, 4px);
+}
+.cmcp-popover-item.sel, .cmcp-popover-item:hover { background: var(--p-surface-700, #3f3f46); }
+.cmcp-popover-item .pi { font-size: 0.75rem; color: var(--p-text-muted-color, #a1a1aa); flex: none; }
+.cmcp-popover-item small { margin-left: auto; color: var(--p-text-muted-color, #a1a1aa); flex: none; padding-left: 0.5rem; }
+.cmcp-popover-item .lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 `;
 
 let styleInjected = false;
@@ -683,6 +905,32 @@ function describeCommand(cmd, msg, reply) {
         text: `Set ${r.set?.widget} = ${JSON.stringify(r.set?.value)} on node ${r.set?.node_id}`,
         detail: `was ${JSON.stringify(r.set?.previous)}`,
       };
+    case "graph_get_subgraph":
+      return {
+        icon: "pi-sitemap",
+        text: `Read subgraph “${r.subgraph_of?.title}” — ${r.node_count} node${r.node_count === 1 ? "" : "s"}`,
+      };
+    case "graph_move_node":
+      return { icon: "pi-arrows-alt", text: `Moved node ${r.moved?.node_id} to [${r.moved?.to?.map(Math.round)}]` };
+    case "graph_canvas":
+      return { icon: "pi-window-maximize", text: `Canvas: ${r.canvas?.action?.replace(/_/g, " ")}` };
+    case "graph_run":
+      return r.queued
+        ? { icon: "pi-play", text: `Queued workflow${r.batch_count > 1 ? ` ×${r.batch_count}` : ""}` }
+        : {
+            icon: "pi-exclamation-triangle",
+            text: "Run blocked by node errors",
+            detail: JSON.stringify(r.node_errors).slice(0, 300),
+          };
+    case "graph_get_errors":
+      return {
+        icon: "pi-info-circle",
+        text: r.node_errors || r.last_execution_error ? "Read execution errors" : "Checked errors — none",
+      };
+    case "workflow_save":
+      return { icon: "pi-save", text: `Saved “${r.workflow}”` };
+    case "workflow_save_as":
+      return { icon: "pi-save", text: `Saved as ${r.saved_as}` };
     default:
       return { icon: "pi-bolt", text: cmd, detail: JSON.stringify(r).slice(0, 300) };
   }
@@ -720,12 +968,35 @@ function buildPanel() {
   title.textContent = "Agent";
   const status = document.createElement("span");
   status.className = "cmcp-status";
+  status.style.marginLeft = "0";
   const dot = document.createElement("span");
   dot.className = "cmcp-dot";
   const statusText = document.createElement("span");
   statusText.textContent = "disconnected";
   status.append(dot, statusText);
-  header.append(title, status);
+
+  function iconBtn(icon, titleText) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "cmcp-iconbtn";
+    b.title = titleText;
+    const i = document.createElement("i");
+    i.className = `pi ${icon}`;
+    b.appendChild(i);
+    return b;
+  }
+
+  const actions = document.createElement("span");
+  actions.style.cssText = "margin-left:auto;display:flex;gap:0.125rem;align-items:center;";
+  const newChatBtn = iconBtn("pi-plus", "New chat");
+  const historyBtn = iconBtn("pi-history", "Chat history");
+  actions.append(newChatBtn, historyBtn);
+
+  header.style.position = "relative";
+  const histPop = document.createElement("div");
+  histPop.className = "cmcp-popover cmcp-popover--down";
+  histPop.hidden = true;
+  header.append(title, actions, status, histPop);
   root.appendChild(header);
 
   // ---- Connection settings ----
@@ -791,29 +1062,127 @@ function buildPanel() {
     if (empty.parentElement) empty.remove();
   }
 
-  // ---- Input row ----
+  // ---- Composer ----
   const form = document.createElement("form");
-  form.className = "cmcp-inputrow";
+  form.className = "cmcp-composer";
+
+  const menuPop = document.createElement("div");
+  menuPop.className = "cmcp-popover";
+  menuPop.hidden = true;
+
   const input = document.createElement("textarea");
-  input.className = "cmcp-textarea";
-  input.placeholder = "Message Claude…";
+  input.className = "cmcp-composer-input";
+  input.placeholder = "Ask Claude… / for commands, @ for context";
   input.rows = 1;
-  const sendBtn = document.createElement("button");
-  sendBtn.className = "cmcp-send";
+
+  const row = document.createElement("div");
+  row.className = "cmcp-composer-row";
+
+  // Context-window ring. Claude Code does not expose its context usage to
+  // MCP servers, so this stays empty until an `agent_status` frame reports
+  // a context_pct — the plumbing is live, the data source is future work.
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const RING_R = 7;
+  const RING_C = 2 * Math.PI * RING_R;
+  const ring = document.createElementNS(SVG_NS, "svg");
+  ring.setAttribute("class", "cmcp-ring");
+  ring.setAttribute("width", "18");
+  ring.setAttribute("height", "18");
+  ring.setAttribute("viewBox", "0 0 18 18");
+  for (const cls of ["bg", "fg"]) {
+    const c = document.createElementNS(SVG_NS, "circle");
+    c.setAttribute("class", cls);
+    c.setAttribute("cx", "9");
+    c.setAttribute("cy", "9");
+    c.setAttribute("r", String(RING_R));
+    c.setAttribute("fill", "none");
+    c.setAttribute("stroke-width", "2");
+    if (cls === "bg") c.setAttribute("opacity", "0.35");
+    if (cls === "fg") {
+      c.setAttribute("stroke-dasharray", String(RING_C));
+      c.setAttribute("stroke-dashoffset", String(RING_C));
+      c.setAttribute("stroke-linecap", "round");
+    }
+    ring.appendChild(c);
+  }
+  const ringTitle = document.createElementNS(SVG_NS, "title");
+  ringTitle.textContent = "Context window — fills as Claude reports usage";
+  ring.appendChild(ringTitle);
+  function setContextPct(p) {
+    const clamped = Math.max(0, Math.min(1, p > 1 ? p / 100 : p));
+    ring.querySelector(".fg").setAttribute("stroke-dashoffset", String(RING_C * (1 - clamped)));
+    ringTitle.textContent = `Context window ~${Math.round(clamped * 100)}% used`;
+  }
+
+  const modelChip = document.createElement("button");
+  modelChip.type = "button";
+  modelChip.className = "cmcp-chip";
+  modelChip.textContent = "Claude";
+  modelChip.title = "The agent is your Claude Code session — switch models there with /model";
+  modelChip.addEventListener("click", () => {
+    appendSystem("The model belongs to your Claude Code session — switch it there with /model.");
+  });
+
+  const spacer = document.createElement("span");
+  spacer.className = "cmcp-spacer";
+
+  const attachBtn = iconBtn("pi-paperclip", "Attach an image (uploads to ComfyUI's input/ folder)");
+  const micBtn = iconBtn("pi-microphone", "Dictate (browser speech recognition)");
+  const sendBtn = iconBtn("pi-send", "Send (Enter)");
   sendBtn.type = "submit";
-  sendBtn.title = "Send (Enter)";
-  const sendIcon = document.createElement("i");
-  sendIcon.className = "pi pi-send";
-  sendBtn.appendChild(sendIcon);
-  form.append(input, sendBtn);
+
+  const fileInput = document.createElement("input");
+  fileInput.type = "file";
+  fileInput.accept = "image/*";
+  fileInput.hidden = true;
+
+  row.append(ring, modelChip, spacer, attachBtn, micBtn, sendBtn);
+  form.append(menuPop, input, row, fileInput);
   root.appendChild(form);
 
-  // ---- feed renderers ----
+  // ---- feed renderers + thread persistence ----
+  // paint* draws DOM only; append* paints AND records into the current
+  // thread (localStorage), so history can replay a conversation verbatim.
+  const THREADS_KEY = "comfyui-mcp.panel.threads";
+  const MAX_THREADS = 20;
+  const MAX_THREAD_MSGS = 200;
+  let threads = (() => {
+    try {
+      const t = JSON.parse(window.localStorage.getItem(THREADS_KEY) ?? "[]");
+      return Array.isArray(t) ? t : [];
+    } catch {
+      return [];
+    }
+  })();
+  let thread = null; // created lazily on first recorded message
+
+  function persistThreads() {
+    try {
+      window.localStorage.setItem(THREADS_KEY, JSON.stringify(threads.slice(-MAX_THREADS)));
+    } catch {
+      // localStorage unavailable — history is session-only.
+    }
+  }
+
+  function record(entry) {
+    if (!thread) {
+      thread = { id: crypto.randomUUID(), ts: Date.now(), msgs: [] };
+      threads.push(thread);
+      if (threads.length > MAX_THREADS) threads = threads.slice(-MAX_THREADS);
+    }
+    thread.msgs.push(entry);
+    if (thread.msgs.length > MAX_THREAD_MSGS) {
+      thread.msgs.splice(0, thread.msgs.length - MAX_THREAD_MSGS);
+    }
+    thread.ts = Date.now();
+    persistThreads();
+  }
+
   function scrollLog() {
     log.scrollTop = log.scrollHeight;
   }
 
-  function appendUser(text) {
+  function paintUser(text) {
     clearEmpty();
     const b = document.createElement("div");
     b.className = "cmcp-bubble user";
@@ -822,7 +1191,7 @@ function buildPanel() {
     scrollLog();
   }
 
-  function appendAgent(text) {
+  function paintAgent(text) {
     clearEmpty();
     const b = document.createElement("div");
     b.className = "cmcp-bubble agent";
@@ -831,19 +1200,10 @@ function buildPanel() {
     scrollLog();
   }
 
-  function appendSystem(text) {
-    const b = document.createElement("div");
-    b.className = "cmcp-sys";
-    b.textContent = text;
-    log.appendChild(b);
-    scrollLog();
-  }
-
-  function appendActivity(cmd, msg, reply) {
+  function paintCard({ icon, text, detail, error }) {
     clearEmpty();
-    const { icon, text, detail } = describeCommand(cmd, msg, reply);
     const card = document.createElement("div");
-    card.className = "cmcp-card" + (reply.ok ? "" : " error");
+    card.className = "cmcp-card" + (error ? " error" : "");
     const head = document.createElement("div");
     head.className = "cmcp-card-head";
     const i = document.createElement("i");
@@ -861,6 +1221,96 @@ function buildPanel() {
     log.appendChild(card);
     scrollLog();
   }
+
+  function appendUser(text) {
+    paintUser(text);
+    record({ role: "user", text });
+  }
+
+  function appendAgent(text) {
+    paintAgent(text);
+    record({ role: "agent", text });
+  }
+
+  function appendSystem(text) {
+    // System notices are transient — painted, never recorded.
+    const b = document.createElement("div");
+    b.className = "cmcp-sys";
+    b.textContent = text;
+    log.appendChild(b);
+    scrollLog();
+  }
+
+  function appendActivity(cmd, msg, reply) {
+    const { icon, text, detail } = describeCommand(cmd, msg, reply);
+    const card = { icon, text, detail, error: !reply.ok };
+    paintCard(card);
+    record({ role: "card", ...card });
+  }
+
+  function resetFeed() {
+    for (const el of [...log.children]) el.remove();
+    log.appendChild(empty);
+  }
+
+  function newChat() {
+    thread = null;
+    resetFeed();
+  }
+
+  function loadThread(t) {
+    thread = t;
+    resetFeed();
+    for (const m of t.msgs) {
+      if (m.role === "user") paintUser(m.text);
+      else if (m.role === "agent") paintAgent(m.text);
+      else if (m.role === "card") paintCard(m);
+    }
+  }
+
+  function renderHistory() {
+    histPop.textContent = "";
+    const list = [...threads].reverse();
+    if (!list.length) {
+      const none = document.createElement("div");
+      none.className = "cmcp-sys";
+      none.style.padding = "0.375rem";
+      none.textContent = "No past chats yet.";
+      histPop.appendChild(none);
+      return;
+    }
+    for (const t of list) {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "cmcp-popover-item";
+      const i = document.createElement("i");
+      i.className = "pi pi-comment";
+      const lbl = document.createElement("span");
+      lbl.className = "lbl";
+      const firstUser = t.msgs.find((m) => m.role === "user");
+      lbl.textContent = (firstUser?.text ?? "(no messages)").slice(0, 48);
+      const when = document.createElement("small");
+      when.textContent = new Date(t.ts).toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric",
+      });
+      item.append(i, lbl, when);
+      item.addEventListener("click", () => {
+        histPop.hidden = true;
+        loadThread(t);
+      });
+      histPop.appendChild(item);
+    }
+  }
+
+  newChatBtn.addEventListener("click", () => {
+    histPop.hidden = true;
+    newChat();
+  });
+  historyBtn.addEventListener("click", () => {
+    if (histPop.hidden) renderHistory();
+    histPop.hidden = !histPop.hidden;
+  });
 
   // ---- "Claude is working…" indicator ----
   // Honest framing: Claude Code does NOT stream its reasoning to MCP
@@ -937,6 +1387,10 @@ function buildPanel() {
       appendActivity(cmd, msg, reply);
       bumpThinking();
     },
+    onAgentStatus(s) {
+      if (typeof s.context_pct === "number") setContextPct(s.context_pct);
+      if (typeof s.model === "string" && s.model) modelChip.textContent = s.model;
+    },
   });
 
   saveBtn.addEventListener("click", () => {
@@ -944,11 +1398,275 @@ function buildPanel() {
     appendSystem(`Reconnecting to ${client.currentUrl()}…`);
   });
 
+  // ---- slash commands (run locally, no agent round-trip) ----
+  async function runLocalCommand(cmd, args) {
+    try {
+      const result = await GRAPH_TOOL_EXECUTORS[cmd](args);
+      appendActivity(cmd, args, { ok: true, result });
+    } catch (err) {
+      appendActivity(cmd, args, { ok: false, error: err?.message ?? String(err) });
+    }
+  }
+
+  const SLASH_COMMANDS = [
+    { cmd: "/new", icon: "pi-plus", hint: "start a new chat", run: () => newChat() },
+    {
+      cmd: "/fit",
+      icon: "pi-window-maximize",
+      hint: "fit the canvas to the graph",
+      run: () => runLocalCommand("graph_canvas", { action: "fit" }),
+    },
+    { cmd: "/run", icon: "pi-play", hint: "queue the open workflow", run: () => runLocalCommand("graph_run", {}) },
+    {
+      cmd: "/errors",
+      icon: "pi-info-circle",
+      hint: "show the last execution errors",
+      run: () => runLocalCommand("graph_get_errors", {}),
+    },
+    {
+      cmd: "/help",
+      icon: "pi-question-circle",
+      hint: "list commands",
+      run: () => appendSystem(SLASH_COMMANDS.map((c) => `${c.cmd} — ${c.hint}`).join(" · ")),
+    },
+  ];
+
+  // ---- completion menu (slash + @ mentions) ----
+  let menuItems = [];
+  let menuSel = 0;
+  let menuToken = null; // { start, end } range in input.value being completed
+
+  function hideMenu() {
+    menuPop.hidden = true;
+    menuItems = [];
+    menuToken = null;
+  }
+
+  function showMenu(items) {
+    menuItems = items;
+    menuSel = 0;
+    menuPop.textContent = "";
+    if (!items.length) {
+      hideMenu();
+      return;
+    }
+    items.forEach((item, idx) => {
+      const el = document.createElement("button");
+      el.type = "button";
+      el.className = "cmcp-popover-item" + (idx === 0 ? " sel" : "");
+      const i = document.createElement("i");
+      i.className = `pi ${item.icon}`;
+      const lbl = document.createElement("span");
+      lbl.className = "lbl";
+      lbl.textContent = item.label;
+      el.append(i, lbl);
+      if (item.small) {
+        const s = document.createElement("small");
+        s.textContent = item.small;
+        el.appendChild(s);
+      }
+      // mousedown (not click) so the textarea never loses focus.
+      el.addEventListener("mousedown", (mev) => {
+        mev.preventDefault();
+        pickMenuItem(item);
+      });
+      menuPop.appendChild(el);
+    });
+    menuPop.hidden = false;
+  }
+
+  function moveSel(delta) {
+    if (!menuItems.length) return;
+    menuSel = (menuSel + delta + menuItems.length) % menuItems.length;
+    [...menuPop.children].forEach((el, i) => el.classList.toggle("sel", i === menuSel));
+    menuPop.children[menuSel]?.scrollIntoView({ block: "nearest" });
+  }
+
+  function pickMenuItem(item) {
+    if (item.kind === "slash") {
+      hideMenu();
+      input.value = "";
+      input.style.height = "auto";
+      appendUser(item.ref.cmd);
+      item.ref.run();
+      return;
+    }
+    const { start, end } = menuToken ?? { start: input.value.length, end: input.value.length };
+    input.value = input.value.slice(0, start) + item.insert + input.value.slice(end);
+    const pos = start + item.insert.length;
+    input.selectionStart = pos;
+    input.selectionEnd = pos;
+    hideMenu();
+    input.focus();
+  }
+
+  function buildAtItems(query) {
+    const q = query.toLowerCase();
+    const items = [];
+    const wf = getWorkflowTitle();
+    if (!q || "workflow".includes(q) || wf.toLowerCase().includes(q)) {
+      items.push({
+        icon: "pi-file",
+        label: `workflow — ${wf}`,
+        small: "context",
+        insert: `@workflow:"${wf}" `,
+      });
+    }
+    try {
+      const { graph } = getGraphCtx();
+      for (const n of graph._nodes ?? []) {
+        const name = n.title ?? n.type;
+        const label = `#${n.id} ${name}`;
+        if (!q || label.toLowerCase().includes(q)) {
+          items.push({
+            icon: n.subgraph ? "pi-sitemap" : "pi-circle",
+            label,
+            small: n.subgraph ? "subgraph" : n.type,
+            insert: `@node:${n.id}(${name}) `,
+          });
+        }
+        if (items.length >= 9) break;
+      }
+    } catch {
+      // graph unavailable — node items skipped
+    }
+    try {
+      const LG = window.LiteGraph ?? globalThis.LiteGraph;
+      if (q.length >= 2 && LG?.registered_node_types) {
+        let added = 0;
+        for (const t of Object.keys(LG.registered_node_types)) {
+          if (t.toLowerCase().includes(q)) {
+            items.push({ icon: "pi-box", label: t, small: "node type", insert: `@type:${t} ` });
+            added += 1;
+            if (added >= 5) break;
+          }
+        }
+      }
+    } catch {
+      // LiteGraph unavailable — type items skipped
+    }
+    return items.slice(0, 12);
+  }
+
+  function refreshMenu() {
+    const caret = input.selectionStart ?? input.value.length;
+    const upto = input.value.slice(0, caret);
+    // Slash menu only while the whole message IS the command being typed.
+    if (/^\/[\w-]*$/.test(upto) && upto === input.value) {
+      const q = upto.toLowerCase();
+      menuToken = { start: 0, end: input.value.length };
+      showMenu(
+        SLASH_COMMANDS.filter((c) => c.cmd.startsWith(q)).map((c) => ({
+          kind: "slash",
+          icon: c.icon,
+          label: c.cmd,
+          small: c.hint,
+          ref: c,
+        })),
+      );
+      return;
+    }
+    const atM = upto.match(/(^|\s)@([\w./:-]*)$/);
+    if (atM) {
+      menuToken = { start: caret - atM[2].length - 1, end: caret };
+      showMenu(buildAtItems(atM[2]));
+      return;
+    }
+    hideMenu();
+  }
+
+  // ---- attach (upload into ComfyUI's input/ folder) ----
+  function insertAtCaret(text) {
+    const s = input.selectionStart ?? input.value.length;
+    const e = input.selectionEnd ?? s;
+    input.value = input.value.slice(0, s) + text + input.value.slice(e);
+    const pos = s + text.length;
+    input.selectionStart = pos;
+    input.selectionEnd = pos;
+    input.dispatchEvent(new Event("input"));
+    input.focus();
+  }
+
+  attachBtn.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", async () => {
+    const file = fileInput.files?.[0];
+    fileInput.value = "";
+    if (!file) return;
+    appendSystem(`Uploading ${file.name}…`);
+    try {
+      const fd = new FormData();
+      fd.append("image", file);
+      const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
+      if (res.status !== 200) throw new Error(`HTTP ${res.status}`);
+      const info = await res.json();
+      const ref = (info.subfolder ? `${info.subfolder}/` : "") + info.name;
+      insertAtCaret(`@input:${ref} `);
+      appendSystem(`Attached — saved to ComfyUI input/${ref} (usable in LoadImage).`);
+    } catch (err) {
+      appendSystem(`Upload failed: ${err?.message ?? err}`);
+    }
+  });
+
+  // ---- voice dictation (browser speech recognition; Chrome) ----
+  const SR = window.SpeechRecognition ?? window.webkitSpeechRecognition;
+  let recognition = null;
+  if (!SR) {
+    micBtn.disabled = true;
+    micBtn.title = "Voice input is not supported in this browser";
+  }
+  micBtn.addEventListener("click", () => {
+    if (!SR) return;
+    if (recognition) {
+      recognition.stop();
+      return;
+    }
+    recognition = new SR();
+    recognition.lang = navigator.language || "en-US";
+    recognition.continuous = true;
+    recognition.interimResults = false;
+    recognition.addEventListener("result", (ev) => {
+      const last = ev.results[ev.results.length - 1];
+      if (last?.isFinal) insertAtCaret(`${last[0].transcript.trim()} `);
+    });
+    recognition.addEventListener("end", () => {
+      micBtn.classList.remove("active");
+      recognition = null;
+    });
+    recognition.addEventListener("error", (ev) => {
+      if (ev.error !== "aborted") appendSystem(`Voice input error: ${ev.error}`);
+    });
+    micBtn.classList.add("active");
+    recognition.start();
+  });
+
+  // ---- submit ----
   form.addEventListener("submit", (ev) => {
     ev.preventDefault();
+    hideMenu();
     const text = input.value.trim();
     if (!text) return;
-    const sent = client.sendUserMessage(text);
+    if (text.startsWith("/")) {
+      const c = SLASH_COMMANDS.find((sc) => sc.cmd === text.split(/\s+/)[0]);
+      if (c) {
+        appendUser(text);
+        input.value = "";
+        input.style.height = "auto";
+        c.run();
+        return;
+      }
+    }
+    // Stamp where the user is — workflow + opened subgraph — so the agent
+    // gets the context without asking.
+    let viewing = { scope: "root" };
+    try {
+      viewing = describeActiveGraph(getGraphCtx().graph);
+    } catch {
+      // graph unavailable — send without subgraph context
+    }
+    const sent = client.sendUserMessage(text, {
+      workflow: getWorkflowTitle(),
+      ...(viewing.scope === "subgraph" ? { subgraph: viewing.title } : {}),
+    });
     if (sent) {
       appendUser(text);
       showThinking();
@@ -961,15 +1679,39 @@ function buildPanel() {
   });
 
   input.addEventListener("keydown", (ev) => {
+    if (!menuPop.hidden && menuItems.length) {
+      if (ev.key === "ArrowDown") {
+        ev.preventDefault();
+        moveSel(1);
+        return;
+      }
+      if (ev.key === "ArrowUp") {
+        ev.preventDefault();
+        moveSel(-1);
+        return;
+      }
+      if (ev.key === "Enter" || ev.key === "Tab") {
+        ev.preventDefault();
+        pickMenuItem(menuItems[menuSel]);
+        return;
+      }
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        hideMenu();
+        return;
+      }
+    }
     if (ev.key === "Enter" && !ev.shiftKey) {
       ev.preventDefault();
       form.requestSubmit();
     }
   });
+  input.addEventListener("blur", () => setTimeout(hideMenu, 150));
   // Auto-grow the textarea up to its CSS max-height.
   input.addEventListener("input", () => {
     input.style.height = "auto";
     input.style.height = `${Math.min(input.scrollHeight, 120)}px`;
+    refreshMenu();
   });
 
   client.start();
@@ -977,6 +1719,11 @@ function buildPanel() {
   return {
     root,
     destroy() {
+      try {
+        recognition?.stop();
+      } catch {
+        // recognition already stopped
+      }
       client.destroy();
       root.remove();
     },
