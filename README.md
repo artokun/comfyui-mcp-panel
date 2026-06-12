@@ -62,6 +62,7 @@ Then either:
 | `panel_get_graph` | Read nodes, widget values, connections (read-only) |
 | `panel_add_node` | Add a node by class_type |
 | `panel_remove_node` | Remove a node |
+| `panel_clear` | Remove every node — the whole wipe is one Ctrl+Z |
 | `panel_connect` / `panel_disconnect` | Wire / unwire slots (by name or index) |
 | `panel_set_widget` | Change a widget value (steps, cfg, prompts, …) |
 | `panel_say` | Post a message into this panel's chat feed |

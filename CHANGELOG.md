@@ -24,6 +24,16 @@ The polished public release. In progress:
   title. The agent sees every tab (`panel_status`), routes edits per tab,
   and knows which tab you typed in. Requires comfyui-mcp ≥ 0.12.
 - **Markdown-lite agent bubbles** — `code` and **bold** rendering, safely.
+- **"Claude is working…" indicator.** Sending a message shows an animated
+  typing indicator immediately; incoming graph edits keep it alive (and bump
+  it below the newest activity card), the agent's reply retires it, and a
+  45-second quiet period swaps it for a hint explaining that the agent reads
+  panel messages by polling its inbox. (Claude Code doesn't stream its
+  internal reasoning to MCP servers — narration + activity cards + this
+  indicator are the feedback surface.)
+- **`graph_clear` command** — wipes every node in a single
+  `beforeChange`/`afterChange` pair, so one Ctrl+Z restores the whole graph.
+  Exposed as the `panel_clear` MCP tool (comfyui-mcp ≥ 0.12).
 
 ## [0.2.0] - 2026-06-12
 

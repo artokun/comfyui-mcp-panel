@@ -220,6 +220,21 @@ const GRAPH_TOOL_EXECUTORS = {
     return { removed: summary };
   },
 
+  graph_clear() {
+    const { graph } = getGraphCtx();
+    const nodes = [...(graph._nodes ?? [])];
+    // Remove node-by-node inside ONE beforeChange/afterChange pair rather
+    // than graph.clear(): the whole wipe becomes a single Ctrl+Z step.
+    graph.beforeChange();
+    try {
+      for (const node of nodes) graph.remove(node);
+    } finally {
+      graph.afterChange();
+    }
+    graph.setDirtyCanvas(true, true);
+    return { cleared: nodes.length };
+  },
+
   graph_connect({ from_node_id, from_output, to_node_id, to_input }) {
     const { graph } = getGraphCtx();
     const origin = resolveNode(graph, from_node_id);
@@ -581,6 +596,28 @@ const PANEL_CSS = `
   max-height: 7.5rem; overflow-y: auto;
 }
 
+.cmcp-thinking {
+  align-self: flex-start; display: flex; align-items: center; gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--p-surface-800, #27272a);
+  border: 1px solid var(--p-content-border-color, #3f3f46);
+  border-radius: var(--p-border-radius-lg, 8px);
+  color: var(--p-text-muted-color, #a1a1aa); font-size: 0.75rem;
+  animation: cmcp-in 0.18s ease-out;
+}
+.cmcp-thinking-dots { display: inline-flex; gap: 3px; }
+.cmcp-thinking-dots span {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--p-primary-color, #60a5fa);
+  animation: cmcp-dotbounce 1.2s ease-in-out infinite;
+}
+.cmcp-thinking-dots span:nth-child(2) { animation-delay: 0.15s; }
+.cmcp-thinking-dots span:nth-child(3) { animation-delay: 0.3s; }
+@keyframes cmcp-dotbounce {
+  0%, 60%, 100% { opacity: 0.25; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-3px); }
+}
+
 .cmcp-inputrow {
   display: flex; gap: 0.5rem; padding: 0.75rem;
   border-top: 1px solid var(--p-content-border-color, #3f3f46);
@@ -628,6 +665,11 @@ function describeCommand(cmd, msg, reply) {
       return { icon: "pi-plus-circle", text: `Added ${r.added?.type ?? "node"} (id ${r.added?.id})` };
     case "graph_remove_node":
       return { icon: "pi-minus-circle", text: `Removed ${r.removed?.type ?? "node"} (id ${r.removed?.id})` };
+    case "graph_clear":
+      return {
+        icon: "pi-eraser",
+        text: `Cleared canvas — removed ${r.cleared} node${r.cleared === 1 ? "" : "s"} (one Ctrl+Z restores all)`,
+      };
     case "graph_connect":
       return {
         icon: "pi-link",
@@ -820,14 +862,72 @@ function buildPanel() {
     scrollLog();
   }
 
+  // ---- "Claude is working…" indicator ----
+  // Honest framing: Claude Code does NOT stream its reasoning to MCP
+  // servers, so real thinking tokens can't appear here. What the panel can
+  // do is acknowledge the send instantly and stay visibly alive until the
+  // agent's next say/graph-edit lands. Graph edits keep the indicator alive
+  // (Claude is mid-task); a say bubble retires it (Claude replied). If
+  // nothing arrives for a while, swap to a hint about how the loop works —
+  // the agent reads panel messages by polling its inbox.
+  const THINKING_HINT_MS = 45000;
+  let thinkingEl = null;
+  let thinkingTimer = null;
+
+  function hideThinking() {
+    if (thinkingTimer) {
+      clearTimeout(thinkingTimer);
+      thinkingTimer = null;
+    }
+    if (thinkingEl) {
+      thinkingEl.remove();
+      thinkingEl = null;
+    }
+  }
+
+  function onThinkingTimeout() {
+    hideThinking();
+    appendSystem(
+      'Claude hasn’t picked this up yet — it reads panel messages when its session checks the inbox. In your Claude terminal, say: "watch the ComfyUI panel".',
+    );
+  }
+
+  function showThinking() {
+    hideThinking();
+    clearEmpty();
+    thinkingEl = document.createElement("div");
+    thinkingEl.className = "cmcp-thinking";
+    const dots = document.createElement("span");
+    dots.className = "cmcp-thinking-dots";
+    for (let i = 0; i < 3; i += 1) dots.appendChild(document.createElement("span"));
+    const label = document.createElement("span");
+    label.textContent = "Claude is working…";
+    thinkingEl.append(dots, label);
+    log.appendChild(thinkingEl);
+    scrollLog();
+    thinkingTimer = setTimeout(onThinkingTimeout, THINKING_HINT_MS);
+  }
+
+  /** Keep the indicator below the newest activity card and reset its
+   *  quiet-period timer — an incoming graph edit proves Claude is working. */
+  function bumpThinking() {
+    if (!thinkingEl) return;
+    log.appendChild(thinkingEl);
+    if (thinkingTimer) clearTimeout(thinkingTimer);
+    thinkingTimer = setTimeout(onThinkingTimeout, THINKING_HINT_MS);
+    scrollLog();
+  }
+
   // ---- bridge wiring ----
   const client = createBridgeClient({
     onStatus(state) {
       statusText.textContent = state;
       dot.className = "cmcp-dot" + (state === "connected" ? " connected" : state === "connecting" ? " connecting" : "");
       settingsBox.open = state !== "connected";
+      if (state !== "connected") hideThinking();
     },
     onSay(text) {
+      hideThinking();
       appendAgent(text);
     },
     onLog(text) {
@@ -835,6 +935,7 @@ function buildPanel() {
     },
     onCommand(cmd, msg, reply) {
       appendActivity(cmd, msg, reply);
+      bumpThinking();
     },
   });
 
@@ -850,6 +951,7 @@ function buildPanel() {
     const sent = client.sendUserMessage(text);
     if (sent) {
       appendUser(text);
+      showThinking();
       input.value = "";
       input.style.height = "auto";
     } else {
