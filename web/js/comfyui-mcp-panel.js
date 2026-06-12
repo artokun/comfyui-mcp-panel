@@ -23,12 +23,19 @@
 // All graph mutations are wrapped in beforeChange/afterChange so ComfyUI's
 // native Ctrl+Z undoes agent edits exactly like the user's own.
 //
-// V1→V2 MIGRATION: registration uses `window.app.registerExtension(...)` +
+// V1→V2 MIGRATION: registration uses `app.registerExtension(...)` (app imported
+// from /scripts/app.js) +
 // `app.extensionManager.registerSidebarTab(...)`, and the executors touch
 // `app.graph` / `LiteGraph` directly. When `@comfyorg/extension-api` ships,
 // the equivalents are `defineExtension()`, `defineSidebarTab()`, and
 // `NodeHandle`/`WidgetHandle`. v1 call sites are tagged `// TODO(v2):`.
 // =============================================================================
+
+// ComfyUI loads extension files as ES modules; on modern frontends (1.4x+)
+// `window.app` is no longer assigned before extension eval, so the module
+// import is the canonical access path. The absolute specifier works from any
+// nesting depth under /extensions/<pack>/.
+import { app } from "/scripts/app.js";
 
 // ---------------------------------------------------------------------------
 // localStorage-backed settings.
@@ -67,7 +74,6 @@ function saveBridgeUrl(url) {
 const MAX_STATE_NODES = 100;
 
 function getGraphCtx() {
-  const app = window.app ?? globalThis.app;
   const graph = app?.graph;
   const LG = window.LiteGraph ?? globalThis.LiteGraph;
   if (!app || !graph || !LG) {
@@ -597,14 +603,11 @@ function buildPanel() {
 }
 
 // ---------------------------------------------------------------------------
-// v1 registration. We reach for `window.app` lazily — at module-eval time
-// `app` may not yet be on `window`, but `registerExtension` itself queues.
+// v1 registration via the imported app module.
 // ---------------------------------------------------------------------------
-const app = window.app ?? globalThis.app;
 if (!app || typeof app.registerExtension !== "function") {
   console.error(
-    "[comfyui-mcp-panel] window.app.registerExtension is unavailable. " +
-      "This extension targets the v1 ComfyUI frontend API.",
+    "[comfyui-mcp-panel] app.registerExtension is unavailable — incompatible ComfyUI frontend version.",
   );
 } else {
   // TODO(v2): replace with `defineExtension({ name, setup() {...} })`.
