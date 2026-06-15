@@ -735,6 +735,18 @@ const PANEL_CSS = `
 }
 .cmcp-empty .pi { font-size: 1.75rem; display: block; margin-bottom: 0.5rem; opacity: 0.5; }
 .cmcp-empty-title { font-weight: 600; color: var(--p-text-color, #fff); margin-bottom: 0.25rem; }
+.cmcp-examples { display: flex; flex-direction: column; gap: 0.375rem; margin-top: 0.875rem; text-align: left; }
+.cmcp-example {
+  display: flex; align-items: center; gap: 0.5rem; width: 100%; box-sizing: border-box;
+  padding: 0.4375rem 0.625rem; cursor: pointer; font: inherit; font-size: 0.75rem;
+  color: var(--p-text-color, #fff); text-align: left;
+  background: var(--p-surface-800, #27272a);
+  border: 1px solid var(--p-content-border-color, #3f3f46);
+  border-radius: var(--p-border-radius-md, 6px);
+  transition: border-color 0.15s, background 0.15s;
+}
+.cmcp-example:hover { border-color: var(--p-primary-color, #60a5fa); background: var(--p-surface-700, #3f3f46); }
+.cmcp-example .pi { font-size: 0.8125rem; margin: 0; opacity: 1; color: var(--p-primary-color, #60a5fa); flex: none; }
 
 .cmcp-bubble {
   padding: 0.5rem 0.75rem; max-width: 92%;
@@ -1053,8 +1065,37 @@ function buildPanel() {
   emptyTitle.textContent = "Claude is at your canvas";
   const emptyBody = document.createElement("div");
   emptyBody.textContent =
-    "Ask for nodes, connections, or parameter changes — every edit lands live on the graph and undoes with Ctrl+Z.";
+    "Build and edit the live graph, generate images & audio, run the workflow and read its errors, or find models on Civitai — every graph edit undoes with Ctrl+Z.";
   empty.append(emptyIcon, emptyTitle, emptyBody);
+
+  // Example prompts surface the agent's newer capabilities and prefill the
+  // composer on click. `input` is assigned later in this closure; the click
+  // handlers run long after, so referencing it is safe.
+  const EXAMPLES = [
+    { icon: "pi-volume-up", text: "Generate a 30s lofi piano track" },
+    { icon: "pi-sliders-h", text: "Build a Flux txt2img graph and run it" },
+    { icon: "pi-exclamation-triangle", text: "Run the workflow and tell me if it errors" },
+    { icon: "pi-search", text: "Find a good Flux LoRA on Civitai and add it" },
+  ];
+  const examplesBox = document.createElement("div");
+  examplesBox.className = "cmcp-examples";
+  for (const ex of EXAMPLES) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "cmcp-example";
+    const i = document.createElement("i");
+    i.className = `pi ${ex.icon}`;
+    const t = document.createElement("span");
+    t.textContent = ex.text;
+    chip.append(i, t);
+    chip.addEventListener("click", () => {
+      input.value = ex.text;
+      input.focus();
+      input.dispatchEvent(new Event("input"));
+    });
+    examplesBox.appendChild(chip);
+  }
+  empty.appendChild(examplesBox);
   log.appendChild(empty);
   root.appendChild(log);
 

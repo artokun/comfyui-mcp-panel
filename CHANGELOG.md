@@ -10,6 +10,11 @@ The polished public release. In progress:
 
 ### Added
 
+- **Capability-aware empty state.** The onboarding hero now reflects the
+  agent's full surface — build/edit the live graph, generate images **and
+  audio** (`generate_audio`, ACE Step 1.5 / Stable Audio 3), run the workflow
+  and read its errors, and find models on Civitai — with clickable example
+  prompts that prefill the composer. Requires comfyui-mcp ≥ 0.13.
 - **Native ComfyUI design system.** The panel is restyled on the same
   PrimeVue semantic tokens (`--p-content-background`, `--p-form-field-*`,
   `--p-primary-color`, border radii, Inter) the built-in sidebar panels use —
