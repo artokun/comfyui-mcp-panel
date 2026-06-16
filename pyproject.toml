@@ -1,8 +1,9 @@
 [project]
 name = "comfyui-mcp-panel"
-description = "Your Claude Code session inside ComfyUI's sidebar - live graph edits over MCP, no API keys. Pairs with the comfyui-mcp npm package's --channels mode."
-version = "0.2.0"
+description = "AI agent sidebar for ComfyUI — drive your graph from a Claude Code (or any MCP client) session over the Model Context Protocol. Add, wire, move and tweak nodes live with full Ctrl+Z undo. No API keys, no extra LLM cost. Part of the comfyui-mcp project (channels mode)."
+version = "0.3.0"
 license = { file = "LICENSE" }
+requires-python = ">=3.9"
 # UI-only pack: no Python deps. The frontend floor guarantees
 # app.extensionManager.registerSidebarTab exists.
 dependencies = ["comfyui-frontend-package>=1.20.0"]
@@ -17,3 +18,4 @@ Documentation = "https://comfyui-mcp.artokun.io/docs"
 PublisherId = "artokun"
 DisplayName = "ComfyUI MCP Panel"
 Icon = "https://raw.githubusercontent.com/artokun/comfyui-mcp-panel/main/assets/icon.png"
+Banner = "https://raw.githubusercontent.com/artokun/comfyui-mcp-panel/main/assets/banner.png"

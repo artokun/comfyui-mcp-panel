@@ -4,11 +4,17 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
-## Unreleased — v0.3.0, coming soon to the Comfy Registry 🚧
+## [0.3.0] - 2026-06-16
 
-The polished public release. In progress:
+The polished public release — now live on the [Comfy Registry](https://registry.comfy.org/nodes/comfyui-mcp-panel) and installable from ComfyUI-Manager.
 
 ### Added
+
+- **Registry banner & SEO listing.** Added a 21:9 brand banner
+  (`assets/banner.png`) so the registry/social card uses a custom image
+  instead of the generic OG fallback, and rewrote the pack description to
+  lead with the terms people actually search (Claude Code, MCP / Model
+  Context Protocol, AI agent, live graph editing).
 
 - **Capability-aware empty state.** The onboarding hero now reflects the
   agent's full surface — build/edit the live graph, generate images **and
