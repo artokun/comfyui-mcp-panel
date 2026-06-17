@@ -1,18 +1,19 @@
 // =============================================================================
-// ComfyUI MCP Panel — sidebar window into your own Claude Code session.
+// ComfyUI MCP Panel — sidebar driven by an autonomous background agent.
 //
 // Shipped as a UI-only custom node pack (served via WEB_DIRECTORY). The panel
-// connects to the loopback WebSocket bridge hosted by the `comfyui-mcp` MCP
-// server when it runs in channels mode:
+// connects to the loopback WebSocket bridge owned by the comfyui-mcp panel
+// orchestrator, started with:
 //
-//     npx -y comfyui-mcp --channels
+//     npx -y comfyui-mcp --panel-orchestrator
 //
-// The AGENT is the user's own Claude Code (or any MCP client) session — there
-// are NO LLM API keys anywhere in this path. Claude drives the graph through
-// the server's panel_* MCP tools; the bridge forwards each rid-correlated
-// command here, where a fixed allowlist of executors mutates the open
-// LiteGraph graph. Messages the user types below travel the other way:
-// panel → bridge → agent session (channel event / panel_inbox tool).
+// The AGENT is a background Claude Agent SDK session the orchestrator spawns
+// per tab, running on the user's Claude SUBSCRIPTION — there are NO LLM API
+// keys anywhere in this path, and the user's interactive Claude session stays
+// free. The agent drives the graph through the bridge; the bridge forwards each
+// rid-correlated command here, where a fixed allowlist of executors mutates the
+// open LiteGraph graph. Messages the user types below travel the other way:
+// panel → bridge → background agent.
 //
 // Wire protocol (mirrors node-lab's mcp/protocol.ts):
 //   inbound  { rid, cmd, ...args }  → execute → reply { rid, ok, result }
@@ -1036,10 +1037,10 @@ function buildPanel() {
   const helpDiv = document.createElement("div");
   helpDiv.className = "cmcp-help";
   helpDiv.textContent =
-    "This panel is a window into your own Claude Code session — no API keys. Add comfyui-mcp with channels mode:";
+    "This panel is driven by an autonomous background agent on your Claude subscription — no API keys. Sign in to Claude once (run `claude`), then start the panel agent:";
   const helpCmd = document.createElement("code");
   helpCmd.className = "cmcp-cmd";
-  helpCmd.textContent = "claude mcp add comfyui -- npx -y comfyui-mcp --channels";
+  helpCmd.textContent = "npx -y comfyui-mcp --panel-orchestrator";
   helpCmd.title = "Click to copy";
   helpCmd.addEventListener("click", () => {
     navigator.clipboard?.writeText(helpCmd.textContent).then(

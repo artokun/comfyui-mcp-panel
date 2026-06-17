@@ -4,6 +4,33 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.0] - 2026-06-17
+
+The panel now drives itself: it auto-starts an autonomous background agent on
+your Claude subscription, so you just open ComfyUI and type.
+
+### Added
+
+- **Auto-start the panel orchestrator on load.** The pack launches
+  `npx -y comfyui-mcp --panel-orchestrator` when ComfyUI loads it — idempotent
+  (skips if the bridge port is already owned), auto-detects this ComfyUI's
+  `COMFYUI_URL`, and runs on your Claude **subscription** (no API key). The agent
+  is a background Claude Agent SDK session per tab that loads comfyui-mcp's
+  bundled skills (model expertise), so the only prerequisite is being signed in
+  to Claude (`claude` once). Opt out with `COMFYUI_MCP_NO_AUTOSPAWN=1`; override
+  the port with `COMFYUI_MCP_BRIDGE_PORT`. Requires comfyui-mcp ≥ 0.14.
+- **Lifecycle beacon.** The pack passes its PID so the orchestrator shuts down
+  when ComfyUI exits — including crashes/hard-kills — with an `atexit` teardown
+  on clean shutdown too. No orphan left holding the bridge port.
+
+### Changed
+
+- **Connection UI reflects the orchestrator model.** The settings help text and
+  header no longer tell you to wire the MCP into your interactive session with
+  `--channels` (which would steal the bridge port from the orchestrator); they
+  now describe the autonomous background agent and the one-time
+  `npx -y comfyui-mcp --panel-orchestrator` fallback.
+
 ## [0.3.0] - 2026-06-16
 
 The polished public release — now live on the [Comfy Registry](https://registry.comfy.org/nodes/comfyui-mcp-panel) and installable from ComfyUI-Manager.
