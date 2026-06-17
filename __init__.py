@@ -5,22 +5,23 @@ Two jobs:
 1. Serve the sidebar panel JS (``web/js/comfyui-mcp-panel.js``) to the ComfyUI
    frontend via ``WEB_DIRECTORY`` (this pack ships no Python nodes).
 
-2. Best-effort **auto-start the panel orchestrator** so the panel "just works":
-   open ComfyUI, type in the Agent sidebar. The orchestrator
+2. Expose a tiny **local** API the panel's **Connect** button calls to start the
+   panel orchestrator on demand. The orchestrator
    (``npx -y comfyui-mcp --panel-orchestrator``) owns the loopback bridge the
    panel connects to and drives it with a background Claude Agent SDK session
    running on the user's Claude SUBSCRIPTION — no LLM API keys, and the user's
    interactive Claude session stays free.
 
-Prerequisites for the agent to work: Node.js/``npx`` on PATH, and a Claude login
-(run ``claude`` once, or ``claude setup-token``). If either is missing the panel
-still loads and shows how to finish setup.
+The orchestrator is started **only when the user clicks Connect** (an explicit,
+authenticated, local action through ComfyUI's own server) — never at import
+time. Prerequisites for the agent to work: Node.js/``npx`` on PATH, and a Claude
+login (run ``claude`` once, or ``claude setup-token``).
 
 Env knobs:
-- ``COMFYUI_MCP_NO_AUTOSPAWN=1`` — don't auto-start (e.g. you run the
-  orchestrator yourself).
 - ``COMFYUI_MCP_BRIDGE_PORT`` — bridge port to check/own (default 9101).
 - ``COMFYUI_URL`` — ComfyUI the agent generates against (auto-detected otherwise).
+- ``COMFYUI_MCP_NO_AUTOSPAWN=1`` — the Connect route won't spawn; it only reports
+  status (use when you run the orchestrator yourself).
 """
 
 import atexit
@@ -44,6 +45,10 @@ _orchestrator_proc = None
 
 def _log(msg):
     print("[comfyui-mcp-panel] " + msg)
+
+
+def _no_autospawn():
+    return os.environ.get("COMFYUI_MCP_NO_AUTOSPAWN", "").lower() in ("1", "true", "yes")
 
 
 def _port_in_use(host, port):
@@ -70,28 +75,34 @@ def _detect_comfyui_url():
     return "http://{}:{}".format(host, port)
 
 
-def _maybe_start_orchestrator():
+def _orchestrator_running():
+    """True if something already owns the bridge port (our spawn or the user's)."""
+    return _port_in_use(_BRIDGE_HOST, _BRIDGE_PORT)
+
+
+def _start_orchestrator():
+    """Start the panel orchestrator on demand. Returns (ok: bool, message: str).
+
+    Called only from the Connect route — i.e. an explicit user action — never at
+    import time. Idempotent: if the bridge port is already owned, it's a no-op.
+    """
     global _orchestrator_proc
 
-    if os.environ.get("COMFYUI_MCP_NO_AUTOSPAWN", "").lower() in ("1", "true", "yes"):
-        return
+    if _orchestrator_running():
+        return True, "already running"
 
-    # Someone already owns the bridge port (a manual orchestrator, or another
-    # ComfyUI instance) — don't spawn a second one; it could never bind anyway.
-    if _port_in_use(_BRIDGE_HOST, _BRIDGE_PORT):
-        _log(
-            "bridge port {} already in use — assuming the panel orchestrator is "
-            "running.".format(_BRIDGE_PORT)
+    if _no_autospawn():
+        return False, (
+            "auto-start is disabled (COMFYUI_MCP_NO_AUTOSPAWN). Start it yourself: "
+            "npx -y comfyui-mcp --panel-orchestrator"
         )
-        return
 
     npx = shutil.which("npx") or shutil.which("npx.cmd")
     if not npx:
-        _log(
-            "Node.js/npx not found on PATH — can't auto-start the panel agent. "
-            "Install Node, then run: npx -y comfyui-mcp --panel-orchestrator"
+        return False, (
+            "Node.js/npx not found on PATH. Install Node, then click Connect again "
+            "(or run: npx -y comfyui-mcp --panel-orchestrator)."
         )
-        return
 
     env = dict(os.environ)
     env["COMFYUI_URL"] = _detect_comfyui_url()
@@ -114,19 +125,14 @@ def _maybe_start_orchestrator():
     try:
         _orchestrator_proc = subprocess.Popen(cmd, **kwargs)
     except Exception as exc:  # noqa: BLE001 - surface any spawn failure to the user
-        _log(
-            "could not auto-start the panel orchestrator: {}\n"
-            "  Start it manually: npx -y comfyui-mcp --panel-orchestrator".format(exc)
-        )
-        return
+        return False, "could not start the panel orchestrator: {}".format(exc)
 
-    _log(
-        "started the panel orchestrator (pid {}) on ws://{}:{} — the agent runs "
-        "on your Claude subscription. Sign in with `claude` if prompts fail.".format(
-            _orchestrator_proc.pid, _BRIDGE_HOST, _BRIDGE_PORT
-        )
-    )
     atexit.register(_stop_orchestrator)
+    _log(
+        "started the panel orchestrator (pid {}) on ws://{}:{} — runs on your "
+        "Claude subscription.".format(_orchestrator_proc.pid, _BRIDGE_HOST, _BRIDGE_PORT)
+    )
+    return True, "started (pid {})".format(_orchestrator_proc.pid)
 
 
 def _stop_orchestrator():
@@ -139,4 +145,46 @@ def _stop_orchestrator():
     _orchestrator_proc = None
 
 
-_maybe_start_orchestrator()
+# ---------------------------------------------------------------------------
+# Local API the panel's Connect button calls. Registering aiohttp routes at
+# import is standard for custom nodes (no subprocess is spawned here); the
+# orchestrator only launches when the user POSTs /connect.
+# ---------------------------------------------------------------------------
+def _register_routes():
+    try:
+        from server import PromptServer  # type: ignore
+        from aiohttp import web  # type: ignore
+    except Exception:
+        # Headless / non-standard host without PromptServer — the panel still
+        # loads; the user runs the orchestrator manually.
+        return
+
+    routes = PromptServer.instance.routes
+
+    @routes.get("/comfyui_mcp_panel/status")
+    async def _status(_request):
+        return web.json_response(
+            {
+                "running": _orchestrator_running(),
+                "port": _BRIDGE_PORT,
+                "can_spawn": not _no_autospawn() and bool(shutil.which("npx") or shutil.which("npx.cmd")),
+            }
+        )
+
+    @routes.post("/comfyui_mcp_panel/connect")
+    async def _connect(_request):
+        ok, message = _start_orchestrator()
+        return web.json_response(
+            {"ok": ok, "running": _orchestrator_running(), "port": _BRIDGE_PORT, "message": message},
+            status=200 if ok else 503,
+        )
+
+    @routes.post("/comfyui_mcp_panel/disconnect")
+    async def _disconnect(_request):
+        # Only stops an orchestrator THIS pack spawned; a user-run one is left be.
+        spawned = _orchestrator_proc is not None
+        _stop_orchestrator()
+        return web.json_response({"ok": True, "stopped": spawned, "running": _orchestrator_running()})
+
+
+_register_routes()

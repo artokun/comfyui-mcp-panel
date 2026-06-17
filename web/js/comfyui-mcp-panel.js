@@ -638,6 +638,22 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAgentStatus }
     currentUrl() {
       return url;
     },
+    isConnected() {
+      return !!sock && sock.readyState === WebSocket.OPEN;
+    },
+    stop() {
+      // Close the socket and stop reconnecting, but stay re-startable (unlike
+      // destroy, which also tears down the title observer for good).
+      closed = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      try {
+        sock?.close();
+      } catch {}
+      sock = null;
+    },
     destroy() {
       closed = true;
       titleObserver?.disconnect();
@@ -1029,15 +1045,36 @@ function buildPanel() {
   urlInput.value = loadBridgeUrl();
   urlInput.placeholder = DEFAULT_BRIDGE_URL;
 
+  // Primary action: starts the background agent on demand (via ComfyUI's own
+  // server) and connects. Nothing is ever spawned without this click.
+  const connectBtn = document.createElement("button");
+  connectBtn.className = "cmcp-btn";
+  connectBtn.type = "button";
+  connectBtn.textContent = "Connect";
+  connectBtn.style.cssText =
+    "background:var(--p-primary-color,#2563eb);color:var(--p-primary-contrast-color,#fff);border-color:transparent;";
+
+  const disconnectBtn = document.createElement("button");
+  disconnectBtn.className = "cmcp-btn";
+  disconnectBtn.type = "button";
+  disconnectBtn.textContent = "Disconnect";
+  disconnectBtn.hidden = true;
+
   const saveBtn = document.createElement("button");
   saveBtn.className = "cmcp-btn";
   saveBtn.type = "button";
   saveBtn.textContent = "Reconnect";
+  saveBtn.title = "Re-open the bridge connection at the URL above";
+  saveBtn.style.opacity = "0.8";
+
+  const btnRow = document.createElement("div");
+  btnRow.style.cssText = "display:flex;gap:0.375rem;align-items:center;flex-wrap:wrap;";
+  btnRow.append(connectBtn, disconnectBtn, saveBtn);
 
   const helpDiv = document.createElement("div");
   helpDiv.className = "cmcp-help";
   helpDiv.textContent =
-    "This panel is driven by an autonomous background agent on your Claude subscription — no API keys. Sign in to Claude once (run `claude`), then start the panel agent:";
+    "Click Connect to start an autonomous agent on your Claude subscription — no API keys. Sign in to Claude once (run `claude`) first. Prefer to run it yourself? Start the orchestrator, then Connect:";
   const helpCmd = document.createElement("code");
   helpCmd.className = "cmcp-cmd";
   helpCmd.textContent = "npx -y comfyui-mcp --panel-orchestrator";
@@ -1050,7 +1087,9 @@ function buildPanel() {
   });
   helpDiv.appendChild(helpCmd);
 
-  settingsBody.append(urlLabel, urlInput, saveBtn, helpDiv);
+  settingsBody.append(urlLabel, urlInput, btnRow, helpDiv);
+  // Open by default so Connect is visible until the agent is connected.
+  settingsBox.open = true;
   settingsBox.append(settingsSummary, settingsBody);
   root.appendChild(settingsBox);
 
@@ -1416,7 +1455,12 @@ function buildPanel() {
       statusText.textContent = state;
       dot.className = "cmcp-dot" + (state === "connected" ? " connected" : state === "connecting" ? " connecting" : "");
       settingsBox.open = state !== "connected";
-      if (state !== "connected") hideThinking();
+      const connected = state === "connected";
+      connectBtn.hidden = connected;
+      disconnectBtn.hidden = !connected;
+      connectBtn.disabled = state === "connecting";
+      connectBtn.textContent = state === "connecting" ? "Connecting…" : "Connect";
+      if (!connected) hideThinking();
     },
     onSay(text) {
       hideThinking();
@@ -1438,6 +1482,42 @@ function buildPanel() {
   saveBtn.addEventListener("click", () => {
     client.setUrl(urlInput.value.trim());
     appendSystem(`Reconnecting to ${client.currentUrl()}…`);
+  });
+
+  // Connect: ask ComfyUI's server to start the background agent on demand, then
+  // open the bridge. The orchestrator is only ever spawned by this click.
+  async function connectAgent() {
+    connectBtn.disabled = true;
+    connectBtn.textContent = "Starting…";
+    try {
+      const res = await api.fetchApi("/comfyui_mcp_panel/connect", { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!data?.ok && data?.message) appendSystem(data.message);
+    } catch (err) {
+      // No /connect route (older/headless host) — fall through and try the
+      // bridge directly in case the user started the orchestrator themselves.
+      appendSystem(`Couldn't reach ComfyUI to start the agent: ${err?.message ?? err}`);
+    }
+    // Connect (or keep reconnecting with backoff until the bridge binds).
+    client.start();
+  }
+  connectBtn.addEventListener("click", connectAgent);
+
+  disconnectBtn.addEventListener("click", async () => {
+    client.stop();
+    connectBtn.hidden = false;
+    disconnectBtn.hidden = true;
+    connectBtn.disabled = false;
+    connectBtn.textContent = "Connect";
+    statusText.textContent = "disconnected";
+    dot.className = "cmcp-dot";
+    settingsBox.open = true;
+    try {
+      await api.fetchApi("/comfyui_mcp_panel/disconnect", { method: "POST" });
+    } catch {
+      // best-effort; a user-run orchestrator is intentionally left running
+    }
+    appendSystem("Disconnected. Click Connect to start again.");
   });
 
   // ---- slash commands (run locally, no agent round-trip) ----
@@ -1715,7 +1795,7 @@ function buildPanel() {
       input.value = "";
       input.style.height = "auto";
     } else {
-      appendSystem("Not connected — start the bridge (see Connection) and try again.");
+      appendSystem("Not connected — click Connect (in the Connection panel) and try again.");
       settingsBox.open = true;
     }
   });
@@ -1756,7 +1836,18 @@ function buildPanel() {
     refreshMenu();
   });
 
-  client.start();
+  // On load, only auto-connect if a bridge is already up (you started the
+  // orchestrator yourself, or another tab did). Otherwise sit idle behind the
+  // Connect button — we never start a process without an explicit click.
+  (async () => {
+    try {
+      const res = await api.fetchApi("/comfyui_mcp_panel/status");
+      const data = await res.json().catch(() => ({}));
+      if (data?.running) client.start();
+    } catch {
+      // No status route — leave the Connect button for the user to drive.
+    }
+  })();
 
   return {
     root,

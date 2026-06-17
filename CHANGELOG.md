@@ -4,6 +4,27 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.1] - 2026-06-17
+
+Start the agent with a **Connect** button instead of auto-spawning it on load.
+The Comfy Registry's security scanner flagged 0.4.0 because the pack launched a
+subprocess (`npx … --panel-orchestrator`) at import time. Now nothing spawns
+until you explicitly click Connect — the registry-safe pattern — and the panel
+still auto-connects when a bridge is already running.
+
+### Changed
+
+- **Connect button replaces import-time auto-spawn.** `__init__.py` no longer
+  starts the orchestrator when ComfyUI imports the pack. Instead it registers a
+  small local API on ComfyUI's own server (`/comfyui_mcp_panel/{status,connect,
+  disconnect}`), and the panel's **Connect** button starts the orchestrator on
+  demand — an explicit, authenticated, local action. On load the panel only
+  auto-connects if a bridge is *already* running (you started it, or another
+  tab did); otherwise it waits behind the Connect button. A **Disconnect**
+  button stops an orchestrator the pack started. `COMFYUI_MCP_NO_AUTOSPAWN=1`
+  now makes Connect report status without spawning; `COMFYUI_MCP_BRIDGE_PORT`
+  still overrides the port. Fixes the `NodeVersionStatusFlagged` 0.4.0 release.
+
 ## [0.4.0] - 2026-06-17
 
 The panel now drives itself: it auto-starts an autonomous background agent on

@@ -37,21 +37,36 @@ git clone https://github.com/artokun/comfyui-mcp-panel
 
 Restart ComfyUI. A new **Agent** tab (💬) appears in the sidebar.
 
-## Connect your Claude session
+## Connect
 
-Add `comfyui-mcp` to Claude Code with channels mode (Node ≥ 22):
+Sign in to Claude once so the agent can run on your subscription (Node ≥ 22):
+
+```bash
+claude        # or: claude setup-token
+```
+
+Open the **Agent** tab and click **Connect**. The panel starts an autonomous
+background agent — `npx -y comfyui-mcp --panel-orchestrator`, running on your
+Claude **subscription** (no API keys) — and the status pill turns green. Type a
+request ("build a Flux txt2img graph and run it") and watch the edits land on
+your canvas. **Disconnect** stops the agent; nothing is ever started without
+your click.
+
+The bridge is loopback-only (`ws://127.0.0.1:9101`, set via
+`COMFYUI_MCP_BRIDGE_PORT`). To run the orchestrator yourself, set
+`COMFYUI_MCP_NO_AUTOSPAWN=1` and launch it manually, then click Connect.
+
+### Advanced: drive the graph from your own Claude Code session
+
+Prefer to use *your own* interactive session as the agent? Run the bridge in
+channels mode instead, then click Connect:
 
 ```bash
 claude mcp add comfyui -- npx -y comfyui-mcp --channels
 ```
 
-That's it. The panel auto-connects to the bridge at `ws://127.0.0.1:9101`
-(configurable in the panel's Connection section / `COMFYUI_MCP_BRIDGE_PORT`).
-The status pill turns green when both sides are up.
-
-Then either:
 - **talk in your Claude terminal**: "check panel_status, then add a CheckpointLoaderSimple to my graph" — Claude uses the `panel_*` tools and the edits appear live;
-- **or type in the panel**: messages are pushed straight into your Claude Code session as channel events — Claude sees them immediately and replies into the panel with `panel_say`. (Hosts without channel support can pull via `panel_inbox`.)
+- **or type in the panel**: messages are pushed straight into your Claude Code session as channel events — Claude replies into the panel with `panel_say`. (Hosts without channel support can pull via `panel_inbox`.)
 
 ## What the agent can do to your graph
 
