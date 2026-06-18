@@ -225,6 +225,32 @@ async function groundUnsavedWorkflow() {
   return null;
 }
 
+/** Call the BUILT-IN ComfyUI Manager v2 API (the same surface the "Extensions"
+ *  UI uses via useComfyManagerService). Because the panel runs inside the
+ *  frontend, api.fetchApi resolves the identical URL the UI hits — so this works
+ *  against the bundled Desktop Manager without the MCP/cm-cli path. */
+async function managerV2(route, { method = "GET", body } = {}) {
+  const res = await api.fetchApi(`/v2/${route}`, {
+    method,
+    ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
+  });
+  if (!res || res.status === 404) {
+    throw new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)");
+  }
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try {
+      const j = await res.json();
+      if (j?.message) msg = j.message;
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new Error(`Manager ${route}: ${msg}`);
+  }
+  const txt = await res.text();
+  return txt ? JSON.parse(txt) : null;
+}
+
 /** Build a ComfyUI /view URL for an output image descriptor. */
 function imageViewUrl(img) {
   const qs = new URLSearchParams({
@@ -761,6 +787,74 @@ const GRAPH_TOOL_EXECUTORS = {
         from_nodes: ns.map((n) => n.id),
       },
     };
+  },
+
+  // --- Custom-node management via the BUILT-IN ComfyUI Manager (/v2 API) ----
+  async nodes_search({ query, limit }) {
+    const data = await managerV2("customnode/getmappings?mode=cache");
+    const q = String(query ?? "").toLowerCase();
+    const out = [];
+    const push = (id, title, desc) => {
+      if (!id) return;
+      const hay = `${id} ${title ?? ""} ${desc ?? ""}`.toLowerCase();
+      if (!q || hay.includes(q)) {
+        out.push({ id, title: title ?? id, description: String(desc ?? "").slice(0, 160) });
+      }
+    };
+    if (Array.isArray(data)) {
+      for (const p of data) push(p.id ?? p.reference ?? p.title, p.title, p.description);
+    } else if (data && typeof data === "object") {
+      // getmappings is keyed by repo/url → [ [classNames…], { title, description, … } ]
+      for (const [key, val] of Object.entries(data)) {
+        const meta = Array.isArray(val) ? val[1] : val;
+        push(meta?.id ?? meta?.title ?? key, meta?.title, meta?.description);
+      }
+    }
+    const max = Math.min(Number(limit) || 15, 40);
+    return { count: out.length, results: out.slice(0, max) };
+  },
+
+  async nodes_list() {
+    return { installed: await managerV2("customnode/installed") };
+  },
+
+  async nodes_install({ id, version, repository, channel, mode, selected_version }) {
+    if (!id && !repository) {
+      throw new Error("id (registry id or author/repo) or repository (git URL) is required");
+    }
+    const sel = selected_version || version || (repository ? "nightly" : "latest");
+    const params = {
+      id: id ?? repository,
+      version: version || (sel === "nightly" ? "nightly" : "latest"),
+      selected_version: sel,
+      ...(repository ? { repository } : {}),
+      mode: mode || "remote",
+      channel: channel || "default",
+    };
+    const ui_id = crypto.randomUUID();
+    const client_id = api.clientId ?? api.initialClientId ?? "comfyui-mcp-panel";
+    await managerV2("manager/queue/task", {
+      method: "POST",
+      body: { kind: "install", params, ui_id, client_id },
+    });
+    await managerV2("manager/queue/start", { method: "POST" });
+    return {
+      queued: true,
+      ui_id,
+      id: params.id,
+      note: "Install queued. Poll nodes_queue_status; a ComfyUI restart (comfy_reboot) is usually required to load new nodes.",
+    };
+  },
+
+  async nodes_queue_status() {
+    return { status: await managerV2("manager/queue/status") };
+  },
+
+  async comfy_reboot() {
+    // Restart the ComfyUI server (to load newly installed nodes). ComfyUI and the
+    // orchestrator go down briefly; the panel auto-reconnects + resumes after.
+    await managerV2("manager/reboot", { method: "POST" });
+    return { rebooting: true };
   },
 };
 
