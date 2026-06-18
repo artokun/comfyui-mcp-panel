@@ -1279,8 +1279,9 @@ const PANEL_CSS = `
   animation: cmcp-in 0.18s ease-out;
 }
 .cmcp-card.error { border-left-color: var(--p-red-400, #f87171); }
-.cmcp-card-head { display: flex; align-items: center; gap: 0.375rem; font-weight: 600; }
-.cmcp-card-head .pi { font-size: 0.75rem; color: var(--p-primary-color, #60a5fa); }
+.cmcp-card-head { display: flex; align-items: center; gap: 0.375rem; font-weight: 600; min-width: 0; }
+.cmcp-card-head .pi { font-size: 0.75rem; color: var(--p-primary-color, #60a5fa); flex: none; }
+.cmcp-card-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cmcp-card.error .cmcp-card-head .pi { color: var(--p-red-400, #f87171); }
 .cmcp-card-detail {
   margin-top: 0.25rem; color: var(--p-text-muted-color, #a1a1aa);
@@ -1962,7 +1963,9 @@ function buildPanel() {
     const i = document.createElement("i");
     i.className = `pi ${icon}`;
     const t = document.createElement("span");
+    t.className = "cmcp-card-text";
     t.textContent = text;
+    t.title = text; // full value on hover (the line is ellipsized)
     head.append(i, t);
     card.appendChild(head);
     if (detail) {
