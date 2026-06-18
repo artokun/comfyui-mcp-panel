@@ -1331,6 +1331,16 @@ const PANEL_CSS = `
   max-height: 7.5rem; overflow-y: auto;
 }
 
+.cmcp-dropzone {
+  position: absolute; inset: 6px; z-index: 60;
+  display: flex; align-items: center; justify-content: center;
+  border: 2px dashed var(--p-primary-color, #3b82f6);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--p-primary-color, #3b82f6) 14%, transparent);
+  color: var(--p-primary-color, #60a5fa); font-weight: 600; font-size: 0.95rem;
+  pointer-events: none; animation: cmcp-in 0.12s ease-out;
+}
+.cmcp-dropzone span { display: inline-flex; align-items: center; gap: 0.5rem; }
 .cmcp-thinking {
   align-self: flex-start; display: flex; align-items: center; gap: 0.5rem;
   padding: 0.5rem 0.75rem;
@@ -2189,6 +2199,7 @@ function buildPanel() {
     ssSet(CURRENT_THREAD_KEY, null);
     ssSet(SESSION_KEY, null);
     ssSet(CTX_KEY, null);
+    if (typeof resetAttachments === "function") resetAttachments();
     resetFeed();
     setContextPct(0);
     ctxLabel.textContent = "—";
@@ -2788,6 +2799,119 @@ function buildPanel() {
     }
   });
 
+  // ---- attachments: drag-drop / paste images + paste large text ----------
+  // Claude-Code style: a dropped/pasted image uploads into ComfyUI input/ and
+  // drops a [Image #N] chip in the composer; a big text paste collapses to a
+  // [Pasted text #N] chip. On send, pasted text expands inline and images are
+  // referenced (the agent can view_image them or wire a LoadImage node).
+  const PASTE_TEXT_THRESHOLD = 800; // chars; longer pastes collapse to a chip
+  let attachments = []; // { id, kind:"image"|"text", ... }
+  let attachSeq = 0;
+  function resetAttachments() {
+    attachments = [];
+    attachSeq = 0;
+  }
+  function readAsDataURL(file) {
+    return new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(fr.result);
+      fr.onerror = reject;
+      fr.readAsDataURL(file);
+    });
+  }
+  function handleImageFile(file) {
+    if (!file || !file.type?.startsWith("image/")) return;
+    const id = ++attachSeq;
+    const ext = (file.type.split("/")[1] || "png").replace("jpeg", "jpg");
+    const name = file.name || `pasted-${id}.${ext}`;
+    const att = { id, kind: "image", name, mediaType: file.type, dataUrl: null, inputRef: null };
+    attachments.push(att);
+    insertAtCaret(`[Image #${id}] `);
+    // Read for a thumbnail + upload to ComfyUI input/ (both async); submit awaits.
+    att.ready = (async () => {
+      try {
+        att.dataUrl = await readAsDataURL(file);
+      } catch {
+        /* no preview */
+      }
+      try {
+        const fd = new FormData();
+        fd.append("image", file, name);
+        const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
+        if (res.status === 200) {
+          const info = await res.json();
+          att.inputRef = (info.subfolder ? `${info.subfolder}/` : "") + info.name;
+        }
+      } catch {
+        /* upload failed — manifest notes it */
+      }
+    })();
+  }
+  function handlePastedText(text) {
+    const id = ++attachSeq;
+    attachments.push({ id, kind: "text", content: text });
+    insertAtCaret(`[Pasted text #${id}] `);
+  }
+
+  // Drop overlay (border dropzone effect on drag-over).
+  root.style.position = root.style.position || "relative";
+  const dropzone = document.createElement("div");
+  dropzone.className = "cmcp-dropzone";
+  dropzone.hidden = true;
+  dropzone.innerHTML = '<span><i class="pi pi-image"></i> Drop image to attach</span>';
+  root.appendChild(dropzone);
+  let dragDepth = 0;
+  const dragHasFiles = (ev) => Array.from(ev.dataTransfer?.types || []).includes("Files");
+  root.addEventListener("dragenter", (ev) => {
+    if (!dragHasFiles(ev)) return;
+    ev.preventDefault();
+    dragDepth += 1;
+    dropzone.hidden = false;
+  });
+  root.addEventListener("dragover", (ev) => {
+    if (!dragHasFiles(ev)) return;
+    ev.preventDefault();
+    if (ev.dataTransfer) ev.dataTransfer.dropEffect = "copy";
+  });
+  root.addEventListener("dragleave", (ev) => {
+    if (!dragHasFiles(ev)) return;
+    dragDepth -= 1;
+    if (dragDepth <= 0) {
+      dragDepth = 0;
+      dropzone.hidden = true;
+    }
+  });
+  root.addEventListener("drop", (ev) => {
+    if (!dragHasFiles(ev)) return;
+    ev.preventDefault();
+    dragDepth = 0;
+    dropzone.hidden = true;
+    for (const f of Array.from(ev.dataTransfer.files || [])) {
+      if (f.type?.startsWith("image/")) handleImageFile(f);
+    }
+    input.focus();
+  });
+  input.addEventListener("paste", (ev) => {
+    const dt = ev.clipboardData;
+    if (!dt) return;
+    const imgItem = Array.from(dt.items || []).find(
+      (it) => it.kind === "file" && it.type?.startsWith("image/"),
+    );
+    if (imgItem) {
+      const file = imgItem.getAsFile();
+      if (file) {
+        ev.preventDefault();
+        handleImageFile(file);
+        return;
+      }
+    }
+    const text = dt.getData("text/plain");
+    if (text && (text.length > PASTE_TEXT_THRESHOLD || (text.match(/\n/g) || []).length >= 12)) {
+      ev.preventDefault();
+      handlePastedText(text);
+    }
+  });
+
   // ---- voice dictation (browser speech recognition; Chrome) ----
   const SR = window.SpeechRecognition ?? window.webkitSpeechRecognition;
   let recognition = null;
@@ -2846,6 +2970,26 @@ function buildPanel() {
     showThinking();
     input.value = "";
     input.style.height = "auto";
+
+    // Resolve attachment chips referenced in this message (the user may have
+    // deleted some), then clear the registry for the next message.
+    const refImgs = attachments.filter((a) => a.kind === "image" && text.includes(`[Image #${a.id}]`));
+    const refTexts = attachments.filter((a) => a.kind === "text" && text.includes(`[Pasted text #${a.id}]`));
+    resetAttachments();
+    if (refImgs.length) await Promise.all(refImgs.map((a) => a.ready));
+    for (const a of refImgs) if (a.dataUrl) paintImage(a.dataUrl, a.name);
+
+    // Compose the text the AGENT receives: pasted text expands inline; images
+    // are referenced by their ComfyUI input path (it can view_image / LoadImage).
+    let sendText = text;
+    for (const a of refTexts) sendText = sendText.split(`[Pasted text #${a.id}]`).join(a.content);
+    if (refImgs.length) {
+      const lines = refImgs
+        .map((a) => `#${a.id} → ${a.inputRef ? `ComfyUI input/${a.inputRef}` : "(upload failed)"}`)
+        .join(", ");
+      sendText += `\n\n[Attached image(s) — view them with the view_image tool, or load via a LoadImage node: ${lines}]`;
+    }
+
     // Ground a brand-new chat: if the open workflow was never saved, save it
     // first so the agent works from a real file (Ctrl+S / reload behave).
     if (freshChat) {
@@ -2860,7 +3004,7 @@ function buildPanel() {
     } catch {
       // graph unavailable — send without subgraph context
     }
-    client.sendUserMessage(text, {
+    client.sendUserMessage(sendText, {
       workflow: getWorkflowTitle(),
       ...(viewing.scope === "subgraph" ? { subgraph: viewing.title } : {}),
     });
