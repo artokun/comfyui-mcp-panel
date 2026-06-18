@@ -119,6 +119,41 @@ const REBOOT_KEY = "comfyui-mcp.panel.rebootResume";
 // agent-triggered reload mid-task — nudge it to continue. Survives the bridge
 // drop via sessionStorage.
 const SOFT_RELOAD_KEY = "comfyui-mcp.panel.softReloadResume";
+// One-shot flag set right before a frontend (page) reload WE trigger, so that
+// after the reload we re-activate our own sidebar tab. ComfyUI restores the
+// last active tab BEFORE our extension re-registers it, so it can't reopen ours
+// on its own — we do it once registration is back.
+const SIDEBAR_REOPEN_KEY = "comfyui-mcp.panel.reopenSidebar";
+/** Our sidebar tab id — referenced by both the opener and the registration. */
+const SIDEBAR_TAB_ID = "comfyui-mcp.agent";
+
+/**
+ * Best-effort: make our sidebar tab the active one. ComfyUI exposes this a few
+ * different ways across versions, so try them in order and stop at the first
+ * that takes. No-op if it's already active.
+ */
+function openSidebarTab() {
+  const em = (typeof app !== "undefined" && app) ? app.extensionManager : null;
+  if (!em) return false;
+  const store = em.sidebarTab || em;
+  const active = () => store.activeSidebarTabId ?? em.activeSidebarTabId;
+  try {
+    if (active() === SIDEBAR_TAB_ID) return true; // already open — nothing to do
+    // Prefer an IDEMPOTENT set (never closes the tab); fall back to toggle only
+    // after confirming our tab isn't the active one (so toggle can't close it).
+    if (typeof em.setActiveSidebarTab === "function") em.setActiveSidebarTab(SIDEBAR_TAB_ID);
+    else { try { store.activeSidebarTabId = SIDEBAR_TAB_ID; } catch { /* not writable */ } }
+    if (active() === SIDEBAR_TAB_ID) return true;
+    if (typeof store.toggleSidebarTab === "function") store.toggleSidebarTab(SIDEBAR_TAB_ID);
+    else if (typeof em.toggleSidebarTab === "function") em.toggleSidebarTab(SIDEBAR_TAB_ID);
+    else em.command?.execute?.(`Workspace.ToggleSidebarTab.${SIDEBAR_TAB_ID}`);
+    return active() === SIDEBAR_TAB_ID;
+  } catch (e) {
+    console.warn("[comfyui-mcp-panel] couldn't open sidebar tab:", e);
+    return false;
+  }
+}
+
 function ssGet(key) {
   try {
     return window.sessionStorage.getItem(key) || null;
@@ -855,6 +890,49 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
+  // Rename a node's TITLE (the label on its header) — distinct from widget values.
+  graph_set_title({ node_id, title }) {
+    const { graph } = getGraphCtx();
+    const node = resolveNode(graph, node_id);
+    const previous = node.title;
+    graph.beforeChange?.();
+    try {
+      node.title = String(title ?? "");
+    } finally {
+      graph.afterChange?.();
+    }
+    graph.setDirtyCanvas?.(true, true);
+    return { node_id: node.id, previous, title: node.title };
+  },
+
+  // Navigate INTO a subgraph node so the canvas (and therefore every graph_*
+  // editor) targets its inner graph — the way to read/edit nodes inside a
+  // subgraph. Pair with graph_exit_subgraph to return to the root.
+  graph_enter_subgraph({ node_id }) {
+    const { graph, canvas } = getGraphCtx();
+    const node = resolveNode(graph, node_id);
+    const sub = node.subgraph;
+    if (!sub) throw new Error(`Node ${node.id} (${node.type}) is not a subgraph`);
+    if (typeof canvas.openSubgraph !== "function") {
+      throw new Error("subgraph navigation unavailable on this frontend");
+    }
+    canvas.openSubgraph(sub, node);
+    canvas.setDirty?.(true, true);
+    return { entered: node.id, viewing: describeActiveGraph(getGraphCtx().graph) };
+  },
+
+  // Leave the current subgraph and return to the root graph.
+  graph_exit_subgraph() {
+    const { graph, canvas, rootGraph } = getGraphCtx();
+    if (graph === rootGraph) return { viewing: { scope: "root" }, note: "already at root" };
+    if (typeof canvas.setGraph !== "function") {
+      throw new Error("subgraph navigation unavailable on this frontend");
+    }
+    canvas.setGraph(graph.rootGraph ?? rootGraph);
+    canvas.setDirty?.(true, true);
+    return { viewing: describeActiveGraph(getGraphCtx().graph) };
+  },
+
   // --- Custom-node management via the BUILT-IN ComfyUI Manager (/v2 API) ----
   async nodes_search({ query, limit }) {
     const data = await managerV2("customnode/getmappings?mode=cache");
@@ -1045,8 +1123,12 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret
         } catch {
           // Socket died between receive and reply — agent side times out.
         }
-        // ask_user paints its own card; other commands get an activity card.
-        if (msg.cmd !== "ask_user") onCommand?.(msg.cmd, msg, reply);
+        // ask_user / request_secret paint their OWN cards and their replies carry
+        // user input (a choice, or a SECRET) — never echo them as an activity card
+        // (and never record them). Other commands get the normal activity card.
+        if (msg.cmd !== "ask_user" && msg.cmd !== "request_secret") {
+          onCommand?.(msg.cmd, msg, reply);
+        }
         return;
       }
       if (msg && msg.type === "say" && typeof msg.text === "string") {
@@ -1519,6 +1601,10 @@ const PANEL_CSS = `
 .cmcp-popover-item .pi { font-size: 0.75rem; color: var(--p-text-muted-color, #a1a1aa); flex: none; }
 .cmcp-popover-item small { margin-left: auto; color: var(--p-text-muted-color, #a1a1aa); flex: none; padding-left: 0.5rem; }
 .cmcp-popover-item .lbl { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Slash commands: keep the short /command always visible and let the (often
+   long) hint truncate instead — otherwise a long hint collapsed the label. */
+.cmcp-popover-item.cmcp-slash .lbl { flex: 0 0 auto; }
+.cmcp-popover-item.cmcp-slash small { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cmcp-status-btn {
   display: inline-flex; align-items: center; gap: 0.3125rem;
   background: none; border: none; cursor: pointer; font: inherit; color: inherit;
@@ -2316,6 +2402,10 @@ function buildPanel() {
       "flex:1;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
       "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:0.8rem;";
 
+    // Show/record only a masked preview (first 4 … last 4) so the user can
+    // confirm WHICH token without ever exposing the full value.
+    const mask = (v) =>
+      !v ? "" : v.length <= 8 ? "•".repeat(v.length) : `${v.slice(0, 4)}…${v.slice(-4)}`;
     const finish = (value) => {
       if (done) return;
       done = true;
@@ -2324,10 +2414,11 @@ function buildPanel() {
       card.style.cssText = "border-left:3px solid var(--p-green-400,#4ade80);opacity:0.9;";
       const ok = document.createElement("div");
       ok.style.cssText = "font-size:0.75rem;color:var(--p-green-400,#4ade80);";
-      ok.textContent = value ? "🔒 Token received — applied to your config." : "Skipped — no token entered.";
+      const m = mask(value);
+      ok.textContent = value ? `🔒 Token saved: ${m}` : "Skipped — no token entered.";
       card.appendChild(ok);
-      // NB: never record the value; only the redacted outcome.
-      record({ role: "card", icon: "pi-lock", text: msg.label || "Token", detail: value ? "received (hidden)" : "skipped" });
+      // Record ONLY the masked preview — never the full value.
+      record({ role: "card", icon: "pi-lock", text: msg.label || "Token", detail: value ? `saved ${m}` : "skipped" });
       scrollLog();
       resolveFn(value || "");
     };
@@ -2585,6 +2676,8 @@ function buildPanel() {
     "graph_connect",
     "graph_disconnect",
     "graph_create_subgraph",
+    "graph_enter_subgraph",
+    "graph_exit_subgraph",
   ]);
   let autoFitTimer = null;
   function scheduleAutoFit() {
@@ -2815,6 +2908,9 @@ function buildPanel() {
     if (scope === "frontend") {
       // Nothing to respawn — just re-fetch the panel with a cache-bust. The
       // session id persists in sessionStorage, so we reconnect + resume on load.
+      // Arm the reopen flag so our sidebar tab re-activates after the reload
+      // (ComfyUI won't, since our tab isn't registered yet when it restores).
+      ssSet(SIDEBAR_REOPEN_KEY, "1");
       appendSystem("Reloading the panel UI (new frontend code)…");
       try {
         const u = new URL(window.location.href);
@@ -2936,18 +3032,23 @@ function buildPanel() {
     items.forEach((item, idx) => {
       const el = document.createElement("button");
       el.type = "button";
-      el.className = "cmcp-popover-item" + (idx === 0 ? " sel" : "");
+      el.className =
+        "cmcp-popover-item" + (idx === 0 ? " sel" : "") + (item.kind === "slash" ? " cmcp-slash" : "");
       const i = document.createElement("i");
       i.className = `pi ${item.icon}`;
       const lbl = document.createElement("span");
       lbl.className = "lbl";
       lbl.textContent = item.label;
+      lbl.title = item.label;
       el.append(i, lbl);
       if (item.small) {
         const s = document.createElement("small");
         s.textContent = item.small;
+        s.title = item.small;
         el.appendChild(s);
       }
+      // Full text on hover for the whole row, so anything truncated is readable.
+      el.title = item.small ? `${item.label} — ${item.small}` : item.label;
       // mousedown (not click) so the textarea never loses focus.
       el.addEventListener("mousedown", (mev) => {
         mev.preventDefault();
@@ -3555,6 +3656,20 @@ if (!app || typeof app.registerExtension !== "function") {
           "[comfyui-mcp-panel] app.extensionManager.registerSidebarTab is unavailable; " +
             "update ComfyUI to a version that exposes the extension manager.",
         );
+      }
+
+      // If WE just reloaded the page (frontend soft reload), re-open our tab so
+      // the panel mounts and auto-resumes — ComfyUI's own tab-restore ran before
+      // this registration, so it couldn't. Retry a few times since the sidebar
+      // store may not be ready the instant setup() runs.
+      if (ssGet(SIDEBAR_REOPEN_KEY)) {
+        ssSet(SIDEBAR_REOPEN_KEY, null);
+        let tries = 0;
+        const reopen = () => {
+          if (openSidebarTab() || ++tries >= 8) return;
+          setTimeout(reopen, 150);
+        };
+        setTimeout(reopen, 120);
       }
     },
   });
