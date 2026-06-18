@@ -100,6 +100,11 @@ function getTabId() {
 // reload" needs, without two tabs clobbering each other.
 const SESSION_KEY = "comfyui-mcp.panel.sessionId";
 const CURRENT_THREAD_KEY = "comfyui-mcp.panel.currentThreadId";
+// Set when the agent triggers a ComfyUI restart, so that after ComfyUI comes
+// back the panel respawns the orchestrator, resumes the agent session, and
+// nudges it to continue — making install→restart→continue autonomous. Survives
+// a page reload (sessionStorage) in case the restart reloads the frontend.
+const REBOOT_KEY = "comfyui-mcp.panel.rebootResume";
 function ssGet(key) {
   try {
     return window.sessionStorage.getItem(key) || null;
@@ -865,7 +870,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAgentStatus, onSession, onModels, getResume }) {
+function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAgentStatus, onSession, onModels, onAck, getResume }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -874,6 +879,12 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAgentStatus, 
 
   function connect() {
     if (closed) return;
+    // Re-entrancy guard: never open a second socket while one is already
+    // connecting/open (multiple callers — reconnect timer, post-restart resume,
+    // Connect button — can race).
+    if (sock && (sock.readyState === WebSocket.CONNECTING || sock.readyState === WebSocket.OPEN)) {
+      return;
+    }
     onStatus("connecting");
     try {
       sock = new WebSocket(url);
@@ -936,6 +947,12 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAgentStatus, 
       // Live model catalog from the orchestrator (SDK-probed).
       if (msg && msg.type === "models" && Array.isArray(msg.models)) {
         onModels?.(msg.models, typeof msg.current === "string" ? msg.current : undefined);
+      }
+      // Structured acks (ready / working / options / …). The "ready" ack is sent
+      // after the orchestrator has processed hello (resume armed), so it's the
+      // reliable signal to send a post-restart resume nudge.
+      if (msg && msg.type === "ack") {
+        onAck?.(msg);
       }
       // "echo" frames are ignored — we render the user bubble locally on send.
     });
@@ -2176,6 +2193,9 @@ function buildPanel() {
       // once the live catalog arrives, so the push happens in applyModelCatalog
       // — sending an unvalidated fallback id can wedge the agent on a model the
       // account can't use.
+      // (Post-restart resume is handled in onAck on the "ready" ack, which the
+      // orchestrator sends only AFTER it has armed hello.resume — so the nudge
+      // can't out-race the session resume.)
     },
     onSay(text) {
       hideThinking();
@@ -2187,6 +2207,12 @@ function buildPanel() {
     onCommand(cmd, msg, reply) {
       appendActivity(cmd, msg, reply);
       bumpThinking();
+      // The agent restarted ComfyUI — arm the auto-resume so we reconnect and
+      // nudge it to continue once ComfyUI is back (install→restart→continue).
+      if (cmd === "comfy_reboot" && reply.ok) {
+        ssSet(REBOOT_KEY, "1");
+        appendSystem("Restarting ComfyUI to load new nodes — I'll reconnect and pick up automatically when it's back.");
+      }
     },
     onAgentStatus(s) {
       // Percentage of the context window used (label + ring), persisted so a
@@ -2209,6 +2235,20 @@ function buildPanel() {
     },
     onModels(list) {
       applyModelCatalog(list);
+    },
+    onAck(ack) {
+      // Post-restart auto-resume (#3): the "ready" ack is sent after the
+      // orchestrator armed hello.resume, so resuming the agent is safe now.
+      // Clear REBOOT_KEY only here (on actual send) so a drop mid-reconnect
+      // retries instead of losing the resume.
+      if (ack?.kind === "ready" && ssGet(REBOOT_KEY)) {
+        ssSet(REBOOT_KEY, null);
+        appendSystem("Reconnected — resuming where we left off.");
+        showThinking();
+        client.sendUserMessage(
+          "✅ ComfyUI just restarted to load newly-installed custom nodes (now available). Continue what you were doing before the restart — if you were mid-build, pick it back up.",
+        );
+      }
     },
     getResume: () => ssGet(SESSION_KEY),
   });
@@ -2239,9 +2279,25 @@ function buildPanel() {
       error: d.exception_message || d.exception_type || "execution error",
     });
   }
+  // Post-restart autonomy (#3): ComfyUI's api fires `reconnecting` when the
+  // server goes down (e.g. a Manager reboot) and `reconnected` when it's back.
+  // After a reboot we triggered, respawn the orchestrator (it died with ComfyUI)
+  // so the bridge can reconnect; onStatus(connected) then resumes the agent.
+  function onComfyReconnecting() {
+    if (ssGet(REBOOT_KEY)) appendSystem("ComfyUI is restarting…");
+  }
+  function onComfyReconnected() {
+    if (!ssGet(REBOOT_KEY)) return;
+    appendSystem("ComfyUI is back — reconnecting the agent…");
+    // Respawn the orchestrator on demand and reopen the bridge (same path as the
+    // Connect button). When it connects, onStatus sends the resume nudge.
+    connectAgent();
+  }
   try {
     api.addEventListener("executed", onExecuted);
     api.addEventListener("execution_error", onExecError);
+    api.addEventListener("reconnecting", onComfyReconnecting);
+    api.addEventListener("reconnected", onComfyReconnected);
   } catch {
     // api unavailable — execution surfacing disabled
   }
@@ -2252,8 +2308,13 @@ function buildPanel() {
   });
 
   // Connect: ask ComfyUI's server to start the background agent on demand, then
-  // open the bridge. The orchestrator is only ever spawned by this click.
+  // open the bridge. The orchestrator is only ever spawned by this click — or by
+  // the post-restart auto-resume. In-flight guard so the multiple callers
+  // (button, reconnected event, mount auto-resume) can't double-spawn.
+  let connecting = false;
   async function connectAgent() {
+    if (connecting) return;
+    connecting = true;
     connectBtn.disabled = true;
     connectBtn.textContent = "Starting…";
     try {
@@ -2264,6 +2325,8 @@ function buildPanel() {
       // No /connect route (older/headless host) — fall through and try the
       // bridge directly in case the user started the orchestrator themselves.
       appendSystem(`Couldn't reach ComfyUI to start the agent: ${err?.message ?? err}`);
+    } finally {
+      connecting = false;
     }
     // Connect (or keep reconnecting with backoff until the bridge binds).
     client.start();
@@ -2669,6 +2732,12 @@ function buildPanel() {
   // orchestrator yourself, or another tab did). Otherwise sit idle behind the
   // Connect button — we never start a process without an explicit click.
   (async () => {
+    // If a restart we triggered reloaded the page, finish the autonomous resume:
+    // respawn the orchestrator and let onStatus(connected) nudge the agent.
+    if (ssGet(REBOOT_KEY)) {
+      connectAgent();
+      return;
+    }
     try {
       const res = await api.fetchApi("/comfyui_mcp_panel/status");
       const data = await res.json().catch(() => ({}));
@@ -2690,6 +2759,8 @@ function buildPanel() {
       try {
         api.removeEventListener("executed", onExecuted);
         api.removeEventListener("execution_error", onExecError);
+        api.removeEventListener("reconnecting", onComfyReconnecting);
+        api.removeEventListener("reconnected", onComfyReconnected);
       } catch {
         // already detached
       }
