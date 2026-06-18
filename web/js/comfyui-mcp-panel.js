@@ -2163,6 +2163,16 @@ function buildPanel() {
   let thinkingLabel = null;
   let workWordTimer = null;
   let workWordIdx = 0;
+  let thinkingSafety = null;
+  // Backstop: if no activity (say/command/turn signal) for this long, auto-hide
+  // — covers a missed turn:done (e.g. an older orchestrator, or an errored turn)
+  // so the indicator never sticks forever.
+  const THINKING_SAFETY_MS = 120000;
+
+  function armSafety() {
+    if (thinkingSafety) clearTimeout(thinkingSafety);
+    thinkingSafety = setTimeout(hideThinking, THINKING_SAFETY_MS);
+  }
 
   function cycleWord() {
     if (!thinkingLabel) return;
@@ -2174,6 +2184,10 @@ function buildPanel() {
     if (workWordTimer) {
       clearInterval(workWordTimer);
       workWordTimer = null;
+    }
+    if (thinkingSafety) {
+      clearTimeout(thinkingSafety);
+      thinkingSafety = null;
     }
     if (thinkingEl) {
       thinkingEl.remove();
@@ -2197,6 +2211,7 @@ function buildPanel() {
     workWordIdx = 0;
     cycleWord();
     if (!workWordTimer) workWordTimer = setInterval(cycleWord, 2600);
+    armSafety();
     scrollLog();
   }
 
@@ -2204,6 +2219,7 @@ function buildPanel() {
   function bumpThinking() {
     if (!thinkingEl) return;
     log.appendChild(thinkingEl);
+    armSafety();
     scrollLog();
   }
 
