@@ -877,7 +877,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAgentStatus, onSession, onModels, onAck, getResume }) {
+function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAgentStatus, onSession, onModels, onAck, onTurn, getResume }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -960,6 +960,11 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAgentStatus, 
       // reliable signal to send a post-restart resume nudge.
       if (msg && msg.type === "ack") {
         onAck?.(msg);
+      }
+      // Turn lifecycle → "working" indicator (working stays up through the whole
+      // turn incl. silent tool work; done clears it).
+      if (msg && msg.type === "turn" && typeof msg.state === "string") {
+        onTurn?.(msg.state);
       }
       // "echo" frames are ignored — we render the user bubble locally on send.
     });
@@ -2131,59 +2136,74 @@ function buildPanel() {
     histPop.hidden = !histPop.hidden;
   });
 
-  // ---- "Claude is working…" indicator ----
-  // Honest framing: Claude Code does NOT stream its reasoning to MCP
-  // servers, so real thinking tokens can't appear here. What the panel can
-  // do is acknowledge the send instantly and stay visibly alive until the
-  // agent's next say/graph-edit lands. Graph edits keep the indicator alive
-  // (Claude is mid-task); a say bubble retires it (Claude replied). If
-  // nothing arrives for a while, swap to a hint about how the loop works —
-  // the agent reads panel messages by polling its inbox.
-  const THINKING_HINT_MS = 45000;
+  // ---- "working" indicator ----
+  // Driven by the turn lifecycle (turn:working / turn:done from the orchestrator,
+  // plus the optimistic show on send). It stays up through the WHOLE turn —
+  // including silent tool work where nothing posts to the chat — so it never
+  // looks idle right before a big reply lands. Whimsical status words cycle so
+  // it's clearly alive.
+  const WORK_WORDS = [
+    "Flibbertigibbeting",
+    "Reticulating splines",
+    "Percolating",
+    "Noodling",
+    "Conjuring nodes",
+    "Wrangling tensors",
+    "Untangling the graph",
+    "Spelunking latent space",
+    "Frobnicating",
+    "Hammering pixels",
+    "Consulting the oracle",
+    "Herding samplers",
+    "Marinating",
+    "Tinkering",
+    "Vibing",
+  ];
   let thinkingEl = null;
-  let thinkingTimer = null;
+  let thinkingLabel = null;
+  let workWordTimer = null;
+  let workWordIdx = 0;
+
+  function cycleWord() {
+    if (!thinkingLabel) return;
+    thinkingLabel.textContent = `${WORK_WORDS[workWordIdx % WORK_WORDS.length]}… (Ctrl+C to stop)`;
+    workWordIdx += 1;
+  }
 
   function hideThinking() {
-    if (thinkingTimer) {
-      clearTimeout(thinkingTimer);
-      thinkingTimer = null;
+    if (workWordTimer) {
+      clearInterval(workWordTimer);
+      workWordTimer = null;
     }
     if (thinkingEl) {
       thinkingEl.remove();
       thinkingEl = null;
+      thinkingLabel = null;
     }
   }
 
-  function onThinkingTimeout() {
-    hideThinking();
-    appendSystem(
-      "Claude hasn’t replied yet — check that comfyui-mcp is connected in your Claude session (/mcp) and that it was started with --channels. It may also just be mid-task.",
-    );
-  }
-
   function showThinking() {
-    hideThinking();
-    clearEmpty();
-    thinkingEl = document.createElement("div");
-    thinkingEl.className = "cmcp-thinking";
-    const dots = document.createElement("span");
-    dots.className = "cmcp-thinking-dots";
-    for (let i = 0; i < 3; i += 1) dots.appendChild(document.createElement("span"));
-    const label = document.createElement("span");
-    label.textContent = "Claude is working… (Ctrl+C to stop)";
-    thinkingEl.append(dots, label);
-    log.appendChild(thinkingEl);
+    if (!thinkingEl) {
+      clearEmpty();
+      thinkingEl = document.createElement("div");
+      thinkingEl.className = "cmcp-thinking";
+      const dots = document.createElement("span");
+      dots.className = "cmcp-thinking-dots";
+      for (let i = 0; i < 3; i += 1) dots.appendChild(document.createElement("span"));
+      thinkingLabel = document.createElement("span");
+      thinkingEl.append(dots, thinkingLabel);
+      log.appendChild(thinkingEl);
+    }
+    workWordIdx = 0;
+    cycleWord();
+    if (!workWordTimer) workWordTimer = setInterval(cycleWord, 2600);
     scrollLog();
-    thinkingTimer = setTimeout(onThinkingTimeout, THINKING_HINT_MS);
   }
 
-  /** Keep the indicator below the newest activity card and reset its
-   *  quiet-period timer — an incoming graph edit proves Claude is working. */
+  /** Keep the indicator pinned below the newest message/activity card. */
   function bumpThinking() {
     if (!thinkingEl) return;
     log.appendChild(thinkingEl);
-    if (thinkingTimer) clearTimeout(thinkingTimer);
-    thinkingTimer = setTimeout(onThinkingTimeout, THINKING_HINT_MS);
     scrollLog();
   }
 
@@ -2208,8 +2228,15 @@ function buildPanel() {
       // can't out-race the session resume.)
     },
     onSay(text) {
-      hideThinking();
+      // Append the agent's words but KEEP the working indicator — the turn isn't
+      // over until turn:done. (A turn often emits progress text, then keeps
+      // working silently.) bumpThinking pins the indicator below the new message.
       appendAgent(text);
+      bumpThinking();
+    },
+    onTurn(state) {
+      if (state === "working") showThinking();
+      else if (state === "done") hideThinking();
     },
     onLog(text) {
       appendSystem(text);
