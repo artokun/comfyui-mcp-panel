@@ -36,22 +36,23 @@
 // `window.app` is no longer assigned before extension eval, so the module
 // import is the canonical access path. The absolute specifier works from any
 // nesting depth under /extensions/<pack>/.
-import { app } from "/scripts/app.js";
-import { api } from "/scripts/api.js";
-
-// Execution-error capture: listen from module load so graph_get_errors can
-// report the most recent failure even if it predates the agent's question.
-// execution_start clears state for the new run.
+let app = null;
+let api = null;
 let lastExecutionError = null;
-try {
-  api.addEventListener("execution_error", (ev) => {
-    lastExecutionError = { ...(ev.detail ?? {}), ts: new Date().toISOString() };
-  });
-  api.addEventListener("execution_start", () => {
-    lastExecutionError = null;
-  });
-} catch {
-  // api unavailable — graph_get_errors reports null.
+
+function setupListeners() {
+  if (api) {
+    try {
+      api.addEventListener("execution_error", (ev) => {
+        lastExecutionError = { ...(ev.detail ?? {}), ts: new Date().toISOString() };
+      });
+      api.addEventListener("execution_start", () => {
+        lastExecutionError = null;
+      });
+    } catch {
+      // api unavailable — graph_get_errors reports null.
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1863,50 +1864,52 @@ function buildPanel() {
   };
 }
 
-// ---------------------------------------------------------------------------
-// v1 registration via the imported app module.
-// ---------------------------------------------------------------------------
-if (!app || typeof app.registerExtension !== "function") {
-  console.error(
-    "[comfyui-mcp-panel] app.registerExtension is unavailable — incompatible ComfyUI frontend version.",
-  );
-} else {
-  // TODO(v2): replace with `defineExtension({ name, setup() {...} })`.
-  app.registerExtension({
-    name: "comfyui-mcp.agent-panel",
-    async setup() {
-      const tabId = "comfyui-mcp.agent";
-      let mounted = null; // { root, destroy }
+function registerExtensionWhenReady() {
+  const comfyApp = window.comfyAPI?.app?.app || window.app;
+  if (comfyApp && typeof comfyApp.registerExtension === "function") {
+    app = comfyApp;
+    api = window.comfyAPI?.api?.api || window.api;
+    setupListeners();
+    
+    app.registerExtension({
+      name: "comfyui-mcp.agent-panel",
+      async setup() {
+        const tabId = "comfyui-mcp.agent";
+        let mounted = null; // { root, destroy }
 
-      const tabSpec = {
-        id: tabId,
-        title: "Agent",
-        // ComfyUI ships PrimeIcons; `pi-comments` is the closest "chat" glyph.
-        icon: "pi pi-comments",
-        tooltip: "ComfyUI MCP Panel — your Claude session's window into this graph",
-        type: "custom",
-        render: (container) => {
-          if (mounted) mounted.destroy();
-          mounted = buildPanel();
-          container.appendChild(mounted.root);
-        },
-        destroy: () => {
-          mounted?.destroy();
-          mounted = null;
-        },
-      };
+        const tabSpec = {
+          id: tabId,
+          title: "Agent",
+          icon: "pi pi-comments",
+          tooltip: "ComfyUI MCP Panel — your Claude session's window into this graph",
+          type: "custom",
+          render: (container) => {
+            if (mounted) mounted.destroy();
+            mounted = buildPanel();
+            container.appendChild(mounted.root);
+          },
+          destroy: () => {
+            mounted?.destroy();
+            mounted = null;
+          },
+        };
 
-      // TODO(v2): replace with `defineSidebarTab({...})` from
-      // '@comfyorg/extension-api'.
-      const mgr = app.extensionManager;
-      if (mgr && typeof mgr.registerSidebarTab === "function") {
-        mgr.registerSidebarTab(tabSpec);
-      } else {
-        console.error(
-          "[comfyui-mcp-panel] app.extensionManager.registerSidebarTab is unavailable; " +
-            "update ComfyUI to a version that exposes the extension manager.",
-        );
-      }
-    },
-  });
+        const mgr = app.extensionManager;
+        if (mgr && typeof mgr.registerSidebarTab === "function") {
+          mgr.registerSidebarTab(tabSpec);
+        } else {
+          console.error(
+            "[comfyui-mcp-panel] app.extensionManager.registerSidebarTab is unavailable; " +
+              "update ComfyUI to a version that exposes the extension manager.",
+          );
+        }
+      },
+    });
+  } else {
+    // Retry in next frame
+    setTimeout(registerExtensionWhenReady, 10);
+  }
 }
+
+registerExtensionWhenReady();
+
