@@ -208,26 +208,48 @@ function autoWorkflowName() {
   return `Untitled ${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
 }
 
+/** Programmatically save the active workflow — NO Save/Rename dialog. Uses the
+ *  workflow STORE's saveWorkflow() (which calls workflow.save({force}); the
+ *  dialog only comes from the Comfy.SaveWorkflow *command* path). If the
+ *  workflow was never saved (or a `name` is given), it's renamed first so it
+ *  lands as a real, named file. Best-effort + feature-detected. Returns the
+ *  saved name, or null if it couldn't save. */
+async function programmaticSave(name) {
+  const svc = app?.extensionManager?.workflow;
+  const wf = svc?.activeWorkflow;
+  if (!wf) throw new Error("no active workflow to save");
+  const wasUnsaved = wf.isTemporary === true || wf.isPersisted === false;
+  // Rename FIRST when we want a specific/auto name, so it persists under that
+  // name (renameWorkflow does the store bookkeeping; path needs the prefix).
+  const desired = (name ? String(name) : wasUnsaved ? autoWorkflowName() : "")
+    .replace(/\.json$/i, "")
+    .trim();
+  if (desired && typeof svc.renameWorkflow === "function") {
+    const target = `workflows/${desired}.json`;
+    if (wf.path !== target) {
+      try {
+        await svc.renameWorkflow(wf, target);
+      } catch {
+        /* keep going — we'll still save under the current name */
+      }
+    }
+  }
+  if (typeof svc.saveWorkflow === "function") await svc.saveWorkflow(wf);
+  else if (typeof wf.save === "function") await wf.save();
+  else throw new Error("workflow save API unavailable on this frontend");
+  return desired || wf.filename || getWorkflowTitle();
+}
+
 /** If the open workflow was never saved to disk, save it (no dialog) so the
- *  agent works from a grounded file. Best-effort + feature-detected: if the
- *  workflow service shape differs, it no-ops rather than throwing. Returns the
- *  saved name, or null if nothing was saved. */
+ *  agent works from a grounded file. Best-effort. Returns the saved name or null. */
 async function groundUnsavedWorkflow() {
   try {
-    const svc = app?.extensionManager?.workflow;
-    const wf = svc?.activeWorkflow;
-    // isPersisted === false means "new workflow, never saved". Leave saved or
-    // unknown-state workflows alone.
-    if (!wf || wf.isPersisted !== false) return null;
-    const name = autoWorkflowName();
-    if (typeof svc.saveWorkflowAs === "function") {
-      await svc.saveWorkflowAs(wf, { filename: name });
-      return name;
-    }
+    const wf = app?.extensionManager?.workflow?.activeWorkflow;
+    if (!wf || (wf.isPersisted !== false && wf.isTemporary !== true)) return null;
+    return await programmaticSave();
   } catch {
-    // best-effort — never block the chat on a save hiccup
+    return null; // best-effort — never block the chat on a save hiccup
   }
-  return null;
 }
 
 /** Call the BUILT-IN ComfyUI Manager v2 API (the same surface the "Extensions"
@@ -639,32 +661,17 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
-  async workflow_save() {
-    // Same path as Ctrl+S, including the save-as dialog for never-saved
-    // workflows.
-    const mgr = app?.extensionManager;
-    if (!mgr?.command?.execute) {
-      throw new Error("Save command unavailable on this frontend — use workflow_save_as with a name");
-    }
-    await mgr.command.execute("Comfy.SaveWorkflow");
-    return { saved: true, workflow: getWorkflowTitle() };
+  async workflow_save({ name } = {}) {
+    // Fully programmatic — no Save/Rename dialog. Auto-names a never-saved
+    // workflow; saves in place otherwise.
+    const saved = await programmaticSave(name);
+    return { saved: true, workflow: saved };
   },
 
   async workflow_save_as({ name }) {
     if (!name || typeof name !== "string") throw new Error("name (string) is required");
-    const { rootGraph } = getGraphCtx();
-    const clean = name.replace(/\.json$/i, "");
-    const data = rootGraph.serialize();
-    const res = await api.fetchApi(
-      `/userdata/${encodeURIComponent(`workflows/${clean}.json`)}?overwrite=true`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data),
-      },
-    );
-    if (res.status !== 200) throw new Error(`save failed: HTTP ${res.status}`);
-    return { saved_as: `workflows/${clean}.json`, node_count: data.nodes?.length ?? 0 };
+    const saved = await programmaticSave(name);
+    return { saved: true, workflow: saved };
   },
 
   // --- Workflow tabs: new / list / open / switch / rename / close ----------
