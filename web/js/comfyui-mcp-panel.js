@@ -595,20 +595,39 @@ const GRAPH_TOOL_EXECUTORS = {
       case "fit": {
         const nodes = graph._nodes ?? [];
         if (!nodes.length) throw new Error("Graph is empty — nothing to fit");
+        // Bounding box of all nodes (prefer litegraph's boundingRect, which
+        // includes titles; fall back to pos/size).
         let minX = Infinity;
         let minY = Infinity;
         let maxX = -Infinity;
         let maxY = -Infinity;
         for (const n of nodes) {
-          minX = Math.min(minX, n.pos[0]);
-          minY = Math.min(minY, n.pos[1] - 30); // title bar renders above pos
-          maxX = Math.max(maxX, n.pos[0] + (n.size?.[0] ?? 200));
-          maxY = Math.max(maxY, n.pos[1] + (n.size?.[1] ?? 100));
+          const br = n.boundingRect;
+          let x, y, w0, h0;
+          if (Array.isArray(br) && br.length === 4 && (br[2] || br[3])) {
+            [x, y, w0, h0] = br;
+          } else {
+            x = n.pos[0];
+            y = n.pos[1] - 30; // title bar renders above pos
+            w0 = n.size?.[0] ?? 200;
+            h0 = (n.size?.[1] ?? 100) + 30;
+          }
+          minX = Math.min(minX, x);
+          minY = Math.min(minY, y);
+          maxX = Math.max(maxX, x + w0);
+          maxY = Math.max(maxY, y + h0);
+        }
+        const bounds = [minX, minY, maxX - minX, maxY - minY];
+        // SMOOTH animated zoom-to-fit when supported (matches the native
+        // "Fit view" easing); fall back to an instant set otherwise.
+        if (typeof canvas.animateToBounds === "function") {
+          canvas.animateToBounds(bounds, { duration: 400 });
+          return { canvas: { action, animated: true } };
         }
         const pad = 60;
         const el = canvas.canvas;
-        const w = maxX - minX + pad * 2;
-        const h = maxY - minY + pad * 2;
+        const w = bounds[2] + pad * 2;
+        const h = bounds[3] + pad * 2;
         const next = Math.min(el.width / w, el.height / h, 1.5);
         ds.scale = next;
         ds.offset[0] = -minX + pad + (el.width / next - w) / 2;
