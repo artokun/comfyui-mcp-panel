@@ -1353,15 +1353,19 @@ const PANEL_CSS = `
 }
 
 .cmcp-dropzone {
-  position: absolute; inset: 6px; z-index: 60;
-  display: flex; align-items: center; justify-content: center;
+  position: absolute; inset: 0; z-index: 60;
+  /* hidden by default — shown only while dragging a file over the composer.
+     NB: use display:none (not the [hidden] attr) because an author display rule
+     would otherwise override the UA [hidden]{display:none}. */
+  display: none; align-items: center; justify-content: center;
   border: 2px dashed var(--p-primary-color, #3b82f6);
-  border-radius: 12px;
-  background: color-mix(in srgb, var(--p-primary-color, #3b82f6) 14%, transparent);
-  color: var(--p-primary-color, #60a5fa); font-weight: 600; font-size: 0.95rem;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--p-primary-color, #3b82f6) 16%, var(--p-surface-900, #18181b));
+  color: var(--p-primary-color, #60a5fa); font-weight: 600; font-size: 0.85rem;
   pointer-events: none; animation: cmcp-in 0.12s ease-out;
 }
-.cmcp-dropzone span { display: inline-flex; align-items: center; gap: 0.5rem; }
+.cmcp-dropzone.cmcp-show { display: flex; }
+.cmcp-dropzone span { display: inline-flex; align-items: center; gap: 0.4rem; }
 .cmcp-thinking {
   align-self: flex-start; display: flex; align-items: center; gap: 0.5rem;
   padding: 0.5rem 0.75rem;
@@ -3015,39 +3019,40 @@ function buildPanel() {
     return refs;
   }
 
-  // Drop overlay (border dropzone effect on drag-over).
-  root.style.position = root.style.position || "relative";
+  // Drop overlay — scoped to the COMPOSER (text area), shown only while dragging
+  // a file over it. Toggled via a class (not the [hidden] attr — see CSS note).
+  form.style.position = form.style.position || "relative";
   const dropzone = document.createElement("div");
   dropzone.className = "cmcp-dropzone";
-  dropzone.hidden = true;
   dropzone.innerHTML = '<span><i class="pi pi-image"></i> Drop image to attach</span>';
-  root.appendChild(dropzone);
+  form.appendChild(dropzone);
   let dragDepth = 0;
+  const showDrop = (on) => dropzone.classList.toggle("cmcp-show", on);
   const dragHasFiles = (ev) => Array.from(ev.dataTransfer?.types || []).includes("Files");
-  root.addEventListener("dragenter", (ev) => {
+  form.addEventListener("dragenter", (ev) => {
     if (!dragHasFiles(ev)) return;
     ev.preventDefault();
     dragDepth += 1;
-    dropzone.hidden = false;
+    showDrop(true);
   });
-  root.addEventListener("dragover", (ev) => {
+  form.addEventListener("dragover", (ev) => {
     if (!dragHasFiles(ev)) return;
     ev.preventDefault();
     if (ev.dataTransfer) ev.dataTransfer.dropEffect = "copy";
   });
-  root.addEventListener("dragleave", (ev) => {
+  form.addEventListener("dragleave", (ev) => {
     if (!dragHasFiles(ev)) return;
     dragDepth -= 1;
     if (dragDepth <= 0) {
       dragDepth = 0;
-      dropzone.hidden = true;
+      showDrop(false);
     }
   });
-  root.addEventListener("drop", (ev) => {
+  form.addEventListener("drop", (ev) => {
     if (!dragHasFiles(ev)) return;
     ev.preventDefault();
     dragDepth = 0;
-    dropzone.hidden = true;
+    showDrop(false);
     for (const f of Array.from(ev.dataTransfer.files || [])) {
       if (f.type?.startsWith("image/")) handleImageFile(f);
     }
