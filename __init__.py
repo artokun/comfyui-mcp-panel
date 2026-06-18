@@ -29,7 +29,6 @@ import atexit
 import json
 import os
 import shutil
-import signal
 import socket
 import subprocess
 import tempfile
@@ -151,40 +150,18 @@ def _pid_alive(pid):
 
 
 def _process_started_at_ms(pid):
-    """Return process creation time in epoch milliseconds, or None if unknown."""
-    try:
-        pid = int(pid)
-    except (TypeError, ValueError):
-        return None
-    if pid <= 0:
-        return None
+    """Process creation time in epoch milliseconds, or None if unknown.
+
+    psutil-only (ComfyUI ships it) — deliberately NO subprocess / no constructed
+    script, so the pack stays clean for the Registry security scanner. If psutil
+    is unavailable, identity checks degrade gracefully to pid-liveness (see
+    _same_process)."""
     try:
         import psutil  # type: ignore
 
-        return int(psutil.Process(pid).create_time() * 1000)
+        return int(psutil.Process(int(pid)).create_time() * 1000)
     except Exception:
-        pass
-    if os.name == "nt":
-        exe = shutil.which("powershell.exe") or shutil.which("powershell")
-        if exe:
-            script = (
-                "$p = Get-CimInstance Win32_Process -Filter 'ProcessId = {}'; "
-                "if ($p) {{ [int64](([Management.ManagementDateTimeConverter]::"
-                "ToDateTime($p.CreationDate).ToUniversalTime() - "
-                "[datetime]'1970-01-01T00:00:00Z').TotalMilliseconds) }}"
-            ).format(pid)
-            try:
-                res = subprocess.run(
-                    [exe, "-NoProfile", "-NonInteractive", "-Command", script],
-                    capture_output=True,
-                    text=True,
-                    timeout=2,
-                )
-                if res.returncode == 0 and res.stdout.strip():
-                    return int(res.stdout.strip())
-            except Exception:
-                pass
-    return None
+        return None
 
 
 def _current_process_started_at_ms():
@@ -231,27 +208,19 @@ def _lock_parent_is_gone(lock):
 
 
 def _kill_pid(pid):
-    try:
-        pid = int(pid)
-    except (TypeError, ValueError):
-        return False
+    """Terminate a (verified-orchestrator) pid via psutil — no shell/taskkill, so
+    the only subprocess the pack ever runs is the explicit, Connect-gated
+    orchestrator spawn. If psutil is unavailable we don't kill (return False);
+    the caller then surfaces a "fully restart ComfyUI" message."""
     try:
         import psutil  # type: ignore
 
-        proc = psutil.Process(pid)
+        proc = psutil.Process(int(pid))
         proc.terminate()
         try:
             proc.wait(timeout=3)
         except Exception:
             proc.kill()
-        return True
-    except Exception:
-        pass
-    try:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
-        else:
-            os.kill(pid, signal.SIGTERM)
         return True
     except Exception:
         return False

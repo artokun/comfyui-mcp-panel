@@ -21,6 +21,11 @@ All notable changes to this project are documented here. This project adheres to
   open, until you explicitly **Disconnect**.
 - **Drop-zone** appears only while dragging a file and is scoped to the composer
   (was permanently visible over the whole panel).
+- **Registry-safe `__init__.py`.** Nothing executes at import except registering
+  the Connect/disconnect/reload routes; the only subprocess the pack ever runs is
+  the orchestrator spawn behind an explicit **Connect** (POST). Process
+  start-time and process-kill are psutil-only — no constructed PowerShell scripts
+  or `taskkill`, so the security scanner sees no shell-exec surface.
 
 ### Added
 
