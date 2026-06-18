@@ -4,6 +4,33 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Truthful "connected".** The panel now turns green only after the orchestrator
+  handshake (its `models` frame) arrives — a non-orchestrator squatting the
+  bridge port (e.g. a stray `comfyui-mcp --channels` server from another
+  Claude/Cursor/codex session) leaves it on "connecting…" with a clear warning
+  instead of a silent dead connection.
+- **Dedicated bridge port `9180`.** The panel/orchestrator bridge moved off
+  `9101` (now reserved for the legacy `--channels` path) so a `--channels` server
+  can't steal it. Saved bridge URLs on the old `9101` default auto-migrate.
+- **Sticky auto-reconnect.** Once you connect, the panel reconnects on its own —
+  respawning the orchestrator if it died (e.g. after a ComfyUI reboot) — on every
+  open, until you explicitly **Disconnect**.
+- **Drop-zone** appears only while dragging a file and is scoped to the composer
+  (was permanently visible over the whole panel).
+
+### Added
+
+- **Drag-drop / paste images** and **paste-large-text chips**, delivered to the
+  agent as inline image blocks — chips, `@input:`/`@node:` mentions, and
+  end-of-run output — with no fetch round-trip.
+- **Smooth animated zoom-to-fit** after the agent makes structural edits.
+- **Programmatic save** (no Save/Rename dialog) and a persistent **"working"**
+  indicator with cycling status words.
+
 ## [0.4.1] - 2026-06-17
 
 Start the agent with a **Connect** button instead of auto-spawning it on load.

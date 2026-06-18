@@ -15,14 +15,19 @@ Type "add a KSampler and wire it to my checkpoint" in the panel (or in your
 Claude terminal) and watch nodes appear on the canvas. Every edit is undoable
 with **Ctrl+Z**.
 
-**No API keys. No extra LLM costs.** The agent is your own Claude Code
-(or any MCP client) session — subscription-billed, connected through the
-[comfyui-mcp](https://github.com/artokun/comfyui-mcp) server's channels mode.
-The panel is just its window into your graph.
+**No API keys. No extra LLM costs.** The agent runs on your Claude
+subscription — a background [comfyui-mcp](https://github.com/artokun/comfyui-mcp)
+**orchestrator** the panel starts for you when you click **Connect**. The panel
+is just its window into your graph.
 
 ```
-you ⇄ Claude Code ⇄ comfyui-mcp (--channels) ⇄ ws://127.0.0.1:9101 ⇄ this panel ⇄ your graph
+this panel ⇄ ws://127.0.0.1:9180 ⇄ comfyui-mcp orchestrator (background, your Claude subscription) ⇄ your graph
 ```
+
+> Your normal `comfyui-mcp` MCP server (in Claude Code / Cursor / etc.) should
+> **not** use `--channels` — the orchestrator owns the bridge port. A stray
+> `--channels` session steals port 9101 and the panel will connect to it with no
+> agent ("connected" but unresponsive). See *Advanced* below.
 
 ## Install
 
@@ -52,7 +57,7 @@ request ("build a Flux txt2img graph and run it") and watch the edits land on
 your canvas. **Disconnect** stops the agent; nothing is ever started without
 your click.
 
-The bridge is loopback-only (`ws://127.0.0.1:9101`, set via
+The bridge is loopback-only (`ws://127.0.0.1:9180`, set via
 `COMFYUI_MCP_BRIDGE_PORT`). To run the orchestrator yourself, set
 `COMFYUI_MCP_NO_AUTOSPAWN=1` and launch it manually, then click Connect.
 
@@ -105,8 +110,8 @@ like your own.
 ## Requirements
 
 - ComfyUI with a frontend exposing `app.extensionManager.registerSidebarTab` (any 2024+ release)
-- Node ≥ 22 for the MCP server (`npx -y comfyui-mcp --channels`)
-- An MCP client you already use: Claude Code, Claude Desktop, Cursor, …
+- Node ≥ 22 for the orchestrator (`npx -y comfyui-mcp --panel-orchestrator`, started for you by **Connect**)
+- A Claude login (run `claude` once) — the agent runs on your subscription, no API key
 
 ## Roadmap
 

@@ -60,11 +60,19 @@ try {
 // localStorage-backed settings.
 // ---------------------------------------------------------------------------
 const STORAGE_KEY_BRIDGE = "comfyui-mcp.panel.bridgeUrl";
-const DEFAULT_BRIDGE_URL = "ws://127.0.0.1:9101";
+// The panel orchestrator owns a DEDICATED bridge port (9180), separate from the
+// legacy `comfyui-mcp --channels` bridge (9101) — so a stray --channels server
+// in any Claude/Cursor session can never sit on the panel's port and produce a
+// "connected but no agent" lie.
+const DEFAULT_BRIDGE_URL = "ws://127.0.0.1:9180";
+const LEGACY_BRIDGE_URL = "ws://127.0.0.1:9101"; // old shared default — migrate off it
 
 function loadBridgeUrl() {
   try {
-    return window.localStorage.getItem(STORAGE_KEY_BRIDGE) || DEFAULT_BRIDGE_URL;
+    const saved = window.localStorage.getItem(STORAGE_KEY_BRIDGE);
+    // Migrate anyone pinned to the old shared 9101 default onto the new port.
+    if (!saved || saved === LEGACY_BRIDGE_URL) return DEFAULT_BRIDGE_URL;
+    return saved;
   } catch {
     return DEFAULT_BRIDGE_URL;
   }
@@ -124,6 +132,27 @@ function ssSet(key, val) {
     else window.sessionStorage.setItem(key, val);
   } catch {
     // sessionStorage unavailable — resume/restore degrade to off.
+  }
+}
+
+// Sticky auto-connect: once the user has connected, the panel auto-reconnects
+// (respawning the orchestrator if it died, e.g. after a ComfyUI reboot) on every
+// open — until they explicitly Disconnect. localStorage so it survives a full
+// frontend reload, not just a tab session.
+const AUTOCONNECT_KEY = "comfyui-mcp.panel.autoConnect";
+function lsGet(key) {
+  try {
+    return window.localStorage.getItem(key) || null;
+  } catch {
+    return null;
+  }
+}
+function lsSet(key, val) {
+  try {
+    if (val == null) window.localStorage.removeItem(key);
+    else window.localStorage.setItem(key, val);
+  } catch {
+    // localStorage unavailable — auto-connect degrades to manual Connect.
   }
 }
 
@@ -902,12 +931,33 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onReload, onAgentStatus, onSession, onModels, onAck, onTurn, getResume }) {
+function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret, onReload, onAgentStatus, onSession, onModels, onAck, onTurn, getResume }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
   let attempt = 0;
   let reconnectTimer = null;
+  // Truthful "connected": a WS open is NOT enough — we only flip to "connected"
+  // once the orchestrator handshake (its `models` frame) arrives. A non-orchestrator
+  // squatter on the port (e.g. a stray `comfyui-mcp --channels`) never sends it,
+  // so the panel won't lie "connected" when there's no agent behind the socket.
+  let handshakeTimer = null;
+  let handshakeDone = false;
+  const HANDSHAKE_MS = 20000;
+  function clearHandshake() {
+    if (handshakeTimer) {
+      clearTimeout(handshakeTimer);
+      handshakeTimer = null;
+    }
+  }
+  function markConnected() {
+    handshakeDone = true;
+    clearHandshake();
+    // Remember the user wants the agent connected, so we auto-reconnect after a
+    // ComfyUI reboot / panel reopen (until they explicitly Disconnect).
+    lsSet(AUTOCONNECT_KEY, "1");
+    onStatus("connected");
+  }
 
   function connect() {
     if (closed) return;
@@ -928,9 +978,20 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onReload
 
     sock.addEventListener("open", () => {
       attempt = 0;
-      onStatus("connected");
-      onLog(`Connected to ${url}`);
+      handshakeDone = false;
+      // Stay "connecting" until the orchestrator handshake (models frame) lands.
+      onStatus("connecting");
+      onLog(`Connected to ${url} — waiting for the panel agent…`);
       sendHello();
+      clearHandshake();
+      handshakeTimer = setTimeout(() => {
+        if (handshakeDone) return;
+        onLog(
+          `⚠ Bridge open on ${url} but no panel agent responded. Something else may be holding the port ` +
+            `(e.g. a 'comfyui-mcp --channels' server from another Claude/Cursor session). Close it, or fully ` +
+            `restart ComfyUI, then reconnect.`,
+        );
+      }, HANDSHAKE_MS);
     });
 
     sock.addEventListener("message", async (ev) => {
@@ -952,6 +1013,12 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onReload
             // becomes the tool result the agent receives.
             if (!onAsk) throw new Error("This panel build can't display questions.");
             result = await onAsk(msg);
+          } else if (msg.cmd === "request_secret") {
+            // Secure secret entry. The pasted value rides back to the
+            // orchestrator (which writes it to config) and is the tool's reply;
+            // it is never surfaced to the agent's context or recorded to history.
+            if (!onSecret) throw new Error("This panel build can't collect secrets.");
+            result = await onSecret(msg);
           } else if (msg.cmd === "soft_reload") {
             // Agent-triggered soft reload. Reply FIRST (below), then bounce —
             // an "orchestrator" scope kills this very session, so the resume
@@ -994,8 +1061,11 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onReload
       if (msg && msg.type === "session") {
         onSession?.(typeof msg.session_id === "string" ? msg.session_id : null);
       }
-      // Live model catalog from the orchestrator (SDK-probed).
+      // Live model catalog from the orchestrator (SDK-probed). This is also the
+      // orchestrator HANDSHAKE — receiving it proves a real panel agent is behind
+      // the socket, so it's the moment we truthfully flip to "connected".
       if (msg && msg.type === "models" && Array.isArray(msg.models)) {
+        markConnected();
         onModels?.(msg.models, typeof msg.current === "string" ? msg.current : undefined);
       }
       // Structured acks (ready / working / options / …). The "ready" ack is sent
@@ -1014,6 +1084,8 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onReload
 
     sock.addEventListener("close", () => {
       sock = null;
+      handshakeDone = false;
+      clearHandshake();
       if (!closed) {
         onStatus("disconnected");
         scheduleReconnect();
@@ -2112,14 +2184,23 @@ function buildPanel() {
     const finish = (answer) => {
       if (done) return;
       done = true;
-      // Lock the card and record the answer so a reload keeps the exchange.
-      card.querySelectorAll("button,input").forEach((el) => (el.disabled = true));
-      card.style.opacity = "0.85";
-      const note = document.createElement("div");
-      note.style.cssText = "font-size:0.7rem;margin-top:0.4rem;color:var(--p-primary-color,#6ea8fe);";
-      note.textContent = `✓ ${answer}`;
-      card.appendChild(note);
-      record({ role: "card", icon: "pi-check", text: `Asked: ${msg.question || ""}`, detail: `Answer: ${answer}` });
+      // Collapse the interactive card into a STATIC result — remove every button
+      // and input so it no longer looks clickable / awaiting an answer.
+      card.replaceChildren();
+      card.classList.remove("cmcp-question");
+      card.style.cssText = "border-left:3px solid var(--p-primary-color,#3a7bd5);opacity:0.9;";
+      if (msg.question) {
+        const q = document.createElement("div");
+        q.style.cssText = "font-size:0.72rem;opacity:0.65;";
+        q.textContent = msg.question;
+        card.appendChild(q);
+      }
+      const a = document.createElement("div");
+      a.style.cssText = "font-weight:600;margin-top:0.15rem;color:var(--p-primary-color,#6ea8fe);";
+      a.textContent = `✓ ${answer}`;
+      card.appendChild(a);
+      // Record as a plain card so a reload restores it as static text, not a widget.
+      record({ role: "card", icon: "pi-check", text: msg.question || "Choice", detail: answer });
       scrollLog();
       resolveFn(answer);
     };
@@ -2187,6 +2268,97 @@ function buildPanel() {
 
     log.appendChild(card);
     scrollLog();
+    return promise;
+  }
+
+  /**
+   * Render a SECURE secret/token input and resolve with the pasted value.
+   * `msg` = { label?, hint? }. The value is masked, never echoed back into the
+   * chat, and NEVER recorded to history — only the agent-supplied label and a
+   * redacted "received" note are kept. The resolved string travels straight back
+   * over the bridge to the orchestrator (which writes it to config); it never
+   * enters the agent's context.
+   */
+  function paintSecret(msg) {
+    clearEmpty();
+    const card = document.createElement("div");
+    card.className = "cmcp-card cmcp-secret";
+    card.style.cssText = "border-left:3px solid var(--p-yellow-400,#facc15);";
+
+    const head = document.createElement("div");
+    head.className = "cmcp-card-head";
+    const lock = document.createElement("i");
+    lock.className = "pi pi-lock";
+    const t = document.createElement("span");
+    t.style.fontWeight = "600";
+    t.textContent = msg.label || "Paste your token";
+    head.append(lock, t);
+    card.appendChild(head);
+
+    const hint = document.createElement("div");
+    hint.style.cssText = "font-size:0.68rem;opacity:0.7;margin:0.2rem 0 0.4rem;";
+    hint.textContent =
+      msg.hint || "Sent straight to your config — never shown to the agent and never saved to chat history.";
+    card.appendChild(hint);
+
+    let done = false;
+    let resolveFn;
+    const promise = new Promise((res) => { resolveFn = res; });
+
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;gap:0.3rem;";
+    const input = document.createElement("input");
+    input.type = "password";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.placeholder = "Paste token…";
+    input.style.cssText =
+      "flex:1;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
+      "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:0.8rem;";
+
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      input.value = ""; // clear the field immediately
+      card.replaceChildren();
+      card.style.cssText = "border-left:3px solid var(--p-green-400,#4ade80);opacity:0.9;";
+      const ok = document.createElement("div");
+      ok.style.cssText = "font-size:0.75rem;color:var(--p-green-400,#4ade80);";
+      ok.textContent = value ? "🔒 Token received — applied to your config." : "Skipped — no token entered.";
+      card.appendChild(ok);
+      // NB: never record the value; only the redacted outcome.
+      record({ role: "card", icon: "pi-lock", text: msg.label || "Token", detail: value ? "received (hidden)" : "skipped" });
+      scrollLog();
+      resolveFn(value || "");
+    };
+
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); finish(input.value.trim()); }
+    });
+    row.appendChild(input);
+
+    const submit = document.createElement("button");
+    submit.type = "button";
+    submit.style.cssText =
+      "padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:0.8rem;" +
+      "background:var(--p-primary-color,#3a7bd5);color:#fff;";
+    submit.textContent = "Save";
+    submit.addEventListener("click", () => finish(input.value.trim()));
+    row.appendChild(submit);
+
+    const skip = document.createElement("button");
+    skip.type = "button";
+    skip.style.cssText =
+      "padding:0.35rem 0.6rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
+      "background:transparent;color:inherit;cursor:pointer;font-size:0.8rem;";
+    skip.textContent = "Skip";
+    skip.addEventListener("click", () => finish(""));
+    row.appendChild(skip);
+
+    card.appendChild(row);
+    log.appendChild(card);
+    scrollLog();
+    setTimeout(() => input.focus(), 0);
     return promise;
   }
 
@@ -2461,6 +2633,12 @@ function buildPanel() {
       bumpThinking();
       return p;
     },
+    // The agent called panel_request_secret — collect a token securely.
+    onSecret(msg) {
+      const p = paintSecret(msg);
+      bumpThinking();
+      return p;
+    },
     // The agent called panel_reload — perform the soft reload it asked for.
     onReload(scope) {
       softReload("agent", scope);
@@ -2570,10 +2748,13 @@ function buildPanel() {
   // After a reboot we triggered, respawn the orchestrator (it died with ComfyUI)
   // so the bridge can reconnect; onStatus(connected) then resumes the agent.
   function onComfyReconnecting() {
-    if (ssGet(REBOOT_KEY)) appendSystem("ComfyUI is restarting…");
+    if (ssGet(REBOOT_KEY) || lsGet(AUTOCONNECT_KEY)) appendSystem("ComfyUI is restarting…");
   }
   function onComfyReconnected() {
-    if (!ssGet(REBOOT_KEY)) return;
+    // After ComfyUI comes back (backend-only reboot — the page didn't reload),
+    // the orchestrator died with it. Respawn + reconnect if the agent was in use:
+    // either a restart WE triggered (REBOOT_KEY) or sticky auto-connect.
+    if (!ssGet(REBOOT_KEY) && !lsGet(AUTOCONNECT_KEY)) return;
     appendSystem("ComfyUI is back — reconnecting the agent…");
     // Respawn the orchestrator on demand and reopen the bridge (same path as the
     // Connect button). When it connects, onStatus sends the resume nudge.
@@ -2670,6 +2851,8 @@ function buildPanel() {
   }
 
   disconnectBtn.addEventListener("click", async () => {
+    // Explicit Disconnect = opt out of sticky auto-reconnect.
+    lsSet(AUTOCONNECT_KEY, null);
     client.stop();
     connectBtn.hidden = false;
     disconnectBtn.hidden = true;
@@ -3279,6 +3462,14 @@ function buildPanel() {
     // If a restart we triggered reloaded the page, finish the autonomous resume:
     // respawn the orchestrator and let onStatus(connected) nudge the agent.
     if (ssGet(REBOOT_KEY)) {
+      connectAgent();
+      return;
+    }
+    // Sticky auto-connect: the user connected before and didn't Disconnect, so
+    // reconnect on open — respawning the orchestrator if it died (e.g. ComfyUI
+    // was rebooted). This is what makes "open the panel after a reboot → it's
+    // back" work without a manual Connect click.
+    if (lsGet(AUTOCONNECT_KEY)) {
       connectAgent();
       return;
     }
