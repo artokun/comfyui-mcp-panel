@@ -105,6 +105,12 @@ const CURRENT_THREAD_KEY = "comfyui-mcp.panel.currentThreadId";
 // nudges it to continue — making install→restart→continue autonomous. Survives
 // a page reload (sessionStorage) in case the restart reloads the frontend.
 const REBOOT_KEY = "comfyui-mcp.panel.rebootResume";
+// Set while a soft reload (orchestrator respawn, no ComfyUI restart) is in
+// flight. Value is the trigger origin ("agent" | "user") so that after the
+// fresh orchestrator reconnects we resume the session and — only for an
+// agent-triggered reload mid-task — nudge it to continue. Survives the bridge
+// drop via sessionStorage.
+const SOFT_RELOAD_KEY = "comfyui-mcp.panel.softReloadResume";
 function ssGet(key) {
   try {
     return window.sessionStorage.getItem(key) || null;
@@ -896,7 +902,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onAgentStatus, onSession, onModels, onAck, onTurn, getResume }) {
+function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onReload, onAgentStatus, onSession, onModels, onAck, onTurn, getResume }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -946,6 +952,14 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onAgentS
             // becomes the tool result the agent receives.
             if (!onAsk) throw new Error("This panel build can't display questions.");
             result = await onAsk(msg);
+          } else if (msg.cmd === "soft_reload") {
+            // Agent-triggered soft reload. Reply FIRST (below), then bounce —
+            // an "orchestrator" scope kills this very session, so the resume
+            // flow (SOFT_RELOAD_KEY) continues the conversation afterward.
+            if (!onReload) throw new Error("This panel build can't soft-reload.");
+            const scope = msg.scope === "frontend" ? "frontend" : "orchestrator";
+            result = `soft reload (${scope}) scheduled`;
+            setTimeout(() => onReload(scope), 60);
           } else {
             const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];
             if (!executor) throw new Error(`Unknown command "${msg.cmd}"`);
@@ -1066,11 +1080,16 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onAgentS
       closed = false;
       connect();
     },
-    sendUserMessage(text, context) {
+    sendUserMessage(text, context, images) {
       if (!sock || sock.readyState !== WebSocket.OPEN) return false;
       try {
         sock.send(
-          JSON.stringify({ type: "user_message", text, ...(context ? { context } : {}) }),
+          JSON.stringify({
+            type: "user_message",
+            text,
+            ...(context ? { context } : {}),
+            ...(images?.length ? { images } : {}),
+          }),
         );
         return true;
       } catch {
@@ -1162,6 +1181,8 @@ const PANEL_CSS = `
 .cmcp-dot.connected { background: var(--p-green-400, #4ade80); }
 .cmcp-dot.connecting { background: var(--p-yellow-400, #facc15); animation: cmcp-pulse 1.2s ease-in-out infinite; }
 @keyframes cmcp-pulse { 50% { opacity: 0.3; } }
+.cmcp-spin i { animation: cmcp-spin 0.8s linear infinite; }
+@keyframes cmcp-spin { to { transform: rotate(360deg); } }
 
 .cmcp-settings {
   margin: 0.625rem 0.75rem 0;
@@ -1572,7 +1593,9 @@ function buildPanel() {
   actions.style.cssText = "margin-left:auto;display:flex;gap:0.125rem;align-items:center;";
   const newChatBtn = iconBtn("pi-plus", "New chat");
   const historyBtn = iconBtn("pi-history", "Chat history");
-  actions.append(newChatBtn, historyBtn);
+  const reloadBtn = iconBtn("pi-sync", "Soft reload the agent — picks up new code, keeps ComfyUI and this conversation");
+  reloadBtn.addEventListener("click", () => softReload("user", "orchestrator"));
+  actions.append(reloadBtn, newChatBtn, historyBtn);
 
   header.style.position = "relative";
   const histPop = document.createElement("div");
@@ -2434,6 +2457,10 @@ function buildPanel() {
       bumpThinking();
       return p;
     },
+    // The agent called panel_reload — perform the soft reload it asked for.
+    onReload(scope) {
+      softReload("agent", scope);
+    },
     onTurn(state) {
       if (state === "working") showThinking();
       else if (state === "done") hideThinking();
@@ -2488,6 +2515,21 @@ function buildPanel() {
         client.sendUserMessage(
           "✅ ComfyUI just restarted to load newly-installed custom nodes (now available). Continue what you were doing before the restart — if you were mid-build, pick it back up.",
         );
+        return;
+      }
+      // Soft-reload resume: the fresh orchestrator is up. Resume silently for a
+      // user-triggered reload; nudge to continue for an agent-triggered one
+      // (it was mid-task and its tool call died with the old process).
+      if (ack?.kind === "ready" && ssGet(SOFT_RELOAD_KEY)) {
+        const origin = ssGet(SOFT_RELOAD_KEY);
+        ssSet(SOFT_RELOAD_KEY, null);
+        appendSystem("Agent reloaded — session resumed.");
+        if (origin === "agent") {
+          showThinking();
+          client.sendUserMessage(
+            "✅ You were just soft-reloaded to pick up code changes (no ComfyUI restart) — your tools and system prompt are now the latest build. Continue exactly what you were doing before the reload.",
+          );
+        }
       }
     },
     getResume: () => ssGet(SESSION_KEY),
@@ -2573,6 +2615,56 @@ function buildPanel() {
   }
   connectBtn.addEventListener("click", connectAgent);
 
+  // Soft reload: pick up new code WITHOUT restarting ComfyUI, keeping this
+  // conversation. Two scopes:
+  //   • "orchestrator" — respawn the background agent (new tools / prompt /
+  //     services). Drops the bridge; the fresh orchestrator resumes the session
+  //     (SESSION_KEY) and onAck continues it.
+  //   • "frontend" — reload just this panel page (new panel JS); ComfyUI and the
+  //     orchestrator stay up, and the reconnect resumes the session.
+  // `origin` ("user" | "agent") only affects whether we nudge the agent to
+  // continue after an orchestrator reload (agent-triggered = it was mid-task).
+  let reloading = false;
+  async function softReload(origin = "user", scope = "orchestrator") {
+    if (reloading) return;
+    if (scope === "frontend") {
+      // Nothing to respawn — just re-fetch the panel with a cache-bust. The
+      // session id persists in sessionStorage, so we reconnect + resume on load.
+      appendSystem("Reloading the panel UI (new frontend code)…");
+      try {
+        const u = new URL(window.location.href);
+        u.searchParams.set("cmcpReload", String(Date.now()));
+        window.location.replace(u.toString());
+      } catch {
+        window.location.reload();
+      }
+      return;
+    }
+    reloading = true;
+    reloadBtn.classList.add("cmcp-spin");
+    ssSet(SOFT_RELOAD_KEY, origin === "agent" ? "agent" : "user");
+    appendSystem("Soft-reloading the agent (new code, no ComfyUI restart)…");
+    try {
+      client.stop(); // drop the bridge so the old orchestrator can release the port
+      const res = await api.fetchApi("/comfyui_mcp_panel/reload", { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!data?.ok) {
+        ssSet(SOFT_RELOAD_KEY, null);
+        appendSystem(data?.message || "Soft reload failed — try Disconnect then Connect.");
+        return;
+      }
+    } catch (err) {
+      ssSet(SOFT_RELOAD_KEY, null);
+      appendSystem(`Couldn't reach ComfyUI to reload the agent: ${err?.message ?? err}`);
+      return;
+    } finally {
+      reloading = false;
+      reloadBtn.classList.remove("cmcp-spin");
+    }
+    // Reconnect with backoff until the fresh orchestrator binds; onAck resumes.
+    client.start();
+  }
+
   disconnectBtn.addEventListener("click", async () => {
     client.stop();
     connectBtn.hidden = false;
@@ -2609,6 +2701,18 @@ function buildPanel() {
       run: () => runLocalCommand("graph_canvas", { action: "fit" }),
     },
     { cmd: "/run", icon: "pi-play", hint: "queue the open workflow", run: () => runLocalCommand("graph_run", {}) },
+    {
+      cmd: "/reload",
+      icon: "pi-sync",
+      hint: "soft-reload the agent (new code, keeps ComfyUI + this chat)",
+      run: () => softReload("user", "orchestrator"),
+    },
+    {
+      cmd: "/reload-ui",
+      icon: "pi-refresh",
+      hint: "reload just the panel UI (new frontend code, keeps the session)",
+      run: () => softReload("user", "frontend"),
+    },
     {
       cmd: "/errors",
       icon: "pi-info-circle",
@@ -2780,23 +2884,11 @@ function buildPanel() {
   }
 
   attachBtn.addEventListener("click", () => fileInput.click());
-  fileInput.addEventListener("change", async () => {
-    const file = fileInput.files?.[0];
+  // The attach button now uses the same chip pipeline as drag/paste — a [Image #N]
+  // chip + structured ref, delivered inline to the agent on send.
+  fileInput.addEventListener("change", () => {
+    for (const f of Array.from(fileInput.files || [])) handleImageFile(f);
     fileInput.value = "";
-    if (!file) return;
-    appendSystem(`Uploading ${file.name}…`);
-    try {
-      const fd = new FormData();
-      fd.append("image", file);
-      const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
-      if (res.status !== 200) throw new Error(`HTTP ${res.status}`);
-      const info = await res.json();
-      const ref = (info.subfolder ? `${info.subfolder}/` : "") + info.name;
-      insertAtCaret(`@input:${ref} `);
-      appendSystem(`Attached — saved to ComfyUI input/${ref} (usable in LoadImage).`);
-    } catch (err) {
-      appendSystem(`Upload failed: ${err?.message ?? err}`);
-    }
   });
 
   // ---- attachments: drag-drop / paste images + paste large text ----------
@@ -2841,9 +2933,10 @@ function buildPanel() {
         if (res.status === 200) {
           const info = await res.json();
           att.inputRef = (info.subfolder ? `${info.subfolder}/` : "") + info.name;
+          att.ref = { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || "input" };
         }
       } catch {
-        /* upload failed — manifest notes it */
+        /* upload failed — the chip still references it by name as a fallback */
       }
     })();
   }
@@ -2851,6 +2944,75 @@ function buildPanel() {
     const id = ++attachSeq;
     attachments.push({ id, kind: "text", content: text });
     insertAtCaret(`[Pasted text #${id}] `);
+  }
+
+  // Resolve image references from an @node:<id> mention to ComfyUI /view refs:
+  // a LoadImage-style input widget, and/or displayed output images (Save/Preview).
+  const IMG_WIDGET_NAMES = /^(image|images|mask|video|file|filename|audio)$/i;
+  function nodeImageRefs(node) {
+    const out = [];
+    for (const w of node?.widgets || []) {
+      if (typeof w?.value === "string" && IMG_WIDGET_NAMES.test(w?.name || "")) {
+        const v = w.value.replace(/\s*\[[^\]]+\]\s*$/, "").trim(); // strip " [input]"
+        if (!/\.(png|jpe?g|gif|webp|bmp)$/i.test(v)) continue;
+        const slash = v.lastIndexOf("/");
+        out.push(
+          slash >= 0
+            ? { filename: v.slice(slash + 1), subfolder: v.slice(0, slash), type: "input" }
+            : { filename: v, type: "input" },
+        );
+      }
+    }
+    for (const im of node?.imgs || []) {
+      if (!im?.src) continue;
+      try {
+        const u = new URL(im.src, location.origin);
+        const filename = u.searchParams.get("filename");
+        if (filename) {
+          out.push({
+            filename,
+            subfolder: u.searchParams.get("subfolder") || undefined,
+            type: u.searchParams.get("type") || "output",
+          });
+        }
+      } catch {
+        /* non-view src — skip */
+      }
+    }
+    return out;
+  }
+
+  // Gather all image refs to deliver inline with a message: attachment chips,
+  // @input:<path> mentions, and @node:<id> mentions (Load/Save/Preview nodes).
+  async function collectImageRefs(text, refImgs) {
+    const refs = [];
+    const seen = new Set();
+    const add = (r) => {
+      if (!r?.filename) return;
+      const key = `${r.type || "input"}/${r.subfolder || ""}/${r.filename}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      refs.push(r);
+    };
+    for (const a of refImgs) if (a.ref) add(a.ref);
+    for (const m of text.matchAll(/@input:(.+?\.(?:png|jpe?g|gif|webp|bmp))\b/gi)) {
+      const p = m[1].trim();
+      const slash = p.lastIndexOf("/");
+      add(slash >= 0 ? { filename: p.slice(slash + 1), subfolder: p.slice(0, slash), type: "input" } : { filename: p, type: "input" });
+    }
+    let graph = null;
+    try {
+      graph = getGraphCtx().graph;
+    } catch {
+      /* no graph */
+    }
+    if (graph?.getNodeById) {
+      for (const m of text.matchAll(/@node:(\d+)/g)) {
+        const node = graph.getNodeById(Number(m[1]));
+        if (node) for (const r of nodeImageRefs(node)) add(r);
+      }
+    }
+    return refs;
   }
 
   // Drop overlay (border dropzone effect on drag-over).
@@ -2979,15 +3141,15 @@ function buildPanel() {
     if (refImgs.length) await Promise.all(refImgs.map((a) => a.ready));
     for (const a of refImgs) if (a.dataUrl) paintImage(a.dataUrl, a.name);
 
-    // Compose the text the AGENT receives: pasted text expands inline; images
-    // are referenced by their ComfyUI input path (it can view_image / LoadImage).
+    // Compose the text the AGENT receives: pasted text expands inline. Images
+    // (chips + @input:/@node: mentions) are delivered as inline image blocks; a
+    // short note lists chip paths as a fallback if a fetch fails.
     let sendText = text;
     for (const a of refTexts) sendText = sendText.split(`[Pasted text #${a.id}]`).join(a.content);
+    const imageRefs = await collectImageRefs(text, refImgs);
     if (refImgs.length) {
-      const lines = refImgs
-        .map((a) => `#${a.id} → ${a.inputRef ? `ComfyUI input/${a.inputRef}` : "(upload failed)"}`)
-        .join(", ");
-      sendText += `\n\n[Attached image(s) — view them with the view_image tool, or load via a LoadImage node: ${lines}]`;
+      const lines = refImgs.map((a) => `#${a.id}${a.inputRef ? ` (input/${a.inputRef})` : ""}`).join(", ");
+      sendText += `\n\n[Attached image(s) ${lines} — shown inline below.]`;
     }
 
     // Ground a brand-new chat: if the open workflow was never saved, save it
@@ -3004,10 +3166,14 @@ function buildPanel() {
     } catch {
       // graph unavailable — send without subgraph context
     }
-    client.sendUserMessage(sendText, {
-      workflow: getWorkflowTitle(),
-      ...(viewing.scope === "subgraph" ? { subgraph: viewing.title } : {}),
-    });
+    client.sendUserMessage(
+      sendText,
+      {
+        workflow: getWorkflowTitle(),
+        ...(viewing.scope === "subgraph" ? { subgraph: viewing.title } : {}),
+      },
+      imageRefs,
+    );
   });
 
   input.addEventListener("keydown", (ev) => {
