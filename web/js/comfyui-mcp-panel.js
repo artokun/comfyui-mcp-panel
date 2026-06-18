@@ -38,6 +38,8 @@
 // nesting depth under /extensions/<pack>/.
 import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
+import { marked } from "./vendor/marked.esm.js";
+import DOMPurify from "./vendor/purify.es.js";
 
 // Execution-error capture: listen from module load so graph_get_errors can
 // report the most recent failure even if it predates the agent's question.
@@ -90,6 +92,151 @@ function getTabId() {
     return id;
   } catch {
     return crypto.randomUUID();
+  }
+}
+
+// Per-tab agent session id + which thread this tab is showing. sessionStorage
+// is tab-scoped and survives reload — exactly what "restore the last session on
+// reload" needs, without two tabs clobbering each other.
+const SESSION_KEY = "comfyui-mcp.panel.sessionId";
+const CURRENT_THREAD_KEY = "comfyui-mcp.panel.currentThreadId";
+function ssGet(key) {
+  try {
+    return window.sessionStorage.getItem(key) || null;
+  } catch {
+    return null;
+  }
+}
+function ssSet(key, val) {
+  try {
+    if (val == null) window.sessionStorage.removeItem(key);
+    else window.sessionStorage.setItem(key, val);
+  } catch {
+    // sessionStorage unavailable — resume/restore degrade to off.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Model + effort picker. The orchestrator passes these to the Agent SDK
+// (Options.model / Options.effort), so the panel can actually drive them now —
+// model switches live, an effort change restarts the (resumed) session.
+//
+// The real catalog is NOT hardcoded: the orchestrator probes the SDK
+// (query.supportedModels()) — the only model-enumeration that works on the
+// subscription lane — and pushes a `models` frame with each model's
+// `supportedEffortLevels`. The list below is only a fallback for when the
+// probe hasn't answered yet (or failed).
+// ---------------------------------------------------------------------------
+const FALLBACK_MODELS = [
+  { value: "opus", displayName: "Opus", description: "most capable", supportsEffort: true },
+];
+// Friendly copy for known effort ids; unknown ids fall back to a capitalized id.
+const EFFORT_META = {
+  low: { label: "Low", small: "quick" },
+  medium: { label: "Medium", small: "default" },
+  high: { label: "High", small: "thorough" },
+  xhigh: { label: "Extra high", small: "deep" },
+  max: { label: "Max", small: "exhaustive" },
+};
+const ALL_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+
+/** Normalize a ModelInfo list (or the fallback) to picker rows. `efforts`:
+ *  an array of effort ids, or null when the model supports effort but didn't
+ *  enumerate levels, or [] when it has no effort control. */
+function normalizeModels(list) {
+  return (Array.isArray(list) ? list : []).map((m) => {
+    let efforts;
+    if (Array.isArray(m.supportedEffortLevels)) efforts = m.supportedEffortLevels;
+    else if (m.supportsEffort) efforts = null; // unknown → offer the standard set
+    else efforts = []; // no effort control
+    const desc = typeof m.description === "string" ? m.description : "";
+    return {
+      id: m.value,
+      label: m.displayName || m.value,
+      small: desc.length > 28 ? desc.slice(0, 27) + "…" : desc,
+      efforts,
+    };
+  });
+}
+function effortMeta(id) {
+  return EFFORT_META[id] ?? { label: id.charAt(0).toUpperCase() + id.slice(1), small: "" };
+}
+
+// Show the clean family aliases (Opus / Sonnet / Haiku): drop the synthetic
+// "default", and drop pinned version ids (claude-*) that just duplicate an
+// alias (e.g. claude-opus-4-8 vs the "opus" alias — same model). Falls back
+// gracefully if that would empty the list.
+function presentableModels(rows) {
+  const aliases = rows.filter((r) => r.id !== "default" && !/^claude-/.test(r.id));
+  if (aliases.length) return aliases;
+  const noDefault = rows.filter((r) => r.id !== "default");
+  return noDefault.length ? noDefault : rows;
+}
+// Pre-select Opus when the user hasn't chosen.
+function pickDefaultModel(rows) {
+  return (rows.find((r) => /opus/i.test(r.id)) ?? rows[0])?.id;
+}
+const PREFS_KEY = "comfyui-mcp.panel.prefs";
+function loadPrefs() {
+  try {
+    const p = JSON.parse(window.localStorage.getItem(PREFS_KEY) ?? "{}");
+    return p && typeof p === "object" ? p : {};
+  } catch {
+    return {};
+  }
+}
+function savePrefs(prefs) {
+  try {
+    window.localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+  } catch {
+    // localStorage unavailable — prefs are session-only.
+  }
+}
+function modelLabel(catalog, id) {
+  return catalog.find((m) => m.id === id)?.label ?? id ?? "Claude";
+}
+
+/** A readable auto name for grounding an unsaved workflow. */
+function autoWorkflowName() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `Untitled ${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
+}
+
+/** If the open workflow was never saved to disk, save it (no dialog) so the
+ *  agent works from a grounded file. Best-effort + feature-detected: if the
+ *  workflow service shape differs, it no-ops rather than throwing. Returns the
+ *  saved name, or null if nothing was saved. */
+async function groundUnsavedWorkflow() {
+  try {
+    const svc = app?.extensionManager?.workflow;
+    const wf = svc?.activeWorkflow;
+    // isPersisted === false means "new workflow, never saved". Leave saved or
+    // unknown-state workflows alone.
+    if (!wf || wf.isPersisted !== false) return null;
+    const name = autoWorkflowName();
+    if (typeof svc.saveWorkflowAs === "function") {
+      await svc.saveWorkflowAs(wf, { filename: name });
+      return name;
+    }
+  } catch {
+    // best-effort — never block the chat on a save hiccup
+  }
+  return null;
+}
+
+/** Build a ComfyUI /view URL for an output image descriptor. */
+function imageViewUrl(img) {
+  const qs = new URLSearchParams({
+    filename: img.filename ?? "",
+    subfolder: img.subfolder ?? "",
+    type: img.type ?? "output",
+  }).toString();
+  const path = `/view?${qs}`;
+  try {
+    return typeof api?.apiURL === "function" ? api.apiURL(path) : path;
+  } catch {
+    return path;
   }
 }
 
@@ -488,6 +635,133 @@ const GRAPH_TOOL_EXECUTORS = {
     if (res.status !== 200) throw new Error(`save failed: HTTP ${res.status}`);
     return { saved_as: `workflows/${clean}.json`, node_count: data.nodes?.length ?? 0 };
   },
+
+  // --- Workflow tabs: new / list / open / switch / rename / close ----------
+  // Uses ComfyUI's workflow service. "New workflow" opens a NEW TAB and never
+  // touches the current graph (graph_clear is ONLY for clearing the open one).
+  workflow_list() {
+    const s = app?.extensionManager?.workflow;
+    if (!s) throw new Error("workflow service unavailable on this frontend");
+    const active = s.activeWorkflow;
+    const brief = (w) => ({
+      path: w.path,
+      filename: w.filename,
+      key: w.key,
+      active: !!active && (w === active || w.key === active.key),
+      modified: !!w.isModified,
+      persisted: !!w.isPersisted,
+    });
+    return {
+      active: active ? { path: active.path, filename: active.filename, key: active.key } : null,
+      open: (s.openWorkflows ?? []).map(brief),
+    };
+  },
+
+  async workflow_new() {
+    const mgr = app?.extensionManager;
+    if (!mgr?.command?.execute) throw new Error("command service unavailable");
+    // Comfy.NewBlankWorkflow opens a fresh TAB — the current workflow is untouched.
+    await mgr.command.execute("Comfy.NewBlankWorkflow");
+    return { created: true, active: getWorkflowTitle() };
+  },
+
+  async workflow_open({ path }) {
+    const s = app?.extensionManager?.workflow;
+    if (!s?.openWorkflow) throw new Error("workflow service unavailable");
+    const all = [...(s.openWorkflows ?? []), ...(s.workflows ?? [])];
+    const target =
+      (typeof s.getWorkflowByPath === "function" && path && s.getWorkflowByPath(path)) ||
+      all.find(
+        (w) =>
+          w &&
+          (w.path === path ||
+            w.filename === path ||
+            w.key === path ||
+            (w.filename && w.filename.replace(/\.json$/i, "") === path)),
+      );
+    if (!target) throw new Error(`no workflow matching "${path}" — call workflow_list first`);
+    await s.openWorkflow(target);
+    return { opened: { path: target.path, filename: target.filename } };
+  },
+
+  async workflow_rename({ name, path }) {
+    const s = app?.extensionManager?.workflow;
+    if (!s?.renameWorkflow) throw new Error("rename unavailable on this frontend");
+    if (!name) throw new Error("name is required");
+    const all = [...(s.openWorkflows ?? []), ...(s.workflows ?? [])];
+    const target = path
+      ? all.find((w) => w && (w.path === path || w.filename === path || w.key === path))
+      : s.activeWorkflow;
+    if (!target) throw new Error("no target workflow");
+    const clean = name.replace(/\.json$/i, "");
+    const slash = target.path ? target.path.lastIndexOf("/") : -1;
+    const dir = slash >= 0 ? target.path.slice(0, slash + 1) : "workflows/";
+    await s.renameWorkflow(target, `${dir}${clean}.json`);
+    return { renamed: { to: `${clean}.json` } };
+  },
+
+  async workflow_close({ path, force }) {
+    const s = app?.extensionManager?.workflow;
+    if (!s?.closeWorkflow) throw new Error("close unavailable on this frontend");
+    const target = path
+      ? (s.openWorkflows ?? []).find(
+          (w) => w && (w.path === path || w.filename === path || w.key === path),
+        )
+      : s.activeWorkflow;
+    if (!target) throw new Error("no target workflow");
+    // Guard against data loss: don't silently close a workflow with unsaved
+    // changes (closeWorkflow bypasses the UI's save prompt). Save first.
+    if (target.isModified && !force) {
+      throw new Error(
+        `"${target.filename || target.path}" has unsaved changes — save it first (panel_save_workflow) before closing, or pass force:true to discard.`,
+      );
+    }
+    await s.closeWorkflow(target);
+    return { closed: { path: target.path } };
+  },
+
+  // --- Subgraphs: select nodes + group into a subgraph ---------------------
+  graph_select_nodes({ node_ids }) {
+    const { graph, canvas } = getGraphCtx();
+    if (!canvas) throw new Error("canvas unavailable");
+    const ns = (Array.isArray(node_ids) ? node_ids : [])
+      .map((id) => graph.getNodeById(Number(id)))
+      .filter(Boolean);
+    if (!ns.length) throw new Error("no matching nodes to select");
+    if (typeof canvas.selectItems === "function") canvas.selectItems(ns);
+    else if (typeof canvas.selectNodes === "function") canvas.selectNodes(ns);
+    else throw new Error("selection API unavailable");
+    canvas.setDirty?.(true, true);
+    return { selected: ns.map((n) => n.id) };
+  },
+
+  graph_create_subgraph({ node_ids }) {
+    const { graph, canvas } = getGraphCtx();
+    if (typeof graph.convertToSubgraph !== "function") {
+      throw new Error("convertToSubgraph unavailable on this frontend");
+    }
+    const ns = (Array.isArray(node_ids) ? node_ids : [])
+      .map((id) => graph.getNodeById(Number(id)))
+      .filter(Boolean);
+    if (!ns.length) throw new Error("provide node_ids to group into a subgraph");
+    if (typeof canvas.selectItems === "function") canvas.selectItems(ns);
+    else if (typeof canvas.selectNodes === "function") canvas.selectNodes(ns);
+    graph.beforeChange?.();
+    let res;
+    try {
+      res = graph.convertToSubgraph(canvas.selectedItems);
+    } finally {
+      graph.afterChange?.();
+    }
+    graph.setDirtyCanvas?.(true, true);
+    return {
+      subgraph: {
+        node_id: res?.node?.id ?? null,
+        name: res?.subgraph?.name ?? null,
+        from_nodes: ns.map((n) => n.id),
+      },
+    };
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -497,7 +771,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAgentStatus }) {
+function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAgentStatus, onSession, onModels, getResume }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -560,6 +834,15 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAgentStatus }
       if (msg && msg.type === "agent_status") {
         onAgentStatus?.(msg);
       }
+      // Session lifecycle: the orchestrator reports the SDK session id (or null
+      // on a reset) so the panel can persist it and resume across reloads.
+      if (msg && msg.type === "session") {
+        onSession?.(typeof msg.session_id === "string" ? msg.session_id : null);
+      }
+      // Live model catalog from the orchestrator (SDK-probed).
+      if (msg && msg.type === "models" && Array.isArray(msg.models)) {
+        onModels?.(msg.models, typeof msg.current === "string" ? msg.current : undefined);
+      }
       // "echo" frames are ignored — we render the user bubble locally on send.
     });
 
@@ -579,20 +862,41 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAgentStatus }
   function sendHello() {
     if (!sock || sock.readyState !== WebSocket.OPEN) return;
     try {
+      // Carry the last session id so the orchestrator resumes the agent's
+      // memory after a panel reload (only honored before the tab's agent spawns).
+      const resume = getResume?.();
       sock.send(
-        JSON.stringify({ type: "hello", tab_id: getTabId(), title: getWorkflowTitle() }),
+        JSON.stringify({
+          type: "hello",
+          tab_id: getTabId(),
+          title: getWorkflowTitle(),
+          ...(resume ? { resume } : {}),
+        }),
       );
     } catch {
       // Reconnect path will retry.
     }
   }
 
-  // Re-hello when the workflow title changes (rename / open different file)
-  // so panel_status stays accurate.
+  // When the workflow title changes (rename / open a different file / progress
+  // ticks during a run / each graph edit toggling the modified "*"), send a
+  // LIGHTWEIGHT title update — NOT a full hello. A full hello re-greets the user
+  // ("agent ready"), so re-helloing on every title mutation during a build/run
+  // produced a greeting storm. Deduped so identical titles don't spam.
   const titleEl = document.querySelector("title");
-  const titleObserver = titleEl
-    ? new MutationObserver(() => sendHello())
-    : null;
+  let lastSentTitle = null;
+  function sendTitle() {
+    if (!sock || sock.readyState !== WebSocket.OPEN) return;
+    const t = getWorkflowTitle();
+    if (t === lastSentTitle) return;
+    lastSentTitle = t;
+    try {
+      sock.send(JSON.stringify({ type: "title", tab_id: getTabId(), title: t }));
+    } catch {
+      // dropped — next mutation retries
+    }
+  }
+  const titleObserver = titleEl ? new MutationObserver(() => sendTitle()) : null;
   titleObserver?.observe(titleEl, { childList: true });
 
   function scheduleReconnect() {
@@ -616,6 +920,16 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAgentStatus }
         sock.send(
           JSON.stringify({ type: "user_message", text, ...(context ? { context } : {}) }),
         );
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    /** Send an arbitrary control frame (set_options, new_session, …). */
+    sendFrame(frame) {
+      if (!sock || sock.readyState !== WebSocket.OPEN) return false;
+      try {
+        sock.send(JSON.stringify({ tab_id: getTabId(), ...frame }));
         return true;
       } catch {
         return false;
@@ -678,7 +992,7 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAgentStatus }
 
 const PANEL_CSS = `
 .cmcp-root {
-  display: flex; flex-direction: column; height: 100%;
+  display: flex; flex-direction: column; height: 100%; min-height: 0;
   font-family: var(--font-inter, "Inter", ui-sans-serif, system-ui, sans-serif);
   font-size: 0.8125rem; line-height: 1.5;
   color: var(--p-text-color, #fff);
@@ -742,8 +1056,14 @@ const PANEL_CSS = `
   overflow-x: auto; white-space: nowrap;
 }
 
+/* Middle section: bounded flex body whose only job is to host the scroll
+   surface, so the header and composer stay pinned. */
+.cmcp-body {
+  flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column;
+  overflow: hidden;
+}
 .cmcp-log {
-  flex: 1 1 auto; overflow-y: auto; padding: 0.75rem;
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0.75rem;
   display: flex; flex-direction: column; gap: 0.5rem;
 }
 .cmcp-empty {
@@ -777,16 +1097,61 @@ const PANEL_CSS = `
   background: var(--p-highlight-background, rgba(96,165,250,0.16));
   border: 1px solid color-mix(in srgb, var(--p-primary-color, #60a5fa), transparent 70%);
 }
+/* Agent text flows freely — no card/bubble. Only user messages are boxed. */
 .cmcp-bubble.agent {
-  align-self: flex-start;
-  background: var(--p-surface-800, #27272a);
-  border: 1px solid var(--p-content-border-color, #3f3f46);
+  align-self: stretch; max-width: 100%;
+  padding: 0; background: none; border: none; border-radius: 0;
 }
 .cmcp-bubble.agent code, .cmcp-bubble.user code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem;
   background: var(--p-form-field-background, #09090b);
   padding: 0.0625rem 0.25rem; border-radius: var(--p-border-radius-sm, 4px);
 }
+/* GFM rendering (marked output) inside bubbles. */
+.cmcp-bubble > :first-child { margin-top: 0; }
+.cmcp-bubble > :last-child { margin-bottom: 0; }
+.cmcp-bubble p { margin: 0 0 0.5rem; }
+.cmcp-bubble ul, .cmcp-bubble ol { margin: 0 0 0.5rem; padding-left: 1.25rem; }
+.cmcp-bubble li { margin: 0.125rem 0; }
+.cmcp-bubble li > p { margin: 0; }
+.cmcp-bubble h1, .cmcp-bubble h2, .cmcp-bubble h3,
+.cmcp-bubble h4, .cmcp-bubble h5, .cmcp-bubble h6 {
+  margin: 0.625rem 0 0.25rem; font-weight: 600; line-height: 1.3;
+}
+.cmcp-bubble h1 { font-size: 1.05rem; }
+.cmcp-bubble h2 { font-size: 1rem; }
+.cmcp-bubble h3 { font-size: 0.9375rem; }
+.cmcp-bubble h4, .cmcp-bubble h5, .cmcp-bubble h6 { font-size: 0.875rem; }
+.cmcp-bubble a { color: var(--p-primary-color, #60a5fa); text-decoration: underline; }
+.cmcp-bubble blockquote {
+  margin: 0.5rem 0; padding: 0.125rem 0 0.125rem 0.75rem;
+  border-left: 3px solid var(--p-content-border-color, #3f3f46);
+  color: var(--p-text-muted-color, #a1a1aa);
+}
+.cmcp-bubble hr { border: none; border-top: 1px solid var(--p-content-border-color, #3f3f46); margin: 0.75rem 0; }
+.cmcp-bubble img { max-width: 100%; border-radius: var(--p-border-radius-md, 6px); }
+.cmcp-bubble pre {
+  margin: 0.375rem 0; padding: 0.5rem 0.625rem;
+  background: var(--p-form-field-background, #09090b);
+  border: 1px solid var(--p-content-border-color, #3f3f46);
+  border-radius: var(--p-border-radius-md, 6px);
+  overflow-x: auto; max-height: 20rem; overflow-y: auto;
+  font-size: 0.6875rem; line-height: 1.5; tab-size: 2;
+}
+.cmcp-bubble.agent pre code, .cmcp-bubble.user pre code {
+  background: none; padding: 0; border-radius: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre; color: var(--p-text-color, #fff);
+}
+.cmcp-bubble table {
+  display: block; width: 100%; overflow-x: auto;
+  border-collapse: collapse; margin: 0.5rem 0; font-size: 0.6875rem;
+}
+.cmcp-bubble th, .cmcp-bubble td {
+  border: 1px solid var(--p-content-border-color, #3f3f46);
+  padding: 0.25rem 0.5rem; text-align: left;
+}
+.cmcp-bubble th { background: var(--p-surface-800, #27272a); font-weight: 600; }
 .cmcp-sys {
   align-self: center; font-size: 0.6875rem; font-style: italic;
   color: var(--p-text-muted-color, #a1a1aa);
@@ -871,6 +1236,7 @@ const PANEL_CSS = `
   padding: 0.125rem 0.375rem; border-radius: var(--p-border-radius-sm, 4px);
 }
 .cmcp-chip:hover { background: var(--p-surface-700, #3f3f46); }
+.cmcp-ctx { font-size: 0.625rem; color: var(--p-text-muted-color, #a1a1aa); min-width: 1.75rem; }
 .cmcp-ring { flex: none; margin: 0 0.125rem; transform: rotate(-90deg); }
 .cmcp-ring .bg { stroke: var(--p-surface-600, #52525b); }
 .cmcp-ring .fg { stroke: var(--p-primary-color, #60a5fa); transition: stroke-dashoffset 0.3s; }
@@ -892,7 +1258,36 @@ const PANEL_CSS = `
 .cmcp-popover-item.sel, .cmcp-popover-item:hover { background: var(--p-surface-700, #3f3f46); }
 .cmcp-popover-item .pi { font-size: 0.75rem; color: var(--p-text-muted-color, #a1a1aa); flex: none; }
 .cmcp-popover-item small { margin-left: auto; color: var(--p-text-muted-color, #a1a1aa); flex: none; padding-left: 0.5rem; }
-.cmcp-popover-item .lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmcp-popover-item .lbl { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmcp-status-btn {
+  display: inline-flex; align-items: center; gap: 0.3125rem;
+  background: none; border: none; cursor: pointer; font: inherit; color: inherit;
+  padding: 0.125rem 0.375rem; border-radius: var(--p-border-radius-sm, 4px);
+}
+.cmcp-status-btn:hover { background: var(--p-surface-800, #27272a); }
+.cmcp-status-btn .pi { color: var(--p-text-muted-color, #a1a1aa); }
+.cmcp-conn-pop { padding: 0.625rem; max-height: none; }
+
+/* History rows: open button + trash, revealed on hover. */
+.cmcp-hist-row { display: flex; align-items: stretch; gap: 0.125rem; }
+.cmcp-hist-row .cmcp-hist-open { flex: 1 1 auto; min-width: 0; }
+.cmcp-hist-del {
+  flex: none; width: 1.75rem; border: none; background: transparent; cursor: pointer;
+  color: var(--p-text-muted-color, #a1a1aa); border-radius: var(--p-border-radius-sm, 4px);
+  opacity: 0; transition: opacity 0.12s, background 0.12s, color 0.12s;
+}
+.cmcp-hist-row:hover .cmcp-hist-del { opacity: 1; }
+.cmcp-hist-del:hover { background: var(--p-surface-700, #3f3f46); color: var(--p-red-400, #f87171); }
+.cmcp-hist-del .pi { font-size: 0.75rem; }
+
+/* Model/effort picker popover (anchored above the composer). */
+.cmcp-pop-section { padding: 0.25rem 0.5rem 0.125rem; font-size: 0.625rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.04em; color: var(--p-text-muted-color, #a1a1aa); }
+.cmcp-pop-section:not(:first-child) { margin-top: 0.25rem; border-top: 1px solid var(--p-content-border-color, #3f3f46); padding-top: 0.375rem; }
+.cmcp-popover-item .check { flex: none; width: 1rem; text-align: center; margin-left: 0.375rem; color: var(--p-primary-color, #60a5fa); visibility: hidden; }
+.cmcp-popover-item .check.on { visibility: visible; }
+.cmcp-chip .pi-angle-down { font-size: 0.5625rem; opacity: 0.7; }
+.cmcp-chip .dim { opacity: 0.65; }
 `;
 
 let styleInjected = false;
@@ -965,22 +1360,13 @@ function describeCommand(cmd, msg, reply) {
   }
 }
 
-/** Minimal markdown for agent bubbles: `code` spans + **bold**. textContent-safe. */
+// GitHub-flavored markdown, single-newline line breaks.
+marked.setOptions({ gfm: true, breaks: true });
+
+/** Render agent markdown (full GFM) via marked, sanitized with DOMPurify so
+ *  agent output can never inject script/handlers into the panel. */
 function renderRichText(el, text) {
-  const parts = String(text).split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
-  for (const part of parts) {
-    if (part.startsWith("`") && part.endsWith("`")) {
-      const c = document.createElement("code");
-      c.textContent = part.slice(1, -1);
-      el.appendChild(c);
-    } else if (part.startsWith("**") && part.endsWith("**")) {
-      const b = document.createElement("strong");
-      b.textContent = part.slice(2, -2);
-      el.appendChild(b);
-    } else if (part) {
-      el.appendChild(document.createTextNode(part));
-    }
-  }
+  el.innerHTML = DOMPurify.sanitize(marked.parse(String(text)));
 }
 
 function buildPanel() {
@@ -995,14 +1381,18 @@ function buildPanel() {
   const title = document.createElement("span");
   title.className = "cmcp-title";
   title.textContent = "Agent";
-  const status = document.createElement("span");
-  status.className = "cmcp-status";
-  status.style.marginLeft = "0";
+  const status = document.createElement("button");
+  status.type = "button";
+  status.className = "cmcp-status cmcp-status-btn";
+  status.title = "Connection";
   const dot = document.createElement("span");
   dot.className = "cmcp-dot";
   const statusText = document.createElement("span");
   statusText.textContent = "disconnected";
-  status.append(dot, statusText);
+  const caret = document.createElement("i");
+  caret.className = "pi pi-angle-down";
+  caret.style.fontSize = "0.625rem";
+  status.append(dot, statusText, caret);
 
   function iconBtn(icon, titleText) {
     const b = document.createElement("button");
@@ -1029,10 +1419,9 @@ function buildPanel() {
   root.appendChild(header);
 
   // ---- Connection settings ----
-  const settingsBox = document.createElement("details");
-  settingsBox.className = "cmcp-settings";
-  const settingsSummary = document.createElement("summary");
-  settingsSummary.textContent = "Connection";
+  const settingsBox = document.createElement("div");
+  settingsBox.className = "cmcp-popover cmcp-popover--down cmcp-conn-pop";
+  settingsBox.hidden = true;
   const settingsBody = document.createElement("div");
   settingsBody.className = "cmcp-settings-body";
 
@@ -1088,10 +1477,14 @@ function buildPanel() {
   helpDiv.appendChild(helpCmd);
 
   settingsBody.append(urlLabel, urlInput, btnRow, helpDiv);
-  // Open by default so Connect is visible until the agent is connected.
-  settingsBox.open = true;
-  settingsBox.append(settingsSummary, settingsBody);
-  root.appendChild(settingsBox);
+  settingsBox.appendChild(settingsBody);
+  // Lives in the header as a dropdown anchored under the status pill.
+  header.appendChild(settingsBox);
+  status.addEventListener("click", (e) => {
+    e.stopPropagation();
+    histPop.hidden = true;
+    settingsBox.hidden = !settingsBox.hidden;
+  });
 
   // ---- Message log + empty state ----
   const log = document.createElement("div");
@@ -1137,7 +1530,10 @@ function buildPanel() {
   }
   empty.appendChild(examplesBox);
   log.appendChild(empty);
-  root.appendChild(log);
+  const body = document.createElement("div");
+  body.className = "cmcp-body";
+  body.appendChild(log);
+  root.appendChild(body);
 
   function clearEmpty() {
     if (empty.parentElement) empty.remove();
@@ -1189,19 +1585,167 @@ function buildPanel() {
   const ringTitle = document.createElementNS(SVG_NS, "title");
   ringTitle.textContent = "Context window — fills as Claude reports usage";
   ring.appendChild(ringTitle);
+  // Compact context-usage readout shown right after the ring.
+  const ctxLabel = document.createElement("span");
+  ctxLabel.className = "cmcp-ctx";
+  ctxLabel.title = "Context window used";
+  const CTX_KEY = "comfyui-mcp.panel.ctxPct";
+  ctxLabel.textContent = "—"; // until the first usage report
+
   function setContextPct(p) {
     const clamped = Math.max(0, Math.min(1, p > 1 ? p / 100 : p));
     ring.querySelector(".fg").setAttribute("stroke-dashoffset", String(RING_C * (1 - clamped)));
-    ringTitle.textContent = `Context window ~${Math.round(clamped * 100)}% used`;
+    const pct = Math.round(clamped * 100);
+    ringTitle.textContent = `Context window ~${pct}% used`;
+    ctxLabel.textContent = clamped > 0 ? `${pct}%` : "—";
+  }
+  // Restore last % across reloads (orchestrator also re-pushes on connect).
+  {
+    const p0 = Number(ssGet(CTX_KEY));
+    if (p0 > 0) setContextPct(p0);
+  }
+
+  // Model + effort picker. The orchestrator forwards these to the Agent SDK,
+  // so the chip actually drives the background agent (model live, effort on a
+  // resumed restart). The catalog arrives live via the `models` frame; until
+  // then it's the small fallback. Selection persists in localStorage and is
+  // re-sent on connect so a freshly-spawned agent adopts it.
+  const prefs = loadPrefs();
+  if (prefs.model === "default") prefs.model = undefined; // migrate old saved value
+  let modelCatalog = presentableModels(normalizeModels(FALLBACK_MODELS));
+  if (!prefs.model) prefs.model = pickDefaultModel(modelCatalog);
+
+  /** The effort ids offered for the currently-selected model. */
+  function effortsForModel(id) {
+    const row = modelCatalog.find((m) => m.id === id);
+    if (!row) return ALL_EFFORTS;
+    if (row.efforts === null) return ALL_EFFORTS; // supports effort, levels unknown
+    return row.efforts; // explicit list (possibly empty = no effort control)
   }
 
   const modelChip = document.createElement("button");
   modelChip.type = "button";
   modelChip.className = "cmcp-chip";
-  modelChip.textContent = "Claude";
-  modelChip.title = "The agent is your Claude Code session — switch models there with /model";
-  modelChip.addEventListener("click", () => {
-    appendSystem("The model belongs to your Claude Code session — switch it there with /model.");
+  modelChip.title = "Model & reasoning effort for the background agent";
+  const modelChipLabel = document.createElement("span");
+  const modelChipEffort = document.createElement("span");
+  modelChipEffort.className = "dim";
+  const modelChipCaret = document.createElement("i");
+  modelChipCaret.className = "pi pi-angle-down";
+  modelChip.append(modelChipLabel, modelChipEffort, modelChipCaret);
+
+  function refreshModelChip() {
+    modelChipLabel.textContent = modelLabel(modelCatalog, prefs.model);
+    modelChipEffort.textContent = prefs.effort ? ` · ${prefs.effort}` : "";
+  }
+  refreshModelChip();
+
+  const modelPop = document.createElement("div");
+  modelPop.className = "cmcp-popover";
+  modelPop.hidden = true;
+
+  function buildModelPop() {
+    modelPop.textContent = "";
+    const section = (label) => {
+      const h = document.createElement("div");
+      h.className = "cmcp-pop-section";
+      h.textContent = label;
+      modelPop.appendChild(h);
+    };
+    const item = ({ label, small }, selected, onPick) => {
+      const el = document.createElement("button");
+      el.type = "button";
+      el.className = "cmcp-popover-item" + (selected ? " sel" : "");
+      const lbl = document.createElement("span");
+      lbl.className = "lbl";
+      lbl.textContent = label;
+      el.appendChild(lbl);
+      if (small) {
+        const s = document.createElement("small");
+        s.textContent = small;
+        el.appendChild(s);
+      }
+      // Always render the check (visibility toggled) so the column is reserved
+      // and rows don't reflow when the selection changes.
+      const c = document.createElement("i");
+      c.className = "pi pi-check check" + (selected ? " on" : "");
+      el.appendChild(c);
+      el.addEventListener("mousedown", (mev) => {
+        mev.preventDefault();
+        onPick();
+      });
+      modelPop.appendChild(el);
+    };
+
+    section("Model");
+    for (const m of modelCatalog) {
+      item({ label: m.label, small: m.small }, m.id === prefs.model, () => {
+        prefs.model = m.id;
+        prefs.userSet = true;
+        // Drop an effort the new model can't do.
+        const avail = effortsForModel(m.id);
+        if (prefs.effort && !avail.includes(prefs.effort)) prefs.effort = undefined;
+        savePrefs(prefs);
+        refreshModelChip();
+        modelPop.hidden = true;
+        client?.sendFrame?.({ type: "set_options", model: m.id, effort: prefs.effort ?? null });
+        appendSystem(`Model → ${m.label}.`);
+      });
+    }
+
+    const efforts = effortsForModel(prefs.model);
+    if (efforts.length) {
+      section("Effort");
+      for (const id of efforts) {
+        const meta = effortMeta(id);
+        item(meta, id === prefs.effort, () => {
+          prefs.effort = id;
+          prefs.userSet = true;
+          savePrefs(prefs);
+          refreshModelChip();
+          modelPop.hidden = true;
+          client?.sendFrame?.({ type: "set_options", effort: id });
+          appendSystem(`Effort → ${meta.label}. Continuing this chat at the new effort…`);
+        });
+      }
+    }
+  }
+
+  /** Replace the catalog when the orchestrator reports the real model list. */
+  function applyModelCatalog(list) {
+    const next = presentableModels(normalizeModels(list));
+    if (!next.length) return;
+    modelCatalog = next;
+    // Keep the user's saved pick if still valid; else pre-select Opus.
+    if (!modelCatalog.some((m) => m.id === prefs.model)) {
+      prefs.model = pickDefaultModel(modelCatalog);
+    }
+    if (prefs.effort && !effortsForModel(prefs.model).includes(prefs.effort)) {
+      prefs.effort = undefined;
+    }
+    savePrefs(prefs);
+    refreshModelChip();
+    if (!modelPop.hidden) buildModelPop();
+    // Now that the catalog is live, prefs.model is a REAL id — safe to push the
+    // user's saved pick so a freshly-spawned agent adopts it. (Never sent before
+    // this point; the fallback id may not be a usable model.)
+    if (prefs.userSet) {
+      client?.sendFrame?.({
+        type: "set_options",
+        model: prefs.model,
+        effort: prefs.effort ?? null,
+      });
+    }
+  }
+
+  modelChip.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (modelPop.hidden) {
+      buildModelPop();
+      modelPop.hidden = false;
+    } else {
+      modelPop.hidden = true;
+    }
   });
 
   const spacer = document.createElement("span");
@@ -1217,8 +1761,8 @@ function buildPanel() {
   fileInput.accept = "image/*";
   fileInput.hidden = true;
 
-  row.append(ring, modelChip, spacer, attachBtn, micBtn, sendBtn);
-  form.append(menuPop, input, row, fileInput);
+  row.append(ring, ctxLabel, modelChip, spacer, attachBtn, micBtn, sendBtn);
+  form.append(menuPop, modelPop, input, row, fileInput);
   root.appendChild(form);
 
   // ---- feed renderers + thread persistence ----
@@ -1248,8 +1792,12 @@ function buildPanel() {
   function record(entry) {
     if (!thread) {
       thread = { id: crypto.randomUUID(), ts: Date.now(), msgs: [] };
+      // Adopt any session id the orchestrator has already reported for this tab.
+      const sid = ssGet(SESSION_KEY);
+      if (sid) thread.sessionId = sid;
       threads.push(thread);
       if (threads.length > MAX_THREADS) threads = threads.slice(-MAX_THREADS);
+      ssSet(CURRENT_THREAD_KEY, thread.id);
     }
     thread.msgs.push(entry);
     if (thread.msgs.length > MAX_THREAD_MSGS) {
@@ -1259,8 +1807,21 @@ function buildPanel() {
     persistThreads();
   }
 
+  /** Bind the agent's current session id to the open thread (for reload/resume). */
+  function bindSession(sessionId) {
+    ssSet(SESSION_KEY, sessionId);
+    if (thread) {
+      thread.sessionId = sessionId || undefined;
+      persistThreads();
+    }
+  }
+
   function scrollLog() {
-    log.scrollTop = log.scrollHeight;
+    // Defer to after layout so tall content (code blocks, images) still lands
+    // at the true bottom.
+    requestAnimationFrame(() => {
+      log.scrollTop = log.scrollHeight;
+    });
   }
 
   function paintUser(text) {
@@ -1303,6 +1864,27 @@ function buildPanel() {
     scrollLog();
   }
 
+  function paintImage(url, name) {
+    clearEmpty();
+    const card = document.createElement("div");
+    card.className = "cmcp-bubble agent cmcp-imgcard";
+    const img = document.createElement("img");
+    img.src = url;
+    img.alt = name || "output";
+    img.loading = "lazy";
+    img.style.cssText = "max-width:100%;border-radius:6px;display:block;cursor:zoom-in;";
+    img.addEventListener("click", () => window.open(url, "_blank"));
+    card.appendChild(img);
+    if (name) {
+      const cap = document.createElement("div");
+      cap.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
+      cap.textContent = name;
+      card.appendChild(cap);
+    }
+    log.appendChild(card);
+    scrollLog();
+  }
+
   function appendUser(text) {
     paintUser(text);
     record({ role: "user", text });
@@ -1336,17 +1918,31 @@ function buildPanel() {
 
   function newChat() {
     thread = null;
+    ssSet(CURRENT_THREAD_KEY, null);
+    ssSet(SESSION_KEY, null);
+    ssSet(CTX_KEY, null);
     resetFeed();
+    setContextPct(0);
+    ctxLabel.textContent = "—";
+    // Tell the orchestrator to forget this tab's session so the NEXT message
+    // starts a genuinely fresh agent (no memory of the prior conversation).
+    client?.sendFrame?.({ type: "new_session" });
   }
 
   function loadThread(t) {
     thread = t;
+    ssSet(CURRENT_THREAD_KEY, t.id);
     resetFeed();
     for (const m of t.msgs) {
       if (m.role === "user") paintUser(m.text);
       else if (m.role === "agent") paintAgent(m.text);
       else if (m.role === "card") paintCard(m);
     }
+    // Resume this conversation's agent session (or start fresh if it has none),
+    // so typing continues THIS chat rather than whatever was last active.
+    ssSet(SESSION_KEY, t.sessionId || null);
+    if (t.sessionId) client?.sendFrame?.({ type: "resume_session", session_id: t.sessionId });
+    else client?.sendFrame?.({ type: "new_session" });
   }
 
   function renderHistory() {
@@ -1361,9 +1957,12 @@ function buildPanel() {
       return;
     }
     for (const t of list) {
+      const row = document.createElement("div");
+      row.className = "cmcp-hist-row";
+
       const item = document.createElement("button");
       item.type = "button";
-      item.className = "cmcp-popover-item";
+      item.className = "cmcp-popover-item cmcp-hist-open";
       const i = document.createElement("i");
       i.className = "pi pi-comment";
       const lbl = document.createElement("span");
@@ -1380,7 +1979,25 @@ function buildPanel() {
         histPop.hidden = true;
         loadThread(t);
       });
-      histPop.appendChild(item);
+
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "cmcp-hist-del";
+      del.title = "Delete this chat";
+      const di = document.createElement("i");
+      di.className = "pi pi-trash";
+      del.appendChild(di);
+      del.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        threads = threads.filter((x) => x.id !== t.id);
+        persistThreads();
+        // Deleting the open chat clears the feed and starts fresh.
+        if (thread && thread.id === t.id) newChat();
+        renderHistory();
+      });
+
+      row.append(item, del);
+      histPop.appendChild(row);
     }
   }
 
@@ -1432,7 +2049,7 @@ function buildPanel() {
     dots.className = "cmcp-thinking-dots";
     for (let i = 0; i < 3; i += 1) dots.appendChild(document.createElement("span"));
     const label = document.createElement("span");
-    label.textContent = "Claude is working…";
+    label.textContent = "Claude is working… (Ctrl+C to stop)";
     thinkingEl.append(dots, label);
     log.appendChild(thinkingEl);
     scrollLog();
@@ -1454,13 +2071,17 @@ function buildPanel() {
     onStatus(state) {
       statusText.textContent = state;
       dot.className = "cmcp-dot" + (state === "connected" ? " connected" : state === "connecting" ? " connecting" : "");
-      settingsBox.open = state !== "connected";
+      settingsBox.hidden = state !== "disconnected";
       const connected = state === "connected";
       connectBtn.hidden = connected;
       disconnectBtn.hidden = !connected;
       connectBtn.disabled = state === "connecting";
       connectBtn.textContent = state === "connecting" ? "Connecting…" : "Connect";
       if (!connected) hideThinking();
+      // NB: do NOT push set_options here. The saved model id is only known-valid
+      // once the live catalog arrives, so the push happens in applyModelCatalog
+      // — sending an unvalidated fallback id can wedge the agent on a model the
+      // account can't use.
     },
     onSay(text) {
       hideThinking();
@@ -1474,10 +2095,62 @@ function buildPanel() {
       bumpThinking();
     },
     onAgentStatus(s) {
-      if (typeof s.context_pct === "number") setContextPct(s.context_pct);
-      if (typeof s.model === "string" && s.model) modelChip.textContent = s.model;
+      // Percentage of the context window used (label + ring), persisted so a
+      // reload isn't blank. % is what the user wants — not raw token counts.
+      if (typeof s.context_pct === "number") {
+        setContextPct(s.context_pct);
+        ssSet(CTX_KEY, String(s.context_pct));
+        if (typeof s.cost_usd === "number") {
+          ringTitle.textContent = `Context ~${Math.round(s.context_pct * 100)}% used · $${s.cost_usd.toFixed(3)}`;
+        }
+      }
+      // Keep the chip in sync if the agent reports a concrete model id we know.
+      if (typeof s.model === "string" && modelCatalog.some((m) => m.id === s.model)) {
+        prefs.model = s.model;
+        refreshModelChip();
+      }
     },
+    onSession(sessionId) {
+      bindSession(sessionId);
+    },
+    onModels(list) {
+      applyModelCatalog(list);
+    },
+    getResume: () => ssGet(SESSION_KEY),
   });
+
+  // ---- ComfyUI execution events → image cards + agent awareness (#7) ----
+  // When a run finishes with output images, show them in the chat and notify
+  // the agent so it knows its render landed (the orchestrator drops the event
+  // if no session is attending). On error, notify the agent to diagnose.
+  function onExecuted(ev) {
+    const d = ev?.detail ?? {};
+    const images = (d.output && d.output.images) || [];
+    if (!images.length) return;
+    for (const img of images) {
+      if (img && img.filename) paintImage(imageViewUrl(img), img.filename);
+    }
+    client.sendFrame({
+      type: "agent_event",
+      kind: "executed",
+      images,
+      node_id: d.node ?? d.display_node ?? null,
+    });
+  }
+  function onExecError(ev) {
+    const d = ev?.detail ?? {};
+    client.sendFrame({
+      type: "agent_event",
+      kind: "run_error",
+      error: d.exception_message || d.exception_type || "execution error",
+    });
+  }
+  try {
+    api.addEventListener("executed", onExecuted);
+    api.addEventListener("execution_error", onExecError);
+  } catch {
+    // api unavailable — execution surfacing disabled
+  }
 
   saveBtn.addEventListener("click", () => {
     client.setUrl(urlInput.value.trim());
@@ -1511,7 +2184,7 @@ function buildPanel() {
     connectBtn.textContent = "Connect";
     statusText.textContent = "disconnected";
     dot.className = "cmcp-dot";
-    settingsBox.open = true;
+    settingsBox.hidden = false;
     try {
       await api.fetchApi("/comfyui_mcp_panel/disconnect", { method: "POST" });
     } catch {
@@ -1762,7 +2435,7 @@ function buildPanel() {
   });
 
   // ---- submit ----
-  form.addEventListener("submit", (ev) => {
+  form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     hideMenu();
     const text = input.value.trim();
@@ -1777,6 +2450,22 @@ function buildPanel() {
         return;
       }
     }
+    if (!client.isConnected()) {
+      appendSystem("Not connected — click Connect (in the Connection panel) and try again.");
+      settingsBox.hidden = false;
+      return;
+    }
+    const freshChat = !thread;
+    appendUser(text);
+    showThinking();
+    input.value = "";
+    input.style.height = "auto";
+    // Ground a brand-new chat: if the open workflow was never saved, save it
+    // first so the agent works from a real file (Ctrl+S / reload behave).
+    if (freshChat) {
+      const saved = await groundUnsavedWorkflow();
+      if (saved) appendSystem(`Saved your workflow as “${saved}” — grounded base for the agent.`);
+    }
     // Stamp where the user is — workflow + opened subgraph — so the agent
     // gets the context without asking.
     let viewing = { scope: "root" };
@@ -1785,19 +2474,10 @@ function buildPanel() {
     } catch {
       // graph unavailable — send without subgraph context
     }
-    const sent = client.sendUserMessage(text, {
+    client.sendUserMessage(text, {
       workflow: getWorkflowTitle(),
       ...(viewing.scope === "subgraph" ? { subgraph: viewing.title } : {}),
     });
-    if (sent) {
-      appendUser(text);
-      showThinking();
-      input.value = "";
-      input.style.height = "auto";
-    } else {
-      appendSystem("Not connected — click Connect (in the Connection panel) and try again.");
-      settingsBox.open = true;
-    }
   });
 
   input.addEventListener("keydown", (ev) => {
@@ -1828,6 +2508,22 @@ function buildPanel() {
       form.requestSubmit();
     }
   });
+  // Ctrl+C / Cmd+C interrupts a running turn. Only when no text is selected
+  // (so copy still works) and a turn is actually in flight. Scoped to the panel
+  // via bubbling — it won't hijack Ctrl+C elsewhere in ComfyUI.
+  root.addEventListener("keydown", (ev) => {
+    if ((ev.ctrlKey || ev.metaKey) && (ev.key === "c" || ev.key === "C")) {
+      const hasSelection = (window.getSelection?.()?.toString() ?? "").length > 0;
+      if (!hasSelection && thinkingEl) {
+        ev.preventDefault();
+        if (client.sendFrame({ type: "interrupt" })) {
+          hideThinking();
+          appendSystem("Interrupted.");
+        }
+      }
+    }
+  });
+
   input.addEventListener("blur", () => setTimeout(hideMenu, 150));
   // Auto-grow the textarea up to its CSS max-height.
   input.addEventListener("input", () => {
@@ -1835,6 +2531,45 @@ function buildPanel() {
     input.style.height = `${Math.min(input.scrollHeight, 120)}px`;
     refreshMenu();
   });
+
+  // Dismiss the header/picker dropdowns when clicking anywhere outside them
+  // (not just on the trigger or an option). Uses mousedown so it settles before
+  // an option's own click handler runs. The completion menu keeps its own
+  // blur-based dismissal.
+  function onDocPointerDown(ev) {
+    const t = ev.target;
+    if (!settingsBox.hidden && !settingsBox.contains(t) && !status.contains(t)) {
+      settingsBox.hidden = true;
+    }
+    if (!histPop.hidden && !histPop.contains(t) && !historyBtn.contains(t)) {
+      histPop.hidden = true;
+    }
+    if (!modelPop.hidden && !modelPop.contains(t) && !modelChip.contains(t)) {
+      modelPop.hidden = true;
+    }
+  }
+  document.addEventListener("mousedown", onDocPointerDown);
+
+  // Reload restore: repaint the chat this tab was last showing. The agent's
+  // memory continues automatically — either the orchestrator's agent for this
+  // (stable) tab id is still alive, or hello's `resume` (the session id kept in
+  // sessionStorage) rehydrates it from disk after an orchestrator restart.
+  (function restoreLastThread() {
+    try {
+      const cur = ssGet(CURRENT_THREAD_KEY);
+      const t = cur ? threads.find((x) => x.id === cur) : null;
+      if (!t || !t.msgs?.length) return;
+      thread = t;
+      resetFeed();
+      for (const m of t.msgs) {
+        if (m.role === "user") paintUser(m.text);
+        else if (m.role === "agent") paintAgent(m.text);
+        else if (m.role === "card") paintCard(m);
+      }
+    } catch {
+      // Corrupt/absent state — start clean.
+    }
+  })();
 
   // On load, only auto-connect if a bridge is already up (you started the
   // orchestrator yourself, or another tab did). Otherwise sit idle behind the
@@ -1856,6 +2591,13 @@ function buildPanel() {
         recognition?.stop();
       } catch {
         // recognition already stopped
+      }
+      document.removeEventListener("mousedown", onDocPointerDown);
+      try {
+        api.removeEventListener("executed", onExecuted);
+        api.removeEventListener("execution_error", onExecError);
+      } catch {
+        // already detached
       }
       client.destroy();
       root.remove();
@@ -1888,6 +2630,13 @@ if (!app || typeof app.registerExtension !== "function") {
         render: (container) => {
           if (mounted) mounted.destroy();
           mounted = buildPanel();
+          // Make the tab content a full-height flex column so the panel's header
+          // and input pin to the edges and only the chat body scrolls (the
+          // container otherwise sizes to content and the whole panel scrolls).
+          container.style.height = "100%";
+          container.style.minHeight = "0";
+          container.style.display = "flex";
+          container.style.flexDirection = "column";
           container.appendChild(mounted.root);
         },
         destroy: () => {

@@ -25,10 +25,14 @@ Env knobs:
 """
 
 import atexit
+import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
+import tempfile
+import time
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
@@ -75,9 +79,101 @@ def _detect_comfyui_url():
     return "http://{}:{}".format(host, port)
 
 
+def _detect_comfyui_path():
+    """Best-effort: the ComfyUI install dir, so the agent's MCP runs in LOCAL
+    mode (download_model, apply_manifest / installer packs, model scans) instead
+    of remote-only."""
+    if os.environ.get("COMFYUI_PATH"):
+        return os.environ["COMFYUI_PATH"]
+    try:
+        import folder_paths  # provided by ComfyUI at runtime
+
+        base = getattr(folder_paths, "base_path", None)
+        if base:
+            return base
+    except Exception:
+        pass
+    return None
+
+
 def _orchestrator_running():
     """True if something already owns the bridge port (our spawn or the user's)."""
     return _port_in_use(_BRIDGE_HOST, _BRIDGE_PORT)
+
+
+# ---------------------------------------------------------------------------
+# Orphan detection. The orchestrator writes a lockfile naming its real pid and
+# the ComfyUI pid that launched it. If a previous ComfyUI session left an
+# orchestrator squatting the bridge port, we can identify it (its parent pid is
+# dead) and replace it on Connect — so a restart never gets trapped talking to a
+# stale agent on old code.
+# ---------------------------------------------------------------------------
+def _lock_path():
+    return os.path.join(
+        tempfile.gettempdir(), "comfyui-mcp-panel-orch-{}.json".format(_BRIDGE_PORT)
+    )
+
+
+def _read_lock():
+    try:
+        with open(_lock_path(), "r") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _pid_alive(pid):
+    """Best-effort liveness probe. Uses psutil (ComfyUI ships it); never uses
+    os.kill(pid, 0) on Windows — there it would TERMINATE the process."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        import psutil  # type: ignore
+
+        return psutil.pid_exists(pid)
+    except Exception:
+        pass
+    if os.name == "nt":
+        return True  # can't safely probe without psutil — assume alive, never kill
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return True
+
+
+def _kill_pid(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    try:
+        import psutil  # type: ignore
+
+        proc = psutil.Process(pid)
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            proc.kill()
+        return True
+    except Exception:
+        pass
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+        else:
+            os.kill(pid, signal.SIGTERM)
+        return True
+    except Exception:
+        return False
 
 
 def _start_orchestrator():
@@ -89,7 +185,39 @@ def _start_orchestrator():
     global _orchestrator_proc
 
     if _orchestrator_running():
-        return True, "already running"
+        lock = _read_lock()
+        parent = lock.get("parent") if lock else None
+        opid = lock.get("pid") if lock else None
+        ours = bool(lock) and parent == os.getpid() and _pid_alive(opid)
+        if ours:
+            return True, "already running"
+        # Replace ONLY a clear orphan: an orchestrator whose launching ComfyUI
+        # (a DIFFERENT pid) is now dead but which still squats the bridge port.
+        # Anything else (user-run orchestrator, another live ComfyUI, or a
+        # pre-lockfile build with no lockfile) is left alone — reuse it.
+        orphan = (
+            bool(lock)
+            and parent
+            and parent != os.getpid()
+            and not _pid_alive(parent)
+        )
+        if not (orphan and not _no_autospawn()):
+            return True, "already running"
+        _log(
+            "replacing orphaned orchestrator pid {} (its ComfyUI {} is gone)".format(opid, parent)
+        )
+        if opid and _pid_alive(opid):
+            _kill_pid(opid)
+        for _ in range(20):
+            if not _port_in_use(_BRIDGE_HOST, _BRIDGE_PORT):
+                break
+            time.sleep(0.1)
+        if _port_in_use(_BRIDGE_HOST, _BRIDGE_PORT):
+            return False, (
+                "the panel bridge port {} is still held by the previous session and "
+                "couldn't be freed — fully restart ComfyUI.".format(_BRIDGE_PORT)
+            )
+        # Port freed — fall through and spawn a fresh orchestrator.
 
     if _no_autospawn():
         return False, (
@@ -106,6 +234,10 @@ def _start_orchestrator():
 
     env = dict(os.environ)
     env["COMFYUI_URL"] = _detect_comfyui_url()
+    _cpath = _detect_comfyui_path()
+    if _cpath:
+        # Local mode for the agent: download_model / apply_manifest (packs) / scans.
+        env["COMFYUI_PATH"] = _cpath
     # Beacon: the orchestrator watches this PID (ComfyUI) and shuts itself down
     # when ComfyUI exits — including crashes/hard-kills where atexit never fires.
     env["COMFYUI_MCP_PARENT_PID"] = str(os.getpid())
