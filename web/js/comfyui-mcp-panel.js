@@ -877,7 +877,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAgentStatus, onSession, onModels, onAck, onTurn, getResume }) {
+function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onAgentStatus, onSession, onModels, onAck, onTurn, getResume }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -920,9 +920,19 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAgentStatus, 
         // Executors may be async (run, save) — await uniformly.
         let reply;
         try {
-          const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];
-          if (!executor) throw new Error(`Unknown command "${msg.cmd}"`);
-          reply = { rid: msg.rid, ok: true, result: await executor(msg) };
+          let result;
+          if (msg.cmd === "ask_user") {
+            // Not a graph executor — render an interactive question card in the
+            // chat (UI scope) and block on the user's pick. The chosen string
+            // becomes the tool result the agent receives.
+            if (!onAsk) throw new Error("This panel build can't display questions.");
+            result = await onAsk(msg);
+          } else {
+            const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];
+            if (!executor) throw new Error(`Unknown command "${msg.cmd}"`);
+            result = await executor(msg);
+          }
+          reply = { rid: msg.rid, ok: true, result };
         } catch (err) {
           reply = {
             rid: msg.rid,
@@ -935,8 +945,8 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAgentStatus, 
         } catch {
           // Socket died between receive and reply — agent side times out.
         }
-        // Surface the action in the chat feed as an activity card.
-        onCommand?.(msg.cmd, msg, reply);
+        // ask_user paints its own card; other commands get an activity card.
+        if (msg.cmd !== "ask_user") onCommand?.(msg.cmd, msg, reply);
         return;
       }
       if (msg && msg.type === "say" && typeof msg.text === "string") {
@@ -2011,6 +2021,119 @@ function buildPanel() {
     scrollLog();
   }
 
+  /**
+   * Render an interactive question card and resolve with the user's pick.
+   * `msg` = { question, header?, options:[{label, description?}], multi_select? }.
+   * Single-select resolves on click; multi-select toggles and resolves on Submit.
+   * An always-present "Other…" field lets the user answer freely. Returns the
+   * chosen string (comma-joined for multi-select) — the agent's tool result.
+   */
+  function paintQuestion(msg) {
+    clearEmpty();
+    const opts = Array.isArray(msg.options) ? msg.options : [];
+    const multi = !!msg.multi_select;
+    const card = document.createElement("div");
+    card.className = "cmcp-card cmcp-question";
+    card.style.cssText = "border-left:3px solid var(--p-primary-color,#3a7bd5);";
+
+    if (msg.header) {
+      const chip = document.createElement("div");
+      chip.className = "cmcp-card-head";
+      chip.style.cssText = "text-transform:uppercase;font-size:0.6rem;letter-spacing:0.05em;opacity:0.7;";
+      chip.textContent = msg.header;
+      card.appendChild(chip);
+    }
+    const q = document.createElement("div");
+    q.style.cssText = "font-weight:600;margin:0.15rem 0 0.5rem;";
+    renderRichText(q, msg.question || "Pick one:");
+    card.appendChild(q);
+
+    const selected = new Set();
+    let done = false;
+    let resolveFn;
+    const promise = new Promise((res) => { resolveFn = res; });
+
+    const finish = (answer) => {
+      if (done) return;
+      done = true;
+      // Lock the card and record the answer so a reload keeps the exchange.
+      card.querySelectorAll("button,input").forEach((el) => (el.disabled = true));
+      card.style.opacity = "0.85";
+      const note = document.createElement("div");
+      note.style.cssText = "font-size:0.7rem;margin-top:0.4rem;color:var(--p-primary-color,#6ea8fe);";
+      note.textContent = `✓ ${answer}`;
+      card.appendChild(note);
+      record({ role: "card", icon: "pi-check", text: `Asked: ${msg.question || ""}`, detail: `Answer: ${answer}` });
+      scrollLog();
+      resolveFn(answer);
+    };
+
+    const btnRow = document.createElement("div");
+    btnRow.style.cssText = "display:flex;flex-direction:column;gap:0.3rem;";
+    for (const opt of opts) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "cmcp-opt";
+      b.style.cssText =
+        "text-align:left;padding:0.4rem 0.55rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
+        "background:var(--p-surface-800,#2a2a2a);color:inherit;cursor:pointer;font-size:0.8rem;";
+      const lbl = document.createElement("div");
+      lbl.style.fontWeight = "600";
+      lbl.textContent = opt.label ?? String(opt);
+      b.appendChild(lbl);
+      if (opt.description) {
+        const d = document.createElement("div");
+        d.style.cssText = "font-size:0.7rem;opacity:0.7;margin-top:0.1rem;";
+        d.textContent = opt.description;
+        b.appendChild(d);
+      }
+      b.addEventListener("click", () => {
+        if (done) return;
+        if (multi) {
+          const label = opt.label ?? String(opt);
+          if (selected.has(label)) { selected.delete(label); b.style.borderColor = "var(--p-surface-500,#555)"; }
+          else { selected.add(label); b.style.borderColor = "var(--p-primary-color,#3a7bd5)"; }
+        } else {
+          finish(opt.label ?? String(opt));
+        }
+      });
+      btnRow.appendChild(b);
+    }
+    card.appendChild(btnRow);
+
+    // Always-available free-text answer ("Other").
+    const otherRow = document.createElement("div");
+    otherRow.style.cssText = "display:flex;gap:0.3rem;margin-top:0.4rem;";
+    const other = document.createElement("input");
+    other.type = "text";
+    other.placeholder = "Other… (type your own answer)";
+    other.style.cssText =
+      "flex:1;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
+      "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:0.8rem;";
+    other.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && other.value.trim()) { e.preventDefault(); finish(other.value.trim()); }
+    });
+    otherRow.appendChild(other);
+
+    const submit = document.createElement("button");
+    submit.type = "button";
+    submit.style.cssText =
+      "padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:0.8rem;" +
+      "background:var(--p-primary-color,#3a7bd5);color:#fff;";
+    submit.textContent = multi ? "Submit" : "Send";
+    submit.addEventListener("click", () => {
+      if (done) return;
+      if (other.value.trim()) finish(other.value.trim());
+      else if (multi && selected.size) finish([...selected].join(", "));
+    });
+    otherRow.appendChild(submit);
+    card.appendChild(otherRow);
+
+    log.appendChild(card);
+    scrollLog();
+    return promise;
+  }
+
   function appendUser(text) {
     paintUser(text);
     record({ role: "user", text });
@@ -2223,6 +2346,30 @@ function buildPanel() {
     scrollLog();
   }
 
+  // ---- auto-fit: after the agent makes structural edits, zoom/center the
+  // canvas so the user can watch what's being built (it's usually zoomed in).
+  // Debounced so a burst of adds/wires/subgraphs settles into ONE fit, and only
+  // for agent-driven structural ops (never the user's own panning/widget tweaks).
+  const AUTOFIT_CMDS = new Set([
+    "graph_add_node",
+    "graph_remove_node",
+    "graph_connect",
+    "graph_disconnect",
+    "graph_create_subgraph",
+  ]);
+  let autoFitTimer = null;
+  function scheduleAutoFit() {
+    if (autoFitTimer) clearTimeout(autoFitTimer);
+    autoFitTimer = setTimeout(() => {
+      autoFitTimer = null;
+      try {
+        GRAPH_TOOL_EXECUTORS.graph_canvas({ action: "fit" });
+      } catch {
+        // empty graph / canvas unavailable — nothing to fit
+      }
+    }, 700);
+  }
+
   // ---- bridge wiring ----
   const client = createBridgeClient({
     onStatus(state) {
@@ -2250,6 +2397,13 @@ function buildPanel() {
       appendAgent(text);
       bumpThinking();
     },
+    // The agent called panel_ask — render a question card and resolve with the
+    // user's pick. Keep the working indicator pinned below it while we wait.
+    onAsk(msg) {
+      const p = paintQuestion(msg);
+      bumpThinking();
+      return p;
+    },
     onTurn(state) {
       if (state === "working") showThinking();
       else if (state === "done") hideThinking();
@@ -2260,6 +2414,9 @@ function buildPanel() {
     onCommand(cmd, msg, reply) {
       appendActivity(cmd, msg, reply);
       bumpThinking();
+      // After structural edits, zoom/center the canvas so the user can watch it
+      // come together (debounced — one fit per burst).
+      if (reply.ok && AUTOFIT_CMDS.has(cmd)) scheduleAutoFit();
       // The agent restarted ComfyUI — arm the auto-resume so we reconnect and
       // nudge it to continue once ComfyUI is back (install→restart→continue).
       if (cmd === "comfy_reboot" && reply.ok) {
