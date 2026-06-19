@@ -18,8 +18,7 @@ time. Prerequisites for the agent to work: Node.js/``npx`` on PATH, and a Claude
 login (run ``claude`` once, or ``claude setup-token``).
 
 Env knobs:
-- ``COMFYUI_MCP_BRIDGE_PORT`` — panel bridge port to check/own (default 9180;
-  distinct from the legacy ``comfyui-mcp --channels`` bridge on 9101).
+- ``COMFYUI_MCP_BRIDGE_PORT`` — panel bridge port to check/own (default 9180).
 - ``COMFYUI_URL`` — ComfyUI the agent generates against (auto-detected otherwise).
 - ``COMFYUI_MCP_NO_AUTOSPAWN=1`` — the Connect route won't spawn; it only reports
   status (use when you run the orchestrator yourself).
@@ -261,14 +260,12 @@ def _start_orchestrator():
         orphan = _lock_parent_is_gone(lock)
         if not (orphan and not _no_autospawn()):
             if not lock:
-                # Port held but NO orchestrator lockfile — a foreign process
-                # (often a `comfyui-mcp --channels` server from a Claude/Cursor
-                # session). Do NOT claim "already running": the panel would attach
-                # to a non-agent ("connected but dead"). Surface it instead.
+                # Port held but NO orchestrator lockfile — a foreign process is
+                # squatting it. Do NOT claim "already running": the panel would
+                # attach to a non-agent ("connected but dead"). Surface it instead.
                 return False, (
                     "the panel bridge port {} is held by another process that isn't a panel "
-                    "orchestrator (often a 'comfyui-mcp --channels' server in a Claude/Cursor "
-                    "session). Close it, or set COMFYUI_MCP_BRIDGE_PORT to a free port.".format(_BRIDGE_PORT)
+                    "orchestrator. Close it, or set COMFYUI_MCP_BRIDGE_PORT to a free port.".format(_BRIDGE_PORT)
                 )
             if parent and parent != os.getpid() and not orphan:
                 return False, (
@@ -319,9 +316,7 @@ def _start_orchestrator():
     _parent_started_at = _current_process_started_at_ms()
     if _parent_started_at is not None:
         env["COMFYUI_MCP_PARENT_STARTED_AT_MS"] = str(_parent_started_at)
-    # Pin the orchestrator to the PANEL bridge port (9180 by default) — distinct
-    # from the legacy `comfyui-mcp --channels` bridge (9101), so a stray
-    # --channels server in any Claude/Cursor session can't squat the panel port.
+    # Pin the orchestrator to the PANEL bridge port (9180 by default).
     env["COMFYUI_MCP_BRIDGE_PORT"] = str(_BRIDGE_PORT)
     # Subscription lane: the background agent authenticates via the on-disk Claude
     # login, never an API key.

@@ -373,7 +373,7 @@ function imageViewUrl(img) {
   }
 }
 
-/** Current workflow title for this tab (shown in panel_status). */
+/** Current workflow title for this tab. */
 function getWorkflowTitle() {
   // document.title is "<name> - ComfyUI" with a leading "*" when unsaved.
   const t = document.title.replace(/ - ComfyUI$/, "").replace(/^\*/, "").trim();
