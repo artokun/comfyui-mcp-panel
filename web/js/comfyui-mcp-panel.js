@@ -1766,6 +1766,18 @@ const PANEL_CSS = `
 .cmcp-todo-item.done .pi { color: var(--p-green-400, #4ade80); }
 .cmcp-todo-item.active { font-weight: 600; }
 .cmcp-todo-item.active .pi { color: var(--p-primary-color, #60a5fa); }
+/* Pending messages live in the tray (not the chat flow). The inline bubble + its
+   status line stay hidden while queued/failed; on "read" the classes drop and the
+   bubble materializes in place — right before the agent's reply. */
+.cmcp-bubble.user.queued, .cmcp-bubble.user.failed { display: none; }
+.cmcp-msg-status.queued, .cmcp-msg-status.failed { display: none; }
+.cmcp-pending-item { display: flex; align-items: center; gap: 0.3rem; padding: 0.15rem 0; line-height: 1.3; }
+.cmcp-pending-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmcp-pending-item.failed .cmcp-pending-text { color: var(--p-red-300, #fca5a5); }
+.cmcp-pending-act { flex: none; width: 1.2rem; height: 1.2rem; padding: 0; border: none; background: transparent;
+  color: var(--p-text-muted-color, #a1a1aa); cursor: pointer; border-radius: 4px; font-size: 0.7rem; }
+.cmcp-pending-act:hover { color: var(--p-primary-color, #60a5fa); background: var(--p-surface-700, #3f3f46); }
+.cmcp-pending-act.danger:hover { color: var(--p-red-300, #fca5a5); }
 .cmcp-todo-item.pending .pi { opacity: 0.5; }
 .cmcp-dl { margin-bottom: 0.4rem; }
 .cmcp-dl-item { padding: 0.18rem 0; }
@@ -2317,12 +2329,58 @@ function buildPanel() {
     return `${v.toFixed(1)} ${u[i]}`;
   }
 
+  function mkPendingAct(icon, title, onClick, danger) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "cmcp-pending-act" + (danger ? " danger" : "");
+    b.title = title;
+    b.innerHTML = `<i class="pi ${icon}"></i>`;
+    b.addEventListener("click", onClick);
+    return b;
+  }
+
   function renderTray() {
     tray.replaceChildren();
+    // Only messages actually waiting (queued behind a turn) or failed belong in
+    // the tray — not idle sends that process immediately.
+    const pendingList = [...pendingMsgs].filter(
+      ([, e]) => e.state === "queued" || e.state === "failed",
+    );
+    const hasPending = pendingList.length > 0;
     const hasDl = downloadItems.length > 0;
     const hasTodo = todoItems.length > 0;
-    tray.hidden = !hasDl && !hasTodo;
+    tray.hidden = !hasPending && !hasDl && !hasTodo;
     if (tray.hidden) return;
+
+    // Pending messages (queued/failed) live here, not in the chat flow. Each has
+    // edit / send-now / delete. On dequeue they materialize as a chat bubble.
+    if (hasPending) {
+      const pend = document.createElement("div");
+      const head = document.createElement("div");
+      head.className = "cmcp-tray-head";
+      head.textContent = `Pending · ${pendingList.length}`;
+      pend.appendChild(head);
+      for (const [mid, entry] of pendingList) {
+        const row = document.createElement("div");
+        row.className = "cmcp-pending-item" + (entry.state === "failed" ? " failed" : "");
+        const txt = document.createElement("span");
+        txt.className = "cmcp-pending-text";
+        txt.textContent = entry.raw || "";
+        txt.title = entry.raw || "";
+        row.append(
+          txt,
+          mkPendingAct("pi-pencil", "Edit — pull back to the composer", () => editMsg(mid)),
+          mkPendingAct(
+            "pi-send",
+            entry.state === "failed" ? "Resend now" : "Send now (interrupt the current turn)",
+            () => sendNowMsg(mid),
+          ),
+          mkPendingAct("pi-times", "Delete this message", () => deleteMsg(mid), true),
+        );
+        pend.appendChild(row);
+      }
+      tray.appendChild(pend);
+    }
 
     if (hasDl) {
       const dl = document.createElement("div");
@@ -3083,16 +3141,21 @@ function buildPanel() {
   function setMsgStatus(mid, state) {
     const statusEl = statusElFor(mid);
     const bubble = log.querySelector(`.cmcp-bubble.user[data-mid="${mid}"]`);
+    const entry = pendingMsgs.get(mid);
+    if (entry) entry.state = state;
     if (state === "read") {
-      // The agent dequeued it → normal bubble, no chrome.
+      // The agent dequeued it → the bubble materializes in place (CSS un-hides it),
+      // and it leaves the pending tray.
       bubble?.classList.remove("queued", "failed");
       statusEl?.remove();
+      renderTray();
       return;
     }
     // queued (muted) or failed (red): tint the bubble + expose ✎/✕. The agent
     // hasn't read it yet, so editing/deleting just yanks it from the queue.
     bubble?.classList.toggle("queued", state === "queued");
     bubble?.classList.toggle("failed", state === "failed");
+    renderTray(); // reflect queued/failed state in the pending tray
     if (!statusEl) return;
     statusEl.className = "cmcp-msg-status " + state;
     statusEl.replaceChildren(
@@ -3128,10 +3191,29 @@ function buildPanel() {
   }
 
   function trackSend(mid, statusEl, payload, raw) {
-    pendingMsgs.set(mid, { statusEl, payload, raw, timer: null });
+    // "queued" (agent busy → waiting in the pending tray) vs "sending" (idle send,
+    // processes immediately → stays inline, not in the tray).
+    pendingMsgs.set(mid, { statusEl, payload, raw, timer: null, state: agentWorking ? "queued" : "sending" });
     const ok = client.sendUserMessage(payload.text, payload.context, payload.images, mid);
     if (!ok) setMsgStatus(mid, "failed"); // socket wasn't open — instant fail
     else armDeliveryTimeout(mid);
+    renderTray(); // surface it in the pending tray (not inline)
+  }
+
+  /** "Send now" from the pending tray: a queued message → interrupt the current
+   *  turn so the agent gets to the queue immediately; a failed one → resend it. */
+  function sendNowMsg(mid) {
+    const entry = pendingMsgs.get(mid);
+    if (!entry) return;
+    if (entry.state === "failed") {
+      setMsgStatus(mid, "queued");
+      const ok = client.sendUserMessage(entry.payload.text, entry.payload.context, entry.payload.images, mid);
+      if (!ok) setMsgStatus(mid, "failed");
+      else armDeliveryTimeout(mid);
+    } else {
+      client?.sendFrame?.({ type: "interrupt" });
+    }
+    renderTray();
   }
 
   /** Receipt ack (orchestrator got it): not dropped → cancel the failure timer.
@@ -3157,6 +3239,7 @@ function buildPanel() {
     if (entry?.timer) clearTimeout(entry.timer);
     pendingMsgs.delete(mid);
     cancelOnServer(mid); // drop it from the agent's queue if still there
+    renderTray(); // remove it from the pending tray
     for (const el of log.querySelectorAll(`[data-mid="${mid}"]`)) el.remove();
     // Remove the EXACT record for this mid (not the trailing one — several may be
     // queued at once).
@@ -3581,6 +3664,11 @@ function buildPanel() {
   // that message forks the session at turnAnchors[recorded-1]. Reset on new chat.
   let turnAnchors = [];
 
+  // True while a turn is in flight — a message sent now will QUEUE (→ pending
+  // tray) rather than start immediately. Drives the tray-vs-inline decision so
+  // an idle send doesn't briefly flash through the tray.
+  let agentWorking = false;
+
   // ---- bridge wiring ----
   const client = createBridgeClient({
     onStatus(state) {
@@ -3644,9 +3732,11 @@ function buildPanel() {
     },
     onTurn(state) {
       if (state === "working") {
+        agentWorking = true;
         showThinking();
         ssSet(MID_TASK_KEY, "1"); // a turn is in flight — arm the resume nudge
       } else if (state === "done") {
+        agentWorking = false;
         hideThinking();
         ssSet(MID_TASK_KEY, null); // turn finished cleanly — nothing to resume
       }
@@ -4770,7 +4860,9 @@ function buildPanel() {
     const freshChat = !thread;
     const mid = newMid();
     const painted = appendUser(text, { mid });
-    setMsgStatus(mid, "queued"); // muted + ✎/✕ until the agent actually reads it
+    // Only mark queued (→ hidden bubble + pending tray) if a turn is already in
+    // flight; an idle send processes immediately, so leave it inline (no flash).
+    if (agentWorking) setMsgStatus(mid, "queued");
     // Capture the pre-turn graph so /revert can undo this turn's edits in one step.
     captureGraphSnapshot(mid, text);
     showThinking();
