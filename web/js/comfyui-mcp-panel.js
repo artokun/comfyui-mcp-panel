@@ -2913,7 +2913,9 @@ function buildPanel() {
     stickToBottom = true; // your own message → always jump to the latest
     newMsgBtn.hidden = true;
     const painted = paintUser(text, opts);
-    record({ role: "user", text });
+    // Tag the record with its mid so deleteMsg can remove the EXACT message even
+    // when several are queued (popping the trailing one would hit the wrong one).
+    record({ role: "user", text, ...(opts.mid ? { mid: opts.mid } : {}) });
     return painted;
   }
 
@@ -3032,11 +3034,15 @@ function buildPanel() {
     pendingMsgs.delete(mid);
     cancelOnServer(mid); // drop it from the agent's queue if still there
     for (const el of log.querySelectorAll(`[data-mid="${mid}"]`)) el.remove();
-    // A queued/undelivered message was never answered → it's the trailing record.
+    // Remove the EXACT record for this mid (not the trailing one — several may be
+    // queued at once).
     const msgs = thread?.msgs;
-    if (msgs && msgs.length && msgs[msgs.length - 1].role === "user") {
-      msgs.pop();
-      persistThreads();
+    if (msgs) {
+      const i = msgs.findIndex((m) => m.role === "user" && m.mid === mid);
+      if (i >= 0) {
+        msgs.splice(i, 1);
+        persistThreads();
+      }
     }
   }
 
