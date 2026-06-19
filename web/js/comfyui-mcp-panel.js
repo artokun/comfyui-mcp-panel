@@ -1271,6 +1271,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
         markConnected();
         onModels?.(msg.models, typeof msg.current === "string" ? msg.current : undefined);
       }
+      // SDK slash commands (built-ins like /compact, plus any loaded skills) —
+      // surfaced in the composer's completion menu.
+      if (msg && msg.type === "commands" && Array.isArray(msg.commands)) {
+        onCommands?.(msg.commands);
+      }
       // Structured acks (ready / working / options / …). The "ready" ack is sent
       // after the orchestrator has processed hello (resume armed), so it's the
       // reliable signal to send a post-restart resume nudge.
@@ -2819,7 +2824,8 @@ function buildPanel() {
     clearEmpty();
     const card = document.createElement("div");
     card.className = "cmcp-card cmcp-secret";
-    card.style.cssText = "border-left:3px solid var(--p-yellow-400,#facc15);";
+    card.style.cssText =
+      "border-left:3px solid var(--p-yellow-400,#facc15);width:100%;box-sizing:border-box;";
 
     const head = document.createElement("div");
     head.className = "cmcp-card-head";
@@ -2849,7 +2855,7 @@ function buildPanel() {
     input.spellcheck = false;
     input.placeholder = "Paste token…";
     input.style.cssText =
-      "flex:1;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
+      "flex:1;min-width:7rem;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
       "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:0.8rem;";
 
     // Show/record only a masked preview (first 4 … last 4) so the user can
@@ -3435,6 +3441,10 @@ function buildPanel() {
     }, 700);
   }
 
+  // SDK-provided slash commands (built-ins like /compact, plus any loaded
+  // skills), pushed by the orchestrator — surfaced in the completion menu below.
+  let sdkCommands = [];
+
   // ---- bridge wiring ----
   const client = createBridgeClient({
     onStatus(state) {
@@ -3542,6 +3552,10 @@ function buildPanel() {
     },
     onModels(list) {
       applyModelCatalog(list);
+    },
+    onCommands(list) {
+      // SDK-provided slash commands → surface in the composer completion menu.
+      sdkCommands = Array.isArray(list) ? list : [];
     },
     onAck(ack) {
       // Receipt: orchestrator got it (not dropped) → cancel the failure timer.
@@ -3845,7 +3859,7 @@ function buildPanel() {
       const el = document.createElement("button");
       el.type = "button";
       el.className =
-        "cmcp-popover-item" + (idx === 0 ? " sel" : "") + (item.kind === "slash" ? " cmcp-slash" : "");
+        "cmcp-popover-item" + (idx === 0 ? " sel" : "") + (item.kind === "slash" || item.kind === "agent" ? " cmcp-slash" : "");
       const i = document.createElement("i");
       i.className = `pi ${item.icon}`;
       const lbl = document.createElement("span");
@@ -3951,15 +3965,30 @@ function buildPanel() {
     if (/^\/[\w-]*$/.test(upto) && upto === input.value) {
       const q = upto.toLowerCase();
       menuToken = { start: 0, end: input.value.length };
-      showMenu(
-        SLASH_COMMANDS.filter((c) => c.cmd.startsWith(q)).map((c) => ({
-          kind: "slash",
-          icon: c.icon,
-          label: c.cmd,
-          small: c.hint,
-          ref: c,
-        })),
-      );
+      const localItems = SLASH_COMMANDS.filter((c) => c.cmd.startsWith(q)).map((c) => ({
+        kind: "slash",
+        icon: c.icon,
+        label: c.cmd,
+        small: c.hint,
+        ref: c,
+      }));
+      // SDK commands (sent to the agent — the SDK processes them). Skip any whose
+      // name collides with a local command. Picking inserts "/name " so the user
+      // can add args, then send routes it to the agent.
+      const localNames = new Set(SLASH_COMMANDS.map((c) => c.cmd));
+      const sdkItems = sdkCommands
+        .filter((c) => {
+          const names = ["/" + c.name, ...(c.aliases || []).map((a) => "/" + a)];
+          return !localNames.has("/" + c.name) && names.some((n) => n.startsWith(q));
+        })
+        .map((c) => ({
+          kind: "agent",
+          icon: "pi-sparkles",
+          label: "/" + c.name,
+          small: c.description || c.argumentHint || "agent command",
+          insert: "/" + c.name + " ",
+        }));
+      showMenu([...localItems, ...sdkItems]);
       return;
     }
     const atM = upto.match(/(^|\s)@([\w./:-]*)$/);
