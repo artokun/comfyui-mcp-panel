@@ -2718,8 +2718,8 @@ function buildPanel() {
       edit.className = "cmcp-edit-btn";
       edit.title = "Edit & roll back from this message";
       edit.innerHTML = '<i class="pi pi-pencil"></i>';
-      const anchorIdx = typeof opts.anchorIdx === "number" ? opts.anchorIdx : 0;
-      edit.addEventListener("click", () => openRollbackModal({ mid: opts.mid, text, anchorIdx }));
+      const rewindAnchor = opts.rewindAnchor ?? null;
+      edit.addEventListener("click", () => openRollbackModal({ mid: opts.mid, text, anchor: rewindAnchor }));
       b.appendChild(edit);
     }
     log.appendChild(b);
@@ -3032,9 +3032,11 @@ function buildPanel() {
   function appendUser(text, opts = {}) {
     stickToBottom = true; // your own message → always jump to the latest
     newMsgBtn.hidden = true;
-    // Record how many turn anchors exist now, so a rewind to this message forks
-    // the conversation at turnAnchors[anchorIdx - 1].
-    const painted = paintUser(text, { ...opts, anchorIdx: turnAnchors.length });
+    // Capture the rewind anchor NOW (the latest turn's UUID) so a later rewind to
+    // this message forks the conversation right before it — stored directly (not as
+    // an index, which a bounded-ring shift() would invalidate).
+    const rewindAnchor = turnAnchors.length > 0 ? turnAnchors[turnAnchors.length - 1] : null;
+    const painted = paintUser(text, { ...opts, rewindAnchor });
     // Tag the record with its mid so deleteMsg can remove the EXACT message even
     // when several are queued (popping the trailing one would hit the wrong one).
     record({ role: "user", text, ...(opts.mid ? { mid: opts.mid } : {}) });
@@ -4657,8 +4659,7 @@ function buildPanel() {
   // Per-message rollback modal (edit button on a user bubble). Edit the message
   // and choose what to roll back — code (revert the canvas to before it),
   // conversation (fork the agent's memory at that point), or both — then resend.
-  function openRollbackModal({ mid, text, anchorIdx }) {
-    const anchor = anchorIdx > 0 ? turnAnchors[anchorIdx - 1] ?? null : null;
+  function openRollbackModal({ mid, text, anchor }) {
     const overlay = document.createElement("div");
     overlay.className = "cmcp-modal-overlay";
     const modal = document.createElement("div");
