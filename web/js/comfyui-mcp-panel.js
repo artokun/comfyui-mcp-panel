@@ -405,6 +405,26 @@ function getGraphCtx() {
   return { app, graph, rootGraph: app.graph, canvas: app.canvas, LG };
 }
 
+/** Reach ComfyUI's subgraph widget-promotion store. The state that exposes an
+ *  inner subgraph widget on the parent SubgraphNode lives in a Pinia store with
+ *  id "promotion" (methods: promote/demote/isPromoted). Pinia attaches itself as
+ *  `$pinia` on the Vue app's globalProperties; the Vue app instance hangs off its
+ *  mount element (#vue-app) as `__vue_app__`; `_s` is pinia's id→store map. */
+function getPromotionStore() {
+  let pinia = null;
+  try {
+    const el = document.getElementById("vue-app") || document.querySelector("[id*='vue']");
+    pinia = el?.__vue_app__?.config?.globalProperties?.$pinia;
+  } catch {
+    // fall through
+  }
+  const store = pinia?._s?.get?.("promotion");
+  if (!store || typeof store.promote !== "function") {
+    throw new Error("widget-promotion unavailable on this ComfyUI frontend (no 'promotion' store)");
+  }
+  return store;
+}
+
 /** Where is the user looking right now — root graph or inside a subgraph? */
 function describeActiveGraph(graph) {
   if (!app?.graph || graph === app.graph) return { scope: "root" };
@@ -965,6 +985,56 @@ const GRAPH_TOOL_EXECUTORS = {
     canvas.setGraph(graph.rootGraph ?? rootGraph);
     canvas.setDirty?.(true, true);
     return { viewing: describeActiveGraph(getGraphCtx().graph) };
+  },
+
+  // Promote (or demote) an INNER subgraph widget so it appears on the PARENT
+  // SubgraphNode — the thing you couldn't do before. Must be called while INSIDE
+  // the subgraph (graph_enter_subgraph first): node_id is an inner node, widget
+  // is one of its widget names. Mirrors the "Promote Widget" context-menu action
+  // via the frontend's promotion store. Pass demote:true to un-promote.
+  graph_promote_widget({ node_id, widget, demote }) {
+    const { graph, canvas, rootGraph } = getGraphCtx();
+    if (graph === rootGraph) {
+      throw new Error(
+        "Enter the subgraph first (graph_enter_subgraph) — promotion exposes an INNER widget on the parent node.",
+      );
+    }
+    const node = resolveNode(graph, node_id);
+    const widgets = node.widgets ?? [];
+    const w = widgets.find((x) => x && x.name === widget);
+    if (!w) {
+      const names = widgets.map((x) => x?.name).filter(Boolean);
+      throw new Error(
+        `Node ${node.id} (${node.type}) has no widget "${widget}". Available: ${names.join(", ") || "(none)"}`,
+      );
+    }
+    // The parent SubgraphNode instance(s) embedding this subgraph (root-level
+    // search, same as describeActiveGraph). The widget is exposed on these.
+    const parents = (rootGraph._nodes ?? []).filter((n) => n.subgraph === graph);
+    if (!parents.length) {
+      throw new Error("Could not locate the parent subgraph node for the open subgraph.");
+    }
+    const store = getPromotionStore();
+    const source = { sourceNodeId: String(node.id), sourceWidgetName: w.name };
+    const action = demote ? "demote" : "promote";
+    graph.beforeChange?.();
+    try {
+      for (const p of parents) {
+        const rootGraphId = p.rootGraph?.id ?? rootGraph?.id;
+        store[action](rootGraphId, p.id, source);
+        // Recompute the parent node so the (un)promoted widget shows immediately.
+        p.computeSize?.(p.size);
+        p.setDirtyCanvas?.(true, true);
+      }
+    } finally {
+      graph.afterChange?.();
+    }
+    canvas?.setDirty?.(true, true);
+    return {
+      [demote ? "demoted" : "promoted"]: w.name,
+      from_node: node.id,
+      on_subgraph_nodes: parents.map((p) => p.id),
+    };
   },
 
   // --- Custom-node management via the BUILT-IN ComfyUI Manager (/v2 API) ----
@@ -1810,6 +1880,10 @@ function describeCommand(cmd, msg, reply) {
         icon: "pi-sitemap",
         text: `Read subgraph “${r.subgraph_of?.title}” — ${r.node_count} node${r.node_count === 1 ? "" : "s"}`,
       };
+    case "graph_promote_widget":
+      return r.demoted
+        ? { icon: "pi-arrow-down", text: `Un-promoted “${r.demoted}” from the subgraph node` }
+        : { icon: "pi-arrow-up", text: `Promoted “${r.promoted}” to the subgraph node` };
     case "graph_move_node":
       return { icon: "pi-arrows-alt", text: `Moved node ${r.moved?.node_id} to [${r.moved?.to?.map(Math.round)}]` };
     case "graph_canvas":
