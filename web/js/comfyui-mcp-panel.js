@@ -1189,9 +1189,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       } catch {
         return;
       }
-      // Any inbound frame proves the backend is alive and talking — feed the
-      // health watchdog so it only ever fires on TRUE silence.
-      if (msg) onActivity?.();
+      // Feed the health watchdog (it decides what counts as the agent actually
+      // responding vs. a bare receipt ack).
+      if (msg) onActivity?.(msg);
       if (msg && typeof msg.rid === "string" && typeof msg.cmd === "string") {
         // Agent command — execute against the graph, reply with the rid.
         // Executors may be async (run, save) — await uniformly.
@@ -3459,10 +3459,15 @@ function buildPanel() {
   // ---- agent-health watchdog -------------------------------------------------
   // Detect a wedged/unresponsive agent backend (e.g. the Agent-SDK shell dying
   // after a re-auth) and offer one-click recovery, so a user is never stuck
-  // reaching for Task Manager. Purely passive: ANY inbound frame counts as
-  // "alive" (noteAgentActivity), so the banner only appears on TRUE silence
-  // after a message was actually sent — a busy agent streams thinking/text and
-  // keeps resetting the clock.
+  // reaching for Task Manager.
+  //
+  // We only watch the window between "user sent a message" (startAwaiting) and
+  // "the agent produced its FIRST real output" — a stream delta, a reply, a tool
+  // call, or a question (stopAwaiting, called from those callbacks). That first
+  // output proves the backend is alive, so we stop watching and idle time can't
+  // trigger a false alarm. A bare "message received" ack does NOT count (that's
+  // exactly the wedge case: orchestrator alive, agent dead). If no real output
+  // arrives within the threshold, the recovery banner appears.
   const HEALTH_THRESHOLD_MS = 75000; // silence-while-awaiting before we flag it
   const HEALTH_TICK_MS = 10000;
   let lastAgentActivityAt = Date.now();
@@ -3484,7 +3489,12 @@ function buildPanel() {
   bannerRestart.style.cssText = "padding:0.2rem 0.55rem;font-size:0.72rem;white-space:nowrap;";
   bannerRestart.addEventListener("click", () => hardRestart("watchdog"));
   const bannerDismiss = iconBtn("pi-times", "Dismiss");
-  bannerDismiss.addEventListener("click", () => hideUnresponsive());
+  // Dismiss must STICK: also stop awaiting so the 10s timer can't re-show it.
+  // (The next message you send re-arms the watchdog via startAwaiting.)
+  bannerDismiss.addEventListener("click", () => {
+    stopAwaiting();
+    hideUnresponsive();
+  });
   unresponsiveBanner.append(bannerText, bannerRestart, bannerDismiss);
   header.insertAdjacentElement("afterend", unresponsiveBanner);
 
@@ -3590,8 +3600,17 @@ function buildPanel() {
         stopAwaiting(); // reply landed — stand the watchdog down
       }
     },
-    onActivity() {
-      noteAgentActivity();
+    onActivity(msg) {
+      noteAgentActivity(); // any frame: reset the clock + hide the banner
+      // A SUBSTANTIVE response proves the agent is alive AND answering, so stop
+      // watching this send — idle time afterward must not raise a false alarm. A
+      // bare receipt ack ({type:"ack"}) is NOT substantive: that's exactly the
+      // wedge case (orchestrator alive, agent dead), so it must keep us watching.
+      const t = msg && msg.type;
+      const isToolCall = msg && typeof msg.rid === "string" && typeof msg.cmd === "string";
+      if (isToolCall || t === "say" || t === "stream" || t === "turn" || t === "thinking") {
+        stopAwaiting();
+      }
     },
     onLog(text) {
       appendSystem(text);
@@ -3856,11 +3875,15 @@ function buildPanel() {
   }
 
   // Hard restart: recover a wedged/unresponsive agent. Unlike soft reload (which
-  // bounces the orchestrator in place to pick up new code), this kills the
-  // orchestrator AND its whole child tree — clearing a dead Agent-SDK shell that
-  // an in-place reload can't — then respawns a clean one. Runs entirely over the
-  // Python /hard_restart route, so it works even when the agent isn't answering.
-  // The conversation resumes afterward via the persisted session id.
+  // bounces the orchestrator in place and RESUMES, to pick up new code), this
+  // kills the orchestrator AND its whole child tree — clearing a dead Agent-SDK
+  // shell that an in-place reload can't — then respawns and starts a FRESH
+  // session. Resuming would defeat the purpose: a dead tool-subprocess handle is
+  // checkpointed into the session, so resume faithfully restores the corpse and
+  // re-wedges. Fresh = a brand-new shell that works. The chat history stays
+  // visible; the agent's memory resets (an acceptable trade to get it working).
+  // Runs entirely over the Python /hard_restart route, so it works even when the
+  // agent isn't answering.
   async function hardRestart(origin = "user") {
     if (reloading) return;
     reloading = true;
@@ -3891,13 +3914,17 @@ function buildPanel() {
       reloading = false;
       restartBtn.classList.remove("cmcp-spin");
     }
-    // On success, arm the resume so the fresh orchestrator continues the thread —
-    // origin-aware like softReload: a watchdog/mid-task restart wants the agent
-    // continuation nudge ("agent"), a manual click just resumes ("user").
-    if (ok) ssSet(SOFT_RELOAD_KEY, origin === "user" ? "user" : "agent");
+    if (ok) {
+      // Start FRESH on reconnect: clear the saved session id so hello sends no
+      // resume (resuming would restore the wedged shell). Don't arm the resume
+      // nudge. The reconnect spins up a brand-new agent.
+      ssSet(SESSION_KEY, null);
+      ssSet(SOFT_RELOAD_KEY, null);
+      ssSet(MID_TASK_KEY, null);
+      appendSystem("Agent restarted with a fresh session — your message history is still here.");
+    }
     // Reconnect EITHER WAY: on success to the fresh orchestrator, on failure to
-    // restore the bridge we dropped (the old backend may still be intact, and the
-    // session resumes via the normal hello.resume path).
+    // restore the bridge we dropped (the old backend may still be intact).
     client.start();
   }
 
