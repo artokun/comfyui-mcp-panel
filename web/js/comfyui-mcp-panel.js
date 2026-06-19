@@ -3071,6 +3071,12 @@ function buildPanel() {
       // full context but has no pending turn, so it would sit idle. Nudge it.
       if (ack?.kind === "ready" && ssGet(MID_TASK_KEY)) {
         ssSet(MID_TASK_KEY, null);
+        // Only nudge for a REAL restart. A fast reconnect (a panel remount from a
+        // sidebar swap, or a brief WS blip) means the orchestrator never died —
+        // the agent's turn kept running — so a "you dropped" nudge is false AND
+        // would inject a spurious turn into a live session. A real ComfyUI restart
+        // takes many seconds to come back, so a long gap since the drop = real.
+        if (Date.now() - lastBridgeDownAt < 6000) return;
         appendSystem("Reconnected — picking up where we left off.");
         showThinking();
         client.sendUserMessage(
