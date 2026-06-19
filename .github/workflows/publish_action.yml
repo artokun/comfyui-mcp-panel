@@ -13,6 +13,50 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # ---- Gate: never publish a broken pack to the Registry. -------------
+      # web/js is served live and a broken save crashes the whole ComfyUI
+      # frontend; these checks mirror ci.yml and run BEFORE publish. A failed
+      # step aborts the job, so the publish step below only runs if all pass.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: JS syntax check (web/js)
+        shell: bash
+        run: |
+          set -e
+          shopt -s globstar nullglob
+          found=0
+          for f in web/js/**/*.js; do
+            found=1
+            echo "node --check $f"
+            node --check "$f"
+          done
+          [ "$found" = "1" ] || { echo "::error::no web/js/*.js files found"; exit 1; }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Python compile check (__init__.py)
+        run: python -m py_compile __init__.py
+
+      - name: pyproject.toml is valid + has registry fields
+        run: |
+          python - <<'PY'
+          import tomllib
+          d = tomllib.load(open("pyproject.toml", "rb"))
+          proj = d.get("project", {})
+          comfy = d.get("tool", {}).get("comfy", {})
+          missing = [k for k in ("name", "version", "description", "license") if not proj.get(k)]
+          if not comfy.get("PublisherId"):
+              missing.append("tool.comfy.PublisherId")
+          assert not missing, f"pyproject missing required fields: {missing}"
+          print(f"publishing {proj['name']} {proj['version']}")
+          PY
+      # --------------------------------------------------------------------
+
       - name: Publish custom node
         uses: Comfy-Org/publish-node-action@main
         with:
