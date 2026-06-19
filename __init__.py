@@ -349,6 +349,28 @@ def _delete_lock():
         pass
 
 
+def _port_owner_pid(host, port):
+    """Pid LISTENING on (host, port), or None. psutil-only. Lets us identify a
+    lockfile-less zombie squatting the bridge port so Connect can reclaim it."""
+    try:
+        import psutil  # type: ignore
+
+        for c in psutil.net_connections(kind="inet"):
+            try:
+                if (
+                    c.status == psutil.CONN_LISTEN
+                    and c.laddr
+                    and int(c.laddr.port) == int(port)
+                    and c.pid
+                ):
+                    return c.pid
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
 def _start_orchestrator():
     """Start the panel orchestrator on demand. Returns (ok: bool, message: str).
 
@@ -361,48 +383,58 @@ def _start_orchestrator():
         lock = _read_lock()
         parent = lock.get("parent") if lock else None
         opid = lock.get("pid") if lock else None
-        ours = _lock_parent_is_current(lock) and _pid_alive(opid)
-        if ours:
+        # Healthy + ours (our ComfyUI launched it and its pid is alive) → reuse.
+        if lock and _lock_parent_is_current(lock) and _pid_alive(opid):
             return True, "already running"
-        # Replace ONLY a clear orphan: an orchestrator whose launching ComfyUI
-        # (a DIFFERENT pid) is now dead but which still squats the bridge port.
-        # Anything else (user-run orchestrator, another live ComfyUI, or a
-        # pre-lockfile build with no lockfile) is left alone — reuse it.
-        orphan = _lock_parent_is_gone(lock)
-        if not (orphan and not _no_autospawn()):
-            if not lock:
-                # Port held but NO orchestrator lockfile — a foreign process is
-                # squatting it. Do NOT claim "already running": the panel would
-                # attach to a non-agent ("connected but dead"). Surface it instead.
-                return False, (
-                    "the panel bridge port {} is held by another process that isn't a panel "
-                    "orchestrator. Close it, or set COMFYUI_MCP_BRIDGE_PORT to a free port.".format(_BRIDGE_PORT)
-                )
-            if parent and parent != os.getpid() and not orphan:
+
+        # Otherwise the port is held by something that isn't a healthy orchestrator
+        # of ours. Decide whether to RECLAIM it (kill + respawn) or bail. Reclaim
+        # only a process we can VERIFY is a panel orchestrator (cmdline check), so
+        # a genuinely foreign squatter is never killed.
+        reclaim_pid = None
+        reclaim_started = None
+        if lock and _pid_alive(opid) and _is_orchestrator_process(opid):
+            if parent and parent != os.getpid() and not _lock_parent_is_gone(lock):
+                # A different, still-live ComfyUI owns it — leave it alone.
                 return False, (
                     "the panel bridge port {} is owned by another live ComfyUI "
                     "(pid {}). Close it or set COMFYUI_MCP_BRIDGE_PORT to a "
                     "different port for this instance.".format(_BRIDGE_PORT, parent)
                 )
-            return True, "already running"
-        _log(
-            "replacing orphaned orchestrator pid {} (its ComfyUI {} is gone)".format(opid, parent)
-        )
-        # Kill ONLY if it's verifiably our orchestrator — never a reused pid.
-        # _kill_pid re-verifies (cmdline + the recorded creation time) right
-        # before it signals, so a pid recycled to an unrelated process is spared.
-        if opid and _is_orchestrator_process(opid):
-            _kill_pid(opid, lock.get("pidStartedAt"))
-        for _ in range(20):
-            if not _port_in_use(_BRIDGE_HOST, _BRIDGE_PORT):
-                break
-            time.sleep(0.1)
-        if _port_in_use(_BRIDGE_HOST, _BRIDGE_PORT):
-            return False, (
-                "the panel bridge port {} is still held by the previous session and "
-                "couldn't be freed — fully restart ComfyUI.".format(_BRIDGE_PORT)
-            )
-        # Port freed — fall through and spawn a fresh orchestrator.
+            # Our orchestrator but not healthy (orphaned ComfyUI, or wedged) → reclaim.
+            reclaim_pid, reclaim_started = opid, lock.get("pidStartedAt")
+        else:
+            # No (valid) lockfile, or its pid is dead, but the port is held. Find
+            # the actual port owner: a lockfile-less panel-orchestrator ZOMBIE (the
+            # "won't reconnect" bug) gets reclaimed; a truly foreign process is left.
+            owner = _port_owner_pid(_BRIDGE_HOST, _BRIDGE_PORT)
+            if owner and _is_orchestrator_process(owner):
+                reclaim_pid = owner
+            elif owner:
+                return False, (
+                    "the panel bridge port {} is held by another process that isn't a "
+                    "panel orchestrator. Close it, or set COMFYUI_MCP_BRIDGE_PORT to a "
+                    "free port.".format(_BRIDGE_PORT)
+                )
+            # owner unknown (couldn't read) → fall through; the bind will fail loudly
+            # if the port really is still held.
+
+        if reclaim_pid is not None:
+            if _no_autospawn():
+                return True, "reconnecting to your orchestrator"  # user-managed; don't kill
+            _log("reclaiming panel bridge port {} from orchestrator pid {}".format(_BRIDGE_PORT, reclaim_pid))
+            _kill_orchestrator_tree(reclaim_pid, reclaim_started)
+            _delete_lock()
+            for _ in range(20):
+                if not _port_in_use(_BRIDGE_HOST, _BRIDGE_PORT):
+                    break
+                time.sleep(0.1)
+            if _port_in_use(_BRIDGE_HOST, _BRIDGE_PORT):
+                return False, (
+                    "the panel bridge port {} is still held and couldn't be freed — "
+                    "fully restart ComfyUI.".format(_BRIDGE_PORT)
+                )
+        # Port freed (or never really held) — fall through and spawn a fresh one.
 
     if _no_autospawn():
         return False, (
