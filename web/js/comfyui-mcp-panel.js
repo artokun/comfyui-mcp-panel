@@ -1039,7 +1039,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onDownloads, onAgentStatus, onSession, onModels, onAck, onTurn, getResume }) {
+function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onDownloads, onThinking, onAgentStatus, onSession, onModels, onAck, onTurn, getResume }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -1200,6 +1200,10 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret
       // from the download tool's temp progress file and/or the Manager queue).
       if (msg && msg.type === "download_progress" && Array.isArray(msg.downloads)) {
         onDownloads?.(msg.downloads);
+      }
+      // Live extended-thinking token count → "thinking… (N)" indicator.
+      if (msg && msg.type === "thinking" && typeof msg.tokens === "number") {
+        onThinking?.(msg.tokens);
       }
       // "echo" frames are ignored — we render the user bubble locally on send.
     });
@@ -2822,6 +2826,7 @@ function buildPanel() {
   let workWordTimer = null;
   let workWordIdx = 0;
   let thinkingSafety = null;
+  let thinkingTokens = 0;
   // Backstop: if no activity (say/command/turn signal) for this long, auto-hide
   // — covers a missed turn:done (e.g. an older orchestrator, or an errored turn)
   // so the indicator never sticks forever.
@@ -2832,10 +2837,24 @@ function buildPanel() {
     thinkingSafety = setTimeout(hideThinking, THINKING_SAFETY_MS);
   }
 
+  function fmtThinkTokens(n) {
+    return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
+  }
   function cycleWord() {
     if (!thinkingLabel) return;
-    thinkingLabel.textContent = `${WORK_WORDS[workWordIdx % WORK_WORDS.length]}… (Ctrl+C to stop)`;
+    const base =
+      thinkingTokens > 0
+        ? `Thinking… (${fmtThinkTokens(thinkingTokens)} tokens)`
+        : `${WORK_WORDS[workWordIdx % WORK_WORDS.length]}…`;
+    thinkingLabel.textContent = `${base} (Ctrl+C to stop)`;
     workWordIdx += 1;
+  }
+  // Live extended-thinking token meter (from the orchestrator's thinking frame).
+  function setThinkingTokens(n) {
+    thinkingTokens = Number(n) || 0;
+    if (!thinkingEl) showThinking();
+    cycleWord();
+    armSafety();
   }
 
   function hideThinking() {
@@ -2852,6 +2871,7 @@ function buildPanel() {
       thinkingEl = null;
       thinkingLabel = null;
     }
+    thinkingTokens = 0; // reset so the next turn doesn't show a stale count
   }
 
   function showThinking() {
@@ -2948,6 +2968,10 @@ function buildPanel() {
     // Orchestrator pushed live download progress → render rows in the tray.
     onDownloads(list) {
       renderDownloads(list);
+    },
+    // Live extended-thinking token count → update the working indicator.
+    onThinking(tokens) {
+      setThinkingTokens(tokens);
     },
     // The agent called panel_request_secret — collect a token securely.
     onSecret(msg) {
