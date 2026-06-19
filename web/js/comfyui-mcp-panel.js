@@ -32,28 +32,35 @@
 // `NodeHandle`/`WidgetHandle`. v1 call sites are tagged `// TODO(v2):`.
 // =============================================================================
 
-// ComfyUI loads extension files as ES modules; on modern frontends (1.4x+)
-// `window.app` is no longer assigned before extension eval, so the module
-// import is the canonical access path. The absolute specifier works from any
-// nesting depth under /extensions/<pack>/.
-import { app } from "/scripts/app.js";
-import { api } from "/scripts/api.js";
+// `app` / `api` are resolved LAZILY (not via a static `import "/scripts/app.js"`).
+// On Vite/Rolldown frontends, extension modules are evaluated alphabetically-early
+// — before `window.comfyAPI.app` is populated — so a static import of the app.js
+// shim can throw synchronously and deadlock the module loader. We grab them from
+// window.comfyAPI once it's ready instead (see registerExtensionWhenReady at the
+// bottom). Deferral approach contributed by @FreesoSaiFared.
 import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 
-// Execution-error capture: listen from module load so graph_get_errors can
-// report the most recent failure even if it predates the agent's question.
-// execution_start clears state for the new run.
+let app = null;
+let api = null;
+
+// Execution-error capture so graph_get_errors can report the most recent failure
+// even if it predates the agent's question. Wired once `api` is ready (via
+// setupListeners, called from registerExtensionWhenReady). execution_start clears
+// state for the new run.
 let lastExecutionError = null;
-try {
-  api.addEventListener("execution_error", (ev) => {
-    lastExecutionError = { ...(ev.detail ?? {}), ts: new Date().toISOString() };
-  });
-  api.addEventListener("execution_start", () => {
-    lastExecutionError = null;
-  });
-} catch {
-  // api unavailable — graph_get_errors reports null.
+function setupListeners() {
+  if (!api) return;
+  try {
+    api.addEventListener("execution_error", (ev) => {
+      lastExecutionError = { ...(ev.detail ?? {}), ts: new Date().toISOString() };
+    });
+    api.addEventListener("execution_start", () => {
+      lastExecutionError = null;
+    });
+  } catch {
+    // api unavailable — graph_get_errors reports null.
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -4322,13 +4329,27 @@ function buildPanel() {
 }
 
 // ---------------------------------------------------------------------------
-// v1 registration via the imported app module.
+// Registration. Resolve `app`/`api` from window.comfyAPI and register the
+// extension only once they're ready — deferring past Vite/Rolldown's early
+// module eval so a not-yet-populated shim can't throw and deadlock the loader.
+// Defensive deferral contributed by @FreesoSaiFared (PR #2).
 // ---------------------------------------------------------------------------
-if (!app || typeof app.registerExtension !== "function") {
-  console.error(
-    "[comfyui-mcp-panel] app.registerExtension is unavailable — incompatible ComfyUI frontend version.",
-  );
-} else {
+function registerExtensionWhenReady(tries = 0) {
+  const comfyApp = window.comfyAPI?.app?.app || window.app;
+  if (!comfyApp || typeof comfyApp.registerExtension !== "function") {
+    if (tries >= 1000) {
+      console.error(
+        "[comfyui-mcp-panel] app.registerExtension never became available — incompatible ComfyUI frontend version.",
+      );
+      return;
+    }
+    setTimeout(() => registerExtensionWhenReady(tries + 1), 10);
+    return;
+  }
+  app = comfyApp;
+  api = window.comfyAPI?.api?.api || window.api || null;
+  setupListeners();
+
   // TODO(v2): replace with `defineExtension({ name, setup() {...} })`.
   app.registerExtension({
     name: "comfyui-mcp.agent-panel",
@@ -4389,3 +4410,5 @@ if (!app || typeof app.registerExtension !== "function") {
     },
   });
 }
+
+registerExtensionWhenReady();
