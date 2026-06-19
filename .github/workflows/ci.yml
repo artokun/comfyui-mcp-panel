@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  panel:
+    runs-on: ubuntu-latest
+    name: Lint pack (JS syntax + Python + pyproject)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # web/js is served LIVE via the custom_nodes junction — a single broken
+      # save throws in ComfyUI's extension loader and takes down the WHOLE
+      # frontend (no sidebar). node --check is the cheapest guard against that.
+      - name: JS syntax check (web/js)
+        shell: bash
+        run: |
+          set -e
+          shopt -s globstar nullglob
+          found=0
+          for f in web/js/**/*.js; do
+            found=1
+            echo "node --check $f"
+            node --check "$f"
+          done
+          [ "$found" = "1" ] || { echo "::error::no web/js/*.js files found"; exit 1; }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # __init__.py must compile and (by design) only register routes at import
+      # time — no import-time subprocess. py_compile catches syntax breakage.
+      - name: Python compile check (__init__.py)
+        run: python -m py_compile __init__.py
+
+      - name: pyproject.toml is valid + has registry fields
+        run: |
+          python - <<'PY'
+          import tomllib
+          d = tomllib.load(open("pyproject.toml", "rb"))
+          proj = d.get("project", {})
+          comfy = d.get("tool", {}).get("comfy", {})
+          missing = [k for k in ("name", "version", "description", "license") if not proj.get(k)]
+          if not comfy.get("PublisherId"):
+              missing.append("tool.comfy.PublisherId")
+          assert not missing, f"pyproject missing required fields: {missing}"
+          print(f"pyproject OK: {proj['name']} {proj['version']}")
+          PY
