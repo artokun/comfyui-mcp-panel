@@ -4559,6 +4559,25 @@ function buildPanel() {
     return true;
   }
 
+  // ---- double-Esc rewind (#44) ----
+  // Two Escapes in quick succession rewind your last turn: revert the canvas to
+  // before your last message AND bring that message back into the composer to
+  // edit & resend. (Graph + edit scope; conversation-fork is a follow-up.)
+  let lastEscAt = 0;
+  function rewindLastTurn() {
+    const snap = revertGraphToLastSnapshot();
+    const recalled = recallPrev(); // pulls your last message into the composer to edit
+    if (snap || recalled) {
+      appendSystem(
+        `↩ Rewound your last turn${snap ? " — canvas reverted" : ""}` +
+          `${recalled ? "; your message is back in the composer to edit & resend" : ""}.`,
+      );
+      input.focus();
+    } else {
+      appendSystem("Nothing to rewind yet — no message/graph snapshot from this session.");
+    }
+  }
+
   // ---- submit ----
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
@@ -4681,6 +4700,18 @@ function buildPanel() {
         hideMenu();
         return;
       }
+    }
+    // Double-Esc (two within 600ms, menu closed, not mid-history-nav) rewinds the
+    // last turn. A single Esc falls through to its normal behavior below.
+    if (ev.key === "Escape" && menuPop.hidden && histIdx === -1) {
+      const now = performance.now();
+      if (now - lastEscAt < 600) {
+        lastEscAt = 0;
+        ev.preventDefault();
+        rewindLastTurn();
+        return;
+      }
+      lastEscAt = now;
     }
     // ↑ recalls your previous sent message (when already navigating, or from the
     // very start of the composer so it never hijacks normal line-up movement);
