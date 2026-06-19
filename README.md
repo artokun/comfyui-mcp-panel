@@ -1,8 +1,8 @@
 # ComfyUI MCP Panel
 
-> ### ✅ v0.3 is live on ComfyUI-Manager & the [Comfy Registry](https://registry.comfy.org/nodes/comfyui-mcp-panel)
+> ### 📦 On ComfyUI-Manager & the [Comfy Registry](https://registry.comfy.org/nodes/comfyui-agent-panel) as `comfyui-agent-panel`
 > The polished public release — native ComfyUI design system, live activity cards for every
-> agent edit, and multi-tab support. Search **`comfyui-mcp-panel`** in ComfyUI-Manager to install,
+> agent edit, and multi-tab support. Search **`comfyui-agent-panel`** in ComfyUI-Manager to install,
 > or see the [docs](https://comfyui-mcp.artokun.io/docs/panel).
 
 **Your Claude Code session, inside ComfyUI's sidebar — it sees your graph and edits it live.**
@@ -31,7 +31,7 @@ this panel ⇄ ws://127.0.0.1:9180 ⇄ comfyui-mcp orchestrator (background, you
 
 ## Install
 
-**Via ComfyUI-Manager** (recommended): search for `comfyui-mcp-panel` and install.
+**Via ComfyUI-Manager** (recommended): search for `comfyui-agent-panel` and install.
 
 **Via git:**
 
