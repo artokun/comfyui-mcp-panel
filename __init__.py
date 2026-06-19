@@ -206,21 +206,56 @@ def _lock_parent_is_gone(lock):
     return not _same_process(parent, lock.get("parentStartedAt"))
 
 
-def _kill_pid(pid):
-    """Terminate a (verified-orchestrator) pid via psutil — no shell/taskkill, so
-    the only subprocess the pack ever runs is the explicit, Connect-gated
-    orchestrator spawn. If psutil is unavailable we don't kill (return False);
-    the caller then surfaces a "fully restart ComfyUI" message."""
+def _kill_pid(pid, started_at_ms=None):
+    """Terminate a pid via psutil, but ONLY while it still verifies as OUR panel
+    orchestrator — re-checking identity (cmdline + creation time) immediately
+    before every terminate()/kill() call.
+
+    This closes a TOCTOU pid-reuse race: the caller checks identity, but the
+    orchestrator can exit and the OS can recycle its pid before the signal lands.
+    Without the re-check we could terminate whatever now holds that pid — a user's
+    shell, node, editor, anything. So we never signal a pid that doesn't, at the
+    instant of signalling, still look like our orchestrator. psutil-only (no
+    shell/taskkill); if psutil is unavailable we don't kill (return False) and the
+    caller surfaces a "fully restart ComfyUI" message."""
     try:
         import psutil  # type: ignore
+    except Exception:
+        return False
 
+    def _still_ours():
+        # Must look like our orchestrator AND (when we recorded its start time) be
+        # the SAME process instance — not a pid-reuse impostor.
+        if not _is_orchestrator_process(pid):
+            return False
+        if started_at_ms is not None and not _same_process(pid, started_at_ms):
+            return False
+        return True
+
+    try:
+        if not _still_ours():
+            _log(
+                "refusing to kill pid {} — not (or no longer) a verified panel "
+                "orchestrator; possible pid reuse. Left untouched.".format(pid)
+            )
+            return False
         proc = psutil.Process(int(pid))
         proc.terminate()
         try:
             proc.wait(timeout=3)
+            return True
         except Exception:
+            # Still alive after terminate → escalate to kill, but ONLY if it's
+            # STILL our orchestrator (it may have exited + had its pid reused
+            # during the wait window).
+            if not _still_ours():
+                _log(
+                    "not escalating to kill pid {} — identity changed during "
+                    "wait (pid reuse?). Left untouched.".format(pid)
+                )
+                return False
             proc.kill()
-        return True
+            return True
     except Exception:
         return False
 
@@ -278,8 +313,10 @@ def _start_orchestrator():
             "replacing orphaned orchestrator pid {} (its ComfyUI {} is gone)".format(opid, parent)
         )
         # Kill ONLY if it's verifiably our orchestrator — never a reused pid.
+        # _kill_pid re-verifies (cmdline + the recorded creation time) right
+        # before it signals, so a pid recycled to an unrelated process is spared.
         if opid and _is_orchestrator_process(opid):
-            _kill_pid(opid)
+            _kill_pid(opid, lock.get("pidStartedAt"))
         for _ in range(20):
             if not _port_in_use(_BRIDGE_HOST, _BRIDGE_PORT):
                 break
@@ -375,8 +412,10 @@ def _reload_orchestrator():
     lock_is_ours = _lock_parent_is_current(lock)
     lock_is_orphan = _lock_parent_is_gone(lock)
     # Kill only a verified orchestrator pid — never a reused pid (pid-reuse safe).
+    # _kill_pid re-verifies identity (cmdline + recorded creation time) right
+    # before it signals, so a recycled pid can't be mistaken for ours and killed.
     if opid and (lock_is_ours or lock_is_orphan) and _is_orchestrator_process(opid):
-        _kill_pid(opid)
+        _kill_pid(opid, lock.get("pidStartedAt"))
     elif lock and parent and parent != os.getpid() and not lock_is_orphan:
         return False, (
             "the panel bridge port {} is owned by another live ComfyUI "
