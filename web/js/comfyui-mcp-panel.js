@@ -119,6 +119,12 @@ const REBOOT_KEY = "comfyui-mcp.panel.rebootResume";
 // agent-triggered reload mid-task — nudge it to continue. Survives the bridge
 // drop via sessionStorage.
 const SOFT_RELOAD_KEY = "comfyui-mcp.panel.softReloadResume";
+// Set while the agent is mid-turn (working), cleared when the turn finishes. If
+// the connection drops while it's set — an UNEXPECTED bounce (another agent
+// rebooting ComfyUI, a crash, an SDK self-heal) — the reconnect nudges the
+// resumed session to continue where it left off. The REBOOT/SOFT_RELOAD cases
+// (deliberate, agent-known) are handled first and clear this so we don't double-nudge.
+const MID_TASK_KEY = "comfyui-mcp.panel.midTaskResume";
 // One-shot flag set right before a frontend (page) reload WE trigger, so that
 // after the reload we re-activate our own sidebar tab. ComfyUI restores the
 // last active tab BEFORE our extension re-registers it, so it can't reopen ours
@@ -2809,8 +2815,13 @@ function buildPanel() {
       softReload("agent", scope);
     },
     onTurn(state) {
-      if (state === "working") showThinking();
-      else if (state === "done") hideThinking();
+      if (state === "working") {
+        showThinking();
+        ssSet(MID_TASK_KEY, "1"); // a turn is in flight — arm the resume nudge
+      } else if (state === "done") {
+        hideThinking();
+        ssSet(MID_TASK_KEY, null); // turn finished cleanly — nothing to resume
+      }
     },
     onLog(text) {
       appendSystem(text);
@@ -2870,6 +2881,7 @@ function buildPanel() {
       if (ack?.kind === "ready" && ssGet(SOFT_RELOAD_KEY)) {
         const origin = ssGet(SOFT_RELOAD_KEY);
         ssSet(SOFT_RELOAD_KEY, null);
+        ssSet(MID_TASK_KEY, null); // deliberate reload — don't also fire the drop nudge
         appendSystem("Agent reloaded — session resumed.");
         if (origin === "agent") {
           showThinking();
@@ -2877,6 +2889,18 @@ function buildPanel() {
             "✅ You were just soft-reloaded to pick up code changes (no ComfyUI restart) — your tools and system prompt are now the latest build. Continue exactly what you were doing before the reload.",
           );
         }
+        return;
+      }
+      // Unexpected bounce while mid-task — a DIFFERENT agent restarting ComfyUI
+      // (to load nodes), a crash, or an SDK self-heal. The session resumed with
+      // full context but has no pending turn, so it would sit idle. Nudge it.
+      if (ack?.kind === "ready" && ssGet(MID_TASK_KEY)) {
+        ssSet(MID_TASK_KEY, null);
+        appendSystem("Reconnected — picking up where we left off.");
+        showThinking();
+        client.sendUserMessage(
+          "✅ Your connection dropped mid-task (e.g. ComfyUI was restarted, possibly by another agent installing nodes). The session resumed with full context — continue exactly what you were doing before the drop; if you were mid-build or mid-edit, pick it right back up.",
+        );
       }
     },
     getResume: () => ssGet(SESSION_KEY),
