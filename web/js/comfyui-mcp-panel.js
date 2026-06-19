@@ -461,10 +461,8 @@ function captureGraphSnapshot(mid, label) {
   }
 }
 
-// Restore the canvas to the most recent pre-turn snapshot (undo the last turn's
-// edits). Returns the restored snapshot, or null if none / restore failed.
-function revertGraphToLastSnapshot() {
-  const snap = graphSnapshots[graphSnapshots.length - 1];
+// Restore the canvas to a given snapshot. Returns the snapshot, or null on fail.
+function restoreSnapshot(snap) {
   if (!snap) return null;
   try {
     // Deep-clone so the stored snapshot isn't mutated by the live graph after load.
@@ -473,6 +471,20 @@ function revertGraphToLastSnapshot() {
   } catch {
     return null;
   }
+}
+
+// Restore the canvas to the most recent pre-turn snapshot (undo the last turn's edits).
+function revertGraphToLastSnapshot() {
+  return restoreSnapshot(graphSnapshots[graphSnapshots.length - 1]);
+}
+
+// Restore the canvas to the snapshot captured before the message with this mid
+// (the per-message rollback). Returns the snapshot or null.
+function revertGraphSnapshotByMid(mid) {
+  for (let i = graphSnapshots.length - 1; i >= 0; i--) {
+    if (graphSnapshots[i].mid === mid) return restoreSnapshot(graphSnapshots[i]);
+  }
+  return null;
 }
 
 /** Summarize one LiteGraph node for the agent — id, type, title, widget
@@ -1152,7 +1164,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onAck, onTurn, getResume }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onAck, onTurn, onTurnAnchor, getResume }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -1295,6 +1307,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // on a reset) so the panel can persist it and resume across reloads.
       if (msg && msg.type === "session") {
         onSession?.(typeof msg.session_id === "string" ? msg.session_id : null);
+      }
+      // Per-turn rewind anchor (assistant UUID) → the panel stores it so a
+      // later "rewind conversation to here" can fork the session at that point.
+      if (msg && msg.type === "turn_anchor" && typeof msg.uuid === "string") {
+        onTurnAnchor?.(msg.uuid);
       }
       // Live model catalog from the orchestrator (SDK-probed). This is also the
       // orchestrator HANDSHAKE — receiving it proves a real panel agent is behind
@@ -1489,6 +1506,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
 const PANEL_CSS = `
 .cmcp-root {
   display: flex; flex-direction: column; height: 100%; min-height: 0;
+  position: relative; /* positioning context for the rollback modal overlay */
   font-family: var(--font-inter, "Inter", ui-sans-serif, system-ui, sans-serif);
   font-size: 0.8125rem; line-height: 1.5;
   color: var(--p-text-color, #fff);
@@ -1592,9 +1610,43 @@ const PANEL_CSS = `
 @keyframes cmcp-in { from { opacity: 0; transform: translateY(4px); } }
 .cmcp-bubble.user {
   align-self: flex-end;
+  position: relative; /* anchor for the absolute hover edit button (no reflow) */
   background: var(--p-highlight-background, rgba(96,165,250,0.16));
   border: 1px solid color-mix(in srgb, var(--p-primary-color, #60a5fa), transparent 70%);
 }
+/* Hover edit/rollback button — absolute to the LEFT so it never reflows text. */
+.cmcp-edit-btn {
+  position: absolute; left: -1.75rem; top: 0.1rem;
+  width: 1.4rem; height: 1.4rem; padding: 0; border-radius: 5px;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--p-content-border-color, #3f3f46);
+  background: var(--p-surface-800, #27272a); color: var(--p-text-muted-color, #a1a1aa);
+  cursor: pointer; opacity: 0; transition: opacity 0.12s, color 0.12s; font-size: 0.7rem;
+}
+.cmcp-bubble.user:hover .cmcp-edit-btn { opacity: 1; }
+.cmcp-edit-btn:hover { color: var(--p-primary-color, #60a5fa); border-color: var(--p-primary-color, #60a5fa); }
+/* Rollback modal */
+.cmcp-modal-overlay {
+  position: absolute; inset: 0; z-index: 50; display: flex; align-items: center;
+  justify-content: center; padding: 1rem; background: rgba(0,0,0,0.45);
+}
+.cmcp-modal {
+  width: 100%; max-width: 22rem; display: flex; flex-direction: column; gap: 0.6rem;
+  padding: 0.85rem; border-radius: 10px; background: var(--p-surface-900, #18181b);
+  border: 1px solid var(--p-content-border-color, #3f3f46); box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+}
+.cmcp-modal-title { font-weight: 600; font-size: 0.85rem; }
+.cmcp-modal-text {
+  width: 100%; box-sizing: border-box; resize: vertical; min-height: 3.5rem;
+  padding: 0.4rem 0.5rem; border-radius: 6px; font: inherit; font-size: 0.8rem;
+  background: var(--p-surface-950, #111113); color: inherit;
+  border: 1px solid var(--p-surface-500, #555);
+}
+.cmcp-modal-scopes { display: flex; flex-direction: column; gap: 0.3rem; }
+.cmcp-modal-scope { display: flex; gap: 0.4rem; align-items: flex-start; font-size: 0.72rem; cursor: pointer; }
+.cmcp-modal-scope input { margin-top: 0.15rem; }
+.cmcp-modal-btns { display: flex; justify-content: flex-end; gap: 0.4rem; }
+.cmcp-btn-primary { background: var(--p-primary-color, #3a7bd5); color: #fff; border: none; }
 /* Agent text flows freely — no card/bubble. Only user messages are boxed. */
 .cmcp-bubble.agent {
   align-self: stretch; max-width: 100%;
@@ -2658,6 +2710,18 @@ function buildPanel() {
     b.className = "cmcp-bubble user";
     b.textContent = text;
     if (opts.mid) b.dataset.mid = opts.mid;
+    // Hover edit/rollback button — only on live messages (those with a mid).
+    // Absolute-positioned to the LEFT of the bubble so it never causes reflow.
+    if (opts.mid) {
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.className = "cmcp-edit-btn";
+      edit.title = "Edit & roll back from this message";
+      edit.innerHTML = '<i class="pi pi-pencil"></i>';
+      const anchorIdx = typeof opts.anchorIdx === "number" ? opts.anchorIdx : 0;
+      edit.addEventListener("click", () => openRollbackModal({ mid: opts.mid, text, anchorIdx }));
+      b.appendChild(edit);
+    }
     log.appendChild(b);
     // Live sends get a delivery-status line below the bubble (sending → seen, or
     // failed with resend/delete). Replayed history has no mid → no status.
@@ -2968,7 +3032,9 @@ function buildPanel() {
   function appendUser(text, opts = {}) {
     stickToBottom = true; // your own message → always jump to the latest
     newMsgBtn.hidden = true;
-    const painted = paintUser(text, opts);
+    // Record how many turn anchors exist now, so a rewind to this message forks
+    // the conversation at turnAnchors[anchorIdx - 1].
+    const painted = paintUser(text, { ...opts, anchorIdx: turnAnchors.length });
     // Tag the record with its mid so deleteMsg can remove the EXACT message even
     // when several are queued (popping the trailing one would hit the wrong one).
     record({ role: "user", text, ...(opts.mid ? { mid: opts.mid } : {}) });
@@ -3279,6 +3345,7 @@ function buildPanel() {
 
   function newChat() {
     thread = null;
+    turnAnchors = []; // fresh conversation → no rewind anchors
     ssSet(CURRENT_THREAD_KEY, null);
     ssSet(SESSION_KEY, null);
     ssSet(CTX_KEY, null);
@@ -3507,6 +3574,11 @@ function buildPanel() {
   // skills), pushed by the orchestrator — surfaced in the completion menu below.
   let sdkCommands = [];
 
+  // Per-turn conversation rewind anchors (assistant UUIDs), in order. A user
+  // message records how many anchors existed when it was sent, so a rewind to
+  // that message forks the session at turnAnchors[recorded-1]. Reset on new chat.
+  let turnAnchors = [];
+
   // ---- bridge wiring ----
   const client = createBridgeClient({
     onStatus(state) {
@@ -3611,6 +3683,10 @@ function buildPanel() {
     },
     onSession(sessionId) {
       bindSession(sessionId);
+    },
+    onTurnAnchor(uuid) {
+      turnAnchors.push(uuid);
+      if (turnAnchors.length > 200) turnAnchors.shift();
     },
     onModels(list) {
       applyModelCatalog(list);
@@ -4576,6 +4652,96 @@ function buildPanel() {
     } else {
       appendSystem("Nothing to rewind yet — no message/graph snapshot from this session.");
     }
+  }
+
+  // Per-message rollback modal (edit button on a user bubble). Edit the message
+  // and choose what to roll back — code (revert the canvas to before it),
+  // conversation (fork the agent's memory at that point), or both — then resend.
+  function openRollbackModal({ mid, text, anchorIdx }) {
+    const anchor = anchorIdx > 0 ? turnAnchors[anchorIdx - 1] ?? null : null;
+    const overlay = document.createElement("div");
+    overlay.className = "cmcp-modal-overlay";
+    const modal = document.createElement("div");
+    modal.className = "cmcp-modal";
+    const title = document.createElement("div");
+    title.className = "cmcp-modal-title";
+    title.textContent = "Roll back & edit";
+    const ta = document.createElement("textarea");
+    ta.className = "cmcp-modal-text";
+    ta.rows = 3;
+    ta.value = text;
+    const scopeWrap = document.createElement("div");
+    scopeWrap.className = "cmcp-modal-scopes";
+    let chosen = "both";
+    const scopes = [
+      { v: "both", label: "Code + conversation", hint: "revert the canvas AND rewind the agent's memory" },
+      { v: "code", label: "Code only", hint: "revert the canvas; keep the conversation" },
+      { v: "conversation", label: "Conversation only", hint: "rewind the agent's memory; keep the canvas" },
+    ];
+    for (const s of scopes) {
+      const lbl = document.createElement("label");
+      lbl.className = "cmcp-modal-scope";
+      const r = document.createElement("input");
+      r.type = "radio";
+      r.name = "cmcp-rollback-scope";
+      r.value = s.v;
+      if (s.v === chosen) r.checked = true;
+      r.addEventListener("change", () => {
+        chosen = s.v;
+      });
+      const span = document.createElement("span");
+      const strong = document.createElement("strong");
+      strong.textContent = s.label;
+      span.append(strong, document.createTextNode(` — ${s.hint}`));
+      lbl.append(r, span);
+      scopeWrap.appendChild(lbl);
+    }
+    const btnRow = document.createElement("div");
+    btnRow.className = "cmcp-modal-btns";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "cmcp-btn";
+    cancel.textContent = "Cancel";
+    const go = document.createElement("button");
+    go.type = "button";
+    go.className = "cmcp-btn cmcp-btn-primary";
+    go.textContent = "Roll back & resend";
+    const close = () => overlay.remove();
+    cancel.addEventListener("click", close);
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) close();
+    });
+    go.addEventListener("click", () => {
+      const edited = ta.value.trim();
+      const wantCode = chosen === "code" || chosen === "both";
+      const wantConvo = chosen === "conversation" || chosen === "both";
+      if (wantCode) {
+        const snap = revertGraphSnapshotByMid(mid);
+        appendSystem(
+          snap
+            ? "↩ Canvas reverted to before this message."
+            : "No graph snapshot for this message — canvas left as-is.",
+        );
+      }
+      if (wantConvo) {
+        client.sendFrame?.({ type: "rewind", anchor });
+        appendSystem(
+          anchor
+            ? "↩ Rewound the conversation to before this message."
+            : "↩ Started a fresh conversation from this point.",
+        );
+      }
+      close();
+      if (edited) {
+        setComposerValue(edited);
+        form.requestSubmit();
+      }
+    });
+    btnRow.append(cancel, go);
+    modal.append(title, ta, scopeWrap, btnRow);
+    overlay.appendChild(modal);
+    root.appendChild(overlay);
+    setTimeout(() => ta.focus(), 0);
   }
 
   // ---- submit ----
