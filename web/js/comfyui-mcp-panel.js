@@ -533,6 +533,69 @@ function resolveNode(graph, nodeId) {
   return node;
 }
 
+// ---- Group boxes (LiteGraph LGraphGroup) helpers --------------------------
+
+/** Resolve a group box by id (with an index fallback for graphs whose groups
+ *  don't carry ids). */
+function resolveGroup(graph, groupId) {
+  const groups = graph._groups ?? [];
+  let g = groups.find((gr) => gr && gr.id === groupId);
+  if (!g && typeof groupId === "number" && groupId >= 0 && groupId < groups.length) g = groups[groupId];
+  if (!g) throw new Error(`No group with id ${groupId} in the current graph`);
+  return g;
+}
+
+/** Next free group id — groups aren't always assigned one by the frontend. */
+function nextGroupId(graph) {
+  const ids = (graph._groups ?? []).map((g) => g.id).filter((n) => typeof n === "number");
+  return (ids.length ? Math.max(...ids) : 0) + 1;
+}
+
+/** Set a group's box, preferring its _bounding array (most portable). */
+function setGroupBounds(group, [x, y, w, h]) {
+  if (group._bounding && group._bounding.length >= 4) {
+    group._bounding[0] = x;
+    group._bounding[1] = y;
+    group._bounding[2] = w;
+    group._bounding[3] = h;
+  } else {
+    group.pos = [x, y];
+    group.size = [w, h];
+  }
+}
+
+/** [x, y, w, h] that wraps the given nodes, padded for the group + node titles. */
+function boundsAroundNodes(nodes, pad = 30, titlePad = 70) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const n of nodes) {
+    const x = n.pos?.[0] ?? 0;
+    const y = n.pos?.[1] ?? 0;
+    const w = n.size?.[0] ?? 200;
+    const h = n.size?.[1] ?? 100;
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x + w);
+    maxY = Math.max(maxY, y + h);
+  }
+  if (!Number.isFinite(minX)) return [100, 100, 400, 300];
+  return [minX - pad, minY - titlePad, maxX - minX + pad * 2, maxY - minY + titlePad + pad];
+}
+
+/** Compact JSON-friendly view of a group box. */
+function summarizeGroup(graph, g) {
+  const b = g._bounding ?? [g.pos?.[0] ?? 0, g.pos?.[1] ?? 0, g.size?.[0] ?? 0, g.size?.[1] ?? 0];
+  return {
+    id: g.id != null ? g.id : (graph._groups ?? []).indexOf(g),
+    title: g.title ?? "",
+    color: g.color ?? null,
+    bounding: [Math.round(b[0]), Math.round(b[1]), Math.round(b[2]), Math.round(b[3])],
+    node_count: (g._nodes ?? []).length,
+  };
+}
+
 /** Resolve a slot reference (name string or numeric index) to an index in
  *  the given slot array. Names are matched case-insensitively. */
 function resolveSlot(slots, ref, kind) {
@@ -569,11 +632,13 @@ const GRAPH_TOOL_EXECUTORS = {
   graph_get_state() {
     const { graph } = getGraphCtx();
     const nodes = (graph._nodes ?? []).slice(0, MAX_STATE_NODES).map(summarizeNode);
+    const groups = (graph._groups ?? []).map((g) => summarizeGroup(graph, g));
     return {
       viewing: describeActiveGraph(graph),
       node_count: graph._nodes?.length ?? 0,
       truncated: (graph._nodes?.length ?? 0) > MAX_STATE_NODES,
       nodes,
+      ...(groups.length ? { groups } : {}),
     };
   },
 
@@ -993,6 +1058,103 @@ const GRAPH_TOOL_EXECUTORS = {
         from_nodes: ns.map((n) => n.id),
       },
     };
+  },
+
+  // ---- Group boxes (LiteGraph LGraphGroup) ----------------------------------
+  // The labeled, colored rectangles. Visual organizers ONLY — distinct from
+  // subgraphs (which nest nodes). All undoable via beforeChange/afterChange.
+
+  // Create a group. Pass node_ids to auto-wrap them, else bounds [x,y,w,h],
+  // else a default box near the last node.
+  graph_create_group({ title, node_ids, bounds, color, font_size }) {
+    const { graph, LG } = getGraphCtx();
+    const GroupCls = LG.LGraphGroup;
+    if (typeof GroupCls !== "function") throw new Error("LGraphGroup unavailable on this frontend");
+    const group = new GroupCls(typeof title === "string" && title ? title : "Group");
+    let bbox;
+    if (Array.isArray(node_ids) && node_ids.length) {
+      const ns = node_ids.map((id) => graph.getNodeById(Number(id))).filter(Boolean);
+      if (!ns.length) throw new Error("none of the given node_ids exist in the current graph");
+      bbox = boundsAroundNodes(ns);
+    } else if (Array.isArray(bounds) && bounds.length === 4) {
+      bbox = bounds.map(Number);
+    } else {
+      bbox = [...placementFor(graph), 400, 300];
+    }
+    if (color != null) group.color = String(color);
+    if (Number.isFinite(font_size)) group.font_size = Number(font_size);
+    graph.beforeChange();
+    try {
+      setGroupBounds(group, bbox);
+      graph.add(group);
+      if (group.id == null) group.id = nextGroupId(graph);
+      group.recomputeInsideNodes?.();
+    } finally {
+      graph.afterChange();
+    }
+    graph.setDirtyCanvas(true, true);
+    return { group: summarizeGroup(graph, group) };
+  },
+
+  // Move a group's box to [x,y]; by default the contained nodes move with it
+  // (move_nodes:false moves only the box).
+  graph_move_group({ group_id, pos, move_nodes }) {
+    const { graph } = getGraphCtx();
+    const g = resolveGroup(graph, group_id);
+    const b = g._bounding ?? [g.pos?.[0] ?? 0, g.pos?.[1] ?? 0, 0, 0];
+    const dx = Number(pos[0]) - b[0];
+    const dy = Number(pos[1]) - b[1];
+    graph.beforeChange();
+    try {
+      if (move_nodes !== false && typeof g.move === "function") {
+        g.recomputeInsideNodes?.();
+        g.move(dx, dy, false); // moves the box AND the nodes inside it
+      } else {
+        setGroupBounds(g, [Number(pos[0]), Number(pos[1]), b[2], b[3]]);
+      }
+    } finally {
+      graph.afterChange();
+    }
+    graph.setDirtyCanvas(true, true);
+    return { group: summarizeGroup(graph, g) };
+  },
+
+  // Edit a group's title / color / font_size / bounds — only the fields passed.
+  graph_edit_group({ group_id, title, color, font_size, bounds }) {
+    const { graph } = getGraphCtx();
+    const g = resolveGroup(graph, group_id);
+    graph.beforeChange();
+    try {
+      if (typeof title === "string") g.title = title;
+      if (color != null) g.color = String(color);
+      if (Number.isFinite(font_size)) g.font_size = Number(font_size);
+      if (Array.isArray(bounds) && bounds.length === 4) setGroupBounds(g, bounds.map(Number));
+      g.recomputeInsideNodes?.();
+    } finally {
+      graph.afterChange();
+    }
+    graph.setDirtyCanvas(true, true);
+    return { group: summarizeGroup(graph, g) };
+  },
+
+  // Remove a group box (the nodes inside are NOT deleted).
+  graph_remove_group({ group_id }) {
+    const { graph } = getGraphCtx();
+    const g = resolveGroup(graph, group_id);
+    const summary = summarizeGroup(graph, g);
+    graph.beforeChange();
+    try {
+      if (typeof graph.removeGroup === "function") graph.removeGroup(g);
+      else if (typeof graph.remove === "function") graph.remove(g);
+      else {
+        const i = (graph._groups ?? []).indexOf(g);
+        if (i >= 0) graph._groups.splice(i, 1);
+      }
+    } finally {
+      graph.afterChange();
+    }
+    graph.setDirtyCanvas(true, true);
+    return { removed: summary };
   },
 
   // Rename a node's TITLE (the label on its header) — distinct from widget values.
@@ -1778,6 +1940,12 @@ const PANEL_CSS = `
   color: var(--p-text-muted-color, #a1a1aa); cursor: pointer; border-radius: 4px; font-size: 0.7rem; }
 .cmcp-pending-act:hover { color: var(--p-primary-color, #60a5fa); background: var(--p-surface-700, #3f3f46); }
 .cmcp-pending-act.danger:hover { color: var(--p-red-300, #fca5a5); }
+.cmcp-pending-handle { flex: none; width: 1rem; height: 1.2rem; display: flex; align-items: center; justify-content: center;
+  color: var(--p-text-muted-color, #71717a); cursor: grab; font-size: 0.65rem; opacity: 0.6; }
+.cmcp-pending-handle:hover { opacity: 1; color: var(--p-primary-color, #60a5fa); }
+.cmcp-pending-handle:active { cursor: grabbing; }
+.cmcp-pending-item.dragging { opacity: 0.4; }
+.cmcp-pending-item.drop-target { box-shadow: inset 0 2px 0 0 var(--p-primary-color, #60a5fa); }
 .cmcp-todo-item.pending .pi { opacity: 0.5; }
 .cmcp-dl { margin-bottom: 0.4rem; }
 .cmcp-dl-item { padding: 0.18rem 0; }
@@ -2033,6 +2201,14 @@ function describeCommand(cmd, msg, reply) {
         : { icon: "pi-arrow-up", text: `Promoted “${r.promoted}” to the subgraph node` };
     case "graph_move_node":
       return { icon: "pi-arrows-alt", text: `Moved node ${r.moved?.node_id} to [${r.moved?.to?.map(Math.round)}]` };
+    case "graph_create_group":
+      return { icon: "pi-clone", text: `Created group “${r.group?.title}” (id ${r.group?.id})` };
+    case "graph_move_group":
+      return { icon: "pi-arrows-alt", text: `Moved group ${r.group?.id} (“${r.group?.title}”)` };
+    case "graph_edit_group":
+      return { icon: "pi-pencil", text: `Edited group ${r.group?.id} (“${r.group?.title}”)` };
+    case "graph_remove_group":
+      return { icon: "pi-minus-circle", text: `Removed group “${r.removed?.title}”` };
     case "graph_canvas":
       return { icon: "pi-window-maximize", text: `Canvas: ${r.canvas?.action?.replace(/_/g, " ")}` };
     case "graph_run":
@@ -2363,11 +2539,36 @@ function buildPanel() {
       for (const [mid, entry] of pendingList) {
         const row = document.createElement("div");
         row.className = "cmcp-pending-item" + (entry.state === "failed" ? " failed" : "");
+        // Drag handle (LEFT) — reorder how the agent flushes the queue.
+        const handle = document.createElement("span");
+        handle.className = "cmcp-pending-handle";
+        handle.draggable = true;
+        handle.title = "Drag to reorder";
+        handle.innerHTML = '<i class="pi pi-bars"></i>';
+        handle.addEventListener("dragstart", (e) => {
+          e.dataTransfer.setData("text/plain", mid);
+          e.dataTransfer.effectAllowed = "move";
+          row.classList.add("dragging");
+        });
+        handle.addEventListener("dragend", () => row.classList.remove("dragging"));
+        row.addEventListener("dragover", (e) => {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "move";
+          row.classList.add("drop-target");
+        });
+        row.addEventListener("dragleave", () => row.classList.remove("drop-target"));
+        row.addEventListener("drop", (e) => {
+          e.preventDefault();
+          row.classList.remove("drop-target");
+          const dragMid = e.dataTransfer.getData("text/plain");
+          if (dragMid) reorderPending(dragMid, mid);
+        });
         const txt = document.createElement("span");
         txt.className = "cmcp-pending-text";
         txt.textContent = entry.raw || "";
         txt.title = entry.raw || "";
         row.append(
+          handle,
           txt,
           mkPendingAct("pi-pencil", "Edit — pull back to the composer", () => editMsg(mid)),
           mkPendingAct(
@@ -3216,6 +3417,25 @@ function buildPanel() {
     renderTray();
   }
 
+  /** Drag-reorder the pending tray: move `dragMid` to where `targetMid` sits, then
+   *  tell the orchestrator the new flush order so it drains the queue that way. */
+  function reorderPending(dragMid, targetMid) {
+    if (!dragMid || dragMid === targetMid) return;
+    const isTray = (e) => e.state === "queued" || e.state === "failed";
+    const queued = [...pendingMsgs].filter(([, e]) => isTray(e));
+    const others = [...pendingMsgs].filter(([, e]) => !isTray(e));
+    const from = queued.findIndex(([m]) => m === dragMid);
+    const to = queued.findIndex(([m]) => m === targetMid);
+    if (from < 0 || to < 0) return;
+    const [moved] = queued.splice(from, 1);
+    queued.splice(to, 0, moved);
+    // Rebuild the Map in the new order (queued reordered; transient sends trail).
+    pendingMsgs.clear();
+    for (const [m, e] of [...queued, ...others]) pendingMsgs.set(m, e);
+    renderTray();
+    client?.sendFrame?.({ type: "reorder", order: queued.map(([m]) => m) });
+  }
+
   /** Receipt ack (orchestrator got it): not dropped → cancel the failure timer.
    *  Still QUEUED until the agent reads it (the "seen" ack). */
   function markReceived(mid) {
@@ -3641,6 +3861,9 @@ function buildPanel() {
     "graph_create_subgraph",
     "graph_enter_subgraph",
     "graph_exit_subgraph",
+    "graph_create_group",
+    "graph_move_group",
+    "graph_remove_group",
   ]);
   let autoFitTimer = null;
   function scheduleAutoFit() {
