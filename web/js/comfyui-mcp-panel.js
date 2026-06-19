@@ -1839,8 +1839,55 @@ function describeCommand(cmd, msg, reply) {
 // GitHub-flavored markdown, single-newline line breaks.
 marked.setOptions({ gfm: true, breaks: true });
 
+// CRITICAL: force every rendered link to open OUT of the panel frame. In the
+// ComfyUI desktop (Electron) app a plain in-frame navigation hijacks the WHOLE
+// window — no back button, hard-reload to escape. Tagging anchors target=_blank
+// + rel makes them open in a new context (the desktop routes that to the default
+// browser); a delegated click handler (wireExternalLinks) is the belt-and-braces
+// that intercepts the click and opens externally even if _blank is ignored.
+DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+  if (node.tagName === "A") {
+    node.setAttribute("target", "_blank");
+    node.setAttribute("rel", "noopener noreferrer nofollow");
+  }
+});
+
+/** Open a URL outside the panel frame — never navigate the app/webview itself.
+ *  Prefers a desktop external-open bridge if present, else a new browser tab. */
+function openExternalUrl(href) {
+  if (!href) return;
+  try {
+    const ext =
+      window.electronAPI?.openExternal ||
+      window.comfyAPI?.electron?.openExternal ||
+      window.api?.openExternal;
+    if (typeof ext === "function") {
+      ext(href);
+      return;
+    }
+  } catch {
+    // fall through to window.open
+  }
+  window.open(href, "_blank", "noopener,noreferrer");
+}
+
+/** Delegate link clicks on a container so http(s)/mailto links open externally
+ *  instead of navigating the panel frame (which hijacks the desktop app). */
+function wireExternalLinks(container) {
+  container.addEventListener("click", (ev) => {
+    const a = ev.target?.closest?.("a[href]");
+    if (!a || !container.contains(a)) return;
+    const href = a.getAttribute("href") || "";
+    if (!href || href.startsWith("#")) return; // in-document anchors: leave alone
+    ev.preventDefault();
+    ev.stopPropagation();
+    openExternalUrl(a.href || href); // a.href resolves relative URLs
+  });
+}
+
 /** Render agent markdown (full GFM) via marked, sanitized with DOMPurify so
- *  agent output can never inject script/handlers into the panel. */
+ *  agent output can never inject script/handlers into the panel. Links are
+ *  forced external via the DOMPurify hook above + wireExternalLinks on the feed. */
 function renderRichText(el, text) {
   el.innerHTML = DOMPurify.sanitize(marked.parse(String(text)));
 }
@@ -1853,6 +1900,9 @@ function buildPanel() {
   // Expose this panel's root so canvas "fit" can measure how much of the canvas
   // the open panel occludes and frame the graph in the visible area.
   activePanelRoot = root;
+  // Any link clicked anywhere in the panel opens externally — never let it
+  // navigate (and hijack) the ComfyUI desktop webview.
+  wireExternalLinks(root);
 
   // ---- Header: title + status dot ----
   const header = document.createElement("div");
@@ -2135,6 +2185,12 @@ function buildPanel() {
   function renderTodo(items) {
     todoItems = Array.isArray(items) ? items : [];
     renderTray();
+    // Persist the plan ON the active thread so it survives a reload / panel
+    // remount (the tray is otherwise rebuilt empty) and follows thread switches.
+    if (thread) {
+      thread.todos = todoItems;
+      persistThreads();
+    }
   }
   function renderDownloads(downloads) {
     downloadItems = (Array.isArray(downloads) ? downloads : []).filter(Boolean);
@@ -2905,6 +2961,7 @@ function buildPanel() {
     ssSet(CTX_KEY, null);
     if (typeof resetAttachments === "function") resetAttachments();
     resetFeed();
+    renderTodo([]); // fresh chat → empty plan tray
     setContextPct(0);
     ctxLabel.textContent = "—";
     // Tell the orchestrator to forget this tab's session so the NEXT message
@@ -2921,6 +2978,7 @@ function buildPanel() {
       else if (m.role === "agent") paintAgent(m.text);
       else if (m.role === "card") paintCard(m);
     }
+    renderTodo(t.todos || []); // restore this thread's plan into the tray
     // Resume this conversation's agent session (or start fresh if it has none),
     // so typing continues THIS chat rather than whatever was last active.
     ssSet(SESSION_KEY, t.sessionId || null);
@@ -4133,6 +4191,7 @@ function buildPanel() {
         else if (m.role === "agent") paintAgent(m.text);
         else if (m.role === "card") paintCard(m);
       }
+      renderTodo(t.todos || []); // restore this thread's plan into the tray
     } catch {
       // Corrupt/absent state — start clean.
     }
