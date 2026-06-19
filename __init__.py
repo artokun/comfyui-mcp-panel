@@ -206,21 +206,56 @@ def _lock_parent_is_gone(lock):
     return not _same_process(parent, lock.get("parentStartedAt"))
 
 
-def _kill_pid(pid):
-    """Terminate a (verified-orchestrator) pid via psutil — no shell/taskkill, so
-    the only subprocess the pack ever runs is the explicit, Connect-gated
-    orchestrator spawn. If psutil is unavailable we don't kill (return False);
-    the caller then surfaces a "fully restart ComfyUI" message."""
+def _kill_pid(pid, started_at_ms=None):
+    """Terminate a pid via psutil, but ONLY while it still verifies as OUR panel
+    orchestrator — re-checking identity (cmdline + creation time) immediately
+    before every terminate()/kill() call.
+
+    This closes a TOCTOU pid-reuse race: the caller checks identity, but the
+    orchestrator can exit and the OS can recycle its pid before the signal lands.
+    Without the re-check we could terminate whatever now holds that pid — a user's
+    shell, node, editor, anything. So we never signal a pid that doesn't, at the
+    instant of signalling, still look like our orchestrator. psutil-only (no
+    shell/taskkill); if psutil is unavailable we don't kill (return False) and the
+    caller surfaces a "fully restart ComfyUI" message."""
     try:
         import psutil  # type: ignore
+    except Exception:
+        return False
 
+    def _still_ours():
+        # Must look like our orchestrator AND (when we recorded its start time) be
+        # the SAME process instance — not a pid-reuse impostor.
+        if not _is_orchestrator_process(pid):
+            return False
+        if started_at_ms is not None and not _same_process(pid, started_at_ms):
+            return False
+        return True
+
+    try:
+        if not _still_ours():
+            _log(
+                "refusing to kill pid {} — not (or no longer) a verified panel "
+                "orchestrator; possible pid reuse. Left untouched.".format(pid)
+            )
+            return False
         proc = psutil.Process(int(pid))
         proc.terminate()
         try:
             proc.wait(timeout=3)
+            return True
         except Exception:
+            # Still alive after terminate → escalate to kill, but ONLY if it's
+            # STILL our orchestrator (it may have exited + had its pid reused
+            # during the wait window).
+            if not _still_ours():
+                _log(
+                    "not escalating to kill pid {} — identity changed during "
+                    "wait (pid reuse?). Left untouched.".format(pid)
+                )
+                return False
             proc.kill()
-        return True
+            return True
     except Exception:
         return False
 
@@ -236,6 +271,82 @@ def _is_orchestrator_process(pid):
         return "--panel-orchestrator" in cmd
     except Exception:
         return False  # can't verify → never kill
+
+
+def _kill_orchestrator_tree(pid, started_at_ms=None):
+    """Kill a VERIFIED orchestrator AND its child process tree, then reap them.
+
+    A soft reload terminates only the orchestrator's own pid — but the Claude
+    Agent SDK spawns child processes (its shell, helper binaries). If one of those
+    wedges (e.g. a dead shell after a re-auth) and is orphaned rather than killed,
+    the wedge survives the respawn and the user is stuck (Task Manager / reboot).
+    Hard restart kills the whole tree so the fresh orchestrator starts truly clean.
+
+    Safe by construction: we only ever snapshot/kill the tree of a pid that
+    verifies as our orchestrator (cmdline + recorded creation time), so every
+    descendant is by definition our agent's own subprocess — never a user's. If
+    the root doesn't verify, nothing is touched."""
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return False
+
+    # Snapshot descendants WITH their creation times, under a verified parent.
+    snapshot = []  # list of (psutil.Process, create_time)
+    try:
+        if _is_orchestrator_process(pid) and (
+            started_at_ms is None or _same_process(pid, started_at_ms)
+        ):
+            for ch in psutil.Process(int(pid)).children(recursive=True):
+                try:
+                    snapshot.append((ch, ch.create_time()))
+                except Exception:
+                    pass
+    except Exception:
+        snapshot = []
+
+    # Kill the root via the identity-re-verifying helper. Only if it confirms the
+    # root was ours do we reap the snapshotted descendants.
+    killed_root = _kill_pid(pid, started_at_ms)
+    if not killed_root:
+        return False
+
+    # A snapshotted child can exit and have its pid reused before we signal it, so
+    # NEVER signal a child whose pid no longer maps to the same process. Read the
+    # creation time FRESH (a cached psutil.Process would return the stale value) and
+    # only signal on an exact match — same guard rigor as _kill_pid uses for the root.
+    def _same_child(proc, ct):
+        try:
+            return abs(psutil.Process(proc.pid).create_time() - ct) <= 0.02
+        except Exception:
+            return False  # gone or unreadable → don't signal
+
+    for proc, ct in snapshot:
+        if _same_child(proc, ct):
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+    try:
+        psutil.wait_procs([p for p, _ in snapshot], timeout=3)
+    except Exception:
+        pass
+    for proc, ct in snapshot:
+        if _same_child(proc, ct):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    return True
+
+
+def _delete_lock():
+    """Remove the orchestrator lockfile (best-effort) so a fresh orchestrator
+    self-registers cleanly after a hard restart."""
+    try:
+        os.remove(_lock_path())
+    except Exception:
+        pass
 
 
 def _start_orchestrator():
@@ -278,8 +389,10 @@ def _start_orchestrator():
             "replacing orphaned orchestrator pid {} (its ComfyUI {} is gone)".format(opid, parent)
         )
         # Kill ONLY if it's verifiably our orchestrator — never a reused pid.
+        # _kill_pid re-verifies (cmdline + the recorded creation time) right
+        # before it signals, so a pid recycled to an unrelated process is spared.
         if opid and _is_orchestrator_process(opid):
-            _kill_pid(opid)
+            _kill_pid(opid, lock.get("pidStartedAt"))
         for _ in range(20):
             if not _port_in_use(_BRIDGE_HOST, _BRIDGE_PORT):
                 break
@@ -375,8 +488,10 @@ def _reload_orchestrator():
     lock_is_ours = _lock_parent_is_current(lock)
     lock_is_orphan = _lock_parent_is_gone(lock)
     # Kill only a verified orchestrator pid — never a reused pid (pid-reuse safe).
+    # _kill_pid re-verifies identity (cmdline + recorded creation time) right
+    # before it signals, so a recycled pid can't be mistaken for ours and killed.
     if opid and (lock_is_ours or lock_is_orphan) and _is_orchestrator_process(opid):
-        _kill_pid(opid)
+        _kill_pid(opid, lock.get("pidStartedAt"))
     elif lock and parent and parent != os.getpid() and not lock_is_orphan:
         return False, (
             "the panel bridge port {} is owned by another live ComfyUI "
@@ -393,6 +508,46 @@ def _reload_orchestrator():
             "the panel bridge port {} is still held by the previous orchestrator and "
             "couldn't be freed — try Disconnect then Connect, or fully restart "
             "ComfyUI.".format(_BRIDGE_PORT)
+        )
+    return _start_orchestrator()
+
+
+def _hard_restart_orchestrator():
+    """Force a truly fresh orchestrator: kill the verified orchestrator AND its
+    whole child tree (clears a wedged Agent-SDK shell an in-place soft reload
+    can't), delete the lockfile, then respawn. Pure Python over the local route,
+    so it works even when the agent itself is unresponsive — the user's one-click
+    escape from "the agent stopped answering" without Task Manager or a reboot.
+    Returns (ok, message)."""
+    if _no_autospawn():
+        return False, (
+            "auto-start is disabled (COMFYUI_MCP_NO_AUTOSPAWN) — restart your "
+            "orchestrator process yourself."
+        )
+
+    _stop_orchestrator()
+    lock = _read_lock()
+    parent = lock.get("parent") if lock else None
+    opid = lock.get("pid") if lock else None
+    lock_is_ours = _lock_parent_is_current(lock)
+    lock_is_orphan = _lock_parent_is_gone(lock)
+    if opid and (lock_is_ours or lock_is_orphan) and _is_orchestrator_process(opid):
+        _kill_orchestrator_tree(opid, lock.get("pidStartedAt"))
+    elif lock and parent and parent != os.getpid() and not lock_is_orphan:
+        return False, (
+            "the panel bridge port {} is owned by another live ComfyUI "
+            "(pid {}). Not restarting it.".format(_BRIDGE_PORT, parent)
+        )
+
+    _delete_lock()
+    for _ in range(30):
+        if not _port_in_use(_BRIDGE_HOST, _BRIDGE_PORT):
+            break
+        time.sleep(0.1)
+    if _port_in_use(_BRIDGE_HOST, _BRIDGE_PORT):
+        return False, (
+            "the panel bridge port {} is still held after the restart — fully "
+            "restart ComfyUI.".format(_BRIDGE_PORT)
         )
     return _start_orchestrator()
 
@@ -443,6 +598,17 @@ def _register_routes():
         # Soft reload: respawn the orchestrator (new code) without restarting
         # ComfyUI. The panel reconnects and resumes the session afterward.
         ok, message = _reload_orchestrator()
+        return web.json_response(
+            {"ok": ok, "running": _orchestrator_running(), "port": _BRIDGE_PORT, "message": message},
+            status=200 if ok else 503,
+        )
+
+    @routes.post("/comfyui_mcp_panel/hard_restart")
+    async def _hard_restart(_request):
+        # Recovery: kill the orchestrator + its whole child tree and respawn — the
+        # fix for a wedged/unresponsive agent backend that a soft reload can't
+        # clear. Pure Python, so it works even when the agent isn't answering.
+        ok, message = _hard_restart_orchestrator()
         return web.json_response(
             {"ok": ok, "running": _orchestrator_running(), "port": _BRIDGE_PORT, "message": message},
             status=200 if ok else 503,

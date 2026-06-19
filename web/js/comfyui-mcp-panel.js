@@ -1120,7 +1120,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onDownloads, onThinking, onAgentStatus, onSession, onModels, onAck, onTurn, getResume }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onAck, onTurn, getResume }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -1271,6 +1271,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
         markConnected();
         onModels?.(msg.models, typeof msg.current === "string" ? msg.current : undefined);
       }
+      // SDK slash commands (built-ins like /compact, plus any loaded skills) —
+      // surfaced in the composer's completion menu.
+      if (msg && msg.type === "commands" && Array.isArray(msg.commands)) {
+        onCommands?.(msg.commands);
+      }
       // Structured acks (ready / working / options / …). The "ready" ack is sent
       // after the orchestrator has processed hello (resume armed), so it's the
       // reliable signal to send a post-restart resume nudge.
@@ -1365,7 +1370,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       closed = false;
       connect();
     },
-    sendUserMessage(text, context, images) {
+    sendUserMessage(text, context, images, mid) {
       if (!sock || sock.readyState !== WebSocket.OPEN) return false;
       try {
         sock.send(
@@ -1374,6 +1379,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
             text,
             ...(context ? { context } : {}),
             ...(images?.length ? { images } : {}),
+            // Client message id — the orchestrator echoes it in the "working"
+            // ack so the panel can mark this exact bubble delivered ("Seen").
+            ...(mid ? { mid } : {}),
           }),
         );
         return true;
@@ -1569,6 +1577,33 @@ const PANEL_CSS = `
    needs pre-wrap to honor its newlines; the commit drops the .streaming class
    and it reverts to normal markdown flow. */
 .cmcp-bubble.agent.streaming .cmcp-reply { white-space: pre-wrap; }
+/* Per-message delivery status: invisible on success (a normal bubble = received
+   and not dropped); only a FAILED send shows up — the bubble tints red and the
+   status row exposes ✎ edit / ✕ delete. */
+.cmcp-msg-status {
+  align-self: flex-end; max-width: 92%;
+  margin: 0.0625rem 0.125rem 0.125rem;
+  font-size: 0.6875rem; color: var(--p-text-muted-color, #71717a);
+  display: flex; gap: 0.375rem; align-items: center;
+}
+.cmcp-msg-status:empty { display: none; }
+/* Queued: received but NOT yet read by the agent — muted/dimmed until it's read. */
+.cmcp-bubble.user.queued { opacity: 0.5; }
+.cmcp-bubble.user.failed {
+  opacity: 1;
+  border-color: color-mix(in srgb, var(--p-red-400, #f87171), transparent 35%);
+  background: color-mix(in srgb, var(--p-red-400, #f87171), transparent 86%);
+}
+.cmcp-msg-action {
+  background: none; border: none; padding: 0.0625rem; cursor: pointer;
+  display: inline-flex; align-items: center; line-height: 1;
+  color: var(--p-text-muted-color, #71717a);
+  border-radius: var(--p-border-radius-sm, 4px);
+  transition: color 0.12s, background 0.12s;
+}
+.cmcp-msg-action .pi { font-size: 0.75rem; }
+.cmcp-msg-action:hover { color: var(--p-text-color, #fff); background: var(--p-surface-700, #3f3f46); }
+.cmcp-msg-status.failed .cmcp-msg-action:hover { color: var(--p-red-300, #fca5a5); }
 .cmcp-bubble.agent code, .cmcp-bubble.user code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem;
   background: var(--p-form-field-background, #09090b);
@@ -2028,9 +2063,9 @@ function buildPanel() {
   actions.style.cssText = "margin-left:auto;display:flex;gap:0.125rem;align-items:center;";
   const newChatBtn = iconBtn("pi-plus", "New chat");
   const historyBtn = iconBtn("pi-history", "Chat history");
-  const reloadBtn = iconBtn("pi-sync", "Soft reload the agent — picks up new code, keeps ComfyUI and this conversation");
-  reloadBtn.addEventListener("click", () => softReload("user", "orchestrator"));
-  actions.append(reloadBtn, newChatBtn, historyBtn);
+  // Reload / restart live as slash commands (/reload, /reload-ui, /restart) — no
+  // header buttons for them.
+  actions.append(newChatBtn, historyBtn);
 
   header.style.position = "relative";
   const histPop = document.createElement("div");
@@ -2581,13 +2616,24 @@ function buildPanel() {
     });
   }
 
-  function paintUser(text) {
+  function paintUser(text, opts = {}) {
     clearEmpty();
     const b = document.createElement("div");
     b.className = "cmcp-bubble user";
     b.textContent = text;
+    if (opts.mid) b.dataset.mid = opts.mid;
     log.appendChild(b);
+    // Live sends get a delivery-status line below the bubble (sending → seen, or
+    // failed with resend/delete). Replayed history has no mid → no status.
+    let statusEl = null;
+    if (opts.mid) {
+      statusEl = document.createElement("div");
+      statusEl.className = "cmcp-msg-status";
+      statusEl.dataset.mid = opts.mid;
+      log.appendChild(statusEl);
+    }
     scrollLog();
+    return { bubble: b, statusEl };
   }
 
   function paintAgent(text) {
@@ -2778,7 +2824,8 @@ function buildPanel() {
     clearEmpty();
     const card = document.createElement("div");
     card.className = "cmcp-card cmcp-secret";
-    card.style.cssText = "border-left:3px solid var(--p-yellow-400,#facc15);";
+    card.style.cssText =
+      "border-left:3px solid var(--p-yellow-400,#facc15);width:100%;box-sizing:border-box;";
 
     const head = document.createElement("div");
     head.className = "cmcp-card-head";
@@ -2808,7 +2855,7 @@ function buildPanel() {
     input.spellcheck = false;
     input.placeholder = "Paste token…";
     input.style.cssText =
-      "flex:1;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
+      "flex:1;min-width:7rem;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
       "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:0.8rem;";
 
     // Show/record only a masked preview (first 4 … last 4) so the user can
@@ -2862,11 +2909,141 @@ function buildPanel() {
     return promise;
   }
 
-  function appendUser(text) {
+  function appendUser(text, opts = {}) {
     stickToBottom = true; // your own message → always jump to the latest
     newMsgBtn.hidden = true;
-    paintUser(text);
-    record({ role: "user", text });
+    const painted = paintUser(text, opts);
+    // Tag the record with its mid so deleteMsg can remove the EXACT message even
+    // when several are queued (popping the trailing one would hit the wrong one).
+    record({ role: "user", text, ...(opts.mid ? { mid: opts.mid } : {}) });
+    return painted;
+  }
+
+  // ---- message delivery / read state ----
+  // Every live send carries a client message id (mid). A message is QUEUED (muted
+  // + ✎/✕) from the moment it's sent until the agent actually DEQUEUES it (the
+  // orchestrator's "seen" ack) — i.e. read state is the true read moment, not mere
+  // receipt. The brief "working" ack (receipt) only cancels the failure timer.
+  // While queued, ✎ pulls it back to the composer and ✕ cancels it — both yank it
+  // out of the agent's queue so it's never processed. If the socket was closed at
+  // send or nothing acks in time, it goes FAILED (red) — a dropped message never
+  // silently vanishes.
+  let midCounter = 0;
+  const pendingMsgs = new Map(); // mid -> { statusEl, payload, raw, timer }
+  const DELIVERY_TIMEOUT_MS = 7000;
+
+  function newMid() {
+    midCounter += 1;
+    return `m${Date.now().toString(36)}_${midCounter.toString(36)}`;
+  }
+
+  function statusElFor(mid) {
+    return (
+      pendingMsgs.get(mid)?.statusEl ||
+      log.querySelector(`.cmcp-msg-status[data-mid="${mid}"]`)
+    );
+  }
+
+  function iconAction(icon, title, onClick) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "cmcp-msg-action";
+    b.title = title;
+    const i = document.createElement("i");
+    i.className = `pi ${icon}`;
+    b.appendChild(i);
+    b.addEventListener("click", onClick);
+    return b;
+  }
+
+  function setMsgStatus(mid, state) {
+    const statusEl = statusElFor(mid);
+    const bubble = log.querySelector(`.cmcp-bubble.user[data-mid="${mid}"]`);
+    if (state === "read") {
+      // The agent dequeued it → normal bubble, no chrome.
+      bubble?.classList.remove("queued", "failed");
+      statusEl?.remove();
+      return;
+    }
+    // queued (muted) or failed (red): tint the bubble + expose ✎/✕. The agent
+    // hasn't read it yet, so editing/deleting just yanks it from the queue.
+    bubble?.classList.toggle("queued", state === "queued");
+    bubble?.classList.toggle("failed", state === "failed");
+    if (!statusEl) return;
+    statusEl.className = "cmcp-msg-status " + state;
+    statusEl.replaceChildren(
+      iconAction("pi-pencil", "Edit — pull back to the composer", () => editMsg(mid)),
+      iconAction("pi-times", "Cancel this message", () => deleteMsg(mid)),
+    );
+  }
+
+  /** Tell the orchestrator to drop a still-queued message from the agent's queue
+   *  (no-op server-side if it was already read or never received). */
+  function cancelOnServer(mid) {
+    client?.sendFrame?.({ type: "cancel_message", mid });
+  }
+
+  /** ✎ a queued/failed message: yank it from the queue and drop its text back in
+   *  the composer to edit & resend. */
+  function editMsg(mid) {
+    const entry = pendingMsgs.get(mid);
+    const bubble = log.querySelector(`.cmcp-bubble.user[data-mid="${mid}"]`);
+    const raw = entry?.raw ?? bubble?.textContent ?? "";
+    deleteMsg(mid); // cancels on server + removes bubble + trailing record
+    setComposerValue(raw);
+    input.focus();
+  }
+
+  function armDeliveryTimeout(mid) {
+    const entry = pendingMsgs.get(mid);
+    if (!entry) return;
+    if (entry.timer) clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => {
+      if (pendingMsgs.has(mid)) setMsgStatus(mid, "failed");
+    }, DELIVERY_TIMEOUT_MS);
+  }
+
+  function trackSend(mid, statusEl, payload, raw) {
+    pendingMsgs.set(mid, { statusEl, payload, raw, timer: null });
+    const ok = client.sendUserMessage(payload.text, payload.context, payload.images, mid);
+    if (!ok) setMsgStatus(mid, "failed"); // socket wasn't open — instant fail
+    else armDeliveryTimeout(mid);
+  }
+
+  /** Receipt ack (orchestrator got it): not dropped → cancel the failure timer.
+   *  Still QUEUED until the agent reads it (the "seen" ack). */
+  function markReceived(mid) {
+    const entry = pendingMsgs.get(mid);
+    if (entry?.timer) {
+      clearTimeout(entry.timer);
+      entry.timer = null;
+    }
+  }
+
+  /** Read ack (agent dequeued it): flip to read state. */
+  function markRead(mid) {
+    const entry = pendingMsgs.get(mid);
+    if (entry?.timer) clearTimeout(entry.timer);
+    pendingMsgs.delete(mid);
+    setMsgStatus(mid, "read");
+  }
+
+  function deleteMsg(mid) {
+    const entry = pendingMsgs.get(mid);
+    if (entry?.timer) clearTimeout(entry.timer);
+    pendingMsgs.delete(mid);
+    cancelOnServer(mid); // drop it from the agent's queue if still there
+    for (const el of log.querySelectorAll(`[data-mid="${mid}"]`)) el.remove();
+    // Remove the EXACT record for this mid (not the trailing one — several may be
+    // queued at once).
+    const msgs = thread?.msgs;
+    if (msgs) {
+      const i = msgs.findIndex((m) => m.role === "user" && m.mid === mid);
+      if (i >= 0) {
+        msgs.splice(i, 1);
+        persistThreads();
+      }
+    }
   }
 
   function appendAgent(text) {
@@ -3270,6 +3447,10 @@ function buildPanel() {
     }, 700);
   }
 
+  // SDK-provided slash commands (built-ins like /compact, plus any loaded
+  // skills), pushed by the orchestrator — surfaced in the completion menu below.
+  let sdkCommands = [];
+
   // ---- bridge wiring ----
   const client = createBridgeClient({
     onStatus(state) {
@@ -3378,7 +3559,22 @@ function buildPanel() {
     onModels(list) {
       applyModelCatalog(list);
     },
+    onCommands(list) {
+      // SDK-provided slash commands → surface in the composer completion menu.
+      sdkCommands = Array.isArray(list) ? list : [];
+    },
     onAck(ack) {
+      // Receipt: orchestrator got it (not dropped) → cancel the failure timer.
+      // The bubble stays QUEUED (muted) until the agent actually reads it.
+      if (ack?.kind === "working" && typeof ack.mid === "string") {
+        markReceived(ack.mid);
+        return;
+      }
+      // Read: the agent dequeued this message → flip its bubble to read (normal).
+      if (ack?.kind === "seen" && typeof ack.mid === "string") {
+        markRead(ack.mid);
+        return;
+      }
       // Effort change while the agent was mid-turn: it can't change a running
       // turn's effort, so it applies once the current turn finishes (no more
       // killing the in-flight reply). Let the user know so the picker selection
@@ -3513,6 +3709,11 @@ function buildPanel() {
     connecting = true;
     connectBtn.disabled = true;
     connectBtn.textContent = "Starting…";
+    // Honor whatever is typed in the Bridge URL field — Connect previously
+    // ignored it (only Reconnect applied it), so editing the port (e.g. 9181)
+    // then clicking Connect still hit the old URL. setUrl persists + reconnects.
+    const wanted = urlInput.value.trim();
+    if (wanted && wanted !== client.currentUrl()) client.setUrl(wanted);
     try {
       const res = await api.fetchApi("/comfyui_mcp_panel/connect", { method: "POST" });
       const data = await res.json().catch(() => ({}));
@@ -3558,7 +3759,6 @@ function buildPanel() {
       return;
     }
     reloading = true;
-    reloadBtn.classList.add("cmcp-spin");
     ssSet(SOFT_RELOAD_KEY, origin === "agent" ? "agent" : "user");
     appendSystem("Soft-reloading the agent (new code, no ComfyUI restart)…");
     try {
@@ -3576,9 +3776,54 @@ function buildPanel() {
       return;
     } finally {
       reloading = false;
-      reloadBtn.classList.remove("cmcp-spin");
     }
     // Reconnect with backoff until the fresh orchestrator binds; onAck resumes.
+    client.start();
+  }
+
+  // Hard restart: recover a wedged/unresponsive agent. Unlike soft reload (which
+  // bounces the orchestrator in place and RESUMES, to pick up new code), this
+  // kills the orchestrator AND its whole child tree — clearing a dead Agent-SDK
+  // shell that an in-place reload can't — then respawns and starts a FRESH
+  // session. Resuming would defeat the purpose: a dead tool-subprocess handle is
+  // checkpointed into the session, so resume faithfully restores the corpse and
+  // re-wedges. Fresh = a brand-new shell that works. The chat history stays
+  // visible; the agent's memory resets (an acceptable trade to get it working).
+  // Runs entirely over the Python /hard_restart route, so it works even when the
+  // agent isn't answering.
+  async function hardRestart(origin = "user") {
+    if (reloading) return;
+    reloading = true;
+    appendSystem("Restarting the agent backend…");
+    let ok = false;
+    try {
+      client.stop(); // drop the bridge so the old orchestrator can release the port
+      const res = await api.fetchApi("/comfyui_mcp_panel/hard_restart", { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (data?.ok) {
+        ok = true;
+      } else {
+        appendSystem(
+          data?.message ||
+            "Restart failed — try Disconnect then Connect, or fully restart ComfyUI.",
+        );
+      }
+    } catch (err) {
+      appendSystem(`Couldn't reach ComfyUI to restart the agent: ${err?.message ?? err}`);
+    } finally {
+      reloading = false;
+    }
+    if (ok) {
+      // Start FRESH on reconnect: clear the saved session id so hello sends no
+      // resume (resuming would restore the wedged shell). Don't arm the resume
+      // nudge. The reconnect spins up a brand-new agent.
+      ssSet(SESSION_KEY, null);
+      ssSet(SOFT_RELOAD_KEY, null);
+      ssSet(MID_TASK_KEY, null);
+      appendSystem("Agent restarted with a fresh session — your message history is still here.");
+    }
+    // Reconnect EITHER WAY: on success to the fresh orchestrator, on failure to
+    // restore the bridge we dropped (the old backend may still be intact).
     client.start();
   }
 
@@ -3633,6 +3878,12 @@ function buildPanel() {
       run: () => softReload("user", "frontend"),
     },
     {
+      cmd: "/restart",
+      icon: "pi-refresh",
+      hint: "restart the agent backend — recover an unresponsive agent",
+      run: () => hardRestart("user"),
+    },
+    {
       cmd: "/errors",
       icon: "pi-info-circle",
       hint: "show the last execution errors",
@@ -3669,7 +3920,7 @@ function buildPanel() {
       const el = document.createElement("button");
       el.type = "button";
       el.className =
-        "cmcp-popover-item" + (idx === 0 ? " sel" : "") + (item.kind === "slash" ? " cmcp-slash" : "");
+        "cmcp-popover-item" + (idx === 0 ? " sel" : "") + (item.kind === "slash" || item.kind === "agent" ? " cmcp-slash" : "");
       const i = document.createElement("i");
       i.className = `pi ${item.icon}`;
       const lbl = document.createElement("span");
@@ -3775,15 +4026,30 @@ function buildPanel() {
     if (/^\/[\w-]*$/.test(upto) && upto === input.value) {
       const q = upto.toLowerCase();
       menuToken = { start: 0, end: input.value.length };
-      showMenu(
-        SLASH_COMMANDS.filter((c) => c.cmd.startsWith(q)).map((c) => ({
-          kind: "slash",
-          icon: c.icon,
-          label: c.cmd,
-          small: c.hint,
-          ref: c,
-        })),
-      );
+      const localItems = SLASH_COMMANDS.filter((c) => c.cmd.startsWith(q)).map((c) => ({
+        kind: "slash",
+        icon: c.icon,
+        label: c.cmd,
+        small: c.hint,
+        ref: c,
+      }));
+      // SDK commands (sent to the agent — the SDK processes them). Skip any whose
+      // name collides with a local command. Picking inserts "/name " so the user
+      // can add args, then send routes it to the agent.
+      const localNames = new Set(SLASH_COMMANDS.map((c) => c.cmd));
+      const sdkItems = sdkCommands
+        .filter((c) => {
+          const names = ["/" + c.name, ...(c.aliases || []).map((a) => "/" + a)];
+          return !localNames.has("/" + c.name) && names.some((n) => n.startsWith(q));
+        })
+        .map((c) => ({
+          kind: "agent",
+          icon: "pi-sparkles",
+          label: "/" + c.name,
+          small: c.description || c.argumentHint || "agent command",
+          insert: "/" + c.name + " ",
+        }));
+      showMenu([...localItems, ...sdkItems]);
       return;
     }
     const atM = upto.match(/(^|\s)@([\w./:-]*)$/);
@@ -4072,7 +4338,14 @@ function buildPanel() {
     animating.clear();
     const userBubbles = log.querySelectorAll(".cmcp-bubble.user");
     const last = userBubbles[userBubbles.length - 1];
+    const mid = last?.dataset?.mid;
     if (last) last.remove();
+    if (mid) {
+      const entry = pendingMsgs.get(mid);
+      if (entry?.timer) clearTimeout(entry.timer);
+      pendingMsgs.delete(mid);
+      log.querySelector(`.cmcp-msg-status[data-mid="${mid}"]`)?.remove();
+    }
     if (thinkingEl) {
       client?.sendFrame?.({ type: "interrupt" });
       hideThinking();
@@ -4125,7 +4398,9 @@ function buildPanel() {
       return;
     }
     const freshChat = !thread;
-    appendUser(text);
+    const mid = newMid();
+    const painted = appendUser(text, { mid });
+    setMsgStatus(mid, "queued"); // muted + ✎/✕ until the agent actually reads it
     showThinking();
     input.value = "";
     input.style.height = "auto";
@@ -4163,14 +4438,14 @@ function buildPanel() {
     } catch {
       // graph unavailable — send without subgraph context
     }
-    client.sendUserMessage(
-      sendText,
-      {
-        workflow: getWorkflowTitle(),
-        ...(viewing.scope === "subgraph" ? { subgraph: viewing.title } : {}),
-      },
-      imageRefs,
-    );
+    const context = {
+      workflow: getWorkflowTitle(),
+      ...(viewing.scope === "subgraph" ? { subgraph: viewing.title } : {}),
+    };
+    // Track delivery: trackSend marks "Sending…", then the working ack flips it
+    // to "✓ Seen" (or a timeout / closed socket flips it to "Not delivered").
+    // `text` (the raw composer text) is kept so ✎ can restore it for editing.
+    trackSend(mid, painted.statusEl, { text: sendText, context, images: imageRefs }, text);
   });
 
   input.addEventListener("keydown", (ev) => {

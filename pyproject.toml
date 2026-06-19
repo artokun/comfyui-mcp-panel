@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-agent-panel"
 description = "AI agent sidebar for ComfyUI — an autonomous background agent drives your graph, running on your Claude subscription with no API keys. Add, wire, move and tweak nodes live with full Ctrl+Z undo, generate images, video and audio, and run your workflow. Click Connect to start the agent. Part of the comfyui-mcp project."
-version = "0.1.2"
+version = "0.1.3"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
 # UI-only pack: no Python deps. The frontend floor guarantees
