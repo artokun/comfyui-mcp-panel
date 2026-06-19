@@ -86,7 +86,7 @@ your Claude subscription, so you just open ComfyUI and type.
 
 ## [0.3.0] - 2026-06-16
 
-The polished public release — now live on the [Comfy Registry](https://registry.comfy.org/nodes/comfyui-mcp-panel) and installable from ComfyUI-Manager.
+The polished public release — now live on the [Comfy Registry](https://registry.comfy.org/nodes/comfyui-agent-panel) and installable from ComfyUI-Manager.
 
 ### Added
 

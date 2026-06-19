@@ -5,3 +5,4 @@ venv/
 node_modules/
 *.log
 .DS_Store
+.panel-guard/

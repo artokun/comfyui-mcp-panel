@@ -1,5 +1,5 @@
 // =============================================================================
-// ComfyUI MCP Panel — sidebar driven by an autonomous background agent.
+// ComfyUI Agent Panel — sidebar driven by an autonomous background agent.
 //
 // Shipped as a UI-only custom node pack (served via WEB_DIRECTORY). The panel
 // connects to the loopback WebSocket bridge owned by the comfyui-mcp panel
@@ -32,37 +32,43 @@
 // `NodeHandle`/`WidgetHandle`. v1 call sites are tagged `// TODO(v2):`.
 // =============================================================================
 
-// ComfyUI loads extension files as ES modules; on modern frontends (1.4x+)
-// `window.app` is no longer assigned before extension eval, so the module
-// import is the canonical access path. The absolute specifier works from any
-// nesting depth under /extensions/<pack>/.
-import { app } from "/scripts/app.js";
-import { api } from "/scripts/api.js";
+// `app` / `api` are resolved LAZILY (not via a static `import "/scripts/app.js"`).
+// On Vite/Rolldown frontends, extension modules are evaluated alphabetically-early
+// — before `window.comfyAPI.app` is populated — so a static import of the app.js
+// shim can throw synchronously and deadlock the module loader. We grab them from
+// window.comfyAPI once it's ready instead (see registerExtensionWhenReady at the
+// bottom). Deferral approach contributed by @FreesoSaiFared.
 import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 
-// Execution-error capture: listen from module load so graph_get_errors can
-// report the most recent failure even if it predates the agent's question.
-// execution_start clears state for the new run.
+let app = null;
+let api = null;
+
+// Execution-error capture so graph_get_errors can report the most recent failure
+// even if it predates the agent's question. Wired once `api` is ready (via
+// setupListeners, called from registerExtensionWhenReady). execution_start clears
+// state for the new run.
 let lastExecutionError = null;
-try {
-  api.addEventListener("execution_error", (ev) => {
-    lastExecutionError = { ...(ev.detail ?? {}), ts: new Date().toISOString() };
-  });
-  api.addEventListener("execution_start", () => {
-    lastExecutionError = null;
-  });
-} catch {
-  // api unavailable — graph_get_errors reports null.
+function setupListeners() {
+  if (!api) return;
+  try {
+    api.addEventListener("execution_error", (ev) => {
+      lastExecutionError = { ...(ev.detail ?? {}), ts: new Date().toISOString() };
+    });
+    api.addEventListener("execution_start", () => {
+      lastExecutionError = null;
+    });
+  } catch {
+    // api unavailable — graph_get_errors reports null.
+  }
 }
 
 // ---------------------------------------------------------------------------
 // localStorage-backed settings.
 // ---------------------------------------------------------------------------
 const STORAGE_KEY_BRIDGE = "comfyui-mcp.panel.bridgeUrl";
-// The panel orchestrator owns a DEDICATED bridge port (9180), separate from the
-// legacy `comfyui-mcp --channels` bridge (9101) — so a stray --channels server
-// in any Claude/Cursor session can never sit on the panel's port and produce a
+// The panel orchestrator owns a DEDICATED bridge port (9180) — so a stray
+// process in another session can never sit on the panel's port and produce a
 // "connected but no agent" lie.
 const DEFAULT_BRIDGE_URL = "ws://127.0.0.1:9180";
 const LEGACY_BRIDGE_URL = "ws://127.0.0.1:9101"; // old shared default — migrate off it
@@ -119,6 +125,17 @@ const REBOOT_KEY = "comfyui-mcp.panel.rebootResume";
 // agent-triggered reload mid-task — nudge it to continue. Survives the bridge
 // drop via sessionStorage.
 const SOFT_RELOAD_KEY = "comfyui-mcp.panel.softReloadResume";
+// Set while the agent is mid-turn (working), cleared when the turn finishes. If
+// the connection drops while it's set — an UNEXPECTED bounce (another agent
+// rebooting ComfyUI, a crash, an SDK self-heal) — the reconnect nudges the
+// resumed session to continue where it left off. The REBOOT/SOFT_RELOAD cases
+// (deliberate, agent-known) are handled first and clear this so we don't double-nudge.
+const MID_TASK_KEY = "comfyui-mcp.panel.midTaskResume";
+// Wall-clock (ms) of the last bridge drop — module-scoped so it survives panel
+// remounts. A FAST reconnect (panel swap / WS blip; orchestrator alive) vs a
+// SLOW one (real ComfyUI restart; orchestrator died + respawned) is how we tell
+// a spurious bounce from a real one — only the slow case fires the resume nudge.
+let lastBridgeDownAt = 0;
 // One-shot flag set right before a frontend (page) reload WE trigger, so that
 // after the reload we re-activate our own sidebar tab. ComfyUI restores the
 // last active tab BEFORE our extension re-registers it, so it can't reopen ours
@@ -363,7 +380,7 @@ function imageViewUrl(img) {
   }
 }
 
-/** Current workflow title for this tab (shown in panel_status). */
+/** Current workflow title for this tab. */
 function getWorkflowTitle() {
   // document.title is "<name> - ComfyUI" with a leading "*" when unsaved.
   const t = document.title.replace(/ - ComfyUI$/, "").replace(/^\*/, "").trim();
@@ -393,6 +410,26 @@ function getGraphCtx() {
     throw new Error("ComfyUI graph is not available (app.graph / LiteGraph missing)");
   }
   return { app, graph, rootGraph: app.graph, canvas: app.canvas, LG };
+}
+
+/** Reach ComfyUI's subgraph widget-promotion store. The state that exposes an
+ *  inner subgraph widget on the parent SubgraphNode lives in a Pinia store with
+ *  id "promotion" (methods: promote/demote/isPromoted). Pinia attaches itself as
+ *  `$pinia` on the Vue app's globalProperties; the Vue app instance hangs off its
+ *  mount element (#vue-app) as `__vue_app__`; `_s` is pinia's id→store map. */
+function getPromotionStore() {
+  let pinia = null;
+  try {
+    const el = document.getElementById("vue-app") || document.querySelector("[id*='vue']");
+    pinia = el?.__vue_app__?.config?.globalProperties?.$pinia;
+  } catch {
+    // fall through
+  }
+  const store = pinia?._s?.get?.("promotion");
+  if (!store || typeof store.promote !== "function") {
+    throw new Error("widget-promotion unavailable on this ComfyUI frontend (no 'promotion' store)");
+  }
+  return store;
 }
 
 /** Where is the user looking right now — root graph or inside a subgraph? */
@@ -957,6 +994,56 @@ const GRAPH_TOOL_EXECUTORS = {
     return { viewing: describeActiveGraph(getGraphCtx().graph) };
   },
 
+  // Promote (or demote) an INNER subgraph widget so it appears on the PARENT
+  // SubgraphNode — the thing you couldn't do before. Must be called while INSIDE
+  // the subgraph (graph_enter_subgraph first): node_id is an inner node, widget
+  // is one of its widget names. Mirrors the "Promote Widget" context-menu action
+  // via the frontend's promotion store. Pass demote:true to un-promote.
+  graph_promote_widget({ node_id, widget, demote }) {
+    const { graph, canvas, rootGraph } = getGraphCtx();
+    if (graph === rootGraph) {
+      throw new Error(
+        "Enter the subgraph first (graph_enter_subgraph) — promotion exposes an INNER widget on the parent node.",
+      );
+    }
+    const node = resolveNode(graph, node_id);
+    const widgets = node.widgets ?? [];
+    const w = widgets.find((x) => x && x.name === widget);
+    if (!w) {
+      const names = widgets.map((x) => x?.name).filter(Boolean);
+      throw new Error(
+        `Node ${node.id} (${node.type}) has no widget "${widget}". Available: ${names.join(", ") || "(none)"}`,
+      );
+    }
+    // The parent SubgraphNode instance(s) embedding this subgraph (root-level
+    // search, same as describeActiveGraph). The widget is exposed on these.
+    const parents = (rootGraph._nodes ?? []).filter((n) => n.subgraph === graph);
+    if (!parents.length) {
+      throw new Error("Could not locate the parent subgraph node for the open subgraph.");
+    }
+    const store = getPromotionStore();
+    const source = { sourceNodeId: String(node.id), sourceWidgetName: w.name };
+    const action = demote ? "demote" : "promote";
+    graph.beforeChange?.();
+    try {
+      for (const p of parents) {
+        const rootGraphId = p.rootGraph?.id ?? rootGraph?.id;
+        store[action](rootGraphId, p.id, source);
+        // Recompute the parent node so the (un)promoted widget shows immediately.
+        p.computeSize?.(p.size);
+        p.setDirtyCanvas?.(true, true);
+      }
+    } finally {
+      graph.afterChange?.();
+    }
+    canvas?.setDirty?.(true, true);
+    return {
+      [demote ? "demoted" : "promoted"]: w.name,
+      from_node: node.id,
+      on_subgraph_nodes: parents.map((p) => p.id),
+    };
+  },
+
   // --- Custom-node management via the BUILT-IN ComfyUI Manager (/v2 API) ----
   async nodes_search({ query, limit }) {
     const data = await managerV2("customnode/getmappings?mode=cache");
@@ -1033,7 +1120,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret, onReload, onAgentStatus, onSession, onModels, onAck, onTurn, getResume }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onDownloads, onThinking, onAgentStatus, onSession, onModels, onAck, onTurn, getResume }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -1041,7 +1128,7 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret
   let reconnectTimer = null;
   // Truthful "connected": a WS open is NOT enough — we only flip to "connected"
   // once the orchestrator handshake (its `models` frame) arrives. A non-orchestrator
-  // squatter on the port (e.g. a stray `comfyui-mcp --channels`) never sends it,
+  // squatter on the port (some other process) never sends it,
   // so the panel won't lie "connected" when there's no agent behind the socket.
   let handshakeTimer = null;
   let handshakeDone = false;
@@ -1089,9 +1176,8 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret
       handshakeTimer = setTimeout(() => {
         if (handshakeDone) return;
         onLog(
-          `⚠ Bridge open on ${url} but no panel agent responded. Something else may be holding the port ` +
-            `(e.g. a 'comfyui-mcp --channels' server from another Claude/Cursor session). Close it, or fully ` +
-            `restart ComfyUI, then reconnect.`,
+          `⚠ Bridge open on ${url} but no panel agent responded. Something else may be holding the port. ` +
+            `Close it, or fully restart ComfyUI, then reconnect.`,
         );
       }, HANDSHAKE_MS);
     });
@@ -1129,6 +1215,11 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret
             const scope = msg.scope === "frontend" ? "frontend" : "orchestrator";
             result = `soft reload (${scope}) scheduled`;
             setTimeout(() => onReload(scope), 60);
+          } else if (msg.cmd === "set_todo") {
+            // Render/update the agent's live TODO checklist in the footer tray.
+            const items = Array.isArray(msg.items) ? msg.items : [];
+            onTodo?.(items);
+            result = { ok: true, count: items.length };
           } else {
             const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];
             if (!executor) throw new Error(`Unknown command "${msg.cmd}"`);
@@ -1150,13 +1241,19 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret
         // ask_user / request_secret paint their OWN cards and their replies carry
         // user input (a choice, or a SECRET) — never echo them as an activity card
         // (and never record them). Other commands get the normal activity card.
-        if (msg.cmd !== "ask_user" && msg.cmd !== "request_secret") {
+        if (msg.cmd !== "ask_user" && msg.cmd !== "request_secret" && msg.cmd !== "set_todo") {
           onCommand?.(msg.cmd, msg, reply);
         }
         return;
       }
       if (msg && msg.type === "say" && typeof msg.text === "string") {
-        onSay(msg.text);
+        // `id` reconciles this committed reply with its live streaming preview.
+        onSay(msg.text, { id: msg.id, streamed: !!msg.streamed });
+      }
+      // Live streaming deltas: incremental thinking / reply text before the final
+      // `say` commits. phase: "think" | "text" | "end".
+      if (msg && msg.type === "stream" && typeof msg.id === "string") {
+        onStream?.(msg);
       }
       // Optional agent-side status (context window fill, model name).
       if (msg && msg.type === "agent_status") {
@@ -1185,6 +1282,15 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret
       if (msg && msg.type === "turn" && typeof msg.state === "string") {
         onTurn?.(msg.state);
       }
+      // Live download progress for the status tray (sourced orchestrator-side
+      // from the download tool's temp progress file and/or the Manager queue).
+      if (msg && msg.type === "download_progress" && Array.isArray(msg.downloads)) {
+        onDownloads?.(msg.downloads);
+      }
+      // Live extended-thinking token count → "thinking… (N)" indicator.
+      if (msg && msg.type === "thinking" && typeof msg.tokens === "number") {
+        onThinking?.(msg.tokens);
+      }
       // "echo" frames are ignored — we render the user bubble locally on send.
     });
 
@@ -1192,6 +1298,7 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret
       sock = null;
       handshakeDone = false;
       clearHandshake();
+      lastBridgeDownAt = Date.now(); // for the fast-vs-slow reconnect heuristic
       if (!closed) {
         onStatus("disconnected");
         scheduleReconnect();
@@ -1452,7 +1559,16 @@ const PANEL_CSS = `
 .cmcp-bubble.agent {
   align-self: stretch; max-width: 100%;
   padding: 0; background: none; border: none; border-radius: 0;
+  /* Rendered markdown is real block elements — collapse the source newlines
+     marked emits between tags (the base .cmcp-bubble pre-wrap would otherwise
+     render every one as a blank line, ballooning the vertical spacing). Block
+     margins below handle the rhythm. */
+  white-space: normal;
 }
+/* While a reply is still STREAMING it's plain text (not yet markdown), so it
+   needs pre-wrap to honor its newlines; the commit drops the .streaming class
+   and it reverts to normal markdown flow. */
+.cmcp-bubble.agent.streaming .cmcp-reply { white-space: pre-wrap; }
 .cmcp-bubble.agent code, .cmcp-bubble.user code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem;
   background: var(--p-form-field-background, #09090b);
@@ -1517,6 +1633,32 @@ const PANEL_CSS = `
 /* The base rule sets display, which beats the UA [hidden] rule — so re-assert
    it or "newMsgBtn.hidden = true" won't actually hide the pill. */
 .cmcp-newmsg[hidden] { display: none; }
+.cmcp-tray {
+  flex: none; margin: 0 0.5rem 0.25rem; padding: 0.4rem 0.55rem;
+  background: var(--p-surface-800, #27272a); border: 1px solid var(--p-content-border-color, #3f3f46);
+  border-radius: 8px; max-height: 9rem; overflow-y: auto; font-size: 0.7rem;
+}
+.cmcp-tray[hidden] { display: none; }
+.cmcp-tray-head { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.55; margin-bottom: 0.3rem; }
+.cmcp-todo-item { display: flex; align-items: flex-start; gap: 0.4rem; padding: 0.12rem 0; line-height: 1.3; }
+.cmcp-todo-item .pi { font-size: 0.7rem; margin-top: 0.1rem; flex: none; }
+.cmcp-todo-item.done { opacity: 0.55; }
+.cmcp-todo-item.done span { text-decoration: line-through; }
+.cmcp-todo-item.done .pi { color: var(--p-green-400, #4ade80); }
+.cmcp-todo-item.active { font-weight: 600; }
+.cmcp-todo-item.active .pi { color: var(--p-primary-color, #60a5fa); }
+.cmcp-todo-item.pending .pi { opacity: 0.5; }
+.cmcp-dl { margin-bottom: 0.4rem; }
+.cmcp-dl-item { padding: 0.18rem 0; }
+.cmcp-dl-top { display: flex; justify-content: space-between; gap: 0.5rem; align-items: baseline; }
+.cmcp-dl-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmcp-dl-meta { flex: none; opacity: 0.7; font-size: 0.62rem; }
+.cmcp-dl-bar { height: 4px; border-radius: 999px; background: var(--p-surface-700, #3f3f46); overflow: hidden; margin-top: 0.2rem; }
+.cmcp-dl-fill { height: 100%; background: var(--p-primary-color, #3a7bd5); transition: width 0.3s ease; }
+.cmcp-dl-item.done .cmcp-dl-fill { background: var(--p-green-400, #4ade80); }
+.cmcp-dl-item.error .cmcp-dl-fill { background: var(--p-red-400, #f87171); }
+.cmcp-dl-bar.indet .cmcp-dl-fill { width: 30%; animation: cmcp-indet 1.1s ease-in-out infinite; }
+@keyframes cmcp-indet { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
 .cmcp-sys {
   align-self: center; font-size: 0.6875rem; font-style: italic;
   color: var(--p-text-muted-color, #a1a1aa);
@@ -1579,6 +1721,42 @@ const PANEL_CSS = `
   0%, 60%, 100% { opacity: 0.25; transform: translateY(0); }
   30% { opacity: 1; transform: translateY(-3px); }
 }
+
+/* ---- live streaming: thinking accordion + reply preview ---- */
+/* The "see thinking" disclosure above a streaming reply. Open + scrollable while
+   the model reasons; collapses to a discreet one-line summary once text starts. */
+.cmcp-think {
+  margin: 0 0 0.5rem; border: 1px solid var(--p-content-border-color, #3f3f46);
+  border-radius: var(--p-border-radius-md, 6px);
+  background: var(--p-surface-900, #18181b);
+}
+.cmcp-think > summary {
+  list-style: none; cursor: pointer; user-select: none;
+  padding: 0.3125rem 0.5rem; font-size: 0.6875rem; font-weight: 600;
+  color: var(--p-text-muted-color, #a1a1aa);
+  display: flex; align-items: center; gap: 0.375rem;
+}
+.cmcp-think > summary::-webkit-details-marker { display: none; }
+.cmcp-think > summary::before {
+  content: "\\25b8"; font-size: 0.625rem; transition: transform 0.15s;
+}
+.cmcp-think[open] > summary::before { transform: rotate(90deg); }
+.cmcp-think-body {
+  max-height: 11rem; overflow-y: auto;
+  padding: 0 0.5rem 0.4375rem 0.875rem;
+  font-size: 0.6875rem; line-height: 1.45;
+  color: var(--p-text-muted-color, #8a8a93);
+  white-space: pre-wrap; word-break: break-word;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+/* While open & streaming, a soft pulse on the summary so it reads as "live". */
+.cmcp-think[open] > summary { color: var(--p-primary-color, #60a5fa); }
+/* Blinking caret on the reply preview while it streams in. */
+.cmcp-reply.streaming-cursor::after {
+  content: "\\258b"; margin-left: 1px; color: var(--p-primary-color, #60a5fa);
+  animation: cmcp-caret 1s step-end infinite;
+}
+@keyframes cmcp-caret { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 
 .cmcp-composer {
   position: relative; margin: 0.625rem 0.75rem 0.75rem; flex: none;
@@ -1718,6 +1896,10 @@ function describeCommand(cmd, msg, reply) {
         icon: "pi-sitemap",
         text: `Read subgraph “${r.subgraph_of?.title}” — ${r.node_count} node${r.node_count === 1 ? "" : "s"}`,
       };
+    case "graph_promote_widget":
+      return r.demoted
+        ? { icon: "pi-arrow-down", text: `Un-promoted “${r.demoted}” from the subgraph node` }
+        : { icon: "pi-arrow-up", text: `Promoted “${r.promoted}” to the subgraph node` };
     case "graph_move_node":
       return { icon: "pi-arrows-alt", text: `Moved node ${r.moved?.node_id} to [${r.moved?.to?.map(Math.round)}]` };
     case "graph_canvas":
@@ -1747,8 +1929,55 @@ function describeCommand(cmd, msg, reply) {
 // GitHub-flavored markdown, single-newline line breaks.
 marked.setOptions({ gfm: true, breaks: true });
 
+// CRITICAL: force every rendered link to open OUT of the panel frame. In the
+// ComfyUI desktop (Electron) app a plain in-frame navigation hijacks the WHOLE
+// window — no back button, hard-reload to escape. Tagging anchors target=_blank
+// + rel makes them open in a new context (the desktop routes that to the default
+// browser); a delegated click handler (wireExternalLinks) is the belt-and-braces
+// that intercepts the click and opens externally even if _blank is ignored.
+DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+  if (node.tagName === "A") {
+    node.setAttribute("target", "_blank");
+    node.setAttribute("rel", "noopener noreferrer nofollow");
+  }
+});
+
+/** Open a URL outside the panel frame — never navigate the app/webview itself.
+ *  Prefers a desktop external-open bridge if present, else a new browser tab. */
+function openExternalUrl(href) {
+  if (!href) return;
+  try {
+    const ext =
+      window.electronAPI?.openExternal ||
+      window.comfyAPI?.electron?.openExternal ||
+      window.api?.openExternal;
+    if (typeof ext === "function") {
+      ext(href);
+      return;
+    }
+  } catch {
+    // fall through to window.open
+  }
+  window.open(href, "_blank", "noopener,noreferrer");
+}
+
+/** Delegate link clicks on a container so http(s)/mailto links open externally
+ *  instead of navigating the panel frame (which hijacks the desktop app). */
+function wireExternalLinks(container) {
+  container.addEventListener("click", (ev) => {
+    const a = ev.target?.closest?.("a[href]");
+    if (!a || !container.contains(a)) return;
+    const href = a.getAttribute("href") || "";
+    if (!href || href.startsWith("#")) return; // in-document anchors: leave alone
+    ev.preventDefault();
+    ev.stopPropagation();
+    openExternalUrl(a.href || href); // a.href resolves relative URLs
+  });
+}
+
 /** Render agent markdown (full GFM) via marked, sanitized with DOMPurify so
- *  agent output can never inject script/handlers into the panel. */
+ *  agent output can never inject script/handlers into the panel. Links are
+ *  forced external via the DOMPurify hook above + wireExternalLinks on the feed. */
 function renderRichText(el, text) {
   el.innerHTML = DOMPurify.sanitize(marked.parse(String(text)));
 }
@@ -1761,6 +1990,9 @@ function buildPanel() {
   // Expose this panel's root so canvas "fit" can measure how much of the canvas
   // the open panel occludes and frame the graph in the visible area.
   activePanelRoot = root;
+  // Any link clicked anywhere in the panel opens externally — never let it
+  // navigate (and hijack) the ComfyUI desktop webview.
+  wireExternalLinks(root);
 
   // ---- Header: title + status dot ----
   const header = document.createElement("div");
@@ -1947,6 +2179,113 @@ function buildPanel() {
   });
   body.appendChild(newMsgBtn);
   root.appendChild(body);
+
+  // Footer status tray — docked above the composer. Hosts the agent's live TODO
+  // checklist (download progress rows slot in here later). Hidden until non-empty.
+  let todoItems = [];
+  let downloadItems = [];
+  const tray = document.createElement("div");
+  tray.className = "cmcp-tray";
+  tray.hidden = true;
+  root.appendChild(tray);
+
+  function fmtBytes(n) {
+    if (!n || n < 1024) return `${n || 0} B`;
+    const u = ["KB", "MB", "GB", "TB"];
+    let i = -1;
+    let v = n;
+    do { v /= 1024; i++; } while (v >= 1024 && i < u.length - 1);
+    return `${v.toFixed(1)} ${u[i]}`;
+  }
+
+  function renderTray() {
+    tray.replaceChildren();
+    const hasDl = downloadItems.length > 0;
+    const hasTodo = todoItems.length > 0;
+    tray.hidden = !hasDl && !hasTodo;
+    if (tray.hidden) return;
+
+    if (hasDl) {
+      const dl = document.createElement("div");
+      dl.className = "cmcp-dl";
+      const head = document.createElement("div");
+      head.className = "cmcp-tray-head";
+      head.textContent = "Downloads";
+      dl.appendChild(head);
+      for (const d of downloadItems) {
+        const total = d && Number(d.total) > 0 ? Number(d.total) : 0;
+        const got = d && Number(d.downloaded) > 0 ? Number(d.downloaded) : 0;
+        const pct = total ? Math.min(100, Math.round((100 * got) / total)) : null;
+        const failed = d && (d.status === "error" || d.status === "failed");
+        const done = d && d.status === "done";
+        const row = document.createElement("div");
+        row.className = "cmcp-dl-item" + (failed ? " error" : done ? " done" : "");
+        const top = document.createElement("div");
+        top.className = "cmcp-dl-top";
+        const name = document.createElement("span");
+        name.className = "cmcp-dl-name";
+        name.textContent = (d && d.name) || "download";
+        name.title = name.textContent;
+        const meta = document.createElement("span");
+        meta.className = "cmcp-dl-meta";
+        const speed = d && Number(d.bytes_per_sec) > 0 ? `${fmtBytes(Number(d.bytes_per_sec))}/s` : "";
+        meta.textContent = failed
+          ? "failed"
+          : done
+            ? "done"
+            : [pct != null ? `${pct}%` : "…", speed].filter(Boolean).join(" · ");
+        top.append(name, meta);
+        row.appendChild(top);
+        const barWrap = document.createElement("div");
+        barWrap.className = "cmcp-dl-bar" + (pct == null && !done && !failed ? " indet" : "");
+        const fill = document.createElement("div");
+        fill.className = "cmcp-dl-fill";
+        fill.style.width = `${done ? 100 : (pct ?? (failed ? 100 : 30))}%`;
+        barWrap.appendChild(fill);
+        row.appendChild(barWrap);
+        dl.appendChild(row);
+      }
+      tray.appendChild(dl);
+    }
+
+    if (hasTodo) {
+      const list = document.createElement("div");
+      list.className = "cmcp-todo";
+      const doneN = todoItems.filter((it) => it && it.status === "done").length;
+      const head = document.createElement("div");
+      head.className = "cmcp-tray-head";
+      head.textContent = `Plan · ${doneN}/${todoItems.length}`;
+      list.appendChild(head);
+      for (const it of todoItems) {
+        const status = it && it.status === "active" ? "active" : it && it.status === "done" ? "done" : "pending";
+        const row = document.createElement("div");
+        row.className = "cmcp-todo-item " + status;
+        const icon = document.createElement("i");
+        icon.className =
+          "pi " + (status === "done" ? "pi-check-circle" : status === "active" ? "pi-spin pi-spinner" : "pi-circle");
+        const txt = document.createElement("span");
+        txt.textContent = (it && it.text) || "";
+        row.append(icon, txt);
+        list.appendChild(row);
+      }
+      tray.appendChild(list);
+    }
+    scrollLog();
+  }
+  function renderTodo(items) {
+    todoItems = Array.isArray(items) ? items : [];
+    renderTray();
+    // Persist the plan ON the active thread so it survives a reload / panel
+    // remount (the tray is otherwise rebuilt empty) and follows thread switches.
+    if (thread) {
+      thread.todos = todoItems;
+      persistThreads();
+    }
+  }
+  function renderDownloads(downloads) {
+    downloadItems = (Array.isArray(downloads) ? downloads : []).filter(Boolean);
+    renderTray();
+  }
 
   function clearEmpty() {
     if (empty.parentElement) empty.remove();
@@ -2535,6 +2874,154 @@ function buildPanel() {
     record({ role: "agent", text });
   }
 
+  // ---- live streaming (thinking + reply) ----
+  // Deltas arrive in uneven, network-sized chunks. To match the official app's
+  // smooth character-by-character feel we DON'T paint each chunk directly —
+  // instead each bubble holds a target string and a "shown" cursor, and ONE rAF
+  // loop advances every active bubble a few chars per frame: fast enough to catch
+  // up on a big burst, slow enough to read as typing. The committed `say` renders
+  // markdown only once the typewriter has caught up, so it never snaps mid-reveal.
+  // Keyed by SDK message id so deltas stay coherent and the final say replaces the
+  // preview instead of duplicating. Zero deps (no GSAP) — streaming text wants a
+  // render loop, not a DOM-splitting animation.
+  const streamBubbles = new Map(); // id -> bubble state
+  const animating = new Set(); // bubbles with characters still to reveal
+  let streamRaf = null;
+
+  function kickStreams(s) {
+    animating.add(s);
+    if (streamRaf == null) streamRaf = requestAnimationFrame(pumpStreams);
+  }
+
+  function pumpStreams() {
+    streamRaf = null;
+    let active = false;
+    for (const s of animating) {
+      let busy = false;
+      // Reveal thinking text (proportional catch-up, a few chars/frame minimum).
+      if (s.thinkBody && s.thinkShown < s.thinkTarget.length) {
+        const rem = s.thinkTarget.length - s.thinkShown;
+        s.thinkShown = Math.min(s.thinkTarget.length, s.thinkShown + Math.max(3, Math.ceil(rem / 6)));
+        s.thinkBody.textContent = s.thinkTarget.slice(0, s.thinkShown);
+        s.thinkBody.scrollTop = s.thinkBody.scrollHeight;
+        busy = true;
+      }
+      // Reveal reply text a touch slower so it reads as deliberate typing.
+      if (s.replyShown < s.replyTarget.length) {
+        const rem = s.replyTarget.length - s.replyShown;
+        s.replyShown = Math.min(s.replyTarget.length, s.replyShown + Math.max(2, Math.ceil(rem / 9)));
+        s.replyEl.textContent = s.replyTarget.slice(0, s.replyShown);
+        busy = true;
+      }
+      if (busy) {
+        active = true;
+      } else if (s.commitText != null) {
+        finalizeStream(s); // caught up and the final text is waiting → commit it
+      } else {
+        animating.delete(s); // idle until the next delta arrives
+      }
+    }
+    if (active) {
+      scrollLog();
+      streamRaf = requestAnimationFrame(pumpStreams);
+    }
+  }
+
+  function ensureStreamBubble(id) {
+    let s = streamBubbles.get(id);
+    if (s) return s;
+    clearEmpty();
+    const el = document.createElement("div");
+    el.className = "cmcp-bubble agent streaming";
+    const replyEl = document.createElement("div");
+    replyEl.className = "cmcp-reply";
+    el.appendChild(replyEl);
+    log.appendChild(el);
+    s = {
+      id,
+      el,
+      replyEl,
+      thinkWrap: null,
+      thinkBody: null,
+      thinkSummary: null,
+      thinkTarget: "",
+      thinkShown: 0,
+      replyTarget: "",
+      replyShown: 0,
+      commitText: null,
+    };
+    streamBubbles.set(id, s);
+    bumpThinking(); // keep the working indicator pinned below the new bubble
+    return s;
+  }
+
+  function ensureThinkArea(s) {
+    if (s.thinkWrap) return s;
+    const det = document.createElement("details");
+    det.className = "cmcp-think";
+    det.open = true;
+    const sum = document.createElement("summary");
+    sum.textContent = "Thinking…";
+    const body = document.createElement("div");
+    body.className = "cmcp-think-body";
+    det.append(sum, body);
+    s.el.insertBefore(det, s.replyEl); // thinking sits above the reply
+    s.thinkWrap = det;
+    s.thinkBody = body;
+    s.thinkSummary = sum;
+    return s;
+  }
+
+  function collapseThinking(s, label) {
+    if (!s.thinkWrap) return;
+    s.thinkShown = s.thinkTarget.length; // snap the (now hidden) reasoning to full
+    if (s.thinkBody) s.thinkBody.textContent = s.thinkTarget;
+    s.thinkWrap.open = false;
+    if (s.thinkSummary) s.thinkSummary.textContent = label;
+  }
+
+  function onStreamDelta(msg) {
+    const { phase, id } = msg;
+    const delta = typeof msg.delta === "string" ? msg.delta : "";
+    if (phase === "think") {
+      const s = ensureStreamBubble(id);
+      ensureThinkArea(s);
+      s.thinkTarget += delta;
+      kickStreams(s);
+    } else if (phase === "text") {
+      const s = ensureStreamBubble(id);
+      collapseThinking(s, "See thinking"); // reply began → tuck the reasoning away
+      s.replyTarget += delta;
+      s.replyEl.classList.add("streaming-cursor");
+      kickStreams(s);
+    }
+    // phase "end" (message_stop): nothing — the commit (or typewriter catch-up)
+    // finalizes the bubble; the caret keeps blinking until the real text lands.
+  }
+
+  function finalizeStream(s) {
+    animating.delete(s);
+    streamBubbles.delete(s.id);
+    s.replyEl.classList.remove("streaming-cursor");
+    collapseThinking(s, "See thinking");
+    renderRichText(s.replyEl, s.commitText); // streamed plain text → final markdown
+    s.el.classList.remove("streaming");
+    record({ role: "agent", text: s.commitText }); // thinking is ephemeral
+    scrollLog();
+  }
+
+  /** Reconcile a committed `say` with its live preview: let the typewriter finish,
+   *  then render final markdown (done in pumpStreams → finalizeStream). Returns
+   *  false if there's no matching stream bubble (caller paints a normal bubble). */
+  function commitStream(id, text) {
+    const s = streamBubbles.get(id);
+    if (!s) return false;
+    s.commitText = text;
+    s.replyTarget = text; // authoritative — guarantees the typewriter reaches the end
+    kickStreams(s); // run to completion; finalizeStream renders markdown when caught up
+    return true;
+  }
+
   function appendSystem(text) {
     // System notices are transient — painted, never recorded.
     const b = document.createElement("div");
@@ -2553,6 +3040,7 @@ function buildPanel() {
 
   function resetFeed() {
     for (const el of [...log.children]) el.remove();
+    streamBubbles.clear(); // drop any in-flight streaming previews (DOM is gone)
     log.appendChild(empty);
   }
 
@@ -2563,6 +3051,7 @@ function buildPanel() {
     ssSet(CTX_KEY, null);
     if (typeof resetAttachments === "function") resetAttachments();
     resetFeed();
+    renderTodo([]); // fresh chat → empty plan tray
     setContextPct(0);
     ctxLabel.textContent = "—";
     // Tell the orchestrator to forget this tab's session so the NEXT message
@@ -2579,6 +3068,7 @@ function buildPanel() {
       else if (m.role === "agent") paintAgent(m.text);
       else if (m.role === "card") paintCard(m);
     }
+    renderTodo(t.todos || []); // restore this thread's plan into the tray
     // Resume this conversation's agent session (or start fresh if it has none),
     // so typing continues THIS chat rather than whatever was last active.
     ssSet(SESSION_KEY, t.sessionId || null);
@@ -2679,6 +3169,7 @@ function buildPanel() {
   let workWordTimer = null;
   let workWordIdx = 0;
   let thinkingSafety = null;
+  let thinkingTokens = 0;
   // Backstop: if no activity (say/command/turn signal) for this long, auto-hide
   // — covers a missed turn:done (e.g. an older orchestrator, or an errored turn)
   // so the indicator never sticks forever.
@@ -2689,10 +3180,24 @@ function buildPanel() {
     thinkingSafety = setTimeout(hideThinking, THINKING_SAFETY_MS);
   }
 
+  function fmtThinkTokens(n) {
+    return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
+  }
   function cycleWord() {
     if (!thinkingLabel) return;
-    thinkingLabel.textContent = `${WORK_WORDS[workWordIdx % WORK_WORDS.length]}… (Ctrl+C to stop)`;
+    const base =
+      thinkingTokens > 0
+        ? `Thinking… (${fmtThinkTokens(thinkingTokens)} tokens)`
+        : `${WORK_WORDS[workWordIdx % WORK_WORDS.length]}…`;
+    thinkingLabel.textContent = `${base} (Ctrl+C to stop)`;
     workWordIdx += 1;
+  }
+  // Live extended-thinking token meter (from the orchestrator's thinking frame).
+  function setThinkingTokens(n) {
+    thinkingTokens = Number(n) || 0;
+    if (!thinkingEl) showThinking();
+    cycleWord();
+    armSafety();
   }
 
   function hideThinking() {
@@ -2709,6 +3214,7 @@ function buildPanel() {
       thinkingEl = null;
       thinkingLabel = null;
     }
+    thinkingTokens = 0; // reset so the next turn doesn't show a stale count
   }
 
   function showThinking() {
@@ -2784,12 +3290,17 @@ function buildPanel() {
       // orchestrator sends only AFTER it has armed hello.resume — so the nudge
       // can't out-race the session resume.)
     },
-    onSay(text) {
-      // Append the agent's words but KEEP the working indicator — the turn isn't
-      // over until turn:done. (A turn often emits progress text, then keeps
-      // working silently.) bumpThinking pins the indicator below the new message.
-      appendAgent(text);
+    onSay(text, meta) {
+      // If this reply was streamed, commit it into its live preview bubble (same
+      // message id) instead of painting a duplicate. Otherwise paint normally.
+      // Either way KEEP the working indicator — the turn isn't over until
+      // turn:done (a turn often emits progress text, then works on silently).
+      if (!(meta && meta.id && commitStream(meta.id, text))) appendAgent(text);
       bumpThinking();
+    },
+    // Live streaming deltas (thinking + reply text) before the committed say.
+    onStream(msg) {
+      onStreamDelta(msg);
     },
     // The agent called panel_ask — render a question card and resolve with the
     // user's pick. Keep the working indicator pinned below it while we wait.
@@ -2797,6 +3308,18 @@ function buildPanel() {
       const p = paintQuestion(msg);
       bumpThinking();
       return p;
+    },
+    // The agent called panel_set_todo — render/update the live plan tray.
+    onTodo(items) {
+      renderTodo(items);
+    },
+    // Orchestrator pushed live download progress → render rows in the tray.
+    onDownloads(list) {
+      renderDownloads(list);
+    },
+    // Live extended-thinking token count → update the working indicator.
+    onThinking(tokens) {
+      setThinkingTokens(tokens);
     },
     // The agent called panel_request_secret — collect a token securely.
     onSecret(msg) {
@@ -2809,8 +3332,13 @@ function buildPanel() {
       softReload("agent", scope);
     },
     onTurn(state) {
-      if (state === "working") showThinking();
-      else if (state === "done") hideThinking();
+      if (state === "working") {
+        showThinking();
+        ssSet(MID_TASK_KEY, "1"); // a turn is in flight — arm the resume nudge
+      } else if (state === "done") {
+        hideThinking();
+        ssSet(MID_TASK_KEY, null); // turn finished cleanly — nothing to resume
+      }
     },
     onLog(text) {
       appendSystem(text);
@@ -2851,6 +3379,14 @@ function buildPanel() {
       applyModelCatalog(list);
     },
     onAck(ack) {
+      // Effort change while the agent was mid-turn: it can't change a running
+      // turn's effort, so it applies once the current turn finishes (no more
+      // killing the in-flight reply). Let the user know so the picker selection
+      // not taking effect *this* turn isn't a mystery.
+      if (ack?.kind === "options" && ack.deferred) {
+        appendSystem(`Effort → ${ack.effort ?? "default"} — applies after the current turn finishes.`);
+        return;
+      }
       // Post-restart auto-resume (#3): the "ready" ack is sent after the
       // orchestrator armed hello.resume, so resuming the agent is safe now.
       // Clear REBOOT_KEY only here (on actual send) so a drop mid-reconnect
@@ -2870,6 +3406,7 @@ function buildPanel() {
       if (ack?.kind === "ready" && ssGet(SOFT_RELOAD_KEY)) {
         const origin = ssGet(SOFT_RELOAD_KEY);
         ssSet(SOFT_RELOAD_KEY, null);
+        ssSet(MID_TASK_KEY, null); // deliberate reload — don't also fire the drop nudge
         appendSystem("Agent reloaded — session resumed.");
         if (origin === "agent") {
           showThinking();
@@ -2877,6 +3414,24 @@ function buildPanel() {
             "✅ You were just soft-reloaded to pick up code changes (no ComfyUI restart) — your tools and system prompt are now the latest build. Continue exactly what you were doing before the reload.",
           );
         }
+        return;
+      }
+      // Unexpected bounce while mid-task — a DIFFERENT agent restarting ComfyUI
+      // (to load nodes), a crash, or an SDK self-heal. The session resumed with
+      // full context but has no pending turn, so it would sit idle. Nudge it.
+      if (ack?.kind === "ready" && ssGet(MID_TASK_KEY)) {
+        ssSet(MID_TASK_KEY, null);
+        // Only nudge for a REAL restart. A fast reconnect (a panel remount from a
+        // sidebar swap, or a brief WS blip) means the orchestrator never died —
+        // the agent's turn kept running — so a "you dropped" nudge is false AND
+        // would inject a spurious turn into a live session. A real ComfyUI restart
+        // takes many seconds to come back, so a long gap since the drop = real.
+        if (Date.now() - lastBridgeDownAt < 6000) return;
+        appendSystem("Reconnected — picking up where we left off.");
+        showThinking();
+        client.sendUserMessage(
+          "✅ Your connection dropped mid-task (e.g. ComfyUI was restarted, possibly by another agent installing nodes). The session resumed with full context — continue exactly what you were doing before the drop; if you were mid-build or mid-edit, pick it right back up.",
+        );
       }
     },
     getResume: () => ssGet(SESSION_KEY),
@@ -2913,16 +3468,25 @@ function buildPanel() {
   // After a reboot we triggered, respawn the orchestrator (it died with ComfyUI)
   // so the bridge can reconnect; onStatus(connected) then resumes the agent.
   function onComfyReconnecting() {
-    if (ssGet(REBOOT_KEY) || lsGet(AUTOCONNECT_KEY)) appendSystem("ComfyUI is restarting…");
+    // Only flag a restart if our bridge actually went down — a benign ComfyUI WS
+    // blip (asset view / image check) shouldn't print a false "restarting" alarm.
+    if ((ssGet(REBOOT_KEY) || lsGet(AUTOCONNECT_KEY)) && !client.isConnected()) {
+      appendSystem("ComfyUI is restarting…");
+    }
   }
   function onComfyReconnected() {
     // After ComfyUI comes back (backend-only reboot — the page didn't reload),
     // the orchestrator died with it. Respawn + reconnect if the agent was in use:
     // either a restart WE triggered (REBOOT_KEY) or sticky auto-connect.
     if (!ssGet(REBOOT_KEY) && !lsGet(AUTOCONNECT_KEY)) return;
+    // ComfyUI fires "reconnected" for BENIGN WS blips too — viewing assets,
+    // checking an image's status, a tab refocus — and those do NOT kill the
+    // orchestrator. If OUR bridge is still up, the agent is alive and well, so
+    // do NOT bounce a live session (that was the spurious "you reconnected"). A
+    // real ComfyUI restart drops the bridge (the orchestrator dies with it, and
+    // the bridge's own retry can't respawn it) — only then do we respawn here.
+    if (client.isConnected()) return;
     appendSystem("ComfyUI is back — reconnecting the agent…");
-    // Respawn the orchestrator on demand and reopen the bridge (same path as the
-    // Connect button). When it connects, onStatus sends the resume nudge.
     connectAgent();
   }
   try {
@@ -3467,12 +4031,84 @@ function buildPanel() {
     recognition.start();
   });
 
+  // ---- composer history (press ↑ to recall your last message for editing) ----
+  // Shell-style: ↑ from an empty composer (or with the caret at the very start)
+  // walks back through messages you've sent and drops them back in the composer;
+  // ↓ walks forward and finally restores the draft you were typing. Any keystroke
+  // that edits the text exits history mode. Born from the muscle-memory urge to
+  // press ↑ and fix a typo in the message you just fired off.
+  const sentHistory = [];
+  let histIdx = -1; // -1 = not navigating; otherwise an index into sentHistory
+  let histDraft = ""; // the unsent draft stashed when navigation began
+
+  function recordSent(text) {
+    if (sentHistory[sentHistory.length - 1] !== text) sentHistory.push(text);
+    if (sentHistory.length > 50) sentHistory.shift();
+    histIdx = -1;
+  }
+  function setComposerValue(val) {
+    input.value = val;
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 120)}px`;
+    const n = val.length;
+    try {
+      input.setSelectionRange(n, n);
+    } catch {
+      // detached/unsupported — value is set, caret position is cosmetic
+    }
+  }
+  /** "Edit last message": when you start navigating, if the agent hasn't answered
+   *  yet (the last recorded message is still yours), RETRACT it — pull the bubble
+   *  out of the feed, drop any in-flight reply preview, and interrupt the turn —
+   *  so editing and resending REPLACES it instead of leaving a duplicate. If the
+   *  agent already replied, we leave the conversation intact and just browse. */
+  function retractLastUserMessage() {
+    const msgs = thread?.msgs;
+    if (!msgs || !msgs.length || msgs[msgs.length - 1].role !== "user") return;
+    msgs.pop();
+    persistThreads();
+    for (const s of streamBubbles.values()) s.el.remove(); // interrupting → drop previews
+    streamBubbles.clear();
+    animating.clear();
+    const userBubbles = log.querySelectorAll(".cmcp-bubble.user");
+    const last = userBubbles[userBubbles.length - 1];
+    if (last) last.remove();
+    if (thinkingEl) {
+      client?.sendFrame?.({ type: "interrupt" });
+      hideThinking();
+    }
+  }
+
+  function recallPrev() {
+    if (!sentHistory.length) return false;
+    if (histIdx === -1) {
+      histDraft = input.value;
+      histIdx = sentHistory.length;
+      retractLastUserMessage(); // pull an unanswered message back so resend ≠ duplicate
+    }
+    histIdx = Math.max(0, histIdx - 1);
+    setComposerValue(sentHistory[histIdx]);
+    return true;
+  }
+  function recallNext() {
+    if (histIdx === -1) return false;
+    histIdx += 1;
+    if (histIdx >= sentHistory.length) {
+      histIdx = -1;
+      setComposerValue(histDraft); // back to the draft you were typing
+    } else {
+      setComposerValue(sentHistory[histIdx]);
+    }
+    return true;
+  }
+
   // ---- submit ----
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     hideMenu();
     const text = input.value.trim();
     if (!text) return;
+    recordSent(text); // remember it so ↑ can recall it later
     if (text.startsWith("/")) {
       const c = SLASH_COMMANDS.find((sc) => sc.cmd === text.split(/\s+/)[0]);
       if (c) {
@@ -3560,6 +4196,27 @@ function buildPanel() {
         return;
       }
     }
+    // ↑ recalls your previous sent message (when already navigating, or from the
+    // very start of the composer so it never hijacks normal line-up movement);
+    // ↓ walks forward / restores your draft. Esc bails out to the draft.
+    if (ev.key === "ArrowUp" && (histIdx !== -1 || (input.selectionStart === 0 && input.selectionEnd === 0))) {
+      if (recallPrev()) {
+        ev.preventDefault();
+        return;
+      }
+    }
+    if (ev.key === "ArrowDown" && histIdx !== -1) {
+      if (recallNext()) {
+        ev.preventDefault();
+        return;
+      }
+    }
+    if (ev.key === "Escape" && histIdx !== -1) {
+      ev.preventDefault();
+      histIdx = -1;
+      setComposerValue(histDraft);
+      return;
+    }
     if (ev.key === "Enter" && !ev.shiftKey) {
       ev.preventDefault();
       form.requestSubmit();
@@ -3584,6 +4241,7 @@ function buildPanel() {
   input.addEventListener("blur", () => setTimeout(hideMenu, 150));
   // Auto-grow the textarea up to its CSS max-height.
   input.addEventListener("input", () => {
+    histIdx = -1; // a real edit exits message-history navigation
     input.style.height = "auto";
     input.style.height = `${Math.min(input.scrollHeight, 120)}px`;
     refreshMenu();
@@ -3623,6 +4281,7 @@ function buildPanel() {
         else if (m.role === "agent") paintAgent(m.text);
         else if (m.role === "card") paintCard(m);
       }
+      renderTodo(t.todos || []); // restore this thread's plan into the tray
     } catch {
       // Corrupt/absent state — start clean.
     }
@@ -3679,13 +4338,27 @@ function buildPanel() {
 }
 
 // ---------------------------------------------------------------------------
-// v1 registration via the imported app module.
+// Registration. Resolve `app`/`api` from window.comfyAPI and register the
+// extension only once they're ready — deferring past Vite/Rolldown's early
+// module eval so a not-yet-populated shim can't throw and deadlock the loader.
+// Defensive deferral contributed by @FreesoSaiFared (PR #2).
 // ---------------------------------------------------------------------------
-if (!app || typeof app.registerExtension !== "function") {
-  console.error(
-    "[comfyui-mcp-panel] app.registerExtension is unavailable — incompatible ComfyUI frontend version.",
-  );
-} else {
+function registerExtensionWhenReady(tries = 0) {
+  const comfyApp = window.comfyAPI?.app?.app || window.app;
+  if (!comfyApp || typeof comfyApp.registerExtension !== "function") {
+    if (tries >= 1000) {
+      console.error(
+        "[comfyui-mcp-panel] app.registerExtension never became available — incompatible ComfyUI frontend version.",
+      );
+      return;
+    }
+    setTimeout(() => registerExtensionWhenReady(tries + 1), 10);
+    return;
+  }
+  app = comfyApp;
+  api = window.comfyAPI?.api?.api || window.api || null;
+  setupListeners();
+
   // TODO(v2): replace with `defineExtension({ name, setup() {...} })`.
   app.registerExtension({
     name: "comfyui-mcp.agent-panel",
@@ -3698,7 +4371,7 @@ if (!app || typeof app.registerExtension !== "function") {
         title: "Agent",
         // ComfyUI ships PrimeIcons; `pi-comments` is the closest "chat" glyph.
         icon: "pi pi-comments",
-        tooltip: "ComfyUI MCP Panel — your Claude session's window into this graph",
+        tooltip: "ComfyUI Agent Panel — your Claude session's window into this graph",
         type: "custom",
         render: (container) => {
           if (mounted) mounted.destroy();
@@ -3746,3 +4419,5 @@ if (!app || typeof app.registerExtension !== "function") {
     },
   });
 }
+
+registerExtensionWhenReady();
