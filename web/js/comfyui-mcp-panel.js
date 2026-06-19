@@ -60,9 +60,8 @@ try {
 // localStorage-backed settings.
 // ---------------------------------------------------------------------------
 const STORAGE_KEY_BRIDGE = "comfyui-mcp.panel.bridgeUrl";
-// The panel orchestrator owns a DEDICATED bridge port (9180), separate from the
-// legacy `comfyui-mcp --channels` bridge (9101) — so a stray --channels server
-// in any Claude/Cursor session can never sit on the panel's port and produce a
+// The panel orchestrator owns a DEDICATED bridge port (9180) — so a stray
+// process in another session can never sit on the panel's port and produce a
 // "connected but no agent" lie.
 const DEFAULT_BRIDGE_URL = "ws://127.0.0.1:9180";
 const LEGACY_BRIDGE_URL = "ws://127.0.0.1:9101"; // old shared default — migrate off it
@@ -1052,7 +1051,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   let reconnectTimer = null;
   // Truthful "connected": a WS open is NOT enough — we only flip to "connected"
   // once the orchestrator handshake (its `models` frame) arrives. A non-orchestrator
-  // squatter on the port (e.g. a stray `comfyui-mcp --channels`) never sends it,
+  // squatter on the port (some other process) never sends it,
   // so the panel won't lie "connected" when there's no agent behind the socket.
   let handshakeTimer = null;
   let handshakeDone = false;
@@ -1100,9 +1099,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       handshakeTimer = setTimeout(() => {
         if (handshakeDone) return;
         onLog(
-          `⚠ Bridge open on ${url} but no panel agent responded. Something else may be holding the port ` +
-            `(e.g. a 'comfyui-mcp --channels' server from another Claude/Cursor session). Close it, or fully ` +
-            `restart ComfyUI, then reconnect.`,
+          `⚠ Bridge open on ${url} but no panel agent responded. Something else may be holding the port. ` +
+            `Close it, or fully restart ComfyUI, then reconnect.`,
         );
       }, HANDSHAKE_MS);
     });
@@ -2731,13 +2729,57 @@ function buildPanel() {
   }
 
   // ---- live streaming (thinking + reply) ----
-  // A streaming bubble is keyed by the SDK message id so deltas stay coherent and
-  // the final committed `say` (same id) REPLACES the preview rather than adding a
-  // duplicate. Thinking text streams into a "see thinking" accordion that's open
-  // (and scrollable) while the model reasons, then collapses the instant reply
-  // text begins. Reply text streams as plain text with a caret; on commit it's
-  // re-rendered as full markdown.
-  const streamBubbles = new Map(); // id -> { el, thinkWrap, thinkBody, thinkSummary, replyEl, thinkText, replyText }
+  // Deltas arrive in uneven, network-sized chunks. To match the official app's
+  // smooth character-by-character feel we DON'T paint each chunk directly —
+  // instead each bubble holds a target string and a "shown" cursor, and ONE rAF
+  // loop advances every active bubble a few chars per frame: fast enough to catch
+  // up on a big burst, slow enough to read as typing. The committed `say` renders
+  // markdown only once the typewriter has caught up, so it never snaps mid-reveal.
+  // Keyed by SDK message id so deltas stay coherent and the final say replaces the
+  // preview instead of duplicating. Zero deps (no GSAP) — streaming text wants a
+  // render loop, not a DOM-splitting animation.
+  const streamBubbles = new Map(); // id -> bubble state
+  const animating = new Set(); // bubbles with characters still to reveal
+  let streamRaf = null;
+
+  function kickStreams(s) {
+    animating.add(s);
+    if (streamRaf == null) streamRaf = requestAnimationFrame(pumpStreams);
+  }
+
+  function pumpStreams() {
+    streamRaf = null;
+    let active = false;
+    for (const s of animating) {
+      let busy = false;
+      // Reveal thinking text (proportional catch-up, a few chars/frame minimum).
+      if (s.thinkBody && s.thinkShown < s.thinkTarget.length) {
+        const rem = s.thinkTarget.length - s.thinkShown;
+        s.thinkShown = Math.min(s.thinkTarget.length, s.thinkShown + Math.max(3, Math.ceil(rem / 6)));
+        s.thinkBody.textContent = s.thinkTarget.slice(0, s.thinkShown);
+        s.thinkBody.scrollTop = s.thinkBody.scrollHeight;
+        busy = true;
+      }
+      // Reveal reply text a touch slower so it reads as deliberate typing.
+      if (s.replyShown < s.replyTarget.length) {
+        const rem = s.replyTarget.length - s.replyShown;
+        s.replyShown = Math.min(s.replyTarget.length, s.replyShown + Math.max(2, Math.ceil(rem / 9)));
+        s.replyEl.textContent = s.replyTarget.slice(0, s.replyShown);
+        busy = true;
+      }
+      if (busy) {
+        active = true;
+      } else if (s.commitText != null) {
+        finalizeStream(s); // caught up and the final text is waiting → commit it
+      } else {
+        animating.delete(s); // idle until the next delta arrives
+      }
+    }
+    if (active) {
+      scrollLog();
+      streamRaf = requestAnimationFrame(pumpStreams);
+    }
+  }
 
   function ensureStreamBubble(id) {
     let s = streamBubbles.get(id);
@@ -2749,7 +2791,19 @@ function buildPanel() {
     replyEl.className = "cmcp-reply";
     el.appendChild(replyEl);
     log.appendChild(el);
-    s = { el, thinkWrap: null, thinkBody: null, thinkSummary: null, replyEl, thinkText: "", replyText: "" };
+    s = {
+      id,
+      el,
+      replyEl,
+      thinkWrap: null,
+      thinkBody: null,
+      thinkSummary: null,
+      thinkTarget: "",
+      thinkShown: 0,
+      replyTarget: "",
+      replyShown: 0,
+      commitText: null,
+    };
     streamBubbles.set(id, s);
     bumpThinking(); // keep the working indicator pinned below the new bubble
     return s;
@@ -2773,10 +2827,11 @@ function buildPanel() {
   }
 
   function collapseThinking(s, label) {
-    if (s.thinkWrap) {
-      s.thinkWrap.open = false;
-      if (s.thinkSummary) s.thinkSummary.textContent = label;
-    }
+    if (!s.thinkWrap) return;
+    s.thinkShown = s.thinkTarget.length; // snap the (now hidden) reasoning to full
+    if (s.thinkBody) s.thinkBody.textContent = s.thinkTarget;
+    s.thinkWrap.open = false;
+    if (s.thinkSummary) s.thinkSummary.textContent = label;
   }
 
   function onStreamDelta(msg) {
@@ -2785,36 +2840,39 @@ function buildPanel() {
     if (phase === "think") {
       const s = ensureStreamBubble(id);
       ensureThinkArea(s);
-      s.thinkText += delta;
-      s.thinkBody.textContent = s.thinkText;
-      s.thinkBody.scrollTop = s.thinkBody.scrollHeight; // follow the newest reasoning
-      scrollLog();
+      s.thinkTarget += delta;
+      kickStreams(s);
     } else if (phase === "text") {
       const s = ensureStreamBubble(id);
       collapseThinking(s, "See thinking"); // reply began → tuck the reasoning away
-      s.replyText += delta;
-      s.replyEl.textContent = s.replyText; // plain while streaming; markdown on commit
+      s.replyTarget += delta;
       s.replyEl.classList.add("streaming-cursor");
-      scrollLog();
-    } else if (phase === "end") {
-      const s = streamBubbles.get(id);
-      if (s) s.replyEl.classList.remove("streaming-cursor");
+      kickStreams(s);
     }
+    // phase "end" (message_stop): nothing — the commit (or typewriter catch-up)
+    // finalizes the bubble; the caret keeps blinking until the real text lands.
   }
 
-  /** Reconcile a committed `say` with its live preview: replace the streamed text
-   *  with final markdown, collapse thinking, record to history. Returns false if
-   *  there's no matching stream bubble (caller falls back to a normal bubble). */
+  function finalizeStream(s) {
+    animating.delete(s);
+    streamBubbles.delete(s.id);
+    s.replyEl.classList.remove("streaming-cursor");
+    collapseThinking(s, "See thinking");
+    renderRichText(s.replyEl, s.commitText); // streamed plain text → final markdown
+    s.el.classList.remove("streaming");
+    record({ role: "agent", text: s.commitText }); // thinking is ephemeral
+    scrollLog();
+  }
+
+  /** Reconcile a committed `say` with its live preview: let the typewriter finish,
+   *  then render final markdown (done in pumpStreams → finalizeStream). Returns
+   *  false if there's no matching stream bubble (caller paints a normal bubble). */
   function commitStream(id, text) {
     const s = streamBubbles.get(id);
     if (!s) return false;
-    s.replyEl.classList.remove("streaming-cursor");
-    collapseThinking(s, "See thinking");
-    renderRichText(s.replyEl, text);
-    s.el.classList.remove("streaming");
-    streamBubbles.delete(id);
-    record({ role: "agent", text }); // thinking is ephemeral — only the reply persists
-    scrollLog();
+    s.commitText = text;
+    s.replyTarget = text; // authoritative — guarantees the typewriter reaches the end
+    kickStreams(s); // run to completion; finalizeStream renders markdown when caught up
     return true;
   }
 
@@ -3843,11 +3901,34 @@ function buildPanel() {
       // detached/unsupported — value is set, caret position is cosmetic
     }
   }
+  /** "Edit last message": when you start navigating, if the agent hasn't answered
+   *  yet (the last recorded message is still yours), RETRACT it — pull the bubble
+   *  out of the feed, drop any in-flight reply preview, and interrupt the turn —
+   *  so editing and resending REPLACES it instead of leaving a duplicate. If the
+   *  agent already replied, we leave the conversation intact and just browse. */
+  function retractLastUserMessage() {
+    const msgs = thread?.msgs;
+    if (!msgs || !msgs.length || msgs[msgs.length - 1].role !== "user") return;
+    msgs.pop();
+    persistThreads();
+    for (const s of streamBubbles.values()) s.el.remove(); // interrupting → drop previews
+    streamBubbles.clear();
+    animating.clear();
+    const userBubbles = log.querySelectorAll(".cmcp-bubble.user");
+    const last = userBubbles[userBubbles.length - 1];
+    if (last) last.remove();
+    if (thinkingEl) {
+      client?.sendFrame?.({ type: "interrupt" });
+      hideThinking();
+    }
+  }
+
   function recallPrev() {
     if (!sentHistory.length) return false;
     if (histIdx === -1) {
       histDraft = input.value;
       histIdx = sentHistory.length;
+      retractLastUserMessage(); // pull an unanswered message back so resend ≠ duplicate
     }
     histIdx = Math.max(0, histIdx - 1);
     setComposerValue(sentHistory[histIdx]);
