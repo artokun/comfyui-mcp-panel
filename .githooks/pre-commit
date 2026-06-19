@@ -1,0 +1,31 @@
+#!/bin/sh
+# Reject a syntactically-broken panel bundle. The repo is junctioned straight
+# into ComfyUI's custom_nodes and web/js is served LIVE, so a single bad save
+# (a stray ``` fence, an optional-chaining assignment, etc.) doesn't just break
+# this panel — it throws in ComfyUI's extension loader and takes down the WHOLE
+# frontend (no sidebar at all). `node --check` catches every one of those.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+
+# Find node even when it isn't on the (git-bash) PATH.
+NODE="$(command -v node 2>/dev/null || true)"
+[ -z "$NODE" ] && [ -x "/c/Program Files/nodejs/node.exe" ] && NODE="/c/Program Files/nodejs/node.exe"
+[ -z "$NODE" ] && { echo "pre-commit: node not found — skipping JS syntax check."; exit 0; }
+
+fail=0
+for f in web/js/*.js; do
+  [ -f "$f" ] || continue
+  if ! err="$("$NODE" --check "$f" 2>&1)"; then
+    echo "✗ JS syntax error in $f:"
+    echo "$err"
+    fail=1
+  fi
+done
+
+if [ "$fail" != "0" ]; then
+  echo ""
+  echo "pre-commit blocked: fix the syntax error(s) above before committing."
+  echo "(a broken web/js file is served live and crashes the entire ComfyUI frontend)"
+  exit 1
+fi
+exit 0
