@@ -1515,7 +1515,7 @@ const PANEL_CSS = `
 }
 .cmcp-newmsg .pi { font-size: 0.7rem; }
 /* The base rule sets display, which beats the UA [hidden] rule — so re-assert
-   it or `newMsgBtn.hidden = true` won't actually hide the pill. */
+   it or "newMsgBtn.hidden = true" won't actually hide the pill. */
 .cmcp-newmsg[hidden] { display: none; }
 .cmcp-sys {
   align-self: center; font-size: 0.6875rem; font-style: italic;
