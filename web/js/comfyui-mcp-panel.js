@@ -1039,7 +1039,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret, onReload, onAgentStatus, onSession, onModels, onAck, onTurn, getResume }) {
+function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onAgentStatus, onSession, onModels, onAck, onTurn, getResume }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -1135,6 +1135,11 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret
             const scope = msg.scope === "frontend" ? "frontend" : "orchestrator";
             result = `soft reload (${scope}) scheduled`;
             setTimeout(() => onReload(scope), 60);
+          } else if (msg.cmd === "set_todo") {
+            // Render/update the agent's live TODO checklist in the footer tray.
+            const items = Array.isArray(msg.items) ? msg.items : [];
+            onTodo?.(items);
+            result = { ok: true, count: items.length };
           } else {
             const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];
             if (!executor) throw new Error(`Unknown command "${msg.cmd}"`);
@@ -1156,7 +1161,7 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret
         // ask_user / request_secret paint their OWN cards and their replies carry
         // user input (a choice, or a SECRET) — never echo them as an activity card
         // (and never record them). Other commands get the normal activity card.
-        if (msg.cmd !== "ask_user" && msg.cmd !== "request_secret") {
+        if (msg.cmd !== "ask_user" && msg.cmd !== "request_secret" && msg.cmd !== "set_todo") {
           onCommand?.(msg.cmd, msg, reply);
         }
         return;
@@ -1523,6 +1528,21 @@ const PANEL_CSS = `
 /* The base rule sets display, which beats the UA [hidden] rule — so re-assert
    it or "newMsgBtn.hidden = true" won't actually hide the pill. */
 .cmcp-newmsg[hidden] { display: none; }
+.cmcp-tray {
+  flex: none; margin: 0 0.5rem 0.25rem; padding: 0.4rem 0.55rem;
+  background: var(--p-surface-800, #27272a); border: 1px solid var(--p-content-border-color, #3f3f46);
+  border-radius: 8px; max-height: 9rem; overflow-y: auto; font-size: 0.7rem;
+}
+.cmcp-tray[hidden] { display: none; }
+.cmcp-tray-head { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.55; margin-bottom: 0.3rem; }
+.cmcp-todo-item { display: flex; align-items: flex-start; gap: 0.4rem; padding: 0.12rem 0; line-height: 1.3; }
+.cmcp-todo-item .pi { font-size: 0.7rem; margin-top: 0.1rem; flex: none; }
+.cmcp-todo-item.done { opacity: 0.55; }
+.cmcp-todo-item.done span { text-decoration: line-through; }
+.cmcp-todo-item.done .pi { color: var(--p-green-400, #4ade80); }
+.cmcp-todo-item.active { font-weight: 600; }
+.cmcp-todo-item.active .pi { color: var(--p-primary-color, #60a5fa); }
+.cmcp-todo-item.pending .pi { opacity: 0.5; }
 .cmcp-sys {
   align-self: center; font-size: 0.6875rem; font-style: italic;
   color: var(--p-text-muted-color, #a1a1aa);
@@ -1953,6 +1973,46 @@ function buildPanel() {
   });
   body.appendChild(newMsgBtn);
   root.appendChild(body);
+
+  // Footer status tray — docked above the composer. Hosts the agent's live TODO
+  // checklist (download progress rows slot in here later). Hidden until non-empty.
+  let todoItems = [];
+  const tray = document.createElement("div");
+  tray.className = "cmcp-tray";
+  tray.hidden = true;
+  root.appendChild(tray);
+
+  function renderTray() {
+    tray.replaceChildren();
+    const has = todoItems.length > 0;
+    tray.hidden = !has;
+    if (!has) return;
+    const list = document.createElement("div");
+    list.className = "cmcp-todo";
+    const doneN = todoItems.filter((it) => it && it.status === "done").length;
+    const head = document.createElement("div");
+    head.className = "cmcp-tray-head";
+    head.textContent = `Plan · ${doneN}/${todoItems.length}`;
+    list.appendChild(head);
+    for (const it of todoItems) {
+      const status = it && it.status === "active" ? "active" : it && it.status === "done" ? "done" : "pending";
+      const row = document.createElement("div");
+      row.className = "cmcp-todo-item " + status;
+      const icon = document.createElement("i");
+      icon.className =
+        "pi " + (status === "done" ? "pi-check-circle" : status === "active" ? "pi-spin pi-spinner" : "pi-circle");
+      const txt = document.createElement("span");
+      txt.textContent = (it && it.text) || "";
+      row.append(icon, txt);
+      list.appendChild(row);
+    }
+    tray.appendChild(list);
+    scrollLog();
+  }
+  function renderTodo(items) {
+    todoItems = Array.isArray(items) ? items : [];
+    renderTray();
+  }
 
   function clearEmpty() {
     if (empty.parentElement) empty.remove();
@@ -2803,6 +2863,10 @@ function buildPanel() {
       const p = paintQuestion(msg);
       bumpThinking();
       return p;
+    },
+    // The agent called panel_set_todo — render/update the live plan tray.
+    onTodo(items) {
+      renderTodo(items);
     },
     // The agent called panel_request_secret — collect a token securely.
     onSecret(msg) {
