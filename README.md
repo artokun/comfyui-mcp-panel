@@ -73,33 +73,95 @@ claude mcp add comfyui -- npx -y comfyui-mcp --channels
 - **talk in your Claude terminal**: "check panel_status, then add a CheckpointLoaderSimple to my graph" — Claude uses the `panel_*` tools and the edits appear live;
 - **or type in the panel**: messages are pushed straight into your Claude Code session as channel events — Claude replies into the panel with `panel_say`. (Hosts without channel support can pull via `panel_inbox`.)
 
-## What the agent can do to your graph
+## What the agent can do
 
-| MCP tool | Effect |
+The agent drives the workflow you're viewing through a **fixed allowlist** of
+`panel_*` commands (no arbitrary JavaScript). Every graph mutation goes through
+LiteGraph's change tracking, so ComfyUI's native **Ctrl+Z** reverts an agent
+edit exactly like your own.
+
+**Read**
+
+| Tool | Effect |
 |---|---|
-| `panel_status` | Is the panel connected? |
 | `panel_get_graph` | Read the graph you're viewing — subgraphs summarized shallowly |
-| `panel_get_subgraph` | Drill into a subgraph node's inner graph |
+| `panel_get_subgraph` | Read inside a subgraph node's inner graph |
+| `panel_get_errors` | Read the last execution error + per-node validation errors |
+| `panel_list_workflows` | List open workflow tabs and which is active |
+| `panel_list_nodes` | List installed custom-node packs |
+| `panel_list_mcp` | List connected MCP servers |
+| `panel_get_content_mode` | Read the adult-content (NSFW) consent state |
+
+**Edit the graph** (all undoable with Ctrl+Z)
+
+| Tool | Effect |
+|---|---|
 | `panel_add_node` | Add a node by class_type |
 | `panel_remove_node` | Remove a node |
-| `panel_move_node` | Move a node to a new canvas position |
-| `panel_clear` | Remove every node — the whole wipe is one Ctrl+Z |
 | `panel_connect` / `panel_disconnect` | Wire / unwire slots (by name or index) |
 | `panel_set_widget` | Change a widget value (steps, cfg, prompts, …) |
-| `panel_canvas` | Fit, center on a node, pan, zoom your view |
+| `panel_move_node` | Move a node on the canvas |
+| `panel_set_node_title` | Rename a node's header title |
+| `panel_clear` | Remove every node — the whole wipe is one Ctrl+Z |
+
+**Subgraphs**
+
+| Tool | Effect |
+|---|---|
+| `panel_select_nodes` | Select nodes on the canvas (multi-selection) |
+| `panel_create_subgraph` | Group selected nodes into a subgraph ("Convert to Subgraph") |
+| `panel_enter_subgraph` | Drill into a subgraph to read/edit its inner nodes |
+| `panel_exit_subgraph` | Return to the parent / root graph |
+
+**Workflow tabs**
+
+| Tool | Effect |
+|---|---|
+| `panel_new_workflow` | Open a fresh blank workflow in a NEW tab (never wipes the current one) |
+| `panel_open_workflow` | Switch to a workflow by path / filename |
+| `panel_rename_workflow` | Rename a workflow |
+| `panel_close_workflow` | Close a tab (refuses unsaved changes unless forced) |
+| `panel_save_workflow` | Save / save-as programmatically (no dialog pops) |
+
+**Run & view**
+
+| Tool | Effect |
+|---|---|
 | `panel_run` | Queue the open workflow (same as pressing Queue Prompt) |
-| `panel_get_errors` | Read the last execution error + node validation errors |
-| `panel_save_workflow` | Save (Ctrl+S) or save-as/duplicate the open workflow |
-| `panel_say` | Post a message into this panel's chat feed |
-| `panel_inbox` | Drain messages you typed into the panel |
+| `panel_canvas` | Fit, center on a node, pan, or zoom your view |
+
+**Custom nodes — via your built-in ComfyUI Manager**
+
+| Tool | Effect |
+|---|---|
+| `panel_search_nodes` | Search installable node packs (the Manager's own source) |
+| `panel_install_node` | Queue a pack install (registry id or git URL) |
+| `panel_node_queue_status` | Check the Manager's install / update queue |
+| `panel_restart_comfyui` | Restart ComfyUI to load new nodes — panel auto-reconnects and the agent resumes |
+
+**MCP & session**
+
+| Tool | Effect |
+|---|---|
+| `panel_add_mcp` / `panel_remove_mcp` | Connect / remove an MCP server in your Claude config |
+| `panel_request_secret` | Securely collect an API token — the agent never sees the value |
+| `panel_reload` | Soft-reload the orchestrator (new code/tools) or the panel UI, then resume |
+
+**Working with you**
+
+| Tool | Effect |
+|---|---|
+| `panel_ask` | Ask you to choose between options (renders a question card, waits for your pick) |
+| `panel_set_todo` | Show a live TODO checklist in the footer tray |
+| `panel_request_adult_consent` / `panel_disable_adult_mode` | Toggle the 18+ NSFW consent gate |
 
 …plus the full comfyui-mcp tool surface (88 tools: queue, models, custom
 nodes, workflows) — the agent is the MCP client, so it has everything.
 
-The graph-mutation surface is a **fixed allowlist** — the agent cannot run
-arbitrary JavaScript in your browser. Every mutation goes through LiteGraph's
-standard change tracking, so ComfyUI's native undo reverts agent edits exactly
-like your own.
+> **Interactive (`--channels`) path:** when *your own* Claude Code session drives
+> the graph (see *Advanced* above), it uses the graph subset of these tools plus
+> `panel_status` (is the panel connected?), `panel_say` (post into the chat feed),
+> and `panel_inbox` (drain what you typed into the panel).
 
 ## Security notes
 
