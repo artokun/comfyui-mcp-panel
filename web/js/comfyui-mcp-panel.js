@@ -3231,6 +3231,14 @@ function buildPanel() {
       applyModelCatalog(list);
     },
     onAck(ack) {
+      // Effort change while the agent was mid-turn: it can't change a running
+      // turn's effort, so it applies once the current turn finishes (no more
+      // killing the in-flight reply). Let the user know so the picker selection
+      // not taking effect *this* turn isn't a mystery.
+      if (ack?.kind === "options" && ack.deferred) {
+        appendSystem(`Effort → ${ack.effort ?? "default"} — applies after the current turn finishes.`);
+        return;
+      }
       // Post-restart auto-resume (#3): the "ready" ack is sent after the
       // orchestrator armed hello.resume, so resuming the agent is safe now.
       // Clear REBOOT_KEY only here (on actual send) so a drop mid-reconnect
