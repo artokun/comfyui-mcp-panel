@@ -1559,7 +1559,16 @@ const PANEL_CSS = `
 .cmcp-bubble.agent {
   align-self: stretch; max-width: 100%;
   padding: 0; background: none; border: none; border-radius: 0;
+  /* Rendered markdown is real block elements — collapse the source newlines
+     marked emits between tags (the base .cmcp-bubble pre-wrap would otherwise
+     render every one as a blank line, ballooning the vertical spacing). Block
+     margins below handle the rhythm. */
+  white-space: normal;
 }
+/* While a reply is still STREAMING it's plain text (not yet markdown), so it
+   needs pre-wrap to honor its newlines; the commit drops the .streaming class
+   and it reverts to normal markdown flow. */
+.cmcp-bubble.agent.streaming .cmcp-reply { white-space: pre-wrap; }
 .cmcp-bubble.agent code, .cmcp-bubble.user code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem;
   background: var(--p-form-field-background, #09090b);
