@@ -1120,7 +1120,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onAck, onTurn, onActivity, getResume }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onAck, onTurn, getResume }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -1189,9 +1189,6 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       } catch {
         return;
       }
-      // Feed the health watchdog (it decides what counts as the agent actually
-      // responding vs. a bare receipt ack).
-      if (msg) onActivity?.(msg);
       if (msg && typeof msg.rid === "string" && typeof msg.cmd === "string") {
         // Agent command — execute against the graph, reply with the rid.
         // Executors may be async (run, save) — await uniformly.
@@ -2066,11 +2063,9 @@ function buildPanel() {
   actions.style.cssText = "margin-left:auto;display:flex;gap:0.125rem;align-items:center;";
   const newChatBtn = iconBtn("pi-plus", "New chat");
   const historyBtn = iconBtn("pi-history", "Chat history");
-  const reloadBtn = iconBtn("pi-sync", "Soft reload the agent — picks up new code, keeps ComfyUI and this conversation");
-  reloadBtn.addEventListener("click", () => softReload("user", "orchestrator"));
-  const restartBtn = iconBtn("pi-refresh", "Restart the agent backend — recover an unresponsive agent (kills + respawns the orchestrator, keeps this chat)");
-  restartBtn.addEventListener("click", () => hardRestart("user"));
-  actions.append(reloadBtn, restartBtn, newChatBtn, historyBtn);
+  // Reload / restart live as slash commands (/reload, /reload-ui, /restart) — no
+  // header buttons for them.
+  actions.append(newChatBtn, historyBtn);
 
   header.style.position = "relative";
   const histPop = document.createElement("div");
@@ -3456,75 +3451,6 @@ function buildPanel() {
   // skills), pushed by the orchestrator — surfaced in the completion menu below.
   let sdkCommands = [];
 
-  // ---- agent-health watchdog -------------------------------------------------
-  // Detect a wedged/unresponsive agent backend (e.g. the Agent-SDK shell dying
-  // after a re-auth) and offer one-click recovery, so a user is never stuck
-  // reaching for Task Manager.
-  //
-  // We only watch the window between "user sent a message" (startAwaiting) and
-  // "the agent produced its FIRST real output" — a stream delta, a reply, a tool
-  // call, or a question (stopAwaiting, called from those callbacks). That first
-  // output proves the backend is alive, so we stop watching and idle time can't
-  // trigger a false alarm. A bare "message received" ack does NOT count (that's
-  // exactly the wedge case: orchestrator alive, agent dead). If no real output
-  // arrives within the threshold, the recovery banner appears.
-  const HEALTH_THRESHOLD_MS = 75000; // silence-while-awaiting before we flag it
-  const HEALTH_TICK_MS = 10000;
-  let lastAgentActivityAt = Date.now();
-  let awaitingReply = false;
-
-  const unresponsiveBanner = document.createElement("div");
-  unresponsiveBanner.hidden = true;
-  unresponsiveBanner.style.cssText =
-    "display:flex;align-items:center;gap:0.5rem;margin:0.4rem 0.5rem;padding:0.45rem 0.6rem;" +
-    "border-radius:8px;border:1px solid var(--p-yellow-400,#facc15);" +
-    "background:color-mix(in srgb, var(--p-yellow-400,#facc15) 12%, transparent);font-size:0.75rem;";
-  const bannerText = document.createElement("span");
-  bannerText.style.cssText = "flex:1;min-width:0;";
-  bannerText.textContent = "The agent backend isn't responding.";
-  const bannerRestart = document.createElement("button");
-  bannerRestart.type = "button";
-  bannerRestart.className = "cmcp-btn";
-  bannerRestart.textContent = "Restart agent";
-  bannerRestart.style.cssText = "padding:0.2rem 0.55rem;font-size:0.72rem;white-space:nowrap;";
-  bannerRestart.addEventListener("click", () => hardRestart("watchdog"));
-  const bannerDismiss = iconBtn("pi-times", "Dismiss");
-  // Dismiss must STICK: also stop awaiting so the 10s timer can't re-show it.
-  // (The next message you send re-arms the watchdog via startAwaiting.)
-  bannerDismiss.addEventListener("click", () => {
-    stopAwaiting();
-    hideUnresponsive();
-  });
-  unresponsiveBanner.append(bannerText, bannerRestart, bannerDismiss);
-  header.insertAdjacentElement("afterend", unresponsiveBanner);
-
-  function showUnresponsive() {
-    unresponsiveBanner.hidden = false;
-  }
-  function hideUnresponsive() {
-    unresponsiveBanner.hidden = true;
-  }
-  function noteAgentActivity() {
-    lastAgentActivityAt = Date.now();
-    if (!unresponsiveBanner.hidden) hideUnresponsive();
-  }
-  function startAwaiting() {
-    awaitingReply = true;
-    lastAgentActivityAt = Date.now();
-  }
-  function stopAwaiting() {
-    awaitingReply = false;
-  }
-  const healthTimer = setInterval(() => {
-    if (
-      awaitingReply &&
-      client.isConnected() &&
-      Date.now() - lastAgentActivityAt > HEALTH_THRESHOLD_MS
-    ) {
-      showUnresponsive();
-    }
-  }, HEALTH_TICK_MS);
-
   // ---- bridge wiring ----
   const client = createBridgeClient({
     onStatus(state) {
@@ -3536,11 +3462,7 @@ function buildPanel() {
       disconnectBtn.hidden = !connected;
       connectBtn.disabled = state === "connecting";
       connectBtn.textContent = state === "connecting" ? "Connecting…" : "Connect";
-      if (!connected) {
-        hideThinking();
-        stopAwaiting(); // not connected → nothing to wait on; clear the watchdog
-        hideUnresponsive();
-      }
+      if (!connected) hideThinking();
       // NB: do NOT push set_options here. The saved model id is only known-valid
       // once the live catalog arrives, so the push happens in applyModelCatalog
       // — sending an unvalidated fallback id can wedge the agent on a model the
@@ -3597,19 +3519,6 @@ function buildPanel() {
       } else if (state === "done") {
         hideThinking();
         ssSet(MID_TASK_KEY, null); // turn finished cleanly — nothing to resume
-        stopAwaiting(); // reply landed — stand the watchdog down
-      }
-    },
-    onActivity(msg) {
-      noteAgentActivity(); // any frame: reset the clock + hide the banner
-      // A SUBSTANTIVE response proves the agent is alive AND answering, so stop
-      // watching this send — idle time afterward must not raise a false alarm. A
-      // bare receipt ack ({type:"ack"}) is NOT substantive: that's exactly the
-      // wedge case (orchestrator alive, agent dead), so it must keep us watching.
-      const t = msg && msg.type;
-      const isToolCall = msg && typeof msg.rid === "string" && typeof msg.cmd === "string";
-      if (isToolCall || t === "say" || t === "stream" || t === "turn" || t === "thinking") {
-        stopAwaiting();
       }
     },
     onLog(text) {
@@ -3850,7 +3759,6 @@ function buildPanel() {
       return;
     }
     reloading = true;
-    reloadBtn.classList.add("cmcp-spin");
     ssSet(SOFT_RELOAD_KEY, origin === "agent" ? "agent" : "user");
     appendSystem("Soft-reloading the agent (new code, no ComfyUI restart)…");
     try {
@@ -3868,7 +3776,6 @@ function buildPanel() {
       return;
     } finally {
       reloading = false;
-      reloadBtn.classList.remove("cmcp-spin");
     }
     // Reconnect with backoff until the fresh orchestrator binds; onAck resumes.
     client.start();
@@ -3887,14 +3794,7 @@ function buildPanel() {
   async function hardRestart(origin = "user") {
     if (reloading) return;
     reloading = true;
-    restartBtn.classList.add("cmcp-spin");
-    hideUnresponsive();
-    stopAwaiting();
-    appendSystem(
-      origin === "watchdog"
-        ? "Restarting the agent backend (it stopped responding)…"
-        : "Restarting the agent backend…",
-    );
+    appendSystem("Restarting the agent backend…");
     let ok = false;
     try {
       client.stop(); // drop the bridge so the old orchestrator can release the port
@@ -3912,7 +3812,6 @@ function buildPanel() {
       appendSystem(`Couldn't reach ComfyUI to restart the agent: ${err?.message ?? err}`);
     } finally {
       reloading = false;
-      restartBtn.classList.remove("cmcp-spin");
     }
     if (ok) {
       // Start FRESH on reconnect: clear the saved session id so hello sends no
@@ -4503,7 +4402,6 @@ function buildPanel() {
     const painted = appendUser(text, { mid });
     setMsgStatus(mid, "queued"); // muted + ✎/✕ until the agent actually reads it
     showThinking();
-    startAwaiting(); // arm the health watchdog — a reply (or activity) is expected
     input.value = "";
     input.style.height = "auto";
 
@@ -4700,7 +4598,6 @@ function buildPanel() {
         // recognition already stopped
       }
       document.removeEventListener("mousedown", onDocPointerDown);
-      clearInterval(healthTimer);
       try {
         api.removeEventListener("executed", onExecuted);
         api.removeEventListener("execution_error", onExecError);
