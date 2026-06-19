@@ -3709,6 +3709,11 @@ function buildPanel() {
     connecting = true;
     connectBtn.disabled = true;
     connectBtn.textContent = "Starting…";
+    // Honor whatever is typed in the Bridge URL field — Connect previously
+    // ignored it (only Reconnect applied it), so editing the port (e.g. 9181)
+    // then clicking Connect still hit the old URL. setUrl persists + reconnects.
+    const wanted = urlInput.value.trim();
+    if (wanted && wanted !== client.currentUrl()) client.setUrl(wanted);
     try {
       const res = await api.fetchApi("/comfyui_mcp_panel/connect", { method: "POST" });
       const data = await res.json().catch(() => ({}));
