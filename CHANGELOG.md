@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Attach more than images.** The composer's attach button, drag-drop, and paste
+  now accept **video**, **workflows (`.json`)**, and **text files** alongside
+  images. Images and video upload into ComfyUI's `input/` folder (video is
+  delivered as an `input/` path the agent can wire into a Load Video node, since
+  it can't be viewed inline); workflow `.json` and text files are read and inlined
+  to the agent (a recognized ComfyUI graph is flagged so it can load/analyze/merge
+  it). Each file drops a typed chip — `[Image #N]` / `[Video #N]` / `[Workflow #N]`
+  / `[File #N]` — and the picker accepts multiple files at once.
+
 ## [0.1.3] - 2026-06-19
 
 ### Added

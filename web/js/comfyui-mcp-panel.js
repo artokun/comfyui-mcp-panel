@@ -513,6 +513,11 @@ function summarizeNode(node) {
     id: node.id,
     type: node.type,
     title: node.title,
+    pos: node.pos ? [Math.round(node.pos[0]), Math.round(node.pos[1])] : null,
+    size: node.size ? [Math.round(node.size[0]), Math.round(node.size[1])] : null,
+    ...(node.flags && node.flags.collapsed ? { collapsed: true } : {}),
+    ...(node.color ? { color: node.color } : {}),
+    ...(node.bgcolor ? { bgcolor: node.bgcolor } : {}),
     widgets,
     inputs,
     outputs,
@@ -596,6 +601,20 @@ function summarizeGroup(graph, g) {
   };
 }
 
+/** Describe a subgraph's input/output "rail" nodes (the boundary I/O proxies)
+ *  so layouts can sit nodes next to them instead of floating away. The exact
+ *  property name varies across ComfyUI versions, so probe the likely ones. */
+function describeRails(sub) {
+  const xy = (n) => (n?.pos ? [Math.round(n.pos[0]), Math.round(n.pos[1])] : null);
+  const wh = (n) => (n?.size ? [Math.round(n.size[0]), Math.round(n.size[1])] : null);
+  const inNode = sub.inputNode ?? sub._inputNode ?? null;
+  const outNode = sub.outputNode ?? sub._outputNode ?? null;
+  return {
+    input: inNode ? { pos: xy(inNode), size: wh(inNode) } : null,
+    output: outNode ? { pos: xy(outNode), size: wh(outNode) } : null,
+  };
+}
+
 /** Resolve a slot reference (name string or numeric index) to an index in
  *  the given slot array. Names are matched case-insensitively. */
 function resolveSlot(slots, ref, kind) {
@@ -630,15 +649,17 @@ let activePanelRoot = null;
 
 const GRAPH_TOOL_EXECUTORS = {
   graph_get_state() {
-    const { graph } = getGraphCtx();
+    const { graph, rootGraph } = getGraphCtx();
     const nodes = (graph._nodes ?? []).slice(0, MAX_STATE_NODES).map(summarizeNode);
     const groups = (graph._groups ?? []).map((g) => summarizeGroup(graph, g));
+    const inSubgraph = graph !== rootGraph;
     return {
       viewing: describeActiveGraph(graph),
       node_count: graph._nodes?.length ?? 0,
       truncated: (graph._nodes?.length ?? 0) > MAX_STATE_NODES,
       nodes,
       ...(groups.length ? { groups } : {}),
+      ...(inSubgraph ? { rails: describeRails(graph) } : {}),
     };
   },
 
@@ -1172,6 +1193,151 @@ const GRAPH_TOOL_EXECUTORS = {
     return { node_id: node.id, previous, title: node.title };
   },
 
+  // Collapse (minimize) or expand a node. `collapsed` defaults to true.
+  graph_set_node_collapsed({ node_id, collapsed }) {
+    const { graph } = getGraphCtx();
+    const node = resolveNode(graph, node_id);
+    const want = collapsed !== false;
+    graph.beforeChange?.();
+    try {
+      const isCollapsed = !!(node.flags && node.flags.collapsed);
+      if (isCollapsed !== want) {
+        if (typeof node.collapse === "function") node.collapse();
+        else {
+          node.flags = node.flags || {};
+          node.flags.collapsed = want;
+        }
+      }
+    } finally {
+      graph.afterChange?.();
+    }
+    graph.setDirtyCanvas?.(true, true);
+    return { node_id: node.id, collapsed: !!(node.flags && node.flags.collapsed) };
+  },
+
+  // Set a node's title-bar color and/or body color. Pass a `preset` name from
+  // LiteGraph's palette (red, brown, green, blue, pale_blue, cyan, purple,
+  // yellow, black) for matched title+body colors, or explicit `color` (title)
+  // and/or `bgcolor` (body) hex strings. Pass null for a field to clear it.
+  graph_set_node_color({ node_id, color, bgcolor, preset }) {
+    const { graph, LG } = getGraphCtx();
+    const node = resolveNode(graph, node_id);
+    graph.beforeChange?.();
+    try {
+      if (preset != null) {
+        const LGC = LG?.LGraphCanvas ?? window.LGraphCanvas ?? globalThis.LGraphCanvas;
+        const presets = LGC?.node_colors;
+        const p = presets && presets[preset];
+        if (!p) {
+          throw new Error(
+            `unknown color preset "${preset}" (available: ${presets ? Object.keys(presets).join(", ") : "none"})`,
+          );
+        }
+        node.color = p.color;
+        node.bgcolor = p.bgcolor;
+      } else {
+        if (color === null) delete node.color;
+        else if (color != null) node.color = String(color);
+        if (bgcolor === null) delete node.bgcolor;
+        else if (bgcolor != null) node.bgcolor = String(bgcolor);
+      }
+    } finally {
+      graph.afterChange?.();
+    }
+    graph.setDirtyCanvas?.(true, true);
+    return { node_id: node.id, color: node.color ?? null, bgcolor: node.bgcolor ?? null };
+  },
+
+  // Render the CURRENT graph view (root graph or the open subgraph) to a PNG and
+  // return it as base64 so the agent can SEE the layout. Temporarily fits the
+  // whole graph (nodes + groups) into the canvas, draws synchronously, captures,
+  // then restores the user's view. Output is capped to ~1600px wide.
+  graph_screenshot({ padding } = {}) {
+    const { graph, canvas } = getGraphCtx();
+    const cv = canvas?.canvas;
+    const ds = canvas?.ds;
+    if (!cv || typeof cv.toDataURL !== "function" || !ds) {
+      throw new Error("canvas not available for screenshot");
+    }
+    const nodes = graph._nodes ?? [];
+    const groups = graph._groups ?? [];
+    if (!nodes.length && !groups.length) throw new Error("nothing to screenshot (empty graph)");
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const n of nodes) {
+      const br = n.boundingRect;
+      let x;
+      let y;
+      let w0;
+      let h0;
+      if (Array.isArray(br) && br.length === 4 && (br[2] || br[3])) {
+        [x, y, w0, h0] = br;
+      } else {
+        x = n.pos?.[0] ?? 0;
+        y = (n.pos?.[1] ?? 0) - 30; // title bar renders above pos
+        w0 = n.size?.[0] ?? 200;
+        h0 = (n.size?.[1] ?? 100) + 30;
+      }
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x + w0);
+      maxY = Math.max(maxY, y + h0);
+    }
+    for (const g of groups) {
+      const b = g._bounding;
+      if (b && b.length >= 4) {
+        minX = Math.min(minX, b[0]);
+        minY = Math.min(minY, b[1]);
+        maxX = Math.max(maxX, b[0] + b[2]);
+        maxY = Math.max(maxY, b[1] + b[3]);
+      }
+    }
+    const bounds = [minX, minY, maxX - minX, maxY - minY];
+    const pad = Number.isFinite(padding) ? Number(padding) : 60;
+    const saved = { scale: ds.scale, ox: ds.offset[0], oy: ds.offset[1] };
+    let dataUrl;
+    let outW = cv.width;
+    let outH = cv.height;
+    try {
+      const w = bounds[2] + pad * 2;
+      const h = bounds[3] + pad * 2;
+      const next = Math.min(cv.width / w, cv.height / h, 1.5);
+      ds.scale = next;
+      ds.offset[0] = -bounds[0] + pad + (cv.width / next - w) / 2;
+      ds.offset[1] = -bounds[1] + pad + (cv.height / next - h) / 2;
+      canvas.draw(true, true); // synchronous redraw at the fitted transform
+      const MAXW = 1600;
+      if (cv.width > MAXW) {
+        const s = MAXW / cv.width;
+        const off = document.createElement("canvas");
+        off.width = Math.round(cv.width * s);
+        off.height = Math.round(cv.height * s);
+        off.getContext("2d").drawImage(cv, 0, 0, off.width, off.height);
+        dataUrl = off.toDataURL("image/png");
+        outW = off.width;
+        outH = off.height;
+      } else {
+        dataUrl = cv.toDataURL("image/png");
+      }
+    } finally {
+      ds.scale = saved.scale;
+      ds.offset[0] = saved.ox;
+      ds.offset[1] = saved.oy;
+      canvas.setDirty?.(true, true);
+      canvas.draw?.(true, true);
+    }
+    const comma = dataUrl.indexOf(",");
+    return {
+      image: comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl,
+      mimeType: "image/png",
+      width: outW,
+      height: outH,
+      viewing: describeActiveGraph(graph),
+    };
+  },
+
   // Navigate INTO a subgraph node so the canvas (and therefore every graph_*
   // editor) targets its inner graph — the way to read/edit nodes inside a
   // subgraph. Pair with graph_exit_subgraph to return to the root.
@@ -1198,6 +1364,32 @@ const GRAPH_TOOL_EXECUTORS = {
     canvas.setGraph(graph.rootGraph ?? rootGraph);
     canvas.setDirty?.(true, true);
     return { viewing: describeActiveGraph(getGraphCtx().graph) };
+  },
+
+  // Reposition a subgraph's input/output RAIL (the boundary I/O node). Must run
+  // INSIDE the subgraph (graph_enter_subgraph first). Lets a layout place the
+  // input rail just left of the first column and the output rail just right of
+  // the last one, so boundary wires stay short — read current rail positions
+  // from graph_get_state's `rails` field.
+  graph_move_rail({ rail, pos }) {
+    const { graph, rootGraph } = getGraphCtx();
+    if (graph === rootGraph) {
+      throw new Error("graph_move_rail must run INSIDE a subgraph — call graph_enter_subgraph first");
+    }
+    const node =
+      rail === "input" ? (graph.inputNode ?? graph._inputNode) :
+      rail === "output" ? (graph.outputNode ?? graph._outputNode) :
+      null;
+    if (!node) throw new Error(`subgraph has no "${rail}" rail — use rail "input" or "output"`);
+    if (!Array.isArray(pos) || pos.length !== 2) throw new Error("pos must be [x, y]");
+    graph.beforeChange?.();
+    try {
+      node.pos = [Number(pos[0]), Number(pos[1])];
+    } finally {
+      graph.afterChange?.();
+    }
+    graph.setDirtyCanvas?.(true, true);
+    return { rail, pos: [Math.round(node.pos[0]), Math.round(node.pos[1])] };
   },
 
   // Promote (or demote) an INNER subgraph widget so it appears on the PARENT
@@ -2209,6 +2401,17 @@ function describeCommand(cmd, msg, reply) {
       return { icon: "pi-pencil", text: `Edited group ${r.group?.id} (“${r.group?.title}”)` };
     case "graph_remove_group":
       return { icon: "pi-minus-circle", text: `Removed group “${r.removed?.title}”` };
+    case "graph_move_rail":
+      return { icon: "pi-arrows-h", text: `Moved ${r.rail} rail to [${r.pos?.map(Math.round)}]` };
+    case "graph_set_node_collapsed":
+      return {
+        icon: r.collapsed ? "pi-chevron-right" : "pi-chevron-down",
+        text: `${r.collapsed ? "Collapsed" : "Expanded"} node ${r.node_id}`,
+      };
+    case "graph_set_node_color":
+      return { icon: "pi-palette", text: `Recolored node ${r.node_id}` };
+    case "graph_screenshot":
+      return { icon: "pi-camera", text: `Captured workflow image (${r.width}×${r.height})` };
     case "graph_canvas":
       return { icon: "pi-window-maximize", text: `Canvas: ${r.canvas?.action?.replace(/_/g, " ")}` };
     case "graph_run":
@@ -2227,7 +2430,7 @@ function describeCommand(cmd, msg, reply) {
     case "workflow_save":
       return { icon: "pi-save", text: `Saved “${r.workflow}”` };
     case "workflow_save_as":
-      return { icon: "pi-save", text: `Saved as ${r.saved_as}` };
+      return { icon: "pi-save", text: `Saved as “${r.workflow}”` };
     default:
       return { icon: "pi-bolt", text: cmd, detail: JSON.stringify(r).slice(0, 300) };
   }
