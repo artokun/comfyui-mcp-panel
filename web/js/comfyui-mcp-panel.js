@@ -3817,12 +3817,61 @@ function buildPanel() {
     recognition.start();
   });
 
+  // ---- composer history (press ↑ to recall your last message for editing) ----
+  // Shell-style: ↑ from an empty composer (or with the caret at the very start)
+  // walks back through messages you've sent and drops them back in the composer;
+  // ↓ walks forward and finally restores the draft you were typing. Any keystroke
+  // that edits the text exits history mode. Born from the muscle-memory urge to
+  // press ↑ and fix a typo in the message you just fired off.
+  const sentHistory = [];
+  let histIdx = -1; // -1 = not navigating; otherwise an index into sentHistory
+  let histDraft = ""; // the unsent draft stashed when navigation began
+
+  function recordSent(text) {
+    if (sentHistory[sentHistory.length - 1] !== text) sentHistory.push(text);
+    if (sentHistory.length > 50) sentHistory.shift();
+    histIdx = -1;
+  }
+  function setComposerValue(val) {
+    input.value = val;
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 120)}px`;
+    const n = val.length;
+    try {
+      input.setSelectionRange(n, n);
+    } catch {
+      // detached/unsupported — value is set, caret position is cosmetic
+    }
+  }
+  function recallPrev() {
+    if (!sentHistory.length) return false;
+    if (histIdx === -1) {
+      histDraft = input.value;
+      histIdx = sentHistory.length;
+    }
+    histIdx = Math.max(0, histIdx - 1);
+    setComposerValue(sentHistory[histIdx]);
+    return true;
+  }
+  function recallNext() {
+    if (histIdx === -1) return false;
+    histIdx += 1;
+    if (histIdx >= sentHistory.length) {
+      histIdx = -1;
+      setComposerValue(histDraft); // back to the draft you were typing
+    } else {
+      setComposerValue(sentHistory[histIdx]);
+    }
+    return true;
+  }
+
   // ---- submit ----
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     hideMenu();
     const text = input.value.trim();
     if (!text) return;
+    recordSent(text); // remember it so ↑ can recall it later
     if (text.startsWith("/")) {
       const c = SLASH_COMMANDS.find((sc) => sc.cmd === text.split(/\s+/)[0]);
       if (c) {
@@ -3910,6 +3959,27 @@ function buildPanel() {
         return;
       }
     }
+    // ↑ recalls your previous sent message (when already navigating, or from the
+    // very start of the composer so it never hijacks normal line-up movement);
+    // ↓ walks forward / restores your draft. Esc bails out to the draft.
+    if (ev.key === "ArrowUp" && (histIdx !== -1 || (input.selectionStart === 0 && input.selectionEnd === 0))) {
+      if (recallPrev()) {
+        ev.preventDefault();
+        return;
+      }
+    }
+    if (ev.key === "ArrowDown" && histIdx !== -1) {
+      if (recallNext()) {
+        ev.preventDefault();
+        return;
+      }
+    }
+    if (ev.key === "Escape" && histIdx !== -1) {
+      ev.preventDefault();
+      histIdx = -1;
+      setComposerValue(histDraft);
+      return;
+    }
     if (ev.key === "Enter" && !ev.shiftKey) {
       ev.preventDefault();
       form.requestSubmit();
@@ -3934,6 +4004,7 @@ function buildPanel() {
   input.addEventListener("blur", () => setTimeout(hideMenu, 150));
   // Auto-grow the textarea up to its CSS max-height.
   input.addEventListener("input", () => {
+    histIdx = -1; // a real edit exits message-history navigation
     input.style.height = "auto";
     input.style.height = `${Math.min(input.scrollHeight, 120)}px`;
     refreshMenu();
