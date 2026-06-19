@@ -11,9 +11,8 @@ Part of the **[comfyui-mcp](https://github.com/artokun/comfyui-mcp)** project �
 plugin + MCP server for ComfyUI (88 tools, 15 AI skills). Full documentation at
 **[comfyui-mcp.artokun.io/docs](https://comfyui-mcp.artokun.io/docs)**.
 
-Type "add a KSampler and wire it to my checkpoint" in the panel (or in your
-Claude terminal) and watch nodes appear on the canvas. Every edit is undoable
-with **Ctrl+Z**.
+Type "add a KSampler and wire it to my checkpoint" in the panel and watch nodes
+appear on the canvas. Every edit is undoable with **Ctrl+Z**.
 
 **No API keys. No extra LLM costs.** The agent runs on your Claude
 subscription — a background [comfyui-mcp](https://github.com/artokun/comfyui-mcp)
@@ -23,11 +22,6 @@ is just its window into your graph.
 ```
 this panel ⇄ ws://127.0.0.1:9180 ⇄ comfyui-mcp orchestrator (background, your Claude subscription) ⇄ your graph
 ```
-
-> Your normal `comfyui-mcp` MCP server (in Claude Code / Cursor / etc.) should
-> **not** use `--channels` — the orchestrator owns the bridge port. A stray
-> `--channels` session steals port 9101 and the panel will connect to it with no
-> agent ("connected" but unresponsive). See *Advanced* below.
 
 ## Install
 
@@ -60,18 +54,6 @@ your click.
 The bridge is loopback-only (`ws://127.0.0.1:9180`, set via
 `COMFYUI_MCP_BRIDGE_PORT`). To run the orchestrator yourself, set
 `COMFYUI_MCP_NO_AUTOSPAWN=1` and launch it manually, then click Connect.
-
-### Advanced: drive the graph from your own Claude Code session
-
-Prefer to use *your own* interactive session as the agent? Run the bridge in
-channels mode instead, then click Connect:
-
-```bash
-claude mcp add comfyui -- npx -y comfyui-mcp --channels
-```
-
-- **talk in your Claude terminal**: "check panel_status, then add a CheckpointLoaderSimple to my graph" — Claude uses the `panel_*` tools and the edits appear live;
-- **or type in the panel**: messages are pushed straight into your Claude Code session as channel events — Claude replies into the panel with `panel_say`. (Hosts without channel support can pull via `panel_inbox`.)
 
 ## What the agent can do
 
@@ -157,11 +139,6 @@ edit exactly like your own.
 
 …plus the full comfyui-mcp tool surface (88 tools: queue, models, custom
 nodes, workflows) — the agent is the MCP client, so it has everything.
-
-> **Interactive (`--channels`) path:** when *your own* Claude Code session drives
-> the graph (see *Advanced* above), it uses the graph subset of these tools plus
-> `panel_status` (is the panel connected?), `panel_say` (post into the chat feed),
-> and `panel_inbox` (drain what you typed into the panel).
 
 ## Security notes
 
