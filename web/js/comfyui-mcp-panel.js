@@ -1365,7 +1365,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       closed = false;
       connect();
     },
-    sendUserMessage(text, context, images) {
+    sendUserMessage(text, context, images, mid) {
       if (!sock || sock.readyState !== WebSocket.OPEN) return false;
       try {
         sock.send(
@@ -1374,6 +1374,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
             text,
             ...(context ? { context } : {}),
             ...(images?.length ? { images } : {}),
+            // Client message id — the orchestrator echoes it in the "working"
+            // ack so the panel can mark this exact bubble delivered ("Seen").
+            ...(mid ? { mid } : {}),
           }),
         );
         return true;
@@ -1569,6 +1572,24 @@ const PANEL_CSS = `
    needs pre-wrap to honor its newlines; the commit drops the .streaming class
    and it reverts to normal markdown flow. */
 .cmcp-bubble.agent.streaming .cmcp-reply { white-space: pre-wrap; }
+/* Per-message delivery status under a sent user bubble (sending → seen → failed). */
+.cmcp-msg-status {
+  align-self: flex-end; max-width: 92%;
+  margin: 0.0625rem 0.125rem 0.125rem;
+  font-size: 0.6875rem; color: var(--p-text-muted-color, #71717a);
+  display: flex; gap: 0.5rem; align-items: center;
+}
+.cmcp-msg-status.failed { color: var(--p-red-400, #f87171); font-weight: 500; }
+.cmcp-msg-action {
+  background: none; border: none; padding: 0.0625rem; cursor: pointer;
+  display: inline-flex; align-items: center; line-height: 1;
+  color: var(--p-text-muted-color, #71717a);
+  border-radius: var(--p-border-radius-sm, 4px);
+  transition: color 0.12s, background 0.12s;
+}
+.cmcp-msg-action .pi { font-size: 0.75rem; }
+.cmcp-msg-action:hover { color: var(--p-text-color, #fff); background: var(--p-surface-700, #3f3f46); }
+.cmcp-msg-status.failed .cmcp-msg-action:hover { color: var(--p-red-300, #fca5a5); }
 .cmcp-bubble.agent code, .cmcp-bubble.user code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem;
   background: var(--p-form-field-background, #09090b);
@@ -2581,13 +2602,24 @@ function buildPanel() {
     });
   }
 
-  function paintUser(text) {
+  function paintUser(text, opts = {}) {
     clearEmpty();
     const b = document.createElement("div");
     b.className = "cmcp-bubble user";
     b.textContent = text;
+    if (opts.mid) b.dataset.mid = opts.mid;
     log.appendChild(b);
+    // Live sends get a delivery-status line below the bubble (sending → seen, or
+    // failed with resend/delete). Replayed history has no mid → no status.
+    let statusEl = null;
+    if (opts.mid) {
+      statusEl = document.createElement("div");
+      statusEl.className = "cmcp-msg-status";
+      statusEl.dataset.mid = opts.mid;
+      log.appendChild(statusEl);
+    }
     scrollLog();
+    return { bubble: b, statusEl };
   }
 
   function paintAgent(text) {
@@ -2862,11 +2894,124 @@ function buildPanel() {
     return promise;
   }
 
-  function appendUser(text) {
+  function appendUser(text, opts = {}) {
     stickToBottom = true; // your own message → always jump to the latest
     newMsgBtn.hidden = true;
-    paintUser(text);
+    const painted = paintUser(text, opts);
     record({ role: "user", text });
+    return painted;
+  }
+
+  // ---- delivery status ("Seen") ----
+  // Every live send carries a client message id (mid). The orchestrator echoes it
+  // in the "working" ack the moment it RECEIVES the message, so we can flip the
+  // bubble from "Sending…" to "✓ Seen". If no ack lands in time (or the socket
+  // was down at send), the bubble shows "Not delivered" with Resend/Delete — so a
+  // dropped message (e.g. an image lost on a WS blip) never silently vanishes.
+  let midCounter = 0;
+  const pendingMsgs = new Map(); // mid -> { statusEl, payload, timer }
+  const DELIVERY_TIMEOUT_MS = 7000;
+
+  function newMid() {
+    midCounter += 1;
+    return `m${Date.now().toString(36)}_${midCounter.toString(36)}`;
+  }
+
+  function statusElFor(mid) {
+    return (
+      pendingMsgs.get(mid)?.statusEl ||
+      log.querySelector(`.cmcp-msg-status[data-mid="${mid}"]`)
+    );
+  }
+
+  function iconAction(icon, title, onClick) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "cmcp-msg-action";
+    b.title = title;
+    const i = document.createElement("i");
+    i.className = `pi ${icon}`;
+    b.appendChild(i);
+    b.addEventListener("click", onClick);
+    return b;
+  }
+
+  function setMsgStatus(mid, state) {
+    const statusEl = statusElFor(mid);
+    if (!statusEl) return;
+    statusEl.className = "cmcp-msg-status " + state;
+    statusEl.replaceChildren();
+    if (state === "sending" || state === "failed") {
+      // Pre-seen (or undelivered): a muted label plus ✎ edit (pull back into the
+      // composer) and ✕ delete. The agent hasn't replied yet, so editing is just
+      // a retract — no rollback needed.
+      const label = document.createElement("span");
+      label.textContent = state === "failed" ? "Not delivered" : "Sending…";
+      statusEl.append(
+        label,
+        iconAction("pi-pencil", "Edit (bring back to composer)", () => editMsg(mid)),
+        iconAction("pi-times", "Delete this message", () => deleteMsg(mid)),
+      );
+    } else if (state === "seen") {
+      // Delivered → the agent is on it. Drop the actions; show a brief "✓ Seen"
+      // that fades so confirmations don't pile up.
+      statusEl.textContent = "✓ Seen";
+      setTimeout(() => {
+        if (statusEl.classList.contains("seen")) statusEl.remove();
+      }, 2500);
+    }
+  }
+
+  /** ✎ on a not-yet-answered message: retract it and drop the text back into the
+   *  composer to edit & resend (interrupting the turn if it already started). */
+  function editMsg(mid) {
+    const entry = pendingMsgs.get(mid);
+    const bubble = log.querySelector(`.cmcp-bubble.user[data-mid="${mid}"]`);
+    const raw = entry?.raw ?? bubble?.textContent ?? "";
+    if (thinkingEl) {
+      client?.sendFrame?.({ type: "interrupt" });
+      hideThinking();
+    }
+    deleteMsg(mid); // removes bubble + status + trailing record
+    setComposerValue(raw);
+    input.focus();
+  }
+
+  function armDeliveryTimeout(mid) {
+    const entry = pendingMsgs.get(mid);
+    if (!entry) return;
+    if (entry.timer) clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => {
+      if (pendingMsgs.has(mid)) setMsgStatus(mid, "failed");
+    }, DELIVERY_TIMEOUT_MS);
+  }
+
+  function trackSend(mid, statusEl, payload, raw) {
+    pendingMsgs.set(mid, { statusEl, payload, raw, timer: null });
+    const ok = client.sendUserMessage(payload.text, payload.context, payload.images, mid);
+    if (!ok) setMsgStatus(mid, "failed"); // socket wasn't open — instant fail
+    else armDeliveryTimeout(mid);
+  }
+
+  function markSeen(mid) {
+    const entry = pendingMsgs.get(mid);
+    if (!entry) return;
+    if (entry.timer) clearTimeout(entry.timer);
+    pendingMsgs.delete(mid);
+    setMsgStatus(mid, "seen");
+  }
+
+  function deleteMsg(mid) {
+    const entry = pendingMsgs.get(mid);
+    if (entry?.timer) clearTimeout(entry.timer);
+    pendingMsgs.delete(mid);
+    for (const el of log.querySelectorAll(`[data-mid="${mid}"]`)) el.remove();
+    // An undelivered message was never answered, so it's the trailing record.
+    const msgs = thread?.msgs;
+    if (msgs && msgs.length && msgs[msgs.length - 1].role === "user") {
+      msgs.pop();
+      persistThreads();
+    }
   }
 
   function appendAgent(text) {
@@ -3379,6 +3524,12 @@ function buildPanel() {
       applyModelCatalog(list);
     },
     onAck(ack) {
+      // Delivery confirmation: the orchestrator received this message → mark its
+      // bubble "✓ Seen". (No mid = an internal nudge send; nothing to mark.)
+      if (ack?.kind === "working" && typeof ack.mid === "string") {
+        markSeen(ack.mid);
+        return;
+      }
       // Effort change while the agent was mid-turn: it can't change a running
       // turn's effort, so it applies once the current turn finishes (no more
       // killing the in-flight reply). Let the user know so the picker selection
@@ -4072,7 +4223,14 @@ function buildPanel() {
     animating.clear();
     const userBubbles = log.querySelectorAll(".cmcp-bubble.user");
     const last = userBubbles[userBubbles.length - 1];
+    const mid = last?.dataset?.mid;
     if (last) last.remove();
+    if (mid) {
+      const entry = pendingMsgs.get(mid);
+      if (entry?.timer) clearTimeout(entry.timer);
+      pendingMsgs.delete(mid);
+      log.querySelector(`.cmcp-msg-status[data-mid="${mid}"]`)?.remove();
+    }
     if (thinkingEl) {
       client?.sendFrame?.({ type: "interrupt" });
       hideThinking();
@@ -4125,7 +4283,9 @@ function buildPanel() {
       return;
     }
     const freshChat = !thread;
-    appendUser(text);
+    const mid = newMid();
+    const painted = appendUser(text, { mid });
+    setMsgStatus(mid, "sending");
     showThinking();
     input.value = "";
     input.style.height = "auto";
@@ -4163,14 +4323,14 @@ function buildPanel() {
     } catch {
       // graph unavailable — send without subgraph context
     }
-    client.sendUserMessage(
-      sendText,
-      {
-        workflow: getWorkflowTitle(),
-        ...(viewing.scope === "subgraph" ? { subgraph: viewing.title } : {}),
-      },
-      imageRefs,
-    );
+    const context = {
+      workflow: getWorkflowTitle(),
+      ...(viewing.scope === "subgraph" ? { subgraph: viewing.title } : {}),
+    };
+    // Track delivery: trackSend marks "Sending…", then the working ack flips it
+    // to "✓ Seen" (or a timeout / closed socket flips it to "Not delivered").
+    // `text` (the raw composer text) is kept so ✎ can restore it for editing.
+    trackSend(mid, painted.statusEl, { text: sendText, context, images: imageRefs }, text);
   });
 
   input.addEventListener("keydown", (ev) => {
