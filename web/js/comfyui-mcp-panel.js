@@ -480,6 +480,10 @@ function placementFor(graph, pos) {
   return [100, 100];
 }
 
+// The currently-mounted panel root (set by buildPanel). Used by canvas "fit" to
+// measure how much of the canvas the open sidebar panel overlays.
+let activePanelRoot = null;
+
 const GRAPH_TOOL_EXECUTORS = {
   graph_get_state() {
     const { graph } = getGraphCtx();
@@ -688,6 +692,26 @@ const GRAPH_TOOL_EXECUTORS = {
           maxY = Math.max(maxY, y + h0);
         }
         const bounds = [minX, minY, maxX - minX, maxY - minY];
+        // Panel-aware: the open sidebar panel overlays part of the canvas, so
+        // widen the fit bounds on the panel's side — the graph then lands in the
+        // VISIBLE area instead of behind the panel (fit otherwise frames the
+        // FULL canvas, which sits behind the panel overlay).
+        try {
+          const cEl = canvas.canvas;
+          const pr = activePanelRoot?.isConnected ? activePanelRoot.getBoundingClientRect() : null;
+          const cr = cEl?.getBoundingClientRect?.();
+          if (pr && cr && pr.width > 0 && cr.width > 0) {
+            const panelOnLeft = (pr.left + pr.right) / 2 < (cr.left + cr.right) / 2;
+            const inset = panelOnLeft ? Math.max(0, pr.right - cr.left) : Math.max(0, cr.right - pr.left);
+            if (inset > 8 && inset < cr.width * 0.9) {
+              const extra = bounds[2] * (cr.width / (cr.width - inset) - 1);
+              bounds[2] += extra;
+              if (panelOnLeft) bounds[0] -= extra; // pad the panel (left) side; right panel grows bounds to the right
+            }
+          }
+        } catch {
+          // measurement unavailable — fall back to a plain full-canvas fit
+        }
         // SMOOTH animated zoom-to-fit when supported (matches the native
         // "Fit view" easing); fall back to an instant set otherwise.
         if (typeof canvas.animateToBounds === "function") {
@@ -700,8 +724,8 @@ const GRAPH_TOOL_EXECUTORS = {
         const h = bounds[3] + pad * 2;
         const next = Math.min(el.width / w, el.height / h, 1.5);
         ds.scale = next;
-        ds.offset[0] = -minX + pad + (el.width / next - w) / 2;
-        ds.offset[1] = -minY + pad + (el.height / next - h) / 2;
+        ds.offset[0] = -bounds[0] + pad + (el.width / next - w) / 2;
+        ds.offset[1] = -bounds[1] + pad + (el.height / next - h) / 2;
         break;
       }
       case "pan":
@@ -1471,14 +1495,28 @@ const PANEL_CSS = `
   white-space: pre; color: var(--p-text-color, #fff);
 }
 .cmcp-bubble table {
-  display: block; width: 100%; overflow-x: auto;
+  /* Real table layout (NOT display:block) so the header row stays aligned with
+     the body; fit the panel width and let long cells wrap instead of scrolling. */
+  display: table; width: 100%; table-layout: fixed;
   border-collapse: collapse; margin: 0.5rem 0; font-size: 0.6875rem;
 }
 .cmcp-bubble th, .cmcp-bubble td {
   border: 1px solid var(--p-content-border-color, #3f3f46);
-  padding: 0.25rem 0.5rem; text-align: left;
+  padding: 0.25rem 0.5rem; text-align: left; vertical-align: top;
+  overflow-wrap: anywhere; word-break: break-word;
 }
 .cmcp-bubble th { background: var(--p-surface-800, #27272a); font-weight: 600; }
+.cmcp-newmsg {
+  position: absolute; left: 50%; transform: translateX(-50%); bottom: 0.6rem; z-index: 6;
+  display: inline-flex; align-items: center; gap: 0.35rem;
+  padding: 0.3rem 0.75rem; border-radius: 999px; border: none; cursor: pointer;
+  background: var(--p-primary-color, #2563eb); color: var(--p-primary-contrast-color, #fff);
+  font: inherit; font-size: 0.7rem; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+}
+.cmcp-newmsg .pi { font-size: 0.7rem; }
+/* The base rule sets display, which beats the UA [hidden] rule — so re-assert
+   it or `newMsgBtn.hidden = true` won't actually hide the pill. */
+.cmcp-newmsg[hidden] { display: none; }
 .cmcp-sys {
   align-self: center; font-size: 0.6875rem; font-style: italic;
   color: var(--p-text-muted-color, #a1a1aa);
@@ -1720,6 +1758,9 @@ function buildPanel() {
 
   const root = document.createElement("div");
   root.className = "cmcp-root";
+  // Expose this panel's root so canvas "fit" can measure how much of the canvas
+  // the open panel occludes and frame the graph in the visible area.
+  activePanelRoot = root;
 
   // ---- Header: title + status dot ----
   const header = document.createElement("div");
@@ -1880,7 +1921,31 @@ function buildPanel() {
   log.appendChild(empty);
   const body = document.createElement("div");
   body.className = "cmcp-body";
+  body.style.position = "relative"; // anchor the "new messages" pill
   body.appendChild(log);
+
+  // Discord-style sticky autoscroll: follow new content only while the user is
+  // already at the bottom. If they've scrolled up to read, leave them there and
+  // surface a "New messages" pill that smooth-scrolls back down.
+  let stickToBottom = true;
+  const BOTTOM_SLACK_PX = 48;
+  const atBottom = () => log.scrollHeight - log.scrollTop - log.clientHeight <= BOTTOM_SLACK_PX;
+  const newMsgBtn = document.createElement("button");
+  newMsgBtn.type = "button";
+  newMsgBtn.className = "cmcp-newmsg";
+  newMsgBtn.hidden = true;
+  newMsgBtn.innerHTML = '<i class="pi pi-arrow-down"></i> New messages';
+  newMsgBtn.addEventListener("click", () => {
+    stickToBottom = true;
+    newMsgBtn.hidden = true;
+    log.scrollTo({ top: log.scrollHeight, behavior: "smooth" });
+  });
+  // Track the user's scroll position; re-stick (and hide the pill) at the bottom.
+  log.addEventListener("scroll", () => {
+    stickToBottom = atBottom();
+    if (stickToBottom) newMsgBtn.hidden = true;
+  });
+  body.appendChild(newMsgBtn);
   root.appendChild(body);
 
   function clearEmpty() {
@@ -2165,6 +2230,11 @@ function buildPanel() {
   }
 
   function scrollLog() {
+    if (!stickToBottom) {
+      // User is reading further up — don't yank them down; offer the jump pill.
+      newMsgBtn.hidden = false;
+      return;
+    }
     // Defer to after layout so tall content (code blocks, images) still lands
     // at the true bottom.
     requestAnimationFrame(() => {
@@ -2454,6 +2524,8 @@ function buildPanel() {
   }
 
   function appendUser(text) {
+    stickToBottom = true; // your own message → always jump to the latest
+    newMsgBtn.hidden = true;
     paintUser(text);
     record({ role: "user", text });
   }
