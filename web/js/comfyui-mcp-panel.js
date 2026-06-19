@@ -1044,7 +1044,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onDownloads, onThinking, onAgentStatus, onSession, onModels, onAck, onTurn, getResume }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onDownloads, onThinking, onAgentStatus, onSession, onModels, onAck, onTurn, getResume }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -1172,7 +1172,13 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret
         return;
       }
       if (msg && msg.type === "say" && typeof msg.text === "string") {
-        onSay(msg.text);
+        // `id` reconciles this committed reply with its live streaming preview.
+        onSay(msg.text, { id: msg.id, streamed: !!msg.streamed });
+      }
+      // Live streaming deltas: incremental thinking / reply text before the final
+      // `say` commits. phase: "think" | "text" | "end".
+      if (msg && msg.type === "stream" && typeof msg.id === "string") {
+        onStream?.(msg);
       }
       // Optional agent-side status (context window fill, model name).
       if (msg && msg.type === "agent_status") {
@@ -1631,6 +1637,42 @@ const PANEL_CSS = `
   0%, 60%, 100% { opacity: 0.25; transform: translateY(0); }
   30% { opacity: 1; transform: translateY(-3px); }
 }
+
+/* ---- live streaming: thinking accordion + reply preview ---- */
+/* The "see thinking" disclosure above a streaming reply. Open + scrollable while
+   the model reasons; collapses to a discreet one-line summary once text starts. */
+.cmcp-think {
+  margin: 0 0 0.5rem; border: 1px solid var(--p-content-border-color, #3f3f46);
+  border-radius: var(--p-border-radius-md, 6px);
+  background: var(--p-surface-900, #18181b);
+}
+.cmcp-think > summary {
+  list-style: none; cursor: pointer; user-select: none;
+  padding: 0.3125rem 0.5rem; font-size: 0.6875rem; font-weight: 600;
+  color: var(--p-text-muted-color, #a1a1aa);
+  display: flex; align-items: center; gap: 0.375rem;
+}
+.cmcp-think > summary::-webkit-details-marker { display: none; }
+.cmcp-think > summary::before {
+  content: "\\25b8"; font-size: 0.625rem; transition: transform 0.15s;
+}
+.cmcp-think[open] > summary::before { transform: rotate(90deg); }
+.cmcp-think-body {
+  max-height: 11rem; overflow-y: auto;
+  padding: 0 0.5rem 0.4375rem 0.875rem;
+  font-size: 0.6875rem; line-height: 1.45;
+  color: var(--p-text-muted-color, #8a8a93);
+  white-space: pre-wrap; word-break: break-word;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+/* While open & streaming, a soft pulse on the summary so it reads as "live". */
+.cmcp-think[open] > summary { color: var(--p-primary-color, #60a5fa); }
+/* Blinking caret on the reply preview while it streams in. */
+.cmcp-reply.streaming-cursor::after {
+  content: "\\258b"; margin-left: 1px; color: var(--p-primary-color, #60a5fa);
+  animation: cmcp-caret 1s step-end infinite;
+}
+@keyframes cmcp-caret { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 
 .cmcp-composer {
   position: relative; margin: 0.625rem 0.75rem 0.75rem; flex: none;
@@ -2688,6 +2730,94 @@ function buildPanel() {
     record({ role: "agent", text });
   }
 
+  // ---- live streaming (thinking + reply) ----
+  // A streaming bubble is keyed by the SDK message id so deltas stay coherent and
+  // the final committed `say` (same id) REPLACES the preview rather than adding a
+  // duplicate. Thinking text streams into a "see thinking" accordion that's open
+  // (and scrollable) while the model reasons, then collapses the instant reply
+  // text begins. Reply text streams as plain text with a caret; on commit it's
+  // re-rendered as full markdown.
+  const streamBubbles = new Map(); // id -> { el, thinkWrap, thinkBody, thinkSummary, replyEl, thinkText, replyText }
+
+  function ensureStreamBubble(id) {
+    let s = streamBubbles.get(id);
+    if (s) return s;
+    clearEmpty();
+    const el = document.createElement("div");
+    el.className = "cmcp-bubble agent streaming";
+    const replyEl = document.createElement("div");
+    replyEl.className = "cmcp-reply";
+    el.appendChild(replyEl);
+    log.appendChild(el);
+    s = { el, thinkWrap: null, thinkBody: null, thinkSummary: null, replyEl, thinkText: "", replyText: "" };
+    streamBubbles.set(id, s);
+    bumpThinking(); // keep the working indicator pinned below the new bubble
+    return s;
+  }
+
+  function ensureThinkArea(s) {
+    if (s.thinkWrap) return s;
+    const det = document.createElement("details");
+    det.className = "cmcp-think";
+    det.open = true;
+    const sum = document.createElement("summary");
+    sum.textContent = "Thinking…";
+    const body = document.createElement("div");
+    body.className = "cmcp-think-body";
+    det.append(sum, body);
+    s.el.insertBefore(det, s.replyEl); // thinking sits above the reply
+    s.thinkWrap = det;
+    s.thinkBody = body;
+    s.thinkSummary = sum;
+    return s;
+  }
+
+  function collapseThinking(s, label) {
+    if (s.thinkWrap) {
+      s.thinkWrap.open = false;
+      if (s.thinkSummary) s.thinkSummary.textContent = label;
+    }
+  }
+
+  function onStreamDelta(msg) {
+    const { phase, id } = msg;
+    const delta = typeof msg.delta === "string" ? msg.delta : "";
+    if (phase === "think") {
+      const s = ensureStreamBubble(id);
+      ensureThinkArea(s);
+      s.thinkText += delta;
+      s.thinkBody.textContent = s.thinkText;
+      s.thinkBody.scrollTop = s.thinkBody.scrollHeight; // follow the newest reasoning
+      scrollLog();
+    } else if (phase === "text") {
+      const s = ensureStreamBubble(id);
+      collapseThinking(s, "See thinking"); // reply began → tuck the reasoning away
+      s.replyText += delta;
+      s.replyEl.textContent = s.replyText; // plain while streaming; markdown on commit
+      s.replyEl.classList.add("streaming-cursor");
+      scrollLog();
+    } else if (phase === "end") {
+      const s = streamBubbles.get(id);
+      if (s) s.replyEl.classList.remove("streaming-cursor");
+    }
+  }
+
+  /** Reconcile a committed `say` with its live preview: replace the streamed text
+   *  with final markdown, collapse thinking, record to history. Returns false if
+   *  there's no matching stream bubble (caller falls back to a normal bubble). */
+  function commitStream(id, text) {
+    const s = streamBubbles.get(id);
+    if (!s) return false;
+    s.replyEl.classList.remove("streaming-cursor");
+    collapseThinking(s, "See thinking");
+    renderRichText(s.replyEl, text);
+    s.el.classList.remove("streaming");
+    streamBubbles.delete(id);
+    record({ role: "agent", text }); // thinking is ephemeral — only the reply persists
+    scrollLog();
+    return true;
+  }
+
   function appendSystem(text) {
     // System notices are transient — painted, never recorded.
     const b = document.createElement("div");
@@ -2706,6 +2836,7 @@ function buildPanel() {
 
   function resetFeed() {
     for (const el of [...log.children]) el.remove();
+    streamBubbles.clear(); // drop any in-flight streaming previews (DOM is gone)
     log.appendChild(empty);
   }
 
@@ -2953,12 +3084,17 @@ function buildPanel() {
       // orchestrator sends only AFTER it has armed hello.resume — so the nudge
       // can't out-race the session resume.)
     },
-    onSay(text) {
-      // Append the agent's words but KEEP the working indicator — the turn isn't
-      // over until turn:done. (A turn often emits progress text, then keeps
-      // working silently.) bumpThinking pins the indicator below the new message.
-      appendAgent(text);
+    onSay(text, meta) {
+      // If this reply was streamed, commit it into its live preview bubble (same
+      // message id) instead of painting a duplicate. Otherwise paint normally.
+      // Either way KEEP the working indicator — the turn isn't over until
+      // turn:done (a turn often emits progress text, then works on silently).
+      if (!(meta && meta.id && commitStream(meta.id, text))) appendAgent(text);
       bumpThinking();
+    },
+    // Live streaming deltas (thinking + reply text) before the committed say.
+    onStream(msg) {
+      onStreamDelta(msg);
     },
     // The agent called panel_ask — render a question card and resolve with the
     // user's pick. Keep the working indicator pinned below it while we wait.
