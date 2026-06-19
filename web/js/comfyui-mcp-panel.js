@@ -443,6 +443,38 @@ function describeActiveGraph(graph) {
   };
 }
 
+// ---- per-turn graph snapshots (rollback foundation, #44) -------------------
+// Before each turn that may edit the graph, capture the ROOT workflow JSON so a
+// whole turn's worth of agent edits can be reverted to a known-good point in one
+// step (ComfyUI's Ctrl+Z is per-operation; this is per-turn). Bounded ring,
+// correlated to the message id that started the turn. In-memory for this session.
+const GRAPH_SNAPSHOTS_MAX = 25;
+const graphSnapshots = []; // [{ mid, ts, label, data }], oldest → newest
+
+function captureGraphSnapshot(mid, label) {
+  try {
+    const data = getGraphCtx().rootGraph.serialize();
+    graphSnapshots.push({ mid, ts: Date.now(), label: (label || "").slice(0, 80), data });
+    while (graphSnapshots.length > GRAPH_SNAPSHOTS_MAX) graphSnapshots.shift();
+  } catch {
+    // graph unavailable — this turn just won't have a restore point.
+  }
+}
+
+// Restore the canvas to the most recent pre-turn snapshot (undo the last turn's
+// edits). Returns the restored snapshot, or null if none / restore failed.
+function revertGraphToLastSnapshot() {
+  const snap = graphSnapshots[graphSnapshots.length - 1];
+  if (!snap) return null;
+  try {
+    // Deep-clone so the stored snapshot isn't mutated by the live graph after load.
+    getGraphCtx().app.loadGraphData(JSON.parse(JSON.stringify(snap.data)));
+    return snap;
+  } catch {
+    return null;
+  }
+}
+
 /** Summarize one LiteGraph node for the agent — id, type, title, widget
  *  values, and input link sources. Deliberately NOT the full serialization
  *  (positions, colors, internal state) to keep token cost low. */
@@ -2538,14 +2570,18 @@ function buildPanel() {
   const spacer = document.createElement("span");
   spacer.className = "cmcp-spacer";
 
-  const attachBtn = iconBtn("pi-paperclip", "Attach an image (uploads to ComfyUI's input/ folder)");
+  const attachBtn = iconBtn("pi-paperclip", "Attach an image, video, workflow (.json), or text file");
   const micBtn = iconBtn("pi-microphone", "Dictate (browser speech recognition)");
   const sendBtn = iconBtn("pi-send", "Send (Enter)");
   sendBtn.type = "submit";
 
   const fileInput = document.createElement("input");
   fileInput.type = "file";
-  fileInput.accept = "image/*";
+  // Images + video upload into ComfyUI input/; workflows (.json) and text files
+  // are read and delivered inline to the agent. See handleFile() below.
+  fileInput.accept =
+    "image/*,video/*,.json,.txt,.md,.markdown,.csv,.tsv,.yaml,.yml,.xml,.toml,.ini,.cfg,.log,.py,.js,.ts,.sh,text/*,application/json";
+  fileInput.multiple = true;
   fileInput.hidden = true;
 
   row.append(ring, ctxLabel, modelChip, spacer, attachBtn, micBtn, sendBtn);
@@ -2680,6 +2716,26 @@ function buildPanel() {
     img.style.cssText = "max-width:100%;border-radius:6px;display:block;cursor:zoom-in;";
     img.addEventListener("click", () => window.open(url, "_blank"));
     card.appendChild(img);
+    if (name) {
+      const cap = document.createElement("div");
+      cap.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
+      cap.textContent = name;
+      card.appendChild(cap);
+    }
+    log.appendChild(card);
+    scrollLog();
+  }
+
+  function paintVideo(url, name) {
+    clearEmpty();
+    const card = document.createElement("div");
+    card.className = "cmcp-bubble agent cmcp-imgcard";
+    const vid = document.createElement("video");
+    vid.src = url;
+    vid.controls = true;
+    vid.preload = "metadata";
+    vid.style.cssText = "max-width:100%;border-radius:6px;display:block;";
+    card.appendChild(vid);
     if (name) {
       const cap = document.createElement("div");
       cap.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
@@ -3884,6 +3940,21 @@ function buildPanel() {
       run: () => hardRestart("user"),
     },
     {
+      cmd: "/revert",
+      icon: "pi-undo",
+      hint: "undo the last turn's graph edits — revert the canvas to before your last message",
+      run: () => {
+        const snap = revertGraphToLastSnapshot();
+        if (snap) {
+          appendSystem(
+            `↩ Reverted the canvas to before${snap.label ? ` “${snap.label}”` : " your last message"}.`,
+          );
+        } else {
+          appendSystem("Nothing to revert — no graph snapshot captured in this session yet.");
+        }
+      },
+    },
+    {
       cmd: "/errors",
       icon: "pi-info-circle",
       hint: "show the last execution errors",
@@ -4074,24 +4145,54 @@ function buildPanel() {
   }
 
   attachBtn.addEventListener("click", () => fileInput.click());
-  // The attach button now uses the same chip pipeline as drag/paste — a [Image #N]
-  // chip + structured ref, delivered inline to the agent on send.
+  // The attach button uses the same chip pipeline as drag/paste — each file drops
+  // a typed chip ([Image #N] / [Video #N] / [Workflow #N] / [File #N]) and a
+  // structured ref, delivered inline to the agent on send.
   fileInput.addEventListener("change", () => {
-    for (const f of Array.from(fileInput.files || [])) handleImageFile(f);
+    for (const f of Array.from(fileInput.files || [])) handleFile(f);
     fileInput.value = "";
   });
 
-  // ---- attachments: drag-drop / paste images + paste large text ----------
-  // Claude-Code style: a dropped/pasted image uploads into ComfyUI input/ and
-  // drops a [Image #N] chip in the composer; a big text paste collapses to a
-  // [Pasted text #N] chip. On send, pasted text expands inline and images are
-  // referenced (the agent can view_image them or wire a LoadImage node).
+  // ---- attachments: drag-drop / paste files + paste large text ------------
+  // Claude-Code style. A dropped/pasted/attached file becomes a typed chip in the
+  // composer; on send it's delivered to the agent inline:
+  //   • image    → uploads into ComfyUI input/, shown + delivered as a viewable ref
+  //   • video    → uploads into ComfyUI input/, delivered as an input/ path the
+  //                agent can wire into a video-load node or pass to video tools
+  //   • workflow → the .json is read and inlined so the agent can load/analyze it
+  //   • text     → the file's text is read and inlined (like a big paste)
+  // A big text paste also collapses to a [Pasted text #N] chip.
   const PASTE_TEXT_THRESHOLD = 800; // chars; longer pastes collapse to a chip
-  let attachments = []; // { id, kind:"image"|"text", ... }
+  const MAX_INLINE_TEXT = 600_000; // chars; cap inlined file text (workflows/docs)
+  // Text-ish files we read & inline rather than upload. (.json is handled as a
+  // workflow first; if it doesn't parse as one it falls back to a text file.)
+  const TEXT_FILE_RE =
+    /\.(txt|md|markdown|csv|tsv|ya?ml|xml|html?|toml|ini|cfg|conf|env|log|py|js|mjs|cjs|ts|tsx|jsx|sh|bat|ps1|rb|go|rs|c|h|cpp|hpp|java|kt|css|scss|sql|json5)$/i;
+  let attachments = []; // { id, kind:"image"|"video"|"text"|"textfile"|"workflow", ... }
   let attachSeq = 0;
   function resetAttachments() {
     attachments = [];
     attachSeq = 0;
+  }
+  function classifyFile(file) {
+    const type = file?.type || "";
+    const name = (file?.name || "").toLowerCase();
+    if (type.startsWith("image/")) return "image";
+    if (type.startsWith("video/")) return "video";
+    if (name.endsWith(".json") || type === "application/json") return "workflow";
+    if (type.startsWith("text/") || TEXT_FILE_RE.test(name)) return "text";
+    return "other"; // unknown binary — upload into input/ and reference by path
+  }
+  // Route any attached/dropped/pasted file to the right handler by kind.
+  function handleFile(file) {
+    if (!file) return;
+    switch (classifyFile(file)) {
+      case "image": return handleImageFile(file);
+      case "video": return handleMediaUpload(file, "video");
+      case "workflow": return handleWorkflowFile(file);
+      case "text": return handleTextFile(file);
+      default: return handleMediaUpload(file, "file");
+    }
   }
   function readAsDataURL(file) {
     return new Promise((resolve, reject) => {
@@ -4099,6 +4200,14 @@ function buildPanel() {
       fr.onload = () => resolve(fr.result);
       fr.onerror = reject;
       fr.readAsDataURL(file);
+    });
+  }
+  function readAsText(file) {
+    return new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(String(fr.result ?? ""));
+      fr.onerror = reject;
+      fr.readAsText(file);
     });
   }
   function handleImageFile(file) {
@@ -4134,6 +4243,83 @@ function buildPanel() {
     const id = ++attachSeq;
     attachments.push({ id, kind: "text", content: text });
     insertAtCaret(`[Pasted text #${id}] `);
+  }
+  // Upload a non-inlineable file (video, or an unknown binary) into ComfyUI's
+  // input/ folder and drop a path-reference chip. Claude can't view video inline,
+  // so on send the agent gets the input/ path — ready to wire into a video-load
+  // node or hand to the comfyui video tools.
+  function handleMediaUpload(file, kind /* "video" | "file" */) {
+    if (!file) return;
+    const id = ++attachSeq;
+    const label = kind === "video" ? "Video" : "File";
+    const name = file.name || `pasted-${id}`;
+    const att = { id, kind, name, mediaType: file.type || "", inputRef: null, ref: null, token: `[${label} #${id}]` };
+    attachments.push(att);
+    insertAtCaret(`${att.token} `);
+    att.ready = (async () => {
+      try {
+        const fd = new FormData();
+        // ComfyUI's /upload/image writes ANY uploaded file verbatim into input/.
+        fd.append("image", file, name);
+        const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
+        if (res.status === 200) {
+          const info = await res.json();
+          att.inputRef = (info.subfolder ? `${info.subfolder}/` : "") + info.name;
+          att.ref = { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || "input" };
+        }
+      } catch {
+        /* upload failed — the chip still names the file as a fallback */
+      }
+    })();
+  }
+  // Read a text file (docs, code, data) and inline its contents to the agent.
+  function handleTextFile(file) {
+    if (!file) return;
+    const id = ++attachSeq;
+    const name = file.name || `file-${id}.txt`;
+    const att = { id, kind: "textfile", name, content: "", token: `[File #${id}]` };
+    attachments.push(att);
+    insertAtCaret(`${att.token} `);
+    att.ready = (async () => {
+      try {
+        let t = await readAsText(file);
+        if (t.length > MAX_INLINE_TEXT) t = t.slice(0, MAX_INLINE_TEXT) + `\n…[truncated — original ${t.length} chars]`;
+        att.content = t;
+      } catch {
+        att.content = "";
+      }
+    })();
+  }
+  // Read a ComfyUI workflow .json and inline it so the agent can load / analyze /
+  // merge it. If it doesn't parse as JSON, fall back to delivering it as raw text.
+  function handleWorkflowFile(file) {
+    if (!file) return;
+    const id = ++attachSeq;
+    const name = file.name || `workflow-${id}.json`;
+    const att = { id, kind: "workflow", name, content: "", isWorkflow: true, token: `[Workflow #${id}]` };
+    attachments.push(att);
+    insertAtCaret(`${att.token} `);
+    att.ready = (async () => {
+      try {
+        let t = await readAsText(file);
+        try {
+          const obj = JSON.parse(t);
+          // Confirm it looks like a ComfyUI graph (UI format with nodes[], or API
+          // format keyed by node id with class_type). Pretty-print either way.
+          att.isWorkflow =
+            !!obj && typeof obj === "object" &&
+            (Array.isArray(obj.nodes) || "last_node_id" in obj ||
+              Object.values(obj).some((v) => v && typeof v === "object" && "class_type" in v));
+          t = JSON.stringify(obj, null, 2);
+        } catch {
+          att.isWorkflow = false; // not valid JSON — deliver as raw text
+        }
+        if (t.length > MAX_INLINE_TEXT) t = t.slice(0, MAX_INLINE_TEXT) + `\n…[truncated — original ${t.length} chars]`;
+        att.content = t;
+      } catch {
+        att.content = "";
+      }
+    })();
   }
 
   // Resolve image references from an @node:<id> mention to ComfyUI /view refs:
@@ -4210,7 +4396,7 @@ function buildPanel() {
   form.style.position = form.style.position || "relative";
   const dropzone = document.createElement("div");
   dropzone.className = "cmcp-dropzone";
-  dropzone.innerHTML = '<span><i class="pi pi-image"></i> Drop image to attach</span>';
+  dropzone.innerHTML = '<span><i class="pi pi-paperclip"></i> Drop a file to attach</span>';
   form.appendChild(dropzone);
   let dragDepth = 0;
   const showDrop = (on) => dropzone.classList.toggle("cmcp-show", on);
@@ -4239,22 +4425,20 @@ function buildPanel() {
     ev.preventDefault();
     dragDepth = 0;
     showDrop(false);
-    for (const f of Array.from(ev.dataTransfer.files || [])) {
-      if (f.type?.startsWith("image/")) handleImageFile(f);
-    }
+    for (const f of Array.from(ev.dataTransfer.files || [])) handleFile(f);
     input.focus();
   });
   input.addEventListener("paste", (ev) => {
     const dt = ev.clipboardData;
     if (!dt) return;
-    const imgItem = Array.from(dt.items || []).find(
-      (it) => it.kind === "file" && it.type?.startsWith("image/"),
-    );
-    if (imgItem) {
-      const file = imgItem.getAsFile();
+    // Any pasted file (a screenshot, or a file copied from the OS) routes through
+    // the same dispatcher as the attach button and drag-drop.
+    const fileItem = Array.from(dt.items || []).find((it) => it.kind === "file");
+    if (fileItem) {
+      const file = fileItem.getAsFile();
       if (file) {
         ev.preventDefault();
-        handleImageFile(file);
+        handleFile(file);
         return;
       }
     }
@@ -4401,27 +4585,54 @@ function buildPanel() {
     const mid = newMid();
     const painted = appendUser(text, { mid });
     setMsgStatus(mid, "queued"); // muted + ✎/✕ until the agent actually reads it
+    // Capture the pre-turn graph so /revert can undo this turn's edits in one step.
+    captureGraphSnapshot(mid, text);
     showThinking();
     input.value = "";
     input.style.height = "auto";
 
     // Resolve attachment chips referenced in this message (the user may have
     // deleted some), then clear the registry for the next message.
+    const referenced = (a) => text.includes(a.token || `[Image #${a.id}]`);
     const refImgs = attachments.filter((a) => a.kind === "image" && text.includes(`[Image #${a.id}]`));
     const refTexts = attachments.filter((a) => a.kind === "text" && text.includes(`[Pasted text #${a.id}]`));
+    const refVideos = attachments.filter((a) => a.kind === "video" && referenced(a));
+    const refFiles = attachments.filter((a) => (a.kind === "textfile" || a.kind === "workflow") && referenced(a));
+    const refUploads = attachments.filter((a) => a.kind === "file" && referenced(a));
     resetAttachments();
-    if (refImgs.length) await Promise.all(refImgs.map((a) => a.ready));
+    const pending = [...refImgs, ...refVideos, ...refFiles, ...refUploads];
+    if (pending.length) await Promise.all(pending.map((a) => a.ready));
     for (const a of refImgs) if (a.dataUrl) paintImage(a.dataUrl, a.name);
+    for (const a of refVideos) if (a.ref) paintVideo(imageViewUrl(a.ref), a.name);
 
-    // Compose the text the AGENT receives: pasted text expands inline. Images
-    // (chips + @input:/@node: mentions) are delivered as inline image blocks; a
-    // short note lists chip paths as a fallback if a fetch fails.
+    // Compose the text the AGENT receives. Pasted text and text/workflow files
+    // expand inline (in a labeled fence). Images (chips + @input:/@node: mentions)
+    // are delivered as inline image blocks; video/binary uploads are delivered as
+    // input/ paths the agent can wire or process. A short note lists chip paths.
     let sendText = text;
     for (const a of refTexts) sendText = sendText.split(`[Pasted text #${a.id}]`).join(a.content);
+    for (const a of refFiles) {
+      const lang = a.kind === "workflow" ? "json" : "";
+      const head =
+        a.kind === "workflow" && a.isWorkflow
+          ? `ComfyUI workflow “${a.name}” (you can load, analyze, or merge it into the canvas):`
+          : `File “${a.name}”:`;
+      const block = `\n\n${head}\n\`\`\`${lang}\n${a.content}\n\`\`\``;
+      sendText = sendText.split(a.token).join(block);
+    }
     const imageRefs = await collectImageRefs(text, refImgs);
     if (refImgs.length) {
       const lines = refImgs.map((a) => `#${a.id}${a.inputRef ? ` (input/${a.inputRef})` : ""}`).join(", ");
       sendText += `\n\n[Attached image(s) ${lines} — shown inline below.]`;
+    }
+    const mediaUploads = [...refVideos, ...refUploads];
+    if (mediaUploads.length) {
+      const lines = mediaUploads
+        .map((a) => `${a.token} ${a.inputRef ? `→ input/${a.inputRef}` : `(${a.name} — upload failed)`}`)
+        .join("\n");
+      sendText +=
+        `\n\n[Attached media in ComfyUI's input/ folder (not viewable inline — load via a ` +
+        `Load Video/file node or pass the path to the comfyui tools):\n${lines}]`;
     }
 
     // Ground a brand-new chat: if the open workflow was never saved, save it
