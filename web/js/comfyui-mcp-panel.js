@@ -1039,7 +1039,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onAgentStatus, onSession, onModels, onAck, onTurn, getResume }) {
+function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onDownloads, onAgentStatus, onSession, onModels, onAck, onTurn, getResume }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -1195,6 +1195,11 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret
       // turn incl. silent tool work; done clears it).
       if (msg && msg.type === "turn" && typeof msg.state === "string") {
         onTurn?.(msg.state);
+      }
+      // Live download progress for the status tray (sourced orchestrator-side
+      // from the download tool's temp progress file and/or the Manager queue).
+      if (msg && msg.type === "download_progress" && Array.isArray(msg.downloads)) {
+        onDownloads?.(msg.downloads);
       }
       // "echo" frames are ignored — we render the user bubble locally on send.
     });
@@ -1543,6 +1548,17 @@ const PANEL_CSS = `
 .cmcp-todo-item.active { font-weight: 600; }
 .cmcp-todo-item.active .pi { color: var(--p-primary-color, #60a5fa); }
 .cmcp-todo-item.pending .pi { opacity: 0.5; }
+.cmcp-dl { margin-bottom: 0.4rem; }
+.cmcp-dl-item { padding: 0.18rem 0; }
+.cmcp-dl-top { display: flex; justify-content: space-between; gap: 0.5rem; align-items: baseline; }
+.cmcp-dl-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmcp-dl-meta { flex: none; opacity: 0.7; font-size: 0.62rem; }
+.cmcp-dl-bar { height: 4px; border-radius: 999px; background: var(--p-surface-700, #3f3f46); overflow: hidden; margin-top: 0.2rem; }
+.cmcp-dl-fill { height: 100%; background: var(--p-primary-color, #3a7bd5); transition: width 0.3s ease; }
+.cmcp-dl-item.done .cmcp-dl-fill { background: var(--p-green-400, #4ade80); }
+.cmcp-dl-item.error .cmcp-dl-fill { background: var(--p-red-400, #f87171); }
+.cmcp-dl-bar.indet .cmcp-dl-fill { width: 30%; animation: cmcp-indet 1.1s ease-in-out infinite; }
+@keyframes cmcp-indet { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
 .cmcp-sys {
   align-self: center; font-size: 0.6875rem; font-style: italic;
   color: var(--p-text-muted-color, #a1a1aa);
@@ -1977,40 +1993,101 @@ function buildPanel() {
   // Footer status tray — docked above the composer. Hosts the agent's live TODO
   // checklist (download progress rows slot in here later). Hidden until non-empty.
   let todoItems = [];
+  let downloadItems = [];
   const tray = document.createElement("div");
   tray.className = "cmcp-tray";
   tray.hidden = true;
   root.appendChild(tray);
 
+  function fmtBytes(n) {
+    if (!n || n < 1024) return `${n || 0} B`;
+    const u = ["KB", "MB", "GB", "TB"];
+    let i = -1;
+    let v = n;
+    do { v /= 1024; i++; } while (v >= 1024 && i < u.length - 1);
+    return `${v.toFixed(1)} ${u[i]}`;
+  }
+
   function renderTray() {
     tray.replaceChildren();
-    const has = todoItems.length > 0;
-    tray.hidden = !has;
-    if (!has) return;
-    const list = document.createElement("div");
-    list.className = "cmcp-todo";
-    const doneN = todoItems.filter((it) => it && it.status === "done").length;
-    const head = document.createElement("div");
-    head.className = "cmcp-tray-head";
-    head.textContent = `Plan · ${doneN}/${todoItems.length}`;
-    list.appendChild(head);
-    for (const it of todoItems) {
-      const status = it && it.status === "active" ? "active" : it && it.status === "done" ? "done" : "pending";
-      const row = document.createElement("div");
-      row.className = "cmcp-todo-item " + status;
-      const icon = document.createElement("i");
-      icon.className =
-        "pi " + (status === "done" ? "pi-check-circle" : status === "active" ? "pi-spin pi-spinner" : "pi-circle");
-      const txt = document.createElement("span");
-      txt.textContent = (it && it.text) || "";
-      row.append(icon, txt);
-      list.appendChild(row);
+    const hasDl = downloadItems.length > 0;
+    const hasTodo = todoItems.length > 0;
+    tray.hidden = !hasDl && !hasTodo;
+    if (tray.hidden) return;
+
+    if (hasDl) {
+      const dl = document.createElement("div");
+      dl.className = "cmcp-dl";
+      const head = document.createElement("div");
+      head.className = "cmcp-tray-head";
+      head.textContent = "Downloads";
+      dl.appendChild(head);
+      for (const d of downloadItems) {
+        const total = d && Number(d.total) > 0 ? Number(d.total) : 0;
+        const got = d && Number(d.downloaded) > 0 ? Number(d.downloaded) : 0;
+        const pct = total ? Math.min(100, Math.round((100 * got) / total)) : null;
+        const failed = d && (d.status === "error" || d.status === "failed");
+        const done = d && d.status === "done";
+        const row = document.createElement("div");
+        row.className = "cmcp-dl-item" + (failed ? " error" : done ? " done" : "");
+        const top = document.createElement("div");
+        top.className = "cmcp-dl-top";
+        const name = document.createElement("span");
+        name.className = "cmcp-dl-name";
+        name.textContent = (d && d.name) || "download";
+        name.title = name.textContent;
+        const meta = document.createElement("span");
+        meta.className = "cmcp-dl-meta";
+        const speed = d && Number(d.bytes_per_sec) > 0 ? `${fmtBytes(Number(d.bytes_per_sec))}/s` : "";
+        meta.textContent = failed
+          ? "failed"
+          : done
+            ? "done"
+            : [pct != null ? `${pct}%` : "…", speed].filter(Boolean).join(" · ");
+        top.append(name, meta);
+        row.appendChild(top);
+        const barWrap = document.createElement("div");
+        barWrap.className = "cmcp-dl-bar" + (pct == null && !done && !failed ? " indet" : "");
+        const fill = document.createElement("div");
+        fill.className = "cmcp-dl-fill";
+        fill.style.width = `${done ? 100 : (pct ?? (failed ? 100 : 30))}%`;
+        barWrap.appendChild(fill);
+        row.appendChild(barWrap);
+        dl.appendChild(row);
+      }
+      tray.appendChild(dl);
     }
-    tray.appendChild(list);
+
+    if (hasTodo) {
+      const list = document.createElement("div");
+      list.className = "cmcp-todo";
+      const doneN = todoItems.filter((it) => it && it.status === "done").length;
+      const head = document.createElement("div");
+      head.className = "cmcp-tray-head";
+      head.textContent = `Plan · ${doneN}/${todoItems.length}`;
+      list.appendChild(head);
+      for (const it of todoItems) {
+        const status = it && it.status === "active" ? "active" : it && it.status === "done" ? "done" : "pending";
+        const row = document.createElement("div");
+        row.className = "cmcp-todo-item " + status;
+        const icon = document.createElement("i");
+        icon.className =
+          "pi " + (status === "done" ? "pi-check-circle" : status === "active" ? "pi-spin pi-spinner" : "pi-circle");
+        const txt = document.createElement("span");
+        txt.textContent = (it && it.text) || "";
+        row.append(icon, txt);
+        list.appendChild(row);
+      }
+      tray.appendChild(list);
+    }
     scrollLog();
   }
   function renderTodo(items) {
     todoItems = Array.isArray(items) ? items : [];
+    renderTray();
+  }
+  function renderDownloads(downloads) {
+    downloadItems = (Array.isArray(downloads) ? downloads : []).filter(Boolean);
     renderTray();
   }
 
@@ -2867,6 +2944,10 @@ function buildPanel() {
     // The agent called panel_set_todo — render/update the live plan tray.
     onTodo(items) {
       renderTodo(items);
+    },
+    // Orchestrator pushed live download progress → render rows in the tray.
+    onDownloads(list) {
+      renderDownloads(list);
     },
     // The agent called panel_request_secret — collect a token securely.
     onSecret(msg) {
