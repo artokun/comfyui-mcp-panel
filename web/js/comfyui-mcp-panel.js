@@ -3872,27 +3872,32 @@ function buildPanel() {
         ? "Restarting the agent backend (it stopped responding)…"
         : "Restarting the agent backend…",
     );
+    let ok = false;
     try {
       client.stop(); // drop the bridge so the old orchestrator can release the port
       const res = await api.fetchApi("/comfyui_mcp_panel/hard_restart", { method: "POST" });
       const data = await res.json().catch(() => ({}));
-      if (!data?.ok) {
+      if (data?.ok) {
+        ok = true;
+      } else {
         appendSystem(
           data?.message ||
             "Restart failed — try Disconnect then Connect, or fully restart ComfyUI.",
         );
-        return;
       }
     } catch (err) {
       appendSystem(`Couldn't reach ComfyUI to restart the agent: ${err?.message ?? err}`);
-      return;
     } finally {
       reloading = false;
       restartBtn.classList.remove("cmcp-spin");
     }
-    // Resume the conversation on the fresh orchestrator (same path soft reload
-    // uses — the session id persists, so onAck resumes the thread).
-    ssSet(SOFT_RELOAD_KEY, "user");
+    // On success, arm the resume so the fresh orchestrator continues the thread —
+    // origin-aware like softReload: a watchdog/mid-task restart wants the agent
+    // continuation nudge ("agent"), a manual click just resumes ("user").
+    if (ok) ssSet(SOFT_RELOAD_KEY, origin === "user" ? "user" : "agent");
+    // Reconnect EITHER WAY: on success to the fresh orchestrator, on failure to
+    // restore the bridge we dropped (the old backend may still be intact, and the
+    // session resumes via the normal hello.resume path).
     client.start();
   }
 

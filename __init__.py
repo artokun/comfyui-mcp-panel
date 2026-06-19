@@ -291,14 +291,19 @@ def _kill_orchestrator_tree(pid, started_at_ms=None):
     except Exception:
         return False
 
-    children = []
+    # Snapshot descendants WITH their creation times, under a verified parent.
+    snapshot = []  # list of (psutil.Process, create_time)
     try:
         if _is_orchestrator_process(pid) and (
             started_at_ms is None or _same_process(pid, started_at_ms)
         ):
-            children = psutil.Process(int(pid)).children(recursive=True)
+            for ch in psutil.Process(int(pid)).children(recursive=True):
+                try:
+                    snapshot.append((ch, ch.create_time()))
+                except Exception:
+                    pass
     except Exception:
-        children = []
+        snapshot = []
 
     # Kill the root via the identity-re-verifying helper. Only if it confirms the
     # root was ours do we reap the snapshotted descendants.
@@ -306,20 +311,32 @@ def _kill_orchestrator_tree(pid, started_at_ms=None):
     if not killed_root:
         return False
 
-    for ch in children:
+    # A snapshotted child can exit and have its pid reused before we signal it, so
+    # NEVER signal a child whose pid no longer maps to the same process. Read the
+    # creation time FRESH (a cached psutil.Process would return the stale value) and
+    # only signal on an exact match — same guard rigor as _kill_pid uses for the root.
+    def _same_child(proc, ct):
         try:
-            ch.terminate()
+            return abs(psutil.Process(proc.pid).create_time() - ct) <= 0.02
         except Exception:
-            pass
+            return False  # gone or unreadable → don't signal
+
+    for proc, ct in snapshot:
+        if _same_child(proc, ct):
+            try:
+                proc.terminate()
+            except Exception:
+                pass
     try:
-        _gone, alive = psutil.wait_procs(children, timeout=3)
+        psutil.wait_procs([p for p, _ in snapshot], timeout=3)
     except Exception:
-        alive = children
-    for ch in alive:
-        try:
-            ch.kill()
-        except Exception:
-            pass
+        pass
+    for proc, ct in snapshot:
+        if _same_child(proc, ct):
+            try:
+                proc.kill()
+            except Exception:
+                pass
     return True
 
 
