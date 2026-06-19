@@ -3106,16 +3106,25 @@ function buildPanel() {
   // After a reboot we triggered, respawn the orchestrator (it died with ComfyUI)
   // so the bridge can reconnect; onStatus(connected) then resumes the agent.
   function onComfyReconnecting() {
-    if (ssGet(REBOOT_KEY) || lsGet(AUTOCONNECT_KEY)) appendSystem("ComfyUI is restarting…");
+    // Only flag a restart if our bridge actually went down — a benign ComfyUI WS
+    // blip (asset view / image check) shouldn't print a false "restarting" alarm.
+    if ((ssGet(REBOOT_KEY) || lsGet(AUTOCONNECT_KEY)) && !client.isConnected()) {
+      appendSystem("ComfyUI is restarting…");
+    }
   }
   function onComfyReconnected() {
     // After ComfyUI comes back (backend-only reboot — the page didn't reload),
     // the orchestrator died with it. Respawn + reconnect if the agent was in use:
     // either a restart WE triggered (REBOOT_KEY) or sticky auto-connect.
     if (!ssGet(REBOOT_KEY) && !lsGet(AUTOCONNECT_KEY)) return;
+    // ComfyUI fires "reconnected" for BENIGN WS blips too — viewing assets,
+    // checking an image's status, a tab refocus — and those do NOT kill the
+    // orchestrator. If OUR bridge is still up, the agent is alive and well, so
+    // do NOT bounce a live session (that was the spurious "you reconnected"). A
+    // real ComfyUI restart drops the bridge (the orchestrator dies with it, and
+    // the bridge's own retry can't respawn it) — only then do we respawn here.
+    if (client.isConnected()) return;
     appendSystem("ComfyUI is back — reconnecting the agent…");
-    // Respawn the orchestrator on demand and reopen the bridge (same path as the
-    // Connect button). When it connects, onStatus sends the resume nudge.
     connectAgent();
   }
   try {
