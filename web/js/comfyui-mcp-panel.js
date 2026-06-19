@@ -1572,14 +1572,20 @@ const PANEL_CSS = `
    needs pre-wrap to honor its newlines; the commit drops the .streaming class
    and it reverts to normal markdown flow. */
 .cmcp-bubble.agent.streaming .cmcp-reply { white-space: pre-wrap; }
-/* Per-message delivery status under a sent user bubble (sending → seen → failed). */
+/* Per-message delivery status: invisible on success (a normal bubble = received
+   and not dropped); only a FAILED send shows up — the bubble tints red and the
+   status row exposes ✎ edit / ✕ delete. */
 .cmcp-msg-status {
   align-self: flex-end; max-width: 92%;
   margin: 0.0625rem 0.125rem 0.125rem;
   font-size: 0.6875rem; color: var(--p-text-muted-color, #71717a);
-  display: flex; gap: 0.5rem; align-items: center;
+  display: flex; gap: 0.375rem; align-items: center;
 }
-.cmcp-msg-status.failed { color: var(--p-red-400, #f87171); font-weight: 500; }
+.cmcp-msg-status:empty { display: none; }
+.cmcp-bubble.user.failed {
+  border-color: color-mix(in srgb, var(--p-red-400, #f87171), transparent 35%);
+  background: color-mix(in srgb, var(--p-red-400, #f87171), transparent 86%);
+}
 .cmcp-msg-action {
   background: none; border: none; padding: 0.0625rem; cursor: pointer;
   display: inline-flex; align-items: center; line-height: 1;
@@ -2938,27 +2944,29 @@ function buildPanel() {
 
   function setMsgStatus(mid, state) {
     const statusEl = statusElFor(mid);
-    if (!statusEl) return;
-    statusEl.className = "cmcp-msg-status " + state;
-    statusEl.replaceChildren();
-    if (state === "sending" || state === "failed") {
-      // Pre-seen (or undelivered): a muted label plus ✎ edit (pull back into the
-      // composer) and ✕ delete. The agent hasn't replied yet, so editing is just
-      // a retract — no rollback needed.
-      const label = document.createElement("span");
-      label.textContent = state === "failed" ? "Not delivered" : "Sending…";
-      statusEl.append(
-        label,
-        iconAction("pi-pencil", "Edit (bring back to composer)", () => editMsg(mid)),
+    const bubble = log.querySelector(`.cmcp-bubble.user[data-mid="${mid}"]`);
+    // Successful delivery needs no chrome — a normal bubble IS the "delivered"
+    // signal. We only surface a PROBLEM: a failed send tints the bubble (color)
+    // and exposes ✎ edit (pull text back to the composer) + ✕ delete, so a
+    // dropped message never silently vanishes.
+    if (state === "sending") {
+      bubble?.classList.remove("failed");
+      statusEl?.replaceChildren(); // empty → hidden via :empty
+      return;
+    }
+    if (state === "seen") {
+      bubble?.classList.remove("failed");
+      statusEl?.remove();
+      return;
+    }
+    if (state === "failed") {
+      bubble?.classList.add("failed");
+      if (!statusEl) return;
+      statusEl.className = "cmcp-msg-status failed";
+      statusEl.replaceChildren(
+        iconAction("pi-pencil", "Edit — bring back to the composer", () => editMsg(mid)),
         iconAction("pi-times", "Delete this message", () => deleteMsg(mid)),
       );
-    } else if (state === "seen") {
-      // Delivered → the agent is on it. Drop the actions; show a brief "✓ Seen"
-      // that fades so confirmations don't pile up.
-      statusEl.textContent = "✓ Seen";
-      setTimeout(() => {
-        if (statusEl.classList.contains("seen")) statusEl.remove();
-      }, 2500);
     }
   }
 
