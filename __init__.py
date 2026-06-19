@@ -273,6 +273,65 @@ def _is_orchestrator_process(pid):
         return False  # can't verify → never kill
 
 
+def _kill_orchestrator_tree(pid, started_at_ms=None):
+    """Kill a VERIFIED orchestrator AND its child process tree, then reap them.
+
+    A soft reload terminates only the orchestrator's own pid — but the Claude
+    Agent SDK spawns child processes (its shell, helper binaries). If one of those
+    wedges (e.g. a dead shell after a re-auth) and is orphaned rather than killed,
+    the wedge survives the respawn and the user is stuck (Task Manager / reboot).
+    Hard restart kills the whole tree so the fresh orchestrator starts truly clean.
+
+    Safe by construction: we only ever snapshot/kill the tree of a pid that
+    verifies as our orchestrator (cmdline + recorded creation time), so every
+    descendant is by definition our agent's own subprocess — never a user's. If
+    the root doesn't verify, nothing is touched."""
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return False
+
+    children = []
+    try:
+        if _is_orchestrator_process(pid) and (
+            started_at_ms is None or _same_process(pid, started_at_ms)
+        ):
+            children = psutil.Process(int(pid)).children(recursive=True)
+    except Exception:
+        children = []
+
+    # Kill the root via the identity-re-verifying helper. Only if it confirms the
+    # root was ours do we reap the snapshotted descendants.
+    killed_root = _kill_pid(pid, started_at_ms)
+    if not killed_root:
+        return False
+
+    for ch in children:
+        try:
+            ch.terminate()
+        except Exception:
+            pass
+    try:
+        _gone, alive = psutil.wait_procs(children, timeout=3)
+    except Exception:
+        alive = children
+    for ch in alive:
+        try:
+            ch.kill()
+        except Exception:
+            pass
+    return True
+
+
+def _delete_lock():
+    """Remove the orchestrator lockfile (best-effort) so a fresh orchestrator
+    self-registers cleanly after a hard restart."""
+    try:
+        os.remove(_lock_path())
+    except Exception:
+        pass
+
+
 def _start_orchestrator():
     """Start the panel orchestrator on demand. Returns (ok: bool, message: str).
 
@@ -436,6 +495,46 @@ def _reload_orchestrator():
     return _start_orchestrator()
 
 
+def _hard_restart_orchestrator():
+    """Force a truly fresh orchestrator: kill the verified orchestrator AND its
+    whole child tree (clears a wedged Agent-SDK shell an in-place soft reload
+    can't), delete the lockfile, then respawn. Pure Python over the local route,
+    so it works even when the agent itself is unresponsive — the user's one-click
+    escape from "the agent stopped answering" without Task Manager or a reboot.
+    Returns (ok, message)."""
+    if _no_autospawn():
+        return False, (
+            "auto-start is disabled (COMFYUI_MCP_NO_AUTOSPAWN) — restart your "
+            "orchestrator process yourself."
+        )
+
+    _stop_orchestrator()
+    lock = _read_lock()
+    parent = lock.get("parent") if lock else None
+    opid = lock.get("pid") if lock else None
+    lock_is_ours = _lock_parent_is_current(lock)
+    lock_is_orphan = _lock_parent_is_gone(lock)
+    if opid and (lock_is_ours or lock_is_orphan) and _is_orchestrator_process(opid):
+        _kill_orchestrator_tree(opid, lock.get("pidStartedAt"))
+    elif lock and parent and parent != os.getpid() and not lock_is_orphan:
+        return False, (
+            "the panel bridge port {} is owned by another live ComfyUI "
+            "(pid {}). Not restarting it.".format(_BRIDGE_PORT, parent)
+        )
+
+    _delete_lock()
+    for _ in range(30):
+        if not _port_in_use(_BRIDGE_HOST, _BRIDGE_PORT):
+            break
+        time.sleep(0.1)
+    if _port_in_use(_BRIDGE_HOST, _BRIDGE_PORT):
+        return False, (
+            "the panel bridge port {} is still held after the restart — fully "
+            "restart ComfyUI.".format(_BRIDGE_PORT)
+        )
+    return _start_orchestrator()
+
+
 # ---------------------------------------------------------------------------
 # Local API the panel's Connect button calls. Registering aiohttp routes at
 # import is standard for custom nodes (no subprocess is spawned here); the
@@ -482,6 +581,17 @@ def _register_routes():
         # Soft reload: respawn the orchestrator (new code) without restarting
         # ComfyUI. The panel reconnects and resumes the session afterward.
         ok, message = _reload_orchestrator()
+        return web.json_response(
+            {"ok": ok, "running": _orchestrator_running(), "port": _BRIDGE_PORT, "message": message},
+            status=200 if ok else 503,
+        )
+
+    @routes.post("/comfyui_mcp_panel/hard_restart")
+    async def _hard_restart(_request):
+        # Recovery: kill the orchestrator + its whole child tree and respawn — the
+        # fix for a wedged/unresponsive agent backend that a soft reload can't
+        # clear. Pure Python, so it works even when the agent isn't answering.
+        ok, message = _hard_restart_orchestrator()
         return web.json_response(
             {"ok": ok, "running": _orchestrator_running(), "port": _BRIDGE_PORT, "message": message},
             status=200 if ok else 503,
