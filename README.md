@@ -55,6 +55,11 @@ The bridge is loopback-only (`ws://127.0.0.1:9180`, set via
 `COMFYUI_MCP_BRIDGE_PORT`). To run the orchestrator yourself, set
 `COMFYUI_MCP_NO_AUTOSPAWN=1` and launch it manually, then click Connect.
 
+Type `/` in the composer for commands — including `/compact`, `/loop` and other
+Claude built-ins, plus panel ones: **`/reload`** (pick up new code, keep the
+chat), **`/reload-ui`** (reload just the panel), and **`/restart`** (recover an
+unresponsive agent — kills the orchestrator and its child tree, starts fresh).
+
 ## What the agent can do
 
 The agent drives the workflow you're viewing through a **fixed allowlist** of

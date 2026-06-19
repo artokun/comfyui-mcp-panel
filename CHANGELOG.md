@@ -6,8 +6,41 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-06-19
+
+### Added
+
+- **Live-streaming chat** — extended-thinking in a collapsible "see thinking"
+  accordion + character-by-character reply, with a live thinking-token counter.
+- **SDK slash commands** in the composer `/` menu — `/compact`, `/context`,
+  `/usage`, `/loop`, `/goal`, `/clear` (the SDK's useful built-ins).
+- **`/restart` — one-click recovery for a wedged agent.** Kills the orchestrator
+  **and its whole child tree** (clearing a dead Agent-SDK shell an in-place reload
+  can't) and starts a **fresh** session — resuming would just restore the wedge.
+  Pure-Python route, so it works even when the agent isn't answering.
+- **Per-message delivery status** (queued → seen) with edit/cancel on a queued
+  message, and a **live model-download progress** tray.
+- **Subgraph authoring** — promote/retract inner widgets, node-title rename,
+  workflow-tab tools, built-in Manager install→restart→resume.
+
+### Changed
+
+- **Rebranded to "ComfyUI Agent Panel"** (registry slug `comfyui-agent-panel`);
+  license declared as the Comfy-correct `{ file = "LICENSE" }` table form.
+- **Removed all `--channels` plumbing.** The panel runs only on the autonomous
+  orchestrator (dedicated bridge `9180`); reload/restart live as slash commands
+  (`/reload`, `/reload-ui`, `/restart`), not header buttons.
+
 ### Fixed
 
+- **Pid-reuse-safe orchestrator kill** — identity (cmdline + creation time) is
+  re-verified immediately before every terminate/kill, for the orchestrator and
+  each child, so a recycled pid is never mistaken for ours and a user's unrelated
+  process is never signalled.
+- **Connect honors the Bridge URL field** (previously only Reconnect did).
+- **Deferred extension registration** so a Vite/Rolldown early module eval can't
+  throw and deadlock the loader (adapted from a community PR, thanks
+  @FreesoSaiFared).
 - **Truthful "connected".** The panel now turns green only after the orchestrator
   handshake (its `models` frame) arrives — a non-orchestrator squatting the
   bridge port (e.g. a stray `comfyui-mcp --channels` server from another
