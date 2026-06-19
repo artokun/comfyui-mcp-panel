@@ -1,5 +1,5 @@
 // =============================================================================
-// ComfyUI MCP Panel — sidebar driven by an autonomous background agent.
+// ComfyUI Agent Panel — sidebar driven by an autonomous background agent.
 //
 // Shipped as a UI-only custom node pack (served via WEB_DIRECTORY). The panel
 // connects to the loopback WebSocket bridge owned by the comfyui-mcp panel
@@ -125,6 +125,11 @@ const SOFT_RELOAD_KEY = "comfyui-mcp.panel.softReloadResume";
 // resumed session to continue where it left off. The REBOOT/SOFT_RELOAD cases
 // (deliberate, agent-known) are handled first and clear this so we don't double-nudge.
 const MID_TASK_KEY = "comfyui-mcp.panel.midTaskResume";
+// Wall-clock (ms) of the last bridge drop — module-scoped so it survives panel
+// remounts. A FAST reconnect (panel swap / WS blip; orchestrator alive) vs a
+// SLOW one (real ComfyUI restart; orchestrator died + respawned) is how we tell
+// a spurious bounce from a real one — only the slow case fires the resume nudge.
+let lastBridgeDownAt = 0;
 // One-shot flag set right before a frontend (page) reload WE trigger, so that
 // after the reload we re-activate our own sidebar tab. ComfyUI restores the
 // last active tab BEFORE our extension re-registers it, so it can't reopen ours
@@ -1212,6 +1217,7 @@ function createBridgeClient({ onStatus, onSay, onLog, onCommand, onAsk, onSecret
       sock = null;
       handshakeDone = false;
       clearHandshake();
+      lastBridgeDownAt = Date.now(); // for the fast-vs-slow reconnect heuristic
       if (!closed) {
         onStatus("disconnected");
         scheduleReconnect();
@@ -3900,7 +3906,7 @@ if (!app || typeof app.registerExtension !== "function") {
         title: "Agent",
         // ComfyUI ships PrimeIcons; `pi-comments` is the closest "chat" glyph.
         icon: "pi pi-comments",
-        tooltip: "ComfyUI MCP Panel — your Claude session's window into this graph",
+        tooltip: "ComfyUI Agent Panel — your Claude session's window into this graph",
         type: "custom",
         render: (container) => {
           if (mounted) mounted.destroy();

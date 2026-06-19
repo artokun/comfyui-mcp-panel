@@ -1,4 +1,4 @@
-"""ComfyUI MCP Panel — sidebar driven by an autonomous background agent.
+"""ComfyUI Agent Panel — sidebar driven by an autonomous background agent.
 
 Two jobs:
 

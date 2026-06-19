@@ -1,4 +1,4 @@
-# ComfyUI MCP Panel
+# ComfyUI Agent Panel
 
 > ### 📦 On ComfyUI-Manager & the [Comfy Registry](https://registry.comfy.org/nodes/comfyui-agent-panel) as `comfyui-agent-panel`
 > The polished public release — native ComfyUI design system, live activity cards for every
