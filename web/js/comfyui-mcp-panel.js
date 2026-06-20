@@ -443,6 +443,50 @@ function describeActiveGraph(graph) {
   };
 }
 
+// ---- per-turn graph snapshots (rollback foundation, #44) -------------------
+// Before each turn that may edit the graph, capture the ROOT workflow JSON so a
+// whole turn's worth of agent edits can be reverted to a known-good point in one
+// step (ComfyUI's Ctrl+Z is per-operation; this is per-turn). Bounded ring,
+// correlated to the message id that started the turn. In-memory for this session.
+const GRAPH_SNAPSHOTS_MAX = 25;
+const graphSnapshots = []; // [{ mid, ts, label, data }], oldest → newest
+
+function captureGraphSnapshot(mid, label) {
+  try {
+    const data = getGraphCtx().rootGraph.serialize();
+    graphSnapshots.push({ mid, ts: Date.now(), label: (label || "").slice(0, 80), data });
+    while (graphSnapshots.length > GRAPH_SNAPSHOTS_MAX) graphSnapshots.shift();
+  } catch {
+    // graph unavailable — this turn just won't have a restore point.
+  }
+}
+
+// Restore the canvas to a given snapshot. Returns the snapshot, or null on fail.
+function restoreSnapshot(snap) {
+  if (!snap) return null;
+  try {
+    // Deep-clone so the stored snapshot isn't mutated by the live graph after load.
+    getGraphCtx().app.loadGraphData(JSON.parse(JSON.stringify(snap.data)));
+    return snap;
+  } catch {
+    return null;
+  }
+}
+
+// Restore the canvas to the most recent pre-turn snapshot (undo the last turn's edits).
+function revertGraphToLastSnapshot() {
+  return restoreSnapshot(graphSnapshots[graphSnapshots.length - 1]);
+}
+
+// Restore the canvas to the snapshot captured before the message with this mid
+// (the per-message rollback). Returns the snapshot or null.
+function revertGraphSnapshotByMid(mid) {
+  for (let i = graphSnapshots.length - 1; i >= 0; i--) {
+    if (graphSnapshots[i].mid === mid) return restoreSnapshot(graphSnapshots[i]);
+  }
+  return null;
+}
+
 /** Summarize one LiteGraph node for the agent — id, type, title, widget
  *  values, and input link sources. Deliberately NOT the full serialization
  *  (positions, colors, internal state) to keep token cost low. */
@@ -469,6 +513,11 @@ function summarizeNode(node) {
     id: node.id,
     type: node.type,
     title: node.title,
+    pos: node.pos ? [Math.round(node.pos[0]), Math.round(node.pos[1])] : null,
+    size: node.size ? [Math.round(node.size[0]), Math.round(node.size[1])] : null,
+    ...(node.flags && node.flags.collapsed ? { collapsed: true } : {}),
+    ...(node.color ? { color: node.color } : {}),
+    ...(node.bgcolor ? { bgcolor: node.bgcolor } : {}),
     widgets,
     inputs,
     outputs,
@@ -487,6 +536,83 @@ function resolveNode(graph, nodeId) {
   const node = graph.getNodeById(Number(nodeId));
   if (!node) throw new Error(`No node with id ${nodeId} in the current graph`);
   return node;
+}
+
+// ---- Group boxes (LiteGraph LGraphGroup) helpers --------------------------
+
+/** Resolve a group box by id (with an index fallback for graphs whose groups
+ *  don't carry ids). */
+function resolveGroup(graph, groupId) {
+  const groups = graph._groups ?? [];
+  let g = groups.find((gr) => gr && gr.id === groupId);
+  if (!g && typeof groupId === "number" && groupId >= 0 && groupId < groups.length) g = groups[groupId];
+  if (!g) throw new Error(`No group with id ${groupId} in the current graph`);
+  return g;
+}
+
+/** Next free group id — groups aren't always assigned one by the frontend. */
+function nextGroupId(graph) {
+  const ids = (graph._groups ?? []).map((g) => g.id).filter((n) => typeof n === "number");
+  return (ids.length ? Math.max(...ids) : 0) + 1;
+}
+
+/** Set a group's box, preferring its _bounding array (most portable). */
+function setGroupBounds(group, [x, y, w, h]) {
+  if (group._bounding && group._bounding.length >= 4) {
+    group._bounding[0] = x;
+    group._bounding[1] = y;
+    group._bounding[2] = w;
+    group._bounding[3] = h;
+  } else {
+    group.pos = [x, y];
+    group.size = [w, h];
+  }
+}
+
+/** [x, y, w, h] that wraps the given nodes, padded for the group + node titles. */
+function boundsAroundNodes(nodes, pad = 30, titlePad = 70) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const n of nodes) {
+    const x = n.pos?.[0] ?? 0;
+    const y = n.pos?.[1] ?? 0;
+    const w = n.size?.[0] ?? 200;
+    const h = n.size?.[1] ?? 100;
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x + w);
+    maxY = Math.max(maxY, y + h);
+  }
+  if (!Number.isFinite(minX)) return [100, 100, 400, 300];
+  return [minX - pad, minY - titlePad, maxX - minX + pad * 2, maxY - minY + titlePad + pad];
+}
+
+/** Compact JSON-friendly view of a group box. */
+function summarizeGroup(graph, g) {
+  const b = g._bounding ?? [g.pos?.[0] ?? 0, g.pos?.[1] ?? 0, g.size?.[0] ?? 0, g.size?.[1] ?? 0];
+  return {
+    id: g.id != null ? g.id : (graph._groups ?? []).indexOf(g),
+    title: g.title ?? "",
+    color: g.color ?? null,
+    bounding: [Math.round(b[0]), Math.round(b[1]), Math.round(b[2]), Math.round(b[3])],
+    node_count: (g._nodes ?? []).length,
+  };
+}
+
+/** Describe a subgraph's input/output "rail" nodes (the boundary I/O proxies)
+ *  so layouts can sit nodes next to them instead of floating away. The exact
+ *  property name varies across ComfyUI versions, so probe the likely ones. */
+function describeRails(sub) {
+  const xy = (n) => (n?.pos ? [Math.round(n.pos[0]), Math.round(n.pos[1])] : null);
+  const wh = (n) => (n?.size ? [Math.round(n.size[0]), Math.round(n.size[1])] : null);
+  const inNode = sub.inputNode ?? sub._inputNode ?? null;
+  const outNode = sub.outputNode ?? sub._outputNode ?? null;
+  return {
+    input: inNode ? { pos: xy(inNode), size: wh(inNode) } : null,
+    output: outNode ? { pos: xy(outNode), size: wh(outNode) } : null,
+  };
 }
 
 /** Resolve a slot reference (name string or numeric index) to an index in
@@ -523,13 +649,17 @@ let activePanelRoot = null;
 
 const GRAPH_TOOL_EXECUTORS = {
   graph_get_state() {
-    const { graph } = getGraphCtx();
+    const { graph, rootGraph } = getGraphCtx();
     const nodes = (graph._nodes ?? []).slice(0, MAX_STATE_NODES).map(summarizeNode);
+    const groups = (graph._groups ?? []).map((g) => summarizeGroup(graph, g));
+    const inSubgraph = graph !== rootGraph;
     return {
       viewing: describeActiveGraph(graph),
       node_count: graph._nodes?.length ?? 0,
       truncated: (graph._nodes?.length ?? 0) > MAX_STATE_NODES,
       nodes,
+      ...(groups.length ? { groups } : {}),
+      ...(inSubgraph ? { rails: describeRails(graph) } : {}),
     };
   },
 
@@ -951,6 +1081,103 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
+  // ---- Group boxes (LiteGraph LGraphGroup) ----------------------------------
+  // The labeled, colored rectangles. Visual organizers ONLY — distinct from
+  // subgraphs (which nest nodes). All undoable via beforeChange/afterChange.
+
+  // Create a group. Pass node_ids to auto-wrap them, else bounds [x,y,w,h],
+  // else a default box near the last node.
+  graph_create_group({ title, node_ids, bounds, color, font_size }) {
+    const { graph, LG } = getGraphCtx();
+    const GroupCls = LG.LGraphGroup;
+    if (typeof GroupCls !== "function") throw new Error("LGraphGroup unavailable on this frontend");
+    const group = new GroupCls(typeof title === "string" && title ? title : "Group");
+    let bbox;
+    if (Array.isArray(node_ids) && node_ids.length) {
+      const ns = node_ids.map((id) => graph.getNodeById(Number(id))).filter(Boolean);
+      if (!ns.length) throw new Error("none of the given node_ids exist in the current graph");
+      bbox = boundsAroundNodes(ns);
+    } else if (Array.isArray(bounds) && bounds.length === 4) {
+      bbox = bounds.map(Number);
+    } else {
+      bbox = [...placementFor(graph), 400, 300];
+    }
+    if (color != null) group.color = String(color);
+    if (Number.isFinite(font_size)) group.font_size = Number(font_size);
+    graph.beforeChange();
+    try {
+      setGroupBounds(group, bbox);
+      graph.add(group);
+      if (group.id == null) group.id = nextGroupId(graph);
+      group.recomputeInsideNodes?.();
+    } finally {
+      graph.afterChange();
+    }
+    graph.setDirtyCanvas(true, true);
+    return { group: summarizeGroup(graph, group) };
+  },
+
+  // Move a group's box to [x,y]; by default the contained nodes move with it
+  // (move_nodes:false moves only the box).
+  graph_move_group({ group_id, pos, move_nodes }) {
+    const { graph } = getGraphCtx();
+    const g = resolveGroup(graph, group_id);
+    const b = g._bounding ?? [g.pos?.[0] ?? 0, g.pos?.[1] ?? 0, 0, 0];
+    const dx = Number(pos[0]) - b[0];
+    const dy = Number(pos[1]) - b[1];
+    graph.beforeChange();
+    try {
+      if (move_nodes !== false && typeof g.move === "function") {
+        g.recomputeInsideNodes?.();
+        g.move(dx, dy, false); // moves the box AND the nodes inside it
+      } else {
+        setGroupBounds(g, [Number(pos[0]), Number(pos[1]), b[2], b[3]]);
+      }
+    } finally {
+      graph.afterChange();
+    }
+    graph.setDirtyCanvas(true, true);
+    return { group: summarizeGroup(graph, g) };
+  },
+
+  // Edit a group's title / color / font_size / bounds — only the fields passed.
+  graph_edit_group({ group_id, title, color, font_size, bounds }) {
+    const { graph } = getGraphCtx();
+    const g = resolveGroup(graph, group_id);
+    graph.beforeChange();
+    try {
+      if (typeof title === "string") g.title = title;
+      if (color != null) g.color = String(color);
+      if (Number.isFinite(font_size)) g.font_size = Number(font_size);
+      if (Array.isArray(bounds) && bounds.length === 4) setGroupBounds(g, bounds.map(Number));
+      g.recomputeInsideNodes?.();
+    } finally {
+      graph.afterChange();
+    }
+    graph.setDirtyCanvas(true, true);
+    return { group: summarizeGroup(graph, g) };
+  },
+
+  // Remove a group box (the nodes inside are NOT deleted).
+  graph_remove_group({ group_id }) {
+    const { graph } = getGraphCtx();
+    const g = resolveGroup(graph, group_id);
+    const summary = summarizeGroup(graph, g);
+    graph.beforeChange();
+    try {
+      if (typeof graph.removeGroup === "function") graph.removeGroup(g);
+      else if (typeof graph.remove === "function") graph.remove(g);
+      else {
+        const i = (graph._groups ?? []).indexOf(g);
+        if (i >= 0) graph._groups.splice(i, 1);
+      }
+    } finally {
+      graph.afterChange();
+    }
+    graph.setDirtyCanvas(true, true);
+    return { removed: summary };
+  },
+
   // Rename a node's TITLE (the label on its header) — distinct from widget values.
   graph_set_title({ node_id, title }) {
     const { graph } = getGraphCtx();
@@ -964,6 +1191,151 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     graph.setDirtyCanvas?.(true, true);
     return { node_id: node.id, previous, title: node.title };
+  },
+
+  // Collapse (minimize) or expand a node. `collapsed` defaults to true.
+  graph_set_node_collapsed({ node_id, collapsed }) {
+    const { graph } = getGraphCtx();
+    const node = resolveNode(graph, node_id);
+    const want = collapsed !== false;
+    graph.beforeChange?.();
+    try {
+      const isCollapsed = !!(node.flags && node.flags.collapsed);
+      if (isCollapsed !== want) {
+        if (typeof node.collapse === "function") node.collapse();
+        else {
+          node.flags = node.flags || {};
+          node.flags.collapsed = want;
+        }
+      }
+    } finally {
+      graph.afterChange?.();
+    }
+    graph.setDirtyCanvas?.(true, true);
+    return { node_id: node.id, collapsed: !!(node.flags && node.flags.collapsed) };
+  },
+
+  // Set a node's title-bar color and/or body color. Pass a `preset` name from
+  // LiteGraph's palette (red, brown, green, blue, pale_blue, cyan, purple,
+  // yellow, black) for matched title+body colors, or explicit `color` (title)
+  // and/or `bgcolor` (body) hex strings. Pass null for a field to clear it.
+  graph_set_node_color({ node_id, color, bgcolor, preset }) {
+    const { graph, LG } = getGraphCtx();
+    const node = resolveNode(graph, node_id);
+    graph.beforeChange?.();
+    try {
+      if (preset != null) {
+        const LGC = LG?.LGraphCanvas ?? window.LGraphCanvas ?? globalThis.LGraphCanvas;
+        const presets = LGC?.node_colors;
+        const p = presets && presets[preset];
+        if (!p) {
+          throw new Error(
+            `unknown color preset "${preset}" (available: ${presets ? Object.keys(presets).join(", ") : "none"})`,
+          );
+        }
+        node.color = p.color;
+        node.bgcolor = p.bgcolor;
+      } else {
+        if (color === null) delete node.color;
+        else if (color != null) node.color = String(color);
+        if (bgcolor === null) delete node.bgcolor;
+        else if (bgcolor != null) node.bgcolor = String(bgcolor);
+      }
+    } finally {
+      graph.afterChange?.();
+    }
+    graph.setDirtyCanvas?.(true, true);
+    return { node_id: node.id, color: node.color ?? null, bgcolor: node.bgcolor ?? null };
+  },
+
+  // Render the CURRENT graph view (root graph or the open subgraph) to a PNG and
+  // return it as base64 so the agent can SEE the layout. Temporarily fits the
+  // whole graph (nodes + groups) into the canvas, draws synchronously, captures,
+  // then restores the user's view. Output is capped to ~1600px wide.
+  graph_screenshot({ padding } = {}) {
+    const { graph, canvas } = getGraphCtx();
+    const cv = canvas?.canvas;
+    const ds = canvas?.ds;
+    if (!cv || typeof cv.toDataURL !== "function" || !ds) {
+      throw new Error("canvas not available for screenshot");
+    }
+    const nodes = graph._nodes ?? [];
+    const groups = graph._groups ?? [];
+    if (!nodes.length && !groups.length) throw new Error("nothing to screenshot (empty graph)");
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const n of nodes) {
+      const br = n.boundingRect;
+      let x;
+      let y;
+      let w0;
+      let h0;
+      if (Array.isArray(br) && br.length === 4 && (br[2] || br[3])) {
+        [x, y, w0, h0] = br;
+      } else {
+        x = n.pos?.[0] ?? 0;
+        y = (n.pos?.[1] ?? 0) - 30; // title bar renders above pos
+        w0 = n.size?.[0] ?? 200;
+        h0 = (n.size?.[1] ?? 100) + 30;
+      }
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x + w0);
+      maxY = Math.max(maxY, y + h0);
+    }
+    for (const g of groups) {
+      const b = g._bounding;
+      if (b && b.length >= 4) {
+        minX = Math.min(minX, b[0]);
+        minY = Math.min(minY, b[1]);
+        maxX = Math.max(maxX, b[0] + b[2]);
+        maxY = Math.max(maxY, b[1] + b[3]);
+      }
+    }
+    const bounds = [minX, minY, maxX - minX, maxY - minY];
+    const pad = Number.isFinite(padding) ? Number(padding) : 60;
+    const saved = { scale: ds.scale, ox: ds.offset[0], oy: ds.offset[1] };
+    let dataUrl;
+    let outW = cv.width;
+    let outH = cv.height;
+    try {
+      const w = bounds[2] + pad * 2;
+      const h = bounds[3] + pad * 2;
+      const next = Math.min(cv.width / w, cv.height / h, 1.5);
+      ds.scale = next;
+      ds.offset[0] = -bounds[0] + pad + (cv.width / next - w) / 2;
+      ds.offset[1] = -bounds[1] + pad + (cv.height / next - h) / 2;
+      canvas.draw(true, true); // synchronous redraw at the fitted transform
+      const MAXW = 1600;
+      if (cv.width > MAXW) {
+        const s = MAXW / cv.width;
+        const off = document.createElement("canvas");
+        off.width = Math.round(cv.width * s);
+        off.height = Math.round(cv.height * s);
+        off.getContext("2d").drawImage(cv, 0, 0, off.width, off.height);
+        dataUrl = off.toDataURL("image/png");
+        outW = off.width;
+        outH = off.height;
+      } else {
+        dataUrl = cv.toDataURL("image/png");
+      }
+    } finally {
+      ds.scale = saved.scale;
+      ds.offset[0] = saved.ox;
+      ds.offset[1] = saved.oy;
+      canvas.setDirty?.(true, true);
+      canvas.draw?.(true, true);
+    }
+    const comma = dataUrl.indexOf(",");
+    return {
+      image: comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl,
+      mimeType: "image/png",
+      width: outW,
+      height: outH,
+      viewing: describeActiveGraph(graph),
+    };
   },
 
   // Navigate INTO a subgraph node so the canvas (and therefore every graph_*
@@ -992,6 +1364,32 @@ const GRAPH_TOOL_EXECUTORS = {
     canvas.setGraph(graph.rootGraph ?? rootGraph);
     canvas.setDirty?.(true, true);
     return { viewing: describeActiveGraph(getGraphCtx().graph) };
+  },
+
+  // Reposition a subgraph's input/output RAIL (the boundary I/O node). Must run
+  // INSIDE the subgraph (graph_enter_subgraph first). Lets a layout place the
+  // input rail just left of the first column and the output rail just right of
+  // the last one, so boundary wires stay short — read current rail positions
+  // from graph_get_state's `rails` field.
+  graph_move_rail({ rail, pos }) {
+    const { graph, rootGraph } = getGraphCtx();
+    if (graph === rootGraph) {
+      throw new Error("graph_move_rail must run INSIDE a subgraph — call graph_enter_subgraph first");
+    }
+    const node =
+      rail === "input" ? (graph.inputNode ?? graph._inputNode) :
+      rail === "output" ? (graph.outputNode ?? graph._outputNode) :
+      null;
+    if (!node) throw new Error(`subgraph has no "${rail}" rail — use rail "input" or "output"`);
+    if (!Array.isArray(pos) || pos.length !== 2) throw new Error("pos must be [x, y]");
+    graph.beforeChange?.();
+    try {
+      node.pos = [Number(pos[0]), Number(pos[1])];
+    } finally {
+      graph.afterChange?.();
+    }
+    graph.setDirtyCanvas?.(true, true);
+    return { rail, pos: [Math.round(node.pos[0]), Math.round(node.pos[1])] };
   },
 
   // Promote (or demote) an INNER subgraph widget so it appears on the PARENT
@@ -1120,7 +1518,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onAck, onTurn, getResume }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onAck, onTurn, onTurnAnchor, getResume }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -1263,6 +1661,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // on a reset) so the panel can persist it and resume across reloads.
       if (msg && msg.type === "session") {
         onSession?.(typeof msg.session_id === "string" ? msg.session_id : null);
+      }
+      // Per-turn rewind anchor (assistant UUID) → the panel stores it so a
+      // later "rewind conversation to here" can fork the session at that point.
+      if (msg && msg.type === "turn_anchor" && typeof msg.uuid === "string") {
+        onTurnAnchor?.(msg.uuid);
       }
       // Live model catalog from the orchestrator (SDK-probed). This is also the
       // orchestrator HANDSHAKE — receiving it proves a real panel agent is behind
@@ -1457,6 +1860,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
 const PANEL_CSS = `
 .cmcp-root {
   display: flex; flex-direction: column; height: 100%; min-height: 0;
+  position: relative; /* positioning context for the rollback modal overlay */
   font-family: var(--font-inter, "Inter", ui-sans-serif, system-ui, sans-serif);
   font-size: 0.8125rem; line-height: 1.5;
   color: var(--p-text-color, #fff);
@@ -1560,9 +1964,43 @@ const PANEL_CSS = `
 @keyframes cmcp-in { from { opacity: 0; transform: translateY(4px); } }
 .cmcp-bubble.user {
   align-self: flex-end;
+  position: relative; /* anchor for the absolute hover edit button (no reflow) */
   background: var(--p-highlight-background, rgba(96,165,250,0.16));
   border: 1px solid color-mix(in srgb, var(--p-primary-color, #60a5fa), transparent 70%);
 }
+/* Hover edit/rollback button — absolute to the LEFT so it never reflows text. */
+.cmcp-edit-btn {
+  position: absolute; left: -1.75rem; top: 0.1rem;
+  width: 1.4rem; height: 1.4rem; padding: 0; border-radius: 5px;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--p-content-border-color, #3f3f46);
+  background: var(--p-surface-800, #27272a); color: var(--p-text-muted-color, #a1a1aa);
+  cursor: pointer; opacity: 0; transition: opacity 0.12s, color 0.12s; font-size: 0.7rem;
+}
+.cmcp-bubble.user:hover .cmcp-edit-btn { opacity: 1; }
+.cmcp-edit-btn:hover { color: var(--p-primary-color, #60a5fa); border-color: var(--p-primary-color, #60a5fa); }
+/* Rollback modal */
+.cmcp-modal-overlay {
+  position: absolute; inset: 0; z-index: 50; display: flex; align-items: center;
+  justify-content: center; padding: 1rem; background: rgba(0,0,0,0.45);
+}
+.cmcp-modal {
+  width: 100%; max-width: 22rem; display: flex; flex-direction: column; gap: 0.6rem;
+  padding: 0.85rem; border-radius: 10px; background: var(--p-surface-900, #18181b);
+  border: 1px solid var(--p-content-border-color, #3f3f46); box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+}
+.cmcp-modal-title { font-weight: 600; font-size: 0.85rem; }
+.cmcp-modal-text {
+  width: 100%; box-sizing: border-box; resize: vertical; min-height: 3.5rem;
+  padding: 0.4rem 0.5rem; border-radius: 6px; font: inherit; font-size: 0.8rem;
+  background: var(--p-surface-950, #111113); color: inherit;
+  border: 1px solid var(--p-surface-500, #555);
+}
+.cmcp-modal-scopes { display: flex; flex-direction: column; gap: 0.3rem; }
+.cmcp-modal-scope { display: flex; gap: 0.4rem; align-items: flex-start; font-size: 0.72rem; cursor: pointer; }
+.cmcp-modal-scope input { margin-top: 0.15rem; }
+.cmcp-modal-btns { display: flex; justify-content: flex-end; gap: 0.4rem; }
+.cmcp-btn-primary { background: var(--p-primary-color, #3a7bd5); color: #fff; border: none; }
 /* Agent text flows freely — no card/bubble. Only user messages are boxed. */
 .cmcp-bubble.agent {
   align-self: stretch; max-width: 100%;
@@ -1682,6 +2120,24 @@ const PANEL_CSS = `
 .cmcp-todo-item.done .pi { color: var(--p-green-400, #4ade80); }
 .cmcp-todo-item.active { font-weight: 600; }
 .cmcp-todo-item.active .pi { color: var(--p-primary-color, #60a5fa); }
+/* Pending messages live in the tray (not the chat flow). The inline bubble + its
+   status line stay hidden while queued/failed; on "read" the classes drop and the
+   bubble materializes in place — right before the agent's reply. */
+.cmcp-bubble.user.queued, .cmcp-bubble.user.failed { display: none; }
+.cmcp-msg-status.queued, .cmcp-msg-status.failed { display: none; }
+.cmcp-pending-item { display: flex; align-items: center; gap: 0.3rem; padding: 0.15rem 0; line-height: 1.3; }
+.cmcp-pending-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmcp-pending-item.failed .cmcp-pending-text { color: var(--p-red-300, #fca5a5); }
+.cmcp-pending-act { flex: none; width: 1.2rem; height: 1.2rem; padding: 0; border: none; background: transparent;
+  color: var(--p-text-muted-color, #a1a1aa); cursor: pointer; border-radius: 4px; font-size: 0.7rem; }
+.cmcp-pending-act:hover { color: var(--p-primary-color, #60a5fa); background: var(--p-surface-700, #3f3f46); }
+.cmcp-pending-act.danger:hover { color: var(--p-red-300, #fca5a5); }
+.cmcp-pending-handle { flex: none; width: 1rem; height: 1.2rem; display: flex; align-items: center; justify-content: center;
+  color: var(--p-text-muted-color, #71717a); cursor: grab; font-size: 0.65rem; opacity: 0.6; }
+.cmcp-pending-handle:hover { opacity: 1; color: var(--p-primary-color, #60a5fa); }
+.cmcp-pending-handle:active { cursor: grabbing; }
+.cmcp-pending-item.dragging { opacity: 0.4; }
+.cmcp-pending-item.drop-target { box-shadow: inset 0 2px 0 0 var(--p-primary-color, #60a5fa); }
 .cmcp-todo-item.pending .pi { opacity: 0.5; }
 .cmcp-dl { margin-bottom: 0.4rem; }
 .cmcp-dl-item { padding: 0.18rem 0; }
@@ -1937,6 +2393,25 @@ function describeCommand(cmd, msg, reply) {
         : { icon: "pi-arrow-up", text: `Promoted “${r.promoted}” to the subgraph node` };
     case "graph_move_node":
       return { icon: "pi-arrows-alt", text: `Moved node ${r.moved?.node_id} to [${r.moved?.to?.map(Math.round)}]` };
+    case "graph_create_group":
+      return { icon: "pi-clone", text: `Created group “${r.group?.title}” (id ${r.group?.id})` };
+    case "graph_move_group":
+      return { icon: "pi-arrows-alt", text: `Moved group ${r.group?.id} (“${r.group?.title}”)` };
+    case "graph_edit_group":
+      return { icon: "pi-pencil", text: `Edited group ${r.group?.id} (“${r.group?.title}”)` };
+    case "graph_remove_group":
+      return { icon: "pi-minus-circle", text: `Removed group “${r.removed?.title}”` };
+    case "graph_move_rail":
+      return { icon: "pi-arrows-h", text: `Moved ${r.rail} rail to [${r.pos?.map(Math.round)}]` };
+    case "graph_set_node_collapsed":
+      return {
+        icon: r.collapsed ? "pi-chevron-right" : "pi-chevron-down",
+        text: `${r.collapsed ? "Collapsed" : "Expanded"} node ${r.node_id}`,
+      };
+    case "graph_set_node_color":
+      return { icon: "pi-palette", text: `Recolored node ${r.node_id}` };
+    case "graph_screenshot":
+      return { icon: "pi-camera", text: `Captured workflow image (${r.width}×${r.height})` };
     case "graph_canvas":
       return { icon: "pi-window-maximize", text: `Canvas: ${r.canvas?.action?.replace(/_/g, " ")}` };
     case "graph_run":
@@ -1955,7 +2430,7 @@ function describeCommand(cmd, msg, reply) {
     case "workflow_save":
       return { icon: "pi-save", text: `Saved “${r.workflow}”` };
     case "workflow_save_as":
-      return { icon: "pi-save", text: `Saved as ${r.saved_as}` };
+      return { icon: "pi-save", text: `Saved as “${r.workflow}”` };
     default:
       return { icon: "pi-bolt", text: cmd, detail: JSON.stringify(r).slice(0, 300) };
   }
@@ -2233,12 +2708,83 @@ function buildPanel() {
     return `${v.toFixed(1)} ${u[i]}`;
   }
 
+  function mkPendingAct(icon, title, onClick, danger) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "cmcp-pending-act" + (danger ? " danger" : "");
+    b.title = title;
+    b.innerHTML = `<i class="pi ${icon}"></i>`;
+    b.addEventListener("click", onClick);
+    return b;
+  }
+
   function renderTray() {
     tray.replaceChildren();
+    // Only messages actually waiting (queued behind a turn) or failed belong in
+    // the tray — not idle sends that process immediately.
+    const pendingList = [...pendingMsgs].filter(
+      ([, e]) => e.state === "queued" || e.state === "failed",
+    );
+    const hasPending = pendingList.length > 0;
     const hasDl = downloadItems.length > 0;
     const hasTodo = todoItems.length > 0;
-    tray.hidden = !hasDl && !hasTodo;
+    tray.hidden = !hasPending && !hasDl && !hasTodo;
     if (tray.hidden) return;
+
+    // Pending messages (queued/failed) live here, not in the chat flow. Each has
+    // edit / send-now / delete. On dequeue they materialize as a chat bubble.
+    if (hasPending) {
+      const pend = document.createElement("div");
+      const head = document.createElement("div");
+      head.className = "cmcp-tray-head";
+      head.textContent = `Pending · ${pendingList.length}`;
+      pend.appendChild(head);
+      for (const [mid, entry] of pendingList) {
+        const row = document.createElement("div");
+        row.className = "cmcp-pending-item" + (entry.state === "failed" ? " failed" : "");
+        // Drag handle (LEFT) — reorder how the agent flushes the queue.
+        const handle = document.createElement("span");
+        handle.className = "cmcp-pending-handle";
+        handle.draggable = true;
+        handle.title = "Drag to reorder";
+        handle.innerHTML = '<i class="pi pi-bars"></i>';
+        handle.addEventListener("dragstart", (e) => {
+          e.dataTransfer.setData("text/plain", mid);
+          e.dataTransfer.effectAllowed = "move";
+          row.classList.add("dragging");
+        });
+        handle.addEventListener("dragend", () => row.classList.remove("dragging"));
+        row.addEventListener("dragover", (e) => {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "move";
+          row.classList.add("drop-target");
+        });
+        row.addEventListener("dragleave", () => row.classList.remove("drop-target"));
+        row.addEventListener("drop", (e) => {
+          e.preventDefault();
+          row.classList.remove("drop-target");
+          const dragMid = e.dataTransfer.getData("text/plain");
+          if (dragMid) reorderPending(dragMid, mid);
+        });
+        const txt = document.createElement("span");
+        txt.className = "cmcp-pending-text";
+        txt.textContent = entry.raw || "";
+        txt.title = entry.raw || "";
+        row.append(
+          handle,
+          txt,
+          mkPendingAct("pi-pencil", "Edit — pull back to the composer", () => editMsg(mid)),
+          mkPendingAct(
+            "pi-send",
+            entry.state === "failed" ? "Resend now" : "Send now (interrupt the current turn)",
+            () => sendNowMsg(mid),
+          ),
+          mkPendingAct("pi-times", "Delete this message", () => deleteMsg(mid), true),
+        );
+        pend.appendChild(row);
+      }
+      tray.appendChild(pend);
+    }
 
     if (hasDl) {
       const dl = document.createElement("div");
@@ -2538,14 +3084,18 @@ function buildPanel() {
   const spacer = document.createElement("span");
   spacer.className = "cmcp-spacer";
 
-  const attachBtn = iconBtn("pi-paperclip", "Attach an image (uploads to ComfyUI's input/ folder)");
+  const attachBtn = iconBtn("pi-paperclip", "Attach an image, video, workflow (.json), or text file");
   const micBtn = iconBtn("pi-microphone", "Dictate (browser speech recognition)");
   const sendBtn = iconBtn("pi-send", "Send (Enter)");
   sendBtn.type = "submit";
 
   const fileInput = document.createElement("input");
   fileInput.type = "file";
-  fileInput.accept = "image/*";
+  // Images + video upload into ComfyUI input/; workflows (.json) and text files
+  // are read and delivered inline to the agent. See handleFile() below.
+  fileInput.accept =
+    "image/*,video/*,.json,.txt,.md,.markdown,.csv,.tsv,.yaml,.yml,.xml,.toml,.ini,.cfg,.log,.py,.js,.ts,.sh,text/*,application/json";
+  fileInput.multiple = true;
   fileInput.hidden = true;
 
   row.append(ring, ctxLabel, modelChip, spacer, attachBtn, micBtn, sendBtn);
@@ -2622,6 +3172,18 @@ function buildPanel() {
     b.className = "cmcp-bubble user";
     b.textContent = text;
     if (opts.mid) b.dataset.mid = opts.mid;
+    // Hover edit/rollback button — only on live messages (those with a mid).
+    // Absolute-positioned to the LEFT of the bubble so it never causes reflow.
+    if (opts.mid) {
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.className = "cmcp-edit-btn";
+      edit.title = "Edit & roll back from this message";
+      edit.innerHTML = '<i class="pi pi-pencil"></i>';
+      const rewindAnchor = opts.rewindAnchor ?? null;
+      edit.addEventListener("click", () => openRollbackModal({ mid: opts.mid, text, anchor: rewindAnchor }));
+      b.appendChild(edit);
+    }
     log.appendChild(b);
     // Live sends get a delivery-status line below the bubble (sending → seen, or
     // failed with resend/delete). Replayed history has no mid → no status.
@@ -2680,6 +3242,26 @@ function buildPanel() {
     img.style.cssText = "max-width:100%;border-radius:6px;display:block;cursor:zoom-in;";
     img.addEventListener("click", () => window.open(url, "_blank"));
     card.appendChild(img);
+    if (name) {
+      const cap = document.createElement("div");
+      cap.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
+      cap.textContent = name;
+      card.appendChild(cap);
+    }
+    log.appendChild(card);
+    scrollLog();
+  }
+
+  function paintVideo(url, name) {
+    clearEmpty();
+    const card = document.createElement("div");
+    card.className = "cmcp-bubble agent cmcp-imgcard";
+    const vid = document.createElement("video");
+    vid.src = url;
+    vid.controls = true;
+    vid.preload = "metadata";
+    vid.style.cssText = "max-width:100%;border-radius:6px;display:block;";
+    card.appendChild(vid);
     if (name) {
       const cap = document.createElement("div");
       cap.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
@@ -2912,7 +3494,11 @@ function buildPanel() {
   function appendUser(text, opts = {}) {
     stickToBottom = true; // your own message → always jump to the latest
     newMsgBtn.hidden = true;
-    const painted = paintUser(text, opts);
+    // Capture the rewind anchor NOW (the latest turn's UUID) so a later rewind to
+    // this message forks the conversation right before it — stored directly (not as
+    // an index, which a bounded-ring shift() would invalidate).
+    const rewindAnchor = turnAnchors.length > 0 ? turnAnchors[turnAnchors.length - 1] : null;
+    const painted = paintUser(text, { ...opts, rewindAnchor });
     // Tag the record with its mid so deleteMsg can remove the EXACT message even
     // when several are queued (popping the trailing one would hit the wrong one).
     record({ role: "user", text, ...(opts.mid ? { mid: opts.mid } : {}) });
@@ -2959,16 +3545,21 @@ function buildPanel() {
   function setMsgStatus(mid, state) {
     const statusEl = statusElFor(mid);
     const bubble = log.querySelector(`.cmcp-bubble.user[data-mid="${mid}"]`);
+    const entry = pendingMsgs.get(mid);
+    if (entry) entry.state = state;
     if (state === "read") {
-      // The agent dequeued it → normal bubble, no chrome.
+      // The agent dequeued it → the bubble materializes in place (CSS un-hides it),
+      // and it leaves the pending tray.
       bubble?.classList.remove("queued", "failed");
       statusEl?.remove();
+      renderTray();
       return;
     }
     // queued (muted) or failed (red): tint the bubble + expose ✎/✕. The agent
     // hasn't read it yet, so editing/deleting just yanks it from the queue.
     bubble?.classList.toggle("queued", state === "queued");
     bubble?.classList.toggle("failed", state === "failed");
+    renderTray(); // reflect queued/failed state in the pending tray
     if (!statusEl) return;
     statusEl.className = "cmcp-msg-status " + state;
     statusEl.replaceChildren(
@@ -3003,11 +3594,58 @@ function buildPanel() {
     }, DELIVERY_TIMEOUT_MS);
   }
 
-  function trackSend(mid, statusEl, payload, raw) {
-    pendingMsgs.set(mid, { statusEl, payload, raw, timer: null });
+  function trackSend(mid, statusEl, payload, raw, materialize) {
+    // A `materialize` fn means this is a QUEUED send: nothing is painted inline yet;
+    // it waits in the pending tray and `materialize()` paints it at the END of the
+    // chat when the agent dequeues it (so the chat flows in dequeue order). An idle
+    // send ("sending") is already painted inline and processes immediately.
+    pendingMsgs.set(mid, {
+      statusEl,
+      payload,
+      raw,
+      timer: null,
+      state: materialize ? "queued" : "sending",
+      materialize: materialize || null,
+    });
     const ok = client.sendUserMessage(payload.text, payload.context, payload.images, mid);
     if (!ok) setMsgStatus(mid, "failed"); // socket wasn't open — instant fail
     else armDeliveryTimeout(mid);
+    renderTray(); // surface it in the pending tray (not inline)
+  }
+
+  /** "Send now" from the pending tray: a queued message → interrupt the current
+   *  turn so the agent gets to the queue immediately; a failed one → resend it. */
+  function sendNowMsg(mid) {
+    const entry = pendingMsgs.get(mid);
+    if (!entry) return;
+    if (entry.state === "failed") {
+      setMsgStatus(mid, "queued");
+      const ok = client.sendUserMessage(entry.payload.text, entry.payload.context, entry.payload.images, mid);
+      if (!ok) setMsgStatus(mid, "failed");
+      else armDeliveryTimeout(mid);
+    } else {
+      client?.sendFrame?.({ type: "interrupt" });
+    }
+    renderTray();
+  }
+
+  /** Drag-reorder the pending tray: move `dragMid` to where `targetMid` sits, then
+   *  tell the orchestrator the new flush order so it drains the queue that way. */
+  function reorderPending(dragMid, targetMid) {
+    if (!dragMid || dragMid === targetMid) return;
+    const isTray = (e) => e.state === "queued" || e.state === "failed";
+    const queued = [...pendingMsgs].filter(([, e]) => isTray(e));
+    const others = [...pendingMsgs].filter(([, e]) => !isTray(e));
+    const from = queued.findIndex(([m]) => m === dragMid);
+    const to = queued.findIndex(([m]) => m === targetMid);
+    if (from < 0 || to < 0) return;
+    const [moved] = queued.splice(from, 1);
+    queued.splice(to, 0, moved);
+    // Rebuild the Map in the new order (queued reordered; transient sends trail).
+    pendingMsgs.clear();
+    for (const [m, e] of [...queued, ...others]) pendingMsgs.set(m, e);
+    renderTray();
+    client?.sendFrame?.({ type: "reorder", order: queued.map(([m]) => m) });
   }
 
   /** Receipt ack (orchestrator got it): not dropped → cancel the failure timer.
@@ -3020,12 +3658,18 @@ function buildPanel() {
     }
   }
 
-  /** Read ack (agent dequeued it): flip to read state. */
+  /** Read ack (agent dequeued it): a queued message materializes at the END of the
+   *  chat (dequeue order, before the reply); an idle send just sheds its status. */
   function markRead(mid) {
     const entry = pendingMsgs.get(mid);
     if (entry?.timer) clearTimeout(entry.timer);
     pendingMsgs.delete(mid);
-    setMsgStatus(mid, "read");
+    if (entry?.materialize) {
+      entry.materialize(); // paint bubble + images at the bottom now
+      renderTray(); // it left the pending tray
+    } else {
+      setMsgStatus(mid, "read");
+    }
   }
 
   function deleteMsg(mid) {
@@ -3033,6 +3677,7 @@ function buildPanel() {
     if (entry?.timer) clearTimeout(entry.timer);
     pendingMsgs.delete(mid);
     cancelOnServer(mid); // drop it from the agent's queue if still there
+    renderTray(); // remove it from the pending tray
     for (const el of log.querySelectorAll(`[data-mid="${mid}"]`)) el.remove();
     // Remove the EXACT record for this mid (not the trailing one — several may be
     // queued at once).
@@ -3223,6 +3868,7 @@ function buildPanel() {
 
   function newChat() {
     thread = null;
+    turnAnchors = []; // fresh conversation → no rewind anchors
     ssSet(CURRENT_THREAD_KEY, null);
     ssSet(SESSION_KEY, null);
     ssSet(CTX_KEY, null);
@@ -3433,6 +4079,9 @@ function buildPanel() {
     "graph_create_subgraph",
     "graph_enter_subgraph",
     "graph_exit_subgraph",
+    "graph_create_group",
+    "graph_move_group",
+    "graph_remove_group",
   ]);
   let autoFitTimer = null;
   function scheduleAutoFit() {
@@ -3450,6 +4099,16 @@ function buildPanel() {
   // SDK-provided slash commands (built-ins like /compact, plus any loaded
   // skills), pushed by the orchestrator — surfaced in the completion menu below.
   let sdkCommands = [];
+
+  // Per-turn conversation rewind anchors (assistant UUIDs), in order. A user
+  // message records how many anchors existed when it was sent, so a rewind to
+  // that message forks the session at turnAnchors[recorded-1]. Reset on new chat.
+  let turnAnchors = [];
+
+  // True while a turn is in flight — a message sent now will QUEUE (→ pending
+  // tray) rather than start immediately. Drives the tray-vs-inline decision so
+  // an idle send doesn't briefly flash through the tray.
+  let agentWorking = false;
 
   // ---- bridge wiring ----
   const client = createBridgeClient({
@@ -3514,9 +4173,11 @@ function buildPanel() {
     },
     onTurn(state) {
       if (state === "working") {
+        agentWorking = true;
         showThinking();
         ssSet(MID_TASK_KEY, "1"); // a turn is in flight — arm the resume nudge
       } else if (state === "done") {
+        agentWorking = false;
         hideThinking();
         ssSet(MID_TASK_KEY, null); // turn finished cleanly — nothing to resume
       }
@@ -3555,6 +4216,10 @@ function buildPanel() {
     },
     onSession(sessionId) {
       bindSession(sessionId);
+    },
+    onTurnAnchor(uuid) {
+      turnAnchors.push(uuid);
+      if (turnAnchors.length > 200) turnAnchors.shift();
     },
     onModels(list) {
       applyModelCatalog(list);
@@ -3884,6 +4549,21 @@ function buildPanel() {
       run: () => hardRestart("user"),
     },
     {
+      cmd: "/revert",
+      icon: "pi-undo",
+      hint: "undo the last turn's graph edits — revert the canvas to before your last message",
+      run: () => {
+        const snap = revertGraphToLastSnapshot();
+        if (snap) {
+          appendSystem(
+            `↩ Reverted the canvas to before${snap.label ? ` “${snap.label}”` : " your last message"}.`,
+          );
+        } else {
+          appendSystem("Nothing to revert — no graph snapshot captured in this session yet.");
+        }
+      },
+    },
+    {
       cmd: "/errors",
       icon: "pi-info-circle",
       hint: "show the last execution errors",
@@ -4074,24 +4754,54 @@ function buildPanel() {
   }
 
   attachBtn.addEventListener("click", () => fileInput.click());
-  // The attach button now uses the same chip pipeline as drag/paste — a [Image #N]
-  // chip + structured ref, delivered inline to the agent on send.
+  // The attach button uses the same chip pipeline as drag/paste — each file drops
+  // a typed chip ([Image #N] / [Video #N] / [Workflow #N] / [File #N]) and a
+  // structured ref, delivered inline to the agent on send.
   fileInput.addEventListener("change", () => {
-    for (const f of Array.from(fileInput.files || [])) handleImageFile(f);
+    for (const f of Array.from(fileInput.files || [])) handleFile(f);
     fileInput.value = "";
   });
 
-  // ---- attachments: drag-drop / paste images + paste large text ----------
-  // Claude-Code style: a dropped/pasted image uploads into ComfyUI input/ and
-  // drops a [Image #N] chip in the composer; a big text paste collapses to a
-  // [Pasted text #N] chip. On send, pasted text expands inline and images are
-  // referenced (the agent can view_image them or wire a LoadImage node).
+  // ---- attachments: drag-drop / paste files + paste large text ------------
+  // Claude-Code style. A dropped/pasted/attached file becomes a typed chip in the
+  // composer; on send it's delivered to the agent inline:
+  //   • image    → uploads into ComfyUI input/, shown + delivered as a viewable ref
+  //   • video    → uploads into ComfyUI input/, delivered as an input/ path the
+  //                agent can wire into a video-load node or pass to video tools
+  //   • workflow → the .json is read and inlined so the agent can load/analyze it
+  //   • text     → the file's text is read and inlined (like a big paste)
+  // A big text paste also collapses to a [Pasted text #N] chip.
   const PASTE_TEXT_THRESHOLD = 800; // chars; longer pastes collapse to a chip
-  let attachments = []; // { id, kind:"image"|"text", ... }
+  const MAX_INLINE_TEXT = 600_000; // chars; cap inlined file text (workflows/docs)
+  // Text-ish files we read & inline rather than upload. (.json is handled as a
+  // workflow first; if it doesn't parse as one it falls back to a text file.)
+  const TEXT_FILE_RE =
+    /\.(txt|md|markdown|csv|tsv|ya?ml|xml|html?|toml|ini|cfg|conf|env|log|py|js|mjs|cjs|ts|tsx|jsx|sh|bat|ps1|rb|go|rs|c|h|cpp|hpp|java|kt|css|scss|sql|json5)$/i;
+  let attachments = []; // { id, kind:"image"|"video"|"text"|"textfile"|"workflow", ... }
   let attachSeq = 0;
   function resetAttachments() {
     attachments = [];
     attachSeq = 0;
+  }
+  function classifyFile(file) {
+    const type = file?.type || "";
+    const name = (file?.name || "").toLowerCase();
+    if (type.startsWith("image/")) return "image";
+    if (type.startsWith("video/")) return "video";
+    if (name.endsWith(".json") || type === "application/json") return "workflow";
+    if (type.startsWith("text/") || TEXT_FILE_RE.test(name)) return "text";
+    return "other"; // unknown binary — upload into input/ and reference by path
+  }
+  // Route any attached/dropped/pasted file to the right handler by kind.
+  function handleFile(file) {
+    if (!file) return;
+    switch (classifyFile(file)) {
+      case "image": return handleImageFile(file);
+      case "video": return handleMediaUpload(file, "video");
+      case "workflow": return handleWorkflowFile(file);
+      case "text": return handleTextFile(file);
+      default: return handleMediaUpload(file, "file");
+    }
   }
   function readAsDataURL(file) {
     return new Promise((resolve, reject) => {
@@ -4099,6 +4809,14 @@ function buildPanel() {
       fr.onload = () => resolve(fr.result);
       fr.onerror = reject;
       fr.readAsDataURL(file);
+    });
+  }
+  function readAsText(file) {
+    return new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(String(fr.result ?? ""));
+      fr.onerror = reject;
+      fr.readAsText(file);
     });
   }
   function handleImageFile(file) {
@@ -4134,6 +4852,83 @@ function buildPanel() {
     const id = ++attachSeq;
     attachments.push({ id, kind: "text", content: text });
     insertAtCaret(`[Pasted text #${id}] `);
+  }
+  // Upload a non-inlineable file (video, or an unknown binary) into ComfyUI's
+  // input/ folder and drop a path-reference chip. Claude can't view video inline,
+  // so on send the agent gets the input/ path — ready to wire into a video-load
+  // node or hand to the comfyui video tools.
+  function handleMediaUpload(file, kind /* "video" | "file" */) {
+    if (!file) return;
+    const id = ++attachSeq;
+    const label = kind === "video" ? "Video" : "File";
+    const name = file.name || `pasted-${id}`;
+    const att = { id, kind, name, mediaType: file.type || "", inputRef: null, ref: null, token: `[${label} #${id}]` };
+    attachments.push(att);
+    insertAtCaret(`${att.token} `);
+    att.ready = (async () => {
+      try {
+        const fd = new FormData();
+        // ComfyUI's /upload/image writes ANY uploaded file verbatim into input/.
+        fd.append("image", file, name);
+        const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
+        if (res.status === 200) {
+          const info = await res.json();
+          att.inputRef = (info.subfolder ? `${info.subfolder}/` : "") + info.name;
+          att.ref = { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || "input" };
+        }
+      } catch {
+        /* upload failed — the chip still names the file as a fallback */
+      }
+    })();
+  }
+  // Read a text file (docs, code, data) and inline its contents to the agent.
+  function handleTextFile(file) {
+    if (!file) return;
+    const id = ++attachSeq;
+    const name = file.name || `file-${id}.txt`;
+    const att = { id, kind: "textfile", name, content: "", token: `[File #${id}]` };
+    attachments.push(att);
+    insertAtCaret(`${att.token} `);
+    att.ready = (async () => {
+      try {
+        let t = await readAsText(file);
+        if (t.length > MAX_INLINE_TEXT) t = t.slice(0, MAX_INLINE_TEXT) + `\n…[truncated — original ${t.length} chars]`;
+        att.content = t;
+      } catch {
+        att.content = "";
+      }
+    })();
+  }
+  // Read a ComfyUI workflow .json and inline it so the agent can load / analyze /
+  // merge it. If it doesn't parse as JSON, fall back to delivering it as raw text.
+  function handleWorkflowFile(file) {
+    if (!file) return;
+    const id = ++attachSeq;
+    const name = file.name || `workflow-${id}.json`;
+    const att = { id, kind: "workflow", name, content: "", isWorkflow: true, token: `[Workflow #${id}]` };
+    attachments.push(att);
+    insertAtCaret(`${att.token} `);
+    att.ready = (async () => {
+      try {
+        let t = await readAsText(file);
+        try {
+          const obj = JSON.parse(t);
+          // Confirm it looks like a ComfyUI graph (UI format with nodes[], or API
+          // format keyed by node id with class_type). Pretty-print either way.
+          att.isWorkflow =
+            !!obj && typeof obj === "object" &&
+            (Array.isArray(obj.nodes) || "last_node_id" in obj ||
+              Object.values(obj).some((v) => v && typeof v === "object" && "class_type" in v));
+          t = JSON.stringify(obj, null, 2);
+        } catch {
+          att.isWorkflow = false; // not valid JSON — deliver as raw text
+        }
+        if (t.length > MAX_INLINE_TEXT) t = t.slice(0, MAX_INLINE_TEXT) + `\n…[truncated — original ${t.length} chars]`;
+        att.content = t;
+      } catch {
+        att.content = "";
+      }
+    })();
   }
 
   // Resolve image references from an @node:<id> mention to ComfyUI /view refs:
@@ -4210,7 +5005,7 @@ function buildPanel() {
   form.style.position = form.style.position || "relative";
   const dropzone = document.createElement("div");
   dropzone.className = "cmcp-dropzone";
-  dropzone.innerHTML = '<span><i class="pi pi-image"></i> Drop image to attach</span>';
+  dropzone.innerHTML = '<span><i class="pi pi-paperclip"></i> Drop a file to attach</span>';
   form.appendChild(dropzone);
   let dragDepth = 0;
   const showDrop = (on) => dropzone.classList.toggle("cmcp-show", on);
@@ -4239,22 +5034,20 @@ function buildPanel() {
     ev.preventDefault();
     dragDepth = 0;
     showDrop(false);
-    for (const f of Array.from(ev.dataTransfer.files || [])) {
-      if (f.type?.startsWith("image/")) handleImageFile(f);
-    }
+    for (const f of Array.from(ev.dataTransfer.files || [])) handleFile(f);
     input.focus();
   });
   input.addEventListener("paste", (ev) => {
     const dt = ev.clipboardData;
     if (!dt) return;
-    const imgItem = Array.from(dt.items || []).find(
-      (it) => it.kind === "file" && it.type?.startsWith("image/"),
-    );
-    if (imgItem) {
-      const file = imgItem.getAsFile();
+    // Any pasted file (a screenshot, or a file copied from the OS) routes through
+    // the same dispatcher as the attach button and drag-drop.
+    const fileItem = Array.from(dt.items || []).find((it) => it.kind === "file");
+    if (fileItem) {
+      const file = fileItem.getAsFile();
       if (file) {
         ev.preventDefault();
-        handleImageFile(file);
+        handleFile(file);
         return;
       }
     }
@@ -4375,6 +5168,114 @@ function buildPanel() {
     return true;
   }
 
+  // ---- double-Esc rewind (#44) ----
+  // Two Escapes in quick succession rewind your last turn: revert the canvas to
+  // before your last message AND bring that message back into the composer to
+  // edit & resend. (Graph + edit scope; conversation-fork is a follow-up.)
+  let lastEscAt = 0;
+  function rewindLastTurn() {
+    const snap = revertGraphToLastSnapshot();
+    const recalled = recallPrev(); // pulls your last message into the composer to edit
+    if (snap || recalled) {
+      appendSystem(
+        `↩ Rewound your last turn${snap ? " — canvas reverted" : ""}` +
+          `${recalled ? "; your message is back in the composer to edit & resend" : ""}.`,
+      );
+      input.focus();
+    } else {
+      appendSystem("Nothing to rewind yet — no message/graph snapshot from this session.");
+    }
+  }
+
+  // Per-message rollback modal (edit button on a user bubble). Edit the message
+  // and choose what to roll back — code (revert the canvas to before it),
+  // conversation (fork the agent's memory at that point), or both — then resend.
+  function openRollbackModal({ mid, text, anchor }) {
+    const overlay = document.createElement("div");
+    overlay.className = "cmcp-modal-overlay";
+    const modal = document.createElement("div");
+    modal.className = "cmcp-modal";
+    const title = document.createElement("div");
+    title.className = "cmcp-modal-title";
+    title.textContent = "Roll back & edit";
+    const ta = document.createElement("textarea");
+    ta.className = "cmcp-modal-text";
+    ta.rows = 3;
+    ta.value = text;
+    const scopeWrap = document.createElement("div");
+    scopeWrap.className = "cmcp-modal-scopes";
+    let chosen = "both";
+    const scopes = [
+      { v: "both", label: "Code + conversation", hint: "revert the canvas AND rewind the agent's memory" },
+      { v: "code", label: "Code only", hint: "revert the canvas; keep the conversation" },
+      { v: "conversation", label: "Conversation only", hint: "rewind the agent's memory; keep the canvas" },
+    ];
+    for (const s of scopes) {
+      const lbl = document.createElement("label");
+      lbl.className = "cmcp-modal-scope";
+      const r = document.createElement("input");
+      r.type = "radio";
+      r.name = "cmcp-rollback-scope";
+      r.value = s.v;
+      if (s.v === chosen) r.checked = true;
+      r.addEventListener("change", () => {
+        chosen = s.v;
+      });
+      const span = document.createElement("span");
+      const strong = document.createElement("strong");
+      strong.textContent = s.label;
+      span.append(strong, document.createTextNode(` — ${s.hint}`));
+      lbl.append(r, span);
+      scopeWrap.appendChild(lbl);
+    }
+    const btnRow = document.createElement("div");
+    btnRow.className = "cmcp-modal-btns";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "cmcp-btn";
+    cancel.textContent = "Cancel";
+    const go = document.createElement("button");
+    go.type = "button";
+    go.className = "cmcp-btn cmcp-btn-primary";
+    go.textContent = "Roll back & resend";
+    const close = () => overlay.remove();
+    cancel.addEventListener("click", close);
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) close();
+    });
+    go.addEventListener("click", () => {
+      const edited = ta.value.trim();
+      const wantCode = chosen === "code" || chosen === "both";
+      const wantConvo = chosen === "conversation" || chosen === "both";
+      if (wantCode) {
+        const snap = revertGraphSnapshotByMid(mid);
+        appendSystem(
+          snap
+            ? "↩ Canvas reverted to before this message."
+            : "No graph snapshot for this message — canvas left as-is.",
+        );
+      }
+      if (wantConvo) {
+        client.sendFrame?.({ type: "rewind", anchor });
+        appendSystem(
+          anchor
+            ? "↩ Rewound the conversation to before this message."
+            : "↩ Started a fresh conversation from this point.",
+        );
+      }
+      close();
+      if (edited) {
+        setComposerValue(edited);
+        form.requestSubmit();
+      }
+    });
+    btnRow.append(cancel, go);
+    modal.append(title, ta, scopeWrap, btnRow);
+    overlay.appendChild(modal);
+    root.appendChild(overlay);
+    setTimeout(() => ta.focus(), 0);
+  }
+
   // ---- submit ----
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
@@ -4399,29 +5300,65 @@ function buildPanel() {
     }
     const freshChat = !thread;
     const mid = newMid();
-    const painted = appendUser(text, { mid });
-    setMsgStatus(mid, "queued"); // muted + ✎/✕ until the agent actually reads it
+    // Decide tray-vs-inline at SEND time: if a turn is already in flight the message
+    // QUEUES — paint nothing inline now; it lives in the pending tray and materializes
+    // at the END of the chat when the agent dequeues it (so the chat flows in dequeue
+    // order, matching any reordering). An idle send paints immediately.
+    const isQueued = agentWorking;
+    const painted = isQueued ? null : appendUser(text, { mid });
+    // Capture the pre-turn graph so /revert can undo this turn's edits in one step.
+    captureGraphSnapshot(mid, text);
     showThinking();
     input.value = "";
     input.style.height = "auto";
 
     // Resolve attachment chips referenced in this message (the user may have
     // deleted some), then clear the registry for the next message.
+    const referenced = (a) => text.includes(a.token || `[Image #${a.id}]`);
     const refImgs = attachments.filter((a) => a.kind === "image" && text.includes(`[Image #${a.id}]`));
     const refTexts = attachments.filter((a) => a.kind === "text" && text.includes(`[Pasted text #${a.id}]`));
+    const refVideos = attachments.filter((a) => a.kind === "video" && referenced(a));
+    const refFiles = attachments.filter((a) => (a.kind === "textfile" || a.kind === "workflow") && referenced(a));
+    const refUploads = attachments.filter((a) => a.kind === "file" && referenced(a));
     resetAttachments();
-    if (refImgs.length) await Promise.all(refImgs.map((a) => a.ready));
-    for (const a of refImgs) if (a.dataUrl) paintImage(a.dataUrl, a.name);
+    const pending = [...refImgs, ...refVideos, ...refFiles, ...refUploads];
+    if (pending.length) await Promise.all(pending.map((a) => a.ready));
+    // Paint the message's media. For a queued send this runs later, inside
+    // materialize() (at dequeue), so the bubble + its images land together at the end.
+    const paintMedia = () => {
+      for (const a of refImgs) if (a.dataUrl) paintImage(a.dataUrl, a.name);
+      for (const a of refVideos) if (a.ref) paintVideo(imageViewUrl(a.ref), a.name);
+    };
+    if (!isQueued) paintMedia();
 
-    // Compose the text the AGENT receives: pasted text expands inline. Images
-    // (chips + @input:/@node: mentions) are delivered as inline image blocks; a
-    // short note lists chip paths as a fallback if a fetch fails.
+    // Compose the text the AGENT receives. Pasted text and text/workflow files
+    // expand inline (in a labeled fence). Images (chips + @input:/@node: mentions)
+    // are delivered as inline image blocks; video/binary uploads are delivered as
+    // input/ paths the agent can wire or process. A short note lists chip paths.
     let sendText = text;
     for (const a of refTexts) sendText = sendText.split(`[Pasted text #${a.id}]`).join(a.content);
+    for (const a of refFiles) {
+      const lang = a.kind === "workflow" ? "json" : "";
+      const head =
+        a.kind === "workflow" && a.isWorkflow
+          ? `ComfyUI workflow “${a.name}” (you can load, analyze, or merge it into the canvas):`
+          : `File “${a.name}”:`;
+      const block = `\n\n${head}\n\`\`\`${lang}\n${a.content}\n\`\`\``;
+      sendText = sendText.split(a.token).join(block);
+    }
     const imageRefs = await collectImageRefs(text, refImgs);
     if (refImgs.length) {
       const lines = refImgs.map((a) => `#${a.id}${a.inputRef ? ` (input/${a.inputRef})` : ""}`).join(", ");
       sendText += `\n\n[Attached image(s) ${lines} — shown inline below.]`;
+    }
+    const mediaUploads = [...refVideos, ...refUploads];
+    if (mediaUploads.length) {
+      const lines = mediaUploads
+        .map((a) => `${a.token} ${a.inputRef ? `→ input/${a.inputRef}` : `(${a.name} — upload failed)`}`)
+        .join("\n");
+      sendText +=
+        `\n\n[Attached media in ComfyUI's input/ folder (not viewable inline — load via a ` +
+        `Load Video/file node or pass the path to the comfyui tools):\n${lines}]`;
     }
 
     // Ground a brand-new chat: if the open workflow was never saved, save it
@@ -4445,7 +5382,17 @@ function buildPanel() {
     // Track delivery: trackSend marks "Sending…", then the working ack flips it
     // to "✓ Seen" (or a timeout / closed socket flips it to "Not delivered").
     // `text` (the raw composer text) is kept so ✎ can restore it for editing.
-    trackSend(mid, painted.statusEl, { text: sendText, context, images: imageRefs }, text);
+    if (isQueued) {
+      // Queued: hand trackSend a materializer that paints this message (bubble +
+      // media) at the END of the chat when the agent finally dequeues it.
+      const materialize = () => {
+        appendUser(text, { mid });
+        paintMedia();
+      };
+      trackSend(mid, null, { text: sendText, context, images: imageRefs }, text, materialize);
+    } else {
+      trackSend(mid, painted.statusEl, { text: sendText, context, images: imageRefs }, text);
+    }
   });
 
   input.addEventListener("keydown", (ev) => {
@@ -4470,6 +5417,18 @@ function buildPanel() {
         hideMenu();
         return;
       }
+    }
+    // Double-Esc (two within 600ms, menu closed, not mid-history-nav) rewinds the
+    // last turn. A single Esc falls through to its normal behavior below.
+    if (ev.key === "Escape" && menuPop.hidden && histIdx === -1) {
+      const now = performance.now();
+      if (now - lastEscAt < 600) {
+        lastEscAt = 0;
+        ev.preventDefault();
+        rewindLastTurn();
+        return;
+      }
+      lastEscAt = now;
     }
     // ↑ recalls your previous sent message (when already navigating, or from the
     // very start of the composer so it never hijacks normal line-up movement);
