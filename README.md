@@ -100,6 +100,16 @@ edit exactly like your own.
 | `panel_enter_subgraph` | Drill into a subgraph to read/edit its inner nodes |
 | `panel_exit_subgraph` | Return to the parent / root graph |
 
+**Spatial layout** — the agent sees node positions/sizes + subgraph rails and arranges the canvas
+
+| Tool | Effect |
+|---|---|
+| `panel_move_rail` | Move a subgraph's input / output rail so boundary wires stay short |
+| `panel_create_group` / `panel_move_group` / `panel_edit_group` / `panel_remove_group` | Create, move, retitle/recolor, or delete a labeled group box |
+| `panel_set_node_color` | Color-code a node (named LiteGraph preset or hex) |
+| `panel_set_node_collapsed` | Collapse / expand a node to a title chip |
+| `panel_screenshot` | Render the canvas to a PNG so the agent can verify its own layout |
+
 **Workflow tabs**
 
 | Tool | Effect |
@@ -144,6 +154,27 @@ edit exactly like your own.
 
 …plus the full comfyui-mcp tool surface (88 tools: queue, models, custom
 nodes, workflows) — the agent is the MCP client, so it has everything.
+
+## Working in the panel
+
+- **Rewind & rollback.** Hover any past message for a **✎ edit** button that
+  opens a modal to roll back **code** (the graph), **conversation**
+  (fork the session), or **both**, then resend an edited message. Plus
+  **`/revert`** (undo the last turn's graph edits) and **double-Esc** (quick
+  last-turn rewind — revert the graph and recall the message to edit). Graph
+  reverts use per-turn snapshots.
+- **Pending-message tray.** Messages sent while the agent is busy wait in a
+  fixed **Pending** tray above the downloads tray — each with edit / send-now /
+  delete buttons. **Send-now** interrupts the current turn to steer it; a drag
+  handle (≡) reorders how the agent flushes them. On dequeue a message
+  materializes at the **bottom** of the chat, so it flows in the exact order
+  Claude processes it.
+- **Destructive-op confirmation.** `panel_clear` and `panel_restart_comfyui`
+  pop a yes / no card and only act on **yes**.
+- **Reconnect durability.** A wedged orchestrator no longer strands the panel —
+  **Connect** reclaims a zombie that still holds the bridge port.
+- **Richer composer attachments.** Attach, drag, or paste **images, video,
+  workflow `.json`, and text** files into the composer.
 
 ## Security notes
 
