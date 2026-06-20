@@ -6,8 +6,25 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-19
+
 ### Added
 
+- **Rewind & rollback (#44).** A hover ✎ on any past message opens a rollback modal
+  to undo **code**, **conversation**, or **both** and resend an edited message —
+  graph reverts via per-turn snapshots, conversation rewinds via `forkSession`.
+  **`/revert`** undoes the last turn's graph edits, and a quick **double-Esc** in
+  the composer rewinds your last turn (revert graph + recall the message to edit).
+- **Pending-message tray.** Messages sent while the agent is busy now wait in a
+  fixed **Pending** tray above downloads (out of the chat flow), each with
+  **edit / send-now / delete**. **Send-now** interrupts the current turn (steer);
+  **drag the ≡ handle** to reorder how the agent flushes them. When the agent
+  dequeues a message it **materializes at the bottom of the chat** — so the chat
+  reads in the exact order Claude processes them.
+- **Spatial layout control.** The agent can now see and arrange the canvas: reads
+  include node positions/sizes and subgraph I/O rails; it can move rails, create
+  and edit groups, collapse/recolor nodes, and **screenshot** the canvas to verify
+  its own layout (with the "expose inputs/outputs" rule baked into a skill).
 - **Attach more than images.** The composer's attach button, drag-drop, and paste
   now accept **video**, **workflows (`.json`)**, and **text files** alongside
   images. Images and video upload into ComfyUI's `input/` folder (video is
@@ -16,6 +33,17 @@ All notable changes to this project are documented here. This project adheres to
   to the agent (a recognized ComfyUI graph is flagged so it can load/analyze/merge
   it). Each file drops a typed chip — `[Image #N]` / `[Video #N]` / `[Workflow #N]`
   / `[File #N]` — and the picker accepts multiple files at once.
+
+### Fixed
+
+- **Reconnect durability.** Connect now reclaims a lockfile-less orchestrator
+  "zombie" (alive but no longer serving the bridge) that would otherwise survive
+  reloads and a full ComfyUI restart and block reconnection — it finds the port
+  owner, and if it's our orchestrator, kills its tree and respawns a clean one.
+- **Rollback anchor stability** — the rewind anchor is stored as the turn's UUID in
+  the message's own handler (not an array index), so a bounded-history eviction
+  can't point a rollback at the wrong turn.
+- **Save-card** rendering fix.
 
 ## [0.1.3] - 2026-06-19
 
