@@ -3594,10 +3594,19 @@ function buildPanel() {
     }, DELIVERY_TIMEOUT_MS);
   }
 
-  function trackSend(mid, statusEl, payload, raw) {
-    // "queued" (agent busy → waiting in the pending tray) vs "sending" (idle send,
-    // processes immediately → stays inline, not in the tray).
-    pendingMsgs.set(mid, { statusEl, payload, raw, timer: null, state: agentWorking ? "queued" : "sending" });
+  function trackSend(mid, statusEl, payload, raw, materialize) {
+    // A `materialize` fn means this is a QUEUED send: nothing is painted inline yet;
+    // it waits in the pending tray and `materialize()` paints it at the END of the
+    // chat when the agent dequeues it (so the chat flows in dequeue order). An idle
+    // send ("sending") is already painted inline and processes immediately.
+    pendingMsgs.set(mid, {
+      statusEl,
+      payload,
+      raw,
+      timer: null,
+      state: materialize ? "queued" : "sending",
+      materialize: materialize || null,
+    });
     const ok = client.sendUserMessage(payload.text, payload.context, payload.images, mid);
     if (!ok) setMsgStatus(mid, "failed"); // socket wasn't open — instant fail
     else armDeliveryTimeout(mid);
@@ -3649,12 +3658,18 @@ function buildPanel() {
     }
   }
 
-  /** Read ack (agent dequeued it): flip to read state. */
+  /** Read ack (agent dequeued it): a queued message materializes at the END of the
+   *  chat (dequeue order, before the reply); an idle send just sheds its status. */
   function markRead(mid) {
     const entry = pendingMsgs.get(mid);
     if (entry?.timer) clearTimeout(entry.timer);
     pendingMsgs.delete(mid);
-    setMsgStatus(mid, "read");
+    if (entry?.materialize) {
+      entry.materialize(); // paint bubble + images at the bottom now
+      renderTray(); // it left the pending tray
+    } else {
+      setMsgStatus(mid, "read");
+    }
   }
 
   function deleteMsg(mid) {
@@ -5285,10 +5300,12 @@ function buildPanel() {
     }
     const freshChat = !thread;
     const mid = newMid();
-    const painted = appendUser(text, { mid });
-    // Only mark queued (→ hidden bubble + pending tray) if a turn is already in
-    // flight; an idle send processes immediately, so leave it inline (no flash).
-    if (agentWorking) setMsgStatus(mid, "queued");
+    // Decide tray-vs-inline at SEND time: if a turn is already in flight the message
+    // QUEUES — paint nothing inline now; it lives in the pending tray and materializes
+    // at the END of the chat when the agent dequeues it (so the chat flows in dequeue
+    // order, matching any reordering). An idle send paints immediately.
+    const isQueued = agentWorking;
+    const painted = isQueued ? null : appendUser(text, { mid });
     // Capture the pre-turn graph so /revert can undo this turn's edits in one step.
     captureGraphSnapshot(mid, text);
     showThinking();
@@ -5306,8 +5323,13 @@ function buildPanel() {
     resetAttachments();
     const pending = [...refImgs, ...refVideos, ...refFiles, ...refUploads];
     if (pending.length) await Promise.all(pending.map((a) => a.ready));
-    for (const a of refImgs) if (a.dataUrl) paintImage(a.dataUrl, a.name);
-    for (const a of refVideos) if (a.ref) paintVideo(imageViewUrl(a.ref), a.name);
+    // Paint the message's media. For a queued send this runs later, inside
+    // materialize() (at dequeue), so the bubble + its images land together at the end.
+    const paintMedia = () => {
+      for (const a of refImgs) if (a.dataUrl) paintImage(a.dataUrl, a.name);
+      for (const a of refVideos) if (a.ref) paintVideo(imageViewUrl(a.ref), a.name);
+    };
+    if (!isQueued) paintMedia();
 
     // Compose the text the AGENT receives. Pasted text and text/workflow files
     // expand inline (in a labeled fence). Images (chips + @input:/@node: mentions)
@@ -5360,7 +5382,17 @@ function buildPanel() {
     // Track delivery: trackSend marks "Sending…", then the working ack flips it
     // to "✓ Seen" (or a timeout / closed socket flips it to "Not delivered").
     // `text` (the raw composer text) is kept so ✎ can restore it for editing.
-    trackSend(mid, painted.statusEl, { text: sendText, context, images: imageRefs }, text);
+    if (isQueued) {
+      // Queued: hand trackSend a materializer that paints this message (bubble +
+      // media) at the END of the chat when the agent finally dequeues it.
+      const materialize = () => {
+        appendUser(text, { mid });
+        paintMedia();
+      };
+      trackSend(mid, null, { text: sendText, context, images: imageRefs }, text, materialize);
+    } else {
+      trackSend(mid, painted.statusEl, { text: sendText, context, images: imageRefs }, text);
+    }
   });
 
   input.addEventListener("keydown", (ev) => {
