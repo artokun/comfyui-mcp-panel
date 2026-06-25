@@ -672,12 +672,30 @@ function summarizeNode(node) {
     type: out.type,
     links: out.links?.length ?? 0,
   }));
+  // True RENDERED footprint height for layout. node.size[1] is the BODY only
+  // (slots + widgets); the title BAR renders ~30px ABOVE node.pos and isn't in it,
+  // so stacking by size[1] overlaps each node by a header. litegraph's getBounding
+  // returns the full box (title + body, or just the title when collapsed) — stack
+  // with THIS (`full_height`), not size[1].
+  let fullHeight = null;
+  try {
+    if (typeof node.getBounding === "function") {
+      const bb = node.getBounding(new Float32Array(4));
+      if (bb && bb.length >= 4 && Number.isFinite(bb[3])) fullHeight = Math.round(bb[3]);
+    }
+  } catch {
+    /* fall through to the estimate below */
+  }
+  if (fullHeight == null && node.size) {
+    fullHeight = node.flags && node.flags.collapsed ? 30 : Math.round(node.size[1] + 30);
+  }
   const summary = {
     id: node.id,
     type: node.type,
     title: node.title,
     pos: node.pos ? [Math.round(node.pos[0]), Math.round(node.pos[1])] : null,
     size: node.size ? [Math.round(node.size[0]), Math.round(node.size[1])] : null,
+    ...(fullHeight != null ? { full_height: fullHeight } : {}),
     ...(node.flags && node.flags.collapsed ? { collapsed: true } : {}),
     ...(node.color ? { color: node.color } : {}),
     ...(node.bgcolor ? { bgcolor: node.bgcolor } : {}),
