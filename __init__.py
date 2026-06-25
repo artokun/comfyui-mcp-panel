@@ -43,6 +43,29 @@ __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
 
 _BRIDGE_HOST = "127.0.0.1"
 _BRIDGE_PORT = int(os.environ.get("COMFYUI_MCP_BRIDGE_PORT", "9180"))
+
+# Backend -> bridge port map. "claude" keeps today's default (9180) so the
+# existing no-backend path is byte-for-byte unchanged; "codex" gets its own port
+# so both can run side by side. Extend this dict to add backends. The default
+# port (COMFYUI_MCP_BRIDGE_PORT, normally 9180) is treated as the claude port so
+# a custom override still maps to "claude".
+_BACKEND_PORTS = {
+    "claude": _BRIDGE_PORT,
+    "codex": 9181,
+}
+_DEFAULT_BACKEND = "claude"
+
+
+def _backend_port(backend):
+    """Bridge port for a backend id; falls back to the claude/default port."""
+    return _BACKEND_PORTS.get((backend or _DEFAULT_BACKEND).lower(), _BRIDGE_PORT)
+
+
+# Per-backend orchestrator handles, keyed by port, so spawning codex doesn't
+# clobber the tracking of a running claude orchestrator (and vice versa). The
+# legacy single-process global below stays in sync with the claude port entry so
+# the existing /disconnect + atexit teardown keep working unchanged.
+_orchestrator_procs = {}
 _orchestrator_proc = None
 
 
@@ -95,9 +118,25 @@ def _detect_comfyui_path():
     return None
 
 
-def _orchestrator_running():
+def _orchestrator_running(port=None):
     """True if something already owns the bridge port (our spawn or the user's)."""
-    return _port_in_use(_BRIDGE_HOST, _BRIDGE_PORT)
+    return _port_in_use(_BRIDGE_HOST, port if port is not None else _BRIDGE_PORT)
+
+
+def _backend_status(backend):
+    """{"backend", "port", "running"} for a backend. "running" means an
+    orchestrator is reachable on its port: prefer the lockfile (present + its pid
+    alive), but a lockfile-less process holding the port still counts as running so
+    a user-managed orchestrator isn't reported dead."""
+    port = _backend_port(backend)
+    lock = _read_lock(port)
+    if lock and _pid_alive(lock.get("pid")):
+        running = True
+    else:
+        # No (valid) lockfile — fall back to a raw port probe (covers a user-run
+        # orchestrator or one started before lockfiles).
+        running = _orchestrator_running(port)
+    return {"backend": backend, "port": port, "running": running}
 
 
 # ---------------------------------------------------------------------------
@@ -107,15 +146,16 @@ def _orchestrator_running():
 # dead) and replace it on Connect — so a restart never gets trapped talking to a
 # stale agent on old code.
 # ---------------------------------------------------------------------------
-def _lock_path():
+def _lock_path(port=None):
     return os.path.join(
-        tempfile.gettempdir(), "comfyui-mcp-panel-orch-{}.json".format(_BRIDGE_PORT)
+        tempfile.gettempdir(),
+        "comfyui-mcp-panel-orch-{}.json".format(port if port is not None else _BRIDGE_PORT),
     )
 
 
-def _read_lock():
+def _read_lock(port=None):
     try:
-        with open(_lock_path(), "r") as fh:
+        with open(_lock_path(port), "r") as fh:
             data = json.load(fh)
         return data if isinstance(data, dict) else None
     except Exception:
@@ -340,11 +380,11 @@ def _kill_orchestrator_tree(pid, started_at_ms=None):
     return True
 
 
-def _delete_lock():
+def _delete_lock(port=None):
     """Remove the orchestrator lockfile (best-effort) so a fresh orchestrator
     self-registers cleanly after a hard restart."""
     try:
-        os.remove(_lock_path())
+        os.remove(_lock_path(port))
     except Exception:
         pass
 
@@ -371,16 +411,25 @@ def _port_owner_pid(host, port):
     return None
 
 
-def _start_orchestrator():
+def _start_orchestrator(backend=_DEFAULT_BACKEND, port=None):
     """Start the panel orchestrator on demand. Returns (ok: bool, message: str).
 
     Called only from the Connect route — i.e. an explicit user action — never at
     import time. Idempotent: if the bridge port is already owned, it's a no-op.
+
+    `backend` selects the provider ("claude" default | "codex"); `port` is the
+    bridge port it should own (defaults to the backend's mapped port). The default
+    call — ``_start_orchestrator()`` → claude on _BRIDGE_PORT (9180) — is the
+    historical no-backend path, byte-for-byte unchanged.
     """
     global _orchestrator_proc
 
-    if _orchestrator_running():
-        lock = _read_lock()
+    backend = (backend or _DEFAULT_BACKEND).lower()
+    if port is None:
+        port = _backend_port(backend)
+
+    if _orchestrator_running(port):
+        lock = _read_lock(port)
         parent = lock.get("parent") if lock else None
         opid = lock.get("pid") if lock else None
         # Healthy + ours (our ComfyUI launched it and its pid is alive) → reuse.
@@ -399,7 +448,7 @@ def _start_orchestrator():
                 return False, (
                     "the panel bridge port {} is owned by another live ComfyUI "
                     "(pid {}). Close it or set COMFYUI_MCP_BRIDGE_PORT to a "
-                    "different port for this instance.".format(_BRIDGE_PORT, parent)
+                    "different port for this instance.".format(port, parent)
                 )
             # Our orchestrator but not healthy (orphaned ComfyUI, or wedged) → reclaim.
             reclaim_pid, reclaim_started = opid, lock.get("pidStartedAt")
@@ -407,14 +456,14 @@ def _start_orchestrator():
             # No (valid) lockfile, or its pid is dead, but the port is held. Find
             # the actual port owner: a lockfile-less panel-orchestrator ZOMBIE (the
             # "won't reconnect" bug) gets reclaimed; a truly foreign process is left.
-            owner = _port_owner_pid(_BRIDGE_HOST, _BRIDGE_PORT)
+            owner = _port_owner_pid(_BRIDGE_HOST, port)
             if owner and _is_orchestrator_process(owner):
                 reclaim_pid = owner
             elif owner:
                 return False, (
                     "the panel bridge port {} is held by another process that isn't a "
                     "panel orchestrator. Close it, or set COMFYUI_MCP_BRIDGE_PORT to a "
-                    "free port.".format(_BRIDGE_PORT)
+                    "free port.".format(port)
                 )
             # owner unknown (couldn't read) → fall through; the bind will fail loudly
             # if the port really is still held.
@@ -422,17 +471,17 @@ def _start_orchestrator():
         if reclaim_pid is not None:
             if _no_autospawn():
                 return True, "reconnecting to your orchestrator"  # user-managed; don't kill
-            _log("reclaiming panel bridge port {} from orchestrator pid {}".format(_BRIDGE_PORT, reclaim_pid))
+            _log("reclaiming panel bridge port {} from orchestrator pid {}".format(port, reclaim_pid))
             _kill_orchestrator_tree(reclaim_pid, reclaim_started)
-            _delete_lock()
+            _delete_lock(port)
             for _ in range(20):
-                if not _port_in_use(_BRIDGE_HOST, _BRIDGE_PORT):
+                if not _port_in_use(_BRIDGE_HOST, port):
                     break
                 time.sleep(0.1)
-            if _port_in_use(_BRIDGE_HOST, _BRIDGE_PORT):
+            if _port_in_use(_BRIDGE_HOST, port):
                 return False, (
                     "the panel bridge port {} is still held and couldn't be freed — "
-                    "fully restart ComfyUI.".format(_BRIDGE_PORT)
+                    "fully restart ComfyUI.".format(port)
                 )
         # Port freed (or never really held) — fall through and spawn a fresh one.
 
@@ -461,8 +510,12 @@ def _start_orchestrator():
     _parent_started_at = _current_process_started_at_ms()
     if _parent_started_at is not None:
         env["COMFYUI_MCP_PARENT_STARTED_AT_MS"] = str(_parent_started_at)
-    # Pin the orchestrator to the PANEL bridge port (9180 by default).
-    env["COMFYUI_MCP_BRIDGE_PORT"] = str(_BRIDGE_PORT)
+    # Pin the orchestrator to its bridge port (claude=9180 default, codex=9181).
+    env["COMFYUI_MCP_BRIDGE_PORT"] = str(port)
+    # Select the agent backend. Only set when non-default so the claude path emits
+    # the exact same env it always has (the orchestrator defaults to claude too).
+    if backend != _DEFAULT_BACKEND:
+        env["PANEL_AGENT_BACKEND"] = backend
     # Subscription lane: the background agent authenticates via the on-disk Claude
     # login, never an API key.
     env.pop("ANTHROPIC_API_KEY", None)
@@ -477,20 +530,38 @@ def _start_orchestrator():
         kwargs["start_new_session"] = True
 
     try:
-        _orchestrator_proc = subprocess.Popen(cmd, **kwargs)
+        proc = subprocess.Popen(cmd, **kwargs)
     except Exception as exc:  # noqa: BLE001 - surface any spawn failure to the user
         return False, "could not start the panel orchestrator: {}".format(exc)
 
+    _orchestrator_procs[port] = proc
+    # Keep the legacy single-process global pointing at the default (claude) port's
+    # proc, so the existing /disconnect + atexit teardown behave exactly as before.
+    if port == _BRIDGE_PORT:
+        _orchestrator_proc = proc
+
     atexit.register(_stop_orchestrator)
     _log(
-        "started the panel orchestrator (pid {}) on ws://{}:{} — runs on your "
-        "Claude subscription.".format(_orchestrator_proc.pid, _BRIDGE_HOST, _BRIDGE_PORT)
+        "started the panel orchestrator (pid {}) on ws://{}:{} (backend={}) — runs "
+        "on your subscription.".format(proc.pid, _BRIDGE_HOST, port, backend)
     )
-    return True, "started (pid {})".format(_orchestrator_proc.pid)
+    return True, "started (pid {})".format(proc.pid)
 
 
 def _stop_orchestrator():
+    """Terminate orchestrators THIS pack spawned. Stops every tracked backend
+    process (claude on 9180, codex on 9181, …); a user-run orchestrator we never
+    spawned is left running."""
     global _orchestrator_proc
+    for proc in list(_orchestrator_procs.values()):
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+    _orchestrator_procs.clear()
+    # Cover the legacy global too (it always aliases the default-port proc, but be
+    # defensive in case it was set without a matching map entry).
     if _orchestrator_proc and _orchestrator_proc.poll() is None:
         try:
             _orchestrator_proc.terminate()
@@ -610,11 +681,51 @@ def _register_routes():
             }
         )
 
+    @routes.get("/comfyui_mcp_panel/backends")
+    async def _backends(_request):
+        # Discovery for the panel's backend picker: each known backend with its
+        # mapped port and whether an orchestrator is currently running there.
+        return web.json_response(
+            {"backends": [_backend_status(b) for b in _BACKEND_PORTS]}
+        )
+
     @routes.post("/comfyui_mcp_panel/connect")
     async def _connect(_request):
-        ok, message = _start_orchestrator()
+        # Backend selector: ?backend=codex query param OR {"backend": "codex"} JSON
+        # body. Absent → "claude" (back-compat: the historical no-arg Connect path).
+        backend = _request.query.get("backend")
+        if not backend:
+            try:
+                body = await _request.json()
+                if isinstance(body, dict):
+                    backend = body.get("backend")
+            except Exception:
+                backend = None
+        # Reject a non-string backend with a clean 400 (e.g. {"backend": 123})
+        # rather than letting .lower() raise a 500.
+        if backend is not None and not isinstance(backend, str):
+            return web.json_response(
+                {"ok": False, "message": "backend must be a string"}, status=400
+            )
+        backend = (backend or _DEFAULT_BACKEND).lower()
+        if backend not in _BACKEND_PORTS:
+            return web.json_response(
+                {"ok": False, "message": "unknown backend '{}'".format(backend)},
+                status=400,
+            )
+        port = _backend_port(backend)
+        ok, message = _start_orchestrator(backend=backend, port=port)
         return web.json_response(
-            {"ok": ok, "running": _orchestrator_running(), "port": _BRIDGE_PORT, "message": message},
+            {
+                "ok": ok,
+                "running": _orchestrator_running(port),
+                "backend": backend,
+                "port": port,
+                # The exact ws URL the panel should connect to — so the user never
+                # types a port.
+                "bridge_url": "ws://{}:{}".format(_BRIDGE_HOST, port),
+                "message": message,
+            },
             status=200 if ok else 503,
         )
 
