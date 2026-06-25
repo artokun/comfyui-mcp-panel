@@ -939,13 +939,19 @@ const GRAPH_TOOL_EXECUTORS = {
     // than let the whole load fail validation.
     const AUX_ID_RE = /^[^/\s]+\/[^/\s]+$/;
     let auxSanitized = 0;
-    for (const n of clone.nodes) {
-      const aux = n?.properties?.aux_id;
-      if (aux != null && !(typeof aux === "string" && AUX_ID_RE.test(aux))) {
-        delete n.properties.aux_id;
-        auxSanitized++;
+    const sanitizeNodes = (nodes) => {
+      for (const n of nodes || []) {
+        const aux = n?.properties?.aux_id;
+        if (aux != null && !(typeof aux === "string" && AUX_ID_RE.test(aux))) {
+          delete n.properties.aux_id;
+          auxSanitized++;
+        }
       }
-    }
+    };
+    sanitizeNodes(clone.nodes);
+    // Recurse into subgraph DEFINITIONS — their inner nodes (e.g. KJNodes
+    // Get/Set) carry the same malformed aux_id and would fail validation too.
+    for (const sg of clone.definitions?.subgraphs ?? []) sanitizeNodes(sg.nodes);
     // Snapshot the current graph FIRST so the load is undoable via the per-turn
     // revert (double-Esc / revert), like every other graph edit this turn.
     captureGraphSnapshot(null, "before graph_load");
