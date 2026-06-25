@@ -1742,6 +1742,40 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
+  // Update an ALREADY-INSTALLED pack to latest/nightly via the built-in Manager.
+  // Mirrors nodes_install but uses the Manager's "update" task kind. The Manager
+  // identifies the installed pack by `node_name` (its pack id / dir name); we
+  // also pass selected_version so 'nightly' pulls the newest commit. Returns the
+  // queued ui_id so panel_node_queue_status can poll the same queue.
+  async graph_update_node({ id, version, channel, mode }) {
+    if (!id) throw new Error("id (installed pack name/dir or registry id) is required");
+    const sel = version === "nightly" ? "nightly" : "latest";
+    const params = {
+      // The Manager's update task keys off node_name; include id too for
+      // correlation parity with install (harmless if the server ignores it).
+      node_name: id,
+      id,
+      selected_version: sel,
+      version: sel,
+      mode: mode || "remote",
+      channel: channel || "default",
+    };
+    const ui_id = crypto.randomUUID();
+    const client_id = api.clientId ?? api.initialClientId ?? "comfyui-mcp-panel";
+    await managerV2("manager/queue/task", {
+      method: "POST",
+      body: { kind: "update", params, ui_id, client_id },
+    });
+    await managerV2("manager/queue/start", { method: "POST" });
+    return {
+      queued: true,
+      ui_id,
+      id,
+      version: sel,
+      note: "Update queued. Poll nodes_queue_status; a ComfyUI restart (comfy_reboot) is usually required to load the updated node.",
+    };
+  },
+
   async nodes_queue_status() {
     return { status: await managerV2("manager/queue/status") };
   },
