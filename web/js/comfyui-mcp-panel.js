@@ -3620,6 +3620,17 @@ function buildPanel() {
     scrollLog();
   }
 
+  /** Decide whether a ComfyUI output descriptor is a VIDEO (render <video>) vs an
+   *  image (<img>). ComfyUI groups video outputs under `gifs`/`videos` and tags
+   *  them with a `format` like "video/h264-mp4" (vs "image/gif" for animated gifs,
+   *  which still render fine in <img>). Fall back to the filename extension. */
+  function isVideoOutput(m) {
+    const fmt = String(m?.format || "").toLowerCase();
+    if (fmt.startsWith("video/")) return true;
+    if (fmt.startsWith("image/")) return false; // incl. image/gif → animate in <img>
+    return /\.(mp4|webm|mov|mkv|m4v|avi)$/i.test(String(m?.filename || ""));
+  }
+
   /**
    * Render an interactive question card and resolve with the user's pick.
    * `msg` = { question, header?, options:[{label, description?}], multi_select? }.
@@ -4682,15 +4693,22 @@ function buildPanel() {
   // if no session is attending). On error, notify the agent to diagnose.
   function onExecuted(ev) {
     const d = ev?.detail ?? {};
-    const images = (d.output && d.output.images) || [];
-    if (!images.length) return;
-    for (const img of images) {
-      if (img && img.filename) paintImage(imageViewUrl(img), img.filename);
+    const out = d.output || {};
+    // ComfyUI groups a node's outputs by kind: `images`, plus `gifs`/`videos` for
+    // VHS-style video nodes (e.g. LTX → VHS_VideoCombine). Render each by type so a
+    // video isn't shown as a broken <img>.
+    const media = [...(out.images || []), ...(out.gifs || []), ...(out.videos || [])];
+    if (!media.length) return;
+    for (const m of media) {
+      if (!m || !m.filename) continue;
+      const url = imageViewUrl(m);
+      if (isVideoOutput(m)) paintVideo(url, m.filename);
+      else paintImage(url, m.filename);
     }
     client.sendFrame({
       type: "agent_event",
       kind: "executed",
-      images,
+      images: media,
       node_id: d.node ?? d.display_node ?? null,
     });
   }
