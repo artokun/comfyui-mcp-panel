@@ -930,12 +930,31 @@ const GRAPH_TOOL_EXECUTORS = {
     if (typeof app.loadGraphData !== "function") {
       throw new Error("app.loadGraphData is unavailable on this frontend");
     }
+    // Deep-clone so the loaded graph can't be mutated by, nor mutate, the source.
+    const clone = JSON.parse(JSON.stringify(data));
+    // Sanitize node metadata that ComfyUI's workflow zod schema rejects, so an
+    // imperfect pack/template still loads instead of erroring out. `aux_id` must be
+    // 'github-user/repo-name' (or absent) — packs/exports sometimes carry a bare
+    // node name (e.g. "GetNode"/"SetNode"); drop those invalid install-hints rather
+    // than let the whole load fail validation.
+    const AUX_ID_RE = /^[^/\s]+\/[^/\s]+$/;
+    let auxSanitized = 0;
+    for (const n of clone.nodes) {
+      const aux = n?.properties?.aux_id;
+      if (aux != null && !(typeof aux === "string" && AUX_ID_RE.test(aux))) {
+        delete n.properties.aux_id;
+        auxSanitized++;
+      }
+    }
     // Snapshot the current graph FIRST so the load is undoable via the per-turn
     // revert (double-Esc / revert), like every other graph edit this turn.
     captureGraphSnapshot(null, "before graph_load");
-    // Deep-clone so the loaded graph can't be mutated by, nor mutate, the source.
-    app.loadGraphData(JSON.parse(JSON.stringify(data)));
-    return { loaded: true, node_count: data.nodes.length };
+    app.loadGraphData(clone);
+    return {
+      loaded: true,
+      node_count: clone.nodes.length,
+      ...(auxSanitized ? { aux_id_sanitized: auxSanitized } : {}),
+    };
   },
 
   graph_connect({ from_node_id, from_output, to_node_id, to_input }) {
