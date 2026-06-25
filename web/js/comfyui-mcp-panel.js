@@ -67,6 +67,10 @@ function setupListeners() {
 // localStorage-backed settings.
 // ---------------------------------------------------------------------------
 const STORAGE_KEY_BRIDGE = "comfyui-mcp.panel.bridgeUrl";
+// The agent backend the user last picked ("claude" | "codex"). Drives which chip
+// is highlighted in the connection settings. Default "claude" keeps the existing
+// no-pick behavior.
+const STORAGE_KEY_BACKEND = "comfyui-mcp.panel.backend";
 // The panel orchestrator owns a DEDICATED bridge port (9180) — so a stray
 // process in another session can never sit on the panel's port and produce a
 // "connected but no agent" lie.
@@ -224,6 +228,8 @@ const FALLBACK_MODELS = [
 ];
 // Friendly copy for known effort ids; unknown ids fall back to a capitalized id.
 const EFFORT_META = {
+  none: { label: "None", small: "no reasoning" },
+  minimal: { label: "Minimal", small: "fastest" },
   low: { label: "Low", small: "quick" },
   medium: { label: "Medium", small: "default" },
   high: { label: "High", small: "thorough" },
@@ -231,6 +237,40 @@ const EFFORT_META = {
   max: { label: "Max", small: "exhaustive" },
 };
 const ALL_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+
+// Per-provider reasoning-effort scales. Claude and Codex (ChatGPT) accept
+// DIFFERENT levels, so the dropdown must offer the valid set for the connected
+// backend — and a chosen level must survive a provider switch by mapping to the
+// nearest valid level for the target (the orchestrator backends do the same
+// mapping server-side; this keeps the picker honest about what's selectable).
+//   • Claude: low | medium | high | xhigh | max
+//   • Codex:  none | minimal | low | medium | high | xhigh
+const BACKEND_EFFORTS = {
+  claude: ["low", "medium", "high", "xhigh", "max"],
+  codex: ["none", "minimal", "low", "medium", "high", "xhigh"],
+};
+// Ordered low→high across BOTH scales, for nearest-level mapping on a switch.
+const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+/** Map an effort to the nearest VALID level for `backend`. Shared levels pass
+ *  through 1:1; an off-scale source (e.g. Claude "max" → Codex "xhigh", or
+ *  Codex "none"/"minimal" → Claude "low") snaps to the closest by ordered rank. */
+function mapEffortToBackend(effort, backend) {
+  const valid = BACKEND_EFFORTS[backend] || BACKEND_EFFORTS.claude;
+  if (!effort) return effort;
+  if (valid.includes(effort)) return effort;
+  const srcRank = EFFORT_ORDER.indexOf(effort);
+  if (srcRank < 0) return valid[0];
+  let best = valid[0];
+  let bestDist = Infinity;
+  for (const v of valid) {
+    const d = Math.abs(EFFORT_ORDER.indexOf(v) - srcRank);
+    if (d < bestDist) {
+      bestDist = d;
+      best = v;
+    }
+  }
+  return best;
+}
 
 /** Normalize a ModelInfo list (or the fallback) to picker rows. `efforts`:
  *  an array of effort ids, or null when the model supports effort but didn't
@@ -430,6 +470,129 @@ function getPromotionStore() {
     throw new Error("widget-promotion unavailable on this ComfyUI frontend (no 'promotion' store)");
   }
   return store;
+}
+
+function uniqueSubgraphInputName(subgraph, baseName) {
+  const names = new Set((subgraph?.inputs ?? []).map((input) => input?.name).filter(Boolean));
+  if (!names.has(baseName)) return baseName;
+  let i = 1;
+  while (names.has(`${baseName}_${i}`)) i++;
+  return `${baseName}_${i}`;
+}
+
+function getWidgetSlot(node, widget) {
+  if (typeof node.getSlotFromWidget === "function") return node.getSlotFromWidget(widget);
+  return (node.inputs ?? []).find((input) => input?.widget?.name === widget.name);
+}
+
+function resolveSubgraphLink(subgraph, linkId) {
+  const link =
+    typeof subgraph?.getLink === "function"
+      ? subgraph.getLink(linkId)
+      : (subgraph?.links ?? []).find((entry) => Number(entry?.id ?? entry?.[0]) === Number(linkId));
+  if (!link) return null;
+  if (typeof link.resolve === "function") return link.resolve(subgraph);
+
+  const originId = link.origin_id ?? link[1];
+  const originSlot = link.origin_slot ?? link[2];
+  const targetId = link.target_id ?? link[3];
+  const targetSlot = link.target_slot ?? link[4];
+  const inputNode = subgraph.getNodeById?.(targetId);
+  const outputNode = subgraph.getNodeById?.(originId);
+  return {
+    inputNode,
+    input: inputNode?.inputs?.[targetSlot],
+    outputNode,
+    output: outputNode?.outputs?.[originSlot],
+  };
+}
+
+function sourceForSubgraphInput(subgraphNode, subgraphInput) {
+  for (const linkId of subgraphInput?.linkIds ?? []) {
+    const resolved = resolveSubgraphLink(subgraphNode.subgraph, linkId);
+    const inputNode = resolved?.inputNode;
+    const targetInput = resolved?.input;
+    if (!inputNode || !targetInput) continue;
+    const targetWidget =
+      typeof inputNode.getWidgetFromSlot === "function"
+        ? inputNode.getWidgetFromSlot(targetInput)
+        : inputNode.widgets?.find((widget) => widget?.name === targetInput.widget?.name);
+    return {
+      sourceNodeId: String(inputNode.id),
+      sourceWidgetName: targetWidget?.name ?? targetInput.name,
+    };
+  }
+  return null;
+}
+
+function findPromotedHostInput(subgraphNode, source) {
+  return (subgraphNode.inputs ?? []).find((input) => {
+    const subgraphInput = input?._subgraphSlot;
+    if (!subgraphInput) return false;
+    const linkedSource = sourceForSubgraphInput(subgraphNode, subgraphInput);
+    return (
+      linkedSource?.sourceNodeId === source.sourceNodeId &&
+      linkedSource.sourceWidgetName === source.sourceWidgetName
+    );
+  });
+}
+
+function promoteWidgetByLink(subgraphNode, sourceNode, sourceWidget) {
+  const subgraph = subgraphNode.subgraph;
+  if (!subgraph || typeof subgraph.addInput !== "function") {
+    throw new Error("link-only promotion unavailable on this frontend (missing subgraph.addInput)");
+  }
+
+  const source = { sourceNodeId: String(sourceNode.id), sourceWidgetName: sourceWidget.name };
+  if (findPromotedHostInput(subgraphNode, source)) return { changed: false };
+
+  const sourceSlot = getWidgetSlot(sourceNode, sourceWidget);
+  if (!sourceSlot) {
+    throw new Error(`Widget "${sourceWidget.name}" is not backed by a connectable input slot`);
+  }
+
+  const inputName = uniqueSubgraphInputName(subgraph, sourceWidget.name);
+  const inputType = String(sourceSlot.type ?? sourceWidget.type ?? "*");
+  const subgraphInput = subgraph.addInput(inputName, inputType);
+  subgraphInput.label = sourceSlot.label;
+
+  const link =
+    typeof subgraphInput.connect === "function" ? subgraphInput.connect(sourceSlot, sourceNode) : null;
+
+  if (!link) {
+    subgraph.removeInput?.(subgraphInput);
+    throw new Error(`Could not link subgraph input "${inputName}" to widget "${sourceWidget.name}"`);
+  }
+
+  const hostInput = (subgraphNode.inputs ?? []).find((input) => input?._subgraphSlot === subgraphInput);
+  if (hostInput) hostInput.label = sourceSlot.label;
+  subgraphNode.invalidatePromotedViews?.();
+  return { changed: true, input: inputName };
+}
+
+function demoteWidgetByLink(subgraphNode, source) {
+  const hostInput = findPromotedHostInput(subgraphNode, source);
+  const subgraphInput = hostInput?._subgraphSlot;
+  if (!subgraphInput) return { changed: false };
+
+  if (hostInput.link != null && typeof subgraphInput.disconnect === "function") {
+    subgraphInput.disconnect();
+  } else if (typeof subgraphNode.subgraph?.removeInput === "function") {
+    subgraphNode.subgraph.removeInput(subgraphInput);
+  } else {
+    throw new Error("link-only demotion unavailable on this frontend (missing subgraph.removeInput)");
+  }
+
+  subgraphNode.invalidatePromotedViews?.();
+  return { changed: true, input: hostInput.name ?? subgraphInput.name };
+}
+
+function refreshPromotedParents(parents, canvas) {
+  for (const parent of parents) {
+    parent.computeSize?.(parent.size);
+    parent.setDirtyCanvas?.(true, true);
+  }
+  canvas?.setDirty?.(true, true);
 }
 
 /** Where is the user looking right now — root graph or inside a subgraph? */
@@ -727,6 +890,52 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     graph.setDirtyCanvas(true, true);
     return { cleared: nodes.length };
+  },
+
+  // Load a COMPLETE workflow onto the live canvas in one shot (replaces the
+  // current graph), so a ready pack/template graph lands without recreating it
+  // node-by-node. Mirrors restoreSnapshot's app.loadGraphData(...) path.
+  graph_load({ graph: incoming } = {}) {
+    const { app } = getGraphCtx();
+    // Accept a JSON string or an object.
+    let data = incoming;
+    if (typeof data === "string") {
+      try {
+        data = JSON.parse(data);
+      } catch (err) {
+        throw new Error(`graph is not valid JSON: ${err?.message ?? err}`);
+      }
+    }
+    if (!data || typeof data !== "object") {
+      throw new Error("graph (object or JSON string) is required");
+    }
+    // Validate UI/litegraph format. The live canvas loads UI-format graphs
+    // (top-level `nodes` array); API/prompt format (top-level numeric keys, each
+    // an object with `class_type`) is NOT loadable here.
+    if (!Array.isArray(data.nodes)) {
+      const keys = Object.keys(data);
+      const looksLikeApi =
+        keys.length > 0 &&
+        keys.every((k) => /^\d+$/.test(k)) &&
+        keys.some((k) => data[k] && typeof data[k] === "object" && "class_type" in data[k]);
+      if (looksLikeApi) {
+        throw new Error(
+          "workflow is in API/prompt format; provide the UI workflow JSON (the pack workflow.json is UI format)",
+        );
+      }
+      throw new Error(
+        "graph is not a UI workflow (missing a `nodes` array). Provide the UI workflow JSON.",
+      );
+    }
+    if (typeof app.loadGraphData !== "function") {
+      throw new Error("app.loadGraphData is unavailable on this frontend");
+    }
+    // Snapshot the current graph FIRST so the load is undoable via the per-turn
+    // revert (double-Esc / revert), like every other graph edit this turn.
+    captureGraphSnapshot(null, "before graph_load");
+    // Deep-clone so the loaded graph can't be mutated by, nor mutate, the source.
+    app.loadGraphData(JSON.parse(JSON.stringify(data)));
+    return { loaded: true, node_count: data.nodes.length };
   },
 
   graph_connect({ from_node_id, from_output, to_node_id, to_input }) {
@@ -1419,26 +1628,35 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!parents.length) {
       throw new Error("Could not locate the parent subgraph node for the open subgraph.");
     }
-    const store = getPromotionStore();
     const source = { sourceNodeId: String(node.id), sourceWidgetName: w.name };
     const action = demote ? "demote" : "promote";
+    let strategy = "link-only";
     graph.beforeChange?.();
     try {
-      for (const p of parents) {
-        const rootGraphId = p.rootGraph?.id ?? rootGraph?.id;
-        store[action](rootGraphId, p.id, source);
-        // Recompute the parent node so the (un)promoted widget shows immediately.
-        p.computeSize?.(p.size);
-        p.setDirtyCanvas?.(true, true);
+      try {
+        let changed = false;
+        for (const p of parents) {
+          const result = demote ? demoteWidgetByLink(p, source) : promoteWidgetByLink(p, node, w);
+          changed = changed || result.changed;
+        }
+        if (demote && !changed) throw new Error("link-only promoted input not found");
+      } catch (linkErr) {
+        const store = getPromotionStore();
+        strategy = "legacy-store";
+        for (const p of parents) {
+          const rootGraphId = p.rootGraph?.id ?? rootGraph?.id;
+          store[action](rootGraphId, p.id, source);
+        }
       }
+      refreshPromotedParents(parents, canvas);
     } finally {
       graph.afterChange?.();
     }
-    canvas?.setDirty?.(true, true);
     return {
       [demote ? "demoted" : "promoted"]: w.name,
       from_node: node.id,
       on_subgraph_nodes: parents.map((p) => p.id),
+      strategy,
     };
   },
 
@@ -1672,7 +1890,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // the socket, so it's the moment we truthfully flip to "connected".
       if (msg && msg.type === "models" && Array.isArray(msg.models)) {
         markConnected();
-        onModels?.(msg.models, typeof msg.current === "string" ? msg.current : undefined);
+        onModels?.(
+          msg.models,
+          typeof msg.current === "string" ? msg.current : undefined,
+          typeof msg.backend === "string" ? msg.backend : undefined,
+        );
       }
       // SDK slash commands (built-ins like /compact, plus any loaded skills) —
       // surfaced in the composer's completion menu.
@@ -2556,6 +2778,67 @@ function buildPanel() {
   const settingsBody = document.createElement("div");
   settingsBody.className = "cmcp-settings-body";
 
+  // ---- backend picker ----
+  // "Pick a backend, not a port": chips for each discovered backend (Claude /
+  // ChatGPT). Clicking one asks the pack to ensure that backend's orchestrator is
+  // running and returns the bridge URL to connect to — the user never types a
+  // port. Populated from GET /comfyui_mcp_panel/backends when settings open.
+  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT" };
+  const backendLabel = document.createElement("label");
+  backendLabel.className = "cmcp-label";
+  backendLabel.textContent = "Agent backend";
+  const backendChips = document.createElement("div");
+  backendChips.className = "cmcp-backend-chips";
+  backendChips.style.cssText =
+    "display:flex;gap:0.375rem;flex-wrap:wrap;margin-bottom:0.5rem;";
+  // The backend the user last picked (so the active chip is highlighted across
+  // reopens). Defaults to claude for back-compat.
+  let selectedBackend = (() => {
+    try {
+      return window.localStorage.getItem(STORAGE_KEY_BACKEND) || "claude";
+    } catch {
+      return "claude";
+    }
+  })();
+  // The backend we're actually CONNECTED to (set from the handshake). Used to
+  // detect a real provider switch (vs. re-picking the current one).
+  let connectedBackend = null;
+
+  function renderBackendChips(backends) {
+    backendChips.replaceChildren();
+    const list =
+      Array.isArray(backends) && backends.length
+        ? backends
+        : [{ backend: "claude", running: false }];
+    for (const b of list) {
+      const id = b.backend;
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "cmcp-btn cmcp-backend-chip";
+      chip.dataset.backend = id;
+      chip.textContent = BACKEND_LABELS[id] || id;
+      if (b.running) chip.title = "Running";
+      if (id === selectedBackend) {
+        chip.style.cssText =
+          "background:var(--p-primary-color,#2563eb);color:var(--p-primary-contrast-color,#fff);border-color:transparent;";
+      }
+      chip.addEventListener("click", () => connectBackend(id));
+      backendChips.appendChild(chip);
+    }
+  }
+  // Initial paint with the default before discovery lands.
+  renderBackendChips(null);
+
+  async function loadBackends() {
+    try {
+      const res = await api.fetchApi("/comfyui_mcp_panel/backends");
+      const data = await res.json().catch(() => ({}));
+      if (Array.isArray(data?.backends)) renderBackendChips(data.backends);
+    } catch {
+      // No /backends route (older host) — keep the default single chip.
+    }
+  }
+
   const urlLabel = document.createElement("label");
   urlLabel.className = "cmcp-label";
   urlLabel.textContent = "Bridge URL";
@@ -2607,7 +2890,24 @@ function buildPanel() {
   });
   helpDiv.appendChild(helpCmd);
 
-  settingsBody.append(urlLabel, urlInput, btnRow, helpDiv);
+  // Bridge URL is now an ADVANCED/fallback control — the backend chips set the URL
+  // for you. Keep it (collapsed) for manual/user-managed orchestrators.
+  const advWrap = document.createElement("div");
+  advWrap.className = "cmcp-advanced";
+  advWrap.append(urlLabel, urlInput);
+  advWrap.hidden = true;
+  const advToggle = document.createElement("button");
+  advToggle.type = "button";
+  advToggle.className = "cmcp-link";
+  advToggle.textContent = "Advanced ▸";
+  advToggle.style.cssText =
+    "background:none;border:none;padding:0;cursor:pointer;color:var(--p-text-muted-color,#888);font-size:0.8em;text-align:left;";
+  advToggle.addEventListener("click", () => {
+    advWrap.hidden = !advWrap.hidden;
+    advToggle.textContent = advWrap.hidden ? "Advanced ▸" : "Advanced ▾";
+  });
+
+  settingsBody.append(backendLabel, backendChips, btnRow, advToggle, advWrap, helpDiv);
   settingsBox.appendChild(settingsBody);
   // Lives in the header as a dropdown anchored under the status pill.
   header.appendChild(settingsBox);
@@ -2615,6 +2915,8 @@ function buildPanel() {
     e.stopPropagation();
     histPop.hidden = true;
     settingsBox.hidden = !settingsBox.hidden;
+    // Refresh the backend chips (running status) each time settings open.
+    if (!settingsBox.hidden) void loadBackends();
   });
 
   // ---- Message log + empty state ----
@@ -2882,7 +3184,11 @@ function buildPanel() {
 
   const input = document.createElement("textarea");
   input.className = "cmcp-composer-input";
-  input.placeholder = "Ask Claude… / for commands, @ for context";
+  // Placeholder reflects the active backend ("Ask Claude…" / "Ask ChatGPT…").
+  function setAskPlaceholder(id) {
+    input.placeholder = `Ask ${BACKEND_LABELS[id] || "Claude"}… / for commands, @ for context`;
+  }
+  setAskPlaceholder(selectedBackend);
   input.rows = 1;
 
   const row = document.createElement("div");
@@ -2948,12 +3254,22 @@ function buildPanel() {
   let modelCatalog = presentableModels(normalizeModels(FALLBACK_MODELS));
   if (!prefs.model) prefs.model = pickDefaultModel(modelCatalog);
 
-  /** The effort ids offered for the currently-selected model. */
+  /** The effort ids offered for the currently-selected model. Driven primarily by
+   *  the connected backend's scale (Claude vs. Codex offer different levels), so a
+   *  Codex session shows none/minimal/… and a Claude session shows …/max. Falls
+   *  back to the model row's enumerated levels, then the full Claude set. */
   function effortsForModel(id) {
+    const backend = connectedBackend || selectedBackend;
+    const scale = BACKEND_EFFORTS[backend] || ALL_EFFORTS;
     const row = modelCatalog.find((m) => m.id === id);
-    if (!row) return ALL_EFFORTS;
-    if (row.efforts === null) return ALL_EFFORTS; // supports effort, levels unknown
-    return row.efforts; // explicit list (possibly empty = no effort control)
+    // Explicit model metadata wins over the provider default: [] = this model has
+    // NO effort control (hide the selector); a non-empty list is intersected with
+    // the provider's scale. row.efforts === null (supports effort, levels unknown)
+    // or no catalog row → fall back to the provider scale.
+    if (row && Array.isArray(row.efforts)) {
+      return row.efforts.length ? row.efforts.filter((e) => scale.includes(e)) : [];
+    }
+    return scale;
   }
 
   const modelChip = document.createElement("button");
@@ -3053,8 +3369,15 @@ function buildPanel() {
     if (!modelCatalog.some((m) => m.id === prefs.model)) {
       prefs.model = pickDefaultModel(modelCatalog);
     }
-    if (prefs.effort && !effortsForModel(prefs.model).includes(prefs.effort)) {
-      prefs.effort = undefined;
+    // Preserve the user's chosen effort across a backend switch: the new backend's
+    // scale may not contain the exact level, so MAP it to the nearest valid one
+    // (Claude "max" → Codex "xhigh", Codex "none"/"minimal" → Claude "low") instead
+    // of dropping it. Only clear it if it maps to nothing (no effort control).
+    if (prefs.effort) {
+      const backend = connectedBackend || selectedBackend;
+      const mapped = mapEffortToBackend(prefs.effort, backend);
+      const avail = effortsForModel(prefs.model);
+      prefs.effort = mapped && avail.includes(mapped) ? mapped : undefined;
     }
     savePrefs(prefs);
     refreshModelChip();
@@ -4221,7 +4544,37 @@ function buildPanel() {
       turnAnchors.push(uuid);
       if (turnAnchors.length > 200) turnAnchors.shift();
     },
-    onModels(list) {
+    onModels(list, _current, backend) {
+      // The orchestrator self-reports its backend on the handshake — this is the
+      // AUTHORITATIVE source of which provider we're actually connected to. Resolve
+      // the switch BEFORE applying the catalog, so the effort scale + nearest-level
+      // mapping in applyModelCatalog uses the NEW backend's scale (fix #5).
+      const known = typeof backend === "string" && BACKEND_LABELS[backend];
+      if (known) {
+        // A real provider switch = the connected backend changed AND we were
+        // already connected to something (not the first connect, not a re-pick).
+        const switched = connectedBackend !== null && connectedBackend !== backend;
+        if (switched) {
+          appendSystem(
+            `Switched to ${BACKEND_LABELS[backend]} — sessions aren't shared across providers, so this starts a fresh chat.`,
+          );
+        }
+        selectedBackend = backend;
+        connectedBackend = backend; // authoritative: update from the handshake (fix #4)
+        setAskPlaceholder(backend); // authoritative placeholder per backend (fix #3)
+        try {
+          window.localStorage.setItem(STORAGE_KEY_BACKEND, backend);
+        } catch {
+          /* non-persistent is fine */
+        }
+        renderBackendChips(
+          Array.from(backendChips.querySelectorAll(".cmcp-backend-chip")).map((el) => ({
+            backend: el.dataset.backend,
+            running: el.title === "Running",
+          })),
+        );
+      }
+      // Apply the catalog AFTER the backend is known so effort mapping is correct.
       applyModelCatalog(list);
     },
     onCommands(list) {
@@ -4369,31 +4722,109 @@ function buildPanel() {
   // the post-restart auto-resume. In-flight guard so the multiple callers
   // (button, reconnected event, mount auto-resume) can't double-spawn.
   let connecting = false;
-  async function connectAgent() {
-    if (connecting) return;
+  // Monotonic connect generation: each connectAgent() bumps it and remembers its
+  // own value; a later attempt (e.g. a chip switch) supersedes an in-flight one, so
+  // when the stale POST finally returns it must NOT touch the client (apply a
+  // bridge_url / setUrl / start) — otherwise it could reconnect the PREVIOUS provider
+  // after the user already picked a new one. Only the newest generation wins.
+  let connectGen = 0;
+  // The last ws URL the picker auto-applied (from /connect's bridge_url). Lets us
+  // tell a MANUAL Advanced-URL override apart from an auto-managed one, so a user
+  // who typed their own bridge URL isn't silently overwritten by the backend's port.
+  let lastAutoUrl = "";
+  async function connectAgent(opts = {}) {
+    // A chip pick (opts.fromChip) is an EXPLICIT backend choice — it must always
+    // (re)connect to that backend's port, so it bypasses the in-flight guard (which
+    // a sticky-reconnect could otherwise hold) and the manual-URL override below.
+    if (connecting && !opts.fromChip) return;
+    const myGen = ++connectGen; // newest attempt; stale ones bail before touching client
     connecting = true;
     connectBtn.disabled = true;
     connectBtn.textContent = "Starting…";
     // Honor whatever is typed in the Bridge URL field — Connect previously
     // ignored it (only Reconnect applied it), so editing the port (e.g. 9181)
     // then clicking Connect still hit the old URL. setUrl persists + reconnects.
+    // A non-empty URL that differs from the last auto-applied one is a deliberate
+    // manual override → keep it, and don't let /connect's bridge_url clobber it.
+    // (A chip pick is never a manual override — it always uses the backend's port.)
     const wanted = urlInput.value.trim();
-    if (wanted && wanted !== client.currentUrl()) client.setUrl(wanted);
+    const manualOverride = !opts.fromChip && !!wanted && wanted !== lastAutoUrl;
+    if (manualOverride && wanted !== client.currentUrl()) client.setUrl(wanted);
     try {
-      const res = await api.fetchApi("/comfyui_mcp_panel/connect", { method: "POST" });
+      // Send the selected backend so the pack starts (and points us at) the right
+      // orchestrator. Default "claude" keeps the historical no-pick Connect path.
+      const res = await api.fetchApi("/comfyui_mcp_panel/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ backend: selectedBackend }),
+      });
       const data = await res.json().catch(() => ({}));
+      // A newer connect (e.g. a backend switch) superseded this one while the POST
+      // was in flight — don't let this stale response retarget/reconnect the client.
+      if (myGen !== connectGen) return;
+      // The pack returns the exact ws URL for the chosen backend's port — connect
+      // there so the user never types a port. Skip it if they manually overrode.
+      if (!manualOverride && data?.bridge_url && data.bridge_url !== client.currentUrl()) {
+        client.setUrl(data.bridge_url);
+        urlInput.value = data.bridge_url;
+        lastAutoUrl = data.bridge_url;
+      }
       if (!data?.ok && data?.message) appendSystem(data.message);
     } catch (err) {
+      if (myGen !== connectGen) return; // superseded → swallow the stale error too
       // No /connect route (older/headless host) — fall through and try the
       // bridge directly in case the user started the orchestrator themselves.
       appendSystem(`Couldn't reach ComfyUI to start the agent: ${err?.message ?? err}`);
     } finally {
       connecting = false;
     }
-    // Connect (or keep reconnecting with backoff until the bridge binds).
+    // Connect (or keep reconnecting with backoff until the bridge binds) — unless a
+    // newer attempt has taken over, in which case let IT drive the client.
+    if (myGen !== connectGen) return;
     client.start();
   }
   connectBtn.addEventListener("click", connectAgent);
+
+  // Pick a backend chip → remember it, repaint the chips so it highlights, then
+  // run the normal Connect flow (which now POSTs this backend and follows the
+  // returned bridge URL). The user never types a port.
+  function connectBackend(id) {
+    selectedBackend = id;
+    try {
+      window.localStorage.setItem(STORAGE_KEY_BACKEND, id);
+    } catch {
+      // localStorage unavailable — selection just won't persist.
+    }
+    renderBackendChips(
+      Array.from(backendChips.querySelectorAll(".cmcp-backend-chip")).map((el) => ({
+        backend: el.dataset.backend,
+        running: el.title === "Running",
+      })),
+    );
+    // Switching to a DIFFERENT backend than we're connected to: agent sessions are
+    // NOT shareable across providers, so start FRESH for the new one (fix #2).
+    // Sending the saved (foreign) session id on hello makes the new orchestrator
+    // try to resume a session it doesn't own ("waiting for the panel agent…" +
+    // a spurious re-send). Mirror newChat()'s session-clear so getResume() → null;
+    // the visible chat log stays, only the agent session resets.
+    const switching = connectedBackend !== null && connectedBackend !== id;
+    if (switching) {
+      ssSet(SESSION_KEY, null);
+      if (thread) thread.sessionId = undefined;
+    }
+    // Reflect the picked backend in the composer placeholder immediately; onModels
+    // reaffirms it authoritatively from the handshake (fix #3).
+    setAskPlaceholder(id);
+    // CLEAN TEARDOWN before the (re)connect (fix #1). The old fromChip path bypassed
+    // the in-flight guard, so a chip pick could OVERLAP a sticky-reconnect already
+    // in flight — re-delivering the prior pending message (a visible duplicate) and
+    // starting a reconnect storm that trips the orchestrator's bounded-restart
+    // give-up ("the agent session keeps dropping"). Tearing the bridge down and
+    // clearing the guard first means EXACTLY ONE connect runs for the new backend.
+    client.stop();
+    connecting = false;
+    void connectAgent({ fromChip: true });
+  }
 
   // Soft reload: pick up new code WITHOUT restarting ComfyUI, keeping this
   // conversation. Two scopes:
