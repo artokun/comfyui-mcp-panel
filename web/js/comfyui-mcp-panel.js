@@ -3600,16 +3600,71 @@ function buildPanel() {
     scrollLog();
   }
 
+  // Lazy chat-video manager: only videos currently scrolled into view hold a live
+  // <video> element (autoplaying muted); off-screen ones are swapped for a gray
+  // placeholder of the same aspect ratio, so a long session with many clips doesn't
+  // accumulate decoded-video memory. Re-entering view re-mounts (and re-autoplays).
+  let _videoIO = null;
+  function videoObserver() {
+    if (_videoIO) return _videoIO;
+    _videoIO = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting) mountHolderVideo(e.target);
+          else unmountHolderVideo(e.target);
+        }
+      },
+      { root: log, rootMargin: "300px 0px" }, // mount slightly before fully in view
+    );
+    return _videoIO;
+  }
+  function mountHolderVideo(holder) {
+    if (holder._video) return; // already live
+    const v = document.createElement("video");
+    v.muted = true;
+    v.setAttribute("muted", ""); // required for muted autoplay on some browsers
+    v.autoplay = true;
+    v.loop = true;
+    v.playsInline = true;
+    v.controls = true;
+    v.preload = "metadata";
+    v.src = holder.dataset.src;
+    v.style.cssText = "width:100%;display:block;border-radius:6px;";
+    v.addEventListener("loadedmetadata", () => {
+      // Learn the real aspect ratio so the placeholder (and layout) match exactly.
+      if (v.videoWidth && v.videoHeight) holder.style.aspectRatio = `${v.videoWidth} / ${v.videoHeight}`;
+    });
+    holder.textContent = "";
+    holder.appendChild(v);
+    holder._video = v;
+    v.play?.().catch(() => {}); // muted autoplay is allowed; ignore if the browser blocks it
+  }
+  function unmountHolderVideo(holder) {
+    const v = holder._video;
+    if (!v) return;
+    try {
+      v.pause();
+      v.removeAttribute("src");
+      v.load(); // release the decoded buffers — this is the memory win
+    } catch {
+      // best-effort
+    }
+    v.remove();
+    holder._video = null; // holder keeps its learned aspect-ratio → gray placeholder fills it
+  }
+
   function paintVideo(url, name) {
     clearEmpty();
     const card = document.createElement("div");
     card.className = "cmcp-bubble agent cmcp-imgcard";
-    const vid = document.createElement("video");
-    vid.src = url;
-    vid.controls = true;
-    vid.preload = "metadata";
-    vid.style.cssText = "max-width:100%;border-radius:6px;display:block;";
-    card.appendChild(vid);
+    // Self-sizing holder: a live <video> when on-screen, a gray aspect-ratio box
+    // when off-screen. Defaults to 16/9 until the first mount learns real dimensions.
+    const holder = document.createElement("div");
+    holder.className = "cmcp-video-holder";
+    holder.dataset.src = url;
+    holder.style.cssText =
+      "width:100%;aspect-ratio:16 / 9;border-radius:6px;background:var(--p-content-hover-background,#2a2a2e);";
+    card.appendChild(holder);
     if (name) {
       const cap = document.createElement("div");
       cap.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
@@ -3617,6 +3672,7 @@ function buildPanel() {
       card.appendChild(cap);
     }
     log.appendChild(card);
+    videoObserver().observe(holder);
     scrollLog();
   }
 
