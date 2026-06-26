@@ -76,6 +76,19 @@ const STORAGE_KEY_BACKEND = "comfyui-mcp.panel.backend";
 // "connected but no agent" lie.
 const DEFAULT_BRIDGE_URL = "ws://127.0.0.1:9180";
 const LEGACY_BRIDGE_URL = "ws://127.0.0.1:9101"; // old shared default — migrate off it
+// Per-backend DEFAULT bridge ports: the panel orchestrator binds a DEDICATED port
+// per backend (claude 9180, codex 9181) so two backends never collide. The Settings
+// "Bridge URL" is PER-BACKEND (a map, like model/effort) and each backend's value
+// seeds the default URL for that backend. A per-backend DEFAULT must NOT count as a
+// "manual override" (so /connect's bridge_url still applies) — only a user-typed
+// NON-default URL overrides (see connectAgent.manualOverride).
+const DEFAULT_BRIDGE_URL_BY_BACKEND = {
+  claude: "ws://127.0.0.1:9180",
+  codex: "ws://127.0.0.1:9181",
+};
+function defaultBridgeUrlFor(backend) {
+  return DEFAULT_BRIDGE_URL_BY_BACKEND[backend] || DEFAULT_BRIDGE_URL;
+}
 
 function loadBridgeUrl() {
   try {
@@ -243,7 +256,16 @@ const SETTING_EFFORT = {
 // Claude group (the default backend) so an upgrade never loses the saved choice.
 const LEGACY_SETTING_MODEL = "comfyui-mcp.defaultModel";
 const LEGACY_SETTING_EFFORT = "comfyui-mcp.defaultEffort";
-const SETTING_BRIDGE_URL = "comfyui-mcp.bridgeUrl";
+// Per-backend Bridge URL (a map, like SETTING_MODEL/SETTING_EFFORT). Each backend
+// keeps its OWN bridge URL so switching to Codex doesn't leave the panel dialing
+// Claude's port — the "Reconnect won't recover after a switch" bug.
+const SETTING_BRIDGE_URL = {
+  claude: "comfyui-mcp.bridgeUrl.claude",
+  codex: "comfyui-mcp.bridgeUrl.codex",
+};
+// Pre-per-backend single Bridge URL key — migrated ONCE into the Claude group so a
+// returning user's custom port isn't lost (runs in the groups-migration block).
+const LEGACY_SETTING_BRIDGE_URL = "comfyui-mcp.bridgeUrl";
 const SETTING_AUTOCONNECT = "comfyui-mcp.autoConnect";
 const SETTING_TOKEN_CIVITAI = "comfyui-mcp.setCivitaiToken";
 const SETTING_TOKEN_HF = "comfyui-mcp.setHuggingfaceToken";
@@ -499,10 +521,12 @@ function panelSettingsList() {
   // the SECTIONS within a category by the MAX `sortOrder` of their settings,
   // DESCENDING (ties broken alphabetically by label), and the rows WITHIN a section
   // by `sortOrder` DESCENDING. So higher number = earlier. We assign DESCENDING
-  // values to force General → Claude → ChatGPT (Codex) → About → API tokens, with
-  // the backend selector first inside General — NOT the alphabetical default
-  // (which would be "ChatGPT, Claude, General" — exactly the misorder the user hit).
+  // values to force About → General → Claude → ChatGPT (Codex) → API tokens — the
+  // Star/About section is given the HIGHEST sortOrder of all so it renders at the
+  // very TOP, then General (backend selector first), then the two backend groups,
+  // then API tokens LAST — NOT the alphabetical default.
   // (Verified against the installed comfyui_frontend_package SettingDialog.vue.)
+  // Section MAX sortOrder: About 200 > General 150 > Claude 130 > Codex 110 > tokens 20.
   //
   // A per-backend "Default model" — a render-fn DROPDOWN of the FETCHED models for
   // THAT backend (the same catalog the composer picker shows). Static `combo`s
@@ -565,73 +589,38 @@ function panelSettingsList() {
       if (backend === currentSettingsBackend()) panelHooks.applyEffort?.(v);
     },
   });
+  // A per-backend "Bridge URL" — each backend has its OWN orchestrator port
+  // (claude 9180, codex 9181), so the URL must be per-backend or a switch to Codex
+  // leaves Reconnect dialing Claude's 9180. The value seeds the default URL for that
+  // backend; /connect's returned bridge_url still applies. Drives the live panel
+  // (a reconnect) only for the ACTIVE backend's group — a non-active group's edit
+  // just persists, it never retargets the running bridge.
+  const bridgeUrlSetting = (backend, sortOrder) => ({
+    id: SETTING_BRIDGE_URL[backend],
+    name: "Bridge URL",
+    category: cat(BACKEND_SECTION[backend], "Bridge URL"),
+    sortOrder,
+    tooltip:
+      `WebSocket URL of the ${BACKEND_TEXT[backend]} panel orchestrator bridge. Default ` +
+      `${defaultBridgeUrlFor(backend)}. Only change this if you run the ${BACKEND_TEXT[backend]} ` +
+      `orchestrator on a non-default port.`,
+    type: "text",
+    defaultValue: defaultBridgeUrlFor(backend),
+    onChange: (v) => {
+      if (suppressSettingOnChange || !settingsArmed) return;
+      if (backend === currentSettingsBackend()) panelHooks.applyBridgeUrl?.(v);
+    },
+  });
 
   return [
-    // ---- General (renders FIRST; backend selector is the first row) ----
-    {
-      id: SETTING_BACKEND,
-      name: "Default agent backend",
-      category: cat("General", "Default agent backend"),
-      sortOrder: 100,
-      tooltip:
-        "Which background agent the panel connects to by default. Claude runs on your Claude subscription; " +
-        "ChatGPT runs on your Codex (ChatGPT) account. Seeds the panel's backend (and which group below seeds " +
-        "the runtime); you can still switch live in the model picker.",
-      type: "combo",
-      options: [
-        { value: "claude", text: "Claude" },
-        { value: "codex", text: "ChatGPT" },
-      ],
-      defaultValue: "claude",
-      onChange: (v) => {
-        if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyBackend?.(v);
-      },
-    },
-    {
-      id: SETTING_AUTOCONNECT,
-      name: "Auto-connect on load",
-      category: cat("General", "Auto-connect on load"),
-      sortOrder: 95,
-      tooltip:
-        "Automatically connect the agent (starting the local orchestrator) when the panel opens, without clicking Connect. " +
-        "Off by default — the orchestrator is otherwise only started by an explicit Connect click.",
-      type: "boolean",
-      defaultValue: false,
-      onChange: (v) => {
-        if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyAutoConnect?.(!!v);
-      },
-    },
-    {
-      id: SETTING_BRIDGE_URL,
-      name: "Bridge URL",
-      category: cat("General", "Bridge URL"),
-      sortOrder: 90,
-      tooltip:
-        "WebSocket URL of the panel orchestrator bridge. Default ws://127.0.0.1:9180. Only change this if you run the " +
-        "orchestrator on a non-default port.",
-      type: "text",
-      defaultValue: DEFAULT_BRIDGE_URL,
-      onChange: (v) => {
-        if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyBridgeUrl?.(v);
-      },
-    },
-    // ---- Claude ----
-    modelSetting("claude", 80),
-    effortSetting("claude", 75),
-    // ---- ChatGPT (Codex) ----
-    modelSetting("codex", 60),
-    effortSetting("codex", 55),
-    // ---- About ----
+    // ---- About (renders FIRST — highest sortOrder of ALL) ----
     {
       // A link row — "⭐ Star on GitHub". Render-fn type (same custom-HTMLElement
       // trick as the token buttons); no persisted value.
       id: "comfyui-mcp.starGithub",
       name: "Star on GitHub",
       category: cat("About", "Star on GitHub"),
-      sortOrder: 40,
+      sortOrder: 200,
       tooltip:
         "Enjoying the ComfyUI Agent Panel? A GitHub star genuinely helps. Opens the repo in a new tab.",
       type: () => {
@@ -647,7 +636,52 @@ function panelSettingsList() {
         return a;
       },
     },
-    // ---- API tokens ----
+    // ---- General (backend selector is the first row) ----
+    {
+      id: SETTING_BACKEND,
+      name: "Default agent backend",
+      category: cat("General", "Default agent backend"),
+      sortOrder: 150,
+      tooltip:
+        "Which background agent the panel connects to by default. Claude runs on your Claude subscription; " +
+        "ChatGPT runs on your Codex (ChatGPT) account. Seeds the panel's backend (and which group below seeds " +
+        "the runtime); you can still switch live in the model picker (a live switch is session-only and does " +
+        "NOT change this default).",
+      type: "combo",
+      options: [
+        { value: "claude", text: "Claude" },
+        { value: "codex", text: "ChatGPT" },
+      ],
+      defaultValue: "claude",
+      onChange: (v) => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyBackend?.(v);
+      },
+    },
+    {
+      id: SETTING_AUTOCONNECT,
+      name: "Auto-connect on load",
+      category: cat("General", "Auto-connect on load"),
+      sortOrder: 145,
+      tooltip:
+        "Automatically connect the agent (starting the local orchestrator) when the panel opens, without clicking Connect. " +
+        "Off by default — the orchestrator is otherwise only started by an explicit Connect click.",
+      type: "boolean",
+      defaultValue: false,
+      onChange: (v) => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyAutoConnect?.(!!v);
+      },
+    },
+    // ---- Claude (Default model, Default reasoning effort, Bridge URL) ----
+    modelSetting("claude", 130),
+    effortSetting("claude", 125),
+    bridgeUrlSetting("claude", 120),
+    // ---- ChatGPT (Codex) (Default model, Default reasoning effort, Bridge URL) ----
+    modelSetting("codex", 110),
+    effortSetting("codex", 105),
+    bridgeUrlSetting("codex", 100),
+    // ---- API tokens (LAST) ----
     tokenSetting(SETTING_TOKEN_CIVITAI, "CIVITAI_API_TOKEN", "CivitAI", 20),
     tokenSetting(SETTING_TOKEN_HF, "HUGGINGFACE_TOKEN", "HuggingFace", 15),
   ];
@@ -4568,6 +4602,18 @@ function buildPanel() {
       if (typeof le === "string" && le && getSetting(SETTING_EFFORT.claude) == null) {
         setSetting(SETTING_EFFORT.claude, le);
       }
+      // Migrate the pre-per-backend single Bridge URL into the Claude group (the old
+      // default port), so a returning user's custom port isn't lost. Skip the dead
+      // 9101 legacy default — that migrates to the modern per-backend default anyway.
+      const lu = getSetting(LEGACY_SETTING_BRIDGE_URL);
+      if (
+        typeof lu === "string" &&
+        lu &&
+        lu !== LEGACY_BRIDGE_URL &&
+        getSetting(SETTING_BRIDGE_URL.claude) == null
+      ) {
+        setSetting(SETTING_BRIDGE_URL.claude, lu);
+      }
       lsSet(SETTINGS_GROUPS_MIGRATED_KEY, "1");
     }
     if (!lsGet(SETTINGS_SEEDED_KEY)) {
@@ -4579,7 +4625,10 @@ function buildPanel() {
         setSetting(SETTING_MODEL[selectedBackend], prefs.model);
       }
       if (prefs.userSet && prefs.effort) setSetting(SETTING_EFFORT[selectedBackend], prefs.effort);
-      setSetting(SETTING_BRIDGE_URL, urlInput.value || DEFAULT_BRIDGE_URL);
+      setSetting(
+        SETTING_BRIDGE_URL[selectedBackend],
+        urlInput.value || defaultBridgeUrlFor(selectedBackend),
+      );
       setSetting(SETTING_AUTOCONNECT, !!lsGet(AUTOCONNECT_KEY));
       lsSet(SETTINGS_SEEDED_KEY, "1");
       return;
@@ -4594,7 +4643,10 @@ function buildPanel() {
       } catch {}
     }
     seedPrefsFromBackendGroup(selectedBackend);
-    const su = getSetting(SETTING_BRIDGE_URL);
+    // Per-backend Bridge URL: seed the field from the ACTIVE backend's setting,
+    // falling back to that backend's default port (claude 9180 / codex 9181).
+    const su =
+      getSetting(SETTING_BRIDGE_URL[selectedBackend]) || defaultBridgeUrlFor(selectedBackend);
     if (su && su !== urlInput.value) {
       urlInput.value = su;
       saveBridgeUrl(su);
@@ -6069,10 +6121,14 @@ function buildPanel() {
       if (turnAnchors.length > 200) turnAnchors.shift();
     },
     // The bridge opened but no orchestrator handshake (models frame) arrived
-    // within the generous cold-start window → the wedge. Try a BOUNDED auto-reclaim
-    // (force-respawn the orchestrator + reconnect) before falling back to the
-    // manual warning. Returns true if it handled it (suppresses the warning).
+    // within the generous cold-start window. FIX 4 — first try a BOUNDED fresh
+    // re-dial (exactly what Reconnect does) for the common initial-load race where
+    // the socket opened before the agent was ready; only escalate to the heavier
+    // BOUNDED force-respawn reclaim once that small redial budget is spent. Both are
+    // bounded + reset on a successful handshake, so neither can become a storm.
+    // Returns true if it handled it (suppresses the manual warning).
     onHandshakeTimeout(timedOutUrl) {
+      if (tryHandshakeRedial(timedOutUrl)) return true;
       return tryAutoReclaim(timedOutUrl);
     },
     // WS reconnects keep failing → the bridge port is dead (orchestrator exited,
@@ -6476,10 +6532,21 @@ function buildPanel() {
   let autoRespawnsLeft = MAX_AUTO_RESPAWNS;
   let autoRespawning = false;
   let respawnGaveUpNoticed = false; // one-shot "keeps failing" notice per budget
+  // FIX 4 — bounded FRESH RE-DIAL budget for the INITIAL-LOAD race: on auto-connect
+  // the WS can open BEFORE the agent finishes spawning, so the orchestrator never
+  // sends `models` on THAT socket and the panel sits "connecting" forever. A manual
+  // Reconnect (a fresh hello on a brand-new socket) recovers it — so on a handshake
+  // timeout we first re-dial automatically (close+reopen, exactly what Reconnect
+  // does), and only escalate to the heavier force-respawn reclaim once this small
+  // budget is spent. STRICTLY BOUNDED + reset by resetAutoReclaim (every user/sticky
+  // Connect AND every successful handshake), so it can NEVER become a redial storm.
+  const MAX_HANDSHAKE_REDIALS = 2;
+  let handshakeRedialsLeft = MAX_HANDSHAKE_REDIALS;
   function resetAutoReclaim() {
     autoReclaimsLeft = MAX_AUTO_RECLAIMS;
     autoRespawnsLeft = MAX_AUTO_RESPAWNS;
     respawnGaveUpNoticed = false;
+    handshakeRedialsLeft = MAX_HANDSHAKE_REDIALS;
   }
 
   // SOFT-RELOAD ↔ AUTO-RESPAWN interlock. A deliberate softReload(orchestrator)
@@ -6630,6 +6697,22 @@ function buildPanel() {
     })();
     return true;
   }
+  // FIX 4 — a single BOUNDED fresh re-dial for the agent-not-ready-yet case: the WS
+  // opened before the agent spawned, so no `models` arrived on this socket. Mirrors a
+  // manual Reconnect: close + reopen on the SAME url → a new hello (which lands once
+  // the agent is up). Returns true if it re-dialed (suppressing the heavier reclaim);
+  // false once the budget is spent — OR if the url already moved on (a newer connect
+  // owns recovery), so we never re-dial a stale target. The budget is replenished
+  // only by resetAutoReclaim (a user/sticky Connect or a successful handshake), so it
+  // can never loop within one unsuccessful connect.
+  function tryHandshakeRedial(timedOutUrl) {
+    if (handshakeRedialsLeft <= 0) return false;
+    if (timedOutUrl !== client.currentUrl()) return false;
+    handshakeRedialsLeft -= 1;
+    appendSystem("The panel agent isn't answering yet — reconnecting…");
+    client.setUrl(client.currentUrl()); // close + reopen on the same url → fresh hello
+    return true;
+  }
   // Returns true if it kicked off a reclaim (the bridge client then suppresses its
   // manual warning); false to let the warning show (budget spent / can't reclaim).
   function tryAutoReclaim(timedOutUrl) {
@@ -6702,13 +6785,17 @@ function buildPanel() {
     // manual override → keep it, and don't let /connect's bridge_url clobber it.
     // (A chip pick is never a manual override — it always uses the backend's port.)
     const wanted = urlInput.value.trim();
-    // Only a GENUINELY custom URL counts as a manual override. The DEFAULT bridge URL
-    // must NOT — the Settings "Bridge URL" field seeds the default (9180), and on a
-    // sticky/load connect lastAutoUrl is still empty, so the old check wrongly flagged
-    // the default as an override and SKIPPED the per-backend bridge_url from /connect.
-    // That connected the Codex backend to Claude's port (9180) instead of 9181.
+    // Only a GENUINELY custom URL counts as a manual override. The SELECTED backend's
+    // DEFAULT bridge URL must NOT — the per-backend Settings "Bridge URL" seeds that
+    // default (claude 9180 / codex 9181), and on a sticky/load connect lastAutoUrl is
+    // still empty, so flagging the default as an override would SKIP the per-backend
+    // bridge_url from /connect (#25, now generalized PER BACKEND). Comparing against
+    // THIS backend's default — not just claude's 9180 — is what lets Codex follow 9181.
     const manualOverride =
-      !opts.fromChip && !!wanted && wanted !== DEFAULT_BRIDGE_URL && wanted !== lastAutoUrl;
+      !opts.fromChip &&
+      !!wanted &&
+      wanted !== defaultBridgeUrlFor(selectedBackend) &&
+      wanted !== lastAutoUrl;
     if (manualOverride && wanted !== client.currentUrl()) client.setUrl(wanted);
     try {
       // Send the selected backend so the pack starts (and points us at) the right
@@ -6783,7 +6870,15 @@ function buildPanel() {
     } catch {
       // localStorage unavailable — selection just won't persist.
     }
-    setSetting(SETTING_BACKEND, id); // keep the Settings default in sync
+    // FIX 1 — do NOT write SETTING_BACKEND here. A live composer/chip backend switch
+    // is TEMPORARY/session-only and must NOT change the saved Settings default. The
+    // old setSetting(SETTING_BACKEND, id) re-entered through SETTING_BACKEND.onChange →
+    // applyBackend → connectBackend → setSetting → … (ComfyUI fires onChange async,
+    // AFTER setSetting's suppressSettingOnChange has already reset), so each switch
+    // overlapped multiple connects and the bridge's close-old-on-new-hello looped
+    // (the 9181 "ready"/"waiting" storm). The Settings "Default agent backend" now
+    // changes ONLY when the user edits it in the Settings dialog. Runtime selection
+    // still persists in STORAGE_KEY_BACKEND above (drives backendNow()'s timings).
     renderBackendChips(
       Array.from(backendChips.querySelectorAll(".cmcp-backend-chip")).map((el) => ({
         backend: el.dataset.backend,
@@ -6812,6 +6907,16 @@ function buildPanel() {
     // clearing the guard first means EXACTLY ONE connect runs for the new backend.
     client.stop();
     connecting = false;
+    // FIX 2 — point the bridge (and the Advanced URL field) at the NEW backend's own
+    // bridge URL before reconnecting, so a switch — and any later Reconnect — dials
+    // THIS backend's port (codex 9181), never the previous backend's (claude 9180).
+    // /connect's returned bridge_url still applies on top. The client is stopped, so
+    // setUrl only updates its `url` here (its connect() no-ops while closed);
+    // connectAgent's client.start() opens it. urlInput has no settings onChange wired,
+    // so updating it can't re-enter the storm.
+    const nextUrl = getSetting(SETTING_BRIDGE_URL[id]) || defaultBridgeUrlFor(id);
+    urlInput.value = nextUrl;
+    if (client.currentUrl() !== nextUrl) client.setUrl(nextUrl);
     void connectAgent({ fromChip: true });
   }
 
