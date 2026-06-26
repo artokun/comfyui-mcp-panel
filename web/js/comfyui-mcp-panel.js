@@ -5548,6 +5548,58 @@ function buildPanel() {
     }
   }
 
+  // ── Per-run image batching ────────────────────────────────────────────────
+  // ComfyUI fires `executed` once PER output node, so a multi-output run used to
+  // inject several fragmented image turns into the agent. Instead we BUFFER each
+  // run's inline image refs by prompt_id as `executed` events arrive (still
+  // painting every image live for the user), then deliver ONE consolidated
+  // `executed` agent_event when that prompt finishes (`execution_success`, or the
+  // legacy `executing` with node===null). A short debounce flushes a buffer that
+  // never sees a run-end signal so images are never stranded.
+  const runImageBuffers = new Map(); // promptId -> { images: ImageRef[], timer }
+  const RUN_FLUSH_DEBOUNCE_MS = 1500;
+  const promptKey = (id) => id ?? "__no_prompt__";
+
+  function bufferRunImages(promptId, images) {
+    if (!images.length) return;
+    const key = promptKey(promptId);
+    let buf = runImageBuffers.get(key);
+    if (!buf) {
+      buf = { images: [], timer: null };
+      runImageBuffers.set(key, buf);
+    }
+    buf.images.push(...images);
+    // Debounce fallback: if no run-end signal lands, flush anyway after a beat.
+    if (buf.timer) clearTimeout(buf.timer);
+    buf.timer = setTimeout(() => flushRunImages(key), RUN_FLUSH_DEBOUNCE_MS);
+  }
+
+  function flushRunImages(promptId) {
+    const key = promptKey(promptId);
+    const buf = runImageBuffers.get(key);
+    if (!buf) return;
+    if (buf.timer) clearTimeout(buf.timer);
+    runImageBuffers.delete(key);
+    if (!buf.images.length) return;
+    // One consolidated turn with ALL of the run's directly-viewable images.
+    client.sendFrame({
+      type: "agent_event",
+      kind: "executed",
+      images: buf.images,
+    });
+  }
+
+  function clearRunImages(promptId) {
+    const key = promptKey(promptId);
+    const buf = runImageBuffers.get(key);
+    if (buf?.timer) clearTimeout(buf.timer);
+    runImageBuffers.delete(key);
+  }
+
+  function flushAllRunImages() {
+    for (const key of [...runImageBuffers.keys()]) flushRunImages(key);
+  }
+
   function onExecuted(ev) {
     const d = ev?.detail ?? {};
     const out = d.output || {};
@@ -5573,15 +5625,12 @@ function buildPanel() {
         inlineImages.push(m);
       }
     }
-    // Always send the executed event (so silent video-only runs still notify the
-    // agent). Only attach the directly-viewable images here.
+    // Buffer the directly-viewable images for THIS run instead of sending a turn
+    // per node — they're flushed as one consolidated `executed` event when the
+    // prompt finishes (see flushRunImages). The image already painted above, so
+    // the user still sees it live; only the agent delivery is deferred+grouped.
     if (inlineImages.length) {
-      client.sendFrame({
-        type: "agent_event",
-        kind: "executed",
-        images: inlineImages,
-        node_id: nodeId,
-      });
+      bufferRunImages(d.prompt_id, inlineImages);
     } else if (!videos.length) {
       // No viewable images and no videos (shouldn't happen given the guard above).
       return;
@@ -5592,6 +5641,9 @@ function buildPanel() {
   }
   function onExecError(ev) {
     const d = ev?.detail ?? {};
+    // The run failed — drop any images we'd buffered for it so we don't deliver a
+    // stale "here are your outputs" batch on top of the run_error interrupt below.
+    clearRunImages(d.prompt_id);
     // Name the failing node so the agent (and the user) know WHERE it broke —
     // "Ideogram4PromptBuilderKJ (node 200)" beats a bare exception string.
     const where = d.node_type
@@ -5612,6 +5664,17 @@ function buildPanel() {
       detail: msg,
       error: true,
     });
+  }
+  // Run-end signal: ComfyUI emits `execution_success` (carrying prompt_id) when a
+  // prompt fully completes — flush THAT run's buffered images as one turn.
+  function onExecutionSuccess(ev) {
+    flushRunImages(ev?.detail?.prompt_id);
+  }
+  // Legacy/secondary run-end: `executing` fires with the current node id, or null
+  // when nothing is left to run. The null event carries no prompt_id, so flush any
+  // remaining buffers (runs are sequential — nothing is executing now).
+  function onExecuting(ev) {
+    if (ev?.detail == null) flushAllRunImages();
   }
   // Post-restart autonomy (#3): ComfyUI's api fires `reconnecting` when the
   // server goes down (e.g. a Manager reboot) and `reconnected` when it's back.
@@ -5641,6 +5704,8 @@ function buildPanel() {
   }
   try {
     api.addEventListener("executed", onExecuted);
+    api.addEventListener("execution_success", onExecutionSuccess);
+    api.addEventListener("executing", onExecuting);
     api.addEventListener("execution_error", onExecError);
     api.addEventListener("reconnecting", onComfyReconnecting);
     api.addEventListener("reconnected", onComfyReconnected);
@@ -7160,6 +7225,8 @@ function buildPanel() {
       document.removeEventListener("mousedown", onDocPointerDown, true);
       try {
         api.removeEventListener("executed", onExecuted);
+        api.removeEventListener("execution_success", onExecutionSuccess);
+        api.removeEventListener("executing", onExecuting);
         api.removeEventListener("execution_error", onExecError);
         api.removeEventListener("reconnecting", onComfyReconnecting);
         api.removeEventListener("reconnected", onComfyReconnected);
