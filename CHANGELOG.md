@@ -18,13 +18,13 @@ All notable changes to this project are documented here. This project adheres to
   attachment and precisely strips its inline token (e.g. `[Pasted text #N]`)
   from the textarea. Purely additive — the send/resolve pipeline still resolves
   attachments by token-match against the textarea, unchanged.
-- **Edit focus-follow** — when the agent edits a node (set widget, set mode,
-  move, connect/disconnect, recolor, retitle, collapse, add/remove), the canvas
-  now smoothly darts to that node with 50% padding so you watch the change land;
-  a burst of edits makes the view dart around. Once edits go quiet for ~5s, it
-  animates back to a full fit so the whole graph is visible again. Reuses the
-  panel-aware "fit" insets and the native zoom easing. Pure eye-candy — disable
-  with `localStorage["cmcp:focus-follow"] = "0"` (re-enable by removing it).
+- **Edit focus-follow** — when the agent changes a node's widget **value**, the
+  canvas now smoothly darts to that node with 50% padding so you watch the change
+  land. Once edits go quiet for ~5s, it animates back to a full fit so the whole
+  graph is visible again. Scoped to value edits only (wiring and node placement
+  don't move the view — those keep the existing gentle fit). Reuses the
+  panel-aware "fit" insets and the native zoom easing. **On by default**; toggle
+  via Settings → Comfy MCP Agent → General → **"Zoom to agent edits"**.
 
 ## [0.4.1] - 2026-06-26
 

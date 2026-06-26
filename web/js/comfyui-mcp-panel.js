@@ -267,6 +267,7 @@ const SETTING_BRIDGE_URL = {
 // returning user's custom port isn't lost (runs in the groups-migration block).
 const LEGACY_SETTING_BRIDGE_URL = "comfyui-mcp.bridgeUrl";
 const SETTING_AUTOCONNECT = "comfyui-mcp.autoConnect";
+const SETTING_FOCUS_FOLLOW = "comfyui-mcp.zoomToAction";
 const SETTING_TOKEN_CIVITAI = "comfyui-mcp.setCivitaiToken";
 const SETTING_TOKEN_HF = "comfyui-mcp.setHuggingfaceToken";
 // One-time flag: on first load with this feature, push the user's EXISTING
@@ -671,6 +672,26 @@ function panelSettingsList() {
       onChange: (v) => {
         if (suppressSettingOnChange || !settingsArmed) return;
         panelHooks.applyAutoConnect?.(!!v);
+      },
+    },
+    {
+      id: SETTING_FOCUS_FOLLOW,
+      name: "Zoom to agent edits",
+      category: cat("General", "Zoom to agent edits"),
+      sortOrder: 140,
+      tooltip:
+        "When the agent changes a node's value, smoothly zoom the canvas to that node (with padding) so you watch " +
+        "the change land, then zoom back out to fit the whole graph once edits go quiet. Scoped to value edits — " +
+        "wiring and node placement don't move the view. On by default; turn off to keep the canvas still.",
+      type: "boolean",
+      defaultValue: true,
+      onChange: (v) => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        // Turning it off mid-burst: drop any pending zoom-back-out.
+        if (!v && fitBackTimer) {
+          clearTimeout(fitBackTimer);
+          fitBackTimer = null;
+        }
       },
     },
     // ---- Claude (Default model, Default reasoning effort, Bridge URL) ----
@@ -2828,11 +2849,13 @@ const GRAPH_TOOL_EXECUTORS = {
 };
 
 // ---------------------------------------------------------------------------
-// Edit focus-follow: when the agent edits a NODE, smoothly dart the viewport to
-// that node (with 50% padding) so the user watches the change land — the canvas
-// appears to dart around as a burst of edits lands. After the burst goes quiet,
-// animate back to a full fit so the whole graph is visible again. Pure
-// eye-candy; toggle off with localStorage["cmcp:focus-follow"] = "0".
+// Edit focus-follow: when the agent changes a node's WIDGET VALUE, smoothly dart
+// the viewport to that node (with 50% padding) so the user watches the change
+// land. Scoped to value edits only (not wiring or placement), which kept the
+// view from moving around too much. After the edits go quiet, the view
+// animates back to a full fit so the whole graph is visible again. Pure
+// eye-candy; on by default, toggled by the "Zoom to agent edits" setting
+// (Settings → Comfy MCP Agent → General).
 // ---------------------------------------------------------------------------
 
 const FOCUS_PAD_PCT = 0.5; // 50% padding around the focused node(s)
@@ -2840,6 +2863,11 @@ const FOCUS_ANIM_MS = 350; // smooth dart duration
 const FIT_BACK_MS = 5000; // idle delay before zooming back out to the full fit
 
 function focusFollowEnabled() {
+  // Prefer the registered ComfyUI setting (Settings → Comfy MCP Agent →
+  // "Zoom to agent edits", default ON). Fall back to the legacy localStorage
+  // flag while the setting isn't registered yet (early load), then default ON.
+  const v = getSetting(SETTING_FOCUS_FOLLOW);
+  if (typeof v === "boolean") return v;
   try {
     return localStorage.getItem("cmcp:focus-follow") !== "0";
   } catch {
@@ -2847,20 +2875,12 @@ function focusFollowEnabled() {
   }
 }
 
-// Per-command extractor for the node id(s) an edit targets. add_node only knows
-// its id AFTER execution, so it reads the reply; the rest read the request args.
+// Per-command extractor for the node id an edit targets. Deliberately ONLY
+// widget VALUE edits — not wiring (connect/disconnect), not placement
+// (add/move/remove), not mode/title/color — those moved the view around too
+// much. Structural ops still get the gentle debounced fit via AUTOFIT_CMDS.
 const FOCUS_TARGETS = {
-  graph_add_node: (_m, reply) => [reply?.result?.added?.id],
-  graph_remove_node: (m) => [m.node_id],
   graph_set_widget: (m) => [m.node_id],
-  graph_set_node_mode: (m) => [m.node_id],
-  graph_move_node: (m) => [m.node_id],
-  graph_set_title: (m) => [m.node_id],
-  graph_set_node_collapsed: (m) => [m.node_id],
-  graph_set_node_color: (m) => [m.node_id],
-  graph_promote_widget: (m) => [m.node_id],
-  graph_connect: (m) => [m.from_node_id, m.to_node_id],
-  graph_disconnect: (m) => [m.node_id],
 };
 
 /** [x, y, w, h] for a node — prefer litegraph's boundingRect (includes title). */
