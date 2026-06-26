@@ -4719,8 +4719,19 @@ function buildPanel() {
         populateModelSelect(settingsModelSelectEls[bk], bk);
       }
     }
-    // Keep the user's saved pick if still valid; else pre-select Opus.
+    // Keep the user's saved pick if still valid; else pre-select Opus. When the
+    // active backend's saved model is ABSENT from the fetched catalog and it isn't
+    // already Auto, snap to Auto and clear the saved setting (under
+    // suppressSettingOnChange) so the single post-handshake push sends model:null —
+    // matching the Settings dropdown, which renders an absent saved id as DISABLED
+    // and selects Auto. Otherwise the push would send a concrete fallback the UI
+    // never shows (a UI/agent mismatch). The !modelAuto guard means this fires at
+    // most once (then modelAuto persists), so it can't oscillate across reconnects.
     if (!modelCatalog.some((m) => m.id === prefs.model)) {
+      if (!prefs.modelAuto && bk) {
+        prefs.modelAuto = true;
+        setSetting(SETTING_MODEL[bk], "");
+      }
       prefs.model = pickDefaultModel(modelCatalog);
     }
     // Preserve the user's chosen effort across a backend switch: the new backend's
@@ -6714,7 +6725,35 @@ function buildPanel() {
   // Pick a backend chip → remember it, repaint the chips so it highlights, then
   // run the normal Connect flow (which now POSTs this backend and follows the
   // returned bridge URL). The user never types a port.
+  /** Seed the live prefs from `id`'s setting group for a backend SWITCH. The
+   *  previous prefs.model/effort belong to the OLD backend's catalog, so they must
+   *  not be carried into the new connection (applyModelCatalog would then push a
+   *  STALE cross-backend model/effort). Force Auto when the new group has no
+   *  concrete saved model, and map the effort into the new backend's scale. SEEDS
+   *  ONLY — sends no set_options; the single post-handshake applyModelCatalog push
+   *  emits exactly one set_options with the NEW backend's values. */
+  function seedPrefsForBackendSwitch(id) {
+    seedPrefsFromBackendGroup(id);
+    const sm = getSetting(SETTING_MODEL[id]);
+    if (typeof sm !== "string" || sm === "") prefs.modelAuto = true;
+    if (prefs.effort) {
+      const scale = BACKEND_EFFORTS[id] || ALL_EFFORTS;
+      prefs.effort = nearestInList(prefs.effort, scale) || undefined;
+    }
+    savePrefs(prefs);
+    refreshModelChip();
+  }
+
   function connectBackend(id) {
+    // CENTRALIZED per-backend seeding: every switch path routes through here — the
+    // backend chips, the model-popover provider row, AND the Settings backend combo
+    // (panelHooks.applyBackend). When the target backend differs from the one prefs
+    // currently reflect (connectedBackend if connected, else the last-picked
+    // selectedBackend), seed prefs from the NEW backend's group BEFORE connecting, so
+    // the post-handshake push uses the new backend's model/effort — never the
+    // previous backend's stale values. A re-pick of the same backend doesn't reseed.
+    const prevBackend = connectedBackend || selectedBackend;
+    if (id !== prevBackend) seedPrefsForBackendSwitch(id);
     selectedBackend = id;
     try {
       window.localStorage.setItem(STORAGE_KEY_BACKEND, id);
@@ -7903,26 +7942,11 @@ function buildPanel() {
   panelHooks.applyBackend = (id) => {
     if (!id || id === selectedBackend) return;
     appendSystem(`Default backend → ${BACKEND_LABELS[id] || id}.`);
-    // SEED the live prefs from the NEW backend's group BEFORE connecting, so the
-    // single post-handshake catalog push (applyModelCatalog) sends STABLE values and
-    // the chip/agent/Settings UI all agree — NO set_options is sent here. (Without
-    // this, applyModelCatalog would snap prefs.model to a concrete default for the
-    // new backend and push THAT, diverging from the group's saved/Auto value.)
-    seedPrefsFromBackendGroup(id);
-    // The previous prefs.model belongs to the OLD backend's catalog. If the new
-    // group has no concrete saved model (Auto / never chosen), force Auto so the
-    // catalog push sends model:null instead of carrying a cross-backend id.
-    const sm = getSetting(SETTING_MODEL[id]);
-    if (typeof sm !== "string" || sm === "") prefs.modelAuto = true;
-    // Defensive: map effort into the new backend's scale (groups are static, but a
-    // legacy/odd value could be off-scale).
-    if (prefs.effort) {
-      const scale = BACKEND_EFFORTS[id] || ALL_EFFORTS;
-      prefs.effort = nearestInList(prefs.effort, scale) || undefined;
-    }
-    savePrefs(prefs);
-    refreshModelChip();
-    connectBackend(id); // exactly ONE connect; no follow-on set_options flip
+    // Route through connectBackend, which CENTRALLY seeds prefs from the new
+    // backend's group before connecting (same path as the chips / model-popover
+    // provider row) — exactly ONE connect, and the single post-handshake catalog
+    // push carries the new backend's values. No set_options is sent here.
+    connectBackend(id);
   };
   panelHooks.applyModel = (id) => {
     const next = (id || "").trim();
