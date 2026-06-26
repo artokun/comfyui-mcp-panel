@@ -255,6 +255,14 @@ const panelHooks = {
 // Best-effort guard so a setSetting() we make while seeding/syncing doesn't bounce
 // back through onChange and re-drive the panel (the idempotent appliers also guard).
 let suppressSettingOnChange = false;
+// ComfyUI fires every setting's onChange when it APPLIES PERSISTED SETTINGS AT
+// STARTUP — not just on real user edits. Those load-time callbacks must NOT drive
+// side effects: a persisted Auto-connect/Bridge-URL would call connectAgent() and
+// race the sticky-autoconnect path, and with the bridge's one-socket-per-tab policy
+// each new socket closes the other → a ~1s reconnect storm. So onChange appliers
+// stay disarmed until the panel has mounted AND made its single initial connect
+// decision; only genuine post-load user edits in the Settings dialog take effect.
+let settingsArmed = false;
 
 function getSetting(id) {
   try {
@@ -386,7 +394,7 @@ function panelSettingsList() {
       ],
       defaultValue: "claude",
       onChange: (v) => {
-        if (suppressSettingOnChange) return;
+        if (suppressSettingOnChange || !settingsArmed) return;
         panelHooks.applyBackend?.(v);
       },
     },
@@ -400,7 +408,7 @@ function panelSettingsList() {
       type: "text",
       defaultValue: "",
       onChange: (v) => {
-        if (suppressSettingOnChange) return;
+        if (suppressSettingOnChange || !settingsArmed) return;
         panelHooks.applyModel?.(v);
       },
     },
@@ -422,7 +430,7 @@ function panelSettingsList() {
       ],
       defaultValue: "",
       onChange: (v) => {
-        if (suppressSettingOnChange) return;
+        if (suppressSettingOnChange || !settingsArmed) return;
         panelHooks.applyEffort?.(v);
       },
     },
@@ -436,7 +444,7 @@ function panelSettingsList() {
       type: "text",
       defaultValue: DEFAULT_BRIDGE_URL,
       onChange: (v) => {
-        if (suppressSettingOnChange) return;
+        if (suppressSettingOnChange || !settingsArmed) return;
         panelHooks.applyBridgeUrl?.(v);
       },
     },
@@ -450,7 +458,7 @@ function panelSettingsList() {
       type: "boolean",
       defaultValue: false,
       onChange: (v) => {
-        if (suppressSettingOnChange) return;
+        if (suppressSettingOnChange || !settingsArmed) return;
         panelHooks.applyAutoConnect?.(!!v);
       },
     },
@@ -4251,6 +4259,13 @@ function buildPanel() {
     }
   }
   seedFromSettings();
+  // Arm the setting onChange appliers only AFTER mount + the startup onChange volley
+  // and the initial (sticky) connect decision have settled — so ComfyUI applying a
+  // persisted Auto-connect/Bridge-URL at load can't drive a connect that storms.
+  // Genuine user edits in the Settings dialog happen long after this window.
+  setTimeout(() => {
+    settingsArmed = true;
+  }, 2500);
 
   refreshModelChip();
 
