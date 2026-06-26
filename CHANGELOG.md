@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Edit focus-follow** — when the agent edits a node (set widget, set mode,
+  move, connect/disconnect, recolor, retitle, collapse, add/remove), the canvas
+  now smoothly darts to that node with 50% padding so you watch the change land;
+  a burst of edits makes the view dart around. Once edits go quiet for ~5s, it
+  animates back to a full fit so the whole graph is visible again. Reuses the
+  panel-aware "fit" insets and the native zoom easing. Pure eye-candy — disable
+  with `localStorage["cmcp:focus-follow"] = "0"` (re-enable by removing it).
+
 ## [0.4.1] - 2026-06-26
 
 ### Added

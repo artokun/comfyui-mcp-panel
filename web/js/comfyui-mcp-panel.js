@@ -2828,6 +2828,159 @@ const GRAPH_TOOL_EXECUTORS = {
 };
 
 // ---------------------------------------------------------------------------
+// Edit focus-follow: when the agent edits a NODE, smoothly dart the viewport to
+// that node (with 50% padding) so the user watches the change land — the canvas
+// appears to dart around as a burst of edits lands. After the burst goes quiet,
+// animate back to a full fit so the whole graph is visible again. Pure
+// eye-candy; toggle off with localStorage["cmcp:focus-follow"] = "0".
+// ---------------------------------------------------------------------------
+
+const FOCUS_PAD_PCT = 0.5; // 50% padding around the focused node(s)
+const FOCUS_ANIM_MS = 350; // smooth dart duration
+const FIT_BACK_MS = 5000; // idle delay before zooming back out to the full fit
+
+function focusFollowEnabled() {
+  try {
+    return localStorage.getItem("cmcp:focus-follow") !== "0";
+  } catch {
+    return true;
+  }
+}
+
+// Per-command extractor for the node id(s) an edit targets. add_node only knows
+// its id AFTER execution, so it reads the reply; the rest read the request args.
+const FOCUS_TARGETS = {
+  graph_add_node: (_m, reply) => [reply?.result?.added?.id],
+  graph_remove_node: (m) => [m.node_id],
+  graph_set_widget: (m) => [m.node_id],
+  graph_set_node_mode: (m) => [m.node_id],
+  graph_move_node: (m) => [m.node_id],
+  graph_set_title: (m) => [m.node_id],
+  graph_set_node_collapsed: (m) => [m.node_id],
+  graph_set_node_color: (m) => [m.node_id],
+  graph_promote_widget: (m) => [m.node_id],
+  graph_connect: (m) => [m.from_node_id, m.to_node_id],
+  graph_disconnect: (m) => [m.node_id],
+};
+
+/** [x, y, w, h] for a node — prefer litegraph's boundingRect (includes title). */
+function nodeFocusBounds(node) {
+  const br = node.boundingRect;
+  if (Array.isArray(br) && br.length === 4 && (br[2] || br[3])) {
+    return [br[0], br[1], br[2], br[3]];
+  }
+  const w = node.size?.[0] ?? 200;
+  const h = node.size?.[1] ?? 100;
+  return [node.pos[0], node.pos[1] - 30, w, h + 30]; // title bar renders above pos
+}
+
+function unionBounds(list) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const b of list) {
+    minX = Math.min(minX, b[0]);
+    minY = Math.min(minY, b[1]);
+    maxX = Math.max(maxX, b[0] + b[2]);
+    maxY = Math.max(maxY, b[1] + b[3]);
+  }
+  return [minX, minY, maxX - minX, maxY - minY];
+}
+
+/** Animate the viewport to `bounds`, padded by `padPct`, accounting for the
+ *  sidebar panel overlay (mirrors the panel-aware inset in graph_canvas "fit"). */
+function animateToBoundsPadded(bounds, padPct, duration) {
+  const { canvas } = getGraphCtx();
+  if (!canvas?.ds) return;
+  const b = bounds.slice();
+  const padX = b[2] * padPct;
+  const padY = b[3] * padPct;
+  b[0] -= padX;
+  b[1] -= padY;
+  b[2] += padX * 2;
+  b[3] += padY * 2;
+  try {
+    const cEl = canvas.canvas;
+    const pr = activePanelRoot?.isConnected ? activePanelRoot.getBoundingClientRect() : null;
+    const cr = cEl?.getBoundingClientRect?.();
+    if (pr && cr && pr.width > 0 && cr.width > 0) {
+      const panelOnLeft = (pr.left + pr.right) / 2 < (cr.left + cr.right) / 2;
+      const inset = panelOnLeft ? Math.max(0, pr.right - cr.left) : Math.max(0, cr.right - pr.left);
+      if (inset > 8 && inset < cr.width * 0.9) {
+        const extra = b[2] * (cr.width / (cr.width - inset) - 1);
+        b[2] += extra;
+        if (panelOnLeft) b[0] -= extra;
+      }
+    }
+  } catch {
+    // measurement unavailable — fall back to the un-inset bounds
+  }
+  if (typeof canvas.animateToBounds === "function") {
+    canvas.animateToBounds(b, { duration });
+    return;
+  }
+  // No animation support — set instantly.
+  const ds = canvas.ds;
+  const el = canvas.canvas;
+  const next = Math.min(el.width / b[2], el.height / b[3], 1.5);
+  ds.scale = next;
+  ds.offset[0] = -b[0] + (el.width / next - b[2]) / 2;
+  ds.offset[1] = -b[1] + (el.height / next - b[3]) / 2;
+  canvas.setDirty(true, true);
+}
+
+/** Smoothly dart to the node(s) with the given ids (skips ones not found). */
+function focusNodesById(ids) {
+  let graph;
+  try {
+    ({ graph } = getGraphCtx());
+  } catch {
+    return; // canvas not ready
+  }
+  if (!graph) return;
+  const boxes = [];
+  for (const id of ids) {
+    if (id == null) continue;
+    let node;
+    try {
+      node = resolveNode(graph, id);
+    } catch {
+      continue; // id not on the currently-viewed graph (e.g. inside a subgraph)
+    }
+    if (node) boxes.push(nodeFocusBounds(node));
+  }
+  if (boxes.length) animateToBoundsPadded(unionBounds(boxes), FOCUS_PAD_PCT, FOCUS_ANIM_MS);
+}
+
+let fitBackTimer = null;
+/** (Re)arm the "zoom back out to the whole graph" animation; fires once the
+ *  agent's edits go quiet for FIT_BACK_MS. */
+function scheduleFitBack() {
+  if (fitBackTimer) clearTimeout(fitBackTimer);
+  fitBackTimer = setTimeout(() => {
+    fitBackTimer = null;
+    try {
+      GRAPH_TOOL_EXECUTORS.graph_canvas({ action: "fit" });
+    } catch {
+      // empty graph / canvas unavailable — nothing to fit
+    }
+  }, FIT_BACK_MS);
+}
+
+/** React to a completed agent command: dart to the edited node, and arm the
+ *  zoom-back-out. Called from the bridge's onCommand after each ok reply. */
+function focusFollowOnCommand(cmd, msg, reply) {
+  if (!reply?.ok || !focusFollowEnabled()) return false;
+  const targeter = FOCUS_TARGETS[cmd];
+  if (!targeter) return false;
+  try {
+    focusNodesById(targeter(msg, reply));
+  } catch {
+    // never let eye-candy break command handling
+  }
+  scheduleFitBack();
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Bridge client: WS connection to the comfyui-mcp server with auto-reconnect.
 // ---------------------------------------------------------------------------
 
@@ -6127,9 +6280,15 @@ function buildPanel() {
     onCommand(cmd, msg, reply) {
       appendActivity(cmd, msg, reply);
       bumpThinking();
-      // After structural edits, zoom/center the canvas so the user can watch it
-      // come together (debounced — one fit per burst).
-      if (reply.ok && AUTOFIT_CMDS.has(cmd)) scheduleAutoFit();
+      // After an edit, follow the action: dart to the edited NODE (25% pad) so
+      // the user watches the change land, then zoom back out to a full fit once
+      // the burst goes quiet (focusFollowOnCommand handles both). Structural ops
+      // with no single node target (subgraph/group/paste) fall back to the plain
+      // debounced fit so the view still settles.
+      if (reply.ok) {
+        const followed = focusFollowOnCommand(cmd, msg, reply);
+        if (!followed && AUTOFIT_CMDS.has(cmd)) scheduleAutoFit();
+      }
       // The agent restarted ComfyUI — arm the auto-resume so we reconnect and
       // nudge it to continue once ComfyUI is back (install→restart→continue).
       // Gate on the handler actually reporting rebooting:true — a busy-guard
