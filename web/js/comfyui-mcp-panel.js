@@ -251,18 +251,19 @@ const BACKEND_EFFORTS = {
 };
 // Ordered low→high across BOTH scales, for nearest-level mapping on a switch.
 const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
-/** Map an effort to the nearest VALID level for `backend`. Shared levels pass
- *  through 1:1; an off-scale source (e.g. Claude "max" → Codex "xhigh", or
- *  Codex "none"/"minimal" → Claude "low") snaps to the closest by ordered rank. */
-function mapEffortToBackend(effort, backend) {
-  const valid = BACKEND_EFFORTS[backend] || BACKEND_EFFORTS.claude;
+/** Snap `effort` to the nearest level present in `list` by EFFORT_ORDER rank.
+ *  Shared levels pass through 1:1; an off-list source snaps to the closest by
+ *  ordered rank (ties prefer the lower level). Returns `effort` unchanged when
+ *  falsy; returns undefined when `list` is EMPTY (no effort control). */
+function nearestInList(effort, list) {
   if (!effort) return effort;
-  if (valid.includes(effort)) return effort;
+  if (!Array.isArray(list) || !list.length) return undefined;
+  if (list.includes(effort)) return effort;
   const srcRank = EFFORT_ORDER.indexOf(effort);
-  if (srcRank < 0) return valid[0];
-  let best = valid[0];
+  if (srcRank < 0) return list[0];
+  let best = list[0];
   let bestDist = Infinity;
-  for (const v of valid) {
+  for (const v of list) {
     const d = Math.abs(EFFORT_ORDER.indexOf(v) - srcRank);
     if (d < bestDist) {
       bestDist = d;
@@ -1389,18 +1390,39 @@ const GRAPH_TOOL_EXECUTORS = {
   async workflow_open({ path }) {
     const s = app?.extensionManager?.workflow;
     if (!s?.openWorkflow) throw new Error("workflow service unavailable");
-    const all = [...(s.openWorkflows ?? []), ...(s.workflows ?? [])];
-    const target =
-      (typeof s.getWorkflowByPath === "function" && path && s.getWorkflowByPath(path)) ||
-      all.find(
-        (w) =>
-          w &&
-          (w.path === path ||
-            w.filename === path ||
-            w.key === path ||
-            (w.filename && w.filename.replace(/\.json$/i, "") === path)),
+    const find = () => {
+      const all = [...(s.openWorkflows ?? []), ...(s.workflows ?? [])];
+      return (
+        (typeof s.getWorkflowByPath === "function" && path && s.getWorkflowByPath(path)) ||
+        all.find(
+          (w) =>
+            w &&
+            (w.path === path ||
+              w.filename === path ||
+              w.key === path ||
+              (w.filename && w.filename.replace(/\.json$/i, "") === path)),
+        )
       );
-    if (!target) throw new Error(`no workflow matching "${path}" — call workflow_list first`);
+    };
+    let target = find();
+    // The frontend's workflow list is CACHED, so a just-saved/staged file (e.g. a
+    // downloaded example) won't appear until the store re-reads the workflows dir.
+    // If the first search misses, REFRESH the store and search again so a freshly
+    // staged file is found + opened natively (no need for a separate refresh call).
+    if (!target && typeof s.syncWorkflows === "function") {
+      try {
+        await s.syncWorkflows();
+      } catch (err) {
+        console.warn("[comfyui-mcp-panel] syncWorkflows failed:", err?.message ?? err);
+      }
+      target = find();
+    }
+    if (!target) {
+      throw new Error(
+        `no workflow matching "${path}" — it isn't among the saved/open workflows even after a refresh. ` +
+          `For a file outside the workflows folder, load it with panel_load_workflow path:<file>.`,
+      );
+    }
     await s.openWorkflow(target);
     return { opened: { path: target.path, filename: target.filename } };
   },
@@ -2158,6 +2180,21 @@ const GRAPH_TOOL_EXECUTORS = {
     await managerV2("manager/reboot", { method: "POST" });
     return { rebooting: true };
   },
+  async free_vram() {
+    // Unload all resident models + free cached VRAM via ComfyUI's standard /free
+    // endpoint (the same one the "Unload Models"/"Free memory" menu uses). Used to
+    // unwedge a stuck/OOM ComfyUI when a cancel left memory pinned — no restart.
+    const res = await api.fetchApi("/free", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ unload_models: true, free_memory: true }),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`Failed to free VRAM: ${res.status} ${res.statusText}${text ? ` — ${text}` : ""}`);
+    }
+    return { freed: true, unload_models: true, free_memory: true };
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -2167,7 +2204,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onAck, onTurn, onTurnAnchor, getResume }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onShowMedia, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onAck, onTurn, onTurnAnchor, getResume, onHandshakeTimeout, onBridgeClosed }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -2222,10 +2259,19 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       clearHandshake();
       handshakeTimer = setTimeout(() => {
         if (handshakeDone) return;
-        onLog(
-          `⚠ Bridge open on ${url} but no panel agent responded. Something else may be holding the port. ` +
-            `Close it, or fully restart ComfyUI, then reconnect.`,
-        );
+        // The WS is OPEN but no orchestrator handshake (models frame) arrived
+        // within the generous cold-start window. Two causes: (1) a WEDGED
+        // orchestrator — alive, bridge up, agent dead — or (2) some non-orchestrator
+        // process squatting the port. Hand off to the panel's bounded auto-reclaim
+        // (force-respawn + reconnect); only if THAT is exhausted does it fall back
+        // to the manual warning below. If no handler is wired, warn directly.
+        const handled = onHandshakeTimeout?.(url);
+        if (!handled) {
+          onLog(
+            `⚠ Bridge open on ${url} but no panel agent responded. Something else may be holding the port. ` +
+              `Close it, or fully restart ComfyUI, then reconnect.`,
+          );
+        }
       }, HANDSHAKE_MS);
     });
 
@@ -2267,6 +2313,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
             const items = Array.isArray(msg.items) ? msg.items : [];
             onTodo?.(items);
             result = { ok: true, count: items.length };
+          } else if (msg.cmd === "show_media") {
+            // Render agent-requested media (images/videos) into the chat.
+            // items: [{ kind: "image"|"video"|"viewRef", dataUrl?, viewRef?, filename, caption? }]
+            const mediaItems = Array.isArray(msg.items) ? msg.items : [];
+            onShowMedia?.(mediaItems);
+            result = { ok: true, count: mediaItems.length };
           } else {
             const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];
             if (!executor) throw new Error(`Unknown command "${msg.cmd}"`);
@@ -2288,7 +2340,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
         // ask_user / request_secret paint their OWN cards and their replies carry
         // user input (a choice, or a SECRET) — never echo them as an activity card
         // (and never record them). Other commands get the normal activity card.
-        if (msg.cmd !== "ask_user" && msg.cmd !== "request_secret" && msg.cmd !== "set_todo") {
+        if (msg.cmd !== "ask_user" && msg.cmd !== "request_secret" && msg.cmd !== "set_todo" && msg.cmd !== "show_media") {
           onCommand?.(msg.cmd, msg, reply);
         }
         return;
@@ -2336,6 +2388,14 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // after the orchestrator has processed hello (resume armed), so it's the
       // reliable signal to send a post-restart resume nudge.
       if (msg && msg.type === "ack") {
+        // A "degraded" ack is the orchestrator's OWN handshake: it's alive and
+        // attending, but its agent backend can't enumerate models yet (typically
+        // sign-in needed). That is NOT the "bridge open but nothing behind it"
+        // wedge — so DISARM the no-handshake timer (no force-reclaim of a valid,
+        // sign-in-needed orchestrator) WITHOUT calling markConnected(). `models`
+        // stays the ONLY path to green/"connected"; a degraded orchestrator just
+        // surfaces its own "please sign in" message and is left running.
+        if (msg.kind === "degraded") clearHandshake();
         onAck?.(msg);
       }
       // Turn lifecycle → "working" indicator (working stays up through the whole
@@ -2411,12 +2471,26 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   const titleObserver = titleEl ? new MutationObserver(() => sendTitle()) : null;
   titleObserver?.observe(titleEl, { childList: true });
 
+  // After this many consecutive failed WS reconnects, the port is almost certainly
+  // DEAD (the orchestrator self-exited) rather than blipping — a bare WS retry will
+  // loop on a dead port forever. So we ESCALATE to a /connect respawn (P1). Kept
+  // low so recovery is quick, but >0 so a benign 1-tick blip to a still-alive
+  // orchestrator reconnects normally without a needless respawn.
+  const RESPAWN_AFTER_ATTEMPTS = 2;
   function scheduleReconnect() {
     if (closed || reconnectTimer) return;
     const delay = Math.min(RECONNECT_BASE_MS * 2 ** attempt, RECONNECT_MAX_MS);
     attempt += 1;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
+      // The WS keeps failing to (re)open → the bridge port is dead. If the panel's
+      // sticky-autoconnect respawn handles it (re-POST /connect, bounded), let IT
+      // drive the client; otherwise fall back to a bare WS retry. The respawn
+      // budget is NOT replenished by an automatic close (only by a successful
+      // handshake / a user-initiated Connect), so a persistent failure loop
+      // (respawn → agent fails → self-exit → respawn …) terminates instead of
+      // spinning hot.
+      if (attempt > RESPAWN_AFTER_ATTEMPTS && onBridgeClosed?.() === true) return;
       connect();
     }, delay);
   }
@@ -3080,6 +3154,8 @@ function describeCommand(cmd, msg, reply) {
         icon: "pi-info-circle",
         text: r.node_errors || r.last_execution_error ? "Read execution errors" : "Checked errors — none",
       };
+    case "free_vram":
+      return { icon: "pi-bolt", text: "Unloaded models — freed VRAM" };
     case "workflow_save":
       return { icon: "pi-save", text: `Saved “${r.workflow}”` };
     case "workflow_save_as":
@@ -3240,6 +3316,12 @@ function buildPanel() {
   // The backend we're actually CONNECTED to (set from the handshake). Used to
   // detect a real provider switch (vs. re-picking the current one).
   let connectedBackend = null;
+  // The discovered providers (from GET /backends), kept so the model popup's
+  // PROVIDER section can render them (the switcher now lives there, not in
+  // settings). Defaults to claude-only until discovery lands.
+  let knownBackends = [{ backend: "claude", running: false }];
+  // Short per-provider hint shown under each provider row in the popup.
+  const BACKEND_HINTS = { claude: "Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)" };
 
   function renderBackendChips(backends) {
     backendChips.replaceChildren();
@@ -3247,6 +3329,7 @@ function buildPanel() {
       Array.isArray(backends) && backends.length
         ? backends
         : [{ backend: "claude", running: false }];
+    knownBackends = list;
     for (const b of list) {
       const id = b.backend;
       const chip = document.createElement("button");
@@ -3361,7 +3444,11 @@ function buildPanel() {
     advToggle.textContent = advWrap.hidden ? "Advanced ▸" : "Advanced ▾";
   });
 
-  settingsBody.append(backendLabel, backendChips, btnRow, advToggle, advWrap, helpDiv);
+  // NOTE: the provider switcher (backendLabel + backendChips) moved INTO the model
+  // popup's PROVIDER section — see buildModelPop. The elements stay defined (so
+  // renderBackendChips/loadBackends keep working as the data source) but are no
+  // longer shown in settings.
+  settingsBody.append(btnRow, advToggle, advWrap, helpDiv);
   settingsBox.appendChild(settingsBody);
   // Lives in the header as a dropdown anchored under the status pill.
   header.appendChild(settingsBox);
@@ -3779,19 +3866,44 @@ function buildPanel() {
       modelPop.appendChild(el);
     };
 
+    // PROVIDER — pick Claude or ChatGPT right here (the switcher used to live in
+    // settings). Picking one runs the full switch flow (connectBackend → fresh
+    // orchestrator on that backend's port → handshake repopulates Model + Effort).
+    // Only shown when more than one provider is actually available.
+    if (knownBackends.length > 1) {
+      section("Provider");
+      const activeBackend = connectedBackend || selectedBackend;
+      for (const b of knownBackends) {
+        const id = b.backend;
+        const small = id === activeBackend ? "connected" : b.running ? "running" : "";
+        item({ label: BACKEND_LABELS[id] || id, small: BACKEND_HINTS[id] || small }, id === activeBackend, () => {
+          modelPop.hidden = true;
+          if (id !== activeBackend) connectBackend(id);
+        });
+      }
+    }
+
     section("Model");
     for (const m of modelCatalog) {
       item({ label: m.label, small: m.small }, m.id === prefs.model, () => {
         prefs.model = m.id;
         prefs.userSet = true;
-        // Drop an effort the new model can't do.
+        // SNAP the effort to the nearest level the new model supports (don't wipe
+        // it silently); only clear if the model has no effort control at all.
+        const before = prefs.effort;
         const avail = effortsForModel(m.id);
-        if (prefs.effort && !avail.includes(prefs.effort)) prefs.effort = undefined;
+        if (prefs.effort && !avail.includes(prefs.effort)) {
+          prefs.effort = avail.length ? nearestInList(prefs.effort, avail) : undefined;
+        }
         savePrefs(prefs);
         refreshModelChip();
         modelPop.hidden = true;
         client?.sendFrame?.({ type: "set_options", model: m.id, effort: prefs.effort ?? null });
-        appendSystem(`Model → ${m.label}.`);
+        if (prefs.effort && prefs.effort !== before) {
+          appendSystem(`Model → ${m.label}. Reasoning effort set to ${effortMeta(prefs.effort).label} (nearest level this model supports).`);
+        } else {
+          appendSystem(`Model → ${m.label}.`);
+        }
       });
     }
 
@@ -3823,14 +3935,29 @@ function buildPanel() {
       prefs.model = pickDefaultModel(modelCatalog);
     }
     // Preserve the user's chosen effort across a backend switch: the new backend's
-    // scale may not contain the exact level, so MAP it to the nearest valid one
-    // (Claude "max" → Codex "xhigh", Codex "none"/"minimal" → Claude "low") instead
-    // of dropping it. Only clear it if it maps to nothing (no effort control).
+    // scale may not contain the exact level, so SNAP it to the nearest level this
+    // MODEL actually offers (Claude "max" → Codex "xhigh", Codex "none"/"minimal"
+    // → Claude "low") instead of dropping it. Only clear it to undefined when the
+    // model has NO effort control (avail empty). Never change it invisibly: if the
+    // resulting level differs from what the user had, leave a one-line note.
     if (prefs.effort) {
-      const backend = connectedBackend || selectedBackend;
-      const mapped = mapEffortToBackend(prefs.effort, backend);
+      const before = prefs.effort;
       const avail = effortsForModel(prefs.model);
-      prefs.effort = mapped && avail.includes(mapped) ? mapped : undefined;
+      // Snap directly into the model's available set (which is already the
+      // intersection of the model's levels with the connected backend's scale).
+      const snapped = nearestInList(before, avail);
+      prefs.effort = snapped;
+      if (snapped !== before && prefs.userSet) {
+        if (snapped) {
+          appendSystem(
+            `Reasoning effort set to ${effortMeta(snapped).label} for ${modelLabel(modelCatalog, prefs.model)} (nearest level this model supports).`,
+          );
+        } else {
+          appendSystem(
+            `${modelLabel(modelCatalog, prefs.model)} has no reasoning-effort control; effort cleared.`,
+          );
+        }
+      }
     }
     savePrefs(prefs);
     refreshModelChip();
@@ -3852,6 +3979,12 @@ function buildPanel() {
     if (modelPop.hidden) {
       buildModelPop();
       modelPop.hidden = false;
+      // Refresh provider discovery (running status) in the background; rebuild the
+      // popup if it's still open and the list changed, so the PROVIDER section is
+      // current without blocking the open.
+      void loadBackends().then(() => {
+        if (!modelPop.hidden) buildModelPop();
+      });
     } else {
       modelPop.hidden = true;
     }
@@ -4467,7 +4600,9 @@ function buildPanel() {
       if (!ok) setMsgStatus(mid, "failed");
       else armDeliveryTimeout(mid);
     } else {
-      client?.sendFrame?.({ type: "interrupt" });
+      // requeue:true — this is SEND NOW, not a plain Stop: re-queue the turn the
+      // agent was interrupted on so BOTH it and this queued message get answered.
+      client?.sendFrame?.({ type: "interrupt", requeue: true });
     }
     renderTray();
   }
@@ -4966,6 +5101,15 @@ function buildPanel() {
       disconnectBtn.hidden = !connected;
       connectBtn.disabled = state === "connecting";
       connectBtn.textContent = state === "connecting" ? "Connecting…" : "Connect";
+      // A successful handshake → restore the auto-reclaim budget, so a LATER wedge
+      // (after a healthy session, e.g. the agent dies mid-use) can be auto-cleared
+      // again. The bound only prevents a loop WITHIN one unsuccessful connect. Also
+      // release the soft-reload interlock: the (possibly slow) reload's orchestrator
+      // handshook, so auto-respawn can guard the next drop normally.
+      if (connected) {
+        resetAutoReclaim();
+        clearSoftReloadGuard();
+      }
       if (!connected) hideThinking();
       // NB: do NOT push set_options here. The saved model id is only known-valid
       // once the live catalog arrives, so the push happens in applyModelCatalog
@@ -4997,6 +5141,23 @@ function buildPanel() {
     // The agent called panel_set_todo — render/update the live plan tray.
     onTodo(items) {
       renderTodo(items);
+    },
+    // The agent called panel_show_media — render images/videos directly in the chat.
+    onShowMedia(items) {
+      for (const item of items) {
+        const caption = item.caption || item.filename || "";
+        if (item.kind === "viewRef" && item.viewRef) {
+          const url = imageViewUrl(item.viewRef);
+          // Determine if ComfyUI ref is a video by extension
+          const isVid = /.(mp4|webm)$/i.test(item.viewRef.filename || "");
+          if (isVid) paintVideo(url, caption);
+          else paintImage(url, caption);
+        } else if (item.kind === "video" && item.dataUrl) {
+          paintVideo(item.dataUrl, caption);
+        } else if (item.dataUrl) {
+          paintImage(item.dataUrl, caption);
+        }
+      }
     },
     // Orchestrator pushed live download progress → render rows in the tray.
     onDownloads(list) {
@@ -5065,6 +5226,20 @@ function buildPanel() {
     onTurnAnchor(uuid) {
       turnAnchors.push(uuid);
       if (turnAnchors.length > 200) turnAnchors.shift();
+    },
+    // The bridge opened but no orchestrator handshake (models frame) arrived
+    // within the generous cold-start window → the wedge. Try a BOUNDED auto-reclaim
+    // (force-respawn the orchestrator + reconnect) before falling back to the
+    // manual warning. Returns true if it handled it (suppresses the warning).
+    onHandshakeTimeout(timedOutUrl) {
+      return tryAutoReclaim(timedOutUrl);
+    },
+    // WS reconnects keep failing → the bridge port is dead (orchestrator exited,
+    // e.g. self-exit after its agent failed). If sticky autoconnect is on, drive a
+    // BOUNDED respawn (re-POST /connect) so a fresh orchestrator comes up — instead
+    // of retrying a dead port forever (P1). Returns true if it handled it.
+    onBridgeClosed() {
+      return tryAutoRespawn();
     },
     onModels(list, _current, backend) {
       // The orchestrator self-reports its backend on the handshake — this is the
@@ -5297,10 +5472,25 @@ function buildPanel() {
   }
   function onExecError(ev) {
     const d = ev?.detail ?? {};
-    client.sendFrame({
-      type: "agent_event",
-      kind: "run_error",
-      error: d.exception_message || d.exception_type || "execution error",
+    // Name the failing node so the agent (and the user) know WHERE it broke —
+    // "Ideogram4PromptBuilderKJ (node 200)" beats a bare exception string.
+    const where = d.node_type
+      ? `${d.node_type} (node ${d.node_id})`
+      : d.node_id != null
+        ? `node ${d.node_id}`
+        : "";
+    const msg = d.exception_message || d.exception_type || "execution error";
+    const error = where ? `${where}: ${msg}` : msg;
+    // 1) Push it to the agent — the orchestrator INTERRUPTS its live turn and
+    //    front-queues this so it stops and fixes the error instead of running blind.
+    client.sendFrame({ type: "agent_event", kind: "run_error", error });
+    // 2) Render it immediately as an error widget in the chat, so the user sees it
+    //    even before the agent reacts (no waiting on a check-errors call).
+    paintCard({
+      icon: "pi-exclamation-triangle",
+      text: `Run error — ${where || "execution failed"}`,
+      detail: msg,
+      error: true,
     });
   }
   // Post-restart autonomy (#3): ComfyUI's api fires `reconnecting` when the
@@ -5358,12 +5548,189 @@ function buildPanel() {
   // tell a MANUAL Advanced-URL override apart from an auto-managed one, so a user
   // who typed their own bridge URL isn't silently overwritten by the backend's port.
   let lastAutoUrl = "";
+  // Bounded auto-reclaim of a WEDGED orchestrator (bridge open, agent never
+  // handshook). Each user-initiated connectAgent() resets the budget; the
+  // handshake-timeout handler spends it (force-respawn + reconnect). Once the
+  // budget is exhausted we stop and let the manual warning show — so a genuinely
+  // unrecoverable port (a foreign squatter the pack refuses to kill, or a backend
+  // that can't sign in) can NEVER drive an infinite respawn loop.
+  const MAX_AUTO_RECLAIMS = 2;
+  let autoReclaimsLeft = MAX_AUTO_RECLAIMS;
+  let autoReclaiming = false;
+  // SEPARATE budget for close-driven RESPAWN (P1): when the bridge dies (e.g. the
+  // orchestrator self-exited because its agent failed) the WS retries a dead port
+  // forever unless we re-POST /connect to spawn a fresh orchestrator. CRITICAL:
+  // this budget is NOT replenished on an automatic bridge-close — only by a
+  // successful handshake or a user-initiated Connect (resetAutoReclaim) — so a
+  // persistent failure (respawn → agent fails → self-exit → respawn …) is BOUNDED
+  // and terminates with the manual warning, never a hot loop.
+  const MAX_AUTO_RESPAWNS = 2;
+  let autoRespawnsLeft = MAX_AUTO_RESPAWNS;
+  let autoRespawning = false;
+  let respawnGaveUpNoticed = false; // one-shot "keeps failing" notice per budget
+  function resetAutoReclaim() {
+    autoReclaimsLeft = MAX_AUTO_RECLAIMS;
+    autoRespawnsLeft = MAX_AUTO_RESPAWNS;
+    respawnGaveUpNoticed = false;
+  }
+
+  // SOFT-RELOAD ↔ AUTO-RESPAWN interlock. A deliberate softReload(orchestrator)
+  // OWNS the respawn: it client.stop() → POST /reload → client.start(), then
+  // reconnects with backoff (up to RECONNECT_MAX_MS=15s) to the respawning
+  // orchestrator. WITHOUT this guard, if the fresh orchestrator's cold start
+  // (node spawn + env-capabilities probe) outlasts ~2 reconnect backoffs (~6s),
+  // scheduleReconnect's escalation would fire tryAutoRespawn → a COMPETING POST
+  // /connect, so two respawns race and reclaim/kill each other's orchestrator and
+  // the handshake never settles ("soft reload never works"). While this flag is
+  // set, tryAutoRespawn STANDS DOWN (returns false) so scheduleReconnect keeps
+  // doing bare WS retries — the soft-reload's own backoff reaches the new
+  // orchestrator uncontested. The flag is cleared on a successful handshake
+  // (onStatus "connected"), on a fresh user/sticky Connect, on a soft-reload that
+  // fails to even POST, and — as a safety net — after a generous timeout, so a
+  // soft-reload whose orchestrator NEVER comes up eventually re-enables the normal
+  // auto-respawn recovery instead of disabling it forever.
+  // > RECONNECT_MAX_MS (15s) so the soft-reload's own backoff gets a full shot
+  // before auto-respawn is re-armed.
+  const SOFT_RELOAD_GUARD_MS = 28000;
+  let softReloadInFlight = false;
+  let softReloadGuardTimer = null;
+  function setSoftReloadGuard() {
+    softReloadInFlight = true;
+    if (softReloadGuardTimer) clearTimeout(softReloadGuardTimer);
+    softReloadGuardTimer = setTimeout(() => {
+      softReloadGuardTimer = null;
+      softReloadInFlight = false; // safety: a failed soft-reload re-enables auto-respawn
+    }, SOFT_RELOAD_GUARD_MS);
+  }
+  function clearSoftReloadGuard() {
+    softReloadInFlight = false;
+    if (softReloadGuardTimer) {
+      clearTimeout(softReloadGuardTimer);
+      softReloadGuardTimer = null;
+    }
+  }
+  // The bridge died and WS reconnects keep failing → the port is dead (the
+  // orchestrator exited). If sticky autoconnect is on, spend the bounded respawn
+  // budget to re-POST /connect (spawn a FRESH orchestrator) and reconnect. Returns
+  // true if it drove a respawn (the caller then skips its bare WS retry), false to
+  // let the WS keep retrying / fall back to the manual warning.
+  function tryAutoRespawn() {
+    if (!lsGet(AUTOCONNECT_KEY)) return false; // user never connected / disconnected
+    // A deliberate soft-reload owns the respawn — DON'T compete. Return false so
+    // scheduleReconnect keeps doing bare WS retries (the soft-reload's own backoff
+    // reaches the new orchestrator); the guard is time-bounded so a stuck reload
+    // eventually re-enables this path.
+    if (softReloadInFlight) return false;
+    if (autoRespawning) return true; // one in flight — don't stack
+    if (autoRespawnsLeft <= 0) {
+      // Budget spent → stop respawning and tell the user once, then let the bare
+      // WS retry continue quietly in the background (cheap; no more spawns).
+      if (!respawnGaveUpNoticed) {
+        respawnGaveUpNoticed = true;
+        appendSystem(
+          "⚠ The panel agent keeps failing to start. Check you're signed in " +
+            "(run `claude` once, or `codex login` for Codex), then click Connect.",
+        );
+      }
+      return false;
+    }
+    autoRespawnsLeft -= 1;
+    autoRespawning = true;
+    appendSystem("The panel agent dropped — restarting it…");
+    const myGen = connectGen;
+    void (async () => {
+      try {
+        const res = await api.fetchApi("/comfyui_mcp_panel/connect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ backend: selectedBackend }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (myGen !== connectGen) return; // a newer user connect took over
+        if (!data?.ok) {
+          if (data?.message) appendSystem(data.message);
+          autoRespawnsLeft = 0; // can't spawn (e.g. not signed in) → stop looping
+          client.start(); // resume the bare WS retry so the client isn't left idle
+          return;
+        }
+        if (data?.bridge_url && data.bridge_url !== client.currentUrl()) {
+          client.setUrl(data.bridge_url); // reconnects to the fresh orchestrator
+        } else {
+          client.start();
+        }
+      } catch (err) {
+        if (myGen !== connectGen) return;
+        appendSystem(`Auto-restart failed: ${err?.message ?? err}`);
+        autoRespawnsLeft = 0; // can't reach the pack → don't loop
+        client.start(); // resume the bare WS retry so the client isn't left idle
+      } finally {
+        autoRespawning = false;
+      }
+    })();
+    return true;
+  }
+  // Returns true if it kicked off a reclaim (the bridge client then suppresses its
+  // manual warning); false to let the warning show (budget spent / can't reclaim).
+  function tryAutoReclaim(timedOutUrl) {
+    if (autoReclaiming) return true; // one in flight already — don't stack
+    if (autoReclaimsLeft <= 0) return false; // budget spent → fall back to warning
+    autoReclaimsLeft -= 1;
+    autoReclaiming = true;
+    appendSystem(
+      "No response from the panel agent on the bridge — the orchestrator looks wedged. " +
+        "Restarting it automatically…",
+    );
+    const myGen = connectGen; // tie to the current connect generation
+    void (async () => {
+      try {
+        // Ask the pack to FORCE-reclaim: kill the wedged (but lockfile-healthy)
+        // orchestrator on this backend's port — verified-orchestrator-only,
+        // server-side — and spawn a fresh one. The pack reports back if the port
+        // is held by a non-orchestrator it refuses to kill.
+        const res = await api.fetchApi("/comfyui_mcp_panel/connect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ backend: selectedBackend, force: true }),
+        });
+        const data = await res.json().catch(() => ({}));
+        // A newer user-initiated connect superseded us → let it drive.
+        if (myGen !== connectGen) return;
+        if (!data?.ok) {
+          // The pack couldn't reclaim (e.g. a foreign process holds the port) —
+          // surface its message and stop auto-reclaiming so the warning can show.
+          if (data?.message) appendSystem(data.message);
+          autoReclaimsLeft = 0;
+          return;
+        }
+        if (data?.bridge_url && data.bridge_url !== client.currentUrl()) {
+          client.setUrl(data.bridge_url); // setUrl reconnects
+        } else {
+          client.start(); // re-open against the same URL → fresh handshake attempt
+        }
+      } catch (err) {
+        if (myGen !== connectGen) return;
+        appendSystem(`Auto-restart failed: ${err?.message ?? err}`);
+        autoReclaimsLeft = 0; // can't reach the pack → don't loop
+      } finally {
+        autoReclaiming = false;
+      }
+    })();
+    return true;
+  }
   async function connectAgent(opts = {}) {
     // A chip pick (opts.fromChip) is an EXPLICIT backend choice — it must always
     // (re)connect to that backend's port, so it bypasses the in-flight guard (which
     // a sticky-reconnect could otherwise hold) and the manual-URL override below.
     if (connecting && !opts.fromChip) return;
     const myGen = ++connectGen; // newest attempt; stale ones bail before touching client
+    // A fresh user-/sticky-initiated connect gets a fresh auto-reclaim budget — the
+    // bound is PER user-initiated connect, so each new Connect can attempt to clear
+    // a wedge again (but a single connect can never loop forever). It also
+    // supersedes any in-flight soft-reload interlock (softReload reconnects via
+    // client.start(), not connectAgent, so reaching here means a NEW connect intent
+    // took over — re-arm normal auto-respawn).
+    resetAutoReclaim();
+    clearSoftReloadGuard();
     connecting = true;
     connectBtn.disabled = true;
     connectBtn.textContent = "Starting…";
@@ -5482,6 +5849,11 @@ function buildPanel() {
     }
     reloading = true;
     ssSet(SOFT_RELOAD_KEY, origin === "agent" ? "agent" : "user");
+    // This deliberate reload OWNS the respawn — stand auto-respawn down so it can't
+    // POST a competing /connect while the fresh orchestrator cold-starts (the race
+    // that made soft reload fail intermittently). Cleared on handshake or by the
+    // guard's safety timeout.
+    setSoftReloadGuard();
     appendSystem("Soft-reloading the agent (new code, no ComfyUI restart)…");
     try {
       client.stop(); // drop the bridge so the old orchestrator can release the port
@@ -5489,17 +5861,20 @@ function buildPanel() {
       const data = await res.json().catch(() => ({}));
       if (!data?.ok) {
         ssSet(SOFT_RELOAD_KEY, null);
+        clearSoftReloadGuard(); // never started respawning → re-enable auto-respawn
         appendSystem(data?.message || "Soft reload failed — try Disconnect then Connect.");
         return;
       }
     } catch (err) {
       ssSet(SOFT_RELOAD_KEY, null);
+      clearSoftReloadGuard(); // POST failed → re-enable auto-respawn
       appendSystem(`Couldn't reach ComfyUI to reload the agent: ${err?.message ?? err}`);
       return;
     } finally {
       reloading = false;
     }
-    // Reconnect with backoff until the fresh orchestrator binds; onAck resumes.
+    // Reconnect with backoff until the fresh orchestrator binds; onAck resumes. The
+    // soft-reload guard keeps auto-respawn from racing this backoff window.
     client.start();
   }
 
@@ -6542,6 +6917,13 @@ function buildPanel() {
   // (not just on the trigger or an option). Uses mousedown so it settles before
   // an option's own click handler runs. The completion menu keeps its own
   // blur-based dismissal.
+  //
+  // CAPTURE PHASE (third arg `true`) is load-bearing: ComfyUI's LiteGraph canvas
+  // calls stopPropagation() on its pointer/mouse events, so a bubble-phase
+  // document listener never sees clicks on the canvas — the dropdown would only
+  // close when clicking inside the panel. Capturing runs on the way DOWN to the
+  // target, before LiteGraph can swallow the event, so a click ANYWHERE (canvas,
+  // toolbar, other widgets) dismisses the dropdown.
   function onDocPointerDown(ev) {
     const t = ev.target;
     if (!settingsBox.hidden && !settingsBox.contains(t) && !status.contains(t)) {
@@ -6554,7 +6936,7 @@ function buildPanel() {
       modelPop.hidden = true;
     }
   }
-  document.addEventListener("mousedown", onDocPointerDown);
+  document.addEventListener("mousedown", onDocPointerDown, true);
 
   // Reload restore: repaint the chat this tab was last showing. The agent's
   // memory continues automatically — either the orchestrator's agent for this
@@ -6613,7 +6995,7 @@ function buildPanel() {
       } catch {
         // recognition already stopped
       }
-      document.removeEventListener("mousedown", onDocPointerDown);
+      document.removeEventListener("mousedown", onDocPointerDown, true);
       try {
         api.removeEventListener("executed", onExecuted);
         api.removeEventListener("execution_error", onExecError);

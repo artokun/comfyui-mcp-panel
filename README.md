@@ -43,7 +43,7 @@ Each provider runs its own orchestrator on its own loopback port (Claude on
 | **Installer packs + skills** | The agent discovers bundled model-family skills and one-command installer packs, then applies the manifest and loads the ready workflow instead of hand-building a graph. |
 | **Rewind & rollback** | Roll back **code** (graph), **conversation** (fork the session), or **both** from any past message, plus `/revert` and double-Esc quick rewind. |
 | **Autonomous install → restart → continue** | Install custom nodes through your own ComfyUI Manager, restart ComfyUI to load them, and the panel auto-reconnects so the agent resumes its task. |
-| **Reasoning effort + model selector** | A per-provider effort/model picker; a chosen effort survives a provider switch by mapping to the nearest valid level. |
+| **Reasoning effort + model selector** | A per-provider effort/model picker — Claude's models, or ChatGPT's GPT-5-class models via Codex — moved into the model selector; a chosen effort survives a provider switch by mapping to the nearest valid level. |
 | **Pending-message tray + reconnect durability** | Queue messages while the agent is busy (edit / send-now / reorder), and reclaim a wedged orchestrator on Connect. |
 
 ## Quickstart
@@ -52,8 +52,8 @@ Each provider runs its own orchestrator on its own loopback port (Claude on
    `git clone https://github.com/artokun/comfyui-mcp-panel` into
    `ComfyUI/custom_nodes`. Restart ComfyUI; an **Agent** tab (💬) appears in the sidebar.
 2. **Sign in to your provider once** so the agent can run on your subscription (Node ≥ 22):
-   - Claude: `claude` (or `claude setup-token`)
-   - ChatGPT: `codex login`
+   - Claude (via the Claude CLI): `claude` (or `claude setup-token`)
+   - ChatGPT (via the Codex CLI): `codex login`
 3. **Open the Agent tab**, pick **Claude** or **ChatGPT** in the backend picker,
    and click **Connect**. The panel starts that provider's background orchestrator
    on your subscription — no API keys — and the status pill turns green.
@@ -203,7 +203,7 @@ hosts for the ChatGPT/Codex backend, so feature parity is automatic.
 
 | Tool | Effect |
 |---|---|
-| `panel_add_mcp` / `panel_remove_mcp` | Connect / remove an MCP server in your Claude config |
+| `panel_add_mcp` / `panel_remove_mcp` | Connect / remove an MCP server in your agent's MCP config (Claude or Codex) |
 | `panel_request_secret` | Securely collect an API token — the agent never sees the value |
 | `panel_reload` | Soft-reload the orchestrator (new code/tools) or the panel UI, then resume |
 
@@ -234,7 +234,7 @@ identical across providers.
   delete buttons. **Send-now** interrupts the current turn to steer it; a drag
   handle (≡) reorders how the agent flushes them. On dequeue a message
   materializes at the **bottom** of the chat, so it flows in the exact order
-  Claude processes it.
+  the agent (Claude or ChatGPT) processes it.
 - **Destructive-op confirmation.** `panel_clear` and `panel_restart_comfyui`
   pop a yes / no card and only act on **yes**.
 - **Reconnect durability.** A wedged orchestrator no longer strands the panel —
@@ -252,7 +252,7 @@ identical across providers.
 
 - ComfyUI with a frontend exposing `app.extensionManager.registerSidebarTab` (any 2024+ release)
 - Node ≥ 22 for the orchestrator (`npx -y comfyui-mcp --panel-orchestrator`, started for you by **Connect**)
-- A subscription login for the provider you pick — **Claude** (`claude`) or **ChatGPT** (`codex login`). The agent runs on your subscription, no API key.
+- A subscription login for the provider you pick — **Claude** via the Claude CLI (`claude`) or **ChatGPT** via the Codex CLI (`codex login`). The agent runs on your subscription, no API key.
 
 ## Roadmap
 

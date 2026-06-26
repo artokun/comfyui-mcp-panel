@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-agent-panel"
-description = "AI agent sidebar for ComfyUI — an autonomous background agent drives your graph, running on your Claude subscription with no API keys. Add, wire, move and tweak nodes live with full Ctrl+Z undo, generate images, video and audio, and run your workflow. Click Connect to start the agent. Part of the comfyui-mcp project."
-version = "0.2.0"
+description = "Autonomous AI agent in the ComfyUI sidebar — on Claude OR ChatGPT (your own subscription, no API keys). Pick a provider and the agent drives your live canvas at full parity: add, wire, move and tweak nodes with Ctrl+Z undo, load whole workflows and installer packs in one shot, generate images, video and audio, and run your workflow — asking before it spends paid API credits. Part of the comfyui-mcp project."
+version = "0.3.0"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
 # UI-only pack: no Python deps. The frontend floor guarantees
@@ -17,5 +17,6 @@ Documentation = "https://comfyui-mcp.artokun.io/docs"
 [tool.comfy]
 PublisherId = "artokun"
 DisplayName = "ComfyUI Agent Panel"
+Tags = ["agent", "ai-agent", "assistant", "copilot", "claude", "chatgpt", "gpt-5", "codex", "mcp", "autonomous", "natural-language", "workflow", "sidebar", "automation"]
 Icon = "https://raw.githubusercontent.com/artokun/comfyui-mcp-panel/main/assets/icon.png"
 Banner = "https://raw.githubusercontent.com/artokun/comfyui-mcp-panel/main/assets/banner.png"
