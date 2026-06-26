@@ -3869,6 +3869,17 @@ function renderRichText(el, text) {
   el.innerHTML = DOMPurify.sanitize(marked.parse(String(text)));
 }
 
+// SINGLETON GUARD: at most ONE bridge client may be live per page. ComfyUI can
+// call the sidebar tab's render() more than once (sidebar restore on a fresh
+// restart, layout re-mounts, open/close churn). Each render() builds a panel +
+// a bridge client that connects with THIS tab's tab_id. If a prior client is
+// left alive, two clients share the same tab_id and the bridge's
+// close-old-on-new-hello (ui-bridge) makes them ping-pong reconnect forever —
+// that's the ~1s "reconnect storm" (proven: alternating sockets, same tab_id,
+// clean 1005 closes). Tracking the live client at module scope and tearing down
+// any prior one before creating a new one makes the storm structurally impossible.
+let liveBridgeClient = null;
+
 function buildPanel() {
   ensureStyles();
 
@@ -5897,6 +5908,16 @@ function buildPanel() {
   let pendingSecretRequest = null;
 
   // ---- bridge wiring ----
+  // Tear down any client a previous mount left alive BEFORE creating ours, so
+  // only one client ever holds this tab's tab_id (see liveBridgeClient note).
+  if (liveBridgeClient) {
+    try {
+      liveBridgeClient.destroy();
+    } catch {
+      // already gone
+    }
+    liveBridgeClient = null;
+  }
   const client = createBridgeClient({
     onStatus(state) {
       statusText.textContent = state;
@@ -6167,6 +6188,8 @@ function buildPanel() {
     },
     getResume: () => ssGet(SESSION_KEY),
   });
+  // This is now THE live client for the page.
+  liveBridgeClient = client;
 
   // ---- ComfyUI execution events → image cards + agent awareness (#7) ----
   // When a run finishes with output images, show them in the chat and notify
@@ -8082,6 +8105,7 @@ function buildPanel() {
       panelHooks.applyAutoConnect = null;
       panelHooks.requestSecret = null;
       client.destroy();
+      if (liveBridgeClient === client) liveBridgeClient = null;
       root.remove();
     },
   };
