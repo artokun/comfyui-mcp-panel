@@ -2648,6 +2648,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
     // into the "Auto-connect on load" setting so the toggle reflects reality.
     lsSet(AUTOCONNECT_KEY, "1");
     setSetting(SETTING_AUTOCONNECT, true);
+    // The REAL handshake landed — this is the ONLY place patience resets. A bare
+    // WS open must NOT reset it: an orchestrator that repeatedly opens-then-closes
+    // before sending `models` (crash loop / agent boot failure / a wrong process
+    // that accepts-then-drops) would otherwise keep attempt pinned at 1 and spin
+    // "connecting" forever, masking a genuine terminal failure.
+    attempt = 0;
     gaveUp = false;
     loggedWaiting = false;
     emitStatus("connected");
@@ -2677,11 +2683,14 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
     }
 
     sock.addEventListener("open", () => {
-      attempt = 0;
-      gaveUp = false; // a real open means the cold start is over → fresh patience
       handshakeDone = false;
-      // Stay "connecting" until the orchestrator handshake (models frame) lands.
-      emitStatus("connecting");
+      // A bare WS open is NOT progress — the orchestrator handshake (`models`)
+      // hasn't arrived yet. Do NOT reset attempt/gaveUp here (only markConnected
+      // does), so an open-then-close-before-`models` cycle still INCREMENTS toward
+      // the patience terminal. While we're still patient, show "connecting"; once
+      // gaveUp is latched, a mere open must NOT clear it back to "connecting" —
+      // only a real `models` handshake (markConnected) does.
+      if (!gaveUp) emitStatus("connecting");
       // FIX 3 — log the "waiting for the panel agent" line ONCE per connect
       // sequence instead of on every (re)open during a cold-start flicker.
       if (!loggedWaiting) {
@@ -6197,20 +6206,31 @@ function buildPanel() {
   // soft-reload whose orchestrator NEVER comes up eventually re-enables the normal
   // auto-respawn recovery instead of disabling it forever.
   // > RECONNECT_MAX_MS (15s) so the soft-reload's own backoff gets a full shot
-  // before auto-respawn is re-armed.
-  const SOFT_RELOAD_GUARD_MS = 28000;
-  // SHORT one-shot escalation window for a STUCK soft-reload. The guard above stops
+  // before auto-respawn is re-armed. BACKEND-AWARE: the guard must outlast the
+  // backend's handshake window (handshakeMs()) so a healthy slow reload completes
+  // on its own backoff before the guard releases — Codex's app-server handshake is
+  // 45s, so its guard is ~50s; Claude keeps 28s (still > its 20s handshake).
+  const SOFT_RELOAD_GUARD_MS_BY_BACKEND = { codex: 50000, claude: 28000 };
+  function softReloadGuardMs() {
+    return SOFT_RELOAD_GUARD_MS_BY_BACKEND[selectedBackend] ?? 28000;
+  }
+  // One-shot escalation window for a STUCK soft-reload. The guard above stops
   // a competing-respawn storm, but it leaves a gap: when the fresh orchestrator binds
   // the port yet its AGENT handshake (the `models` frame → "connected") never lands,
   // the WS is OPEN — so there's no close event to drive scheduleReconnect, and
   // tryAutoRespawn is standing down for the guard window. The panel then sits in the
   // "Connected … waiting for the panel agent" stuck state until the user manually
-  // clicks Reconnect. So: if the handshake hasn't landed within this short window
-  // (comfortably under the 28s guard and the 20s HANDSHAKE_MS, but generous enough
-  // for a normal cold start), AUTO-ESCALATE once to exactly what Reconnect does — a
-  // single clean connectAgent(). One-shot (never a loop) so it can't reintroduce the
-  // storm the interlock prevents.
-  const SOFT_RELOAD_ESCALATE_MS = 11000;
+  // clicks Reconnect. So: if the handshake hasn't landed within this window,
+  // AUTO-ESCALATE once to exactly what Reconnect does — a single clean
+  // connectAgent(). One-shot (never a loop) so it can't reintroduce the storm the
+  // interlock prevents. BACKEND-AWARE: the escalation must sit BEYOND the backend's
+  // normal cold-start handshake (handshakeMs()) so a healthy-but-slow reload is
+  // never pre-empted — Codex (45s handshake) escalates at ~40s, comfortably under
+  // its ~50s guard; Claude keeps 11s (under its 28s guard and > its 20s handshake).
+  const SOFT_RELOAD_ESCALATE_MS_BY_BACKEND = { codex: 40000, claude: 11000 };
+  function softReloadEscalateMs() {
+    return SOFT_RELOAD_ESCALATE_MS_BY_BACKEND[selectedBackend] ?? 11000;
+  }
   let softReloadInFlight = false;
   let softReloadGuardTimer = null;
   let softReloadEscalateTimer = null;
@@ -6220,7 +6240,7 @@ function buildPanel() {
     softReloadGuardTimer = setTimeout(() => {
       softReloadGuardTimer = null;
       softReloadInFlight = false; // safety: a failed soft-reload re-enables auto-respawn
-    }, SOFT_RELOAD_GUARD_MS);
+    }, softReloadGuardMs());
     // Arm the stuck-handshake escalation. A FAST soft-reload handshakes well before
     // this fires and clearSoftReloadGuard() (on "connected") cancels it → no
     // escalation. Only a genuinely stuck reload reaches the timer.
@@ -6228,7 +6248,7 @@ function buildPanel() {
     softReloadEscalateTimer = setTimeout(() => {
       softReloadEscalateTimer = null;
       escalateSoftReload();
-    }, SOFT_RELOAD_ESCALATE_MS);
+    }, softReloadEscalateMs());
   }
   function clearSoftReloadGuard() {
     softReloadInFlight = false;
