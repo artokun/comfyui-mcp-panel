@@ -2786,13 +2786,59 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   let closed = false;
   let attempt = 0;
   let reconnectTimer = null;
+  // De-duped status emitter. The pill only ever needs TRANSITIONS, so collapsing
+  // consecutive repeats is a guard against any path double-emitting the same state
+  // (and keeps the cold-start steady-"connecting" from re-painting on every retry).
+  // "connected" is never swallowed — a re-handshake must still re-run its side
+  // effects (budget reset, soft-reload interlock release).
+  let lastStatus = null;
+  function emitStatus(s) {
+    if (s === lastStatus && s !== "connected") return;
+    lastStatus = s;
+    onStatus(s);
+  }
+  // FIX 1/2 — STEADY status + cold-start patience. While we're actively (auto)
+  // reconnecting we hold the pill on a steady "connecting"; a terminal
+  // "disconnected" ("couldn't connect") is only surfaced once the patient
+  // cold-start window is exhausted. The bounded reconnect/respawn machinery keeps
+  // trying underneath either way — `gaveUp` just latches the terminal display so
+  // later background retries don't re-pulse the pill connecting↔disconnected.
+  let gaveUp = false;
+  let loggedWaiting = false; // FIX 3 — throttle the "waiting for the panel agent" log
+  function backendNow() {
+    try {
+      return window.localStorage.getItem(STORAGE_KEY_BACKEND) || "claude";
+    } catch {
+      return "claude";
+    }
+  }
+  // Bare WS retries before escalating to the BOUNDED /connect respawn. Codex's
+  // `codex app-server` cold-starts much slower than Claude's Agent SDK, so it gets
+  // ~3x the window. This is the escalation THRESHOLD only — the respawn/reclaim
+  // BOUNDS (MAX_AUTO_RESPAWNS / MAX_AUTO_RECLAIMS) are untouched.
+  const RESPAWN_AFTER_BY_BACKEND = { codex: 6, claude: 2 };
+  function respawnAfterAttempts() {
+    return RESPAWN_AFTER_BY_BACKEND[backendNow()] ?? 2;
+  }
+  // Failed (re)connect attempts ridden out as a steady "connecting" before a
+  // terminal "disconnected". Backend-aware, ~3x for Codex's slower cold start.
+  const CONNECT_PATIENCE_BY_BACKEND = { codex: 12, claude: 4 };
+  function connectPatienceAttempts() {
+    return CONNECT_PATIENCE_BY_BACKEND[backendNow()] ?? 4;
+  }
   // Truthful "connected": a WS open is NOT enough — we only flip to "connected"
   // once the orchestrator handshake (its `models` frame) arrives. A non-orchestrator
   // squatter on the port (some other process) never sends it,
   // so the panel won't lie "connected" when there's no agent behind the socket.
   let handshakeTimer = null;
   let handshakeDone = false;
-  const HANDSHAKE_MS = 20000;
+  // Handshake (models-frame) window AFTER the WS opens. Backend-aware: Codex's
+  // app-server can still be booting its agent after the bridge accepts the socket,
+  // so it gets a wider window before we treat the open socket as wedged (FIX 2).
+  const HANDSHAKE_MS_BY_BACKEND = { codex: 45000, claude: 20000 };
+  function handshakeMs() {
+    return HANDSHAKE_MS_BY_BACKEND[backendNow()] ?? 20000;
+  }
   function clearHandshake() {
     if (handshakeTimer) {
       clearTimeout(handshakeTimer);
@@ -2807,7 +2853,15 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
     // into the "Auto-connect on load" setting so the toggle reflects reality.
     lsSet(AUTOCONNECT_KEY, "1");
     setSetting(SETTING_AUTOCONNECT, true);
-    onStatus("connected");
+    // The REAL handshake landed — this is the ONLY place patience resets. A bare
+    // WS open must NOT reset it: an orchestrator that repeatedly opens-then-closes
+    // before sending `models` (crash loop / agent boot failure / a wrong process
+    // that accepts-then-drops) would otherwise keep attempt pinned at 1 and spin
+    // "connecting" forever, masking a genuine terminal failure.
+    attempt = 0;
+    gaveUp = false;
+    loggedWaiting = false;
+    emitStatus("connected");
   }
 
   function connect() {
@@ -2818,21 +2872,36 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
     if (sock && (sock.readyState === WebSocket.CONNECTING || sock.readyState === WebSocket.OPEN)) {
       return;
     }
-    onStatus("connecting");
+    // Steady "connecting" while we're still within the patient cold-start window.
+    // Once we've given up (patience exhausted) we DON'T flip back to "connecting"
+    // on each background retry — that latched "disconnected" is what stops the
+    // connecting↔disconnected flicker.
+    if (!gaveUp) emitStatus("connecting");
     try {
       sock = new WebSocket(url);
     } catch (err) {
-      onStatus("disconnected");
+      // Constructor threw before a socket exists → no open/close will fire, so we
+      // drive the retry directly. Keep the status steady (scheduleReconnect decides
+      // connecting-vs-terminal); do NOT flip to "disconnected" here (FIX 1).
       scheduleReconnect();
       return;
     }
 
     sock.addEventListener("open", () => {
-      attempt = 0;
       handshakeDone = false;
-      // Stay "connecting" until the orchestrator handshake (models frame) lands.
-      onStatus("connecting");
-      onLog(`Connected to ${url} — waiting for the panel agent…`);
+      // A bare WS open is NOT progress — the orchestrator handshake (`models`)
+      // hasn't arrived yet. Do NOT reset attempt/gaveUp here (only markConnected
+      // does), so an open-then-close-before-`models` cycle still INCREMENTS toward
+      // the patience terminal. While we're still patient, show "connecting"; once
+      // gaveUp is latched, a mere open must NOT clear it back to "connecting" —
+      // only a real `models` handshake (markConnected) does.
+      if (!gaveUp) emitStatus("connecting");
+      // FIX 3 — log the "waiting for the panel agent" line ONCE per connect
+      // sequence instead of on every (re)open during a cold-start flicker.
+      if (!loggedWaiting) {
+        loggedWaiting = true;
+        onLog(`Connected to ${url} — waiting for the panel agent…`);
+      }
       sendHello();
       clearHandshake();
       handshakeTimer = setTimeout(() => {
@@ -2850,7 +2919,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
               `Close it, or fully restart ComfyUI, then reconnect.`,
           );
         }
-      }, HANDSHAKE_MS);
+      }, handshakeMs());
     });
 
     sock.addEventListener("message", async (ev) => {
@@ -2999,7 +3068,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       clearHandshake();
       lastBridgeDownAt = Date.now(); // for the fast-vs-slow reconnect heuristic
       if (!closed) {
-        onStatus("disconnected");
+        // FIX 1 — auto-reconnecting: keep the pill STEADY (scheduleReconnect picks
+        // connecting-vs-terminal based on the patience window). Do NOT flip to
+        // "disconnected" between attempts — that was the source of the flicker.
         scheduleReconnect();
       }
     });
@@ -3049,26 +3120,33 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   const titleObserver = titleEl ? new MutationObserver(() => sendTitle()) : null;
   titleObserver?.observe(titleEl, { childList: true });
 
-  // After this many consecutive failed WS reconnects, the port is almost certainly
-  // DEAD (the orchestrator self-exited) rather than blipping — a bare WS retry will
-  // loop on a dead port forever. So we ESCALATE to a /connect respawn (P1). Kept
-  // low so recovery is quick, but >0 so a benign 1-tick blip to a still-alive
-  // orchestrator reconnects normally without a needless respawn.
-  const RESPAWN_AFTER_ATTEMPTS = 2;
   function scheduleReconnect() {
     if (closed || reconnectTimer) return;
     const delay = Math.min(RECONNECT_BASE_MS * 2 ** attempt, RECONNECT_MAX_MS);
     attempt += 1;
+    // FIX 1/2 — STATUS: hold a steady "connecting" while we're still inside the
+    // patient (backend-aware) cold-start window; only once it's exhausted do we
+    // latch a terminal "disconnected" ("couldn't connect"). The reconnect/respawn
+    // machinery below keeps trying regardless — this only governs the pill so it
+    // neither thrashes nor lies.
+    if (attempt > connectPatienceAttempts()) {
+      gaveUp = true;
+      emitStatus("disconnected");
+    } else if (!gaveUp) {
+      emitStatus("connecting");
+    }
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
-      // The WS keeps failing to (re)open → the bridge port is dead. If the panel's
-      // sticky-autoconnect respawn handles it (re-POST /connect, bounded), let IT
-      // drive the client; otherwise fall back to a bare WS retry. The respawn
+      // The WS keeps failing to (re)open → the bridge port is likely dead. If the
+      // panel's sticky-autoconnect respawn handles it (re-POST /connect, bounded),
+      // let IT drive the client; otherwise fall back to a bare WS retry. The respawn
       // budget is NOT replenished by an automatic close (only by a successful
       // handshake / a user-initiated Connect), so a persistent failure loop
       // (respawn → agent fails → self-exit → respawn …) terminates instead of
-      // spinning hot.
-      if (attempt > RESPAWN_AFTER_ATTEMPTS && onBridgeClosed?.() === true) return;
+      // spinning hot. The escalation THRESHOLD (respawnAfterAttempts) is backend-
+      // aware so Codex's slower cold start gets more bare retries before we respawn;
+      // the respawn/reclaim BOUNDS themselves are unchanged.
+      if (attempt > respawnAfterAttempts() && onBridgeClosed?.() === true) return;
       connect();
     }, delay);
   }
@@ -3076,6 +3154,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   return {
     start() {
       closed = false;
+      // A fresh connect intent (user Connect / sticky reconnect / respawn handoff)
+      // restarts the patient cold-start window: clear the terminal latch and the
+      // attempt count so we ride out the slow boot again as a steady "connecting"
+      // (and the "waiting for the panel agent" line logs once more). FIX 1/2/3.
+      gaveUp = false;
+      loggedWaiting = false;
+      attempt = 0;
       connect();
     },
     sendUserMessage(text, context, images, mid) {
@@ -3111,6 +3196,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       url = next || DEFAULT_BRIDGE_URL;
       saveBridgeUrl(url);
       attempt = 0;
+      // Pointing at a new bridge is a fresh connect → restart the patience window.
+      gaveUp = false;
+      loggedWaiting = false;
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -6371,20 +6459,31 @@ function buildPanel() {
   // soft-reload whose orchestrator NEVER comes up eventually re-enables the normal
   // auto-respawn recovery instead of disabling it forever.
   // > RECONNECT_MAX_MS (15s) so the soft-reload's own backoff gets a full shot
-  // before auto-respawn is re-armed.
-  const SOFT_RELOAD_GUARD_MS = 28000;
-  // SHORT one-shot escalation window for a STUCK soft-reload. The guard above stops
+  // before auto-respawn is re-armed. BACKEND-AWARE: the guard must outlast the
+  // backend's handshake window (handshakeMs()) so a healthy slow reload completes
+  // on its own backoff before the guard releases — Codex's app-server handshake is
+  // 45s, so its guard is ~50s; Claude keeps 28s (still > its 20s handshake).
+  const SOFT_RELOAD_GUARD_MS_BY_BACKEND = { codex: 50000, claude: 28000 };
+  function softReloadGuardMs() {
+    return SOFT_RELOAD_GUARD_MS_BY_BACKEND[selectedBackend] ?? 28000;
+  }
+  // One-shot escalation window for a STUCK soft-reload. The guard above stops
   // a competing-respawn storm, but it leaves a gap: when the fresh orchestrator binds
   // the port yet its AGENT handshake (the `models` frame → "connected") never lands,
   // the WS is OPEN — so there's no close event to drive scheduleReconnect, and
   // tryAutoRespawn is standing down for the guard window. The panel then sits in the
   // "Connected … waiting for the panel agent" stuck state until the user manually
-  // clicks Reconnect. So: if the handshake hasn't landed within this short window
-  // (comfortably under the 28s guard and the 20s HANDSHAKE_MS, but generous enough
-  // for a normal cold start), AUTO-ESCALATE once to exactly what Reconnect does — a
-  // single clean connectAgent(). One-shot (never a loop) so it can't reintroduce the
-  // storm the interlock prevents.
-  const SOFT_RELOAD_ESCALATE_MS = 11000;
+  // clicks Reconnect. So: if the handshake hasn't landed within this window,
+  // AUTO-ESCALATE once to exactly what Reconnect does — a single clean
+  // connectAgent(). One-shot (never a loop) so it can't reintroduce the storm the
+  // interlock prevents. BACKEND-AWARE: the escalation must sit BEYOND the backend's
+  // normal cold-start handshake (handshakeMs()) so a healthy-but-slow reload is
+  // never pre-empted — Codex (45s handshake) escalates at ~40s, comfortably under
+  // its ~50s guard; Claude keeps 11s (under its 28s guard and > its 20s handshake).
+  const SOFT_RELOAD_ESCALATE_MS_BY_BACKEND = { codex: 40000, claude: 11000 };
+  function softReloadEscalateMs() {
+    return SOFT_RELOAD_ESCALATE_MS_BY_BACKEND[selectedBackend] ?? 11000;
+  }
   let softReloadInFlight = false;
   let softReloadGuardTimer = null;
   let softReloadEscalateTimer = null;
@@ -6394,7 +6493,7 @@ function buildPanel() {
     softReloadGuardTimer = setTimeout(() => {
       softReloadGuardTimer = null;
       softReloadInFlight = false; // safety: a failed soft-reload re-enables auto-respawn
-    }, SOFT_RELOAD_GUARD_MS);
+    }, softReloadGuardMs());
     // Arm the stuck-handshake escalation. A FAST soft-reload handshakes well before
     // this fires and clearSoftReloadGuard() (on "connected") cancels it → no
     // escalation. Only a genuinely stuck reload reaches the timer.
@@ -6402,7 +6501,7 @@ function buildPanel() {
     softReloadEscalateTimer = setTimeout(() => {
       softReloadEscalateTimer = null;
       escalateSoftReload();
-    }, SOFT_RELOAD_ESCALATE_MS);
+    }, softReloadEscalateMs());
   }
   function clearSoftReloadGuard() {
     softReloadInFlight = false;
