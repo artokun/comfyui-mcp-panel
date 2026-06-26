@@ -6318,6 +6318,13 @@ function buildPanel() {
   // paint it as a card so the user sees it too. Fully non-blocking + best-effort:
   // any failure just logs and leaves the video player as-is (no agent image).
   async function deliverVideoStoryboard(m, nodeId) {
+    // Same final-vs-preview distinction as still images: a VHS-style video node
+    // with `type:"output"` is the real SAVED file; `type:"temp"` (save_output off)
+    // is a throwaway preview. Be conservative — only explicit "output" is final.
+    const isFinalVideo = m && m.type === "output";
+    const videoKind = isFinalVideo
+      ? `the FINAL saved video (file ${m.filename} — reference THIS filename)`
+      : `a PREVIEW video (file ${m.filename}, temporary — not a saved file; add/enable a save to persist it)`;
     // ALWAYS notify the agent a video rendered — with a storyboard if we can build
     // one, else a note-only event (no images) so the agent still learns the render
     // landed even when the preview is off or sampling/upload fails.
@@ -6326,7 +6333,7 @@ function buildPanel() {
         type: "agent_event",
         kind: "executed",
         note:
-          `🎬 A video rendered (file ${m.filename}). You can't view it directly` +
+          `🎬 A video rendered — ${videoKind}. You can't view it directly` +
           (why ? ` — ${why}` : "") +
           `; tell the user it's ready and ask how it looks if you need to judge it.`,
         node_id: nodeId,
@@ -6360,8 +6367,8 @@ function buildPanel() {
         kind: "executed",
         images: [ref],
         note:
-          `📽️ ${n}-frame storyboard (contact sheet) of the video you just generated ` +
-          `(file ${m.filename}) — frames run top-left→bottom-right = start→end. ` +
+          `📽️ ${n}-frame storyboard (contact sheet) of ${videoKind} — ` +
+          `frames run top-left→bottom-right = start→end. ` +
           `Review motion, sharpness, and temporal consistency.`,
         node_id: nodeId,
       });
@@ -6404,11 +6411,51 @@ function buildPanel() {
     if (buf.timer) clearTimeout(buf.timer);
     runImageBuffers.delete(key);
     if (!buf.images.length) return;
-    // One consolidated turn with ALL of the run's directly-viewable images.
+    // Classify by ComfyUI's output type: SaveImage writes `type:"output"` with a
+    // real filename = the FINAL saved result; PreviewImage writes `type:"temp"`
+    // (under a temp/ subfolder, throwaway /tmp-style names) = a preview frame.
+    // Be conservative: ONLY an explicit `type === "output"` counts as final, so a
+    // missing/unknown type defaults to preview and we never mislabel a throwaway
+    // frame as the saved result. Don't crash on odd shapes.
+    const finals = [];
+    const previews = [];
+    for (const m of buf.images) {
+      if (m && m.type === "output") finals.push(m);
+      else previews.push(m);
+    }
+    // Send EVERYTHING for vision (the agent should see previews too), but ordered
+    // finals-first so the primary result is unambiguous as image #1.
+    const images = [...finals, ...previews];
+    const finalNames = finals.map((m) => m?.filename).filter(Boolean);
+    const previewCount = previews.length;
+    let note;
+    if (finalNames.length) {
+      const list = finalNames.join(", ");
+      const fileWord = finalNames.length === 1 ? "output" : "outputs";
+      note =
+        `Run finished. FINAL ${fileWord}: ${list} ` +
+        `(this is the saved result — reference THIS filename` +
+        (finalNames.length === 1 ? "" : "s") +
+        `).`;
+      if (previewCount) {
+        note +=
+          ` Also shown: ${previewCount} preview frame(s) (temporary, not the final file).`;
+      }
+    } else {
+      // No SaveImage (or equivalent output node) ran — everything we have is a
+      // throwaway preview. Tell the agent so it doesn't cite a /tmp name as final.
+      note =
+        `Run finished, but no saved output node ran — ` +
+        `these ${previewCount} image(s) are previews (temporary, not a final file). ` +
+        `Add a SaveImage node to persist the result, or treat the preview as the result if that's intended.`;
+    }
+    // One consolidated turn with ALL of the run's directly-viewable images,
+    // finals-first, plus a note naming which file(s) are the real saved output.
     client.sendFrame({
       type: "agent_event",
       kind: "executed",
-      images: buf.images,
+      images,
+      note,
     });
   }
 
