@@ -5712,8 +5712,21 @@ function buildPanel() {
   // > RECONNECT_MAX_MS (15s) so the soft-reload's own backoff gets a full shot
   // before auto-respawn is re-armed.
   const SOFT_RELOAD_GUARD_MS = 28000;
+  // SHORT one-shot escalation window for a STUCK soft-reload. The guard above stops
+  // a competing-respawn storm, but it leaves a gap: when the fresh orchestrator binds
+  // the port yet its AGENT handshake (the `models` frame → "connected") never lands,
+  // the WS is OPEN — so there's no close event to drive scheduleReconnect, and
+  // tryAutoRespawn is standing down for the guard window. The panel then sits in the
+  // "Connected … waiting for the panel agent" stuck state until the user manually
+  // clicks Reconnect. So: if the handshake hasn't landed within this short window
+  // (comfortably under the 28s guard and the 20s HANDSHAKE_MS, but generous enough
+  // for a normal cold start), AUTO-ESCALATE once to exactly what Reconnect does — a
+  // single clean connectAgent(). One-shot (never a loop) so it can't reintroduce the
+  // storm the interlock prevents.
+  const SOFT_RELOAD_ESCALATE_MS = 11000;
   let softReloadInFlight = false;
   let softReloadGuardTimer = null;
+  let softReloadEscalateTimer = null;
   function setSoftReloadGuard() {
     softReloadInFlight = true;
     if (softReloadGuardTimer) clearTimeout(softReloadGuardTimer);
@@ -5721,6 +5734,14 @@ function buildPanel() {
       softReloadGuardTimer = null;
       softReloadInFlight = false; // safety: a failed soft-reload re-enables auto-respawn
     }, SOFT_RELOAD_GUARD_MS);
+    // Arm the stuck-handshake escalation. A FAST soft-reload handshakes well before
+    // this fires and clearSoftReloadGuard() (on "connected") cancels it → no
+    // escalation. Only a genuinely stuck reload reaches the timer.
+    if (softReloadEscalateTimer) clearTimeout(softReloadEscalateTimer);
+    softReloadEscalateTimer = setTimeout(() => {
+      softReloadEscalateTimer = null;
+      escalateSoftReload();
+    }, SOFT_RELOAD_ESCALATE_MS);
   }
   function clearSoftReloadGuard() {
     softReloadInFlight = false;
@@ -5728,6 +5749,27 @@ function buildPanel() {
       clearTimeout(softReloadGuardTimer);
       softReloadGuardTimer = null;
     }
+    if (softReloadEscalateTimer) {
+      clearTimeout(softReloadEscalateTimer);
+      softReloadEscalateTimer = null;
+    }
+  }
+  // The soft-reload's WS is open (or reconnecting) but the agent handshake hasn't
+  // landed within the short window — the "connected … waiting for the panel agent"
+  // stuck state. Escalate ONCE to exactly what the user's manual Reconnect does:
+  // drop the stale (open-but-unhandshook) socket — necessary because connect()
+  // early-returns on an already-OPEN socket, so a bare connectAgent()/client.start()
+  // alone would NOT replace it — then run a single clean connectAgent(). connectAgent
+  // bumps connectGen (superseding the soft-reload's own pending reconnect so the two
+  // never both drive the client), resets the reclaim/respawn budgets and clears this
+  // guard, so its own connectGen/budget logic owns recovery from here. One-shot
+  // timer: it can't loop, so no competing-respawn storm.
+  function escalateSoftReload() {
+    if (!softReloadInFlight) return; // handshake already landed / guard cleared → nothing to do
+    appendSystem("The agent reload is taking too long to hand off — reconnecting cleanly…");
+    client.stop(); // drop the stuck socket so connect() won't early-return on an OPEN sock
+    connecting = false; // don't let a stale in-flight guard block the escalation connect
+    void connectAgent();
   }
   // The bridge died and WS reconnects keep failing → the port is dead (the
   // orchestrator exited). If sticky autoconnect is on, spend the bounded respawn
