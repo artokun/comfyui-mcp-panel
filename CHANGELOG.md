@@ -6,6 +6,38 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-26
+
+### Added
+
+- **Application Settings page** under ComfyUI Settings → **"Comfy MCP Agent"**, split
+  into per-backend groups so each provider owns its own defaults (#20, #21, #27, #29):
+  - **General** — Default agent backend, Auto-connect on load.
+  - **Claude** / **ChatGPT (Codex)** — Default model (a dropdown of the backend's
+    *fetched* models), Default reasoning effort (the backend's own scale), and a
+    per-backend **Bridge URL** (`9180` for Claude, `9181` for Codex).
+  - **About** — ⭐ Star on GitHub. **API tokens** — secure CivitAI / HuggingFace
+    buttons (stored by the orchestrator, never in ComfyUI settings).
+  - The comfyui-mcp logo in the panel header.
+
+### Fixed
+
+- **Reconnect storm eliminated at the root.** Only one bridge client may be live per
+  page now — a re-rendered/restored sidebar no longer spawns a second client that
+  shares the tab id and ping-pongs the connection (the bridge's close-old-on-new-hello
+  was closing each socket in a ~1s loop). (#28)
+- **Backend-switch storm.** Switching Claude↔Codex no longer re-enters the connect
+  path via a settings `onChange`; a live switch produces exactly one connect. (#29)
+- **Per-backend bridge ports.** The Codex backend connects to `9181` (not Claude's
+  `9180`), and **Reconnect after a switch dials the right port** (the default URL is no
+  longer mistaken for a manual override). (#25, #29)
+- **Cold-start "stuck on connecting".** A handshake timeout now auto-redials (bounded)
+  and recovers like Reconnect, instead of sitting idle while the agent spawns. (#29)
+- **Settings-load reconnect storm** — ComfyUI fires `onChange` during its startup
+  settings load; appliers are now gated until the panel is armed. (#22)
+- **Steady connection status** — no connecting↔disconnected flicker, with
+  backend-aware patience for slow Codex cold starts. (#24)
+
 ## [0.3.1] - 2026-06-25
 
 ### Fixed
