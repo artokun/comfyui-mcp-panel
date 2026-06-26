@@ -460,7 +460,17 @@ function panelSettingsList() {
         const sel = makeSettingSelect();
         populateModelSelect(sel, currentSettingsBackend());
         sel.addEventListener("change", () => {
-          const v = sel.value === SETTINGS_PLACEHOLDER ? "" : sel.value;
+          let v = sel.value === SETTINGS_PLACEHOLDER ? "" : sel.value;
+          // Guard: never persist/send a model that isn't in the known fetched catalog
+          // for the current backend (a stale cross-backend id) — snap to Auto instead
+          // (P2). Disabled options already can't be picked; this covers any other path.
+          if (v) {
+            const rows = settingsModelsFor(currentSettingsBackend());
+            if (rows && !rows.some((m) => m.id === v)) {
+              v = "";
+              sel.value = "";
+            }
+          }
           setSetting(SETTING_MODEL, v);
           if (settingsArmed) panelHooks.applyModel?.(v);
         });
@@ -598,13 +608,22 @@ function populateModelSelect(sel, backend) {
     hint.textContent = `Connect to ${BACKEND_TEXT[backend] || backend} to load its models`;
     sel.appendChild(hint);
   }
-  // Preserve a saved model id that isn't in this catalog (cross-backend / offline).
+  // A saved model id that isn't in this list. When there's NO live catalog (backend
+  // not connected this session), keep it SELECTABLE so the user's choice isn't lost.
+  // But when `rows` IS the fetched catalog for this backend and the id isn't in it,
+  // it's invalid for this backend — render it DISABLED ("not available") and snap the
+  // selection to Auto, so it can never be re-sent as a cross-backend model (P2 fix).
   if (saved && !seen.has(saved)) {
     const o = document.createElement("option");
     o.value = saved;
-    o.textContent = `${saved} (saved)`;
+    if (rows) {
+      o.disabled = true;
+      o.textContent = `${saved} (not available for this backend)`;
+    } else {
+      o.textContent = `${saved} (saved)`;
+      seen.add(saved);
+    }
     sel.appendChild(o);
-    seen.add(saved);
   }
   sel.value = seen.has(saved) ? saved : "";
 }
@@ -7774,6 +7793,21 @@ function buildPanel() {
   panelHooks.applyBackend = (id) => {
     if (!id || id === selectedBackend) return;
     appendSystem(`Default backend → ${BACKEND_LABELS[id] || id}.`);
+    // A Settings backend change RESETS the dependent controls (the Settings UI does
+    // this for SETTING_MODEL/EFFORT, but those writes are under suppressSettingOnChange
+    // and the model/effort are render-fns with no onChange, so they never reach the
+    // live prefs). Mirror the reset in the LIVE prefs BEFORE connecting so the agent
+    // and the Settings UI agree on Auto: set modelAuto so the next catalog push sends
+    // model:null (P1 desync fix — otherwise applyModelCatalog would snap prefs.model
+    // to a concrete backend default and send THAT while the UI shows "Auto"), and map
+    // the effort to the nearest valid level in the new backend's scale.
+    prefs.modelAuto = true;
+    if (prefs.effort) {
+      const scale = BACKEND_EFFORTS[id] || ALL_EFFORTS;
+      prefs.effort = nearestInList(prefs.effort, scale) || undefined;
+    }
+    savePrefs(prefs);
+    refreshModelChip();
     connectBackend(id);
   };
   panelHooks.applyModel = (id) => {
