@@ -6,7 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-25
+
 ### Added
+
+- **Provider switcher in the model selector.** Pick Claude or ChatGPT from a
+  PROVIDER section at the top of the model popup (Provider → Model → Effort).
+- **`show_media` + `free_vram` panel commands**, **soft-reload ↔ auto-respawn
+  interlock**, **pack force-reclaim** of a wedged orchestrator, **Desktop-nested
+  ComfyUI path self-heal**, and **effort snaps to the nearest supported level** on a
+  model/provider switch (no silent drop). New multi-provider branding (banner, icon,
+  OG card).
 
 - **Run errors interrupt the agent and show a widget.** When a queued render fails,
   the panel now names the failing node (e.g. `Ideogram4PromptBuilderKJ (node 200)`),
