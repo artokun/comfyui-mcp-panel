@@ -251,18 +251,19 @@ const BACKEND_EFFORTS = {
 };
 // Ordered low→high across BOTH scales, for nearest-level mapping on a switch.
 const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
-/** Map an effort to the nearest VALID level for `backend`. Shared levels pass
- *  through 1:1; an off-scale source (e.g. Claude "max" → Codex "xhigh", or
- *  Codex "none"/"minimal" → Claude "low") snaps to the closest by ordered rank. */
-function mapEffortToBackend(effort, backend) {
-  const valid = BACKEND_EFFORTS[backend] || BACKEND_EFFORTS.claude;
+/** Snap `effort` to the nearest level present in `list` by EFFORT_ORDER rank.
+ *  Shared levels pass through 1:1; an off-list source snaps to the closest by
+ *  ordered rank (ties prefer the lower level). Returns `effort` unchanged when
+ *  falsy; returns undefined when `list` is EMPTY (no effort control). */
+function nearestInList(effort, list) {
   if (!effort) return effort;
-  if (valid.includes(effort)) return effort;
+  if (!Array.isArray(list) || !list.length) return undefined;
+  if (list.includes(effort)) return effort;
   const srcRank = EFFORT_ORDER.indexOf(effort);
-  if (srcRank < 0) return valid[0];
-  let best = valid[0];
+  if (srcRank < 0) return list[0];
+  let best = list[0];
   let bestDist = Infinity;
-  for (const v of valid) {
+  for (const v of list) {
     const d = Math.abs(EFFORT_ORDER.indexOf(v) - srcRank);
     if (d < bestDist) {
       bestDist = d;
@@ -2179,6 +2180,21 @@ const GRAPH_TOOL_EXECUTORS = {
     await managerV2("manager/reboot", { method: "POST" });
     return { rebooting: true };
   },
+  async free_vram() {
+    // Unload all resident models + free cached VRAM via ComfyUI's standard /free
+    // endpoint (the same one the "Unload Models"/"Free memory" menu uses). Used to
+    // unwedge a stuck/OOM ComfyUI when a cancel left memory pinned — no restart.
+    const res = await api.fetchApi("/free", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ unload_models: true, free_memory: true }),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`Failed to free VRAM: ${res.status} ${res.statusText}${text ? ` — ${text}` : ""}`);
+    }
+    return { freed: true, unload_models: true, free_memory: true };
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -2188,7 +2204,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onAck, onTurn, onTurnAnchor, getResume, onHandshakeTimeout, onBridgeClosed }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onShowMedia, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onAck, onTurn, onTurnAnchor, getResume, onHandshakeTimeout, onBridgeClosed }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -2297,6 +2313,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
             const items = Array.isArray(msg.items) ? msg.items : [];
             onTodo?.(items);
             result = { ok: true, count: items.length };
+          } else if (msg.cmd === "show_media") {
+            // Render agent-requested media (images/videos) into the chat.
+            // items: [{ kind: "image"|"video"|"viewRef", dataUrl?, viewRef?, filename, caption? }]
+            const mediaItems = Array.isArray(msg.items) ? msg.items : [];
+            onShowMedia?.(mediaItems);
+            result = { ok: true, count: mediaItems.length };
           } else {
             const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];
             if (!executor) throw new Error(`Unknown command "${msg.cmd}"`);
@@ -2318,7 +2340,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
         // ask_user / request_secret paint their OWN cards and their replies carry
         // user input (a choice, or a SECRET) — never echo them as an activity card
         // (and never record them). Other commands get the normal activity card.
-        if (msg.cmd !== "ask_user" && msg.cmd !== "request_secret" && msg.cmd !== "set_todo") {
+        if (msg.cmd !== "ask_user" && msg.cmd !== "request_secret" && msg.cmd !== "set_todo" && msg.cmd !== "show_media") {
           onCommand?.(msg.cmd, msg, reply);
         }
         return;
@@ -3132,6 +3154,8 @@ function describeCommand(cmd, msg, reply) {
         icon: "pi-info-circle",
         text: r.node_errors || r.last_execution_error ? "Read execution errors" : "Checked errors — none",
       };
+    case "free_vram":
+      return { icon: "pi-bolt", text: "Unloaded models — freed VRAM" };
     case "workflow_save":
       return { icon: "pi-save", text: `Saved “${r.workflow}”` };
     case "workflow_save_as":
@@ -3836,14 +3860,22 @@ function buildPanel() {
       item({ label: m.label, small: m.small }, m.id === prefs.model, () => {
         prefs.model = m.id;
         prefs.userSet = true;
-        // Drop an effort the new model can't do.
+        // SNAP the effort to the nearest level the new model supports (don't wipe
+        // it silently); only clear if the model has no effort control at all.
+        const before = prefs.effort;
         const avail = effortsForModel(m.id);
-        if (prefs.effort && !avail.includes(prefs.effort)) prefs.effort = undefined;
+        if (prefs.effort && !avail.includes(prefs.effort)) {
+          prefs.effort = avail.length ? nearestInList(prefs.effort, avail) : undefined;
+        }
         savePrefs(prefs);
         refreshModelChip();
         modelPop.hidden = true;
         client?.sendFrame?.({ type: "set_options", model: m.id, effort: prefs.effort ?? null });
-        appendSystem(`Model → ${m.label}.`);
+        if (prefs.effort && prefs.effort !== before) {
+          appendSystem(`Model → ${m.label}. Reasoning effort set to ${effortMeta(prefs.effort).label} (nearest level this model supports).`);
+        } else {
+          appendSystem(`Model → ${m.label}.`);
+        }
       });
     }
 
@@ -3875,14 +3907,29 @@ function buildPanel() {
       prefs.model = pickDefaultModel(modelCatalog);
     }
     // Preserve the user's chosen effort across a backend switch: the new backend's
-    // scale may not contain the exact level, so MAP it to the nearest valid one
-    // (Claude "max" → Codex "xhigh", Codex "none"/"minimal" → Claude "low") instead
-    // of dropping it. Only clear it if it maps to nothing (no effort control).
+    // scale may not contain the exact level, so SNAP it to the nearest level this
+    // MODEL actually offers (Claude "max" → Codex "xhigh", Codex "none"/"minimal"
+    // → Claude "low") instead of dropping it. Only clear it to undefined when the
+    // model has NO effort control (avail empty). Never change it invisibly: if the
+    // resulting level differs from what the user had, leave a one-line note.
     if (prefs.effort) {
-      const backend = connectedBackend || selectedBackend;
-      const mapped = mapEffortToBackend(prefs.effort, backend);
+      const before = prefs.effort;
       const avail = effortsForModel(prefs.model);
-      prefs.effort = mapped && avail.includes(mapped) ? mapped : undefined;
+      // Snap directly into the model's available set (which is already the
+      // intersection of the model's levels with the connected backend's scale).
+      const snapped = nearestInList(before, avail);
+      prefs.effort = snapped;
+      if (snapped !== before && prefs.userSet) {
+        if (snapped) {
+          appendSystem(
+            `Reasoning effort set to ${effortMeta(snapped).label} for ${modelLabel(modelCatalog, prefs.model)} (nearest level this model supports).`,
+          );
+        } else {
+          appendSystem(
+            `${modelLabel(modelCatalog, prefs.model)} has no reasoning-effort control; effort cleared.`,
+          );
+        }
+      }
     }
     savePrefs(prefs);
     refreshModelChip();
@@ -5055,6 +5102,23 @@ function buildPanel() {
     // The agent called panel_set_todo — render/update the live plan tray.
     onTodo(items) {
       renderTodo(items);
+    },
+    // The agent called panel_show_media — render images/videos directly in the chat.
+    onShowMedia(items) {
+      for (const item of items) {
+        const caption = item.caption || item.filename || "";
+        if (item.kind === "viewRef" && item.viewRef) {
+          const url = imageViewUrl(item.viewRef);
+          // Determine if ComfyUI ref is a video by extension
+          const isVid = /.(mp4|webm)$/i.test(item.viewRef.filename || "");
+          if (isVid) paintVideo(url, caption);
+          else paintImage(url, caption);
+        } else if (item.kind === "video" && item.dataUrl) {
+          paintVideo(item.dataUrl, caption);
+        } else if (item.dataUrl) {
+          paintImage(item.dataUrl, caption);
+        }
+      }
     },
     // Orchestrator pushed live download progress → render rows in the tray.
     onDownloads(list) {
@@ -6761,6 +6825,13 @@ function buildPanel() {
   // (not just on the trigger or an option). Uses mousedown so it settles before
   // an option's own click handler runs. The completion menu keeps its own
   // blur-based dismissal.
+  //
+  // CAPTURE PHASE (third arg `true`) is load-bearing: ComfyUI's LiteGraph canvas
+  // calls stopPropagation() on its pointer/mouse events, so a bubble-phase
+  // document listener never sees clicks on the canvas — the dropdown would only
+  // close when clicking inside the panel. Capturing runs on the way DOWN to the
+  // target, before LiteGraph can swallow the event, so a click ANYWHERE (canvas,
+  // toolbar, other widgets) dismisses the dropdown.
   function onDocPointerDown(ev) {
     const t = ev.target;
     if (!settingsBox.hidden && !settingsBox.contains(t) && !status.contains(t)) {
@@ -6773,7 +6844,7 @@ function buildPanel() {
       modelPop.hidden = true;
     }
   }
-  document.addEventListener("mousedown", onDocPointerDown);
+  document.addEventListener("mousedown", onDocPointerDown, true);
 
   // Reload restore: repaint the chat this tab was last showing. The agent's
   // memory continues automatically — either the orchestrator's agent for this
@@ -6832,7 +6903,7 @@ function buildPanel() {
       } catch {
         // recognition already stopped
       }
-      document.removeEventListener("mousedown", onDocPointerDown);
+      document.removeEventListener("mousedown", onDocPointerDown, true);
       try {
         api.removeEventListener("executed", onExecuted);
         api.removeEventListener("execution_error", onExecError);
