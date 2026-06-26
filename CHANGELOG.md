@@ -8,6 +8,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Run errors interrupt the agent and show a widget.** When a queued render fails,
+  the panel now names the failing node (e.g. `Ideogram4PromptBuilderKJ (node 200)`),
+  pushes it to the agent as an urgent `run_error` event — the orchestrator
+  **interrupts the live turn and front-queues it**, so the agent stops and fixes the
+  error instead of carrying on as if the run succeeded — and immediately renders a
+  red **error card** in the chat, so you see it without waiting on a check-errors
+  call. (ComfyUI targets `execution_error` to the queuing client, so the panel is
+  the right place to catch and forward it.)
+
 - **Multi-provider agent: Claude + ChatGPT/Codex at full parity.** The panel is no
   longer Claude-only — a **backend picker** (Claude / ChatGPT chips) lets you choose
   a provider rather than a port, and each runs its own background orchestrator on

@@ -2188,7 +2188,7 @@ const GRAPH_TOOL_EXECUTORS = {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onAck, onTurn, onTurnAnchor, getResume }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onAck, onTurn, onTurnAnchor, getResume, onHandshakeTimeout, onBridgeClosed }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -2243,10 +2243,19 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       clearHandshake();
       handshakeTimer = setTimeout(() => {
         if (handshakeDone) return;
-        onLog(
-          `⚠ Bridge open on ${url} but no panel agent responded. Something else may be holding the port. ` +
-            `Close it, or fully restart ComfyUI, then reconnect.`,
-        );
+        // The WS is OPEN but no orchestrator handshake (models frame) arrived
+        // within the generous cold-start window. Two causes: (1) a WEDGED
+        // orchestrator — alive, bridge up, agent dead — or (2) some non-orchestrator
+        // process squatting the port. Hand off to the panel's bounded auto-reclaim
+        // (force-respawn + reconnect); only if THAT is exhausted does it fall back
+        // to the manual warning below. If no handler is wired, warn directly.
+        const handled = onHandshakeTimeout?.(url);
+        if (!handled) {
+          onLog(
+            `⚠ Bridge open on ${url} but no panel agent responded. Something else may be holding the port. ` +
+              `Close it, or fully restart ComfyUI, then reconnect.`,
+          );
+        }
       }, HANDSHAKE_MS);
     });
 
@@ -2357,6 +2366,14 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // after the orchestrator has processed hello (resume armed), so it's the
       // reliable signal to send a post-restart resume nudge.
       if (msg && msg.type === "ack") {
+        // A "degraded" ack is the orchestrator's OWN handshake: it's alive and
+        // attending, but its agent backend can't enumerate models yet (typically
+        // sign-in needed). That is NOT the "bridge open but nothing behind it"
+        // wedge — so DISARM the no-handshake timer (no force-reclaim of a valid,
+        // sign-in-needed orchestrator) WITHOUT calling markConnected(). `models`
+        // stays the ONLY path to green/"connected"; a degraded orchestrator just
+        // surfaces its own "please sign in" message and is left running.
+        if (msg.kind === "degraded") clearHandshake();
         onAck?.(msg);
       }
       // Turn lifecycle → "working" indicator (working stays up through the whole
@@ -2432,12 +2449,26 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   const titleObserver = titleEl ? new MutationObserver(() => sendTitle()) : null;
   titleObserver?.observe(titleEl, { childList: true });
 
+  // After this many consecutive failed WS reconnects, the port is almost certainly
+  // DEAD (the orchestrator self-exited) rather than blipping — a bare WS retry will
+  // loop on a dead port forever. So we ESCALATE to a /connect respawn (P1). Kept
+  // low so recovery is quick, but >0 so a benign 1-tick blip to a still-alive
+  // orchestrator reconnects normally without a needless respawn.
+  const RESPAWN_AFTER_ATTEMPTS = 2;
   function scheduleReconnect() {
     if (closed || reconnectTimer) return;
     const delay = Math.min(RECONNECT_BASE_MS * 2 ** attempt, RECONNECT_MAX_MS);
     attempt += 1;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
+      // The WS keeps failing to (re)open → the bridge port is dead. If the panel's
+      // sticky-autoconnect respawn handles it (re-POST /connect, bounded), let IT
+      // drive the client; otherwise fall back to a bare WS retry. The respawn
+      // budget is NOT replenished by an automatic close (only by a successful
+      // handshake / a user-initiated Connect), so a persistent failure loop
+      // (respawn → agent fails → self-exit → respawn …) terminates instead of
+      // spinning hot.
+      if (attempt > RESPAWN_AFTER_ATTEMPTS && onBridgeClosed?.() === true) return;
       connect();
     }, delay);
   }
@@ -4989,6 +5020,10 @@ function buildPanel() {
       disconnectBtn.hidden = !connected;
       connectBtn.disabled = state === "connecting";
       connectBtn.textContent = state === "connecting" ? "Connecting…" : "Connect";
+      // A successful handshake → restore the auto-reclaim budget, so a LATER wedge
+      // (after a healthy session, e.g. the agent dies mid-use) can be auto-cleared
+      // again. The bound only prevents a loop WITHIN one unsuccessful connect.
+      if (connected) resetAutoReclaim();
       if (!connected) hideThinking();
       // NB: do NOT push set_options here. The saved model id is only known-valid
       // once the live catalog arrives, so the push happens in applyModelCatalog
@@ -5088,6 +5123,20 @@ function buildPanel() {
     onTurnAnchor(uuid) {
       turnAnchors.push(uuid);
       if (turnAnchors.length > 200) turnAnchors.shift();
+    },
+    // The bridge opened but no orchestrator handshake (models frame) arrived
+    // within the generous cold-start window → the wedge. Try a BOUNDED auto-reclaim
+    // (force-respawn the orchestrator + reconnect) before falling back to the
+    // manual warning. Returns true if it handled it (suppresses the warning).
+    onHandshakeTimeout(timedOutUrl) {
+      return tryAutoReclaim(timedOutUrl);
+    },
+    // WS reconnects keep failing → the bridge port is dead (orchestrator exited,
+    // e.g. self-exit after its agent failed). If sticky autoconnect is on, drive a
+    // BOUNDED respawn (re-POST /connect) so a fresh orchestrator comes up — instead
+    // of retrying a dead port forever (P1). Returns true if it handled it.
+    onBridgeClosed() {
+      return tryAutoRespawn();
     },
     onModels(list, _current, backend) {
       // The orchestrator self-reports its backend on the handshake — this is the
@@ -5320,10 +5369,25 @@ function buildPanel() {
   }
   function onExecError(ev) {
     const d = ev?.detail ?? {};
-    client.sendFrame({
-      type: "agent_event",
-      kind: "run_error",
-      error: d.exception_message || d.exception_type || "execution error",
+    // Name the failing node so the agent (and the user) know WHERE it broke —
+    // "Ideogram4PromptBuilderKJ (node 200)" beats a bare exception string.
+    const where = d.node_type
+      ? `${d.node_type} (node ${d.node_id})`
+      : d.node_id != null
+        ? `node ${d.node_id}`
+        : "";
+    const msg = d.exception_message || d.exception_type || "execution error";
+    const error = where ? `${where}: ${msg}` : msg;
+    // 1) Push it to the agent — the orchestrator INTERRUPTS its live turn and
+    //    front-queues this so it stops and fixes the error instead of running blind.
+    client.sendFrame({ type: "agent_event", kind: "run_error", error });
+    // 2) Render it immediately as an error widget in the chat, so the user sees it
+    //    even before the agent reacts (no waiting on a check-errors call).
+    paintCard({
+      icon: "pi-exclamation-triangle",
+      text: `Run error — ${where || "execution failed"}`,
+      detail: msg,
+      error: true,
     });
   }
   // Post-restart autonomy (#3): ComfyUI's api fires `reconnecting` when the
@@ -5381,12 +5445,144 @@ function buildPanel() {
   // tell a MANUAL Advanced-URL override apart from an auto-managed one, so a user
   // who typed their own bridge URL isn't silently overwritten by the backend's port.
   let lastAutoUrl = "";
+  // Bounded auto-reclaim of a WEDGED orchestrator (bridge open, agent never
+  // handshook). Each user-initiated connectAgent() resets the budget; the
+  // handshake-timeout handler spends it (force-respawn + reconnect). Once the
+  // budget is exhausted we stop and let the manual warning show — so a genuinely
+  // unrecoverable port (a foreign squatter the pack refuses to kill, or a backend
+  // that can't sign in) can NEVER drive an infinite respawn loop.
+  const MAX_AUTO_RECLAIMS = 2;
+  let autoReclaimsLeft = MAX_AUTO_RECLAIMS;
+  let autoReclaiming = false;
+  // SEPARATE budget for close-driven RESPAWN (P1): when the bridge dies (e.g. the
+  // orchestrator self-exited because its agent failed) the WS retries a dead port
+  // forever unless we re-POST /connect to spawn a fresh orchestrator. CRITICAL:
+  // this budget is NOT replenished on an automatic bridge-close — only by a
+  // successful handshake or a user-initiated Connect (resetAutoReclaim) — so a
+  // persistent failure (respawn → agent fails → self-exit → respawn …) is BOUNDED
+  // and terminates with the manual warning, never a hot loop.
+  const MAX_AUTO_RESPAWNS = 2;
+  let autoRespawnsLeft = MAX_AUTO_RESPAWNS;
+  let autoRespawning = false;
+  let respawnGaveUpNoticed = false; // one-shot "keeps failing" notice per budget
+  function resetAutoReclaim() {
+    autoReclaimsLeft = MAX_AUTO_RECLAIMS;
+    autoRespawnsLeft = MAX_AUTO_RESPAWNS;
+    respawnGaveUpNoticed = false;
+  }
+  // The bridge died and WS reconnects keep failing → the port is dead (the
+  // orchestrator exited). If sticky autoconnect is on, spend the bounded respawn
+  // budget to re-POST /connect (spawn a FRESH orchestrator) and reconnect. Returns
+  // true if it drove a respawn (the caller then skips its bare WS retry), false to
+  // let the WS keep retrying / fall back to the manual warning.
+  function tryAutoRespawn() {
+    if (!lsGet(AUTOCONNECT_KEY)) return false; // user never connected / disconnected
+    if (autoRespawning) return true; // one in flight — don't stack
+    if (autoRespawnsLeft <= 0) {
+      // Budget spent → stop respawning and tell the user once, then let the bare
+      // WS retry continue quietly in the background (cheap; no more spawns).
+      if (!respawnGaveUpNoticed) {
+        respawnGaveUpNoticed = true;
+        appendSystem(
+          "⚠ The panel agent keeps failing to start. Check you're signed in " +
+            "(run `claude` once, or `codex login` for Codex), then click Connect.",
+        );
+      }
+      return false;
+    }
+    autoRespawnsLeft -= 1;
+    autoRespawning = true;
+    appendSystem("The panel agent dropped — restarting it…");
+    const myGen = connectGen;
+    void (async () => {
+      try {
+        const res = await api.fetchApi("/comfyui_mcp_panel/connect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ backend: selectedBackend }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (myGen !== connectGen) return; // a newer user connect took over
+        if (!data?.ok) {
+          if (data?.message) appendSystem(data.message);
+          autoRespawnsLeft = 0; // can't spawn (e.g. not signed in) → stop looping
+          client.start(); // resume the bare WS retry so the client isn't left idle
+          return;
+        }
+        if (data?.bridge_url && data.bridge_url !== client.currentUrl()) {
+          client.setUrl(data.bridge_url); // reconnects to the fresh orchestrator
+        } else {
+          client.start();
+        }
+      } catch (err) {
+        if (myGen !== connectGen) return;
+        appendSystem(`Auto-restart failed: ${err?.message ?? err}`);
+        autoRespawnsLeft = 0; // can't reach the pack → don't loop
+        client.start(); // resume the bare WS retry so the client isn't left idle
+      } finally {
+        autoRespawning = false;
+      }
+    })();
+    return true;
+  }
+  // Returns true if it kicked off a reclaim (the bridge client then suppresses its
+  // manual warning); false to let the warning show (budget spent / can't reclaim).
+  function tryAutoReclaim(timedOutUrl) {
+    if (autoReclaiming) return true; // one in flight already — don't stack
+    if (autoReclaimsLeft <= 0) return false; // budget spent → fall back to warning
+    autoReclaimsLeft -= 1;
+    autoReclaiming = true;
+    appendSystem(
+      "No response from the panel agent on the bridge — the orchestrator looks wedged. " +
+        "Restarting it automatically…",
+    );
+    const myGen = connectGen; // tie to the current connect generation
+    void (async () => {
+      try {
+        // Ask the pack to FORCE-reclaim: kill the wedged (but lockfile-healthy)
+        // orchestrator on this backend's port — verified-orchestrator-only,
+        // server-side — and spawn a fresh one. The pack reports back if the port
+        // is held by a non-orchestrator it refuses to kill.
+        const res = await api.fetchApi("/comfyui_mcp_panel/connect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ backend: selectedBackend, force: true }),
+        });
+        const data = await res.json().catch(() => ({}));
+        // A newer user-initiated connect superseded us → let it drive.
+        if (myGen !== connectGen) return;
+        if (!data?.ok) {
+          // The pack couldn't reclaim (e.g. a foreign process holds the port) —
+          // surface its message and stop auto-reclaiming so the warning can show.
+          if (data?.message) appendSystem(data.message);
+          autoReclaimsLeft = 0;
+          return;
+        }
+        if (data?.bridge_url && data.bridge_url !== client.currentUrl()) {
+          client.setUrl(data.bridge_url); // setUrl reconnects
+        } else {
+          client.start(); // re-open against the same URL → fresh handshake attempt
+        }
+      } catch (err) {
+        if (myGen !== connectGen) return;
+        appendSystem(`Auto-restart failed: ${err?.message ?? err}`);
+        autoReclaimsLeft = 0; // can't reach the pack → don't loop
+      } finally {
+        autoReclaiming = false;
+      }
+    })();
+    return true;
+  }
   async function connectAgent(opts = {}) {
     // A chip pick (opts.fromChip) is an EXPLICIT backend choice — it must always
     // (re)connect to that backend's port, so it bypasses the in-flight guard (which
     // a sticky-reconnect could otherwise hold) and the manual-URL override below.
     if (connecting && !opts.fromChip) return;
     const myGen = ++connectGen; // newest attempt; stale ones bail before touching client
+    // A fresh user-/sticky-initiated connect gets a fresh auto-reclaim budget — the
+    // bound is PER user-initiated connect, so each new Connect can attempt to clear
+    // a wedge again (but a single connect can never loop forever).
+    resetAutoReclaim();
     connecting = true;
     connectBtn.disabled = true;
     connectBtn.textContent = "Starting…";
