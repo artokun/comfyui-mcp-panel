@@ -1386,6 +1386,9 @@ function summarizeNode(node) {
     size: node.size ? [Math.round(node.size[0]), Math.round(node.size[1])] : null,
     ...(fullHeight != null ? { full_height: fullHeight } : {}),
     ...(node.flags && node.flags.collapsed ? { collapsed: true } : {}),
+    // Execution mode — only emitted when NOT active so bypassed/muted nodes are
+    // clearly visible to the agent (LiteGraph: 2 = mute, 4 = bypass, 0 = active).
+    ...(node.mode ? { mode: { 2: "mute", 4: "bypass" }[node.mode] ?? `mode_${node.mode}` } : {}),
     ...(node.color ? { color: node.color } : {}),
     ...(node.bgcolor ? { bgcolor: node.bgcolor } : {}),
     widgets,
@@ -2391,6 +2394,42 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     graph.setDirtyCanvas?.(true, true);
     return { node_id: node.id, color: node.color ?? null, bgcolor: node.bgcolor ?? null };
+  },
+
+  // Set a node's execution MODE: "active" (runs normally), "bypass" (the node is
+  // skipped but its inputs pass through to its outputs — LiteGraph mode 4), or
+  // "mute" (the node and everything downstream of it is skipped — mode 2). Also
+  // accepts the raw numeric LiteGraph modes 0/2/4 defensively. Undo-able like the
+  // other graph_set_node_* edits.
+  graph_set_node_mode({ node_id, mode }) {
+    const { graph } = getGraphCtx();
+    const node = resolveNode(graph, node_id);
+    const MODE_TO_NUM = { active: 0, bypass: 4, mute: 2 };
+    const NUM_TO_MODE = { 0: "active", 2: "mute", 4: "bypass" };
+    let target;
+    if (typeof mode === "number" || (typeof mode === "string" && /^\d+$/.test(mode.trim()))) {
+      const n = Number(mode);
+      if (!(n in NUM_TO_MODE)) {
+        throw new Error(`invalid mode ${mode} (valid: "active", "bypass", "mute" or 0/2/4)`);
+      }
+      target = n;
+    } else {
+      const key = String(mode ?? "").toLowerCase();
+      if (!(key in MODE_TO_NUM)) {
+        throw new Error(`invalid mode "${mode}" (valid: "active", "bypass", "mute")`);
+      }
+      target = MODE_TO_NUM[key];
+    }
+    const prevNum = typeof node.mode === "number" ? node.mode : 0;
+    const previous_mode = NUM_TO_MODE[prevNum] ?? prevNum;
+    graph.beforeChange?.();
+    try {
+      node.mode = target;
+    } finally {
+      graph.afterChange?.();
+    }
+    graph.setDirtyCanvas?.(true, true);
+    return { node_id: node.id, mode: NUM_TO_MODE[target], previous_mode };
   },
 
   // Render the CURRENT graph view (root graph or the open subgraph) to a PNG and
@@ -3819,6 +3858,11 @@ function describeCommand(cmd, msg, reply) {
       };
     case "graph_set_node_color":
       return { icon: "pi-palette", text: `Recolored node ${r.node_id}` };
+    case "graph_set_node_mode":
+      return {
+        icon: r.mode === "active" ? "pi-play-circle" : r.mode === "mute" ? "pi-volume-off" : "pi-ban",
+        text: `Set node ${r.node_id} to ${r.mode}${r.previous_mode && r.previous_mode !== r.mode ? ` (was ${r.previous_mode})` : ""}`,
+      };
     case "graph_screenshot":
       return { icon: "pi-camera", text: `Captured workflow image (${r.width}×${r.height})` };
     case "graph_canvas":
