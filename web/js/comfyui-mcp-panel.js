@@ -213,6 +213,232 @@ function lsSet(key, val) {
 }
 
 // ---------------------------------------------------------------------------
+// ComfyUI Settings dialog integration.
+//
+// We register a `settings: [...]` block on app.registerExtension (same API
+// rgthree/KJNodes/VHS/cg-use-everywhere use) so the panel's user-facing DEFAULTS
+// live in ComfyUI's standard Settings dialog (persisted to comfy.settings.json).
+// These SEED the panel's existing localStorage-backed runtime (selectedBackend,
+// prefs.model/effort, bridge URL, auto-connect) on load, and live changes in the
+// dialog push into the open panel via `panelHooks`. The in-composer pickers write
+// BACK to the settings so the two never drift. SECRET tokens are NOT stored here
+// (never plaintext in comfy.settings.json) — their settings are BUTTONS that drive
+// the existing secure request_secret flow into the orchestrator's secure store.
+// ---------------------------------------------------------------------------
+const SETTING_BACKEND = "comfyui-mcp.defaultBackend";
+const SETTING_MODEL = "comfyui-mcp.defaultModel";
+const SETTING_EFFORT = "comfyui-mcp.defaultEffort";
+const SETTING_BRIDGE_URL = "comfyui-mcp.bridgeUrl";
+const SETTING_AUTOCONNECT = "comfyui-mcp.autoConnect";
+const SETTING_TOKEN_CIVITAI = "comfyui-mcp.setCivitaiToken";
+const SETTING_TOKEN_HF = "comfyui-mcp.setHuggingfaceToken";
+// One-time flag: on first load with this feature, push the user's EXISTING
+// localStorage choices INTO the settings (so the dialog reflects reality and an
+// upgrade never silently resets a returning user's backend/model/effort/url).
+// After that, the settings are canonical and seed the runtime on each open.
+const SETTINGS_SEEDED_KEY = "comfyui-mcp.panel.settingsSeeded";
+// The allowlisted secure-store keys (mirrors the orchestrator's #59 allowlist).
+const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
+
+// Hooks the OPEN panel registers so the Settings dialog can drive the running
+// panel live. Null when no panel is mounted (settings still persist via ComfyUI;
+// buildPanel re-seeds from them on the next open). Every applier is idempotent
+// (no-ops when the value already matches) so a setSetting→onChange echo can't loop.
+const panelHooks = {
+  applyBackend: null, // (id)
+  applyModel: null, // (id)
+  applyEffort: null, // (id|"")
+  applyBridgeUrl: null, // (url)
+  applyAutoConnect: null, // (bool)
+  requestSecret: null, // (envKey, friendly)
+};
+// Best-effort guard so a setSetting() we make while seeding/syncing doesn't bounce
+// back through onChange and re-drive the panel (the idempotent appliers also guard).
+let suppressSettingOnChange = false;
+
+function getSetting(id) {
+  try {
+    return app?.ui?.settings?.getSettingValue?.(id);
+  } catch {
+    return undefined;
+  }
+}
+function setSetting(id, value) {
+  try {
+    suppressSettingOnChange = true;
+    app?.ui?.settings?.setSettingValue?.(id, value);
+  } catch {
+    // settings store unavailable — settings just won't persist this change.
+  } finally {
+    suppressSettingOnChange = false;
+  }
+}
+
+// Drive the secure token flow from a Settings button. Reuses the SAME masked
+// secure input the agent's panel_request_secret tool already opens — the pasted
+// value rides the existing request_secret bridge command straight into the
+// orchestrator's secure store (#59 → setComfyuiSecret → 0600 panel-secrets.json),
+// so the raw token NEVER lands in comfy.settings.json or chat history. Opens the
+// Agent sidebar tab first (mounting the panel if needed) and retries briefly until
+// the live panel's hook is ready.
+function triggerSecret(envKey, friendly) {
+  openSidebarTab();
+  const go = () => {
+    if (panelHooks.requestSecret) {
+      panelHooks.requestSecret(envKey, friendly);
+      return true;
+    }
+    return false;
+  };
+  if (go()) return;
+  let tries = 0;
+  const t = setInterval(() => {
+    if (go() || ++tries > 25) clearInterval(t);
+  }, 150);
+}
+
+// Build the settings list registered on the extension. Defined as a function so
+// it can close over the module-level hooks/helpers above.
+function panelSettingsList() {
+  const cat = (sub, name) => ["Comfy MCP Agent", sub, name];
+  // A BUTTON-type setting: ComfyUI supports a custom `type` render function that
+  // returns an HTMLElement (cg-use-everywhere uses the same trick for its About
+  // row). We render a button + a masked set/not-set indicator.
+  const tokenSetting = (id, envKey, friendly) => ({
+    id,
+    name: `${friendly} token`,
+    category: cat("API tokens", friendly),
+    tooltip:
+      `Securely store your ${friendly} API token. Opens the Agent panel's masked secure input; the value goes ` +
+      `straight to the agent's secure store on the orchestrator — it is NEVER written to ComfyUI settings, logs, ` +
+      `or chat history. The Agent must be connected (click Connect in the panel first).`,
+    type: () => {
+      const wrap = document.createElement("div");
+      wrap.style.cssText = "display:flex;align-items:center;gap:0.5rem;";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "p-button p-component";
+      btn.textContent = `Set ${friendly} token…`;
+      btn.style.cssText =
+        "padding:0.3rem 0.7rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
+        "background:var(--p-primary-color,#3a7bd5);color:#fff;cursor:pointer;font-size:0.8rem;white-space:nowrap;";
+      const status = document.createElement("span");
+      status.style.cssText = "font-size:0.72rem;opacity:0.8;";
+      const refresh = () => {
+        const at = lsGet(SECRET_SET_AT_PREFIX + envKey);
+        if (at) {
+          const d = new Date(Number(at));
+          status.textContent = Number.isFinite(d.getTime())
+            ? `🔒 set ${d.toLocaleDateString()}`
+            : "🔒 set";
+          status.style.color = "var(--p-green-400,#4ade80)";
+        } else {
+          status.textContent = "not set";
+          status.style.color = "var(--p-text-muted-color,#a1a1aa)";
+        }
+      };
+      refresh();
+      btn.addEventListener("click", () => {
+        triggerSecret(envKey, friendly);
+        // The actual "set" marker is written when the masked input resolves with a
+        // value; refresh shortly after so the indicator reflects a completed entry.
+        setTimeout(refresh, 1500);
+        setTimeout(refresh, 8000);
+      });
+      wrap.append(btn, status);
+      return wrap;
+    },
+  });
+
+  return [
+    {
+      id: SETTING_BACKEND,
+      name: "Default agent backend",
+      category: cat("Defaults", "Default agent backend"),
+      tooltip:
+        "Which background agent the panel connects to by default. Claude runs on your Claude subscription; " +
+        "ChatGPT runs on your Codex (ChatGPT) account. Seeds the panel's backend; you can still switch live in the model picker.",
+      type: "combo",
+      options: [
+        { value: "claude", text: "Claude" },
+        { value: "codex", text: "ChatGPT" },
+      ],
+      defaultValue: "claude",
+      onChange: (v) => {
+        if (suppressSettingOnChange) return;
+        panelHooks.applyBackend?.(v);
+      },
+    },
+    {
+      id: SETTING_MODEL,
+      name: "Default model",
+      category: cat("Defaults", "Default model"),
+      tooltip:
+        "Default model id for the background agent, e.g. claude-opus-4-8 or claude-sonnet-4-5 (Claude) / a Codex model id. " +
+        "Leave blank to auto-pick. Changing the model in the panel updates this too.",
+      type: "text",
+      defaultValue: "",
+      onChange: (v) => {
+        if (suppressSettingOnChange) return;
+        panelHooks.applyModel?.(v);
+      },
+    },
+    {
+      id: SETTING_EFFORT,
+      name: "Default reasoning effort",
+      category: cat("Defaults", "Default reasoning effort"),
+      tooltip:
+        "Default reasoning effort. The panel snaps this to the nearest level the connected backend/model supports " +
+        "(Claude: low–max; ChatGPT/Codex: none–xhigh). 'Model default' leaves it unset.",
+      type: "combo",
+      options: [
+        { value: "", text: "Model default" },
+        { value: "low", text: "Low" },
+        { value: "medium", text: "Medium" },
+        { value: "high", text: "High" },
+        { value: "xhigh", text: "Extra high" },
+        { value: "max", text: "Max" },
+      ],
+      defaultValue: "",
+      onChange: (v) => {
+        if (suppressSettingOnChange) return;
+        panelHooks.applyEffort?.(v);
+      },
+    },
+    {
+      id: SETTING_BRIDGE_URL,
+      name: "Bridge URL",
+      category: cat("Defaults", "Bridge URL"),
+      tooltip:
+        "WebSocket URL of the panel orchestrator bridge. Default ws://127.0.0.1:9180. Only change this if you run the " +
+        "orchestrator on a non-default port.",
+      type: "text",
+      defaultValue: DEFAULT_BRIDGE_URL,
+      onChange: (v) => {
+        if (suppressSettingOnChange) return;
+        panelHooks.applyBridgeUrl?.(v);
+      },
+    },
+    {
+      id: SETTING_AUTOCONNECT,
+      name: "Auto-connect on load",
+      category: cat("Defaults", "Auto-connect on load"),
+      tooltip:
+        "Automatically connect the agent (starting the local orchestrator) when the panel opens, without clicking Connect. " +
+        "Off by default — the orchestrator is otherwise only started by an explicit Connect click.",
+      type: "boolean",
+      defaultValue: false,
+      onChange: (v) => {
+        if (suppressSettingOnChange) return;
+        panelHooks.applyAutoConnect?.(!!v);
+      },
+    },
+    tokenSetting(SETTING_TOKEN_CIVITAI, "CIVITAI_API_TOKEN", "CivitAI"),
+    tokenSetting(SETTING_TOKEN_HF, "HUGGINGFACE_TOKEN", "HuggingFace"),
+  ];
+}
+
+// ---------------------------------------------------------------------------
 // Model + effort picker. The orchestrator passes these to the Agent SDK
 // (Options.model / Options.effort), so the panel can actually drive them now —
 // model switches live, an effort change restarts the (resumed) session.
@@ -2343,8 +2569,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
     handshakeDone = true;
     clearHandshake();
     // Remember the user wants the agent connected, so we auto-reconnect after a
-    // ComfyUI reboot / panel reopen (until they explicitly Disconnect).
+    // ComfyUI reboot / panel reopen (until they explicitly Disconnect). Mirror it
+    // into the "Auto-connect on load" setting so the toggle reflects reality.
     lsSet(AUTOCONNECT_KEY, "1");
+    setSetting(SETTING_AUTOCONNECT, true);
     onStatus("connected");
   }
 
@@ -2714,6 +2942,7 @@ const PANEL_CSS = `
   padding: 0.75rem 1rem;
   border-bottom: 1px solid var(--p-content-border-color, #3f3f46);
 }
+.cmcp-logo { width: 20px; height: 20px; flex: none; border-radius: 4px; object-fit: contain; display: block; }
 .cmcp-title { font-size: 0.9375rem; font-weight: 600; }
 .cmcp-status { display: flex; align-items: center; gap: 0.375rem; margin-left: auto;
   font-size: 0.6875rem; color: var(--p-text-muted-color, #a1a1aa); }
@@ -3349,9 +3578,21 @@ function buildPanel() {
   // navigate (and hijack) the ComfyUI desktop webview.
   wireExternalLinks(root);
 
-  // ---- Header: title + status dot ----
+  // ---- Header: logo + title + status dot ----
   const header = document.createElement("div");
   header.className = "cmcp-header";
+  // comfyui-mcp brand mark. Served from this pack's WEB_DIRECTORY (web/img/…), so
+  // it must be referenced by a SERVED url — resolve it relative to this module so
+  // it works regardless of where the extension is mounted.
+  const logo = document.createElement("img");
+  logo.className = "cmcp-logo";
+  logo.alt = "";
+  logo.setAttribute("aria-hidden", "true");
+  try {
+    logo.src = new URL("../img/comfyui-mcp-logo.png", import.meta.url).href;
+  } catch {
+    logo.src = "/extensions/comfyui-mcp-panel/img/comfyui-mcp-logo.png";
+  }
   const title = document.createElement("span");
   title.className = "cmcp-title";
   title.textContent = "Agent";
@@ -3391,7 +3632,7 @@ function buildPanel() {
   const histPop = document.createElement("div");
   histPop.className = "cmcp-popover cmcp-popover--down";
   histPop.hidden = true;
-  header.append(title, actions, status, histPop);
+  header.append(logo, title, actions, status, histPop);
   root.appendChild(header);
 
   // Panel preferences (model/effort/storyboard toggle/…), localStorage-backed.
@@ -3943,6 +4184,53 @@ function buildPanel() {
     modelChipLabel.textContent = modelLabel(modelCatalog, prefs.model);
     modelChipEffort.textContent = prefs.effort ? ` · ${prefs.effort}` : "";
   }
+
+  // Reconcile the ComfyUI Settings defaults with the panel's localStorage runtime.
+  // FIRST run with this feature: push the user's existing choices INTO the settings
+  // (no regression on upgrade). AFTERWARDS: the settings are canonical and seed the
+  // runtime here on each open. Applies directly to the already-declared runtime
+  // (selectedBackend / prefs / urlInput) — no chat noise, no set_options push (the
+  // normal connect/catalog path sends those once the catalog is live).
+  function seedFromSettings() {
+    if (!app?.ui?.settings) return;
+    if (!lsGet(SETTINGS_SEEDED_KEY)) {
+      setSetting(SETTING_BACKEND, selectedBackend || "claude");
+      // Only persist model/effort the user actually chose — never a synthetic
+      // fallback-catalog default (which may be an alias id, not a real model).
+      if (prefs.userSet && prefs.model) setSetting(SETTING_MODEL, prefs.model);
+      if (prefs.userSet && prefs.effort) setSetting(SETTING_EFFORT, prefs.effort);
+      setSetting(SETTING_BRIDGE_URL, urlInput.value || DEFAULT_BRIDGE_URL);
+      setSetting(SETTING_AUTOCONNECT, !!lsGet(AUTOCONNECT_KEY));
+      lsSet(SETTINGS_SEEDED_KEY, "1");
+      return;
+    }
+    const sb = getSetting(SETTING_BACKEND);
+    if (sb && sb !== selectedBackend) {
+      selectedBackend = sb;
+      try {
+        window.localStorage.setItem(STORAGE_KEY_BACKEND, sb);
+      } catch {}
+    }
+    const sm = getSetting(SETTING_MODEL);
+    if (sm && sm !== prefs.model) {
+      prefs.model = sm;
+      prefs.userSet = true;
+      savePrefs(prefs);
+    }
+    const se = getSetting(SETTING_EFFORT);
+    if (typeof se === "string" && se !== "" && se !== prefs.effort) {
+      prefs.effort = se;
+      prefs.userSet = true;
+      savePrefs(prefs);
+    }
+    const su = getSetting(SETTING_BRIDGE_URL);
+    if (su && su !== urlInput.value) {
+      urlInput.value = su;
+      saveBridgeUrl(su);
+    }
+  }
+  seedFromSettings();
+
   refreshModelChip();
 
   const modelPop = document.createElement("div");
@@ -4012,6 +4300,9 @@ function buildPanel() {
           prefs.effort = avail.length ? nearestInList(prefs.effort, avail) : undefined;
         }
         savePrefs(prefs);
+        // Keep the ComfyUI Settings default in sync with the picker.
+        setSetting(SETTING_MODEL, m.id);
+        setSetting(SETTING_EFFORT, prefs.effort ?? "");
         refreshModelChip();
         modelPop.hidden = true;
         client?.sendFrame?.({ type: "set_options", model: m.id, effort: prefs.effort ?? null });
@@ -4032,6 +4323,7 @@ function buildPanel() {
           prefs.effort = id;
           prefs.userSet = true;
           savePrefs(prefs);
+          setSetting(SETTING_EFFORT, id); // keep the Settings default in sync
           refreshModelChip();
           modelPop.hidden = true;
           client?.sendFrame?.({ type: "set_options", effort: id });
@@ -5206,6 +5498,11 @@ function buildPanel() {
   // an idle send doesn't briefly flash through the tray.
   let agentWorking = false;
 
+  // Set by a Settings "Set … token" button just before it asks the agent to open
+  // the secure input, so the resolved value can be marked set/not-set (timestamp
+  // only) for the Settings indicator. Cleared as soon as the next secret is painted.
+  let pendingSecretRequest = null;
+
   // ---- bridge wiring ----
   const client = createBridgeClient({
     onStatus(state) {
@@ -5287,6 +5584,16 @@ function buildPanel() {
     onSecret(msg) {
       const p = paintSecret(msg);
       bumpThinking();
+      // If this secure request was kicked off from a Settings "Set … token" button,
+      // record a (non-secret) "set at" marker once a non-empty value is submitted so
+      // the Settings indicator can show set/not-set. Only the timestamp is stored.
+      const req = pendingSecretRequest;
+      pendingSecretRequest = null;
+      if (req) {
+        p.then((value) => {
+          if (value) lsSet(SECRET_SET_AT_PREFIX + req.key, String(Date.now()));
+        }).catch(() => {});
+      }
       return p;
     },
     // The agent called panel_reload — perform the soft reload it asked for.
@@ -6015,6 +6322,7 @@ function buildPanel() {
     } catch {
       // localStorage unavailable — selection just won't persist.
     }
+    setSetting(SETTING_BACKEND, id); // keep the Settings default in sync
     renderBackendChips(
       Array.from(backendChips.querySelectorAll(".cmcp-backend-chip")).map((el) => ({
         backend: el.dataset.backend,
@@ -6152,8 +6460,9 @@ function buildPanel() {
   }
 
   disconnectBtn.addEventListener("click", async () => {
-    // Explicit Disconnect = opt out of sticky auto-reconnect.
+    // Explicit Disconnect = opt out of sticky auto-reconnect (and the matching setting).
     lsSet(AUTOCONNECT_KEY, null);
+    setSetting(SETTING_AUTOCONNECT, false);
     client.stop();
     connectBtn.hidden = false;
     disconnectBtn.hidden = true;
@@ -7187,6 +7496,80 @@ function buildPanel() {
     }
   })();
 
+  // ---- Settings dialog → live panel hooks ----
+  // Registered now that the runtime + connect functions exist. Each applier is
+  // idempotent (no-ops when the value already matches) so a setSetting→onChange
+  // echo can't loop. Cleared in destroy() so a stale closure can't drive a torn-down
+  // panel; the most-recently-mounted panel owns the hooks.
+  panelHooks.applyBackend = (id) => {
+    if (!id || id === selectedBackend) return;
+    appendSystem(`Default backend → ${BACKEND_LABELS[id] || id}.`);
+    connectBackend(id);
+  };
+  panelHooks.applyModel = (id) => {
+    const next = (id || "").trim();
+    if (!next || next === prefs.model) return;
+    prefs.model = next;
+    prefs.userSet = true;
+    savePrefs(prefs);
+    refreshModelChip();
+    client?.sendFrame?.({ type: "set_options", model: next, effort: prefs.effort ?? null });
+    appendSystem(`Model → ${modelLabel(modelCatalog, next)}.`);
+  };
+  panelHooks.applyEffort = (eff) => {
+    const next = eff || undefined;
+    if (next === prefs.effort) return;
+    prefs.effort = next;
+    prefs.userSet = true;
+    savePrefs(prefs);
+    refreshModelChip();
+    client?.sendFrame?.({ type: "set_options", effort: prefs.effort ?? null });
+    appendSystem(next ? `Effort → ${effortMeta(next).label}.` : "Effort → model default.");
+  };
+  panelHooks.applyBridgeUrl = (url) => {
+    const u = (url || "").trim();
+    if (!u || u === urlInput.value.trim()) return;
+    urlInput.value = u;
+    saveBridgeUrl(u);
+    if (client.isConnected()) {
+      client.setUrl(u);
+      appendSystem(`Bridge URL → ${u} (reconnecting).`);
+    }
+  };
+  panelHooks.applyAutoConnect = (on) => {
+    const cur = !!lsGet(AUTOCONNECT_KEY);
+    if (on === cur) return;
+    lsSet(AUTOCONNECT_KEY, on ? "1" : null);
+    if (on && !client.isConnected()) connectAgent();
+  };
+  panelHooks.requestSecret = (envKey, friendly) => {
+    if (!client.isConnected()) {
+      appendSystem(
+        `To set your ${friendly} token, connect the Agent first (click Connect), then choose “Set ${friendly} token…” again. ` +
+          `Tokens are stored securely by the orchestrator — never in ComfyUI settings.`,
+      );
+      try {
+        window.alert(`Connect the Agent first (open this panel → Connect), then set your ${friendly} token.`);
+      } catch {}
+      return;
+    }
+    pendingSecretRequest = { key: envKey, friendly };
+    const sent = client.sendUserMessage(
+      `Please securely store my ${friendly} API token. Call panel_request_secret now for the built-in "comfyui" ` +
+        `MCP server with target_kind "env" and key "${envKey}", labeled "${friendly} API token" — so I can paste it ` +
+        `into the masked field. Do not ask any clarifying questions; just open the secure input.`,
+    );
+    if (sent) {
+      appendSystem(
+        `Opening a secure field to set your ${friendly} token — paste it into the masked input below. ` +
+          `It goes straight to the agent's secure store, never into ComfyUI settings, logs, or chat history.`,
+      );
+    } else {
+      pendingSecretRequest = null;
+      appendSystem(`Couldn't reach the agent to set your ${friendly} token — make sure it's connected, then try again.`);
+    }
+  };
+
   // On load, only auto-connect if a bridge is already up (you started the
   // orchestrator yourself, or another tab did). Otherwise sit idle behind the
   // Connect button — we never start a process without an explicit click.
@@ -7200,8 +7583,9 @@ function buildPanel() {
     // Sticky auto-connect: the user connected before and didn't Disconnect, so
     // reconnect on open — respawning the orchestrator if it died (e.g. ComfyUI
     // was rebooted). This is what makes "open the panel after a reboot → it's
-    // back" work without a manual Connect click.
-    if (lsGet(AUTOCONNECT_KEY)) {
+    // back" work without a manual Connect click. The "Auto-connect on load" setting
+    // opts into the same behavior even for a user who hasn't manually connected yet.
+    if (lsGet(AUTOCONNECT_KEY) || getSetting(SETTING_AUTOCONNECT) === true) {
       connectAgent();
       return;
     }
@@ -7233,6 +7617,14 @@ function buildPanel() {
       } catch {
         // already detached
       }
+      // Drop the Settings→panel hooks so the dialog can't drive a torn-down panel
+      // (a freshly-mounted panel re-registers them).
+      panelHooks.applyBackend = null;
+      panelHooks.applyModel = null;
+      panelHooks.applyEffort = null;
+      panelHooks.applyBridgeUrl = null;
+      panelHooks.applyAutoConnect = null;
+      panelHooks.requestSecret = null;
       client.destroy();
       root.remove();
     },
@@ -7264,6 +7656,11 @@ function registerExtensionWhenReady(tries = 0) {
   // TODO(v2): replace with `defineExtension({ name, setup() {...} })`.
   app.registerExtension({
     name: "comfyui-mcp.agent-panel",
+    // Standard ComfyUI Settings dialog entries (persisted to comfy.settings.json).
+    // Grouped under "Comfy MCP Agent". These seed the panel's runtime defaults and
+    // stay in sync with the in-panel pickers; token entries are secure buttons that
+    // never persist a raw value here. See panelSettingsList() above.
+    settings: panelSettingsList(),
     async setup() {
       const tabId = "comfyui-mcp.agent";
       let mounted = null; // { root, destroy }
