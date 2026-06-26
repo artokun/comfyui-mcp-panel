@@ -106,18 +106,66 @@ def _detect_comfyui_url():
     return "http://{}:{}".format(host, port)
 
 
+def _looks_like_comfyui_root(p):
+    """True if ``p`` is a dir that looks like a real ComfyUI install root. A
+    ComfyUI Desktop-installer *wrapper* dir has NONE of these markers, while the
+    real (sometimes nested) root has at least one. Dependency-free + defensive:
+    never throws."""
+    try:
+        if not p or not os.path.isdir(p):
+            return False
+        for marker in ("main.py", "output", "custom_nodes", "models"):
+            if os.path.exists(os.path.join(p, marker)):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _descend_to_nested_root(candidate, source="COMFYUI_PATH"):
+    """Self-heal the nested ("doubled") ComfyUI Desktop-installer layout: if
+    ``candidate`` is not itself a valid root but ``candidate/ComfyUI`` is,
+    descend exactly ONE level (never more — guards against re-doubling). Returns
+    ``candidate`` unchanged otherwise, so this is a strict no-op for a normal,
+    non-nested install. Never throws."""
+    try:
+        if _looks_like_comfyui_root(candidate):
+            return candidate
+        nested = os.path.join(candidate, "ComfyUI")
+        if _looks_like_comfyui_root(nested):
+            if source == "env":
+                print(
+                    "[comfyui-mcp-panel] COMFYUI_PATH env var '{}' looks like a "
+                    "Desktop-installer wrapper; descending to nested root "
+                    "'{}'.".format(candidate, nested)
+                )
+            return nested
+    except Exception:
+        pass
+    return candidate
+
+
 def _detect_comfyui_path():
     """Best-effort: the ComfyUI install dir, so the agent's MCP runs in LOCAL
     mode (download_model, apply_manifest / installer packs, model scans) instead
-    of remote-only."""
-    if os.environ.get("COMFYUI_PATH"):
-        return os.environ["COMFYUI_PATH"]
-    try:
-        import folder_paths  # provided by ComfyUI at runtime
+    of remote-only.
 
-        base = getattr(folder_paths, "base_path", None)
-        if base:
-            return base
+    Both the explicit env var and ComfyUI's ``folder_paths.base_path`` can point
+    at a Desktop-installer wrapper whose real root is one level down
+    (``<wrapper>/ComfyUI/``); validate + descend so filesystem tools target the
+    actual install. If neither validates, the candidate is returned as-is
+    (best-effort — never regresses prior behavior)."""
+    try:
+        if os.environ.get("COMFYUI_PATH"):
+            return _descend_to_nested_root(os.environ["COMFYUI_PATH"], source="env")
+        try:
+            import folder_paths  # provided by ComfyUI at runtime
+
+            base = getattr(folder_paths, "base_path", None)
+            if base:
+                return _descend_to_nested_root(base, source="folder_paths")
+        except Exception:
+            pass
     except Exception:
         pass
     return None
