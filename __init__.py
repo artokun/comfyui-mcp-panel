@@ -77,6 +77,11 @@ def _no_autospawn():
     return os.environ.get("COMFYUI_MCP_NO_AUTOSPAWN", "").lower() in ("1", "true", "yes")
 
 
+def _truthy(val):
+    """Loose truthiness for a query-string flag (?force=1 / true / yes)."""
+    return str(val).lower() in ("1", "true", "yes") if val is not None else False
+
+
 def _port_in_use(host, port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(0.3)
@@ -411,7 +416,7 @@ def _port_owner_pid(host, port):
     return None
 
 
-def _start_orchestrator(backend=_DEFAULT_BACKEND, port=None):
+def _start_orchestrator(backend=_DEFAULT_BACKEND, port=None, force=False):
     """Start the panel orchestrator on demand. Returns (ok: bool, message: str).
 
     Called only from the Connect route — i.e. an explicit user action — never at
@@ -421,6 +426,15 @@ def _start_orchestrator(backend=_DEFAULT_BACKEND, port=None):
     bridge port it should own (defaults to the backend's mapped port). The default
     call — ``_start_orchestrator()`` → claude on _BRIDGE_PORT (9180) — is the
     historical no-backend path, byte-for-byte unchanged.
+
+    `force` (the panel's auto-reclaim safety net) RECLAIMS a WEDGED orchestrator
+    that still looks healthy by the lockfile (our ComfyUI launched it, its pid is
+    alive) but whose agent backend is dead — the "bridge open but no panel agent
+    responded" wedge. Without force we'd reuse it ("already running") and stay
+    stuck; with force we kill+respawn it. CRITICAL SAFETY: force still only ever
+    kills a process VERIFIED as our panel orchestrator (_is_orchestrator_process,
+    cmdline check) and never a different live ComfyUI's orchestrator — a truly
+    foreign process on the port is reported, never killed.
     """
     global _orchestrator_proc
 
@@ -432,8 +446,13 @@ def _start_orchestrator(backend=_DEFAULT_BACKEND, port=None):
         lock = _read_lock(port)
         parent = lock.get("parent") if lock else None
         opid = lock.get("pid") if lock else None
-        # Healthy + ours (our ComfyUI launched it and its pid is alive) → reuse.
-        if lock and _lock_parent_is_current(lock) and _pid_alive(opid):
+        # Healthy + ours (our ComfyUI launched it and its pid is alive) → reuse,
+        # UNLESS the caller forced a reclaim. A force request means the panel
+        # connected to this bridge but got NO orchestrator handshake (no models
+        # frame) within its generous timeout, i.e. the lockfile says "healthy" but
+        # the agent is actually dead. Fall through to the reclaim branch below so we
+        # kill+respawn it (verified-orchestrator-only) instead of reusing the wedge.
+        if lock and _lock_parent_is_current(lock) and _pid_alive(opid) and not force:
             return True, "already running"
 
         # Otherwise the port is held by something that isn't a healthy orchestrator
@@ -693,12 +712,18 @@ def _register_routes():
     async def _connect(_request):
         # Backend selector: ?backend=codex query param OR {"backend": "codex"} JSON
         # body. Absent → "claude" (back-compat: the historical no-arg Connect path).
+        # `force`/`reclaim` (query ?force=1 OR {"force": true} / {"reclaim": true}):
+        # the panel's auto-reclaim safety net asks us to KILL a wedged orchestrator
+        # that looks healthy by the lockfile but never handshook, and respawn fresh.
         backend = _request.query.get("backend")
+        force = _truthy(_request.query.get("force")) or _truthy(_request.query.get("reclaim"))
         if not backend:
             try:
                 body = await _request.json()
                 if isinstance(body, dict):
                     backend = body.get("backend")
+                    if not force:
+                        force = bool(body.get("force") or body.get("reclaim"))
             except Exception:
                 backend = None
         # Reject a non-string backend with a clean 400 (e.g. {"backend": 123})
@@ -714,13 +739,14 @@ def _register_routes():
                 status=400,
             )
         port = _backend_port(backend)
-        ok, message = _start_orchestrator(backend=backend, port=port)
+        ok, message = _start_orchestrator(backend=backend, port=port, force=force)
         return web.json_response(
             {
                 "ok": ok,
                 "running": _orchestrator_running(port),
                 "backend": backend,
                 "port": port,
+                "forced": force,
                 # The exact ws URL the panel should connect to — so the user never
                 # types a port.
                 "bridge_url": "ws://{}:{}".format(_BRIDGE_HOST, port),
