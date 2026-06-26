@@ -2177,8 +2177,56 @@ const GRAPH_TOOL_EXECUTORS = {
         // reboot; don't block a needed restart on a flaky probe.
       }
     }
-    await managerV2("manager/reboot", { method: "POST" });
-    return { rebooting: true };
+    // Fire the reboot. IMPORTANT: a "successful" reboot usually looks like a
+    // FAILED fetch. The bundled Desktop Manager handler calls exit(0) the instant
+    // it accepts POST /v2/manager/reboot — the process dies before sending any HTTP
+    // response, so fetch rejects with "Failed to fetch". Because this panel runs
+    // INSIDE the live ComfyUI frontend, the server was demonstrably up a moment
+    // ago, so a dropped connection here means the reboot fired (not that the
+    // endpoint is unreachable). Treat that as success and let the auto-reconnect/
+    // resume flow take over. Try the canonical v2 route first, then the legacy
+    // GET route for older Manager builds; a real Response that is 404/non-OK means
+    // "wrong route on this build" → try the next; 403 means Manager security
+    // blocked it (a real, actionable failure). On total failure we RETURN a
+    // structured error (rebooting:false) rather than throw, so the agent is told
+    // accurately AND the auto-resume flag is not armed.
+    const candidates = [
+      { route: "/v2/manager/reboot", method: "POST" },
+      { route: "/manager/reboot", method: "GET" },
+    ];
+    const errors = [];
+    for (const { route, method } of candidates) {
+      try {
+        const res = await api.fetchApi(route, { method });
+        if (res && res.ok) return { rebooting: true, endpoint: route, method };
+        if (res && res.status === 403) {
+          return {
+            rebooting: false,
+            error:
+              "ComfyUI-Manager refused the reboot (HTTP 403): rebooting requires the Manager " +
+              "security level to be 'middle' or below. Ask the user to lower it in ComfyUI-Manager " +
+              "settings, then retry. ComfyUI was NOT restarted.",
+          };
+        }
+        // 404 / other non-OK: this route isn't the one on this build — try next.
+        errors.push(`${method} ${route} → HTTP ${res ? res.status : "no response"}`);
+      } catch {
+        // Connection dropped mid-request = server going down = reboot initiated.
+        return {
+          rebooting: true,
+          endpoint: route,
+          method,
+          note: "connection dropped (server going down) — reboot initiated",
+        };
+      }
+    }
+    return {
+      rebooting: false,
+      error:
+        "Could not reach any ComfyUI-Manager reboot endpoint — ComfyUI was NOT restarted " +
+        "(is the built-in Manager enabled?). Tried: " +
+        errors.join("; "),
+    };
   },
   async free_vram() {
     // Unload all resident models + free cached VRAM via ComfyUI's standard /free
@@ -5199,7 +5247,11 @@ function buildPanel() {
       if (reply.ok && AUTOFIT_CMDS.has(cmd)) scheduleAutoFit();
       // The agent restarted ComfyUI — arm the auto-resume so we reconnect and
       // nudge it to continue once ComfyUI is back (install→restart→continue).
-      if (cmd === "comfy_reboot" && reply.ok) {
+      // Gate on the handler actually reporting rebooting:true — a busy-guard
+      // refusal or a failed reboot also returns ok:true but rebooting:false, and
+      // arming resume in those cases would leave the panel waiting for a restart
+      // that never happens.
+      if (cmd === "comfy_reboot" && reply.ok && reply.result?.rebooting === true) {
         ssSet(REBOOT_KEY, "1");
         appendSystem("Restarting ComfyUI to load new nodes — I'll reconnect and pick up automatically when it's back.");
       }
