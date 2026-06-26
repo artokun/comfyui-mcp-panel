@@ -8,6 +8,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Expandable attachment chips** — composer attachments now show as a chip
+  strip above the input (Claude-Code style) instead of only an opaque
+  `[Pasted text #N]` token in the textarea. Each chip carries a kind icon +
+  label (pasted text shows a dim char count; files show their name; images show
+  a thumbnail). Click a text/pasted/file/workflow chip to expand an inline,
+  read-only, scrollable monospace preview of the full content (one open at a
+  time); click an image chip to see a larger thumbnail. A per-chip × removes the
+  attachment and precisely strips its inline token (e.g. `[Pasted text #N]`)
+  from the textarea. Purely additive — the send/resolve pipeline still resolves
+  attachments by token-match against the textarea, unchanged.
 - **Edit focus-follow** — when the agent edits a node (set widget, set mode,
   move, connect/disconnect, recolor, retitle, collapse, add/remove), the canvas
   now smoothly darts to that node with 50% padding so you watch the change land;
