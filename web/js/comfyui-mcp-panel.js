@@ -1389,18 +1389,39 @@ const GRAPH_TOOL_EXECUTORS = {
   async workflow_open({ path }) {
     const s = app?.extensionManager?.workflow;
     if (!s?.openWorkflow) throw new Error("workflow service unavailable");
-    const all = [...(s.openWorkflows ?? []), ...(s.workflows ?? [])];
-    const target =
-      (typeof s.getWorkflowByPath === "function" && path && s.getWorkflowByPath(path)) ||
-      all.find(
-        (w) =>
-          w &&
-          (w.path === path ||
-            w.filename === path ||
-            w.key === path ||
-            (w.filename && w.filename.replace(/\.json$/i, "") === path)),
+    const find = () => {
+      const all = [...(s.openWorkflows ?? []), ...(s.workflows ?? [])];
+      return (
+        (typeof s.getWorkflowByPath === "function" && path && s.getWorkflowByPath(path)) ||
+        all.find(
+          (w) =>
+            w &&
+            (w.path === path ||
+              w.filename === path ||
+              w.key === path ||
+              (w.filename && w.filename.replace(/\.json$/i, "") === path)),
+        )
       );
-    if (!target) throw new Error(`no workflow matching "${path}" — call workflow_list first`);
+    };
+    let target = find();
+    // The frontend's workflow list is CACHED, so a just-saved/staged file (e.g. a
+    // downloaded example) won't appear until the store re-reads the workflows dir.
+    // If the first search misses, REFRESH the store and search again so a freshly
+    // staged file is found + opened natively (no need for a separate refresh call).
+    if (!target && typeof s.syncWorkflows === "function") {
+      try {
+        await s.syncWorkflows();
+      } catch (err) {
+        console.warn("[comfyui-mcp-panel] syncWorkflows failed:", err?.message ?? err);
+      }
+      target = find();
+    }
+    if (!target) {
+      throw new Error(
+        `no workflow matching "${path}" — it isn't among the saved/open workflows even after a refresh. ` +
+          `For a file outside the workflows folder, load it with panel_load_workflow path:<file>.`,
+      );
+    }
     await s.openWorkflow(target);
     return { opened: { path: target.path, filename: target.filename } };
   },
@@ -4467,7 +4488,9 @@ function buildPanel() {
       if (!ok) setMsgStatus(mid, "failed");
       else armDeliveryTimeout(mid);
     } else {
-      client?.sendFrame?.({ type: "interrupt" });
+      // requeue:true — this is SEND NOW, not a plain Stop: re-queue the turn the
+      // agent was interrupted on so BOTH it and this queued message get answered.
+      client?.sendFrame?.({ type: "interrupt", requeue: true });
     }
     renderTray();
   }
