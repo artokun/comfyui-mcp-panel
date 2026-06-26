@@ -420,6 +420,139 @@ function imageViewUrl(img) {
   }
 }
 
+// ---- VIDEO → STORYBOARD (contact sheet) config -----------------------------
+// When a VIDEO output lands the panel can't show the agent the raw .mp4 (the
+// vision path only accepts images), so it samples frames in-browser and composes
+// a single contact-sheet PNG the agent CAN see. Tunable constants:
+const STORYBOARD = {
+  COLS: 5, // grid columns
+  ROWS: 4, // grid rows  → COLS*ROWS = frame count (default 20, i.e. "2×5"-style sheet)
+  CELL_W: 256, // px width of each cell (height derives from video aspect)
+  GAP: 6, // px gap between cells
+  PAD: 8, // px outer padding
+  LABEL: true, // draw a small frame-index label in each cell
+  HEAD: 0.05, // skip the first 5% (likely black/fade-in)
+  TAIL: 0.95, // stop at 95% (likely black/fade-out)
+  SEEK_TIMEOUT_MS: 4000, // per-frame seek guard
+  META_TIMEOUT_MS: 15000, // loadedmetadata guard
+};
+function storyboardFrameCount() {
+  return Math.max(1, STORYBOARD.COLS * STORYBOARD.ROWS);
+}
+
+/** Await a one-shot media event (e.g. 'seeked', 'loadedmetadata') with a timeout
+ *  guard so a wedged decode can't hang the storyboard pipeline forever. */
+function awaitMediaEvent(el, name, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const finish = (ok, err) => {
+      if (done) return;
+      done = true;
+      el.removeEventListener(name, onEv);
+      clearTimeout(timer);
+      ok ? resolve() : reject(err);
+    };
+    const onEv = () => finish(true);
+    const timer = setTimeout(() => finish(false, new Error(`${name} timeout`)), timeoutMs);
+    el.addEventListener(name, onEv, { once: true });
+  });
+}
+
+/**
+ * Build a contact-sheet/storyboard PNG from a same-origin video URL by sampling
+ * N frames evenly across HEAD..TAIL of its duration and tiling them into a grid.
+ * Same-origin /view means the canvas is NOT tainted, so toBlob works. Returns a
+ * PNG Blob, or null if the video can't be decoded/sampled. Never throws.
+ */
+async function buildVideoStoryboard(url) {
+  const video = document.createElement("video");
+  video.muted = true;
+  video.setAttribute("muted", "");
+  video.playsInline = true;
+  video.preload = "auto";
+  video.src = url;
+  // Keep it off-layout but attached so some browsers actually decode/seek.
+  video.style.cssText = "position:fixed;left:-99999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;";
+  document.body.appendChild(video);
+
+  const cleanup = () => {
+    try {
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+    } catch {
+      /* best-effort */
+    }
+    video.remove();
+  };
+
+  try {
+    await awaitMediaEvent(video, "loadedmetadata", STORYBOARD.META_TIMEOUT_MS);
+    const duration = Number(video.duration);
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!isFinite(duration) || duration <= 0 || !vw || !vh) return null;
+
+    const n = storyboardFrameCount();
+    const cellW = STORYBOARD.CELL_W;
+    const cellH = Math.max(1, Math.round((cellW * vh) / vw));
+    const cols = STORYBOARD.COLS;
+    const rows = STORYBOARD.ROWS;
+    const gap = STORYBOARD.GAP;
+    const pad = STORYBOARD.PAD;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = pad * 2 + cols * cellW + (cols - 1) * gap;
+    canvas.height = pad * 2 + rows * cellH + (rows - 1) * gap;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.fillStyle = "#111114";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Evenly-spaced timestamps across HEAD..TAIL (skip likely-black head/tail).
+    const lo = duration * STORYBOARD.HEAD;
+    const hi = duration * STORYBOARD.TAIL;
+    const span = Math.max(0, hi - lo);
+
+    let painted = 0;
+    for (let i = 0; i < n; i += 1) {
+      const t = n === 1 ? duration / 2 : lo + (span * i) / (n - 1);
+      try {
+        video.currentTime = Math.min(Math.max(0, t), Math.max(0, duration - 0.01));
+        await awaitMediaEvent(video, "seeked", STORYBOARD.SEEK_TIMEOUT_MS);
+      } catch {
+        continue; // skip a frame that won't seek; keep building the rest
+      }
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const x = pad + col * (cellW + gap);
+      const y = pad + row * (cellH + gap);
+      try {
+        ctx.drawImage(video, x, y, cellW, cellH);
+        painted += 1;
+      } catch {
+        continue; // a single bad frame shouldn't kill the sheet
+      }
+      if (STORYBOARD.LABEL) {
+        ctx.font = "10px monospace";
+        ctx.textBaseline = "top";
+        ctx.fillStyle = "rgba(0,0,0,0.55)";
+        ctx.fillRect(x + 2, y + 2, 22, 13);
+        ctx.fillStyle = "#e6e6e6";
+        ctx.fillText(String(i + 1).padStart(2, "0"), x + 4, y + 4);
+      }
+    }
+    if (!painted) return null;
+
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+    return blob || null;
+  } catch {
+    return null; // decode/seek/metadata failure → caller falls back to video-only
+  } finally {
+    cleanup();
+  }
+}
+
 /** Current workflow title for this tab. */
 function getWorkflowTitle() {
   // document.title is "<name> - ComfyUI" with a leading "*" when unsaved.
@@ -3069,6 +3202,12 @@ function buildPanel() {
   header.append(title, actions, status, histPop);
   root.appendChild(header);
 
+  // Panel preferences (model/effort/storyboard toggle/…), localStorage-backed.
+  // Declared up here so the settings UI below can read/write it (e.g. the
+  // video-storyboard toggle). Model-related migration happens at first use.
+  const prefs = loadPrefs();
+  if (prefs.model === "default") prefs.model = undefined; // migrate old saved value
+
   // ---- Connection settings ----
   const settingsBox = document.createElement("div");
   settingsBox.className = "cmcp-popover cmcp-popover--down cmcp-conn-pop";
@@ -3192,7 +3331,24 @@ function buildPanel() {
   // for you. Keep it (collapsed) for manual/user-managed orchestrators.
   const advWrap = document.createElement("div");
   advWrap.className = "cmcp-advanced";
-  advWrap.append(urlLabel, urlInput);
+
+  // Toggle: auto-generate a frame storyboard (contact sheet) from each VIDEO
+  // output and deliver it to the agent as an inline image (so it can "see" the
+  // video it made). Default ON; persisted in prefs.
+  const sbWrap = document.createElement("label");
+  sbWrap.style.cssText = "display:flex;align-items:center;gap:0.4rem;cursor:pointer;font-size:0.85em;";
+  const sbToggle = document.createElement("input");
+  sbToggle.type = "checkbox";
+  sbToggle.checked = prefs.videoStoryboard !== false; // default on
+  sbToggle.addEventListener("change", () => {
+    prefs.videoStoryboard = sbToggle.checked;
+    savePrefs(prefs);
+  });
+  const sbText = document.createElement("span");
+  sbText.textContent = "Show the agent a storyboard of generated videos";
+  sbWrap.append(sbToggle, sbText);
+
+  advWrap.append(urlLabel, urlInput, sbWrap);
   advWrap.hidden = true;
   const advToggle = document.createElement("button");
   advToggle.type = "button";
@@ -3546,9 +3702,8 @@ function buildPanel() {
   // so the chip actually drives the background agent (model live, effort on a
   // resumed restart). The catalog arrives live via the `models` frame; until
   // then it's the small fallback. Selection persists in localStorage and is
-  // re-sent on connect so a freshly-spawned agent adopts it.
-  const prefs = loadPrefs();
-  if (prefs.model === "default") prefs.model = undefined; // migrate old saved value
+  // re-sent on connect so a freshly-spawned agent adopts it. (`prefs` itself is
+  // declared earlier — near the settings UI that also reads it.)
   let modelCatalog = presentableModels(normalizeModels(FALLBACK_MODELS));
   if (!prefs.model) prefs.model = pickDefaultModel(modelCatalog);
 
@@ -5022,6 +5177,82 @@ function buildPanel() {
   // When a run finishes with output images, show them in the chat and notify
   // the agent so it knows its render landed (the orchestrator drops the event
   // if no session is attending). On error, notify the agent to diagnose.
+  // Upload a Blob into ComfyUI's input/ folder via the SAME endpoint chat
+  // attachments use (/upload/image writes any blob verbatim) → returns an
+  // ImageRef ({filename, subfolder, type:"input"}) the vision path can resolve,
+  // or null on failure. Mirrors handleImageFile's upload.
+  async function uploadBlobToInput(blob, name) {
+    try {
+      const fd = new FormData();
+      fd.append("image", blob, name);
+      const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
+      if (res.status !== 200) return null;
+      const info = await res.json();
+      return { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || "input" };
+    } catch {
+      return null;
+    }
+  }
+
+  // VIDEO-VISION: a video output just landed and was painted as a <video> for the
+  // user — but the agent can't see video bytes. Sample frames → contact sheet PNG
+  // → upload to input/ → deliver THAT as an inline image (own executed event), and
+  // paint it as a card so the user sees it too. Fully non-blocking + best-effort:
+  // any failure just logs and leaves the video player as-is (no agent image).
+  async function deliverVideoStoryboard(m, nodeId) {
+    // ALWAYS notify the agent a video rendered — with a storyboard if we can build
+    // one, else a note-only event (no images) so the agent still learns the render
+    // landed even when the preview is off or sampling/upload fails.
+    const noteOnly = (why) =>
+      client.sendFrame({
+        type: "agent_event",
+        kind: "executed",
+        note:
+          `🎬 A video rendered (file ${m.filename}). You can't view it directly` +
+          (why ? ` — ${why}` : "") +
+          `; tell the user it's ready and ask how it looks if you need to judge it.`,
+        node_id: nodeId,
+      });
+    if (prefs.videoStoryboard === false) {
+      noteOnly("storyboard preview is turned off in panel settings");
+      return;
+    }
+    try {
+      const blob = await buildVideoStoryboard(imageViewUrl(m));
+      if (!blob) {
+        console.warn("[cmcp] storyboard: could not sample frames from", m.filename);
+        noteOnly("couldn't sample a storyboard from it");
+        return;
+      }
+      const base = String(m.filename || "video").replace(/\.[^.]+$/, "");
+      const ref = await uploadBlobToInput(blob, `storyboard_${base}.png`);
+      if (!ref) {
+        console.warn("[cmcp] storyboard: upload failed for", m.filename);
+        noteOnly("couldn't upload its storyboard");
+        return;
+      }
+      const n = storyboardFrameCount();
+      // Show the user the contact sheet next to the <video> player.
+      paintImage(imageViewUrl(ref), `Storyboard · ${n} frames`);
+      // Deliver the storyboard to BOTH backends via the existing inline-vision
+      // path: the ImageRef rides in the executed event's `images`; the `note`
+      // tells the agent what it's looking at. Do NOT include the raw video ref.
+      client.sendFrame({
+        type: "agent_event",
+        kind: "executed",
+        images: [ref],
+        note:
+          `📽️ ${n}-frame storyboard (contact sheet) of the video you just generated ` +
+          `(file ${m.filename}) — frames run top-left→bottom-right = start→end. ` +
+          `Review motion, sharpness, and temporal consistency.`,
+        node_id: nodeId,
+      });
+    } catch (err) {
+      console.warn("[cmcp] storyboard pipeline failed:", err);
+      noteOnly("its storyboard preview failed to build");
+    }
+  }
+
   function onExecuted(ev) {
     const d = ev?.detail ?? {};
     const out = d.output || {};
@@ -5030,18 +5261,39 @@ function buildPanel() {
     // video isn't shown as a broken <img>.
     const media = [...(out.images || []), ...(out.gifs || []), ...(out.videos || [])];
     if (!media.length) return;
+    const nodeId = d.node ?? d.display_node ?? null;
+    // Viewable images (incl. animated gifs) go inline to the agent as-is. Video
+    // refs are EXCLUDED here — the agent can't decode them — and instead get a
+    // storyboard delivered asynchronously below.
+    const inlineImages = [];
+    const videos = [];
     for (const m of media) {
       if (!m || !m.filename) continue;
       const url = imageViewUrl(m);
-      if (isVideoOutput(m)) paintVideo(url, m.filename);
-      else paintImage(url, m.filename);
+      if (isVideoOutput(m)) {
+        paintVideo(url, m.filename);
+        videos.push(m);
+      } else {
+        paintImage(url, m.filename);
+        inlineImages.push(m);
+      }
     }
-    client.sendFrame({
-      type: "agent_event",
-      kind: "executed",
-      images: media,
-      node_id: d.node ?? d.display_node ?? null,
-    });
+    // Always send the executed event (so silent video-only runs still notify the
+    // agent). Only attach the directly-viewable images here.
+    if (inlineImages.length) {
+      client.sendFrame({
+        type: "agent_event",
+        kind: "executed",
+        images: inlineImages,
+        node_id: nodeId,
+      });
+    } else if (!videos.length) {
+      // No viewable images and no videos (shouldn't happen given the guard above).
+      return;
+    }
+    // Kick off a storyboard per video — non-blocking; onExecuted has already sent
+    // its event and painted everything. Each storyboard delivers its own event.
+    for (const m of videos) deliverVideoStoryboard(m, nodeId);
   }
   function onExecError(ev) {
     const d = ev?.detail ?? {};
