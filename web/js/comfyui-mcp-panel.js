@@ -6438,15 +6438,18 @@ function buildPanel() {
         (finalNames.length === 1 ? "" : "s") +
         `).`;
       if (previewCount) {
-        note +=
-          ` Also shown: ${previewCount} preview frame(s) (temporary, not the final file).`;
+        const frameWord = previewCount === 1 ? "preview frame" : "preview frames";
+        note += ` Also shown: ${previewCount} ${frameWord} (temporary, not the final file).`;
       }
     } else {
       // No SaveImage (or equivalent output node) ran — everything we have is a
       // throwaway preview. Tell the agent so it doesn't cite a /tmp name as final.
+      const previewClause =
+        previewCount === 1
+          ? `this image is a preview (temporary, not a final file)`
+          : `these ${previewCount} images are previews (temporary, not a final file)`;
       note =
-        `Run finished, but no saved output node ran — ` +
-        `these ${previewCount} image(s) are previews (temporary, not a final file). ` +
+        `Run finished, but no saved output node ran — ${previewClause}. ` +
         `Add a SaveImage node to persist the result, or treat the preview as the result if that's intended.`;
     }
     // One consolidated turn with ALL of the run's directly-viewable images,
