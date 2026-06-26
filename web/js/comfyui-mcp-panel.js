@@ -1993,9 +1993,35 @@ const GRAPH_TOOL_EXECUTORS = {
     return { status: await managerV2("manager/queue/status") };
   },
 
-  async comfy_reboot() {
+  async comfy_reboot({ force } = {}) {
     // Restart the ComfyUI server (to load newly installed nodes). ComfyUI and the
     // orchestrator go down briefly; the panel auto-reconnects + resumes after.
+    // GUARD: a reboot ABORTS any in-progress/queued generation. Don't silently kill
+    // a render the user is waiting on — check the queue first and refuse (with a
+    // clear message the agent relays) unless force:true.
+    if (!force) {
+      try {
+        const res = await api.fetchApi("/queue");
+        const q = await res.json();
+        const running = q?.queue_running?.length ?? 0;
+        const pending = q?.queue_pending?.length ?? 0;
+        if (running > 0 || pending > 0) {
+          return {
+            rebooting: false,
+            blocked_busy: true,
+            queue_running: running,
+            queue_pending: pending,
+            message:
+              `NOT rebooting — ComfyUI is busy (${running} generating, ${pending} queued). A reboot would ABORT the in-progress render. ` +
+              `Tell the user a generation is running and either wait for it to finish (poll get_queue / panel_node_queue_status) ` +
+              `or, only if they confirm they want to kill it, call again with force:true.`,
+          };
+        }
+      } catch {
+        // Queue probe failed (ComfyUI unreachable / no /queue) — fall through and
+        // reboot; don't block a needed restart on a flaky probe.
+      }
+    }
     await managerV2("manager/reboot", { method: "POST" });
     return { rebooting: true };
   },
