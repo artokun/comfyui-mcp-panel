@@ -6,6 +6,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-06-26
+
+### Added
+
+- **`graph_set_node_mode`** — bypass / mute / activate a node on the live canvas
+  (undo-able like every other edit), so the agent can enable a bypassed path (e.g. a
+  pack's Ideogram-JSON prompt builder) instead of improvising. The graph read now
+  surfaces each node's mode, so bypassed/muted nodes are visible. (#30)
+
+### Fixed
+
+- **Run outputs now name the FINAL result vs previews.** A run emits both preview
+  images (`type:"temp"`, throwaway `/tmp` names) and the saved output (`type:"output"`,
+  real filename); the panel now batches them into one event, orders finals first, and
+  the note tells the agent which filename is the real saved result — so it stops citing
+  a preview's temp name as the output. Applies to images and videos. (#31)
+
 ## [0.4.0] - 2026-06-26
 
 ### Added
