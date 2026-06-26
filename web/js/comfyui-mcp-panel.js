@@ -3316,6 +3316,12 @@ function buildPanel() {
   // The backend we're actually CONNECTED to (set from the handshake). Used to
   // detect a real provider switch (vs. re-picking the current one).
   let connectedBackend = null;
+  // The discovered providers (from GET /backends), kept so the model popup's
+  // PROVIDER section can render them (the switcher now lives there, not in
+  // settings). Defaults to claude-only until discovery lands.
+  let knownBackends = [{ backend: "claude", running: false }];
+  // Short per-provider hint shown under each provider row in the popup.
+  const BACKEND_HINTS = { claude: "Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)" };
 
   function renderBackendChips(backends) {
     backendChips.replaceChildren();
@@ -3323,6 +3329,7 @@ function buildPanel() {
       Array.isArray(backends) && backends.length
         ? backends
         : [{ backend: "claude", running: false }];
+    knownBackends = list;
     for (const b of list) {
       const id = b.backend;
       const chip = document.createElement("button");
@@ -3437,7 +3444,11 @@ function buildPanel() {
     advToggle.textContent = advWrap.hidden ? "Advanced ▸" : "Advanced ▾";
   });
 
-  settingsBody.append(backendLabel, backendChips, btnRow, advToggle, advWrap, helpDiv);
+  // NOTE: the provider switcher (backendLabel + backendChips) moved INTO the model
+  // popup's PROVIDER section — see buildModelPop. The elements stay defined (so
+  // renderBackendChips/loadBackends keep working as the data source) but are no
+  // longer shown in settings.
+  settingsBody.append(btnRow, advToggle, advWrap, helpDiv);
   settingsBox.appendChild(settingsBody);
   // Lives in the header as a dropdown anchored under the status pill.
   header.appendChild(settingsBox);
@@ -3855,6 +3866,23 @@ function buildPanel() {
       modelPop.appendChild(el);
     };
 
+    // PROVIDER — pick Claude or ChatGPT right here (the switcher used to live in
+    // settings). Picking one runs the full switch flow (connectBackend → fresh
+    // orchestrator on that backend's port → handshake repopulates Model + Effort).
+    // Only shown when more than one provider is actually available.
+    if (knownBackends.length > 1) {
+      section("Provider");
+      const activeBackend = connectedBackend || selectedBackend;
+      for (const b of knownBackends) {
+        const id = b.backend;
+        const small = id === activeBackend ? "connected" : b.running ? "running" : "";
+        item({ label: BACKEND_LABELS[id] || id, small: BACKEND_HINTS[id] || small }, id === activeBackend, () => {
+          modelPop.hidden = true;
+          if (id !== activeBackend) connectBackend(id);
+        });
+      }
+    }
+
     section("Model");
     for (const m of modelCatalog) {
       item({ label: m.label, small: m.small }, m.id === prefs.model, () => {
@@ -3951,6 +3979,12 @@ function buildPanel() {
     if (modelPop.hidden) {
       buildModelPop();
       modelPop.hidden = false;
+      // Refresh provider discovery (running status) in the background; rebuild the
+      // popup if it's still open and the list changed, so the PROVIDER section is
+      // current without blocking the open.
+      void loadBackends().then(() => {
+        if (!modelPop.hidden) buildModelPop();
+      });
     } else {
       modelPop.hidden = true;
     }
