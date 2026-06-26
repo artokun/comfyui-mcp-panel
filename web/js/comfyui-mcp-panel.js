@@ -352,6 +352,27 @@ function panelSettingsList() {
 
   return [
     {
+      // A link row near the top of the group — "⭐ Star on GitHub". Render-fn type
+      // (same custom-HTMLElement trick as the token buttons); no persisted value.
+      id: "comfyui-mcp.starGithub",
+      name: "Star on GitHub",
+      category: cat("About", "Star on GitHub"),
+      tooltip:
+        "Enjoying the ComfyUI Agent Panel? A GitHub star genuinely helps. Opens the repo in a new tab.",
+      type: () => {
+        const a = document.createElement("a");
+        a.href = "https://github.com/artokun/comfyui-mcp-panel";
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.textContent = "⭐ Star comfyui-mcp-panel on GitHub";
+        a.style.cssText =
+          "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
+          "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
+          "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:0.8rem;white-space:nowrap;";
+        return a;
+      },
+    },
+    {
       id: SETTING_BACKEND,
       name: "Default agent backend",
       category: cat("Defaults", "Default agent backend"),
