@@ -5103,8 +5103,13 @@ function buildPanel() {
       connectBtn.textContent = state === "connecting" ? "Connecting…" : "Connect";
       // A successful handshake → restore the auto-reclaim budget, so a LATER wedge
       // (after a healthy session, e.g. the agent dies mid-use) can be auto-cleared
-      // again. The bound only prevents a loop WITHIN one unsuccessful connect.
-      if (connected) resetAutoReclaim();
+      // again. The bound only prevents a loop WITHIN one unsuccessful connect. Also
+      // release the soft-reload interlock: the (possibly slow) reload's orchestrator
+      // handshook, so auto-respawn can guard the next drop normally.
+      if (connected) {
+        resetAutoReclaim();
+        clearSoftReloadGuard();
+      }
       if (!connected) hideThinking();
       // NB: do NOT push set_options here. The saved model id is only known-valid
       // once the live catalog arrives, so the push happens in applyModelCatalog
@@ -5568,6 +5573,42 @@ function buildPanel() {
     autoRespawnsLeft = MAX_AUTO_RESPAWNS;
     respawnGaveUpNoticed = false;
   }
+
+  // SOFT-RELOAD ↔ AUTO-RESPAWN interlock. A deliberate softReload(orchestrator)
+  // OWNS the respawn: it client.stop() → POST /reload → client.start(), then
+  // reconnects with backoff (up to RECONNECT_MAX_MS=15s) to the respawning
+  // orchestrator. WITHOUT this guard, if the fresh orchestrator's cold start
+  // (node spawn + env-capabilities probe) outlasts ~2 reconnect backoffs (~6s),
+  // scheduleReconnect's escalation would fire tryAutoRespawn → a COMPETING POST
+  // /connect, so two respawns race and reclaim/kill each other's orchestrator and
+  // the handshake never settles ("soft reload never works"). While this flag is
+  // set, tryAutoRespawn STANDS DOWN (returns false) so scheduleReconnect keeps
+  // doing bare WS retries — the soft-reload's own backoff reaches the new
+  // orchestrator uncontested. The flag is cleared on a successful handshake
+  // (onStatus "connected"), on a fresh user/sticky Connect, on a soft-reload that
+  // fails to even POST, and — as a safety net — after a generous timeout, so a
+  // soft-reload whose orchestrator NEVER comes up eventually re-enables the normal
+  // auto-respawn recovery instead of disabling it forever.
+  // > RECONNECT_MAX_MS (15s) so the soft-reload's own backoff gets a full shot
+  // before auto-respawn is re-armed.
+  const SOFT_RELOAD_GUARD_MS = 28000;
+  let softReloadInFlight = false;
+  let softReloadGuardTimer = null;
+  function setSoftReloadGuard() {
+    softReloadInFlight = true;
+    if (softReloadGuardTimer) clearTimeout(softReloadGuardTimer);
+    softReloadGuardTimer = setTimeout(() => {
+      softReloadGuardTimer = null;
+      softReloadInFlight = false; // safety: a failed soft-reload re-enables auto-respawn
+    }, SOFT_RELOAD_GUARD_MS);
+  }
+  function clearSoftReloadGuard() {
+    softReloadInFlight = false;
+    if (softReloadGuardTimer) {
+      clearTimeout(softReloadGuardTimer);
+      softReloadGuardTimer = null;
+    }
+  }
   // The bridge died and WS reconnects keep failing → the port is dead (the
   // orchestrator exited). If sticky autoconnect is on, spend the bounded respawn
   // budget to re-POST /connect (spawn a FRESH orchestrator) and reconnect. Returns
@@ -5575,6 +5616,11 @@ function buildPanel() {
   // let the WS keep retrying / fall back to the manual warning.
   function tryAutoRespawn() {
     if (!lsGet(AUTOCONNECT_KEY)) return false; // user never connected / disconnected
+    // A deliberate soft-reload owns the respawn — DON'T compete. Return false so
+    // scheduleReconnect keeps doing bare WS retries (the soft-reload's own backoff
+    // reaches the new orchestrator); the guard is time-bounded so a stuck reload
+    // eventually re-enables this path.
+    if (softReloadInFlight) return false;
     if (autoRespawning) return true; // one in flight — don't stack
     if (autoRespawnsLeft <= 0) {
       // Budget spent → stop respawning and tell the user once, then let the bare
@@ -5679,8 +5725,12 @@ function buildPanel() {
     const myGen = ++connectGen; // newest attempt; stale ones bail before touching client
     // A fresh user-/sticky-initiated connect gets a fresh auto-reclaim budget — the
     // bound is PER user-initiated connect, so each new Connect can attempt to clear
-    // a wedge again (but a single connect can never loop forever).
+    // a wedge again (but a single connect can never loop forever). It also
+    // supersedes any in-flight soft-reload interlock (softReload reconnects via
+    // client.start(), not connectAgent, so reaching here means a NEW connect intent
+    // took over — re-arm normal auto-respawn).
     resetAutoReclaim();
+    clearSoftReloadGuard();
     connecting = true;
     connectBtn.disabled = true;
     connectBtn.textContent = "Starting…";
@@ -5799,6 +5849,11 @@ function buildPanel() {
     }
     reloading = true;
     ssSet(SOFT_RELOAD_KEY, origin === "agent" ? "agent" : "user");
+    // This deliberate reload OWNS the respawn — stand auto-respawn down so it can't
+    // POST a competing /connect while the fresh orchestrator cold-starts (the race
+    // that made soft reload fail intermittently). Cleared on handshake or by the
+    // guard's safety timeout.
+    setSoftReloadGuard();
     appendSystem("Soft-reloading the agent (new code, no ComfyUI restart)…");
     try {
       client.stop(); // drop the bridge so the old orchestrator can release the port
@@ -5806,17 +5861,20 @@ function buildPanel() {
       const data = await res.json().catch(() => ({}));
       if (!data?.ok) {
         ssSet(SOFT_RELOAD_KEY, null);
+        clearSoftReloadGuard(); // never started respawning → re-enable auto-respawn
         appendSystem(data?.message || "Soft reload failed — try Disconnect then Connect.");
         return;
       }
     } catch (err) {
       ssSet(SOFT_RELOAD_KEY, null);
+      clearSoftReloadGuard(); // POST failed → re-enable auto-respawn
       appendSystem(`Couldn't reach ComfyUI to reload the agent: ${err?.message ?? err}`);
       return;
     } finally {
       reloading = false;
     }
-    // Reconnect with backoff until the fresh orchestrator binds; onAck resumes.
+    // Reconnect with backoff until the fresh orchestrator binds; onAck resumes. The
+    // soft-reload guard keeps auto-respawn from racing this backoff window.
     client.start();
   }
 
