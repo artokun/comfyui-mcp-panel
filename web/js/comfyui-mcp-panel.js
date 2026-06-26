@@ -6410,7 +6410,13 @@ function buildPanel() {
     // manual override → keep it, and don't let /connect's bridge_url clobber it.
     // (A chip pick is never a manual override — it always uses the backend's port.)
     const wanted = urlInput.value.trim();
-    const manualOverride = !opts.fromChip && !!wanted && wanted !== lastAutoUrl;
+    // Only a GENUINELY custom URL counts as a manual override. The DEFAULT bridge URL
+    // must NOT — the Settings "Bridge URL" field seeds the default (9180), and on a
+    // sticky/load connect lastAutoUrl is still empty, so the old check wrongly flagged
+    // the default as an override and SKIPPED the per-backend bridge_url from /connect.
+    // That connected the Codex backend to Claude's port (9180) instead of 9181.
+    const manualOverride =
+      !opts.fromChip && !!wanted && wanted !== DEFAULT_BRIDGE_URL && wanted !== lastAutoUrl;
     if (manualOverride && wanted !== client.currentUrl()) client.setUrl(wanted);
     try {
       // Send the selected backend so the pack starts (and points us at) the right
