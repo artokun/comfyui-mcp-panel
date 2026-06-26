@@ -6,6 +6,28 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-06-25
+
+### Fixed
+
+- **`comfy_reboot` (restart_comfyui) no longer reports a false failure.** ComfyUI
+  Desktop's Manager `exit(0)`s before answering the reboot POST, so the fetch
+  rejected with "Failed to fetch" and the restart looked failed (auto-resume never
+  armed). A dropped connection mid-request is now treated as a successful reboot,
+  with an endpoint fallback chain and accurate errors otherwise.
+- **Stuck soft-reload auto-recovers.** If a soft-reload's fresh orchestrator binds
+  but the agent handshake stalls, the panel now auto-escalates to a clean reconnect
+  (~11s) — what you'd do by clicking Reconnect — instead of sitting on "waiting for
+  the panel agent."
+- **Workflow tabs**: `save` keeps a renamed tab's title (no more "Untitled …"
+  overwrite); merely opening a workflow no longer marks a clean tab modified.
+- **Run output images batch at run-end.** A multi-output run now delivers all its
+  images to the agent in ONE turn when the run completes (buffered per `prompt_id`,
+  flushed on `execution_success`, with a debounce fallback) instead of a fragmented
+  turn per node — while still painting each image live as it finishes.
+- **Desktop-nested ComfyUI path self-heal** in `_detect_comfyui_path` (mirrors the
+  orchestrator fix).
+
 ## [0.3.0] - 2026-06-25
 
 ### Added
