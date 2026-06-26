@@ -6,6 +6,34 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Multi-provider agent: Claude + ChatGPT/Codex at full parity.** The panel is no
+  longer Claude-only — a **backend picker** (Claude / ChatGPT chips) lets you choose
+  a provider rather than a port, and each runs its own background orchestrator on
+  *your* subscription (no API keys). Both providers reach **full feature parity**:
+  - **Provider switch** posts a system message and starts a fresh chat (sessions
+    aren't shared across providers), with a **per-backend composer placeholder**
+    ("Ask Claude…" / "Ask ChatGPT…").
+  - **Reasoning-effort + model selector** is per-provider; a chosen effort survives
+    a provider switch by mapping to the nearest valid level for the target backend.
+  - **Live-canvas tools** (`panel_*`) and the **headless comfyui MCP** are exposed
+    identically to both backends — in-process for Claude, and over a loopback
+    streamable-HTTP MCP plus `codex app-server -c mcp_servers` for ChatGPT — so the
+    `panel_*` surface (incl. the destructive-confirm gating) is the same everywhere.
+  - **Knowledge parity** — both backends can discover bundled skills, installer
+    packs, and the connected server's official workflow templates
+    (`list_skills` / `read_skill` / `list_packs` / `read_pack_workflow` /
+    `list_workflow_templates`) with steering toward packs over hand-built graphs.
+- **One-shot workflow / pack load (`panel_load_workflow`).** Drop a whole workflow
+  onto the live canvas in one call — prefer `pack:<name>` to load a bundled
+  installer pack's local-GPU workflow without shuttling the JSON through the chat.
+  The replaced graph is captured as an undo point (double-Esc / `/revert`).
+- **Local-GPU vs paid-API cost guardrail (`check_workflow_runtime`).** Bundled
+  packs are local/free; for an ad-hoc or generated graph the agent classifies the
+  runtime (local / api / mixed / unknown) and **asks before spending paid API
+  credits** rather than silently using hosted API nodes.
+
 ## [0.2.0] - 2026-06-19
 
 ### Added
