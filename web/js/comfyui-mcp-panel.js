@@ -67,6 +67,10 @@ function setupListeners() {
 // localStorage-backed settings.
 // ---------------------------------------------------------------------------
 const STORAGE_KEY_BRIDGE = "comfyui-mcp.panel.bridgeUrl";
+// The agent backend the user last picked ("claude" | "codex"). Drives which chip
+// is highlighted in the connection settings. Default "claude" keeps the existing
+// no-pick behavior.
+const STORAGE_KEY_BACKEND = "comfyui-mcp.panel.backend";
 // The panel orchestrator owns a DEDICATED bridge port (9180) — so a stray
 // process in another session can never sit on the panel's port and produce a
 // "connected but no agent" lie.
@@ -224,6 +228,8 @@ const FALLBACK_MODELS = [
 ];
 // Friendly copy for known effort ids; unknown ids fall back to a capitalized id.
 const EFFORT_META = {
+  none: { label: "None", small: "no reasoning" },
+  minimal: { label: "Minimal", small: "fastest" },
   low: { label: "Low", small: "quick" },
   medium: { label: "Medium", small: "default" },
   high: { label: "High", small: "thorough" },
@@ -231,6 +237,40 @@ const EFFORT_META = {
   max: { label: "Max", small: "exhaustive" },
 };
 const ALL_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+
+// Per-provider reasoning-effort scales. Claude and Codex (ChatGPT) accept
+// DIFFERENT levels, so the dropdown must offer the valid set for the connected
+// backend — and a chosen level must survive a provider switch by mapping to the
+// nearest valid level for the target (the orchestrator backends do the same
+// mapping server-side; this keeps the picker honest about what's selectable).
+//   • Claude: low | medium | high | xhigh | max
+//   • Codex:  none | minimal | low | medium | high | xhigh
+const BACKEND_EFFORTS = {
+  claude: ["low", "medium", "high", "xhigh", "max"],
+  codex: ["none", "minimal", "low", "medium", "high", "xhigh"],
+};
+// Ordered low→high across BOTH scales, for nearest-level mapping on a switch.
+const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+/** Map an effort to the nearest VALID level for `backend`. Shared levels pass
+ *  through 1:1; an off-scale source (e.g. Claude "max" → Codex "xhigh", or
+ *  Codex "none"/"minimal" → Claude "low") snaps to the closest by ordered rank. */
+function mapEffortToBackend(effort, backend) {
+  const valid = BACKEND_EFFORTS[backend] || BACKEND_EFFORTS.claude;
+  if (!effort) return effort;
+  if (valid.includes(effort)) return effort;
+  const srcRank = EFFORT_ORDER.indexOf(effort);
+  if (srcRank < 0) return valid[0];
+  let best = valid[0];
+  let bestDist = Infinity;
+  for (const v of valid) {
+    const d = Math.abs(EFFORT_ORDER.indexOf(v) - srcRank);
+    if (d < bestDist) {
+      bestDist = d;
+      best = v;
+    }
+  }
+  return best;
+}
 
 /** Normalize a ModelInfo list (or the fallback) to picker rows. `efforts`:
  *  an array of effort ids, or null when the model supports effort but didn't
@@ -380,6 +420,139 @@ function imageViewUrl(img) {
   }
 }
 
+// ---- VIDEO → STORYBOARD (contact sheet) config -----------------------------
+// When a VIDEO output lands the panel can't show the agent the raw .mp4 (the
+// vision path only accepts images), so it samples frames in-browser and composes
+// a single contact-sheet PNG the agent CAN see. Tunable constants:
+const STORYBOARD = {
+  COLS: 5, // grid columns
+  ROWS: 4, // grid rows  → COLS*ROWS = frame count (default 20, i.e. "2×5"-style sheet)
+  CELL_W: 256, // px width of each cell (height derives from video aspect)
+  GAP: 6, // px gap between cells
+  PAD: 8, // px outer padding
+  LABEL: true, // draw a small frame-index label in each cell
+  HEAD: 0.05, // skip the first 5% (likely black/fade-in)
+  TAIL: 0.95, // stop at 95% (likely black/fade-out)
+  SEEK_TIMEOUT_MS: 4000, // per-frame seek guard
+  META_TIMEOUT_MS: 15000, // loadedmetadata guard
+};
+function storyboardFrameCount() {
+  return Math.max(1, STORYBOARD.COLS * STORYBOARD.ROWS);
+}
+
+/** Await a one-shot media event (e.g. 'seeked', 'loadedmetadata') with a timeout
+ *  guard so a wedged decode can't hang the storyboard pipeline forever. */
+function awaitMediaEvent(el, name, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const finish = (ok, err) => {
+      if (done) return;
+      done = true;
+      el.removeEventListener(name, onEv);
+      clearTimeout(timer);
+      ok ? resolve() : reject(err);
+    };
+    const onEv = () => finish(true);
+    const timer = setTimeout(() => finish(false, new Error(`${name} timeout`)), timeoutMs);
+    el.addEventListener(name, onEv, { once: true });
+  });
+}
+
+/**
+ * Build a contact-sheet/storyboard PNG from a same-origin video URL by sampling
+ * N frames evenly across HEAD..TAIL of its duration and tiling them into a grid.
+ * Same-origin /view means the canvas is NOT tainted, so toBlob works. Returns a
+ * PNG Blob, or null if the video can't be decoded/sampled. Never throws.
+ */
+async function buildVideoStoryboard(url) {
+  const video = document.createElement("video");
+  video.muted = true;
+  video.setAttribute("muted", "");
+  video.playsInline = true;
+  video.preload = "auto";
+  video.src = url;
+  // Keep it off-layout but attached so some browsers actually decode/seek.
+  video.style.cssText = "position:fixed;left:-99999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;";
+  document.body.appendChild(video);
+
+  const cleanup = () => {
+    try {
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+    } catch {
+      /* best-effort */
+    }
+    video.remove();
+  };
+
+  try {
+    await awaitMediaEvent(video, "loadedmetadata", STORYBOARD.META_TIMEOUT_MS);
+    const duration = Number(video.duration);
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!isFinite(duration) || duration <= 0 || !vw || !vh) return null;
+
+    const n = storyboardFrameCount();
+    const cellW = STORYBOARD.CELL_W;
+    const cellH = Math.max(1, Math.round((cellW * vh) / vw));
+    const cols = STORYBOARD.COLS;
+    const rows = STORYBOARD.ROWS;
+    const gap = STORYBOARD.GAP;
+    const pad = STORYBOARD.PAD;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = pad * 2 + cols * cellW + (cols - 1) * gap;
+    canvas.height = pad * 2 + rows * cellH + (rows - 1) * gap;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.fillStyle = "#111114";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Evenly-spaced timestamps across HEAD..TAIL (skip likely-black head/tail).
+    const lo = duration * STORYBOARD.HEAD;
+    const hi = duration * STORYBOARD.TAIL;
+    const span = Math.max(0, hi - lo);
+
+    let painted = 0;
+    for (let i = 0; i < n; i += 1) {
+      const t = n === 1 ? duration / 2 : lo + (span * i) / (n - 1);
+      try {
+        video.currentTime = Math.min(Math.max(0, t), Math.max(0, duration - 0.01));
+        await awaitMediaEvent(video, "seeked", STORYBOARD.SEEK_TIMEOUT_MS);
+      } catch {
+        continue; // skip a frame that won't seek; keep building the rest
+      }
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const x = pad + col * (cellW + gap);
+      const y = pad + row * (cellH + gap);
+      try {
+        ctx.drawImage(video, x, y, cellW, cellH);
+        painted += 1;
+      } catch {
+        continue; // a single bad frame shouldn't kill the sheet
+      }
+      if (STORYBOARD.LABEL) {
+        ctx.font = "10px monospace";
+        ctx.textBaseline = "top";
+        ctx.fillStyle = "rgba(0,0,0,0.55)";
+        ctx.fillRect(x + 2, y + 2, 22, 13);
+        ctx.fillStyle = "#e6e6e6";
+        ctx.fillText(String(i + 1).padStart(2, "0"), x + 4, y + 4);
+      }
+    }
+    if (!painted) return null;
+
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+    return blob || null;
+  } catch {
+    return null; // decode/seek/metadata failure → caller falls back to video-only
+  } finally {
+    cleanup();
+  }
+}
+
 /** Current workflow title for this tab. */
 function getWorkflowTitle() {
   // document.title is "<name> - ComfyUI" with a leading "*" when unsaved.
@@ -412,24 +585,165 @@ function getGraphCtx() {
   return { app, graph, rootGraph: app.graph, canvas: app.canvas, LG };
 }
 
-/** Reach ComfyUI's subgraph widget-promotion store. The state that exposes an
- *  inner subgraph widget on the parent SubgraphNode lives in a Pinia store with
- *  id "promotion" (methods: promote/demote/isPromoted). Pinia attaches itself as
- *  `$pinia` on the Vue app's globalProperties; the Vue app instance hangs off its
- *  mount element (#vue-app) as `__vue_app__`; `_s` is pinia's id→store map. */
-function getPromotionStore() {
-  let pinia = null;
+/** Reach a Pinia store by id. Pinia attaches itself as `$pinia` on the Vue app's
+ *  globalProperties; the Vue app instance hangs off its mount element (#vue-app)
+ *  as `__vue_app__`; `_s` is pinia's id→store map. Returns null if unavailable. */
+function getPiniaStore(id) {
   try {
     const el = document.getElementById("vue-app") || document.querySelector("[id*='vue']");
-    pinia = el?.__vue_app__?.config?.globalProperties?.$pinia;
+    const pinia = el?.__vue_app__?.config?.globalProperties?.$pinia;
+    return pinia?._s?.get?.(id) ?? null;
   } catch {
-    // fall through
+    return null;
   }
-  const store = pinia?._s?.get?.("promotion");
+}
+
+/** Reach ComfyUI's subgraph widget-promotion store (id "promotion"; methods
+ *  promote/demote/isPromoted) — the state that exposes an inner subgraph widget
+ *  on the parent SubgraphNode. */
+function getPromotionStore() {
+  const store = getPiniaStore("promotion");
   if (!store || typeof store.promote !== "function") {
     throw new Error("widget-promotion unavailable on this ComfyUI frontend (no 'promotion' store)");
   }
   return store;
+}
+
+/** Reach ComfyUI's subgraph-blueprint store (id "subgraph"). Exposes
+ *  publishSubgraph(name?), getBlueprint(type), subgraphBlueprints (saved defs),
+ *  and typePrefix ("SubgraphBlueprint.") — the save/list/load surface for reusable
+ *  subgraphs. */
+function getSubgraphStore() {
+  const store = getPiniaStore("subgraph");
+  if (!store || typeof store.publishSubgraph !== "function") {
+    throw new Error(
+      "subgraph blueprints unavailable on this ComfyUI frontend (no 'subgraph' store)",
+    );
+  }
+  return store;
+}
+
+function uniqueSubgraphInputName(subgraph, baseName) {
+  const names = new Set((subgraph?.inputs ?? []).map((input) => input?.name).filter(Boolean));
+  if (!names.has(baseName)) return baseName;
+  let i = 1;
+  while (names.has(`${baseName}_${i}`)) i++;
+  return `${baseName}_${i}`;
+}
+
+function getWidgetSlot(node, widget) {
+  if (typeof node.getSlotFromWidget === "function") return node.getSlotFromWidget(widget);
+  return (node.inputs ?? []).find((input) => input?.widget?.name === widget.name);
+}
+
+function resolveSubgraphLink(subgraph, linkId) {
+  const link =
+    typeof subgraph?.getLink === "function"
+      ? subgraph.getLink(linkId)
+      : (subgraph?.links ?? []).find((entry) => Number(entry?.id ?? entry?.[0]) === Number(linkId));
+  if (!link) return null;
+  if (typeof link.resolve === "function") return link.resolve(subgraph);
+
+  const originId = link.origin_id ?? link[1];
+  const originSlot = link.origin_slot ?? link[2];
+  const targetId = link.target_id ?? link[3];
+  const targetSlot = link.target_slot ?? link[4];
+  const inputNode = subgraph.getNodeById?.(targetId);
+  const outputNode = subgraph.getNodeById?.(originId);
+  return {
+    inputNode,
+    input: inputNode?.inputs?.[targetSlot],
+    outputNode,
+    output: outputNode?.outputs?.[originSlot],
+  };
+}
+
+function sourceForSubgraphInput(subgraphNode, subgraphInput) {
+  for (const linkId of subgraphInput?.linkIds ?? []) {
+    const resolved = resolveSubgraphLink(subgraphNode.subgraph, linkId);
+    const inputNode = resolved?.inputNode;
+    const targetInput = resolved?.input;
+    if (!inputNode || !targetInput) continue;
+    const targetWidget =
+      typeof inputNode.getWidgetFromSlot === "function"
+        ? inputNode.getWidgetFromSlot(targetInput)
+        : inputNode.widgets?.find((widget) => widget?.name === targetInput.widget?.name);
+    return {
+      sourceNodeId: String(inputNode.id),
+      sourceWidgetName: targetWidget?.name ?? targetInput.name,
+    };
+  }
+  return null;
+}
+
+function findPromotedHostInput(subgraphNode, source) {
+  return (subgraphNode.inputs ?? []).find((input) => {
+    const subgraphInput = input?._subgraphSlot;
+    if (!subgraphInput) return false;
+    const linkedSource = sourceForSubgraphInput(subgraphNode, subgraphInput);
+    return (
+      linkedSource?.sourceNodeId === source.sourceNodeId &&
+      linkedSource.sourceWidgetName === source.sourceWidgetName
+    );
+  });
+}
+
+function promoteWidgetByLink(subgraphNode, sourceNode, sourceWidget) {
+  const subgraph = subgraphNode.subgraph;
+  if (!subgraph || typeof subgraph.addInput !== "function") {
+    throw new Error("link-only promotion unavailable on this frontend (missing subgraph.addInput)");
+  }
+
+  const source = { sourceNodeId: String(sourceNode.id), sourceWidgetName: sourceWidget.name };
+  if (findPromotedHostInput(subgraphNode, source)) return { changed: false };
+
+  const sourceSlot = getWidgetSlot(sourceNode, sourceWidget);
+  if (!sourceSlot) {
+    throw new Error(`Widget "${sourceWidget.name}" is not backed by a connectable input slot`);
+  }
+
+  const inputName = uniqueSubgraphInputName(subgraph, sourceWidget.name);
+  const inputType = String(sourceSlot.type ?? sourceWidget.type ?? "*");
+  const subgraphInput = subgraph.addInput(inputName, inputType);
+  subgraphInput.label = sourceSlot.label;
+
+  const link =
+    typeof subgraphInput.connect === "function" ? subgraphInput.connect(sourceSlot, sourceNode) : null;
+
+  if (!link) {
+    subgraph.removeInput?.(subgraphInput);
+    throw new Error(`Could not link subgraph input "${inputName}" to widget "${sourceWidget.name}"`);
+  }
+
+  const hostInput = (subgraphNode.inputs ?? []).find((input) => input?._subgraphSlot === subgraphInput);
+  if (hostInput) hostInput.label = sourceSlot.label;
+  subgraphNode.invalidatePromotedViews?.();
+  return { changed: true, input: inputName };
+}
+
+function demoteWidgetByLink(subgraphNode, source) {
+  const hostInput = findPromotedHostInput(subgraphNode, source);
+  const subgraphInput = hostInput?._subgraphSlot;
+  if (!subgraphInput) return { changed: false };
+
+  if (hostInput.link != null && typeof subgraphInput.disconnect === "function") {
+    subgraphInput.disconnect();
+  } else if (typeof subgraphNode.subgraph?.removeInput === "function") {
+    subgraphNode.subgraph.removeInput(subgraphInput);
+  } else {
+    throw new Error("link-only demotion unavailable on this frontend (missing subgraph.removeInput)");
+  }
+
+  subgraphNode.invalidatePromotedViews?.();
+  return { changed: true, input: hostInput.name ?? subgraphInput.name };
+}
+
+function refreshPromotedParents(parents, canvas) {
+  for (const parent of parents) {
+    parent.computeSize?.(parent.size);
+    parent.setDirtyCanvas?.(true, true);
+  }
+  canvas?.setDirty?.(true, true);
 }
 
 /** Where is the user looking right now — root graph or inside a subgraph? */
@@ -509,12 +823,30 @@ function summarizeNode(node) {
     type: out.type,
     links: out.links?.length ?? 0,
   }));
+  // True RENDERED footprint height for layout. node.size[1] is the BODY only
+  // (slots + widgets); the title BAR renders ~30px ABOVE node.pos and isn't in it,
+  // so stacking by size[1] overlaps each node by a header. litegraph's getBounding
+  // returns the full box (title + body, or just the title when collapsed) — stack
+  // with THIS (`full_height`), not size[1].
+  let fullHeight = null;
+  try {
+    if (typeof node.getBounding === "function") {
+      const bb = node.getBounding(new Float32Array(4));
+      if (bb && bb.length >= 4 && Number.isFinite(bb[3])) fullHeight = Math.round(bb[3]);
+    }
+  } catch {
+    /* fall through to the estimate below */
+  }
+  if (fullHeight == null && node.size) {
+    fullHeight = node.flags && node.flags.collapsed ? 30 : Math.round(node.size[1] + 30);
+  }
   const summary = {
     id: node.id,
     type: node.type,
     title: node.title,
     pos: node.pos ? [Math.round(node.pos[0]), Math.round(node.pos[1])] : null,
     size: node.size ? [Math.round(node.size[0]), Math.round(node.size[1])] : null,
+    ...(fullHeight != null ? { full_height: fullHeight } : {}),
     ...(node.flags && node.flags.collapsed ? { collapsed: true } : {}),
     ...(node.color ? { color: node.color } : {}),
     ...(node.bgcolor ? { bgcolor: node.bgcolor } : {}),
@@ -727,6 +1059,77 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     graph.setDirtyCanvas(true, true);
     return { cleared: nodes.length };
+  },
+
+  // Load a COMPLETE workflow onto the live canvas in one shot (replaces the
+  // current graph), so a ready pack/template graph lands without recreating it
+  // node-by-node. Mirrors restoreSnapshot's app.loadGraphData(...) path.
+  graph_load({ graph: incoming } = {}) {
+    const { app } = getGraphCtx();
+    // Accept a JSON string or an object.
+    let data = incoming;
+    if (typeof data === "string") {
+      try {
+        data = JSON.parse(data);
+      } catch (err) {
+        throw new Error(`graph is not valid JSON: ${err?.message ?? err}`);
+      }
+    }
+    if (!data || typeof data !== "object") {
+      throw new Error("graph (object or JSON string) is required");
+    }
+    // Validate UI/litegraph format. The live canvas loads UI-format graphs
+    // (top-level `nodes` array); API/prompt format (top-level numeric keys, each
+    // an object with `class_type`) is NOT loadable here.
+    if (!Array.isArray(data.nodes)) {
+      const keys = Object.keys(data);
+      const looksLikeApi =
+        keys.length > 0 &&
+        keys.every((k) => /^\d+$/.test(k)) &&
+        keys.some((k) => data[k] && typeof data[k] === "object" && "class_type" in data[k]);
+      if (looksLikeApi) {
+        throw new Error(
+          "workflow is in API/prompt format; provide the UI workflow JSON (the pack workflow.json is UI format)",
+        );
+      }
+      throw new Error(
+        "graph is not a UI workflow (missing a `nodes` array). Provide the UI workflow JSON.",
+      );
+    }
+    if (typeof app.loadGraphData !== "function") {
+      throw new Error("app.loadGraphData is unavailable on this frontend");
+    }
+    // Deep-clone so the loaded graph can't be mutated by, nor mutate, the source.
+    const clone = JSON.parse(JSON.stringify(data));
+    // Sanitize node metadata that ComfyUI's workflow zod schema rejects, so an
+    // imperfect pack/template still loads instead of erroring out. `aux_id` must be
+    // 'github-user/repo-name' (or absent) — packs/exports sometimes carry a bare
+    // node name (e.g. "GetNode"/"SetNode"); drop those invalid install-hints rather
+    // than let the whole load fail validation.
+    const AUX_ID_RE = /^[^/\s]+\/[^/\s]+$/;
+    let auxSanitized = 0;
+    const sanitizeNodes = (nodes) => {
+      for (const n of nodes || []) {
+        const aux = n?.properties?.aux_id;
+        if (aux != null && !(typeof aux === "string" && AUX_ID_RE.test(aux))) {
+          delete n.properties.aux_id;
+          auxSanitized++;
+        }
+      }
+    };
+    sanitizeNodes(clone.nodes);
+    // Recurse into subgraph DEFINITIONS — their inner nodes (e.g. KJNodes
+    // Get/Set) carry the same malformed aux_id and would fail validation too.
+    for (const sg of clone.definitions?.subgraphs ?? []) sanitizeNodes(sg.nodes);
+    // Snapshot the current graph FIRST so the load is undoable via the per-turn
+    // revert (double-Esc / revert), like every other graph edit this turn.
+    captureGraphSnapshot(null, "before graph_load");
+    app.loadGraphData(clone);
+    return {
+      loaded: true,
+      node_count: clone.nodes.length,
+      ...(auxSanitized ? { aux_id_sanitized: auxSanitized } : {}),
+    };
   },
 
   graph_connect({ from_node_id, from_output, to_node_id, to_input }) {
@@ -1081,6 +1484,183 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
+  // ---- Copy / paste (cross-workflow MERGE) ---------------------------------
+  // LiteGraph's clipboard PERSISTS across workflow switches, so copying from one
+  // workflow and pasting into another MERGES the copied nodes in. copyToClipboard
+  // /pasteFromClipboard are the same APIs the native Ctrl+C / Ctrl+V use.
+
+  // Copy nodes to the litegraph clipboard. With node_ids: select them first; with
+  // no ids: copy the current canvas selection. The clipboard survives a workflow
+  // switch, so the next graph_paste_nodes can drop them into a DIFFERENT workflow.
+  graph_copy_nodes({ node_ids } = {}) {
+    const { graph, canvas } = getGraphCtx();
+    if (!canvas) throw new Error("canvas unavailable");
+    if (typeof canvas.copyToClipboard !== "function") {
+      throw new Error("copyToClipboard unavailable on this frontend");
+    }
+    if (Array.isArray(node_ids) && node_ids.length) {
+      const resolved = node_ids.map((id) => ({ id, node: graph.getNodeById(Number(id)) }));
+      const missing = resolved.filter((r) => !r.node).map((r) => r.id);
+      // Fail loudly on any unknown id rather than silently copying a partial subset
+      // (the agent would think it grabbed everything).
+      if (missing.length) {
+        throw new Error(`node_ids not found in the current graph: ${missing.join(", ")}`);
+      }
+      const ns = resolved.map((r) => r.node);
+      if (typeof canvas.selectItems === "function") canvas.selectItems(ns);
+      else if (typeof canvas.selectNodes === "function") canvas.selectNodes(ns);
+    }
+    const selected = canvas.selectedItems;
+    const count = selected?.size ?? (Array.isArray(selected) ? selected.length : 0);
+    if (!count) {
+      throw new Error("nothing selected to copy — pass node_ids or select nodes first");
+    }
+    canvas.copyToClipboard(selected);
+    return { copied: count };
+  },
+
+  // Paste the litegraph clipboard onto the CURRENT graph. Snapshots node ids
+  // before/after so the freshly-pasted node ids can be returned. connect_inputs
+  // false (default) drops a disconnected copy; pos places the paste anchor.
+  graph_paste_nodes({ pos, connect_inputs } = {}) {
+    const { graph, canvas } = getGraphCtx();
+    if (!canvas) throw new Error("canvas unavailable");
+    if (typeof canvas.pasteFromClipboard !== "function") {
+      throw new Error("pasteFromClipboard unavailable on this frontend");
+    }
+    const before = new Set((graph._nodes ?? []).map((n) => n.id));
+    const options = { connectInputs: connect_inputs ?? false };
+    if (Array.isArray(pos) && pos.length === 2) options.position = [Number(pos[0]), Number(pos[1])];
+    graph.beforeChange?.();
+    try {
+      canvas.pasteFromClipboard(options);
+    } finally {
+      graph.afterChange?.();
+    }
+    graph.setDirtyCanvas?.(true, true);
+    const pasted = (graph._nodes ?? [])
+      .filter((n) => !before.has(n.id))
+      .map((n) => summarizeNode(n));
+    return { pasted_count: pasted.length, pasted_node_ids: pasted.map((n) => n.id), pasted };
+  },
+
+  // ---- Subgraph blueprints (SAVE / LIST / ADD reusable subgraphs) -----------
+  // A SubgraphNode can be published to the user's blueprint LIBRARY as a reusable
+  // node type "SubgraphBlueprint.<name>". Saved blueprints can be dropped into ANY
+  // workflow. Backed by the Pinia "subgraph" store (publishSubgraph/getBlueprint/
+  // subgraphBlueprints). publishSubgraph(name) skips the name dialog when given a
+  // name, so this runs fully programmatically.
+
+  // Publish a subgraph node to the library. node_id selects the subgraph node
+  // first (else the current single selection must be a subgraph node). name is the
+  // blueprint name (defaults to the node's title). No dialog when name is given.
+  async graph_save_subgraph({ node_id, name } = {}) {
+    const { graph, canvas } = getGraphCtx();
+    if (!canvas) throw new Error("canvas unavailable");
+    const store = getSubgraphStore();
+    let target = null;
+    if (node_id != null) {
+      target = graph.getNodeById(Number(node_id));
+      if (!target) throw new Error(`No node with id ${node_id} in the current graph`);
+      if (!target.subgraph) {
+        throw new Error(`Node ${node_id} (${target.type}) is not a subgraph node`);
+      }
+      if (typeof canvas.select === "function") {
+        canvas.selectedItems?.clear?.();
+        canvas.select(target);
+      } else if (typeof canvas.selectItems === "function") {
+        canvas.selectItems([target]);
+      }
+    } else {
+      const selected = [...(canvas.selectedItems ?? [])];
+      if (selected.length === 1 && selected[0]?.subgraph) target = selected[0];
+      if (!target) {
+        throw new Error(
+          "select a single subgraph node (or pass node_id) before saving it to the library",
+        );
+      }
+    }
+    const finalName =
+      typeof name === "string" && name.trim() ? name.trim() : target.title || "Subgraph";
+    const fullType = `${store.typePrefix ?? "SubgraphBlueprint."}${finalName}`;
+    // publishSubgraph() pops a confirmOverwrite() dialog on a name COLLISION — which
+    // would hang this programmatic call waiting for UI. Preflight and refuse with a
+    // clear error instead (the agent picks a new name).
+    if ((store.subgraphBlueprints ?? []).some((d) => d?.name === fullType)) {
+      throw new Error(
+        `a subgraph blueprint named "${finalName}" already exists — choose a different name (programmatic overwrite isn't supported)`,
+      );
+    }
+    await store.publishSubgraph(finalName);
+    return { saved: { name: finalName, from_node_id: target.id, type: fullType } };
+  },
+
+  // List saved subgraph blueprints. Each is addable via graph_add_subgraph(name)
+  // or graph_add_node(type). Read-only.
+  graph_list_subgraphs() {
+    const store = getSubgraphStore();
+    const prefix = store.typePrefix ?? "SubgraphBlueprint.";
+    const defs = store.subgraphBlueprints ?? [];
+    const blueprints = [...defs].map((d) => {
+      const type = d?.name ?? "";
+      return {
+        name: type.startsWith(prefix) ? type.slice(prefix.length) : type,
+        type,
+        display_name: d?.display_name ?? null,
+        description: d?.description ?? null,
+        is_global: d?.isGlobal === true,
+      };
+    });
+    return { count: blueprints.length, blueprints };
+  },
+
+  // Add a saved subgraph blueprint to the current graph by name (or full type).
+  // Blueprints are NOT created via LiteGraph.createNode — they deserialize their
+  // stored {nodes, subgraphs} via canvas._deserializeItems (mirrors the frontend's
+  // addNodeOnGraph blueprint path), so this is a dedicated tool.
+  graph_add_subgraph({ name, pos } = {}) {
+    const { graph, canvas } = getGraphCtx();
+    if (!canvas || typeof canvas._deserializeItems !== "function") {
+      throw new Error("canvas._deserializeItems unavailable on this frontend");
+    }
+    if (!name || typeof name !== "string") throw new Error("name (blueprint name or type) is required");
+    const store = getSubgraphStore();
+    const prefix = store.typePrefix ?? "SubgraphBlueprint.";
+    const type = name.startsWith(prefix) ? name : `${prefix}${name}`;
+    if (typeof store.getBlueprint !== "function") {
+      throw new Error("subgraph store does not expose getBlueprint on this frontend");
+    }
+    let bp;
+    try {
+      bp = store.getBlueprint(type);
+    } catch (err) {
+      throw new Error(
+        `No saved subgraph blueprint "${name}" (${err?.message ?? err}). List them with graph_list_subgraphs.`,
+      );
+    }
+    const position = placementFor(graph, pos);
+    const before = new Set((graph._nodes ?? []).map((n) => n.id));
+    graph.beforeChange?.();
+    let results;
+    try {
+      results = canvas._deserializeItems(
+        { nodes: bp.nodes, subgraphs: bp.definitions?.subgraphs },
+        { position },
+      );
+    } finally {
+      graph.afterChange?.();
+    }
+    graph.setDirtyCanvas?.(true, true);
+    if (!results) throw new Error("failed to add subgraph blueprint");
+    // Confirm a node actually landed — don't report a fake success if deserialize
+    // produced nothing (mirrors the frontend, which throws when no node resolves).
+    const added = (graph._nodes ?? []).find((n) => !before.has(n.id));
+    if (!added) {
+      throw new Error("subgraph blueprint deserialized but no new node resolved on the canvas");
+    }
+    return { added: summarizeNode(added), from_blueprint: type };
+  },
+
   // ---- Group boxes (LiteGraph LGraphGroup) ----------------------------------
   // The labeled, colored rectangles. Visual organizers ONLY — distinct from
   // subgraphs (which nest nodes). All undoable via beforeChange/afterChange.
@@ -1419,26 +1999,35 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!parents.length) {
       throw new Error("Could not locate the parent subgraph node for the open subgraph.");
     }
-    const store = getPromotionStore();
     const source = { sourceNodeId: String(node.id), sourceWidgetName: w.name };
     const action = demote ? "demote" : "promote";
+    let strategy = "link-only";
     graph.beforeChange?.();
     try {
-      for (const p of parents) {
-        const rootGraphId = p.rootGraph?.id ?? rootGraph?.id;
-        store[action](rootGraphId, p.id, source);
-        // Recompute the parent node so the (un)promoted widget shows immediately.
-        p.computeSize?.(p.size);
-        p.setDirtyCanvas?.(true, true);
+      try {
+        let changed = false;
+        for (const p of parents) {
+          const result = demote ? demoteWidgetByLink(p, source) : promoteWidgetByLink(p, node, w);
+          changed = changed || result.changed;
+        }
+        if (demote && !changed) throw new Error("link-only promoted input not found");
+      } catch (linkErr) {
+        const store = getPromotionStore();
+        strategy = "legacy-store";
+        for (const p of parents) {
+          const rootGraphId = p.rootGraph?.id ?? rootGraph?.id;
+          store[action](rootGraphId, p.id, source);
+        }
       }
+      refreshPromotedParents(parents, canvas);
     } finally {
       graph.afterChange?.();
     }
-    canvas?.setDirty?.(true, true);
     return {
       [demote ? "demoted" : "promoted"]: w.name,
       from_node: node.id,
       on_subgraph_nodes: parents.map((p) => p.id),
+      strategy,
     };
   },
 
@@ -1499,13 +2088,73 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
+  // Update an ALREADY-INSTALLED pack to latest/nightly via the built-in Manager.
+  // Mirrors nodes_install but uses the Manager's "update" task kind. The Manager
+  // identifies the installed pack by `node_name` (its pack id / dir name); we
+  // also pass selected_version so 'nightly' pulls the newest commit. Returns the
+  // queued ui_id so panel_node_queue_status can poll the same queue.
+  async graph_update_node({ id, version, channel, mode }) {
+    if (!id) throw new Error("id (installed pack name/dir or registry id) is required");
+    const sel = version === "nightly" ? "nightly" : "latest";
+    const params = {
+      // The Manager's update task keys off node_name; include id too for
+      // correlation parity with install (harmless if the server ignores it).
+      node_name: id,
+      id,
+      selected_version: sel,
+      version: sel,
+      mode: mode || "remote",
+      channel: channel || "default",
+    };
+    const ui_id = crypto.randomUUID();
+    const client_id = api.clientId ?? api.initialClientId ?? "comfyui-mcp-panel";
+    await managerV2("manager/queue/task", {
+      method: "POST",
+      body: { kind: "update", params, ui_id, client_id },
+    });
+    await managerV2("manager/queue/start", { method: "POST" });
+    return {
+      queued: true,
+      ui_id,
+      id,
+      version: sel,
+      note: "Update queued. Poll nodes_queue_status; a ComfyUI restart (comfy_reboot) is usually required to load the updated node.",
+    };
+  },
+
   async nodes_queue_status() {
     return { status: await managerV2("manager/queue/status") };
   },
 
-  async comfy_reboot() {
+  async comfy_reboot({ force } = {}) {
     // Restart the ComfyUI server (to load newly installed nodes). ComfyUI and the
     // orchestrator go down briefly; the panel auto-reconnects + resumes after.
+    // GUARD: a reboot ABORTS any in-progress/queued generation. Don't silently kill
+    // a render the user is waiting on — check the queue first and refuse (with a
+    // clear message the agent relays) unless force:true.
+    if (!force) {
+      try {
+        const res = await api.fetchApi("/queue");
+        const q = await res.json();
+        const running = q?.queue_running?.length ?? 0;
+        const pending = q?.queue_pending?.length ?? 0;
+        if (running > 0 || pending > 0) {
+          return {
+            rebooting: false,
+            blocked_busy: true,
+            queue_running: running,
+            queue_pending: pending,
+            message:
+              `NOT rebooting — ComfyUI is busy (${running} generating, ${pending} queued). A reboot would ABORT the in-progress render. ` +
+              `Tell the user a generation is running and either wait for it to finish (poll get_queue / panel_node_queue_status) ` +
+              `or, only if they confirm they want to kill it, call again with force:true.`,
+          };
+        }
+      } catch {
+        // Queue probe failed (ComfyUI unreachable / no /queue) — fall through and
+        // reboot; don't block a needed restart on a flaky probe.
+      }
+    }
     await managerV2("manager/reboot", { method: "POST" });
     return { rebooting: true };
   },
@@ -1672,7 +2321,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // the socket, so it's the moment we truthfully flip to "connected".
       if (msg && msg.type === "models" && Array.isArray(msg.models)) {
         markConnected();
-        onModels?.(msg.models, typeof msg.current === "string" ? msg.current : undefined);
+        onModels?.(
+          msg.models,
+          typeof msg.current === "string" ? msg.current : undefined,
+          typeof msg.backend === "string" ? msg.backend : undefined,
+        );
       }
       // SDK slash commands (built-ins like /compact, plus any loaded skills) —
       // surfaced in the composer's completion menu.
@@ -2549,12 +3202,79 @@ function buildPanel() {
   header.append(title, actions, status, histPop);
   root.appendChild(header);
 
+  // Panel preferences (model/effort/storyboard toggle/…), localStorage-backed.
+  // Declared up here so the settings UI below can read/write it (e.g. the
+  // video-storyboard toggle). Model-related migration happens at first use.
+  const prefs = loadPrefs();
+  if (prefs.model === "default") prefs.model = undefined; // migrate old saved value
+
   // ---- Connection settings ----
   const settingsBox = document.createElement("div");
   settingsBox.className = "cmcp-popover cmcp-popover--down cmcp-conn-pop";
   settingsBox.hidden = true;
   const settingsBody = document.createElement("div");
   settingsBody.className = "cmcp-settings-body";
+
+  // ---- backend picker ----
+  // "Pick a backend, not a port": chips for each discovered backend (Claude /
+  // ChatGPT). Clicking one asks the pack to ensure that backend's orchestrator is
+  // running and returns the bridge URL to connect to — the user never types a
+  // port. Populated from GET /comfyui_mcp_panel/backends when settings open.
+  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT" };
+  const backendLabel = document.createElement("label");
+  backendLabel.className = "cmcp-label";
+  backendLabel.textContent = "Agent backend";
+  const backendChips = document.createElement("div");
+  backendChips.className = "cmcp-backend-chips";
+  backendChips.style.cssText =
+    "display:flex;gap:0.375rem;flex-wrap:wrap;margin-bottom:0.5rem;";
+  // The backend the user last picked (so the active chip is highlighted across
+  // reopens). Defaults to claude for back-compat.
+  let selectedBackend = (() => {
+    try {
+      return window.localStorage.getItem(STORAGE_KEY_BACKEND) || "claude";
+    } catch {
+      return "claude";
+    }
+  })();
+  // The backend we're actually CONNECTED to (set from the handshake). Used to
+  // detect a real provider switch (vs. re-picking the current one).
+  let connectedBackend = null;
+
+  function renderBackendChips(backends) {
+    backendChips.replaceChildren();
+    const list =
+      Array.isArray(backends) && backends.length
+        ? backends
+        : [{ backend: "claude", running: false }];
+    for (const b of list) {
+      const id = b.backend;
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "cmcp-btn cmcp-backend-chip";
+      chip.dataset.backend = id;
+      chip.textContent = BACKEND_LABELS[id] || id;
+      if (b.running) chip.title = "Running";
+      if (id === selectedBackend) {
+        chip.style.cssText =
+          "background:var(--p-primary-color,#2563eb);color:var(--p-primary-contrast-color,#fff);border-color:transparent;";
+      }
+      chip.addEventListener("click", () => connectBackend(id));
+      backendChips.appendChild(chip);
+    }
+  }
+  // Initial paint with the default before discovery lands.
+  renderBackendChips(null);
+
+  async function loadBackends() {
+    try {
+      const res = await api.fetchApi("/comfyui_mcp_panel/backends");
+      const data = await res.json().catch(() => ({}));
+      if (Array.isArray(data?.backends)) renderBackendChips(data.backends);
+    } catch {
+      // No /backends route (older host) — keep the default single chip.
+    }
+  }
 
   const urlLabel = document.createElement("label");
   urlLabel.className = "cmcp-label";
@@ -2607,7 +3327,41 @@ function buildPanel() {
   });
   helpDiv.appendChild(helpCmd);
 
-  settingsBody.append(urlLabel, urlInput, btnRow, helpDiv);
+  // Bridge URL is now an ADVANCED/fallback control — the backend chips set the URL
+  // for you. Keep it (collapsed) for manual/user-managed orchestrators.
+  const advWrap = document.createElement("div");
+  advWrap.className = "cmcp-advanced";
+
+  // Toggle: auto-generate a frame storyboard (contact sheet) from each VIDEO
+  // output and deliver it to the agent as an inline image (so it can "see" the
+  // video it made). Default ON; persisted in prefs.
+  const sbWrap = document.createElement("label");
+  sbWrap.style.cssText = "display:flex;align-items:center;gap:0.4rem;cursor:pointer;font-size:0.85em;";
+  const sbToggle = document.createElement("input");
+  sbToggle.type = "checkbox";
+  sbToggle.checked = prefs.videoStoryboard !== false; // default on
+  sbToggle.addEventListener("change", () => {
+    prefs.videoStoryboard = sbToggle.checked;
+    savePrefs(prefs);
+  });
+  const sbText = document.createElement("span");
+  sbText.textContent = "Show the agent a storyboard of generated videos";
+  sbWrap.append(sbToggle, sbText);
+
+  advWrap.append(urlLabel, urlInput, sbWrap);
+  advWrap.hidden = true;
+  const advToggle = document.createElement("button");
+  advToggle.type = "button";
+  advToggle.className = "cmcp-link";
+  advToggle.textContent = "Advanced ▸";
+  advToggle.style.cssText =
+    "background:none;border:none;padding:0;cursor:pointer;color:var(--p-text-muted-color,#888);font-size:0.8em;text-align:left;";
+  advToggle.addEventListener("click", () => {
+    advWrap.hidden = !advWrap.hidden;
+    advToggle.textContent = advWrap.hidden ? "Advanced ▸" : "Advanced ▾";
+  });
+
+  settingsBody.append(backendLabel, backendChips, btnRow, advToggle, advWrap, helpDiv);
   settingsBox.appendChild(settingsBody);
   // Lives in the header as a dropdown anchored under the status pill.
   header.appendChild(settingsBox);
@@ -2615,6 +3369,8 @@ function buildPanel() {
     e.stopPropagation();
     histPop.hidden = true;
     settingsBox.hidden = !settingsBox.hidden;
+    // Refresh the backend chips (running status) each time settings open.
+    if (!settingsBox.hidden) void loadBackends();
   });
 
   // ---- Message log + empty state ----
@@ -2882,7 +3638,11 @@ function buildPanel() {
 
   const input = document.createElement("textarea");
   input.className = "cmcp-composer-input";
-  input.placeholder = "Ask Claude… / for commands, @ for context";
+  // Placeholder reflects the active backend ("Ask Claude…" / "Ask ChatGPT…").
+  function setAskPlaceholder(id) {
+    input.placeholder = `Ask ${BACKEND_LABELS[id] || "Claude"}… / for commands, @ for context`;
+  }
+  setAskPlaceholder(selectedBackend);
   input.rows = 1;
 
   const row = document.createElement("div");
@@ -2942,18 +3702,27 @@ function buildPanel() {
   // so the chip actually drives the background agent (model live, effort on a
   // resumed restart). The catalog arrives live via the `models` frame; until
   // then it's the small fallback. Selection persists in localStorage and is
-  // re-sent on connect so a freshly-spawned agent adopts it.
-  const prefs = loadPrefs();
-  if (prefs.model === "default") prefs.model = undefined; // migrate old saved value
+  // re-sent on connect so a freshly-spawned agent adopts it. (`prefs` itself is
+  // declared earlier — near the settings UI that also reads it.)
   let modelCatalog = presentableModels(normalizeModels(FALLBACK_MODELS));
   if (!prefs.model) prefs.model = pickDefaultModel(modelCatalog);
 
-  /** The effort ids offered for the currently-selected model. */
+  /** The effort ids offered for the currently-selected model. Driven primarily by
+   *  the connected backend's scale (Claude vs. Codex offer different levels), so a
+   *  Codex session shows none/minimal/… and a Claude session shows …/max. Falls
+   *  back to the model row's enumerated levels, then the full Claude set. */
   function effortsForModel(id) {
+    const backend = connectedBackend || selectedBackend;
+    const scale = BACKEND_EFFORTS[backend] || ALL_EFFORTS;
     const row = modelCatalog.find((m) => m.id === id);
-    if (!row) return ALL_EFFORTS;
-    if (row.efforts === null) return ALL_EFFORTS; // supports effort, levels unknown
-    return row.efforts; // explicit list (possibly empty = no effort control)
+    // Explicit model metadata wins over the provider default: [] = this model has
+    // NO effort control (hide the selector); a non-empty list is intersected with
+    // the provider's scale. row.efforts === null (supports effort, levels unknown)
+    // or no catalog row → fall back to the provider scale.
+    if (row && Array.isArray(row.efforts)) {
+      return row.efforts.length ? row.efforts.filter((e) => scale.includes(e)) : [];
+    }
+    return scale;
   }
 
   const modelChip = document.createElement("button");
@@ -3053,8 +3822,15 @@ function buildPanel() {
     if (!modelCatalog.some((m) => m.id === prefs.model)) {
       prefs.model = pickDefaultModel(modelCatalog);
     }
-    if (prefs.effort && !effortsForModel(prefs.model).includes(prefs.effort)) {
-      prefs.effort = undefined;
+    // Preserve the user's chosen effort across a backend switch: the new backend's
+    // scale may not contain the exact level, so MAP it to the nearest valid one
+    // (Claude "max" → Codex "xhigh", Codex "none"/"minimal" → Claude "low") instead
+    // of dropping it. Only clear it if it maps to nothing (no effort control).
+    if (prefs.effort) {
+      const backend = connectedBackend || selectedBackend;
+      const mapped = mapEffortToBackend(prefs.effort, backend);
+      const avail = effortsForModel(prefs.model);
+      prefs.effort = mapped && avail.includes(mapped) ? mapped : undefined;
     }
     savePrefs(prefs);
     refreshModelChip();
@@ -3252,16 +4028,71 @@ function buildPanel() {
     scrollLog();
   }
 
+  // Lazy chat-video manager: only videos currently scrolled into view hold a live
+  // <video> element (autoplaying muted); off-screen ones are swapped for a gray
+  // placeholder of the same aspect ratio, so a long session with many clips doesn't
+  // accumulate decoded-video memory. Re-entering view re-mounts (and re-autoplays).
+  let _videoIO = null;
+  function videoObserver() {
+    if (_videoIO) return _videoIO;
+    _videoIO = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting) mountHolderVideo(e.target);
+          else unmountHolderVideo(e.target);
+        }
+      },
+      { root: log, rootMargin: "300px 0px" }, // mount slightly before fully in view
+    );
+    return _videoIO;
+  }
+  function mountHolderVideo(holder) {
+    if (holder._video) return; // already live
+    const v = document.createElement("video");
+    v.muted = true;
+    v.setAttribute("muted", ""); // required for muted autoplay on some browsers
+    v.autoplay = true;
+    v.loop = true;
+    v.playsInline = true;
+    v.controls = true;
+    v.preload = "metadata";
+    v.src = holder.dataset.src;
+    v.style.cssText = "width:100%;display:block;border-radius:6px;";
+    v.addEventListener("loadedmetadata", () => {
+      // Learn the real aspect ratio so the placeholder (and layout) match exactly.
+      if (v.videoWidth && v.videoHeight) holder.style.aspectRatio = `${v.videoWidth} / ${v.videoHeight}`;
+    });
+    holder.textContent = "";
+    holder.appendChild(v);
+    holder._video = v;
+    v.play?.().catch(() => {}); // muted autoplay is allowed; ignore if the browser blocks it
+  }
+  function unmountHolderVideo(holder) {
+    const v = holder._video;
+    if (!v) return;
+    try {
+      v.pause();
+      v.removeAttribute("src");
+      v.load(); // release the decoded buffers — this is the memory win
+    } catch {
+      // best-effort
+    }
+    v.remove();
+    holder._video = null; // holder keeps its learned aspect-ratio → gray placeholder fills it
+  }
+
   function paintVideo(url, name) {
     clearEmpty();
     const card = document.createElement("div");
     card.className = "cmcp-bubble agent cmcp-imgcard";
-    const vid = document.createElement("video");
-    vid.src = url;
-    vid.controls = true;
-    vid.preload = "metadata";
-    vid.style.cssText = "max-width:100%;border-radius:6px;display:block;";
-    card.appendChild(vid);
+    // Self-sizing holder: a live <video> when on-screen, a gray aspect-ratio box
+    // when off-screen. Defaults to 16/9 until the first mount learns real dimensions.
+    const holder = document.createElement("div");
+    holder.className = "cmcp-video-holder";
+    holder.dataset.src = url;
+    holder.style.cssText =
+      "width:100%;aspect-ratio:16 / 9;border-radius:6px;background:var(--p-content-hover-background,#2a2a2e);";
+    card.appendChild(holder);
     if (name) {
       const cap = document.createElement("div");
       cap.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
@@ -3269,7 +4100,19 @@ function buildPanel() {
       card.appendChild(cap);
     }
     log.appendChild(card);
+    videoObserver().observe(holder);
     scrollLog();
+  }
+
+  /** Decide whether a ComfyUI output descriptor is a VIDEO (render <video>) vs an
+   *  image (<img>). ComfyUI groups video outputs under `gifs`/`videos` and tags
+   *  them with a `format` like "video/h264-mp4" (vs "image/gif" for animated gifs,
+   *  which still render fine in <img>). Fall back to the filename extension. */
+  function isVideoOutput(m) {
+    const fmt = String(m?.format || "").toLowerCase();
+    if (fmt.startsWith("video/")) return true;
+    if (fmt.startsWith("image/")) return false; // incl. image/gif → animate in <img>
+    return /\.(mp4|webm|mov|mkv|m4v|avi)$/i.test(String(m?.filename || ""));
   }
 
   /**
@@ -4077,6 +4920,8 @@ function buildPanel() {
     "graph_connect",
     "graph_disconnect",
     "graph_create_subgraph",
+    "graph_add_subgraph",
+    "graph_paste_nodes",
     "graph_enter_subgraph",
     "graph_exit_subgraph",
     "graph_create_group",
@@ -4221,7 +5066,37 @@ function buildPanel() {
       turnAnchors.push(uuid);
       if (turnAnchors.length > 200) turnAnchors.shift();
     },
-    onModels(list) {
+    onModels(list, _current, backend) {
+      // The orchestrator self-reports its backend on the handshake — this is the
+      // AUTHORITATIVE source of which provider we're actually connected to. Resolve
+      // the switch BEFORE applying the catalog, so the effort scale + nearest-level
+      // mapping in applyModelCatalog uses the NEW backend's scale (fix #5).
+      const known = typeof backend === "string" && BACKEND_LABELS[backend];
+      if (known) {
+        // A real provider switch = the connected backend changed AND we were
+        // already connected to something (not the first connect, not a re-pick).
+        const switched = connectedBackend !== null && connectedBackend !== backend;
+        if (switched) {
+          appendSystem(
+            `Switched to ${BACKEND_LABELS[backend]} — sessions aren't shared across providers, so this starts a fresh chat.`,
+          );
+        }
+        selectedBackend = backend;
+        connectedBackend = backend; // authoritative: update from the handshake (fix #4)
+        setAskPlaceholder(backend); // authoritative placeholder per backend (fix #3)
+        try {
+          window.localStorage.setItem(STORAGE_KEY_BACKEND, backend);
+        } catch {
+          /* non-persistent is fine */
+        }
+        renderBackendChips(
+          Array.from(backendChips.querySelectorAll(".cmcp-backend-chip")).map((el) => ({
+            backend: el.dataset.backend,
+            running: el.title === "Running",
+          })),
+        );
+      }
+      // Apply the catalog AFTER the backend is known so effort mapping is correct.
       applyModelCatalog(list);
     },
     onCommands(list) {
@@ -4302,19 +5177,123 @@ function buildPanel() {
   // When a run finishes with output images, show them in the chat and notify
   // the agent so it knows its render landed (the orchestrator drops the event
   // if no session is attending). On error, notify the agent to diagnose.
+  // Upload a Blob into ComfyUI's input/ folder via the SAME endpoint chat
+  // attachments use (/upload/image writes any blob verbatim) → returns an
+  // ImageRef ({filename, subfolder, type:"input"}) the vision path can resolve,
+  // or null on failure. Mirrors handleImageFile's upload.
+  async function uploadBlobToInput(blob, name) {
+    try {
+      const fd = new FormData();
+      fd.append("image", blob, name);
+      const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
+      if (res.status !== 200) return null;
+      const info = await res.json();
+      return { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || "input" };
+    } catch {
+      return null;
+    }
+  }
+
+  // VIDEO-VISION: a video output just landed and was painted as a <video> for the
+  // user — but the agent can't see video bytes. Sample frames → contact sheet PNG
+  // → upload to input/ → deliver THAT as an inline image (own executed event), and
+  // paint it as a card so the user sees it too. Fully non-blocking + best-effort:
+  // any failure just logs and leaves the video player as-is (no agent image).
+  async function deliverVideoStoryboard(m, nodeId) {
+    // ALWAYS notify the agent a video rendered — with a storyboard if we can build
+    // one, else a note-only event (no images) so the agent still learns the render
+    // landed even when the preview is off or sampling/upload fails.
+    const noteOnly = (why) =>
+      client.sendFrame({
+        type: "agent_event",
+        kind: "executed",
+        note:
+          `🎬 A video rendered (file ${m.filename}). You can't view it directly` +
+          (why ? ` — ${why}` : "") +
+          `; tell the user it's ready and ask how it looks if you need to judge it.`,
+        node_id: nodeId,
+      });
+    if (prefs.videoStoryboard === false) {
+      noteOnly("storyboard preview is turned off in panel settings");
+      return;
+    }
+    try {
+      const blob = await buildVideoStoryboard(imageViewUrl(m));
+      if (!blob) {
+        console.warn("[cmcp] storyboard: could not sample frames from", m.filename);
+        noteOnly("couldn't sample a storyboard from it");
+        return;
+      }
+      const base = String(m.filename || "video").replace(/\.[^.]+$/, "");
+      const ref = await uploadBlobToInput(blob, `storyboard_${base}.png`);
+      if (!ref) {
+        console.warn("[cmcp] storyboard: upload failed for", m.filename);
+        noteOnly("couldn't upload its storyboard");
+        return;
+      }
+      const n = storyboardFrameCount();
+      // Show the user the contact sheet next to the <video> player.
+      paintImage(imageViewUrl(ref), `Storyboard · ${n} frames`);
+      // Deliver the storyboard to BOTH backends via the existing inline-vision
+      // path: the ImageRef rides in the executed event's `images`; the `note`
+      // tells the agent what it's looking at. Do NOT include the raw video ref.
+      client.sendFrame({
+        type: "agent_event",
+        kind: "executed",
+        images: [ref],
+        note:
+          `📽️ ${n}-frame storyboard (contact sheet) of the video you just generated ` +
+          `(file ${m.filename}) — frames run top-left→bottom-right = start→end. ` +
+          `Review motion, sharpness, and temporal consistency.`,
+        node_id: nodeId,
+      });
+    } catch (err) {
+      console.warn("[cmcp] storyboard pipeline failed:", err);
+      noteOnly("its storyboard preview failed to build");
+    }
+  }
+
   function onExecuted(ev) {
     const d = ev?.detail ?? {};
-    const images = (d.output && d.output.images) || [];
-    if (!images.length) return;
-    for (const img of images) {
-      if (img && img.filename) paintImage(imageViewUrl(img), img.filename);
+    const out = d.output || {};
+    // ComfyUI groups a node's outputs by kind: `images`, plus `gifs`/`videos` for
+    // VHS-style video nodes (e.g. LTX → VHS_VideoCombine). Render each by type so a
+    // video isn't shown as a broken <img>.
+    const media = [...(out.images || []), ...(out.gifs || []), ...(out.videos || [])];
+    if (!media.length) return;
+    const nodeId = d.node ?? d.display_node ?? null;
+    // Viewable images (incl. animated gifs) go inline to the agent as-is. Video
+    // refs are EXCLUDED here — the agent can't decode them — and instead get a
+    // storyboard delivered asynchronously below.
+    const inlineImages = [];
+    const videos = [];
+    for (const m of media) {
+      if (!m || !m.filename) continue;
+      const url = imageViewUrl(m);
+      if (isVideoOutput(m)) {
+        paintVideo(url, m.filename);
+        videos.push(m);
+      } else {
+        paintImage(url, m.filename);
+        inlineImages.push(m);
+      }
     }
-    client.sendFrame({
-      type: "agent_event",
-      kind: "executed",
-      images,
-      node_id: d.node ?? d.display_node ?? null,
-    });
+    // Always send the executed event (so silent video-only runs still notify the
+    // agent). Only attach the directly-viewable images here.
+    if (inlineImages.length) {
+      client.sendFrame({
+        type: "agent_event",
+        kind: "executed",
+        images: inlineImages,
+        node_id: nodeId,
+      });
+    } else if (!videos.length) {
+      // No viewable images and no videos (shouldn't happen given the guard above).
+      return;
+    }
+    // Kick off a storyboard per video — non-blocking; onExecuted has already sent
+    // its event and painted everything. Each storyboard delivers its own event.
+    for (const m of videos) deliverVideoStoryboard(m, nodeId);
   }
   function onExecError(ev) {
     const d = ev?.detail ?? {};
@@ -4369,31 +5348,109 @@ function buildPanel() {
   // the post-restart auto-resume. In-flight guard so the multiple callers
   // (button, reconnected event, mount auto-resume) can't double-spawn.
   let connecting = false;
-  async function connectAgent() {
-    if (connecting) return;
+  // Monotonic connect generation: each connectAgent() bumps it and remembers its
+  // own value; a later attempt (e.g. a chip switch) supersedes an in-flight one, so
+  // when the stale POST finally returns it must NOT touch the client (apply a
+  // bridge_url / setUrl / start) — otherwise it could reconnect the PREVIOUS provider
+  // after the user already picked a new one. Only the newest generation wins.
+  let connectGen = 0;
+  // The last ws URL the picker auto-applied (from /connect's bridge_url). Lets us
+  // tell a MANUAL Advanced-URL override apart from an auto-managed one, so a user
+  // who typed their own bridge URL isn't silently overwritten by the backend's port.
+  let lastAutoUrl = "";
+  async function connectAgent(opts = {}) {
+    // A chip pick (opts.fromChip) is an EXPLICIT backend choice — it must always
+    // (re)connect to that backend's port, so it bypasses the in-flight guard (which
+    // a sticky-reconnect could otherwise hold) and the manual-URL override below.
+    if (connecting && !opts.fromChip) return;
+    const myGen = ++connectGen; // newest attempt; stale ones bail before touching client
     connecting = true;
     connectBtn.disabled = true;
     connectBtn.textContent = "Starting…";
     // Honor whatever is typed in the Bridge URL field — Connect previously
     // ignored it (only Reconnect applied it), so editing the port (e.g. 9181)
     // then clicking Connect still hit the old URL. setUrl persists + reconnects.
+    // A non-empty URL that differs from the last auto-applied one is a deliberate
+    // manual override → keep it, and don't let /connect's bridge_url clobber it.
+    // (A chip pick is never a manual override — it always uses the backend's port.)
     const wanted = urlInput.value.trim();
-    if (wanted && wanted !== client.currentUrl()) client.setUrl(wanted);
+    const manualOverride = !opts.fromChip && !!wanted && wanted !== lastAutoUrl;
+    if (manualOverride && wanted !== client.currentUrl()) client.setUrl(wanted);
     try {
-      const res = await api.fetchApi("/comfyui_mcp_panel/connect", { method: "POST" });
+      // Send the selected backend so the pack starts (and points us at) the right
+      // orchestrator. Default "claude" keeps the historical no-pick Connect path.
+      const res = await api.fetchApi("/comfyui_mcp_panel/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ backend: selectedBackend }),
+      });
       const data = await res.json().catch(() => ({}));
+      // A newer connect (e.g. a backend switch) superseded this one while the POST
+      // was in flight — don't let this stale response retarget/reconnect the client.
+      if (myGen !== connectGen) return;
+      // The pack returns the exact ws URL for the chosen backend's port — connect
+      // there so the user never types a port. Skip it if they manually overrode.
+      if (!manualOverride && data?.bridge_url && data.bridge_url !== client.currentUrl()) {
+        client.setUrl(data.bridge_url);
+        urlInput.value = data.bridge_url;
+        lastAutoUrl = data.bridge_url;
+      }
       if (!data?.ok && data?.message) appendSystem(data.message);
     } catch (err) {
+      if (myGen !== connectGen) return; // superseded → swallow the stale error too
       // No /connect route (older/headless host) — fall through and try the
       // bridge directly in case the user started the orchestrator themselves.
       appendSystem(`Couldn't reach ComfyUI to start the agent: ${err?.message ?? err}`);
     } finally {
       connecting = false;
     }
-    // Connect (or keep reconnecting with backoff until the bridge binds).
+    // Connect (or keep reconnecting with backoff until the bridge binds) — unless a
+    // newer attempt has taken over, in which case let IT drive the client.
+    if (myGen !== connectGen) return;
     client.start();
   }
   connectBtn.addEventListener("click", connectAgent);
+
+  // Pick a backend chip → remember it, repaint the chips so it highlights, then
+  // run the normal Connect flow (which now POSTs this backend and follows the
+  // returned bridge URL). The user never types a port.
+  function connectBackend(id) {
+    selectedBackend = id;
+    try {
+      window.localStorage.setItem(STORAGE_KEY_BACKEND, id);
+    } catch {
+      // localStorage unavailable — selection just won't persist.
+    }
+    renderBackendChips(
+      Array.from(backendChips.querySelectorAll(".cmcp-backend-chip")).map((el) => ({
+        backend: el.dataset.backend,
+        running: el.title === "Running",
+      })),
+    );
+    // Switching to a DIFFERENT backend than we're connected to: agent sessions are
+    // NOT shareable across providers, so start FRESH for the new one (fix #2).
+    // Sending the saved (foreign) session id on hello makes the new orchestrator
+    // try to resume a session it doesn't own ("waiting for the panel agent…" +
+    // a spurious re-send). Mirror newChat()'s session-clear so getResume() → null;
+    // the visible chat log stays, only the agent session resets.
+    const switching = connectedBackend !== null && connectedBackend !== id;
+    if (switching) {
+      ssSet(SESSION_KEY, null);
+      if (thread) thread.sessionId = undefined;
+    }
+    // Reflect the picked backend in the composer placeholder immediately; onModels
+    // reaffirms it authoritatively from the handshake (fix #3).
+    setAskPlaceholder(id);
+    // CLEAN TEARDOWN before the (re)connect (fix #1). The old fromChip path bypassed
+    // the in-flight guard, so a chip pick could OVERLAP a sticky-reconnect already
+    // in flight — re-delivering the prior pending message (a visible duplicate) and
+    // starting a reconnect storm that trips the orchestrator's bounded-restart
+    // give-up ("the agent session keeps dropping"). Tearing the bridge down and
+    // clearing the guard first means EXACTLY ONE connect runs for the new backend.
+    client.stop();
+    connecting = false;
+    void connectAgent({ fromChip: true });
+  }
 
   // Soft reload: pick up new code WITHOUT restarting ComfyUI, keeping this
   // conversation. Two scopes:
