@@ -336,6 +336,16 @@ function autoWorkflowName() {
   return `Untitled ${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
 }
 
+/** True when `name` is a placeholder rather than a name the user/agent chose.
+ *  ComfyUI's brand-new temporary tabs are pathed "Unsaved Workflow.json" (and
+ *  "Unsaved Workflow (2).json", …); our own grounding auto-name is
+ *  "Untitled <timestamp>". Anything else is a real, deliberate name (e.g. set
+ *  via rename_workflow) and must NOT be clobbered by a fresh auto-name on save. */
+function isDefaultWorkflowName(name) {
+  const n = String(name || "").trim();
+  return !n || /^Unsaved Workflow\b/i.test(n) || /^Untitled\b/.test(n);
+}
+
 /** Programmatically save the active workflow — NO Save/Rename dialog. Uses the
  *  workflow STORE's saveWorkflow() (which calls workflow.save({force}); the
  *  dialog only comes from the Comfy.SaveWorkflow *command* path). If the
@@ -347,9 +357,16 @@ async function programmaticSave(name) {
   const wf = svc?.activeWorkflow;
   if (!wf) throw new Error("no active workflow to save");
   const wasUnsaved = wf.isTemporary === true || wf.isPersisted === false;
+  // Respect a name the workflow ALREADY carries. A workflow can be unsaved yet
+  // already named — e.g. rename_workflow set its title/path but it hasn't hit
+  // disk. In that case auto-naming would clobber the user's chosen name, so we
+  // only mint a fresh auto-name for a genuinely placeholder ("Unsaved Workflow"
+  // / "Untitled …") workflow. A named-but-unsaved workflow saves in place.
+  const currentName = (wf.filename || "").replace(/\.json$/i, "").trim();
+  const needsAutoName = wasUnsaved && isDefaultWorkflowName(currentName);
   // Rename FIRST when we want a specific/auto name, so it persists under that
   // name (renameWorkflow does the store bookkeeping; path needs the prefix).
-  const desired = (name ? String(name) : wasUnsaved ? autoWorkflowName() : "")
+  const desired = (name ? String(name) : needsAutoName ? autoWorkflowName() : "")
     .replace(/\.json$/i, "")
     .trim();
   if (desired && typeof svc.renameWorkflow === "function") {
@@ -377,6 +394,51 @@ async function groundUnsavedWorkflow() {
     return await programmaticSave();
   } catch {
     return null; // best-effort — never block the chat on a save hiccup
+  }
+}
+
+/** Resolve on the next animation frame (or a short timer when rAF is absent) so
+ *  a just-loaded graph can finish rendering / capturing state before we read it. */
+function nextFrame() {
+  return new Promise((resolve) => {
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => resolve());
+    else setTimeout(resolve, 16);
+  });
+}
+
+/** Opening a workflow must NOT leave it flagged modified. ComfyUI re-serializes
+ *  the graph on load, then the change tracker compares that re-serialized state
+ *  against the differently-formatted on-disk JSON (via a graphChanged capture
+ *  that fires AFTER openWorkflow resolves) — a spurious diff that flips a
+ *  freshly-opened, unedited workflow to modified:true, which later blocks an
+ *  unforced close. Re-baseline the tracker to the just-loaded graph so a clean
+ *  open stays modified:false. This mirrors what the frontend's own save() does
+ *  (changeTracker.reset(); isModified = false), minus the disk write — opening
+ *  from disk means the loaded graph already IS the saved state. Best-effort +
+ *  feature-detected; never throws. */
+async function clearSpuriousOpenModified(wf) {
+  if (!wf) return;
+  try {
+    // Wait for the load's post-render state capture to settle, otherwise we'd
+    // re-baseline before the spurious modification is recorded.
+    await nextFrame();
+    const ct = wf.changeTracker;
+    // Bring activeState up to date with the loaded graph, then make that the
+    // baseline so initialState === activeState (graphEqual → not modified).
+    ct?.captureCanvasState?.();
+    ct?.reset?.();
+    if (wf.isModified === true) {
+      try {
+        wf.isModified = false; // settable flag on current builds
+      } catch {
+        /* getter-only on older builds — reset() above already re-baselined */
+      }
+    }
+  } catch (err) {
+    console.warn(
+      "[comfyui-mcp-panel] could not clear post-open modified flag:",
+      err?.message ?? err,
+    );
   }
 }
 
@@ -1424,7 +1486,13 @@ const GRAPH_TOOL_EXECUTORS = {
       );
     }
     await s.openWorkflow(target);
-    return { opened: { path: target.path, filename: target.filename } };
+    // Opening alone must not dirty the tab (a spurious post-load change-tracker
+    // diff otherwise flips it to modified:true and blocks an unforced close).
+    await clearSpuriousOpenModified(target);
+    return {
+      opened: { path: target.path, filename: target.filename },
+      modified: !!target.isModified,
+    };
   },
 
   async workflow_rename({ name, path }) {
