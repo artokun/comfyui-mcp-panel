@@ -3886,6 +3886,43 @@ const PANEL_CSS = `
   padding: 0.125rem 0.375rem; border-radius: var(--p-border-radius-sm, 4px);
 }
 .cmcp-chip:hover { background: var(--p-surface-700, #3f3f46); }
+/* Attachment chip strip (composer): viewable/expandable pasted text + files. */
+.cmcp-attachbar { display: flex; flex-direction: column; gap: 0.25rem; padding: 0.25rem 0.25rem 0; }
+.cmcp-chipstrip { display: flex; flex-wrap: wrap; gap: 0.25rem; max-height: 4.75rem; overflow-y: auto; }
+.cmcp-attach-chip {
+  display: inline-flex; align-items: center; gap: 0.3125rem; max-width: 15rem;
+  background: var(--p-surface-700, #3f3f46);
+  border: 1px solid var(--p-content-border-color, #52525b);
+  border-radius: var(--p-border-radius-md, 6px);
+  color: var(--p-text-color, #fff); font: inherit; font-size: 0.6875rem;
+  padding: 0.1875rem 0.25rem 0.1875rem 0.375rem; cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.cmcp-attach-chip:hover { background: var(--p-surface-600, #52525b); }
+.cmcp-attach-chip.open { border-color: var(--p-primary-color, #60a5fa); }
+.cmcp-attach-chip > .pi { font-size: 0.75rem; color: var(--p-text-muted-color, #a1a1aa); flex: none; }
+.cmcp-attach-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmcp-attach-meta { color: var(--p-text-muted-color, #a1a1aa); flex: none; }
+.cmcp-attach-thumb { width: 1.125rem; height: 1.125rem; border-radius: 3px; object-fit: cover; flex: none; }
+.cmcp-attach-rm {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 1rem; height: 1rem; flex: none; margin-left: 0.0625rem; padding: 0;
+  border-radius: 3px; color: var(--p-text-muted-color, #a1a1aa);
+}
+.cmcp-attach-rm:hover { background: var(--p-surface-800, #27272a); color: var(--p-text-color, #fff); }
+.cmcp-attach-rm .pi { font-size: 0.625rem; }
+.cmcp-attach-preview {
+  background: var(--p-surface-900, #18181b);
+  border: 1px solid var(--p-content-border-color, #3f3f46);
+  border-radius: var(--p-border-radius-md, 6px);
+  max-height: 14rem; overflow: auto; padding: 0.5rem;
+}
+.cmcp-attach-preview pre {
+  margin: 0; white-space: pre-wrap; word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.6875rem; line-height: 1.45; color: var(--p-text-color, #e4e4e7);
+}
+.cmcp-attach-preview img { max-width: 100%; max-height: 12rem; border-radius: 4px; display: block; }
 .cmcp-ctx { font-size: 0.625rem; color: var(--p-text-muted-color, #a1a1aa); min-width: 1.75rem; }
 .cmcp-ring { flex: none; margin: 0 0.125rem; transform: rotate(-90deg); }
 .cmcp-ring .bg { stroke: var(--p-surface-600, #52525b); }
@@ -4644,6 +4681,21 @@ function buildPanel() {
   setAskPlaceholder(selectedBackend);
   input.rows = 1;
 
+  // ---- Attachment chip strip (visual manager for attachments[]) -------------
+  // A Claude-Code-style row of chips ABOVE the input. Each chip mirrors one entry
+  // in attachments[]; clicking expands an inline read-only preview; the × removes
+  // the attachment AND its inline token from the textarea. Purely additive — the
+  // send/resolve pipeline still works off the textarea tokens + attachments[].
+  const attachBar = document.createElement("div");
+  attachBar.className = "cmcp-attachbar";
+  attachBar.hidden = true;
+  const chipStrip = document.createElement("div");
+  chipStrip.className = "cmcp-chipstrip";
+  const chipPreview = document.createElement("div");
+  chipPreview.className = "cmcp-attach-preview";
+  chipPreview.hidden = true;
+  attachBar.append(chipStrip, chipPreview);
+
   const row = document.createElement("div");
   row.className = "cmcp-composer-row";
 
@@ -5069,7 +5121,7 @@ function buildPanel() {
   fileInput.hidden = true;
 
   row.append(ring, ctxLabel, modelChip, spacer, attachBtn, micBtn, sendBtn);
-  form.append(menuPop, modelPop, input, row, fileInput);
+  form.append(menuPop, modelPop, attachBar, input, row, fileInput);
   root.appendChild(form);
 
   // ---- feed renderers + thread persistence ----
@@ -7570,6 +7622,148 @@ function buildPanel() {
   function resetAttachments() {
     attachments = [];
     attachSeq = 0;
+    openPreviewId = null;
+    renderAttachmentChips();
+  }
+
+  // ---- Attachment chip rendering / preview / removal -----------------------
+  // The chip strip is a viewer for attachments[]; it never changes how messages
+  // are sent (send still resolves attachments by token-match against the textarea).
+  let openPreviewId = null; // id of the attachment whose inline preview is open
+  const ATT_ICON = {
+    image: "pi-image",
+    video: "pi-video",
+    text: "pi-align-left",
+    textfile: "pi-file",
+    workflow: "pi-sitemap",
+    file: "pi-file",
+  };
+  // The exact inline token a given attachment inserted into the textarea.
+  function attTokenFor(att) {
+    if (!att) return "";
+    if (att.kind === "image") return `[Image #${att.id}]`;
+    if (att.kind === "text") return `[Pasted text #${att.id}]`;
+    return att.token || "";
+  }
+  function attChipLabel(att) {
+    if (att.kind === "text") return `Pasted text #${att.id}`;
+    return att.name || attTokenFor(att) || `#${att.id}`;
+  }
+  // Remove the attachment + its inline token (and a single trailing space) from
+  // the textarea, then re-render. Precise: only the first exact token match.
+  function removeAttachment(id) {
+    try {
+      const idx = attachments.findIndex((a) => a && a.id === id);
+      if (idx === -1) return;
+      const att = attachments[idx];
+      attachments.splice(idx, 1);
+      const tok = attTokenFor(att);
+      if (tok && input) {
+        const v = input.value;
+        const i = v.indexOf(tok);
+        if (i !== -1) {
+          let end = i + tok.length;
+          if (v[end] === " ") end++; // drop the trailing space the insert added
+          input.value = v.slice(0, i) + v.slice(end);
+          input.dispatchEvent(new Event("input")); // re-run autosize + menus
+        }
+      }
+      if (openPreviewId === id) openPreviewId = null;
+      renderAttachmentChips();
+    } catch {
+      /* never throw into the composer */
+    }
+  }
+  function toggleAttachPreview(id) {
+    openPreviewId = openPreviewId === id ? null : id;
+    renderAttachmentChips();
+  }
+  // Fill the inline preview panel for the currently-open attachment.
+  function renderAttachPreview() {
+    if (!chipPreview) return;
+    chipPreview.textContent = "";
+    const att = attachments.find((a) => a && a.id === openPreviewId);
+    if (!att) {
+      chipPreview.hidden = true;
+      openPreviewId = null;
+      return;
+    }
+    chipPreview.hidden = false;
+    if (att.kind === "image") {
+      if (att.dataUrl) {
+        const img = document.createElement("img");
+        img.src = att.dataUrl;
+        img.alt = att.name || "image";
+        chipPreview.appendChild(img);
+      } else {
+        const p = document.createElement("pre");
+        p.textContent = att.name || "image (no preview yet)";
+        chipPreview.appendChild(p);
+      }
+      return;
+    }
+    const pre = document.createElement("pre");
+    const content = att.content != null ? String(att.content) : "";
+    pre.textContent = content || (att.ready ? "Loading…" : "(empty)");
+    chipPreview.appendChild(pre);
+  }
+  // Rebuild the chip strip from attachments[]. Safe to call any time.
+  function renderAttachmentChips() {
+    if (!attachBar || !chipStrip) return;
+    chipStrip.textContent = "";
+    if (!attachments.length) {
+      attachBar.hidden = true;
+      chipPreview.hidden = true;
+      chipPreview.textContent = "";
+      openPreviewId = null;
+      return;
+    }
+    attachBar.hidden = false;
+    for (const att of attachments) {
+      if (!att) continue;
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "cmcp-attach-chip";
+      if (att.id === openPreviewId) chip.classList.add("open");
+      chip.title = "Click to preview";
+      if (att.kind === "image" && att.dataUrl) {
+        const img = document.createElement("img");
+        img.className = "cmcp-attach-thumb";
+        img.src = att.dataUrl;
+        img.alt = "";
+        chip.appendChild(img);
+      } else {
+        const ic = document.createElement("i");
+        ic.className = "pi " + (ATT_ICON[att.kind] || "pi-file");
+        chip.appendChild(ic);
+      }
+      const name = document.createElement("span");
+      name.className = "cmcp-attach-name";
+      name.textContent = attChipLabel(att);
+      chip.appendChild(name);
+      if (att.kind === "text") {
+        const meta = document.createElement("span");
+        meta.className = "cmcp-attach-meta";
+        meta.textContent = `${(att.content || "").length.toLocaleString()} chars`;
+        chip.appendChild(meta);
+      }
+      chip.addEventListener("click", () => toggleAttachPreview(att.id));
+      // Remove control: a span (not a nested <button>, which is invalid HTML).
+      const rm = document.createElement("span");
+      rm.className = "cmcp-attach-rm";
+      rm.setAttribute("role", "button");
+      rm.title = "Remove attachment";
+      const rmi = document.createElement("i");
+      rmi.className = "pi pi-times";
+      rm.appendChild(rmi);
+      rm.addEventListener("click", (e) => {
+        e.stopPropagation();
+        removeAttachment(att.id);
+      });
+      chip.appendChild(rm);
+      chipStrip.appendChild(chip);
+    }
+    renderAttachPreview();
   }
   function classifyFile(file) {
     const type = file?.type || "";
@@ -7615,6 +7809,7 @@ function buildPanel() {
     const att = { id, kind: "image", name, mediaType: file.type, dataUrl: null, inputRef: null };
     attachments.push(att);
     insertAtCaret(`[Image #${id}] `);
+    renderAttachmentChips();
     // Read for a thumbnail + upload to ComfyUI input/ (both async); submit awaits.
     att.ready = (async () => {
       try {
@@ -7635,11 +7830,13 @@ function buildPanel() {
         /* upload failed — the chip still references it by name as a fallback */
       }
     })();
+    att.ready.then(renderAttachmentChips, () => {}); // refresh once the thumb loads
   }
   function handlePastedText(text) {
     const id = ++attachSeq;
     attachments.push({ id, kind: "text", content: text });
     insertAtCaret(`[Pasted text #${id}] `);
+    renderAttachmentChips();
   }
   // Upload a non-inlineable file (video, or an unknown binary) into ComfyUI's
   // input/ folder and drop a path-reference chip. Claude can't view video inline,
@@ -7653,6 +7850,7 @@ function buildPanel() {
     const att = { id, kind, name, mediaType: file.type || "", inputRef: null, ref: null, token: `[${label} #${id}]` };
     attachments.push(att);
     insertAtCaret(`${att.token} `);
+    renderAttachmentChips();
     att.ready = (async () => {
       try {
         const fd = new FormData();
@@ -7677,6 +7875,7 @@ function buildPanel() {
     const att = { id, kind: "textfile", name, content: "", token: `[File #${id}]` };
     attachments.push(att);
     insertAtCaret(`${att.token} `);
+    renderAttachmentChips();
     att.ready = (async () => {
       try {
         let t = await readAsText(file);
@@ -7686,6 +7885,7 @@ function buildPanel() {
         att.content = "";
       }
     })();
+    att.ready.then(renderAttachmentChips, () => {}); // refresh once content is read
   }
   // Read a ComfyUI workflow .json and inline it so the agent can load / analyze /
   // merge it. If it doesn't parse as JSON, fall back to delivering it as raw text.
@@ -7696,6 +7896,7 @@ function buildPanel() {
     const att = { id, kind: "workflow", name, content: "", isWorkflow: true, token: `[Workflow #${id}]` };
     attachments.push(att);
     insertAtCaret(`${att.token} `);
+    renderAttachmentChips();
     att.ready = (async () => {
       try {
         let t = await readAsText(file);
@@ -7717,6 +7918,7 @@ function buildPanel() {
         att.content = "";
       }
     })();
+    att.ready.then(renderAttachmentChips, () => {}); // refresh once content is read
   }
 
   // Resolve image references from an @node:<id> mention to ComfyUI /view refs:
