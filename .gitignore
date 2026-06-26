@@ -6,3 +6,5 @@ node_modules/
 *.log
 .DS_Store
 .panel-guard/
+assets/brand-preview/
+assets/brand-preview-ai/
