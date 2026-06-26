@@ -26,6 +26,8 @@ All notable changes to this project are documented here. This project adheres to
     ("Ask Claude…" / "Ask ChatGPT…").
   - **Reasoning-effort + model selector** is per-provider; a chosen effort survives
     a provider switch by mapping to the nearest valid level for the target backend.
+    The **provider switcher now lives inside the model selector** (Claude models vs
+    ChatGPT/GPT-5 models via Codex), so picking an agent and a model is one control.
   - **Live-canvas tools** (`panel_*`) and the **headless comfyui MCP** are exposed
     identically to both backends — in-process for Claude, and over a loopback
     streamable-HTTP MCP plus `codex app-server -c mcp_servers` for ChatGPT — so the
@@ -34,6 +36,8 @@ All notable changes to this project are documented here. This project adheres to
     packs, and the connected server's official workflow templates
     (`list_skills` / `read_skill` / `list_packs` / `read_pack_workflow` /
     `list_workflow_templates`) with steering toward packs over hand-built graphs.
+  - **Docs/README rebalanced multi-provider** — setup, sign-in, and usage copy now
+    present Claude and ChatGPT (Codex) as equal first-class providers.
 - **One-shot workflow / pack load (`panel_load_workflow`).** Drop a whole workflow
   onto the live canvas in one call — prefer `pack:<name>` to load a bundled
   installer pack's local-GPU workflow without shuttling the JSON through the chat.
