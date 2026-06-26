@@ -226,8 +226,23 @@ function lsSet(key, val) {
 // the existing secure request_secret flow into the orchestrator's secure store.
 // ---------------------------------------------------------------------------
 const SETTING_BACKEND = "comfyui-mcp.defaultBackend";
-const SETTING_MODEL = "comfyui-mcp.defaultModel";
-const SETTING_EFFORT = "comfyui-mcp.defaultEffort";
+// Default model/effort are now PER-BACKEND (one independent setting each per
+// provider), so the Claude group never resets/repopulates the Codex group on a
+// switch and vice-versa — that interdependence is what caused the prior storms.
+// The ACTIVE backend (SETTING_BACKEND) decides which group seeds the runtime.
+const SETTING_MODEL = {
+  claude: "comfyui-mcp.defaultModel.claude",
+  codex: "comfyui-mcp.defaultModel.codex",
+};
+const SETTING_EFFORT = {
+  claude: "comfyui-mcp.defaultEffort.claude",
+  codex: "comfyui-mcp.defaultEffort.codex",
+};
+// Pre-grouping single-key settings (a returning user upgrading from the single
+// "Default model"/"Default reasoning effort" had these). Migrated ONCE into the
+// Claude group (the default backend) so an upgrade never loses the saved choice.
+const LEGACY_SETTING_MODEL = "comfyui-mcp.defaultModel";
+const LEGACY_SETTING_EFFORT = "comfyui-mcp.defaultEffort";
 const SETTING_BRIDGE_URL = "comfyui-mcp.bridgeUrl";
 const SETTING_AUTOCONNECT = "comfyui-mcp.autoConnect";
 const SETTING_TOKEN_CIVITAI = "comfyui-mcp.setCivitaiToken";
@@ -237,6 +252,14 @@ const SETTING_TOKEN_HF = "comfyui-mcp.setHuggingfaceToken";
 // upgrade never silently resets a returning user's backend/model/effort/url).
 // After that, the settings are canonical and seed the runtime on each open.
 const SETTINGS_SEEDED_KEY = "comfyui-mcp.panel.settingsSeeded";
+// One-time flag: migrate the pre-grouping single Default-model/effort into the
+// per-backend groups (runs independently of SETTINGS_SEEDED_KEY).
+const SETTINGS_GROUPS_MIGRATED_KEY = "comfyui-mcp.panel.settingsGroupsMigrated";
+// Section (sub-category) labels for the grouped Settings dialog, per backend.
+const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)" };
+// Backend display names at module scope (the Settings dialog's render-fns live
+// outside buildPanel's closure, so they need their own copy).
+const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT" };
 // The allowlisted secure-store keys (mirrors the orchestrator's #59 allowlist).
 const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
 
@@ -263,6 +286,103 @@ let suppressSettingOnChange = false;
 // stay disarmed until the panel has mounted AND made its single initial connect
 // decision; only genuine post-load user edits in the Settings dialog take effect.
 let settingsArmed = false;
+
+// Per-backend FETCHED model catalog PUBLISHED for the Settings dialog's
+// per-backend "Default model" dropdowns. Those <select>s render at MODULE scope
+// (via the settings `type:()=>HTMLElement` render-fns, outside buildPanel's
+// closure), so the open panel keeps this current as each backend connects, and
+// it survives a panel unmount (last value) so the dialog can still offer the
+// right list. Each backend's list is INDEPENDENT — a Claude connect only ever
+// touches modelsByBackend.claude, so the Codex dropdown never repopulates from a
+// Claude switch (and vice-versa). That independence is the whole point of groups.
+const settingsBackendState = {
+  modelsByBackend: {}, // backend id -> presentable model rows (last fetched)
+};
+// References to the dialog's live per-backend model <select>s, set by their
+// render-fns when the dialog opens, so a freshly-arrived catalog can repaint the
+// matching backend's dropdown in place (a render-fn setting has no static options
+// to re-key). Keyed by backend; null when that group isn't mounted.
+const settingsModelSelectEls = { claude: null, codex: null };
+// Disabled placeholder <option> value — mapped to "" (Auto) if ever selected so
+// it can never persist as a bogus model id.
+const SETTINGS_PLACEHOLDER = "__cmcp_placeholder__";
+
+/** Which backend the Settings dialog currently treats as ACTIVE — the persisted
+ *  Default-backend (claude/codex), defaulting to claude. Used to decide whether a
+ *  per-backend group's edit should drive the LIVE panel (only the active group does). */
+function currentSettingsBackend() {
+  return getSetting(SETTING_BACKEND) === "codex" ? "codex" : "claude";
+}
+/** Fetched model rows for `backend` (the same presentable catalog the composer
+ *  picker uses), or null when none is cached (backend never connected this session). */
+function settingsModelsFor(backend) {
+  const rows = settingsBackendState.modelsByBackend[backend];
+  return Array.isArray(rows) && rows.length ? rows : null;
+}
+/** A styled <select> matching the settings dialog's inputs. */
+function makeSettingSelect() {
+  const sel = document.createElement("select");
+  sel.className = "p-inputtext p-component";
+  sel.style.cssText =
+    "padding:0.3rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
+    "background:var(--p-surface-900,#18181b);color:var(--p-text-color,#e4e4e7);font-size:0.8rem;min-width:14rem;";
+  return sel;
+}
+/** (Re)populate a backend's Default-model <select>: an "Auto" option, then that
+ *  backend's FETCHED models; a saved-but-absent model id is kept SELECTABLE only
+ *  when there's no live catalog (backend not connected) so the choice isn't lost —
+ *  when a fetched catalog exists and lacks the id it's shown DISABLED and the
+ *  selection snaps to Auto (never re-sent as an invalid model). Fully INDEPENDENT
+ *  per backend: only reads SETTING_MODEL[backend] + modelsByBackend[backend]. */
+function populateModelSelect(sel, backend) {
+  if (!sel) return;
+  const rows = settingsModelsFor(backend);
+  const saved = getSetting(SETTING_MODEL[backend]) || "";
+  sel.replaceChildren();
+  const auto = document.createElement("option");
+  auto.value = "";
+  auto.textContent = "Auto (let the agent pick)";
+  sel.appendChild(auto);
+  const seen = new Set([""]);
+  if (rows) {
+    for (const m of rows) {
+      const o = document.createElement("option");
+      o.value = m.id;
+      o.textContent = m.small ? `${m.label} — ${m.small}` : m.label;
+      sel.appendChild(o);
+      seen.add(m.id);
+    }
+  } else {
+    const hint = document.createElement("option");
+    hint.value = SETTINGS_PLACEHOLDER;
+    hint.disabled = true;
+    hint.textContent = `Connect to ${BACKEND_TEXT[backend] || backend} to load its models`;
+    sel.appendChild(hint);
+  }
+  if (saved && !seen.has(saved)) {
+    const o = document.createElement("option");
+    o.value = saved;
+    if (rows) {
+      o.disabled = true;
+      o.textContent = `${saved} (not available for this backend)`;
+    } else {
+      o.textContent = `${saved} (saved)`;
+      seen.add(saved);
+    }
+    sel.appendChild(o);
+  }
+  sel.value = seen.has(saved) ? saved : "";
+}
+/** Build the static effort-combo options for `backend` ("Model default" + that
+ *  backend's fixed scale). Each group's combo is static — no dynamic remap needed
+ *  since the groups are separate (no shared dropdown to flip on a switch). */
+function effortComboOptions(backend) {
+  const scale = BACKEND_EFFORTS[backend] || ALL_EFFORTS;
+  return [
+    { value: "", text: "Model default" },
+    ...scale.map((id) => ({ value: id, text: effortMeta(id).label })),
+  ];
+}
 
 function getSetting(id) {
   try {
@@ -301,7 +421,23 @@ function triggerSecret(envKey, friendly) {
   if (go()) return;
   let tries = 0;
   const t = setInterval(() => {
-    if (go() || ++tries > 25) clearInterval(t);
+    if (go()) {
+      clearInterval(t);
+      return;
+    }
+    // Retry exhausted: the panel never mounted / its hook never appeared (e.g. the
+    // Agent tab was never opened, or it failed to mount). Don't silently no-op —
+    // tell the user how to recover instead of leaving the button dead (P2 b).
+    if (++tries > 25) {
+      clearInterval(t);
+      try {
+        window.alert(
+          `Open the Agent panel, connect, then set the ${friendly} token again.`,
+        );
+      } catch {
+        /* alert unavailable (headless/embedded) — nothing else to do */
+      }
+    }
   }, 150);
 }
 
@@ -312,10 +448,11 @@ function panelSettingsList() {
   // A BUTTON-type setting: ComfyUI supports a custom `type` render function that
   // returns an HTMLElement (cg-use-everywhere uses the same trick for its About
   // row). We render a button + a masked set/not-set indicator.
-  const tokenSetting = (id, envKey, friendly) => ({
+  const tokenSetting = (id, envKey, friendly, sortOrder) => ({
     id,
     name: `${friendly} token`,
     category: cat("API tokens", friendly),
+    sortOrder,
     tooltip:
       `Securely store your ${friendly} API token. Opens the Agent panel's masked secure input; the value goes ` +
       `straight to the agent's secure store on the orchestrator — it is NEVER written to ComfyUI settings, logs, ` +
@@ -358,13 +495,143 @@ function panelSettingsList() {
     },
   });
 
+  // ORDERING. ComfyUI's Settings dialog (SettingDialog.vue → sortedGroups) orders
+  // the SECTIONS within a category by the MAX `sortOrder` of their settings,
+  // DESCENDING (ties broken alphabetically by label), and the rows WITHIN a section
+  // by `sortOrder` DESCENDING. So higher number = earlier. We assign DESCENDING
+  // values to force General → Claude → ChatGPT (Codex) → About → API tokens, with
+  // the backend selector first inside General — NOT the alphabetical default
+  // (which would be "ChatGPT, Claude, General" — exactly the misorder the user hit).
+  // (Verified against the installed comfyui_frontend_package SettingDialog.vue.)
+  //
+  // A per-backend "Default model" — a render-fn DROPDOWN of the FETCHED models for
+  // THAT backend (the same catalog the composer picker shows). Static `combo`s
+  // can't be repopulated, hence the custom render-fn. Each group is INDEPENDENT and
+  // STATIC: the Claude group only reads/writes the Claude setting + Claude catalog,
+  // the Codex group only the Codex ones — neither resets the other on a switch.
+  // "Auto" clears the forced model. We gate the LIVE applier on settingsArmed AND
+  // on this being the ACTIVE backend's group (a non-active group's edit only
+  // persists; it must not drive the running agent).
+  const modelSetting = (backend, sortOrder) => ({
+    id: SETTING_MODEL[backend],
+    name: "Default model",
+    category: cat(BACKEND_SECTION[backend], "Default model"),
+    sortOrder,
+    tooltip:
+      `Default model for the ${BACKEND_TEXT[backend]} background agent, chosen from the models fetched for ` +
+      `${BACKEND_TEXT[backend]} (the same list the panel's model picker shows). 'Auto' lets the agent pick. ` +
+      `Changing the model in the panel updates this too. Until you connect to ${BACKEND_TEXT[backend]} this may ` +
+      `show only 'Auto' + your saved choice.`,
+    type: () => {
+      const sel = makeSettingSelect();
+      populateModelSelect(sel, backend);
+      sel.addEventListener("change", () => {
+        let v = sel.value === SETTINGS_PLACEHOLDER ? "" : sel.value;
+        // Never persist/send a model that isn't in this backend's known fetched
+        // catalog (a stale cross-backend id) — snap to Auto instead.
+        if (v) {
+          const rows = settingsModelsFor(backend);
+          if (rows && !rows.some((m) => m.id === v)) {
+            v = "";
+            sel.value = "";
+          }
+        }
+        setSetting(SETTING_MODEL[backend], v);
+        // Drive the live panel ONLY for the ACTIVE backend's group.
+        if (settingsArmed && backend === currentSettingsBackend()) {
+          panelHooks.applyModel?.(v);
+        }
+      });
+      settingsModelSelectEls[backend] = sel;
+      return sel;
+    },
+  });
+  // A per-backend "Default reasoning effort" — a STATIC combo of THAT backend's
+  // fixed scale (Claude: low–max; Codex: none–xhigh). No dynamic remap needed
+  // since the groups are separate. Drives the live panel only for the active group.
+  const effortSetting = (backend, sortOrder) => ({
+    id: SETTING_EFFORT[backend],
+    name: "Default reasoning effort",
+    category: cat(BACKEND_SECTION[backend], "Default reasoning effort"),
+    sortOrder,
+    tooltip:
+      `Default reasoning effort for the ${BACKEND_TEXT[backend]} agent, from its scale ` +
+      `(${backend === "codex" ? "none–xhigh" : "low–max"}). 'Model default' leaves it unset.`,
+    type: "combo",
+    options: effortComboOptions(backend),
+    defaultValue: "",
+    onChange: (v) => {
+      if (suppressSettingOnChange || !settingsArmed) return;
+      if (backend === currentSettingsBackend()) panelHooks.applyEffort?.(v);
+    },
+  });
+
   return [
+    // ---- General (renders FIRST; backend selector is the first row) ----
     {
-      // A link row near the top of the group — "⭐ Star on GitHub". Render-fn type
-      // (same custom-HTMLElement trick as the token buttons); no persisted value.
+      id: SETTING_BACKEND,
+      name: "Default agent backend",
+      category: cat("General", "Default agent backend"),
+      sortOrder: 100,
+      tooltip:
+        "Which background agent the panel connects to by default. Claude runs on your Claude subscription; " +
+        "ChatGPT runs on your Codex (ChatGPT) account. Seeds the panel's backend (and which group below seeds " +
+        "the runtime); you can still switch live in the model picker.",
+      type: "combo",
+      options: [
+        { value: "claude", text: "Claude" },
+        { value: "codex", text: "ChatGPT" },
+      ],
+      defaultValue: "claude",
+      onChange: (v) => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyBackend?.(v);
+      },
+    },
+    {
+      id: SETTING_AUTOCONNECT,
+      name: "Auto-connect on load",
+      category: cat("General", "Auto-connect on load"),
+      sortOrder: 95,
+      tooltip:
+        "Automatically connect the agent (starting the local orchestrator) when the panel opens, without clicking Connect. " +
+        "Off by default — the orchestrator is otherwise only started by an explicit Connect click.",
+      type: "boolean",
+      defaultValue: false,
+      onChange: (v) => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyAutoConnect?.(!!v);
+      },
+    },
+    {
+      id: SETTING_BRIDGE_URL,
+      name: "Bridge URL",
+      category: cat("General", "Bridge URL"),
+      sortOrder: 90,
+      tooltip:
+        "WebSocket URL of the panel orchestrator bridge. Default ws://127.0.0.1:9180. Only change this if you run the " +
+        "orchestrator on a non-default port.",
+      type: "text",
+      defaultValue: DEFAULT_BRIDGE_URL,
+      onChange: (v) => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyBridgeUrl?.(v);
+      },
+    },
+    // ---- Claude ----
+    modelSetting("claude", 80),
+    effortSetting("claude", 75),
+    // ---- ChatGPT (Codex) ----
+    modelSetting("codex", 60),
+    effortSetting("codex", 55),
+    // ---- About ----
+    {
+      // A link row — "⭐ Star on GitHub". Render-fn type (same custom-HTMLElement
+      // trick as the token buttons); no persisted value.
       id: "comfyui-mcp.starGithub",
       name: "Star on GitHub",
       category: cat("About", "Star on GitHub"),
+      sortOrder: 40,
       tooltip:
         "Enjoying the ComfyUI Agent Panel? A GitHub star genuinely helps. Opens the repo in a new tab.",
       type: () => {
@@ -380,90 +647,9 @@ function panelSettingsList() {
         return a;
       },
     },
-    {
-      id: SETTING_BACKEND,
-      name: "Default agent backend",
-      category: cat("Defaults", "Default agent backend"),
-      tooltip:
-        "Which background agent the panel connects to by default. Claude runs on your Claude subscription; " +
-        "ChatGPT runs on your Codex (ChatGPT) account. Seeds the panel's backend; you can still switch live in the model picker.",
-      type: "combo",
-      options: [
-        { value: "claude", text: "Claude" },
-        { value: "codex", text: "ChatGPT" },
-      ],
-      defaultValue: "claude",
-      onChange: (v) => {
-        if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyBackend?.(v);
-      },
-    },
-    {
-      id: SETTING_MODEL,
-      name: "Default model",
-      category: cat("Defaults", "Default model"),
-      tooltip:
-        "Default model id for the background agent, e.g. claude-opus-4-8 or claude-sonnet-4-5 (Claude) / a Codex model id. " +
-        "Leave blank to auto-pick. Changing the model in the panel updates this too.",
-      type: "text",
-      defaultValue: "",
-      onChange: (v) => {
-        if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyModel?.(v);
-      },
-    },
-    {
-      id: SETTING_EFFORT,
-      name: "Default reasoning effort",
-      category: cat("Defaults", "Default reasoning effort"),
-      tooltip:
-        "Default reasoning effort. The panel snaps this to the nearest level the connected backend/model supports " +
-        "(Claude: low–max; ChatGPT/Codex: none–xhigh). 'Model default' leaves it unset.",
-      type: "combo",
-      options: [
-        { value: "", text: "Model default" },
-        { value: "low", text: "Low" },
-        { value: "medium", text: "Medium" },
-        { value: "high", text: "High" },
-        { value: "xhigh", text: "Extra high" },
-        { value: "max", text: "Max" },
-      ],
-      defaultValue: "",
-      onChange: (v) => {
-        if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyEffort?.(v);
-      },
-    },
-    {
-      id: SETTING_BRIDGE_URL,
-      name: "Bridge URL",
-      category: cat("Defaults", "Bridge URL"),
-      tooltip:
-        "WebSocket URL of the panel orchestrator bridge. Default ws://127.0.0.1:9180. Only change this if you run the " +
-        "orchestrator on a non-default port.",
-      type: "text",
-      defaultValue: DEFAULT_BRIDGE_URL,
-      onChange: (v) => {
-        if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyBridgeUrl?.(v);
-      },
-    },
-    {
-      id: SETTING_AUTOCONNECT,
-      name: "Auto-connect on load",
-      category: cat("Defaults", "Auto-connect on load"),
-      tooltip:
-        "Automatically connect the agent (starting the local orchestrator) when the panel opens, without clicking Connect. " +
-        "Off by default — the orchestrator is otherwise only started by an explicit Connect click.",
-      type: "boolean",
-      defaultValue: false,
-      onChange: (v) => {
-        if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyAutoConnect?.(!!v);
-      },
-    },
-    tokenSetting(SETTING_TOKEN_CIVITAI, "CIVITAI_API_TOKEN", "CivitAI"),
-    tokenSetting(SETTING_TOKEN_HF, "HUGGINGFACE_TOKEN", "HuggingFace"),
+    // ---- API tokens ----
+    tokenSetting(SETTING_TOKEN_CIVITAI, "CIVITAI_API_TOKEN", "CivitAI", 20),
+    tokenSetting(SETTING_TOKEN_HF, "HUGGINGFACE_TOKEN", "HuggingFace", 15),
   ];
 }
 
@@ -3705,10 +3891,20 @@ function buildPanel() {
   logo.className = "cmcp-logo";
   logo.alt = "";
   logo.setAttribute("aria-hidden", "true");
+  const LOGO_SERVED_PATH = "/extensions/comfyui-mcp-panel/img/comfyui-mcp-logo.png";
+  // A 404 on the module-resolved URL must also recover — not just a URL()
+  // construction failure. Fall back to the served path once (a flag prevents an
+  // error loop if the served path itself 404s) (P2 c).
+  logo.addEventListener("error", () => {
+    if (logo.dataset.fellBack === "1") return;
+    logo.dataset.fellBack = "1";
+    logo.src = LOGO_SERVED_PATH;
+  });
   try {
     logo.src = new URL("../img/comfyui-mcp-logo.png", import.meta.url).href;
   } catch {
-    logo.src = "/extensions/comfyui-mcp-panel/img/comfyui-mcp-logo.png";
+    logo.dataset.fellBack = "1";
+    logo.src = LOGO_SERVED_PATH;
   }
   const title = document.createElement("span");
   title.className = "cmcp-title";
@@ -4298,7 +4494,7 @@ function buildPanel() {
   modelChip.append(modelChipLabel, modelChipEffort, modelChipCaret);
 
   function refreshModelChip() {
-    modelChipLabel.textContent = modelLabel(modelCatalog, prefs.model);
+    modelChipLabel.textContent = prefs.modelAuto ? "Auto" : modelLabel(modelCatalog, prefs.model);
     modelChipEffort.textContent = prefs.effort ? ` · ${prefs.effort}` : "";
   }
 
@@ -4308,19 +4504,77 @@ function buildPanel() {
   // runtime here on each open. Applies directly to the already-declared runtime
   // (selectedBackend / prefs / urlInput) — no chat noise, no set_options push (the
   // normal connect/catalog path sends those once the catalog is live).
+  /** SEED prefs (model/modelAuto/effort) from `backend`'s setting group. SEED-ONLY:
+   *  it mutates the runtime prefs and saves them, but NEVER sends set_options — the
+   *  connect→handshake→applyModelCatalog path makes the single push. Blank model =
+   *  Auto (clears the forced model); blank effort = Model default (clears effort).
+   *  An UNSET setting (never chosen) is left alone so a brand-new user keeps the
+   *  default — callers that switch backends force Auto separately (see applyBackend). */
+  function seedPrefsFromBackendGroup(backend) {
+    let changed = false;
+    const sm = getSetting(SETTING_MODEL[backend]);
+    if (typeof sm === "string") {
+      if (sm === "") {
+        if (!prefs.modelAuto) {
+          prefs.modelAuto = true;
+          if (!prefs.model) prefs.model = pickDefaultModel(modelCatalog);
+          changed = true;
+        }
+      } else if (sm !== prefs.model || prefs.modelAuto) {
+        prefs.model = sm;
+        prefs.modelAuto = false;
+        prefs.userSet = true;
+        changed = true;
+      }
+    }
+    const se = getSetting(SETTING_EFFORT[backend]);
+    if (typeof se === "string") {
+      if (se === "") {
+        if (prefs.effort) {
+          prefs.effort = undefined;
+          changed = true;
+        }
+      } else if (se !== prefs.effort) {
+        prefs.effort = se;
+        prefs.userSet = true;
+        changed = true;
+      }
+    }
+    if (changed) savePrefs(prefs);
+  }
+
   function seedFromSettings() {
     if (!app?.ui?.settings) return;
+    // One-time: migrate the pre-grouping single Default-model/effort into the Claude
+    // group (the default backend) so an upgrade never loses the saved choice. Runs
+    // independently of SETTINGS_SEEDED_KEY; only fills an empty Claude-group value.
+    if (!lsGet(SETTINGS_GROUPS_MIGRATED_KEY)) {
+      const lm = getSetting(LEGACY_SETTING_MODEL);
+      const le = getSetting(LEGACY_SETTING_EFFORT);
+      if (typeof lm === "string" && lm && getSetting(SETTING_MODEL.claude) == null) {
+        setSetting(SETTING_MODEL.claude, lm);
+      }
+      if (typeof le === "string" && le && getSetting(SETTING_EFFORT.claude) == null) {
+        setSetting(SETTING_EFFORT.claude, le);
+      }
+      lsSet(SETTINGS_GROUPS_MIGRATED_KEY, "1");
+    }
     if (!lsGet(SETTINGS_SEEDED_KEY)) {
       setSetting(SETTING_BACKEND, selectedBackend || "claude");
       // Only persist model/effort the user actually chose — never a synthetic
-      // fallback-catalog default (which may be an alias id, not a real model).
-      if (prefs.userSet && prefs.model) setSetting(SETTING_MODEL, prefs.model);
-      if (prefs.userSet && prefs.effort) setSetting(SETTING_EFFORT, prefs.effort);
+      // fallback-catalog default (which may be an alias id, not a real model). Push
+      // them into the ACTIVE backend's group.
+      if (prefs.userSet && prefs.model && !prefs.modelAuto) {
+        setSetting(SETTING_MODEL[selectedBackend], prefs.model);
+      }
+      if (prefs.userSet && prefs.effort) setSetting(SETTING_EFFORT[selectedBackend], prefs.effort);
       setSetting(SETTING_BRIDGE_URL, urlInput.value || DEFAULT_BRIDGE_URL);
       setSetting(SETTING_AUTOCONNECT, !!lsGet(AUTOCONNECT_KEY));
       lsSet(SETTINGS_SEEDED_KEY, "1");
       return;
     }
+    // Canonical path: settings seed the runtime. Backend FIRST (it decides which
+    // group seeds prefs), then seed model/effort from THAT backend's group.
     const sb = getSetting(SETTING_BACKEND);
     if (sb && sb !== selectedBackend) {
       selectedBackend = sb;
@@ -4328,18 +4582,7 @@ function buildPanel() {
         window.localStorage.setItem(STORAGE_KEY_BACKEND, sb);
       } catch {}
     }
-    const sm = getSetting(SETTING_MODEL);
-    if (sm && sm !== prefs.model) {
-      prefs.model = sm;
-      prefs.userSet = true;
-      savePrefs(prefs);
-    }
-    const se = getSetting(SETTING_EFFORT);
-    if (typeof se === "string" && se !== "" && se !== prefs.effort) {
-      prefs.effort = se;
-      prefs.userSet = true;
-      savePrefs(prefs);
-    }
+    seedPrefsFromBackendGroup(selectedBackend);
     const su = getSetting(SETTING_BRIDGE_URL);
     if (su && su !== urlInput.value) {
       urlInput.value = su;
@@ -4413,8 +4656,9 @@ function buildPanel() {
 
     section("Model");
     for (const m of modelCatalog) {
-      item({ label: m.label, small: m.small }, m.id === prefs.model, () => {
+      item({ label: m.label, small: m.small }, m.id === prefs.model && !prefs.modelAuto, () => {
         prefs.model = m.id;
+        prefs.modelAuto = false; // an explicit pick clears the Auto state
         prefs.userSet = true;
         // SNAP the effort to the nearest level the new model supports (don't wipe
         // it silently); only clear if the model has no effort control at all.
@@ -4424,9 +4668,10 @@ function buildPanel() {
           prefs.effort = avail.length ? nearestInList(prefs.effort, avail) : undefined;
         }
         savePrefs(prefs);
-        // Keep the ComfyUI Settings default in sync with the picker.
-        setSetting(SETTING_MODEL, m.id);
-        setSetting(SETTING_EFFORT, prefs.effort ?? "");
+        // Keep the ACTIVE backend's Settings group in sync with the picker.
+        const bk = connectedBackend || selectedBackend;
+        setSetting(SETTING_MODEL[bk], m.id);
+        setSetting(SETTING_EFFORT[bk], prefs.effort ?? "");
         refreshModelChip();
         modelPop.hidden = true;
         client?.sendFrame?.({ type: "set_options", model: m.id, effort: prefs.effort ?? null });
@@ -4447,7 +4692,8 @@ function buildPanel() {
           prefs.effort = id;
           prefs.userSet = true;
           savePrefs(prefs);
-          setSetting(SETTING_EFFORT, id); // keep the Settings default in sync
+          // keep the ACTIVE backend's Settings group in sync
+          setSetting(SETTING_EFFORT[connectedBackend || selectedBackend], id);
           refreshModelChip();
           modelPop.hidden = true;
           client?.sendFrame?.({ type: "set_options", effort: id });
@@ -4462,8 +4708,30 @@ function buildPanel() {
     const next = presentableModels(normalizeModels(list));
     if (!next.length) return;
     modelCatalog = next;
-    // Keep the user's saved pick if still valid; else pre-select Opus.
+    // Cache this FETCHED catalog for the CONNECTED backend so the Settings dialog's
+    // per-backend "Default model" dropdown can offer the right list — and repaint
+    // that backend's dropdown in place if it's currently mounted. Only ever touches
+    // the connected backend's slot (the other backend's group stays independent).
+    const bk = connectedBackend || selectedBackend;
+    if (bk) {
+      settingsBackendState.modelsByBackend[bk] = modelCatalog;
+      if (settingsModelSelectEls[bk]?.isConnected) {
+        populateModelSelect(settingsModelSelectEls[bk], bk);
+      }
+    }
+    // Keep the user's saved pick if still valid; else pre-select Opus. When the
+    // active backend's saved model is ABSENT from the fetched catalog and it isn't
+    // already Auto, snap to Auto and clear the saved setting (under
+    // suppressSettingOnChange) so the single post-handshake push sends model:null —
+    // matching the Settings dropdown, which renders an absent saved id as DISABLED
+    // and selects Auto. Otherwise the push would send a concrete fallback the UI
+    // never shows (a UI/agent mismatch). The !modelAuto guard means this fires at
+    // most once (then modelAuto persists), so it can't oscillate across reconnects.
     if (!modelCatalog.some((m) => m.id === prefs.model)) {
+      if (!prefs.modelAuto && bk) {
+        prefs.modelAuto = true;
+        setSetting(SETTING_MODEL[bk], "");
+      }
       prefs.model = pickDefaultModel(modelCatalog);
     }
     // Preserve the user's chosen effort across a backend switch: the new backend's
@@ -4500,7 +4768,8 @@ function buildPanel() {
     if (prefs.userSet) {
       client?.sendFrame?.({
         type: "set_options",
-        model: prefs.model,
+        // Auto (modelAuto) un-pins the model so the agent uses its own default.
+        model: prefs.modelAuto ? null : prefs.model,
         effort: prefs.effort ?? null,
       });
     }
@@ -6456,7 +6725,35 @@ function buildPanel() {
   // Pick a backend chip → remember it, repaint the chips so it highlights, then
   // run the normal Connect flow (which now POSTs this backend and follows the
   // returned bridge URL). The user never types a port.
+  /** Seed the live prefs from `id`'s setting group for a backend SWITCH. The
+   *  previous prefs.model/effort belong to the OLD backend's catalog, so they must
+   *  not be carried into the new connection (applyModelCatalog would then push a
+   *  STALE cross-backend model/effort). Force Auto when the new group has no
+   *  concrete saved model, and map the effort into the new backend's scale. SEEDS
+   *  ONLY — sends no set_options; the single post-handshake applyModelCatalog push
+   *  emits exactly one set_options with the NEW backend's values. */
+  function seedPrefsForBackendSwitch(id) {
+    seedPrefsFromBackendGroup(id);
+    const sm = getSetting(SETTING_MODEL[id]);
+    if (typeof sm !== "string" || sm === "") prefs.modelAuto = true;
+    if (prefs.effort) {
+      const scale = BACKEND_EFFORTS[id] || ALL_EFFORTS;
+      prefs.effort = nearestInList(prefs.effort, scale) || undefined;
+    }
+    savePrefs(prefs);
+    refreshModelChip();
+  }
+
   function connectBackend(id) {
+    // CENTRALIZED per-backend seeding: every switch path routes through here — the
+    // backend chips, the model-popover provider row, AND the Settings backend combo
+    // (panelHooks.applyBackend). When the target backend differs from the one prefs
+    // currently reflect (connectedBackend if connected, else the last-picked
+    // selectedBackend), seed prefs from the NEW backend's group BEFORE connecting, so
+    // the post-handshake push uses the new backend's model/effort — never the
+    // previous backend's stale values. A re-pick of the same backend doesn't reseed.
+    const prevBackend = connectedBackend || selectedBackend;
+    if (id !== prevBackend) seedPrefsForBackendSwitch(id);
     selectedBackend = id;
     try {
       window.localStorage.setItem(STORAGE_KEY_BACKEND, id);
@@ -7645,12 +7942,30 @@ function buildPanel() {
   panelHooks.applyBackend = (id) => {
     if (!id || id === selectedBackend) return;
     appendSystem(`Default backend → ${BACKEND_LABELS[id] || id}.`);
+    // Route through connectBackend, which CENTRALLY seeds prefs from the new
+    // backend's group before connecting (same path as the chips / model-popover
+    // provider row) — exactly ONE connect, and the single post-handshake catalog
+    // push carries the new backend's values. No set_options is sent here.
     connectBackend(id);
   };
   panelHooks.applyModel = (id) => {
     const next = (id || "").trim();
-    if (!next || next === prefs.model) return;
+    // Blank = "Auto (let the agent pick)" → CLEAR the forced model live: un-pin so a
+    // fresh/continued session uses the agent's own default. Keep a valid display id;
+    // the chip shows "Auto".
+    if (!next) {
+      if (prefs.modelAuto) return;
+      prefs.modelAuto = true;
+      if (!prefs.model) prefs.model = pickDefaultModel(modelCatalog);
+      savePrefs(prefs);
+      refreshModelChip();
+      client?.sendFrame?.({ type: "set_options", model: null, effort: prefs.effort ?? null });
+      appendSystem("Model → Auto (the agent picks).");
+      return;
+    }
+    if (next === prefs.model && !prefs.modelAuto) return;
     prefs.model = next;
+    prefs.modelAuto = false;
     prefs.userSet = true;
     savePrefs(prefs);
     refreshModelChip();
