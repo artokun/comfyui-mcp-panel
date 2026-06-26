@@ -452,22 +452,40 @@ function getGraphCtx() {
   return { app, graph, rootGraph: app.graph, canvas: app.canvas, LG };
 }
 
-/** Reach ComfyUI's subgraph widget-promotion store. The state that exposes an
- *  inner subgraph widget on the parent SubgraphNode lives in a Pinia store with
- *  id "promotion" (methods: promote/demote/isPromoted). Pinia attaches itself as
- *  `$pinia` on the Vue app's globalProperties; the Vue app instance hangs off its
- *  mount element (#vue-app) as `__vue_app__`; `_s` is pinia's id→store map. */
-function getPromotionStore() {
-  let pinia = null;
+/** Reach a Pinia store by id. Pinia attaches itself as `$pinia` on the Vue app's
+ *  globalProperties; the Vue app instance hangs off its mount element (#vue-app)
+ *  as `__vue_app__`; `_s` is pinia's id→store map. Returns null if unavailable. */
+function getPiniaStore(id) {
   try {
     const el = document.getElementById("vue-app") || document.querySelector("[id*='vue']");
-    pinia = el?.__vue_app__?.config?.globalProperties?.$pinia;
+    const pinia = el?.__vue_app__?.config?.globalProperties?.$pinia;
+    return pinia?._s?.get?.(id) ?? null;
   } catch {
-    // fall through
+    return null;
   }
-  const store = pinia?._s?.get?.("promotion");
+}
+
+/** Reach ComfyUI's subgraph widget-promotion store (id "promotion"; methods
+ *  promote/demote/isPromoted) — the state that exposes an inner subgraph widget
+ *  on the parent SubgraphNode. */
+function getPromotionStore() {
+  const store = getPiniaStore("promotion");
   if (!store || typeof store.promote !== "function") {
     throw new Error("widget-promotion unavailable on this ComfyUI frontend (no 'promotion' store)");
+  }
+  return store;
+}
+
+/** Reach ComfyUI's subgraph-blueprint store (id "subgraph"). Exposes
+ *  publishSubgraph(name?), getBlueprint(type), subgraphBlueprints (saved defs),
+ *  and typePrefix ("SubgraphBlueprint.") — the save/list/load surface for reusable
+ *  subgraphs. */
+function getSubgraphStore() {
+  const store = getPiniaStore("subgraph");
+  if (!store || typeof store.publishSubgraph !== "function") {
+    throw new Error(
+      "subgraph blueprints unavailable on this ComfyUI frontend (no 'subgraph' store)",
+    );
   }
   return store;
 }
@@ -1331,6 +1349,183 @@ const GRAPH_TOOL_EXECUTORS = {
         from_nodes: ns.map((n) => n.id),
       },
     };
+  },
+
+  // ---- Copy / paste (cross-workflow MERGE) ---------------------------------
+  // LiteGraph's clipboard PERSISTS across workflow switches, so copying from one
+  // workflow and pasting into another MERGES the copied nodes in. copyToClipboard
+  // /pasteFromClipboard are the same APIs the native Ctrl+C / Ctrl+V use.
+
+  // Copy nodes to the litegraph clipboard. With node_ids: select them first; with
+  // no ids: copy the current canvas selection. The clipboard survives a workflow
+  // switch, so the next graph_paste_nodes can drop them into a DIFFERENT workflow.
+  graph_copy_nodes({ node_ids } = {}) {
+    const { graph, canvas } = getGraphCtx();
+    if (!canvas) throw new Error("canvas unavailable");
+    if (typeof canvas.copyToClipboard !== "function") {
+      throw new Error("copyToClipboard unavailable on this frontend");
+    }
+    if (Array.isArray(node_ids) && node_ids.length) {
+      const resolved = node_ids.map((id) => ({ id, node: graph.getNodeById(Number(id)) }));
+      const missing = resolved.filter((r) => !r.node).map((r) => r.id);
+      // Fail loudly on any unknown id rather than silently copying a partial subset
+      // (the agent would think it grabbed everything).
+      if (missing.length) {
+        throw new Error(`node_ids not found in the current graph: ${missing.join(", ")}`);
+      }
+      const ns = resolved.map((r) => r.node);
+      if (typeof canvas.selectItems === "function") canvas.selectItems(ns);
+      else if (typeof canvas.selectNodes === "function") canvas.selectNodes(ns);
+    }
+    const selected = canvas.selectedItems;
+    const count = selected?.size ?? (Array.isArray(selected) ? selected.length : 0);
+    if (!count) {
+      throw new Error("nothing selected to copy — pass node_ids or select nodes first");
+    }
+    canvas.copyToClipboard(selected);
+    return { copied: count };
+  },
+
+  // Paste the litegraph clipboard onto the CURRENT graph. Snapshots node ids
+  // before/after so the freshly-pasted node ids can be returned. connect_inputs
+  // false (default) drops a disconnected copy; pos places the paste anchor.
+  graph_paste_nodes({ pos, connect_inputs } = {}) {
+    const { graph, canvas } = getGraphCtx();
+    if (!canvas) throw new Error("canvas unavailable");
+    if (typeof canvas.pasteFromClipboard !== "function") {
+      throw new Error("pasteFromClipboard unavailable on this frontend");
+    }
+    const before = new Set((graph._nodes ?? []).map((n) => n.id));
+    const options = { connectInputs: connect_inputs ?? false };
+    if (Array.isArray(pos) && pos.length === 2) options.position = [Number(pos[0]), Number(pos[1])];
+    graph.beforeChange?.();
+    try {
+      canvas.pasteFromClipboard(options);
+    } finally {
+      graph.afterChange?.();
+    }
+    graph.setDirtyCanvas?.(true, true);
+    const pasted = (graph._nodes ?? [])
+      .filter((n) => !before.has(n.id))
+      .map((n) => summarizeNode(n));
+    return { pasted_count: pasted.length, pasted_node_ids: pasted.map((n) => n.id), pasted };
+  },
+
+  // ---- Subgraph blueprints (SAVE / LIST / ADD reusable subgraphs) -----------
+  // A SubgraphNode can be published to the user's blueprint LIBRARY as a reusable
+  // node type "SubgraphBlueprint.<name>". Saved blueprints can be dropped into ANY
+  // workflow. Backed by the Pinia "subgraph" store (publishSubgraph/getBlueprint/
+  // subgraphBlueprints). publishSubgraph(name) skips the name dialog when given a
+  // name, so this runs fully programmatically.
+
+  // Publish a subgraph node to the library. node_id selects the subgraph node
+  // first (else the current single selection must be a subgraph node). name is the
+  // blueprint name (defaults to the node's title). No dialog when name is given.
+  async graph_save_subgraph({ node_id, name } = {}) {
+    const { graph, canvas } = getGraphCtx();
+    if (!canvas) throw new Error("canvas unavailable");
+    const store = getSubgraphStore();
+    let target = null;
+    if (node_id != null) {
+      target = graph.getNodeById(Number(node_id));
+      if (!target) throw new Error(`No node with id ${node_id} in the current graph`);
+      if (!target.subgraph) {
+        throw new Error(`Node ${node_id} (${target.type}) is not a subgraph node`);
+      }
+      if (typeof canvas.select === "function") {
+        canvas.selectedItems?.clear?.();
+        canvas.select(target);
+      } else if (typeof canvas.selectItems === "function") {
+        canvas.selectItems([target]);
+      }
+    } else {
+      const selected = [...(canvas.selectedItems ?? [])];
+      if (selected.length === 1 && selected[0]?.subgraph) target = selected[0];
+      if (!target) {
+        throw new Error(
+          "select a single subgraph node (or pass node_id) before saving it to the library",
+        );
+      }
+    }
+    const finalName =
+      typeof name === "string" && name.trim() ? name.trim() : target.title || "Subgraph";
+    const fullType = `${store.typePrefix ?? "SubgraphBlueprint."}${finalName}`;
+    // publishSubgraph() pops a confirmOverwrite() dialog on a name COLLISION — which
+    // would hang this programmatic call waiting for UI. Preflight and refuse with a
+    // clear error instead (the agent picks a new name).
+    if ((store.subgraphBlueprints ?? []).some((d) => d?.name === fullType)) {
+      throw new Error(
+        `a subgraph blueprint named "${finalName}" already exists — choose a different name (programmatic overwrite isn't supported)`,
+      );
+    }
+    await store.publishSubgraph(finalName);
+    return { saved: { name: finalName, from_node_id: target.id, type: fullType } };
+  },
+
+  // List saved subgraph blueprints. Each is addable via graph_add_subgraph(name)
+  // or graph_add_node(type). Read-only.
+  graph_list_subgraphs() {
+    const store = getSubgraphStore();
+    const prefix = store.typePrefix ?? "SubgraphBlueprint.";
+    const defs = store.subgraphBlueprints ?? [];
+    const blueprints = [...defs].map((d) => {
+      const type = d?.name ?? "";
+      return {
+        name: type.startsWith(prefix) ? type.slice(prefix.length) : type,
+        type,
+        display_name: d?.display_name ?? null,
+        description: d?.description ?? null,
+        is_global: d?.isGlobal === true,
+      };
+    });
+    return { count: blueprints.length, blueprints };
+  },
+
+  // Add a saved subgraph blueprint to the current graph by name (or full type).
+  // Blueprints are NOT created via LiteGraph.createNode — they deserialize their
+  // stored {nodes, subgraphs} via canvas._deserializeItems (mirrors the frontend's
+  // addNodeOnGraph blueprint path), so this is a dedicated tool.
+  graph_add_subgraph({ name, pos } = {}) {
+    const { graph, canvas } = getGraphCtx();
+    if (!canvas || typeof canvas._deserializeItems !== "function") {
+      throw new Error("canvas._deserializeItems unavailable on this frontend");
+    }
+    if (!name || typeof name !== "string") throw new Error("name (blueprint name or type) is required");
+    const store = getSubgraphStore();
+    const prefix = store.typePrefix ?? "SubgraphBlueprint.";
+    const type = name.startsWith(prefix) ? name : `${prefix}${name}`;
+    if (typeof store.getBlueprint !== "function") {
+      throw new Error("subgraph store does not expose getBlueprint on this frontend");
+    }
+    let bp;
+    try {
+      bp = store.getBlueprint(type);
+    } catch (err) {
+      throw new Error(
+        `No saved subgraph blueprint "${name}" (${err?.message ?? err}). List them with graph_list_subgraphs.`,
+      );
+    }
+    const position = placementFor(graph, pos);
+    const before = new Set((graph._nodes ?? []).map((n) => n.id));
+    graph.beforeChange?.();
+    let results;
+    try {
+      results = canvas._deserializeItems(
+        { nodes: bp.nodes, subgraphs: bp.definitions?.subgraphs },
+        { position },
+      );
+    } finally {
+      graph.afterChange?.();
+    }
+    graph.setDirtyCanvas?.(true, true);
+    if (!results) throw new Error("failed to add subgraph blueprint");
+    // Confirm a node actually landed — don't report a fake success if deserialize
+    // produced nothing (mirrors the frontend, which throws when no node resolves).
+    const added = (graph._nodes ?? []).find((n) => !before.has(n.id));
+    if (!added) {
+      throw new Error("subgraph blueprint deserialized but no new node resolved on the canvas");
+    }
+    return { added: summarizeNode(added), from_blueprint: type };
   },
 
   // ---- Group boxes (LiteGraph LGraphGroup) ----------------------------------
@@ -4544,6 +4739,8 @@ function buildPanel() {
     "graph_connect",
     "graph_disconnect",
     "graph_create_subgraph",
+    "graph_add_subgraph",
+    "graph_paste_nodes",
     "graph_enter_subgraph",
     "graph_exit_subgraph",
     "graph_create_group",
