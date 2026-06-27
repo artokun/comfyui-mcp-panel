@@ -8,6 +8,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Pasted-text chips in sent bubbles** — a sent (or reloaded) user message no
+  longer shows the raw `[Pasted text #N]` token. Each token now renders inline as
+  an expandable chip ("Pasted text #N · N chars") that, on click, toggles a
+  read-only, scrollable monospace preview of the full pasted content (one open at
+  a time per bubble), mirroring the composer chips. The pasted content is
+  persisted with the message (capped at 100,000 chars, marked truncated beyond
+  that) so reloaded conversations re-render the chips. Tokens with no stored
+  content fall back gracefully to their literal text. The raw `text` (with
+  tokens) is unchanged — the agent, history, and edit/rollback still use it.
 - **Expandable attachment chips** — composer attachments now show as a chip
   strip above the input (Claude-Code style) instead of only an opaque
   `[Pasted text #N]` token in the textarea. Each chip carries a kind icon +

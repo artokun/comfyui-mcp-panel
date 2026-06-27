@@ -3943,6 +3943,10 @@ const PANEL_CSS = `
   font-size: 0.6875rem; line-height: 1.45; color: var(--p-text-color, #e4e4e7);
 }
 .cmcp-attach-preview img { max-width: 100%; max-height: 12rem; border-radius: 4px; display: block; }
+/* Pasted-text chips rendered inline inside a sent user bubble. */
+.cmcp-bubble-chip { vertical-align: baseline; margin: 0.0625rem 0.125rem; max-width: 100%; }
+.cmcp-bubble-chip.open { border-color: var(--p-primary-color, #60a5fa); }
+.cmcp-bubble-preview { margin: 0.375rem 0; max-width: 100%; }
 .cmcp-ctx { font-size: 0.625rem; color: var(--p-text-muted-color, #a1a1aa); min-width: 1.75rem; }
 .cmcp-ring { flex: none; margin: 0 0.125rem; transform: rotate(-90deg); }
 .cmcp-ring .bg { stroke: var(--p-surface-600, #52525b); }
@@ -5208,11 +5212,85 @@ function buildPanel() {
     });
   }
 
+  // Build an inline, expandable chip (+ hidden preview) for one [Pasted text #N]
+  // token inside a user bubble. The chip mirrors the composer chip look; clicking
+  // it toggles a read-only, scrollable, monospace preview of the FULL content.
+  // `bubble` scopes "one preview open at a time". Null-safe; never throws.
+  function buildPastedChip(bubble, id, content, truncated) {
+    const text = content != null ? String(content) : "";
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "cmcp-attach-chip cmcp-bubble-chip";
+    chip.title = "Click to show/hide the pasted text";
+    const ic = document.createElement("i");
+    ic.className = "pi pi-align-left";
+    chip.appendChild(ic);
+    const name = document.createElement("span");
+    name.className = "cmcp-attach-name";
+    name.textContent = `Pasted text #${id}`;
+    chip.appendChild(name);
+    const meta = document.createElement("span");
+    meta.className = "cmcp-attach-meta";
+    meta.textContent = `${text.length.toLocaleString()} chars${truncated ? "+" : ""}`;
+    chip.appendChild(meta);
+
+    const preview = document.createElement("div");
+    preview.className = "cmcp-attach-preview cmcp-bubble-preview";
+    preview.hidden = true;
+    const pre = document.createElement("pre");
+    pre.textContent = truncated ? `${text}\n\n… (truncated for display)` : text;
+    preview.appendChild(pre);
+
+    chip.addEventListener("click", () => {
+      const willOpen = preview.hidden;
+      // One open at a time within this bubble.
+      if (bubble) {
+        bubble.querySelectorAll(".cmcp-bubble-preview").forEach((p) => { p.hidden = true; });
+        bubble.querySelectorAll(".cmcp-bubble-chip.open").forEach((c) => c.classList.remove("open"));
+      }
+      preview.hidden = !willOpen;
+      chip.classList.toggle("open", willOpen);
+    });
+    return { chip, preview };
+  }
+
+  // Render a user message into `container`, turning each [Pasted text #N] token
+  // into an expandable chip (content looked up in `atts` by id). Surrounding
+  // text is rendered verbatim as text nodes. Tokens with no matching attachment
+  // content fall back to their literal text. Never throws into the render.
+  function renderUserText(container, text, atts) {
+    const raw = text != null ? String(text) : "";
+    try {
+      const byId = new Map();
+      if (Array.isArray(atts)) {
+        for (const a of atts) if (a && a.id != null) byId.set(String(a.id), a);
+      }
+      const re = /\[Pasted text #(\d+)\]/g;
+      let last = 0;
+      let m;
+      while ((m = re.exec(raw)) !== null) {
+        if (m.index > last) container.appendChild(document.createTextNode(raw.slice(last, m.index)));
+        const att = byId.get(m[1]);
+        if (att && att.content != null) {
+          const { chip, preview } = buildPastedChip(container, m[1], att.content, !!att.truncated);
+          container.appendChild(chip);
+          container.appendChild(preview);
+        } else {
+          container.appendChild(document.createTextNode(m[0])); // graceful fallback
+        }
+        last = re.lastIndex;
+      }
+      if (last < raw.length) container.appendChild(document.createTextNode(raw.slice(last)));
+    } catch {
+      container.textContent = raw; // a bad attachment must never blank the bubble
+    }
+  }
+
   function paintUser(text, opts = {}) {
     clearEmpty();
     const b = document.createElement("div");
     b.className = "cmcp-bubble user";
-    b.textContent = text;
+    renderUserText(b, text, opts.attachments);
     if (opts.mid) b.dataset.mid = opts.mid;
     // Hover edit/rollback button — only on live messages (those with a mid).
     // Absolute-positioned to the LEFT of the bubble so it never causes reflow.
@@ -5610,7 +5688,15 @@ function buildPanel() {
     const painted = paintUser(text, { ...opts, rewindAnchor });
     // Tag the record with its mid so deleteMsg can remove the EXACT message even
     // when several are queued (popping the trailing one would hit the wrong one).
-    record({ role: "user", text, ...(opts.mid ? { mid: opts.mid } : {}) });
+    // Persist any pasted-text attachments ({id, content[, truncated]}) so reload
+    // can re-render the bubble chips. `text` stays raw (tokens) for agent/rollback.
+    const atts = Array.isArray(opts.attachments) ? opts.attachments : null;
+    record({
+      role: "user",
+      text,
+      ...(opts.mid ? { mid: opts.mid } : {}),
+      ...(atts && atts.length ? { attachments: atts } : {}),
+    });
     return painted;
   }
 
@@ -5998,7 +6084,7 @@ function buildPanel() {
     ssSet(CURRENT_THREAD_KEY, t.id);
     resetFeed();
     for (const m of t.msgs) {
-      if (m.role === "user") paintUser(m.text);
+      if (m.role === "user") paintUser(m.text, { attachments: m.attachments });
       else if (m.role === "agent") paintAgent(m.text);
       else if (m.role === "card") paintCard(m);
     }
@@ -8315,7 +8401,21 @@ function buildPanel() {
     // at the END of the chat when the agent dequeues it (so the chat flows in dequeue
     // order, matching any reordering). An idle send paints immediately.
     const isQueued = agentWorking;
-    const painted = isQueued ? null : appendUser(text, { mid });
+    // Snapshot the pasted-text attachments referenced in this message so the SENT
+    // bubble (and any later reload) can render them as expandable chips. Captured
+    // BEFORE resetAttachments() clears the registry. Each content is capped so a
+    // huge paste can't bloat localStorage — the agent already got the full text;
+    // this copy is only for the user to read back.
+    const PASTED_DISPLAY_CAP = 100_000;
+    const pastedTexts = attachments
+      .filter((a) => a && a.kind === "text" && text.includes(`[Pasted text #${a.id}]`))
+      .map((a) => {
+        const full = a.content != null ? String(a.content) : "";
+        return full.length > PASTED_DISPLAY_CAP
+          ? { id: a.id, content: full.slice(0, PASTED_DISPLAY_CAP), truncated: true }
+          : { id: a.id, content: full };
+      });
+    const painted = isQueued ? null : appendUser(text, { mid, attachments: pastedTexts });
     // Capture the pre-turn graph so /revert can undo this turn's edits in one step.
     captureGraphSnapshot(mid, text);
     showThinking();
@@ -8396,7 +8496,7 @@ function buildPanel() {
       // Queued: hand trackSend a materializer that paints this message (bubble +
       // media) at the END of the chat when the agent finally dequeues it.
       const materialize = () => {
-        appendUser(text, { mid });
+        appendUser(text, { mid, attachments: pastedTexts });
         paintMedia();
       };
       trackSend(mid, null, { text: sendText, context, images: imageRefs }, text, materialize);
@@ -8528,7 +8628,7 @@ function buildPanel() {
       thread = t;
       resetFeed();
       for (const m of t.msgs) {
-        if (m.role === "user") paintUser(m.text);
+        if (m.role === "user") paintUser(m.text, { attachments: m.attachments });
         else if (m.role === "agent") paintAgent(m.text);
         else if (m.role === "card") paintCard(m);
       }
