@@ -6,6 +6,28 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-06-27
+
+### Added
+
+- **Rich media metadata in agent pushes.** When a render's media is sent to the agent,
+  the executed-event note (and a structured `metadata` field) now include each output's
+  path (subfolder-relative), file size, pixel dimensions, asset-set grouping ("output K
+  of N from this run" + sibling filenames, or "single output"), render duration, and
+  completion time. Video storyboards add format + real frame count/fps when the payload
+  carries them.
+- **Provider onboarding.** Connect-time readiness detection per provider (CLI on PATH +
+  a login on disk; macOS Keychain handled) via `/backends`. An onboarding card shows
+  only when neither provider is signed in; the panel auto-switches to a ready provider
+  when the saved pick isn't usable (saved preference untouched), and a not-ready
+  provider row becomes a "set up" action that seeds a prompt to the working agent.
+- **Code-block tools.** Rendered fenced code blocks get a Copy button + a persisted
+  global line-wrap toggle (off by default); inline code gets Copy. Hover-gated, styled
+  to match the panel.
+- **Render-stall warning threshold setting** (General; default 180s, range 15–3600).
+  Sent on connect (the orchestrator spawn default) and pushed **live** via a `set_config`
+  frame, so changing it applies without a reconnect.
+
 ## [0.4.3] - 2026-06-27
 
 ### Fixed

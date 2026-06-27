@@ -37,6 +37,7 @@ Each provider runs its own orchestrator on its own loopback port (Claude on
 | Capability | What it does |
 |---|---|
 | **Pick a provider** | A backend picker with **Claude** / **ChatGPT** chips — choose the agent, not a port. Switching providers starts a fresh chat (sessions aren't shared across providers) and posts a system note. |
+| **Provider onboarding** | Connect-time readiness detection per provider (CLI on PATH + a login on disk; macOS Keychain handled). An onboarding card shows only when neither provider is signed in; the panel auto-switches to a ready provider when your saved pick isn't usable (your saved preference is untouched), and a not-ready row becomes a "set up" action. |
 | **Live-canvas building** | The agent adds, wires, moves, retitles, colors, collapses, groups, and lays out nodes on the graph you're viewing — all through a fixed `panel_*` allowlist (no arbitrary JS), every edit undoable with **Ctrl+Z**. |
 | **One-shot workflow / pack load** | `panel_load_workflow` drops a whole graph onto the canvas in one call — load a bundled installer pack's local-GPU workflow by name without shuttling the JSON through the chat. |
 | **Local-GPU vs paid-API awareness** | Bundled packs are local/free; for ad-hoc graphs the agent checks the runtime (`check_workflow_runtime`) and **asks before spending paid API credits**. |
@@ -240,7 +241,25 @@ identical across providers.
 - **Reconnect durability.** A wedged orchestrator no longer strands the panel —
   **Connect** reclaims a zombie that still holds the bridge port.
 - **Richer composer attachments.** Attach, drag, or paste **images, video,
-  workflow `.json`, and text** files into the composer.
+  workflow `.json`, and text** files into the composer. Attachments show as
+  expandable **chips** above the input (kind icon + label; click to preview the
+  full content, × to remove), and **pasted text renders inline** in the sent
+  bubble — verbatim, exactly as if you'd typed it, rather than a raw
+  `[Pasted text #N]` token.
+- **Rich media metadata.** When a render's media is pushed to the agent, the
+  executed-event note includes each output's path (subfolder-relative), file
+  size, pixel dimensions, asset-set grouping ("output K of N from this run" +
+  sibling filenames), render duration, and completion time — videos add format +
+  real frame count / fps.
+- **Code-block tools.** Rendered fenced code blocks get a **Copy** button plus a
+  persisted global **line-wrap** toggle (off by default); inline code gets Copy.
+- **Streamed replies in background tabs.** Switching away from the ComfyUI tab
+  mid-turn no longer leaves an empty bubble with a stuck cursor — the reply
+  finalizes synchronously while the tab is hidden and flushes on
+  `visibilitychange`, so long pipeline runs render even if you tab away.
+- **Render-stall warning.** A tunable stall threshold (Settings → General;
+  default 180s, range 15–3600) warns when a render wedges; it's pushed **live**,
+  so changing it applies without a reconnect.
 
 ## Security notes
 

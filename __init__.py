@@ -30,6 +30,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -61,6 +62,55 @@ def _backend_port(backend):
     return _BACKEND_PORTS.get((backend or _DEFAULT_BACKEND).lower(), _BRIDGE_PORT)
 
 
+# Provider-CLI binary names per backend (Windows resolves .cmd/.exe via PATHEXT,
+# but mirror the defensive npx lookup elsewhere and probe the variants too).
+_PROVIDER_CLIS = {
+    "claude": ("claude", "claude.cmd", "claude.exe"),
+    "codex": ("codex", "codex.cmd", "codex.exe"),
+}
+
+
+def _provider_cli(provider):
+    """True if the provider's CLI binary is resolvable on PATH."""
+    return any(shutil.which(name) for name in _PROVIDER_CLIS.get(provider, ()))
+
+
+def _provider_auth(provider):
+    """Whether a usable login/credential for the provider exists on disk.
+
+    Returns True/False, or None ("unknown") for Claude on macOS, whose token
+    lives in the login Keychain rather than a file we can cheaply read — callers
+    treat unknown as 'don't block' so a logged-in mac user isn't told to sign in.
+    Package-presence is NOT a signal: `npx -y comfyui-mcp` bundles both provider
+    SDKs as optional deps, so the only thing that distinguishes a usable backend
+    is an actual login."""
+    home = os.path.expanduser("~")
+    if provider == "claude":
+        if os.path.isfile(os.path.join(home, ".claude", ".credentials.json")):
+            return True
+        # macOS stores the OAuth token in Keychain — unreadable from here. Report
+        # unknown so a CLI-present mac user is taken as ready rather than nagged.
+        if sys.platform == "darwin":
+            return None
+        return False
+    if provider == "codex":
+        return os.path.isfile(os.path.join(home, ".codex", "auth.json"))
+    return False
+
+
+def _provider_state(provider):
+    """Per-provider readiness for the panel onboarding flow.
+
+    `ready` means the agent can actually run on this provider: its CLI is on PATH
+    AND a login exists. `cli`/`auth` are reported separately so the panel can tell
+    'install the CLI' apart from 'sign in'; `auth` is null when unknown (macOS
+    Keychain), and unknown-with-cli still counts as ready."""
+    cli = _provider_cli(provider)
+    auth = _provider_auth(provider)
+    ready = bool(cli and auth is not False)
+    return {"cli": cli, "auth": auth, "ready": ready}
+
+
 # Per-backend orchestrator handles, keyed by port, so spawning codex doesn't
 # clobber the tracking of a running claude orchestrator (and vice versa). The
 # legacy single-process global below stays in sync with the claude port entry so
@@ -80,6 +130,21 @@ def _no_autospawn():
 def _truthy(val):
     """Loose truthiness for a query-string flag (?force=1 / true / yes)."""
     return str(val).lower() in ("1", "true", "yes") if val is not None else False
+
+
+def _coerce_stall(val):
+    """Clamp a stall-warning-seconds value to [15, 3600]; None when absent/invalid.
+    Forwarded to the orchestrator as COMFYUI_MCP_STALL_S — how long a render may
+    make no progress before the agent is warned it looks stalled/wedged."""
+    if val is None:
+        return None
+    try:
+        n = int(float(val))
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    return max(15, min(3600, n))
 
 
 def _port_in_use(host, port):
@@ -189,7 +254,16 @@ def _backend_status(backend):
         # No (valid) lockfile — fall back to a raw port probe (covers a user-run
         # orchestrator or one started before lockfiles).
         running = _orchestrator_running(port)
-    return {"backend": backend, "port": port, "running": running}
+    state = _provider_state(backend)
+    return {
+        "backend": backend,
+        "port": port,
+        "running": running,
+        # Readiness for the onboarding flow: ready = CLI on PATH + a login on disk.
+        "cli": state["cli"],
+        "auth": state["auth"],
+        "ready": state["ready"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +538,7 @@ def _port_owner_pid(host, port):
     return None
 
 
-def _start_orchestrator(backend=_DEFAULT_BACKEND, port=None, force=False):
+def _start_orchestrator(backend=_DEFAULT_BACKEND, port=None, force=False, stall_seconds=None):
     """Start the panel orchestrator on demand. Returns (ok: bool, message: str).
 
     Called only from the Connect route — i.e. an explicit user action — never at
@@ -583,6 +657,10 @@ def _start_orchestrator(backend=_DEFAULT_BACKEND, port=None, force=False):
     # the exact same env it always has (the orchestrator defaults to claude too).
     if backend != _DEFAULT_BACKEND:
         env["PANEL_AGENT_BACKEND"] = backend
+    # Render-stall warning threshold (from the panel setting). Only set when given
+    # so an unset setting leaves the orchestrator's own default (180s) in place.
+    if stall_seconds is not None:
+        env["COMFYUI_MCP_STALL_S"] = str(stall_seconds)
     # Subscription lane: the background agent authenticates via the on-disk Claude
     # login, never an API key.
     env.pop("ANTHROPIC_API_KEY", None)
@@ -751,9 +829,15 @@ def _register_routes():
     @routes.get("/comfyui_mcp_panel/backends")
     async def _backends(_request):
         # Discovery for the panel's backend picker: each known backend with its
-        # mapped port and whether an orchestrator is currently running there.
+        # mapped port, whether an orchestrator is running there, and per-provider
+        # readiness (cli/auth/ready) so the panel can show an onboarding card when
+        # NEITHER provider is signed in and auto-pick a ready one otherwise.
+        backends = [_backend_status(b) for b in _BACKEND_PORTS]
         return web.json_response(
-            {"backends": [_backend_status(b) for b in _BACKEND_PORTS]}
+            {
+                "backends": backends,
+                "any_ready": any(b["ready"] for b in backends),
+            }
         )
 
     @routes.post("/comfyui_mcp_panel/connect")
@@ -765,6 +849,9 @@ def _register_routes():
         # that looks healthy by the lockfile but never handshook, and respawn fresh.
         backend = _request.query.get("backend")
         force = _truthy(_request.query.get("force")) or _truthy(_request.query.get("reclaim"))
+        # Optional render-stall threshold (seconds) from the panel setting, applied
+        # to the orchestrator's env on spawn.
+        stall_seconds = _coerce_stall(_request.query.get("stall_seconds"))
         if not backend:
             try:
                 body = await _request.json()
@@ -772,6 +859,8 @@ def _register_routes():
                     backend = body.get("backend")
                     if not force:
                         force = bool(body.get("force") or body.get("reclaim"))
+                    if stall_seconds is None:
+                        stall_seconds = _coerce_stall(body.get("stall_seconds"))
             except Exception:
                 backend = None
         # Reject a non-string backend with a clean 400 (e.g. {"backend": 123})
@@ -787,7 +876,7 @@ def _register_routes():
                 status=400,
             )
         port = _backend_port(backend)
-        ok, message = _start_orchestrator(backend=backend, port=port, force=force)
+        ok, message = _start_orchestrator(backend=backend, port=port, force=force, stall_seconds=stall_seconds)
         return web.json_response(
             {
                 "ok": ok,
