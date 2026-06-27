@@ -30,6 +30,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -59,6 +60,55 @@ _DEFAULT_BACKEND = "claude"
 def _backend_port(backend):
     """Bridge port for a backend id; falls back to the claude/default port."""
     return _BACKEND_PORTS.get((backend or _DEFAULT_BACKEND).lower(), _BRIDGE_PORT)
+
+
+# Provider-CLI binary names per backend (Windows resolves .cmd/.exe via PATHEXT,
+# but mirror the defensive npx lookup elsewhere and probe the variants too).
+_PROVIDER_CLIS = {
+    "claude": ("claude", "claude.cmd", "claude.exe"),
+    "codex": ("codex", "codex.cmd", "codex.exe"),
+}
+
+
+def _provider_cli(provider):
+    """True if the provider's CLI binary is resolvable on PATH."""
+    return any(shutil.which(name) for name in _PROVIDER_CLIS.get(provider, ()))
+
+
+def _provider_auth(provider):
+    """Whether a usable login/credential for the provider exists on disk.
+
+    Returns True/False, or None ("unknown") for Claude on macOS, whose token
+    lives in the login Keychain rather than a file we can cheaply read — callers
+    treat unknown as 'don't block' so a logged-in mac user isn't told to sign in.
+    Package-presence is NOT a signal: `npx -y comfyui-mcp` bundles both provider
+    SDKs as optional deps, so the only thing that distinguishes a usable backend
+    is an actual login."""
+    home = os.path.expanduser("~")
+    if provider == "claude":
+        if os.path.isfile(os.path.join(home, ".claude", ".credentials.json")):
+            return True
+        # macOS stores the OAuth token in Keychain — unreadable from here. Report
+        # unknown so a CLI-present mac user is taken as ready rather than nagged.
+        if sys.platform == "darwin":
+            return None
+        return False
+    if provider == "codex":
+        return os.path.isfile(os.path.join(home, ".codex", "auth.json"))
+    return False
+
+
+def _provider_state(provider):
+    """Per-provider readiness for the panel onboarding flow.
+
+    `ready` means the agent can actually run on this provider: its CLI is on PATH
+    AND a login exists. `cli`/`auth` are reported separately so the panel can tell
+    'install the CLI' apart from 'sign in'; `auth` is null when unknown (macOS
+    Keychain), and unknown-with-cli still counts as ready."""
+    cli = _provider_cli(provider)
+    auth = _provider_auth(provider)
+    ready = bool(cli and auth is not False)
+    return {"cli": cli, "auth": auth, "ready": ready}
 
 
 # Per-backend orchestrator handles, keyed by port, so spawning codex doesn't
@@ -189,7 +239,16 @@ def _backend_status(backend):
         # No (valid) lockfile — fall back to a raw port probe (covers a user-run
         # orchestrator or one started before lockfiles).
         running = _orchestrator_running(port)
-    return {"backend": backend, "port": port, "running": running}
+    state = _provider_state(backend)
+    return {
+        "backend": backend,
+        "port": port,
+        "running": running,
+        # Readiness for the onboarding flow: ready = CLI on PATH + a login on disk.
+        "cli": state["cli"],
+        "auth": state["auth"],
+        "ready": state["ready"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -751,9 +810,15 @@ def _register_routes():
     @routes.get("/comfyui_mcp_panel/backends")
     async def _backends(_request):
         # Discovery for the panel's backend picker: each known backend with its
-        # mapped port and whether an orchestrator is currently running there.
+        # mapped port, whether an orchestrator is running there, and per-provider
+        # readiness (cli/auth/ready) so the panel can show an onboarding card when
+        # NEITHER provider is signed in and auto-pick a ready one otherwise.
+        backends = [_backend_status(b) for b in _BACKEND_PORTS]
         return web.json_response(
-            {"backends": [_backend_status(b) for b in _BACKEND_PORTS]}
+            {
+                "backends": backends,
+                "any_ready": any(b["ready"] for b in backends),
+            }
         )
 
     @routes.post("/comfyui_mcp_panel/connect")

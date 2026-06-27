@@ -3978,6 +3978,20 @@ const PANEL_CSS = `
 .cmcp-example:hover { border-color: var(--p-primary-color, #60a5fa); background: var(--p-surface-700, #3f3f46); }
 .cmcp-example .pi { font-size: 0.8125rem; margin: 0; opacity: 1; color: var(--p-primary-color, #60a5fa); flex: none; }
 
+/* Provider onboarding card — shown only when NEITHER provider is signed in. */
+.cmcp-onboard {
+  margin: 0.75rem; padding: 0.75rem 0.875rem;
+  background: var(--p-surface-800, #27272a);
+  border: 1px solid var(--p-content-border-color, #3f3f46);
+  border-radius: var(--p-border-radius-md, 6px);
+  display: flex; flex-direction: column; gap: 0.5rem;
+}
+.cmcp-onboard-title { font-weight: 600; color: var(--p-text-color, #fff); }
+.cmcp-onboard-sub { font-size: 0.75rem; color: var(--p-text-muted-color, #a1a1aa); line-height: 1.4; }
+.cmcp-onboard-col { display: flex; flex-direction: column; gap: 0.25rem; }
+.cmcp-onboard-prov { font-weight: 600; font-size: 0.8125rem; color: var(--p-text-color, #fff); margin-top: 0.25rem; }
+.cmcp-onboard-step { font-size: 0.7rem; color: var(--p-text-muted-color, #a1a1aa); }
+
 .cmcp-bubble {
   padding: 0.5rem 0.75rem; max-width: 92%;
   border-radius: var(--p-border-radius-lg, 8px);
@@ -4106,6 +4120,47 @@ const PANEL_CSS = `
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   white-space: pre; color: var(--p-text-color, #fff);
 }
+/* Hover tools on rendered code (decorateCode): Copy + Wrap on fenced blocks,
+   Copy on inline pills. Buttons are absolute so they never reflow the code, and
+   match the panel's .cmcp-iconbtn style (borderless, muted, hover surface+white). */
+.cmcp-bubble pre.cmcp-codeblock { position: relative; }
+.cmcp-code-tools {
+  position: absolute; top: 0.3rem; right: 0.3rem; display: flex; gap: 0.125rem;
+  opacity: 0; transition: opacity 0.12s;
+}
+.cmcp-bubble pre.cmcp-codeblock:hover .cmcp-code-tools,
+.cmcp-code-tools:focus-within { opacity: 1; }
+.cmcp-code-tool {
+  width: 1.5rem; height: 1.5rem; flex: none; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: transparent; border: none; cursor: pointer;
+  border-radius: var(--p-border-radius-sm, 4px);
+  color: var(--p-text-muted-color, #a1a1aa);
+  transition: background 0.15s, color 0.15s;
+}
+.cmcp-code-tool:hover { background: var(--p-surface-700, #3f3f46); color: var(--p-text-color, #fff); }
+.cmcp-code-tool .pi { font-size: 0.8rem; }
+.cmcp-code-tool.ok { color: #4ade80; }
+.cmcp-wrap-btn.on { color: var(--p-primary-color, #60a5fa); }
+.cmcp-wrap-btn.on:hover { color: var(--p-primary-color, #60a5fa); }
+/* Wrap toggle: flip the block from horizontal-scroll (pre) to wrapping. Higher
+   specificity than the base pre-code rule so no !important is needed. */
+.cmcp-bubble pre.cmcp-codeblock.cmcp-wrap { overflow-x: hidden; }
+.cmcp-bubble pre.cmcp-codeblock.cmcp-wrap code { white-space: pre-wrap; word-break: break-word; }
+/* Inline code copy: a small badge at the pill's top-right corner, shown on hover.
+   Same muted→surface+white treatment as the icon buttons, sized for the pill. */
+.cmcp-bubble.agent code.cmcp-inline-code, .cmcp-bubble.user code.cmcp-inline-code { position: relative; }
+.cmcp-inline-copy {
+  position: absolute; top: -0.5rem; right: -0.35rem; width: 1.1rem; height: 1.1rem; padding: 0;
+  display: none; align-items: center; justify-content: center;
+  background: var(--p-surface-700, #3f3f46); border: none; border-radius: 4px;
+  color: var(--p-text-muted-color, #a1a1aa); cursor: pointer;
+  font-size: 0.55rem; line-height: 1; z-index: 2; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+  transition: background 0.12s, color 0.12s;
+}
+.cmcp-bubble code.cmcp-inline-code:hover .cmcp-inline-copy { display: flex; }
+.cmcp-inline-copy:hover { background: var(--p-surface-600, #52525b); color: var(--p-text-color, #fff); }
+.cmcp-inline-copy.ok { color: #4ade80; display: flex; }
 .cmcp-bubble table {
   /* Real table layout (NOT display:block) so the header row stays aligned with
      the body; fit the panel width and let long cells wrap instead of scrolling. */
@@ -4552,11 +4607,93 @@ function wireExternalLinks(container) {
   });
 }
 
+// ---- code-block hover tools (copy + global line-wrap toggle) ---------------
+// Line-wrap is a SINGLE global preference (persisted), so toggling one block
+// flips them all — matching how editors expose word-wrap as one setting.
+const CODE_WRAP_KEY = "comfyui-mcp.panel.codeWrap";
+function codeWrapOn() {
+  return lsGet(CODE_WRAP_KEY) === "1";
+}
+function setCodeWrap(on) {
+  lsSet(CODE_WRAP_KEY, on ? "1" : null);
+  // Apply to every rendered block already on screen + sync the toggle buttons.
+  for (const pre of document.querySelectorAll("pre.cmcp-codeblock")) {
+    pre.classList.toggle("cmcp-wrap", on);
+    const wb = pre.querySelector(".cmcp-wrap-btn");
+    if (wb) wb.classList.toggle("on", on);
+  }
+}
+
+/** Flash a tool button green for ~1s as copy confirmation (icon → check). */
+function flashCopied(btn) {
+  const i = btn.querySelector("i");
+  const prev = i ? i.className : null;
+  if (i) i.className = "pi pi-check";
+  btn.classList.add("ok");
+  setTimeout(() => {
+    if (i && prev) i.className = prev;
+    btn.classList.remove("ok");
+  }, 1100);
+}
+
+function copyCodeText(text, btn) {
+  navigator.clipboard?.writeText(text).then(() => flashCopied(btn), () => {});
+}
+
+function codeToolBtn(iconClass, title, onClick) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.title = title;
+  const i = document.createElement("i");
+  i.className = "pi " + iconClass;
+  b.appendChild(i);
+  b.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    onClick();
+  });
+  return b;
+}
+
+/** Add hover Copy (+ Wrap-toggle on fenced blocks) UI to rendered code in `el`.
+ *  Idempotent per element; safe to call after every renderRichText. */
+function decorateCode(el) {
+  // Fenced blocks (```): Copy + global Wrap toggle.
+  for (const pre of el.querySelectorAll("pre")) {
+    if (pre.dataset.cmcpTools) continue;
+    pre.dataset.cmcpTools = "1";
+    pre.classList.add("cmcp-codeblock");
+    if (codeWrapOn()) pre.classList.add("cmcp-wrap");
+    const tools = document.createElement("div");
+    tools.className = "cmcp-code-tools";
+    const copyBtn = codeToolBtn("pi-copy", "Copy", () => {
+      const code = pre.querySelector("code");
+      copyCodeText(code ? code.textContent : pre.textContent, copyBtn);
+    });
+    copyBtn.className = "cmcp-code-tool";
+    const wrapBtn = codeToolBtn("pi-bars", "Toggle line wrap (all blocks)", () => setCodeWrap(!codeWrapOn()));
+    wrapBtn.className = "cmcp-code-tool cmcp-wrap-btn" + (codeWrapOn() ? " on" : "");
+    tools.append(copyBtn, wrapBtn);
+    pre.appendChild(tools);
+  }
+  // Inline code (`x`): Copy only (a wrap toggle is meaningless for inline).
+  for (const code of el.querySelectorAll("code")) {
+    if (code.closest("pre") || code.dataset.cmcpCopy) continue;
+    code.dataset.cmcpCopy = "1";
+    code.classList.add("cmcp-inline-code");
+    const text = code.textContent; // capture before appending the button
+    const copyBtn = codeToolBtn("pi-copy", "Copy", () => copyCodeText(text, copyBtn));
+    copyBtn.className = "cmcp-inline-copy";
+    code.appendChild(copyBtn);
+  }
+}
+
 /** Render agent markdown (full GFM) via marked, sanitized with DOMPurify so
  *  agent output can never inject script/handlers into the panel. Links are
  *  forced external via the DOMPurify hook above + wireExternalLinks on the feed. */
 function renderRichText(el, text) {
   el.innerHTML = DOMPurify.sanitize(marked.parse(String(text)));
+  decorateCode(el);
 }
 
 // SINGLETON GUARD: at most ONE bridge client may be live per page. ComfyUI can
@@ -4691,8 +4828,25 @@ function buildPanel() {
   // PROVIDER section can render them (the switcher now lives there, not in
   // settings). Defaults to claude-only until discovery lands.
   let knownBackends = [{ backend: "claude", running: false }];
+  // Durable per-provider readiness (cli/auth/ready), keyed by backend id. Owned by
+  // applyReadiness from GET /backends. Kept SEPARATE from knownBackends because
+  // renderBackendChips is also called from connect/handshake paths that reconstruct
+  // entries as {backend, running} (no readiness) — reading the map instead means a
+  // connect never erases "is this provider signed in", so the set-up affordance and
+  // not-ready hints survive a reconnect.
+  const backendReady = {};
   // Short per-provider hint shown under each provider row in the popup.
   const BACKEND_HINTS = { claude: "Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)" };
+
+  // Hint for a provider that exists but isn't usable yet — distinguishes
+  // "install the CLI" from "sign in". Empty when ready or readiness is unknown.
+  function notReadyHint(b) {
+    if (!b) return "";
+    const r = backendReady[b.backend] || b; // durable readiness survives chip repaints
+    if (r.ready !== false) return "";
+    if (r.cli === false) return `${BACKEND_LABELS[b.backend] || b.backend} CLI not installed`;
+    return b.backend === "codex" ? "Not signed in — run: codex login" : "Not signed in — run: claude auth login";
+  }
 
   function renderBackendChips(backends) {
     backendChips.replaceChildren();
@@ -4708,7 +4862,13 @@ function buildPanel() {
       chip.className = "cmcp-btn cmcp-backend-chip";
       chip.dataset.backend = id;
       chip.textContent = BACKEND_LABELS[id] || id;
-      if (b.running) chip.title = "Running";
+      const hint = notReadyHint(b);
+      if (hint) {
+        chip.title = hint;
+        chip.style.opacity = "0.55"; // dim a provider that isn't signed in yet
+      } else if (b.running) {
+        chip.title = "Running";
+      }
       if (id === selectedBackend) {
         chip.style.cssText =
           "background:var(--p-primary-color,#2563eb);color:var(--p-primary-contrast-color,#fff);border-color:transparent;";
@@ -4724,7 +4884,10 @@ function buildPanel() {
     try {
       const res = await api.fetchApi("/comfyui_mcp_panel/backends");
       const data = await res.json().catch(() => ({}));
-      if (Array.isArray(data?.backends)) renderBackendChips(data.backends);
+      if (Array.isArray(data?.backends)) {
+        renderBackendChips(data.backends);
+        applyReadiness(data);
+      }
     } catch {
       // No /backends route (older host) — keep the default single chip.
     }
@@ -4875,9 +5038,145 @@ function buildPanel() {
   }
   empty.appendChild(examplesBox);
   log.appendChild(empty);
+
+  // ---- provider onboarding ----
+  // `npx -y comfyui-mcp` bundles BOTH provider SDKs as optional deps, so package
+  // presence is meaningless — the real gate is a login. This card walks a fresh
+  // user through installing + signing into a provider, and is shown ONLY when
+  // NEITHER provider is ready (CLI on PATH + a login on disk). The moment one is
+  // ready it hides and the panel auto-picks that provider (see applyReadiness).
+  const PROVIDER_SETUP = {
+    claude: { label: "Claude", install: "npm i -g @anthropic-ai/claude-code", login: "claude auth login" },
+    codex: { label: "ChatGPT", install: "npm i -g @openai/codex", login: "codex login" },
+  };
+  let anyReady = false;
+  let autoPickDone = false; // auto-switch + note fires at most once per panel mount
+  const onboard = document.createElement("div");
+  onboard.className = "cmcp-onboard";
+  onboard.hidden = true;
+
+  function onboardCmd(cmd) {
+    const code = document.createElement("code");
+    code.className = "cmcp-cmd";
+    code.textContent = cmd;
+    code.title = "Click to copy";
+    code.addEventListener("click", () => {
+      navigator.clipboard?.writeText(cmd).then(() => appendSystem("Command copied."), () => {});
+    });
+    return code;
+  }
+
+  function renderOnboard(list) {
+    onboard.replaceChildren();
+    const title = document.createElement("div");
+    title.className = "cmcp-onboard-title";
+    title.textContent = "Sign in to an AI provider to use the agent";
+    const sub = document.createElement("div");
+    sub.className = "cmcp-onboard-sub";
+    sub.textContent =
+      "The agent runs on your own Claude or ChatGPT subscription — no API keys. Set up at least one (Node ≥ 22 required), then click Connect.";
+    onboard.append(title, sub);
+    for (const id of ["claude", "codex"]) {
+      const meta = PROVIDER_SETUP[id];
+      const st = list.find((b) => b.backend === id) || {};
+      const col = document.createElement("div");
+      col.className = "cmcp-onboard-col";
+      const prov = document.createElement("div");
+      prov.className = "cmcp-onboard-prov";
+      prov.textContent = meta.label;
+      col.appendChild(prov);
+      // Only show the install step when the CLI isn't already on PATH (otherwise
+      // the user just needs to sign in).
+      if (!st.cli) {
+        const s1 = document.createElement("div");
+        s1.className = "cmcp-onboard-step";
+        s1.textContent = "1. Install the CLI";
+        col.append(s1, onboardCmd(meta.install));
+      }
+      const s2 = document.createElement("div");
+      s2.className = "cmcp-onboard-step";
+      s2.textContent = st.cli ? "Sign in" : "2. Sign in";
+      col.append(s2, onboardCmd(meta.login));
+      onboard.appendChild(col);
+    }
+  }
+
+  // Apply per-provider readiness from GET /backends: toggle the onboarding card,
+  // and — when a saved pick isn't usable but another provider IS — auto-switch the
+  // active backend (in-memory only; the saved pref is left untouched so it returns
+  // once that provider is set up) and leave a one-line system note.
+  function applyReadiness(data) {
+    const list = Array.isArray(data?.backends) ? data.backends : [];
+    // Only act when the backend actually reports readiness. Derive any_ready from
+    // the per-backend `ready` flags if the top-level field is absent (older Python
+    // / mid-deploy), and treat a backend with NO readiness data at all as "ready"
+    // so the onboarding card never shows spuriously against an old host.
+    const hasReadiness = list.some((b) => typeof b.ready === "boolean");
+    // Persist readiness durably so it survives later renderBackendChips repaints
+    // that only carry {backend, running}.
+    for (const b of list) {
+      if (typeof b.ready === "boolean") backendReady[b.backend] = { cli: b.cli, auth: b.auth, ready: b.ready };
+    }
+    if (!hasReadiness) {
+      anyReady = true;
+      onboard.hidden = true;
+      return;
+    }
+    anyReady = typeof data?.any_ready === "boolean" ? data.any_ready : list.some((b) => b.ready);
+    if (list.length && !anyReady) {
+      renderOnboard(list);
+      onboard.hidden = false;
+    } else {
+      onboard.hidden = true;
+    }
+    if (!anyReady || autoPickDone) return;
+    const sel = list.find((b) => b.backend === selectedBackend);
+    if (sel && sel.ready === false) {
+      const ready = list.find((b) => b.ready);
+      if (ready) {
+        autoPickDone = true;
+        const prevLabel = BACKEND_LABELS[selectedBackend] || selectedBackend;
+        selectedBackend = ready.backend; // active pick only; STORAGE_KEY_BACKEND untouched
+        renderBackendChips(list);
+        setAskPlaceholder(ready.backend);
+        appendSystem(
+          `${prevLabel} isn't signed in — using ${BACKEND_LABELS[ready.backend] || ready.backend}. ` +
+            `Sign in to ${prevLabel} to switch back.`,
+        );
+      }
+    } else {
+      // Saved pick is ready (or readiness unknown) — nothing to switch.
+      autoPickDone = true;
+    }
+  }
+
+  // "Set up the other provider" — when one provider is signed in and the other
+  // isn't, the working agent helps with the install/sign-in. Per design this is
+  // JUST A PROMPT to the agent (no command-runner baked into the panel allowlist):
+  // we send it the request if connected, else drop it in the composer to send once
+  // the user connects to the provider that IS ready.
+  function requestProviderSetup(id) {
+    const meta = PROVIDER_SETUP[id];
+    if (!meta) return;
+    modelPop.hidden = true;
+    const prompt =
+      `Help me set up the ${meta.label} backend so I can use it in this panel — I'm not signed in to it yet. ` +
+      `Walk me through it for my OS: install the CLI (\`${meta.install}\`), sign in (\`${meta.login}\`), ` +
+      `then in this panel pick ${meta.label} in the provider picker and click Connect. Give exact terminal commands.`;
+    if (client.isConnected() && client.sendUserMessage(prompt)) {
+      appendSystem(`Asked the agent to help you set up ${meta.label}.`);
+    } else {
+      input.value = prompt;
+      input.focus();
+      input.dispatchEvent(new Event("input"));
+      appendSystem(`Connect to a signed-in provider, then send this queued request to set up ${meta.label}.`);
+    }
+  }
+
   const body = document.createElement("div");
   body.className = "cmcp-body";
   body.style.position = "relative"; // anchor the "new messages" pill
+  body.appendChild(onboard);
   body.appendChild(log);
 
   // Discord-style sticky autoscroll: follow new content only while the user is
@@ -5380,10 +5679,18 @@ function buildPanel() {
       const activeBackend = connectedBackend || selectedBackend;
       for (const b of knownBackends) {
         const id = b.backend;
-        const small = id === activeBackend ? "connected" : b.running ? "running" : "";
-        item({ label: BACKEND_LABELS[id] || id, small: BACKEND_HINTS[id] || small }, id === activeBackend, () => {
+        const hint = notReadyHint(b);
+        const notReady = (backendReady[id] || b).ready === false;
+        // A not-ready provider can't be connected — tapping it asks the working
+        // agent to help you install/sign in instead of failing a connect.
+        const small = notReady ? `Tap to set up — ${hint}` : BACKEND_HINTS[id] || (id === activeBackend ? "connected" : b.running ? "running" : "");
+        item({ label: BACKEND_LABELS[id] || id, small }, id === activeBackend, () => {
           modelPop.hidden = true;
-          if (id !== activeBackend) connectBackend(id);
+          if (notReady) {
+            requestProviderSetup(id);
+          } else if (id !== activeBackend) {
+            connectBackend(id);
+          }
         });
       }
     }
@@ -9115,6 +9422,11 @@ function buildPanel() {
   // On load, only auto-connect if a bridge is already up (you started the
   // orchestrator yourself, or another tab did). Otherwise sit idle behind the
   // Connect button — we never start a process without an explicit click.
+  // Evaluate provider readiness on open (independent of the connect decision
+  // below): shows the onboarding card if NEITHER provider is signed in, and
+  // auto-picks a ready provider if the saved pick isn't usable.
+  void loadBackends();
+
   (async () => {
     // If a restart we triggered reloaded the page, finish the autonomous resume:
     // respawn the orchestrator and let onStatus(connected) nudge the agent.
