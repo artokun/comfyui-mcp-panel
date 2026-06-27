@@ -1190,6 +1190,30 @@ function uniqueSubgraphInputName(subgraph, baseName) {
   return `${baseName}_${i}`;
 }
 
+function uniqueSubgraphOutputName(subgraph, baseName) {
+  const names = new Set((subgraph?.outputs ?? []).map((output) => output?.name).filter(Boolean));
+  if (!names.has(baseName)) return baseName;
+  let i = 1;
+  while (names.has(`${baseName}_${i}`)) i++;
+  return `${baseName}_${i}`;
+}
+
+/** Find the parent SubgraphNode that hosts a given Subgraph instance (searching
+ *  from root through nested subgraphs), so its promoted views can be refreshed
+ *  after a boundary I/O change. Returns null if it can't be located. */
+function findSubgraphHostNode(subgraph) {
+  const root = app?.graph;
+  if (!root || !subgraph) return null;
+  const stack = [...(root._nodes ?? [])];
+  while (stack.length) {
+    const node = stack.pop();
+    if (!node) continue;
+    if (node.subgraph === subgraph) return node;
+    if (node.subgraph?._nodes?.length) stack.push(...node.subgraph._nodes);
+  }
+  return null;
+}
+
 function getWidgetSlot(node, widget) {
   if (typeof node.getSlotFromWidget === "function") return node.getSlotFromWidget(widget);
   return (node.inputs ?? []).find((input) => input?.widget?.name === widget.name);
@@ -1432,6 +1456,57 @@ function resolveNode(graph, nodeId) {
   return node;
 }
 
+// ---- Subgraph boundary rails (input/output proxy nodes) -------------------
+// LiteGraph: subgraph.inputNode.id === SUBGRAPH_INPUT_ID (-10),
+//            subgraph.outputNode.id === SUBGRAPH_OUTPUT_ID (-20).
+// These rail nodes are NOT in graph._nodes_by_id, so resolveNode/getNodeById
+// cannot find them — rail-aware executors use resolveRail instead.
+const SUBGRAPH_INPUT_RAIL_ID = -10;
+const SUBGRAPH_OUTPUT_RAIL_ID = -20;
+const RAIL_INPUT_ALIASES = new Set(["input", "input_rail", "inputs", "in"]);
+const RAIL_OUTPUT_ALIASES = new Set(["output", "output_rail", "outputs", "out"]);
+
+/** Resolve a node-id reference to a subgraph boundary rail, by the rail node's
+ *  real id (-10 / -20) or by an alias ("input"/"output"/..). Returns
+ *  { rail: "input"|"output", node } or null when it isn't a rail reference. */
+function resolveRail(graph, ref) {
+  const inNode = graph?.inputNode ?? null;
+  const outNode = graph?.outputNode ?? null;
+  if (typeof ref === "string") {
+    const key = ref.trim().toLowerCase();
+    if (RAIL_INPUT_ALIASES.has(key)) return inNode ? { rail: "input", node: inNode } : null;
+    if (RAIL_OUTPUT_ALIASES.has(key)) return outNode ? { rail: "output", node: outNode } : null;
+  }
+  const num = Number(ref);
+  if (Number.isFinite(num)) {
+    if (inNode && (Number(inNode.id) === num || num === SUBGRAPH_INPUT_RAIL_ID))
+      return { rail: "input", node: inNode };
+    if (outNode && (Number(outNode.id) === num || num === SUBGRAPH_OUTPUT_RAIL_ID))
+      return { rail: "output", node: outNode };
+  }
+  return null;
+}
+
+/** True when a rail slot reference means "make a NEW exposed slot" rather than
+ *  reusing an existing one (empty string / "new" / "empty" / "+" / null). */
+function isEmptyRailSlotRef(ref) {
+  if (ref == null) return true;
+  if (typeof ref !== "string") return false;
+  const k = ref.trim().toLowerCase();
+  return k === "" || k === "new" || k === "empty" || k === "+";
+}
+
+/** Find an EXISTING rail slot (SubgraphInput/SubgraphOutput) by name or index,
+ *  or null if none matches. */
+function findExistingRailSlot(slots, ref) {
+  if (ref == null) return null;
+  if (typeof ref === "number" && Number.isInteger(ref)) {
+    return ref >= 0 && ref < (slots?.length ?? 0) ? slots[ref] : null;
+  }
+  const name = String(ref).toLowerCase();
+  return (slots ?? []).find((s) => s?.name?.toLowerCase() === name) ?? null;
+}
+
 // ---- Group boxes (LiteGraph LGraphGroup) helpers --------------------------
 
 /** Resolve a group box by id (with an index fallback for graphs whose groups
@@ -1496,16 +1571,43 @@ function summarizeGroup(graph, g) {
 }
 
 /** Describe a subgraph's input/output "rail" nodes (the boundary I/O proxies)
- *  so layouts can sit nodes next to them instead of floating away. The exact
- *  property name varies across ComfyUI versions, so probe the likely ones. */
+ *  so layouts can sit nodes next to them instead of floating away, AND so the
+ *  agent can wire internal nodes to/from the rails. Reports each rail node's id
+ *  + its connectable slots:
+ *   - the INPUT rail (`subgraph.inputNode`, id -10) hands OUTPUT slots to internal
+ *     node inputs — listed under `provides_outputs`.
+ *   - the OUTPUT rail (`subgraph.outputNode`, id -20) accepts INPUT slots from
+ *     internal node outputs — listed under `accepts_inputs`.
+ *  `has_empty_slot` reflects the trailing "+" slot that adds a NEW exposed I/O.
+ *  The exact rail property name varies across ComfyUI versions, so probe likely ones. */
 function describeRails(sub) {
   const xy = (n) => (n?.pos ? [Math.round(n.pos[0]), Math.round(n.pos[1])] : null);
   const wh = (n) => (n?.size ? [Math.round(n.size[0]), Math.round(n.size[1])] : null);
   const inNode = sub.inputNode ?? sub._inputNode ?? null;
   const outNode = sub.outputNode ?? sub._outputNode ?? null;
+  const slotList = (slots) =>
+    (slots ?? []).map((s, i) => ({ index: i, name: s?.name ?? null, type: s?.type ?? null }));
   return {
-    input: inNode ? { pos: xy(inNode), size: wh(inNode) } : null,
-    output: outNode ? { pos: xy(outNode), size: wh(outNode) } : null,
+    input: inNode
+      ? {
+          rail_node_id: inNode.id,
+          pos: xy(inNode),
+          size: wh(inNode),
+          provides_outputs: slotList(sub.inputs),
+          has_empty_slot: !!inNode.emptySlot,
+          aliases: ["input", "input_rail"],
+        }
+      : null,
+    output: outNode
+      ? {
+          rail_node_id: outNode.id,
+          pos: xy(outNode),
+          size: wh(outNode),
+          accepts_inputs: slotList(sub.outputs),
+          has_empty_slot: !!outNode.emptySlot,
+          aliases: ["output", "output_rail"],
+        }
+      : null,
   };
 }
 
@@ -1696,6 +1798,102 @@ const GRAPH_TOOL_EXECUTORS = {
 
   graph_connect({ from_node_id, from_output, to_node_id, to_input }) {
     const { graph } = getGraphCtx();
+
+    // Rail tolerance: when an endpoint is a subgraph boundary rail (by real id
+    // -10/-20 or alias "input"/"output"/..), route to the boundary I/O logic
+    // instead of throwing "No node with id". Normal node-to-node connect below
+    // is unchanged.
+    const fromRail = resolveRail(graph, from_node_id);
+    const toRail = resolveRail(graph, to_node_id);
+
+    if (toRail?.rail === "output") {
+      // internal node OUTPUT -> subgraph OUTPUT rail.
+      const node = resolveNode(graph, from_node_id);
+      const outIdx = resolveSlot(node.outputs, from_output ?? 0, "output");
+      const outputSlot = node.outputs[outIdx];
+      const existing = isEmptyRailSlotRef(to_input)
+        ? null
+        : findExistingRailSlot(graph.outputs, to_input);
+      if (existing && typeof existing.connect === "function") {
+        graph.beforeChange?.();
+        let link;
+        try {
+          link = existing.connect(outputSlot, node);
+        } finally {
+          graph.afterChange?.();
+        }
+        if (!link) {
+          throw new Error(
+            `connect refused — node ${node.id} output "${outputSlot?.name ?? outIdx}" ` +
+              `(${outputSlot?.type}) is not compatible with subgraph output "${existing.name}" (${existing.type})`,
+          );
+        }
+        graph.setDirtyCanvas?.(true, true);
+        findSubgraphHostNode(graph)?.invalidatePromotedViews?.();
+        return {
+          connected: {
+            from: { node_id: node.id, output: outputSlot?.name ?? outIdx },
+            to: { subgraph_output: existing.name },
+          },
+        };
+      }
+      return GRAPH_TOOL_EXECUTORS.graph_expose_subgraph_output({
+        from_node_id,
+        from_output,
+        name: typeof to_input === "string" && !isEmptyRailSlotRef(to_input) ? to_input : undefined,
+      });
+    }
+
+    if (fromRail?.rail === "input") {
+      // subgraph INPUT rail -> internal node INPUT.
+      const node = resolveNode(graph, to_node_id);
+      const inIdx = resolveSlot(node.inputs, to_input ?? 0, "input");
+      const inputSlot = node.inputs[inIdx];
+      const existing = isEmptyRailSlotRef(from_output)
+        ? null
+        : findExistingRailSlot(graph.inputs, from_output);
+      if (existing && typeof existing.connect === "function") {
+        graph.beforeChange?.();
+        let link;
+        try {
+          link = existing.connect(inputSlot, node);
+        } finally {
+          graph.afterChange?.();
+        }
+        if (!link) {
+          throw new Error(
+            `connect refused — subgraph input "${existing.name}" (${existing.type}) is not ` +
+              `compatible with node ${node.id} input "${inputSlot?.name ?? inIdx}" (${inputSlot?.type})`,
+          );
+        }
+        graph.setDirtyCanvas?.(true, true);
+        findSubgraphHostNode(graph)?.invalidatePromotedViews?.();
+        return {
+          connected: {
+            from: { subgraph_input: existing.name },
+            to: { node_id: node.id, input: inputSlot?.name ?? inIdx },
+          },
+        };
+      }
+      return GRAPH_TOOL_EXECUTORS.graph_expose_subgraph_input({
+        to_node_id,
+        to_input,
+        name:
+          typeof from_output === "string" && !isEmptyRailSlotRef(from_output) ? from_output : undefined,
+      });
+    }
+
+    if (fromRail?.rail === "output") {
+      throw new Error(
+        'cannot connect FROM the output rail — set from_node_id to an internal node and to_node_id to "output"',
+      );
+    }
+    if (toRail?.rail === "input") {
+      throw new Error(
+        'cannot connect TO the input rail — set from_node_id to "input" and to_node_id to an internal node',
+      );
+    }
+
     const origin = resolveNode(graph, from_node_id);
     const target = resolveNode(graph, to_node_id);
     const outIdx = resolveSlot(origin.outputs, from_output ?? 0, "output");
@@ -2069,6 +2267,178 @@ const GRAPH_TOOL_EXECUTORS = {
         node_id: res?.node?.id ?? null,
         name: res?.subgraph?.name ?? null,
         from_nodes: ns.map((n) => n.id),
+      },
+    };
+  },
+
+  // --- Subgraph boundary I/O: wire internal nodes to the input/output rails --
+  // Run while INSIDE a subgraph (the active graph IS the Subgraph). Mirrors
+  // promoteWidgetByLink (subgraph.addInput + SubgraphInput.connect) for the
+  // OUTPUT side via subgraph.addOutput + SubgraphOutput.connect.
+  // Ref: ComfyUI_frontend LGraph.ts addOutput ~2970 / addInput ~2948;
+  //      SubgraphOutput.connect(slot, node) ~line 34; SubgraphInput.connect(slot, node) ~line 48.
+
+  // Take an internal node's OUTPUT and expose it as a subgraph OUTPUT.
+  graph_expose_subgraph_output({ from_node_id, from_output, name }) {
+    const { graph, canvas } = getGraphCtx();
+    const subgraph = graph;
+    if (typeof subgraph.addOutput !== "function" || !subgraph.outputNode) {
+      throw new Error(
+        "graph_expose_subgraph_output must be run INSIDE a subgraph (no subgraph.addOutput on the active graph)",
+      );
+    }
+    const node = resolveNode(subgraph, from_node_id);
+    const outIdx = resolveSlot(node.outputs, from_output ?? 0, "output");
+    const outputSlot = node.outputs[outIdx];
+
+    // Idempotent-ish: reuse an existing subgraph output already fed by this slot.
+    const existing = (subgraph.outputs ?? []).find((o) =>
+      (o?.linkIds ?? []).some((linkId) => {
+        const link = subgraph.getLink?.(linkId);
+        return (
+          link && Number(link.origin_id) === Number(node.id) && Number(link.origin_slot) === outIdx
+        );
+      }),
+    );
+    if (existing) {
+      return {
+        exposed: {
+          name: existing.name,
+          type: existing.type,
+          slot: subgraph.outputs.indexOf(existing),
+          reused: true,
+          from: { node_id: node.id, output: outputSlot?.name ?? outIdx },
+        },
+      };
+    }
+
+    const outputName = uniqueSubgraphOutputName(subgraph, name || outputSlot?.name || "output");
+    const outputType = String(outputSlot?.type ?? "*");
+    subgraph.beforeChange?.();
+    let subgraphOutput;
+    let link;
+    try {
+      subgraphOutput = subgraph.addOutput(outputName, outputType);
+      subgraphOutput.label = outputSlot?.label;
+      link =
+        typeof subgraphOutput.connect === "function"
+          ? subgraphOutput.connect(outputSlot, node)
+          : null;
+      if (!link) {
+        subgraph.removeOutput?.(subgraphOutput);
+        throw new Error(
+          `Could not link node ${node.id} output "${outputSlot?.name ?? outIdx}" (${outputType}) to a new subgraph output`,
+        );
+      }
+    } finally {
+      subgraph.afterChange?.();
+    }
+    findSubgraphHostNode(subgraph)?.invalidatePromotedViews?.();
+    subgraph.setDirtyCanvas?.(true, true);
+    canvas?.setDirty?.(true, true);
+    return {
+      exposed: {
+        name: outputName,
+        type: outputType,
+        slot: subgraph.outputs.indexOf(subgraphOutput),
+        on_host_subgraph_node: true,
+        from: { node_id: node.id, output: outputSlot?.name ?? outIdx },
+      },
+    };
+  },
+
+  // Expose the input rail as a subgraph INPUT feeding an internal node's INPUT.
+  graph_expose_subgraph_input({ to_node_id, to_input, name }) {
+    const { graph, canvas } = getGraphCtx();
+    const subgraph = graph;
+    if (typeof subgraph.addInput !== "function" || !subgraph.inputNode) {
+      throw new Error(
+        "graph_expose_subgraph_input must be run INSIDE a subgraph (no subgraph.addInput on the active graph)",
+      );
+    }
+    const node = resolveNode(subgraph, to_node_id);
+    const inIdx = resolveSlot(node.inputs, to_input ?? 0, "input");
+    const inputSlot = node.inputs[inIdx];
+
+    // Idempotent-ish: reuse an existing subgraph input already feeding this slot.
+    const existing = (subgraph.inputs ?? []).find((s) =>
+      (s?.linkIds ?? []).some((linkId) => {
+        const link = subgraph.getLink?.(linkId);
+        return (
+          link && Number(link.target_id) === Number(node.id) && Number(link.target_slot) === inIdx
+        );
+      }),
+    );
+    if (existing) {
+      return {
+        exposed: {
+          name: existing.name,
+          type: existing.type,
+          slot: subgraph.inputs.indexOf(existing),
+          reused: true,
+          to: { node_id: node.id, input: inputSlot?.name ?? inIdx },
+        },
+      };
+    }
+
+    const inputName = uniqueSubgraphInputName(subgraph, name || inputSlot?.name || "input");
+    const inputType = String(inputSlot?.type ?? "*");
+    subgraph.beforeChange?.();
+    let subgraphInput;
+    let link;
+    try {
+      subgraphInput = subgraph.addInput(inputName, inputType);
+      subgraphInput.label = inputSlot?.label;
+      link =
+        typeof subgraphInput.connect === "function" ? subgraphInput.connect(inputSlot, node) : null;
+      if (!link) {
+        subgraph.removeInput?.(subgraphInput);
+        throw new Error(
+          `Could not link a new subgraph input to node ${node.id} input "${inputSlot?.name ?? inIdx}" (${inputType})`,
+        );
+      }
+    } finally {
+      subgraph.afterChange?.();
+    }
+    findSubgraphHostNode(subgraph)?.invalidatePromotedViews?.();
+    subgraph.setDirtyCanvas?.(true, true);
+    canvas?.setDirty?.(true, true);
+    return {
+      exposed: {
+        name: inputName,
+        type: inputType,
+        slot: subgraph.inputs.indexOf(subgraphInput),
+        on_host_subgraph_node: true,
+        to: { node_id: node.id, input: inputSlot?.name ?? inIdx },
+      },
+    };
+  },
+
+  // Dissolve a subgraph: inline its interior nodes into the parent + rewire
+  // external links. node_id is the SubgraphNode in the CURRENT (parent) graph.
+  // Ref: ComfyUI_frontend LGraph.ts unpackSubgraph ~1932 (wraps its own
+  // beforeChange/afterChange) and _unpackSubgraphImpl ~1950.
+  graph_unpack_subgraph({ node_id }) {
+    const { graph, canvas } = getGraphCtx();
+    const node = resolveNode(graph, node_id);
+    if (!node.subgraph) {
+      throw new Error(`Node ${node.id} (${node.type}) is not a subgraph`);
+    }
+    if (typeof graph.unpackSubgraph !== "function") {
+      throw new Error("unpackSubgraph is unavailable on this ComfyUI frontend");
+    }
+    const before = new Set((graph._nodes ?? []).map((n) => n.id));
+    // unpackSubgraph wraps its own beforeChange/afterChange for undo, so don't
+    // nest another pair here.
+    graph.unpackSubgraph(node, { skipMissingNodes: true });
+    const newNodeIds = (graph._nodes ?? []).filter((n) => !before.has(n.id)).map((n) => n.id);
+    graph.setDirtyCanvas?.(true, true);
+    canvas?.setDirty?.(true, true);
+    return {
+      unpacked: {
+        node_id,
+        new_node_ids: newNodeIds,
+        node_count: newNodeIds.length,
       },
     };
   },
