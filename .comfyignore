@@ -12,6 +12,7 @@ browser_tests/
 playwright.config.ts
 playwright-report/
 test-results/
+.playwright/
 package.json
 package-lock.json
 tsconfig.json
