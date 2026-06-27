@@ -297,6 +297,7 @@ const panelHooks = {
   applyEffort: null, // (id|"")
   applyBridgeUrl: null, // (url)
   applyAutoConnect: null, // (bool)
+  applyStallConfig: null, // () — push the live render-stall threshold to the orchestrator
   requestSecret: null, // (envKey, friendly)
 };
 // Best-effort guard so a setSetting() we make while seeding/syncing doesn't bounce
@@ -699,8 +700,10 @@ function panelSettingsList() {
       attrs: { min: 15, max: 3600, step: 5 },
       defaultValue: 180,
       onChange: () => {
-        // Applied via the /connect request when the orchestrator (re)starts; there
-        // is nothing to push live.
+        if (suppressSettingOnChange || !settingsArmed) return;
+        // Push the new threshold to a live orchestrator (set_config) so it applies
+        // without a reconnect; also sent on connect and forwarded on spawn via env.
+        panelHooks.applyStallConfig?.();
       },
     },
     {
@@ -7029,6 +7032,13 @@ function buildPanel() {
     }
     liveBridgeClient = null;
   }
+  // Push the live render-stall threshold (panel setting) to the orchestrator over
+  // the bridge so a change applies WITHOUT a reconnect. No-op until connected.
+  function sendStallConfig() {
+    if (!client?.isConnected?.()) return;
+    client.sendFrame?.({ type: "set_config", stall_seconds: stallSettingSeconds() });
+  }
+
   const client = createBridgeClient({
     onStatus(state) {
       statusText.textContent = state;
@@ -7047,6 +7057,9 @@ function buildPanel() {
       if (connected) {
         resetAutoReclaim();
         clearSoftReloadGuard();
+        // Push the current render-stall threshold so a reused/just-connected
+        // orchestrator reflects the live setting (the spawn env covers a fresh one).
+        sendStallConfig();
       }
       if (!connected) hideThinking();
       // NB: do NOT push set_options here. The saved model id is only known-valid
@@ -9420,6 +9433,7 @@ function buildPanel() {
     lsSet(AUTOCONNECT_KEY, on ? "1" : null);
     if (on && !client.isConnected()) connectAgent();
   };
+  panelHooks.applyStallConfig = () => sendStallConfig();
   panelHooks.requestSecret = (envKey, friendly) => {
     if (!client.isConnected()) {
       appendSystem(
@@ -9508,6 +9522,7 @@ function buildPanel() {
       panelHooks.applyEffort = null;
       panelHooks.applyBridgeUrl = null;
       panelHooks.applyAutoConnect = null;
+      panelHooks.applyStallConfig = null;
       panelHooks.requestSecret = null;
       client.destroy();
       if (liveBridgeClient === client) liveBridgeClient = null;
