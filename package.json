@@ -1,0 +1,19 @@
+{
+  "name": "comfyui-agent-panel-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Dev-only Playwright e2e harness for the ComfyUI Agent Panel. NOT shipped with the pack (see .comfyignore).",
+  "scripts": {
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:e2e:list": "playwright test --list",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0",
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.7.2",
+    "ws": "^8.18.0"
+  }
+}
