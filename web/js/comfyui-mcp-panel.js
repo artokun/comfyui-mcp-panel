@@ -268,6 +268,7 @@ const SETTING_BRIDGE_URL = {
 const LEGACY_SETTING_BRIDGE_URL = "comfyui-mcp.bridgeUrl";
 const SETTING_AUTOCONNECT = "comfyui-mcp.autoConnect";
 const SETTING_FOCUS_FOLLOW = "comfyui-mcp.zoomToAction";
+const SETTING_STALL_S = "comfyui-mcp.stallWarningSeconds";
 const SETTING_TOKEN_CIVITAI = "comfyui-mcp.setCivitaiToken";
 const SETTING_TOKEN_HF = "comfyui-mcp.setHuggingfaceToken";
 // One-time flag: on first load with this feature, push the user's EXISTING
@@ -462,6 +463,16 @@ function triggerSecret(envKey, friendly) {
       }
     }
   }, 150);
+}
+
+// Stall-warning threshold (seconds) from the panel setting, clamped to a sane
+// range — sent on connect so the orchestrator (COMFYUI_MCP_STALL_S) warns the
+// agent once a render has made no progress for this long. null when unset/invalid
+// (the orchestrator then keeps its own 180s default).
+function stallSettingSeconds() {
+  const v = Number(getSetting(SETTING_STALL_S));
+  if (!Number.isFinite(v) || v <= 0) return null;
+  return Math.min(3600, Math.max(15, Math.round(v)));
 }
 
 // Build the settings list registered on the extension. Defined as a function so
@@ -672,6 +683,24 @@ function panelSettingsList() {
       onChange: (v) => {
         if (suppressSettingOnChange || !settingsArmed) return;
         panelHooks.applyAutoConnect?.(!!v);
+      },
+    },
+    {
+      id: SETTING_STALL_S,
+      name: "Render stall warning (seconds)",
+      category: cat("General", "Render stall warning (seconds)"),
+      sortOrder: 142,
+      tooltip:
+        "How long a ComfyUI render may make NO progress before the agent is warned its render looks stalled/wedged " +
+        "(e.g. an OOM-stuck sampler step) and is told to cancel/restart rather than queue another run. Video steps " +
+        "are legitimately slow, so keep this generous. Default 180s; range 15–3600. Applies when the orchestrator " +
+        "next starts — Disconnect then Connect (or /restart) to change it for a running agent.",
+      type: "number",
+      attrs: { min: 15, max: 3600, step: 5 },
+      defaultValue: 180,
+      onChange: () => {
+        // Applied via the /connect request when the orchestrator (re)starts; there
+        // is nothing to push live.
       },
     },
     {
@@ -7757,7 +7786,7 @@ function buildPanel() {
         const res = await api.fetchApi("/comfyui_mcp_panel/connect", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ backend: selectedBackend }),
+          body: JSON.stringify({ backend: selectedBackend, stall_seconds: stallSettingSeconds() }),
         });
         const data = await res.json().catch(() => ({}));
         if (myGen !== connectGen) return; // a newer user connect took over
@@ -7820,7 +7849,7 @@ function buildPanel() {
         const res = await api.fetchApi("/comfyui_mcp_panel/connect", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ backend: selectedBackend, force: true }),
+          body: JSON.stringify({ backend: selectedBackend, force: true, stall_seconds: stallSettingSeconds() }),
         });
         const data = await res.json().catch(() => ({}));
         // A newer user-initiated connect superseded us → let it drive.
@@ -7890,7 +7919,7 @@ function buildPanel() {
       const res = await api.fetchApi("/comfyui_mcp_panel/connect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ backend: selectedBackend }),
+        body: JSON.stringify({ backend: selectedBackend, stall_seconds: stallSettingSeconds() }),
       });
       const data = await res.json().catch(() => ({}));
       // A newer connect (e.g. a backend switch) superseded this one while the POST

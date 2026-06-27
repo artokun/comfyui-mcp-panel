@@ -132,6 +132,21 @@ def _truthy(val):
     return str(val).lower() in ("1", "true", "yes") if val is not None else False
 
 
+def _coerce_stall(val):
+    """Clamp a stall-warning-seconds value to [15, 3600]; None when absent/invalid.
+    Forwarded to the orchestrator as COMFYUI_MCP_STALL_S — how long a render may
+    make no progress before the agent is warned it looks stalled/wedged."""
+    if val is None:
+        return None
+    try:
+        n = int(float(val))
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    return max(15, min(3600, n))
+
+
 def _port_in_use(host, port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(0.3)
@@ -523,7 +538,7 @@ def _port_owner_pid(host, port):
     return None
 
 
-def _start_orchestrator(backend=_DEFAULT_BACKEND, port=None, force=False):
+def _start_orchestrator(backend=_DEFAULT_BACKEND, port=None, force=False, stall_seconds=None):
     """Start the panel orchestrator on demand. Returns (ok: bool, message: str).
 
     Called only from the Connect route — i.e. an explicit user action — never at
@@ -642,6 +657,10 @@ def _start_orchestrator(backend=_DEFAULT_BACKEND, port=None, force=False):
     # the exact same env it always has (the orchestrator defaults to claude too).
     if backend != _DEFAULT_BACKEND:
         env["PANEL_AGENT_BACKEND"] = backend
+    # Render-stall warning threshold (from the panel setting). Only set when given
+    # so an unset setting leaves the orchestrator's own default (180s) in place.
+    if stall_seconds is not None:
+        env["COMFYUI_MCP_STALL_S"] = str(stall_seconds)
     # Subscription lane: the background agent authenticates via the on-disk Claude
     # login, never an API key.
     env.pop("ANTHROPIC_API_KEY", None)
@@ -830,6 +849,9 @@ def _register_routes():
         # that looks healthy by the lockfile but never handshook, and respawn fresh.
         backend = _request.query.get("backend")
         force = _truthy(_request.query.get("force")) or _truthy(_request.query.get("reclaim"))
+        # Optional render-stall threshold (seconds) from the panel setting, applied
+        # to the orchestrator's env on spawn.
+        stall_seconds = _coerce_stall(_request.query.get("stall_seconds"))
         if not backend:
             try:
                 body = await _request.json()
@@ -837,6 +859,8 @@ def _register_routes():
                     backend = body.get("backend")
                     if not force:
                         force = bool(body.get("force") or body.get("reclaim"))
+                    if stall_seconds is None:
+                        stall_seconds = _coerce_stall(body.get("stall_seconds"))
             except Exception:
                 backend = None
         # Reject a non-string backend with a clean 400 (e.g. {"backend": 123})
@@ -852,7 +876,7 @@ def _register_routes():
                 status=400,
             )
         port = _backend_port(backend)
-        ok, message = _start_orchestrator(backend=backend, port=port, force=force)
+        ok, message = _start_orchestrator(backend=backend, port=port, force=force, stall_seconds=stall_seconds)
         return web.json_response(
             {
                 "ok": ok,
