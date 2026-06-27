@@ -979,6 +979,89 @@ function imageViewUrl(img) {
   }
 }
 
+// ---- Media metadata helpers ------------------------------------------------
+// Used to enrich the `executed` agent_event note (and a structured `metadata`
+// field) with render context: file size, pixel dimensions, render duration, etc.
+// Every gatherer is RESILIENT — it resolves to null on any failure and never
+// throws, so a flaky HEAD / decode can't drop the agent_event itself.
+
+/** Humanize a byte count → "1.8 MB" / "640 KB". Returns null for unknown. */
+function humanizeBytes(n) {
+  if (!Number.isFinite(n) || n < 0) return null;
+  if (n < 1024) return `${n} B`;
+  const u = ["KB", "MB", "GB", "TB"];
+  let i = -1;
+  let v = n;
+  do { v /= 1024; i++; } while (v >= 1024 && i < u.length - 1);
+  return `${v.toFixed(1)} ${u[i]}`;
+}
+
+/** Format a render duration (ms) → "3.1s" / "42s" / "3m 6s". Null if invalid. */
+function formatDuration(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  const s = ms / 1000;
+  if (s < 10) return `${s.toFixed(1)}s`;
+  if (s < 60) return `${Math.round(s)}s`;
+  const m = Math.floor(s / 60);
+  const rem = Math.round(s % 60);
+  return `${m}m ${rem}s`;
+}
+
+/** Local wall-clock time the run finished, e.g. "11:13:07". */
+function formatClock(date) {
+  try {
+    return date.toLocaleTimeString();
+  } catch {
+    return null;
+  }
+}
+
+/** HEAD an image's /view URL and read Content-Length. Resolves bytes or null.
+ *  Bounded by an AbortController timeout so a stalled HEAD can never delay the
+ *  run-finished agent_event (metadata is best-effort; the frame must always send). */
+async function fetchImageBytes(url) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const res = await fetch(url, { method: "HEAD", signal: ctrl.signal });
+    if (!res || !res.ok) return null;
+    const len = res.headers.get("content-length");
+    if (!len) return null;
+    const n = parseInt(len, 10);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Load an Image() from a /view URL to read natural pixel dimensions. Resolves
+ *  {w,h} or null. Bounded by a timeout so a stuck decode can't hang the flush. */
+function fetchImageDimensions(url) {
+  return new Promise((resolve) => {
+    try {
+      const img = new Image();
+      let done = false;
+      const finish = (v) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(v);
+      };
+      const timer = setTimeout(() => finish(null), 8000);
+      img.onload = () =>
+        finish(img.naturalWidth && img.naturalHeight
+          ? { w: img.naturalWidth, h: img.naturalHeight }
+          : null);
+      img.onerror = () => finish(null);
+      img.src = url;
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
 // ---- VIDEO → STORYBOARD (contact sheet) config -----------------------------
 // When a VIDEO output lands the panel can't show the agent the raw .mp4 (the
 // vision path only accepts images), so it samples frames in-browser and composes
@@ -7002,7 +7085,7 @@ function buildPanel() {
   // → upload to input/ → deliver THAT as an inline image (own executed event), and
   // paint it as a card so the user sees it too. Fully non-blocking + best-effort:
   // any failure just logs and leaves the video player as-is (no agent image).
-  async function deliverVideoStoryboard(m, nodeId) {
+  async function deliverVideoStoryboard(m, nodeId, promptId) {
     // Same final-vs-preview distinction as still images: a VHS-style video node
     // with `type:"output"` is the real SAVED file; `type:"temp"` (save_output off)
     // is a throwaway preview. Be conservative — only explicit "output" is final.
@@ -7010,6 +7093,40 @@ function buildPanel() {
     const videoKind = isFinalVideo
       ? `the FINAL saved video (file ${m.filename} — reference THIS filename)`
       : `a PREVIEW video (file ${m.filename}, temporary — not a saved file; add/enable a save to persist it)`;
+    // ── Video metadata (gathered up front) ─────────────────────────────────
+    // path (subfolder-relative), real frame metadata when the VHS/video output
+    // payload carries it, render duration, and completion time. Capture the
+    // render-start SYNCHRONOUSLY here (before any await / before the run's flush
+    // retires it) so the duration survives a concurrent execution_success.
+    const subfolder = m?.subfolder || "";
+    const path = subfolder ? `${subfolder}/${m?.filename || ""}` : (m?.filename || "");
+    const startTs = runStartTimes.get(promptKey(promptId));
+    const duration = startTs != null ? formatDuration(Date.now() - startTs) : null;
+    const finishedClock = formatClock(new Date());
+    // Real per-video frame metadata, when present on the descriptor (VHS-style
+    // video/gif outputs may include frame_count / frame_rate / format). Omit if
+    // the payload doesn't carry it (it's not always populated).
+    const realFrames = m?.frame_count ?? m?.frameCount ?? m?.frames ?? null;
+    const realFps = m?.frame_rate ?? m?.frameRate ?? m?.fps ?? null;
+    const format = m?.format || null;
+    // Compose the compact "· a · b · c" metadata suffix appended to a note.
+    // sizeStr (async HEAD) and storyboardN are optional/contextual.
+    const metaSuffix = (sizeStr, storyboardN) => {
+      const parts = [`path: ${path}`];
+      if (format) parts.push(String(format));
+      if (Number.isFinite(realFrames)) {
+        parts.push(
+          `${realFrames} frames` +
+            (Number.isFinite(realFps) ? ` @ ${realFps} fps` : ""),
+        );
+      } else if (storyboardN) {
+        parts.push(`${storyboardN}-frame storyboard`);
+      }
+      if (sizeStr) parts.push(sizeStr);
+      if (duration) parts.push(`rendered in ${duration}`);
+      if (finishedClock) parts.push(`finished ${finishedClock}`);
+      return parts.length ? `\n• ${m?.filename || "video"} — ${parts.join(" · ")}` : "";
+    };
     // ALWAYS notify the agent a video rendered — with a storyboard if we can build
     // one, else a note-only event (no images) so the agent still learns the render
     // landed even when the preview is off or sampling/upload fails.
@@ -7020,7 +7137,8 @@ function buildPanel() {
         note:
           `🎬 A video rendered — ${videoKind}. You can't view it directly` +
           (why ? ` — ${why}` : "") +
-          `; tell the user it's ready and ask how it looks if you need to judge it.`,
+          `; tell the user it's ready and ask how it looks if you need to judge it.` +
+          metaSuffix(null, null),
         node_id: nodeId,
       });
     if (prefs.videoStoryboard === false) {
@@ -7042,6 +7160,9 @@ function buildPanel() {
         return;
       }
       const n = storyboardFrameCount();
+      // Best-effort file size of the SOURCE video via HEAD (resilient — null on
+      // any failure, never blocks the storyboard delivery).
+      const sizeStr = humanizeBytes(await fetchImageBytes(imageViewUrl(m)));
       // Show the user the contact sheet next to the <video> player.
       paintImage(imageViewUrl(ref), `Storyboard · ${n} frames`);
       // Deliver the storyboard to BOTH backends via the existing inline-vision
@@ -7054,7 +7175,8 @@ function buildPanel() {
         note:
           `📽️ ${n}-frame storyboard (contact sheet) of ${videoKind} — ` +
           `frames run top-left→bottom-right = start→end. ` +
-          `Review motion, sharpness, and temporal consistency.`,
+          `Review motion, sharpness, and temporal consistency.` +
+          metaSuffix(sizeStr, n),
         node_id: nodeId,
       });
     } catch (err) {
@@ -7075,8 +7197,31 @@ function buildPanel() {
   const RUN_FLUSH_DEBOUNCE_MS = 1500;
   const promptKey = (id) => id ?? "__no_prompt__";
 
+  // Render-duration tracking: promptKey -> start Date.now(). The primary start
+  // signal is ComfyUI's `execution_start` (carries prompt_id) — recorded the
+  // instant a run begins. Fallbacks (first `executing`/`executed` for that
+  // prompt) fill in if execution_start is missed, so we never invent a bogus
+  // start. duration = finish - start is computed at flush; the entry is cleaned
+  // up on flush / execution_success / clear. Clock-consistent: BOTH ends use the
+  // client's Date.now(), so a server/client clock skew can't distort it.
+  const runStartTimes = new Map();
+  function markRunStart(promptId) {
+    const key = promptKey(promptId);
+    // First signal wins — don't let a later per-node event reset an earlier start.
+    if (!runStartTimes.has(key)) runStartTimes.set(key, Date.now());
+    // Safety cap: runs are sequential, but if a run starts and never produces a
+    // run-end signal the entry would linger — bound the map so it can't grow.
+    if (runStartTimes.size > 20) {
+      const oldest = runStartTimes.keys().next().value;
+      if (oldest !== key) runStartTimes.delete(oldest);
+    }
+  }
+
   function bufferRunImages(promptId, images) {
     if (!images.length) return;
+    // Fallback render-start: if execution_start was missed, anchor the timer at
+    // the first output we see for this run (no-op if a start is already recorded).
+    markRunStart(promptId);
     const key = promptKey(promptId);
     let buf = runImageBuffers.get(key);
     if (!buf) {
@@ -7089,12 +7234,20 @@ function buildPanel() {
     buf.timer = setTimeout(() => flushRunImages(key), RUN_FLUSH_DEBOUNCE_MS);
   }
 
-  function flushRunImages(promptId) {
+  async function flushRunImages(promptId) {
     const key = promptKey(promptId);
     const buf = runImageBuffers.get(key);
     if (!buf) return;
     if (buf.timer) clearTimeout(buf.timer);
     runImageBuffers.delete(key);
+    // Render duration: read + retire the start time NOW (synchronously, before any
+    // await) so a concurrent flush can't double-count it. null start ⇒ omit.
+    const startTs = runStartTimes.get(key);
+    runStartTimes.delete(key);
+    const durationMs = startTs != null ? Date.now() - startTs : null;
+    const duration = formatDuration(durationMs);
+    const finishedAt = new Date();
+    const finishedClock = formatClock(finishedAt);
     if (!buf.images.length) return;
     // Classify by ComfyUI's output type: SaveImage writes `type:"output"` with a
     // real filename = the FINAL saved result; PreviewImage writes `type:"temp"`
@@ -7137,13 +7290,91 @@ function buildPanel() {
         `Run finished, but no saved output node ran — ${previewClause}. ` +
         `Add a SaveImage node to persist the result, or treat the preview as the result if that's intended.`;
     }
+    // ── Rich per-output metadata ───────────────────────────────────────────
+    // Gather metadata for the FINAL outputs (size + dimensions fetched in
+    // PARALLEL and bounded via allSettled, so a single failed HEAD/decode never
+    // drops the agent_event). Weave a compact human-readable block into the note
+    // (the agent reads TEXT) AND attach a structured `metadata` array for future
+    // programmatic use. Every field is individually optional — omitted when
+    // unavailable rather than shown as a bogus value.
+    const total = finals.length;
+    const finalNameSet = finalNames; // sibling list source (asset set)
+    let metadata = [];
+    try {
+      metadata = await Promise.all(
+        finals.map(async (m, idx) => {
+          const filename = m?.filename || "(unknown)";
+          const subfolder = m?.subfolder || "";
+          const path = subfolder ? `${subfolder}/${filename}` : filename;
+          const url = imageViewUrl(m);
+          const [sizeRes, dimRes] = await Promise.allSettled([
+            fetchImageBytes(url),
+            fetchImageDimensions(url),
+          ]);
+          const sizeBytes =
+            sizeRes.status === "fulfilled" ? sizeRes.value : null;
+          const dim = dimRes.status === "fulfilled" ? dimRes.value : null;
+          const siblings = finalNameSet.filter((n) => n !== filename);
+          return {
+            filename,
+            path,
+            subfolder,
+            sizeBytes,
+            size: humanizeBytes(sizeBytes),
+            width: dim?.w ?? null,
+            height: dim?.h ?? null,
+            dimensions: dim ? `${dim.w}×${dim.h}` : null,
+            index: idx + 1,
+            total,
+            siblings,
+            durationMs,
+            duration,
+            finishedAt: finishedAt.toISOString(),
+            finishedClock,
+          };
+        }),
+      );
+    } catch {
+      // Defensive: metadata gathering must never block the agent_event.
+      metadata = [];
+    }
+    // Append the readable metadata block (one bullet per final output).
+    if (metadata.length) {
+      const lines = metadata.map((meta) => {
+        const parts = [`path: ${meta.path}`];
+        if (meta.size) parts.push(meta.size);
+        if (meta.dimensions) parts.push(meta.dimensions);
+        // asset set (same-run grouping)
+        parts.push(
+          meta.total === 1
+            ? "single output"
+            : `output ${meta.index} of ${meta.total} from this run`,
+        );
+        if (meta.siblings.length) {
+          parts.push(`alongside: ${meta.siblings.join(", ")}`);
+        }
+        if (meta.duration) parts.push(`rendered in ${meta.duration}`);
+        if (meta.finishedClock) parts.push(`finished ${meta.finishedClock}`);
+        return `• ${meta.filename} — ${parts.join(" · ")}`;
+      });
+      note += `\n${lines.join("\n")}`;
+    } else if (duration || finishedClock) {
+      // Preview-only run (no finals to attach metadata to) — still surface the
+      // run-level render context if we have it.
+      const bits = [];
+      if (duration) bits.push(`rendered in ${duration}`);
+      if (finishedClock) bits.push(`finished ${finishedClock}`);
+      if (bits.length) note += `\n• ${bits.join(" · ")}`;
+    }
     // One consolidated turn with ALL of the run's directly-viewable images,
-    // finals-first, plus a note naming which file(s) are the real saved output.
+    // finals-first, plus a note naming which file(s) are the real saved output
+    // and the structured metadata array (one entry per final output).
     client.sendFrame({
       type: "agent_event",
       kind: "executed",
       images,
       note,
+      metadata,
     });
   }
 
@@ -7152,6 +7383,7 @@ function buildPanel() {
     const buf = runImageBuffers.get(key);
     if (buf?.timer) clearTimeout(buf.timer);
     runImageBuffers.delete(key);
+    runStartTimes.delete(key);
   }
 
   function flushAllRunImages() {
@@ -7195,7 +7427,7 @@ function buildPanel() {
     }
     // Kick off a storyboard per video — non-blocking; onExecuted has already sent
     // its event and painted everything. Each storyboard delivers its own event.
-    for (const m of videos) deliverVideoStoryboard(m, nodeId);
+    for (const m of videos) deliverVideoStoryboard(m, nodeId, d.prompt_id);
   }
   function onExecError(ev) {
     const d = ev?.detail ?? {};
@@ -7226,13 +7458,30 @@ function buildPanel() {
   // Run-end signal: ComfyUI emits `execution_success` (carrying prompt_id) when a
   // prompt fully completes — flush THAT run's buffered images as one turn.
   function onExecutionSuccess(ev) {
-    flushRunImages(ev?.detail?.prompt_id);
+    const id = ev?.detail?.prompt_id;
+    flushRunImages(id);
+    // Retire the render-start for runs that produced NO buffered inline images
+    // (e.g. video-only runs) — flushRunImages early-returns for those and leaves
+    // the start entry behind. The video storyboard already captured its duration
+    // synchronously, so deleting here is safe.
+    runStartTimes.delete(promptKey(id));
+  }
+  // Primary render-duration start signal: ComfyUI emits `execution_start` with the
+  // prompt_id the instant a run begins — anchor the duration timer there.
+  function onExecutionStart(ev) {
+    markRunStart(ev?.detail?.prompt_id);
   }
   // Legacy/secondary run-end: `executing` fires with the current node id, or null
   // when nothing is left to run. The null event carries no prompt_id, so flush any
   // remaining buffers (runs are sequential — nothing is executing now).
   function onExecuting(ev) {
-    if (ev?.detail == null) flushAllRunImages();
+    if (ev?.detail == null) {
+      flushAllRunImages();
+      return;
+    }
+    // Fallback render-start: the first per-node `executing` for a prompt anchors
+    // the timer if execution_start was missed (no-op if already recorded).
+    if (ev?.detail?.prompt_id != null) markRunStart(ev.detail.prompt_id);
   }
   // Post-restart autonomy (#3): ComfyUI's api fires `reconnecting` when the
   // server goes down (e.g. a Manager reboot) and `reconnected` when it's back.
@@ -7263,6 +7512,7 @@ function buildPanel() {
   try {
     api.addEventListener("executed", onExecuted);
     api.addEventListener("execution_success", onExecutionSuccess);
+    api.addEventListener("execution_start", onExecutionStart);
     api.addEventListener("executing", onExecuting);
     api.addEventListener("execution_error", onExecError);
     api.addEventListener("reconnecting", onComfyReconnecting);
@@ -9153,6 +9403,7 @@ function buildPanel() {
       try {
         api.removeEventListener("executed", onExecuted);
         api.removeEventListener("execution_success", onExecutionSuccess);
+        api.removeEventListener("execution_start", onExecutionStart);
         api.removeEventListener("executing", onExecuting);
         api.removeEventListener("execution_error", onExecError);
         api.removeEventListener("reconnecting", onComfyReconnecting);
