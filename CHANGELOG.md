@@ -6,6 +6,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-06-27
+
+### Fixed
+
+- **Streamed replies now render when the ComfyUI tab is in the background.** The
+  reply typewriter + its commit-finalize ran on `requestAnimationFrame`, which the
+  browser **pauses in a hidden/background tab** — so if you switched away during an
+  agent turn (common on long multi-stage pipeline runs), the reply never painted and
+  the bubble sat empty with a stuck streaming cursor, looking like the agent was
+  "stuck thinking / never draining the queue" even though the turn had finished. The
+  commit now finalizes the reply **synchronously when the tab is hidden**, plus a
+  `visibilitychange` handler flushes any pending reply on hide and resumes the
+  typewriter on return. Foreground animation is unchanged.
+
 ## [0.4.2] - 2026-06-26
 
 ### Added
