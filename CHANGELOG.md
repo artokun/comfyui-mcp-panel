@@ -6,8 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-06-26
+
 ### Added
 
+- **Subgraph rail I/O + expand/dissolve** — from inside a subgraph the agent can
+  now wire an interior node to the boundary: `graph_expose_subgraph_output` /
+  `graph_expose_subgraph_input` expose an interior node's output/input as a
+  subgraph output/input (the host subgraph node gains the slot). `graph_get_state`'s
+  `rails` now reports the input/output rail node ids + their slots, and
+  `graph_connect` tolerates rail endpoints with a clear "enter the subgraph first"
+  error at root. `graph_unpack_subgraph` **dissolves** a subgraph back into its
+  parent (inlines the interior nodes, rewires external links) — the inverse of
+  create-subgraph, Ctrl+Z-undoable.
 - **Pasted text renders inline in sent bubbles** — a sent (or reloaded) user
   message no longer shows the raw `[Pasted text #N]` token. Each token is now
   replaced **inline with the actual pasted content**, rendered verbatim as plain
