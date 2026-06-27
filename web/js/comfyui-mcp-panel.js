@@ -6398,7 +6398,14 @@ function buildPanel() {
     if (!s) return false;
     s.commitText = text;
     s.replyTarget = text; // authoritative — guarantees the typewriter reaches the end
-    kickStreams(s); // run to completion; finalizeStream renders markdown when caught up
+    // CRITICAL: the typewriter (pumpStreams) runs on requestAnimationFrame, which
+    // the browser PAUSES in a hidden/background tab. If the user switched away
+    // during the turn (common on long pipeline runs), the reply would never paint
+    // and the bubble would sit empty with a stuck cursor — looking like "stuck
+    // thinking / never drains." When hidden, render the final text SYNCHRONOUSLY
+    // instead of waiting for an RAF tick that won't come.
+    if (document.hidden) finalizeStream(s);
+    else kickStreams(s); // run to completion; finalizeStream renders markdown when caught up
     return true;
   }
 
@@ -8976,6 +8983,20 @@ function buildPanel() {
     }
   }
   document.addEventListener("mousedown", onDocPointerDown, true);
+  // Background-tab safety for streamed replies: requestAnimationFrame (which drives
+  // the typewriter + finalize) is paused while the tab is hidden. When the tab goes
+  // hidden, synchronously finalize any reply whose commit already arrived so it never
+  // gets stranded as an empty cursor bubble; when it returns, resume the typewriters.
+  function onVisibilityChange() {
+    if (document.hidden) {
+      for (const s of [...streamBubbles.values()]) {
+        if (s.commitText != null) finalizeStream(s);
+      }
+    } else {
+      for (const s of streamBubbles.values()) kickStreams(s);
+    }
+  }
+  document.addEventListener("visibilitychange", onVisibilityChange);
 
   // Reload restore: repaint the chat this tab was last showing. The agent's
   // memory continues automatically — either the orchestrator's agent for this
@@ -9128,6 +9149,7 @@ function buildPanel() {
         // recognition already stopped
       }
       document.removeEventListener("mousedown", onDocPointerDown, true);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       try {
         api.removeEventListener("executed", onExecuted);
         api.removeEventListener("execution_success", onExecutionSuccess);
