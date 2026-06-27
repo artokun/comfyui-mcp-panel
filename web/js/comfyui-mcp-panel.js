@@ -3943,10 +3943,6 @@ const PANEL_CSS = `
   font-size: 0.6875rem; line-height: 1.45; color: var(--p-text-color, #e4e4e7);
 }
 .cmcp-attach-preview img { max-width: 100%; max-height: 12rem; border-radius: 4px; display: block; }
-/* Pasted-text chips rendered inline inside a sent user bubble. */
-.cmcp-bubble-chip { vertical-align: baseline; margin: 0.0625rem 0.125rem; max-width: 100%; }
-.cmcp-bubble-chip.open { border-color: var(--p-primary-color, #60a5fa); }
-.cmcp-bubble-preview { margin: 0.375rem 0; max-width: 100%; }
 .cmcp-ctx { font-size: 0.625rem; color: var(--p-text-muted-color, #a1a1aa); min-width: 1.75rem; }
 .cmcp-ring { flex: none; margin: 0 0.125rem; transform: rotate(-90deg); }
 .cmcp-ring .bg { stroke: var(--p-surface-600, #52525b); }
@@ -5216,47 +5212,10 @@ function buildPanel() {
   // token inside a user bubble. The chip mirrors the composer chip look; clicking
   // it toggles a read-only, scrollable, monospace preview of the FULL content.
   // `bubble` scopes "one preview open at a time". Null-safe; never throws.
-  function buildPastedChip(bubble, id, content, truncated) {
-    const text = content != null ? String(content) : "";
-    const chip = document.createElement("button");
-    chip.type = "button";
-    chip.className = "cmcp-attach-chip cmcp-bubble-chip";
-    chip.title = "Click to show/hide the pasted text";
-    const ic = document.createElement("i");
-    ic.className = "pi pi-align-left";
-    chip.appendChild(ic);
-    const name = document.createElement("span");
-    name.className = "cmcp-attach-name";
-    name.textContent = `Pasted text #${id}`;
-    chip.appendChild(name);
-    const meta = document.createElement("span");
-    meta.className = "cmcp-attach-meta";
-    meta.textContent = `${text.length.toLocaleString()} chars${truncated ? "+" : ""}`;
-    chip.appendChild(meta);
-
-    const preview = document.createElement("div");
-    preview.className = "cmcp-attach-preview cmcp-bubble-preview";
-    preview.hidden = true;
-    const pre = document.createElement("pre");
-    pre.textContent = truncated ? `${text}\n\n… (truncated for display)` : text;
-    preview.appendChild(pre);
-
-    chip.addEventListener("click", () => {
-      const willOpen = preview.hidden;
-      // One open at a time within this bubble.
-      if (bubble) {
-        bubble.querySelectorAll(".cmcp-bubble-preview").forEach((p) => { p.hidden = true; });
-        bubble.querySelectorAll(".cmcp-bubble-chip.open").forEach((c) => c.classList.remove("open"));
-      }
-      preview.hidden = !willOpen;
-      chip.classList.toggle("open", willOpen);
-    });
-    return { chip, preview };
-  }
-
-  // Render a user message into `container`, turning each [Pasted text #N] token
-  // into an expandable chip (content looked up in `atts` by id). Surrounding
-  // text is rendered verbatim as text nodes. Tokens with no matching attachment
+  // Render a user message into `container`, replacing each [Pasted text #N] token
+  // with the actual pasted content INLINE (looked up in `atts` by id) — rendered
+  // verbatim as a text node, exactly as if the user had typed it (no chip/widget).
+  // Surrounding text renders verbatim too. Tokens with no matching attachment
   // content fall back to their literal text. Never throws into the render.
   function renderUserText(container, text, atts) {
     const raw = text != null ? String(text) : "";
@@ -5272,9 +5231,9 @@ function buildPanel() {
         if (m.index > last) container.appendChild(document.createTextNode(raw.slice(last, m.index)));
         const att = byId.get(m[1]);
         if (att && att.content != null) {
-          const { chip, preview } = buildPastedChip(container, m[1], att.content, !!att.truncated);
-          container.appendChild(chip);
-          container.appendChild(preview);
+          // Interpolate the pasted content INLINE as plain text — render the message
+          // exactly as if the user had typed it (no chip / preview widget).
+          container.appendChild(document.createTextNode(att.content));
         } else {
           container.appendChild(document.createTextNode(m[0])); // graceful fallback
         }
