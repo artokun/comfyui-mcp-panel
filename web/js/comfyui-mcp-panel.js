@@ -1487,6 +1487,24 @@ function resolveRail(graph, ref) {
   return null;
 }
 
+/** Detect rail INTENT independent of whether rails actually exist on the active
+ *  graph — i.e. the reference is clearly meant to be a boundary rail (an alias,
+ *  or the reserved rail ids -10/-20). Returns "input"|"output"|null. Used to give
+ *  a clear error when a rail endpoint is used at the ROOT graph (no rails). */
+function railIntent(ref) {
+  if (typeof ref === "string") {
+    const key = ref.trim().toLowerCase();
+    if (RAIL_INPUT_ALIASES.has(key)) return "input";
+    if (RAIL_OUTPUT_ALIASES.has(key)) return "output";
+  }
+  const num = Number(ref);
+  if (Number.isFinite(num)) {
+    if (num === SUBGRAPH_INPUT_RAIL_ID) return "input";
+    if (num === SUBGRAPH_OUTPUT_RAIL_ID) return "output";
+  }
+  return null;
+}
+
 /** True when a rail slot reference means "make a NEW exposed slot" rather than
  *  reusing an existing one (empty string / "new" / "empty" / "+" / null). */
 function isEmptyRailSlotRef(ref) {
@@ -1891,6 +1909,20 @@ const GRAPH_TOOL_EXECUTORS = {
     if (toRail?.rail === "input") {
       throw new Error(
         'cannot connect TO the input rail — set from_node_id to "input" and to_node_id to an internal node',
+      );
+    }
+
+    // Rail INTENT without resolvable rails: the endpoint is clearly a rail
+    // reference (alias or id -10/-20) but the active graph has none — i.e. we're
+    // at the root graph. Fail clearly instead of falling through to the normal
+    // node path (which would throw the confusing "No node with id output").
+    const fromIntent = railIntent(from_node_id);
+    const toIntent = railIntent(to_node_id);
+    if ((fromIntent && !fromRail) || (toIntent && !toRail)) {
+      const ref = toIntent && !toRail ? to_node_id : from_node_id;
+      throw new Error(
+        `Rail endpoint "${ref}" is only valid inside a subgraph — enter the subgraph first ` +
+          `(graph_enter_subgraph), then expose I/O with graph_expose_subgraph_output / graph_expose_subgraph_input.`,
       );
     }
 
