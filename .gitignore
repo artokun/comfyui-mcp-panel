@@ -8,3 +8,7 @@ node_modules/
 .panel-guard/
 assets/brand-preview/
 assets/brand-preview-ai/
+# Playwright e2e artifacts
+playwright-report/
+test-results/
+.playwright/

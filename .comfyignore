@@ -7,3 +7,11 @@ venv/
 node_modules/
 *.log
 .DS_Store
+# Dev-only e2e tooling — never ship with the pack
+browser_tests/
+playwright.config.ts
+playwright-report/
+test-results/
+package.json
+package-lock.json
+tsconfig.json
