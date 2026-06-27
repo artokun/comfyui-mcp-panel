@@ -1016,10 +1016,14 @@ function formatClock(date) {
   }
 }
 
-/** HEAD an image's /view URL and read Content-Length. Resolves bytes or null. */
+/** HEAD an image's /view URL and read Content-Length. Resolves bytes or null.
+ *  Bounded by an AbortController timeout so a stalled HEAD can never delay the
+ *  run-finished agent_event (metadata is best-effort; the frame must always send). */
 async function fetchImageBytes(url) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
   try {
-    const res = await fetch(url, { method: "HEAD" });
+    const res = await fetch(url, { method: "HEAD", signal: ctrl.signal });
     if (!res || !res.ok) return null;
     const len = res.headers.get("content-length");
     if (!len) return null;
@@ -1027,6 +1031,8 @@ async function fetchImageBytes(url) {
     return Number.isFinite(n) ? n : null;
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -9397,6 +9403,7 @@ function buildPanel() {
       try {
         api.removeEventListener("executed", onExecuted);
         api.removeEventListener("execution_success", onExecutionSuccess);
+        api.removeEventListener("execution_start", onExecutionStart);
         api.removeEventListener("executing", onExecuting);
         api.removeEventListener("execution_error", onExecError);
         api.removeEventListener("reconnecting", onComfyReconnecting);
