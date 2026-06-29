@@ -1569,6 +1569,9 @@ function summarizeNode(node) {
     ...(node.mode ? { mode: { 2: "mute", 4: "bypass" }[node.mode] ?? `mode_${node.mode}` } : {}),
     ...(node.color ? { color: node.color } : {}),
     ...(node.bgcolor ? { bgcolor: node.bgcolor } : {}),
+    // OUTPUT nodes (SaveImage/PreviewImage/SaveVideo/…) are the only valid
+    // targets for panel_run's to_node_id ("run to node" partial execution).
+    ...(node.constructor?.nodeData?.output_node ? { is_output: true } : {}),
     widgets,
     inputs,
     outputs,
@@ -1832,7 +1835,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const node = LG.createNode(class_type);
     if (!node) {
       throw new Error(
-        `Unknown node type "${class_type}" — check the exact class_type via graph_get_state or the node search`,
+        `Unknown node type "${class_type}" — check the exact class_type via panel_get_graph or panel_search_nodes`,
       );
     }
     graph.beforeChange();
@@ -2242,18 +2245,57 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
-  async graph_run({ batch_count }) {
+  async graph_run({ batch_count, to_node_id }) {
     const { app } = getGraphCtx();
     if (typeof app.queuePrompt !== "function") {
       throw new Error("app.queuePrompt is unavailable on this frontend");
     }
     const batch = Number(batch_count ?? 1);
-    await app.queuePrompt(0, batch);
+
+    // "Run to node" = ComfyUI partial execution. The server keeps an OUTPUT node
+    // (SaveImage/PreviewImage/SaveVideo/…) as an execution root only when its id
+    // is in partial_execution_targets, then walks back through that node's
+    // dependencies — so only that branch renders. A non-output node can't be a
+    // root (the prompt would have "no outputs"), and an output node nested in a
+    // subgraph needs a path-style NodeExecutionId we don't build yet — reject
+    // both with guidance instead of silently running the whole graph. Stays
+    // undefined for a normal full run (byte-identical to the prior behaviour).
+    let partialTargets;
+    if (to_node_id != null) {
+      const node = app.graph?.getNodeById?.(Number(to_node_id));
+      if (!node) {
+        return {
+          queued: false,
+          error:
+            `node ${to_node_id} is not on the root graph — run-to-node targets a ` +
+            `root-level output node (output nodes inside subgraphs aren't supported yet)`,
+        };
+      }
+      // isOutputNode mirrors ComfyUI's util: node.constructor.nodeData.output_node.
+      if (!node.constructor?.nodeData?.output_node) {
+        return {
+          queued: false,
+          error:
+            `node ${to_node_id} (${node.type}) is not an output node — "run to node" can ` +
+            `only target an output node such as SaveImage, PreviewImage, or SaveVideo. Pick the ` +
+            `output node at the end of the branch you want to render (is_output:true in panel_get_graph).`,
+        };
+      }
+      partialTargets = [String(to_node_id)];
+    }
+
+    // app.queuePrompt(number, batchCount, queueNodeIds) — the 3rd arg becomes the
+    // request's partial_execution_targets (queue-service signature; ComfyUI 0.26.2).
+    await app.queuePrompt(0, batch, partialTargets);
     // queuePrompt swallows validation failures into lastNodeErrors.
     const nodeErrors =
       app.lastNodeErrors && Object.keys(app.lastNodeErrors).length ? app.lastNodeErrors : null;
     if (nodeErrors) return { queued: false, node_errors: nodeErrors };
-    return { queued: true, batch_count: batch };
+    return {
+      queued: true,
+      batch_count: batch,
+      ...(partialTargets ? { ran_to_node: Number(to_node_id) } : {}),
+    };
   },
 
   graph_get_errors() {
@@ -4669,11 +4711,19 @@ function describeCommand(cmd, msg, reply) {
       return { icon: "pi-window-maximize", text: `Canvas: ${r.canvas?.action?.replace(/_/g, " ")}` };
     case "graph_run":
       return r.queued
-        ? { icon: "pi-play", text: `Queued workflow${r.batch_count > 1 ? ` ×${r.batch_count}` : ""}` }
+        ? {
+            icon: "pi-play",
+            text:
+              `Queued workflow${r.batch_count > 1 ? ` ×${r.batch_count}` : ""}` +
+              (r.ran_to_node != null ? ` → node ${r.ran_to_node}` : ""),
+          }
         : {
             icon: "pi-exclamation-triangle",
-            text: "Run blocked by node errors",
-            detail: JSON.stringify(r.node_errors).slice(0, 300),
+            // run-to-node rejection returns { error } (no node_errors); a normal
+            // validation failure returns { node_errors }. Handle both — guard the
+            // JSON.stringify so an undefined node_errors can't throw here.
+            text: r.error ? "Run blocked" : "Run blocked by node errors",
+            detail: r.error ?? (r.node_errors ? JSON.stringify(r.node_errors).slice(0, 300) : undefined),
           };
     case "graph_get_errors":
       return {

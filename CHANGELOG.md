@@ -6,6 +6,28 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-06-29
+
+### Added
+
+- **Run to node (partial execution).** `graph_run` now accepts `to_node_id`: render only
+  that output node's branch (the node plus everything upstream) via ComfyUI's native
+  partial execution (`app.queuePrompt(0, batch, partial_execution_targets)`), skipping
+  every other output branch — fast/cheap previewing or debugging of part of a big graph.
+  The target must be a root-level **output** node (SaveImage/PreviewImage/SaveVideo/…);
+  non-output or subgraph-nested targets are rejected with actionable guidance instead of
+  silently running the whole graph. Node summaries now tag output nodes `is_output:true`,
+  and the command line shows `→ node N` when a partial run was queued. Omitting
+  `to_node_id` is byte-identical to the previous full-graph run. Pairs with the MCP
+  `panel_run` `to_node_id` parameter and the `debug-render` skill (comfyui-mcp ≥ 0.21.0).
+
+### Fixed
+
+- **Run-result display crash.** A blocked run that returns `{ error }` (the new
+  run-to-node rejection) no longer throws in the activity line — `describeCommand` guarded
+  the `JSON.stringify(node_errors)` path and now shows the returned guidance for `error`
+  and the node-error JSON only when `node_errors` is present.
+
 ## [0.4.4] - 2026-06-27
 
 ### Added
