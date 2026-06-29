@@ -85,6 +85,7 @@ const LEGACY_BRIDGE_URL = "ws://127.0.0.1:9101"; // old shared default — migra
 const DEFAULT_BRIDGE_URL_BY_BACKEND = {
   claude: "ws://127.0.0.1:9180",
   codex: "ws://127.0.0.1:9181",
+  gemini: "ws://127.0.0.1:9182",
 };
 function defaultBridgeUrlFor(backend) {
   return DEFAULT_BRIDGE_URL_BY_BACKEND[backend] || DEFAULT_BRIDGE_URL;
@@ -246,10 +247,12 @@ const SETTING_BACKEND = "comfyui-mcp.defaultBackend";
 const SETTING_MODEL = {
   claude: "comfyui-mcp.defaultModel.claude",
   codex: "comfyui-mcp.defaultModel.codex",
+  gemini: "comfyui-mcp.defaultModel.gemini",
 };
 const SETTING_EFFORT = {
   claude: "comfyui-mcp.defaultEffort.claude",
   codex: "comfyui-mcp.defaultEffort.codex",
+  gemini: "comfyui-mcp.defaultEffort.gemini",
 };
 // Pre-grouping single-key settings (a returning user upgrading from the single
 // "Default model"/"Default reasoning effort" had these). Migrated ONCE into the
@@ -262,6 +265,7 @@ const LEGACY_SETTING_EFFORT = "comfyui-mcp.defaultEffort";
 const SETTING_BRIDGE_URL = {
   claude: "comfyui-mcp.bridgeUrl.claude",
   codex: "comfyui-mcp.bridgeUrl.codex",
+  gemini: "comfyui-mcp.bridgeUrl.gemini",
 };
 // Pre-per-backend single Bridge URL key — migrated ONCE into the Claude group so a
 // returning user's custom port isn't lost (runs in the groups-migration block).
@@ -280,10 +284,10 @@ const SETTINGS_SEEDED_KEY = "comfyui-mcp.panel.settingsSeeded";
 // per-backend groups (runs independently of SETTINGS_SEEDED_KEY).
 const SETTINGS_GROUPS_MIGRATED_KEY = "comfyui-mcp.panel.settingsGroupsMigrated";
 // Section (sub-category) labels for the grouped Settings dialog, per backend.
-const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)" };
+const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)", gemini: "Gemini" };
 // Backend display names at module scope (the Settings dialog's render-fns live
 // outside buildPanel's closure, so they need their own copy).
-const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT" };
+const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini" };
 // The allowlisted secure-store keys (mirrors the orchestrator's #59 allowlist).
 const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
 
@@ -327,7 +331,7 @@ const settingsBackendState = {
 // render-fns when the dialog opens, so a freshly-arrived catalog can repaint the
 // matching backend's dropdown in place (a render-fn setting has no static options
 // to re-key). Keyed by backend; null when that group isn't mounted.
-const settingsModelSelectEls = { claude: null, codex: null };
+const settingsModelSelectEls = { claude: null, codex: null, gemini: null };
 // Disabled placeholder <option> value — mapped to "" (Auto) if ever selected so
 // it can never persist as a bogus model id.
 const SETTINGS_PLACEHOLDER = "__cmcp_placeholder__";
@@ -336,7 +340,8 @@ const SETTINGS_PLACEHOLDER = "__cmcp_placeholder__";
  *  Default-backend (claude/codex), defaulting to claude. Used to decide whether a
  *  per-backend group's edit should drive the LIVE panel (only the active group does). */
 function currentSettingsBackend() {
-  return getSetting(SETTING_BACKEND) === "codex" ? "codex" : "claude";
+  const b = getSetting(SETTING_BACKEND);
+  return b === "codex" || b === "gemini" ? b : "claude";
 }
 /** Fetched model rows for `backend` (the same presentable catalog the composer
  *  picker uses), or null when none is cached (backend never connected this session). */
@@ -539,7 +544,7 @@ function panelSettingsList() {
   // very TOP, then General (backend selector first), then the two backend groups,
   // then API tokens LAST — NOT the alphabetical default.
   // (Verified against the installed comfyui_frontend_package SettingDialog.vue.)
-  // Section MAX sortOrder: About 200 > General 150 > Claude 130 > Codex 110 > tokens 20.
+  // Section MAX sortOrder: About 200 > General 150 > Claude 130 > Codex 110 > Gemini 90 > tokens 20.
   //
   // A per-backend "Default model" — a render-fn DROPDOWN of the FETCHED models for
   // THAT backend (the same catalog the composer picker shows). Static `combo`s
@@ -584,16 +589,19 @@ function panelSettingsList() {
     },
   });
   // A per-backend "Default reasoning effort" — a STATIC combo of THAT backend's
-  // fixed scale (Claude: low–max; Codex: none–xhigh). No dynamic remap needed
-  // since the groups are separate. Drives the live panel only for the active group.
+  // fixed scale (Claude: low–max; Codex: none–xhigh; Gemini: no effort control).
+  // No dynamic remap needed since the groups are separate. Drives the live panel
+  // only for the active group.
   const effortSetting = (backend, sortOrder) => ({
     id: SETTING_EFFORT[backend],
     name: "Default reasoning effort",
     category: cat(BACKEND_SECTION[backend], "Default reasoning effort"),
     sortOrder,
     tooltip:
-      `Default reasoning effort for the ${BACKEND_TEXT[backend]} agent, from its scale ` +
-      `(${backend === "codex" ? "none–xhigh" : "low–max"}). 'Model default' leaves it unset.`,
+      ((BACKEND_EFFORTS[backend] || ALL_EFFORTS).length
+        ? `Default reasoning effort for the ${BACKEND_TEXT[backend]} agent, from its scale ` +
+          `(${backend === "codex" ? "none–xhigh" : "low–max"}). 'Model default' leaves it unset.`
+        : `${BACKEND_TEXT[backend]} exposes no reasoning-effort control; leave this at 'Model default'.`),
     type: "combo",
     options: effortComboOptions(backend),
     defaultValue: "",
@@ -657,13 +665,14 @@ function panelSettingsList() {
       sortOrder: 150,
       tooltip:
         "Which background agent the panel connects to by default. Claude runs on your Claude subscription; " +
-        "ChatGPT runs on your Codex (ChatGPT) account. Seeds the panel's backend (and which group below seeds " +
-        "the runtime); you can still switch live in the model picker (a live switch is session-only and does " +
-        "NOT change this default).",
+        "ChatGPT runs on your Codex (ChatGPT) account; Gemini runs on your Google (Gemini) login. Seeds the " +
+        "panel's backend (and which group below seeds the runtime); you can still switch live in the model " +
+        "picker (a live switch is session-only and does NOT change this default).",
       type: "combo",
       options: [
         { value: "claude", text: "Claude" },
         { value: "codex", text: "ChatGPT" },
+        { value: "gemini", text: "Gemini" },
       ],
       defaultValue: "claude",
       onChange: (v) => {
@@ -734,6 +743,10 @@ function panelSettingsList() {
     modelSetting("codex", 110),
     effortSetting("codex", 105),
     bridgeUrlSetting("codex", 100),
+    // ---- Gemini (Default model, Default reasoning effort, Bridge URL) ----
+    modelSetting("gemini", 90),
+    effortSetting("gemini", 85),
+    bridgeUrlSetting("gemini", 80),
     // ---- API tokens (LAST) ----
     tokenSetting(SETTING_TOKEN_CIVITAI, "CIVITAI_API_TOKEN", "CivitAI", 20),
     tokenSetting(SETTING_TOKEN_HF, "HUGGINGFACE_TOKEN", "HuggingFace", 15),
@@ -773,9 +786,14 @@ const ALL_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 // mapping server-side; this keeps the picker honest about what's selectable).
 //   • Claude: low | medium | high | xhigh | max
 //   • Codex:  none | minimal | low | medium | high | xhigh
+//   • Gemini: (none) — the gemini CLI (run via `gemini --acp`) exposes no
+//     user-facing reasoning-effort levels, so the effort selector is hidden for
+//     it (empty scale → effortsForModel returns [], intersecting any model-
+//     reported levels down to none). The orchestrator maps effort server-side.
 const BACKEND_EFFORTS = {
   claude: ["low", "medium", "high", "xhigh", "max"],
   codex: ["none", "minimal", "low", "medium", "high", "xhigh"],
+  gemini: [],
 };
 // Ordered low→high across BOTH scales, for nearest-level mapping on a switch.
 const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -3560,13 +3578,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   // `codex app-server` cold-starts much slower than Claude's Agent SDK, so it gets
   // ~3x the window. This is the escalation THRESHOLD only — the respawn/reclaim
   // BOUNDS (MAX_AUTO_RESPAWNS / MAX_AUTO_RECLAIMS) are untouched.
-  const RESPAWN_AFTER_BY_BACKEND = { codex: 6, claude: 2 };
+  const RESPAWN_AFTER_BY_BACKEND = { codex: 6, gemini: 6, claude: 2 };
   function respawnAfterAttempts() {
     return RESPAWN_AFTER_BY_BACKEND[backendNow()] ?? 2;
   }
   // Failed (re)connect attempts ridden out as a steady "connecting" before a
   // terminal "disconnected". Backend-aware, ~3x for Codex's slower cold start.
-  const CONNECT_PATIENCE_BY_BACKEND = { codex: 12, claude: 4 };
+  const CONNECT_PATIENCE_BY_BACKEND = { codex: 12, gemini: 12, claude: 4 };
   function connectPatienceAttempts() {
     return CONNECT_PATIENCE_BY_BACKEND[backendNow()] ?? 4;
   }
@@ -3579,7 +3597,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   // Handshake (models-frame) window AFTER the WS opens. Backend-aware: Codex's
   // app-server can still be booting its agent after the bridge accepts the socket,
   // so it gets a wider window before we treat the open socket as wedged (FIX 2).
-  const HANDSHAKE_MS_BY_BACKEND = { codex: 45000, claude: 20000 };
+  const HANDSHAKE_MS_BY_BACKEND = { codex: 45000, gemini: 45000, claude: 20000 };
   function handshakeMs() {
     return HANDSHAKE_MS_BY_BACKEND[backendNow()] ?? 20000;
   }
@@ -4919,7 +4937,7 @@ function buildPanel() {
   // ChatGPT). Clicking one asks the pack to ensure that backend's orchestrator is
   // running and returns the bridge URL to connect to — the user never types a
   // port. Populated from GET /comfyui_mcp_panel/backends when settings open.
-  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT" };
+  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini" };
   const backendLabel = document.createElement("label");
   backendLabel.className = "cmcp-label";
   backendLabel.textContent = "Agent backend";
@@ -4951,7 +4969,7 @@ function buildPanel() {
   // not-ready hints survive a reconnect.
   const backendReady = {};
   // Short per-provider hint shown under each provider row in the popup.
-  const BACKEND_HINTS = { claude: "Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)" };
+  const BACKEND_HINTS = { claude: "Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash" };
 
   // Hint for a provider that exists but isn't usable yet — distinguishes
   // "install the CLI" from "sign in". Empty when ready or readiness is unknown.
@@ -4960,7 +4978,9 @@ function buildPanel() {
     const r = backendReady[b.backend] || b; // durable readiness survives chip repaints
     if (r.ready !== false) return "";
     if (r.cli === false) return `${BACKEND_LABELS[b.backend] || b.backend} CLI not installed`;
-    return b.backend === "codex" ? "Not signed in — run: codex login" : "Not signed in — run: claude auth login";
+    if (b.backend === "codex") return "Not signed in — run: codex login";
+    if (b.backend === "gemini") return "Not signed in — run: gemini (then sign in with Google)";
+    return "Not signed in — run: claude auth login";
   }
 
   function renderBackendChips(backends) {
@@ -5163,6 +5183,7 @@ function buildPanel() {
   const PROVIDER_SETUP = {
     claude: { label: "Claude", install: "npm i -g @anthropic-ai/claude-code", login: "claude auth login" },
     codex: { label: "ChatGPT", install: "npm i -g @openai/codex", login: "codex login" },
+    gemini: { label: "Gemini", install: "npm i -g @google/gemini-cli", login: "gemini" },
   };
   let anyReady = false;
   let autoPickDone = false; // auto-switch + note fires at most once per panel mount
@@ -5189,9 +5210,9 @@ function buildPanel() {
     const sub = document.createElement("div");
     sub.className = "cmcp-onboard-sub";
     sub.textContent =
-      "The agent runs on your own Claude or ChatGPT subscription — no API keys. Set up at least one (Node ≥ 22 required), then click Connect.";
+      "The agent runs on your own Claude, ChatGPT, or Gemini subscription — no API keys. Set up at least one (Node ≥ 22 required), then click Connect.";
     onboard.append(title, sub);
-    for (const id of ["claude", "codex"]) {
+    for (const id of ["claude", "codex", "gemini"]) {
       const meta = PROVIDER_SETUP[id];
       const st = list.find((b) => b.backend === id) || {};
       const col = document.createElement("div");
@@ -7947,7 +7968,7 @@ function buildPanel() {
   // backend's handshake window (handshakeMs()) so a healthy slow reload completes
   // on its own backoff before the guard releases — Codex's app-server handshake is
   // 45s, so its guard is ~50s; Claude keeps 28s (still > its 20s handshake).
-  const SOFT_RELOAD_GUARD_MS_BY_BACKEND = { codex: 50000, claude: 28000 };
+  const SOFT_RELOAD_GUARD_MS_BY_BACKEND = { codex: 50000, gemini: 50000, claude: 28000 };
   function softReloadGuardMs() {
     return SOFT_RELOAD_GUARD_MS_BY_BACKEND[selectedBackend] ?? 28000;
   }
@@ -7964,7 +7985,7 @@ function buildPanel() {
   // normal cold-start handshake (handshakeMs()) so a healthy-but-slow reload is
   // never pre-empted — Codex (45s handshake) escalates at ~40s, comfortably under
   // its ~50s guard; Claude keeps 11s (under its 28s guard and > its 20s handshake).
-  const SOFT_RELOAD_ESCALATE_MS_BY_BACKEND = { codex: 40000, claude: 11000 };
+  const SOFT_RELOAD_ESCALATE_MS_BY_BACKEND = { codex: 40000, gemini: 40000, claude: 11000 };
   function softReloadEscalateMs() {
     return SOFT_RELOAD_ESCALATE_MS_BY_BACKEND[selectedBackend] ?? 11000;
   }
@@ -8035,7 +8056,7 @@ function buildPanel() {
         respawnGaveUpNoticed = true;
         appendSystem(
           "⚠ The panel agent keeps failing to start. Check you're signed in " +
-            "(run `claude` once, or `codex login` for Codex), then click Connect.",
+            "(run `claude` once, `codex login` for Codex, or `gemini` for Gemini), then click Connect.",
         );
       }
       return false;

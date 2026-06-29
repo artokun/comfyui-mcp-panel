@@ -47,12 +47,13 @@ _BRIDGE_PORT = int(os.environ.get("COMFYUI_MCP_BRIDGE_PORT", "9180"))
 
 # Backend -> bridge port map. "claude" keeps today's default (9180) so the
 # existing no-backend path is byte-for-byte unchanged; "codex" gets its own port
-# so both can run side by side. Extend this dict to add backends. The default
-# port (COMFYUI_MCP_BRIDGE_PORT, normally 9180) is treated as the claude port so
-# a custom override still maps to "claude".
+# (9181) and "gemini" the next (9182) so all can run side by side. Extend this
+# dict to add backends. The default port (COMFYUI_MCP_BRIDGE_PORT, normally 9180)
+# is treated as the claude port so a custom override still maps to "claude".
 _BACKEND_PORTS = {
     "claude": _BRIDGE_PORT,
     "codex": 9181,
+    "gemini": 9182,
 }
 _DEFAULT_BACKEND = "claude"
 
@@ -67,6 +68,7 @@ def _backend_port(backend):
 _PROVIDER_CLIS = {
     "claude": ("claude", "claude.cmd", "claude.exe"),
     "codex": ("codex", "codex.cmd", "codex.exe"),
+    "gemini": ("gemini", "gemini.cmd", "gemini.exe"),
 }
 
 
@@ -95,6 +97,16 @@ def _provider_auth(provider):
         return False
     if provider == "codex":
         return os.path.isfile(os.path.join(home, ".codex", "auth.json"))
+    if provider == "gemini":
+        # The gemini CLI caches the browser-based Google OAuth (Code Assist) login
+        # at <home>/.gemini/oauth_creds.json. No API key — a present creds file is
+        # the on-disk signal that a Google login exists, mirroring codex's auth.json.
+        # The CLI roots its config at GEMINI_CLI_HOME when that env var is set (used
+        # to isolate state in shared/enterprise setups), else the user home — honor
+        # the override or a GEMINI_CLI_HOME user is falsely reported as not-signed-in
+        # even though the spawned CLI authenticates fine.
+        gemini_home = os.environ.get("GEMINI_CLI_HOME") or home
+        return os.path.isfile(os.path.join(gemini_home, ".gemini", "oauth_creds.json"))
     return False
 
 
