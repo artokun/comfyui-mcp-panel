@@ -1829,8 +1829,9 @@ function summarizeGroup(graph, g) {
 }
 
 /** Resolve a group by numeric id (matching summarizeGroup's id) or a
- *  case-insensitive title substring. Returns the LGraphGroup or null. */
-function resolveGroup(graph, ref) {
+ *  case-insensitive title substring. Returns the LGraphGroup or null.
+ *  (Distinct from resolveGroup() above, which is id-only and throws.) */
+function resolveGroupRef(graph, ref) {
   const groups = graph._groups ?? [];
   if (ref == null || ref === "") return null;
   const asNum = Number(ref);
@@ -2832,7 +2833,7 @@ const GRAPH_TOOL_EXECUTORS = {
     if (typeof graph.convertToSubgraph !== "function") {
       throw new Error("convertToSubgraph unavailable on this frontend");
     }
-    const g = resolveGroup(graph, group);
+    const g = resolveGroupRef(graph, group);
     if (!g) {
       throw new Error(
         `no group matching "${group}" — list groups via panel_get_graph (each has id, title, node_ids)`,
