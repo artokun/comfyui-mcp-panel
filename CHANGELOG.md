@@ -6,6 +6,28 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-06-29
+
+### Added
+
+- **Graph navigation executors** (for the panel agent's new read tools):
+  - `graph_outline` — a compact, dependency-ordered TEXT map of the open graph
+    (topologically sorted, each node with its key widgets + `←`/`→` wiring, plus a
+    groups index). Built to be read top-to-bottom by an LLM instead of dumping JSON.
+  - `graph_find_nodes` — search every node on the open graph by type, title, input/
+    output port, widget name, widget value, `is_output`, `is_subgraph`, or mode (or a
+    free-text query across all), returning enriched matches with a `matched_on` reason.
+  - `graph_subgraph_group` — wrap an existing group's nodes into one subgraph node in a
+    single step (resolves the group by title/id and computes its geometric membership).
+- `graph_get_state` groups now report their member `node_ids` (groups are geometric —
+  they don't own nodes), so a region can be wrapped/toggled without reconstructing
+  membership by hand.
+
+### Fixed
+
+- Agent-facing error messages now name agent tools (`panel_get_graph`/`panel_search_nodes`)
+  instead of the internal `graph_get_state` command.
+
 ## [0.4.5] - 2026-06-29
 
 ### Added

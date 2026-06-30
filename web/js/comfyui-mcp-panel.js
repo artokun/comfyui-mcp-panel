@@ -1586,6 +1586,13 @@ function summarizeNode(node) {
   return summary;
 }
 
+/** The node TYPE's human description (from its ComfyUI node def), used by
+ *  graph_find_nodes so the agent can search/filter on what a node does. Empty
+ *  string when the frontend doesn't carry a description for this type. */
+function nodeDescription(node) {
+  return String(node?.constructor?.nodeData?.description ?? node?.description ?? "");
+}
+
 function resolveNode(graph, nodeId) {
   const node = graph.getNodeById(Number(nodeId));
   if (!node) throw new Error(`No node with id ${nodeId} in the current graph`);
@@ -1715,13 +1722,67 @@ function boundsAroundNodes(nodes, pad = 30, titlePad = 70) {
 /** Compact JSON-friendly view of a group box. */
 function summarizeGroup(graph, g) {
   const b = g._bounding ?? [g.pos?.[0] ?? 0, g.pos?.[1] ?? 0, g.size?.[0] ?? 0, g.size?.[1] ?? 0];
+  // LiteGraph groups do NOT own their nodes — membership is purely geometric
+  // (which nodes sit inside the group box). Recompute it so the agent gets the
+  // actual member node_ids (to wrap a group into a subgraph, toggle it as a unit,
+  // etc.) instead of reconstructing membership from coordinates by hand.
+  g.recomputeInsideNodes?.();
+  const memberIds = (g._nodes ?? []).map((n) => n.id);
   return {
     id: g.id != null ? g.id : (graph._groups ?? []).indexOf(g),
     title: g.title ?? "",
     color: g.color ?? null,
     bounding: [Math.round(b[0]), Math.round(b[1]), Math.round(b[2]), Math.round(b[3])],
-    node_count: (g._nodes ?? []).length,
+    node_count: memberIds.length,
+    node_ids: memberIds,
   };
+}
+
+/** Resolve a group by numeric id (matching summarizeGroup's id) or a
+ *  case-insensitive title substring. Returns the LGraphGroup or null. */
+function resolveGroup(graph, ref) {
+  const groups = graph._groups ?? [];
+  if (ref == null || ref === "") return null;
+  const asNum = Number(ref);
+  if (Number.isFinite(asNum) && String(ref).trim() !== "") {
+    const byId = groups.find((g, i) => (g.id != null ? g.id : i) === asNum);
+    if (byId) return byId;
+  }
+  const lc = String(ref).toLowerCase();
+  return groups.find((g) => String(g.title ?? "").toLowerCase().includes(lc)) ?? null;
+}
+
+/** Dependency order (Kahn topological sort) so a reader following the list
+ *  top→down follows the data flow: sources first, sinks last. Nodes left out by
+ *  a cycle (shouldn't happen in a ComfyUI DAG) are appended in original order. */
+function topoSortNodes(nodes, links) {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const indeg = new Map(nodes.map((n) => [n.id, 0]));
+  const adj = new Map(nodes.map((n) => [n.id, []]));
+  for (const n of nodes) {
+    for (const inp of n.inputs ?? []) {
+      if (inp.link == null) continue;
+      const l = links[inp.link];
+      if (!l || !byId.has(l.origin_id)) continue;
+      adj.get(l.origin_id).push(n.id);
+      indeg.set(n.id, (indeg.get(n.id) ?? 0) + 1);
+    }
+  }
+  const queue = nodes.filter((n) => (indeg.get(n.id) ?? 0) === 0).map((n) => n.id);
+  const out = [];
+  const seen = new Set();
+  while (queue.length) {
+    const id = queue.shift();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(byId.get(id));
+    for (const m of adj.get(id) ?? []) {
+      indeg.set(m, (indeg.get(m) ?? 0) - 1);
+      if ((indeg.get(m) ?? 0) <= 0) queue.push(m);
+    }
+  }
+  for (const n of nodes) if (!seen.has(n.id)) out.push(n);
+  return out;
 }
 
 /** Describe a subgraph's input/output "rail" nodes (the boundary I/O proxies)
@@ -1810,6 +1871,200 @@ const GRAPH_TOOL_EXECUTORS = {
       nodes,
       ...(groups.length ? { groups } : {}),
       ...(inSubgraph ? { rails: describeRails(graph) } : {}),
+    };
+  },
+
+  // A compact, dependency-ordered TEXT outline of the open graph — built to be
+  // read top→down by an LLM (sources first, sinks last). Each node is one block:
+  //   id  Type "title" [mode] [OUTPUT] · group:X   widget=value …
+  //      ← inputs as source_node.output_name
+  //      → outputs as target_node.input_name
+  // Far cheaper to read than the full JSON state, and shows the WIRING (which the
+  // raw node dump makes you reconstruct). Read-only.
+  graph_outline() {
+    const { graph } = getGraphCtx();
+    const nodes = graph._nodes ?? [];
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const links = graph.links ?? {};
+
+    // Geometric group membership → node id → group titles, plus a title→ids index.
+    const groups = graph._groups ?? [];
+    const groupOf = new Map();
+    const groupLines = [];
+    for (const g of groups) {
+      g.recomputeInsideNodes?.();
+      const ids = (g._nodes ?? []).map((n) => n.id);
+      const tag = { 2: " [mute]", 4: " [bypass]" }[g.mode] ?? "";
+      groupLines.push(`  "${g.title ?? ""}"${tag} → ${ids.join(",") || "(empty)"}`);
+      for (const id of ids) {
+        if (!groupOf.has(id)) groupOf.set(id, []);
+        groupOf.get(id).push(g.title ?? "");
+      }
+    }
+
+    const fmtVal = (v) => {
+      const s = String(typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ");
+      return s.length > 60 ? s.slice(0, 57) + "…" : s;
+    };
+    const modeTag = (n) => ({ 2: " [mute]", 4: " [bypass]" }[n.mode] ?? "");
+    const outTag = (n) => (n.constructor?.nodeData?.output_node ? " [OUTPUT]" : "");
+
+    const lines = [];
+    for (const n of topoSortNodes(nodes, links)) {
+      const title = n.title && n.title !== n.type ? ` "${n.title}"` : "";
+      const grps = groupOf.get(n.id);
+      const groupTag = grps?.length ? ` · group:${grps.join("/")}` : "";
+      const widgets = (n.widgets ?? [])
+        .filter((w) => w && typeof w.name === "string")
+        .map((w) => `${w.name}=${fmtVal(w.value)}`)
+        .join(" ");
+      lines.push(
+        `${n.id}  ${n.type}${title}${modeTag(n)}${outTag(n)}${groupTag}${widgets ? "  " + widgets : ""}`,
+      );
+      const ins = (n.inputs ?? [])
+        .map((inp) => {
+          if (inp.link == null) return null;
+          const l = links[inp.link];
+          if (!l) return null;
+          const src = byId.get(l.origin_id);
+          return `${l.origin_id}.${src?.outputs?.[l.origin_slot]?.name ?? l.origin_slot}`;
+        })
+        .filter(Boolean);
+      if (ins.length) lines.push(`     ← ${ins.join(", ")}`);
+      const outs = [];
+      for (const out of n.outputs ?? []) {
+        for (const lid of out.links ?? []) {
+          const l = links[lid];
+          if (!l) continue;
+          const tgt = byId.get(l.target_id);
+          outs.push(`${l.target_id}.${tgt?.inputs?.[l.target_slot]?.name ?? l.target_slot}`);
+        }
+      }
+      if (outs.length) lines.push(`     → ${outs.join(", ")}`);
+    }
+
+    const header = `${nodes.length} nodes · ${groups.length} group(s) · viewing: ${describeActiveGraph(graph)}`;
+    const outline =
+      header +
+      (groupLines.length ? `\n\nGROUPS (title → member node ids):\n${groupLines.join("\n")}` : "") +
+      `\n\nNODES (data flows top→down; ← inputs from, → outputs to):\n${lines.join("\n")}`;
+
+    return {
+      node_count: nodes.length,
+      group_count: groups.length,
+      viewing: describeActiveGraph(graph),
+      outline,
+    };
+  },
+
+  // Pinpoint nodes in the graph the user is viewing WITHOUT dumping the whole
+  // thing. Searches EVERY node (not capped like graph_get_state), applies the
+  // filters, and returns only matches — each the same rich summary as
+  // graph_get_state plus the node's `description` and a `matched_on` list saying
+  // why it hit. Targeted filters (type/title/input/output/widget/widget_value/
+  // is_output/is_subgraph/mode) are ANDed; the free-text `query` ORs across
+  // type, title, description, widget names+values, and port names+types.
+  graph_find_nodes({
+    query,
+    type,
+    title,
+    input,
+    output,
+    widget,
+    widget_value,
+    is_output,
+    is_subgraph,
+    mode,
+    limit,
+  } = {}) {
+    const { graph } = getGraphCtx();
+    const cap = Math.min(Math.max(Number(limit ?? 40), 1), 200);
+    const lc = (s) => String(s ?? "").toLowerCase();
+    const has = (v) => typeof v === "string" && v.trim() !== "";
+    const modeNum = mode ? { active: 0, mute: 2, bypass: 4 }[mode] : undefined;
+    const q = has(query) ? lc(query) : null;
+
+    const nodes = graph._nodes ?? [];
+    const matches = [];
+    for (const node of nodes) {
+      const summary = summarizeNode(node);
+      const desc = nodeDescription(node);
+      const widgetEntries = Object.entries(summary.widgets ?? {});
+      const matchedOn = [];
+
+      // Targeted filters — ANDed. Every one provided must hit, or skip the node.
+      if (has(type)) {
+        if (!lc(node.type).includes(lc(type))) continue;
+        matchedOn.push(`type:${node.type}`);
+      }
+      if (has(title)) {
+        if (!lc(node.title).includes(lc(title))) continue;
+        matchedOn.push(`title:${node.title}`);
+      }
+      if (has(input)) {
+        const hit = (node.inputs ?? []).find(
+          (i) => lc(i.name).includes(lc(input)) || lc(i.type).includes(lc(input)),
+        );
+        if (!hit) continue;
+        matchedOn.push(`input:${hit.name}(${hit.type})`);
+      }
+      if (has(output)) {
+        const hit = (node.outputs ?? []).find(
+          (o) => lc(o.name).includes(lc(output)) || lc(o.type).includes(lc(output)),
+        );
+        if (!hit) continue;
+        matchedOn.push(`output:${hit.name}(${hit.type})`);
+      }
+      if (has(widget)) {
+        const hit = widgetEntries.find(([n]) => lc(n).includes(lc(widget)));
+        if (!hit) continue;
+        matchedOn.push(`widget:${hit[0]}`);
+      }
+      if (has(widget_value)) {
+        const hit = widgetEntries.find(([, v]) => lc(JSON.stringify(v)).includes(lc(widget_value)));
+        if (!hit) continue;
+        matchedOn.push(`widget_value:${hit[0]}=${String(hit[1]).slice(0, 60)}`);
+      }
+      if (is_output === true && !summary.is_output) continue;
+      if (is_output === false && summary.is_output) continue;
+      if (is_subgraph === true && !summary.is_subgraph) continue;
+      if (is_subgraph === false && summary.is_subgraph) continue;
+      if (modeNum !== undefined && (node.mode ?? 0) !== modeNum) continue;
+
+      // Free-text query — ORed across every searchable field. matched_on records
+      // which fields hit so the agent sees WHY a node matched.
+      if (q) {
+        const hits = [];
+        if (lc(node.type).includes(q)) hits.push(`type:${node.type}`);
+        if (lc(node.title).includes(q)) hits.push(`title:${node.title}`);
+        if (lc(desc).includes(q)) hits.push("description");
+        for (const [n, v] of widgetEntries) {
+          if (lc(n).includes(q)) hits.push(`widget:${n}`);
+          else if (lc(JSON.stringify(v)).includes(q))
+            hits.push(`widget_value:${n}=${String(v).slice(0, 60)}`);
+        }
+        for (const i of node.inputs ?? [])
+          if (lc(i.name).includes(q) || lc(i.type).includes(q)) hits.push(`input:${i.name}(${i.type})`);
+        for (const o of node.outputs ?? [])
+          if (lc(o.name).includes(q) || lc(o.type).includes(q)) hits.push(`output:${o.name}(${o.type})`);
+        if (!hits.length) continue;
+        matchedOn.push(...hits);
+      }
+
+      matches.push({
+        ...summary,
+        ...(desc ? { description: desc.slice(0, 240) } : {}),
+        ...(matchedOn.length ? { matched_on: matchedOn } : {}),
+      });
+      if (matches.length >= cap) break;
+    }
+
+    return {
+      viewing: describeActiveGraph(graph),
+      total: nodes.length,
+      count: matches.length,
+      truncated: matches.length >= cap,
+      matches,
     };
   },
 
@@ -2473,6 +2728,46 @@ const GRAPH_TOOL_EXECUTORS = {
       subgraph: {
         node_id: res?.node?.id ?? null,
         name: res?.subgraph?.name ?? null,
+        from_nodes: ns.map((n) => n.id),
+      },
+    };
+  },
+
+  // Wrap an existing GROUP's nodes into a subgraph in one step. Resolves the
+  // group (by id or title), recomputes its geometric membership, then runs the
+  // same convertToSubgraph path as graph_create_subgraph. This is how a region
+  // like a "REPLACEMENT MODE" group becomes one toggleable subgraph node.
+  graph_subgraph_group({ group }) {
+    const { graph, canvas } = getGraphCtx();
+    if (typeof graph.convertToSubgraph !== "function") {
+      throw new Error("convertToSubgraph unavailable on this frontend");
+    }
+    const g = resolveGroup(graph, group);
+    if (!g) {
+      throw new Error(
+        `no group matching "${group}" — list groups via panel_get_graph (each has id, title, node_ids)`,
+      );
+    }
+    g.recomputeInsideNodes?.();
+    const ns = [...(g._nodes ?? [])];
+    if (!ns.length) {
+      throw new Error(`group "${g.title}" has no nodes inside its box to wrap into a subgraph`);
+    }
+    if (typeof canvas.selectItems === "function") canvas.selectItems(ns);
+    else if (typeof canvas.selectNodes === "function") canvas.selectNodes(ns);
+    graph.beforeChange?.();
+    let res;
+    try {
+      res = graph.convertToSubgraph(canvas.selectedItems);
+    } finally {
+      graph.afterChange?.();
+    }
+    graph.setDirtyCanvas?.(true, true);
+    return {
+      subgraph: {
+        node_id: res?.node?.id ?? null,
+        name: res?.subgraph?.name ?? null,
+        from_group: g.title ?? null,
         from_nodes: ns.map((n) => n.id),
       },
     };
@@ -4725,6 +5020,11 @@ function describeCommand(cmd, msg, reply) {
             text: r.error ? "Run blocked" : "Run blocked by node errors",
             detail: r.error ?? (r.node_errors ? JSON.stringify(r.node_errors).slice(0, 300) : undefined),
           };
+    case "graph_find_nodes":
+      return {
+        icon: "pi-search",
+        text: `Found ${r.count}${r.truncated ? "+" : ""} of ${r.total} node${r.total === 1 ? "" : "s"}`,
+      };
     case "graph_get_errors":
       return {
         icon: "pi-info-circle",
