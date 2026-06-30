@@ -2034,7 +2034,9 @@ const GRAPH_TOOL_EXECUTORS = {
       if (outs.length) lines.push(`     → ${outs.join(", ")}`);
     }
 
-    const header = `${nodes.length} nodes · ${groups.length} group(s) · viewing: ${describeActiveGraph(graph)}`;
+    const va = describeActiveGraph(graph);
+    const viewingStr = va && va.scope === "subgraph" ? `subgraph "${va.title ?? ""}"` : (va?.scope ?? "root");
+    const header = `${nodes.length} nodes · ${groups.length} group(s) · viewing: ${viewingStr}`;
     const outline =
       header +
       (groupLines.length ? `\n\nGROUPS (title → member node ids):\n${groupLines.join("\n")}` : "") +
