@@ -6,6 +6,37 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-06-29
+
+### Added
+
+- **Graph navigation executors** (for the panel agent's new read tools):
+  - `graph_outline` — a compact, dependency-ordered TEXT map of the open graph
+    (topologically sorted, each node with its key widgets + `←`/`→` wiring, plus a
+    groups index). Built to be read top-to-bottom by an LLM instead of dumping JSON.
+  - `graph_find_nodes` — search every node on the open graph by type, title, input/
+    output port, widget name, widget value, `is_output`, `is_subgraph`, or mode (or a
+    free-text query across all), returning enriched matches with a `matched_on` reason.
+  - `graph_subgraph_group` — wrap an existing group's nodes into one subgraph node in a
+    single step (resolves the group by title/id and computes its geometric membership).
+- `graph_get_state` groups now report their member `node_ids` (groups are geometric —
+  they don't own nodes), so a region can be wrapped/toggled without reconstructing
+  membership by hand.
+- **Manual-edit awareness.** The graph the agent leaves at each turn's end is snapshotted;
+  when the user sends their next message, the live graph is diffed against it and a compact
+  "⟳ MANUAL CANVAS CHANGES" list (node add/remove, mode bypass/mute, widget-value, title,
+  and connection changes) is prepended to the agent's input — so a hand edit between turns
+  (e.g. bypassing a node) never catches the agent unaware. Visible chat text is untouched.
+
+### Fixed
+
+- Agent-facing error messages now name agent tools (`panel_get_graph`/`panel_search_nodes`)
+  instead of the internal `graph_get_state` command.
+- `graph_find_nodes` no longer throws on exotic widget values — widget stringification is
+  guarded (a BigInt or circular/custom value would have failed the whole search call).
+- `graph_outline` topological sort uses an index cursor instead of `Array.shift()`, keeping
+  it linear (was O(n²)) on large/flat graphs.
+
 ## [0.4.5] - 2026-06-29
 
 ### Added

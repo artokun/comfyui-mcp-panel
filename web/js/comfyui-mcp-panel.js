@@ -1508,6 +1508,96 @@ function revertGraphToLastSnapshot() {
   return restoreSnapshot(graphSnapshots[graphSnapshots.length - 1]);
 }
 
+// ---- manual-edit awareness --------------------------------------------------
+// At each turn END we snapshot the graph the agent left behind (lastAgentGraph).
+// When the user sends their next message we diff the LIVE graph against it — any
+// difference is a MANUAL edit (the agent only acts during its own turn) — and
+// prepend a compact change-list to the agent's input so it isn't caught unaware
+// of edits the user made by hand (a bypassed node, a tweaked widget, a rewire).
+let lastAgentGraph = null;
+
+const MODE_NAME = { 0: "active", 2: "mute", 4: "bypass" };
+const modeName = (m) => MODE_NAME[m] ?? `mode${m ?? 0}`;
+// Serialized link = [id, origin_id, origin_slot, target_id, target_slot, type].
+// Compare by ENDPOINTS (link ids churn on every edit), not by id.
+const linkKey = (l) => `${l[1]}:${l[2]}->${l[3]}:${l[4]}`;
+function widgetName(liveGraph, nodeId, i) {
+  try {
+    const w = liveGraph?.getNodeById?.(Number(nodeId))?.widgets?.[i];
+    if (w && w.name) return w.name;
+  } catch {}
+  return `#${i}`;
+}
+function shortVal(v) {
+  const s = String(typeof v === "string" ? v : (JSON.stringify(v) ?? "")).replace(/\s+/g, " ");
+  return s.length > 40 ? s.slice(0, 37) + "…" : s;
+}
+
+// Diff two serialized root graphs (prev → curr) into compact, LLM-readable lines.
+// Reports node add/remove, mode (bypass/mute) changes, widget-value changes, title
+// changes, and connection add/remove. Ignores pure moves/resizes/recolors (noise).
+function diffGraphsForAgent(prev, curr, liveGraph) {
+  if (!prev || !curr) return [];
+  const lines = [];
+  const P = new Map((prev.nodes || []).map((n) => [n.id, n]));
+  const C = new Map((curr.nodes || []).map((n) => [n.id, n]));
+  const label = (n) => `${n.id} ${n.type}${n.title && n.title !== n.type ? ` "${n.title}"` : ""}`;
+  for (const [id, n] of C) if (!P.has(id)) lines.push(`+ added ${label(n)}`);
+  for (const [id, n] of P) if (!C.has(id)) lines.push(`− removed ${label(n)}`);
+  for (const [id, c] of C) {
+    const p = P.get(id);
+    if (!p) continue;
+    if ((c.mode ?? 0) !== (p.mode ?? 0))
+      lines.push(`• ${label(c)}: mode ${modeName(p.mode)} → ${modeName(c.mode)}`);
+    if ((p.title || "") !== (c.title || ""))
+      lines.push(`• ${id}: title "${p.title ?? ""}" → "${c.title ?? ""}"`);
+    const pv = p.widgets_values, cv = c.widgets_values;
+    if (JSON.stringify(pv) !== JSON.stringify(cv)) {
+      if (Array.isArray(pv) && Array.isArray(cv)) {
+        for (let i = 0; i < Math.max(pv.length, cv.length); i++) {
+          if (JSON.stringify(pv[i]) === JSON.stringify(cv[i])) continue;
+          if ((cv[i] && typeof cv[i] === "object") || (pv[i] && typeof pv[i] === "object")) continue; // skip nested preview blobs
+          lines.push(`• ${label(c)}: ${widgetName(liveGraph, id, i)} ${shortVal(pv[i])} → ${shortVal(cv[i])}`);
+        }
+      } else {
+        lines.push(`• ${label(c)}: widgets changed`);
+      }
+    }
+  }
+  const PL = new Set((prev.links || []).map(linkKey));
+  const CL = new Set((curr.links || []).map(linkKey));
+  for (const l of curr.links || []) if (!PL.has(linkKey(l))) lines.push(`+ wire ${l[1]} → ${l[3]} (${l[5] || "?"})`);
+  for (const l of prev.links || []) if (!CL.has(linkKey(l))) lines.push(`− wire ${l[1]} → ${l[3]} (${l[5] || "?"})`);
+  return lines;
+}
+
+// Build the banner to prepend to a user turn (empty string when nothing changed).
+// Consumes the baseline (resets it to the current graph) so the same edits aren't
+// re-reported if the user sends twice without the agent acting in between.
+function manualChangeBanner() {
+  if (!lastAgentGraph) return "";
+  let curr, live;
+  try {
+    live = getGraphCtx().rootGraph;
+    curr = live.serialize();
+  } catch {
+    return "";
+  }
+  const lines = diffGraphsForAgent(lastAgentGraph, curr, live);
+  lastAgentGraph = curr;
+  if (!lines.length) return "";
+  const MAX = 40;
+  const shown = lines.slice(0, MAX);
+  const more = lines.length > MAX ? `\n  …and ${lines.length - MAX} more change(s)` : "";
+  return (
+    `⟳ MANUAL CANVAS CHANGES since your last turn — the user edited the graph directly:\n  ` +
+    shown.join("\n  ") +
+    more +
+    `\nTreat the canvas as being in THIS state now (it overrides what you remember); ` +
+    `re-read with panel_graph_outline if the changes are substantial.\n\n`
+  );
+}
+
 // Restore the canvas to the snapshot captured before the message with this mid
 // (the per-message rollback). Returns the snapshot or null.
 function revertGraphSnapshotByMid(mid) {
@@ -1584,6 +1674,13 @@ function summarizeNode(node) {
       node.subgraph._nodes?.length ?? node.subgraph.nodes?.length ?? 0;
   }
   return summary;
+}
+
+/** The node TYPE's human description (from its ComfyUI node def), used by
+ *  graph_find_nodes so the agent can search/filter on what a node does. Empty
+ *  string when the frontend doesn't carry a description for this type. */
+function nodeDescription(node) {
+  return String(node?.constructor?.nodeData?.description ?? node?.description ?? "");
 }
 
 function resolveNode(graph, nodeId) {
@@ -1715,13 +1812,71 @@ function boundsAroundNodes(nodes, pad = 30, titlePad = 70) {
 /** Compact JSON-friendly view of a group box. */
 function summarizeGroup(graph, g) {
   const b = g._bounding ?? [g.pos?.[0] ?? 0, g.pos?.[1] ?? 0, g.size?.[0] ?? 0, g.size?.[1] ?? 0];
+  // LiteGraph groups do NOT own their nodes — membership is purely geometric
+  // (which nodes sit inside the group box). Recompute it so the agent gets the
+  // actual member node_ids (to wrap a group into a subgraph, toggle it as a unit,
+  // etc.) instead of reconstructing membership from coordinates by hand.
+  g.recomputeInsideNodes?.();
+  const memberIds = (g._nodes ?? []).map((n) => n.id);
   return {
     id: g.id != null ? g.id : (graph._groups ?? []).indexOf(g),
     title: g.title ?? "",
     color: g.color ?? null,
     bounding: [Math.round(b[0]), Math.round(b[1]), Math.round(b[2]), Math.round(b[3])],
-    node_count: (g._nodes ?? []).length,
+    node_count: memberIds.length,
+    node_ids: memberIds,
   };
+}
+
+/** Resolve a group by numeric id (matching summarizeGroup's id) or a
+ *  case-insensitive title substring. Returns the LGraphGroup or null.
+ *  (Distinct from resolveGroup() above, which is id-only and throws.) */
+function resolveGroupRef(graph, ref) {
+  const groups = graph._groups ?? [];
+  if (ref == null || ref === "") return null;
+  const asNum = Number(ref);
+  if (Number.isFinite(asNum) && String(ref).trim() !== "") {
+    const byId = groups.find((g, i) => (g.id != null ? g.id : i) === asNum);
+    if (byId) return byId;
+  }
+  const lc = String(ref).toLowerCase();
+  return groups.find((g) => String(g.title ?? "").toLowerCase().includes(lc)) ?? null;
+}
+
+/** Dependency order (Kahn topological sort) so a reader following the list
+ *  top→down follows the data flow: sources first, sinks last. Nodes left out by
+ *  a cycle (shouldn't happen in a ComfyUI DAG) are appended in original order. */
+function topoSortNodes(nodes, links) {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const indeg = new Map(nodes.map((n) => [n.id, 0]));
+  const adj = new Map(nodes.map((n) => [n.id, []]));
+  for (const n of nodes) {
+    for (const inp of n.inputs ?? []) {
+      if (inp.link == null) continue;
+      const l = links[inp.link];
+      if (!l || !byId.has(l.origin_id)) continue;
+      adj.get(l.origin_id).push(n.id);
+      indeg.set(n.id, (indeg.get(n.id) ?? 0) + 1);
+    }
+  }
+  const queue = nodes.filter((n) => (indeg.get(n.id) ?? 0) === 0).map((n) => n.id);
+  const out = [];
+  const seen = new Set();
+  // Index cursor instead of queue.shift() — shift() is O(n), making Kahn's loop
+  // O(n^2) on large/flat graphs; cursor keeps it linear.
+  let qi = 0;
+  while (qi < queue.length) {
+    const id = queue[qi++];
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(byId.get(id));
+    for (const m of adj.get(id) ?? []) {
+      indeg.set(m, (indeg.get(m) ?? 0) - 1);
+      if ((indeg.get(m) ?? 0) <= 0) queue.push(m);
+    }
+  }
+  for (const n of nodes) if (!seen.has(n.id)) out.push(n);
+  return out;
 }
 
 /** Describe a subgraph's input/output "rail" nodes (the boundary I/O proxies)
@@ -1810,6 +1965,211 @@ const GRAPH_TOOL_EXECUTORS = {
       nodes,
       ...(groups.length ? { groups } : {}),
       ...(inSubgraph ? { rails: describeRails(graph) } : {}),
+    };
+  },
+
+  // A compact, dependency-ordered TEXT outline of the open graph — built to be
+  // read top→down by an LLM (sources first, sinks last). Each node is one block:
+  //   id  Type "title" [mode] [OUTPUT] · group:X   widget=value …
+  //      ← inputs as source_node.output_name
+  //      → outputs as target_node.input_name
+  // Far cheaper to read than the full JSON state, and shows the WIRING (which the
+  // raw node dump makes you reconstruct). Read-only.
+  graph_outline() {
+    const { graph } = getGraphCtx();
+    const nodes = graph._nodes ?? [];
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const links = graph.links ?? {};
+
+    // Geometric group membership → node id → group titles, plus a title→ids index.
+    const groups = graph._groups ?? [];
+    const groupOf = new Map();
+    const groupLines = [];
+    for (const g of groups) {
+      g.recomputeInsideNodes?.();
+      const ids = (g._nodes ?? []).map((n) => n.id);
+      const tag = { 2: " [mute]", 4: " [bypass]" }[g.mode] ?? "";
+      groupLines.push(`  "${g.title ?? ""}"${tag} → ${ids.join(",") || "(empty)"}`);
+      for (const id of ids) {
+        if (!groupOf.has(id)) groupOf.set(id, []);
+        groupOf.get(id).push(g.title ?? "");
+      }
+    }
+
+    const fmtVal = (v) => {
+      const s = String(typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ");
+      return s.length > 60 ? s.slice(0, 57) + "…" : s;
+    };
+    const modeTag = (n) => ({ 2: " [mute]", 4: " [bypass]" }[n.mode] ?? "");
+    const outTag = (n) => (n.constructor?.nodeData?.output_node ? " [OUTPUT]" : "");
+
+    const lines = [];
+    for (const n of topoSortNodes(nodes, links)) {
+      const title = n.title && n.title !== n.type ? ` "${n.title}"` : "";
+      const grps = groupOf.get(n.id);
+      const groupTag = grps?.length ? ` · group:${grps.join("/")}` : "";
+      const widgets = (n.widgets ?? [])
+        .filter((w) => w && typeof w.name === "string")
+        .map((w) => `${w.name}=${fmtVal(w.value)}`)
+        .join(" ");
+      lines.push(
+        `${n.id}  ${n.type}${title}${modeTag(n)}${outTag(n)}${groupTag}${widgets ? "  " + widgets : ""}`,
+      );
+      const ins = (n.inputs ?? [])
+        .map((inp) => {
+          if (inp.link == null) return null;
+          const l = links[inp.link];
+          if (!l) return null;
+          const src = byId.get(l.origin_id);
+          return `${l.origin_id}.${src?.outputs?.[l.origin_slot]?.name ?? l.origin_slot}`;
+        })
+        .filter(Boolean);
+      if (ins.length) lines.push(`     ← ${ins.join(", ")}`);
+      const outs = [];
+      for (const out of n.outputs ?? []) {
+        for (const lid of out.links ?? []) {
+          const l = links[lid];
+          if (!l) continue;
+          const tgt = byId.get(l.target_id);
+          outs.push(`${l.target_id}.${tgt?.inputs?.[l.target_slot]?.name ?? l.target_slot}`);
+        }
+      }
+      if (outs.length) lines.push(`     → ${outs.join(", ")}`);
+    }
+
+    const va = describeActiveGraph(graph);
+    const viewingStr = va && va.scope === "subgraph" ? `subgraph "${va.title ?? ""}"` : (va?.scope ?? "root");
+    const header = `${nodes.length} nodes · ${groups.length} group(s) · viewing: ${viewingStr}`;
+    const outline =
+      header +
+      (groupLines.length ? `\n\nGROUPS (title → member node ids):\n${groupLines.join("\n")}` : "") +
+      `\n\nNODES (data flows top→down; ← inputs from, → outputs to):\n${lines.join("\n")}`;
+
+    return {
+      node_count: nodes.length,
+      group_count: groups.length,
+      viewing: describeActiveGraph(graph),
+      outline,
+    };
+  },
+
+  // Pinpoint nodes in the graph the user is viewing WITHOUT dumping the whole
+  // thing. Searches EVERY node (not capped like graph_get_state), applies the
+  // filters, and returns only matches — each the same rich summary as
+  // graph_get_state plus the node's `description` and a `matched_on` list saying
+  // why it hit. Targeted filters (type/title/input/output/widget/widget_value/
+  // is_output/is_subgraph/mode) are ANDed; the free-text `query` ORs across
+  // type, title, description, widget names+values, and port names+types.
+  graph_find_nodes({
+    query,
+    type,
+    title,
+    input,
+    output,
+    widget,
+    widget_value,
+    is_output,
+    is_subgraph,
+    mode,
+    limit,
+  } = {}) {
+    const { graph } = getGraphCtx();
+    const cap = Math.min(Math.max(Number(limit ?? 40), 1), 200);
+    const lc = (s) => String(s ?? "").toLowerCase();
+    // Safe stringify for widget values — a BigInt or circular/custom value would
+    // throw in JSON.stringify and fail the whole find call; fall back to String().
+    const safeJson = (v) => {
+      try {
+        return JSON.stringify(v) ?? String(v);
+      } catch {
+        return String(v);
+      }
+    };
+    const has = (v) => typeof v === "string" && v.trim() !== "";
+    const modeNum = mode ? { active: 0, mute: 2, bypass: 4 }[mode] : undefined;
+    const q = has(query) ? lc(query) : null;
+
+    const nodes = graph._nodes ?? [];
+    const matches = [];
+    for (const node of nodes) {
+      const summary = summarizeNode(node);
+      const desc = nodeDescription(node);
+      const widgetEntries = Object.entries(summary.widgets ?? {});
+      const matchedOn = [];
+
+      // Targeted filters — ANDed. Every one provided must hit, or skip the node.
+      if (has(type)) {
+        if (!lc(node.type).includes(lc(type))) continue;
+        matchedOn.push(`type:${node.type}`);
+      }
+      if (has(title)) {
+        if (!lc(node.title).includes(lc(title))) continue;
+        matchedOn.push(`title:${node.title}`);
+      }
+      if (has(input)) {
+        const hit = (node.inputs ?? []).find(
+          (i) => lc(i.name).includes(lc(input)) || lc(i.type).includes(lc(input)),
+        );
+        if (!hit) continue;
+        matchedOn.push(`input:${hit.name}(${hit.type})`);
+      }
+      if (has(output)) {
+        const hit = (node.outputs ?? []).find(
+          (o) => lc(o.name).includes(lc(output)) || lc(o.type).includes(lc(output)),
+        );
+        if (!hit) continue;
+        matchedOn.push(`output:${hit.name}(${hit.type})`);
+      }
+      if (has(widget)) {
+        const hit = widgetEntries.find(([n]) => lc(n).includes(lc(widget)));
+        if (!hit) continue;
+        matchedOn.push(`widget:${hit[0]}`);
+      }
+      if (has(widget_value)) {
+        const hit = widgetEntries.find(([, v]) => lc(safeJson(v)).includes(lc(widget_value)));
+        if (!hit) continue;
+        matchedOn.push(`widget_value:${hit[0]}=${String(hit[1]).slice(0, 60)}`);
+      }
+      if (is_output === true && !summary.is_output) continue;
+      if (is_output === false && summary.is_output) continue;
+      if (is_subgraph === true && !summary.is_subgraph) continue;
+      if (is_subgraph === false && summary.is_subgraph) continue;
+      if (modeNum !== undefined && (node.mode ?? 0) !== modeNum) continue;
+
+      // Free-text query — ORed across every searchable field. matched_on records
+      // which fields hit so the agent sees WHY a node matched.
+      if (q) {
+        const hits = [];
+        if (lc(node.type).includes(q)) hits.push(`type:${node.type}`);
+        if (lc(node.title).includes(q)) hits.push(`title:${node.title}`);
+        if (lc(desc).includes(q)) hits.push("description");
+        for (const [n, v] of widgetEntries) {
+          if (lc(n).includes(q)) hits.push(`widget:${n}`);
+          else if (lc(safeJson(v)).includes(q))
+            hits.push(`widget_value:${n}=${String(v).slice(0, 60)}`);
+        }
+        for (const i of node.inputs ?? [])
+          if (lc(i.name).includes(q) || lc(i.type).includes(q)) hits.push(`input:${i.name}(${i.type})`);
+        for (const o of node.outputs ?? [])
+          if (lc(o.name).includes(q) || lc(o.type).includes(q)) hits.push(`output:${o.name}(${o.type})`);
+        if (!hits.length) continue;
+        matchedOn.push(...hits);
+      }
+
+      matches.push({
+        ...summary,
+        ...(desc ? { description: desc.slice(0, 240) } : {}),
+        ...(matchedOn.length ? { matched_on: matchedOn } : {}),
+      });
+      if (matches.length >= cap) break;
+    }
+
+    return {
+      viewing: describeActiveGraph(graph),
+      total: nodes.length,
+      count: matches.length,
+      truncated: matches.length >= cap,
+      matches,
     };
   },
 
@@ -2473,6 +2833,46 @@ const GRAPH_TOOL_EXECUTORS = {
       subgraph: {
         node_id: res?.node?.id ?? null,
         name: res?.subgraph?.name ?? null,
+        from_nodes: ns.map((n) => n.id),
+      },
+    };
+  },
+
+  // Wrap an existing GROUP's nodes into a subgraph in one step. Resolves the
+  // group (by id or title), recomputes its geometric membership, then runs the
+  // same convertToSubgraph path as graph_create_subgraph. This is how a region
+  // like a "REPLACEMENT MODE" group becomes one toggleable subgraph node.
+  graph_subgraph_group({ group }) {
+    const { graph, canvas } = getGraphCtx();
+    if (typeof graph.convertToSubgraph !== "function") {
+      throw new Error("convertToSubgraph unavailable on this frontend");
+    }
+    const g = resolveGroupRef(graph, group);
+    if (!g) {
+      throw new Error(
+        `no group matching "${group}" — list groups via panel_get_graph (each has id, title, node_ids)`,
+      );
+    }
+    g.recomputeInsideNodes?.();
+    const ns = [...(g._nodes ?? [])];
+    if (!ns.length) {
+      throw new Error(`group "${g.title}" has no nodes inside its box to wrap into a subgraph`);
+    }
+    if (typeof canvas.selectItems === "function") canvas.selectItems(ns);
+    else if (typeof canvas.selectNodes === "function") canvas.selectNodes(ns);
+    graph.beforeChange?.();
+    let res;
+    try {
+      res = graph.convertToSubgraph(canvas.selectedItems);
+    } finally {
+      graph.afterChange?.();
+    }
+    graph.setDirtyCanvas?.(true, true);
+    return {
+      subgraph: {
+        node_id: res?.node?.id ?? null,
+        name: res?.subgraph?.name ?? null,
+        from_group: g.title ?? null,
         from_nodes: ns.map((n) => n.id),
       },
     };
@@ -4725,6 +5125,11 @@ function describeCommand(cmd, msg, reply) {
             text: r.error ? "Run blocked" : "Run blocked by node errors",
             detail: r.error ?? (r.node_errors ? JSON.stringify(r.node_errors).slice(0, 300) : undefined),
           };
+    case "graph_find_nodes":
+      return {
+        icon: "pi-search",
+        text: `Found ${r.count}${r.truncated ? "+" : ""} of ${r.total} node${r.total === 1 ? "" : "s"}`,
+      };
     case "graph_get_errors":
       return {
         icon: "pi-info-circle",
@@ -7301,6 +7706,11 @@ function buildPanel() {
         agentWorking = false;
         hideThinking();
         ssSet(MID_TASK_KEY, null); // turn finished cleanly — nothing to resume
+        // Snapshot the graph the agent is leaving behind; the next user turn diffs
+        // the live graph against this to surface MANUAL edits made between turns.
+        try {
+          lastAgentGraph = getGraphCtx().rootGraph.serialize();
+        } catch {}
       }
     },
     onLog(text) {
@@ -9527,6 +9937,10 @@ function buildPanel() {
       workflow: getWorkflowTitle(),
       ...(viewing.scope === "subgraph" ? { subgraph: viewing.title } : {}),
     };
+    // Surface any MANUAL canvas edits the user made since the agent's last turn,
+    // prepended to the agent-facing text only (the visible `text` is untouched).
+    const changeBanner = manualChangeBanner();
+    if (changeBanner) sendText = changeBanner + sendText;
     // Track delivery: trackSend marks "Sending…", then the working ack flips it
     // to "✓ Seen" (or a timeout / closed socket flips it to "Not delivered").
     // `text` (the raw composer text) is kept so ✎ can restore it for editing.
