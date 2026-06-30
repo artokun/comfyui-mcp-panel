@@ -25,10 +25,28 @@ test('external mode connects to the bridge WITHOUT a host /connect spawn', async
   // Point the panel at the MockBridge. In external mode this non-default URL is a
   // manual override, so Connect dials it straight (no host involvement).
   await panel.setBridgeUrl(mockBridge.url)
-  await panel.openSidebar()
 
-  // Turn ON the external/local orchestrator toggle via ComfyUI's settings store —
-  // the same store the panel reads through getSetting().
+  // EVERYTHING that shapes the connect decision must be in place BEFORE the panel
+  // mounts (openSidebar), otherwise the panel can auto-connect during mount and
+  // POST /connect before the guard below exists — silently MISSING the very
+  // host-spawn behavior this test forbids.
+
+  // 1) Truly disable sticky auto-connect. goto() writes "0", but the panel's
+  //    lsGet() returns the raw string and treats ANY non-null value as truthy —
+  //    so "0" would still fire a mount-time connectAgent(). Remove the key so the
+  //    panel sits idle on mount and the explicit Connect click below is the ONLY
+  //    connect attempt.
+  await panel.page.evaluate(() => {
+    try {
+      localStorage.removeItem('comfyui-mcp.panel.autoConnect')
+    } catch {
+      // storage disabled — nothing persisted to auto-connect from anyway.
+    }
+  })
+
+  // 2) Turn ON the external/local orchestrator toggle via ComfyUI's settings store
+  //    (the same store the panel reads through getSetting()) — before mount, so the
+  //    mount-time connect decision and the Connect click both see external mode.
   await panel.page.evaluate((id) => {
     const w = window as unknown as {
       comfyAPI?: { app?: { app?: { ui?: { settings?: { setSettingValue?: (k: string, v: unknown) => void } } } } }
@@ -38,8 +56,9 @@ test('external mode connects to the bridge WITHOUT a host /connect spawn', async
     app?.ui?.settings?.setSettingValue?.(id, true)
   }, EXTERNAL_SETTING)
 
-  // Guard: fail loudly if the panel POSTs the host spawn route. External mode must
-  // never depend on the ComfyUI host starting anything.
+  // 3) Install the host-spawn guard/spy. External mode must never depend on the
+  //    ComfyUI host starting anything, so fail loudly if the panel POSTs /connect —
+  //    installed BEFORE mount so even a stray mount-time connect would be caught.
   let connectPosts = 0
   await panel.page.route(CONNECT_ROUTE, async (route) => {
     if (route.request().method() === 'POST') connectPosts += 1
@@ -49,6 +68,9 @@ test('external mode connects to the bridge WITHOUT a host /connect spawn', async
       body: '{"ok":false,"message":"external mode should not call this"}'
     })
   })
+
+  // Now mount the panel — external mode on, auto-connect off, guard armed.
+  await panel.openSidebar()
 
   // Click the REAL Connect button (whose default path would POST /connect) — in
   // external mode it must skip that and dial the Bridge URL directly.
