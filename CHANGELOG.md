@@ -22,6 +22,11 @@ All notable changes to this project are documented here. This project adheres to
 - `graph_get_state` groups now report their member `node_ids` (groups are geometric —
   they don't own nodes), so a region can be wrapped/toggled without reconstructing
   membership by hand.
+- **Manual-edit awareness.** The graph the agent leaves at each turn's end is snapshotted;
+  when the user sends their next message, the live graph is diffed against it and a compact
+  "⟳ MANUAL CANVAS CHANGES" list (node add/remove, mode bypass/mute, widget-value, title,
+  and connection changes) is prepended to the agent's input — so a hand edit between turns
+  (e.g. bypassing a node) never catches the agent unaware. Visible chat text is untouched.
 
 ### Fixed
 

@@ -1508,6 +1508,96 @@ function revertGraphToLastSnapshot() {
   return restoreSnapshot(graphSnapshots[graphSnapshots.length - 1]);
 }
 
+// ---- manual-edit awareness --------------------------------------------------
+// At each turn END we snapshot the graph the agent left behind (lastAgentGraph).
+// When the user sends their next message we diff the LIVE graph against it — any
+// difference is a MANUAL edit (the agent only acts during its own turn) — and
+// prepend a compact change-list to the agent's input so it isn't caught unaware
+// of edits the user made by hand (a bypassed node, a tweaked widget, a rewire).
+let lastAgentGraph = null;
+
+const MODE_NAME = { 0: "active", 2: "mute", 4: "bypass" };
+const modeName = (m) => MODE_NAME[m] ?? `mode${m ?? 0}`;
+// Serialized link = [id, origin_id, origin_slot, target_id, target_slot, type].
+// Compare by ENDPOINTS (link ids churn on every edit), not by id.
+const linkKey = (l) => `${l[1]}:${l[2]}->${l[3]}:${l[4]}`;
+function widgetName(liveGraph, nodeId, i) {
+  try {
+    const w = liveGraph?.getNodeById?.(Number(nodeId))?.widgets?.[i];
+    if (w && w.name) return w.name;
+  } catch {}
+  return `#${i}`;
+}
+function shortVal(v) {
+  const s = String(typeof v === "string" ? v : (JSON.stringify(v) ?? "")).replace(/\s+/g, " ");
+  return s.length > 40 ? s.slice(0, 37) + "…" : s;
+}
+
+// Diff two serialized root graphs (prev → curr) into compact, LLM-readable lines.
+// Reports node add/remove, mode (bypass/mute) changes, widget-value changes, title
+// changes, and connection add/remove. Ignores pure moves/resizes/recolors (noise).
+function diffGraphsForAgent(prev, curr, liveGraph) {
+  if (!prev || !curr) return [];
+  const lines = [];
+  const P = new Map((prev.nodes || []).map((n) => [n.id, n]));
+  const C = new Map((curr.nodes || []).map((n) => [n.id, n]));
+  const label = (n) => `${n.id} ${n.type}${n.title && n.title !== n.type ? ` "${n.title}"` : ""}`;
+  for (const [id, n] of C) if (!P.has(id)) lines.push(`+ added ${label(n)}`);
+  for (const [id, n] of P) if (!C.has(id)) lines.push(`− removed ${label(n)}`);
+  for (const [id, c] of C) {
+    const p = P.get(id);
+    if (!p) continue;
+    if ((c.mode ?? 0) !== (p.mode ?? 0))
+      lines.push(`• ${label(c)}: mode ${modeName(p.mode)} → ${modeName(c.mode)}`);
+    if ((p.title || "") !== (c.title || ""))
+      lines.push(`• ${id}: title "${p.title ?? ""}" → "${c.title ?? ""}"`);
+    const pv = p.widgets_values, cv = c.widgets_values;
+    if (JSON.stringify(pv) !== JSON.stringify(cv)) {
+      if (Array.isArray(pv) && Array.isArray(cv)) {
+        for (let i = 0; i < Math.max(pv.length, cv.length); i++) {
+          if (JSON.stringify(pv[i]) === JSON.stringify(cv[i])) continue;
+          if ((cv[i] && typeof cv[i] === "object") || (pv[i] && typeof pv[i] === "object")) continue; // skip nested preview blobs
+          lines.push(`• ${label(c)}: ${widgetName(liveGraph, id, i)} ${shortVal(pv[i])} → ${shortVal(cv[i])}`);
+        }
+      } else {
+        lines.push(`• ${label(c)}: widgets changed`);
+      }
+    }
+  }
+  const PL = new Set((prev.links || []).map(linkKey));
+  const CL = new Set((curr.links || []).map(linkKey));
+  for (const l of curr.links || []) if (!PL.has(linkKey(l))) lines.push(`+ wire ${l[1]} → ${l[3]} (${l[5] || "?"})`);
+  for (const l of prev.links || []) if (!CL.has(linkKey(l))) lines.push(`− wire ${l[1]} → ${l[3]} (${l[5] || "?"})`);
+  return lines;
+}
+
+// Build the banner to prepend to a user turn (empty string when nothing changed).
+// Consumes the baseline (resets it to the current graph) so the same edits aren't
+// re-reported if the user sends twice without the agent acting in between.
+function manualChangeBanner() {
+  if (!lastAgentGraph) return "";
+  let curr, live;
+  try {
+    live = getGraphCtx().rootGraph;
+    curr = live.serialize();
+  } catch {
+    return "";
+  }
+  const lines = diffGraphsForAgent(lastAgentGraph, curr, live);
+  lastAgentGraph = curr;
+  if (!lines.length) return "";
+  const MAX = 40;
+  const shown = lines.slice(0, MAX);
+  const more = lines.length > MAX ? `\n  …and ${lines.length - MAX} more change(s)` : "";
+  return (
+    `⟳ MANUAL CANVAS CHANGES since your last turn — the user edited the graph directly:\n  ` +
+    shown.join("\n  ") +
+    more +
+    `\nTreat the canvas as being in THIS state now (it overrides what you remember); ` +
+    `re-read with panel_graph_outline if the changes are substantial.\n\n`
+  );
+}
+
 // Restore the canvas to the snapshot captured before the message with this mid
 // (the per-message rollback). Returns the snapshot or null.
 function revertGraphSnapshotByMid(mid) {
@@ -7601,6 +7691,11 @@ function buildPanel() {
         agentWorking = false;
         hideThinking();
         ssSet(MID_TASK_KEY, null); // turn finished cleanly — nothing to resume
+        // Snapshot the graph the agent is leaving behind; the next user turn diffs
+        // the live graph against this to surface MANUAL edits made between turns.
+        try {
+          lastAgentGraph = getGraphCtx().rootGraph.serialize();
+        } catch {}
       }
     },
     onLog(text) {
@@ -9827,6 +9922,10 @@ function buildPanel() {
       workflow: getWorkflowTitle(),
       ...(viewing.scope === "subgraph" ? { subgraph: viewing.title } : {}),
     };
+    // Surface any MANUAL canvas edits the user made since the agent's last turn,
+    // prepended to the agent-facing text only (the visible `text` is untouched).
+    const changeBanner = manualChangeBanner();
+    if (changeBanner) sendText = changeBanner + sendText;
     // Track delivery: trackSend marks "Sending…", then the working ack flips it
     // to "✓ Seen" (or a timeout / closed socket flips it to "Not delivered").
     // `text` (the raw composer text) is kept so ✎ can restore it for editing.
