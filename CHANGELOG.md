@@ -32,6 +32,10 @@ All notable changes to this project are documented here. This project adheres to
 
 - Agent-facing error messages now name agent tools (`panel_get_graph`/`panel_search_nodes`)
   instead of the internal `graph_get_state` command.
+- `graph_find_nodes` no longer throws on exotic widget values — widget stringification is
+  guarded (a BigInt or circular/custom value would have failed the whole search call).
+- `graph_outline` topological sort uses an index cursor instead of `Array.shift()`, keeping
+  it linear (was O(n²)) on large/flat graphs.
 
 ## [0.4.5] - 2026-06-29
 

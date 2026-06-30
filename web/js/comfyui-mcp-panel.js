@@ -1862,8 +1862,11 @@ function topoSortNodes(nodes, links) {
   const queue = nodes.filter((n) => (indeg.get(n.id) ?? 0) === 0).map((n) => n.id);
   const out = [];
   const seen = new Set();
-  while (queue.length) {
-    const id = queue.shift();
+  // Index cursor instead of queue.shift() — shift() is O(n), making Kahn's loop
+  // O(n^2) on large/flat graphs; cursor keeps it linear.
+  let qi = 0;
+  while (qi < queue.length) {
+    const id = queue[qi++];
     if (seen.has(id)) continue;
     seen.add(id);
     out.push(byId.get(id));
@@ -2073,6 +2076,15 @@ const GRAPH_TOOL_EXECUTORS = {
     const { graph } = getGraphCtx();
     const cap = Math.min(Math.max(Number(limit ?? 40), 1), 200);
     const lc = (s) => String(s ?? "").toLowerCase();
+    // Safe stringify for widget values — a BigInt or circular/custom value would
+    // throw in JSON.stringify and fail the whole find call; fall back to String().
+    const safeJson = (v) => {
+      try {
+        return JSON.stringify(v) ?? String(v);
+      } catch {
+        return String(v);
+      }
+    };
     const has = (v) => typeof v === "string" && v.trim() !== "";
     const modeNum = mode ? { active: 0, mute: 2, bypass: 4 }[mode] : undefined;
     const q = has(query) ? lc(query) : null;
@@ -2114,7 +2126,7 @@ const GRAPH_TOOL_EXECUTORS = {
         matchedOn.push(`widget:${hit[0]}`);
       }
       if (has(widget_value)) {
-        const hit = widgetEntries.find(([, v]) => lc(JSON.stringify(v)).includes(lc(widget_value)));
+        const hit = widgetEntries.find(([, v]) => lc(safeJson(v)).includes(lc(widget_value)));
         if (!hit) continue;
         matchedOn.push(`widget_value:${hit[0]}=${String(hit[1]).slice(0, 60)}`);
       }
@@ -2133,7 +2145,7 @@ const GRAPH_TOOL_EXECUTORS = {
         if (lc(desc).includes(q)) hits.push("description");
         for (const [n, v] of widgetEntries) {
           if (lc(n).includes(q)) hits.push(`widget:${n}`);
-          else if (lc(JSON.stringify(v)).includes(q))
+          else if (lc(safeJson(v)).includes(q))
             hits.push(`widget_value:${n}=${String(v).slice(0, 60)}`);
         }
         for (const i of node.inputs ?? [])
