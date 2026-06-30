@@ -183,6 +183,60 @@ def _detect_comfyui_url():
     return "http://{}:{}".format(host, port)
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0", ""}
+
+
+def _coerce_comfyui_url(val):
+    """Validate + normalize a user-supplied remote ComfyUI URL (panel setting).
+
+    Returns a cleaned ``scheme://host[:port][/path]`` string (no trailing slash),
+    or ``None`` when blank/invalid — callers fall back to the local default. Only
+    http/https with a host are accepted; anything else is rejected rather than
+    silently mis-targeting the agent."""
+    if not val or not isinstance(val, str):
+        return None
+    raw = val.strip()
+    if not raw:
+        return None
+    # Reject any whitespace / control char: urlsplit is permissive and would
+    # otherwise treat "foo bar" (or "https://h/a b") as a valid host and mis-target
+    # the agent. A real ComfyUI URL never contains whitespace.
+    if any(ch.isspace() or ord(ch) < 0x20 for ch in raw):
+        return None
+    # Tolerate a bare host[:port] by assuming http://.
+    if "://" not in raw:
+        raw = "http://" + raw
+    try:
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(raw)
+        host = parts.hostname or ""
+        if parts.scheme not in ("http", "https") or not host:
+            return None
+        # Defensive: hostname must contain at least one usable char and no spaces
+        # (already excluded above) — reject anything else rather than mis-route.
+        if not host.strip():
+            return None
+    except Exception:
+        return None
+    return raw.rstrip("/")
+
+
+def _url_is_loopback(url):
+    """True if ``url`` points at this machine (localhost/127.0.0.1/::1/0.0.0.0).
+    A non-loopback URL means the agent should run in REMOTE mode (no local
+    COMFYUI_PATH), so its filesystem tools don't target the wrong box."""
+    if not url:
+        return True
+    try:
+        from urllib.parse import urlsplit
+
+        host = (urlsplit(url).hostname or "").lower()
+    except Exception:
+        return True
+    return host in _LOOPBACK_HOSTS
+
+
 def _looks_like_comfyui_root(p):
     """True if ``p`` is a dir that looks like a real ComfyUI install root. A
     ComfyUI Desktop-installer *wrapper* dir has NONE of these markers, while the
@@ -550,7 +604,7 @@ def _port_owner_pid(host, port):
     return None
 
 
-def _start_orchestrator(backend=_DEFAULT_BACKEND, port=None, force=False, stall_seconds=None):
+def _start_orchestrator(backend=_DEFAULT_BACKEND, port=None, force=False, stall_seconds=None, comfyui_url=None):
     """Start the panel orchestrator on demand. Returns (ok: bool, message: str).
 
     Called only from the Connect route — i.e. an explicit user action — never at
@@ -652,11 +706,21 @@ def _start_orchestrator(backend=_DEFAULT_BACKEND, port=None, force=False, stall_
         )
 
     env = dict(os.environ)
-    env["COMFYUI_URL"] = _detect_comfyui_url()
-    _cpath = _detect_comfyui_path()
+    # A user-supplied remote URL (panel setting) overrides the local default and
+    # puts the agent in REMOTE mode. When remote (non-loopback) we deliberately do
+    # NOT set COMFYUI_PATH: the install dir is on the OTHER box, so the agent's
+    # filesystem tools must not target this machine (the MCP would otherwise run a
+    # confusing local-FS + remote-API split). Loopback URLs keep local mode.
+    remote_url = comfyui_url if (comfyui_url and not _url_is_loopback(comfyui_url)) else None
+    env["COMFYUI_URL"] = comfyui_url or _detect_comfyui_url()
+    _cpath = None if remote_url else _detect_comfyui_path()
     if _cpath:
         # Local mode for the agent: download_model / apply_manifest (packs) / scans.
         env["COMFYUI_PATH"] = _cpath
+    elif remote_url:
+        # Belt-and-suspenders: ensure no inherited COMFYUI_PATH leaks local mode in.
+        env.pop("COMFYUI_PATH", None)
+        _log("agent targeting REMOTE ComfyUI {} (local model/pack tools disabled)".format(remote_url))
     # Beacon: the orchestrator watches this PID (ComfyUI) and shuts itself down
     # when ComfyUI exits — including crashes/hard-kills where atexit never fires.
     env["COMFYUI_MCP_PARENT_PID"] = str(os.getpid())
@@ -864,6 +928,9 @@ def _register_routes():
         # Optional render-stall threshold (seconds) from the panel setting, applied
         # to the orchestrator's env on spawn.
         stall_seconds = _coerce_stall(_request.query.get("stall_seconds"))
+        # Optional remote ComfyUI URL (panel setting): when set + non-loopback, the
+        # agent drives a remote server (e.g. a RunPod instance) instead of localhost.
+        comfyui_url = _coerce_comfyui_url(_request.query.get("comfyui_url"))
         if not backend:
             try:
                 body = await _request.json()
@@ -873,6 +940,8 @@ def _register_routes():
                         force = bool(body.get("force") or body.get("reclaim"))
                     if stall_seconds is None:
                         stall_seconds = _coerce_stall(body.get("stall_seconds"))
+                    if comfyui_url is None:
+                        comfyui_url = _coerce_comfyui_url(body.get("comfyui_url"))
             except Exception:
                 backend = None
         # Reject a non-string backend with a clean 400 (e.g. {"backend": 123})
@@ -888,7 +957,9 @@ def _register_routes():
                 status=400,
             )
         port = _backend_port(backend)
-        ok, message = _start_orchestrator(backend=backend, port=port, force=force, stall_seconds=stall_seconds)
+        ok, message = _start_orchestrator(
+            backend=backend, port=port, force=force, stall_seconds=stall_seconds, comfyui_url=comfyui_url
+        )
         return web.json_response(
             {
                 "ok": ok,
