@@ -4612,9 +4612,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
         return false;
       }
     },
-    setUrl(next) {
+    setUrl(next, opts) {
       url = next || DEFAULT_BRIDGE_URL;
-      saveBridgeUrl(url);
+      // Ephemeral URLs (e.g. a per-session secure wss:// tunnel advertised by a
+      // remote-driving orchestrator) pass { persist: false } so they don't get
+      // saved as the bridge default and go stale next load.
+      if (!opts || opts.persist !== false) saveBridgeUrl(url);
       attempt = 0;
       // Pointing at a new bridge is a fresh connect → restart the patience window.
       gaveUp = false;
@@ -8956,6 +8959,23 @@ function buildPanel() {
     })();
     return true;
   }
+  // On an https page (a remote pod), the local orchestrator driving this pod via
+  // `connect` advertises a SECURE wss:// bridge URL (cloudflared tunnel, token in
+  // the query) here — a plain ws://127.0.0.1 from an https origin is blocked by the
+  // browser (mixed-content / Private Network Access). Returns the wss URL or null.
+  // No-op on http/localhost pages, where the plain ws:// default works.
+  async function fetchAdvertisedBridgeUrl() {
+    if (location.protocol !== "https:") return null;
+    try {
+      const res = await api.fetchApi("/comfyui_mcp_panel/bridge_url");
+      const data = await res.json().catch(() => ({}));
+      const url = data && data.url;
+      return typeof url === "string" && url.startsWith("wss://") ? url : null;
+    } catch {
+      return null;
+    }
+  }
+
   async function connectAgent(opts = {}) {
     // A chip pick (opts.fromChip) is an EXPLICIT backend choice — it must always
     // (re)connect to that backend's port, so it bypasses the in-flight guard (which
@@ -9001,11 +9021,21 @@ function buildPanel() {
     if (externalOrchestratorMode()) {
       connecting = false;
       if (!manualOverride) {
-        const target = configuredBridgeUrlFor(selectedBackend);
-        if (target && target !== client.currentUrl()) {
-          client.setUrl(target);
-          urlInput.value = target;
-          lastAutoUrl = target;
+        // Prefer a secure wss:// bridge advertised by the orchestrator (required on
+        // an https pod, where ws://127.0.0.1 is browser-blocked). It's per-session
+        // and ephemeral, so connect WITHOUT persisting it as the saved default.
+        const secure = await fetchAdvertisedBridgeUrl();
+        if (myGen !== connectGen) return;
+        if (secure) {
+          if (secure !== client.currentUrl()) client.setUrl(secure, { persist: false });
+          lastAutoUrl = secure;
+        } else {
+          const target = configuredBridgeUrlFor(selectedBackend);
+          if (target && target !== client.currentUrl()) {
+            client.setUrl(target);
+            urlInput.value = target;
+            lastAutoUrl = target;
+          }
         }
       }
       if (myGen !== connectGen) return;

@@ -58,6 +58,13 @@ _BACKEND_PORTS = {
 }
 _DEFAULT_BACKEND = "claude"
 
+# Secure bridge URL advertised by a local orchestrator that is driving THIS
+# (remote) pod via `connect`. When set, it's a public wss:// URL (cloudflared
+# tunnel, token embedded) that the browser panel uses instead of the plain
+# ws://127.0.0.1 loopback default — required when this page is served over https,
+# where a plain ws:// is blocked by the browser. In-process; last writer wins.
+_ADVERTISED_BRIDGE_URL = None
+
 
 def _log(msg):
     print("[comfyui-mcp-panel] " + msg)
@@ -284,6 +291,34 @@ def _register_routes():
                 "start_command": _start_command(detected),
             }
         )
+
+    @routes.post("/comfyui_mcp_panel/advertise_bridge")
+    async def _advertise_bridge(_request):
+        # A local orchestrator driving this remote pod (`connect <this-pod>`) POSTs
+        # the public wss:// URL of its secure bridge here so the browser panel can
+        # fetch and use it — no URL copy/paste. Restricted to wss:// so a stray POST
+        # can't redirect the panel to an arbitrary/insecure endpoint.
+        global _ADVERTISED_BRIDGE_URL
+        try:
+            body = await _request.json()
+        except Exception:
+            return web.json_response({"ok": False, "message": "invalid JSON"}, status=400)
+        url = body.get("url") if isinstance(body, dict) else None
+        if not isinstance(url, str) or not url.startswith("wss://"):
+            return web.json_response(
+                {"ok": False, "message": "url must be a wss:// string"}, status=400
+            )
+        _ADVERTISED_BRIDGE_URL = url
+        _log("secure bridge advertised: {}".format(url.split("?")[0]))
+        return web.json_response({"ok": True})
+
+    @routes.get("/comfyui_mcp_panel/bridge_url")
+    async def _bridge_url(_request):
+        # The panel calls this on Connect. If a local orchestrator advertised a
+        # secure wss:// bridge, return it (the browser uses it instead of the
+        # ws://127.0.0.1 default — mandatory when this page is https); else null so
+        # the panel keeps its loopback default.
+        return web.json_response({"url": _ADVERTISED_BRIDGE_URL})
 
     @routes.get("/comfyui_mcp_panel/backends")
     async def _backends(_request):

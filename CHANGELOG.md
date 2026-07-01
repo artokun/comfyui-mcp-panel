@@ -6,6 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.11] - 2026-07-01
+
+### Added
+
+- **Secure bridge for remote pods.** When a local orchestrator drives this pod via
+  `connect` over https, it advertises a token-gated `wss://` bridge URL (a
+  Cloudflare tunnel) to two new routes — `POST /comfyui_mcp_panel/advertise_bridge`
+  and `GET /comfyui_mcp_panel/bridge_url`. On an **https** page the panel now fetches
+  that URL on Connect and uses it instead of the plain `ws://127.0.0.1:9180` default
+  — which browsers block from a secure origin (mixed content / Private Network
+  Access). No URL to paste; works in any browser. Local/http pages are unchanged.
+  Pairs with comfyui-mcp 0.23.4.
+
 ## [0.4.10] - 2026-07-01
 
 ### Changed
