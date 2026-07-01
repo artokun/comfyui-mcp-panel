@@ -6,6 +6,27 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-07-01
+
+### Fixed
+
+- **Provider switcher no longer falsely says "CLI not installed."** Readiness was
+  probed only by the ComfyUI-side Python (`shutil.which` + on-disk logins), which
+  runs wherever ComfyUI runs — behind a remote pod that's a box with no provider
+  CLIs, no logins, and no visibility into Claude's SDK (which has no CLI at all),
+  so every provider read as unavailable. The panel now prefers the **orchestrator's**
+  readiness (the machine that actually runs the agents), pushed as a `{type:"backends"}`
+  frame on connect, and a successful "ready" ack marks the live backend ready outright.
+  Pairs with comfyui-mcp 0.23.1.
+
+### Changed
+
+- **Connect dropdown shows `npx -y comfyui-mcp connect`** (not the old
+  `--panel-orchestrator`, which read as "local only"). With browser-host targeting
+  the panel hands the orchestrator whatever ComfyUI you're viewing — local or a remote
+  pod — so the bare `connect` is the canonical one-command start. OS-aware (`cmd /c`
+  wrapper on Windows, where a bare npx line can trip PowerShell's exec policy).
+
 ## [0.4.7] - 2026-07-01
 
 ### Added
