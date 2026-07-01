@@ -5630,10 +5630,22 @@ function buildPanel() {
   const helpDiv = document.createElement("div");
   helpDiv.className = "cmcp-help";
   helpDiv.textContent =
-    "Click Connect to start an autonomous agent on your Claude subscription — no API keys. Sign in to Claude once (run `claude`) first. Prefer to run it yourself? Start the orchestrator, then Connect:";
+    "The agent runs on YOUR machine on your own subscription — no API keys. Sign into a provider once (e.g. run `claude`), then start the agent with the command below — it targets the ComfyUI you're viewing — and click Connect:";
   const helpCmd = document.createElement("code");
   helpCmd.className = "cmcp-cmd";
-  helpCmd.textContent = "npx -y comfyui-mcp --panel-orchestrator";
+  {
+    // `connect <url>` points the orchestrator at the ComfyUI the panel is VIEWING
+    // (a remote pod when opened over its proxy URL), so the agent drives THAT
+    // instance — NOT `--panel-orchestrator`, which targets the local machine and
+    // was the cause of "opened the pod but the agent reported my laptop's GPU".
+    // `cmd /c` on Windows dodges PowerShell's npx.ps1 execution-policy block.
+    const connectUrl = comfyuiUrlForConnect();
+    const isWin =
+      /win/i.test(navigator.platform || "") || /Windows/i.test(navigator.userAgent || "");
+    helpCmd.textContent = isWin
+      ? `cmd /c "npx -y comfyui-mcp connect ${connectUrl}"`
+      : `npx -y comfyui-mcp connect ${connectUrl}`;
+  }
   helpCmd.title = "Click to copy";
   helpCmd.addEventListener("click", () => {
     navigator.clipboard?.writeText(helpCmd.textContent).then(
