@@ -96,6 +96,23 @@ function defaultBridgeUrlFor(backend) {
   return DEFAULT_BRIDGE_URL_BY_BACKEND[backend] || DEFAULT_BRIDGE_URL;
 }
 
+// The exact `connect` command to show the user. On an https page (a remote pod)
+// the local orchestrator can't learn this pod's URL on its own — the panel's hello
+// travels over the ws bridge, which the browser blocks from an https origin — so we
+// PREFILL this pod's own hostname (window.location.origin). Running it that way lets
+// the orchestrator open a secure wss:// bridge that works in every browser. On
+// http/localhost the bare form auto-targets the local ComfyUI. Callers wrap in
+// `cmd /c "…"` on Windows.
+function connectCommand() {
+  const base = "npx -y comfyui-mcp@latest connect";
+  try {
+    if (location.protocol === "https:") return `${base} ${location.origin}`;
+  } catch {
+    // location unavailable — fall back to the bare form
+  }
+  return base;
+}
+
 function loadBridgeUrl() {
   // Single-port: the single (advanced) Bridge URL override, else the default. Old
   // per-port localStorage / per-backend values are intentionally ignored so a
@@ -5753,7 +5770,7 @@ function buildPanel() {
   // as "local only". Wrap in `cmd /c` on Windows, where a bare npx line can trip
   // PowerShell's executable policy.
   const _isWin = /win/i.test((navigator.platform || navigator.userAgent || ""));
-  const _connectCmd = "npx -y comfyui-mcp@latest connect";
+  const _connectCmd = connectCommand();
   helpCmd.textContent = _isWin ? `cmd /c "${_connectCmd}"` : _connectCmd;
   helpCmd.title = "Click to copy";
   helpCmd.addEventListener("click", () => {
@@ -5938,9 +5955,7 @@ function buildPanel() {
     // No URL needed: the panel sends the ComfyUI host (window.location) in its
     // hello, so a bare `connect` auto-targets whatever ComfyUI is open.
     void url;
-    const runCmd = isWin
-      ? `cmd /c "npx -y comfyui-mcp@latest connect"`
-      : `npx -y comfyui-mcp@latest connect`;
+    const runCmd = isWin ? `cmd /c "${connectCommand()}"` : connectCommand();
     runCol.append(onboardCmd(runCmd));
     if (isWin) {
       const note = document.createElement("div");
@@ -8727,10 +8742,8 @@ function buildPanel() {
     const bridge = configuredBridgeUrlFor(selectedBackend);
     appendSystem(
       "No agent is listening on the bridge (" + bridge + "). This ComfyUI won’t " +
-        "start one — run the agent on YOUR machine:\n" +
-        "    npx -y comfyui-mcp@latest connect\n" +
-        "It auto-targets the ComfyUI you have open (" + comfyuiUrlForConnect() +
-        "), then click Connect.",
+        "start one — run the agent on YOUR machine, then click Connect:\n" +
+        "    " + connectCommand(),
     );
   }
   function resetAutoReclaim() {
