@@ -8,6 +8,8 @@
 **An autonomous AI agent embedded in the ComfyUI sidebar that drives your canvas — now on EITHER
 Claude or ChatGPT (your own subscription, no API key).**
 
+[![Deploy on RunPod](https://img.shields.io/badge/Deploy_on-RunPod-673AB7?style=for-the-badge)](https://console.runpod.io/deploy?template=bnqtkvcer3&ref=dkx71w9b) &nbsp;**One-click GPU pod** — a ready-to-run ComfyUI with this panel + [comfyui-mcp](https://github.com/artokun/comfyui-mcp) + ComfyUI-Manager v2 preinstalled, on your own GPU. No setup.
+
 Pick a provider — **Claude** or **ChatGPT** — and the matching agent runs in the background on
 *your* subscription, sees the graph you're looking at, and edits it live. Both providers reach
 **full feature parity**: the same live-canvas tools, the same model knowledge, the same one-shot
