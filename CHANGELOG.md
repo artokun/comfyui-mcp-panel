@@ -6,6 +6,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-06-30
+
+### Added
+
+- **Remote ComfyUI URL (drive a RunPod / remote instance).** A new
+  *Settings → Comfy MCP Agent → General → Remote ComfyUI URL (advanced)* field points the
+  agent at a remote ComfyUI (e.g. `https://xxxxxxxx-8188.proxy.runpod.net`) instead of
+  localhost. When set, it's sent on Connect and the orchestrator spawns its MCP with
+  `COMFYUI_URL` targeting the remote server (queue, models, history, uploads all go there);
+  for a non-loopback URL `COMFYUI_PATH` is deliberately omitted so the agent runs in clean
+  remote mode (no local-FS/remote-API split). Blank = local (unchanged default). The URL is
+  validated server-side (`http`/`https` + host) and applied on the next Connect. Your live
+  canvas still follows whichever ComfyUI you opened in the browser. (MCP already supported
+  remote via `COMFYUI_URL`/`isRemoteMode`; this exposes it from the panel — no MCP change.)
+
 ## [0.4.6] - 2026-06-29
 
 ### Added

@@ -273,6 +273,7 @@ const LEGACY_SETTING_BRIDGE_URL = "comfyui-mcp.bridgeUrl";
 const SETTING_AUTOCONNECT = "comfyui-mcp.autoConnect";
 const SETTING_FOCUS_FOLLOW = "comfyui-mcp.zoomToAction";
 const SETTING_STALL_S = "comfyui-mcp.stallWarningSeconds";
+const SETTING_REMOTE_URL = "comfyui-mcp.remoteComfyuiUrl";
 const SETTING_TOKEN_CIVITAI = "comfyui-mcp.setCivitaiToken";
 const SETTING_TOKEN_HF = "comfyui-mcp.setHuggingfaceToken";
 // One-time flag: on first load with this feature, push the user's EXISTING
@@ -479,6 +480,14 @@ function stallSettingSeconds() {
   const v = Number(getSetting(SETTING_STALL_S));
   if (!Number.isFinite(v) || v <= 0) return null;
   return Math.min(3600, Math.max(15, Math.round(v)));
+}
+
+// Optional remote ComfyUI URL (panel setting). Blank → drive the local ComfyUI.
+// Sent on every /connect so the orchestrator spawns its MCP against the remote
+// server; validated + normalized server-side in __init__.py (_coerce_comfyui_url).
+function remoteUrlSetting() {
+  const v = getSetting(SETTING_REMOTE_URL);
+  return typeof v === "string" ? v.trim() : "";
 }
 
 // Build the settings list registered on the extension. Defined as a function so
@@ -713,6 +722,25 @@ function panelSettingsList() {
         // Push the new threshold to a live orchestrator (set_config) so it applies
         // without a reconnect; also sent on connect and forwarded on spawn via env.
         panelHooks.applyStallConfig?.();
+      },
+    },
+    {
+      id: SETTING_REMOTE_URL,
+      name: "Remote ComfyUI URL (advanced)",
+      category: cat("General", "Remote ComfyUI URL (advanced)"),
+      sortOrder: 143,
+      tooltip:
+        "Point the AGENT at a remote ComfyUI instead of this machine — e.g. a RunPod pod at " +
+        "https://xxxxxxxx-8188.proxy.runpod.net. Leave BLANK to drive the local ComfyUI (default). " +
+        "When set, the agent's tools (queue, models, history, uploads) target the remote server, and " +
+        "local-only tools (download_model / installer packs / model scans) are disabled. Applies when " +
+        "the orchestrator next starts — Disconnect then Connect to change it. Your live canvas still " +
+        "follows whichever ComfyUI you opened in the browser.",
+      type: "text",
+      defaultValue: "",
+      onChange: () => {
+        // No live apply: the URL is baked into the orchestrator's MCP at spawn, so
+        // it takes effect on the next Connect (Disconnect → Connect).
       },
     },
     {
@@ -8530,7 +8558,7 @@ function buildPanel() {
         const res = await api.fetchApi("/comfyui_mcp_panel/connect", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ backend: selectedBackend, stall_seconds: stallSettingSeconds() }),
+          body: JSON.stringify({ backend: selectedBackend, stall_seconds: stallSettingSeconds(), comfyui_url: remoteUrlSetting() }),
         });
         const data = await res.json().catch(() => ({}));
         if (myGen !== connectGen) return; // a newer user connect took over
@@ -8593,7 +8621,7 @@ function buildPanel() {
         const res = await api.fetchApi("/comfyui_mcp_panel/connect", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ backend: selectedBackend, force: true, stall_seconds: stallSettingSeconds() }),
+          body: JSON.stringify({ backend: selectedBackend, force: true, stall_seconds: stallSettingSeconds(), comfyui_url: remoteUrlSetting() }),
         });
         const data = await res.json().catch(() => ({}));
         // A newer user-initiated connect superseded us → let it drive.
@@ -8663,7 +8691,7 @@ function buildPanel() {
       const res = await api.fetchApi("/comfyui_mcp_panel/connect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ backend: selectedBackend, stall_seconds: stallSettingSeconds() }),
+        body: JSON.stringify({ backend: selectedBackend, stall_seconds: stallSettingSeconds(), comfyui_url: remoteUrlSetting() }),
       });
       const data = await res.json().catch(() => ({}));
       // A newer connect (e.g. a backend switch) superseded this one while the POST
