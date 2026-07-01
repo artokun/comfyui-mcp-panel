@@ -5750,7 +5750,7 @@ function buildPanel() {
   // as "local only". Wrap in `cmd /c` on Windows, where a bare npx line can trip
   // PowerShell's executable policy.
   const _isWin = /win/i.test((navigator.platform || navigator.userAgent || ""));
-  const _connectCmd = "npx -y comfyui-mcp connect";
+  const _connectCmd = "npx -y comfyui-mcp@latest connect";
   helpCmd.textContent = _isWin ? `cmd /c "${_connectCmd}"` : _connectCmd;
   helpCmd.title = "Click to copy";
   helpCmd.addEventListener("click", () => {
@@ -5933,11 +5933,11 @@ function buildPanel() {
     // On Windows, `cmd /c` sidesteps the PowerShell execution-policy trap that
     // blocks the npx.ps1 shim ("running scripts is disabled on this system").
     // No URL needed: the panel sends the ComfyUI host (window.location) in its
-    // hello, so a bare `--panel-orchestrator` auto-targets whatever ComfyUI is open.
+    // hello, so a bare `connect` auto-targets whatever ComfyUI is open.
     void url;
     const runCmd = isWin
-      ? `cmd /c "npx -y comfyui-mcp --panel-orchestrator"`
-      : `npx -y comfyui-mcp --panel-orchestrator`;
+      ? `cmd /c "npx -y comfyui-mcp@latest connect"`
+      : `npx -y comfyui-mcp@latest connect`;
     runCol.append(onboardCmd(runCmd));
     if (isWin) {
       const note = document.createElement("div");
@@ -8725,7 +8725,7 @@ function buildPanel() {
     appendSystem(
       "No agent is listening on the bridge (" + bridge + "). This ComfyUI won’t " +
         "start one — run the agent on YOUR machine:\n" +
-        "    npx -y comfyui-mcp --panel-orchestrator\n" +
+        "    npx -y comfyui-mcp@latest connect\n" +
         "It auto-targets the ComfyUI you have open (" + comfyuiUrlForConnect() +
         "), then click Connect.",
     );

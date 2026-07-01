@@ -15,8 +15,8 @@ Pick a provider — **Claude** or **ChatGPT** — and the matching agent runs in
 **full feature parity**: the same live-canvas tools, the same model knowledge, the same one-shot
 workflow loads, the same cost guardrail.
 
-Part of the **[comfyui-mcp](https://github.com/artokun/comfyui-mcp)** project — the MCP server +
-agent orchestrator for ComfyUI. Full documentation at
+Part of the **[comfyui-mcp](https://github.com/artokun/comfyui-mcp)** project — the local-first,
+agent-native control plane for ComfyUI (MCP server + agent orchestrator). Full documentation at
 **[comfyui-mcp.artokun.io/docs](https://comfyui-mcp.artokun.io/docs)**.
 
 Type "add a KSampler and wire it to my checkpoint" in the panel and watch nodes
@@ -88,7 +88,7 @@ codex login   # ChatGPT (Codex)
 
 Open the **Agent** tab, **pick a provider** in the backend picker (Claude /
 ChatGPT chips), and click **Connect**. The panel starts that provider's
-autonomous background agent — `npx -y comfyui-mcp --panel-orchestrator`, running
+autonomous background agent — `npx -y comfyui-mcp@latest connect`, running
 on your **subscription** (no API keys) — and the status pill turns green. Type a
 request ("build a Flux txt2img graph and run it") and watch the edits land on
 your canvas. **Disconnect** stops the agent; nothing is ever started without
@@ -272,7 +272,7 @@ identical across providers.
 ## Requirements
 
 - ComfyUI with a frontend exposing `app.extensionManager.registerSidebarTab` (any 2024+ release)
-- Node ≥ 22 for the orchestrator (`npx -y comfyui-mcp --panel-orchestrator`, started for you by **Connect**)
+- Node ≥ 22 for the orchestrator (`npx -y comfyui-mcp@latest connect`, started for you by **Connect**)
 - A subscription login for the provider you pick — **Claude** via the Claude CLI (`claude`) or **ChatGPT** via the Codex CLI (`codex login`). The agent runs on your subscription, no API key.
 
 ## Roadmap

@@ -228,12 +228,12 @@ def _url_is_loopback(url):
 
 def _start_command(comfyui_url=None):
     """The exact one-liner the user runs in a terminal to start the orchestrator
-    the panel connects to. ALWAYS the bare orchestrator flag now — the panel sends
+    the panel connects to. ALWAYS the bare `connect` (no URL) now — the panel sends
     the ComfyUI URL it was served from (window.location) in its hello, and the
     orchestrator retargets to it (local OR remote), so no `connect <url>` is needed.
     `comfyui_url` is accepted for call-site compatibility but unused."""
     del comfyui_url
-    return "npx -y comfyui-mcp --panel-orchestrator"
+    return "npx -y comfyui-mcp@latest connect"
 
 
 def _start_hint(port, comfyui_url=None):

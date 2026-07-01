@@ -6,6 +6,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.10] - 2026-07-01
+
+### Changed
+
+- **The "run the agent on YOUR machine" hint, the onboarding step, and the help
+  dropdown now show `npx -y comfyui-mcp@latest connect`** — replacing the deprecated
+  `--panel-orchestrator` flag, and pinned to `@latest` so users pick up new releases.
+  `connect` (no URL) starts the orchestrator and auto-targets whatever ComfyUI the
+  panel is served from (local or a remote pod).
+- README / pyproject positioning: **"the local-first, agent-native control plane for
+  ComfyUI"**.
+
 ## [0.4.9] - 2026-07-01
 
 ### Added
