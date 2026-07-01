@@ -6305,7 +6305,20 @@ function buildPanel() {
     }
     // Canonical path: settings seed the runtime. Backend FIRST (it decides which
     // group seeds prefs), then seed model/effort from THAT backend's group.
-    const sb = getSetting(SETTING_BACKEND);
+    // #43: the LAST RUNTIME pick (STORAGE_KEY_BACKEND, already in selectedBackend)
+    // must survive a panel REMOUNT — navigating away and back was silently swapping
+    // an active Codex session to the durable default (Claude) and dropping the
+    // conversation. A Settings-dialog change to the default already writes
+    // STORAGE_KEY_BACKEND (via applyBackend→connectBackend), so the two only diverge
+    // after a session-only chip pick — and then the runtime pick wins. Fall back to
+    // the durable default ONLY when there's no runtime pick yet (first-ever load).
+    let runtimePick = null;
+    try {
+      runtimePick = window.localStorage.getItem(STORAGE_KEY_BACKEND);
+    } catch {
+      runtimePick = null;
+    }
+    const sb = runtimePick || getSetting(SETTING_BACKEND);
     if (sb && sb !== selectedBackend) {
       selectedBackend = sb;
       try {

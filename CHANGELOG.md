@@ -78,6 +78,23 @@ All notable changes to this project are documented here. This project adheres to
   so a would-be-flagged release fails CI before it can publish. `.comfyignore` now
   also drops dev-only `scripts/` and `.githooks/` from the published archive.
 
+### Fixed
+
+- **Panel remount no longer silently swaps provider or drops the conversation
+  (#43).** Navigating away from the agent panel and back (a remount) used to
+  re-seed the runtime backend from the durable default and reconnect on Claude —
+  swapping an active Codex session and losing its thread. The last *runtime* pick
+  (session-only chip switch) now wins over the durable default on remount, so the
+  panel reconnects on the same provider; combined with single-port + the
+  orchestrator-owned per-(tab, backend) session, the conversation **resumes**
+  instead of starting fresh. (A Settings-dialog change to the default still takes
+  effect — it already writes the runtime pick.)
+- **Stale Bridge URL made Connect dial a dead port.** A legacy per-backend Bridge
+  URL (e.g. a migrated custom port) could survive into the single-port layout and
+  send the panel to a phantom port — the "connecting… then red" flash. Bridge-URL
+  resolution now reads one setting (default `ws://127.0.0.1:9180`) and self-heals a
+  polluted value.
+
 ## [0.4.6] - 2026-06-29
 
 ### Added
