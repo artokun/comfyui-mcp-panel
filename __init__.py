@@ -10,10 +10,12 @@ This pack ships **no Python nodes**. It does two things:
    and the ComfyUI URL to target — so the sidebar can show the right onboarding
    state and the exact one-command start line.
 
-The orchestrator itself — ``npx -y comfyui-mcp connect <comfyui-url>`` (or
-``--panel-orchestrator`` for a local instance) — owns the loopback bridge the
-panel connects to and drives it with a background Agent SDK session on the
-user's own subscription (no LLM API keys).
+The orchestrator itself — ``npx -y comfyui-mcp --panel-orchestrator`` — owns the
+loopback bridge the panel connects to and drives it with a background Agent SDK
+session on the user's own subscription (no LLM API keys). The panel sends the
+ComfyUI URL it was served from (window.location) in its hello, so the orchestrator
+auto-targets whatever ComfyUI is open (local or a remote proxy) with no
+``connect <url>`` needed.
 
 **Why this pack does not launch the orchestrator.** The Comfy Registry security
 standards prohibit custom nodes from spawning processes / installing-and-running
@@ -226,11 +228,11 @@ def _url_is_loopback(url):
 
 def _start_command(comfyui_url=None):
     """The exact one-liner the user runs in a terminal to start the orchestrator
-    the panel connects to. A remote (non-loopback) URL uses the `connect <url>`
-    sugar so the agent targets that box; a local instance uses the bare
-    orchestrator flag."""
-    if comfyui_url and not _url_is_loopback(comfyui_url):
-        return "npx -y comfyui-mcp connect {}".format(comfyui_url)
+    the panel connects to. ALWAYS the bare orchestrator flag now — the panel sends
+    the ComfyUI URL it was served from (window.location) in its hello, and the
+    orchestrator retargets to it (local OR remote), so no `connect <url>` is needed.
+    `comfyui_url` is accepted for call-site compatibility but unused."""
+    del comfyui_url
     return "npx -y comfyui-mcp --panel-orchestrator"
 
 
