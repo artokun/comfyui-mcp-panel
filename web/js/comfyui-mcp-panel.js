@@ -82,10 +82,15 @@ const LEGACY_BRIDGE_URL = "ws://127.0.0.1:9101"; // old shared default — migra
 // seeds the default URL for that backend. A per-backend DEFAULT must NOT count as a
 // "manual override" (so /connect's bridge_url still applies) — only a user-typed
 // NON-default URL overrides (see connectAgent.manualOverride).
+// Single-port multi-provider: ONE orchestrator on ONE bridge serves every
+// provider. The backend is chosen in the hello / set_backend handshake, NOT by
+// port — so all providers resolve to the same default bridge URL. (Kept as a
+// per-backend map only so a user can still pin a custom Bridge URL per provider
+// in Settings; the defaults are identical now.)
 const DEFAULT_BRIDGE_URL_BY_BACKEND = {
-  claude: "ws://127.0.0.1:9180",
-  codex: "ws://127.0.0.1:9181",
-  gemini: "ws://127.0.0.1:9182",
+  claude: DEFAULT_BRIDGE_URL,
+  codex: DEFAULT_BRIDGE_URL,
+  gemini: DEFAULT_BRIDGE_URL,
 };
 function defaultBridgeUrlFor(backend) {
   return DEFAULT_BRIDGE_URL_BY_BACKEND[backend] || DEFAULT_BRIDGE_URL;
@@ -4054,7 +4059,7 @@ function focusFollowOnCommand(cmd, msg, reply) {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onShowMedia, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onAck, onTurn, onTurnAnchor, getResume, onHandshakeTimeout, onBridgeClosed }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onShowMedia, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -4360,11 +4365,15 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // Carry the last session id so the orchestrator resumes the agent's
       // memory after a panel reload (only honored before the tab's agent spawns).
       const resume = getResume?.();
+      // Single-port multi-provider: name the selected provider so ONE orchestrator
+      // routes this tab to the right backend (default claude when unset).
+      const backend = getBackend?.() || "claude";
       sock.send(
         JSON.stringify({
           type: "hello",
           tab_id: getTabId(),
           title: getWorkflowTitle(),
+          backend,
           ...(resume ? { resume } : {}),
         }),
       );
@@ -7963,6 +7972,7 @@ function buildPanel() {
       }
     },
     getResume: () => ssGet(SESSION_KEY),
+    getBackend: () => selectedBackend,
   });
   // This is now THE live client for the page.
   liveBridgeClient = client;

@@ -33,6 +33,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- **Single-port multi-provider.** All providers now share ONE bridge
+  (`ws://127.0.0.1:9180`) instead of a port per provider (claude 9180 / codex 9181
+  / gemini 9182). The panel names its chosen provider in the `hello` handshake
+  (`backend` field), and one orchestrator routes each tab to the right backend.
+  Switching provider re-handshakes on the same bridge (fresh session for the new
+  provider — agent sessions aren't portable across providers). Requires the paired
+  `comfyui-mcp` single-port orchestrator.
 - **The pack is now a pure frontend extension — it never spawns the orchestrator.**
   Every published registry version `0.1.0`–`0.4.6` sat `NodeVersionStatusFlagged`
   on the Comfy Registry (so the registry computed no `latest_version` and
