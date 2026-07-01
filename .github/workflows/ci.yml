@@ -55,8 +55,10 @@ jobs:
       # of publishing a version that never promotes to "latest" on the Registry.
       # (`import subprocess` = B404; subprocess calls = B602/B603 — exactly what
       # flagged every 0.x release before this pack went pure-frontend.)
+      # No `-ll`: the stand-in reports ALL severities (only B101/B112/B311 excluded),
+      # so LOW-severity smells like B110 (try/except/pass) are caught here too.
       - name: Security scan (Comfy Registry parity — Bandit)
-        run: bandit -r . -s B101,B112,B311 -ll
+        run: bandit -r . -s B101,B112,B311
 
       - name: pyproject.toml is valid + has registry fields
         run: |

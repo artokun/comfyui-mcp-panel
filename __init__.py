@@ -168,7 +168,9 @@ def _detect_comfyui_url():
         if listen and listen not in (_ANY_IPV4_HOST, "::"):
             host = listen
     except Exception:
-        pass
+        # comfy.cli_args not importable (headless / older host) — keep the
+        # localhost default already in host/port.
+        host, port = "127.0.0.1", 8188
     return "http://{}:{}".format(host, port)
 
 
@@ -314,7 +316,8 @@ def _register_routes():
                     if comfyui_url is None:
                         comfyui_url = _coerce_comfyui_url(body.get("comfyui_url"))
             except Exception:
-                pass
+                # No/!invalid JSON body — fall back to query params (already read).
+                backend = backend or None
         if backend is not None and not isinstance(backend, str):
             return web.json_response(
                 {"ok": False, "message": "backend must be a string"}, status=400
