@@ -502,18 +502,16 @@ function remoteUrlSetting() {
   const v = getSetting(SETTING_REMOTE_URL);
   return typeof v === "string" ? v.trim() : "";
 }
-// External/local orchestrator mode (panel setting). When ON, the agent is run
-// by the USER on their own machine (`npx -y comfyui-mcp connect <url>`), NOT
-// spawned by the ComfyUI host — so Connect skips the host /connect POST and dials
-// the configured Bridge URL directly. OFF by default, which keeps the co-located
-// autospawn path (POST /connect) byte-for-byte unchanged.
+// External/local orchestrator mode (panel setting). The agent is run by the USER
+// on their own machine (`npx -y comfyui-mcp --panel-orchestrator`), NOT spawned by
+// the ComfyUI host — so Connect dials the configured Bridge URL directly.
 function externalOrchestratorMode() {
   // Always ON now: the pack is pure-frontend and can no longer spawn the
   // orchestrator (Comfy Registry security standards), so external/local is the
   // ONLY mode — Connect always dials the bridge directly and never POSTs the
-  // host /connect (which the stripped node answers 503). The user still starts
-  // the orchestrator out-of-band (`npx -y comfyui-mcp connect <url>` /
-  // `--panel-orchestrator`); the setting is retained only for back-compat.
+  // host /connect (which the stripped node answers 503). The user starts the
+  // orchestrator out-of-band (`npx -y comfyui-mcp --panel-orchestrator`), which
+  // auto-targets the ComfyUI the browser is on; the setting is a back-compat no-op.
   return true;
 }
 // The Bridge URL to dial for `backend`: its per-backend Settings value when set,
@@ -534,6 +532,20 @@ function comfyuiUrlForConnect() {
     return window.location.origin;
   } catch {
     return "<this-comfyui-url>";
+  }
+}
+// The ComfyUI URL to hand the orchestrator in `hello`: the advanced Remote-URL
+// override if the user set one, else the URL the browser was SERVED FROM
+// (window.location) — so the agent auto-targets whatever ComfyUI is open (local or
+// a RunPod proxy) with zero config. The orchestrator retargets to it and decides
+// local vs remote mode from the host, so a bare `--panel-orchestrator` just works.
+function comfyuiUrlForAgent() {
+  const override = remoteUrlSetting();
+  if (override) return override;
+  try {
+    return window.location.origin;
+  } catch {
+    return "";
   }
 }
 
@@ -4393,12 +4405,16 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // Single-port multi-provider: name the selected provider so ONE orchestrator
       // routes this tab to the right backend (default claude when unset).
       const backend = getBackend?.() || "claude";
+      // Auto-target: the URL the browser was served from (or the manual override),
+      // so a bare `--panel-orchestrator` points the agent at whatever ComfyUI is open.
+      const comfyuiUrl = comfyuiUrlForAgent();
       sock.send(
         JSON.stringify({
           type: "hello",
           tab_id: getTabId(),
           title: getWorkflowTitle(),
           backend,
+          ...(comfyuiUrl ? { comfyui_url: comfyuiUrl } : {}),
           ...(resume ? { resume } : {}),
         }),
       );
@@ -5819,9 +5835,12 @@ function buildPanel() {
       /win/i.test(navigator.platform || "") || /Windows/i.test(navigator.userAgent || "");
     // On Windows, `cmd /c` sidesteps the PowerShell execution-policy trap that
     // blocks the npx.ps1 shim ("running scripts is disabled on this system").
+    // No URL needed: the panel sends the ComfyUI host (window.location) in its
+    // hello, so a bare `--panel-orchestrator` auto-targets whatever ComfyUI is open.
+    void url;
     const runCmd = isWin
-      ? `cmd /c "npx -y comfyui-mcp connect ${url}"`
-      : `npx -y comfyui-mcp connect ${url}`;
+      ? `cmd /c "npx -y comfyui-mcp --panel-orchestrator"`
+      : `npx -y comfyui-mcp --panel-orchestrator`;
     runCol.append(onboardCmd(runCmd));
     if (isWin) {
       const note = document.createElement("div");
@@ -8579,10 +8598,11 @@ function buildPanel() {
     externalHintShown = true;
     const bridge = configuredBridgeUrlFor(selectedBackend);
     appendSystem(
-      "No agent is listening on the bridge (" + bridge + "). External orchestrator " +
-        "mode is ON, so this ComfyUI won’t start one. Run the agent on YOUR machine:\n" +
-        "    npx -y comfyui-mcp connect " + comfyuiUrlForConnect() + "\n" +
-        "then click Connect.",
+      "No agent is listening on the bridge (" + bridge + "). This ComfyUI won’t " +
+        "start one — run the agent on YOUR machine:\n" +
+        "    npx -y comfyui-mcp --panel-orchestrator\n" +
+        "It auto-targets the ComfyUI you have open (" + comfyuiUrlForConnect() +
+        "), then click Connect.",
     );
   }
   function resetAutoReclaim() {
