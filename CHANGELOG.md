@@ -6,7 +6,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
-## [0.4.7] - 2026-06-30
+## [0.4.7] - 2026-07-01
 
 ### Added
 
@@ -33,6 +33,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- **Auto-target the ComfyUI you're on — no `connect <url>`.** The panel is served
+  by ComfyUI, so it sends the URL it was loaded from (`window.location`) in its
+  hello; the orchestrator retargets to it and picks local vs remote mode from the
+  host. So `npx -y comfyui-mcp --panel-orchestrator` just works for both a local
+  ComfyUI and a remote (RunPod proxy) one — the start command everywhere is now the
+  bare `--panel-orchestrator`. The Remote ComfyUI URL setting stays as an advanced
+  override (subpath / tunnel cases the browser origin can't express). Requires
+  `comfyui-mcp` ≥ 0.23.0.
 - **Single-port multi-provider.** All providers now share ONE bridge
   (`ws://127.0.0.1:9180`) instead of a port per provider (claude 9180 / codex 9181
   / gemini 9182). The panel names its chosen provider in the `hello` handshake
