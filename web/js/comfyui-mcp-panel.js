@@ -5664,7 +5664,14 @@ function buildPanel() {
     "Click Connect to start an autonomous agent on your Claude subscription — no API keys. Sign in to Claude once (run `claude`) first. Prefer to run it yourself? Start the orchestrator, then Connect:";
   const helpCmd = document.createElement("code");
   helpCmd.className = "cmcp-cmd";
-  helpCmd.textContent = "npx -y comfyui-mcp --panel-orchestrator";
+  // `connect` (no URL) starts the orchestrator; the panel hands it THIS ComfyUI's
+  // host on connect (browser-host targeting), so it drives whatever you're viewing
+  // — local or a remote pod. The old `--panel-orchestrator` text confusingly read
+  // as "local only". Wrap in `cmd /c` on Windows, where a bare npx line can trip
+  // PowerShell's executable policy.
+  const _isWin = /win/i.test((navigator.platform || navigator.userAgent || ""));
+  const _connectCmd = "npx -y comfyui-mcp connect";
+  helpCmd.textContent = _isWin ? `cmd /c "${_connectCmd}"` : _connectCmd;
   helpCmd.title = "Click to copy";
   helpCmd.addEventListener("click", () => {
     navigator.clipboard?.writeText(helpCmd.textContent).then(
