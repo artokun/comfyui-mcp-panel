@@ -4087,7 +4087,7 @@ function focusFollowOnCommand(cmd, msg, reply) {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onShowMedia, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onShowMedia, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -4346,6 +4346,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // surfaced in the composer's completion menu.
       if (msg && msg.type === "commands" && Array.isArray(msg.commands)) {
         onCommands?.(msg.commands);
+      }
+      // Authoritative provider readiness from the orchestrator (the machine that
+      // actually runs the agents). Supersedes the ComfyUI-side probe, which is
+      // blind to the laptop behind a remote pod and never sees Claude's SDK.
+      if (msg && msg.type === "backends" && Array.isArray(msg.backends)) {
+        onBackends?.(msg);
       }
       // Structured acks (ready / working / options / …). The "ready" ack is sent
       // after the orchestrator has processed hello (resume armed), so it's the
@@ -5553,6 +5559,10 @@ function buildPanel() {
   // connect never erases "is this provider signed in", so the set-up affordance and
   // not-ready hints survive a reconnect.
   const backendReady = {};
+  // Once the connected orchestrator reports readiness over the bridge (the machine
+  // that actually RUNS the agents — authoritative), the ComfyUI-side Python probe
+  // (GET /backends, blind to the laptop behind a remote pod) must not override it.
+  let readinessFromOrchestrator = false;
   // Short per-provider hint shown under each provider row in the popup.
   const BACKEND_HINTS = { claude: "Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash" };
 
@@ -5654,7 +5664,14 @@ function buildPanel() {
     "Click Connect to start an autonomous agent on your Claude subscription — no API keys. Sign in to Claude once (run `claude`) first. Prefer to run it yourself? Start the orchestrator, then Connect:";
   const helpCmd = document.createElement("code");
   helpCmd.className = "cmcp-cmd";
-  helpCmd.textContent = "npx -y comfyui-mcp --panel-orchestrator";
+  // `connect` (no URL) starts the orchestrator; the panel hands it THIS ComfyUI's
+  // host on connect (browser-host targeting), so it drives whatever you're viewing
+  // — local or a remote pod. The old `--panel-orchestrator` text confusingly read
+  // as "local only". Wrap in `cmd /c` on Windows, where a bare npx line can trip
+  // PowerShell's executable policy.
+  const _isWin = /win/i.test((navigator.platform || navigator.userAgent || ""));
+  const _connectCmd = "npx -y comfyui-mcp connect";
+  helpCmd.textContent = _isWin ? `cmd /c "${_connectCmd}"` : _connectCmd;
   helpCmd.title = "Click to copy";
   helpCmd.addEventListener("click", () => {
     navigator.clipboard?.writeText(helpCmd.textContent).then(
@@ -5860,7 +5877,13 @@ function buildPanel() {
   // and — when a saved pick isn't usable but another provider IS — auto-switch the
   // active backend (in-memory only; the saved pref is left untouched so it returns
   // once that provider is set up) and leave a one-line system note.
-  function applyReadiness(data) {
+  function applyReadiness(data, opts) {
+    const fromOrchestrator = !!(opts && opts.fromOrchestrator);
+    // The orchestrator's report wins: it runs on the agent machine and knows the
+    // truth (incl. Claude, which has no CLI). Ignore a later pod-side probe that
+    // would falsely downgrade a connected provider to "CLI not installed".
+    if (fromOrchestrator) readinessFromOrchestrator = true;
+    else if (readinessFromOrchestrator) return;
     const list = Array.isArray(data?.backends) ? data.backends : [];
     // Only act when the backend actually reports readiness. Derive any_ready from
     // the per-backend `ready` flags if the top-level field is absent (older Python
@@ -8004,6 +8027,13 @@ function buildPanel() {
       // SDK-provided slash commands → surface in the composer completion menu.
       sdkCommands = Array.isArray(list) ? list : [];
     },
+    onBackends(data) {
+      // Authoritative readiness from the connected orchestrator — the machine that
+      // runs the agents. Wins over the ComfyUI-side probe (which false-flags "CLI
+      // not installed" behind a remote pod). Repaint the chips so hints refresh.
+      applyReadiness(data, { fromOrchestrator: true });
+      renderBackendChips(Array.isArray(data.backends) ? data.backends : knownBackends);
+    },
     onAck(ack) {
       // Receipt: orchestrator got it (not dropped) → cancel the failure timer.
       // The bubble stays QUEUED (muted) until the agent actually reads it.
@@ -8023,6 +8053,21 @@ function buildPanel() {
       if (ack?.kind === "options" && ack.deferred) {
         appendSystem(`Effort → ${ack.effort ?? "default"} — applies after the current turn finishes.`);
         return;
+      }
+      // A "ready" ack PROVES this backend actually runs on the agent machine —
+      // mark it ready so the switcher never shows the live provider as "CLI not
+      // installed" (covers a working provider whose on-disk login heuristic
+      // under-reported, e.g. macOS Keychain). Non-returning: the resume branches
+      // below still need to run on this same ack.
+      if (ack?.kind === "ready") {
+        const b = typeof ack.backend === "string" ? ack.backend : connectedBackend;
+        if (b) {
+          backendReady[b] = { cli: true, auth: true, ready: true };
+          readinessFromOrchestrator = true;
+          anyReady = true;
+          onboard.hidden = true;
+          renderBackendChips(knownBackends);
+        }
       }
       // Post-restart auto-resume (#3): the "ready" ack is sent after the
       // orchestrator armed hello.resume, so resuming the agent is safe now.
