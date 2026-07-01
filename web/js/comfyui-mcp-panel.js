@@ -274,6 +274,7 @@ const SETTING_AUTOCONNECT = "comfyui-mcp.autoConnect";
 const SETTING_FOCUS_FOLLOW = "comfyui-mcp.zoomToAction";
 const SETTING_STALL_S = "comfyui-mcp.stallWarningSeconds";
 const SETTING_REMOTE_URL = "comfyui-mcp.remoteComfyuiUrl";
+const SETTING_EXTERNAL_ORCH = "comfyui-mcp.externalOrchestrator";
 const SETTING_TOKEN_CIVITAI = "comfyui-mcp.setCivitaiToken";
 const SETTING_TOKEN_HF = "comfyui-mcp.setHuggingfaceToken";
 // One-time flag: on first load with this feature, push the user's EXISTING
@@ -488,6 +489,29 @@ function stallSettingSeconds() {
 function remoteUrlSetting() {
   const v = getSetting(SETTING_REMOTE_URL);
   return typeof v === "string" ? v.trim() : "";
+}
+// External/local orchestrator mode (panel setting). When ON, the agent is run
+// by the USER on their own machine (`npx -y comfyui-mcp connect <url>`), NOT
+// spawned by the ComfyUI host — so Connect skips the host /connect POST and dials
+// the configured Bridge URL directly. OFF by default, which keeps the co-located
+// autospawn path (POST /connect) byte-for-byte unchanged.
+function externalOrchestratorMode() {
+  return !!getSetting(SETTING_EXTERNAL_ORCH);
+}
+// The Bridge URL to dial for `backend`: its per-backend Settings value when set,
+// else that backend’s default port (claude 9180 / codex 9181 / gemini 9182).
+function configuredBridgeUrlFor(backend) {
+  const v = getSetting(SETTING_BRIDGE_URL[backend]);
+  return (typeof v === "string" && v.trim()) || defaultBridgeUrlFor(backend);
+}
+// Best-effort ComfyUI URL to put in the "start it locally" hint — the address of
+// the ComfyUI the user is viewing (a remote pod when opened over its proxy URL).
+function comfyuiUrlForConnect() {
+  try {
+    return window.location.origin;
+  } catch {
+    return "<this-comfyui-url>";
+  }
 }
 
 // Build the settings list registered on the extension. Defined as a function so
@@ -741,6 +765,24 @@ function panelSettingsList() {
       onChange: () => {
         // No live apply: the URL is baked into the orchestrator's MCP at spawn, so
         // it takes effect on the next Connect (Disconnect → Connect).
+      },
+    },
+    {
+      id: SETTING_EXTERNAL_ORCH,
+      name: "Use external/local orchestrator (advanced)",
+      category: cat("General", "Use external/local orchestrator (advanced)"),
+      sortOrder: 141,
+      tooltip:
+        "Advanced: run the agent OUTSIDE this ComfyUI host — started by YOU on your own machine " +
+        "(npx -y comfyui-mcp connect <this comfyui url>) instead of being spawned by this ComfyUI. " +
+        "Use it to drive a REMOTE ComfyUI (e.g. a RunPod pod with no Node/agent) from an agent on " +
+        "your laptop. When ON, Connect does NOT ask this host to start anything — it connects straight " +
+        "to the Bridge URL (default ws://127.0.0.1:9180). Leave OFF for the normal local setup where " +
+        "ComfyUI starts the agent for you.",
+      type: "boolean",
+      defaultValue: false,
+      onChange: () => {
+        // No live side effect — it only changes how the NEXT Connect behaves.
       },
     },
     {
@@ -7649,6 +7691,7 @@ function buildPanel() {
         sendStallConfig();
       }
       if (!connected) hideThinking();
+      if (state === "disconnected" && externalOrchestratorMode()) showExternalHintOnce();
       // NB: do NOT push set_options here. The saved model id is only known-valid
       // once the live catalog arrives, so the push happens in applyModelCatalog
       // — sending an unvalidated fallback id can wedge the agent on a model the
@@ -7798,6 +7841,13 @@ function buildPanel() {
     // bounded + reset on a successful handshake, so neither can become a storm.
     // Returns true if it handled it (suppresses the manual warning).
     onHandshakeTimeout(timedOutUrl) {
+      if (externalOrchestratorMode()) {
+        // No host to reclaim — re-dial once (the local agent may still be booting),
+        // then show the "start it locally" hint instead of the squatter warning.
+        if (tryHandshakeRedial(timedOutUrl)) return true;
+        showExternalHintOnce();
+        return true; // handled — suppress the generic "port held by something" warning
+      }
       if (tryHandshakeRedial(timedOutUrl)) return true;
       return tryAutoReclaim(timedOutUrl);
     },
@@ -8429,11 +8479,27 @@ function buildPanel() {
   // Connect AND every successful handshake), so it can NEVER become a redial storm.
   const MAX_HANDSHAKE_REDIALS = 2;
   let handshakeRedialsLeft = MAX_HANDSHAKE_REDIALS;
+  // One-shot "start it locally" hint for external-orchestrator mode: shown when
+  // no agent answers on the bridge. Reset on each user Connect AND on a successful
+  // handshake (both call resetAutoReclaim) so it can re-appear for a later drop.
+  let externalHintShown = false;
+  function showExternalHintOnce() {
+    if (externalHintShown) return;
+    externalHintShown = true;
+    const bridge = configuredBridgeUrlFor(selectedBackend);
+    appendSystem(
+      "No agent is listening on the bridge (" + bridge + "). External orchestrator " +
+        "mode is ON, so this ComfyUI won’t start one. Run the agent on YOUR machine:\n" +
+        "    npx -y comfyui-mcp connect " + comfyuiUrlForConnect() + "\n" +
+        "then click Connect.",
+    );
+  }
   function resetAutoReclaim() {
     autoReclaimsLeft = MAX_AUTO_RECLAIMS;
     autoRespawnsLeft = MAX_AUTO_RESPAWNS;
     respawnGaveUpNoticed = false;
     handshakeRedialsLeft = MAX_HANDSHAKE_REDIALS;
+    externalHintShown = false;
   }
 
   // SOFT-RELOAD ↔ AUTO-RESPAWN interlock. A deliberate softReload(orchestrator)
@@ -8530,6 +8596,10 @@ function buildPanel() {
   // true if it drove a respawn (the caller then skips its bare WS retry), false to
   // let the WS keep retrying / fall back to the manual warning.
   function tryAutoRespawn() {
+    // External/local orchestrator: this host doesn’t own the agent process, so it
+    // can’t respawn it. Let the bare WS retry keep trying (the user restarts it
+    // locally); never POST /connect here.
+    if (externalOrchestratorMode()) return false;
     if (!lsGet(AUTOCONNECT_KEY)) return false; // user never connected / disconnected
     // A deliberate soft-reload owns the respawn — DON'T compete. Return false so
     // scheduleReconnect keeps doing bare WS retries (the soft-reload's own backoff
@@ -8603,6 +8673,8 @@ function buildPanel() {
   // Returns true if it kicked off a reclaim (the bridge client then suppresses its
   // manual warning); false to let the warning show (budget spent / can't reclaim).
   function tryAutoReclaim(timedOutUrl) {
+    // External/local orchestrator: nothing on this host to reclaim.
+    if (externalOrchestratorMode()) return false;
     if (autoReclaiming) return true; // one in flight already — don't stack
     if (autoReclaimsLeft <= 0) return false; // budget spent → fall back to warning
     autoReclaimsLeft -= 1;
@@ -8685,6 +8757,25 @@ function buildPanel() {
     const manualOverride =
       !!wanted && wanted !== defaultBridgeUrlFor(selectedBackend) && wanted !== lastAutoUrl;
     if (manualOverride && wanted !== client.currentUrl()) client.setUrl(wanted);
+    // EXTERNAL/LOCAL ORCHESTRATOR MODE: the agent is run by the user on THEIR
+    // machine, not spawned by this ComfyUI host — so do NOT POST /connect (this
+    // host may have no Node/agent, e.g. a remote pod). Dial the configured Bridge
+    // URL for the selected backend directly; the bounded WS retry surfaces a clear
+    // "start it locally" hint if nothing is listening yet (showExternalHintOnce).
+    if (externalOrchestratorMode()) {
+      connecting = false;
+      if (!manualOverride) {
+        const target = configuredBridgeUrlFor(selectedBackend);
+        if (target && target !== client.currentUrl()) {
+          client.setUrl(target);
+          urlInput.value = target;
+          lastAutoUrl = target;
+        }
+      }
+      if (myGen !== connectGen) return;
+      client.start();
+      return;
+    }
     try {
       // Send the selected backend so the pack starts (and points us at) the right
       // orchestrator. Default "claude" keeps the historical no-pick Connect path.
