@@ -40,6 +40,15 @@ All notable changes to this project are documented here. This project adheres to
   Switching provider re-handshakes on the same bridge (fresh session for the new
   provider — agent sessions aren't portable across providers). Requires the paired
   `comfyui-mcp` single-port orchestrator.
+- **Provider switch replays the transcript.** Because a switch starts a fresh
+  session on the new provider, the panel now sends the visible user+agent
+  transcript as one-shot `context` on the first message after a switch, so the new
+  provider picks up the conversation (internal thinking / tool history don't carry
+  — they aren't portable). Capped from the end so a long chat can't blow context.
+- **External/local orchestrator is now the only mode.** Since the pack can no
+  longer spawn the orchestrator, Connect always dials the bridge directly (never
+  the host `/connect` POST). The "Use external/local orchestrator" toggle is
+  retained for back-compat but is now a no-op.
 - **The pack is now a pure frontend extension — it never spawns the orchestrator.**
   Every published registry version `0.1.0`–`0.4.6` sat `NodeVersionStatusFlagged`
   on the Comfy Registry (so the registry computed no `latest_version` and
