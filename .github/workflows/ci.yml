@@ -37,10 +37,26 @@ jobs:
         with:
           python-version: "3.11"
 
-      # __init__.py must compile and (by design) only register routes at import
-      # time — no import-time subprocess. py_compile catches syntax breakage.
+      # __init__.py must compile and (by design) only register read-only routes
+      # at import time. py_compile catches syntax breakage.
       - name: Python compile check (__init__.py)
         run: python -m py_compile __init__.py
+
+      - name: Install bandit
+        run: pip install bandit
+
+      # Comfy Registry security-scan parity. The Registry flags custom nodes that
+      # spawn processes / install-and-run packages at runtime, or use
+      # eval/exec/os.system/pickle — see https://docs.comfy.org/registry/standards.
+      # The Registry's own scanner is private, but Comfy-Org's public stand-in
+      # (christian-byrne/custom-nodes-security-scan) runs Bandit with these exact
+      # excludes (B101 assert / B112 try-except-continue / B311 random). Running
+      # the SAME config here fails a would-be-flagged release in CI FIRST, instead
+      # of publishing a version that never promotes to "latest" on the Registry.
+      # (`import subprocess` = B404; subprocess calls = B602/B603 — exactly what
+      # flagged every 0.x release before this pack went pure-frontend.)
+      - name: Security scan (Comfy Registry parity — Bandit)
+        run: bandit -r . -s B101,B112,B311 -ll
 
       - name: pyproject.toml is valid + has registry fields
         run: |

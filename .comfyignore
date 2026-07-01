@@ -16,3 +16,6 @@ test-results/
 package.json
 package-lock.json
 tsconfig.json
+# Dev-only tooling — keep the published (security-scanned) archive minimal
+scripts/
+.githooks/
