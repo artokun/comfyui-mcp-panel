@@ -1701,6 +1701,86 @@ function manualChangeBanner() {
   );
 }
 
+// Signature of the validation state we last injected into the agent's turn, so
+// errors surface the instant they appear/change but an UNCHANGED set isn't
+// re-injected every turn (event-driven, like manualChangeBanner — not
+// poll-every-turn, which would burn tokens and nag about mid-build graphs).
+let lastInjectedValidationSig = null;
+
+// Surface ComfyUI's OWN pre-run validation result — app.lastNodeErrors, the exact
+// data behind the frontend's "N ERRORS" panel — plus the last runtime execution
+// error, so the agent learns a graph is broken the MOMENT the user does, without
+// running a redundant validate. These are PRE-RUN validation errors (missing
+// models, value_not_in_list, broken links); labeled distinctly from runtime
+// failures because the agent acts on them differently. Returns "" when the graph
+// is clean or the state is unchanged since we last injected it.
+function validationBanner() {
+  let nodeErrors = null;
+  try {
+    nodeErrors =
+      app && app.lastNodeErrors && Object.keys(app.lastNodeErrors).length
+        ? app.lastNodeErrors
+        : null;
+  } catch {
+    nodeErrors = null;
+  }
+  const execErr = lastExecutionError;
+  if (!nodeErrors && !execErr) {
+    lastInjectedValidationSig = null; // clean → let a future re-appearance inject again
+    return "";
+  }
+  let sig;
+  try {
+    sig = JSON.stringify({
+      n: nodeErrors,
+      e: execErr && (execErr.node_id ?? execErr.exception_message ?? execErr.ts),
+    });
+  } catch {
+    sig = String(!!nodeErrors) + "|" + String(!!execErr);
+  }
+  if (sig === lastInjectedValidationSig) return ""; // unchanged since last inject
+  lastInjectedValidationSig = sig;
+
+  let out = "";
+  if (nodeErrors) {
+    const lines = [];
+    for (const [nid, info] of Object.entries(nodeErrors)) {
+      const ct = (info && info.class_type) || "?";
+      const errs = info && Array.isArray(info.errors) ? info.errors : [];
+      if (!errs.length) {
+        lines.push(`node ${nid} (${ct}): invalid`);
+        continue;
+      }
+      for (const e of errs) {
+        const detail = e && e.details ? ` — ${e.details}` : "";
+        lines.push(`node ${nid} (${ct}): ${(e && (e.message || e.type)) || "error"}${detail}`);
+      }
+    }
+    const MAX = 30;
+    const shown = lines.slice(0, MAX);
+    const more = lines.length > MAX ? `\n  …and ${lines.length - MAX} more` : "";
+    out +=
+      `⚠️ GRAPH VALIDATION ERRORS — ComfyUI rejected the current graph at queue time; ` +
+      `the user is seeing these in the frontend's error panel RIGHT NOW. These are PRE-RUN ` +
+      `validation errors (missing models, invalid widget values / value_not_in_list, broken ` +
+      `links) — NOT runtime failures:\n  ` +
+      shown.join("\n  ") +
+      more +
+      `\nAddress these before running. If you're mid-build they may be expected — judge in ` +
+      `context. Re-check anytime with panel_get_errors.\n\n`;
+  }
+  if (execErr) {
+    const msg = execErr.exception_message || execErr.exception_type || "execution error";
+    const where = execErr.node_type
+      ? ` in ${execErr.node_type} (node ${execErr.node_id ?? "?"})`
+      : "";
+    out +=
+      `⚠️ LAST RUN FAILED${where}: ${msg}\nThis is a RUNTIME error from the most recent ` +
+      `execution (distinct from the validation errors above).\n\n`;
+  }
+  return out;
+}
+
 // Restore the canvas to the snapshot captured before the message with this mid
 // (the per-message rollback). Returns the snapshot or null.
 function revertGraphSnapshotByMid(mid) {
@@ -10244,6 +10324,12 @@ function buildPanel() {
     // prepended to the agent-facing text only (the visible `text` is untouched).
     const changeBanner = manualChangeBanner();
     if (changeBanner) sendText = changeBanner + sendText;
+    // Surface ComfyUI's own pre-run validation errors (missing models,
+    // value_not_in_list, broken links) the instant they appear — the same data the
+    // user sees in the frontend's error panel — so the agent isn't blind to a broken
+    // graph until it independently re-runs. Conditional + deduped (event-driven).
+    const valBanner = validationBanner();
+    if (valBanner) sendText = valBanner + sendText;
     // Track delivery: trackSend marks "Sending…", then the working ack flips it
     // to "✓ Seen" (or a timeout / closed socket flips it to "Not delivered").
     // `text` (the raw composer text) is kept so ✎ can restore it for editing.
