@@ -20,6 +20,16 @@ All notable changes to this project are documented here. This project adheres to
   validated server-side (`http`/`https` + host) and applied on the next Connect. Your live
   canvas still follows whichever ComfyUI you opened in the browser. (MCP already supported
   remote via `COMFYUI_URL`/`isRemoteMode`; this exposes it from the panel — no MCP change.)
+- **External/local orchestrator mode** (Settings → General → "Use external/local
+  orchestrator (advanced)"). When ON, Connect no longer asks the ComfyUI host to
+  spawn an orchestrator — it connects the bridge WebSocket straight to the
+  configured Bridge URL (default `ws://127.0.0.1:9180`) and treats the host
+  `/comfyui_mcp_panel/connect` POST as skipped. This lets an agent running on the
+  USER's machine (`npx -y comfyui-mcp connect <url>`) drive a REMOTE ComfyUI (e.g.
+  a RunPod pod with no Node/agent) — no agent login on the box, no tunnel. If no
+  orchestrator answers on the bridge, the panel surfaces a clear "start it locally"
+  hint with the exact `npx` command. OFF by default, so the co-located autospawn
+  path is byte-for-byte unchanged. The toggle persists via ComfyUI settings.
 
 ## [0.4.6] - 2026-06-29
 
