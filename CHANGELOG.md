@@ -6,6 +6,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.13] - 2026-07-01
+
+### Changed
+
+- **The connect command now prefills THIS pod's own URL on https pages** (help
+  dropdown, onboarding step, no-agent hint) — e.g.
+  `npx -y comfyui-mcp@latest connect https://<this-pod>`, read from
+  `window.location`. Running it with the URL lets the orchestrator open a secure
+  `wss://` bridge that works in **every browser** (Safari / Firefox / Comet), not
+  just Chrome-with-a-prompt. Composes with the per-shell copy block (0.4.12); bare
+  form still shown on http/localhost. Pairs with comfyui-mcp 0.23.4.
+
 ## [0.4.12] - 2026-07-01
 
 ### Changed

@@ -1680,6 +1680,22 @@ function diffGraphsForAgent(prev, curr, liveGraph) {
 // A copy widget for the `connect` command, offered PER SHELL. PowerShell needs a
 // `cmd /c "…"` wrapper to dodge the npx.ps1 execution-policy trap ("running scripts
 // is disabled on this system"); Command Prompt and bash/zsh take the command bare.
+// The `connect` command to show. On an https page (a remote pod) the local
+// orchestrator can't learn this pod's URL on its own — the panel's hello rides the
+// ws bridge, which browsers block from a secure origin — so PREFILL this pod's own
+// hostname (window.location.origin). Running it that way opens a secure wss:// bridge
+// that works in every browser (Safari/Firefox/Comet), not just Chrome-with-a-prompt.
+// On http/localhost the bare form auto-targets local.
+function connectCommand() {
+  const base = "npx -y comfyui-mcp@latest connect";
+  try {
+    if (location.protocol === "https:") return `${base} ${location.origin}`;
+  } catch {
+    // location unavailable — bare form
+  }
+  return base;
+}
+
 // Three pills (detected OS preselected) switch the shown command AND copy it; the
 // code line is click-to-copy too. `baseCmd` is the plain (cmd / unix) form.
 function makeShellCommandBlock(baseCmd) {
@@ -5806,7 +5822,7 @@ function buildPanel() {
   // — local or a remote pod. Offer the command per shell: PowerShell needs a
   // `cmd /c "…"` wrapper to dodge the npx.ps1 execution-policy trap; cmd and
   // bash/zsh take it bare.
-  helpDiv.appendChild(makeShellCommandBlock("npx -y comfyui-mcp@latest connect"));
+  helpDiv.appendChild(makeShellCommandBlock(connectCommand()));
 
   // Bridge URL is now an ADVANCED/fallback control — the backend chips set the URL
   // for you. Keep it (collapsed) for manual/user-managed orchestrators.
@@ -5977,7 +5993,7 @@ function buildPanel() {
     // hello, so a bare `connect` auto-targets whatever ComfyUI is open. Offer the
     // command per shell (PowerShell / Command Prompt / macOS·Linux) — the PS pill
     // ships the `cmd /c` wrapper, so no separate execution-policy caveat is needed.
-    runCol.append(makeShellCommandBlock("npx -y comfyui-mcp@latest connect"));
+    runCol.append(makeShellCommandBlock(connectCommand()));
     const clickNote = document.createElement("div");
     clickNote.className = "cmcp-onboard-step";
     clickNote.textContent = "…then click Connect above.";
@@ -8756,10 +8772,8 @@ function buildPanel() {
     const bridge = configuredBridgeUrlFor(selectedBackend);
     appendSystem(
       "No agent is listening on the bridge (" + bridge + "). This ComfyUI won’t " +
-        "start one — run the agent on YOUR machine:\n" +
-        "    npx -y comfyui-mcp@latest connect\n" +
-        "It auto-targets the ComfyUI you have open (" + comfyuiUrlForConnect() +
-        "), then click Connect.",
+        "start one — run the agent on YOUR machine, then click Connect:\n" +
+        "    " + connectCommand(),
     );
   }
   function resetAutoReclaim() {
