@@ -97,14 +97,16 @@ function defaultBridgeUrlFor(backend) {
 }
 
 function loadBridgeUrl() {
+  // Single-port: the single (advanced) Bridge URL override, else the default. Old
+  // per-port localStorage / per-backend values are intentionally ignored so a
+  // stale custom port can't make the initial connect dial a dead bridge.
   try {
-    const saved = window.localStorage.getItem(STORAGE_KEY_BRIDGE);
-    // Migrate anyone pinned to the old shared 9101 default onto the new port.
-    if (!saved || saved === LEGACY_BRIDGE_URL) return DEFAULT_BRIDGE_URL;
-    return saved;
+    const v = getSetting(SETTING_BRIDGE);
+    if (typeof v === "string" && v.trim()) return v.trim();
   } catch {
-    return DEFAULT_BRIDGE_URL;
+    // settings not ready yet — fall through to the default.
   }
+  return DEFAULT_BRIDGE_URL;
 }
 
 function saveBridgeUrl(url) {
@@ -275,6 +277,11 @@ const SETTING_BRIDGE_URL = {
 // Pre-per-backend single Bridge URL key — migrated ONCE into the Claude group so a
 // returning user's custom port isn't lost (runs in the groups-migration block).
 const LEGACY_SETTING_BRIDGE_URL = "comfyui-mcp.bridgeUrl";
+// Single-port multi-provider: ONE bridge serves every provider, so there is ONE
+// (advanced) Bridge URL. A FRESH key — deliberately NOT the per-backend or legacy
+// ones, whose stale pre-single-port values (e.g. a migrated custom port) must not
+// leak in and make the panel dial a dead port.
+const SETTING_BRIDGE = "comfyui-mcp.bridgeUrl.single";
 const SETTING_AUTOCONNECT = "comfyui-mcp.autoConnect";
 const SETTING_FOCUS_FOLLOW = "comfyui-mcp.zoomToAction";
 const SETTING_STALL_S = "comfyui-mcp.stallWarningSeconds";
@@ -512,8 +519,13 @@ function externalOrchestratorMode() {
 // The Bridge URL to dial for `backend`: its per-backend Settings value when set,
 // else that backend’s default port (claude 9180 / codex 9181 / gemini 9182).
 function configuredBridgeUrlFor(backend) {
-  const v = getSetting(SETTING_BRIDGE_URL[backend]);
-  return (typeof v === "string" && v.trim()) || defaultBridgeUrlFor(backend);
+  // Single-port multi-provider: ONE bridge for every provider. Honor only the
+  // single (advanced) Bridge URL override, else the default — ignore any stale
+  // per-backend value from the pre-single-port layout. (backend kept for
+  // call-site compatibility.)
+  void backend;
+  const v = getSetting(SETTING_BRIDGE);
+  return (typeof v === "string" && v.trim()) || DEFAULT_BRIDGE_URL;
 }
 // Best-effort ComfyUI URL to put in the "start it locally" hint — the address of
 // the ComfyUI the user is viewing (a remote pod when opened over its proxy URL).
@@ -779,21 +791,22 @@ function panelSettingsList() {
       },
     },
     {
-      id: SETTING_EXTERNAL_ORCH,
-      name: "Use external/local orchestrator (advanced)",
-      category: cat("General", "Use external/local orchestrator (advanced)"),
+      // Single-port multi-provider: ONE bridge for every provider (the per-backend
+      // Bridge URLs and the old external-orchestrator toggle are gone — external is
+      // now the only mode). Advanced: only needed for a non-default port.
+      id: SETTING_BRIDGE,
+      name: "Bridge URL (advanced)",
+      category: cat("General", "Bridge URL (advanced)"),
       sortOrder: 141,
       tooltip:
-        "Advanced: run the agent OUTSIDE this ComfyUI host — started by YOU on your own machine " +
-        "(npx -y comfyui-mcp connect <this comfyui url>) instead of being spawned by this ComfyUI. " +
-        "Use it to drive a REMOTE ComfyUI (e.g. a RunPod pod with no Node/agent) from an agent on " +
-        "your laptop. When ON, Connect does NOT ask this host to start anything — it connects straight " +
-        "to the Bridge URL (default ws://127.0.0.1:9180). Leave OFF for the normal local setup where " +
-        "ComfyUI starts the agent for you.",
-      type: "boolean",
-      defaultValue: false,
-      onChange: () => {
-        // No live side effect — it only changes how the NEXT Connect behaves.
+        "WebSocket URL of the panel orchestrator bridge — ONE bridge now serves every provider " +
+        "(default ws://127.0.0.1:9180). Only change this if you start the orchestrator on a " +
+        "non-default port (COMFYUI_MCP_BRIDGE_PORT). Applies on the next Connect.",
+      type: "text",
+      defaultValue: DEFAULT_BRIDGE_URL,
+      onChange: (v) => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyBridgeUrl?.(v);
       },
     },
     {
@@ -816,18 +829,15 @@ function panelSettingsList() {
         }
       },
     },
-    // ---- Claude (Default model, Default reasoning effort, Bridge URL) ----
+    // ---- Claude (Default model, Default reasoning effort) ----
     modelSetting("claude", 130),
     effortSetting("claude", 125),
-    bridgeUrlSetting("claude", 120),
-    // ---- ChatGPT (Codex) (Default model, Default reasoning effort, Bridge URL) ----
+    // ---- ChatGPT (Codex) (Default model, Default reasoning effort) ----
     modelSetting("codex", 110),
     effortSetting("codex", 105),
-    bridgeUrlSetting("codex", 100),
-    // ---- Gemini (Default model, Default reasoning effort, Bridge URL) ----
+    // ---- Gemini (Default model, Default reasoning effort) ----
     modelSetting("gemini", 90),
     effortSetting("gemini", 85),
-    bridgeUrlSetting("gemini", 80),
     // ---- API tokens (LAST) ----
     tokenSetting(SETTING_TOKEN_CIVITAI, "CIVITAI_API_TOKEN", "CivitAI", 20),
     tokenSetting(SETTING_TOKEN_HF, "HUGGINGFACE_TOKEN", "HuggingFace", 15),
@@ -6303,10 +6313,10 @@ function buildPanel() {
       } catch {}
     }
     seedPrefsFromBackendGroup(selectedBackend);
-    // Per-backend Bridge URL: seed the field from the ACTIVE backend's setting,
-    // falling back to that backend's default port (claude 9180 / codex 9181).
-    const su =
-      getSetting(SETTING_BRIDGE_URL[selectedBackend]) || defaultBridgeUrlFor(selectedBackend);
+    // Single-port: seed the Bridge URL field from the ONE (advanced) override, else
+    // the single default — never the stale per-backend value (that's what made the
+    // panel dial a dead port after upgrade).
+    const su = configuredBridgeUrlFor(selectedBackend);
     if (su && su !== urlInput.value) {
       urlInput.value = su;
       saveBridgeUrl(su);
@@ -8951,7 +8961,7 @@ function buildPanel() {
     // setUrl only updates its `url` here (its connect() no-ops while closed);
     // connectAgent's client.start() opens it. urlInput has no settings onChange wired,
     // so updating it can't re-enter the storm.
-    const nextUrl = getSetting(SETTING_BRIDGE_URL[id]) || defaultBridgeUrlFor(id);
+    const nextUrl = configuredBridgeUrlFor(id);
     urlInput.value = nextUrl;
     if (client.currentUrl() !== nextUrl) client.setUrl(nextUrl);
     void connectAgent({ fromChip: true });
