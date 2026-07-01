@@ -6,6 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.12] - 2026-07-01
+
+### Changed
+
+- **Per-shell copy for the `connect` command.** The Settings connect help and the
+  onboarding "start the agent" step now offer the command as **three labeled copy
+  buttons — PowerShell, Command Prompt, macOS / Linux** — with your detected OS
+  preselected. PowerShell copies the `cmd /c "npx -y comfyui-mcp@latest connect"`
+  form (which sidesteps the `npx.ps1` execution-policy trap), while Command Prompt
+  and bash/zsh copy the bare `npx -y comfyui-mcp@latest connect`. Replaces the
+  single OS-guessed command + Windows caveat, so a copy always pastes-and-runs in
+  the shell you're actually using.
+
 ## [0.4.11] - 2026-07-01
 
 ### Added

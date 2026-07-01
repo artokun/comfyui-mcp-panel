@@ -1677,6 +1677,62 @@ function diffGraphsForAgent(prev, curr, liveGraph) {
 // Build the banner to prepend to a user turn (empty string when nothing changed).
 // Consumes the baseline (resets it to the current graph) so the same edits aren't
 // re-reported if the user sends twice without the agent acting in between.
+// A copy widget for the `connect` command, offered PER SHELL. PowerShell needs a
+// `cmd /c "…"` wrapper to dodge the npx.ps1 execution-policy trap ("running scripts
+// is disabled on this system"); Command Prompt and bash/zsh take the command bare.
+// Three pills (detected OS preselected) switch the shown command AND copy it; the
+// code line is click-to-copy too. `baseCmd` is the plain (cmd / unix) form.
+function makeShellCommandBlock(baseCmd) {
+  const forms = { powershell: `cmd /c "${baseCmd}"`, cmd: baseCmd, unix: baseCmd };
+  const shells = [
+    { key: "powershell", label: "PowerShell" },
+    { key: "cmd", label: "Command Prompt" },
+    { key: "unix", label: "macOS / Linux" },
+  ];
+  const isWin = /win/i.test(navigator.platform || navigator.userAgent || "");
+  let selected = isWin ? "powershell" : "unix";
+
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "display:flex;flex-direction:column;gap:0.375rem;margin-top:0.375rem;";
+  const pills = document.createElement("div");
+  pills.style.cssText = "display:flex;gap:0.25rem;flex-wrap:wrap;";
+  const code = document.createElement("code");
+  code.className = "cmcp-cmd";
+  code.title = "Click to copy";
+
+  let flashTimer = null;
+  const copy = (text) =>
+    navigator.clipboard?.writeText(text).then(() => {
+      code.textContent = "Copied ✓";
+      if (flashTimer) clearTimeout(flashTimer);
+      flashTimer = setTimeout(() => { code.textContent = forms[selected]; }, 900);
+    }, () => {});
+  const render = () => {
+    code.textContent = forms[selected];
+    for (const b of pills.children) {
+      const on = b.dataset.shell === selected;
+      b.style.background = on ? "var(--p-primary-color,#2563eb)" : "";
+      b.style.color = on ? "var(--p-primary-contrast-color,#fff)" : "";
+      b.style.borderColor = on ? "transparent" : "";
+      b.style.opacity = on ? "1" : "0.7";
+    }
+  };
+  for (const s of shells) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "cmcp-btn";
+    b.dataset.shell = s.key;
+    b.textContent = s.label;
+    b.style.cssText = "font-size:0.72rem;padding:0.12rem 0.45rem;";
+    b.addEventListener("click", () => { selected = s.key; render(); copy(forms[s.key]); });
+    pills.appendChild(b);
+  }
+  code.addEventListener("click", () => copy(forms[selected]));
+  wrap.append(pills, code);
+  render();
+  return wrap;
+}
+
 function manualChangeBanner() {
   if (!lastAgentGraph) return "";
   let curr, live;
@@ -5745,24 +5801,12 @@ function buildPanel() {
   helpDiv.className = "cmcp-help";
   helpDiv.textContent =
     "Click Connect to start an autonomous agent on your Claude subscription — no API keys. Sign in to Claude once (run `claude`) first. Prefer to run it yourself? Start the orchestrator, then Connect:";
-  const helpCmd = document.createElement("code");
-  helpCmd.className = "cmcp-cmd";
   // `connect` (no URL) starts the orchestrator; the panel hands it THIS ComfyUI's
   // host on connect (browser-host targeting), so it drives whatever you're viewing
-  // — local or a remote pod. The old `--panel-orchestrator` text confusingly read
-  // as "local only". Wrap in `cmd /c` on Windows, where a bare npx line can trip
-  // PowerShell's executable policy.
-  const _isWin = /win/i.test((navigator.platform || navigator.userAgent || ""));
-  const _connectCmd = "npx -y comfyui-mcp@latest connect";
-  helpCmd.textContent = _isWin ? `cmd /c "${_connectCmd}"` : _connectCmd;
-  helpCmd.title = "Click to copy";
-  helpCmd.addEventListener("click", () => {
-    navigator.clipboard?.writeText(helpCmd.textContent).then(
-      () => appendSystem("Command copied."),
-      () => {},
-    );
-  });
-  helpDiv.appendChild(helpCmd);
+  // — local or a remote pod. Offer the command per shell: PowerShell needs a
+  // `cmd /c "…"` wrapper to dodge the npx.ps1 execution-policy trap; cmd and
+  // bash/zsh take it bare.
+  helpDiv.appendChild(makeShellCommandBlock("npx -y comfyui-mcp@latest connect"));
 
   // Bridge URL is now an ADVANCED/fallback control — the backend chips set the URL
   // for you. Keep it (collapsed) for manual/user-managed orchestrators.
@@ -5929,26 +5973,11 @@ function buildPanel() {
     runProv.className = "cmcp-onboard-prov";
     runProv.textContent = "Then start the agent (on this machine)";
     runCol.appendChild(runProv);
-    let url = "<this-comfyui-url>";
-    try { url = window.location.origin; } catch { /* keep placeholder */ }
-    const isWin =
-      /win/i.test(navigator.platform || "") || /Windows/i.test(navigator.userAgent || "");
-    // On Windows, `cmd /c` sidesteps the PowerShell execution-policy trap that
-    // blocks the npx.ps1 shim ("running scripts is disabled on this system").
     // No URL needed: the panel sends the ComfyUI host (window.location) in its
-    // hello, so a bare `connect` auto-targets whatever ComfyUI is open.
-    void url;
-    const runCmd = isWin
-      ? `cmd /c "npx -y comfyui-mcp@latest connect"`
-      : `npx -y comfyui-mcp@latest connect`;
-    runCol.append(onboardCmd(runCmd));
-    if (isWin) {
-      const note = document.createElement("div");
-      note.className = "cmcp-onboard-step";
-      note.textContent =
-        "If PowerShell blocks npx, run it in Git Bash, cmd, or Windows Terminal.";
-      runCol.appendChild(note);
-    }
+    // hello, so a bare `connect` auto-targets whatever ComfyUI is open. Offer the
+    // command per shell (PowerShell / Command Prompt / macOS·Linux) — the PS pill
+    // ships the `cmd /c` wrapper, so no separate execution-policy caveat is needed.
+    runCol.append(makeShellCommandBlock("npx -y comfyui-mcp@latest connect"));
     const clickNote = document.createElement("div");
     clickNote.className = "cmcp-onboard-step";
     clickNote.textContent = "…then click Connect above.";
