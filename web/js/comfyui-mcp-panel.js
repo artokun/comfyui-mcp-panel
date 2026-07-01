@@ -4094,6 +4094,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   function emitStatus(s) {
     if (s === lastStatus && s !== "connected") return;
     lastStatus = s;
+    // Once the agent is actually up (a "connected" handshake means a provider IS
+    // working), the provider-onboarding card is moot — hide it regardless of the
+    // readiness probe, which can be wrong (e.g. a CLI the orchestrator's PATH
+    // can't see). try/catch guards the case where the card isn't built yet.
+    if (s === "connected") { try { onboard.hidden = true; } catch {} }
     onStatus(s);
   }
   // FIX 1/2 — STEADY status + cold-start patience. While we're actively (auto)
@@ -5774,7 +5779,7 @@ function buildPanel() {
     const sub = document.createElement("div");
     sub.className = "cmcp-onboard-sub";
     sub.textContent =
-      "The agent runs on your own Claude, ChatGPT, or Gemini subscription — no API keys. Set up at least one (Node ≥ 22 required), then click Connect.";
+      "The agent runs on YOUR machine on your own Claude, ChatGPT, or Gemini subscription — no API keys. Set up a provider (Node ≥ 22), start the agent with the command below, then click Connect.";
     onboard.append(title, sub);
     for (const id of ["claude", "codex", "gemini"]) {
       const meta = PROVIDER_SETUP[id];
@@ -5799,6 +5804,37 @@ function buildPanel() {
       col.append(s2, onboardCmd(meta.login));
       onboard.appendChild(col);
     }
+    // External orchestrator: the agent runs on THIS machine — after signing in,
+    // the user starts it themselves (the panel can't spawn it) and clicks Connect.
+    // Surface the exact command with the ComfyUI URL pre-filled + a Windows caveat.
+    const runCol = document.createElement("div");
+    runCol.className = "cmcp-onboard-col";
+    const runProv = document.createElement("div");
+    runProv.className = "cmcp-onboard-prov";
+    runProv.textContent = "Then start the agent (on this machine)";
+    runCol.appendChild(runProv);
+    let url = "<this-comfyui-url>";
+    try { url = window.location.origin; } catch { /* keep placeholder */ }
+    const isWin =
+      /win/i.test(navigator.platform || "") || /Windows/i.test(navigator.userAgent || "");
+    // On Windows, `cmd /c` sidesteps the PowerShell execution-policy trap that
+    // blocks the npx.ps1 shim ("running scripts is disabled on this system").
+    const runCmd = isWin
+      ? `cmd /c "npx -y comfyui-mcp connect ${url}"`
+      : `npx -y comfyui-mcp connect ${url}`;
+    runCol.append(onboardCmd(runCmd));
+    if (isWin) {
+      const note = document.createElement("div");
+      note.className = "cmcp-onboard-step";
+      note.textContent =
+        "If PowerShell blocks npx, run it in Git Bash, cmd, or Windows Terminal.";
+      runCol.appendChild(note);
+    }
+    const clickNote = document.createElement("div");
+    clickNote.className = "cmcp-onboard-step";
+    clickNote.textContent = "…then click Connect above.";
+    runCol.appendChild(clickNote);
+    onboard.appendChild(runCol);
   }
 
   // Apply per-provider readiness from GET /backends: toggle the onboarding card,
@@ -5823,7 +5859,9 @@ function buildPanel() {
       return;
     }
     anyReady = typeof data?.any_ready === "boolean" ? data.any_ready : list.some((b) => b.ready);
-    if (list.length && !anyReady) {
+    // Never show the setup card while connected — a live agent means a provider
+    // works, whatever the probe reports.
+    if (list.length && !anyReady && lastStatus !== "connected") {
       renderOnboard(list);
       onboard.hidden = false;
     } else {
