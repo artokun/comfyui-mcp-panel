@@ -82,24 +82,31 @@ const LEGACY_BRIDGE_URL = "ws://127.0.0.1:9101"; // old shared default — migra
 // seeds the default URL for that backend. A per-backend DEFAULT must NOT count as a
 // "manual override" (so /connect's bridge_url still applies) — only a user-typed
 // NON-default URL overrides (see connectAgent.manualOverride).
+// Single-port multi-provider: ONE orchestrator on ONE bridge serves every
+// provider. The backend is chosen in the hello / set_backend handshake, NOT by
+// port — so all providers resolve to the same default bridge URL. (Kept as a
+// per-backend map only so a user can still pin a custom Bridge URL per provider
+// in Settings; the defaults are identical now.)
 const DEFAULT_BRIDGE_URL_BY_BACKEND = {
-  claude: "ws://127.0.0.1:9180",
-  codex: "ws://127.0.0.1:9181",
-  gemini: "ws://127.0.0.1:9182",
+  claude: DEFAULT_BRIDGE_URL,
+  codex: DEFAULT_BRIDGE_URL,
+  gemini: DEFAULT_BRIDGE_URL,
 };
 function defaultBridgeUrlFor(backend) {
   return DEFAULT_BRIDGE_URL_BY_BACKEND[backend] || DEFAULT_BRIDGE_URL;
 }
 
 function loadBridgeUrl() {
+  // Single-port: the single (advanced) Bridge URL override, else the default. Old
+  // per-port localStorage / per-backend values are intentionally ignored so a
+  // stale custom port can't make the initial connect dial a dead bridge.
   try {
-    const saved = window.localStorage.getItem(STORAGE_KEY_BRIDGE);
-    // Migrate anyone pinned to the old shared 9101 default onto the new port.
-    if (!saved || saved === LEGACY_BRIDGE_URL) return DEFAULT_BRIDGE_URL;
-    return saved;
+    const v = getSetting(SETTING_BRIDGE);
+    if (typeof v === "string" && v.trim()) return v.trim();
   } catch {
-    return DEFAULT_BRIDGE_URL;
+    // settings not ready yet — fall through to the default.
   }
+  return DEFAULT_BRIDGE_URL;
 }
 
 function saveBridgeUrl(url) {
@@ -270,6 +277,11 @@ const SETTING_BRIDGE_URL = {
 // Pre-per-backend single Bridge URL key — migrated ONCE into the Claude group so a
 // returning user's custom port isn't lost (runs in the groups-migration block).
 const LEGACY_SETTING_BRIDGE_URL = "comfyui-mcp.bridgeUrl";
+// Single-port multi-provider: ONE bridge serves every provider, so there is ONE
+// (advanced) Bridge URL. A FRESH key — deliberately NOT the per-backend or legacy
+// ones, whose stale pre-single-port values (e.g. a migrated custom port) must not
+// leak in and make the panel dial a dead port.
+const SETTING_BRIDGE = "comfyui-mcp.bridgeUrl.single";
 const SETTING_AUTOCONNECT = "comfyui-mcp.autoConnect";
 const SETTING_FOCUS_FOLLOW = "comfyui-mcp.zoomToAction";
 const SETTING_STALL_S = "comfyui-mcp.stallWarningSeconds";
@@ -496,13 +508,24 @@ function remoteUrlSetting() {
 // the configured Bridge URL directly. OFF by default, which keeps the co-located
 // autospawn path (POST /connect) byte-for-byte unchanged.
 function externalOrchestratorMode() {
-  return !!getSetting(SETTING_EXTERNAL_ORCH);
+  // Always ON now: the pack is pure-frontend and can no longer spawn the
+  // orchestrator (Comfy Registry security standards), so external/local is the
+  // ONLY mode — Connect always dials the bridge directly and never POSTs the
+  // host /connect (which the stripped node answers 503). The user still starts
+  // the orchestrator out-of-band (`npx -y comfyui-mcp connect <url>` /
+  // `--panel-orchestrator`); the setting is retained only for back-compat.
+  return true;
 }
 // The Bridge URL to dial for `backend`: its per-backend Settings value when set,
 // else that backend’s default port (claude 9180 / codex 9181 / gemini 9182).
 function configuredBridgeUrlFor(backend) {
-  const v = getSetting(SETTING_BRIDGE_URL[backend]);
-  return (typeof v === "string" && v.trim()) || defaultBridgeUrlFor(backend);
+  // Single-port multi-provider: ONE bridge for every provider. Honor only the
+  // single (advanced) Bridge URL override, else the default — ignore any stale
+  // per-backend value from the pre-single-port layout. (backend kept for
+  // call-site compatibility.)
+  void backend;
+  const v = getSetting(SETTING_BRIDGE);
+  return (typeof v === "string" && v.trim()) || DEFAULT_BRIDGE_URL;
 }
 // Best-effort ComfyUI URL to put in the "start it locally" hint — the address of
 // the ComfyUI the user is viewing (a remote pod when opened over its proxy URL).
@@ -768,21 +791,22 @@ function panelSettingsList() {
       },
     },
     {
-      id: SETTING_EXTERNAL_ORCH,
-      name: "Use external/local orchestrator (advanced)",
-      category: cat("General", "Use external/local orchestrator (advanced)"),
+      // Single-port multi-provider: ONE bridge for every provider (the per-backend
+      // Bridge URLs and the old external-orchestrator toggle are gone — external is
+      // now the only mode). Advanced: only needed for a non-default port.
+      id: SETTING_BRIDGE,
+      name: "Bridge URL (advanced)",
+      category: cat("General", "Bridge URL (advanced)"),
       sortOrder: 141,
       tooltip:
-        "Advanced: run the agent OUTSIDE this ComfyUI host — started by YOU on your own machine " +
-        "(npx -y comfyui-mcp connect <this comfyui url>) instead of being spawned by this ComfyUI. " +
-        "Use it to drive a REMOTE ComfyUI (e.g. a RunPod pod with no Node/agent) from an agent on " +
-        "your laptop. When ON, Connect does NOT ask this host to start anything — it connects straight " +
-        "to the Bridge URL (default ws://127.0.0.1:9180). Leave OFF for the normal local setup where " +
-        "ComfyUI starts the agent for you.",
-      type: "boolean",
-      defaultValue: false,
-      onChange: () => {
-        // No live side effect — it only changes how the NEXT Connect behaves.
+        "WebSocket URL of the panel orchestrator bridge — ONE bridge now serves every provider " +
+        "(default ws://127.0.0.1:9180). Only change this if you start the orchestrator on a " +
+        "non-default port (COMFYUI_MCP_BRIDGE_PORT). Applies on the next Connect.",
+      type: "text",
+      defaultValue: DEFAULT_BRIDGE_URL,
+      onChange: (v) => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyBridgeUrl?.(v);
       },
     },
     {
@@ -805,18 +829,15 @@ function panelSettingsList() {
         }
       },
     },
-    // ---- Claude (Default model, Default reasoning effort, Bridge URL) ----
+    // ---- Claude (Default model, Default reasoning effort) ----
     modelSetting("claude", 130),
     effortSetting("claude", 125),
-    bridgeUrlSetting("claude", 120),
-    // ---- ChatGPT (Codex) (Default model, Default reasoning effort, Bridge URL) ----
+    // ---- ChatGPT (Codex) (Default model, Default reasoning effort) ----
     modelSetting("codex", 110),
     effortSetting("codex", 105),
-    bridgeUrlSetting("codex", 100),
-    // ---- Gemini (Default model, Default reasoning effort, Bridge URL) ----
+    // ---- Gemini (Default model, Default reasoning effort) ----
     modelSetting("gemini", 90),
     effortSetting("gemini", 85),
-    bridgeUrlSetting("gemini", 80),
     // ---- API tokens (LAST) ----
     tokenSetting(SETTING_TOKEN_CIVITAI, "CIVITAI_API_TOKEN", "CivitAI", 20),
     tokenSetting(SETTING_TOKEN_HF, "HUGGINGFACE_TOKEN", "HuggingFace", 15),
@@ -4054,12 +4075,16 @@ function focusFollowOnCommand(cmd, msg, reply) {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onShowMedia, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onAck, onTurn, onTurnAnchor, getResume, onHandshakeTimeout, onBridgeClosed }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onShowMedia, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
   let attempt = 0;
   let reconnectTimer = null;
+  // One-shot context to ride on the NEXT user message (armed via armContext) —
+  // used to replay the transcript to a freshly-switched provider so it has the
+  // conversation. Cleared the moment it's consumed.
+  let pendingContext = null;
   // De-duped status emitter. The pill only ever needs TRANSITIONS, so collapsing
   // consecutive repeats is a guard against any path double-emitting the same state
   // (and keeps the cold-start steady-"connecting" from re-painting on every retry).
@@ -4360,11 +4385,15 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // Carry the last session id so the orchestrator resumes the agent's
       // memory after a panel reload (only honored before the tab's agent spawns).
       const resume = getResume?.();
+      // Single-port multi-provider: name the selected provider so ONE orchestrator
+      // routes this tab to the right backend (default claude when unset).
+      const backend = getBackend?.() || "claude";
       sock.send(
         JSON.stringify({
           type: "hello",
           tab_id: getTabId(),
           title: getWorkflowTitle(),
+          backend,
           ...(resume ? { resume } : {}),
         }),
       );
@@ -4437,14 +4466,24 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       attempt = 0;
       connect();
     },
+    /** Arm a one-shot context (e.g. a provider-switch transcript replay) to ride
+     *  on the NEXT user message, then auto-clear. */
+    armContext(ctx) {
+      pendingContext = typeof ctx === "string" && ctx.trim() ? ctx : null;
+    },
     sendUserMessage(text, context, images, mid) {
       if (!sock || sock.readyState !== WebSocket.OPEN) return false;
+      // Merge any armed one-shot context (transcript replay) ahead of this
+      // message's own context, then clear it so it's sent exactly once.
+      const mergedContext =
+        [pendingContext, context].filter(Boolean).join("\n\n") || undefined;
+      pendingContext = null;
       try {
         sock.send(
           JSON.stringify({
             type: "user_message",
             text,
-            ...(context ? { context } : {}),
+            ...(mergedContext ? { context: mergedContext } : {}),
             ...(images?.length ? { images } : {}),
             // Client message id — the orchestrator echoes it in the "working"
             // ack so the panel can mark this exact bubble delivered ("Seen").
@@ -6266,7 +6305,20 @@ function buildPanel() {
     }
     // Canonical path: settings seed the runtime. Backend FIRST (it decides which
     // group seeds prefs), then seed model/effort from THAT backend's group.
-    const sb = getSetting(SETTING_BACKEND);
+    // #43: the LAST RUNTIME pick (STORAGE_KEY_BACKEND, already in selectedBackend)
+    // must survive a panel REMOUNT — navigating away and back was silently swapping
+    // an active Codex session to the durable default (Claude) and dropping the
+    // conversation. A Settings-dialog change to the default already writes
+    // STORAGE_KEY_BACKEND (via applyBackend→connectBackend), so the two only diverge
+    // after a session-only chip pick — and then the runtime pick wins. Fall back to
+    // the durable default ONLY when there's no runtime pick yet (first-ever load).
+    let runtimePick = null;
+    try {
+      runtimePick = window.localStorage.getItem(STORAGE_KEY_BACKEND);
+    } catch {
+      runtimePick = null;
+    }
+    const sb = runtimePick || getSetting(SETTING_BACKEND);
     if (sb && sb !== selectedBackend) {
       selectedBackend = sb;
       try {
@@ -6274,10 +6326,10 @@ function buildPanel() {
       } catch {}
     }
     seedPrefsFromBackendGroup(selectedBackend);
-    // Per-backend Bridge URL: seed the field from the ACTIVE backend's setting,
-    // falling back to that backend's default port (claude 9180 / codex 9181).
-    const su =
-      getSetting(SETTING_BRIDGE_URL[selectedBackend]) || defaultBridgeUrlFor(selectedBackend);
+    // Single-port: seed the Bridge URL field from the ONE (advanced) override, else
+    // the single default — never the stale per-backend value (that's what made the
+    // panel dial a dead port after upgrade).
+    const su = configuredBridgeUrlFor(selectedBackend);
     if (su && su !== urlInput.value) {
       urlInput.value = su;
       saveBridgeUrl(su);
@@ -7963,6 +8015,7 @@ function buildPanel() {
       }
     },
     getResume: () => ssGet(SESSION_KEY),
+    getBackend: () => selectedBackend,
   });
   // This is now THE live client for the page.
   liveBridgeClient = client;
@@ -8833,6 +8886,29 @@ function buildPanel() {
     refreshModelChip();
   }
 
+  // Build a compact transcript of the VISIBLE conversation (user + agent text) to
+  // seed a freshly-switched provider. Capped from the END so a long chat doesn't
+  // blow the new session's context; internal session data (thinking / tool calls /
+  // prompt cache) isn't portable across providers and is intentionally omitted.
+  function buildReplayTranscript() {
+    const msgs = thread && Array.isArray(thread.msgs) ? thread.msgs : [];
+    const lines = [];
+    for (const m of msgs) {
+      if (!m || typeof m.text !== "string" || !m.text.trim()) continue;
+      if (m.role === "user") lines.push("User: " + m.text.trim());
+      else if (m.role === "agent") lines.push("Assistant: " + m.text.trim());
+    }
+    if (!lines.length) return "";
+    let body = lines.join("\n\n");
+    const CAP = 8000;
+    if (body.length > CAP) body = "…(earlier messages trimmed)…\n\n" + body.slice(body.length - CAP);
+    return (
+      "[Conversation so far — continued from a different AI provider. Context only: the " +
+      "previous session's memory, thinking, and tool history did NOT carry over. Pick it up:]\n\n" +
+      body
+    );
+  }
+
   function connectBackend(id) {
     // CENTRALIZED per-backend seeding: every switch path routes through here — the
     // backend chips, the model-popover provider row, AND the Settings backend combo
@@ -8874,6 +8950,11 @@ function buildPanel() {
     if (switching) {
       ssSet(SESSION_KEY, null);
       if (thread) thread.sessionId = undefined;
+      // Replay the visible transcript to the NEW provider as one-shot context so
+      // its fresh session has the conversation (session/thinking aren't portable
+      // across providers). Consumed by the next user message, then auto-cleared.
+      const replay = buildReplayTranscript();
+      if (replay) client.armContext(replay);
     }
     // Reflect the picked backend in the composer placeholder immediately; onModels
     // reaffirms it authoritatively from the handshake (fix #3).
@@ -8893,7 +8974,7 @@ function buildPanel() {
     // setUrl only updates its `url` here (its connect() no-ops while closed);
     // connectAgent's client.start() opens it. urlInput has no settings onChange wired,
     // so updating it can't re-enter the storm.
-    const nextUrl = getSetting(SETTING_BRIDGE_URL[id]) || defaultBridgeUrlFor(id);
+    const nextUrl = configuredBridgeUrlFor(id);
     urlInput.value = nextUrl;
     if (client.currentUrl() !== nextUrl) client.setUrl(nextUrl);
     void connectAgent({ fromChip: true });

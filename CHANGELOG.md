@@ -31,6 +31,70 @@ All notable changes to this project are documented here. This project adheres to
   hint with the exact `npx` command. OFF by default, so the co-located autospawn
   path is byte-for-byte unchanged. The toggle persists via ComfyUI settings.
 
+### Changed
+
+- **Single-port multi-provider.** All providers now share ONE bridge
+  (`ws://127.0.0.1:9180`) instead of a port per provider (claude 9180 / codex 9181
+  / gemini 9182). The panel names its chosen provider in the `hello` handshake
+  (`backend` field), and one orchestrator routes each tab to the right backend.
+  Switching provider re-handshakes on the same bridge (fresh session for the new
+  provider — agent sessions aren't portable across providers). Requires the paired
+  `comfyui-mcp` single-port orchestrator.
+- **Provider switch replays the transcript.** Because a switch starts a fresh
+  session on the new provider, the panel now sends the visible user+agent
+  transcript as one-shot `context` on the first message after a switch, so the new
+  provider picks up the conversation (internal thinking / tool history don't carry
+  — they aren't portable). Capped from the end so a long chat can't blow context.
+- **External/local orchestrator is now the only mode.** Since the pack can no
+  longer spawn the orchestrator, Connect always dials the bridge directly (never
+  the host `/connect` POST). The "Use external/local orchestrator" toggle is
+  retained for back-compat but is now a no-op.
+- **The pack is now a pure frontend extension — it never spawns the orchestrator.**
+  Every published registry version `0.1.0`–`0.4.6` sat `NodeVersionStatusFlagged`
+  on the Comfy Registry (so the registry computed no `latest_version` and
+  ComfyUI-Manager could only offer the nightly channel). The cause was
+  `__init__.py` calling `subprocess.Popen([… "npx", "-y", "comfyui-mcp" …])` to
+  auto-start the orchestrator: the registry standards
+  (https://docs.comfy.org/registry/standards) forbid a node spawning processes /
+  installing-and-running packages at runtime, and the static (Bandit) scanner
+  flags it (`B404`/`B603`) regardless of runtime guards. `__init__.py` no longer
+  imports or calls `subprocess` (nor `psutil`, process kills, or lockfiles); it
+  only serves the panel JS and exposes **read-only** status / discovery routes.
+  The remote-URL helpers are kept (they shape the start command, not a spawn).
+
+### Removed
+
+- In-process auto-spawn / reclaim / soft-reload / hard-restart of the orchestrator.
+  The orchestrator now always runs **out-of-band** — external-orchestrator mode is
+  effectively the only mode. Start it once (`npx -y comfyui-mcp connect <url>` for a
+  remote instance, or `--panel-orchestrator` locally) and the panel connects to the
+  bridge automatically and keeps retrying until it's up. The `/connect` etc. routes
+  still exist but report status and return that command instead of launching anything.
+
+### Added
+
+- CI **security-scan parity** step: `bandit -r . -s B101,B112,B311 -ll` mirrors the
+  Comfy Registry scanner (public stand-in `christian-byrne/custom-nodes-security-scan`)
+  so a would-be-flagged release fails CI before it can publish. `.comfyignore` now
+  also drops dev-only `scripts/` and `.githooks/` from the published archive.
+
+### Fixed
+
+- **Panel remount no longer silently swaps provider or drops the conversation
+  (#43).** Navigating away from the agent panel and back (a remount) used to
+  re-seed the runtime backend from the durable default and reconnect on Claude —
+  swapping an active Codex session and losing its thread. The last *runtime* pick
+  (session-only chip switch) now wins over the durable default on remount, so the
+  panel reconnects on the same provider; combined with single-port + the
+  orchestrator-owned per-(tab, backend) session, the conversation **resumes**
+  instead of starting fresh. (A Settings-dialog change to the default still takes
+  effect — it already writes the runtime pick.)
+- **Stale Bridge URL made Connect dial a dead port.** A legacy per-backend Bridge
+  URL (e.g. a migrated custom port) could survive into the single-port layout and
+  send the panel to a phantom port — the "connecting… then red" flash. Bridge-URL
+  resolution now reads one setting (default `ws://127.0.0.1:9180`) and self-heals a
+  polluted value.
+
 ## [0.4.6] - 2026-06-29
 
 ### Added
