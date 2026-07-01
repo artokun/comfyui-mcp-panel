@@ -6,6 +6,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.9] - 2026-07-01
+
+### Added
+
+- **The agent now sees ComfyUI's validation errors the moment you do.** A
+  `⚠️ GRAPH VALIDATION` block is injected at the agent's turn start — populated from
+  `app.lastNodeErrors`, the same data behind the frontend's "N ERRORS" panel (missing
+  models, `value_not_in_list` / invalid widget values, broken links) — plus the last
+  runtime execution error, labeled distinctly. Previously the agent only learned of a
+  broken graph if it independently re-ran. It mirrors the existing `⟳ MANUAL CANVAS
+  CHANGES` injection and is **event-driven**: shown only when errors exist AND the
+  state changed since the last injection (no nagging on mid-build graphs, no token
+  cost on clean/chat turns). Pairs with comfyui-mcp 0.23.2 (whose `validate_workflow`
+  now reports out-of-list combo values as errors, matching this block).
+
 ## [0.4.8] - 2026-07-01
 
 ### Fixed
