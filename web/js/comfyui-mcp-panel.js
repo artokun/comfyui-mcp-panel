@@ -91,6 +91,7 @@ const DEFAULT_BRIDGE_URL_BY_BACKEND = {
   claude: DEFAULT_BRIDGE_URL,
   codex: DEFAULT_BRIDGE_URL,
   gemini: DEFAULT_BRIDGE_URL,
+  ollama: DEFAULT_BRIDGE_URL,
 };
 function defaultBridgeUrlFor(backend) {
   return DEFAULT_BRIDGE_URL_BY_BACKEND[backend] || DEFAULT_BRIDGE_URL;
@@ -255,11 +256,13 @@ const SETTING_MODEL = {
   claude: "comfyui-mcp.defaultModel.claude",
   codex: "comfyui-mcp.defaultModel.codex",
   gemini: "comfyui-mcp.defaultModel.gemini",
+  ollama: "comfyui-mcp.defaultModel.ollama",
 };
 const SETTING_EFFORT = {
   claude: "comfyui-mcp.defaultEffort.claude",
   codex: "comfyui-mcp.defaultEffort.codex",
   gemini: "comfyui-mcp.defaultEffort.gemini",
+  ollama: "comfyui-mcp.defaultEffort.ollama",
 };
 // Pre-grouping single-key settings (a returning user upgrading from the single
 // "Default model"/"Default reasoning effort" had these). Migrated ONCE into the
@@ -273,6 +276,7 @@ const SETTING_BRIDGE_URL = {
   claude: "comfyui-mcp.bridgeUrl.claude",
   codex: "comfyui-mcp.bridgeUrl.codex",
   gemini: "comfyui-mcp.bridgeUrl.gemini",
+  ollama: "comfyui-mcp.bridgeUrl.ollama",
 };
 // Pre-per-backend single Bridge URL key — migrated ONCE into the Claude group so a
 // returning user's custom port isn't lost (runs in the groups-migration block).
@@ -298,10 +302,10 @@ const SETTINGS_SEEDED_KEY = "comfyui-mcp.panel.settingsSeeded";
 // per-backend groups (runs independently of SETTINGS_SEEDED_KEY).
 const SETTINGS_GROUPS_MIGRATED_KEY = "comfyui-mcp.panel.settingsGroupsMigrated";
 // Section (sub-category) labels for the grouped Settings dialog, per backend.
-const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)", gemini: "Gemini" };
+const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)", gemini: "Gemini", ollama: "Ollama (local)" };
 // Backend display names at module scope (the Settings dialog's render-fns live
 // outside buildPanel's closure, so they need their own copy).
-const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini" };
+const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", ollama: "Ollama" };
 // The allowlisted secure-store keys (mirrors the orchestrator's #59 allowlist).
 const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
 
@@ -345,7 +349,7 @@ const settingsBackendState = {
 // render-fns when the dialog opens, so a freshly-arrived catalog can repaint the
 // matching backend's dropdown in place (a render-fn setting has no static options
 // to re-key). Keyed by backend; null when that group isn't mounted.
-const settingsModelSelectEls = { claude: null, codex: null, gemini: null };
+const settingsModelSelectEls = { claude: null, codex: null, gemini: null, ollama: null };
 // Disabled placeholder <option> value — mapped to "" (Auto) if ever selected so
 // it can never persist as a bogus model id.
 const SETTINGS_PLACEHOLDER = "__cmcp_placeholder__";
@@ -355,7 +359,7 @@ const SETTINGS_PLACEHOLDER = "__cmcp_placeholder__";
  *  per-backend group's edit should drive the LIVE panel (only the active group does). */
 function currentSettingsBackend() {
   const b = getSetting(SETTING_BACKEND);
-  return b === "codex" || b === "gemini" ? b : "claude";
+  return b === "codex" || b === "gemini" || b === "ollama" ? b : "claude";
 }
 /** Fetched model rows for `backend` (the same presentable catalog the composer
  *  picker uses), or null when none is cached (backend never connected this session). */
@@ -741,6 +745,7 @@ function panelSettingsList() {
         { value: "claude", text: "Claude" },
         { value: "codex", text: "ChatGPT" },
         { value: "gemini", text: "Gemini" },
+        { value: "ollama", text: "Ollama (local)" },
       ],
       defaultValue: "claude",
       onChange: (v) => {
@@ -850,6 +855,8 @@ function panelSettingsList() {
     // ---- Gemini (Default model, Default reasoning effort) ----
     modelSetting("gemini", 90),
     effortSetting("gemini", 85),
+    // ---- Ollama (local) (Default model; no effort scale) ----
+    modelSetting("ollama", 70),
     // ---- API tokens (LAST) ----
     tokenSetting(SETTING_TOKEN_CIVITAI, "CIVITAI_API_TOKEN", "CivitAI", 20),
     tokenSetting(SETTING_TOKEN_HF, "HUGGINGFACE_TOKEN", "HuggingFace", 15),
@@ -897,6 +904,8 @@ const BACKEND_EFFORTS = {
   claude: ["low", "medium", "high", "xhigh", "max"],
   codex: ["none", "minimal", "low", "medium", "high", "xhigh"],
   gemini: [],
+  // Ollama local models expose no reasoning-effort control — selector hidden.
+  ollama: [],
 };
 // Ordered low→high across BOTH scales, for nearest-level mapping on a switch.
 const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -4284,13 +4293,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   // `codex app-server` cold-starts much slower than Claude's Agent SDK, so it gets
   // ~3x the window. This is the escalation THRESHOLD only — the respawn/reclaim
   // BOUNDS (MAX_AUTO_RESPAWNS / MAX_AUTO_RECLAIMS) are untouched.
-  const RESPAWN_AFTER_BY_BACKEND = { codex: 6, gemini: 6, claude: 2 };
+  const RESPAWN_AFTER_BY_BACKEND = { codex: 6, gemini: 6, ollama: 6, claude: 2 };
   function respawnAfterAttempts() {
     return RESPAWN_AFTER_BY_BACKEND[backendNow()] ?? 2;
   }
   // Failed (re)connect attempts ridden out as a steady "connecting" before a
   // terminal "disconnected". Backend-aware, ~3x for Codex's slower cold start.
-  const CONNECT_PATIENCE_BY_BACKEND = { codex: 12, gemini: 12, claude: 4 };
+  const CONNECT_PATIENCE_BY_BACKEND = { codex: 12, gemini: 12, ollama: 12, claude: 4 };
   function connectPatienceAttempts() {
     return CONNECT_PATIENCE_BY_BACKEND[backendNow()] ?? 4;
   }
@@ -4303,7 +4312,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   // Handshake (models-frame) window AFTER the WS opens. Backend-aware: Codex's
   // app-server can still be booting its agent after the bridge accepts the socket,
   // so it gets a wider window before we treat the open socket as wedged (FIX 2).
-  const HANDSHAKE_MS_BY_BACKEND = { codex: 45000, gemini: 45000, claude: 20000 };
+  // Ollama gets the long handshake too: a cold model load into VRAM can take
+  // tens of seconds before the first token.
+  const HANDSHAKE_MS_BY_BACKEND = { codex: 45000, gemini: 45000, ollama: 45000, claude: 20000 };
   function handshakeMs() {
     return HANDSHAKE_MS_BY_BACKEND[backendNow()] ?? 20000;
   }
@@ -5293,6 +5304,9 @@ const PANEL_CSS = `
    long) hint truncate instead — otherwise a long hint collapsed the label. */
 .cmcp-popover-item.cmcp-slash .lbl { flex: 0 0 auto; }
 .cmcp-popover-item.cmcp-slash small { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Provider rows: same rule — the provider NAME stays, the hint truncates. */
+.cmcp-popover-item.cmcp-provider .lbl { flex: 0 0 auto; }
+.cmcp-popover-item.cmcp-provider small { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cmcp-status-btn {
   display: inline-flex; align-items: center; gap: 0.3125rem;
   background: none; border: none; cursor: pointer; font: inherit; color: inherit;
@@ -5683,7 +5697,7 @@ function buildPanel() {
   // ChatGPT). Clicking one asks the pack to ensure that backend's orchestrator is
   // running and returns the bridge URL to connect to — the user never types a
   // port. Populated from GET /comfyui_mcp_panel/backends when settings open.
-  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini" };
+  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", ollama: "Ollama" };
   const backendLabel = document.createElement("label");
   backendLabel.className = "cmcp-label";
   backendLabel.textContent = "Agent backend";
@@ -5719,7 +5733,7 @@ function buildPanel() {
   // (GET /backends, blind to the laptop behind a remote pod) must not override it.
   let readinessFromOrchestrator = false;
   // Short per-provider hint shown under each provider row in the popup.
-  const BACKEND_HINTS = { claude: "Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash" };
+  const BACKEND_HINTS = { claude: "Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", ollama: "Local LLMs" };
 
   // Hint for a provider that exists but isn't usable yet — distinguishes
   // "install the CLI" from "sign in". Empty when ready or readiness is unknown.
@@ -5727,9 +5741,14 @@ function buildPanel() {
     if (!b) return "";
     const r = backendReady[b.backend] || b; // durable readiness survives chip repaints
     if (r.ready !== false) return "";
-    if (r.cli === false) return `${BACKEND_LABELS[b.backend] || b.backend} CLI not installed`;
+    if (r.cli === false) {
+      return b.backend === "ollama"
+        ? "Ollama not installed — get it at ollama.com/download"
+        : `${BACKEND_LABELS[b.backend] || b.backend} CLI not installed`;
+    }
     if (b.backend === "codex") return "Not signed in — run: codex login";
     if (b.backend === "gemini") return "Not signed in — run: gemini (then sign in with Google)";
+    if (b.backend === "ollama") return "Ollama not running — run: ollama serve";
     return "Not signed in — run: claude auth login";
   }
 
@@ -5929,6 +5948,8 @@ function buildPanel() {
     claude: { label: "Claude", install: "npm i -g @anthropic-ai/claude-code", login: "claude auth login" },
     codex: { label: "ChatGPT", install: "npm i -g @openai/codex", login: "codex login" },
     gemini: { label: "Gemini", install: "npm i -g @google/gemini-cli", login: "gemini" },
+    // No sign-in — "login" is pulling a tool-calling model (the arena's best).
+    ollama: { label: "Ollama (local, free)", install: "winget install Ollama.Ollama", login: "ollama pull gemma4:e4b" },
   };
   let anyReady = false;
   let autoPickDone = false; // auto-switch + note fires at most once per panel mount
@@ -5957,7 +5978,7 @@ function buildPanel() {
     sub.textContent =
       "The agent runs on YOUR machine on your own Claude, ChatGPT, or Gemini subscription — no API keys. Set up a provider (Node ≥ 22), start the agent with the command below, then click Connect.";
     onboard.append(title, sub);
-    for (const id of ["claude", "codex", "gemini"]) {
+    for (const id of ["claude", "codex", "gemini", "ollama"]) {
       const meta = PROVIDER_SETUP[id];
       const st = list.find((b) => b.backend === id) || {};
       const col = document.createElement("div");
@@ -6385,6 +6406,9 @@ function buildPanel() {
   // re-sent on connect so a freshly-spawned agent adopts it. (`prefs` itself is
   // declared earlier — near the settings UI that also reads it.)
   let modelCatalog = presentableModels(normalizeModels(FALLBACK_MODELS));
+  // The model the orchestrator reports as ACTIVE for the connected backend (the
+  // `current` field on the models frame). Drives the Auto-mode selection mark.
+  let orchestratorCurrentModel = null;
   if (!prefs.model) prefs.model = pickDefaultModel(modelCatalog);
 
   /** The effort ids offered for the currently-selected model. Driven primarily by
@@ -6566,10 +6590,10 @@ function buildPanel() {
       h.textContent = label;
       modelPop.appendChild(h);
     };
-    const item = ({ label, small }, selected, onPick) => {
+    const item = ({ label, small, cls }, selected, onPick) => {
       const el = document.createElement("button");
       el.type = "button";
-      el.className = "cmcp-popover-item" + (selected ? " sel" : "");
+      el.className = "cmcp-popover-item" + (cls ? ` ${cls}` : "") + (selected ? " sel" : "");
       const lbl = document.createElement("span");
       lbl.className = "lbl";
       lbl.textContent = label;
@@ -6605,7 +6629,9 @@ function buildPanel() {
         // A not-ready provider can't be connected — tapping it asks the working
         // agent to help you install/sign in instead of failing a connect.
         const small = notReady ? `Tap to set up — ${hint}` : BACKEND_HINTS[id] || (id === activeBackend ? "connected" : b.running ? "running" : "");
-        item({ label: BACKEND_LABELS[id] || id, small }, id === activeBackend, () => {
+        // cmcp-provider: the NAME never shrinks; a long hint truncates instead
+        // (a long hint used to collapse "Ollama" to nothing).
+        item({ label: BACKEND_LABELS[id] || id, small, cls: "cmcp-provider" }, id === activeBackend, () => {
           modelPop.hidden = true;
           if (notReady) {
             requestProviderSetup(id);
@@ -6618,7 +6644,12 @@ function buildPanel() {
 
     section("Model");
     for (const m of modelCatalog) {
-      item({ label: m.label, small: m.small }, m.id === prefs.model && !prefs.modelAuto, () => {
+      // Checked when explicitly picked — or, in Auto mode, on the model the
+      // orchestrator reports as actually loaded (so Auto isn't a blank column).
+      const isCurrent =
+        (m.id === prefs.model && !prefs.modelAuto) ||
+        (prefs.modelAuto && !!orchestratorCurrentModel && m.id === orchestratorCurrentModel);
+      item({ label: m.label, small: m.small }, isCurrent, () => {
         prefs.model = m.id;
         prefs.modelAuto = false; // an explicit pick clears the Auto state
         prefs.userSet = true;
@@ -6694,7 +6725,13 @@ function buildPanel() {
         prefs.modelAuto = true;
         setSetting(SETTING_MODEL[bk], "");
       }
-      prefs.model = pickDefaultModel(modelCatalog);
+      // Auto should track what the orchestrator ACTUALLY runs (its reported
+      // current model) when that model is in the catalog — not just row 0 /
+      // the Opus heuristic (which pointed Auto at the wrong Ollama model).
+      prefs.model =
+        orchestratorCurrentModel && modelCatalog.some((m) => m.id === orchestratorCurrentModel)
+          ? orchestratorCurrentModel
+          : pickDefaultModel(modelCatalog);
     }
     // Preserve the user's chosen effort across a backend switch: the new backend's
     // scale may not contain the exact level, so SNAP it to the nearest level this
@@ -8118,7 +8155,11 @@ function buildPanel() {
     onBridgeClosed() {
       return tryAutoRespawn();
     },
-    onModels(list, _current, backend) {
+    onModels(list, current, backend) {
+      // The orchestrator's ACTIVE model for this backend (e.g. the Ollama default
+      // gemma4:e4b, or COMFYUI_MCP_CODEX_MODEL). In Auto mode this is what
+      // actually runs — remember it so the picker can check the real row.
+      orchestratorCurrentModel = typeof current === "string" && current ? current : null;
       // The orchestrator self-reports its backend on the handshake — this is the
       // AUTHORITATIVE source of which provider we're actually connected to. Resolve
       // the switch BEFORE applying the catalog, so the effort scale + nearest-level
@@ -8804,7 +8845,7 @@ function buildPanel() {
   // backend's handshake window (handshakeMs()) so a healthy slow reload completes
   // on its own backoff before the guard releases — Codex's app-server handshake is
   // 45s, so its guard is ~50s; Claude keeps 28s (still > its 20s handshake).
-  const SOFT_RELOAD_GUARD_MS_BY_BACKEND = { codex: 50000, gemini: 50000, claude: 28000 };
+  const SOFT_RELOAD_GUARD_MS_BY_BACKEND = { codex: 50000, gemini: 50000, ollama: 50000, claude: 28000 };
   function softReloadGuardMs() {
     return SOFT_RELOAD_GUARD_MS_BY_BACKEND[selectedBackend] ?? 28000;
   }
@@ -8821,7 +8862,7 @@ function buildPanel() {
   // normal cold-start handshake (handshakeMs()) so a healthy-but-slow reload is
   // never pre-empted — Codex (45s handshake) escalates at ~40s, comfortably under
   // its ~50s guard; Claude keeps 11s (under its 28s guard and > its 20s handshake).
-  const SOFT_RELOAD_ESCALATE_MS_BY_BACKEND = { codex: 40000, gemini: 40000, claude: 11000 };
+  const SOFT_RELOAD_ESCALATE_MS_BY_BACKEND = { codex: 40000, gemini: 40000, ollama: 40000, claude: 11000 };
   function softReloadEscalateMs() {
     return SOFT_RELOAD_ESCALATE_MS_BY_BACKEND[selectedBackend] ?? 11000;
   }
@@ -8896,7 +8937,7 @@ function buildPanel() {
         respawnGaveUpNoticed = true;
         appendSystem(
           "⚠ The panel agent keeps failing to start. Check you're signed in " +
-            "(run `claude` once, `codex login` for Codex, or `gemini` for Gemini), then click Connect.",
+            "(run `claude` once, `codex login` for Codex, `gemini` for Gemini, or `ollama serve` for local models), then click Connect.",
         );
       }
       return false;
