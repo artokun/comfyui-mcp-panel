@@ -55,6 +55,7 @@ _BACKEND_PORTS = {
     "claude": _BRIDGE_PORT,
     "codex": 9181,
     "gemini": 9182,
+    "ollama": _BRIDGE_PORT,  # single-port multi-provider — same orchestrator
 }
 _DEFAULT_BACKEND = "claude"
 
@@ -81,7 +82,19 @@ _PROVIDER_CLIS = {
     "claude": ("claude", "claude.cmd", "claude.exe"),
     "codex": ("codex", "codex.cmd", "codex.exe"),
     "gemini": ("gemini", "gemini.cmd", "gemini.exe"),
+    "ollama": ("ollama", "ollama.exe"),
 }
+
+
+def _ollama_installed():
+    """Ollama binary on PATH or in the default install locations (the Windows
+    installer only adds PATH for new shells)."""
+    if _provider_cli("ollama"):
+        return True
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+        return os.path.isfile(os.path.join(local, "Programs", "Ollama", "ollama.exe"))
+    return os.path.isfile("/usr/local/bin/ollama") or os.path.isfile("/opt/homebrew/bin/ollama")
 
 
 def _provider_cli(provider):
@@ -114,6 +127,10 @@ def _provider_auth(provider):
         # creds file is the on-disk signal that a Google login exists.
         gemini_home = os.environ.get("GEMINI_CLI_HOME") or home
         return os.path.isfile(os.path.join(gemini_home, ".gemini", "oauth_creds.json"))
+    if provider == "ollama":
+        # No login concept — a local daemon. Installed = usable; a stopped daemon
+        # surfaces at connect time (the orchestrator's model probe).
+        return True if _ollama_installed() else False
     return False
 
 
@@ -122,7 +139,7 @@ def _provider_state(provider):
     PATH AND a login exists; `cli`/`auth` are reported separately so the panel
     can tell 'install the CLI' apart from 'sign in'; `auth` is null when unknown
     (macOS Keychain), and unknown-with-cli still counts as ready."""
-    cli = _provider_cli(provider)
+    cli = _ollama_installed() if provider == "ollama" else _provider_cli(provider)
     auth = _provider_auth(provider)
     ready = bool(cli and auth is not False)
     return {"cli": cli, "auth": auth, "ready": ready}
