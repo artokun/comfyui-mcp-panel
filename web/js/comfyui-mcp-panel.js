@@ -5304,6 +5304,9 @@ const PANEL_CSS = `
    long) hint truncate instead — otherwise a long hint collapsed the label. */
 .cmcp-popover-item.cmcp-slash .lbl { flex: 0 0 auto; }
 .cmcp-popover-item.cmcp-slash small { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Provider rows: same rule — the provider NAME stays, the hint truncates. */
+.cmcp-popover-item.cmcp-provider .lbl { flex: 0 0 auto; }
+.cmcp-popover-item.cmcp-provider small { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cmcp-status-btn {
   display: inline-flex; align-items: center; gap: 0.3125rem;
   background: none; border: none; cursor: pointer; font: inherit; color: inherit;
@@ -5730,7 +5733,7 @@ function buildPanel() {
   // (GET /backends, blind to the laptop behind a remote pod) must not override it.
   let readinessFromOrchestrator = false;
   // Short per-provider hint shown under each provider row in the popup.
-  const BACKEND_HINTS = { claude: "Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", ollama: "Local LLMs — gemma4 · qwen3 (free, no account)" };
+  const BACKEND_HINTS = { claude: "Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", ollama: "Local LLMs" };
 
   // Hint for a provider that exists but isn't usable yet — distinguishes
   // "install the CLI" from "sign in". Empty when ready or readiness is unknown.
@@ -6403,6 +6406,9 @@ function buildPanel() {
   // re-sent on connect so a freshly-spawned agent adopts it. (`prefs` itself is
   // declared earlier — near the settings UI that also reads it.)
   let modelCatalog = presentableModels(normalizeModels(FALLBACK_MODELS));
+  // The model the orchestrator reports as ACTIVE for the connected backend (the
+  // `current` field on the models frame). Drives the Auto-mode selection mark.
+  let orchestratorCurrentModel = null;
   if (!prefs.model) prefs.model = pickDefaultModel(modelCatalog);
 
   /** The effort ids offered for the currently-selected model. Driven primarily by
@@ -6584,10 +6590,10 @@ function buildPanel() {
       h.textContent = label;
       modelPop.appendChild(h);
     };
-    const item = ({ label, small }, selected, onPick) => {
+    const item = ({ label, small, cls }, selected, onPick) => {
       const el = document.createElement("button");
       el.type = "button";
-      el.className = "cmcp-popover-item" + (selected ? " sel" : "");
+      el.className = "cmcp-popover-item" + (cls ? ` ${cls}` : "") + (selected ? " sel" : "");
       const lbl = document.createElement("span");
       lbl.className = "lbl";
       lbl.textContent = label;
@@ -6623,7 +6629,9 @@ function buildPanel() {
         // A not-ready provider can't be connected — tapping it asks the working
         // agent to help you install/sign in instead of failing a connect.
         const small = notReady ? `Tap to set up — ${hint}` : BACKEND_HINTS[id] || (id === activeBackend ? "connected" : b.running ? "running" : "");
-        item({ label: BACKEND_LABELS[id] || id, small }, id === activeBackend, () => {
+        // cmcp-provider: the NAME never shrinks; a long hint truncates instead
+        // (a long hint used to collapse "Ollama" to nothing).
+        item({ label: BACKEND_LABELS[id] || id, small, cls: "cmcp-provider" }, id === activeBackend, () => {
           modelPop.hidden = true;
           if (notReady) {
             requestProviderSetup(id);
@@ -6636,7 +6644,12 @@ function buildPanel() {
 
     section("Model");
     for (const m of modelCatalog) {
-      item({ label: m.label, small: m.small }, m.id === prefs.model && !prefs.modelAuto, () => {
+      // Checked when explicitly picked — or, in Auto mode, on the model the
+      // orchestrator reports as actually loaded (so Auto isn't a blank column).
+      const isCurrent =
+        (m.id === prefs.model && !prefs.modelAuto) ||
+        (prefs.modelAuto && !!orchestratorCurrentModel && m.id === orchestratorCurrentModel);
+      item({ label: m.label, small: m.small }, isCurrent, () => {
         prefs.model = m.id;
         prefs.modelAuto = false; // an explicit pick clears the Auto state
         prefs.userSet = true;
@@ -6712,7 +6725,13 @@ function buildPanel() {
         prefs.modelAuto = true;
         setSetting(SETTING_MODEL[bk], "");
       }
-      prefs.model = pickDefaultModel(modelCatalog);
+      // Auto should track what the orchestrator ACTUALLY runs (its reported
+      // current model) when that model is in the catalog — not just row 0 /
+      // the Opus heuristic (which pointed Auto at the wrong Ollama model).
+      prefs.model =
+        orchestratorCurrentModel && modelCatalog.some((m) => m.id === orchestratorCurrentModel)
+          ? orchestratorCurrentModel
+          : pickDefaultModel(modelCatalog);
     }
     // Preserve the user's chosen effort across a backend switch: the new backend's
     // scale may not contain the exact level, so SNAP it to the nearest level this
@@ -8136,7 +8155,11 @@ function buildPanel() {
     onBridgeClosed() {
       return tryAutoRespawn();
     },
-    onModels(list, _current, backend) {
+    onModels(list, current, backend) {
+      // The orchestrator's ACTIVE model for this backend (e.g. the Ollama default
+      // gemma4:e4b, or COMFYUI_MCP_CODEX_MODEL). In Auto mode this is what
+      // actually runs — remember it so the picker can check the real row.
+      orchestratorCurrentModel = typeof current === "string" && current ? current : null;
       // The orchestrator self-reports its backend on the handshake — this is the
       // AUTHORITATIVE source of which provider we're actually connected to. Resolve
       // the switch BEFORE applying the catalog, so the effort scale + nearest-level
