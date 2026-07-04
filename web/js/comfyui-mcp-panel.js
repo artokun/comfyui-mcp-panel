@@ -263,12 +263,14 @@ const SETTING_MODEL = {
   codex: "comfyui-mcp.defaultModel.codex",
   gemini: "comfyui-mcp.defaultModel.gemini",
   ollama: "comfyui-mcp.defaultModel.ollama",
+  openrouter: "comfyui-mcp.defaultModel.openrouter",
 };
 const SETTING_EFFORT = {
   claude: "comfyui-mcp.defaultEffort.claude",
   codex: "comfyui-mcp.defaultEffort.codex",
   gemini: "comfyui-mcp.defaultEffort.gemini",
   ollama: "comfyui-mcp.defaultEffort.ollama",
+  openrouter: "comfyui-mcp.defaultEffort.openrouter",
 };
 // Pre-grouping single-key settings (a returning user upgrading from the single
 // "Default model"/"Default reasoning effort" had these). Migrated ONCE into the
@@ -283,6 +285,7 @@ const SETTING_BRIDGE_URL = {
   codex: "comfyui-mcp.bridgeUrl.codex",
   gemini: "comfyui-mcp.bridgeUrl.gemini",
   ollama: "comfyui-mcp.bridgeUrl.ollama",
+  openrouter: "comfyui-mcp.bridgeUrl.openrouter",
 };
 // Pre-per-backend single Bridge URL key — migrated ONCE into the Claude group so a
 // returning user's custom port isn't lost (runs in the groups-migration block).
@@ -981,6 +984,8 @@ const BACKEND_EFFORTS = {
   gemini: [],
   // Ollama local models expose no reasoning-effort control — selector hidden.
   ollama: [],
+  // OpenRouter rides the same backend as ollama — no effort control either.
+  openrouter: [],
 };
 // Ordered low→high across BOTH scales, for nearest-level mapping on a switch.
 const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
