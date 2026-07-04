@@ -293,6 +293,14 @@ const SETTING_REMOTE_URL = "comfyui-mcp.remoteComfyuiUrl";
 const SETTING_EXTERNAL_ORCH = "comfyui-mcp.externalOrchestrator";
 const SETTING_TOKEN_CIVITAI = "comfyui-mcp.setCivitaiToken";
 const SETTING_TOKEN_HF = "comfyui-mcp.setHuggingfaceToken";
+// User-curated agent models (Ollama tags or OpenRouter ids) + the Ollama
+// backend's endpoint config. Synced to the orchestrator over set_config and
+// persisted server-side (~/.comfyui-mcp/panel-settings.json) so they survive
+// restarts and apply even when the panel is closed. API keys do NOT live in
+// settings — they stay in the orchestrator's env (OPENROUTER_API_KEY etc.).
+const SETTING_PREFERRED_MODELS = "comfyui-mcp.preferredModels";
+const SETTING_OLLAMA_API = "comfyui-mcp.ollama.api";
+const SETTING_OLLAMA_BASE_URL = "comfyui-mcp.ollama.baseUrl";
 // One-time flag: on first load with this feature, push the user's EXISTING
 // localStorage choices INTO the settings (so the dialog reflects reality and an
 // upgrade never silently resets a returning user's backend/model/effort/url).
@@ -320,6 +328,7 @@ const panelHooks = {
   applyBridgeUrl: null, // (url)
   applyAutoConnect: null, // (bool)
   applyStallConfig: null, // () — push the live render-stall threshold to the orchestrator
+  applyAgentModelConfig: null, // () — push preferred models + ollama endpoint config
   requestSecret: null, // (envKey, friendly)
 };
 // Best-effort guard so a setSetting() we make while seeding/syncing doesn't bounce
@@ -857,6 +866,59 @@ function panelSettingsList() {
     effortSetting("gemini", 85),
     // ---- Ollama (local) (Default model; no effort scale) ----
     modelSetting("ollama", 70),
+    {
+      id: SETTING_PREFERRED_MODELS,
+      name: "Preferred models",
+      category: cat(BACKEND_SECTION.ollama, "Preferred models"),
+      sortOrder: 68,
+      tooltip:
+        "Your own favorite models, comma-separated — Ollama tags (gemma4:12b, qwen3:4b) and/or OpenRouter ids " +
+        "(xiaomi/mimo-v2.5, moonshotai/kimi-k2.5). They pin to the TOP of the model picker (marked ★ when not in " +
+        "the discovered catalog). Persisted by the orchestrator, so they survive restarts and apply immediately.",
+      type: "text",
+      defaultValue: "",
+      onChange: () => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyAgentModelConfig?.();
+      },
+    },
+    {
+      id: SETTING_OLLAMA_API,
+      name: "Endpoint type",
+      category: cat(BACKEND_SECTION.ollama, "Endpoint type"),
+      sortOrder: 66,
+      tooltip:
+        "How the Ollama backend talks to its endpoint. 'Ollama (local)' uses the native /api/chat on your local " +
+        "Ollama. 'OpenAI-compatible' speaks /chat/completions — use it for OpenRouter, vLLM, LM Studio, DeepSeek " +
+        "etc. (set the base URL below; the API key comes from the orchestrator's env, e.g. OPENROUTER_API_KEY). " +
+        "Applies to NEW sessions — Disconnect then Connect after changing.",
+      type: "combo",
+      options: [
+        { value: "ollama", text: "Ollama (local)" },
+        { value: "openai", text: "OpenAI-compatible (OpenRouter, vLLM, …)" },
+      ],
+      defaultValue: "ollama",
+      onChange: () => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyAgentModelConfig?.();
+      },
+    },
+    {
+      id: SETTING_OLLAMA_BASE_URL,
+      name: "Endpoint base URL",
+      category: cat(BACKEND_SECTION.ollama, "Endpoint base URL"),
+      sortOrder: 64,
+      tooltip:
+        "Base URL for the endpoint above. Leave BLANK for local Ollama (http://127.0.0.1:11434). For " +
+        "OpenAI-compatible endpoints include the /v1 (e.g. https://openrouter.ai/api/v1). Applies to NEW " +
+        "sessions — Disconnect then Connect after changing.",
+      type: "text",
+      defaultValue: "",
+      onChange: () => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyAgentModelConfig?.();
+      },
+    },
     // ---- API tokens (LAST) ----
     tokenSetting(SETTING_TOKEN_CIVITAI, "CIVITAI_API_TOKEN", "CivitAI", 20),
     tokenSetting(SETTING_TOKEN_HF, "HUGGINGFACE_TOKEN", "HuggingFace", 15),
@@ -7964,6 +8026,26 @@ function buildPanel() {
     if (!client?.isConnected?.()) return;
     client.sendFrame?.({ type: "set_config", stall_seconds: stallSettingSeconds() });
   }
+  // Push the user's preferred models + Ollama endpoint config (set_config → the
+  // orchestrator persists them in ~/.comfyui-mcp/panel-settings.json and refreshes
+  // the model catalog). On connect we only sync when something is non-default
+  // (force=false) so a fresh panel never clobbers a hand-edited server file;
+  // an explicit Settings edit always sends (force=true).
+  function sendAgentModelConfig(force) {
+    if (!client?.isConnected?.()) return;
+    const preferred = String(getSetting(SETTING_PREFERRED_MODELS) ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const apiKind = String(getSetting(SETTING_OLLAMA_API) ?? "") === "openai" ? "openai" : "ollama";
+    const baseUrl = String(getSetting(SETTING_OLLAMA_BASE_URL) ?? "").trim();
+    if (!force && !preferred.length && apiKind === "ollama" && !baseUrl) return;
+    client.sendFrame?.({
+      type: "set_config",
+      preferred_models: preferred,
+      ollama: { api: apiKind, base_url: baseUrl },
+    });
+  }
 
   const client = createBridgeClient({
     onStatus(state) {
@@ -7986,6 +8068,8 @@ function buildPanel() {
         // Push the current render-stall threshold so a reused/just-connected
         // orchestrator reflects the live setting (the spawn env covers a fresh one).
         sendStallConfig();
+        // Sync preferred models + ollama endpoint config (only when non-default).
+        sendAgentModelConfig(false);
       }
       if (!connected) hideThinking();
       if (state === "disconnected" && externalOrchestratorMode()) showExternalHintOnce();
@@ -10672,6 +10756,7 @@ function buildPanel() {
     if (on && !client.isConnected()) connectAgent();
   };
   panelHooks.applyStallConfig = () => sendStallConfig();
+  panelHooks.applyAgentModelConfig = () => sendAgentModelConfig(true);
   panelHooks.requestSecret = (envKey, friendly) => {
     if (!client.isConnected()) {
       appendSystem(
@@ -10762,6 +10847,7 @@ function buildPanel() {
       panelHooks.applyBridgeUrl = null;
       panelHooks.applyAutoConnect = null;
       panelHooks.applyStallConfig = null;
+      panelHooks.applyAgentModelConfig = null;
       panelHooks.requestSecret = null;
       client.destroy();
       if (liveBridgeClient === client) liveBridgeClient = null;
