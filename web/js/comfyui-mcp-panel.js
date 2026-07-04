@@ -307,6 +307,9 @@ const SETTING_TOKEN_HF = "comfyui-mcp.setHuggingfaceToken";
 const SETTING_PREFERRED_MODELS = "comfyui-mcp.preferredModels";
 const SETTING_OLLAMA_API = "comfyui-mcp.ollama.api";
 const SETTING_OLLAMA_BASE_URL = "comfyui-mcp.ollama.baseUrl";
+// OpenRouter API key button — stored 0600 in ~/.comfyui-mcp by the orchestrator
+// (agent-secret slice), never in ComfyUI settings. Enables the OpenRouter provider.
+const SETTING_TOKEN_OPENROUTER = "comfyui-mcp.setOpenrouterKey";
 // One-time flag: on first load with this feature, push the user's EXISTING
 // localStorage choices INTO the settings (so the dialog reflects reality and an
 // upgrade never silently resets a returning user's backend/model/effort/url).
@@ -316,10 +319,10 @@ const SETTINGS_SEEDED_KEY = "comfyui-mcp.panel.settingsSeeded";
 // per-backend groups (runs independently of SETTINGS_SEEDED_KEY).
 const SETTINGS_GROUPS_MIGRATED_KEY = "comfyui-mcp.panel.settingsGroupsMigrated";
 // Section (sub-category) labels for the grouped Settings dialog, per backend.
-const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)", gemini: "Gemini", ollama: "Ollama (local)" };
+const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)", gemini: "Gemini", ollama: "Ollama (local)", openrouter: "OpenRouter" };
 // Backend display names at module scope (the Settings dialog's render-fns live
 // outside buildPanel's closure, so they need their own copy).
-const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", ollama: "Ollama" };
+const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", ollama: "Ollama", openrouter: "OpenRouter" };
 // The allowlisted secure-store keys (mirrors the orchestrator's #59 allowlist).
 const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
 
@@ -575,10 +578,10 @@ function panelSettingsList() {
   // A BUTTON-type setting: ComfyUI supports a custom `type` render function that
   // returns an HTMLElement (cg-use-everywhere uses the same trick for its About
   // row). We render a button + a masked set/not-set indicator.
-  const tokenSetting = (id, envKey, friendly, sortOrder) => ({
+  const tokenSetting = (id, envKey, friendly, sortOrder, section = "API tokens", noun = "token") => ({
     id,
-    name: `${friendly} token`,
-    category: cat("API tokens", friendly),
+    name: `${friendly} ${noun}`,
+    category: cat(section, friendly),
     sortOrder,
     tooltip:
       `Securely store your ${friendly} API token. Opens the Agent panel's masked secure input; the value goes ` +
@@ -590,7 +593,7 @@ function panelSettingsList() {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "p-button p-component";
-      btn.textContent = `Set ${friendly} token…`;
+      btn.textContent = `Set ${friendly} ${noun}…`;
       btn.style.cssText =
         "padding:0.3rem 0.7rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
         "background:var(--p-primary-color,#3a7bd5);color:#fff;cursor:pointer;font-size:0.8rem;white-space:nowrap;";
@@ -761,6 +764,7 @@ function panelSettingsList() {
         { value: "codex", text: "ChatGPT" },
         { value: "gemini", text: "Gemini" },
         { value: "ollama", text: "Ollama (local)" },
+        { value: "openrouter", text: "OpenRouter (1M · SOTA)" },
       ],
       defaultValue: "claude",
       onChange: (v) => {
@@ -925,6 +929,9 @@ function panelSettingsList() {
         panelHooks.applyAgentModelConfig?.();
       },
     },
+    // ---- OpenRouter (hosted: curated 1M · SOTA models; key stored 0600) ----
+    modelSetting("openrouter", 62),
+    tokenSetting(SETTING_TOKEN_OPENROUTER, "OPENROUTER_API_KEY", "OpenRouter", 61, BACKEND_SECTION.openrouter, "API key"),
     // ---- API tokens (LAST) ----
     tokenSetting(SETTING_TOKEN_CIVITAI, "CIVITAI_API_TOKEN", "CivitAI", 20),
     tokenSetting(SETTING_TOKEN_HF, "HUGGINGFACE_TOKEN", "HuggingFace", 15),
@@ -5765,7 +5772,7 @@ function buildPanel() {
   // ChatGPT). Clicking one asks the pack to ensure that backend's orchestrator is
   // running and returns the bridge URL to connect to — the user never types a
   // port. Populated from GET /comfyui_mcp_panel/backends when settings open.
-  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", ollama: "Ollama" };
+  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", ollama: "Ollama", openrouter: "OpenRouter" };
   const backendLabel = document.createElement("label");
   backendLabel.className = "cmcp-label";
   backendLabel.textContent = "Agent backend";
@@ -5801,7 +5808,7 @@ function buildPanel() {
   // (GET /backends, blind to the laptop behind a remote pod) must not override it.
   let readinessFromOrchestrator = false;
   // Short per-provider hint shown under each provider row in the popup.
-  const BACKEND_HINTS = { claude: "Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", ollama: "Local LLMs" };
+  const BACKEND_HINTS = { claude: "Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)" };
 
   // Hint for a provider that exists but isn't usable yet — distinguishes
   // "install the CLI" from "sign in". Empty when ready or readiness is unknown.
@@ -5810,6 +5817,8 @@ function buildPanel() {
     const r = backendReady[b.backend] || b; // durable readiness survives chip repaints
     if (r.ready !== false) return "";
     if (r.cli === false) {
+      // For openrouter, "cli" is really "API key present" — no CLI to install.
+      if (b.backend === "openrouter") return "No OpenRouter API key — set it in Settings › OpenRouter";
       return b.backend === "ollama"
         ? "Ollama not installed — get it at ollama.com/download"
         : `${BACKEND_LABELS[b.backend] || b.backend} CLI not installed`;
@@ -5817,6 +5826,7 @@ function buildPanel() {
     if (b.backend === "codex") return "Not signed in — run: codex login";
     if (b.backend === "gemini") return "Not signed in — run: gemini (then sign in with Google)";
     if (b.backend === "ollama") return "Ollama not running — run: ollama serve";
+    if (b.backend === "openrouter") return "No OpenRouter API key — set it in Settings › OpenRouter";
     return "Not signed in — run: claude auth login";
   }
 
@@ -6018,6 +6028,8 @@ function buildPanel() {
     gemini: { label: "Gemini", install: "npm i -g @google/gemini-cli", login: "gemini" },
     // No sign-in — "login" is pulling a tool-calling model (the arena's best).
     ollama: { label: "Ollama (local, free)", install: "winget install Ollama.Ollama", login: "ollama pull gemma4:e4b" },
+    // No CLI — "setup" is pasting an OpenRouter API key (Settings › OpenRouter).
+    openrouter: { label: "OpenRouter (hosted, 1M · SOTA)", install: "", login: "Set your OpenRouter API key in Settings › OpenRouter" },
   };
   let anyReady = false;
   let autoPickDone = false; // auto-switch + note fires at most once per panel mount
@@ -6046,7 +6058,7 @@ function buildPanel() {
     sub.textContent =
       "The agent runs on YOUR machine on your own Claude, ChatGPT, or Gemini subscription — no API keys. Set up a provider (Node ≥ 22), start the agent with the command below, then click Connect.";
     onboard.append(title, sub);
-    for (const id of ["claude", "codex", "gemini", "ollama"]) {
+    for (const id of ["claude", "codex", "gemini", "ollama", "openrouter"]) {
       const meta = PROVIDER_SETUP[id];
       const st = list.find((b) => b.backend === id) || {};
       const col = document.createElement("div");
@@ -10775,9 +10787,12 @@ function buildPanel() {
       return;
     }
     pendingSecretRequest = { key: envKey, friendly };
+    // OPENROUTER_API_KEY targets the ORCHESTRATOR itself (enables the OpenRouter
+    // provider); all other keys target the built-in "comfyui" MCP server.
+    const target = envKey === "OPENROUTER_API_KEY" ? "orchestrator" : "comfyui";
     const sent = client.sendUserMessage(
-      `Please securely store my ${friendly} API token. Call panel_request_secret now for the built-in "comfyui" ` +
-        `MCP server with target_kind "env" and key "${envKey}", labeled "${friendly} API token" — so I can paste it ` +
+      `Please securely store my ${friendly} API key. Call panel_request_secret now for the "${target}" ` +
+        `MCP server with target_kind "env" and key "${envKey}", labeled "${friendly} API key" — so I can paste it ` +
         `into the masked field. Do not ask any clarifying questions; just open the secure input.`,
     );
     if (sent) {
