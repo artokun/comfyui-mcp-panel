@@ -394,7 +394,7 @@ const settingsBackendState = {
 // render-fns when the dialog opens, so a freshly-arrived catalog can repaint the
 // matching backend's dropdown in place (a render-fn setting has no static options
 // to re-key). Keyed by backend; null when that group isn't mounted.
-const settingsModelSelectEls = { claude: null, codex: null, gemini: null, ollama: null };
+const settingsModelSelectEls = { claude: null, codex: null, gemini: null, ollama: null, openrouter: null };
 // Disabled placeholder <option> value — mapped to "" (Auto) if ever selected so
 // it can never persist as a bogus model id.
 const SETTINGS_PLACEHOLDER = "__cmcp_placeholder__";

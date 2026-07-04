@@ -56,6 +56,7 @@ _BACKEND_PORTS = {
     "codex": 9181,
     "gemini": 9182,
     "ollama": _BRIDGE_PORT,  # single-port multi-provider — same orchestrator
+    "openrouter": _BRIDGE_PORT,  # hosted (OpenRouter) — same orchestrator, key-gated
 }
 _DEFAULT_BACKEND = "claude"
 
