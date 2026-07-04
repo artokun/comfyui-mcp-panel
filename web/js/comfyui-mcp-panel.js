@@ -1,6 +1,6 @@
 // =============================================================================
 // ComfyUI Agent Panel — sidebar driven by an autonomous background agent.
-//
+// =============================================================================
 // Shipped as a UI-only custom node pack (served via WEB_DIRECTORY). The panel
 // connects to the loopback WebSocket bridge owned by the comfyui-mcp panel
 // orchestrator, started with:
@@ -31,6 +31,30 @@
 // the equivalents are `defineExtension()`, `defineSidebarTab()`, and
 // `NodeHandle`/`WidgetHandle`. v1 call sites are tagged `// TODO(v2):`.
 // =============================================================================
+
+// crypto.randomUUID is gated to SECURE contexts; plain http://LAN
+// (ComfyUI's default) isn't one. Install a spec-compliant fallback on
+// first load so getTabId() / thread creation can mint a UUID.
+(function installUuidPolyfill() {
+  const _polyfill = function randomUUID() {
+    const b = crypto.getRandomValues(new Uint8Array(16));
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    const h = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+    return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20,32)}`;
+  };
+  if (typeof crypto.randomUUID !== "function") {
+    try {
+      Object.defineProperty(crypto, "randomUUID", { value: _polyfill, configurable: true, writable: true });
+    } catch {
+      // crypto is a frozen host object — leave it alone rather than re-clobber
+      // it (re-binding getRandomValues / subtle by hand has already proven
+      // fragile). Behavior reverts to pre-polyfill: the panel hangs in
+      // 'waiting for the panel agent…' on a non-secure LAN host, exactly as
+      // before this fix.
+    }
+  }
+})();
 
 // `app` / `api` are resolved LAZILY (not via a static `import "/scripts/app.js"`).
 // On Vite/Rolldown frontends, extension modules are evaluated alphabetically-early
@@ -116,6 +140,12 @@ function saveBridgeUrl(url) {
   } catch {
     // localStorage unavailable — session-scoped settings only.
   }
+  // Mirror into ComfyUI's setting store so a backend switch (which calls
+  // configuredBridgeUrlFor → getSetting(SETTING_BRIDGE)) sees the same value.
+  // Without this, the per-backend chip switch silently reverts the Bridge URL
+  // to whatever the ComfyUI setting still holds, and the user's custom URL
+  // is lost on the very next backend pick.
+  setSetting(SETTING_BRIDGE, url);
 }
 
 // Per-TAB session id: sessionStorage is scoped to the tab and survives
