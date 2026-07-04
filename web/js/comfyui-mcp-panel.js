@@ -116,6 +116,12 @@ function saveBridgeUrl(url) {
   } catch {
     // localStorage unavailable — session-scoped settings only.
   }
+  // Mirror into ComfyUI's setting store so a backend switch (which calls
+  // configuredBridgeUrlFor → getSetting(SETTING_BRIDGE)) sees the same value.
+  // Without this, the per-backend chip switch silently reverts the Bridge URL
+  // to whatever the ComfyUI setting still holds, and the user's custom URL
+  // is lost on the very next backend pick.
+  setSetting(SETTING_BRIDGE, url);
 }
 
 // Per-TAB session id: sessionStorage is scoped to the tab and survives
