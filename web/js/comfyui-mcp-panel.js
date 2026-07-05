@@ -4352,7 +4352,7 @@ function focusFollowOnCommand(cmd, msg, reply) {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onReload, onTodo, onShowMedia, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -4619,6 +4619,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // blind to the laptop behind a remote pod and never sees Claude's SDK.
       if (msg && msg.type === "backends" && Array.isArray(msg.backends)) {
         onBackends?.(msg);
+      }
+      // Ack for a PANEL-initiated set_secret (Settings › "Set API key…" — the
+      // no-agent path). The refreshed "backends" frame that follows a success
+      // flips the provider picker to ready on its own.
+      if (msg && msg.type === "secret_saved") {
+        onSecretSaved?.(msg);
       }
       // Structured acks (ready / working / options / …). The "ready" ack is sent
       // after the orchestrator has processed hello (resume armed), so it's the
@@ -6197,6 +6203,20 @@ function buildPanel() {
     const meta = PROVIDER_SETUP[id];
     if (!meta) return;
     modelPop.hidden = true;
+    // OpenRouter is a hosted API — there is nothing to install and nothing an
+    // agent chat adds. Show the two setup paths inline and stop; no chat.
+    if (id === "openrouter") {
+      appendSystem(
+        `OpenRouter is a hosted API — no CLI, no login flow. Enable it by setting your API key (create one at https://openrouter.ai/keys):
+` +
+          `  • Settings → OpenRouter → “Set API key…” — masked input, stored by the orchestrator in ~/.comfyui-mcp (0600), never in ComfyUI settings. Applies immediately.
+` +
+          `  • Or set the OPENROUTER_API_KEY environment variable and (re)start the orchestrator.
+` +
+          `Then pick OpenRouter here again and Connect.`,
+      );
+      return;
+    }
     const prompt =
       `Help me set up the ${meta.label} backend so I can use it in this panel — I'm not signed in to it yet. ` +
       `Walk me through it for my OS: install the CLI (\`${meta.install}\`), sign in (\`${meta.login}\`), ` +
@@ -8055,6 +8075,8 @@ function buildPanel() {
   // the secure input, so the resolved value can be marked set/not-set (timestamp
   // only) for the Settings indicator. Cleared as soon as the next secret is painted.
   let pendingSecretRequest = null;
+  // Panel-initiated (no-agent) secret save in flight: { key, friendly }.
+  let pendingSetSecret = null;
 
   // ---- bridge wiring ----
   // Tear down any client a previous mount left alive BEFORE creating ours, so
@@ -8191,6 +8213,18 @@ function buildPanel() {
         }).catch(() => {});
       }
       return p;
+    },
+    // Ack for the Settings-button set_secret flow (no agent involved).
+    onSecretSaved(msg) {
+      const req = pendingSetSecret;
+      pendingSetSecret = null;
+      const friendly = req?.friendly || msg.key || "API";
+      if (msg.ok) {
+        if (req?.key) lsSet(SECRET_SET_AT_PREFIX + req.key, String(Date.now()));
+        appendSystem(`🔒 ${friendly} key saved — the provider is enabled now (stored by the orchestrator in ~/.comfyui-mcp, never in ComfyUI settings).`);
+      } else {
+        appendSystem(`Couldn't save the ${friendly} key: ${msg.error || "unknown error"}.`);
+      }
     },
     // The agent called panel_reload — perform the soft reload it asked for.
     onReload(scope) {
@@ -10805,6 +10839,38 @@ function buildPanel() {
   panelHooks.applyStallConfig = () => sendStallConfig();
   panelHooks.applyAgentModelConfig = () => sendAgentModelConfig(true);
   panelHooks.requestSecret = (envKey, friendly) => {
+    // PROVIDER keys (OPENROUTER_API_KEY) never involve the agent or the chat:
+    // paint the same masked card the agent flow uses, then ship the value in a
+    // set_secret frame the ORCHESTRATOR stores itself (0600 agent-secret slice,
+    // hydrated into its env live). Only needs the bridge socket — works before
+    // ANY backend is ready, so there's no chicken-and-egg where enabling
+    // OpenRouter first requires connecting some other provider.
+    if (envKey === "OPENROUTER_API_KEY") {
+      if (!client.isConnected()) {
+        appendSystem(
+          `To set your ${friendly} key from here, click Connect first — the bridge alone is enough, no provider needs to be ready — then press “Set API key…” again. ` +
+            `Or skip the panel entirely: set the ${envKey} environment variable and (re)start the orchestrator with it. PowerShell: [Environment]::SetEnvironmentVariable("${envKey}", "sk-or-…", "User")`,
+        );
+        return;
+      }
+      paintSecret({
+        label: `${friendly} API key`,
+        hint: "Sent straight to the orchestrator's 0600 config (~/.comfyui-mcp) — never into ComfyUI settings, chat history, or the agent's context.",
+      })
+        .then((value) => {
+          if (!value) return;
+          pendingSetSecret = { key: envKey, friendly };
+          if (!client.sendFrame({ type: "set_secret", key: envKey, value })) {
+            pendingSetSecret = null;
+            appendSystem(`Couldn't reach the orchestrator to save the ${friendly} key — reconnect and try again.`);
+          }
+        })
+        .catch(() => {});
+      return;
+    }
+    // comfyui-TOOL keys (Civitai / HuggingFace) still ride the agent's
+    // panel_request_secret — that path also respawns the comfyui MCP server
+    // with the new env, which needs a working agent turn.
     if (!client.isConnected()) {
       appendSystem(
         `To set your ${friendly} token, connect the Agent first (click Connect), then choose “Set ${friendly} token…” again. ` +
@@ -10816,9 +10882,7 @@ function buildPanel() {
       return;
     }
     pendingSecretRequest = { key: envKey, friendly };
-    // OPENROUTER_API_KEY targets the ORCHESTRATOR itself (enables the OpenRouter
-    // provider); all other keys target the built-in "comfyui" MCP server.
-    const target = envKey === "OPENROUTER_API_KEY" ? "orchestrator" : "comfyui";
+    const target = "comfyui";
     const sent = client.sendUserMessage(
       `Please securely store my ${friendly} API key. Call panel_request_secret now for the "${target}" ` +
         `MCP server with target_kind "env" and key "${envKey}", labeled "${friendly} API key" — so I can paste it ` +
