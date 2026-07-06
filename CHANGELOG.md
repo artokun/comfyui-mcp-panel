@@ -6,6 +6,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-06
+
+### Fixed
+
+- **Reconnect wedged forever on a remote pod's `wss://` secure bridge.** On an
+  https pod page, if a tab's first autoconnect raced the orchestrator's advertise
+  of the secure tunnel URL (e.g. right at orchestrator startup, or a background
+  tab that was already retrying before this orchestrator came up), it fell back
+  to the plain unauthenticated `ws://127.0.0.1:<port>` default. Contrary to this
+  file's own long-standing assumption, Chrome does **not** mixed-content-block a
+  `ws://127.0.0.1` dial from an `https://` page (loopback is exempt) — so that
+  fallback actually reached the real local bridge directly and got rejected for a
+  missing token, then retried that SAME wrong URL forever (capped at 15s) with no
+  way back to the correct tunnel short of a manual Reconnect. The reconnect loop
+  now re-fetches the advertised bridge URL on every retry and switches over the
+  moment one becomes available, self-healing without user action.
+
 ## [0.4.13] - 2026-07-01
 
 ### Changed
