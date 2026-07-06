@@ -9086,8 +9086,15 @@ function buildPanel() {
   function tryAutoRespawn() {
     // External/local orchestrator: this host doesn’t own the agent process, so it
     // can’t respawn it. Let the bare WS retry keep trying (the user restarts it
-    // locally); never POST /connect here.
-    if (externalOrchestratorMode()) return false;
+    // locally); never POST /connect here — but DO try to reclaim a fresher
+    // advertised bridge URL in case this retry loop is wedged on the wrong one
+    // (see reclaimAdvertisedBridgeUrl). Always return false: this is a best-effort
+    // side channel, not a replacement for the bare retry — if it finds a new URL,
+    // client.setUrl() immediately supersedes whatever connect() below dials.
+    if (externalOrchestratorMode()) {
+      void reclaimAdvertisedBridgeUrl();
+      return false;
+    }
     if (!lsGet(AUTOCONNECT_KEY)) return false; // user never connected / disconnected
     // A deliberate soft-reload owns the respawn — DON'T compete. Return false so
     // scheduleReconnect keeps doing bare WS retries (the soft-reload's own backoff
@@ -9223,6 +9230,35 @@ function buildPanel() {
     } catch {
       return null;
     }
+  }
+
+  // Self-heal a wedged external-orchestrator reconnect: a tab's FIRST autoconnect
+  // (page load, or a background tab that's been retrying since before this
+  // orchestrator started) can race the orchestrator's advertise POST and get back
+  // no wss:// URL yet, falling back to the plain unauthenticated loopback default
+  // (configuredBridgeUrlFor). Contrary to this file's own long-standing assumption
+  // above ("blocked by the browser (mixed-content / Private Network Access)"),
+  // Chrome does NOT block a ws://127.0.0.1 dial from an https:// page — loopback is
+  // exempt from mixed-content blocking (the same reason local dev-server HMR works
+  // over an https page) — so that fallback actually reaches the real local bridge
+  // and gets rejected for a missing token. scheduleReconnect then retries that SAME
+  // wrong URL forever (capped at RECONNECT_MAX_MS = 15s), which is exactly the
+  // "rejected a bridge connection with a missing/invalid token" drumbeat every 15s
+  // this was firing in practice — with no way back to the correct tunnel short of a
+  // manual Reconnect, even once the orchestrator's advertise has long since landed.
+  // Called from tryAutoRespawn on every bridge-closed retry so a later-landing
+  // advertise (or the orchestrator itself coming up after this tab started
+  // retrying) self-heals instead of wedging permanently.
+  async function reclaimAdvertisedBridgeUrl() {
+    if (location.protocol !== "https:") return;
+    const wanted = urlInput.value.trim();
+    const manualOverride =
+      !!wanted && wanted !== defaultBridgeUrlFor(selectedBackend) && wanted !== lastAutoUrl;
+    if (manualOverride) return; // a user-typed Advanced Bridge URL is never clobbered
+    const secure = await fetchAdvertisedBridgeUrl();
+    if (!secure || secure === client.currentUrl()) return;
+    client.setUrl(secure, { persist: false });
+    lastAutoUrl = secure;
   }
 
   async function connectAgent(opts = {}) {
