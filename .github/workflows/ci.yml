@@ -60,6 +60,29 @@ jobs:
       - name: Security scan (Comfy Registry parity — Bandit)
         run: bandit -r . -s B101,B112,B311
 
+      # Comfy Registry security-scan parity — YARA. The scanner also runs YARA
+      # rules over ALL files (JS included). The one that bit us for every release
+      # 0.1.0→0.6.1 was `SUSP_SVG_Onload_Onerror_Jul23`, which fires on the mere
+      # co-occurrence in a file of "svg" AND ("onload" | "onerror") — nocase, no
+      # proximity. It's a false positive on DOMPurify (a sanitizer contains those
+      # XSS tokens by design) and on our own image handlers. Guard against a
+      # regression: no shipped web/js file may contain svg + onload/onerror.
+      # Fix pattern: addEventListener("load"|"error") instead of .onload/.onerror,
+      # and keep the literal "onload"/"onerror" tokens out of comments.
+      - name: Security scan (Comfy Registry parity — YARA SUSP_SVG)
+        shell: bash
+        run: |
+          set -e
+          shopt -s globstar nullglob
+          fail=0
+          for f in web/js/**/*.js; do
+            if grep -qi 'svg' "$f" && grep -qiE 'onload|onerror' "$f"; then
+              echo "::error file=$f::matches YARA SUSP_SVG_Onload_Onerror (svg + onload/onerror in one file) — the registry will flag this. Use addEventListener('load'/'error') and drop literal onload/onerror tokens."
+              fail=1
+            fi
+          done
+          [ "$fail" = "0" ] || exit 1
+
       - name: pyproject.toml is valid + has registry fields
         run: |
           python - <<'PY'

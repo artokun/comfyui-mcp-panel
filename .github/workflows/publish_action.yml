@@ -35,6 +35,24 @@ jobs:
           done
           [ "$found" = "1" ] || { echo "::error::no web/js/*.js files found"; exit 1; }
 
+      # Never publish a version the registry's YARA scan will flag. The rule
+      # SUSP_SVG_Onload_Onerror fires on "svg" + ("onload"|"onerror") co-occurring
+      # in any file (nocase). Flagged every release 0.1.0→0.6.1. Fix: use
+      # addEventListener("load"/"error") and keep onload/onerror tokens out of code+comments.
+      - name: Registry YARA parity (SUSP_SVG) — block a would-be-flagged publish
+        shell: bash
+        run: |
+          set -e
+          shopt -s globstar nullglob
+          fail=0
+          for f in web/js/**/*.js; do
+            if grep -qi 'svg' "$f" && grep -qiE 'onload|onerror' "$f"; then
+              echo "::error file=$f::svg + onload/onerror co-occur — registry will flag. Aborting publish."
+              fail=1
+            fi
+          done
+          [ "$fail" = "0" ] || exit 1
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
