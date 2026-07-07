@@ -7971,7 +7971,7 @@ function buildPanel() {
       thinkingTokens > 0
         ? `Thinking… (${fmtThinkTokens(thinkingTokens)} tokens)`
         : `${WORK_WORDS[workWordIdx % WORK_WORDS.length]}…`;
-    thinkingLabel.textContent = `${base} (Ctrl+C to stop)`;
+    thinkingLabel.textContent = `${base} (Esc or Ctrl+C to stop)`;
     workWordIdx += 1;
   }
   // Live extended-thinking token meter (from the orchestrator's thinking frame).
@@ -10722,21 +10722,47 @@ function buildPanel() {
       form.requestSubmit();
     }
   });
-  // Ctrl+C / Cmd+C interrupts a running turn. Only when no text is selected
-  // (so copy still works) and a turn is actually in flight. Scoped to the panel
-  // via bubbling — it won't hijack Ctrl+C elsewhere in ComfyUI.
-  root.addEventListener("keydown", (ev) => {
-    if ((ev.ctrlKey || ev.metaKey) && (ev.key === "c" || ev.key === "C")) {
-      const hasSelection = (window.getSelection?.()?.toString() ?? "").length > 0;
-      if (!hasSelection && thinkingEl) {
-        ev.preventDefault();
-        if (client.sendFrame({ type: "interrupt" })) {
-          hideThinking();
-          appendSystem("Interrupted.");
-        }
-      }
+  // Ctrl+C / Cmd+C and Esc interrupt a running turn. DOCUMENT capture phase
+  // (like onDocPointerDown below) is load-bearing: keydown only bubbles through
+  // `root` while keyboard focus sits INSIDE the panel — clicking the chat log
+  // or the canvas parks focus on <body>, so the old root-scoped listener
+  // silently never fired — and ComfyUI's own keybinding/canvas handlers can
+  // swallow the event before a bubble-phase listener sees it. The guards keep
+  // the global scope polite: only while a turn is in flight, Ctrl+C never
+  // steals a real copy (text selection anywhere, or selected graph nodes), and
+  // Esc defers to its other meanings (composer menu/history, ComfyUI dialogs,
+  // editing a node widget). Removed in destroy() so remounts can't stack it.
+  function onInterruptKeydown(ev) {
+    if (!thinkingEl && !agentWorking) return; // no turn in flight
+    const isCopy = (ev.ctrlKey || ev.metaKey) && !ev.altKey && (ev.key === "c" || ev.key === "C");
+    const isEsc = ev.key === "Escape";
+    if (!isCopy && !isEsc) return;
+    const ae = document.activeElement;
+    if (isCopy) {
+      // A real copy wins. window.getSelection() misses selections inside
+      // inputs/textareas in Chromium, so check the active element too.
+      if ((window.getSelection?.()?.toString() ?? "").length > 0) return;
+      if (ae && typeof ae.selectionStart === "number" && ae.selectionStart !== ae.selectionEnd) return;
+      // Nodes selected on the canvas → Ctrl+C means "copy nodes".
+      try {
+        if (Object.keys(app?.canvas?.selected_nodes || {}).length > 0) return;
+      } catch {}
+    } else {
+      // Esc keeps its composer meanings (close the completion menu, bail out
+      // of message-history navigation) — the input handler owns those.
+      if ((!menuPop.hidden && menuItems.length) || histIdx !== -1) return;
+      // Esc while editing something OUTSIDE the panel (a node title/widget)
+      // or with a dialog open means "cancel that", not "stop the agent".
+      if (ae && !root.contains(ae) && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return;
+      if (document.querySelector(".p-dialog-mask, dialog[open]")) return;
     }
-  });
+    if (client.sendFrame({ type: "interrupt" })) {
+      ev.preventDefault();
+      hideThinking();
+      appendSystem("Interrupted.");
+    }
+  }
+  document.addEventListener("keydown", onInterruptKeydown, true);
 
   input.addEventListener("blur", () => setTimeout(hideMenu, 150));
   // Auto-grow the textarea up to its CSS max-height.
@@ -10977,6 +11003,7 @@ function buildPanel() {
         // recognition already stopped
       }
       document.removeEventListener("mousedown", onDocPointerDown, true);
+      document.removeEventListener("keydown", onInterruptKeydown, true);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       try {
         api.removeEventListener("executed", onExecuted);
