@@ -6,6 +6,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-07-06
+
+### Fixed
+
+- **Registry security-scan: stop shipping this changelog in the published
+  archive.** The Registry's private YARA scan matches code-shaped literals in
+  ANY file of the uploaded zip — markdown prose included. 0.6.2 (which cleared
+  the SUSP_SVG tokens) was still flagged `any-code-execute` because THIS file's
+  0.3.x-era entry quoted, verbatim, the process-spawn call that entry was
+  documenting the removal of. `CHANGELOG.md` is now `.comfyignore`'d (it
+  documents security fixes, so it will always contain such literals), and CI +
+  the publish gate scan every file that still ships for process-spawn literals.
+  The three remaining scanner findings (env-var reads, the local orchestrator
+  port probe, and the panel's WebSocket client) are info-severity and intrinsic
+  to what this pack is; per the scanner's design any finding queues the version
+  for manual review, which is being requested separately.
+
 ## [0.6.1] - 2026-07-06
 
 ### Fixed

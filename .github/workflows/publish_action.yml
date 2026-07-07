@@ -53,6 +53,27 @@ jobs:
           done
           [ "$fail" = "0" ] || exit 1
 
+      # 0.6.2 proved the scanner also matches call-shaped literals in shipped
+      # markdown PROSE (CHANGELOG.md quoting the removed spawn call → flagged,
+      # any-code-execute). CHANGELOG.md must stay .comfyignore'd and no shipped
+      # file may contain a process-spawn literal.
+      - name: Registry YARA parity (exec literals) — block a would-be-flagged publish
+        shell: bash
+        run: |
+          set -e
+          grep -q '^CHANGELOG.md' .comfyignore || {
+            echo "::error file=.comfyignore::CHANGELOG.md must stay .comfyignore'd — its prose quotes exec-call literals the registry YARA scan flags."
+            exit 1
+          }
+          fail=0
+          while IFS= read -r -d '' f; do
+            if grep -qE 'subprocess\.(Popen|run|call|check_output|check_call)\s*\(|os\.system\s*\(' "$f"; then
+              echo "::error file=$f::contains a process-spawn call literal — the registry YARA scan flags this in ANY shipped file, prose included. Aborting publish."
+              fail=1
+            fi
+          done < <(find __init__.py README.md pyproject.toml web -type f \( -name '*.py' -o -name '*.js' -o -name '*.md' -o -name '*.toml' -o -name '*.json' -o -name '*.html' -o -name '*.css' \) -print0)
+          [ "$fail" = "0" ] || exit 1
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"

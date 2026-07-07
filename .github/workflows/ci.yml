@@ -83,6 +83,30 @@ jobs:
           done
           [ "$fail" = "0" ] || exit 1
 
+      # Comfy Registry security-scan parity — YARA command-exec literals.
+      # 0.6.2 was flagged (python_command_injection_risk / any-code-execute,
+      # pattern $subprocess_popen_direct) by a code literal in CHANGELOG.md PROSE:
+      # the scanner matches call-shaped strings in ANY shipped file, markdown
+      # included. CHANGELOG.md is .comfyignore'd now (it documents security fixes,
+      # so it will always quote such literals) — this guard (a) keeps it ignored
+      # and (b) blocks the literals from every file that still ships.
+      - name: Security scan (Comfy Registry parity — YARA exec literals)
+        shell: bash
+        run: |
+          set -e
+          grep -q '^CHANGELOG.md' .comfyignore || {
+            echo "::error file=.comfyignore::CHANGELOG.md must stay .comfyignore'd — its prose quotes exec-call literals the registry YARA scan flags."
+            exit 1
+          }
+          fail=0
+          while IFS= read -r -d '' f; do
+            if grep -qE 'subprocess\.(Popen|run|call|check_output|check_call)\s*\(|os\.system\s*\(' "$f"; then
+              echo "::error file=$f::contains a process-spawn call literal — the registry YARA scan ($subprocess_popen_direct et al.) flags this in ANY shipped file, prose included."
+              fail=1
+            fi
+          done < <(find __init__.py README.md pyproject.toml web -type f \( -name '*.py' -o -name '*.js' -o -name '*.md' -o -name '*.toml' -o -name '*.json' -o -name '*.html' -o -name '*.css' \) -print0)
+          [ "$fail" = "0" ] || exit 1
+
       - name: pyproject.toml is valid + has registry fields
         run: |
           python - <<'PY'
