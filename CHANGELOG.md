@@ -6,6 +6,25 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-07-07
+
+### Fixed
+
+- **Ctrl+C never interrupted the agent when focus sat outside the panel.** The
+  interrupt hotkey listened on the panel root in bubble phase, so clicking the
+  chat log or the canvas (focus on `<body>`) made the shortcut silently do
+  nothing. It now uses a document-level capture listener gated to a turn in
+  flight, with **Esc** added as a second stop key. Guards keep the global scope
+  polite: Ctrl+C never steals a real copy (text selection and selected graph
+  nodes win), Esc defers to the composer menu, ComfyUI dialogs, and editable
+  fields outside the panel, and the listener is removed on destroy so remounts
+  can't stack it. The thinking label now reads "(Esc or Ctrl+C to stop)". (#61)
+- **Onboarding card never hid once shown.** The `.cmcp-onboard` base rule's
+  `display:flex` beat the UA's `[hidden]` rule by cascade, so readiness updates
+  that set `hidden` had no visual effect. `display:none` is now re-asserted
+  under `[hidden]`, matching the existing overrides in the stylesheet. (#59,
+  #60)
+
 ## [0.6.3] - 2026-07-06
 
 ### Fixed
