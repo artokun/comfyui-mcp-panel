@@ -4973,6 +4973,9 @@ const PANEL_CSS = `
   border-radius: var(--p-border-radius-md, 6px);
   display: flex; flex-direction: column; gap: 0.5rem;
 }
+/* The base rule sets display, which beats the UA [hidden] rule — so re-assert
+   it or "onboard.hidden = true" won't actually hide the card. */
+.cmcp-onboard[hidden] { display: none; }
 .cmcp-onboard-title { font-weight: 600; color: var(--p-text-color, #fff); }
 .cmcp-onboard-sub { font-size: 0.75rem; color: var(--p-text-muted-color, #a1a1aa); line-height: 1.4; }
 .cmcp-onboard-col { display: flex; flex-direction: column; gap: 0.25rem; }
