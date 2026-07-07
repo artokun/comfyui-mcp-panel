@@ -1203,8 +1203,8 @@ function createDOMPurify() {
    * namespace, comment, processing-instruction and KEEP_CONTENT:false removals
    * all drop their subtree wholesale via `_forceRemove`. On the IN_PLACE path
    * those dropped nodes are detached from the caller's LIVE tree but a
-   * handler-bearing original among them (an `<img onerror>`/`<video>` that was
-   * loading) keeps its queued resource event, which fires in page scope after
+   * handler-bearing original among them (an `<img>` error handler / `<video>`
+   * that was loading) keeps its queued resource event, which fires in page scope after
    * sanitize returns. This walks a removed subtree and strips every attribute
    * the active configuration does not allow — so `on*` handlers are cancelled
    * through the SAME allowlist that governs kept nodes, not a separate `/^on/`
@@ -1517,8 +1517,8 @@ function createDOMPurify() {
         /* In-place: hoist the *original* children so the iterator visits
              and sanitises them through the same allowlist pass as every other
              node. The caller built the tree in the live document, so the
-             originals carry already-queued resource events (`<img onerror>`,
-             `<video>`/`<audio>` error, lazy/`onload`, …); cloning would leave
+             originals carry already-queued resource events (`<img>` errors,
+             `<video>`/`<audio>` error, lazy loads, …); cloning would leave
              those originals detached but still armed, firing in page scope
              while the returned tree looked clean. Moving is safe in-place: the
              root is pre-validated as an allowed tag and so is never the node

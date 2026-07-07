@@ -72,15 +72,15 @@ let api = null;
 // even if it predates the agent's question. Wired once `api` is ready (via
 // setupListeners, called from registerExtensionWhenReady). execution_start clears
 // state for the new run.
-let lastExecutionError = null;
+let lastExecFailure = null;
 function setupListeners() {
   if (!api) return;
   try {
     api.addEventListener("execution_error", (ev) => {
-      lastExecutionError = { ...(ev.detail ?? {}), ts: new Date().toISOString() };
+      lastExecFailure = { ...(ev.detail ?? {}), ts: new Date().toISOString() };
     });
     api.addEventListener("execution_start", () => {
-      lastExecutionError = null;
+      lastExecFailure = null;
     });
   } catch {
     // api unavailable — graph_get_errors reports null.
@@ -1316,11 +1316,11 @@ function fetchImageDimensions(url) {
         resolve(v);
       };
       const timer = setTimeout(() => finish(null), 8000);
-      img.onload = () =>
+      img.addEventListener("load", () =>
         finish(img.naturalWidth && img.naturalHeight
           ? { w: img.naturalWidth, h: img.naturalHeight }
-          : null);
-      img.onerror = () => finish(null);
+          : null));
+      img.addEventListener("error", () => finish(null));
       img.src = url;
     } catch {
       resolve(null);
@@ -1909,7 +1909,7 @@ function validationBanner() {
   } catch {
     nodeErrors = null;
   }
-  const execErr = lastExecutionError;
+  const execErr = lastExecFailure;
   if (!nodeErrors && !execErr) {
     lastInjectedValidationSig = null; // clean → let a future re-appearance inject again
     return "";
@@ -3031,9 +3031,9 @@ const GRAPH_TOOL_EXECUTORS = {
     const nodeErrors =
       app.lastNodeErrors && Object.keys(app.lastNodeErrors).length ? app.lastNodeErrors : null;
     return {
-      last_execution_error: lastExecutionError,
+      last_execution_error: lastExecFailure,
       node_errors: nodeErrors,
-      ...(lastExecutionError || nodeErrors
+      ...(lastExecFailure || nodeErrors
         ? {}
         : { note: "no errors recorded since the last execution start" }),
     };
@@ -10040,16 +10040,16 @@ function buildPanel() {
   function readAsDataURL(file) {
     return new Promise((resolve, reject) => {
       const fr = new FileReader();
-      fr.onload = () => resolve(fr.result);
-      fr.onerror = reject;
+      fr.addEventListener("load", () => resolve(fr.result));
+      fr.addEventListener("error", reject);
       fr.readAsDataURL(file);
     });
   }
   function readAsText(file) {
     return new Promise((resolve, reject) => {
       const fr = new FileReader();
-      fr.onload = () => resolve(String(fr.result ?? ""));
-      fr.onerror = reject;
+      fr.addEventListener("load", () => resolve(String(fr.result ?? "")));
+      fr.addEventListener("error", reject);
       fr.readAsText(file);
     });
   }
