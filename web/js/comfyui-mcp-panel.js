@@ -3118,6 +3118,29 @@ const GRAPH_TOOL_EXECUTORS = {
       );
     }
     await s.openWorkflow(target);
+    // openWorkflow sets the tab ACTIVE but does NOT repaint the canvas for an
+    // ALREADY-OPEN instance — the graph load normally rides the frontend's
+    // workflow *service* tab-switch, which the panel can't reach (it's a Vue
+    // composable, not on the store or window). So switching to an open tab left
+    // the PREVIOUS tab's graph frozen on the canvas ("all tabs show the same
+    // graph" — issue #65), and the earlier in-place-load attempts corrupted tab
+    // buffers (#63/#64). Force the repaint the way a real tab-click does: load
+    // the target's OWN live buffer (changeTracker.activeState — preserves its
+    // unsaved edits, NOT the on-disk copy) into ITS tab. The 4th arg (the
+    // workflow) associates the load with the target so it does NOT spawn a new
+    // "Unsaved Workflow" tab. Verified live in-browser (2026-07-08): switching
+    // among 12/39-node tabs repaints to the correct graph each time, no dup
+    // tabs, no cross-tab clobber. NOTE: getWorkflowByPath returns the SAME
+    // object as the open instance (verified), so find() needs no reorder — the
+    // #63 find() patch was a no-op that only regressed things.
+    try {
+      const st = target.changeTracker?.activeState;
+      if (st && typeof app.loadGraphData === "function") {
+        await app.loadGraphData(JSON.parse(JSON.stringify(st)), true, true, target);
+      }
+    } catch (err) {
+      console.warn("[comfyui-mcp-panel] workflow_open repaint failed:", err?.message ?? err);
+    }
     // Opening alone must not dirty the tab (a spurious post-load change-tracker
     // diff otherwise flips it to modified:true and blocks an unforced close).
     await clearSpuriousOpenModified(target);

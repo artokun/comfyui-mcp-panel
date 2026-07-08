@@ -6,6 +6,30 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.6.6] - 2026-07-08
+
+### Fixed
+
+- **Switching to an already-open workflow tab (`panel_open_workflow`) left the
+  canvas frozen on the previous graph, and earlier attempts corrupted tab
+  buffers.** Root cause (confirmed by live in-browser debugging): the frontend
+  store's `openWorkflow` sets the tab *active* but does **not** load the graph
+  onto the canvas — that repaint normally rides the frontend's workflow
+  *service* tab-switch, which the panel can't reach (it's a Vue composable, not
+  exposed on the store or `window`). So switching among open tabs showed the
+  wrong graph (#65), and prior in-place-load workarounds clobbered a tab's live
+  buffer, where a Save would then overwrite the good file (#63, #64). Fix: after
+  `openWorkflow`, force the repaint the way a real tab-click does — load the
+  target's own live buffer (`changeTracker.activeState`, so unsaved edits are
+  preserved, not the on-disk copy) into **its** tab via
+  `app.loadGraphData(state, true, true, target)` (the 4th arg associates the
+  load with the target so no duplicate "Unsaved Workflow" tab spawns). Verified
+  live: switching among 12/39/126-node tabs repaints correctly each time with no
+  duplicate tabs and no cross-tab clobber. NOTE: `getWorkflowByPath` returns the
+  *same object* as the open-tab instance, so the `find()` reorder proposed in
+  #63 was a no-op red herring (it only regressed switching, per #65) — reverted
+  and not shipped.
+
 ## [0.6.5] - 2026-07-07
 
 ### Fixed
