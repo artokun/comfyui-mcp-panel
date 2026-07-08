@@ -6697,6 +6697,18 @@ function buildPanel() {
       }
       lsSet(SETTINGS_GROUPS_MIGRATED_KEY, "1");
     }
+    // One-time: upgrade a saved Ollama model of "gemma4:e4b" — the OLD shipped
+    // default — to the comfyui-mcp fine-tune that replaced it. Users with that
+    // value almost always just accepted the old default; leaving it pinned
+    // silently overrides the new default on every connect (field: the header
+    // said gemma4:e4b while the picker showed the fine-tune selected). Anyone
+    // who genuinely wants stock gemma4:e4b can re-pick it — it stays listed.
+    if (!lsGet("comfyui-mcp.migratedOllamaFinetune")) {
+      if (getSetting(SETTING_MODEL.ollama) === "gemma4:e4b") {
+        setSetting(SETTING_MODEL.ollama, "artokun/gemma4-comfyui-mcp:e4b");
+      }
+      lsSet("comfyui-mcp.migratedOllamaFinetune", "1");
+    }
     if (!lsGet(SETTINGS_SEEDED_KEY)) {
       setSetting(SETTING_BACKEND, selectedBackend || "claude");
       // Only persist model/effort the user actually chose — never a synthetic
