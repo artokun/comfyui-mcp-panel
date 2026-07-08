@@ -126,6 +126,7 @@ const DEFAULT_BRIDGE_URL_BY_BACKEND = {
   codex: DEFAULT_BRIDGE_URL,
   gemini: DEFAULT_BRIDGE_URL,
   grok: DEFAULT_BRIDGE_URL,
+  kimi: DEFAULT_BRIDGE_URL,
   ollama: DEFAULT_BRIDGE_URL,
 };
 function defaultBridgeUrlFor(backend) {
@@ -402,6 +403,7 @@ const SETTING_MODEL = {
   codex: "comfyui-mcp.defaultModel.codex",
   gemini: "comfyui-mcp.defaultModel.gemini",
   grok: "comfyui-mcp.defaultModel.grok",
+  kimi: "comfyui-mcp.defaultModel.kimi",
   ollama: "comfyui-mcp.defaultModel.ollama",
   openrouter: "comfyui-mcp.defaultModel.openrouter",
   lmstudio: "comfyui-mcp.defaultModel.lmstudio",
@@ -413,6 +415,7 @@ const SETTING_EFFORT = {
   codex: "comfyui-mcp.defaultEffort.codex",
   gemini: "comfyui-mcp.defaultEffort.gemini",
   grok: "comfyui-mcp.defaultEffort.grok",
+  kimi: "comfyui-mcp.defaultEffort.kimi",
   ollama: "comfyui-mcp.defaultEffort.ollama",
   openrouter: "comfyui-mcp.defaultEffort.openrouter",
   lmstudio: "comfyui-mcp.defaultEffort.lmstudio",
@@ -432,6 +435,7 @@ const SETTING_BRIDGE_URL = {
   codex: "comfyui-mcp.bridgeUrl.codex",
   gemini: "comfyui-mcp.bridgeUrl.gemini",
   grok: "comfyui-mcp.bridgeUrl.grok",
+  kimi: "comfyui-mcp.bridgeUrl.kimi",
   ollama: "comfyui-mcp.bridgeUrl.ollama",
   openrouter: "comfyui-mcp.bridgeUrl.openrouter",
   lmstudio: "comfyui-mcp.bridgeUrl.lmstudio",
@@ -486,10 +490,10 @@ const SETTINGS_SEEDED_KEY = "comfyui-mcp.panel.settingsSeeded";
 // per-backend groups (runs independently of SETTINGS_SEEDED_KEY).
 const SETTINGS_GROUPS_MIGRATED_KEY = "comfyui-mcp.panel.settingsGroupsMigrated";
 // Section (sub-category) labels for the grouped Settings dialog, per backend.
-const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)", gemini: "Gemini", grok: "Grok", ollama: "Ollama (local)", openrouter: "OpenRouter", lmstudio: "LM Studio (local)", llamacpp: "llama.cpp (local)", custom: "Custom endpoint" };
+const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)", gemini: "Gemini", grok: "Grok", kimi: "Kimi", ollama: "Ollama (local)", openrouter: "OpenRouter", lmstudio: "LM Studio (local)", llamacpp: "llama.cpp (local)", custom: "Custom endpoint" };
 // Backend display names at module scope (the Settings dialog's render-fns live
 // outside buildPanel's closure, so they need their own copy).
-const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", grok: "Grok", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint" };
+const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", grok: "Grok", kimi: "Kimi", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint" };
 // The allowlisted secure-store keys (mirrors the orchestrator's #59 allowlist).
 const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
 
@@ -535,7 +539,7 @@ const settingsBackendState = {
 // render-fns when the dialog opens, so a freshly-arrived catalog can repaint the
 // matching backend's dropdown in place (a render-fn setting has no static options
 // to re-key). Keyed by backend; null when that group isn't mounted.
-const settingsModelSelectEls = { claude: null, codex: null, gemini: null, grok: null, ollama: null, openrouter: null, lmstudio: null, llamacpp: null, custom: null };
+const settingsModelSelectEls = { claude: null, codex: null, gemini: null, grok: null, kimi: null, ollama: null, openrouter: null, lmstudio: null, llamacpp: null, custom: null };
 // Disabled placeholder <option> value — mapped to "" (Auto) if ever selected so
 // it can never persist as a bogus model id.
 const SETTINGS_PLACEHOLDER = "__cmcp_placeholder__";
@@ -547,7 +551,7 @@ function currentSettingsBackend() {
   const b = getSetting(SETTING_BACKEND);
   // Every selectable backend counts — this list lagging a provider addition
   // silently stops that provider's Settings edits from driving the live panel.
-  return ["codex", "gemini", "grok", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"].includes(b) ? b : "claude";
+  return ["codex", "gemini", "grok", "kimi", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"].includes(b) ? b : "claude";
 }
 /** Fetched model rows for `backend` (the same presentable catalog the composer
  *  picker uses), or null when none is cached (backend never connected this session). */
@@ -996,6 +1000,7 @@ function panelSettingsList() {
         { value: "codex", text: "ChatGPT" },
         { value: "gemini", text: "Gemini" },
         { value: "grok", text: "Grok" },
+        { value: "kimi", text: "Kimi" },
         { value: "ollama", text: "Ollama (local)" },
         { value: "openrouter", text: "OpenRouter (1M · SOTA)" },
         { value: "lmstudio", text: "LM Studio (local)" },
@@ -1177,6 +1182,8 @@ function panelSettingsList() {
     // ---- Grok (Default model, Default reasoning effort) ----
     modelSetting("grok", 80),
     effortSetting("grok", 75),
+    modelSetting("kimi", 76),
+    effortSetting("kimi", 72),
     // ---- Ollama (local) (Default model; no effort scale) ----
     modelSetting("ollama", 70),
     {
@@ -1305,6 +1312,7 @@ const BACKEND_EFFORTS = {
   gemini: [],
   // Grok rides the ACP CLI like gemini — no user-facing reasoning-effort scale.
   grok: [],
+  kimi: [],
   // Ollama local models expose no reasoning-effort control — selector hidden.
   ollama: [],
   // OpenRouter rides the same backend as ollama — no effort control either.
@@ -5397,13 +5405,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   // `codex app-server` cold-starts much slower than Claude's Agent SDK, so it gets
   // ~3x the window. This is the escalation THRESHOLD only — the respawn/reclaim
   // BOUNDS (MAX_AUTO_RESPAWNS / MAX_AUTO_RECLAIMS) are untouched.
-  const RESPAWN_AFTER_BY_BACKEND = { codex: 6, gemini: 6, grok: 6, ollama: 6, claude: 2 };
+  const RESPAWN_AFTER_BY_BACKEND = { codex: 6, gemini: 6, grok: 6, kimi: 6, ollama: 6, claude: 2 };
   function respawnAfterAttempts() {
     return RESPAWN_AFTER_BY_BACKEND[backendNow()] ?? 2;
   }
   // Failed (re)connect attempts ridden out as a steady "connecting" before a
   // terminal "disconnected". Backend-aware, ~3x for Codex's slower cold start.
-  const CONNECT_PATIENCE_BY_BACKEND = { codex: 12, gemini: 12, grok: 12, ollama: 12, claude: 4 };
+  const CONNECT_PATIENCE_BY_BACKEND = { codex: 12, gemini: 12, grok: 12, kimi: 12, ollama: 12, claude: 4 };
   function connectPatienceAttempts() {
     return CONNECT_PATIENCE_BY_BACKEND[backendNow()] ?? 4;
   }
@@ -5418,7 +5426,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   // so it gets a wider window before we treat the open socket as wedged (FIX 2).
   // Ollama gets the long handshake too: a cold model load into VRAM can take
   // tens of seconds before the first token.
-  const HANDSHAKE_MS_BY_BACKEND = { codex: 45000, gemini: 45000, grok: 45000, ollama: 45000, claude: 20000 };
+  const HANDSHAKE_MS_BY_BACKEND = { codex: 45000, gemini: 45000, grok: 45000, kimi: 45000, ollama: 45000, claude: 20000 };
   function handshakeMs() {
     return HANDSHAKE_MS_BY_BACKEND[backendNow()] ?? 20000;
   }
@@ -6879,7 +6887,7 @@ function buildPanel() {
   // ChatGPT). Clicking one asks the pack to ensure that backend's orchestrator is
   // running and returns the bridge URL to connect to — the user never types a
   // port. Populated from GET /comfyui_mcp_panel/backends when settings open.
-  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", grok: "Grok", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint" };
+  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", grok: "Grok", kimi: "Kimi", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint" };
   const backendLabel = document.createElement("label");
   backendLabel.className = "cmcp-label";
   backendLabel.textContent = "Agent backend";
@@ -6915,7 +6923,7 @@ function buildPanel() {
   // (GET /backends, blind to the laptop behind a remote pod) must not override it.
   let readinessFromOrchestrator = false;
   // Short per-provider hint shown under each provider row in the popup.
-  const BACKEND_HINTS = { claude: "Fable · Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", grok: "Grok Composer · Build", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)", lmstudio: "Local LLMs · no account", llamacpp: "Local LLMs · no account", custom: "Any OpenAI-compatible server" };
+  const BACKEND_HINTS = { claude: "Fable · Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", grok: "Grok Composer · Build", kimi: "Kimi (Moonshot)", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)", lmstudio: "Local LLMs · no account", llamacpp: "Local LLMs · no account", custom: "Any OpenAI-compatible server" };
 
   // Hint for a provider that exists but isn't usable yet — distinguishes
   // "install the CLI" from "sign in". Empty when ready or readiness is unknown.
@@ -6936,6 +6944,7 @@ function buildPanel() {
     if (b.backend === "codex") return "Not signed in — run: codex login";
     if (b.backend === "gemini") return "Not signed in — run: gemini (then sign in with Google)";
     if (b.backend === "grok") return "Not signed in — run: grok";
+    if (b.backend === "kimi") return "Not signed in — run: kimi (then sign in)";
     if (b.backend === "ollama") return "Ollama not running — run: ollama serve";
     if (b.backend === "lmstudio") return "LM Studio server not running — LM Studio → Developer → Start Server";
     if (b.backend === "llamacpp") return "llama-server not running — llama-server -m model.gguf --jinja -c 16384";
@@ -7141,6 +7150,7 @@ function buildPanel() {
     codex: { label: "ChatGPT", install: "npm i -g @openai/codex", login: "codex login" },
     gemini: { label: "Gemini", install: "npm i -g @google/gemini-cli", login: "gemini" },
     grok: { label: "Grok", install: "install the Grok CLI (Grok Build / xAI)", login: "grok" },
+    kimi: { label: "Kimi", install: "install the Kimi CLI (Moonshot)", login: "kimi" },
     // No sign-in — "login" is pulling OUR FINE-TUNE: gemma4 QLoRA-trained on
     // 1,055 server-verified comfyui-mcp trajectories (hf.co/artokun/
     // gemma4-comfyui-mcp) — it knows this tool suite natively. :e2b fits
@@ -7183,7 +7193,7 @@ function buildPanel() {
     sub.textContent =
       "The agent runs on YOUR machine on your own Claude, ChatGPT, or Gemini subscription — no API keys. Set up a provider (Node ≥ 22), start the agent with the command below, then click Connect.";
     onboard.append(title, sub);
-    for (const id of ["claude", "codex", "gemini", "grok", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"]) {
+    for (const id of ["claude", "codex", "gemini", "grok", "kimi", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"]) {
       const meta = PROVIDER_SETUP[id];
       const st = list.find((b) => b.backend === id) || {};
       const col = document.createElement("div");
@@ -10141,7 +10151,7 @@ function buildPanel() {
   // backend's handshake window (handshakeMs()) so a healthy slow reload completes
   // on its own backoff before the guard releases — Codex's app-server handshake is
   // 45s, so its guard is ~50s; Claude keeps 28s (still > its 20s handshake).
-  const SOFT_RELOAD_GUARD_MS_BY_BACKEND = { codex: 50000, gemini: 50000, grok: 50000, ollama: 50000, claude: 28000 };
+  const SOFT_RELOAD_GUARD_MS_BY_BACKEND = { codex: 50000, gemini: 50000, grok: 50000, kimi: 50000, ollama: 50000, claude: 28000 };
   function softReloadGuardMs() {
     return SOFT_RELOAD_GUARD_MS_BY_BACKEND[selectedBackend] ?? 28000;
   }
@@ -10158,7 +10168,7 @@ function buildPanel() {
   // normal cold-start handshake (handshakeMs()) so a healthy-but-slow reload is
   // never pre-empted — Codex (45s handshake) escalates at ~40s, comfortably under
   // its ~50s guard; Claude keeps 11s (under its 28s guard and > its 20s handshake).
-  const SOFT_RELOAD_ESCALATE_MS_BY_BACKEND = { codex: 40000, gemini: 40000, grok: 40000, ollama: 40000, claude: 11000 };
+  const SOFT_RELOAD_ESCALATE_MS_BY_BACKEND = { codex: 40000, gemini: 40000, grok: 40000, kimi: 40000, ollama: 40000, claude: 11000 };
   function softReloadEscalateMs() {
     return SOFT_RELOAD_ESCALATE_MS_BY_BACKEND[selectedBackend] ?? 11000;
   }
