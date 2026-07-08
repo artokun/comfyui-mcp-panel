@@ -909,7 +909,7 @@ function panelSettingsList() {
       category: cat(BACKEND_SECTION.ollama, "Preferred models"),
       sortOrder: 68,
       tooltip:
-        "Your own favorite models, comma-separated — Ollama tags (gemma4:12b, qwen3:4b) and/or OpenRouter ids " +
+        "Your own favorite models, comma-separated — Ollama tags (artokun/gemma4-comfyui-mcp:e4b — our ComfyUI fine-tune, gemma4:12b, qwen3:4b) and/or OpenRouter ids " +
         "(xiaomi/mimo-v2.5, moonshotai/kimi-k2.5). They pin to the TOP of the model picker (marked ★ when not in " +
         "the discovered catalog). Persisted by the orchestrator, so they survive restarts and apply immediately.",
       type: "text",
@@ -6085,8 +6085,11 @@ function buildPanel() {
     claude: { label: "Claude", install: "npm i -g @anthropic-ai/claude-code", login: "claude auth login" },
     codex: { label: "ChatGPT", install: "npm i -g @openai/codex", login: "codex login" },
     gemini: { label: "Gemini", install: "npm i -g @google/gemini-cli", login: "gemini" },
-    // No sign-in — "login" is pulling a tool-calling model (the arena's best).
-    ollama: { label: "Ollama (local, free)", install: "winget install Ollama.Ollama", login: "ollama pull gemma4:e4b" },
+    // No sign-in — "login" is pulling OUR FINE-TUNE: gemma4 QLoRA-trained on
+    // 1,055 server-verified comfyui-mcp trajectories (hf.co/artokun/
+    // gemma4-comfyui-mcp) — it knows this tool suite natively. :e2b fits
+    // ~2 GB VRAM, :12b ~8 GB.
+    ollama: { label: "Ollama (local, free — our ComfyUI fine-tune)", install: "winget install Ollama.Ollama", login: "ollama pull artokun/gemma4-comfyui-mcp:e4b" },
     // No CLI — "setup" is pasting an OpenRouter API key (Settings › OpenRouter).
     openrouter: { label: "OpenRouter (hosted, 1M · SOTA)", install: "", login: "Set your OpenRouter API key in Settings › OpenRouter" },
   };
