@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-07-07
+
+### Fixed
+
+- **Clicking a chat image on a remote pod opened a blank tab.** Bridge-delivered
+  images arrive as `data:` URIs, and Chrome blocks top-frame navigation to
+  `data:` — the zoom click's new tab stayed on `about:blank`. Data URIs are now
+  re-wrapped as same-origin `blob:` URLs before opening (plain `/view` URLs on
+  local ComfyUI are unaffected).
+
 ## [0.6.4] - 2026-07-07
 
 ### Fixed

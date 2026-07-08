@@ -5599,6 +5599,27 @@ function openExternalUrl(href) {
   window.open(href, "_blank", "noopener,noreferrer");
 }
 
+/** Open a chat media URL in a new tab. Bridge-delivered images on remote pods
+ *  arrive as data: URIs, and Chrome BLOCKS top-frame navigation to data: —
+ *  window.open(dataUri) silently yields an about:blank tab. Re-wrap those as a
+ *  blob: URL (same-origin, allowed in a new tab). The fetch of a data: URI
+ *  resolves in-memory within the click's transient activation, so the popup
+ *  isn't blocked. The blob URL is deliberately never revoked: revoking breaks
+ *  a later reload of that tab, at the cost of one decoded image kept for the
+ *  page's lifetime per click. */
+function openMediaUrl(url) {
+  if (!/^data:/i.test(url)) {
+    window.open(url, "_blank", "noopener,noreferrer");
+    return;
+  }
+  fetch(url)
+    .then((r) => r.blob())
+    .then((b) => {
+      window.open(URL.createObjectURL(b), "_blank", "noopener,noreferrer");
+    })
+    .catch(() => window.open(url, "_blank", "noopener,noreferrer"));
+}
+
 /** Delegate link clicks on a container so http(s)/mailto links open externally
  *  instead of navigating the panel frame (which hijacks the desktop app). */
 function wireExternalLinks(container) {
@@ -7118,7 +7139,7 @@ function buildPanel() {
     img.alt = name || "output";
     img.loading = "lazy";
     img.style.cssText = "max-width:100%;border-radius:6px;display:block;cursor:zoom-in;";
-    img.addEventListener("click", () => window.open(url, "_blank"));
+    img.addEventListener("click", () => openMediaUrl(url));
     card.appendChild(img);
     if (name) {
       const cap = document.createElement("div");
