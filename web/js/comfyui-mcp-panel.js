@@ -296,6 +296,7 @@ const SETTING_MODEL = {
   gemini: "comfyui-mcp.defaultModel.gemini",
   ollama: "comfyui-mcp.defaultModel.ollama",
   openrouter: "comfyui-mcp.defaultModel.openrouter",
+  lmstudio: "comfyui-mcp.defaultModel.lmstudio",
 };
 const SETTING_EFFORT = {
   claude: "comfyui-mcp.defaultEffort.claude",
@@ -303,6 +304,7 @@ const SETTING_EFFORT = {
   gemini: "comfyui-mcp.defaultEffort.gemini",
   ollama: "comfyui-mcp.defaultEffort.ollama",
   openrouter: "comfyui-mcp.defaultEffort.openrouter",
+  lmstudio: "comfyui-mcp.defaultEffort.lmstudio",
 };
 // Pre-grouping single-key settings (a returning user upgrading from the single
 // "Default model"/"Default reasoning effort" had these). Migrated ONCE into the
@@ -318,6 +320,7 @@ const SETTING_BRIDGE_URL = {
   gemini: "comfyui-mcp.bridgeUrl.gemini",
   ollama: "comfyui-mcp.bridgeUrl.ollama",
   openrouter: "comfyui-mcp.bridgeUrl.openrouter",
+  lmstudio: "comfyui-mcp.bridgeUrl.lmstudio",
 };
 // Pre-per-backend single Bridge URL key — migrated ONCE into the Claude group so a
 // returning user's custom port isn't lost (runs in the groups-migration block).
@@ -354,10 +357,10 @@ const SETTINGS_SEEDED_KEY = "comfyui-mcp.panel.settingsSeeded";
 // per-backend groups (runs independently of SETTINGS_SEEDED_KEY).
 const SETTINGS_GROUPS_MIGRATED_KEY = "comfyui-mcp.panel.settingsGroupsMigrated";
 // Section (sub-category) labels for the grouped Settings dialog, per backend.
-const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)", gemini: "Gemini", ollama: "Ollama (local)", openrouter: "OpenRouter" };
+const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)", gemini: "Gemini", ollama: "Ollama (local)", openrouter: "OpenRouter", lmstudio: "LM Studio (local)" };
 // Backend display names at module scope (the Settings dialog's render-fns live
 // outside buildPanel's closure, so they need their own copy).
-const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", ollama: "Ollama", openrouter: "OpenRouter" };
+const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio" };
 // The allowlisted secure-store keys (mirrors the orchestrator's #59 allowlist).
 const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
 
@@ -402,7 +405,7 @@ const settingsBackendState = {
 // render-fns when the dialog opens, so a freshly-arrived catalog can repaint the
 // matching backend's dropdown in place (a render-fn setting has no static options
 // to re-key). Keyed by backend; null when that group isn't mounted.
-const settingsModelSelectEls = { claude: null, codex: null, gemini: null, ollama: null, openrouter: null };
+const settingsModelSelectEls = { claude: null, codex: null, gemini: null, ollama: null, openrouter: null, lmstudio: null };
 // Disabled placeholder <option> value — mapped to "" (Auto) if ever selected so
 // it can never persist as a bogus model id.
 const SETTINGS_PLACEHOLDER = "__cmcp_placeholder__";
@@ -862,6 +865,7 @@ function panelSettingsList() {
         { value: "gemini", text: "Gemini" },
         { value: "ollama", text: "Ollama (local)" },
         { value: "openrouter", text: "OpenRouter (1M · SOTA)" },
+        { value: "lmstudio", text: "LM Studio (local)" },
       ],
       defaultValue: "claude",
       onChange: (v) => {
@@ -1028,6 +1032,7 @@ function panelSettingsList() {
     },
     // ---- OpenRouter (hosted: curated 1M · SOTA models; key stored 0600) ----
     modelSetting("openrouter", 62),
+    modelSetting("lmstudio", 63),
     tokenSetting(SETTING_TOKEN_OPENROUTER, "OPENROUTER_API_KEY", "OpenRouter", 61, BACKEND_SECTION.openrouter, "API key"),
     // ---- API tokens (LAST) ----
     tokenSetting(SETTING_TOKEN_CIVITAI, "CIVITAI_API_TOKEN", "CivitAI", 20),
@@ -1080,6 +1085,7 @@ const BACKEND_EFFORTS = {
   ollama: [],
   // OpenRouter rides the same backend as ollama — no effort control either.
   openrouter: [],
+  lmstudio: [],
 };
 // Ordered low→high across BOTH scales, for nearest-level mapping on a switch.
 const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -5934,7 +5940,7 @@ function buildPanel() {
   // ChatGPT). Clicking one asks the pack to ensure that backend's orchestrator is
   // running and returns the bridge URL to connect to — the user never types a
   // port. Populated from GET /comfyui_mcp_panel/backends when settings open.
-  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", ollama: "Ollama", openrouter: "OpenRouter" };
+  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio" };
   const backendLabel = document.createElement("label");
   backendLabel.className = "cmcp-label";
   backendLabel.textContent = "Agent backend";
@@ -5970,7 +5976,7 @@ function buildPanel() {
   // (GET /backends, blind to the laptop behind a remote pod) must not override it.
   let readinessFromOrchestrator = false;
   // Short per-provider hint shown under each provider row in the popup.
-  const BACKEND_HINTS = { claude: "Fable · Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)" };
+  const BACKEND_HINTS = { claude: "Fable · Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)", lmstudio: "Local LLMs · no account" };
 
   // Hint for a provider that exists but isn't usable yet — distinguishes
   // "install the CLI" from "sign in". Empty when ready or readiness is unknown.
@@ -5981,13 +5987,14 @@ function buildPanel() {
     if (r.cli === false) {
       // For openrouter, "cli" is really "API key present" — no CLI to install.
       if (b.backend === "openrouter") return "No OpenRouter API key — set it in Settings › OpenRouter";
-      return b.backend === "ollama"
-        ? "Ollama not installed — get it at ollama.com/download"
-        : `${BACKEND_LABELS[b.backend] || b.backend} CLI not installed`;
+      if (b.backend === "ollama") return "Ollama not installed — get it at ollama.com/download";
+      if (b.backend === "lmstudio") return "LM Studio not installed — get it at lmstudio.ai";
+      return `${BACKEND_LABELS[b.backend] || b.backend} CLI not installed`;
     }
     if (b.backend === "codex") return "Not signed in — run: codex login";
     if (b.backend === "gemini") return "Not signed in — run: gemini (then sign in with Google)";
     if (b.backend === "ollama") return "Ollama not running — run: ollama serve";
+    if (b.backend === "lmstudio") return "LM Studio server not running — LM Studio → Developer → Start Server";
     if (b.backend === "openrouter") return "No OpenRouter API key — set it in Settings › OpenRouter";
     return "Not signed in — run: claude auth login";
   }
@@ -6195,6 +6202,8 @@ function buildPanel() {
     ollama: { label: "Ollama (local, free — our ComfyUI fine-tune)", install: "winget install Ollama.Ollama", login: "ollama pull artokun/gemma4-comfyui-mcp:e4b" },
     // No CLI — "setup" is pasting an OpenRouter API key (Settings › OpenRouter).
     openrouter: { label: "OpenRouter (hosted, 1M · SOTA)", install: "", login: "Set your OpenRouter API key in Settings › OpenRouter" },
+    // No sign-in — "login" is starting the local server with a tool-calling model.
+    lmstudio: { label: "LM Studio (local, free)", install: "winget install ElementLabs.LMStudio", login: "LM Studio → Developer → Start Server (load a tool-calling model — try our gemma4-comfyui-mcp GGUFs)" },
   };
   let anyReady = false;
   let autoPickDone = false; // auto-switch + note fires at most once per panel mount
@@ -6223,7 +6232,7 @@ function buildPanel() {
     sub.textContent =
       "The agent runs on YOUR machine on your own Claude, ChatGPT, or Gemini subscription — no API keys. Set up a provider (Node ≥ 22), start the agent with the command below, then click Connect.";
     onboard.append(title, sub);
-    for (const id of ["claude", "codex", "gemini", "ollama", "openrouter"]) {
+    for (const id of ["claude", "codex", "gemini", "ollama", "openrouter", "lmstudio"]) {
       const meta = PROVIDER_SETUP[id];
       const st = list.find((b) => b.backend === id) || {};
       const col = document.createElement("div");
