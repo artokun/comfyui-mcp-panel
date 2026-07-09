@@ -8,7 +8,9 @@
 **An autonomous AI agent embedded in the ComfyUI sidebar that drives your canvas — now on EITHER
 Claude or ChatGPT (your own subscription, no API key).**
 
-[![Deploy on RunPod](https://img.shields.io/badge/Deploy_on-RunPod-673AB7?style=for-the-badge)](https://console.runpod.io/deploy?template=bnqtkvcer3&ref=dkx71w9b) &nbsp;**One-click GPU pod** — a ready-to-run ComfyUI with this panel + [comfyui-mcp](https://github.com/artokun/comfyui-mcp) + ComfyUI-Manager v2 preinstalled, on your own GPU. No setup.
+[![Deploy on RunPod](https://img.shields.io/badge/Deploy_on-RunPod-673AB7?style=for-the-badge)](https://console.runpod.io/deploy?template=bnqtkvcer3&ref=dkx71w9b) [![Join the Discord](https://img.shields.io/badge/Discord-Join_%26_get_help-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/TtQpf96BHS) &nbsp;**One-click GPU pod** — a ready-to-run ComfyUI with this panel + [comfyui-mcp](https://github.com/artokun/comfyui-mcp) + ComfyUI-Manager v2 preinstalled, on your own GPU. No setup.
+
+**Stuck or have a question? [Join the Discord](https://discord.gg/TtQpf96BHS)** — or hit **🆘 Need help?** in the panel's Settings → About (it copies a diagnostics summary and opens the Discord for you).
 
 Pick a provider — **Claude** or **ChatGPT** — and the matching agent runs in the background on
 *your* subscription, sees the graph you're looking at, and edits it live. Both providers reach
