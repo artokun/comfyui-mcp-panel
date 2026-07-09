@@ -24,6 +24,14 @@ All notable changes to this project are documented here. This project adheres to
   `node scripts/set-version.mjs <v>`, and CI + the publish gate FAIL if the two
   disagree — a stale version can't be shipped.
 
+## [0.6.7] - 2026-07-08
+
+### Changed
+
+- **Local (Ollama) backend now defaults to the fine-tuned `gemma4-comfyui-mcp`
+  ladder**, with a one-time migration of the stale `gemma4:e4b` default to the
+  fine-tune. (#62, #66)
+
 ## [0.6.6] - 2026-07-08
 
 ### Fixed
