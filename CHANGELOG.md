@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.6.9] - 2026-07-09
+
+### Added
+- LM Studio backend chip + setup card (#160 panel side) (#71)
+- Discord + Need-help buttons + version-sync guard (recover stranded 0.6.8) (#68)
+
+### Fixed
+- Fable 5 was invisible — dedupe pinned claude-* ids by resolvedModel, not pattern (#70)
+
+
 ## [0.6.8] - 2026-07-08
 
 ### Added
