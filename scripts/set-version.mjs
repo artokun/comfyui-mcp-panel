@@ -8,6 +8,7 @@
 //   node scripts/set-version.mjs 0.6.8
 //
 import { readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -38,3 +39,12 @@ if (js2 === js) {
 writeFileSync(pyPath, py2);
 writeFileSync(jsPath, js2);
 console.log(`set version ${version} in pyproject.toml + PANEL_VERSION (web/js/comfyui-mcp-panel.js)`);
+
+// Stamp the changelog for this version (hybrid: keeps hand-written [Unreleased]
+// highlights, appends commits since the last release, deduped by PR). Best-effort
+// — a bump must not fail because the changelog gen hiccuped.
+try {
+  execFileSync("node", [join(root, "scripts", "gen-changelog.mjs"), version], { stdio: "inherit" });
+} catch (err) {
+  console.warn(`changelog generation skipped: ${err instanceof Error ? err.message : String(err)}`);
+}
