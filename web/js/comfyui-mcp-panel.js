@@ -1120,6 +1120,9 @@ function normalizeModels(list) {
       label: m.displayName || m.value,
       small: desc.length > 28 ? desc.slice(0, 27) + "…" : desc,
       efforts,
+      // Concrete model id behind an alias/pinned value (SDK resolvedModel) —
+      // presentableModels dedupes on this instead of pattern-matching ids.
+      resolved: typeof m.resolvedModel === "string" ? m.resolvedModel : undefined,
     };
   });
 }
@@ -1127,14 +1130,21 @@ function effortMeta(id) {
   return EFFORT_META[id] ?? { label: id.charAt(0).toUpperCase() + id.slice(1), small: "" };
 }
 
-// Show the clean family aliases (Opus / Sonnet / Haiku): drop the synthetic
-// "default", and drop pinned version ids (claude-*) that just duplicate an
-// alias (e.g. claude-opus-4-8 vs the "opus" alias — same model). Falls back
-// gracefully if that would empty the list.
+// Show the clean family aliases (Opus / Sonnet / Haiku / Fable): drop the
+// synthetic "default", and drop a pinned version id (claude-*) ONLY when an
+// alias row resolves to the SAME model (claude-opus-4-8 duplicating "opus").
+// A model that exists solely as a pinned id must survive — Fable ships as
+// value "claude-fable-5[1m]" with NO family alias, and the old blanket
+// /^claude-/ filter silently removed it from the picker.
 function presentableModels(rows) {
-  const aliases = rows.filter((r) => r.id !== "default" && !/^claude-/.test(r.id));
-  if (aliases.length) return aliases;
   const noDefault = rows.filter((r) => r.id !== "default");
+  const aliasResolved = new Set(
+    noDefault.filter((r) => !/^claude-/.test(r.id)).map((r) => r.resolved).filter(Boolean),
+  );
+  const kept = noDefault.filter(
+    (r) => !/^claude-/.test(r.id) || !r.resolved || !aliasResolved.has(r.resolved),
+  );
+  if (kept.length) return kept;
   return noDefault.length ? noDefault : rows;
 }
 // Pre-select Opus when the user hasn't chosen.
@@ -5960,7 +5970,7 @@ function buildPanel() {
   // (GET /backends, blind to the laptop behind a remote pod) must not override it.
   let readinessFromOrchestrator = false;
   // Short per-provider hint shown under each provider row in the popup.
-  const BACKEND_HINTS = { claude: "Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)" };
+  const BACKEND_HINTS = { claude: "Fable · Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)" };
 
   // Hint for a provider that exists but isn't usable yet — distinguishes
   // "install the CLI" from "sign in". Empty when ready or readiness is unknown.
