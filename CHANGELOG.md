@@ -6,6 +6,32 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.6.8] - 2026-07-08
+
+### Added
+
+- **Discord community + one-tap "Need help?" in Settings → About.** Alongside
+  ⭐ Star on GitHub there's now **💬 Join the Discord** and a **🆘 Need help?**
+  button that copies a short diagnostics summary (panel version, backend,
+  ComfyUI version, page URL, user-agent) to the clipboard and opens the Discord,
+  so a stuck user pastes exactly what's needed to help fast. README links the
+  Discord too. Invite: https://discord.gg/TtQpf96BHS
+
+### Changed
+
+- **Panel version can no longer drift out of the diagnostics blob.** The JS
+  `PANEL_VERSION` is now bumped together with `pyproject.toml` via
+  `node scripts/set-version.mjs <v>`, and CI + the publish gate FAIL if the two
+  disagree — a stale version can't be shipped.
+
+## [0.6.7] - 2026-07-08
+
+### Changed
+
+- **Local (Ollama) backend now defaults to the fine-tuned `gemma4-comfyui-mcp`
+  ladder**, with a one-time migration of the stale `gemma4:e4b` default to the
+  fine-tune. (#62, #66)
+
 ## [0.6.6] - 2026-07-08
 
 ### Fixed
