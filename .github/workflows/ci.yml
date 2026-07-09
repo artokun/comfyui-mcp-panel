@@ -107,10 +107,10 @@ jobs:
           done < <(find __init__.py README.md pyproject.toml web -type f \( -name '*.py' -o -name '*.js' -o -name '*.md' -o -name '*.toml' -o -name '*.json' -o -name '*.html' -o -name '*.css' \) -print0)
           [ "$fail" = "0" ] || exit 1
 
-      - name: pyproject.toml is valid + has registry fields
+      - name: pyproject.toml is valid + has registry fields + JS version matches
         run: |
           python - <<'PY'
-          import tomllib
+          import tomllib, re, sys
           d = tomllib.load(open("pyproject.toml", "rb"))
           proj = d.get("project", {})
           comfy = d.get("tool", {}).get("comfy", {})
@@ -118,5 +118,18 @@ jobs:
           if not comfy.get("PublisherId"):
               missing.append("tool.comfy.PublisherId")
           assert not missing, f"pyproject missing required fields: {missing}"
-          print(f"pyproject OK: {proj['name']} {proj['version']}")
+          # The panel JS carries PANEL_VERSION for its "Need help?" diagnostics blob;
+          # a build step can't inject it (the file is served raw), so ENFORCE that it
+          # equals pyproject's version here — a mismatch fails CI + the publish gate
+          # so a stale panel version can never ship (see scripts/set-version.mjs to
+          # bump both at once).
+          js = open("web/js/comfyui-mcp-panel.js", encoding="utf-8").read()
+          m = re.search(r'const PANEL_VERSION = "([^"]+)"', js)
+          assert m, "PANEL_VERSION constant not found in web/js/comfyui-mcp-panel.js"
+          if m.group(1) != proj["version"]:
+              sys.exit(
+                  f"VERSION MISMATCH: pyproject={proj['version']} but PANEL_VERSION={m.group(1)} "
+                  f"in comfyui-mcp-panel.js — run `node scripts/set-version.mjs {proj['version']}`."
+              )
+          print(f"pyproject OK: {proj['name']} {proj['version']} (JS PANEL_VERSION matches)")
           PY

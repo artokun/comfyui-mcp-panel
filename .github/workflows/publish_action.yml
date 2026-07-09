@@ -81,10 +81,10 @@ jobs:
       - name: Python compile check (__init__.py)
         run: python -m py_compile __init__.py
 
-      - name: pyproject.toml is valid + has registry fields
+      - name: pyproject.toml is valid + has registry fields + JS version matches
         run: |
           python - <<'PY'
-          import tomllib
+          import tomllib, re, sys
           d = tomllib.load(open("pyproject.toml", "rb"))
           proj = d.get("project", {})
           comfy = d.get("tool", {}).get("comfy", {})
@@ -92,7 +92,14 @@ jobs:
           if not comfy.get("PublisherId"):
               missing.append("tool.comfy.PublisherId")
           assert not missing, f"pyproject missing required fields: {missing}"
-          print(f"publishing {proj['name']} {proj['version']}")
+          # Block a publish whose panel JS PANEL_VERSION (shown in "Need help?"
+          # diagnostics) drifted from pyproject — run scripts/set-version.mjs to sync.
+          js = open("web/js/comfyui-mcp-panel.js", encoding="utf-8").read()
+          m = re.search(r'const PANEL_VERSION = "([^"]+)"', js)
+          assert m, "PANEL_VERSION constant not found in web/js/comfyui-mcp-panel.js"
+          if m.group(1) != proj["version"]:
+              sys.exit(f"VERSION MISMATCH: pyproject={proj['version']} PANEL_VERSION={m.group(1)} — run scripts/set-version.mjs")
+          print(f"publishing {proj['name']} {proj['version']} (JS PANEL_VERSION matches)")
           PY
       # --------------------------------------------------------------------
 

@@ -87,6 +87,14 @@ function setupListeners() {
   }
 }
 
+// Community + support. The Discord is the one-tap "I'm stuck" channel surfaced
+// in Settings → About (Join + Need help buttons) and linked from the README.
+const DISCORD_INVITE_URL = "https://discord.gg/TtQpf96BHS";
+// Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
+// `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
+// and the publish gate FAIL if the two ever drift, so this can't go stale.
+const PANEL_VERSION = "0.6.8";
+
 // ---------------------------------------------------------------------------
 // localStorage-backed settings.
 // ---------------------------------------------------------------------------
@@ -772,6 +780,68 @@ function panelSettingsList() {
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
           "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:0.8rem;white-space:nowrap;";
         return a;
+      },
+    },
+    {
+      // A link row — "💬 Join the Discord" (community). Same render-fn pattern.
+      id: "comfyui-mcp.joinDiscord",
+      name: "Community",
+      category: cat("About", "Community"),
+      sortOrder: 199,
+      tooltip: "Join the comfyui-mcp Discord — announcements, tips, and help. Opens in a new tab.",
+      type: () => {
+        const a = document.createElement("a");
+        a.href = DISCORD_INVITE_URL;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.textContent = "💬 Join the Discord";
+        a.style.cssText =
+          "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
+          "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
+          "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:0.8rem;white-space:nowrap;";
+        return a;
+      },
+    },
+    {
+      // "🆘 Need help?" — copies a small diagnostics blob to the clipboard, then
+      // opens the Discord, so a stuck user pastes exactly what's needed for
+      // triage instead of a back-and-forth. Uses openExternalUrl (blob-safe on
+      // remote pods). Distinct, warmer-colored button so it reads as "support".
+      id: "comfyui-mcp.getHelp",
+      name: "Need help?",
+      category: cat("About", "Need help?"),
+      sortOrder: 198,
+      tooltip:
+        "Stuck? This copies a short diagnostics summary (panel version, backend, ComfyUI, OS) to your clipboard and opens the Discord — paste it into your message so we can help fast.",
+      type: () => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = "🆘 Need help? Contact me on Discord";
+        btn.style.cssText =
+          "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
+          "border:1px solid var(--p-primary-color,#8b5cf6);background:var(--p-primary-color,#8b5cf6);" +
+          "color:#fff;font-size:0.8rem;white-space:nowrap;cursor:pointer;";
+        btn.addEventListener("click", async () => {
+          const diag = [
+            "--- comfyui-mcp panel diagnostics ---",
+            `panel: ${PANEL_VERSION}`,
+            `backend: ${(getSetting(SETTING_BACKEND) ?? "claude")}`,
+            `comfyui: ${window.app?.frontendVersion ?? window.app?.extensionManager?.appVersion ?? "unknown"}`,
+            `page: ${location.origin}`,
+            `ua: ${navigator.userAgent}`,
+            `time: ${new Date().toISOString()}`,
+          ].join("\n");
+          try {
+            await navigator.clipboard.writeText(diag);
+            btn.textContent = "✅ Diagnostics copied — paste them in Discord";
+            setTimeout(() => { btn.textContent = "🆘 Need help? Contact me on Discord"; }, 4000);
+          } catch {
+            // clipboard blocked (permissions/insecure context) — still open Discord;
+            // the user can describe the issue manually.
+          }
+          openExternalUrl(DISCORD_INVITE_URL);
+        });
+        return btn;
       },
     },
     // ---- General (backend selector is the first row) ----
