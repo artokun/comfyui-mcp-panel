@@ -298,6 +298,7 @@ const SETTING_MODEL = {
   openrouter: "comfyui-mcp.defaultModel.openrouter",
   lmstudio: "comfyui-mcp.defaultModel.lmstudio",
   llamacpp: "comfyui-mcp.defaultModel.llamacpp",
+  custom: "comfyui-mcp.defaultModel.custom",
 };
 const SETTING_EFFORT = {
   claude: "comfyui-mcp.defaultEffort.claude",
@@ -307,6 +308,7 @@ const SETTING_EFFORT = {
   openrouter: "comfyui-mcp.defaultEffort.openrouter",
   lmstudio: "comfyui-mcp.defaultEffort.lmstudio",
   llamacpp: "comfyui-mcp.defaultEffort.llamacpp",
+  custom: "comfyui-mcp.defaultEffort.custom",
 };
 // Pre-grouping single-key settings (a returning user upgrading from the single
 // "Default model"/"Default reasoning effort" had these). Migrated ONCE into the
@@ -324,6 +326,7 @@ const SETTING_BRIDGE_URL = {
   openrouter: "comfyui-mcp.bridgeUrl.openrouter",
   lmstudio: "comfyui-mcp.bridgeUrl.lmstudio",
   llamacpp: "comfyui-mcp.bridgeUrl.llamacpp",
+  custom: "comfyui-mcp.bridgeUrl.custom",
 };
 // Pre-per-backend single Bridge URL key — migrated ONCE into the Claude group so a
 // returning user's custom port isn't lost (runs in the groups-migration block).
@@ -351,6 +354,11 @@ const SETTING_OLLAMA_BASE_URL = "comfyui-mcp.ollama.baseUrl";
 // OpenRouter API key button — stored 0600 in ~/.comfyui-mcp by the orchestrator
 // (agent-secret slice), never in ComfyUI settings. Enables the OpenRouter provider.
 const SETTING_TOKEN_OPENROUTER = "comfyui-mcp.setOpenrouterKey";
+// Custom OpenAI-compatible endpoint (issue #162): base URL + optional API key.
+// URL/model persist server-side via set_config; the key rides the same masked
+// set_secret flow as OpenRouter (0600 store, never in ComfyUI settings).
+const SETTING_CUSTOM_BASE_URL = "comfyui-mcp.custom.baseUrl";
+const SETTING_TOKEN_CUSTOM = "comfyui-mcp.setCustomEndpointKey";
 // One-time flag: on first load with this feature, push the user's EXISTING
 // localStorage choices INTO the settings (so the dialog reflects reality and an
 // upgrade never silently resets a returning user's backend/model/effort/url).
@@ -360,10 +368,10 @@ const SETTINGS_SEEDED_KEY = "comfyui-mcp.panel.settingsSeeded";
 // per-backend groups (runs independently of SETTINGS_SEEDED_KEY).
 const SETTINGS_GROUPS_MIGRATED_KEY = "comfyui-mcp.panel.settingsGroupsMigrated";
 // Section (sub-category) labels for the grouped Settings dialog, per backend.
-const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)", gemini: "Gemini", ollama: "Ollama (local)", openrouter: "OpenRouter", lmstudio: "LM Studio (local)", llamacpp: "llama.cpp (local)" };
+const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)", gemini: "Gemini", ollama: "Ollama (local)", openrouter: "OpenRouter", lmstudio: "LM Studio (local)", llamacpp: "llama.cpp (local)", custom: "Custom endpoint" };
 // Backend display names at module scope (the Settings dialog's render-fns live
 // outside buildPanel's closure, so they need their own copy).
-const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp" };
+const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint" };
 // The allowlisted secure-store keys (mirrors the orchestrator's #59 allowlist).
 const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
 
@@ -408,7 +416,7 @@ const settingsBackendState = {
 // render-fns when the dialog opens, so a freshly-arrived catalog can repaint the
 // matching backend's dropdown in place (a render-fn setting has no static options
 // to re-key). Keyed by backend; null when that group isn't mounted.
-const settingsModelSelectEls = { claude: null, codex: null, gemini: null, ollama: null, openrouter: null, lmstudio: null, llamacpp: null };
+const settingsModelSelectEls = { claude: null, codex: null, gemini: null, ollama: null, openrouter: null, lmstudio: null, llamacpp: null, custom: null };
 // Disabled placeholder <option> value — mapped to "" (Auto) if ever selected so
 // it can never persist as a bogus model id.
 const SETTINGS_PLACEHOLDER = "__cmcp_placeholder__";
@@ -418,7 +426,9 @@ const SETTINGS_PLACEHOLDER = "__cmcp_placeholder__";
  *  per-backend group's edit should drive the LIVE panel (only the active group does). */
 function currentSettingsBackend() {
   const b = getSetting(SETTING_BACKEND);
-  return b === "codex" || b === "gemini" || b === "ollama" ? b : "claude";
+  // Every selectable backend counts — this list lagging a provider addition
+  // silently stops that provider's Settings edits from driving the live panel.
+  return ["codex", "gemini", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"].includes(b) ? b : "claude";
 }
 /** Fetched model rows for `backend` (the same presentable catalog the composer
  *  picker uses), or null when none is cached (backend never connected this session). */
@@ -625,9 +635,9 @@ function panelSettingsList() {
     category: cat(section, friendly),
     sortOrder,
     tooltip:
-      `Securely store your ${friendly} API token. Opens the Agent panel's masked secure input; the value goes ` +
-      `straight to the agent's secure store on the orchestrator — it is NEVER written to ComfyUI settings, logs, ` +
-      `or chat history. The Agent must be connected (click Connect in the panel first).`,
+      `Securely store your ${friendly} API ${noun}. Opens a masked input; the value goes straight to the ` +
+      `orchestrator's 0600 store (~/.comfyui-mcp) — it is NEVER written to ComfyUI settings, logs, chat history, ` +
+      `or the agent's context. Needs only the bridge (click Connect first — no provider has to be ready).`,
     type: () => {
       const wrap = document.createElement("div");
       wrap.style.cssText = "display:flex;align-items:center;gap:0.5rem;";
@@ -870,6 +880,7 @@ function panelSettingsList() {
         { value: "openrouter", text: "OpenRouter (1M · SOTA)" },
         { value: "lmstudio", text: "LM Studio (local)" },
         { value: "llamacpp", text: "llama.cpp (local)" },
+        { value: "custom", text: "Custom endpoint (OpenAI-compatible)" },
       ],
       defaultValue: "claude",
       onChange: (v) => {
@@ -1039,6 +1050,25 @@ function panelSettingsList() {
     modelSetting("lmstudio", 63),
     modelSetting("llamacpp", 64),
     tokenSetting(SETTING_TOKEN_OPENROUTER, "OPENROUTER_API_KEY", "OpenRouter", 61, BACKEND_SECTION.openrouter, "API key"),
+    // ---- Custom endpoint (issue #162: any OpenAI-compatible server) ----
+    {
+      id: SETTING_CUSTOM_BASE_URL,
+      name: "Endpoint base URL",
+      category: cat(BACKEND_SECTION.custom, "Endpoint base URL"),
+      sortOrder: 60,
+      tooltip:
+        "Any OpenAI-compatible endpoint — vLLM, DeepSeek, Together, Azure OpenAI, a llama-server on another " +
+        "box… Include the /v1 (e.g. http://192.168.1.20:8000/v1). Persisted by the orchestrator and applies " +
+        "immediately; if the server needs a key, use “Set API key…” below. Leave blank to disable this provider.",
+      type: "text",
+      defaultValue: "",
+      onChange: () => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyAgentModelConfig?.();
+      },
+    },
+    modelSetting("custom", 59),
+    tokenSetting(SETTING_TOKEN_CUSTOM, "COMFYUI_MCP_CUSTOM_API_KEY", "Custom endpoint", 58, BACKEND_SECTION.custom, "API key"),
     // ---- API tokens (LAST) ----
     tokenSetting(SETTING_TOKEN_CIVITAI, "CIVITAI_API_TOKEN", "CivitAI", 20),
     tokenSetting(SETTING_TOKEN_HF, "HUGGINGFACE_TOKEN", "HuggingFace", 15),
@@ -1092,6 +1122,8 @@ const BACKEND_EFFORTS = {
   openrouter: [],
   lmstudio: [],
   llamacpp: [],
+  // Custom endpoints ride the same openai dialect — no effort control.
+  custom: [],
 };
 // Ordered low→high across BOTH scales, for nearest-level mapping on a switch.
 const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -5946,7 +5978,7 @@ function buildPanel() {
   // ChatGPT). Clicking one asks the pack to ensure that backend's orchestrator is
   // running and returns the bridge URL to connect to — the user never types a
   // port. Populated from GET /comfyui_mcp_panel/backends when settings open.
-  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp" };
+  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint" };
   const backendLabel = document.createElement("label");
   backendLabel.className = "cmcp-label";
   backendLabel.textContent = "Agent backend";
@@ -5982,7 +6014,7 @@ function buildPanel() {
   // (GET /backends, blind to the laptop behind a remote pod) must not override it.
   let readinessFromOrchestrator = false;
   // Short per-provider hint shown under each provider row in the popup.
-  const BACKEND_HINTS = { claude: "Fable · Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)", lmstudio: "Local LLMs · no account", llamacpp: "Local LLMs · no account" };
+  const BACKEND_HINTS = { claude: "Fable · Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)", lmstudio: "Local LLMs · no account", llamacpp: "Local LLMs · no account", custom: "Any OpenAI-compatible server" };
 
   // Hint for a provider that exists but isn't usable yet — distinguishes
   // "install the CLI" from "sign in". Empty when ready or readiness is unknown.
@@ -5993,6 +6025,8 @@ function buildPanel() {
     if (r.cli === false) {
       // For openrouter, "cli" is really "API key present" — no CLI to install.
       if (b.backend === "openrouter") return "No OpenRouter API key — set it in Settings › OpenRouter";
+      // For custom, "cli" is "a base URL is configured" — nothing to install.
+      if (b.backend === "custom") return "No endpoint URL — set it in Settings › Custom endpoint";
       if (b.backend === "ollama") return "Ollama not installed — get it at ollama.com/download";
       if (b.backend === "lmstudio") return "LM Studio not installed — get it at lmstudio.ai";
       if (b.backend === "llamacpp") return "llama.cpp not found on PATH — github.com/ggml-org/llama.cpp/releases (a reachable server still works)";
@@ -6004,6 +6038,7 @@ function buildPanel() {
     if (b.backend === "lmstudio") return "LM Studio server not running — LM Studio → Developer → Start Server";
     if (b.backend === "llamacpp") return "llama-server not running — llama-server -m model.gguf --jinja -c 16384";
     if (b.backend === "openrouter") return "No OpenRouter API key — set it in Settings › OpenRouter";
+    if (b.backend === "custom") return "No endpoint URL — set it in Settings › Custom endpoint";
     return "Not signed in — run: claude auth login";
   }
 
@@ -6214,6 +6249,9 @@ function buildPanel() {
     lmstudio: { label: "LM Studio (local, free)", install: "winget install ElementLabs.LMStudio", login: "LM Studio → Developer → Start Server (load a tool-calling model — try our gemma4-comfyui-mcp GGUFs)" },
     // No sign-in — "login" is launching llama-server; --jinja is REQUIRED for tool calling.
     llamacpp: { label: "llama.cpp (local, free)", install: "winget install ggml.llamacpp", login: "llama-server -m model.gguf --jinja -c 16384" },
+    // No CLI — "setup" is pointing the panel at any OpenAI-compatible /v1
+    // (vLLM, DeepSeek, Together, Azure, a llama-server on another box…).
+    custom: { label: "Custom endpoint (any OpenAI-compatible)", install: "", login: "Set the base URL (and API key if needed) in Settings › Custom endpoint" },
   };
   let anyReady = false;
   let autoPickDone = false; // auto-switch + note fires at most once per panel mount
@@ -6242,7 +6280,7 @@ function buildPanel() {
     sub.textContent =
       "The agent runs on YOUR machine on your own Claude, ChatGPT, or Gemini subscription — no API keys. Set up a provider (Node ≥ 22), start the agent with the command below, then click Connect.";
     onboard.append(title, sub);
-    for (const id of ["claude", "codex", "gemini", "ollama", "openrouter", "lmstudio", "llamacpp"]) {
+    for (const id of ["claude", "codex", "gemini", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"]) {
       const meta = PROVIDER_SETUP[id];
       const st = list.find((b) => b.backend === id) || {};
       const col = document.createElement("div");
@@ -8269,11 +8307,20 @@ function buildPanel() {
       .filter(Boolean);
     const apiKind = String(getSetting(SETTING_OLLAMA_API) ?? "") === "openai" ? "openai" : "ollama";
     const baseUrl = String(getSetting(SETTING_OLLAMA_BASE_URL) ?? "").trim();
-    if (!force && !preferred.length && apiKind === "ollama" && !baseUrl) return;
+    const customUrl = String(getSetting(SETTING_CUSTOM_BASE_URL) ?? "").trim();
+    const customModel = String(getSetting(SETTING_MODEL.custom) ?? "").trim();
+    if (!force && !preferred.length && apiKind === "ollama" && !baseUrl && !customUrl) return;
+    // `custom` only rides when configured or on a deliberate Settings edit
+    // (force) — so a fresh browser with empty local settings can't clobber a
+    // base URL persisted server-side from another machine.
+    const includeCustom = force || !!customUrl || !!customModel;
     client.sendFrame?.({
       type: "set_config",
       preferred_models: preferred,
       ollama: { api: apiKind, base_url: baseUrl },
+      ...(includeCustom
+        ? { custom: { base_url: customUrl, ...(customModel ? { model: customModel } : {}) } }
+        : {}),
     });
   }
 
@@ -8382,7 +8429,12 @@ function buildPanel() {
       const friendly = req?.friendly || msg.key || "API";
       if (msg.ok) {
         if (req?.key) lsSet(SECRET_SET_AT_PREFIX + req.key, String(Date.now()));
-        appendSystem(`🔒 ${friendly} key saved — the provider is enabled now (stored by the orchestrator in ~/.comfyui-mcp, never in ComfyUI settings).`);
+        const isToolToken = ["CIVITAI_API_TOKEN", "HUGGINGFACE_TOKEN", "HF_TOKEN"].includes(req?.key || msg.key);
+        appendSystem(
+          isToolToken
+            ? `🔒 ${friendly} token saved — active for the agent's download tools now (stored by the orchestrator in ~/.comfyui-mcp, never in ComfyUI settings).`
+            : `🔒 ${friendly} key saved — the provider is enabled now (stored by the orchestrator in ~/.comfyui-mcp, never in ComfyUI settings).`,
+        );
       } else {
         appendSystem(`Couldn't save the ${friendly} key: ${msg.error || "unknown error"}.`);
       }
@@ -11062,64 +11114,35 @@ function buildPanel() {
   panelHooks.applyStallConfig = () => sendStallConfig();
   panelHooks.applyAgentModelConfig = () => sendAgentModelConfig(true);
   panelHooks.requestSecret = (envKey, friendly) => {
-    // PROVIDER keys (OPENROUTER_API_KEY) never involve the agent or the chat:
-    // paint the same masked card the agent flow uses, then ship the value in a
-    // set_secret frame the ORCHESTRATOR stores itself (0600 agent-secret slice,
-    // hydrated into its env live). Only needs the bridge socket — works before
-    // ANY backend is ready, so there's no chicken-and-egg where enabling
-    // OpenRouter first requires connecting some other provider.
-    if (envKey === "OPENROUTER_API_KEY") {
-      if (!client.isConnected()) {
-        appendSystem(
-          `To set your ${friendly} key from here, click Connect first — the bridge alone is enough, no provider needs to be ready — then press “Set API key…” again. ` +
-            `Or skip the panel entirely: set the ${envKey} environment variable and (re)start the orchestrator with it. PowerShell: [Environment]::SetEnvironmentVariable("${envKey}", "sk-or-…", "User")`,
-        );
-        return;
-      }
-      paintSecret({
-        label: `${friendly} API key`,
-        hint: "Sent straight to the orchestrator's 0600 config (~/.comfyui-mcp) — never into ComfyUI settings, chat history, or the agent's context.",
-      })
-        .then((value) => {
-          if (!value) return;
-          pendingSetSecret = { key: envKey, friendly };
-          if (!client.sendFrame({ type: "set_secret", key: envKey, value })) {
-            pendingSetSecret = null;
-            appendSystem(`Couldn't reach the orchestrator to save the ${friendly} key — reconnect and try again.`);
-          }
-        })
-        .catch(() => {});
-      return;
-    }
-    // comfyui-TOOL keys (Civitai / HuggingFace) still ride the agent's
-    // panel_request_secret — that path also respawns the comfyui MCP server
-    // with the new env, which needs a working agent turn.
+    // EVERY token button is agent-free: paint the same masked card the agent
+    // flow uses, then ship the value in a set_secret frame the ORCHESTRATOR
+    // stores itself (0600 ~/.comfyui-mcp/panel-secrets.json). It routes by
+    // allowlist server-side — provider keys hydrate its own env live; comfyui
+    // TOOL tokens (CivitAI/HuggingFace) re-inject the MCP child's env and
+    // respawn it on idle. Only needs the bridge socket — works before ANY
+    // provider is ready, and the raw value never touches chat, settings, or
+    // the agent's context. (The agent-initiated panel_request_secret flow
+    // still exists for mid-conversation asks; these buttons just don't use it.)
     if (!client.isConnected()) {
       appendSystem(
-        `To set your ${friendly} token, connect the Agent first (click Connect), then choose “Set ${friendly} token…” again. ` +
-          `Tokens are stored securely by the orchestrator — never in ComfyUI settings.`,
+        `To set your ${friendly} key from here, click Connect first — the bridge alone is enough, no provider needs to be ready — then press the button again. ` +
+          `Or skip the panel entirely: set the ${envKey} environment variable and (re)start the orchestrator with it. PowerShell: [Environment]::SetEnvironmentVariable("${envKey}", "…", "User")`,
       );
-      try {
-        window.alert(`Connect the Agent first (open this panel → Connect), then set your ${friendly} token.`);
-      } catch {}
       return;
     }
-    pendingSecretRequest = { key: envKey, friendly };
-    const target = "comfyui";
-    const sent = client.sendUserMessage(
-      `Please securely store my ${friendly} API key. Call panel_request_secret now for the "${target}" ` +
-        `MCP server with target_kind "env" and key "${envKey}", labeled "${friendly} API key" — so I can paste it ` +
-        `into the masked field. Do not ask any clarifying questions; just open the secure input.`,
-    );
-    if (sent) {
-      appendSystem(
-        `Opening a secure field to set your ${friendly} token — paste it into the masked input below. ` +
-          `It goes straight to the agent's secure store, never into ComfyUI settings, logs, or chat history.`,
-      );
-    } else {
-      pendingSecretRequest = null;
-      appendSystem(`Couldn't reach the agent to set your ${friendly} token — make sure it's connected, then try again.`);
-    }
+    paintSecret({
+      label: `${friendly} API key`,
+      hint: "Sent straight to the orchestrator's 0600 config (~/.comfyui-mcp) — never into ComfyUI settings, chat history, or the agent's context.",
+    })
+      .then((value) => {
+        if (!value) return;
+        pendingSetSecret = { key: envKey, friendly };
+        if (!client.sendFrame({ type: "set_secret", key: envKey, value })) {
+          pendingSetSecret = null;
+          appendSystem(`Couldn't reach the orchestrator to save the ${friendly} key — reconnect and try again.`);
+        }
+      })
+      .catch(() => {});
   };
 
   // On load, only auto-connect if a bridge is already up (you started the
