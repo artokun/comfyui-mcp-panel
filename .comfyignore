@@ -25,3 +25,7 @@ scripts/
 # documents security fixes and will always contain such literals — keep it on
 # GitHub only, never in the scanned artifact.
 CHANGELOG.md
+# Same reason: docs/registry-scan-exception.md explains the scanner findings to
+# maintainers and must quote the matched literals to do so. Shipping it would
+# manufacture the very findings it documents.
+docs/
