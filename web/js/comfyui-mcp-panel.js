@@ -97,6 +97,48 @@ const DISCORD_INVITE_URL = "https://discord.gg/TtQpf96BHS";
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
 const PANEL_VERSION = "0.7.3";
 
+// The connected orchestrator's console URL/token (captured off the `backends`
+// bridge message — see onBackends). Drives the "API Keys" credentials frame;
+// null until a `backends` message with both fields has landed.
+let cmcpConsoleUrl = null;
+let cmcpConsoleToken = null;
+
+// Opens the orchestrator's /credentials console in an in-panel iframe overlay
+// (token-gated — the token travels as a query param, same-origin postMessage
+// only after the frame's origin matches cmcpConsoleUrl's origin).
+function cmcpOpenCredentialsFrame() {
+  if (!cmcpConsoleUrl || !cmcpConsoleToken) {
+    alert("Connect the panel first — the credentials console isn't available yet.");
+    return;
+  }
+  let origin;
+  try { origin = new URL(cmcpConsoleUrl).origin; } catch { return; }
+  const backdrop = document.createElement("div");
+  backdrop.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:100000;display:flex;align-items:center;justify-content:center;";
+  const frame = document.createElement("iframe");
+  frame.src = `${cmcpConsoleUrl}/credentials?token=${encodeURIComponent(cmcpConsoleToken)}`;
+  frame.style.cssText = "width:420px;max-width:92vw;height:520px;max-height:88vh;border:1px solid #2a2f3a;border-radius:12px;background:#0f1115;box-shadow:0 12px 48px rgba(0,0,0,.5);";
+  frame.addEventListener("error", () => { frame.replaceWith(fallback()); });
+  function fallback() {
+    const d = document.createElement("div");
+    d.style.cssText = "width:420px;max-width:92vw;padding:1.5rem;border-radius:12px;background:#0f1115;color:#e8eaed;border:1px solid #2a2f3a;text-align:center;";
+    d.innerHTML = `<p>Couldn't load the credentials console.</p><p><a href="${frame.src}" target="_blank" rel="noopener" style="color:#8ab4f8">Open it in a browser tab</a></p>`;
+    return d;
+  }
+  function close() { window.removeEventListener("message", onMsg); backdrop.remove(); }
+  function onMsg(e) {
+    if (e.origin !== origin) return;
+    if (e.data && e.data.type === "resize" && e.data.height) {
+      frame.style.height = Math.min(e.data.height + 8, window.innerHeight * 0.88) + "px";
+    }
+    if (e.data && e.data.type === "close") close();
+  }
+  backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(); });
+  window.addEventListener("message", onMsg);
+  backdrop.appendChild(frame);
+  document.body.appendChild(backdrop);
+}
+
 // ---------------------------------------------------------------------------
 // localStorage-backed settings.
 // ---------------------------------------------------------------------------
@@ -7029,9 +7071,23 @@ function buildPanel() {
   saveBtn.title = "Re-open the bridge connection at the URL above";
   saveBtn.style.opacity = "0.8";
 
+  // Opens the orchestrator's credentials console (API keys) in an in-panel
+  // iframe overlay — see cmcpOpenCredentialsFrame. Same cmcp-btn idiom as
+  // Connect/Disconnect/Reconnect above.
+  const apiKeysBtn = document.createElement("button");
+  apiKeysBtn.className = "cmcp-btn";
+  apiKeysBtn.type = "button";
+  apiKeysBtn.textContent = "API Keys";
+  apiKeysBtn.title = "Open the credentials console";
+  apiKeysBtn.style.opacity = "0.8";
+  apiKeysBtn.addEventListener("click", () => {
+    settingsBox.hidden = true;
+    cmcpOpenCredentialsFrame();
+  });
+
   const btnRow = document.createElement("div");
   btnRow.style.cssText = "display:flex;gap:0.375rem;align-items:center;flex-wrap:wrap;";
-  btnRow.append(connectBtn, disconnectBtn, saveBtn);
+  btnRow.append(connectBtn, disconnectBtn, saveBtn, apiKeysBtn);
 
   const helpDiv = document.createElement("div");
   helpDiv.className = "cmcp-help";
@@ -9503,6 +9559,10 @@ function buildPanel() {
       sdkCommands = Array.isArray(list) ? list : [];
     },
     onBackends(data) {
+      // Capture the console URL/token for the "API Keys" credentials frame (see
+      // cmcpOpenCredentialsFrame) — sent alongside backends/any_ready.
+      if (data && typeof data.console_url === "string") cmcpConsoleUrl = data.console_url;
+      if (data && typeof data.console_token === "string") cmcpConsoleToken = data.console_token;
       // Authoritative readiness from the connected orchestrator — the machine that
       // runs the agents. Wins over the ComfyUI-side probe (which false-flags "CLI
       // not installed" behind a remote pod). Repaint the chips so hints refresh.
