@@ -237,6 +237,110 @@ function openSidebarTab() {
   }
 }
 
+/** True when OUR sidebar tab is the active (visible) one. */
+function agentTabIsActive() {
+  const em = (typeof app !== "undefined" && app) ? app.extensionManager : null;
+  if (!em) return false;
+  const store = em.sidebarTab || em;
+  return (store.activeSidebarTabId ?? em.activeSidebarTabId) === SIDEBAR_TAB_ID;
+}
+
+// ---------------------------------------------------------------------------
+// Sidebar tab badge — agent activity surfaced ON the sidebar icon, so the user
+// can browse other tabs (Assets, Queue, …) while the agent keeps working:
+//   "working"  → the chat-bubble glyph becomes a spinner (turn in flight)
+//   "unseen"   → red dot: the turn finished while the tab wasn't being looked at
+//   "idle"     → plain glyph (nothing running, nothing unseen)
+// The toolbar is Vue-owned and can re-render (wiping our classes/badge), so a
+// light interval re-asserts the current state while it's non-idle.
+// ---------------------------------------------------------------------------
+let tabBadgeState = "idle";
+let tabBadgeTimer = null;
+
+/** Find our tab's icon element in the sidebar toolbar (never inside the panel
+ *  itself — the empty-state also uses pi-comments). Marked with a data attr so
+ *  the lookup still works after the "working" state swaps the glyph classes. */
+function findAgentTabIcon() {
+  // ComfyUI stamps the toolbar button with `${tabId}-tab-button` — the precise
+  // hook (attribute selector: the id contains a dot). Fall back to the chat
+  // glyph inside a sidebar container for older frontends.
+  const btn = document.querySelector(`button[class~="${SIDEBAR_TAB_ID}-tab-button"]`);
+  if (btn) {
+    const icon = btn.querySelector("[data-cmcp-agent-icon]") || btn.querySelector(".pi");
+    if (icon) {
+      icon.setAttribute("data-cmcp-agent-icon", "1");
+      return icon;
+    }
+  }
+  const bars = document.querySelectorAll(".side-tool-bar-container, .side-tool-bar-end, nav.side-tool-bar");
+  for (const bar of bars) {
+    const icon = bar.querySelector("[data-cmcp-agent-icon]") || bar.querySelector(".pi-comments");
+    if (icon && !icon.closest(".cmcp-root")) {
+      icon.setAttribute("data-cmcp-agent-icon", "1");
+      return icon;
+    }
+  }
+  return null;
+}
+
+/** (Re-)paint the sidebar icon to match tabBadgeState. Idempotent. */
+function applyTabBadge() {
+  const icon = findAgentTabIcon();
+  if (!icon) return;
+  if (tabBadgeState === "working") {
+    icon.classList.remove("pi-comments");
+    icon.classList.add("pi-spinner", "pi-spin", "cmcp-tab-spinner");
+  } else {
+    icon.classList.remove("pi-spinner", "pi-spin", "cmcp-tab-spinner");
+    icon.classList.add("pi-comments");
+  }
+  const btn = icon.closest("button") || icon.parentElement;
+  if (!btn) return;
+  let dotEl = btn.querySelector(".cmcp-tab-dot");
+  if (tabBadgeState === "unseen") {
+    if (!dotEl) {
+      dotEl = document.createElement("span");
+      dotEl.className = "cmcp-tab-dot";
+      try {
+        if (getComputedStyle(btn).position === "static") btn.style.position = "relative";
+      } catch {
+        btn.style.position = "relative";
+      }
+      btn.appendChild(dotEl);
+    }
+  } else if (dotEl) {
+    dotEl.remove();
+  }
+}
+
+function setTabBadge(state) {
+  tabBadgeState = state;
+  applyTabBadge();
+  if (state === "idle") {
+    if (tabBadgeTimer) {
+      clearInterval(tabBadgeTimer);
+      tabBadgeTimer = null;
+    }
+  } else if (!tabBadgeTimer) {
+    // Heal Vue toolbar re-renders that wipe our classes/badge while non-idle.
+    tabBadgeTimer = setInterval(applyTabBadge, 1500);
+  }
+}
+
+/** A turn stopped (done / disconnect / interrupt / safety timeout): if the user
+ *  is looking at the tab it's just idle; otherwise flag it unseen (red dot).
+ *  Only meaningful coming OUT of "working" — an idle panel going through
+ *  disconnects must not sprout a red dot. */
+function setTabBadgeDone() {
+  if (tabBadgeState !== "working") return;
+  setTabBadge(agentTabIsActive() && !document.hidden ? "idle" : "unseen");
+}
+
+/** The user is looking at the panel now — clear an unseen flag. */
+function markAgentSeen() {
+  if (tabBadgeState === "unseen") setTabBadge("idle");
+}
+
 function ssGet(key) {
   try {
     return window.sessionStorage.getItem(key) || null;
@@ -6251,6 +6355,17 @@ const PANEL_CSS = `
 .cmcp-iconbtn:disabled { opacity: 0.35; cursor: default; }
 .cmcp-iconbtn.active { color: var(--p-red-400, #f87171); }
 .cmcp-iconbtn .pi { font-size: 0.875rem; }
+/* ---- sidebar tab badge (these live OUTSIDE .cmcp-root, on the toolbar) ---- */
+/* Agent working → the tab glyph is a spinner, tinted so it reads as "alive". */
+.cmcp-tab-spinner { color: var(--p-green-400, #4ade80) !important; }
+/* Turn finished while the tab wasn't being viewed → red "unread" dot. */
+.cmcp-tab-dot {
+  position: absolute; top: 15%; right: 15%;
+  width: 0.5rem; height: 0.5rem; border-radius: 50%;
+  background: var(--p-red-500, #ef4444);
+  box-shadow: 0 0 0 2px var(--p-surface-900, #18181b);
+  pointer-events: none; z-index: 5;
+}
 .cmcp-chip {
   display: flex; align-items: center; gap: 0.25rem;
   border: none; background: transparent; cursor: pointer;
@@ -8958,6 +9073,8 @@ function buildPanel() {
   }
 
   function hideThinking() {
+    // Working stopped — reflect it on the sidebar icon (red dot if unseen).
+    setTabBadgeDone();
     if (workWordTimer) {
       clearInterval(workWordTimer);
       workWordTimer = null;
@@ -8975,6 +9092,8 @@ function buildPanel() {
   }
 
   function showThinking() {
+    // Agent is working — spin the sidebar icon so activity is visible from any tab.
+    setTabBadge("working");
     if (!thinkingEl) {
       clearEmpty();
       thinkingEl = document.createElement("div");
@@ -11938,6 +12057,9 @@ function buildPanel() {
       }
     } else {
       for (const s of streamBubbles.values()) kickStreams(s);
+      // The window is visible again — if our tab is the one showing, whatever
+      // finished while it was hidden has now been seen.
+      if (agentTabIsActive()) markAgentSeen();
     }
   }
   document.addEventListener("visibilitychange", onVisibilityChange);
@@ -12097,6 +12219,12 @@ function buildPanel() {
 
   return {
     root,
+    /** Called when the tab re-opens with the panel kept alive: land the log at
+     *  the bottom (scrollHeight was 0 while detached) and clear the unseen dot. */
+    onShow() {
+      markAgentSeen();
+      scrollLog();
+    },
     destroy() {
       try {
         recognition?.stop();
@@ -12176,9 +12304,13 @@ function registerExtensionWhenReady(tries = 0) {
         icon: "pi pi-comments",
         tooltip: "ComfyUI Agent Panel — your Claude session's window into this graph",
         type: "custom",
+        // KEEP-ALIVE: the panel (bridge client, agent session, chat DOM) is built
+        // ONCE and survives tab switches. render() re-attaches the same root into
+        // whatever container ComfyUI hands us; destroy() (fires when the user
+        // switches to another sidebar tab) only DETACHES it — the agent keeps
+        // working in the background and the sidebar-icon badge shows its state.
         render: (container) => {
-          if (mounted) mounted.destroy();
-          mounted = buildPanel();
+          if (!mounted) mounted = buildPanel();
           // Make the tab content a full-height flex column so the panel's header
           // and input pin to the edges and only the chat body scrolls (the
           // container otherwise sizes to content and the whole panel scrolls).
@@ -12187,10 +12319,12 @@ function registerExtensionWhenReady(tries = 0) {
           container.style.display = "flex";
           container.style.flexDirection = "column";
           container.appendChild(mounted.root);
+          mounted.onShow?.();
         },
         destroy: () => {
-          mounted?.destroy();
-          mounted = null;
+          // Detach only — never mounted.destroy(). Tearing down here is what used
+          // to kill the live agent whenever the user peeked at another tab.
+          mounted?.root?.remove();
         },
       };
 
