@@ -342,6 +342,14 @@ const SETTING_AUTOCONNECT = "comfyui-mcp.autoConnect";
 const SETTING_FOCUS_FOLLOW = "comfyui-mcp.zoomToAction";
 const SETTING_STALL_S = "comfyui-mcp.stallWarningSeconds";
 const SETTING_REMOTE_URL = "comfyui-mcp.remoteComfyuiUrl";
+// Mobile app (beta) feature flag: gates the header "Remote control" QR button and
+// surfaces the tester-channel download links in Settings. The links are the
+// standing channel INVITES (TestFlight public link / Firebase App Distribution
+// tester link) — leave "" until a channel opens; its button renders disabled as
+// "coming soon" so the section can ship ahead of the store uploads.
+const SETTING_MOBILE_BETA = "comfyui-mcp.mobileAppBeta";
+const MOBILE_IOS_TESTFLIGHT_URL = ""; // e.g. https://testflight.apple.com/join/XXXXXXXX
+const MOBILE_ANDROID_FIREBASE_URL = ""; // e.g. https://appdistribution.firebase.dev/i/XXXXXXXX
 const SETTING_EXTERNAL_ORCH = "comfyui-mcp.externalOrchestrator";
 const SETTING_TOKEN_CIVITAI = "comfyui-mcp.setCivitaiToken";
 const SETTING_TOKEN_HF = "comfyui-mcp.setHuggingfaceToken";
@@ -389,6 +397,7 @@ const panelHooks = {
   applyAutoConnect: null, // (bool)
   applyStallConfig: null, // () — push the live render-stall threshold to the orchestrator
   applyAgentModelConfig: null, // () — push preferred models + ollama endpoint config
+  applyMobileBeta: null, // (bool) — show/hide the header Remote-control (QR) button
   requestSecret: null, // (envKey, friendly)
 };
 // Best-effort guard so a setSetting() we make while seeding/syncing doesn't bounce
@@ -903,6 +912,70 @@ function panelSettingsList() {
       onChange: (v) => {
         if (suppressSettingOnChange || !settingsArmed) return;
         panelHooks.applyAutoConnect?.(!!v);
+      },
+    },
+    {
+      id: SETTING_MOBILE_BETA,
+      name: "Control via Mobile app (beta)",
+      category: cat("Mobile app (beta)", "Control via Mobile app (beta)"),
+      sortOrder: 144,
+      tooltip:
+        "Show the Remote-control pairing button (QR) in the panel header and the beta app download links below. " +
+        "The mobile app is in BETA and rapidly changing — expect rough edges, breaking changes between builds, and " +
+        "occasional re-pairing. Pairing stays on your own machine/network unless you explicitly choose Internet mode.",
+      type: "boolean",
+      defaultValue: false,
+      onChange: (v) => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyMobileBeta?.(!!v);
+      },
+    },
+    {
+      // Link rows — same custom-HTMLElement trick as "Star on GitHub"; no
+      // persisted value. Buttons render disabled ("coming soon") while a
+      // channel's invite URL constant is still empty.
+      id: "comfyui-mcp.mobileAppLinks",
+      name: "Get the beta app",
+      category: cat("Mobile app (beta)", "Get the beta app"),
+      sortOrder: 143,
+      tooltip:
+        "Tester downloads for the ComfyUI MCP mobile app. iOS installs via Apple TestFlight; Android via Firebase " +
+        "App Distribution. Both channels are beta: builds update frequently and may require re-pairing with this panel.",
+      type: () => {
+        const wrap = document.createElement("div");
+        wrap.style.cssText = "display:flex;flex-direction:column;gap:0.4rem;max-width:26rem;";
+        const note = document.createElement("div");
+        note.textContent =
+          "⚠️ Beta — the app changes rapidly and builds may break between updates. " +
+          "Enable the toggle above, install for your platform, then pair with the QR button in the panel header.";
+        note.style.cssText = "font-size:0.75rem;opacity:0.75;line-height:1.35;";
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex;gap:0.5rem;flex-wrap:wrap;";
+        const linkBtn = (label, url) => {
+          const a = document.createElement("a");
+          a.textContent = label;
+          a.style.cssText =
+            "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
+            "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
+            "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:0.8rem;white-space:nowrap;";
+          if (url) {
+            a.href = url;
+            a.target = "_blank";
+            a.rel = "noopener noreferrer";
+          } else {
+            a.textContent += " — coming soon";
+            a.style.opacity = "0.45";
+            a.style.pointerEvents = "none";
+            a.setAttribute("aria-disabled", "true");
+          }
+          return a;
+        };
+        row.append(
+          linkBtn("🍎 iOS — TestFlight", MOBILE_IOS_TESTFLIGHT_URL),
+          linkBtn("🤖 Android — Firebase beta", MOBILE_ANDROID_FIREBASE_URL),
+        );
+        wrap.append(note, row);
+        return wrap;
       },
     },
     {
@@ -5366,6 +5439,17 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
             const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];
             if (!executor) throw new Error(`Unknown command "${msg.cmd}"`);
             result = await executor(msg);
+            // ComfyUI's ChangeTracker snapshots on USER input events only —
+            // graph.beforeChange/afterChange is not wired into it, so bridge-driven
+            // mutations were invisible to undo (Ctrl+Z did nothing). An explicit
+            // checkState() after each successful command pushes the pre-command
+            // state onto the undo queue; it diffs first, so read-only commands
+            // (get_state, screenshot, dry_run) are free no-ops.
+            try {
+              app.extensionManager?.workflow?.activeWorkflow?.changeTracker?.checkState?.();
+            } catch {
+              /* tracker unavailable (older frontend) — undo stays best-effort */
+            }
           }
           reply = { rid: msg.rid, ok: true, result };
         } catch (err) {
@@ -6632,6 +6716,12 @@ function buildPanel() {
   const historyBtn = iconBtn("pi-history", "Chat history");
   const remoteBtn = iconBtn("pi-qrcode", "Remote control — pair a phone");
   remoteBtn.addEventListener("click", () => openPairModal());
+  // Feature-flagged behind Settings → "Control via Mobile app (beta)": the mobile
+  // client is beta, so the pairing entry point stays hidden until opted in.
+  remoteBtn.hidden = getSetting(SETTING_MOBILE_BETA) !== true;
+  panelHooks.applyMobileBeta = (on) => {
+    remoteBtn.hidden = !on;
+  };
   // Reload / restart live as slash commands (/reload, /reload-ui, /restart) — no
   // header buttons for them.
   actions.append(newChatBtn, historyBtn, remoteBtn);
@@ -12033,6 +12123,7 @@ function buildPanel() {
       panelHooks.applyAutoConnect = null;
       panelHooks.applyStallConfig = null;
       panelHooks.applyAgentModelConfig = null;
+      panelHooks.applyMobileBeta = null;
       panelHooks.requestSecret = null;
       client.destroy();
       if (liveBridgeClient === client) liveBridgeClient = null;
