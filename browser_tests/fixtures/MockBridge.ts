@@ -277,6 +277,34 @@ export class MockBridge {
     return id
   }
 
+  /**
+   * Drive a graph command the way the real orchestrator does: send
+   * { rid, cmd, ...args } to the panel and resolve with the panel's reply frame
+   * ({ rid, ok, result } | { rid, ok:false, error }). Used by the connect-matcher
+   * suite to exercise GRAPH_TOOL_EXECUTORS against the live LiteGraph graph.
+   */
+  command(
+    cmd: string,
+    args: Record<string, unknown> = {},
+    timeoutMs = 10_000
+  ): Promise<{ rid: string; ok: boolean; result?: any; error?: string }> {
+    const rid = `cmd-${Date.now().toString(36)}-${++this.streamSeq}`
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        off()
+        reject(new Error(`MockBridge.command("${cmd}") timed out`))
+      }, timeoutMs)
+      const off = this.onFrame((frame) => {
+        if (frame.rid === rid && (frame.ok !== undefined || frame.error !== undefined)) {
+          clearTimeout(timer)
+          off()
+          resolve(frame as { rid: string; ok: boolean; result?: any; error?: string })
+        }
+      })
+      this.send({ rid, cmd, ...args })
+    })
+  }
+
   /** Close all sockets and the server. */
   async close(): Promise<void> {
     for (const s of this.sockets) {
