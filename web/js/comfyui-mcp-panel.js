@@ -2430,6 +2430,260 @@ function resolveSlot(slots, ref, kind) {
   return idx;
 }
 
+// ---------------------------------------------------------------------------
+// graph_connect: type-based slot auto-matching + full-slot failure diagnostics.
+// See docs/design/connect-auto-match.md. Ported/extended from FL-MCP's fl_api.js
+// (type auto-match + rich failures) with `*` wildcard + COMBO handling, widget
+// ranking, an ambiguity guard, and no silent fallback on a named-slot miss.
+// ---------------------------------------------------------------------------
+
+const SLOT_RANK_EXACT = 2;
+const SLOT_RANK_WILD = 1;
+
+/** True if a slot type is a COMBO/array selector (LiteGraph passes the option
+ *  list as the "type"), or the literal string "COMBO". Combos auto-match only
+ *  against an identical combo — never via the "*" wildcard. */
+function isComboType(type) {
+  return Array.isArray(type) || String(type ?? "").toUpperCase() === "COMBO";
+}
+
+/** Stable signature so two combos compare equal only when they carry the same
+ *  option set (arrays) or are both the bare "COMBO". */
+function comboSignature(type) {
+  if (Array.isArray(type)) return "COMBO[" + type.map((o) => String(o)).join(" ") + "]";
+  return "COMBO";
+}
+
+/** Split a (possibly comma-joined, e.g. "IMAGE,MASK") type string into segments. */
+function typeSegments(type) {
+  return String(type ?? "*")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/** Type-compatibility RANK between an output type and an input type:
+ *    0 = incompatible, 2 (SLOT_RANK_EXACT) = exact, 1 (SLOT_RANK_WILD) = "*".
+ * Higher wins, so an exact pairing always outranks a wildcard one. COMBO/array
+ * types match identical-only and never via wildcard; comma multi-types match if
+ * ANY segment matches. Falsy (0) when incompatible, so usable as a boolean. */
+function isTypeCompatible(outType, inType) {
+  const outCombo = isComboType(outType);
+  const inCombo = isComboType(inType);
+  if (outCombo || inCombo) {
+    if (!outCombo || !inCombo) return 0; // a combo only pairs with a combo
+    return comboSignature(outType) === comboSignature(inType) ? SLOT_RANK_EXACT : 0;
+  }
+  const outSegs = typeSegments(outType);
+  const inSegs = typeSegments(inType);
+  let best = 0;
+  for (const o of outSegs) {
+    for (const i of inSegs) {
+      if (o === "*" || i === "*") best = Math.max(best, SLOT_RANK_WILD);
+      else if (o.toUpperCase() === i.toUpperCase()) best = Math.max(best, SLOT_RANK_EXACT);
+    }
+  }
+  return best;
+}
+
+/** True when two slot types are the same (combo-aware, case-insensitive). */
+function sameSlotType(a, b) {
+  if (isComboType(a) || isComboType(b)) return comboSignature(a) === comboSignature(b);
+  return String(a ?? "").toUpperCase() === String(b ?? "").toUpperCase();
+}
+
+/** Human render of a slot type for diagnostics: COMBO(<n> options) for array
+ *  combos, else the raw type string. */
+function renderSlotType(type) {
+  if (Array.isArray(type)) return `COMBO(${type.length} options)`;
+  if (String(type ?? "").toUpperCase() === "COMBO") return "COMBO";
+  return String(type ?? "*");
+}
+
+/** Short base type name (no option count) for widget-tagged inputs. */
+function baseSlotType(type) {
+  if (isComboType(type)) return "COMBO";
+  return String(type ?? "*");
+}
+
+// One type-specific hint appended to the diagnostic tip when the failing output
+// type is unambiguous.
+const SLOT_TYPE_HINTS = {
+  MODEL: "MODEL outputs typically feed KSampler.model",
+  CLIP: "CLIP outputs typically feed CLIPTextEncode.clip",
+  VAE: "VAE outputs typically feed VAEDecode.vae / VAEEncode.vae",
+  CONDITIONING: "CONDITIONING feeds KSampler.positive / negative",
+  LATENT: "LATENT feeds KSampler.latent_image / VAEDecode.samples",
+  IMAGE: "IMAGE feeds VAEEncode / PreviewImage / SaveImage",
+};
+
+/** Build the full multi-line connect-failure diagnostic: every output and input
+ *  with index, name, type and [connected] / (TYPE/widget) flags, plus a tip.
+ *  `requested` carries the raw refs { from_output, to_input } and an optional
+ *  `reason` (used by the ambiguity guard) that overrides the computed tail. */
+function slotDiagnostic(origin, target, requested = {}) {
+  const refLabel = (ref) =>
+    ref == null ? "auto" : typeof ref === "string" ? `"${ref}"` : String(ref);
+  const outs = (origin.outputs ?? [])
+    .map((o, i) => `[${i}] "${o?.name ?? ""}" (${renderSlotType(o?.type)})`)
+    .join(", ");
+  const ins = (target.inputs ?? [])
+    .map((inp, i) => {
+      const typeStr = inp?.widget
+        ? `${baseSlotType(inp?.type)}/widget`
+        : renderSlotType(inp?.type);
+      const connected = inp?.link != null ? " [connected]" : "";
+      return `[${i}] "${inp?.name ?? ""}" (${typeStr})${connected}`;
+    })
+    .join(", ");
+
+  // The output type we were trying to place, when known (explicit or the sole
+  // output), used for the tail sentence + type-specific hint.
+  let failType = null;
+  const fromRef = requested.from_output;
+  if (typeof fromRef === "number" && origin.outputs?.[fromRef]) {
+    failType = origin.outputs[fromRef].type;
+  } else if (typeof fromRef === "string") {
+    const hit = (origin.outputs ?? []).find(
+      (o) => o?.name?.toLowerCase() === fromRef.toLowerCase(),
+    );
+    if (hit) failType = hit.type;
+  } else if ((origin.outputs ?? []).length === 1) {
+    failType = origin.outputs[0]?.type;
+  }
+
+  let tail;
+  if (requested.reason) {
+    tail = requested.reason;
+  } else if (failType != null && !isComboType(failType)) {
+    const typeName = typeSegments(failType)[0]?.toUpperCase();
+    const hint = SLOT_TYPE_HINTS[typeName];
+    tail =
+      `No input on node ${target.id} accepts type ${renderSlotType(failType)}. ` +
+      `Tip: ${hint ? hint + "; " : ""}check wiring with panel_get_graph.`;
+  } else {
+    tail =
+      `No compatible output→input pair found between node ${origin.id} and node ${target.id}. ` +
+      `Tip: check wiring with panel_get_graph.`;
+  }
+
+  const oType = origin.type ?? origin.comfyClass ?? origin.title ?? "node";
+  const tType = target.type ?? target.comfyClass ?? target.title ?? "node";
+  return (
+    `Could not connect node ${origin.id} (${oType}) → node ${target.id} (${tType}).\n` +
+    `Requested: from_output=${refLabel(requested.from_output)} → to_input=${refLabel(requested.to_input)}.\n` +
+    `Node ${origin.id} outputs: ${outs || "none"}\n` +
+    `Node ${target.id} inputs:  ${ins || "none"}\n` +
+    tail
+  );
+}
+
+/** Resolve one explicit slot ref to an index, or null when omitted (auto).
+ *  Numbers are range-checked; names are case-insensitive/trimmed with NO silent
+ *  fallback. Returns { index } | { error: "range"|"name" } | null (omitted). */
+function resolveExplicitSlot(slots, ref) {
+  if (ref == null) return null;
+  if (typeof ref === "number" && Number.isInteger(ref)) {
+    if (ref < 0 || ref >= (slots?.length ?? 0)) return { error: "range" };
+    return { index: ref };
+  }
+  const name = String(ref).trim().toLowerCase();
+  const idx = (slots ?? []).findIndex((s) => s?.name?.trim().toLowerCase() === name);
+  return idx === -1 ? { error: "name" } : { index: idx };
+}
+
+/** Resolve output/input slot indices for graph_connect, auto-matching omitted
+ *  sides by type. Returns { outIdx, inIdx, autoMatched: [...] } or throws a
+ *  diagnostic Error (range error for a bad index; slotDiagnostic otherwise:
+ *  named-slot miss, no compatible pair, or an ambiguous tie). */
+function autoMatchSlots(origin, target, fromRef, toRef) {
+  const outputs = origin.outputs ?? [];
+  const inputs = target.inputs ?? [];
+  const requested = { from_output: fromRef, to_input: toRef };
+
+  const out = resolveExplicitSlot(outputs, fromRef);
+  const inp = resolveExplicitSlot(inputs, toRef);
+  if (out?.error === "range")
+    throw new Error(`output slot index ${fromRef} out of range (node has ${outputs.length})`);
+  if (out?.error === "name") throw new Error(slotDiagnostic(origin, target, requested));
+  if (inp?.error === "range")
+    throw new Error(`input slot index ${toRef} out of range (node has ${inputs.length})`);
+  if (inp?.error === "name") throw new Error(slotDiagnostic(origin, target, requested));
+
+  const outIdxFixed = out ? out.index : null;
+  const inIdxFixed = inp ? inp.index : null;
+
+  // Both explicit → straight through, no auto-match.
+  if (outIdxFixed != null && inIdxFixed != null) {
+    return { outIdx: outIdxFixed, inIdx: inIdxFixed, autoMatched: [] };
+  }
+
+  const autoMatched = [];
+  if (fromRef == null) autoMatched.push("from_output");
+  if (toRef == null) autoMatched.push("to_input");
+
+  const outCandidates = outIdxFixed != null ? [outIdxFixed] : outputs.map((_, i) => i);
+  const inCandidates = inIdxFixed != null ? [inIdxFixed] : inputs.map((_, i) => i);
+
+  // Score every type-compatible (output, input) pairing.
+  const pairs = [];
+  for (const oi of outCandidates) {
+    const oType = outputs[oi]?.type;
+    for (const ii of inCandidates) {
+      const input = inputs[ii];
+      const rank = isTypeCompatible(oType, input?.type);
+      if (!rank) continue;
+      pairs.push({
+        outIdx: oi,
+        inIdx: ii,
+        rank,
+        connected: input?.link != null,
+        widget: !!input?.widget,
+        inType: input?.type,
+      });
+    }
+  }
+
+  if (!pairs.length) throw new Error(slotDiagnostic(origin, target, requested));
+
+  // Preference: exact type > wildcard; unconnected > connected; non-widget >
+  // widget; then lowest input index, then lowest output index.
+  const score = (p) => [p.rank, p.connected ? 0 : 1, p.widget ? 0 : 1];
+  pairs.sort((a, b) => {
+    const sa = score(a);
+    const sb = score(b);
+    for (let i = 0; i < sa.length; i++) if (sb[i] !== sa[i]) return sb[i] - sa[i];
+    if (a.inIdx !== b.inIdx) return a.inIdx - b.inIdx;
+    return a.outIdx - b.outIdx;
+  });
+  const best = pairs[0];
+
+  // Ambiguity guard: when the INPUT side was auto-matched, ≥2 equally-ranked,
+  // unconnected, non-widget candidates on DIFFERENT input slots of the same type
+  // → refuse rather than silently pick one (the classic wrong-negative bug).
+  if (inIdxFixed == null && !best.connected && !best.widget) {
+    const tied = pairs.filter(
+      (p) =>
+        p.inIdx !== best.inIdx &&
+        p.rank === best.rank &&
+        !p.connected &&
+        !p.widget &&
+        sameSlotType(p.inType, best.inType),
+    );
+    if (tied.length) {
+      const uniqNames = [
+        ...new Set([best, ...tied].map((p) => inputs[p.inIdx]?.name).filter(Boolean)),
+      ];
+      const reason = `ambiguous: ${uniqNames.length} ${renderSlotType(best.inType)} inputs (${uniqNames.join(
+        ", ",
+      )}) — name one`;
+      throw new Error(slotDiagnostic(origin, target, { ...requested, reason }));
+    }
+  }
+
+  return { outIdx: best.outIdx, inIdx: best.inIdx, autoMatched };
+}
+
 /** Place a new node: explicit [x, y], else cascade right from the last node
  *  in the graph so repeated adds don't stack at the origin. */
 function placementFor(graph, pos) {
@@ -2802,7 +3056,7 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
-  graph_connect({ from_node_id, from_output, to_node_id, to_input }) {
+  graph_connect({ from_node_id, from_output, to_node_id, to_input, auto_match }) {
     const { graph } = getGraphCtx();
 
     // Rail tolerance: when an endpoint is a subgraph boundary rail (by real id
@@ -2916,8 +3170,36 @@ const GRAPH_TOOL_EXECUTORS = {
 
     const origin = resolveNode(graph, from_node_id);
     const target = resolveNode(graph, to_node_id);
-    const outIdx = resolveSlot(origin.outputs, from_output ?? 0, "output");
-    const inIdx = resolveSlot(target.inputs, to_input ?? 0, "input");
+
+    let outIdx;
+    let inIdx;
+    let autoMatched = [];
+    if (auto_match === false) {
+      // Legacy exact behavior: an omitted slot means index 0, no type matching.
+      outIdx = resolveSlot(origin.outputs, from_output ?? 0, "output");
+      inIdx = resolveSlot(target.inputs, to_input ?? 0, "input");
+    } else {
+      const m = autoMatchSlots(origin, target, from_output, to_input);
+      outIdx = m.outIdx;
+      inIdx = m.inIdx;
+      autoMatched = m.autoMatched;
+    }
+
+    // Capture any pre-existing link on the target input so we can report the
+    // wire this connect replaces (LiteGraph silently drops it on reconnect).
+    const prevLinkId = target.inputs?.[inIdx]?.link;
+    let replacedLink = null;
+    if (prevLinkId != null) {
+      const l = graph.links?.[prevLinkId];
+      if (l) {
+        const src = graph.getNodeById?.(l.origin_id) ?? null;
+        replacedLink = {
+          node_id: l.origin_id,
+          output: src?.outputs?.[l.origin_slot]?.name ?? l.origin_slot,
+        };
+      }
+    }
+
     graph.beforeChange();
     let link;
     try {
@@ -2927,15 +3209,23 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     graph.setDirtyCanvas(true, true);
     if (!link) {
-      throw new Error(
-        `connect refused — output "${origin.outputs?.[outIdx]?.name}" (${origin.outputs?.[outIdx]?.type}) ` +
-          `is not compatible with input "${target.inputs?.[inIdx]?.name}" (${target.inputs?.[inIdx]?.type})`,
-      );
+      throw new Error(slotDiagnostic(origin, target, { from_output, to_input }));
     }
     return {
       connected: {
-        from: { node_id: origin.id, output: origin.outputs?.[outIdx]?.name ?? outIdx },
-        to: { node_id: target.id, input: target.inputs?.[inIdx]?.name ?? inIdx },
+        from: {
+          node_id: origin.id,
+          output: origin.outputs?.[outIdx]?.name ?? outIdx,
+          output_index: outIdx,
+        },
+        to: {
+          node_id: target.id,
+          input: target.inputs?.[inIdx]?.name ?? inIdx,
+          input_index: inIdx,
+        },
+        type: origin.outputs?.[outIdx]?.type,
+        ...(autoMatched.length ? { auto_matched: autoMatched } : {}),
+        ...(replacedLink ? { replaced_link: replacedLink } : {}),
       },
     };
   },
@@ -5627,7 +5917,9 @@ function describeCommand(cmd, msg, reply) {
     case "graph_connect":
       return {
         icon: "pi-link",
-        text: `Connected ${r.connected?.from?.node_id}.${r.connected?.from?.output} → ${r.connected?.to?.node_id}.${r.connected?.to?.input}`,
+        text:
+          `Connected ${r.connected?.from?.node_id}.${r.connected?.from?.output} → ${r.connected?.to?.node_id}.${r.connected?.to?.input}` +
+          (r.connected?.auto_matched ? " (auto-matched)" : ""),
       };
     case "graph_disconnect":
       return { icon: "pi-times-circle", text: `Disconnected ${r.disconnected?.node_id}.${r.disconnected?.input}` };

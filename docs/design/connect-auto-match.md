@@ -1,6 +1,6 @@
 # `graph_connect` auto-match by type + full slot diagnostics on failure
 
-**Status:** draft (RFC — spec-only PR) · **Implementation branch:** `feat/connect-auto-match` · **Pairs with:** comfyui-mcp `docs/design/panel-connect-auto-match.md` (`panel_connect` schema + DSL wiring warnings)
+**Status:** implemented (this PR) · **Implementation branch:** `spec/connect-auto-match` · **Pairs with:** comfyui-mcp `docs/design/panel-connect-auto-match.md` (`panel_connect` schema + DSL wiring warnings)
 
 > Prior art: [filliptm/ComfyUI_FL-MCP](https://github.com/filliptm/ComfyUI_FL-MCP) `fl_api.js` (~638–810): type-based slot auto-matching preferring unconnected inputs, and rich failure diagnostics listing every slot. We port both and add what FL-MCP lacked: `*` wildcard and COMBO handling, widget-input ranking, and an ambiguity guard — plus we never silently fall back when a *named* slot misses.
 
