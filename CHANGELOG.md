@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-07-09
+
+### Fixed
+- the "Control via Mobile app (beta)" gate now actually hides the header QR
+  button when off — the `hidden` attribute was overridden by the icon-button's
+  `display: flex` CSS; switched to inline display toggling
+
+
 ## [0.7.1] - 2026-07-09
 
 ### Added

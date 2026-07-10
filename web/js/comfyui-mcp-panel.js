@@ -95,7 +95,7 @@ const DISCORD_INVITE_URL = "https://discord.gg/TtQpf96BHS";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
-const PANEL_VERSION = "0.7.1";
+const PANEL_VERSION = "0.7.2";
 
 // ---------------------------------------------------------------------------
 // localStorage-backed settings.
@@ -6718,10 +6718,13 @@ function buildPanel() {
   remoteBtn.addEventListener("click", () => openPairModal());
   // Feature-flagged behind Settings → "Control via Mobile app (beta)": the mobile
   // client is beta, so the pairing entry point stays hidden until opted in.
-  remoteBtn.hidden = getSetting(SETTING_MOBILE_BETA) !== true;
-  panelHooks.applyMobileBeta = (on) => {
-    remoteBtn.hidden = !on;
+  // NOTE: inline display, not the `hidden` attribute — .cmcp-iconbtn's
+  // `display: flex` rule outranks the UA's `[hidden] { display: none }`.
+  const applyMobileBetaVisibility = (on) => {
+    remoteBtn.style.display = on ? "" : "none";
   };
+  applyMobileBetaVisibility(getSetting(SETTING_MOBILE_BETA) === true);
+  panelHooks.applyMobileBeta = applyMobileBetaVisibility;
   // Reload / restart live as slash commands (/reload, /reload-ui, /restart) — no
   // header buttons for them.
   actions.append(newChatBtn, historyBtn, remoteBtn);
