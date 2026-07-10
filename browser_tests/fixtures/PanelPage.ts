@@ -158,34 +158,46 @@ export class PanelPage {
   }
 
   /**
-   * Point the panel at a bridge URL. Writes the localStorage key the panel reads
-   * at build time AND, if the panel is already mounted, fills the visible Bridge
-   * URL field so the Reconnect button uses it. Call BEFORE openSidebar() for the
-   * cleanest path (the URL field is seeded from localStorage on mount).
+   * Point the panel at a bridge URL. The panel resolves its initial URL from
+   * ComfyUI's SERVER-side setting (`comfyui-mcp.bridgeUrl.single`) and
+   * deliberately ignores localStorage, so the only reliable agent-free path is
+   * the UI one: connect() expands the Advanced section, fills the visible
+   * Bridge URL field, and clicks Reconnect. This method just records the URL
+   * for connect() to use.
    */
+  private pendingBridgeUrl: string | null = null
+
   async setBridgeUrl(url: string): Promise<void> {
-    await this.page.evaluate((u) => {
-      try {
-        localStorage.setItem('comfyui-mcp.panel.bridgeUrl', u)
-      } catch {
-        // ignore — fall back to the input below
-      }
-      const input = document.querySelector<HTMLInputElement>(
-        '.cmcp-root .cmcp-input'
-      )
-      if (input) input.value = u
-    }, url)
+    this.pendingBridgeUrl = url
   }
 
   /**
-   * Open the connection settings popover and click Reconnect, which calls the
-   * bridge client's setUrl(urlInput.value) -> connect(). This is the agent-free
-   * connect path: it does NOT POST /connect (which would start a real backend).
-   * Waits for the handshake (status "connected").
+   * Open the connection settings popover, apply the pending bridge URL via the
+   * Advanced field, and click Reconnect — which calls the bridge client's
+   * setUrl(urlInput.value) -> connect(). This is the agent-free connect path:
+   * it does NOT POST /connect (which would start a real backend). Waits for the
+   * handshake (status "connected").
    */
   async connect(): Promise<void> {
     await this.openConnectionSettings()
-    await this.reconnectButton.click()
+    if (this.pendingBridgeUrl !== null) {
+      // The popover re-renders while it settles (backend chips / status text),
+      // which detaches nodes mid-click and makes the expand-Advanced → fill →
+      // click sequence racy. Set the URL and fire Reconnect atomically in one
+      // JS task against the LIVE nodes — same input, same real click handler.
+      await this.page.evaluate((u) => {
+        const pop = document.querySelector('.cmcp-root .cmcp-conn-pop')
+        const input = pop?.querySelector<HTMLInputElement>('input.cmcp-input')
+        const rec = Array.from(pop?.querySelectorAll('button') ?? []).find(
+          (b) => b.textContent?.trim() === 'Reconnect'
+        )
+        if (!input || !rec) throw new Error('connection popover not ready')
+        input.value = u
+        rec.click()
+      }, this.pendingBridgeUrl)
+    } else {
+      await this.reconnectButton.click()
+    }
     await this.waitForStatus('connected')
   }
 
