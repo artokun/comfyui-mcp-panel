@@ -2451,7 +2451,7 @@ function isComboType(type) {
 /** Stable signature so two combos compare equal only when they carry the same
  *  option set (arrays) or are both the bare "COMBO". */
 function comboSignature(type) {
-  if (Array.isArray(type)) return "COMBO[" + type.map((o) => String(o)).join(" ") + "]";
+  if (Array.isArray(type)) return "COMBO[" + type.map((o) => String(o)).join(String.fromCharCode(0)) + "]";
   return "COMBO";
 }
 
