@@ -6,6 +6,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-09
+
+### Added
+- "Remote control" QR — pair a phone (LAN default / Internet opt-in) (#78)
+- Settings: "Control via Mobile app (beta)" toggle (default off) gating the QR
+  pair button, plus "Get the beta app" tester links (iOS TestFlight / Android
+  Firebase App Distribution — buttons show "coming soon" until channels open)
+
+### Fixed
+- bridge-driven graph mutations are now actually undoable — the dispatcher
+  registers each successful command with ComfyUI's ChangeTracker
+  (checkState()), so one command = one Ctrl+Z step
+- e2e suite is hermetic on dev boxes (13/13): fixtures stub orchestrator
+  discovery + panel settings so a live agent can't hijack specs or have its
+  settings polluted by them
+
+
 ## [0.7.0] - 2026-07-09
 
 ### Added
