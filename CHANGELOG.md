@@ -6,6 +6,22 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-09
+
+### Added
+- graph_auto_layout — topological auto-layout with group + reroute handling,
+  barycenter ordering, dry-run planner; pure engine module in web/js/lib/ (#75)
+- graph_connect auto-match by type + full slot diagnostics on failure —
+  wildcard/COMBO/widget ranking, ambiguity guard, replaced_link reporting (#76)
+- graph_query executor — filter/traverse/aggregate the live canvas (#169 panel side) (#77)
+- Custom endpoint chip + Settings, all token buttons agent-free (#162 panel side) (#74)
+- llama.cpp backend chip + setup card (#161 panel side) (#73)
+
+### Fixed
+- comboSignature — text-safe NUL separator; raw NUL byte made git/scanners treat the bundle as binary
+- clear both Python findings from the release scan (#72)
+
+
 ## [0.6.9] - 2026-07-09
 
 ### Added

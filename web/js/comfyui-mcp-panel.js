@@ -94,7 +94,7 @@ const DISCORD_INVITE_URL = "https://discord.gg/TtQpf96BHS";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
-const PANEL_VERSION = "0.6.9";
+const PANEL_VERSION = "0.7.0";
 
 // ---------------------------------------------------------------------------
 // localStorage-backed settings.
