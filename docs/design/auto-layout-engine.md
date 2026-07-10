@@ -1,6 +1,6 @@
 # `graph_auto_layout` — topological auto-layout with group + reroute handling
 
-**Status:** draft (RFC — spec-only PR) · **Implementation branch:** `feat/auto-layout-engine` · **Pairs with:** comfyui-mcp `docs/design/panel-auto-layout-tool.md` (`panel_auto_layout` tool)
+**Status:** implemented (this PR) · **Implementation branch:** `spec/auto-layout-engine` · **Pairs with:** comfyui-mcp `docs/design/panel-auto-layout-tool.md` (`panel_auto_layout` tool)
 
 > Prior art: [filliptm/ComfyUI_FL-MCP](https://github.com/filliptm/ComfyUI_FL-MCP) `web/js/layout_engine.js` — a dependency-aware column layout (DFS topo sort, depth = max(input depths)+1, cumulative column widths). We port that core and fix its three known gaps: LiteGraph **groups** are ignored (members scatter, boxes orphan), **Reroute** nodes each get a full column (blowing up horizontal span), and there is **no overlap resolution** when a subset layout collides with untouched nodes.
 

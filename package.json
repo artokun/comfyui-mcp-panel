@@ -4,6 +4,7 @@
   "private": true,
   "description": "Dev-only Playwright e2e harness for the ComfyUI Agent Panel. NOT shipped with the pack (see .comfyignore).",
   "scripts": {
+    "test:unit": "node --test browser_tests/unit/*.test.mjs",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
     "test:e2e:list": "playwright test --list",

@@ -64,6 +64,7 @@
 // bottom). Deferral approach contributed by @FreesoSaiFared.
 import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
+import { computeLayout } from "./lib/layout-engine.js";
 
 let app = null;
 let api = null;
@@ -2999,6 +3000,193 @@ const GRAPH_TOOL_EXECUTORS = {
     return { moved: { node_id: node.id, from: previous, to: [node.pos[0], node.pos[1]] } };
   },
 
+  // Dependency-aware auto-layout of the active graph (or a `node_ids` subset).
+  // Builds a plain snapshot from the live graph, runs the pure layout-engine, and
+  // (unless dry_run) applies every position write in ONE beforeChange/afterChange
+  // pair so a single Ctrl+Z restores the prior arrangement. Groups are re-fit
+  // (preserve), moved rigidly (cluster), or left alone (ignore). Pinned nodes are
+  // never moved; the subgraph boundary rails (-10/-20) are excluded.
+  graph_auto_layout({
+    node_ids,
+    mode = "flow_horizontal",
+    spacing = 1.0,
+    align = "start",
+    anchor = "bbox",
+    groups = "preserve",
+    dry_run = false,
+  } = {}) {
+    const { graph } = getGraphCtx();
+    const allNodes = (graph._nodes ?? []).filter(
+      (n) => n.id !== SUBGRAPH_INPUT_RAIL_ID && n.id !== SUBGRAPH_OUTPUT_RAIL_ID,
+    );
+    if (!allNodes.length) throw new Error("Graph is empty — nothing to lay out");
+    if (groups !== "preserve" && groups !== "cluster" && groups !== "ignore") {
+      throw new Error(`Unknown groups mode "${groups}" (preserve | cluster | ignore)`);
+    }
+
+    // The set of nodes to lay out: explicit node_ids (validated) or ALL nodes.
+    let targetNodes;
+    if (Array.isArray(node_ids) && node_ids.length) {
+      targetNodes = node_ids.map((id) => resolveNode(graph, id)); // throws on miss
+    } else {
+      targetNodes = allNodes;
+    }
+    const targetIds = new Set(targetNodes.map((n) => n.id));
+
+    // True rendered footprint: collapsed nodes measure via boundingRect (title
+    // pill only), expanded nodes via size. Keeps columns tight.
+    const footprint = (n) => {
+      const collapsed = !!(n.flags && n.flags.collapsed);
+      let w = n.size?.[0] ?? 200;
+      let h = n.size?.[1] ?? 100;
+      if (collapsed) {
+        const br = n.boundingRect;
+        if (Array.isArray(br) && br.length === 4 && (br[2] || br[3])) {
+          w = br[2];
+          h = br[3];
+        }
+      }
+      return { w, h, collapsed };
+    };
+
+    const snapNodes = targetNodes.map((n) => {
+      const { w, h, collapsed } = footprint(n);
+      return {
+        id: n.id,
+        type: n.type ?? null,
+        x: n.pos?.[0] ?? 0,
+        y: n.pos?.[1] ?? 0,
+        width: w,
+        height: h,
+        pinned: !!(n.flags && n.flags.pinned),
+        collapsed,
+      };
+    });
+
+    // Edges among the target set (both endpoints in-set), from graph.links.
+    const links = graph.links ?? {};
+    const edges = [];
+    for (const l of Object.values(links)) {
+      if (!l) continue;
+      if (targetIds.has(l.origin_id) && targetIds.has(l.target_id)) {
+        edges.push({ from: l.origin_id, to: l.target_id });
+      }
+    }
+
+    // Group boxes (geometric membership recomputed, same as summarizeGroup).
+    const groupBoxes = (graph._groups ?? []).map((g) => {
+      g.recomputeInsideNodes?.();
+      const memberIds = (g._nodes ?? []).map((n) => n.id).filter((id) => targetIds.has(id));
+      const collapsed = !!(g.flags?.collapsed || g.collapsed);
+      return { g, memberIds, collapsed };
+    });
+
+    // Clusters (rigid super-nodes): ALL groups when clustering; only COLLAPSED
+    // groups when preserving (collapsed groups always move as a unit).
+    let clusters = [];
+    if (groups === "cluster") {
+      clusters = groupBoxes
+        .filter((gb) => gb.memberIds.length)
+        .map((gb, i) => ({ id: gb.g.id ?? `g${i}`, memberIds: gb.memberIds }));
+    } else if (groups === "preserve") {
+      clusters = groupBoxes
+        .filter((gb) => gb.collapsed && gb.memberIds.length)
+        .map((gb, i) => ({ id: gb.g.id ?? `g${i}`, memberIds: gb.memberIds }));
+    }
+
+    // Obstacles: nodes that will NOT move (outside the subset, or pinned) so the
+    // laid-out block is pushed clear of them instead of overlapping.
+    const willMove = (n) => targetIds.has(n.id) && !(n.flags && n.flags.pinned);
+    const obstacles = allNodes
+      .filter((n) => !willMove(n))
+      .map((n) => {
+        const { w, h } = footprint(n);
+        return { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0, width: w, height: h };
+      });
+
+    const layout = computeLayout(
+      { nodes: snapNodes, edges, groups: groupBoxes.map((gb) => ({ id: gb.g.id, memberIds: gb.memberIds, collapsed: gb.collapsed })) },
+      { mode, spacing, align, anchor, clusters, obstacles },
+    );
+
+    const byId = new Map(targetNodes.map((n) => [n.id, n]));
+    const moved = [];
+    for (const [id, [nx, ny]] of layout.positions) {
+      const n = byId.get(id);
+      if (!n) continue;
+      moved.push({
+        node_id: id,
+        from: [Math.round(n.pos?.[0] ?? 0), Math.round(n.pos?.[1] ?? 0)],
+        to: [Math.round(nx), Math.round(ny)],
+        column: layout.columnOf.get(id) ?? 0,
+      });
+    }
+
+    // Predicted group boxes (new member positions, current pos for un-moved
+    // members). preserve + cluster re-fit; ignore leaves boxes untouched.
+    const predictGroupBounds = (g) => {
+      const members = (g._nodes ?? []).map((n) => {
+        const p = layout.positions.get(n.id);
+        return {
+          pos: p ? [p[0], p[1]] : [n.pos?.[0] ?? 0, n.pos?.[1] ?? 0],
+          size: [n.size?.[0] ?? 200, n.size?.[1] ?? 100],
+        };
+      });
+      return boundsAroundNodes(members);
+    };
+    const groupResults =
+      groups === "ignore"
+        ? []
+        : groupBoxes
+            .filter((gb) => gb.memberIds.length)
+            .map((gb) => ({
+              group_id: gb.g.id != null ? gb.g.id : (graph._groups ?? []).indexOf(gb.g),
+              title: gb.g.title ?? "",
+              bounds: predictGroupBounds(gb.g).map(Math.round),
+            }));
+
+    if (dry_run) {
+      return {
+        applied: false,
+        mode,
+        node_count: moved.length,
+        columns: layout.columns,
+        moved,
+        ...(groupResults.length ? { groups: groupResults } : {}),
+        ...(layout.skipped.length ? { skipped: layout.skipped } : {}),
+      };
+    }
+
+    // Apply — a SINGLE undo step for the whole re-layout.
+    graph.beforeChange();
+    try {
+      for (const [id, [nx, ny]] of layout.positions) {
+        const n = byId.get(id);
+        if (n) n.pos = [nx, ny];
+      }
+      if (groups !== "ignore") {
+        for (const gb of groupBoxes) {
+          if (!gb.memberIds.length) continue;
+          setGroupBounds(gb.g, predictGroupBounds(gb.g));
+          gb.g.recomputeInsideNodes?.();
+        }
+      }
+    } finally {
+      graph.afterChange();
+    }
+    graph.setDirtyCanvas(true, true);
+
+    return {
+      applied: true,
+      mode,
+      node_count: moved.length,
+      columns: layout.columns,
+      moved,
+      ...(groupResults.length ? { groups: groupResults } : {}),
+      ...(layout.skipped.length ? { skipped: layout.skipped } : {}),
+    };
+  },
+
   graph_canvas({ action, node_id, dx, dy, scale }) {
     const { graph, canvas } = getGraphCtx();
     if (!canvas?.ds) throw new Error("Canvas is not available");
@@ -5648,6 +5836,11 @@ function describeCommand(cmd, msg, reply) {
         : { icon: "pi-arrow-up", text: `Promoted “${r.promoted}” to the subgraph node` };
     case "graph_move_node":
       return { icon: "pi-arrows-alt", text: `Moved node ${r.moved?.node_id} to [${r.moved?.to?.map(Math.round)}]` };
+    case "graph_auto_layout":
+      return {
+        icon: "pi-th-large",
+        text: `Auto-arranged ${r.node_count} node${r.node_count === 1 ? "" : "s"} (${r.columns} column${r.columns === 1 ? "" : "s"})`,
+      };
     case "graph_create_group":
       return { icon: "pi-clone", text: `Created group “${r.group?.title}” (id ${r.group?.id})` };
     case "graph_move_group":
@@ -8242,6 +8435,7 @@ function buildPanel() {
     "graph_create_group",
     "graph_move_group",
     "graph_remove_group",
+    "graph_auto_layout",
   ]);
   let autoFitTimer = null;
   function scheduleAutoFit() {
