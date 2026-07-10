@@ -6,6 +6,22 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-07-09
+
+### Added
+- the agent now keeps working when you switch to another sidebar tab (Assets,
+  Queue, …) — the panel detaches instead of tearing down, so the connection,
+  session, and chat survive; replies that land while you're away are waiting
+  when you come back
+- agent activity badge on the sidebar tab icon: green spinner while a turn is
+  in flight, red dot when it finished while you weren't looking (clears on
+  open), plain chat glyph when idle
+
+### Fixed
+- rapid sidebar tab switching no longer causes any bridge reconnect churn —
+  the panel is built once per page instead of once per tab open
+
+
 ## [0.7.2] - 2026-07-09
 
 ### Fixed
