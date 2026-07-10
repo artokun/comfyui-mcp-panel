@@ -64,6 +64,7 @@
 // bottom). Deferral approach contributed by @FreesoSaiFared.
 import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
+import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
 
 let app = null;
@@ -5164,7 +5165,7 @@ function focusFollowOnCommand(cmd, msg, reply) {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -5437,6 +5438,14 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // flips the provider picker to ready on its own.
       if (msg && msg.type === "secret_saved") {
         onSecretSaved?.(msg);
+      }
+      // Reply to a PANEL-initiated `pair` request (Remote control button): the
+      // orchestrator minted a phone-reachable bridge URL, or reported an error.
+      if (msg && msg.type === "pair_url") {
+        onPairUrl?.(msg);
+      }
+      if (msg && msg.type === "pair_error") {
+        onPairError?.(msg);
       }
       // Structured acks (ready / working / options / …). The "ready" ack is sent
       // after the orchestrator has processed hello (resume armed), so it's the
@@ -6621,9 +6630,11 @@ function buildPanel() {
   actions.style.cssText = "margin-left:auto;display:flex;gap:0.125rem;align-items:center;";
   const newChatBtn = iconBtn("pi-plus", "New chat");
   const historyBtn = iconBtn("pi-history", "Chat history");
+  const remoteBtn = iconBtn("pi-qrcode", "Remote control — pair a phone");
+  remoteBtn.addEventListener("click", () => openPairModal());
   // Reload / restart live as slash commands (/reload, /reload-ui, /restart) — no
   // header buttons for them.
-  actions.append(newChatBtn, historyBtn);
+  actions.append(newChatBtn, historyBtn, remoteBtn);
 
   header.style.position = "relative";
   const histPop = document.createElement("div");
@@ -8997,6 +9008,9 @@ function buildPanel() {
     });
   }
 
+  // In-flight Remote-control pairing request: the open modal registers a handler
+  // here; the `pair_url`/`pair_error` reply consumes it (mirrors pendingSetSecret).
+  let pendingPair = null;
   const client = createBridgeClient({
     onStatus(state) {
       statusText.textContent = state;
@@ -9094,6 +9108,13 @@ function buildPanel() {
         }).catch(() => {});
       }
       return p;
+    },
+    // Reply to the Remote-control pairing request → hand the URL to the open modal.
+    onPairUrl(msg) {
+      pendingPair?.({ url: msg.url, mode: msg.mode });
+    },
+    onPairError(msg) {
+      pendingPair?.({ error: msg.error || "Pairing failed", mode: msg.mode });
     },
     // Ack for the Settings-button set_secret flow (no agent involved).
     onSecretSaved(msg) {
@@ -11402,6 +11423,136 @@ function buildPanel() {
     overlay.appendChild(modal);
     root.appendChild(overlay);
     setTimeout(() => ta.focus(), 0);
+  }
+
+  // Draw a QR of `text` into `canvas` using the vendored qrcode-generator.
+  function drawQrToCanvas(canvas, text, px = 240) {
+    const qr = qrcodegen(0, "M"); // auto size, medium error correction
+    qr.addData(text);
+    qr.make();
+    const n = qr.getModuleCount();
+    const quiet = 4; // required quiet zone (modules)
+    const total = n + quiet * 2;
+    const scale = Math.max(2, Math.floor(px / total));
+    const dim = total * scale;
+    canvas.width = dim;
+    canvas.height = dim;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, dim, dim);
+    ctx.fillStyle = "#000000";
+    for (let r = 0; r < n; r++) {
+      for (let c = 0; c < n; c++) {
+        if (qr.isDark(r, c)) {
+          ctx.fillRect((c + quiet) * scale, (r + quiet) * scale, scale, scale);
+        }
+      }
+    }
+  }
+
+  // "Remote control": pair a phone by showing a QR of a phone-reachable bridge
+  // URL. Local wifi (LAN) by default; Internet (cloudflared tunnel) opt-in. The
+  // orchestrator mints the URL on demand via the `pair` frame (off by default —
+  // nothing is exposed beyond loopback until the user opens this modal).
+  function openPairModal() {
+    if (!client?.sendFrame) {
+      appendSystem("Connect to an agent first, then use Remote control to pair a phone.");
+      return;
+    }
+    const overlay = document.createElement("div");
+    overlay.className = "cmcp-modal-overlay";
+    const modal = document.createElement("div");
+    modal.className = "cmcp-modal";
+    const title = document.createElement("div");
+    title.className = "cmcp-modal-title";
+    title.textContent = "Remote control — pair a phone";
+
+    const scopeWrap = document.createElement("div");
+    scopeWrap.className = "cmcp-modal-scopes";
+    let mode = "lan";
+    const modes = [
+      { v: "lan", label: "Local wifi", hint: "phone on the same network — stays inside your network" },
+      { v: "tunnel", label: "Internet", hint: "pair from anywhere via an encrypted tunnel" },
+    ];
+
+    const qrWrap = document.createElement("div");
+    qrWrap.style.cssText =
+      "display:flex;flex-direction:column;align-items:center;gap:0.5rem;margin:0.75rem 0;min-height:260px;justify-content:center;";
+    const canvas = document.createElement("canvas");
+    canvas.style.cssText = "background:#fff;border-radius:8px;padding:8px;width:240px;height:240px;";
+    canvas.hidden = true;
+    const statusMsg = document.createElement("div");
+    statusMsg.style.cssText = "font-size:0.85rem;opacity:0.85;text-align:center;";
+    const urlLine = document.createElement("div");
+    urlLine.style.cssText =
+      "font-size:0.7rem;opacity:0.55;word-break:break-all;text-align:center;max-width:280px;";
+    qrWrap.append(canvas, statusMsg, urlLine);
+
+    let reqId = 0;
+    function requestPairing() {
+      canvas.hidden = true;
+      urlLine.textContent = "";
+      statusMsg.textContent =
+        mode === "tunnel" ? "Opening a secure tunnel…" : "Preparing a local link…";
+      const myReq = ++reqId;
+      pendingPair = (res) => {
+        if (myReq !== reqId) return; // a newer request (mode switch) superseded this
+        if (res.error) {
+          statusMsg.textContent = "⚠ " + res.error;
+          return;
+        }
+        try {
+          drawQrToCanvas(canvas, res.url);
+          canvas.hidden = false;
+          statusMsg.textContent = "Scan with the ComfyUI Agent app";
+          urlLine.textContent = res.url;
+        } catch {
+          statusMsg.textContent = "⚠ Could not render the QR code.";
+        }
+      };
+      client.sendFrame({ type: "pair", mode });
+    }
+
+    for (const m of modes) {
+      const lbl = document.createElement("label");
+      lbl.className = "cmcp-modal-scope";
+      const r = document.createElement("input");
+      r.type = "radio";
+      r.name = "cmcp-pair-mode";
+      r.value = m.v;
+      if (m.v === mode) r.checked = true;
+      r.addEventListener("change", () => {
+        mode = m.v;
+        requestPairing();
+      });
+      const span = document.createElement("span");
+      const strong = document.createElement("strong");
+      strong.textContent = m.label;
+      span.append(strong, document.createTextNode(` — ${m.hint}`));
+      lbl.append(r, span);
+      scopeWrap.appendChild(lbl);
+    }
+
+    const btnRow = document.createElement("div");
+    btnRow.className = "cmcp-modal-btns";
+    const doneBtn = document.createElement("button");
+    doneBtn.type = "button";
+    doneBtn.className = "cmcp-btn cmcp-btn-primary";
+    doneBtn.textContent = "Done";
+    const close = () => {
+      pendingPair = null;
+      overlay.remove();
+    };
+    doneBtn.addEventListener("click", close);
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) close();
+    });
+    btnRow.append(doneBtn);
+
+    modal.append(title, scopeWrap, qrWrap, btnRow);
+    overlay.appendChild(modal);
+    root.appendChild(overlay);
+    requestPairing();
   }
 
   // ---- submit ----
