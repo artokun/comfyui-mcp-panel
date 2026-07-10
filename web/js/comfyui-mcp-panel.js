@@ -64,6 +64,7 @@
 // bottom). Deferral approach contributed by @FreesoSaiFared.
 import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
+import { computeLayout } from "./lib/layout-engine.js";
 
 let app = null;
 let api = null;
@@ -2799,6 +2800,193 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
+  // QUERY the live graph — filter + traverse + project + aggregate, replacing
+  // the old graph_get_state full dump as the agent-facing read (issue #169).
+  // Semantics MIRROR the orchestrator's headless engine (comfyui-mcp
+  // src/services/graph-query.ts) — keep the two in lockstep:
+  //   scope (upstream_of/downstream_of + depth BFS, seed at depth 0)
+  //   → filters (types any-contains, title contains, `where` widget predicates
+  //     "name op value" with ops = != >= <= > < ~, ids exact)
+  //   → group_by:"type" counts, or projection (ids | compact lines | detail =
+  //     summarizeNode JSON rows), char-bounded with an explicit truncation tail.
+  // graph_get_state stays registered for BACK-COMPAT with older orchestrators.
+  graph_query({ types, title, where, ids, upstream_of, downstream_of, depth, fields, group_by, limit, max_chars }) {
+    const { graph, rootGraph } = getGraphCtx();
+    const nodes = graph._nodes ?? [];
+    const links = graph.links ?? {};
+    const byId = new Map(nodes.map((n) => [String(n.id), n]));
+    const total = nodes.length;
+    const lim = Math.min(Math.max(Number(limit) || 40, 1), 200);
+    const maxChars = Math.min(Math.max(Number(max_chars) || 12000, 500), 60000);
+
+    // Adjacency over live links.
+    const up = new Map();
+    const down = new Map();
+    for (const n of nodes) {
+      const id = String(n.id);
+      for (const inp of n.inputs ?? []) {
+        if (inp.link == null) continue;
+        const l = links[inp.link];
+        if (!l) continue;
+        const src = String(l.origin_id);
+        if (!up.has(id)) up.set(id, new Set());
+        up.get(id).add(src);
+        if (!down.has(src)) down.set(src, new Set());
+        down.get(src).add(id);
+      }
+    }
+    const closure = (adj, seed, maxDepth) => {
+      const seen = new Set([seed]);
+      let frontier = [seed];
+      for (let d = 0; d < maxDepth && frontier.length; d++) {
+        const next = [];
+        for (const id of frontier) {
+          for (const m of adj.get(id) ?? []) {
+            if (!seen.has(m)) {
+              seen.add(m);
+              next.push(m);
+            }
+          }
+        }
+        frontier = next;
+      }
+      return seen;
+    };
+
+    // 1) Traversal scope.
+    let scope = null;
+    const maxDepth = depth != null && depth >= 0 ? Number(depth) : Infinity;
+    if (upstream_of != null) {
+      const seed = String(upstream_of);
+      if (!byId.has(seed)) return { total, candidates: 0, matched: 0, shown: 0, truncated: false, text: `upstream_of node ${seed} not found (${total} nodes in view).` };
+      scope = closure(up, seed, maxDepth);
+    }
+    if (downstream_of != null) {
+      const seed = String(downstream_of);
+      if (!byId.has(seed)) return { total, candidates: 0, matched: 0, shown: 0, truncated: false, text: `downstream_of node ${seed} not found (${total} nodes in view).` };
+      const d = closure(down, seed, maxDepth);
+      scope = scope ? new Set([...scope].filter((x) => d.has(x))) : d;
+    }
+    const candidates = scope ? [...scope].map((id) => byId.get(id)).filter(Boolean) : nodes.slice();
+
+    // 2) Filters.
+    const wantIds = Array.isArray(ids) ? ids.map(String) : null;
+    const wantTypes = Array.isArray(types) ? types.map((t) => String(t).toLowerCase()).filter(Boolean) : null;
+    const wantTitle = title ? String(title).toLowerCase() : null;
+    const preds = (Array.isArray(where) ? where : []).map((w) => {
+      const m = /^\s*([A-Za-z0-9_.]+)\s*(>=|<=|!=|=|>|<|~)\s*(.*?)\s*$/.exec(String(w));
+      // A value starting with an operator char means a mistyped op ("cfg >> 7").
+      if (!m || /^[=<>~]/.test(m[3])) throw new Error(`Bad predicate "${w}" — expected "name op value" with op one of = != >= <= > < ~`);
+      return { name: m[1], op: m[2], rhs: m[3] };
+    });
+    const matchPred = (value, op, rhs) => {
+      const ln = typeof value === "number" ? value : Number(value);
+      const rn = Number(rhs);
+      const numeric = !Number.isNaN(ln) && !Number.isNaN(rn) && String(value).trim() !== "";
+      if (numeric && op !== "~") {
+        if (op === "=") return ln === rn;
+        if (op === "!=") return ln !== rn;
+        if (op === ">") return ln > rn;
+        if (op === ">=") return ln >= rn;
+        if (op === "<") return ln < rn;
+        if (op === "<=") return ln <= rn;
+      }
+      const l = String(value ?? "").toLowerCase();
+      const r = String(rhs).toLowerCase();
+      if (op === "=") return l === r;
+      if (op === "!=") return l !== r;
+      if (op === "~") return l.includes(r);
+      if (op === ">") return l > r;
+      if (op === ">=") return l >= r;
+      if (op === "<") return l < r;
+      if (op === "<=") return l <= r;
+      return false;
+    };
+    const widgetsOf = (n) => {
+      const out = {};
+      for (const w of n.widgets ?? []) if (w && typeof w.name === "string") out[w.name] = w.value;
+      return out;
+    };
+    const matched = candidates.filter((n) => {
+      if (wantIds && !wantIds.includes(String(n.id))) return false;
+      if (wantTypes && !wantTypes.some((t) => String(n.type ?? "").toLowerCase().includes(t))) return false;
+      if (wantTitle && !String(n.title ?? "").toLowerCase().includes(wantTitle)) return false;
+      if (preds.length) {
+        const w = widgetsOf(n);
+        for (const p of preds) {
+          if (!(p.name in w) || !matchPred(w[p.name], p.op, p.rhs)) return false;
+        }
+      }
+      return true;
+    });
+    matched.sort((a, b) => (Number(a.id) || 0) - (Number(b.id) || 0));
+
+    // Groups + rails ride on every result (they replaced graph_get_state's role
+    // as the structured source of group membership / subgraph boundary slots).
+    const groups = (graph._groups ?? []).map((g) => summarizeGroup(graph, g));
+    const inSubgraph = graph !== rootGraph;
+    const meta = {
+      viewing: describeActiveGraph(graph),
+      ...(groups.length ? { groups } : {}),
+      ...(inSubgraph ? { rails: describeRails(graph) } : {}),
+    };
+
+    // 3) Aggregate?
+    if (group_by === "type") {
+      const hist = new Map();
+      for (const n of matched) hist.set(n.type ?? "?", (hist.get(n.type ?? "?") ?? 0) + 1);
+      const lines = [...hist.entries()].sort((a, b) => b[1] - a[1]).map(([t, c]) => `${c}× ${t}`);
+      return {
+        ...meta, total, candidates: candidates.length, matched: matched.length,
+        shown: matched.length, truncated: false,
+        text: `${matched.length} node(s) across ${hist.size} type(s):\n${lines.join("\n")}`,
+      };
+    }
+
+    // 4) Projection, char-bounded.
+    const proj = fields === "ids" || fields === "detail" ? fields : "compact";
+    const clip = (v, n = 60) => {
+      const s = String(typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ");
+      return s.length > n ? s.slice(0, n - 1) + "…" : s;
+    };
+    const modeTag = (n) => ({ 2: " [mute]", 4: " [bypass]" }[n.mode] ?? "");
+    const outTag = (n) => (n.constructor?.nodeData?.output_node ? " [OUTPUT]" : "");
+    const header =
+      `${matched.length} match(es) of ${candidates.length} in scope (viewing: ${total} nodes)` +
+      (scope ? ` · traversal${Number.isFinite(maxDepth) ? ` depth≤${maxDepth}` : ""}` : "");
+    const lines = [];
+    let shown = 0;
+    let truncated = false;
+    let chars = header.length;
+    for (const n of matched) {
+      if (shown >= lim) { truncated = true; break; }
+      let line;
+      if (proj === "ids") {
+        line = String(n.id);
+      } else if (proj === "detail") {
+        line = JSON.stringify(summarizeNode(n));
+      } else {
+        const w = Object.entries(widgetsOf(n)).map(([k, v]) => `${k}=${clip(v)}`).join(" ");
+        const ins = [...(up.get(String(n.id)) ?? [])].join(",");
+        const outs = [...(down.get(String(n.id)) ?? [])].join(",");
+        const t = n.title && n.title !== n.type ? ` "${clip(n.title, 40)}"` : "";
+        line = `#${n.id} ${n.type ?? "?"}${t}${modeTag(n)}${outTag(n)}` + (w ? ` · ${w}` : "") + (ins ? `  ← ${ins}` : "") + (outs ? `  → ${outs}` : "");
+      }
+      if (chars + line.length + 1 > maxChars) { truncated = true; break; }
+      chars += line.length + 1;
+      lines.push(line);
+      shown++;
+    }
+    const tail = truncated
+      ? `\n… truncated at ${shown} of ${matched.length} — narrow with types/where/ids/depth, use group_by:"type", or raise limit/max_chars.`
+      : "";
+    const body = proj === "ids" ? lines.join(",") : lines.join("\n");
+    return {
+      ...meta, total, candidates: candidates.length, matched: matched.length, shown, truncated,
+      text: `${header}\n${body}${tail}`,
+    };
+  },
+
   // Pinpoint nodes in the graph the user is viewing WITHOUT dumping the whole
   // thing. Searches EVERY node (not capped like graph_get_state), applies the
   // filters, and returns only matches — each the same rich summary as
@@ -3287,6 +3475,193 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     graph.setDirtyCanvas(true, true);
     return { moved: { node_id: node.id, from: previous, to: [node.pos[0], node.pos[1]] } };
+  },
+
+  // Dependency-aware auto-layout of the active graph (or a `node_ids` subset).
+  // Builds a plain snapshot from the live graph, runs the pure layout-engine, and
+  // (unless dry_run) applies every position write in ONE beforeChange/afterChange
+  // pair so a single Ctrl+Z restores the prior arrangement. Groups are re-fit
+  // (preserve), moved rigidly (cluster), or left alone (ignore). Pinned nodes are
+  // never moved; the subgraph boundary rails (-10/-20) are excluded.
+  graph_auto_layout({
+    node_ids,
+    mode = "flow_horizontal",
+    spacing = 1.0,
+    align = "start",
+    anchor = "bbox",
+    groups = "preserve",
+    dry_run = false,
+  } = {}) {
+    const { graph } = getGraphCtx();
+    const allNodes = (graph._nodes ?? []).filter(
+      (n) => n.id !== SUBGRAPH_INPUT_RAIL_ID && n.id !== SUBGRAPH_OUTPUT_RAIL_ID,
+    );
+    if (!allNodes.length) throw new Error("Graph is empty — nothing to lay out");
+    if (groups !== "preserve" && groups !== "cluster" && groups !== "ignore") {
+      throw new Error(`Unknown groups mode "${groups}" (preserve | cluster | ignore)`);
+    }
+
+    // The set of nodes to lay out: explicit node_ids (validated) or ALL nodes.
+    let targetNodes;
+    if (Array.isArray(node_ids) && node_ids.length) {
+      targetNodes = node_ids.map((id) => resolveNode(graph, id)); // throws on miss
+    } else {
+      targetNodes = allNodes;
+    }
+    const targetIds = new Set(targetNodes.map((n) => n.id));
+
+    // True rendered footprint: collapsed nodes measure via boundingRect (title
+    // pill only), expanded nodes via size. Keeps columns tight.
+    const footprint = (n) => {
+      const collapsed = !!(n.flags && n.flags.collapsed);
+      let w = n.size?.[0] ?? 200;
+      let h = n.size?.[1] ?? 100;
+      if (collapsed) {
+        const br = n.boundingRect;
+        if (Array.isArray(br) && br.length === 4 && (br[2] || br[3])) {
+          w = br[2];
+          h = br[3];
+        }
+      }
+      return { w, h, collapsed };
+    };
+
+    const snapNodes = targetNodes.map((n) => {
+      const { w, h, collapsed } = footprint(n);
+      return {
+        id: n.id,
+        type: n.type ?? null,
+        x: n.pos?.[0] ?? 0,
+        y: n.pos?.[1] ?? 0,
+        width: w,
+        height: h,
+        pinned: !!(n.flags && n.flags.pinned),
+        collapsed,
+      };
+    });
+
+    // Edges among the target set (both endpoints in-set), from graph.links.
+    const links = graph.links ?? {};
+    const edges = [];
+    for (const l of Object.values(links)) {
+      if (!l) continue;
+      if (targetIds.has(l.origin_id) && targetIds.has(l.target_id)) {
+        edges.push({ from: l.origin_id, to: l.target_id });
+      }
+    }
+
+    // Group boxes (geometric membership recomputed, same as summarizeGroup).
+    const groupBoxes = (graph._groups ?? []).map((g) => {
+      g.recomputeInsideNodes?.();
+      const memberIds = (g._nodes ?? []).map((n) => n.id).filter((id) => targetIds.has(id));
+      const collapsed = !!(g.flags?.collapsed || g.collapsed);
+      return { g, memberIds, collapsed };
+    });
+
+    // Clusters (rigid super-nodes): ALL groups when clustering; only COLLAPSED
+    // groups when preserving (collapsed groups always move as a unit).
+    let clusters = [];
+    if (groups === "cluster") {
+      clusters = groupBoxes
+        .filter((gb) => gb.memberIds.length)
+        .map((gb, i) => ({ id: gb.g.id ?? `g${i}`, memberIds: gb.memberIds }));
+    } else if (groups === "preserve") {
+      clusters = groupBoxes
+        .filter((gb) => gb.collapsed && gb.memberIds.length)
+        .map((gb, i) => ({ id: gb.g.id ?? `g${i}`, memberIds: gb.memberIds }));
+    }
+
+    // Obstacles: nodes that will NOT move (outside the subset, or pinned) so the
+    // laid-out block is pushed clear of them instead of overlapping.
+    const willMove = (n) => targetIds.has(n.id) && !(n.flags && n.flags.pinned);
+    const obstacles = allNodes
+      .filter((n) => !willMove(n))
+      .map((n) => {
+        const { w, h } = footprint(n);
+        return { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0, width: w, height: h };
+      });
+
+    const layout = computeLayout(
+      { nodes: snapNodes, edges, groups: groupBoxes.map((gb) => ({ id: gb.g.id, memberIds: gb.memberIds, collapsed: gb.collapsed })) },
+      { mode, spacing, align, anchor, clusters, obstacles },
+    );
+
+    const byId = new Map(targetNodes.map((n) => [n.id, n]));
+    const moved = [];
+    for (const [id, [nx, ny]] of layout.positions) {
+      const n = byId.get(id);
+      if (!n) continue;
+      moved.push({
+        node_id: id,
+        from: [Math.round(n.pos?.[0] ?? 0), Math.round(n.pos?.[1] ?? 0)],
+        to: [Math.round(nx), Math.round(ny)],
+        column: layout.columnOf.get(id) ?? 0,
+      });
+    }
+
+    // Predicted group boxes (new member positions, current pos for un-moved
+    // members). preserve + cluster re-fit; ignore leaves boxes untouched.
+    const predictGroupBounds = (g) => {
+      const members = (g._nodes ?? []).map((n) => {
+        const p = layout.positions.get(n.id);
+        return {
+          pos: p ? [p[0], p[1]] : [n.pos?.[0] ?? 0, n.pos?.[1] ?? 0],
+          size: [n.size?.[0] ?? 200, n.size?.[1] ?? 100],
+        };
+      });
+      return boundsAroundNodes(members);
+    };
+    const groupResults =
+      groups === "ignore"
+        ? []
+        : groupBoxes
+            .filter((gb) => gb.memberIds.length)
+            .map((gb) => ({
+              group_id: gb.g.id != null ? gb.g.id : (graph._groups ?? []).indexOf(gb.g),
+              title: gb.g.title ?? "",
+              bounds: predictGroupBounds(gb.g).map(Math.round),
+            }));
+
+    if (dry_run) {
+      return {
+        applied: false,
+        mode,
+        node_count: moved.length,
+        columns: layout.columns,
+        moved,
+        ...(groupResults.length ? { groups: groupResults } : {}),
+        ...(layout.skipped.length ? { skipped: layout.skipped } : {}),
+      };
+    }
+
+    // Apply — a SINGLE undo step for the whole re-layout.
+    graph.beforeChange();
+    try {
+      for (const [id, [nx, ny]] of layout.positions) {
+        const n = byId.get(id);
+        if (n) n.pos = [nx, ny];
+      }
+      if (groups !== "ignore") {
+        for (const gb of groupBoxes) {
+          if (!gb.memberIds.length) continue;
+          setGroupBounds(gb.g, predictGroupBounds(gb.g));
+          gb.g.recomputeInsideNodes?.();
+        }
+      }
+    } finally {
+      graph.afterChange();
+    }
+    graph.setDirtyCanvas(true, true);
+
+    return {
+      applied: true,
+      mode,
+      node_count: moved.length,
+      columns: layout.columns,
+      moved,
+      ...(groupResults.length ? { groups: groupResults } : {}),
+      ...(layout.skipped.length ? { skipped: layout.skipped } : {}),
+    };
   },
 
   graph_canvas({ action, node_id, dx, dy, scale }) {
@@ -5940,6 +6315,11 @@ function describeCommand(cmd, msg, reply) {
         : { icon: "pi-arrow-up", text: `Promoted “${r.promoted}” to the subgraph node` };
     case "graph_move_node":
       return { icon: "pi-arrows-alt", text: `Moved node ${r.moved?.node_id} to [${r.moved?.to?.map(Math.round)}]` };
+    case "graph_auto_layout":
+      return {
+        icon: "pi-th-large",
+        text: `Auto-arranged ${r.node_count} node${r.node_count === 1 ? "" : "s"} (${r.columns} column${r.columns === 1 ? "" : "s"})`,
+      };
     case "graph_create_group":
       return { icon: "pi-clone", text: `Created group “${r.group?.title}” (id ${r.group?.id})` };
     case "graph_move_group":
@@ -8534,6 +8914,7 @@ function buildPanel() {
     "graph_create_group",
     "graph_move_group",
     "graph_remove_group",
+    "graph_auto_layout",
   ]);
   let autoFitTimer = null;
   function scheduleAutoFit() {
