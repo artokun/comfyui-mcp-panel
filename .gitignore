@@ -12,3 +12,4 @@ assets/brand-preview-ai/
 playwright-report/
 test-results/
 .playwright/
+.claude/
