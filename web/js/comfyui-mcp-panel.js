@@ -11662,6 +11662,24 @@ function buildPanel() {
     }
   }
 
+  // The QR encodes a LANDER url (https), not the raw ws:// pair URL — phone
+  // cameras refuse unknown schemes ("No usable data found"). The lander at
+  // pair.artokun.io routes: in-app scan / installed app (universal link) /
+  // store buttons. Pairing data rides the FRAGMENT so host+token never reach
+  // the lander's server. Raw ws URL stays visible below the QR for manual paste.
+  const PAIR_LANDER_ORIGIN = "https://pair.artokun.io/";
+  function pairingQrText(rawUrl) {
+    try {
+      const u = new URL(rawUrl);
+      const token = u.searchParams.get("token");
+      if (!token) return rawUrl;
+      u.searchParams.delete("token");
+      return `${PAIR_LANDER_ORIGIN}#v=1&host=${encodeURIComponent(u.toString())}&token=${encodeURIComponent(token)}`;
+    } catch {
+      return rawUrl; // unparseable — QR the raw URL rather than nothing
+    }
+  }
+
   // "Remote control": pair a phone by showing a QR of a phone-reachable bridge
   // URL. Local wifi (LAN) by default; Internet (cloudflared tunnel) opt-in. The
   // orchestrator mints the URL on demand via the `pair` frame (off by default —
@@ -11714,9 +11732,9 @@ function buildPanel() {
           return;
         }
         try {
-          drawQrToCanvas(canvas, res.url);
+          drawQrToCanvas(canvas, pairingQrText(res.url));
           canvas.hidden = false;
-          statusMsg.textContent = "Scan with the ComfyUI Agent app";
+          statusMsg.textContent = "Scan with your phone camera or the app";
           urlLine.textContent = res.url;
         } catch {
           statusMsg.textContent = "⚠ Could not render the QR code.";
