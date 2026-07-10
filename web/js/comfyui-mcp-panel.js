@@ -2545,6 +2545,193 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
+  // QUERY the live graph — filter + traverse + project + aggregate, replacing
+  // the old graph_get_state full dump as the agent-facing read (issue #169).
+  // Semantics MIRROR the orchestrator's headless engine (comfyui-mcp
+  // src/services/graph-query.ts) — keep the two in lockstep:
+  //   scope (upstream_of/downstream_of + depth BFS, seed at depth 0)
+  //   → filters (types any-contains, title contains, `where` widget predicates
+  //     "name op value" with ops = != >= <= > < ~, ids exact)
+  //   → group_by:"type" counts, or projection (ids | compact lines | detail =
+  //     summarizeNode JSON rows), char-bounded with an explicit truncation tail.
+  // graph_get_state stays registered for BACK-COMPAT with older orchestrators.
+  graph_query({ types, title, where, ids, upstream_of, downstream_of, depth, fields, group_by, limit, max_chars }) {
+    const { graph, rootGraph } = getGraphCtx();
+    const nodes = graph._nodes ?? [];
+    const links = graph.links ?? {};
+    const byId = new Map(nodes.map((n) => [String(n.id), n]));
+    const total = nodes.length;
+    const lim = Math.min(Math.max(Number(limit) || 40, 1), 200);
+    const maxChars = Math.min(Math.max(Number(max_chars) || 12000, 500), 60000);
+
+    // Adjacency over live links.
+    const up = new Map();
+    const down = new Map();
+    for (const n of nodes) {
+      const id = String(n.id);
+      for (const inp of n.inputs ?? []) {
+        if (inp.link == null) continue;
+        const l = links[inp.link];
+        if (!l) continue;
+        const src = String(l.origin_id);
+        if (!up.has(id)) up.set(id, new Set());
+        up.get(id).add(src);
+        if (!down.has(src)) down.set(src, new Set());
+        down.get(src).add(id);
+      }
+    }
+    const closure = (adj, seed, maxDepth) => {
+      const seen = new Set([seed]);
+      let frontier = [seed];
+      for (let d = 0; d < maxDepth && frontier.length; d++) {
+        const next = [];
+        for (const id of frontier) {
+          for (const m of adj.get(id) ?? []) {
+            if (!seen.has(m)) {
+              seen.add(m);
+              next.push(m);
+            }
+          }
+        }
+        frontier = next;
+      }
+      return seen;
+    };
+
+    // 1) Traversal scope.
+    let scope = null;
+    const maxDepth = depth != null && depth >= 0 ? Number(depth) : Infinity;
+    if (upstream_of != null) {
+      const seed = String(upstream_of);
+      if (!byId.has(seed)) return { total, candidates: 0, matched: 0, shown: 0, truncated: false, text: `upstream_of node ${seed} not found (${total} nodes in view).` };
+      scope = closure(up, seed, maxDepth);
+    }
+    if (downstream_of != null) {
+      const seed = String(downstream_of);
+      if (!byId.has(seed)) return { total, candidates: 0, matched: 0, shown: 0, truncated: false, text: `downstream_of node ${seed} not found (${total} nodes in view).` };
+      const d = closure(down, seed, maxDepth);
+      scope = scope ? new Set([...scope].filter((x) => d.has(x))) : d;
+    }
+    const candidates = scope ? [...scope].map((id) => byId.get(id)).filter(Boolean) : nodes.slice();
+
+    // 2) Filters.
+    const wantIds = Array.isArray(ids) ? ids.map(String) : null;
+    const wantTypes = Array.isArray(types) ? types.map((t) => String(t).toLowerCase()).filter(Boolean) : null;
+    const wantTitle = title ? String(title).toLowerCase() : null;
+    const preds = (Array.isArray(where) ? where : []).map((w) => {
+      const m = /^\s*([A-Za-z0-9_.]+)\s*(>=|<=|!=|=|>|<|~)\s*(.*?)\s*$/.exec(String(w));
+      // A value starting with an operator char means a mistyped op ("cfg >> 7").
+      if (!m || /^[=<>~]/.test(m[3])) throw new Error(`Bad predicate "${w}" — expected "name op value" with op one of = != >= <= > < ~`);
+      return { name: m[1], op: m[2], rhs: m[3] };
+    });
+    const matchPred = (value, op, rhs) => {
+      const ln = typeof value === "number" ? value : Number(value);
+      const rn = Number(rhs);
+      const numeric = !Number.isNaN(ln) && !Number.isNaN(rn) && String(value).trim() !== "";
+      if (numeric && op !== "~") {
+        if (op === "=") return ln === rn;
+        if (op === "!=") return ln !== rn;
+        if (op === ">") return ln > rn;
+        if (op === ">=") return ln >= rn;
+        if (op === "<") return ln < rn;
+        if (op === "<=") return ln <= rn;
+      }
+      const l = String(value ?? "").toLowerCase();
+      const r = String(rhs).toLowerCase();
+      if (op === "=") return l === r;
+      if (op === "!=") return l !== r;
+      if (op === "~") return l.includes(r);
+      if (op === ">") return l > r;
+      if (op === ">=") return l >= r;
+      if (op === "<") return l < r;
+      if (op === "<=") return l <= r;
+      return false;
+    };
+    const widgetsOf = (n) => {
+      const out = {};
+      for (const w of n.widgets ?? []) if (w && typeof w.name === "string") out[w.name] = w.value;
+      return out;
+    };
+    const matched = candidates.filter((n) => {
+      if (wantIds && !wantIds.includes(String(n.id))) return false;
+      if (wantTypes && !wantTypes.some((t) => String(n.type ?? "").toLowerCase().includes(t))) return false;
+      if (wantTitle && !String(n.title ?? "").toLowerCase().includes(wantTitle)) return false;
+      if (preds.length) {
+        const w = widgetsOf(n);
+        for (const p of preds) {
+          if (!(p.name in w) || !matchPred(w[p.name], p.op, p.rhs)) return false;
+        }
+      }
+      return true;
+    });
+    matched.sort((a, b) => (Number(a.id) || 0) - (Number(b.id) || 0));
+
+    // Groups + rails ride on every result (they replaced graph_get_state's role
+    // as the structured source of group membership / subgraph boundary slots).
+    const groups = (graph._groups ?? []).map((g) => summarizeGroup(graph, g));
+    const inSubgraph = graph !== rootGraph;
+    const meta = {
+      viewing: describeActiveGraph(graph),
+      ...(groups.length ? { groups } : {}),
+      ...(inSubgraph ? { rails: describeRails(graph) } : {}),
+    };
+
+    // 3) Aggregate?
+    if (group_by === "type") {
+      const hist = new Map();
+      for (const n of matched) hist.set(n.type ?? "?", (hist.get(n.type ?? "?") ?? 0) + 1);
+      const lines = [...hist.entries()].sort((a, b) => b[1] - a[1]).map(([t, c]) => `${c}× ${t}`);
+      return {
+        ...meta, total, candidates: candidates.length, matched: matched.length,
+        shown: matched.length, truncated: false,
+        text: `${matched.length} node(s) across ${hist.size} type(s):\n${lines.join("\n")}`,
+      };
+    }
+
+    // 4) Projection, char-bounded.
+    const proj = fields === "ids" || fields === "detail" ? fields : "compact";
+    const clip = (v, n = 60) => {
+      const s = String(typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ");
+      return s.length > n ? s.slice(0, n - 1) + "…" : s;
+    };
+    const modeTag = (n) => ({ 2: " [mute]", 4: " [bypass]" }[n.mode] ?? "");
+    const outTag = (n) => (n.constructor?.nodeData?.output_node ? " [OUTPUT]" : "");
+    const header =
+      `${matched.length} match(es) of ${candidates.length} in scope (viewing: ${total} nodes)` +
+      (scope ? ` · traversal${Number.isFinite(maxDepth) ? ` depth≤${maxDepth}` : ""}` : "");
+    const lines = [];
+    let shown = 0;
+    let truncated = false;
+    let chars = header.length;
+    for (const n of matched) {
+      if (shown >= lim) { truncated = true; break; }
+      let line;
+      if (proj === "ids") {
+        line = String(n.id);
+      } else if (proj === "detail") {
+        line = JSON.stringify(summarizeNode(n));
+      } else {
+        const w = Object.entries(widgetsOf(n)).map(([k, v]) => `${k}=${clip(v)}`).join(" ");
+        const ins = [...(up.get(String(n.id)) ?? [])].join(",");
+        const outs = [...(down.get(String(n.id)) ?? [])].join(",");
+        const t = n.title && n.title !== n.type ? ` "${clip(n.title, 40)}"` : "";
+        line = `#${n.id} ${n.type ?? "?"}${t}${modeTag(n)}${outTag(n)}` + (w ? ` · ${w}` : "") + (ins ? `  ← ${ins}` : "") + (outs ? `  → ${outs}` : "");
+      }
+      if (chars + line.length + 1 > maxChars) { truncated = true; break; }
+      chars += line.length + 1;
+      lines.push(line);
+      shown++;
+    }
+    const tail = truncated
+      ? `\n… truncated at ${shown} of ${matched.length} — narrow with types/where/ids/depth, use group_by:"type", or raise limit/max_chars.`
+      : "";
+    const body = proj === "ids" ? lines.join(",") : lines.join("\n");
+    return {
+      ...meta, total, candidates: candidates.length, matched: matched.length, shown, truncated,
+      text: `${header}\n${body}${tail}`,
+    };
+  },
+
   // Pinpoint nodes in the graph the user is viewing WITHOUT dumping the whole
   // thing. Searches EVERY node (not capped like graph_get_state), applies the
   // filters, and returns only matches — each the same rich summary as
