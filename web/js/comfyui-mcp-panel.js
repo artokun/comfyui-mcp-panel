@@ -9743,6 +9743,36 @@ function buildPanel() {
     record({ role: "agent", text });
   }
 
+  // ```a2ui fence fallback — for backends without panel tools (Ollama family).
+  // Runs at message COMMIT time (spec: no token-level partial card rendering).
+  // Malformed JSON is left IN the text so it renders as a plain code block.
+  const A2UI_FENCE_RE = /```a2ui[ \t]*\n([\s\S]*?)```/g;
+  function extractA2UIFences(text) {
+    const specs = [];
+    const stripped = String(text).replace(A2UI_FENCE_RE, (whole, body) => {
+      try {
+        specs.push({ raw: body, parsed: JSON.parse(body) });
+        return ""; // fence consumed — card painted separately
+      } catch {
+        return whole; // broken JSON → leave as a normal code block
+      }
+    });
+    return { text: stripped.trim(), specs };
+  }
+
+  /** Paint extracted fence specs through the same pipeline as the tool path. */
+  function paintFenceSpecs(specs) {
+    for (const s of specs) {
+      const v = validateA2UISpec(s.parsed);
+      if (v.ok) appendA2UICard(v.spec);
+      else {
+        log.appendChild(renderA2UIFailCard(s.raw, v.errors));
+        record({ role: "card", icon: "pi-exclamation-triangle", text: "Unsupported card", detail: v.errors[0] || "invalid a2ui spec" });
+        scrollLog();
+      }
+    }
+  }
+
   // ---- live streaming (thinking + reply) ----
   // Deltas arrive in uneven, network-sized chunks. To match the official app's
   // smooth character-by-character feel we DON'T paint each chunk directly —
@@ -10364,11 +10394,22 @@ function buildPanel() {
       // can't out-race the session resume.)
     },
     onSay(text, meta) {
-      // If this reply was streamed, commit it into its live preview bubble (same
-      // message id) instead of painting a duplicate. Otherwise paint normally.
-      // Either way KEEP the working indicator — the turn isn't over until
-      // turn:done (a turn often emits progress text, then works on silently).
-      if (!(meta && meta.id && commitStream(meta.id, text))) appendAgent(text);
+      // Message COMMIT time — the one place fenced ```a2ui blocks are detected
+      // (backends without panel tools, e.g. Ollama family, can only emit cards
+      // this way). Malformed JSON is left in `stripped` as a normal code block.
+      // If this reply was streamed, commit the remaining text into its live
+      // preview bubble (same message id) instead of painting a duplicate.
+      // Otherwise paint normally. Either way KEEP the working indicator — the
+      // turn isn't over until turn:done (a turn often emits progress text,
+      // then works on silently).
+      const { text: stripped, specs } = extractA2UIFences(text);
+      const committed = stripped || (specs.length ? "" : text);
+      if (committed) {
+        if (!(meta && meta.id && commitStream(meta.id, committed))) appendAgent(committed);
+      } else if (meta && meta.id) {
+        commitStream(meta.id, committed); // clears the streaming bubble even when the whole say was one fence
+      }
+      if (specs.length) paintFenceSpecs(specs);
       bumpThinking();
     },
     // Live streaming deltas (thinking + reply text) before the committed say.
