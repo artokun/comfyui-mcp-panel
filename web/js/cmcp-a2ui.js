@@ -48,6 +48,14 @@ export function validateA2UISpec(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return { ok: false, errors: ["spec must be an object"] };
   }
+  // Detach from the caller: a JSON round-trip strips getters/functions/symbols,
+  // so the data we VALIDATE is exactly the data we RETURN (no re-read can change
+  // it after validation), and cyclic raw objects are rejected up front.
+  try {
+    raw = JSON.parse(JSON.stringify(raw));
+  } catch {
+    return { ok: false, errors: ["spec must be plain JSON-serializable data"] };
+  }
   const spec = {
     surface: raw.surface === undefined ? "inline" : raw.surface,
     title: raw.title,
@@ -92,6 +100,7 @@ export function validateA2UISpec(raw) {
         break;
       case "Row": case "Column": case "Card":
         if (!Array.isArray(c.children)) err(`"${c.id}": children array required`);
+        else if (c.children.length > A2UI_CAPS.maxComponents) err(`"${c.id}": too many children (> ${A2UI_CAPS.maxComponents})`);
         else if (c.children.some((k) => !str(k))) err(`"${c.id}": children must be id strings`);
         break;
       case "Divider":
@@ -148,7 +157,7 @@ export function validateA2UISpec(raw) {
           if (s.values.length > A2UI_CAPS.maxChartPoints) { err(`"${c.id}": too many points (> ${A2UI_CAPS.maxChartPoints})`); break; }
           if (s.values.some((v) => typeof v !== "number" || !Number.isFinite(v))) { err(`"${c.id}": values must be finite numbers`); break; }
         }
-        if (c.x !== undefined && (!Array.isArray(c.x) || c.x.some((l) => !capped(l, A2UI_CAPS.maxLabelLen)))) err(`"${c.id}": x labels invalid`);
+        if (c.x !== undefined && (!Array.isArray(c.x) || c.x.length > A2UI_CAPS.maxChartPoints || c.x.some((l) => !capped(l, A2UI_CAPS.maxLabelLen)))) err(`"${c.id}": x labels invalid or too many`);
         break;
       }
     }
@@ -165,12 +174,19 @@ export function validateA2UISpec(raw) {
   }
   if (errors.length) return { ok: false, errors };
 
-  // Cycle + depth check via DFS from root.
+  // Cycle + depth check via DFS from root — and cap total INSTANCES: repeated
+  // child references multiply the render tree, so we count every visit, not
+  // just declared components (2 declared components must not render 50k nodes).
   const visiting = new Set();
+  let instances = 0;
+  let imageInstances = 0;
   const walk = (id, depth) => {
+    if (errors.length) return;
+    if (++instances > A2UI_CAPS.maxComponents) { err(`render tree exceeds ${A2UI_CAPS.maxComponents} component instances (repeated child references count)`); return; }
     if (depth > A2UI_CAPS.maxDepth) { err(`nesting depth exceeds ${A2UI_CAPS.maxDepth}`); return; }
     if (visiting.has(id)) { err(`reference cycle through "${id}"`); return; }
     const c = byId.get(id);
+    if (c.type === "Image" && ++imageInstances > A2UI_CAPS.maxImages) { err(`render tree exceeds ${A2UI_CAPS.maxImages} image instances`); return; }
     if (!CONTAINER_TYPES.has(c.type)) return;
     visiting.add(id);
     for (const k of c.children ?? []) {

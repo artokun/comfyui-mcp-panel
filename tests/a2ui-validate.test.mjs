@@ -107,3 +107,45 @@ test("surface enum and unknown top-level surface value", () => {
   ok({ ...minimal(), surface: "wide" });
   bad({ ...minimal(), surface: "fullscreen" }, "surface");
 });
+
+test("rejects repeated child references that inflate the render tree", () => {
+  bad({ root: "col", components: [
+    { id: "col", type: "Column", children: Array(50000).fill("t") },
+    { id: "t", type: "Text", text: "x" },
+  ] }, "children");
+  bad({ root: "a", components: [
+    { id: "a", type: "Column", children: Array(10).fill("b") },
+    { id: "b", type: "Column", children: Array(10).fill("c") },
+    { id: "c", type: "Text", text: "x" },
+  ] }, "instances");
+});
+
+test("caps image INSTANCES in the render tree, not just declared Images", () => {
+  bad({ root: "col", components: [
+    { id: "col", type: "Column", children: ["i", "i", "i", "i", "i"] },
+    { id: "i", type: "Image", src: "/view?filename=x.png" },
+  ] }, "image instances");
+});
+
+test("returned spec is detached plain data (no TOCTOU via getters or later mutation)", () => {
+  let calls = 0;
+  const comp = { id: "t", type: "Text" };
+  Object.defineProperty(comp, "text", { enumerable: true, get() { return calls++ === 0 ? "hi" : "x".repeat(999999); } });
+  const raw = { root: "c", components: [{ id: "c", type: "Column", children: ["t"] }, comp] };
+  const r = validateA2UISpec(raw);
+  assert.equal(r.ok, true);
+  assert.equal(r.spec.components[1].text, "hi");
+  raw.components[0].children.push("t");
+  assert.equal(r.spec.components[0].children.length, 1);
+});
+
+test("rejects cyclic raw objects and over-long chart x arrays; NaN values rejected explicitly", () => {
+  const cyc = { root: "c", components: [{ id: "c", type: "Text", text: "x" }] };
+  cyc.self = cyc;
+  bad(cyc, "JSON-serializable");
+  bad({ root: "ch", components: [{ id: "ch", type: "comfy:chart", kind: "bar",
+    x: Array.from({ length: A2UI_CAPS.maxChartPoints + 1 }, () => "l"),
+    series: [{ label: "s", values: [1] }] }] }, "x labels");
+  bad({ root: "ch", components: [{ id: "ch", type: "comfy:chart", kind: "line",
+    series: [{ label: "s", values: [1, NaN] }] }] }, "finite");
+});
