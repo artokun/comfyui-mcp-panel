@@ -136,7 +136,7 @@ export function validateA2UISpec(raw) {
         if (!Array.isArray(edges) || edges.length > A2UI_CAPS.maxGraphEdges) { err(`"${c.id}": too many graph edges`); break; }
         const nodeIds = new Set();
         for (const n of nodes) {
-          if (!n || !capped(n.id, A2UI_CAPS.maxLabelLen) || !capped(n.label, A2UI_CAPS.maxLabelLen)) { err(`"${c.id}": graph node id/label missing`); break; }
+          if (!n || !capped(n.id, A2UI_CAPS.maxLabelLen) || !n.id || !capped(n.label, A2UI_CAPS.maxLabelLen)) { err(`"${c.id}": graph node id/label missing`); break; }
           if (n.color !== undefined && !/^#[0-9a-fA-F]{3,8}$/.test(n.color)) { err(`"${c.id}": node color must be a hex color`); break; }
           nodeIds.add(n.id);
         }
@@ -169,7 +169,7 @@ export function validateA2UISpec(raw) {
   for (const c of byId.values()) {
     if (!CONTAINER_TYPES.has(c.type)) continue;
     for (const k of c.children ?? []) {
-      if (!byId.has(k)) err(`"${c.id}": child references unknown component id "${k}"`);
+      if (!byId.has(k)) err(`"${c.id}": child references unknown component id "${String(k).slice(0, 80)}"`);
     }
   }
   if (errors.length) return { ok: false, errors };

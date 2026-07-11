@@ -103,7 +103,7 @@ export function mountA2uiLeaf(c, { onFire } = {}) {
   });
 
   // Card lifecycle hook (called from cmcp-a2ui.js's resolve()): make this
-  // leaf inert. No-op for non-Button leaves (Text/Heading/Divider/Image
+  // leaf inert. No-op for non-Button leaves (Text/Divider/Image
   // have no interaction to disable).
   wrap._a2uiDisable = () => {
     wrap._a2uiWantsDisabled = true;

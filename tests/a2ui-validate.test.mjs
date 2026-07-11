@@ -92,6 +92,11 @@ test("graph edges must reference declared node ids", () => {
     edges: [{ from: "a", to: "ghost" }] }] }, "unknown graph node");
 });
 
+test("rejects empty graph-node ids (server/panel lockstep)", () => {
+  bad({ root: "g", components: [{ id: "g", type: "comfy:graph",
+    nodes: [{ id: "", label: "x" }] }] }, "graph node id");
+});
+
 test("image src origin restriction", () => {
   assert.equal(isAllowedImageSrc("/view?filename=x.png&type=output"), true);
   assert.equal(isAllowedImageSrc("/api/view?filename=x.png"), true);

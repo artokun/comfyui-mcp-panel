@@ -7543,7 +7543,6 @@ function buildPanel() {
   // of owned state, not scattered CSS, so a future A2UI layer can widen the surface
   // (e.g. to show a diagram) and shrink it back. No-op visual default today.
   root.style.setProperty("--cmcp-surface-width", "100%");
-  let _surfacePrevWidth = null; // remembered sidebar width while wide
   function cmcpSetChatSurface(mode) {
     root.style.setProperty("--cmcp-surface-width", mode === "wide" ? "60%" : "100%");
     root.dataset.surface = mode === "wide" ? "wide" : "normal";
@@ -7554,22 +7553,40 @@ function buildPanel() {
     // (the resizable PrimeVue Splitter pane) > .p-splitter > ... > #graph-canvas-container.
     // `.side-bar-panel` is the ComfyUI-specific class on that pane (present alongside
     // PrimeVue's generic `.p-splitterpanel`), so it's the more stable selector.
+    // The pre-wide width memo lives on the PANE element (dataset), not in closure
+    // state: buildPanel re-mounts on every workflow switch and the pane OUTLIVES
+    // the mount, so closure state would die while the mutated width persisted —
+    // leaving the sidebar stuck wide (and the next wide cycle would capture the
+    // wide width as its "previous" baseline).
     try {
       const pane = root.closest(".side-bar-panel") || root.closest("[class*='sidebar']");
       if (!pane) return;
       if (mode === "wide") {
-        if (_surfacePrevWidth == null) _surfacePrevWidth = pane.style.width || "";
+        if (!("cmcpPrevWidth" in pane.dataset)) pane.dataset.cmcpPrevWidth = pane.style.width || "";
         const target = Math.min(Math.round(window.innerWidth * 0.6), 900);
         pane.style.width = `${target}px`;
         pane.style.flex = `0 0 ${target}px`;
-      } else if (_surfacePrevWidth != null) {
-        pane.style.width = _surfacePrevWidth;
+      } else if ("cmcpPrevWidth" in pane.dataset) {
+        pane.style.width = pane.dataset.cmcpPrevWidth;
         pane.style.flex = "";
-        _surfacePrevWidth = null;
+        delete pane.dataset.cmcpPrevWidth;
       }
     } catch {
       // inline fallback only
     }
+  }
+  // Heal a stuck-wide pane left by a previous mount: this mount starts with no
+  // live cards, so the surface must be inline. `root` isn't in the DOM yet at
+  // this point (ComfyUI appends it after render), so closest() can't find the
+  // pane — scan the document for the dataset memo directly instead.
+  try {
+    for (const pane of document.querySelectorAll("[data-cmcp-prev-width]")) {
+      pane.style.width = pane.dataset.cmcpPrevWidth;
+      pane.style.flex = "";
+      delete pane.dataset.cmcpPrevWidth;
+    }
+  } catch {
+    // best-effort heal only
   }
   // Expose this panel's root so canvas "fit" can measure how much of the canvas
   // the open panel occludes and frame the graph in the visible area.
@@ -9947,6 +9964,13 @@ function buildPanel() {
   function resetFeed() {
     for (const el of [...log.children]) el.remove();
     streamBubbles.clear(); // drop any in-flight streaming previews (DOM is gone)
+    // Drop live A2UI card handles — their DOM was just removed. Without this,
+    // a ui_update against a card from a previous view would silently repaint a
+    // DETACHED element (and mutate+persist the background thread's record) while
+    // claiming success; and a stale unresolved surface:"wide" entry would keep
+    // the sidebar wide forever. Cards replay INERT from the thread instead.
+    liveA2uiCards.clear();
+    setChatSurfaceForCards();
     log.appendChild(empty);
   }
 
@@ -10450,8 +10474,11 @@ function buildPanel() {
       if (!v.ok) {
         // Client-side wall (fence path has no server check; tool path double-checks).
         // Throwing turns this into a retryable tool error for the agent.
+        clearEmpty();
         log.appendChild(renderA2UIFailCard(msg.spec, v.errors));
         scrollLog();
+        // Record a plain card so the fail chip survives reload (matches the fence path).
+        record({ role: "card", icon: "pi-exclamation-triangle", text: "Unsupported card", detail: v.errors[0] || "invalid a2ui spec" });
         throw new Error(`invalid a2ui spec: ${v.errors.slice(0, 5).join("; ")}`);
       }
       const card_id = appendA2UICard(v.spec);
