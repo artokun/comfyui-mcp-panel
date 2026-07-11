@@ -229,11 +229,47 @@ function cmcpOpenCredentialsFrame(client) {
   oauthHeader.style.cssText = "font-weight:600;margin-bottom:8px;font-size:13px";
   oauthHeader.textContent = "Sign in";
   oauthSection.appendChild(oauthHeader);
+  // Section-level error line (e.g. a failed oauth_status probe — Fix 2). Hidden
+  // until there's something to say; textContent only, per XSS discipline.
+  const oauthErrBox = document.createElement("div");
+  oauthErrBox.style.cssText = "color:#f28b82;font-size:11px;margin-bottom:8px;display:none";
+  oauthSection.appendChild(oauthErrBox);
+  function oauthError(msg) {
+    oauthErrBox.textContent = msg || "";
+    oauthErrBox.style.display = msg ? "block" : "none";
+  }
 
   const oauthEntries = new Map(); // provider id -> { rowEl, state }
   let oauthPollTimer = null;
-  let pendingBeginProvider = null;
-  let pendingSignoutProvider = null;
+  // Correlate acks to their originating row by PROVIDER, not by a single
+  // "last-clicked" guess — two overlapping sign-ins would otherwise be
+  // misrouted (one row shows the other's data, the other hangs forever). Each
+  // in-flight request's provider id lives in the matching set; the FIFO queue is
+  // the DEGRADE path for an older orchestrator whose ack omits `ack.provider`
+  // (resolve to the oldest still-pending request of that kind).
+  const beginInFlight = new Set();
+  const signoutInFlight = new Set();
+  const beginQueue = [];
+  const signoutQueue = [];
+
+  // Resolve which provider an oauth_begin/signout ack belongs to: prefer the
+  // provider the orchestrator echoed (correlation — route straight to that row),
+  // else fall back to the oldest still-pending request of that kind (older-
+  // orchestrator compatibility, whose ack omits `ack.provider`).
+  function resolveAckProvider(ack, inFlight, queue) {
+    const echoed = typeof ack.provider === "string" ? ack.provider : null;
+    if (echoed) {
+      // Trust the echoed id and clear any tracking we held for it.
+      inFlight.delete(echoed);
+      const qi = queue.indexOf(echoed);
+      if (qi !== -1) queue.splice(qi, 1);
+      return echoed;
+    }
+    // No provider on the ack (older orchestrator) — degrade to FIFO order.
+    const id = queue.shift() || null;
+    if (id) inFlight.delete(id);
+    return id;
+  }
 
   function oauthEntry(id) {
     let entry = oauthEntries.get(id);
@@ -362,7 +398,8 @@ function cmcpOpenCredentialsFrame(client) {
       paintOauthRow(p);
       return;
     }
-    pendingBeginProvider = p.id;
+    beginInFlight.add(p.id);
+    beginQueue.push(p.id);
   }
 
   function beginOauthSignout(p) {
@@ -375,10 +412,12 @@ function cmcpOpenCredentialsFrame(client) {
       paintOauthRow(p);
       return;
     }
-    pendingSignoutProvider = p.id;
+    signoutInFlight.add(p.id);
+    signoutQueue.push(p.id);
   }
 
   function applyOauthStatus(providers) {
+    oauthError(""); // a good status probe clears any prior "couldn't load" error
     const signedIn = new Map((Array.isArray(providers) ? providers : []).map((r) => [r.provider, r]));
     let anyPending = false;
     for (const p of CMCP_OAUTH_PROVIDERS) {
@@ -402,12 +441,18 @@ function cmcpOpenCredentialsFrame(client) {
   // is open land here instead of being silently ignored.
   cmcpOauthOnAck = (ack) => {
     if (ack.kind === "oauth_status") {
-      if (ack.ok) applyOauthStatus(ack.providers);
+      if (ack.ok) {
+        applyOauthStatus(ack.providers);
+      } else {
+        // Fix 2: surface a failed status probe instead of ignoring it — put the
+        // error on the section header row so the user isn't left staring at
+        // stale/blank rows with no explanation.
+        oauthError(ack.message || "Couldn't load sign-in status.");
+      }
       return;
     }
     if (ack.kind === "oauth_begin") {
-      const id = pendingBeginProvider;
-      pendingBeginProvider = null;
+      const id = resolveAckProvider(ack, beginInFlight, beginQueue);
       const p = CMCP_OAUTH_PROVIDERS.find((x) => x.id === id);
       if (!p) return;
       const entry = oauthEntry(id);
@@ -426,8 +471,7 @@ function cmcpOpenCredentialsFrame(client) {
       return;
     }
     if (ack.kind === "oauth_signout") {
-      const id = pendingSignoutProvider;
-      pendingSignoutProvider = null;
+      const id = resolveAckProvider(ack, signoutInFlight, signoutQueue);
       const p = CMCP_OAUTH_PROVIDERS.find((x) => x.id === id);
       if (!p) return;
       const entry = oauthEntry(id);
