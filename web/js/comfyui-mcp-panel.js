@@ -103,6 +103,29 @@ const PANEL_VERSION = "0.7.3";
 let cmcpConsoleUrl = null;
 let cmcpConsoleToken = null;
 
+// Known in-panel OAuth providers (mirrors the orchestrator's OAUTH_PROVIDERS —
+// see oauth-flow.ts in the comfyui-mcp package). The panel needs this catalog
+// up front because `oauth_status` only reports providers that HAVE a status
+// record — a provider nobody has signed into yet is simply absent from that
+// reply, not returned as "signed out". `codex`/`grok` are first-class;
+// `copilot` is experimental (device-code, GitHub ToS risk) and only ever
+// sent with `allow_experimental: true`.
+const CMCP_OAUTH_PROVIDERS = [
+  { id: "codex", label: "ChatGPT (Codex)" },
+  { id: "grok", label: "Grok" },
+  { id: "copilot", label: "GitHub Copilot", experimental: true },
+];
+
+// Hooks the OAuth section of the credentials card (built on demand — see
+// cmcpOpenCredentialsFrame) installs while it's open. The shared bridge-client
+// callback object (onAck / onBackends, wired once at connect time — see
+// createBridgeClient's caller) forwards into these so the card can react to
+// oauth_begin/oauth_status/oauth_signout acks and the readiness push without
+// threading the whole callback object through this module-level function.
+// Only one credentials card is ever open at a time; both reset to null on close.
+let cmcpOauthOnAck = null;
+let cmcpOauthOnBackendsPush = null;
+
 // Native API-Keys editor (no iframe). Talks straight to the orchestrator's
 // token-gated credential API (`GET/POST {consoleUrl}/api/secrets`) — the standalone
 // comfyui-cred-console sidebar tab is retired; credential management lives in the
@@ -113,7 +136,7 @@ let cmcpConsoleToken = null;
 function cmcpApiBase() {
   return `${cmcpConsoleUrl}/api/secrets?token=${encodeURIComponent(cmcpConsoleToken)}`;
 }
-function cmcpOpenCredentialsFrame() {
+function cmcpOpenCredentialsFrame(client) {
   if (!cmcpConsoleUrl || !cmcpConsoleToken) {
     alert("Connect the panel first — the credentials console isn't available yet.");
     return;
@@ -129,8 +152,14 @@ function cmcpOpenCredentialsFrame() {
     </div>
     <div style="opacity:.6;font-size:11px;margin-bottom:10px">Stored locally on the backend, per instance. Values are write-only and never leave this machine.</div>
     <div data-err style="color:#f28b82;font-size:12px;margin-bottom:8px;display:none"></div>
-    <div data-list style="opacity:.7">Loading…</div>`;
-  const close = () => backdrop.remove();
+    <div data-list style="opacity:.7">Loading…</div>
+    <div data-oauth style="margin-top:14px;padding-top:10px;border-top:1px solid #2a2f3a"></div>`;
+  const close = () => {
+    stopOauthPolling();
+    cmcpOauthOnAck = null;
+    cmcpOauthOnBackendsPush = null;
+    backdrop.remove();
+  };
   card.querySelector("[data-close]").onclick = close;
   backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(); });
   const errBox = card.querySelector("[data-err]");
@@ -189,6 +218,255 @@ function cmcpOpenCredentialsFrame() {
       showErr("Couldn't load credentials — reconnect the panel. (" + String((e && e.message) || e) + ")");
     }
   })();
+
+  // ---- OAuth sign-in section ------------------------------------------------
+  // Per-provider rows fed by oauth_status / driven by oauth_begin / oauth_signout.
+  // Every dynamic string here (account_label, user_code, verification_url) comes
+  // from the orchestrator or an OAuth provider and is rendered via textContent —
+  // never innerHTML — per this file's XSS discipline.
+  const oauthSection = card.querySelector("[data-oauth]");
+  const oauthHeader = document.createElement("div");
+  oauthHeader.style.cssText = "font-weight:600;margin-bottom:8px;font-size:13px";
+  oauthHeader.textContent = "Sign in";
+  oauthSection.appendChild(oauthHeader);
+
+  const oauthEntries = new Map(); // provider id -> { rowEl, state }
+  let oauthPollTimer = null;
+  let pendingBeginProvider = null;
+  let pendingSignoutProvider = null;
+
+  function oauthEntry(id) {
+    let entry = oauthEntries.get(id);
+    if (!entry) {
+      const rowEl = document.createElement("div");
+      rowEl.style.cssText = "margin-bottom:12px";
+      entry = { rowEl, state: { status: "signed_out", busy: false, error: null } };
+      oauthEntries.set(id, entry);
+    }
+    return entry;
+  }
+
+  function stopOauthPolling() {
+    if (oauthPollTimer) {
+      clearInterval(oauthPollTimer);
+      oauthPollTimer = null;
+    }
+  }
+  function startOauthPolling() {
+    if (oauthPollTimer) return;
+    oauthPollTimer = setInterval(() => {
+      client?.sendFrame?.({ type: "oauth_status" });
+    }, 3000);
+  }
+
+  function paintOauthRow(p) {
+    const entry = oauthEntry(p.id);
+    const { rowEl, state } = entry;
+    rowEl.replaceChildren();
+
+    const label = document.createElement("div");
+    label.style.cssText = "font-weight:500;margin-bottom:4px";
+    label.textContent = p.label;
+    rowEl.appendChild(label);
+
+    if (state.status === "signed_in") {
+      const info = document.createElement("div");
+      info.style.cssText = "display:flex;align-items:center;gap:8px;flex-wrap:wrap";
+      const who = document.createElement("span");
+      who.style.cssText = "opacity:.75;font-size:12px";
+      who.textContent = state.accountLabel ? `Signed in as ${state.accountLabel}` : "Signed in";
+      const signOutBtn = document.createElement("button");
+      signOutBtn.type = "button";
+      signOutBtn.className = "cmcp-btn";
+      signOutBtn.textContent = "Sign out";
+      signOutBtn.disabled = !!state.busy;
+      signOutBtn.onclick = () => beginOauthSignout(p);
+      info.append(who, signOutBtn);
+      rowEl.appendChild(info);
+    } else if (state.status === "pending_device") {
+      const code = document.createElement("code");
+      code.className = "cmcp-cmd";
+      code.style.cssText = "display:inline-block;font-size:15px;letter-spacing:1px;margin-bottom:6px";
+      code.textContent = state.userCode || "";
+      rowEl.appendChild(code);
+      const urlRow = document.createElement("div");
+      urlRow.style.cssText = "display:flex;align-items:center;gap:6px;margin-bottom:4px;flex-wrap:wrap";
+      const url = String(state.verificationUrl || "");
+      if (/^https:\/\//i.test(url)) {
+        const link = document.createElement("a");
+        link.href = url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.style.cssText = "color:#8ab4f8;word-break:break-all;font-size:12px";
+        link.textContent = url;
+        urlRow.appendChild(link);
+      } else if (url) {
+        const span = document.createElement("span");
+        span.style.cssText = "font-size:12px;word-break:break-all";
+        span.textContent = url;
+        urlRow.appendChild(span);
+      }
+      if (url) {
+        const copyBtn = document.createElement("button");
+        copyBtn.type = "button";
+        copyBtn.className = "cmcp-btn";
+        copyBtn.style.cssText = "padding:2px 8px;font-size:11px";
+        copyBtn.textContent = "Copy URL";
+        copyBtn.onclick = () => {
+          navigator.clipboard?.writeText(url).then(
+            () => { copyBtn.textContent = "Copied ✓"; setTimeout(() => { copyBtn.textContent = "Copy URL"; }, 1200); },
+            () => {},
+          );
+        };
+        urlRow.appendChild(copyBtn);
+      }
+      rowEl.appendChild(urlRow);
+      const waiting = document.createElement("div");
+      waiting.style.cssText = "opacity:.65;font-size:11px";
+      waiting.textContent = "Waiting for approval…";
+      rowEl.appendChild(waiting);
+    } else if (state.status === "pending_loopback") {
+      const waiting = document.createElement("div");
+      waiting.style.cssText = "opacity:.75;font-size:12px";
+      waiting.textContent = "A browser window opened — finish sign-in there…";
+      rowEl.appendChild(waiting);
+    } else {
+      const signInBtn = document.createElement("button");
+      signInBtn.type = "button";
+      signInBtn.className = "cmcp-btn";
+      signInBtn.textContent = `Sign in with ${p.label}`;
+      signInBtn.disabled = !!state.busy;
+      signInBtn.onclick = () => beginOauthSignin(p);
+      rowEl.appendChild(signInBtn);
+    }
+
+    if (state.error) {
+      const err = document.createElement("div");
+      err.style.cssText = "color:#f28b82;font-size:11px;margin-top:4px";
+      err.textContent = state.error;
+      rowEl.appendChild(err);
+    }
+  }
+
+  function beginOauthSignin(p) {
+    const entry = oauthEntry(p.id);
+    entry.state = { status: entry.state.status, busy: true, error: null };
+    paintOauthRow(p);
+    const ok = client?.sendFrame?.({
+      type: "oauth_begin",
+      provider: p.id,
+      ...(p.experimental ? { allow_experimental: true } : {}),
+    });
+    if (!ok) {
+      entry.state = { status: "signed_out", busy: false, error: "Not connected — reconnect the panel first." };
+      paintOauthRow(p);
+      return;
+    }
+    pendingBeginProvider = p.id;
+  }
+
+  function beginOauthSignout(p) {
+    const entry = oauthEntry(p.id);
+    entry.state = { ...entry.state, busy: true, error: null };
+    paintOauthRow(p);
+    const ok = client?.sendFrame?.({ type: "oauth_signout", provider: p.id });
+    if (!ok) {
+      entry.state = { ...entry.state, busy: false, error: "Not connected — reconnect the panel first." };
+      paintOauthRow(p);
+      return;
+    }
+    pendingSignoutProvider = p.id;
+  }
+
+  function applyOauthStatus(providers) {
+    const signedIn = new Map((Array.isArray(providers) ? providers : []).map((r) => [r.provider, r]));
+    let anyPending = false;
+    for (const p of CMCP_OAUTH_PROVIDERS) {
+      const entry = oauthEntry(p.id);
+      const rec = signedIn.get(p.id);
+      if (rec) {
+        entry.state = { status: "signed_in", accountLabel: rec.account_label, busy: false, error: null };
+      } else if (entry.state.status === "pending_device" || entry.state.status === "pending_loopback") {
+        anyPending = true; // still mid-flow — leave the waiting card up
+      } else if (entry.state.status !== "signed_out" || entry.state.busy) {
+        entry.state = { status: "signed_out", busy: false, error: entry.state.error || null };
+      }
+      paintOauthRow(p);
+    }
+    if (anyPending) startOauthPolling();
+    else stopOauthPolling();
+  }
+
+  // Wired into the shared bridge client's onAck/onBackends callbacks (see the
+  // big createBridgeClient({...}) call) so acks routed there while this card
+  // is open land here instead of being silently ignored.
+  cmcpOauthOnAck = (ack) => {
+    if (ack.kind === "oauth_status") {
+      if (ack.ok) applyOauthStatus(ack.providers);
+      return;
+    }
+    if (ack.kind === "oauth_begin") {
+      const id = pendingBeginProvider;
+      pendingBeginProvider = null;
+      const p = CMCP_OAUTH_PROVIDERS.find((x) => x.id === id);
+      if (!p) return;
+      const entry = oauthEntry(id);
+      if (!ack.ok) {
+        entry.state = { status: "signed_out", busy: false, error: ack.message || "Sign-in failed." };
+        paintOauthRow(p);
+        return;
+      }
+      if (ack.mode === "device") {
+        entry.state = { status: "pending_device", busy: false, error: null, userCode: ack.user_code, verificationUrl: ack.verification_url };
+      } else {
+        entry.state = { status: "pending_loopback", busy: false, error: null };
+      }
+      paintOauthRow(p);
+      startOauthPolling();
+      return;
+    }
+    if (ack.kind === "oauth_signout") {
+      const id = pendingSignoutProvider;
+      pendingSignoutProvider = null;
+      const p = CMCP_OAUTH_PROVIDERS.find((x) => x.id === id);
+      if (!p) return;
+      const entry = oauthEntry(id);
+      if (!ack.ok) {
+        entry.state = { ...entry.state, busy: false, error: ack.message || "Sign-out failed." };
+      } else {
+        entry.state = { status: "signed_out", busy: false, error: null };
+      }
+      paintOauthRow(p);
+    }
+  };
+  // A fresh readiness push follows a sign-in/out landing in the background
+  // (see the orchestrator's pushReadiness) — re-poll status so this card
+  // reflects it even if oauth_begin's own reply already resolved.
+  cmcpOauthOnBackendsPush = () => {
+    client?.sendFrame?.({ type: "oauth_status" });
+  };
+
+  for (const p of CMCP_OAUTH_PROVIDERS.filter((x) => !x.experimental)) {
+    paintOauthRow(p);
+    oauthSection.appendChild(oauthEntry(p.id).rowEl);
+  }
+  const experimentalProviders = CMCP_OAUTH_PROVIDERS.filter((x) => x.experimental);
+  if (experimentalProviders.length) {
+    const expHeader = document.createElement("div");
+    expHeader.style.cssText = "font-weight:600;margin:10px 0 2px;font-size:12px;opacity:.85";
+    expHeader.textContent = "Experimental";
+    oauthSection.appendChild(expHeader);
+    const expNote = document.createElement("div");
+    expNote.style.cssText = "opacity:.6;font-size:11px;margin-bottom:8px";
+    expNote.textContent = "Signs in as VS Code — against GitHub's Copilot API terms; use at your own risk.";
+    oauthSection.appendChild(expNote);
+    for (const p of experimentalProviders) {
+      paintOauthRow(p);
+      oauthSection.appendChild(oauthEntry(p.id).rowEl);
+    }
+  }
+  // Prime with whatever status the orchestrator already has.
+  client?.sendFrame?.({ type: "oauth_status" });
 
   backdrop.appendChild(card);
   document.body.appendChild(backdrop);
@@ -7142,7 +7420,7 @@ function buildPanel() {
   apiKeysBtn.style.opacity = "0.8";
   apiKeysBtn.addEventListener("click", () => {
     settingsBox.hidden = true;
-    cmcpOpenCredentialsFrame();
+    cmcpOpenCredentialsFrame(client);
   });
 
   const btnRow = document.createElement("div");
@@ -9628,8 +9906,19 @@ function buildPanel() {
       // not installed" behind a remote pod). Repaint the chips so hints refresh.
       applyReadiness(data, { fromOrchestrator: true });
       renderBackendChips(Array.isArray(data.backends) ? data.backends : knownBackends);
+      // A sign-in/out that just landed pushes a fresh backends frame — nudge an
+      // open credentials card to re-poll oauth_status (see cmcpOpenCredentialsFrame).
+      cmcpOauthOnBackendsPush?.();
     },
     onAck(ack) {
+      // In-panel OAuth acks (oauth_begin/oauth_status/oauth_signout) are routed
+      // to whichever credentials card is currently open — see
+      // cmcpOpenCredentialsFrame's onclick handlers. Nothing to do here if no
+      // card is open (the hook is null); the card re-primes on open anyway.
+      if (ack && typeof ack.kind === "string" && ack.kind.startsWith("oauth_")) {
+        cmcpOauthOnAck?.(ack);
+        return;
+      }
       // Receipt: orchestrator got it (not dropped) → cancel the failure timer.
       // The bubble stays QUEUED (muted) until the agent actually reads it.
       if (ack?.kind === "working" && typeof ack.mid === "string") {
