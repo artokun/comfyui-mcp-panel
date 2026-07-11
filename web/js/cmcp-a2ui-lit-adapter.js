@@ -1,5 +1,5 @@
 // cmcp-a2ui-lit-adapter.js — routes a scoped set of A2UI leaf components
-// (Text, Heading, Button, Divider, Image) through the vendored @a2ui/lit
+// (Text, Button, Divider, Image) through the vendored @a2ui/lit
 // basic catalog (web/js/vendor/a2ui-lit.bundle.js), per Task 1's GO decision.
 //
 // SCOPE (see task-3-report.md "deviations" for the full rationale):
@@ -16,7 +16,10 @@
 //     internal signal/binder with no documented external read API, and
 //     ChoicePicker's rendered markup varies by variant/displayStyle. Native
 //     <input>/<select> keeps that contract exact and dependency-free.
-//   - Text, Heading, Button, Divider, Image have no children to interleave
+//   - Heading stays hand-rolled (reviewer fix): the catalog maps it to
+//     Text{variant:hN}, which needs a markdown renderer and otherwise
+//     renders literal "#" prefixes. A plain <hN> is strictly better.
+//   - Text, Button, Divider, Image have no children to interleave
 //     and no read-back requirement, so each mounts as its own tiny
 //     single-component a2ui-surface, wrapped in a plain <span> the
 //     hand-rolled container tree slots in like any other child.
@@ -40,10 +43,6 @@ function leafMessages(c, disabled) {
   switch (c.type) {
     case "Text":
       return [{ id: "root", component: "Text", text: c.text }];
-    case "Heading":
-      // No markdown renderer wired (by design — see Task 1/3 notes: literal
-      // "#"/"*" rendering is safe and correct for v1).
-      return [{ id: "root", component: "Text", text: c.text, variant: `h${c.level ?? 2}` }];
     case "Divider":
       return [{ id: "root", component: "Divider" }];
     case "Image":
@@ -82,6 +81,10 @@ export function mountA2uiLeaf(c, { onFire } = {}) {
   wrap._a2uiWantsDisabled = false;
 
   loadBundle().then(({ basicCatalog, MessageProcessor }) => {
+    // Stale-mount guard (reviewer fix): a superseded update() paint (or a
+    // removed card) can detach this wrapper before the bundle resolves —
+    // don't mount a surface into a dead span.
+    if (!wrap.isConnected) return;
     const surfaceId = `leaf-${++_surfaceSeq}`;
     const surfaceEl = document.createElement("a2ui-surface");
     const processor = new MessageProcessor([basicCatalog], () => onFire?.());
@@ -114,8 +117,8 @@ export function mountA2uiLeaf(c, { onFire } = {}) {
 }
 
 /**
- * Entry point cmcp-a2ui.js's mountComponents() calls for the five leaf types
- * routed through Lit. `ctx` is the same lifecycle context renderA2UICard()
+ * Entry point cmcp-a2ui.js's mountComponents() calls for the four leaf types
+ * routed through Lit (Text, Button, Divider, Image). `ctx` is the same lifecycle context renderA2UICard()
  * builds (buttons/inputs/fields/choose/isResolved) — Button wiring mirrors
  * the hand-rolled Button case exactly (reply text, submit serialization via
  * ctx.fields, ctx.choose()) so resolve()/update() behave identically

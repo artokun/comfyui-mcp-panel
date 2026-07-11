@@ -205,12 +205,13 @@ export function validateA2UISpec(raw) {
 // Part 2: renderer + card lifecycle. document is touched only inside calls.
 //
 // GO branch (Task 1 spike decided GO — see .superpowers/sdd/task-1-report.md):
-// Text/Heading/Button/Divider/Image mount through the vendored @a2ui/lit
-// basic catalog via cmcp-a2ui-lit-adapter.js. Row/Column/Card containers and
-// TextField/Select/Checkbox form fields stay hand-rolled here — see the
-// scope note at the top of cmcp-a2ui-lit-adapter.js and task-3-report.md for
-// why (container interleaving with comfy:graph/comfy:chart; reliable
-// synchronous read-back for submit serialization). comfy:graph/comfy:chart
+// Text/Button/Divider/Image mount through the vendored @a2ui/lit
+// basic catalog via cmcp-a2ui-lit-adapter.js. Row/Column/Card containers,
+// TextField/Select/Checkbox form fields, and Heading stay hand-rolled here —
+// see the scope note at the top of cmcp-a2ui-lit-adapter.js and
+// task-3-report.md for why (container interleaving with comfy:graph/chart;
+// reliable synchronous read-back for submit serialization; Heading would
+// render literal "#" without a markdown renderer). comfy:graph/comfy:chart
 // are always hand-rolled: we draw those SVGs from data, which IS the custom
 // catalog. This static import is DOM-free at module scope (the adapter
 // lazy-imports the vendor bundle inside a function), so this file stays
@@ -443,9 +444,10 @@ function buildChartSVG(c) {
 
 /**
  * Mount one validated spec into a container element. Internal seam: standard
- * leaf types (Text/Heading/Button/Divider/Image) delegate to the Lit adapter;
- * containers (Row/Column/Card), form fields (TextField/Select/Checkbox), and
- * comfy:* stay hand-rolled here (see cmcp-a2ui-lit-adapter.js's scope note).
+ * leaf types (Text/Button/Divider/Image) delegate to the Lit adapter;
+ * Heading, containers (Row/Column/Card), form fields (TextField/Select/
+ * Checkbox), and comfy:* stay hand-rolled here (see cmcp-a2ui-lit-adapter.js's
+ * scope note; Heading is hand-rolled so it never shows raw "#" markdown).
  * Returns nothing; ctx.fields collects { name, read() } for submit serialization.
  */
 function mountComponents(container, spec, ctx) {
@@ -457,11 +459,18 @@ function mountComponents(container, spec, ctx) {
     const c = byId.get(id);
     switch (c.type) {
       case "Text":
-      case "Heading":
       case "Button":
       case "Divider":
       case "Image":
         return mountStandardComponent(c, ctx);
+      case "Heading": {
+        // Hand-rolled (reviewer fix): the Lit catalog's Text{variant:hN}
+        // renders literal "#" prefixes without a markdown renderer. A plain
+        // <hN> has no children/read-back needs, so it doesn't need Lit.
+        const h = document.createElement(`h${c.level ?? 2}`);
+        h.textContent = c.text;
+        return h;
+      }
       case "Row": case "Column": case "Card": {
         const d = document.createElement("div");
         d.className = c.type === "Row" ? "cmcp-a2ui-row" : c.type === "Card" ? "cmcp-a2ui-card" : "cmcp-a2ui-col";
