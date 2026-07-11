@@ -613,6 +613,10 @@ const _tempWorkflowIds = new Map(); // wf.key -> "tmp:<uuid>"
 // re-seed them to the now-current workflow and defeat change detection.
 let currentWorkflowId = null;
 let currentWorkflowKey = null;
+// The live workflow OBJECT last seen. ComfyUI mutates the SAME instance's path in
+// place on rename/Save-As (path and the derived .key getter both change), so the
+// instance is the only stable identity a rename leaves intact.
+let currentWorkflowRef = null;
 function activeWorkflowRef() {
   try {
     return (
@@ -9856,10 +9860,11 @@ function buildPanel() {
   }
 
   // Per-workflow auto-follow. Called on any workflow change (open/switch/save/rename).
-  // Three cases: (1) id unchanged → nothing; (2) same wf.key, id flipped tmp:→wf: →
+  // Four cases: (1) id unchanged → nothing; (2) same wf.key, id flipped tmp:→wf: →
   // ADOPT (migrate the temp thread to the file identity, keep the same session);
-  // (3) different id → SWITCH (re-hello + load that workflow's thread, or a fresh
-  // empty view if it has none).
+  // (2b) SAME workflow object, wf:→wf: id change → RENAME/Save-As (migrate the
+  // thread to the new path, keep the same session); (3) different id → SWITCH
+  // (re-hello + load that workflow's thread, or a fresh empty view if it has none).
   function rehelloForWorkflow(sessionId) {
     // Re-target the socket to the current workflow's tab id, then resume that
     // workflow's agent session. The backend drops the socket's prior tab mapping
@@ -9889,12 +9894,39 @@ function buildPanel() {
       if (wf && (wf.key || wf.id)) _tempWorkflowIds.delete(wf.key || wf.id);
       currentWorkflowId = wfid;
       currentWorkflowKey = wfkey;
+      currentWorkflowRef = wf;
       rehelloForWorkflow(t?.sessionId || null); // same session continues
+      return;
+    }
+
+    // Case 2b: RENAME / Save-As of an already-saved workflow. ComfyUI mutates the
+    // SAME object's path in place (instance identity survives; path and the derived
+    // .key getter change), so "same object, wf:→wf: id change" can only be a rename —
+    // a genuine switch always arrives on a different object. Without this branch the
+    // thread stays keyed to the OLD path and the renamed workflow opens a blank chat.
+    const renaming =
+      wf &&
+      wf === currentWorkflowRef &&
+      currentWorkflowId &&
+      currentWorkflowId.startsWith("wf:") &&
+      wfid.startsWith("wf:");
+    if (renaming) {
+      const t = threadForWorkflow(currentWorkflowId);
+      if (t) {
+        t.workflowKey = wfid; // thread follows the workflow to its new path
+        t.ts = Date.now(); // newest-wins lookup must favor the migrated thread over any stray
+        persistThreads();
+      }
+      currentWorkflowId = wfid;
+      currentWorkflowKey = wfkey;
+      currentWorkflowRef = wf;
+      rehelloForWorkflow(t?.sessionId || null); // same session continues under the new id
       return;
     }
 
     currentWorkflowId = wfid;
     currentWorkflowKey = wfkey;
+    currentWorkflowRef = wf;
     const existing = threadForWorkflow(wfid);
     // Bind THIS workflow's session BEFORE the re-hello. sendHello() reads
     // SESSION_KEY at hello time for its spawn-time `resume` — re-helloing first
