@@ -66,6 +66,7 @@ import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
+import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
 
 let app = null;
 let api = null;
@@ -6070,7 +6071,7 @@ const RECONNECT_MAX_MS = 15000;
 let AGENT_MUTED = (() => { try { return localStorage.getItem("cmcp.muteAgents") === "1"; } catch { return false; } })();
 let AGENT_BLIND = (() => { try { return localStorage.getItem("cmcp.blindAgents") === "1"; } catch { return false; } })();
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -6267,6 +6268,14 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
             const mediaItems = Array.isArray(msg.items) ? msg.items : [];
             onShowMedia?.(mediaItems);
             result = { ok: true, count: mediaItems.length };
+          } else if (msg.cmd === "ui_render") {
+            // A2UI card render. Validation errors THROW so the agent gets a
+            // retryable tool error instead of a broken card.
+            if (!onUiRender) throw new Error("This panel build can't render UI cards.");
+            result = await onUiRender(msg);
+          } else if (msg.cmd === "ui_update") {
+            if (!onUiUpdate) throw new Error("This panel build can't render UI cards.");
+            result = await onUiUpdate(msg);
           } else {
             const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];
             if (!executor) throw new Error(`Unknown command "${msg.cmd}"`);
@@ -6299,7 +6308,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
         // ask_user / request_secret paint their OWN cards and their replies carry
         // user input (a choice, or a SECRET) — never echo them as an activity card
         // (and never record them). Other commands get the normal activity card.
-        if (msg.cmd !== "ask_user" && msg.cmd !== "request_secret" && msg.cmd !== "set_todo" && msg.cmd !== "show_media") {
+        if (msg.cmd !== "ask_user" && msg.cmd !== "request_secret" && msg.cmd !== "set_todo" && msg.cmd !== "show_media" && msg.cmd !== "ui_render" && msg.cmd !== "ui_update") {
           onCommand?.(msg.cmd, msg, reply);
         }
         return;
@@ -7217,6 +7226,7 @@ function ensureStyles() {
   const tag = document.createElement("style");
   tag.id = "comfyui-mcp-panel-styles";
   tag.textContent = PANEL_CSS;
+  tag.textContent += A2UI_CSS;
   document.head.appendChild(tag);
   styleInjected = true;
 }
@@ -7533,9 +7543,33 @@ function buildPanel() {
   // of owned state, not scattered CSS, so a future A2UI layer can widen the surface
   // (e.g. to show a diagram) and shrink it back. No-op visual default today.
   root.style.setProperty("--cmcp-surface-width", "100%");
+  let _surfacePrevWidth = null; // remembered sidebar width while wide
   function cmcpSetChatSurface(mode) {
     root.style.setProperty("--cmcp-surface-width", mode === "wide" ? "60%" : "100%");
     root.dataset.surface = mode === "wide" ? "wide" : "normal";
+    // Best-effort: grow the ComfyUI sidebar pane itself so "wide" is visibly wide.
+    // Fails soft to inline-only if ComfyUI's DOM shape changes.
+    // Selector verified live (2026-07-10, via devtools): .cmcp-root's DOM chain is
+    // .cmcp-root > div > .sidebar-content-container > .p-splitterpanel.side-bar-panel
+    // (the resizable PrimeVue Splitter pane) > .p-splitter > ... > #graph-canvas-container.
+    // `.side-bar-panel` is the ComfyUI-specific class on that pane (present alongside
+    // PrimeVue's generic `.p-splitterpanel`), so it's the more stable selector.
+    try {
+      const pane = root.closest(".side-bar-panel") || root.closest("[class*='sidebar']");
+      if (!pane) return;
+      if (mode === "wide") {
+        if (_surfacePrevWidth == null) _surfacePrevWidth = pane.style.width || "";
+        const target = Math.min(Math.round(window.innerWidth * 0.6), 900);
+        pane.style.width = `${target}px`;
+        pane.style.flex = `0 0 ${target}px`;
+      } else if (_surfacePrevWidth != null) {
+        pane.style.width = _surfacePrevWidth;
+        pane.style.flex = "";
+        _surfacePrevWidth = null;
+      }
+    } catch {
+      // inline fallback only
+    }
   }
   // Expose this panel's root so canvas "fit" can measure how much of the canvas
   // the open panel occludes and frame the graph in the visible area.
@@ -9215,6 +9249,66 @@ function buildPanel() {
     return /\.(mp4|webm|mov|mkv|m4v|avi)$/i.test(String(m?.filename || ""));
   }
 
+  // ---- A2UI cards ------------------------------------------------------------
+  // Live interactive cards by card_id (for panel_ui_update). Entries also point
+  // at their thread record so resolve/update persist. Cards are per-mount DOM;
+  // the registry is mount-local on purpose — a workflow switch re-mounts and
+  // replays cards INERT from the thread (live handles don't survive, by design).
+  const liveA2uiCards = new Map(); // cardId -> { handle, rec }
+
+  /** Round-trip: a card interaction becomes a normal, visible user message. */
+  function sendCardReply(text) {
+    appendUser(text, {});
+    const ok = client?.sendUserMessage?.(text);
+    if (!ok) appendSystem("Card reply couldn't be sent — agent disconnected.");
+  }
+
+  /** Paint + record + register one live A2UI card. Returns its card_id. */
+  function appendA2UICard(spec) {
+    clearEmpty();
+    const rec = { role: "card", kind: "a2ui", spec, resolved: false, choice: null };
+    const handle = renderA2UICard(spec, {
+      onAction(text) {
+        rec.resolved = true;
+        rec.choice = text;
+        persistThreads();
+        liveA2uiCards.delete(handle.cardId);
+        setChatSurfaceForCards();
+        sendCardReply(text);
+      },
+      onDismiss() {
+        rec.resolved = true; // dismissed: inert, no choice, agent NOT notified
+        persistThreads();
+        liveA2uiCards.delete(handle.cardId);
+        setChatSurfaceForCards();
+      },
+    });
+    record(rec);
+    liveA2uiCards.set(handle.cardId, { handle, rec });
+    log.appendChild(handle.el);
+    scrollLog();
+    if (spec.surface === "wide") setChatSurfaceForCards();
+    return handle.cardId;
+  }
+
+  /** Replay one persisted a2ui record inert (reload / thread switch). */
+  function paintA2UIRecord(m) {
+    clearEmpty();
+    try {
+      log.appendChild(renderA2UIInert(m.spec, m.choice));
+    } catch {
+      log.appendChild(renderA2UIFailCard(m.spec, ["stored card failed to render"]));
+    }
+  }
+
+  /** Wide while ANY live unresolved card asked for it; restored otherwise. */
+  function setChatSurfaceForCards() {
+    const wantsWide = [...liveA2uiCards.values()].some(
+      (c) => !c.handle.isResolved() && c.rec.spec?.surface === "wide",
+    );
+    cmcpSetChatSurface(wantsWide ? "wide" : "inline");
+  }
+
   /**
    * Render an interactive question card and resolve with the user's pick.
    * `msg` = { question, header?, options:[{label, description?}], multi_select? }.
@@ -9849,7 +9943,10 @@ function buildPanel() {
     for (const m of t.msgs) {
       if (m.role === "user") paintUser(m.text, { attachments: m.attachments });
       else if (m.role === "agent") paintAgent(m.text);
-      else if (m.role === "card") paintCard(m);
+      else if (m.role === "card") {
+        if (m.kind === "a2ui") paintA2UIRecord(m);
+        else paintCard(m);
+      }
     }
     renderTodo(t.todos || []); // restore this thread's plan into the tray
     // Resume this conversation's agent session (or start fresh if it has none),
@@ -10305,6 +10402,31 @@ function buildPanel() {
           paintImage(item.dataUrl, caption);
         }
       }
+    },
+    // The agent called panel_ui_render / panel_ui_update — A2UI cards in the chat.
+    onUiRender(msg) {
+      const v = validateA2UISpec(msg.spec);
+      if (!v.ok) {
+        // Client-side wall (fence path has no server check; tool path double-checks).
+        // Throwing turns this into a retryable tool error for the agent.
+        log.appendChild(renderA2UIFailCard(msg.spec, v.errors));
+        scrollLog();
+        throw new Error(`invalid a2ui spec: ${v.errors.slice(0, 5).join("; ")}`);
+      }
+      const card_id = appendA2UICard(v.spec);
+      bumpThinking();
+      return { card_id };
+    },
+    onUiUpdate(msg) {
+      const entry = liveA2uiCards.get(String(msg.card_id));
+      if (!entry) throw new Error(`no live card "${msg.card_id}" (already resolved, dismissed, or from a previous view)`);
+      const v = validateA2UISpec(msg.spec);
+      if (!v.ok) throw new Error(`invalid a2ui spec: ${v.errors.slice(0, 5).join("; ")}`);
+      if (!entry.handle.update(v.spec)) throw new Error(`card "${msg.card_id}" is resolved`);
+      entry.rec.spec = v.spec;
+      persistThreads();
+      setChatSurfaceForCards();
+      return { ok: true };
     },
     // Orchestrator pushed live download progress → render rows in the tray.
     onDownloads(list) {
@@ -13158,7 +13280,10 @@ function buildPanel() {
       for (const m of t.msgs) {
         if (m.role === "user") paintUser(m.text, { attachments: m.attachments });
         else if (m.role === "agent") paintAgent(m.text);
-        else if (m.role === "card") paintCard(m);
+        else if (m.role === "card") {
+          if (m.kind === "a2ui") paintA2UIRecord(m);
+          else paintCard(m);
+        }
       }
       renderTodo(t.todos || []); // restore this thread's plan into the tray
     } catch {
