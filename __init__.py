@@ -68,6 +68,8 @@ _BACKEND_PORTS = {
     "claude": _BRIDGE_PORT,
     "codex": 9181,
     "gemini": 9182,
+    "grok": _BRIDGE_PORT,  # single-port multi-provider — same orchestrator
+    "kimi": _BRIDGE_PORT,  # single-port multi-provider — same orchestrator
     "ollama": _BRIDGE_PORT,  # single-port multi-provider — same orchestrator
     "openrouter": _BRIDGE_PORT,  # hosted (OpenRouter) — same orchestrator, key-gated
 }
@@ -96,6 +98,8 @@ _PROVIDER_CLIS = {
     "claude": ("claude", "claude.cmd", "claude.exe"),
     "codex": ("codex", "codex.cmd", "codex.exe"),
     "gemini": ("gemini", "gemini.cmd", "gemini.exe"),
+    "grok": ("grok", "grok.cmd", "grok.exe"),
+    "kimi": ("kimi", "kimi.cmd", "kimi.exe"),
     "ollama": ("ollama", "ollama.exe"),
 }
 

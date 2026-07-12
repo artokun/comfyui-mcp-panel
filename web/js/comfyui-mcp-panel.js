@@ -97,6 +97,430 @@ const DISCORD_INVITE_URL = "https://discord.gg/TtQpf96BHS";
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
 const PANEL_VERSION = "0.7.3";
 
+// The connected orchestrator's console URL/token (captured off the `backends`
+// bridge message — see onBackends). Drives the "API Keys" credentials frame;
+// null until a `backends` message with both fields has landed.
+let cmcpConsoleUrl = null;
+let cmcpConsoleToken = null;
+
+// Known in-panel OAuth providers (mirrors the orchestrator's OAUTH_PROVIDERS —
+// see oauth-flow.ts in the comfyui-mcp package). The panel needs this catalog
+// up front because `oauth_status` only reports providers that HAVE a status
+// record — a provider nobody has signed into yet is simply absent from that
+// reply, not returned as "signed out". `codex`/`grok` are first-class;
+// `copilot` is experimental (device-code, GitHub ToS risk) and only ever
+// sent with `allow_experimental: true`.
+const CMCP_OAUTH_PROVIDERS = [
+  { id: "codex", label: "ChatGPT (Codex)" },
+  { id: "grok", label: "Grok" },
+  { id: "copilot", label: "GitHub Copilot", experimental: true },
+];
+
+// Hooks the OAuth section of the credentials card (built on demand — see
+// cmcpOpenCredentialsFrame) installs while it's open. The shared bridge-client
+// callback object (onAck / onBackends, wired once at connect time — see
+// createBridgeClient's caller) forwards into these so the card can react to
+// oauth_begin/oauth_status/oauth_signout acks and the readiness push without
+// threading the whole callback object through this module-level function.
+// Only one credentials card is ever open at a time; both reset to null on close.
+let cmcpOauthOnAck = null;
+let cmcpOauthOnBackendsPush = null;
+
+// Native API-Keys editor (no iframe). Talks straight to the orchestrator's
+// token-gated credential API (`GET/POST {consoleUrl}/api/secrets`) — the standalone
+// comfyui-cred-console sidebar tab is retired; credential management lives in the
+// AI backend and is edited here. The fetch is cross-origin (ComfyUI :8188 → console
+// :9182), which the console now allows via CORS on /api/secrets (see
+// panel-console-http.ts). The token travels as a query param; values are write-only
+// and never read back (only a masked preview comes down).
+function cmcpApiBase() {
+  return `${cmcpConsoleUrl}/api/secrets?token=${encodeURIComponent(cmcpConsoleToken)}`;
+}
+function cmcpOpenCredentialsFrame(client) {
+  if (!cmcpConsoleUrl || !cmcpConsoleToken) {
+    alert("Connect the panel first — the credentials console isn't available yet.");
+    return;
+  }
+  const backdrop = document.createElement("div");
+  backdrop.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:100000;display:flex;align-items:center;justify-content:center;";
+  const card = document.createElement("div");
+  card.style.cssText = "width:440px;max-width:92vw;max-height:88vh;overflow:auto;padding:1rem 1.1rem;border-radius:12px;background:#0f1115;color:#e8eaed;border:1px solid #2a2f3a;box-shadow:0 12px 48px rgba(0,0,0,.5);font:13px system-ui,sans-serif;";
+  card.innerHTML = `
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">
+      <b style="flex:1;font-size:15px">API Keys</b>
+      <span data-close style="cursor:pointer;font-size:18px;opacity:.6;line-height:1">✕</span>
+    </div>
+    <div style="opacity:.6;font-size:11px;margin-bottom:10px">Stored locally on the backend, per instance. Values are write-only and never leave this machine.</div>
+    <div data-err style="color:#f28b82;font-size:12px;margin-bottom:8px;display:none"></div>
+    <div data-list style="opacity:.7">Loading…</div>
+    <div data-oauth style="margin-top:14px;padding-top:10px;border-top:1px solid #2a2f3a"></div>`;
+  const close = () => {
+    stopOauthPolling();
+    cmcpOauthOnAck = null;
+    cmcpOauthOnBackendsPush = null;
+    backdrop.remove();
+  };
+  card.querySelector("[data-close]").onclick = close;
+  backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(); });
+  const errBox = card.querySelector("[data-err]");
+  const showErr = (m) => { errBox.textContent = m; errBox.style.display = m ? "block" : "none"; };
+  const list = card.querySelector("[data-list]");
+
+  const row = (s) => {
+    const r = document.createElement("div");
+    r.style.cssText = "margin-bottom:12px";
+    r.innerHTML = `
+      <label style="display:block;margin-bottom:4px">${esc2(s.label)}
+        <span data-badge style="margin-left:6px;font-size:11px;opacity:.6">${s.set ? "set · " + esc2(s.masked || "") : "not set"}</span></label>
+      <div style="display:flex;gap:6px">
+        <input type="password" autocomplete="off" data-input
+               placeholder="${s.set ? "•••• set — type to replace" : "paste key"}"
+               style="flex:1;padding:6px;background:#1a1a1a;border:1px solid #333;color:#ddd;border-radius:4px;box-sizing:border-box"/>
+        <button data-save style="padding:6px 12px;border-radius:4px;cursor:pointer">Save</button>
+      </div>`;
+    const input = r.querySelector("[data-input]");
+    const badge = r.querySelector("[data-badge]");
+    const btn = r.querySelector("[data-save]");
+    btn.onclick = async () => {
+      const value = input.value.trim();
+      if (!value) return;
+      showErr("");
+      btn.disabled = true; btn.textContent = "Saving…";
+      try {
+        const resp = await fetch(cmcpApiBase(), {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ slot: s.id, value }),
+        });
+        const d = await resp.json();
+        if (!resp.ok || !d.ok) throw new Error(d.error || "save failed");
+        input.value = "";
+        badge.textContent = "set · " + (d.masked || "");
+        btn.textContent = "Saved ✓";
+        setTimeout(() => { btn.textContent = "Save"; btn.disabled = false; }, 1400);
+      } catch (e) {
+        showErr(String((e && e.message) || e));
+        btn.textContent = "Save"; btn.disabled = false;
+      }
+    };
+    return r;
+  };
+
+  (async () => {
+    try {
+      const resp = await fetch(cmcpApiBase());
+      const d = await resp.json();
+      if (!resp.ok || !d.ok) throw new Error(d.error || "could not load");
+      list.innerHTML = "";
+      for (const s of (d.slots || [])) list.appendChild(row(s));
+      if (!list.children.length) list.textContent = "No credential slots.";
+    } catch (e) {
+      list.textContent = "";
+      showErr("Couldn't load credentials — reconnect the panel. (" + String((e && e.message) || e) + ")");
+    }
+  })();
+
+  // ---- OAuth sign-in section ------------------------------------------------
+  // Per-provider rows fed by oauth_status / driven by oauth_begin / oauth_signout.
+  // Every dynamic string here (account_label, user_code, verification_url) comes
+  // from the orchestrator or an OAuth provider and is rendered via textContent —
+  // never innerHTML — per this file's XSS discipline.
+  const oauthSection = card.querySelector("[data-oauth]");
+  const oauthHeader = document.createElement("div");
+  oauthHeader.style.cssText = "font-weight:600;margin-bottom:8px;font-size:13px";
+  oauthHeader.textContent = "Sign in";
+  oauthSection.appendChild(oauthHeader);
+  // Section-level error line (e.g. a failed oauth_status probe — Fix 2). Hidden
+  // until there's something to say; textContent only, per XSS discipline.
+  const oauthErrBox = document.createElement("div");
+  oauthErrBox.style.cssText = "color:#f28b82;font-size:11px;margin-bottom:8px;display:none";
+  oauthSection.appendChild(oauthErrBox);
+  function oauthError(msg) {
+    oauthErrBox.textContent = msg || "";
+    oauthErrBox.style.display = msg ? "block" : "none";
+  }
+
+  const oauthEntries = new Map(); // provider id -> { rowEl, state }
+  let oauthPollTimer = null;
+  // Correlate acks to their originating row by PROVIDER, not by a single
+  // "last-clicked" guess — two overlapping sign-ins would otherwise be
+  // misrouted (one row shows the other's data, the other hangs forever). Each
+  // in-flight request's provider id lives in the matching set; the FIFO queue is
+  // the DEGRADE path for an older orchestrator whose ack omits `ack.provider`
+  // (resolve to the oldest still-pending request of that kind).
+  const beginInFlight = new Set();
+  const signoutInFlight = new Set();
+  const beginQueue = [];
+  const signoutQueue = [];
+
+  // Resolve which provider an oauth_begin/signout ack belongs to: prefer the
+  // provider the orchestrator echoed (correlation — route straight to that row),
+  // else fall back to the oldest still-pending request of that kind (older-
+  // orchestrator compatibility, whose ack omits `ack.provider`).
+  function resolveAckProvider(ack, inFlight, queue) {
+    const echoed = typeof ack.provider === "string" ? ack.provider : null;
+    if (echoed) {
+      // Trust the echoed id and clear any tracking we held for it.
+      inFlight.delete(echoed);
+      const qi = queue.indexOf(echoed);
+      if (qi !== -1) queue.splice(qi, 1);
+      return echoed;
+    }
+    // No provider on the ack (older orchestrator) — degrade to FIFO order.
+    const id = queue.shift() || null;
+    if (id) inFlight.delete(id);
+    return id;
+  }
+
+  function oauthEntry(id) {
+    let entry = oauthEntries.get(id);
+    if (!entry) {
+      const rowEl = document.createElement("div");
+      rowEl.style.cssText = "margin-bottom:12px";
+      entry = { rowEl, state: { status: "signed_out", busy: false, error: null } };
+      oauthEntries.set(id, entry);
+    }
+    return entry;
+  }
+
+  function stopOauthPolling() {
+    if (oauthPollTimer) {
+      clearInterval(oauthPollTimer);
+      oauthPollTimer = null;
+    }
+  }
+  function startOauthPolling() {
+    if (oauthPollTimer) return;
+    oauthPollTimer = setInterval(() => {
+      client?.sendFrame?.({ type: "oauth_status" });
+    }, 3000);
+  }
+
+  function paintOauthRow(p) {
+    const entry = oauthEntry(p.id);
+    const { rowEl, state } = entry;
+    rowEl.replaceChildren();
+
+    const label = document.createElement("div");
+    label.style.cssText = "font-weight:500;margin-bottom:4px";
+    label.textContent = p.label;
+    rowEl.appendChild(label);
+
+    if (state.status === "signed_in") {
+      const info = document.createElement("div");
+      info.style.cssText = "display:flex;align-items:center;gap:8px;flex-wrap:wrap";
+      const who = document.createElement("span");
+      who.style.cssText = "opacity:.75;font-size:12px";
+      who.textContent = state.accountLabel ? `Signed in as ${state.accountLabel}` : "Signed in";
+      const signOutBtn = document.createElement("button");
+      signOutBtn.type = "button";
+      signOutBtn.className = "cmcp-btn";
+      signOutBtn.textContent = "Sign out";
+      signOutBtn.disabled = !!state.busy;
+      signOutBtn.onclick = () => beginOauthSignout(p);
+      info.append(who, signOutBtn);
+      rowEl.appendChild(info);
+    } else if (state.status === "pending_device") {
+      const code = document.createElement("code");
+      code.className = "cmcp-cmd";
+      code.style.cssText = "display:inline-block;font-size:15px;letter-spacing:1px;margin-bottom:6px";
+      code.textContent = state.userCode || "";
+      rowEl.appendChild(code);
+      const urlRow = document.createElement("div");
+      urlRow.style.cssText = "display:flex;align-items:center;gap:6px;margin-bottom:4px;flex-wrap:wrap";
+      const url = String(state.verificationUrl || "");
+      if (/^https:\/\//i.test(url)) {
+        const link = document.createElement("a");
+        link.href = url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.style.cssText = "color:#8ab4f8;word-break:break-all;font-size:12px";
+        link.textContent = url;
+        urlRow.appendChild(link);
+      } else if (url) {
+        const span = document.createElement("span");
+        span.style.cssText = "font-size:12px;word-break:break-all";
+        span.textContent = url;
+        urlRow.appendChild(span);
+      }
+      if (url) {
+        const copyBtn = document.createElement("button");
+        copyBtn.type = "button";
+        copyBtn.className = "cmcp-btn";
+        copyBtn.style.cssText = "padding:2px 8px;font-size:11px";
+        copyBtn.textContent = "Copy URL";
+        copyBtn.onclick = () => {
+          navigator.clipboard?.writeText(url).then(
+            () => { copyBtn.textContent = "Copied ✓"; setTimeout(() => { copyBtn.textContent = "Copy URL"; }, 1200); },
+            () => {},
+          );
+        };
+        urlRow.appendChild(copyBtn);
+      }
+      rowEl.appendChild(urlRow);
+      const waiting = document.createElement("div");
+      waiting.style.cssText = "opacity:.65;font-size:11px";
+      waiting.textContent = "Waiting for approval…";
+      rowEl.appendChild(waiting);
+    } else if (state.status === "pending_loopback") {
+      const waiting = document.createElement("div");
+      waiting.style.cssText = "opacity:.75;font-size:12px";
+      waiting.textContent = "A browser window opened — finish sign-in there…";
+      rowEl.appendChild(waiting);
+    } else {
+      const signInBtn = document.createElement("button");
+      signInBtn.type = "button";
+      signInBtn.className = "cmcp-btn";
+      signInBtn.textContent = `Sign in with ${p.label}`;
+      signInBtn.disabled = !!state.busy;
+      signInBtn.onclick = () => beginOauthSignin(p);
+      rowEl.appendChild(signInBtn);
+    }
+
+    if (state.error) {
+      const err = document.createElement("div");
+      err.style.cssText = "color:#f28b82;font-size:11px;margin-top:4px";
+      err.textContent = state.error;
+      rowEl.appendChild(err);
+    }
+  }
+
+  function beginOauthSignin(p) {
+    const entry = oauthEntry(p.id);
+    entry.state = { status: entry.state.status, busy: true, error: null };
+    paintOauthRow(p);
+    const ok = client?.sendFrame?.({
+      type: "oauth_begin",
+      provider: p.id,
+      ...(p.experimental ? { allow_experimental: true } : {}),
+    });
+    if (!ok) {
+      entry.state = { status: "signed_out", busy: false, error: "Not connected — reconnect the panel first." };
+      paintOauthRow(p);
+      return;
+    }
+    beginInFlight.add(p.id);
+    beginQueue.push(p.id);
+  }
+
+  function beginOauthSignout(p) {
+    const entry = oauthEntry(p.id);
+    entry.state = { ...entry.state, busy: true, error: null };
+    paintOauthRow(p);
+    const ok = client?.sendFrame?.({ type: "oauth_signout", provider: p.id });
+    if (!ok) {
+      entry.state = { ...entry.state, busy: false, error: "Not connected — reconnect the panel first." };
+      paintOauthRow(p);
+      return;
+    }
+    signoutInFlight.add(p.id);
+    signoutQueue.push(p.id);
+  }
+
+  function applyOauthStatus(providers) {
+    oauthError(""); // a good status probe clears any prior "couldn't load" error
+    const signedIn = new Map((Array.isArray(providers) ? providers : []).map((r) => [r.provider, r]));
+    let anyPending = false;
+    for (const p of CMCP_OAUTH_PROVIDERS) {
+      const entry = oauthEntry(p.id);
+      const rec = signedIn.get(p.id);
+      if (rec) {
+        entry.state = { status: "signed_in", accountLabel: rec.account_label, busy: false, error: null };
+      } else if (entry.state.status === "pending_device" || entry.state.status === "pending_loopback") {
+        anyPending = true; // still mid-flow — leave the waiting card up
+      } else if (entry.state.status !== "signed_out" || entry.state.busy) {
+        entry.state = { status: "signed_out", busy: false, error: entry.state.error || null };
+      }
+      paintOauthRow(p);
+    }
+    if (anyPending) startOauthPolling();
+    else stopOauthPolling();
+  }
+
+  // Wired into the shared bridge client's onAck/onBackends callbacks (see the
+  // big createBridgeClient({...}) call) so acks routed there while this card
+  // is open land here instead of being silently ignored.
+  cmcpOauthOnAck = (ack) => {
+    if (ack.kind === "oauth_status") {
+      if (ack.ok) {
+        applyOauthStatus(ack.providers);
+      } else {
+        // Fix 2: surface a failed status probe instead of ignoring it — put the
+        // error on the section header row so the user isn't left staring at
+        // stale/blank rows with no explanation.
+        oauthError(ack.message || "Couldn't load sign-in status.");
+      }
+      return;
+    }
+    if (ack.kind === "oauth_begin") {
+      const id = resolveAckProvider(ack, beginInFlight, beginQueue);
+      const p = CMCP_OAUTH_PROVIDERS.find((x) => x.id === id);
+      if (!p) return;
+      const entry = oauthEntry(id);
+      if (!ack.ok) {
+        entry.state = { status: "signed_out", busy: false, error: ack.message || "Sign-in failed." };
+        paintOauthRow(p);
+        return;
+      }
+      if (ack.mode === "device") {
+        entry.state = { status: "pending_device", busy: false, error: null, userCode: ack.user_code, verificationUrl: ack.verification_url };
+      } else {
+        entry.state = { status: "pending_loopback", busy: false, error: null };
+      }
+      paintOauthRow(p);
+      startOauthPolling();
+      return;
+    }
+    if (ack.kind === "oauth_signout") {
+      const id = resolveAckProvider(ack, signoutInFlight, signoutQueue);
+      const p = CMCP_OAUTH_PROVIDERS.find((x) => x.id === id);
+      if (!p) return;
+      const entry = oauthEntry(id);
+      if (!ack.ok) {
+        entry.state = { ...entry.state, busy: false, error: ack.message || "Sign-out failed." };
+      } else {
+        entry.state = { status: "signed_out", busy: false, error: null };
+      }
+      paintOauthRow(p);
+    }
+  };
+  // A fresh readiness push follows a sign-in/out landing in the background
+  // (see the orchestrator's pushReadiness) — re-poll status so this card
+  // reflects it even if oauth_begin's own reply already resolved.
+  cmcpOauthOnBackendsPush = () => {
+    client?.sendFrame?.({ type: "oauth_status" });
+  };
+
+  for (const p of CMCP_OAUTH_PROVIDERS.filter((x) => !x.experimental)) {
+    paintOauthRow(p);
+    oauthSection.appendChild(oauthEntry(p.id).rowEl);
+  }
+  const experimentalProviders = CMCP_OAUTH_PROVIDERS.filter((x) => x.experimental);
+  if (experimentalProviders.length) {
+    const expHeader = document.createElement("div");
+    expHeader.style.cssText = "font-weight:600;margin:10px 0 2px;font-size:12px;opacity:.85";
+    expHeader.textContent = "Experimental";
+    oauthSection.appendChild(expHeader);
+    const expNote = document.createElement("div");
+    expNote.style.cssText = "opacity:.6;font-size:11px;margin-bottom:8px";
+    expNote.textContent = "Signs in as VS Code — against GitHub's Copilot API terms; use at your own risk.";
+    oauthSection.appendChild(expNote);
+    for (const p of experimentalProviders) {
+      paintOauthRow(p);
+      oauthSection.appendChild(oauthEntry(p.id).rowEl);
+    }
+  }
+  // Prime with whatever status the orchestrator already has.
+  client?.sendFrame?.({ type: "oauth_status" });
+
+  backdrop.appendChild(card);
+  document.body.appendChild(backdrop);
+}
+// Minimal HTML-escape for the credentials card (labels/masked previews are trusted
+// server strings, but escape defensively so a stray < can't break layout).
+function esc2(s) {
+  return String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
 // ---------------------------------------------------------------------------
 // localStorage-backed settings.
 // ---------------------------------------------------------------------------
@@ -125,6 +549,8 @@ const DEFAULT_BRIDGE_URL_BY_BACKEND = {
   claude: DEFAULT_BRIDGE_URL,
   codex: DEFAULT_BRIDGE_URL,
   gemini: DEFAULT_BRIDGE_URL,
+  grok: DEFAULT_BRIDGE_URL,
+  kimi: DEFAULT_BRIDGE_URL,
   ollama: DEFAULT_BRIDGE_URL,
 };
 function defaultBridgeUrlFor(backend) {
@@ -400,6 +826,8 @@ const SETTING_MODEL = {
   claude: "comfyui-mcp.defaultModel.claude",
   codex: "comfyui-mcp.defaultModel.codex",
   gemini: "comfyui-mcp.defaultModel.gemini",
+  grok: "comfyui-mcp.defaultModel.grok",
+  kimi: "comfyui-mcp.defaultModel.kimi",
   ollama: "comfyui-mcp.defaultModel.ollama",
   openrouter: "comfyui-mcp.defaultModel.openrouter",
   lmstudio: "comfyui-mcp.defaultModel.lmstudio",
@@ -410,6 +838,8 @@ const SETTING_EFFORT = {
   claude: "comfyui-mcp.defaultEffort.claude",
   codex: "comfyui-mcp.defaultEffort.codex",
   gemini: "comfyui-mcp.defaultEffort.gemini",
+  grok: "comfyui-mcp.defaultEffort.grok",
+  kimi: "comfyui-mcp.defaultEffort.kimi",
   ollama: "comfyui-mcp.defaultEffort.ollama",
   openrouter: "comfyui-mcp.defaultEffort.openrouter",
   lmstudio: "comfyui-mcp.defaultEffort.lmstudio",
@@ -428,6 +858,8 @@ const SETTING_BRIDGE_URL = {
   claude: "comfyui-mcp.bridgeUrl.claude",
   codex: "comfyui-mcp.bridgeUrl.codex",
   gemini: "comfyui-mcp.bridgeUrl.gemini",
+  grok: "comfyui-mcp.bridgeUrl.grok",
+  kimi: "comfyui-mcp.bridgeUrl.kimi",
   ollama: "comfyui-mcp.bridgeUrl.ollama",
   openrouter: "comfyui-mcp.bridgeUrl.openrouter",
   lmstudio: "comfyui-mcp.bridgeUrl.lmstudio",
@@ -482,10 +914,10 @@ const SETTINGS_SEEDED_KEY = "comfyui-mcp.panel.settingsSeeded";
 // per-backend groups (runs independently of SETTINGS_SEEDED_KEY).
 const SETTINGS_GROUPS_MIGRATED_KEY = "comfyui-mcp.panel.settingsGroupsMigrated";
 // Section (sub-category) labels for the grouped Settings dialog, per backend.
-const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)", gemini: "Gemini", ollama: "Ollama (local)", openrouter: "OpenRouter", lmstudio: "LM Studio (local)", llamacpp: "llama.cpp (local)", custom: "Custom endpoint" };
+const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)", gemini: "Gemini", grok: "Grok", kimi: "Kimi", ollama: "Ollama (local)", openrouter: "OpenRouter", lmstudio: "LM Studio (local)", llamacpp: "llama.cpp (local)", custom: "Custom endpoint" };
 // Backend display names at module scope (the Settings dialog's render-fns live
 // outside buildPanel's closure, so they need their own copy).
-const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint" };
+const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", grok: "Grok", kimi: "Kimi", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint" };
 // The allowlisted secure-store keys (mirrors the orchestrator's #59 allowlist).
 const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
 
@@ -531,7 +963,7 @@ const settingsBackendState = {
 // render-fns when the dialog opens, so a freshly-arrived catalog can repaint the
 // matching backend's dropdown in place (a render-fn setting has no static options
 // to re-key). Keyed by backend; null when that group isn't mounted.
-const settingsModelSelectEls = { claude: null, codex: null, gemini: null, ollama: null, openrouter: null, lmstudio: null, llamacpp: null, custom: null };
+const settingsModelSelectEls = { claude: null, codex: null, gemini: null, grok: null, kimi: null, ollama: null, openrouter: null, lmstudio: null, llamacpp: null, custom: null };
 // Disabled placeholder <option> value — mapped to "" (Auto) if ever selected so
 // it can never persist as a bogus model id.
 const SETTINGS_PLACEHOLDER = "__cmcp_placeholder__";
@@ -543,7 +975,7 @@ function currentSettingsBackend() {
   const b = getSetting(SETTING_BACKEND);
   // Every selectable backend counts — this list lagging a provider addition
   // silently stops that provider's Settings edits from driving the live panel.
-  return ["codex", "gemini", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"].includes(b) ? b : "claude";
+  return ["codex", "gemini", "grok", "kimi", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"].includes(b) ? b : "claude";
 }
 /** Fetched model rows for `backend` (the same presentable catalog the composer
  *  picker uses), or null when none is cached (backend never connected this session). */
@@ -991,6 +1423,8 @@ function panelSettingsList() {
         { value: "claude", text: "Claude" },
         { value: "codex", text: "ChatGPT" },
         { value: "gemini", text: "Gemini" },
+        { value: "grok", text: "Grok" },
+        { value: "kimi", text: "Kimi" },
         { value: "ollama", text: "Ollama (local)" },
         { value: "openrouter", text: "OpenRouter (1M · SOTA)" },
         { value: "lmstudio", text: "LM Studio (local)" },
@@ -1169,6 +1603,11 @@ function panelSettingsList() {
     // ---- Gemini (Default model, Default reasoning effort) ----
     modelSetting("gemini", 90),
     effortSetting("gemini", 85),
+    // ---- Grok (Default model, Default reasoning effort) ----
+    modelSetting("grok", 80),
+    effortSetting("grok", 75),
+    modelSetting("kimi", 76),
+    effortSetting("kimi", 72),
     // ---- Ollama (local) (Default model; no effort scale) ----
     modelSetting("ollama", 70),
     {
@@ -1295,6 +1734,9 @@ const BACKEND_EFFORTS = {
   claude: ["low", "medium", "high", "xhigh", "max"],
   codex: ["none", "minimal", "low", "medium", "high", "xhigh"],
   gemini: [],
+  // Grok rides the ACP CLI like gemini — no user-facing reasoning-effort scale.
+  grok: [],
+  kimi: [],
   // Ollama local models expose no reasoning-effort control — selector hidden.
   ollama: [],
   // OpenRouter rides the same backend as ollama — no effort control either.
@@ -5387,13 +5829,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   // `codex app-server` cold-starts much slower than Claude's Agent SDK, so it gets
   // ~3x the window. This is the escalation THRESHOLD only — the respawn/reclaim
   // BOUNDS (MAX_AUTO_RESPAWNS / MAX_AUTO_RECLAIMS) are untouched.
-  const RESPAWN_AFTER_BY_BACKEND = { codex: 6, gemini: 6, ollama: 6, claude: 2 };
+  const RESPAWN_AFTER_BY_BACKEND = { codex: 6, gemini: 6, grok: 6, kimi: 6, ollama: 6, claude: 2 };
   function respawnAfterAttempts() {
     return RESPAWN_AFTER_BY_BACKEND[backendNow()] ?? 2;
   }
   // Failed (re)connect attempts ridden out as a steady "connecting" before a
   // terminal "disconnected". Backend-aware, ~3x for Codex's slower cold start.
-  const CONNECT_PATIENCE_BY_BACKEND = { codex: 12, gemini: 12, ollama: 12, claude: 4 };
+  const CONNECT_PATIENCE_BY_BACKEND = { codex: 12, gemini: 12, grok: 12, kimi: 12, ollama: 12, claude: 4 };
   function connectPatienceAttempts() {
     return CONNECT_PATIENCE_BY_BACKEND[backendNow()] ?? 4;
   }
@@ -5408,7 +5850,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   // so it gets a wider window before we treat the open socket as wedged (FIX 2).
   // Ollama gets the long handshake too: a cold model load into VRAM can take
   // tens of seconds before the first token.
-  const HANDSHAKE_MS_BY_BACKEND = { codex: 45000, gemini: 45000, ollama: 45000, claude: 20000 };
+  const HANDSHAKE_MS_BY_BACKEND = { codex: 45000, gemini: 45000, grok: 45000, kimi: 45000, ollama: 45000, claude: 20000 };
   function handshakeMs() {
     return HANDSHAKE_MS_BY_BACKEND[backendNow()] ?? 20000;
   }
@@ -6869,7 +7311,15 @@ function buildPanel() {
   // ChatGPT). Clicking one asks the pack to ensure that backend's orchestrator is
   // running and returns the bridge URL to connect to — the user never types a
   // port. Populated from GET /comfyui_mcp_panel/backends when settings open.
-  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint" };
+  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", grok: "Grok", kimi: "Kimi", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" };
+  // Appends a visible "(experimental)" marker to a backend's display label when
+  // the readiness data flags it (b.experimental, e.g. Copilot — device-code,
+  // GitHub ToS risk). Keeps picking it a deliberate, informed act everywhere a
+  // provider name is rendered, not just in the sign-in credentials card.
+  function backendDisplayLabel(id, b) {
+    const label = BACKEND_LABELS[id] || id;
+    return b && b.experimental ? `${label} (experimental)` : label;
+  }
   const backendLabel = document.createElement("label");
   backendLabel.className = "cmcp-label";
   backendLabel.textContent = "Agent backend";
@@ -6905,7 +7355,7 @@ function buildPanel() {
   // (GET /backends, blind to the laptop behind a remote pod) must not override it.
   let readinessFromOrchestrator = false;
   // Short per-provider hint shown under each provider row in the popup.
-  const BACKEND_HINTS = { claude: "Fable · Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)", lmstudio: "Local LLMs · no account", llamacpp: "Local LLMs · no account", custom: "Any OpenAI-compatible server" };
+  const BACKEND_HINTS = { claude: "Fable · Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", grok: "Grok Composer · Build", kimi: "Kimi (Moonshot)", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)", lmstudio: "Local LLMs · no account", llamacpp: "Local LLMs · no account", custom: "Any OpenAI-compatible server" };
 
   // Hint for a provider that exists but isn't usable yet — distinguishes
   // "install the CLI" from "sign in". Empty when ready or readiness is unknown.
@@ -6925,6 +7375,8 @@ function buildPanel() {
     }
     if (b.backend === "codex") return "Not signed in — run: codex login";
     if (b.backend === "gemini") return "Not signed in — run: gemini (then sign in with Google)";
+    if (b.backend === "grok") return "Not signed in — run: grok";
+    if (b.backend === "kimi") return "Not signed in — run: kimi (then sign in)";
     if (b.backend === "ollama") return "Ollama not running — run: ollama serve";
     if (b.backend === "lmstudio") return "LM Studio server not running — LM Studio → Developer → Start Server";
     if (b.backend === "llamacpp") return "llama-server not running — llama-server -m model.gguf --jinja -c 16384";
@@ -6946,7 +7398,7 @@ function buildPanel() {
       chip.type = "button";
       chip.className = "cmcp-btn cmcp-backend-chip";
       chip.dataset.backend = id;
-      chip.textContent = BACKEND_LABELS[id] || id;
+      chip.textContent = backendDisplayLabel(id, b);
       const hint = notReadyHint(b);
       if (hint) {
         chip.title = hint;
@@ -6957,6 +7409,15 @@ function buildPanel() {
       if (id === selectedBackend) {
         chip.style.cssText =
           "background:var(--p-primary-color,#2563eb);color:var(--p-primary-contrast-color,#fff);border-color:transparent;";
+      }
+      if (b.experimental) {
+        // Applied AFTER the selected-background cssText above (which would
+        // otherwise wipe it via a full style reset) — an amber outline that
+        // stays visible whether or not the backend is selected/ready, so
+        // picking a ToS-risk provider is always a deliberate, informed act.
+        chip.style.borderColor = "var(--p-orange-500,#f59e0b)";
+        if (id !== selectedBackend) chip.style.color = "var(--p-orange-500,#f59e0b)";
+        if (!hint) chip.title = "Experimental — signs in as VS Code, against GitHub's Copilot API terms";
       }
       chip.addEventListener("click", () => connectBackend(id));
       backendChips.appendChild(chip);
@@ -7009,9 +7470,23 @@ function buildPanel() {
   saveBtn.title = "Re-open the bridge connection at the URL above";
   saveBtn.style.opacity = "0.8";
 
+  // Opens the orchestrator's credentials console (API keys) in an in-panel
+  // iframe overlay — see cmcpOpenCredentialsFrame. Same cmcp-btn idiom as
+  // Connect/Disconnect/Reconnect above.
+  const apiKeysBtn = document.createElement("button");
+  apiKeysBtn.className = "cmcp-btn";
+  apiKeysBtn.type = "button";
+  apiKeysBtn.textContent = "API Keys";
+  apiKeysBtn.title = "Open the credentials console";
+  apiKeysBtn.style.opacity = "0.8";
+  apiKeysBtn.addEventListener("click", () => {
+    settingsBox.hidden = true;
+    cmcpOpenCredentialsFrame(client);
+  });
+
   const btnRow = document.createElement("div");
   btnRow.style.cssText = "display:flex;gap:0.375rem;align-items:center;flex-wrap:wrap;";
-  btnRow.append(connectBtn, disconnectBtn, saveBtn);
+  btnRow.append(connectBtn, disconnectBtn, saveBtn, apiKeysBtn);
 
   const helpDiv = document.createElement("div");
   helpDiv.className = "cmcp-help";
@@ -7129,6 +7604,8 @@ function buildPanel() {
     claude: { label: "Claude", install: "npm i -g @anthropic-ai/claude-code", login: "claude auth login" },
     codex: { label: "ChatGPT", install: "npm i -g @openai/codex", login: "codex login" },
     gemini: { label: "Gemini", install: "npm i -g @google/gemini-cli", login: "gemini" },
+    grok: { label: "Grok", install: "install the Grok CLI (Grok Build / xAI)", login: "grok" },
+    kimi: { label: "Kimi", install: "install the Kimi CLI (Moonshot)", login: "kimi" },
     // No sign-in — "login" is pulling OUR FINE-TUNE: gemma4 QLoRA-trained on
     // 1,055 server-verified comfyui-mcp trajectories (hf.co/artokun/
     // gemma4-comfyui-mcp) — it knows this tool suite natively. :e2b fits
@@ -7171,7 +7648,7 @@ function buildPanel() {
     sub.textContent =
       "The agent runs on YOUR machine on your own Claude, ChatGPT, or Gemini subscription — no API keys. Set up a provider (Node ≥ 22), start the agent with the command below, then click Connect.";
     onboard.append(title, sub);
-    for (const id of ["claude", "codex", "gemini", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"]) {
+    for (const id of ["claude", "codex", "gemini", "grok", "kimi", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"]) {
       const meta = PROVIDER_SETUP[id];
       const st = list.find((b) => b.backend === id) || {};
       const col = document.createElement("div");
@@ -7254,7 +7731,11 @@ function buildPanel() {
     if (!anyReady || autoPickDone) return;
     const sel = list.find((b) => b.backend === selectedBackend);
     if (sel && sel.ready === false) {
-      const ready = list.find((b) => b.ready);
+      // Never auto-pick an experimental backend (b.experimental, e.g. Copilot) —
+      // those must only become active via explicit user selection in the provider
+      // picker, not silently behind the user's back. (The fork also gates on its
+      // provider on/off toggle — that feature rides another port PR.)
+      const ready = list.find((b) => b.ready && !b.experimental);
       if (ready) {
         autoPickDone = true;
         const prevLabel = BACKEND_LABELS[selectedBackend] || selectedBackend;
@@ -7832,6 +8313,8 @@ function buildPanel() {
         onPick();
       });
       modelPop.appendChild(el);
+      // Return the row so callers can decorate it (e.g. the experimental tint).
+      return el;
     };
 
     // PROVIDER — pick Claude or ChatGPT right here (the switcher used to live in
@@ -7849,8 +8332,11 @@ function buildPanel() {
         // agent to help you install/sign in instead of failing a connect.
         const small = notReady ? `Tap to set up — ${hint}` : BACKEND_HINTS[id] || (id === activeBackend ? "connected" : b.running ? "running" : "");
         // cmcp-provider: the NAME never shrinks; a long hint truncates instead
-        // (a long hint used to collapse "Ollama" to nothing).
-        item({ label: BACKEND_LABELS[id] || id, small, cls: "cmcp-provider" }, id === activeBackend, () => {
+        // (a long hint used to collapse "Ollama" to nothing). backendDisplayLabel
+        // appends "(experimental)" for ToS-risk backends (e.g. Copilot) so picking
+        // one from this — the main provider picker — is always an informed act,
+        // not just in the sign-in credentials card.
+        const row = item({ label: backendDisplayLabel(id, b), small, cls: "cmcp-provider" }, id === activeBackend, () => {
           modelPop.hidden = true;
           if (notReady) {
             requestProviderSetup(id);
@@ -7858,6 +8344,10 @@ function buildPanel() {
             connectBackend(id);
           }
         });
+        // Experimental backends render tinted so the risk reads at a glance.
+        // (The fork's provider on/off ✕ / hidden-row UI rides its per-workflow
+        // sessions stack — not ported here.)
+        if (b.experimental && row) row.style.color = "var(--p-orange-500,#f59e0b)";
       }
     }
 
@@ -9481,13 +9971,28 @@ function buildPanel() {
       sdkCommands = Array.isArray(list) ? list : [];
     },
     onBackends(data) {
+      // Capture the console URL/token for the "API Keys" credentials frame (see
+      // cmcpOpenCredentialsFrame) — sent alongside backends/any_ready.
+      if (data && typeof data.console_url === "string") cmcpConsoleUrl = data.console_url;
+      if (data && typeof data.console_token === "string") cmcpConsoleToken = data.console_token;
       // Authoritative readiness from the connected orchestrator — the machine that
       // runs the agents. Wins over the ComfyUI-side probe (which false-flags "CLI
       // not installed" behind a remote pod). Repaint the chips so hints refresh.
       applyReadiness(data, { fromOrchestrator: true });
       renderBackendChips(Array.isArray(data.backends) ? data.backends : knownBackends);
+      // A sign-in/out that just landed pushes a fresh backends frame — nudge an
+      // open credentials card to re-poll oauth_status (see cmcpOpenCredentialsFrame).
+      cmcpOauthOnBackendsPush?.();
     },
     onAck(ack) {
+      // In-panel OAuth acks (oauth_begin/oauth_status/oauth_signout) are routed
+      // to whichever credentials card is currently open — see
+      // cmcpOpenCredentialsFrame's onclick handlers. Nothing to do here if no
+      // card is open (the hook is null); the card re-primes on open anyway.
+      if (ack && typeof ack.kind === "string" && ack.kind.startsWith("oauth_")) {
+        cmcpOauthOnAck?.(ack);
+        return;
+      }
       // Receipt: orchestrator got it (not dropped) → cancel the failure timer.
       // The bubble stays QUEUED (muted) until the agent actually reads it.
       if (ack?.kind === "working" && typeof ack.mid === "string") {
@@ -10129,7 +10634,7 @@ function buildPanel() {
   // backend's handshake window (handshakeMs()) so a healthy slow reload completes
   // on its own backoff before the guard releases — Codex's app-server handshake is
   // 45s, so its guard is ~50s; Claude keeps 28s (still > its 20s handshake).
-  const SOFT_RELOAD_GUARD_MS_BY_BACKEND = { codex: 50000, gemini: 50000, ollama: 50000, claude: 28000 };
+  const SOFT_RELOAD_GUARD_MS_BY_BACKEND = { codex: 50000, gemini: 50000, grok: 50000, kimi: 50000, ollama: 50000, claude: 28000 };
   function softReloadGuardMs() {
     return SOFT_RELOAD_GUARD_MS_BY_BACKEND[selectedBackend] ?? 28000;
   }
@@ -10146,7 +10651,7 @@ function buildPanel() {
   // normal cold-start handshake (handshakeMs()) so a healthy-but-slow reload is
   // never pre-empted — Codex (45s handshake) escalates at ~40s, comfortably under
   // its ~50s guard; Claude keeps 11s (under its 28s guard and > its 20s handshake).
-  const SOFT_RELOAD_ESCALATE_MS_BY_BACKEND = { codex: 40000, gemini: 40000, ollama: 40000, claude: 11000 };
+  const SOFT_RELOAD_ESCALATE_MS_BY_BACKEND = { codex: 40000, gemini: 40000, grok: 40000, kimi: 40000, ollama: 40000, claude: 11000 };
   function softReloadEscalateMs() {
     return SOFT_RELOAD_ESCALATE_MS_BY_BACKEND[selectedBackend] ?? 11000;
   }
