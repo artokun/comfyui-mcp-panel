@@ -6675,6 +6675,35 @@ const PANEL_CSS = `
 .cmcp-spin i { animation: cmcp-spin 0.8s linear infinite; }
 @keyframes cmcp-spin { to { transform: rotate(360deg); } }
 
+/* ---- second header row: agent-feed gates + (soon) explorers ---- */
+/* Slightly tinted vs the header so it reads as a distinct utility strip. */
+.cmcp-toolbar {
+  display: flex; align-items: center; gap: 0.375rem;
+  padding: 0.3125rem 0.75rem;
+  background: color-mix(in srgb, var(--p-surface-800, #27272a) 55%, transparent);
+  border-bottom: 1px solid var(--p-content-border-color, #3f3f46);
+}
+.cmcp-toolbtn {
+  display: inline-flex; align-items: center; gap: 0.3125rem;
+  background: transparent; border: none; cursor: pointer;
+  border-radius: var(--p-border-radius-sm, 4px);
+  padding: 0.25rem 0.5rem;
+  font: inherit; font-size: 0.6875rem;
+  color: var(--p-text-muted-color, #a1a1aa);
+  transition: background 0.15s, color 0.15s;
+}
+.cmcp-toolbtn:hover { background: var(--p-surface-700, #3f3f46); color: var(--p-text-color, #fff); }
+.cmcp-toolbtn .pi { font-size: 0.8125rem; }
+.cmcp-toolbtn svg { width: 13px; height: 13px; display: block; }
+/* Engaged gates get a colored tint so their state is readable at a glance. */
+.cmcp-toolbtn.gate-on-mute { color: var(--p-red-400, #f87171); }
+.cmcp-toolbtn.gate-on-mute .pi { animation: cmcp-pulse 1s ease-in-out infinite; }
+.cmcp-toolbtn.gate-on-blind { color: var(--p-amber-400, #fbbf24); }
+.cmcp-toolbtn:disabled, .cmcp-toolbtn[data-soon] {
+  opacity: 0.38; cursor: default;
+}
+.cmcp-toolbtn[data-soon]:hover { background: transparent; color: var(--p-text-muted-color, #a1a1aa); }
+
 .cmcp-settings {
   margin: 0.625rem 0.75rem 0;
   border: 1px solid var(--p-content-border-color, #3f3f46);
@@ -7698,6 +7727,14 @@ function buildPanel() {
   histPop.hidden = true;
   header.append(logo, title, actions, status, histPop);
   root.appendChild(header);
+
+  // ── Utility strip (row 2): agent-feed gates now live here instead of
+  // crowding the composer; future integrations (Civitai explorer, …) join it.
+  // Buttons are appended by the sections that own their logic (feed gates are
+  // wired next to the composer's context ring, which they also tint).
+  const toolbar = document.createElement("div");
+  toolbar.className = "cmcp-toolbar";
+  root.appendChild(toolbar);
 
   // Panel preferences (model/effort/storyboard toggle/…), localStorage-backed.
   // Declared up here so the settings UI below can read/write it (e.g. the
@@ -8979,21 +9016,43 @@ function buildPanel() {
   fileInput.multiple = true;
   fileInput.hidden = true;
 
-  // ── Mute / Blind agent-feed toggles (next to the context ring) ────────────
-  const muteBtn = document.createElement("button");
-  muteBtn.type = "button";
-  muteBtn.title = "Mute agents — feed NOTHING to any agent (images, renders, observations)";
-  muteBtn.style.cssText = "background:none;border:none;cursor:pointer;font-size:13px;padding:0 1px";
-  const blindBtn = document.createElement("button");
-  blindBtn.type = "button";
-  blindBtn.title = "Blind agents — they still get text/results but NEVER image pixels (ToS-safe)";
-  blindBtn.style.cssText = "background:none;border:none;cursor:pointer;font-size:13px;padding:0 1px";
+  // ── Mute / Blind agent-feed toggles — live on the header utility strip
+  // (row 2), not the composer; they still tint the composer's context ring so
+  // "why is the ring red" answers itself. PrimeIcons only (already bundled).
+  function toolbarBtn(icon, label) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "cmcp-toolbtn";
+    const i = document.createElement("i");
+    i.className = `pi ${icon}`;
+    const span = document.createElement("span");
+    span.textContent = label;
+    b.append(i, span);
+    return b;
+  }
+  const muteBtn = toolbarBtn("pi-volume-up", "Mute");
+  const blindBtn = toolbarBtn("pi-eye", "Blind");
   function reflectFeedGates() {
-    muteBtn.textContent = AGENT_MUTED ? "🔇" : "🔈";
-    muteBtn.style.opacity = AGENT_MUTED ? "1" : ".5";
-    muteBtn.style.animation = AGENT_MUTED ? "cmcp-pulse 1s ease-in-out infinite" : "none";
-    blindBtn.textContent = AGENT_BLIND ? "🙈" : "👁";
-    blindBtn.style.opacity = AGENT_BLIND ? "1" : ".5";
+    const mi = muteBtn.querySelector(".pi");
+    mi.className = `pi ${AGENT_MUTED ? "pi-volume-off" : "pi-volume-up"}`;
+    muteBtn.classList.toggle("gate-on-mute", AGENT_MUTED);
+    muteBtn.querySelector("span").textContent = AGENT_MUTED ? "Muted" : "Mute";
+    muteBtn.title = AGENT_MUTED
+      ? "Agent feed: MUTED — no renders, images, errors, or canvas events reach any agent right now. " +
+        "Messages you type still go through normally. Click to restore the live feed."
+      : "Agent feed: live. The agent automatically hears about canvas activity — finished renders, " +
+        "execution errors, graph changes. Click to MUTE: nothing is fed to any agent until you unmute " +
+        "(your typed messages still work). Use it to work on the canvas without the agent reacting.";
+    const bi = blindBtn.querySelector(".pi");
+    bi.className = `pi ${AGENT_BLIND ? "pi-eye-slash" : "pi-eye"}`;
+    blindBtn.classList.toggle("gate-on-blind", AGENT_BLIND);
+    blindBtn.querySelector("span").textContent = AGENT_BLIND ? "Blind" : "Blind";
+    blindBtn.title = AGENT_BLIND
+      ? "Image feed: BLIND — the agent still gets text notifications about renders and results, but " +
+        "NEVER receives the image pixels. Click to allow images again."
+      : "Image feed: on — the agent can receive the actual pixels of finished renders (to verify its " +
+        "work, judge quality, etc.). Click for BLIND mode: it keeps getting text notifications and " +
+        "results but never the images — for content you'd rather no cloud model ever sees.";
     try {
       const fg = ring.querySelector(".fg");
       if (fg) fg.style.stroke = AGENT_MUTED ? "#e5484d" : "";
@@ -9005,7 +9064,44 @@ function buildPanel() {
   ring.style.cursor = "pointer"; ring.onclick = muteBtn.onclick; // clicking the ring toggles mute
   reflectFeedGates();
 
-  row.append(ring, muteBtn, blindBtn, ctxLabel, modelChip, spacer, attachBtn, micBtn, sendBtn);
+  // Civitai explorer — parked slot on the strip (greyed until it ships).
+  // Mark: Civitai's hexagon-C, monochrome via currentColor (no brand gradients,
+  // no event attrs — keeps the registry's SVG YARA gate happy).
+  const civitaiBtn = toolbarBtn("pi-circle", "Civitai");
+  civitaiBtn.querySelector(".pi").remove();
+  civitaiBtn.dataset.soon = "1";
+  civitaiBtn.setAttribute("aria-disabled", "true");
+  civitaiBtn.title = "Civitai explorer — browse and pull models, LoRAs, and workflows without leaving the panel. Coming soon.";
+  {
+    const svgNs = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(svgNs, "svg");
+    svg.setAttribute("viewBox", "-1 0 22.7 22.7");
+    svg.setAttribute("aria-hidden", "true");
+    const shell = document.createElementNS(svgNs, "path");
+    shell.setAttribute("fill", "currentColor");
+    shell.setAttribute(
+      "d",
+      "M10.2,4.7l5.9,3.4V15l-5.9,3.4L4.2,15V8.1L10.2,4.7 M10.2,1.6l-8.7,5v10l8.7,5l8.7-5v-10C18.8,6.6,10.2,1.6,10.2,1.6z",
+    );
+    const cMark = document.createElementNS(svgNs, "path");
+    cMark.setAttribute("fill", "currentColor");
+    cMark.setAttribute(
+      "d",
+      "M11.8,12.4l-1.7,1l-1.7-1v-1.9l1.7-1l1.7,1h2.1V9.3l-3.8-2.2L6.4,9.3v4.3l3.8,2.2l3.8-2.2v-1.2H11.8z",
+    );
+    svg.append(shell, cMark);
+    civitaiBtn.prepend(svg);
+  }
+  const soonTag = document.createElement("span");
+  soonTag.textContent = "soon";
+  soonTag.style.cssText = "font-size:0.5625rem;opacity:.7;letter-spacing:.03em;text-transform:uppercase";
+  civitaiBtn.appendChild(soonTag);
+
+  const toolbarSpacer = document.createElement("span");
+  toolbarSpacer.className = "cmcp-spacer";
+  toolbar.append(muteBtn, blindBtn, toolbarSpacer, civitaiBtn);
+
+  row.append(ring, ctxLabel, modelChip, spacer, attachBtn, micBtn, sendBtn);
   form.append(menuPop, modelPop, attachBar, input, row, fileInput);
   root.appendChild(form);
 
