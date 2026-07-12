@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { validateA2UISpec, isAllowedImageSrc, A2UI_CAPS } from "../web/js/cmcp-a2ui.js";
+import { validateA2UISpec, isAllowedImageSrc, A2UI_CAPS } from "../../web/js/cmcp-a2ui.js";
 
 const ok = (spec) => {
   const r = validateA2UISpec(spec);
