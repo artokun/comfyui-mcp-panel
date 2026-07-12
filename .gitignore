@@ -13,3 +13,6 @@ playwright-report/
 test-results/
 .playwright/
 .claude/
+vendor-spike/node_modules/
+vendor-spike/entry.js
+vendor-spike/package-lock.json
