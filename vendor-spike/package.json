@@ -1,0 +1,10 @@
+{
+  "name": "a2ui-vendor-spike",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@a2ui/lit": "0.10.1",
+    "@a2ui/web_core": "0.10.4",
+    "esbuild": "0.28.1"
+  }
+}
