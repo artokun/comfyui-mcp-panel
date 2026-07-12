@@ -103,40 +103,100 @@ const PANEL_VERSION = "0.7.3";
 let cmcpConsoleUrl = null;
 let cmcpConsoleToken = null;
 
-// Opens the orchestrator's /credentials console in an in-panel iframe overlay
-// (token-gated — the token travels as a query param, same-origin postMessage
-// only after the frame's origin matches cmcpConsoleUrl's origin).
+// Native API-Keys editor (no iframe). Talks straight to the orchestrator's
+// token-gated credential API (`GET/POST {consoleUrl}/api/secrets`) — the standalone
+// comfyui-cred-console sidebar tab is retired; credential management lives in the
+// AI backend and is edited here. The fetch is cross-origin (ComfyUI :8188 → console
+// :9182), which the console now allows via CORS on /api/secrets (see
+// panel-console-http.ts). The token travels as a query param; values are write-only
+// and never read back (only a masked preview comes down).
+function cmcpApiBase() {
+  return `${cmcpConsoleUrl}/api/secrets?token=${encodeURIComponent(cmcpConsoleToken)}`;
+}
 function cmcpOpenCredentialsFrame() {
   if (!cmcpConsoleUrl || !cmcpConsoleToken) {
     alert("Connect the panel first — the credentials console isn't available yet.");
     return;
   }
-  let origin;
-  try { origin = new URL(cmcpConsoleUrl).origin; } catch { return; }
   const backdrop = document.createElement("div");
   backdrop.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:100000;display:flex;align-items:center;justify-content:center;";
-  const frame = document.createElement("iframe");
-  frame.src = `${cmcpConsoleUrl}/credentials?token=${encodeURIComponent(cmcpConsoleToken)}`;
-  frame.style.cssText = "width:420px;max-width:92vw;height:520px;max-height:88vh;border:1px solid #2a2f3a;border-radius:12px;background:#0f1115;box-shadow:0 12px 48px rgba(0,0,0,.5);";
-  frame.addEventListener("error", () => { frame.replaceWith(fallback()); });
-  function fallback() {
-    const d = document.createElement("div");
-    d.style.cssText = "width:420px;max-width:92vw;padding:1.5rem;border-radius:12px;background:#0f1115;color:#e8eaed;border:1px solid #2a2f3a;text-align:center;";
-    d.innerHTML = `<p>Couldn't load the credentials console.</p><p><a href="${frame.src}" target="_blank" rel="noopener" style="color:#8ab4f8">Open it in a browser tab</a></p>`;
-    return d;
-  }
-  function close() { window.removeEventListener("message", onMsg); backdrop.remove(); }
-  function onMsg(e) {
-    if (e.origin !== origin) return;
-    if (e.data && e.data.type === "resize" && e.data.height) {
-      frame.style.height = Math.min(e.data.height + 8, window.innerHeight * 0.88) + "px";
-    }
-    if (e.data && e.data.type === "close") close();
-  }
+  const card = document.createElement("div");
+  card.style.cssText = "width:440px;max-width:92vw;max-height:88vh;overflow:auto;padding:1rem 1.1rem;border-radius:12px;background:#0f1115;color:#e8eaed;border:1px solid #2a2f3a;box-shadow:0 12px 48px rgba(0,0,0,.5);font:13px system-ui,sans-serif;";
+  card.innerHTML = `
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">
+      <b style="flex:1;font-size:15px">API Keys</b>
+      <span data-close style="cursor:pointer;font-size:18px;opacity:.6;line-height:1">✕</span>
+    </div>
+    <div style="opacity:.6;font-size:11px;margin-bottom:10px">Stored locally on the backend, per instance. Values are write-only and never leave this machine.</div>
+    <div data-err style="color:#f28b82;font-size:12px;margin-bottom:8px;display:none"></div>
+    <div data-list style="opacity:.7">Loading…</div>`;
+  const close = () => backdrop.remove();
+  card.querySelector("[data-close]").onclick = close;
   backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(); });
-  window.addEventListener("message", onMsg);
-  backdrop.appendChild(frame);
+  const errBox = card.querySelector("[data-err]");
+  const showErr = (m) => { errBox.textContent = m; errBox.style.display = m ? "block" : "none"; };
+  const list = card.querySelector("[data-list]");
+
+  const row = (s) => {
+    const r = document.createElement("div");
+    r.style.cssText = "margin-bottom:12px";
+    r.innerHTML = `
+      <label style="display:block;margin-bottom:4px">${esc2(s.label)}
+        <span data-badge style="margin-left:6px;font-size:11px;opacity:.6">${s.set ? "set · " + esc2(s.masked || "") : "not set"}</span></label>
+      <div style="display:flex;gap:6px">
+        <input type="password" autocomplete="off" data-input
+               placeholder="${s.set ? "•••• set — type to replace" : "paste key"}"
+               style="flex:1;padding:6px;background:#1a1a1a;border:1px solid #333;color:#ddd;border-radius:4px;box-sizing:border-box"/>
+        <button data-save style="padding:6px 12px;border-radius:4px;cursor:pointer">Save</button>
+      </div>`;
+    const input = r.querySelector("[data-input]");
+    const badge = r.querySelector("[data-badge]");
+    const btn = r.querySelector("[data-save]");
+    btn.onclick = async () => {
+      const value = input.value.trim();
+      if (!value) return;
+      showErr("");
+      btn.disabled = true; btn.textContent = "Saving…";
+      try {
+        const resp = await fetch(cmcpApiBase(), {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ slot: s.id, value }),
+        });
+        const d = await resp.json();
+        if (!resp.ok || !d.ok) throw new Error(d.error || "save failed");
+        input.value = "";
+        badge.textContent = "set · " + (d.masked || "");
+        btn.textContent = "Saved ✓";
+        setTimeout(() => { btn.textContent = "Save"; btn.disabled = false; }, 1400);
+      } catch (e) {
+        showErr(String((e && e.message) || e));
+        btn.textContent = "Save"; btn.disabled = false;
+      }
+    };
+    return r;
+  };
+
+  (async () => {
+    try {
+      const resp = await fetch(cmcpApiBase());
+      const d = await resp.json();
+      if (!resp.ok || !d.ok) throw new Error(d.error || "could not load");
+      list.innerHTML = "";
+      for (const s of (d.slots || [])) list.appendChild(row(s));
+      if (!list.children.length) list.textContent = "No credential slots.";
+    } catch (e) {
+      list.textContent = "";
+      showErr("Couldn't load credentials — reconnect the panel. (" + String((e && e.message) || e) + ")");
+    }
+  })();
+
+  backdrop.appendChild(card);
   document.body.appendChild(backdrop);
+}
+// Minimal HTML-escape for the credentials card (labels/masked previews are trusted
+// server strings, but escape defensively so a stray < can't break layout).
+function esc2(s) {
+  return String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
 // ---------------------------------------------------------------------------
