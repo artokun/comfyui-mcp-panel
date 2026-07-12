@@ -178,10 +178,13 @@ function cmcpOpenCredentialsFrame(client) {
                placeholder="${s.set ? "•••• set — type to replace" : "paste key"}"
                style="flex:1;padding:6px;background:#1a1a1a;border:1px solid #333;color:#ddd;border-radius:4px;box-sizing:border-box"/>
         <button data-save style="padding:6px 12px;border-radius:4px;cursor:pointer">Save</button>
+        <button data-clear title="Remove this key from the orchestrator's store"
+                style="padding:6px 10px;border-radius:4px;cursor:pointer;${s.set ? "" : "display:none"}">Clear</button>
       </div>`;
     const input = r.querySelector("[data-input]");
     const badge = r.querySelector("[data-badge]");
     const btn = r.querySelector("[data-save]");
+    const clearBtn = r.querySelector("[data-clear]");
     btn.onclick = async () => {
       const value = input.value.trim();
       if (!value) return;
@@ -196,11 +199,34 @@ function cmcpOpenCredentialsFrame(client) {
         if (!resp.ok || !d.ok) throw new Error(d.error || "save failed");
         input.value = "";
         badge.textContent = "set · " + (d.masked || "");
+        clearBtn.style.display = "";
         btn.textContent = "Saved ✓";
         setTimeout(() => { btn.textContent = "Save"; btn.disabled = false; }, 1400);
       } catch (e) {
         showErr(String((e && e.message) || e));
         btn.textContent = "Save"; btn.disabled = false;
+      }
+    };
+    // Revoke path (comfyui-mcp issue #203): POST {slot, clear:true} removes every
+    // alias key of the slot server-side — previously a set key could only be
+    // overwritten, never removed, short of hand-editing panel-secrets.json.
+    clearBtn.onclick = async () => {
+      showErr("");
+      clearBtn.disabled = true; clearBtn.textContent = "Clearing…";
+      try {
+        const resp = await fetch(cmcpApiBase(), {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ slot: s.id, clear: true }),
+        });
+        const d = await resp.json();
+        if (!resp.ok || !d.ok) throw new Error(d.error || "clear failed");
+        badge.textContent = "not set";
+        input.placeholder = "paste key";
+        clearBtn.style.display = "none";
+        clearBtn.textContent = "Clear"; clearBtn.disabled = false;
+      } catch (e) {
+        showErr(String((e && e.message) || e));
+        clearBtn.textContent = "Clear"; clearBtn.disabled = false;
       }
     };
     return r;
