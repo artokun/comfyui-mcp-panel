@@ -601,6 +601,48 @@ function getTabId() {
   }
 }
 
+// --- Per-workflow agent identity -----------------------------------------
+// Each ComfyUI workflow gets its OWN agent session. Saved workflows key by file
+// path (stable across restarts → the conversation lives with the file). Unsaved
+// ones get a stable temp id for this app session (adopted into the file id on save,
+// see the workflow-change handler). Falls back to the legacy per-browser-session id
+// when no workflow service is present (headless / odd frontend).
+const _tempWorkflowIds = new Map(); // wf.key -> "tmp:<uuid>"
+// MODULE-scoped so they survive buildPanel re-mounts (the panel re-mounts on every
+// ComfyUI workflow switch). If these lived in the panel closure, each re-mount would
+// re-seed them to the now-current workflow and defeat change detection.
+let currentWorkflowId = null;
+let currentWorkflowKey = null;
+// The live workflow OBJECT last seen. ComfyUI mutates the SAME instance's path in
+// place on rename/Save-As (path and the derived .key getter both change), so the
+// instance is the only stable identity a rename leaves intact.
+let currentWorkflowRef = null;
+function activeWorkflowRef() {
+  try {
+    return (
+      window.comfyAPI?.app?.app?.extensionManager?.workflow?.activeWorkflow ||
+      (typeof app !== "undefined" && app?.extensionManager?.workflow?.activeWorkflow) ||
+      null
+    );
+  } catch {
+    return null;
+  }
+}
+function workflowTabId() {
+  const wf = activeWorkflowRef();
+  if (!wf) return getTabId();
+  const saved =
+    wf.isPersisted === true && wf.isTemporary !== true && typeof wf.path === "string" && wf.path;
+  if (saved) return "wf:" + wf.path;
+  const k = wf.key || wf.id || "unsaved";
+  let id = _tempWorkflowIds.get(k);
+  if (!id) {
+    id = "tmp:" + crypto.randomUUID();
+    _tempWorkflowIds.set(k, id);
+  }
+  return id;
+}
+
 // Per-tab agent session id + which thread this tab is showing. sessionStorage
 // is tab-scoped and survives reload — exactly what "restore the last session on
 // reload" needs, without two tabs clobbering each other.
@@ -3607,6 +3649,244 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
+  // Domain-aware, READ-ONLY audit for Prompt Director. Correlates visible graph
+  // wiring/widgets with the node pack's sanitized runtime inspection registry.
+  // Recommendations are proposals only; the agent must ask before applying them.
+  async graph_prompt_director_audit() {
+    const { graph } = getGraphCtx();
+    const nodes = graph._nodes ?? [];
+    const isPromptDirector = (node) =>
+      String(node?.type ?? "").startsWith("PromptDirector") || node?.type === "PromptProducer";
+    const directorNodes = nodes.filter(isPromptDirector);
+    const widgetMap = (node) =>
+      Object.fromEntries((node.widgets ?? []).filter((w) => w?.name).map((w) => [w.name, w.value]));
+    const inputConnected = (node, name) => {
+      const input = (node.inputs ?? []).find((item) => item?.name === name);
+      return !!input && input.link != null;
+    };
+    const outputLinked = (node, name) => {
+      const output = (node.outputs ?? []).find((item) => item?.name === name);
+      return !!output && (output.links?.length ?? 0) > 0;
+    };
+    const observations = [];
+    const recommendations = [];
+    const addObservation = (severity, code, message, nodeId = null, evidence = {}) =>
+      observations.push({ severity, code, message, ...(nodeId != null ? { node_id: nodeId } : {}), evidence });
+    const proposeWidget = (node, widget, value, reason) =>
+      recommendations.push({
+        requires_confirmation: true,
+        reason,
+        change: { tool: "panel_set_widget", args: { node_id: node.id, widget, value } },
+      });
+
+    let runtimePayload = { inspections: [] };
+    try {
+      const response = await fetch("/prompt_director/inspection");
+      if (response.ok) runtimePayload = await response.json();
+      else addObservation("warning", "inspection_unavailable", `Prompt Director inspection returned HTTP ${response.status}.`);
+    } catch (error) {
+      addObservation("warning", "inspection_unavailable", String(error?.message ?? error));
+    }
+    const runtimeByNode = new Map(
+      (runtimePayload.inspections ?? []).map((item) => [String(item.node_id), item]),
+    );
+
+    const modelCandidates = [];
+    const loraLoaders = [];
+    const modelWidgetCategories = {
+      ckpt_name: "checkpoints",
+      checkpoint_name: "checkpoints",
+      unet_name: "diffusion_models",
+      diffusion_model: "diffusion_models",
+      diffusion_model_name: "diffusion_models",
+    };
+    for (const node of nodes) {
+      if (isPromptDirector(node)) continue;
+      const widgets = widgetMap(node);
+      for (const [name, value] of Object.entries(widgets)) {
+        if (typeof value !== "string" || !value.toLowerCase().endsWith(".safetensors")) continue;
+        if (name === "lora_name" || /lora/i.test(node.type)) {
+          const modelStrength = Number(widgets.strength_model ?? widgets.model_strength ?? 1);
+          const clipStrength = Number(widgets.strength_clip ?? widgets.clip_strength ?? 1);
+          loraLoaders.push({
+            node_id: node.id,
+            name: value,
+            strength_model: Number.isFinite(modelStrength) ? modelStrength : 1,
+            strength_clip: Number.isFinite(clipStrength) ? clipStrength : 1,
+          });
+          continue;
+        }
+        const category = modelWidgetCategories[name];
+        if (category) modelCandidates.push({ node_id: node.id, widget: name, category, name: value });
+      }
+    }
+
+    if (!directorNodes.length) {
+      addObservation("info", "prompt_director_not_present", "No Prompt Director nodes are present in the graph being viewed.");
+    }
+
+    for (const node of directorNodes) {
+      const widgets = widgetMap(node);
+      const runtime = runtimeByNode.get(String(node.id));
+      if (node.mode) {
+        addObservation(
+          "warning",
+          "node_not_active",
+          `${node.type} is ${node.mode === 4 ? "bypassed" : node.mode === 2 ? "muted" : `in mode ${node.mode}`}.`,
+          node.id,
+        );
+      }
+
+      if (["PromptDirector", "PromptDirectorAuto", "PromptProducer"].includes(node.type)) {
+        const outputName = node.type === "PromptProducer" ? "enhanced_prompt" : "final_prompt";
+        if (!outputLinked(node, outputName)) {
+          addObservation(
+            "warning",
+            "model_prompt_not_connected",
+            `${node.type}.${outputName} is not connected, so this node cannot affect the downstream model prompt.`,
+            node.id,
+          );
+        }
+      }
+
+      if (["PromptDirector", "PromptDirectorAuto", "PromptProducer", "PromptDirectorPromptEnhancer"].includes(node.type)) {
+        if (widgets.model_target === "auto" && !inputConnected(node, "context")) {
+          addObservation(
+            "warning",
+            "auto_target_without_context",
+            `${node.type} uses model_target=auto without a connected Prompt Director Context.`,
+            node.id,
+          );
+        }
+      }
+
+      if (node.type === "PromptDirectorAuto" && inputConnected(node, "image") && !inputConnected(node, "config")) {
+        addObservation(
+          "info",
+          "source_image_not_analyzed",
+          "Prompt Director Auto has a source image but no provider config, so it will compile deterministically without visual inspection.",
+          node.id,
+        );
+      }
+
+      if (node.type === "PromptDirectorResultCritic" && !inputConnected(node, "config")) {
+        addObservation(
+          "warning",
+          "critic_without_provider",
+          "Result Critic has no provider config and cannot perform a two-image visual comparison.",
+          node.id,
+        );
+      }
+
+      if (node.type === "PromptDirectorContext") {
+        const selected = String(widgets.model_asset ?? "none");
+        if (selected === "none" && modelCandidates.length === 1) {
+          const candidate = modelCandidates[0];
+          const value = `${candidate.category}/${candidate.name}`;
+          addObservation(
+            "warning",
+            "model_context_not_bound",
+            `The graph loads ${candidate.name}, but Prompt Director Context has no model selected.`,
+            node.id,
+            { loader_node_id: candidate.node_id, suggested_model_asset: value },
+          );
+          proposeWidget(node, "model_asset", value, `Bind Prompt Director Context to the only detected loaded model, ${candidate.name}.`);
+        } else if (selected !== "none" && modelCandidates.length) {
+          const selectedName = selected.split("/").slice(1).join("/");
+          if (!modelCandidates.some((candidate) => candidate.name === selectedName)) {
+            addObservation(
+              "warning",
+              "model_context_mismatch",
+              `Prompt Director Context selects ${selectedName}, but detected model loaders use ${modelCandidates.map((item) => item.name).join(", ")}.`,
+              node.id,
+            );
+          }
+        }
+
+        if (loraLoaders.length) {
+          let tracked = [];
+          try {
+            tracked = JSON.parse(String(widgets.lora_stack_json ?? "[]"));
+            if (!Array.isArray(tracked)) tracked = [];
+          } catch {
+            addObservation("warning", "invalid_lora_stack_json", "Prompt Director Context lora_stack_json is invalid JSON.", node.id);
+          }
+          const trackedNames = new Set(tracked.map((item) => (typeof item === "string" ? item : item?.name)).filter(Boolean));
+          const missing = loraLoaders.filter((item) => !trackedNames.has(item.name));
+          if (missing.length) {
+            const proposed = loraLoaders.map(({ name, strength_model, strength_clip }) => ({ name, strength_model, strength_clip }));
+            addObservation(
+              "warning",
+              "loaded_loras_missing_from_context",
+              `Loaded LoRAs are missing from Prompt Director Context: ${missing.map((item) => item.name).join(", ")}.`,
+              node.id,
+              { detected_loras: proposed },
+            );
+            proposeWidget(
+              node,
+              "lora_stack_json",
+              JSON.stringify(proposed),
+              "Mirror the detected LoRA loader names and actual model/CLIP strengths into Prompt Director Context.",
+            );
+          }
+        }
+      }
+
+      if (!runtime) {
+        addObservation(
+          "info",
+          "node_not_executed",
+          `${node.type} has no recorded runtime inspection yet; run its downstream output path before judging the compiled plan.`,
+          node.id,
+        );
+        continue;
+      }
+      const payload = runtime.payload ?? {};
+      for (const warning of payload.warnings ?? payload.critique?.warnings ?? []) {
+        addObservation("warning", "runtime_warning", String(warning), node.id);
+      }
+      const incompatible = (payload.context?.loras ?? []).filter((item) => item?.compatibility === "incompatible");
+      if (incompatible.length) {
+        addObservation(
+          "warning",
+          "incompatible_lora_runtime",
+          `Runtime context marks these LoRAs incompatible: ${incompatible.map((item) => item.name).join(", ")}.`,
+          node.id,
+        );
+      }
+      if (payload.context?.model && !incompatible.length && !(payload.warnings ?? []).some((item) => String(item).startsWith("model_"))) {
+        addObservation(
+          "info",
+          "model_context_valid",
+          `Resolved model context is coherent for ${payload.context.target_model ?? "the selected target"}.`,
+          node.id,
+        );
+      }
+      if (payload.critique?.verdict && !["acceptable", "pass", "approved"].includes(String(payload.critique.verdict).toLowerCase())) {
+        addObservation(
+          "warning",
+          "critic_requests_revision",
+          `Result Critic verdict: ${payload.critique.verdict}.`,
+          node.id,
+          { revised_prompt: payload.critique.revised_prompt ?? "", observations: payload.critique.observations ?? [] },
+        );
+      }
+    }
+
+    const severityRank = { warning: 0, info: 1 };
+    observations.sort((a, b) => (severityRank[a.severity] ?? 9) - (severityRank[b.severity] ?? 9));
+    return {
+      viewing: describeActiveGraph(graph),
+      prompt_director_node_count: directorNodes.length,
+      detected_models: modelCandidates,
+      detected_loras: loraLoaders,
+      runtime_inspections: runtimePayload.inspections ?? [],
+      observations,
+      recommendations,
+      changed: false,
+    };
+  },
+
   // Pinpoint nodes in the graph the user is viewing WITHOUT dumping the whole
   // thing. Searches EVERY node (not capped like graph_get_state), applies the
   // filters, and returns only matches — each the same rich summary as
@@ -5784,6 +6064,12 @@ function focusFollowOnCommand(cmd, msg, reply) {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
+// Agent feed gates (persisted across reloads). MUTE = NO agent_event reaches any
+// agent (total silence). BLIND = agents still get the text/observation but never the
+// image pixels (ToS-safe: reason about the work without receiving the images).
+let AGENT_MUTED = (() => { try { return localStorage.getItem("cmcp.muteAgents") === "1"; } catch { return false; } })();
+let AGENT_BLIND = (() => { try { return localStorage.getItem("cmcp.blindAgents") === "1"; } catch { return false; } })();
+
 function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError }) {
   let sock = null;
   let url = loadBridgeUrl();
@@ -6141,7 +6427,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       sock.send(
         JSON.stringify({
           type: "hello",
-          tab_id: getTabId(),
+          tab_id: workflowTabId(),
           title: getWorkflowTitle(),
           backend,
           ...(comfyuiUrl ? { comfyui_url: comfyuiUrl } : {}),
@@ -6166,7 +6452,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
     if (t === lastSentTitle) return;
     lastSentTitle = t;
     try {
-      sock.send(JSON.stringify({ type: "title", tab_id: getTabId(), title: t }));
+      sock.send(JSON.stringify({ type: "title", tab_id: workflowTabId(), title: t }));
     } catch {
       // dropped — next mutation retries
     }
@@ -6206,6 +6492,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   }
 
   return {
+    // Public re-hello so the panel can re-target this socket to a new workflow's
+    // tab id (per-workflow sessions) without opening a second client.
+    rehello: sendHello,
     start() {
       closed = false;
       // A fresh connect intent (user Connect / sticky reconnect / respawn handoff)
@@ -6249,8 +6538,17 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
     /** Send an arbitrary control frame (set_options, new_session, …). */
     sendFrame(frame) {
       if (!sock || sock.readyState !== WebSocket.OPEN) return false;
+      // Mute/Blind gate — applies ONLY to agent-facing observations (agent_event);
+      // control frames (set_config, interrupt, secrets, hello, …) always pass.
+      if (frame && frame.type === "agent_event") {
+        if (AGENT_MUTED) return false;                     // total silence
+        if (AGENT_BLIND && "images" in frame) {            // keep the note, drop pixels
+          const { images: _drop, ...rest } = frame;
+          frame = rest;
+        }
+      }
       try {
-        sock.send(JSON.stringify({ tab_id: getTabId(), ...frame }));
+        sock.send(JSON.stringify({ tab_id: workflowTabId(), ...frame }));
         return true;
       } catch {
         return false;
@@ -7202,12 +7500,43 @@ function renderRichText(el, text) {
 // clean 1005 closes). Tracking the live client at module scope and tearing down
 // any prior one before creating a new one makes the storm structurally impossible.
 let liveBridgeClient = null;
+// (MDC's fork also proxied all client callbacks through a module-level
+// `panelSink` so the client could outlive panel re-mounts. Upstream's sidebar
+// KEEP-ALIVE already keeps buildPanel a page singleton whose root is detached/
+// reattached on tab switches, so the proxy layer is redundant here and was
+// dropped in the port — the singleton client + keep-alive provide the same
+// persistence. Per-workflow re-targeting rides client.rehello() instead.)
+// Auto-pick ("X isn't signed in — using Y") must fire at most once per PAGE, not
+// per mount — mount-local state re-armed it on every workflow switch and spammed
+// spurious fallbacks (e.g. to Ollama) off pre-orchestrator readiness data.
+let autoPickDone = false;
+// Providers the user turned OFF (chips hidden, never an auto-pick target).
+const DISABLED_BACKENDS_KEY = "comfyui-mcp.panel.disabledBackends";
+function disabledBackends() {
+  try { return new Set(JSON.parse(window.localStorage.getItem(DISABLED_BACKENDS_KEY) || "[]")); }
+  catch { return new Set(); }
+}
+function setBackendDisabled(id, off) {
+  const s = disabledBackends();
+  if (off) s.add(id); else s.delete(id);
+  try { window.localStorage.setItem(DISABLED_BACKENDS_KEY, JSON.stringify([...s])); } catch { /* session-only */ }
+}
+function backendEnabled(id) { return !disabledBackends().has(id); }
+
 
 function buildPanel() {
   ensureStyles();
 
   const root = document.createElement("div");
   root.className = "cmcp-root";
+  // A2UI seam (forward-compat, see spec): the chat surface width is a SINGLE piece
+  // of owned state, not scattered CSS, so a future A2UI layer can widen the surface
+  // (e.g. to show a diagram) and shrink it back. No-op visual default today.
+  root.style.setProperty("--cmcp-surface-width", "100%");
+  function cmcpSetChatSurface(mode) {
+    root.style.setProperty("--cmcp-surface-width", mode === "wide" ? "60%" : "100%");
+    root.dataset.surface = mode === "wide" ? "wide" : "normal";
+  }
   // Expose this panel's root so canvas "fit" can measure how much of the canvas
   // the open panel occludes and frame the graph in the visible area.
   activePanelRoot = root;
@@ -7392,6 +7721,11 @@ function buildPanel() {
         ? backends
         : [{ backend: "claude", running: false }];
     knownBackends = list;
+    // NOTE: paint EVERY provider here — no disabled-filter. This container is a
+    // detached DATA MIRROR (the model popup and switch paths rebuild the provider
+    // list from its chips), so filtering here would permanently drop a hidden
+    // provider from the round-trip and make it unrestorable. The user-visible
+    // on/off filter lives in ONE place: the model popup's Provider section.
     for (const b of list) {
       const id = b.backend;
       const chip = document.createElement("button");
@@ -7484,9 +7818,26 @@ function buildPanel() {
     cmcpOpenCredentialsFrame(client);
   });
 
+  // Opens the orchestrator's "edit every prompt" console page in a new tab. The
+  // page is same-origin to the console server, so its /api/prompts fetches need no
+  // CORS. Token travels as a query param, like the credentials console.
+  const promptsBtn = document.createElement("button");
+  promptsBtn.className = "cmcp-btn";
+  promptsBtn.type = "button";
+  promptsBtn.textContent = "Prompts";
+  promptsBtn.title = "Edit the agent's system prompts (persona, per-backend, Ask-AI)";
+  promptsBtn.style.opacity = "0.8";
+  promptsBtn.addEventListener("click", () => {
+    if (!cmcpConsoleUrl || !cmcpConsoleToken) {
+      alert("Connect the panel first — the prompt editor isn't available yet.");
+      return;
+    }
+    window.open(`${cmcpConsoleUrl}/prompts?token=${encodeURIComponent(cmcpConsoleToken)}`, "_blank", "noopener");
+  });
+
   const btnRow = document.createElement("div");
   btnRow.style.cssText = "display:flex;gap:0.375rem;align-items:center;flex-wrap:wrap;";
-  btnRow.append(connectBtn, disconnectBtn, saveBtn, apiKeysBtn);
+  btnRow.append(connectBtn, disconnectBtn, saveBtn, apiKeysBtn, promptsBtn);
 
   const helpDiv = document.createElement("div");
   helpDiv.className = "cmcp-help";
@@ -7622,7 +7973,8 @@ function buildPanel() {
     custom: { label: "Custom endpoint (any OpenAI-compatible)", install: "", login: "Set the base URL (and API key if needed) in Settings › Custom endpoint" },
   };
   let anyReady = false;
-  let autoPickDone = false; // auto-switch + note fires at most once per panel mount
+  // (autoPickDone is module-scoped now — once per PAGE, not per mount, so workflow
+  // switches can't re-arm the spurious provider fallback.)
   const onboard = document.createElement("div");
   onboard.className = "cmcp-onboard";
   onboard.hidden = true;
@@ -7733,9 +8085,9 @@ function buildPanel() {
     if (sel && sel.ready === false) {
       // Never auto-pick an experimental backend (b.experimental, e.g. Copilot) —
       // those must only become active via explicit user selection in the provider
-      // picker, not silently behind the user's back. (The fork also gates on its
-      // provider on/off toggle — that feature rides another port PR.)
-      const ready = list.find((b) => b.ready && !b.experimental);
+      // picker, not silently behind the user's back. Likewise never fall back to a
+      // provider the user turned OFF (chip hidden = not a target — see backendEnabled).
+      const ready = list.find((b) => b.ready && !b.experimental && backendEnabled(b.backend));
       if (ready) {
         autoPickDone = true;
         const prevLabel = BACKEND_LABELS[selectedBackend] || selectedBackend;
@@ -8326,6 +8678,10 @@ function buildPanel() {
       const activeBackend = connectedBackend || selectedBackend;
       for (const b of knownBackends) {
         const id = b.backend;
+        // A provider the user turned OFF is skipped entirely (and can never be an
+        // auto-pick fallback target — see applyReadiness). The ACTIVE provider
+        // always shows so you can't strand yourself. Restore via the row below.
+        if (!backendEnabled(id) && id !== activeBackend) continue;
         const hint = notReadyHint(b);
         const notReady = (backendReady[id] || b).ready === false;
         // A not-ready provider can't be connected — tapping it asks the working
@@ -8345,9 +8701,39 @@ function buildPanel() {
           }
         });
         // Experimental backends render tinted so the risk reads at a glance.
-        // (The fork's provider on/off ✕ / hidden-row UI rides its per-workflow
-        // sessions stack — not ported here.)
         if (b.experimental && row) row.style.color = "var(--p-orange-500,#f59e0b)";
+        // Provider on/off: a small always-visible ✕ that hides this provider from
+        // the panel (list + fallback). Not shown on the active provider.
+        if (id !== activeBackend && row) {
+          const off = document.createElement("i");
+          off.className = "pi pi-times";
+          off.title = `Hide ${BACKEND_LABELS[id] || id} — you don't use it. Restore it from the "hidden" row below.`;
+          off.style.cssText = "margin-left:0.4rem;opacity:0.4;cursor:pointer;font-size:0.7rem;flex:none;";
+          off.addEventListener("mousedown", (mev) => {
+            // Swallow the row's pick handler — this gesture only hides.
+            mev.preventDefault();
+            mev.stopPropagation();
+            setBackendDisabled(id, true);
+            buildModelPop(); // repaint in place so the row vanishes immediately
+          });
+          row.appendChild(off);
+        }
+      }
+      // Restore row: lists how many providers are hidden; one tap shows them all.
+      const hiddenIds = knownBackends.map((b) => b.backend).filter((id) => !backendEnabled(id) && id !== activeBackend);
+      if (hiddenIds.length) {
+        item(
+          {
+            label: `${hiddenIds.length} provider${hiddenIds.length === 1 ? "" : "s"} hidden`,
+            small: `${hiddenIds.map((id) => BACKEND_LABELS[id] || id).join(", ")} — tap to show`,
+            cls: "cmcp-provider",
+          },
+          false,
+          () => {
+            for (const id of hiddenIds) setBackendDisabled(id, false);
+            buildModelPop();
+          },
+        );
       }
     }
 
@@ -8516,7 +8902,33 @@ function buildPanel() {
   fileInput.multiple = true;
   fileInput.hidden = true;
 
-  row.append(ring, ctxLabel, modelChip, spacer, attachBtn, micBtn, sendBtn);
+  // ── Mute / Blind agent-feed toggles (next to the context ring) ────────────
+  const muteBtn = document.createElement("button");
+  muteBtn.type = "button";
+  muteBtn.title = "Mute agents — feed NOTHING to any agent (images, renders, observations)";
+  muteBtn.style.cssText = "background:none;border:none;cursor:pointer;font-size:13px;padding:0 1px";
+  const blindBtn = document.createElement("button");
+  blindBtn.type = "button";
+  blindBtn.title = "Blind agents — they still get text/results but NEVER image pixels (ToS-safe)";
+  blindBtn.style.cssText = "background:none;border:none;cursor:pointer;font-size:13px;padding:0 1px";
+  function reflectFeedGates() {
+    muteBtn.textContent = AGENT_MUTED ? "🔇" : "🔈";
+    muteBtn.style.opacity = AGENT_MUTED ? "1" : ".5";
+    muteBtn.style.animation = AGENT_MUTED ? "cmcp-pulse 1s ease-in-out infinite" : "none";
+    blindBtn.textContent = AGENT_BLIND ? "🙈" : "👁";
+    blindBtn.style.opacity = AGENT_BLIND ? "1" : ".5";
+    try {
+      const fg = ring.querySelector(".fg");
+      if (fg) fg.style.stroke = AGENT_MUTED ? "#e5484d" : "";
+      ring.style.animation = AGENT_MUTED ? "cmcp-pulse 1s ease-in-out infinite" : "none";
+    } catch {}
+  }
+  muteBtn.onclick = () => { AGENT_MUTED = !AGENT_MUTED; try { localStorage.setItem("cmcp.muteAgents", AGENT_MUTED ? "1" : "0"); } catch {} reflectFeedGates(); };
+  blindBtn.onclick = () => { AGENT_BLIND = !AGENT_BLIND; try { localStorage.setItem("cmcp.blindAgents", AGENT_BLIND ? "1" : "0"); } catch {} reflectFeedGates(); };
+  ring.style.cursor = "pointer"; ring.onclick = muteBtn.onclick; // clicking the ring toggles mute
+  reflectFeedGates();
+
+  row.append(ring, muteBtn, blindBtn, ctxLabel, modelChip, spacer, attachBtn, micBtn, sendBtn);
   form.append(menuPop, modelPop, attachBar, input, row, fileInput);
   root.appendChild(form);
 
@@ -8544,9 +8956,18 @@ function buildPanel() {
     }
   }
 
+  // Find the (single) thread bound to a workflow id, or null. One conversation per
+  // workflow: newest wins if duplicates ever exist.
+  function threadForWorkflow(wfid) {
+    for (let i = threads.length - 1; i >= 0; i--) {
+      if (threads[i].workflowKey === wfid) return threads[i];
+    }
+    return null;
+  }
+
   function record(entry) {
     if (!thread) {
-      thread = { id: crypto.randomUUID(), ts: Date.now(), msgs: [] };
+      thread = { id: crypto.randomUUID(), ts: Date.now(), msgs: [], workflowKey: workflowTabId() };
       // Adopt any session id the orchestrator has already reported for this tab.
       const sid = ssGet(SESSION_KEY);
       if (sid) thread.sessionId = sid;
@@ -9438,6 +9859,104 @@ function buildPanel() {
     else client?.sendFrame?.({ type: "new_session" });
   }
 
+  // Per-workflow auto-follow. Called on any workflow change (open/switch/save/rename).
+  // Four cases: (1) id unchanged → nothing; (2) same wf.key, id flipped tmp:→wf: →
+  // ADOPT (migrate the temp thread to the file identity, keep the same session);
+  // (2b) SAME workflow object, wf:→wf: id change → RENAME/Save-As (migrate the
+  // thread to the new path, keep the same session); (3) different id → SWITCH
+  // (re-hello + load that workflow's thread, or a fresh empty view if it has none).
+  function rehelloForWorkflow(sessionId) {
+    // Re-target the socket to the current workflow's tab id, then resume that
+    // workflow's agent session. The backend drops the socket's prior tab mapping
+    // so a background workflow's output can't leak here.
+    try {
+      client?.rehello?.();
+      if (sessionId) client?.sendFrame?.({ type: "resume_session", session_id: sessionId });
+    } catch {
+      /* reconnect path retries the hello */
+    }
+  }
+  function onWorkflowMaybeChanged() {
+    const wf = activeWorkflowRef();
+    const wfid = workflowTabId();
+    const wfkey = wf ? (wf.key || wf.id || "unsaved") : null;
+    if (wfid === currentWorkflowId) return; // case 1: no change
+
+    const adopting =
+      currentWorkflowId &&
+      currentWorkflowKey &&
+      wfkey === currentWorkflowKey &&
+      currentWorkflowId.startsWith("tmp:") &&
+      wfid.startsWith("wf:");
+    if (adopting) {
+      const t = threadForWorkflow(currentWorkflowId);
+      if (t) { t.workflowKey = wfid; persistThreads(); } // migrate to the file identity
+      if (wf && (wf.key || wf.id)) _tempWorkflowIds.delete(wf.key || wf.id);
+      currentWorkflowId = wfid;
+      currentWorkflowKey = wfkey;
+      currentWorkflowRef = wf;
+      rehelloForWorkflow(t?.sessionId || null); // same session continues
+      return;
+    }
+
+    // Case 2b: RENAME / Save-As of an already-saved workflow. ComfyUI mutates the
+    // SAME object's path in place (instance identity survives; path and the derived
+    // .key getter change), so "same object, wf:→wf: id change" can only be a rename —
+    // a genuine switch always arrives on a different object. Without this branch the
+    // thread stays keyed to the OLD path and the renamed workflow opens a blank chat.
+    const renaming =
+      wf &&
+      wf === currentWorkflowRef &&
+      currentWorkflowId &&
+      currentWorkflowId.startsWith("wf:") &&
+      wfid.startsWith("wf:");
+    if (renaming) {
+      const t = threadForWorkflow(currentWorkflowId);
+      if (t) {
+        t.workflowKey = wfid; // thread follows the workflow to its new path
+        t.ts = Date.now(); // newest-wins lookup must favor the migrated thread over any stray
+        persistThreads();
+      }
+      currentWorkflowId = wfid;
+      currentWorkflowKey = wfkey;
+      currentWorkflowRef = wf;
+      rehelloForWorkflow(t?.sessionId || null); // same session continues under the new id
+      return;
+    }
+
+    currentWorkflowId = wfid;
+    currentWorkflowKey = wfkey;
+    currentWorkflowRef = wf;
+    const existing = threadForWorkflow(wfid);
+    // Bind THIS workflow's session BEFORE the re-hello. sendHello() reads
+    // SESSION_KEY at hello time for its spawn-time `resume` — re-helloing first
+    // carried the PREVIOUS workflow's session id, so a fresh workspace's agent
+    // spawned as a resume-FORK of the other conversation (verbatim memory bleed
+    // across workspaces). Order is the whole fix.
+    ssSet(SESSION_KEY, existing?.sessionId || null);
+    rehelloForWorkflow(existing?.sessionId || null);
+    if (existing) {
+      loadThread(existing); // resets feed + repaints + resumes
+    } else {
+      thread = null; // fresh empty view; the thread is minted (tagged) on first message
+      ssSet(CURRENT_THREAD_KEY, null);
+      resetFeed();
+      // NOTE: no `new_session` frame here — SESSION_KEY was bound BEFORE the
+      // re-hello, so the hello already spawns a clean agent for this tab. Sending
+      // new_session too caused a rapid double-spawn (double greeting, and two
+      // concurrent Claude session starts that can race token refresh → 401s).
+      // Workspace awareness: ride a one-shot context on the FIRST message so the
+      // fresh agent knows exactly which workflow it serves (and that other
+      // workflows have their own separate conversations).
+      try {
+        client?.armContext?.(
+          `[Workspace context: this chat is dedicated to the ComfyUI workflow "${getWorkflowTitle()}". ` +
+          `Each workflow has its own separate agent conversation — other workflows are NOT in your context.]`,
+        );
+      } catch { /* armContext unavailable — awareness rides the title instead */ }
+    }
+  }
+
   function renderHistory() {
     histPop.textContent = "";
     const list = [...threads].reverse();
@@ -10079,6 +10598,44 @@ function buildPanel() {
   });
   // This is now THE live client for the page.
   liveBridgeClient = client;
+
+  // Per-workflow auto-follow. Sync to the current workflow's thread NOW (initial
+  // bind), then poll: under keep-alive the panel does NOT re-mount on a ComfyUI
+  // workflow switch, so the poll is what detects open/switch/save/rename and
+  // re-targets the client (re-hello + session swap) to the new workflow.
+  // (A <title> MutationObserver proved unreliable in MDC's fork — polling is the
+  // deliberate choice.)
+  onWorkflowMaybeChanged();
+  const _wfPoll = setInterval(() => onWorkflowMaybeChanged(), 600);
+
+  // Model Explorer "Ask AI" → open this chat and seed a rich metadata-curation
+  // brief so the agent investigates THIS model and proposes into the diff-review
+  // window (via its model_metadata tools). Reachable from the Model Explorer node.
+  window.cmcpAskAboutModel = (name, category) => {
+    // Force the chat tab to the front (closing whatever panel was open). A retry
+    // covers the case where the first activate lands before the tab store is ready.
+    try { openSidebarTab(); } catch { /* best effort */ }
+    setTimeout(() => { try { openSidebarTab(); } catch {} }, 120);
+    const cat = category || "loras";
+    const seed = [
+      `Let's curate the embedded metadata for the model file **${name}** (it lives in ComfyUI's \`${cat}\` folder). Work carefully — really look at THIS specific model and figure out the right answer; don't guess.`,
+      ``,
+      `Use your model_metadata tools:`,
+      `1. Call **model_metadata_read** { category: "${cat}", name: "${name}" } to pull its CURRENT embedded metadata (model_card + prompt_director), the read-only \`modelspec\`, and the top training tags (from ss_tag_frequency).`,
+      `2. If the embedded evidence is thin (empty model_card/prompt_director, no ss_tag_frequency) OR to flesh out details, call **model_metadata_fetch_civitai** { category, name } to pull the model's data from **Civitai (civitai.com** — adult models on civitai.red resolve through the same API): description, trainedWords, example prompts, tags. Treat it as RAW input — much of it is marketing fluff; distill it, and if any of it is wrong/junk, clean it up.`,
+      `3. Figure out what this model actually IS and does, and write a tight, factual \`semantic_intent\` + a practical \`prompt_guidance\`.`,
+      `4. Derive **trigger_tokens** from real evidence ONLY — and note the trigger is OFTEN NOT in \`trainedWords\` (frequently empty). **MINE THE EXAMPLE PROMPTS**: if every sample prompt starts with e.g. "photo in the style of redditya", the trigger is \`redditya\`. NEVER invent a trigger. Suggest strength (default_strength_model/clip, min/max) ONLY if a weight like \`<lora:name:0.8>\` actually appears in an example prompt; otherwise leave them blank.`,
+      `5. Push your proposal with **model_metadata_propose** { category, name, fields: { ... } }. That fills the review window on the right for me — it does NOT write the file. Include only fields you're confident about.`,
+      ``,
+      `Then tell me, in chat, what you found and what you changed and why. I'll review in the window, edit, and hit Confirm — so do NOT write anything yourself; \`model_metadata_propose\` is your only output. If I push back ("the prompt guidance is off", "focus on X", "that trigger's wrong"), revise and call model_metadata_propose again with the FULL field set.`,
+    ].join("\n");
+    try {
+      if (!liveBridgeClient?.sendUserMessage?.(seed)) {
+        console.warn("[cmcpAskAboutModel] chat not connected — connect the panel, then Ask AI again");
+      }
+    } catch (e) { console.warn("[cmcpAskAboutModel]", e); }
+  };
+
 
   // ---- ComfyUI execution events → image cards + agent awareness (#7) ----
   // When a run finishes with output images, show them in the chat and notify
@@ -12748,12 +13305,14 @@ function buildPanel() {
       markAgentSeen();
       scrollLog();
     },
+    setChatSurface: cmcpSetChatSurface, // A2UI seam: widen/restore the chat surface
     destroy() {
       try {
         recognition?.stop();
       } catch {
         // recognition already stopped
       }
+      clearInterval(_wfPoll); // stop per-workflow change polling on unmount
       document.removeEventListener("mousedown", onDocPointerDown, true);
       document.removeEventListener("keydown", onInterruptKeydown, true);
       document.removeEventListener("visibilitychange", onVisibilityChange);
@@ -12792,6 +13351,38 @@ function buildPanel() {
 // module eval so a not-yet-populated shim can't throw and deadlock the loader.
 // Defensive deferral contributed by @FreesoSaiFared (PR #2).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Sidebar-tab overlap guard. ComfyUI renders every `type:"custom"` sidebar tab
+// into ONE shared host <div> and expects each tab's render() to replace its
+// contents. This panel appends its .cmcp-root rather than clearing, and other
+// extensions (e.g. ComfyUI-Easy-Use's NodesMap) render elsewhere and never touch
+// the shared host — so our panel stays painted when another tab is active and the
+// panels visibly stack. `activeSidebarTabId` is unreliable in this frontend build,
+// so we read the active tab from the DOM: the selected rail button carries
+// `side-bar-button-selected` plus a unique `<tabId>-tab-button` class. When our tab
+// isn't selected we remove our own root; render() rebuilds it on re-entry. We guard
+// only OUR root, never another tab's.
+function installSidebarTabGuard(tabId, getRoot) {
+  const activeTabId = () => {
+    const b = document.querySelector(".side-bar-button-selected");
+    if (!b) return null;
+    const t = [...b.classList].find((c) => c.endsWith("-tab-button"));
+    return t ? t.slice(0, -"-tab-button".length) : null;
+  };
+  const enforce = () => {
+    if (activeTabId() === tabId) return;             // our tab active → keep content
+    const r = getRoot();                              // inactive → drop our stray content
+    if (r && r.isConnected) r.remove();
+  };
+  const start = (tries = 0) => {
+    const toolbar = document.querySelector(".side-tool-bar-container");
+    if (!toolbar) { if (tries < 40) setTimeout(() => start(tries + 1), 250); return; }
+    new MutationObserver(enforce).observe(toolbar, { subtree: true, attributes: true, attributeFilter: ["class"] });
+    enforce();
+  };
+  start();
+}
+
 function registerExtensionWhenReady(tries = 0) {
   const comfyApp = window.comfyAPI?.app?.app || window.app;
   if (!comfyApp || typeof comfyApp.registerExtension !== "function") {
@@ -12856,6 +13447,7 @@ function registerExtensionWhenReady(tries = 0) {
       const mgr = app.extensionManager;
       if (mgr && typeof mgr.registerSidebarTab === "function") {
         mgr.registerSidebarTab(tabSpec);
+        installSidebarTabGuard(tabId, () => document.querySelector(".cmcp-root"));
       } else {
         console.error(
           "[comfyui-mcp-panel] app.extensionManager.registerSidebarTab is unavailable; " +
