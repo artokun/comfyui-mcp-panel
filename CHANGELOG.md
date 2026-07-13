@@ -6,6 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-12
+
+### Added
+- utility strip (header row 2) — Mute/Blind move off the composer; Civitai explorer parked
+- Clear button on credential slot rows — revoke a saved key (comfyui-mcp#203)
+- A2UI chat cards — validated interactive UI cards in chat (lit renderer) — ported from MichaelDanCurtis fork (#79)
+- per-workflow agent sessions + provider on/off + thread rename migration — ported from MichaelDanCurtis fork (#80)
+- Grok + Kimi providers, in-panel OAuth sign-in, experimental-backend gating — ported from MichaelDanCurtis fork (#81)
+
+### Fixed
+- QR encodes the https lander URL — phone cameras refuse ws:// ("No usable data found")
+
+
 ## [0.7.3] - 2026-07-09
 
 ### Added
