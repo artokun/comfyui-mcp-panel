@@ -7798,7 +7798,7 @@ function buildPanel() {
   // (GET /backends, blind to the laptop behind a remote pod) must not override it.
   let readinessFromOrchestrator = false;
   // Short per-provider hint shown under each provider row in the popup.
-  const BACKEND_HINTS = { claude: "Fable · Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", grok: "Grok Composer · Build", kimi: "Kimi (Moonshot)", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)", lmstudio: "Local LLMs · no account", llamacpp: "Local LLMs · no account", custom: "Any OpenAI-compatible server" };
+  const BACKEND_HINTS = { claude: "Fable · Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", grok: "Grok Composer · Build", kimi: "Kimi (Moonshot)", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)", lmstudio: "Local LLMs · no account", llamacpp: "Local LLMs · no account", custom: "DeepSeek · vLLM · any OpenAI-compatible API" };
 
   // Hint for a provider that exists but isn't usable yet — distinguishes
   // "install the CLI" from "sign in". Empty when ready or readiness is unknown.
@@ -7806,25 +7806,30 @@ function buildPanel() {
     if (!b) return "";
     const r = backendReady[b.backend] || b; // durable readiness survives chip repaints
     if (r.ready !== false) return "";
+    // The one-click path for keys is the API Keys card (▾ menu next to
+    // "connected") — it saves straight into the orchestrator and readiness
+    // refreshes immediately. Windows env vars do NOT reach an already-running
+    // orchestrator (processes snapshot their env at spawn), which is exactly
+    // the trap a #help user fell into — so the hints lead with the card.
     if (r.cli === false) {
       // For openrouter, "cli" is really "API key present" — no CLI to install.
-      if (b.backend === "openrouter") return "No OpenRouter API key — set it in Settings › OpenRouter";
+      if (b.backend === "openrouter") return "No OpenRouter API key — add it via API Keys (▾ menu by “connected”); takes effect immediately";
       // For custom, "cli" is "a base URL is configured" — nothing to install.
-      if (b.backend === "custom") return "No endpoint URL — set it in Settings › Custom endpoint";
+      if (b.backend === "custom") return "No endpoint URL — Settings › Custom endpoint (works with DeepSeek, vLLM, any OpenAI-compatible API)";
       if (b.backend === "ollama") return "Ollama not installed — get it at ollama.com/download";
       if (b.backend === "lmstudio") return "LM Studio not installed — get it at lmstudio.ai";
       if (b.backend === "llamacpp") return "llama.cpp not found on PATH — github.com/ggml-org/llama.cpp/releases (a reachable server still works)";
       return `${BACKEND_LABELS[b.backend] || b.backend} CLI not installed`;
     }
-    if (b.backend === "codex") return "Not signed in — run: codex login";
+    if (b.backend === "codex") return "Not signed in — Sign in via API Keys (▾ menu) or run: codex login";
     if (b.backend === "gemini") return "Not signed in — run: gemini (then sign in with Google)";
-    if (b.backend === "grok") return "Not signed in — run: grok";
-    if (b.backend === "kimi") return "Not signed in — run: kimi (then sign in)";
+    if (b.backend === "grok") return "Not signed in — Sign in with Grok via API Keys (▾ menu) or run: grok";
+    if (b.backend === "kimi") return "Not signed in — add a Kimi key via API Keys (▾ menu) or run: kimi";
     if (b.backend === "ollama") return "Ollama not running — run: ollama serve";
     if (b.backend === "lmstudio") return "LM Studio server not running — LM Studio → Developer → Start Server";
     if (b.backend === "llamacpp") return "llama-server not running — llama-server -m model.gguf --jinja -c 16384";
-    if (b.backend === "openrouter") return "No OpenRouter API key — set it in Settings › OpenRouter";
-    if (b.backend === "custom") return "No endpoint URL — set it in Settings › Custom endpoint";
+    if (b.backend === "openrouter") return "No OpenRouter API key — add it via API Keys (▾ menu by “connected”); takes effect immediately";
+    if (b.backend === "custom") return "No endpoint URL — Settings › Custom endpoint (works with DeepSeek, vLLM, any OpenAI-compatible API)";
     return "Not signed in — run: claude auth login";
   }
 
