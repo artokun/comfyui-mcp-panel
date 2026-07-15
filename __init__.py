@@ -313,6 +313,15 @@ def _register_routes():
 
     routes = PromptServer.instance.routes
 
+    # Same-origin CivitAI proxy for the browser CivitAI modal (bot-gate headers +
+    # OAuth live server-side; the browser never sees CivitAI tokens).
+    try:
+        from .py import civitai_proxy
+
+        civitai_proxy.register(routes, web)
+    except Exception as _e:  # pragma: no cover - never block panel load
+        _log("civitai proxy not registered: {}".format(_e))
+
     @routes.get("/comfyui_mcp_panel/status")
     async def _status(_request):
         detected = _detect_comfyui_url()

@@ -67,6 +67,7 @@ import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
+import { openCivitaiModal } from "./cmcp-civitai-ui.js";
 
 let app = null;
 let api = null;
@@ -6130,7 +6131,7 @@ const RECONNECT_MAX_MS = 15000;
 let AGENT_MUTED = (() => { try { return localStorage.getItem("cmcp.muteAgents") === "1"; } catch { return false; } })();
 let AGENT_BLIND = (() => { try { return localStorage.getItem("cmcp.blindAgents") === "1"; } catch { return false; } })();
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -6140,6 +6141,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   // used to replay the transcript to a freshly-switched provider so it has the
   // conversation. Cleared the moment it's consumed.
   let pendingContext = null;
+  // Direct call_tool requests, cid-correlated. The CivitAI modal uses these to run
+  // whitelisted backend tools (download_civitai_model, save_workflow) synchronously
+  // without an agent turn — mirrors the mobile bridge_client.callTool. The
+  // orchestrator's call_tool handler + whitelist already exist server-side.
+  const pendingCalls = new Map(); // cid -> { resolve, reject, timer }
+  let cidSeq = 0;
   // De-duped status emitter. The pill only ever needs TRANSITIONS, so collapsing
   // consecutive repeats is a guard against any path double-emitting the same state
   // (and keeps the cold-start steady-"connecting" from re-painting on every retry).
@@ -6327,6 +6334,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
             const mediaItems = Array.isArray(msg.items) ? msg.items : [];
             onShowMedia?.(mediaItems);
             result = { ok: true, count: mediaItems.length };
+          } else if (msg.cmd === "open_civitai") {
+            // Agent opens the CivitAI browser pre-seeded with a query + filters so
+            // the user can visually pick a resource.
+            if (!onOpenCivitai) throw new Error("This panel build can't open the CivitAI browser.");
+            result = onOpenCivitai(msg) || { ok: true };
           } else if (msg.cmd === "ui_render") {
             // A2UI card render. Validation errors THROW so the agent gets a
             // retryable tool error instead of a broken card.
@@ -6367,8 +6379,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
         // ask_user / request_secret paint their OWN cards and their replies carry
         // user input (a choice, or a SECRET) — never echo them as an activity card
         // (and never record them). Other commands get the normal activity card.
-        if (msg.cmd !== "ask_user" && msg.cmd !== "request_secret" && msg.cmd !== "set_todo" && msg.cmd !== "show_media" && msg.cmd !== "ui_render" && msg.cmd !== "ui_update") {
+        if (msg.cmd !== "ask_user" && msg.cmd !== "request_secret" && msg.cmd !== "set_todo" && msg.cmd !== "show_media" && msg.cmd !== "open_civitai" && msg.cmd !== "ui_render" && msg.cmd !== "ui_update") {
           onCommand?.(msg.cmd, msg, reply);
+        }
+        return;
+      }
+      // Reply to a direct callTool() request (cid-correlated).
+      if (msg && msg.type === "tool_result" && typeof msg.cid === "string") {
+        const pend = pendingCalls.get(msg.cid);
+        if (pend) {
+          pendingCalls.delete(msg.cid);
+          clearTimeout(pend.timer);
+          pend.resolve(msg);
         }
         return;
       }
@@ -6465,6 +6487,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
     sock.addEventListener("close", () => {
       sock = null;
       handshakeDone = false;
+      // Fail any in-flight direct tool calls — the reply can never arrive now.
+      for (const [, pend] of pendingCalls) {
+        clearTimeout(pend.timer);
+        pend.reject(new Error("bridge connection lost"));
+      }
+      pendingCalls.clear();
       clearHandshake();
       lastBridgeDownAt = Date.now(); // for the fast-vs-slow reconnect heuristic
       if (!closed) {
@@ -6621,6 +6649,40 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       } catch {
         return false;
       }
+    },
+    /** Run a whitelisted backend tool directly (no agent turn), cid-correlated.
+     *  Resolves { ok, result, error } where result is the MCP content array
+     *  ([{type:"text",text}], flatten by joining .text). Rejects on timeout or
+     *  socket close. Used by the CivitAI modal for download_civitai_model /
+     *  save_workflow. */
+    callTool(tool, args, opts) {
+      if (!sock || sock.readyState !== WebSocket.OPEN) {
+        return Promise.reject(new Error("bridge not connected"));
+      }
+      const cid = `ct-${Date.now()}-${cidSeq++}`;
+      const timeoutMs = (opts && opts.timeout) || 60000;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pendingCalls.delete(cid);
+          reject(new Error(`call_tool ${tool} timed out`));
+        }, timeoutMs);
+        pendingCalls.set(cid, { resolve, reject, timer });
+        try {
+          sock.send(
+            JSON.stringify({
+              type: "call_tool",
+              tab_id: workflowTabId(),
+              cid,
+              tool,
+              args: args || {},
+            }),
+          );
+        } catch (e) {
+          pendingCalls.delete(cid);
+          clearTimeout(timer);
+          reject(e);
+        }
+      });
     },
     setUrl(next, opts) {
       url = next || DEFAULT_BRIDGE_URL;
@@ -9131,14 +9193,33 @@ function buildPanel() {
   ring.style.cursor = "pointer"; ring.onclick = deafenBtn.onclick; // clicking the ring toggles deafen
   reflectFeedGates();
 
-  // Civitai explorer — parked slot on the strip (greyed until it ships).
+  // Civitai explorer — opens the in-panel CivitAI browser modal. Also opened BY
+  // the agent (cmd:open_civitai) pre-seeded with a query + filters.
   // Mark: Civitai's hexagon-C, monochrome via currentColor (no brand gradients,
   // no event attrs — keeps the registry's SVG YARA gate happy).
+  let _civitaiHandle = null;
+  function civitaiCtx() {
+    return {
+      api,
+      root,
+      callTool: (t, a, o) => liveBridgeClient?.callTool(t, a, o),
+      sendUserMessage: (t, c, i) => liveBridgeClient?.sendUserMessage(t, c, i),
+      uploadBlobToInput,
+      bringChatForward: () => { try { openSidebarTab(); } catch {} },
+      isMuted: () => AGENT_MUTED,
+      marked,
+      DOMPurify,
+    };
+  }
+  function openCivitai(opts) {
+    try { _civitaiHandle?.close(); } catch {}
+    _civitaiHandle = openCivitaiModal(civitaiCtx(), opts || {});
+    return _civitaiHandle;
+  }
   const civitaiBtn = toolbarBtn("pi-circle", "Civitai");
   civitaiBtn.querySelector(".pi").remove();
-  civitaiBtn.dataset.soon = "1";
-  civitaiBtn.setAttribute("aria-disabled", "true");
-  civitaiBtn.title = "Civitai explorer — browse and pull models, LoRAs, and workflows without leaving the panel. Coming soon.";
+  civitaiBtn.title = "Civitai explorer — browse and pull models, LoRAs, and workflows without leaving the panel.";
+  civitaiBtn.addEventListener("click", () => openCivitai());
   {
     const svgNs = "http://www.w3.org/2000/svg";
     const svg = document.createElementNS(svgNs, "svg");
@@ -9159,10 +9240,6 @@ function buildPanel() {
     svg.append(shell, cMark);
     civitaiBtn.prepend(svg);
   }
-  const soonTag = document.createElement("span");
-  soonTag.textContent = "soon";
-  soonTag.style.cssText = "font-size:0.5625rem;opacity:.7;letter-spacing:.03em;text-transform:uppercase";
-  civitaiBtn.appendChild(soonTag);
 
   const toolbarSpacer = document.createElement("span");
   toolbarSpacer.className = "cmcp-spacer";
@@ -10695,6 +10772,17 @@ function buildPanel() {
           paintImage(item.dataUrl, caption);
         }
       }
+    },
+    // The agent called panel_open_civitai — open the CivitAI browser pre-seeded
+    // with a query + suggested filters so the user can visually pick a resource.
+    onOpenCivitai(msg) {
+      openCivitai({
+        query: typeof msg.query === "string" ? msg.query : "",
+        tab: msg.tab,
+        filters: msg.filters,
+        browsingLevels: msg.browsingLevels,
+      });
+      return { ok: true };
     },
     // The agent called panel_ui_render / panel_ui_update — A2UI cards in the chat.
     onUiRender(msg) {
