@@ -3389,6 +3389,16 @@ function placementFor(graph, pos) {
 let activePanelRoot = null;
 
 const GRAPH_TOOL_EXECUTORS = {
+  // Full-fidelity capture of the live canvas — the ROOT graph's serialized UI
+  // JSON (the same shape ComfyUI writes to disk on save), so the orchestrator
+  // can strip/slice/save what the user ACTUALLY has open without asking them to
+  // save to a file first. Read-only; subgraph defs ride along in `definitions`.
+  graph_serialize() {
+    const { rootGraph } = getGraphCtx();
+    const workflow = rootGraph.serialize();
+    return { workflow, node_count: workflow?.nodes?.length ?? 0 };
+  },
+
   graph_get_state() {
     const { graph, rootGraph } = getGraphCtx();
     const nodes = (graph._nodes ?? []).slice(0, MAX_STATE_NODES).map(summarizeNode);
@@ -7293,6 +7303,8 @@ function describeCommand(cmd, msg, reply) {
   switch (cmd) {
     case "graph_get_state":
       return { icon: "pi-eye", text: `Read graph — ${r.node_count} node${r.node_count === 1 ? "" : "s"}` };
+    case "graph_serialize":
+      return { icon: "pi-copy", text: `Captured canvas — ${r.node_count} node${r.node_count === 1 ? "" : "s"}` };
     case "graph_add_node":
       return { icon: "pi-plus-circle", text: `Added ${r.added?.type ?? "node"} (id ${r.added?.id})` };
     case "graph_remove_node":
