@@ -13,7 +13,7 @@ classifiers = ["Operating System :: OS Independent"]
 Repository = "https://github.com/artokun/comfyui-mcp-panel"
 Documentation = "https://comfyui-mcp.artokun.io/docs"
 "Bug Tracker" = "https://github.com/artokun/comfyui-mcp-panel/issues"
-Discord = "https://discord.gg/TtQpf96BHS"
+Discord = "https://discord.gg/cW9arBhzCu"
 
 [tool.comfy]
 PublisherId = "artokun"
