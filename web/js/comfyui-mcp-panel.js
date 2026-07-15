@@ -6117,6 +6117,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   // used to replay the transcript to a freshly-switched provider so it has the
   // conversation. Cleared the moment it's consumed.
   let pendingContext = null;
+  // Direct call_tool requests, cid-correlated. The CivitAI modal uses these to run
+  // whitelisted backend tools (download_civitai_model, save_workflow) synchronously
+  // without an agent turn — mirrors the mobile bridge_client.callTool. The
+  // orchestrator's call_tool handler + whitelist already exist server-side.
+  const pendingCalls = new Map(); // cid -> { resolve, reject, timer }
+  let cidSeq = 0;
   // De-duped status emitter. The pill only ever needs TRANSITIONS, so collapsing
   // consecutive repeats is a guard against any path double-emitting the same state
   // (and keeps the cold-start steady-"connecting" from re-painting on every retry).
@@ -6349,6 +6355,16 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
         }
         return;
       }
+      // Reply to a direct callTool() request (cid-correlated).
+      if (msg && msg.type === "tool_result" && typeof msg.cid === "string") {
+        const pend = pendingCalls.get(msg.cid);
+        if (pend) {
+          pendingCalls.delete(msg.cid);
+          clearTimeout(pend.timer);
+          pend.resolve(msg);
+        }
+        return;
+      }
       if (msg && msg.type === "say" && typeof msg.text === "string") {
         // `id` reconciles this committed reply with its live streaming preview.
         onSay(msg.text, { id: msg.id, streamed: !!msg.streamed });
@@ -6442,6 +6458,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
     sock.addEventListener("close", () => {
       sock = null;
       handshakeDone = false;
+      // Fail any in-flight direct tool calls — the reply can never arrive now.
+      for (const [, pend] of pendingCalls) {
+        clearTimeout(pend.timer);
+        pend.reject(new Error("bridge connection lost"));
+      }
+      pendingCalls.clear();
       clearHandshake();
       lastBridgeDownAt = Date.now(); // for the fast-vs-slow reconnect heuristic
       if (!closed) {
@@ -6598,6 +6620,40 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       } catch {
         return false;
       }
+    },
+    /** Run a whitelisted backend tool directly (no agent turn), cid-correlated.
+     *  Resolves { ok, result, error } where result is the MCP content array
+     *  ([{type:"text",text}], flatten by joining .text). Rejects on timeout or
+     *  socket close. Used by the CivitAI modal for download_civitai_model /
+     *  save_workflow. */
+    callTool(tool, args, opts) {
+      if (!sock || sock.readyState !== WebSocket.OPEN) {
+        return Promise.reject(new Error("bridge not connected"));
+      }
+      const cid = `ct-${Date.now()}-${cidSeq++}`;
+      const timeoutMs = (opts && opts.timeout) || 60000;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pendingCalls.delete(cid);
+          reject(new Error(`call_tool ${tool} timed out`));
+        }, timeoutMs);
+        pendingCalls.set(cid, { resolve, reject, timer });
+        try {
+          sock.send(
+            JSON.stringify({
+              type: "call_tool",
+              tab_id: workflowTabId(),
+              cid,
+              tool,
+              args: args || {},
+            }),
+          );
+        } catch (e) {
+          pendingCalls.delete(cid);
+          clearTimeout(timer);
+          reject(e);
+        }
+      });
     },
     setUrl(next, opts) {
       url = next || DEFAULT_BRIDGE_URL;
