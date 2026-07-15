@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-07-14
+
+### Added
+- graph_serialize command — full-fidelity live-canvas capture
+
+### Fixed
+- replace expired invite with the permanent link (#82)
+
+
 ## [0.8.1] - 2026-07-14
 
 ### Fixed
