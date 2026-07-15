@@ -111,6 +111,28 @@ export class CivitaiClient {
     return i >= 0 && parts[i + 1] ? parts[i + 1] : parts[parts.length - 2] || u;
   }
 
+  // primary downloadable file name for a model version (for "in library" matching)
+  _primaryFile(v) {
+    const files = (v && v.files) || [];
+    const f = files.find((x) => x.primary) || files[0];
+    return f && f.name ? f.name : null;
+  }
+
+  /** Parse the `list_local_models` markdown into a Set of normalized local
+   *  filenames (lowercased full name AND stem) for "in library" matching. */
+  static parseLocalNames(text) {
+    const set = new Set();
+    for (const line of (text || "").split("\n")) {
+      const m = line.match(/^\s*-\s+(.+?)(?:\s+\(\d|\s*$)/);
+      if (!m) continue;
+      const name = m[1].trim().toLowerCase();
+      if (!name || name.startsWith("trigger words") || name.startsWith("base:")) continue;
+      set.add(name);
+      set.add(name.replace(/\.[a-z0-9]+$/, "")); // stem, for extension mismatches
+    }
+    return set;
+  }
+
   _reactions(m) {
     const k = (a, b) => (m[a] ?? m[b] ?? 0);
     return k("likeCount", "likeCountAllTime") + k("heartCount", "heartCountAllTime") +
@@ -165,6 +187,7 @@ export class CivitaiClient {
       nsfwLevel: bestLvl, baseModel: j.modelVersions?.[0]?.baseModel || null,
       creator: j.creator?.username || null,
       downloadCount: j.stats?.downloadCount, thumbsUp: j.stats?.thumbsUpCount,
+      fileName: this._primaryFile(j.modelVersions?.[0]),
     };
   }
 
@@ -178,6 +201,7 @@ export class CivitaiClient {
       descriptionHtml: v.description || null,
       trainedWords: v.trainedWords || [], examples,
       downloadCount: v.stats?.downloadCount,
+      fileName: this._primaryFile(v),
     };
   }
 

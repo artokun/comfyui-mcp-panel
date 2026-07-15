@@ -63,6 +63,8 @@ function injectCss() {
     font-size: .6rem; padding: .1rem .3rem; border-radius: 4px; }
   .cmcp-cv-add { position: absolute; top: .3rem; right: .3rem; background: rgba(0,0,0,.55); color:#fff;
     border: none; border-radius: 6px; width: 24px; height: 24px; cursor: pointer; }
+  .cmcp-cv-owned { position: absolute; top: .3rem; right: .3rem; background: rgba(34,197,94,.92);
+    color: #04120a; font-size: .6rem; font-weight: 700; padding: .12rem .35rem; border-radius: 4px; }
   .cmcp-cv-loading { text-align: center; padding: 1rem; color: var(--p-text-muted-color,#a1a1aa); }
   .cmcp-cv-progress { position: absolute; top: 0; left: 0; right: 0; height: 2px;
     background: var(--p-primary-color, #3a7bd5); opacity: .0; transition: opacity .2s; }
@@ -108,7 +110,7 @@ export function openCivitaiModal(ctx, opts = {}) {
     query: opts.query || "",
     filters: { ...DEFAULT_FILTERS, ...(opts.filters || {}) },
     items: [], models: [], cursor: null, loading: false, done: false, reqId: 0,
-    signedIn: false,
+    signedIn: false, localNames: new Set(), localLoaded: false,
   };
   if (Array.isArray(opts.browsingLevels) && opts.browsingLevels.length) {
     state.filters = { ...state.filters, browsingLevels: opts.browsingLevels };
@@ -199,6 +201,7 @@ export function openCivitaiModal(ctx, opts = {}) {
         state.cursor = page.nextCursor; state.done = !page.nextCursor;
         appendItems(page.items);
       } else if (t.model) {
+        if (!state.localLoaded) await refreshLocalModels(); // for "in library" marks
         const page = await client.fetchModels({
           type: t.model, sort: f.modelSort, period: f.period,
           baseModels: f.baseModels, levels, cursor: state.cursor,
@@ -270,6 +273,7 @@ export function openCivitaiModal(ctx, opts = {}) {
     img.loading = "lazy"; img.src = m.coverUrl;
     img.addEventListener("error", () => { card.style.display = "none"; });
     card.append(img, el("span", "cmcp-cv-badge", m.type));
+    if (owned(m.fileName)) card.appendChild(el("span", "cmcp-cv-owned", "✓ In library"));
     const foot = el("div", "cmcp-cv-cardfoot", `${m.name}\n${m.baseModel || ""} · ⬇ ${m.downloadCount ?? "?"}`);
     foot.style.whiteSpace = "pre-line";
     card.appendChild(foot);
@@ -407,10 +411,17 @@ export function openCivitaiModal(ctx, opts = {}) {
         detailBody.appendChild(tw);
       }
       const dl = el("div", "cmcp-cv-actions");
+      const have = owned(version.fileName);
       const dlBtn = el("button", "cmcp-btn cmcp-btn-primary",
-        ctx.isMuted() ? "Download to my machine" : "Ask agent to download");
+        have ? "✓ In library — re-download"
+             : (ctx.isMuted() ? "Download to my machine" : "Ask agent to download"));
       dlBtn.addEventListener("click", () => pickModel(detail, version));
       dl.appendChild(dlBtn);
+      if (have) {
+        const note = el("span", null, "You already have this file locally.");
+        note.style.cssText = "font-size:.72rem;color:#4ade80;align-self:center";
+        dl.appendChild(note);
+      }
       detailBody.appendChild(dl);
       if (version.descriptionHtml || detail.descriptionHtml) {
         const desc = el("div", "cmcp-cv-detail");
@@ -540,6 +551,21 @@ export function openCivitaiModal(ctx, opts = {}) {
     wrap.appendChild(reset);
 
     sheet.body.appendChild(wrap);
+  }
+
+  // ── local model index ("in library" marks) ──────────────────────────
+  async function refreshLocalModels() {
+    try {
+      const res = await ctx.callTool("list_local_models", {}, { timeout: 15000 });
+      const text = (res.result || []).map((b) => (b && b.text) || "").join("\n");
+      state.localNames = CivitaiClient.parseLocalNames(text);
+    } catch { /* no marks if the call fails */ }
+    state.localLoaded = true;
+  }
+  function owned(fileName) {
+    if (!fileName || !state.localNames.size) return false;
+    const n = fileName.toLowerCase();
+    return state.localNames.has(n) || state.localNames.has(n.replace(/\.[a-z0-9]+$/, ""));
   }
 
   // ── account / OAuth ──────────────────────────────────────────────────
