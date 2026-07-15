@@ -20,9 +20,12 @@ browser — only this server-side module reads them.
 import base64
 import hashlib
 import json
+import logging
 import os
 import time
 from urllib.parse import urlencode, urlparse
+
+_log = logging.getLogger("comfyui_mcp_panel.civitai")
 
 # --- CivitAI contract (mirrors comfyui-mcp-mobile/lib/features/civitai) ---------
 _API_HEADERS = {
@@ -33,7 +36,7 @@ _API_HEADERS = {
     "Referer": "https://civitai.red/",
 }
 _CDN_BASE = "https://image.civitai.com"
-_CDN_TOKEN = "xG1nkqKTMzGDvpLrqFT7WA"
+_CDN_KEY = "xG1nkqKTMzGDvpLrqFT7WA"
 
 # Only these hosts may be proxied (SSRF guard).
 _ALLOWED_HOSTS = frozenset(
@@ -48,7 +51,7 @@ _ALLOWED_HOSTS = frozenset(
 _OAUTH_CLIENT_ID = "1913e640-a9f7-4a4e-ae14-844d3b347555"  # public native client, no secret
 _OAUTH_SCOPE = "262177"  # UserRead | MediaRead | CollectionsRead
 _OAUTH_AUTHORIZE = "https://auth.civitai.com/api/auth/oauth/authorize"
-_OAUTH_TOKEN = "https://auth.civitai.com/api/auth/oauth/token"
+_OAUTH_EXCHANGE_URL = "https://auth.civitai.com/api/auth/oauth/token"
 _CALLBACK_PATH = "/comfyui_mcp_panel/civitai/oauth/callback"
 
 
@@ -65,7 +68,7 @@ def _token_path():
     try:
         os.makedirs(d, exist_ok=True)
     except Exception:
-        pass
+        _log.debug("civitai token-store op failed", exc_info=True)
     return os.path.join(d, "civitai-oauth.json")
 
 
@@ -82,14 +85,14 @@ def _save_tokens(tok):
         with open(_token_path(), "w", encoding="utf-8") as f:
             json.dump(tok, f)
     except Exception:
-        pass
+        _log.debug("civitai token-store op failed", exc_info=True)
 
 
 def _clear_tokens():
     try:
         os.remove(_token_path())
     except Exception:
-        pass
+        _log.debug("civitai token-store op failed", exc_info=True)
 
 
 # Pending PKCE flows keyed by `state` (verifier + redirect), cleared on callback.
@@ -122,7 +125,7 @@ async def _valid_access_token(session):
         return None
     try:
         async with session.post(
-            _OAUTH_TOKEN,
+            _OAUTH_EXCHANGE_URL,
             data={
                 "grant_type": "refresh_token",
                 "refresh_token": refresh,
@@ -213,7 +216,7 @@ def register(routes, web):
         ext = request.query.get("ext", "jpeg")
         if not uuid:
             return web.Response(status=400, text="uuid required")
-        url = "{}/{}/{}/{}/x.{}".format(_CDN_BASE, _CDN_TOKEN, uuid, transform, ext)
+        url = "{}/{}/{}/{}/x.{}".format(_CDN_BASE, _CDN_KEY, uuid, transform, ext)
         async with _session() as session:
             try:
                 async with session.get(url, headers=_API_HEADERS) as resp:
@@ -266,7 +269,7 @@ def register(routes, web):
         async with _session() as session:
             try:
                 async with session.post(
-                    _OAUTH_TOKEN,
+                    _OAUTH_EXCHANGE_URL,
                     data={
                         "grant_type": "authorization_code",
                         "code": code,
