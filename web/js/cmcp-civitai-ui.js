@@ -236,18 +236,24 @@ export function openCivitaiModal(ctx, opts = {}) {
   // ── cards ─────────────────────────────────────────────────────────────
   function mediaCard(it, idx) {
     const card = el("div", "cmcp-cv-card");
+    // Both image and video cards show a still (video thumbnailUrl is a jpeg
+    // poster); hover on a video swaps in the muted transcoded clip.
+    const img = document.createElement("img");
+    img.loading = "lazy"; img.src = it.thumbnailUrl;
+    img.addEventListener("error", () => { card.style.display = "none"; });
+    card.appendChild(img);
     if (it.type === "video") {
-      const v = document.createElement("video");
-      v.src = it.thumbnailUrl; v.muted = true; v.loop = true; v.playsInline = true;
-      v.addEventListener("mouseenter", () => v.play().catch(() => {}));
-      v.addEventListener("mouseleave", () => { v.pause(); v.currentTime = 0; });
-      card.appendChild(v);
-      const badge = el("span", "cmcp-cv-badge", "▶"); card.appendChild(badge);
-    } else {
-      const img = document.createElement("img");
-      img.loading = "lazy"; img.src = it.thumbnailUrl;
-      img.addEventListener("error", () => { card.style.display = "none"; });
-      card.appendChild(img);
+      card.appendChild(el("span", "cmcp-cv-badge", "▶"));
+      let vid = null;
+      card.addEventListener("mouseenter", () => {
+        if (vid) return;
+        vid = document.createElement("video");
+        vid.src = it.fullUrl; vid.muted = true; vid.loop = true; vid.playsInline = true;
+        vid.autoplay = true;
+        card.appendChild(vid);
+        vid.play().catch(() => {});
+      });
+      card.addEventListener("mouseleave", () => { if (vid) { vid.remove(); vid = null; } });
     }
     const foot = el("div", "cmcp-cv-cardfoot", `${it.author ? "@" + it.author : ""}  ♥ ${it.reactions || 0}`);
     card.appendChild(foot);
@@ -406,8 +412,8 @@ export function openCivitaiModal(ctx, opts = {}) {
       if (version.descriptionHtml || detail.descriptionHtml) {
         const desc = el("div", "cmcp-cv-detail");
         desc.style.cssText = "font-size:.78rem;margin-top:.5rem";
-        desc.innerHTML = ctx.DOMPurify.sanitize(
-          ctx.marked.parse(htmlToText(version.descriptionHtml || detail.descriptionHtml)));
+        // CivitAI descriptions are HTML — sanitize and render directly.
+        desc.innerHTML = ctx.DOMPurify.sanitize(version.descriptionHtml || detail.descriptionHtml || "");
         detailBody.appendChild(desc);
       }
       // official examples
@@ -587,13 +593,6 @@ export function openCivitaiModal(ctx, opts = {}) {
       "z-index:80;font-size:.8rem;box-shadow:0 4px 16px rgba(0,0,0,.5)";
     modal.appendChild(t);
     setTimeout(() => t.remove(), 3000);
-  }
-
-  function htmlToText(html) {
-    if (!html) return "";
-    const d = document.createElement("div");
-    d.innerHTML = ctx.DOMPurify.sanitize(html);
-    return d.innerHTML;
   }
 
   // ── go ───────────────────────────────────────────────────────────────

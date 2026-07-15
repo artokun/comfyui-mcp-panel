@@ -145,17 +145,15 @@ export class CivitaiClient {
     };
   }
 
-  // pick the highest-level cover image within `levels`; drop the model if none qualify
+  // pick the highest-level cover image whose level is in the selected set (mask);
+  // drop the model entirely if none qualify (no NSFW cover leaking into an SFW view)
   _modelFromJson(j, levels) {
     const mask = bitmask(levels);
     let best = null, bestLvl = -1;
     for (const v of j.modelVersions || []) {
       for (const img of v.images || []) {
         const lvl = img.nsfwLevel || 1;
-        if ((lvl & mask) === 0 && lvl > 1) continue; // outside selected set (allow lvl1 always)
-        if ((mask & lvl) !== 0 || lvl <= (levels[0] || 1)) {
-          if (lvl > bestLvl) { best = img; bestLvl = lvl; }
-        }
+        if ((lvl & mask) !== 0 && lvl > bestLvl) { best = img; bestLvl = lvl; }
       }
     }
     if (!best) return null;
@@ -173,7 +171,7 @@ export class CivitaiClient {
   _versionFromJson(v, levels) {
     const mask = bitmask(levels);
     const examples = (v.images || [])
-      .filter((img) => ((img.nsfwLevel || 1) & mask) !== 0 || (img.nsfwLevel || 1) === 1)
+      .filter((img) => (((img.nsfwLevel || 1) & mask) !== 0))
       .map((img) => this._fromRest({ ...img, url: img.url }));
     return {
       id: v.id, name: v.name || null, baseModel: v.baseModel || null,
@@ -213,6 +211,7 @@ export class CivitaiClient {
       url: SEARCH_URL, method: "POST",
       headers: {
         authorization: `Bearer ${SEARCH_KEY}`,
+        origin: "https://civitai.red",
         "x-meilisearch-client":
           "Meilisearch instant-meilisearch (v0.13.5) ; Meilisearch JavaScript (v0.34.0)",
       },
