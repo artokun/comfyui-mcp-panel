@@ -67,6 +67,7 @@ import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
+import { openCivitaiModal } from "./cmcp-civitai-ui.js";
 
 let app = null;
 let api = null;
@@ -6107,7 +6108,7 @@ const RECONNECT_MAX_MS = 15000;
 let AGENT_MUTED = (() => { try { return localStorage.getItem("cmcp.muteAgents") === "1"; } catch { return false; } })();
 let AGENT_BLIND = (() => { try { return localStorage.getItem("cmcp.blindAgents") === "1"; } catch { return false; } })();
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -6310,6 +6311,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
             const mediaItems = Array.isArray(msg.items) ? msg.items : [];
             onShowMedia?.(mediaItems);
             result = { ok: true, count: mediaItems.length };
+          } else if (msg.cmd === "open_civitai") {
+            // Agent opens the CivitAI browser pre-seeded with a query + filters so
+            // the user can visually pick a resource.
+            if (!onOpenCivitai) throw new Error("This panel build can't open the CivitAI browser.");
+            result = onOpenCivitai(msg) || { ok: true };
           } else if (msg.cmd === "ui_render") {
             // A2UI card render. Validation errors THROW so the agent gets a
             // retryable tool error instead of a broken card.
@@ -6350,7 +6356,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
         // ask_user / request_secret paint their OWN cards and their replies carry
         // user input (a choice, or a SECRET) — never echo them as an activity card
         // (and never record them). Other commands get the normal activity card.
-        if (msg.cmd !== "ask_user" && msg.cmd !== "request_secret" && msg.cmd !== "set_todo" && msg.cmd !== "show_media" && msg.cmd !== "ui_render" && msg.cmd !== "ui_update") {
+        if (msg.cmd !== "ask_user" && msg.cmd !== "request_secret" && msg.cmd !== "set_todo" && msg.cmd !== "show_media" && msg.cmd !== "open_civitai" && msg.cmd !== "ui_render" && msg.cmd !== "ui_update") {
           onCommand?.(msg.cmd, msg, reply);
         }
         return;
@@ -9137,14 +9143,33 @@ function buildPanel() {
   ring.style.cursor = "pointer"; ring.onclick = muteBtn.onclick; // clicking the ring toggles mute
   reflectFeedGates();
 
-  // Civitai explorer — parked slot on the strip (greyed until it ships).
+  // Civitai explorer — opens the in-panel CivitAI browser modal. Also opened BY
+  // the agent (cmd:open_civitai) pre-seeded with a query + filters.
   // Mark: Civitai's hexagon-C, monochrome via currentColor (no brand gradients,
   // no event attrs — keeps the registry's SVG YARA gate happy).
+  let _civitaiHandle = null;
+  function civitaiCtx() {
+    return {
+      api,
+      root,
+      callTool: (t, a, o) => liveBridgeClient?.callTool(t, a, o),
+      sendUserMessage: (t, c, i) => liveBridgeClient?.sendUserMessage(t, c, i),
+      uploadBlobToInput,
+      bringChatForward: () => { try { openSidebarTab(); } catch {} },
+      isMuted: () => AGENT_MUTED,
+      marked,
+      DOMPurify,
+    };
+  }
+  function openCivitai(opts) {
+    try { _civitaiHandle?.close(); } catch {}
+    _civitaiHandle = openCivitaiModal(civitaiCtx(), opts || {});
+    return _civitaiHandle;
+  }
   const civitaiBtn = toolbarBtn("pi-circle", "Civitai");
   civitaiBtn.querySelector(".pi").remove();
-  civitaiBtn.dataset.soon = "1";
-  civitaiBtn.setAttribute("aria-disabled", "true");
-  civitaiBtn.title = "Civitai explorer — browse and pull models, LoRAs, and workflows without leaving the panel. Coming soon.";
+  civitaiBtn.title = "Civitai explorer — browse and pull models, LoRAs, and workflows without leaving the panel.";
+  civitaiBtn.addEventListener("click", () => openCivitai());
   {
     const svgNs = "http://www.w3.org/2000/svg";
     const svg = document.createElementNS(svgNs, "svg");
@@ -9165,10 +9190,6 @@ function buildPanel() {
     svg.append(shell, cMark);
     civitaiBtn.prepend(svg);
   }
-  const soonTag = document.createElement("span");
-  soonTag.textContent = "soon";
-  soonTag.style.cssText = "font-size:0.5625rem;opacity:.7;letter-spacing:.03em;text-transform:uppercase";
-  civitaiBtn.appendChild(soonTag);
 
   const toolbarSpacer = document.createElement("span");
   toolbarSpacer.className = "cmcp-spacer";
@@ -10662,6 +10683,17 @@ function buildPanel() {
           paintImage(item.dataUrl, caption);
         }
       }
+    },
+    // The agent called panel_open_civitai — open the CivitAI browser pre-seeded
+    // with a query + suggested filters so the user can visually pick a resource.
+    onOpenCivitai(msg) {
+      openCivitai({
+        query: typeof msg.query === "string" ? msg.query : "",
+        tab: msg.tab,
+        filters: msg.filters,
+        browsingLevels: msg.browsingLevels,
+      });
+      return { ok: true };
     },
     // The agent called panel_ui_render / panel_ui_update — A2UI cards in the chat.
     onUiRender(msg) {
