@@ -33,8 +33,10 @@ function injectCss() {
   if (_cssInjected) return;
   _cssInjected = true;
   const css = `
-  .cmcp-civitai-modal { max-width: 62rem; width: 96%; height: 92%; max-height: 92%;
-    padding: 0; gap: 0; overflow: hidden; }
+  .cmcp-cv-overlay { position: fixed; inset: 0; z-index: 10000; display: flex;
+    align-items: center; justify-content: center; padding: 1.5rem; background: rgba(0,0,0,.6); }
+  .cmcp-civitai-modal { width: min(1150px, 94vw); max-width: none; height: 90vh;
+    max-height: 90vh; padding: 0; gap: 0; overflow: hidden; }
   .cmcp-cv-head { display: flex; align-items: center; gap: .5rem; padding: .6rem .7rem;
     border-bottom: 1px solid var(--p-content-border-color, #3f3f46); flex-wrap: wrap; }
   .cmcp-cv-tabs { display: flex; gap: .25rem; flex-wrap: wrap; }
@@ -114,8 +116,9 @@ export function openCivitaiModal(ctx, opts = {}) {
   const tabDef = () => TABS.find((t) => t.key === state.tab);
   const isModelTab = () => !!tabDef().model;
 
-  // ── overlay ──────────────────────────────────────────────────────────────
-  const overlay = el("div", "cmcp-modal-overlay");
+  // ── overlay (full-viewport, mounted on <body> so it isn't confined to the
+  // narrow panel sidebar) ────────────────────────────────────────────────────
+  const overlay = el("div", "cmcp-cv-overlay");
   const modal = el("div", "cmcp-modal cmcp-civitai-modal");
   const close = () => overlay.remove();
   overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
@@ -163,7 +166,7 @@ export function openCivitaiModal(ctx, opts = {}) {
 
   modal.append(head, body);
   overlay.appendChild(modal);
-  ctx.root.appendChild(overlay);
+  document.body.appendChild(overlay);
 
   function syncTabs() {
     for (const b of tabsWrap.children) b.classList.toggle("active", b._key === state.tab);
@@ -572,9 +575,9 @@ export function openCivitaiModal(ctx, opts = {}) {
 
   // ── sub-modal + toast helpers ────────────────────────────────────────
   function openSubModal(title) {
-    const ov = el("div", "cmcp-modal-overlay"); ov.style.zIndex = "60";
-    const m = el("div", "cmcp-modal"); m.style.maxWidth = "34rem";
-    m.style.maxHeight = "80%"; m.style.overflowY = "auto";
+    const ov = el("div", "cmcp-cv-overlay"); ov.style.zIndex = "10001";
+    const m = el("div", "cmcp-modal"); m.style.maxWidth = "40rem"; m.style.width = "min(40rem, 92vw)";
+    m.style.maxHeight = "85vh"; m.style.overflowY = "auto";
     const head2 = el("div", "cmcp-modal-title", title);
     const x = el("button", "cmcp-cv-iconbtn"); x.innerHTML = '<i class="pi pi-times"></i>';
     x.style.cssText = "position:absolute;top:.5rem;right:.5rem";
@@ -582,7 +585,7 @@ export function openCivitaiModal(ctx, opts = {}) {
     const close2 = () => ov.remove();
     x.addEventListener("click", close2);
     ov.addEventListener("mousedown", (e) => { if (e.target === ov) close2(); });
-    m.append(head2, x, b); ov.appendChild(m); ctx.root.appendChild(ov);
+    m.append(head2, x, b); ov.appendChild(m); document.body.appendChild(ov);
     return { body: b, close: close2 };
   }
 
