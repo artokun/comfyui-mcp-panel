@@ -953,6 +953,12 @@ const SETTING_REMOTE_URL = "comfyui-mcp.remoteComfyuiUrl";
 // tester link) — leave "" until a channel opens; its button renders disabled as
 // "coming soon" so the section can ship ahead of the store uploads.
 const SETTING_MOBILE_BETA = "comfyui-mcp.mobileAppBeta";
+// Session ownership: when TRUE (default), the conversation belongs to the PANEL
+// — switching/saving/renaming/creating workflows never swaps or resets the chat;
+// the agent just gets told (mechanically, on the next message) which canvas it's
+// now operating on. When FALSE, the legacy per-workflow behavior: each workflow
+// keeps its own thread + agent session and switching tabs switches conversations.
+const SETTING_SESSION_FOLLOWS_PANEL = "comfyui-mcp.sessionFollowsPanel";
 const MOBILE_IOS_TESTFLIGHT_URL = ""; // e.g. https://testflight.apple.com/join/XXXXXXXX
 const MOBILE_ANDROID_FIREBASE_URL = ""; // e.g. https://appdistribution.firebase.dev/i/XXXXXXXX
 const SETTING_EXTERNAL_ORCH = "comfyui-mcp.externalOrchestrator";
@@ -1123,6 +1129,10 @@ function getSetting(id) {
   } catch {
     return undefined;
   }
+}
+/** Session ownership mode — panel-owned (default) vs legacy per-workflow. */
+function sessionFollowsPanel() {
+  return getSetting(SETTING_SESSION_FOLLOWS_PANEL) !== false;
 }
 function setSetting(id, value) {
   try {
@@ -1505,6 +1515,19 @@ function panelSettingsList() {
         if (suppressSettingOnChange || !settingsArmed) return;
         panelHooks.applyBackend?.(v);
       },
+    },
+    {
+      id: SETTING_SESSION_FOLLOWS_PANEL,
+      name: "Conversation follows the panel (not the workflow)",
+      category: cat("General", "Conversation follows the panel"),
+      sortOrder: 146,
+      tooltip:
+        "ON (default): your chat and the agent's memory persist while you switch, save, rename, or create " +
+        "workflows — the agent is simply told which canvas it now operates on. " +
+        "OFF: the legacy per-workflow mode — every workflow keeps its own separate conversation and agent " +
+        "session, and switching tabs switches chats.",
+      type: "boolean",
+      defaultValue: true,
     },
     {
       id: SETTING_AUTOCONNECT,
@@ -10198,6 +10221,45 @@ function buildPanel() {
     const wfid = workflowTabId();
     const wfkey = wf ? (wf.key || wf.id || "unsaved") : null;
     if (wfid === currentWorkflowId) return; // case 1: no change
+
+    // PANEL-OWNED SESSION (default): the conversation is the unit of continuity
+    // and the workflow is just the canvas target — switching, saving, renaming,
+    // or creating workflows must never swap or reset the chat (field report:
+    // "context window empties on workflow change", #feature-requests
+    // 1526999582418931845). Mechanics, not memory tools: re-hello re-targets
+    // THIS socket to the new tab id, the bridge stamps migrated_from, and the
+    // orchestrator REBINDS the live agent instance — deliberately NO
+    // resume_session frame (manager.reset would respawn the agent and wipe
+    // in-memory backends like Ollama). The agent learns which canvas it now
+    // drives via a one-shot context on the next message.
+    if (sessionFollowsPanel()) {
+      const initial = currentWorkflowId == null;
+      // tmp→wf adopt bookkeeping (a save gave the unsaved workflow a real id).
+      if (wfid.startsWith("wf:") && wf && (wf.key || wf.id)) _tempWorkflowIds.delete(wf.key || wf.id);
+      if (thread) {
+        thread.workflowKey = wfid; // thread rides along for per-workflow lookups
+        thread.ts = Date.now();
+        persistThreads();
+      }
+      currentWorkflowId = wfid;
+      currentWorkflowKey = wfkey;
+      currentWorkflowRef = wf;
+      if (!initial) {
+        try {
+          client?.rehello?.();
+        } catch {
+          /* reconnect path retries the hello */
+        }
+        const name = wf?.filename || wfkey || wfid;
+        client?.armContext?.(
+          `[panel] The user switched the open workflow on the canvas — it is now "${name}". ` +
+            `Your panel_* graph tools operate on THIS graph now; re-read it (panel_graph_outline) before ` +
+            `assuming or editing anything, since earlier turns may refer to a different workflow.`,
+        );
+        appendSystem(`Canvas → ${name} (same conversation).`);
+      }
+      return;
+    }
 
     const adopting =
       currentWorkflowId &&

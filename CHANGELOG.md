@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+- **panel-owned sessions (default)** — the conversation and agent memory now
+  persist while you switch, save, rename, or create workflows; the agent is
+  mechanically told which canvas it operates on (one-shot context, no memory
+  tools). The live agent instance is rebound across tab ids (no respawn), so
+  even in-memory local backends keep their history. Settings → General →
+  "Conversation follows the panel" restores the legacy per-workflow mode
+
 ### Changed
 - the agent-feed gate is now **Deafen** (was Mute), with ear / slashed-ear icons —
   "deafen" says what it does (the agent stops HEARING canvas events; your typed
