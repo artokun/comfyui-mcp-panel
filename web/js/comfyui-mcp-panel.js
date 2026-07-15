@@ -6706,8 +6706,8 @@ const PANEL_CSS = `
 .cmcp-toolbtn .pi { font-size: 0.8125rem; }
 .cmcp-toolbtn svg { width: 13px; height: 13px; display: block; }
 /* Engaged gates get a colored tint so their state is readable at a glance. */
-.cmcp-toolbtn.gate-on-mute { color: var(--p-red-400, #f87171); }
-.cmcp-toolbtn.gate-on-mute .pi { animation: cmcp-pulse 1s ease-in-out infinite; }
+.cmcp-toolbtn.gate-on-deafen { color: var(--p-red-400, #f87171); }
+.cmcp-toolbtn.gate-on-deafen svg { animation: cmcp-pulse 1s ease-in-out infinite; }
 .cmcp-toolbtn.gate-on-blind { color: var(--p-amber-400, #fbbf24); }
 .cmcp-toolbtn:disabled, .cmcp-toolbtn[data-soon] {
   opacity: 0.38; cursor: default;
@@ -9033,9 +9033,12 @@ function buildPanel() {
   fileInput.multiple = true;
   fileInput.hidden = true;
 
-  // ── Mute / Blind agent-feed toggles — live on the header utility strip
+  // ── Deafen / Blind agent-feed toggles — live on the header utility strip
   // (row 2), not the composer; they still tint the composer's context ring so
-  // "why is the ring red" answers itself. PrimeIcons only (already bundled).
+  // "why is the ring red" answers itself. Blind uses PrimeIcons (bundled);
+  // Deafen draws an inline ear SVG (PrimeIcons has no ear glyph) — monochrome
+  // currentColor strokes, no event attrs, same registry-YARA-safe recipe as
+  // the Civitai mark below.
   function toolbarBtn(icon, label) {
     const b = document.createElement("button");
     b.type = "button";
@@ -9047,18 +9050,40 @@ function buildPanel() {
     b.append(i, span);
     return b;
   }
-  const muteBtn = toolbarBtn("pi-volume-up", "Mute");
+  const deafenBtn = toolbarBtn("pi-volume-up", "Deafen");
   const blindBtn = toolbarBtn("pi-eye", "Blind");
+  // Ear icon (Lucide-style strokes): the ear is always drawn; the slash strokes
+  // toggle for the deafened state (ear vs ear-off).
+  let deafenSlash;
+  {
+    deafenBtn.querySelector(".pi").remove();
+    const svgNs = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(svgNs, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "2");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.setAttribute("aria-hidden", "true");
+    const outer = document.createElementNS(svgNs, "path");
+    outer.setAttribute("d", "M6 8.5a6.5 6.5 0 1 1 13 0c0 6-6 6-6 10a3.5 3.5 0 1 1-7 0");
+    const inner = document.createElementNS(svgNs, "path");
+    inner.setAttribute("d", "M15 8.5a2.5 2.5 0 0 0-5 0v1a2 2 0 1 1 0 4");
+    deafenSlash = document.createElementNS(svgNs, "path");
+    deafenSlash.setAttribute("d", "m2 2 20 20");
+    svg.append(outer, inner, deafenSlash);
+    deafenBtn.prepend(svg);
+  }
   function reflectFeedGates() {
-    const mi = muteBtn.querySelector(".pi");
-    mi.className = `pi ${AGENT_MUTED ? "pi-volume-off" : "pi-volume-up"}`;
-    muteBtn.classList.toggle("gate-on-mute", AGENT_MUTED);
-    muteBtn.querySelector("span").textContent = AGENT_MUTED ? "Muted" : "Mute";
-    muteBtn.title = AGENT_MUTED
-      ? "Agent feed: MUTED — no renders, images, errors, or canvas events reach any agent right now. " +
+    deafenSlash.style.display = AGENT_MUTED ? "" : "none";
+    deafenBtn.classList.toggle("gate-on-deafen", AGENT_MUTED);
+    deafenBtn.querySelector("span").textContent = AGENT_MUTED ? "Deafened" : "Deafen";
+    deafenBtn.title = AGENT_MUTED
+      ? "Agent feed: DEAFENED — no renders, images, errors, or canvas events reach any agent right now. " +
         "Messages you type still go through normally. Click to restore the live feed."
       : "Agent feed: live. The agent automatically hears about canvas activity — finished renders, " +
-        "execution errors, graph changes. Click to MUTE: nothing is fed to any agent until you unmute " +
+        "execution errors, graph changes. Click to DEAFEN: the agent hears nothing until you undeafen " +
         "(your typed messages still work). Use it to work on the canvas without the agent reacting.";
     const bi = blindBtn.querySelector(".pi");
     bi.className = `pi ${AGENT_BLIND ? "pi-eye-slash" : "pi-eye"}`;
@@ -9076,9 +9101,11 @@ function buildPanel() {
       ring.style.animation = AGENT_MUTED ? "cmcp-pulse 1s ease-in-out infinite" : "none";
     } catch {}
   }
-  muteBtn.onclick = () => { AGENT_MUTED = !AGENT_MUTED; try { localStorage.setItem("cmcp.muteAgents", AGENT_MUTED ? "1" : "0"); } catch {} reflectFeedGates(); };
+  // The localStorage key stays "cmcp.muteAgents" so an existing Deafen (né
+  // Mute) setting survives this rename.
+  deafenBtn.onclick = () => { AGENT_MUTED = !AGENT_MUTED; try { localStorage.setItem("cmcp.muteAgents", AGENT_MUTED ? "1" : "0"); } catch {} reflectFeedGates(); };
   blindBtn.onclick = () => { AGENT_BLIND = !AGENT_BLIND; try { localStorage.setItem("cmcp.blindAgents", AGENT_BLIND ? "1" : "0"); } catch {} reflectFeedGates(); };
-  ring.style.cursor = "pointer"; ring.onclick = muteBtn.onclick; // clicking the ring toggles mute
+  ring.style.cursor = "pointer"; ring.onclick = deafenBtn.onclick; // clicking the ring toggles deafen
   reflectFeedGates();
 
   // Civitai explorer — parked slot on the strip (greyed until it ships).
@@ -9116,7 +9143,7 @@ function buildPanel() {
 
   const toolbarSpacer = document.createElement("span");
   toolbarSpacer.className = "cmcp-spacer";
-  toolbar.append(muteBtn, blindBtn, toolbarSpacer, civitaiBtn);
+  toolbar.append(deafenBtn, blindBtn, toolbarSpacer, civitaiBtn);
 
   row.append(ring, ctxLabel, modelChip, spacer, attachBtn, micBtn, sendBtn);
   form.append(menuPop, modelPop, attachBar, input, row, fileInput);

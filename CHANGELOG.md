@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+- the agent-feed gate is now **Deafen** (was Mute), with ear / slashed-ear icons —
+  "deafen" says what it does (the agent stops HEARING canvas events; your typed
+  messages still go through), the old speaker icon read as audio mute. The saved
+  setting carries over (same storage key).
+
 ## [0.8.2] - 2026-07-14
 
 ### Added
