@@ -92,7 +92,7 @@ function setupListeners() {
 
 // Community + support. The Discord is the one-tap "I'm stuck" channel surfaced
 // in Settings → About (Join + Need help buttons) and linked from the README.
-const DISCORD_INVITE_URL = "https://discord.gg/TtQpf96BHS";
+const DISCORD_INVITE_URL = "https://discord.gg/cW9arBhzCu";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
