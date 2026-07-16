@@ -42,6 +42,9 @@ _API_HEADERS = {
 }
 _CDN_BASE = "https://image.civitai.com"
 _CDN_KEY = "xG1nkqKTMzGDvpLrqFT7WA"
+# Model-version file download endpoint. A module constant (not an inline literal)
+# so the aiohttp-level integration test can point it at a local mock server.
+_DOWNLOAD_BASE = "https://civitai.red/api/download/models/"
 
 # Only these hosts may be proxied (SSRF guard).
 _ALLOWED_HOSTS = frozenset(
@@ -122,19 +125,31 @@ def _host_ok(url):
 
 
 # --- /download redirect SSRF guard -------------------------------------------
-# civitai's signed download URLs live on civitai-owned hosts (b2.civitai.com,
-# live-verified) or Backblaze B2 directly. A /download redirect may ONLY land
-# on these — a compromised upstream must not be able to steer this server-side
-# fetch at loopback/RFC1918/link-local/metadata targets.
+# civitai's signed download URLs live on a few CDN hosts. Live-verified 2026-07:
+#   * signed-OUT / older files  → b2.civitai.com (Backblaze B2)
+#   * signed-IN / newer files   → civitai's Cloudflare R2 delivery worker,
+#       civitai-delivery-worker-prod.<civitai-account>.r2.cloudflarestorage.com
+# A /download redirect may ONLY land on these — a compromised upstream must not
+# be able to steer this server-side fetch at loopback/RFC1918/link-local/
+# metadata targets (and _resolves_public() re-checks every resolved address).
 _DL_REDIRECT_HOSTS = ("civitai.com", "civitai.red", "backblazeb2.com")
+# civitai's own Cloudflare R2 delivery worker: the worker-name prefix pins it to
+# civitai's delivery service (an attacker can't publish under this exact worker
+# name on civitai's account), and the r2.cloudflarestorage.com suffix keeps it
+# on Cloudflare's public object store. _resolves_public still blocks internal IPs.
+_R2_DELIVERY_PREFIX = "civitai-delivery-worker-prod."
+_R2_DELIVERY_SUFFIX = ".r2.cloudflarestorage.com"
 
 
 def _redirect_host_ok(host):
-    """True when a redirect host is civitai/B2 (exact match or subdomain)."""
+    """True when a redirect host is a civitai download CDN — civitai/B2 (exact
+    or subdomain) or civitai's signed Cloudflare R2 delivery worker."""
     if not isinstance(host, str) or not host:
         return False
     h = host.lower().rstrip(".")
-    return any(h == base or h.endswith("." + base) for base in _DL_REDIRECT_HOSTS)
+    if any(h == base or h.endswith("." + base) for base in _DL_REDIRECT_HOSTS):
+        return True
+    return h.startswith(_R2_DELIVERY_PREFIX) and h.endswith(_R2_DELIVERY_SUFFIX)
 
 
 def _ip_public(ip_str):
@@ -318,7 +333,7 @@ def register(routes, web):
         if not version_id.isdigit():
             return web.Response(status=400, text="numeric versionId required")
         q = {k: request.query[k] for k in ("type", "format") if request.query.get(k)}
-        url = "https://civitai.red/api/download/models/" + version_id
+        url = _DOWNLOAD_BASE + version_id
         if q:
             url += "?" + urlencode(q)
         timeout = aiohttp.ClientTimeout(total=300)
@@ -393,13 +408,16 @@ def register(routes, web):
                         return out
                 return web.Response(status=502, text="too many redirects")
             except Exception as e:
+                # Surface the traceback to ComfyUI's log — a swallowed handler
+                # exception here reads as an opaque 502 to the panel.
+                _log.warning("civitai download failed: %s", e, exc_info=True)
                 if streaming:
                     # mid-stream failure: headers are gone — abort the
                     # connection so the client's fetch fails loudly
                     if request.transport is not None:
                         request.transport.close()
                     raise
-                return web.Response(status=502, text=str(e))
+                return web.Response(status=502, text="download error: " + str(e))
 
     @routes.get("/comfyui_mcp_panel/civitai/oauth/start")
     async def _oauth_start(request):

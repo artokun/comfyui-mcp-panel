@@ -20,7 +20,7 @@ class RedirectHostAllowlist(unittest.TestCase):
     def test_civitai_and_b2_hosts_pass(self):
         for host in (
             "civitai.com",
-            "b2.civitai.com",          # the live signed-download host
+            "b2.civitai.com",          # the live signed-out download host
             "delivery.civitai.com",
             "civitai.red",
             "api.civitai.red",
@@ -28,6 +28,9 @@ class RedirectHostAllowlist(unittest.TestCase):
             "f004.backblazeb2.com",
             "B2.CIVITAI.COM",          # case-insensitive
             "b2.civitai.com.",         # trailing-dot FQDN form
+            # live signed-IN download host — civitai's Cloudflare R2 delivery worker
+            "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
+            "CIVITAI-DELIVERY-WORKER-PROD.abc123.R2.CLOUDFLARESTORAGE.COM",  # case-insensitive
         ):
             self.assertTrue(cp._redirect_host_ok(host), host)
 
@@ -40,6 +43,11 @@ class RedirectHostAllowlist(unittest.TestCase):
             "civitai.com.evil.com",     # allow-listed name as a PREFIX
             "notcivitai.com",           # suffix match must sit on a label boundary
             "xbackblazeb2.com",
+            # a foreign R2 bucket must NOT pass — only civitai's delivery worker
+            "evil-bucket.abc123.r2.cloudflarestorage.com",
+            "r2.cloudflarestorage.com",
+            # delivery-worker prefix on a NON-r2 host must not pass either
+            "civitai-delivery-worker-prod.evil.com",
             "",
             None,
             123,

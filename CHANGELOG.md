@@ -35,10 +35,12 @@ All notable changes to this project are documented here. This project adheres to
   per-entry and aggregate uncompressed size — a lying size header is
   re-checked after inflation; duplicate directory records aimed at one blob
   are deduped). Downloads stream through a new same-origin proxy route that
-  follows civitai's 307 server-side with an SSRF guard — only https
-  civitai/B2 hosts whose every DNS answer is a public address (no
-  loopback/RFC1918/link-local/metadata, no rebinding), OAuth header dropped
-  on the cross-host hop — streaming through (no buffering) with a 100MB cap.
+  follows civitai's 307 server-side with an SSRF guard — only https civitai
+  download CDNs (civitai/B2 **and** civitai's signed Cloudflare R2 delivery
+  worker, where signed-in downloads land) whose every DNS answer is a public
+  address (no loopback/RFC1918/link-local/metadata, no rebinding), OAuth
+  header dropped on the cross-host hop — streaming through (no buffering)
+  with a 100MB cap.
   Gated files (civitai 307s the download to `/login?…reason=download-auth`,
   even on some "Public" versions) are detected deterministically and return a
   clean 401, and every download/parse/empty/API-only outcome is surfaced BOTH
