@@ -961,7 +961,7 @@ const SETTING_MOBILE_BETA = "comfyui-mcp.mobileAppBeta";
 // keeps its own thread + agent session and switching tabs switches conversations.
 const SETTING_SESSION_FOLLOWS_PANEL = "comfyui-mcp.sessionFollowsPanel";
 const MOBILE_IOS_TESTFLIGHT_URL = "https://testflight.apple.com/join/ws65s4a2"; // beta-testers external group
-const MOBILE_ANDROID_FIREBASE_URL = ""; // e.g. https://appdistribution.firebase.dev/i/XXXXXXXX
+const MOBILE_ANDROID_FIREBASE_URL = "https://appdistribution.firebase.dev/i/27a5cccde72ffb42"; // beta testers group
 const SETTING_EXTERNAL_ORCH = "comfyui-mcp.externalOrchestrator";
 const SETTING_TOKEN_CIVITAI = "comfyui-mcp.setCivitaiToken";
 const SETTING_TOKEN_HF = "comfyui-mcp.setHuggingfaceToken";
