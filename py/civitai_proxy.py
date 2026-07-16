@@ -8,6 +8,9 @@ runs in the ComfyUI process — makes the real, header-injected calls server-sid
 Routes (all under ``/comfyui_mcp_panel/civitai``):
   GET/POST /api            JSON passthrough to an allow-listed CivitAI host.
   GET      /media          Stream CDN image/video bytes (for <img>/<video> src).
+  GET      /download       Stream a model-version file (workflow .json/.zip);
+                           follows civitai's 307 to the signed CDN URL here,
+                           dropping the Authorization header on the hop.
   GET      /oauth/start    Begin the OAuth (PKCE) sign-in; returns the authorize URL.
   GET      /oauth/callback OAuth redirect target; exchanges the code for tokens.
   GET      /oauth/status   Whether a valid session exists.
@@ -156,6 +159,7 @@ async def _valid_access_token(session):
 def register(routes, web):
     """Register the CivitAI proxy routes on ``PromptServer.instance.routes``."""
     import aiohttp  # ComfyUI ships aiohttp
+    from yarl import URL  # aiohttp's own URL type (for manual redirect joins)
 
     def _session():
         return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
@@ -232,6 +236,59 @@ def register(routes, web):
                         content_type=ctype.split(";")[0],
                         headers={"Cache-Control": "public, max-age=86400"},
                     )
+            except Exception as e:
+                return web.Response(status=502, text=str(e))
+
+    # Model-version file download (the Workflows tab's "load onto canvas").
+    # The /api JSON passthrough is text-only, so binary zips need a byte route.
+    # Live behavior (2026-07): GET /api/download/models/{id} 307s to a
+    # pre-SIGNED b2.civitai.com URL — redirects are followed HERE, manually,
+    # so the OAuth Authorization header is dropped on the cross-host hop
+    # (B2 rejects requests carrying both its query signature and a foreign
+    # Authorization header). Many workflow files download signed-out; gated
+    # ones (early access etc.) surface their 401/403 to the panel as-is.
+    _DL_CAP = 100 * 1024 * 1024  # workflow archives are KB-sized; 100MB is generous
+    _REDIRECTS = (301, 302, 303, 307, 308)
+
+    @routes.get("/comfyui_mcp_panel/civitai/download")
+    async def _civitai_download(request):
+        version_id = request.query.get("versionId", "")
+        if not version_id.isdigit():
+            return web.Response(status=400, text="numeric versionId required")
+        q = {k: request.query[k] for k in ("type", "format") if request.query.get(k)}
+        url = "https://civitai.red/api/download/models/" + version_id
+        if q:
+            url += "?" + urlencode(q)
+        timeout = aiohttp.ClientTimeout(total=300)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            headers = await _authed_headers(session, True)  # OAuth when signed in
+            try:
+                for _ in range(5):
+                    async with session.get(
+                        url, headers=headers, allow_redirects=False
+                    ) as resp:
+                        if resp.status in _REDIRECTS:
+                            loc = resp.headers.get("Location")
+                            if not loc:
+                                return web.Response(status=502, text="redirect without Location")
+                            url = str(resp.url.join(URL(loc)))
+                            if not url.startswith("https://"):
+                                return web.Response(status=502, text="unsafe redirect target")
+                            headers = dict(_API_HEADERS)  # drop Authorization on the hop
+                            continue
+                        if resp.status != 200:
+                            return web.Response(status=resp.status, text=await resp.text())
+                        if (resp.content_length or 0) > _DL_CAP:
+                            return web.Response(status=413, text="file too large")
+                        buf = bytearray()
+                        async for chunk in resp.content.iter_chunked(1 << 16):
+                            buf.extend(chunk)
+                            if len(buf) > _DL_CAP:
+                                return web.Response(status=413, text="file too large")
+                        return web.Response(
+                            body=bytes(buf), content_type="application/octet-stream"
+                        )
+                return web.Response(status=502, text="too many redirects")
             except Exception as e:
                 return web.Response(status=502, text=str(e))
 

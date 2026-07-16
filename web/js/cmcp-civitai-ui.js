@@ -7,7 +7,8 @@
 //
 // The monolith injects a `ctx` so this module never reaches into panel internals:
 //   ctx = { api, root, callTool, sendUserMessage, uploadBlobToInput,
-//           bringChatForward, isMuted, marked, DOMPurify }
+//           bringChatForward, isMuted, marked, DOMPurify,
+//           graphIsDirty, loadGraph }   // canvas access for "load onto canvas"
 
 import {
   CivitaiClient, DEFAULT_FILTERS, LEVELS, PERIODS, IMAGE_SORTS, MODEL_SORTS,
@@ -645,15 +646,23 @@ export function openCivitaiModal(ctx, opts = {}) {
           ctx.isMuted() ? "Save reference to inputs" : "Share with agent");
         shareBtn.addEventListener("click", () => shareImage(it, gen));
         actions.appendChild(shareBtn);
-        const graph = CivitaiClient.comfyGraph(gen.meta);
-        if (graph) {
+        const wf = CivitaiClient.comfyGraphInfo(gen.meta);
+        if (wf) {
+          if (wf.format === "ui") {
+            const loadBtn = el("button", "cmcp-btn", "Load onto canvas");
+            loadBtn.title = "Replace the current canvas with this post's embedded ComfyUI workflow (Ctrl+Z undoes it).";
+            loadBtn.addEventListener("click", () => loadOntoCanvas(wf.graph, closeLb));
+            actions.appendChild(loadBtn);
+          }
           const saveBtn = el("button", "cmcp-btn", "Save workflow");
-          saveBtn.addEventListener("click", () => saveWorkflow(it, graph));
+          saveBtn.addEventListener("click", () => saveWorkflow(it, wf.graph));
           actions.appendChild(saveBtn);
         }
         genBox.innerHTML = "";
         genBox.appendChild(el("div", "cmcp-cv-lb-muted",
-          graph ? "✓ Embedded ComfyUI workflow" : "No embedded workflow"));
+          !wf ? "No embedded workflow"
+          : wf.format === "ui" ? "✓ Embedded ComfyUI workflow"
+          : "Embedded graph is API-format only — it can't load onto the canvas, but Save keeps its JSON."));
         if (gen.meta?.prompt) {
           genBox.appendChild(el("div", "cmcp-cv-flabel", "Prompt"));
           genBox.appendChild(el("div", "cmcp-cv-lb-prompt", gen.meta.prompt));
@@ -708,17 +717,26 @@ export function openCivitaiModal(ctx, opts = {}) {
     try { gen = await client.getGenerationData(it.id); }
     catch (e) { sheet.body.innerHTML = ""; sheet.body.appendChild(el("div", null, "No data: " + e.message)); return; }
     sheet.body.innerHTML = "";
-    const graph = CivitaiClient.comfyGraph(gen.meta);
-    sheet.body.appendChild(el("div", null, graph ? "✓ Embedded ComfyUI workflow" : "No embedded workflow"));
+    const wf = CivitaiClient.comfyGraphInfo(gen.meta);
+    sheet.body.appendChild(el("div", null,
+      !wf ? "No embedded workflow"
+      : wf.format === "ui" ? "✓ Embedded ComfyUI workflow"
+      : "Embedded graph is API-format only — it can't load onto the canvas, but Save keeps its JSON."));
 
     const actions = el("div", "cmcp-cv-actions");
     const shareBtn = el("button", "cmcp-btn cmcp-btn-primary",
       ctx.isMuted() ? "Save reference to inputs" : "Share with agent");
     shareBtn.addEventListener("click", () => shareImage(it, gen));
     actions.appendChild(shareBtn);
-    if (graph) {
+    if (wf) {
+      if (wf.format === "ui") {
+        const loadBtn = el("button", "cmcp-btn", "Load onto canvas");
+        loadBtn.title = "Replace the current canvas with this example's embedded ComfyUI workflow (Ctrl+Z undoes it).";
+        loadBtn.addEventListener("click", () => loadOntoCanvas(wf.graph));
+        actions.appendChild(loadBtn);
+      }
       const saveBtn = el("button", "cmcp-btn", "Save workflow");
-      saveBtn.addEventListener("click", () => saveWorkflow(it, graph));
+      saveBtn.addEventListener("click", () => saveWorkflow(it, wf.graph));
       actions.appendChild(saveBtn);
     }
     sheet.body.appendChild(actions);
@@ -773,6 +791,90 @@ export function openCivitaiModal(ctx, opts = {}) {
     } catch (e) { toast("Save failed: " + e.message); }
   }
 
+  // ── load a UI-format workflow onto the live canvas ───────────────────
+  /** Confirm-if-dirty, then load via the bridge's undoable graph_load path
+   *  (snapshot → loadGraphData → checkState — one load = one Ctrl+Z step).
+   *  On success every explorer surface closes so the canvas is visible,
+   *  `beforeClose` first (e.g. the lightbox, which isn't a sub-modal).
+   *  Returns true when it loaded. */
+  function loadOntoCanvas(graph, beforeClose) {
+    if (typeof ctx.loadGraph !== "function") {
+      toast("This panel build can't load onto the canvas.");
+      return false;
+    }
+    if (ctx.graphIsDirty?.() && !window.confirm(
+      "Load this workflow onto the canvas?\n\n" +
+      "Your current workflow has unsaved changes that will be replaced (Ctrl+Z undoes the load).",
+    )) return false;
+    let res;
+    try {
+      res = ctx.loadGraph(graph);
+    } catch (e) {
+      toast("Couldn't load workflow: " + (e.message || e));
+      return false;
+    }
+    if (beforeClose) { try { beforeClose(); } catch { /* already gone */ } }
+    closeSubModals();
+    close();
+    toast(`Workflow loaded onto the canvas — ${res.node_count} node${res.node_count === 1 ? "" : "s"}. Ctrl+Z undoes it.`);
+    return true;
+  }
+
+  /** Download a model-version workflow file (raw .json or civitai's zip
+   *  wrapper), extract the UI-format graph(s), and load onto the canvas —
+   *  with a picker when an archive holds several. */
+  async function loadVersionWorkflow(version, file) {
+    toast("Fetching workflow…");
+    let bytes;
+    try {
+      bytes = await client.downloadVersionFile(version.id, file);
+    } catch (e) {
+      if (e.status === 401 || e.status === 403) {
+        // Most workflow files download signed-out (live-verified); a 401/403
+        // means this one is gated — the account button is the panel's way in.
+        toast(state.signedIn
+          ? "CivitAI refused this download — the file may need early access or a purchase."
+          : "CivitAI requires sign-in for this download — use the account (👤) button, then try again.");
+      } else {
+        toast("Download failed: " + (e.message || e));
+      }
+      return;
+    }
+    let candidates;
+    try {
+      if (/\.zip$/i.test(file.name || "")) {
+        candidates = await CivitaiClient.workflowsFromZip(bytes);
+      } else {
+        const graph = JSON.parse(new TextDecoder().decode(bytes));
+        const format = CivitaiClient.workflowFormat(graph);
+        candidates = format === "unknown" ? [] : [{ name: file.name, graph, format }];
+      }
+    } catch (e) {
+      toast("Couldn't read the workflow file: " + (e.message || e));
+      return;
+    }
+    const uis = candidates.filter((c) => c.format === "ui");
+    if (!uis.length) {
+      toast(candidates.length
+        ? "That file only holds API-format graphs — not loadable onto the canvas. Ask the agent to run it instead."
+        : "No ComfyUI workflow found in that file.");
+      return;
+    }
+    if (uis.length === 1) { loadOntoCanvas(uis[0].graph); return; }
+    // several workflows in one archive — let the user pick
+    const picker = openSubModal("Pick a workflow to load");
+    const list = el("div", "cmcp-cv-creators");
+    list.style.maxHeight = "24rem";
+    for (const c of uis) {
+      const b = el("button", "cmcp-cv-creator");
+      b.appendChild(el("span", null, c.name));
+      b.appendChild(el("span", "sub", `${c.graph.nodes.length} nodes`));
+      b.addEventListener("click", () => loadOntoCanvas(c.graph));
+      list.appendChild(b);
+    }
+    picker.body.appendChild(list);
+  }
+
   // ── model detail ─────────────────────────────────────────────────────
   async function openModelDetail(m) {
     const sheet = openSubModal(m.name);
@@ -798,6 +900,19 @@ export function openCivitaiModal(ctx, opts = {}) {
              : (ctx.isMuted() ? "Download to my machine" : "Ask agent to download"));
       dlBtn.addEventListener("click", () => pickModel(detail, version));
       dl.appendChild(dlBtn);
+      // Workflow files (.json, or the zip wrapper civitai puts around Workflows
+      // uploads) can load straight onto the canvas — the community ask.
+      const wfFiles = CivitaiClient.workflowFiles(version, detail.type);
+      for (const f of wfFiles) {
+        const b = el("button", "cmcp-btn",
+          wfFiles.length > 1 ? `Load onto canvas — ${f.name}` : "Load workflow onto canvas");
+        const size = f.sizeKB != null
+          ? (f.sizeKB >= 1024 ? (f.sizeKB / 1024).toFixed(1) + " MB" : Math.max(1, Math.round(f.sizeKB)) + " KB")
+          : null;
+        b.title = `Download ${f.name}${size ? ` (${size})` : ""} and load it onto the canvas (Ctrl+Z undoes it).`;
+        b.addEventListener("click", () => loadVersionWorkflow(version, f));
+        dl.appendChild(b);
+      }
       if (have) {
         const note = el("span", null, "You already have this file locally.");
         note.style.cssText = "font-size:.72rem;color:#4ade80;align-self:center";
@@ -1191,6 +1306,12 @@ export function openCivitaiModal(ctx, opts = {}) {
   }
 
   // ── sub-modal + toast helpers ────────────────────────────────────────
+  // Open sub-modal closers, so a successful canvas load can dismiss every
+  // stacked sheet (detail → gen-info → picker) in one sweep.
+  const _subModals = new Set();
+  function closeSubModals() {
+    for (const c of [..._subModals]) { try { c(); } catch { /* already gone */ } }
+  }
   function openSubModal(title, onClose) {
     const ov = el("div", "cmcp-cv-overlay"); ov.style.zIndex = "10001";
     const m = el("div", "cmcp-modal"); m.style.maxWidth = "40rem"; m.style.width = "min(40rem, 92vw)";
@@ -1201,7 +1322,8 @@ export function openCivitaiModal(ctx, opts = {}) {
     const b = el("div"); m.style.position = "relative";
     // Every close path (✕ button, backdrop click, sheet.close()) funnels here,
     // so a caller-supplied teardown runs no matter how the sheet is dismissed.
-    const close2 = () => { ov.remove(); if (onClose) onClose(); };
+    const close2 = () => { _subModals.delete(close2); ov.remove(); if (onClose) onClose(); };
+    _subModals.add(close2);
     x.addEventListener("click", close2);
     ov.addEventListener("mousedown", (e) => { if (e.target === ov) close2(); });
     m.append(head2, x, b); ov.appendChild(m); document.body.appendChild(ov);
@@ -1210,10 +1332,13 @@ export function openCivitaiModal(ctx, opts = {}) {
 
   function toast(msg) {
     const t = el("div", null, msg);
-    t.style.cssText = "position:absolute;bottom:1rem;left:50%;transform:translateX(-50%);" +
+    // A successful canvas load closes the whole modal — that toast must
+    // outlive it, so a disconnected modal falls back to a fixed body toast.
+    const inModal = modal.isConnected;
+    t.style.cssText = `position:${inModal ? "absolute" : "fixed"};bottom:1rem;left:50%;transform:translateX(-50%);` +
       "background:var(--p-surface-800,#27272a);color:#fafafa;padding:.5rem .8rem;border-radius:8px;" +
-      "z-index:80;font-size:.8rem;box-shadow:0 4px 16px rgba(0,0,0,.5)";
-    modal.appendChild(t);
+      `z-index:${inModal ? "80" : "10005"};font-size:.8rem;box-shadow:0 4px 16px rgba(0,0,0,.5)`;
+    (inModal ? modal : document.body).appendChild(t);
     setTimeout(() => t.remove(), 3000);
   }
 

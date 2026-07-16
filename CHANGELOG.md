@@ -10,12 +10,32 @@ All notable changes to this project are documented here. This project adheres to
 - CivitAI browser filters actually respond: chips re-render on click (the sheet
   wired a rerender hook that was never defined, so they looked dead), and the
   level/base-model toggles no longer mutate the frozen module defaults
+- CivitAI lightbox no longer claims "✓ Embedded ComfyUI workflow" for posts
+  whose `meta.comfy.workflow` is the empty `{}` civitai sometimes emits — it
+  now falls back to the API-format prompt (savable) and says which one it found
 
 ### Added
 - CivitAI browser: **"See more from @creator"** in the lightbox and model
   detail, and **GitHub-style search qualifiers** — "@name terms" sets the
   creator filter (the displayed @token always owns it; deleting it clears)
   while the terms stay ranked full-text search (#86)
+- CivitAI browser: **Load workflow onto canvas** (community request from
+  Discord). In the lightbox, a post with an embedded UI-format ComfyUI graph
+  gets a "Load onto canvas" action: confirm-overwrite when the current
+  workflow has unsaved changes, then load through the same undoable path the
+  agent bridge uses (snapshot → `loadGraphData` → change-tracker `checkState`,
+  so one load = one Ctrl+Z). API-format-only posts say so honestly instead of
+  corrupting the canvas (Save still keeps their JSON — there is no client-side
+  API→UI converter). On the Workflows tab, model versions grow a
+  "Load workflow onto canvas" button per downloadable workflow file: raw
+  `.json` loads directly; civitai's `.zip` wrappers (780 of 844 live versions)
+  are unpacked in the browser (central-directory walk +
+  `DecompressionStream("deflate-raw")`, no new dependency) with a picker when
+  an archive holds several workflows. Downloads stream through a new
+  same-origin proxy route that follows civitai's 307 to the signed CDN URL
+  server-side (dropping the OAuth header on the cross-host hop) and caps at
+  100MB; a gated file's 401/403 surfaces as a "sign in via the account
+  button" hint
 - CivitAI browser: **Creator filter** in the filter sheet (parity with the
   mobile app) — an empty field shows the site's top-creators leaderboard
   (ranked, with download/like counts; degrades to a friendly note when the

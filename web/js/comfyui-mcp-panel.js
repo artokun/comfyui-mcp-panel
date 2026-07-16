@@ -9212,6 +9212,22 @@ function buildPanel() {
       isMuted: () => AGENT_MUTED,
       marked,
       DOMPurify,
+      // Canvas access for "load workflow onto canvas": dirty check for the
+      // confirm-overwrite prompt, then the SAME undoable path the bridge's
+      // graph_load command takes (snapshot → loadGraphData → checkState, so
+      // one load = one Ctrl+Z step). Throws with a readable message when the
+      // graph isn't a loadable UI workflow.
+      graphIsDirty: () => {
+        try { return !!app?.extensionManager?.workflow?.activeWorkflow?.isModified; }
+        catch { return false; }
+      },
+      loadGraph: (graph) => {
+        const result = GRAPH_TOOL_EXECUTORS.graph_load({ graph });
+        try {
+          app.extensionManager?.workflow?.activeWorkflow?.changeTracker?.checkState?.();
+        } catch { /* tracker unavailable (older frontend) — undo stays best-effort */ }
+        return result;
+      },
     };
   }
   function openCivitai(opts) {
