@@ -12,6 +12,16 @@ All notable changes to this project are documented here. This project adheres to
   level/base-model toggles no longer mutate the frozen module defaults
 
 ### Added
+- CivitAI browser: **like/unlike toggle** — heart on card hover and in the
+  lightbox (signed out, the heart opens sign-in); likes mirror into a **default
+  likes collection** picked (or created) in the new account sheet
+- CivitAI browser: sub-nav under the tabs with **debounced (500ms) search on
+  every tab** (Meili for media, REST query for models, client-side for
+  favorites) behind a blur+spinner overlay; **Favorites shows ALL your likes**
+  (no browsing-level gate on your own reactions) with All/Images/Videos filter
+  chips; all feeds page 100 at a time with scroll auto-load
+- CivitAI OAuth scope now includes SocialWrite + CollectionsRead (reactions and
+  collections 403'd under the old scope — existing sign-ins re-consent once)
 - CivitAI browser: clicking an image/video opens a full-screen LIGHTBOX — media
   on the left, details on the right (author, stats, prompt/negative, parameters,
   share-with-agent / save-workflow actions), with arrow-key/wheel paging and Esc
