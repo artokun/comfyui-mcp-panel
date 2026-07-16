@@ -39,6 +39,24 @@ export const DEFAULT_FILTERS = Object.freeze({
   username: null, // creator filter — null means everyone
 });
 
+/**
+ * GitHub-style search qualifiers: an "@name" token anywhere in the input sets
+ * the creator filter; every other token stays part of the ranked full-text
+ * query. "@ba0zi cyberpunk city rain" -> { creator: "ba0zi", query:
+ * "cyberpunk city rain" }. The terms deliberately remain Meili `q` (typo-
+ * tolerant, relevance-ranked) rather than exact tagNames filters, which would
+ * be brittle. Only the FIRST @token is the creator; later ones are treated as
+ * plain terms so a pasted sentence can't silently retarget the filter.
+ */
+export function parseCreatorQuery(raw) {
+  const tokens = String(raw ?? "").trim().split(/\s+/).filter(Boolean);
+  const at = tokens.find((t) => t.length > 1 && t.startsWith("@"));
+  return {
+    creator: at ? at.slice(1) : null,
+    query: tokens.filter((t) => t !== at).join(" "),
+  };
+}
+
 export function filtersDirty(f) {
   return (
     f.period !== "Week" ||

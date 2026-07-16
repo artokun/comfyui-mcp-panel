@@ -11,7 +11,7 @@
 
 import {
   CivitaiClient, DEFAULT_FILTERS, LEVELS, PERIODS, IMAGE_SORTS, MODEL_SORTS,
-  BASE_MODELS, filtersDirty, bitmask,
+  BASE_MODELS, filtersDirty, bitmask, parseCreatorQuery,
 } from "./cmcp-civitai.js";
 
 const TABS = [
@@ -212,12 +212,40 @@ export function openCivitaiModal(ctx, opts = {}) {
   search.placeholder = "Search CivitAI…";
   search.value = state.query;
   let searchTimer = null;
+  // An @token in the search box OWNS the creator filter: typing one sets it,
+  // deleting it clears it — but a creator picked in the filter sheet is left
+  // alone (creatorFromSearch tracks whose it is).
+  let creatorFromSearch = false;
   const applySearch = () => {
-    const q = search.value.trim();
-    if (q === state.query) return;
-    state.query = q;
+    const { creator, query } = parseCreatorQuery(search.value);
+    const f = state.filters;
+    let changed = query !== state.query;
+    if (creator) {
+      if (f.username !== creator) { f.username = creator; changed = true; }
+      creatorFromSearch = true;
+    } else if (creatorFromSearch && f.username) {
+      f.username = null;
+      creatorFromSearch = false;
+      changed = true;
+    }
+    if (!changed) return;
+    state.query = query;
+    syncTabs();
     reload({ searching: true });
   };
+  /** "See more from @creator" — set the creator filter and reflect it in the
+   *  search box as an @token (the box is the source of truth for it). The
+   *  favorites tab has no creator param, so it jumps to Images. */
+  function seeMoreFromCreator(name, { toModelTab = false } = {}) {
+    if (!name) return;
+    state.filters.username = String(name);
+    creatorFromSearch = true;
+    state.query = "";
+    search.value = `@${name} `;
+    if (tabDef().fav) state.tab = toModelTab ? state.tab : "images";
+    syncTabs();
+    reload({ searching: true });
+  }
   search.addEventListener("input", () => {
     clearTimeout(searchTimer);
     searchTimer = setTimeout(applySearch, 500);
@@ -574,6 +602,14 @@ export function openCivitaiModal(ctx, opts = {}) {
         `♥ ${it.reactions || 0} · ${idx + 1} / ${state.items.length}${state.done ? "" : "+"}`));
 
       const actions = el("div", "cmcp-cv-actions");
+      if (it.author) {
+        const moreBtn = el("button", "cmcp-btn", `See more from @${it.author}`);
+        moreBtn.addEventListener("click", () => {
+          closeLb();
+          seeMoreFromCreator(it.author);
+        });
+        actions.appendChild(moreBtn);
+      }
       side.appendChild(actions);
       const genBox = el("div");
       genBox.appendChild(el("div", "cmcp-cv-lb-muted", "Loading generation info…"));
@@ -743,6 +779,14 @@ export function openCivitaiModal(ctx, opts = {}) {
         const note = el("span", null, "You already have this file locally.");
         note.style.cssText = "font-size:.72rem;color:#4ade80;align-self:center";
         dl.appendChild(note);
+      }
+      if (detail.creator) {
+        const moreBtn = el("button", "cmcp-btn", `See more from @${detail.creator}`);
+        moreBtn.addEventListener("click", () => {
+          sheet.close();
+          seeMoreFromCreator(detail.creator, { toModelTab: true });
+        });
+        dl.appendChild(moreBtn);
       }
       detailBody.appendChild(dl);
       if (version.descriptionHtml || detail.descriptionHtml) {

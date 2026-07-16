@@ -4,7 +4,7 @@
 // query the explorer makes.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CivitaiClient, DEFAULT_FILTERS, filtersDirty } from "../../web/js/cmcp-civitai.js";
+import { CivitaiClient, DEFAULT_FILTERS, filtersDirty, parseCreatorQuery } from "../../web/js/cmcp-civitai.js";
 
 /** Client whose proxy calls are captured. `payload` may be a single response
  *  (every call resolves it) or an array consumed one per call (last repeats). */
@@ -167,4 +167,39 @@ test("searchCreators shapes /v1/creators and short-circuits empty queries", asyn
   calls.length = 0;
   assert.deepEqual(await client.searchCreators("   "), []);
   assert.equal(calls.length, 0); // no network call for a blank query
+});
+
+// ── parseCreatorQuery: GitHub-style "@creator terms" search qualifiers ──────
+test("parseCreatorQuery: @name + terms split into creator and ranked query", () => {
+  assert.deepEqual(parseCreatorQuery("@ba0zi cyberpunk city rain"), {
+    creator: "ba0zi",
+    query: "cyberpunk city rain",
+  });
+});
+
+test("parseCreatorQuery: @token position doesn't matter", () => {
+  assert.deepEqual(parseCreatorQuery("cyberpunk @ba0zi rain"), {
+    creator: "ba0zi",
+    query: "cyberpunk rain",
+  });
+});
+
+test("parseCreatorQuery: no qualifier → plain query, null creator", () => {
+  assert.deepEqual(parseCreatorQuery("cyberpunk city"), { creator: null, query: "cyberpunk city" });
+});
+
+test("parseCreatorQuery: bare '@' is a plain term, not an empty creator", () => {
+  assert.deepEqual(parseCreatorQuery("@ rain"), { creator: null, query: "@ rain" });
+});
+
+test("parseCreatorQuery: only the FIRST @token is the creator; later ones stay terms", () => {
+  assert.deepEqual(parseCreatorQuery("@first @second rain"), {
+    creator: "first",
+    query: "@second rain",
+  });
+});
+
+test("parseCreatorQuery: empty/whitespace input", () => {
+  assert.deepEqual(parseCreatorQuery("   "), { creator: null, query: "" });
+  assert.deepEqual(parseCreatorQuery(""), { creator: null, query: "" });
 });
