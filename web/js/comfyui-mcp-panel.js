@@ -562,10 +562,10 @@ const STORAGE_KEY_BACKEND = "comfyui-mcp.panel.backend";
 // "connected but no agent" lie.
 const DEFAULT_BRIDGE_URL = "ws://127.0.0.1:9180";
 const LEGACY_BRIDGE_URL = "ws://127.0.0.1:9101"; // old shared default — migrate off it
-// Per-backend DEFAULT bridge ports: the panel orchestrator binds a DEDICATED port
-// per backend (claude 9180, codex 9181) so two backends never collide. The Settings
-// "Bridge URL" is PER-BACKEND (a map, like model/effort) and each backend's value
-// seeds the default URL for that backend. A per-backend DEFAULT must NOT count as a
+// Single-port multi-provider: ONE orchestrator bridge (9180) serves ALL backends —
+// provider selection happens per tab over the hello/set_backend handshake, not by
+// port. This per-backend map survives from the old per-port layout for call-site
+// compatibility; every entry is the same URL. A DEFAULT must NOT count as a
 // "manual override" (so /connect's bridge_url still applies) — only a user-typed
 // NON-default URL overrides (see connectAgent.manualOverride).
 // Single-port multi-provider: ONE orchestrator on ONE bridge serves every
@@ -1214,8 +1214,8 @@ function externalOrchestratorMode() {
   // auto-targets the ComfyUI the browser is on; the setting is a back-compat no-op.
   return true;
 }
-// The Bridge URL to dial for `backend`: its per-backend Settings value when set,
-// else that backend’s default port (claude 9180 / codex 9181 / gemini 9182).
+// The Bridge URL to dial: the single (advanced) Bridge URL override when set,
+// else the shared single-port default (9180 — same for every backend).
 function configuredBridgeUrlFor(backend) {
   // Single-port multi-provider: ONE bridge for every provider. Honor only the
   // single (advanced) Bridge URL override, else the default — ignore any stale
@@ -1378,10 +1378,10 @@ function panelSettingsList() {
       if (backend === currentSettingsBackend()) panelHooks.applyEffort?.(v);
     },
   });
-  // A per-backend "Bridge URL" — each backend has its OWN orchestrator port
-  // (claude 9180, codex 9181), so the URL must be per-backend or a switch to Codex
-  // leaves Reconnect dialing Claude's 9180. The value seeds the default URL for that
-  // backend; /connect's returned bridge_url still applies. Drives the live panel
+  // A per-backend "Bridge URL" settings row — retained from the pre-single-port
+  // layout (ONE bridge on 9180 now serves every backend; configuredBridgeUrlFor
+  // ignores stale per-backend values). The value seeds the URL field shown for
+  // that backend; /connect's returned bridge_url still applies. Drives the live panel
   // (a reconnect) only for the ACTIVE backend's group — a non-active group's edit
   // just persists, it never retargets the running bridge.
   const bridgeUrlSetting = (backend, sortOrder) => ({
@@ -11974,12 +11974,11 @@ function buildPanel() {
     // A non-empty URL that differs from the last auto-applied one is a deliberate
     // manual override → keep it, and don't let /connect's bridge_url clobber it.
     const wanted = urlInput.value.trim();
-    // Only a GENUINELY custom URL counts as a manual override. The SELECTED backend's
-    // DEFAULT bridge URL must NOT — the per-backend Settings "Bridge URL" seeds that
-    // default (claude 9180 / codex 9181), and on a sticky/load connect lastAutoUrl is
-    // still empty, so flagging the default as an override would SKIP the per-backend
-    // bridge_url from /connect (#25, now generalized PER BACKEND). Comparing against
-    // THIS backend's default — not just claude's 9180 — is what lets Codex follow 9181.
+    // Only a GENUINELY custom URL counts as a manual override. The backend's DEFAULT
+    // bridge URL must NOT — the Settings "Bridge URL" seeds that default (the shared
+    // single-port 9180, same for every backend), and on a sticky/load connect
+    // lastAutoUrl is still empty, so flagging the default as an override would SKIP
+    // the bridge_url from /connect (#25).
     // A chip switch is INCLUDED now (no `!opts.fromChip` guard): connectBackend already
     // seeds urlInput + the client url from SETTING_BRIDGE_URL[id] BEFORE this runs, so a
     // user-CUSTOMIZED non-default per-backend URL must survive the switch and not be
@@ -12155,9 +12154,9 @@ function buildPanel() {
     // clearing the guard first means EXACTLY ONE connect runs for the new backend.
     client.stop();
     connecting = false;
-    // FIX 2 — point the bridge (and the Advanced URL field) at the NEW backend's own
-    // bridge URL before reconnecting, so a switch — and any later Reconnect — dials
-    // THIS backend's port (codex 9181), never the previous backend's (claude 9180).
+    // FIX 2 — refresh the bridge URL (and the Advanced URL field) before
+    // reconnecting. Single-port now, so this is normally the same 9180 URL for
+    // every backend — it still matters when a custom Bridge URL override is set.
     // /connect's returned bridge_url still applies on top. The client is stopped, so
     // setUrl only updates its `url` here (its connect() no-ops while closed);
     // connectAgent's client.start() opens it. urlInput has no settings onChange wired,
