@@ -134,6 +134,15 @@ function injectCss() {
     animation: cmcp-cv-spin .8s linear infinite; }
   @keyframes cmcp-cv-spin { to { transform: rotate(360deg); } }
   .cmcp-cv-lb-muted { font-size: .74rem; color: var(--p-text-muted-color,#a1a1aa); }
+  .cmcp-cv-creators { display: flex; flex-direction: column; gap: .2rem; width: 100%;
+    max-height: 13rem; overflow-y: auto; }
+  .cmcp-cv-creator { display: flex; align-items: baseline; gap: .5rem; padding: .3rem .5rem;
+    border-radius: 8px; border: 1px solid var(--p-content-border-color,#3f3f46);
+    background: transparent; color: var(--p-text-color,#fafafa); cursor: pointer;
+    text-align: left; font-size: .78rem; }
+  .cmcp-cv-creator:hover { background: var(--p-surface-800,#27272a); }
+  .cmcp-cv-creator .sub { margin-left: auto; font-size: .68rem; flex-shrink: 0;
+    color: var(--p-text-muted-color,#a1a1aa); }
   .cmcp-cv-lb-prompt { font-size: .78rem; white-space: pre-wrap; word-break: break-word;
     background: var(--p-surface-950,#111); border-radius: 8px; padding: .5rem;
     max-height: 14rem; overflow-y: auto; }
@@ -175,6 +184,7 @@ export function openCivitaiModal(ctx, opts = {}) {
       browsingLevels: [...(opts.filters?.browsingLevels ?? DEFAULT_FILTERS.browsingLevels)],
     },
     items: [], models: [], cursor: null, loading: false, done: false, reqId: 0,
+    searchSeq: 0, // searching-overlay ownership (see reload)
     signedIn: false, localNames: new Set(), localLoaded: false,
     favType: "all", // favorites sub-filter: all | image | video
   };
@@ -283,13 +293,23 @@ export function openCivitaiModal(ctx, opts = {}) {
   function setLoading(on) { state.loading = on; progress.classList.toggle("on", on); }
 
   async function reload({ searching = false } = {}) {
+    // Invalidate any page load already IN FLIGHT: its response belongs to the
+    // OLD tab/query/filters and must not repopulate the just-cleared grid (nor
+    // leave its cursor behind). The stale request's guarded `finally` won't
+    // clear the loading flag anymore, so reset it here too.
+    state.reqId++;
+    setLoading(false);
     state.items = []; state.models = []; state.cursor = null; state.done = false;
     grid.innerHTML = ""; syncTabs();
+    // Overlay ownership: only the NEWEST reload may hide the searching
+    // spinner — a superseded reload's finally must not kill the overlay of
+    // the search that replaced it (same generation pattern as the grid).
+    const mySearch = ++state.searchSeq;
     if (searching) searchOverlay.style.display = "";
     try {
       await loadMore();
     } finally {
-      searchOverlay.style.display = "none";
+      if (mySearch === state.searchSeq) searchOverlay.style.display = "none";
     }
   }
 
@@ -298,6 +318,11 @@ export function openCivitaiModal(ctx, opts = {}) {
     const req = ++state.reqId;
     setLoading(true);
     sentinel.textContent = "Loading…";
+    // keyword × creator on model tabs matches client-side (API quirk — see
+    // fetchModels): even after its bounded page-chase a load can come back
+    // empty with more pages left. That must not dead-end the list — the
+    // scroll sentinel only re-fires when the grid grows.
+    let stalled = false;
     try {
       const f = state.filters;
       const levels = f.browsingLevels;
@@ -322,24 +347,42 @@ export function openCivitaiModal(ctx, opts = {}) {
           type: t.model, sort: f.modelSort, period: f.period,
           baseModels: f.baseModels, levels, cursor: state.cursor,
           ...(state.query ? { query: state.query } : {}),
+          ...(f.username ? { username: f.username } : {}),
         });
         if (req !== state.reqId) return;
         state.cursor = page.nextCursor; state.done = !page.nextCursor;
         appendModels(page.models);
+        stalled = !page.models.length && !state.done;
       } else if (state.query) {
-        const items = await client.searchMedia(state.query, { type: t.media, levels, offset: state.items.length });
+        const items = await client.searchMedia(state.query, {
+          type: t.media, levels, offset: state.items.length,
+          ...(f.username ? { username: f.username } : {}),
+        });
         if (req !== state.reqId) return;
         state.done = items.length === 0;
         appendItems(items);
       } else {
-        const page = await client.fetchFeed({ type: t.media, period: f.period, sort: f.imageSort, levels, cursor: state.cursor });
+        const page = await client.fetchFeed({
+          type: t.media, period: f.period, sort: f.imageSort, levels, cursor: state.cursor,
+          ...(f.username ? { username: f.username } : {}),
+        });
         if (req !== state.reqId) return;
         state.cursor = page.nextCursor; state.done = !page.nextCursor;
         appendItems(page.items);
       }
-      sentinel.textContent = state.done ? "" : "";
+      if (stalled) {
+        // Explicit affordance instead of a silent dead end.
+        sentinel.textContent = "";
+        const more = el("button", "cmcp-btn", "No matches yet — keep searching");
+        more.addEventListener("click", () => loadMore());
+        sentinel.appendChild(more);
+      } else if (state.done && !grid.children.length) {
+        sentinel.textContent = "No results.";
+      } else {
+        sentinel.textContent = "";
+      }
     } catch (e) {
-      sentinel.textContent = "CivitAI error: " + (e.message || e);
+      if (req === state.reqId) sentinel.textContent = "CivitAI error: " + (e.message || e);
     } finally {
       if (req === state.reqId) setLoading(false);
     }
@@ -763,15 +806,42 @@ export function openCivitaiModal(ctx, opts = {}) {
   }
 
   // ── filters ──────────────────────────────────────────────────────────
+  // Top-creators leaderboard for the Creator picker, cached for the modal's
+  // lifetime (the board changes daily — a session-stale list is fine here).
+  let _topCreators = null;
+  async function topCreators() {
+    if (!_topCreators) _topCreators = await client.fetchTopCreators();
+    return _topCreators;
+  }
+  const compactCount = (n) =>
+    n >= 1e6 ? (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M"
+    : n >= 1e3 ? (n / 1e3).toFixed(1).replace(/\.0$/, "") + "K"
+    : String(n);
+
   // The whole sheet re-renders after every change: a chip click must flip its
   // own highlight immediately (the original wired a `toggleFilters._rerender`
   // hook that was never defined, so chips looked completely dead — field
   // report: "I press them, nothing happens").
   function toggleFilters() {
-    const sheet = openSubModal("Filters");
+    // Creator-lookup generation counter + debounce timer — live OUTSIDE
+    // renderSheet so a re-render can't resurrect a stale in-flight response
+    // (debounce race), and so a timer armed before a re-render can be
+    // cancelled instead of firing against the torn-down sheet (which would
+    // bump crReq and strand the new sheet on "Looking up creators…").
+    let crReq = 0;
+    let crTimer = null;
+    // Closing the sheet (✕ / backdrop) tears the picker down for good:
+    // cancel the pending debounce and invalidate any lookup already in
+    // flight so its completion early-returns instead of touching the
+    // detached nodes.
+    const sheet = openSubModal("Filters", () => {
+      clearTimeout(crTimer); crTimer = null;
+      crReq++;
+    });
     const update = () => { syncTabs(); reload(); };
 
     const renderSheet = () => {
+      clearTimeout(crTimer); crTimer = null; // pending lookups target dead nodes
       const f = state.filters;
       sheet.body.innerHTML = "";
       const wrap = el("div", "cmcp-cv-filters");
@@ -830,6 +900,100 @@ export function openCivitaiModal(ctx, opts = {}) {
         }
       });
       wrap.append(pills, bmSearch, bmList);
+
+      // creator — single-select async search. Empty field shows the site's
+      // TOP-CREATORS leaderboard (ranked, with stats); typing runs a debounced
+      // (300ms) /v1/creators username search. Picking one threads `username`
+      // through every feed/search/model query; no selection = everyone.
+      wrap.appendChild(el("div", "cmcp-cv-flabel", "Creator"));
+      if (tabDef().fav) {
+        // Favorites are "images YOU liked", from every creator — the tRPC
+        // favorites feed has no creator param, so render the filter visibly
+        // inert here instead of silently no-oping.
+        const box = el("div", "cmcp-cv-frow");
+        box.style.opacity = ".6";
+        if (f.username) {
+          const pill = el("button", "cmcp-cv-chip on", f.username + "  ✕");
+          pill.title = "Remove creator filter";
+          pill.addEventListener("click", () => { f.username = null; renderSheet(); update(); });
+          box.appendChild(pill);
+        }
+        box.appendChild(el("div", "cmcp-cv-lb-muted",
+          "Ignored on the Favorites tab — favorites are the images you liked, from every creator."));
+        wrap.appendChild(box);
+      } else {
+        const crPills = el("div", "cmcp-cv-frow");
+        if (f.username) {
+          const pill = el("button", "cmcp-cv-chip on", f.username + "  ✕");
+          pill.title = "Remove creator filter";
+          pill.addEventListener("click", () => { f.username = null; renderSheet(); update(); });
+          crPills.appendChild(pill);
+        }
+        const crSearch = el("input", "cmcp-cv-search");
+        crSearch.placeholder = f.username
+          ? "Switch creator…"
+          : "All creators — search, or pick from the top";
+        const crNote = el("div", "cmcp-cv-lb-muted");
+        crNote.style.display = "none";
+        const crList = el("div", "cmcp-cv-creators");
+        const renderMatches = (matches) => {
+          crList.innerHTML = "";
+          for (const c of matches) {
+            const b = el("button", "cmcp-cv-creator");
+            b.appendChild(el("span", null,
+              c.position != null ? `#${c.position}  ${c.username}` : c.username));
+            const sub = c.position != null
+              ? [
+                  c.downloads != null ? compactCount(c.downloads) + " downloads" : null,
+                  c.thumbsUp != null ? compactCount(c.thumbsUp) + " likes" : null,
+                ].filter(Boolean).join(" · ")
+              : `${c.modelCount ?? 0} model${(c.modelCount ?? 0) === 1 ? "" : "s"}`;
+            if (sub) b.appendChild(el("span", "sub", sub));
+            b.addEventListener("click", () => {
+              f.username = c.username;
+              renderSheet(); update();
+            });
+            crList.appendChild(b);
+          }
+        };
+        const loadMatches = () => {
+          if (!crSearch.isConnected) return; // sheet closed or re-rendered
+          // Direct calls (the focus path) must also cancel a pending debounce
+          // tick, or the same text fires a second, redundant lookup.
+          clearTimeout(crTimer); crTimer = null;
+          const req = ++crReq;
+          const cq = crSearch.value.trim();
+          crNote.style.display = ""; crNote.textContent = "Looking up creators…";
+          (cq ? client.searchCreators(cq) : topCreators())
+            .then((matches) => {
+              if (req !== crReq) return; // a newer lookup owns the list
+              renderMatches(matches);
+              crNote.style.display = matches.length ? "none" : "";
+              crNote.textContent = cq
+                ? "No creators match."
+                : "Top creators unavailable right now.";
+            })
+            .catch(() => {
+              // The leaderboard tRPC intermittently 401s bare user agents —
+              // degrade to a note without breaking the rest of the sheet.
+              if (req !== crReq) return;
+              crList.innerHTML = "";
+              crNote.style.display = "";
+              crNote.textContent = cq
+                ? "Creator search failed — try again."
+                : "Top creators unavailable right now.";
+            });
+        };
+        crSearch.addEventListener("input", () => {
+          crReq++; // invalidate lookups in flight for the previous text NOW
+          clearTimeout(crTimer);
+          crTimer = setTimeout(loadMatches, 300);
+        });
+        crSearch.addEventListener("focus", () => {
+          if (!crList.children.length) loadMatches();
+        });
+        wrap.append(crPills, crSearch, crNote, crList);
+      }
 
       const reset = el("button", "cmcp-btn", "Reset filters");
       reset.addEventListener("click", () => {
@@ -959,7 +1123,7 @@ export function openCivitaiModal(ctx, opts = {}) {
   }
 
   // ── sub-modal + toast helpers ────────────────────────────────────────
-  function openSubModal(title) {
+  function openSubModal(title, onClose) {
     const ov = el("div", "cmcp-cv-overlay"); ov.style.zIndex = "10001";
     const m = el("div", "cmcp-modal"); m.style.maxWidth = "40rem"; m.style.width = "min(40rem, 92vw)";
     m.style.maxHeight = "85vh"; m.style.overflowY = "auto";
@@ -967,7 +1131,9 @@ export function openCivitaiModal(ctx, opts = {}) {
     const x = el("button", "cmcp-cv-iconbtn"); x.innerHTML = '<i class="pi pi-times"></i>';
     x.style.cssText = "position:absolute;top:.5rem;right:.5rem";
     const b = el("div"); m.style.position = "relative";
-    const close2 = () => ov.remove();
+    // Every close path (✕ button, backdrop click, sheet.close()) funnels here,
+    // so a caller-supplied teardown runs no matter how the sheet is dismissed.
+    const close2 = () => { ov.remove(); if (onClose) onClose(); };
     x.addEventListener("click", close2);
     ov.addEventListener("mousedown", (e) => { if (e.target === ov) close2(); });
     m.append(head2, x, b); ov.appendChild(m); document.body.appendChild(ov);
