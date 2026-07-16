@@ -6,7 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- CivitAI browser filters actually respond: chips re-render on click (the sheet
+  wired a rerender hook that was never defined, so they looked dead), and the
+  level/base-model toggles no longer mutate the frozen module defaults
+
 ### Added
+- CivitAI browser: clicking an image/video opens a full-screen LIGHTBOX — media
+  on the left, details on the right (author, stats, prompt/negative, parameters,
+  share-with-agent / save-workflow actions), with arrow-key/wheel paging and Esc
 - **panel-owned sessions (default)** — the conversation and agent memory now
   persist while you switch, save, rename, or create workflows; the agent is
   mechanically told which canvas it operates on (one-shot context, no memory

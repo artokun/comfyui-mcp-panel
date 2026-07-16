@@ -86,6 +86,31 @@ function injectCss() {
   .cmcp-cv-triggers { display: flex; flex-wrap: wrap; gap: .3rem; margin: .4rem 0; }
   .cmcp-cv-trigger { font-size: .72rem; padding: .15rem .4rem; border-radius: 6px;
     background: var(--p-surface-800,#27272a); color: var(--p-text-color,#fafafa); }
+  .cmcp-cv-lb { position: fixed; inset: 0; z-index: 10002; display: flex;
+    background: rgba(0,0,0,.96); outline: none; }
+  .cmcp-cv-lb-stage { position: relative; flex: 1 1 auto; display: flex;
+    align-items: center; justify-content: center; min-width: 0; }
+  .cmcp-cv-lb-stage img, .cmcp-cv-lb-stage video { max-width: 100%; max-height: 100vh; object-fit: contain; }
+  .cmcp-cv-lb-side { flex: 0 0 380px; max-width: 44vw; overflow-y: auto; padding: 1rem;
+    background: var(--p-surface-900, #18181b); border-left: 1px solid var(--p-content-border-color,#3f3f46);
+    color: var(--p-text-color,#fafafa); display: flex; flex-direction: column; gap: .6rem; }
+  .cmcp-cv-lb-nav { position: absolute; top: 50%; transform: translateY(-50%);
+    background: rgba(0,0,0,.5); border: none; color: #fff; border-radius: 999px;
+    width: 40px; height: 40px; cursor: pointer; font-size: 1rem; z-index: 3; }
+  .cmcp-cv-lb-nav:hover { background: rgba(0,0,0,.8); }
+  .cmcp-cv-lb-close { position: absolute; top: .6rem; right: .6rem; z-index: 3; }
+  .cmcp-cv-lb-title { font-size: .9rem; font-weight: 600; display: flex; align-items: center;
+    gap: .5rem; padding-right: 2.2rem; }
+  .cmcp-cv-lb-muted { font-size: .74rem; color: var(--p-text-muted-color,#a1a1aa); }
+  .cmcp-cv-lb-prompt { font-size: .78rem; white-space: pre-wrap; word-break: break-word;
+    background: var(--p-surface-950,#111); border-radius: 8px; padding: .5rem;
+    max-height: 14rem; overflow-y: auto; }
+  .cmcp-cv-lb-params { display: grid; grid-template-columns: max-content 1fr; gap: .15rem .6rem;
+    font-size: .74rem; }
+  .cmcp-cv-lb-params .k { color: var(--p-text-muted-color,#a1a1aa); }
+  @media (max-width: 760px) { .cmcp-cv-lb { flex-direction: column; }
+    .cmcp-cv-lb-side { flex: 0 0 45%; max-width: none; border-left: none;
+      border-top: 1px solid var(--p-content-border-color,#3f3f46); } }
   `;
   const style = document.createElement("style");
   style.textContent = css;
@@ -108,12 +133,20 @@ export function openCivitaiModal(ctx, opts = {}) {
   const state = {
     tab: opts.tab && TABS.some((t) => t.key === opts.tab) ? opts.tab : "images",
     query: opts.query || "",
-    filters: { ...DEFAULT_FILTERS, ...(opts.filters || {}) },
+    // Deep-copy the array fields: DEFAULT_FILTERS is frozen but freeze is
+    // shallow — spreading shares its arrays, and the level/base-model toggles
+    // mutate in place (push/splice), which would corrupt the module default.
+    filters: {
+      ...DEFAULT_FILTERS,
+      ...(opts.filters || {}),
+      baseModels: [...(opts.filters?.baseModels ?? DEFAULT_FILTERS.baseModels)],
+      browsingLevels: [...(opts.filters?.browsingLevels ?? DEFAULT_FILTERS.browsingLevels)],
+    },
     items: [], models: [], cursor: null, loading: false, done: false, reqId: 0,
     signedIn: false, localNames: new Set(), localLoaded: false,
   };
   if (Array.isArray(opts.browsingLevels) && opts.browsingLevels.length) {
-    state.filters = { ...state.filters, browsingLevels: opts.browsingLevels };
+    state.filters = { ...state.filters, browsingLevels: [...opts.browsingLevels] };
   }
   const tabDef = () => TABS.find((t) => t.key === state.tab);
   const isModelTab = () => !!tabDef().model;
@@ -281,41 +314,131 @@ export function openCivitaiModal(ctx, opts = {}) {
     return card;
   }
 
-  // ── viewer ───────────────────────────────────────────────────────────
+  // ── viewer: full-screen LIGHTBOX — media on the left, details on the right.
+  // Mounted on <body> (above the browser modal) so it truly fills the screen.
+  // Generation info loads asynchronously into the side pane and is cached per
+  // item, so paging through the feed doesn't refetch.
+  const _genCache = new Map();
   function openViewer(startIdx) {
     let idx = startIdx;
-    const v = el("div", "cmcp-cv-viewer");
-    const top = el("div", "cmcp-cv-vtop");
+    let renderSeq = 0;
+    const lb = el("div", "cmcp-cv-lb");
+    lb.tabIndex = -1; // focusable → receives key events
+    const stage = el("div", "cmcp-cv-lb-stage");
+    const side = el("div", "cmcp-cv-lb-side");
     const mk = (icon, fn, title) => {
       const b = el("button", "cmcp-cv-iconbtn"); b.innerHTML = `<i class="pi ${icon}"></i>`;
       if (title) b.title = title; b.addEventListener("click", fn); return b;
     };
-    const stage = el("div"); stage.style.cssText = "max-width:100%;max-height:100%";
+    const closeLb = () => { lb.remove(); document.removeEventListener("keydown", onKey, true); };
+    const onKey = (e) => {
+      if (e.key === "Escape") { e.stopPropagation(); closeLb(); }
+      else if (e.key === "ArrowRight" || e.key === "ArrowDown") { e.stopPropagation(); step(1); }
+      else if (e.key === "ArrowLeft" || e.key === "ArrowUp") { e.stopPropagation(); step(-1); }
+    };
+    const prevBtn = el("button", "cmcp-cv-lb-nav", "‹"); prevBtn.style.left = ".6rem";
+    const nextBtn = el("button", "cmcp-cv-lb-nav", "›"); nextBtn.style.right = ".6rem";
+    prevBtn.addEventListener("click", () => step(-1));
+    nextBtn.addEventListener("click", () => step(1));
+    const closeBtn2 = mk("pi-times", closeLb, "Close (Esc)");
+    closeBtn2.classList.add("cmcp-cv-lb-close");
+
+    async function genFor(it) {
+      if (_genCache.has(it.id)) return _genCache.get(it.id);
+      const gen = await client.getGenerationData(it.id);
+      _genCache.set(it.id, gen);
+      return gen;
+    }
+
     const render = () => {
+      const seq = ++renderSeq;
       const it = state.items[idx];
+      if (!it) return;
+      // left: the media itself
       stage.innerHTML = "";
       if (it.type === "video") {
         const vid = document.createElement("video");
         vid.src = it.fullUrl; vid.controls = true; vid.autoplay = true; vid.loop = true;
+        vid.playsInline = true;
         stage.appendChild(vid);
       } else {
         const img = document.createElement("img"); img.src = it.fullUrl; stage.appendChild(img);
       }
+      stage.append(prevBtn, nextBtn, closeBtn2);
+      prevBtn.style.display = idx <= 0 ? "none" : "";
+
+      // right: identity + actions immediately, generation info when it arrives
+      side.innerHTML = "";
+      side.appendChild(el("div", "cmcp-cv-lb-title",
+        `${it.type === "video" ? "🎬" : "🖼"} ${it.author ? "@" + it.author : "CivitAI " + it.type}`));
+      side.appendChild(el("div", "cmcp-cv-lb-muted",
+        `♥ ${it.reactions || 0} · ${idx + 1} / ${state.items.length}${state.done ? "" : "+"}`));
+
+      const actions = el("div", "cmcp-cv-actions");
+      side.appendChild(actions);
+      const genBox = el("div");
+      genBox.appendChild(el("div", "cmcp-cv-lb-muted", "Loading generation info…"));
+      side.appendChild(genBox);
+
+      genFor(it).then((gen) => {
+        if (seq !== renderSeq) return; // user already paged on
+        // actions need the gen payload (caption/workflow), so they land here
+        const shareBtn = el("button", "cmcp-btn cmcp-btn-primary",
+          ctx.isMuted() ? "Save reference to inputs" : "Share with agent");
+        shareBtn.addEventListener("click", () => shareImage(it, gen));
+        actions.appendChild(shareBtn);
+        const graph = CivitaiClient.comfyGraph(gen.meta);
+        if (graph) {
+          const saveBtn = el("button", "cmcp-btn", "Save workflow");
+          saveBtn.addEventListener("click", () => saveWorkflow(it, graph));
+          actions.appendChild(saveBtn);
+        }
+        genBox.innerHTML = "";
+        genBox.appendChild(el("div", "cmcp-cv-lb-muted",
+          graph ? "✓ Embedded ComfyUI workflow" : "No embedded workflow"));
+        if (gen.meta?.prompt) {
+          genBox.appendChild(el("div", "cmcp-cv-flabel", "Prompt"));
+          genBox.appendChild(el("div", "cmcp-cv-lb-prompt", gen.meta.prompt));
+        }
+        if (gen.meta?.negativePrompt) {
+          genBox.appendChild(el("div", "cmcp-cv-flabel", "Negative"));
+          genBox.appendChild(el("div", "cmcp-cv-lb-prompt", gen.meta.negativePrompt));
+        }
+        const params = CivitaiClient.params(gen.meta);
+        if (params.length) {
+          genBox.appendChild(el("div", "cmcp-cv-flabel", "Parameters"));
+          const grid2 = el("div", "cmcp-cv-lb-params");
+          for (const [k, val] of params) {
+            grid2.appendChild(el("span", "k", k));
+            grid2.appendChild(el("span", null, String(val)));
+          }
+          genBox.appendChild(grid2);
+        }
+      }).catch((e) => {
+        if (seq !== renderSeq) return;
+        genBox.innerHTML = "";
+        genBox.appendChild(el("div", "cmcp-cv-lb-muted", "No generation data: " + (e.message || e)));
+        // sharing works without gen data — caption just has no settings
+        const shareBtn = el("button", "cmcp-btn cmcp-btn-primary",
+          ctx.isMuted() ? "Save reference to inputs" : "Share with agent");
+        shareBtn.addEventListener("click", () => shareImage(it, { meta: {} }));
+        actions.appendChild(shareBtn);
+      });
     };
     const step = (d) => {
       idx = Math.max(0, Math.min(state.items.length - 1, idx + d));
-      if (idx >= state.items.length - 3) loadMore();
+      if (idx >= state.items.length - 3) loadMore().then(() => {
+        // arriving items extend the counter — refresh it without a full rerender
+        if (state.items[idx]) render();
+      });
       render();
     };
-    top.append(
-      mk("pi-info-circle", () => showGenInfo(state.items[idx]), "Generation info"),
-      mk("pi-chevron-up", () => step(-1)),
-      mk("pi-chevron-down", () => step(1)),
-      mk("pi-times", () => v.remove()),
-    );
-    v.append(stage, top);
-    v.addEventListener("wheel", (e) => { step(e.deltaY > 0 ? 1 : -1); }, { passive: true });
-    body.appendChild(v);
+    stage.addEventListener("wheel", (e) => { step(e.deltaY > 0 ? 1 : -1); }, { passive: true });
+    stage.addEventListener("mousedown", (e) => { if (e.target === stage) closeLb(); });
+    document.addEventListener("keydown", onKey, true);
+    lb.append(stage, side);
+    document.body.appendChild(lb);
+    lb.focus();
     render();
   }
 
@@ -484,73 +607,88 @@ export function openCivitaiModal(ctx, opts = {}) {
   }
 
   // ── filters ──────────────────────────────────────────────────────────
+  // The whole sheet re-renders after every change: a chip click must flip its
+  // own highlight immediately (the original wired a `toggleFilters._rerender`
+  // hook that was never defined, so chips looked completely dead — field
+  // report: "I press them, nothing happens").
   function toggleFilters() {
     const sheet = openSubModal("Filters");
-    const f = state.filters;
-    const wrap = el("div", "cmcp-cv-filters");
     const update = () => { syncTabs(); reload(); };
 
-    const chipRow = (label, options, isOn, onToggle) => {
-      wrap.appendChild(el("div", "cmcp-cv-flabel", label));
-      const row = el("div", "cmcp-cv-frow");
-      for (const o of options) {
-        const chip = el("button", "cmcp-cv-chip", o.label);
-        if (isOn(o.value)) chip.classList.add("on");
-        chip.addEventListener("click", () => { onToggle(o.value); update(); toggleFilters._rerender?.(); });
-        row.appendChild(chip);
-      }
-      wrap.appendChild(row);
-    };
+    const renderSheet = () => {
+      const f = state.filters;
+      sheet.body.innerHTML = "";
+      const wrap = el("div", "cmcp-cv-filters");
 
-    chipRow("Time period", PERIODS.map((p) => ({ label: p, value: p })),
-      (v) => f.period === v, (v) => { f.period = v; });
-    const sorts = isModelTab() ? MODEL_SORTS : IMAGE_SORTS;
-    chipRow("Sort", sorts.map((s) => ({ label: s, value: s })),
-      (v) => (isModelTab() ? f.modelSort : f.imageSort) === v,
-      (v) => { if (isModelTab()) f.modelSort = v; else f.imageSort = v; });
-    // browsing levels — ALL selectable, no sign-in gate
-    chipRow("Browsing level", LEVELS.map((l) => ({ label: l.label, value: l.level })),
-      (v) => f.browsingLevels.includes(v),
-      (v) => {
-        const i = f.browsingLevels.indexOf(v);
-        if (i >= 0) f.browsingLevels.splice(i, 1); else f.browsingLevels.push(v);
-        if (f.browsingLevels.length === 0) f.browsingLevels.push(1);
-      });
+      const chipRow = (label, options, isOn, onToggle) => {
+        wrap.appendChild(el("div", "cmcp-cv-flabel", label));
+        const row = el("div", "cmcp-cv-frow");
+        for (const o of options) {
+          const chip = el("button", "cmcp-cv-chip", o.label);
+          if (isOn(o.value)) chip.classList.add("on");
+          chip.addEventListener("click", () => { onToggle(o.value); renderSheet(); update(); });
+          row.appendChild(chip);
+        }
+        wrap.appendChild(row);
+      };
 
-    // base model omni-search
-    wrap.appendChild(el("div", "cmcp-cv-flabel", "Base model"));
-    const pills = el("div", "cmcp-cv-frow");
-    const renderPills = () => {
-      pills.innerHTML = "";
+      chipRow("Time period", PERIODS.map((p) => ({ label: p, value: p })),
+        (v) => f.period === v, (v) => { f.period = v; });
+      const sorts = isModelTab() ? MODEL_SORTS : IMAGE_SORTS;
+      chipRow("Sort", sorts.map((s) => ({ label: s, value: s })),
+        (v) => (isModelTab() ? f.modelSort : f.imageSort) === v,
+        (v) => { if (isModelTab()) f.modelSort = v; else f.imageSort = v; });
+      // browsing levels — ALL selectable, no sign-in gate
+      chipRow("Browsing level", LEVELS.map((l) => ({ label: l.label, value: l.level })),
+        (v) => f.browsingLevels.includes(v),
+        (v) => {
+          const i = f.browsingLevels.indexOf(v);
+          if (i >= 0) f.browsingLevels.splice(i, 1); else f.browsingLevels.push(v);
+          if (f.browsingLevels.length === 0) f.browsingLevels.push(1);
+        });
+
+      // base model omni-search
+      wrap.appendChild(el("div", "cmcp-cv-flabel", "Base model"));
+      const pills = el("div", "cmcp-cv-frow");
       for (const b of f.baseModels) {
         const pill = el("button", "cmcp-cv-chip on", b + "  ✕");
-        pill.addEventListener("click", () => { f.baseModels = f.baseModels.filter((x) => x !== b); renderPills(); update(); });
+        pill.addEventListener("click", () => {
+          f.baseModels = f.baseModels.filter((x) => x !== b);
+          renderSheet(); update();
+        });
         pills.appendChild(pill);
       }
+      const bmSearch = el("input", "cmcp-cv-search"); bmSearch.placeholder = "Filter base models…";
+      const bmList = el("div", "cmcp-cv-frow");
+      bmSearch.addEventListener("input", () => {
+        const q = bmSearch.value.toLowerCase();
+        bmList.innerHTML = "";
+        if (!q) return;
+        for (const b of BASE_MODELS.filter((x) => x.toLowerCase().includes(q)).slice(0, 12)) {
+          const chip = el("button", "cmcp-cv-chip", b);
+          chip.addEventListener("click", () => {
+            if (!f.baseModels.includes(b)) f.baseModels.push(b);
+            renderSheet(); update();
+          });
+          bmList.appendChild(chip);
+        }
+      });
+      wrap.append(pills, bmSearch, bmList);
+
+      const reset = el("button", "cmcp-btn", "Reset filters");
+      reset.addEventListener("click", () => {
+        state.filters = {
+          ...DEFAULT_FILTERS,
+          baseModels: [...DEFAULT_FILTERS.baseModels],
+          browsingLevels: [...DEFAULT_FILTERS.browsingLevels],
+        };
+        renderSheet(); update();
+      });
+      wrap.appendChild(reset);
+
+      sheet.body.appendChild(wrap);
     };
-    const bmSearch = el("input", "cmcp-cv-search"); bmSearch.placeholder = "Filter base models…";
-    const bmList = el("div", "cmcp-cv-frow");
-    bmSearch.addEventListener("input", () => {
-      const q = bmSearch.value.toLowerCase();
-      bmList.innerHTML = "";
-      if (!q) return;
-      for (const b of BASE_MODELS.filter((x) => x.toLowerCase().includes(q)).slice(0, 12)) {
-        const chip = el("button", "cmcp-cv-chip", b);
-        chip.addEventListener("click", () => {
-          if (!f.baseModels.includes(b)) f.baseModels.push(b);
-          bmSearch.value = ""; bmList.innerHTML = ""; renderPills(); update();
-        });
-        bmList.appendChild(chip);
-      }
-    });
-    wrap.append(pills, bmSearch, bmList);
-    renderPills();
-
-    const reset = el("button", "cmcp-btn", "Reset filters");
-    reset.addEventListener("click", () => { state.filters = { ...DEFAULT_FILTERS, browsingLevels: [1] }; sheet.close(); update(); });
-    wrap.appendChild(reset);
-
-    sheet.body.appendChild(wrap);
+    renderSheet();
   }
 
   // ── local model index ("in library" marks) ──────────────────────────
