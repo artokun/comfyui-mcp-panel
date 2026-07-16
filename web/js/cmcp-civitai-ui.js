@@ -11,7 +11,7 @@
 
 import {
   CivitaiClient, DEFAULT_FILTERS, LEVELS, PERIODS, IMAGE_SORTS, MODEL_SORTS,
-  BASE_MODELS, filtersDirty, bitmask,
+  BASE_MODELS, filtersDirty, bitmask, parseCreatorQuery,
 } from "./cmcp-civitai.js";
 
 const TABS = [
@@ -212,12 +212,63 @@ export function openCivitaiModal(ctx, opts = {}) {
   search.placeholder = "Search CivitAI…";
   search.value = state.query;
   let searchTimer = null;
+  // The @token displayed in the search box ALWAYS owns the creator filter:
+  // setCreator mirrors every creator change (sheet picker, pill ✕, reset,
+  // "See more from") into the box as an @token, so deleting that token must
+  // clear the filter no matter where it came from — ownership is "the token
+  // is displayed", not "who typed it" (codex round-3: a sheet-picked creator's
+  // mirrored token previously didn't own the filter, making deletion
+  // history-dependent). setCreator is the ONE mutation point outside
+  // applySearch.
+  let creatorFromSearch = false;
+  function setCreator(name) {
+    const f = state.filters;
+    f.username = name ? String(name) : null;
+    creatorFromSearch = !!name; // displayed token == owned token, always
+    // Rewrite only the qualifier part of the box; keep the user's terms.
+    const { query } = parseCreatorQuery(search.value);
+    search.value = f.username ? `@${f.username}${query ? " " + query : " "}` : query;
+  }
   const applySearch = () => {
-    const q = search.value.trim();
-    if (q === state.query) return;
-    state.query = q;
+    const { creator, query } = parseCreatorQuery(search.value);
+    const f = state.filters;
+    let changed = query !== state.query;
+    if (creator) {
+      if (f.username !== creator) { f.username = creator; changed = true; }
+      creatorFromSearch = true;
+    } else if (creatorFromSearch && f.username) {
+      f.username = null;
+      creatorFromSearch = false;
+      changed = true;
+    }
+    if (!changed) return;
+    state.query = query;
+    syncTabs();
     reload({ searching: true });
   };
+  // Finding: a pre-seeded opts.query may carry an @qualifier (the agent's
+  // open_civitai can pass one) — reconcile it into the filter BEFORE the
+  // first reload instead of searching for the literal token.
+  {
+    const seeded = parseCreatorQuery(state.query);
+    if (seeded.creator) {
+      state.filters.username = seeded.creator;
+      creatorFromSearch = true;
+      state.query = seeded.query;
+    }
+  }
+  /** "See more from @creator" — set the creator filter and reflect it in the
+   *  search box as an @token (the box is the source of truth for it). The
+   *  favorites tab has no creator param, so it jumps to Images. */
+  function seeMoreFromCreator(name, { toModelTab = false } = {}) {
+    if (!name) return;
+    state.query = "";
+    search.value = "";
+    setCreator(name);
+    if (tabDef().fav) state.tab = toModelTab ? state.tab : "images";
+    syncTabs();
+    reload({ searching: true });
+  }
   search.addEventListener("input", () => {
     clearTimeout(searchTimer);
     searchTimer = setTimeout(applySearch, 500);
@@ -574,6 +625,14 @@ export function openCivitaiModal(ctx, opts = {}) {
         `♥ ${it.reactions || 0} · ${idx + 1} / ${state.items.length}${state.done ? "" : "+"}`));
 
       const actions = el("div", "cmcp-cv-actions");
+      if (it.author) {
+        const moreBtn = el("button", "cmcp-btn", `See more from @${it.author}`);
+        moreBtn.addEventListener("click", () => {
+          closeLb();
+          seeMoreFromCreator(it.author);
+        });
+        actions.appendChild(moreBtn);
+      }
       side.appendChild(actions);
       const genBox = el("div");
       genBox.appendChild(el("div", "cmcp-cv-lb-muted", "Loading generation info…"));
@@ -743,6 +802,14 @@ export function openCivitaiModal(ctx, opts = {}) {
         const note = el("span", null, "You already have this file locally.");
         note.style.cssText = "font-size:.72rem;color:#4ade80;align-self:center";
         dl.appendChild(note);
+      }
+      if (detail.creator) {
+        const moreBtn = el("button", "cmcp-btn", `See more from @${detail.creator}`);
+        moreBtn.addEventListener("click", () => {
+          sheet.close();
+          seeMoreFromCreator(detail.creator, { toModelTab: true });
+        });
+        dl.appendChild(moreBtn);
       }
       detailBody.appendChild(dl);
       if (version.descriptionHtml || detail.descriptionHtml) {
@@ -915,7 +982,7 @@ export function openCivitaiModal(ctx, opts = {}) {
         if (f.username) {
           const pill = el("button", "cmcp-cv-chip on", f.username + "  ✕");
           pill.title = "Remove creator filter";
-          pill.addEventListener("click", () => { f.username = null; renderSheet(); update(); });
+          pill.addEventListener("click", () => { setCreator(null); renderSheet(); update(); });
           box.appendChild(pill);
         }
         box.appendChild(el("div", "cmcp-cv-lb-muted",
@@ -926,7 +993,7 @@ export function openCivitaiModal(ctx, opts = {}) {
         if (f.username) {
           const pill = el("button", "cmcp-cv-chip on", f.username + "  ✕");
           pill.title = "Remove creator filter";
-          pill.addEventListener("click", () => { f.username = null; renderSheet(); update(); });
+          pill.addEventListener("click", () => { setCreator(null); renderSheet(); update(); });
           crPills.appendChild(pill);
         }
         const crSearch = el("input", "cmcp-cv-search");
@@ -950,7 +1017,7 @@ export function openCivitaiModal(ctx, opts = {}) {
               : `${c.modelCount ?? 0} model${(c.modelCount ?? 0) === 1 ? "" : "s"}`;
             if (sub) b.appendChild(el("span", "sub", sub));
             b.addEventListener("click", () => {
-              f.username = c.username;
+              setCreator(c.username);
               renderSheet(); update();
             });
             crList.appendChild(b);
@@ -1002,6 +1069,7 @@ export function openCivitaiModal(ctx, opts = {}) {
           baseModels: [...DEFAULT_FILTERS.baseModels],
           browsingLevels: [...DEFAULT_FILTERS.browsingLevels],
         };
+        setCreator(null); // also strips a stale @token from the search box
         renderSheet(); update();
       });
       wrap.appendChild(reset);
