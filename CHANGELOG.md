@@ -12,6 +12,10 @@ All notable changes to this project are documented here. This project adheres to
   level/base-model toggles no longer mutate the frozen module defaults
 
 ### Added
+- CivitAI browser: **"See more from @creator"** in the lightbox and model
+  detail, and **GitHub-style search qualifiers** — "@name terms" sets the
+  creator filter (the displayed @token always owns it; deleting it clears)
+  while the terms stay ranked full-text search (#86)
 - CivitAI browser: **Creator filter** in the filter sheet (parity with the
   mobile app) — an empty field shows the site's top-creators leaderboard
   (ranked, with download/like counts; degrades to a friendly note when the
