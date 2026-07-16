@@ -51,6 +51,30 @@ export function filtersDirty(f) {
   );
 }
 
+/** GitHub-style creator syntax for the explorer search bar: an "@name" token
+ *  sets the creator filter and the remaining words are the search terms —
+ *  "@bab0zi cyberpunk city rain" → { username: "bab0zi", query: "cyberpunk city rain" }.
+ *  The FIRST @token wins; later @tokens are consumed too (as literals they'd
+ *  only pollute the Meili/REST keyword search). A lone "@" is NOT a creator
+ *  token and stays in the text; "me@example.com" doesn't start with "@" so it
+ *  stays too. "@name" alone → { username: "name", query: "" } (filter only).
+ *  username is returned raw — Meili callers must still escapeMeili it, and the
+ *  REST paths URL-encode it via URLSearchParams (per Meili docs, `q` + `filter`
+ *  combine in ONE request: filter narrows the set, q ranks within it). */
+export function parseCreatorQuery(raw) {
+  let username = null;
+  const words = [];
+  for (const t of String(raw || "").trim().split(/\s+/)) {
+    if (!t) continue;
+    if (t.length > 1 && t.startsWith("@")) {
+      if (username == null) username = t.slice(1);
+      continue;
+    }
+    words.push(t);
+  }
+  return { username, query: words.join(" ") };
+}
+
 export function bitmask(levels) {
   if (!levels || levels.length === 0) return 1;
   return levels.reduce((a, b) => a | b, 0);

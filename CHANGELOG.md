@@ -12,6 +12,19 @@ All notable changes to this project are documented here. This project adheres to
   level/base-model toggles no longer mutate the frozen module defaults
 
 ### Added
+- CivitAI browser: **"See more from @creator"** in the lightbox and in the
+  model detail sheet — one click sets the creator filter (the same removable
+  pill + filter-dot slot the sheet uses), closes the view, and reloads; from
+  Favorites it lands on the matching Images/Videos tab (the favorites feed has
+  no creator param)
+- CivitAI browser: **GitHub-style `@creator` search syntax** — typing
+  `@bab0zi cyberpunk city rain` in the search bar sets the creator filter to
+  `bab0zi` and searches the remaining terms (Meili gets `q` + escaped
+  `user.username` filter in one request; REST feeds get `username=` plus the
+  existing keyword handling). The first `@token` wins and a new `@name`
+  replaces the previous creator; `@name` alone just sets the filter; a lone
+  `@` and mid-word `@` (emails) stay plain text. Agent-seeded queries
+  (`open_civitai`) honor the same syntax
 - CivitAI browser: **Creator filter** in the filter sheet (parity with the
   mobile app) — an empty field shows the site's top-creators leaderboard
   (ranked, with download/like counts; degrades to a friendly note when the

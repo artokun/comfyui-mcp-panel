@@ -11,7 +11,7 @@
 
 import {
   CivitaiClient, DEFAULT_FILTERS, LEVELS, PERIODS, IMAGE_SORTS, MODEL_SORTS,
-  BASE_MODELS, filtersDirty, bitmask,
+  BASE_MODELS, filtersDirty, bitmask, parseCreatorQuery,
 } from "./cmcp-civitai.js";
 
 const TABS = [
@@ -191,6 +191,16 @@ export function openCivitaiModal(ctx, opts = {}) {
   if (Array.isArray(opts.browsingLevels) && opts.browsingLevels.length) {
     state.filters = { ...state.filters, browsingLevels: [...opts.browsingLevels] };
   }
+  {
+    // A pre-seeded query (cmd: open_civitai) honors the same "@name terms"
+    // creator syntax as the search bar — otherwise the box would display an
+    // @token the initial load ignores. An explicit opts.filters.username wins.
+    const seeded = parseCreatorQuery(state.query);
+    if (seeded.username != null) {
+      state.query = seeded.query;
+      if (!state.filters.username) state.filters.username = seeded.username;
+    }
+  }
   const tabDef = () => TABS.find((t) => t.key === state.tab);
   const isModelTab = () => !!tabDef().model;
 
@@ -213,9 +223,21 @@ export function openCivitaiModal(ctx, opts = {}) {
   search.value = state.query;
   let searchTimer = null;
   const applySearch = () => {
-    const q = search.value.trim();
-    if (q === state.query) return;
-    state.query = q;
+    // GitHub-style syntax: "@bab0zi cyberpunk city rain" → creator=bab0zi,
+    // search="cyberpunk city rain". The creator rides the SAME filter slot the
+    // sheet uses (pill + dot reflect it, pill removes it); typing a new @name
+    // replaces the previous one. "@name" alone just sets the filter.
+    const parsed = parseCreatorQuery(search.value);
+    const creatorChanged =
+      parsed.username != null && parsed.username !== state.filters.username;
+    if (parsed.username != null) {
+      // From here the creator lives in the filter pill — strip the @token from
+      // the visible text so removing the pill can't resurrect it on re-search.
+      state.filters.username = parsed.username;
+      search.value = parsed.query;
+    }
+    if (parsed.query === state.query && !creatorChanged) return;
+    state.query = parsed.query;
     reload({ searching: true });
   };
   search.addEventListener("input", () => {
@@ -574,6 +596,22 @@ export function openCivitaiModal(ctx, opts = {}) {
         `♥ ${it.reactions || 0} · ${idx + 1} / ${state.items.length}${state.done ? "" : "+"}`));
 
       const actions = el("div", "cmcp-cv-actions");
+      if (it.author) {
+        // Jump from the lightbox to everything this creator posted — the SAME
+        // filter slot the sheet sets (pill removes it, dot lights up), so no
+        // second creator-filter mechanism. Lives in the actions row and is
+        // appended synchronously (gen info hasn't necessarily landed yet).
+        const moreBtn = el("button", "cmcp-btn", `See more from @${it.author}`);
+        moreBtn.addEventListener("click", () => {
+          state.filters.username = it.author;
+          // Favorites ignores the creator filter (no creator param on the
+          // tRPC feed) — land on the matching media tab so the click works.
+          if (tabDef().fav) state.tab = it.type === "video" ? "videos" : "images";
+          closeLb();
+          reload(); // reload() re-syncs tabs + the filter dot
+        });
+        actions.appendChild(moreBtn);
+      }
       side.appendChild(actions);
       const genBox = el("div");
       genBox.appendChild(el("div", "cmcp-cv-lb-muted", "Loading generation info…"));
@@ -722,6 +760,19 @@ export function openCivitaiModal(ctx, opts = {}) {
     try { detail = await client.fetchModelDetail(m.id, { levels: state.filters.browsingLevels }); }
     catch (e) { sheet.body.innerHTML = ""; sheet.body.appendChild(el("div", null, "Error: " + e.message)); return; }
     sheet.body.innerHTML = "";
+    if (detail.creator) {
+      // Same "See more from @creator" as the lightbox — sets the shared
+      // creator filter slot, closes the sheet, reloads the current model tab.
+      const byRow = el("div", "cmcp-cv-actions");
+      const moreBtn = el("button", "cmcp-btn", `See more from @${detail.creator}`);
+      moreBtn.addEventListener("click", () => {
+        state.filters.username = detail.creator;
+        sheet.close();
+        reload(); // reload() re-syncs tabs + the filter dot
+      });
+      byRow.appendChild(moreBtn);
+      sheet.body.appendChild(byRow);
+    }
     let version = detail.versions[0];
 
     const versionRow = el("div", "cmcp-cv-frow");
