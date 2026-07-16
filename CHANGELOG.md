@@ -6,6 +6,26 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+- **Share transcript** — a header flag button (visible only once
+  Settings → “Share-transcript endpoint (advanced)” is set; blank default =
+  feature fully dormant) opens a consent modal: rate the conversation
+  “This was good!” / “This was bad”, optionally say why, and upload the FULL
+  chat transcript + version info (panel/model/mcp/backend/comfyui) to the
+  maintainer's collector — the labeled dataset for the local-model retrain.
+  Privacy by construction (`web/js/lib/feedback.js`, unit-tested): no account
+  identifiers (an anonymous random id only), token-save cards dropped, bridge
+  URLs / sensitive query values / recognizable API-key shapes / bare
+  `token=`-style assignments redacted, home-dir usernames masked, internal
+  message ids stripped, transcript size-capped newest-first. Nothing uploads
+  without an explicit verdict pick + Share click; failures leave the modal
+  open to retry. Ships with the collector as a deployable artifact:
+  `workers/feedback-uploader/` — a zero-dependency Cloudflare Worker
+  (hand-rolled SigV4 pinned to AWS's test vector) that validates, size-caps
+  (1 MiB), CORS-gates, and PUTs each submission to S3 (R2/MinIO via
+  `S3_ENDPOINT`); bucket + credentials are wrangler vars/secrets, 503 until
+  provisioned — see its README for deploy and what the maintainer must set up
+
 ### Fixed
 - CivitAI browser filters actually respond: chips re-render on click (the sheet
   wired a rerender hook that was never defined, so they looked dead), and the

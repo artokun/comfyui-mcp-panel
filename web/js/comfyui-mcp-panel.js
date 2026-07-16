@@ -66,6 +66,7 @@ import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
+import { buildFeedbackPayload, createShareModalState } from "./lib/feedback.js";
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
 import { openCivitaiModal } from "./cmcp-civitai-ui.js";
 
@@ -963,6 +964,11 @@ const SETTING_SESSION_FOLLOWS_PANEL = "comfyui-mcp.sessionFollowsPanel";
 const MOBILE_IOS_TESTFLIGHT_URL = ""; // e.g. https://testflight.apple.com/join/XXXXXXXX
 const MOBILE_ANDROID_FIREBASE_URL = ""; // e.g. https://appdistribution.firebase.dev/i/XXXXXXXX
 const SETTING_EXTERNAL_ORCH = "comfyui-mcp.externalOrchestrator";
+// "Share transcript" collector endpoint (COMFYUI_MCP_FEEDBACK_URL). Empty
+// (the default) = the feature is entirely hidden and NOTHING ever uploads.
+// When the maintainer publishes the collector (workers/feedback-uploader/),
+// its https URL goes here and the header gains a Share-transcript button.
+const SETTING_FEEDBACK_URL = "comfyui-mcp.feedbackUrl";
 const SETTING_TOKEN_CIVITAI = "comfyui-mcp.setCivitaiToken";
 const SETTING_TOKEN_HF = "comfyui-mcp.setHuggingfaceToken";
 // User-curated agent models (Ollama tags or OpenRouter ids) + the Ollama
@@ -1010,6 +1016,7 @@ const panelHooks = {
   applyStallConfig: null, // () — push the live render-stall threshold to the orchestrator
   applyAgentModelConfig: null, // () — push preferred models + ollama endpoint config
   applyMobileBeta: null, // (bool) — show/hide the header Remote-control (QR) button
+  applyFeedbackUrl: null, // (url) — show/hide the header Share-transcript button
   requestSecret: null, // (envKey, friendly)
 };
 // Best-effort guard so a setSetting() we make while seeding/syncing doesn't bounce
@@ -1201,6 +1208,15 @@ function stallSettingSeconds() {
 function remoteUrlSetting() {
   const v = getSetting(SETTING_REMOTE_URL);
   return typeof v === "string" ? v.trim() : "";
+}
+// "Share transcript" collector endpoint (panel setting). Blank (default) = the
+// feature is hidden and nothing can upload. Only http(s) URLs count — anything
+// else is treated as unset so a typo can't route the transcript somewhere odd.
+function feedbackEndpoint() {
+  const v = getSetting(SETTING_FEEDBACK_URL);
+  if (typeof v !== "string") return "";
+  const url = v.trim();
+  return /^https?:\/\//i.test(url) ? url : "";
 }
 // External/local orchestrator mode (panel setting). The agent is run by the USER
 // on their own machine (`npx -y comfyui-mcp --panel-orchestrator`), NOT spawned by
@@ -1646,6 +1662,24 @@ function panelSettingsList() {
       onChange: () => {
         // No live apply: the URL is baked into the orchestrator's MCP at spawn, so
         // it takes effect on the next Connect (Disconnect → Connect).
+      },
+    },
+    {
+      id: SETTING_FEEDBACK_URL,
+      name: "Share-transcript endpoint (advanced)",
+      category: cat("General", "Share-transcript endpoint (advanced)"),
+      sortOrder: 142,
+      tooltip:
+        "Where the header's Share-transcript button uploads rated conversations (an https collector URL, " +
+        "COMFYUI_MCP_FEEDBACK_URL). Sharing sends the FULL chat transcript plus version info (panel/model/" +
+        "backend) to help improve the local models — no account data; tokens, secrets, and bridge URLs are " +
+        "stripped first, and nothing is EVER sent without you explicitly clicking Share in the consent dialog. " +
+        "Leave BLANK to hide the feature entirely (default).",
+      type: "text",
+      defaultValue: "",
+      onChange: (v) => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyFeedbackUrl?.(v);
       },
     },
     {
@@ -6131,7 +6165,7 @@ const RECONNECT_MAX_MS = 15000;
 let AGENT_MUTED = (() => { try { return localStorage.getItem("cmcp.muteAgents") === "1"; } catch { return false; } })();
 let AGENT_BLIND = (() => { try { return localStorage.getItem("cmcp.blindAgents") === "1"; } catch { return false; } })();
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onMcpVersion, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -6420,6 +6454,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // Live model catalog from the orchestrator (SDK-probed). This is also the
       // orchestrator HANDSHAKE — receiving it proves a real panel agent is behind
       // the socket, so it's the moment we truthfully flip to "connected".
+      // Forward-compat: any frame that carries the orchestrator's npm package
+      // version (mcp_version) feeds the Share-transcript payload's versions
+      // block. The orchestrator doesn't send it yet — null until it does.
+      if (msg && typeof msg.mcp_version === "string") {
+        onMcpVersion?.(msg.mcp_version);
+      }
       if (msg && msg.type === "models" && Array.isArray(msg.models)) {
         markConnected();
         onModels?.(
@@ -7814,9 +7854,21 @@ function buildPanel() {
   };
   applyMobileBetaVisibility(getSetting(SETTING_MOBILE_BETA) === true);
   panelHooks.applyMobileBeta = applyMobileBetaVisibility;
+  // "Share transcript" — rate this conversation good/bad and upload it (with
+  // explicit consent) to the maintainer's collector, feeding the local-model
+  // fine-tune dataset. Hidden unless a collector endpoint is configured
+  // (Settings › Share-transcript endpoint) — with no endpoint the feature is
+  // dormant and nothing can upload. Same inline-display trick as remoteBtn.
+  const shareBtn = iconBtn("pi-flag", "Share transcript — rate this chat to help improve the models");
+  shareBtn.addEventListener("click", () => openShareTranscriptModal());
+  const applyFeedbackUrlVisibility = () => {
+    shareBtn.style.display = feedbackEndpoint() ? "" : "none";
+  };
+  applyFeedbackUrlVisibility();
+  panelHooks.applyFeedbackUrl = applyFeedbackUrlVisibility;
   // Reload / restart live as slash commands (/reload, /reload-ui, /restart) — no
   // header buttons for them.
-  actions.append(newChatBtn, historyBtn, remoteBtn);
+  actions.append(newChatBtn, historyBtn, shareBtn, remoteBtn);
 
   header.style.position = "relative";
   const histPop = document.createElement("div");
@@ -8665,6 +8717,10 @@ function buildPanel() {
   // The model the orchestrator reports as ACTIVE for the connected backend (the
   // `current` field on the models frame). Drives the Auto-mode selection mark.
   let orchestratorCurrentModel = null;
+  // The connected orchestrator's comfyui-mcp package version, when it reports
+  // one (mcp_version on any frame — forward-compat; see createBridgeClient).
+  // Feeds the Share-transcript payload's versions block; null until known.
+  let orchestratorMcpVersion = null;
   if (!prefs.model) prefs.model = pickDefaultModel(modelCatalog);
 
   /** The effort ids offered for the currently-selected model. Driven primarily by
@@ -10990,6 +11046,9 @@ function buildPanel() {
       }
       // Apply the catalog AFTER the backend is known so effort mapping is correct.
       applyModelCatalog(list);
+    },
+    onMcpVersion(v) {
+      orchestratorMcpVersion = v;
     },
     onCommands(list) {
       // SDK-provided slash commands → surface in the composer completion menu.
@@ -13351,6 +13410,144 @@ function buildPanel() {
     overlay.appendChild(modal);
     root.appendChild(overlay);
     requestPairing();
+  }
+
+  // "Share transcript": rate this conversation good/bad (+ optional why) and —
+  // with explicit consent, on an explicit click — upload the FULL transcript
+  // plus version info to the maintainer's collector (Settings › Share-transcript
+  // endpoint; see workers/feedback-uploader/). The payload is built by the pure
+  // lib/feedback.js module, which drops the panel's token cards, redacts bridge
+  // URLs / recognizable secrets, and carries NO account identifiers — just an
+  // anonymous random submission id. Rated transcripts feed the local-model
+  // fine-tune dataset (good/bad labels).
+  function openShareTranscriptModal() {
+    const endpoint = feedbackEndpoint();
+    if (!endpoint) return; // button is hidden without an endpoint; belt & braces
+    const msgs = thread && Array.isArray(thread.msgs) ? thread.msgs : [];
+    if (!msgs.length) {
+      appendSystem("Nothing to share yet — have a conversation first, then rate it.");
+      return;
+    }
+    const state = createShareModalState();
+
+    const overlay = document.createElement("div");
+    overlay.className = "cmcp-modal-overlay";
+    const modal = document.createElement("div");
+    modal.className = "cmcp-modal";
+    const title = document.createElement("div");
+    title.className = "cmcp-modal-title";
+    title.textContent = "Share transcript";
+
+    const verdictWrap = document.createElement("div");
+    verdictWrap.className = "cmcp-modal-scopes";
+    const verdicts = [
+      { v: "good", label: "This was good!", hint: "the agent did what I wanted" },
+      { v: "bad", label: "This was bad", hint: "the agent got it wrong or got stuck" },
+    ];
+    for (const s of verdicts) {
+      const lbl = document.createElement("label");
+      lbl.className = "cmcp-modal-scope";
+      const r = document.createElement("input");
+      r.type = "radio";
+      r.name = "cmcp-share-verdict";
+      r.value = s.v;
+      // No pre-selection: submit stays disabled until the user explicitly
+      // picks good or bad, so an unlabeled upload is impossible.
+      r.addEventListener("change", () => {
+        state.setVerdict(s.v);
+        sendBtn.disabled = !state.canSubmit;
+      });
+      const span = document.createElement("span");
+      const strong = document.createElement("strong");
+      strong.textContent = s.label;
+      span.append(strong, document.createTextNode(` — ${s.hint}`));
+      lbl.append(r, span);
+      verdictWrap.appendChild(lbl);
+    }
+
+    const why = document.createElement("textarea");
+    why.className = "cmcp-modal-text";
+    why.rows = 3;
+    why.placeholder = "Why? (optional — what went well or wrong)";
+    why.addEventListener("input", () => state.setWhy(why.value));
+
+    // The consent line — the user must know exactly what leaves the machine
+    // BEFORE clicking Share. Keep it accurate if the payload ever changes.
+    const consent = document.createElement("div");
+    consent.style.cssText = "font-size:0.72rem;opacity:0.75;line-height:1.4;";
+    consent.textContent =
+      "Sharing uploads this full conversation (messages + tool activity) and version info " +
+      "(panel / model / backend) to the comfyui-mcp developer to improve the local models. " +
+      "No account data is sent — tokens, secrets, and bridge URLs are stripped first.";
+
+    const statusMsg = document.createElement("div");
+    statusMsg.style.cssText = "font-size:0.75rem;min-height:1em;";
+
+    const btnRow = document.createElement("div");
+    btnRow.className = "cmcp-modal-btns";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "cmcp-btn";
+    cancel.textContent = "Cancel";
+    const sendBtn = document.createElement("button");
+    sendBtn.type = "button";
+    sendBtn.className = "cmcp-btn cmcp-btn-primary";
+    sendBtn.textContent = "Share";
+    sendBtn.disabled = true; // until a verdict is picked
+    const close = () => overlay.remove();
+    cancel.addEventListener("click", close);
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) close();
+    });
+
+    sendBtn.addEventListener("click", async () => {
+      if (!state.canSubmit || sendBtn.dataset.busy === "1") return;
+      sendBtn.dataset.busy = "1";
+      sendBtn.disabled = true;
+      cancel.disabled = true;
+      statusMsg.textContent = "Uploading…";
+      try {
+        state.setWhy(why.value); // authoritative — covers paste/autofill paths
+        const payload = buildFeedbackPayload({
+          verdict: state.verdict,
+          why: state.why,
+          msgs,
+          versions: {
+            panel: PANEL_VERSION,
+            // In Auto mode the orchestrator's reported model is what actually
+            // ran; otherwise the user's pick (fall back to the report).
+            model: prefs.modelAuto ? orchestratorCurrentModel : prefs.model || orchestratorCurrentModel,
+            mcp: orchestratorMcpVersion,
+            backend: connectedBackend || selectedBackend,
+            comfyui: window.app?.frontendVersion ?? window.app?.extensionManager?.appVersion ?? null,
+          },
+        });
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+          // Give slow links a real chance but never hang the modal forever.
+          ...(typeof AbortSignal !== "undefined" && AbortSignal.timeout
+            ? { signal: AbortSignal.timeout(20000) }
+            : {}),
+        });
+        if (!res.ok) throw new Error(`collector answered ${res.status}`);
+        close();
+        appendSystem("✅ Transcript shared — thank you for helping improve the models!");
+      } catch (err) {
+        // Leave the modal open so the user can retry (or cancel) — a failed
+        // upload must never silently discard their rating.
+        statusMsg.textContent = `⚠ Upload failed: ${err instanceof Error ? err.message : String(err)}`;
+        sendBtn.dataset.busy = "";
+        sendBtn.disabled = !state.canSubmit;
+        cancel.disabled = false;
+      }
+    });
+
+    btnRow.append(cancel, sendBtn);
+    modal.append(title, verdictWrap, why, consent, statusMsg, btnRow);
+    overlay.appendChild(modal);
+    root.appendChild(overlay);
   }
 
   // ---- submit ----

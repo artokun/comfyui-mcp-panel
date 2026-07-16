@@ -1,0 +1,15 @@
+{
+  "name": "comfyui-mcp-feedback-uploader",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker that receives the panel's Share-transcript feedback and writes it to S3 (local-model retrain dataset).",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

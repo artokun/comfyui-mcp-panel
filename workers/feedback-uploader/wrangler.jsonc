@@ -1,0 +1,30 @@
+// comfyui-mcp feedback uploader — see README.md for deploy + secrets.
+// Nothing sensitive lives in this file: credentials are Worker secrets
+// (wrangler secret put), and the bucket name is a plain var you set below.
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "comfyui-mcp-feedback-uploader",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-01",
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    // REQUIRED — the S3 bucket that receives feedback objects. Fill in before
+    // deploying (the Worker answers 503 "collector not configured" until every
+    // required var/secret is present).
+    "S3_BUCKET": "",
+    "S3_REGION": "us-east-1",
+    // OPTIONAL — custom S3-compatible endpoint (path-style addressing), e.g.
+    // R2: "https://<ACCOUNT_ID>.r2.cloudflarestorage.com". Leave empty for AWS.
+    "S3_ENDPOINT": "",
+    // OPTIONAL — comma-separated list of allowed browser origins, e.g.
+    // "http://127.0.0.1:8188,http://localhost:8188". "*" (default) allows any
+    // origin — acceptable for a write-only, credential-free collector, but
+    // tighten it if you only serve known ComfyUI hosts.
+    "ALLOWED_ORIGINS": "*"
+  }
+  // Secrets (NOT in this file — set with `wrangler secret put`):
+  //   AWS_ACCESS_KEY_ID
+  //   AWS_SECRET_ACCESS_KEY
+}
