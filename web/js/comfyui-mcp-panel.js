@@ -4137,7 +4137,7 @@ const GRAPH_TOOL_EXECUTORS = {
   // Load a COMPLETE workflow onto the live canvas in one shot (replaces the
   // current graph), so a ready pack/template graph lands without recreating it
   // node-by-node. Mirrors restoreSnapshot's app.loadGraphData(...) path.
-  graph_load({ graph: incoming } = {}) {
+  async graph_load({ graph: incoming } = {}) {
     const { app } = getGraphCtx();
     // Accept a JSON string or an object.
     let data = incoming;
@@ -4197,7 +4197,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // Snapshot the current graph FIRST so the load is undoable via the per-turn
     // revert (double-Esc / revert), like every other graph edit this turn.
     captureGraphSnapshot(null, "before graph_load");
-    app.loadGraphData(clone);
+    // loadGraphData is async on current frontends — AWAIT it so follow-ups
+    // (checkState for one-step undo, success toasts) run after the graph has
+    // actually landed, and a load failure rejects instead of vanishing.
+    await app.loadGraphData(clone);
     return {
       loaded: true,
       node_count: clone.nodes.length,
@@ -9212,6 +9215,28 @@ function buildPanel() {
       isMuted: () => AGENT_MUTED,
       marked,
       DOMPurify,
+      // Canvas access for "load workflow onto canvas": dirty check for the
+      // confirm-overwrite prompt, then the SAME undoable path the bridge's
+      // graph_load command takes (snapshot → await loadGraphData → checkState,
+      // so one load = one Ctrl+Z step). Rejects with a readable message when
+      // the graph isn't a loadable UI workflow or the load itself fails.
+      // Dirty check fails CLOSED: when the workflow state can't be read
+      // (older frontend, missing service, throw), report dirty so the caller
+      // confirms instead of silently clobbering an unsaved canvas.
+      graphIsDirty: () => {
+        try {
+          const wf = app?.extensionManager?.workflow?.activeWorkflow;
+          if (!wf || typeof wf.isModified !== "boolean") return true; // unknown → confirm
+          return wf.isModified;
+        } catch { return true; }
+      },
+      loadGraph: async (graph) => {
+        const result = await GRAPH_TOOL_EXECUTORS.graph_load({ graph });
+        try {
+          app.extensionManager?.workflow?.activeWorkflow?.changeTracker?.checkState?.();
+        } catch { /* tracker unavailable (older frontend) — undo stays best-effort */ }
+        return result;
+      },
     };
   }
   function openCivitai(opts) {

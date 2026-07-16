@@ -8,6 +8,9 @@ runs in the ComfyUI process — makes the real, header-injected calls server-sid
 Routes (all under ``/comfyui_mcp_panel/civitai``):
   GET/POST /api            JSON passthrough to an allow-listed CivitAI host.
   GET      /media          Stream CDN image/video bytes (for <img>/<video> src).
+  GET      /download       Stream a model-version file (workflow .json/.zip);
+                           follows civitai's 307 to the signed CDN URL here,
+                           dropping the Authorization header on the hop.
   GET      /oauth/start    Begin the OAuth (PKCE) sign-in; returns the authorize URL.
   GET      /oauth/callback OAuth redirect target; exchanges the code for tokens.
   GET      /oauth/status   Whether a valid session exists.
@@ -19,9 +22,11 @@ browser — only this server-side module reads them.
 
 import base64
 import hashlib
+import ipaddress
 import json
 import logging
 import os
+import socket
 import time
 from urllib.parse import urlencode, urlparse
 
@@ -37,6 +42,9 @@ _API_HEADERS = {
 }
 _CDN_BASE = "https://image.civitai.com"
 _CDN_KEY = "xG1nkqKTMzGDvpLrqFT7WA"
+# Model-version file download endpoint. A module constant (not an inline literal)
+# so the aiohttp-level integration test can point it at a local mock server.
+_DOWNLOAD_BASE = "https://civitai.red/api/download/models/"
 
 # Only these hosts may be proxied (SSRF guard).
 _ALLOWED_HOSTS = frozenset(
@@ -116,6 +124,78 @@ def _host_ok(url):
         return False
 
 
+# --- /download redirect SSRF guard -------------------------------------------
+# civitai's signed download URLs live on a few CDN hosts. Live-verified 2026-07:
+#   * signed-OUT / older files  → b2.civitai.com (Backblaze B2)
+#   * signed-IN / newer files   → civitai's Cloudflare R2 delivery worker,
+#       civitai-delivery-worker-prod.<civitai-account>.r2.cloudflarestorage.com
+# A /download redirect may ONLY land on these — a compromised upstream must not
+# be able to steer this server-side fetch at loopback/RFC1918/link-local/
+# metadata targets (and _resolves_public() re-checks every resolved address).
+_DL_REDIRECT_HOSTS = ("civitai.com", "civitai.red", "backblazeb2.com")
+# civitai's own Cloudflare R2 delivery worker: the worker-name prefix pins it to
+# civitai's delivery service (an attacker can't publish under this exact worker
+# name on civitai's account), and the r2.cloudflarestorage.com suffix keeps it
+# on Cloudflare's public object store. _resolves_public still blocks internal IPs.
+_R2_DELIVERY_PREFIX = "civitai-delivery-worker-prod."
+_R2_DELIVERY_SUFFIX = ".r2.cloudflarestorage.com"
+
+
+def _redirect_host_ok(host):
+    """True when a redirect host is a civitai download CDN — civitai/B2 (exact
+    or subdomain) or civitai's signed Cloudflare R2 delivery worker."""
+    if not isinstance(host, str) or not host:
+        return False
+    h = host.lower().rstrip(".")
+    if any(h == base or h.endswith("." + base) for base in _DL_REDIRECT_HOSTS):
+        return True
+    return h.startswith(_R2_DELIVERY_PREFIX) and h.endswith(_R2_DELIVERY_SUFFIX)
+
+
+def _ip_public(ip_str):
+    """True when the address is a plain public one — not private, loopback,
+    link-local, reserved, multicast, or unspecified (IPv4-mapped IPv6 is
+    unwrapped first so ::ffff:127.0.0.1 can't smuggle loopback through)."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _is_auth_redirect(path, query):
+    """True when a download redirect points at civitai's sign-in wall — live:
+    307 → ``/login?returnUrl=…&reason=download-auth``. Such a file is gated;
+    the proxy returns 401 instead of chasing the login page and handing its
+    HTML back as if it were the download."""
+    return (path or "").startswith("/login") or "reason=download-auth" in (query or "")
+
+
+async def _resolves_public(host):
+    """Resolve ``host`` and require EVERY answer to be public — a DNS name
+    with any private/loopback record is rejected outright (DNS-rebinding to
+    internal ranges)."""
+    import asyncio
+
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, 443, type=socket.SOCK_STREAM
+        )
+    except Exception:
+        return False
+    ips = {info[4][0] for info in infos}
+    return bool(ips) and all(_ip_public(ip) for ip in ips)
+
+
 async def _valid_access_token(session):
     """Return a non-expired access token, refreshing if needed; None if signed out."""
     tok = _load_tokens()
@@ -156,6 +236,7 @@ async def _valid_access_token(session):
 def register(routes, web):
     """Register the CivitAI proxy routes on ``PromptServer.instance.routes``."""
     import aiohttp  # ComfyUI ships aiohttp
+    from yarl import URL  # aiohttp's own URL type (for manual redirect joins)
 
     def _session():
         return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
@@ -234,6 +315,109 @@ def register(routes, web):
                     )
             except Exception as e:
                 return web.Response(status=502, text=str(e))
+
+    # Model-version file download (the Workflows tab's "load onto canvas").
+    # The /api JSON passthrough is text-only, so binary zips need a byte route.
+    # Live behavior (2026-07): GET /api/download/models/{id} 307s to a
+    # pre-SIGNED b2.civitai.com URL — redirects are followed HERE, manually,
+    # so the OAuth Authorization header is dropped on the cross-host hop
+    # (B2 rejects requests carrying both its query signature and a foreign
+    # Authorization header). Many workflow files download signed-out; gated
+    # ones (early access etc.) surface their 401/403 to the panel as-is.
+    _DL_CAP = 100 * 1024 * 1024  # workflow archives are KB-sized; 100MB is generous
+    _REDIRECTS = (301, 302, 303, 307, 308)
+
+    @routes.get("/comfyui_mcp_panel/civitai/download")
+    async def _civitai_download(request):
+        version_id = request.query.get("versionId", "")
+        if not version_id.isdigit():
+            return web.Response(status=400, text="numeric versionId required")
+        q = {k: request.query[k] for k in ("type", "format") if request.query.get(k)}
+        url = _DOWNLOAD_BASE + version_id
+        if q:
+            url += "?" + urlencode(q)
+        timeout = aiohttp.ClientTimeout(total=300)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            headers = await _authed_headers(session, True)  # OAuth when signed in
+            streaming = False  # once True, headers are sent — no 502 fallback
+            try:
+                for _ in range(5):
+                    async with session.get(
+                        url, headers=headers, allow_redirects=False
+                    ) as resp:
+                        if resp.status in _REDIRECTS:
+                            loc = resp.headers.get("Location")
+                            if not loc:
+                                return web.Response(status=502, text="redirect without Location")
+                            u = resp.url.join(URL(loc))
+                            # A redirect to civitai's own /login (live: 307 →
+                            # /login?returnUrl=…&reason=download-auth) means the
+                            # file is gated — the signed-out (or under-scoped)
+                            # session can't fetch it. Return a clean 401 so the
+                            # panel shows its "sign in via the account button"
+                            # hint deterministically, instead of chasing the
+                            # login page and handing back its HTML as the file.
+                            if _is_auth_redirect(u.path, u.query_string):
+                                return web.json_response(
+                                    {"error": "sign-in required to download this file"},
+                                    status=401,
+                                )
+                            # SSRF guard: only follow to https on a civitai/B2
+                            # host, and only when EVERY address it resolves to
+                            # is public — never loopback/RFC1918/link-local/
+                            # metadata, even via a rebinding DNS answer.
+                            if u.scheme != "https" or not _redirect_host_ok(u.host):
+                                return web.Response(status=502, text="redirect target not allowed")
+                            if not await _resolves_public(u.host):
+                                return web.Response(status=502, text="redirect target not allowed")
+                            url = str(u)
+                            headers = dict(_API_HEADERS)  # drop Authorization on the hop
+                            continue
+                        if resp.status != 200:
+                            return web.Response(status=resp.status, text=await resp.text())
+                        # A 200 that is an HTML page (not a file) is a rendered
+                        # login/interstitial — treat it as auth-required rather
+                        # than handing the panel an HTML "workflow" to choke on.
+                        ctype = (resp.headers.get("Content-Type") or "").lower()
+                        if ctype.startswith("text/html"):
+                            return web.json_response(
+                                {"error": "sign-in required to download this file"},
+                                status=401,
+                            )
+                        if (resp.content_length or 0) > _DL_CAP:
+                            return web.Response(status=413, text="file too large")
+                        # Stream through — no 100MB buffer. Past the cap the
+                        # headers are already gone, so abort the connection:
+                        # the browser sees a failed fetch, never a silently
+                        # truncated file.
+                        out = web.StreamResponse(status=200)
+                        out.content_type = "application/octet-stream"
+                        if resp.content_length:
+                            out.content_length = resp.content_length
+                        await out.prepare(request)
+                        streaming = True
+                        total = 0
+                        async for chunk in resp.content.iter_chunked(1 << 16):
+                            total += len(chunk)
+                            if total > _DL_CAP:
+                                if request.transport is not None:
+                                    request.transport.close()
+                                return out
+                            await out.write(chunk)
+                        await out.write_eof()
+                        return out
+                return web.Response(status=502, text="too many redirects")
+            except Exception as e:
+                # Surface the traceback to ComfyUI's log — a swallowed handler
+                # exception here reads as an opaque 502 to the panel.
+                _log.warning("civitai download failed: %s", e, exc_info=True)
+                if streaming:
+                    # mid-stream failure: headers are gone — abort the
+                    # connection so the client's fetch fails loudly
+                    if request.transport is not None:
+                        request.transport.close()
+                    raise
+                return web.Response(status=502, text="download error: " + str(e))
 
     @routes.get("/comfyui_mcp_panel/civitai/oauth/start")
     async def _oauth_start(request):

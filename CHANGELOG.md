@@ -10,12 +10,47 @@ All notable changes to this project are documented here. This project adheres to
 - CivitAI browser filters actually respond: chips re-render on click (the sheet
   wired a rerender hook that was never defined, so they looked dead), and the
   level/base-model toggles no longer mutate the frozen module defaults
+- CivitAI lightbox no longer claims "✓ Embedded ComfyUI workflow" for posts
+  whose `meta.comfy.workflow` is the empty `{}` civitai sometimes emits — it
+  now falls back to the API-format prompt (savable) and says which one it found
 
 ### Added
 - CivitAI browser: **"See more from @creator"** in the lightbox and model
   detail, and **GitHub-style search qualifiers** — "@name terms" sets the
   creator filter (the displayed @token always owns it; deleting it clears)
   while the terms stay ranked full-text search (#86)
+- CivitAI browser: **Load workflow onto canvas** (community request from
+  Discord). In the lightbox, a post with an embedded UI-format ComfyUI graph
+  gets a "Load onto canvas" action: confirm-overwrite when the current
+  workflow has unsaved changes, then load through the same undoable path the
+  agent bridge uses (snapshot → `loadGraphData` → change-tracker `checkState`,
+  so one load = one Ctrl+Z). API-format-only posts say so honestly instead of
+  corrupting the canvas (Save still keeps their JSON — there is no client-side
+  API→UI converter). On the Workflows tab, model versions grow a
+  "Load workflow onto canvas" button per downloadable workflow file: raw
+  `.json` loads directly; civitai's `.zip` wrappers (780 of 844 live versions)
+  are unpacked in the browser (central-directory walk +
+  `DecompressionStream("deflate-raw")`, no new dependency) with a picker when
+  an archive holds several workflows, under zip-bomb caps (entry count,
+  per-entry and aggregate uncompressed size — a lying size header is
+  re-checked after inflation; duplicate directory records aimed at one blob
+  are deduped). Downloads stream through a new same-origin proxy route that
+  follows civitai's 307 server-side with an SSRF guard — only https civitai
+  download CDNs (civitai/B2 **and** civitai's signed Cloudflare R2 delivery
+  worker, where signed-in downloads land) whose every DNS answer is a public
+  address (no loopback/RFC1918/link-local/metadata, no rebinding), OAuth
+  header dropped on the cross-host hop — streaming through (no buffering)
+  with a 100MB cap.
+  Gated files (civitai 307s the download to `/login?…reason=download-auth`,
+  even on some "Public" versions) are detected deterministically and return a
+  clean 401, and every download/parse/empty/API-only outcome is surfaced BOTH
+  as a top-of-stack toast and an inline status line in the version sheet
+  (which stays open) — with a one-click "sign in" for the gated case — so the
+  action is never a silent no-op. A load reporting zero nodes is treated as a
+  failure (the explorer stays open) rather than a phantom success. The
+  overwrite-confirm dirty check fails CLOSED (unknown workflow state ⇒ ask),
+  and the load is awaited so success/undo bookkeeping only fires once the
+  graph actually landed
 - CivitAI browser: **Creator filter** in the filter sheet (parity with the
   mobile app) — an empty field shows the site's top-creators leaderboard
   (ranked, with download/like counts; degrades to a friendly note when the

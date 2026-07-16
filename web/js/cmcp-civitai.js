@@ -224,6 +224,12 @@ export class CivitaiClient {
       trainedWords: v.trainedWords || [], examples,
       downloadCount: v.stats?.downloadCount,
       fileName: this._primaryFile(v),
+      // Downloadable files, kept for the Workflows "load onto canvas" path.
+      // `format` rides in metadata (live shape: type:"Archive", metadata:{format:"Other"}).
+      files: (v.files || []).map((f) => ({
+        id: f.id, name: f.name || "", sizeKB: f.sizeKB ?? null,
+        type: f.type || null, format: f.metadata?.format ?? null,
+      })),
     };
   }
 
@@ -436,18 +442,271 @@ export class CivitaiClient {
     };
   }
 
+  /** Classify a parsed graph object.
+   *  "ui"  — litegraph/canvas format (top-level `nodes` array): loadable.
+   *  "api" — prompt format (numeric keys, each with `class_type`): runnable by
+   *          the backend but NOT loadable onto the canvas (same test the
+   *          panel's graph_load uses; there is no client-side converter).
+   *  "unknown" — neither (includes the empty `workflow: {}` civitai emits). */
+  static workflowFormat(g) {
+    if (!g || typeof g !== "object" || Array.isArray(g)) return "unknown";
+    if (Array.isArray(g.nodes)) return "ui";
+    const keys = Object.keys(g);
+    if (
+      keys.length > 0 &&
+      keys.every((k) => /^\d+$/.test(k)) &&
+      keys.some((k) => g[k] && typeof g[k] === "object" && "class_type" in g[k])
+    ) return "api";
+    return "unknown";
+  }
+
+  /** Best embedded ComfyUI graph from generation meta → {graph, format} | null.
+   *  Live shapes (2026-07, tRPC image.getGenerationData):
+   *    meta.comfy = { prompt: <api-format obj>, workflow: <ui obj with nodes[]> }
+   *    meta.comfy = { prompt: <api-format obj>, workflow: {} }   ← EMPTY workflow
+   *  plus the legacy shape where meta.comfy (or its fields) is a JSON string.
+   *  Prefers a real UI graph; falls back to the API prompt (savable, not
+   *  loadable); returns null when nothing parses — the old comfyGraph returned
+   *  the truthy-but-empty `{}` here and lit the ✓ badge for nothing. */
+  static comfyGraphInfo(meta) {
+    if (!meta || meta.comfy == null) return null;
+    const parse = (v) => {
+      if (typeof v !== "string") return v;
+      try { return JSON.parse(v); } catch { return null; }
+    };
+    const c = parse(meta.comfy);
+    if (!c || typeof c !== "object") return null;
+    const candidates = ("workflow" in c || "prompt" in c)
+      ? [parse(c.workflow), parse(c.prompt)]
+      : [c];
+    let api = null;
+    for (const g of candidates) {
+      const format = CivitaiClient.workflowFormat(g);
+      if (format === "ui") return { graph: g, format };
+      if (format === "api" && !api) api = g;
+    }
+    return api ? { graph: api, format: "api" } : null;
+  }
+
   /** Parse the embedded ComfyUI graph from generation meta (prefer UI-format). */
   static comfyGraph(meta) {
-    if (!meta || meta.comfy == null) return null;
-    let c = meta.comfy;
-    if (typeof c === "string") {
-      try { c = JSON.parse(c); } catch { return null; }
+    return CivitaiClient.comfyGraphInfo(meta)?.graph ?? null;
+  }
+
+  // ── version-file workflows (Workflows tab "load onto canvas") ───────────
+  /** Files of a model version worth offering as canvas workflows: raw .json
+   *  always; .zip only on Workflows-type models (live sweep of 844 versions:
+   *  780 zips / 77 raw .json — but a zip on a Checkpoint is training data).
+   *  The download API addresses files by (type, format), NOT id — duplicates
+   *  on that key are unreachable, so they're deduped away. */
+  static workflowFiles(version, modelType) {
+    const out = [];
+    const seen = new Set();
+    for (const f of version?.files || []) {
+      const name = (f.name || "").toLowerCase();
+      const isJson = name.endsWith(".json");
+      const isZip = name.endsWith(".zip");
+      if (!isJson && !(isZip && modelType === "Workflows")) continue;
+      if (f.sizeKB != null && f.sizeKB > 100 * 1024) continue; // proxy cap is 100MB
+      const key = `${f.type || ""}|${f.format || ""}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(f);
     }
-    if (c && typeof c === "object") {
-      if (c.workflow) return typeof c.workflow === "string" ? JSON.parse(c.workflow) : c.workflow;
-      if (c.prompt) return typeof c.prompt === "string" ? JSON.parse(c.prompt) : c.prompt;
+    return out;
+  }
+
+  /** Download a model-version file's raw bytes via the same-origin proxy
+   *  (which follows civitai's 307 to the signed CDN URL server-side and
+   *  attaches the OAuth token when signed in). Throws Error with `.status`
+   *  on HTTP failure — 401/403 means the file needs a signed-in account. */
+  async downloadVersionFile(versionId, { type, format } = {}) {
+    const q = new URLSearchParams({ versionId: String(versionId) });
+    if (type) q.set("type", type);
+    if (format) q.set("format", format);
+    const res = await this.api.fetchApi(`/comfyui_mcp_panel/civitai/download?${q.toString()}`);
+    if (!res.ok) {
+      const err = new Error(`civitai download ${res.status}`);
+      err.status = res.status;
+      throw err;
     }
-    return c;
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
+  // ── minimal zip reader (for workflow archives) ──────────────────────────
+  // Civitai wraps workflow uploads in small zips whose local headers use data
+  // descriptors (sizes = 0), so entries MUST be walked via the central
+  // directory. No dependency: DEFLATE entries inflate through the browser's
+  // native DecompressionStream("deflate-raw").
+  //
+  // Zip-bomb caps: workflow archives are KB-sized, so anything past these is
+  // not a workflow zip. Cap violations throw errors tagged `.zipCap = true`
+  // (they must surface to the user, unlike a single unparseable entry, which
+  // is merely skipped). Tests inject smaller caps.
+  static get ZIP_CAPS() {
+    return {
+      entries: 512,                  // central-directory records
+      entryBytes: 32 * 1024 * 1024,  // uncompressed, per entry
+      totalBytes: 96 * 1024 * 1024,  // uncompressed, whole archive
+    };
+  }
+  static _zipCapError(msg) {
+    return Object.assign(new Error(msg), { zipCap: true });
+  }
+
+  /** List entries: [{name, method, cSize, uSize, lfhOff}]. Throws if not a
+   *  zip or past the entry-count cap. Records whose spans run past the buffer
+   *  stop the walk; duplicates aimed at the same local header are dropped
+   *  (a bomb trick: many directory records sharing one compressed blob). */
+  static zipEntries(bytes, caps = CivitaiClient.ZIP_CAPS) {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    // EOCD signature scan from the tail (comment may pad up to 64KB).
+    let eocd = -1;
+    const min = Math.max(0, bytes.length - 65558);
+    for (let i = bytes.length - 22; i >= min; i--) {
+      if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd < 0) throw new Error("not a zip file");
+    const count = dv.getUint16(eocd + 10, true);
+    if (count > caps.entries) {
+      throw CivitaiClient._zipCapError(`zip has too many entries (${count} > ${caps.entries})`);
+    }
+    let off = dv.getUint32(eocd + 16, true);
+    const entries = [];
+    const seenOff = new Set();
+    const td = new TextDecoder();
+    for (let n = 0; n < count; n++) {
+      if (off + 46 > bytes.length || dv.getUint32(off, true) !== 0x02014b50) break;
+      const nameLen = dv.getUint16(off + 28, true);
+      const extraLen = dv.getUint16(off + 30, true);
+      const cmtLen = dv.getUint16(off + 32, true);
+      const end = off + 46 + nameLen + extraLen + cmtLen;
+      if (end > bytes.length) break; // record claims bytes past the buffer
+      const lfhOff = dv.getUint32(off + 42, true);
+      if (!seenOff.has(lfhOff)) {
+        seenOff.add(lfhOff);
+        entries.push({
+          name: td.decode(bytes.subarray(off + 46, off + 46 + nameLen)),
+          method: dv.getUint16(off + 10, true),
+          cSize: dv.getUint32(off + 20, true),
+          uSize: dv.getUint32(off + 24, true),
+          lfhOff,
+        });
+      }
+      off = end;
+    }
+    return entries;
+  }
+
+  /** Locate an entry's raw compressed bytes in the buffer. The read offset is
+   *  the LOCAL header (the only place we actually seek to), and the span
+   *  length is the central-directory `cSize` — but that length is
+   *  bounds-checked against `bytes.length` here, so a lying cSize can't point
+   *  the slice out of bounds (it throws "bad zip entry" instead). */
+  static _entryData(bytes, entry) {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const o = entry.lfhOff;
+    if (o + 30 > bytes.length || dv.getUint32(o, true) !== 0x04034b50) {
+      throw new Error("bad zip entry");
+    }
+    const nameLen = dv.getUint16(o + 26, true);
+    const extraLen = dv.getUint16(o + 28, true);
+    const start = o + 30 + nameLen + extraLen;
+    if (start + entry.cSize > bytes.length) throw new Error("bad zip entry");
+    return bytes.subarray(start, start + entry.cSize);
+  }
+
+  /** Inflate (or pass through) an entry to raw bytes, enforcing `cap` with a
+   *  STREAMING byte counter — chunks are summed as they arrive and the stream
+   *  is CANCELLED the instant the running total exceeds `cap`, so a falsified
+   *  central-directory size can't make us materialize a giant buffer first.
+   *  No declared size (uSize/cSize) is trusted for the limit; the counter is.
+   *  Returns { bytes, byteLength } (byteLength counts ACTUAL decoded bytes). */
+  static async _readEntryBytes(bytes, entry, cap) {
+    const data = CivitaiClient._entryData(bytes, entry);
+    if (entry.method === 0) {
+      // STORE: compressed == uncompressed, already fully present in-buffer and
+      // bounded by cSize ≤ buffer; still enforce the cap.
+      if (data.byteLength > cap) throw CivitaiClient._zipCapError("zip entry too large to unpack");
+      return { bytes: data, byteLength: data.byteLength };
+    }
+    if (entry.method !== 8) throw new Error(`unsupported zip compression (method ${entry.method})`);
+    if (typeof DecompressionStream !== "function") {
+      throw new Error("this browser can't inflate zip archives");
+    }
+    const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+    const reader = stream.getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > cap) {
+        // abort mid-stream — never accumulate past the cap
+        try { await reader.cancel(); } catch { /* already torn down */ }
+        throw CivitaiClient._zipCapError("zip entry too large to unpack");
+      }
+      chunks.push(value);
+    }
+    // Peak memory here is ~2× the cap: the retained `chunks` (bounded to ≤ cap,
+    // since we abort the instant `total` crosses it) plus the single contiguous
+    // `out` copy we assemble from them. Bounded either way — no unbounded
+    // buffer, no full-archive materialization.
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+    return { bytes: out, byteLength: total };
+  }
+
+  /** Read one zipEntries() entry as text (stored or DEFLATE), enforcing the
+   *  per-entry uncompressed cap with a streaming byte counter (see
+   *  _readEntryBytes) — a lying header can't expand unbounded. */
+  static async zipReadText(bytes, entry, caps = CivitaiClient.ZIP_CAPS) {
+    const { bytes: raw } = await CivitaiClient._readEntryBytes(bytes, entry, caps.entryBytes);
+    return new TextDecoder().decode(raw);
+  }
+
+  /** Extract every parseable .json graph from zip bytes →
+   *  [{name, graph, format}] (format per workflowFormat, "ui" first).
+   *  Cap breaches (entry count, per-entry size, aggregate size) THROW with a
+   *  clear message; an individually unparseable entry is merely skipped. The
+   *  aggregate counter sums ACTUAL decoded bytes (not UTF-16 string length, so
+   *  multibyte UTF-8 can't slip past the byte cap) and the per-entry read
+   *  aborts streaming past its own cap before this ever sees a giant buffer. */
+  static async workflowsFromZip(bytes, caps = CivitaiClient.ZIP_CAPS) {
+    const out = [];
+    let total = 0;
+    for (const e of CivitaiClient.zipEntries(bytes, caps)) {
+      if (!/\.json$/i.test(e.name) || /\/$/.test(e.name)) continue;
+      // Cap the per-entry read to whatever aggregate budget REMAINS, so the
+      // streaming counter also enforces the aggregate mid-inflation — an entry
+      // that alone fits its own cap but would blow the archive total aborts
+      // without materializing. min() keeps the per-entry cap when budget > it.
+      const remaining = caps.totalBytes - total;
+      const perEntryCap = Math.min(caps.entryBytes, Math.max(0, remaining));
+      let read;
+      try {
+        read = await CivitaiClient._readEntryBytes(bytes, e, perEntryCap);
+      } catch (err) {
+        if (err && err.zipCap) {
+          // distinguish the aggregate breach for a clearer message
+          throw remaining < caps.entryBytes
+            ? CivitaiClient._zipCapError("archive unpacks too large")
+            : err;
+        }
+        continue; // undecodable entry — skip, don't fail the zip
+      }
+      total += read.byteLength;
+      let graph;
+      try { graph = JSON.parse(new TextDecoder().decode(read.bytes)); }
+      catch { continue; } // unparseable entry — skip
+      const format = CivitaiClient.workflowFormat(graph);
+      if (format === "unknown") continue;
+      out.push({ name: e.name, graph, format });
+    }
+    out.sort((a, b) => (a.format === b.format ? 0 : a.format === "ui" ? -1 : 1));
+    return out;
   }
 
   /** Ordered generation params for the info panel. */
