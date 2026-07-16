@@ -95,6 +95,11 @@ function injectCss() {
     color: var(--p-text-muted-color,#a1a1aa); width: 100%; }
   .cmcp-cv-detail img, .cmcp-cv-detail video { border-radius: 8px; }
   .cmcp-cv-actions { display: flex; gap: .4rem; flex-wrap: wrap; margin-top: .5rem; }
+  .cmcp-cv-wfstatus { margin-top: .5rem; padding: .45rem .6rem; border-radius: 8px; font-size: .78rem;
+    line-height: 1.35; background: var(--p-surface-800,#27272a); color: var(--p-text-color,#fafafa);
+    border: 1px solid var(--p-content-border-color,#3f3f46); }
+  .cmcp-cv-wfstatus.warn { border-color: #d97706; color: #fcd34d; }
+  .cmcp-cv-wfstatus.err { border-color: #dc2626; color: #fca5a5; }
   .cmcp-cv-viewer { position: absolute; inset: 0; z-index: 5; background: rgba(0,0,0,.94);
     display: flex; align-items: center; justify-content: center; }
   .cmcp-cv-viewer img, .cmcp-cv-viewer video { max-width: 100%; max-height: 100%; object-fit: contain; }
@@ -828,6 +833,12 @@ export function openCivitaiModal(ctx, opts = {}) {
       toast("Couldn't load workflow: " + (e.message || e));
       return false;
     }
+    // Defend against a silent no-op: if the load reported zero nodes the graph
+    // didn't actually land — don't dismiss the explorer as if it succeeded.
+    if (!res || !res.node_count) {
+      toast("The workflow loaded empty (0 nodes) — nothing was placed on the canvas.");
+      return false;
+    }
     if (beforeClose) { try { beforeClose(); } catch { /* already gone */ } }
     closeSubModals();
     close();
@@ -837,21 +848,31 @@ export function openCivitaiModal(ctx, opts = {}) {
 
   /** Download a model-version workflow file (raw .json or civitai's zip
    *  wrapper), extract the UI-format graph(s), and load onto the canvas —
-   *  with a picker when an archive holds several. */
-  async function loadVersionWorkflow(version, file) {
-    toast("Fetching workflow…");
+   *  with a picker when an archive holds several. Reports progress and EVERY
+   *  failure through `opts.setStatus` (an inline line in the detail sheet) as
+   *  well as a toast, and NEVER closes the sheet on failure — only a genuine
+   *  canvas load (via loadOntoCanvas) dismisses the explorer. */
+  async function loadVersionWorkflow(version, file, opts = {}) {
+    const setStatus = opts.setStatus || (() => {});
+    const say = (msg, kind = "err") => { setStatus(msg, kind); toast(msg); };
+    setStatus("Fetching workflow…", "info");
     let bytes;
     try {
       bytes = await client.downloadVersionFile(version.id, file);
     } catch (e) {
       if (e.status === 401 || e.status === 403) {
-        // Most workflow files download signed-out (live-verified); a 401/403
-        // means this one is gated — the account button is the panel's way in.
-        toast(state.signedIn
-          ? "CivitAI refused this download — the file may need early access or a purchase."
-          : "CivitAI requires sign-in for this download — use the account (👤) button, then try again.");
+        // Some workflow files are gated (the proxy returns 401 when civitai
+        // redirects the download to /login). The account button is the way in;
+        // offer it right here so the hint is actionable, not just informative.
+        say(state.signedIn
+          ? "CivitAI refused this download — this file may need early access or a purchase. Try the account (👤) button to re-check your sign-in."
+          : "This workflow is gated — sign in to CivitAI (the account 👤 button) to download it, then try again.", "warn");
+        if (!state.signedIn && opts.signIn) {
+          setStatus("This workflow is gated — opening CivitAI sign-in…", "warn");
+          try { opts.signIn(); } catch { /* account flow unavailable */ }
+        }
       } else {
-        toast("Download failed: " + (e.message || e));
+        say("Download failed: " + (e.message || e));
       }
       return;
     }
@@ -865,16 +886,22 @@ export function openCivitaiModal(ctx, opts = {}) {
         candidates = format === "unknown" ? [] : [{ name: file.name, graph, format }];
       }
     } catch (e) {
-      toast("Couldn't read the workflow file: " + (e.message || e));
+      // A gated file can slip through as an HTML page the proxy couldn't tag;
+      // "not a zip" then really means "we got a login page, not the file".
+      const notZip = /not a zip/i.test(String(e.message || e));
+      say(notZip
+        ? "Couldn't read the download — CivitAI may require sign-in for this file (account 👤 button)."
+        : "Couldn't read the workflow file: " + (e.message || e), notZip ? "warn" : "err");
       return;
     }
     const uis = candidates.filter((c) => c.format === "ui");
     if (!uis.length) {
-      toast(candidates.length
-        ? "That file only holds API-format graphs — not loadable onto the canvas. Ask the agent to run it instead."
-        : "No ComfyUI workflow found in that file.");
+      say(candidates.length
+        ? "This file only holds an API-format graph — it can't load as an editable canvas workflow. Ask the agent to run it instead."
+        : "No ComfyUI workflow found in that file.", "warn");
       return;
     }
+    setStatus("", "info"); // clear before a successful load closes the explorer
     if (uis.length === 1) { await loadOntoCanvas(uis[0].graph); return; }
     // several workflows in one archive — let the user pick
     const picker = openSubModal("Pick a workflow to load");
@@ -916,8 +943,18 @@ export function openCivitaiModal(ctx, opts = {}) {
       dlBtn.addEventListener("click", () => pickModel(detail, version));
       dl.appendChild(dlBtn);
       // Workflow files (.json, or the zip wrapper civitai puts around Workflows
-      // uploads) can load straight onto the canvas — the community ask.
+      // uploads) can load straight onto the canvas — the community ask. An
+      // inline status line under the buttons reports progress/errors right in
+      // the sheet (a toast alone was easy to miss / hid behind this overlay).
       const wfFiles = CivitaiClient.workflowFiles(version, detail.type);
+      const wfStatus = el("div", "cmcp-cv-wfstatus");
+      wfStatus.style.display = "none";
+      const setStatus = (msg, kind = "info") => {
+        if (!msg) { wfStatus.style.display = "none"; wfStatus.textContent = ""; return; }
+        wfStatus.style.display = "";
+        wfStatus.className = "cmcp-cv-wfstatus " + kind;
+        wfStatus.textContent = msg;
+      };
       for (const f of wfFiles) {
         const b = el("button", "cmcp-btn",
           wfFiles.length > 1 ? `Load onto canvas — ${f.name}` : "Load workflow onto canvas");
@@ -925,7 +962,7 @@ export function openCivitaiModal(ctx, opts = {}) {
           ? (f.sizeKB >= 1024 ? (f.sizeKB / 1024).toFixed(1) + " MB" : Math.max(1, Math.round(f.sizeKB)) + " KB")
           : null;
         b.title = `Download ${f.name}${size ? ` (${size})` : ""} and load it onto the canvas (Ctrl+Z undoes it).`;
-        b.addEventListener("click", () => loadVersionWorkflow(version, f));
+        b.addEventListener("click", () => { void loadVersionWorkflow(version, f, { setStatus, signIn: () => accountFlow() }); });
         dl.appendChild(b);
       }
       if (have) {
@@ -942,6 +979,7 @@ export function openCivitaiModal(ctx, opts = {}) {
         dl.appendChild(moreBtn);
       }
       detailBody.appendChild(dl);
+      if (wfFiles.length) detailBody.appendChild(wfStatus);
       if (version.descriptionHtml || detail.descriptionHtml) {
         const desc = el("div", "cmcp-cv-detail");
         desc.style.cssText = "font-size:.78rem;margin-top:.5rem";
@@ -1345,16 +1383,20 @@ export function openCivitaiModal(ctx, opts = {}) {
     return { body: b, close: close2 };
   }
 
-  function toast(msg) {
+  function toast(msg, { ms = 3500 } = {}) {
     const t = el("div", null, msg);
-    // A successful canvas load closes the whole modal — that toast must
-    // outlive it, so a disconnected modal falls back to a fixed body toast.
-    const inModal = modal.isConnected;
-    t.style.cssText = `position:${inModal ? "absolute" : "fixed"};bottom:1rem;left:50%;transform:translateX(-50%);` +
-      "background:var(--p-surface-800,#27272a);color:#fafafa;padding:.5rem .8rem;border-radius:8px;" +
-      `z-index:${inModal ? "80" : "10005"};font-size:.8rem;box-shadow:0 4px 16px rgba(0,0,0,.5)`;
-    (inModal ? modal : document.body).appendChild(t);
-    setTimeout(() => t.remove(), 3000);
+    // ALWAYS mount on <body> above every overlay — sub-modals (10001), the
+    // lightbox (10002) and the workflow picker sit above the base modal, and a
+    // toast rendered inside `modal` (z-index 80) was hidden behind them, so a
+    // gated-download hint or a load error read as "nothing happened". A fixed,
+    // top-of-stack toast is visible no matter which sheet is open (or if the
+    // whole explorer just closed after a successful load).
+    t.style.cssText = "position:fixed;bottom:1.25rem;left:50%;transform:translateX(-50%);" +
+      "max-width:min(38rem,90vw);text-align:center;background:var(--p-surface-800,#27272a);" +
+      "color:#fafafa;padding:.55rem .9rem;border-radius:8px;z-index:10060;font-size:.82rem;" +
+      "box-shadow:0 4px 16px rgba(0,0,0,.5)";
+    document.body.appendChild(t);
+    setTimeout(() => t.remove(), ms);
   }
 
   // ── go ───────────────────────────────────────────────────────────────

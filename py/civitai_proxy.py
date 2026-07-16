@@ -157,6 +157,14 @@ def _ip_public(ip_str):
     )
 
 
+def _is_auth_redirect(path, query):
+    """True when a download redirect points at civitai's sign-in wall — live:
+    307 → ``/login?returnUrl=…&reason=download-auth``. Such a file is gated;
+    the proxy returns 401 instead of chasing the login page and handing its
+    HTML back as if it were the download."""
+    return (path or "").startswith("/login") or "reason=download-auth" in (query or "")
+
+
 async def _resolves_public(host):
     """Resolve ``host`` and require EVERY answer to be public — a DNS name
     with any private/loopback record is rejected outright (DNS-rebinding to
@@ -327,6 +335,18 @@ def register(routes, web):
                             if not loc:
                                 return web.Response(status=502, text="redirect without Location")
                             u = resp.url.join(URL(loc))
+                            # A redirect to civitai's own /login (live: 307 →
+                            # /login?returnUrl=…&reason=download-auth) means the
+                            # file is gated — the signed-out (or under-scoped)
+                            # session can't fetch it. Return a clean 401 so the
+                            # panel shows its "sign in via the account button"
+                            # hint deterministically, instead of chasing the
+                            # login page and handing back its HTML as the file.
+                            if _is_auth_redirect(u.path, u.query_string):
+                                return web.json_response(
+                                    {"error": "sign-in required to download this file"},
+                                    status=401,
+                                )
                             # SSRF guard: only follow to https on a civitai/B2
                             # host, and only when EVERY address it resolves to
                             # is public — never loopback/RFC1918/link-local/
@@ -340,6 +360,15 @@ def register(routes, web):
                             continue
                         if resp.status != 200:
                             return web.Response(status=resp.status, text=await resp.text())
+                        # A 200 that is an HTML page (not a file) is a rendered
+                        # login/interstitial — treat it as auth-required rather
+                        # than handing the panel an HTML "workflow" to choke on.
+                        ctype = (resp.headers.get("Content-Type") or "").lower()
+                        if ctype.startswith("text/html"):
+                            return web.json_response(
+                                {"error": "sign-in required to download this file"},
+                                status=401,
+                            )
                         if (resp.content_length or 0) > _DL_CAP:
                             return web.Response(status=413, text="file too large")
                         # Stream through — no 100MB buffer. Past the cap the

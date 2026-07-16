@@ -72,5 +72,24 @@ class PublicIpCheck(unittest.TestCase):
             self.assertFalse(cp._ip_public(ip), ip)
 
 
+class GatedDownloadRedirect(unittest.TestCase):
+    def test_login_redirects_are_flagged_as_auth(self):
+        # live shape: 307 → /login?returnUrl=%2Fmodel-versions%2F3125639&reason=download-auth
+        self.assertTrue(cp._is_auth_redirect("/login", "returnUrl=%2Fx&reason=download-auth"))
+        self.assertTrue(cp._is_auth_redirect("/login/", ""))
+        # reason qualifier alone (path already rewritten) still counts
+        self.assertTrue(cp._is_auth_redirect("/api/whatever", "reason=download-auth"))
+
+    def test_real_file_redirects_are_not_auth(self):
+        # the B2 signed-download hop must NOT be mistaken for a login wall
+        self.assertFalse(cp._is_auth_redirect(
+            "/file/civitai-modelfiles/default/841236/wan21Img2video.0OLz.zip",
+            "Authorization=3_2026...&b2ContentDisposition=attachment",
+        ))
+        self.assertFalse(cp._is_auth_redirect("/api/download/models/2947948", "type=Archive"))
+        self.assertFalse(cp._is_auth_redirect("", ""))
+        self.assertFalse(cp._is_auth_redirect(None, None))
+
+
 if __name__ == "__main__":
     unittest.main()

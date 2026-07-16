@@ -38,11 +38,17 @@ All notable changes to this project are documented here. This project adheres to
   follows civitai's 307 server-side with an SSRF guard — only https
   civitai/B2 hosts whose every DNS answer is a public address (no
   loopback/RFC1918/link-local/metadata, no rebinding), OAuth header dropped
-  on the cross-host hop — streaming through (no buffering) with a 100MB cap;
-  a gated file's 401/403 surfaces as a "sign in via the account button" hint.
-  The overwrite-confirm dirty check fails CLOSED (unknown workflow state ⇒
-  ask), and the load is awaited so success/undo bookkeeping only fires once
-  the graph actually landed
+  on the cross-host hop — streaming through (no buffering) with a 100MB cap.
+  Gated files (civitai 307s the download to `/login?…reason=download-auth`,
+  even on some "Public" versions) are detected deterministically and return a
+  clean 401, and every download/parse/empty/API-only outcome is surfaced BOTH
+  as a top-of-stack toast and an inline status line in the version sheet
+  (which stays open) — with a one-click "sign in" for the gated case — so the
+  action is never a silent no-op. A load reporting zero nodes is treated as a
+  failure (the explorer stays open) rather than a phantom success. The
+  overwrite-confirm dirty check fails CLOSED (unknown workflow state ⇒ ask),
+  and the load is awaited so success/undo bookkeeping only fires once the
+  graph actually landed
 - CivitAI browser: **Creator filter** in the filter sheet (parity with the
   mobile app) — an empty field shows the site's top-creators leaderboard
   (ranked, with download/like counts; degrades to a friendly note when the
