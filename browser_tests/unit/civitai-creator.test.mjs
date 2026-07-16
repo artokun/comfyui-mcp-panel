@@ -6,18 +6,27 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CivitaiClient, DEFAULT_FILTERS, filtersDirty } from "../../web/js/cmcp-civitai.js";
 
-/** Client whose proxy calls are captured; each call resolves `payload`. */
+/** Client whose proxy calls are captured. `payload` may be a single response
+ *  (every call resolves it) or an array consumed one per call (last repeats). */
 const stub = (payload) => {
   const calls = [];
+  const pages = Array.isArray(payload) ? [...payload] : null;
   const client = new CivitaiClient({
     fetchApi: async (_path, opts) => {
       calls.push(JSON.parse(opts.body));
-      return { ok: true, json: async () => payload };
+      const body = pages ? (pages.length > 1 ? pages.shift() : pages[0]) : payload;
+      return { ok: true, json: async () => body };
     },
     apiURL: (p) => p,
   });
   return { client, calls };
 };
+
+/** A minimal /v1/models item whose cover survives _modelFromJson at PG. */
+const modelItem = (name) => ({
+  id: 1, name, type: "LORA",
+  modelVersions: [{ baseModel: "SDXL 1.0", images: [{ url: "u1", nsfwLevel: 1 }], files: [] }],
+});
 
 test("escapeMeili escapes backslashes FIRST, then quotes", () => {
   // the other order would re-escape the quote escaping and let a trailing
@@ -57,25 +66,59 @@ test("searchMedia adds an escaped user.username Meili filter", async () => {
 });
 
 test("fetchModels QUIRK: query+username sends only username, filters keyword client-side", async () => {
-  const item = (name) => ({
-    id: 1, name, type: "LORA",
-    modelVersions: [{ baseModel: "SDXL 1.0", images: [{ url: "u1", nsfwLevel: 1 }], files: [] }],
-  });
-  const { client, calls } = stub({ items: [item("Anime Style"), item("Realism Pack")], metadata: {} });
+  const { client, calls } = stub({ items: [modelItem("Anime Style"), modelItem("Realism Pack")], metadata: {} });
   const page = await client.fetchModels({ type: "LORA", query: "anime", username: "artist" });
   const url = new URL(calls[0].url);
   // both together return an empty page server-side — query must NOT be sent
   assert.equal(url.searchParams.has("query"), false);
   assert.equal(url.searchParams.get("username"), "artist");
   assert.deepEqual(page.models.map((m) => m.name), ["Anime Style"]);
+  assert.equal(calls.length, 1); // matched on page one — no chase
 });
 
-test("fetchModels without username still sends query server-side", async () => {
-  const { client, calls } = stub({ items: [], metadata: {} });
-  await client.fetchModels({ type: "LORA", query: "anime" });
-  const url = new URL(calls[0].url);
-  assert.equal(url.searchParams.get("query"), "anime");
-  assert.equal(url.searchParams.has("username"), false);
+test("fetchModels default path is ONE request — even on an empty page with a cursor", async () => {
+  // no creator filter → no page-chasing, identical to pre-creator behavior
+  const empty = { items: [], metadata: { nextCursor: "c2" } };
+  {
+    const { client, calls } = stub(empty);
+    const page = await client.fetchModels({ type: "LORA" });
+    assert.equal(calls.length, 1);
+    assert.equal(page.nextCursor, "c2");
+  }
+  {
+    const { client, calls } = stub(empty);
+    await client.fetchModels({ type: "LORA", query: "anime" }); // keyword only
+    assert.equal(calls.length, 1);
+    assert.equal(new URL(calls[0].url).searchParams.get("query"), "anime");
+  }
+  {
+    const { client, calls } = stub(empty);
+    await client.fetchModels({ type: "LORA", username: "artist" }); // creator only
+    assert.equal(calls.length, 1);
+  }
+});
+
+test("fetchModels keyword×creator chases past client-side-emptied pages", async () => {
+  const { client, calls } = stub([
+    { items: [modelItem("Realism Pack")], metadata: { nextCursor: "c2" } }, // filtered to zero
+    { items: [modelItem("Anime Style")], metadata: { nextCursor: "c3" } },  // match — stop
+  ]);
+  const page = await client.fetchModels({ type: "LORA", query: "anime", username: "artist" });
+  assert.equal(calls.length, 2);
+  assert.equal(new URL(calls[1].url).searchParams.get("cursor"), "c2"); // hop used the page-1 cursor
+  assert.deepEqual(page.models.map((m) => m.name), ["Anime Style"]);
+  assert.equal(page.nextCursor, "c3"); // resumes AFTER the matched page
+});
+
+test("fetchModels keyword×creator chase is capped (initial + 4 hops)", async () => {
+  const { client, calls } = stub({
+    items: [modelItem("Realism Pack")], // never matches "anime"
+    metadata: { nextCursor: "again" },
+  });
+  const page = await client.fetchModels({ type: "LORA", query: "anime", username: "artist" });
+  assert.equal(calls.length, 5);
+  assert.deepEqual(page.models, []);
+  assert.equal(page.nextCursor, "again"); // caller can keep going explicitly
 });
 
 test("fetchTopCreators parses the leaderboard tRPC shape", async () => {

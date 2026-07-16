@@ -324,26 +324,35 @@ export class CivitaiClient {
   }
 
   async fetchModels({ type, sort = "Most Downloaded", period = "Week", baseModels = [], levels = [1], limit = 100, cursor, query, username } = {}) {
-    const q = new URLSearchParams({
+    const base = new URLSearchParams({
       limit: String(limit), types: type, sort, period,
       nsfw: bitmask(levels) > 2 ? "true" : "false",
     });
-    for (const b of baseModels) q.append("baseModels", b);
+    for (const b of baseModels) base.append("baseModels", b);
     // API QUIRK (live-verified on mobile): /v1/models returns an EMPTY page
     // when BOTH `query` and `username` are sent — so with a creator picked,
     // send only `username` and match the keyword client-side below.
-    if (query && !username) q.set("query", query);
-    if (username) q.set("username", username);
-    if (cursor) q.set("cursor", cursor);
-    const data = await this._get(`${API}/v1/models?${q.toString()}`);
-    let models = (data.items || [])
-      .map((x) => this._modelFromJson(x, levels))
-      .filter(Boolean);
-    if (query && username) {
-      const kw = String(query).toLowerCase();
-      models = models.filter((m) => (m.name || "").toLowerCase().includes(kw));
+    const clientFilter = !!(query && username);
+    if (query && !username) base.set("query", query);
+    if (username) base.set("username", username);
+    const kw = clientFilter ? String(query).toLowerCase() : null;
+    let next = cursor || null;
+    let models = [];
+    // Exactly ONE request on every path except keyword×creator, whose
+    // client-side matching can empty a page — that combo (and ONLY that
+    // combo) chases a few more pages so a thinned page isn't a dead end.
+    for (let hop = 0; ; hop++) {
+      const q = new URLSearchParams(base);
+      if (next) q.set("cursor", next);
+      const data = await this._get(`${API}/v1/models?${q.toString()}`);
+      models = (data.items || [])
+        .map((x) => this._modelFromJson(x, levels))
+        .filter(Boolean);
+      if (kw) models = models.filter((m) => (m.name || "").toLowerCase().includes(kw));
+      next = data.metadata?.nextCursor || null;
+      if (!clientFilter || models.length || !next || hop >= 4) break;
     }
-    return { models, nextCursor: data.metadata?.nextCursor || null };
+    return { models, nextCursor: next };
   }
 
   async fetchModelDetail(modelId, { levels = [1] } = {}) {

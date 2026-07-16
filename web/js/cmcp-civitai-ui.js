@@ -292,6 +292,12 @@ export function openCivitaiModal(ctx, opts = {}) {
   function setLoading(on) { state.loading = on; progress.classList.toggle("on", on); }
 
   async function reload({ searching = false } = {}) {
+    // Invalidate any page load already IN FLIGHT: its response belongs to the
+    // OLD tab/query/filters and must not repopulate the just-cleared grid (nor
+    // leave its cursor behind). The stale request's guarded `finally` won't
+    // clear the loading flag anymore, so reset it here too.
+    state.reqId++;
+    setLoading(false);
     state.items = []; state.models = []; state.cursor = null; state.done = false;
     grid.innerHTML = ""; syncTabs();
     if (searching) searchOverlay.style.display = "";
@@ -307,6 +313,11 @@ export function openCivitaiModal(ctx, opts = {}) {
     const req = ++state.reqId;
     setLoading(true);
     sentinel.textContent = "Loading…";
+    // keyword × creator on model tabs matches client-side (API quirk — see
+    // fetchModels): even after its bounded page-chase a load can come back
+    // empty with more pages left. That must not dead-end the list — the
+    // scroll sentinel only re-fires when the grid grows.
+    let stalled = false;
     try {
       const f = state.filters;
       const levels = f.browsingLevels;
@@ -327,23 +338,16 @@ export function openCivitaiModal(ctx, opts = {}) {
           (it.prompt || "").toLowerCase().includes(q) || (it.author || "").toLowerCase().includes(q)));
       } else if (t.model) {
         if (!state.localLoaded) await refreshLocalModels(); // for "in library" marks
-        const fetchPage = (cursor) => client.fetchModels({
+        const page = await client.fetchModels({
           type: t.model, sort: f.modelSort, period: f.period,
-          baseModels: f.baseModels, levels, cursor,
+          baseModels: f.baseModels, levels, cursor: state.cursor,
           ...(state.query ? { query: state.query } : {}),
           ...(f.username ? { username: f.username } : {}),
         });
-        let page = await fetchPage(state.cursor);
-        // keyword × creator matches client-side (API quirk — see fetchModels),
-        // and the cover-level filter can thin pages too: a page that filters
-        // down to nothing would stall the scroll sentinel, so chase a few
-        // more pages before giving up.
-        for (let hop = 0; req === state.reqId && !page.models.length && page.nextCursor && hop < 4; hop++) {
-          page = await fetchPage(page.nextCursor);
-        }
         if (req !== state.reqId) return;
         state.cursor = page.nextCursor; state.done = !page.nextCursor;
         appendModels(page.models);
+        stalled = !page.models.length && !state.done;
       } else if (state.query) {
         const items = await client.searchMedia(state.query, {
           type: t.media, levels, offset: state.items.length,
@@ -361,9 +365,19 @@ export function openCivitaiModal(ctx, opts = {}) {
         state.cursor = page.nextCursor; state.done = !page.nextCursor;
         appendItems(page.items);
       }
-      sentinel.textContent = state.done ? "" : "";
+      if (stalled) {
+        // Explicit affordance instead of a silent dead end.
+        sentinel.textContent = "";
+        const more = el("button", "cmcp-btn", "No matches yet — keep searching");
+        more.addEventListener("click", () => loadMore());
+        sentinel.appendChild(more);
+      } else if (state.done && !grid.children.length) {
+        sentinel.textContent = "No results.";
+      } else {
+        sentinel.textContent = "";
+      }
     } catch (e) {
-      sentinel.textContent = "CivitAI error: " + (e.message || e);
+      if (req === state.reqId) sentinel.textContent = "CivitAI error: " + (e.message || e);
     } finally {
       if (req === state.reqId) setLoading(false);
     }
@@ -806,11 +820,16 @@ export function openCivitaiModal(ctx, opts = {}) {
   function toggleFilters() {
     const sheet = openSubModal("Filters");
     const update = () => { syncTabs(); reload(); };
-    // Creator-lookup generation counter — lives OUTSIDE renderSheet so a
-    // re-render can't resurrect a stale in-flight response (debounce race).
+    // Creator-lookup generation counter + debounce timer — live OUTSIDE
+    // renderSheet so a re-render can't resurrect a stale in-flight response
+    // (debounce race), and so a timer armed before a re-render can be
+    // cancelled instead of firing against the torn-down sheet (which would
+    // bump crReq and strand the new sheet on "Looking up creators…").
     let crReq = 0;
+    let crTimer = null;
 
     const renderSheet = () => {
+      clearTimeout(crTimer); crTimer = null; // pending lookups target dead nodes
       const f = state.filters;
       sheet.body.innerHTML = "";
       const wrap = el("div", "cmcp-cv-filters");
@@ -926,6 +945,7 @@ export function openCivitaiModal(ctx, opts = {}) {
           }
         };
         const loadMatches = () => {
+          if (!crSearch.isConnected) return; // sheet closed or re-rendered
           const req = ++crReq;
           const cq = crSearch.value.trim();
           crNote.style.display = ""; crNote.textContent = "Looking up creators…";
@@ -949,7 +969,6 @@ export function openCivitaiModal(ctx, opts = {}) {
                 : "Top creators unavailable right now.";
             });
         };
-        let crTimer = null;
         crSearch.addEventListener("input", () => {
           crReq++; // invalidate lookups in flight for the previous text NOW
           clearTimeout(crTimer);
