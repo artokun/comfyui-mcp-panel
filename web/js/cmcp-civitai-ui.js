@@ -134,6 +134,15 @@ function injectCss() {
     animation: cmcp-cv-spin .8s linear infinite; }
   @keyframes cmcp-cv-spin { to { transform: rotate(360deg); } }
   .cmcp-cv-lb-muted { font-size: .74rem; color: var(--p-text-muted-color,#a1a1aa); }
+  .cmcp-cv-creators { display: flex; flex-direction: column; gap: .2rem; width: 100%;
+    max-height: 13rem; overflow-y: auto; }
+  .cmcp-cv-creator { display: flex; align-items: baseline; gap: .5rem; padding: .3rem .5rem;
+    border-radius: 8px; border: 1px solid var(--p-content-border-color,#3f3f46);
+    background: transparent; color: var(--p-text-color,#fafafa); cursor: pointer;
+    text-align: left; font-size: .78rem; }
+  .cmcp-cv-creator:hover { background: var(--p-surface-800,#27272a); }
+  .cmcp-cv-creator .sub { margin-left: auto; font-size: .68rem; flex-shrink: 0;
+    color: var(--p-text-muted-color,#a1a1aa); }
   .cmcp-cv-lb-prompt { font-size: .78rem; white-space: pre-wrap; word-break: break-word;
     background: var(--p-surface-950,#111); border-radius: 8px; padding: .5rem;
     max-height: 14rem; overflow-y: auto; }
@@ -318,21 +327,36 @@ export function openCivitaiModal(ctx, opts = {}) {
           (it.prompt || "").toLowerCase().includes(q) || (it.author || "").toLowerCase().includes(q)));
       } else if (t.model) {
         if (!state.localLoaded) await refreshLocalModels(); // for "in library" marks
-        const page = await client.fetchModels({
+        const fetchPage = (cursor) => client.fetchModels({
           type: t.model, sort: f.modelSort, period: f.period,
-          baseModels: f.baseModels, levels, cursor: state.cursor,
+          baseModels: f.baseModels, levels, cursor,
           ...(state.query ? { query: state.query } : {}),
+          ...(f.username ? { username: f.username } : {}),
         });
+        let page = await fetchPage(state.cursor);
+        // keyword × creator matches client-side (API quirk — see fetchModels),
+        // and the cover-level filter can thin pages too: a page that filters
+        // down to nothing would stall the scroll sentinel, so chase a few
+        // more pages before giving up.
+        for (let hop = 0; req === state.reqId && !page.models.length && page.nextCursor && hop < 4; hop++) {
+          page = await fetchPage(page.nextCursor);
+        }
         if (req !== state.reqId) return;
         state.cursor = page.nextCursor; state.done = !page.nextCursor;
         appendModels(page.models);
       } else if (state.query) {
-        const items = await client.searchMedia(state.query, { type: t.media, levels, offset: state.items.length });
+        const items = await client.searchMedia(state.query, {
+          type: t.media, levels, offset: state.items.length,
+          ...(f.username ? { username: f.username } : {}),
+        });
         if (req !== state.reqId) return;
         state.done = items.length === 0;
         appendItems(items);
       } else {
-        const page = await client.fetchFeed({ type: t.media, period: f.period, sort: f.imageSort, levels, cursor: state.cursor });
+        const page = await client.fetchFeed({
+          type: t.media, period: f.period, sort: f.imageSort, levels, cursor: state.cursor,
+          ...(f.username ? { username: f.username } : {}),
+        });
         if (req !== state.reqId) return;
         state.cursor = page.nextCursor; state.done = !page.nextCursor;
         appendItems(page.items);
@@ -763,6 +787,18 @@ export function openCivitaiModal(ctx, opts = {}) {
   }
 
   // ── filters ──────────────────────────────────────────────────────────
+  // Top-creators leaderboard for the Creator picker, cached for the modal's
+  // lifetime (the board changes daily — a session-stale list is fine here).
+  let _topCreators = null;
+  async function topCreators() {
+    if (!_topCreators) _topCreators = await client.fetchTopCreators();
+    return _topCreators;
+  }
+  const compactCount = (n) =>
+    n >= 1e6 ? (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M"
+    : n >= 1e3 ? (n / 1e3).toFixed(1).replace(/\.0$/, "") + "K"
+    : String(n);
+
   // The whole sheet re-renders after every change: a chip click must flip its
   // own highlight immediately (the original wired a `toggleFilters._rerender`
   // hook that was never defined, so chips looked completely dead — field
@@ -770,6 +806,9 @@ export function openCivitaiModal(ctx, opts = {}) {
   function toggleFilters() {
     const sheet = openSubModal("Filters");
     const update = () => { syncTabs(); reload(); };
+    // Creator-lookup generation counter — lives OUTSIDE renderSheet so a
+    // re-render can't resurrect a stale in-flight response (debounce race).
+    let crReq = 0;
 
     const renderSheet = () => {
       const f = state.filters;
@@ -830,6 +869,97 @@ export function openCivitaiModal(ctx, opts = {}) {
         }
       });
       wrap.append(pills, bmSearch, bmList);
+
+      // creator — single-select async search. Empty field shows the site's
+      // TOP-CREATORS leaderboard (ranked, with stats); typing runs a debounced
+      // (300ms) /v1/creators username search. Picking one threads `username`
+      // through every feed/search/model query; no selection = everyone.
+      wrap.appendChild(el("div", "cmcp-cv-flabel", "Creator"));
+      if (tabDef().fav) {
+        // Favorites are "images YOU liked", from every creator — the tRPC
+        // favorites feed has no creator param, so render the filter visibly
+        // inert here instead of silently no-oping.
+        const box = el("div", "cmcp-cv-frow");
+        box.style.opacity = ".6";
+        if (f.username) {
+          const pill = el("button", "cmcp-cv-chip on", f.username + "  ✕");
+          pill.title = "Remove creator filter";
+          pill.addEventListener("click", () => { f.username = null; renderSheet(); update(); });
+          box.appendChild(pill);
+        }
+        box.appendChild(el("div", "cmcp-cv-lb-muted",
+          "Ignored on the Favorites tab — favorites are the images you liked, from every creator."));
+        wrap.appendChild(box);
+      } else {
+        const crPills = el("div", "cmcp-cv-frow");
+        if (f.username) {
+          const pill = el("button", "cmcp-cv-chip on", f.username + "  ✕");
+          pill.title = "Remove creator filter";
+          pill.addEventListener("click", () => { f.username = null; renderSheet(); update(); });
+          crPills.appendChild(pill);
+        }
+        const crSearch = el("input", "cmcp-cv-search");
+        crSearch.placeholder = f.username
+          ? "Switch creator…"
+          : "All creators — search, or pick from the top";
+        const crNote = el("div", "cmcp-cv-lb-muted");
+        crNote.style.display = "none";
+        const crList = el("div", "cmcp-cv-creators");
+        const renderMatches = (matches) => {
+          crList.innerHTML = "";
+          for (const c of matches) {
+            const b = el("button", "cmcp-cv-creator");
+            b.appendChild(el("span", null,
+              c.position != null ? `#${c.position}  ${c.username}` : c.username));
+            const sub = c.position != null
+              ? [
+                  c.downloads != null ? compactCount(c.downloads) + " downloads" : null,
+                  c.thumbsUp != null ? compactCount(c.thumbsUp) + " likes" : null,
+                ].filter(Boolean).join(" · ")
+              : `${c.modelCount ?? 0} model${(c.modelCount ?? 0) === 1 ? "" : "s"}`;
+            if (sub) b.appendChild(el("span", "sub", sub));
+            b.addEventListener("click", () => {
+              f.username = c.username;
+              renderSheet(); update();
+            });
+            crList.appendChild(b);
+          }
+        };
+        const loadMatches = () => {
+          const req = ++crReq;
+          const cq = crSearch.value.trim();
+          crNote.style.display = ""; crNote.textContent = "Looking up creators…";
+          (cq ? client.searchCreators(cq) : topCreators())
+            .then((matches) => {
+              if (req !== crReq) return; // a newer lookup owns the list
+              renderMatches(matches);
+              crNote.style.display = matches.length ? "none" : "";
+              crNote.textContent = cq
+                ? "No creators match."
+                : "Top creators unavailable right now.";
+            })
+            .catch(() => {
+              // The leaderboard tRPC intermittently 401s bare user agents —
+              // degrade to a note without breaking the rest of the sheet.
+              if (req !== crReq) return;
+              crList.innerHTML = "";
+              crNote.style.display = "";
+              crNote.textContent = cq
+                ? "Creator search failed — try again."
+                : "Top creators unavailable right now.";
+            });
+        };
+        let crTimer = null;
+        crSearch.addEventListener("input", () => {
+          crReq++; // invalidate lookups in flight for the previous text NOW
+          clearTimeout(crTimer);
+          crTimer = setTimeout(loadMatches, 300);
+        });
+        crSearch.addEventListener("focus", () => {
+          if (!crList.children.length) loadMatches();
+        });
+        wrap.append(crPills, crSearch, crNote, crList);
+      }
 
       const reset = el("button", "cmcp-btn", "Reset filters");
       reset.addEventListener("click", () => {

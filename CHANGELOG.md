@@ -12,6 +12,15 @@ All notable changes to this project are documented here. This project adheres to
   level/base-model toggles no longer mutate the frozen module defaults
 
 ### Added
+- CivitAI browser: **Creator filter** in the filter sheet (parity with the
+  mobile app) — an empty field shows the site's top-creators leaderboard
+  (ranked, with download/like counts; degrades to a friendly note when the
+  endpoint balks), typing runs a debounced username search, and the picked
+  creator becomes a removable pill that narrows every feed: images/videos
+  (`/v1/images?username=`), media search (Meili `user.username` filter,
+  escaped), and model tabs (`/v1/models?username=` — keyword+creator matches
+  the keyword client-side around an API quirk). Favorites shows the filter as
+  visibly ignored (your likes come from every creator); Reset clears it
 - CivitAI browser: **like/unlike toggle** — heart on card hover and in the
   lightbox (signed out, the heart opens sign-in); likes mirror into a **default
   likes collection** picked (or created) in the new account sheet

@@ -36,6 +36,7 @@ export const DEFAULT_FILTERS = Object.freeze({
   modelSort: "Most Downloaded",
   browsingLevels: [1],
   favorited: false,
+  username: null, // creator filter — null means everyone
 });
 
 export function filtersDirty(f) {
@@ -45,6 +46,7 @@ export function filtersDirty(f) {
     f.modelSort !== "Most Downloaded" ||
     f.baseModels.length > 0 ||
     f.favorited ||
+    !!f.username ||
     !(f.browsingLevels.length === 1 && f.browsingLevels[0] === 1)
   );
 }
@@ -205,12 +207,21 @@ export class CivitaiClient {
     };
   }
 
+  /** Escape a string for use inside a quoted MeiliSearch filter value.
+   *  Backslashes FIRST, then quotes — the other order would re-escape the
+   *  quote escaping, letting a trailing `\` (or a crafted `\"`) break out of
+   *  the quoted string and alter the filter. */
+  static escapeMeili(s) {
+    return String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
   // ── public API ───────────────────────────────────────────────────────────
-  async fetchFeed({ type = "image", period = "Week", sort = "Most Reactions", levels = [1], limit = 100, cursor } = {}) {
+  async fetchFeed({ type = "image", period = "Week", sort = "Most Reactions", levels = [1], limit = 100, cursor, username } = {}) {
     const q = new URLSearchParams({
       limit: String(limit), browsingLevel: String(bitmask(levels)),
       period, type, sort,
     });
+    if (username) q.set("username", username); // narrow to one creator's posts
     if (cursor) q.set("cursor", cursor);
     const data = await this._get(`${API}/v1/images?${q.toString()}`);
     return {
@@ -229,8 +240,12 @@ export class CivitaiClient {
     return (data.items || []).map((x) => this._fromRest(x));
   }
 
-  async searchMedia(query, { type = "image", levels = [1], limit = 100, offset = 0 } = {}) {
+  async searchMedia(query, { type = "image", levels = [1], limit = 100, offset = 0, username } = {}) {
     const filter = [`type = ${type}`, `nsfwLevel IN [${levels.join(", ")}]`];
+    // Creator filter — the index exposes the author under `user.username`
+    // (live-verified filterable on the mobile app). Quoted + escaped so any
+    // legal username parses without breaking out of the filter string.
+    if (username) filter.push(`user.username = "${CivitaiClient.escapeMeili(username)}"`);
     const data = await this._request({
       url: SEARCH_URL, method: "POST",
       headers: {
@@ -308,18 +323,26 @@ export class CivitaiClient {
     return { items: (j.items || []).map((x) => this._fromMeili(x)), nextCursor: j.nextCursor || null };
   }
 
-  async fetchModels({ type, sort = "Most Downloaded", period = "Week", baseModels = [], levels = [1], limit = 100, cursor, query } = {}) {
+  async fetchModels({ type, sort = "Most Downloaded", period = "Week", baseModels = [], levels = [1], limit = 100, cursor, query, username } = {}) {
     const q = new URLSearchParams({
       limit: String(limit), types: type, sort, period,
       nsfw: bitmask(levels) > 2 ? "true" : "false",
     });
     for (const b of baseModels) q.append("baseModels", b);
-    if (query) q.set("query", query);
+    // API QUIRK (live-verified on mobile): /v1/models returns an EMPTY page
+    // when BOTH `query` and `username` are sent — so with a creator picked,
+    // send only `username` and match the keyword client-side below.
+    if (query && !username) q.set("query", query);
+    if (username) q.set("username", username);
     if (cursor) q.set("cursor", cursor);
     const data = await this._get(`${API}/v1/models?${q.toString()}`);
-    const models = (data.items || [])
+    let models = (data.items || [])
       .map((x) => this._modelFromJson(x, levels))
       .filter(Boolean);
+    if (query && username) {
+      const kw = String(query).toLowerCase();
+      models = models.filter((m) => (m.name || "").toLowerCase().includes(kw));
+    }
     return { models, nextCursor: data.metadata?.nextCursor || null };
   }
 
@@ -332,6 +355,45 @@ export class CivitaiClient {
       downloadCount: j.stats?.downloadCount, thumbsUp: j.stats?.thumbsUpCount,
       tags: j.tags || [],
     };
+  }
+
+  // ── creators (leaderboard tRPC + /v1/creators search) ────────────────────
+  /** The site's creator leaderboard (civitai.com/leaderboard, "Creators"
+   *  board) via tRPC — the public v1 API exposes NO leaderboard ordering
+   *  (/v1/creators is join-date ordered), so this mirrors the website's own
+   *  request. The endpoint intermittently 401s bare user agents; the proxy's
+   *  browser-shaped headers usually pass, but callers must degrade gracefully
+   *  (the picker shows "Top creators unavailable right now"). */
+  async fetchTopCreators({ limit = 25 } = {}) {
+    const enc = encodeURIComponent(JSON.stringify({ json: { id: "overall" } }));
+    const data = await this._get(`${API}/trpc/leaderboard.getLeaderboard?input=${enc}`);
+    const entries = data.result?.data?.json;
+    if (!Array.isArray(entries)) return [];
+    const out = [];
+    for (const e of entries) {
+      const username = e?.user?.username;
+      if (!username || e?.user?.deletedAt != null) continue;
+      const metric = (t) =>
+        Array.isArray(e.metrics) ? e.metrics.find((m) => m?.type === t)?.value ?? null : null;
+      out.push({
+        username, position: e.position ?? null, score: e.score ?? null,
+        downloads: metric("downloadCount"), thumbsUp: metric("thumbsUpCount"),
+      });
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+
+  /** Search creators by (partial) username via the public /v1/creators API.
+   *  Unranked (join-date order) — for ranked names use fetchTopCreators. */
+  async searchCreators(query, { limit = 20 } = {}) {
+    const trimmed = String(query || "").trim();
+    if (!trimmed) return [];
+    const q = new URLSearchParams({ query: trimmed, limit: String(limit) });
+    const data = await this._get(`${API}/v1/creators?${q.toString()}`);
+    return (data.items || [])
+      .filter((j) => j && j.username)
+      .map((j) => ({ username: j.username, modelCount: j.modelCount ?? 0 }));
   }
 
   async getGenerationData(imageId) {
