@@ -212,17 +212,19 @@ export function openCivitaiModal(ctx, opts = {}) {
   search.placeholder = "Search CivitAI…";
   search.value = state.query;
   let searchTimer = null;
-  // An @token in the search box OWNS the creator filter: typing one sets it,
-  // deleting it clears it — but a creator picked in the filter sheet is left
-  // alone (creatorFromSearch tracks whose it is). setCreator is the ONE place
-  // filters.username changes outside applySearch: it also rewrites the box's
-  // @token so the sheet's pill/picker/reset and the box can never desync
-  // (codex review: a removed pill used to resurrect from the stale token).
+  // The @token displayed in the search box ALWAYS owns the creator filter:
+  // setCreator mirrors every creator change (sheet picker, pill ✕, reset,
+  // "See more from") into the box as an @token, so deleting that token must
+  // clear the filter no matter where it came from — ownership is "the token
+  // is displayed", not "who typed it" (codex round-3: a sheet-picked creator's
+  // mirrored token previously didn't own the filter, making deletion
+  // history-dependent). setCreator is the ONE mutation point outside
+  // applySearch.
   let creatorFromSearch = false;
-  function setCreator(name, { fromSearch = false } = {}) {
+  function setCreator(name) {
     const f = state.filters;
     f.username = name ? String(name) : null;
-    creatorFromSearch = !!name && fromSearch;
+    creatorFromSearch = !!name; // displayed token == owned token, always
     // Rewrite only the qualifier part of the box; keep the user's terms.
     const { query } = parseCreatorQuery(search.value);
     search.value = f.username ? `@${f.username}${query ? " " + query : " "}` : query;
@@ -262,7 +264,7 @@ export function openCivitaiModal(ctx, opts = {}) {
     if (!name) return;
     state.query = "";
     search.value = "";
-    setCreator(name, { fromSearch: true });
+    setCreator(name);
     if (tabDef().fav) state.tab = toModelTab ? state.tab : "images";
     syncTabs();
     reload({ searching: true });
