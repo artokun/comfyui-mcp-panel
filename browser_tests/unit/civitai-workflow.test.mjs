@@ -7,6 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { deflateRawSync } from "node:zlib";
 import { CivitaiClient } from "../../web/js/cmcp-civitai.js";
+import { graphDirtyForConfirm } from "../../web/js/cmcp-civitai-ui.js";
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 const UI_GRAPH = {
@@ -23,8 +24,10 @@ const API_GRAPH = {
 
 /** Minimal in-memory zip builder. zeroLfhSizes mirrors civitai's real zips:
  *  bit-3 data descriptors leave the LOCAL header sizes at 0 — only the
- *  central directory knows them. */
-function buildZip(files, { zeroLfhSizes = false, store = false } = {}) {
+ *  central directory knows them. uSizeOverride fakes the central directory's
+ *  claimed uncompressed size (lying-header bomb); dupCentral appends N extra
+ *  copies of each central record pointing at the SAME local header. */
+function buildZip(files, { zeroLfhSizes = false, store = false, uSizeOverride = null, dupCentral = 0 } = {}) {
   const u16 = (v) => { const b = Buffer.alloc(2); b.writeUInt16LE(v); return b; };
   const u32 = (v) => { const b = Buffer.alloc(4); b.writeUInt32LE(v >>> 0); return b; };
   const chunks = [];
@@ -43,17 +46,19 @@ function buildZip(files, { zeroLfhSizes = false, store = false } = {}) {
       u32(0), u32(zeroLfhSizes ? 0 : data.length), u32(zeroLfhSizes ? 0 : raw.length),
       u16(nameB.length), u16(0), nameB, data,
     ]));
-    central.push(Buffer.concat([
+    const record = Buffer.concat([
       u32(0x02014b50), u16(20), u16(20), u16(flags), u16(method), u16(0), u16(0),
-      u32(0), u32(data.length), u32(raw.length),
+      u32(0), u32(data.length), u32(uSizeOverride ?? raw.length),
       u16(nameB.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(lfhOff), nameB,
-    ]));
+    ]);
+    central.push(record);
+    for (let d = 0; d < dupCentral; d++) central.push(Buffer.from(record));
   }
   const cd = Buffer.concat(central);
   const cdOff = offset;
   push(cd);
   push(Buffer.concat([
-    u32(0x06054b50), u16(0), u16(0), u16(files.length), u16(files.length),
+    u32(0x06054b50), u16(0), u16(0), u16(central.length), u16(central.length),
     u32(cd.length), u32(cdOff), u16(0),
   ]));
   return new Uint8Array(Buffer.concat(chunks));
@@ -180,6 +185,78 @@ test("zipReadText inflates DEFLATE and reads STORE entries", async () => {
 
 test("zipEntries throws on non-zip bytes", () => {
   assert.throws(() => CivitaiClient.zipEntries(new Uint8Array([1, 2, 3, 4])), /not a zip/);
+});
+
+// ── zip-bomb caps (injected small so the tests stay KB-sized) ───────────────
+test("zipEntries rejects archives past the entry-count cap", () => {
+  const bytes = buildZip([
+    ["a.json", "{}"], ["b.json", "{}"], ["c.json", "{}"],
+  ]);
+  const caps = { ...CivitaiClient.ZIP_CAPS, entries: 2 };
+  assert.throws(() => CivitaiClient.zipEntries(bytes, caps),
+    (e) => e.zipCap === true && /too many entries/.test(e.message));
+});
+
+test("zipReadText rejects entries whose CLAIMED size exceeds the per-entry cap", async () => {
+  const big = JSON.stringify({ ...UI_GRAPH, pad: "x".repeat(500) });
+  const bytes = buildZip([["big.json", big]]);
+  const caps = { ...CivitaiClient.ZIP_CAPS, entryBytes: 100 };
+  const [e] = CivitaiClient.zipEntries(bytes, caps);
+  await assert.rejects(() => CivitaiClient.zipReadText(bytes, e, caps),
+    (err) => err.zipCap === true && /entry too large/.test(err.message));
+});
+
+test("a LYING uSize header still hits the post-inflation cap", async () => {
+  // claimed 10 bytes (passes every pre-check: uSize 10 and the well-compressed
+  // cSize both sit under the cap), actually inflates to ~10KB
+  const big = JSON.stringify({ ...UI_GRAPH, pad: "x".repeat(10000) });
+  const bytes = buildZip([["liar.json", big]], { uSizeOverride: 10 });
+  const caps = { ...CivitaiClient.ZIP_CAPS, entryBytes: 300 };
+  const [e] = CivitaiClient.zipEntries(bytes, caps);
+  assert.equal(e.uSize, 10); // the lie is in place
+  await assert.rejects(() => CivitaiClient.zipReadText(bytes, e, caps),
+    (err) => err.zipCap === true && /entry too large/.test(err.message));
+  // and workflowsFromZip surfaces it instead of silently skipping
+  await assert.rejects(() => CivitaiClient.workflowsFromZip(bytes, caps),
+    (err) => err.zipCap === true);
+});
+
+test("workflowsFromZip rejects archives past the AGGREGATE cap", async () => {
+  const entry = JSON.stringify({ ...UI_GRAPH, pad: "x".repeat(40) }); // ~190B each
+  const bytes = buildZip([["a.json", entry], ["b.json", entry]]);
+  const caps = { ...CivitaiClient.ZIP_CAPS, totalBytes: 250 }; // one fits, two don't
+  await assert.rejects(() => CivitaiClient.workflowsFromZip(bytes, caps),
+    (err) => err.zipCap === true && /unpacks too large/.test(err.message));
+});
+
+test("duplicate central-directory records aimed at one local header are deduped", () => {
+  // bomb trick: N directory records × one compressed blob = N× inflation
+  const bytes = buildZip([["a.json", JSON.stringify(UI_GRAPH)]], { dupCentral: 3 });
+  const entries = CivitaiClient.zipEntries(bytes);
+  assert.equal(entries.length, 1);
+});
+
+test("central records whose spans run past the buffer stop the walk", () => {
+  const bytes = buildZip([["a.json", "{}"]]);
+  // patch the central record's nameLen to a huge value (record sig scan)
+  const dv = new DataView(bytes.buffer);
+  for (let i = 0; i + 4 <= bytes.length; i++) {
+    if (dv.getUint32(i, true) === 0x02014b50) { dv.setUint16(i + 28, 0xffff, true); break; }
+  }
+  assert.deepEqual(CivitaiClient.zipEntries(bytes), []);
+});
+
+// ── dirty-check fails CLOSED ────────────────────────────────────────────────
+test("graphDirtyForConfirm treats every uncertainty as dirty", () => {
+  assert.equal(graphDirtyForConfirm(undefined), true);           // no ctx at all
+  assert.equal(graphDirtyForConfirm({}), true);                  // getter missing
+  assert.equal(graphDirtyForConfirm({ graphIsDirty: 7 }), true); // not callable
+  assert.equal(graphDirtyForConfirm({ graphIsDirty: () => { throw new Error("x"); } }), true);
+  assert.equal(graphDirtyForConfirm({ graphIsDirty: () => undefined }), true); // non-boolean
+  assert.equal(graphDirtyForConfirm({ graphIsDirty: () => "no" }), true);
+  // and it still trusts a definite answer
+  assert.equal(graphDirtyForConfirm({ graphIsDirty: () => false }), false);
+  assert.equal(graphDirtyForConfirm({ graphIsDirty: () => true }), true);
 });
 
 test("workflowsFromZip extracts graphs, skips junk, sorts UI first", async () => {

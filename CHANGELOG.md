@@ -31,11 +31,18 @@ All notable changes to this project are documented here. This project adheres to
   `.json` loads directly; civitai's `.zip` wrappers (780 of 844 live versions)
   are unpacked in the browser (central-directory walk +
   `DecompressionStream("deflate-raw")`, no new dependency) with a picker when
-  an archive holds several workflows. Downloads stream through a new
-  same-origin proxy route that follows civitai's 307 to the signed CDN URL
-  server-side (dropping the OAuth header on the cross-host hop) and caps at
-  100MB; a gated file's 401/403 surfaces as a "sign in via the account
-  button" hint
+  an archive holds several workflows, under zip-bomb caps (entry count,
+  per-entry and aggregate uncompressed size — a lying size header is
+  re-checked after inflation; duplicate directory records aimed at one blob
+  are deduped). Downloads stream through a new same-origin proxy route that
+  follows civitai's 307 server-side with an SSRF guard — only https
+  civitai/B2 hosts whose every DNS answer is a public address (no
+  loopback/RFC1918/link-local/metadata, no rebinding), OAuth header dropped
+  on the cross-host hop — streaming through (no buffering) with a 100MB cap;
+  a gated file's 401/403 surfaces as a "sign in via the account button" hint.
+  The overwrite-confirm dirty check fails CLOSED (unknown workflow state ⇒
+  ask), and the load is awaited so success/undo bookkeeping only fires once
+  the graph actually landed
 - CivitAI browser: **Creator filter** in the filter sheet (parity with the
   mobile app) — an empty field shows the site's top-creators leaderboard
   (ranked, with download/like counts; degrades to a friendly note when the

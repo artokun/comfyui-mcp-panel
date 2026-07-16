@@ -166,6 +166,20 @@ const el = (tag, cls, txt) => {
   return n;
 };
 
+/** Fail-CLOSED dirty check for the load-onto-canvas overwrite confirm: any
+ *  uncertainty (missing getter, non-boolean answer, a throw) counts as DIRTY
+ *  so the user gets asked — never silently clobber an unsaved canvas.
+ *  Exported for unit tests. */
+export function graphDirtyForConfirm(ctx) {
+  try {
+    if (typeof ctx?.graphIsDirty !== "function") return true;
+    const d = ctx.graphIsDirty();
+    return typeof d === "boolean" ? d : true;
+  } catch {
+    return true;
+  }
+}
+
 /** Open (or focus) the CivitAI modal. opts = {query, tab, filters, browsingLevels}. */
 export function openCivitaiModal(ctx, opts = {}) {
   injectCss();
@@ -651,7 +665,7 @@ export function openCivitaiModal(ctx, opts = {}) {
           if (wf.format === "ui") {
             const loadBtn = el("button", "cmcp-btn", "Load onto canvas");
             loadBtn.title = "Replace the current canvas with this post's embedded ComfyUI workflow (Ctrl+Z undoes it).";
-            loadBtn.addEventListener("click", () => loadOntoCanvas(wf.graph, closeLb));
+            loadBtn.addEventListener("click", () => { void loadOntoCanvas(wf.graph, closeLb); });
             actions.appendChild(loadBtn);
           }
           const saveBtn = el("button", "cmcp-btn", "Save workflow");
@@ -732,7 +746,7 @@ export function openCivitaiModal(ctx, opts = {}) {
       if (wf.format === "ui") {
         const loadBtn = el("button", "cmcp-btn", "Load onto canvas");
         loadBtn.title = "Replace the current canvas with this example's embedded ComfyUI workflow (Ctrl+Z undoes it).";
-        loadBtn.addEventListener("click", () => loadOntoCanvas(wf.graph));
+        loadBtn.addEventListener("click", () => { void loadOntoCanvas(wf.graph); });
         actions.appendChild(loadBtn);
       }
       const saveBtn = el("button", "cmcp-btn", "Save workflow");
@@ -792,23 +806,24 @@ export function openCivitaiModal(ctx, opts = {}) {
   }
 
   // ── load a UI-format workflow onto the live canvas ───────────────────
-  /** Confirm-if-dirty, then load via the bridge's undoable graph_load path
-   *  (snapshot → loadGraphData → checkState — one load = one Ctrl+Z step).
-   *  On success every explorer surface closes so the canvas is visible,
-   *  `beforeClose` first (e.g. the lightbox, which isn't a sub-modal).
+  /** Confirm-if-dirty (fail-closed — see graphDirtyForConfirm), then load via
+   *  the bridge's undoable graph_load path (snapshot → await loadGraphData →
+   *  checkState — one load = one Ctrl+Z step). Success is only announced —
+   *  and the explorer only closed — after the awaited load actually landed;
+   *  `beforeClose` runs first (e.g. the lightbox, which isn't a sub-modal).
    *  Returns true when it loaded. */
-  function loadOntoCanvas(graph, beforeClose) {
+  async function loadOntoCanvas(graph, beforeClose) {
     if (typeof ctx.loadGraph !== "function") {
       toast("This panel build can't load onto the canvas.");
       return false;
     }
-    if (ctx.graphIsDirty?.() && !window.confirm(
+    if (graphDirtyForConfirm(ctx) && !window.confirm(
       "Load this workflow onto the canvas?\n\n" +
       "Your current workflow has unsaved changes that will be replaced (Ctrl+Z undoes the load).",
     )) return false;
     let res;
     try {
-      res = ctx.loadGraph(graph);
+      res = await ctx.loadGraph(graph);
     } catch (e) {
       toast("Couldn't load workflow: " + (e.message || e));
       return false;
@@ -860,7 +875,7 @@ export function openCivitaiModal(ctx, opts = {}) {
         : "No ComfyUI workflow found in that file.");
       return;
     }
-    if (uis.length === 1) { loadOntoCanvas(uis[0].graph); return; }
+    if (uis.length === 1) { await loadOntoCanvas(uis[0].graph); return; }
     // several workflows in one archive — let the user pick
     const picker = openSubModal("Pick a workflow to load");
     const list = el("div", "cmcp-cv-creators");
@@ -869,7 +884,7 @@ export function openCivitaiModal(ctx, opts = {}) {
       const b = el("button", "cmcp-cv-creator");
       b.appendChild(el("span", null, c.name));
       b.appendChild(el("span", "sub", `${c.graph.nodes.length} nodes`));
-      b.addEventListener("click", () => loadOntoCanvas(c.graph));
+      b.addEventListener("click", () => { void loadOntoCanvas(c.graph); });
       list.appendChild(b);
     }
     picker.body.appendChild(list);

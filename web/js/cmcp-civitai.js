@@ -538,8 +538,27 @@ export class CivitaiClient {
   // descriptors (sizes = 0), so entries MUST be walked via the central
   // directory. No dependency: DEFLATE entries inflate through the browser's
   // native DecompressionStream("deflate-raw").
-  /** List entries: [{name, method, cSize, uSize, lfhOff}]. Throws if not a zip. */
-  static zipEntries(bytes) {
+  //
+  // Zip-bomb caps: workflow archives are KB-sized, so anything past these is
+  // not a workflow zip. Cap violations throw errors tagged `.zipCap = true`
+  // (they must surface to the user, unlike a single unparseable entry, which
+  // is merely skipped). Tests inject smaller caps.
+  static get ZIP_CAPS() {
+    return {
+      entries: 512,                  // central-directory records
+      entryBytes: 32 * 1024 * 1024,  // uncompressed, per entry
+      totalBytes: 96 * 1024 * 1024,  // uncompressed, whole archive
+    };
+  }
+  static _zipCapError(msg) {
+    return Object.assign(new Error(msg), { zipCap: true });
+  }
+
+  /** List entries: [{name, method, cSize, uSize, lfhOff}]. Throws if not a
+   *  zip or past the entry-count cap. Records whose spans run past the buffer
+   *  stop the walk; duplicates aimed at the same local header are dropped
+   *  (a bomb trick: many directory records sharing one compressed blob). */
+  static zipEntries(bytes, caps = CivitaiClient.ZIP_CAPS) {
     const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     // EOCD signature scan from the tail (comment may pad up to 64KB).
     let eocd = -1;
@@ -549,28 +568,43 @@ export class CivitaiClient {
     }
     if (eocd < 0) throw new Error("not a zip file");
     const count = dv.getUint16(eocd + 10, true);
+    if (count > caps.entries) {
+      throw CivitaiClient._zipCapError(`zip has too many entries (${count} > ${caps.entries})`);
+    }
     let off = dv.getUint32(eocd + 16, true);
     const entries = [];
+    const seenOff = new Set();
     const td = new TextDecoder();
     for (let n = 0; n < count; n++) {
       if (off + 46 > bytes.length || dv.getUint32(off, true) !== 0x02014b50) break;
       const nameLen = dv.getUint16(off + 28, true);
       const extraLen = dv.getUint16(off + 30, true);
       const cmtLen = dv.getUint16(off + 32, true);
-      entries.push({
-        name: td.decode(bytes.subarray(off + 46, off + 46 + nameLen)),
-        method: dv.getUint16(off + 10, true),
-        cSize: dv.getUint32(off + 20, true),
-        uSize: dv.getUint32(off + 24, true),
-        lfhOff: dv.getUint32(off + 42, true),
-      });
-      off += 46 + nameLen + extraLen + cmtLen;
+      const end = off + 46 + nameLen + extraLen + cmtLen;
+      if (end > bytes.length) break; // record claims bytes past the buffer
+      const lfhOff = dv.getUint32(off + 42, true);
+      if (!seenOff.has(lfhOff)) {
+        seenOff.add(lfhOff);
+        entries.push({
+          name: td.decode(bytes.subarray(off + 46, off + 46 + nameLen)),
+          method: dv.getUint16(off + 10, true),
+          cSize: dv.getUint32(off + 20, true),
+          uSize: dv.getUint32(off + 24, true),
+          lfhOff,
+        });
+      }
+      off = end;
     }
     return entries;
   }
 
-  /** Read one zipEntries() entry as text (stored or DEFLATE). */
-  static async zipReadText(bytes, entry) {
+  /** Read one zipEntries() entry as text (stored or DEFLATE), enforcing the
+   *  per-entry uncompressed cap both up front (claimed uSize/cSize) and after
+   *  inflation — a lying header doesn't get to expand unbounded. */
+  static async zipReadText(bytes, entry, caps = CivitaiClient.ZIP_CAPS) {
+    if (entry.uSize > caps.entryBytes || entry.cSize > caps.entryBytes) {
+      throw CivitaiClient._zipCapError("zip entry too large to unpack");
+    }
     const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     const o = entry.lfhOff;
     if (o + 30 > bytes.length || dv.getUint32(o, true) !== 0x04034b50) {
@@ -579,6 +613,7 @@ export class CivitaiClient {
     const nameLen = dv.getUint16(o + 26, true);
     const extraLen = dv.getUint16(o + 28, true);
     const start = o + 30 + nameLen + extraLen;
+    if (start + entry.cSize > bytes.length) throw new Error("bad zip entry");
     const data = bytes.subarray(start, start + entry.cSize);
     if (entry.method === 0) return new TextDecoder().decode(data);
     if (entry.method !== 8) throw new Error(`unsupported zip compression (method ${entry.method})`);
@@ -586,18 +621,41 @@ export class CivitaiClient {
       throw new Error("this browser can't inflate zip archives");
     }
     const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
-    return await new Response(stream).text();
+    const buf = await new Response(stream).arrayBuffer();
+    if (buf.byteLength > caps.entryBytes) {
+      throw CivitaiClient._zipCapError("zip entry too large to unpack");
+    }
+    return new TextDecoder().decode(buf);
   }
 
   /** Extract every parseable .json graph from zip bytes →
-   *  [{name, graph, format}] (format per workflowFormat, "ui" first). */
-  static async workflowsFromZip(bytes) {
+   *  [{name, graph, format}] (format per workflowFormat, "ui" first).
+   *  Cap breaches (entry count, per-entry size, aggregate size) THROW with a
+   *  clear message; an individually unparseable entry is merely skipped. */
+  static async workflowsFromZip(bytes, caps = CivitaiClient.ZIP_CAPS) {
     const out = [];
-    for (const e of CivitaiClient.zipEntries(bytes)) {
+    let total = 0;
+    for (const e of CivitaiClient.zipEntries(bytes, caps)) {
       if (!/\.json$/i.test(e.name) || /\/$/.test(e.name)) continue;
+      // aggregate cap on CLAIMED sizes first, so a bomb can't be inflated
+      // piecewise; the true inflated size is re-counted after reading.
+      if (total + e.uSize > caps.totalBytes) {
+        throw CivitaiClient._zipCapError("archive unpacks too large");
+      }
+      let text;
+      try {
+        text = await CivitaiClient.zipReadText(bytes, e, caps);
+      } catch (err) {
+        if (err && err.zipCap) throw err; // cap breach — fail the whole zip
+        continue; // undecodable entry — skip, don't fail the zip
+      }
+      total += text.length;
+      if (total > caps.totalBytes) {
+        throw CivitaiClient._zipCapError("archive unpacks too large");
+      }
       let graph;
-      try { graph = JSON.parse(await CivitaiClient.zipReadText(bytes, e)); }
-      catch { continue; } // undecodable/unparseable entry — skip, don't fail the zip
+      try { graph = JSON.parse(text); }
+      catch { continue; } // unparseable entry — skip
       const format = CivitaiClient.workflowFormat(graph);
       if (format === "unknown") continue;
       out.push({ name: e.name, graph, format });

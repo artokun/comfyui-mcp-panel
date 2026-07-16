@@ -22,9 +22,11 @@ browser — only this server-side module reads them.
 
 import base64
 import hashlib
+import ipaddress
 import json
 import logging
 import os
+import socket
 import time
 from urllib.parse import urlencode, urlparse
 
@@ -117,6 +119,58 @@ def _host_ok(url):
         return urlparse(url).hostname in _ALLOWED_HOSTS
     except Exception:
         return False
+
+
+# --- /download redirect SSRF guard -------------------------------------------
+# civitai's signed download URLs live on civitai-owned hosts (b2.civitai.com,
+# live-verified) or Backblaze B2 directly. A /download redirect may ONLY land
+# on these — a compromised upstream must not be able to steer this server-side
+# fetch at loopback/RFC1918/link-local/metadata targets.
+_DL_REDIRECT_HOSTS = ("civitai.com", "civitai.red", "backblazeb2.com")
+
+
+def _redirect_host_ok(host):
+    """True when a redirect host is civitai/B2 (exact match or subdomain)."""
+    if not isinstance(host, str) or not host:
+        return False
+    h = host.lower().rstrip(".")
+    return any(h == base or h.endswith("." + base) for base in _DL_REDIRECT_HOSTS)
+
+
+def _ip_public(ip_str):
+    """True when the address is a plain public one — not private, loopback,
+    link-local, reserved, multicast, or unspecified (IPv4-mapped IPv6 is
+    unwrapped first so ::ffff:127.0.0.1 can't smuggle loopback through)."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+async def _resolves_public(host):
+    """Resolve ``host`` and require EVERY answer to be public — a DNS name
+    with any private/loopback record is rejected outright (DNS-rebinding to
+    internal ranges)."""
+    import asyncio
+
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, 443, type=socket.SOCK_STREAM
+        )
+    except Exception:
+        return False
+    ips = {info[4][0] for info in infos}
+    return bool(ips) and all(_ip_public(ip) for ip in ips)
 
 
 async def _valid_access_token(session):
@@ -262,6 +316,7 @@ def register(routes, web):
         timeout = aiohttp.ClientTimeout(total=300)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             headers = await _authed_headers(session, True)  # OAuth when signed in
+            streaming = False  # once True, headers are sent — no 502 fallback
             try:
                 for _ in range(5):
                     async with session.get(
@@ -271,25 +326,50 @@ def register(routes, web):
                             loc = resp.headers.get("Location")
                             if not loc:
                                 return web.Response(status=502, text="redirect without Location")
-                            url = str(resp.url.join(URL(loc)))
-                            if not url.startswith("https://"):
-                                return web.Response(status=502, text="unsafe redirect target")
+                            u = resp.url.join(URL(loc))
+                            # SSRF guard: only follow to https on a civitai/B2
+                            # host, and only when EVERY address it resolves to
+                            # is public — never loopback/RFC1918/link-local/
+                            # metadata, even via a rebinding DNS answer.
+                            if u.scheme != "https" or not _redirect_host_ok(u.host):
+                                return web.Response(status=502, text="redirect target not allowed")
+                            if not await _resolves_public(u.host):
+                                return web.Response(status=502, text="redirect target not allowed")
+                            url = str(u)
                             headers = dict(_API_HEADERS)  # drop Authorization on the hop
                             continue
                         if resp.status != 200:
                             return web.Response(status=resp.status, text=await resp.text())
                         if (resp.content_length or 0) > _DL_CAP:
                             return web.Response(status=413, text="file too large")
-                        buf = bytearray()
+                        # Stream through — no 100MB buffer. Past the cap the
+                        # headers are already gone, so abort the connection:
+                        # the browser sees a failed fetch, never a silently
+                        # truncated file.
+                        out = web.StreamResponse(status=200)
+                        out.content_type = "application/octet-stream"
+                        if resp.content_length:
+                            out.content_length = resp.content_length
+                        await out.prepare(request)
+                        streaming = True
+                        total = 0
                         async for chunk in resp.content.iter_chunked(1 << 16):
-                            buf.extend(chunk)
-                            if len(buf) > _DL_CAP:
-                                return web.Response(status=413, text="file too large")
-                        return web.Response(
-                            body=bytes(buf), content_type="application/octet-stream"
-                        )
+                            total += len(chunk)
+                            if total > _DL_CAP:
+                                if request.transport is not None:
+                                    request.transport.close()
+                                return out
+                            await out.write(chunk)
+                        await out.write_eof()
+                        return out
                 return web.Response(status=502, text="too many redirects")
             except Exception as e:
+                if streaming:
+                    # mid-stream failure: headers are gone — abort the
+                    # connection so the client's fetch fails loudly
+                    if request.transport is not None:
+                        request.transport.close()
+                    raise
                 return web.Response(status=502, text=str(e))
 
     @routes.get("/comfyui_mcp_panel/civitai/oauth/start")
