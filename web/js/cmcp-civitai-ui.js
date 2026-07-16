@@ -184,6 +184,7 @@ export function openCivitaiModal(ctx, opts = {}) {
       browsingLevels: [...(opts.filters?.browsingLevels ?? DEFAULT_FILTERS.browsingLevels)],
     },
     items: [], models: [], cursor: null, loading: false, done: false, reqId: 0,
+    searchSeq: 0, // searching-overlay ownership (see reload)
     signedIn: false, localNames: new Set(), localLoaded: false,
     favType: "all", // favorites sub-filter: all | image | video
   };
@@ -300,11 +301,15 @@ export function openCivitaiModal(ctx, opts = {}) {
     setLoading(false);
     state.items = []; state.models = []; state.cursor = null; state.done = false;
     grid.innerHTML = ""; syncTabs();
+    // Overlay ownership: only the NEWEST reload may hide the searching
+    // spinner — a superseded reload's finally must not kill the overlay of
+    // the search that replaced it (same generation pattern as the grid).
+    const mySearch = ++state.searchSeq;
     if (searching) searchOverlay.style.display = "";
     try {
       await loadMore();
     } finally {
-      searchOverlay.style.display = "none";
+      if (mySearch === state.searchSeq) searchOverlay.style.display = "none";
     }
   }
 
@@ -818,8 +823,6 @@ export function openCivitaiModal(ctx, opts = {}) {
   // hook that was never defined, so chips looked completely dead — field
   // report: "I press them, nothing happens").
   function toggleFilters() {
-    const sheet = openSubModal("Filters");
-    const update = () => { syncTabs(); reload(); };
     // Creator-lookup generation counter + debounce timer — live OUTSIDE
     // renderSheet so a re-render can't resurrect a stale in-flight response
     // (debounce race), and so a timer armed before a re-render can be
@@ -827,6 +830,15 @@ export function openCivitaiModal(ctx, opts = {}) {
     // bump crReq and strand the new sheet on "Looking up creators…").
     let crReq = 0;
     let crTimer = null;
+    // Closing the sheet (✕ / backdrop) tears the picker down for good:
+    // cancel the pending debounce and invalidate any lookup already in
+    // flight so its completion early-returns instead of touching the
+    // detached nodes.
+    const sheet = openSubModal("Filters", () => {
+      clearTimeout(crTimer); crTimer = null;
+      crReq++;
+    });
+    const update = () => { syncTabs(); reload(); };
 
     const renderSheet = () => {
       clearTimeout(crTimer); crTimer = null; // pending lookups target dead nodes
@@ -946,6 +958,9 @@ export function openCivitaiModal(ctx, opts = {}) {
         };
         const loadMatches = () => {
           if (!crSearch.isConnected) return; // sheet closed or re-rendered
+          // Direct calls (the focus path) must also cancel a pending debounce
+          // tick, or the same text fires a second, redundant lookup.
+          clearTimeout(crTimer); crTimer = null;
           const req = ++crReq;
           const cq = crSearch.value.trim();
           crNote.style.display = ""; crNote.textContent = "Looking up creators…";
@@ -1108,7 +1123,7 @@ export function openCivitaiModal(ctx, opts = {}) {
   }
 
   // ── sub-modal + toast helpers ────────────────────────────────────────
-  function openSubModal(title) {
+  function openSubModal(title, onClose) {
     const ov = el("div", "cmcp-cv-overlay"); ov.style.zIndex = "10001";
     const m = el("div", "cmcp-modal"); m.style.maxWidth = "40rem"; m.style.width = "min(40rem, 92vw)";
     m.style.maxHeight = "85vh"; m.style.overflowY = "auto";
@@ -1116,7 +1131,9 @@ export function openCivitaiModal(ctx, opts = {}) {
     const x = el("button", "cmcp-cv-iconbtn"); x.innerHTML = '<i class="pi pi-times"></i>';
     x.style.cssText = "position:absolute;top:.5rem;right:.5rem";
     const b = el("div"); m.style.position = "relative";
-    const close2 = () => ov.remove();
+    // Every close path (✕ button, backdrop click, sheet.close()) funnels here,
+    // so a caller-supplied teardown runs no matter how the sheet is dismissed.
+    const close2 = () => { ov.remove(); if (onClose) onClose(); };
     x.addEventListener("click", close2);
     ov.addEventListener("mousedown", (e) => { if (e.target === ov) close2(); });
     m.append(head2, x, b); ov.appendChild(m); document.body.appendChild(ov);
