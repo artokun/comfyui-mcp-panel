@@ -960,7 +960,7 @@ const SETTING_MOBILE_BETA = "comfyui-mcp.mobileAppBeta";
 // now operating on. When FALSE, the legacy per-workflow behavior: each workflow
 // keeps its own thread + agent session and switching tabs switches conversations.
 const SETTING_SESSION_FOLLOWS_PANEL = "comfyui-mcp.sessionFollowsPanel";
-const MOBILE_IOS_TESTFLIGHT_URL = ""; // e.g. https://testflight.apple.com/join/XXXXXXXX
+const MOBILE_IOS_TESTFLIGHT_URL = "https://testflight.apple.com/join/ws65s4a2"; // beta-testers external group
 const MOBILE_ANDROID_FIREBASE_URL = ""; // e.g. https://appdistribution.firebase.dev/i/XXXXXXXX
 const SETTING_EXTERNAL_ORCH = "comfyui-mcp.externalOrchestrator";
 const SETTING_TOKEN_CIVITAI = "comfyui-mcp.setCivitaiToken";
@@ -8058,7 +8058,7 @@ function buildPanel() {
   const helpDiv = document.createElement("div");
   helpDiv.className = "cmcp-help";
   helpDiv.textContent =
-    "Click Connect to start an autonomous agent on your Claude subscription — no API keys. Sign in to Claude once (run `claude`) first. Prefer to run it yourself? Start the orchestrator, then Connect:";
+    "Click Connect to start an autonomous agent on your own AI subscription or a local model — no API keys. Sign in to your provider once first (e.g. run `claude`, `codex login`, or `gemini`). Prefer to run it yourself? Start the orchestrator, then Connect:";
   // `connect` (no URL) starts the orchestrator; the panel hands it THIS ComfyUI's
   // host on connect (browser-host targeting), so it drives whatever you're viewing
   // — local or a remote pod. Offer the command per shell: PowerShell needs a
@@ -8125,7 +8125,7 @@ function buildPanel() {
   emptyIcon.className = "pi pi-comments";
   const emptyTitle = document.createElement("div");
   emptyTitle.className = "cmcp-empty-title";
-  emptyTitle.textContent = "Claude is at your canvas";
+  emptyTitle.textContent = "Your agent is at your canvas";
   const emptyBody = document.createElement("div");
   emptyBody.textContent =
     "Build and edit the live graph, generate images & audio, run the workflow and read its errors, or find models on Civitai — every graph edit undoes with Ctrl+Z.";
@@ -8214,7 +8214,7 @@ function buildPanel() {
     const sub = document.createElement("div");
     sub.className = "cmcp-onboard-sub";
     sub.textContent =
-      "The agent runs on YOUR machine on your own Claude, ChatGPT, or Gemini subscription — no API keys. Set up a provider (Node ≥ 22), start the agent with the command below, then click Connect.";
+      "The agent runs on YOUR machine on your own AI subscription (Claude, ChatGPT, Gemini, …) or a local model (Ollama, LM Studio, llama.cpp) — no API keys. Set up a provider (Node ≥ 22), start the agent with the command below, then click Connect.";
     onboard.append(title, sub);
     for (const id of ["claude", "codex", "gemini", "grok", "kimi", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"]) {
       const meta = PROVIDER_SETUP[id];
@@ -8580,9 +8580,12 @@ function buildPanel() {
 
   const input = document.createElement("textarea");
   input.className = "cmcp-composer-input";
-  // Placeholder reflects the active backend ("Ask Claude…" / "Ask ChatGPT…").
+  // Placeholder + empty-state hero reflect the active backend ("Ask Claude…" /
+  // "Ask ChatGPT…", "Claude is at your canvas" / "Ollama is at your canvas").
   function setAskPlaceholder(id) {
-    input.placeholder = `Ask ${BACKEND_LABELS[id] || "Claude"}… / for commands, @ for context`;
+    const label = BACKEND_LABELS[id];
+    input.placeholder = `Ask ${label || "your agent"}… / for commands, @ for context`;
+    emptyTitle.textContent = `${label || "Your agent"} is at your canvas`;
   }
   setAskPlaceholder(selectedBackend);
   input.rows = 1;
@@ -8633,7 +8636,7 @@ function buildPanel() {
     ring.appendChild(c);
   }
   const ringTitle = document.createElementNS(SVG_NS, "title");
-  ringTitle.textContent = "Context window — fills as Claude reports usage";
+  ringTitle.textContent = "Context window — fills as the agent reports usage";
   ring.appendChild(ringTitle);
   // Compact context-usage readout shown right after the ring.
   const ctxLabel = document.createElement("span");
@@ -13925,7 +13928,7 @@ function registerExtensionWhenReady(tries = 0) {
         title: "Agent",
         // ComfyUI ships PrimeIcons; `pi-comments` is the closest "chat" glyph.
         icon: "pi pi-comments",
-        tooltip: "ComfyUI Agent Panel — your Claude session's window into this graph",
+        tooltip: "ComfyUI Agent Panel — your agent session's window into this graph",
         type: "custom",
         // KEEP-ALIVE: the panel (bridge client, agent session, chat DOM) is built
         // ONCE and survives tab switches. render() re-attaches the same root into
