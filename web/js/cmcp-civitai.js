@@ -50,10 +50,12 @@ export const DEFAULT_FILTERS = Object.freeze({
  */
 export function parseCreatorQuery(raw) {
   const tokens = String(raw ?? "").trim().split(/\s+/).filter(Boolean);
-  const at = tokens.find((t) => t.length > 1 && t.startsWith("@"));
+  const atIdx = tokens.findIndex((t) => t.length > 1 && t.startsWith("@"));
   return {
-    creator: at ? at.slice(1) : null,
-    query: tokens.filter((t) => t !== at).join(" "),
+    creator: atIdx >= 0 ? tokens[atIdx].slice(1) : null,
+    // Remove only the FIRST qualifier occurrence — a later identical token is
+    // a plain term per the documented rule ("@alice cats @alice").
+    query: tokens.filter((_, i) => i !== atIdx).join(" "),
   };
 }
 
