@@ -197,7 +197,7 @@ test("zipEntries rejects archives past the entry-count cap", () => {
     (e) => e.zipCap === true && /too many entries/.test(e.message));
 });
 
-test("zipReadText rejects entries whose CLAIMED size exceeds the per-entry cap", async () => {
+test("zipReadText aborts inflation past the per-entry cap", async () => {
   const big = JSON.stringify({ ...UI_GRAPH, pad: "x".repeat(500) });
   const bytes = buildZip([["big.json", big]]);
   const caps = { ...CivitaiClient.ZIP_CAPS, entryBytes: 100 };
@@ -206,17 +206,19 @@ test("zipReadText rejects entries whose CLAIMED size exceeds the per-entry cap",
     (err) => err.zipCap === true && /entry too large/.test(err.message));
 });
 
-test("a LYING uSize header still hits the post-inflation cap", async () => {
-  // claimed 10 bytes (passes every pre-check: uSize 10 and the well-compressed
-  // cSize both sit under the cap), actually inflates to ~10KB
-  const big = JSON.stringify({ ...UI_GRAPH, pad: "x".repeat(10000) });
-  const bytes = buildZip([["liar.json", big]], { uSizeOverride: 10 });
-  const caps = { ...CivitaiClient.ZIP_CAPS, entryBytes: 300 };
+test("a LYING-LOW uSize is ignored — the STREAMING counter catches the real inflation", async () => {
+  // The killer case: central-directory uSize claims 5 bytes (so any declared-
+  // size pre-check would wave it through), the well-compressed cSize is tiny,
+  // but it actually inflates to ~2MB from a highly repetitive payload. The
+  // streaming counter must abort mid-inflation — never materialize the 2MB.
+  const bomb = JSON.stringify({ ...UI_GRAPH, pad: "A".repeat(2_000_000) });
+  const bytes = buildZip([["liar.json", bomb]], { uSizeOverride: 5 });
+  const caps = { ...CivitaiClient.ZIP_CAPS, entryBytes: 4096 }; // 4KB — far below 2MB
   const [e] = CivitaiClient.zipEntries(bytes, caps);
-  assert.equal(e.uSize, 10); // the lie is in place
+  assert.equal(e.uSize, 5);                    // the lie is in place
+  assert.ok(e.cSize < 4096);                   // compressed blob itself is tiny
   await assert.rejects(() => CivitaiClient.zipReadText(bytes, e, caps),
     (err) => err.zipCap === true && /entry too large/.test(err.message));
-  // and workflowsFromZip surfaces it instead of silently skipping
   await assert.rejects(() => CivitaiClient.workflowsFromZip(bytes, caps),
     (err) => err.zipCap === true);
 });
@@ -227,6 +229,27 @@ test("workflowsFromZip rejects archives past the AGGREGATE cap", async () => {
   const caps = { ...CivitaiClient.ZIP_CAPS, totalBytes: 250 }; // one fits, two don't
   await assert.rejects(() => CivitaiClient.workflowsFromZip(bytes, caps),
     (err) => err.zipCap === true && /unpacks too large/.test(err.message));
+});
+
+test("aggregate cap counts UTF-8 BYTES, not UTF-16 code units", async () => {
+  // Each entry pads with a 3-byte-UTF-8 / 1-UTF-16-unit char, so byte length is
+  // ~3× the string length. Two entries: ~24KB of bytes but only ~8K code
+  // units. A byte cap between them must catch the second; a string-length
+  // counter (the bug) would see 8K < the cap and wave it through.
+  const pad = "の".repeat(4000);                 // 12000 UTF-8 bytes, 4000 UTF-16 units
+  const entry = JSON.stringify({ ...UI_GRAPH, pad });
+  const bytes = buildZip([["a.json", entry], ["b.json", entry]], { zeroLfhSizes: true });
+  const oneByteLen = new TextEncoder().encode(entry).length;
+  const oneStrLen = entry.length;
+  assert.ok(oneByteLen > oneStrLen * 2);         // multibyte confirmed
+  // cap: one entry fits, two exceed it in BYTES but NOT in UTF-16 units
+  const caps = { ...CivitaiClient.ZIP_CAPS, totalBytes: Math.floor(oneByteLen * 1.5) };
+  assert.ok(caps.totalBytes > oneStrLen * 2);    // a string counter would pass both
+  await assert.rejects(() => CivitaiClient.workflowsFromZip(bytes, caps),
+    (err) => err.zipCap === true && /unpacks too large/.test(err.message));
+  // control: a byte cap that fits both loads both
+  const roomy = { ...CivitaiClient.ZIP_CAPS, totalBytes: oneByteLen * 3 };
+  assert.equal((await CivitaiClient.workflowsFromZip(bytes, roomy)).length, 2);
 });
 
 test("duplicate central-directory records aimed at one local header are deduped", () => {

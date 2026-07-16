@@ -598,13 +598,12 @@ export class CivitaiClient {
     return entries;
   }
 
-  /** Read one zipEntries() entry as text (stored or DEFLATE), enforcing the
-   *  per-entry uncompressed cap both up front (claimed uSize/cSize) and after
-   *  inflation — a lying header doesn't get to expand unbounded. */
-  static async zipReadText(bytes, entry, caps = CivitaiClient.ZIP_CAPS) {
-    if (entry.uSize > caps.entryBytes || entry.cSize > caps.entryBytes) {
-      throw CivitaiClient._zipCapError("zip entry too large to unpack");
-    }
+  /** Locate an entry's raw compressed bytes in the buffer. The read offset is
+   *  the LOCAL header (the only place we actually seek to), and the span
+   *  length is the central-directory `cSize` — but that length is
+   *  bounds-checked against `bytes.length` here, so a lying cSize can't point
+   *  the slice out of bounds (it throws "bad zip entry" instead). */
+  static _entryData(bytes, entry) {
     const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     const o = entry.lfhOff;
     if (o + 30 > bytes.length || dv.getUint32(o, true) !== 0x04034b50) {
@@ -614,47 +613,93 @@ export class CivitaiClient {
     const extraLen = dv.getUint16(o + 28, true);
     const start = o + 30 + nameLen + extraLen;
     if (start + entry.cSize > bytes.length) throw new Error("bad zip entry");
-    const data = bytes.subarray(start, start + entry.cSize);
-    if (entry.method === 0) return new TextDecoder().decode(data);
+    return bytes.subarray(start, start + entry.cSize);
+  }
+
+  /** Inflate (or pass through) an entry to raw bytes, enforcing `cap` with a
+   *  STREAMING byte counter — chunks are summed as they arrive and the stream
+   *  is CANCELLED the instant the running total exceeds `cap`, so a falsified
+   *  central-directory size can't make us materialize a giant buffer first.
+   *  No declared size (uSize/cSize) is trusted for the limit; the counter is.
+   *  Returns { bytes, byteLength } (byteLength counts ACTUAL decoded bytes). */
+  static async _readEntryBytes(bytes, entry, cap) {
+    const data = CivitaiClient._entryData(bytes, entry);
+    if (entry.method === 0) {
+      // STORE: compressed == uncompressed, already fully present in-buffer and
+      // bounded by cSize ≤ buffer; still enforce the cap.
+      if (data.byteLength > cap) throw CivitaiClient._zipCapError("zip entry too large to unpack");
+      return { bytes: data, byteLength: data.byteLength };
+    }
     if (entry.method !== 8) throw new Error(`unsupported zip compression (method ${entry.method})`);
     if (typeof DecompressionStream !== "function") {
       throw new Error("this browser can't inflate zip archives");
     }
     const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
-    const buf = await new Response(stream).arrayBuffer();
-    if (buf.byteLength > caps.entryBytes) {
-      throw CivitaiClient._zipCapError("zip entry too large to unpack");
+    const reader = stream.getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > cap) {
+        // abort mid-stream — never accumulate past the cap
+        try { await reader.cancel(); } catch { /* already torn down */ }
+        throw CivitaiClient._zipCapError("zip entry too large to unpack");
+      }
+      chunks.push(value);
     }
-    return new TextDecoder().decode(buf);
+    // Peak memory here is ~2× the cap: the retained `chunks` (bounded to ≤ cap,
+    // since we abort the instant `total` crosses it) plus the single contiguous
+    // `out` copy we assemble from them. Bounded either way — no unbounded
+    // buffer, no full-archive materialization.
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+    return { bytes: out, byteLength: total };
+  }
+
+  /** Read one zipEntries() entry as text (stored or DEFLATE), enforcing the
+   *  per-entry uncompressed cap with a streaming byte counter (see
+   *  _readEntryBytes) — a lying header can't expand unbounded. */
+  static async zipReadText(bytes, entry, caps = CivitaiClient.ZIP_CAPS) {
+    const { bytes: raw } = await CivitaiClient._readEntryBytes(bytes, entry, caps.entryBytes);
+    return new TextDecoder().decode(raw);
   }
 
   /** Extract every parseable .json graph from zip bytes →
    *  [{name, graph, format}] (format per workflowFormat, "ui" first).
    *  Cap breaches (entry count, per-entry size, aggregate size) THROW with a
-   *  clear message; an individually unparseable entry is merely skipped. */
+   *  clear message; an individually unparseable entry is merely skipped. The
+   *  aggregate counter sums ACTUAL decoded bytes (not UTF-16 string length, so
+   *  multibyte UTF-8 can't slip past the byte cap) and the per-entry read
+   *  aborts streaming past its own cap before this ever sees a giant buffer. */
   static async workflowsFromZip(bytes, caps = CivitaiClient.ZIP_CAPS) {
     const out = [];
     let total = 0;
     for (const e of CivitaiClient.zipEntries(bytes, caps)) {
       if (!/\.json$/i.test(e.name) || /\/$/.test(e.name)) continue;
-      // aggregate cap on CLAIMED sizes first, so a bomb can't be inflated
-      // piecewise; the true inflated size is re-counted after reading.
-      if (total + e.uSize > caps.totalBytes) {
-        throw CivitaiClient._zipCapError("archive unpacks too large");
-      }
-      let text;
+      // Cap the per-entry read to whatever aggregate budget REMAINS, so the
+      // streaming counter also enforces the aggregate mid-inflation — an entry
+      // that alone fits its own cap but would blow the archive total aborts
+      // without materializing. min() keeps the per-entry cap when budget > it.
+      const remaining = caps.totalBytes - total;
+      const perEntryCap = Math.min(caps.entryBytes, Math.max(0, remaining));
+      let read;
       try {
-        text = await CivitaiClient.zipReadText(bytes, e, caps);
+        read = await CivitaiClient._readEntryBytes(bytes, e, perEntryCap);
       } catch (err) {
-        if (err && err.zipCap) throw err; // cap breach — fail the whole zip
+        if (err && err.zipCap) {
+          // distinguish the aggregate breach for a clearer message
+          throw remaining < caps.entryBytes
+            ? CivitaiClient._zipCapError("archive unpacks too large")
+            : err;
+        }
         continue; // undecodable entry — skip, don't fail the zip
       }
-      total += text.length;
-      if (total > caps.totalBytes) {
-        throw CivitaiClient._zipCapError("archive unpacks too large");
-      }
+      total += read.byteLength;
       let graph;
-      try { graph = JSON.parse(text); }
+      try { graph = JSON.parse(new TextDecoder().decode(read.bytes)); }
       catch { continue; } // unparseable entry — skip
       const format = CivitaiClient.workflowFormat(graph);
       if (format === "unknown") continue;
