@@ -206,7 +206,7 @@ export class CivitaiClient {
   }
 
   // ── public API ───────────────────────────────────────────────────────────
-  async fetchFeed({ type = "image", period = "Week", sort = "Most Reactions", levels = [1], limit = 60, cursor } = {}) {
+  async fetchFeed({ type = "image", period = "Week", sort = "Most Reactions", levels = [1], limit = 100, cursor } = {}) {
     const q = new URLSearchParams({
       limit: String(limit), browsingLevel: String(bitmask(levels)),
       period, type, sort,
@@ -229,7 +229,7 @@ export class CivitaiClient {
     return (data.items || []).map((x) => this._fromRest(x));
   }
 
-  async searchMedia(query, { type = "image", levels = [1], limit = 40, offset = 0 } = {}) {
+  async searchMedia(query, { type = "image", levels = [1], limit = 100, offset = 0 } = {}) {
     const filter = [`type = ${type}`, `nsfwLevel IN [${levels.join(", ")}]`];
     const data = await this._request({
       url: SEARCH_URL, method: "POST",
@@ -244,11 +244,61 @@ export class CivitaiClient {
     return (data.results?.[0]?.hits || []).map((x) => this._fromMeili(x));
   }
 
-  async fetchFavorites({ levels = [1, 2, 4, 8, 16], cursor } = {}) {
+  /** Toggle the signed-in user's "Like" on an image (tRPC reaction.toggle —
+   *  the same mutation the CivitAI site fires; calling it again un-likes).
+   *  Requires OAuth (auth: true). Returns the raw tRPC result. */
+  async toggleReaction(imageId, reaction = "Like") {
+    return this._request({
+      url: `${API}/trpc/reaction.toggle`,
+      method: "POST",
+      body: { json: { entityType: "image", entityId: imageId, reaction } },
+      auth: true,
+    });
+  }
+
+  // ── collections (the "likes folder") ────────────────────────────────────
+  /** The signed-in user's image collections they can add to. */
+  async getUserCollections() {
+    const enc = encodeURIComponent(JSON.stringify({ json: { permissions: ["ADD"], type: "Image" } }));
+    const data = await this._get(`${API}/trpc/collection.getAllUser?input=${enc}`, { auth: true });
+    const j = data.result?.data?.json;
+    const list = Array.isArray(j) ? j : j?.collections || [];
+    return list.map((c) => ({ id: c.id, name: c.name, type: c.type }));
+  }
+
+  /** Create a new (private) image collection and return {id, name}. */
+  async createCollection(name) {
+    const data = await this._request({
+      url: `${API}/trpc/collection.upsert`,
+      method: "POST",
+      body: { json: { name, type: "Image", read: "Private", write: "Private" } },
+      auth: true,
+    });
+    const j = data.result?.data?.json || {};
+    return { id: j.id, name: j.name || name };
+  }
+
+  /** Add (or remove) an image in a collection — the like's "folder" side. */
+  async setImageInCollection(imageId, collectionId, on = true) {
+    return this._request({
+      url: `${API}/trpc/collection.saveItem`,
+      method: "POST",
+      body: {
+        json: on
+          ? { imageId, collections: [{ collectionId }], type: "Image" }
+          : { imageId, collections: [], removeFromCollectionIds: [collectionId], type: "Image" },
+      },
+      auth: true,
+    });
+  }
+
+  async fetchFavorites({ levels = [1, 2, 4, 8, 16], cursor, types } = {}) {
     const input = {
       json: {
         period: "AllTime", sort: "Newest", reactions: ["Like"],
         browsingLevel: bitmask(levels), cursor: cursor ?? null, authed: true,
+        limit: 100,
+        ...(Array.isArray(types) && types.length ? { types } : {}),
       },
     };
     if (cursor == null) input.meta = { values: { cursor: ["undefined"] } };
@@ -258,12 +308,13 @@ export class CivitaiClient {
     return { items: (j.items || []).map((x) => this._fromMeili(x)), nextCursor: j.nextCursor || null };
   }
 
-  async fetchModels({ type, sort = "Most Downloaded", period = "Week", baseModels = [], levels = [1], limit = 40, cursor } = {}) {
+  async fetchModels({ type, sort = "Most Downloaded", period = "Week", baseModels = [], levels = [1], limit = 100, cursor, query } = {}) {
     const q = new URLSearchParams({
       limit: String(limit), types: type, sort, period,
       nsfw: bitmask(levels) > 2 ? "true" : "false",
     });
     for (const b of baseModels) q.append("baseModels", b);
+    if (query) q.set("query", query);
     if (cursor) q.set("cursor", cursor);
     const data = await this._get(`${API}/v1/models?${q.toString()}`);
     const models = (data.items || [])

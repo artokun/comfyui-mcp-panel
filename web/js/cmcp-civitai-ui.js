@@ -28,6 +28,21 @@ const SUBFOLDER = {
   VAE: "vae", Controlnet: "controlnet", Checkpoint: "checkpoints",
 };
 
+// The "default likes folder": a CivitAI collection every like is also saved
+// into (and removed from on unlike). Picked in the account sheet; persisted
+// locally as {id, name}.
+const LIKES_COLLECTION_KEY = "comfyui-mcp.civitai.likesCollection";
+function likesCollection() {
+  try { return JSON.parse(localStorage.getItem(LIKES_COLLECTION_KEY)) || null; }
+  catch { return null; }
+}
+function setLikesCollection(c) {
+  try {
+    if (c && c.id) localStorage.setItem(LIKES_COLLECTION_KEY, JSON.stringify({ id: c.id, name: c.name }));
+    else localStorage.removeItem(LIKES_COLLECTION_KEY);
+  } catch { /* non-persistent is fine */ }
+}
+
 let _cssInjected = false;
 function injectCss() {
   if (_cssInjected) return;
@@ -101,6 +116,23 @@ function injectCss() {
   .cmcp-cv-lb-close { position: absolute; top: .6rem; right: .6rem; z-index: 3; }
   .cmcp-cv-lb-title { font-size: .9rem; font-weight: 600; display: flex; align-items: center;
     gap: .5rem; padding-right: 2.2rem; }
+  .cmcp-cv-like { margin-left: auto; }
+  .cmcp-cv-like.on { color: #f43f5e; border-color: #f43f5e; }
+  .cmcp-cv-subnav { display: flex; align-items: center; gap: .4rem; padding: .45rem .7rem;
+    border-bottom: 1px solid var(--p-content-border-color, #3f3f46); }
+  .cmcp-cv-cardlike { position: absolute; top: .3rem; right: .3rem; z-index: 2;
+    background: rgba(0,0,0,.55); border: none; color: #fff; border-radius: 8px;
+    width: 28px; height: 28px; cursor: pointer; display: none; align-items: center;
+    justify-content: center; }
+  .cmcp-cv-card:hover .cmcp-cv-cardlike { display: inline-flex; }
+  .cmcp-cv-cardlike.on { display: inline-flex; color: #f43f5e; }
+  .cmcp-cv-searching { position: absolute; inset: 0; z-index: 4; display: flex;
+    align-items: center; justify-content: center; backdrop-filter: blur(4px);
+    background: rgba(0,0,0,.35); }
+  .cmcp-cv-spinner { width: 42px; height: 42px; border-radius: 50%;
+    border: 3px solid rgba(255,255,255,.25); border-top-color: var(--p-primary-color,#3a7bd5);
+    animation: cmcp-cv-spin .8s linear infinite; }
+  @keyframes cmcp-cv-spin { to { transform: rotate(360deg); } }
   .cmcp-cv-lb-muted { font-size: .74rem; color: var(--p-text-muted-color,#a1a1aa); }
   .cmcp-cv-lb-prompt { font-size: .78rem; white-space: pre-wrap; word-break: break-word;
     background: var(--p-surface-950,#111); border-radius: 8px; padding: .5rem;
@@ -144,6 +176,7 @@ export function openCivitaiModal(ctx, opts = {}) {
     },
     items: [], models: [], cursor: null, loading: false, done: false, reqId: 0,
     signedIn: false, localNames: new Set(), localLoaded: false,
+    favType: "all", // favorites sub-filter: all | image | video
   };
   if (Array.isArray(opts.browsingLevels) && opts.browsingLevels.length) {
     state.filters = { ...state.filters, browsingLevels: [...opts.browsingLevels] };
@@ -161,11 +194,26 @@ export function openCivitaiModal(ctx, opts = {}) {
   // header
   const head = el("div", "cmcp-cv-head");
   const tabsWrap = el("div", "cmcp-cv-tabs");
+  // Search lives in the SUBNAV under the tabs (every tab gets it) — debounced
+  // 500ms; while the debounced search request is in flight the grid sits under
+  // a blur overlay with a spinner. Favorites search filters client-side (the
+  // tRPC favorites feed has no text query), everything else hits Meili/REST.
   const search = el("input", "cmcp-cv-search");
   search.placeholder = "Search CivitAI…";
   search.value = state.query;
+  let searchTimer = null;
+  const applySearch = () => {
+    const q = search.value.trim();
+    if (q === state.query) return;
+    state.query = q;
+    reload({ searching: true });
+  };
+  search.addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(applySearch, 500);
+  });
   search.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { state.query = search.value.trim(); reload(); }
+    if (e.key === "Enter") { clearTimeout(searchTimer); applySearch(); }
   });
   const filterBtn = el("button", "cmcp-cv-iconbtn");
   filterBtn.innerHTML = '<i class="pi pi-sliders-h"></i>';
@@ -187,7 +235,23 @@ export function openCivitaiModal(ctx, opts = {}) {
     b._key = t.key;
     tabsWrap.appendChild(b);
   }
-  head.append(tabsWrap, search, filterBtn, acctBtn, closeBtn);
+  head.append(tabsWrap, filterBtn, acctBtn, closeBtn);
+
+  // subnav: search (all tabs) + favorites media-type chips
+  const subnav = el("div", "cmcp-cv-subnav");
+  const favChips = el("div", "cmcp-cv-frow");
+  for (const [label, val] of [["All", "all"], ["Images", "image"], ["Videos", "video"]]) {
+    const chip = el("button", "cmcp-cv-chip", label);
+    chip._fv = val;
+    chip.addEventListener("click", () => {
+      if (state.favType === val) return;
+      state.favType = val;
+      syncTabs();
+      reload();
+    });
+    favChips.appendChild(chip);
+  }
+  subnav.append(search, favChips);
 
   // body
   const body = el("div", "cmcp-cv-body");
@@ -199,23 +263,34 @@ export function openCivitaiModal(ctx, opts = {}) {
     if (body.scrollTop + body.clientHeight >= body.scrollHeight - 600) loadMore();
   });
 
-  modal.append(head, body);
+  const searchOverlay = el("div", "cmcp-cv-searching");
+  searchOverlay.appendChild(el("div", "cmcp-cv-spinner"));
+  searchOverlay.style.display = "none";
+  body.appendChild(searchOverlay);
+
+  modal.append(head, subnav, body);
   overlay.appendChild(modal);
   document.body.appendChild(overlay);
 
   function syncTabs() {
     for (const b of tabsWrap.children) b.classList.toggle("active", b._key === state.tab);
-    search.style.display = isModelTab() ? "none" : "";
+    favChips.style.display = tabDef().fav ? "" : "none";
+    for (const c of favChips.children) c.classList.toggle("on", c._fv === state.favType);
     filterDot.style.display = filtersDirty(state.filters) ? "" : "none";
   }
 
   // ── data ───────────────────────────────────────────────────────────────
   function setLoading(on) { state.loading = on; progress.classList.toggle("on", on); }
 
-  async function reload() {
+  async function reload({ searching = false } = {}) {
     state.items = []; state.models = []; state.cursor = null; state.done = false;
     grid.innerHTML = ""; syncTabs();
-    await loadMore();
+    if (searching) searchOverlay.style.display = "";
+    try {
+      await loadMore();
+    } finally {
+      searchOverlay.style.display = "none";
+    }
   }
 
   async function loadMore() {
@@ -229,15 +304,24 @@ export function openCivitaiModal(ctx, opts = {}) {
       const t = tabDef();
       if (t.fav) {
         if (!state.signedIn) { sentinel.textContent = "Sign in to see your favorites."; setLoading(false); return; }
-        const page = await client.fetchFavorites({ levels, cursor: state.cursor });
+        // YOUR likes are yours: no browsing-level gate here (the PG default was
+        // silently hiding most of the list), and the subnav chips narrow by type.
+        const page = await client.fetchFavorites({
+          cursor: state.cursor,
+          ...(state.favType !== "all" ? { types: [state.favType] } : {}),
+        });
         if (req !== state.reqId) return;
         state.cursor = page.nextCursor; state.done = !page.nextCursor;
-        appendItems(page.items);
+        // The favorites feed has no text query — search filters client-side.
+        const q = state.query.toLowerCase();
+        appendItems(!q ? page.items : page.items.filter((it) =>
+          (it.prompt || "").toLowerCase().includes(q) || (it.author || "").toLowerCase().includes(q)));
       } else if (t.model) {
         if (!state.localLoaded) await refreshLocalModels(); // for "in library" marks
         const page = await client.fetchModels({
           type: t.model, sort: f.modelSort, period: f.period,
           baseModels: f.baseModels, levels, cursor: state.cursor,
+          ...(state.query ? { query: state.query } : {}),
         });
         if (req !== state.reqId) return;
         state.cursor = page.nextCursor; state.done = !page.nextCursor;
@@ -263,6 +347,7 @@ export function openCivitaiModal(ctx, opts = {}) {
 
   function appendItems(items) {
     for (const it of items) {
+      if (tabDef().fav && !_liked.has(it.id)) _liked.set(it.id, true);
       state.items.push(it);
       const idx = state.items.length - 1;
       grid.appendChild(mediaCard(it, idx));
@@ -296,6 +381,26 @@ export function openCivitaiModal(ctx, opts = {}) {
     }
     const foot = el("div", "cmcp-cv-cardfoot", `${it.author ? "@" + it.author : ""}  ♥ ${it.reactions || 0}`);
     card.appendChild(foot);
+    {
+      // Hover like — no need to open the lightbox to react. Shares _liked with
+      // the lightbox heart; stays visible while lit so likes are scannable.
+      // Signed out? The heart doubles as a sign-in button.
+      const likeBtn = el("button", "cmcp-cv-cardlike");
+      const paintLike = () => {
+        const on = _liked.get(it.id) === true;
+        likeBtn.classList.toggle("on", on);
+        likeBtn.innerHTML = `<i class="pi ${on ? "pi-heart-fill" : "pi-heart"}"></i>`;
+        likeBtn.title = !state.signedIn ? "Sign in to CivitAI to like" : on ? "Unlike on CivitAI" : "Like on CivitAI";
+      };
+      paintLike();
+      card.addEventListener("mouseenter", paintLike); // resync after lightbox toggles
+      likeBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (!state.signedIn) { toast("Sign in to CivitAI to like — opening sign-in…"); accountFlow(); return; }
+        void toggleLike(it, paintLike);
+      });
+      card.appendChild(likeBtn);
+    }
     card.addEventListener("click", () => openViewer(idx));
     return card;
   }
@@ -319,6 +424,35 @@ export function openCivitaiModal(ctx, opts = {}) {
   // Generation info loads asynchronously into the side pane and is cached per
   // item, so paging through the feed doesn't refetch.
   const _genCache = new Map();
+  // Liked-state per image id, session-scoped. The feed payloads don't carry the
+  // viewer's own reactions, so this starts from what we know (everything on the
+  // Favorites tab IS liked) and tracks toggles optimistically from there.
+  const _liked = new Map();
+
+  /** Toggle a like (optimistic, with revert), then mirror it into the default
+   *  likes collection when one is picked. A 403 means the stored token predates
+   *  the current OAuth scopes -- tell the user to re-sign-in instead of failing
+   *  mutely. */
+  async function toggleLike(it, paint) {
+    const next = !(_liked.get(it.id) === true);
+    _liked.set(it.id, next); paint();
+    try {
+      await client.toggleReaction(it.id);
+    } catch (e) {
+      _liked.set(it.id, !next); paint();
+      const msg = String(e.message || e);
+      toast(msg.includes("403")
+        ? "CivitAI permissions changed -- use the account button to sign out and back in."
+        : "Like failed: " + msg);
+      return;
+    }
+    const col = likesCollection();
+    if (col?.id) {
+      client.setImageInCollection(it.id, col.id, next).catch((e) =>
+        toast(`Couldn't update collection "${col.name}": ` + (e.message || e)));
+    }
+  }
+
   function openViewer(startIdx) {
     let idx = startIdx;
     let renderSeq = 0;
@@ -369,8 +503,30 @@ export function openCivitaiModal(ctx, opts = {}) {
 
       // right: identity + actions immediately, generation info when it arrives
       side.innerHTML = "";
-      side.appendChild(el("div", "cmcp-cv-lb-title",
+      const titleRow = el("div", "cmcp-cv-lb-title");
+      titleRow.appendChild(el("span", null,
         `${it.type === "video" ? "🎬" : "🖼"} ${it.author ? "@" + it.author : "CivitAI " + it.type}`));
+      {
+        // Like toggle — the same tRPC mutation the CivitAI site fires
+        // (reaction.toggle; calling it again un-likes). Optimistic flip,
+        // reverted with a toast on failure. Favorites-tab items start lit;
+        // signed out, the heart doubles as a sign-in button.
+        if (!_liked.has(it.id) && tabDef().fav) _liked.set(it.id, true);
+        const likeBtn = el("button", "cmcp-cv-iconbtn cmcp-cv-like");
+        const paintLike = () => {
+          const on = _liked.get(it.id) === true;
+          likeBtn.classList.toggle("on", on);
+          likeBtn.innerHTML = `<i class="pi ${on ? "pi-heart-fill" : "pi-heart"}"></i>`;
+          likeBtn.title = !state.signedIn ? "Sign in to CivitAI to like" : on ? "Unlike on CivitAI" : "Like on CivitAI";
+        };
+        paintLike();
+        likeBtn.addEventListener("click", () => {
+          if (!state.signedIn) { toast("Sign in to CivitAI to like — opening sign-in…"); accountFlow(); return; }
+          void toggleLike(it, paintLike);
+        });
+        titleRow.appendChild(likeBtn);
+      }
+      side.appendChild(titleRow);
       side.appendChild(el("div", "cmcp-cv-lb-muted",
         `♥ ${it.reactions || 0} · ${idx + 1} / ${state.items.length}${state.done ? "" : "+"}`));
 
@@ -717,8 +873,73 @@ export function openCivitaiModal(ctx, opts = {}) {
   async function accountFlow() {
     await refreshAuth();
     if (state.signedIn) {
-      await ctx.api.fetchApi("/comfyui_mcp_panel/civitai/oauth/logout", { method: "POST" });
-      await refreshAuth(); toast("Signed out of CivitAI.");
+      // Account sheet: the "default likes folder" (a CivitAI collection every
+      // like also lands in) + sign out. Signed-in no longer instant-signs-out.
+      const sheet = openSubModal("CivitAI account");
+      const wrap = el("div", "cmcp-cv-filters");
+      wrap.appendChild(el("div", null, "Signed in ✓"));
+      wrap.appendChild(el("div", "cmcp-cv-flabel", "Default likes collection"));
+      wrap.appendChild(el("div", "cmcp-cv-lb-muted",
+        "Every like is also saved into this collection on your CivitAI account (and removed when you unlike)."));
+      const row = el("div", "cmcp-cv-frow");
+      const sel = document.createElement("select");
+      sel.className = "cmcp-cv-search";
+      sel.disabled = true;
+      sel.appendChild(new Option("Loading collections…", ""));
+      const newBtn = el("button", "cmcp-btn", "+ New…");
+      row.append(sel, newBtn);
+      wrap.appendChild(row);
+      let colCache = [];
+      const fillSelect = () => {
+        sel.innerHTML = "";
+        sel.appendChild(new Option("(none — likes only)", ""));
+        const cur = likesCollection();
+        for (const c of colCache) {
+          const o = new Option(c.name, String(c.id));
+          if (cur && cur.id === c.id) o.selected = true;
+          sel.appendChild(o);
+        }
+        sel.disabled = false;
+      };
+      client.getUserCollections()
+        .then((cols) => { colCache = cols; fillSelect(); })
+        .catch((e) => {
+          sel.innerHTML = "";
+          sel.appendChild(new Option("Couldn't load collections", ""));
+          if (String(e.message || e).includes("403")) {
+            wrap.appendChild(el("div", "cmcp-cv-lb-muted",
+              "Your sign-in predates the collection permissions — sign out and back in to grant them."));
+          }
+        });
+      sel.addEventListener("change", () => {
+        const c = colCache.find((x) => String(x.id) === sel.value);
+        setLikesCollection(c || null);
+        toast(c ? `Likes will also go to "${c.name}".` : "Likes won't be added to a collection.");
+      });
+      newBtn.addEventListener("click", async () => {
+        const name = window.prompt("Name for the new CivitAI collection:");
+        if (!name || !name.trim()) return;
+        newBtn.disabled = true;
+        try {
+          const c = await client.createCollection(name.trim());
+          colCache.push(c);
+          fillSelect();
+          sel.value = String(c.id);
+          setLikesCollection(c);
+          toast(`Created "${c.name}" — it's now your likes collection.`);
+        } catch (e) {
+          toast("Create failed: " + (e.message || e));
+        } finally {
+          newBtn.disabled = false;
+        }
+      });
+      const out = el("button", "cmcp-btn", "Sign out");
+      out.addEventListener("click", async () => {
+        await ctx.api.fetchApi("/comfyui_mcp_panel/civitai/oauth/logout", { method: "POST" });
+        await refreshAuth(); sheet.close(); toast("Signed out of CivitAI.");
+      });
+      wrap.appendChild(out);
+      sheet.body.appendChild(wrap);
       return;
     }
     try {

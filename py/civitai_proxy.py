@@ -49,7 +49,10 @@ _ALLOWED_HOSTS = frozenset(
 )
 
 _OAUTH_CLIENT_ID = "1913e640-a9f7-4a4e-ae14-844d3b347555"  # public native client, no secret
-_OAUTH_SCOPE = "262177"  # UserRead | MediaRead | CollectionsRead
+# UserRead(1) | MediaRead(32) | CollectionsRead(131072) | CollectionsWrite(262144)
+# | SocialWrite(524288) — SocialWrite is what reaction.toggle needs; the original
+# 262177 mislabeled 262144 as CollectionsRead, so likes/collections 403'd.
+_OAUTH_SCOPE = "917537"
 _OAUTH_AUTHORIZE = "https://auth.civitai.com/api/auth/oauth/authorize"
 _OAUTH_EXCHANGE_URL = "https://auth.civitai.com/api/auth/oauth/token"
 _CALLBACK_PATH = "/comfyui_mcp_panel/civitai/oauth/callback"
