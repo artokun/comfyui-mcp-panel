@@ -68,6 +68,7 @@ import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
 import { openCivitaiModal } from "./cmcp-civitai-ui.js";
+import { openTrainingModal } from "./cmcp-training-ui.js";
 
 let app = null;
 let api = null;
@@ -9269,9 +9270,35 @@ function buildPanel() {
     civitaiBtn.prepend(svg);
   }
 
+  // LoRA Training — the coming-soon preview modal (mobile-app parity). Same
+  // modal treatment as the CivitAI browser; dumbbell mark via currentColor.
+  let _trainingHandle = null;
+  const trainingBtn = toolbarBtn("pi-circle", "Training");
+  trainingBtn.querySelector(".pi").remove();
+  trainingBtn.title = "LoRA Training — coming soon: train character/style/edit/slider and video LoRAs, locally or on RunPod.";
+  trainingBtn.addEventListener("click", () => {
+    try { _trainingHandle?.close(); } catch {}
+    _trainingHandle = openTrainingModal({ api });
+  });
+  {
+    const svgNs = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(svgNs, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("aria-hidden", "true");
+    const bar = document.createElementNS(svgNs, "path");
+    bar.setAttribute("fill", "currentColor");
+    // A simple dumbbell: two plates + bar, all axis-aligned rects.
+    bar.setAttribute(
+      "d",
+      "M4 9h2v6H4V9zm3-2h2v10H7V7zm8 0h2v10h-2V7zm3 2h2v6h-2V9zm-8 2h4v2h-4v-2z",
+    );
+    svg.append(bar);
+    trainingBtn.prepend(svg);
+  }
+
   const toolbarSpacer = document.createElement("span");
   toolbarSpacer.className = "cmcp-spacer";
-  toolbar.append(deafenBtn, blindBtn, toolbarSpacer, civitaiBtn);
+  toolbar.append(deafenBtn, blindBtn, toolbarSpacer, civitaiBtn, trainingBtn);
 
   row.append(ring, ctxLabel, modelChip, spacer, attachBtn, micBtn, sendBtn);
   form.append(menuPop, modelPop, attachBar, input, row, fileInput);
