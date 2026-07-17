@@ -44,6 +44,27 @@ function setLikesCollection(c) {
   } catch { /* non-persistent is fine */ }
 }
 
+/** The collection the likes feed reads from: the picked "likes collection"
+ *  when set, else a one-time auto-detect persisted for next time (the web's ❤
+ *  saves into a COLLECTION — reactions only hold in-app hearts, so reading
+ *  reactions alone showed a handful while the collection held the real
+ *  hundreds). Null → the reactions fallback. */
+async function resolveLikesCollectionId(client) {
+  const cur = likesCollection();
+  if (cur?.id) return cur.id;
+  try {
+    const all = await client.getUserCollections();
+    if (!all.length) return null;
+    const byName = all.filter((c) => /fav|like/i.test(c.name || ""));
+    const pick = byName[0] || (all.length === 1 ? all[0] : null);
+    if (!pick) return null;
+    setLikesCollection(pick); // the ❤ mirror + this feed now share one collection
+    return pick.id;
+  } catch {
+    return null; // never block the tab on this lookup
+  }
+}
+
 let _cssInjected = false;
 function injectCss() {
   if (_cssInjected) return;
@@ -402,16 +423,28 @@ export function openCivitaiModal(ctx, opts = {}) {
         if (!state.signedIn) { sentinel.textContent = "Sign in to see your favorites."; setLoading(false); return; }
         // YOUR likes are yours: no browsing-level gate here (the PG default was
         // silently hiding most of the list), and the subnav chips narrow by type.
+        // The feed reads the likes COLLECTION (auto-detected) — reactions only
+        // hold in-app hearts; see resolveLikesCollectionId.
+        const colId = await resolveLikesCollectionId(client);
+        if (req !== state.reqId) return;
         const page = await client.fetchFavorites({
           cursor: state.cursor,
+          ...(colId ? { collectionId: colId } : {}),
           ...(state.favType !== "all" ? { types: [state.favType] } : {}),
         });
         if (req !== state.reqId) return;
         state.cursor = page.nextCursor; state.done = !page.nextCursor;
+        // Dedup on id: the feed pages by "last item id" (see the client's
+        // cursor quirk) — if CivitAI ever flips its keyset comparison to
+        // inclusive, the boundary item would come back twice.
         // The favorites feed has no text query — search filters client-side.
+        const seen = new Set(state.items.map((i) => i.id));
         const q = state.query.toLowerCase();
-        appendItems(!q ? page.items : page.items.filter((it) =>
-          (it.prompt || "").toLowerCase().includes(q) || (it.author || "").toLowerCase().includes(q)));
+        const fresh = page.items.filter((it) => !seen.has(it.id) &&
+          (!q || (it.prompt || "").toLowerCase().includes(q) ||
+            (it.author || "").toLowerCase().includes(q)));
+        appendItems(fresh);
+        stalled = !fresh.length && !state.done && !!q;
       } else if (t.model) {
         if (!state.localLoaded) await refreshLocalModels(); // for "in library" marks
         const page = await client.fetchModels({
@@ -451,6 +484,15 @@ export function openCivitaiModal(ctx, opts = {}) {
         sentinel.textContent = "No results.";
       } else {
         sentinel.textContent = "";
+        // Under-filled top-up (every tab): a page that doesn't overflow the
+        // body leaves the scroll sentinel unreachable — no scroll event can
+        // ever fire the next page, so the list silently dead-ends after one
+        // short load. Chase the next page until the body can scroll (or the
+        // feed is exhausted / a stall affordance takes over).
+        if (!state.done && req === state.reqId &&
+            body.scrollHeight <= body.clientHeight + 40) {
+          setTimeout(() => { if (req === state.reqId) loadMore(); }, 0);
+        }
       }
     } catch (e) {
       if (req === state.reqId) sentinel.textContent = "CivitAI error: " + (e.message || e);
@@ -726,6 +768,11 @@ export function openCivitaiModal(ctx, opts = {}) {
     document.body.appendChild(lb);
     lb.focus();
     render();
+    // Opened ON one of the last items: step() hasn't run yet, so without this
+    // the viewer dead-ends until the first navigation (mobile-parity fix).
+    if (startIdx >= state.items.length - 3) {
+      loadMore().then(() => { if (state.items[idx]) render(); });
+    }
   }
 
   // ── generation info + share/save (mute-aware) ────────────────────────

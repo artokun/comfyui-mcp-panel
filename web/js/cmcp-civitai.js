@@ -333,10 +333,21 @@ export class CivitaiClient {
     });
   }
 
-  async fetchFavorites({ levels = [1, 2, 4, 8, 16], cursor, types } = {}) {
+  /** The likes feed. When [collectionId] is set, reads that COLLECTION instead
+   *  of the `reactions:['Like']` filter — this matters: the web's ❤ saves into
+   *  the user's likes collection, while image REACTIONS only hold in-app hearts
+   *  (live-verified on mobile: reactions had 17 items, the collection 700+).
+   *
+   *  CURSOR QUIRK (live-verified): `nextCursor` is the id of the FIRST item of
+   *  the NEXT page, but the server's keyset WHERE is a STRICT `id < cursor` for
+   *  the Newest sort — echoing it back silently drops one item per page
+   *  boundary. We continue from the id of the LAST item we received and treat
+   *  the server cursor purely as a has-more flag. */
+  async fetchFavorites({ levels = [1, 2, 4, 8, 16], cursor, types, collectionId } = {}) {
     const input = {
       json: {
-        period: "AllTime", sort: "Newest", reactions: ["Like"],
+        period: "AllTime", sort: "Newest",
+        ...(collectionId ? { collectionId } : { reactions: ["Like"] }),
         browsingLevel: bitmask(levels), cursor: cursor ?? null, authed: true,
         limit: 100,
         ...(Array.isArray(types) && types.length ? { types } : {}),
@@ -346,7 +357,12 @@ export class CivitaiClient {
     const enc = encodeURIComponent(JSON.stringify(input));
     const data = await this._get(`${API}/trpc/image.getInfinite?input=${enc}`, { auth: true });
     const j = data.result?.data?.json || {};
-    return { items: (j.items || []).map((x) => this._fromMeili(x)), nextCursor: j.nextCursor || null };
+    const raw = j.items || [];
+    const items = raw.map((x) => this._fromMeili(x));
+    const next = j.nextCursor ?? null;
+    if (next == null) return { items, nextCursor: null };
+    const lastRawId = Number(raw[raw.length - 1]?.id) || 0;
+    return { items, nextCursor: lastRawId > 0 ? String(lastRawId) : String(next) };
   }
 
   async fetchModels({ type, sort = "Most Downloaded", period = "Week", baseModels = [], levels = [1], limit = 100, cursor, query, username } = {}) {
