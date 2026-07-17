@@ -12,12 +12,18 @@ function injectCss() {
   cssInjected = true;
   const style = document.createElement("style");
   style.textContent = `
-    .cmcp-tr-modal { max-width: 860px; width: min(92vw, 860px); }
-    .cmcp-tr-head { display:flex; align-items:center; gap:.75rem; padding:1rem 1.25rem .5rem; }
+    /* Same containment as the CivitAI modal: fixed-height flex column with
+       overflow hidden; only .cmcp-tr-body scrolls, the header/switch stay put. */
+    .cmcp-tr-modal { width: min(92vw, 860px); max-width: none;
+      max-height: min(90vh, 840px); padding: 0; gap: 0; overflow: hidden;
+      display: flex; flex-direction: column; }
+    .cmcp-tr-body { flex: 1; overflow-y: auto; min-height: 0; }
+    .cmcp-tr-head { display:flex; align-items:center; gap:.75rem; padding:1rem 1.25rem .5rem;
+      border-bottom: 1px solid var(--p-content-border-color, #3f3f46); }
     .cmcp-tr-head h2 { margin:0; font-size:1.05rem; flex:1; }
     .cmcp-tr-close { background:none; border:none; color:inherit; cursor:pointer; font-size:1.1rem; opacity:.7; }
     .cmcp-tr-close:hover { opacity:1; }
-    .cmcp-tr-seg { display:flex; gap:0; margin:0 1.25rem .75rem; border:1px solid var(--p-surface-500,#555); border-radius:999px; overflow:hidden; width:fit-content; }
+    .cmcp-tr-seg { display:flex; gap:0; margin:.75rem 1.25rem; border:1px solid var(--p-surface-500,#555); border-radius:999px; overflow:hidden; width:fit-content; flex:none; }
     .cmcp-tr-seg button { border:none; background:transparent; color:inherit; padding:.4rem .9rem; cursor:pointer; font-size:.85rem; display:flex; align-items:center; gap:.4rem; }
     .cmcp-tr-seg button.active { background: var(--p-surface-700,#3f3f46); }
     .cmcp-tr-token { margin:0 1.25rem .75rem; display:flex; flex-direction:column; gap:.25rem; }
@@ -148,7 +154,12 @@ export function openTrainingModal(ctx = {}) {
   foot.className = "cmcp-tr-foot";
   foot.textContent = "LoRA training is on the roadmap — nothing here works yet.";
 
-  modal.append(head, seg, token, grid, foot);
+  // Scroll containment (CivitAI-modal structure): head + switch stay fixed;
+  // the card grid scrolls inside the body.
+  const body = document.createElement("div");
+  body.className = "cmcp-tr-body";
+  body.append(grid, foot);
+  modal.append(head, seg, token, body);
   overlay.appendChild(modal);
   document.body.appendChild(overlay);
   return { close };
