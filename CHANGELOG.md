@@ -6,6 +6,34 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-17
+
+### Added
+- **LoRA Training modal** (mobile-app parity): a Training button next to
+  Civitai in the panel toolbar opens a coming-soon preview — six training
+  flows (Image Character/Edit/Style/Slider, Video Character/Action) as cards
+  with base-model dropdowns (Krea2/Flux2/ZImg, Qwen Edit 2509, LTX 2.3/
+  Wan 2.2), under a Local/Cloud switch. Local shows the rig's REAL GPU from
+  `/system_stats`; Cloud (RunPod) previews the token field for the future
+  headless trainer. Fixed-height modal, header pinned, card grid scrolls
+- Settings → Mobile app (beta): the iOS TestFlight and Android Firebase
+  App Distribution buttons are LIVE invite links (no more "coming soon")
+
+### Fixed
+- **CivitAI Favorites shows ALL your likes**: the feed now reads your likes
+  COLLECTION (auto-detected from your account when none is picked, shared
+  with the ❤ mirror; reactions fallback) — image reactions only hold hearts
+  made in-panel, while the website's ❤ saves into the collection, so the tab
+  previously showed a handful instead of the full list
+- CivitAI pagination is boundary-safe and never dead-ends: cursors continue
+  from the last received item (the server's echoed cursor silently dropped
+  one liked item per page), appends dedup by id, EVERY tab tops itself up
+  when a page doesn't overflow the modal (a short first page previously left
+  the scroll sentinel unreachable — the list just stopped), and the lightbox
+  pages immediately when opened on one of the last items
+- The provider chips, connect help, empty-state hero, and tooltips no longer
+  hardcode Claude — they follow the active backend (provider-agnostic copy)
+
 ### Fixed
 - CivitAI browser filters actually respond: chips re-render on click (the sheet
   wired a rerender hook that was never defined, so they looked dead), and the
