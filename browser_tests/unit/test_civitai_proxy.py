@@ -67,7 +67,7 @@ class PublicIpCheck(unittest.TestCase):
             "172.16.0.1",           # RFC1918
             "192.168.1.1",          # RFC1918
             "169.254.169.254",      # link-local / metadata
-            "0.0.0.0",              # unspecified
+            "0.0.0.0",              # unspecified  # nosec B104 — test FIXTURE of addresses the proxy must BLOCK, nothing binds here
             "224.0.0.1",            # multicast
             "::1",                  # v6 loopback
             "fe80::1",              # v6 link-local
