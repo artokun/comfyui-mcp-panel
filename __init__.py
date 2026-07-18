@@ -70,6 +70,7 @@ _BACKEND_PORTS = {
     "gemini": 9182,
     "grok": _BRIDGE_PORT,  # single-port multi-provider — same orchestrator
     "kimi": _BRIDGE_PORT,  # single-port multi-provider — same orchestrator
+    "moonshot": _BRIDGE_PORT,  # hosted (Moonshot / Kimi K3) — same orchestrator, key-gated
     "ollama": _BRIDGE_PORT,  # single-port multi-provider — same orchestrator
     "openrouter": _BRIDGE_PORT,  # hosted (OpenRouter) — same orchestrator, key-gated
 }
