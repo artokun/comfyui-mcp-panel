@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-07-19
+
+### Fixed
+- carry exception_type, and surface runtime failures in the affordance
+
+
 ## [0.9.4] - 2026-07-19
 
 ### Fixed
