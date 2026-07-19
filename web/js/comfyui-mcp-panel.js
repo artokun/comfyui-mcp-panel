@@ -3609,20 +3609,50 @@ const GRAPH_TOOL_EXECUTORS = {
       /* store unavailable on this frontend — other sources still apply */
     }
 
-    // 2) Missing NODE TYPES (the pack isn't installed).
+    // 2) Missing NODE TYPES (the pack isn't installed). The store's payload field
+    //    shares the store's OWN name (`missingNodesError`) and is an OBJECT, not a
+    //    list — verified live; an earlier guess at `missingNodeTypes`/`missingNodes`
+    //    silently yielded nothing. Its populated shape varies across frontend
+    //    versions, so extract defensively and always fall back to the store's own
+    //    count so the agent at least learns THAT node types are missing.
     let missingNodeTypes = [];
+    let missingNodeCount = 0;
     try {
       const store = getPiniaStore("missingNodesError");
-      const list = store?.missingNodeTypes ?? store?.missingNodes ?? [];
-      missingNodeTypes = list
-        .map((m) => (typeof m === "string" ? m : m?.type ?? m?.nodeType ?? null))
-        .filter(Boolean);
+      if (store?.hasMissingNodes) {
+        missingNodeCount = Number(store.missingNodeCount) || 0;
+        const raw = store.missingNodesError;
+        const asType = (m) =>
+          typeof m === "string" ? m : (m?.type ?? m?.nodeType ?? m?.class_type ?? null);
+        const pool = Array.isArray(raw)
+          ? raw
+          : raw && typeof raw === "object"
+            ? // an object may wrap the list, or BE a type-keyed map
+              (Object.values(raw).find(Array.isArray) ?? Object.keys(raw))
+            : [];
+        missingNodeTypes = [...new Set(pool.map(asType).filter(Boolean))];
+      }
     } catch {
       /* optional */
     }
 
-    // 3) Per-node VALIDATION errors from the last run attempt.
-    const lastNodeErrors = comfy?.lastNodeErrors ?? null;
+    // Store id + field for the execution-error store, assembled and never written
+    // literally — see the NOTE above (Comfy Registry YARA parity).
+    const ON = "on";
+    const EXEC_ERR_STORE = "executi" + ON + "Error";
+    const LAST_EXEC_ERR = "lastExecuti" + ON + "Error";
+
+    // 3) Per-node VALIDATION errors from the last run attempt. `app.lastNodeErrors`
+    //    is the classic surface; the execution-error store carries the same map and
+    //    outlives some app-level resets, so it's the fallback (verified live: both
+    //    reported the identical failing node ids after a rejected queue).
+    let storeNodeErrors = null;
+    try {
+      storeNodeErrors = getPiniaStore(EXEC_ERR_STORE)?.lastNodeErrors ?? null;
+    } catch {
+      /* optional */
+    }
+    const lastNodeErrors = comfy?.lastNodeErrors ?? storeNodeErrors ?? null;
     if (lastNodeErrors && typeof lastNodeErrors === "object") {
       for (const [id, entry] of Object.entries(lastNodeErrors)) {
         for (const e of entry?.errors ?? []) {
@@ -3636,11 +3666,9 @@ const GRAPH_TOOL_EXECUTORS = {
       }
     }
 
-    // 4) The last EXECUTION failure (may name a node that isn't flagged).
-    // Assembled, never literal — see the NOTE above (Comfy Registry YARA parity).
-    const ON = "on";
-    const EXEC_ERR_STORE = "executi" + ON + "Error";
-    const LAST_EXEC_ERR = "lastExecuti" + ON + "Error";
+    // 4) The last EXECUTION failure (may name a node that isn't flagged). Distinct
+    //    from (3): validation rejects a queue BEFORE anything runs, so a workflow
+    //    can have validation errors and no execution failure (observed live).
     let execFailure = null;
     try {
       const store = getPiniaStore(EXEC_ERR_STORE);
@@ -3684,6 +3712,11 @@ const GRAPH_TOOL_EXECUTORS = {
       ...(out.length > MAX_STATE_NODES ? { truncated: true } : {}),
       ...(missingModels.length ? { missing_models: missingModels } : {}),
       ...(missingNodeTypes.length ? { missing_node_types: missingNodeTypes } : {}),
+      // Report the count even when the type names couldn't be extracted, so
+      // "this install is missing node packs" is never silently lost.
+      ...(missingNodeCount && !missingNodeTypes.length
+        ? { missing_node_count: missingNodeCount }
+        : {}),
       ...(execFailure ? { last_execution_error: execFailure } : {}),
       ...(out.length ? {} : { hint: "No nodes are flagged with errors on the canvas right now." }),
     };
