@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-07-19
+
+### Fixed
+- stop tripping the YARA SUSP_SVG scan
+
+
 ## [0.9.2] - 2026-07-19
 
 ### Added
