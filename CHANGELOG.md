@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-07-19
+
+### Fixed
+- correct the missing-node-types source; fall back for validation errors
+
+
 ## [0.9.3] - 2026-07-19
 
 ### Fixed
