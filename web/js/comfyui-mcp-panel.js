@@ -3449,6 +3449,234 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
+  // WHICH NODE(S) THE USER HAS SELECTED. Without this the agent can only guess
+  // what "this node" / "the highlighted one" means and ends up skimming the whole
+  // graph for clues (a user with a 700-node canvas burned a lot of tokens doing
+  // exactly that). Selection is the cheapest possible scope: read it FIRST.
+  // LiteGraph keeps two views of it — `selectedItems` (a Set, the modern one, and
+  // the only one that also holds groups/reroutes) and `selected_nodes` (an
+  // id→node object). Prefer the Set, fall back to the object. `current_node` is
+  // NOT the selection (it tracks the last node under the pointer), so it's ignored.
+  graph_view_selected() {
+    const { graph, canvas } = getGraphCtx();
+    const inGraph = new Set(graph._nodes ?? []);
+    const picked = [];
+    const others = [];
+    const items = canvas?.selectedItems;
+    if (items && typeof items.forEach === "function") {
+      for (const it of items) {
+        if (inGraph.has(it)) picked.push(it);
+        else if (it) others.push(it.constructor?.name ?? "item");
+      }
+    }
+    // Fallback for frontends that only maintain the legacy id→node object.
+    if (!picked.length && canvas?.selected_nodes) {
+      for (const n of Object.values(canvas.selected_nodes)) {
+        if (inGraph.has(n)) picked.push(n);
+      }
+    }
+    return {
+      viewing: describeActiveGraph(graph),
+      selected_count: picked.length,
+      node_count: graph._nodes?.length ?? 0,
+      nodes: picked.slice(0, MAX_STATE_NODES).map(summarizeNode),
+      ...(picked.length > MAX_STATE_NODES ? { truncated: true } : {}),
+      // Groups/reroutes can be selected too — report them so "nothing selected"
+      // is never misreported when the user actually has a group highlighted.
+      ...(others.length ? { other_selected_items: others } : {}),
+      ...(picked.length
+        ? {}
+        : { hint: "Nothing is selected on the canvas. Ask the user to click the node they mean, or use panel_graph_outline / panel_find_nodes to locate it." }),
+    };
+  },
+
+  // WHAT THE USER CAN ACTUALLY SEE. The agent has no eyes on the canvas, so on a
+  // big graph it either dumps everything or guesses. The viewport is the user's
+  // implicit context ("this node", "these ones here"), so scoping to it is both
+  // far cheaper and usually what they meant. `canvas.visible_area` is [x,y,w,h]
+  // in GRAPH coordinates (already accounts for pan+zoom); a node counts as
+  // visible when its full rendered box (getBounding — title bar included)
+  // INTERSECTS that rect, so half-on-screen nodes are included rather than
+  // dropped. Read-only.
+  graph_view_nodes_in_viewport() {
+    const { graph, canvas } = getGraphCtx();
+    // DERIVE the rect rather than trusting `canvas.visible_area`: LiteGraph only
+    // refreshes visible_area when it DRAWS, and it sizes it from the canvas
+    // BACKING store (canvas.width/height). A canvas that hasn't painted yet — a
+    // background tab, a panel opened before the first draw — still reports the
+    // 300x150 HTML default, which yields a viewport ~5x too small and silently
+    // returns ZERO nodes (measured: visible_area 333x167 vs the real 1712x1478).
+    // The element's CSS rect is always the true on-screen size, so compute from
+    // it: origin = -ds.offset (graph coords), extent = css_size / ds.scale.
+    // visible_area stays as the fallback for a headless/detached canvas.
+    const ds = canvas?.ds;
+    const el = canvas?.canvas;
+    let vx, vy, vw, vh;
+    const rect = typeof el?.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+    const scale = Number(ds?.scale);
+    if (rect && rect.width > 0 && rect.height > 0 && Number.isFinite(scale) && scale > 0 && ds?.offset) {
+      vx = -ds.offset[0];
+      vy = -ds.offset[1];
+      vw = rect.width / scale;
+      vh = rect.height / scale;
+    } else {
+      const va = canvas?.visible_area;
+      if (!va || va.length < 4) {
+        throw new Error("Viewport bounds unavailable (no canvas rect and no canvas.visible_area) — the canvas may not be rendered yet.");
+      }
+      [vx, vy, vw, vh] = [va[0], va[1], va[2], va[3]];
+    }
+    const bb = new Float32Array(4);
+    const all = graph._nodes ?? [];
+    const visible = all.filter((n) => {
+      let b = null;
+      try {
+        if (typeof n.getBounding === "function") b = n.getBounding(bb);
+      } catch {
+        /* fall through to pos/size below */
+      }
+      const x = b ? b[0] : n.pos?.[0];
+      const y = b ? b[1] : n.pos?.[1];
+      const w = b ? b[2] : n.size?.[0] ?? 0;
+      const h = b ? b[3] : n.size?.[1] ?? 0;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+      // AABB overlap against the viewport rect.
+      return x < vx + vw && x + w > vx && y < vy + vh && y + h > vy;
+    });
+    return {
+      viewing: describeActiveGraph(graph),
+      viewport: {
+        x: Math.round(vx),
+        y: Math.round(vy),
+        width: Math.round(vw),
+        height: Math.round(vh),
+        ...(Number.isFinite(canvas?.ds?.scale) ? { zoom: Number(canvas.ds.scale.toFixed(3)) } : {}),
+      },
+      node_count: all.length,
+      in_view_count: visible.length,
+      truncated: visible.length > MAX_STATE_NODES,
+      nodes: visible.slice(0, MAX_STATE_NODES).map(summarizeNode),
+    };
+  },
+
+  // WHY IS THAT NODE RED? LiteGraph only sets a boolean (`node.has_errors`) and
+  // paints a red outline — the REASON lives somewhere else entirely, which is why
+  // users see "red node, no error message". This gathers every source and joins
+  // them onto the offending node:
+  //   - missingModel store  → the exact missing file, its directory, download URL
+  //   - missingNodesError   → node types this install doesn't have
+  //   - app.lastNodeErrors  → per-node validation errors from the last run attempt
+  //   - executionError      → the last execution failure
+  // Read-only.
+  graph_view_errored_nodes() {
+    const { app: comfy, graph } = getGraphCtx();
+    const nodes = graph._nodes ?? [];
+    const byId = new Map(nodes.map((n) => [String(n.id), n]));
+    // node id → reasons[]
+    const reasons = new Map();
+    const addReason = (id, reason) => {
+      const key = String(id);
+      if (!reasons.has(key)) reasons.set(key, []);
+      reasons.get(key).push(reason);
+    };
+
+    // 1) Missing MODELS — the most common cause of a red loader node.
+    let missingModels = [];
+    try {
+      const store = getPiniaStore("missingModel");
+      const cands = store?.missingModelCandidates ?? [];
+      for (const c of cands) {
+        if (c?.isMissing === false) continue;
+        const r = {
+          kind: "missing_model",
+          file: c?.name ?? null,
+          directory: c?.directory ?? null,
+          ...(c?.widgetName ? { widget: c.widgetName } : {}),
+          ...(c?.url ? { download_url: c.url } : {}),
+        };
+        missingModels.push({ node_id: c?.nodeId ?? null, ...r });
+        if (c?.nodeId != null) addReason(c.nodeId, r);
+      }
+    } catch {
+      /* store unavailable on this frontend — other sources still apply */
+    }
+
+    // 2) Missing NODE TYPES (the pack isn't installed).
+    let missingNodeTypes = [];
+    try {
+      const store = getPiniaStore("missingNodesError");
+      const list = store?.missingNodeTypes ?? store?.missingNodes ?? [];
+      missingNodeTypes = list
+        .map((m) => (typeof m === "string" ? m : m?.type ?? m?.nodeType ?? null))
+        .filter(Boolean);
+    } catch {
+      /* optional */
+    }
+
+    // 3) Per-node VALIDATION errors from the last run attempt.
+    const lastNodeErrors = comfy?.lastNodeErrors ?? null;
+    if (lastNodeErrors && typeof lastNodeErrors === "object") {
+      for (const [id, entry] of Object.entries(lastNodeErrors)) {
+        for (const e of entry?.errors ?? []) {
+          addReason(id, {
+            kind: "validation",
+            message: e?.message ?? String(e),
+            ...(e?.details ? { details: e.details } : {}),
+            ...(e?.extra_info?.input_name ? { input: e.extra_info.input_name } : {}),
+          });
+        }
+      }
+    }
+
+    // 4) The last EXECUTION failure (may name a node that isn't flagged).
+    let executionError = null;
+    try {
+      const store = getPiniaStore("executionError");
+      const e = store?.lastExecutionError ?? comfy?.lastExecutionError ?? null;
+      if (e) {
+        executionError = {
+          node_id: e.node_id ?? null,
+          node_type: e.node_type ?? null,
+          message: e.exception_message ?? e.message ?? null,
+        };
+        if (e.node_id != null) {
+          addReason(e.node_id, { kind: "execution", message: executionError.message });
+        }
+      }
+    } catch {
+      /* optional */
+    }
+
+    // The red-outlined set is has_errors, UNIONed with anything a source blamed
+    // (a source can name a node LiteGraph never flagged).
+    const flagged = new Set(nodes.filter((n) => n.has_errors).map((n) => String(n.id)));
+    for (const id of reasons.keys()) if (byId.has(id)) flagged.add(id);
+
+    const out = [...flagged]
+      .map((id) => byId.get(id))
+      .filter(Boolean)
+      .map((n) => ({
+        ...summarizeNode(n),
+        red_outline: !!n.has_errors,
+        reasons: reasons.get(String(n.id)) ?? [],
+        ...(reasons.get(String(n.id))?.length
+          ? {}
+          : { note: "Flagged by LiteGraph but no source explained it — it may be stale; re-run to refresh, or check the node's widget values." }),
+      }));
+
+    return {
+      viewing: describeActiveGraph(graph),
+      node_count: nodes.length,
+      errored_count: out.length,
+      nodes: out.slice(0, MAX_STATE_NODES),
+      ...(out.length > MAX_STATE_NODES ? { truncated: true } : {}),
+      ...(missingModels.length ? { missing_models: missingModels } : {}),
+      ...(missingNodeTypes.length ? { missing_node_types: missingNodeTypes } : {}),
+      ...(executionError ? { last_execution_error: executionError } : {}),
+      ...(out.length ? {} : { hint: "No nodes are flagged with errors on the canvas right now." }),
+    };
+  },
+
   // A compact, dependency-ordered TEXT outline of the open graph — built to be
   // read top→down by an LLM (sources first, sinks last). Each node is one block:
   //   id  Type "title" [mode] [OUTPUT] · group:X   widget=value …
