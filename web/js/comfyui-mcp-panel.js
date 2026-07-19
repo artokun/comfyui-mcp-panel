@@ -7484,6 +7484,12 @@ const PANEL_CSS = `
 }
 .cmcp-composer-row { display: flex; align-items: center; gap: 0.25rem; padding: 0.25rem 0.5rem 0.5rem; }
 .cmcp-spacer { flex: 1; }
+/* "Why is this red?" — only rendered while the canvas has flagged nodes, so it
+   reads as a live alert rather than permanent chrome. Amber (not red) so it
+   doesn't imitate ComfyUI's own error toast. */
+.cmcp-errors-btn { width: auto; min-width: 1.75rem; gap: 0.2rem; padding: 0 0.3rem; color: var(--p-orange-500, #f59e0b); }
+.cmcp-errors-btn:hover { background: var(--p-surface-700, #3f3f46); color: var(--p-orange-400, #fbbf24); }
+.cmcp-errors-count { font-size: 0.6875rem; font-weight: 600; line-height: 1; }
 .cmcp-iconbtn {
   width: 1.75rem; height: 1.75rem; flex: none;
   display: flex; align-items: center; justify-content: center;
@@ -9371,6 +9377,53 @@ function buildPanel() {
   const sendBtn = iconBtn("pi-send", "Send (Enter)");
   sendBtn.type = "submit";
 
+  // ⚠ "Why is this red?" — LiteGraph paints a node red but stores no reason
+  // anywhere the user can see (its badge text is empty), so the standing
+  // complaint is "red node, no error message". This button appears ONLY while
+  // the live canvas has flagged nodes and routes the agent straight at
+  // panel_view_errored_nodes, which joins the actual cause (missing model +
+  // download URL, validation error, execution failure) onto each node.
+  const errorsBtn = iconBtn("pi-exclamation-triangle", "Nodes with errors — ask why");
+  errorsBtn.classList.add("cmcp-errors-btn");
+  errorsBtn.hidden = true;
+  const errorsCount = document.createElement("span");
+  errorsCount.className = "cmcp-errors-count";
+  errorsBtn.appendChild(errorsCount);
+  let _erroredIds = [];
+  /** Poll the live graph for flagged nodes and show/hide the affordance. Cheap
+   *  (one pass over nodes) and diffed against the last id list so we only touch
+   *  the DOM when the set actually changes. */
+  function refreshErroredAffordance() {
+    let ids = [];
+    try {
+      const nodes = app?.canvas?.graph?._nodes ?? app?.graph?._nodes ?? [];
+      ids = nodes.filter((n) => n?.has_errors).map((n) => n.id);
+    } catch {
+      return; // canvas not ready — leave the affordance as-is
+    }
+    if (ids.length === _erroredIds.length && ids.every((v, i) => v === _erroredIds[i])) return;
+    _erroredIds = ids;
+    errorsBtn.hidden = ids.length === 0;
+    errorsCount.textContent = ids.length > 1 ? String(ids.length) : "";
+    errorsBtn.title = ids.length
+      ? `${ids.length} node${ids.length === 1 ? "" : "s"} with errors (id ${ids.join(", ")}) — ask why`
+      : "Nodes with errors — ask why";
+  }
+  errorsBtn.addEventListener("click", () => {
+    const ids = _erroredIds;
+    if (!ids.length) return;
+    const which =
+      ids.length === 1 ? `is node ${ids[0]}` : `are nodes ${ids.join(", ")}`;
+    input.value =
+      `Why ${which} highlighted red on my canvas? Use panel_view_errored_nodes to read the actual reason ` +
+      `(don't guess from widget values), then tell me plainly what's wrong and exactly how to fix it — ` +
+      `if a model is missing, name the file, the folder it belongs in, and where to get it.`;
+    input.focus();
+    // Submitting via the form keeps the normal send path (attachments, mid,
+    // pending bubble) instead of duplicating it here.
+    form.requestSubmit ? form.requestSubmit() : sendBtn.click();
+  });
+
   const fileInput = document.createElement("input");
   fileInput.type = "file";
   // Images + video upload into ComfyUI input/; workflows (.json) and text files
@@ -9555,7 +9608,12 @@ function buildPanel() {
   toolbarSpacer.className = "cmcp-spacer";
   toolbar.append(deafenBtn, blindBtn, toolbarSpacer, civitaiBtn, trainingBtn);
 
-  row.append(ring, ctxLabel, modelChip, spacer, attachBtn, micBtn, sendBtn);
+  row.append(ring, ctxLabel, modelChip, errorsBtn, spacer, attachBtn, micBtn, sendBtn);
+  // Watch the live canvas for flagged nodes. 1.2s is well under human reaction
+  // time for "I just saw a node go red" and costs one array pass; the interval
+  // is cleared with the panel's other timers on teardown.
+  refreshErroredAffordance();
+  const _errPoll = setInterval(refreshErroredAffordance, 1200);
   form.append(menuPop, modelPop, attachBar, input, row, fileInput);
   root.appendChild(form);
 
@@ -14131,6 +14189,7 @@ function buildPanel() {
         // recognition already stopped
       }
       clearInterval(_wfPoll); // stop per-workflow change polling on unmount
+      clearInterval(_errPoll); // stop errored-node affordance polling on unmount
       document.removeEventListener("mousedown", onDocPointerDown, true);
       document.removeEventListener("keydown", onInterruptKeydown, true);
       document.removeEventListener("visibilitychange", onVisibilityChange);
