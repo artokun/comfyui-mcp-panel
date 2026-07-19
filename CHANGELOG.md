@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-18
+
+### Added
+- add Kimi K3 (Moonshot) provider chip (#89)
+
+
 ## [0.9.0] - 2026-07-17
 
 ### Added
