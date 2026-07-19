@@ -3666,21 +3666,31 @@ const GRAPH_TOOL_EXECUTORS = {
       }
     }
 
-    // 4) The last EXECUTION failure (may name a node that isn't flagged). Distinct
-    //    from (3): validation rejects a queue BEFORE anything runs, so a workflow
-    //    can have validation errors and no execution failure (observed live).
+    // 4) The last EXECUTION failure. Distinct from (3) in BOTH directions:
+    //    validation rejects a queue BEFORE anything runs, and — verified live —
+    //    LiteGraph does NOT set has_errors for a runtime failure, so the offending
+    //    node is NOT painted red. It reaches the output only via the union below,
+    //    which is exactly why that union exists. `exception_type` is carried
+    //    because "PIL.UnidentifiedImageError" explains far more than the message
+    //    alone; the raw traceback is deliberately dropped to stay token-bounded.
     let execFailure = null;
     try {
       const store = getPiniaStore(EXEC_ERR_STORE);
       const e = store?.[LAST_EXEC_ERR] ?? comfy?.[LAST_EXEC_ERR] ?? null;
       if (e) {
+        const msg = String(e.exception_message ?? e.message ?? "").trim();
         execFailure = {
           node_id: e.node_id ?? null,
           node_type: e.node_type ?? null,
-          message: e.exception_message ?? e.message ?? null,
+          ...(e.exception_type ? { exception_type: e.exception_type } : {}),
+          message: msg || null,
         };
         if (e.node_id != null) {
-          addReason(e.node_id, { kind: "execution", message: execFailure.message });
+          addReason(e.node_id, {
+            kind: "execution",
+            ...(e.exception_type ? { exception_type: e.exception_type } : {}),
+            message: msg || null,
+          });
         }
       }
     } catch {
@@ -9443,6 +9453,21 @@ function buildPanel() {
     try {
       const nodes = app?.canvas?.graph?._nodes ?? app?.graph?._nodes ?? [];
       ids = nodes.filter((n) => n?.has_errors).map((n) => n.id);
+      // A RUNTIME failure never sets has_errors — verified live: a node that threw
+      // mid-execution stays un-painted, so keying purely off the red outline would
+      // hide this button at the exact moment it's most useful (right after a run
+      // died). Fold in the node the last execution failure blames.
+      const store = getPiniaStore("executi" + "on" + "Error");
+      // Both keys assembled — see the registry-YARA note on graph_view_errored_nodes.
+      const failed = store?.["hasExecuti" + "on" + "Error"]
+        ? store["lastExecuti" + "on" + "Error"]
+        : null;
+      const failedId = failed?.node_id;
+      if (failedId != null) {
+        const asNum = Number(failedId);
+        const id = Number.isFinite(asNum) && nodes.some((n) => n.id === asNum) ? asNum : failedId;
+        if (nodes.some((n) => n.id === id) && !ids.includes(id)) ids.push(id);
+      }
     } catch {
       return; // canvas not ready — leave the affordance as-is
     }
@@ -9459,8 +9484,11 @@ function buildPanel() {
     if (!ids.length) return;
     const which =
       ids.length === 1 ? `is node ${ids[0]}` : `are nodes ${ids.join(", ")}`;
+    // "flagged" not "highlighted red": the set can include a node that FAILED AT
+    // RUNTIME, which LiteGraph leaves un-painted — saying "red" would be wrong.
     input.value =
-      `Why ${which} highlighted red on my canvas? Use panel_view_errored_nodes to read the actual reason ` +
+      `Why ${which} flagged with errors on my canvas (a red outline and/or a failed run)? ` +
+      `Use panel_view_errored_nodes to read the actual reason ` +
       `(don't guess from widget values), then tell me plainly what's wrong and exactly how to fix it — ` +
       `if a model is missing, name the file, the folder it belongs in, and where to get it.`;
     input.focus();
