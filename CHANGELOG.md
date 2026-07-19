@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-07-19
+
+### Added
+- view_selected / view_nodes_in_viewport / view_errored_nodes (#91)
+
+
 ## [0.9.1] - 2026-07-18
 
 ### Added
