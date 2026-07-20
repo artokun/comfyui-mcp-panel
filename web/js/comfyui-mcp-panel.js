@@ -1818,7 +1818,7 @@ const EFFORT_META = {
   high: { label: "High", small: "thorough" },
   xhigh: { label: "Extra high", small: "deep" },
   max: { label: "Max", small: "exhaustive" },
-  ultra: { label: "Ultra", small: "no limits" },
+  ultra: { label: "Ultra", small: "4 parallel agents" },
 };
 const ALL_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 
