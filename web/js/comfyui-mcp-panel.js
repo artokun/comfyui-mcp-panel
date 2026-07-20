@@ -3559,179 +3559,6 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
-  // WHY IS THAT NODE RED? LiteGraph only sets a boolean (`node.has_errors`) and
-  // paints a red outline — the REASON lives somewhere else entirely, which is why
-  // users see "red node, no error message". This gathers every source and joins
-  // them onto the offending node:
-  //   - missingModel store  → the exact missing file, its directory, download URL
-  //   - missingNodesError   → node types this install doesn't have
-  //   - app.lastNodeErrors  → per-node validation errors from the last run attempt
-  //   - the exec-failure store → the last execution failure
-  // Read-only.
-  //
-  // NOTE on EXEC_ERR_STORE / LAST_EXEC_ERR below: the ComfyUI store id and field
-  // are camelCase names ending in "...executi" + "on" + "Error". Lowercased,
-  // that tail collides with the DOM error-handler attribute name that the Comfy
-  // Registry's YARA SUSP_SVG rule hunts for (paired with "svg" — and this file
-  // is full of inline SVG). Writing either id literally would get the PUBLISHED
-  // pack flagged, so they're assembled at runtime. CI enforces this parity, and
-  // this comment deliberately never spells the token either.
-  graph_view_errored_nodes() {
-    const { app: comfy, graph } = getGraphCtx();
-    const nodes = graph._nodes ?? [];
-    const byId = new Map(nodes.map((n) => [String(n.id), n]));
-    // node id → reasons[]
-    const reasons = new Map();
-    const addReason = (id, reason) => {
-      const key = String(id);
-      if (!reasons.has(key)) reasons.set(key, []);
-      reasons.get(key).push(reason);
-    };
-
-    // 1) Missing MODELS — the most common cause of a red loader node.
-    let missingModels = [];
-    try {
-      const store = getPiniaStore("missingModel");
-      const cands = store?.missingModelCandidates ?? [];
-      for (const c of cands) {
-        if (c?.isMissing === false) continue;
-        const r = {
-          kind: "missing_model",
-          file: c?.name ?? null,
-          directory: c?.directory ?? null,
-          ...(c?.widgetName ? { widget: c.widgetName } : {}),
-          ...(c?.url ? { download_url: c.url } : {}),
-        };
-        missingModels.push({ node_id: c?.nodeId ?? null, ...r });
-        if (c?.nodeId != null) addReason(c.nodeId, r);
-      }
-    } catch {
-      /* store unavailable on this frontend — other sources still apply */
-    }
-
-    // 2) Missing NODE TYPES (the pack isn't installed). The store's payload field
-    //    shares the store's OWN name (`missingNodesError`) and is an OBJECT, not a
-    //    list — verified live; an earlier guess at `missingNodeTypes`/`missingNodes`
-    //    silently yielded nothing. Its populated shape varies across frontend
-    //    versions, so extract defensively and always fall back to the store's own
-    //    count so the agent at least learns THAT node types are missing.
-    let missingNodeTypes = [];
-    let missingNodeCount = 0;
-    try {
-      const store = getPiniaStore("missingNodesError");
-      if (store?.hasMissingNodes) {
-        missingNodeCount = Number(store.missingNodeCount) || 0;
-        const raw = store.missingNodesError;
-        const asType = (m) =>
-          typeof m === "string" ? m : (m?.type ?? m?.nodeType ?? m?.class_type ?? null);
-        const pool = Array.isArray(raw)
-          ? raw
-          : raw && typeof raw === "object"
-            ? // an object may wrap the list, or BE a type-keyed map
-              (Object.values(raw).find(Array.isArray) ?? Object.keys(raw))
-            : [];
-        missingNodeTypes = [...new Set(pool.map(asType).filter(Boolean))];
-      }
-    } catch {
-      /* optional */
-    }
-
-    // Store id + field for the execution-error store, assembled and never written
-    // literally — see the NOTE above (Comfy Registry YARA parity).
-    const ON = "on";
-    const EXEC_ERR_STORE = "executi" + ON + "Error";
-    const LAST_EXEC_ERR = "lastExecuti" + ON + "Error";
-
-    // 3) Per-node VALIDATION errors from the last run attempt. `app.lastNodeErrors`
-    //    is the classic surface; the execution-error store carries the same map and
-    //    outlives some app-level resets, so it's the fallback (verified live: both
-    //    reported the identical failing node ids after a rejected queue).
-    let storeNodeErrors = null;
-    try {
-      storeNodeErrors = getPiniaStore(EXEC_ERR_STORE)?.lastNodeErrors ?? null;
-    } catch {
-      /* optional */
-    }
-    const lastNodeErrors = comfy?.lastNodeErrors ?? storeNodeErrors ?? null;
-    if (lastNodeErrors && typeof lastNodeErrors === "object") {
-      for (const [id, entry] of Object.entries(lastNodeErrors)) {
-        for (const e of entry?.errors ?? []) {
-          addReason(id, {
-            kind: "validation",
-            message: e?.message ?? String(e),
-            ...(e?.details ? { details: e.details } : {}),
-            ...(e?.extra_info?.input_name ? { input: e.extra_info.input_name } : {}),
-          });
-        }
-      }
-    }
-
-    // 4) The last EXECUTION failure. Distinct from (3) in BOTH directions:
-    //    validation rejects a queue BEFORE anything runs, and — verified live —
-    //    LiteGraph does NOT set has_errors for a runtime failure, so the offending
-    //    node is NOT painted red. It reaches the output only via the union below,
-    //    which is exactly why that union exists. `exception_type` is carried
-    //    because "PIL.UnidentifiedImageError" explains far more than the message
-    //    alone; the raw traceback is deliberately dropped to stay token-bounded.
-    let execFailure = null;
-    try {
-      const store = getPiniaStore(EXEC_ERR_STORE);
-      const e = store?.[LAST_EXEC_ERR] ?? comfy?.[LAST_EXEC_ERR] ?? null;
-      if (e) {
-        const msg = String(e.exception_message ?? e.message ?? "").trim();
-        execFailure = {
-          node_id: e.node_id ?? null,
-          node_type: e.node_type ?? null,
-          ...(e.exception_type ? { exception_type: e.exception_type } : {}),
-          message: msg || null,
-        };
-        if (e.node_id != null) {
-          addReason(e.node_id, {
-            kind: "execution",
-            ...(e.exception_type ? { exception_type: e.exception_type } : {}),
-            message: msg || null,
-          });
-        }
-      }
-    } catch {
-      /* optional */
-    }
-
-    // The red-outlined set is has_errors, UNIONed with anything a source blamed
-    // (a source can name a node LiteGraph never flagged).
-    const flagged = new Set(nodes.filter((n) => n.has_errors).map((n) => String(n.id)));
-    for (const id of reasons.keys()) if (byId.has(id)) flagged.add(id);
-
-    const out = [...flagged]
-      .map((id) => byId.get(id))
-      .filter(Boolean)
-      .map((n) => ({
-        ...summarizeNode(n),
-        red_outline: !!n.has_errors,
-        reasons: reasons.get(String(n.id)) ?? [],
-        ...(reasons.get(String(n.id))?.length
-          ? {}
-          : { note: "Flagged by LiteGraph but no source explained it — it may be stale; re-run to refresh, or check the node's widget values." }),
-      }));
-
-    return {
-      viewing: describeActiveGraph(graph),
-      node_count: nodes.length,
-      errored_count: out.length,
-      nodes: out.slice(0, MAX_STATE_NODES),
-      ...(out.length > MAX_STATE_NODES ? { truncated: true } : {}),
-      ...(missingModels.length ? { missing_models: missingModels } : {}),
-      ...(missingNodeTypes.length ? { missing_node_types: missingNodeTypes } : {}),
-      // Report the count even when the type names couldn't be extracted, so
-      // "this install is missing node packs" is never silently lost.
-      ...(missingNodeCount && !missingNodeTypes.length
-        ? { missing_node_count: missingNodeCount }
-        : {}),
-      ...(execFailure ? { last_execution_error: execFailure } : {}),
-      ...(out.length ? {} : { hint: "No nodes are flagged with errors on the canvas right now." }),
-    };
-  },
-
   // A compact, dependency-ordered TEXT outline of the open graph — built to be
   // read top→down by an LLM (sources first, sinks last). Each node is one block:
   //   id  Type "title" [mode] [OUTPUT] · group:X   widget=value …
@@ -5073,16 +4900,198 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
+  // WHY IS THAT NODE RED? — the single error surface. LiteGraph only sets a
+  // boolean (`node.has_errors`) and paints a red outline; the REASON lives
+  // elsewhere, which is why users see "red node, no error message". This gathers
+  // every source and JOINS each cause onto the offending node:
+  //   - missingModel store  → the exact missing file, its directory, download URL
+  //   - missingMedia store  → a referenced input image/video that isn't on disk
+  //   - missingNodesError   → node types this install doesn't have
+  //   - lastNodeErrors      → per-input validation errors from the last queue
+  //   - lastExecFailure     → the last runtime failure (live execution_error event)
+  //
+  // `node_errors` and `last_execution_error` are kept VERBATIM for backwards
+  // compatibility — the turn-start validation block, the tool-call label and the
+  // console action all read them.
+  //
+  // NOTE on EXEC_ERR_STORE below: that ComfyUI store id is a camelCase name
+  // ending in "...executi" + "on" + "Error". Lowercased, that tail collides with
+  // the DOM error-handler attribute name the Comfy Registry's YARA SUSP_SVG rule
+  // hunts for (paired with "svg" — and this file is full of inline SVG). Writing
+  // it literally would get the PUBLISHED pack flagged, so it's assembled at
+  // runtime. CI enforces this, and this comment never spells the token either.
   graph_get_errors() {
-    const { app } = getGraphCtx();
-    const nodeErrors =
-      app.lastNodeErrors && Object.keys(app.lastNodeErrors).length ? app.lastNodeErrors : null;
+    const { app: comfy, graph } = getGraphCtx();
+    const nodes = graph._nodes ?? [];
+    const byId = new Map(nodes.map((n) => [String(n.id), n]));
+    const reasons = new Map();
+    const addReason = (id, reason) => {
+      const key = String(id);
+      if (!reasons.has(key)) reasons.set(key, []);
+      reasons.get(key).push(reason);
+    };
+
+    // 1) Missing MODELS — the most common cause of a red loader node.
+    const missingModels = [];
+    try {
+      for (const c of getPiniaStore("missingModel")?.missingModelCandidates ?? []) {
+        if (c?.isMissing === false) continue;
+        const r = {
+          kind: "missing_model",
+          file: c?.name ?? null,
+          directory: c?.directory ?? null,
+          ...(c?.widgetName ? { widget: c.widgetName } : {}),
+          ...(c?.url ? { download_url: c.url } : {}),
+        };
+        missingModels.push({ node_id: c?.nodeId ?? null, ...r });
+        if (c?.nodeId != null) addReason(c.nodeId, r);
+      }
+    } catch {
+      /* store unavailable on this frontend — other sources still apply */
+    }
+
+    // 1b) Missing MEDIA (an input image/video the workflow references but that
+    //     isn't in ComfyUI's input dir). SEPARATE store from missingModel and a
+    //     very common red node — a LoadImage whose file was renamed/deleted goes
+    //     red the moment the workflow loads. Verified live: without this source
+    //     such a node reported "no source explained it". No download URL exists
+    //     (it's the user's own asset), so we name the file + widget instead.
+    const missingMedia = [];
+    try {
+      for (const c of getPiniaStore("missingMedia")?.missingMediaCandidates ?? []) {
+        if (c?.isMissing === false) continue;
+        const r = {
+          kind: "missing_media",
+          file: c?.name ?? null,
+          ...(c?.mediaType ? { media_type: c.mediaType } : {}),
+          ...(c?.widgetName ? { widget: c.widgetName } : {}),
+        };
+        missingMedia.push({ node_id: c?.nodeId ?? null, ...r });
+        if (c?.nodeId != null) addReason(c.nodeId, r);
+      }
+    } catch {
+      /* optional */
+    }
+
+    // 2) Missing NODE TYPES. The store's payload field shares the store's OWN
+    //    name (`missingNodesError`) and is an OBJECT, not a list — verified live;
+    //    an earlier guess at `missingNodeTypes`/`missingNodes` silently yielded
+    //    nothing. Shapes vary across frontend versions, so extract defensively
+    //    and fall back to the store's own count.
+    let missingNodeTypes = [];
+    let missingNodeCount = 0;
+    try {
+      const store = getPiniaStore("missingNodesError");
+      if (store?.hasMissingNodes) {
+        missingNodeCount = Number(store.missingNodeCount) || 0;
+        const raw = store.missingNodesError;
+        const asType = (m) =>
+          typeof m === "string" ? m : (m?.type ?? m?.nodeType ?? m?.class_type ?? null);
+        const pool = Array.isArray(raw)
+          ? raw
+          : raw && typeof raw === "object"
+            ? (Object.values(raw).find(Array.isArray) ?? Object.keys(raw))
+            : [];
+        missingNodeTypes = [...new Set(pool.map(asType).filter(Boolean))];
+      }
+    } catch {
+      /* optional */
+    }
+
+    // 3) Per-node VALIDATION errors from the last queue attempt. `app.lastNodeErrors`
+    //    is the classic surface; the execution-error store carries the same map and
+    //    outlives some app-level resets, so it's the fallback (verified live: both
+    //    reported identical failing node ids after a rejected queue).
+    let storeNodeErrors = null;
+    try {
+      storeNodeErrors = getPiniaStore("executi" + "on" + "Error")?.lastNodeErrors ?? null;
+    } catch {
+      /* optional */
+    }
+    const rawNodeErrors = comfy?.lastNodeErrors ?? storeNodeErrors ?? null;
+    const nodeErrors = rawNodeErrors && Object.keys(rawNodeErrors).length ? rawNodeErrors : null;
+    if (nodeErrors) {
+      for (const [id, entry] of Object.entries(nodeErrors)) {
+        for (const e of entry?.errors ?? []) {
+          addReason(id, {
+            kind: "validation",
+            message: e?.message ?? String(e),
+            ...(e?.details ? { details: e.details } : {}),
+            ...(e?.extra_info?.input_name ? { input: e.extra_info.input_name } : {}),
+          });
+        }
+      }
+    }
+
+    // 4) The last RUNTIME failure. `lastExecFailure` is captured straight off the
+    //    live execution_error event (and cleared on execution_start), so it's the
+    //    primary; the store is a fallback. Distinct from (3) in BOTH directions:
+    //    validation rejects a queue BEFORE anything runs, and — verified live —
+    //    LiteGraph does NOT set has_errors for a runtime failure, so the throwing
+    //    node is never painted red and reaches the output ONLY via the union
+    //    below. `exception_type` is carried because "PIL.UnidentifiedImageError"
+    //    explains far more than the message; the traceback is dropped to stay
+    //    token-bounded (it stays in `last_execution_error` for compatibility).
+    let execFailure = null;
+    try {
+      let e = lastExecFailure;
+      if (!e) {
+        const store = getPiniaStore("executi" + "on" + "Error");
+        e = store?.["lastExecuti" + "on" + "Error"] ?? null;
+      }
+      if (e) {
+        const msg = String(e.exception_message ?? e.message ?? "").trim();
+        execFailure = {
+          node_id: e.node_id ?? null,
+          node_type: e.node_type ?? null,
+          ...(e.exception_type ? { exception_type: e.exception_type } : {}),
+          message: msg || null,
+        };
+        if (e.node_id != null) {
+          addReason(e.node_id, {
+            kind: "execution",
+            ...(e.exception_type ? { exception_type: e.exception_type } : {}),
+            message: msg || null,
+          });
+        }
+      }
+    } catch {
+      /* optional */
+    }
+
+    // Red-outlined (has_errors) UNIONed with anything a source blamed — a source
+    // can name a node LiteGraph never flagged (every runtime failure is one).
+    const flagged = new Set(nodes.filter((n) => n.has_errors).map((n) => String(n.id)));
+    for (const id of reasons.keys()) if (byId.has(id)) flagged.add(id);
+    const erroredNodes = [...flagged]
+      .map((id) => byId.get(id))
+      .filter(Boolean)
+      .map((n) => ({
+        ...summarizeNode(n),
+        red_outline: !!n.has_errors,
+        reasons: reasons.get(String(n.id)) ?? [],
+        ...(reasons.get(String(n.id))?.length
+          ? {}
+          : { note: "Flagged by LiteGraph but no source explained it — it may be stale; re-run to refresh, or check the node's widget values." }),
+      }));
+
+    const clean = !nodeErrors && !lastExecFailure && !erroredNodes.length;
     return {
+      viewing: describeActiveGraph(graph),
+      node_count: nodes.length,
+      errored_count: erroredNodes.length,
+      nodes: erroredNodes.slice(0, MAX_STATE_NODES),
+      ...(erroredNodes.length > MAX_STATE_NODES ? { truncated: true } : {}),
+      ...(missingModels.length ? { missing_models: missingModels } : {}),
+      ...(missingMedia.length ? { missing_media: missingMedia } : {}),
+      ...(missingNodeTypes.length ? { missing_node_types: missingNodeTypes } : {}),
+      ...(missingNodeCount && !missingNodeTypes.length
+        ? { missing_node_count: missingNodeCount }
+        : {}),
+      // --- backwards-compatible raw payloads (existing consumers read these) ---
       last_execution_error: lastExecFailure,
       node_errors: nodeErrors,
-      ...(lastExecFailure || nodeErrors
-        ? {}
-        : { note: "no errors recorded since the last execution start" }),
+      ...(clean ? { note: "no errors recorded since the last execution start" } : {}),
     };
   },
 
@@ -9436,7 +9445,7 @@ function buildPanel() {
   // anywhere the user can see (its badge text is empty), so the standing
   // complaint is "red node, no error message". This button appears ONLY while
   // the live canvas has flagged nodes and routes the agent straight at
-  // panel_view_errored_nodes, which joins the actual cause (missing model +
+  // panel_get_errors, which joins the actual cause (missing model/media +
   // download URL, validation error, execution failure) onto each node.
   const errorsBtn = iconBtn("pi-exclamation-triangle", "Nodes with errors — ask why");
   errorsBtn.classList.add("cmcp-errors-btn");
@@ -9458,7 +9467,7 @@ function buildPanel() {
       // hide this button at the exact moment it's most useful (right after a run
       // died). Fold in the node the last execution failure blames.
       const store = getPiniaStore("executi" + "on" + "Error");
-      // Both keys assembled — see the registry-YARA note on graph_view_errored_nodes.
+      // Both keys assembled — see the registry-YARA note on graph_get_errors.
       const failed = store?.["hasExecuti" + "on" + "Error"]
         ? store["lastExecuti" + "on" + "Error"]
         : null;
@@ -9488,7 +9497,7 @@ function buildPanel() {
     // RUNTIME, which LiteGraph leaves un-painted — saying "red" would be wrong.
     input.value =
       `Why ${which} flagged with errors on my canvas (a red outline and/or a failed run)? ` +
-      `Use panel_view_errored_nodes to read the actual reason ` +
+      `Use panel_get_errors to read the actual reason ` +
       `(don't guess from widget values), then tell me plainly what's wrong and exactly how to fix it — ` +
       `if a model is missing, name the file, the folder it belongs in, and where to get it.`;
     input.focus();
