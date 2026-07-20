@@ -323,6 +323,15 @@ def _register_routes():
     except Exception as _e:  # pragma: no cover - never block panel load
         _log("civitai proxy not registered: {}".format(_e))
 
+    # Training-wizard helpers: image-ref → absolute-path resolution for dataset
+    # staging, and serving training-sample images from under the training root.
+    try:
+        from .py import training_routes
+
+        training_routes.register(routes, web)
+    except Exception as _e:  # pragma: no cover - never block panel load
+        _log("training routes not registered: {}".format(_e))
+
     @routes.get("/comfyui_mcp_panel/status")
     async def _status(_request):
         detected = _detect_comfyui_url()
