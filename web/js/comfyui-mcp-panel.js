@@ -1818,6 +1818,7 @@ const EFFORT_META = {
   high: { label: "High", small: "thorough" },
   xhigh: { label: "Extra high", small: "deep" },
   max: { label: "Max", small: "exhaustive" },
+  ultra: { label: "Ultra", small: "no limits" },
 };
 const ALL_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 
@@ -1827,14 +1828,16 @@ const ALL_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 // nearest valid level for the target (the orchestrator backends do the same
 // mapping server-side; this keeps the picker honest about what's selectable).
 //   • Claude: low | medium | high | xhigh | max
-//   • Codex:  none | minimal | low | medium | high | xhigh
+//   • Codex:  none | minimal | low | medium | high | xhigh | max | ultra (GPT-5.6)
 //   • Gemini: (none) — the gemini CLI (run via `gemini --acp`) exposes no
 //     user-facing reasoning-effort levels, so the effort selector is hidden for
 //     it (empty scale → effortsForModel returns [], intersecting any model-
 //     reported levels down to none). The orchestrator maps effort server-side.
 const BACKEND_EFFORTS = {
   claude: ["low", "medium", "high", "xhigh", "max"],
-  codex: ["none", "minimal", "low", "medium", "high", "xhigh"],
+  // GPT-5.6 adds max + ultra (per-model ceilings come from the model list —
+  // Luna tops out at max; the intersection in effortsForModel handles that).
+  codex: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
   gemini: [],
   // Grok rides the ACP CLI like gemini — no user-facing reasoning-effort scale.
   grok: [],
@@ -1851,7 +1854,7 @@ const BACKEND_EFFORTS = {
   custom: [],
 };
 // Ordered low→high across BOTH scales, for nearest-level mapping on a switch.
-const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 /** Snap `effort` to the nearest level present in `list` by EFFORT_ORDER rank.
  *  Shared levels pass through 1:1; an off-list source snaps to the closest by
  *  ordered rank (ties prefer the lower level). Returns `effort` unchanged when
