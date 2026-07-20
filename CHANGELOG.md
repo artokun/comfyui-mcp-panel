@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-07-19
+
+### Fixed
+- announce missing assets at turn start, not just on request (#93)
+
+### Changed
+- merge graph_view_errored_nodes into graph_get_errors (#92)
+
+
 ## [0.9.5] - 2026-07-19
 
 ### Fixed
