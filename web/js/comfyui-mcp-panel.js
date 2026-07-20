@@ -9725,15 +9725,21 @@ function buildPanel() {
     civitaiBtn.prepend(svg);
   }
 
-  // LoRA Training — the coming-soon preview modal (mobile-app parity). Same
-  // modal treatment as the CivitAI browser; dumbbell mark via currentColor.
+  // LoRA Training — the dataset gather/label/launch/monitor wizard for the
+  // local trainer (ai-toolkit in a GPU container, train_* tools over call_tool).
+  // Same modal treatment as the CivitAI browser; dumbbell mark via currentColor.
   let _trainingHandle = null;
   const trainingBtn = toolbarBtn("pi-circle", "Training");
   trainingBtn.querySelector(".pi").remove();
-  trainingBtn.title = "LoRA Training — coming soon: train character/style/edit/slider and video LoRAs, locally or on RunPod.";
+  trainingBtn.title = "LoRA Training — train a character LoRA locally on FLUX.1-dev (style/edit/slider/video coming in P2).";
   trainingBtn.addEventListener("click", () => {
     try { _trainingHandle?.close(); } catch {}
-    _trainingHandle = openTrainingModal({ api });
+    _trainingHandle = openTrainingModal({
+      api,
+      root,
+      callTool: (t, a, o) => liveBridgeClient?.callTool(t, a, o),
+      uploadBlobToInput,
+    });
   });
   {
     const svgNs = "http://www.w3.org/2000/svg";
