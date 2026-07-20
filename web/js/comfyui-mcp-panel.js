@@ -1362,7 +1362,7 @@ function panelSettingsList() {
     },
   });
   // A per-backend "Default reasoning effort" — a STATIC combo of THAT backend's
-  // fixed scale (Claude: low–max; Codex: none–xhigh; Gemini: no effort control).
+  // fixed scale (Claude: low–max; Codex: none–ultra; Gemini: no effort control).
   // No dynamic remap needed since the groups are separate. Drives the live panel
   // only for the active group.
   const effortSetting = (backend, sortOrder) => ({
@@ -1373,7 +1373,7 @@ function panelSettingsList() {
     tooltip:
       ((BACKEND_EFFORTS[backend] || ALL_EFFORTS).length
         ? `Default reasoning effort for the ${BACKEND_TEXT[backend]} agent, from its scale ` +
-          `(${backend === "codex" ? "none–xhigh" : "low–max"}). 'Model default' leaves it unset.`
+          `(${backend === "codex" ? "none–ultra" : "low–max"}). 'Model default' leaves it unset.`
         : `${BACKEND_TEXT[backend]} exposes no reasoning-effort control; leave this at 'Model default'.`),
     type: "combo",
     options: effortComboOptions(backend),
@@ -1818,6 +1818,7 @@ const EFFORT_META = {
   high: { label: "High", small: "thorough" },
   xhigh: { label: "Extra high", small: "deep" },
   max: { label: "Max", small: "exhaustive" },
+  ultra: { label: "Ultra", small: "no limits" },
 };
 const ALL_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 
@@ -1827,14 +1828,16 @@ const ALL_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 // nearest valid level for the target (the orchestrator backends do the same
 // mapping server-side; this keeps the picker honest about what's selectable).
 //   • Claude: low | medium | high | xhigh | max
-//   • Codex:  none | minimal | low | medium | high | xhigh
+//   • Codex:  none | minimal | low | medium | high | xhigh | max | ultra (GPT-5.6)
 //   • Gemini: (none) — the gemini CLI (run via `gemini --acp`) exposes no
 //     user-facing reasoning-effort levels, so the effort selector is hidden for
 //     it (empty scale → effortsForModel returns [], intersecting any model-
 //     reported levels down to none). The orchestrator maps effort server-side.
 const BACKEND_EFFORTS = {
   claude: ["low", "medium", "high", "xhigh", "max"],
-  codex: ["none", "minimal", "low", "medium", "high", "xhigh"],
+  // GPT-5.6 adds max + ultra (per-model ceilings come from the model list —
+  // Luna tops out at max; the intersection in effortsForModel handles that).
+  codex: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
   gemini: [],
   // Grok rides the ACP CLI like gemini — no user-facing reasoning-effort scale.
   grok: [],
@@ -1851,7 +1854,7 @@ const BACKEND_EFFORTS = {
   custom: [],
 };
 // Ordered low→high across BOTH scales, for nearest-level mapping on a switch.
-const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 /** Snap `effort` to the nearest level present in `list` by EFFORT_ORDER rank.
  *  Shared levels pass through 1:1; an off-list source snaps to the closest by
  *  ordered rank (ties prefer the lower level). Returns `effort` unchanged when
