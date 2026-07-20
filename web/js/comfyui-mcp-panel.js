@@ -2748,6 +2748,70 @@ let lastInjectedValidationSig = null;
 // models, value_not_in_list, broken links); labeled distinctly from runtime
 // failures because the agent acts on them differently. Returns "" when the graph
 // is clean or the state is unchanged since we last injected it.
+/**
+ * Missing ASSETS the frontend already knows about — models, input media, and
+ * uninstalled node types. CRITICAL TIMING: these are detected when a workflow is
+ * LOADED, long before anything is queued, and they paint nodes red immediately.
+ * ComfyUI's validator (app.lastNodeErrors) only runs on a QUEUE ATTEMPT, so
+ * between "user opens a broken workflow" and "user clicks Run" this is the ONLY
+ * source that knows why the canvas is red — which is exactly the window in which
+ * users ask "why is this node red with no error message".
+ *
+ * Shared by graph_get_errors and validationBanner so the tool and the proactive
+ * turn-start injection can never drift apart again.
+ */
+function collectMissingAssets() {
+  const models = [];
+  const media = [];
+  let nodeTypes = [];
+  let nodeCount = 0;
+  try {
+    for (const c of getPiniaStore("missingModel")?.missingModelCandidates ?? []) {
+      if (c?.isMissing === false) continue;
+      models.push({
+        node_id: c?.nodeId ?? null,
+        file: c?.name ?? null,
+        directory: c?.directory ?? null,
+        ...(c?.widgetName ? { widget: c.widgetName } : {}),
+        ...(c?.url ? { download_url: c.url } : {}),
+      });
+    }
+  } catch {
+    /* store unavailable on this frontend */
+  }
+  try {
+    for (const c of getPiniaStore("missingMedia")?.missingMediaCandidates ?? []) {
+      if (c?.isMissing === false) continue;
+      media.push({
+        node_id: c?.nodeId ?? null,
+        file: c?.name ?? null,
+        ...(c?.mediaType ? { media_type: c.mediaType } : {}),
+        ...(c?.widgetName ? { widget: c.widgetName } : {}),
+      });
+    }
+  } catch {
+    /* optional */
+  }
+  try {
+    const store = getPiniaStore("missingNodesError");
+    if (store?.hasMissingNodes) {
+      nodeCount = Number(store.missingNodeCount) || 0;
+      const raw = store.missingNodesError;
+      const asType = (m) =>
+        typeof m === "string" ? m : (m?.type ?? m?.nodeType ?? m?.class_type ?? null);
+      const pool = Array.isArray(raw)
+        ? raw
+        : raw && typeof raw === "object"
+          ? (Object.values(raw).find(Array.isArray) ?? Object.keys(raw))
+          : [];
+      nodeTypes = [...new Set(pool.map(asType).filter(Boolean))];
+    }
+  } catch {
+    /* optional */
+  }
+  return { models, media, nodeTypes, nodeCount, any: !!(models.length || media.length || nodeTypes.length || nodeCount) };
+}
+
 function validationBanner() {
   let nodeErrors = null;
   try {
@@ -2759,7 +2823,12 @@ function validationBanner() {
     nodeErrors = null;
   }
   const execErr = lastExecFailure;
-  if (!nodeErrors && !execErr) {
+  // Missing ASSETS are their own trigger: on a freshly-loaded broken workflow
+  // BOTH nodeErrors and execErr are null (nothing queued, nothing run) while the
+  // canvas is already red. Bailing on those two alone left the agent blind
+  // exactly when the user could see the problem — reported from the field.
+  const missing = collectMissingAssets();
+  if (!nodeErrors && !execErr && !missing.any) {
     lastInjectedValidationSig = null; // clean → let a future re-appearance inject again
     return "";
   }
@@ -2768,6 +2837,14 @@ function validationBanner() {
     sig = JSON.stringify({
       n: nodeErrors,
       e: execErr && (execErr.node_id ?? execErr.exception_message ?? execErr.ts),
+      // Include missing assets so RESOLVING them (installing the model, restoring
+      // the file) counts as a change and the banner stops repeating a stale warning.
+      m: [
+        missing.models.map((x) => `${x.node_id}:${x.file}`),
+        missing.media.map((x) => `${x.node_id}:${x.file}`),
+        missing.nodeTypes,
+        missing.nodeCount,
+      ],
     });
   } catch {
     sig = String(!!nodeErrors) + "|" + String(!!execErr);
@@ -2802,6 +2879,37 @@ function validationBanner() {
       more +
       `\nAddress these before running. If you're mid-build they may be expected — judge in ` +
       `context. Re-check anytime with panel_get_errors.\n\n`;
+  }
+  if (missing.any) {
+    const lines = [];
+    for (const m of missing.models.slice(0, 12)) {
+      lines.push(
+        `node ${m.node_id ?? "?"}: MODEL missing — ${m.file ?? "?"}` +
+          (m.directory ? ` (belongs in models/${m.directory})` : "") +
+          (m.widget ? ` [widget ${m.widget}]` : "") +
+          (m.download_url ? `\n    download: ${m.download_url}` : ""),
+      );
+    }
+    for (const m of missing.media.slice(0, 12)) {
+      lines.push(
+        `node ${m.node_id ?? "?"}: INPUT ${m.media_type ?? "file"} missing — ${m.file ?? "?"}` +
+          (m.widget ? ` [widget ${m.widget}]` : "") +
+          ` (the user must re-upload it; it's their own asset, not a download)`,
+      );
+    }
+    if (missing.nodeTypes.length) {
+      lines.push(`node types not installed: ${missing.nodeTypes.slice(0, 12).join(", ")}`);
+    } else if (missing.nodeCount) {
+      lines.push(`${missing.nodeCount} node type(s) not installed on this ComfyUI`);
+    }
+    out +=
+      `⚠️ MISSING ASSETS — the user's canvas has RED nodes RIGHT NOW because the workflow ` +
+      `references things this ComfyUI doesn't have. This is detected AT LOAD TIME, so it is ` +
+      `already true before anything is queued (ComfyUI's validator hasn't run yet, which is ` +
+      `why the raw validation list can be empty while nodes are visibly red):\n  ` +
+      lines.join("\n  ") +
+      `\nOffer to fix these — download the model into the right folder, or ask the user to ` +
+      `re-upload the input file. Full detail anytime with panel_get_errors.\n\n`;
   }
   if (execErr) {
     const msg = execErr.exception_message || execErr.exception_type || "execution error";
@@ -4931,71 +5039,25 @@ const GRAPH_TOOL_EXECUTORS = {
       reasons.get(key).push(reason);
     };
 
-    // 1) Missing MODELS — the most common cause of a red loader node.
-    const missingModels = [];
-    try {
-      for (const c of getPiniaStore("missingModel")?.missingModelCandidates ?? []) {
-        if (c?.isMissing === false) continue;
-        const r = {
-          kind: "missing_model",
-          file: c?.name ?? null,
-          directory: c?.directory ?? null,
-          ...(c?.widgetName ? { widget: c.widgetName } : {}),
-          ...(c?.url ? { download_url: c.url } : {}),
-        };
-        missingModels.push({ node_id: c?.nodeId ?? null, ...r });
-        if (c?.nodeId != null) addReason(c.nodeId, r);
-      }
-    } catch {
-      /* store unavailable on this frontend — other sources still apply */
+    // 1) Missing ASSETS (models, input media, uninstalled node types) — the same
+    //    collector the turn-start validation banner uses, so the tool and the
+    //    proactive injection can never disagree. These are detected AT WORKFLOW
+    //    LOAD, which is why they explain a red canvas long before anything is
+    //    queued (see collectMissingAssets).
+    const assets = collectMissingAssets();
+    const missingModels = assets.models.map((m) => ({ ...m, kind: "missing_model" }));
+    const missingMedia = assets.media.map((m) => ({ ...m, kind: "missing_media" }));
+    const missingNodeTypes = assets.nodeTypes;
+    const missingNodeCount = assets.nodeCount;
+    for (const m of assets.models) {
+      if (m.node_id == null) continue;
+      const { node_id, ...rest } = m;
+      addReason(node_id, { kind: "missing_model", ...rest });
     }
-
-    // 1b) Missing MEDIA (an input image/video the workflow references but that
-    //     isn't in ComfyUI's input dir). SEPARATE store from missingModel and a
-    //     very common red node — a LoadImage whose file was renamed/deleted goes
-    //     red the moment the workflow loads. Verified live: without this source
-    //     such a node reported "no source explained it". No download URL exists
-    //     (it's the user's own asset), so we name the file + widget instead.
-    const missingMedia = [];
-    try {
-      for (const c of getPiniaStore("missingMedia")?.missingMediaCandidates ?? []) {
-        if (c?.isMissing === false) continue;
-        const r = {
-          kind: "missing_media",
-          file: c?.name ?? null,
-          ...(c?.mediaType ? { media_type: c.mediaType } : {}),
-          ...(c?.widgetName ? { widget: c.widgetName } : {}),
-        };
-        missingMedia.push({ node_id: c?.nodeId ?? null, ...r });
-        if (c?.nodeId != null) addReason(c.nodeId, r);
-      }
-    } catch {
-      /* optional */
-    }
-
-    // 2) Missing NODE TYPES. The store's payload field shares the store's OWN
-    //    name (`missingNodesError`) and is an OBJECT, not a list — verified live;
-    //    an earlier guess at `missingNodeTypes`/`missingNodes` silently yielded
-    //    nothing. Shapes vary across frontend versions, so extract defensively
-    //    and fall back to the store's own count.
-    let missingNodeTypes = [];
-    let missingNodeCount = 0;
-    try {
-      const store = getPiniaStore("missingNodesError");
-      if (store?.hasMissingNodes) {
-        missingNodeCount = Number(store.missingNodeCount) || 0;
-        const raw = store.missingNodesError;
-        const asType = (m) =>
-          typeof m === "string" ? m : (m?.type ?? m?.nodeType ?? m?.class_type ?? null);
-        const pool = Array.isArray(raw)
-          ? raw
-          : raw && typeof raw === "object"
-            ? (Object.values(raw).find(Array.isArray) ?? Object.keys(raw))
-            : [];
-        missingNodeTypes = [...new Set(pool.map(asType).filter(Boolean))];
-      }
-    } catch {
-      /* optional */
+    for (const m of assets.media) {
+      if (m.node_id == null) continue;
+      const { node_id, ...rest } = m;
+      addReason(node_id, { kind: "missing_media", ...rest });
     }
 
     // 3) Per-node VALIDATION errors from the last queue attempt. `app.lastNodeErrors`
