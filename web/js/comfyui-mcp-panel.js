@@ -1362,7 +1362,7 @@ function panelSettingsList() {
     },
   });
   // A per-backend "Default reasoning effort" — a STATIC combo of THAT backend's
-  // fixed scale (Claude: low–max; Codex: none–xhigh; Gemini: no effort control).
+  // fixed scale (Claude: low–max; Codex: none–ultra; Gemini: no effort control).
   // No dynamic remap needed since the groups are separate. Drives the live panel
   // only for the active group.
   const effortSetting = (backend, sortOrder) => ({
@@ -1373,7 +1373,7 @@ function panelSettingsList() {
     tooltip:
       ((BACKEND_EFFORTS[backend] || ALL_EFFORTS).length
         ? `Default reasoning effort for the ${BACKEND_TEXT[backend]} agent, from its scale ` +
-          `(${backend === "codex" ? "none–xhigh" : "low–max"}). 'Model default' leaves it unset.`
+          `(${backend === "codex" ? "none–ultra" : "low–max"}). 'Model default' leaves it unset.`
         : `${BACKEND_TEXT[backend]} exposes no reasoning-effort control; leave this at 'Model default'.`),
     type: "combo",
     options: effortComboOptions(backend),
