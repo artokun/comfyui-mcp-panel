@@ -6,10 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-07-20
+
 ### Changed
 - Codex/ChatGPT reasoning-effort scale extends to `max` and `ultra` for the
   GPT-5.6 family (per-model ceilings still intersect with the model list —
   Luna tops out at `max`); pairs with comfyui-mcp >= 0.41.0
+
+### Added
+- max + ultra on the Codex scale for GPT-5.6 (#94)
+
 
 ## [0.9.6] - 2026-07-19
 
