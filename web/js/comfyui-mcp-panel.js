@@ -7338,7 +7338,7 @@ const PANEL_CSS = `
   padding: 0.75rem 1rem;
   border-bottom: 1px solid var(--p-content-border-color, #3f3f46);
 }
-/* The wordmark is ~5.9:1, so pin the HEIGHT and let width follow — the old
+/* The wordmark is ~4.9:1, so pin the HEIGHT and let width follow — the old
    square 20x20 rule would squash it. max-width keeps it from crowding the
    header actions on a narrow sidebar. */
 .cmcp-logo { height: 20px; width: auto; max-width: 148px; flex: none; object-fit: contain; display: block; }
