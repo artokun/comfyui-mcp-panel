@@ -42,9 +42,12 @@ function injectStyle(root) {
 .cmcp-rp-actions{display:flex;flex-wrap:wrap;gap:0.4rem;}
 .cmcp-rp-actions .cmcp-btn{flex:1 1 auto;min-width:96px;}
 .cmcp-rp-connect{display:flex;gap:0.4rem;}
-.cmcp-rp-connect input{flex:1 1 auto;min-width:0;padding:0.4rem 0.55rem;border-radius:6px;
+.cmcp-rp-connect input,.cmcp-rp-podselect{flex:1 1 auto;min-width:0;padding:0.4rem 0.55rem;border-radius:6px;
   border:1px solid var(--p-content-border-color,#3f3f46);background:var(--p-inputtext-background,#18181b);
-  color:inherit;font-size:0.82rem;font-family:ui-monospace,monospace;}
+  color:inherit;font-size:0.82rem;}
+.cmcp-rp-connect input{font-family:ui-monospace,monospace;}
+.cmcp-rp-podselect{cursor:pointer;}
+.cmcp-rp-refresh{flex:0 0 auto;min-width:auto;padding:0.4rem 0.6rem;}
 .cmcp-rp-log{font-size:0.78rem;opacity:0.85;min-height:1.1em;white-space:pre-wrap;word-break:break-word;}
 .cmcp-rp-log.busy{opacity:0.6;}
 .cmcp-rp-log.err{color:#f87171;}
@@ -117,15 +120,32 @@ export function openRunpodModal(ctx, opts = {}) {
   const card = document.createElement("div");
   card.className = "cmcp-rp-card";
 
-  // Connect-by-id row.
+  // Pod picker row: a dropdown of the account's pods (humans pick by name, not id),
+  // with a manual-ID fallback + a refresh. Populated from runpod_list_pods.
   const connectRow = document.createElement("div");
   connectRow.className = "cmcp-rp-connect";
+  const podSelect = document.createElement("select");
+  podSelect.className = "cmcp-rp-podselect";
+  podSelect.append(new Option("Loading pods…", ""));
+  const refreshBtn = mkBtn("↻");
+  refreshBtn.title = "Refresh pod list";
+  refreshBtn.classList.add("cmcp-rp-refresh");
+  const connectBtn = mkBtn("Connect", "primary");
+  connectRow.append(podSelect, refreshBtn, connectBtn);
+
+  // Manual-ID row (hidden unless "paste a pod ID…" is chosen in the dropdown).
+  const manualRow = document.createElement("div");
+  manualRow.className = "cmcp-rp-connect";
+  manualRow.style.display = "none";
   const podInput = document.createElement("input");
   podInput.type = "text";
-  podInput.placeholder = "pod id (from console.runpod.io)";
+  podInput.placeholder = "paste pod id (from console.runpod.io)";
   podInput.spellcheck = false;
-  const connectBtn = mkBtn("Connect", "primary");
-  connectRow.append(podInput, connectBtn);
+  manualRow.append(podInput);
+  podSelect.addEventListener("change", () => {
+    manualRow.style.display = podSelect.value === "__manual__" ? "flex" : "none";
+    if (podSelect.value === "__manual__") podInput.focus();
+  });
 
   // Action buttons.
   const actions = document.createElement("div");
@@ -156,7 +176,7 @@ export function openRunpodModal(ctx, opts = {}) {
   const doneBtn = mkBtn("Close", "primary");
   btnRow.append(doneBtn);
 
-  body.append(host, card, connectRow, actions, linkRow, log, credit);
+  body.append(host, card, connectRow, manualRow, actions, linkRow, log, credit);
   modal.append(title, body, btnRow);
   overlay.append(modal);
   // Mount the overlay on <body>, NOT the panel root: the ComfyUI sidebar clips
@@ -175,10 +195,46 @@ export function openRunpodModal(ctx, opts = {}) {
     log.className = "cmcp-rp-log" + (kind ? " " + kind : "");
   }
 
+  // The pod a lifecycle action targets: the one being watched (connected), else
+  // the dropdown selection, else a manually-pasted id.
+  function selectedPodId() {
+    if (podSelect.value === "__manual__") return podInput.value.trim() || null;
+    return podSelect.value || null;
+  }
   function currentPodId() {
     const s = getStatus?.();
-    return (s && s.watching && s.pod_id) || (podInput.value.trim() || null);
+    return (s && s.watching && s.pod_id) || selectedPodId();
   }
+
+  // Populate the dropdown from runpod_list_pods (humans pick by name, not id).
+  async function loadPods(preselect) {
+    try {
+      const res = await callTool("runpod_list_pods", {});
+      const txt = toolText(res);
+      const rows = [];
+      const re = /\*\*(.+?)\*\*\s*`([a-z0-9]+)`\s*—\s*(\S+)([^\n]*)/gi;
+      let m;
+      while ((m = re.exec(txt))) {
+        const gpu = (m[4].match(/·\s*([^·$]+?)(?:\s*·|\s*$)/) || [])[1];
+        rows.push({ name: m[1].trim(), id: m[2], status: m[3], gpu: gpu ? gpu.trim() : "" });
+      }
+      const want = preselect || selectedPodId();
+      podSelect.innerHTML = "";
+      podSelect.append(new Option(rows.length ? "— select a pod —" : "no pods yet — deploy one below", ""));
+      for (const r of rows) {
+        podSelect.append(new Option(`${r.name} — ${r.status}${r.gpu ? " · " + r.gpu : ""}`, r.id));
+      }
+      podSelect.append(new Option("＋ paste a pod ID…", "__manual__"));
+      if (want && rows.some((r) => r.id === want)) podSelect.value = want;
+      else if (rows.length === 1) podSelect.value = rows[0].id;
+    } catch (err) {
+      podSelect.innerHTML = "";
+      podSelect.append(new Option("couldn't list pods", ""));
+      podSelect.append(new Option("＋ paste a pod ID…", "__manual__"));
+    }
+    manualRow.style.display = podSelect.value === "__manual__" ? "flex" : "none";
+  }
+  refreshBtn.addEventListener("click", () => loadPods());
 
   function render() {
     if (closed) return;
@@ -242,27 +298,30 @@ export function openRunpodModal(ctx, opts = {}) {
   }, 1000);
 
   async function run(label, fn) {
-    if (busy) return;
+    if (busy) return false;
     busy = true;
     render();
     setLog(label + "…", "busy");
+    let ok = false;
     try {
       const res = await fn();
-      if (closed) return;
+      if (closed) return false;
       const txt = toolText(res);
-      setLog(txt, res && res.ok === false ? "err" : "");
+      ok = !(res && res.ok === false);
+      setLog(txt, ok ? "" : "err");
     } catch (err) {
       if (!closed) setLog((err && err.message) || String(err), "err");
     } finally {
       busy = false;
       if (!closed) render();
     }
+    return ok;
   }
 
   connectBtn.addEventListener("click", () => {
-    const id = podInput.value.trim();
+    const id = selectedPodId();
     if (!id) {
-      setLog("Enter a pod ID first (from the RunPod console).", "err");
+      setLog("Pick a pod from the list first (or deploy a new one).", "err");
       return;
     }
     run("Connecting to " + id, () => callTool("runpod_pod_connect", { pod_id: id }));
@@ -299,7 +358,9 @@ export function openRunpodModal(ctx, opts = {}) {
     }
     deployBtn.dataset.armed = "0";
     deployBtn.textContent = "Deploy new pod";
-    run("Deploying a new pod", () => callTool("runpod_pod_create", {}, { timeout: 120000 }));
+    run("Deploying a new pod", () => callTool("runpod_pod_create", {}, { timeout: 120000 })).then((ok) => {
+      if (ok) loadPods(); // show the new pod in the dropdown
+    });
   });
   linkBtn.addEventListener("click", async (e) => {
     e.preventDefault();
@@ -325,10 +386,9 @@ export function openRunpodModal(ctx, opts = {}) {
     if (e.target === overlay) close();
   });
 
-  // Seed the pod-id field if we're already watching one.
+  // Load the pod dropdown on open, preselecting the watched pod (or opts.pod_id).
   const s0 = getStatus?.();
-  if (s0 && s0.watching && s0.pod_id) podInput.value = s0.pod_id;
-  if (opts.pod_id) podInput.value = opts.pod_id;
+  void loadPods((s0 && s0.watching && s0.pod_id) || opts.pod_id);
 
   render();
 
