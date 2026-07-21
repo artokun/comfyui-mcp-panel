@@ -970,8 +970,10 @@ function applyTabBadge() {
     icon.classList.remove("cmcp-tab-logo", "pi-comments");
     icon.classList.add("pi-spinner", "pi-spin", "cmcp-tab-spinner");
   } else {
-    icon.classList.remove("pi-spinner", "pi-spin", "cmcp-tab-spinner", "pi-comments");
-    icon.classList.add("cmcp-tab-logo");
+    // Back to the chat bubble. `cmcp-tab-logo` is still stripped here so an icon
+    // left masked by an older build recovers on the next repaint.
+    icon.classList.remove("pi-spinner", "pi-spin", "cmcp-tab-spinner", "cmcp-tab-logo");
+    icon.classList.add("pi-comments");
   }
   const btn = icon.closest("button") || icon.parentElement;
   if (!btn) return;
@@ -7325,8 +7327,10 @@ const PANEL_CSS = `
   padding: 0.75rem 1rem;
   border-bottom: 1px solid var(--p-content-border-color, #3f3f46);
 }
-.cmcp-logo { width: 20px; height: 20px; flex: none; border-radius: 4px; object-fit: contain; display: block; }
-.cmcp-title { font-size: 0.9375rem; font-weight: 600; }
+/* The wordmark is ~5.9:1, so pin the HEIGHT and let width follow — the old
+   square 20x20 rule would squash it. max-width keeps it from crowding the
+   header actions on a narrow sidebar. */
+.cmcp-logo { height: 20px; width: auto; max-width: 148px; flex: none; object-fit: contain; display: block; }
 .cmcp-status { display: flex; align-items: center; gap: 0.375rem; margin-left: auto;
   font-size: 0.6875rem; color: var(--p-text-muted-color, #a1a1aa); }
 .cmcp-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--p-red-400, #f87171); flex: none; }
@@ -8343,9 +8347,11 @@ function buildPanel() {
   // it works regardless of where the extension is mounted.
   const logo = document.createElement("img");
   logo.className = "cmcp-logo";
-  logo.alt = "";
-  logo.setAttribute("aria-hidden", "true");
-  const LOGO_SERVED_PATH = "/extensions/comfyui-mcp-panel/img/comfyui-mcp-logo.png";
+  // The wordmark carries the product name, so it IS the header's label — the
+  // separate "Agent" text that used to sit beside it was redundant and is gone.
+  // Keep it announced for screen readers rather than aria-hidden.
+  logo.alt = "comfyui-mcp";
+  const LOGO_SERVED_PATH = "/extensions/comfyui-mcp-panel/img/comfyui-mcp-wordmark.svg";
   // A 404 on the module-resolved URL must also recover — not just a URL()
   // construction failure. Fall back to the served path once (a flag prevents an
   // error loop if the served path itself 404s) (P2 c).
@@ -8355,14 +8361,11 @@ function buildPanel() {
     logo.src = LOGO_SERVED_PATH;
   });
   try {
-    logo.src = new URL("../img/comfyui-mcp-logo.png", import.meta.url).href;
+    logo.src = new URL("../img/comfyui-mcp-wordmark.svg", import.meta.url).href;
   } catch {
     logo.dataset.fellBack = "1";
     logo.src = LOGO_SERVED_PATH;
   }
-  const title = document.createElement("span");
-  title.className = "cmcp-title";
-  title.textContent = "Agent";
   const status = document.createElement("button");
   status.type = "button";
   status.className = "cmcp-status cmcp-status-btn";
@@ -8410,7 +8413,7 @@ function buildPanel() {
   const histPop = document.createElement("div");
   histPop.className = "cmcp-popover cmcp-popover--down";
   histPop.hidden = true;
-  header.append(logo, title, actions, status, histPop);
+  header.append(logo, actions, status, histPop);
   root.appendChild(header);
 
   // ── Utility strip (row 2): agent-feed gates now live here instead of
@@ -14740,10 +14743,11 @@ function registerExtensionWhenReady(tries = 0) {
       const tabSpec = {
         id: tabId,
         title: "Agent",
-        // Our own logo mark (CSS mask, currentColor) — same mark as the
-        // registry icon and mobile app, so every surface shows one identity.
-        // `pi` keeps PrimeIcon box sizing; the mask class paints the glyph.
-        icon: "pi cmcp-tab-logo",
+        // The chat bubble. The sidebar rail is a row of FUNCTION glyphs (assets,
+        // nodes, models, workflows…), so a brand mark there reads as decoration
+        // and doesn't say what the tab does — brand belongs in the panel header,
+        // which is where the wordmark now lives.
+        icon: "pi pi-comments",
         tooltip: "ComfyUI Agent Panel — your agent session's window into this graph",
         type: "custom",
         // KEEP-ALIVE: the panel (bridge client, agent session, chat DOM) is built
