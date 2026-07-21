@@ -4,7 +4,8 @@ import test from 'node:test'
 import {
   isThreadInScope,
   normalizedWorkflowPath,
-  shouldForkEmbeddedWorkflowUuid
+  shouldForkEmbeddedWorkflowUuid,
+  workflowAliasForPath
 } from '../../web/js/lib/workflow-chat-identity.js'
 
 test('normalizes Windows paths for stable identity comparisons', () => {
@@ -51,6 +52,13 @@ test('keeps the canonical path when stale aliases still mention the same UUID', 
       'workflows/current.json': 'same-uuid'
     }
   }), false)
+})
+
+test('reuses the path alias minted for an unsaved fork after a browser restart', () => {
+  assert.equal(workflowAliasForPath({
+    'workflows/original.json': 'embedded-original',
+    'Workflows\\Copy.JSON': 'stable-fork'
+  }, 'workflows/copy.json'), 'stable-fork')
 })
 
 test('scope guard authorizes only an exact workflow UUID key', () => {

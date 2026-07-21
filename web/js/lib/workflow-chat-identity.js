@@ -1,7 +1,17 @@
 // Pure workflow transcript-identity rules shared by the panel and unit tests.
 
 export function normalizedWorkflowPath(path) {
-  return typeof path === "string" ? path.replaceAll("\\", "/").toLocaleLowerCase() : null;
+  return typeof path === "string" ? path.replaceAll("\\", "/").toLowerCase() : null;
+}
+
+/** Resolve a persisted path alias without making identity locale-dependent. */
+export function workflowAliasForPath(aliases, path) {
+  const normalized = normalizedWorkflowPath(path);
+  if (!normalized) return null;
+  const match = Object.entries(aliases || {}).find(
+    ([knownPath]) => normalizedWorkflowPath(knownPath) === normalized,
+  );
+  return typeof match?.[1] === "string" && match[1] ? match[1] : null;
 }
 
 /** Return true when an embedded UUID belongs to a different workflow file.

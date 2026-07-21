@@ -70,6 +70,7 @@ import {
   isThreadInScope,
   normalizedWorkflowPath,
   shouldForkEmbeddedWorkflowUuid,
+  workflowAliasForPath,
 } from "./lib/workflow-chat-identity.js";
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
 import { openCivitaiModal } from "./cmcp-civitai-ui.js";
@@ -721,6 +722,25 @@ function persistWorkflowAliases() {
   }
 }
 
+function workflowUuidOwner(id) {
+  const stored = _workflowUuidOwners.get(id);
+  const owner = stored && typeof stored.deref === "function" ? stored.deref() ?? null : stored ?? null;
+  if (!owner) _workflowUuidOwners.delete(id);
+  return owner;
+}
+
+function rememberWorkflowUuidOwner(id, owner) {
+  _workflowUuidOwners.set(id, typeof WeakRef === "function" ? new WeakRef(owner) : owner);
+  // WeakRef is unavailable only on older embedded browsers. Keep that fallback
+  // bounded rather than retaining every workflow object for the life of the page.
+  if (typeof WeakRef !== "function" && _workflowUuidOwners.size > 64) {
+    for (const key of _workflowUuidOwners.keys()) {
+      if (key !== id) _workflowUuidOwners.delete(key);
+      if (_workflowUuidOwners.size <= 64) break;
+    }
+  }
+}
+
 /** Stable transcript identity, deliberately separate from workflowTabId(): the
  *  latter is bridge routing, while this UUID follows a workflow across rename.
  *  Copies carrying the same embedded UUID get a fresh identity when opened as a
@@ -732,9 +752,10 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
   const objectUuid = _workflowObjectUuids.get(identityObject);
   const embedded = embeddedWorkflowUuid(wf);
   const embeddedPath = embeddedWorkflowPath(wf);
-  let id = objectUuid || embedded || (path ? _workflowUuidAliases[path] : null) || crypto.randomUUID();
+  const pathAlias = workflowAliasForPath(_workflowUuidAliases, path);
+  let id = objectUuid || embedded || pathAlias || crypto.randomUUID();
 
-  const embeddedOwner = embedded ? _workflowUuidOwners.get(embedded) : null;
+  const embeddedOwner = embedded ? workflowUuidOwner(embedded) : null;
   if (!objectUuid && embeddedOwner && embeddedOwner !== identityObject) id = crypto.randomUUID();
   if (
     wf !== currentWorkflowRef &&
@@ -746,11 +767,14 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
       aliases: _workflowUuidAliases,
     })
   ) {
-    id = crypto.randomUUID();
+    // A previously-opened but not-yet-saved copy still carries the source UUID
+    // in its JSON. Its path alias is the durable fork identity until the next
+    // user-initiated save embeds it, so reuse that alias across browser restarts.
+    id = pathAlias && pathAlias !== embedded ? pathAlias : crypto.randomUUID();
   }
 
   _workflowObjectUuids.set(identityObject, id);
-  _workflowUuidOwners.set(id, identityObject);
+  rememberWorkflowUuidOwner(id, identityObject);
   if (objectUuid && path) {
     // Rename/Save-As mutates the same live workflow object. Drop stale aliases
     // so a cold start does not later misclassify the renamed file as a clone.
@@ -770,15 +794,13 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
       const previous = extra?.[WORKFLOW_META_NAMESPACE];
       const pathChanged = path && normalizedWorkflowPath(previous?.[WORKFLOW_PATH_FIELD]) !== normalizedWorkflowPath(path);
       if (extra && (previous?.[WORKFLOW_UUID_FIELD] !== id || pathChanged)) {
-        app?.graph?.beforeChange?.();
+        // Transcript metadata silently rides the next save the user initiates.
+        // It must never create a dirty asterisk or an undo/graph-change entry.
         extra[WORKFLOW_META_NAMESPACE] = {
           ...(previous && typeof previous === "object" ? previous : {}),
           [WORKFLOW_UUID_FIELD]: id,
           ...(path ? { [WORKFLOW_PATH_FIELD]: path } : {}),
         };
-        app?.graph?.afterChange?.();
-        app?.graph?.setDirtyCanvas?.(true, true);
-        try { wf.isModified = true; } catch { /* getter-only on older builds */ }
       }
     } catch {
       // The path alias still makes the identity durable in this browser.
@@ -7915,6 +7937,8 @@ const PANEL_CSS = `
 /* History rows: open button + trash, revealed on hover. */
 .cmcp-hist-row { display: flex; align-items: stretch; gap: 0.125rem; }
 .cmcp-hist-row .cmcp-hist-open { flex: 1 1 auto; min-width: 0; }
+.cmcp-hist-row.foreign-workflow { opacity: 0.48; }
+.cmcp-hist-row.foreign-workflow .cmcp-hist-open { cursor: not-allowed; }
 .cmcp-hist-del {
   flex: none; width: 1.75rem; border: none; background: transparent; cursor: pointer;
   color: var(--p-text-muted-color, #a1a1aa); border-radius: var(--p-border-radius-sm, 4px);
@@ -9999,7 +10023,7 @@ function buildPanel() {
   let thread = null; // created lazily on first recorded message
 
   function currentTranscriptScopeKey({ embed = false } = {}) {
-    return sessionFollowsPanel() ? "panel:global" : workflowStorageKey({ embed });
+    return sessionFollowsPanel() ? workflowTabId() : workflowStorageKey({ embed });
   }
 
   function persistThreads() {
@@ -10030,13 +10054,13 @@ function buildPanel() {
   }
 
   function record(entry) {
-    const scopeKey = currentTranscriptScopeKey({ embed: !sessionFollowsPanel() });
+    const perWorkflow = !sessionFollowsPanel();
+    const scopeKey = perWorkflow ? workflowStorageKey({ embed: true }) : workflowTabId();
     // Settings can hydrate after a greeting was painted. Never append a real
     // workflow-scoped message to a thread carrying another scope.
-    if (thread && !sessionFollowsPanel() && !isThreadInScope(thread, scopeKey)) {
+    if (thread && perWorkflow && !isThreadInScope(thread, scopeKey)) {
       thread = null;
       ssSet(CURRENT_THREAD_KEY, null);
-      ssSet(SESSION_KEY, null);
     }
     if (!thread) {
       thread = { id: crypto.randomUUID(), ts: Date.now(), msgs: [], workflowKey: scopeKey };
@@ -11012,8 +11036,7 @@ function buildPanel() {
   }
 
   function loadThread(t) {
-    const scopeKey = currentTranscriptScopeKey();
-    if (!isThreadInScope(t, scopeKey)) {
+    if (!sessionFollowsPanel() && !isThreadInScope(t, workflowStorageKey())) {
       appendSystem("Blocked a chat from another workflow. Open its owning workflow before resuming it.");
       return false;
     }
@@ -11059,7 +11082,6 @@ function buildPanel() {
     const wfid = workflowTabId();
     const wfkey = wf ? (wf.key || wf.id || "unsaved") : null;
     if (wfid === currentWorkflowId) return; // case 1: no change
-    const historyKey = currentTranscriptScopeKey({ embed: !sessionFollowsPanel() });
 
     // PANEL-OWNED SESSION (default): the conversation is the unit of continuity
     // and the workflow is just the canvas target — switching, saving, renaming,
@@ -11076,7 +11098,7 @@ function buildPanel() {
       // tmp→wf adopt bookkeeping (a save gave the unsaved workflow a real id).
       if (wfid.startsWith("wf:") && wf && (wf.key || wf.id)) _tempWorkflowIds.delete(wf.key || wf.id);
       if (thread) {
-        thread.workflowKey = "panel:global";
+        thread.workflowKey = wfid; // thread rides along for archive provenance
         thread.ts = Date.now();
         persistThreads();
       }
@@ -11099,6 +11121,10 @@ function buildPanel() {
       }
       return;
     }
+
+    // Identity is read-only while switching/opening. Embedding happens only on
+    // first record(), and even then silently, so viewing a workflow never dirties it.
+    const historyKey = workflowStorageKey();
 
     const adopting =
       currentWorkflowId &&
@@ -14420,11 +14446,24 @@ function buildPanel() {
     try {
       const cur = ssGet(CURRENT_THREAD_KEY);
       const pointed = cur ? threads.find((x) => x.id === cur) : null;
-      const scopeKey = currentTranscriptScopeKey();
-      if (sessionFollowsPanel() && pointed && pointed.workflowKey !== "panel:global") {
-        pointed.workflowKey = "panel:global";
-        persistThreads();
+      if (sessionFollowsPanel()) {
+        // Main/default behavior: restore the pointed chat exactly as stored.
+        // Settings may not be hydrated yet, so this path must never rewrite keys.
+        if (!pointed || !pointed.msgs?.length) return;
+        thread = pointed;
+        resetFeed();
+        for (const m of pointed.msgs) {
+          if (m.role === "user") paintUser(m.text, { attachments: m.attachments });
+          else if (m.role === "agent") paintAgent(m.text);
+          else if (m.role === "card") {
+            if (m.kind === "a2ui") paintA2UIRecord(m);
+            else paintCard(m);
+          }
+        }
+        renderTodo(pointed.todos || []);
+        return;
       }
+      const scopeKey = workflowStorageKey();
       const scopedPointed = pointed && isThreadInScope(pointed, scopeKey) ? pointed : null;
       const t = scopedPointed || threadForWorkflow(scopeKey);
       if (!t || !t.msgs?.length) return;
