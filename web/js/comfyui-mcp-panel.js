@@ -755,6 +755,30 @@ function agentTabIsActive() {
 let tabBadgeState = "idle";
 let tabBadgeTimer = null;
 
+// The comfyui-mcp logo mark as the tab glyph — a currentColor mask, so it
+// follows the toolbar's active/hover tinting exactly like a PrimeIcon.
+// Geometry is the same two-node mark as assets/icon.png / the docs logo.
+// Injected STANDALONE (not via the panel stylesheet): registerSidebarTab()
+// paints the toolbar icon before the panel's first render, and without this
+// rule the tab glyph would be invisible until the user opened the panel.
+const TAB_LOGO_MASK =
+  "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='84 104 232 192'%3E%3Cg fill='none' stroke='%23000' stroke-width='40' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='140' cy='160' r='36'/%3E%3Ccircle cx='260' cy='240' r='36'/%3E%3Cpath d='M176 160h40a30 30 0 0 1 30 30v14'/%3E%3C/g%3E%3C/svg%3E\") center / contain no-repeat";
+
+function ensureTabIconStyle() {
+  if (document.getElementById("cmcp-tab-icon-style")) return;
+  const tag = document.createElement("style");
+  tag.id = "cmcp-tab-icon-style";
+  tag.textContent = [
+    ".cmcp-tab-logo {",
+    "  display: inline-block; width: 1em; height: 1em; vertical-align: -0.125em;",
+    "  background-color: currentColor;",
+    `  -webkit-mask: ${TAB_LOGO_MASK};`,
+    `  mask: ${TAB_LOGO_MASK};`,
+    "}",
+  ].join("\n");
+  document.head.appendChild(tag);
+}
+
 /** Find our tab's icon element in the sidebar toolbar (never inside the panel
  *  itself — the empty-state also uses pi-comments). Marked with a data attr so
  *  the lookup still works after the "working" state swaps the glyph classes. */
@@ -7649,15 +7673,9 @@ const PANEL_CSS = `
 .cmcp-iconbtn.active { color: var(--p-red-400, #f87171); }
 .cmcp-iconbtn .pi { font-size: 0.875rem; }
 /* ---- sidebar tab badge (these live OUTSIDE .cmcp-root, on the toolbar) ---- */
-/* The comfyui-mcp logo mark as the tab glyph — a currentColor mask, so it
-   follows the toolbar's active/hover tinting exactly like a PrimeIcon. Geometry
-   is the same two-node mark as assets/icon.png / the docs logo. */
-.cmcp-tab-logo {
-  display: inline-block; width: 1em; height: 1em; vertical-align: -0.125em;
-  background-color: currentColor;
-  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='84 104 232 192'%3E%3Cg fill='none' stroke='%23000' stroke-width='40' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='140' cy='160' r='36'/%3E%3Ccircle cx='260' cy='240' r='36'/%3E%3Cpath d='M176 160h40a30 30 0 0 1 30 30v14'/%3E%3C/g%3E%3C/svg%3E") center / contain no-repeat;
-  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='84 104 232 192'%3E%3Cg fill='none' stroke='%23000' stroke-width='40' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='140' cy='160' r='36'/%3E%3Ccircle cx='260' cy='240' r='36'/%3E%3Cpath d='M176 160h40a30 30 0 0 1 30 30v14'/%3E%3C/g%3E%3C/svg%3E") center / contain no-repeat;
-}
+/* (.cmcp-tab-logo — the logo-mark tab glyph — is NOT here: it must exist the
+   moment registerSidebarTab() paints the toolbar, before the panel ever
+   renders, so it's injected standalone by ensureTabIconStyle().) */
 /* Agent working → the tab glyph is a spinner, tinted so it reads as "alive". */
 .cmcp-tab-spinner { color: var(--p-green-400, #4ade80) !important; }
 /* Turn finished while the tab wasn't being viewed → red "unread" dot. */
@@ -14525,6 +14543,9 @@ function registerExtensionWhenReady(tries = 0) {
       // '@comfyorg/extension-api'.
       const mgr = app.extensionManager;
       if (mgr && typeof mgr.registerSidebarTab === "function") {
+        // The logo-mask rule must exist BEFORE the toolbar paints our icon —
+        // the panel stylesheet only loads on first render (codex-review F1).
+        ensureTabIconStyle();
         mgr.registerSidebarTab(tabSpec);
         installSidebarTabGuard(tabId, () => document.querySelector(".cmcp-root"));
       } else {
