@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-agent-panel"
-description = "Autonomous AI agent in the ComfyUI sidebar â€” runs locally on your own Claude OR ChatGPT subscription (no API keys, no extra LLM costs). Pick a provider and the agent drives your live canvas at full parity: add, wire, move and tweak nodes with Ctrl+Z undo, load whole workflows and installer packs in one shot, generate images, video and audio, and run your workflow â€” asking before it spends paid API credits. The sidebar UI for comfyui-mcp, the local-first, agent-native control plane for ComfyUI."
+description = "Autonomous AI agent in the ComfyUI sidebar - local-first, bring any LLM. Run it on your Claude or ChatGPT subscription (no API keys, no extra LLM costs), on a Kimi K3 / GLM / OpenRouter key, or fully offline on free local models via Ollama, LM Studio, or llama.cpp. The agent drives your live canvas at full parity: add, wire, move and tweak nodes with Ctrl+Z undo, load whole workflows and installer packs in one shot, generate images, video and audio, browse CivitAI, and run your workflow - asking before it spends paid API credits. The sidebar UI for comfyui-mcp, the local-first, agent-native control plane for ComfyUI."
 version = "0.9.8"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
