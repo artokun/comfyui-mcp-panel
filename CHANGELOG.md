@@ -6,6 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+- **Chat archive UI** — multiple named or pinned conversations per workflow,
+  workflow-grouped search and filtering, JSON merge import/export, explicit
+  Panel / Workflow / Ask-on-switch scope modes, provider/model metadata, and
+  per-user-message workflow-version context. Missing provider sessions continue
+  from a bounded transcript replay. Portable imports cannot carry foreign
+  sessions, checkpoints, tombstones, or active pointers into local history;
+  provider-mismatched sessions start fresh with bounded transcript hydration.
+  Import is add-only on colliding IDs and fails closed at thread/message caps
+  instead of evicting local history. Materialized metadata maps are bounded, and
+  an IndexedDB outage now warns when the small localStorage shadow is incomplete.
+  Legacy shadow-only transcripts are never silently truncated by those caps.
+
 ## [0.11.0] - 2026-07-22
 
 ### Added

@@ -5,6 +5,7 @@
  */
 import { test, expect } from './fixtures/panelTest'
 import { PanelPage } from './fixtures/PanelPage'
+import { resolveHistoryStoreModuleUrl } from './fixtures/historyStoreModule'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
@@ -46,9 +47,9 @@ test.beforeEach(async ({ context }) => {
   // The target ComfyUI server may have been started before this worktree was
   // created. Route the two reviewed modules from the checked-out source so the
   // browser gate always exercises this commit rather than a stale server copy.
-  await context.route('**/extensions/comfyui-agent-panel/js/comfyui-mcp-panel.js*', (route) =>
+  await context.route(/\/extensions\/[^/]+\/js\/comfyui-mcp-panel\.js(?:\?.*)?$/, (route) =>
     route.fulfill({ contentType: 'text/javascript', body: PANEL_SOURCE }))
-  await context.route('**/extensions/comfyui-agent-panel/js/lib/chat-history-store.js*', (route) =>
+  await context.route(/\/extensions\/[^/]+\/js\/lib\/chat-history-store\.js(?:\?.*)?$/, (route) =>
     route.fulfill({ contentType: 'text/javascript', body: HISTORY_STORE_SOURCE }))
 })
 
@@ -314,28 +315,25 @@ test('panel delete remains final when a stale tab republishes the removed thread
   expect(staleSnapshot.threads?.some((thread: any) => thread.id === removedThreadId)).toBe(true)
 
   await panel.root.getByTitle('Chat history').click()
-  await page.evaluate(() => {
-    const row = Array.from(document.querySelectorAll<HTMLElement>('.cmcp-hist-row'))
-      .find((candidate) => candidate.textContent?.includes('delete me causally'))
-    const button = row?.querySelector<HTMLButtonElement>('.cmcp-hist-del')
-    if (!button) throw new Error('history delete button was not rendered')
-    button.click()
-  })
+  const deletedRow = panel.root.locator('.cmcp-hist-row').filter({ hasText: 'delete me causally' })
+  page.once('dialog', (dialog) => dialog.accept())
+  await deletedRow.getByRole('button', { name: 'Delete this chat' })
+    .evaluate((button: HTMLButtonElement) => button.click())
   await expect.poll(() => page.evaluate(({ snapshotKey }) => {
     const snapshot = JSON.parse(localStorage.getItem(snapshotKey) || '{}')
     return Object.keys(snapshot.meta?.deletedThreads || {})
   }, { snapshotKey: LOCAL_HISTORY_SNAPSHOT_KEY })).toContain(removedThreadId!)
   await expect.poll(() => indexedHasThread(page, removedThreadId!)).toBe(false)
 
-  await staleTab.evaluate(async (snapshot) => {
-    const storeModuleUrl = '/extensions/comfyui-agent-panel/js/lib/chat-history-store.js'
+  const storeModuleUrl = await resolveHistoryStoreModuleUrl(page)
+  await staleTab.evaluate(async ({ snapshot, storeModuleUrl }) => {
     const { ChatHistoryStore } = await import(storeModuleUrl)
     const staleStore = new ChatHistoryStore({ writerId: 'stale-panel-test' })
     staleStore.persist(snapshot.threads || [], snapshot.meta || {})
     const result = await staleStore.flush()
     if (result !== true && result?.ok !== true) throw new Error(`stale write failed: ${JSON.stringify(result)}`)
     await staleStore.close?.()
-  }, staleSnapshot)
+  }, { snapshot: staleSnapshot, storeModuleUrl })
 
   await page.reload()
   await panel.openSidebar()
@@ -368,8 +366,8 @@ test('clear all removes durable transcripts, preserves workflow identity, and fe
   // Workflow aliases are durable identity metadata, not chat content. Seed one
   // through the public store API so clearAll must preserve it while advancing
   // the canonical checkpoint that fences stale transcript snapshots.
-  await page.evaluate(async ({ path, uuid }) => {
-    const storeModuleUrl = '/extensions/comfyui-agent-panel/js/lib/chat-history-store.js'
+  const storeModuleUrl = await resolveHistoryStoreModuleUrl(page)
+  await page.evaluate(async ({ path, uuid, storeModuleUrl }) => {
     const { ChatHistoryStore, updateMetadataEntry } = await import(storeModuleUrl)
     const seedStore = new ChatHistoryStore({ writerId: 'clear-all-alias-seed' })
     const canonical = await seedStore.readCanonical()
@@ -387,7 +385,7 @@ test('clear all removes durable transcripts, preserves workflow identity, and fe
       throw new Error(`alias seed failed: ${JSON.stringify(result)}`)
     }
     await seedStore.close?.()
-  }, { path: workflowPath, uuid: workflowUuid })
+  }, { path: workflowPath, uuid: workflowUuid, storeModuleUrl })
   await expect.poll(() => indexedWorkflowAlias(page, workflowPath)).toBe(workflowUuid)
 
   const staleTab = await context.newPage()
@@ -423,8 +421,7 @@ test('clear all removes durable transcripts, preserves workflow identity, and fe
 
   // A tab that captured the pre-reset snapshot must not resurrect any deleted
   // transcript, but it must continue to converge on the preserved alias.
-  await staleTab.evaluate(async (snapshot) => {
-    const storeModuleUrl = '/extensions/comfyui-agent-panel/js/lib/chat-history-store.js'
+  await staleTab.evaluate(async ({ snapshot, storeModuleUrl }) => {
     const { ChatHistoryStore } = await import(storeModuleUrl)
     const staleStore = new ChatHistoryStore({ writerId: 'stale-clear-all-panel' })
     staleStore.persist(snapshot.threads || [], snapshot.meta || {})
@@ -433,7 +430,7 @@ test('clear all removes durable transcripts, preserves workflow identity, and fe
       throw new Error(`stale write failed: ${JSON.stringify(result)}`)
     }
     await staleStore.close?.()
-  }, staleSnapshot)
+  }, { snapshot: staleSnapshot, storeModuleUrl })
 
   await expect.poll(() => indexedThreadCount(page)).toBe(0)
   await expect.poll(() => indexedWorkflowAlias(page, workflowPath)).toBe(workflowUuid)
