@@ -1,10 +1,14 @@
-// LoRA Training modal — a navigable COMING-SOON preview, parity with the
-// mobile app's Training tab. Everything is intentionally inert placeholder
-// UI: six training flows as cards (base-model dropdown + description), all
-// badged "Coming soon", under a Local/Cloud switch previewing the two
-// backends we plan to support (this rig vs a RunPod pod managed headlessly by
-// our own trainer, built by decoding how Ostris' AI Toolkit drives the
-// process). Same overlay treatment as the CivitAI browser modal.
+// LoRA Training modal — the panel's dataset-gather → label → launch → monitor
+// wizard for the local trainer (ai-toolkit in a GPU Docker container, driven by
+// the comfyui-mcp train_* tools). Parity target for the mobile app's Training
+// tab; the Character card is functional (FLUX.1-dev), the rest are P2 previews.
+//
+// Backend channels (both already existed):
+//  - ctx.callTool(tool, args, {timeout}) — cid-correlated call_tool over the
+//    orchestrator bridge (train_* tools; whitelisted server-side).
+//  - /comfyui_mcp_panel/training/* — same-origin py routes for structured
+//    output listing, image-ref → absolute-path resolution, and serving
+//    training-sample images from the rig's training root.
 
 let cssInjected = false;
 function injectCss() {
@@ -12,12 +16,15 @@ function injectCss() {
   cssInjected = true;
   const style = document.createElement("style");
   style.textContent = `
-    /* Same containment as the CivitAI modal: fixed-height flex column with
-       overflow hidden; only .cmcp-tr-body scrolls, the header/switch stay put. */
-    .cmcp-tr-modal { width: min(92vw, 860px); max-width: none;
-      max-height: min(90vh, 840px); padding: 0; gap: 0; overflow: hidden;
+    /* Self-contained overlay + modal base (the CivitAI modal's .cmcp-cv-overlay
+       styles only exist once that modal has opened, and the base .cmcp-modal is
+       a narrow confirm-dialog — neither can be relied on here). */
+    .cmcp-cv-overlay { position: fixed; inset: 0; z-index: 10000; display: flex;
+      align-items: center; justify-content: center; padding: 1.5rem; background: rgba(0,0,0,.6); }
+    .cmcp-modal.cmcp-tr-modal { width: min(94vw, 960px); max-width: none;
+      max-height: min(92vh, 880px); padding: 0; gap: 0; overflow: hidden;
       display: flex; flex-direction: column; }
-    .cmcp-tr-body { flex: 1; overflow-y: auto; min-height: 0; }
+    .cmcp-tr-body { flex: 1; overflow-y: auto; min-height: 0; padding-bottom: 1rem; }
     .cmcp-tr-head { display:flex; align-items:center; gap:.75rem; padding:1rem 1.25rem .5rem;
       border-bottom: 1px solid var(--p-content-border-color, #3f3f46); }
     .cmcp-tr-head h2 { margin:0; font-size:1.05rem; flex:1; }
@@ -26,30 +33,79 @@ function injectCss() {
     .cmcp-tr-seg { display:flex; gap:0; margin:.75rem 1.25rem; border:1px solid var(--p-surface-500,#555); border-radius:999px; overflow:hidden; width:fit-content; flex:none; }
     .cmcp-tr-seg button { border:none; background:transparent; color:inherit; padding:.4rem .9rem; cursor:pointer; font-size:.85rem; display:flex; align-items:center; gap:.4rem; }
     .cmcp-tr-seg button.active { background: var(--p-surface-700,#3f3f46); }
-    .cmcp-tr-token { margin:0 1.25rem .75rem; display:flex; flex-direction:column; gap:.25rem; }
-    .cmcp-tr-token input { background:var(--p-surface-800,#27272a); border:1px solid var(--p-surface-600,#52525b); border-radius:8px; padding:.5rem .75rem; color:inherit; opacity:.55; }
-    .cmcp-tr-token small { opacity:.6; }
     .cmcp-tr-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:.75rem; padding:0 1.25rem 1rem; }
     @media (max-width: 640px) { .cmcp-tr-grid { grid-template-columns:repeat(2,1fr); } }
     .cmcp-tr-card { background:var(--p-surface-800,#27272a); border:1px solid var(--p-surface-600,#3f3f46); border-radius:12px; padding:.75rem; display:flex; flex-direction:column; gap:.45rem; }
+    .cmcp-tr-card.active { border-color: var(--p-primary-color,#94a3b8); }
     .cmcp-tr-icon { aspect-ratio:1.6; border-radius:10px; background:color-mix(in srgb, currentColor 8%, transparent); display:flex; align-items:center; justify-content:center; font-size:1.6rem; opacity:.8; }
     .cmcp-tr-card select { background:var(--p-surface-900,#18181b); color:inherit; border:1px solid var(--p-surface-600,#52525b); border-radius:6px; padding:.25rem .4rem; font-size:.8rem; width:100%; }
     .cmcp-tr-card h3 { margin:0; font-size:.9rem; }
     .cmcp-tr-card p { margin:0; font-size:.78rem; opacity:.65; line-height:1.35; flex:1; }
     .cmcp-tr-badge { align-self:flex-start; font-size:.72rem; padding:.1rem .5rem; border-radius:999px; background:color-mix(in srgb, currentColor 10%, transparent); opacity:.75; }
+    .cmcp-tr-badge.ok { background: color-mix(in srgb, #22c55e 18%, transparent); opacity:1; }
+    .cmcp-tr-badge.err { background: color-mix(in srgb, #ef4444 18%, transparent); opacity:1; }
+    .cmcp-tr-badge.warn { background: color-mix(in srgb, #eab308 18%, transparent); opacity:1; }
     .cmcp-tr-foot { padding:0 1.25rem 1rem; font-size:.8rem; opacity:.55; }
+    .cmcp-tr-section { padding: .25rem 1.25rem; display:flex; flex-direction:column; gap:.6rem; }
+    .cmcp-tr-row { display:flex; gap:.6rem; align-items:center; flex-wrap:wrap; }
+    .cmcp-tr-row > label { font-size:.8rem; opacity:.75; min-width:6.5rem; }
+    .cmcp-tr-input, .cmcp-tr-section input[type=text], .cmcp-tr-section input[type=number] {
+      background:var(--p-surface-800,#27272a); border:1px solid var(--p-surface-600,#52525b);
+      border-radius:8px; padding:.45rem .7rem; color:inherit; font-size:.85rem; flex:1; min-width:0; }
+    .cmcp-tr-hint { font-size:.75rem; opacity:.55; margin:0; }
+    .cmcp-tr-btn { background:var(--p-surface-700,#3f3f46); border:1px solid var(--p-surface-600,#52525b);
+      color:inherit; border-radius:8px; padding:.45rem .9rem; cursor:pointer; font-size:.85rem; }
+    .cmcp-tr-btn:hover { filter:brightness(1.2); }
+    .cmcp-tr-btn:disabled { opacity:.45; cursor:not-allowed; }
+    .cmcp-tr-btn.primary { background:var(--p-primary-color,#64748b); border-color:transparent; color:#fff; }
+    .cmcp-tr-btn.danger { background: color-mix(in srgb, #ef4444 25%, transparent); }
+    .cmcp-tr-pickgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(96px,1fr)); gap:.5rem; max-height:38vh; overflow-y:auto; padding:.25rem; }
+    .cmcp-tr-pick { position:relative; aspect-ratio:1; border-radius:8px; overflow:hidden; cursor:pointer; border:2px solid transparent; background:var(--p-surface-900,#18181b); }
+    .cmcp-tr-pick img { width:100%; height:100%; object-fit:cover; display:block; }
+    .cmcp-tr-pick.sel { border-color: var(--p-primary-color,#94a3b8); }
+    .cmcp-tr-pick .mark { position:absolute; top:4px; right:4px; background:rgba(0,0,0,.65); border-radius:999px; width:20px; height:20px; display:flex; align-items:center; justify-content:center; font-size:.7rem; }
+    .cmcp-tr-pick.sel .mark { background:var(--p-primary-color,#64748b); color:#fff; }
+    .cmcp-tr-drop { border:2px dashed var(--p-surface-600,#52525b); border-radius:12px; padding:1.5rem; text-align:center; opacity:.8; cursor:pointer; }
+    .cmcp-tr-drop.over { border-color: var(--p-primary-color,#94a3b8); opacity:1; }
+    .cmcp-tr-tray { display:flex; gap:.4rem; flex-wrap:wrap; }
+    .cmcp-tr-chip { position:relative; width:44px; height:44px; border-radius:6px; background-size:cover; background-position:center; }
+    .cmcp-tr-chip button { position:absolute; top:-6px; right:-6px; width:16px; height:16px; border-radius:999px; border:none; background:#ef4444; color:#fff; font-size:.65rem; line-height:1; cursor:pointer; }
+    .cmcp-tr-labelgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:.75rem; }
+    .cmcp-tr-labelitem { background:var(--p-surface-800,#27272a); border-radius:10px; padding:.5rem; display:flex; flex-direction:column; gap:.4rem; }
+    .cmcp-tr-labelitem .thumb { aspect-ratio:1; border-radius:8px; background-size:cover; background-position:center; }
+    .cmcp-tr-labelitem textarea { background:var(--p-surface-900,#18181b); border:1px solid var(--p-surface-600,#52525b); border-radius:6px; color:inherit; font-size:.78rem; padding:.35rem .5rem; resize:vertical; min-height:2.6rem; width:100%; box-sizing:border-box; }
+    .cmcp-tr-steps { display:flex; gap:.35rem; margin:.6rem 1.25rem 0; flex:none; }
+    .cmcp-tr-steps span { font-size:.72rem; padding:.15rem .6rem; border-radius:999px; background:color-mix(in srgb, currentColor 8%, transparent); opacity:.55; }
+    .cmcp-tr-steps span.on { opacity:1; background:var(--p-surface-700,#3f3f46); }
+    .cmcp-tr-progress { height:10px; border-radius:999px; background:var(--p-surface-800,#27272a); overflow:hidden; }
+    .cmcp-tr-progress > div { height:100%; background:var(--p-primary-color,#64748b); transition:width .4s; }
+    .cmcp-tr-log { background:var(--p-surface-900,#18181b); border-radius:8px; padding:.5rem .7rem; font-family:monospace; font-size:.72rem; max-height:140px; overflow-y:auto; white-space:pre-wrap; word-break:break-all; opacity:.85; }
+    .cmcp-tr-samples { display:flex; gap:.5rem; flex-wrap:wrap; }
+    .cmcp-tr-samples img { width:120px; height:120px; object-fit:cover; border-radius:8px; cursor:pointer; }
+    .cmcp-tr-jobrow { display:flex; align-items:center; gap:.6rem; padding:.5rem .25rem; border-bottom:1px solid var(--p-surface-700,#3f3f46); cursor:pointer; }
+    .cmcp-tr-jobrow:hover { background:color-mix(in srgb, currentColor 4%, transparent); }
+    .cmcp-tr-jobrow .name { flex:1; font-size:.85rem; }
+    .cmcp-tr-jobrow .meta { font-size:.75rem; opacity:.6; }
+    .cmcp-tr-preflight { display:flex; gap:1rem; flex-wrap:wrap; font-size:.78rem; }
+    .cmcp-tr-preflight span b { font-weight:600; }
   `;
   document.head.appendChild(style);
 }
 
 const FLOWS = [
-  { title: "Image Character", icon: "pi-user", models: ["Krea2", "Flux2", "ZImg"], desc: "Train a person or character into an image model." },
+  { title: "Image Character", icon: "pi-user", models: ["FLUX.1-dev"], desc: "Train a person or character into an image model.", live: true },
   { title: "Image Edit", icon: "pi-pencil", models: ["Qwen Edit 2509"], desc: "Teach an edit model your custom transformation." },
   { title: "Image Style", icon: "pi-palette", models: ["Krea2", "Flux2", "ZImg"], desc: "Capture an art style you can apply to any prompt." },
   { title: "Image Slider", icon: "pi-sliders-h", models: ["Krea2", "Flux2", "ZImg"], desc: "A concept slider with adjustable strength." },
   { title: "Video Character", icon: "pi-video", models: ["LTX 2.3", "Wan 2.2"], desc: "Bring a character into video generation." },
   { title: "Video Action", icon: "pi-forward", models: ["LTX 2.3", "Wan 2.2"], desc: "Teach a motion or action to a video model." },
 ];
+
+const PRESETS = {
+  smoke: { label: "Smoke test", params: { steps: 200, saveEvery: 100, sampleEvery: 100, resolution: [512] }, note: "~10 min on a 4090 — proves the pipeline, not a usable LoRA." },
+  standard: { label: "Standard", params: { steps: 2000, lr: 1e-4, rank: 16, resolution: [512, 768, 1024], saveEvery: 250, sampleEvery: 250, quantize: true }, note: "~1–2 h on a 4090. The real thing." },
+  custom: { label: "Custom", params: null, note: "Edit every parameter yourself." },
+};
 
 /** The rig's GPU ("RTX 4090 24GB") from ComfyUI's /system_stats — the panel
  *  runs on the ComfyUI origin, so this always reaches the right instance. */
@@ -73,94 +129,949 @@ async function fetchGpuLabel(api) {
   }
 }
 
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+/** callTool envelope → parsed JSON (train_* tools return text-wrapped JSON). */
+async function callJson(ctx, tool, args, opts) {
+  if (!ctx.callTool) throw new Error("panel bridge not connected — start the comfyui-mcp orchestrator");
+  const res = await ctx.callTool(tool, args, opts);
+  const text = (res?.result || []).map((c) => c?.text || "").join("").trim();
+  if (!res || res.ok === false) {
+    // The bridge flags MCP errors with ok:false but KEEPS the tool's own
+    // content — prefer the actionable tool message (JSON error, root message,
+    // or plain text) over the generic bridge one (codex finding).
+    let msg = res?.error || `${tool} failed`;
+    if (text) {
+      try {
+        const errData = JSON.parse(text);
+        if (errData?.error?.message) msg = errData.error.message;
+        else if (errData?.message) msg = errData.message;
+        else msg = text;
+      } catch {
+        msg = text; // plain-text tool error (e.g. dataset rejection)
+      }
+    }
+    throw new Error(msg);
+  }
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`${tool} returned unexpected output`);
+  }
+  if (data && data.ok === false) {
+    throw new Error(data.error?.message || `${tool} failed`);
+  }
+  return data;
+}
+
+function apiUrl(ctx, path) {
+  // Route through ComfyUI's API base (supports non-root base-path deployments);
+  // fall back to root-relative when the api helper isn't around (codex finding).
+  try {
+    if (ctx.api?.apiURL) return ctx.api.apiURL(path);
+  } catch { /* fall through */ }
+  return path;
+}
+
+async function apiFetch(ctx, path, opts) {
+  if (ctx.api?.fetchApi) return ctx.api.fetchApi(path, opts);
+  return fetch(apiUrl(ctx, path), opts);
+}
+
+function viewUrl(ctx, ref) {
+  const q = new URLSearchParams({ filename: ref.filename, type: ref.type || "output" });
+  if (ref.subfolder) q.set("subfolder", ref.subfolder);
+  return apiUrl(ctx, `/view?${q.toString()}`);
+}
+
+function sampleUrl(ctx, path) {
+  return apiUrl(ctx, `/comfyui_mcp_panel/training/file?path=${encodeURIComponent(path)}`);
+}
+
+function sanitizeNameClient(name) {
+  const cleaned = String(name || "").trim().replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
+  // Dot-only names ("."/"..") fall back server-side ("dataset"/"lora") — reject
+  // them here so the launched name can't silently diverge from the reviewed one.
+  if (!cleaned || /^\.+$/.test(cleaned)) return "";
+  return cleaned;
+}
+
+function fmtAgo(iso) {
+  const t = Date.parse(iso || "");
+  if (!t) return "";
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 60) return `${Math.floor(s)}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+const STATUS_BADGE = { running: "ok", queued: "warn", completed: "ok", failed: "err", cancelled: "warn" };
+
 export function openTrainingModal(ctx = {}) {
   injectCss();
   const overlay = document.createElement("div");
   overlay.className = "cmcp-cv-overlay";
   const modal = document.createElement("div");
   modal.className = "cmcp-modal cmcp-tr-modal";
-  const close = () => overlay.remove();
+
+  let pollTimer = null;
+  let pollGen = 0;
+  let closed = false;
+  const stopPolling = () => {
+    pollGen++; // invalidate any in-flight poll response
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  };
+  const close = () => {
+    closed = true;
+    stopPolling();
+    wiz.launchGen++; // a pending launch's continuation self-discards (codex finding)
+    wiz.uploadGen++;
+    overlay.remove();
+  };
   overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
 
-  const head = document.createElement("div");
-  head.className = "cmcp-tr-head";
-  const title = document.createElement("h2");
-  title.textContent = "LoRA Training";
-  const badge = document.createElement("span");
-  badge.className = "cmcp-tr-badge";
-  badge.textContent = "Coming soon";
-  const closeBtn = document.createElement("button");
-  closeBtn.className = "cmcp-tr-close";
+  // Wizard state (one character-LoRA job being configured/tracked). Held at
+  // modal scope so it survives view navigation: launching/uploadsPending MUST
+  // outlive individual renders (codex findings: double-launch via Back, stale
+  // upload tracking across gather re-entry).
+  const wiz = {
+    datasetName: "",
+    trigger: "",
+    images: [], // { ref: {filename, subfolder, type}, thumb, caption }
+    preset: "standard",
+    params: { ...PRESETS.standard.params },
+    customParams: undefined,
+    jobId: null,
+    job: null,
+    launching: false,
+    launchError: null,
+    uploadsPending: 0,
+    /** Generations: bumped on launch/reset so a stale async continuation (an
+     *  in-flight launch or upload batch from a PREVIOUS wizard run) can't
+     *  mutate the new run's state (codex findings). */
+    launchGen: 0,
+    uploadGen: 0,
+  };
+  /** Reset the configuration fields for a genuinely NEW run (Jobs → "New
+   *  character LoRA") — a fresh run must not silently reuse the previous
+   *  dataset (codex finding). Bumps both generations so stale continuations
+   *  self-discard. REFUSED while a launch is in flight: the backend may still
+   *  start that container, and resetting would orphan it from this modal
+   *  (and invite a second GPU job alongside it). */
+  function resetWizardConfig() {
+    if (wiz.launching) return false;
+    wiz.datasetName = "";
+    wiz.trigger = "";
+    wiz.images = [];
+    wiz.preset = "standard";
+    wiz.params = { ...PRESETS.standard.params };
+    wiz.customParams = undefined;
+    wiz.jobId = null;
+    wiz.job = null;
+    wiz.launchError = null;
+    wiz.uploadsPending = 0;
+    wiz.launchGen++;
+    wiz.uploadGen++;
+    return true;
+  }
+
+  const head = el("div", "cmcp-tr-head");
+  const title = el("h2", null, "LoRA Training");
+  const jobsBtn = el("button", "cmcp-tr-btn", "Jobs");
+  jobsBtn.style.flex = "none";
+  const closeBtn = el("button", "cmcp-tr-close");
   closeBtn.innerHTML = "&#10005;";
   closeBtn.title = "Close";
   closeBtn.onclick = close;
-  head.append(title, badge, closeBtn);
+  head.append(title, jobsBtn, closeBtn);
 
-  // Local / Cloud switch — cosmetic for now; Local shows the REAL GPU.
-  const seg = document.createElement("div");
-  seg.className = "cmcp-tr-seg";
-  const localBtn = document.createElement("button");
-  localBtn.className = "active";
-  localBtn.textContent = "Local (your rig)";
-  const cloudBtn = document.createElement("button");
-  cloudBtn.textContent = "Cloud (RunPod)";
-  seg.append(localBtn, cloudBtn);
-  fetchGpuLabel(ctx.api).then((gpu) => {
-    if (gpu) localBtn.textContent = `Local (${gpu})`;
-  });
-
-  const token = document.createElement("div");
-  token.className = "cmcp-tr-token";
-  token.hidden = true;
-  const tokenInput = document.createElement("input");
-  tokenInput.type = "password";
-  tokenInput.placeholder = "RunPod API token";
-  tokenInput.disabled = true;
-  const tokenNote = document.createElement("small");
-  tokenNote.textContent = "Coming soon — pods and training runs managed for you, headlessly.";
-  token.append(tokenInput, tokenNote);
-
-  localBtn.onclick = () => { localBtn.classList.add("active"); cloudBtn.classList.remove("active"); token.hidden = true; };
-  cloudBtn.onclick = () => { cloudBtn.classList.add("active"); localBtn.classList.remove("active"); token.hidden = false; };
-
-  const grid = document.createElement("div");
-  grid.className = "cmcp-tr-grid";
-  for (const f of FLOWS) {
-    const card = document.createElement("div");
-    card.className = "cmcp-tr-card";
-    const icon = document.createElement("div");
-    icon.className = "cmcp-tr-icon";
-    const i = document.createElement("i");
-    i.className = `pi ${f.icon}`;
-    icon.appendChild(i);
-    const select = document.createElement("select");
-    for (const m of f.models) {
-      const o = document.createElement("option");
-      o.textContent = m;
-      select.appendChild(o);
-    }
-    const h = document.createElement("h3");
-    h.textContent = f.title;
-    const p = document.createElement("p");
-    p.textContent = f.desc;
-    const b = document.createElement("span");
-    b.className = "cmcp-tr-badge";
-    b.textContent = "Coming soon";
-    card.append(icon, select, h, p, b);
-    grid.appendChild(card);
-  }
-
-  const foot = document.createElement("div");
-  foot.className = "cmcp-tr-foot";
-  foot.textContent = "LoRA training is on the roadmap — nothing here works yet.";
-
-  // Scroll containment (CivitAI-modal structure): head + switch stay fixed;
-  // the card grid scrolls inside the body.
-  const body = document.createElement("div");
-  body.className = "cmcp-tr-body";
-  body.append(grid, foot);
-  modal.append(head, seg, token, body);
+  const stepsBar = el("div", "cmcp-tr-steps");
+  const body = el("div", "cmcp-tr-body");
+  modal.append(head, stepsBar, body);
   overlay.appendChild(modal);
   document.body.appendChild(overlay);
+
+  function setSteps(names, current) {
+    stepsBar.textContent = "";
+    stepsBar.style.display = names ? "" : "none";
+    (names || []).forEach((n, i) => {
+      const s = el("span", i === current ? "on" : null, n);
+      stepsBar.appendChild(s);
+    });
+  }
+
+  let currentView = "flows";
+  function show(view) {
+    if (closed) return;
+    currentView = view;
+    stopPolling();
+    body.textContent = "";
+    if (view === "flows") { setSteps(null); renderFlows(); }
+    else if (view === "jobs") { setSteps(null); renderJobs(); }
+    else if (view === "wizard-1") { setSteps(["1 · Dataset", "2 · Label", "3 · Launch", "4 · Monitor"], 0); renderGather(); }
+    else if (view === "wizard-2") { setSteps(["1 · Dataset", "2 · Label", "3 · Launch", "4 · Monitor"], 1); renderLabel(); }
+    else if (view === "wizard-3") { setSteps(["1 · Dataset", "2 · Label", "3 · Launch", "4 · Monitor"], 2); renderLaunch(); }
+    else if (view === "wizard-4") { setSteps(["1 · Dataset", "2 · Label", "3 · Launch", "4 · Monitor"], 3); renderMonitor(); }
+  }
+
+  jobsBtn.onclick = () => show("jobs");
+
+  // ---------------------------------------------------------------- flows ---
+  function renderFlows() {
+    const grid = el("div", "cmcp-tr-grid");
+    for (const f of FLOWS) {
+      const card = el("div", `cmcp-tr-card${f.live ? " active" : ""}`);
+      const icon = el("div", "cmcp-tr-icon");
+      const i = el("i", `pi ${f.icon}`);
+      icon.appendChild(i);
+      const select = document.createElement("select");
+      for (const m of f.models) {
+        const o = document.createElement("option");
+        o.textContent = m;
+        select.appendChild(o);
+      }
+      if (f.live) select.disabled = true;
+      const h = el("h3", null, f.title);
+      const p = el("p", null, f.desc);
+      if (f.live) {
+        const b = el("span", "cmcp-tr-badge ok", "Local · ready");
+        const start = el("button", "cmcp-tr-btn primary", "Start");
+        start.onclick = () => {
+          if (!resetWizardConfig()) { alert("A launch is still in flight — let it settle (or cancel it from Jobs) before starting a new run."); return; }
+          show("wizard-1");
+        };
+        card.append(icon, select, h, p, b, start);
+      } else {
+        const b = el("span", "cmcp-tr-badge", "Coming soon (P2)");
+        card.append(icon, select, h, p, b);
+      }
+      grid.appendChild(card);
+    }
+    const foot = el("div", "cmcp-tr-foot",
+      "Character LoRAs train locally on this rig (ai-toolkit in a GPU container, FLUX.1-dev). Style / edit / slider / video flows land in P2; RunPod in P4.");
+    body.append(grid, foot);
+  }
+
+  // --------------------------------------------------------------- gather ---
+  let backendChecked = false;
+  let backendCapable = false;
+  /** One-time capability gate: train_* tools only exist on an orchestrator
+   *  running the trainer release (mcp PR #237+). Older orchestrators reject
+   *  call_tool — detect that at wizard entry instead of letting the user walk
+   *  into a doomed launch (codex finding). */
+  async function checkBackendCapable() {
+    if (backendChecked) return backendCapable;
+    try {
+      await callJson(ctx, "train_list_flows", {}, { timeout: 15000 });
+      backendCapable = true;
+    } catch {
+      backendCapable = false;
+    }
+    backendChecked = true;
+    return backendCapable;
+  }
+
+  function renderGather() {
+    const sec = el("div", "cmcp-tr-section");
+    // Capability gate (async): swap in a blocking notice when the orchestrator
+    // predates the trainer.
+    checkBackendCapable().then((capable) => {
+      syncNext();
+      if (capable) return;
+      sec.textContent = "";
+      const card = el("div", "cmcp-tr-card");
+      card.append(el("h3", null, "Trainer backend not available"));
+      card.append(el("p", null,
+        "The connected orchestrator doesn't expose the train_* tools — it needs to run the comfyui-mcp release that includes the LoRA trainer (PR #237 or later), and the panel's bridge must point at it. Upgrade/restart the orchestrator, then reopen this wizard."));
+      const back2 = el("button", "cmcp-tr-btn", "← Flows");
+      back2.onclick = () => show("flows");
+      card.append(back2);
+      sec.appendChild(card);
+    });
+
+    const nameRow = el("div", "cmcp-tr-row");
+    nameRow.append(el("label", null, "Dataset name"));
+    const nameInput = el("input", null);
+    nameInput.type = "text";
+    nameInput.placeholder = "e.g. aria_character";
+    nameInput.value = wiz.datasetName;
+    nameInput.oninput = () => { wiz.datasetName = nameInput.value; syncNext(); };
+    nameRow.appendChild(nameInput);
+
+    const trigRow = el("div", "cmcp-tr-row");
+    trigRow.append(el("label", null, "Trigger word"));
+    const trigInput = el("input", null);
+    trigInput.type = "text";
+    trigInput.placeholder = "e.g. ohwx — a rare token, not a real word";
+    trigInput.value = wiz.trigger;
+    trigInput.oninput = () => { wiz.trigger = trigInput.value.trim(); };
+    trigRow.appendChild(trigInput);
+    sec.append(nameRow, trigRow, el("p", "cmcp-tr-hint",
+      "10–30 varied images of the subject work best (angles, lighting, backgrounds). The trigger word goes in every caption."));
+
+    // Source tabs.
+    const tabs = el("div", "cmcp-tr-seg");
+    tabs.style.margin = "0";
+    const outTab = el("button", "active", "From outputs");
+    const upTab = el("button", null, "Upload");
+    tabs.append(outTab, upTab);
+    const tabBody = el("div");
+    sec.append(tabs, tabBody);
+
+    // Selection tray.
+    const trayLabel = el("p", "cmcp-tr-hint");
+    const tray = el("div", "cmcp-tr-tray");
+    const nav = el("div", "cmcp-tr-row");
+    nav.style.marginTop = ".4rem";
+    const back = el("button", "cmcp-tr-btn", "← Flows");
+    back.onclick = () => show("flows");
+    const next = el("button", "cmcp-tr-btn primary", "Next: label captions →");
+    next.onclick = () => show("wizard-2");
+    nav.append(back, next);
+    sec.append(trayLabel, tray, nav);
+    body.appendChild(sec);
+
+    function syncTray() {
+      trayLabel.textContent = wiz.images.length
+        ? `${wiz.images.length} selected${wiz.images.length < 6 ? " — add more for a usable LoRA (10–30 recommended)" : ""}`
+        : "Nothing selected yet.";
+      tray.textContent = "";
+      wiz.images.forEach((img, idx) => {
+        const chip = el("div", "cmcp-tr-chip");
+        chip.style.backgroundImage = `url("${img.thumb}")`;
+        const x = el("button", null, "×");
+        x.title = "Remove";
+        x.onclick = () => { wiz.images.splice(idx, 1); syncTray(); syncNext(); if (refreshGridSel) refreshGridSel(); };
+        chip.appendChild(x);
+        tray.appendChild(chip);
+      });
+    }
+
+    function syncNext() {
+      // Also gated on the backend capability check: until train_list_flows
+      // resolves, advancing is blocked (codex finding: the gate was bypassable
+      // while pending).
+      next.disabled = !backendCapable || wiz.uploadsPending > 0 || !(wiz.images.length >= 1 && sanitizeNameClient(wiz.datasetName));
+      next.title = !backendCapable && !backendChecked ? "Checking trainer backend…"
+        : wiz.uploadsPending > 0 ? `Waiting for ${wiz.uploadsPending} upload(s)…` : "";
+    }
+
+    // Outputs tab.
+    let refreshGridSel = null;
+    async function renderOutputs() {
+      tabBody.textContent = "";
+      const filterRow = el("div", "cmcp-tr-row");
+      const filter = el("input", null);
+      filter.type = "text";
+      filter.placeholder = "Filter by filename…";
+      filterRow.appendChild(filter);
+      const grid = el("div", "cmcp-tr-pickgrid");
+      const status = el("p", "cmcp-tr-hint", "Loading recent outputs…");
+      tabBody.append(filterRow, status, grid);
+      let images = [];
+      try {
+        const res = await apiFetch(ctx, "/comfyui_mcp_panel/training/list-outputs?limit=120");
+        const data = await res.json();
+        images = data.images || [];
+        status.textContent = images.length ? "" : "No output images found — generate something first, or use Upload.";
+      } catch (e) {
+        status.textContent = `Could not list outputs: ${e.message || e}`;
+        return;
+      }
+      const isSel = (img) => wiz.images.some((w) => w.ref.filename === img.filename && (w.ref.subfolder || "") === (img.subfolder || "") && w.ref.type === "output");
+      function paint() {
+        grid.textContent = "";
+        const pat = filter.value.trim().toLowerCase();
+        for (const img of images) {
+          if (pat && !img.filename.toLowerCase().includes(pat)) continue;
+          const cell = el("div", "cmcp-tr-pick");
+          const url = viewUrl(ctx, { filename: img.filename, subfolder: img.subfolder, type: "output" });
+          // <img loading=lazy> — CSS backgrounds would eagerly decode ALL ~120
+          // full-res outputs at once (codex finding: hundreds of MB, stalled modal).
+          const thumb = document.createElement("img");
+          thumb.loading = "lazy";
+          thumb.src = url;
+          thumb.alt = img.filename;
+          cell.appendChild(thumb);
+          if (isSel(img)) cell.classList.add("sel");
+          const mark = el("div", "mark", isSel(img) ? "✓" : "+");
+          cell.appendChild(mark);
+          cell.title = img.subfolder ? `${img.subfolder}/${img.filename}` : img.filename;
+          cell.onclick = () => {
+            const at = wiz.images.findIndex((w) => w.ref.filename === img.filename && (w.ref.subfolder || "") === (img.subfolder || "") && w.ref.type === "output");
+            if (at >= 0) wiz.images.splice(at, 1);
+            else wiz.images.push({ ref: { filename: img.filename, subfolder: img.subfolder || undefined, type: "output" }, thumb: url, caption: "" });
+            syncTray(); syncNext(); paint();
+          };
+          grid.appendChild(cell);
+        }
+        refreshGridSel = paint;
+      }
+      filter.oninput = paint;
+      paint();
+    }
+
+    // Upload tab.
+    function renderUpload() {
+      tabBody.textContent = "";
+      const drop = el("div", "cmcp-tr-drop", "Drop images here, or click to browse");
+      const picker = document.createElement("input");
+      picker.type = "file";
+      picker.accept = "image/png,image/jpeg,image/webp";
+      picker.multiple = true;
+      picker.style.display = "none";
+      const status = el("p", "cmcp-tr-hint");
+      tabBody.append(drop, picker, status);
+      // Per-file upload deadline. uploadBlobToInput has no abort path (it
+      // swallows errors and returns null, but a request that never settles
+      // hangs its promise forever) — so race it against a timer. Without this,
+      // ONE hung upload left uploadsPending > 0 permanently and deadlocked
+      // wizard navigation (codex finding). A late success after the timeout is
+      // simply discarded — the file is reported failed and can be re-added.
+      const UPLOAD_TIMEOUT_MS = 30000;
+      function withTimeout(promise, ms, label) {
+        return new Promise((resolve, reject) => {
+          const t = setTimeout(() => reject(new Error(`timed out after ${Math.round(ms / 1000)}s: ${label}`)), ms);
+          promise.then(
+            (v) => { clearTimeout(t); resolve(v); },
+            (e) => { clearTimeout(t); reject(e); },
+          );
+        });
+      }
+      // Magic-byte sniff: the extension regex alone happily uploads any file
+      // renamed to .png (codex finding). Cheap 12-byte header check for the
+      // three accepted formats; on read failure fall back to trusting the
+      // extension (sniffing is a guard, not a gate on flaky File APIs).
+      async function looksLikeImage(f) {
+        try {
+          const b = new Uint8Array(await f.slice(0, 12).arrayBuffer());
+          const png = b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47;
+          const jpg = b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
+          const webp = b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46
+            && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50;
+          return png || jpg || webp;
+        } catch {
+          return true;
+        }
+      }
+      async function addFiles(files) {
+        if (!ctx.uploadBlobToInput) { status.textContent = "Upload unavailable (no bridge helper)."; return; }
+        // Track the batch: Next stays disabled until every upload settles, so a
+        // user can't advance mid-batch and silently lose/re-caption the files
+        // still in flight (codex finding).
+        const batch = files.filter((f) => /\.(png|jpe?g|webp)$/i.test(f.name));
+        const skipped = files.length - batch.length;
+        const failed = [];
+        const notImage = [];
+        const gen = wiz.uploadGen;
+        wiz.uploadsPending += batch.length;
+        syncNext();
+        for (const f of batch) {
+          status.textContent = `Uploading ${f.name}… (${wiz.images.length} added)`;
+          try {
+            if (!(await looksLikeImage(f))) { notImage.push(f.name); continue; }
+            const ref = await withTimeout(
+              ctx.uploadBlobToInput(f, f.name.replace(/[^a-zA-Z0-9._-]+/g, "_")),
+              UPLOAD_TIMEOUT_MS,
+              f.name,
+            );
+            if (gen !== wiz.uploadGen) return; // wizard was reset mid-batch — discard
+            if (!ref) { failed.push(f.name); continue; }
+            wiz.images.push({ ref: { filename: ref.filename, subfolder: ref.subfolder, type: "input" }, thumb: viewUrl(ctx, { ...ref, type: "input" }), caption: "" });
+          } catch {
+            // Timeout (or an unexpected reject) — record and MOVE ON so the
+            // rest of the batch still uploads and the pending count settles.
+            if (gen !== wiz.uploadGen) return;
+            failed.push(f.name);
+          } finally {
+            // Only settle the counter when the batch still belongs to the
+            // current wizard run (a reset zeroed it already).
+            if (gen === wiz.uploadGen) wiz.uploadsPending -= 1;
+            syncTray(); syncNext();
+          }
+        }
+        // Batch summary PERSISTS (codex finding: per-file errors were cleared
+        // by the next success, hiding an incomplete dataset).
+        const parts = [];
+        if (skipped) parts.push(`${skipped} skipped (png/jpg/webp only)`);
+        if (notImage.length) parts.push(`${notImage.length} skipped (not a real png/jpg/webp): ${notImage.join(", ")}`);
+        if (failed.length) parts.push(`${failed.length} FAILED: ${failed.join(", ")}`);
+        status.textContent = parts.join(" · ");
+        status.style.color = failed.length || notImage.length ? "#ef4444" : "";
+      }
+      drop.onclick = () => picker.click();
+      picker.onchange = () => addFiles([...picker.files]);
+      drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
+      drop.ondragleave = () => drop.classList.remove("over");
+      drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); addFiles([...e.dataTransfer.files]); };
+    }
+
+    outTab.onclick = () => { outTab.classList.add("active"); upTab.classList.remove("active"); renderOutputs(); };
+    upTab.onclick = () => { upTab.classList.add("active"); outTab.classList.remove("active"); renderUpload(); };
+    renderOutputs();
+    syncTray();
+    syncNext();
+  }
+
+  // ---------------------------------------------------------------- label ---
+  function renderLabel() {
+    const sec = el("div", "cmcp-tr-section");
+    const bulk = el("div", "cmcp-tr-row");
+    const prefixBtn = el("button", "cmcp-tr-btn", `Prefix "${wiz.trigger || "trigger"}" to all`);
+    prefixBtn.onclick = () => {
+      const t = wiz.trigger.trim();
+      if (!t) return;
+      wiz.images.forEach((img) => {
+        const c = img.caption.trim();
+        if (!c) img.caption = t;
+        else if (!c.toLowerCase().startsWith(t.toLowerCase())) img.caption = `${t} ${c}`;
+      });
+      paint();
+    };
+    const applyAllBtn = el("button", "cmcp-tr-btn", "Apply first caption to all");
+    applyAllBtn.onclick = () => {
+      const first = (wiz.images[0]?.caption || "").trim();
+      if (!first) return;
+      wiz.images.forEach((img) => { img.caption = first; });
+      paint();
+    };
+    const clearBtn = el("button", "cmcp-tr-btn", "Clear all");
+    clearBtn.onclick = () => { wiz.images.forEach((img) => { img.caption = ""; }); paint(); };
+    bulk.append(prefixBtn, applyAllBtn, clearBtn);
+    const countHint = el("p", "cmcp-tr-hint");
+    const grid = el("div", "cmcp-tr-labelgrid");
+    const nav = el("div", "cmcp-tr-row");
+    const back = el("button", "cmcp-tr-btn", "← Dataset");
+    back.onclick = () => show("wizard-1");
+    const next = el("button", "cmcp-tr-btn primary", "Next: review & launch →");
+    next.onclick = () => show("wizard-3");
+    nav.append(back, next);
+    sec.append(bulk, countHint, grid, nav);
+    body.appendChild(sec);
+
+    function syncHint() {
+      const captioned = wiz.images.filter((i) => i.caption.trim()).length;
+      countHint.textContent = `${captioned}/${wiz.images.length} captioned — caption what CHANGES between images (pose, setting, clothing); the trigger word covers identity. Empty captions fall back to the trigger word.`;
+    }
+    function paint() {
+      grid.textContent = "";
+      wiz.images.forEach((img) => {
+        const item = el("div", "cmcp-tr-labelitem");
+        const thumb = el("div", "thumb");
+        thumb.style.backgroundImage = `url("${img.thumb}")`;
+        const ta = document.createElement("textarea");
+        ta.placeholder = wiz.trigger ? `${wiz.trigger} …` : "caption…";
+        ta.value = img.caption;
+        ta.oninput = () => { img.caption = ta.value; syncHint(); };
+        item.append(thumb, ta);
+        grid.appendChild(item);
+      });
+      syncHint();
+    }
+    paint();
+  }
+
+  // --------------------------------------------------------------- launch ---
+  function renderLaunch() {
+    const sec = el("div", "cmcp-tr-section");
+    const captioned = wiz.images.filter((i) => i.caption.trim()).length;
+    // Live summary (rank updates with preset switches + custom edits).
+    const summaryHint = el("p", "cmcp-tr-hint");
+    const syncSummary = () => {
+      const effRank = wiz.preset === "custom" ? (wiz.customParams?.rank ?? 16) : (PRESETS[wiz.preset].params?.rank ?? 16);
+      summaryHint.textContent = `Dataset "${sanitizeNameClient(wiz.datasetName)}" — ${wiz.images.length} images, ${captioned} with custom captions${wiz.trigger ? `, trigger "${wiz.trigger}"` : ""}. Model: FLUX.1-dev (quantized, rank ${effRank}).`;
+    };
+    syncSummary();
+    sec.append(summaryHint);
+
+    // Presets.
+    const presetSeg = el("div", "cmcp-tr-seg");
+    presetSeg.style.margin = "0";
+    const presetNote = el("p", "cmcp-tr-hint");
+    const customBox = el("div", "cmcp-tr-row");
+    // Initialize visibility from the CURRENT preset and seed fields from the
+    // user's saved custom edits (codex finding: navigating away and back used
+    // to silently reseed defaults and submit them).
+    customBox.style.display = wiz.preset === "custom" ? "" : "none";
+    const customFields = {};
+    // Assigned once the launch button exists (below); persist() calls it during
+    // seeding too, so start with a no-op.
+    let syncLaunchEnabled = () => {};
+    // Strict full-token parsers — parseInt/parseFloat truncate ("2000oops" →
+    // 2000), which would submit a value the user can't see (codex finding).
+    const parseIntStrict = (v) => (/^\d+$/.test(v.trim()) ? parseInt(v.trim(), 10) : NaN);
+    const parseLrStrict = (v) => (/^\d+(\.\d+)?([eE][-+]?\d+)?$/.test(v.trim()) ? parseFloat(v.trim()) : NaN);
+    const parseResStrict = (v) => {
+      const parts = v.split(",").map((s) => s.trim()).filter(Boolean);
+      return parts.length && parts.every((p) => /^\d+$/.test(p) && parseInt(p, 10) > 0) ? parts.map((p) => parseInt(p, 10)) : null;
+    };
+    for (const [key, label] of [["steps", "Steps"], ["lr", "Learning rate"], ["rank", "LoRA rank"], ["resolution", "Resolutions (comma)"]]) {
+      const l = el("label", null, label);
+      l.style.minWidth = "auto";
+      const inp = el("input", null);
+      inp.type = "text";
+      inp.style.flex = "0 1 110px";
+      const saved = wiz.customParams?.[key];
+      inp.value = saved !== undefined
+        ? (key === "resolution" ? saved.join(",") : String(saved))
+        : (key === "resolution" ? "512,768,1024" : String(PRESETS.standard.params[key] ?? ""));
+      customFields[key] = inp;
+      const persist = () => {
+        wiz.customParams = wiz.customParams || {};
+        if (key === "resolution") {
+          const list = parseResStrict(inp.value);
+          if (list) wiz.customParams.resolution = list;
+          else delete wiz.customParams.resolution;
+        } else {
+          const n = key === "lr" ? parseLrStrict(inp.value) : parseIntStrict(inp.value);
+          if (Number.isFinite(n) && n > 0) wiz.customParams[key] = n;
+          else delete wiz.customParams[key];
+        }
+        syncLaunchEnabled();
+      };
+      inp.oninput = () => { persist(); syncSummary(); };
+      persist(); // capture the seeded values too
+      customBox.append(l, inp);
+    }
+    function syncCustomValidity() {
+      // Launch is blocked while a custom field is visibly invalid — submitting a
+      // stale previously-valid value the user no longer sees would silently
+      // change an expensive run (codex finding).
+      if (wiz.preset !== "custom") return true;
+      return ["steps", "lr", "rank"].every((k) => {
+        const n = k === "lr" ? parseLrStrict(customFields[k].value) : parseIntStrict(customFields[k].value);
+        return Number.isFinite(n) && n > 0;
+      }) && !!parseResStrict(customFields.resolution.value);
+    }
+    for (const key of Object.keys(PRESETS)) {
+      const b = el("button", key === wiz.preset ? "active" : null, PRESETS[key].label);
+      b.onclick = () => {
+        wiz.preset = key;
+        [...presetSeg.children].forEach((c) => c.classList.remove("active"));
+        b.classList.add("active");
+        customBox.style.display = key === "custom" ? "" : "none";
+        presetNote.textContent = PRESETS[key].note;
+        // Hidden custom fields can't be invalid — recompute the launch gate
+        // (codex finding: switching off Custom left a stale disable).
+        syncLaunchEnabled();
+        syncSummary();
+      };
+      presetSeg.appendChild(b);
+    }
+    presetNote.textContent = PRESETS[wiz.preset].note;
+    sec.append(presetSeg, presetNote, customBox);
+
+    // Preflight. Launch stays disabled until the doctor resolves — a pending
+    // call that eventually reports a remote (non-local) ComfyUI must not leave
+    // a clickable window for a doomed launch (codex finding).
+    let preflightState = "pending"; // pending | local | remote | failed
+    const pre = el("div", "cmcp-tr-preflight");
+    pre.append(el("span", null, "Preflight: checking…"));
+    sec.append(pre);
+    const gpuLine = el("p", "cmcp-tr-hint");
+    sec.append(gpuLine);
+    fetchGpuLabel(ctx.api).then((gpu) => { if (gpu) gpuLine.textContent = `Local GPU: ${gpu}`; });
+    callJson(ctx, "train_doctor", {}, { timeout: 180000 }).then((d) => {
+      const dd = d.data || {};
+      pre.textContent = "";
+      const mk = (label, ok) => el("span", null, `${label}: `);
+      for (const [label, ok] of [["docker", dd.docker], ["gpu", dd.gpu], ["image", dd.image], ["hf token", dd.hfTokenSet]]) {
+        const s = el("span");
+        s.innerHTML = `${label}: <b style="color:${ok ? "#22c55e" : "#ef4444"}">${ok ? "✓" : "✗"}</b>`;
+        pre.appendChild(s);
+      }
+      (dd.hints || []).forEach((h) => sec.appendChild(el("p", "cmcp-tr-hint", `⚠ ${h}`)));
+      if (dd.localFs === false) {
+        preflightState = "remote";
+        sec.appendChild(el("p", "cmcp-tr-hint",
+          "⚠ The orchestrator targets a REMOTE ComfyUI — dataset staging and the LoRA handoff need a ComfyUI local to the orchestrator's machine; launching from here would fail at staging. Point the orchestrator at this local ComfyUI first."));
+      } else if (!dd.docker || !dd.gpu || !dd.image) {
+        // Missing prerequisites guarantee a rejected/failed run — keep Launch
+        // disabled until the doctor passes (codex finding).
+        preflightState = "prereq";
+      } else {
+        preflightState = "local";
+      }
+      syncLaunchEnabled();
+    }).catch((e) => {
+      // Doctor unreachable/unavailable: train_start does its own docker+image
+      // preflight server-side and reports honestly, so don't block on this.
+      preflightState = "failed";
+      syncLaunchEnabled();
+      pre.textContent = "";
+      pre.appendChild(el("span", null, `Preflight unavailable: ${e.message}`));
+    });
+
+    // Launch.
+    const err = el("p", "cmcp-tr-hint");
+    err.style.color = "#ef4444";
+    // Persisted across renders: a failure that lands while the user is on a
+    // different view is shown when they return here (codex finding).
+    if (wiz.launchError) err.textContent = wiz.launchError;
+    const nav = el("div", "cmcp-tr-row");
+    const back = el("button", "cmcp-tr-btn", "← Label");
+    back.onclick = () => show("wizard-2");
+    const launch = el("button", "cmcp-tr-btn primary", "Launch training");
+    nav.append(back, launch);
+    sec.append(err, nav);
+    body.appendChild(sec);
+
+    syncLaunchEnabled = () => {
+      launch.disabled = wiz.launching || preflightState !== "local" && preflightState !== "failed" || !syncCustomValidity();
+      if (wiz.launching) launch.textContent = "Launching…";
+      else launch.textContent = "Launch training";
+    };
+    syncLaunchEnabled();
+
+    launch.onclick = async () => {
+      err.textContent = "";
+      if (!syncCustomValidity()) {
+        err.textContent = "Fix the custom parameters first — every field needs a positive value.";
+        return;
+      }
+      // Modal-scoped lock: navigating Back/Jobs and returning must NOT allow a
+      // second launch while this one is mid-flight (codex finding).
+      const gen = ++wiz.launchGen;
+      wiz.launching = true;
+      wiz.launchError = null;
+      syncLaunchEnabled();
+      // Snapshot the FULL launch configuration up front (codex finding): the
+      // user can navigate and edit while the async resolve/stage/start is in
+      // flight — the submitted job must be exactly what was reviewed at click
+      // time, not a mix of old paths and new captions/settings.
+      const snapTrigger = wiz.trigger || undefined;
+      const snap = {
+        name: sanitizeNameClient(wiz.datasetName),
+        trigger: snapTrigger,
+        images: wiz.images.map((i) => {
+          let caption = i.caption.trim();
+          // The UI tells users the trigger belongs in EVERY caption — enforce it
+          // at snapshot time too (defaultCaption only covers empty ones, so a
+          // hand-written caption could otherwise omit it and waste a run on a
+          // LoRA unassociated with the token; codex finding).
+          if (caption && snapTrigger && !caption.toLowerCase().startsWith(snapTrigger.toLowerCase())) {
+            caption = `${snapTrigger} ${caption}`;
+          }
+          return { ref: { ...i.ref }, caption: caption || undefined };
+        }),
+        params: wiz.preset === "custom"
+          ? (Object.keys(wiz.customParams || {}).length ? { ...wiz.customParams } : undefined)
+          : { ...PRESETS[wiz.preset].params },
+      };
+      try {
+        // 1) Resolve image refs → host paths.
+        const res = await apiFetch(ctx, "/comfyui_mcp_panel/training/resolve-paths", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ images: snap.images.map((i) => i.ref) }),
+        });
+        const resolved = (await res.json()).paths || [];
+        if (gen !== wiz.launchGen) return; // superseded BEFORE any side effect
+        const bad = resolved.filter((r) => r.error);
+        if (bad.length) throw new Error(`${bad.length} image(s) could not be resolved: ${bad[0].error}`);
+        // 2) Stage dataset.
+        const items = resolved.map((r, i) => ({ path: r.path, caption: snap.images[i].caption }));
+        const prep = await callJson(ctx, "train_prepare_dataset", { name: snap.name, items, defaultCaption: snap.trigger }, { timeout: 60000 });
+        if (gen !== wiz.launchGen) return; // superseded after staging, before launch
+        // 3) Launch.
+        const started = await callJson(ctx, "train_start", {
+          name: snap.name, flow: "character", model: "flux1-dev",
+          datasetPath: prep.datasetPath, trigger: snap.trigger, params: snap.params,
+        }, { timeout: 120000 });
+        if (gen !== wiz.launchGen) return; // a newer launch/reset superseded this one
+        wiz.jobId = started.job.id;
+        wiz.job = started.job;
+        wiz.launching = false;
+        // Success must be VISIBLE: take the user to the new run's monitor
+        // regardless of where they wandered mid-launch (codex finding).
+        show("wizard-4");
+      } catch (e) {
+        if (gen !== wiz.launchGen) return; // stale handler — new run owns the state
+        wiz.launching = false;
+        wiz.launchError = e.message || String(e);
+        // Failures must also be visible when the user left the launch step.
+        if (currentView === "wizard-3") {
+          err.textContent = wiz.launchError;
+        } else {
+          alert(`Training launch failed: ${wiz.launchError}`);
+        }
+        syncLaunchEnabled();
+      }
+    };
+  }
+
+  // -------------------------------------------------------------- monitor ---
+  /** Persistent badge node — updated in place (replaceWith would detach it on
+   *  the first poll and leave every later status invisible; codex finding). */
+  function setBadge(badgeEl, status) {
+    badgeEl.textContent = status;
+    badgeEl.className = `cmcp-tr-badge ${STATUS_BADGE[status] || ""}`;
+  }
+
+  function jobStatusBadge(job) {
+    return el("span", `cmcp-tr-badge ${STATUS_BADGE[job.status] || ""}`, job.status);
+  }
+
+  function renderMonitor() {
+    // Monotonic generation: bumps on every monitor (re)entry AND on stopPolling,
+    // so a slow in-flight response from a previous monitor view is dropped
+    // instead of overwriting the new one (codex finding).
+    const myGen = ++pollGen;
+    const sec = el("div", "cmcp-tr-section");
+    const headRow = el("div", "cmcp-tr-row");
+    const nameEl = el("h3", null, wiz.job?.name || wiz.jobId || "job");
+    nameEl.style.margin = "0";
+    const badge = el("span", "cmcp-tr-badge", "…");
+    headRow.append(nameEl, badge);
+    const barWrap = el("div", "cmcp-tr-progress");
+    const bar = el("div");
+    bar.style.width = "0%";
+    barWrap.appendChild(bar);
+    const statLine = el("p", "cmcp-tr-hint");
+    const samplesLabel = el("p", "cmcp-tr-hint");
+    const samples = el("div", "cmcp-tr-samples");
+    const logBox = el("div", "cmcp-tr-log");
+    const resultBox = el("div", "cmcp-tr-section");
+    resultBox.style.padding = "0";
+    const nav = el("div", "cmcp-tr-row");
+    const cancelBtn = el("button", "cmcp-tr-btn danger", "Cancel run");
+    const jobsNavBtn = el("button", "cmcp-tr-btn", "All jobs");
+    jobsNavBtn.onclick = () => show("jobs");
+    nav.append(cancelBtn, jobsNavBtn);
+    sec.append(headRow, barWrap, statLine, samplesLabel, samples, resultBox, logBox, nav);
+    body.appendChild(sec);
+
+    let lastStep = null;
+    let lastStepAt = null;
+
+    cancelBtn.onclick = async () => {
+      if (!wiz.jobId) return;
+      if (!confirm("Cancel this training run? Saved checkpoints stay in the job's output dir; no LoRA is handed off.")) return;
+      cancelBtn.disabled = true;
+      try {
+        await callJson(ctx, "train_cancel", { id: wiz.jobId }, { timeout: 60000 });
+      } catch (e) {
+        alert(e.message || String(e));
+      } finally {
+        cancelBtn.disabled = false;
+      }
+    };
+
+    async function poll() {
+      if (!wiz.jobId || myGen !== pollGen) return;
+      try {
+        const d = await callJson(ctx, "train_status", { id: wiz.jobId }, { timeout: 30000 });
+        if (myGen !== pollGen) return; // view changed while the request was out
+        const job = d.job;
+        wiz.job = job;
+        setBadge(badge, job.status);
+        const p = job.progress || {};
+        if (p.totalSteps) {
+          const pct = Math.min(100, Math.round(((p.step || 0) / p.totalSteps) * 100));
+          bar.style.width = `${pct}%`;
+          let eta = "";
+          if (p.step !== undefined && lastStep !== null && p.step > lastStep) {
+            const perSec = (Date.now() - lastStepAt) / (p.step - lastStep);
+            const left = Math.round(((p.totalSteps - p.step) * perSec) / 1000);
+            if (left > 5) eta = ` · ~${Math.floor(left / 60)}m${left % 60 ? ` ${left % 60}s` : ""} left`;
+          }
+          if (p.step !== lastStep) { lastStep = p.step; lastStepAt = Date.now(); }
+          statLine.textContent = `step ${p.step ?? "—"}/${p.totalSteps}${p.loss !== undefined ? ` · loss ${Number(p.loss).toFixed(4)}` : ""}${eta} · updated ${fmtAgo(job.updatedAt)}`;
+        } else {
+          statLine.textContent = `${job.status} — model download / dataset caching can take several minutes on first run · updated ${fmtAgo(job.updatedAt)}`;
+        }
+        const s = p.samples || [];
+        if (s.length) {
+          samplesLabel.textContent = "Latest samples:";
+          samples.textContent = "";
+          for (const sp of s) {
+            const img = document.createElement("img");
+            img.src = sampleUrl(ctx, sp);
+            img.onclick = () => window.open(sampleUrl(ctx, sp), "_blank");
+            samples.appendChild(img);
+          }
+        } else {
+          samplesLabel.textContent = job.status === "running" ? "Samples appear here as the run produces them." : "";
+        }
+        logBox.textContent = (job.log || []).slice(-8).join("\n") || "(no log yet)";
+        logBox.scrollTop = logBox.scrollHeight;
+        const terminal = ["completed", "failed", "cancelled"].includes(job.status);
+        cancelBtn.style.display = terminal ? "none" : "";
+        resultBox.textContent = "";
+        if (job.status === "completed") {
+          stopPolling();
+          const card = el("div", "cmcp-tr-card active");
+          card.append(el("h3", null, "LoRA ready ✓"));
+          card.append(el("p", null, `${job.result?.loraRelPath || "copied to models/loras"} — in the LoRA picker now. Load it with LoraLoaderModelOnly on FLUX.1-dev${job.trigger ? ` and prompt with "${job.trigger}"` : ""}.`));
+          resultBox.appendChild(card);
+        } else if (job.status === "failed") {
+          stopPolling();
+          const card = el("div", "cmcp-tr-card");
+          card.append(el("h3", null, "Run failed"));
+          card.append(el("p", null, (job.error || "").slice(0, 600)));
+          resultBox.appendChild(card);
+        } else if (job.status === "cancelled") {
+          stopPolling();
+        }
+      } catch (e) {
+        if (myGen === pollGen) statLine.textContent = `status poll failed (bridge?) — retrying… (${e.message || e})`;
+      } finally {
+        // Chained (never overlapping) scheduling: the next poll starts only
+        // after this one settles — a slow bridge can't stack up requests or
+        // resolve them out of order (codex finding). stopPolling() bumps the
+        // generation, so terminal/navigation paths never reschedule.
+        if (myGen === pollGen) pollTimer = setTimeout(poll, 5000);
+      }
+    }
+    poll();
+  }
+
+  // ----------------------------------------------------------------- jobs ---
+  async function renderJobs() {
+    const sec = el("div", "cmcp-tr-section");
+    const topRow = el("div", "cmcp-tr-row");
+    const newBtn = el("button", "cmcp-tr-btn primary", "New character LoRA");
+    newBtn.onclick = () => {
+      if (!resetWizardConfig()) { alert("A launch is still in flight — let it settle (or cancel it from Jobs) before starting a new run."); return; }
+      show("wizard-1");
+    };
+    topRow.appendChild(newBtn);
+    const list = el("div");
+    list.append(el("p", "cmcp-tr-hint", "Loading jobs…"));
+    sec.append(topRow, list);
+    body.appendChild(sec);
+    let jobs = [];
+    try {
+      const d = await callJson(ctx, "train_status", {}, { timeout: 30000 });
+      jobs = d.jobs || [];
+    } catch (e) {
+      list.textContent = "";
+      list.append(el("p", "cmcp-tr-hint", `Could not load jobs: ${e.message || e}`));
+      return;
+    }
+    list.textContent = "";
+    if (!jobs.length) {
+      list.append(el("p", "cmcp-tr-hint", "No training runs yet."));
+      return;
+    }
+    for (const job of jobs) {
+      const row = el("div", "cmcp-tr-jobrow");
+      const name = el("span", "name", job.name);
+      const meta = el("span", "meta",
+        `${job.model}${job.progress?.totalSteps ? ` · ${job.progress.step ?? 0}/${job.progress.totalSteps}` : ""} · ${fmtAgo(job.createdAt)}`);
+      row.append(name, meta, jobStatusBadge(job));
+      row.onclick = () => { wiz.jobId = job.id; wiz.job = job; show("wizard-4"); };
+      list.appendChild(row);
+    }
+  }
+
+  show("flows");
   return { close };
 }
