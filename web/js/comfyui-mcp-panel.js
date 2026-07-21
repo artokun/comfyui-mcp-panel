@@ -5947,6 +5947,14 @@ const GRAPH_TOOL_EXECUTORS = {
   // whole graph (nodes + groups) into the canvas, draws synchronously, captures,
   // then restores the user's view. Output is capped to ~1600px wide.
   graph_screenshot({ padding } = {}) {
+    // Blind mode withholds ALL pixels from the agent — screenshots included
+    // (issue #90; the comfyui tool server gates its own image tools, this
+    // covers the panel-side capture path).
+    if (AGENT_BLIND) {
+      throw new Error(
+        "Blind mode is ON: screenshots are withheld from the agent. Ask the user to describe the canvas, or to turn Blind off.",
+      );
+    }
     const { graph, canvas } = getGraphCtx();
     const cv = canvas?.canvas;
     const ds = canvas?.ds;
@@ -6827,6 +6835,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // Structured acks (ready / working / options / …). The "ready" ack is sent
       // after the orchestrator has processed hello (resume armed), so it's the
       // reliable signal to send a post-restart resume nudge.
+      if (msg && msg.type === "ack" && msg.kind === "set_content_mode") {
+        try { window.dispatchEvent(new CustomEvent("cmcp:set-content-mode-ack")); } catch {}
+      }
       if (msg && msg.type === "ack") {
         // A "degraded" ack is the orchestrator's OWN handshake: it's alive and
         // attending, but its agent backend can't enumerate models yet (typically
@@ -6897,6 +6908,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
           tab_id: workflowTabId(),
           title: getWorkflowTitle(),
           backend,
+          // Blind content mode (issue #90): the orchestrator spawns this tab's
+          // comfyui tool server with pixel-withholding env when true.
+          blind: AGENT_BLIND,
           ...(comfyuiUrl ? { comfyui_url: comfyuiUrl } : {}),
           ...(resume ? { resume } : {}),
         }),
@@ -9651,7 +9665,34 @@ function buildPanel() {
   // The localStorage key stays "cmcp.muteAgents" so an existing Deafen (né
   // Mute) setting survives this rename.
   deafenBtn.onclick = () => { AGENT_MUTED = !AGENT_MUTED; try { localStorage.setItem("cmcp.muteAgents", AGENT_MUTED ? "1" : "0"); } catch {} reflectFeedGates(); };
-  blindBtn.onclick = () => { AGENT_BLIND = !AGENT_BLIND; try { localStorage.setItem("cmcp.blindAgents", AGENT_BLIND ? "1" : "0"); } catch {} reflectFeedGates(); };
+  let _blindAckPending = null;
+  window.addEventListener("cmcp:set-content-mode-ack", () => {
+    if (_blindAckPending) { clearTimeout(_blindAckPending); _blindAckPending = null; }
+  });
+  blindBtn.onclick = () => {
+    AGENT_BLIND = !AGENT_BLIND;
+    try { localStorage.setItem("cmcp.blindAgents", AGENT_BLIND ? "1" : "0"); } catch {}
+    reflectFeedGates();
+    // Issue #90: Blind must also gate the comfyui MCP's image tools
+    // (get_image/view_image return pixels straight from /view). Tell the
+    // orchestrator so it respawns this tab's tool server with the blind env —
+    // without this the toggle only covered the panel's own image channel.
+    // An OLD orchestrator has no handler and never acks — warn so the user
+    // knows only the legacy panel-feed gating applies (codex-review F4). A
+    // lost frame (socket drop) self-heals on the next hello, which re-seeds
+    // blind and respawns on change.
+    if (_blindAckPending) { clearTimeout(_blindAckPending); _blindAckPending = null; }
+    let sent = false;
+    try { sent = client?.sendFrame?.({ type: "set_content_mode", tab_id: workflowTabId(), blind: AGENT_BLIND }) !== false; } catch {}
+    if (sent) {
+      _blindAckPending = setTimeout(() => {
+        _blindAckPending = null;
+        appendSystem(
+          "⚠️ The orchestrator didn't acknowledge the Blind change — it may predate v0.42.0, where Blind only gates the panel's own image feed (the agent's image tools are NOT gated). Update comfyui-mcp for full enforcement.",
+        );
+      }, 6000);
+    }
+  };
   ring.style.cursor = "pointer"; ring.onclick = deafenBtn.onclick; // clicking the ring toggles deafen
   reflectFeedGates();
 
