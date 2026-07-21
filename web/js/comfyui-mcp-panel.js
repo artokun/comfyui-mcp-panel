@@ -66,6 +66,11 @@ import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
+import {
+  isThreadInScope,
+  normalizedWorkflowPath,
+  shouldForkEmbeddedWorkflowUuid,
+} from "./lib/workflow-chat-identity.js";
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
 import { openCivitaiModal } from "./cmcp-civitai-ui.js";
 import { openTrainingModal } from "./cmcp-training-ui.js";
@@ -638,6 +643,20 @@ function getTabId() {
 // see the workflow-change handler). Falls back to the legacy per-browser-session id
 // when no workflow service is present (headless / odd frontend).
 const _tempWorkflowIds = new Map(); // wf.key -> "tmp:<uuid>"
+const _workflowObjectUuids = new WeakMap();
+const _workflowUuidOwners = new Map();
+const WORKFLOW_UUID_ALIASES_KEY = "comfyui-mcp.panel.workflowUuidAliases";
+const WORKFLOW_META_NAMESPACE = "comfyui_mcp";
+const WORKFLOW_UUID_FIELD = "workflow_uuid";
+const WORKFLOW_PATH_FIELD = "workflow_path";
+let _workflowUuidAliases = (() => {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(WORKFLOW_UUID_ALIASES_KEY) || "{}");
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+})();
 // MODULE-scoped so they survive buildPanel re-mounts (the panel re-mounts on every
 // ComfyUI workflow switch). If these lived in the panel closure, each re-mount would
 // re-seed them to the now-current workflow and defeat change detection.
@@ -658,11 +677,124 @@ function activeWorkflowRef() {
     return null;
   }
 }
+
+function savedWorkflowPath(wf = activeWorkflowRef()) {
+  return wf?.isPersisted === true && wf?.isTemporary !== true && typeof wf.path === "string" && wf.path
+    ? wf.path
+    : null;
+}
+
+function activeWorkflowExtra(wf = activeWorkflowRef(), { create = false } = {}) {
+  try {
+    const root = app?.graph;
+    if (root && typeof root === "object") {
+      if (root.extra && typeof root.extra === "object") return root.extra;
+      if (create) {
+        root.extra = {};
+        return root.extra;
+      }
+    }
+  } catch {
+    // Fall through to workflow-owned metadata variants used by older builds.
+  }
+  const candidate = wf?.extra || wf?.workflow?.extra || wf?.data?.extra;
+  return candidate && typeof candidate === "object" ? candidate : null;
+}
+
+function embeddedWorkflowUuid(wf = activeWorkflowRef()) {
+  const ns = activeWorkflowExtra(wf)?.[WORKFLOW_META_NAMESPACE];
+  const id = ns?.[WORKFLOW_UUID_FIELD];
+  return typeof id === "string" && id ? id : null;
+}
+
+function embeddedWorkflowPath(wf = activeWorkflowRef()) {
+  const ns = activeWorkflowExtra(wf)?.[WORKFLOW_META_NAMESPACE];
+  const path = ns?.[WORKFLOW_PATH_FIELD];
+  return typeof path === "string" && path ? path : null;
+}
+
+function persistWorkflowAliases() {
+  try {
+    window.localStorage.setItem(WORKFLOW_UUID_ALIASES_KEY, JSON.stringify(_workflowUuidAliases));
+  } catch {
+    // The embedded UUID remains authoritative when localStorage is unavailable.
+  }
+}
+
+/** Stable transcript identity, deliberately separate from workflowTabId(): the
+ *  latter is bridge routing, while this UUID follows a workflow across rename.
+ *  Copies carrying the same embedded UUID get a fresh identity when opened as a
+ *  different workflow object/path. */
+function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
+  const identityObject = wf || app?.graph;
+  if (!identityObject || typeof identityObject !== "object") return getTabId();
+  const path = savedWorkflowPath(wf);
+  const objectUuid = _workflowObjectUuids.get(identityObject);
+  const embedded = embeddedWorkflowUuid(wf);
+  const embeddedPath = embeddedWorkflowPath(wf);
+  let id = objectUuid || embedded || (path ? _workflowUuidAliases[path] : null) || crypto.randomUUID();
+
+  const embeddedOwner = embedded ? _workflowUuidOwners.get(embedded) : null;
+  if (!objectUuid && embeddedOwner && embeddedOwner !== identityObject) id = crypto.randomUUID();
+  if (
+    wf !== currentWorkflowRef &&
+    shouldForkEmbeddedWorkflowUuid({
+      objectUuid,
+      embeddedUuid: embedded,
+      embeddedPath,
+      currentPath: path,
+      aliases: _workflowUuidAliases,
+    })
+  ) {
+    id = crypto.randomUUID();
+  }
+
+  _workflowObjectUuids.set(identityObject, id);
+  _workflowUuidOwners.set(id, identityObject);
+  if (objectUuid && path) {
+    // Rename/Save-As mutates the same live workflow object. Drop stale aliases
+    // so a cold start does not later misclassify the renamed file as a clone.
+    for (const [knownPath, knownUuid] of Object.entries(_workflowUuidAliases)) {
+      if (knownUuid === id && normalizedWorkflowPath(knownPath) !== normalizedWorkflowPath(path)) {
+        delete _workflowUuidAliases[knownPath];
+      }
+    }
+  }
+  if (path && _workflowUuidAliases[path] !== id) {
+    _workflowUuidAliases[path] = id;
+    persistWorkflowAliases();
+  }
+  if (embed) {
+    try {
+      const extra = activeWorkflowExtra(wf, { create: true });
+      const previous = extra?.[WORKFLOW_META_NAMESPACE];
+      const pathChanged = path && normalizedWorkflowPath(previous?.[WORKFLOW_PATH_FIELD]) !== normalizedWorkflowPath(path);
+      if (extra && (previous?.[WORKFLOW_UUID_FIELD] !== id || pathChanged)) {
+        app?.graph?.beforeChange?.();
+        extra[WORKFLOW_META_NAMESPACE] = {
+          ...(previous && typeof previous === "object" ? previous : {}),
+          [WORKFLOW_UUID_FIELD]: id,
+          ...(path ? { [WORKFLOW_PATH_FIELD]: path } : {}),
+        };
+        app?.graph?.afterChange?.();
+        app?.graph?.setDirtyCanvas?.(true, true);
+        try { wf.isModified = true; } catch { /* getter-only on older builds */ }
+      }
+    } catch {
+      // The path alias still makes the identity durable in this browser.
+    }
+  }
+  return id;
+}
+
+function workflowStorageKey({ embed = false } = {}) {
+  return `workflow:${workflowStableUuid(activeWorkflowRef(), { embed })}`;
+}
+
 function workflowTabId() {
   const wf = activeWorkflowRef();
   if (!wf) return getTabId();
-  const saved =
-    wf.isPersisted === true && wf.isTemporary !== true && typeof wf.path === "string" && wf.path;
+  const saved = savedWorkflowPath(wf);
   if (saved) return "wf:" + wf.path;
   const k = wf.key || wf.id || "unsaved";
   let id = _tempWorkflowIds.get(k);
@@ -9866,6 +9998,10 @@ function buildPanel() {
   })();
   let thread = null; // created lazily on first recorded message
 
+  function currentTranscriptScopeKey({ embed = false } = {}) {
+    return sessionFollowsPanel() ? "panel:global" : workflowStorageKey({ embed });
+  }
+
   function persistThreads() {
     try {
       window.localStorage.setItem(THREADS_KEY, JSON.stringify(threads.slice(-MAX_THREADS)));
@@ -9874,9 +10010,19 @@ function buildPanel() {
     }
   }
 
-  // Find the (single) thread bound to a workflow id, or null. One conversation per
-  // workflow: newest wins if duplicates ever exist.
+  // Find the (single) thread bound to an exact transcript scope. Old path-keyed
+  // records are adopted only when their path exactly matches the open workflow;
+  // paths never authorize loading after that one-way migration.
   function threadForWorkflow(wfid) {
+    if (wfid.startsWith("workflow:") && !threads.some((candidate) => candidate.workflowKey === wfid)) {
+      const path = savedWorkflowPath();
+      const legacyKey = path ? `wf:${path}` : null;
+      const legacy = legacyKey ? threads.filter((candidate) => candidate.workflowKey === legacyKey) : [];
+      if (legacy.length) {
+        for (const candidate of legacy) candidate.workflowKey = wfid;
+        persistThreads();
+      }
+    }
     for (let i = threads.length - 1; i >= 0; i--) {
       if (threads[i].workflowKey === wfid) return threads[i];
     }
@@ -9884,8 +10030,16 @@ function buildPanel() {
   }
 
   function record(entry) {
+    const scopeKey = currentTranscriptScopeKey({ embed: !sessionFollowsPanel() });
+    // Settings can hydrate after a greeting was painted. Never append a real
+    // workflow-scoped message to a thread carrying another scope.
+    if (thread && !sessionFollowsPanel() && !isThreadInScope(thread, scopeKey)) {
+      thread = null;
+      ssSet(CURRENT_THREAD_KEY, null);
+      ssSet(SESSION_KEY, null);
+    }
     if (!thread) {
-      thread = { id: crypto.randomUUID(), ts: Date.now(), msgs: [], workflowKey: workflowTabId() };
+      thread = { id: crypto.randomUUID(), ts: Date.now(), msgs: [], workflowKey: scopeKey };
       // Adopt any session id the orchestrator has already reported for this tab.
       const sid = ssGet(SESSION_KEY);
       if (sid) thread.sessionId = sid;
@@ -10858,6 +11012,11 @@ function buildPanel() {
   }
 
   function loadThread(t) {
+    const scopeKey = currentTranscriptScopeKey();
+    if (!isThreadInScope(t, scopeKey)) {
+      appendSystem("Blocked a chat from another workflow. Open its owning workflow before resuming it.");
+      return false;
+    }
     thread = t;
     ssSet(CURRENT_THREAD_KEY, t.id);
     resetFeed();
@@ -10875,6 +11034,7 @@ function buildPanel() {
     ssSet(SESSION_KEY, t.sessionId || null);
     if (t.sessionId) client?.sendFrame?.({ type: "resume_session", session_id: t.sessionId });
     else client?.sendFrame?.({ type: "new_session" });
+    return true;
   }
 
   // Per-workflow auto-follow. Called on any workflow change (open/switch/save/rename).
@@ -10899,6 +11059,7 @@ function buildPanel() {
     const wfid = workflowTabId();
     const wfkey = wf ? (wf.key || wf.id || "unsaved") : null;
     if (wfid === currentWorkflowId) return; // case 1: no change
+    const historyKey = currentTranscriptScopeKey({ embed: !sessionFollowsPanel() });
 
     // PANEL-OWNED SESSION (default): the conversation is the unit of continuity
     // and the workflow is just the canvas target — switching, saving, renaming,
@@ -10915,7 +11076,7 @@ function buildPanel() {
       // tmp→wf adopt bookkeeping (a save gave the unsaved workflow a real id).
       if (wfid.startsWith("wf:") && wf && (wf.key || wf.id)) _tempWorkflowIds.delete(wf.key || wf.id);
       if (thread) {
-        thread.workflowKey = wfid; // thread rides along for per-workflow lookups
+        thread.workflowKey = "panel:global";
         thread.ts = Date.now();
         persistThreads();
       }
@@ -10946,8 +11107,7 @@ function buildPanel() {
       currentWorkflowId.startsWith("tmp:") &&
       wfid.startsWith("wf:");
     if (adopting) {
-      const t = threadForWorkflow(currentWorkflowId);
-      if (t) { t.workflowKey = wfid; persistThreads(); } // migrate to the file identity
+      const t = threadForWorkflow(historyKey);
       if (wf && (wf.key || wf.id)) _tempWorkflowIds.delete(wf.key || wf.id);
       currentWorkflowId = wfid;
       currentWorkflowKey = wfkey;
@@ -10968,12 +11128,7 @@ function buildPanel() {
       currentWorkflowId.startsWith("wf:") &&
       wfid.startsWith("wf:");
     if (renaming) {
-      const t = threadForWorkflow(currentWorkflowId);
-      if (t) {
-        t.workflowKey = wfid; // thread follows the workflow to its new path
-        t.ts = Date.now(); // newest-wins lookup must favor the migrated thread over any stray
-        persistThreads();
-      }
+      const t = threadForWorkflow(historyKey);
       currentWorkflowId = wfid;
       currentWorkflowKey = wfkey;
       currentWorkflowRef = wf;
@@ -10984,7 +11139,7 @@ function buildPanel() {
     currentWorkflowId = wfid;
     currentWorkflowKey = wfkey;
     currentWorkflowRef = wf;
-    const existing = threadForWorkflow(wfid);
+    const existing = threadForWorkflow(historyKey);
     // Bind THIS workflow's session BEFORE the re-hello. sendHello() reads
     // SESSION_KEY at hello time for its spawn-time `resume` — re-helloing first
     // carried the PREVIOUS workflow's session id, so a fresh workspace's agent
@@ -11044,7 +11199,14 @@ function buildPanel() {
         day: "numeric",
       });
       item.append(i, lbl, when);
+      const foreignWorkflow = !sessionFollowsPanel() && !isThreadInScope(t, currentTranscriptScopeKey());
+      if (foreignWorkflow) {
+        item.disabled = true;
+        item.title = "Open this chat's workflow before resuming it";
+        row.classList.add("foreign-workflow");
+      }
       item.addEventListener("click", () => {
+        if (foreignWorkflow) return;
         histPop.hidden = true;
         loadThread(t);
       });
@@ -14257,9 +14419,18 @@ function buildPanel() {
   (function restoreLastThread() {
     try {
       const cur = ssGet(CURRENT_THREAD_KEY);
-      const t = cur ? threads.find((x) => x.id === cur) : null;
+      const pointed = cur ? threads.find((x) => x.id === cur) : null;
+      const scopeKey = currentTranscriptScopeKey();
+      if (sessionFollowsPanel() && pointed && pointed.workflowKey !== "panel:global") {
+        pointed.workflowKey = "panel:global";
+        persistThreads();
+      }
+      const scopedPointed = pointed && isThreadInScope(pointed, scopeKey) ? pointed : null;
+      const t = scopedPointed || threadForWorkflow(scopeKey);
       if (!t || !t.msgs?.length) return;
       thread = t;
+      ssSet(CURRENT_THREAD_KEY, t.id);
+      ssSet(SESSION_KEY, t.sessionId || null);
       resetFeed();
       for (const m of t.msgs) {
         if (m.role === "user") paintUser(m.text, { attachments: m.attachments });
