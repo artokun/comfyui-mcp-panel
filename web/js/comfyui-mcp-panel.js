@@ -7202,6 +7202,17 @@ const PANEL_CSS = `
 .cmcp-toolbtn:hover { background: var(--p-surface-700, #3f3f46); color: var(--p-text-color, #fff); }
 .cmcp-toolbtn .pi { font-size: 0.8125rem; }
 .cmcp-toolbtn svg { width: 13px; height: 13px; display: block; }
+/* Icon-only variant (Deafen/Blind): the label span stays in the DOM — state
+   copy still flows into it for screen readers / the find-icon logic — but is
+   visually hidden; tooltips + the ear-slash / eye-slash glyphs and the tint
+   below carry the state for sighted users. */
+.cmcp-toolbtn.cmcp-toolbtn-iconic { padding: 0.25rem 0.375rem; }
+.cmcp-toolbtn.cmcp-toolbtn-iconic span {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
+}
+.cmcp-toolbtn.cmcp-toolbtn-iconic .pi { font-size: 0.9375rem; }
+.cmcp-toolbtn.cmcp-toolbtn-iconic svg { width: 15px; height: 15px; }
 /* Engaged gates get a colored tint so their state is readable at a glance. */
 .cmcp-toolbtn.gate-on-deafen { color: var(--p-red-400, #f87171); }
 .cmcp-toolbtn.gate-on-deafen svg { animation: cmcp-pulse 1s ease-in-out infinite; }
@@ -9643,6 +9654,10 @@ function buildPanel() {
   }
   const deafenBtn = toolbarBtn("pi-volume-up", "Deafen");
   const blindBtn = toolbarBtn("pi-eye", "Blind");
+  // Icon-only (user request): the glyph + tint + tooltip carry the state; the
+  // label span stays in the DOM (visually hidden) for screen readers.
+  deafenBtn.classList.add("cmcp-toolbtn-iconic");
+  blindBtn.classList.add("cmcp-toolbtn-iconic");
   // Ear icon (Lucide-style strokes): the ear is always drawn; the slash strokes
   // toggle for the deafened state (ear vs ear-off).
   let deafenSlash;
