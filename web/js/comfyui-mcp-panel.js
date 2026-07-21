@@ -182,7 +182,8 @@ function cmcpOpenCredentialsFrame(client) {
         <button data-save style="padding:6px 12px;border-radius:4px;cursor:pointer">Save</button>
         <button data-clear title="Remove this key from the orchestrator's store"
                 style="padding:6px 10px;border-radius:4px;cursor:pointer;${s.set ? "" : "display:none"}">Clear</button>
-      </div>`;
+      </div>
+      ${s.help ? `<div data-help style="font-size:11px;opacity:.55;margin-top:4px;line-height:1.45">${esc2(s.help)}</div>` : ""}`;
     const input = r.querySelector("[data-input]");
     const badge = r.querySelector("[data-badge]");
     const btn = r.querySelector("[data-save]");
