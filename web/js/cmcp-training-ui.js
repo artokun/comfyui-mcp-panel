@@ -252,6 +252,8 @@ export function openTrainingModal(ctx = {}) {
     job: null,
     launching: false,
     launchError: null,
+    target: "local",
+    podInfo: null,
     uploadsPending: 0,
     /** Generations: bumped on launch/reset so a stale async continuation (an
      *  in-flight launch or upload batch from a PREVIOUS wizard run) can't
@@ -736,6 +738,30 @@ export function openTrainingModal(ctx = {}) {
     fetchGpuLabel(ctx.api).then((gpu) => { if (gpu) gpuLine.textContent = `Local GPU: ${gpu}`; });
     callJson(ctx, "train_doctor", {}, { timeout: 180000 }).then((d) => {
       const dd = d.data || {};
+      wiz.podInfo = dd.pod && dd.pod.status === "RUNNING" ? dd.pod : null;
+      // Local ⇄ Pod switch — only when a RUNNING pod is connected (connector).
+      if (wiz.podInfo) {
+        const pod = wiz.podInfo;
+        const targetSeg = el("div", "cmcp-tr-seg");
+        targetSeg.style.margin = "0";
+        const localBtn = el("button", wiz.target !== "pod" ? "active" : null, "Local (docker)");
+        const podBtn = el("button", wiz.target === "pod" ? "active" : null, `Pod (${pod.name || pod.id}${pod.gpu ? ` · ${pod.gpu}` : ""})`);
+        if (!pod.ssh) podBtn.title = "pod has no working SSH endpoint";
+        localBtn.onclick = () => { wiz.target = "local"; localBtn.classList.add("active"); podBtn.classList.remove("active"); syncLaunchEnabled(); syncSummary(); };
+        podBtn.onclick = () => {
+          if (!pod.ssh) return;
+          wiz.target = "pod";
+          podBtn.classList.add("active");
+          localBtn.classList.remove("active");
+          syncLaunchEnabled();
+          syncSummary();
+        };
+        targetSeg.append(localBtn, podBtn);
+        pre.before(targetSeg);
+        const podNote = el("p", "cmcp-tr-hint",
+          `Pod training runs ai-toolkit natively ON the pod (no docker there). Fresh pods need a one-time bootstrap (~10 min) — run train_bootstrap (or ask the agent) once; it persists on the pod's volume. The pod bills GPU-time while it's up.`);
+        pre.after(podNote);
+      }
       pre.textContent = "";
       const mk = (label, ok) => el("span", null, `${label}: `);
       for (const [label, ok] of [["docker", dd.docker], ["gpu", dd.gpu], ["image", dd.image], ["hf token", dd.hfTokenSet]]) {
@@ -780,9 +806,14 @@ export function openTrainingModal(ctx = {}) {
     body.appendChild(sec);
 
     syncLaunchEnabled = () => {
-      launch.disabled = wiz.launching || preflightState !== "local" && preflightState !== "failed" || !syncCustomValidity();
+      // Pod target: docker/gpu/image are irrelevant — the gate is a working pod
+      // SSH endpoint (plus the custom-param check).
+      const podReady = wiz.target === "pod" && !!wiz.podInfo?.ssh;
+      launch.disabled = wiz.launching
+        || (wiz.target === "pod" ? !podReady : preflightState !== "local" && preflightState !== "failed")
+        || !syncCustomValidity();
       if (wiz.launching) launch.textContent = "Launching…";
-      else launch.textContent = "Launch training";
+      else launch.textContent = wiz.target === "pod" ? "Launch on pod" : "Launch training";
     };
     syncLaunchEnabled();
 
@@ -840,6 +871,8 @@ export function openTrainingModal(ctx = {}) {
         const started = await callJson(ctx, "train_start", {
           name: snap.name, flow: "character", model: "flux1-dev",
           datasetPath: prep.datasetPath, trigger: snap.trigger, params: snap.params,
+          target: wiz.target,
+          ...(wiz.target === "pod" && wiz.podInfo ? { pod_id: wiz.podInfo.id } : {}),
         }, { timeout: 120000 });
         if (gen !== wiz.launchGen) return; // a newer launch/reset superseded this one
         wiz.jobId = started.job.id;
@@ -872,7 +905,12 @@ export function openTrainingModal(ctx = {}) {
   }
 
   function jobStatusBadge(job) {
-    return el("span", `cmcp-tr-badge ${STATUS_BADGE[job.status] || ""}`, job.status);
+    const b = el("span", `cmcp-tr-badge ${STATUS_BADGE[job.status] || ""}`, job.status);
+    if (job.target === "pod") {
+      b.textContent = `${job.status} · pod`;
+      b.title = "Trained on a RunPod pod";
+    }
+    return b;
   }
 
   function renderMonitor() {
