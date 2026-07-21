@@ -584,6 +584,7 @@ const DEFAULT_BRIDGE_URL_BY_BACKEND = {
   claude: DEFAULT_BRIDGE_URL,
   codex: DEFAULT_BRIDGE_URL,
   gemini: DEFAULT_BRIDGE_URL,
+  antigravity: DEFAULT_BRIDGE_URL,
   grok: DEFAULT_BRIDGE_URL,
   kimi: DEFAULT_BRIDGE_URL,
   moonshot: DEFAULT_BRIDGE_URL,
@@ -1081,6 +1082,7 @@ const SETTING_MODEL = {
   claude: "comfyui-mcp.defaultModel.claude",
   codex: "comfyui-mcp.defaultModel.codex",
   gemini: "comfyui-mcp.defaultModel.gemini",
+  antigravity: "comfyui-mcp.defaultModel.antigravity",
   grok: "comfyui-mcp.defaultModel.grok",
   kimi: "comfyui-mcp.defaultModel.kimi",
   moonshot: "comfyui-mcp.defaultModel.moonshot",
@@ -1094,6 +1096,7 @@ const SETTING_EFFORT = {
   claude: "comfyui-mcp.defaultEffort.claude",
   codex: "comfyui-mcp.defaultEffort.codex",
   gemini: "comfyui-mcp.defaultEffort.gemini",
+  antigravity: "comfyui-mcp.defaultEffort.antigravity",
   grok: "comfyui-mcp.defaultEffort.grok",
   kimi: "comfyui-mcp.defaultEffort.kimi",
   moonshot: "comfyui-mcp.defaultEffort.moonshot",
@@ -1115,6 +1118,7 @@ const SETTING_BRIDGE_URL = {
   claude: "comfyui-mcp.bridgeUrl.claude",
   codex: "comfyui-mcp.bridgeUrl.codex",
   gemini: "comfyui-mcp.bridgeUrl.gemini",
+  antigravity: "comfyui-mcp.bridgeUrl.antigravity",
   grok: "comfyui-mcp.bridgeUrl.grok",
   kimi: "comfyui-mcp.bridgeUrl.kimi",
   moonshot: "comfyui-mcp.bridgeUrl.moonshot",
@@ -1178,10 +1182,10 @@ const SETTINGS_SEEDED_KEY = "comfyui-mcp.panel.settingsSeeded";
 // per-backend groups (runs independently of SETTINGS_SEEDED_KEY).
 const SETTINGS_GROUPS_MIGRATED_KEY = "comfyui-mcp.panel.settingsGroupsMigrated";
 // Section (sub-category) labels for the grouped Settings dialog, per backend.
-const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)", gemini: "Gemini", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", ollama: "Ollama (local)", openrouter: "OpenRouter", lmstudio: "LM Studio (local)", llamacpp: "llama.cpp (local)", custom: "Custom endpoint" };
+const BACKEND_SECTION = { claude: "Claude", codex: "ChatGPT (Codex)", gemini: "Gemini", antigravity: "Antigravity (Google)", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", ollama: "Ollama (local)", openrouter: "OpenRouter", lmstudio: "LM Studio (local)", llamacpp: "llama.cpp (local)", custom: "Custom endpoint" };
 // Backend display names at module scope (the Settings dialog's render-fns live
 // outside buildPanel's closure, so they need their own copy).
-const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint" };
+const BACKEND_TEXT = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", antigravity: "Antigravity", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint" };
 // The allowlisted secure-store keys (mirrors the orchestrator's #59 allowlist).
 const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
 
@@ -1227,7 +1231,7 @@ const settingsBackendState = {
 // render-fns when the dialog opens, so a freshly-arrived catalog can repaint the
 // matching backend's dropdown in place (a render-fn setting has no static options
 // to re-key). Keyed by backend; null when that group isn't mounted.
-const settingsModelSelectEls = { claude: null, codex: null, gemini: null, grok: null, kimi: null, moonshot: null, ollama: null, openrouter: null, lmstudio: null, llamacpp: null, custom: null };
+const settingsModelSelectEls = { claude: null, codex: null, gemini: null, antigravity: null, grok: null, kimi: null, moonshot: null, ollama: null, openrouter: null, lmstudio: null, llamacpp: null, custom: null };
 // Disabled placeholder <option> value — mapped to "" (Auto) if ever selected so
 // it can never persist as a bogus model id.
 const SETTINGS_PLACEHOLDER = "__cmcp_placeholder__";
@@ -1239,7 +1243,7 @@ function currentSettingsBackend() {
   const b = getSetting(SETTING_BACKEND);
   // Every selectable backend counts — this list lagging a provider addition
   // silently stops that provider's Settings edits from driving the live panel.
-  return ["codex", "gemini", "grok", "kimi", "moonshot", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"].includes(b) ? b : "claude";
+  return ["codex", "gemini", "antigravity", "grok", "kimi", "moonshot", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"].includes(b) ? b : "claude";
 }
 /** Fetched model rows for `backend` (the same presentable catalog the composer
  *  picker uses), or null when none is cached (backend never connected this session). */
@@ -1691,6 +1695,7 @@ function panelSettingsList() {
         { value: "claude", text: "Claude" },
         { value: "codex", text: "ChatGPT" },
         { value: "gemini", text: "Gemini" },
+        { value: "antigravity", text: "Antigravity (Google subscription)" },
         { value: "grok", text: "Grok" },
         { value: "kimi", text: "Kimi" },
         { value: "moonshot", text: "Kimi K3" },
@@ -1885,6 +1890,9 @@ function panelSettingsList() {
     // ---- Gemini (Default model, Default reasoning effort) ----
     modelSetting("gemini", 90),
     effortSetting("gemini", 85),
+    // ---- Antigravity (Google) (Default model; no effort scale, like Gemini) ----
+    modelSetting("antigravity", 84),
+    effortSetting("antigravity", 82),
     // ---- Grok (Default model, Default reasoning effort) ----
     modelSetting("grok", 80),
     effortSetting("grok", 75),
@@ -2022,6 +2030,9 @@ const BACKEND_EFFORTS = {
   // Luna tops out at max; the intersection in effortsForModel handles that).
   codex: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
   gemini: [],
+  // Antigravity drives Google's agy CLI like gemini — no user-facing
+  // reasoning-effort scale; the orchestrator maps effort server-side.
+  antigravity: [],
   // Grok rides the ACP CLI like gemini — no user-facing reasoning-effort scale.
   grok: [],
   kimi: [],
@@ -6744,13 +6755,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   // `codex app-server` cold-starts much slower than Claude's Agent SDK, so it gets
   // ~3x the window. This is the escalation THRESHOLD only — the respawn/reclaim
   // BOUNDS (MAX_AUTO_RESPAWNS / MAX_AUTO_RECLAIMS) are untouched.
-  const RESPAWN_AFTER_BY_BACKEND = { codex: 6, gemini: 6, grok: 6, kimi: 6, moonshot: 6, ollama: 6, claude: 2 };
+  const RESPAWN_AFTER_BY_BACKEND = { codex: 6, gemini: 6, antigravity: 6, grok: 6, kimi: 6, moonshot: 6, ollama: 6, claude: 2 };
   function respawnAfterAttempts() {
     return RESPAWN_AFTER_BY_BACKEND[backendNow()] ?? 2;
   }
   // Failed (re)connect attempts ridden out as a steady "connecting" before a
   // terminal "disconnected". Backend-aware, ~3x for Codex's slower cold start.
-  const CONNECT_PATIENCE_BY_BACKEND = { codex: 12, gemini: 12, grok: 12, kimi: 12, moonshot: 12, ollama: 12, claude: 4 };
+  const CONNECT_PATIENCE_BY_BACKEND = { codex: 12, gemini: 12, antigravity: 12, grok: 12, kimi: 12, moonshot: 12, ollama: 12, claude: 4 };
   function connectPatienceAttempts() {
     return CONNECT_PATIENCE_BY_BACKEND[backendNow()] ?? 4;
   }
@@ -6765,7 +6776,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
   // so it gets a wider window before we treat the open socket as wedged (FIX 2).
   // Ollama gets the long handshake too: a cold model load into VRAM can take
   // tens of seconds before the first token.
-  const HANDSHAKE_MS_BY_BACKEND = { codex: 45000, gemini: 45000, grok: 45000, kimi: 45000, moonshot: 45000, ollama: 45000, claude: 20000 };
+  const HANDSHAKE_MS_BY_BACKEND = { codex: 45000, gemini: 45000, antigravity: 45000, grok: 45000, kimi: 45000, moonshot: 45000, ollama: 45000, claude: 20000 };
   function handshakeMs() {
     return HANDSHAKE_MS_BY_BACKEND[backendNow()] ?? 20000;
   }
@@ -8442,7 +8453,7 @@ function buildPanel() {
   // ChatGPT). Clicking one asks the pack to ensure that backend's orchestrator is
   // running and returns the bridge URL to connect to — the user never types a
   // port. Populated from GET /comfyui_mcp_panel/backends when settings open.
-  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" };
+  const BACKEND_LABELS = { claude: "Claude", codex: "ChatGPT", gemini: "Gemini", antigravity: "Antigravity", grok: "Grok", kimi: "Kimi", moonshot: "Kimi K3", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" };
   // Appends a visible "(experimental)" marker to a backend's display label when
   // the readiness data flags it (b.experimental, e.g. Copilot — device-code,
   // GitHub ToS risk). Keeps picking it a deliberate, informed act everywhere a
@@ -8486,7 +8497,7 @@ function buildPanel() {
   // (GET /backends, blind to the laptop behind a remote pod) must not override it.
   let readinessFromOrchestrator = false;
   // Short per-provider hint shown under each provider row in the popup.
-  const BACKEND_HINTS = { claude: "Fable · Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", grok: "Grok Composer · Build", kimi: "Kimi (Moonshot)", moonshot: "Kimi K3 · Moonshot", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)", lmstudio: "Local LLMs · no account", llamacpp: "Local LLMs · no account", custom: "DeepSeek · vLLM · any OpenAI-compatible API" };
+  const BACKEND_HINTS = { claude: "Fable · Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", antigravity: "Gemini 3 · Google subscription", grok: "Grok Composer · Build", kimi: "Kimi (Moonshot)", moonshot: "Kimi K3 · Moonshot", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)", lmstudio: "Local LLMs · no account", llamacpp: "Local LLMs · no account", custom: "DeepSeek · vLLM · any OpenAI-compatible API" };
 
   // Hint for a provider that exists but isn't usable yet — distinguishes
   // "install the CLI" from "sign in". Empty when ready or readiness is unknown.
@@ -8507,10 +8518,12 @@ function buildPanel() {
       if (b.backend === "ollama") return "Ollama not installed — get it at ollama.com/download";
       if (b.backend === "lmstudio") return "LM Studio not installed — get it at lmstudio.ai";
       if (b.backend === "llamacpp") return "llama.cpp not found on PATH — github.com/ggml-org/llama.cpp/releases (a reachable server still works)";
+      if (b.backend === "antigravity") return "Install the Antigravity CLI (agy) and run `agy` once to sign in with your Google account.";
       return `${BACKEND_LABELS[b.backend] || b.backend} CLI not installed`;
     }
     if (b.backend === "codex") return "Not signed in — Sign in via API Keys (▾ menu) or run: codex login";
     if (b.backend === "gemini") return "Not signed in — run: gemini (then sign in with Google)";
+    if (b.backend === "antigravity") return "Install the Antigravity CLI (agy) and run `agy` once to sign in with your Google account.";
     if (b.backend === "grok") return "Not signed in — Sign in with Grok via API Keys (▾ menu) or run: grok";
     if (b.backend === "kimi") return "Not signed in — add a Kimi key via API Keys (▾ menu) or run: kimi";
     if (b.backend === "ollama") return "Ollama not running — run: ollama serve";
@@ -8763,6 +8776,9 @@ function buildPanel() {
     claude: { label: "Claude", install: "npm i -g @anthropic-ai/claude-code", login: "claude auth login" },
     codex: { label: "ChatGPT", install: "npm i -g @openai/codex", login: "codex login" },
     gemini: { label: "Gemini", install: "npm i -g @google/gemini-cli", login: "gemini" },
+    // Google's Antigravity CLI (agy) — the individual-tier Google-subscription
+    // path; auth lives in the OS keyring (no in-panel OAuth, no API-key slot).
+    antigravity: { label: "Antigravity (Google subscription)", install: "install the Antigravity CLI (agy)", login: "agy" },
     grok: { label: "Grok", install: "install the Grok CLI (Grok Build / xAI)", login: "grok" },
     kimi: { label: "Kimi", install: "install the Kimi CLI (Moonshot)", login: "kimi" },
     // No CLI — "setup" is pasting a Moonshot platform API key (Kimi K3).
@@ -8810,7 +8826,7 @@ function buildPanel() {
     sub.textContent =
       "The agent runs on YOUR machine on your own AI subscription (Claude, ChatGPT, Gemini, …) or a local model (Ollama, LM Studio, llama.cpp) — no API keys. Set up a provider (Node ≥ 22), start the agent with the command below, then click Connect.";
     onboard.append(title, sub);
-    for (const id of ["claude", "codex", "gemini", "grok", "kimi", "moonshot", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"]) {
+    for (const id of ["claude", "codex", "gemini", "antigravity", "grok", "kimi", "moonshot", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"]) {
       const meta = PROVIDER_SETUP[id];
       const st = list.find((b) => b.backend === id) || {};
       const col = document.createElement("div");
@@ -12495,7 +12511,7 @@ function buildPanel() {
   // backend's handshake window (handshakeMs()) so a healthy slow reload completes
   // on its own backoff before the guard releases — Codex's app-server handshake is
   // 45s, so its guard is ~50s; Claude keeps 28s (still > its 20s handshake).
-  const SOFT_RELOAD_GUARD_MS_BY_BACKEND = { codex: 50000, gemini: 50000, grok: 50000, kimi: 50000, moonshot: 50000, ollama: 50000, claude: 28000 };
+  const SOFT_RELOAD_GUARD_MS_BY_BACKEND = { codex: 50000, gemini: 50000, antigravity: 50000, grok: 50000, kimi: 50000, moonshot: 50000, ollama: 50000, claude: 28000 };
   function softReloadGuardMs() {
     return SOFT_RELOAD_GUARD_MS_BY_BACKEND[selectedBackend] ?? 28000;
   }
@@ -12512,7 +12528,7 @@ function buildPanel() {
   // normal cold-start handshake (handshakeMs()) so a healthy-but-slow reload is
   // never pre-empted — Codex (45s handshake) escalates at ~40s, comfortably under
   // its ~50s guard; Claude keeps 11s (under its 28s guard and > its 20s handshake).
-  const SOFT_RELOAD_ESCALATE_MS_BY_BACKEND = { codex: 40000, gemini: 40000, grok: 40000, kimi: 40000, moonshot: 40000, ollama: 40000, claude: 11000 };
+  const SOFT_RELOAD_ESCALATE_MS_BY_BACKEND = { codex: 40000, gemini: 40000, antigravity: 40000, grok: 40000, kimi: 40000, moonshot: 40000, ollama: 40000, claude: 11000 };
   function softReloadEscalateMs() {
     return SOFT_RELOAD_ESCALATE_MS_BY_BACKEND[selectedBackend] ?? 11000;
   }
