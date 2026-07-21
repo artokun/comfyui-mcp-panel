@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.9.9] - 2026-07-20
+
+### Changed
+- Registry listing refresh: display name is now **ComfyUI MCP | Agent Panel**,
+  the description is rewritten local-first in pure ASCII (the old text carried
+  double-encoded em-dashes that rendered as mojibake on registry.comfy.org),
+  and the icon/banner are the flat comfyui-mcp mark shared with the docs site
+  and mobile app — the sidebar tab wears the same mark (#99)
+
+
 ## [0.9.8] - 2026-07-20
 
 ### Fixed
