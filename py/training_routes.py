@@ -22,6 +22,7 @@ import asyncio
 import logging
 import os
 import pathlib
+import stat as stat_module
 from os import environ  # bare-name on purpose — see root __init__.py (Registry scanner)
 
 logger = logging.getLogger(__name__)
@@ -57,22 +58,56 @@ def _training_roots() -> list:
     return roots
 
 
+# Traversal caps for _newest_outputs (codex finding: the walk was unbounded, so
+# repeated list-outputs calls against a huge outputs tree could saturate the
+# shared worker executor). Generous for real output dirs — 20k files is far
+# beyond what the picker's `limit<=200` newest-first view needs — but a hard
+# ceiling regardless of tree size.
+_MAX_SCAN_FILES = 20000
+_MAX_SCAN_DIRS = 2000
+
+
 def _newest_outputs(root: str, pattern: str, limit: int) -> list:
     """The `limit` newest image files under `root` (sync; runs in a worker
-    thread). A size-bounded heap avoids materializing the whole tree."""
+    thread). A size-bounded heap avoids materializing the whole tree, and the
+    walk itself is capped (_MAX_SCAN_FILES / _MAX_SCAN_DIRS) with sibling dirs
+    visited newest-mtime-first, so on a pathologically large tree the budget is
+    spent on the most recent subtrees before the caps stop the scan."""
     import heapq
 
     heap = []  # min-heap by mtime, max size `limit`
-    for dirpath, _dirnames, filenames in os.walk(root):
+    scanned_files = 0
+    scanned_dirs = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        scanned_dirs += 1
+        if scanned_dirs > _MAX_SCAN_DIRS:
+            break
+        # Visit newest sibling dirs first so the scan budget favors recent
+        # outputs (os.walk honors in-place reordering of dirnames in topdown
+        # mode). Dir symlinks are never followed (os.walk default).
+        def _dir_mtime(d):
+            try:
+                return os.lstat(os.path.join(dirpath, d)).st_mtime
+            except OSError:
+                return 0.0
+        dirnames.sort(key=_dir_mtime, reverse=True)
         for name in filenames:
+            scanned_files += 1
+            if scanned_files > _MAX_SCAN_FILES:
+                return [item for _mtime, _i, item in sorted(heap, key=lambda x: -x[0])]
             if os.path.splitext(name)[1].lower() not in _PICK_EXTS:
                 continue
             if pattern and pattern not in name.lower():
                 continue
             full = os.path.join(dirpath, name)
             try:
-                st = os.stat(full)
+                # lstat, not stat: never follow file symlinks — a link planted
+                # in outputs/ must not leak metadata about (or list) a target
+                # outside the tree (codex finding).
+                st = os.lstat(full)
             except OSError:
+                continue
+            if not stat_module.S_ISREG(st.st_mode):
                 continue
             sub = os.path.relpath(dirpath, root)
             item = {
