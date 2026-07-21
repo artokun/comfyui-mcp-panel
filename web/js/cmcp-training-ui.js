@@ -252,6 +252,8 @@ export function openTrainingModal(ctx = {}) {
     job: null,
     launching: false,
     launchError: null,
+    target: "local",
+    podInfo: null,
     uploadsPending: 0,
     /** Generations: bumped on launch/reset so a stale async continuation (an
      *  in-flight launch or upload batch from a PREVIOUS wizard run) can't
@@ -276,6 +278,13 @@ export function openTrainingModal(ctx = {}) {
     wiz.jobId = null;
     wiz.job = null;
     wiz.launchError = null;
+    // Reset the target selection too — a stale target:"pod" from a prior run,
+    // paired with a fresh train_doctor that reports no pod, would leave the
+    // switch unrendered but Launch disabled against the retained pod target
+    // (dead-end until modal reopen; codex finding). The Launch step re-derives
+    // the live pod availability from a fresh train_doctor.
+    wiz.target = "local";
+    wiz.podInfo = null;
     wiz.uploadsPending = 0;
     wiz.launchGen++;
     wiz.uploadGen++;
@@ -355,7 +364,7 @@ export function openTrainingModal(ctx = {}) {
       grid.appendChild(card);
     }
     const foot = el("div", "cmcp-tr-foot",
-      "Character LoRAs train locally on this rig (ai-toolkit in a GPU container, FLUX.1-dev). Style / edit / slider / video flows land in P2; RunPod in P4.");
+      "Character LoRAs train on this rig (ai-toolkit in a GPU container, FLUX.1-dev) — or on a connected RunPod pod via the Local/Pod switch on the Launch step. Style / edit / slider / video flows land in P2.");
     body.append(grid, foot);
   }
 
@@ -772,6 +781,10 @@ export function openTrainingModal(ctx = {}) {
     // call that eventually reports a remote (non-local) ComfyUI must not leave
     // a clickable window for a doomed launch (codex finding).
     let preflightState = "pending"; // pending | local | remote | failed
+    // Target-switch buttons, hoisted so syncLaunchEnabled can lock them while a
+    // launch is in flight — a mid-launch target switch must not change what the
+    // job runs on (codex finding).
+    let targetBtns = [];
     const pre = el("div", "cmcp-tr-preflight");
     pre.append(el("span", null, "Preflight: checking…"));
     sec.append(pre);
@@ -780,6 +793,38 @@ export function openTrainingModal(ctx = {}) {
     fetchGpuLabel(ctx.api).then((gpu) => { if (gpu) gpuLine.textContent = `Local GPU: ${gpu}`; });
     callJson(ctx, "train_doctor", {}, { timeout: 180000 }).then((d) => {
       const dd = d.data || {};
+      wiz.podInfo = dd.pod && dd.pod.status === "RUNNING" ? dd.pod : null;
+      // Re-derive target from the FRESH doctor result: if no pod (or its SSH
+      // dropped), the switch below won't render, so a retained target:"pod"
+      // would strand Launch disabled. Fall back to local (codex finding).
+      if (!wiz.podInfo || !wiz.podInfo.ssh) wiz.target = "local";
+      // Local ⇄ Pod switch — only when a RUNNING pod is connected (connector).
+      if (wiz.podInfo) {
+        const pod = wiz.podInfo;
+        const targetSeg = el("div", "cmcp-tr-seg");
+        targetSeg.style.margin = "0";
+        const localBtn = el("button", wiz.target !== "pod" ? "active" : null, "Local (docker)");
+        const podBtn = el("button", wiz.target === "pod" ? "active" : null, `Pod (${pod.name || pod.id}${pod.gpu ? ` · ${pod.gpu}` : ""})`);
+        if (!pod.ssh) podBtn.title = "pod has no working SSH endpoint";
+        localBtn.onclick = () => { wiz.target = "local"; localBtn.classList.add("active"); podBtn.classList.remove("active"); syncLaunchEnabled(); syncSummary(); };
+        podBtn.onclick = () => {
+          if (!pod.ssh) return;
+          wiz.target = "pod";
+          podBtn.classList.add("active");
+          localBtn.classList.remove("active");
+          syncLaunchEnabled();
+          syncSummary();
+        };
+        targetSeg.append(localBtn, podBtn);
+        targetBtns = [localBtn, podBtn];
+        // A launch may already be in flight when the doctor resolves (the user
+        // can leave and return) — lock immediately if so.
+        if (wiz.launching) targetBtns.forEach((b) => { b.disabled = true; });
+        pre.before(targetSeg);
+        const podNote = el("p", "cmcp-tr-hint",
+          `Pod training runs ai-toolkit natively ON the pod (no docker there). Fresh pods need a one-time bootstrap (~10 min) — run train_bootstrap (or ask the agent) once; it persists on the pod's volume. The pod bills GPU-time while it's up.`);
+        pre.after(podNote);
+      }
       pre.textContent = "";
       const mk = (label, ok) => el("span", null, `${label}: `);
       for (const [label, ok] of [["docker", dd.docker], ["gpu", dd.gpu], ["image", dd.image], ["hf token", dd.hfTokenSet]]) {
@@ -824,9 +869,17 @@ export function openTrainingModal(ctx = {}) {
     body.appendChild(sec);
 
     syncLaunchEnabled = () => {
-      launch.disabled = wiz.launching || preflightState !== "local" && preflightState !== "failed" || !syncCustomValidity();
+      // Pod target: docker/gpu/image are irrelevant — the gate is a working pod
+      // SSH endpoint (plus the custom-param check).
+      const podReady = wiz.target === "pod" && !!wiz.podInfo?.ssh;
+      launch.disabled = wiz.launching
+        || (wiz.target === "pod" ? !podReady : preflightState !== "local" && preflightState !== "failed")
+        || !syncCustomValidity();
       if (wiz.launching) launch.textContent = "Launching…";
-      else launch.textContent = "Launch training";
+      else launch.textContent = wiz.target === "pod" ? "Launch on pod" : "Launch training";
+      // Freeze the target choice while launching — the submitted job runs on the
+      // target that was selected at click time (codex finding).
+      targetBtns.forEach((b) => { b.disabled = wiz.launching; });
     };
     syncLaunchEnabled();
 
@@ -847,9 +900,16 @@ export function openTrainingModal(ctx = {}) {
       // flight — the submitted job must be exactly what was reviewed at click
       // time, not a mix of old paths and new captions/settings.
       const snapTrigger = wiz.trigger || undefined;
+      // Freeze the target at click time — the target buttons are locked during
+      // the launch, but snapshot regardless so train_start below runs on the
+      // reviewed target, never a live wiz.* that a race could have moved.
+      const snapTarget = wiz.target;
+      const snapPodId = snapTarget === "pod" && wiz.podInfo ? wiz.podInfo.id : undefined;
       const snap = {
         name: sanitizeNameClient(wiz.datasetName),
         trigger: snapTrigger,
+        target: snapTarget,
+        podId: snapPodId,
         images: wiz.images.map((i) => {
           let caption = i.caption.trim();
           // The UI tells users the trigger belongs in EVERY caption — enforce it
@@ -884,6 +944,8 @@ export function openTrainingModal(ctx = {}) {
         const started = await callJson(ctx, "train_start", {
           name: snap.name, flow: "character", model: "flux1-dev",
           datasetPath: prep.datasetPath, trigger: snap.trigger, params: snap.params,
+          target: snap.target,
+          ...(snap.target === "pod" && snap.podId ? { pod_id: snap.podId } : {}),
         }, { timeout: 120000 });
         if (gen !== wiz.launchGen) return; // a newer launch/reset superseded this one
         wiz.jobId = started.job.id;
@@ -910,13 +972,21 @@ export function openTrainingModal(ctx = {}) {
   // -------------------------------------------------------------- monitor ---
   /** Persistent badge node — updated in place (replaceWith would detach it on
    *  the first poll and leave every later status invisible; codex finding). */
-  function setBadge(badgeEl, status) {
-    badgeEl.textContent = status;
+  function setBadge(badgeEl, job) {
+    // Accepts the whole job so the live monitor shows the same pod-aware badge
+    // as the Jobs list (codex finding: the monitor previously passed job.status
+    // only, so a pod run never showed "· pod" while it was running).
+    const status = job && typeof job === "object" ? job.status : job;
+    const onPod = job && typeof job === "object" && job.target === "pod";
+    badgeEl.textContent = onPod ? `${status} · pod` : status;
     badgeEl.className = `cmcp-tr-badge ${STATUS_BADGE[status] || ""}`;
+    badgeEl.title = onPod ? "Trained on a RunPod pod" : "";
   }
 
   function jobStatusBadge(job) {
-    return el("span", `cmcp-tr-badge ${STATUS_BADGE[job.status] || ""}`, job.status);
+    const b = el("span", `cmcp-tr-badge ${STATUS_BADGE[job.status] || ""}`, job.status);
+    setBadge(b, job);
+    return b;
   }
 
   function renderMonitor() {
@@ -971,7 +1041,7 @@ export function openTrainingModal(ctx = {}) {
         if (myGen !== pollGen) return; // view changed while the request was out
         const job = d.job;
         wiz.job = job;
-        setBadge(badge, job.status);
+        setBadge(badge, job);
         const p = job.progress || {};
         if (p.totalSteps) {
           const pct = Math.min(100, Math.round(((p.step || 0) / p.totalSteps) * 100));
