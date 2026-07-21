@@ -529,6 +529,38 @@ export function openTrainingModal(ctx = {}) {
       picker.style.display = "none";
       const status = el("p", "cmcp-tr-hint");
       tabBody.append(drop, picker, status);
+      // Per-file upload deadline. uploadBlobToInput has no abort path (it
+      // swallows errors and returns null, but a request that never settles
+      // hangs its promise forever) — so race it against a timer. Without this,
+      // ONE hung upload left uploadsPending > 0 permanently and deadlocked
+      // wizard navigation (codex finding). A late success after the timeout is
+      // simply discarded — the file is reported failed and can be re-added.
+      const UPLOAD_TIMEOUT_MS = 30000;
+      function withTimeout(promise, ms, label) {
+        return new Promise((resolve, reject) => {
+          const t = setTimeout(() => reject(new Error(`timed out after ${Math.round(ms / 1000)}s: ${label}`)), ms);
+          promise.then(
+            (v) => { clearTimeout(t); resolve(v); },
+            (e) => { clearTimeout(t); reject(e); },
+          );
+        });
+      }
+      // Magic-byte sniff: the extension regex alone happily uploads any file
+      // renamed to .png (codex finding). Cheap 12-byte header check for the
+      // three accepted formats; on read failure fall back to trusting the
+      // extension (sniffing is a guard, not a gate on flaky File APIs).
+      async function looksLikeImage(f) {
+        try {
+          const b = new Uint8Array(await f.slice(0, 12).arrayBuffer());
+          const png = b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47;
+          const jpg = b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
+          const webp = b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46
+            && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50;
+          return png || jpg || webp;
+        } catch {
+          return true;
+        }
+      }
       async function addFiles(files) {
         if (!ctx.uploadBlobToInput) { status.textContent = "Upload unavailable (no bridge helper)."; return; }
         // Track the batch: Next stays disabled until every upload settles, so a
@@ -537,16 +569,27 @@ export function openTrainingModal(ctx = {}) {
         const batch = files.filter((f) => /\.(png|jpe?g|webp)$/i.test(f.name));
         const skipped = files.length - batch.length;
         const failed = [];
+        const notImage = [];
         const gen = wiz.uploadGen;
         wiz.uploadsPending += batch.length;
         syncNext();
         for (const f of batch) {
           status.textContent = `Uploading ${f.name}… (${wiz.images.length} added)`;
           try {
-            const ref = await ctx.uploadBlobToInput(f, f.name.replace(/[^a-zA-Z0-9._-]+/g, "_"));
+            if (!(await looksLikeImage(f))) { notImage.push(f.name); continue; }
+            const ref = await withTimeout(
+              ctx.uploadBlobToInput(f, f.name.replace(/[^a-zA-Z0-9._-]+/g, "_")),
+              UPLOAD_TIMEOUT_MS,
+              f.name,
+            );
             if (gen !== wiz.uploadGen) return; // wizard was reset mid-batch — discard
             if (!ref) { failed.push(f.name); continue; }
             wiz.images.push({ ref: { filename: ref.filename, subfolder: ref.subfolder, type: "input" }, thumb: viewUrl(ctx, { ...ref, type: "input" }), caption: "" });
+          } catch {
+            // Timeout (or an unexpected reject) — record and MOVE ON so the
+            // rest of the batch still uploads and the pending count settles.
+            if (gen !== wiz.uploadGen) return;
+            failed.push(f.name);
           } finally {
             // Only settle the counter when the batch still belongs to the
             // current wizard run (a reset zeroed it already).
@@ -558,9 +601,10 @@ export function openTrainingModal(ctx = {}) {
         // by the next success, hiding an incomplete dataset).
         const parts = [];
         if (skipped) parts.push(`${skipped} skipped (png/jpg/webp only)`);
+        if (notImage.length) parts.push(`${notImage.length} skipped (not a real png/jpg/webp): ${notImage.join(", ")}`);
         if (failed.length) parts.push(`${failed.length} FAILED: ${failed.join(", ")}`);
         status.textContent = parts.join(" · ");
-        status.style.color = failed.length ? "#ef4444" : "";
+        status.style.color = failed.length || notImage.length ? "#ef4444" : "";
       }
       drop.onclick = () => picker.click();
       picker.onchange = () => addFiles([...picker.files]);
