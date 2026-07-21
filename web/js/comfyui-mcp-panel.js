@@ -6835,6 +6835,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // Structured acks (ready / working / options / …). The "ready" ack is sent
       // after the orchestrator has processed hello (resume armed), so it's the
       // reliable signal to send a post-restart resume nudge.
+      if (msg && msg.type === "ack" && msg.kind === "set_content_mode") {
+        try { window.dispatchEvent(new CustomEvent("cmcp:set-content-mode-ack")); } catch {}
+      }
       if (msg && msg.type === "ack") {
         // A "degraded" ack is the orchestrator's OWN handshake: it's alive and
         // attending, but its agent backend can't enumerate models yet (typically
@@ -9662,6 +9665,10 @@ function buildPanel() {
   // The localStorage key stays "cmcp.muteAgents" so an existing Deafen (né
   // Mute) setting survives this rename.
   deafenBtn.onclick = () => { AGENT_MUTED = !AGENT_MUTED; try { localStorage.setItem("cmcp.muteAgents", AGENT_MUTED ? "1" : "0"); } catch {} reflectFeedGates(); };
+  let _blindAckPending = null;
+  window.addEventListener("cmcp:set-content-mode-ack", () => {
+    if (_blindAckPending) { clearTimeout(_blindAckPending); _blindAckPending = null; }
+  });
   blindBtn.onclick = () => {
     AGENT_BLIND = !AGENT_BLIND;
     try { localStorage.setItem("cmcp.blindAgents", AGENT_BLIND ? "1" : "0"); } catch {}
@@ -9670,7 +9677,21 @@ function buildPanel() {
     // (get_image/view_image return pixels straight from /view). Tell the
     // orchestrator so it respawns this tab's tool server with the blind env —
     // without this the toggle only covered the panel's own image channel.
-    try { client?.sendFrame?.({ type: "set_content_mode", tab_id: workflowTabId(), blind: AGENT_BLIND }); } catch {}
+    // An OLD orchestrator has no handler and never acks — warn so the user
+    // knows only the legacy panel-feed gating applies (codex-review F4). A
+    // lost frame (socket drop) self-heals on the next hello, which re-seeds
+    // blind and respawns on change.
+    if (_blindAckPending) { clearTimeout(_blindAckPending); _blindAckPending = null; }
+    let sent = false;
+    try { sent = client?.sendFrame?.({ type: "set_content_mode", tab_id: workflowTabId(), blind: AGENT_BLIND }) !== false; } catch {}
+    if (sent) {
+      _blindAckPending = setTimeout(() => {
+        _blindAckPending = null;
+        appendSystem(
+          "⚠️ The orchestrator didn't acknowledge the Blind change — it may predate v0.42.0, where Blind only gates the panel's own image feed (the agent's image tools are NOT gated). Update comfyui-mcp for full enforcement.",
+        );
+      }, 6000);
+    }
   };
   ring.style.cursor = "pointer"; ring.onclick = deafenBtn.onclick; // clicking the ring toggles deafen
   reflectFeedGates();
