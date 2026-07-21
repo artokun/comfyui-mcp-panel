@@ -12,6 +12,7 @@ test('opening a workflow does not dirty it and first record embeds silently', as
   await page.route(
     (url) => /\/(api\/)?settings\/?$/.test(url.pathname),
     async (route) => {
+      if (route.request().method() !== 'GET') return route.continue()
       const response = await route.fetch()
       const settings = await response.json() as Record<string, unknown>
       settings['comfyui-mcp.sessionFollowsPanel'] = false
@@ -177,6 +178,7 @@ test('embeds a workflow UUID and blocks a foreign transcript pointer', async ({
   await page.route(
     (url) => /\/(api\/)?settings\/?$/.test(url.pathname),
     async (route) => {
+      if (route.request().method() !== 'GET') return route.continue()
       const response = await route.fetch()
       const settings = await response.json() as Record<string, unknown>
       settings['comfyui-mcp.sessionFollowsPanel'] = false
