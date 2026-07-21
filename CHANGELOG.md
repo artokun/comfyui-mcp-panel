@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- **Blind is now a real guarantee** (#90): the toggle rides the hello and a
+  live set_content_mode frame so the orchestrator withholds pixels from ALL
+  of the agent's image tools (requires comfyui-mcp >= 0.42.0), and
+  graph_screenshot refuses under Blind — previously only the panel's own
+  image feed was gated
+
 ## [0.9.7] - 2026-07-20
 
 ### Changed
