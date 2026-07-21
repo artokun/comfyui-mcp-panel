@@ -26,6 +26,7 @@ function injectStyle(root) {
   if (styleInjected) return;
   styleInjected = true;
   const css = `
+.cmcp-rp-modal{max-width:min(480px,92vw)!important;width:auto;}
 .cmcp-rp-body{display:flex;flex-direction:column;gap:0.75rem;min-width:min(440px,90vw);max-width:520px;}
 .cmcp-rp-host{display:flex;align-items:center;gap:0.5rem;padding:0.55rem 0.7rem;border-radius:8px;
   font-size:0.85rem;font-weight:600;border:1px solid var(--p-content-border-color,#3f3f46);}
@@ -53,9 +54,15 @@ function injectStyle(root) {
 `;
   const el = document.createElement("style");
   el.textContent = css;
-  (root.getRootNode?.() || document).appendChild
-    ? (root.getRootNode?.() || document).appendChild(el)
-    : document.head.appendChild(el);
+  // Append into the same root the modal mounts in: a ShadowRoot when the panel
+  // lives in shadow DOM, else document.head. (A bare `document.appendChild`
+  // throws — the document may hold only one element child.)
+  const r = root?.getRootNode?.();
+  const target =
+    r && typeof r.appendChild === "function" && r.nodeType === 11 /* DOCUMENT_FRAGMENT (ShadowRoot) */
+      ? r
+      : document.head;
+  target.appendChild(el);
 }
 
 /** Pull human text out of a tool_result frame (result = MCP content array). */
@@ -90,7 +97,7 @@ export function openRunpodModal(ctx, opts = {}) {
   const overlay = document.createElement("div");
   overlay.className = "cmcp-modal-overlay";
   const modal = document.createElement("div");
-  modal.className = "cmcp-modal";
+  modal.className = "cmcp-modal cmcp-rp-modal";
   const title = document.createElement("div");
   title.className = "cmcp-modal-title";
   title.textContent = "RunPod — cloud GPU for this session";
@@ -152,7 +159,11 @@ export function openRunpodModal(ctx, opts = {}) {
   body.append(host, card, connectRow, actions, linkRow, log, credit);
   modal.append(title, body, btnRow);
   overlay.append(modal);
-  root.appendChild(overlay);
+  // Mount the overlay on <body>, NOT the panel root: the ComfyUI sidebar clips
+  // its descendants, so a root-mounted overlay would be squeezed into the narrow
+  // panel (buttons + status values cut off). On body it's a true viewport-centered
+  // modal at its full width.
+  document.body.appendChild(overlay);
 
   // ── state + rendering ──────────────────────────────────────────────────────
   let busy = false;
