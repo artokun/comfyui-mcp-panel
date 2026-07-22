@@ -261,7 +261,8 @@ test('panel delete remains final when a stale tab republishes the removed thread
   }, { snapshotKey: LOCAL_HISTORY_SNAPSHOT_KEY, threadId: removedThreadId! })).toBe(true)
 
   await staleTab.evaluate(async (snapshot) => {
-    const { ChatHistoryStore } = await import('/extensions/comfyui-mcp-panel/lib/chat-history-store.js')
+    const storeModuleUrl = '/extensions/comfyui-mcp-panel/lib/chat-history-store.js'
+    const { ChatHistoryStore } = await import(storeModuleUrl)
     const staleStore = new ChatHistoryStore({ writerId: 'stale-panel-test' })
     staleStore.persist(snapshot.threads || [], snapshot.meta || {})
     const result = await staleStore.flush()
