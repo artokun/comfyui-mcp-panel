@@ -7,6 +7,7 @@ import { test, expect } from './fixtures/panelTest'
 
 const SESSION_KEY = 'comfyui-mcp.panel.sessionId'
 const CURRENT_THREAD_KEY = 'comfyui-mcp.panel.currentThreadId'
+const LOCAL_HISTORY_SNAPSHOT_KEY = 'comfyui-mcp.panel.historySnapshot'
 
 async function indexedThreadCount(page: import('@playwright/test').Page): Promise<number> {
   return page.evaluate(async () => {
@@ -46,6 +47,30 @@ async function indexedHasText(page: import('@playwright/test').Page, text: strin
       db.close()
     }
   }, text)
+}
+
+async function indexedHasThread(
+  page: import('@playwright/test').Page,
+  threadId: string
+): Promise<boolean> {
+  return page.evaluate(async (id) => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open('comfyui-mcp-panel-history', 2)
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error)
+    })
+    try {
+      return await new Promise<boolean>((resolve, reject) => {
+        const request = db.transaction('snapshots', 'readonly').objectStore('snapshots').get('state')
+        request.onsuccess = () => resolve(Boolean(
+          request.result?.threads?.some((thread: any) => thread.id === id)
+        ))
+        request.onerror = () => reject(request.error)
+      })
+    } finally {
+      db.close()
+    }
+  }, threadId)
 }
 
 async function seedReloadEvictionRace(
@@ -186,6 +211,7 @@ test('restores from IndexedDB after the localStorage shadow is lost', async ({
   await expect.poll(() => indexedHasText(page, 'indexeddb-only reply')).toBe(true)
 
   await page.evaluate(() => {
+    localStorage.removeItem('comfyui-mcp.panel.historySnapshot')
     localStorage.removeItem('comfyui-mcp.panel.threads')
     localStorage.removeItem('comfyui-mcp.panel.historyMeta')
     localStorage.removeItem('comfyui-mcp.panel.autoConnect')
@@ -251,4 +277,7 @@ test('reload keeps the pointed conversation and live tab session during durable 
       hasPointed: shadow.some((thread: any) => thread.id === pointedId)
     }
   }, currentThreadId)).toEqual({ count: 20, hasPointed: true })
+  await expect.poll(() => indexedThreadCount(page)).toBe(500)
+  await expect.poll(() => indexedHasThread(page, currentThreadId!)).toBe(true)
+  expect(await page.evaluate((key) => localStorage.getItem(key), LOCAL_HISTORY_SNAPSHOT_KEY)).not.toBeNull()
 })
