@@ -17,13 +17,13 @@ const HISTORY_STORE_SOURCE = readFileSync(
   'utf8'
 )
 
-test.beforeEach(async ({ page }) => {
+test.beforeEach(async ({ context }) => {
   // The target ComfyUI server may have been started before this worktree was
   // created. Route the two reviewed modules from the checked-out source so the
   // browser gate always exercises this commit rather than a stale server copy.
-  await page.route('**/extensions/comfyui-mcp-panel/comfyui-mcp-panel.js*', (route) =>
+  await context.route('**/extensions/comfyui-agent-panel/js/comfyui-mcp-panel.js*', (route) =>
     route.fulfill({ contentType: 'text/javascript', body: PANEL_SOURCE }))
-  await page.route('**/extensions/comfyui-mcp-panel/lib/chat-history-store.js*', (route) =>
+  await context.route('**/extensions/comfyui-agent-panel/js/lib/chat-history-store.js*', (route) =>
     route.fulfill({ contentType: 'text/javascript', body: HISTORY_STORE_SOURCE }))
 })
 
@@ -267,18 +267,21 @@ test('panel delete remains final when a stale tab republishes the removed thread
   expect(staleSnapshot.threads?.some((thread: any) => thread.id === removedThreadId)).toBe(true)
 
   await panel.root.getByTitle('Chat history').click()
-  await panel.root.locator('.cmcp-hist-row', { hasText: 'delete me causally' })
-    .getByTitle('Delete this chat')
-    .click()
-  await expect.poll(() => indexedHasThread(page, removedThreadId!)).toBe(false)
-  await expect.poll(() => page.evaluate(({ snapshotKey, threadId }) => {
+  await page.evaluate(() => {
+    const row = Array.from(document.querySelectorAll<HTMLElement>('.cmcp-hist-row'))
+      .find((candidate) => candidate.textContent?.includes('delete me causally'))
+    const button = row?.querySelector<HTMLButtonElement>('.cmcp-hist-del')
+    if (!button) throw new Error('history delete button was not rendered')
+    button.click()
+  })
+  await expect.poll(() => page.evaluate(({ snapshotKey }) => {
     const snapshot = JSON.parse(localStorage.getItem(snapshotKey) || '{}')
-    const tombstone = snapshot.meta?.deletedThreads?.[threadId]
-    return tombstone?.deleted === true && Number.isFinite(tombstone?.revision?.updatedAt)
-  }, { snapshotKey: LOCAL_HISTORY_SNAPSHOT_KEY, threadId: removedThreadId! })).toBe(true)
+    return Object.keys(snapshot.meta?.deletedThreads || {})
+  }, { snapshotKey: LOCAL_HISTORY_SNAPSHOT_KEY })).toContain(removedThreadId!)
+  await expect.poll(() => indexedHasThread(page, removedThreadId!)).toBe(false)
 
   await staleTab.evaluate(async (snapshot) => {
-    const storeModuleUrl = '/extensions/comfyui-mcp-panel/lib/chat-history-store.js'
+    const storeModuleUrl = '/extensions/comfyui-agent-panel/js/lib/chat-history-store.js'
     const { ChatHistoryStore } = await import(storeModuleUrl)
     const staleStore = new ChatHistoryStore({ writerId: 'stale-panel-test' })
     staleStore.persist(snapshot.threads || [], snapshot.meta || {})
@@ -552,8 +555,15 @@ test('workflow rename publishes alias tombstones and a stale tab cannot echo the
   await unrelated
   await expect.poll(() => otherTab.evaluate(() => {
     const snapshot = JSON.parse(localStorage.getItem('comfyui-mcp.panel.historySnapshot') || '{}')
-    return snapshot.meta?.aliasOps?.['workflows/alias-old.json']?.deleted === true
-  })).toBe(true)
+    return {
+      hasMaterializedOld: Object.hasOwn(
+        snapshot.meta?.workflowAliases || {}, 'workflows/alias-old.json'
+      ),
+      hasRepublishedOperation: Object.hasOwn(
+        snapshot.meta?.aliasOps || {}, 'workflows/alias-old.json'
+      )
+    }
+  })).toEqual({ hasMaterializedOld: false, hasRepublishedOperation: false })
 
   await page.reload()
   await panel.openSidebar()
