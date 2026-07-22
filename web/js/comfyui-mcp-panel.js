@@ -667,6 +667,7 @@ let _workflowUuidAliases = (() => {
     return {};
   }
 })();
+let workflowAliasMutationSink = null;
 // MODULE-scoped so they survive buildPanel re-mounts (the panel re-mounts on every
 // ComfyUI workflow switch). If these lived in the panel closure, each re-mount would
 // re-seed them to the now-current workflow and defeat change detection.
@@ -784,18 +785,24 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
 
   _workflowObjectUuids.set(identityObject, id);
   rememberWorkflowUuidOwner(id, identityObject);
+  const aliasMutations = [];
   if (objectUuid && path) {
     // Rename/Save-As mutates the same live workflow object. Drop stale aliases
     // so a cold start does not later misclassify the renamed file as a clone.
     for (const [knownPath, knownUuid] of Object.entries(_workflowUuidAliases)) {
       if (knownUuid === id && normalizedWorkflowPath(knownPath) !== normalizedWorkflowPath(path)) {
         delete _workflowUuidAliases[knownPath];
+        aliasMutations.push([knownPath, null]);
       }
     }
   }
   if (path && _workflowUuidAliases[path] !== id) {
     _workflowUuidAliases[path] = id;
+    aliasMutations.push([path, id]);
+  }
+  if (aliasMutations.length) {
     persistWorkflowAliases();
+    for (const [aliasPath, value] of aliasMutations) workflowAliasMutationSink?.(aliasPath, value);
   }
   if (embed) {
     try {
@@ -10470,8 +10477,8 @@ function buildPanel() {
     );
   }
 
-  function persistThreads() {
-    syncWorkflowAliases();
+  function persistThreads({ syncAliases = true } = {}) {
+    if (syncAliases) syncWorkflowAliases();
     threads = capHistoryThreads(threads);
     historyStore.persist(threads, historyMeta, {
       protectedThreadIds: protectedHistoryThreadIds(),
@@ -10479,6 +10486,18 @@ function buildPanel() {
       maxMessages: MAX_THREAD_MSGS,
     });
   }
+
+  const panelAliasMutationSink = (path, value) => {
+    historyMeta = updateMetadataEntry(
+      historyMeta,
+      "workflowAliases",
+      path,
+      value,
+      nextHistoryRevision(),
+    );
+    persistThreads({ syncAliases: false });
+  };
+  workflowAliasMutationSink = panelAliasMutationSink;
 
   function detachInvalidCurrentThread({ scopeKey = null, rebind = false } = {}) {
     thread = null;
@@ -10506,6 +10525,9 @@ function buildPanel() {
     const currentThreadId = thread?.id;
     const merged = mergeHistorySnapshots({ threads, meta: historyMeta }, incoming);
     historyMeta = merged.meta;
+    // Remote alias operations are authoritative cache updates. Apply them before
+    // any local-diff pass so a received tombstone cannot be echoed as a new set.
+    applyWorkflowAliasesFromHistory();
     threads = capHistoryThreads(merged.threads, currentThreadId);
     if (currentThreadId) {
       const refreshed = threads.find((candidate) => candidate.id === currentThreadId);
@@ -15385,6 +15407,7 @@ function buildPanel() {
       document.removeEventListener("visibilitychange", onVisibilityChange);
       window.removeEventListener("pagehide", onPageHide);
       unsubscribeHistorySync();
+      if (workflowAliasMutationSink === panelAliasMutationSink) workflowAliasMutationSink = null;
       try {
         api.removeEventListener("executed", onExecuted);
         api.removeEventListener("execution_success", onExecutionSuccess);

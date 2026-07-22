@@ -11,7 +11,8 @@ import {
   retainBoundedThreads,
   selectPanelThread,
   selectRestoreThread,
-  selectThreadForScope
+  selectThreadForScope,
+  updateMetadataEntry
 } from '../../web/js/lib/chat-history-store.js'
 
 function createMemoryStorage({ throwOnSet = null } = {}) {
@@ -399,6 +400,38 @@ test('metadata tombstones clear active pointers and aliases across stale snapsho
   assert.equal(selectPanelThread([
     { id: 'old-thread', workflowKey: 'panel:global', updatedAt: 100, msgs: [] }
   ], merged.meta), null)
+})
+
+test('alias tombstones and exact-time writer ties remain deterministic in both merge orders', () => {
+  const base = {
+    updatedAt: 100,
+    workflowAliases: { 'workflows/old.json': 'workflow-id' }
+  }
+  const deleted = updateMetadataEntry(base, 'workflowAliases', 'workflows/old.json', null, {
+    updatedAt: 500,
+    writerId: 'z-renamer',
+    sequence: 1
+  })
+  const staleSet = updateMetadataEntry(base, 'workflowAliases', 'workflows/old.json', 'workflow-id', {
+    updatedAt: 500,
+    writerId: 'a-stale',
+    sequence: 99
+  })
+  const unrelated = updateMetadataEntry(staleSet, 'activeByScope', 'panel:global', 'thread-b', {
+    updatedAt: 600,
+    writerId: 'a-stale',
+    sequence: 100
+  })
+
+  for (const pair of [[deleted, unrelated], [unrelated, deleted]]) {
+    const merged = mergeHistorySnapshots(
+      { threads: [], meta: pair[0] },
+      { threads: [], meta: pair[1] }
+    )
+    assert.equal(Object.hasOwn(merged.meta.workflowAliases, 'workflows/old.json'), false)
+    assert.equal(merged.meta.aliasOps['workflows/old.json'].deleted, true)
+    assert.equal(merged.meta.activeByScope['panel:global'], 'thread-b')
+  }
 })
 
 test('scope selection never falls back to a chat from another workflow', () => {

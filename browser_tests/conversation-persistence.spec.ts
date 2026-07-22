@@ -4,6 +4,7 @@
  * transcript and the backend session id from the durable thread record.
  */
 import { test, expect } from './fixtures/panelTest'
+import { PanelPage } from './fixtures/PanelPage'
 
 const SESSION_KEY = 'comfyui-mcp.panel.sessionId'
 const CURRENT_THREAD_KEY = 'comfyui-mcp.panel.currentThreadId'
@@ -370,5 +371,80 @@ test('strict workflow storage sync detaches transcript todos and session before 
   expect(rebound.thread?.workflowKey).toBe(`workflow:${rebound.workflowUuid}`)
   expect(rebound.thread?.sessionId).toBeUndefined()
   expect(rebound.sessionId).toBeNull()
+  await otherTab.close()
+})
+
+test('workflow rename publishes alias tombstones and a stale tab cannot echo them back', async ({
+  page,
+  context,
+  panel,
+  mockBridge
+}) => {
+  await panel.goto()
+  await panel.openSidebar()
+  await page.evaluate(() => {
+    const w = window as any
+    const app = w.comfyAPI?.app?.app || w.app
+    const workflow = app.extensionManager?.workflow?.activeWorkflow
+    Object.defineProperties(workflow, {
+      path: { configurable: true, writable: true, value: 'workflows/alias-old.json' },
+      isPersisted: { configurable: true, writable: true, value: true },
+      isTemporary: { configurable: true, writable: true, value: false }
+    })
+  })
+  await expect.poll(() => page.evaluate(() => {
+    const aliases = JSON.parse(localStorage.getItem('comfyui-mcp.panel.workflowUuidAliases') || '{}')
+    return aliases['workflows/alias-old.json'] || null
+  })).not.toBeNull()
+  const workflowUuid = await page.evaluate(() => {
+    const aliases = JSON.parse(localStorage.getItem('comfyui-mcp.panel.workflowUuidAliases') || '{}')
+    return aliases['workflows/alias-old.json']
+  })
+
+  const otherTab = await context.newPage()
+  const otherPanel = new PanelPage(otherTab)
+  await otherTab.goto(page.url())
+  await otherPanel.openSidebar()
+  await expect.poll(() => otherTab.evaluate(() => {
+    const aliases = JSON.parse(localStorage.getItem('comfyui-mcp.panel.workflowUuidAliases') || '{}')
+    return aliases['workflows/alias-old.json'] || null
+  })).toBe(workflowUuid)
+
+  await page.evaluate(() => {
+    const w = window as any
+    const app = w.comfyAPI?.app?.app || w.app
+    app.extensionManager.workflow.activeWorkflow.path = 'workflows/alias-new.json'
+  })
+  await expect.poll(() => page.evaluate(() => {
+    const snapshot = JSON.parse(localStorage.getItem('comfyui-mcp.panel.historySnapshot') || '{}')
+    return {
+      oldDeleted: snapshot.meta?.aliasOps?.['workflows/alias-old.json']?.deleted === true,
+      newValue: snapshot.meta?.workflowAliases?.['workflows/alias-new.json'] || null
+    }
+  })).toEqual({ oldDeleted: true, newValue: workflowUuid })
+
+  await otherPanel.setBridgeUrl(mockBridge.url)
+  await otherPanel.connect()
+  const unrelated = mockBridge.waitForUserMessage()
+  await otherPanel.sendMessage('unrelated append after remote rename')
+  await unrelated
+  await expect.poll(() => otherTab.evaluate(() => {
+    const snapshot = JSON.parse(localStorage.getItem('comfyui-mcp.panel.historySnapshot') || '{}')
+    return snapshot.meta?.aliasOps?.['workflows/alias-old.json']?.deleted === true
+  })).toBe(true)
+
+  await page.reload()
+  await panel.openSidebar()
+  await otherTab.reload()
+  await otherPanel.openSidebar()
+  for (const tab of [page, otherTab]) {
+    await expect.poll(() => tab.evaluate(() => {
+      const aliases = JSON.parse(localStorage.getItem('comfyui-mcp.panel.workflowUuidAliases') || '{}')
+      return {
+        hasOld: Object.hasOwn(aliases, 'workflows/alias-old.json'),
+        newValue: aliases['workflows/alias-new.json'] || null
+      }
+    })).toEqual({ hasOld: false, newValue: workflowUuid })
+  }
   await otherTab.close()
 })
