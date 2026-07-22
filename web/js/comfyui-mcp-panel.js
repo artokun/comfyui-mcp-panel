@@ -7454,7 +7454,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
         const timer = setTimeout(() => {
           pendingCalls.delete(cid);
           reject(new Error("upload_media timed out"));
-        }, 60000);
+          // Large images over slow pod links legitimately exceed a minute;
+          // the mobile client uses the same 3-minute budget for this frame.
+        }, 180_000);
         pendingCalls.set(cid, { resolve, reject, timer });
         try {
           sock.send(

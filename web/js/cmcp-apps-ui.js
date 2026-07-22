@@ -856,13 +856,18 @@ export function openAppsModal(ctx, opts = {}) {
     }
 
     /** Pod image transfer: the bridge's upload_media handler writes the bytes
-     *  to the CONNECTED ComfyUI's input/ — i.e. the pod when we're on a pod. */
+     *  to the CONNECTED ComfyUI's input/ — i.e. the pod when we're on a pod.
+     *  The remote name is uniquified per app+input: ComfyUI's /upload/image
+     *  OVERWRITES on name collision, so two inputs sharing a basename (or a
+     *  repeat run with "image.png") would otherwise silently swap in the last
+     *  upload (codex finding). */
     async function uploadImageToPod(f) {
       if (typeof ctx.uploadMedia !== "function") {
         throw new Error("pod image transfer needs a newer panel bridge — update the orchestrator");
       }
+      const unique = `cmcp-app-${app.id.slice(0, 8)}-${crypto.randomUUID().slice(0, 8)}-${f.name}`;
       status.textContent = `Transferring ${f.name} to the pod…`;
-      const res = await ctx.uploadMedia(f, f.name);
+      const res = await ctx.uploadMedia(f, unique);
       if (!res || res.ok === false) throw new Error((res && res.error) || "pod image transfer failed");
       return res.name;
     }

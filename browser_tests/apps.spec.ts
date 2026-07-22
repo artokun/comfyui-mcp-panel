@@ -353,7 +353,11 @@ test('run on RunPod: dry-patches locally, enqueues on the pod via the bridge', a
   await modal.getByRole('button', { name: '☁ Run on RunPod' }).click()
 
   await expect(modal.locator('.cmcp-apps-status')).toContainText('queued on pod (prompt_id pod-1)')
-  expect(uploads).toEqual([{ filename: 'face.png', mime: 'image/png' }])
+  // The remote name is uniquified (app prefix + random) so same-basename
+  // inputs can never overwrite each other on the pod.
+  expect(uploads).toHaveLength(1)
+  expect(uploads[0].mime).toBe('image/png')
+  expect(uploads[0].filename).toMatch(/^cmcp-app-123e4567-[0-9a-f]{8}-face\.png$/)
   const enqueue = toolCalls.find((c) => c.tool === 'enqueue_workflow')
   expect(enqueue).toBeTruthy()
   const wf = enqueue!.args.workflow as Record<string, { inputs: Record<string, unknown> }>
