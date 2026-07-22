@@ -791,6 +791,7 @@ export class ChatHistoryStore {
     this.writerId = options.writerId || globalThis.crypto?.randomUUID?.() || `writer-${Math.random().toString(16).slice(2)}`;
     this._revisionSequence = 0;
     this._lastRevisionAt = 0;
+    this._observedRevision = null;
     this._writePromise = Promise.resolve(null);
     this._lastCommitted = null;
     const channelFactory = options.broadcastChannelFactory || (
@@ -806,13 +807,42 @@ export class ChatHistoryStore {
   }
 
   nextRevision(updatedAt = Date.now()) {
-    const at = finiteTs(updatedAt) || Date.now();
+    const wallAt = finiteTs(updatedAt) || Date.now();
+    const observedAt = finiteTs(this._observedRevision?.updatedAt);
+    const floor = Math.max(this._lastRevisionAt, observedAt);
+    const at = wallAt > floor ? wallAt : floor + 1;
     if (at !== this._lastRevisionAt) {
       this._lastRevisionAt = at;
       this._revisionSequence = 0;
     }
     this._revisionSequence += 1;
-    return { updatedAt: at, writerId: this.writerId, sequence: this._revisionSequence };
+    const revision = { updatedAt: at, writerId: this.writerId, sequence: this._revisionSequence };
+    this._observedRevision = revision;
+    return revision;
+  }
+
+  _observeRevision(value) {
+    const revision = normalizeRevision(value);
+    if (revision && compareRevisions(revision, this._observedRevision) > 0) {
+      this._observedRevision = revision;
+      this._lastRevisionAt = Math.max(this._lastRevisionAt, revision.updatedAt);
+    }
+  }
+
+  _observeSnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== "object") return;
+    this._observeRevision(snapshot.meta?.checkpoint?.revision);
+    for (const operation of Object.values(snapshot.meta?.activeOps || {})) this._observeRevision(operation);
+    for (const operation of Object.values(snapshot.meta?.aliasOps || {})) this._observeRevision(operation);
+    for (const operation of Object.values(snapshot.meta?.deletedThreads || {})) this._observeRevision(operation);
+    for (const thread of Array.isArray(snapshot.threads) ? snapshot.threads : []) {
+      this._observeRevision(thread?.createdRevision);
+      for (const operation of Object.values(thread?.fieldOps || {})) this._observeRevision(operation);
+      for (const message of Array.isArray(thread?.msgs) ? thread.msgs : []) {
+        this._observeRevision(message?.createdRevision);
+        this._observeRevision(message?.revision || message);
+      }
+    }
   }
 
   reviseThread(thread, values, updatedAt = Date.now()) {
@@ -821,6 +851,7 @@ export class ChatHistoryStore {
     let newestAt = finiteTs(thread.updatedAt);
     for (const [field, value] of Object.entries(values)) {
       if (!THREAD_FIELDS.includes(field)) continue;
+      this._observeRevision(fieldOps[field]);
       const revision = this.nextRevision(updatedAt);
       const deleted = value == null;
       fieldOps[field] = {
@@ -841,6 +872,7 @@ export class ChatHistoryStore {
 
   touchMessage(message, updatedAt = Date.now()) {
     if (!message || typeof message !== "object") return message;
+    this._observeRevision(message.revision || message);
     const revision = this.nextRevision(updatedAt);
     message.updatedAt = revision.updatedAt;
     message.revision = revision;
@@ -879,6 +911,7 @@ export class ChatHistoryStore {
     const local = this.readLocal();
     const indexed = await idbRead(this.indexedDb);
     const merged = mergeHistorySnapshots(local, indexed);
+    this._observeSnapshot(merged);
     // Migration is automatic: once loaded, the full merged set is promoted to
     // IndexedDB while a small legacy shadow remains for older panel builds.
     this.persist(merged.threads, merged.meta, options);
@@ -886,7 +919,9 @@ export class ChatHistoryStore {
   }
 
   async readCanonical() {
-    return mergeHistorySnapshots(this.readLocal(), await idbRead(this.indexedDb));
+    const merged = mergeHistorySnapshots(this.readLocal(), await idbRead(this.indexedDb));
+    this._observeSnapshot(merged);
+    return merged;
   }
 
   _writeLocalSnapshot(snapshot, protectedThreadIds) {
@@ -921,6 +956,7 @@ export class ChatHistoryStore {
 
   persist(threads, meta = {}, options = {}) {
     const snapshot = mergeHistorySnapshots({ threads, meta });
+    this._observeSnapshot(snapshot);
     const protectedThreadIds = [
       ...(Array.isArray(options.protectedThreadIds) ? options.protectedThreadIds : []),
       ...Object.values(snapshot.meta.activeByScope || {}),
@@ -942,6 +978,7 @@ export class ChatHistoryStore {
       .then((merged) => {
         if (merged) {
           this._lastCommitted = merged;
+          this._observeSnapshot(merged);
           this._writeLocalSnapshot(merged, protectedThreadIds);
           try {
             this._broadcastChannel?.postMessage({ type: "history-changed", writerId: this.writerId });

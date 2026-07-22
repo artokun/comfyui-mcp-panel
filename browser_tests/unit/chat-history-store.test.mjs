@@ -258,6 +258,87 @@ test('exact revision ties use writer and sequence deterministically in both merg
   }
 })
 
+test('observed revisions advance every mutable field and card state despite backward clocks', async () => {
+  const future = { updatedAt: 50_000, writerId: 'future-tab', sequence: 9 }
+  const fields = {
+    sessionId: 'old-session',
+    todos: [{ text: 'old', status: 'pending' }],
+    workflowKey: 'workflow:old',
+    workflowTitle: 'Old workflow',
+    provider: 'claude',
+    model: 'old-model',
+    effort: 'low',
+    pinned: false,
+    title: 'Old title'
+  }
+  const fieldOps = Object.fromEntries(Object.entries(fields).map(([field, value]) => [field, {
+    value,
+    deleted: false,
+    updatedAt: future.updatedAt,
+    revision: future
+  }]))
+  const thread = normalizeThread({
+    id: 'clock-skew-thread',
+    ...fields,
+    updatedAt: future.updatedAt,
+    fieldOps,
+    msgs: [{
+      id: 'card',
+      role: 'card',
+      text: 'old card',
+      createdAt: 10,
+      updatedAt: future.updatedAt,
+      revision: future
+    }]
+  })
+  const store = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb: null,
+    writerId: 'backward-clock'
+  })
+  store.reviseThread(thread, {
+    sessionId: 'new-session',
+    todos: [{ text: 'new', status: 'done' }],
+    workflowKey: 'workflow:new',
+    workflowTitle: 'New workflow',
+    provider: 'codex',
+    model: 'new-model',
+    effort: 'high',
+    pinned: true,
+    title: 'New title'
+  }, 1_000)
+  thread.msgs[0].text = 'new card'
+  store.touchMessage(thread.msgs[0], 900)
+
+  for (const operation of Object.values(thread.fieldOps)) {
+    assert.ok(operation.revision.updatedAt > future.updatedAt)
+  }
+  assert.ok(thread.msgs[0].revision.updatedAt > future.updatedAt)
+
+  const canonicalFuture = normalizeThread({
+    id: 'remote',
+    sessionId: 'remote-session',
+    updatedAt: 90_000,
+    fieldOps: {
+      sessionId: {
+        value: 'remote-session',
+        deleted: false,
+        updatedAt: 90_000,
+        revision: { updatedAt: 90_000, writerId: 'remote', sequence: 1 }
+      }
+    },
+    msgs: []
+  })
+  const hydrated = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb: createFakeIndexedDb({ threads: [canonicalFuture], meta: {} }),
+    writerId: 'hydrated-backward-clock'
+  })
+  const loaded = await hydrated.load()
+  hydrated.reviseThread(loaded.threads[0], { sessionId: null }, 500)
+  assert.ok(loaded.threads[0].fieldOps.sessionId.revision.updatedAt > 90_000)
+})
+
 test('thread tombstones preserve causal delete operations and prevent stale resurrection', () => {
   const deletedAt = { updatedAt: 500, writerId: 'delete-tab', sequence: 1 }
   const merged = mergeHistorySnapshots(
