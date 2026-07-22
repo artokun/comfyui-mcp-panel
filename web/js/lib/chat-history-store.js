@@ -78,6 +78,23 @@ export function selectPanelThread(threads, meta) {
   return candidates.find((thread) => thread?.id === activeId) || candidates[0] || null;
 }
 
+/** Choose the durable conversation for reload without replacing a conversation
+ * already selected by this browser tab. In per-workflow mode that preferred
+ * pointer is still subject to the strict workflow scope guard. */
+export function selectRestoreThread(
+  threads,
+  meta,
+  { panelOwned = true, scopeKey = null, preferredThreadId = null } = {},
+) {
+  const preferred = preferredThreadId
+    ? (Array.isArray(threads) ? threads : []).find((candidate) => candidate?.id === preferredThreadId)
+    : null;
+  if (preferred && (panelOwned || isThreadInScope(preferred, scopeKey))) return preferred;
+  return panelOwned
+    ? selectPanelThread(threads, meta)
+    : selectThreadForScope(threads, meta, scopeKey);
+}
+
 function mergeThreadMessages(older, newer) {
   const oldMessages = Array.isArray(older?.msgs) ? older.msgs : [];
   const newMessages = Array.isArray(newer?.msgs) ? newer.msgs : [];
@@ -189,6 +206,9 @@ function openDb(indexedDb) {
       resolve(null);
       return;
     }
+    // The schema number is also the IndexedDB version: every future bump fires
+    // this callback. Structural store/index migrations belong here; record-shape
+    // migration remains app-layer normalization in mergeHistorySnapshots().
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains("snapshots")) db.createObjectStore("snapshots");

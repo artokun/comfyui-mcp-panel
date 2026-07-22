@@ -69,7 +69,7 @@ import { computeLayout } from "./lib/layout-engine.js";
 import {
   ChatHistoryStore,
   mergeHistorySnapshots,
-  selectPanelThread,
+  selectRestoreThread,
   selectThreadForScope,
 } from "./lib/chat-history-store.js";
 import {
@@ -1218,8 +1218,9 @@ let suppressSettingOnChange = false;
 // side effects: a persisted Auto-connect/Bridge-URL would call connectAgent() and
 // race the sticky-autoconnect path, and with the bridge's one-socket-per-tab policy
 // each new socket closes the other → a ~1s reconnect storm. So onChange appliers
-// stay disarmed until the panel has mounted AND made its single initial connect
-// decision; only genuine post-load user edits in the Settings dialog take effect.
+// stay disarmed until the panel has mounted and the startup volley has settled.
+// Reload restore and the single initial connect decision wait on that boundary;
+// only genuine post-load user edits in the Settings dialog take effect.
 let settingsArmed = false;
 
 // Per-backend FETCHED model catalog PUBLISHED for the Settings dialog's
@@ -9734,13 +9735,17 @@ function buildPanel() {
     }
   }
   seedFromSettings();
-  // Arm the setting onChange appliers only AFTER mount + the startup onChange volley
-  // and the initial (sticky) connect decision have settled — so ComfyUI applying a
-  // persisted Auto-connect/Bridge-URL at load can't drive a connect that storms.
-  // Genuine user edits in the Settings dialog happen long after this window.
-  setTimeout(() => {
-    settingsArmed = true;
-  }, 2500);
+  // Resolve only after ComfyUI's startup onChange volley has settled. Reload
+  // restore and the initial connection both wait on this same boundary, so neither
+  // can bind a thread/session using the default value before settings hydrate.
+  const settingsHydrated = settingsArmed
+    ? Promise.resolve()
+    : new Promise((resolve) => {
+      setTimeout(() => {
+        settingsArmed = true;
+        resolve();
+      }, 2500);
+    });
 
   refreshModelChip();
 
@@ -10379,6 +10384,8 @@ function buildPanel() {
   // thread. IndexedDB is canonical; localStorage remains a small synchronous
   // startup shadow and migration source for pre-v2 panel builds.
   const THREADS_KEY = "comfyui-mcp.panel.threads";
+  // Intentional canonical durable caps. The synchronous localStorage startup
+  // shadow stays much smaller (20 threads / 200 messages) in ChatHistoryStore.
   const MAX_THREADS = 500;
   const MAX_THREAD_MSGS = 5000;
   const historyStore = new ChatHistoryStore({ threadsKey: THREADS_KEY });
@@ -11437,15 +11444,8 @@ function buildPanel() {
     client?.sendFrame?.({ type: "new_session" });
   }
 
-  function loadThread(t) {
-    if (!sessionFollowsPanel() && !isThreadInScope(t, workflowStorageKey())) {
-      appendSystem("Blocked a chat from another workflow. Open its owning workflow before resuming it.");
-      return false;
-    }
+  function paintThread(t) {
     thread = t;
-    ssSet(CURRENT_THREAD_KEY, t.id);
-    setActiveThread(currentHistorySelectionKey(), t.id);
-    persistThreads();
     resetFeed();
     for (const m of t.msgs) {
       if (m.role === "user") paintUser(m.text, { attachments: m.attachments });
@@ -11455,7 +11455,18 @@ function buildPanel() {
         else paintCard(m);
       }
     }
-    renderTodo(t.todos || []); // restore this thread's plan into the tray
+    renderTodo(t.todos || []);
+  }
+
+  function loadThread(t) {
+    if (!sessionFollowsPanel() && !isThreadInScope(t, workflowStorageKey())) {
+      appendSystem("Blocked a chat from another workflow. Open its owning workflow before resuming it.");
+      return false;
+    }
+    ssSet(CURRENT_THREAD_KEY, t.id);
+    setActiveThread(currentHistorySelectionKey(), t.id);
+    persistThreads();
+    paintThread(t);
     // Resume this conversation's agent session (or start fresh if it has none),
     // so typing continues THIS chat rather than whatever was last active.
     ssSet(SESSION_KEY, t.sessionId || null);
@@ -13208,6 +13219,9 @@ function buildPanel() {
   }
 
   async function connectAgent(opts = {}) {
+    // hello reads SESSION_KEY, so wait until reload reconciliation has made the
+    // single settings-aware thread/session binding for this browser tab.
+    await historyRestoreReady;
     // A chip pick (opts.fromChip) is an EXPLICIT backend choice — it must always
     // (re)connect to that backend's port, so it bypasses the in-flight guard (which
     // a sticky-reconnect could otherwise hold) and the manual-URL override below.
@@ -15026,76 +15040,75 @@ function buildPanel() {
   const onPageHide = () => { void historyStore.flush(); };
   window.addEventListener("pagehide", onPageHide);
 
-  // Reload restore: repaint the chat this tab was last showing. The agent's
-  // memory continues automatically — either the orchestrator's agent for this
-  // (stable) tab id is still alive, or hello's `resume` (the session id kept in
-  // sessionStorage) rehydrates it from disk after an orchestrator restart.
+  // Reload restore preserves this tab's exact conversation/session pair. When
+  // those tab-scoped pointers were lost in a full browser restart, the durable
+  // active pointer supplies the fallback after settings and IndexedDB hydrate.
+  const reloadThreadId = ssGet(CURRENT_THREAD_KEY);
+  const reloadSessionId = ssGet(SESSION_KEY);
+
+  // This synchronous pass is paint-only. Settings may not be hydrated, so it
+  // must not infer a scope, rewrite session keys, persist metadata, or send a
+  // session frame. With no tab pointer, canonical IndexedDB recovery paints later.
   (function restoreLastThread() {
     try {
-      const cur = ssGet(CURRENT_THREAD_KEY);
-      const pointed = cur ? threads.find((x) => x.id === cur) : null;
-      if (sessionFollowsPanel()) {
-        // Recover from a lost tab pointer using durable metadata/newest fallback.
-        // Settings may not be hydrated yet, so never rewrite the thread's key.
-        const panelThread = pointed || selectPanelThread(threads, historyMeta);
-        if (!panelThread || !panelThread.msgs?.length) return;
-        thread = panelThread;
-        ssSet(CURRENT_THREAD_KEY, panelThread.id);
-        ssSet(SESSION_KEY, panelThread.sessionId || null);
-        setActiveThread("panel:global", panelThread.id);
-        resetFeed();
-        for (const m of panelThread.msgs) {
-          if (m.role === "user") paintUser(m.text, { attachments: m.attachments });
-          else if (m.role === "agent") paintAgent(m.text);
-          else if (m.role === "card") {
-            if (m.kind === "a2ui") paintA2UIRecord(m);
-            else paintCard(m);
-          }
-        }
-        renderTodo(panelThread.todos || []);
-        return;
-      }
-      const scopeKey = workflowStorageKey();
-      const scopedPointed = pointed && isThreadInScope(pointed, scopeKey) ? pointed : null;
-      const t = scopedPointed || threadForWorkflow(scopeKey);
-      if (!t || !t.msgs?.length) return;
-      thread = t;
-      ssSet(CURRENT_THREAD_KEY, t.id);
-      ssSet(SESSION_KEY, t.sessionId || null);
-      setActiveThread(t.workflowKey, t.id);
-      resetFeed();
-      for (const m of t.msgs) {
-        if (m.role === "user") paintUser(m.text, { attachments: m.attachments });
-        else if (m.role === "agent") paintAgent(m.text);
-        else if (m.role === "card") {
-          if (m.kind === "a2ui") paintA2UIRecord(m);
-          else paintCard(m);
-        }
-      }
-      renderTodo(t.todos || []); // restore this thread's plan into the tray
+      const pointed = reloadThreadId
+        ? threads.find((candidate) => candidate.id === reloadThreadId)
+        : null;
+      if (pointed?.msgs?.length) paintThread(pointed);
     } catch {
       // Corrupt/absent state — start clean.
     }
   })();
 
-  // Paint the localStorage shadow immediately, then hydrate the canonical
-  // IndexedDB snapshot in the background and promote any legacy records.
-  void historyStore.load().then((loaded) => {
-    const merged = mergeHistorySnapshots({ threads, meta: historyMeta }, loaded);
-    threads = merged.threads.slice(-MAX_THREADS);
-    historyMeta = merged.meta;
-    if (historyMeta.workflowAliases && typeof historyMeta.workflowAliases === "object") {
-      _workflowUuidAliases = { ...historyMeta.workflowAliases, ..._workflowUuidAliases };
-      persistWorkflowAliases();
+  // Merge the canonical IndexedDB snapshot in the background and promote any
+  // legacy records before making the final, settings-aware binding.
+  const historyRestoreReady = (async () => {
+    try {
+      const loaded = await historyStore.load();
+      const merged = mergeHistorySnapshots({ threads, meta: historyMeta }, loaded);
+      threads = merged.threads.slice(-MAX_THREADS);
+      historyMeta = merged.meta;
+      if (historyMeta.workflowAliases && typeof historyMeta.workflowAliases === "object") {
+        _workflowUuidAliases = { ...historyMeta.workflowAliases, ..._workflowUuidAliases };
+        persistWorkflowAliases();
+      }
+      persistThreads();
+    } catch {
+      // localStorage shadow remains usable when IndexedDB is unavailable.
     }
+
+    await settingsHydrated;
+    const panelOwned = sessionFollowsPanel();
+    const scopeKey = panelOwned ? "panel:global" : workflowStorageKey();
+    const durableActive = selectRestoreThread(threads, historyMeta, {
+      panelOwned,
+      scopeKey,
+      preferredThreadId: reloadThreadId,
+    });
+
+    if (!durableActive) {
+      thread = null;
+      ssSet(CURRENT_THREAD_KEY, null);
+      ssSet(SESSION_KEY, null);
+      setActiveThread(scopeKey, null);
+      resetFeed();
+      renderTodo([]);
+      persistThreads();
+      return;
+    }
+
+    // For the exact conversation already owned by this tab, sessionStorage is
+    // authoritative even when empty. The stored id is only a full-restart fallback.
+    const boundSessionId = durableActive.id === reloadThreadId
+      ? reloadSessionId
+      : (durableActive.sessionId || null);
+    if (durableActive.id === reloadThreadId) durableActive.sessionId = boundSessionId;
+    ssSet(CURRENT_THREAD_KEY, durableActive.id);
+    ssSet(SESSION_KEY, boundSessionId);
+    setActiveThread(scopeKey, durableActive.id);
+    paintThread(durableActive);
     persistThreads();
-    const durableActive = sessionFollowsPanel()
-      ? selectPanelThread(threads, historyMeta)
-      : threadForWorkflow(currentTranscriptScopeKey());
-    if (durableActive && durableActive.id !== thread?.id) loadThread(durableActive);
-  }).catch(() => {
-    // localStorage shadow already painted; persistence degrades gracefully.
-  });
+  })();
 
   // ---- Settings dialog → live panel hooks ----
   // Registered now that the runtime + connect functions exist. Each applier is
@@ -15204,6 +15217,7 @@ function buildPanel() {
   void loadBackends();
 
   (async () => {
+    await historyRestoreReady;
     // If a restart we triggered reloaded the page, finish the autonomous resume:
     // respawn the orchestrator and let onStatus(connected) nudge the agent.
     if (ssGet(REBOOT_KEY)) {

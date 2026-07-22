@@ -8,6 +8,7 @@ import {
   mergeHistorySnapshots,
   normalizeThread,
   selectPanelThread,
+  selectRestoreThread,
   selectThreadForScope
 } from '../../web/js/lib/chat-history-store.js'
 
@@ -118,6 +119,31 @@ test('panel selection preserves provenance and recovers when its tab pointer is 
   )
   assert.equal(selectPanelThread(threads, {})?.id, 'newest')
   assert.equal(threads[0].workflowKey, 'wf:workflows/a.json')
+})
+
+test('reload keeps the tab-pointed panel conversation instead of switching to a newer thread', () => {
+  const threads = [
+    { id: 'visible', workflowKey: 'workflow:wf-a', updatedAt: 100, msgs: [] },
+    { id: 'newer-background', workflowKey: 'workflow:wf-b', updatedAt: 999, msgs: [] }
+  ]
+
+  assert.equal(selectRestoreThread(threads, {}, {
+    panelOwned: true,
+    preferredThreadId: 'visible'
+  })?.id, 'visible')
+})
+
+test('reload never accepts a tab pointer from another workflow', () => {
+  const threads = [
+    { id: 'visible-elsewhere', workflowKey: 'workflow:wf-b', updatedAt: 999, msgs: [] },
+    { id: 'scoped', workflowKey: 'workflow:wf-a', updatedAt: 100, msgs: [] }
+  ]
+
+  assert.equal(selectRestoreThread(threads, {}, {
+    panelOwned: false,
+    scopeKey: 'workflow:wf-a',
+    preferredThreadId: 'visible-elsewhere'
+  })?.id, 'scoped')
 })
 
 test('notifies another tab when the local history shadow changes', () => {
