@@ -10480,6 +10480,28 @@ function buildPanel() {
     });
   }
 
+  function detachInvalidCurrentThread({ scopeKey = null, rebind = false } = {}) {
+    thread = null;
+    ssSet(CURRENT_THREAD_KEY, null);
+    ssSet(SESSION_KEY, null);
+    resetFeed();
+    renderTodo([], { persist: false });
+    const replacement = rebind && scopeKey
+      ? selectThreadForScope(threads, historyMeta, scopeKey)
+      : null;
+    if (replacement) {
+      thread = replacement;
+      ssSet(CURRENT_THREAD_KEY, replacement.id);
+      ssSet(SESSION_KEY, replacement.sessionId || null);
+      setActiveThread(currentHistorySelectionKey(), replacement.id);
+      paintThread(replacement);
+    } else if (scopeKey) {
+      setActiveThread(currentHistorySelectionKey(), null);
+    }
+    persistThreads();
+    return replacement;
+  }
+
   const unsubscribeHistorySync = historyStore.subscribe((incoming) => {
     const currentThreadId = thread?.id;
     const merged = mergeHistorySnapshots({ threads, meta: historyMeta }, incoming);
@@ -10491,16 +10513,8 @@ function buildPanel() {
       if (refreshed && (panelOwned || isThreadInScope(refreshed, currentTranscriptScopeKey()))) {
         thread = refreshed;
       } else {
-        // Never keep a reference to an object no longer present in `threads`.
-        // The next record must create/rebind a valid conversation rather than
-        // append to a detached object that persistThreads() cannot serialize.
-        thread = null;
-        ssSet(CURRENT_THREAD_KEY, null);
-        if (historyMeta.deletedThreads?.[currentThreadId]) {
-          ssSet(SESSION_KEY, null);
-          resetFeed();
-          renderTodo([]);
-        }
+        const scopeKey = panelOwned ? null : currentTranscriptScopeKey();
+        detachInvalidCurrentThread({ scopeKey, rebind: !panelOwned });
       }
     }
     if (!histPop.hidden) renderHistory();
@@ -10528,8 +10542,7 @@ function buildPanel() {
     // Settings can hydrate after a greeting was painted. Never append a real
     // workflow-scoped message to a thread carrying another scope.
     if (thread && perWorkflow && !isThreadInScope(thread, scopeKey)) {
-      thread = null;
-      ssSet(CURRENT_THREAD_KEY, null);
+      detachInvalidCurrentThread({ scopeKey, rebind: true });
     }
     if (!thread) {
       const now = Date.now();
@@ -10543,9 +10556,10 @@ function buildPanel() {
         workflowKey: scopeKey,
       };
       historyStore.reviseThread(thread, { workflowKey: scopeKey }, now);
-      // Adopt any session id the orchestrator has already reported for this tab.
+      // A workflow-scoped conversation never adopts a loose tab session. Its
+      // session must arrive through a thread selected for this exact scope.
       const sid = ssGet(SESSION_KEY);
-      if (sid) historyStore.reviseThread(thread, { sessionId: sid }, now);
+      if (sid && !perWorkflow) historyStore.reviseThread(thread, { sessionId: sid }, now);
       threads.push(thread);
       if (threads.length > MAX_THREADS) threads = capHistoryThreads(threads, thread.id);
       ssSet(CURRENT_THREAD_KEY, thread.id);
@@ -11556,6 +11570,7 @@ function buildPanel() {
 
   function loadThread(t) {
     if (!sessionFollowsPanel() && !isThreadInScope(t, workflowStorageKey())) {
+      detachInvalidCurrentThread({ scopeKey: workflowStorageKey(), rebind: true });
       appendSystem("Blocked a chat from another workflow. Open its owning workflow before resuming it.");
       return false;
     }

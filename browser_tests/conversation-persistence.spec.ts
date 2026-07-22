@@ -12,7 +12,7 @@ const LOCAL_HISTORY_SNAPSHOT_KEY = 'comfyui-mcp.panel.historySnapshot'
 async function indexedThreadCount(page: import('@playwright/test').Page): Promise<number> {
   return page.evaluate(async () => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('comfyui-mcp-panel-history', 2)
+      const request = indexedDB.open('comfyui-mcp-panel-history', 3)
       request.onsuccess = () => resolve(request.result)
       request.onerror = () => reject(request.error)
     })
@@ -31,7 +31,7 @@ async function indexedThreadCount(page: import('@playwright/test').Page): Promis
 async function indexedHasText(page: import('@playwright/test').Page, text: string): Promise<boolean> {
   return page.evaluate(async (needle) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('comfyui-mcp-panel-history', 2)
+      const request = indexedDB.open('comfyui-mcp-panel-history', 3)
       request.onsuccess = () => resolve(request.result)
       request.onerror = () => reject(request.error)
     })
@@ -55,7 +55,7 @@ async function indexedHasThread(
 ): Promise<boolean> {
   return page.evaluate(async (id) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('comfyui-mcp-panel-history', 2)
+      const request = indexedDB.open('comfyui-mcp-panel-history', 3)
       request.onsuccess = () => resolve(request.result)
       request.onerror = () => reject(request.error)
     })
@@ -126,7 +126,7 @@ async function seedReloadEvictionRace(
     localStorage.setItem('comfyui-mcp.panel.historyMeta', JSON.stringify(local.meta))
 
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('comfyui-mcp-panel-history', 2)
+      const request = indexedDB.open('comfyui-mcp-panel-history', 3)
       request.onsuccess = () => resolve(request.result)
       request.onerror = () => reject(request.error)
     })
@@ -280,4 +280,95 @@ test('reload keeps the pointed conversation and live tab session during durable 
   await expect.poll(() => indexedThreadCount(page)).toBe(500)
   await expect.poll(() => indexedHasThread(page, currentThreadId!)).toBe(true)
   expect(await page.evaluate((key) => localStorage.getItem(key), LOCAL_HISTORY_SNAPSHOT_KEY)).not.toBeNull()
+})
+
+test('strict workflow storage sync detaches transcript todos and session before the next record', async ({
+  page,
+  context,
+  panel,
+  mockBridge
+}) => {
+  await page.route(
+    (url) => /\/(api\/)?settings\/?$/.test(url.pathname),
+    async (route) => {
+      if (route.request().method() !== 'GET') return route.continue()
+      const response = await route.fetch()
+      const settings = await response.json() as Record<string, unknown>
+      settings['comfyui-mcp.sessionFollowsPanel'] = false
+      await route.fulfill({ response, json: settings })
+    }
+  )
+  await panel.goto()
+  await panel.setBridgeUrl(mockBridge.url)
+  await panel.openSidebar()
+  await panel.connect()
+  mockBridge.send({ type: 'session', session_id: 'workflow-a-session' })
+
+  const initial = mockBridge.waitForUserMessage()
+  await panel.sendMessage('workflow A visible transcript')
+  await initial
+  await expect.poll(
+    () => page.evaluate((key) => sessionStorage.getItem(key), SESSION_KEY)
+  ).toBe('workflow-a-session')
+  const currentThreadId = await page.evaluate(
+    (key) => sessionStorage.getItem(key),
+    CURRENT_THREAD_KEY
+  )
+  expect(currentThreadId).not.toBeNull()
+
+  const otherTab = await context.newPage()
+  await otherTab.goto(page.url())
+  await otherTab.evaluate(({ snapshotKey, threadId }) => {
+    const snapshot = JSON.parse(localStorage.getItem(snapshotKey) || '{}')
+    const thread = snapshot.threads?.find((candidate: any) => candidate.id === threadId)
+    if (!thread) throw new Error('current thread missing from shared shadow')
+    const updatedAt = Date.now() + 10_000
+    const revision = { updatedAt, writerId: 'tab-b', sequence: 1 }
+    thread.workflowKey = 'workflow:foreign-provenance'
+    thread.todos = [{ text: 'foreign todo', status: 'active' }]
+    thread.updatedAt = updatedAt
+    thread.ts = updatedAt
+    thread.fieldOps = {
+      ...(thread.fieldOps || {}),
+      workflowKey: {
+        value: 'workflow:foreign-provenance',
+        deleted: false,
+        updatedAt,
+        revision
+      },
+      todos: {
+        value: [{ text: 'foreign todo', status: 'active' }],
+        deleted: false,
+        updatedAt,
+        revision: { ...revision, sequence: 2 }
+      }
+    }
+    localStorage.setItem(snapshotKey, JSON.stringify(snapshot))
+  }, { snapshotKey: LOCAL_HISTORY_SNAPSHOT_KEY, threadId: currentThreadId })
+
+  await expect.poll(
+    () => page.evaluate((key) => sessionStorage.getItem(key), SESSION_KEY)
+  ).toBeNull()
+  await expect.poll(
+    () => page.evaluate((key) => sessionStorage.getItem(key), CURRENT_THREAD_KEY)
+  ).toBeNull()
+  await expect(panel.userBubble('workflow A visible transcript')).toHaveCount(0)
+  await expect(panel.root.locator('.cmcp-todo-item')).toHaveCount(0)
+
+  const next = mockBridge.waitForUserMessage()
+  await panel.sendMessage('fresh workflow A transcript')
+  await next
+  const rebound = await page.evaluate(({ snapshotKey, sessionKey }) => {
+    const w = window as any
+    const app = w.comfyAPI?.app?.app || w.app
+    const workflowUuid = app.graph?.extra?.comfyui_mcp?.workflow_uuid
+    const snapshot = JSON.parse(localStorage.getItem(snapshotKey) || '{}')
+    const thread = snapshot.threads?.find((candidate: any) =>
+      candidate.msgs?.some((message: any) => message.text === 'fresh workflow A transcript'))
+    return { workflowUuid, thread, sessionId: sessionStorage.getItem(sessionKey) }
+  }, { snapshotKey: LOCAL_HISTORY_SNAPSHOT_KEY, sessionKey: SESSION_KEY })
+  expect(rebound.thread?.workflowKey).toBe(`workflow:${rebound.workflowUuid}`)
+  expect(rebound.thread?.sessionId).toBeUndefined()
+  expect(rebound.sessionId).toBeNull()
+  await otherTab.close()
 })
