@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-22
+
 ### Added
 - **RunPod control panel** (`cmcp-runpod-ui.js`) — a toolbar host pill that
   reads **🟢 Local** or **🔵 RunPod** and opens a control modal: live status
@@ -20,6 +22,23 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - CivitAI browser: the **base-model filter is now complete and searchable**, and
   the composer is uncrowded (#108, #110).
+
+### Added
+- dock + slide the three toolbar side-panels; CivitAI share closes + right-aligned actions (#113)
+- agent-drivable CivitAI + training modals with side-dock + green highlights (#112)
+- RunPod control panel + honest host indicator (#100)
+- Local/Pod target switch in the training wizard (P4) (#109)
+- Antigravity (Google subscription) provider chip (comfyui-mcp#262)
+- docs wordmark in the panel header; chat bubble back in the sidebar (#105)
+- LoRA training wizard — dataset gather/label + launch/monitor (panel) (#96)
+
+### Fixed
+- defects in the base-model filter found reviewing #108 (#110)
+- uncrowd the composer; make the base-model filter complete and searchable (#108)
+- _antigravity_installed honors COMFYUI_MCP_ANTIGRAVITY_PATH (comfyui-mcp#271)
+- render each slot's help text in the API Keys card (#103)
+- crop, centre and whiten the header wordmark (#107)
+
 
 ## [0.9.9] - 2026-07-20
 
