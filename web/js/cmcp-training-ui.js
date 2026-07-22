@@ -243,6 +243,10 @@ export function openTrainingModal(ctx = {}, opts = {}) {
   let _onDockResize = null;
   let _dockDispose = null;
   let _onEscape = null;
+  // train_doctor generation: every doctor request captures the current value;
+  // only the NEWEST completion may write wiz.podInfo, so a slow stale doctor
+  // can't resurrect a pod that a later check found gone (codex finding).
+  let doctorGen = 0;
   const stopPolling = () => {
     pollGen++; // invalidate any in-flight poll response
     if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
@@ -776,9 +780,11 @@ export function openTrainingModal(ctx = {}, opts = {}) {
       grid.textContent = "";
       wiz.images.forEach((img) => {
         const item = el("div", "cmcp-tr-labelitem");
-        // Stable per-image ref (audit item 7): key off the dataset filename, NOT
-        // the array index (which shifts when an image is removed).
-        const imgId = img.ref?.filename || img.ref?.subfolder && `${img.ref.subfolder}/${img.ref?.filename}`;
+        // Stable per-image ref (audit item 7): key off subfolder+filename (the
+        // selection identity), NOT the array index (which shifts on removal) and
+        // NOT filename alone (a/foo.png and b/foo.png would collide — codex).
+        const fn = img.ref?.filename;
+        const imgId = fn ? (img.ref?.subfolder ? `${img.ref.subfolder}/${fn}` : fn) : null;
         if (imgId) item.dataset.ref = `caption:${imgId}`;
         const thumb = el("div", "thumb");
         thumb.style.backgroundImage = `url("${img.thumb}")`;
@@ -899,7 +905,11 @@ export function openTrainingModal(ctx = {}, opts = {}) {
     const gpuLine = el("p", "cmcp-tr-hint");
     sec.append(gpuLine);
     fetchGpuLabel(ctx.api).then((gpu) => { if (gpu) gpuLine.textContent = `Local GPU: ${gpu}`; });
+    const myDoctorGen = ++doctorGen;
     callJson(ctx, "train_doctor", {}, { timeout: 180000 }).then((d) => {
+      // A newer doctor (e.g. driveSetTarget's preflight) superseded this one —
+      // don't let a stale completion overwrite wiz.podInfo or rebuild the switch.
+      if (myDoctorGen !== doctorGen) return;
       const dd = d.data || {};
       wiz.podInfo = dd.pod && dd.pod.status === "RUNNING" ? dd.pod : null;
       // Re-derive target from the FRESH doctor result: if no pod (or its SSH
@@ -1266,6 +1276,18 @@ export function openTrainingModal(ctx = {}, opts = {}) {
     const m = /^wizard-(\d)$/.exec(currentView);
     return m ? Number(m[1]) : null;
   }
+  /** Readiness signals — the SINGLE source both getState() reports and
+   *  gotoStep() enforces (so the agent's view of "can I advance?" matches what
+   *  the wizard actually gates on, mirroring the gather Next button). */
+  function _readiness() {
+    return {
+      backendCapable, backendChecked,
+      nameOk: !!sanitizeNameClient(wiz.datasetName),
+      uploadsSettled: wiz.uploadsPending === 0,
+      hasImages: wiz.images.length >= 1,
+      hasJob: !!wiz.jobId,
+    };
+  }
   function driveGetState() {
     return {
       isOpen: !closed, view: currentView, step: _stepNum(), target: wiz.target,
@@ -1275,6 +1297,7 @@ export function openTrainingModal(ctx = {}, opts = {}) {
       podAvailable: !!(wiz.podInfo && wiz.podInfo.ssh),
       docked: !applyDock.centered && overlay.classList.contains("cmcp-docked"),
       highlighted: wiz.highlightRefs.slice(),
+      readiness: _readiness(),
     };
   }
   function driveSetField(name, value) {
@@ -1294,20 +1317,44 @@ export function openTrainingModal(ctx = {}, opts = {}) {
     if (currentView) show(currentView);
     return { ok: true, name, value: wiz[name] };
   }
-  function driveGotoStep(step) {
+  async function driveGotoStep(step) {
     _assertOpen();
     const view = _STEP_VIEW[Number(step)] || (step === "flows" || step === "jobs" ? step : null);
     if (!view) throw new Error(`invalid step "${step}" (expected 1-4, "flows", or "jobs")`);
+    const n = Number(step);
+    // Entering a wizard step ENFORCES the same prerequisites as the Next button
+    // (codex finding: gotoStep previously bypassed them). Label/Launch/Monitor
+    // all require the dataset to be ready; Monitor also needs a live job.
+    if (n >= 2 && n <= 4) {
+      const capable = await checkBackendCapable();
+      _assertOpen();
+      if (!capable) throw new Error("trainer backend unavailable — the orchestrator doesn't expose the train_* tools");
+      const r = _readiness();
+      if (!r.nameOk) throw new Error("set a valid dataset name before advancing");
+      if (!r.hasImages) throw new Error("add at least one image before advancing");
+      if (!r.uploadsSettled) throw new Error(`wait for ${wiz.uploadsPending} upload(s) to settle before advancing`);
+    }
+    if (n === 4 && !wiz.jobId) throw new Error("no training job to monitor — launch one first");
     show(view);
     return { view: currentView, step: _stepNum() };
   }
-  function driveSetTarget(target) {
+  async function driveSetTarget(target) {
     _assertOpen();
     if (target !== "local" && target !== "pod") throw new Error(`invalid target "${target}" (expected "local" or "pod")`);
-    // Preflight gate: a pod target needs a RUNNING pod with a working SSH
-    // endpoint (populated by the Launch step's train_doctor). Reject otherwise
-    // rather than arming a launch that would fail at staging.
-    if (target === "pod" && !(wiz.podInfo && wiz.podInfo.ssh)) throw new Error("no connected pod with a working SSH endpoint");
+    if (target === "pod") {
+      // Await a CURRENT preflight — never trust a possibly-stale wiz.podInfo. A
+      // versioned doctor means only the newest completion writes wiz.podInfo, so
+      // after the await it reflects the freshest check (codex finding).
+      const myDoctorGen = ++doctorGen;
+      let dd;
+      try { dd = (await callJson(ctx, "train_doctor", {}, { timeout: 180000 })).data || {}; }
+      catch (e) { throw new Error("pod preflight failed: " + (e.message || e)); }
+      _assertOpen();
+      if (myDoctorGen === doctorGen) {
+        wiz.podInfo = dd.pod && dd.pod.status === "RUNNING" ? dd.pod : null;
+      }
+      if (!(wiz.podInfo && wiz.podInfo.ssh)) throw new Error("no connected pod with a working SSH endpoint");
+    }
     wiz.target = target;
     if (currentView === "wizard-3") show("wizard-3"); // re-derive Launch enablement
     return { target: wiz.target };

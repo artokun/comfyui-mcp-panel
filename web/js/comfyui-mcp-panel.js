@@ -6997,9 +6997,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
             if (!onCivitaiCmd) throw new Error("This panel build can't drive the CivitAI browser.");
             result = await onCivitaiCmd(msg);
           } else if (
-            msg.cmd === "open_training" || msg.cmd === "training_set_field" ||
-            msg.cmd === "training_goto_step" || msg.cmd === "training_set_target" ||
-            msg.cmd === "training_highlight"
+            msg.cmd === "open_training" || msg.cmd === "training_get_state" ||
+            msg.cmd === "training_set_field" || msg.cmd === "training_goto_step" ||
+            msg.cmd === "training_set_target" || msg.cmd === "training_highlight"
           ) {
             if (!onTrainingCmd) throw new Error("This panel build can't drive the training wizard.");
             result = await onTrainingCmd(msg);
@@ -7050,8 +7050,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
           "ui_render", "ui_update",
           "civitai_results", "civitai_highlight", "civitai_clear_highlight",
           "civitai_switch_tab", "civitai_search", "civitai_open_lightbox",
-          "open_training", "training_set_field", "training_goto_step",
-          "training_set_target", "training_highlight",
+          "open_training", "training_get_state", "training_set_field",
+          "training_goto_step", "training_set_target", "training_highlight",
         ]);
         if (!SILENT_CMDS.has(msg.cmd)) {
           onCommand?.(msg.cmd, msg, reply);
@@ -11765,6 +11765,7 @@ function buildPanel() {
       const h = _trainingHandle;
       if (!h) throw new Error("training wizard not open");
       switch (msg.cmd) {
+        case "training_get_state": return h.getState();
         case "training_set_field": return h.setField(msg.name, msg.value);
         case "training_goto_step": return h.gotoStep(msg.step);
         case "training_set_target": return h.setTarget(msg.target);

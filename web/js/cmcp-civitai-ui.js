@@ -334,6 +334,7 @@ export function openCivitaiModal(ctx, opts = {}) {
   let _dockDispose = null;    // ResizeObserver+listener disposer from ctx.watchDock
   let _oauthPollIv = null;    // sign-in completion poll (accountFlow)
   let _onEscape = null;       // document Escape → close
+  let _activeLightboxClose = null; // openViewer's teardown (owns its own doc keydown listener)
   const close = () => {
     if (!isOpen) return;      // idempotent
     isOpen = false;
@@ -342,6 +343,10 @@ export function openCivitaiModal(ctx, opts = {}) {
     state.activeLoadPromise = null;
     try { clearTimeout(searchTimer); } catch { /* not armed */ }
     if (_oauthPollIv) { clearInterval(_oauthPollIv); _oauthPollIv = null; }
+    // The lightbox is body-mounted with its OWN document keydown listener — a
+    // programmatic reopen would otherwise strand it (+ its listener) above the
+    // new modal (codex finding). Tear it down through this one path.
+    if (_activeLightboxClose) { try { _activeLightboxClose(); } catch { /* already gone */ } _activeLightboxClose = null; }
     try { closeSubModals(); } catch { /* already gone */ }
     if (_onEscape) { document.removeEventListener("keydown", _onEscape); _onEscape = null; }
     if (_onDockResize) { window.removeEventListener("resize", _onDockResize); _onDockResize = null; }
@@ -627,14 +632,18 @@ export function openCivitaiModal(ctx, opts = {}) {
       const t = tabDef();
       if (t.fav) {
         if (!state.signedIn) { sentinel.textContent = "Sign in to see your favorites."; setLoading(false); return; }
-        // YOUR likes are yours: no browsing-level gate here (the PG default was
-        // silently hiding most of the list), and the subnav chips narrow by type.
-        // The feed reads the likes COLLECTION (auto-detected) — reactions only
-        // hold in-app hearts; see resolveLikesCollectionId.
+        // The favorites feed is still browsing-level gated by the ACTIVE filter:
+        // fetchFavorites defaults to ALL levels, so an agent-driven session that
+        // clamped the levels (no NSFW consent) would otherwise leak R/X/XXX here
+        // (security: codex finding). Pass the same clamped set as every other
+        // feed. The subnav chips narrow by type; the feed reads the likes
+        // COLLECTION (auto-detected) — reactions only hold in-app hearts; see
+        // resolveLikesCollectionId.
         const colId = await resolveLikesCollectionId(client);
         if (req !== state.reqId) return;
         const page = await client.fetchFavorites({
           cursor: state.cursor,
+          levels,
           ...(colId ? { collectionId: colId } : {}),
           ...(state.favType !== "all" ? { types: [state.favType] } : {}),
         });
@@ -843,7 +852,14 @@ export function openCivitaiModal(ctx, opts = {}) {
       const b = el("button", "cmcp-cv-iconbtn"); b.innerHTML = `<i class="pi ${icon}"></i>`;
       if (title) b.title = title; b.addEventListener("click", fn); return b;
     };
-    const closeLb = () => { lb.remove(); document.removeEventListener("keydown", onKey, true); };
+    const closeLb = () => {
+      lb.remove();
+      document.removeEventListener("keydown", onKey, true);
+      if (_activeLightboxClose === closeLb) _activeLightboxClose = null;
+    };
+    // Track the live lightbox so the modal's unified close() can dismiss it (and
+    // remove its listener) on a programmatic reopen (codex finding).
+    _activeLightboxClose = closeLb;
     const onKey = (e) => {
       if (e.key === "Escape") { e.stopPropagation(); closeLb(); }
       else if (e.key === "ArrowRight" || e.key === "ArrowDown") { e.stopPropagation(); step(1); }
@@ -1781,6 +1797,9 @@ export function openCivitaiModal(ctx, opts = {}) {
       _oauthPollIv = setInterval(async () => {
         if (!isOpen) { clearInterval(_oauthPollIv); _oauthPollIv = null; return; }
         await refreshAuth();
+        // Re-check AFTER the await: close() may have fired during the fetch, and
+        // the continuation must not toast/reload a torn-down modal (codex finding).
+        if (!isOpen) { if (_oauthPollIv) { clearInterval(_oauthPollIv); _oauthPollIv = null; } return; }
         if (state.signedIn || ++tries > 120) {
           clearInterval(_oauthPollIv); _oauthPollIv = null;
           if (state.signedIn) { toast("Signed in to CivitAI."); if (tabDef().fav) reload(); }
@@ -1894,8 +1913,7 @@ export function openCivitaiModal(ctx, opts = {}) {
     };
   }
   /** Highlight a set of ids (REPLACEMENT semantics). Awaits the in-flight
-   *  first-page load so a highlight issued before results land still lands; if a
-   *  reload/tab/filter supersedes us mid-await the set was cleared and we no-op.
+   *  first-page load so a highlight issued before results land still lands.
    *  Persists the set so later pages glow as they stream in (see appendItems). */
   async function driveHighlight(ids, { kind } = {}) { // eslint-disable-line no-unused-vars
     _assertOpen();
@@ -1904,8 +1922,12 @@ export function openCivitaiModal(ctx, opts = {}) {
     try { await state.activeReloadPromise; } catch { /* fetch error surfaces elsewhere */ }
     _assertOpen();
     if (state.renderRev !== rev) {
-      // A reload superseded this highlight while we awaited — honor the newest
-      // intent by applying to the CURRENT generation rather than a stale grid.
+      // A reload/tab/filter superseded this highlight while we awaited: these ids
+      // belonged to the OLD search and MUST NOT be installed on the new
+      // generation (they'd glow same-id cards from a different query). Bail
+      // without touching the current set — the agent can re-issue against the
+      // new results (codex finding).
+      return { highlighted: 0, missing: list, renderRev: state.renderRev, superseded: true };
     }
     // Replacement: strip the prior set, install the new one, then paint.
     driveClearHighlight();

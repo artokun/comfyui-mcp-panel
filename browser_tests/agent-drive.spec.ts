@@ -8,9 +8,14 @@
  * MockBridge.command({rid,cmd,...}) — and we assert the reply shape AND the DOM
  * (green-glow cards/steps, dock geometry, teardown).
  *
- * These are the audit item-12 coverage: highlight-before-load, reload clears
- * glow, appended-card highlight on scroll, stale-handle throw, training-first
- * glow, dock orientation/collapse/detach, Escape cleanup.
+ * Audit item-12 coverage present here: highlight-before-load, reload clears
+ * glow, appended-card highlight on scroll, results shape, stale-handle throw
+ * (CivitAI + Training), docked click-through, and training-first glow.
+ *
+ * NOT covered here (require real ComfyUI splitter/pane geometry the MockBridge
+ * harness can't drive deterministically): dock ORIENTATION flip (pane docked
+ * left vs right), pane COLLAPSE, and Agent-root DETACH re-centering. Those stay
+ * manual checks in the live browser pass — see the report.
  *
  * NOTE: like the rest of this suite, these specs require a LIVE ComfyUI at
  * localhost:8188 with the pack junctioned in (see playwright.config.ts). They
@@ -182,9 +187,46 @@ test.describe('agent-driven Training modal', () => {
     await openPanel(panel, mockBridge)
     await mockBridge.command('open_training', { dock: true })
     await expect(page.locator('.cmcp-tr-modal')).toBeVisible()
+    // open_training lands on the FLOWS view (step bar cleared) — navigate to the
+    // Dataset step so the step:dataset chip exists before highlighting it. Step 1
+    // has no prerequisite gate, so gotoStep(1) enters directly.
+    await mockBridge.command('training_goto_step', { step: 1 })
+    await expect(page.locator('[data-ref="step:dataset"]')).toBeVisible()
     const hl = await mockBridge.command('training_highlight', { refs: ['step:dataset'] })
     expect(hl.ok).toBe(true)
     await expect(page.locator('[data-ref="step:dataset"].cmcp-agent-glow')).toBeVisible()
+  })
+
+  test('training_get_state is routed (not "Unknown command") and reports readiness', async ({
+    page,
+    panel,
+    mockBridge
+  }) => {
+    await openPanel(panel, mockBridge)
+    await mockBridge.command('open_training', { dock: true })
+    await expect(page.locator('.cmcp-tr-modal')).toBeVisible()
+    const st = await mockBridge.command('training_get_state', {})
+    expect(st.ok).toBe(true)
+    expect(st.result.view).toBe('flows')
+    expect(st.result.readiness).toBeTruthy()
+    // A fresh wizard has no dataset name/images yet → not advance-ready.
+    expect(st.result.readiness.nameOk).toBe(false)
+    expect(st.result.readiness.hasImages).toBe(false)
+  })
+
+  test('gotoStep enforces prerequisites — jumping to Label without a dataset is rejected', async ({
+    page,
+    panel,
+    mockBridge
+  }) => {
+    await openPanel(panel, mockBridge)
+    await mockBridge.command('open_training', { dock: true })
+    await expect(page.locator('.cmcp-tr-modal')).toBeVisible()
+    const reply = await mockBridge.command('training_goto_step', { step: 2 })
+    expect(reply.ok).toBe(false)
+    // Backend-capability or dataset-name/image gate fires — either is an honest
+    // rejection rather than a silent jump.
+    expect(String(reply.error)).toMatch(/backend|dataset name|image/i)
   })
 
   test('stale training handle after Escape → honest not-open error', async ({
