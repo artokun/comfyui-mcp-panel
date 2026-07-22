@@ -95,6 +95,38 @@ export function selectRestoreThread(
     : selectThreadForScope(threads, meta, scopeKey);
 }
 
+/** Apply a strict recency cap without evicting conversations that are still
+ * bound to a browser tab or durable active-scope pointer. Protected ids are
+ * ordered by priority; remaining capacity is filled with the newest threads. */
+export function retainBoundedThreads(threads, limit, protectedThreadIds = []) {
+  const max = Math.max(0, Math.floor(Number(limit) || 0));
+  if (!max) return [];
+  const ordered = [...(Array.isArray(threads) ? threads : [])]
+    .filter((candidate) => candidate && typeof candidate.id === "string" && candidate.id)
+    .sort((a, b) => finiteTs(a.updatedAt || a.ts) - finiteTs(b.updatedAt || b.ts));
+  if (ordered.length <= max) return ordered;
+
+  const available = new Set(ordered.map((candidate) => candidate.id));
+  const protectedIds = [];
+  const protectedSet = new Set();
+  for (const id of Array.isArray(protectedThreadIds) ? protectedThreadIds : []) {
+    if (typeof id !== "string" || !id || !available.has(id) || protectedSet.has(id)) continue;
+    protectedIds.push(id);
+    protectedSet.add(id);
+    if (protectedIds.length === max) break;
+  }
+
+  const remaining = max - protectedIds.length;
+  const newestIds = remaining
+    ? ordered
+      .filter((candidate) => !protectedSet.has(candidate.id))
+      .slice(-remaining)
+      .map((candidate) => candidate.id)
+    : [];
+  const keptIds = new Set([...protectedIds, ...newestIds]);
+  return ordered.filter((candidate) => keptIds.has(candidate.id));
+}
+
 function mergeThreadMessages(older, newer) {
   const oldMessages = Array.isArray(older?.msgs) ? older.msgs : [];
   const newMessages = Array.isArray(newer?.msgs) ? newer.msgs : [];
@@ -277,21 +309,28 @@ export class ChatHistoryStore {
     }
   }
 
-  async load() {
+  async load(options = {}) {
     const local = this.readLocal();
     const indexed = await idbRead(this.indexedDb);
     const merged = mergeHistorySnapshots(local, indexed);
     // Migration is automatic: once loaded, the full merged set is promoted to
     // IndexedDB while a small legacy shadow remains for older panel builds.
-    this.persist(merged.threads, merged.meta);
+    this.persist(merged.threads, merged.meta, options);
     return merged;
   }
 
-  persist(threads, meta = {}) {
+  persist(threads, meta = {}, options = {}) {
     const snapshot = mergeHistorySnapshots({ threads, meta });
     try {
-      const shadow = snapshot.threads
-        .slice(-LOCAL_SHADOW_THREADS)
+      const protectedThreadIds = [
+        ...(Array.isArray(options.protectedThreadIds) ? options.protectedThreadIds : []),
+        ...Object.values(snapshot.meta.activeByScope || {}),
+      ];
+      const shadow = retainBoundedThreads(
+        snapshot.threads,
+        LOCAL_SHADOW_THREADS,
+        protectedThreadIds,
+      )
         .map((t) => ({ ...t, msgs: t.msgs.slice(-LOCAL_SHADOW_MESSAGES) }));
       this.storage?.setItem(this.threadsKey, JSON.stringify(shadow));
       this.storage?.setItem(this.metaKey, JSON.stringify(snapshot.meta));

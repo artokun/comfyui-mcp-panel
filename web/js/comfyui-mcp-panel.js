@@ -69,6 +69,7 @@ import { computeLayout } from "./lib/layout-engine.js";
 import {
   ChatHistoryStore,
   mergeHistorySnapshots,
+  retainBoundedThreads,
   selectRestoreThread,
   selectThreadForScope,
 } from "./lib/chat-history-store.js";
@@ -10408,16 +10409,36 @@ function buildPanel() {
     else delete historyMeta.activeByScope[scopeKey];
   }
 
+  function protectedHistoryThreadIds(preferredThreadId = null) {
+    return [
+      preferredThreadId,
+      thread?.id,
+      ssGet(CURRENT_THREAD_KEY),
+      ...Object.values(historyMeta.activeByScope || {}),
+    ].filter(Boolean);
+  }
+
+  function capHistoryThreads(candidates, preferredThreadId = null) {
+    return retainBoundedThreads(
+      candidates,
+      MAX_THREADS,
+      protectedHistoryThreadIds(preferredThreadId),
+    );
+  }
+
   function persistThreads() {
     historyMeta.workflowAliases = { ..._workflowUuidAliases };
-    historyStore.persist(threads.slice(-MAX_THREADS), historyMeta);
+    threads = capHistoryThreads(threads);
+    historyStore.persist(threads, historyMeta, {
+      protectedThreadIds: protectedHistoryThreadIds(),
+    });
   }
 
   const unsubscribeHistorySync = historyStore.subscribe((incoming) => {
     const currentThreadId = thread?.id;
     const merged = mergeHistorySnapshots({ threads, meta: historyMeta }, incoming);
-    threads = merged.threads.slice(-MAX_THREADS);
     historyMeta = merged.meta;
+    threads = capHistoryThreads(merged.threads, currentThreadId);
     if (currentThreadId) {
       const refreshed = threads.find((candidate) => candidate.id === currentThreadId);
       if (refreshed && isThreadInScope(refreshed, currentTranscriptScopeKey())) thread = refreshed;
@@ -10466,7 +10487,7 @@ function buildPanel() {
       const sid = ssGet(SESSION_KEY);
       if (sid) thread.sessionId = sid;
       threads.push(thread);
-      if (threads.length > MAX_THREADS) threads = threads.slice(-MAX_THREADS);
+      if (threads.length > MAX_THREADS) threads = capHistoryThreads(threads, thread.id);
       ssSet(CURRENT_THREAD_KEY, thread.id);
       setActiveThread(currentHistorySelectionKey(), thread.id);
     }
@@ -15064,10 +15085,10 @@ function buildPanel() {
   // legacy records before making the final, settings-aware binding.
   const historyRestoreReady = (async () => {
     try {
-      const loaded = await historyStore.load();
+      const loaded = await historyStore.load({ protectedThreadIds: [reloadThreadId].filter(Boolean) });
       const merged = mergeHistorySnapshots({ threads, meta: historyMeta }, loaded);
-      threads = merged.threads.slice(-MAX_THREADS);
       historyMeta = merged.meta;
+      threads = capHistoryThreads(merged.threads, reloadThreadId);
       if (historyMeta.workflowAliases && typeof historyMeta.workflowAliases === "object") {
         _workflowUuidAliases = { ...historyMeta.workflowAliases, ..._workflowUuidAliases };
         persistWorkflowAliases();

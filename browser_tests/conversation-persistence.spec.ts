@@ -48,26 +48,26 @@ async function indexedHasText(page: import('@playwright/test').Page, text: strin
   }, text)
 }
 
-async function seedReloadRace(
+async function seedReloadEvictionRace(
   page: import('@playwright/test').Page,
   currentThreadId: string
 ): Promise<void> {
   await page.evaluate(async ({ pointedId }) => {
     const future = Date.now() + 60_000
-    const background = {
-      id: 'newer-background-thread',
+    const background = Array.from({ length: 500 }, (_, i) => ({
+      id: `newer-background-thread-${i}`,
       schemaVersion: 2,
-      workflowKey: 'workflow:background-race',
-      createdAt: future - 100,
-      updatedAt: future,
-      ts: future,
+      workflowKey: `workflow:background-race-${i}`,
+      createdAt: future + i,
+      updatedAt: future + i,
+      ts: future + i,
       msgs: [{
-        id: 'newer-background-message',
+        id: `newer-background-message-${i}`,
         role: 'user',
-        text: 'newer background transcript',
-        createdAt: future
+        text: i === 0 ? 'newer background transcript' : `background transcript ${i}`,
+        createdAt: future + i
       }]
-    }
+    }))
     const rewrite = (snapshot: any) => {
       const threads = Array.isArray(snapshot?.threads) ? snapshot.threads : []
       const pointed = threads.find((thread: any) => thread.id === pointedId)
@@ -79,7 +79,10 @@ async function seedReloadRace(
       return {
         ...snapshot,
         updatedAt: future,
-        threads: [...threads.filter((thread: any) => thread.id !== background.id), background],
+        threads: [
+          ...threads.filter((thread: any) => !thread.id?.startsWith('newer-background-thread-')),
+          ...background
+        ],
         meta: {
           ...(snapshot?.meta || {}),
           updatedAt: future,
@@ -220,7 +223,7 @@ test('reload keeps the pointed conversation and live tab session during durable 
   )
   expect(currentThreadId).not.toBeNull()
   await expect.poll(() => indexedHasText(page, 'conversation selected by this tab')).toBe(true)
-  await seedReloadRace(page, currentThreadId!)
+  await seedReloadEvictionRace(page, currentThreadId!)
 
   await page.evaluate(() => localStorage.removeItem('comfyui-mcp.panel.autoConnect'))
   await page.reload()
@@ -232,10 +235,20 @@ test('reload keeps the pointed conversation and live tab session during durable 
     () => page.evaluate((key) => sessionStorage.getItem(key), SESSION_KEY)
   ).toBe('live-tab-session')
 
-  // Cross the settings-hydration boundary and the async IndexedDB load. Neither
-  // is allowed to repaint another conversation or replace the live tab session.
-  await page.waitForTimeout(3_000)
+  // The active metadata rewrite occurs only after settings + IndexedDB hydration,
+  // so this is a deterministic completion signal for the final binding.
+  await expect.poll(() => page.evaluate(() => {
+    const meta = JSON.parse(localStorage.getItem('comfyui-mcp.panel.historyMeta') || '{}')
+    return meta.activeByScope?.['panel:global'] || null
+  })).toBe(currentThreadId)
   await expect(panel.userBubble('conversation selected by this tab')).toBeVisible()
   await expect(panel.userBubble('newer background transcript')).toHaveCount(0)
   expect(await page.evaluate((key) => sessionStorage.getItem(key), SESSION_KEY)).toBe('live-tab-session')
+  expect(await page.evaluate((pointedId) => {
+    const shadow = JSON.parse(localStorage.getItem('comfyui-mcp.panel.threads') || '[]')
+    return {
+      count: shadow.length,
+      hasPointed: shadow.some((thread: any) => thread.id === pointedId)
+    }
+  }, currentThreadId)).toEqual({ count: 20, hasPointed: true })
 })

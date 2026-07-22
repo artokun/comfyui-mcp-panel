@@ -7,6 +7,7 @@ import {
   isThreadInScope,
   mergeHistorySnapshots,
   normalizeThread,
+  retainBoundedThreads,
   selectPanelThread,
   selectRestoreThread,
   selectThreadForScope
@@ -144,6 +145,55 @@ test('reload never accepts a tab pointer from another workflow', () => {
     scopeKey: 'workflow:wf-a',
     preferredThreadId: 'visible-elsewhere'
   })?.id, 'scoped')
+})
+
+test('canonical eviction retains the pointed thread and fills the rest by recency', () => {
+  const threads = Array.from({ length: 501 }, (_, i) => ({
+    id: `t${i}`,
+    workflowKey: 'panel:global',
+    updatedAt: 1000 + i,
+    msgs: [{ id: `m${i}` }]
+  }))
+  const kept = retainBoundedThreads(threads, 500, ['t0'])
+
+  assert.equal(kept.length, 500)
+  assert.equal(kept.some((thread) => thread.id === 't0'), true)
+  assert.equal(kept.some((thread) => thread.id === 't1'), false)
+  assert.equal(kept.some((thread) => thread.id === 't500'), true)
+  assert.equal(selectRestoreThread(kept, {}, {
+    panelOwned: true,
+    preferredThreadId: 't0'
+  })?.id, 't0')
+
+  const protectedOverflow = retainBoundedThreads(threads.slice(0, 3), 2, ['t0', 't1', 't2'])
+  assert.deepEqual(protectedOverflow.map((thread) => thread.id), ['t0', 't1'])
+})
+
+test('localStorage shadow retains the active tab thread when IndexedDB is unavailable', async () => {
+  const values = new Map()
+  const storage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value)
+  }
+  const threads = Array.from({ length: 21 }, (_, i) => ({
+    id: `t${i}`,
+    workflowKey: 'panel:global',
+    updatedAt: 1000 + i,
+    msgs: [{ id: `m${i}`, role: 'user', text: `message ${i}` }]
+  }))
+  const store = new ChatHistoryStore({ storage, indexedDb: null })
+  store.persist(threads, { activeByScope: { 'panel:global': 't0' } })
+  await store.flush()
+
+  const shadow = JSON.parse(values.get('comfyui-mcp.panel.threads'))
+  assert.equal(shadow.length, 20)
+  assert.equal(shadow.some((thread) => thread.id === 't0'), true)
+  assert.equal(shadow.some((thread) => thread.id === 't1'), false)
+  assert.equal(store.readLocal().threads.some((thread) => thread.id === 't0'), true)
+  const degradedStore = new ChatHistoryStore({ storage, indexedDb: null })
+  const degradedReload = await degradedStore.load({ protectedThreadIds: ['t0'] })
+  await degradedStore.flush()
+  assert.equal(degradedReload.threads.some((thread) => thread.id === 't0'), true)
 })
 
 test('notifies another tab when the local history shadow changes', () => {
