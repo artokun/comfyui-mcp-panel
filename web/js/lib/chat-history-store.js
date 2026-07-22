@@ -816,6 +816,9 @@ export class ChatHistoryStore {
     this.maxTombstones = options.maxTombstones ?? DEFAULT_MAX_TOMBSTONES;
     this.maxMetadataOps = options.maxMetadataOps ?? DEFAULT_MAX_METADATA_OPS;
     this.onShadowError = typeof options.onShadowError === "function" ? options.onShadowError : null;
+    this.onPersistenceError = typeof options.onPersistenceError === "function"
+      ? options.onPersistenceError
+      : null;
     this.lastShadowWriteOk = null;
     this.lastShadowError = null;
     this.writerId = options.writerId || globalThis.crypto?.randomUUID?.() || `writer-${Math.random().toString(16).slice(2)}`;
@@ -824,6 +827,7 @@ export class ChatHistoryStore {
     this._observedRevision = null;
     this._writePromise = Promise.resolve(null);
     this._lastCommitted = null;
+    this._dirtyWrite = null;
     const channelFactory = options.broadcastChannelFactory || (
       globalThis.window === globalThis && typeof globalThis.BroadcastChannel === "function"
         ? (name) => new globalThis.BroadcastChannel(name)
@@ -990,7 +994,10 @@ export class ChatHistoryStore {
   }
 
   persist(threads, meta = {}, options = {}) {
-    const snapshot = mergeHistorySnapshots({ threads, meta });
+    const freshSnapshot = mergeHistorySnapshots({ threads, meta });
+    const snapshot = this._dirtyWrite
+      ? mergeHistorySnapshots(this._dirtyWrite.snapshot, freshSnapshot)
+      : freshSnapshot;
     this._observeSnapshot(snapshot);
     const protectedThreadIds = [
       ...(Array.isArray(options.protectedThreadIds) ? options.protectedThreadIds : []),
@@ -1003,7 +1010,7 @@ export class ChatHistoryStore {
       maxMetadataOps: options.maxMetadataOps ?? this.maxMetadataOps,
       protectedThreadIds,
     };
-    this._writeLocalSnapshot(snapshot, protectedThreadIds);
+    const shadowCommitted = this._writeLocalSnapshot(snapshot, protectedThreadIds);
     // Start the atomic merge immediately. Chat records are low-frequency and a
     // debounce creates an avoidable shutdown window in which the local shadow
     // exists but IndexedDB has not started its transaction yet.
@@ -1021,7 +1028,24 @@ export class ChatHistoryStore {
             // localStorage events remain available when the channel is blocked.
           }
         }
-        return merged;
+        const result = {
+          ok: Boolean(merged || shadowCommitted),
+          shadowCommitted,
+          canonicalCommitted: Boolean(merged),
+          retryable: !merged && !shadowCommitted,
+          code: !merged && !shadowCommitted ? "history-persistence-unavailable" : null,
+        };
+        if (result.ok) {
+          this._dirtyWrite = null;
+        } else {
+          // Neither durability layer accepted this state. Keep the complete
+          // intent so the next persist can retry it after quota/IDB recovery.
+          // No BroadcastChannel message is sent: peers must only invalidate
+          // against a committed canonical revision.
+          this._dirtyWrite = { snapshot, limits, protectedThreadIds };
+          this.onPersistenceError?.(result);
+        }
+        return result;
       });
     return snapshot;
   }
@@ -1052,8 +1076,15 @@ export class ChatHistoryStore {
   }
 
   async flush() {
-    await this._writePromise.catch(() => null);
-    return true;
+    const result = await this._writePromise.catch((error) => ({
+      ok: false,
+      shadowCommitted: false,
+      canonicalCommitted: false,
+      retryable: true,
+      code: "history-persistence-error",
+      error: error?.message || String(error),
+    }));
+    return result == null || result.ok === true ? true : result;
   }
 
 }

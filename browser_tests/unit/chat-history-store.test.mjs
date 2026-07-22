@@ -777,6 +777,40 @@ test('atomic local shadow survives a failed legacy metadata write', async () => 
   assert.equal(store.readLocal().meta.activeByScope['panel:global'], 'kept')
 })
 
+test('flush reports total persistence failure and retries the retained dirty snapshot', async () => {
+  const failures = []
+  const blockedStorage = createMemoryStorage({ throwOnSet: CHAT_HISTORY_LOCAL_SNAPSHOT_KEY })
+  const store = new ChatHistoryStore({
+    storage: blockedStorage,
+    indexedDb: null,
+    onPersistenceError: (failure) => failures.push(failure)
+  })
+  store.persist(
+    [{ id: 'retry-thread', workflowKey: 'panel:global', updatedAt: 10, msgs: [] }],
+    { activeByScope: { 'panel:global': 'retry-thread' } }
+  )
+
+  const failed = await store.flush()
+  assert.deepEqual(failed, {
+    ok: false,
+    shadowCommitted: false,
+    canonicalCommitted: false,
+    retryable: true,
+    code: 'history-persistence-unavailable'
+  })
+  assert.equal(failures.length, 1)
+  assert.equal(store._lastCommitted, null)
+
+  const recoveredStorage = createMemoryStorage()
+  const recoveredIndexedDb = createFakeIndexedDb()
+  store.storage = recoveredStorage
+  store.indexedDb = recoveredIndexedDb
+  store.persist([], {})
+  assert.equal(await store.flush(), true)
+  assert.equal(recoveredIndexedDb.readState().threads[0].id, 'retry-thread')
+  assert.equal(store.readLocal().threads[0].id, 'retry-thread')
+})
+
 test('legacy local shadow migration preserves the valid half of split or corrupt state', () => {
   const storage = createMemoryStorage()
   storage.values.set('comfyui-mcp.panel.threads', JSON.stringify([

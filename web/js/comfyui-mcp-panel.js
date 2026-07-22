@@ -10401,6 +10401,11 @@ function buildPanel() {
     threadsKey: THREADS_KEY,
     maxThreads: MAX_THREADS,
     maxMessages: MAX_THREAD_MSGS,
+    onPersistenceError: () => {
+      appendSystem(
+        "Chat history could not be saved. Keep this tab open, free browser storage, then send or edit once to retry.",
+      );
+    },
   });
   const localHistory = historyStore.readLocal();
   let threads = localHistory.threads;
@@ -10494,7 +10499,8 @@ function buildPanel() {
     ssSet(SESSION_KEY, null);
     if (thread) historyStore.reviseThread(thread, { sessionId: null });
     persistThreads();
-    return historyStore.flush();
+    const result = await historyStore.flush();
+    return result === true || result?.ok === true;
   }
 
   const panelAliasMutationSink = (path, value) => {
@@ -13562,7 +13568,7 @@ function buildPanel() {
       // The old provider's session must be durably invalid before any reconnect
       // can observe it. If reconnect fails or the browser closes here, reload
       // still starts fresh instead of restoring a foreign session.
-      await invalidateDurableAgentSession();
+      if (!await invalidateDurableAgentSession()) return;
     }
     // Reflect the picked backend in the composer placeholder immediately; onModels
     // reaffirms it authoritatively from the handshake (fix #3).
@@ -13683,7 +13689,10 @@ function buildPanel() {
       // Start FRESH on reconnect: clear the saved session id so hello sends no
       // resume (resuming would restore the wedged shell). Don't arm the resume
       // nudge. The reconnect spins up a brand-new agent.
-      await invalidateDurableAgentSession();
+      if (!await invalidateDurableAgentSession()) {
+        appendSystem("The old session could not be invalidated durably; reconnect is paused to avoid restoring it.");
+        return;
+      }
       ssSet(SOFT_RELOAD_KEY, null);
       ssSet(MID_TASK_KEY, null);
       appendSystem("Agent restarted with a fresh session — your message history is still here.");
