@@ -54,6 +54,21 @@ function injectStyle() {
 .cmcp-rp-credit{font-size:0.7rem;opacity:0.5;}
 .cmcp-rp-credit a{color:inherit;}
 .cmcp-rp-muted{font-size:0.75rem;opacity:0.6;}
+/* Agent-drive/manual side-dock (parity with the CivitAI + Training modals):
+   anchor the card to the canvas side OPPOSITE the Agent pane, drop the backdrop,
+   let clicks pass THROUGH the overlay so chat stays interactive; only the card
+   catches pointer events. Bumped above the canvas (z 10000) to match. Slides in
+   via translateX; the close() path reverses it before detaching. The base
+   .cmcp-modal-overlay (panel monolith CSS, always loaded) styles the centered
+   fallback — this only overrides the docked case, so centered opens are
+   unchanged. */
+.cmcp-modal-overlay.cmcp-docked{position:fixed;display:block;padding:0;background:transparent;
+  pointer-events:none;z-index:10000;}
+.cmcp-modal-overlay.cmcp-docked .cmcp-rp-modal{position:fixed;pointer-events:auto;
+  width:auto;max-width:none!important;height:auto;max-height:none;overflow-y:auto;
+  border-radius:0;box-shadow:-8px 0 32px rgba(0,0,0,.45);
+  transform:translateX(24px);opacity:0;transition:transform .28s ease,opacity .28s ease;}
+.cmcp-modal-overlay.cmcp-docked.cmcp-dock-in .cmcp-rp-modal{transform:translateX(0);opacity:1;}
 `;
   const el = document.createElement("style");
   el.textContent = css;
@@ -192,6 +207,61 @@ export function openRunpodModal(ctx, opts = {}) {
   let busy = false;
   let closed = false;
   let tick = null;
+  let _onDockResize = null; // window-resize fallback when ctx.watchDock is absent
+  let _dockDispose = null;  // ResizeObserver+listener disposer from ctx.watchDock
+
+  // ── docked mode (parity with the CivitAI + Training modals) ──────────────────
+  // Geometry from the host (ctx.dockGeometry owns pane/canvas measurement +
+  // left/right detection); three states detached(hide)/centered/docked. See the
+  // CivitAI modal for the full rationale. When opts.dock is unset this is inert
+  // and the modal stays the plain centered overlay it always was.
+  applyDock.centered = false;
+  function applyDock() {
+    if (!opts.dock) { setCentered(); return; }
+    const geo = _dockGeometry();
+    if (geo && geo.status === "detached") { overlay.style.display = "none"; return; }
+    overlay.style.display = "";
+    if (geo && geo.status === "docked" && window.innerWidth >= 900) {
+      overlay.classList.add("cmcp-docked");
+      modal.style.left = `${Math.round(geo.left)}px`;
+      modal.style.top = `${Math.round(geo.top)}px`;
+      modal.style.right = `${Math.round(geo.right)}px`;
+      modal.style.bottom = `${Math.round(geo.bottom)}px`;
+      applyDock.centered = false;
+    } else { setCentered(); }
+  }
+  function setCentered() {
+    overlay.classList.remove("cmcp-docked");
+    overlay.style.display = "";
+    modal.style.left = modal.style.right = modal.style.top = modal.style.bottom = "";
+    applyDock.centered = true;
+  }
+  function _dockGeometry() {
+    if (typeof ctx.dockGeometry === "function") {
+      try { const g = ctx.dockGeometry(); if (g) return g; } catch { /* fall through */ }
+    }
+    try {
+      if (root && !root.isConnected) return { status: "detached" };
+      const pane = root?.closest?.(".side-bar-panel") || root?.closest?.("[class*='sidebar']") || root;
+      const pr = pane?.getBoundingClientRect?.();
+      if (!pr || pr.width < 1 || pr.height < 1) return { status: "centered" };
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const paneOnLeft = (pr.left + pr.right) / 2 < vw / 2;
+      const left = paneOnLeft ? Math.max(0, pr.right) : 0;
+      const right = paneOnLeft ? 0 : Math.max(0, vw - pr.left);
+      if (vw - left - right < 320) return { status: "centered" };
+      return { status: "docked", left, right, top: Math.max(0, pr.top), bottom: Math.max(0, vh - pr.bottom) };
+    } catch { return { status: "centered" }; }
+  }
+  if (opts.dock) {
+    applyDock();
+    if (typeof ctx.watchDock === "function") {
+      try { _dockDispose = ctx.watchDock(applyDock); } catch { _dockDispose = null; }
+    }
+    if (!_dockDispose) { _onDockResize = () => applyDock(); window.addEventListener("resize", _onDockResize); }
+    // Slide-in on the next frame so the transition runs from the initial state.
+    requestAnimationFrame(() => overlay.classList.add("cmcp-dock-in"));
+  }
 
   function setLog(text, kind) {
     log.textContent = text || "";
@@ -415,9 +485,12 @@ export function openRunpodModal(ctx, opts = {}) {
   });
 
   const close = () => {
+    if (closed) return; // idempotent
     closed = true;
-    if (tick) clearInterval(tick);
-    overlay.remove();
+    if (tick) { clearInterval(tick); tick = null; }
+    if (_onDockResize) { window.removeEventListener("resize", _onDockResize); _onDockResize = null; }
+    if (_dockDispose) { try { _dockDispose(); } catch { /* best effort */ } _dockDispose = null; }
+    slideOutThenRemove(overlay);
   };
   doneBtn.addEventListener("click", close);
   overlay.addEventListener("mousedown", (e) => {
@@ -438,6 +511,24 @@ export function openRunpodModal(ctx, opts = {}) {
     },
     isOpen: () => !closed,
   };
+}
+
+/** Slide/fade the panel out before detaching (parity across the three
+ *  side-panels). Docked: reverse the translateX slide-in (drop cmcp-dock-in);
+ *  centered/narrow: a plain opacity fade — no horizontal slide. The DOM is
+ *  removed after the transition window (jsdom fires no transitionend, so a fixed
+ *  timer drives it). Idempotent — remove() on a detached node is a no-op. */
+const DOCK_SLIDE_OUT_MS = 240;
+function slideOutThenRemove(overlay) {
+  const docked = overlay.classList.contains("cmcp-docked");
+  overlay.style.pointerEvents = "none";
+  if (docked) {
+    overlay.classList.remove("cmcp-dock-in"); // card returns to translateX(24px)/opacity 0
+  } else {
+    overlay.style.transition = "opacity .18s ease";
+    overlay.style.opacity = "0";
+  }
+  setTimeout(() => { try { overlay.remove(); } catch { /* already gone */ } }, DOCK_SLIDE_OUT_MS);
 }
 
 function mkBtn(label, variant) {

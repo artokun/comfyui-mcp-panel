@@ -237,6 +237,25 @@ const el = (tag, cls, txt) => {
   return n;
 };
 
+/** Slide/fade the panel out before detaching (shared exit for the three docked
+ *  side-panels). Docked: reverse the translateX slide-in (drop cmcp-dock-in) so
+ *  the card slides back out; centered/narrow: a plain opacity fade — no
+ *  horizontal slide. The DOM is removed after the transition window (jsdom fires
+ *  no transitionend, so a fixed timer drives it). Idempotent — remove() on an
+ *  already-detached node is a no-op. */
+const DOCK_SLIDE_OUT_MS = 240;
+function slideOutThenRemove(overlay) {
+  const docked = overlay.classList.contains("cmcp-docked");
+  overlay.style.pointerEvents = "none";
+  if (docked) {
+    overlay.classList.remove("cmcp-dock-in"); // card returns to translateX(24px)/opacity 0
+  } else {
+    overlay.style.transition = "opacity .18s ease";
+    overlay.style.opacity = "0";
+  }
+  setTimeout(() => { try { overlay.remove(); } catch { /* already gone */ } }, DOCK_SLIDE_OUT_MS);
+}
+
 /** Fail-CLOSED dirty check for the load-onto-canvas overwrite confirm: any
  *  uncertainty (missing getter, non-boolean answer, a throw) counts as DIRTY
  *  so the user gets asked — never silently clobber an unsaved canvas.
@@ -351,7 +370,10 @@ export function openCivitaiModal(ctx, opts = {}) {
     if (_onEscape) { document.removeEventListener("keydown", _onEscape); _onEscape = null; }
     if (_onDockResize) { window.removeEventListener("resize", _onDockResize); _onDockResize = null; }
     if (_dockDispose) { try { _dockDispose(); } catch { /* best effort */ } _dockDispose = null; }
-    overlay.remove();
+    // Slide/fade the card out, THEN detach (parity with the Training + RunPod
+    // side-panels). isOpen already flipped above, so drive methods + re-close are
+    // inert during the ~240ms exit; host bookkeeping (onClose) still runs now.
+    slideOutThenRemove(overlay);
     try { opts.onClose?.(); } catch { /* host bookkeeping only */ }
   };
   // In docked mode the overlay itself is click-through (pointer-events:none), so a
@@ -445,6 +467,10 @@ export function openCivitaiModal(ctx, opts = {}) {
     if (e.key === "Enter") { clearTimeout(searchTimer); applySearch(); }
   });
   const filterBtn = el("button", "cmcp-cv-iconbtn");
+  // First of the three right-side actions (filters ⚙ / account 👤 / close ✕):
+  // margin-left:auto pushes this trio to the right edge while the tab row stays
+  // left-aligned in the flex header.
+  filterBtn.style.marginLeft = "auto";
   filterBtn.innerHTML = '<i class="pi pi-sliders-h"></i>';
   const filterDot = el("span", "cmcp-cv-dot"); filterDot.style.display = "none";
   filterBtn.appendChild(filterDot);
@@ -1089,6 +1115,11 @@ export function openCivitaiModal(ctx, opts = {}) {
         ctx.bringChatForward();
         toast("Shared with the agent.");
       }
+      // Hand-off is done (either variant) — close the explorer so the chat/agent
+      // is visible. Only on SUCCESS; a failed share (below) leaves it open to
+      // retry. The toast is body-mounted (survives the close) so the confirmation
+      // stays on screen. close() is idempotent + tears down the lightbox/sheets.
+      close();
     } catch (e) { toast("Share failed: " + e.message); }
   }
 
