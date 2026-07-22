@@ -17,6 +17,31 @@ const HISTORY_STORE_SOURCE = readFileSync(
   'utf8'
 )
 
+async function forcePerWorkflowSettings(route: import('@playwright/test').Route) {
+  if (route.request().method() !== 'GET') return route.continue()
+  const response = await route.fetch()
+  const raw = await response.text()
+  let settings: Record<string, unknown> = {}
+  if (raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) settings = parsed
+    } catch {
+      // Some live ComfyUI builds transiently return an empty/truncated settings
+      // body during startup. The test only needs a deterministic scope setting.
+    }
+  }
+  settings['comfyui-mcp.sessionFollowsPanel'] = false
+  const headers = response.headers()
+  delete headers['content-length']
+  delete headers['content-encoding']
+  await route.fulfill({
+    status: 200,
+    headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify(settings)
+  })
+}
+
 test.beforeEach(async ({ context }) => {
   // The target ComfyUI server may have been started before this worktree was
   // created. Route the two reviewed modules from the checked-out source so the
@@ -363,13 +388,7 @@ test('strict workflow storage sync detaches transcript todos and session before 
 }) => {
   await page.route(
     (url) => /\/(api\/)?settings\/?$/.test(url.pathname),
-    async (route) => {
-      if (route.request().method() !== 'GET') return route.continue()
-      const response = await route.fetch()
-      const settings = await response.json() as Record<string, unknown>
-      settings['comfyui-mcp.sessionFollowsPanel'] = false
-      await route.fulfill({ response, json: settings })
-    }
+    forcePerWorkflowSettings
   )
   await panel.goto()
   await panel.setBridgeUrl(mockBridge.url)
@@ -454,13 +473,7 @@ test('workflow rename publishes alias tombstones and a stale tab cannot echo the
 }) => {
   await page.route(
     (url) => /\/(api\/)?settings\/?$/.test(url.pathname),
-    async (route) => {
-      if (route.request().method() !== 'GET') return route.continue()
-      const response = await route.fetch()
-      const settings = await response.json() as Record<string, unknown>
-      settings['comfyui-mcp.sessionFollowsPanel'] = false
-      await route.fulfill({ response, json: settings })
-    }
+    forcePerWorkflowSettings
   )
   await panel.goto()
   await panel.openSidebar()
