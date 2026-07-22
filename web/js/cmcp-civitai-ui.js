@@ -12,7 +12,8 @@
 
 import {
   CivitaiClient, DEFAULT_FILTERS, LEVELS, PERIODS, IMAGE_SORTS, MODEL_SORTS,
-  BASE_MODELS, filtersDirty, bitmask, parseCreatorQuery,
+  BASE_MODELS, ACTIVE_BASE_MODELS, tokenizeQuery, matchesBaseModel,
+  filtersDirty, bitmask, parseCreatorQuery,
 } from "./cmcp-civitai.js";
 
 const TABS = [
@@ -170,6 +171,31 @@ function injectCss() {
   .cmcp-cv-creator:hover { background: var(--p-surface-800,#27272a); }
   .cmcp-cv-creator .sub { margin-left: auto; font-size: .68rem; flex-shrink: 0;
     color: var(--p-text-muted-color,#a1a1aa); }
+  .cmcp-cv-dd { position: relative; width: 100%; }
+  .cmcp-cv-ddpanel { position: absolute; z-index: 6; left: 0; right: 0; top: calc(100% + .25rem);
+    display: none; flex-direction: column; gap: .1rem; padding: .25rem;
+    max-height: min(20rem, 50vh); overflow-y: auto; border-radius: 8px;
+    background: var(--p-surface-900,#18181b);
+    border: 1px solid var(--p-content-border-color,#3f3f46);
+    box-shadow: 0 8px 24px rgba(0,0,0,.45); }
+  .cmcp-cv-dd.open .cmcp-cv-ddpanel { display: flex; }
+  .cmcp-cv-ddgroup { font-size: .64rem; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--p-text-muted-color,#a1a1aa); padding: .35rem .5rem .15rem; }
+  .cmcp-cv-ddopt { display: flex; align-items: center; gap: .45rem; padding: .3rem .5rem;
+    border: none; border-radius: 6px; background: transparent; cursor: pointer;
+    color: var(--p-text-color,#fafafa); font-size: .78rem; text-align: left; width: 100%; }
+  .cmcp-cv-ddopt:hover, .cmcp-cv-ddopt.active { background: var(--p-surface-800,#27272a); }
+  .cmcp-cv-ddopt .tick { width: .9rem; flex-shrink: 0; opacity: 0; }
+  .cmcp-cv-ddopt.on .tick { opacity: 1; color: var(--p-primary-color,#3a7bd5); }
+  .cmcp-cv-ddempty { padding: .4rem .5rem; font-size: .74rem;
+    color: var(--p-text-muted-color,#a1a1aa); }
+  .cmcp-cv-ddfoot { position: sticky; bottom: -.25rem; display: flex; align-items: center;
+    justify-content: space-between; gap: .5rem; margin-top: .15rem; padding: .35rem .5rem;
+    font-size: .72rem; color: var(--p-text-muted-color,#a1a1aa);
+    background: var(--p-surface-900,#18181b);
+    border-top: 1px solid var(--p-content-border-color,#3f3f46); }
+  .cmcp-cv-ddclear { background: transparent; border: none; cursor: pointer; font-size: .72rem;
+    padding: 0; color: var(--p-primary-color,#3a7bd5); }
   .cmcp-cv-lb-prompt { font-size: .78rem; white-space: pre-wrap; word-break: break-word;
     background: var(--p-surface-950,#111); border-radius: 8px; padding: .5rem;
     max-height: 14rem; overflow-y: auto; }
@@ -1166,22 +1192,128 @@ export function openCivitaiModal(ctx, opts = {}) {
         });
         pills.appendChild(pill);
       }
-      const bmSearch = el("input", "cmcp-cv-search"); bmSearch.placeholder = "Filter base models…";
-      const bmList = el("div", "cmcp-cv-frow");
-      bmSearch.addEventListener("input", () => {
-        const q = bmSearch.value.toLowerCase();
-        bmList.innerHTML = "";
-        if (!q) return;
-        for (const b of BASE_MODELS.filter((x) => x.toLowerCase().includes(q)).slice(0, 12)) {
-          const chip = el("button", "cmcp-cv-chip", b);
-          chip.addEventListener("click", () => {
-            if (!f.baseModels.includes(b)) f.baseModels.push(b);
+      // The control this replaces was a bare text input that rendered NOTHING
+      // until you typed and then showed only the first 12 hits — so the ~90
+      // base models were undiscoverable: you had to already know a family's
+      // exact Civitai spelling ("ZImageTurbo", "Wan Video 2.2 I2V-A14B") to
+      // reach it. This opens the full list on focus, filters as you type, and
+      // caps nothing; the retired half is kept but sunk below the families
+      // Civitai still accepts uploads for, since those return almost nothing.
+      const dd = el("div", "cmcp-cv-dd");
+      const bmSearch = el("input", "cmcp-cv-search");
+      bmSearch.placeholder = "Search base models…";
+      bmSearch.setAttribute("role", "combobox");
+      bmSearch.setAttribute("aria-expanded", "false");
+      bmSearch.autocomplete = "off";
+      const bmPanel = el("div", "cmcp-cv-ddpanel");
+      let bmOpts = [];   // the option buttons currently rendered, in view order
+      let bmActive = -1; // keyboard cursor
+
+      const setActive = (i) => {
+        if (bmOpts[bmActive]) bmOpts[bmActive].classList.remove("active");
+        bmActive = i < 0 || i >= bmOpts.length ? -1 : i;
+        const cur = bmOpts[bmActive];
+        if (cur) { cur.classList.add("active"); cur.scrollIntoView({ block: "nearest" }); }
+      };
+      const closeDd = () => {
+        dd.classList.remove("open");
+        bmSearch.setAttribute("aria-expanded", "false");
+        setActive(-1);
+      };
+      const toggleModel = (b) => {
+        const i = f.baseModels.indexOf(b);
+        if (i >= 0) f.baseModels.splice(i, 1); else f.baseModels.push(b);
+        // Re-render so the chip row above reflects the change, then reopen —
+        // multi-select means the next pick usually follows immediately, and
+        // closing on every toggle would make selecting three models a chore.
+        renderSheet(); update();
+      };
+
+      const renderOpts = () => {
+        const tokens = tokenizeQuery(bmSearch.value);
+        bmPanel.innerHTML = "";
+        bmOpts = [];
+        const hits = BASE_MODELS.filter((x) => matchesBaseModel(x, tokens));
+        const groups = [
+          ["Current", hits.filter((x) => ACTIVE_BASE_MODELS.has(x))],
+          ["Legacy", hits.filter((x) => !ACTIVE_BASE_MODELS.has(x))],
+        ];
+        for (const [label, items] of groups) {
+          if (!items.length) continue;
+          bmPanel.appendChild(el("div", "cmcp-cv-ddgroup", label));
+          for (const b of items) {
+            const on = f.baseModels.includes(b);
+            const opt = el("button", "cmcp-cv-ddopt" + (on ? " on" : ""));
+            opt.type = "button";
+            opt.setAttribute("role", "option");
+            opt.setAttribute("aria-selected", on ? "true" : "false");
+            opt.appendChild(el("span", "tick", "✓"));
+            opt.appendChild(el("span", null, b));
+            // mousedown, not click: the input's blur would close the panel and
+            // detach the button before a click ever lands on it.
+            opt.addEventListener("mousedown", (e) => { e.preventDefault(); toggleModel(b); });
+            bmPanel.appendChild(opt);
+            bmOpts.push(opt);
+          }
+        }
+        if (!bmOpts.length) {
+          bmPanel.appendChild(el("div", "cmcp-cv-ddempty", `No base model matches “${bmSearch.value.trim()}”.`));
+        }
+        // Selected-count + clear, matching what ComfyUI's own multi-select
+        // shows. With the list scrolled or filtered the chips above can be out
+        // of view, so without this there is no way to tell how many filters are
+        // live — or to drop them without hunting each one down.
+        if (f.baseModels.length) {
+          const foot = el("div", "cmcp-cv-ddfoot");
+          foot.appendChild(el("span", null,
+            `${f.baseModels.length} selected`));
+          const clear = el("button", "cmcp-cv-ddclear", "Clear");
+          clear.type = "button";
+          clear.addEventListener("mousedown", (e) => {
+            e.preventDefault();
+            f.baseModels.length = 0;
             renderSheet(); update();
           });
-          bmList.appendChild(chip);
+          foot.appendChild(clear);
+          bmPanel.appendChild(foot);
+        }
+        setActive(-1);
+      };
+      const openDd = () => {
+        renderOpts();
+        dd.classList.add("open");
+        bmSearch.setAttribute("aria-expanded", "true");
+      };
+
+      bmSearch.addEventListener("focus", openDd);
+      bmSearch.addEventListener("input", () => { renderOpts(); dd.classList.add("open"); });
+      bmSearch.addEventListener("blur", closeDd);
+      bmSearch.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") {
+          // Escape MUST stop here. The sheet is mounted inside ComfyUI's own
+          // document, so an un-stopped Escape closes the whole filter sheet
+          // (and reaches the canvas) — dismissing the dropdown would throw
+          // away the user's other filter edits with it.
+          if (dd.classList.contains("open")) { e.preventDefault(); e.stopPropagation(); closeDd(); }
+          return;
+        }
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+          e.preventDefault();
+          if (!dd.classList.contains("open")) { openDd(); return; }
+          if (!bmOpts.length) return;
+          const next = e.key === "ArrowDown"
+            ? (bmActive + 1) % bmOpts.length
+            : (bmActive <= 0 ? bmOpts.length : bmActive) - 1;
+          setActive(next);
+          return;
+        }
+        if (e.key === "Enter" && bmActive >= 0) {
+          e.preventDefault();
+          bmOpts[bmActive].dispatchEvent(new MouseEvent("mousedown"));
         }
       });
-      wrap.append(pills, bmSearch, bmList);
+      dd.append(bmSearch, bmPanel);
+      wrap.append(pills, dd);
 
       // creator — single-select async search. Empty field shows the site's
       // TOP-CREATORS leaderboard (ranked, with stats); typing runs a debounced
