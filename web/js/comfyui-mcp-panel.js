@@ -7992,12 +7992,28 @@ const PANEL_CSS = `
   box-shadow: 0 0 0 2px var(--p-surface-900, #18181b);
   pointer-events: none; z-index: 5;
 }
+/* Model chip (composer). Stays on ONE line at every panel width: a wrapped
+   chip pushed the composer row taller and shoved the send/mic buttons around,
+   and the only way to get it back on one line was to widen the panel until it
+   ate the canvas. The model NAME truncates with an ellipsis instead; the
+   effort suffix and caret never shrink, so "which model + which effort" stays
+   readable even when the name is clipped, and the full value is in the title. */
 .cmcp-chip {
   display: flex; align-items: center; gap: 0.25rem;
   border: none; background: transparent; cursor: pointer;
   color: var(--p-text-muted-color, #a1a1aa); font: inherit; font-size: 0.6875rem;
   padding: 0.125rem 0.375rem; border-radius: var(--p-border-radius-sm, 4px);
+  white-space: nowrap; min-width: 0; overflow: hidden; flex: 0 1 auto;
 }
+/* The NAME keeps a floor so it never truncates to nothing — at very narrow
+   widths an unfloored ellipsis ate the whole model name and left a bare
+   "· medium", which tells you the least useful half. The effort suffix yields
+   first instead: "which model" matters more than "which effort", and the full
+   value is on the chip's title either way. The caret never shrinks, so the
+   dropdown affordance survives at any width. */
+.cmcp-chip .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 4.5ch; }
+.cmcp-chip .dim { overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
+.cmcp-chip .pi-angle-down { flex: 0 0 auto; }
 .cmcp-chip:hover { background: var(--p-surface-700, #3f3f46); }
 /* Attachment chip strip (composer): viewable/expandable pasted text + files. */
 .cmcp-attachbar { display: flex; flex-direction: column; gap: 0.25rem; padding: 0.25rem 0.25rem 0; }
@@ -9445,8 +9461,11 @@ function buildPanel() {
   const modelChip = document.createElement("button");
   modelChip.type = "button";
   modelChip.className = "cmcp-chip";
+  // Initial title only — refreshModelChip() replaces it with the live model and
+  // effort, since the name can be ellipsised at narrow widths.
   modelChip.title = "Model & reasoning effort for the background agent";
   const modelChipLabel = document.createElement("span");
+  modelChipLabel.className = "name";
   const modelChipEffort = document.createElement("span");
   modelChipEffort.className = "dim";
   const modelChipCaret = document.createElement("i");
@@ -9454,8 +9473,15 @@ function buildPanel() {
   modelChip.append(modelChipLabel, modelChipEffort, modelChipCaret);
 
   function refreshModelChip() {
-    modelChipLabel.textContent = prefs.modelAuto ? "Auto" : modelLabel(modelCatalog, prefs.model);
+    const name = prefs.modelAuto ? "Auto" : modelLabel(modelCatalog, prefs.model);
+    modelChipLabel.textContent = name;
     modelChipEffort.textContent = prefs.effort ? ` · ${prefs.effort}` : "";
+    // The name ellipsises in a narrow panel, so the hover has to carry the full
+    // value — otherwise a truncated model id is unrecoverable without widening
+    // the panel, which is the thing we're avoiding.
+    modelChip.title =
+      `Model: ${name}${prefs.effort ? ` · effort: ${prefs.effort}` : ""}` +
+      "\nModel & reasoning effort for the background agent";
   }
 
   // Reconcile the ComfyUI Settings defaults with the panel's localStorage runtime.
