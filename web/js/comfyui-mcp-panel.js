@@ -10021,7 +10021,8 @@ function buildPanel() {
   const civitaiBtn = toolbarBtn("pi-circle", "Civitai");
   civitaiBtn.querySelector(".pi").remove();
   civitaiBtn.title = "Civitai explorer — browse and pull models, LoRAs, and workflows without leaving the panel.";
-  civitaiBtn.addEventListener("click", () => openCivitai());
+  // Manual open side-docks too (chat stays visible) — parity with the agent open.
+  civitaiBtn.addEventListener("click", () => openCivitai({ dock: true }));
   {
     const svgNs = "http://www.w3.org/2000/svg";
     const svg = document.createElementNS(svgNs, "svg");
@@ -10070,7 +10071,8 @@ function buildPanel() {
   const trainingBtn = toolbarBtn("pi-circle", "Training");
   trainingBtn.querySelector(".pi").remove();
   trainingBtn.title = "LoRA Training — train a character LoRA locally on FLUX.1-dev (style/edit/slider/video coming in P2).";
-  trainingBtn.addEventListener("click", () => openTraining());
+  // Manual open side-docks too (chat stays visible) — parity with the agent open.
+  trainingBtn.addEventListener("click", () => openTraining({ dock: true }));
   {
     const svgNs = "http://www.w3.org/2000/svg";
     const svg = document.createElementNS(svgNs, "svg");
@@ -10153,7 +10155,11 @@ function buildPanel() {
       getStatus: () => _runpodStatus,
       getTarget: () => _comfyuiTarget,
       openUrl: (u) => { try { window.open(u, "_blank", "noopener"); } catch {} },
-    });
+      // Agent-drive side-dock geometry/observation (pane may be docked L or R),
+      // same helpers the CivitAI/Training modals use.
+      dockGeometry: panelDockGeometry,
+      watchDock: panelWatchDock,
+    }, { dock: true });
   });
   // Expose for the bridge callbacks (defined outside this closure).
   panelRunpod = {

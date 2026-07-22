@@ -152,6 +152,25 @@ function el(tag, cls, text) {
   return e;
 }
 
+/** Slide/fade the panel out before detaching (shared exit for the three docked
+ *  side-panels). Docked: reverse the translateX slide-in (drop cmcp-dock-in) so
+ *  the card slides back out; centered/narrow: a plain opacity fade — no
+ *  horizontal slide. The DOM is removed after the transition window (jsdom fires
+ *  no transitionend, so a fixed timer drives it). Idempotent — remove() on an
+ *  already-detached node is a no-op. */
+const DOCK_SLIDE_OUT_MS = 240;
+function slideOutThenRemove(overlay) {
+  const docked = overlay.classList.contains("cmcp-docked");
+  overlay.style.pointerEvents = "none";
+  if (docked) {
+    overlay.classList.remove("cmcp-dock-in"); // card returns to translateX(24px)/opacity 0
+  } else {
+    overlay.style.transition = "opacity .18s ease";
+    overlay.style.opacity = "0";
+  }
+  setTimeout(() => { try { overlay.remove(); } catch { /* already gone */ } }, DOCK_SLIDE_OUT_MS);
+}
+
 /** callTool envelope → parsed JSON (train_* tools return text-wrapped JSON). */
 async function callJson(ctx, tool, args, opts) {
   if (!ctx.callTool) throw new Error("panel bridge not connected — start the comfyui-mcp orchestrator");
@@ -260,7 +279,10 @@ export function openTrainingModal(ctx = {}, opts = {}) {
     if (_dockDispose) { try { _dockDispose(); } catch { /* best effort */ } _dockDispose = null; }
     wiz.launchGen++; // a pending launch's continuation self-discards (codex finding)
     wiz.uploadGen++;
-    overlay.remove();
+    // Slide/fade the card out, THEN detach (parity with the CivitAI + RunPod
+    // side-panels). `closed` already true above, so the exit window is inert;
+    // host bookkeeping (onClose) still runs now.
+    slideOutThenRemove(overlay);
     try { opts.onClose?.(); } catch { /* host bookkeeping only */ }
   };
   overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
