@@ -9439,13 +9439,13 @@ function buildPanel() {
     }
     scrollLog();
   }
-  function renderTodo(items) {
+  function renderTodo(items, { persist = true } = {}) {
     todoItems = Array.isArray(items) ? items : [];
     renderTray();
     // Persist the plan ON the active thread so it survives a reload / panel
     // remount (the tray is otherwise rebuilt empty) and follows thread switches.
-    if (thread) {
-      thread.todos = todoItems;
+    if (thread && persist) {
+      historyStore.reviseThread(thread, { todos: todoItems });
       persistThreads();
     }
   }
@@ -10401,7 +10401,7 @@ function buildPanel() {
   let thread = null; // created lazily on first recorded message
 
   function nextHistoryRevision() {
-    return Math.max(Date.now(), Number(historyMeta?.updatedAt) + 1 || 0);
+    return historyStore.nextRevision(Math.max(Date.now(), Number(historyMeta?.updatedAt) + 1 || 0));
   }
 
   function applyWorkflowAliasesFromHistory() {
@@ -10439,7 +10439,6 @@ function buildPanel() {
   function syncWorkflowAliases() {
     const previous = historyMeta.workflowAliases || {};
     const paths = new Set([...Object.keys(previous), ...Object.keys(_workflowUuidAliases)]);
-    let revision = nextHistoryRevision();
     for (const path of paths) {
       const oldValue = previous[path];
       const newValue = _workflowUuidAliases[path];
@@ -10449,9 +10448,8 @@ function buildPanel() {
         "workflowAliases",
         path,
         newValue ?? null,
-        revision,
+        nextHistoryRevision(),
       );
-      revision += 1;
     }
   }
 
@@ -10517,7 +10515,7 @@ function buildPanel() {
       const legacyKey = path ? `wf:${path}` : null;
       const legacy = legacyKey ? threads.filter((candidate) => candidate.workflowKey === legacyKey) : [];
       if (legacy.length) {
-        for (const candidate of legacy) candidate.workflowKey = wfid;
+        for (const candidate of legacy) historyStore.reviseThread(candidate, { workflowKey: wfid });
         persistThreads();
       }
     }
@@ -10544,9 +10542,10 @@ function buildPanel() {
         msgs: [],
         workflowKey: scopeKey,
       };
+      historyStore.reviseThread(thread, { workflowKey: scopeKey }, now);
       // Adopt any session id the orchestrator has already reported for this tab.
       const sid = ssGet(SESSION_KEY);
-      if (sid) thread.sessionId = sid;
+      if (sid) historyStore.reviseThread(thread, { sessionId: sid }, now);
       threads.push(thread);
       if (threads.length > MAX_THREADS) threads = capHistoryThreads(threads, thread.id);
       ssSet(CURRENT_THREAD_KEY, thread.id);
@@ -10563,6 +10562,7 @@ function buildPanel() {
           : crypto.randomUUID(),
       createdAt: Number(entry.createdAt) || now,
     };
+    historyStore.touchMessage(entry, now);
     thread.msgs.push(entry);
     if (thread.msgs.length > MAX_THREAD_MSGS) {
       thread.msgs.splice(0, thread.msgs.length - MAX_THREAD_MSGS);
@@ -10577,7 +10577,7 @@ function buildPanel() {
   function bindSession(sessionId) {
     ssSet(SESSION_KEY, sessionId);
     if (thread) {
-      thread.sessionId = sessionId || undefined;
+      historyStore.reviseThread(thread, { sessionId: sessionId || null });
       persistThreads();
     }
   }
@@ -10827,6 +10827,7 @@ function buildPanel() {
       onAction(text) {
         rec.resolved = true;
         rec.choice = text;
+        historyStore.touchMessage(rec);
         persistThreads();
         liveA2uiCards.delete(handle.cardId);
         setChatSurfaceForCards();
@@ -10834,6 +10835,7 @@ function buildPanel() {
       },
       onDismiss() {
         rec.resolved = true; // dismissed: inert, no choice, agent NOT notified
+        historyStore.touchMessage(rec);
         persistThreads();
         liveA2uiCards.delete(handle.cardId);
         setChatSurfaceForCards();
@@ -11549,7 +11551,7 @@ function buildPanel() {
         else paintCard(m);
       }
     }
-    renderTodo(t.todos || []);
+    renderTodo(t.todos || [], { persist: false });
   }
 
   function loadThread(t) {
@@ -11607,9 +11609,7 @@ function buildPanel() {
       // tmp→wf adopt bookkeeping (a save gave the unsaved workflow a real id).
       if (wfid.startsWith("wf:") && wf && (wf.key || wf.id)) _tempWorkflowIds.delete(wf.key || wf.id);
       if (thread) {
-        thread.workflowKey = wfid; // thread rides along for archive provenance
-        thread.updatedAt = Date.now();
-        thread.ts = thread.updatedAt;
+        historyStore.reviseThread(thread, { workflowKey: wfid }); // archive provenance
         setActiveThread("panel:global", thread.id);
         persistThreads();
       }
@@ -12162,6 +12162,7 @@ function buildPanel() {
       if (!v.ok) throw new Error(`invalid a2ui spec: ${v.errors.slice(0, 5).join("; ")}`);
       if (!entry.handle.update(v.spec)) throw new Error(`card "${msg.card_id}" is resolved`);
       entry.rec.spec = v.spec;
+      historyStore.touchMessage(entry.rec);
       persistThreads();
       setChatSurfaceForCards();
       return { ok: true };
@@ -13502,7 +13503,7 @@ function buildPanel() {
     const switching = connectedBackend !== null && connectedBackend !== id;
     if (switching) {
       ssSet(SESSION_KEY, null);
-      if (thread) thread.sessionId = undefined;
+      if (thread) historyStore.reviseThread(thread, { sessionId: null });
       // Replay the visible transcript to the NEW provider as one-shot context so
       // its fresh session has the conversation (session/thinking aren't portable
       // across providers). Consumed by the next user message, then auto-cleared.
@@ -15202,7 +15203,9 @@ function buildPanel() {
     const boundSessionId = durableActive.id === reloadThreadId
       ? reloadSessionId
       : (durableActive.sessionId || null);
-    if (durableActive.id === reloadThreadId) durableActive.sessionId = boundSessionId;
+    if (durableActive.id === reloadThreadId) {
+      historyStore.reviseThread(durableActive, { sessionId: boundSessionId });
+    }
     ssSet(CURRENT_THREAD_KEY, durableActive.id);
     ssSet(SESSION_KEY, boundSessionId);
     setActiveThread(scopeKey, durableActive.id);

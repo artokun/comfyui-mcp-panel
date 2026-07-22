@@ -18,6 +18,17 @@ const DEFAULT_MAX_MESSAGES = 5000;
 const LOCAL_SHADOW_THREADS = 20;
 const LOCAL_SHADOW_MESSAGES = 200;
 const IDB_OPEN_TIMEOUT_MS = 2000;
+const THREAD_FIELDS = [
+  "sessionId",
+  "todos",
+  "workflowKey",
+  "workflowTitle",
+  "provider",
+  "model",
+  "effort",
+  "pinned",
+  "title",
+];
 
 function finiteTs(value) {
   const n = Number(value);
@@ -46,21 +57,55 @@ function stableHash(value) {
   return first.toString(16).padStart(8, "0") + second.toString(16).padStart(8, "0");
 }
 
+function normalizeRevision(value, fallbackUpdatedAt = 0, fallbackWriterId = "legacy", fallbackSequence = 0) {
+  const source = value && typeof value === "object" && !Array.isArray(value)
+    ? (value.revision && typeof value.revision === "object" ? value.revision : value)
+    : null;
+  const updatedAt = finiteTs(source?.updatedAt) || finiteTs(fallbackUpdatedAt);
+  if (!updatedAt) return null;
+  const writerId = typeof source?.writerId === "string" && source.writerId
+    ? source.writerId
+    : fallbackWriterId;
+  const sequenceValue = Number(source?.sequence ?? fallbackSequence);
+  const sequence = Number.isSafeInteger(sequenceValue) && sequenceValue >= 0 ? sequenceValue : 0;
+  return { updatedAt, writerId, sequence };
+}
+
+function compareRevisions(left, right) {
+  const a = normalizeRevision(left);
+  const b = normalizeRevision(right);
+  if (!a) return b ? -1 : 0;
+  if (!b) return 1;
+  if (a.updatedAt !== b.updatedAt) return a.updatedAt < b.updatedAt ? -1 : 1;
+  if (a.writerId !== b.writerId) return a.writerId < b.writerId ? -1 : 1;
+  if (a.sequence !== b.sequence) return a.sequence < b.sequence ? -1 : 1;
+  return 0;
+}
+
+function legacyRevision(value, updatedAt) {
+  return normalizeRevision(null, updatedAt || 1, `legacy-${stableHash(canonicalJson(value))}`, 0);
+}
+
+function normalizeMessage(message, threadId, ordinal) {
+  if (!message || typeof message !== "object" || Array.isArray(message)) return null;
+  const id = typeof message.id === "string" && message.id
+    ? message.id
+    : `legacy-${stableHash(`${threadId}:${ordinal}:${canonicalJson(message)}`)}`;
+  const createdAt = finiteTs(message.createdAt) || finiteTs(message.ts) || 1;
+  const updatedAt = finiteTs(message.updatedAt) || createdAt;
+  const revision = normalizeRevision(
+    message.revision || message,
+    updatedAt,
+    `legacy-${stableHash(`${threadId}:${id}:${canonicalJson(message)}`)}`,
+  );
+  return { ...message, id, createdAt, updatedAt, revision };
+}
+
 function normalizeMessages(threadId, messages) {
   const normalized = [];
   for (const [ordinal, message] of (Array.isArray(messages) ? messages : []).entries()) {
-    if (!message || typeof message !== "object" || Array.isArray(message)) continue;
-    if (typeof message.id === "string" && message.id) {
-      normalized.push(message);
-      continue;
-    }
-    // Legacy records predate message UUIDs. The thread id, original ordinal and
-    // canonical content make the migration identical in every tab, including
-    // duplicate messages, so it is safe to union and tombstone immediately.
-    normalized.push({
-      ...message,
-      id: `legacy-${stableHash(`${threadId}:${ordinal}:${canonicalJson(message)}`)}`,
-    });
+    const next = normalizeMessage(message, threadId, ordinal);
+    if (next) normalized.push(next);
   }
   return normalized;
 }
@@ -84,25 +129,32 @@ function mergeTimestampMaps(...maps) {
 
 function normalizeMetadataOperation(operation, fallbackValue, fallbackUpdatedAt) {
   if (operation && typeof operation === "object" && !Array.isArray(operation)) {
-    const updatedAt = finiteTs(operation.updatedAt);
+    const revision = normalizeRevision(
+      operation.revision || operation,
+      0,
+      `legacy-${stableHash(canonicalJson(operation))}`,
+    );
     const deleted = operation.deleted;
     const coherent =
       deleted === true
         ? operation.value == null
         : deleted === false && operation.value != null;
-    if (!updatedAt || !coherent) return null;
+    if (!revision || !coherent) return null;
     return {
       value: deleted ? null : cloneJson(operation.value),
       deleted,
-      updatedAt,
+      updatedAt: revision.updatedAt,
+      revision,
     };
   }
   const updatedAt = finiteTs(fallbackUpdatedAt);
   if (!updatedAt || fallbackValue == null) return null;
+  const revision = legacyRevision(fallbackValue, updatedAt);
   return {
     value: cloneJson(fallbackValue),
     deleted: false,
     updatedAt,
+    revision,
   };
 }
 
@@ -132,14 +184,11 @@ function mergeMetadataOperationMaps(current, incoming) {
   for (const [key, operation] of Object.entries(current || {})) merged[key] = operation;
   for (const [key, operation] of Object.entries(incoming || {})) {
     const previous = merged[key];
-    const previousAt = finiteTs(previous?.updatedAt);
-    const incomingAt = finiteTs(operation?.updatedAt);
-    // Deletion wins an exact-time tie so a concurrent stale value cannot revive
-    // a pointer/alias merely because two tabs happened to mutate in one clock tick.
+    const order = compareRevisions(operation?.revision || operation, previous?.revision || previous);
     if (
       !previous ||
-      incomingAt > previousAt ||
-      (incomingAt === previousAt && (operation.deleted === true || previous.deleted !== true))
+      order > 0 ||
+      (order === 0 && operation.deleted === true && previous.deleted !== true)
     ) {
       merged[key] = operation;
     }
@@ -163,7 +212,7 @@ export function updateMetadataEntry(meta, mapName, key, value, updatedAt = Date.
       ? "aliasOps"
       : null;
   if (!opsName || typeof key !== "string" || !key) return meta;
-  const revision = finiteTs(updatedAt) || Date.now();
+  const revision = normalizeRevision(updatedAt, Date.now(), "local", 0);
   const values = safeMap();
   for (const [existingKey, existingValue] of Object.entries(meta?.[mapName] || {})) {
     values[existingKey] = existingValue;
@@ -173,12 +222,56 @@ export function updateMetadataEntry(meta, mapName, key, value, updatedAt = Date.
   else values[key] = value;
   return {
     ...(meta && typeof meta === "object" ? meta : {}),
-    updatedAt: Math.max(finiteTs(meta?.updatedAt), revision),
+    updatedAt: Math.max(finiteTs(meta?.updatedAt), revision.updatedAt),
     [mapName]: values,
     [opsName]: Object.assign(safeMap(), meta?.[opsName] || {}, {
-      [key]: { value: deleted ? null : value, deleted, updatedAt: revision },
+      [key]: { value: deleted ? null : value, deleted, updatedAt: revision.updatedAt, revision },
     }),
   };
+}
+
+function normalizeThreadFieldOperations(raw, fallbackUpdatedAt) {
+  const operations = safeMap();
+  const source = raw?.fieldOps && typeof raw.fieldOps === "object" && !Array.isArray(raw.fieldOps)
+    ? raw.fieldOps
+    : null;
+  for (const field of THREAD_FIELDS) {
+    if (source && Object.hasOwn(source, field)) {
+      const operation = normalizeMetadataOperation(source[field], null, 0);
+      if (operation) operations[field] = operation;
+      continue;
+    }
+    let hasValue = Object.hasOwn(raw, field);
+    let value = raw[field];
+    if (field === "workflowKey" && !hasValue) {
+      hasValue = true;
+      value = "panel:global";
+    }
+    if (!hasValue || value == null) continue;
+    const revision = legacyRevision(value, fallbackUpdatedAt);
+    operations[field] = {
+      value: cloneJson(value),
+      deleted: false,
+      updatedAt: revision.updatedAt,
+      revision,
+    };
+  }
+  return operations;
+}
+
+function materializeThreadFields(thread, fieldOps) {
+  const materialized = { ...thread, fieldOps };
+  for (const field of THREAD_FIELDS) {
+    const operation = fieldOps[field];
+    if (!operation) continue;
+    if (operation.deleted === true) delete materialized[field];
+    else materialized[field] = cloneJson(operation.value);
+  }
+  materialized.pinned = materialized.pinned === true;
+  materialized.workflowKey = typeof materialized.workflowKey === "string"
+    ? materialized.workflowKey
+    : "panel:global";
+  return materialized;
 }
 
 export function normalizeThread(raw) {
@@ -194,7 +287,8 @@ export function normalizeThread(raw) {
   const ts = finiteTs(raw.ts) || finiteTs(raw.createdAt) || Date.now();
   const createdAt = finiteTs(raw.createdAt) || ts;
   const updatedAt = finiteTs(raw.updatedAt) || ts;
-  return {
+  const fieldOps = normalizeThreadFieldOperations(raw, updatedAt);
+  return materializeThreadFields({
     ...raw,
     id: raw.id,
     schemaVersion: CHAT_HISTORY_SCHEMA,
@@ -203,14 +297,12 @@ export function normalizeThread(raw) {
     ts: updatedAt,
     msgs,
     deletedMessages,
-    pinned: raw.pinned === true,
     title: typeof raw.title === "string" ? raw.title.slice(0, 160) : undefined,
-    workflowKey: typeof raw.workflowKey === "string" ? raw.workflowKey : "panel:global",
     workflowTitle: typeof raw.workflowTitle === "string" ? raw.workflowTitle.slice(0, 240) : undefined,
     provider: typeof raw.provider === "string" ? raw.provider : undefined,
     model: typeof raw.model === "string" ? raw.model : undefined,
     effort: typeof raw.effort === "string" ? raw.effort : undefined,
-  };
+  }, fieldOps);
 }
 
 export function selectThreadForScope(threads, meta, scopeKey) {
@@ -289,12 +381,14 @@ function mergeThreadMessages(older, newer) {
   const byId = new Map();
   for (const message of [...oldMessages, ...newMessages]) {
     const previous = byId.get(message.id);
-    if (!previous || finiteTs(message.updatedAt || message.createdAt) >= finiteTs(previous.updatedAt || previous.createdAt)) {
+    if (!previous || compareRevisions(message.revision || message, previous.revision || previous) > 0) {
       byId.set(message.id, message);
     }
   }
   return [...byId.values()].sort(
-    (a, b) => finiteTs(a.createdAt || a.ts) - finiteTs(b.createdAt || b.ts),
+    (a, b) =>
+      finiteTs(a.createdAt || a.ts) - finiteTs(b.createdAt || b.ts) ||
+      String(a.id).localeCompare(String(b.id)),
   );
 }
 
@@ -355,7 +449,11 @@ export function mergeHistorySnapshots(...snapshots) {
           (message) =>
             !(typeof message?.id === "string" && Object.hasOwn(deletedMessages, message.id)),
         );
-      byId.set(next.id, { ...older, ...overlay, msgs, deletedMessages });
+      const fieldOps = mergeMetadataOperationMaps(older.fieldOps, newer.fieldOps);
+      byId.set(next.id, materializeThreadFields(
+        { ...older, ...overlay, msgs, deletedMessages },
+        fieldOps,
+      ));
     }
   }
   const threads = [...byId.values()]
@@ -484,8 +582,53 @@ export class ChatHistoryStore {
     this.snapshotKey = options.snapshotKey ?? CHAT_HISTORY_LOCAL_SNAPSHOT_KEY;
     this.maxThreads = options.maxThreads ?? DEFAULT_MAX_THREADS;
     this.maxMessages = options.maxMessages ?? DEFAULT_MAX_MESSAGES;
+    this.writerId = options.writerId || globalThis.crypto?.randomUUID?.() || `writer-${Math.random().toString(16).slice(2)}`;
+    this._revisionSequence = 0;
+    this._lastRevisionAt = 0;
     this._writePromise = Promise.resolve(null);
     this._lastCommitted = null;
+  }
+
+  nextRevision(updatedAt = Date.now()) {
+    const at = finiteTs(updatedAt) || Date.now();
+    if (at !== this._lastRevisionAt) {
+      this._lastRevisionAt = at;
+      this._revisionSequence = 0;
+    }
+    this._revisionSequence += 1;
+    return { updatedAt: at, writerId: this.writerId, sequence: this._revisionSequence };
+  }
+
+  reviseThread(thread, values, updatedAt = Date.now()) {
+    if (!thread || typeof thread !== "object" || !values || typeof values !== "object") return thread;
+    const fieldOps = Object.assign(safeMap(), thread.fieldOps || {});
+    let newestAt = finiteTs(thread.updatedAt);
+    for (const [field, value] of Object.entries(values)) {
+      if (!THREAD_FIELDS.includes(field)) continue;
+      const revision = this.nextRevision(updatedAt);
+      const deleted = value == null;
+      fieldOps[field] = {
+        value: deleted ? null : cloneJson(value),
+        deleted,
+        updatedAt: revision.updatedAt,
+        revision,
+      };
+      if (deleted) delete thread[field];
+      else thread[field] = cloneJson(value);
+      newestAt = Math.max(newestAt, revision.updatedAt);
+    }
+    thread.fieldOps = fieldOps;
+    thread.updatedAt = newestAt || Date.now();
+    thread.ts = thread.updatedAt;
+    return thread;
+  }
+
+  touchMessage(message, updatedAt = Date.now()) {
+    if (!message || typeof message !== "object") return message;
+    const revision = this.nextRevision(updatedAt);
+    message.updatedAt = revision.updatedAt;
+    message.revision = revision;
+    return message;
   }
 
   readLocal() {

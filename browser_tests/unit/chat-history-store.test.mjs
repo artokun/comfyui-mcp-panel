@@ -145,6 +145,94 @@ test('merges concurrent messages in the same thread without dropping either tab'
   ])
 })
 
+test('stale append cannot roll back independently revised session todos provenance or card state', () => {
+  const base = normalizeThread({
+    id: 'causal-thread',
+    workflowKey: 'workflow:old',
+    sessionId: 'old-session',
+    todos: [{ text: 'old todo', status: 'pending' }],
+    createdAt: 100,
+    updatedAt: 100,
+    msgs: [{
+      id: 'card',
+      role: 'card',
+      kind: 'a2ui',
+      spec: { title: 'old card' },
+      resolved: false,
+      createdAt: 100
+    }]
+  })
+  const stateTab = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb: null,
+    writerId: 'writer-a'
+  })
+  const appendTab = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb: null,
+    writerId: 'writer-b'
+  })
+  const stateThread = structuredClone(base)
+  stateTab.reviseThread(stateThread, {
+    sessionId: 'new-session',
+    todos: [{ text: 'new todo', status: 'done' }],
+    workflowKey: 'workflow:new'
+  }, 1_000)
+  stateThread.msgs[0].spec = { title: 'new card' }
+  stateThread.msgs[0].resolved = true
+  stateTab.touchMessage(stateThread.msgs[0], 1_000)
+
+  const staleAppend = structuredClone(base)
+  const reply = { id: 'reply', role: 'agent', text: 'late reply', createdAt: 2_000 }
+  appendTab.touchMessage(reply, 2_000)
+  staleAppend.msgs.push(reply)
+  staleAppend.updatedAt = 2_000
+  staleAppend.ts = 2_000
+
+  for (const pair of [[stateThread, staleAppend], [staleAppend, stateThread]]) {
+    const merged = mergeHistorySnapshots(
+      { threads: [pair[0]], meta: {} },
+      { threads: [pair[1]], meta: {} }
+    ).threads[0]
+    assert.equal(merged.sessionId, 'new-session')
+    assert.deepEqual(merged.todos, [{ text: 'new todo', status: 'done' }])
+    assert.equal(merged.workflowKey, 'workflow:new')
+    assert.equal(merged.msgs.find((message) => message.id === 'card').spec.title, 'new card')
+    assert.equal(merged.msgs.find((message) => message.id === 'card').resolved, true)
+    assert.equal(merged.msgs.find((message) => message.id === 'reply').text, 'late reply')
+  }
+})
+
+test('exact revision ties use writer and sequence deterministically in both merge orders', () => {
+  const base = normalizeThread({
+    id: 'tie-thread',
+    workflowKey: 'workflow:base',
+    sessionId: 'base-session',
+    updatedAt: 100,
+    msgs: [{ id: 'card', role: 'card', text: 'base', createdAt: 100 }]
+  })
+  const lowerWriter = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb: null, writerId: 'a' })
+  const higherWriter = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb: null, writerId: 'z' })
+  const left = structuredClone(base)
+  const right = structuredClone(base)
+  lowerWriter.reviseThread(left, { sessionId: 'from-a', workflowKey: 'workflow:a' }, 1_000)
+  higherWriter.reviseThread(right, { sessionId: 'from-z', workflowKey: 'workflow:z' }, 1_000)
+  left.msgs[0].text = 'card-a'
+  right.msgs[0].text = 'card-z'
+  lowerWriter.touchMessage(left.msgs[0], 1_000)
+  higherWriter.touchMessage(right.msgs[0], 1_000)
+
+  for (const pair of [[left, right], [right, left]]) {
+    const merged = mergeHistorySnapshots(
+      { threads: [pair[0]], meta: {} },
+      { threads: [pair[1]], meta: {} }
+    ).threads[0]
+    assert.equal(merged.sessionId, 'from-z')
+    assert.equal(merged.workflowKey, 'workflow:z')
+    assert.equal(merged.msgs[0].text, 'card-z')
+  }
+})
+
 test('thread tombstones prevent deleted chats from being resurrected by stale snapshots', () => {
   const deletedAt = 500
   const merged = mergeHistorySnapshots(
