@@ -842,6 +842,10 @@ export function openCivitaiModal(ctx, opts = {}) {
   }
 
   function openViewer(startIdx) {
+    // At-most-one lightbox: tear down any prior one (and its document keydown
+    // listener) before opening a new one, so a second open without an
+    // intervening close can't strand the older listener (codex finding).
+    if (_activeLightboxClose) { try { _activeLightboxClose(); } catch { /* already gone */ } _activeLightboxClose = null; }
     let idx = startIdx;
     let renderSeq = 0;
     const lb = el("div", "cmcp-cv-lb");

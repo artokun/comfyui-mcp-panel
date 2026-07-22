@@ -996,7 +996,14 @@ export function openTrainingModal(ctx = {}, opts = {}) {
       // Pod target: docker/gpu/image are irrelevant — the gate is a working pod
       // SSH endpoint (plus the custom-param check).
       const podReady = wiz.target === "pod" && !!wiz.podInfo?.ssh;
+      // Dataset readiness shares the ONE _readiness() source with the gather Next
+      // button + gotoStep, so an agent set_field that invalidates the name (or
+      // otherwise breaks readiness) while already ON this step disables Launch
+      // instead of leaving the gate bypassed (codex finding).
+      const r = _readiness();
+      const datasetReady = r.backendCapable && r.nameOk && r.hasImages && r.uploadsSettled;
       launch.disabled = wiz.launching
+        || !datasetReady
         || (wiz.target === "pod" ? !podReady : preflightState !== "local" && preflightState !== "failed")
         || !syncCustomValidity();
       if (wiz.launching) launch.textContent = "Launching…";
@@ -1343,16 +1350,18 @@ export function openTrainingModal(ctx = {}, opts = {}) {
     if (target !== "local" && target !== "pod") throw new Error(`invalid target "${target}" (expected "local" or "pod")`);
     if (target === "pod") {
       // Await a CURRENT preflight — never trust a possibly-stale wiz.podInfo. A
-      // versioned doctor means only the newest completion writes wiz.podInfo, so
-      // after the await it reflects the freshest check (codex finding).
+      // versioned doctor means only the newest completion may decide (codex).
       const myDoctorGen = ++doctorGen;
       let dd;
       try { dd = (await callJson(ctx, "train_doctor", {}, { timeout: 180000 })).data || {}; }
       catch (e) { throw new Error("pod preflight failed: " + (e.message || e)); }
       _assertOpen();
-      if (myDoctorGen === doctorGen) {
-        wiz.podInfo = dd.pod && dd.pod.status === "RUNNING" ? dd.pod : null;
-      }
+      // If a NEWER doctor superseded ours mid-flight, our result is stale and
+      // must NOT accept — reading the shared wiz.podInfo here could let an older
+      // SSH-ready value pass a preflight whose own (no-pod) result should fail.
+      // Reject and let the agent retry against the current check (codex finding).
+      if (myDoctorGen !== doctorGen) throw new Error("pod preflight was superseded — retry");
+      wiz.podInfo = dd.pod && dd.pod.status === "RUNNING" ? dd.pod : null;
       if (!(wiz.podInfo && wiz.podInfo.ssh)) throw new Error("no connected pod with a working SSH endpoint");
     }
     wiz.target = target;
