@@ -81,6 +81,38 @@ export const ACTIVE_BASE_MODELS = new Set([
   "ZImageTurbo", "ZImageBase", "ACE Audio",
 ]);
 
+/**
+ * Match a base-model name against a typed query.
+ *
+ * Plain substring matching is wrong here, and fails on the most obvious
+ * searches there are: Civitai writes the families as "Flux.2 D" and
+ * "Wan Video 2.5 T2V", so `"flux 2"` and `"wan 2.5"` — what a person actually
+ * types — both find NOTHING, because of a dot in one and an interposed word in
+ * the other. A zero-result list reads as "this model isn't supported", which is
+ * exactly the wrong conclusion.
+ *
+ * So: split both sides on punctuation and require every query token to appear,
+ * IN ORDER, as the prefix of some later name token. "flux 2" reaches "Flux.2 D"
+ * and "wan 2.5" reaches "Wan Video 2.5 T2V", while "flux 2" still does not
+ * reach "Flux.1 D". Order matters — without it "d flux" would match too, and
+ * ranking suffers when every token floats free.
+ */
+export function tokenizeQuery(q) {
+  return String(q || "").toLowerCase().split(/[^a-z0-9]+/i).filter(Boolean);
+}
+
+export function matchesBaseModel(name, tokens) {
+  if (!tokens.length) return true;
+  const words = String(name).toLowerCase().split(/[^a-z0-9]+/i).filter(Boolean);
+  let at = 0;
+  for (const t of tokens) {
+    const hit = words.findIndex((w, i) => i >= at && w.startsWith(t));
+    if (hit < 0) return false;
+    at = hit + 1;
+  }
+  return true;
+}
+
 export const DEFAULT_FILTERS = Object.freeze({
   period: "Week",
   baseModels: [],

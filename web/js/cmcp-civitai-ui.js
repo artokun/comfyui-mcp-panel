@@ -12,7 +12,8 @@
 
 import {
   CivitaiClient, DEFAULT_FILTERS, LEVELS, PERIODS, IMAGE_SORTS, MODEL_SORTS,
-  BASE_MODELS, ACTIVE_BASE_MODELS, filtersDirty, bitmask, parseCreatorQuery,
+  BASE_MODELS, ACTIVE_BASE_MODELS, tokenizeQuery, matchesBaseModel,
+  filtersDirty, bitmask, parseCreatorQuery,
 } from "./cmcp-civitai.js";
 
 const TABS = [
@@ -173,7 +174,7 @@ function injectCss() {
   .cmcp-cv-dd { position: relative; width: 100%; }
   .cmcp-cv-ddpanel { position: absolute; z-index: 6; left: 0; right: 0; top: calc(100% + .25rem);
     display: none; flex-direction: column; gap: .1rem; padding: .25rem;
-    max-height: 15rem; overflow-y: auto; border-radius: 8px;
+    max-height: min(20rem, 50vh); overflow-y: auto; border-radius: 8px;
     background: var(--p-surface-900,#18181b);
     border: 1px solid var(--p-content-border-color,#3f3f46);
     box-shadow: 0 8px 24px rgba(0,0,0,.45); }
@@ -188,6 +189,13 @@ function injectCss() {
   .cmcp-cv-ddopt.on .tick { opacity: 1; color: var(--p-primary-color,#3a7bd5); }
   .cmcp-cv-ddempty { padding: .4rem .5rem; font-size: .74rem;
     color: var(--p-text-muted-color,#a1a1aa); }
+  .cmcp-cv-ddfoot { position: sticky; bottom: -.25rem; display: flex; align-items: center;
+    justify-content: space-between; gap: .5rem; margin-top: .15rem; padding: .35rem .5rem;
+    font-size: .72rem; color: var(--p-text-muted-color,#a1a1aa);
+    background: var(--p-surface-900,#18181b);
+    border-top: 1px solid var(--p-content-border-color,#3f3f46); }
+  .cmcp-cv-ddclear { background: transparent; border: none; cursor: pointer; font-size: .72rem;
+    padding: 0; color: var(--p-primary-color,#3a7bd5); }
   .cmcp-cv-lb-prompt { font-size: .78rem; white-space: pre-wrap; word-break: break-word;
     background: var(--p-surface-950,#111); border-radius: 8px; padding: .5rem;
     max-height: 14rem; overflow-y: auto; }
@@ -1222,10 +1230,10 @@ export function openCivitaiModal(ctx, opts = {}) {
       };
 
       const renderOpts = () => {
-        const q = bmSearch.value.trim().toLowerCase();
+        const tokens = tokenizeQuery(bmSearch.value);
         bmPanel.innerHTML = "";
         bmOpts = [];
-        const hits = BASE_MODELS.filter((x) => !q || x.toLowerCase().includes(q));
+        const hits = BASE_MODELS.filter((x) => matchesBaseModel(x, tokens));
         const groups = [
           ["Current", hits.filter((x) => ACTIVE_BASE_MODELS.has(x))],
           ["Legacy", hits.filter((x) => !ACTIVE_BASE_MODELS.has(x))],
@@ -1251,6 +1259,24 @@ export function openCivitaiModal(ctx, opts = {}) {
         if (!bmOpts.length) {
           bmPanel.appendChild(el("div", "cmcp-cv-ddempty", `No base model matches “${bmSearch.value.trim()}”.`));
         }
+        // Selected-count + clear, matching what ComfyUI's own multi-select
+        // shows. With the list scrolled or filtered the chips above can be out
+        // of view, so without this there is no way to tell how many filters are
+        // live — or to drop them without hunting each one down.
+        if (f.baseModels.length) {
+          const foot = el("div", "cmcp-cv-ddfoot");
+          foot.appendChild(el("span", null,
+            `${f.baseModels.length} selected`));
+          const clear = el("button", "cmcp-cv-ddclear", "Clear");
+          clear.type = "button";
+          clear.addEventListener("mousedown", (e) => {
+            e.preventDefault();
+            f.baseModels.length = 0;
+            renderSheet(); update();
+          });
+          foot.appendChild(clear);
+          bmPanel.appendChild(foot);
+        }
         setActive(-1);
       };
       const openDd = () => {
@@ -1263,7 +1289,14 @@ export function openCivitaiModal(ctx, opts = {}) {
       bmSearch.addEventListener("input", () => { renderOpts(); dd.classList.add("open"); });
       bmSearch.addEventListener("blur", closeDd);
       bmSearch.addEventListener("keydown", (e) => {
-        if (e.key === "Escape") { closeDd(); return; }
+        if (e.key === "Escape") {
+          // Escape MUST stop here. The sheet is mounted inside ComfyUI's own
+          // document, so an un-stopped Escape closes the whole filter sheet
+          // (and reaches the canvas) — dismissing the dropdown would throw
+          // away the user's other filter edits with it.
+          if (dd.classList.contains("open")) { e.preventDefault(); e.stopPropagation(); closeDd(); }
+          return;
+        }
         if (e.key === "ArrowDown" || e.key === "ArrowUp") {
           e.preventDefault();
           if (!dd.classList.contains("open")) { openDd(); return; }
