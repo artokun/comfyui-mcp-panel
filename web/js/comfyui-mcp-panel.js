@@ -6796,6 +6796,31 @@ const RECONNECT_MAX_MS = 15000;
 let AGENT_MUTED = (() => { try { return localStorage.getItem("cmcp.muteAgents") === "1"; } catch { return false; } })();
 let AGENT_BLIND = (() => { try { return localStorage.getItem("cmcp.blindAgents") === "1"; } catch { return false; } })();
 
+/**
+ * Strip the auth token out of a bridge URL before it goes anywhere a human can
+ * see it.
+ *
+ * These lines get screenshotted into bug reports and pasted into chats — a live
+ * bridge token does not belong in either, and there's no reason a status line
+ * needs it. It is also what made these lines overflow: a 64-char hex token is
+ * one unbreakable word, so it blew past the panel width and forced a horizontal
+ * scrollbar on the whole log. Keeping the first few characters preserves the
+ * one thing the token is useful for here — telling two sessions apart.
+ */
+function redactBridgeUrl(u) {
+  const raw = String(u ?? "");
+  try {
+    const url = new URL(raw);
+    const t = url.searchParams.get("token");
+    if (t) url.searchParams.set("token", `${t.slice(0, 4)}…`);
+    return decodeURIComponent(url.toString());
+  } catch {
+    // Unparseable (relative, malformed) — redact textually rather than give up,
+    // so a bad URL can't leak the token the parsed path would have caught.
+    return raw.replace(/([?&]token=)[^&\s]+/gi, "$1…");
+  }
+}
+
 function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget }) {
   let sock = null;
   let url = loadBridgeUrl();
@@ -6933,7 +6958,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // sequence instead of on every (re)open during a cold-start flicker.
       if (!loggedWaiting) {
         loggedWaiting = true;
-        onLog(`Connected to ${url} — waiting for the panel agent…`);
+        onLog(`Connected to ${redactBridgeUrl(url)} — waiting for the panel agent…`);
       }
       sendHello();
       clearHandshake();
@@ -7851,6 +7876,12 @@ const PANEL_CSS = `
   align-self: center; font-size: 0.6875rem; font-style: italic;
   color: var(--p-text-muted-color, #a1a1aa);
   animation: cmcp-in 0.18s ease-out;
+  /* Status lines quote URLs, paths and ids — strings with no spaces to break
+     at. Without this, a single long token is one unbreakable word that widens
+     the whole log and forces a horizontal scrollbar across the panel. Uses
+     overflow-wrap:anywhere rather than break-word so it also breaks MID-token
+     when the token alone is wider than the panel, which is the case here. */
+  max-width: 100%; overflow-wrap: anywhere; text-align: center;
 }
 .cmcp-card {
   align-self: flex-start; max-width: 92%; width: 100%; box-sizing: border-box;
@@ -12706,7 +12737,7 @@ function buildPanel() {
 
   saveBtn.addEventListener("click", () => {
     client.setUrl(urlInput.value.trim());
-    appendSystem(`Reconnecting to ${client.currentUrl()}…`);
+    appendSystem(`Reconnecting to ${redactBridgeUrl(client.currentUrl())}…`);
   });
 
   // Connect: ask ComfyUI's server to start the background agent on demand, then
@@ -14864,7 +14895,7 @@ function buildPanel() {
     saveBridgeUrl(u);
     if (client.isConnected()) {
       client.setUrl(u);
-      appendSystem(`Bridge URL → ${u} (reconnecting).`);
+      appendSystem(`Bridge URL → ${redactBridgeUrl(u)} (reconnecting).`);
     }
   };
   panelHooks.applyAutoConnect = (on) => {
