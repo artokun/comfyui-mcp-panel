@@ -473,6 +473,63 @@ test('two stores migrate id-less messages once and preserve concurrent append an
   }
 })
 
+test('legacy migration fence handles duplicate shifts and content changes in both write orders', async () => {
+  const legacy = {
+    updatedAt: 100,
+    threads: [{
+      id: 'legacy-fence',
+      workflowKey: 'panel:global',
+      updatedAt: 100,
+      msgs: [
+        { role: 'user', text: 'duplicate', createdAt: 10 },
+        { role: 'user', text: 'duplicate', createdAt: 20 },
+        { role: 'card', text: 'old card', spec: { title: 'old' }, createdAt: 30 }
+      ]
+    }],
+    meta: {}
+  }
+  const staleChanged = [{
+    id: 'legacy-fence',
+    workflowKey: 'panel:global',
+    updatedAt: 500,
+    msgs: [
+      { role: 'user', text: 'duplicate', createdAt: 20 },
+      { role: 'card', text: 'changed card', spec: { title: 'changed' }, createdAt: 30 }
+    ]
+  }]
+
+  // Migration wins: a later id-less snapshot is quarantined.
+  const migratedFirstDb = createFakeIndexedDb(legacy)
+  const migrator = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb: migratedFirstDb })
+  const migrated = await migrator.load()
+  await migrator.flush()
+  assert.equal(migrated.threads[0].msgs.length, 3)
+  const staleAfterFence = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb: migratedFirstDb })
+  staleAfterFence.persist(staleChanged, {})
+  await staleAfterFence.flush()
+  const fenced = await new ChatHistoryStore({
+    storage: createMemoryStorage(), indexedDb: migratedFirstDb
+  }).load()
+  assert.deepEqual(fenced.threads[0].msgs.map((message) => message.text), [
+    'duplicate', 'duplicate', 'old card'
+  ])
+
+  // Stale legacy write wins: replace the matching pre-v3 thread before IDs are
+  // assigned, so the shifted duplicate/card never fork into extra messages.
+  const staleFirstDb = createFakeIndexedDb(legacy)
+  const staleBeforeFence = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb: staleFirstDb })
+  staleBeforeFence.persist(staleChanged, {})
+  await staleBeforeFence.flush()
+  const migratedAfter = await new ChatHistoryStore({
+    storage: createMemoryStorage(), indexedDb: staleFirstDb
+  }).load()
+  assert.deepEqual(migratedAfter.threads[0].msgs.map((message) => message.text), [
+    'duplicate', 'changed card'
+  ])
+  assert.equal(new Set(migratedAfter.threads[0].msgs.map((message) => message.id)).size, 2)
+  assert.equal(migratedAfter.threads[0].msgs[1].spec.title, 'changed')
+})
+
 test('metadata tombstones clear active pointers and aliases across stale snapshots', () => {
   const merged = mergeHistorySnapshots(
     {

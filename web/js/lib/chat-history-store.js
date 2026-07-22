@@ -21,6 +21,7 @@ const IDB_OPEN_TIMEOUT_MS = 2000;
 const DEFAULT_MAX_TOMBSTONES = 512;
 const DEFAULT_MAX_METADATA_OPS = 512;
 const BROADCAST_CHANNEL_NAME = "comfyui-mcp-panel-history-v3";
+const LEGACY_IDLESS_SOURCE = Symbol("legacy-idless-source");
 const THREAD_FIELDS = [
   "sessionId",
   "todos",
@@ -40,6 +41,12 @@ function finiteTs(value) {
 
 function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function hasIdlessMessages(threads) {
+  return (Array.isArray(threads) ? threads : []).some((thread) =>
+    (Array.isArray(thread?.msgs) ? thread.msgs : []).some((message) =>
+      !message || typeof message.id !== "string" || !message.id));
 }
 
 function canonicalJson(value) {
@@ -701,9 +708,31 @@ function withoutCheckpoint(snapshot) {
  * existed at that generation. Newer causal operations still pass the normal
  * post-checkpoint filters. */
 function mergeUnderCanonicalCheckpoint(canonical, ...untrusted) {
+  const canonicalFenced = Number(canonical?.schemaVersion) >= CHAT_HISTORY_SCHEMA &&
+    !hasIdlessMessages(canonical?.threads);
+  const accepted = untrusted.filter((snapshot) =>
+    !(canonicalFenced && snapshot?.[LEGACY_IDLESS_SOURCE] === true));
+  let canonicalBaseline = canonical && typeof canonical === "object" ? canonical : null;
+  if (!canonicalFenced) {
+    // Before the one-way schema-3 fence, a pre-v3 tab writes a complete thread.
+    // Replace matching legacy threads as a unit; UUID-unioning independently
+    // hashed positions/content would duplicate shifted or edited messages.
+    const legacyThreadIds = new Set(accepted
+      .filter((snapshot) => snapshot?.[LEGACY_IDLESS_SOURCE] === true)
+      .flatMap((snapshot) => (Array.isArray(snapshot?.threads) ? snapshot.threads : []))
+      .map((thread) => thread?.id)
+      .filter(Boolean));
+    if (canonicalBaseline && legacyThreadIds.size) {
+      canonicalBaseline = {
+        ...canonicalBaseline,
+        threads: (Array.isArray(canonicalBaseline.threads) ? canonicalBaseline.threads : [])
+          .filter((thread) => !legacyThreadIds.has(thread?.id)),
+      };
+    }
+  }
   return mergeHistorySnapshots(
-    canonical && typeof canonical === "object" ? canonical : null,
-    ...untrusted.map(withoutCheckpoint),
+    canonicalBaseline,
+    ...accepted.map(withoutCheckpoint),
   );
 }
 
@@ -936,7 +965,9 @@ export class ChatHistoryStore {
       : legacyMeta;
     try {
       const local = { threads: Array.isArray(threads) ? threads : [], meta };
-      return mergeHistorySnapshots(quarantineCheckpoint ? withoutCheckpoint(local) : local);
+      const normalized = mergeHistorySnapshots(quarantineCheckpoint ? withoutCheckpoint(local) : local);
+      if (hasIdlessMessages(local.threads)) normalized[LEGACY_IDLESS_SOURCE] = true;
+      return normalized;
     } catch {
       return mergeHistorySnapshots({ threads: [], meta: {} });
     }
@@ -995,6 +1026,7 @@ export class ChatHistoryStore {
 
   persist(threads, meta = {}, options = {}) {
     const freshSnapshot = mergeHistorySnapshots({ threads, meta });
+    if (hasIdlessMessages(threads)) freshSnapshot[LEGACY_IDLESS_SOURCE] = true;
     const snapshot = this._dirtyWrite
       ? mergeHistorySnapshots(this._dirtyWrite.snapshot, freshSnapshot)
       : freshSnapshot;
@@ -1061,7 +1093,9 @@ export class ChatHistoryStore {
         event?.key !== this.threadsKey &&
         event?.key !== this.metaKey
       ) return;
-      listener(this.readLocal());
+      // Resolve through canonical IDB first so quarantined pre-v3 shadows never
+      // transiently remount in another live panel.
+      void this.readCanonical().then(listener);
     };
     const onBroadcast = (event) => {
       if (event?.data?.type !== "history-changed" || event.data.writerId === this.writerId) return;
