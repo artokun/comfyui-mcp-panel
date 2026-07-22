@@ -12,7 +12,7 @@
 
 import {
   CivitaiClient, DEFAULT_FILTERS, LEVELS, PERIODS, IMAGE_SORTS, MODEL_SORTS,
-  BASE_MODELS, ACTIVE_BASE_MODELS, tokenizeQuery, matchesBaseModel,
+  BASE_MODELS, ACTIVE_BASE_MODELS, prepareQuery, matchesBaseModel,
   filtersDirty, bitmask, parseCreatorQuery,
 } from "./cmcp-civitai.js";
 
@@ -179,6 +179,7 @@ function injectCss() {
     border: 1px solid var(--p-content-border-color,#3f3f46);
     box-shadow: 0 8px 24px rgba(0,0,0,.45); }
   .cmcp-cv-dd.open .cmcp-cv-ddpanel { display: flex; }
+  .cmcp-cv-ddlist, .cmcp-cv-ddgroupwrap { display: flex; flex-direction: column; gap: .1rem; }
   .cmcp-cv-ddgroup { font-size: .64rem; text-transform: uppercase; letter-spacing: .05em;
     color: var(--p-text-muted-color,#a1a1aa); padding: .35rem .5rem .15rem; }
   .cmcp-cv-ddopt { display: flex; align-items: center; gap: .45rem; padding: .3rem .5rem;
@@ -1184,14 +1185,19 @@ export function openCivitaiModal(ctx, opts = {}) {
       // base model omni-search
       wrap.appendChild(el("div", "cmcp-cv-flabel", "Base model"));
       const pills = el("div", "cmcp-cv-frow");
-      for (const b of f.baseModels) {
-        const pill = el("button", "cmcp-cv-chip on", b + "  ✕");
-        pill.addEventListener("click", () => {
-          f.baseModels = f.baseModels.filter((x) => x !== b);
-          renderSheet(); update();
-        });
-        pills.appendChild(pill);
-      }
+      // Rebuilt in place rather than via renderSheet(), so toggling a model
+      // does not tear down the dropdown mid-selection (see toggleModel).
+      const syncPills = () => {
+        pills.textContent = "";
+        for (const b of f.baseModels) {
+          const pill = el("button", "cmcp-cv-chip on", b + "  ✕");
+          pill.addEventListener("click", () => {
+            f.baseModels = f.baseModels.filter((x) => x !== b);
+            syncPills(); renderOpts(); update();
+          });
+          pills.appendChild(pill);
+        }
+      };
       // The control this replaces was a bare text input that rendered NOTHING
       // until you typed and then showed only the first 12 hits — so the ~90
       // base models were undiscoverable: you had to already know a family's
@@ -1200,11 +1206,18 @@ export function openCivitaiModal(ctx, opts = {}) {
       // caps nothing; the retired half is kept but sunk below the families
       // Civitai still accepts uploads for, since those return almost nothing.
       const dd = el("div", "cmcp-cv-dd");
+      const ddId = `cmcp-cv-bm-${Math.random().toString(36).slice(2, 8)}`;
       const bmSearch = el("input", "cmcp-cv-search");
       bmSearch.placeholder = "Search base models…";
       bmSearch.setAttribute("role", "combobox");
       bmSearch.setAttribute("aria-expanded", "false");
+      bmSearch.setAttribute("aria-controls", ddId);
+      bmSearch.setAttribute("aria-autocomplete", "list");
       bmSearch.autocomplete = "off";
+      // bmPanel is the visual popup container. The listbox lives INSIDE it and
+      // owns only option/group children (a listbox may not own the group-label
+      // divs, the empty notice, or the Clear button) — those siblings sit in the
+      // panel, outside the listbox, which is rebuilt each render.
       const bmPanel = el("div", "cmcp-cv-ddpanel");
       let bmOpts = [];   // the option buttons currently rendered, in view order
       let bmActive = -1; // keyboard cursor
@@ -1213,7 +1226,13 @@ export function openCivitaiModal(ctx, opts = {}) {
         if (bmOpts[bmActive]) bmOpts[bmActive].classList.remove("active");
         bmActive = i < 0 || i >= bmOpts.length ? -1 : i;
         const cur = bmOpts[bmActive];
-        if (cur) { cur.classList.add("active"); cur.scrollIntoView({ block: "nearest" }); }
+        if (cur) {
+          cur.classList.add("active");
+          cur.scrollIntoView({ block: "nearest" });
+          bmSearch.setAttribute("aria-activedescendant", cur.id);
+        } else {
+          bmSearch.removeAttribute("aria-activedescendant");
+        }
       };
       const closeDd = () => {
         dd.classList.remove("open");
@@ -1223,40 +1242,71 @@ export function openCivitaiModal(ctx, opts = {}) {
       const toggleModel = (b) => {
         const i = f.baseModels.indexOf(b);
         if (i >= 0) f.baseModels.splice(i, 1); else f.baseModels.push(b);
-        // Re-render so the chip row above reflects the change, then reopen —
-        // multi-select means the next pick usually follows immediately, and
-        // closing on every toggle would make selecting three models a chore.
-        renderSheet(); update();
+        // Update the chip row and the option ticks IN PLACE. Calling
+        // renderSheet() here rebuilds the whole sheet, which destroys this
+        // input and its text — so picking "Wan Video 2.5 T2V" out of a "wan 2.5"
+        // search would close the list and clear the query, and reaching the
+        // I2V sibling right below it meant retyping the search. In a
+        // multi-select the second pick is the common case, not the rare one.
+        syncPills();
+        renderOpts();
+        update();
       };
 
       const renderOpts = () => {
-        const tokens = tokenizeQuery(bmSearch.value);
+        const query = prepareQuery(bmSearch.value);
         bmPanel.innerHTML = "";
         bmOpts = [];
-        const hits = BASE_MODELS.filter((x) => matchesBaseModel(x, tokens));
+        // The listbox owns ONLY options (grouped under role="group"); it is
+        // rebuilt each render but keeps the stable ddId so aria-controls and
+        // aria-activedescendant keep resolving.
+        const listbox = el("div", "cmcp-cv-ddlist");
+        listbox.id = ddId;
+        listbox.setAttribute("role", "listbox");
+        listbox.setAttribute("aria-multiselectable", "true");
+        listbox.setAttribute("aria-label", "Base model");
+        bmPanel.appendChild(listbox);
+        const hits = BASE_MODELS.filter((x) => matchesBaseModel(x, query));
         const groups = [
           ["Current", hits.filter((x) => ACTIVE_BASE_MODELS.has(x))],
           ["Legacy", hits.filter((x) => !ACTIVE_BASE_MODELS.has(x))],
         ];
         for (const [label, items] of groups) {
           if (!items.length) continue;
-          bmPanel.appendChild(el("div", "cmcp-cv-ddgroup", label));
+          // A listbox may only own option/group children — so each labelled
+          // section is a role="group" (named via aria-label), not a bare div.
+          const group = el("div", "cmcp-cv-ddgroupwrap");
+          group.setAttribute("role", "group");
+          group.setAttribute("aria-label", label);
+          const heading = el("div", "cmcp-cv-ddgroup", label);
+          heading.setAttribute("aria-hidden", "true"); // group's aria-label already names it
+          group.appendChild(heading);
           for (const b of items) {
             const on = f.baseModels.includes(b);
             const opt = el("button", "cmcp-cv-ddopt" + (on ? " on" : ""));
             opt.type = "button";
+            opt.id = `${ddId}-o${bmOpts.length}`;
             opt.setAttribute("role", "option");
             opt.setAttribute("aria-selected", on ? "true" : "false");
             opt.appendChild(el("span", "tick", "✓"));
             opt.appendChild(el("span", null, b));
             // mousedown, not click: the input's blur would close the panel and
-            // detach the button before a click ever lands on it.
-            opt.addEventListener("mousedown", (e) => { e.preventDefault(); toggleModel(b); });
-            bmPanel.appendChild(opt);
+            // detach the button before a click ever lands on it. Left button
+            // ONLY — mousedown fires for every button, so without this guard a
+            // right-click meant to open a context menu silently toggles the
+            // filter under the cursor.
+            opt.addEventListener("mousedown", (e) => {
+              if (e.button !== 0) return;
+              e.preventDefault();
+              toggleModel(b);
+            });
+            group.appendChild(opt);
             bmOpts.push(opt);
           }
+          listbox.appendChild(group);
         }
         if (!bmOpts.length) {
+          // Not an option — belongs in the panel, outside the listbox.
           bmPanel.appendChild(el("div", "cmcp-cv-ddempty", `No base model matches “${bmSearch.value.trim()}”.`));
         }
         // Selected-count + clear, matching what ComfyUI's own multi-select
@@ -1269,10 +1319,13 @@ export function openCivitaiModal(ctx, opts = {}) {
             `${f.baseModels.length} selected`));
           const clear = el("button", "cmcp-cv-ddclear", "Clear");
           clear.type = "button";
+          // Left button only — right-clicking "Clear" would otherwise wipe every
+          // selected model before the context menu even appeared.
           clear.addEventListener("mousedown", (e) => {
+            if (e.button !== 0) return;
             e.preventDefault();
             f.baseModels.length = 0;
-            renderSheet(); update();
+            syncPills(); renderOpts(); update();
           });
           foot.appendChild(clear);
           bmPanel.appendChild(foot);
@@ -1313,6 +1366,7 @@ export function openCivitaiModal(ctx, opts = {}) {
         }
       });
       dd.append(bmSearch, bmPanel);
+      syncPills(); // paint the chips for models already selected on this sheet
       wrap.append(pills, dd);
 
       // creator — single-select async search. Empty field shows the site's
