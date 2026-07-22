@@ -223,7 +223,7 @@ def _self_base_url() -> str:
 
     inst = PromptServer.instance
     addr = getattr(inst, "address", "127.0.0.1") or "127.0.0.1"
-    if addr in ("0.0.0.0", "::"):
+    if addr in ("0.0.0.0", "::"):  # nosec B104 — DETECTS a wildcard bind to replace it with loopback; nothing binds here
         addr = "127.0.0.1"
     if ":" in addr and not addr.startswith("["):
         # IPv6 literal (e.g. --listen ::1) — URLs need [::1] bracket form.
