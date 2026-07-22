@@ -6481,11 +6481,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // ago, so a dropped connection here means the reboot fired (not that the
     // endpoint is unreachable). Treat that as success and let the auto-reconnect/
     // resume flow take over. Try the canonical v2 route first, then the legacy
-    // GET route for older Manager builds; a real Response that is 404/non-OK means
-    // "wrong route on this build" → try the next; 403 means Manager security
-    // blocked it (a real, actionable failure). On total failure we RETURN a
-    // structured error (rebooting:false) rather than throw, so the agent is told
-    // accurately AND the auto-resume flag is not armed.
+    // GET route for older Manager builds. Classification of a real Response:
+    // 403 means Manager security blocked it (a real, actionable failure); a
+    // 502/503/504 means we're reaching ComfyUI through a reverse proxy / tunnel
+    // whose origin was just killed by the reboot (the proxy can't reach it) —
+    // that's a reboot that FIRED, same as a dropped connection; any other
+    // non-OK (404, etc.) means "wrong route on this build" → try the next. On
+    // total failure we RETURN a structured error (rebooting:false) rather than
+    // throw, so the agent is told accurately AND the auto-resume flag is not armed.
     const candidates = [
       { route: "/v2/manager/reboot", method: "POST" },
       { route: "/manager/reboot", method: "GET" },
@@ -6502,6 +6505,20 @@ const GRAPH_TOOL_EXECUTORS = {
               "ComfyUI-Manager refused the reboot (HTTP 403): rebooting requires the Manager " +
               "security level to be 'middle' or below. Ask the user to lower it in ComfyUI-Manager " +
               "settings, then retry. ComfyUI was NOT restarted.",
+          };
+        }
+        // Reverse proxy / Cloudflare tunnel case: killing the origin doesn't drop
+        // the connection here — the proxy answers with a gateway error instead.
+        // 502/503/504 means the request reached the proxy and the origin is going
+        // down, i.e. the reboot FIRED. Treat it EXACTLY like the connection-drop
+        // success branch below (arms the same auto-resume via rebooting:true), NOT
+        // as a refusal — so a remote agent isn't told a fired reboot "failed".
+        if (res && (res.status === 502 || res.status === 503 || res.status === 504)) {
+          return {
+            rebooting: true,
+            endpoint: route,
+            method,
+            note: `proxy returned ${res.status} (origin going down) — reboot initiated`,
           };
         }
         // 404 / other non-OK: this route isn't the one on this build — try next.
