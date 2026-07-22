@@ -19,15 +19,67 @@ export const LEVELS = [
 export const PERIODS = ["Day", "Week", "Month", "Year", "AllTime"];
 export const IMAGE_SORTS = ["Most Reactions", "Most Comments", "Most Collected", "Newest", "Oldest"];
 export const MODEL_SORTS = ["Most Downloaded", "Highest Rated", "Most Liked", "Newest", "Oldest"];
+/**
+ * Civitai's full `BaseModel` enum. The site accepts ONLY these strings for
+ * `baseModels=` — anything else silently returns nothing, so this list is the
+ * filter's entire vocabulary and an omission is invisible: the model just
+ * "doesn't exist" to the browser.
+ *
+ * It is hardcoded because Civitai publishes no endpoint for it. There is no
+ * paginated enum route to walk (`system.getBaseModels` 404s on the tRPC API);
+ * the values live in the site's own bundle. So this must be refreshed by hand
+ * when Civitai adds a family — see ACTIVE_BASE_MODELS below for the subset
+ * currently accepting uploads, which is what changes.
+ */
 export const BASE_MODELS = [
-  "SD 1.4", "SD 1.5", "SD 1.5 LCM", "SD 2.0", "SD 2.1", "SDXL 0.9", "SDXL 1.0",
-  "SDXL Turbo", "SDXL Lightning", "Pony", "Illustrious", "NoobAI", "SD 3", "SD 3.5",
-  "SD 3.5 Medium", "SD 3.5 Large", "SD 3.5 Large Turbo", "Flux.1 S", "Flux.1 D",
-  "Flux.1 Kontext", "Hunyuan Video", "Wan Video 2.2 I2V-A14B", "Wan Video 2.2 T2V-A14B",
-  "Wan Video 14B t2v", "Wan Video 14B i2v 480p", "Wan Video 14B i2v 720p", "LTXV",
-  "Mochi", "CogVideoX", "Kolors", "Qwen", "Chroma", "HiDream", "Lumina", "PixArt a",
-  "PixArt E", "Playground v2", "Stable Cascade", "Aura Flow", "Other",
+  "Anima", "AuraFlow", "Chroma", "CogVideoX", "Ernie",
+  "Flux.1 S", "Flux.1 D", "Flux.1 Krea", "Flux.1 Kontext",
+  "Flux.2 D", "Flux.2 Klein 9B", "Flux.2 Klein 9B-base",
+  "Flux.2 Klein 4B", "Flux.2 Klein 4B-base",
+  "Grok", "HappyHorse", "HiDream", "HiDream-O1", "Hunyuan 1", "Hunyuan Video",
+  "Hunyuan3D", "Ideogram 4.0", "Boogu", "Illustrious", "Imagen4", "Kolors",
+  "Krea 2", "LTXV", "LTXV2", "LTXV 2.3", "Lens", "Lumina", "MAI", "Mochi",
+  "Nano Banana", "NoobAI", "ODOR", "OpenAI", "Upscaler", "Other",
+  "PixArt a", "PixArt E", "Playground v2", "PolyGen", "Pony", "Pony V7",
+  "Qwen", "Qwen 2", "Reve", "Seedance", "Seedream", "Sora 2",
+  "Stable Cascade", "SVD", "SVD XT",
+  "SD 1.4", "SD 1.5", "SD 1.5 LCM", "SD 1.5 Hyper",
+  "SD 2.0", "SD 2.0 768", "SD 2.1", "SD 2.1 768", "SD 2.1 Unclip",
+  "SD 3", "SD 3.5", "SD 3.5 Medium", "SD 3.5 Large", "SD 3.5 Large Turbo",
+  "SDXL 0.9", "SDXL 1.0", "SDXL 1.0 LCM", "SDXL Distilled",
+  "SDXL Turbo", "SDXL Lightning", "SDXL Hyper",
+  "Tripo", "Veo 3", "Vidu Q1", "Hailuo by MiniMax", "Kling",
+  "Wan Video", "Wan Video 1.3B t2v", "Wan Video 14B t2v",
+  "Wan Video 14B i2v 480p", "Wan Video 14B i2v 720p",
+  "Wan Video 2.2 TI2V-5B", "Wan Video 2.2 I2V-A14B", "Wan Video 2.2 T2V-A14B",
+  "Wan Video 2.5 T2V", "Wan Video 2.5 I2V", "Wan Image 2.7", "Wan Video 2.7",
+  "ZImageTurbo", "ZImageBase", "ACE Audio",
 ];
+
+/**
+ * The subset Civitai still accepts new uploads for. Surfaced FIRST in the
+ * filter dropdown: the full list is 90+ entries and the retired half (SD 2.x,
+ * SVD, Playground) buries what people actually search for today under names
+ * that will return almost nothing.
+ */
+export const ACTIVE_BASE_MODELS = new Set([
+  "Anima", "AuraFlow", "Chroma", "CogVideoX", "Ernie",
+  "Flux.1 S", "Flux.1 D", "Flux.1 Krea", "Flux.1 Kontext",
+  "Flux.2 D", "Flux.2 Klein 9B", "Flux.2 Klein 9B-base",
+  "Flux.2 Klein 4B", "Flux.2 Klein 4B-base",
+  "Grok", "HappyHorse", "HiDream", "HiDream-O1", "Hunyuan 1", "Hunyuan Video",
+  "Ideogram 4.0", "Boogu", "Illustrious", "Kolors", "Krea 2",
+  "LTXV", "LTXV2", "LTXV 2.3", "Lens", "Lumina", "MAI", "Mochi", "NoobAI",
+  "Upscaler", "Other", "PixArt a", "PixArt E", "Pony", "Pony V7",
+  "Qwen", "Qwen 2", "Reve",
+  "SD 1.4", "SD 1.5", "SD 1.5 LCM", "SD 1.5 Hyper", "SD 2.0", "SD 2.1",
+  "SDXL 1.0", "SDXL Lightning", "SDXL Hyper",
+  "Wan Video 1.3B t2v", "Wan Video 14B t2v",
+  "Wan Video 14B i2v 480p", "Wan Video 14B i2v 720p",
+  "Wan Video 2.2 TI2V-5B", "Wan Video 2.2 I2V-A14B", "Wan Video 2.2 T2V-A14B",
+  "Wan Video 2.5 T2V", "Wan Video 2.5 I2V", "Wan Image 2.7", "Wan Video 2.7",
+  "ZImageTurbo", "ZImageBase", "ACE Audio",
+]);
 
 export const DEFAULT_FILTERS = Object.freeze({
   period: "Week",
