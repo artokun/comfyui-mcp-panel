@@ -677,6 +677,36 @@ export function mergeHistorySnapshots(...snapshots) {
   };
 }
 
+function withoutCheckpoint(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return snapshot;
+  const hadCheckpoint = snapshot.meta?.checkpoint != null;
+  return {
+    ...snapshot,
+    meta: snapshot.meta && typeof snapshot.meta === "object"
+      ? {
+        ...snapshot.meta,
+        checkpoint: undefined,
+        // Materialized maps in a checkpointed shadow are baseline cache, not
+        // fresh operations. The canonical record supplies that baseline.
+        activeByScope: hadCheckpoint ? {} : snapshot.meta.activeByScope,
+        workflowAliases: hadCheckpoint ? {} : snapshot.meta.workflowAliases,
+      }
+      : {},
+  };
+}
+
+/** Merge an untrusted shadow/write intent under the baseline owned by IndexedDB.
+ * Local checkpoints are deliberately removed even when they repeat the current
+ * generation: only the canonical record may define which compacted records
+ * existed at that generation. Newer causal operations still pass the normal
+ * post-checkpoint filters. */
+function mergeUnderCanonicalCheckpoint(canonical, ...untrusted) {
+  return mergeHistorySnapshots(
+    canonical && typeof canonical === "object" ? canonical : null,
+    ...untrusted.map(withoutCheckpoint),
+  );
+}
+
 function boundedSnapshot(snapshot, { maxThreads, maxMessages, protectedThreadIds = [] }) {
   const activeThreadIds = Object.values(snapshot?.meta?.activeByScope || {})
     .filter((id) => typeof id === "string" && id);
@@ -756,10 +786,10 @@ async function idbMergeWrite(indexedDb, snapshot, limits) {
       const tx = db.transaction("snapshots", "readwrite");
       const store = tx.objectStore("snapshots");
       const get = store.get(CHAT_HISTORY_STATE_KEY);
-      let merged = compactSnapshot(boundedSnapshot(snapshot, limits), limits);
+      let merged = compactSnapshot(boundedSnapshot(withoutCheckpoint(snapshot), limits), limits);
       get.onsuccess = () => {
         merged = compactSnapshot(
-          boundedSnapshot(mergeHistorySnapshots(get.result, snapshot), limits),
+          boundedSnapshot(mergeUnderCanonicalCheckpoint(get.result, snapshot), limits),
           limits,
         );
         store.put(merged, CHAT_HISTORY_STATE_KEY);
@@ -879,7 +909,7 @@ export class ChatHistoryStore {
     return message;
   }
 
-  readLocal() {
+  readLocal({ quarantineCheckpoint = false } = {}) {
     const readJson = (key, fallback) => {
       try {
         const raw = this.storage?.getItem(key);
@@ -901,16 +931,17 @@ export class ChatHistoryStore {
       ? atomicObject.meta
       : legacyMeta;
     try {
-      return mergeHistorySnapshots({ threads: Array.isArray(threads) ? threads : [], meta });
+      const local = { threads: Array.isArray(threads) ? threads : [], meta };
+      return mergeHistorySnapshots(quarantineCheckpoint ? withoutCheckpoint(local) : local);
     } catch {
       return mergeHistorySnapshots({ threads: [], meta: {} });
     }
   }
 
   async load(options = {}) {
-    const local = this.readLocal();
     const indexed = await idbRead(this.indexedDb);
-    const merged = mergeHistorySnapshots(local, indexed);
+    const local = this.readLocal({ quarantineCheckpoint: indexed != null });
+    const merged = mergeUnderCanonicalCheckpoint(indexed, local);
     this._observeSnapshot(merged);
     // Migration is automatic: once loaded, the full merged set is promoted to
     // IndexedDB while a small legacy shadow remains for older panel builds.
@@ -919,7 +950,11 @@ export class ChatHistoryStore {
   }
 
   async readCanonical() {
-    const merged = mergeHistorySnapshots(this.readLocal(), await idbRead(this.indexedDb));
+    const indexed = await idbRead(this.indexedDb);
+    const merged = mergeUnderCanonicalCheckpoint(
+      indexed,
+      this.readLocal({ quarantineCheckpoint: indexed != null }),
+    );
     this._observeSnapshot(merged);
     return merged;
   }

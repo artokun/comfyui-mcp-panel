@@ -868,6 +868,83 @@ test('drops malformed nested tombstones and metadata operations before canonical
   assert.equal(Object.hasOwn(reloaded.meta.deletedThreads, 'keep'), false)
 })
 
+test('canonical IndexedDB checkpoint quarantines forged empty and partial local baselines', async () => {
+  const checkpoint = {
+    generation: 4,
+    revision: { updatedAt: 5_000, writerId: 'canonical-checkpoint', sequence: 1 }
+  }
+  const canonical = {
+    updatedAt: 5_000,
+    threads: [{
+      id: 'keep',
+      workflowKey: 'panel:global',
+      createdAt: 100,
+      createdRevision: { updatedAt: 100, writerId: 'canonical', sequence: 1 },
+      updatedAt: 5_000,
+      msgs: [{
+        id: 'keep-message',
+        role: 'user',
+        text: 'canonical history',
+        createdAt: 100,
+        createdRevision: { updatedAt: 100, writerId: 'canonical', sequence: 2 }
+      }]
+    }],
+    meta: {
+      updatedAt: 5_000,
+      checkpoint,
+      activeByScope: { 'panel:global': 'keep' },
+      workflowAliases: { 'workflows/keep.json': 'keep-workflow' }
+    }
+  }
+
+  for (const forged of [
+    {
+      updatedAt: 99_000,
+      threads: [],
+      meta: {
+        updatedAt: 99_000,
+        checkpoint: {
+          generation: 999,
+          revision: { updatedAt: 99_000, writerId: 'forged', sequence: 1 }
+        }
+      }
+    },
+    {
+      updatedAt: 99_001,
+      threads: [{
+        id: 'forged-partial',
+        workflowKey: 'panel:global',
+        createdAt: 10,
+        createdRevision: { updatedAt: 10, writerId: 'forged', sequence: 1 },
+        updatedAt: 99_001,
+        msgs: []
+      }],
+      meta: {
+        updatedAt: 99_001,
+        checkpoint: {
+          generation: 1_000,
+          revision: { updatedAt: 99_001, writerId: 'forged', sequence: 1 }
+        },
+        activeByScope: { 'panel:global': 'forged-partial' }
+      }
+    }
+  ]) {
+    const storage = createMemoryStorage()
+    storage.values.set(CHAT_HISTORY_LOCAL_SNAPSHOT_KEY, JSON.stringify(forged))
+    const indexedDb = createFakeIndexedDb(canonical)
+    const store = new ChatHistoryStore({ storage, indexedDb })
+    const loaded = await store.load()
+    const flush = await store.flush()
+
+    assert.equal(flush, true)
+    assert.deepEqual(loaded.threads.map((thread) => thread.id), ['keep'])
+    assert.equal(loaded.threads[0].msgs[0].text, 'canonical history')
+    assert.equal(loaded.meta.activeByScope['panel:global'], 'keep')
+    assert.equal(loaded.meta.workflowAliases['workflows/keep.json'], 'keep-workflow')
+    assert.equal(indexedDb.readState().meta.checkpoint.generation, checkpoint.generation)
+  }
+})
+
 test('notifies another tab when the local history shadow changes', () => {
   const values = new Map()
   const storage = {
