@@ -74,6 +74,7 @@ import {
 } from "./lib/workflow-chat-identity.js";
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
 import { openCivitaiModal } from "./cmcp-civitai-ui.js";
+import { openRunpodModal } from "./cmcp-runpod-ui.js";
 import { openTrainingModal } from "./cmcp-training-ui.js";
 
 let app = null;
@@ -6705,7 +6706,7 @@ const RECONNECT_MAX_MS = 15000;
 let AGENT_MUTED = (() => { try { return localStorage.getItem("cmcp.muteAgents") === "1"; } catch { return false; } })();
 let AGENT_BLIND = (() => { try { return localStorage.getItem("cmcp.blindAgents") === "1"; } catch { return false; } })();
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -7053,6 +7054,16 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // from the download tool's temp progress file and/or the Manager queue).
       if (msg && msg.type === "download_progress" && Array.isArray(msg.downloads)) {
         onDownloads?.(msg.downloads);
+      }
+      // Live RunPod pod status (services/runpod-watch.ts) → control panel + host
+      // indicator. Change-only frames; a cleared frame (watching:false) means no
+      // pod is being watched.
+      if (msg && msg.type === "runpod_status") {
+        onRunpodStatus?.(msg);
+      }
+      // Honest host indicator: where renders currently run (local ⇄ pod).
+      if (msg && msg.type === "comfyui_target") {
+        onComfyuiTarget?.(msg);
       }
       // Live extended-thinking token count → "thinking… (N)" indicator.
       if (msg && msg.type === "thinking" && typeof msg.tokens === "number") {
@@ -8263,6 +8274,10 @@ function renderRichText(el, text) {
 // clean 1005 closes). Tracking the live client at module scope and tearing down
 // any prior one before creating a new one makes the storm structurally impossible.
 let liveBridgeClient = null;
+// RunPod host indicator/control bridge: the toolbar closure publishes handlers
+// here so the (separately-scoped) createBridgeClient callbacks can forward
+// `runpod_status` / `comfyui_target` frames to the host pill + open modal.
+let panelRunpod = null;
 // (MDC's fork also proxied all client callbacks through a module-level
 // `panelSink` so the client could outlive panel re-mounts. Upstream's sidebar
 // KEEP-ALIVE already keeps buildPanel a page singleton whose root is detached/
@@ -9951,9 +9966,84 @@ function buildPanel() {
     trainingBtn.prepend(svg);
   }
 
+  // RunPod — cloud GPU control panel + honest host indicator. The button label
+  // reflects WHERE renders run (Local vs the pod), so it doubles as the host
+  // pill; clicking opens the control modal (deploy / start / stop / connect /
+  // use-local). Driven by the orchestrator's `runpod_status` + `comfyui_target`
+  // frames (wired below). The pod runs our template → full canvas parity.
+  let _runpodHandle = null;
+  let _runpodStatus = null; // last runpod_status frame
+  let _comfyuiTarget = null; // last comfyui_target frame
+  const runpodBtn = toolbarBtn("pi-circle", "Local");
+  runpodBtn.querySelector(".pi").remove();
+  runpodBtn.title = "RunPod — run this session on a cloud GPU (deploy / start / stop / connect), or switch back to local.";
+  {
+    const svgNs = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(svgNs, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "2");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.setAttribute("aria-hidden", "true");
+    // Two stacked server bricks (cloud-GPU rack).
+    const r1 = document.createElementNS(svgNs, "rect");
+    r1.setAttribute("x", "3"); r1.setAttribute("y", "4"); r1.setAttribute("width", "18");
+    r1.setAttribute("height", "7"); r1.setAttribute("rx", "1.5");
+    const r2 = document.createElementNS(svgNs, "rect");
+    r2.setAttribute("x", "3"); r2.setAttribute("y", "13"); r2.setAttribute("width", "18");
+    r2.setAttribute("height", "7"); r2.setAttribute("rx", "1.5");
+    const d1 = document.createElementNS(svgNs, "line");
+    d1.setAttribute("x1", "7"); d1.setAttribute("y1", "7.5"); d1.setAttribute("x2", "7"); d1.setAttribute("y2", "7.5");
+    const d2 = document.createElementNS(svgNs, "line");
+    d2.setAttribute("x1", "7"); d2.setAttribute("y1", "16.5"); d2.setAttribute("x2", "7"); d2.setAttribute("y2", "16.5");
+    svg.append(r1, r2, d1, d2);
+    runpodBtn.prepend(svg);
+  }
+  function reflectRunpodHost() {
+    const t = _comfyuiTarget;
+    const s = _runpodStatus;
+    // Honesty: "on pod" comes ONLY from the comfyui_target frame — a watched
+    // RUNNING pod does NOT mean renders go there (runpod_watch broadcasts status
+    // without retargeting). Default to Local when the target is unknown.
+    const onPod = !!(t && !t.is_local);
+    const label = runpodBtn.querySelector("span");
+    if (onPod && s && s.watching) {
+      label.textContent = s.name || s.pod_id || "RunPod";
+    } else if (onPod) {
+      label.textContent = "RunPod";
+    } else {
+      label.textContent = "Local";
+    }
+    runpodBtn.classList.toggle("cmcp-runpod-onpod", onPod);
+    runpodBtn.style.color = onPod ? "#60a5fa" : "";
+    const gpu = s && s.watching && s.gpu ? ` · ${s.gpu}` : "";
+    const cost = s && s.watching && s.cost_per_hr != null ? ` · $${Number(s.cost_per_hr).toFixed(3)}/hr` : "";
+    runpodBtn.title = onPod
+      ? `Rendering on RunPod${gpu}${cost} — click to manage the pod or switch back to local.`
+      : "Rendering locally on this machine — click to run this session on a cloud GPU (RunPod).";
+  }
+  runpodBtn.addEventListener("click", () => {
+    try { _runpodHandle?.close(); } catch {}
+    _runpodHandle = openRunpodModal({
+      root,
+      callTool: (tool, args, o) => liveBridgeClient?.callTool(tool, args, o),
+      getStatus: () => _runpodStatus,
+      getTarget: () => _comfyuiTarget,
+      openUrl: (u) => { try { window.open(u, "_blank", "noopener"); } catch {} },
+    });
+  });
+  // Expose for the bridge callbacks (defined outside this closure).
+  panelRunpod = {
+    onStatus: (frame) => { _runpodStatus = frame; reflectRunpodHost(); if (_runpodHandle?.isOpen?.()) _runpodHandle.update(); },
+    onTarget: (frame) => { _comfyuiTarget = frame; reflectRunpodHost(); if (_runpodHandle?.isOpen?.()) _runpodHandle.update(); },
+  };
+  reflectRunpodHost();
+
   const toolbarSpacer = document.createElement("span");
   toolbarSpacer.className = "cmcp-spacer";
-  toolbar.append(deafenBtn, blindBtn, toolbarSpacer, civitaiBtn, trainingBtn);
+  toolbar.append(deafenBtn, blindBtn, toolbarSpacer, civitaiBtn, trainingBtn, runpodBtn);
 
   row.append(ring, ctxLabel, modelChip, spacer, attachBtn, micBtn, sendBtn);
   form.append(menuPop, modelPop, attachBar, input, row, fileInput);
@@ -11557,6 +11647,14 @@ function buildPanel() {
     // Orchestrator pushed live download progress → render rows in the tray.
     onDownloads(list) {
       renderDownloads(list);
+    },
+    // Live RunPod pod status → the host pill + open control modal.
+    onRunpodStatus(frame) {
+      panelRunpod?.onStatus(frame);
+    },
+    // Honest host indicator (local ⇄ pod) → the host pill + open control modal.
+    onComfyuiTarget(frame) {
+      panelRunpod?.onTarget(frame);
     },
     // Live extended-thinking token count → update the working indicator.
     onThinking(tokens) {
