@@ -6,6 +6,26 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+- **RunPod control panel** (`cmcp-runpod-ui.js`) — a toolbar host pill that
+  reads **🟢 Local** or **🔵 RunPod** and opens a control modal: live status
+  card (pod / GPU / VRAM / uptime / $·hr / ComfyUI URL / idle auto-stop
+  countdown), a **pod dropdown that lists your pods by name** (with refresh +
+  manual-ID fallback), Connect / Start / Stop / **Use Local**, and a
+  confirm-armed **Deploy** that routes through the referral deploy link. Driven
+  by the orchestrator's `runpod_status` + `comfyui_target` broadcasts and the
+  whitelisted `runpod_*` tools, so where a render runs is never ambiguous.
+  (requires comfyui-mcp >= 0.44.0)
+- **CivitAI browser in the panel** (`cmcp-civitai-ui.js` + `cmcp-civitai.js` +
+  `py/civitai_proxy.py`) — browse CivitAI without leaving ComfyUI: images,
+  videos, checkpoints, LoRAs and workflows with search, filters (period / sort /
+  base-model / browsing-level), a fullscreen viewer, model detail with a version
+  picker, and OAuth sign-in for Favorites. Pick a resource to **share it with the
+  agent**, **download it to your machine**, or **save an embedded workflow** to
+  the canvas. A same-origin Python proxy adds the CivitAI bot-gate headers
+  (User-Agent / Referer) a browser can't set, and keeps the token/OAuth secrets
+  server-side.
+
 ## [0.9.9] - 2026-07-20
 
 ### Changed
