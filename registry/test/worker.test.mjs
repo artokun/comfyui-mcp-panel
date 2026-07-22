@@ -202,3 +202,31 @@ test("parseCursor round-trips and rejects garbage", () => {
   const raw = btoa(JSON.stringify({ v: 3, id: "x" }));
   assert.deepEqual(parseCursor(raw), { v: 3, id: "x" });
 });
+
+test("CORS: preflight answered, every response carries allow-origin", async () => {
+  const pre = await worker.fetch(new Request("http://x/v1/apps", { method: "OPTIONS" }), env);
+  assert.equal(pre.status, 204);
+  assert.equal(pre.headers.get("access-control-allow-origin"), "*");
+  const res = await get("/v1/apps");
+  assert.equal(res.headers.get("access-control-allow-origin"), "*");
+});
+
+test("publish: oversized bodies are rejected before parsing", async () => {
+  const huge = JSON.stringify({ creator_key: KEY, app: { id: APP_ID, name: "x".padEnd(20 * 1024 * 1024, "x") } });
+  const res = await worker.fetch(
+    new Request("http://x/v1/apps", { method: "POST", body: huge }),
+    env,
+  );
+  assert.equal(res.status, 413);
+});
+
+test("pricing_json: invalid values rejected at publish, defensive at read", async () => {
+  const res = await post("/v1/apps", publishBody({ app: { id: "423e4567-e89b-42d3-a456-426614174003", name: "Priced", pricing_json: "{not json" } }));
+  assert.equal(res.status, 400);
+  // A legacy bad value in the DB must not 500 the list (defensive parse).
+  await env.DB.prepare(
+    "INSERT INTO apps (id, slug, creator_id, creator_name, name, description, version, hide_workflow, nsfw, hosted_only, pricing_json, star_count, run_count, hidden, created_at, updated_at) VALUES ('bad-price', 'x/bad', 'c', 'x', 'Bad', '', 1, 0, 0, 0, '{oops', 0, 0, 0, 1, 1)",
+  ).bind().run();
+  const list = await (await get("/v1/apps?limit=100")).json();
+  assert.ok(list.apps.find((a) => a.id === "bad-price"));
+});

@@ -56,7 +56,17 @@ export function shapePublish(body) {
       appMode,
       deps,
       // P5 (monetization) hooks — reserved from day one, unused for now.
-      pricingJson: typeof a.pricing_json === "string" ? a.pricing_json : null,
+      // pricing_json must be VALID JSON when present: an invalid string would
+      // otherwise reach list responses (parsed there per row).
+      pricingJson: (() => {
+        if (typeof a.pricing_json !== "string") return null;
+        try {
+          JSON.parse(a.pricing_json);
+          return a.pricing_json;
+        } catch {
+          throw { status: 400, message: "pricing_json must be valid JSON" };
+        }
+      })(),
       hostedOnly: a.hosted_only === true,
     },
     bundle: {
@@ -129,8 +139,16 @@ export function buildListQuery({ sort, q, creator, includeNsfw, limit, cursor })
   return { sql, params, limit: lim, sort };
 }
 
-/** Shape a D1 apps row for the public API. */
+/** Shape a D1 apps row for the public API. pricing_json is parsed defensively:
+ *  a bad value must never 500 a list page (it poisons every page the row is
+ *  on) — degrade to null instead. */
 export function publicAppRow(row) {
+  let pricing = null;
+  try {
+    pricing = row.pricing_json ? JSON.parse(row.pricing_json) : null;
+  } catch {
+    pricing = null;
+  }
   return {
     id: row.id,
     slug: row.slug,
@@ -141,7 +159,7 @@ export function publicAppRow(row) {
     hide_workflow: !!row.hide_workflow,
     nsfw: !!row.nsfw,
     hosted_only: !!row.hosted_only,
-    pricing: row.pricing_json ? JSON.parse(row.pricing_json) : null,
+    pricing,
     stars: row.star_count,
     runs: row.run_count,
     score: row.score || 0,

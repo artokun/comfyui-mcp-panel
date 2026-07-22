@@ -73,6 +73,16 @@ class SanitizeManifest(unittest.TestCase):
         self.assertEqual(len(m["name"]), 120)
         self.assertEqual(len(m["description"]), 4000)
 
+    def test_partial_update_omits_unsent_fields(self):
+        # for_update with no description key must NOT emit one — otherwise
+        # manifest.update(patch) wipes the saved description on publish/hide.
+        patch = ar._sanitize_manifest({"published": {"slug": "a/b"}}, for_update=True)
+        self.assertNotIn("description", patch)
+        self.assertNotIn("name", patch)
+        self.assertNotIn("id", patch)
+        patch = ar._sanitize_manifest({"description": "new"}, for_update=True)
+        self.assertEqual(patch["description"], "new")
+
 
 class ValidatePrompt(unittest.TestCase):
     def test_api_format_ok(self):

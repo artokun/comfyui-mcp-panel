@@ -117,7 +117,10 @@ def _sanitize_manifest(raw, *, for_update: bool = False) -> dict:
         if not name:
             raise ValueError("manifest.name is required")
         out["name"] = name[:_MAX_NAME]
-    out["description"] = str(raw.get("description") or "")[:_MAX_DESC]
+    if not for_update or "description" in raw:
+        # Partial updates (publish/hide) omit the description — including it
+        # unconditionally would WIPE it via manifest.update(patch).
+        out["description"] = str(raw.get("description") or "")[:_MAX_DESC]
 
     app_mode = raw.get("appMode")
     if app_mode is None and not for_update:
@@ -222,6 +225,9 @@ def _self_base_url() -> str:
     addr = getattr(inst, "address", "127.0.0.1") or "127.0.0.1"
     if addr in ("0.0.0.0", "::"):
         addr = "127.0.0.1"
+    if ":" in addr and not addr.startswith("["):
+        # IPv6 literal (e.g. --listen ::1) — URLs need [::1] bracket form.
+        addr = "[{}]".format(addr)
     port = getattr(inst, "port", 8188)
     return "http://{}:{}".format(addr, port)
 
@@ -282,6 +288,19 @@ def register(routes, web):
                     status=400,
                 )
         thumb_b64 = body.get("thumbnail_b64")
+        # Decode + validate the thumbnail BEFORE writing anything — validating
+        # inside _write leaves a ghost bundle (manifest+prompt on disk, 400 to
+        # the client) behind a failed create.
+        thumb_bytes = None
+        if isinstance(thumb_b64, str) and thumb_b64:
+            import base64
+
+            try:
+                thumb_bytes = base64.b64decode(thumb_b64, validate=True)
+            except Exception:
+                return web.json_response({"error": "thumbnail_b64 is not valid base64"}, status=400)
+            if len(thumb_bytes) > _MAX_THUMB_BYTES:
+                return web.json_response({"error": "thumbnail too large"}, status=400)
 
         def _write():
             root = _apps_root()
@@ -308,13 +327,8 @@ def register(routes, web):
                     os.path.join(bdir, "workflow.json"),
                     json.dumps(workflow).encode("utf-8"),
                 )
-            if isinstance(thumb_b64, str) and thumb_b64:
-                import base64
-
-                raw = base64.b64decode(thumb_b64, validate=True)
-                if len(raw) > _MAX_THUMB_BYTES:
-                    raise ValueError("thumbnail too large")
-                _atomic_write(os.path.join(bdir, "thumbnail.png"), raw)
+            if thumb_bytes is not None:
+                _atomic_write(os.path.join(bdir, "thumbnail.png"), thumb_bytes)
 
         try:
             await asyncio.to_thread(_write)

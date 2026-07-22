@@ -21,7 +21,15 @@ import {
   slugify,
 } from "./core.js";
 
-const JSON_HEADERS = { "content-type": "application/json" };
+const JSON_HEADERS = {
+  "content-type": "application/json",
+  // The panel fetches the registry cross-origin (ComfyUI origin → workers.dev),
+  // so every response needs CORS and OPTIONS must answer preflights.
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, POST, OPTIONS",
+  "access-control-allow-headers": "content-type",
+  "access-control-max-age": "86400",
+};
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: JSON_HEADERS });
@@ -41,6 +49,11 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
+    // CORS preflight (the panel's POSTs carry a JSON content-type, so browsers
+    // preflight them cross-origin).
+    if (method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: JSON_HEADERS });
+    }
     try {
       // POST /v1/apps — publish (create) or update (same id, owner only).
       if (method === "POST" && path === "/v1/apps") return await publish(request, env);
@@ -71,7 +84,20 @@ export default {
 };
 
 async function publish(request, env) {
-  const body = await request.json().catch(() => null);
+  // Anonymous endpoint with R2 storage behind it: hard-cap the request BEFORE
+  // parsing (a JSON body can declare any content-length, so check both the
+  // header and the actual buffered size).
+  const MAX_PUBLISH_BYTES = 16 * 1024 * 1024;
+  const declared = Number(request.headers.get("content-length") || 0);
+  if (declared > MAX_PUBLISH_BYTES) return err(413, "bundle too large");
+  const raw = await request.text();
+  if (raw.length > MAX_PUBLISH_BYTES) return err(413, "bundle too large");
+  let body;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return err(400, "invalid JSON");
+  }
   const { creatorKey, creatorName, app, bundle } = shapePublish(body);
   const creatorId = await creatorIdFor(creatorKey, (hex) => sha256Hex(hex));
   const now = Math.floor(Date.now() / 1000);
@@ -159,14 +185,20 @@ async function bundle(env, id) {
   if (!obj) throw { status: 404, message: "bundle missing" };
   // Hidden apps must report a run: the registry counts it so trending works
   // even where the panel never phones home. (Client-reported; not billing.)
-  return new Response(obj.body, { headers: { "content-type": "application/json" } });
+  return new Response(obj.body, {
+    headers: { "content-type": "application/json", "access-control-allow-origin": "*" },
+  });
 }
 
 async function thumbnail(env, id) {
   const obj = await env.BUNDLES.get(`thumbs/${id}.png`);
   if (!obj) return err(404, "no thumbnail");
   return new Response(obj.body, {
-    headers: { "content-type": "image/png", "cache-control": "public, max-age=3600" },
+    headers: {
+      "content-type": "image/png",
+      "cache-control": "public, max-age=3600",
+      "access-control-allow-origin": "*",
+    },
   });
 }
 

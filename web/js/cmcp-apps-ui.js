@@ -131,6 +131,10 @@ async function draftFromCanvas(getApp) {
   const inputs = [];
   const outputs = [];
   const seen = new Set();
+  // Imported APP-mode selections are honored on ANY node type — the hint-type
+  // filter only applies to the heuristic fallback. (codex finding: an app-mode
+  // input on a custom node outside the hint set used to vanish silently.)
+  const importedKeys = new Set((imported?.inputs || []).map((i) => `${i.nodeId}.${i.widget}`));
   for (const node of liveNodes) {
     const id = Number(node.id);
     if (!Number.isFinite(id)) continue;
@@ -148,7 +152,8 @@ async function draftFromCanvas(getApp) {
       });
       continue;
     }
-    if (!AppBuilder.INPUT_HINT_TYPES.has(String(node.type || ""))) continue;
+    const nodeHasImported = [...importedKeys].some((k) => Number(k.split(".")[0]) === id);
+    if (!AppBuilder.INPUT_HINT_TYPES.has(String(node.type || "")) && !nodeHasImported) continue;
     const linkDriven = new Set(
       (Array.isArray(node.inputs) ? node.inputs : [])
         .map((inp) => inp && inp.widget && inp.widget.name)
@@ -950,6 +955,21 @@ export function openAppsModal(ctx, opts = {}) {
       try {
         status.textContent = "Preparing…";
         const values = await collectValues();
+        // Image inputs upload to the LOCAL ComfyUI's input/ — the pod can't
+        // see those bytes, so a pod run with an image input would fail on a
+        // missing file. Refuse honestly rather than silently enqueueing a
+        // broken prompt (pod-side media transfer is a follow-up).
+        const imageKeys = new Set(
+          (app.appMode?.inputs || [])
+            .filter((i) => i.kind === "image")
+            .map((i) => `${i.nodeId}.${i.widget}`),
+        );
+        if ([...imageKeys].some((k) => values[k] !== undefined)) {
+          throw new Error(
+            "This app takes an image input, which uploads to the LOCAL ComfyUI — pod runs can't " +
+              "reach those bytes yet. Run it locally, or remove the image input.",
+          );
+        }
         const dry = await client.run(app.id, values, { dry: true });
         const patched = dry.prompt;
         if (!patched) throw new Error("couldn't build the prompt snapshot");
