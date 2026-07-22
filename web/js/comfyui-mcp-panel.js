@@ -72,6 +72,7 @@ import {
   retainBoundedThreads,
   selectRestoreThread,
   selectThreadForScope,
+  updateMetadataEntry,
 } from "./lib/chat-history-store.js";
 import {
   isThreadInScope,
@@ -10389,11 +10390,33 @@ function buildPanel() {
   // shadow stays much smaller (20 threads / 200 messages) in ChatHistoryStore.
   const MAX_THREADS = 500;
   const MAX_THREAD_MSGS = 5000;
-  const historyStore = new ChatHistoryStore({ threadsKey: THREADS_KEY });
+  const historyStore = new ChatHistoryStore({
+    threadsKey: THREADS_KEY,
+    maxThreads: MAX_THREADS,
+    maxMessages: MAX_THREAD_MSGS,
+  });
   const localHistory = historyStore.readLocal();
   let threads = localHistory.threads;
   let historyMeta = localHistory.meta;
   let thread = null; // created lazily on first recorded message
+
+  function nextHistoryRevision() {
+    return Math.max(Date.now(), Number(historyMeta?.updatedAt) + 1 || 0);
+  }
+
+  function applyWorkflowAliasesFromHistory() {
+    const operations = historyMeta.aliasOps || {};
+    for (const [path, operation] of Object.entries(operations)) {
+      if (operation?.deleted === true || operation?.value == null) delete _workflowUuidAliases[path];
+      else _workflowUuidAliases[path] = operation.value;
+    }
+    for (const [path, value] of Object.entries(historyMeta.workflowAliases || {})) {
+      if (!Object.hasOwn(operations, path)) _workflowUuidAliases[path] = value;
+    }
+    persistWorkflowAliases();
+  }
+
+  applyWorkflowAliasesFromHistory();
 
   function currentTranscriptScopeKey({ embed = false } = {}) {
     return sessionFollowsPanel() ? workflowTabId() : workflowStorageKey({ embed });
@@ -10403,10 +10426,33 @@ function buildPanel() {
     return sessionFollowsPanel() ? "panel:global" : workflowStorageKey({ embed });
   }
 
-  function setActiveThread(scopeKey, threadId) {
-    historyMeta.activeByScope = historyMeta.activeByScope || {};
-    if (threadId) historyMeta.activeByScope[scopeKey] = threadId;
-    else delete historyMeta.activeByScope[scopeKey];
+  function setActiveThread(scopeKey, threadId, updatedAt = nextHistoryRevision()) {
+    historyMeta = updateMetadataEntry(
+      historyMeta,
+      "activeByScope",
+      scopeKey,
+      threadId || null,
+      updatedAt,
+    );
+  }
+
+  function syncWorkflowAliases() {
+    const previous = historyMeta.workflowAliases || {};
+    const paths = new Set([...Object.keys(previous), ...Object.keys(_workflowUuidAliases)]);
+    let revision = nextHistoryRevision();
+    for (const path of paths) {
+      const oldValue = previous[path];
+      const newValue = _workflowUuidAliases[path];
+      if (oldValue === newValue) continue;
+      historyMeta = updateMetadataEntry(
+        historyMeta,
+        "workflowAliases",
+        path,
+        newValue ?? null,
+        revision,
+      );
+      revision += 1;
+    }
   }
 
   function protectedHistoryThreadIds(preferredThreadId = null) {
@@ -10427,10 +10473,12 @@ function buildPanel() {
   }
 
   function persistThreads() {
-    historyMeta.workflowAliases = { ..._workflowUuidAliases };
+    syncWorkflowAliases();
     threads = capHistoryThreads(threads);
     historyStore.persist(threads, historyMeta, {
       protectedThreadIds: protectedHistoryThreadIds(),
+      maxThreads: MAX_THREADS,
+      maxMessages: MAX_THREAD_MSGS,
     });
   }
 
@@ -10441,8 +10489,21 @@ function buildPanel() {
     threads = capHistoryThreads(merged.threads, currentThreadId);
     if (currentThreadId) {
       const refreshed = threads.find((candidate) => candidate.id === currentThreadId);
-      if (refreshed && isThreadInScope(refreshed, currentTranscriptScopeKey())) thread = refreshed;
-      else if (historyMeta.deletedThreads?.[currentThreadId]) newChat();
+      const panelOwned = sessionFollowsPanel();
+      if (refreshed && (panelOwned || isThreadInScope(refreshed, currentTranscriptScopeKey()))) {
+        thread = refreshed;
+      } else {
+        // Never keep a reference to an object no longer present in `threads`.
+        // The next record must create/rebind a valid conversation rather than
+        // append to a detached object that persistThreads() cannot serialize.
+        thread = null;
+        ssSet(CURRENT_THREAD_KEY, null);
+        if (historyMeta.deletedThreads?.[currentThreadId]) {
+          ssSet(SESSION_KEY, null);
+          resetFeed();
+          renderTodo([]);
+        }
+      }
     }
     if (!histPop.hidden) renderHistory();
   });
@@ -10494,7 +10555,12 @@ function buildPanel() {
     const now = Date.now();
     entry = {
       ...entry,
-      id: typeof entry.id === "string" && entry.id ? entry.id : crypto.randomUUID(),
+      id:
+        typeof entry.id === "string" &&
+        entry.id &&
+        !Object.hasOwn(thread.deletedMessages || {}, entry.id)
+          ? entry.id
+          : crypto.randomUUID(),
       createdAt: Number(entry.createdAt) || now,
     };
     thread.msgs.push(entry);
@@ -11222,7 +11288,14 @@ function buildPanel() {
     if (msgs) {
       const i = msgs.findIndex((m) => m.role === "user" && m.mid === mid);
       if (i >= 0) {
-        msgs.splice(i, 1);
+        const [removed] = msgs.splice(i, 1);
+        const now = Math.max(Date.now(), Number(thread.updatedAt) + 1 || 0);
+        if (removed?.id) {
+          thread.deletedMessages = thread.deletedMessages || {};
+          thread.deletedMessages[removed.id] = now;
+        }
+        thread.updatedAt = now;
+        thread.ts = now;
         persistThreads();
       }
     }
@@ -11684,11 +11757,13 @@ function buildPanel() {
       del.appendChild(di);
       del.addEventListener("click", (ev) => {
         ev.stopPropagation();
+        const now = nextHistoryRevision();
         historyMeta.deletedThreads = historyMeta.deletedThreads || {};
-        historyMeta.deletedThreads[t.id] = Date.now();
+        historyMeta.deletedThreads[t.id] = now;
+        historyMeta.updatedAt = now;
         threads = threads.filter((x) => x.id !== t.id);
         for (const [key, value] of Object.entries(historyMeta.activeByScope || {})) {
-          if (value === t.id) delete historyMeta.activeByScope[key];
+          if (value === t.id) setActiveThread(key, null, now);
         }
         persistThreads();
         // Deleting the open chat clears the feed and starts fresh.
@@ -14346,7 +14421,14 @@ function buildPanel() {
   function retractLastUserMessage() {
     const msgs = thread?.msgs;
     if (!msgs || !msgs.length || msgs[msgs.length - 1].role !== "user") return;
-    msgs.pop();
+    const removed = msgs.pop();
+    const now = Math.max(Date.now(), Number(thread.updatedAt) + 1 || 0);
+    if (removed?.id) {
+      thread.deletedMessages = thread.deletedMessages || {};
+      thread.deletedMessages[removed.id] = now;
+    }
+    thread.updatedAt = now;
+    thread.ts = now;
     persistThreads();
     for (const s of streamBubbles.values()) s.el.remove(); // interrupting → drop previews
     streamBubbles.clear();
@@ -15089,10 +15171,7 @@ function buildPanel() {
       const merged = mergeHistorySnapshots({ threads, meta: historyMeta }, loaded);
       historyMeta = merged.meta;
       threads = capHistoryThreads(merged.threads, reloadThreadId);
-      if (historyMeta.workflowAliases && typeof historyMeta.workflowAliases === "object") {
-        _workflowUuidAliases = { ...historyMeta.workflowAliases, ..._workflowUuidAliases };
-        persistWorkflowAliases();
-      }
+      applyWorkflowAliasesFromHistory();
       persistThreads();
     } catch {
       // localStorage shadow remains usable when IndexedDB is unavailable.
