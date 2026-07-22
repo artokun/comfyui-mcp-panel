@@ -22,7 +22,7 @@
 const GPU_CLI_URL = "https://gpu-cli.sh";
 
 let styleInjected = false;
-function injectStyle(root) {
+function injectStyle() {
   if (styleInjected) return;
   styleInjected = true;
   const css = `
@@ -57,15 +57,11 @@ function injectStyle(root) {
 `;
   const el = document.createElement("style");
   el.textContent = css;
-  // Append into the same root the modal mounts in: a ShadowRoot when the panel
-  // lives in shadow DOM, else document.head. (A bare `document.appendChild`
-  // throws — the document may hold only one element child.)
-  const r = root?.getRootNode?.();
-  const target =
-    r && typeof r.appendChild === "function" && r.nodeType === 11 /* DOCUMENT_FRAGMENT (ShadowRoot) */
-      ? r
-      : document.head;
-  target.appendChild(el);
+  // The overlay mounts on document.body (see openRunpodModal), which is OUTSIDE
+  // any panel ShadowRoot — so the CSS must live in document.head, not the shadow
+  // root, or shadow-DOM hosts would render the modal unstyled. Inject into head
+  // unconditionally.
+  document.head.appendChild(el);
 }
 
 /** Pull human text out of a tool_result frame (result = MCP content array). */
@@ -95,7 +91,7 @@ function fmtCountdown(sec) {
 
 export function openRunpodModal(ctx, opts = {}) {
   const { root, callTool, getStatus, getTarget, openUrl } = ctx;
-  injectStyle(root);
+  injectStyle();
 
   const overlay = document.createElement("div");
   overlay.className = "cmcp-modal-overlay";
@@ -142,6 +138,13 @@ export function openRunpodModal(ctx, opts = {}) {
   podInput.placeholder = "paste pod id (from console.runpod.io)";
   podInput.spellcheck = false;
   manualRow.append(podInput);
+  // Enter in the manual-ID field connects, matching the primary button.
+  podInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      connectBtn.click();
+    }
+  });
   podSelect.addEventListener("change", () => {
     manualRow.style.display = podSelect.value === "__manual__" ? "flex" : "none";
     if (podSelect.value === "__manual__") podInput.focus();
@@ -205,6 +208,13 @@ export function openRunpodModal(ctx, opts = {}) {
     const s = getStatus?.();
     return (s && s.watching && s.pod_id) || selectedPodId();
   }
+  // The pod currently being watched (connected), or null. Stop targets ONLY this
+  // one: Stop is enabled solely for a watched RUNNING pod, so it must never fall
+  // back to a different pod the user merely typed/selected in the dropdown.
+  function watchedPodId() {
+    const s = getStatus?.();
+    return (s && s.watching && s.pod_id) || null;
+  }
 
   // Populate the dropdown from runpod_list_pods (humans pick by name, not id).
   async function loadPods(preselect) {
@@ -240,7 +250,11 @@ export function openRunpodModal(ctx, opts = {}) {
     if (closed) return;
     const s = getStatus?.() || null;
     const t = getTarget?.() || null;
-    const onPod = t ? !t.is_local : !!(s && s.watching && s.status === "RUNNING");
+    // Honesty: only claim "on pod" when the orchestrator's comfyui_target frame
+    // actually says so. Without a target frame the render destination is unknown
+    // — and runpod_watch broadcasts pod status WITHOUT retargeting, so a watched
+    // RUNNING pod does NOT mean renders go there. Default to local when unknown.
+    const onPod = !!(t && !t.is_local);
 
     // Host banner.
     host.classList.toggle("local", !onPod);
@@ -335,19 +349,25 @@ export function openRunpodModal(ctx, opts = {}) {
     run("Starting " + id, () => callTool("runpod_pod_start", { pod_id: id }));
   });
   stopBtn.addEventListener("click", () => {
-    const id = currentPodId();
+    const id = watchedPodId();
     if (!id) return;
     run("Stopping " + id, () => callTool("runpod_pod_stop", { pod_id: id }));
   });
   localBtn.addEventListener("click", () => {
     run("Switching to local ComfyUI", () => callTool("runpod_use_local", {}));
   });
+  // Confirm must be two DISTINCT human decisions, not one double-click. Arming
+  // opens a short cool-down window during which confirm clicks (and keyboard
+  // repeat on Enter/Space) are ignored, so an accidental double-click can't bill.
+  const DEPLOY_ARM_COOLDOWN_MS = 600;
+  let deployArmedAt = 0;
   deployBtn.addEventListener("click", () => {
     // Deploying bills GPU-time immediately — confirm once inline.
     if (deployBtn.dataset.armed !== "1") {
       deployBtn.dataset.armed = "1";
+      deployArmedAt = Date.now();
       deployBtn.textContent = "Deploy — this bills. Click to confirm";
-      setLog("A new pod bills per running GPU-second (~$0.30–0.70/hr). It idle-auto-stops, and Stop ends billing.", "");
+      setLog("A new pod bills per running GPU-second (~$0.30–0.70/hr). It idle-auto-stops; Stop ends GPU billing (disk storage still bills until you terminate the pod in the console).", "");
       setTimeout(() => {
         if (deployBtn.dataset.armed === "1") {
           deployBtn.dataset.armed = "0";
@@ -356,6 +376,9 @@ export function openRunpodModal(ctx, opts = {}) {
       }, 5000);
       return;
     }
+    // Ignore a confirm that lands inside the cool-down (a double-click / key
+    // repeat is not a second human decision). Keep it armed so a real click works.
+    if (Date.now() - deployArmedAt < DEPLOY_ARM_COOLDOWN_MS) return;
     deployBtn.dataset.armed = "0";
     deployBtn.textContent = "Deploy new pod";
     run("Deploying a new pod", () => callTool("runpod_pod_create", {}, { timeout: 120000 })).then((ok) => {
