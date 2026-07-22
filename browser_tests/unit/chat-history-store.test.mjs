@@ -502,6 +502,25 @@ test('legacy local shadow migration preserves the valid half of split or corrupt
   assert.deepEqual(loaded.meta.activeByScope, {})
 })
 
+test('partially corrupt atomic shadow recovers each invalid half from legacy storage', () => {
+  const storage = createMemoryStorage()
+  storage.values.set(CHAT_HISTORY_LOCAL_SNAPSHOT_KEY, JSON.stringify({
+    schemaVersion: CHAT_HISTORY_SCHEMA,
+    threads: 'broken',
+    meta: { activeByScope: { 'panel:global': 'legacy-thread' } }
+  }))
+  storage.values.set('comfyui-mcp.panel.threads', JSON.stringify([
+    { id: 'legacy-thread', workflowKey: 'panel:global', updatedAt: 10, msgs: [] }
+  ]))
+  storage.values.set('comfyui-mcp.panel.historyMeta', '{broken')
+  const store = new ChatHistoryStore({ storage, indexedDb: null })
+
+  const loaded = store.readLocal()
+
+  assert.equal(loaded.threads[0].id, 'legacy-thread')
+  assert.equal(loaded.meta.activeByScope['panel:global'], 'legacy-thread')
+})
+
 test('notifies another tab when the local history shadow changes', () => {
   const values = new Map()
   const storage = {

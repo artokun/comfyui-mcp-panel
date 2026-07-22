@@ -451,17 +451,17 @@ export class ChatHistoryStore {
       }
     };
     const atomic = readJson(this.snapshotKey, null);
-    if (
-      atomic &&
-      typeof atomic === "object" &&
-      (Array.isArray(atomic.threads) || (atomic.meta && typeof atomic.meta === "object"))
-    ) {
-      return mergeHistorySnapshots(atomic);
-    }
     // Migrate legacy two-key shadows defensively: one corrupt half must not
     // discard the other valid half.
-    const threads = readJson(this.threadsKey, []);
-    const meta = readJson(this.metaKey, {});
+    const legacyThreads = readJson(this.threadsKey, []);
+    const legacyMeta = readJson(this.metaKey, {});
+    const atomicObject = atomic && typeof atomic === "object" ? atomic : null;
+    const threads = Array.isArray(atomicObject?.threads)
+      ? atomicObject.threads
+      : legacyThreads;
+    const meta = atomicObject?.meta && typeof atomicObject.meta === "object"
+      ? atomicObject.meta
+      : legacyMeta;
     try {
       return mergeHistorySnapshots({ threads: Array.isArray(threads) ? threads : [], meta });
     } catch {
