@@ -9,11 +9,15 @@ export { isThreadInScope };
 export const CHAT_HISTORY_SCHEMA = 2;
 export const CHAT_HISTORY_DB = "comfyui-mcp-panel-history";
 export const CHAT_HISTORY_STATE_KEY = "state";
+export const CHAT_HISTORY_LOCAL_SNAPSHOT_KEY = "comfyui-mcp.panel.historySnapshot";
 
 const DEFAULT_THREADS_KEY = "comfyui-mcp.panel.threads";
 const DEFAULT_META_KEY = "comfyui-mcp.panel.historyMeta";
+const DEFAULT_MAX_THREADS = 500;
+const DEFAULT_MAX_MESSAGES = 5000;
 const LOCAL_SHADOW_THREADS = 20;
 const LOCAL_SHADOW_MESSAGES = 200;
+const IDB_OPEN_TIMEOUT_MS = 2000;
 
 function finiteTs(value) {
   const n = Number(value);
@@ -35,9 +39,103 @@ function mergeTimestampMaps(...maps) {
   return merged;
 }
 
+function normalizeMetadataOperation(operation, fallbackValue, fallbackUpdatedAt) {
+  if (operation && typeof operation === "object") {
+    const deleted = operation.deleted === true || operation.value == null;
+    return {
+      value: deleted ? null : operation.value,
+      deleted,
+      updatedAt: finiteTs(operation.updatedAt) || finiteTs(fallbackUpdatedAt),
+    };
+  }
+  return {
+    value: fallbackValue,
+    deleted: false,
+    updatedAt: finiteTs(fallbackUpdatedAt),
+  };
+}
+
+function normalizeMetadataOperations(operations, values, fallbackUpdatedAt) {
+  const normalized = {};
+  if (operations && typeof operations === "object") {
+    for (const [key, operation] of Object.entries(operations)) {
+      normalized[key] = normalizeMetadataOperation(operation, null, fallbackUpdatedAt);
+    }
+  }
+  if (values && typeof values === "object") {
+    for (const [key, value] of Object.entries(values)) {
+      if (!Object.hasOwn(normalized, key)) {
+        normalized[key] = normalizeMetadataOperation(null, value, fallbackUpdatedAt);
+      }
+    }
+  }
+  return normalized;
+}
+
+function mergeMetadataOperationMaps(current, incoming) {
+  const merged = { ...(current && typeof current === "object" ? current : {}) };
+  for (const [key, operation] of Object.entries(incoming || {})) {
+    const previous = merged[key];
+    const previousAt = finiteTs(previous?.updatedAt);
+    const incomingAt = finiteTs(operation?.updatedAt);
+    // Deletion wins an exact-time tie so a concurrent stale value cannot revive
+    // a pointer/alias merely because two tabs happened to mutate in one clock tick.
+    if (
+      !previous ||
+      incomingAt > previousAt ||
+      (incomingAt === previousAt && (operation.deleted === true || previous.deleted !== true))
+    ) {
+      merged[key] = operation;
+    }
+  }
+  return merged;
+}
+
+function materializeMetadataOperations(operations) {
+  const values = {};
+  for (const [key, operation] of Object.entries(operations || {})) {
+    if (operation?.deleted !== true && operation?.value != null) values[key] = operation.value;
+  }
+  return values;
+}
+
+/** Return metadata with a versioned set/delete operation for one keyed value. */
+export function updateMetadataEntry(meta, mapName, key, value, updatedAt = Date.now()) {
+  const opsName = mapName === "activeByScope"
+    ? "activeOps"
+    : mapName === "workflowAliases"
+      ? "aliasOps"
+      : null;
+  if (!opsName || typeof key !== "string" || !key) return meta;
+  const revision = finiteTs(updatedAt) || Date.now();
+  const values = {
+    ...(meta?.[mapName] && typeof meta[mapName] === "object" ? meta[mapName] : {}),
+  };
+  const deleted = value == null;
+  if (deleted) delete values[key];
+  else values[key] = value;
+  return {
+    ...(meta && typeof meta === "object" ? meta : {}),
+    updatedAt: Math.max(finiteTs(meta?.updatedAt), revision),
+    [mapName]: values,
+    [opsName]: {
+      ...(meta?.[opsName] && typeof meta[opsName] === "object" ? meta[opsName] : {}),
+      [key]: { value: deleted ? null : value, deleted, updatedAt: revision },
+    },
+  };
+}
+
 export function normalizeThread(raw) {
   if (!raw || typeof raw !== "object" || typeof raw.id !== "string" || !raw.id) return null;
-  const msgs = Array.isArray(raw.msgs) ? raw.msgs.filter((m) => m && typeof m === "object") : [];
+  const deletedMessages = mergeTimestampMaps(raw.deletedMessages);
+  const msgs = Array.isArray(raw.msgs)
+    ? raw.msgs.filter(
+      (message) =>
+        message &&
+        typeof message === "object" &&
+        !(typeof message.id === "string" && Object.hasOwn(deletedMessages, message.id)),
+    )
+    : [];
   const ts = finiteTs(raw.ts) || finiteTs(raw.createdAt) || Date.now();
   const createdAt = finiteTs(raw.createdAt) || ts;
   const updatedAt = finiteTs(raw.updatedAt) || ts;
@@ -49,6 +147,7 @@ export function normalizeThread(raw) {
     updatedAt,
     ts: updatedAt,
     msgs,
+    deletedMessages,
     pinned: raw.pinned === true,
     title: typeof raw.title === "string" ? raw.title.slice(0, 160) : undefined,
     workflowKey: typeof raw.workflowKey === "string" ? raw.workflowKey : "panel:global",
@@ -64,6 +163,7 @@ export function selectThreadForScope(threads, meta, scopeKey) {
     .filter((thread) => isThreadInScope(thread, scopeKey))
     .sort((a, b) => finiteTs(b.updatedAt || b.ts) - finiteTs(a.updatedAt || a.ts));
   const activeId = meta?.activeByScope?.[scopeKey];
+  if (!activeId && meta?.activeOps?.[scopeKey]?.deleted === true) return null;
   return candidates.find((thread) => thread.id === activeId) || candidates[0] || null;
 }
 
@@ -75,6 +175,7 @@ export function selectPanelThread(threads, meta) {
   const candidates = [...(Array.isArray(threads) ? threads : [])]
     .sort((a, b) => finiteTs(b?.updatedAt || b?.ts) - finiteTs(a?.updatedAt || a?.ts));
   const activeId = meta?.activeByScope?.["panel:global"];
+  if (!activeId && meta?.activeOps?.["panel:global"]?.deleted === true) return null;
   return candidates.find((thread) => thread?.id === activeId) || candidates[0] || null;
 }
 
@@ -155,6 +256,9 @@ function mergeThreadMessages(older, newer) {
 export function mergeHistorySnapshots(...snapshots) {
   const byId = new Map();
   let meta = {};
+  let activeOps = {};
+  let aliasOps = {};
+  let deletedThreads = {};
   let metaUpdatedAt = 0;
   let snapshotUpdatedAt = 0;
   for (const snap of snapshots) {
@@ -168,19 +272,16 @@ export function mergeHistorySnapshots(...snapshots) {
       meta = {
         ...older,
         ...newer,
-        activeByScope: {
-          ...(older.activeByScope && typeof older.activeByScope === "object" ? older.activeByScope : {}),
-          ...(newer.activeByScope && typeof newer.activeByScope === "object" ? newer.activeByScope : {}),
-        },
-        // Aliases are additive; a newer path entry naturally wins on collision.
-        workflowAliases: {
-          ...(older.workflowAliases && typeof older.workflowAliases === "object" ? older.workflowAliases : {}),
-          ...(newer.workflowAliases && typeof newer.workflowAliases === "object" ? newer.workflowAliases : {}),
-        },
-        deletedThreads: {
-          ...mergeTimestampMaps(older.deletedThreads, newer.deletedThreads),
-        },
       };
+      activeOps = mergeMetadataOperationMaps(
+        activeOps,
+        normalizeMetadataOperations(snap.meta.activeOps, snap.meta.activeByScope, incomingUpdatedAt),
+      );
+      aliasOps = mergeMetadataOperationMaps(
+        aliasOps,
+        normalizeMetadataOperations(snap.meta.aliasOps, snap.meta.workflowAliases, incomingUpdatedAt),
+      );
+      deletedThreads = mergeTimestampMaps(deletedThreads, snap.meta.deletedThreads);
       metaUpdatedAt = Math.max(metaUpdatedAt, incomingUpdatedAt);
     }
     for (const candidate of Array.isArray(snap.threads) ? snap.threads : []) {
@@ -201,13 +302,17 @@ export function mergeHistorySnapshots(...snapshots) {
       // metadata already present in the older snapshot.
       if (newer === next && !Object.hasOwn(candidate, "workflowKey")) delete overlay.workflowKey;
       if (newer === next && !Object.hasOwn(candidate, "pinned")) delete overlay.pinned;
-      byId.set(next.id, { ...older, ...overlay, msgs: mergeThreadMessages(older, newer) });
+      const deletedMessages = mergeTimestampMaps(older.deletedMessages, newer.deletedMessages);
+      const msgs = mergeThreadMessages(older, newer)
+        .filter(
+          (message) =>
+            !(typeof message?.id === "string" && Object.hasOwn(deletedMessages, message.id)),
+        );
+      byId.set(next.id, { ...older, ...overlay, msgs, deletedMessages });
     }
   }
-  const deletedThreads =
-    meta.deletedThreads && typeof meta.deletedThreads === "object" ? meta.deletedThreads : {};
   const threads = [...byId.values()]
-    .filter((thread) => finiteTs(deletedThreads[thread.id]) < finiteTs(thread.updatedAt || thread.ts))
+    .filter((thread) => !Object.hasOwn(deletedThreads, thread.id))
     .sort((a, b) => finiteTs(a.updatedAt) - finiteTs(b.updatedAt));
   const newestThreadAt = threads.reduce((max, thread) => Math.max(max, finiteTs(thread.updatedAt)), 0);
   return {
@@ -219,12 +324,31 @@ export function mergeHistorySnapshots(...snapshots) {
       workflowAliases: {},
       deletedThreads: {},
       ...meta,
-      activeByScope:
-        meta.activeByScope && typeof meta.activeByScope === "object" ? meta.activeByScope : {},
-      workflowAliases:
-        meta.workflowAliases && typeof meta.workflowAliases === "object" ? meta.workflowAliases : {},
+      updatedAt: metaUpdatedAt,
+      activeOps,
+      aliasOps,
+      activeByScope: materializeMetadataOperations(activeOps),
+      workflowAliases: materializeMetadataOperations(aliasOps),
       deletedThreads,
     },
+  };
+}
+
+function boundedSnapshot(snapshot, { maxThreads, maxMessages, protectedThreadIds = [] }) {
+  const activeThreadIds = Object.values(snapshot?.meta?.activeByScope || {})
+    .filter((id) => typeof id === "string" && id);
+  const boundedThreads = retainBoundedThreads(
+    snapshot?.threads,
+    maxThreads,
+    [...protectedThreadIds, ...activeThreadIds],
+  );
+  const messageLimit = Math.max(0, Math.floor(Number(maxMessages) || 0));
+  return {
+    ...snapshot,
+    threads: boundedThreads.map((thread) => ({
+      ...thread,
+      msgs: messageLimit ? thread.msgs.slice(-messageLimit) : [],
+    })),
   };
 }
 
@@ -232,10 +356,21 @@ function openDb(indexedDb) {
   if (!indexedDb || typeof indexedDb.open !== "function") return Promise.resolve(null);
   return new Promise((resolve) => {
     let request;
+    let settled = false;
+    let timeout = null;
+    const finish = (db) => {
+      if (settled) {
+        db?.close?.();
+        return;
+      }
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      resolve(db);
+    };
     try {
       request = indexedDb.open(CHAT_HISTORY_DB, CHAT_HISTORY_SCHEMA);
     } catch {
-      resolve(null);
+      finish(null);
       return;
     }
     // The schema number is also the IndexedDB version: every future bump fires
@@ -245,9 +380,13 @@ function openDb(indexedDb) {
       const db = request.result;
       if (!db.objectStoreNames.contains("snapshots")) db.createObjectStore("snapshots");
     };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => resolve(null);
-    request.onblocked = () => resolve(null);
+    request.onsuccess = () => finish(request.result);
+    request.onerror = () => finish(null);
+    // A blocked upgrade may still succeed after another tab closes its older
+    // connection. Keep waiting; if it outlives the bound below, late success is
+    // closed by finish() instead of leaking an unowned IDBDatabase.
+    request.onblocked = () => {};
+    timeout = setTimeout(() => finish(null), IDB_OPEN_TIMEOUT_MS);
   });
 }
 
@@ -266,7 +405,7 @@ async function idbRead(indexedDb) {
   }
 }
 
-async function idbMergeWrite(indexedDb, snapshot) {
+async function idbMergeWrite(indexedDb, snapshot, limits) {
   const db = await openDb(indexedDb);
   if (!db) return null;
   try {
@@ -274,12 +413,12 @@ async function idbMergeWrite(indexedDb, snapshot) {
       const tx = db.transaction("snapshots", "readwrite");
       const store = tx.objectStore("snapshots");
       const get = store.get(CHAT_HISTORY_STATE_KEY);
-      let merged = snapshot;
+      let merged = boundedSnapshot(snapshot, limits);
       get.onsuccess = () => {
-        merged = mergeHistorySnapshots(get.result, snapshot);
+        merged = boundedSnapshot(mergeHistorySnapshots(get.result, snapshot), limits);
         store.put(merged, CHAT_HISTORY_STATE_KEY);
       };
-      get.onerror = () => store.put(snapshot, CHAT_HISTORY_STATE_KEY);
+      get.onerror = () => store.put(merged, CHAT_HISTORY_STATE_KEY);
       tx.oncomplete = () => resolve(merged);
       tx.onerror = () => resolve(null);
       tx.onabort = () => resolve(null);
@@ -295,14 +434,35 @@ export class ChatHistoryStore {
     this.indexedDb = options.indexedDb ?? globalThis.indexedDB;
     this.threadsKey = options.threadsKey ?? DEFAULT_THREADS_KEY;
     this.metaKey = options.metaKey ?? DEFAULT_META_KEY;
+    this.snapshotKey = options.snapshotKey ?? CHAT_HISTORY_LOCAL_SNAPSHOT_KEY;
+    this.maxThreads = options.maxThreads ?? DEFAULT_MAX_THREADS;
+    this.maxMessages = options.maxMessages ?? DEFAULT_MAX_MESSAGES;
     this._writePromise = Promise.resolve(null);
     this._lastCommitted = null;
   }
 
   readLocal() {
+    const readJson = (key, fallback) => {
+      try {
+        const raw = this.storage?.getItem(key);
+        return raw == null ? fallback : JSON.parse(raw);
+      } catch {
+        return fallback;
+      }
+    };
+    const atomic = readJson(this.snapshotKey, null);
+    if (
+      atomic &&
+      typeof atomic === "object" &&
+      (Array.isArray(atomic.threads) || (atomic.meta && typeof atomic.meta === "object"))
+    ) {
+      return mergeHistorySnapshots(atomic);
+    }
+    // Migrate legacy two-key shadows defensively: one corrupt half must not
+    // discard the other valid half.
+    const threads = readJson(this.threadsKey, []);
+    const meta = readJson(this.metaKey, {});
     try {
-      const threads = JSON.parse(this.storage?.getItem(this.threadsKey) ?? "[]");
-      const meta = JSON.parse(this.storage?.getItem(this.metaKey) ?? "{}");
       return mergeHistorySnapshots({ threads: Array.isArray(threads) ? threads : [], meta });
     } catch {
       return mergeHistorySnapshots({ threads: [], meta: {} });
@@ -321,28 +481,50 @@ export class ChatHistoryStore {
 
   persist(threads, meta = {}, options = {}) {
     const snapshot = mergeHistorySnapshots({ threads, meta });
+    const protectedThreadIds = [
+      ...(Array.isArray(options.protectedThreadIds) ? options.protectedThreadIds : []),
+      ...Object.values(snapshot.meta.activeByScope || {}),
+    ];
+    const limits = {
+      maxThreads: options.maxThreads ?? this.maxThreads,
+      maxMessages: options.maxMessages ?? this.maxMessages,
+      protectedThreadIds,
+    };
+    const shadow = retainBoundedThreads(
+      snapshot.threads,
+      LOCAL_SHADOW_THREADS,
+      protectedThreadIds,
+    )
+      .map((thread) => ({ ...thread, msgs: thread.msgs.slice(-LOCAL_SHADOW_MESSAGES) }));
+    const localSnapshot = { ...snapshot, threads: shadow };
+    let atomicWritten = false;
     try {
-      const protectedThreadIds = [
-        ...(Array.isArray(options.protectedThreadIds) ? options.protectedThreadIds : []),
-        ...Object.values(snapshot.meta.activeByScope || {}),
-      ];
-      const shadow = retainBoundedThreads(
-        snapshot.threads,
-        LOCAL_SHADOW_THREADS,
-        protectedThreadIds,
-      )
-        .map((t) => ({ ...t, msgs: t.msgs.slice(-LOCAL_SHADOW_MESSAGES) }));
-      this.storage?.setItem(this.threadsKey, JSON.stringify(shadow));
-      this.storage?.setItem(this.metaKey, JSON.stringify(snapshot.meta));
+      this.storage?.setItem(this.snapshotKey, JSON.stringify(localSnapshot));
+      atomicWritten = true;
     } catch {
       // IndexedDB remains canonical when localStorage is unavailable or full.
+    }
+    if (atomicWritten) {
+      // Keep the pre-v2 keys as best-effort compatibility mirrors. Current code
+      // always reads the atomic snapshot first, so a partial legacy write cannot
+      // create a mixed generation for this implementation.
+      try {
+        this.storage?.setItem(this.threadsKey, JSON.stringify(shadow));
+      } catch {
+        // The atomic shadow is already committed.
+      }
+      try {
+        this.storage?.setItem(this.metaKey, JSON.stringify(snapshot.meta));
+      } catch {
+        // The atomic shadow is already committed.
+      }
     }
     // Start the atomic merge immediately. Chat records are low-frequency and a
     // debounce creates an avoidable shutdown window in which the local shadow
     // exists but IndexedDB has not started its transaction yet.
     this._writePromise = this._writePromise
       .catch(() => null)
-      .then(() => idbMergeWrite(this.indexedDb, snapshot))
+      .then(() => idbMergeWrite(this.indexedDb, snapshot, limits))
       .then((merged) => {
         if (merged) this._lastCommitted = merged;
         return merged;
@@ -356,7 +538,11 @@ export class ChatHistoryStore {
   subscribe(listener, eventTarget = globalThis) {
     if (!eventTarget?.addEventListener || typeof listener !== "function") return () => {};
     const onStorage = (event) => {
-      if (event?.key !== this.threadsKey && event?.key !== this.metaKey) return;
+      if (
+        event?.key !== this.snapshotKey &&
+        event?.key !== this.threadsKey &&
+        event?.key !== this.metaKey
+      ) return;
       listener(this.readLocal());
     };
     eventTarget.addEventListener("storage", onStorage);

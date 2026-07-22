@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  CHAT_HISTORY_LOCAL_SNAPSHOT_KEY,
   CHAT_HISTORY_SCHEMA,
   ChatHistoryStore,
   isThreadInScope,
@@ -12,6 +13,74 @@ import {
   selectRestoreThread,
   selectThreadForScope
 } from '../../web/js/lib/chat-history-store.js'
+
+function createMemoryStorage({ throwOnSet = null } = {}) {
+  const values = new Map()
+  return {
+    values,
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => {
+      if (key === throwOnSet) throw new Error(`blocked write: ${key}`)
+      values.set(key, value)
+    }
+  }
+}
+
+function createFakeIndexedDb(initialState = null, { blockedThenSuccess = false } = {}) {
+  let state = initialState == null ? null : structuredClone(initialState)
+  let closeCount = 0
+
+  const createDb = () => ({
+    objectStoreNames: { contains: (name) => name === 'snapshots' },
+    createObjectStore() {},
+    close: () => { closeCount += 1 },
+    transaction: (_name, mode) => {
+      const tx = {
+        oncomplete: null,
+        onerror: null,
+        onabort: null,
+        objectStore: () => ({
+          get: () => {
+            const request = { result: undefined, onsuccess: null, onerror: null }
+            queueMicrotask(() => {
+              request.result = state == null ? undefined : structuredClone(state)
+              request.onsuccess?.()
+            })
+            return request
+          },
+          put: (value) => {
+            assert.equal(mode, 'readwrite')
+            state = structuredClone(value)
+            queueMicrotask(() => tx.oncomplete?.())
+          }
+        })
+      }
+      return tx
+    }
+  })
+
+  return {
+    open: () => {
+      const request = {
+        result: null,
+        onupgradeneeded: null,
+        onsuccess: null,
+        onerror: null,
+        onblocked: null
+      }
+      queueMicrotask(() => {
+        if (blockedThenSuccess) request.onblocked?.()
+        queueMicrotask(() => {
+          request.result = createDb()
+          request.onsuccess?.()
+        })
+      })
+      return request
+    },
+    readState: () => state == null ? null : structuredClone(state),
+    closeCount: () => closeCount
+  }
+}
 
 test('normalizes legacy threads into schema v2 without losing messages', () => {
   const thread = normalizeThread({ id: 'legacy', ts: 123, msgs: [{ role: 'user', text: 'hello' }] })
@@ -92,6 +161,94 @@ test('thread tombstones prevent deleted chats from being resurrected by stale sn
 
   assert.equal(merged.threads.some((thread) => thread.id === 'removed'), false)
   assert.equal(merged.meta.deletedThreads.removed, deletedAt)
+})
+
+test('thread tombstones remain final even when another tab writes the thread later', () => {
+  const merged = mergeHistorySnapshots(
+    {
+      updatedAt: 500,
+      threads: [],
+      meta: { updatedAt: 500, deletedThreads: { removed: 500 } }
+    },
+    {
+      updatedAt: 900,
+      threads: [{ id: 'removed', updatedAt: 900, workflowKey: 'workflow:wf-a', msgs: [] }],
+      meta: { updatedAt: 900 }
+    }
+  )
+
+  assert.equal(merged.threads.some((thread) => thread.id === 'removed'), false)
+  assert.equal(merged.meta.deletedThreads.removed, 500)
+})
+
+test('message tombstones survive concurrent append and later reload merges', () => {
+  const base = {
+    id: 'shared',
+    workflowKey: 'workflow:wf-a',
+    createdAt: 100,
+    updatedAt: 100,
+    msgs: [{ id: 'm1', role: 'user', text: 'remove me', createdAt: 100 }]
+  }
+  const merged = mergeHistorySnapshots(
+    {
+      threads: [{ ...base, updatedAt: 300, msgs: [], deletedMessages: { m1: 300 } }],
+      meta: {}
+    },
+    {
+      threads: [{
+        ...base,
+        updatedAt: 400,
+        msgs: [
+          ...base.msgs,
+          { id: 'm2', role: 'agent', text: 'concurrent append', createdAt: 400 }
+        ]
+      }],
+      meta: {}
+    }
+  )
+  const reloaded = mergeHistorySnapshots(merged, {
+    threads: [{ ...base, updatedAt: 500 }],
+    meta: {}
+  })
+
+  assert.deepEqual(merged.threads[0].msgs.map((message) => message.id), ['m2'])
+  assert.equal(merged.threads[0].deletedMessages.m1, 300)
+  assert.deepEqual(reloaded.threads[0].msgs.map((message) => message.id), ['m2'])
+})
+
+test('metadata tombstones clear active pointers and aliases across stale snapshots', () => {
+  const merged = mergeHistorySnapshots(
+    {
+      updatedAt: 100,
+      threads: [],
+      meta: {
+        updatedAt: 100,
+        activeByScope: { 'panel:global': 'old-thread' },
+        workflowAliases: { 'workflows/old.json': 'old-workflow' }
+      }
+    },
+    {
+      updatedAt: 300,
+      threads: [],
+      meta: {
+        updatedAt: 300,
+        activeOps: {
+          'panel:global': { value: null, deleted: true, updatedAt: 300 }
+        },
+        aliasOps: {
+          'workflows/old.json': { value: null, deleted: true, updatedAt: 300 }
+        }
+      }
+    }
+  )
+
+  assert.equal(Object.hasOwn(merged.meta.activeByScope, 'panel:global'), false)
+  assert.equal(Object.hasOwn(merged.meta.workflowAliases, 'workflows/old.json'), false)
+  assert.equal(merged.meta.activeOps['panel:global'].deleted, true)
+  assert.equal(merged.meta.aliasOps['workflows/old.json'].deleted, true)
+  assert.equal(selectPanelThread([
+    { id: 'old-thread', workflowKey: 'panel:global', updatedAt: 100, msgs: [] }
+  ], merged.meta), null)
 })
 
 test('scope selection never falls back to a chat from another workflow', () => {
@@ -194,6 +351,155 @@ test('localStorage shadow retains the active tab thread when IndexedDB is unavai
   const degradedReload = await degradedStore.load({ protectedThreadIds: ['t0'] })
   await degradedStore.flush()
   assert.equal(degradedReload.threads.some((thread) => thread.id === 't0'), true)
+})
+
+test('canonical IndexedDB merge enforces thread and message limits after union', async () => {
+  const oldMessages = Array.from({ length: 5000 }, (_, i) => ({
+    id: `old-${i}`,
+    role: 'user',
+    text: `old ${i}`,
+    createdAt: i + 1
+  }))
+  const seededThreads = Array.from({ length: 501 }, (_, i) => ({
+    id: `t${i}`,
+    workflowKey: 'panel:global',
+    updatedAt: i + 1,
+    msgs: i === 0 ? oldMessages : []
+  }))
+  const indexedDb = createFakeIndexedDb({
+    updatedAt: 10_000,
+    threads: seededThreads,
+    meta: { activeByScope: { 'panel:global': 't0' } }
+  })
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb })
+  const incomingMessages = [
+    ...oldMessages.slice(1),
+    { id: 'newest', role: 'agent', text: 'newest', createdAt: 10_001 }
+  ]
+
+  store.persist([
+    { id: 't0', workflowKey: 'panel:global', updatedAt: 10_001, msgs: incomingMessages },
+    ...seededThreads.slice(2)
+  ], { activeByScope: { 'panel:global': 't0' } }, { protectedThreadIds: ['t0'] })
+  await store.flush()
+
+  const canonical = indexedDb.readState()
+  const protectedThread = canonical.threads.find((thread) => thread.id === 't0')
+  assert.equal(canonical.threads.length, 500)
+  assert.equal(canonical.threads.some((thread) => thread.id === 't0'), true)
+  assert.equal(canonical.threads.some((thread) => thread.id === 't1'), false)
+  assert.equal(protectedThread.msgs.length, 5000)
+  assert.equal(protectedThread.msgs.some((message) => message.id === 'old-0'), false)
+  assert.equal(protectedThread.msgs.at(-1).id, 'newest')
+})
+
+test('atomic writes keep message, metadata, and chat deletions through stale writers and reload', async () => {
+  const indexedDb = createFakeIndexedDb({
+    updatedAt: 100,
+    threads: [
+      {
+        id: 'shared',
+        workflowKey: 'panel:global',
+        updatedAt: 100,
+        msgs: [{ id: 'm1', role: 'user', text: 'deleted', createdAt: 100 }]
+      },
+      { id: 'removed-chat', workflowKey: 'panel:global', updatedAt: 100, msgs: [] }
+    ],
+    meta: {
+      updatedAt: 100,
+      activeByScope: { 'panel:global': 'removed-chat' },
+      workflowAliases: { 'workflows/old.json': 'old-workflow' }
+    }
+  })
+  const deletingTab = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb })
+  const staleTab = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb })
+
+  deletingTab.persist([
+    {
+      id: 'shared',
+      workflowKey: 'panel:global',
+      updatedAt: 300,
+      msgs: [],
+      deletedMessages: { m1: 300 }
+    }
+  ], {
+    updatedAt: 300,
+    deletedThreads: { 'removed-chat': 300 },
+    activeOps: { 'panel:global': { value: null, deleted: true, updatedAt: 300 } },
+    aliasOps: {
+      'workflows/old.json': { value: null, deleted: true, updatedAt: 300 }
+    }
+  })
+  await deletingTab.flush()
+
+  staleTab.persist([
+    {
+      id: 'shared',
+      workflowKey: 'panel:global',
+      updatedAt: 900,
+      msgs: [
+        { id: 'm1', role: 'user', text: 'deleted', createdAt: 100 },
+        { id: 'm2', role: 'agent', text: 'late append', createdAt: 900 }
+      ]
+    },
+    { id: 'removed-chat', workflowKey: 'panel:global', updatedAt: 900, msgs: [] }
+  ], {
+    updatedAt: 100,
+    activeByScope: { 'panel:global': 'removed-chat' },
+    workflowAliases: { 'workflows/old.json': 'old-workflow' }
+  })
+  await staleTab.flush()
+
+  const reloadedStore = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb })
+  const reloaded = await reloadedStore.load()
+  await reloadedStore.flush()
+
+  assert.deepEqual(reloaded.threads.find((thread) => thread.id === 'shared').msgs.map((m) => m.id), ['m2'])
+  assert.equal(reloaded.threads.some((thread) => thread.id === 'removed-chat'), false)
+  assert.equal(Object.hasOwn(reloaded.meta.activeByScope, 'panel:global'), false)
+  assert.equal(Object.hasOwn(reloaded.meta.workflowAliases, 'workflows/old.json'), false)
+})
+
+test('blocked IndexedDB opens can continue to success and always close the connection', async () => {
+  const indexedDb = createFakeIndexedDb({
+    threads: [{ id: 'durable', workflowKey: 'panel:global', updatedAt: 10, msgs: [] }],
+    meta: {}
+  }, { blockedThenSuccess: true })
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb })
+
+  const loaded = await store.load()
+  await store.flush()
+
+  assert.equal(loaded.threads.some((thread) => thread.id === 'durable'), true)
+  assert.equal(indexedDb.closeCount(), 2)
+})
+
+test('atomic local shadow survives a failed legacy metadata write', async () => {
+  const storage = createMemoryStorage({ throwOnSet: 'comfyui-mcp.panel.historyMeta' })
+  const store = new ChatHistoryStore({ storage, indexedDb: null })
+  store.persist(
+    [{ id: 'kept', workflowKey: 'panel:global', updatedAt: 10, msgs: [] }],
+    { activeByScope: { 'panel:global': 'kept' } }
+  )
+  await store.flush()
+
+  assert.notEqual(storage.values.get(CHAT_HISTORY_LOCAL_SNAPSHOT_KEY), undefined)
+  assert.equal(store.readLocal().threads[0].id, 'kept')
+  assert.equal(store.readLocal().meta.activeByScope['panel:global'], 'kept')
+})
+
+test('legacy local shadow migration preserves the valid half of split or corrupt state', () => {
+  const storage = createMemoryStorage()
+  storage.values.set('comfyui-mcp.panel.threads', JSON.stringify([
+    { id: 'legacy-thread', workflowKey: 'panel:global', updatedAt: 10, msgs: [] }
+  ]))
+  storage.values.set('comfyui-mcp.panel.historyMeta', '{broken')
+  const store = new ChatHistoryStore({ storage, indexedDb: null })
+
+  const loaded = store.readLocal()
+
+  assert.equal(loaded.threads[0].id, 'legacy-thread')
+  assert.deepEqual(loaded.meta.activeByScope, {})
 })
 
 test('notifies another tab when the local history shadow changes', () => {
