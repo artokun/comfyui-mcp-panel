@@ -6778,7 +6778,7 @@ const RECONNECT_MAX_MS = 15000;
 let AGENT_MUTED = (() => { try { return localStorage.getItem("cmcp.muteAgents") === "1"; } catch { return false; } })();
 let AGENT_BLIND = (() => { try { return localStorage.getItem("cmcp.blindAgents") === "1"; } catch { return false; } })();
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -7159,6 +7159,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // pod is being watched.
       if (msg && msg.type === "runpod_status") {
         onRunpodStatus?.(msg);
+      }
+      // Auto-connect FAILURE alerts (timeout/superseded/resolved) — a billing
+      // warning separate from the single status slot (#287).
+      if (msg && msg.type === "runpod_alert") {
+        onRunpodAlert?.(msg);
       }
       // Honest host indicator: where renders currently run (local ⇄ pod).
       if (msg && msg.type === "comfyui_target") {
@@ -10124,6 +10129,10 @@ function buildPanel() {
     svg.append(r1, r2, d1, d2);
     runpodBtn.prepend(svg);
   }
+  // Auto-connect failure alerts (pod_id → frame). Resolved frames retract.
+  // Seeded by the orchestrator's failedFrames() so a reloaded tab sees every
+  // still-billing failure (#287).
+  const _runpodAlerts = new Map();
   function reflectRunpodHost() {
     const t = _comfyuiTarget;
     const s = _runpodStatus;
@@ -10140,12 +10149,16 @@ function buildPanel() {
       label.textContent = "Local";
     }
     runpodBtn.classList.toggle("cmcp-runpod-onpod", onPod);
-    runpodBtn.style.color = onPod ? "#60a5fa" : "";
+    const alertCount = _runpodAlerts.size;
+    runpodBtn.style.color = alertCount > 0 ? "#f59e0b" : onPod ? "#60a5fa" : "";
     const gpu = s && s.watching && s.gpu ? ` · ${s.gpu}` : "";
     const cost = s && s.watching && s.cost_per_hr != null ? ` · $${Number(s.cost_per_hr).toFixed(3)}/hr` : "";
-    runpodBtn.title = onPod
+    const alertNote = alertCount > 0
+      ? ` ⚠ ${alertCount} pod alert${alertCount > 1 ? "s" : ""}: ${[..._runpodAlerts.keys()].join(", ")} — auto-connect ${[..._runpodAlerts.values()][0].reason === "superseded" ? "superseded" : "timed out"}, still billing. Click to manage/stop.`
+      : "";
+    runpodBtn.title = (onPod
       ? `Rendering on RunPod${gpu}${cost} — click to manage the pod or switch back to local.`
-      : "Rendering locally on this machine — click to run this session on a cloud GPU (RunPod).";
+      : "Rendering locally on this machine — click to run this session on a cloud GPU (RunPod).") + alertNote;
   }
   runpodBtn.addEventListener("click", () => {
     try { _runpodHandle?.close(); } catch {}
@@ -10165,6 +10178,14 @@ function buildPanel() {
   panelRunpod = {
     onStatus: (frame) => { _runpodStatus = frame; reflectRunpodHost(); if (_runpodHandle?.isOpen?.()) _runpodHandle.update(); },
     onTarget: (frame) => { _comfyuiTarget = frame; reflectRunpodHost(); if (_runpodHandle?.isOpen?.()) _runpodHandle.update(); },
+    onAlert: (frame) => {
+      const id = frame && frame.pod_id;
+      if (!id) return;
+      if (frame.resolved || frame.reason === "resolved") _runpodAlerts.delete(id);
+      else _runpodAlerts.set(id, frame);
+      reflectRunpodHost();
+      if (_runpodHandle?.isOpen?.()) _runpodHandle.update();
+    },
   };
   reflectRunpodHost();
 
@@ -11833,6 +11854,10 @@ function buildPanel() {
     // Honest host indicator (local ⇄ pod) → the host pill + open control modal.
     onComfyuiTarget(frame) {
       panelRunpod?.onTarget(frame);
+    },
+    // Auto-connect failure alerts → the pod button warning treatment (#287).
+    onRunpodAlert(frame) {
+      panelRunpod?.onAlert(frame);
     },
     // Live extended-thinking token count → update the working indicator.
     onThinking(tokens) {
