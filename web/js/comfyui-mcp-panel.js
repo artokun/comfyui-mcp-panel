@@ -75,6 +75,7 @@ import {
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
 import { openCivitaiModal } from "./cmcp-civitai-ui.js";
 import { openRunpodModal } from "./cmcp-runpod-ui.js";
+import { openAppsModal } from "./cmcp-apps-ui.js";
 import { openTrainingModal } from "./cmcp-training-ui.js";
 
 let app = null;
@@ -10061,6 +10062,48 @@ function buildPanel() {
     civitaiBtn.prepend(svg);
   }
 
+  // Apps — the micro-app layer: convert the canvas workflow (or an existing
+  // ComfyUI APP-mode config) into a named, one-click app; runs headless via
+  // the pack's py/apps_routes.py (canvas never touched). Grid of four rounded
+  // squares (mini-app launcher mark), currentColor like the neighbors.
+  let _appsHandle = null;
+  function openApps(opts) {
+    try { _appsHandle?.close(); } catch {}
+    const handle = openAppsModal(
+      {
+        getApp: () => app,
+        uploadBlobToInput,
+        callTool: (t, a, o) => liveBridgeClient?.callTool(t, a, o),
+        getRunpodTarget: () => _comfyuiTarget,
+      },
+      {
+        ...(opts || {}),
+        onClose: () => { if (_appsHandle === handle) _appsHandle = null; },
+      },
+    );
+    _appsHandle = handle;
+    return _appsHandle;
+  }
+  const appsBtn = toolbarBtn("pi-circle", "Apps");
+  appsBtn.querySelector(".pi").remove();
+  appsBtn.title = "Apps — one-click micro-apps built from workflows: convert, run locally or on RunPod, share.";
+  appsBtn.addEventListener("click", () => openApps());
+  {
+    const svgNs = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(svgNs, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "currentColor");
+    svg.setAttribute("aria-hidden", "true");
+    // 2x2 grid of rounded squares (mini-app launcher).
+    for (const [x, y] of [[4, 4], [14, 4], [4, 14], [14, 14]]) {
+      const r = document.createElementNS(svgNs, "rect");
+      r.setAttribute("x", String(x)); r.setAttribute("y", String(y));
+      r.setAttribute("width", "6"); r.setAttribute("height", "6"); r.setAttribute("rx", "1.5");
+      svg.append(r);
+    }
+    appsBtn.prepend(svg);
+  }
+
   // LoRA Training — the dataset gather/label/launch/monitor wizard for the
   // local trainer (ai-toolkit in a GPU container, train_* tools over call_tool).
   // Same modal treatment as the CivitAI browser; dumbbell mark via currentColor.
@@ -10187,7 +10230,7 @@ function buildPanel() {
 
   const toolbarSpacer = document.createElement("span");
   toolbarSpacer.className = "cmcp-spacer";
-  toolbar.append(deafenBtn, blindBtn, toolbarSpacer, civitaiBtn, trainingBtn, runpodBtn);
+  toolbar.append(deafenBtn, blindBtn, toolbarSpacer, civitaiBtn, appsBtn, trainingBtn, runpodBtn);
 
   row.append(ring, ctxLabel, modelChip, spacer, attachBtn, micBtn, sendBtn);
   form.append(menuPop, modelPop, attachBar, input, row, fileInput);
