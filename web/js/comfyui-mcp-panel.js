@@ -11647,11 +11647,26 @@ function buildPanel() {
   // In-flight Remote-control pairing request: the open modal registers a handler
   // here; the `pair_url`/`pair_error` reply consumes it (mirrors pendingSetSecret).
   let pendingPair = null;
+  // Last status this panel reconciled the settings box against, so a repeated
+  // "connected" emission cannot re-close a box the user just opened.
+  let settingsStatusApplied = null;
   const client = createBridgeClient({
     onStatus(state) {
       statusText.textContent = state;
       dot.className = "cmcp-dot" + (state === "connected" ? " connected" : state === "connecting" ? " connecting" : "");
-      settingsBox.hidden = state !== "disconnected";
+      // Reconcile the settings box only when the status actually CHANGED.
+      // The bridge re-emits "connected" repeatedly on purpose — its dedupe
+      // guard exempts that state (`s === lastStatus && s !== "connected"`) so
+      // connected-state side effects re-apply. Deriving visibility on every
+      // emission therefore slammed this box shut a moment after the user
+      // opened it: click the status chip while connected, and the next tick
+      // re-hid it. That is the "dropdown flashes open then closes, can't
+      // reach Disconnect" report — the box was being closed by a heartbeat,
+      // not by the click-outside handler.
+      if (state !== settingsStatusApplied) {
+        settingsStatusApplied = state;
+        settingsBox.hidden = state !== "disconnected";
+      }
       const connected = state === "connected";
       connectBtn.hidden = connected;
       disconnectBtn.hidden = !connected;
