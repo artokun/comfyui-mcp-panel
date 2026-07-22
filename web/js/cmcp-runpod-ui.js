@@ -356,29 +356,44 @@ export function openRunpodModal(ctx, opts = {}) {
   localBtn.addEventListener("click", () => {
     run("Switching to local ComfyUI", () => callTool("runpod_use_local", {}));
   });
-  // Confirm must be two DISTINCT human decisions, not one double-click. Arming
-  // opens a short cool-down window during which confirm clicks (and keyboard
-  // repeat on Enter/Space) are ignored, so an accidental double-click can't bill.
+  // Confirm must be two DISTINCT human decisions, not one gesture. Arming opens
+  // a short cool-down that ignores confirm clicks (rapid double-click), and a
+  // keydown guard suppresses held-key autorepeat entirely — a held Enter fires
+  // repeated click events, and time-elapsed alone would let one through once the
+  // cool-down passes. A fresh discrete click, or a fresh Enter/Space keypress
+  // (repeat=false), after the cool-down still confirms.
   const DEPLOY_ARM_COOLDOWN_MS = 600;
   let deployArmedAt = 0;
+  let deployArmGen = 0; // bumped each arming so a stale disarm timer is inert
+  // Swallow the activation an auto-repeating Enter/Space would synthesize, so a
+  // held key can never produce the confirming click. Discrete presses pass.
+  deployBtn.addEventListener("keydown", (e) => {
+    if (e.repeat && (e.key === "Enter" || e.key === " " || e.key === "Spacebar")) {
+      e.preventDefault();
+    }
+  });
   deployBtn.addEventListener("click", () => {
     // Deploying bills GPU-time immediately — confirm once inline.
     if (deployBtn.dataset.armed !== "1") {
       deployBtn.dataset.armed = "1";
       deployArmedAt = Date.now();
+      const gen = ++deployArmGen;
       deployBtn.textContent = "Deploy — this bills. Click to confirm";
       setLog("A new pod bills per running GPU-second (~$0.30–0.70/hr). It idle-auto-stops; Stop ends GPU billing (disk storage still bills until you terminate the pod in the console).", "");
       setTimeout(() => {
-        if (deployBtn.dataset.armed === "1") {
+        // Only disarm the arming that scheduled this timer — a newer arm (e.g.
+        // after a deploy completes and re-arms) must not be cleared by an old one.
+        if (deployBtn.dataset.armed === "1" && deployArmGen === gen) {
           deployBtn.dataset.armed = "0";
           deployBtn.textContent = "Deploy new pod";
         }
       }, 5000);
       return;
     }
-    // Ignore a confirm that lands inside the cool-down (a double-click / key
-    // repeat is not a second human decision). Keep it armed so a real click works.
+    // Ignore a confirm that lands inside the cool-down (a double-click is not a
+    // second human decision). Keep it armed so a real click still works.
     if (Date.now() - deployArmedAt < DEPLOY_ARM_COOLDOWN_MS) return;
+    deployArmGen++; // invalidate the pending disarm timer for this arming
     deployBtn.dataset.armed = "0";
     deployBtn.textContent = "Deploy new pod";
     run("Deploying a new pod", () => callTool("runpod_pod_create", {}, { timeout: 120000 })).then((ok) => {

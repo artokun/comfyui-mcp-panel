@@ -10004,7 +10004,10 @@ function buildPanel() {
   function reflectRunpodHost() {
     const t = _comfyuiTarget;
     const s = _runpodStatus;
-    const onPod = t ? !t.is_local : !!(s && s.watching && s.status === "RUNNING");
+    // Honesty: "on pod" comes ONLY from the comfyui_target frame — a watched
+    // RUNNING pod does NOT mean renders go there (runpod_watch broadcasts status
+    // without retargeting). Default to Local when the target is unknown.
+    const onPod = !!(t && !t.is_local);
     const label = runpodBtn.querySelector("span");
     if (onPod && s && s.watching) {
       label.textContent = s.name || s.pod_id || "RunPod";
