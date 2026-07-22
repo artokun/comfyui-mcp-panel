@@ -8,6 +8,7 @@ Dev-only. Run from the repo root:
 
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "py"))
@@ -19,12 +20,12 @@ UUID = "123e4567-e89b-42d3-a456-426614174000"
 
 class BundleDir(unittest.TestCase):
     def test_uuid_contained(self):
-        root = os.path.realpath("/tmp/apps-root")
+        root = os.path.realpath(os.path.join(tempfile.gettempdir(), "apps-root"))
         path = ar._bundle_dir(root, UUID)
         self.assertTrue(path.startswith(root + os.sep), path)
 
     def test_non_uuid_rejected(self):
-        root = os.path.realpath("/tmp/apps-root")
+        root = os.path.realpath(os.path.join(tempfile.gettempdir(), "apps-root"))
         for bad in ("", "..", "../etc", "not-a-uuid", UUID + "/..", None, UUID.upper() + "x"):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 ar._bundle_dir(root, bad)
