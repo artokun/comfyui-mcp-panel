@@ -19,6 +19,9 @@ tsconfig.json
 # Dev-only tooling — keep the published (security-scanned) archive minimal
 scripts/
 .githooks/
+# The Cloudflare registry worker (deploy infra, not part of the custom-node
+# pack; its fetch/crypto calls would only manufacture scanner findings)
+registry/
 # The registry's YARA scan matches code-shaped literals in ANY shipped file,
 # including markdown prose: 0.6.2 was flagged (any-code-execute) because the
 # changelog QUOTED the removed process-spawn call verbatim. The changelog

@@ -75,6 +75,7 @@ import {
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
 import { openCivitaiModal } from "./cmcp-civitai-ui.js";
 import { openRunpodModal } from "./cmcp-runpod-ui.js";
+import { openAppsModal } from "./cmcp-apps-ui.js";
 import { openTrainingModal } from "./cmcp-training-ui.js";
 
 let app = null;
@@ -105,7 +106,7 @@ const DISCORD_INVITE_URL = "https://discord.gg/cW9arBhzCu";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
-const PANEL_VERSION = "0.10.0";
+const PANEL_VERSION = "0.11.0";
 
 // The connected orchestrator's console URL/token (captured off the `backends`
 // bridge message — see onBackends). Drives the "API Keys" credentials frame;
@@ -6481,11 +6482,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // ago, so a dropped connection here means the reboot fired (not that the
     // endpoint is unreachable). Treat that as success and let the auto-reconnect/
     // resume flow take over. Try the canonical v2 route first, then the legacy
-    // GET route for older Manager builds; a real Response that is 404/non-OK means
-    // "wrong route on this build" → try the next; 403 means Manager security
-    // blocked it (a real, actionable failure). On total failure we RETURN a
-    // structured error (rebooting:false) rather than throw, so the agent is told
-    // accurately AND the auto-resume flag is not armed.
+    // GET route for older Manager builds. Classification of a real Response:
+    // 403 means Manager security blocked it (a real, actionable failure); a
+    // 502/503/504 means we're reaching ComfyUI through a reverse proxy / tunnel
+    // whose origin was just killed by the reboot (the proxy can't reach it) —
+    // that's a reboot that FIRED, same as a dropped connection; any other
+    // non-OK (404, etc.) means "wrong route on this build" → try the next. On
+    // total failure we RETURN a structured error (rebooting:false) rather than
+    // throw, so the agent is told accurately AND the auto-resume flag is not armed.
     const candidates = [
       { route: "/v2/manager/reboot", method: "POST" },
       { route: "/manager/reboot", method: "GET" },
@@ -6502,6 +6506,20 @@ const GRAPH_TOOL_EXECUTORS = {
               "ComfyUI-Manager refused the reboot (HTTP 403): rebooting requires the Manager " +
               "security level to be 'middle' or below. Ask the user to lower it in ComfyUI-Manager " +
               "settings, then retry. ComfyUI was NOT restarted.",
+          };
+        }
+        // Reverse proxy / Cloudflare tunnel case: killing the origin doesn't drop
+        // the connection here — the proxy answers with a gateway error instead.
+        // 502/503/504 means the request reached the proxy and the origin is going
+        // down, i.e. the reboot FIRED. Treat it EXACTLY like the connection-drop
+        // success branch below (arms the same auto-resume via rebooting:true), NOT
+        // as a refusal — so a remote agent isn't told a fired reboot "failed".
+        if (res && (res.status === 502 || res.status === 503 || res.status === 504)) {
+          return {
+            rebooting: true,
+            endpoint: route,
+            method,
+            note: `proxy returned ${res.status} (origin going down) — reboot initiated`,
           };
         }
         // 404 / other non-OK: this route isn't the one on this build — try next.
@@ -6778,6 +6796,31 @@ const RECONNECT_MAX_MS = 15000;
 let AGENT_MUTED = (() => { try { return localStorage.getItem("cmcp.muteAgents") === "1"; } catch { return false; } })();
 let AGENT_BLIND = (() => { try { return localStorage.getItem("cmcp.blindAgents") === "1"; } catch { return false; } })();
 
+/**
+ * Strip the auth token out of a bridge URL before it goes anywhere a human can
+ * see it.
+ *
+ * These lines get screenshotted into bug reports and pasted into chats — a live
+ * bridge token does not belong in either, and there's no reason a status line
+ * needs it. It is also what made these lines overflow: a 64-char hex token is
+ * one unbreakable word, so it blew past the panel width and forced a horizontal
+ * scrollbar on the whole log. Keeping the first few characters preserves the
+ * one thing the token is useful for here — telling two sessions apart.
+ */
+function redactBridgeUrl(u) {
+  const raw = String(u ?? "");
+  try {
+    const url = new URL(raw);
+    const t = url.searchParams.get("token");
+    if (t) url.searchParams.set("token", `${t.slice(0, 4)}…`);
+    return decodeURIComponent(url.toString());
+  } catch {
+    // Unparseable (relative, malformed) — redact textually rather than give up,
+    // so a bad URL can't leak the token the parsed path would have caught.
+    return raw.replace(/([?&]token=)[^&\s]+/gi, "$1…");
+  }
+}
+
 function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert }) {
   let sock = null;
   let url = loadBridgeUrl();
@@ -6915,7 +6958,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // sequence instead of on every (re)open during a cold-start flicker.
       if (!loggedWaiting) {
         loggedWaiting = true;
-        onLog(`Connected to ${url} — waiting for the panel agent…`);
+        onLog(`Connected to ${redactBridgeUrl(url)} — waiting for the panel agent…`);
       }
       sendHello();
       clearHandshake();
@@ -7838,6 +7881,12 @@ const PANEL_CSS = `
   align-self: center; font-size: 0.6875rem; font-style: italic;
   color: var(--p-text-muted-color, #a1a1aa);
   animation: cmcp-in 0.18s ease-out;
+  /* Status lines quote URLs, paths and ids — strings with no spaces to break
+     at. Without this, a single long token is one unbreakable word that widens
+     the whole log and forces a horizontal scrollbar across the panel. Uses
+     overflow-wrap:anywhere rather than break-word so it also breaks MID-token
+     when the token alone is wider than the panel, which is the case here. */
+  max-width: 100%; overflow-wrap: anywhere; text-align: center;
 }
 .cmcp-card {
   align-self: flex-start; max-width: 92%; width: 100%; box-sizing: border-box;
@@ -7979,12 +8028,28 @@ const PANEL_CSS = `
   box-shadow: 0 0 0 2px var(--p-surface-900, #18181b);
   pointer-events: none; z-index: 5;
 }
+/* Model chip (composer). Stays on ONE line at every panel width: a wrapped
+   chip pushed the composer row taller and shoved the send/mic buttons around,
+   and the only way to get it back on one line was to widen the panel until it
+   ate the canvas. The model NAME truncates with an ellipsis instead; the
+   effort suffix and caret never shrink, so "which model + which effort" stays
+   readable even when the name is clipped, and the full value is in the title. */
 .cmcp-chip {
   display: flex; align-items: center; gap: 0.25rem;
   border: none; background: transparent; cursor: pointer;
   color: var(--p-text-muted-color, #a1a1aa); font: inherit; font-size: 0.6875rem;
   padding: 0.125rem 0.375rem; border-radius: var(--p-border-radius-sm, 4px);
+  white-space: nowrap; min-width: 0; overflow: hidden; flex: 0 1 auto;
 }
+/* The NAME keeps a floor so it never truncates to nothing — at very narrow
+   widths an unfloored ellipsis ate the whole model name and left a bare
+   "· medium", which tells you the least useful half. The effort suffix yields
+   first instead: "which model" matters more than "which effort", and the full
+   value is on the chip's title either way. The caret never shrinks, so the
+   dropdown affordance survives at any width. */
+.cmcp-chip .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 4.5ch; }
+.cmcp-chip .dim { overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
+.cmcp-chip .pi-angle-down { flex: 0 0 auto; }
 .cmcp-chip:hover { background: var(--p-surface-700, #3f3f46); }
 /* Attachment chip strip (composer): viewable/expandable pasted text + files. */
 .cmcp-attachbar { display: flex; flex-direction: column; gap: 0.25rem; padding: 0.25rem 0.25rem 0; }
@@ -8046,6 +8111,10 @@ const PANEL_CSS = `
 .cmcp-popover-item .pi { font-size: 0.75rem; color: var(--p-text-muted-color, #a1a1aa); flex: none; }
 .cmcp-popover-item small { margin-left: auto; color: var(--p-text-muted-color, #a1a1aa); flex: none; padding-left: 0.5rem; }
 .cmcp-popover-item .lbl { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Hover-to-read: while revealing, drop the ellipsis so the tail is legible, and
+   hide the scrollbar the programmatic scroll would otherwise expose. */
+.cmcp-revealing { text-overflow: clip !important; scrollbar-width: none; }
+.cmcp-revealing::-webkit-scrollbar { display: none; }
 /* Slash commands: keep the short /command always visible and let the (often
    long) hint truncate instead — otherwise a long hint collapsed the label. */
 .cmcp-popover-item.cmcp-slash .lbl { flex: 0 0 auto; }
@@ -9432,8 +9501,11 @@ function buildPanel() {
   const modelChip = document.createElement("button");
   modelChip.type = "button";
   modelChip.className = "cmcp-chip";
+  // Initial title only — refreshModelChip() replaces it with the live model and
+  // effort, since the name can be ellipsised at narrow widths.
   modelChip.title = "Model & reasoning effort for the background agent";
   const modelChipLabel = document.createElement("span");
+  modelChipLabel.className = "name";
   const modelChipEffort = document.createElement("span");
   modelChipEffort.className = "dim";
   const modelChipCaret = document.createElement("i");
@@ -9441,8 +9513,15 @@ function buildPanel() {
   modelChip.append(modelChipLabel, modelChipEffort, modelChipCaret);
 
   function refreshModelChip() {
-    modelChipLabel.textContent = prefs.modelAuto ? "Auto" : modelLabel(modelCatalog, prefs.model);
+    const name = prefs.modelAuto ? "Auto" : modelLabel(modelCatalog, prefs.model);
+    modelChipLabel.textContent = name;
     modelChipEffort.textContent = prefs.effort ? ` · ${prefs.effort}` : "";
+    // The name ellipsises in a narrow panel, so the hover has to carry the full
+    // value — otherwise a truncated model id is unrecoverable without widening
+    // the panel, which is the thing we're avoiding.
+    modelChip.title =
+      `Model: ${name}${prefs.effort ? ` · effort: ${prefs.effort}` : ""}` +
+      "\nModel & reasoning effort for the background agent";
   }
 
   // Reconcile the ComfyUI Settings defaults with the panel's localStorage runtime.
@@ -10049,6 +10128,48 @@ function buildPanel() {
     civitaiBtn.prepend(svg);
   }
 
+  // Apps — the micro-app layer: convert the canvas workflow (or an existing
+  // ComfyUI APP-mode config) into a named, one-click app; runs headless via
+  // the pack's py/apps_routes.py (canvas never touched). Grid of four rounded
+  // squares (mini-app launcher mark), currentColor like the neighbors.
+  let _appsHandle = null;
+  function openApps(opts) {
+    try { _appsHandle?.close(); } catch {}
+    const handle = openAppsModal(
+      {
+        getApp: () => app,
+        uploadBlobToInput,
+        callTool: (t, a, o) => liveBridgeClient?.callTool(t, a, o),
+        getRunpodTarget: () => _comfyuiTarget,
+      },
+      {
+        ...(opts || {}),
+        onClose: () => { if (_appsHandle === handle) _appsHandle = null; },
+      },
+    );
+    _appsHandle = handle;
+    return _appsHandle;
+  }
+  const appsBtn = toolbarBtn("pi-circle", "Apps");
+  appsBtn.querySelector(".pi").remove();
+  appsBtn.title = "Apps — one-click micro-apps built from workflows: convert, run locally or on RunPod, share.";
+  appsBtn.addEventListener("click", () => openApps());
+  {
+    const svgNs = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(svgNs, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "currentColor");
+    svg.setAttribute("aria-hidden", "true");
+    // 2x2 grid of rounded squares (mini-app launcher).
+    for (const [x, y] of [[4, 4], [14, 4], [4, 14], [14, 14]]) {
+      const r = document.createElementNS(svgNs, "rect");
+      r.setAttribute("x", String(x)); r.setAttribute("y", String(y));
+      r.setAttribute("width", "6"); r.setAttribute("height", "6"); r.setAttribute("rx", "1.5");
+      svg.append(r);
+    }
+    appsBtn.prepend(svg);
+  }
+
   // LoRA Training — the dataset gather/label/launch/monitor wizard for the
   // local trainer (ai-toolkit in a GPU container, train_* tools over call_tool).
   // Same modal treatment as the CivitAI browser; dumbbell mark via currentColor.
@@ -10191,7 +10312,7 @@ function buildPanel() {
 
   const toolbarSpacer = document.createElement("span");
   toolbarSpacer.className = "cmcp-spacer";
-  toolbar.append(deafenBtn, blindBtn, toolbarSpacer, civitaiBtn, trainingBtn, runpodBtn);
+  toolbar.append(deafenBtn, blindBtn, toolbarSpacer, civitaiBtn, appsBtn, trainingBtn, runpodBtn);
 
   row.append(ring, ctxLabel, modelChip, spacer, attachBtn, micBtn, sendBtn);
   form.append(menuPop, modelPop, attachBar, input, row, fileInput);
@@ -11668,26 +11789,21 @@ function buildPanel() {
   // In-flight Remote-control pairing request: the open modal registers a handler
   // here; the `pair_url`/`pair_error` reply consumes it (mirrors pendingSetSecret).
   let pendingPair = null;
-  // Last status this panel reconciled the settings box against, so a repeated
-  // "connected" emission cannot re-close a box the user just opened.
-  let settingsStatusApplied = null;
   const client = createBridgeClient({
     onStatus(state) {
       statusText.textContent = state;
       dot.className = "cmcp-dot" + (state === "connected" ? " connected" : state === "connecting" ? " connecting" : "");
-      // Reconcile the settings box only when the status actually CHANGED.
-      // The bridge re-emits "connected" repeatedly on purpose — its dedupe
-      // guard exempts that state (`s === lastStatus && s !== "connected"`) so
-      // connected-state side effects re-apply. Deriving visibility on every
-      // emission therefore slammed this box shut a moment after the user
-      // opened it: click the status chip while connected, and the next tick
-      // re-hid it. That is the "dropdown flashes open then closes, can't
-      // reach Disconnect" report — the box was being closed by a heartbeat,
-      // not by the click-outside handler.
-      if (state !== settingsStatusApplied) {
-        settingsStatusApplied = state;
-        settingsBox.hidden = state !== "disconnected";
-      }
+      // Connection status does NOT drive this box's visibility. It's a
+      // dropdown: the user opens it and the user closes it (trigger, click
+      // away, or Escape). Deriving `hidden` from status here is what made it
+      // flash open and snap shut — the bridge re-emits "connected" on every
+      // handshake frame, and each emission re-hid a box the user had just
+      // opened, putting Disconnect out of reach. Guarding that on "only when
+      // the status changed" papered over it; not owning the visibility at all
+      // is the actual fix, and it means no future status path can steal it
+      // back. The places that legitimately REVEAL the box are user-initiated
+      // (clicking Disconnect, or trying to send while disconnected) and live
+      // at those call sites.
       const connected = state === "connected";
       connectBtn.hidden = connected;
       disconnectBtn.hidden = !connected;
@@ -12650,7 +12766,7 @@ function buildPanel() {
 
   saveBtn.addEventListener("click", () => {
     client.setUrl(urlInput.value.trim());
-    appendSystem(`Reconnecting to ${client.currentUrl()}…`);
+    appendSystem(`Reconnecting to ${redactBridgeUrl(client.currentUrl())}…`);
   });
 
   // Connect: ask ComfyUI's server to start the background agent on demand, then
@@ -14661,6 +14777,121 @@ function buildPanel() {
   // close when clicking inside the panel. Capturing runs on the way DOWN to the
   // target, before LiteGraph can swallow the event, so a click ANYWHERE (canvas,
   // toolbar, other widgets) dismisses the dropdown.
+  // ── Hover to read the rest of a truncated label ────────────────────────
+  // An ellipsis hides the END of the string, and the end is usually the part
+  // that identifies it: a quantisation suffix, a size tag, a date. Model ids
+  // are the worst case — "…-instruct-q4_K_M" and Ollama's size suffix both sit
+  // past the cut, so a list of clipped names can be genuinely unusable.
+  //
+  // Hovering a clipped element scrolls it to its end and hovering away returns
+  // it. Delegated from the panel root so it covers popover rows, the model
+  // chip, download and attachment names — including elements rendered later,
+  // which is most of them.
+  const REVEAL_SEL = [
+    ".cmcp-popover-item .lbl",
+    ".cmcp-popover-item small",
+    ".cmcp-chip .name",
+    ".cmcp-chip .dim",
+    ".cmcp-dl-name",
+    ".cmcp-attach-name",
+    ".cmcp-pending-text",
+    ".cmcp-card-text",
+  ].join(", ");
+  // Respect the OS setting — an animation that chases the cursor is exactly the
+  // kind of motion people disable it for. They still get the reveal, instantly.
+  const revealReduced = () =>
+    !!window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+  let revealEl = null;
+  let revealResetTimer = null;
+
+  /**
+   * Ease scrollLeft by hand rather than using scrollTo({behavior:"smooth"}).
+   *
+   * Three reasons, in order of weight:
+   *  - Pacing. Distance-proportional duration keeps a 60-char model id from
+   *    crawling and a short one from snapping; the built-in curve is fixed.
+   *  - Reduced-motion gets a clean instant branch instead of relying on the
+   *    browser to honour it for programmatic scrolls.
+   *  - Interruptibility. Moving the cursor across a list cancels the previous
+   *    animation explicitly (`cancelAnimationFrame`), so rows don't fight.
+   *
+   * Note: `scrollLeft =` and `scrollTo({behavior:"auto"})` are both confirmed
+   * to move these overflow:hidden labels. Whether `behavior:"smooth"` also
+   * works on them is UNVERIFIED — it appeared not to during testing, but that
+   * was measured in a backgrounded tab where rAF was paused and every
+   * animation was frozen, so the observation proves nothing either way. Don't
+   * cite it as a reason to avoid smooth; the reasons above stand on their own.
+   */
+  function revealScroll(el, toEnd) {
+    const max = el.scrollWidth - el.clientWidth;
+    if (max <= 0) return false;
+    const from = el.scrollLeft;
+    const to = toEnd ? max : 0;
+    if (Math.abs(to - from) < 1) return true;
+    if (el._revealRaf) cancelAnimationFrame(el._revealRaf);
+    if (revealReduced()) { el.scrollLeft = to; return true; }
+    // Pace by distance so a long id doesn't crawl and a short one doesn't jerk.
+    const dur = Math.min(600, Math.max(160, Math.abs(to - from) * 2.5));
+    const t0 = performance.now();
+    const step = (now) => {
+      const p = Math.min(1, (now - t0) / dur);
+      const eased = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+      el.scrollLeft = from + (to - from) * eased;
+      if (p < 1) el._revealRaf = requestAnimationFrame(step);
+      else el._revealRaf = 0;
+    };
+    el._revealRaf = requestAnimationFrame(step);
+    return true;
+  }
+  function revealRelease(el) {
+    if (!el) return;
+    revealScroll(el, false);
+    // Keep `clip` until the scroll-back lands, or the ellipsis snaps in over
+    // text that is still sliding — which reads as a glitch rather than a return.
+    clearTimeout(revealResetTimer);
+    revealResetTimer = setTimeout(() => el.classList.remove("cmcp-revealing"), 320);
+  }
+  function onRootOver(ev) {
+    const el = ev.target?.closest?.(REVEAL_SEL);
+    if (!el || el === revealEl) return;
+    if (revealEl) revealRelease(revealEl);
+    revealEl = null;
+    // Only act on text that is ACTUALLY clipped; otherwise every hover would
+    // add a class and run a no-op scroll across the whole panel.
+    if (el.scrollWidth > el.clientWidth + 1) {
+      clearTimeout(revealResetTimer);
+      if (revealEl && revealEl._revealRaf) cancelAnimationFrame(revealEl._revealRaf);
+      el.classList.add("cmcp-revealing");
+      revealScroll(el, true);
+      revealEl = el;
+    }
+  }
+  function onRootOut(ev) {
+    if (!revealEl) return;
+    const to = ev.relatedTarget;
+    // mouseout fires when crossing into a CHILD of the same label too; ignore
+    // those or the reveal would stutter as the cursor moves across the text.
+    if (to && (revealEl.contains(to) || to.closest?.(REVEAL_SEL) === revealEl)) return;
+    revealRelease(revealEl);
+    revealEl = null;
+  }
+  root.addEventListener("mouseover", onRootOver);
+  root.addEventListener("mouseout", onRootOut);
+
+  // Escape closes whichever dropdown is open, the way every other menu does.
+  // Capture phase for the same reason as the pointer handler: ComfyUI binds its
+  // own Escape (deselect / close dialogs) and we want ours to win while a panel
+  // dropdown is open, without stealing the key when nothing is open.
+  function onDocEscape(ev) {
+    if (ev.key !== "Escape") return;
+    if (!settingsBox.hidden) {
+      settingsBox.hidden = true;
+      ev.stopPropagation();
+      ev.preventDefault();
+    }
+  }
+  document.addEventListener("keydown", onDocEscape, true);
+
   function onDocPointerDown(ev) {
     const t = ev.target;
     if (!settingsBox.hidden && !settingsBox.contains(t) && !status.contains(t)) {
@@ -14794,7 +15025,7 @@ function buildPanel() {
     saveBridgeUrl(u);
     if (client.isConnected()) {
       client.setUrl(u);
-      appendSystem(`Bridge URL → ${u} (reconnecting).`);
+      appendSystem(`Bridge URL → ${redactBridgeUrl(u)} (reconnecting).`);
     }
   };
   panelHooks.applyAutoConnect = (on) => {
@@ -14887,6 +15118,10 @@ function buildPanel() {
       }
       clearInterval(_wfPoll); // stop per-workflow change polling on unmount
       document.removeEventListener("mousedown", onDocPointerDown, true);
+      document.removeEventListener("keydown", onDocEscape, true);
+      root.removeEventListener("mouseover", onRootOver);
+      root.removeEventListener("mouseout", onRootOut);
+      clearTimeout(revealResetTimer);
       document.removeEventListener("keydown", onInterruptKeydown, true);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       try {
