@@ -97,15 +97,61 @@ export const ACTIVE_BASE_MODELS = new Set([
  * reach "Flux.1 D". Order matters — without it "d flux" would match too, and
  * ranking suffers when every token floats free.
  */
+/**
+ * Split into words, keeping a version number whole: "wan 2.5" -&gt; ["wan","2.5"],
+ * "Flux.2 D" -&gt; ["flux","2","d"]. The dot survives only BETWEEN DIGITS, which
+ * is what separates a version from ordinary punctuation — and it is what keeps
+ * "wan 2.5" off "Wan Video 2.2 TI2V-5B", where a naive split into ["wan","2","5"]
+ * happily matches the "2" of 2.2 and the "5" of 5B and offers the wrong model.
+ */
 export function tokenizeQuery(q) {
-  return String(q || "").toLowerCase().split(/[^a-z0-9]+/i).filter(Boolean);
+  return String(q ?? "").toLowerCase().match(/[0-9]+(?:\.[0-9]+)+|[a-z0-9]+/g) || [];
 }
 
-export function matchesBaseModel(name, tokens) {
-  if (!tokens.length) return true;
-  const words = String(name).toLowerCase().split(/[^a-z0-9]+/i).filter(Boolean);
+/** Everything that isn't alphanumeric, dropped — "z-image" and "Z Image" both
+ *  collapse onto "zimage", which is how they reach "ZImageTurbo". */
+function compactify(s) {
+  return String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+export function prepareQuery(q) {
+  const raw = String(q ?? "").trim();
+  return { raw, tokens: tokenizeQuery(raw), compact: compactify(raw) };
+}
+
+/**
+ * Match a base-model name against a typed query.
+ *
+ * Two matching strategies, because Civitai's names break each one alone:
+ *
+ * - **Ordered token prefixes** handle names with words in between. "wan 2.5"
+ *   has to cross "Video" to reach "Wan Video 2.5 T2V".
+ * - **Compacted substring** handles names that are jammed together. "z-image"
+ *   and "aura flow" have to reach "ZImageTurbo" and "AuraFlow", which are one
+ *   token each — no amount of token matching gets there, since the query has
+ *   two tokens and the name has one.
+ *
+ * Either one hitting is a match. Both are ordered, so "flux 2" still cannot
+ * reach "Flux.1 D" and "sd 3.5" cannot reach bare "SD 3" — matching the wrong
+ * version is worse than matching nothing, because it sends someone off to
+ * download a model that will not do what they asked.
+ */
+export function matchesBaseModel(name, query) {
+  const q = query && typeof query === "object" && "raw" in query
+    ? query
+    : prepareQuery(Array.isArray(query) ? query.join(" ") : query);
+
+  // An empty box means "no filter". But a query of "🔥" or "..." is NOT empty —
+  // it tokenizes to nothing, and treating that as no-filter would answer a
+  // nonsense search with all 96 models, which reads as if they all matched.
+  if (!q.raw) return true;
+  if (!q.tokens.length && !q.compact) return false;
+
+  if (q.compact && compactify(name).includes(q.compact)) return true;
+
+  const words = tokenizeQuery(name);
   let at = 0;
-  for (const t of tokens) {
+  for (const t of q.tokens) {
     const hit = words.findIndex((w, i) => i >= at && w.startsWith(t));
     if (hit < 0) return false;
     at = hit + 1;
