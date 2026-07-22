@@ -6,6 +6,62 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-22
+
+### Added
+- **Micro-apps — turn a workflow into a one-click app.** A WeChat-mini-program-style
+  layer over ComfyUI APP mode, with panel and mobile parity. App bundles live under
+  `user/comfyui-mcp-panel/apps/` (manifest + UI workflow + API prompt snapshot +
+  thumbnail); the run engine patches `<nodeId>.<widget>` into the snapshot and queues
+  it. Includes the AppBuilder (APP-mode config import, heuristic input/output
+  selection, dependency scan), a My Apps grid with a generated run form and output
+  gallery, **Run on RunPod** (dry-patch, then enqueue on the connected pod with
+  pinned deps pushed first), and a Publish / Explore registry with trending, new,
+  stars, search and install. (#114)
+- **Hover a truncated label to read the rest of it.** An ellipsis hides the END of a
+  string, which is usually the identifying part — a quantisation suffix, an Ollama
+  size tag, a date. Hovering a clipped element now scrolls it to its end and hovering
+  away restores the truncation. Delegated from the panel root, so it covers popover
+  rows, the model chip, download and attachment names, pending text and card text —
+  including elements rendered later. Honours `prefers-reduced-motion`. (#120)
+
+### Fixed
+- **The settings dropdown no longer closes itself.** Connection status drove the
+  visibility of that box, and the bridge re-emits `connected` on every handshake
+  frame — so opening the menu while connected got it slammed shut by the next tick,
+  putting **Disconnect out of reach entirely**. Status no longer owns that
+  visibility: the dropdown opens and closes on user intent only (trigger, click-away,
+  Escape, or API Keys). Escape-to-close is new — the box never had a keyboard
+  dismissal. (#116, #117)
+- **The model chip stays on one line at any panel width.** It had no wrapping rules,
+  so a squeezed chip broke across two lines and pushed the composer row taller. The
+  model name now ellipsises instead, keeping a floor so it never truncates to
+  nothing, with the effort suffix yielding first and the full value on the title of
+  the chip. (#118)
+- **A reboot behind a proxy is no longer reported as a failure.** When ComfyUI is
+  reached through a reverse proxy or Cloudflare tunnel, killing the origin returns a
+  gateway error rather than dropping the connection, so a reboot that actually FIRED
+  was misreported and remote agents concluded "restart failed". 502/503/504 are now
+  classified exactly like the connection-drop success branch. (#119)
+
+### Security
+- **Bridge auth tokens are no longer printed to the panel log.** Three status lines
+  echoed the full bridge URL including `token=<64 hex chars>`; those lines get
+  screenshotted into bug reports and pasted into chats. Only the first four
+  characters now survive. The same change wraps long status lines
+  (`overflow-wrap: anywhere`), since an unbreakable 64-char token was also forcing a
+  horizontal scrollbar across the whole log. (#121)
+
+### Internal
+- **CI actually runs again.** The Bandit step had been failing since the micro-apps
+  merge, and because it runs before the YARA and pyproject checks, those three were
+  being **skipped** on every run — the registry-parity gate was not being enforced,
+  not merely reported red. Both findings were false positives: a test used a literal
+  `/tmp` path (now `tempfile.gettempdir()`, which also fixes the test on Windows),
+  and a wildcard-bind comparison that exists precisely to rewrite the bind to
+  loopback is marked `# nosec` with a reason. (#122)
+
+
 ## [0.10.0] - 2026-07-22
 
 ### Added
