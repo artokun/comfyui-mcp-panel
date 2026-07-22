@@ -18,6 +18,9 @@ const DEFAULT_MAX_MESSAGES = 5000;
 const LOCAL_SHADOW_THREADS = 20;
 const LOCAL_SHADOW_MESSAGES = 200;
 const IDB_OPEN_TIMEOUT_MS = 2000;
+const DEFAULT_MAX_TOMBSTONES = 512;
+const DEFAULT_MAX_METADATA_OPS = 512;
+const BROADCAST_CHANNEL_NAME = "comfyui-mcp-panel-history-v3";
 const THREAD_FIELDS = [
   "sessionId",
   "todos",
@@ -98,7 +101,12 @@ function normalizeMessage(message, threadId, ordinal) {
     updatedAt,
     `legacy-${stableHash(`${threadId}:${id}:${canonicalJson(message)}`)}`,
   );
-  return { ...message, id, createdAt, updatedAt, revision };
+  const createdRevision = normalizeRevision(
+    message.createdRevision,
+    createdAt,
+    `created-${stableHash(`${threadId}:${id}`)}`,
+  );
+  return { ...message, id, createdAt, updatedAt, revision, createdRevision };
 }
 
 function normalizeMessages(threadId, messages) {
@@ -179,6 +187,15 @@ function normalizeMetadataOperations(operations, values, fallbackUpdatedAt) {
   return normalized;
 }
 
+function sanitizedMetadataValues(values, operations) {
+  const sanitized = safeMap();
+  for (const [key, value] of Object.entries(values || {})) sanitized[key] = value;
+  for (const [key, operation] of Object.entries(operations || {})) {
+    if (!normalizeMetadataOperation(operation, null, 0)) delete sanitized[key];
+  }
+  return sanitized;
+}
+
 function mergeMetadataOperationMaps(current, incoming) {
   const merged = safeMap();
   for (const [key, operation] of Object.entries(current || {})) merged[key] = operation;
@@ -196,10 +213,12 @@ function mergeMetadataOperationMaps(current, incoming) {
   return merged;
 }
 
-function materializeMetadataOperations(operations) {
+function materializeMetadataOperations(operations, base = null) {
   const values = safeMap();
+  for (const [key, value] of Object.entries(base || {})) values[key] = value;
   for (const [key, operation] of Object.entries(operations || {})) {
-    if (operation?.deleted !== true && operation?.value != null) values[key] = operation.value;
+    if (operation?.deleted === true || operation?.value == null) delete values[key];
+    else values[key] = operation.value;
   }
   return values;
 }
@@ -274,6 +293,67 @@ function materializeThreadFields(thread, fieldOps) {
   return materialized;
 }
 
+function normalizeCheckpoint(meta) {
+  const generation = Number(meta?.checkpoint?.generation);
+  const revision = normalizeRevision(meta?.checkpoint?.revision);
+  return {
+    generation: Number.isSafeInteger(generation) && generation > 0 ? generation : 0,
+    revision,
+  };
+}
+
+function operationRevision(operation) {
+  return normalizeRevision(operation?.revision || operation);
+}
+
+function boundedEntries(map, limit, revisionOf) {
+  const entries = Object.entries(map || {});
+  if (entries.length <= limit) return [map, []];
+  entries.sort((left, right) =>
+    compareRevisions(revisionOf(left[1]), revisionOf(right[1])) || left[0].localeCompare(right[0]),
+  );
+  const dropped = entries.slice(0, entries.length - limit);
+  const kept = safeMap();
+  for (const [key, value] of entries.slice(-limit)) kept[key] = value;
+  return [kept, dropped];
+}
+
+function compactSnapshot(snapshot, { maxTombstones, maxMetadataOps }) {
+  const tombstoneLimit = Math.max(1, Math.floor(Number(maxTombstones) || DEFAULT_MAX_TOMBSTONES));
+  const operationLimit = Math.max(1, Math.floor(Number(maxMetadataOps) || DEFAULT_MAX_METADATA_OPS));
+  const meta = { ...(snapshot.meta || {}) };
+  const droppedRevisions = [];
+  let changed = false;
+  [meta.deletedThreads, changed] = (() => {
+    const [kept, dropped] = boundedEntries(meta.deletedThreads, tombstoneLimit, finiteTs);
+    for (const [, value] of dropped) droppedRevisions.push(normalizeRevision(null, value, "tombstone"));
+    return [kept, changed || dropped.length > 0];
+  })();
+  for (const name of ["activeOps", "aliasOps"]) {
+    const [kept, dropped] = boundedEntries(meta[name], operationLimit, operationRevision);
+    meta[name] = kept;
+    for (const [, value] of dropped) droppedRevisions.push(operationRevision(value));
+    if (dropped.length) changed = true;
+  }
+  const threads = snapshot.threads.map((thread) => {
+    const [deletedMessages, dropped] = boundedEntries(thread.deletedMessages, tombstoneLimit, finiteTs);
+    for (const [, value] of dropped) droppedRevisions.push(normalizeRevision(null, value, "tombstone"));
+    if (dropped.length) changed = true;
+    return dropped.length ? { ...thread, deletedMessages } : thread;
+  });
+  if (!changed) return { ...snapshot, threads, meta };
+  const previous = normalizeCheckpoint(meta);
+  let revision = previous.revision;
+  for (const candidate of droppedRevisions) {
+    if (compareRevisions(candidate, revision) > 0) revision = candidate;
+  }
+  meta.checkpoint = {
+    generation: previous.generation + 1,
+    revision: revision || normalizeRevision(null, Date.now(), "checkpoint"),
+  };
+  return { ...snapshot, threads, meta };
+}
+
 export function normalizeThread(raw) {
   if (!raw || typeof raw !== "object" || typeof raw.id !== "string" || !raw.id) return null;
   const deletedMessages = mergeTimestampMaps(raw.deletedMessages);
@@ -293,6 +373,11 @@ export function normalizeThread(raw) {
     id: raw.id,
     schemaVersion: CHAT_HISTORY_SCHEMA,
     createdAt,
+    createdRevision: normalizeRevision(
+      raw.createdRevision,
+      createdAt,
+      `created-${stableHash(raw.id)}`,
+    ),
     updatedAt,
     ts: updatedAt,
     msgs,
@@ -395,6 +480,41 @@ function mergeThreadMessages(older, newer) {
 /** Merge snapshots by thread id; the newest record wins without dropping fields
  *  added by an older copy (useful while migrating localStorage -> IndexedDB). */
 export function mergeHistorySnapshots(...snapshots) {
+  const usableSnapshots = snapshots.filter((snap) => snap && typeof snap === "object");
+  let checkpointGeneration = 0;
+  let checkpointRevision = null;
+  for (const snap of usableSnapshots) {
+    const checkpoint = normalizeCheckpoint(snap.meta);
+    if (checkpoint.generation > checkpointGeneration) {
+      checkpointGeneration = checkpoint.generation;
+      checkpointRevision = checkpoint.revision;
+    } else if (
+      checkpoint.generation === checkpointGeneration &&
+      compareRevisions(checkpoint.revision, checkpointRevision) > 0
+    ) {
+      checkpointRevision = checkpoint.revision;
+    }
+  }
+  const checkpointThreadIds = new Set();
+  const checkpointMessageIds = new Map();
+  const checkpointActive = safeMap();
+  const checkpointAliases = safeMap();
+  if (checkpointGeneration) {
+    for (const snap of usableSnapshots) {
+      if (normalizeCheckpoint(snap.meta).generation !== checkpointGeneration) continue;
+      for (const [key, value] of Object.entries(snap.meta?.activeByScope || {})) checkpointActive[key] = value;
+      for (const [key, value] of Object.entries(snap.meta?.workflowAliases || {})) checkpointAliases[key] = value;
+      for (const rawThread of Array.isArray(snap.threads) ? snap.threads : []) {
+        if (!rawThread || typeof rawThread.id !== "string" || !rawThread.id) continue;
+        checkpointThreadIds.add(rawThread.id);
+        const ids = checkpointMessageIds.get(rawThread.id) || new Set();
+        for (const message of Array.isArray(rawThread.msgs) ? rawThread.msgs : []) {
+          if (typeof message?.id === "string" && message.id) ids.add(message.id);
+        }
+        checkpointMessageIds.set(rawThread.id, ids);
+      }
+    }
+  }
   const byId = new Map();
   let meta = {};
   let activeOps = {};
@@ -402,32 +522,66 @@ export function mergeHistorySnapshots(...snapshots) {
   let deletedThreads = {};
   let metaUpdatedAt = 0;
   let snapshotUpdatedAt = 0;
-  for (const snap of snapshots) {
-    if (!snap || typeof snap !== "object") continue;
+  for (const snap of usableSnapshots) {
+    const snapCheckpoint = normalizeCheckpoint(snap.meta);
+    const beforeCheckpoint = snapCheckpoint.generation < checkpointGeneration;
     const incomingUpdatedAt = Math.max(finiteTs(snap.updatedAt), finiteTs(snap.meta?.updatedAt));
     snapshotUpdatedAt = Math.max(snapshotUpdatedAt, incomingUpdatedAt);
     if (snap.meta && typeof snap.meta === "object") {
+      const snapMeta = {
+        ...snap.meta,
+        activeByScope: sanitizedMetadataValues(snap.meta.activeByScope, snap.meta.activeOps),
+        workflowAliases: sanitizedMetadataValues(snap.meta.workflowAliases, snap.meta.aliasOps),
+      };
       const incomingNewer = incomingUpdatedAt >= metaUpdatedAt;
-      const older = incomingNewer ? meta : snap.meta;
-      const newer = incomingNewer ? snap.meta : meta;
+      const older = incomingNewer ? meta : snapMeta;
+      const newer = incomingNewer ? snapMeta : meta;
       meta = {
         ...older,
         ...newer,
       };
       activeOps = mergeMetadataOperationMaps(
         activeOps,
-        normalizeMetadataOperations(snap.meta.activeOps, snap.meta.activeByScope, incomingUpdatedAt || 1),
+        Object.fromEntries(Object.entries(normalizeMetadataOperations(
+          snap.meta.activeOps,
+          beforeCheckpoint ? null : snapMeta.activeByScope,
+          incomingUpdatedAt || 1,
+        )).filter(([, operation]) =>
+          !beforeCheckpoint || compareRevisions(operation.revision, checkpointRevision) > 0)),
       );
       aliasOps = mergeMetadataOperationMaps(
         aliasOps,
-        normalizeMetadataOperations(snap.meta.aliasOps, snap.meta.workflowAliases, incomingUpdatedAt || 1),
+        Object.fromEntries(Object.entries(normalizeMetadataOperations(
+          snap.meta.aliasOps,
+          beforeCheckpoint ? null : snapMeta.workflowAliases,
+          incomingUpdatedAt || 1,
+        )).filter(([, operation]) =>
+          !beforeCheckpoint || compareRevisions(operation.revision, checkpointRevision) > 0)),
       );
-      deletedThreads = mergeTimestampMaps(deletedThreads, snap.meta.deletedThreads);
+      const acceptedDeletedThreads = beforeCheckpoint
+        ? Object.fromEntries(Object.entries(snap.meta.deletedThreads || {}).filter(([, value]) =>
+          finiteTs(value) > finiteTs(checkpointRevision?.updatedAt)))
+        : snap.meta.deletedThreads;
+      deletedThreads = mergeTimestampMaps(deletedThreads, acceptedDeletedThreads);
       metaUpdatedAt = Math.max(metaUpdatedAt, incomingUpdatedAt);
     }
     for (const candidate of Array.isArray(snap.threads) ? snap.threads : []) {
       const next = normalizeThread(candidate);
       if (!next) continue;
+      if (
+        beforeCheckpoint &&
+        !checkpointThreadIds.has(next.id) &&
+        compareRevisions(next.createdRevision, checkpointRevision) <= 0
+      ) continue;
+      if (beforeCheckpoint && checkpointMessageIds.has(next.id)) {
+        const baselineIds = checkpointMessageIds.get(next.id);
+        next.msgs = next.msgs.filter((message) =>
+          baselineIds.has(message.id) || compareRevisions(message.createdRevision, checkpointRevision) > 0);
+        next.deletedMessages = mergeTimestampMaps(Object.fromEntries(
+          Object.entries(next.deletedMessages).filter(([, value]) =>
+            finiteTs(value) > finiteTs(checkpointRevision?.updatedAt)),
+        ));
+      }
       const prev = byId.get(next.id);
       if (!prev) {
         byId.set(next.id, next);
@@ -469,11 +623,20 @@ export function mergeHistorySnapshots(...snapshots) {
       workflowAliases: {},
       deletedThreads: {},
       ...meta,
+      checkpoint: checkpointGeneration
+        ? { generation: checkpointGeneration, revision: checkpointRevision }
+        : undefined,
       updatedAt: metaUpdatedAt,
       activeOps,
       aliasOps,
-      activeByScope: materializeMetadataOperations(activeOps),
-      workflowAliases: materializeMetadataOperations(aliasOps),
+      activeByScope: materializeMetadataOperations(
+        activeOps,
+        checkpointGeneration ? checkpointActive : meta.activeByScope,
+      ),
+      workflowAliases: materializeMetadataOperations(
+        aliasOps,
+        checkpointGeneration ? checkpointAliases : meta.workflowAliases,
+      ),
       deletedThreads,
     },
   };
@@ -558,9 +721,12 @@ async function idbMergeWrite(indexedDb, snapshot, limits) {
       const tx = db.transaction("snapshots", "readwrite");
       const store = tx.objectStore("snapshots");
       const get = store.get(CHAT_HISTORY_STATE_KEY);
-      let merged = boundedSnapshot(snapshot, limits);
+      let merged = compactSnapshot(boundedSnapshot(snapshot, limits), limits);
       get.onsuccess = () => {
-        merged = boundedSnapshot(mergeHistorySnapshots(get.result, snapshot), limits);
+        merged = compactSnapshot(
+          boundedSnapshot(mergeHistorySnapshots(get.result, snapshot), limits),
+          limits,
+        );
         store.put(merged, CHAT_HISTORY_STATE_KEY);
       };
       get.onerror = () => store.put(merged, CHAT_HISTORY_STATE_KEY);
@@ -582,11 +748,26 @@ export class ChatHistoryStore {
     this.snapshotKey = options.snapshotKey ?? CHAT_HISTORY_LOCAL_SNAPSHOT_KEY;
     this.maxThreads = options.maxThreads ?? DEFAULT_MAX_THREADS;
     this.maxMessages = options.maxMessages ?? DEFAULT_MAX_MESSAGES;
+    this.maxTombstones = options.maxTombstones ?? DEFAULT_MAX_TOMBSTONES;
+    this.maxMetadataOps = options.maxMetadataOps ?? DEFAULT_MAX_METADATA_OPS;
+    this.onShadowError = typeof options.onShadowError === "function" ? options.onShadowError : null;
+    this.lastShadowWriteOk = null;
+    this.lastShadowError = null;
     this.writerId = options.writerId || globalThis.crypto?.randomUUID?.() || `writer-${Math.random().toString(16).slice(2)}`;
     this._revisionSequence = 0;
     this._lastRevisionAt = 0;
     this._writePromise = Promise.resolve(null);
     this._lastCommitted = null;
+    const channelFactory = options.broadcastChannelFactory || (
+      globalThis.window === globalThis && typeof globalThis.BroadcastChannel === "function"
+        ? (name) => new globalThis.BroadcastChannel(name)
+        : null
+    );
+    try {
+      this._broadcastChannel = channelFactory?.(BROADCAST_CHANNEL_NAME) || null;
+    } catch {
+      this._broadcastChannel = null;
+    }
   }
 
   nextRevision(updatedAt = Date.now()) {
@@ -669,6 +850,40 @@ export class ChatHistoryStore {
     return merged;
   }
 
+  async readCanonical() {
+    return mergeHistorySnapshots(this.readLocal(), await idbRead(this.indexedDb));
+  }
+
+  _writeLocalSnapshot(snapshot, protectedThreadIds) {
+    const shadow = retainBoundedThreads(
+      snapshot.threads,
+      LOCAL_SHADOW_THREADS,
+      protectedThreadIds,
+    ).map((thread) => ({ ...thread, msgs: thread.msgs.slice(-LOCAL_SHADOW_MESSAGES) }));
+    const localSnapshot = { ...snapshot, threads: shadow };
+    try {
+      this.storage?.setItem(this.snapshotKey, JSON.stringify(localSnapshot));
+      this.lastShadowWriteOk = true;
+      this.lastShadowError = null;
+    } catch (error) {
+      this.lastShadowWriteOk = false;
+      this.lastShadowError = error;
+      this.onShadowError?.(error);
+      return false;
+    }
+    try {
+      this.storage?.setItem(this.threadsKey, JSON.stringify(shadow));
+    } catch {
+      // The atomic shadow is already committed.
+    }
+    try {
+      this.storage?.setItem(this.metaKey, JSON.stringify(snapshot.meta));
+    } catch {
+      // The atomic shadow is already committed.
+    }
+    return true;
+  }
+
   persist(threads, meta = {}, options = {}) {
     const snapshot = mergeHistorySnapshots({ threads, meta });
     const protectedThreadIds = [
@@ -678,37 +893,11 @@ export class ChatHistoryStore {
     const limits = {
       maxThreads: options.maxThreads ?? this.maxThreads,
       maxMessages: options.maxMessages ?? this.maxMessages,
+      maxTombstones: options.maxTombstones ?? this.maxTombstones,
+      maxMetadataOps: options.maxMetadataOps ?? this.maxMetadataOps,
       protectedThreadIds,
     };
-    const shadow = retainBoundedThreads(
-      snapshot.threads,
-      LOCAL_SHADOW_THREADS,
-      protectedThreadIds,
-    )
-      .map((thread) => ({ ...thread, msgs: thread.msgs.slice(-LOCAL_SHADOW_MESSAGES) }));
-    const localSnapshot = { ...snapshot, threads: shadow };
-    let atomicWritten = false;
-    try {
-      this.storage?.setItem(this.snapshotKey, JSON.stringify(localSnapshot));
-      atomicWritten = true;
-    } catch {
-      // IndexedDB remains canonical when localStorage is unavailable or full.
-    }
-    if (atomicWritten) {
-      // Keep the pre-v2 keys as best-effort compatibility mirrors. Current code
-      // always reads the atomic snapshot first, so a partial legacy write cannot
-      // create a mixed generation for this implementation.
-      try {
-        this.storage?.setItem(this.threadsKey, JSON.stringify(shadow));
-      } catch {
-        // The atomic shadow is already committed.
-      }
-      try {
-        this.storage?.setItem(this.metaKey, JSON.stringify(snapshot.meta));
-      } catch {
-        // The atomic shadow is already committed.
-      }
-    }
+    this._writeLocalSnapshot(snapshot, protectedThreadIds);
     // Start the atomic merge immediately. Chat records are low-frequency and a
     // debounce creates an avoidable shutdown window in which the local shadow
     // exists but IndexedDB has not started its transaction yet.
@@ -716,7 +905,15 @@ export class ChatHistoryStore {
       .catch(() => null)
       .then(() => idbMergeWrite(this.indexedDb, snapshot, limits))
       .then((merged) => {
-        if (merged) this._lastCommitted = merged;
+        if (merged) {
+          this._lastCommitted = merged;
+          this._writeLocalSnapshot(merged, protectedThreadIds);
+          try {
+            this._broadcastChannel?.postMessage({ type: "history-changed", writerId: this.writerId });
+          } catch {
+            // localStorage events remain available when the channel is blocked.
+          }
+        }
         return merged;
       });
     return snapshot;
@@ -726,7 +923,7 @@ export class ChatHistoryStore {
    *  in the other tabs, making it a cheap cross-tab invalidation channel while
    *  IndexedDB remains the full, atomically merged source of truth. */
   subscribe(listener, eventTarget = globalThis) {
-    if (!eventTarget?.addEventListener || typeof listener !== "function") return () => {};
+    if (typeof listener !== "function") return () => {};
     const onStorage = (event) => {
       if (
         event?.key !== this.snapshotKey &&
@@ -735,8 +932,16 @@ export class ChatHistoryStore {
       ) return;
       listener(this.readLocal());
     };
-    eventTarget.addEventListener("storage", onStorage);
-    return () => eventTarget.removeEventListener?.("storage", onStorage);
+    const onBroadcast = (event) => {
+      if (event?.data?.type !== "history-changed" || event.data.writerId === this.writerId) return;
+      void this.readCanonical().then(listener);
+    };
+    eventTarget?.addEventListener?.("storage", onStorage);
+    this._broadcastChannel?.addEventListener?.("message", onBroadcast);
+    return () => {
+      eventTarget?.removeEventListener?.("storage", onStorage);
+      this._broadcastChannel?.removeEventListener?.("message", onBroadcast);
+    };
   }
 
   async flush() {

@@ -83,6 +83,30 @@ function createFakeIndexedDb(initialState = null, { blockedThenSuccess = false }
   }
 }
 
+function createBroadcastHub() {
+  const channels = new Set()
+  return {
+    factory: () => {
+      const listeners = new Set()
+      const channel = {
+        addEventListener: (type, listener) => type === 'message' && listeners.add(listener),
+        removeEventListener: (type, listener) => type === 'message' && listeners.delete(listener),
+        postMessage: (data) => {
+          for (const peer of channels) {
+            if (peer === channel) continue
+            queueMicrotask(() => peer.dispatch(data))
+          }
+        },
+        dispatch: (data) => {
+          for (const listener of listeners) listener({ data })
+        }
+      }
+      channels.add(channel)
+      return channel
+    }
+  }
+}
+
 test('migrates legacy messages to stable schema identities without losing content', () => {
   const thread = normalizeThread({ id: 'legacy', ts: 123, msgs: [{ role: 'user', text: 'hello' }] })
   const sameMigration = normalizeThread({ id: 'legacy', ts: 123, msgs: [{ role: 'user', text: 'hello' }] })
@@ -786,4 +810,110 @@ test('notifies another tab when the local history shadow changes', () => {
   assert.equal(received.threads[0].id, 'from-other-tab')
   unsubscribe()
   assert.equal(listeners.size, 0)
+})
+
+test('bounds checkpointed operations, rejects compacted stale resurrection, and broadcasts quota failures', async () => {
+  const indexedDb = createFakeIndexedDb()
+  const hub = createBroadcastHub()
+  const shadowErrors = []
+  const quotaStorage = createMemoryStorage({ throwOnSet: CHAT_HISTORY_LOCAL_SNAPSHOT_KEY })
+  const writer = new ChatHistoryStore({
+    storage: quotaStorage,
+    indexedDb,
+    writerId: 'quota-writer',
+    maxTombstones: 3,
+    maxMetadataOps: 3,
+    broadcastChannelFactory: hub.factory,
+    onShadowError: (error) => shadowErrors.push(error.message)
+  })
+  const receiver = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb,
+    writerId: 'receiver',
+    maxTombstones: 3,
+    maxMetadataOps: 3,
+    broadcastChannelFactory: hub.factory
+  })
+  let invalidated = null
+  const unsubscribe = receiver.subscribe((snapshot) => { invalidated = snapshot }, null)
+  const deletedMessages = Object.fromEntries(
+    Array.from({ length: 10 }, (_, index) => [`m${index}`, 1_000 + index])
+  )
+  const deletedThreads = Object.fromEntries(
+    Array.from({ length: 10 }, (_, index) => [`t${index}`, 1_000 + index])
+  )
+  const aliasOps = Object.fromEntries(Array.from({ length: 10 }, (_, index) => [
+    `workflows/deleted-${index}.json`,
+    {
+      value: null,
+      deleted: true,
+      updatedAt: 1_000 + index,
+      revision: { updatedAt: 1_000 + index, writerId: 'quota-writer', sequence: index + 1 }
+    }
+  ]))
+  const activeOps = Object.fromEntries(Array.from({ length: 10 }, (_, index) => [
+    `workflow:deleted-${index}`,
+    {
+      value: null,
+      deleted: true,
+      updatedAt: 1_100 + index,
+      revision: { updatedAt: 1_100 + index, writerId: 'quota-writer', sequence: index + 20 }
+    }
+  ]))
+
+  writer.persist([{
+    id: 'live',
+    workflowKey: 'panel:global',
+    createdAt: 100,
+    updatedAt: 1_200,
+    msgs: [],
+    deletedMessages
+  }], { updatedAt: 1_200, deletedThreads, aliasOps, activeOps })
+  await writer.flush()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+
+  const compacted = indexedDb.readState()
+  assert.equal(writer.lastShadowWriteOk, false)
+  assert.match(shadowErrors[0], /blocked write/)
+  assert.ok(invalidated?.meta?.checkpoint?.generation > 0)
+  assert.ok(Object.keys(compacted.meta.deletedThreads).length <= 3)
+  assert.ok(Object.keys(compacted.meta.aliasOps).length <= 3)
+  assert.ok(Object.keys(compacted.meta.activeOps).length <= 3)
+  assert.ok(Object.keys(compacted.threads[0].deletedMessages).length <= 3)
+
+  const stale = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb,
+    writerId: 'stale-writer',
+    maxTombstones: 3,
+    maxMetadataOps: 3
+  })
+  stale.persist([
+    {
+      id: 'live',
+      workflowKey: 'panel:global',
+      createdAt: 100,
+      updatedAt: 2_000,
+      msgs: [{ id: 'm0', role: 'user', text: 'must stay deleted', createdAt: 100 }]
+    },
+    { id: 't0', workflowKey: 'panel:global', createdAt: 100, updatedAt: 2_000, msgs: [] }
+  ], {
+    updatedAt: 2_000,
+    workflowAliases: { 'workflows/deleted-0.json': 'must-stay-deleted' },
+    aliasOps: {
+      'workflows/deleted-0.json': {
+        value: 'must-stay-deleted',
+        deleted: false,
+        updatedAt: 100,
+        revision: { updatedAt: 100, writerId: 'stale-writer', sequence: 1 }
+      }
+    }
+  })
+  await stale.flush()
+  const reloaded = await receiver.readCanonical()
+
+  assert.equal(reloaded.threads.some((thread) => thread.id === 't0'), false)
+  assert.equal(reloaded.threads.find((thread) => thread.id === 'live').msgs.some((message) => message.id === 'm0'), false)
+  assert.equal(Object.hasOwn(reloaded.meta.workflowAliases, 'workflows/deleted-0.json'), false)
+  unsubscribe()
 })
