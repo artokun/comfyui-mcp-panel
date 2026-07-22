@@ -2,13 +2,13 @@ name = "cmcp-apps-registry"
 main = "src/worker.js"
 compatibility_date = "2026-01-01"
 
-# D1 database — create with:  wrangler d1 create cmcp-apps-registry
-# then paste the database_id below and run:
-#   wrangler d1 execute cmcp-apps-registry --file migrations/0001_init.sql
+# D1 database — created 2026-07-22 (region WNAM).
+# Migration applied via:
+#   wrangler d1 execute cmcp-apps-registry --remote --file migrations/0001_init.sql
 [[d1_databases]]
 binding = "DB"
 database_name = "cmcp-apps-registry"
-database_id = "REPLACE_ME"
+database_id = "f5d56b93-fc8a-4bb1-9098-9c52abcc0acb"
 
 # R2 bucket — create with:  wrangler r2 bucket create cmcp-app-bundles
 [[r2_buckets]]
