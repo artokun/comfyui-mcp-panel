@@ -5,10 +5,27 @@
  */
 import { test, expect } from './fixtures/panelTest'
 import { PanelPage } from './fixtures/PanelPage'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 
 const SESSION_KEY = 'comfyui-mcp.panel.sessionId'
 const CURRENT_THREAD_KEY = 'comfyui-mcp.panel.currentThreadId'
 const LOCAL_HISTORY_SNAPSHOT_KEY = 'comfyui-mcp.panel.historySnapshot'
+const PANEL_SOURCE = readFileSync(resolve('web/js/comfyui-mcp-panel.js'), 'utf8')
+const HISTORY_STORE_SOURCE = readFileSync(
+  resolve('web/js/lib/chat-history-store.js'),
+  'utf8'
+)
+
+test.beforeEach(async ({ page }) => {
+  // The target ComfyUI server may have been started before this worktree was
+  // created. Route the two reviewed modules from the checked-out source so the
+  // browser gate always exercises this commit rather than a stale server copy.
+  await page.route('**/extensions/comfyui-mcp-panel/comfyui-mcp-panel.js*', (route) =>
+    route.fulfill({ contentType: 'text/javascript', body: PANEL_SOURCE }))
+  await page.route('**/extensions/comfyui-mcp-panel/lib/chat-history-store.js*', (route) =>
+    route.fulfill({ contentType: 'text/javascript', body: HISTORY_STORE_SOURCE }))
+})
 
 async function indexedThreadCount(page: import('@playwright/test').Page): Promise<number> {
   return page.evaluate(async () => {
