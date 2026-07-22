@@ -179,6 +179,7 @@ function injectCss() {
     border: 1px solid var(--p-content-border-color,#3f3f46);
     box-shadow: 0 8px 24px rgba(0,0,0,.45); }
   .cmcp-cv-dd.open .cmcp-cv-ddpanel { display: flex; }
+  .cmcp-cv-ddlist, .cmcp-cv-ddgroupwrap { display: flex; flex-direction: column; gap: .1rem; }
   .cmcp-cv-ddgroup { font-size: .64rem; text-transform: uppercase; letter-spacing: .05em;
     color: var(--p-text-muted-color,#a1a1aa); padding: .35rem .5rem .15rem; }
   .cmcp-cv-ddopt { display: flex; align-items: center; gap: .45rem; padding: .3rem .5rem;
@@ -1213,14 +1214,11 @@ export function openCivitaiModal(ctx, opts = {}) {
       bmSearch.setAttribute("aria-controls", ddId);
       bmSearch.setAttribute("aria-autocomplete", "list");
       bmSearch.autocomplete = "off";
+      // bmPanel is the visual popup container. The listbox lives INSIDE it and
+      // owns only option/group children (a listbox may not own the group-label
+      // divs, the empty notice, or the Clear button) — those siblings sit in the
+      // panel, outside the listbox, which is rebuilt each render.
       const bmPanel = el("div", "cmcp-cv-ddpanel");
-      bmPanel.id = ddId;
-      // The options already claim role="option"; without a listbox parent that
-      // is invalid, and without aria-activedescendant the arrow keys move a
-      // purely VISUAL cursor — a screen reader announces nothing at all.
-      bmPanel.setAttribute("role", "listbox");
-      bmPanel.setAttribute("aria-multiselectable", "true");
-      bmPanel.setAttribute("aria-label", "Base model");
       let bmOpts = [];   // the option buttons currently rendered, in view order
       let bmActive = -1; // keyboard cursor
 
@@ -1259,6 +1257,15 @@ export function openCivitaiModal(ctx, opts = {}) {
         const query = prepareQuery(bmSearch.value);
         bmPanel.innerHTML = "";
         bmOpts = [];
+        // The listbox owns ONLY options (grouped under role="group"); it is
+        // rebuilt each render but keeps the stable ddId so aria-controls and
+        // aria-activedescendant keep resolving.
+        const listbox = el("div", "cmcp-cv-ddlist");
+        listbox.id = ddId;
+        listbox.setAttribute("role", "listbox");
+        listbox.setAttribute("aria-multiselectable", "true");
+        listbox.setAttribute("aria-label", "Base model");
+        bmPanel.appendChild(listbox);
         const hits = BASE_MODELS.filter((x) => matchesBaseModel(x, query));
         const groups = [
           ["Current", hits.filter((x) => ACTIVE_BASE_MODELS.has(x))],
@@ -1266,7 +1273,14 @@ export function openCivitaiModal(ctx, opts = {}) {
         ];
         for (const [label, items] of groups) {
           if (!items.length) continue;
-          bmPanel.appendChild(el("div", "cmcp-cv-ddgroup", label));
+          // A listbox may only own option/group children — so each labelled
+          // section is a role="group" (named via aria-label), not a bare div.
+          const group = el("div", "cmcp-cv-ddgroupwrap");
+          group.setAttribute("role", "group");
+          group.setAttribute("aria-label", label);
+          const heading = el("div", "cmcp-cv-ddgroup", label);
+          heading.setAttribute("aria-hidden", "true"); // group's aria-label already names it
+          group.appendChild(heading);
           for (const b of items) {
             const on = f.baseModels.includes(b);
             const opt = el("button", "cmcp-cv-ddopt" + (on ? " on" : ""));
@@ -1286,11 +1300,13 @@ export function openCivitaiModal(ctx, opts = {}) {
               e.preventDefault();
               toggleModel(b);
             });
-            bmPanel.appendChild(opt);
+            group.appendChild(opt);
             bmOpts.push(opt);
           }
+          listbox.appendChild(group);
         }
         if (!bmOpts.length) {
+          // Not an option — belongs in the panel, outside the listbox.
           bmPanel.appendChild(el("div", "cmcp-cv-ddempty", `No base model matches “${bmSearch.value.trim()}”.`));
         }
         // Selected-count + clear, matching what ComfyUI's own multi-select
