@@ -88,6 +88,22 @@ function injectCss() {
     .cmcp-tr-jobrow .meta { font-size:.75rem; opacity:.6; }
     .cmcp-tr-preflight { display:flex; gap:1rem; flex-wrap:wrap; font-size:.78rem; }
     .cmcp-tr-preflight span b { font-weight:600; }
+    /* Agent-driven "glow" — shared class name with the CivitAI modal; generic here
+       so it applies to step chips + field wrappers, not just cards. */
+    .cmcp-agent-glow { outline: 2px solid var(--p-green-400,#4ade80);
+      box-shadow: 0 0 0 2px var(--p-green-400,#4ade80), 0 0 16px 2px rgba(74,222,128,.6);
+      border-radius: 8px; animation: cmcp-glow 1.4s ease-in-out infinite; }
+    @keyframes cmcp-glow { 50% { box-shadow: 0 0 0 3px var(--p-green-400,#4ade80),
+      0 0 24px 6px rgba(74,222,128,.9); } }
+    /* Agent-driven side-dock (parity with the CivitAI modal): anchor to the
+       sidebar's right edge, drop the backdrop, keep chat interactive. */
+    .cmcp-cv-overlay.cmcp-docked { display: block; padding: 0; background: transparent;
+      pointer-events: none; }
+    .cmcp-cv-overlay.cmcp-docked .cmcp-tr-modal { position: fixed; pointer-events: auto;
+      width: auto; max-width: none; max-height: none; border-radius: 0;
+      box-shadow: -8px 0 32px rgba(0,0,0,.45); transform: translateX(24px); opacity: 0;
+      transition: transform .28s ease, opacity .28s ease; }
+    .cmcp-cv-overlay.cmcp-docked.cmcp-dock-in .cmcp-tr-modal { transform: translateX(0); opacity: 1; }
   `;
   document.head.appendChild(style);
 }
@@ -214,7 +230,7 @@ function fmtAgo(iso) {
 
 const STATUS_BADGE = { running: "ok", queued: "warn", completed: "ok", failed: "err", cancelled: "warn" };
 
-export function openTrainingModal(ctx = {}) {
+export function openTrainingModal(ctx = {}, opts = {}) {
   injectCss();
   const overlay = document.createElement("div");
   overlay.className = "cmcp-cv-overlay";
@@ -224,18 +240,33 @@ export function openTrainingModal(ctx = {}) {
   let pollTimer = null;
   let pollGen = 0;
   let closed = false;
+  let _onDockResize = null;
+  let _dockDispose = null;
+  let _onEscape = null;
+  // train_doctor generation: every doctor request captures the current value;
+  // only the NEWEST completion may write wiz.podInfo, so a slow stale doctor
+  // can't resurrect a pod that a later check found gone (codex finding).
+  let doctorGen = 0;
   const stopPolling = () => {
     pollGen++; // invalidate any in-flight poll response
     if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   };
   const close = () => {
+    if (closed) return; // idempotent
     closed = true;
     stopPolling();
+    if (_onEscape) { document.removeEventListener("keydown", _onEscape); _onEscape = null; }
+    if (_onDockResize) { window.removeEventListener("resize", _onDockResize); _onDockResize = null; }
+    if (_dockDispose) { try { _dockDispose(); } catch { /* best effort */ } _dockDispose = null; }
     wiz.launchGen++; // a pending launch's continuation self-discards (codex finding)
     wiz.uploadGen++;
     overlay.remove();
+    try { opts.onClose?.(); } catch { /* host bookkeeping only */ }
   };
   overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
+  // Base modal had no Escape handler (audit item 9) — add one through close().
+  _onEscape = (e) => { if (e.key === "Escape") { e.stopPropagation(); close(); } };
+  document.addEventListener("keydown", _onEscape);
 
   // Wizard state (one character-LoRA job being configured/tracked). Held at
   // modal scope so it survives view navigation: launching/uploadsPending MUST
@@ -260,6 +291,10 @@ export function openTrainingModal(ctx = {}) {
      *  mutate the new run's state (codex findings). */
     launchGen: 0,
     uploadGen: 0,
+    // Agent-drive: the ordered set of data-ref targets to glow. The wizard
+    // rebuilds its body on every show(view), so this OUTLIVES a render and is
+    // re-applied after each one (see reapplyHighlight).
+    highlightRefs: [],
   };
   /** Reset the configuration fields for a genuinely NEW run (Jobs → "New
    *  character LoRA") — a fresh run must not silently reuse the previous
@@ -307,13 +342,80 @@ export function openTrainingModal(ctx = {}) {
   overlay.appendChild(modal);
   document.body.appendChild(overlay);
 
+  // ── docked mode (agent-driven, parity with the CivitAI modal) ───────────────
+  // Geometry from the host (ctx.dockGeometry owns pane/canvas measurement +
+  // left/right detection); three states detached(hide)/centered/docked. See the
+  // CivitAI modal for the full rationale.
+  applyDock.centered = false;
+  function applyDock() {
+    if (!opts.dock) { setCentered(); return; }
+    const geo = _dockGeometry();
+    if (geo?.status === "detached") { overlay.style.display = "none"; return; }
+    overlay.style.display = "";
+    if (geo?.status === "docked" && window.innerWidth >= 900) {
+      overlay.classList.add("cmcp-docked");
+      modal.style.left = `${Math.round(geo.left)}px`;
+      modal.style.top = `${Math.round(geo.top)}px`;
+      modal.style.right = `${Math.round(geo.right)}px`;
+      modal.style.bottom = `${Math.round(geo.bottom)}px`;
+      modal.style.height = "auto";
+      applyDock.centered = false;
+    } else { setCentered(); }
+  }
+  function setCentered() {
+    overlay.classList.remove("cmcp-docked");
+    overlay.style.display = "";
+    modal.style.left = modal.style.right = modal.style.top = modal.style.bottom = modal.style.height = "";
+    applyDock.centered = true;
+  }
+  function _dockGeometry() {
+    if (typeof ctx.dockGeometry === "function") {
+      try { const g = ctx.dockGeometry(); if (g) return g; } catch { /* fall through */ }
+    }
+    try {
+      const root = ctx.root;
+      if (root && !root.isConnected) return { status: "detached" };
+      const pane = root?.closest?.(".side-bar-panel") || root?.closest?.("[class*='sidebar']") || root;
+      const pr = pane?.getBoundingClientRect?.();
+      if (!pr || pr.width < 1 || pr.height < 1) return { status: "centered" };
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const paneOnLeft = (pr.left + pr.right) / 2 < vw / 2;
+      const left = paneOnLeft ? Math.max(0, pr.right) : 0;
+      const right = paneOnLeft ? 0 : Math.max(0, vw - pr.left);
+      if (vw - left - right < 320) return { status: "centered" };
+      return { status: "docked", left, right, top: Math.max(0, pr.top), bottom: Math.max(0, vh - pr.bottom) };
+    } catch { return { status: "centered" }; }
+  }
+  if (opts.dock) {
+    applyDock();
+    if (typeof ctx.watchDock === "function") {
+      try { _dockDispose = ctx.watchDock(applyDock); } catch { _dockDispose = null; }
+    }
+    if (!_dockDispose) { _onDockResize = () => applyDock(); window.addEventListener("resize", _onDockResize); }
+    requestAnimationFrame(() => overlay.classList.add("cmcp-dock-in"));
+  }
+
+  // Stable step namespace (audit item 7): refs survive the body rebuild every
+  // show(view) because they're regenerated deterministically per render.
+  const STEP_REFS = ["dataset", "label", "launch", "monitor"];
   function setSteps(names, current) {
     stepsBar.textContent = "";
     stepsBar.style.display = names ? "" : "none";
     (names || []).forEach((n, i) => {
       const s = el("span", i === current ? "on" : null, n);
+      if (STEP_REFS[i]) s.dataset.ref = `step:${STEP_REFS[i]}`;
       stepsBar.appendChild(s);
     });
+  }
+
+  /** Re-apply the agent's ordered highlight set after a render (the body is
+   *  rebuilt every show(view), so refs must be re-stamped THEN re-glowed). */
+  function reapplyHighlight() {
+    for (const c of modal.querySelectorAll(".cmcp-agent-glow")) c.classList.remove("cmcp-agent-glow");
+    for (const ref of wiz.highlightRefs) {
+      const node = modal.querySelector(`[data-ref="${CSS.escape(String(ref))}"]`);
+      if (node) node.classList.add("cmcp-agent-glow");
+    }
   }
 
   let currentView = "flows";
@@ -328,6 +430,9 @@ export function openTrainingModal(ctx = {}) {
     else if (view === "wizard-2") { setSteps(["1 · Dataset", "2 · Label", "3 · Launch", "4 · Monitor"], 1); renderLabel(); }
     else if (view === "wizard-3") { setSteps(["1 · Dataset", "2 · Label", "3 · Launch", "4 · Monitor"], 2); renderLaunch(); }
     else if (view === "wizard-4") { setSteps(["1 · Dataset", "2 · Label", "3 · Launch", "4 · Monitor"], 3); renderMonitor(); }
+    // Re-glow after the new view's DOM exists (renderers can be async but stamp
+    // their static refs synchronously; async content re-applies on its own).
+    reapplyHighlight();
   }
 
   jobsBtn.onclick = () => show("jobs");
@@ -409,6 +514,7 @@ export function openTrainingModal(ctx = {}) {
     nameRow.append(el("label", null, "Dataset name"));
     const nameInput = el("input", null);
     nameInput.type = "text";
+    nameInput.dataset.ref = "field:dataset_name";
     nameInput.placeholder = "e.g. aria_character";
     nameInput.value = wiz.datasetName;
     nameInput.oninput = () => { wiz.datasetName = nameInput.value; syncNext(); };
@@ -418,6 +524,7 @@ export function openTrainingModal(ctx = {}) {
     trigRow.append(el("label", null, "Trigger word"));
     const trigInput = el("input", null);
     trigInput.type = "text";
+    trigInput.dataset.ref = "field:trigger";
     trigInput.placeholder = "e.g. ohwx — a rare token, not a real word";
     trigInput.value = wiz.trigger;
     trigInput.oninput = () => { wiz.trigger = trigInput.value.trim(); };
@@ -673,6 +780,12 @@ export function openTrainingModal(ctx = {}) {
       grid.textContent = "";
       wiz.images.forEach((img) => {
         const item = el("div", "cmcp-tr-labelitem");
+        // Stable per-image ref (audit item 7): key off subfolder+filename (the
+        // selection identity), NOT the array index (which shifts on removal) and
+        // NOT filename alone (a/foo.png and b/foo.png would collide — codex).
+        const fn = img.ref?.filename;
+        const imgId = fn ? (img.ref?.subfolder ? `${img.ref.subfolder}/${fn}` : fn) : null;
+        if (imgId) item.dataset.ref = `caption:${imgId}`;
         const thumb = el("div", "thumb");
         thumb.style.backgroundImage = `url("${img.thumb}")`;
         const ta = document.createElement("textarea");
@@ -726,6 +839,7 @@ export function openTrainingModal(ctx = {}) {
       l.style.minWidth = "auto";
       const inp = el("input", null);
       inp.type = "text";
+      inp.dataset.ref = `param:${key}`;
       inp.style.flex = "0 1 110px";
       const saved = wiz.customParams?.[key];
       inp.value = saved !== undefined
@@ -791,7 +905,11 @@ export function openTrainingModal(ctx = {}) {
     const gpuLine = el("p", "cmcp-tr-hint");
     sec.append(gpuLine);
     fetchGpuLabel(ctx.api).then((gpu) => { if (gpu) gpuLine.textContent = `Local GPU: ${gpu}`; });
+    const myDoctorGen = ++doctorGen;
     callJson(ctx, "train_doctor", {}, { timeout: 180000 }).then((d) => {
+      // A newer doctor (e.g. driveSetTarget's preflight) superseded this one —
+      // don't let a stale completion overwrite wiz.podInfo or rebuild the switch.
+      if (myDoctorGen !== doctorGen) return;
       const dd = d.data || {};
       wiz.podInfo = dd.pod && dd.pod.status === "RUNNING" ? dd.pod : null;
       // Re-derive target from the FRESH doctor result: if no pod (or its SSH
@@ -804,7 +922,9 @@ export function openTrainingModal(ctx = {}) {
         const targetSeg = el("div", "cmcp-tr-seg");
         targetSeg.style.margin = "0";
         const localBtn = el("button", wiz.target !== "pod" ? "active" : null, "Local (docker)");
+        localBtn.dataset.ref = "target:local";
         const podBtn = el("button", wiz.target === "pod" ? "active" : null, `Pod (${pod.name || pod.id}${pod.gpu ? ` · ${pod.gpu}` : ""})`);
+        podBtn.dataset.ref = "target:pod";
         if (!pod.ssh) podBtn.title = "pod has no working SSH endpoint";
         localBtn.onclick = () => { wiz.target = "local"; localBtn.classList.add("active"); podBtn.classList.remove("active"); syncLaunchEnabled(); syncSummary(); };
         podBtn.onclick = () => {
@@ -845,6 +965,10 @@ export function openTrainingModal(ctx = {}) {
         preflightState = "local";
       }
       syncLaunchEnabled();
+      // The target buttons (target:pod / target:local) render HERE, after the
+      // synchronous show() reapply — re-glow so an agent highlight of a target
+      // that predates the doctor still lands.
+      reapplyHighlight();
     }).catch((e) => {
       // Doctor unreachable/unavailable: train_start does its own docker+image
       // preflight server-side and reports honestly, so don't block on this.
@@ -872,7 +996,14 @@ export function openTrainingModal(ctx = {}) {
       // Pod target: docker/gpu/image are irrelevant — the gate is a working pod
       // SSH endpoint (plus the custom-param check).
       const podReady = wiz.target === "pod" && !!wiz.podInfo?.ssh;
+      // Dataset readiness shares the ONE _readiness() source with the gather Next
+      // button + gotoStep, so an agent set_field that invalidates the name (or
+      // otherwise breaks readiness) while already ON this step disables Launch
+      // instead of leaving the gate bypassed (codex finding).
+      const r = _readiness();
+      const datasetReady = r.backendCapable && r.nameOk && r.hasImages && r.uploadsSettled;
       launch.disabled = wiz.launching
+        || !datasetReady
         || (wiz.target === "pod" ? !podReady : preflightState !== "local" && preflightState !== "failed")
         || !syncCustomValidity();
       if (wiz.launching) launch.textContent = "Launching…";
@@ -1142,6 +1273,128 @@ export function openTrainingModal(ctx = {}) {
     }
   }
 
+  // ── agent-driven handle (parity with the CivitAI modal) ────────────────────
+  // Drives the existing wizard state; every method returns a small plain object
+  // or throws. set_field is an explicit per-field ALLOWLIST — never an arbitrary
+  // wiz[name]= assignment (audit item 6/11). No dynamic exec (YARA safe).
+  const _STEP_VIEW = { 1: "wizard-1", 2: "wizard-2", 3: "wizard-3", 4: "wizard-4" };
+  function _assertOpen() { if (closed) throw new Error("training wizard not open"); }
+  function _stepNum() {
+    const m = /^wizard-(\d)$/.exec(currentView);
+    return m ? Number(m[1]) : null;
+  }
+  /** Readiness signals — the SINGLE source both getState() reports and
+   *  gotoStep() enforces (so the agent's view of "can I advance?" matches what
+   *  the wizard actually gates on, mirroring the gather Next button). */
+  function _readiness() {
+    return {
+      backendCapable, backendChecked,
+      nameOk: !!sanitizeNameClient(wiz.datasetName),
+      uploadsSettled: wiz.uploadsPending === 0,
+      hasImages: wiz.images.length >= 1,
+      hasJob: !!wiz.jobId,
+    };
+  }
+  function driveGetState() {
+    return {
+      isOpen: !closed, view: currentView, step: _stepNum(), target: wiz.target,
+      datasetName: wiz.datasetName, trigger: wiz.trigger,
+      preset: wiz.preset, images: wiz.images.length,
+      launching: !!wiz.launching, jobId: wiz.jobId || null,
+      podAvailable: !!(wiz.podInfo && wiz.podInfo.ssh),
+      docked: !applyDock.centered && overlay.classList.contains("cmcp-docked"),
+      highlighted: wiz.highlightRefs.slice(),
+      readiness: _readiness(),
+    };
+  }
+  function driveSetField(name, value) {
+    _assertOpen();
+    switch (name) {
+      case "datasetName": wiz.datasetName = String(value ?? ""); break;
+      case "trigger": wiz.trigger = String(value ?? "").trim(); break;
+      case "preset":
+        if (!PRESETS[value]) throw new Error(`unknown preset "${value}"`);
+        wiz.preset = value;
+        if (PRESETS[value].params) wiz.params = { ...PRESETS[value].params };
+        break;
+      case "target": return driveSetTarget(value);
+      default: throw new Error(`unknown field "${name}" (allowed: datasetName, trigger, preset, target)`);
+    }
+    // Reflect the change in the live inputs by re-rendering the current step.
+    if (currentView) show(currentView);
+    return { ok: true, name, value: wiz[name] };
+  }
+  async function driveGotoStep(step) {
+    _assertOpen();
+    const view = _STEP_VIEW[Number(step)] || (step === "flows" || step === "jobs" ? step : null);
+    if (!view) throw new Error(`invalid step "${step}" (expected 1-4, "flows", or "jobs")`);
+    const n = Number(step);
+    // Entering a wizard step ENFORCES the same prerequisites as the Next button
+    // (codex finding: gotoStep previously bypassed them). Label/Launch/Monitor
+    // all require the dataset to be ready; Monitor also needs a live job.
+    if (n >= 2 && n <= 4) {
+      const capable = await checkBackendCapable();
+      _assertOpen();
+      if (!capable) throw new Error("trainer backend unavailable — the orchestrator doesn't expose the train_* tools");
+      const r = _readiness();
+      if (!r.nameOk) throw new Error("set a valid dataset name before advancing");
+      if (!r.hasImages) throw new Error("add at least one image before advancing");
+      if (!r.uploadsSettled) throw new Error(`wait for ${wiz.uploadsPending} upload(s) to settle before advancing`);
+    }
+    if (n === 4 && !wiz.jobId) throw new Error("no training job to monitor — launch one first");
+    show(view);
+    return { view: currentView, step: _stepNum() };
+  }
+  async function driveSetTarget(target) {
+    _assertOpen();
+    if (target !== "local" && target !== "pod") throw new Error(`invalid target "${target}" (expected "local" or "pod")`);
+    if (target === "pod") {
+      // Await a CURRENT preflight — never trust a possibly-stale wiz.podInfo. A
+      // versioned doctor means only the newest completion may decide (codex).
+      const myDoctorGen = ++doctorGen;
+      let dd;
+      try { dd = (await callJson(ctx, "train_doctor", {}, { timeout: 180000 })).data || {}; }
+      catch (e) { throw new Error("pod preflight failed: " + (e.message || e)); }
+      _assertOpen();
+      // If a NEWER doctor superseded ours mid-flight, our result is stale and
+      // must NOT accept — reading the shared wiz.podInfo here could let an older
+      // SSH-ready value pass a preflight whose own (no-pod) result should fail.
+      // Reject and let the agent retry against the current check (codex finding).
+      if (myDoctorGen !== doctorGen) throw new Error("pod preflight was superseded — retry");
+      wiz.podInfo = dd.pod && dd.pod.status === "RUNNING" ? dd.pod : null;
+      if (!(wiz.podInfo && wiz.podInfo.ssh)) throw new Error("no connected pod with a working SSH endpoint");
+    }
+    wiz.target = target;
+    if (currentView === "wizard-3") show("wizard-3"); // re-derive Launch enablement
+    return { target: wiz.target };
+  }
+  /** Highlight data-ref nodes (REPLACEMENT semantics). Persists the ordered set
+   *  in wiz so it re-applies after each render (the body rebuilds per view). */
+  function driveHighlight(refs) {
+    _assertOpen();
+    wiz.highlightRefs = (Array.isArray(refs) ? refs : (refs != null ? [refs] : [])).map((x) => String(x));
+    reapplyHighlight();
+    let first = null, hit = 0;
+    const missing = [];
+    for (const ref of wiz.highlightRefs) {
+      const node = modal.querySelector(`[data-ref="${CSS.escape(ref)}"]`);
+      if (node) { if (!first) first = node; hit++; }
+      else missing.push(ref);
+    }
+    if (first) first.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    return { highlighted: hit, missing };
+  }
+  function driveClearHighlight() {
+    _assertOpen();
+    wiz.highlightRefs = [];
+    for (const c of modal.querySelectorAll(".cmcp-agent-glow")) c.classList.remove("cmcp-agent-glow");
+    return { ok: true };
+  }
+
   show("flows");
-  return { close };
+  return {
+    close, getState: driveGetState, setField: driveSetField,
+    gotoStep: driveGotoStep, setTarget: driveSetTarget,
+    highlight: driveHighlight, clearHighlight: driveClearHighlight,
+  };
 }

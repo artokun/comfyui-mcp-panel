@@ -6640,6 +6640,78 @@ function animateToBoundsPadded(bounds, padPct, duration) {
   canvas.setDirty(true, true);
 }
 
+/** Docked-modal geometry for the agent-driven CivitAI/Training modals. Measures
+ *  the Agent pane and the ComfyUI canvas, then anchors into the canvas area
+ *  OPPOSITE the pane (the pane can be docked LEFT or RIGHT). Three states:
+ *   - detached → the Agent root left the DOM (sidebar-tab switch); the caller
+ *     hides the orphaned body-mounted modal.
+ *   - centered → no usable anchor (missing/zero-size/too-small).
+ *   - docked   → { left, right, top, bottom } insets for position:fixed.
+ *  Mirrors the pane/canvas detection in animateToBoundsPadded (:6613-6624). */
+function panelDockGeometry() {
+  try {
+    const root = activePanelRoot;
+    if (!root || !root.isConnected) return { status: "detached" };
+    const pane = root.closest(".side-bar-panel") || root.closest("[class*='sidebar']") || root;
+    const pr = pane.getBoundingClientRect();
+    if (!pr || pr.width < 1 || pr.height < 1) return { status: "centered" };
+    const vw = window.innerWidth, vh = window.innerHeight;
+    let cr = null;
+    try { cr = getGraphCtx().canvas?.canvas?.getBoundingClientRect?.() || null; } catch { cr = null; }
+    const canvasRect = (cr && cr.width > 1)
+      ? cr : { left: 0, right: vw, top: 0, bottom: vh, width: vw };
+    const paneOnLeft = (pr.left + pr.right) / 2 < (canvasRect.left + canvasRect.right) / 2;
+    let left, right;
+    if (paneOnLeft) {
+      left = Math.max(pr.right, canvasRect.left);
+      right = Math.max(0, vw - canvasRect.right);
+    } else {
+      left = Math.max(0, canvasRect.left);
+      right = Math.max(0, vw - Math.min(pr.left, canvasRect.right));
+    }
+    const top = Math.max(0, Math.min(pr.top, canvasRect.top));
+    const bottom = Math.max(0, vh - Math.max(pr.bottom, canvasRect.bottom));
+    if (vw - left - right < 320 || vh - top - bottom < 200) return { status: "centered" };
+    return { status: "docked", left, right, top, bottom };
+  } catch {
+    return { status: "centered" };
+  }
+}
+
+/** Watch everything that can move the dock anchor and invoke `cb`: window
+ *  resize, PrimeVue splitter drags (ResizeObserver on pane + canvas — these do
+ *  NOT fire window-resize), and sidebar-tab switches (the Agent root detaches
+ *  without a resize; observe the rail's class changes). Returns a disposer that
+ *  the modal's single close() path calls. */
+function panelWatchDock(cb) {
+  const disposers = [];
+  const fire = () => { try { cb(); } catch { /* modal owns error handling */ } };
+  window.addEventListener("resize", fire);
+  disposers.push(() => window.removeEventListener("resize", fire));
+  try {
+    const root = activePanelRoot;
+    const pane = root?.closest?.(".side-bar-panel") || root?.closest?.("[class*='sidebar']") || root;
+    let cEl = null;
+    try { cEl = getGraphCtx().canvas?.canvas || null; } catch { cEl = null; }
+    if (typeof ResizeObserver === "function") {
+      const ro = new ResizeObserver(fire);
+      try { if (pane) ro.observe(pane); } catch { /* detached */ }
+      try { if (cEl) ro.observe(cEl); } catch { /* not ready */ }
+      disposers.push(() => { try { ro.disconnect(); } catch { /* already gone */ } });
+    }
+    // Sidebar-tab switch detaches the Agent root with no resize event — watch the
+    // rail's selected-button class so the dock re-evaluates (→ hide on detach,
+    // re-dock on return).
+    const toolbar = document.querySelector(".side-tool-bar-container");
+    if (toolbar && typeof MutationObserver === "function") {
+      const mo = new MutationObserver(fire);
+      mo.observe(toolbar, { subtree: true, attributes: true, attributeFilter: ["class"] });
+      disposers.push(() => { try { mo.disconnect(); } catch { /* already gone */ } });
+    }
+  } catch { /* best-effort; window-resize still wired */ }
+  return () => { for (const d of disposers) { try { d(); } catch { /* ignore */ } } };
+}
+
 /** Smoothly dart to the node(s) with the given ids (skips ones not found). */
 function focusNodesById(ids) {
   let graph;
@@ -6706,7 +6778,7 @@ const RECONNECT_MAX_MS = 15000;
 let AGENT_MUTED = (() => { try { return localStorage.getItem("cmcp.muteAgents") === "1"; } catch { return false; } })();
 let AGENT_BLIND = (() => { try { return localStorage.getItem("cmcp.blindAgents") === "1"; } catch { return false; } })();
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -6914,6 +6986,23 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
             // the user can visually pick a resource.
             if (!onOpenCivitai) throw new Error("This panel build can't open the CivitAI browser.");
             result = onOpenCivitai(msg) || { ok: true };
+          } else if (
+            msg.cmd === "civitai_results" || msg.cmd === "civitai_highlight" ||
+            msg.cmd === "civitai_clear_highlight" || msg.cmd === "civitai_switch_tab" ||
+            msg.cmd === "civitai_search" || msg.cmd === "civitai_open_lightbox"
+          ) {
+            // Agent DRIVES the already-open CivitAI browser. onCivitaiCmd throws
+            // an honest "civitai browser not open" when the modal isn't live, which
+            // becomes a retryable tool error.
+            if (!onCivitaiCmd) throw new Error("This panel build can't drive the CivitAI browser.");
+            result = await onCivitaiCmd(msg);
+          } else if (
+            msg.cmd === "open_training" || msg.cmd === "training_get_state" ||
+            msg.cmd === "training_set_field" || msg.cmd === "training_goto_step" ||
+            msg.cmd === "training_set_target" || msg.cmd === "training_highlight"
+          ) {
+            if (!onTrainingCmd) throw new Error("This panel build can't drive the training wizard.");
+            result = await onTrainingCmd(msg);
           } else if (msg.cmd === "ui_render") {
             // A2UI card render. Validation errors THROW so the agent gets a
             // retryable tool error instead of a broken card.
@@ -6953,8 +7042,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
         }
         // ask_user / request_secret paint their OWN cards and their replies carry
         // user input (a choice, or a SECRET) — never echo them as an activity card
-        // (and never record them). Other commands get the normal activity card.
-        if (msg.cmd !== "ask_user" && msg.cmd !== "request_secret" && msg.cmd !== "set_todo" && msg.cmd !== "show_media" && msg.cmd !== "open_civitai" && msg.cmd !== "ui_render" && msg.cmd !== "ui_update") {
+        // (and never record them). The CivitAI/training DRIVE cmds animate the
+        // modal itself, so they'd only clutter the chat as activity cards. Other
+        // commands get the normal activity card.
+        const SILENT_CMDS = new Set([
+          "ask_user", "request_secret", "set_todo", "show_media", "open_civitai",
+          "ui_render", "ui_update",
+          "civitai_results", "civitai_highlight", "civitai_clear_highlight",
+          "civitai_switch_tab", "civitai_search", "civitai_open_lightbox",
+          "open_training", "training_get_state", "training_set_field",
+          "training_goto_step", "training_set_target", "training_highlight",
+        ]);
+        if (!SILENT_CMDS.has(msg.cmd)) {
           onCommand?.(msg.cmd, msg, reply);
         }
         return;
@@ -9873,6 +9972,9 @@ function buildPanel() {
     return {
       api,
       root,
+      // Agent-drive side-dock geometry/observation (pane may be docked L or R).
+      dockGeometry: panelDockGeometry,
+      watchDock: panelWatchDock,
       callTool: (t, a, o) => liveBridgeClient?.callTool(t, a, o),
       sendUserMessage: (t, c, i) => liveBridgeClient?.sendUserMessage(t, c, i),
       uploadBlobToInput,
@@ -9906,7 +10008,14 @@ function buildPanel() {
   }
   function openCivitai(opts) {
     try { _civitaiHandle?.close(); } catch {}
-    _civitaiHandle = openCivitaiModal(civitaiCtx(), opts || {});
+    const handle = openCivitaiModal(civitaiCtx(), {
+      ...(opts || {}),
+      // Null the stored handle whenever THIS modal closes (✕, reopen, backdrop)
+      // so post-open drive cmds get an honest "not open" error instead of
+      // operating on a detached grid.
+      onClose: () => { if (_civitaiHandle === handle) _civitaiHandle = null; },
+    });
+    _civitaiHandle = handle;
     return _civitaiHandle;
   }
   const civitaiBtn = toolbarBtn("pi-circle", "Civitai");
@@ -9938,18 +10047,30 @@ function buildPanel() {
   // local trainer (ai-toolkit in a GPU container, train_* tools over call_tool).
   // Same modal treatment as the CivitAI browser; dumbbell mark via currentColor.
   let _trainingHandle = null;
+  function trainingCtx() {
+    return {
+      api,
+      root,
+      dockGeometry: panelDockGeometry,
+      watchDock: panelWatchDock,
+      callTool: (t, a, o) => liveBridgeClient?.callTool(t, a, o),
+      uploadBlobToInput,
+    };
+  }
+  // Reused by both the toolbar button (centered) and the agent bridge (docked).
+  function openTraining(opts) {
+    try { _trainingHandle?.close(); } catch {}
+    const handle = openTrainingModal(trainingCtx(), {
+      ...(opts || {}),
+      onClose: () => { if (_trainingHandle === handle) _trainingHandle = null; },
+    });
+    _trainingHandle = handle;
+    return _trainingHandle;
+  }
   const trainingBtn = toolbarBtn("pi-circle", "Training");
   trainingBtn.querySelector(".pi").remove();
   trainingBtn.title = "LoRA Training — train a character LoRA locally on FLUX.1-dev (style/edit/slider/video coming in P2).";
-  trainingBtn.addEventListener("click", () => {
-    try { _trainingHandle?.close(); } catch {}
-    _trainingHandle = openTrainingModal({
-      api,
-      root,
-      callTool: (t, a, o) => liveBridgeClient?.callTool(t, a, o),
-      uploadBlobToInput,
-    });
-  });
+  trainingBtn.addEventListener("click", () => openTraining());
   {
     const svgNs = "http://www.w3.org/2000/svg";
     const svg = document.createElementNS(svgNs, "svg");
@@ -11613,8 +11734,44 @@ function buildPanel() {
         tab: msg.tab,
         filters: msg.filters,
         browsingLevels: msg.browsingLevels,
+        // Agent-opened → side-dock by default (chat stays visible) unless the
+        // agent explicitly passes dock:false.
+        dock: msg.dock !== false,
       });
       return { ok: true };
+    },
+    // The agent DRIVES the already-open CivitAI browser (switch tab, re-search,
+    // read results, glow-highlight). Routes to the live modal handle; throws an
+    // honest "not open" error the agent can retry after re-opening.
+    onCivitaiCmd(msg) {
+      const h = _civitaiHandle;
+      if (!h) throw new Error("civitai browser not open");
+      switch (msg.cmd) {
+        case "civitai_results": return h.getResults({ limit: msg.limit });
+        case "civitai_highlight": return h.highlight(Array.isArray(msg.ids) ? msg.ids : (msg.ids != null ? [msg.ids] : []), { kind: msg.kind });
+        case "civitai_clear_highlight": return h.clearHighlight();
+        case "civitai_switch_tab": return h.switchTab(msg.tab);
+        case "civitai_search": return h.search({ query: msg.query, filters: msg.filters, browsingLevels: msg.browsingLevels });
+        case "civitai_open_lightbox": return h.openLightbox(msg.id);
+        default: throw new Error(`unknown civitai cmd "${msg.cmd}"`);
+      }
+    },
+    // The agent opens/drives the training wizard (parity with CivitAI).
+    onTrainingCmd(msg) {
+      if (msg.cmd === "open_training") {
+        openTraining({ dock: msg.dock !== false });
+        return { ok: true };
+      }
+      const h = _trainingHandle;
+      if (!h) throw new Error("training wizard not open");
+      switch (msg.cmd) {
+        case "training_get_state": return h.getState();
+        case "training_set_field": return h.setField(msg.name, msg.value);
+        case "training_goto_step": return h.gotoStep(msg.step);
+        case "training_set_target": return h.setTarget(msg.target);
+        case "training_highlight": return h.highlight(Array.isArray(msg.refs) ? msg.refs : (msg.refs != null ? [msg.refs] : []));
+        default: throw new Error(`unknown training cmd "${msg.cmd}"`);
+      }
     },
     // The agent called panel_ui_render / panel_ui_update — A2UI cards in the chat.
     onUiRender(msg) {

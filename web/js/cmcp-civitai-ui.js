@@ -206,6 +206,24 @@ function injectCss() {
   @media (max-width: 760px) { .cmcp-cv-lb { flex-direction: column; }
     .cmcp-cv-lb-side { flex: 0 0 45%; max-width: none; border-left: none;
       border-top: 1px solid var(--p-content-border-color,#3f3f46); } }
+  /* Agent-driven "glow" — the modal highlights the cards the agent points at. */
+  .cmcp-cv-card.cmcp-agent-glow { outline: 2px solid var(--p-green-400,#4ade80);
+    box-shadow: 0 0 0 2px var(--p-green-400,#4ade80), 0 0 16px 2px rgba(74,222,128,.6);
+    animation: cmcp-glow 1.4s ease-in-out infinite; }
+  @keyframes cmcp-glow { 50% { box-shadow: 0 0 0 3px var(--p-green-400,#4ade80),
+    0 0 24px 6px rgba(74,222,128,.9); } }
+  /* Agent-driven side-dock: anchor to the sidebar's right edge (measured in JS),
+     drop the dim backdrop and let clicks pass THROUGH the overlay so chat stays
+     interactive; only the modal card itself catches pointer events. Slide-in via
+     the first translateX transition in the codebase. Kept below the lightbox
+     (z 10002) so the lightbox still overlays. */
+  .cmcp-cv-overlay.cmcp-docked { display: block; padding: 0; background: transparent;
+    pointer-events: none; }
+  .cmcp-cv-overlay.cmcp-docked .cmcp-civitai-modal { position: fixed; pointer-events: auto;
+    width: auto; max-width: none; height: auto; max-height: none; border-radius: 0;
+    box-shadow: -8px 0 32px rgba(0,0,0,.45); transform: translateX(24px); opacity: 0;
+    transition: transform .28s ease, opacity .28s ease; }
+  .cmcp-cv-overlay.cmcp-docked.cmcp-dock-in .cmcp-civitai-modal { transform: translateX(0); opacity: 1; }
   `;
   const style = document.createElement("style");
   style.textContent = css;
@@ -233,7 +251,37 @@ export function graphDirtyForConfirm(ctx) {
   }
 }
 
-/** Open (or focus) the CivitAI modal. opts = {query, tab, filters, browsingLevels}. */
+/** Serialize result rows — `state.items` (media) or `state.models` (models) —
+ *  to the agent's `civitai_results` contract shape: id, kind, title, creator,
+ *  baseModel/type, stats, prompt, and media URL(s). Metadata + URLs ONLY — never
+ *  image bytes (the agent reasons from text; the human clicks to view). Pure and
+ *  exported for unit tests. `limit` is clamped to [1, 200]. */
+export const CIVITAI_PROMPT_CAP = 600; // chars — bound the agent's token budget
+function _capPrompt(p) {
+  if (typeof p !== "string" || !p) return p || null;
+  return p.length > CIVITAI_PROMPT_CAP ? p.slice(0, CIVITAI_PROMPT_CAP) + "…" : p;
+}
+export function serializeCivitaiResults(source, { model = false, limit = 20, loading = false } = {}) {
+  const n = Number(limit);
+  const lim = Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 200) : 20;
+  const rows = Array.isArray(source) ? source : [];
+  const items = rows.slice(0, lim).map((x) => model ? {
+    id: x.id, kind: "model", title: x.name || null, creator: x.creator || null,
+    baseModel: x.baseModel || null, type: x.type || null,
+    stats: { downloadCount: x.downloadCount ?? null, thumbsUp: x.thumbsUp ?? null },
+    prompt: null, urls: x.coverUrl ? [x.coverUrl] : [],
+  } : {
+    id: x.id, kind: x.type === "video" ? "video" : "image",
+    title: null, creator: x.author || null,
+    baseModel: x.modelName || null, type: x.type || null,
+    stats: { reactions: x.reactions ?? null },
+    prompt: _capPrompt(x.prompt), // bounded — token budget (audit item 3)
+    urls: [x.thumbnailUrl, x.fullUrl].filter(Boolean),
+  });
+  return { items, total: rows.length, loading: !!loading };
+}
+
+/** Open (or focus) the CivitAI modal. opts = {query, tab, filters, browsingLevels, dock, onClose}. */
 export function openCivitaiModal(ctx, opts = {}) {
   injectCss();
   const client = new CivitaiClient(ctx.api);
@@ -255,6 +303,17 @@ export function openCivitaiModal(ctx, opts = {}) {
     searchSeq: 0, // searching-overlay ownership (see reload)
     signedIn: false, localNames: new Set(), localLoaded: false,
     favType: "all", // favorites sub-filter: all | image | video
+    // Agent-drive: a render generation bumped on every reload/tab/filter so a
+    // highlight that survives the await knows whether it's stale, and the
+    // highlight target set (ids, in input order) that appendItems/appendModels
+    // re-applies as later pages stream in on scroll.
+    renderRev: 0,
+    highlightSet: new Set(),
+    highlightOrder: [],
+    // The in-flight first-page reload / current page load, so drive methods can
+    // truly await the modal settling.
+    activeReloadPromise: null,
+    activeLoadPromise: null,
   };
   if (Array.isArray(opts.browsingLevels) && opts.browsingLevels.length) {
     state.filters = { ...state.filters, browsingLevels: [...opts.browsingLevels] };
@@ -266,8 +325,49 @@ export function openCivitaiModal(ctx, opts = {}) {
   // narrow panel sidebar) ────────────────────────────────────────────────────
   const overlay = el("div", "cmcp-cv-overlay");
   const modal = el("div", "cmcp-modal cmcp-civitai-modal");
-  const close = () => overlay.remove();
+  // Self-invalidating handle: isOpen flips false on the FIRST close() and every
+  // drive method asserts it, so a stale reference held past close throws instead
+  // of poking a detached grid. onClose lets the host compare-and-null its stored
+  // handle. close() is idempotent and tears down EVERY async/listener owned here.
+  let isOpen = true;
+  let _onDockResize = null;   // window-resize fallback when ctx.watchDock is absent
+  let _dockDispose = null;    // ResizeObserver+listener disposer from ctx.watchDock
+  let _oauthPollIv = null;    // sign-in completion poll (accountFlow)
+  let _onEscape = null;       // document Escape → close
+  let _activeLightboxClose = null; // openViewer's teardown (owns its own doc keydown listener)
+  const close = () => {
+    if (!isOpen) return;      // idempotent
+    isOpen = false;
+    state.reqId++;            // invalidate any in-flight fetch (its guarded finally no-ops)
+    state.activeReloadPromise = null;
+    state.activeLoadPromise = null;
+    try { clearTimeout(searchTimer); } catch { /* not armed */ }
+    if (_oauthPollIv) { clearInterval(_oauthPollIv); _oauthPollIv = null; }
+    // The lightbox is body-mounted with its OWN document keydown listener — a
+    // programmatic reopen would otherwise strand it (+ its listener) above the
+    // new modal (codex finding). Tear it down through this one path.
+    if (_activeLightboxClose) { try { _activeLightboxClose(); } catch { /* already gone */ } _activeLightboxClose = null; }
+    try { closeSubModals(); } catch { /* already gone */ }
+    if (_onEscape) { document.removeEventListener("keydown", _onEscape); _onEscape = null; }
+    if (_onDockResize) { window.removeEventListener("resize", _onDockResize); _onDockResize = null; }
+    if (_dockDispose) { try { _dockDispose(); } catch { /* best effort */ } _dockDispose = null; }
+    overlay.remove();
+    try { opts.onClose?.(); } catch { /* host bookkeeping only */ }
+  };
+  // In docked mode the overlay itself is click-through (pointer-events:none), so a
+  // backdrop mousedown never fires here — the header ✕ / Escape are the dismissals.
+  // Centered mode keeps the backdrop-click-to-close affordance.
   overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
+  // Base modals had no Escape handler (audit item 9): add one that funnels through
+  // close(), but yield to a stacked lightbox / sub-modal so Escape peels the top.
+  _onEscape = (e) => {
+    if (e.key !== "Escape") return;
+    if (_subModals.size > 0) return;
+    if (document.querySelector(".cmcp-cv-lb")) return;
+    e.stopPropagation();
+    close();
+  };
+  document.addEventListener("keydown", _onEscape);
 
   // header
   const head = el("div", "cmcp-cv-head");
@@ -401,6 +501,73 @@ export function openCivitaiModal(ctx, opts = {}) {
   overlay.appendChild(modal);
   document.body.appendChild(overlay);
 
+  // ── docked mode (agent-driven) ─────────────────────────────────────────────
+  // Dock into the canvas area OPPOSITE the Agent pane (which may be docked left
+  // OR right) so chat stays visible + interactive. Geometry comes from the host
+  // (ctx.dockGeometry: it owns the ComfyUI pane/canvas measurement and the
+  // left/right detection), so this module stays ComfyUI-agnostic. Three states:
+  //  - detached  → the Agent tab was switched away; the body-mounted modal is
+  //    orphaned, so HIDE it (don't float centered over an unrelated screen).
+  //  - centered  → no eligible anchor (missing/zero-size/too-small/narrow window)
+  //  - docked    → anchored rect from the host.
+  applyDock.centered = false;
+  function applyDock() {
+    if (!opts.dock) { setCentered(); return; }
+    const geo = _dockGeometry();
+    if (geo?.status === "detached") {
+      overlay.style.display = "none";
+      return;
+    }
+    overlay.style.display = "";
+    if (geo?.status === "docked" && window.innerWidth >= 900) {
+      overlay.classList.add("cmcp-docked");
+      modal.style.left = `${Math.round(geo.left)}px`;
+      modal.style.top = `${Math.round(geo.top)}px`;
+      modal.style.right = `${Math.round(geo.right)}px`;
+      modal.style.bottom = `${Math.round(geo.bottom)}px`;
+      applyDock.centered = false;
+    } else {
+      setCentered();
+    }
+  }
+  function setCentered() {
+    overlay.classList.remove("cmcp-docked");
+    overlay.style.display = "";
+    modal.style.left = modal.style.right = modal.style.top = modal.style.bottom = "";
+    applyDock.centered = true;
+  }
+  /** Host geometry, with a self-contained fallback (single-pane / no host help /
+   *  tests): measure ctx.root's pane and dock to the wider viewport side. */
+  function _dockGeometry() {
+    if (typeof ctx.dockGeometry === "function") {
+      try { const g = ctx.dockGeometry(); if (g) return g; } catch { /* fall through */ }
+    }
+    try {
+      const root = ctx.root;
+      if (root && !root.isConnected) return { status: "detached" };
+      const pane = root?.closest?.(".side-bar-panel") || root?.closest?.("[class*='sidebar']") || root;
+      const pr = pane?.getBoundingClientRect?.();
+      if (!pr || pr.width < 1 || pr.height < 1) return { status: "centered" };
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const paneOnLeft = (pr.left + pr.right) / 2 < vw / 2;
+      const left = paneOnLeft ? Math.max(0, pr.right) : 0;
+      const right = paneOnLeft ? 0 : Math.max(0, vw - pr.left);
+      if (vw - left - right < 320) return { status: "centered" };
+      return { status: "docked", left, right, top: Math.max(0, pr.top), bottom: Math.max(0, vh - pr.bottom) };
+    } catch { return { status: "centered" }; }
+  }
+  if (opts.dock) {
+    applyDock();
+    // Watch pane + canvas (splitter drags don't fire window-resize) via the host;
+    // fall back to a bare window-resize listener when the host can't help.
+    if (typeof ctx.watchDock === "function") {
+      try { _dockDispose = ctx.watchDock(applyDock); } catch { _dockDispose = null; }
+    }
+    if (!_dockDispose) { _onDockResize = () => applyDock(); window.addEventListener("resize", _onDockResize); }
+    // Slide-in on the next frame so the transition runs from the initial state.
+    requestAnimationFrame(() => overlay.classList.add("cmcp-dock-in"));
+  }
+
   function syncTabs() {
     for (const b of tabsWrap.children) b.classList.toggle("active", b._key === state.tab);
     favChips.style.display = tabDef().fav ? "" : "none";
@@ -411,12 +578,24 @@ export function openCivitaiModal(ctx, opts = {}) {
   // ── data ───────────────────────────────────────────────────────────────
   function setLoading(on) { state.loading = on; progress.classList.toggle("on", on); }
 
-  async function reload({ searching = false } = {}) {
+  // Public reload: stores the in-flight promise so drive methods can await the
+  // first page settling, and returns it.
+  function reload(opts2 = {}) {
+    const p = _reload(opts2);
+    state.activeReloadPromise = p;
+    return p;
+  }
+  async function _reload({ searching = false } = {}) {
     // Invalidate any page load already IN FLIGHT: its response belongs to the
     // OLD tab/query/filters and must not repopulate the just-cleared grid (nor
     // leave its cursor behind). The stale request's guarded `finally` won't
     // clear the loading flag anymore, so reset it here too.
     state.reqId++;
+    // New render generation: any highlight awaiting the previous load is now
+    // stale, and the target set is cleared so it can't re-apply to fresh cards.
+    state.renderRev++;
+    state.highlightSet = new Set();
+    state.highlightOrder = [];
     setLoading(false);
     state.items = []; state.models = []; state.cursor = null; state.done = false;
     grid.innerHTML = ""; syncTabs();
@@ -432,7 +611,12 @@ export function openCivitaiModal(ctx, opts = {}) {
     }
   }
 
-  async function loadMore() {
+  function loadMore() {
+    const p = _loadMore();
+    state.activeLoadPromise = p;
+    return p;
+  }
+  async function _loadMore() {
     if (state.loading || state.done) return;
     const req = ++state.reqId;
     setLoading(true);
@@ -448,14 +632,18 @@ export function openCivitaiModal(ctx, opts = {}) {
       const t = tabDef();
       if (t.fav) {
         if (!state.signedIn) { sentinel.textContent = "Sign in to see your favorites."; setLoading(false); return; }
-        // YOUR likes are yours: no browsing-level gate here (the PG default was
-        // silently hiding most of the list), and the subnav chips narrow by type.
-        // The feed reads the likes COLLECTION (auto-detected) — reactions only
-        // hold in-app hearts; see resolveLikesCollectionId.
+        // The favorites feed is still browsing-level gated by the ACTIVE filter:
+        // fetchFavorites defaults to ALL levels, so an agent-driven session that
+        // clamped the levels (no NSFW consent) would otherwise leak R/X/XXX here
+        // (security: codex finding). Pass the same clamped set as every other
+        // feed. The subnav chips narrow by type; the feed reads the likes
+        // COLLECTION (auto-detected) — reactions only hold in-app hearts; see
+        // resolveLikesCollectionId.
         const colId = await resolveLikesCollectionId(client);
         if (req !== state.reqId) return;
         const page = await client.fetchFavorites({
           cursor: state.cursor,
+          levels,
           ...(colId ? { collectionId: colId } : {}),
           ...(state.favType !== "all" ? { types: [state.favType] } : {}),
         });
@@ -528,21 +716,36 @@ export function openCivitaiModal(ctx, opts = {}) {
     }
   }
 
+  // Re-apply the agent's highlight to a freshly-appended card: a highlight can
+  // target an id that only lands on a LATER page (scroll), so the glow must be
+  // (re)applied as cards stream in — not just at the moment highlight() ran.
+  function _applyGlowIfTargeted(card, id) {
+    if (state.highlightSet.has(String(id))) card.classList.add("cmcp-agent-glow");
+  }
   function appendItems(items) {
     for (const it of items) {
       if (tabDef().fav && !_liked.has(it.id)) _liked.set(it.id, true);
       state.items.push(it);
       const idx = state.items.length - 1;
-      grid.appendChild(mediaCard(it, idx));
+      const card = mediaCard(it, idx);
+      _applyGlowIfTargeted(card, it.id);
+      grid.appendChild(card);
     }
   }
   function appendModels(models) {
-    for (const m of models) { state.models.push(m); grid.appendChild(modelCard(m)); }
+    for (const m of models) {
+      state.models.push(m);
+      const card = modelCard(m);
+      _applyGlowIfTargeted(card, m.id);
+      grid.appendChild(card);
+    }
   }
 
   // ── cards ─────────────────────────────────────────────────────────────
   function mediaCard(it, idx) {
     const card = el("div", "cmcp-cv-card");
+    card.dataset.id = String(it.id);
+    card.dataset.kind = "media";
     // Both image and video cards show a still (video thumbnailUrl is a jpeg
     // poster); hover on a video swaps in the muted transcoded clip.
     const img = document.createElement("img");
@@ -590,6 +793,8 @@ export function openCivitaiModal(ctx, opts = {}) {
 
   function modelCard(m) {
     const card = el("div", "cmcp-cv-card");
+    card.dataset.id = String(m.id);
+    card.dataset.kind = "model";
     const img = document.createElement("img");
     img.loading = "lazy"; img.src = m.coverUrl;
     img.addEventListener("error", () => { card.style.display = "none"; });
@@ -637,6 +842,10 @@ export function openCivitaiModal(ctx, opts = {}) {
   }
 
   function openViewer(startIdx) {
+    // At-most-one lightbox: tear down any prior one (and its document keydown
+    // listener) before opening a new one, so a second open without an
+    // intervening close can't strand the older listener (codex finding).
+    if (_activeLightboxClose) { try { _activeLightboxClose(); } catch { /* already gone */ } _activeLightboxClose = null; }
     let idx = startIdx;
     let renderSeq = 0;
     const lb = el("div", "cmcp-cv-lb");
@@ -647,7 +856,14 @@ export function openCivitaiModal(ctx, opts = {}) {
       const b = el("button", "cmcp-cv-iconbtn"); b.innerHTML = `<i class="pi ${icon}"></i>`;
       if (title) b.title = title; b.addEventListener("click", fn); return b;
     };
-    const closeLb = () => { lb.remove(); document.removeEventListener("keydown", onKey, true); };
+    const closeLb = () => {
+      lb.remove();
+      document.removeEventListener("keydown", onKey, true);
+      if (_activeLightboxClose === closeLb) _activeLightboxClose = null;
+    };
+    // Track the live lightbox so the modal's unified close() can dismiss it (and
+    // remove its listener) on a programmatic reopen (codex finding).
+    _activeLightboxClose = closeLb;
     const onKey = (e) => {
       if (e.key === "Escape") { e.stopPropagation(); closeLb(); }
       else if (e.key === "ArrowRight" || e.key === "ArrowDown") { e.stopPropagation(); step(1); }
@@ -1579,12 +1795,17 @@ export function openCivitaiModal(ctx, opts = {}) {
       const r = await ctx.api.fetchApi("/comfyui_mcp_panel/civitai/oauth/start?origin=" + encodeURIComponent(location.origin));
       const { authorize_url } = await r.json();
       window.open(authorize_url, "_blank", "width=520,height=720");
-      // poll for completion
+      // poll for completion — tracked so close() can cancel a pending sign-in.
       let tries = 0;
-      const iv = setInterval(async () => {
+      if (_oauthPollIv) clearInterval(_oauthPollIv);
+      _oauthPollIv = setInterval(async () => {
+        if (!isOpen) { clearInterval(_oauthPollIv); _oauthPollIv = null; return; }
         await refreshAuth();
+        // Re-check AFTER the await: close() may have fired during the fetch, and
+        // the continuation must not toast/reload a torn-down modal (codex finding).
+        if (!isOpen) { if (_oauthPollIv) { clearInterval(_oauthPollIv); _oauthPollIv = null; } return; }
         if (state.signedIn || ++tries > 120) {
-          clearInterval(iv);
+          clearInterval(_oauthPollIv); _oauthPollIv = null;
           if (state.signedIn) { toast("Signed in to CivitAI."); if (tabDef().fav) reload(); }
         }
       }, 2000);
@@ -1632,9 +1853,140 @@ export function openCivitaiModal(ctx, opts = {}) {
     setTimeout(() => t.remove(), ms);
   }
 
+  // ── agent-driven handle ────────────────────────────────────────────────
+  // Post-open control surface: the same inner state/functions the UI drives,
+  // exposed so the bridge (and through it the agent) can switch tabs, re-search,
+  // read results (metadata + URLs only — never image bytes), and glow-highlight
+  // the interesting cards. Every method awaits the modal settling, throws on a
+  // closed handle, and returns a small plain object; no dynamic exec (YARA safe).
+  function _assertOpen() { if (!isOpen) throw new Error("civitai browser not open"); }
+  async function driveSwitchTab(key) {
+    _assertOpen();
+    if (!TABS.some((t) => t.key === key)) throw new Error(`unknown tab "${key}"`);
+    if (state.tab !== key) { state.tab = key; syncTabs(); await reload(); }
+    else syncTabs();
+    return { tab: state.tab, renderRev: state.renderRev };
+  }
+  async function driveSearch({ query, filters, browsingLevels } = {}) {
+    _assertOpen();
+    // Atomic normalize: fold filters, then query→(creator,text) in one shot so a
+    // half-applied state never reaches reload.
+    if (filters && typeof filters === "object") {
+      state.filters = {
+        ...state.filters, ...filters,
+        baseModels: Array.isArray(filters.baseModels) ? [...filters.baseModels] : state.filters.baseModels,
+        browsingLevels: Array.isArray(filters.browsingLevels) ? [...filters.browsingLevels] : state.filters.browsingLevels,
+      };
+    }
+    // NSFW browsing levels arrive already server-clamped (mcp strips adult
+    // levels without consent). Defense-in-depth: the client has no NSFW gate, so
+    // drop any level ∉ the known enum {1,2,4,8,16} before applying — never let a
+    // malformed/unknown level reach the query. Omitted → leave the filter as-is.
+    const lvlSrc = Array.isArray(browsingLevels) ? browsingLevels
+      : (filters && Array.isArray(filters.browsingLevels) ? filters.browsingLevels : null);
+    if (lvlSrc) {
+      const KNOWN = new Set(LEVELS.map((l) => l.level));
+      const clean = [...new Set(lvlSrc.map(Number).filter((n) => KNOWN.has(n)))];
+      state.filters = { ...state.filters, browsingLevels: clean.length ? clean : [1] };
+    }
+    if (typeof query === "string") {
+      search.value = query;
+      const parsed = parseCreatorQuery(query);
+      state.query = parsed.query;
+      if (parsed.creator) setCreator(parsed.creator); // normalizes @token + username
+      else if (creatorFromSearch && state.filters.username) { setCreator(null); }
+    }
+    clearTimeout(searchTimer); // cancel the 500ms debounce so it can't double-fire
+    syncTabs();
+    // FORCE a reload even when the text is unchanged (a re-search is an explicit
+    // agent intent, unlike applySearch's typing-debounce dedupe).
+    await reload({ searching: true });
+    return { tab: state.tab, query: state.query, creator: state.filters.username || null, renderRev: state.renderRev };
+  }
+  function driveGetResults({ limit = 20 } = {}) {
+    _assertOpen();
+    const model = isModelTab();
+    const source = model ? state.models : state.items;
+    const ser = serializeCivitaiResults(source, { model, limit, loading: state.loading });
+    return {
+      ...ser, // { items, total, loading }
+      count: ser.items.length,
+      done: !!state.done,
+      renderRev: state.renderRev,
+      truncated: source.length > ser.items.length,
+    };
+  }
+  /** Highlight a set of ids (REPLACEMENT semantics). Awaits the in-flight
+   *  first-page load so a highlight issued before results land still lands.
+   *  Persists the set so later pages glow as they stream in (see appendItems). */
+  async function driveHighlight(ids, { kind } = {}) { // eslint-disable-line no-unused-vars
+    _assertOpen();
+    const list = (Array.isArray(ids) ? ids : (ids != null ? [ids] : [])).map((x) => String(x));
+    const rev = state.renderRev;
+    try { await state.activeReloadPromise; } catch { /* fetch error surfaces elsewhere */ }
+    _assertOpen();
+    if (state.renderRev !== rev) {
+      // A reload/tab/filter superseded this highlight while we awaited: these ids
+      // belonged to the OLD search and MUST NOT be installed on the new
+      // generation (they'd glow same-id cards from a different query). Bail
+      // without touching the current set — the agent can re-issue against the
+      // new results (codex finding).
+      return { highlighted: 0, missing: list, renderRev: state.renderRev, superseded: true };
+    }
+    // Replacement: strip the prior set, install the new one, then paint.
+    driveClearHighlight();
+    state.highlightOrder = [...list];
+    state.highlightSet = new Set(list);
+    let first = null, hit = 0;
+    const missing = [];
+    for (const id of list) { // input order → first found scrolls into view
+      const card = grid.querySelector(`.cmcp-cv-card[data-id="${CSS.escape(id)}"]`);
+      if (card) { card.classList.add("cmcp-agent-glow"); if (!first) first = card; hit++; }
+      else missing.push(id);
+    }
+    if (first) first.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    return { highlighted: hit, missing, renderRev: state.renderRev };
+  }
+  function driveClearHighlight() {
+    _assertOpen();
+    state.highlightSet = new Set();
+    state.highlightOrder = [];
+    for (const c of grid.querySelectorAll(".cmcp-cv-card.cmcp-agent-glow")) c.classList.remove("cmcp-agent-glow");
+    return { ok: true };
+  }
+  /** Open the lightbox for a card. Dispatch by KIND: media → openViewer(index)
+   *  (index-addressed); model → openModelDetail (model tabs leave state.items
+   *  empty, so an index lookup there is meaningless). */
+  function driveOpenLightbox(id, { kind } = {}) {
+    _assertOpen();
+    const wantModel = kind === "model" || (kind == null && isModelTab());
+    if (wantModel) {
+      const m = state.models.find((x) => String(x.id) === String(id));
+      if (!m) throw new Error(`no model card for id ${id}`);
+      openModelDetail(m);
+      return { opened: "model", id };
+    }
+    const i = state.items.findIndex((x) => String(x.id) === String(id));
+    if (i < 0) throw new Error(`no media card for id ${id}`);
+    openViewer(i);
+    return { opened: "media", id };
+  }
+  function driveGetState() {
+    return {
+      isOpen, tab: state.tab, loading: !!state.loading, done: !!state.done,
+      renderRev: state.renderRev, docked: !applyDock.centered && overlay.classList.contains("cmcp-docked"),
+      highlighted: state.highlightOrder.slice(),
+    };
+  }
+
   // ── go ───────────────────────────────────────────────────────────────
   syncTabs();
   refreshAuth();
   reload();
-  return { close, focus: () => search.focus() };
+  return {
+    close, focus: () => search.focus(),
+    switchTab: driveSwitchTab, search: driveSearch, getResults: driveGetResults,
+    highlight: driveHighlight, clearHighlight: driveClearHighlight,
+    openLightbox: driveOpenLightbox, getState: driveGetState,
+  };
 }
