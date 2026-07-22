@@ -362,6 +362,15 @@ def _register_routes():
     except Exception as _e:  # pragma: no cover - never block panel load
         _log("training routes not registered: {}".format(_e))
 
+    # Micro-Apps: bundle storage under the user dir + headless run engine
+    # (same HTTP surface backs the mobile app's whitelisted apps_* tools).
+    try:
+        from .py import apps_routes
+
+        apps_routes.register(routes, web)
+    except Exception as _e:  # pragma: no cover - never block panel load
+        _log("apps routes not registered: {}".format(_e))
+
     @routes.get("/comfyui_mcp_panel/status")
     async def _status(_request):
         detected = _detect_comfyui_url()
