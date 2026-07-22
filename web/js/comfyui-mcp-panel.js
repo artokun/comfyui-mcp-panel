@@ -10490,6 +10490,13 @@ function buildPanel() {
     });
   }
 
+  async function invalidateDurableAgentSession() {
+    ssSet(SESSION_KEY, null);
+    if (thread) historyStore.reviseThread(thread, { sessionId: null });
+    persistThreads();
+    return historyStore.flush();
+  }
+
   const panelAliasMutationSink = (path, value) => {
     historyMeta = updateMetadataEntry(
       historyMeta,
@@ -13508,7 +13515,7 @@ function buildPanel() {
     );
   }
 
-  function connectBackend(id) {
+  async function connectBackend(id) {
     // CENTRALIZED per-backend seeding: every switch path routes through here — the
     // backend chips, the model-popover provider row, AND the Settings backend combo
     // (panelHooks.applyBackend). When the target backend differs from the one prefs
@@ -13547,13 +13554,15 @@ function buildPanel() {
     // the visible chat log stays, only the agent session resets.
     const switching = connectedBackend !== null && connectedBackend !== id;
     if (switching) {
-      ssSet(SESSION_KEY, null);
-      if (thread) historyStore.reviseThread(thread, { sessionId: null });
       // Replay the visible transcript to the NEW provider as one-shot context so
       // its fresh session has the conversation (session/thinking aren't portable
       // across providers). Consumed by the next user message, then auto-cleared.
       const replay = buildReplayTranscript();
       if (replay) client.armContext(replay);
+      // The old provider's session must be durably invalid before any reconnect
+      // can observe it. If reconnect fails or the browser closes here, reload
+      // still starts fresh instead of restoring a foreign session.
+      await invalidateDurableAgentSession();
     }
     // Reflect the picked backend in the composer placeholder immediately; onModels
     // reaffirms it authoritatively from the handshake (fix #3).
@@ -13674,7 +13683,7 @@ function buildPanel() {
       // Start FRESH on reconnect: clear the saved session id so hello sends no
       // resume (resuming would restore the wedged shell). Don't arm the resume
       // nudge. The reconnect spins up a brand-new agent.
-      ssSet(SESSION_KEY, null);
+      await invalidateDurableAgentSession();
       ssSet(SOFT_RELOAD_KEY, null);
       ssSet(MID_TASK_KEY, null);
       appendSystem("Agent restarted with a fresh session — your message history is still here.");
