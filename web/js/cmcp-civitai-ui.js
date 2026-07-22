@@ -206,6 +206,24 @@ function injectCss() {
   @media (max-width: 760px) { .cmcp-cv-lb { flex-direction: column; }
     .cmcp-cv-lb-side { flex: 0 0 45%; max-width: none; border-left: none;
       border-top: 1px solid var(--p-content-border-color,#3f3f46); } }
+  /* Agent-driven "glow" — the modal highlights the cards the agent points at. */
+  .cmcp-cv-card.cmcp-agent-glow { outline: 2px solid var(--p-green-400,#4ade80);
+    box-shadow: 0 0 0 2px var(--p-green-400,#4ade80), 0 0 16px 2px rgba(74,222,128,.6);
+    animation: cmcp-glow 1.4s ease-in-out infinite; }
+  @keyframes cmcp-glow { 50% { box-shadow: 0 0 0 3px var(--p-green-400,#4ade80),
+    0 0 24px 6px rgba(74,222,128,.9); } }
+  /* Agent-driven side-dock: anchor to the sidebar's right edge (measured in JS),
+     drop the dim backdrop and let clicks pass THROUGH the overlay so chat stays
+     interactive; only the modal card itself catches pointer events. Slide-in via
+     the first translateX transition in the codebase. Kept below the lightbox
+     (z 10002) so the lightbox still overlays. */
+  .cmcp-cv-overlay.cmcp-docked { display: block; padding: 0; background: transparent;
+    pointer-events: none; }
+  .cmcp-cv-overlay.cmcp-docked .cmcp-civitai-modal { position: fixed; pointer-events: auto;
+    width: auto; max-width: none; height: auto; max-height: none; border-radius: 0;
+    box-shadow: -8px 0 32px rgba(0,0,0,.45); transform: translateX(24px); opacity: 0;
+    transition: transform .28s ease, opacity .28s ease; }
+  .cmcp-cv-overlay.cmcp-docked.cmcp-dock-in .cmcp-civitai-modal { transform: translateX(0); opacity: 1; }
   `;
   const style = document.createElement("style");
   style.textContent = css;
@@ -233,7 +251,32 @@ export function graphDirtyForConfirm(ctx) {
   }
 }
 
-/** Open (or focus) the CivitAI modal. opts = {query, tab, filters, browsingLevels}. */
+/** Serialize result rows — `state.items` (media) or `state.models` (models) —
+ *  to the agent's `civitai_results` contract shape: id, kind, title, creator,
+ *  baseModel/type, stats, prompt, and media URL(s). Metadata + URLs ONLY — never
+ *  image bytes (the agent reasons from text; the human clicks to view). Pure and
+ *  exported for unit tests. `limit` is clamped to [1, 200]. */
+export function serializeCivitaiResults(source, { model = false, limit = 20, loading = false } = {}) {
+  const n = Number(limit);
+  const lim = Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 200) : 20;
+  const rows = Array.isArray(source) ? source : [];
+  const items = rows.slice(0, lim).map((x) => model ? {
+    id: x.id, kind: "model", title: x.name || null, creator: x.creator || null,
+    baseModel: x.baseModel || null, type: x.type || null,
+    stats: { downloadCount: x.downloadCount ?? null, thumbsUp: x.thumbsUp ?? null },
+    prompt: null, urls: x.coverUrl ? [x.coverUrl] : [],
+  } : {
+    id: x.id, kind: x.type === "video" ? "video" : "image",
+    title: null, creator: x.author || null,
+    baseModel: x.modelName || null, type: x.type || null,
+    stats: { reactions: x.reactions ?? null },
+    prompt: x.prompt || null,
+    urls: [x.thumbnailUrl, x.fullUrl].filter(Boolean),
+  });
+  return { items, total: rows.length, loading: !!loading };
+}
+
+/** Open (or focus) the CivitAI modal. opts = {query, tab, filters, browsingLevels, dock, onClose}. */
 export function openCivitaiModal(ctx, opts = {}) {
   injectCss();
   const client = new CivitaiClient(ctx.api);
@@ -266,7 +309,15 @@ export function openCivitaiModal(ctx, opts = {}) {
   // narrow panel sidebar) ────────────────────────────────────────────────────
   const overlay = el("div", "cmcp-cv-overlay");
   const modal = el("div", "cmcp-modal cmcp-civitai-modal");
-  const close = () => overlay.remove();
+  let _onDockResize = null;
+  const close = () => {
+    if (_onDockResize) { window.removeEventListener("resize", _onDockResize); _onDockResize = null; }
+    overlay.remove();
+    try { opts.onClose?.(); } catch { /* host bookkeeping only */ }
+  };
+  // In docked mode the overlay itself is click-through (pointer-events:none), so a
+  // backdrop mousedown never fires here — the header ✕ is the only dismiss. Centered
+  // mode keeps the backdrop-click-to-close affordance.
   overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
 
   // header
@@ -400,6 +451,37 @@ export function openCivitaiModal(ctx, opts = {}) {
   modal.append(head, subnav, body);
   overlay.appendChild(modal);
   document.body.appendChild(overlay);
+
+  // ── docked mode (agent-driven) ─────────────────────────────────────────────
+  // Anchor the card to the sidebar's right edge so chat stays visible + usable;
+  // below a narrow breakpoint fall back to the centered overlay. Recomputed on
+  // window resize (listener torn down in close()).
+  const DOCK_MIN_WIDTH = 900;
+  function applyDock() {
+    const docked = !!opts.dock && window.innerWidth >= DOCK_MIN_WIDTH;
+    overlay.classList.toggle("cmcp-docked", docked);
+    if (!docked) {
+      modal.style.left = modal.style.right = modal.style.top = modal.style.bottom = "";
+      return;
+    }
+    let left = 0, top = 0;
+    try {
+      const pane = ctx.root?.closest?.(".side-bar-panel") || ctx.root?.closest?.("[class*='sidebar']");
+      const r = pane?.getBoundingClientRect();
+      if (r) { left = Math.max(0, Math.round(r.right)); top = Math.max(0, Math.round(r.top)); }
+    } catch { /* fall back to full-height right edge */ }
+    modal.style.left = `${left}px`;
+    modal.style.top = `${top}px`;
+    modal.style.right = "0px";
+    modal.style.bottom = "0px";
+  }
+  if (opts.dock) {
+    applyDock();
+    _onDockResize = () => applyDock();
+    window.addEventListener("resize", _onDockResize);
+    // Slide-in on the next frame so the transition runs from the initial state.
+    requestAnimationFrame(() => overlay.classList.add("cmcp-dock-in"));
+  }
 
   function syncTabs() {
     for (const b of tabsWrap.children) b.classList.toggle("active", b._key === state.tab);
@@ -543,6 +625,8 @@ export function openCivitaiModal(ctx, opts = {}) {
   // ── cards ─────────────────────────────────────────────────────────────
   function mediaCard(it, idx) {
     const card = el("div", "cmcp-cv-card");
+    card.dataset.id = String(it.id);
+    card.dataset.kind = "media";
     // Both image and video cards show a still (video thumbnailUrl is a jpeg
     // poster); hover on a video swaps in the muted transcoded clip.
     const img = document.createElement("img");
@@ -590,6 +674,8 @@ export function openCivitaiModal(ctx, opts = {}) {
 
   function modelCard(m) {
     const card = el("div", "cmcp-cv-card");
+    card.dataset.id = String(m.id);
+    card.dataset.kind = "model";
     const img = document.createElement("img");
     img.loading = "lazy"; img.src = m.coverUrl;
     img.addEventListener("error", () => { card.style.display = "none"; });
@@ -1632,9 +1718,81 @@ export function openCivitaiModal(ctx, opts = {}) {
     setTimeout(() => t.remove(), ms);
   }
 
+  // ── agent-driven handle ────────────────────────────────────────────────
+  // Post-open control surface: the same inner state/functions the UI drives,
+  // exposed so the bridge (and through it the agent) can switch tabs, re-search,
+  // read results (metadata + URLs only — never image bytes), and glow-highlight
+  // the interesting cards. Every method throws or returns a small plain object;
+  // no dynamic exec (registry-YARA safe).
+  function driveSwitchTab(key) {
+    if (!TABS.some((t) => t.key === key)) throw new Error(`unknown tab "${key}"`);
+    if (state.tab !== key) { state.tab = key; syncTabs(); reload(); }
+    else syncTabs();
+    return { tab: state.tab };
+  }
+  function driveSearch({ query, filters } = {}) {
+    if (filters && typeof filters === "object") {
+      state.filters = {
+        ...state.filters, ...filters,
+        baseModels: Array.isArray(filters.baseModels) ? [...filters.baseModels] : state.filters.baseModels,
+        browsingLevels: Array.isArray(filters.browsingLevels) ? [...filters.browsingLevels] : state.filters.browsingLevels,
+      };
+    }
+    if (typeof query === "string") {
+      search.value = query;
+      const parsed = parseCreatorQuery(query);
+      state.query = parsed.query;
+      if (parsed.creator) setCreator(parsed.creator); // normalizes @token + username
+      else if (creatorFromSearch && state.filters.username) { setCreator(null); }
+    }
+    syncTabs();
+    reload({ searching: true });
+    return { tab: state.tab, query: state.query, creator: state.filters.username || null };
+  }
+  function driveGetResults({ limit = 20 } = {}) {
+    const model = isModelTab();
+    return serializeCivitaiResults(model ? state.models : state.items,
+      { model, limit, loading: state.loading });
+  }
+  function driveHighlight(ids, { kind } = {}) { // eslint-disable-line no-unused-vars
+    const list = Array.isArray(ids) ? ids : (ids != null ? [ids] : []);
+    let first = null, n = 0;
+    for (const id of list) {
+      const card = grid.querySelector(`.cmcp-cv-card[data-id="${CSS.escape(String(id))}"]`);
+      if (!card) continue;
+      card.classList.add("cmcp-agent-glow");
+      if (!first) first = card;
+      n++;
+    }
+    if (first) first.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    return { highlighted: n };
+  }
+  function driveClearHighlight() {
+    for (const c of grid.querySelectorAll(".cmcp-cv-card.cmcp-agent-glow")) c.classList.remove("cmcp-agent-glow");
+    return { ok: true };
+  }
+  function driveOpenLightbox(id) {
+    if (isModelTab()) {
+      const m = state.models.find((x) => String(x.id) === String(id));
+      if (!m) throw new Error(`no model card for id ${id}`);
+      openModelDetail(m);
+      return { opened: "model", id };
+    }
+    const i = state.items.findIndex((x) => String(x.id) === String(id));
+    if (i < 0) throw new Error(`no media card for id ${id}`);
+    openViewer(i);
+    return { opened: "media", id };
+  }
+  function driveGetState() { return { tab: state.tab, loading: !!state.loading }; }
+
   // ── go ───────────────────────────────────────────────────────────────
   syncTabs();
   refreshAuth();
   reload();
-  return { close, focus: () => search.focus() };
+  return {
+    close, focus: () => search.focus(),
+    switchTab: driveSwitchTab, search: driveSearch, getResults: driveGetResults,
+    highlight: driveHighlight, clearHighlight: driveClearHighlight,
+    openLightbox: driveOpenLightbox, getState: driveGetState,
+  };
 }

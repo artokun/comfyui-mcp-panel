@@ -88,6 +88,22 @@ function injectCss() {
     .cmcp-tr-jobrow .meta { font-size:.75rem; opacity:.6; }
     .cmcp-tr-preflight { display:flex; gap:1rem; flex-wrap:wrap; font-size:.78rem; }
     .cmcp-tr-preflight span b { font-weight:600; }
+    /* Agent-driven "glow" — shared class name with the CivitAI modal; generic here
+       so it applies to step chips + field wrappers, not just cards. */
+    .cmcp-agent-glow { outline: 2px solid var(--p-green-400,#4ade80);
+      box-shadow: 0 0 0 2px var(--p-green-400,#4ade80), 0 0 16px 2px rgba(74,222,128,.6);
+      border-radius: 8px; animation: cmcp-glow 1.4s ease-in-out infinite; }
+    @keyframes cmcp-glow { 50% { box-shadow: 0 0 0 3px var(--p-green-400,#4ade80),
+      0 0 24px 6px rgba(74,222,128,.9); } }
+    /* Agent-driven side-dock (parity with the CivitAI modal): anchor to the
+       sidebar's right edge, drop the backdrop, keep chat interactive. */
+    .cmcp-cv-overlay.cmcp-docked { display: block; padding: 0; background: transparent;
+      pointer-events: none; }
+    .cmcp-cv-overlay.cmcp-docked .cmcp-tr-modal { position: fixed; pointer-events: auto;
+      width: auto; max-width: none; max-height: none; border-radius: 0;
+      box-shadow: -8px 0 32px rgba(0,0,0,.45); transform: translateX(24px); opacity: 0;
+      transition: transform .28s ease, opacity .28s ease; }
+    .cmcp-cv-overlay.cmcp-docked.cmcp-dock-in .cmcp-tr-modal { transform: translateX(0); opacity: 1; }
   `;
   document.head.appendChild(style);
 }
@@ -214,7 +230,7 @@ function fmtAgo(iso) {
 
 const STATUS_BADGE = { running: "ok", queued: "warn", completed: "ok", failed: "err", cancelled: "warn" };
 
-export function openTrainingModal(ctx = {}) {
+export function openTrainingModal(ctx = {}, opts = {}) {
   injectCss();
   const overlay = document.createElement("div");
   overlay.className = "cmcp-cv-overlay";
@@ -224,6 +240,7 @@ export function openTrainingModal(ctx = {}) {
   let pollTimer = null;
   let pollGen = 0;
   let closed = false;
+  let _onDockResize = null;
   const stopPolling = () => {
     pollGen++; // invalidate any in-flight poll response
     if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
@@ -231,9 +248,11 @@ export function openTrainingModal(ctx = {}) {
   const close = () => {
     closed = true;
     stopPolling();
+    if (_onDockResize) { window.removeEventListener("resize", _onDockResize); _onDockResize = null; }
     wiz.launchGen++; // a pending launch's continuation self-discards (codex finding)
     wiz.uploadGen++;
     overlay.remove();
+    try { opts.onClose?.(); } catch { /* host bookkeeping only */ }
   };
   overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
 
@@ -307,11 +326,40 @@ export function openTrainingModal(ctx = {}) {
   overlay.appendChild(modal);
   document.body.appendChild(overlay);
 
+  // ── docked mode (agent-driven, parity with the CivitAI modal) ───────────────
+  const DOCK_MIN_WIDTH = 900;
+  function applyDock() {
+    const docked = !!opts.dock && window.innerWidth >= DOCK_MIN_WIDTH;
+    overlay.classList.toggle("cmcp-docked", docked);
+    if (!docked) {
+      modal.style.left = modal.style.right = modal.style.top = modal.style.bottom = modal.style.height = "";
+      return;
+    }
+    let left = 0, top = 0;
+    try {
+      const pane = ctx.root?.closest?.(".side-bar-panel") || ctx.root?.closest?.("[class*='sidebar']");
+      const r = pane?.getBoundingClientRect();
+      if (r) { left = Math.max(0, Math.round(r.right)); top = Math.max(0, Math.round(r.top)); }
+    } catch { /* fall back to full-height right edge */ }
+    modal.style.left = `${left}px`;
+    modal.style.top = `${top}px`;
+    modal.style.right = "0px";
+    modal.style.bottom = "0px";
+    modal.style.height = "auto";
+  }
+  if (opts.dock) {
+    applyDock();
+    _onDockResize = () => applyDock();
+    window.addEventListener("resize", _onDockResize);
+    requestAnimationFrame(() => overlay.classList.add("cmcp-dock-in"));
+  }
+
   function setSteps(names, current) {
     stepsBar.textContent = "";
     stepsBar.style.display = names ? "" : "none";
     (names || []).forEach((n, i) => {
       const s = el("span", i === current ? "on" : null, n);
+      s.dataset.ref = `step-${i + 1}`; // agent highlight target
       stepsBar.appendChild(s);
     });
   }
@@ -409,6 +457,7 @@ export function openTrainingModal(ctx = {}) {
     nameRow.append(el("label", null, "Dataset name"));
     const nameInput = el("input", null);
     nameInput.type = "text";
+    nameInput.dataset.ref = "datasetName";
     nameInput.placeholder = "e.g. aria_character";
     nameInput.value = wiz.datasetName;
     nameInput.oninput = () => { wiz.datasetName = nameInput.value; syncNext(); };
@@ -418,6 +467,7 @@ export function openTrainingModal(ctx = {}) {
     trigRow.append(el("label", null, "Trigger word"));
     const trigInput = el("input", null);
     trigInput.type = "text";
+    trigInput.dataset.ref = "trigger";
     trigInput.placeholder = "e.g. ohwx — a rare token, not a real word";
     trigInput.value = wiz.trigger;
     trigInput.oninput = () => { wiz.trigger = trigInput.value.trim(); };
@@ -804,7 +854,9 @@ export function openTrainingModal(ctx = {}) {
         const targetSeg = el("div", "cmcp-tr-seg");
         targetSeg.style.margin = "0";
         const localBtn = el("button", wiz.target !== "pod" ? "active" : null, "Local (docker)");
+        localBtn.dataset.ref = "target-local";
         const podBtn = el("button", wiz.target === "pod" ? "active" : null, `Pod (${pod.name || pod.id}${pod.gpu ? ` · ${pod.gpu}` : ""})`);
+        podBtn.dataset.ref = "target-pod";
         if (!pod.ssh) podBtn.title = "pod has no working SSH endpoint";
         localBtn.onclick = () => { wiz.target = "local"; localBtn.classList.add("active"); podBtn.classList.remove("active"); syncLaunchEnabled(); syncSummary(); };
         podBtn.onclick = () => {
@@ -1142,6 +1194,73 @@ export function openTrainingModal(ctx = {}) {
     }
   }
 
+  // ── agent-driven handle (parity with the CivitAI modal) ────────────────────
+  // Drives the existing wizard state; every method returns a small plain object
+  // or throws. No dynamic exec (registry-YARA safe).
+  const _STEP_VIEW = { 1: "wizard-1", 2: "wizard-2", 3: "wizard-3", 4: "wizard-4" };
+  function _stepNum() {
+    const m = /^wizard-(\d)$/.exec(currentView);
+    return m ? Number(m[1]) : null;
+  }
+  function driveGetState() {
+    return {
+      view: currentView, step: _stepNum(), target: wiz.target,
+      datasetName: wiz.datasetName, trigger: wiz.trigger,
+      preset: wiz.preset, images: wiz.images.length,
+      launching: !!wiz.launching, jobId: wiz.jobId || null,
+    };
+  }
+  function driveSetField(name, value) {
+    switch (name) {
+      case "datasetName": wiz.datasetName = String(value ?? ""); break;
+      case "trigger": wiz.trigger = String(value ?? "").trim(); break;
+      case "preset":
+        if (!PRESETS[value]) throw new Error(`unknown preset "${value}"`);
+        wiz.preset = value;
+        if (PRESETS[value].params) wiz.params = { ...PRESETS[value].params };
+        break;
+      case "target": return driveSetTarget(value);
+      default: throw new Error(`unknown field "${name}"`);
+    }
+    // Reflect the change in the live inputs by re-rendering the current step.
+    if (currentView) show(currentView);
+    return { ok: true, name, value: wiz[name] };
+  }
+  function driveGotoStep(step) {
+    const view = _STEP_VIEW[Number(step)] || (step === "flows" || step === "jobs" ? step : null);
+    if (!view) throw new Error(`invalid step "${step}" (expected 1-4, "flows", or "jobs")`);
+    show(view);
+    return { view: currentView, step: _stepNum() };
+  }
+  function driveSetTarget(target) {
+    if (target !== "local" && target !== "pod") throw new Error(`invalid target "${target}" (expected "local" or "pod")`);
+    if (target === "pod" && !(wiz.podInfo && wiz.podInfo.ssh)) throw new Error("no connected pod with a working SSH endpoint");
+    wiz.target = target;
+    if (currentView === "wizard-3") show("wizard-3"); // re-derive Launch enablement
+    return { target: wiz.target };
+  }
+  function driveHighlight(refs) {
+    const list = Array.isArray(refs) ? refs : (refs != null ? [refs] : []);
+    let first = null, n = 0;
+    for (const ref of list) {
+      const node = modal.querySelector(`[data-ref="${CSS.escape(String(ref))}"]`);
+      if (!node) continue;
+      node.classList.add("cmcp-agent-glow");
+      if (!first) first = node;
+      n++;
+    }
+    if (first) first.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    return { highlighted: n };
+  }
+  function driveClearHighlight() {
+    for (const c of modal.querySelectorAll(".cmcp-agent-glow")) c.classList.remove("cmcp-agent-glow");
+    return { ok: true };
+  }
+
   show("flows");
-  return { close };
+  return {
+    close, getState: driveGetState, setField: driveSetField,
+    gotoStep: driveGotoStep, setTarget: driveSetTarget,
+    highlight: driveHighlight, clearHighlight: driveClearHighlight,
+  };
 }
