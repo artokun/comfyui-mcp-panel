@@ -8075,6 +8075,10 @@ const PANEL_CSS = `
 .cmcp-popover-item .pi { font-size: 0.75rem; color: var(--p-text-muted-color, #a1a1aa); flex: none; }
 .cmcp-popover-item small { margin-left: auto; color: var(--p-text-muted-color, #a1a1aa); flex: none; padding-left: 0.5rem; }
 .cmcp-popover-item .lbl { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Hover-to-read: while revealing, drop the ellipsis so the tail is legible, and
+   hide the scrollbar the programmatic scroll would otherwise expose. */
+.cmcp-revealing { text-overflow: clip !important; scrollbar-width: none; }
+.cmcp-revealing::-webkit-scrollbar { display: none; }
 /* Slash commands: keep the short /command always visible and let the (often
    long) hint truncate instead — otherwise a long hint collapsed the label. */
 .cmcp-popover-item.cmcp-slash .lbl { flex: 0 0 auto; }
@@ -14717,6 +14721,107 @@ function buildPanel() {
   // close when clicking inside the panel. Capturing runs on the way DOWN to the
   // target, before LiteGraph can swallow the event, so a click ANYWHERE (canvas,
   // toolbar, other widgets) dismisses the dropdown.
+  // ── Hover to read the rest of a truncated label ────────────────────────
+  // An ellipsis hides the END of the string, and the end is usually the part
+  // that identifies it: a quantisation suffix, a size tag, a date. Model ids
+  // are the worst case — "…-instruct-q4_K_M" and Ollama's size suffix both sit
+  // past the cut, so a list of clipped names can be genuinely unusable.
+  //
+  // Hovering a clipped element scrolls it to its end and hovering away returns
+  // it. Delegated from the panel root so it covers popover rows, the model
+  // chip, download and attachment names — including elements rendered later,
+  // which is most of them.
+  const REVEAL_SEL = [
+    ".cmcp-popover-item .lbl",
+    ".cmcp-popover-item small",
+    ".cmcp-chip .name",
+    ".cmcp-chip .dim",
+    ".cmcp-dl-name",
+    ".cmcp-attach-name",
+    ".cmcp-pending-text",
+    ".cmcp-card-text",
+  ].join(", ");
+  // Respect the OS setting — an animation that chases the cursor is exactly the
+  // kind of motion people disable it for. They still get the reveal, instantly.
+  const revealReduced = () =>
+    !!window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+  let revealEl = null;
+  let revealResetTimer = null;
+
+  /**
+   * Ease scrollLeft by hand rather than using scrollTo({behavior:"smooth"}).
+   *
+   * Three reasons, in order of weight:
+   *  - Pacing. Distance-proportional duration keeps a 60-char model id from
+   *    crawling and a short one from snapping; the built-in curve is fixed.
+   *  - Reduced-motion gets a clean instant branch instead of relying on the
+   *    browser to honour it for programmatic scrolls.
+   *  - Interruptibility. Moving the cursor across a list cancels the previous
+   *    animation explicitly (`cancelAnimationFrame`), so rows don't fight.
+   *
+   * Note: `scrollLeft =` and `scrollTo({behavior:"auto"})` are both confirmed
+   * to move these overflow:hidden labels. Whether `behavior:"smooth"` also
+   * works on them is UNVERIFIED — it appeared not to during testing, but that
+   * was measured in a backgrounded tab where rAF was paused and every
+   * animation was frozen, so the observation proves nothing either way. Don't
+   * cite it as a reason to avoid smooth; the reasons above stand on their own.
+   */
+  function revealScroll(el, toEnd) {
+    const max = el.scrollWidth - el.clientWidth;
+    if (max <= 0) return false;
+    const from = el.scrollLeft;
+    const to = toEnd ? max : 0;
+    if (Math.abs(to - from) < 1) return true;
+    if (el._revealRaf) cancelAnimationFrame(el._revealRaf);
+    if (revealReduced()) { el.scrollLeft = to; return true; }
+    // Pace by distance so a long id doesn't crawl and a short one doesn't jerk.
+    const dur = Math.min(600, Math.max(160, Math.abs(to - from) * 2.5));
+    const t0 = performance.now();
+    const step = (now) => {
+      const p = Math.min(1, (now - t0) / dur);
+      const eased = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+      el.scrollLeft = from + (to - from) * eased;
+      if (p < 1) el._revealRaf = requestAnimationFrame(step);
+      else el._revealRaf = 0;
+    };
+    el._revealRaf = requestAnimationFrame(step);
+    return true;
+  }
+  function revealRelease(el) {
+    if (!el) return;
+    revealScroll(el, false);
+    // Keep `clip` until the scroll-back lands, or the ellipsis snaps in over
+    // text that is still sliding — which reads as a glitch rather than a return.
+    clearTimeout(revealResetTimer);
+    revealResetTimer = setTimeout(() => el.classList.remove("cmcp-revealing"), 320);
+  }
+  function onRootOver(ev) {
+    const el = ev.target?.closest?.(REVEAL_SEL);
+    if (!el || el === revealEl) return;
+    if (revealEl) revealRelease(revealEl);
+    revealEl = null;
+    // Only act on text that is ACTUALLY clipped; otherwise every hover would
+    // add a class and run a no-op scroll across the whole panel.
+    if (el.scrollWidth > el.clientWidth + 1) {
+      clearTimeout(revealResetTimer);
+      if (revealEl && revealEl._revealRaf) cancelAnimationFrame(revealEl._revealRaf);
+      el.classList.add("cmcp-revealing");
+      revealScroll(el, true);
+      revealEl = el;
+    }
+  }
+  function onRootOut(ev) {
+    if (!revealEl) return;
+    const to = ev.relatedTarget;
+    // mouseout fires when crossing into a CHILD of the same label too; ignore
+    // those or the reveal would stutter as the cursor moves across the text.
+    if (to && (revealEl.contains(to) || to.closest?.(REVEAL_SEL) === revealEl)) return;
+    revealRelease(revealEl);
+    revealEl = null;
+  }
+  root.addEventListener("mouseover", onRootOver);
+  root.addEventListener("mouseout", onRootOut);
+
   // Escape closes whichever dropdown is open, the way every other menu does.
   // Capture phase for the same reason as the pointer handler: ComfyUI binds its
   // own Escape (deselect / close dialogs) and we want ours to win while a panel
@@ -14958,6 +15063,9 @@ function buildPanel() {
       clearInterval(_wfPoll); // stop per-workflow change polling on unmount
       document.removeEventListener("mousedown", onDocPointerDown, true);
       document.removeEventListener("keydown", onDocEscape, true);
+      root.removeEventListener("mouseover", onRootOver);
+      root.removeEventListener("mouseout", onRootOut);
+      clearTimeout(revealResetTimer);
       document.removeEventListener("keydown", onInterruptKeydown, true);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       try {
