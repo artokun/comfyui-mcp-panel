@@ -1930,9 +1930,18 @@ export function openCivitaiModal(ctx, opts = {}) {
     clearTimeout(searchTimer); // cancel the 500ms debounce so it can't double-fire
     syncTabs();
     // FORCE a reload even when the text is unchanged (a re-search is an explicit
-    // agent intent, unlike applySearch's typing-debounce dedupe).
-    await reload({ searching: true });
-    return { tab: state.tab, query: state.query, creator: state.filters.username || null, renderRev: state.renderRev };
+    // agent intent, unlike applySearch's typing-debounce dedupe) — but resolve on
+    // DISPATCH, not on fetch completion (#282): awaiting the cold first fetch
+    // (modal still docking) blew the 10s ctx.call bridge timeout and cost the
+    // agent several retry turns. reload() tracks its own promise
+    // (state.activeReloadPromise) for drive methods that need the first page, and
+    // _loadMore swallows fetch errors into the sentinel (never rejects), so the
+    // dropped promise is safe. _reload's reqId/renderRev bumps run SYNCHRONOUSLY
+    // (before its first await), so state.renderRev below is already the new
+    // generation. The agent reads the data via panel_civitai_results
+    // (loading/done flags) — the metadata-poll design.
+    void reload({ searching: true });
+    return { tab: state.tab, query: state.query, creator: state.filters.username || null, renderRev: state.renderRev, dispatched: true };
   }
   function driveGetResults({ limit = 20 } = {}) {
     _assertOpen();
