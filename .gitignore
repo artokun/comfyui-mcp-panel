@@ -16,3 +16,6 @@ test-results/
 vendor-spike/node_modules/
 vendor-spike/entry.js
 vendor-spike/package-lock.json
+
+# Dev-only planning/spec artifacts — untracked, keep local
+docs/superpowers/
