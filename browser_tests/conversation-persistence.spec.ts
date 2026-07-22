@@ -225,6 +225,57 @@ test('restores from IndexedDB after the localStorage shadow is lost', async ({
   await expect(panel.agentBubbles.filter({ hasText: 'indexeddb-only reply' }).last()).toBeVisible()
 })
 
+test('panel delete remains final when a stale tab republishes the removed thread', async ({
+  page,
+  context,
+  panel,
+  mockBridge
+}) => {
+  await panel.goto()
+  await panel.setBridgeUrl(mockBridge.url)
+  await panel.openSidebar()
+  await panel.connect()
+
+  const received = mockBridge.waitForUserMessage()
+  await panel.sendMessage('delete me causally')
+  await received
+  await expect.poll(() => indexedHasText(page, 'delete me causally')).toBe(true)
+  const removedThreadId = await page.evaluate((key) => sessionStorage.getItem(key), CURRENT_THREAD_KEY)
+  expect(removedThreadId).not.toBeNull()
+
+  const staleTab = await context.newPage()
+  await staleTab.goto(page.url())
+  const staleSnapshot = await staleTab.evaluate((snapshotKey) =>
+    JSON.parse(localStorage.getItem(snapshotKey) || '{}'), LOCAL_HISTORY_SNAPSHOT_KEY)
+  expect(staleSnapshot.threads?.some((thread: any) => thread.id === removedThreadId)).toBe(true)
+
+  await panel.root.getByTitle('Chat history').click()
+  await panel.root.locator('.cmcp-hist-row', { hasText: 'delete me causally' })
+    .getByTitle('Delete this chat')
+    .click()
+  await expect.poll(() => indexedHasThread(page, removedThreadId!)).toBe(false)
+  await expect.poll(() => page.evaluate(({ snapshotKey, threadId }) => {
+    const snapshot = JSON.parse(localStorage.getItem(snapshotKey) || '{}')
+    const tombstone = snapshot.meta?.deletedThreads?.[threadId]
+    return tombstone?.deleted === true && Number.isFinite(tombstone?.revision?.updatedAt)
+  }, { snapshotKey: LOCAL_HISTORY_SNAPSHOT_KEY, threadId: removedThreadId! })).toBe(true)
+
+  await staleTab.evaluate(async (snapshot) => {
+    const { ChatHistoryStore } = await import('/extensions/comfyui-mcp-panel/lib/chat-history-store.js')
+    const staleStore = new ChatHistoryStore({ writerId: 'stale-panel-test' })
+    staleStore.persist(snapshot.threads || [], snapshot.meta || {})
+    const result = await staleStore.flush()
+    if (result !== true && result?.ok !== true) throw new Error(`stale write failed: ${JSON.stringify(result)}`)
+    await staleStore.close?.()
+  }, staleSnapshot)
+
+  await page.reload()
+  await panel.openSidebar()
+  await expect(panel.userBubble('delete me causally')).toHaveCount(0)
+  await expect.poll(() => indexedHasThread(page, removedThreadId!)).toBe(false)
+  await staleTab.close()
+})
+
 test('reload keeps the pointed conversation and live tab session during durable hydration', async ({
   page,
   panel,

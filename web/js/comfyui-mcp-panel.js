@@ -11796,8 +11796,13 @@ function buildPanel() {
         ev.stopPropagation();
         const now = nextHistoryRevision();
         historyMeta.deletedThreads = historyMeta.deletedThreads || {};
-        historyMeta.deletedThreads[t.id] = now;
-        historyMeta.updatedAt = now;
+        historyMeta.deletedThreads[t.id] = {
+          value: null,
+          deleted: true,
+          updatedAt: now.updatedAt,
+          revision: now,
+        };
+        historyMeta.updatedAt = Math.max(Number(historyMeta.updatedAt) || 0, now.updatedAt);
         threads = threads.filter((x) => x.id !== t.id);
         for (const [key, value] of Object.entries(historyMeta.activeByScope || {})) {
           if (value === t.id) setActiveThread(key, null, now);

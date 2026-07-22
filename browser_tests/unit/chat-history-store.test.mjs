@@ -258,8 +258,8 @@ test('exact revision ties use writer and sequence deterministically in both merg
   }
 })
 
-test('thread tombstones prevent deleted chats from being resurrected by stale snapshots', () => {
-  const deletedAt = 500
+test('thread tombstones preserve causal delete operations and prevent stale resurrection', () => {
+  const deletedAt = { updatedAt: 500, writerId: 'delete-tab', sequence: 1 }
   const merged = mergeHistorySnapshots(
     {
       threads: [],
@@ -276,7 +276,8 @@ test('thread tombstones prevent deleted chats from being resurrected by stale sn
   )
 
   assert.equal(merged.threads.some((thread) => thread.id === 'removed'), false)
-  assert.equal(merged.meta.deletedThreads.removed, deletedAt)
+  assert.deepEqual(merged.meta.deletedThreads.removed.revision, deletedAt)
+  assert.equal(merged.meta.deletedThreads.removed.deleted, true)
 })
 
 test('thread tombstones remain final even when another tab writes the thread later', () => {
@@ -294,7 +295,7 @@ test('thread tombstones remain final even when another tab writes the thread lat
   )
 
   assert.equal(merged.threads.some((thread) => thread.id === 'removed'), false)
-  assert.equal(merged.meta.deletedThreads.removed, 500)
+  assert.equal(merged.meta.deletedThreads.removed.updatedAt, 500)
 })
 
 test('message tombstones survive concurrent append and later reload merges', () => {

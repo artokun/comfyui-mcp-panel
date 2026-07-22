@@ -135,6 +135,41 @@ function mergeTimestampMaps(...maps) {
   return merged;
 }
 
+function normalizeThreadDeletion(operation) {
+  const legacyAt = finiteTs(operation);
+  if (legacyAt) {
+    const revision = legacyRevision(null, legacyAt);
+    return { value: null, deleted: true, updatedAt: revision.updatedAt, revision };
+  }
+  if (!operation || typeof operation !== "object" || Array.isArray(operation)) return null;
+  const normalized = operation.deleted === true
+    ? normalizeMetadataOperation(operation, null, 0)
+    : null;
+  if (normalized?.deleted === true) return normalized;
+  // Schema-3 builds briefly wrote a bare causal revision here. Accept that
+  // transitional shape, but always materialize the canonical delete operation.
+  const revision = normalizeRevision(operation);
+  return revision
+    ? { value: null, deleted: true, updatedAt: revision.updatedAt, revision }
+    : null;
+}
+
+function mergeThreadDeletionMaps(...maps) {
+  const merged = safeMap();
+  for (const map of maps) {
+    if (!map || typeof map !== "object" || Array.isArray(map)) continue;
+    for (const [key, value] of Object.entries(map)) {
+      if (typeof key !== "string" || !key) continue;
+      const operation = normalizeThreadDeletion(value);
+      if (!operation) continue;
+      if (!merged[key] || compareRevisions(operation.revision, merged[key].revision) > 0) {
+        merged[key] = operation;
+      }
+    }
+  }
+  return merged;
+}
+
 function normalizeMetadataOperation(operation, fallbackValue, fallbackUpdatedAt) {
   if (operation && typeof operation === "object" && !Array.isArray(operation)) {
     const revision = normalizeRevision(
@@ -325,8 +360,8 @@ function compactSnapshot(snapshot, { maxTombstones, maxMetadataOps }) {
   const droppedRevisions = [];
   let changed = false;
   [meta.deletedThreads, changed] = (() => {
-    const [kept, dropped] = boundedEntries(meta.deletedThreads, tombstoneLimit, finiteTs);
-    for (const [, value] of dropped) droppedRevisions.push(normalizeRevision(null, value, "tombstone"));
+    const [kept, dropped] = boundedEntries(meta.deletedThreads, tombstoneLimit, operationRevision);
+    for (const [, value] of dropped) droppedRevisions.push(operationRevision(value));
     return [kept, changed || dropped.length > 0];
   })();
   for (const name of ["activeOps", "aliasOps"]) {
@@ -560,9 +595,9 @@ export function mergeHistorySnapshots(...snapshots) {
       );
       const acceptedDeletedThreads = beforeCheckpoint
         ? Object.fromEntries(Object.entries(snap.meta.deletedThreads || {}).filter(([, value]) =>
-          finiteTs(value) > finiteTs(checkpointRevision?.updatedAt)))
+          compareRevisions(normalizeThreadDeletion(value)?.revision, checkpointRevision) > 0))
         : snap.meta.deletedThreads;
-      deletedThreads = mergeTimestampMaps(deletedThreads, acceptedDeletedThreads);
+      deletedThreads = mergeThreadDeletionMaps(deletedThreads, acceptedDeletedThreads);
       metaUpdatedAt = Math.max(metaUpdatedAt, incomingUpdatedAt);
     }
     for (const candidate of Array.isArray(snap.threads) ? snap.threads : []) {
