@@ -380,6 +380,16 @@ test('workflow rename publishes alias tombstones and a stale tab cannot echo the
   panel,
   mockBridge
 }) => {
+  await page.route(
+    (url) => /\/(api\/)?settings\/?$/.test(url.pathname),
+    async (route) => {
+      if (route.request().method() !== 'GET') return route.continue()
+      const response = await route.fetch()
+      const settings = await response.json() as Record<string, unknown>
+      settings['comfyui-mcp.sessionFollowsPanel'] = false
+      await route.fulfill({ response, json: settings })
+    }
+  )
   await panel.goto()
   await panel.openSidebar()
   await page.evaluate(() => {
