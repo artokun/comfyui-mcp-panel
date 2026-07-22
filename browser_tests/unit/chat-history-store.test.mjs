@@ -499,7 +499,7 @@ test('legacy local shadow migration preserves the valid half of split or corrupt
   const loaded = store.readLocal()
 
   assert.equal(loaded.threads[0].id, 'legacy-thread')
-  assert.deepEqual(loaded.meta.activeByScope, {})
+  assert.deepEqual(Object.keys(loaded.meta.activeByScope), [])
 })
 
 test('partially corrupt atomic shadow recovers each invalid half from legacy storage', () => {
@@ -519,6 +519,64 @@ test('partially corrupt atomic shadow recovers each invalid half from legacy sto
 
   assert.equal(loaded.threads[0].id, 'legacy-thread')
   assert.equal(loaded.meta.activeByScope['panel:global'], 'legacy-thread')
+})
+
+test('drops malformed nested tombstones and metadata operations before canonical merge', async () => {
+  const canonical = {
+    updatedAt: 500,
+    threads: [{
+      id: 'keep',
+      workflowKey: 'panel:global',
+      updatedAt: 500,
+      msgs: [{ id: 'keep-message', role: 'user', text: 'durable', createdAt: 500 }]
+    }],
+    meta: {
+      updatedAt: 500,
+      activeByScope: { 'panel:global': 'keep' },
+      workflowAliases: { 'workflows/keep.json': 'keep-workflow' }
+    }
+  }
+  const storage = createMemoryStorage()
+  storage.values.set(CHAT_HISTORY_LOCAL_SNAPSHOT_KEY, JSON.stringify({
+    updatedAt: 900,
+    threads: [{
+      id: 'keep',
+      workflowKey: 'panel:global',
+      updatedAt: 100,
+      msgs: [],
+      deletedMessages: {
+        'keep-message': 'bad',
+        'also-bad': -1,
+        'still-bad': null
+      }
+    }],
+    meta: {
+      updatedAt: 900,
+      deletedThreads: { keep: 'bad', nope: 0 },
+      activeByScope: { 'panel:global': 'malformed-shadow' },
+      activeOps: {
+        'panel:global': { value: null, deleted: true, updatedAt: 'bad' },
+        broken: { value: 'x', deleted: true, updatedAt: 900 }
+      },
+      workflowAliases: { 'workflows/keep.json': 'malformed-shadow' },
+      aliasOps: {
+        'workflows/keep.json': { value: null, deleted: true, updatedAt: NaN },
+        'workflows/broken.json': { value: null, deleted: false, updatedAt: 900 }
+      }
+    }
+  }))
+  const indexedDb = createFakeIndexedDb(canonical)
+  const store = new ChatHistoryStore({ storage, indexedDb })
+
+  const loaded = await store.load()
+  await store.flush()
+  const reloaded = await new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb }).load()
+
+  assert.deepEqual(loaded.threads[0].msgs.map((message) => message.id), ['keep-message'])
+  assert.equal(loaded.meta.activeByScope['panel:global'], 'keep')
+  assert.equal(loaded.meta.workflowAliases['workflows/keep.json'], 'keep-workflow')
+  assert.deepEqual(reloaded.threads[0].msgs.map((message) => message.id), ['keep-message'])
+  assert.equal(Object.hasOwn(reloaded.meta.deletedThreads, 'keep'), false)
 })
 
 test('notifies another tab when the local history shadow changes', () => {

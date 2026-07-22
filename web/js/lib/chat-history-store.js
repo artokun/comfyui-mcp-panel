@@ -28,52 +28,71 @@ function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function safeMap() {
+  return Object.create(null);
+}
+
 function mergeTimestampMaps(...maps) {
-  const merged = {};
+  const merged = safeMap();
   for (const map of maps) {
-    if (!map || typeof map !== "object") continue;
+    if (!map || typeof map !== "object" || Array.isArray(map)) continue;
     for (const [key, value] of Object.entries(map)) {
-      merged[key] = Math.max(finiteTs(merged[key]), finiteTs(value));
+      const revision = finiteTs(value);
+      if (typeof key !== "string" || !key || !revision) continue;
+      merged[key] = Math.max(finiteTs(merged[key]), revision);
     }
   }
   return merged;
 }
 
 function normalizeMetadataOperation(operation, fallbackValue, fallbackUpdatedAt) {
-  if (operation && typeof operation === "object") {
-    const deleted = operation.deleted === true || operation.value == null;
+  if (operation && typeof operation === "object" && !Array.isArray(operation)) {
+    const updatedAt = finiteTs(operation.updatedAt);
+    const deleted = operation.deleted;
+    const coherent =
+      deleted === true
+        ? operation.value == null
+        : deleted === false && operation.value != null;
+    if (!updatedAt || !coherent) return null;
     return {
-      value: deleted ? null : operation.value,
+      value: deleted ? null : cloneJson(operation.value),
       deleted,
-      updatedAt: finiteTs(operation.updatedAt) || finiteTs(fallbackUpdatedAt),
+      updatedAt,
     };
   }
+  const updatedAt = finiteTs(fallbackUpdatedAt);
+  if (!updatedAt || fallbackValue == null) return null;
   return {
-    value: fallbackValue,
+    value: cloneJson(fallbackValue),
     deleted: false,
-    updatedAt: finiteTs(fallbackUpdatedAt),
+    updatedAt,
   };
 }
 
 function normalizeMetadataOperations(operations, values, fallbackUpdatedAt) {
-  const normalized = {};
-  if (operations && typeof operations === "object") {
+  const normalized = safeMap();
+  const seen = new Set();
+  if (operations && typeof operations === "object" && !Array.isArray(operations)) {
     for (const [key, operation] of Object.entries(operations)) {
-      normalized[key] = normalizeMetadataOperation(operation, null, fallbackUpdatedAt);
+      if (typeof key !== "string" || !key) continue;
+      seen.add(key);
+      const valid = normalizeMetadataOperation(operation, null, fallbackUpdatedAt);
+      if (valid) normalized[key] = valid;
     }
   }
-  if (values && typeof values === "object") {
+  if (values && typeof values === "object" && !Array.isArray(values)) {
     for (const [key, value] of Object.entries(values)) {
-      if (!Object.hasOwn(normalized, key)) {
-        normalized[key] = normalizeMetadataOperation(null, value, fallbackUpdatedAt);
-      }
+      if (typeof key !== "string" || !key || seen.has(key)) continue;
+      const valid = normalizeMetadataOperation(null, value, fallbackUpdatedAt);
+      if (valid) normalized[key] = valid;
     }
   }
   return normalized;
 }
 
 function mergeMetadataOperationMaps(current, incoming) {
-  const merged = { ...(current && typeof current === "object" ? current : {}) };
+  const merged = safeMap();
+  for (const [key, operation] of Object.entries(current || {})) merged[key] = operation;
   for (const [key, operation] of Object.entries(incoming || {})) {
     const previous = merged[key];
     const previousAt = finiteTs(previous?.updatedAt);
@@ -92,7 +111,7 @@ function mergeMetadataOperationMaps(current, incoming) {
 }
 
 function materializeMetadataOperations(operations) {
-  const values = {};
+  const values = safeMap();
   for (const [key, operation] of Object.entries(operations || {})) {
     if (operation?.deleted !== true && operation?.value != null) values[key] = operation.value;
   }
@@ -108,9 +127,10 @@ export function updateMetadataEntry(meta, mapName, key, value, updatedAt = Date.
       : null;
   if (!opsName || typeof key !== "string" || !key) return meta;
   const revision = finiteTs(updatedAt) || Date.now();
-  const values = {
-    ...(meta?.[mapName] && typeof meta[mapName] === "object" ? meta[mapName] : {}),
-  };
+  const values = safeMap();
+  for (const [existingKey, existingValue] of Object.entries(meta?.[mapName] || {})) {
+    values[existingKey] = existingValue;
+  }
   const deleted = value == null;
   if (deleted) delete values[key];
   else values[key] = value;
@@ -118,10 +138,9 @@ export function updateMetadataEntry(meta, mapName, key, value, updatedAt = Date.
     ...(meta && typeof meta === "object" ? meta : {}),
     updatedAt: Math.max(finiteTs(meta?.updatedAt), revision),
     [mapName]: values,
-    [opsName]: {
-      ...(meta?.[opsName] && typeof meta[opsName] === "object" ? meta[opsName] : {}),
+    [opsName]: Object.assign(safeMap(), meta?.[opsName] || {}, {
       [key]: { value: deleted ? null : value, deleted, updatedAt: revision },
-    },
+    }),
   };
 }
 
@@ -275,11 +294,11 @@ export function mergeHistorySnapshots(...snapshots) {
       };
       activeOps = mergeMetadataOperationMaps(
         activeOps,
-        normalizeMetadataOperations(snap.meta.activeOps, snap.meta.activeByScope, incomingUpdatedAt),
+        normalizeMetadataOperations(snap.meta.activeOps, snap.meta.activeByScope, incomingUpdatedAt || 1),
       );
       aliasOps = mergeMetadataOperationMaps(
         aliasOps,
-        normalizeMetadataOperations(snap.meta.aliasOps, snap.meta.workflowAliases, incomingUpdatedAt),
+        normalizeMetadataOperations(snap.meta.aliasOps, snap.meta.workflowAliases, incomingUpdatedAt || 1),
       );
       deletedThreads = mergeTimestampMaps(deletedThreads, snap.meta.deletedThreads);
       metaUpdatedAt = Math.max(metaUpdatedAt, incomingUpdatedAt);
