@@ -11647,26 +11647,21 @@ function buildPanel() {
   // In-flight Remote-control pairing request: the open modal registers a handler
   // here; the `pair_url`/`pair_error` reply consumes it (mirrors pendingSetSecret).
   let pendingPair = null;
-  // Last status this panel reconciled the settings box against, so a repeated
-  // "connected" emission cannot re-close a box the user just opened.
-  let settingsStatusApplied = null;
   const client = createBridgeClient({
     onStatus(state) {
       statusText.textContent = state;
       dot.className = "cmcp-dot" + (state === "connected" ? " connected" : state === "connecting" ? " connecting" : "");
-      // Reconcile the settings box only when the status actually CHANGED.
-      // The bridge re-emits "connected" repeatedly on purpose — its dedupe
-      // guard exempts that state (`s === lastStatus && s !== "connected"`) so
-      // connected-state side effects re-apply. Deriving visibility on every
-      // emission therefore slammed this box shut a moment after the user
-      // opened it: click the status chip while connected, and the next tick
-      // re-hid it. That is the "dropdown flashes open then closes, can't
-      // reach Disconnect" report — the box was being closed by a heartbeat,
-      // not by the click-outside handler.
-      if (state !== settingsStatusApplied) {
-        settingsStatusApplied = state;
-        settingsBox.hidden = state !== "disconnected";
-      }
+      // Connection status does NOT drive this box's visibility. It's a
+      // dropdown: the user opens it and the user closes it (trigger, click
+      // away, or Escape). Deriving `hidden` from status here is what made it
+      // flash open and snap shut — the bridge re-emits "connected" on every
+      // handshake frame, and each emission re-hid a box the user had just
+      // opened, putting Disconnect out of reach. Guarding that on "only when
+      // the status changed" papered over it; not owning the visibility at all
+      // is the actual fix, and it means no future status path can steal it
+      // back. The places that legitimately REVEAL the box are user-initiated
+      // (clicking Disconnect, or trying to send while disconnected) and live
+      // at those call sites.
       const connected = state === "connected";
       connectBtn.hidden = connected;
       disconnectBtn.hidden = !connected;
@@ -14636,6 +14631,20 @@ function buildPanel() {
   // close when clicking inside the panel. Capturing runs on the way DOWN to the
   // target, before LiteGraph can swallow the event, so a click ANYWHERE (canvas,
   // toolbar, other widgets) dismisses the dropdown.
+  // Escape closes whichever dropdown is open, the way every other menu does.
+  // Capture phase for the same reason as the pointer handler: ComfyUI binds its
+  // own Escape (deselect / close dialogs) and we want ours to win while a panel
+  // dropdown is open, without stealing the key when nothing is open.
+  function onDocEscape(ev) {
+    if (ev.key !== "Escape") return;
+    if (!settingsBox.hidden) {
+      settingsBox.hidden = true;
+      ev.stopPropagation();
+      ev.preventDefault();
+    }
+  }
+  document.addEventListener("keydown", onDocEscape, true);
+
   function onDocPointerDown(ev) {
     const t = ev.target;
     if (!settingsBox.hidden && !settingsBox.contains(t) && !status.contains(t)) {
@@ -14862,6 +14871,7 @@ function buildPanel() {
       }
       clearInterval(_wfPoll); // stop per-workflow change polling on unmount
       document.removeEventListener("mousedown", onDocPointerDown, true);
+      document.removeEventListener("keydown", onDocEscape, true);
       document.removeEventListener("keydown", onInterruptKeydown, true);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       try {
