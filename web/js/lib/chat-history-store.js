@@ -33,6 +33,18 @@ const THREAD_FIELDS = [
   "pinned",
   "title",
 ];
+const INVALID_FIELD_VALUE = Symbol("invalid-thread-field-value");
+const THREAD_STRING_LIMITS = {
+  sessionId: 512,
+  workflowKey: 512,
+  workflowTitle: 240,
+  provider: 80,
+  model: 200,
+  effort: 40,
+  title: 160,
+};
+const MAX_TODOS = 100;
+const MAX_TODO_TEXT = 2000;
 
 function finiteTs(value) {
   const n = Number(value);
@@ -142,6 +154,36 @@ function mergeTimestampMaps(...maps) {
   return merged;
 }
 
+function normalizeExplicitRevision(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const updatedAt = finiteTs(value.updatedAt);
+  const writerId = typeof value.writerId === "string" ? value.writerId.trim() : "";
+  const sequence = Number(value.sequence);
+  if (
+    !updatedAt || !writerId || writerId.length > 200 ||
+    !Number.isSafeInteger(sequence) || sequence < 0
+  ) return null;
+  return { updatedAt, writerId, sequence };
+}
+
+function normalizeThreadFieldValue(field, value) {
+  if (value == null) return null;
+  if (field === "pinned") return typeof value === "boolean" ? value : INVALID_FIELD_VALUE;
+  if (field === "todos") {
+    if (!Array.isArray(value)) return INVALID_FIELD_VALUE;
+    const todos = [];
+    for (const item of value.slice(0, MAX_TODOS)) {
+      if (!item || typeof item !== "object" || Array.isArray(item) || typeof item.text !== "string") continue;
+      const status = item.status === "active" || item.status === "done" ? item.status : "pending";
+      todos.push({ text: item.text.slice(0, MAX_TODO_TEXT), status });
+    }
+    return todos;
+  }
+  const limit = THREAD_STRING_LIMITS[field];
+  if (limit) return typeof value === "string" ? value.slice(0, limit) : INVALID_FIELD_VALUE;
+  return INVALID_FIELD_VALUE;
+}
+
 function normalizeThreadDeletion(operation) {
   const legacyAt = finiteTs(operation);
   if (legacyAt) {
@@ -179,11 +221,10 @@ function mergeThreadDeletionMaps(...maps) {
 
 function normalizeMetadataOperation(operation, fallbackValue, fallbackUpdatedAt) {
   if (operation && typeof operation === "object" && !Array.isArray(operation)) {
-    const revision = normalizeRevision(
-      operation.revision || operation,
-      0,
-      `legacy-${stableHash(canonicalJson(operation))}`,
-    );
+    const hasExplicitRevision = Object.hasOwn(operation, "revision");
+    const revision = hasExplicitRevision
+      ? normalizeExplicitRevision(operation.revision)
+      : legacyRevision(operation.value, finiteTs(operation.updatedAt));
     const deleted = operation.deleted;
     const coherent =
       deleted === true
@@ -299,7 +340,12 @@ function normalizeThreadFieldOperations(raw, fallbackUpdatedAt) {
   for (const field of THREAD_FIELDS) {
     if (source && Object.hasOwn(source, field)) {
       const operation = normalizeMetadataOperation(source[field], null, 0);
-      if (operation) operations[field] = operation;
+      if (operation) {
+        const value = operation.deleted ? null : normalizeThreadFieldValue(field, operation.value);
+        if (operation.deleted || value !== INVALID_FIELD_VALUE) {
+          operations[field] = { ...operation, value };
+        }
+      }
       continue;
     }
     let hasValue = Object.hasOwn(raw, field);
@@ -309,6 +355,8 @@ function normalizeThreadFieldOperations(raw, fallbackUpdatedAt) {
       value = "panel:global";
     }
     if (!hasValue || value == null) continue;
+    value = normalizeThreadFieldValue(field, value);
+    if (value === INVALID_FIELD_VALUE) continue;
     const revision = legacyRevision(value, fallbackUpdatedAt);
     operations[field] = {
       value: cloneJson(value),
@@ -324,9 +372,14 @@ function materializeThreadFields(thread, fieldOps) {
   const materialized = { ...thread, fieldOps };
   for (const field of THREAD_FIELDS) {
     const operation = fieldOps[field];
-    if (!operation) continue;
-    if (operation.deleted === true) delete materialized[field];
-    else materialized[field] = cloneJson(operation.value);
+    if (operation) {
+      if (operation.deleted === true) delete materialized[field];
+      else materialized[field] = cloneJson(operation.value);
+      continue;
+    }
+    const normalized = normalizeThreadFieldValue(field, materialized[field]);
+    if (normalized === INVALID_FIELD_VALUE || normalized == null) delete materialized[field];
+    else materialized[field] = cloneJson(normalized);
   }
   materialized.pinned = materialized.pinned === true;
   materialized.workflowKey = typeof materialized.workflowKey === "string"
@@ -337,9 +390,9 @@ function materializeThreadFields(thread, fieldOps) {
 
 function normalizeCheckpoint(meta) {
   const generation = Number(meta?.checkpoint?.generation);
-  const revision = normalizeRevision(meta?.checkpoint?.revision);
+  const revision = normalizeExplicitRevision(meta?.checkpoint?.revision);
   return {
-    generation: Number.isSafeInteger(generation) && generation > 0 ? generation : 0,
+    generation: Number.isSafeInteger(generation) && generation > 0 && revision ? generation : 0,
     revision,
   };
 }
@@ -916,17 +969,19 @@ export class ChatHistoryStore {
     let newestAt = finiteTs(thread.updatedAt);
     for (const [field, value] of Object.entries(values)) {
       if (!THREAD_FIELDS.includes(field)) continue;
+      const normalizedValue = value == null ? null : normalizeThreadFieldValue(field, value);
+      if (normalizedValue === INVALID_FIELD_VALUE) continue;
       this._observeRevision(fieldOps[field]);
       const revision = this.nextRevision(updatedAt);
-      const deleted = value == null;
+      const deleted = normalizedValue == null;
       fieldOps[field] = {
-        value: deleted ? null : cloneJson(value),
+        value: deleted ? null : cloneJson(normalizedValue),
         deleted,
         updatedAt: revision.updatedAt,
         revision,
       };
       if (deleted) delete thread[field];
-      else thread[field] = cloneJson(value);
+      else thread[field] = cloneJson(normalizedValue);
       newestAt = Math.max(newestAt, revision.updatedAt);
     }
     thread.fieldOps = fieldOps;

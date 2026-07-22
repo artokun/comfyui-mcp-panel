@@ -908,6 +908,85 @@ test('partially corrupt atomic shadow recovers each invalid half from legacy sto
   assert.equal(loaded.meta.activeByScope['panel:global'], 'legacy-thread')
 })
 
+test('validates and caps field operations while preserving legacy clear migration', () => {
+  const base = normalizeThread({
+    id: 'field-validation',
+    sessionId: 'canonical-session',
+    pinned: true,
+    todos: [{ text: 'canonical todo', status: 'active' }],
+    title: 'canonical title',
+    workflowTitle: 'canonical workflow title',
+    updatedAt: 100,
+    msgs: []
+  })
+  const malformed = normalizeThread({
+    ...base,
+    updatedAt: 1_000,
+    fieldOps: {
+      ...base.fieldOps,
+      sessionId: {
+        value: { forged: true },
+        deleted: false,
+        updatedAt: 1_000,
+        revision: { updatedAt: 1_000, writerId: 'attacker', sequence: 1 }
+      },
+      pinned: {
+        value: 'yes',
+        deleted: false,
+        updatedAt: 1_001,
+        revision: { updatedAt: 1_001, writerId: 'attacker', sequence: 2 }
+      },
+      todos: {
+        value: 'not-an-array',
+        deleted: false,
+        updatedAt: 1_002,
+        revision: { updatedAt: 1_002, writerId: 'attacker', sequence: 3 }
+      },
+      title: {
+        value: 'x'.repeat(500),
+        deleted: false,
+        updatedAt: 1_003,
+        revision: { updatedAt: 1_003, writerId: 'attacker', sequence: 4 }
+      },
+      workflowTitle: {
+        value: 'y'.repeat(500),
+        deleted: false,
+        updatedAt: 1_004,
+        revision: { updatedAt: 1_004, writerId: '', sequence: -1 }
+      }
+    }
+  })
+
+  assert.equal(malformed.sessionId, 'canonical-session')
+  assert.equal(malformed.pinned, true)
+  assert.deepEqual(malformed.todos, [{ text: 'canonical todo', status: 'active' }])
+  assert.equal(malformed.title.length, 160)
+  assert.equal(malformed.workflowTitle, 'canonical workflow title')
+
+  const cappedTodos = Array.from({ length: 140 }, (_, index) => ({
+    text: `todo-${index}-${'z'.repeat(2_100)}`,
+    status: index === 0 ? 'done' : 'unknown'
+  }))
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb: null })
+  store.reviseThread(malformed, { todos: cappedTodos, pinned: 'invalid', model: { bad: true } }, 2_000)
+  assert.equal(malformed.todos.length, 100)
+  assert.equal(malformed.todos[0].text.length, 2_000)
+  assert.equal(malformed.todos[0].status, 'done')
+  assert.equal(malformed.todos[1].status, 'pending')
+  assert.equal(malformed.pinned, true)
+  assert.equal(malformed.model, undefined)
+
+  const legacyClear = normalizeThread({
+    ...base,
+    fieldOps: {
+      ...base.fieldOps,
+      sessionId: { value: null, deleted: true, updatedAt: 3_000 }
+    }
+  })
+  assert.equal(legacyClear.sessionId, undefined)
+  assert.equal(legacyClear.fieldOps.sessionId.deleted, true)
+})
+
 test('drops malformed nested tombstones and metadata operations before canonical merge', async () => {
   const canonical = {
     updatedAt: 500,
