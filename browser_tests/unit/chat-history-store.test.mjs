@@ -85,6 +85,7 @@ function createFakeIndexedDb(initialState = null, { blockedThenSuccess = false }
 
 function createBroadcastHub() {
   const channels = new Set()
+  let closeCount = 0
   return {
     factory: () => {
       const listeners = new Set()
@@ -99,11 +100,17 @@ function createBroadcastHub() {
         },
         dispatch: (data) => {
           for (const listener of listeners) listener({ data })
+        },
+        close: () => {
+          if (!channels.delete(channel)) return
+          closeCount += 1
+          listeners.clear()
         }
       }
       channels.add(channel)
       return channel
-    }
+    },
+    closeCount: () => closeCount
   }
 }
 
@@ -1036,7 +1043,7 @@ test('canonical IndexedDB checkpoint quarantines forged empty and partial local 
   }
 })
 
-test('notifies another tab when the local history shadow changes', () => {
+test('notifies another tab when the local history shadow changes', async () => {
   const values = new Map()
   const storage = {
     getItem: (key) => values.get(key) ?? null,
@@ -1057,8 +1064,34 @@ test('notifies another tab when the local history shadow changes', () => {
   for (const listener of listeners) listener({ key: 'unrelated' })
   assert.equal(received, null)
   for (const listener of listeners) listener({ key: 'comfyui-mcp.panel.threads' })
+  await new Promise((resolve) => setTimeout(resolve, 0))
   assert.equal(received.threads[0].id, 'from-other-tab')
   unsubscribe()
+  assert.equal(listeners.size, 0)
+})
+
+test('store close is idempotent and releases subscriptions and BroadcastChannel once', () => {
+  const listeners = new Set()
+  const eventTarget = {
+    addEventListener: (type, listener) => type === 'storage' && listeners.add(listener),
+    removeEventListener: (type, listener) => type === 'storage' && listeners.delete(listener)
+  }
+  const hub = createBroadcastHub()
+  const store = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb: null,
+    broadcastChannelFactory: hub.factory
+  })
+  store.subscribe(() => {}, eventTarget)
+  assert.equal(listeners.size, 1)
+
+  store.close()
+  store.close()
+
+  assert.equal(listeners.size, 0)
+  assert.equal(hub.closeCount(), 1)
+  const unsubscribeAfterClose = store.subscribe(() => {}, eventTarget)
+  unsubscribeAfterClose()
   assert.equal(listeners.size, 0)
 })
 

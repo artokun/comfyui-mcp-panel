@@ -857,6 +857,8 @@ export class ChatHistoryStore {
     this._writePromise = Promise.resolve(null);
     this._lastCommitted = null;
     this._dirtyWrite = null;
+    this._closed = false;
+    this._subscriptions = new Set();
     const channelFactory = options.broadcastChannelFactory || (
       globalThis.window === globalThis && typeof globalThis.BroadcastChannel === "function"
         ? (name) => new globalThis.BroadcastChannel(name)
@@ -1025,6 +1027,7 @@ export class ChatHistoryStore {
   }
 
   persist(threads, meta = {}, options = {}) {
+    if (this._closed) return this._lastCommitted || mergeHistorySnapshots({ threads, meta });
     const freshSnapshot = mergeHistorySnapshots({ threads, meta });
     if (hasIdlessMessages(threads)) freshSnapshot[LEGACY_IDLESS_SOURCE] = true;
     const snapshot = this._dirtyWrite
@@ -1086,7 +1089,7 @@ export class ChatHistoryStore {
    *  in the other tabs, making it a cheap cross-tab invalidation channel while
    *  IndexedDB remains the full, atomically merged source of truth. */
   subscribe(listener, eventTarget = globalThis) {
-    if (typeof listener !== "function") return () => {};
+    if (this._closed || typeof listener !== "function") return () => {};
     const onStorage = (event) => {
       if (
         event?.key !== this.snapshotKey &&
@@ -1103,10 +1106,16 @@ export class ChatHistoryStore {
     };
     eventTarget?.addEventListener?.("storage", onStorage);
     this._broadcastChannel?.addEventListener?.("message", onBroadcast);
-    return () => {
+    let active = true;
+    const unsubscribe = () => {
+      if (!active) return;
+      active = false;
       eventTarget?.removeEventListener?.("storage", onStorage);
       this._broadcastChannel?.removeEventListener?.("message", onBroadcast);
+      this._subscriptions.delete(unsubscribe);
     };
+    this._subscriptions.add(unsubscribe);
+    return unsubscribe;
   }
 
   async flush() {
@@ -1119,6 +1128,19 @@ export class ChatHistoryStore {
       error: error?.message || String(error),
     }));
     return result == null || result.ok === true ? true : result;
+  }
+
+  close() {
+    if (this._closed) return;
+    this._closed = true;
+    for (const unsubscribe of [...this._subscriptions]) unsubscribe();
+    this._subscriptions.clear();
+    try {
+      this._broadcastChannel?.close?.();
+    } catch {
+      // Closing an already-detached native channel is harmless.
+    }
+    this._broadcastChannel = null;
   }
 
 }

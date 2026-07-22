@@ -15433,6 +15433,7 @@ function buildPanel() {
       document.removeEventListener("visibilitychange", onVisibilityChange);
       window.removeEventListener("pagehide", onPageHide);
       unsubscribeHistorySync();
+      void historyStore.flush().finally(() => historyStore.close());
       if (workflowAliasMutationSink === panelAliasMutationSink) workflowAliasMutationSink = null;
       try {
         api.removeEventListener("executed", onExecuted);
