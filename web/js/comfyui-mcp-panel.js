@@ -10412,13 +10412,16 @@ function buildPanel() {
   }
 
   function applyWorkflowAliasesFromHistory() {
-    const operations = historyMeta.aliasOps || {};
-    for (const [path, operation] of Object.entries(operations)) {
-      if (operation?.deleted === true || operation?.value == null) delete _workflowUuidAliases[path];
-      else _workflowUuidAliases[path] = operation.value;
+    // This materialized map is the complete canonical view, including the
+    // current checkpoint baseline plus every newer local/remote operation in
+    // the merge. Replace the cache wholesale so a compacted delete cannot
+    // leave a stale module-level alias that the next local diff republishes.
+    const materialized = historyMeta.workflowAliases || {};
+    for (const path of Object.keys(_workflowUuidAliases)) {
+      if (!Object.hasOwn(materialized, path)) delete _workflowUuidAliases[path];
     }
-    for (const [path, value] of Object.entries(historyMeta.workflowAliases || {})) {
-      if (!Object.hasOwn(operations, path)) _workflowUuidAliases[path] = value;
+    for (const [path, value] of Object.entries(materialized)) {
+      _workflowUuidAliases[path] = value;
     }
     persistWorkflowAliases();
   }

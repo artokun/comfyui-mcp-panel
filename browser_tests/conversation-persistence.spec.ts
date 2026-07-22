@@ -484,6 +484,49 @@ test('workflow rename publishes alias tombstones and a stale tab cannot echo the
     }
   })).toEqual({ oldDeleted: true, newValue: workflowUuid })
 
+  // Model canonical compaction after the old-path delete has crossed the
+  // metadata-operation bound: the materialized aliases remain complete, while
+  // the delete operation itself no longer exists.
+  await page.evaluate(async () => {
+    const snapshotKey = 'comfyui-mcp.panel.historySnapshot'
+    const snapshot = JSON.parse(localStorage.getItem(snapshotKey) || '{}')
+    const revisions = Object.values(snapshot.meta?.aliasOps || {})
+      .map((operation: any) => operation?.revision)
+      .filter((revision: any) => Number.isFinite(revision?.updatedAt))
+    const revision = revisions.sort((a: any, b: any) => b.updatedAt - a.updatedAt)[0] || {
+      updatedAt: Date.now(), writerId: 'compaction-test', sequence: 1
+    }
+    snapshot.meta = {
+      ...(snapshot.meta || {}),
+      aliasOps: {},
+      checkpoint: {
+        generation: Number(snapshot.meta?.checkpoint?.generation || 0) + 1,
+        revision
+      }
+    }
+    localStorage.setItem(snapshotKey, JSON.stringify(snapshot))
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open('comfyui-mcp-panel-history', 3)
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error)
+    })
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction('snapshots', 'readwrite')
+        tx.objectStore('snapshots').put(snapshot, 'state')
+        tx.oncomplete = () => resolve()
+        tx.onerror = () => reject(tx.error)
+        tx.onabort = () => reject(tx.error)
+      })
+    } finally {
+      db.close()
+    }
+  })
+  await expect.poll(() => otherTab.evaluate(() => {
+    const aliases = JSON.parse(localStorage.getItem('comfyui-mcp.panel.workflowUuidAliases') || '{}')
+    return Object.hasOwn(aliases, 'workflows/alias-old.json')
+  })).toBe(false)
+
   await otherPanel.setBridgeUrl(mockBridge.url)
   await otherPanel.connect()
   const unrelated = mockBridge.waitForUserMessage()
