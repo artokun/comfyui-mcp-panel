@@ -288,7 +288,10 @@ test('run on RunPod: dry-patches locally, enqueues on the pod via the bridge', a
       version: 1,
       hideWorkflow: false,
       appMode: {
-        inputs: [{ nodeId: 6, widget: 'text', label: 'Prompt', kind: 'text', default: 'a cat' }],
+        inputs: [
+          { nodeId: 6, widget: 'text', label: 'Prompt', kind: 'text', default: 'a cat' },
+          { nodeId: 5, widget: 'image', label: 'Face', kind: 'image' }
+        ],
         outputs: [],
         importedFromFrontend: false
       },
@@ -296,12 +299,27 @@ test('run on RunPod: dry-patches locally, enqueues on the pod via the bridge', a
       published: null
     },
     workflow: FIXTURE_WORKFLOW,
-    prompt: FIXTURE_PROMPT
+    prompt: {
+      ...FIXTURE_PROMPT,
+      '5': { class_type: 'LoadImage', inputs: { image: 'placeholder.png' } }
+    }
   })
 
   // Answer the bridge's whitelisted call_tool surface: capture enqueue_workflow.
   const toolCalls: { tool: string; args: Record<string, unknown> }[] = []
+  const uploads: { filename: string; mime: string }[] = []
   mockBridge.onFrame((frame) => {
+    if (frame.type === 'upload_media') {
+      uploads.push({ filename: String(frame.filename), mime: String(frame.mime) })
+      mockBridge.send({
+        type: 'media_uploaded',
+        cid: frame.cid,
+        ok: true,
+        name: 'pod_img_00001.png',
+        kind: 'image'
+      })
+      return
+    }
     if (frame.type !== 'call_tool') return
     toolCalls.push({ tool: String(frame.tool), args: (frame.args || {}) as Record<string, unknown> })
     mockBridge.send({
@@ -325,13 +343,22 @@ test('run on RunPod: dry-patches locally, enqueues on the pod via the bridge', a
   const modal = page.locator('.cmcp-apps-modal')
   await modal.locator('.cmcp-app-card', { hasText: 'Pod App' }).click()
   await modal.locator('.cmcp-apps-field textarea').first().fill('a pod dog')
+  // Image input: the bytes must go THROUGH THE BRIDGE to the pod, and the
+  // patched prompt must carry the pod-side filename.
+  await modal.locator('input[type=file]').setInputFiles({
+    name: 'face.png',
+    mimeType: 'image/png',
+    buffer: PIXEL
+  })
   await modal.getByRole('button', { name: '☁ Run on RunPod' }).click()
 
   await expect(modal.locator('.cmcp-apps-status')).toContainText('queued on pod (prompt_id pod-1)')
+  expect(uploads).toEqual([{ filename: 'face.png', mime: 'image/png' }])
   const enqueue = toolCalls.find((c) => c.tool === 'enqueue_workflow')
   expect(enqueue).toBeTruthy()
   const wf = enqueue!.args.workflow as Record<string, { inputs: Record<string, unknown> }>
   expect(wf['6'].inputs.text).toBe('a pod dog')
+  expect(wf['5'].inputs.image).toBe('pod_img_00001.png')
   // App inputs are the user's choices — the seed is never re-rolled.
   expect(enqueue!.args.disable_random_seed).toBe(true)
   // Nothing hit the LOCAL queue path.

@@ -199,6 +199,10 @@ export class PanelPage {
       await this.reconnectButton.click()
     }
     await this.waitForStatus('connected')
+    // The connection popover stays open after Connect (dropdown semantics from
+    // #116/#117) and covers the toolbar — dismiss it so tests can click on.
+    await this.page.keyboard.press('Escape')
+    await this.connectionPopover.waitFor({ state: 'hidden' }).catch(() => {})
   }
 
   async openConnectionSettings(): Promise<void> {
