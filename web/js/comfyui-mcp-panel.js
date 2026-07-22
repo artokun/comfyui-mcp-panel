@@ -6640,6 +6640,78 @@ function animateToBoundsPadded(bounds, padPct, duration) {
   canvas.setDirty(true, true);
 }
 
+/** Docked-modal geometry for the agent-driven CivitAI/Training modals. Measures
+ *  the Agent pane and the ComfyUI canvas, then anchors into the canvas area
+ *  OPPOSITE the pane (the pane can be docked LEFT or RIGHT). Three states:
+ *   - detached → the Agent root left the DOM (sidebar-tab switch); the caller
+ *     hides the orphaned body-mounted modal.
+ *   - centered → no usable anchor (missing/zero-size/too-small).
+ *   - docked   → { left, right, top, bottom } insets for position:fixed.
+ *  Mirrors the pane/canvas detection in animateToBoundsPadded (:6613-6624). */
+function panelDockGeometry() {
+  try {
+    const root = activePanelRoot;
+    if (!root || !root.isConnected) return { status: "detached" };
+    const pane = root.closest(".side-bar-panel") || root.closest("[class*='sidebar']") || root;
+    const pr = pane.getBoundingClientRect();
+    if (!pr || pr.width < 1 || pr.height < 1) return { status: "centered" };
+    const vw = window.innerWidth, vh = window.innerHeight;
+    let cr = null;
+    try { cr = getGraphCtx().canvas?.canvas?.getBoundingClientRect?.() || null; } catch { cr = null; }
+    const canvasRect = (cr && cr.width > 1)
+      ? cr : { left: 0, right: vw, top: 0, bottom: vh, width: vw };
+    const paneOnLeft = (pr.left + pr.right) / 2 < (canvasRect.left + canvasRect.right) / 2;
+    let left, right;
+    if (paneOnLeft) {
+      left = Math.max(pr.right, canvasRect.left);
+      right = Math.max(0, vw - canvasRect.right);
+    } else {
+      left = Math.max(0, canvasRect.left);
+      right = Math.max(0, vw - Math.min(pr.left, canvasRect.right));
+    }
+    const top = Math.max(0, Math.min(pr.top, canvasRect.top));
+    const bottom = Math.max(0, vh - Math.max(pr.bottom, canvasRect.bottom));
+    if (vw - left - right < 320 || vh - top - bottom < 200) return { status: "centered" };
+    return { status: "docked", left, right, top, bottom };
+  } catch {
+    return { status: "centered" };
+  }
+}
+
+/** Watch everything that can move the dock anchor and invoke `cb`: window
+ *  resize, PrimeVue splitter drags (ResizeObserver on pane + canvas — these do
+ *  NOT fire window-resize), and sidebar-tab switches (the Agent root detaches
+ *  without a resize; observe the rail's class changes). Returns a disposer that
+ *  the modal's single close() path calls. */
+function panelWatchDock(cb) {
+  const disposers = [];
+  const fire = () => { try { cb(); } catch { /* modal owns error handling */ } };
+  window.addEventListener("resize", fire);
+  disposers.push(() => window.removeEventListener("resize", fire));
+  try {
+    const root = activePanelRoot;
+    const pane = root?.closest?.(".side-bar-panel") || root?.closest?.("[class*='sidebar']") || root;
+    let cEl = null;
+    try { cEl = getGraphCtx().canvas?.canvas || null; } catch { cEl = null; }
+    if (typeof ResizeObserver === "function") {
+      const ro = new ResizeObserver(fire);
+      try { if (pane) ro.observe(pane); } catch { /* detached */ }
+      try { if (cEl) ro.observe(cEl); } catch { /* not ready */ }
+      disposers.push(() => { try { ro.disconnect(); } catch { /* already gone */ } });
+    }
+    // Sidebar-tab switch detaches the Agent root with no resize event — watch the
+    // rail's selected-button class so the dock re-evaluates (→ hide on detach,
+    // re-dock on return).
+    const toolbar = document.querySelector(".side-tool-bar-container");
+    if (toolbar && typeof MutationObserver === "function") {
+      const mo = new MutationObserver(fire);
+      mo.observe(toolbar, { subtree: true, attributes: true, attributeFilter: ["class"] });
+      disposers.push(() => { try { mo.disconnect(); } catch { /* already gone */ } });
+    }
+  } catch { /* best-effort; window-resize still wired */ }
+  return () => { for (const d of disposers) { try { d(); } catch { /* ignore */ } } };
+}
+
 /** Smoothly dart to the node(s) with the given ids (skips ones not found). */
 function focusNodesById(ids) {
   let graph;
@@ -9900,6 +9972,9 @@ function buildPanel() {
     return {
       api,
       root,
+      // Agent-drive side-dock geometry/observation (pane may be docked L or R).
+      dockGeometry: panelDockGeometry,
+      watchDock: panelWatchDock,
       callTool: (t, a, o) => liveBridgeClient?.callTool(t, a, o),
       sendUserMessage: (t, c, i) => liveBridgeClient?.sendUserMessage(t, c, i),
       uploadBlobToInput,
@@ -9976,6 +10051,8 @@ function buildPanel() {
     return {
       api,
       root,
+      dockGeometry: panelDockGeometry,
+      watchDock: panelWatchDock,
       callTool: (t, a, o) => liveBridgeClient?.callTool(t, a, o),
       uploadBlobToInput,
     };
@@ -11674,7 +11751,7 @@ function buildPanel() {
         case "civitai_highlight": return h.highlight(Array.isArray(msg.ids) ? msg.ids : (msg.ids != null ? [msg.ids] : []), { kind: msg.kind });
         case "civitai_clear_highlight": return h.clearHighlight();
         case "civitai_switch_tab": return h.switchTab(msg.tab);
-        case "civitai_search": return h.search({ query: msg.query, filters: msg.filters });
+        case "civitai_search": return h.search({ query: msg.query, filters: msg.filters, browsingLevels: msg.browsingLevels });
         case "civitai_open_lightbox": return h.openLightbox(msg.id);
         default: throw new Error(`unknown civitai cmd "${msg.cmd}"`);
       }

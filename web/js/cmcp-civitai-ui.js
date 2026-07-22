@@ -256,6 +256,11 @@ export function graphDirtyForConfirm(ctx) {
  *  baseModel/type, stats, prompt, and media URL(s). Metadata + URLs ONLY — never
  *  image bytes (the agent reasons from text; the human clicks to view). Pure and
  *  exported for unit tests. `limit` is clamped to [1, 200]. */
+export const CIVITAI_PROMPT_CAP = 600; // chars — bound the agent's token budget
+function _capPrompt(p) {
+  if (typeof p !== "string" || !p) return p || null;
+  return p.length > CIVITAI_PROMPT_CAP ? p.slice(0, CIVITAI_PROMPT_CAP) + "…" : p;
+}
 export function serializeCivitaiResults(source, { model = false, limit = 20, loading = false } = {}) {
   const n = Number(limit);
   const lim = Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 200) : 20;
@@ -270,7 +275,7 @@ export function serializeCivitaiResults(source, { model = false, limit = 20, loa
     title: null, creator: x.author || null,
     baseModel: x.modelName || null, type: x.type || null,
     stats: { reactions: x.reactions ?? null },
-    prompt: x.prompt || null,
+    prompt: _capPrompt(x.prompt), // bounded — token budget (audit item 3)
     urls: [x.thumbnailUrl, x.fullUrl].filter(Boolean),
   });
   return { items, total: rows.length, loading: !!loading };
@@ -298,6 +303,17 @@ export function openCivitaiModal(ctx, opts = {}) {
     searchSeq: 0, // searching-overlay ownership (see reload)
     signedIn: false, localNames: new Set(), localLoaded: false,
     favType: "all", // favorites sub-filter: all | image | video
+    // Agent-drive: a render generation bumped on every reload/tab/filter so a
+    // highlight that survives the await knows whether it's stale, and the
+    // highlight target set (ids, in input order) that appendItems/appendModels
+    // re-applies as later pages stream in on scroll.
+    renderRev: 0,
+    highlightSet: new Set(),
+    highlightOrder: [],
+    // The in-flight first-page reload / current page load, so drive methods can
+    // truly await the modal settling.
+    activeReloadPromise: null,
+    activeLoadPromise: null,
   };
   if (Array.isArray(opts.browsingLevels) && opts.browsingLevels.length) {
     state.filters = { ...state.filters, browsingLevels: [...opts.browsingLevels] };
@@ -309,16 +325,44 @@ export function openCivitaiModal(ctx, opts = {}) {
   // narrow panel sidebar) ────────────────────────────────────────────────────
   const overlay = el("div", "cmcp-cv-overlay");
   const modal = el("div", "cmcp-modal cmcp-civitai-modal");
-  let _onDockResize = null;
+  // Self-invalidating handle: isOpen flips false on the FIRST close() and every
+  // drive method asserts it, so a stale reference held past close throws instead
+  // of poking a detached grid. onClose lets the host compare-and-null its stored
+  // handle. close() is idempotent and tears down EVERY async/listener owned here.
+  let isOpen = true;
+  let _onDockResize = null;   // window-resize fallback when ctx.watchDock is absent
+  let _dockDispose = null;    // ResizeObserver+listener disposer from ctx.watchDock
+  let _oauthPollIv = null;    // sign-in completion poll (accountFlow)
+  let _onEscape = null;       // document Escape → close
   const close = () => {
+    if (!isOpen) return;      // idempotent
+    isOpen = false;
+    state.reqId++;            // invalidate any in-flight fetch (its guarded finally no-ops)
+    state.activeReloadPromise = null;
+    state.activeLoadPromise = null;
+    try { clearTimeout(searchTimer); } catch { /* not armed */ }
+    if (_oauthPollIv) { clearInterval(_oauthPollIv); _oauthPollIv = null; }
+    try { closeSubModals(); } catch { /* already gone */ }
+    if (_onEscape) { document.removeEventListener("keydown", _onEscape); _onEscape = null; }
     if (_onDockResize) { window.removeEventListener("resize", _onDockResize); _onDockResize = null; }
+    if (_dockDispose) { try { _dockDispose(); } catch { /* best effort */ } _dockDispose = null; }
     overlay.remove();
     try { opts.onClose?.(); } catch { /* host bookkeeping only */ }
   };
   // In docked mode the overlay itself is click-through (pointer-events:none), so a
-  // backdrop mousedown never fires here — the header ✕ is the only dismiss. Centered
-  // mode keeps the backdrop-click-to-close affordance.
+  // backdrop mousedown never fires here — the header ✕ / Escape are the dismissals.
+  // Centered mode keeps the backdrop-click-to-close affordance.
   overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
+  // Base modals had no Escape handler (audit item 9): add one that funnels through
+  // close(), but yield to a stacked lightbox / sub-modal so Escape peels the top.
+  _onEscape = (e) => {
+    if (e.key !== "Escape") return;
+    if (_subModals.size > 0) return;
+    if (document.querySelector(".cmcp-cv-lb")) return;
+    e.stopPropagation();
+    close();
+  };
+  document.addEventListener("keydown", _onEscape);
 
   // header
   const head = el("div", "cmcp-cv-head");
@@ -453,32 +497,68 @@ export function openCivitaiModal(ctx, opts = {}) {
   document.body.appendChild(overlay);
 
   // ── docked mode (agent-driven) ─────────────────────────────────────────────
-  // Anchor the card to the sidebar's right edge so chat stays visible + usable;
-  // below a narrow breakpoint fall back to the centered overlay. Recomputed on
-  // window resize (listener torn down in close()).
-  const DOCK_MIN_WIDTH = 900;
+  // Dock into the canvas area OPPOSITE the Agent pane (which may be docked left
+  // OR right) so chat stays visible + interactive. Geometry comes from the host
+  // (ctx.dockGeometry: it owns the ComfyUI pane/canvas measurement and the
+  // left/right detection), so this module stays ComfyUI-agnostic. Three states:
+  //  - detached  → the Agent tab was switched away; the body-mounted modal is
+  //    orphaned, so HIDE it (don't float centered over an unrelated screen).
+  //  - centered  → no eligible anchor (missing/zero-size/too-small/narrow window)
+  //  - docked    → anchored rect from the host.
+  applyDock.centered = false;
   function applyDock() {
-    const docked = !!opts.dock && window.innerWidth >= DOCK_MIN_WIDTH;
-    overlay.classList.toggle("cmcp-docked", docked);
-    if (!docked) {
-      modal.style.left = modal.style.right = modal.style.top = modal.style.bottom = "";
+    if (!opts.dock) { setCentered(); return; }
+    const geo = _dockGeometry();
+    if (geo?.status === "detached") {
+      overlay.style.display = "none";
       return;
     }
-    let left = 0, top = 0;
+    overlay.style.display = "";
+    if (geo?.status === "docked" && window.innerWidth >= 900) {
+      overlay.classList.add("cmcp-docked");
+      modal.style.left = `${Math.round(geo.left)}px`;
+      modal.style.top = `${Math.round(geo.top)}px`;
+      modal.style.right = `${Math.round(geo.right)}px`;
+      modal.style.bottom = `${Math.round(geo.bottom)}px`;
+      applyDock.centered = false;
+    } else {
+      setCentered();
+    }
+  }
+  function setCentered() {
+    overlay.classList.remove("cmcp-docked");
+    overlay.style.display = "";
+    modal.style.left = modal.style.right = modal.style.top = modal.style.bottom = "";
+    applyDock.centered = true;
+  }
+  /** Host geometry, with a self-contained fallback (single-pane / no host help /
+   *  tests): measure ctx.root's pane and dock to the wider viewport side. */
+  function _dockGeometry() {
+    if (typeof ctx.dockGeometry === "function") {
+      try { const g = ctx.dockGeometry(); if (g) return g; } catch { /* fall through */ }
+    }
     try {
-      const pane = ctx.root?.closest?.(".side-bar-panel") || ctx.root?.closest?.("[class*='sidebar']");
-      const r = pane?.getBoundingClientRect();
-      if (r) { left = Math.max(0, Math.round(r.right)); top = Math.max(0, Math.round(r.top)); }
-    } catch { /* fall back to full-height right edge */ }
-    modal.style.left = `${left}px`;
-    modal.style.top = `${top}px`;
-    modal.style.right = "0px";
-    modal.style.bottom = "0px";
+      const root = ctx.root;
+      if (root && !root.isConnected) return { status: "detached" };
+      const pane = root?.closest?.(".side-bar-panel") || root?.closest?.("[class*='sidebar']") || root;
+      const pr = pane?.getBoundingClientRect?.();
+      if (!pr || pr.width < 1 || pr.height < 1) return { status: "centered" };
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const paneOnLeft = (pr.left + pr.right) / 2 < vw / 2;
+      const left = paneOnLeft ? Math.max(0, pr.right) : 0;
+      const right = paneOnLeft ? 0 : Math.max(0, vw - pr.left);
+      if (vw - left - right < 320) return { status: "centered" };
+      return { status: "docked", left, right, top: Math.max(0, pr.top), bottom: Math.max(0, vh - pr.bottom) };
+    } catch { return { status: "centered" }; }
   }
   if (opts.dock) {
     applyDock();
-    _onDockResize = () => applyDock();
-    window.addEventListener("resize", _onDockResize);
+    // Watch pane + canvas (splitter drags don't fire window-resize) via the host;
+    // fall back to a bare window-resize listener when the host can't help.
+    if (typeof ctx.watchDock === "function") {
+      try { _dockDispose = ctx.watchDock(applyDock); } catch { _dockDispose = null; }
+    }
+    if (!_dockDispose) { _onDockResize = () => applyDock(); window.addEventListener("resize", _onDockResize); }
     // Slide-in on the next frame so the transition runs from the initial state.
     requestAnimationFrame(() => overlay.classList.add("cmcp-dock-in"));
   }
@@ -493,12 +573,24 @@ export function openCivitaiModal(ctx, opts = {}) {
   // ── data ───────────────────────────────────────────────────────────────
   function setLoading(on) { state.loading = on; progress.classList.toggle("on", on); }
 
-  async function reload({ searching = false } = {}) {
+  // Public reload: stores the in-flight promise so drive methods can await the
+  // first page settling, and returns it.
+  function reload(opts2 = {}) {
+    const p = _reload(opts2);
+    state.activeReloadPromise = p;
+    return p;
+  }
+  async function _reload({ searching = false } = {}) {
     // Invalidate any page load already IN FLIGHT: its response belongs to the
     // OLD tab/query/filters and must not repopulate the just-cleared grid (nor
     // leave its cursor behind). The stale request's guarded `finally` won't
     // clear the loading flag anymore, so reset it here too.
     state.reqId++;
+    // New render generation: any highlight awaiting the previous load is now
+    // stale, and the target set is cleared so it can't re-apply to fresh cards.
+    state.renderRev++;
+    state.highlightSet = new Set();
+    state.highlightOrder = [];
     setLoading(false);
     state.items = []; state.models = []; state.cursor = null; state.done = false;
     grid.innerHTML = ""; syncTabs();
@@ -514,7 +606,12 @@ export function openCivitaiModal(ctx, opts = {}) {
     }
   }
 
-  async function loadMore() {
+  function loadMore() {
+    const p = _loadMore();
+    state.activeLoadPromise = p;
+    return p;
+  }
+  async function _loadMore() {
     if (state.loading || state.done) return;
     const req = ++state.reqId;
     setLoading(true);
@@ -610,16 +707,29 @@ export function openCivitaiModal(ctx, opts = {}) {
     }
   }
 
+  // Re-apply the agent's highlight to a freshly-appended card: a highlight can
+  // target an id that only lands on a LATER page (scroll), so the glow must be
+  // (re)applied as cards stream in — not just at the moment highlight() ran.
+  function _applyGlowIfTargeted(card, id) {
+    if (state.highlightSet.has(String(id))) card.classList.add("cmcp-agent-glow");
+  }
   function appendItems(items) {
     for (const it of items) {
       if (tabDef().fav && !_liked.has(it.id)) _liked.set(it.id, true);
       state.items.push(it);
       const idx = state.items.length - 1;
-      grid.appendChild(mediaCard(it, idx));
+      const card = mediaCard(it, idx);
+      _applyGlowIfTargeted(card, it.id);
+      grid.appendChild(card);
     }
   }
   function appendModels(models) {
-    for (const m of models) { state.models.push(m); grid.appendChild(modelCard(m)); }
+    for (const m of models) {
+      state.models.push(m);
+      const card = modelCard(m);
+      _applyGlowIfTargeted(card, m.id);
+      grid.appendChild(card);
+    }
   }
 
   // ── cards ─────────────────────────────────────────────────────────────
@@ -1665,12 +1775,14 @@ export function openCivitaiModal(ctx, opts = {}) {
       const r = await ctx.api.fetchApi("/comfyui_mcp_panel/civitai/oauth/start?origin=" + encodeURIComponent(location.origin));
       const { authorize_url } = await r.json();
       window.open(authorize_url, "_blank", "width=520,height=720");
-      // poll for completion
+      // poll for completion — tracked so close() can cancel a pending sign-in.
       let tries = 0;
-      const iv = setInterval(async () => {
+      if (_oauthPollIv) clearInterval(_oauthPollIv);
+      _oauthPollIv = setInterval(async () => {
+        if (!isOpen) { clearInterval(_oauthPollIv); _oauthPollIv = null; return; }
         await refreshAuth();
         if (state.signedIn || ++tries > 120) {
-          clearInterval(iv);
+          clearInterval(_oauthPollIv); _oauthPollIv = null;
           if (state.signedIn) { toast("Signed in to CivitAI."); if (tabDef().fav) reload(); }
         }
       }, 2000);
@@ -1722,21 +1834,37 @@ export function openCivitaiModal(ctx, opts = {}) {
   // Post-open control surface: the same inner state/functions the UI drives,
   // exposed so the bridge (and through it the agent) can switch tabs, re-search,
   // read results (metadata + URLs only — never image bytes), and glow-highlight
-  // the interesting cards. Every method throws or returns a small plain object;
-  // no dynamic exec (registry-YARA safe).
-  function driveSwitchTab(key) {
+  // the interesting cards. Every method awaits the modal settling, throws on a
+  // closed handle, and returns a small plain object; no dynamic exec (YARA safe).
+  function _assertOpen() { if (!isOpen) throw new Error("civitai browser not open"); }
+  async function driveSwitchTab(key) {
+    _assertOpen();
     if (!TABS.some((t) => t.key === key)) throw new Error(`unknown tab "${key}"`);
-    if (state.tab !== key) { state.tab = key; syncTabs(); reload(); }
+    if (state.tab !== key) { state.tab = key; syncTabs(); await reload(); }
     else syncTabs();
-    return { tab: state.tab };
+    return { tab: state.tab, renderRev: state.renderRev };
   }
-  function driveSearch({ query, filters } = {}) {
+  async function driveSearch({ query, filters, browsingLevels } = {}) {
+    _assertOpen();
+    // Atomic normalize: fold filters, then query→(creator,text) in one shot so a
+    // half-applied state never reaches reload.
     if (filters && typeof filters === "object") {
       state.filters = {
         ...state.filters, ...filters,
         baseModels: Array.isArray(filters.baseModels) ? [...filters.baseModels] : state.filters.baseModels,
         browsingLevels: Array.isArray(filters.browsingLevels) ? [...filters.browsingLevels] : state.filters.browsingLevels,
       };
+    }
+    // NSFW browsing levels arrive already server-clamped (mcp strips adult
+    // levels without consent). Defense-in-depth: the client has no NSFW gate, so
+    // drop any level ∉ the known enum {1,2,4,8,16} before applying — never let a
+    // malformed/unknown level reach the query. Omitted → leave the filter as-is.
+    const lvlSrc = Array.isArray(browsingLevels) ? browsingLevels
+      : (filters && Array.isArray(filters.browsingLevels) ? filters.browsingLevels : null);
+    if (lvlSrc) {
+      const KNOWN = new Set(LEVELS.map((l) => l.level));
+      const clean = [...new Set(lvlSrc.map(Number).filter((n) => KNOWN.has(n)))];
+      state.filters = { ...state.filters, browsingLevels: clean.length ? clean : [1] };
     }
     if (typeof query === "string") {
       search.value = query;
@@ -1745,34 +1873,68 @@ export function openCivitaiModal(ctx, opts = {}) {
       if (parsed.creator) setCreator(parsed.creator); // normalizes @token + username
       else if (creatorFromSearch && state.filters.username) { setCreator(null); }
     }
+    clearTimeout(searchTimer); // cancel the 500ms debounce so it can't double-fire
     syncTabs();
-    reload({ searching: true });
-    return { tab: state.tab, query: state.query, creator: state.filters.username || null };
+    // FORCE a reload even when the text is unchanged (a re-search is an explicit
+    // agent intent, unlike applySearch's typing-debounce dedupe).
+    await reload({ searching: true });
+    return { tab: state.tab, query: state.query, creator: state.filters.username || null, renderRev: state.renderRev };
   }
   function driveGetResults({ limit = 20 } = {}) {
+    _assertOpen();
     const model = isModelTab();
-    return serializeCivitaiResults(model ? state.models : state.items,
-      { model, limit, loading: state.loading });
+    const source = model ? state.models : state.items;
+    const ser = serializeCivitaiResults(source, { model, limit, loading: state.loading });
+    return {
+      ...ser, // { items, total, loading }
+      count: ser.items.length,
+      done: !!state.done,
+      renderRev: state.renderRev,
+      truncated: source.length > ser.items.length,
+    };
   }
-  function driveHighlight(ids, { kind } = {}) { // eslint-disable-line no-unused-vars
-    const list = Array.isArray(ids) ? ids : (ids != null ? [ids] : []);
-    let first = null, n = 0;
-    for (const id of list) {
-      const card = grid.querySelector(`.cmcp-cv-card[data-id="${CSS.escape(String(id))}"]`);
-      if (!card) continue;
-      card.classList.add("cmcp-agent-glow");
-      if (!first) first = card;
-      n++;
+  /** Highlight a set of ids (REPLACEMENT semantics). Awaits the in-flight
+   *  first-page load so a highlight issued before results land still lands; if a
+   *  reload/tab/filter supersedes us mid-await the set was cleared and we no-op.
+   *  Persists the set so later pages glow as they stream in (see appendItems). */
+  async function driveHighlight(ids, { kind } = {}) { // eslint-disable-line no-unused-vars
+    _assertOpen();
+    const list = (Array.isArray(ids) ? ids : (ids != null ? [ids] : [])).map((x) => String(x));
+    const rev = state.renderRev;
+    try { await state.activeReloadPromise; } catch { /* fetch error surfaces elsewhere */ }
+    _assertOpen();
+    if (state.renderRev !== rev) {
+      // A reload superseded this highlight while we awaited — honor the newest
+      // intent by applying to the CURRENT generation rather than a stale grid.
+    }
+    // Replacement: strip the prior set, install the new one, then paint.
+    driveClearHighlight();
+    state.highlightOrder = [...list];
+    state.highlightSet = new Set(list);
+    let first = null, hit = 0;
+    const missing = [];
+    for (const id of list) { // input order → first found scrolls into view
+      const card = grid.querySelector(`.cmcp-cv-card[data-id="${CSS.escape(id)}"]`);
+      if (card) { card.classList.add("cmcp-agent-glow"); if (!first) first = card; hit++; }
+      else missing.push(id);
     }
     if (first) first.scrollIntoView({ behavior: "smooth", block: "nearest" });
-    return { highlighted: n };
+    return { highlighted: hit, missing, renderRev: state.renderRev };
   }
   function driveClearHighlight() {
+    _assertOpen();
+    state.highlightSet = new Set();
+    state.highlightOrder = [];
     for (const c of grid.querySelectorAll(".cmcp-cv-card.cmcp-agent-glow")) c.classList.remove("cmcp-agent-glow");
     return { ok: true };
   }
-  function driveOpenLightbox(id) {
-    if (isModelTab()) {
+  /** Open the lightbox for a card. Dispatch by KIND: media → openViewer(index)
+   *  (index-addressed); model → openModelDetail (model tabs leave state.items
+   *  empty, so an index lookup there is meaningless). */
+  function driveOpenLightbox(id, { kind } = {}) {
+    _assertOpen();
+    const wantModel = kind === "model" || (kind == null && isModelTab());
+    if (wantModel) {
       const m = state.models.find((x) => String(x.id) === String(id));
       if (!m) throw new Error(`no model card for id ${id}`);
       openModelDetail(m);
@@ -1783,7 +1945,13 @@ export function openCivitaiModal(ctx, opts = {}) {
     openViewer(i);
     return { opened: "media", id };
   }
-  function driveGetState() { return { tab: state.tab, loading: !!state.loading }; }
+  function driveGetState() {
+    return {
+      isOpen, tab: state.tab, loading: !!state.loading, done: !!state.done,
+      renderRev: state.renderRev, docked: !applyDock.centered && overlay.classList.contains("cmcp-docked"),
+      highlighted: state.highlightOrder.slice(),
+    };
+  }
 
   // ── go ───────────────────────────────────────────────────────────────
   syncTabs();

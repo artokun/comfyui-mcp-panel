@@ -7,7 +7,7 @@
 // returns METADATA + URLs ONLY, never image bytes, and clamps `limit`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { serializeCivitaiResults } from "../../web/js/cmcp-civitai-ui.js";
+import { serializeCivitaiResults, CIVITAI_PROMPT_CAP } from "../../web/js/cmcp-civitai-ui.js";
 
 // Media rows as produced by CivitaiClient._fromRest / _fromMeili.
 const mediaRows = [
@@ -92,4 +92,21 @@ test("missing/empty urls are dropped, not emitted as null/undefined", () => {
 test("non-array source is tolerated", () => {
   const out = serializeCivitaiResults(null, { model: false });
   assert.deepEqual(out, { items: [], total: 0, loading: false });
+});
+
+test("long prompts are capped to the token budget with an ellipsis", () => {
+  const long = "x".repeat(CIVITAI_PROMPT_CAP + 500);
+  const out = serializeCivitaiResults(
+    [{ id: 1, type: "image", author: "a", reactions: 0, prompt: long, thumbnailUrl: "/t/1", fullUrl: "/f/1" }],
+    { model: false },
+  );
+  const p = out.items[0].prompt;
+  assert.equal(p.length, CIVITAI_PROMPT_CAP + 1); // cap + the "…"
+  assert.ok(p.endsWith("…"));
+  // A short prompt is passed through verbatim.
+  const short = serializeCivitaiResults(
+    [{ id: 2, type: "image", author: "a", reactions: 0, prompt: "tiny", thumbnailUrl: "/t/2", fullUrl: "/f/2" }],
+    { model: false },
+  );
+  assert.equal(short.items[0].prompt, "tiny");
 });
