@@ -119,8 +119,14 @@ def _ollama_installed():
 
 
 def _antigravity_installed():
-    """Antigravity CLI (agy) on PATH or in its well-known install locations
-    (the installer may only add PATH for new shells, like Ollama's)."""
+    """Antigravity CLI (agy) at COMFYUI_MCP_ANTIGRAVITY_PATH, on PATH, or in its
+    well-known install locations (the installer may only add PATH for new
+    shells, like Ollama's). The env override mirrors the orchestrator's
+    resolveAgyBin so an env-var-only install doesn't read "not installed" in
+    onboarding until the orchestrator's readiness frame corrects it."""
+    override = (environ.get("COMFYUI_MCP_ANTIGRAVITY_PATH") or "").strip()
+    if override and os.path.isfile(override):
+        return True
     if _provider_cli("antigravity"):
         return True
     if sys.platform == "win32":
