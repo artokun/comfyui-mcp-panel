@@ -82,22 +82,25 @@ function createFakeIndexedDb(initialState = null, { blockedThenSuccess = false }
   }
 }
 
-test('normalizes legacy threads into schema v2 without losing messages', () => {
+test('migrates legacy messages to stable schema identities without losing content', () => {
   const thread = normalizeThread({ id: 'legacy', ts: 123, msgs: [{ role: 'user', text: 'hello' }] })
+  const sameMigration = normalizeThread({ id: 'legacy', ts: 123, msgs: [{ role: 'user', text: 'hello' }] })
   assert.equal(thread.schemaVersion, CHAT_HISTORY_SCHEMA)
   assert.equal(thread.workflowKey, 'panel:global')
   assert.equal(thread.updatedAt, 123)
   assert.equal(thread.msgs[0].text, 'hello')
+  assert.match(thread.msgs[0].id, /^legacy-[a-f0-9]{16}$/)
+  assert.equal(thread.msgs[0].id, sameMigration.msgs[0].id)
 })
 
 test('merges browser and durable snapshots by newest thread update', () => {
   const merged = mergeHistorySnapshots(
     {
-      threads: [{ id: 'same', ts: 100, msgs: [{ role: 'user', text: 'old' }], title: 'kept title' }],
+      threads: [{ id: 'same', ts: 100, msgs: [{ id: 'same-message', role: 'user', text: 'old', createdAt: 100 }], title: 'kept title' }],
       meta: { activeByScope: { 'panel:global': 'same' } }
     },
     {
-      threads: [{ id: 'same', updatedAt: 200, msgs: [{ role: 'agent', text: 'new' }] }],
+      threads: [{ id: 'same', updatedAt: 200, msgs: [{ id: 'same-message', role: 'agent', text: 'new', createdAt: 100, updatedAt: 200 }] }],
       meta: { workflowAliases: { 'workflows/a.json': 'uuid-a' } }
     }
   )
@@ -214,6 +217,65 @@ test('message tombstones survive concurrent append and later reload merges', () 
   assert.deepEqual(merged.threads[0].msgs.map((message) => message.id), ['m2'])
   assert.equal(merged.threads[0].deletedMessages.m1, 300)
   assert.deepEqual(reloaded.threads[0].msgs.map((message) => message.id), ['m2'])
+})
+
+test('two stores migrate id-less messages once and preserve concurrent append and delete in both orders', async () => {
+  async function run(order) {
+    const indexedDb = createFakeIndexedDb({
+      updatedAt: 100,
+      threads: [{
+        id: 'legacy-shared',
+        workflowKey: 'panel:global',
+        updatedAt: 100,
+        msgs: [
+          { role: 'user', text: 'delete this', createdAt: 90 },
+          { role: 'agent', text: 'keep this', createdAt: 100 }
+        ]
+      }],
+      meta: {}
+    })
+    const stores = [
+      new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb }),
+      new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb })
+    ]
+    const snapshots = await Promise.all(stores.map((store) => store.load()))
+    await Promise.all(stores.map((store) => store.flush()))
+    const migratedIds = snapshots.map((snapshot) => snapshot.threads[0].msgs.map((message) => message.id))
+    assert.deepEqual(migratedIds[0], migratedIds[1])
+
+    const [deletedId] = migratedIds[0]
+    const aThread = structuredClone(snapshots[0].threads[0])
+    aThread.msgs = [
+      ...aThread.msgs.filter((message) => message.id !== deletedId),
+      { id: 'append-a', role: 'user', text: 'from A', createdAt: 300 }
+    ]
+    aThread.deletedMessages = { [deletedId]: 300 }
+    aThread.updatedAt = 300
+    const bThread = structuredClone(snapshots[1].threads[0])
+    bThread.msgs.push({ id: 'append-b', role: 'agent', text: 'from B', createdAt: 400 })
+    bThread.updatedAt = 400
+    const writes = [
+      () => stores[0].persist([aThread], {}),
+      () => stores[1].persist([bThread], {})
+    ]
+    for (const index of order) {
+      writes[index]()
+      await stores[index].flush()
+    }
+
+    const reloadStore = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb })
+    const reloaded = await reloadStore.load()
+    await reloadStore.flush()
+    return reloaded.threads[0]
+  }
+
+  for (const order of [[0, 1], [1, 0]]) {
+    const thread = await run(order)
+    assert.equal(thread.schemaVersion, CHAT_HISTORY_SCHEMA)
+    assert.deepEqual(thread.msgs.map((message) => message.text), ['keep this', 'from A', 'from B'])
+    assert.equal(Object.hasOwn(thread.deletedMessages, thread.msgs[0].id), false)
+    assert.equal(Object.values(thread.deletedMessages).length, 1)
+  }
 })
 
 test('metadata tombstones clear active pointers and aliases across stale snapshots', () => {

@@ -6,7 +6,7 @@
 import { isThreadInScope } from "./workflow-chat-identity.js";
 export { isThreadInScope };
 
-export const CHAT_HISTORY_SCHEMA = 2;
+export const CHAT_HISTORY_SCHEMA = 3;
 export const CHAT_HISTORY_DB = "comfyui-mcp-panel-history";
 export const CHAT_HISTORY_STATE_KEY = "state";
 export const CHAT_HISTORY_LOCAL_SNAPSHOT_KEY = "comfyui-mcp.panel.historySnapshot";
@@ -26,6 +26,43 @@ function finiteTs(value) {
 
 function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+}
+
+function stableHash(value) {
+  const input = String(value);
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  for (let i = 0; i < input.length; i += 1) {
+    const code = input.charCodeAt(i);
+    first = Math.imul(first ^ code, 0x01000193) >>> 0;
+    second = Math.imul(second ^ code, 0x85ebca6b) >>> 0;
+  }
+  return first.toString(16).padStart(8, "0") + second.toString(16).padStart(8, "0");
+}
+
+function normalizeMessages(threadId, messages) {
+  const normalized = [];
+  for (const [ordinal, message] of (Array.isArray(messages) ? messages : []).entries()) {
+    if (!message || typeof message !== "object" || Array.isArray(message)) continue;
+    if (typeof message.id === "string" && message.id) {
+      normalized.push(message);
+      continue;
+    }
+    // Legacy records predate message UUIDs. The thread id, original ordinal and
+    // canonical content make the migration identical in every tab, including
+    // duplicate messages, so it is safe to union and tombstone immediately.
+    normalized.push({
+      ...message,
+      id: `legacy-${stableHash(`${threadId}:${ordinal}:${canonicalJson(message)}`)}`,
+    });
+  }
+  return normalized;
 }
 
 function safeMap() {
@@ -147,14 +184,13 @@ export function updateMetadataEntry(meta, mapName, key, value, updatedAt = Date.
 export function normalizeThread(raw) {
   if (!raw || typeof raw !== "object" || typeof raw.id !== "string" || !raw.id) return null;
   const deletedMessages = mergeTimestampMaps(raw.deletedMessages);
-  const msgs = Array.isArray(raw.msgs)
-    ? raw.msgs.filter(
+  const msgs = normalizeMessages(raw.id, raw.msgs)
+    .filter(
       (message) =>
         message &&
         typeof message === "object" &&
         !(typeof message.id === "string" && Object.hasOwn(deletedMessages, message.id)),
-    )
-    : [];
+    );
   const ts = finiteTs(raw.ts) || finiteTs(raw.createdAt) || Date.now();
   const createdAt = finiteTs(raw.createdAt) || ts;
   const updatedAt = finiteTs(raw.updatedAt) || ts;
@@ -250,14 +286,6 @@ export function retainBoundedThreads(threads, limit, protectedThreadIds = []) {
 function mergeThreadMessages(older, newer) {
   const oldMessages = Array.isArray(older?.msgs) ? older.msgs : [];
   const newMessages = Array.isArray(newer?.msgs) ? newer.msgs : [];
-  // Schema-v2 messages carry UUIDs. Unioning them makes append-only chat writes
-  // safe when two tabs persist the same workflow between each other's reads.
-  // Legacy messages had no ids, so retain the historical newest-snapshot rule
-  // rather than guessing whether equal-looking entries are duplicates.
-  const identified = [...oldMessages, ...newMessages].every(
-    (message) => message && typeof message.id === "string" && message.id,
-  );
-  if (!identified) return newMessages;
   const byId = new Map();
   for (const message of [...oldMessages, ...newMessages]) {
     const previous = byId.get(message.id);
