@@ -235,7 +235,10 @@ export class AppBuilder {
 
   /** Node types whose widgets are natural app INPUTS by default (mirrors what
    *  the frontend APP builder highlights: prompt text, images, models,
-   *  primitives, seeds/steps-samplers). */
+   *  primitives, seeds/steps-samplers, and the empty-latent/image generators
+   *  whose size/batch widgets are among the most-exposed app endpoints — found
+   *  dogfooding: an EmptyImage→Preview graph offered NO candidates without
+   *  these). */
   static INPUT_HINT_TYPES = new Set([
     "CLIPTextEncode",
     "LoadImage",
@@ -255,6 +258,12 @@ export class AppBuilder {
     "KSampler",
     "KSamplerAdvanced",
     "SamplerCustom",
+    "EmptyImage",
+    "EmptyLatentImage",
+    "EmptySD3LatentImage",
+    "EmptyLTXVLatentVideo",
+    "EmptyHunyuanLatentVideo",
+    "EmptyMochiLatentVideo",
   ]);
 
   /** Widget value → app input kind. `nodeType` refines (LoadImage → image

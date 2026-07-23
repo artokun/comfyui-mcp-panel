@@ -182,11 +182,11 @@ async function stubAppsBackend(page: Page) {
           version: 0.4
         }
       })
-      const node = (id: number, type: string, widgets: unknown[], outputNode = false) => ({
+      const node = (id: number, type: string, widgets: unknown[], outputNode = false, inputs: unknown[] = []) => ({
         id,
         type,
         title: type,
-        inputs: [],
+        inputs,
         widgets,
         constructor: { nodeData: { output_node: outputNode } }
       })
@@ -197,10 +197,17 @@ async function stubAppsBackend(page: Page) {
           node(4, 'CheckpointLoaderSimple', [
             { name: 'ckpt_name', value: 'flux.safetensors', type: 'combo', options: { values: ['flux.safetensors', 'sdxl.safetensors'] } }
           ]),
-          node(6, 'CLIPTextEncode', [{ name: 'text', value: 'a cat', type: 'text' }]),
+          // Unconnected widget-input SOCKET (link: null — how modern frontends
+          // materialize every widget): must STAY a candidate.
+          node(6, 'CLIPTextEncode', [{ name: 'text', value: 'a cat', type: 'text' }], false, [
+            { name: 'text', widget: { name: 'text' }, link: null }
+          ]),
           node(3, 'KSampler', [
             { name: 'seed', value: 42, type: 'number' },
             { name: 'steps', value: 20, type: 'number' }
+          ], false, [
+            // CONNECTED widget input: seed is link-driven → excluded.
+            { name: 'seed', widget: { name: 'seed' }, link: 7 }
           ]),
           node(9, 'SaveImage', [], true)
         ]
@@ -241,6 +248,12 @@ test('convert canvas → app card → detail → one-click run with patched valu
   await installFixtureCanvas()
   await modal.getByRole('button', { name: 'Convert current workflow' }).click()
   await expect(modal.getByText('Inputs — the endpoints this app exposes')).toBeVisible()
+  // Widget-input guard: the UNCONNECTED text socket stays a candidate; the
+  // CONNECTED (link-driven) seed is excluded.
+  const pickRows = modal.locator('.cmcp-apps-pick label')
+  await expect(pickRows.filter({ hasText: 'text' })).not.toHaveCount(0)
+  await expect(pickRows.filter({ hasText: 'seed' })).toHaveCount(0)
+  await expect(pickRows.filter({ hasText: 'steps' })).not.toHaveCount(0)
   await modal.locator('.cmcp-apps-field input[type=text]').fill('Fixture App')
   await modal.locator('.cmcp-apps-field textarea').fill('Made from a fixture graph')
   await modal.getByRole('button', { name: 'Create app' }).click()
