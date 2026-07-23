@@ -856,6 +856,15 @@ export function openTrainingModal(ctx = {}, opts = {}) {
       const parts = v.split(",").map((s) => s.trim()).filter(Boolean);
       return parts.length && parts.every((p) => /^\d+$/.test(p) && parseInt(p, 10) > 0) ? parts.map((p) => parseInt(p, 10)) : null;
     };
+    // Sane ceilings for free-form custom params (#104): the Custom preset
+    // accepts any number, so a typo (steps=10^9, rank=100000, resolution=100000)
+    // starts a doomed/OOM BILLED run. Mirrored by the backend train_start
+    // schema's max constraints in comfyui-mcp — this is the friendly gate,
+    // that one is the hard wall.
+    const PARAM_MAX = { steps: 100000, lr: 1, rank: 1024, resolution: 4096 };
+    const PARAM_MIN = { resolution: 64 };
+    const inBounds = (key, n) => Number.isFinite(n) && n > 0 && n <= PARAM_MAX[key];
+    const resInBounds = (list) => !!list && list.every((r) => r >= PARAM_MIN.resolution && r <= PARAM_MAX.resolution);
     for (const [key, label] of [["steps", "Steps"], ["lr", "Learning rate"], ["rank", "LoRA rank"], ["resolution", "Resolutions (comma)"]]) {
       const l = el("label", null, label);
       l.style.minWidth = "auto";
@@ -863,6 +872,9 @@ export function openTrainingModal(ctx = {}, opts = {}) {
       inp.type = "text";
       inp.dataset.ref = `param:${key}`;
       inp.style.flex = "0 1 110px";
+      inp.title = key === "resolution"
+        ? `each ${PARAM_MIN.resolution}–${PARAM_MAX.resolution}`
+        : `max ${PARAM_MAX[key]}`;
       const saved = wiz.customParams?.[key];
       inp.value = saved !== undefined
         ? (key === "resolution" ? saved.join(",") : String(saved))
@@ -872,11 +884,11 @@ export function openTrainingModal(ctx = {}, opts = {}) {
         wiz.customParams = wiz.customParams || {};
         if (key === "resolution") {
           const list = parseResStrict(inp.value);
-          if (list) wiz.customParams.resolution = list;
+          if (resInBounds(list)) wiz.customParams.resolution = list;
           else delete wiz.customParams.resolution;
         } else {
           const n = key === "lr" ? parseLrStrict(inp.value) : parseIntStrict(inp.value);
-          if (Number.isFinite(n) && n > 0) wiz.customParams[key] = n;
+          if (inBounds(key, n)) wiz.customParams[key] = n;
           else delete wiz.customParams[key];
         }
         syncLaunchEnabled();
@@ -892,8 +904,8 @@ export function openTrainingModal(ctx = {}, opts = {}) {
       if (wiz.preset !== "custom") return true;
       return ["steps", "lr", "rank"].every((k) => {
         const n = k === "lr" ? parseLrStrict(customFields[k].value) : parseIntStrict(customFields[k].value);
-        return Number.isFinite(n) && n > 0;
-      }) && !!parseResStrict(customFields.resolution.value);
+        return inBounds(k, n);
+      }) && resInBounds(parseResStrict(customFields.resolution.value));
     }
     for (const key of Object.keys(PRESETS)) {
       const b = el("button", key === wiz.preset ? "active" : null, PRESETS[key].label);
