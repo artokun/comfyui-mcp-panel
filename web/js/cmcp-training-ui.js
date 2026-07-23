@@ -323,6 +323,25 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     return true;
   }
 
+  /** Collision-free rerun name (codex finding: a fixed "-r2" suffix silently
+   *  overwrites the previous rerun's LoRA — the name IS the .safetensors
+   *  basename). Bumps -rN past every existing job sharing the base name. */
+  async function uniqueRerunName(base) {
+    try {
+      const d = await callJson(ctx, "train_status", {}, { timeout: 30000 });
+      const esc = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re = new RegExp(`^${esc}-r(\\d+)$`);
+      let max = 1;
+      for (const j of d.jobs || []) {
+        const m = re.exec(j.name || "");
+        if (m) max = Math.max(max, Number(m[1]));
+      }
+      return `${base}-r${max + 1}`;
+    } catch {
+      return `${base}-r2`;
+    }
+  }
+
   // Jobs + Datasets buttons → shell subnav (via subnavExtras). The shell owns the ✕/title.
   const jobsBtn = el("button", "cmcp-tr-btn", "Jobs");
   jobsBtn.style.flex = "none";
@@ -1031,9 +1050,18 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
           }
           return { ref: { ...i.ref }, caption: caption || undefined };
         }),
-        params: wiz.preset === "custom"
-          ? (Object.keys(wiz.customParams || {}).length ? { ...wiz.customParams } : undefined)
-          : { ...PRESETS[wiz.preset].params },
+        params: wiz.reuseDataset
+          // Reuse mode: carry EVERY effective param from the source job
+          // (batchSize/saveEvery/sampleEvery/quantize aren't custom-editable —
+          // dropping them silently changed the rerun, codex finding). The 4
+          // custom fields override on top; a named preset is a deliberate
+          // switch away from the job's settings.
+          ? (wiz.preset === "custom"
+              ? { ...wiz.reuseDataset.params, ...(wiz.customParams || {}) }
+              : { ...PRESETS[wiz.preset].params })
+          : (wiz.preset === "custom"
+              ? (Object.keys(wiz.customParams || {}).length ? { ...wiz.customParams } : undefined)
+              : { ...PRESETS[wiz.preset].params }),
       };
       try {
         let datasetPath;
@@ -1146,7 +1174,11 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
       if (!wiz.jobId) return;
       try {
         const cfg = await callJson(ctx, "train_job_config", { id: wiz.jobId }, { timeout: 30000 });
-        if (myGen !== pollGen) return;
+        // Do NOT gate on pollGen: a terminal status stopPolling()s (bumping the
+        // generation) and would discard a perfectly good config response —
+        // settings/dataset/train-again must still render for completed jobs
+        // (codex finding). The only real guards: modal open, still on Monitor.
+        if (closed || currentView !== "wizard-4") return;
         const p = cfg.params || {};
         const bits = [
           p.steps != null ? `${p.steps} steps` : null,
@@ -1168,10 +1200,11 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
           dsLink.onclick = () => { wiz.datasetDetail = dsName; show("dataset-detail"); };
           const againBtn = el("button", "cmcp-tr-btn", "Train again");
           againBtn.title = "Run another job from this dataset + settings";
-          againBtn.onclick = () => {
+          againBtn.onclick = async () => {
             if (!resetWizardConfig()) { alert("A launch is still in flight — let it settle (or cancel it from Jobs) before starting a new run."); return; }
+            await checkBackendCapable(); // a Jobs-first entry may never have probed (codex)
             wiz.reuseDataset = { name: dsName, datasetPath: cfg.datasetPath, params: p };
-            wiz.datasetName = `${cfg.name}-r2`;
+            wiz.datasetName = await uniqueRerunName(cfg.name);
             if (cfg.trigger) wiz.trigger = cfg.trigger;
             wiz.preset = "custom";
             wiz.customParams = {};
@@ -1306,6 +1339,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
       row.onclick = () => { wiz.datasetDetail = ds.name; show("dataset-detail"); };
       list.appendChild(row);
     }
+    reapplyHighlight(); // rows landed async, after show()'s initial glow pass
   }
 
   /** One staged dataset: thumb grid + captions + "train with this dataset". */
@@ -1331,28 +1365,47 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     }
     sub.textContent = `${d.imageCount} images · ${d.captionedCount} captioned · ${d.datasetPath}`;
     grid.textContent = "";
+    // Thumbs ride train_file (inline bytes) — NOT the /training/file py route:
+    // that route only serves files under the PANEL's own training roots, so an
+    // orchestrator-side dataset path 403/404s there (codex finding). Bounded
+    // and tunnel-safe by design.
+    const imgUrl = async (file) => {
+      try {
+        const res = await ctx.callTool("train_file", { path: `${d.datasetPath}/${file}` }, { timeout: 30000 });
+        const img = (res?.result || []).find((c) => c?.type === "image" && c.data && c.mimeType);
+        return img ? `data:${img.mimeType};base64,${img.data}` : null;
+      } catch {
+        return null;
+      }
+    };
     for (const it of d.items || []) {
       const cell = el("div");
       cell.style.maxWidth = "180px";
-      const img = document.createElement("img");
-      img.src = sampleUrl(ctx, `${d.datasetPath}/${it.file}`);
-      img.style.width = "100%";
-      img.style.borderRadius = "6px";
-      img.onclick = () => window.open(sampleUrl(ctx, `${d.datasetPath}/${it.file}`), "_blank");
       const cap = el("p", "cmcp-tr-hint", it.caption || "(no caption)");
       cap.style.fontSize = "11px";
-      cell.append(img, cap);
+      cell.appendChild(cap);
       grid.appendChild(cell);
+      imgUrl(it.file).then((url) => {
+        if (!url) return;
+        const img = document.createElement("img");
+        img.src = url;
+        img.style.width = "100%";
+        img.style.borderRadius = "6px";
+        cell.insertBefore(img, cap);
+        reapplyHighlight();
+      });
     }
+    reapplyHighlight(); // async content landed after show()'s initial glow pass
     // Train again with THIS staged set: skip the gather/label staging entirely
     // (train_start takes datasetPath directly). Prefill a distinct job name so
     // the new run can't silently overwrite the previous LoRA.
     const trainBtn = el("button", "cmcp-tr-btn primary", "Train with this dataset");
     trainBtn.dataset.ref = "train_with_dataset";
-    trainBtn.onclick = () => {
+    trainBtn.onclick = async () => {
       if (!resetWizardConfig()) { alert("A launch is still in flight — let it settle (or cancel it from Jobs) before starting a new run."); return; }
+      await checkBackendCapable(); // a Datasets-first entry may never have probed (codex)
       wiz.reuseDataset = { name: d.name, datasetPath: d.datasetPath };
-      wiz.datasetName = `${d.name}-r2`;
+      wiz.datasetName = await uniqueRerunName(d.name);
       show("wizard-3");
     };
     sec.appendChild(trainBtn);
@@ -1415,7 +1468,10 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
       backendCapable, backendChecked,
       nameOk: !!sanitizeNameClient(wiz.datasetName),
       uploadsSettled: wiz.uploadsPending === 0,
-      hasImages: wiz.images.length >= 1,
+      // A staged set being reused IS dataset readiness (codex finding: the
+      // reuse flow jumps straight to Launch with wiz.images empty — requiring
+      // gathered images here dead-ended it).
+      hasImages: wiz.images.length >= 1 || !!wiz.reuseDataset,
       hasJob: !!wiz.jobId,
     };
   }
