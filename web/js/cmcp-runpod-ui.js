@@ -54,21 +54,9 @@ function injectStyle() {
 .cmcp-rp-credit{font-size:0.7rem;opacity:0.5;}
 .cmcp-rp-credit a{color:inherit;}
 .cmcp-rp-muted{font-size:0.75rem;opacity:0.6;}
-/* Agent-drive/manual side-dock (parity with the CivitAI + Training modals):
-   anchor the card to the canvas side OPPOSITE the Agent pane, drop the backdrop,
-   let clicks pass THROUGH the overlay so chat stays interactive; only the card
-   catches pointer events. Bumped above the canvas (z 10000) to match. Slides in
-   via translateX; the close() path reverses it before detaching. The base
-   .cmcp-modal-overlay (panel monolith CSS, always loaded) styles the centered
-   fallback — this only overrides the docked case, so centered opens are
-   unchanged. */
-.cmcp-modal-overlay.cmcp-docked{position:fixed;display:block;padding:0;background:transparent;
-  pointer-events:none;z-index:10000;}
-.cmcp-modal-overlay.cmcp-docked .cmcp-rp-modal{position:fixed;pointer-events:auto;
-  width:auto;max-width:none!important;height:auto;max-height:none;overflow-y:auto;
-  border-radius:0;box-shadow:-8px 0 32px rgba(0,0,0,.45);
-  transform:translateX(24px);opacity:0;transition:transform .28s ease,opacity .28s ease;}
-.cmcp-modal-overlay.cmcp-docked.cmcp-dock-in .cmcp-rp-modal{transform:translateX(0);opacity:1;}
+/* The unified side-panel shell (cmcp-sidepanel-ui.js) owns the overlay + dock +
+   slide; the Local tab centers this body in the shared card. */
+.cmcp-rp-title{font-weight:600;font-size:0.85rem;}
 `;
   const el = document.createElement("style");
   el.textContent = css;
@@ -104,20 +92,20 @@ function fmtCountdown(sec) {
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 
-export function openRunpodModal(ctx, opts = {}) {
-  const { root, callTool, getStatus, getTarget, openUrl } = ctx;
+/** Content-provider factory for the Local/RunPod tab of the unified side panel.
+ *  The shell owns the overlay/dock/close; this builds the centered control body.
+ *  hasSearch:false, drive:null; update() re-renders on runpod_status frames. */
+export function createLocalContent(ctx, shell, opts = {}) {
+  const { callTool, getStatus, getTarget, openUrl } = ctx;
   injectStyle();
-
-  const overlay = document.createElement("div");
-  overlay.className = "cmcp-modal-overlay";
-  const modal = document.createElement("div");
-  modal.className = "cmcp-modal cmcp-rp-modal";
-  const title = document.createElement("div");
-  title.className = "cmcp-modal-title";
-  title.textContent = "RunPod — cloud GPU for this session";
 
   const body = document.createElement("div");
   body.className = "cmcp-rp-body";
+  // Center the control body in the shared card (was a viewport-centered modal).
+  body.style.margin = "1rem auto";
+  const title = document.createElement("div");
+  title.className = "cmcp-rp-title";
+  title.textContent = "RunPod — cloud GPU for this session";
 
   // Host indicator (honest: where renders run right now).
   const host = document.createElement("div");
@@ -189,79 +177,12 @@ export function openRunpodModal(ctx, opts = {}) {
   credit.className = "cmcp-rp-credit";
   credit.innerHTML = `Pod control inspired by <a href="${GPU_CLI_URL}" target="_blank" rel="noopener">gpu-cli.sh</a>.`;
 
-  const btnRow = document.createElement("div");
-  btnRow.className = "cmcp-modal-btns";
-  const doneBtn = mkBtn("Close", "primary");
-  btnRow.append(doneBtn);
-
-  body.append(host, card, connectRow, manualRow, actions, linkRow, log, credit);
-  modal.append(title, body, btnRow);
-  overlay.append(modal);
-  // Mount the overlay on <body>, NOT the panel root: the ComfyUI sidebar clips
-  // its descendants, so a root-mounted overlay would be squeezed into the narrow
-  // panel (buttons + status values cut off). On body it's a true viewport-centered
-  // modal at its full width.
-  document.body.appendChild(overlay);
+  body.append(title, host, card, connectRow, manualRow, actions, linkRow, log, credit);
 
   // ── state + rendering ──────────────────────────────────────────────────────
   let busy = false;
   let closed = false;
   let tick = null;
-  let _onDockResize = null; // window-resize fallback when ctx.watchDock is absent
-  let _dockDispose = null;  // ResizeObserver+listener disposer from ctx.watchDock
-
-  // ── docked mode (parity with the CivitAI + Training modals) ──────────────────
-  // Geometry from the host (ctx.dockGeometry owns pane/canvas measurement +
-  // left/right detection); three states detached(hide)/centered/docked. See the
-  // CivitAI modal for the full rationale. When opts.dock is unset this is inert
-  // and the modal stays the plain centered overlay it always was.
-  applyDock.centered = false;
-  function applyDock() {
-    if (!opts.dock) { setCentered(); return; }
-    const geo = _dockGeometry();
-    if (geo && geo.status === "detached") { overlay.style.display = "none"; return; }
-    overlay.style.display = "";
-    if (geo && geo.status === "docked" && window.innerWidth >= 900) {
-      overlay.classList.add("cmcp-docked");
-      modal.style.left = `${Math.round(geo.left)}px`;
-      modal.style.top = `${Math.round(geo.top)}px`;
-      modal.style.right = `${Math.round(geo.right)}px`;
-      modal.style.bottom = `${Math.round(geo.bottom)}px`;
-      applyDock.centered = false;
-    } else { setCentered(); }
-  }
-  function setCentered() {
-    overlay.classList.remove("cmcp-docked");
-    overlay.style.display = "";
-    modal.style.left = modal.style.right = modal.style.top = modal.style.bottom = "";
-    applyDock.centered = true;
-  }
-  function _dockGeometry() {
-    if (typeof ctx.dockGeometry === "function") {
-      try { const g = ctx.dockGeometry(); if (g) return g; } catch { /* fall through */ }
-    }
-    try {
-      if (root && !root.isConnected) return { status: "detached" };
-      const pane = root?.closest?.(".side-bar-panel") || root?.closest?.("[class*='sidebar']") || root;
-      const pr = pane?.getBoundingClientRect?.();
-      if (!pr || pr.width < 1 || pr.height < 1) return { status: "centered" };
-      const vw = window.innerWidth, vh = window.innerHeight;
-      const paneOnLeft = (pr.left + pr.right) / 2 < vw / 2;
-      const left = paneOnLeft ? Math.max(0, pr.right) : 0;
-      const right = paneOnLeft ? 0 : Math.max(0, vw - pr.left);
-      if (vw - left - right < 320) return { status: "centered" };
-      return { status: "docked", left, right, top: Math.max(0, pr.top), bottom: Math.max(0, vh - pr.bottom) };
-    } catch { return { status: "centered" }; }
-  }
-  if (opts.dock) {
-    applyDock();
-    if (typeof ctx.watchDock === "function") {
-      try { _dockDispose = ctx.watchDock(applyDock); } catch { _dockDispose = null; }
-    }
-    if (!_dockDispose) { _onDockResize = () => applyDock(); window.addEventListener("resize", _onDockResize); }
-    // Slide-in on the next frame so the transition runs from the initial state.
-    requestAnimationFrame(() => overlay.classList.add("cmcp-dock-in"));
-  }
 
   function setLog(text, kind) {
     log.textContent = text || "";
@@ -376,10 +297,16 @@ export function openRunpodModal(ctx, opts = {}) {
   }
 
   // Re-render the idle countdown every second while a status frame is live.
-  tick = setInterval(() => {
-    const s = getStatus?.();
-    if (s && s.watching && s.autostop_in_seconds != null) render();
-  }, 1000);
+  // Re-render the idle countdown every second while a status frame is live —
+  // only while the Local tab is active (started/stopped by the shell).
+  function startTick() {
+    if (tick) return;
+    tick = setInterval(() => {
+      const s = getStatus?.();
+      if (s && s.watching && s.autostop_in_seconds != null) render();
+    }, 1000);
+  }
+  function stopTick() { if (tick) { clearInterval(tick); tick = null; } }
 
   async function run(label, fn) {
     if (busy) return false;
@@ -484,51 +411,26 @@ export function openRunpodModal(ctx, opts = {}) {
     }
   });
 
-  const close = () => {
-    if (closed) return; // idempotent
-    closed = true;
-    if (tick) { clearInterval(tick); tick = null; }
-    if (_onDockResize) { window.removeEventListener("resize", _onDockResize); _onDockResize = null; }
-    if (_dockDispose) { try { _dockDispose(); } catch { /* best effort */ } _dockDispose = null; }
-    slideOutThenRemove(overlay);
-  };
-  doneBtn.addEventListener("click", close);
-  overlay.addEventListener("mousedown", (e) => {
-    if (e.target === overlay) close();
-  });
-
-  // Load the pod dropdown on open, preselecting the watched pod (or opts.pod_id).
-  const s0 = getStatus?.();
-  void loadPods((s0 && s0.watching && s0.pod_id) || opts.pod_id);
-
-  render();
+  // Load the pod dropdown once, preselecting the watched pod (or opts.pod_id).
+  let _loaded = false;
+  function loadOnce() {
+    if (_loaded) return;
+    _loaded = true;
+    const s0 = getStatus?.();
+    void loadPods((s0 && s0.watching && s0.pod_id) || opts.pod_id);
+  }
 
   return {
-    close,
-    /** Called by the panel when a new runpod_status / comfyui_target frame arrives. */
-    update() {
-      render();
-    },
-    isOpen: () => !closed,
+    key: "local", label: "RunPod", icon: "pi-server", driveKind: null,
+    hasSearch: false, drive: null,
+    subnavExtras: () => [],
+    mount(bodyEl) { bodyEl.appendChild(body); render(); },
+    onActivate() { startTick(); loadOnce(); render(); },
+    onDeactivate() { stopTick(); },
+    // RunPod status / comfyui_target frames → re-render (no-op unless mounted).
+    update() { if (!closed) render(); },
+    teardown() { closed = true; stopTick(); },
   };
-}
-
-/** Slide/fade the panel out before detaching (parity across the three
- *  side-panels). Docked: reverse the translateX slide-in (drop cmcp-dock-in);
- *  centered/narrow: a plain opacity fade — no horizontal slide. The DOM is
- *  removed after the transition window (jsdom fires no transitionend, so a fixed
- *  timer drives it). Idempotent — remove() on a detached node is a no-op. */
-const DOCK_SLIDE_OUT_MS = 240;
-function slideOutThenRemove(overlay) {
-  const docked = overlay.classList.contains("cmcp-docked");
-  overlay.style.pointerEvents = "none";
-  if (docked) {
-    overlay.classList.remove("cmcp-dock-in"); // card returns to translateX(24px)/opacity 0
-  } else {
-    overlay.style.transition = "opacity .18s ease";
-    overlay.style.opacity = "0";
-  }
-  setTimeout(() => { try { overlay.remove(); } catch { /* already gone */ } }, DOCK_SLIDE_OUT_MS);
 }
 
 function mkBtn(label, variant) {

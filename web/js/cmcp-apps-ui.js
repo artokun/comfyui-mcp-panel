@@ -22,9 +22,11 @@ function injectStyle() {
   if (styleInjected) return;
   styleInjected = true;
   const css = `
-.cmcp-apps-overlay{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;
-  padding:1rem;background:rgba(0,0,0,0.45);}
-.cmcp-apps-modal{max-width:min(860px,94vw)!important;width:100%;max-height:88vh;display:flex;flex-direction:column;}
+/* The unified side-panel shell (cmcp-sidepanel-ui.js) owns the overlay + card
+   sizing; .cmcp-apps-modal is only the active-tab alias now — no sizing here, or
+   its !important max-width would leak onto the shared shell (shrinking the card
+   on the Apps tab + breaking docked-fill). Keep only the flex-column layout. */
+.cmcp-apps-modal{display:flex;flex-direction:column;}
 .cmcp-apps-body{display:flex;flex-direction:column;gap:0.75rem;min-height:0;flex:1;}
 .cmcp-apps-toolbar{display:flex;gap:0.4rem;flex-wrap:wrap;align-items:center;}
 .cmcp-apps-toolbar .spacer{flex:1;}
@@ -196,65 +198,63 @@ async function draftFromCanvas(getApp) {
   return { prompt: gp.output, workflow, imported, inputs, outputs };
 }
 
-
-export function openAppsModal(ctx, opts = {}) {
+/** Content-provider factory for the Apps tab of the unified side panel. The
+ *  shell owns the overlay/header/✕/dock/Escape; this builds the grid/convert/
+ *  detail body. The My/Explore toggle is chips in the shared subnav (decision D);
+ *  the shared search shows only on Explore. */
+export function createAppsContent(ctx, shell, opts = {}) {
   const { getApp, uploadBlobToInput, callTool, getRunpodTarget } = ctx;
   const client = new AppsClient();
   const registry = new RegistryClient();
   injectStyle();
 
-  const overlay = el("div", "cmcp-apps-overlay");
-  const modal = el("div", "cmcp-modal cmcp-apps-modal");
-  const title = el("div", "cmcp-modal-title", "Apps");
-  const body = el("div", "cmcp-apps-body");
-  modal.append(title, body);
-  overlay.appendChild(modal);
+  const body = el("div", "cmcp-apps-body"); // content root (mounted in shell body)
 
   let closed = false;
-  let pollTimer = null;
-  function close() {
-    if (closed) return;
-    closed = true;
-    if (pollTimer) clearInterval(pollTimer);
-    overlay.remove();
-    opts.onClose && opts.onClose();
+  let pollTimer = null; // setTimeout id for the in-flight run poll
+  // Run-poll pause/resume across tab switches: _hidden gates rescheduling,
+  // _lastTick is the resume anchor, _polling guards against double-arming while a
+  // tick is mid-flight.
+  let _hidden = false;
+  let _lastTick = null;
+  let _polling = false;
+  let _tab = "mine"; // "mine" | "explore"
+  let _started = false;
+  let exploreQuery = "";
+  let _exploreReload = null; // showExplore's load(), so onSearch can re-run it
+  let _exploreTimer = null;
+
+  // ── My / Explore toggle → chips in the shared subnav (decision D) ──────────
+  const mineChip = el("button", "cmcp-cv-chip", "My Apps");
+  const exploreChip = el("button", "cmcp-cv-chip", "Explore");
+  function syncChips() {
+    mineChip.classList.toggle("on", _tab === "mine");
+    exploreChip.classList.toggle("on", _tab === "explore");
   }
-  overlay.addEventListener("mousedown", (e) => {
-    if (e.target === overlay) close();
+  mineChip.addEventListener("click", () => {
+    if (_tab === "mine") return;
+    _tab = "mine"; syncChips(); shell.syncSearch(); showGrid().catch(showError);
   });
-  const onKey = (e) => {
-    if (e.key === "Escape") close();
-  };
-  window.addEventListener("keydown", onKey);
-  const origClose = close;
-  close = function () {
-    window.removeEventListener("keydown", onKey);
-    origClose();
-  };
+  exploreChip.addEventListener("click", () => {
+    if (_tab === "explore") return;
+    _tab = "explore"; syncChips(); shell.syncSearch(); showGrid().catch(showError);
+  });
 
   // ── Grid view ────────────────────────────────────────────────────────────
-
-  let _tab = "mine"; // "mine" | "explore"
-
   async function showGrid() {
     if (closed) return;
+    syncChips();
     body.textContent = "";
-    const bar = el("div", "cmcp-apps-toolbar");
-    const mineTab = makeBtn("My Apps", { primary: _tab === "mine" });
-    const exploreTab = makeBtn("Explore", { primary: _tab === "explore" });
-    mineTab.addEventListener("click", () => { _tab = "mine"; showGrid().catch(showError); });
-    exploreTab.addEventListener("click", () => { _tab = "explore"; showGrid().catch(showError); });
-    bar.append(mineTab, exploreTab);
     if (_tab === "mine") {
-      const spacer = el("span", "spacer");
+      const bar = el("div", "cmcp-apps-toolbar");
       const convertBtn = makeBtn("＋ Convert current workflow", {
         primary: true,
         title: "Package the workflow on the canvas as a one-click app.",
       });
       convertBtn.addEventListener("click", () => showConvert().catch(showError));
-      bar.append(spacer, convertBtn);
+      bar.append(convertBtn);
+      body.append(bar);
     }
-    body.append(bar);
     if (_tab === "explore") return showExplore();
     return showMine();
   }
@@ -322,18 +322,15 @@ export function openAppsModal(ctx, opts = {}) {
     const sorts = [["trending", "Trending"], ["new", "New"], ["stars", "Most starred"]];
     const chips = new Map();
     const grid = el("div", "cmcp-apps-grid");
-    const search = document.createElement("input");
-    search.type = "text";
-    search.placeholder = "Search apps…";
-    search.style.cssText =
-      "flex:1;min-width:140px;padding:0.4rem 0.55rem;border-radius:6px;border:1px solid var(--p-content-border-color,#3f3f46);background:var(--p-inputtext-background,#18181b);color:inherit;font-size:0.82rem;";
+    // Search is the shell's shared box (shown only on Explore); its value is
+    // mirrored into exploreQuery and re-runs load() via onSearch.
     async function load(append = false, cursor = "") {
       if (!append) {
         grid.textContent = "";
         grid.append(el("div", "cmcp-apps-empty", "Loading…"));
       }
       try {
-        const res = await registry.list({ sort, q: search.value.trim(), cursor });
+        const res = await registry.list({ sort, q: exploreQuery.trim(), cursor });
         if (closed) return;
         if (!append) grid.textContent = "";
         renderCards(res.apps || [], res.next_cursor);
@@ -385,12 +382,7 @@ export function openAppsModal(ctx, opts = {}) {
       });
       controls.append(chip);
     }
-    let searchTimer = null;
-    search.addEventListener("input", () => {
-      clearTimeout(searchTimer);
-      searchTimer = setTimeout(() => load(), 350);
-    });
-    controls.append(search);
+    _exploreReload = () => load(); // onSearch (shared box) re-runs this
     body.append(controls, grid);
     load();
   }
@@ -902,27 +894,37 @@ export function openAppsModal(ctx, opts = {}) {
     async function pollRun(promptId) {
       const deadline = Date.now() + 30 * 60 * 1000;
       return new Promise((resolve) => {
+        // Terminal: clear the resume anchor so a later re-activate can't restart
+        // a finished run.
+        const done = () => { _polling = false; _lastTick = null; resolve(); };
         const tick = async () => {
-          if (closed) return resolve();
+          if (closed) return done();
+          _polling = true;
           try {
             const st = await client.runStatus(app.id, promptId);
             if (st.status === "done") {
               renderOutputs(st);
-              return resolve();
+              return done();
             }
             status.textContent = st.status === "running" ? "Running…" : "Queued…";
           } catch (e) {
             status.textContent = e.message;
             status.classList.add("err");
-            return resolve();
+            return done();
           }
           if (Date.now() > deadline) {
             status.textContent = "Timed out waiting for the run — it may still finish; check ComfyUI's queue.";
             status.classList.add("err");
-            return resolve();
+            return done();
           }
+          _polling = false;
+          // Paused while the Apps tab is hidden — onDeactivate cleared pollTimer,
+          // and onActivate re-arms via _lastTick. The shell only detaches the
+          // detail DOM (same nodes), so the resumed poll updates the right nodes.
+          if (_hidden) { pollTimer = null; return; }
           pollTimer = setTimeout(tick, 2000);
         };
+        _lastTick = tick; // resume anchor for re-activation
         tick();
       });
     }
@@ -1044,13 +1046,39 @@ export function openAppsModal(ctx, opts = {}) {
     body.append(bar, el("div", "cmcp-apps-empty", e && e.message ? e.message : String(e)));
   }
 
-  document.body.appendChild(overlay);
-  showGrid().catch(showError);
-
   return {
-    close,
-    isOpen: () => !closed,
+    key: "apps", label: "Apps", icon: "pi-th-large", driveKind: null,
+    hasSearch: () => _tab === "explore",
+    searchPlaceholder: "Search apps…",
+    subnavExtras: () => [mineChip, exploreChip],
+    mount(bodyEl) { bodyEl.appendChild(body); },
+    onActivate() {
+      _hidden = false;
+      syncChips();
+      if (!_started) { _started = true; showGrid().catch(showError); }
+      // Re-arm a paused run poll (the detail DOM is preserved by the shell). The
+      // _polling / !pollTimer guards prevent double-arming when a tick is still
+      // mid-flight or already scheduled.
+      else if (_lastTick && !_polling && !pollTimer) { pollTimer = setTimeout(_lastTick, 0); }
+    },
+    // Halt the in-flight run poll while hidden — it would otherwise keep polling +
+    // writing to the DOM the shell detached on switch.
+    onDeactivate() {
+      _hidden = true;
+      if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    },
+    // Shared search → Explore registry query (debounced), no-op on My Apps.
+    onSearch(value) {
+      exploreQuery = value;
+      if (_tab !== "explore" || !_exploreReload) return;
+      clearTimeout(_exploreTimer);
+      _exploreTimer = setTimeout(() => { if (_exploreReload) _exploreReload(); }, 350);
+    },
     update: () => {},
-    el: overlay,
+    teardown() {
+      closed = true;
+      if (pollTimer) clearTimeout(pollTimer); // pollTimer is a setTimeout id, not an interval
+      if (_exploreTimer) clearTimeout(_exploreTimer);
+    },
   };
 }
