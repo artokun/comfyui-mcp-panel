@@ -7592,6 +7592,24 @@ const PANEL_CSS = `
 }
 .cmcp-toolbtn.cmcp-toolbtn-iconic .pi { font-size: 0.9375rem; }
 .cmcp-toolbtn.cmcp-toolbtn-iconic svg { width: 15px; height: 15px; }
+/* Active tab: the four surface buttons ARE the tab bar (issue #124) — the open
+   one gets the themed toggled state (inverts light/dark via the primary tokens). */
+.cmcp-toolbtn.cmcp-toolbtn-active {
+  background: var(--p-primary-color, #3a7bd5);
+  color: var(--p-primary-contrast-color, #fff);
+}
+.cmcp-toolbtn.cmcp-toolbtn-active:hover { background: var(--p-primary-color, #3a7bd5); color: var(--p-primary-contrast-color, #fff); }
+/* Responsive tab bar: under 400px the toolbar collapses its labels to icons only
+   (container query on the bar's OWN width, so a narrow docked/sidebar pane
+   collapses even on a wide screen). Mirrors the iconic Deafen/Blind hide. */
+.cmcp-toolbar { container-type: inline-size; }
+@container (max-width: 400px) {
+  .cmcp-toolbar .cmcp-toolbtn span {
+    position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
+  }
+  .cmcp-toolbar .cmcp-toolbtn { padding: 0.25rem 0.375rem; }
+}
 /* Engaged gates get a colored tint so their state is readable at a glance. */
 .cmcp-toolbtn.gate-on-deafen { color: var(--p-red-400, #f87171); }
 .cmcp-toolbtn.gate-on-deafen svg { animation: cmcp-pulse 1s ease-in-out infinite; }
@@ -10150,6 +10168,15 @@ function buildPanel() {
       },
     };
   }
+  // The four toolbar buttons ARE the tab bar: reflect the open surface with a
+  // themed toggled state (cleared on close). The buttons are const-declared below,
+  // but this only runs at tab-change time, by which point they're initialized.
+  function setActiveToolbarTab(key) {
+    const map = { civitai: civitaiBtn, apps: appsBtn, training: trainingBtn, local: runpodBtn };
+    for (const [k, btn] of Object.entries(map)) {
+      if (btn) btn.classList.toggle("cmcp-toolbtn-active", k === key);
+    }
+  }
   /** Open the unified side panel on `tab`, or switch to it if already open. */
   function openSidePanelTab(tab, { tabOpts, dock = true } = {}) {
     if (_sidePanelHandle?.isOpen?.()) {
@@ -10160,9 +10187,11 @@ function buildPanel() {
       tab,
       dock,
       ...(tabOpts ? { tabOpts: { [tab]: tabOpts } } : {}),
+      // The toolbar buttons are the tabs — highlight the active one on every switch.
+      onTabChange: setActiveToolbarTab,
       // Null the stored handle whenever the panel closes (✕, Escape, backdrop) so
-      // post-open drive cmds get an honest "not open" error.
-      onClose: () => { if (_sidePanelHandle === handle) _sidePanelHandle = null; },
+      // post-open drive cmds get an honest "not open" error; clear the toolbar too.
+      onClose: () => { if (_sidePanelHandle === handle) _sidePanelHandle = null; setActiveToolbarTab(null); },
     });
     _sidePanelHandle = handle;
     return handle;
