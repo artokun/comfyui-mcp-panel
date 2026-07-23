@@ -16,6 +16,21 @@ export const LEVELS = [
   { label: "X", level: 8 },
   { label: "XXX", level: 16 },
 ];
+
+/** Human rating label for an image's `nsfwLevel` bit (1=PG … 16=XXX). An
+ *  nsfwLevel is normally a single bit, but tolerate a combined mask by
+ *  labelling with the HIGHEST rating present (so nothing under-reports). Used
+ *  by the gated-favorite placeholder cards, which show the rating in place of
+ *  the (withheld) media. */
+export function levelLabel(n) {
+  const lvl = Number(n) || 0;
+  const exact = LEVELS.find((l) => l.level === lvl);
+  if (exact) return exact.label;
+  for (let i = LEVELS.length - 1; i >= 0; i--) {
+    if (lvl & LEVELS[i].level) return LEVELS[i].label;
+  }
+  return "?";
+}
 export const PERIODS = ["Day", "Week", "Month", "Year", "AllTime"];
 export const IMAGE_SORTS = ["Most Reactions", "Most Comments", "Most Collected", "Newest", "Oldest"];
 export const MODEL_SORTS = ["Most Downloaded", "Highest Rated", "Most Liked", "Newest", "Oldest"];
