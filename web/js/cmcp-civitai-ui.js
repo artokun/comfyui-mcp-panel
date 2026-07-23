@@ -508,6 +508,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         const page = await client.fetchFavorites({
           cursor: state.cursor,
           levels,
+          sort: f.imageSort, period: f.period,
           ...(colId ? { collectionId: colId } : {}),
           ...(state.favType !== "all" ? { types: [state.favType] } : {}),
         });
