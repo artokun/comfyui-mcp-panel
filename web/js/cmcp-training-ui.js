@@ -1339,7 +1339,18 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     searchPlaceholder: "Filter outputs by filename…",
     subnavExtras: () => [jobsBtn],
     mount(bodyEl) { bodyEl.append(stepsBar, body); },
-    onActivate() { if (!_started) { _started = true; show("flows"); } },
+    onActivate() {
+      // First activation lands on Flows; every re-activation RE-ENTERS the
+      // current view so its renderer rebinds to the freshly re-mounted DOM — and
+      // in particular the Monitor poll re-arms (renderMonitor bumps pollGen +
+      // poll()) after having been stopped on deactivate. All field state lives in
+      // `wiz`, so a re-render is lossless (inputs re-seed from wiz).
+      if (!_started) { _started = true; show("flows"); }
+      else show(currentView);
+    },
+    // Halt the monitor poll while the tab is hidden — otherwise it keeps writing
+    // to the DOM the shell detached on switch (frozen monitor after a round-trip).
+    onDeactivate() { stopPolling(); },
     onSearch(value) {
       outputsFilter = value;
       if (repaintOutputs) repaintOutputs();
