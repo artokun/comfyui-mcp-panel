@@ -159,10 +159,14 @@ async function draftFromCanvas(getApp) {
     }
     const nodeHasImported = [...importedKeys].some((k) => Number(k.split(".")[0]) === id);
     if (!AppBuilder.INPUT_HINT_TYPES.has(String(node.type || "")) && !nodeHasImported) continue;
+    // Only a CONNECTED widget-input makes a widget link-driven. Modern
+    // frontends materialize an input socket (link: null) for EVERY widget —
+    // treating mere presence as link-driven excluded every candidate on
+    // current ComfyUI (found dogfooding: an EmptyImage offered zero inputs).
     const linkDriven = new Set(
       (Array.isArray(node.inputs) ? node.inputs : [])
-        .map((inp) => inp && inp.widget && inp.widget.name)
-        .filter(Boolean),
+        .filter((inp) => inp && inp.link != null && inp.widget && inp.widget.name)
+        .map((inp) => inp.widget.name),
     );
     for (const w of Array.isArray(node.widgets) ? node.widgets : []) {
       if (!w || !w.name || linkDriven.has(w.name)) continue;
