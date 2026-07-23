@@ -13,7 +13,7 @@
 import {
   CivitaiClient, DEFAULT_FILTERS, LEVELS, PERIODS, IMAGE_SORTS, MODEL_SORTS,
   BASE_MODELS, ACTIVE_BASE_MODELS, prepareQuery, matchesBaseModel,
-  filtersDirty, bitmask, parseCreatorQuery,
+  filtersDirty, bitmask, parseCreatorQuery, levelLabel,
 } from "./cmcp-civitai.js";
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import { openSubModal as openSubModalBase, toast } from "./cmcp-modal.js";
@@ -85,6 +85,14 @@ function injectCss() {
     font-size: .7rem; color: #fff; background: linear-gradient(transparent, rgba(0,0,0,.75)); }
   .cmcp-cv-badge { position: absolute; top: .3rem; left: .3rem; background: rgba(0,0,0,.6); color:#fff;
     font-size: .6rem; padding: .1rem .3rem; border-radius: 4px; }
+  /* Gated favorites: black card in place of withheld media, rating centered. */
+  .cmcp-cv-card.cmcp-cv-gated { background: #000; }
+  .cmcp-cv-lb-stage.cmcp-cv-gated { background: #000; }
+  .cmcp-cv-gatedlabel { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    background: rgba(0,0,0,.6); color: #fff; font-weight: 700; font-size: .95rem; letter-spacing: .06em;
+    padding: .28rem .6rem; border-radius: 6px; border: 1px solid var(--p-content-border-color,#3f3f46);
+    pointer-events: none; }
+  .cmcp-cv-lb-stage .cmcp-cv-gatedlabel { font-size: 2rem; padding: .5rem 1.2rem; }
   .cmcp-cv-add { position: absolute; top: .3rem; right: .3rem; background: rgba(0,0,0,.55); color:#fff;
     border: none; border-radius: 6px; width: 24px; height: 24px; cursor: pointer; }
   .cmcp-cv-owned { position: absolute; top: .3rem; right: .3rem; background: rgba(34,197,94,.92);
@@ -497,18 +505,23 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       const t = tabDef();
       if (t.fav) {
         if (!state.signedIn) { sentinel.textContent = "Sign in to see your favorites."; setLoading(false); return; }
-        // The favorites feed is still browsing-level gated by the ACTIVE filter:
-        // fetchFavorites defaults to ALL levels, so an agent-driven session that
-        // clamped the levels (no NSFW consent) would otherwise leak R/X/XXX here
-        // (security: codex finding). Pass the same clamped set as every other
-        // feed. The subnav chips narrow by type; the feed reads the likes
-        // COLLECTION (auto-detected) — reactions only hold in-app hearts; see
+        // Fetch the WHOLE likes collection regardless of the browsing-level
+        // mask, so a favorite whose rating is outside the enabled levels still
+        // comes back instead of vanishing (the "Favorites shows 0 results"
+        // bug). Those items render as BLACK PLACEHOLDER cards: their media URL
+        // is never loaded, so no R/X/XXX imagery leaks even in a session with
+        // no NSFW consent (the original codex finding) — only the rating label,
+        // creator, and heart count show. `enabledMask` marks which items are
+        // gated (rating not in the active levels) for the card renderer. The
+        // subnav chips narrow by type; the feed reads the likes COLLECTION
+        // (auto-detected) — reactions only hold in-app hearts; see
         // resolveLikesCollectionId.
+        const enabledMask = bitmask(levels);
         const colId = await resolveLikesCollectionId(client);
         if (req !== state.reqId) return;
         const page = await client.fetchFavorites({
           cursor: state.cursor,
-          levels,
+          levels: LEVELS.map((l) => l.level),
           sort: f.imageSort, period: f.period,
           ...(colId ? { collectionId: colId } : {}),
           ...(state.favType !== "all" ? { types: [state.favType] } : {}),
@@ -537,6 +550,10 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
           return true;
         };
         const fresh = page.items.filter((it) => !seen.has(it.id) && favMatch(it));
+        // Mark (don't drop) items whose rating isn't in the enabled levels —
+        // mediaCard/openViewer render these as a black placeholder instead of
+        // the media.
+        for (const it of fresh) it.gated = (it.nsfwLevel & enabledMask) === 0;
         appendItems(fresh);
         const filtering = !!q || bms.length > 0 || !!creator;
         stalled = !fresh.length && !state.done && filtering;
@@ -626,24 +643,36 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     const card = el("div", "cmcp-cv-card");
     card.dataset.id = String(it.id);
     card.dataset.kind = "media";
-    // Both image and video cards show a still (video thumbnailUrl is a jpeg
-    // poster); hover on a video swaps in the muted transcoded clip.
-    const img = document.createElement("img");
-    img.loading = "lazy"; img.src = it.thumbnailUrl;
-    img.addEventListener("error", () => { card.style.display = "none"; });
-    card.appendChild(img);
-    if (it.type === "video") {
-      card.appendChild(el("span", "cmcp-cv-badge", "▶"));
-      let vid = null;
-      card.addEventListener("mouseenter", () => {
-        if (vid) return;
-        vid = document.createElement("video");
-        vid.src = it.fullUrl; vid.muted = true; vid.loop = true; vid.playsInline = true;
-        vid.autoplay = true;
-        card.appendChild(vid);
-        vid.play().catch(() => {});
-      });
-      card.addEventListener("mouseleave", () => { if (vid) { vid.remove(); vid = null; } });
+    // Gated (rating outside the enabled browsing levels) or no usable media:
+    // render a BLACK placeholder with the rating label centered — never load
+    // the thumbnail/clip — but keep every overlay (▶ for video, the ♥ heart
+    // count + @creator foot, and the hover like button) so the card is still
+    // scannable and likable.
+    const gated = it.gated === true || !it.thumbnailUrl;
+    if (gated) {
+      card.classList.add("cmcp-cv-gated");
+      if (it.type === "video") card.appendChild(el("span", "cmcp-cv-badge", "▶"));
+      card.appendChild(el("span", "cmcp-cv-gatedlabel", levelLabel(it.nsfwLevel)));
+    } else {
+      // Both image and video cards show a still (video thumbnailUrl is a jpeg
+      // poster); hover on a video swaps in the muted transcoded clip.
+      const img = document.createElement("img");
+      img.loading = "lazy"; img.src = it.thumbnailUrl;
+      img.addEventListener("error", () => { card.style.display = "none"; });
+      card.appendChild(img);
+      if (it.type === "video") {
+        card.appendChild(el("span", "cmcp-cv-badge", "▶"));
+        let vid = null;
+        card.addEventListener("mouseenter", () => {
+          if (vid) return;
+          vid = document.createElement("video");
+          vid.src = it.fullUrl; vid.muted = true; vid.loop = true; vid.playsInline = true;
+          vid.autoplay = true;
+          card.appendChild(vid);
+          vid.play().catch(() => {});
+        });
+        card.addEventListener("mouseleave", () => { if (vid) { vid.remove(); vid = null; } });
+      }
     }
     const foot = el("div", "cmcp-cv-cardfoot", `${it.author ? "@" + it.author : ""}  ♥ ${it.reactions || 0}`);
     card.appendChild(foot);
@@ -767,9 +796,16 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       const seq = ++renderSeq;
       const it = state.items[idx];
       if (!it) return;
-      // left: the media itself
+      // left: the media itself — unless gated (rating outside the enabled
+      // levels) or missing a URL, in which case the stage stays BLACK with the
+      // rating label centered. No <img>/<video> is created, so no withheld
+      // media loads; the side panel (creator, actions) is unaffected.
       stage.innerHTML = "";
-      if (it.type === "video") {
+      const gated = it.gated === true || !it.fullUrl;
+      stage.classList.toggle("cmcp-cv-gated", gated);
+      if (gated) {
+        stage.appendChild(el("span", "cmcp-cv-gatedlabel", levelLabel(it.nsfwLevel)));
+      } else if (it.type === "video") {
         const vid = document.createElement("video");
         vid.src = it.fullUrl; vid.controls = true; vid.autoplay = true; vid.loop = true;
         vid.playsInline = true;
