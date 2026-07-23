@@ -24,7 +24,7 @@ import { createLocalContent } from "./cmcp-runpod-ui.js";
 
 // key → content factory + tab presentation. Order = tab-bar order.
 const TABS = [
-  { key: "civitai", label: "Civitai", icon: "pi-images", factory: createCivitaiContent },
+  { key: "civitai", label: "CivitAI", icon: "pi-images", factory: createCivitaiContent },
   { key: "apps", label: "Apps", icon: "pi-th-large", factory: createAppsContent },
   { key: "training", label: "Training", icon: "pi-bolt", factory: createTrainingContent },
   { key: "local", label: "RunPod", icon: "pi-server", factory: createLocalContent },
