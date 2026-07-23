@@ -505,10 +505,10 @@ export class CivitaiClient {
    *  the Newest sort — echoing it back silently drops one item per page
    *  boundary. We continue from the id of the LAST item we received and treat
    *  the server cursor purely as a has-more flag. */
-  async fetchFavorites({ levels = [1, 2, 4, 8, 16], cursor, types, collectionId } = {}) {
+  async fetchFavorites({ levels = [1, 2, 4, 8, 16], cursor, types, collectionId, sort = "Newest", period = "AllTime" } = {}) {
     const input = {
       json: {
-        period: "AllTime", sort: "Newest",
+        period, sort,
         ...(collectionId ? { collectionId } : { reactions: ["Like"] }),
         browsingLevel: bitmask(levels), cursor: cursor ?? null, authed: true,
         limit: 100,
@@ -523,8 +523,13 @@ export class CivitaiClient {
     const items = raw.map((x) => this._fromMeili(x));
     const next = j.nextCursor ?? null;
     if (next == null) return { items, nextCursor: null };
+    // The id-cursor workaround (continue from the last item's id, dodging the
+    // boundary-skip) is only valid for the Newest sort's strict `id < cursor`
+    // keyset. Other sorts key off a different column, so echo the server's own
+    // nextCursor for them instead.
     const lastRawId = Number(raw[raw.length - 1]?.id) || 0;
-    return { items, nextCursor: lastRawId > 0 ? String(lastRawId) : String(next) };
+    const useIdCursor = sort === "Newest" && lastRawId > 0;
+    return { items, nextCursor: useIdCursor ? String(lastRawId) : String(next) };
   }
 
   async fetchModels({ type, sort = "Most Downloaded", period = "Week", baseModels = [], levels = [1], limit = 100, cursor, query, username } = {}) {
