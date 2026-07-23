@@ -73,10 +73,7 @@ import {
   workflowAliasForPath,
 } from "./lib/workflow-chat-identity.js";
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
-import { openCivitaiModal } from "./cmcp-civitai-ui.js";
-import { openRunpodModal } from "./cmcp-runpod-ui.js";
-import { openAppsModal } from "./cmcp-apps-ui.js";
-import { openTrainingModal } from "./cmcp-training-ui.js";
+import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 
 let app = null;
 let api = null;
@@ -10101,12 +10098,13 @@ function buildPanel() {
   ring.style.cursor = "pointer"; ring.onclick = deafenBtn.onclick; // clicking the ring toggles deafen
   reflectFeedGates();
 
-  // Civitai explorer — opens the in-panel CivitAI browser modal. Also opened BY
-  // the agent (cmd:open_civitai) pre-seeded with a query + filters.
+  // Unified side panel (issue #124): ONE tabbed overlay hosting Civitai / Apps /
+  // Training / Local-RunPod. openSidePanelTab opens it (or switches tab if it is
+  // already open); the four openX wrappers + toolbar buttons all route through it.
   // Mark: Civitai's hexagon-C, monochrome via currentColor (no brand gradients,
   // no event attrs — keeps the registry's SVG YARA gate happy).
-  let _civitaiHandle = null;
-  function civitaiCtx() {
+  let _sidePanelHandle = null;
+  function sidePanelCtx() {
     return {
       api,
       root,
@@ -10120,14 +10118,22 @@ function buildPanel() {
       isMuted: () => AGENT_MUTED,
       marked,
       DOMPurify,
-      // Canvas access for "load workflow onto canvas": dirty check for the
-      // confirm-overwrite prompt, then the SAME undoable path the bridge's
-      // graph_load command takes (snapshot → await loadGraphData → checkState,
-      // so one load = one Ctrl+Z step). Rejects with a readable message when
-      // the graph isn't a loadable UI workflow or the load itself fails.
-      // Dirty check fails CLOSED: when the workflow state can't be read
-      // (older frontend, missing service, throw), report dirty so the caller
-      // confirms instead of silently clobbering an unsaved canvas.
+      // Apps tab: live canvas app; Local tab: honest host + pod status frames.
+      getApp: () => app,
+      getRunpodTarget: () => _comfyuiTarget,
+      // Apps pod runs: transfer image inputs through the bridge's upload_media
+      // handler → the CONNECTED ComfyUI (the pod when on one), not the local
+      // /upload/image (#125).
+      uploadMedia: (b, n) => liveBridgeClient?.uploadMedia(b, n),
+      getStatus: () => _runpodStatus,
+      getTarget: () => _comfyuiTarget,
+      openUrl: (u) => { try { window.open(u, "_blank", "noopener"); } catch {} },
+      // Canvas access for "load workflow onto canvas" (Civitai tab): dirty check
+      // for the confirm-overwrite prompt, then the SAME undoable path the bridge's
+      // graph_load command takes (snapshot → await loadGraphData → checkState, so
+      // one load = one Ctrl+Z step). Dirty check fails CLOSED: when the workflow
+      // state can't be read (older frontend, missing service, throw), report dirty
+      // so the caller confirms instead of silently clobbering an unsaved canvas.
       graphIsDirty: () => {
         try {
           const wf = app?.extensionManager?.workflow?.activeWorkflow;
@@ -10144,18 +10150,30 @@ function buildPanel() {
       },
     };
   }
-  function openCivitai(opts) {
-    try { _civitaiHandle?.close(); } catch {}
-    const handle = openCivitaiModal(civitaiCtx(), {
-      ...(opts || {}),
-      // Null the stored handle whenever THIS modal closes (✕, reopen, backdrop)
-      // so post-open drive cmds get an honest "not open" error instead of
-      // operating on a detached grid.
-      onClose: () => { if (_civitaiHandle === handle) _civitaiHandle = null; },
+  /** Open the unified side panel on `tab`, or switch to it if already open. */
+  function openSidePanelTab(tab, { tabOpts, dock = true } = {}) {
+    if (_sidePanelHandle?.isOpen?.()) {
+      try { _sidePanelHandle.switchTab(tab, tabOpts); } catch { /* stale */ }
+      return _sidePanelHandle;
+    }
+    const handle = openSidePanel(sidePanelCtx(), {
+      tab,
+      dock,
+      ...(tabOpts ? { tabOpts: { [tab]: tabOpts } } : {}),
+      // Null the stored handle whenever the panel closes (✕, Escape, backdrop) so
+      // post-open drive cmds get an honest "not open" error.
+      onClose: () => { if (_sidePanelHandle === handle) _sidePanelHandle = null; },
     });
-    _civitaiHandle = handle;
-    return _civitaiHandle;
+    _sidePanelHandle = handle;
+    return handle;
   }
+  const openCivitai = (opts = {}) => openSidePanelTab("civitai", {
+    dock: opts.dock !== false,
+    tabOpts: { query: opts.query, tab: opts.tab, filters: opts.filters, browsingLevels: opts.browsingLevels },
+  });
+  const openApps = () => openSidePanelTab("apps");
+  const openTraining = (opts = {}) => openSidePanelTab("training", { dock: opts.dock !== false });
+  const openRunpod = () => openSidePanelTab("local");
   const civitaiBtn = toolbarBtn("pi-circle", "Civitai");
   civitaiBtn.querySelector(".pi").remove();
   civitaiBtn.title = "Civitai explorer — browse and pull models, LoRAs, and workflows without leaving the panel.";
@@ -10186,28 +10204,6 @@ function buildPanel() {
   // ComfyUI APP-mode config) into a named, one-click app; runs headless via
   // the pack's py/apps_routes.py (canvas never touched). Grid of four rounded
   // squares (mini-app launcher mark), currentColor like the neighbors.
-  let _appsHandle = null;
-  function openApps(opts) {
-    try { _appsHandle?.close(); } catch {}
-    const handle = openAppsModal(
-      {
-        getApp: () => app,
-        uploadBlobToInput,
-        callTool: (t, a, o) => liveBridgeClient?.callTool(t, a, o),
-        // Pod image transfer for app runs: bytes go through the bridge's
-        // upload_media handler, which writes to the CONNECTED ComfyUI (the
-        // pod when we're on one) — NOT the local /upload/image.
-        uploadMedia: (b, n) => liveBridgeClient?.uploadMedia(b, n),
-        getRunpodTarget: () => _comfyuiTarget,
-      },
-      {
-        ...(opts || {}),
-        onClose: () => { if (_appsHandle === handle) _appsHandle = null; },
-      },
-    );
-    _appsHandle = handle;
-    return _appsHandle;
-  }
   const appsBtn = toolbarBtn("pi-circle", "Apps");
   appsBtn.querySelector(".pi").remove();
   appsBtn.title = "Apps — one-click micro-apps built from workflows: convert, run locally or on RunPod, share.";
@@ -10230,28 +10226,7 @@ function buildPanel() {
 
   // LoRA Training — the dataset gather/label/launch/monitor wizard for the
   // local trainer (ai-toolkit in a GPU container, train_* tools over call_tool).
-  // Same modal treatment as the CivitAI browser; dumbbell mark via currentColor.
-  let _trainingHandle = null;
-  function trainingCtx() {
-    return {
-      api,
-      root,
-      dockGeometry: panelDockGeometry,
-      watchDock: panelWatchDock,
-      callTool: (t, a, o) => liveBridgeClient?.callTool(t, a, o),
-      uploadBlobToInput,
-    };
-  }
-  // Reused by both the toolbar button (centered) and the agent bridge (docked).
-  function openTraining(opts) {
-    try { _trainingHandle?.close(); } catch {}
-    const handle = openTrainingModal(trainingCtx(), {
-      ...(opts || {}),
-      onClose: () => { if (_trainingHandle === handle) _trainingHandle = null; },
-    });
-    _trainingHandle = handle;
-    return _trainingHandle;
-  }
+  // Same side-panel treatment as the CivitAI browser; dumbbell mark via currentColor.
   const trainingBtn = toolbarBtn("pi-circle", "Training");
   trainingBtn.querySelector(".pi").remove();
   trainingBtn.title = "LoRA Training — train a character LoRA locally on FLUX.1-dev (style/edit/slider/video coming in P2).";
@@ -10275,10 +10250,9 @@ function buildPanel() {
 
   // RunPod — cloud GPU control panel + honest host indicator. The button label
   // reflects WHERE renders run (Local vs the pod), so it doubles as the host
-  // pill; clicking opens the control modal (deploy / start / stop / connect /
-  // use-local). Driven by the orchestrator's `runpod_status` + `comfyui_target`
-  // frames (wired below). The pod runs our template → full canvas parity.
-  let _runpodHandle = null;
+  // pill; clicking opens the unified side panel on the Local tab (deploy / start
+  // / stop / connect / use-local). Driven by the orchestrator's `runpod_status` +
+  // `comfyui_target` frames (wired below). The pod runs our template → full parity.
   let _runpodStatus = null; // last runpod_status frame
   let _comfyuiTarget = null; // last comfyui_target frame
   const runpodBtn = toolbarBtn("pi-circle", "Local");
@@ -10339,31 +10313,20 @@ function buildPanel() {
       ? `Rendering on RunPod${gpu}${cost} — click to manage the pod or switch back to local.`
       : "Rendering locally on this machine — click to run this session on a cloud GPU (RunPod).") + alertNote;
   }
-  runpodBtn.addEventListener("click", () => {
-    try { _runpodHandle?.close(); } catch {}
-    _runpodHandle = openRunpodModal({
-      root,
-      callTool: (tool, args, o) => liveBridgeClient?.callTool(tool, args, o),
-      getStatus: () => _runpodStatus,
-      getTarget: () => _comfyuiTarget,
-      openUrl: (u) => { try { window.open(u, "_blank", "noopener"); } catch {} },
-      // Agent-drive side-dock geometry/observation (pane may be docked L or R),
-      // same helpers the CivitAI/Training modals use.
-      dockGeometry: panelDockGeometry,
-      watchDock: panelWatchDock,
-    }, { dock: true });
-  });
-  // Expose for the bridge callbacks (defined outside this closure).
+  runpodBtn.addEventListener("click", () => openRunpod());
+  // Expose for the bridge callbacks (defined outside this closure). Status/target
+  // frames update the host pill independently, and re-render the side panel's
+  // Local tab only when it's the active tab (update() no-ops on other tabs).
   panelRunpod = {
-    onStatus: (frame) => { _runpodStatus = frame; reflectRunpodHost(); if (_runpodHandle?.isOpen?.()) _runpodHandle.update(); },
-    onTarget: (frame) => { _comfyuiTarget = frame; reflectRunpodHost(); if (_runpodHandle?.isOpen?.()) _runpodHandle.update(); },
+    onStatus: (frame) => { _runpodStatus = frame; reflectRunpodHost(); if (_sidePanelHandle?.isOpen?.()) _sidePanelHandle.update(); },
+    onTarget: (frame) => { _comfyuiTarget = frame; reflectRunpodHost(); if (_sidePanelHandle?.isOpen?.()) _sidePanelHandle.update(); },
     onAlert: (frame) => {
       const id = frame && frame.pod_id;
       if (!id) return;
       if (frame.resolved || frame.reason === "resolved") _runpodAlerts.delete(id);
       else _runpodAlerts.set(id, frame);
       reflectRunpodHost();
-      if (_runpodHandle?.isOpen?.()) _runpodHandle.update();
+      if (_sidePanelHandle?.isOpen?.()) _sidePanelHandle.update();
     },
   };
   reflectRunpodHost();
@@ -11956,36 +11919,37 @@ function buildPanel() {
       });
       return { ok: true };
     },
-    // The agent DRIVES the already-open CivitAI browser (switch tab, re-search,
-    // read results, glow-highlight). Routes to the live modal handle; throws an
-    // honest "not open" error the agent can retry after re-opening.
+    // The agent DRIVES the already-open CivitAI browser tab (switch sub-tab,
+    // re-search, read results, glow-highlight). Routes to the unified side-panel
+    // handle's civitai facade; throws an honest "civitai browser not open" error
+    // (guard here, plus the facade re-checks the active tab).
     onCivitaiCmd(msg) {
-      const h = _civitaiHandle;
+      const h = _sidePanelHandle;
       if (!h) throw new Error("civitai browser not open");
       switch (msg.cmd) {
-        case "civitai_results": return h.getResults({ limit: msg.limit });
-        case "civitai_highlight": return h.highlight(Array.isArray(msg.ids) ? msg.ids : (msg.ids != null ? [msg.ids] : []), { kind: msg.kind });
-        case "civitai_clear_highlight": return h.clearHighlight();
-        case "civitai_switch_tab": return h.switchTab(msg.tab);
-        case "civitai_search": return h.search({ query: msg.query, filters: msg.filters, browsingLevels: msg.browsingLevels });
-        case "civitai_open_lightbox": return h.openLightbox(msg.id);
+        case "civitai_results": return h.civitai.getResults({ limit: msg.limit });
+        case "civitai_highlight": return h.civitai.highlight(Array.isArray(msg.ids) ? msg.ids : (msg.ids != null ? [msg.ids] : []), { kind: msg.kind });
+        case "civitai_clear_highlight": return h.civitai.clearHighlight();
+        case "civitai_switch_tab": return h.civitai.switchTab(msg.tab);
+        case "civitai_search": return h.civitai.search({ query: msg.query, filters: msg.filters, browsingLevels: msg.browsingLevels });
+        case "civitai_open_lightbox": return h.civitai.openLightbox(msg.id);
         default: throw new Error(`unknown civitai cmd "${msg.cmd}"`);
       }
     },
-    // The agent opens/drives the training wizard (parity with CivitAI).
+    // The agent opens/drives the training wizard tab (parity with CivitAI).
     onTrainingCmd(msg) {
       if (msg.cmd === "open_training") {
         openTraining({ dock: msg.dock !== false });
         return { ok: true };
       }
-      const h = _trainingHandle;
+      const h = _sidePanelHandle;
       if (!h) throw new Error("training wizard not open");
       switch (msg.cmd) {
-        case "training_get_state": return h.getState();
-        case "training_set_field": return h.setField(msg.name, msg.value);
-        case "training_goto_step": return h.gotoStep(msg.step);
-        case "training_set_target": return h.setTarget(msg.target);
-        case "training_highlight": return h.highlight(Array.isArray(msg.refs) ? msg.refs : (msg.refs != null ? [msg.refs] : []));
+        case "training_get_state": return h.training.getState();
+        case "training_set_field": return h.training.setField(msg.name, msg.value);
+        case "training_goto_step": return h.training.gotoStep(msg.step);
+        case "training_set_target": return h.training.setTarget(msg.target);
+        case "training_highlight": return h.training.highlight(Array.isArray(msg.refs) ? msg.refs : (msg.refs != null ? [msg.refs] : []));
         default: throw new Error(`unknown training cmd "${msg.cmd}"`);
       }
     },
