@@ -10196,6 +10196,16 @@ function buildPanel() {
     _sidePanelHandle = handle;
     return handle;
   }
+  // Toolbar-click toggle: clicking the ALREADY-active surface closes the panel.
+  // Scoped to the toolbar buttons only — the agent open path (openCivitai etc.)
+  // must never self-close when it re-opens an already-open tab.
+  function toggleSidePanelTab(tab, openFn) {
+    if (_sidePanelHandle?.isOpen?.() && _sidePanelHandle.activeTab?.() === tab) {
+      _sidePanelHandle.close();
+      return;
+    }
+    openFn();
+  }
   const openCivitai = (opts = {}) => openSidePanelTab("civitai", {
     dock: opts.dock !== false,
     tabOpts: { query: opts.query, tab: opts.tab, filters: opts.filters, browsingLevels: opts.browsingLevels },
@@ -10203,11 +10213,12 @@ function buildPanel() {
   const openApps = () => openSidePanelTab("apps");
   const openTraining = (opts = {}) => openSidePanelTab("training", { dock: opts.dock !== false });
   const openRunpod = () => openSidePanelTab("local");
-  const civitaiBtn = toolbarBtn("pi-circle", "Civitai");
+  const civitaiBtn = toolbarBtn("pi-circle", "CivitAI");
   civitaiBtn.querySelector(".pi").remove();
-  civitaiBtn.title = "Civitai explorer — browse and pull models, LoRAs, and workflows without leaving the panel.";
+  civitaiBtn.title = "CivitAI explorer — browse and pull models, LoRAs, and workflows without leaving the panel.";
   // Manual open side-docks too (chat stays visible) — parity with the agent open.
-  civitaiBtn.addEventListener("click", () => openCivitai({ dock: true }));
+  // Clicking the already-open CivitAI tab toggles it closed.
+  civitaiBtn.addEventListener("click", () => toggleSidePanelTab("civitai", () => openCivitai({ dock: true })));
   {
     const svgNs = "http://www.w3.org/2000/svg";
     const svg = document.createElementNS(svgNs, "svg");
@@ -10236,7 +10247,7 @@ function buildPanel() {
   const appsBtn = toolbarBtn("pi-circle", "Apps");
   appsBtn.querySelector(".pi").remove();
   appsBtn.title = "Apps — one-click micro-apps built from workflows: convert, run locally or on RunPod, share.";
-  appsBtn.addEventListener("click", () => openApps());
+  appsBtn.addEventListener("click", () => toggleSidePanelTab("apps", () => openApps()));
   {
     const svgNs = "http://www.w3.org/2000/svg";
     const svg = document.createElementNS(svgNs, "svg");
@@ -10260,7 +10271,7 @@ function buildPanel() {
   trainingBtn.querySelector(".pi").remove();
   trainingBtn.title = "LoRA Training — train a character LoRA locally on FLUX.1-dev (style/edit/slider/video coming in P2).";
   // Manual open side-docks too (chat stays visible) — parity with the agent open.
-  trainingBtn.addEventListener("click", () => openTraining({ dock: true }));
+  trainingBtn.addEventListener("click", () => toggleSidePanelTab("training", () => openTraining({ dock: true })));
   {
     const svgNs = "http://www.w3.org/2000/svg";
     const svg = document.createElementNS(svgNs, "svg");
@@ -10342,7 +10353,7 @@ function buildPanel() {
       ? `Rendering on RunPod${gpu}${cost} — click to manage the pod or switch back to local.`
       : "Rendering locally on this machine — click to run this session on a cloud GPU (RunPod).") + alertNote;
   }
-  runpodBtn.addEventListener("click", () => openRunpod());
+  runpodBtn.addEventListener("click", () => toggleSidePanelTab("local", () => openRunpod()));
   // Expose for the bridge callbacks (defined outside this closure). Status/target
   // frames update the host pill independently, and re-render the side panel's
   // Local tab only when it's the active tab (update() no-ops on other tabs).
