@@ -276,6 +276,12 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     target: "local",
     podInfo: null,
     uploadsPending: 0,
+    /** Reuse-a-staged-dataset mode (Jobs/Datasets → "Train again"): when set,
+     *  the Launch step skips the gather/label staging and calls train_start
+     *  directly with this datasetPath. { name, datasetPath, trigger?, params? } */
+    reuseDataset: null,
+    /** Dataset name open in the detail view (Datasets → row). */
+    datasetDetail: null,
     /** Generations: bumped on launch/reset so a stale async continuation (an
      *  in-flight launch or upload batch from a PREVIOUS wizard run) can't
      *  mutate the new run's state (codex findings). */
@@ -313,12 +319,15 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     wiz.uploadsPending = 0;
     wiz.launchGen++;
     wiz.uploadGen++;
+    wiz.reuseDataset = null; // a fresh run stages its own dataset
     return true;
   }
 
-  // Jobs button → shell subnav (via subnavExtras). The shell owns the ✕/title.
+  // Jobs + Datasets buttons → shell subnav (via subnavExtras). The shell owns the ✕/title.
   const jobsBtn = el("button", "cmcp-tr-btn", "Jobs");
   jobsBtn.style.flex = "none";
+  const datasetsBtn = el("button", "cmcp-tr-btn", "Datasets");
+  datasetsBtn.style.flex = "none";
 
   // Step chips (carry data-ref) + the wizard body, mounted into the shell's
   // .cmcp-cv-body scroll surface.
@@ -360,6 +369,8 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     body.textContent = "";
     if (view === "flows") { setSteps(null); renderFlows(); }
     else if (view === "jobs") { setSteps(null); renderJobs(); }
+    else if (view === "datasets") { setSteps(null); renderDatasets(); }
+    else if (view === "dataset-detail") { setSteps(null); renderDatasetDetail(); }
     else if (view === "wizard-1") { setSteps(["1 · Dataset", "2 · Label", "3 · Launch", "4 · Monitor"], 0); renderGather(); }
     else if (view === "wizard-2") { setSteps(["1 · Dataset", "2 · Label", "3 · Launch", "4 · Monitor"], 1); renderLabel(); }
     else if (view === "wizard-3") { setSteps(["1 · Dataset", "2 · Label", "3 · Launch", "4 · Monitor"], 2); renderLaunch(); }
@@ -371,6 +382,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
   }
 
   jobsBtn.onclick = () => show("jobs");
+  datasetsBtn.onclick = () => show("datasets");
 
   // ---------------------------------------------------------------- flows ---
   function renderFlows() {
@@ -744,11 +756,26 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
   function renderLaunch() {
     const sec = el("div", "cmcp-tr-section");
     const captioned = wiz.images.filter((i) => i.caption.trim()).length;
+    // Reuse mode (Jobs/Datasets → "Train again"): the set is already staged —
+    // say so up front, with an escape back to the full wizard (codex-style
+    // honesty: the launch below will NOT re-stage anything).
+    if (wiz.reuseDataset) {
+      const reuseBox = el("div", "cmcp-tr-card active");
+      const rd = wiz.reuseDataset;
+      reuseBox.append(el("p", null,
+        `Reusing staged dataset "${rd.name}" — already captioned and staged, so Launch starts training immediately (nothing is re-gathered or re-labeled).`));
+      const changeBtn = el("button", "cmcp-tr-btn", "Use a different dataset");
+      changeBtn.onclick = () => { wiz.reuseDataset = null; show("wizard-1"); };
+      reuseBox.appendChild(changeBtn);
+      sec.appendChild(reuseBox);
+    }
     // Live summary (rank updates with preset switches + custom edits).
     const summaryHint = el("p", "cmcp-tr-hint");
     const syncSummary = () => {
       const effRank = wiz.preset === "custom" ? (wiz.customParams?.rank ?? 16) : (PRESETS[wiz.preset].params?.rank ?? 16);
-      summaryHint.textContent = `Dataset "${sanitizeNameClient(wiz.datasetName)}" — ${wiz.images.length} images, ${captioned} with custom captions${wiz.trigger ? `, trigger "${wiz.trigger}"` : ""}. Model: FLUX.1-dev (quantized, rank ${effRank}).`;
+      summaryHint.textContent = wiz.reuseDataset
+        ? `Job name "${sanitizeNameClient(wiz.datasetName)}" (new run of staged set "${wiz.reuseDataset.name}")${wiz.trigger ? `, trigger "${wiz.trigger}"` : ""}. Model: FLUX.1-dev (quantized, rank ${effRank}).`
+        : `Dataset "${sanitizeNameClient(wiz.datasetName)}" — ${wiz.images.length} images, ${captioned} with custom captions${wiz.trigger ? `, trigger "${wiz.trigger}"` : ""}. Model: FLUX.1-dev (quantized, rank ${effRank}).`;
     };
     syncSummary();
     sec.append(summaryHint);
@@ -1009,24 +1036,34 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
           : { ...PRESETS[wiz.preset].params },
       };
       try {
-        // 1) Resolve image refs → host paths.
-        const res = await apiFetch(ctx, "/comfyui_mcp_panel/training/resolve-paths", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ images: snap.images.map((i) => i.ref) }),
-        });
-        const resolved = (await res.json()).paths || [];
-        if (gen !== wiz.launchGen) return; // superseded BEFORE any side effect
-        const bad = resolved.filter((r) => r.error);
-        if (bad.length) throw new Error(`${bad.length} image(s) could not be resolved: ${bad[0].error}`);
-        // 2) Stage dataset.
-        const items = resolved.map((r, i) => ({ path: r.path, caption: snap.images[i].caption }));
-        const prep = await callJson(ctx, "train_prepare_dataset", { name: snap.name, items, defaultCaption: snap.trigger }, { timeout: 60000 });
-        if (gen !== wiz.launchGen) return; // superseded after staging, before launch
+        let datasetPath;
+        if (wiz.reuseDataset) {
+          // Reuse-a-staged-dataset mode (Jobs/Datasets → "Train again"): the
+          // set is already staged with captions — skip resolve + re-staging
+          // entirely and train straight from it.
+          datasetPath = wiz.reuseDataset.datasetPath;
+          if (gen !== wiz.launchGen) return;
+        } else {
+          // 1) Resolve image refs → host paths.
+          const res = await apiFetch(ctx, "/comfyui_mcp_panel/training/resolve-paths", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ images: snap.images.map((i) => i.ref) }),
+          });
+          const resolved = (await res.json()).paths || [];
+          if (gen !== wiz.launchGen) return; // superseded BEFORE any side effect
+          const bad = resolved.filter((r) => r.error);
+          if (bad.length) throw new Error(`${bad.length} image(s) could not be resolved: ${bad[0].error}`);
+          // 2) Stage dataset.
+          const items = resolved.map((r, i) => ({ path: r.path, caption: snap.images[i].caption }));
+          const prep = await callJson(ctx, "train_prepare_dataset", { name: snap.name, items, defaultCaption: snap.trigger }, { timeout: 60000 });
+          if (gen !== wiz.launchGen) return; // superseded after staging, before launch
+          datasetPath = prep.datasetPath;
+        }
         // 3) Launch.
         const started = await callJson(ctx, "train_start", {
           name: snap.name, flow: "character", model: "flux1-dev",
-          datasetPath: prep.datasetPath, trigger: snap.trigger, params: snap.params,
+          datasetPath, trigger: snap.trigger, params: snap.params,
           target: snap.target,
           ...(snap.target === "pod" && snap.podId ? { pod_id: snap.podId } : {}),
         }, { timeout: 120000 });
@@ -1093,13 +1130,59 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     const logBox = el("div", "cmcp-tr-log");
     const resultBox = el("div", "cmcp-tr-section");
     resultBox.style.padding = "0";
+    // Settings used + the dataset this job trained on (and a one-tap rerun) —
+    // loaded once from train_job_config (the ai-toolkit config it consumed).
+    const metaBox = el("div", "cmcp-tr-section");
+    metaBox.style.padding = "0";
     const nav = el("div", "cmcp-tr-row");
     const cancelBtn = el("button", "cmcp-tr-btn danger", "Cancel run");
     const jobsNavBtn = el("button", "cmcp-tr-btn", "All jobs");
     jobsNavBtn.onclick = () => show("jobs");
     nav.append(cancelBtn, jobsNavBtn);
-    sec.append(headRow, barWrap, statLine, samplesLabel, samples, resultBox, logBox, nav);
+    sec.append(headRow, barWrap, statLine, samplesLabel, samples, metaBox, resultBox, logBox, nav);
     body.appendChild(sec);
+
+    (async () => {
+      if (!wiz.jobId) return;
+      try {
+        const cfg = await callJson(ctx, "train_job_config", { id: wiz.jobId }, { timeout: 30000 });
+        if (myGen !== pollGen) return;
+        const p = cfg.params || {};
+        const bits = [
+          p.steps != null ? `${p.steps} steps` : null,
+          p.lr != null ? `lr ${p.lr}` : null,
+          p.rank != null ? `rank ${p.rank}` : null,
+          Array.isArray(p.resolution) ? `res ${p.resolution.join("/")}` : null,
+          p.batchSize != null ? `batch ${p.batchSize}` : null,
+          p.saveEvery != null ? `save ${p.saveEvery}` : null,
+          p.sampleEvery != null ? `sample ${p.sampleEvery}` : null,
+          p.quantize != null ? (p.quantize ? "quantize on" : "quantize off") : null,
+        ].filter(Boolean);
+        metaBox.textContent = "";
+        if (bits.length) metaBox.append(el("p", "cmcp-tr-hint", `Settings: ${bits.join(" · ")}`));
+        if (cfg.datasetPath) {
+          const dsName = cfg.datasetPath.replace(/\\/g, "/").split("/").pop();
+          const dsRow = el("div", "cmcp-tr-row");
+          const dsLink = el("button", "cmcp-tr-btn", `Dataset: ${dsName}`);
+          dsLink.title = `${cfg.datasetPath} — see the labeled set this job trained on`;
+          dsLink.onclick = () => { wiz.datasetDetail = dsName; show("dataset-detail"); };
+          const againBtn = el("button", "cmcp-tr-btn", "Train again");
+          againBtn.title = "Run another job from this dataset + settings";
+          againBtn.onclick = () => {
+            if (!resetWizardConfig()) { alert("A launch is still in flight — let it settle (or cancel it from Jobs) before starting a new run."); return; }
+            wiz.reuseDataset = { name: dsName, datasetPath: cfg.datasetPath, params: p };
+            wiz.datasetName = `${cfg.name}-r2`;
+            if (cfg.trigger) wiz.trigger = cfg.trigger;
+            wiz.preset = "custom";
+            wiz.customParams = {};
+            for (const k of ["steps", "lr", "rank", "resolution"]) if (p[k] != null) wiz.customParams[k] = p[k];
+            show("wizard-3");
+          };
+          dsRow.append(dsLink, againBtn);
+          metaBox.appendChild(dsRow);
+        }
+      } catch { /* config view is best-effort decoration */ }
+    })();
 
     let lastStep = null;
     let lastStepAt = null;
@@ -1184,6 +1267,95 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
       }
     }
     poll();
+  }
+
+  // ------------------------------------------------------------- datasets ---
+  /** Staged datasets (the labeled sets from prepare) — see what you trained
+   *  on, and run another job from the same set. */
+  async function renderDatasets() {
+    const sec = el("div", "cmcp-tr-section");
+    const topRow = el("div", "cmcp-tr-row");
+    const backBtn = el("button", "cmcp-tr-btn", "All jobs");
+    backBtn.onclick = () => show("jobs");
+    topRow.appendChild(backBtn);
+    const list = el("div");
+    list.append(el("p", "cmcp-tr-hint", "Loading datasets…"));
+    sec.append(topRow, list);
+    body.appendChild(sec);
+    let datasets = [];
+    try {
+      const d = await callJson(ctx, "train_list_datasets", {}, { timeout: 30000 });
+      datasets = d.datasets || [];
+    } catch (e) {
+      list.textContent = "";
+      list.append(el("p", "cmcp-tr-hint", `Could not load datasets: ${e.message || e}`));
+      return;
+    }
+    list.textContent = "";
+    if (!datasets.length) {
+      list.append(el("p", "cmcp-tr-hint", "No staged datasets yet — gather images in a new character LoRA run."));
+      return;
+    }
+    for (const ds of datasets) {
+      const row = el("div", "cmcp-tr-jobrow");
+      row.dataset.ref = `dataset:${ds.name}`;
+      const name = el("span", "name", ds.name);
+      const meta = el("span", "meta",
+        `${ds.imageCount} image${ds.imageCount === 1 ? "" : "s"} · ${ds.captionedCount} captioned · ${fmtAgo(ds.modified)}`);
+      row.append(name, meta);
+      row.onclick = () => { wiz.datasetDetail = ds.name; show("dataset-detail"); };
+      list.appendChild(row);
+    }
+  }
+
+  /** One staged dataset: thumb grid + captions + "train with this dataset". */
+  async function renderDatasetDetail() {
+    const name = wiz.datasetDetail;
+    const sec = el("div", "cmcp-tr-section");
+    const topRow = el("div", "cmcp-tr-row");
+    const backBtn = el("button", "cmcp-tr-btn", "All datasets");
+    backBtn.onclick = () => show("datasets");
+    topRow.appendChild(backBtn);
+    const head = el("h3", null, name || "dataset");
+    head.style.margin = "0";
+    const sub = el("p", "cmcp-tr-hint", "Loading…");
+    const grid = el("div", "cmcp-tr-samples");
+    sec.append(topRow, head, sub, grid);
+    body.appendChild(sec);
+    let d;
+    try {
+      d = await callJson(ctx, "train_dataset_detail", { name }, { timeout: 30000 });
+    } catch (e) {
+      sub.textContent = `Could not load dataset: ${e.message || e}`;
+      return;
+    }
+    sub.textContent = `${d.imageCount} images · ${d.captionedCount} captioned · ${d.datasetPath}`;
+    grid.textContent = "";
+    for (const it of d.items || []) {
+      const cell = el("div");
+      cell.style.maxWidth = "180px";
+      const img = document.createElement("img");
+      img.src = sampleUrl(ctx, `${d.datasetPath}/${it.file}`);
+      img.style.width = "100%";
+      img.style.borderRadius = "6px";
+      img.onclick = () => window.open(sampleUrl(ctx, `${d.datasetPath}/${it.file}`), "_blank");
+      const cap = el("p", "cmcp-tr-hint", it.caption || "(no caption)");
+      cap.style.fontSize = "11px";
+      cell.append(img, cap);
+      grid.appendChild(cell);
+    }
+    // Train again with THIS staged set: skip the gather/label staging entirely
+    // (train_start takes datasetPath directly). Prefill a distinct job name so
+    // the new run can't silently overwrite the previous LoRA.
+    const trainBtn = el("button", "cmcp-tr-btn primary", "Train with this dataset");
+    trainBtn.dataset.ref = "train_with_dataset";
+    trainBtn.onclick = () => {
+      if (!resetWizardConfig()) { alert("A launch is still in flight — let it settle (or cancel it from Jobs) before starting a new run."); return; }
+      wiz.reuseDataset = { name: d.name, datasetPath: d.datasetPath };
+      wiz.datasetName = `${d.name}-r2`;
+      show("wizard-3");
+    };
+    sec.appendChild(trainBtn);
   }
 
   // ----------------------------------------------------------------- jobs ---
@@ -1349,7 +1521,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     // Search filters the outputs grid on the Dataset step only (decision B).
     hasSearch: () => currentView === "wizard-1" && outputsTabActive,
     searchPlaceholder: "Filter outputs by filename…",
-    subnavExtras: () => [jobsBtn],
+    subnavExtras: () => [jobsBtn, datasetsBtn],
     mount(bodyEl) { bodyEl.append(stepsBar, body); },
     onActivate() {
       // First activation lands on Flows; every re-activation RE-ENTERS the
