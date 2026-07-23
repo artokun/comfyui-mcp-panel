@@ -15,6 +15,7 @@ import {
   BASE_MODELS, ACTIVE_BASE_MODELS, prepareQuery, matchesBaseModel,
   filtersDirty, bitmask, parseCreatorQuery,
 } from "./cmcp-civitai.js";
+import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 
 const TABS = [
   { key: "images", label: "Images", icon: "pi-image", media: "image" },
@@ -70,27 +71,11 @@ let _cssInjected = false;
 function injectCss() {
   if (_cssInjected) return;
   _cssInjected = true;
+  // Shared-chrome rules (.cmcp-cv-overlay / .cmcp-modal.cmcp-sidepanel / -head /
+  // -tabs / -tab / -search / -iconbtn / -dot / -body / -subnav + the docked rules)
+  // now live in the shell (cmcp-sidepanel-ui.js). This block keeps ONLY Civitai's
+  // body CSS so the -cv-* card/lightbox/filter styles still resolve.
   const css = `
-  .cmcp-cv-overlay { position: fixed; inset: 0; z-index: 10000; display: flex;
-    align-items: center; justify-content: center; padding: 1.5rem; background: rgba(0,0,0,.6); }
-  .cmcp-civitai-modal { width: min(1150px, 94vw); max-width: none; height: 90vh;
-    max-height: 90vh; padding: 0; gap: 0; overflow: hidden; }
-  .cmcp-cv-head { display: flex; align-items: center; gap: .5rem; padding: .6rem .7rem;
-    border-bottom: 1px solid var(--p-content-border-color, #3f3f46); flex-wrap: wrap; }
-  .cmcp-cv-tabs { display: flex; gap: .25rem; flex-wrap: wrap; }
-  .cmcp-cv-tab { display: inline-flex; align-items: center; gap: .3rem; padding: .3rem .55rem;
-    border-radius: 8px; border: 1px solid transparent; background: transparent;
-    color: var(--p-text-muted-color, #a1a1aa); cursor: pointer; font-size: .8rem; }
-  .cmcp-cv-tab.active { background: var(--p-surface-800, #27272a);
-    color: var(--p-text-color, #fafafa); border-color: var(--p-content-border-color, #3f3f46); }
-  .cmcp-cv-search { flex: 1 1 8rem; min-width: 6rem; padding: .35rem .5rem; border-radius: 8px;
-    background: var(--p-surface-950, #111); border: 1px solid var(--p-content-border-color, #3f3f46);
-    color: var(--p-text-color, #fafafa); }
-  .cmcp-cv-iconbtn { position: relative; background: transparent; border: 1px solid var(--p-content-border-color,#3f3f46);
-    color: var(--p-text-color,#fafafa); border-radius: 8px; padding: .35rem .5rem; cursor: pointer; }
-  .cmcp-cv-dot { position: absolute; top: -3px; right: -3px; width: 8px; height: 8px; border-radius: 50%;
-    background: var(--p-primary-color, #3a7bd5); }
-  .cmcp-cv-body { position: relative; flex: 1; overflow-y: auto; padding: .6rem; }
   .cmcp-cv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: .5rem; }
   .cmcp-cv-card { position: relative; border-radius: 10px; overflow: hidden; cursor: pointer;
     background: var(--p-surface-900, #18181b); aspect-ratio: .72; }
@@ -146,8 +131,6 @@ function injectCss() {
     gap: .5rem; padding-right: 2.2rem; }
   .cmcp-cv-like { margin-left: auto; }
   .cmcp-cv-like.on { color: #f43f5e; border-color: #f43f5e; }
-  .cmcp-cv-subnav { display: flex; align-items: center; gap: .4rem; padding: .45rem .7rem;
-    border-bottom: 1px solid var(--p-content-border-color, #3f3f46); }
   .cmcp-cv-cardlike { position: absolute; top: .3rem; right: .3rem; z-index: 2;
     background: rgba(0,0,0,.55); border: none; color: #fff; border-radius: 8px;
     width: 28px; height: 28px; cursor: pointer; display: none; align-items: center;
@@ -212,18 +195,6 @@ function injectCss() {
     animation: cmcp-glow 1.4s ease-in-out infinite; }
   @keyframes cmcp-glow { 50% { box-shadow: 0 0 0 3px var(--p-green-400,#4ade80),
     0 0 24px 6px rgba(74,222,128,.9); } }
-  /* Agent-driven side-dock: anchor to the sidebar's right edge (measured in JS),
-     drop the dim backdrop and let clicks pass THROUGH the overlay so chat stays
-     interactive; only the modal card itself catches pointer events. Slide-in via
-     the first translateX transition in the codebase. Kept below the lightbox
-     (z 10002) so the lightbox still overlays. */
-  .cmcp-cv-overlay.cmcp-docked { display: block; padding: 0; background: transparent;
-    pointer-events: none; }
-  .cmcp-cv-overlay.cmcp-docked .cmcp-civitai-modal { position: fixed; pointer-events: auto;
-    width: auto; max-width: none; height: auto; max-height: none; border-radius: 0;
-    box-shadow: -8px 0 32px rgba(0,0,0,.45); transform: translateX(24px); opacity: 0;
-    transition: transform .28s ease, opacity .28s ease; }
-  .cmcp-cv-overlay.cmcp-docked.cmcp-dock-in .cmcp-civitai-modal { transform: translateX(0); opacity: 1; }
   `;
   const style = document.createElement("style");
   style.textContent = css;
@@ -236,25 +207,6 @@ const el = (tag, cls, txt) => {
   if (txt != null) n.textContent = txt;
   return n;
 };
-
-/** Slide/fade the panel out before detaching (shared exit for the three docked
- *  side-panels). Docked: reverse the translateX slide-in (drop cmcp-dock-in) so
- *  the card slides back out; centered/narrow: a plain opacity fade — no
- *  horizontal slide. The DOM is removed after the transition window (jsdom fires
- *  no transitionend, so a fixed timer drives it). Idempotent — remove() on an
- *  already-detached node is a no-op. */
-const DOCK_SLIDE_OUT_MS = 240;
-function slideOutThenRemove(overlay) {
-  const docked = overlay.classList.contains("cmcp-docked");
-  overlay.style.pointerEvents = "none";
-  if (docked) {
-    overlay.classList.remove("cmcp-dock-in"); // card returns to translateX(24px)/opacity 0
-  } else {
-    overlay.style.transition = "opacity .18s ease";
-    overlay.style.opacity = "0";
-  }
-  setTimeout(() => { try { overlay.remove(); } catch { /* already gone */ } }, DOCK_SLIDE_OUT_MS);
-}
 
 /** Fail-CLOSED dirty check for the load-onto-canvas overwrite confirm: any
  *  uncertainty (missing getter, non-boolean answer, a throw) counts as DIRTY
@@ -300,10 +252,15 @@ export function serializeCivitaiResults(source, { model = false, limit = 20, loa
   return { items, total: rows.length, loading: !!loading };
 }
 
-/** Open (or focus) the CivitAI modal. opts = {query, tab, filters, browsingLevels, dock, onClose}. */
-export function openCivitaiModal(ctx, opts = {}) {
+/** Content-provider factory for the CivitAI browser tab of the unified side
+ *  panel. Builds the grid/lightbox/filter body + the agent-drive surface; the
+ *  shell (cmcp-sidepanel-ui.js) owns the overlay, header, tab bar, single search
+ *  box, ✕, dock and Escape. opts = {query, tab, filters, browsingLevels}. */
+export function createCivitaiContent(ctx, shell, opts = {}) {
   injectCss();
   const client = new CivitaiClient(ctx.api);
+  const { body } = shell;
+  const search = shell.searchEl; // the shell's single search input
 
   // ── state ────────────────────────────────────────────────────────────────
   const state = {
@@ -340,68 +297,31 @@ export function openCivitaiModal(ctx, opts = {}) {
   const tabDef = () => TABS.find((t) => t.key === state.tab);
   const isModelTab = () => !!tabDef().model;
 
-  // ── overlay (full-viewport, mounted on <body> so it isn't confined to the
-  // narrow panel sidebar) ────────────────────────────────────────────────────
-  const overlay = el("div", "cmcp-cv-overlay");
-  const modal = el("div", "cmcp-modal cmcp-civitai-modal");
-  // Self-invalidating handle: isOpen flips false on the FIRST close() and every
-  // drive method asserts it, so a stale reference held past close throws instead
-  // of poking a detached grid. onClose lets the host compare-and-null its stored
-  // handle. close() is idempotent and tears down EVERY async/listener owned here.
+  // Self-invalidating internal open flag: drive methods assert it and the shell
+  // facade also gates on the active tab. teardown() (run by the shell's close)
+  // tears down every async/listener owned here. close() closes the WHOLE side
+  // panel — shareImage / loadOntoCanvas call it on success to reveal the chat.
   let isOpen = true;
-  let _onDockResize = null;   // window-resize fallback when ctx.watchDock is absent
-  let _dockDispose = null;    // ResizeObserver+listener disposer from ctx.watchDock
-  let _oauthPollIv = null;    // sign-in completion poll (accountFlow)
-  let _onEscape = null;       // document Escape → close
+  let _oauthPollIv = null;         // sign-in completion poll (accountFlow)
   let _activeLightboxClose = null; // openViewer's teardown (owns its own doc keydown listener)
-  const close = () => {
-    if (!isOpen) return;      // idempotent
+  let searchTimer = null;
+  const close = () => { try { shell.close(); } catch { /* already gone */ } };
+  function teardown() {
+    if (!isOpen) return;           // idempotent
     isOpen = false;
-    state.reqId++;            // invalidate any in-flight fetch (its guarded finally no-ops)
+    state.reqId++;                 // invalidate any in-flight fetch (its guarded finally no-ops)
     state.activeReloadPromise = null;
     state.activeLoadPromise = null;
     try { clearTimeout(searchTimer); } catch { /* not armed */ }
     if (_oauthPollIv) { clearInterval(_oauthPollIv); _oauthPollIv = null; }
-    // The lightbox is body-mounted with its OWN document keydown listener — a
-    // programmatic reopen would otherwise strand it (+ its listener) above the
-    // new modal (codex finding). Tear it down through this one path.
+    // The lightbox is body-mounted with its OWN document keydown listener — tear
+    // it down through this one path (codex finding).
     if (_activeLightboxClose) { try { _activeLightboxClose(); } catch { /* already gone */ } _activeLightboxClose = null; }
     try { closeSubModals(); } catch { /* already gone */ }
-    if (_onEscape) { document.removeEventListener("keydown", _onEscape); _onEscape = null; }
-    if (_onDockResize) { window.removeEventListener("resize", _onDockResize); _onDockResize = null; }
-    if (_dockDispose) { try { _dockDispose(); } catch { /* best effort */ } _dockDispose = null; }
-    // Slide/fade the card out, THEN detach (parity with the Training + RunPod
-    // side-panels). isOpen already flipped above, so drive methods + re-close are
-    // inert during the ~240ms exit; host bookkeeping (onClose) still runs now.
-    slideOutThenRemove(overlay);
-    try { opts.onClose?.(); } catch { /* host bookkeeping only */ }
-  };
-  // In docked mode the overlay itself is click-through (pointer-events:none), so a
-  // backdrop mousedown never fires here — the header ✕ / Escape are the dismissals.
-  // Centered mode keeps the backdrop-click-to-close affordance.
-  overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
-  // Base modals had no Escape handler (audit item 9): add one that funnels through
-  // close(), but yield to a stacked lightbox / sub-modal so Escape peels the top.
-  _onEscape = (e) => {
-    if (e.key !== "Escape") return;
-    if (_subModals.size > 0) return;
-    if (document.querySelector(".cmcp-cv-lb")) return;
-    e.stopPropagation();
-    close();
-  };
-  document.addEventListener("keydown", _onEscape);
+  }
 
-  // header
-  const head = el("div", "cmcp-cv-head");
-  const tabsWrap = el("div", "cmcp-cv-tabs");
-  // Search lives in the SUBNAV under the tabs (every tab gets it) — debounced
-  // 500ms; while the debounced search request is in flight the grid sits under
-  // a blur overlay with a spinner. Favorites search filters client-side (the
-  // tRPC favorites feed has no text query), everything else hits Meili/REST.
-  const search = el("input", "cmcp-cv-search");
-  search.placeholder = "Search CivitAI…";
-  search.value = state.query;
-  let searchTimer = null;
+  // The search box is the shell's single input (aliased `search`). The debounce +
+  // creator-token parsing stay here; the shell dispatches keystrokes to onSearch.
   // The @token displayed in the search box ALWAYS owns the creator filter:
   // setCreator mirrors every creator change (sheet picker, pill ✕, reset,
   // "See more from") into the box as an @token, so deleting that token must
@@ -459,17 +379,11 @@ export function openCivitaiModal(ctx, opts = {}) {
     syncTabs();
     reload({ searching: true });
   }
-  search.addEventListener("input", () => {
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(applySearch, 500);
-  });
-  search.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { clearTimeout(searchTimer); applySearch(); }
-  });
+  // The shell wires its single search input → onSearch (returned below); no
+  // direct input/keydown listeners are attached here.
   const filterBtn = el("button", "cmcp-cv-iconbtn");
-  // First of the three right-side actions (filters ⚙ / account 👤 / close ✕):
-  // margin-left:auto pushes this trio to the right edge while the tab row stays
-  // left-aligned in the flex header.
+  // margin-left:auto pushes the filter ⚙ + account 👤 pair to the subnav's right
+  // edge while the sub-tab row stays left-aligned.
   filterBtn.style.marginLeft = "auto";
   filterBtn.innerHTML = '<i class="pi pi-sliders-h"></i>';
   const filterDot = el("span", "cmcp-cv-dot"); filterDot.style.display = "none";
@@ -479,21 +393,20 @@ export function openCivitaiModal(ctx, opts = {}) {
   acctBtn.innerHTML = '<i class="pi pi-user"></i>';
   acctBtn.title = "CivitAI account";
   acctBtn.addEventListener("click", () => accountFlow());
-  const closeBtn = el("button", "cmcp-cv-iconbtn");
-  closeBtn.innerHTML = '<i class="pi pi-times"></i>';
-  closeBtn.addEventListener("click", close);
 
+  // Civitai sub-tabs (images / videos / checkpoints / …) — mounted in the shell
+  // subnav via subnavExtras(). Reuse .cmcp-cv-tab so the themed active state +
+  // the responsive container query apply here too.
+  const subTabsWrap = el("div", "cmcp-cv-tabs");
   for (const t of TABS) {
     const b = el("button", "cmcp-cv-tab");
     b.innerHTML = `<i class="pi ${t.icon}"></i><span>${t.label}</span>`;
     b.addEventListener("click", () => { state.tab = t.key; syncTabs(); reload(); });
     b._key = t.key;
-    tabsWrap.appendChild(b);
+    subTabsWrap.appendChild(b);
   }
-  head.append(tabsWrap, filterBtn, acctBtn, closeBtn);
 
-  // subnav: search (all tabs) + favorites media-type chips
-  const subnav = el("div", "cmcp-cv-subnav");
+  // Favorites media-type chips (shown only on the Favorites sub-tab).
   const favChips = el("div", "cmcp-cv-frow");
   for (const [label, val] of [["All", "all"], ["Images", "image"], ["Videos", "video"]]) {
     const chip = el("button", "cmcp-cv-chip", label);
@@ -506,96 +419,21 @@ export function openCivitaiModal(ctx, opts = {}) {
     });
     favChips.appendChild(chip);
   }
-  subnav.append(search, favChips);
 
-  // body
-  const body = el("div", "cmcp-cv-body");
+  // Body content (appended into the shell's .cmcp-cv-body scroll surface on mount).
   const progress = el("div", "cmcp-cv-progress");
   const grid = el("div", "cmcp-cv-grid");
   const sentinel = el("div", "cmcp-cv-loading");
-  body.append(progress, grid, sentinel);
-  body.addEventListener("scroll", () => {
-    if (body.scrollTop + body.clientHeight >= body.scrollHeight - 600) loadMore();
-  });
-
   const searchOverlay = el("div", "cmcp-cv-searching");
   searchOverlay.appendChild(el("div", "cmcp-cv-spinner"));
   searchOverlay.style.display = "none";
-  body.appendChild(searchOverlay);
-
-  modal.append(head, subnav, body);
-  overlay.appendChild(modal);
-  document.body.appendChild(overlay);
-
-  // ── docked mode (agent-driven) ─────────────────────────────────────────────
-  // Dock into the canvas area OPPOSITE the Agent pane (which may be docked left
-  // OR right) so chat stays visible + interactive. Geometry comes from the host
-  // (ctx.dockGeometry: it owns the ComfyUI pane/canvas measurement and the
-  // left/right detection), so this module stays ComfyUI-agnostic. Three states:
-  //  - detached  → the Agent tab was switched away; the body-mounted modal is
-  //    orphaned, so HIDE it (don't float centered over an unrelated screen).
-  //  - centered  → no eligible anchor (missing/zero-size/too-small/narrow window)
-  //  - docked    → anchored rect from the host.
-  applyDock.centered = false;
-  function applyDock() {
-    if (!opts.dock) { setCentered(); return; }
-    const geo = _dockGeometry();
-    if (geo?.status === "detached") {
-      overlay.style.display = "none";
-      return;
-    }
-    overlay.style.display = "";
-    if (geo?.status === "docked" && window.innerWidth >= 900) {
-      overlay.classList.add("cmcp-docked");
-      modal.style.left = `${Math.round(geo.left)}px`;
-      modal.style.top = `${Math.round(geo.top)}px`;
-      modal.style.right = `${Math.round(geo.right)}px`;
-      modal.style.bottom = `${Math.round(geo.bottom)}px`;
-      applyDock.centered = false;
-    } else {
-      setCentered();
-    }
-  }
-  function setCentered() {
-    overlay.classList.remove("cmcp-docked");
-    overlay.style.display = "";
-    modal.style.left = modal.style.right = modal.style.top = modal.style.bottom = "";
-    applyDock.centered = true;
-  }
-  /** Host geometry, with a self-contained fallback (single-pane / no host help /
-   *  tests): measure ctx.root's pane and dock to the wider viewport side. */
-  function _dockGeometry() {
-    if (typeof ctx.dockGeometry === "function") {
-      try { const g = ctx.dockGeometry(); if (g) return g; } catch { /* fall through */ }
-    }
-    try {
-      const root = ctx.root;
-      if (root && !root.isConnected) return { status: "detached" };
-      const pane = root?.closest?.(".side-bar-panel") || root?.closest?.("[class*='sidebar']") || root;
-      const pr = pane?.getBoundingClientRect?.();
-      if (!pr || pr.width < 1 || pr.height < 1) return { status: "centered" };
-      const vw = window.innerWidth, vh = window.innerHeight;
-      const paneOnLeft = (pr.left + pr.right) / 2 < vw / 2;
-      const left = paneOnLeft ? Math.max(0, pr.right) : 0;
-      const right = paneOnLeft ? 0 : Math.max(0, vw - pr.left);
-      if (vw - left - right < 320) return { status: "centered" };
-      return { status: "docked", left, right, top: Math.max(0, pr.top), bottom: Math.max(0, vh - pr.bottom) };
-    } catch { return { status: "centered" }; }
-  }
-  if (opts.dock) {
-    applyDock();
-    // Watch pane + canvas (splitter drags don't fire window-resize) via the host;
-    // fall back to a bare window-resize listener when the host can't help.
-    if (typeof ctx.watchDock === "function") {
-      try { _dockDispose = ctx.watchDock(applyDock); } catch { _dockDispose = null; }
-    }
-    if (!_dockDispose) { _onDockResize = () => applyDock(); window.addEventListener("resize", _onDockResize); }
-    // Slide-in on the next frame so the transition runs from the initial state.
-    requestAnimationFrame(() => overlay.classList.add("cmcp-dock-in"));
-  }
+  // Infinite scroll: the shell body is the scroll surface. Wired on activate.
+  const onBodyScroll = () => {
+    if (body.scrollTop + body.clientHeight >= body.scrollHeight - 600) loadMore();
+  };
 
   function syncTabs() {
-    for (const b of tabsWrap.children) b.classList.toggle("active", b._key === state.tab);
+    for (const b of subTabsWrap.children) b.classList.toggle("active", b._key === state.tab);
     favChips.style.display = tabDef().fav ? "" : "none";
     for (const c of favChips.children) c.classList.toggle("on", c._fv === state.favType);
     filterDot.style.display = filtersDirty(state.filters) ? "" : "none";
@@ -2005,19 +1843,62 @@ export function openCivitaiModal(ctx, opts = {}) {
   function driveGetState() {
     return {
       isOpen, tab: state.tab, loading: !!state.loading, done: !!state.done,
-      renderRev: state.renderRev, docked: !applyDock.centered && overlay.classList.contains("cmcp-docked"),
+      renderRev: state.renderRev, docked: shell.isDocked(),
       highlighted: state.highlightOrder.slice(),
     };
   }
 
-  // ── go ───────────────────────────────────────────────────────────────
-  syncTabs();
-  refreshAuth();
-  reload();
+  // ── content provider (the shell owns the chrome; this owns the body) ──────
+  let _started = false;
   return {
-    close, focus: () => search.focus(),
-    switchTab: driveSwitchTab, search: driveSearch, getResults: driveGetResults,
-    highlight: driveHighlight, clearHighlight: driveClearHighlight,
-    openLightbox: driveOpenLightbox, getState: driveGetState,
+    key: "civitai", label: "Civitai", icon: "pi-images", driveKind: "civitai",
+    hasSearch: true, searchPlaceholder: "Search CivitAI…",
+    subnavExtras: () => [subTabsWrap, favChips, filterBtn, acctBtn],
+    mount(bodyEl) {
+      search.value = state.query;
+      bodyEl.append(progress, grid, sentinel, searchOverlay);
+    },
+    // The shell dispatches every keystroke here; keep the 500ms debounce + the
+    // creator-token parse (applySearch reads the shared box). Enter flushes.
+    onSearch(_value, o = {}) {
+      clearTimeout(searchTimer);
+      if (o.enter) applySearch();
+      else searchTimer = setTimeout(applySearch, 500);
+    },
+    onActivate() {
+      body.addEventListener("scroll", onBodyScroll);
+      if (!_started) { _started = true; syncTabs(); refreshAuth(); reload(); }
+      else syncTabs();
+    },
+    onDeactivate() { body.removeEventListener("scroll", onBodyScroll); },
+    // Re-open onto an already-mounted Civitai tab with a fresh query/filters
+    // (host switches tabs on open_civitai while the panel is already up).
+    reseed(o) {
+      if (!o || !isOpen) return;
+      if (o.tab) { try { driveSwitchTab(o.tab); } catch { /* ignore */ } }
+      if (o.query != null || o.filters || o.browsingLevels) {
+        try { driveSearch({ query: o.query, filters: o.filters, browsingLevels: o.browsingLevels }); } catch { /* ignore */ }
+      }
+    },
+    teardown,
+    // Escape peels the lightbox / a stacked sub-modal before it can close the panel.
+    escapeBlocked: () => _subModals.size > 0 || !!document.querySelector(".cmcp-cv-lb"),
+    drive: {
+      switchTab: driveSwitchTab, search: driveSearch, getResults: driveGetResults,
+      highlight: driveHighlight, clearHighlight: driveClearHighlight,
+      openLightbox: driveOpenLightbox, getState: driveGetState,
+    },
   };
+}
+
+/** Thin back-compat wrapper: opens the unified side panel on the Civitai tab.
+ *  Returns the shell handle. */
+export function openCivitaiModal(ctx, opts = {}) {
+  const { query, tab, filters, browsingLevels, dock, onClose } = opts;
+  return openSidePanel(ctx, {
+    tab: "civitai",
+    dock,
+    onClose,
+    tabOpts: { civitai: { query, tab, filters, browsingLevels } },
+  });
 }
