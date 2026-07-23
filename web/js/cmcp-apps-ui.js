@@ -16,6 +16,7 @@
 // offered — see the hide toggle copy. True protection = hosted runs (P5).
 
 import { AppBuilder, AppsClient, RegistryClient } from "./cmcp-apps.js";
+import { confirmModal, promptModal, formModal, toast } from "./cmcp-modal.js";
 
 let styleInjected = false;
 function injectStyle() {
@@ -27,49 +28,86 @@ function injectStyle() {
    its !important max-width would leak onto the shared shell (shrinking the card
    on the Apps tab + breaking docked-fill). Keep only the flex-column layout. */
 .cmcp-apps-modal{display:flex;flex-direction:column;}
-.cmcp-apps-body{display:flex;flex-direction:column;gap:0.75rem;min-height:0;flex:1;}
+.cmcp-apps-body{display:flex;flex-direction:column;gap:0.7rem;min-height:0;flex:1;}
 .cmcp-apps-toolbar{display:flex;gap:0.4rem;flex-wrap:wrap;align-items:center;}
 .cmcp-apps-toolbar .spacer{flex:1;}
-.cmcp-apps-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:0.75rem;overflow-y:auto;min-height:120px;}
-.cmcp-app-card{border:1px solid var(--p-content-border-color,#3f3f46);border-radius:10px;overflow:hidden;cursor:pointer;
-  background:var(--p-content-background,#18181b);display:flex;flex-direction:column;transition:border-color .15s;}
-.cmcp-app-card:hover{border-color:var(--p-primary-color,#60a5fa);}
-.cmcp-app-card .thumb{aspect-ratio:16/9;background:#0c0c0e center/cover no-repeat;display:flex;align-items:center;justify-content:center;
-  font-size:1.6rem;opacity:0.85;}
-.cmcp-app-card .meta{padding:0.5rem 0.6rem;display:flex;flex-direction:column;gap:0.15rem;}
-.cmcp-app-card .name{font-weight:600;font-size:0.85rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.cmcp-app-card .desc{font-size:0.72rem;opacity:0.65;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
-.cmcp-app-badges{display:flex;gap:0.3rem;margin-top:0.15rem;}
-.cmcp-app-badge{font-size:0.62rem;padding:0.05rem 0.35rem;border-radius:99px;border:1px solid var(--p-content-border-color,#3f3f46);opacity:0.8;}
+/* Buttons: primary pops, everything else reads as a quiet secondary so the
+   hierarchy is legible (matches the CivitAI tab's chip/button vocabulary). */
+.cmcp-apps-body .cmcp-btn{align-self:auto;padding:0.4rem 0.75rem;border-radius:8px;font-size:0.8rem;}
+.cmcp-apps-body .cmcp-btn:not(.primary):not(.danger){background:var(--p-surface-800,#27272a);
+  color:var(--p-text-color,#fafafa);border:1px solid var(--p-content-border-color,#3f3f46);font-weight:500;}
+.cmcp-apps-body .cmcp-btn:not(.primary):not(.danger):hover{border-color:var(--p-primary-color,#60a5fa);opacity:1;}
+.cmcp-apps-body .cmcp-btn.primary{background:var(--p-button-primary-background,var(--p-primary-color,#3a7bd5));
+  color:var(--p-primary-contrast-color,#fff);border:1px solid transparent;}
+.cmcp-apps-body .cmcp-btn.danger{background:transparent;border:1px solid rgba(248,113,113,0.5);color:#f87171;font-weight:500;}
+.cmcp-apps-body .cmcp-btn.danger:hover{background:rgba(248,113,113,0.12);border-color:#f87171;opacity:1;}
+.cmcp-apps-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(172px,1fr));gap:0.7rem;
+  overflow-y:auto;min-height:120px;padding:0.1rem 0.1rem 0.6rem;align-content:start;}
+.cmcp-app-card{border:1px solid var(--p-content-border-color,#3f3f46);border-radius:12px;overflow:hidden;cursor:pointer;
+  background:var(--p-surface-900,#18181b);display:flex;flex-direction:column;
+  transition:border-color .15s,transform .15s,box-shadow .15s;}
+.cmcp-app-card:hover{border-color:var(--p-primary-color,#60a5fa);transform:translateY(-2px);
+  box-shadow:0 6px 18px rgba(0,0,0,0.35);}
+.cmcp-app-card .thumb{aspect-ratio:16/9;background:linear-gradient(135deg,#1b1b20,#0c0c0e) center/cover no-repeat;
+  display:flex;align-items:center;justify-content:center;font-size:1.6rem;opacity:0.9;color:var(--p-text-muted-color,#a1a1aa);}
+.cmcp-app-card .meta{padding:0.5rem 0.6rem 0.55rem;display:flex;flex-direction:column;gap:0.2rem;}
+.cmcp-app-card .name{font-weight:600;font-size:0.83rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.cmcp-app-card .desc{font-size:0.71rem;line-height:1.35;opacity:0.62;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
+.cmcp-app-badges{display:flex;gap:0.3rem;margin-top:0.25rem;flex-wrap:wrap;}
+.cmcp-app-badge{font-size:0.62rem;padding:0.1rem 0.4rem;border-radius:99px;border:1px solid var(--p-content-border-color,#3f3f46);
+  color:var(--p-text-muted-color,#a1a1aa);opacity:0.9;white-space:nowrap;}
 .cmcp-app-badge.hidden-wf{border-color:rgba(245,158,11,0.5);color:#f59e0b;}
-.cmcp-apps-empty{opacity:0.6;font-size:0.85rem;padding:2rem 1rem;text-align:center;grid-column:1/-1;}
+.cmcp-apps-empty{opacity:0.6;font-size:0.85rem;line-height:1.5;padding:2.5rem 1rem;text-align:center;grid-column:1/-1;}
+.cmcp-apps-more{grid-column:1/-1;justify-self:center;margin-top:0.4rem;}
 .cmcp-apps-back{align-self:flex-start;}
-.cmcp-apps-detail{display:flex;flex-direction:column;gap:0.75rem;overflow-y:auto;min-height:0;}
-.cmcp-apps-detail-head{display:flex;gap:0.75rem;align-items:flex-start;}
-.cmcp-apps-detail-head .thumb{width:96px;height:54px;flex:0 0 auto;border-radius:8px;background:#0c0c0e center/cover no-repeat;
-  display:flex;align-items:center;justify-content:center;font-size:1.3rem;}
+.cmcp-apps-detail{display:flex;flex-direction:column;gap:0.8rem;overflow-y:auto;min-height:0;padding-bottom:0.4rem;}
+.cmcp-apps-detail-head{display:flex;gap:0.8rem;align-items:flex-start;padding-bottom:0.7rem;
+  border-bottom:1px solid var(--p-content-border-color,#3f3f46);}
+.cmcp-apps-detail-head .thumb{width:104px;height:58px;flex:0 0 auto;border-radius:10px;
+  background:linear-gradient(135deg,#1b1b20,#0c0c0e) center/cover no-repeat;
+  display:flex;align-items:center;justify-content:center;font-size:1.3rem;color:var(--p-text-muted-color,#a1a1aa);}
 .cmcp-apps-detail-head .titles{flex:1;min-width:0;}
-.cmcp-apps-detail-head h3{margin:0;font-size:1rem;}
-.cmcp-apps-detail-head .desc{font-size:0.78rem;opacity:0.7;margin-top:0.2rem;white-space:pre-wrap;}
-.cmcp-apps-form{display:flex;flex-direction:column;gap:0.55rem;}
-.cmcp-apps-field{display:flex;flex-direction:column;gap:0.2rem;}
-.cmcp-apps-field>label{font-size:0.72rem;font-weight:600;opacity:0.75;}
+.cmcp-apps-detail-head h3{margin:0;font-size:1.05rem;}
+.cmcp-apps-detail-head .desc{font-size:0.78rem;opacity:0.7;margin-top:0.25rem;line-height:1.45;white-space:pre-wrap;}
+.cmcp-apps-form{display:flex;flex-direction:column;gap:0.65rem;}
+.cmcp-apps-field{display:flex;flex-direction:column;gap:0.28rem;}
+.cmcp-apps-field>label{font-size:0.7rem;font-weight:600;opacity:0.8;text-transform:uppercase;letter-spacing:0.03em;}
 .cmcp-apps-field input[type=text],.cmcp-apps-field input[type=number],.cmcp-apps-field textarea,.cmcp-apps-field select{
-  padding:0.45rem 0.6rem;border-radius:6px;border:1px solid var(--p-content-border-color,#3f3f46);
-  background:var(--p-inputtext-background,#18181b);color:inherit;font-size:0.85rem;font-family:inherit;}
+  padding:0.5rem 0.6rem;border-radius:8px;border:1px solid var(--p-content-border-color,#3f3f46);
+  background:var(--p-surface-950,#111113);color:var(--p-text-color,#fafafa);font-size:0.85rem;font-family:inherit;box-sizing:border-box;width:100%;}
+.cmcp-apps-field input:focus,.cmcp-apps-field textarea:focus,.cmcp-apps-field select:focus{outline:none;border-color:var(--p-primary-color,#60a5fa);}
+.cmcp-apps-field input[type=file]{font-size:0.78rem;}
 .cmcp-apps-field textarea{min-height:64px;resize:vertical;}
-.cmcp-apps-runbar{display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;}
-.cmcp-apps-status{font-size:0.8rem;opacity:0.85;min-height:1.1em;}
+.cmcp-apps-hint{font-size:0.68rem;opacity:0.6;}
+/* number-with-bounds slider + synced readout */
+.cmcp-apps-sliderrow{display:flex;gap:0.6rem;align-items:center;}
+.cmcp-apps-sliderrow input[type=range]{flex:1;min-width:0;accent-color:var(--p-primary-color,#60a5fa);}
+.cmcp-apps-sliderval{flex:0 0 5.5rem;width:5.5rem;}
+/* seed number + 🎲 randomize/fix toggle */
+.cmcp-apps-seedrow{display:flex;gap:0.5rem;align-items:center;}
+.cmcp-apps-seedrow input[type=number]{flex:1;min-width:0;}
+.cmcp-apps-seedrow .cmcp-btn{flex:0 0 auto;padding:0.4rem 0.6rem;}
+.cmcp-apps-field input[type=color]{width:3rem;height:2rem;padding:0.15rem;border-radius:8px;
+  border:1px solid var(--p-content-border-color,#3f3f46);background:var(--p-surface-950,#111113);cursor:pointer;}
+.cmcp-apps-runbar{display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;padding-top:0.15rem;}
+.cmcp-apps-status{font-size:0.8rem;opacity:0.85;min-height:1.1em;flex:1 1 8rem;}
 .cmcp-apps-status.err{color:#f87171;}
 .cmcp-apps-outputs{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:0.5rem;}
-.cmcp-apps-outputs img,.cmcp-apps-outputs video{width:100%;border-radius:8px;display:block;background:#0c0c0e;}
+.cmcp-apps-outputs:empty{display:none;}
+.cmcp-apps-outputs img,.cmcp-apps-outputs video{width:100%;border-radius:10px;display:block;background:#0c0c0e;
+  border:1px solid var(--p-content-border-color,#3f3f46);}
 .cmcp-apps-outputs .text-out{grid-column:1/-1;font-size:0.8rem;white-space:pre-wrap;background:rgba(255,255,255,0.04);
   border-radius:8px;padding:0.5rem 0.6rem;}
-.cmcp-apps-pick{max-height:220px;overflow-y:auto;border:1px solid var(--p-content-border-color,#3f3f46);border-radius:8px;padding:0.4rem;}
-.cmcp-apps-pick label{display:flex;gap:0.45rem;align-items:center;font-size:0.78rem;padding:0.15rem 0.2rem;cursor:pointer;}
-.cmcp-apps-pick .grp{font-size:0.68rem;font-weight:700;opacity:0.6;margin:0.35rem 0 0.1rem;text-transform:uppercase;letter-spacing:0.04em;}
-.cmcp-apps-warn{font-size:0.75rem;color:#f59e0b;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.3);
-  border-radius:8px;padding:0.5rem 0.6rem;}
+.cmcp-apps-pick{display:flex;flex-direction:column;gap:0.1rem;max-height:240px;overflow-y:auto;
+  border:1px solid var(--p-content-border-color,#3f3f46);border-radius:10px;padding:0.5rem;background:var(--p-surface-950,#111113);}
+.cmcp-apps-pick label{display:flex;gap:0.45rem;align-items:center;font-size:0.78rem;padding:0.22rem 0.3rem;
+  border-radius:6px;cursor:pointer;transition:background .12s;}
+.cmcp-apps-pick label:hover{background:rgba(255,255,255,0.05);}
+.cmcp-apps-pick .grp{font-size:0.66rem;font-weight:700;opacity:0.6;margin:0.45rem 0 0.15rem;text-transform:uppercase;letter-spacing:0.05em;}
+.cmcp-apps-pick .grp:first-child{margin-top:0.1rem;}
+.cmcp-apps-warn{font-size:0.75rem;line-height:1.45;color:#f59e0b;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.3);
+  border-radius:8px;padding:0.55rem 0.65rem;}
+/* Fallback for danger buttons rendered outside .cmcp-apps-body (defensive). */
 .cmcp-btn.danger{border-color:rgba(248,113,113,0.5);color:#f87171;}
 `;
   const el = document.createElement("style");
@@ -112,6 +150,65 @@ function toolText(res) {
   if (r && Array.isArray(r.content)) return r.content.map((c) => (c && c.text) || "").join("");
   if (typeof r === "string") return r;
   return res.ok === false ? "The action failed." : "Done.";
+}
+
+// ── run-form model picker helpers ──────────────────────────────────────────
+
+/** Map a model-loader widget name to a ComfyUI models subfolder (the
+ *  list_local_models `model_type` enum) so the picker can scope its server
+ *  query. Best effort — null means "list everything". */
+const MODEL_DIR_BY_WIDGET = [
+  [/ckpt|checkpoint/i, "checkpoints"],
+  [/lora/i, "loras"],
+  [/vae/i, "vae"],
+  [/control_?net/i, "controlnet"],
+  [/upscale/i, "upscale_models"],
+  [/unet|diffusion/i, "diffusion_models"],
+  [/clip|text_encoder/i, "text_encoders"],
+  [/style/i, "style_models"],
+  [/gligen/i, "gligen"],
+  [/hypernet/i, "hypernetworks"],
+  [/embed/i, "embeddings"],
+];
+function modelDirForWidget(widget) {
+  for (const [re, dir] of MODEL_DIR_BY_WIDGET) if (re.test(String(widget || ""))) return dir;
+  return null;
+}
+
+/** The connected server's current valid values for a widget, read from the
+ *  ComfyUI frontend's object_info (defs are keyed by class_type, so they cover
+ *  node types not currently on the canvas too). Null when unavailable. */
+function liveWidgetChoices(getApp, nodeType, widget) {
+  try {
+    if (!nodeType) return null;
+    const app = typeof getApp === "function" ? getApp() : null;
+    const defs = app?.nodeManager?.defs || app?.extensions?.nodeDefs || app?.nodeDefs;
+    const def = defs && defs[nodeType];
+    const spec = def?.input?.required?.[widget] || def?.input?.optional?.[widget];
+    const values = Array.isArray(spec) && Array.isArray(spec[0]) ? spec[0] : null;
+    return values ? values.map(String) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Best-effort extraction of model filenames from a list_local_models
+ *  tool_result (the bridge returns grouped JSON or prose). Filtered to real
+ *  model-file extensions so a stray label can't pollute the picker. */
+const _MODEL_EXT = /\.(safetensors|ckpt|pt|pth|bin|gguf|sft|onnx|vae|pkl)$/i;
+function parseModelList(res, dir) {
+  const text = toolText(res);
+  if (!text) return [];
+  const cand = new Set();
+  try {
+    const j = JSON.parse(text);
+    const src = dir && j && typeof j === "object" && !Array.isArray(j) && Array.isArray(j[dir]) ? j[dir] : j;
+    // Collect every string anywhere in the structure, then extension-filter.
+    JSON.stringify(src, (_k, v) => { if (typeof v === "string") cand.add(v); return v; });
+  } catch {
+    for (const line of text.split(/\r?\n/)) cand.add(line.trim());
+  }
+  return [...cand].filter((s) => _MODEL_EXT.test(s));
 }
 
 /** Convert the LIVE canvas into an app bundle draft: prompt snapshot + UI
@@ -174,13 +271,33 @@ async function draftFromCanvas(getApp) {
       const key = `${id}.${w.name}`;
       if (seen.has(key)) continue;
       seen.add(key);
+      const nodeType = String(node.type || "");
+      const kind = AppBuilder.classifyWidget(nodeType, w.name, w.value, w.type);
+      const opts = w.options || {};
+      const num = (x) => (typeof x === "number" && Number.isFinite(x) ? x : undefined);
+      // control_after_generate lives on a sibling combo widget for seed nodes;
+      // its value ("randomize"/"fixed"/"increment"/…) seeds the 🎲 default.
+      let seedBehavior;
+      if (kind === "seed") {
+        const ctrl = (Array.isArray(node.widgets) ? node.widgets : []).find(
+          (x) => x && /control_after_generate/i.test(String(x.name || "")),
+        );
+        seedBehavior = typeof ctrl?.value === "string" ? ctrl.value : "randomize";
+      }
       inputs.push({
         nodeId: id,
         widget: w.name,
+        // nodeType lets the run-form model picker read the live /object_info
+        // (defs[nodeType]) for the connected server's current choices.
+        nodeType,
         label: `${node.title || node.type} #${id} · ${w.label || w.name}`,
-        kind: AppBuilder.classifyWidget(String(node.type || ""), w.name, w.value),
-        choices: Array.isArray(w.options?.values) ? w.options.values.map(String) : undefined,
+        kind,
+        choices: Array.isArray(opts.values) ? opts.values.map(String) : undefined,
         default: typeof w.value === "string" || typeof w.value === "number" || typeof w.value === "boolean" ? w.value : undefined,
+        min: num(opts.min),
+        max: num(opts.max),
+        step: num(opts.step),
+        ...(seedBehavior ? { seedBehavior } : {}),
         checked: true,
       });
     }
@@ -451,12 +568,14 @@ export function createAppsContent(ctx, shell, opts = {}) {
         const models = Array.isArray(deps.models) ? deps.models : [];
         const nodes = Array.isArray(deps.customNodes) ? deps.customNodes : [];
         if (models.length || nodes.length) {
-          const ok = window.confirm(
-            `“${regApp.name}” needs:\n` +
-              (models.length ? `\nModels (${models.length}):\n  ${models.map((m) => m.name || m).join("\n  ")}\n` : "") +
-              (nodes.length ? `\nCustom nodes (${nodes.length}):\n  ${nodes.join("\n  ")}\n` : "") +
-              "\nAnything missing must be installed before the app can run (ask the agent to install it, or install it yourself). Continue?",
-          );
+          const ok = await confirmModal({
+            title: `Install “${regApp.name}”`,
+            message:
+              (models.length ? `Models (${models.length}):\n  ${models.map((m) => m.name || m).join("\n  ")}\n\n` : "") +
+              (nodes.length ? `Custom nodes (${nodes.length}):\n  ${nodes.join("\n  ")}\n\n` : "") +
+              "Anything missing must be installed before the app can run (ask the agent to install it, or install it yourself).",
+            confirmLabel: "Install",
+          });
           if (!ok) {
             installBtn.disabled = false;
             status.textContent = "";
@@ -608,13 +727,18 @@ export function createAppsContent(ctx, shell, opts = {}) {
           name,
           description: descInput.value.trim(),
           appMode: {
-            inputs: inputs.map(({ nodeId, widget, label, kind, choices, default: def }) => ({
+            inputs: inputs.map(({ nodeId, widget, nodeType, label, kind, choices, default: def, min, max, step, seedBehavior }) => ({
               nodeId,
               widget,
               label,
               kind,
+              ...(nodeType ? { nodeType } : {}),
               ...(choices ? { choices } : {}),
               ...(def !== undefined ? { default: def } : {}),
+              ...(min !== undefined ? { min } : {}),
+              ...(max !== undefined ? { max } : {}),
+              ...(step !== undefined ? { step } : {}),
+              ...(seedBehavior ? { seedBehavior } : {}),
             })),
             outputs,
             importedFromFrontend: !!draft.imported,
@@ -686,6 +810,88 @@ export function createAppsContent(ctx, shell, opts = {}) {
         // Return the raw File — the RUN path decides where the bytes go
         // (local /upload/image, or the bridge's upload_media → the pod).
         getter = () => (fileInput.files && fileInput.files[0]) || undefined;
+      } else if (input.kind === "model") {
+        // A real, searchable picker — NEVER a bare textarea. Options come from
+        // the connected server's live object_info first, the convert-time
+        // choices next, and a bridge list_local_models query as a last resort.
+        const inp = document.createElement("input");
+        inp.type = "text";
+        inp.autocomplete = "off";
+        inp.placeholder = "Pick or type a model…";
+        inp.className = "cmcp-apps-modelpick";
+        const dl = document.createElement("datalist");
+        dl.id = `cmcp-models-${key.replace(/[^\w-]/g, "_")}-${Math.random().toString(36).slice(2, 7)}`;
+        inp.setAttribute("list", dl.id);
+        const caption = el("div", "cmcp-apps-hint");
+        const applyOptions = (list) => {
+          const uniq = [...new Set(list.filter(Boolean).map(String))];
+          dl.textContent = "";
+          for (const v of uniq) {
+            const o = document.createElement("option");
+            o.value = v;
+            dl.append(o);
+          }
+          caption.textContent = uniq.length
+            ? `${uniq.length} model${uniq.length === 1 ? "" : "s"} available — type to filter`
+            : "No models found on the server — type a filename.";
+          return uniq;
+        };
+        let known = applyOptions([
+          ...(liveWidgetChoices(getApp, input.nodeType, input.widget) || []),
+          ...(Array.isArray(input.choices) ? input.choices : []),
+        ]);
+        if (input.default !== undefined) inp.value = String(input.default);
+        field.append(inp, dl, caption);
+        getter = () => inp.value.trim() || undefined;
+        // Augment from the CONNECTED server (best effort; the bridge may be
+        // absent on a local-only session, in which case callTool resolves
+        // undefined and this is a no-op).
+        if (typeof callTool === "function") {
+          const dir = modelDirForWidget(input.widget);
+          Promise.resolve(callTool("list_local_models", dir ? { model_type: dir } : {}))
+            .then((res) => {
+              const more = parseModelList(res, dir);
+              if (more.length) known = applyOptions([...known, ...more]);
+            })
+            .catch(() => { /* offline / older bridge — keep the local options */ });
+        }
+      } else if (input.kind === "color") {
+        const c = document.createElement("input");
+        c.type = "color";
+        const raw = typeof input.default === "string" ? input.default : "";
+        c.value = /^#?[0-9a-fA-F]{6}$/.test(raw) ? (raw[0] === "#" ? raw : "#" + raw) : "#000000";
+        field.append(c);
+        getter = () => c.value;
+      } else if (input.kind === "seed") {
+        // Classic ComfyUI seed control: a number + a 🎲 randomize/fix toggle.
+        const row = el("div", "cmcp-apps-seedrow");
+        const num = document.createElement("input");
+        num.type = "number";
+        num.step = "1";
+        num.min = "0";
+        const init = input.default !== undefined ? Number(input.default) : 0;
+        num.value = String(Number.isFinite(init) ? init : 0);
+        let randomize = input.seedBehavior ? input.seedBehavior !== "fixed" : true;
+        const rollSeed = () => Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
+        const dice = makeBtn("🎲");
+        const syncDice = () => {
+          dice.classList.toggle("primary", randomize);
+          dice.title = randomize
+            ? "Seed is randomized on every run — click to fix it"
+            : "Seed is fixed — click to randomize each run";
+        };
+        dice.addEventListener("click", () => {
+          randomize = !randomize;
+          if (randomize) num.value = String(rollSeed());
+          syncDice();
+        });
+        syncDice();
+        row.append(num, dice);
+        field.append(row);
+        getter = () => {
+          if (randomize) num.value = String(rollSeed());
+          return num.value === "" ? undefined : Number(num.value);
+        };
       } else if (input.kind === "combo" && Array.isArray(input.choices) && input.choices.length) {
         const sel = document.createElement("select");
         for (const c of input.choices) {
@@ -698,10 +904,33 @@ export function createAppsContent(ctx, shell, opts = {}) {
         field.append(sel);
         getter = () => sel.value;
       } else if (input.kind === "number") {
+        const hasRange = typeof input.min === "number" && typeof input.max === "number" && input.max > input.min;
+        const step = typeof input.step === "number" && input.step > 0 ? String(input.step) : "";
         const num = document.createElement("input");
         num.type = "number";
+        if (step) num.step = step;
+        if (typeof input.min === "number") num.min = String(input.min);
+        if (typeof input.max === "number") num.max = String(input.max);
         if (input.default !== undefined) num.value = String(input.default);
-        field.append(num);
+        if (hasRange) {
+          // Slider + a synced numeric readout when the manifest carries bounds.
+          const row = el("div", "cmcp-apps-sliderrow");
+          const range = document.createElement("input");
+          range.type = "range";
+          range.min = String(input.min);
+          range.max = String(input.max);
+          if (step) range.step = step;
+          num.classList.add("cmcp-apps-sliderval");
+          const init = input.default !== undefined ? Number(input.default) : Number(input.min);
+          range.value = String(Number.isFinite(init) ? init : input.min);
+          if (input.default === undefined) num.value = range.value;
+          range.addEventListener("input", () => { num.value = range.value; });
+          num.addEventListener("input", () => { if (num.value !== "") range.value = num.value; });
+          row.append(range, num);
+          field.append(row);
+        } else {
+          field.append(num);
+        }
         getter = () => (num.value === "" ? undefined : Number(num.value));
       } else if (input.kind === "toggle") {
         const cb = document.createElement("input");
@@ -749,18 +978,18 @@ export function createAppsContent(ctx, shell, opts = {}) {
 
     publishBtn.addEventListener("click", async () => {
       if (!registry.configured) {
-        window.alert(
-          "No registry configured yet. The registry worker isn't deployed — set localStorage " +
-            "“comfyui-mcp.panel.registryUrl” to a deployed instance to publish.",
-        );
+        toast("No registry configured yet — set “comfyui-mcp.panel.registryUrl” to a deployed registry to publish.");
         return;
       }
       if (app.hideWorkflow) {
-        const ok = window.confirm(
-          "Publish “" + (app.name || "this app") + "” as a HIDDEN app?\n\n" +
+        const ok = await confirmModal({
+          title: "Publish a hidden app?",
+          message:
+            "Publish “" + (app.name || "this app") + "” as a HIDDEN app?\n\n" +
             "Only the run snapshot is uploaded — never the node graph. This is best-effort " +
-            "privacy, not security: anyone who runs the app can still intercept the prompt. Continue?",
-        );
+            "privacy, not security: anyone who runs the app can still intercept the prompt.",
+          confirmLabel: "Publish hidden",
+        });
         if (!ok) return;
       }
       publishBtn.disabled = true;
@@ -768,8 +997,14 @@ export function createAppsContent(ctx, shell, opts = {}) {
         let creatorName = null;
         try { creatorName = localStorage.getItem("comfyui-mcp.panel.creatorName"); } catch {}
         if (!creatorName) {
-          creatorName = window.prompt("Publish under what creator name?", "anonymous");
-          if (creatorName === null) return;
+          creatorName = await promptModal({
+            title: "Publish to the registry",
+            label: "Creator name",
+            value: "anonymous",
+            placeholder: "anonymous",
+            submitLabel: "Continue",
+          });
+          if (creatorName === null) { publishBtn.disabled = false; return; }
           creatorName = creatorName.trim() || "anonymous";
           try { localStorage.setItem("comfyui-mcp.panel.creatorName", creatorName); } catch {}
         }
@@ -795,35 +1030,50 @@ export function createAppsContent(ctx, shell, opts = {}) {
         });
         await showDetail(app.id);
       } catch (e) {
-        window.alert(`Publish failed: ${e.message}`);
+        toast(`Publish failed: ${e.message}`);
         publishBtn.disabled = false;
       }
     });
 
     editBtn.addEventListener("click", async () => {
-      const name = window.prompt("App name", app.name || "");
-      if (name === null) return;
-      const description = window.prompt("Description", app.description || "");
-      if (description === null) return;
-      await client.update(app.id, { manifest: { name: name.trim() || app.name, description } });
+      const vals = await formModal({
+        title: "Edit app info",
+        submitLabel: "Save",
+        fields: [
+          { key: "name", label: "App name", value: app.name || "", maxLength: 120 },
+          { key: "description", label: "Description", value: app.description || "", multiline: true, rows: 4 },
+        ],
+      });
+      if (!vals) return;
+      await client.update(app.id, { manifest: { name: vals.name.trim() || app.name, description: vals.description } });
       await showDetail(app.id);
     });
 
     hideBtn.disabled = !!app.hideWorkflow;
     hideBtn.addEventListener("click", async () => {
-      const ok = window.confirm(
-        "Hide the workflow for “" + (app.name || "this app") + "”?\n\n" +
+      const ok = await confirmModal({
+        title: "Hide the workflow?",
+        message:
+          "Hide the workflow for “" + (app.name || "this app") + "”?\n\n" +
           "This DELETES the stored node graph — the app keeps only its run snapshot and can't be " +
-          "edited as a workflow afterwards. This is best-effort privacy, not security: anyone who " +
-          "runs the app can still intercept the prompt via ComfyUI's API.\n\nContinue?",
-      );
+          "edited as a workflow afterwards. Best-effort privacy, not security: anyone who runs the " +
+          "app can still intercept the prompt via ComfyUI's API.",
+        confirmLabel: "Hide workflow",
+        danger: true,
+      });
       if (!ok) return;
       await client.update(app.id, { manifest: { hideWorkflow: true } });
       await showDetail(app.id);
     });
 
     delBtn.addEventListener("click", async () => {
-      if (!window.confirm(`Delete “${app.name || "this app"}”? This can't be undone.`)) return;
+      const ok = await confirmModal({
+        title: "Delete app",
+        message: `Delete “${app.name || "this app"}”? This can't be undone.`,
+        confirmLabel: "Delete",
+        danger: true,
+      });
+      if (!ok) return;
       await client.remove(app.id);
       await showGrid();
     });
