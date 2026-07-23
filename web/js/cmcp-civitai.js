@@ -216,6 +216,38 @@ const CDN_TOKEN = "xG1nkqKTMzGDvpLrqFT7WA";
 const _levelFromString = (s) =>
   ({ None: 1, Soft: 2, Mature: 4, X: 8, XXX: 16 }[s] || 1);
 
+// CivitAI's tRPC responses switched from superjson ({json,meta}) to the devalue
+// "flattened" form: result.data is a STRING that parses to a flat array where
+// index 0 is the root and EVERY container value is an integer index into that
+// array (negatives are special values). Our readers all expect result.data.json,
+// so on a string result.data we unflatten and rewrap as { json: <root> }. This
+// is what broke Favorites (the only tab on tRPC image.getInfinite) on prod while
+// the REST-backed tabs kept working. No-op on already-normal / REST responses.
+const _DEVALUE_SPECIAL = { "-1": undefined, "-2": null, "-3": NaN, "-4": Infinity, "-5": -Infinity, "-6": -0 };
+export function unflattenDevalue(flat) {
+  if (!Array.isArray(flat) || flat.length === 0) return flat;
+  const seen = new Array(flat.length);
+  const build = (i) => {
+    if (typeof i === "number" && i < 0) return _DEVALUE_SPECIAL[i];
+    if (typeof i !== "number") return i;
+    if (i in seen) return seen[i];
+    const v = flat[i];
+    if (v === null || typeof v !== "object") { seen[i] = v; return v; }
+    if (Array.isArray(v)) { const a = []; seen[i] = a; for (const e of v) a.push(build(e)); return a; }
+    const o = {}; seen[i] = o; for (const k in v) o[k] = build(v[k]); return o;
+  };
+  return build(0);
+}
+export function normalizeTrpcResponse(data) {
+  const d = data && data.result ? data.result.data : undefined;
+  if (typeof d !== "string") return data; // already {json:…} or a REST/plain response
+  try {
+    const flat = JSON.parse(d);
+    if (Array.isArray(flat)) data.result.data = { json: unflattenDevalue(flat) };
+  } catch { /* not the devalue string form — leave untouched */ }
+  return data;
+}
+
 export class CivitaiClient {
   /** @param {object} api ComfyUI api ({fetchApi, apiURL}) injected by the monolith. */
   constructor(api) {
@@ -234,7 +266,7 @@ export class CivitaiClient {
       body: JSON.stringify({ url, method, body, auth, headers }),
     });
     if (!res.ok) throw new Error(`civitai proxy ${res.status}`);
-    return res.json();
+    return normalizeTrpcResponse(await res.json());
   }
 
   /** Same-origin CDN media URL (usable as <img>/<video> src AND fetchable as a Blob). */

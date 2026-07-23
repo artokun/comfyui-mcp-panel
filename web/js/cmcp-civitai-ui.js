@@ -516,14 +516,28 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         // Dedup on id: the feed pages by "last item id" (see the client's
         // cursor quirk) — if CivitAI ever flips its keyset comparison to
         // inclusive, the boundary item would come back twice.
-        // The favorites feed has no text query — search filters client-side.
+        // Favorites has no server-side text / base-model / creator filter — apply
+        // the active filter panel client-side. image.getInfinite carries no prompt
+        // text, so a text query matches the author or model name; the base-model
+        // chips match the item's own baseModel; the @creator qualifier matches the
+        // author. (A page emptied by these shows the manual "Load more" below.)
         const seen = new Set(state.items.map((i) => i.id));
         const q = state.query.toLowerCase();
-        const fresh = page.items.filter((it) => !seen.has(it.id) &&
-          (!q || (it.prompt || "").toLowerCase().includes(q) ||
-            (it.author || "").toLowerCase().includes(q)));
+        const bms = f.baseModels;
+        const creator = f.username ? f.username.toLowerCase() : null;
+        const favMatch = (it) => {
+          const model = (it.modelName || "").toLowerCase();
+          const author = (it.author || "").toLowerCase();
+          if (q && !(author.includes(q) || model.includes(q) ||
+                     (it.prompt || "").toLowerCase().includes(q))) return false;
+          if (bms.length && !bms.some((b) => matchesBaseModel(it.modelName || "", b))) return false;
+          if (creator && author !== creator) return false;
+          return true;
+        };
+        const fresh = page.items.filter((it) => !seen.has(it.id) && favMatch(it));
         appendItems(fresh);
-        stalled = !fresh.length && !state.done && !!q;
+        const filtering = !!q || bms.length > 0 || !!creator;
+        stalled = !fresh.length && !state.done && filtering;
       } else if (t.model) {
         if (!state.localLoaded) await refreshLocalModels(); // for "in library" marks
         const page = await client.fetchModels({
