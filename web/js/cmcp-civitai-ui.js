@@ -16,6 +16,7 @@ import {
   filtersDirty, bitmask, parseCreatorQuery,
 } from "./cmcp-civitai.js";
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
+import { openSubModal as openSubModalBase, toast } from "./cmcp-modal.js";
 
 const TABS = [
   { key: "images", label: "Images", icon: "pi-image", media: "image" },
@@ -1703,38 +1704,11 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   function closeSubModals() {
     for (const c of [..._subModals]) { try { c(); } catch { /* already gone */ } }
   }
+  // openSubModal + toast now live in the shared cmcp-modal.js (the Apps tab reuses
+  // them). This wrapper threads Civitai's own `_subModals` tracker so the stacked
+  // close-sweep + Escape gating stay byte-identical; `toast` is imported directly.
   function openSubModal(title, onClose) {
-    const ov = el("div", "cmcp-cv-overlay"); ov.style.zIndex = "10001";
-    const m = el("div", "cmcp-modal"); m.style.maxWidth = "40rem"; m.style.width = "min(40rem, 92vw)";
-    m.style.maxHeight = "85vh"; m.style.overflowY = "auto";
-    const head2 = el("div", "cmcp-modal-title", title);
-    const x = el("button", "cmcp-cv-iconbtn"); x.innerHTML = '<i class="pi pi-times"></i>';
-    x.style.cssText = "position:absolute;top:.5rem;right:.5rem";
-    const b = el("div"); m.style.position = "relative";
-    // Every close path (✕ button, backdrop click, sheet.close()) funnels here,
-    // so a caller-supplied teardown runs no matter how the sheet is dismissed.
-    const close2 = () => { _subModals.delete(close2); ov.remove(); if (onClose) onClose(); };
-    _subModals.add(close2);
-    x.addEventListener("click", close2);
-    ov.addEventListener("mousedown", (e) => { if (e.target === ov) close2(); });
-    m.append(head2, x, b); ov.appendChild(m); document.body.appendChild(ov);
-    return { body: b, close: close2 };
-  }
-
-  function toast(msg, { ms = 3500 } = {}) {
-    const t = el("div", null, msg);
-    // ALWAYS mount on <body> above every overlay — sub-modals (10001), the
-    // lightbox (10002) and the workflow picker sit above the base modal, and a
-    // toast rendered inside `modal` (z-index 80) was hidden behind them, so a
-    // gated-download hint or a load error read as "nothing happened". A fixed,
-    // top-of-stack toast is visible no matter which sheet is open (or if the
-    // whole explorer just closed after a successful load).
-    t.style.cssText = "position:fixed;bottom:1.25rem;left:50%;transform:translateX(-50%);" +
-      "max-width:min(38rem,90vw);text-align:center;background:var(--p-surface-800,#27272a);" +
-      "color:#fafafa;padding:.55rem .9rem;border-radius:8px;z-index:10060;font-size:.82rem;" +
-      "box-shadow:0 4px 16px rgba(0,0,0,.5)";
-    document.body.appendChild(t);
-    setTimeout(() => t.remove(), ms);
+    return openSubModalBase(title, onClose, _subModals);
   }
 
   // ── agent-driven handle ────────────────────────────────────────────────

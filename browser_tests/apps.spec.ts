@@ -438,21 +438,25 @@ test('hide workflow: warns honestly and strips the graph from the bundle', async
     workflow: FIXTURE_WORKFLOW,
     prompt: FIXTURE_PROMPT
   })
-  page.on('dialog', (d) => d.accept())
-
   await panel.goto()
   await panel.openSidebar()
   await panel.root.getByRole('button', { name: 'Apps', exact: true }).click()
   const modal = page.locator('.cmcp-apps-modal')
   await modal.locator('.cmcp-app-card', { hasText: 'Secret Sauce' }).click()
 
+  // The native window.confirm is now a themed modal (cmcp-modal.js). The
+  // honest-warning copy lives inside it; click its confirm button to proceed.
   await modal.getByRole('button', { name: /Hide workflow/ }).click()
-  // The honest-warning copy is in the confirm dialog (accepted above); the PUT
-  // flips the flag and the server drops workflow.json (stub mirrors the flag).
-  const put = captured.find((c) => c.method === 'PUT')
-  expect((put!.body as { manifest: { hideWorkflow: boolean } }).manifest.hideWorkflow).toBe(true)
+  const confirm = page.locator('.cmcp-mdl')
+  await expect(confirm).toContainText('DELETES the stored node graph')
+  await page.locator('.cmcp-mdl-ok').click()
+
+  // After confirming: the PUT flips the flag (stub drops workflow.json) and the
+  // detail re-renders with the honest below-the-fold warning.
   await expect(modal).toContainText('Hidden workflow (best effort)')
   await expect(modal).toContainText('anyone technical who runs this app can still intercept')
+  const put = captured.find((c) => c.method === 'PUT')
+  expect((put!.body as { manifest: { hideWorkflow: boolean } }).manifest.hideWorkflow).toBe(true)
 })
 
 // ── Registry (P4): publish / explore / install, worker stubbed over HTTP ────
@@ -562,14 +566,19 @@ test('publish: bundle goes to the registry, local manifest records the slug', as
     workflow: FIXTURE_WORKFLOW,
     prompt: FIXTURE_PROMPT
   })
-  page.on('dialog', (d) => d.accept('tester'))
-
   await panel.goto()
   await panel.openSidebar()
   await panel.root.getByRole('button', { name: 'Apps', exact: true }).click()
   const modal = page.locator('.cmcp-apps-modal')
   await modal.locator('.cmcp-app-card', { hasText: 'Shareable' }).click()
   await modal.getByRole('button', { name: /Publish/ }).click()
+
+  // The window.prompt for the creator name is now a themed prompt modal
+  // (cmcp-modal.js): type the name and submit.
+  const creatorField = page.locator('.cmcp-mdl input')
+  await expect(creatorField).toBeVisible()
+  await creatorField.fill('tester')
+  await page.locator('.cmcp-mdl-ok').click()
 
   // The registry got the app; the local manifest records published{slug}.
   await expect(modal.getByRole('button', { name: /Update published/ })).toBeVisible()
