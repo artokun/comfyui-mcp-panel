@@ -737,6 +737,40 @@ export function mergeHistorySnapshots(...snapshots) {
   };
 }
 
+/** Build a canonical empty-history checkpoint without discarding workflow
+ * identity aliases. Advancing the generation fences every older browser tab:
+ * a stale pre-clear snapshot cannot republish a thread that no longer exists in
+ * this empty baseline. Alias operations are folded into the new checkpoint
+ * baseline because they identify workflows, not transcripts. */
+export function createHistoryResetSnapshot(snapshot, revision = null) {
+  const normalized = mergeHistorySnapshots(snapshot);
+  const resetRevision = normalizeExplicitRevision(revision) ||
+    normalizeRevision(null, Date.now(), "history-clear", 0);
+  const previousCheckpoint = normalizeCheckpoint(normalized.meta);
+  const workflowAliases = safeMap();
+  for (const [path, value] of Object.entries(normalized.meta?.workflowAliases || {})) {
+    workflowAliases[path] = value;
+  }
+  return {
+    schemaVersion: CHAT_HISTORY_SCHEMA,
+    updatedAt: resetRevision.updatedAt,
+    threads: [],
+    meta: {
+      ...(normalized.meta || {}),
+      updatedAt: resetRevision.updatedAt,
+      checkpoint: {
+        generation: previousCheckpoint.generation + 1,
+        revision: resetRevision,
+      },
+      activeByScope: safeMap(),
+      activeOps: safeMap(),
+      deletedThreads: safeMap(),
+      workflowAliases,
+      aliasOps: safeMap(),
+    },
+  };
+}
+
 function withoutCheckpoint(snapshot) {
   if (!snapshot || typeof snapshot !== "object") return snapshot;
   const hadCheckpoint = snapshot.meta?.checkpoint != null;
@@ -878,6 +912,31 @@ async function idbMergeWrite(indexedDb, snapshot, limits) {
       };
       get.onerror = () => store.put(merged, CHAT_HISTORY_STATE_KEY);
       tx.oncomplete = () => resolve(merged);
+      tx.onerror = () => resolve(null);
+      tx.onabort = () => resolve(null);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function idbResetHistory(indexedDb, snapshot, createReset) {
+  const db = await openDb(indexedDb);
+  if (!db) return null;
+  try {
+    return await new Promise((resolve) => {
+      const tx = db.transaction("snapshots", "readwrite");
+      const store = tx.objectStore("snapshots");
+      const get = store.get(CHAT_HISTORY_STATE_KEY);
+      let reset = null;
+      const replace = (canonical) => {
+        const merged = mergeUnderCanonicalCheckpoint(canonical, snapshot);
+        reset = createReset(merged);
+        store.put(reset, CHAT_HISTORY_STATE_KEY);
+      };
+      get.onsuccess = () => replace(get.result);
+      get.onerror = () => replace(null);
+      tx.oncomplete = () => resolve(reset);
       tx.onerror = () => resolve(null);
       tx.onabort = () => resolve(null);
     });
@@ -1140,6 +1199,64 @@ export class ChatHistoryStore {
     return snapshot;
   }
 
+  /** Remove every transcript as one canonical checkpoint. This deliberately
+   * does not delete the IndexedDB database: doing so would also erase workflow
+   * aliases and would let a stale open tab recreate the old snapshot. */
+  async clearAll(threads, meta = {}) {
+    if (this._closed) {
+      return {
+        ok: false,
+        canonicalCommitted: false,
+        shadowCommitted: false,
+        retryable: false,
+        code: "history-store-closed",
+      };
+    }
+    const localSnapshot = this._dirtyWrite
+      ? mergeHistorySnapshots(this._dirtyWrite.snapshot, { threads, meta })
+      : mergeHistorySnapshots({ threads, meta });
+    this._observeSnapshot(localSnapshot);
+    this._writePromise = this._writePromise
+      .catch(() => null)
+      .then(() => idbResetHistory(this.indexedDb, localSnapshot, (canonical) => {
+        this._observeSnapshot(canonical);
+        return createHistoryResetSnapshot(canonical, this.nextRevision());
+      }))
+      .then((reset) => {
+        if (!reset) {
+          return {
+            ok: false,
+            canonicalCommitted: false,
+            shadowCommitted: false,
+            retryable: true,
+            code: "history-clear-canonical-unavailable",
+          };
+        }
+        this._lastCommitted = reset;
+        this._dirtyWrite = null;
+        this._observeSnapshot(reset);
+        const shadowCommitted = this._writeLocalSnapshot(reset, []);
+        try {
+          this._broadcastChannel?.postMessage({
+            type: "history-reset",
+            writerId: this.writerId,
+            generation: reset.meta?.checkpoint?.generation || 0,
+          });
+        } catch {
+          // localStorage events remain available when the channel is blocked.
+        }
+        return {
+          ok: true,
+          canonicalCommitted: true,
+          shadowCommitted,
+          retryable: false,
+          code: null,
+          snapshot: reset,
+        };
+      });
+    return this._writePromise;
+  }
+
   /** Watch the localStorage compatibility shadow. Browsers fire `storage` only
    *  in the other tabs, making it a cheap cross-tab invalidation channel while
    *  IndexedDB remains the full, atomically merged source of truth. */
@@ -1156,7 +1273,10 @@ export class ChatHistoryStore {
       void this.readCanonical().then(listener);
     };
     const onBroadcast = (event) => {
-      if (event?.data?.type !== "history-changed" || event.data.writerId === this.writerId) return;
+      if (
+        !["history-changed", "history-reset"].includes(event?.data?.type) ||
+        event.data.writerId === this.writerId
+      ) return;
       void this.readCanonical().then(listener);
     };
     eventTarget?.addEventListener?.("storage", onStorage);

@@ -5,6 +5,7 @@ import {
   CHAT_HISTORY_LOCAL_SNAPSHOT_KEY,
   CHAT_HISTORY_SCHEMA,
   ChatHistoryStore,
+  createHistoryResetSnapshot,
   isThreadInScope,
   mergeHistorySnapshots,
   normalizeThread,
@@ -811,6 +812,140 @@ test('atomic writes keep message, metadata, and chat deletions through stale wri
   assert.equal(reloaded.threads.some((thread) => thread.id === 'removed-chat'), false)
   assert.equal(Object.hasOwn(reloaded.meta.activeByScope, 'panel:global'), false)
   assert.equal(Object.hasOwn(reloaded.meta.workflowAliases, 'workflows/old.json'), false)
+})
+
+test('history reset creates an empty checkpoint while preserving workflow identity aliases', () => {
+  const reset = createHistoryResetSnapshot({
+    threads: [
+      { id: 'chat-a', workflowKey: 'workflow:wf-a', updatedAt: 100, msgs: [] },
+      { id: 'chat-b', workflowKey: 'workflow:wf-b', updatedAt: 200, msgs: [] }
+    ],
+    meta: {
+      updatedAt: 200,
+      checkpoint: {
+        generation: 4,
+        revision: { updatedAt: 150, writerId: 'old-checkpoint', sequence: 1 }
+      },
+      activeByScope: { 'workflow:wf-a': 'chat-a', 'workflow:wf-b': 'chat-b' },
+      workflowAliases: {
+        'workflows/a.json': 'wf-a',
+        'workflows/b.json': 'wf-b'
+      },
+      aliasOps: {
+        'workflows/a.json': {
+          value: 'wf-a',
+          deleted: false,
+          updatedAt: 100,
+          revision: { updatedAt: 100, writerId: 'alias', sequence: 1 }
+        }
+      }
+    }
+  }, { updatedAt: 300, writerId: 'clear-all', sequence: 1 })
+
+  assert.deepEqual(reset.threads, [])
+  assert.deepEqual({ ...reset.meta.activeByScope }, {})
+  assert.deepEqual({ ...reset.meta.activeOps }, {})
+  assert.deepEqual({ ...reset.meta.deletedThreads }, {})
+  assert.deepEqual({ ...reset.meta.workflowAliases }, {
+    'workflows/a.json': 'wf-a',
+    'workflows/b.json': 'wf-b'
+  })
+  assert.deepEqual({ ...reset.meta.aliasOps }, {})
+  assert.equal(reset.meta.checkpoint.generation, 5)
+  assert.deepEqual(reset.meta.checkpoint.revision, {
+    updatedAt: 300,
+    writerId: 'clear-all',
+    sequence: 1
+  })
+})
+
+test('clear all is canonical, broadcasts, and fences a stale tab without deleting aliases', async () => {
+  const initial = {
+    schemaVersion: CHAT_HISTORY_SCHEMA,
+    updatedAt: 200,
+    threads: [
+      {
+        id: 'chat-a',
+        workflowKey: 'workflow:wf-a',
+        createdAt: 100,
+        updatedAt: 200,
+        msgs: [{ id: 'message-a', role: 'user', text: 'erase me', createdAt: 200 }]
+      }
+    ],
+    meta: {
+      updatedAt: 200,
+      activeByScope: { 'workflow:wf-a': 'chat-a' },
+      workflowAliases: { 'workflows/a.json': 'wf-a' }
+    }
+  }
+  const staleSnapshot = structuredClone(initial)
+  const indexedDb = createFakeIndexedDb(initial)
+  const clearingStorage = createMemoryStorage()
+  const staleStorage = createMemoryStorage()
+  const hub = createBroadcastHub()
+  const clearingStore = new ChatHistoryStore({
+    storage: clearingStorage,
+    indexedDb,
+    writerId: 'clearing-tab',
+    broadcastChannelFactory: hub.factory
+  })
+  const observingStore = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb,
+    writerId: 'observing-tab',
+    broadcastChannelFactory: hub.factory
+  })
+  const observedReset = new Promise((resolve) => {
+    observingStore.subscribe((snapshot) => resolve(snapshot), {
+      addEventListener() {},
+      removeEventListener() {}
+    })
+  })
+
+  const result = await clearingStore.clearAll(initial.threads, initial.meta)
+  assert.equal(result.ok, true)
+  assert.equal(result.canonicalCommitted, true)
+  assert.deepEqual(result.snapshot.threads, [])
+  assert.equal(result.snapshot.meta.workflowAliases['workflows/a.json'], 'wf-a')
+
+  const peerSnapshot = await observedReset
+  assert.deepEqual(peerSnapshot.threads, [])
+  assert.equal(peerSnapshot.meta.workflowAliases['workflows/a.json'], 'wf-a')
+  const shadow = JSON.parse(clearingStorage.getItem(CHAT_HISTORY_LOCAL_SNAPSHOT_KEY))
+  assert.deepEqual(shadow.threads, [])
+  assert.equal(shadow.meta.workflowAliases['workflows/a.json'], 'wf-a')
+
+  const staleStore = new ChatHistoryStore({
+    storage: staleStorage,
+    indexedDb,
+    writerId: 'stale-tab'
+  })
+  staleStore.persist(staleSnapshot.threads, staleSnapshot.meta)
+  await staleStore.flush()
+  const canonical = indexedDb.readState()
+  assert.deepEqual(canonical.threads, [])
+  assert.deepEqual({ ...canonical.meta.activeByScope }, {})
+  assert.equal(canonical.meta.workflowAliases['workflows/a.json'], 'wf-a')
+
+  clearingStore.close()
+  observingStore.close()
+  staleStore.close()
+})
+
+test('clear all fails closed when the canonical IndexedDB store is unavailable', async () => {
+  const storage = createMemoryStorage()
+  const store = new ChatHistoryStore({ storage, indexedDb: null })
+  const threads = [{ id: 'shadow-only', workflowKey: 'panel:global', updatedAt: 100, msgs: [] }]
+  store.persist(threads, {})
+  await store.flush()
+  const before = storage.getItem(CHAT_HISTORY_LOCAL_SNAPSHOT_KEY)
+
+  const result = await store.clearAll(threads, {})
+
+  assert.equal(result.ok, false)
+  assert.equal(result.retryable, true)
+  assert.equal(result.code, 'history-clear-canonical-unavailable')
+  assert.equal(storage.getItem(CHAT_HISTORY_LOCAL_SNAPSHOT_KEY), before)
 })
 
 test('blocked IndexedDB opens can continue to success and always close the connection', async () => {

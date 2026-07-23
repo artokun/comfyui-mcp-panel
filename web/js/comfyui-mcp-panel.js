@@ -8229,6 +8229,23 @@ const PANEL_CSS = `
 .cmcp-hist-row:hover .cmcp-hist-del { opacity: 1; }
 .cmcp-hist-del:hover { background: var(--p-surface-700, #3f3f46); color: var(--p-red-400, #f87171); }
 .cmcp-hist-del .pi { font-size: 0.75rem; }
+.cmcp-hist-footer {
+  margin-top: 0.25rem; padding: 0.5rem 0.375rem 0.125rem;
+  border-top: 1px solid var(--p-content-border-color, #3f3f46);
+}
+.cmcp-hist-note {
+  margin: 0 0 0.375rem; color: var(--p-text-muted-color, #a1a1aa);
+  font-size: 0.625rem; line-height: 1.35;
+}
+.cmcp-hist-clear {
+  display: flex; align-items: center; justify-content: center; gap: 0.375rem;
+  width: 100%; padding: 0.3125rem 0.5rem; border-radius: var(--p-border-radius-sm, 4px);
+  border: 1px solid color-mix(in srgb, var(--p-red-400, #f87171) 45%, transparent);
+  background: transparent; color: var(--p-red-400, #f87171); cursor: pointer;
+  font: inherit; font-size: 0.6875rem;
+}
+.cmcp-hist-clear:hover:not(:disabled) { background: color-mix(in srgb, var(--p-red-400, #f87171) 12%, transparent); }
+.cmcp-hist-clear:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* Model/effort picker popover (anchored above the composer). */
 .cmcp-pop-section { padding: 0.25rem 0.5rem 0.125rem; font-size: 0.625rem; font-weight: 600;
@@ -10530,8 +10547,12 @@ function buildPanel() {
       ssSet(SESSION_KEY, replacement.sessionId || null);
       setActiveThread(currentHistorySelectionKey(), replacement.id);
       paintThread(replacement);
-    } else if (scopeKey) {
-      setActiveThread(currentHistorySelectionKey(), null);
+    } else {
+      if (scopeKey) setActiveThread(currentHistorySelectionKey(), null);
+      // A remote delete/reset removed the conversation this tab's live agent
+      // belonged to. Clear backend memory as well as the visible transcript so
+      // the next message cannot continue a history the user just deleted.
+      client?.sendFrame?.({ type: "new_session" });
     }
     persistThreads();
     return replacement;
@@ -11768,7 +11789,6 @@ function buildPanel() {
       none.style.padding = "0.375rem";
       none.textContent = "No past chats yet.";
       histPop.appendChild(none);
-      return;
     }
     for (const t of list) {
       const row = document.createElement("div");
@@ -11832,6 +11852,61 @@ function buildPanel() {
       row.append(item, del);
       histPop.appendChild(row);
     }
+
+    const footer = document.createElement("div");
+    footer.className = "cmcp-hist-footer";
+    const note = document.createElement("p");
+    note.className = "cmcp-hist-note";
+    note.textContent = "Transcripts are stored in this browser using IndexedDB.";
+    const clear = document.createElement("button");
+    clear.type = "button";
+    clear.className = "cmcp-hist-clear";
+    clear.disabled = !threads.length;
+    clear.title = "Permanently clear chat history for every workflow in this browser";
+    const clearIcon = document.createElement("i");
+    clearIcon.className = "pi pi-trash";
+    const clearLabel = document.createElement("span");
+    clearLabel.textContent = "Clear all history";
+    clear.append(clearIcon, clearLabel);
+    clear.addEventListener("click", async () => {
+      if (!threads.length) return;
+      const confirmed = globalThis.confirm?.(
+        "Clear all Agent Panel chat history from this browser?\n\n" +
+        "This affects every workflow and open ComfyUI tab. It cannot be undone. " +
+        "Your workflows and their stable identities will not be deleted.",
+      );
+      if (!confirmed) return;
+      clear.disabled = true;
+      clearLabel.textContent = "Clearing…";
+      const result = await historyStore.clearAll(threads, historyMeta);
+      if (!result?.ok || !result.snapshot) {
+        clear.disabled = false;
+        clearLabel.textContent = "Clear all history";
+        appendSystem(
+          "Chat history could not be cleared from IndexedDB. Close other ComfyUI tabs, then try again.",
+        );
+        return;
+      }
+
+      threads = result.snapshot.threads;
+      historyMeta = result.snapshot.meta;
+      applyWorkflowAliasesFromHistory();
+      thread = null;
+      turnAnchors = [];
+      ssSet(CURRENT_THREAD_KEY, null);
+      ssSet(SESSION_KEY, null);
+      ssSet(CTX_KEY, null);
+      if (typeof resetAttachments === "function") resetAttachments();
+      resetFeed();
+      renderTodo([], { persist: false });
+      setContextPct(0);
+      ctxLabel.textContent = "—";
+      client?.sendFrame?.({ type: "new_session" });
+      histPop.hidden = true;
+      appendSystem("Chat history was cleared from this browser.");
+    });
+    footer.append(note, clear);
+    histPop.appendChild(footer);
   }
 
   newChatBtn.addEventListener("click", () => {
