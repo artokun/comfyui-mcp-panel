@@ -6,6 +6,9 @@
 // ctx (from the panel monolith):
 //   getApp()           — the live ComfyUI app object (graph, graphToPrompt)
 //   uploadBlobToInput  — (blob, name) => Promise<{filename, subfolder, type}|null>
+//                        (LOCAL ComfyUI /upload/image — the local run path)
+//   uploadMedia        — (blob, name) => Promise<media_uploaded frame> over the
+//                        bridge; writes to the CONNECTED ComfyUI (pod) input/
 //   callTool           — (tool, args, opts) => Promise<tool_result> (P2: RunPod)
 //   getRunpodTarget    — () => last comfyui_target frame (P2: honest host)
 //
@@ -682,17 +685,10 @@ export function openAppsModal(ctx, opts = {}) {
         const fileInput = document.createElement("input");
         fileInput.type = "file";
         fileInput.accept = "image/*";
-        const hint = el("span", "cmcp-apps-status");
-        field.append(fileInput, hint);
-        getter = async () => {
-          const f = fileInput.files && fileInput.files[0];
-          if (!f) return undefined;
-          hint.textContent = "Uploading…";
-          const ref = await uploadBlobToInput(f, f.name);
-          if (!ref) throw new Error("image upload failed");
-          hint.textContent = "";
-          return ref.subfolder ? `${ref.subfolder}/${ref.filename}` : ref.filename;
-        };
+        field.append(fileInput);
+        // Return the raw File — the RUN path decides where the bytes go
+        // (local /upload/image, or the bridge's upload_media → the pod).
+        getter = () => (fileInput.files && fileInput.files[0]) || undefined;
       } else if (input.kind === "combo" && Array.isArray(input.choices) && input.choices.length) {
         const sel = document.createElement("select");
         for (const c of input.choices) {
@@ -835,13 +831,45 @@ export function openAppsModal(ctx, opts = {}) {
       await showGrid();
     });
 
-    async function collectValues() {
+    /** Collect form values; image Files are handed to `uploadImage` (the run
+     *  path picks WHERE the bytes go) and replaced by the returned input
+     *  filename. */
+    async function collectValues(uploadImage) {
       const values = {};
       for (const [key, getter] of fieldEls) {
-        const v = await getter();
+        let v = await getter();
+        if (v instanceof File) {
+          if (!uploadImage) continue;
+          v = await uploadImage(v);
+        }
         if (v !== undefined) values[key] = v;
       }
       return values;
+    }
+
+    /** Local image transfer: same-origin /upload/image. */
+    async function uploadImageLocal(f) {
+      status.textContent = "Uploading image…";
+      const ref = await uploadBlobToInput(f, f.name);
+      if (!ref) throw new Error("image upload failed");
+      return ref.subfolder ? `${ref.subfolder}/${ref.filename}` : ref.filename;
+    }
+
+    /** Pod image transfer: the bridge's upload_media handler writes the bytes
+     *  to the CONNECTED ComfyUI's input/ — i.e. the pod when we're on a pod.
+     *  The remote name is uniquified per app+input: ComfyUI's /upload/image
+     *  OVERWRITES on name collision, so two inputs sharing a basename (or a
+     *  repeat run with "image.png") would otherwise silently swap in the last
+     *  upload (codex finding). */
+    async function uploadImageToPod(f) {
+      if (typeof ctx.uploadMedia !== "function") {
+        throw new Error("pod image transfer needs a newer panel bridge — update the orchestrator");
+      }
+      const unique = `cmcp-app-${app.id.slice(0, 8)}-${crypto.randomUUID().slice(0, 8)}-${f.name}`;
+      status.textContent = `Transferring ${f.name} to the pod…`;
+      const res = await ctx.uploadMedia(f, unique);
+      if (!res || res.ok === false) throw new Error((res && res.error) || "pod image transfer failed");
+      return res.name;
     }
 
     async function runApp() {
@@ -851,7 +879,7 @@ export function openAppsModal(ctx, opts = {}) {
       status.textContent = "Queueing…";
       outputs.textContent = "";
       try {
-        const values = await collectValues();
+        const values = await collectValues(uploadImageLocal);
         const res = await client.run(app.id, values);
         const promptId = res.prompt_id;
         if (!promptId) throw new Error("queue returned no prompt_id");
@@ -939,9 +967,11 @@ export function openAppsModal(ctx, opts = {}) {
       status.classList.add("err");
     }));
 
-    /** One-click pod run: the LOCAL apps route dry-patches the snapshot, then
-     *  the orchestrator's enqueue_workflow sends it to the connected pod. Deps
-     *  pinned to a CivitAI version are pushed first (download_civitai_model is
+    /** One-click pod run: image inputs are transferred to the pod through the
+     *  bridge's upload_media handler FIRST (it writes to the connected target),
+     *  then the LOCAL apps route dry-patches the snapshot and the
+     *  orchestrator's enqueue_workflow sends it to the pod. Deps pinned to a
+     *  CivitAI version are pushed first (download_civitai_model is
      *  whitelisted); anything unpinned is reported, not silently skipped. */
     async function runOnPod() {
       status.classList.remove("err");
@@ -954,22 +984,7 @@ export function openAppsModal(ctx, opts = {}) {
       runBtn.disabled = true;
       try {
         status.textContent = "Preparing…";
-        const values = await collectValues();
-        // Image inputs upload to the LOCAL ComfyUI's input/ — the pod can't
-        // see those bytes, so a pod run with an image input would fail on a
-        // missing file. Refuse honestly rather than silently enqueueing a
-        // broken prompt (pod-side media transfer is a follow-up).
-        const imageKeys = new Set(
-          (app.appMode?.inputs || [])
-            .filter((i) => i.kind === "image")
-            .map((i) => `${i.nodeId}.${i.widget}`),
-        );
-        if ([...imageKeys].some((k) => values[k] !== undefined)) {
-          throw new Error(
-            "This app takes an image input, which uploads to the LOCAL ComfyUI — pod runs can't " +
-              "reach those bytes yet. Run it locally, or remove the image input.",
-          );
-        }
+        const values = await collectValues(uploadImageToPod);
         const dry = await client.run(app.id, values, { dry: true });
         const patched = dry.prompt;
         if (!patched) throw new Error("couldn't build the prompt snapshot");

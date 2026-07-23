@@ -7111,6 +7111,16 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
         }
         return;
       }
+      // Reply to a direct uploadMedia() request (cid-correlated).
+      if (msg && msg.type === "media_uploaded" && typeof msg.cid === "string") {
+        const pend = pendingCalls.get(msg.cid);
+        if (pend) {
+          pendingCalls.delete(msg.cid);
+          clearTimeout(pend.timer);
+          pend.resolve(msg);
+        }
+        return;
+      }
       if (msg && msg.type === "say" && typeof msg.text === "string") {
         // `id` reconciles this committed reply with its live streaming preview.
         onSay(msg.text, { id: msg.id, streamed: !!msg.streamed });
@@ -7413,6 +7423,50 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
               cid,
               tool,
               args: args || {},
+            }),
+          );
+        } catch (e) {
+          pendingCalls.delete(cid);
+          clearTimeout(timer);
+          reject(e);
+        }
+      });
+    },
+    /** Upload image bytes to the ComfyUI input/ folder OF THE CURRENT TARGET —
+     *  when the session is connected to a pod, the orchestrator's upload_media
+     *  handler writes the bytes to the POD's input/ (same handler the mobile
+     *  app uses). cid-correlated like callTool; resolves the media_uploaded
+     *  frame { ok, name, kind } or rejects on timeout/socket close. Used by
+     *  the Apps modal to transfer image inputs before a pod run. */
+    async uploadMedia(blob, name) {
+      if (!sock || sock.readyState !== WebSocket.OPEN) {
+        throw new Error("bridge not connected");
+      }
+      const cid = `um-${Date.now()}-${cidSeq++}`;
+      const buf = new Uint8Array(await blob.arrayBuffer());
+      let bin = "";
+      const CHUNK = 0x8000;
+      for (let i = 0; i < buf.length; i += CHUNK) {
+        bin += String.fromCharCode.apply(null, buf.subarray(i, i + CHUNK));
+      }
+      const data_base64 = btoa(bin);
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pendingCalls.delete(cid);
+          reject(new Error("upload_media timed out"));
+          // Large images over slow pod links legitimately exceed a minute;
+          // the mobile client uses the same 3-minute budget for this frame.
+        }, 180_000);
+        pendingCalls.set(cid, { resolve, reject, timer });
+        try {
+          sock.send(
+            JSON.stringify({
+              type: "upload_media",
+              tab_id: workflowTabId(),
+              cid,
+              filename: name || "upload.png",
+              mime: blob.type || "image/png",
+              data_base64,
             }),
           );
         } catch (e) {
@@ -10140,6 +10194,10 @@ function buildPanel() {
         getApp: () => app,
         uploadBlobToInput,
         callTool: (t, a, o) => liveBridgeClient?.callTool(t, a, o),
+        // Pod image transfer for app runs: bytes go through the bridge's
+        // upload_media handler, which writes to the CONNECTED ComfyUI (the
+        // pod when we're on one) — NOT the local /upload/image.
+        uploadMedia: (b, n) => liveBridgeClient?.uploadMedia(b, n),
         getRunpodTarget: () => _comfyuiTarget,
       },
       {
