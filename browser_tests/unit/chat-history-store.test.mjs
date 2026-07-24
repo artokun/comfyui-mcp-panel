@@ -1414,3 +1414,47 @@ test('bounds checkpointed operations, rejects compacted stale resurrection, and 
   assert.equal(Object.hasOwn(reloaded.meta.workflowAliases, 'workflows/deleted-0.json'), false)
   unsubscribe()
 })
+
+test('reviseThread stamps a causal createdRevision on new threads (codex: pre-checkpoint loss)', () => {
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb: null })
+  const thread = { id: 'fresh', createdAt: 1, updatedAt: 1, msgs: [] }
+  store.reviseThread(thread, { workflowKey: 'workflow:new' }, 5_000)
+  assert.ok(thread.createdRevision, 'new thread must carry a causal creation stamp')
+  assert.ok(thread.createdRevision.updatedAt >= 5_000)
+  const existing = thread.createdRevision
+  store.reviseThread(thread, { sessionId: 's1' }, 6_000)
+  assert.equal(thread.createdRevision, existing, 'creation stamp is write-once')
+})
+
+test('touchMessage stamps a causal createdRevision when missing (codex: pre-checkpoint loss)', () => {
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb: null })
+  const message = { id: 'm1', createdAt: 1, text: 'hi' }
+  store.touchMessage(message, 5_000)
+  assert.ok(message.createdRevision)
+  assert.ok(message.createdRevision.updatedAt >= 5_000)
+  const existing = message.createdRevision
+  store.touchMessage(message, 6_000)
+  assert.equal(message.createdRevision, existing, 'creation stamp is write-once')
+})
+
+test('unsubscribe suppresses a pending readCanonical delivery (codex: dead-panel callback)', async () => {
+  const values = new Map()
+  const storage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value)
+  }
+  const listeners = new Set()
+  const eventTarget = {
+    addEventListener: (type, listener) => type === 'storage' && listeners.add(listener),
+    removeEventListener: (type, listener) => type === 'storage' && listeners.delete(listener)
+  }
+  const store = new ChatHistoryStore({ storage, indexedDb: null })
+  let calls = 0
+  const unsubscribe = store.subscribe(() => { calls += 1 }, eventTarget)
+
+  for (const listener of listeners) listener({ key: 'comfyui-mcp.panel.threads' })
+  // The read is in flight; destroy the panel before it resolves.
+  unsubscribe()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(calls, 0, 'a read started before unsubscribe must not deliver')
+})

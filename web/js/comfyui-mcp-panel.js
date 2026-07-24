@@ -10582,6 +10582,14 @@ function buildPanel() {
       const panelOwned = sessionFollowsPanel();
       if (refreshed && (panelOwned || isThreadInScope(refreshed, currentTranscriptScopeKey()))) {
         thread = refreshed;
+        // The merge cloned every message — rebind live A2UI cards to the NEW
+        // records by id, or their next action mutates a detached object that
+        // persistThreads no longer writes (codex finding).
+        const byId = new Map((thread.msgs || []).map((m) => [m.id, m]));
+        for (const entry of liveA2uiCards.values()) {
+          const live = byId.get(entry.rec?.id);
+          if (live) entry.rec = live;
+        }
       } else {
         const scopeKey = panelOwned ? null : currentTranscriptScopeKey();
         detachInvalidCurrentThread({ scopeKey, rebind: !panelOwned });
@@ -10636,16 +10644,20 @@ function buildPanel() {
       setActiveThread(currentHistorySelectionKey(), thread.id);
     }
     const now = Date.now();
-    entry = {
-      ...entry,
-      id:
+    // Mutate in place — NEVER clone: callers (appendA2UICard) keep the record
+    // they passed and mutate it later (resolve/dismiss/ui_update). Replacing
+    // it with a spread here detached those mutations from thread.msgs, so card
+    // state silently never persisted (codex finding).
+    if (
+      !(
         typeof entry.id === "string" &&
         entry.id &&
         !Object.hasOwn(thread.deletedMessages || {}, entry.id)
-          ? entry.id
-          : crypto.randomUUID(),
-      createdAt: Number(entry.createdAt) || now,
-    };
+      )
+    ) {
+      entry.id = crypto.randomUUID();
+    }
+    if (!Number(entry.createdAt)) entry.createdAt = now;
     historyStore.touchMessage(entry, now);
     thread.msgs.push(entry);
     if (thread.msgs.length > MAX_THREAD_MSGS) {
