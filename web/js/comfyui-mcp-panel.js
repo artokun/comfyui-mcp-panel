@@ -12013,13 +12013,18 @@ function buildPanel() {
   const THINKING_SAFETY_MS = 120000;
 
   function armSafety() {
-    // (Re)schedule the backstop timer ONLY — deliberately does NOT touch the
-    // silence clock. A repaint/repair/reconnect re-arm must never extend the
-    // 10-minute ceiling; only a genuine turn frame (noteActivity) resets it.
+    // RESET the backstop deadline (cancel + reschedule). ONLY for real activity —
+    // via noteActivity(). A non-activity re-arm must not use this, or repeated
+    // repaints < THINKING_SAFETY_MS apart would postpone the budget check forever.
     if (thinkingSafety) clearTimeout(thinkingSafety);
     thinkingSafety = setTimeout(onThinkingSafety, THINKING_SAFETY_MS);
   }
-  // A real turn frame arrived → reset the silence clock and (re)arm the backstop.
+  function ensureSafety() {
+    // Ensure a backstop is pending WITHOUT resetting an existing deadline — for
+    // non-activity DOM ops (rebuild / re-pin). Preserves the running budget check.
+    if (!thinkingSafety) thinkingSafety = setTimeout(onThinkingSafety, THINKING_SAFETY_MS);
+  }
+  // A real turn frame arrived → reset the silence clock and the backstop deadline.
   function noteActivity() {
     lastActivityAt = Date.now();
     armSafety();
@@ -12161,7 +12166,7 @@ function buildPanel() {
     workWordIdx = 0;
     cycleWord();
     if (!workWordTimer) workWordTimer = setInterval(cycleWord, 2600);
-    armSafety();
+    ensureSafety(); // DOM rebuild — don't postpone the budget check
     scrollLog();
   }
 
@@ -12169,7 +12174,7 @@ function buildPanel() {
   function bumpThinking() {
     if (!thinkingEl) return;
     log.appendChild(thinkingEl);
-    armSafety();
+    ensureSafety(); // re-pin only — don't postpone the budget check
     scrollLog();
   }
 
