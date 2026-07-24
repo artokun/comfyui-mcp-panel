@@ -11190,7 +11190,6 @@ function buildPanel() {
   }
 
   function appendUser(text, opts = {}) {
-    localEndPending = false; // a real send starts a new turn — drop the stale-working guard
     stickToBottom = true; // your own message → always jump to the latest
     newMsgBtn.hidden = true;
     // Capture the rewind anchor NOW (the latest turn's UUID) so a later rewind to
@@ -11314,6 +11313,10 @@ function buildPanel() {
       state: materialize ? "queued" : "sending",
       materialize: materialize || null,
     });
+    // A real user_message is going out → a NEW turn is expected. Drop the
+    // stale-working guard here (NOT in appendUser, which also paints local slash
+    // commands like /help that must NOT re-open the resurrection window).
+    localEndPending = false;
     const ok = client.sendUserMessage(payload.text, payload.context, payload.images, mid);
     if (!ok) setMsgStatus(mid, "failed"); // socket wasn't open — instant fail
     else armDeliveryTimeout(mid);
@@ -12038,6 +12041,15 @@ function buildPanel() {
         thinkingSafety = setTimeout(onThinkingSafety, THINKING_SAFETY_MS);
       }
       return;
+    }
+    // Reaping: we've concluded the turn isn't live (ended, disconnected, or silent
+    // past budget). Terminate it locally too — leaving agentWorking true would keep
+    // the composer "queued" forever and let a repaint/reconnect resurrect a dead
+    // indicator. A turn that IS still alive re-announces via turn:working on
+    // reconnect (localEndPending stays false), which re-shows it.
+    if (agentWorking) {
+      agentWorking = false;
+      ssSet(MID_TASK_KEY, null);
     }
     hideThinking();
   }
