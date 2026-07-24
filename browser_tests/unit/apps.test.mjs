@@ -87,6 +87,17 @@ test("classifyWidget", () => {
   assert.equal(AppBuilder.classifyWidget("Foo", "enabled", true), "toggle");
   assert.equal(AppBuilder.classifyWidget("Foo", "sampler", ["euler", "dpm"]), "combo");
   assert.equal(AppBuilder.classifyWidget("CLIPTextEncode", "text", "hello"), "text");
+  // seed control: seed/noise_seed names get the dedicated 🎲 widget.
+  assert.equal(AppBuilder.classifyWidget("KSampler", "seed", 42), "seed");
+  assert.equal(AppBuilder.classifyWidget("KSamplerAdvanced", "noise_seed", 7), "seed");
+  // color: an explicit color widget type, or a color-named hex-valued string.
+  assert.equal(AppBuilder.classifyWidget("SolidColor", "value", "#ff0000", "color"), "color");
+  assert.equal(AppBuilder.classifyWidget("Node", "background_color", "#00ff00"), "color");
+  // a plain 6-char string that isn't color-named stays text (no false positive).
+  assert.equal(AppBuilder.classifyWidget("Node", "label", "abcdef"), "text");
+  // loader still wins over a seed-ish name; positional (nameless) never seeds.
+  assert.equal(AppBuilder.classifyWidget("VAELoader", "vae_name", "v.pt"), "model");
+  assert.equal(AppBuilder.classifyWidget("KSampler", "", 42), "number");
 });
 
 // ── dependency scan ─────────────────────────────────────────────────────────

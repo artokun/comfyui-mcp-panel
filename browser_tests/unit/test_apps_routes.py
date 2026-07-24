@@ -69,6 +69,50 @@ class SanitizeManifest(unittest.TestCase):
         self.assertEqual(m["appMode"]["inputs"][0]["nodeId"], 6)
         self.assertEqual(m["appMode"]["outputs"], [{"nodeId": 9, "kind": "images"}])
 
+    def test_widget_metadata_kept(self):
+        # min/max/step + seedBehavior + nodeType flow through for the richer
+        # run-form controls; a bool must NOT pose as a numeric bound.
+        m = ar._sanitize_manifest(
+            {
+                "id": UUID,
+                "name": "x",
+                "appMode": {
+                    "inputs": [
+                        {
+                            "nodeId": 3,
+                            "widget": "steps",
+                            "kind": "number",
+                            "min": 1,
+                            "max": 100,
+                            "step": 0.5,
+                        },
+                        {
+                            "nodeId": 3,
+                            "widget": "seed",
+                            "kind": "seed",
+                            "seedBehavior": "randomize",
+                            "control_after_generate": "randomize",
+                            "min": True,  # bool must be dropped, not kept as 1
+                        },
+                        {
+                            "nodeId": 4,
+                            "widget": "ckpt_name",
+                            "kind": "model",
+                            "nodeType": "CheckpointLoaderSimple",
+                        },
+                    ],
+                },
+            }
+        )
+        ins = m["appMode"]["inputs"]
+        self.assertEqual(ins[0]["min"], 1)
+        self.assertEqual(ins[0]["max"], 100)
+        self.assertEqual(ins[0]["step"], 0.5)
+        self.assertEqual(ins[1]["seedBehavior"], "randomize")
+        self.assertEqual(ins[1]["control_after_generate"], "randomize")
+        self.assertNotIn("min", ins[1])  # bool rejected
+        self.assertEqual(ins[2]["nodeType"], "CheckpointLoaderSimple")
+
     def test_truncation(self):
         m = ar._sanitize_manifest({"id": UUID, "name": "n" * 500, "description": "d" * 9000})
         self.assertEqual(len(m["name"]), 120)

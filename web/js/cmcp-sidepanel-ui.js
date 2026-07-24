@@ -24,7 +24,7 @@ import { createLocalContent } from "./cmcp-runpod-ui.js";
 
 // key → content factory + tab presentation. Order = tab-bar order.
 const TABS = [
-  { key: "civitai", label: "Civitai", icon: "pi-images", factory: createCivitaiContent },
+  { key: "civitai", label: "CivitAI", icon: "pi-images", factory: createCivitaiContent },
   { key: "apps", label: "Apps", icon: "pi-th-large", factory: createAppsContent },
   { key: "training", label: "Training", icon: "pi-bolt", factory: createTrainingContent },
   { key: "local", label: "RunPod", icon: "pi-server", factory: createLocalContent },
@@ -264,6 +264,12 @@ export function openSidePanel(ctx = {}, opts = {}) {
   const shell = {
     ctx, overlay, modal, body, searchEl, subnav, extras, head,
     close, applyDock, syncSearch,
+    // Cross-tab hop for content providers (e.g. CivitAI's "Create App from
+    // workflow" jumping to the Apps tab). `reseed` is forwarded to the target
+    // tab's reseed()/factory opt — the same seam the host handle's switchTab uses.
+    // `activate` is a hoisted declaration below, so this closure resolves it at
+    // call time.
+    switchTab: (key, reseed) => activate(key, { reseed }),
     isDocked: () => overlay.classList.contains("cmcp-docked") && !applyDock.centered,
     isCentered: () => applyDock.centered,
   };

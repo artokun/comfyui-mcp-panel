@@ -16,6 +16,21 @@ export const LEVELS = [
   { label: "X", level: 8 },
   { label: "XXX", level: 16 },
 ];
+
+/** Human rating label for an image's `nsfwLevel` bit (1=PG … 16=XXX). An
+ *  nsfwLevel is normally a single bit, but tolerate a combined mask by
+ *  labelling with the HIGHEST rating present (so nothing under-reports). Used
+ *  by the gated-favorite placeholder cards, which show the rating in place of
+ *  the (withheld) media. */
+export function levelLabel(n) {
+  const lvl = Number(n) || 0;
+  const exact = LEVELS.find((l) => l.level === lvl);
+  if (exact) return exact.label;
+  for (let i = LEVELS.length - 1; i >= 0; i--) {
+    if (lvl & LEVELS[i].level) return LEVELS[i].label;
+  }
+  return "?";
+}
 export const PERIODS = ["Day", "Week", "Month", "Year", "AllTime"];
 export const IMAGE_SORTS = ["Most Reactions", "Most Comments", "Most Collected", "Newest", "Oldest"];
 export const MODEL_SORTS = ["Most Downloaded", "Highest Rated", "Most Liked", "Newest", "Oldest"];
@@ -216,6 +231,38 @@ const CDN_TOKEN = "xG1nkqKTMzGDvpLrqFT7WA";
 const _levelFromString = (s) =>
   ({ None: 1, Soft: 2, Mature: 4, X: 8, XXX: 16 }[s] || 1);
 
+// CivitAI's tRPC responses switched from superjson ({json,meta}) to the devalue
+// "flattened" form: result.data is a STRING that parses to a flat array where
+// index 0 is the root and EVERY container value is an integer index into that
+// array (negatives are special values). Our readers all expect result.data.json,
+// so on a string result.data we unflatten and rewrap as { json: <root> }. This
+// is what broke Favorites (the only tab on tRPC image.getInfinite) on prod while
+// the REST-backed tabs kept working. No-op on already-normal / REST responses.
+const _DEVALUE_SPECIAL = { "-1": undefined, "-2": null, "-3": NaN, "-4": Infinity, "-5": -Infinity, "-6": -0 };
+export function unflattenDevalue(flat) {
+  if (!Array.isArray(flat) || flat.length === 0) return flat;
+  const seen = new Array(flat.length);
+  const build = (i) => {
+    if (typeof i === "number" && i < 0) return _DEVALUE_SPECIAL[i];
+    if (typeof i !== "number") return i;
+    if (i in seen) return seen[i];
+    const v = flat[i];
+    if (v === null || typeof v !== "object") { seen[i] = v; return v; }
+    if (Array.isArray(v)) { const a = []; seen[i] = a; for (const e of v) a.push(build(e)); return a; }
+    const o = {}; seen[i] = o; for (const k in v) o[k] = build(v[k]); return o;
+  };
+  return build(0);
+}
+export function normalizeTrpcResponse(data) {
+  const d = data && data.result ? data.result.data : undefined;
+  if (typeof d !== "string") return data; // already {json:…} or a REST/plain response
+  try {
+    const flat = JSON.parse(d);
+    if (Array.isArray(flat)) data.result.data = { json: unflattenDevalue(flat) };
+  } catch { /* not the devalue string form — leave untouched */ }
+  return data;
+}
+
 export class CivitaiClient {
   /** @param {object} api ComfyUI api ({fetchApi, apiURL}) injected by the monolith. */
   constructor(api) {
@@ -234,7 +281,7 @@ export class CivitaiClient {
       body: JSON.stringify({ url, method, body, auth, headers }),
     });
     if (!res.ok) throw new Error(`civitai proxy ${res.status}`);
-    return res.json();
+    return normalizeTrpcResponse(await res.json());
   }
 
   /** Same-origin CDN media URL (usable as <img>/<video> src AND fetchable as a Blob). */
@@ -473,10 +520,10 @@ export class CivitaiClient {
    *  the Newest sort — echoing it back silently drops one item per page
    *  boundary. We continue from the id of the LAST item we received and treat
    *  the server cursor purely as a has-more flag. */
-  async fetchFavorites({ levels = [1, 2, 4, 8, 16], cursor, types, collectionId } = {}) {
+  async fetchFavorites({ levels = [1, 2, 4, 8, 16], cursor, types, collectionId, sort = "Newest", period = "AllTime" } = {}) {
     const input = {
       json: {
-        period: "AllTime", sort: "Newest",
+        period, sort,
         ...(collectionId ? { collectionId } : { reactions: ["Like"] }),
         browsingLevel: bitmask(levels), cursor: cursor ?? null, authed: true,
         limit: 100,
@@ -491,8 +538,13 @@ export class CivitaiClient {
     const items = raw.map((x) => this._fromMeili(x));
     const next = j.nextCursor ?? null;
     if (next == null) return { items, nextCursor: null };
+    // The id-cursor workaround (continue from the last item's id, dodging the
+    // boundary-skip) is only valid for the Newest sort's strict `id < cursor`
+    // keyset. Other sorts key off a different column, so echo the server's own
+    // nextCursor for them instead.
     const lastRawId = Number(raw[raw.length - 1]?.id) || 0;
-    return { items, nextCursor: lastRawId > 0 ? String(lastRawId) : String(next) };
+    const useIdCursor = sort === "Newest" && lastRawId > 0;
+    return { items, nextCursor: useIdCursor ? String(lastRawId) : String(next) };
   }
 
   async fetchModels({ type, sort = "Most Downloaded", period = "Week", baseModels = [], levels = [1], limit = 100, cursor, query, username } = {}) {

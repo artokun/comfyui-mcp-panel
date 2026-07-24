@@ -138,6 +138,9 @@ test("publish → detail → list → search → star → unstar → bundle → 
   await post(`/v1/apps/${APP_ID}/star`, { star_key: "user-1" }); // dup = no-op
   await post(`/v1/apps/${APP_ID}/star`, { star_key: "user-2" });
   assert.equal(((await (await get(`/v1/apps/${APP_ID}`)).json()).app).stars, 2);
+  // /starred reflects each key's own state
+  assert.equal((await (await get(`/v1/apps/${APP_ID}/starred?key=user-1`)).json()).starred, true);
+  assert.equal((await (await get(`/v1/apps/${APP_ID}/starred?key=nobody`)).json()).starred, false);
   await post(`/v1/apps/${APP_ID}/unstar`, { star_key: "user-2" });
   assert.equal(((await (await get(`/v1/apps/${APP_ID}`)).json()).app).stars, 1);
 

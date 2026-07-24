@@ -60,11 +60,12 @@ export default {
       // GET /v1/apps — list/search.
       if (method === "GET" && path === "/v1/apps") return await list(url, env);
 
-      const appMatch = path.match(/^\/v1\/apps\/([0-9a-f-]{36})(\/(star|unstar|ran|report|thumbnail|bundle))?$/);
+      const appMatch = path.match(/^\/v1\/apps\/([0-9a-f-]{36})(\/(star|unstar|starred|ran|report|thumbnail|bundle))?$/);
       if (appMatch) {
         const [, id, , action] = appMatch;
         if (method === "POST" && action === "star") return await star(env, id, request, true);
         if (method === "POST" && action === "unstar") return await star(env, id, request, false);
+        if (method === "GET" && action === "starred") return await starred(env, id, url);
         if (method === "POST" && action === "ran") return await ran(env, id, request);
         if (method === "POST" && action === "report") return await report(env, id, request);
         if (method === "GET" && action === "thumbnail") return await thumbnail(env, id);
@@ -226,6 +227,16 @@ async function star(env, id, request, on) {
     }
   }
   return json({ ok: true, starred: on });
+}
+
+async function starred(env, id, url) {
+  const key = url.searchParams.get("key") || "";
+  if (!/^[0-9a-zA-Z-]{4,64}$/.test(key)) return err(400, "key required");
+  const keyHash = await sha256Hex(key);
+  const row = await env.DB.prepare("SELECT 1 AS x FROM stars WHERE app_id = ? AND user_key = ?")
+    .bind(id, keyHash)
+    .first();
+  return json({ starred: !!row });
 }
 
 async function ran(env, id, request) {
