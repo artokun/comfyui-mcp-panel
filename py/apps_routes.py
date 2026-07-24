@@ -81,6 +81,7 @@ def _bundle_dir(root: str, app_id: str) -> str:
 
 def _atomic_write(path: str, data: bytes) -> None:
     """tmp-then-rename so a crash mid-write can't leave a torn bundle file."""
+    path = os.path.realpath(path)
     tmp = path + ".tmp-" + uuid_module.uuid4().hex[:8]
     with open(tmp, "wb") as fh:
         fh.write(data)
@@ -88,6 +89,7 @@ def _atomic_write(path: str, data: bytes) -> None:
 
 
 def _read_manifest(bdir: str) -> dict:
+    bdir = os.path.realpath(bdir)
     with open(os.path.join(bdir, "manifest.json"), "r", encoding="utf-8") as fh:
         return json.load(fh)
 
