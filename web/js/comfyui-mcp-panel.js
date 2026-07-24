@@ -1161,6 +1161,14 @@ const SETTING_REMOTE_URL = "comfyui-mcp.remoteComfyuiUrl";
 // tester link) — leave "" until a channel opens; its button renders disabled as
 // "coming soon" so the section can ship ahead of the store uploads.
 const SETTING_MOBILE_BETA = "comfyui-mcp.mobileAppBeta";
+// Feature flags for the newer toolbar surfaces — same pattern as the mobile-app
+// beta flag: OFF by default, opt in via Settings. Each gates its nav button (and
+// is relayed to a connected mobile app on connect so its nav matches). Off →
+// the button is hidden; the feature's tools/side-panel are still reachable by the
+// agent, this only controls the manual entry point in the toolbar.
+const SETTING_FLAG_APPS = "comfyui-mcp.featureFlag.apps";
+const SETTING_FLAG_TRAINING = "comfyui-mcp.featureFlag.training";
+const SETTING_FLAG_RUNPOD = "comfyui-mcp.featureFlag.runpod";
 // Session ownership: when TRUE (default), the conversation belongs to the PANEL
 // — switching/saving/renaming/creating workflows never swaps or resets the chat;
 // the agent just gets told (mechanically, on the next message) which canvas it's
@@ -1217,6 +1225,9 @@ const panelHooks = {
   applyStallConfig: null, // () — push the live render-stall threshold to the orchestrator
   applyAgentModelConfig: null, // () — push preferred models + ollama endpoint config
   applyMobileBeta: null, // (bool) — show/hide the header Remote-control (QR) button
+  applyFlagApps: null, // (bool) — show/hide the Apps toolbar button
+  applyFlagTraining: null, // (bool) — show/hide the Training toolbar button
+  applyFlagRunpod: null, // (bool) — show/hide the RunPod/Local toolbar button
   requestSecret: null, // (envKey, friendly)
 };
 // Best-effort guard so a setSetting() we make while seeding/syncing doesn't bounce
@@ -1769,6 +1780,51 @@ function panelSettingsList() {
       onChange: (v) => {
         if (suppressSettingOnChange || !settingsArmed) return;
         panelHooks.applyMobileBeta?.(!!v);
+      },
+    },
+    {
+      id: SETTING_FLAG_APPS,
+      name: "Show Apps",
+      category: cat("Features", "Show Apps"),
+      sortOrder: 147,
+      tooltip:
+        "Show the Apps button in the toolbar — the micro-app layer (convert a workflow into a one-click app, " +
+        "run it locally or on a pod, publish/explore). Off by default; the flag is also sent to a connected mobile app.",
+      type: "boolean",
+      defaultValue: false,
+      onChange: (v) => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyFlagApps?.(!!v);
+      },
+    },
+    {
+      id: SETTING_FLAG_TRAINING,
+      name: "Show Training",
+      category: cat("Features", "Show Training"),
+      sortOrder: 148,
+      tooltip:
+        "Show the Training button in the toolbar — the LoRA training wizard (dataset gather/label/launch/monitor). " +
+        "Off by default; the flag is also sent to a connected mobile app.",
+      type: "boolean",
+      defaultValue: false,
+      onChange: (v) => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyFlagTraining?.(!!v);
+      },
+    },
+    {
+      id: SETTING_FLAG_RUNPOD,
+      name: "Show RunPod / Local",
+      category: cat("Features", "Show RunPod / Local"),
+      sortOrder: 149,
+      tooltip:
+        "Show the RunPod / Local host button in the toolbar — deploy/start/stop/connect a cloud GPU pod, or switch " +
+        "back to local. Off by default; the flag is also sent to a connected mobile app.",
+      type: "boolean",
+      defaultValue: false,
+      onChange: (v) => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyFlagRunpod?.(!!v);
       },
     },
     {
@@ -10424,6 +10480,20 @@ function buildPanel() {
   toolbarSpacer.className = "cmcp-spacer";
   toolbar.append(deafenBtn, blindBtn, toolbarSpacer, civitaiBtn, appsBtn, trainingBtn, runpodBtn);
 
+  // Feature-flag the newer toolbar surfaces (Apps / Training / RunPod). Hidden by
+  // default; opt in via Settings › Features. Inline display (not the `hidden`
+  // attribute) for the same reason as the mobile-beta button — the button's own
+  // `display` rule outranks `[hidden]`. The flag state is also relayed to a
+  // connected mobile app on connect (see the flags push below), so its nav bar
+  // matches — with Chat kept centered regardless of how many are hidden.
+  const flagVisibility = (btn) => (on) => { btn.style.display = on ? "" : "none"; };
+  panelHooks.applyFlagApps = flagVisibility(appsBtn);
+  panelHooks.applyFlagTraining = flagVisibility(trainingBtn);
+  panelHooks.applyFlagRunpod = flagVisibility(runpodBtn);
+  panelHooks.applyFlagApps(getSetting(SETTING_FLAG_APPS) === true);
+  panelHooks.applyFlagTraining(getSetting(SETTING_FLAG_TRAINING) === true);
+  panelHooks.applyFlagRunpod(getSetting(SETTING_FLAG_RUNPOD) === true);
+
   row.append(ring, ctxLabel, modelChip, spacer, attachBtn, micBtn, sendBtn);
   form.append(menuPop, modelPop, attachBar, input, row, fileInput);
   root.appendChild(form);
@@ -15759,6 +15829,9 @@ function buildPanel() {
       panelHooks.applyStallConfig = null;
       panelHooks.applyAgentModelConfig = null;
       panelHooks.applyMobileBeta = null;
+      panelHooks.applyFlagApps = null;
+      panelHooks.applyFlagTraining = null;
+      panelHooks.applyFlagRunpod = null;
       panelHooks.requestSecret = null;
       client.destroy();
       if (liveBridgeClient === client) liveBridgeClient = null;
