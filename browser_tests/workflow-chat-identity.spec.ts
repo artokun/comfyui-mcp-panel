@@ -119,7 +119,7 @@ test('default mode opens pre-upgrade history without re-keying it', async ({
   ])
 })
 
-test('settings hydration cannot rewrite a workflow thread or clear the live session', async ({
+test('settings hydration never adopts a loose session into a workflow thread', async ({
   page,
   panel,
   mockBridge
@@ -155,21 +155,36 @@ test('settings hydration cannot rewrite a workflow thread or clear the live sess
   await panel.setBridgeUrl(mockBridge.url)
   await panel.connect()
 
-  const state = await page.evaluate(({ threadsKey, sessionKey }) => ({
-    sessionId: sessionStorage.getItem(sessionKey),
-    threads: JSON.parse(localStorage.getItem(threadsKey) || '[]')
-  }), { threadsKey: THREADS_KEY, sessionKey: SESSION_KEY })
-  expect(state.sessionId).toBe('live-tab-session')
-  expect(state.threads.find((t: any) => t.id === 'workflow-before-hydration')?.workflowKey)
-    .toBe('workflow:existing-scope')
-  const greetingThread = state.threads.find((t: any) =>
-    t.msgs?.some((m: any) => m.text === 'Panel agent ready.'))
-  expect(greetingThread?.workflowKey).toMatch(/^workflow:/)
-  expect(greetingThread?.sessionId).toBe('live-tab-session')
+  // #106's contract: a workflow-scoped conversation NEVER adopts a loose tab
+  // session — its session must arrive through a thread selected for its exact
+  // scope. Hydration clears the loose key instead of binding it to the wrong
+  // conversation, and the new greeting thread starts fresh without it.
+  await expect
+    .poll(async () => {
+      const state = await page.evaluate(({ threadsKey, sessionKey }) => ({
+        sessionId: sessionStorage.getItem(sessionKey),
+        threads: JSON.parse(localStorage.getItem(threadsKey) || '[]')
+      }), { threadsKey: THREADS_KEY, sessionKey: SESSION_KEY })
+      const greeting = state.threads.find((t: any) =>
+        t.msgs?.some((m: any) => m.text === 'Panel agent ready.'))
+      return {
+        sessionId: state.sessionId,
+        beforeScope: state.threads.find((t: any) => t.id === 'workflow-before-hydration')?.workflowKey,
+        greetingScope: greeting?.workflowKey ?? null,
+        greetingSession: greeting?.sessionId ?? null
+      }
+    }, { timeout: 15_000 })
+    .toEqual({
+      sessionId: null,
+      beforeScope: 'workflow:existing-scope',
+      greetingScope: expect.stringMatching(/^workflow:/) as unknown as string,
+      greetingSession: null
+    })
 })
 
 test('embeds a workflow UUID and blocks a foreign transcript pointer', async ({
   page,
+  context,
   panel,
   mockBridge
 }) => {
@@ -208,17 +223,30 @@ test('embeds a workflow UUID and blocks a foreign transcript pointer', async ({
   expect(current.uuid).toMatch(/^[0-9a-f-]{36}$/i)
   expect(current.thread?.workflowKey).toBe(`workflow:${current.uuid}`)
 
-  await page.evaluate(({ threadsKey, currentThreadKey }) => {
-    const threads = JSON.parse(localStorage.getItem(threadsKey) || '[]')
-    threads.push({
-      id: 'foreign-thread',
-      ts: Date.now() + 10,
-      workflowKey: 'workflow:definitely-another-workflow',
-      msgs: [{ role: 'user', text: 'must never restore on this workflow' }]
-    })
-    localStorage.setItem(threadsKey, JSON.stringify(threads))
-    sessionStorage.setItem(currentThreadKey, 'foreign-thread')
+  // A foreign (other-workflow) thread arrives the way foreign threads really
+  // do in this architecture: another tab writes it through the store, landing
+  // in the shared canonical. (Direct localStorage writes are just this tab's
+  // own cache and are legitimately overwritten by the owning panel's flush.)
+  const otherTab = await context.newPage()
+  await otherTab.goto(page.url())
+  await otherTab.evaluate(async ({ threadsKey, currentThreadKey }) => {
+    const storeModuleUrl = '/extensions/comfyui-agent-panel/js/lib/chat-history-store.js'
+    const { ChatHistoryStore } = await import(storeModuleUrl)
+    const foreignStore = new ChatHistoryStore({ writerId: 'foreign-tab-test' })
+    const existing = JSON.parse(localStorage.getItem(threadsKey) || '[]')
+    foreignStore.persist([
+      ...existing,
+      {
+        id: 'foreign-thread',
+        ts: Date.now() + 10,
+        workflowKey: 'workflow:definitely-another-workflow',
+        msgs: [{ id: 'foreign-msg-1', role: 'user', text: 'must never restore on this workflow' }]
+      }
+    ], {})
+    await foreignStore.flush()
+    await foreignStore.close?.()
   }, { threadsKey: THREADS_KEY, currentThreadKey: CURRENT_THREAD_KEY })
+  await otherTab.close()
 
   await page.reload()
   await panel.openSidebar()

@@ -11861,13 +11861,21 @@ function buildPanel() {
       });
       item.append(i, lbl, when);
       const foreignWorkflow = !sessionFollowsPanel() && !isThreadInScope(t, currentTranscriptScopeKey());
+      // legacyShadow threads are read-only in EVERY mode: fenced out of the
+      // canonical, opening one for editing would build a conversation that can
+      // never become durable (codex finding). View it; don't resume it.
+      const legacyReadonly = t.legacyShadow === true;
       if (foreignWorkflow) {
         item.disabled = true;
         item.title = "Open this chat's workflow before resuming it";
         row.classList.add("foreign-workflow");
+      } else if (legacyReadonly) {
+        item.disabled = true;
+        item.title = "A pre-upgrade copy kept for reference — it can't be resumed";
+        row.classList.add("foreign-workflow");
       }
       item.addEventListener("click", () => {
-        if (foreignWorkflow) return;
+        if (foreignWorkflow || legacyReadonly) return;
         histPop.hidden = true;
         loadThread(t);
       });
