@@ -164,10 +164,14 @@ async function list(url, env) {
   });
 }
 
+const DETAIL_QUERIES = {
+  "a.id": "SELECT a.*, 0 AS score FROM apps a WHERE a.id = ? AND hidden = 0",
+  "a.slug": "SELECT a.*, 0 AS score FROM apps a WHERE a.slug = ? AND hidden = 0",
+};
 async function detailRow(env, by, value) {
-  const row = await env.DB.prepare(`SELECT a.*, 0 AS score FROM apps a WHERE ${by} = ? AND hidden = 0`)
-    .bind(value)
-    .first();
+  const sql = DETAIL_QUERIES[by];
+  if (!sql) throw { status: 400, message: "invalid lookup column" };
+  const row = await env.DB.prepare(sql).bind(value).first();
   if (!row) throw { status: 404, message: "app not found" };
   return row;
 }
