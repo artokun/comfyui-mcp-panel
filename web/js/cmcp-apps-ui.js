@@ -112,7 +112,7 @@ function injectStyle() {
 .cmcp-btn.danger{border-color:rgba(248,113,113,0.5);color:#f87171;}
 /* ── Dependency side-panel (models + custom-node packs) ──────────────────── */
 .cmcp-deps{display:flex;flex-direction:column;gap:0.75rem;border:1px solid var(--p-content-border-color,#3f3f46);
-  border-radius:10px;padding:0.6rem 0.7rem;background:var(--p-surface-950,#111113);}
+  border-radius:10px;padding:0.6rem 0.7rem;background:var(--p-surface-950,#111113);flex:0 0 260px;}
 .cmcp-deps-sec{display:flex;flex-direction:column;}
 .cmcp-deps-h{font-size:0.7rem;font-weight:700;opacity:0.8;text-transform:uppercase;letter-spacing:0.04em;
   padding-bottom:0.25rem;}
@@ -133,6 +133,16 @@ function injectStyle() {
   border-top-color:var(--p-primary-color,#60a5fa);border-radius:50%;display:inline-block;
   animation:cmcp-deps-spin 0.7s linear infinite;}
 @keyframes cmcp-deps-spin{to{transform:rotate(360deg);}}
+/* Detail layout (form + deps side-panel) + the title star icon. */
+.cmcp-apps-main{display:flex;gap:1rem;align-items:flex-start;min-height:0;}
+.cmcp-apps-main>.grow{flex:1;min-width:0;display:flex;flex-direction:column;gap:0.75rem;}
+@media (max-width:720px){.cmcp-apps-main{flex-direction:column;}.cmcp-deps{flex:1 1 auto;width:100%;}}
+.cmcp-apps-title-row{display:flex;align-items:center;gap:0.45rem;}
+.cmcp-apps-starbtn{border:none;background:none;color:inherit;font-size:1.05rem;cursor:pointer;padding:0 0.1rem;line-height:1;}
+.cmcp-apps-starbtn:hover{color:#facc15;}
+.cmcp-apps-starbtn.starred{color:#facc15;}
+.cmcp-apps-starbtn:disabled{opacity:0.4;cursor:default;}
+.cmcp-apps-starcount{font-size:0.78rem;opacity:0.7;}
 `;
   const el = document.createElement("style");
   el.textContent = css;
@@ -952,6 +962,46 @@ export function createAppsContent(ctx, shell, opts = {}) {
 
   // ── Registry app detail (install view) ───────────────────────────────────
 
+  /** Silent, idempotent install of a registry bundle as a local app. The
+   *  registry id becomes the local id; an already-installed copy is left
+   *  alone (its published marker is refreshed so Update-published works). */
+  async function installRegistryBundle(regApp, bundle) {
+    let thumbnail_b64;
+    try {
+      const res = await fetch(registry.thumbnailUrl(regApp.id));
+      if (res.ok) {
+        const buf = new Uint8Array(await res.arrayBuffer());
+        let bin = "";
+        for (const b of buf) bin += String.fromCharCode(b);
+        thumbnail_b64 = btoa(bin);
+      }
+    } catch { /* no thumbnail — fine */ }
+    try {
+      await client.create({
+        manifest: {
+          ...bundle.manifest,
+          source: { type: "registry", workflowUuid: null, registryId: regApp.id },
+          published: { registryId: regApp.id, slug: regApp.slug, publishedVersion: regApp.version },
+        },
+        prompt: bundle.prompt,
+        ...(bundle.workflow ? { workflow: bundle.workflow } : {}),
+        ...(thumbnail_b64 ? { thumbnail_b64 } : {}),
+      });
+    } catch (e) {
+      if (!/already exists/.test(e.message || "")) throw e;
+      // Already installed — refresh the published marker so the detail's
+      // update path tracks the registry version the user is looking at.
+      try {
+        await client.update(regApp.id, {
+          manifest: { published: { registryId: regApp.id, slug: regApp.slug, publishedVersion: regApp.version } },
+        });
+      } catch { /* older copy without the app — proceed to detail anyway */ }
+    }
+  }
+
+  /** Registry app view: NO install gate — the bundle installs silently on
+   *  open and the local detail shows immediately (inputs right away). Deps
+   *  are visible in the Requirements panel before the first run. */
   async function showRegistryDetail(regApp) {
     if (closed) return;
     body.textContent = "";
@@ -959,131 +1009,14 @@ export function createAppsContent(ctx, shell, opts = {}) {
     const back = makeBtn("← Explore");
     back.addEventListener("click", () => { _tab = "explore"; showGrid().catch(showError); });
     bar.append(back);
-    body.append(bar);
-
-    const detail = el("div", "cmcp-apps-detail");
-    const head = el("div", "cmcp-apps-detail-head");
-    const thumb = el("div", "thumb", "▶");
-    thumb.style.backgroundImage = `url("${registry.thumbnailUrl(regApp.id)}")`;
-    thumb.textContent = "";
-    const titles = el("div", "titles");
-    titles.append(el("h3", "", regApp.name || "Untitled"));
-    titles.append(el("div", "desc", `by ${regApp.creator || "anonymous"} · ★ ${regApp.stars || 0} · ${regApp.runs || 0} runs · v${regApp.version || 1}`));
-    if (regApp.description) titles.append(el("div", "desc", regApp.description));
-    head.append(thumb, titles);
-    detail.append(head);
-
-    if (regApp.hide_workflow) {
-      detail.append(
-        el(
-          "div",
-          "cmcp-apps-warn",
-          "Hidden workflow (best effort): the graph is never distributed with this app — but anyone technical " +
-            "who runs it can still intercept the prompt via ComfyUI's API. Real protection comes with hosted runs (coming soon).",
-        ),
-      );
+    body.append(bar, el("div", "cmcp-apps-empty", "Preparing…"));
+    try {
+      const bundle = await registry.bundle(regApp.id);
+      await installRegistryBundle(regApp, bundle);
+    } catch (e) {
+      return showError(e);
     }
-
-    const actions = el("div", "cmcp-apps-runbar");
-    const installBtn = makeBtn("⬇ Install", { primary: true });
-    const starBtn = makeBtn("☆ Star");
-    const status = el("span", "cmcp-apps-status");
-    actions.append(installBtn, starBtn, status);
-    detail.append(actions);
-
-    // Dependency side-panel. The registry bundle carries manifest.deps + the API
-    // prompt; memoise it so the Install handler reuses this same fetch.
-    let _regBundleP = null;
-    const getRegBundle = () => (_regBundleP ||= registry.bundle(regApp.id));
-    const depsHost = el("div");
-    depsHost.append(el("div", "cmcp-deps-note", "Loading dependencies…"));
-    detail.append(depsHost);
-    getRegBundle()
-      .then((bundle) => {
-        if (closed || !depsHost.isConnected) return;
-        depsHost.textContent = "";
-        const deps = bundle.manifest?.deps || {};
-        renderDepsPanel(depsHost, {
-          models: deps.models,
-          customNodes: deps.customNodes,
-          getWorkflow: () => bundle.prompt || null,
-        });
-      })
-      .catch((e) => {
-        if (closed || !depsHost.isConnected) return;
-        depsHost.textContent = "";
-        depsHost.append(el("div", "cmcp-deps-note", `Couldn't load dependencies: ${e.message}`));
-      });
-
-    body.append(detail);
-
-    let starred = false;
-    starBtn.addEventListener("click", async () => {
-      starred = !starred;
-      starBtn.textContent = starred ? "★ Starred" : "☆ Star";
-      try {
-        await registry.star(regApp.id, starred);
-      } catch (e) {
-        status.textContent = e.message;
-        status.classList.add("err");
-      }
-    });
-
-    installBtn.addEventListener("click", async () => {
-      installBtn.disabled = true;
-      status.classList.remove("err");
-      try {
-        status.textContent = "Fetching bundle…";
-        const bundle = await getRegBundle();
-        const deps = bundle.manifest?.deps || {};
-        const models = Array.isArray(deps.models) ? deps.models : [];
-        const nodes = Array.isArray(deps.customNodes) ? deps.customNodes : [];
-        if (models.length || nodes.length) {
-          const ok = await confirmModal({
-            title: `Install “${regApp.name}”`,
-            message:
-              (models.length ? `Models (${models.length}):\n  ${models.map((m) => m.name || m).join("\n  ")}\n\n` : "") +
-              (nodes.length ? `Custom nodes (${nodes.length}):\n  ${nodes.join("\n  ")}\n\n` : "") +
-              "Anything missing must be installed before the app can run (ask the agent to install it, or install it yourself).",
-            confirmLabel: "Install",
-          });
-          if (!ok) {
-            installBtn.disabled = false;
-            status.textContent = "";
-            return;
-          }
-        }
-        status.textContent = "Installing…";
-        let thumbnail_b64;
-        try {
-          const res = await fetch(registry.thumbnailUrl(regApp.id));
-          if (res.ok) {
-            const buf = new Uint8Array(await res.arrayBuffer());
-            let bin = "";
-            for (const b of buf) bin += String.fromCharCode(b);
-            thumbnail_b64 = btoa(bin);
-          }
-        } catch { /* no thumbnail — fine */ }
-        await client.create({
-          manifest: {
-            ...bundle.manifest,
-            source: { type: "registry", workflowUuid: null, registryId: regApp.id },
-            published: { registryId: regApp.id, slug: regApp.slug, publishedVersion: regApp.version },
-          },
-          prompt: bundle.prompt,
-          ...(bundle.workflow ? { workflow: bundle.workflow } : {}),
-          ...(thumbnail_b64 ? { thumbnail_b64 } : {}),
-        });
-        _tab = "mine";
-        await showDetail(regApp.id);
-      } catch (e) {
-        status.textContent = e.message.includes("already exists")
-          ? "Already installed — find it in My Apps."
-          : e.message;
-        status.classList.add("err");
-        installBtn.disabled = false;
-      }
-    });
+    await showDetail(regApp.id, regApp);
   }
 
   // ── Convert view ─────────────────────────────────────────────────────────
@@ -1229,14 +1162,17 @@ export function createAppsContent(ctx, shell, opts = {}) {
 
   // ── Detail view ──────────────────────────────────────────────────────────
 
-  async function showDetail(id) {
+  async function showDetail(id, regCtx = null) {
     const app = await client.get(id);
     if (closed) return;
     body.textContent = "";
 
     const bar = el("div", "cmcp-apps-toolbar");
-    const back = makeBtn("← My Apps");
-    back.addEventListener("click", () => showGrid().catch(showError));
+    const back = makeBtn(regCtx ? "← Explore" : "← My Apps");
+    back.addEventListener("click", () => {
+      if (regCtx) _tab = "explore";
+      showGrid().catch(showError);
+    });
     bar.append(back);
     body.append(bar);
 
@@ -1248,7 +1184,47 @@ export function createAppsContent(ctx, shell, opts = {}) {
       thumb.textContent = "";
     }
     const titles = el("div", "titles");
-    titles.append(el("h3", "", app.name || "Untitled app"));
+    // Title row: name + (registry apps) a star icon right beside it.
+    const titleRow = el("div", "cmcp-apps-title-row");
+    titleRow.append(el("h3", "", app.name || "Untitled app"));
+    if (regCtx) {
+      const starBtn = el("button", "cmcp-apps-starbtn", "☆");
+      starBtn.type = "button";
+      starBtn.title = "Star this app";
+      const starCount = el("span", "cmcp-apps-starcount", String(regCtx.stars || 0));
+      let starred = false;
+      let count = Number(regCtx.stars || 0);
+      const paint = () => {
+        starBtn.textContent = starred ? "★" : "☆";
+        starBtn.classList.toggle("starred", starred);
+        starCount.textContent = String(count);
+      };
+      // No clicks until the real state arrives — a click while the lookup is
+      // in flight would toggle from the WRONG initial value (star instead of
+      // unstar, corrupting the count — codex finding).
+      starBtn.disabled = true;
+      registry.starred(regCtx.id).then((r) => {
+        starred = !!r?.starred;
+        paint();
+      }).catch(() => {})
+        .finally(() => {
+          starBtn.disabled = false;
+        });
+      starBtn.addEventListener("click", async () => {
+        starred = !starred;
+        count = Math.max(0, count + (starred ? 1 : -1));
+        paint();
+        try {
+          await registry.star(regCtx.id, starred);
+        } catch { /* star is cosmetic — the count resyncs on next open */ }
+      });
+      paint();
+      titleRow.append(starBtn, starCount);
+    }
+    titles.append(titleRow);
+    if (regCtx) {
+      titles.append(el("div", "desc", `by ${regCtx.creator || "anonymous"} · ${regCtx.runs || 0} runs · v${regCtx.version || 1}`));
+    }
     if (app.description) titles.append(el("div", "desc", app.description));
     head.append(thumb, titles);
     detail.append(head);
@@ -1265,16 +1241,16 @@ export function createAppsContent(ctx, shell, opts = {}) {
       );
     }
 
-    // Dependency side-panel — required models + node packs, each ✓ or an action.
-    // The prompt (API snapshot) lives in the bundle, not the detail record, so
-    // the node section fetches it lazily (only when the bridge is connected).
+    // Dependency side-panel — required models + node packs, each ✓ or an
+    // action. ONE renderDepsPanel, mounted as the right-hand column of the
+    // detail layout (the merge briefly had two: this one and a duplicate
+    // after the form). The prompt (API snapshot) lives in the bundle, not the
+    // detail record, so the node section fetches it lazily.
+    const deps = app.deps || {};
+    const hasDeps =
+      (Array.isArray(deps.models) && deps.models.length > 0) ||
+      (Array.isArray(deps.customNodes) && deps.customNodes.length > 0);
     const depsHost = el("div");
-    detail.append(depsHost);
-    renderDepsPanel(depsHost, {
-      models: app.deps?.models,
-      customNodes: app.deps?.customNodes,
-      getWorkflow: () => client.bundle(app.id).then((b) => (b && b.prompt) || null).catch(() => null),
-    });
 
     // Generated input form.
     const form = el("div", "cmcp-apps-form");
@@ -1440,7 +1416,22 @@ export function createAppsContent(ctx, shell, opts = {}) {
     form.append(runRow);
 
     const outputs = el("div", "cmcp-apps-outputs");
-    detail.append(form, outputs);
+
+    // ONE deps panel, right-hand column (declared above; registry installs see
+    // it before their first run, replacing the old install-gate consent).
+    const main = el("div", "cmcp-apps-main");
+    const grow = el("div", "grow");
+    grow.append(form, outputs);
+    main.append(grow);
+    if (hasDeps) {
+      renderDepsPanel(depsHost, {
+        models: deps.models,
+        customNodes: deps.customNodes,
+        getWorkflow: () => client.bundle(app.id).then((b) => (b && b.prompt) || null).catch(() => null),
+      });
+      main.append(depsHost);
+    }
+    detail.append(main);
     body.append(detail);
 
     // Management row (metadata edit, publish, hide, delete) — below the fold.

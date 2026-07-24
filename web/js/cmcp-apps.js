@@ -91,6 +91,9 @@ export class RegistryClient {
   star(id, on = true) {
     return this._req("POST", `/v1/apps/${id}/${on ? "star" : "unstar"}`, { star_key: starKey() });
   }
+  starred(id) {
+    return this._req("GET", `/v1/apps/${id}/starred?key=${encodeURIComponent(starKey())}`);
+  }
   ran(id) {
     return this._req("POST", `/v1/apps/${id}/ran`, { star_key: starKey() }).catch(() => {});
   }
