@@ -1501,3 +1501,80 @@ test('legacy-idless shadow-only threads are retained in the shadow, fenced out o
     'legacyShadow threads must never enter the fenced canonical',
   )
 })
+
+test('canonical commits keep quarantined threads in the local shadow (codex P1: shadow erasure)', async () => {
+  const now = Date.now()
+  const canonical = {
+    schemaVersion: CHAT_HISTORY_SCHEMA,
+    updatedAt: now - 1000,
+    meta: {
+      checkpoint: { generation: 3, revision: { updatedAt: now - 1000, writerId: 'w1', sequence: 1 } },
+      activeByScope: {},
+      workflowAliases: {}
+    },
+    threads: []
+  }
+  const storage = createMemoryStorage()
+  const indexedDb = createFakeIndexedDb(canonical)
+  const store = new ChatHistoryStore({ storage, indexedDb })
+  storage.setItem('comfyui-mcp.panel.threads', JSON.stringify([
+    { id: 'foreign-thread', ts: now + 10, workflowKey: 'workflow:other',
+      msgs: [{ role: 'user', text: 'legacy content with no ids' }] }
+  ]))
+
+  await store.load({ protectedThreadIds: ['foreign-thread'] })
+  await store.flush()
+
+  // After a SUCCESSFUL canonical commit, the localStorage shadow must still
+  // carry the quarantined thread (a canonical-only shadow would erase it).
+  const shadowThreads = JSON.parse(storage.values.get('comfyui-mcp.panel.threads'))
+  assert.ok(
+    shadowThreads.some((thread) => thread.id === 'foreign-thread'),
+    'quarantined threads must survive the post-commit shadow rewrite',
+  )
+  // …and remain excluded from canonical.
+  const canonicalAfter = indexedDb.readState()
+  assert.equal(
+    (canonicalAfter?.threads || []).some((thread) => thread?.id === 'foreign-thread'),
+    false,
+  )
+})
+
+test('the shadow cap exempts legacyShadow threads (their only copy)', async () => {
+  const now = Date.now()
+  const storage = createMemoryStorage()
+  const indexedDb = createFakeIndexedDb({
+    schemaVersion: CHAT_HISTORY_SCHEMA,
+    updatedAt: now - 1000,
+    meta: { checkpoint: { generation: 3, revision: { updatedAt: now - 1000, writerId: 'w1', sequence: 1 } } },
+    threads: []
+  })
+  const store = new ChatHistoryStore({ storage, indexedDb })
+  // A fully legacy (idless) shadow: 19 normal + 1 foreign = the 20-thread cap
+  // exactly. Without the exemption the oldest could still be evicted because
+  // legacyShadow threads are canonical-excluded (the shadow is their ONLY copy).
+  const many = Array.from({ length: 19 }, (_, i) => ({
+    id: `t${i}`, workflowKey: 'workflow:a', createdAt: now - i, updatedAt: now - i,
+    msgs: [{ role: 'user', text: `legacy msg ${i}`, createdAt: now - i }]
+  }))
+  storage.setItem('comfyui-mcp.panel.threads', JSON.stringify([
+    ...many,
+    { id: 'foreign-thread', ts: 1, workflowKey: 'workflow:other',
+      msgs: [{ role: 'user', text: 'legacy content' }] }
+  ]))
+
+  await store.load({})
+  await store.flush()
+
+  const shadowThreads = JSON.parse(storage.values.get('comfyui-mcp.panel.threads'))
+  assert.ok(
+    shadowThreads.some((thread) => thread.id === 'foreign-thread'),
+    'the shadow cap must never evict a quarantined thread',
+  )
+  // And every quarantined thread keeps its shadow copy (none merged into canonical).
+  const canonicalAfter = indexedDb.readState()
+  assert.equal(
+    (canonicalAfter?.threads || []).some((thread) => thread?.id === 'foreign-thread'),
+    false,
+  )
+})

@@ -814,6 +814,11 @@ function mergeUnderCanonicalCheckpoint(canonical, ...untrusted) {
         .map((thread) => thread?.id)
         .filter(Boolean),
     );
+    // Whole-snapshot quarantine: the flag exists because a stale pre-v3 writer
+    // re-hashes shifted ordinals, so NOTHING in a flagged snapshot can be
+    // deduped safely (persist() assigns ids BEFORE this point — checking
+    // message ids here would wrongly admit them). Canonical-covered threads
+    // are excluded: the canonical copy wins and must not be duplicated.
     quarantined = untrusted
       .filter((snapshot) => snapshot?.[LEGACY_IDLESS_SOURCE] === true)
       .flatMap((snapshot) => (Array.isArray(snapshot?.threads) ? snapshot.threads : []))
@@ -931,21 +936,24 @@ async function idbMergeWrite(indexedDb, snapshot, limits) {
       const tx = db.transaction("snapshots", "readwrite");
       const store = tx.objectStore("snapshots");
       const get = store.get(CHAT_HISTORY_STATE_KEY);
-      // legacyShadow threads never enter canonical (the schema-3 fence) — they
-      // live only in the local shadow until the user migrates or deletes them.
+      // legacyShadow threads never enter canonical (the schema-3 fence). But
+      // the RESOLVED snapshot must keep them — persist() rewrites the local
+      // shadow from this result, and a canonical-only result would erase the
+      // very threads the quarantine exists to retain (codex finding).
       const withoutLegacyShadow = (snap) =>
         snap && Array.isArray(snap.threads)
           ? { ...snap, threads: snap.threads.filter((thread) => !thread?.legacyShadow) }
           : snap;
-      let merged = compactSnapshot(boundedSnapshot(withoutLegacyShadow(withoutCheckpoint(snapshot)), limits), limits);
+      let merged = compactSnapshot(boundedSnapshot(withoutCheckpoint(snapshot), limits), limits);
       get.onsuccess = () => {
+        const mergeResult = mergeUnderCanonicalCheckpoint(get.result, snapshot);
         merged = compactSnapshot(
-          boundedSnapshot(withoutLegacyShadow(mergeUnderCanonicalCheckpoint(get.result, snapshot)), limits),
+          boundedSnapshot(mergeResult, limits),
           limits,
         );
-        store.put(merged, CHAT_HISTORY_STATE_KEY);
+        store.put(withoutLegacyShadow(merged), CHAT_HISTORY_STATE_KEY);
       };
-      get.onerror = () => store.put(merged, CHAT_HISTORY_STATE_KEY);
+      get.onerror = () => store.put(withoutLegacyShadow(merged), CHAT_HISTORY_STATE_KEY);
       tx.oncomplete = () => resolve(merged);
       tx.onerror = () => resolve(null);
       tx.onabort = () => resolve(null);
@@ -1125,7 +1133,11 @@ export class ChatHistoryStore {
     try {
       const local = { threads: Array.isArray(threads) ? threads : [], meta };
       const normalized = mergeHistorySnapshots(quarantineCheckpoint ? withoutCheckpoint(local) : local);
-      if (hasIdlessMessages(local.threads)) normalized[LEGACY_IDLESS_SOURCE] = true;
+      // Same dual condition as persist(): raw idlessness (pre-v3 shadows) and
+      // legacyShadow (already-fenced content) both keep the snapshot fenced.
+      if (hasIdlessMessages(local.threads) || local.threads.some((t) => t?.legacyShadow === true)) {
+        normalized[LEGACY_IDLESS_SOURCE] = true;
+      }
       return normalized;
     } catch {
       return mergeHistorySnapshots({ threads: [], meta: {} });
@@ -1154,10 +1166,19 @@ export class ChatHistoryStore {
   }
 
   _writeLocalSnapshot(snapshot, protectedThreadIds) {
+    // legacyShadow threads are exempt from the shadow cap: excluded from
+    // IndexedDB by the fence, the shadow copy is their ONLY copy — eviction
+    // would be silent data loss (codex finding).
+    const protectedWithLegacy = [
+      ...protectedThreadIds,
+      ...(Array.isArray(snapshot.threads) ? snapshot.threads : [])
+        .filter((thread) => thread?.legacyShadow && typeof thread.id === "string")
+        .map((thread) => thread.id),
+    ];
     const shadow = retainBoundedThreads(
       snapshot.threads,
       LOCAL_SHADOW_THREADS,
-      protectedThreadIds,
+      protectedWithLegacy,
     ).map((thread) => ({ ...thread, msgs: thread.msgs.slice(-LOCAL_SHADOW_MESSAGES) }));
     const localSnapshot = { ...snapshot, threads: shadow };
     try {
@@ -1186,7 +1207,14 @@ export class ChatHistoryStore {
   persist(threads, meta = {}, options = {}) {
     if (this._closed) return this._lastCommitted || mergeHistorySnapshots({ threads, meta });
     const freshSnapshot = mergeHistorySnapshots({ threads, meta });
-    if (hasIdlessMessages(threads)) freshSnapshot[LEGACY_IDLESS_SOURCE] = true;
+    // Flag on raw idlessness (legacy pre-v3 writers) AND on legacyShadow threads
+    // (already-fenced content): normalization assigns ids BEFORE this point, so
+    // without the legacyShadow check a quarantined thread would launder through
+    // the fence into canonical on the very next persist.
+    if (hasIdlessMessages(threads) ||
+        (Array.isArray(threads) && threads.some((t) => t?.legacyShadow === true))) {
+      freshSnapshot[LEGACY_IDLESS_SOURCE] = true;
+    }
     const snapshot = this._dirtyWrite
       ? mergeHistorySnapshots(this._dirtyWrite.snapshot, freshSnapshot)
       : freshSnapshot;
