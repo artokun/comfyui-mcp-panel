@@ -6818,7 +6818,7 @@ function redactBridgeUrl(u) {
   }
 }
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -7198,6 +7198,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       // turn incl. silent tool work; done clears it).
       if (msg && msg.type === "turn" && typeof msg.state === "string") {
         onTurn?.(msg.state);
+      }
+      // The tool/operation the agent is currently running (e.g.
+      // "panel.panel_query_graph") → live activity label on the working
+      // indicator, so a long SILENT tool phase shows progress instead of
+      // looking idle. Emitted throughout a turn; cleared on turn:done.
+      if (msg && msg.type === "action" && typeof msg.name === "string") {
+        onAction?.(msg.name);
       }
       // Live download progress for the status tray (sourced orchestrator-side
       // from the download tool's temp progress file and/or the Manager queue).
@@ -11388,8 +11395,17 @@ function buildPanel() {
     // claiming success; and a stale unresolved surface:"wide" entry would keep
     // the sidebar wide forever. Cards replay INERT from the thread instead.
     liveA2uiCards.clear();
+    // The thinking indicator lived in `log` and was just detached along with
+    // everything else. Drop the stale refs — otherwise a later showThinking()
+    // sees a truthy-but-detached thinkingEl and silently no-ops, hiding a live
+    // turn's progress (reachable when an async history/thread repaint runs mid
+    // turn). If a turn is still authoritative, recreate the indicator so it
+    // stays visible; loadThread re-pins it below the repainted messages.
+    thinkingEl = null;
+    thinkingLabel = null;
     setChatSurfaceForCards();
     log.appendChild(empty);
+    if (agentWorking) showThinking();
   }
 
   function newChat() {
@@ -11424,6 +11440,9 @@ function buildPanel() {
         else paintCard(m);
       }
     }
+    // resetFeed() recreated the indicator (if a turn is live) ABOVE these
+    // repainted messages — re-pin it to the bottom so it trails the newest one.
+    if (agentWorking) bumpThinking();
     renderTodo(t.todos || []); // restore this thread's plan into the tray
     // Resume this conversation's agent session (or start fresh if it has none),
     // so typing continues THIS chat rather than whatever was last active.
@@ -11669,6 +11688,8 @@ function buildPanel() {
   let workWordIdx = 0;
   let thinkingSafety = null;
   let thinkingTokens = 0;
+  let thinkingAction = null; // current tool/operation label (from `action` frames)
+  let thinkingReconnecting = false; // transient bridge drop while a turn is live
   // Backstop: if no activity (say/command/turn signal) for this long, auto-hide
   // — covers a missed turn:done (e.g. an older orchestrator, or an errored turn)
   // so the indicator never sticks forever.
@@ -11676,7 +11697,21 @@ function buildPanel() {
 
   function armSafety() {
     if (thinkingSafety) clearTimeout(thinkingSafety);
-    thinkingSafety = setTimeout(hideThinking, THINKING_SAFETY_MS);
+    thinkingSafety = setTimeout(onThinkingSafety, THINKING_SAFETY_MS);
+  }
+
+  // The 120s backstop must never make a STILL-RUNNING turn look finished (a
+  // silent tool phase can exceed two minutes). If the turn is still
+  // authoritative, repair a detached indicator and re-arm; only auto-hide when
+  // no turn is in flight (covers a missed turn:done so it can't stick forever).
+  function onThinkingSafety() {
+    thinkingSafety = null;
+    if (agentWorking) {
+      if (!thinkingEl) showThinking(); // rebuilds the indicator AND re-arms
+      else armSafety();
+      return;
+    }
+    hideThinking();
   }
 
   function fmtThinkTokens(n) {
@@ -11684,19 +11719,44 @@ function buildPanel() {
   }
   function cycleWord() {
     if (!thinkingLabel) return;
-    const base =
-      thinkingTokens > 0
-        ? `Thinking… (${fmtThinkTokens(thinkingTokens)} tokens)`
-        : `${WORK_WORDS[workWordIdx % WORK_WORDS.length]}…`;
+    // Priority: a transient reconnect banner > the live token meter (active
+    // extended thinking) > the current tool/operation label > playful idle
+    // words. A running tool clears the token meter (setThinkingAction), so the
+    // action label wins during silent tool phases rather than a stale count.
+    let base;
+    if (thinkingReconnecting) base = "Reconnecting… (turn still running)";
+    else if (thinkingTokens > 0) base = `Thinking… (${fmtThinkTokens(thinkingTokens)} tokens)`;
+    else if (thinkingAction) base = thinkingAction;
+    else base = `${WORK_WORDS[workWordIdx % WORK_WORDS.length]}…`;
     thinkingLabel.textContent = `${base} (Esc or Ctrl+C to stop)`;
     workWordIdx += 1;
   }
   // Live extended-thinking token meter (from the orchestrator's thinking frame).
   function setThinkingTokens(n) {
     thinkingTokens = Number(n) || 0;
+    thinkingAction = null; // live thinking supersedes the last tool's label
     if (!thinkingEl) showThinking();
     cycleWord();
     armSafety();
+  }
+
+  // Humanize an `action` frame name — "panel.panel_query_graph" → "Using query
+  // graph…" — into a live activity label so silent tool phases show what the
+  // agent is doing. Rebuilds a detached indicator and re-pins/re-arms it.
+  function humanizeAction(name) {
+    let s = String(name || "").trim();
+    s = s.split(".").pop() || s; // drop a "panel." (etc.) namespace prefix
+    s = s.replace(/^panel_/, "").replace(/_/g, " ").trim();
+    return s ? `Using ${s}…` : "Working…";
+  }
+  function setThinkingAction(name) {
+    thinkingAction = humanizeAction(name);
+    thinkingTokens = 0; // a tool is running now, not extended thinking
+    if (!thinkingEl) showThinking(); // rebuilds + re-arms; cycleWord shows the label
+    else {
+      cycleWord();
+      bumpThinking(); // re-pin below the newest activity + re-arm the safety timer
+    }
   }
 
   function hideThinking() {
@@ -11716,6 +11776,18 @@ function buildPanel() {
       thinkingLabel = null;
     }
     thinkingTokens = 0; // reset so the next turn doesn't show a stale count
+    thinkingAction = null;
+    thinkingReconnecting = false;
+  }
+
+  // A user-initiated local stop (Esc / Ctrl+C, or discarding the last turn).
+  // Mark the turn terminated authoritatively BEFORE hiding, so the safety timer
+  // and a transient reconnect (both of which now keep a live turn visible) can't
+  // resurrect the indicator in the window before the orchestrator's turn:done.
+  function endTurnLocally() {
+    agentWorking = false;
+    ssSet(MID_TASK_KEY, null); // turn stopped — nothing to resume
+    hideThinking();
   }
 
   function showThinking() {
@@ -11883,8 +11955,23 @@ function buildPanel() {
         sendStallConfig();
         // Sync preferred models + ollama endpoint config (only when non-default).
         sendAgentModelConfig(false);
+        // Reconnected — drop any transient "reconnecting" banner; live frames
+        // resume the normal label from here.
+        thinkingReconnecting = false;
       }
-      if (!connected) hideThinking();
+      // A transient drop mid-turn keeps the turn AUTHORITATIVE — the orchestrator
+      // still owns it and the bridge will rebind/resume. Clearing the indicator
+      // here falsely reads as "turn finished", so keep it up (with a reconnecting
+      // banner) while a turn is live; only hide when nothing is in flight.
+      if (!connected) {
+        if (agentWorking) {
+          thinkingReconnecting = true;
+          if (!thinkingEl) showThinking();
+          else cycleWord();
+        } else {
+          hideThinking();
+        }
+      }
       if (state === "disconnected" && externalOrchestratorMode()) showExternalHintOnce();
       // NB: do NOT push set_options here. The saved model id is only known-valid
       // once the live catalog arrives, so the push happens in applyModelCatalog
@@ -12085,6 +12172,13 @@ function buildPanel() {
     onReload(scope) {
       softReload("agent", scope);
     },
+    onAction(name) {
+      // A tool/operation started (or changed). Only meaningful while a turn is
+      // in flight; keep the indicator alive with its label so a silent tool
+      // phase never looks idle.
+      if (!agentWorking) return;
+      setThinkingAction(name);
+    },
     onTurn(state) {
       if (state === "working") {
         agentWorking = true;
@@ -12092,7 +12186,7 @@ function buildPanel() {
         ssSet(MID_TASK_KEY, "1"); // a turn is in flight — arm the resume nudge
       } else if (state === "done") {
         agentWorking = false;
-        hideThinking();
+        hideThinking(); // authoritative terminal frame — clears the action label too
         ssSet(MID_TASK_KEY, null); // turn finished cleanly — nothing to resume
         // Snapshot the graph the agent is leaving behind; the next user turn diffs
         // the live graph against this to surface MANUAL edits made between turns.
@@ -14290,7 +14384,7 @@ function buildPanel() {
     }
     if (thinkingEl) {
       client?.sendFrame?.({ type: "interrupt" });
-      hideThinking();
+      endTurnLocally();
     }
   }
 
@@ -14813,7 +14907,7 @@ function buildPanel() {
     }
     if (client.sendFrame({ type: "interrupt" })) {
       ev.preventDefault();
-      hideThinking();
+      endTurnLocally();
       appendSystem("Interrupted.");
     }
   }
