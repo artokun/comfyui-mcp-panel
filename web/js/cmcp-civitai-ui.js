@@ -86,6 +86,15 @@ function injectCss() {
     font-size: .7rem; color: #fff; background: linear-gradient(transparent, rgba(0,0,0,.75)); }
   .cmcp-cv-badge { position: absolute; top: .3rem; left: .3rem; background: rgba(0,0,0,.6); color:#fff;
     font-size: .6rem; padding: .1rem .3rem; border-radius: 4px; }
+  /* Rating badge (top-right), colour-coded by browsing level. */
+  .cmcp-cv-rating { position: absolute; top: .3rem; right: .3rem; z-index: 2; color:#fff;
+    font-size: .58rem; font-weight: 700; letter-spacing: .02em; padding: .1rem .32rem;
+    border-radius: 4px; text-shadow: 0 1px 2px rgba(0,0,0,.55); }
+  .cmcp-cv-rating--pg   { background: #16a34a; } /* PG    → green  */
+  .cmcp-cv-rating--pg13 { background: #2563eb; } /* PG-13 → blue   */
+  .cmcp-cv-rating--r    { background: #ea580c; } /* R     → orange */
+  .cmcp-cv-rating--x    { background: #dc2626; } /* X     → red    */
+  .cmcp-cv-rating--xxx  { background: #dc2626; } /* XXX   → red    */
   /* Gated favorites: black card in place of withheld media, rating centered. */
   .cmcp-cv-card.cmcp-cv-gated { background: #000; }
   .cmcp-cv-lb-stage.cmcp-cv-gated { background: #000; }
@@ -286,6 +295,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       browsingLevels: [...(opts.filters?.browsingLevels ?? DEFAULT_FILTERS.browsingLevels)],
     },
     items: [], models: [], cursor: null, loading: false, done: false, reqId: 0,
+    favOut: [], // favorites outside the enabled levels, held for the catchall
     searchSeq: 0, // searching-overlay ownership (see reload)
     signedIn: false, localNames: new Set(), localLoaded: false,
     favType: "all", // favorites sub-filter: all | image | video
@@ -470,6 +480,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     state.highlightOrder = [];
     setLoading(false);
     state.items = []; state.models = []; state.cursor = null; state.done = false;
+    state.favOut = []; // favorites outside the enabled levels, held for the catchall
     grid.innerHTML = ""; syncTabs();
     // Overlay ownership: only the NEWEST reload may hide the searching
     // spinner — a superseded reload's finally must not kill the overlay of
@@ -559,14 +570,24 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
           if (creator && author !== creator) return false;
           return true;
         };
-        const fresh = page.items.filter((it) => !seen.has(it.id) && favMatch(it));
-        // Mark (don't drop) items whose rating isn't in the enabled levels —
-        // mediaCard/openViewer render these as a black placeholder instead of
-        // the media.
-        for (const it of fresh) it.gated = (it.nsfwLevel & enabledMask) === 0;
-        appendItems(fresh);
+        const matched = page.items.filter((it) => !seen.has(it.id) && favMatch(it));
+        // Show ONLY favorites whose rating is in the enabled levels; buffer the
+        // rest. Catchall: if the exhausted feed has nothing in-level, fall back to
+        // showing ALL matching favorites (out-of-level ones as gated placeholders)
+        // so a strict level pick never dead-ends on an empty grid.
+        const inLevel = [];
+        for (const it of matched) {
+          if (it.nsfwLevel & enabledMask) { it.gated = false; inLevel.push(it); }
+          else state.favOut.push(it);
+        }
+        appendItems(inLevel);
+        if (state.done && state.items.length === 0 && state.favOut.length) {
+          for (const it of state.favOut) it.gated = true;
+          appendItems(state.favOut);
+          state.favOut = [];
+        }
         const filtering = !!q || bms.length > 0 || !!creator;
-        stalled = !fresh.length && !state.done && filtering;
+        stalled = !inLevel.length && !state.done && (filtering || enabledMask !== 31);
       } else if (t.model) {
         if (!state.localLoaded) await refreshLocalModels(); // for "in library" marks
         const page = await client.fetchModels({
@@ -649,10 +670,17 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   }
 
   // ── cards ─────────────────────────────────────────────────────────────
+  const _RATING_CLASS = { PG: "pg", "PG-13": "pg13", R: "r", X: "x", XXX: "xxx" };
+  function ratingBadge(nsfwLevel) {
+    const label = levelLabel(nsfwLevel);
+    const cls = _RATING_CLASS[label] || "pg";
+    return el("span", `cmcp-cv-rating cmcp-cv-rating--${cls}`, label);
+  }
   function mediaCard(it, idx) {
     const card = el("div", "cmcp-cv-card");
     card.dataset.id = String(it.id);
     card.dataset.kind = "media";
+    card.appendChild(ratingBadge(it.nsfwLevel));
     // Gated (rating outside the enabled browsing levels) or no usable media:
     // render a BLACK placeholder with the rating label centered — never load
     // the thumbnail/clip — but keep every overlay (▶ for video, the ♥ heart
