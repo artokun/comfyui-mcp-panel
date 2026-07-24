@@ -6834,7 +6834,7 @@ function redactBridgeUrl(u) {
   }
 }
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCommandReceived, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -7003,6 +7003,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       if (msg && typeof msg.rid === "string" && typeof msg.cmd === "string") {
         // Agent command — execute against the graph, reply with the rid.
         // Executors may be async (run, save) — await uniformly.
+        // ANY command frame is real turn activity (incl. the SILENT_CMDS that
+        // never reach onCommand: set_todo, show_media, ui_render/update,
+        // request_secret, the drive cmds) — mark it so the silence backstop can't
+        // reap a still-working turn between two silent commands.
+        onCommandReceived?.();
         let reply;
         try {
           let result;
@@ -12579,10 +12584,15 @@ function buildPanel() {
     onLog(text) {
       appendSystem(text);
     },
+    // Fires for EVERY command frame (silent or not) → real turn activity, resets
+    // the silence backstop. Non-silent commands ALSO paint an activity card below
+    // via onCommand; the activity marking lives here so silent commands count too.
+    onCommandReceived() {
+      noteActivity();
+    },
     onCommand(cmd, msg, reply) {
       appendActivity(cmd, msg, reply);
       bumpThinking();
-      noteActivity(); // a tool/command frame is real turn activity → reset the clock
       // After an edit, follow the action: dart to the edited NODE (25% pad) so
       // the user watches the change land, then zoom back out to a full fit once
       // the burst goes quiet (focusFollowOnCommand handles both). Structural ops
