@@ -6834,7 +6834,7 @@ function redactBridgeUrl(u) {
   }
 }
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCommandReceived, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -7003,6 +7003,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onAsk
       if (msg && typeof msg.rid === "string" && typeof msg.cmd === "string") {
         // Agent command — execute against the graph, reply with the rid.
         // Executors may be async (run, save) — await uniformly.
+        // ANY command frame is real turn activity (incl. the SILENT_CMDS that
+        // never reach onCommand: set_todo, show_media, ui_render/update,
+        // request_secret, the drive cmds) — mark it so the silence backstop can't
+        // reap a still-working turn between two silent commands.
+        onCommandReceived?.();
         let reply;
         try {
           let result;
@@ -11999,29 +12004,74 @@ function buildPanel() {
   let thinkingTokens = 0;
   let thinkingAction = null; // current tool/operation label (from `action` frames)
   let thinkingReconnecting = false; // transient bridge drop while a turn is live
+  let lastActivityAt = 0; // Date.now() of the last real turn frame; bounds the backstop
+  let localEndAt = 0; // Date.now() of the last LOCAL turn end (interrupt/disconnect/switch)
+  // A turn:working arriving within this window of a local end is treated as a
+  // straggler from the turn we just ended and ignored. Path-independent (no
+  // reliance on catching every send site) — a human can't end a turn and start a
+  // NEW one inside this window, so a genuine new turn is never dropped. (The fully
+  // correct fix needs per-turn ids on the orchestrator's frames; this is the bound.)
+  const STALE_WORKING_GUARD_MS = 300;
   // Backstop: if no activity (say/command/turn signal) for this long, auto-hide
   // — covers a missed turn:done (e.g. an older orchestrator, or an errored turn)
   // so the indicator never sticks forever.
   const THINKING_SAFETY_MS = 120000;
 
   function armSafety() {
+    // RESET the backstop deadline (cancel + reschedule). ONLY for real activity —
+    // via noteActivity(). A non-activity re-arm must not use this, or repeated
+    // repaints < THINKING_SAFETY_MS apart would postpone the budget check forever.
     if (thinkingSafety) clearTimeout(thinkingSafety);
     thinkingSafety = setTimeout(onThinkingSafety, THINKING_SAFETY_MS);
   }
+  function ensureSafety() {
+    // Ensure a backstop is pending WITHOUT resetting an existing deadline — for
+    // non-activity DOM ops (rebuild / re-pin). Preserves the running budget check.
+    if (!thinkingSafety) thinkingSafety = setTimeout(onThinkingSafety, THINKING_SAFETY_MS);
+  }
+  // A real turn frame arrived → reset the silence clock and the backstop deadline.
+  function noteActivity() {
+    lastActivityAt = Date.now();
+    armSafety();
+  }
+
+  // Absolute ceiling on how long the indicator may survive on the backstop with
+  // NO activity at all. A live turn re-arms armSafety() on every frame, so this
+  // only matters after a genuinely long silence.
+  const MAX_SILENT_TURN_MS = 10 * 60 * 1000;
 
   // The 120s backstop must never make a STILL-RUNNING turn look finished (a
-  // silent tool phase can exceed two minutes). If the turn is still
-  // authoritative, repair a detached indicator and re-arm; only auto-hide when
-  // no turn is in flight (covers a missed turn:done so it can't stick forever).
+  // silent tool phase can exceed two minutes). While the turn is authoritative
+  // (agentWorking) AND the total silence is under budget, keep the indicator
+  // alive — WITHOUT counting the re-arm as activity — so a long silent tool phase
+  // OR a transient bridge outage stays visible up to the SAME 10-minute budget.
+  // A disconnect isn't special-cased: it's just silence, bounded by the budget,
+  // so a reconnect within it repairs rather than hitting a shorter 120s cliff.
+  // Once the budget is exceeded (or the turn already ended), reap.
   function onThinkingSafety() {
     thinkingSafety = null;
-    // Persist only while the turn is genuinely live — working AND connected.
-    // A permanent disconnect leaves agentWorking true with no more frames, so
-    // gating on bridgeConnected too lets this backstop still hide it in ≤120s.
-    if (agentWorking && bridgeConnected) {
-      if (!thinkingEl) showThinking(); // rebuilds the indicator AND re-arms
-      else armSafety();
+    const withinBudget = Date.now() - lastActivityAt < MAX_SILENT_TURN_MS;
+    if (agentWorking && withinBudget) {
+      if (!thinkingEl) {
+        // Detached by a mid-turn repaint — rebuild. showThinking() only
+        // (re)schedules the timer; it no longer resets the silence clock, so a
+        // repaint/repair loop can't extend the budget.
+        showThinking();
+      } else {
+        // Re-arm directly, NOT via armSafety(), so the silence clock keeps running
+        // toward MAX_SILENT_TURN_MS instead of resetting on a non-activity re-arm.
+        thinkingSafety = setTimeout(onThinkingSafety, THINKING_SAFETY_MS);
+      }
       return;
+    }
+    // Reaping: the turn isn't live (already ended, or silent past budget).
+    // Terminate it locally too — leaving agentWorking true would keep the composer
+    // "queued" forever and let a repaint/reconnect resurrect a dead indicator. A
+    // turn that IS still alive re-announces via turn:working on reconnect (outside
+    // the stale-working window), which re-shows it.
+    if (agentWorking) {
+      agentWorking = false;
+      ssSet(MID_TASK_KEY, null);
     }
     hideThinking();
   }
@@ -12049,7 +12099,7 @@ function buildPanel() {
     thinkingAction = null; // live thinking supersedes the last tool's label
     if (!thinkingEl) showThinking();
     cycleWord();
-    armSafety();
+    noteActivity(); // a thinking frame is real turn activity → reset the clock
   }
 
   // Humanize an `action` frame name — "panel.panel_query_graph" → "Using query
@@ -12064,11 +12114,12 @@ function buildPanel() {
   function setThinkingAction(name) {
     thinkingAction = humanizeAction(name);
     thinkingTokens = 0; // a tool is running now, not extended thinking
-    if (!thinkingEl) showThinking(); // rebuilds + re-arms; cycleWord shows the label
+    if (!thinkingEl) showThinking(); // rebuilds; cycleWord shows the label
     else {
       cycleWord();
-      bumpThinking(); // re-pin below the newest activity + re-arm the safety timer
+      bumpThinking(); // re-pin below the newest activity
     }
+    noteActivity(); // an action frame is real turn activity → reset the clock
   }
 
   function hideThinking() {
@@ -12098,6 +12149,7 @@ function buildPanel() {
   // resurrect the indicator in the window before the orchestrator's turn:done.
   function endTurnLocally() {
     agentWorking = false;
+    localEndAt = Date.now(); // briefly ignore a straggler turn:working from this turn
     ssSet(MID_TASK_KEY, null); // turn stopped — nothing to resume
     hideThinking();
   }
@@ -12119,7 +12171,7 @@ function buildPanel() {
     workWordIdx = 0;
     cycleWord();
     if (!workWordTimer) workWordTimer = setInterval(cycleWord, 2600);
-    armSafety();
+    ensureSafety(); // DOM rebuild — don't postpone the budget check
     scrollLog();
   }
 
@@ -12127,7 +12179,7 @@ function buildPanel() {
   function bumpThinking() {
     if (!thinkingEl) return;
     log.appendChild(thinkingEl);
-    armSafety();
+    ensureSafety(); // re-pin only — don't postpone the budget check
     scrollLog();
   }
 
@@ -12176,11 +12228,6 @@ function buildPanel() {
   // tray) rather than start immediately. Drives the tray-vs-inline decision so
   // an idle send doesn't briefly flash through the tray.
   let agentWorking = false;
-  // Best-effort "is the bridge live" flag (mirrors onStatus). The working
-  // indicator persists past the 120s backstop only while a turn is BOTH working
-  // AND connected — so a permanent bridge drop mid-turn still self-clears in
-  // ≤120s instead of spinning "Reconnecting…" forever.
-  let bridgeConnected = false;
 
   // Set by a Settings "Set … token" button just before it asks the agent to open
   // the secure input, so the resolved value can be marked set/not-set (timestamp
@@ -12255,7 +12302,6 @@ function buildPanel() {
       // (clicking Disconnect, or trying to send while disconnected) and live
       // at those call sites.
       const connected = state === "connected";
-      bridgeConnected = connected; // bounds the working-indicator backstop
       connectBtn.hidden = connected;
       disconnectBtn.hidden = !connected;
       connectBtn.disabled = state === "connecting";
@@ -12276,6 +12322,9 @@ function buildPanel() {
         // Reconnected — drop any transient "reconnecting" banner; live frames
         // resume the normal label from here.
         thinkingReconnecting = false;
+        // The drop may have let the backstop hide a still-live turn; repair the
+        // indicator on reconnect so the resumed turn stays visible.
+        if (agentWorking && !thinkingEl) showThinking();
       }
       // A transient drop mid-turn keeps the turn AUTHORITATIVE — the orchestrator
       // still owns it and the bridge will rebind/resume. Clearing the indicator
@@ -12284,6 +12333,11 @@ function buildPanel() {
       if (!connected) {
         if (agentWorking) {
           thinkingReconnecting = true;
+          // Keep the indicator up with the reconnecting banner, but DON'T re-arm
+          // here: the self-perpetuating backstop (governed by the silence budget
+          // from the last real frame) already keeps it visible until the budget
+          // runs out. Re-arming on every drop would let a flapping bridge push the
+          // timer out forever and never reap a stale turn.
           if (!thinkingEl) showThinking();
           else cycleWord();
         } else {
@@ -12317,16 +12371,19 @@ function buildPanel() {
       }
       if (specs.length) paintFenceSpecs(specs);
       bumpThinking();
+      noteActivity(); // agent output is real turn activity → reset the silence clock
     },
     // Live streaming deltas (thinking + reply text) before the committed say.
     onStream(msg) {
       onStreamDelta(msg);
+      noteActivity(); // streaming output is real turn activity → reset the clock
     },
     // The agent called panel_ask — render a question card and resolve with the
     // user's pick. Keep the working indicator pinned below it while we wait.
     onAsk(msg) {
       const p = paintQuestion(msg);
       bumpThinking();
+      noteActivity(); // a panel_ask frame is real turn activity → reset the clock
       return p;
     },
     // The agent called panel_set_todo — render/update the live plan tray.
@@ -12503,8 +12560,15 @@ function buildPanel() {
     },
     onTurn(state) {
       if (state === "working") {
+        // Ignore a straggler turn:working from a turn we just ended locally
+        // (interrupt / disconnect / backend switch) — one that was already in
+        // flight when we ended it. The time window is path-independent, so it
+        // works regardless of which send path (composer, card reply, slash) starts
+        // the NEXT turn, and a human can't end + restart a turn inside the window.
+        if (Date.now() - localEndAt < STALE_WORKING_GUARD_MS) return;
         agentWorking = true;
         showThinking();
+        noteActivity(); // turn start = real activity → seed the silence clock
         ssSet(MID_TASK_KEY, "1"); // a turn is in flight — arm the resume nudge
       } else if (state === "done") {
         agentWorking = false;
@@ -12519,6 +12583,12 @@ function buildPanel() {
     },
     onLog(text) {
       appendSystem(text);
+    },
+    // Fires for EVERY command frame (silent or not) → real turn activity, resets
+    // the silence backstop. Non-silent commands ALSO paint an activity card below
+    // via onCommand; the activity marking lives here so silent commands count too.
+    onCommandReceived() {
+      noteActivity();
     },
     onCommand(cmd, msg, reply) {
       appendActivity(cmd, msg, reply);
@@ -13772,6 +13842,11 @@ function buildPanel() {
     // the visible chat log stays, only the agent session resets.
     const switching = connectedBackend !== null && connectedBackend !== id;
     if (switching) {
+      // Switching providers abandons the old agent session (not portable across
+      // backends). End the turn locally — like the Disconnect handler — so the
+      // working indicator doesn't outlive the session we're dropping (the client
+      // .stop() below sets closed=true, suppressing the onStatus that would hide).
+      endTurnLocally();
       // Replay the visible transcript to the NEW provider as one-shot context so
       // its fresh session has the conversation (session/thinking aren't portable
       // across providers). Consumed by the next user message, then auto-cleared.
@@ -13922,7 +13997,6 @@ function buildPanel() {
     // client.stop() sets closed=true, so the socket onclose suppresses onStatus
     // — end the turn locally so the working indicator can't spin forever against
     // a turn the user just walked away from (no turn:done will ever arrive).
-    bridgeConnected = false;
     endTurnLocally();
     connectBtn.hidden = false;
     disconnectBtn.hidden = true;
@@ -15646,6 +15720,10 @@ function buildPanel() {
       root.removeEventListener("mouseover", onRootOver);
       root.removeEventListener("mouseout", onRootOut);
       clearTimeout(revealResetTimer);
+      // Stop the working-indicator timers so a torn-down panel leaves nothing
+      // running (a remount would otherwise stack a second word cycler / backstop).
+      if (workWordTimer) { clearInterval(workWordTimer); workWordTimer = null; }
+      if (thinkingSafety) { clearTimeout(thinkingSafety); thinkingSafety = null; }
       document.removeEventListener("keydown", onInterruptKeydown, true);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       window.removeEventListener("pagehide", onPageHide);
