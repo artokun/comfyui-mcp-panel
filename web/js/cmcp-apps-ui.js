@@ -110,6 +110,39 @@ function injectStyle() {
   border-radius:8px;padding:0.55rem 0.65rem;}
 /* Fallback for danger buttons rendered outside .cmcp-apps-body (defensive). */
 .cmcp-btn.danger{border-color:rgba(248,113,113,0.5);color:#f87171;}
+/* ── Dependency side-panel (models + custom-node packs) ──────────────────── */
+.cmcp-deps{display:flex;flex-direction:column;gap:0.75rem;border:1px solid var(--p-content-border-color,#3f3f46);
+  border-radius:10px;padding:0.6rem 0.7rem;background:var(--p-surface-950,#111113);flex:0 0 260px;}
+.cmcp-deps-sec{display:flex;flex-direction:column;}
+.cmcp-deps-h{font-size:0.7rem;font-weight:700;opacity:0.8;text-transform:uppercase;letter-spacing:0.04em;
+  padding-bottom:0.25rem;}
+.cmcp-deps-row{display:flex;align-items:center;gap:0.6rem;padding:0.34rem 0.1rem;
+  border-top:1px solid rgba(255,255,255,0.05);}
+.cmcp-deps-row:first-of-type{border-top:none;}
+.cmcp-deps-name{flex:1;min-width:0;display:flex;flex-direction:column;gap:0.1rem;}
+.cmcp-deps-name .n{font-size:0.8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.cmcp-deps-name .sub{font-size:0.66rem;opacity:0.55;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.cmcp-deps-status{flex:0 0 auto;font-size:0.78rem;display:flex;align-items:center;gap:0.4rem;max-width:55%;
+  justify-content:flex-end;text-align:right;}
+.cmcp-deps-ok{color:var(--p-green-400,#4ade80);font-weight:600;white-space:nowrap;}
+.cmcp-deps-status .cmcp-btn{padding:0.28rem 0.6rem;font-size:0.74rem;}
+.cmcp-deps-muted{opacity:0.6;font-size:0.74rem;}
+.cmcp-deps-err{color:#f87171;font-size:0.72rem;}
+.cmcp-deps-note{font-size:0.68rem;opacity:0.6;line-height:1.4;}
+.cmcp-deps-spin{width:0.85rem;height:0.85rem;flex:0 0 auto;border:2px solid rgba(255,255,255,0.22);
+  border-top-color:var(--p-primary-color,#60a5fa);border-radius:50%;display:inline-block;
+  animation:cmcp-deps-spin 0.7s linear infinite;}
+@keyframes cmcp-deps-spin{to{transform:rotate(360deg);}}
+/* Detail layout (form + deps side-panel) + the title star icon. */
+.cmcp-apps-main{display:flex;gap:1rem;align-items:flex-start;min-height:0;}
+.cmcp-apps-main>.grow{flex:1;min-width:0;display:flex;flex-direction:column;gap:0.75rem;}
+@media (max-width:720px){.cmcp-apps-main{flex-direction:column;}.cmcp-deps{flex:1 1 auto;width:100%;}}
+.cmcp-apps-title-row{display:flex;align-items:center;gap:0.45rem;}
+.cmcp-apps-starbtn{border:none;background:none;color:inherit;font-size:1.05rem;cursor:pointer;padding:0 0.1rem;line-height:1;}
+.cmcp-apps-starbtn:hover{color:#facc15;}
+.cmcp-apps-starbtn.starred{color:#facc15;}
+.cmcp-apps-starbtn:disabled{opacity:0.4;cursor:default;}
+.cmcp-apps-starcount{font-size:0.78rem;opacity:0.7;}
 `;
   const el = document.createElement("style");
   el.textContent = css;
@@ -210,6 +243,102 @@ function parseModelList(res, dir) {
     for (const line of text.split(/\r?\n/)) cand.add(line.trim());
   }
   return [...cand].filter((s) => _MODEL_EXT.test(s));
+}
+
+// ── dependency side-panel parsing helpers (pure) ────────────────────────────
+
+/** Basename of a model path, lower-cased, for case-insensitive presence match. */
+function depBasename(s) {
+  return String(s || "").split(/[\\/]/).pop().trim().toLowerCase();
+}
+
+/** Set of present model basenames (lower-cased) from a list_local_models
+ *  tool_result. Reuses parseModelList (grouped-JSON / prose tolerant). */
+function presentModelBasenames(res) {
+  const set = new Set();
+  for (const p of parseModelList(res)) set.add(depBasename(p));
+  return set;
+}
+
+/** Parse list_installed_nodes TEXT (formatInstalledNodes shape:
+ *    "1. <module> [cnr:<id>, git:<aux>]\n   version: … | enabled")
+ *  into a lower-cased Set of every identifier we can match a declared pack
+ *  against — the module name plus any cnr / git ids. */
+function parseInstalledNodeSet(text) {
+  const set = new Set();
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const m = line.match(/^\s*\d+\.\s+(.+?)\s*(?:\[(.+)\])?\s*$/);
+    if (!m) continue;
+    const module = (m[1] || "").trim();
+    if (module) set.add(module.toLowerCase());
+    if (m[2]) {
+      for (const part of m[2].split(",")) {
+        const id = part.replace(/^\s*(?:cnr|git):/i, "").trim();
+        if (id) {
+          set.add(id.toLowerCase());
+          // git ids arrive as "owner/Repo" — also index the repo tail.
+          const tail = id.split("/").pop();
+          if (tail) set.add(tail.toLowerCase());
+        }
+      }
+    }
+  }
+  return set;
+}
+
+/** Parse extract_workflow_dependencies TEXT — the "Required custom node packs"
+ *  section only — into [{ pack, installed }]. Each line there is
+ *  "- <pack>  — installed" or "- <pack>  — **NOT INSTALLED**" (em-dash U+2014).
+ *  Returns { corePacksOnly: true } style via an empty array + a flag when the
+ *  workflow needs no packs. */
+function parseRequiredPacks(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  const packs = [];
+  let inSection = false;
+  let coreOnly = false;
+  for (const line of lines) {
+    if (/^###\s+Required custom node packs/i.test(line)) { inSection = true; continue; }
+    if (inSection && /^#{2,3}\s+/.test(line)) break; // next heading ends the section
+    if (/core\/built-in ComfyUI nodes\. No custom node packs required/i.test(line)) coreOnly = true;
+    if (!inSection) continue;
+    // Split on the em-dash separator; left side holds the pack name.
+    const idx = line.indexOf("—");
+    if (idx === -1) continue;
+    const name = line.slice(0, idx).replace(/^\s*[-*]\s*/, "").trim();
+    if (!name) continue;
+    packs.push({ pack: name, installed: !/NOT\s+INSTALLED/i.test(line) });
+  }
+  return { packs, coreOnly };
+}
+
+/** Normalize an identifier for fuzzy pack matching (drop case + punctuation). */
+function normId(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/** Is a declared pack/class_type present in a parseInstalledNodeSet() set?
+ *  Exact lower-case first, then a punctuation-insensitive compare (best effort —
+ *  the manifest may carry class_types, which don't 1:1 match pack module ids). */
+function nodeInstalled(set, name) {
+  const lc = String(name || "").toLowerCase();
+  if (set.has(lc)) return true;
+  const nn = normId(name);
+  if (!nn) return false;
+  for (const id of set) if (normId(id) === nn) return true;
+  return false;
+}
+
+/** De-dupe [{pack,installed}] by pack name (case-insensitive); installed wins. */
+function dedupePacks(packs) {
+  const map = new Map();
+  for (const p of packs) {
+    if (!p || !p.pack) continue;
+    const k = p.pack.toLowerCase();
+    const prev = map.get(k);
+    if (!prev) map.set(k, { pack: p.pack, installed: !!p.installed });
+    else if (p.installed) prev.installed = true;
+  }
+  return [...map.values()];
 }
 
 /** Convert the LIVE canvas into an app bundle draft: prompt snapshot + UI
@@ -536,8 +665,343 @@ export function createAppsContent(ctx, shell, opts = {}) {
     load();
   }
 
+  // ── Dependency side-panel (shared by both detail views) ──────────────────
+
+  /** Render the app's required models + custom-node packs, each with a green ✓
+   *  (present/installed) or an action button (Download / Install). Downloads and
+   *  installs run over the orchestrator bridge (callTool); their byte progress
+   *  surfaces in the existing panel download tray (server-side), so we don't
+   *  reimplement progress here — we just re-check presence after the call.
+   *
+   *  opts:
+   *    models      — manifest.deps.models[]  (mixed shapes; older apps are sparse:
+   *                  { name } only; convert-flow apps carry the full
+   *                  { fileName, directory, source, sourceUrl, civitaiVersionId, … })
+   *    customNodes — manifest.deps.customNodes[]  (class_type string | { pack })
+   *    getWorkflow — () => Promise<apiPrompt|null>; the API-format prompt handed to
+   *                  extract_workflow_dependencies / resolve_missing_models. Invoked
+   *                  lazily, memoised — at most one bundle fetch even if both
+   *                  sections need it.
+   *
+   *  Teardown-safe: alive() gates every post-await DOM write, so a late callTool
+   *  never mutates a container the shell already detached / re-rendered. */
+  function renderDepsPanel(container, { models = [], customNodes = [], getWorkflow } = {}) {
+    const alive = () => !closed && container.isConnected;
+    const mods = (Array.isArray(models) ? models : []).filter((m) => m && typeof m === "object");
+    const packs = (Array.isArray(customNodes) ? customNodes : [])
+      .map((c) => (typeof c === "string" ? c : (c && (c.pack || c.name)) || ""))
+      .filter(Boolean);
+
+    if (!mods.length && !packs.length) {
+      container.append(el("div", "cmcp-deps-note", "This app declares no external model or node dependencies."));
+      return;
+    }
+
+    const bridgeReady = typeof callTool === "function";
+    const panel = el("div", "cmcp-deps");
+    container.append(panel);
+
+    // Lazy, memoised API-format prompt (used by both sections).
+    let _wfP = null;
+    const workflow = () => {
+      if (!_wfP) {
+        _wfP = Promise.resolve()
+          .then(() => (typeof getWorkflow === "function" ? getWorkflow() : null))
+          .catch(() => null);
+      }
+      return _wfP;
+    };
+
+    // spinner + label chip
+    const spinning = (label) => {
+      const wrap = el("span");
+      wrap.append(el("span", "cmcp-deps-spin"), el("span", "cmcp-deps-muted", label));
+      return wrap;
+    };
+    const okChip = (label) => el("span", "cmcp-deps-ok", label);
+
+    // ── Models ──────────────────────────────────────────────────────────────
+    if (mods.length) {
+      const sec = el("div", "cmcp-deps-sec");
+      const h = el("div", "cmcp-deps-h", `Models (${mods.length})`);
+      sec.append(h);
+      panel.append(sec);
+
+      const rows = mods.map((m) => {
+        const fname = m.fileName || m.name || m.file || "";
+        const dir = m.directory || m.targetSubfolder || m.dir || "";
+        const row = el("div", "cmcp-deps-row");
+        const nameWrap = el("div", "cmcp-deps-name");
+        nameWrap.append(el("div", "n", fname || "(unnamed model)"));
+        if (dir) nameWrap.append(el("div", "sub", `models/${dir}/`));
+        const status = el("div", "cmcp-deps-status");
+        row.append(nameWrap, status);
+        sec.append(row);
+        return { m, fname, dir, row, status, present: false };
+      });
+
+      const syncModelHeader = () => {
+        const done = rows.filter((r) => r.present).length;
+        h.textContent = `Models (${done}/${rows.length} installed)`;
+      };
+
+      if (!bridgeReady) {
+        for (const r of rows) { r.status.textContent = ""; r.status.append(el("span", "cmcp-deps-muted", "connect orchestrator")); }
+        sec.append(el("div", "cmcp-deps-note", "Connect the orchestrator to check for and download models."));
+      } else {
+        for (const r of rows) { r.status.append(spinning("checking…")); }
+        (async () => {
+          let present = new Set();
+          try { present = presentModelBasenames(await callTool("list_local_models", {})); }
+          catch { /* offline / older bridge — treat as unknown */ }
+          if (!alive()) return;
+          for (const r of rows) {
+            r.present = r.fname ? present.has(depBasename(r.fname)) : false;
+            r.status.textContent = "";
+            if (r.present) r.status.append(okChip("✓ Installed"));
+            else wireModelDownload(r);
+          }
+          syncModelHeader();
+        })();
+      }
+
+      function wireModelDownload(r) {
+        const btn = makeBtn("⬇ Download", { primary: true });
+        r.status.textContent = "";
+        r.status.append(btn);
+        const target = r.dir || "checkpoints";
+        const show = (node) => { r.status.textContent = ""; r.status.append(node); };
+        btn.addEventListener("click", async () => {
+          btn.disabled = true;
+          show(spinning("starting…"));
+          try {
+            const issued = await startModelDownload(r.m, r.fname, target);
+            if (!alive()) return;
+            if (!issued) { show(el("span", "cmcp-deps-muted", "no download link")); return; }
+            // Big files won't have landed by the time the grace-window call
+            // resolves — re-check once; if not present yet, point at the tray.
+            const nowPresent = await recheckModel(r.fname);
+            if (!alive()) return;
+            if (nowPresent) { r.present = true; show(okChip("✓ Installed")); syncModelHeader(); }
+            else show(el("span", "cmcp-deps-muted", "downloading… (see tray)"));
+          } catch (e) {
+            if (!alive()) return;
+            show(el("span", "cmcp-deps-err", e && e.message ? e.message : "download failed"));
+            btn.disabled = false;
+          }
+        });
+      }
+    }
+
+    // ── Custom-node packs ─────────────────────────────────────────────────────
+    if (packs.length) {
+      const sec = el("div", "cmcp-deps-sec");
+      const h = el("div", "cmcp-deps-h", `Custom nodes (${packs.length})`);
+      sec.append(h);
+      panel.append(sec);
+
+      if (!bridgeReady) {
+        for (const c of packs) {
+          const row = el("div", "cmcp-deps-row");
+          const nameWrap = el("div", "cmcp-deps-name");
+          nameWrap.append(el("div", "n", c));
+          const status = el("div", "cmcp-deps-status");
+          status.append(el("span", "cmcp-deps-muted", "connect orchestrator"));
+          row.append(nameWrap, status);
+          sec.append(row);
+        }
+        sec.append(el("div", "cmcp-deps-note", "Connect the orchestrator to check for and install custom-node packs."));
+      } else {
+        const loading = el("div", "cmcp-deps-row");
+        loading.append(spinning("resolving node packs…"));
+        sec.append(loading);
+        (async () => {
+          const resolved = await resolveNodePacks(packs);
+          if (!alive()) return;
+          loading.remove();
+          if (!resolved.length) {
+            h.textContent = "Custom nodes (0)";
+            sec.append(el("div", "cmcp-deps-note", "No custom-node packs required."));
+            return;
+          }
+          const rows = [];
+          const syncNodeHeader = () => {
+            const done = rows.filter((r) => r.installed).length;
+            h.textContent = `Custom nodes (${done}/${rows.length} installed)`;
+          };
+          for (const p of resolved) {
+            const row = el("div", "cmcp-deps-row");
+            const nameWrap = el("div", "cmcp-deps-name");
+            nameWrap.append(el("div", "n", p.pack));
+            const status = el("div", "cmcp-deps-status");
+            row.append(nameWrap, status);
+            sec.append(row);
+            const r = { pack: p.pack, installed: p.installed, row, status };
+            rows.push(r);
+            if (p.installed) status.append(okChip("✓ Installed"));
+            else wireNodeInstall(r, syncNodeHeader);
+          }
+          syncNodeHeader();
+        })();
+      }
+
+      function wireNodeInstall(r, onChanged) {
+        const btn = makeBtn("⬇ Install", { primary: true });
+        r.status.textContent = "";
+        r.status.append(btn);
+        const show = (node) => { r.status.textContent = ""; r.status.append(node); };
+        btn.addEventListener("click", async () => {
+          // Installing a custom node runs that pack's third-party code — gate it.
+          const ok = await confirmModal({
+            title: "Install custom-node pack",
+            message:
+              `Install custom node pack “${r.pack}”?\n\n` +
+              "This downloads and runs third-party code. ComfyUI may need to restart to load the new nodes.",
+            confirmLabel: "Install",
+          });
+          if (!ok || !alive()) return;
+          btn.disabled = true;
+          show(spinning("installing…"));
+          try {
+            const res = await callTool("install_custom_node", { id: r.pack });
+            if (!alive()) return;
+            if (res && res.ok === false) throw new Error(toolText(res) || "install failed");
+            r.installed = true;
+            show(okChip("✓ Installed"));
+            onChanged();
+            toast("Installed — restart ComfyUI to load new nodes.");
+          } catch (e) {
+            if (!alive()) return;
+            show(el("span", "cmcp-deps-err", e && e.message ? e.message : "install failed"));
+            btn.disabled = false;
+          }
+        });
+      }
+    }
+
+    // ── bridge calls (closure over callTool + the memoised workflow thunk) ────
+
+    /** Issue the right download call for a model. Returns true when a download
+     *  was kicked off, false when no link could be resolved (disabled state).
+     *  Throws on a tool-reported failure. */
+    async function startModelDownload(m, fname, target) {
+      const vid = m.civitaiVersionId || m.civitai_version_id;
+      if (vid) return civitai(Number(vid), target);
+      const url = m.sourceUrl || m.source_url || m.url;
+      if (url) return direct(url, target, fname);
+      // No pinned link on this (sparse/old) entry — ask the orchestrator to
+      // resolve a candidate from the live workflow (best effort; markdown parse).
+      const wf = await workflow();
+      if (wf) {
+        const cand = await resolveModelCandidate(wf, fname);
+        if (cand && cand.versionId) return civitai(cand.versionId, target);
+        if (cand && cand.url) return direct(cand.url, target, fname);
+      }
+      return false;
+
+      async function civitai(versionId, subfolder) {
+        const res = await callTool("download_civitai_model", { model_version_id: versionId, target_subfolder: subfolder });
+        if (res && res.ok === false) throw new Error(toolText(res) || "CivitAI download failed");
+        return true;
+      }
+      async function direct(u, subfolder, filename) {
+        const res = await callTool("download_model", { url: u, target_subfolder: subfolder, ...(filename ? { filename } : {}) });
+        if (res && res.ok === false) throw new Error(toolText(res) || "download failed");
+        return true;
+      }
+    }
+
+    /** Re-query list_local_models and report whether `fname` has landed. */
+    async function recheckModel(fname) {
+      if (!fname) return false;
+      try { return presentModelBasenames(await callTool("list_local_models", {})).has(depBasename(fname)); }
+      catch { return false; }
+    }
+
+    /** Best-effort candidate parse from resolve_missing_models markdown. Finds
+     *  the `### \`<name>\`` section for this file, then the first CivitAI version
+     *  id (→ download_civitai_model) or an http(s) URL (→ download_model). */
+    async function resolveModelCandidate(wf, fname) {
+      let text = "";
+      try { text = toolText(await callTool("resolve_missing_models", { workflow: wf })); }
+      catch { return null; }
+      if (!text) return null;
+      const base = depBasename(fname);
+      let inMatch = !base; // no filename → scan the whole doc
+      for (const line of text.split(/\r?\n/)) {
+        const hdr = line.match(/^###\s+`([^`]+)`/);
+        if (hdr) { inMatch = depBasename(hdr[1]) === base; continue; }
+        if (!inMatch) continue;
+        const ver = line.match(/\(version\s+(\d{2,})\)/i) || line.match(/version\s+(\d{2,})\)?\s*(?:→|->)?\s*download_civitai_model/i);
+        if (ver) return { versionId: Number(ver[1]) };
+        const url = line.match(/https?:\/\/\S+/);
+        if (url) return { url: url[0].replace(/[)\].,]+$/, "") };
+      }
+      return null;
+    }
+
+    /** Resolve the declared node deps to [{pack, installed}]. Preferred path:
+     *  extract_workflow_dependencies (maps class_type→pack + reports installed vs
+     *  missing authoritatively). Fallback when the prompt is unavailable: the
+     *  declared class_types vs list_installed_nodes (loose — see nodeInstalled). */
+    async function resolveNodePacks(declared) {
+      const wf = await workflow();
+      if (wf) {
+        try {
+          const { packs: parsed, coreOnly } = parseRequiredPacks(toolText(await callTool("extract_workflow_dependencies", { workflow: wf })));
+          if (parsed.length) return dedupePacks(parsed);
+          if (coreOnly) return [];
+        } catch { /* fall through to the declared-list heuristic */ }
+      }
+      let installed = new Set();
+      try { installed = parseInstalledNodeSet(toolText(await callTool("list_installed_nodes", {}))); }
+      catch { /* older/offline bridge — everything reads as unknown */ }
+      return dedupePacks(declared.map((c) => ({ pack: c, installed: installed.size ? nodeInstalled(installed, c) : false })));
+    }
+  }
+
   // ── Registry app detail (install view) ───────────────────────────────────
 
+  /** Silent, idempotent install of a registry bundle as a local app. The
+   *  registry id becomes the local id; an already-installed copy is left
+   *  alone (its published marker is refreshed so Update-published works). */
+  async function installRegistryBundle(regApp, bundle) {
+    let thumbnail_b64;
+    try {
+      const res = await fetch(registry.thumbnailUrl(regApp.id));
+      if (res.ok) {
+        const buf = new Uint8Array(await res.arrayBuffer());
+        let bin = "";
+        for (const b of buf) bin += String.fromCharCode(b);
+        thumbnail_b64 = btoa(bin);
+      }
+    } catch { /* no thumbnail — fine */ }
+    try {
+      await client.create({
+        manifest: {
+          ...bundle.manifest,
+          source: { type: "registry", workflowUuid: null, registryId: regApp.id },
+          published: { registryId: regApp.id, slug: regApp.slug, publishedVersion: regApp.version },
+        },
+        prompt: bundle.prompt,
+        ...(bundle.workflow ? { workflow: bundle.workflow } : {}),
+        ...(thumbnail_b64 ? { thumbnail_b64 } : {}),
+      });
+    } catch (e) {
+      if (!/already exists/.test(e.message || "")) throw e;
+      // Already installed — refresh the published marker so the detail's
+      // update path tracks the registry version the user is looking at.
+      try {
+        await client.update(regApp.id, {
+          manifest: { published: { registryId: regApp.id, slug: regApp.slug, publishedVersion: regApp.version } },
+        });
+      } catch { /* older copy without the app — proceed to detail anyway */ }
+    }
+  }
+
+  /** Registry app view: NO install gate — the bundle installs silently on
+   *  open and the local detail shows immediately (inputs right away). Deps
+   *  are visible in the Requirements panel before the first run. */
   async function showRegistryDetail(regApp) {
     if (closed) return;
     body.textContent = "";
@@ -545,106 +1009,14 @@ export function createAppsContent(ctx, shell, opts = {}) {
     const back = makeBtn("← Explore");
     back.addEventListener("click", () => { _tab = "explore"; showGrid().catch(showError); });
     bar.append(back);
-    body.append(bar);
-
-    const detail = el("div", "cmcp-apps-detail");
-    const head = el("div", "cmcp-apps-detail-head");
-    const thumb = el("div", "thumb", "▶");
-    thumb.style.backgroundImage = `url("${registry.thumbnailUrl(regApp.id)}")`;
-    thumb.textContent = "";
-    const titles = el("div", "titles");
-    titles.append(el("h3", "", regApp.name || "Untitled"));
-    titles.append(el("div", "desc", `by ${regApp.creator || "anonymous"} · ★ ${regApp.stars || 0} · ${regApp.runs || 0} runs · v${regApp.version || 1}`));
-    if (regApp.description) titles.append(el("div", "desc", regApp.description));
-    head.append(thumb, titles);
-    detail.append(head);
-
-    if (regApp.hide_workflow) {
-      detail.append(
-        el(
-          "div",
-          "cmcp-apps-warn",
-          "Hidden workflow (best effort): the graph is never distributed with this app — but anyone technical " +
-            "who runs it can still intercept the prompt via ComfyUI's API. Real protection comes with hosted runs (coming soon).",
-        ),
-      );
+    body.append(bar, el("div", "cmcp-apps-empty", "Preparing…"));
+    try {
+      const bundle = await registry.bundle(regApp.id);
+      await installRegistryBundle(regApp, bundle);
+    } catch (e) {
+      return showError(e);
     }
-
-    const actions = el("div", "cmcp-apps-runbar");
-    const installBtn = makeBtn("⬇ Install", { primary: true });
-    const starBtn = makeBtn("☆ Star");
-    const status = el("span", "cmcp-apps-status");
-    actions.append(installBtn, starBtn, status);
-    detail.append(actions);
-    body.append(detail);
-
-    let starred = false;
-    starBtn.addEventListener("click", async () => {
-      starred = !starred;
-      starBtn.textContent = starred ? "★ Starred" : "☆ Star";
-      try {
-        await registry.star(regApp.id, starred);
-      } catch (e) {
-        status.textContent = e.message;
-        status.classList.add("err");
-      }
-    });
-
-    installBtn.addEventListener("click", async () => {
-      installBtn.disabled = true;
-      status.classList.remove("err");
-      try {
-        status.textContent = "Fetching bundle…";
-        const bundle = await registry.bundle(regApp.id);
-        const deps = bundle.manifest?.deps || {};
-        const models = Array.isArray(deps.models) ? deps.models : [];
-        const nodes = Array.isArray(deps.customNodes) ? deps.customNodes : [];
-        if (models.length || nodes.length) {
-          const ok = await confirmModal({
-            title: `Install “${regApp.name}”`,
-            message:
-              (models.length ? `Models (${models.length}):\n  ${models.map((m) => m.name || m).join("\n  ")}\n\n` : "") +
-              (nodes.length ? `Custom nodes (${nodes.length}):\n  ${nodes.join("\n  ")}\n\n` : "") +
-              "Anything missing must be installed before the app can run (ask the agent to install it, or install it yourself).",
-            confirmLabel: "Install",
-          });
-          if (!ok) {
-            installBtn.disabled = false;
-            status.textContent = "";
-            return;
-          }
-        }
-        status.textContent = "Installing…";
-        let thumbnail_b64;
-        try {
-          const res = await fetch(registry.thumbnailUrl(regApp.id));
-          if (res.ok) {
-            const buf = new Uint8Array(await res.arrayBuffer());
-            let bin = "";
-            for (const b of buf) bin += String.fromCharCode(b);
-            thumbnail_b64 = btoa(bin);
-          }
-        } catch { /* no thumbnail — fine */ }
-        await client.create({
-          manifest: {
-            ...bundle.manifest,
-            source: { type: "registry", workflowUuid: null, registryId: regApp.id },
-            published: { registryId: regApp.id, slug: regApp.slug, publishedVersion: regApp.version },
-          },
-          prompt: bundle.prompt,
-          ...(bundle.workflow ? { workflow: bundle.workflow } : {}),
-          ...(thumbnail_b64 ? { thumbnail_b64 } : {}),
-        });
-        _tab = "mine";
-        await showDetail(regApp.id);
-      } catch (e) {
-        status.textContent = e.message.includes("already exists")
-          ? "Already installed — find it in My Apps."
-          : e.message;
-        status.classList.add("err");
-        installBtn.disabled = false;
-      }
-    });
+    await showDetail(regApp.id, regApp);
   }
 
   // ── Convert view ─────────────────────────────────────────────────────────
@@ -790,14 +1162,17 @@ export function createAppsContent(ctx, shell, opts = {}) {
 
   // ── Detail view ──────────────────────────────────────────────────────────
 
-  async function showDetail(id) {
+  async function showDetail(id, regCtx = null) {
     const app = await client.get(id);
     if (closed) return;
     body.textContent = "";
 
     const bar = el("div", "cmcp-apps-toolbar");
-    const back = makeBtn("← My Apps");
-    back.addEventListener("click", () => showGrid().catch(showError));
+    const back = makeBtn(regCtx ? "← Explore" : "← My Apps");
+    back.addEventListener("click", () => {
+      if (regCtx) _tab = "explore";
+      showGrid().catch(showError);
+    });
     bar.append(back);
     body.append(bar);
 
@@ -809,7 +1184,47 @@ export function createAppsContent(ctx, shell, opts = {}) {
       thumb.textContent = "";
     }
     const titles = el("div", "titles");
-    titles.append(el("h3", "", app.name || "Untitled app"));
+    // Title row: name + (registry apps) a star icon right beside it.
+    const titleRow = el("div", "cmcp-apps-title-row");
+    titleRow.append(el("h3", "", app.name || "Untitled app"));
+    if (regCtx) {
+      const starBtn = el("button", "cmcp-apps-starbtn", "☆");
+      starBtn.type = "button";
+      starBtn.title = "Star this app";
+      const starCount = el("span", "cmcp-apps-starcount", String(regCtx.stars || 0));
+      let starred = false;
+      let count = Number(regCtx.stars || 0);
+      const paint = () => {
+        starBtn.textContent = starred ? "★" : "☆";
+        starBtn.classList.toggle("starred", starred);
+        starCount.textContent = String(count);
+      };
+      // No clicks until the real state arrives — a click while the lookup is
+      // in flight would toggle from the WRONG initial value (star instead of
+      // unstar, corrupting the count — codex finding).
+      starBtn.disabled = true;
+      registry.starred(regCtx.id).then((r) => {
+        starred = !!r?.starred;
+        paint();
+      }).catch(() => {})
+        .finally(() => {
+          starBtn.disabled = false;
+        });
+      starBtn.addEventListener("click", async () => {
+        starred = !starred;
+        count = Math.max(0, count + (starred ? 1 : -1));
+        paint();
+        try {
+          await registry.star(regCtx.id, starred);
+        } catch { /* star is cosmetic — the count resyncs on next open */ }
+      });
+      paint();
+      titleRow.append(starBtn, starCount);
+    }
+    titles.append(titleRow);
+    if (regCtx) {
+      titles.append(el("div", "desc", `by ${regCtx.creator || "anonymous"} · ${regCtx.runs || 0} runs · v${regCtx.version || 1}`));
+    }
     if (app.description) titles.append(el("div", "desc", app.description));
     head.append(thumb, titles);
     detail.append(head);
@@ -825,6 +1240,17 @@ export function createAppsContent(ctx, shell, opts = {}) {
         ),
       );
     }
+
+    // Dependency side-panel — required models + node packs, each ✓ or an
+    // action. ONE renderDepsPanel, mounted as the right-hand column of the
+    // detail layout (the merge briefly had two: this one and a duplicate
+    // after the form). The prompt (API snapshot) lives in the bundle, not the
+    // detail record, so the node section fetches it lazily.
+    const deps = app.deps || {};
+    const hasDeps =
+      (Array.isArray(deps.models) && deps.models.length > 0) ||
+      (Array.isArray(deps.customNodes) && deps.customNodes.length > 0);
+    const depsHost = el("div");
 
     // Generated input form.
     const form = el("div", "cmcp-apps-form");
@@ -990,7 +1416,22 @@ export function createAppsContent(ctx, shell, opts = {}) {
     form.append(runRow);
 
     const outputs = el("div", "cmcp-apps-outputs");
-    detail.append(form, outputs);
+
+    // ONE deps panel, right-hand column (declared above; registry installs see
+    // it before their first run, replacing the old install-gate consent).
+    const main = el("div", "cmcp-apps-main");
+    const grow = el("div", "grow");
+    grow.append(form, outputs);
+    main.append(grow);
+    if (hasDeps) {
+      renderDepsPanel(depsHost, {
+        models: deps.models,
+        customNodes: deps.customNodes,
+        getWorkflow: () => client.bundle(app.id).then((b) => (b && b.prompt) || null).catch(() => null),
+      });
+      main.append(depsHost);
+    }
+    detail.append(main);
     body.append(detail);
 
     // Management row (metadata edit, publish, hide, delete) — below the fold.
