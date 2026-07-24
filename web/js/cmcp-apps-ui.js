@@ -16,7 +16,8 @@
 // offered — see the hide toggle copy. True protection = hosted runs (P5).
 
 import { AppBuilder, AppsClient, RegistryClient } from "./cmcp-apps.js";
-import { confirmModal, promptModal, formModal, toast } from "./cmcp-modal.js";
+import { confirmModal, promptModal, formModal, toast, openSubModal as openSubModalBase } from "./cmcp-modal.js";
+import { chipRow, makeFilterButton, openFilterPanel } from "./cmcp-filter.js";
 
 let styleInjected = false;
 function injectStyle() {
@@ -338,15 +339,58 @@ export function createAppsContent(ctx, shell, opts = {}) {
   let _tab = "mine"; // "mine" | "explore"
   let _started = false;
   let exploreQuery = "";
+  let exploreSort = "trending"; // Explore sort — the shared filter panel's Sort row
   let _exploreReload = null; // showExplore's load(), so onSearch can re-run it
   let _exploreTimer = null;
+  // Stacked-sheet tracker (mirrors CivitAI's) so the filter panel joins the
+  // Escape-gated close set — see escapeBlocked() below.
+  const _subModals = new Set();
 
   // ── My / Explore toggle → chips in the shared subnav (decision D) ──────────
   const mineChip = el("button", "cmcp-cv-chip", "My Apps");
   const exploreChip = el("button", "cmcp-cv-chip", "Explore");
+
+  // ── Shared filter affordance (P1c) — the SAME header filter button + chip
+  // panel CivitAI uses (cmcp-filter.js). Sort-only for now; structured so
+  // tag/category rows drop straight in as the catalogue grows. Shown on Explore
+  // (My Apps has nothing to sort). Sort keys match RegistryClient.list.
+  const APPS_SORTS = [
+    { value: "trending", label: "Trending" },
+    { value: "new", label: "Newest" },
+    { value: "stars", label: "Most Stars" },
+  ];
+  const { btn: filterBtn, setActive: setFilterActive } =
+    makeFilterButton({ onOpen: () => openAppsFilters(), title: "Filter apps" });
+  function syncFilterBtn() {
+    filterBtn.style.display = _tab === "explore" ? "" : "none";
+    setFilterActive(exploreSort !== "trending"); // "dirty" dot once sort != default
+  }
+  function openAppsFilters() {
+    openFilterPanel({
+      // Thread the tracker so Escape peels the sheet before it can close the panel.
+      openModal: (title, onClose) => openSubModalBase(title, onClose, _subModals),
+      title: "Filter apps",
+      render: (wrap, rerender) => {
+        chipRow(
+          wrap, "Sort", APPS_SORTS,
+          (v) => exploreSort === v,
+          (v) => {
+            if (exploreSort === v) return;
+            exploreSort = v;
+            syncFilterBtn();
+            rerender();                       // flip the pressed chip in the open sheet
+            if (_exploreReload) _exploreReload(); // reload the feed behind it
+          },
+        );
+        // Future rows (tags / categories) append here — same chipRow calls.
+      },
+    });
+  }
+
   function syncChips() {
     mineChip.classList.toggle("on", _tab === "mine");
     exploreChip.classList.toggle("on", _tab === "explore");
+    syncFilterBtn();
   }
   mineChip.addEventListener("click", () => {
     if (_tab === "mine") return;
@@ -434,20 +478,18 @@ export function createAppsContent(ctx, shell, opts = {}) {
       );
       return;
     }
-    const controls = el("div", "cmcp-apps-toolbar");
-    let sort = "trending";
-    const sorts = [["trending", "Trending"], ["new", "New"], ["stars", "Most starred"]];
-    const chips = new Map();
     const grid = el("div", "cmcp-apps-grid");
-    // Search is the shell's shared box (shown only on Explore); its value is
-    // mirrored into exploreQuery and re-runs load() via onSearch.
+    // Sort lives in the shared header filter panel (openAppsFilters), not inline
+    // chips — Explore reads the module-scoped exploreSort. Search is the shell's
+    // shared box (shown only on Explore); its value is mirrored into exploreQuery
+    // and re-runs load() via onSearch.
     async function load(append = false, cursor = "") {
       if (!append) {
         grid.textContent = "";
         grid.append(el("div", "cmcp-apps-empty", "Loading…"));
       }
       try {
-        const res = await registry.list({ sort, q: exploreQuery.trim(), cursor });
+        const res = await registry.list({ sort: exploreSort, q: exploreQuery.trim(), cursor });
         if (closed) return;
         if (!append) grid.textContent = "";
         renderCards(res.apps || [], res.next_cursor);
@@ -489,18 +531,8 @@ export function createAppsContent(ctx, shell, opts = {}) {
         grid.append(more);
       }
     }
-    for (const [key, label] of sorts) {
-      const chip = makeBtn(label, { primary: key === sort });
-      chips.set(key, chip);
-      chip.addEventListener("click", () => {
-        sort = key;
-        for (const [k, c] of chips) c.classList.toggle("primary", k === sort);
-        load();
-      });
-      controls.append(chip);
-    }
-    _exploreReload = () => load(); // onSearch (shared box) re-runs this
-    body.append(controls, grid);
+    _exploreReload = () => load(); // onSearch (shared box) + filter panel re-run this
+    body.append(grid);
     load();
   }
 
@@ -1296,11 +1328,31 @@ export function createAppsContent(ctx, shell, opts = {}) {
     body.append(bar, el("div", "cmcp-apps-empty", e && e.message ? e.message : String(e)));
   }
 
+  // Cross-tab hop seed (CivitAI's "Create App from workflow" → shell.switchTab
+  // ("apps", { view: "convert" })): open straight into the convert view seeded
+  // from the now-loaded canvas. Runs during activate BEFORE onActivate; setting
+  // _started here suppresses onActivate's default showGrid so it can't clobber
+  // the convert form.
+  function reseed(o) {
+    if (!o) return;
+    if (o.view === "convert" || o.convert) {
+      _tab = "mine";
+      _started = true;
+      syncChips();
+      shell.syncSearch();
+      showConvert().catch(showError);
+    }
+  }
+
   return {
     key: "apps", label: "Apps", icon: "pi-th-large", driveKind: null,
     hasSearch: () => _tab === "explore",
     searchPlaceholder: "Search apps…",
-    subnavExtras: () => [mineChip, exploreChip],
+    subnavExtras: () => [mineChip, exploreChip, filterBtn],
+    reseed,
+    // Escape peels an open filter (or other stacked) sheet before it can close the
+    // panel — mirrors CivitAI's escapeBlocked.
+    escapeBlocked: () => _subModals.size > 0,
     mount(bodyEl) { bodyEl.appendChild(body); },
     onActivate() {
       _hidden = false;

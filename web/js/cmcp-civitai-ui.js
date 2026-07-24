@@ -17,6 +17,7 @@ import {
 } from "./cmcp-civitai.js";
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import { openSubModal as openSubModalBase, toast } from "./cmcp-modal.js";
+import { chipRow as filterChipRow, makeFilterButton } from "./cmcp-filter.js";
 
 const TABS = [
   { key: "images", label: "Images", icon: "pi-image", media: "image" },
@@ -390,14 +391,12 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   }
   // The shell wires its single search input → onSearch (returned below); no
   // direct input/keydown listeners are attached here.
-  const filterBtn = el("button", "cmcp-cv-iconbtn");
-  // margin-left:auto pushes the filter ⚙ + account 👤 pair to the subnav's right
-  // edge while the sub-tab row stays left-aligned.
-  filterBtn.style.marginLeft = "auto";
-  filterBtn.innerHTML = '<i class="pi pi-sliders-h"></i>';
-  const filterDot = el("span", "cmcp-cv-dot"); filterDot.style.display = "none";
-  filterBtn.appendChild(filterDot);
-  filterBtn.addEventListener("click", () => toggleFilters());
+  // Header filter button + "dirty" dot via the shared filter helper (cmcp-filter.js)
+  // — same DOM CivitAI always rendered (button.cmcp-cv-iconbtn + child span.cmcp-cv-dot,
+  // margin-left:auto pushing the filter ⚙ + account 👤 pair to the subnav's right
+  // edge, no title to stay byte-identical). setFilterActive lights the dot.
+  const { btn: filterBtn, setActive: setFilterActive } =
+    makeFilterButton({ onOpen: () => toggleFilters(), title: null });
   const acctBtn = el("button", "cmcp-cv-iconbtn");
   acctBtn.innerHTML = '<i class="pi pi-user"></i>';
   acctBtn.title = "CivitAI account";
@@ -445,7 +444,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     for (const b of subTabsWrap.children) b.classList.toggle("active", b._key === state.tab);
     favChips.style.display = tabDef().fav ? "" : "none";
     for (const c of favChips.children) c.classList.toggle("on", c._fv === state.favType);
-    filterDot.style.display = filtersDirty(state.filters) ? "" : "none";
+    setFilterActive(filtersDirty(state.filters));
   }
 
   // ── data ───────────────────────────────────────────────────────────────
@@ -884,6 +883,14 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
             loadBtn.title = "Replace the current canvas with this post's embedded ComfyUI workflow (Ctrl+Z undoes it).";
             loadBtn.addEventListener("click", () => { void loadOntoCanvas(wf.graph, closeLb); });
             actions.appendChild(loadBtn);
+            // Same loadable-workflow condition as "Load onto canvas": load the graph,
+            // then jump to the Apps tab's convert view seeded from the live canvas.
+            const appBtn = el("button", "cmcp-btn", "Create App from workflow");
+            appBtn.title = "Load this workflow onto the canvas and package it as a one-click app.";
+            appBtn.addEventListener("click", () => {
+              void createAppFromWorkflow(() => loadOntoCanvas(wf.graph, closeLb, { keepPanelOpen: true }));
+            });
+            actions.appendChild(appBtn);
           }
           const saveBtn = el("button", "cmcp-btn", "Save workflow");
           saveBtn.addEventListener("click", () => saveWorkflow(it, wf.graph));
@@ -1038,8 +1045,11 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
    *  checkState — one load = one Ctrl+Z step). Success is only announced —
    *  and the explorer only closed — after the awaited load actually landed;
    *  `beforeClose` runs first (e.g. the lightbox, which isn't a sub-modal).
+   *  `opts.keepPanelOpen` keeps the unified side-panel up after a successful land
+   *  (the create-app-from-workflow hop needs to switch to the Apps tab rather than
+   *  dismiss the explorer); the originating lightbox/sub-modal is still closed.
    *  Returns true when it loaded. */
-  async function loadOntoCanvas(graph, beforeClose) {
+  async function loadOntoCanvas(graph, beforeClose, opts = {}) {
     if (typeof ctx.loadGraph !== "function") {
       toast("This panel build can't load onto the canvas.");
       return false;
@@ -1063,9 +1073,30 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     }
     if (beforeClose) { try { beforeClose(); } catch { /* already gone */ } }
     closeSubModals();
-    close();
+    // keepPanelOpen: the create-app-from-workflow flow hops to the Apps tab next,
+    // so the side-panel must stay up; a plain load closes the whole explorer.
+    if (!opts.keepPanelOpen) close();
     toast(`Workflow loaded onto the canvas — ${res.node_count} node${res.node_count === 1 ? "" : "s"}. Ctrl+Z undoes it.`);
     return true;
+  }
+
+  /** "Create App from workflow": run `loadWorkflow` (a thunk that loads a UI-format
+   *  graph onto the canvas with the panel kept open — reusing whichever existing
+   *  load path the calling surface uses, so the dirty-confirm + undoable graph_load
+   *  + empty-guard stay identical to that surface's plain "Load onto canvas"
+   *  button), then hop to the Apps tab and open its convert view seeded from the
+   *  now-loaded canvas. The loader resolves truthy only when the graph actually
+   *  landed; on a failed/cancelled/gated load we stay put (the loader already
+   *  toasted). Both the media lightbox and the model-detail surface share this. */
+  async function createAppFromWorkflow(loadWorkflow) {
+    const loaded = await loadWorkflow();
+    if (!loaded) return; // load failed / was cancelled — stay put (toast already shown)
+    try {
+      if (typeof shell.switchTab === "function") shell.switchTab("apps", { view: "convert" });
+      else toast("This panel build can't open the Apps tab.");
+    } catch (e) {
+      toast("Couldn't open the Apps tab: " + (e.message || e));
+    }
   }
 
   /** Download a model-version workflow file (raw .json or civitai's zip
@@ -1073,7 +1104,10 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
    *  with a picker when an archive holds several. Reports progress and EVERY
    *  failure through `opts.setStatus` (an inline line in the detail sheet) as
    *  well as a toast, and NEVER closes the sheet on failure — only a genuine
-   *  canvas load (via loadOntoCanvas) dismisses the explorer. */
+   *  canvas load (via loadOntoCanvas) dismisses the explorer. `opts.keepPanelOpen`
+   *  threads through to loadOntoCanvas so the create-app-from-workflow hop keeps
+   *  the side-panel up. Resolves truthy only when a graph actually landed (the
+   *  single-file case, or a chosen entry from the multi-workflow picker). */
   async function loadVersionWorkflow(version, file, opts = {}) {
     const setStatus = opts.setStatus || (() => {});
     const say = (msg, kind = "err") => { setStatus(msg, kind); toast(msg); };
@@ -1124,19 +1158,33 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       return;
     }
     setStatus("", "info"); // clear before a successful load closes the explorer
-    if (uis.length === 1) { await loadOntoCanvas(uis[0].graph); return; }
-    // several workflows in one archive — let the user pick
-    const picker = openSubModal("Pick a workflow to load");
-    const list = el("div", "cmcp-cv-creators");
-    list.style.maxHeight = "24rem";
-    for (const c of uis) {
-      const b = el("button", "cmcp-cv-creator");
-      b.appendChild(el("span", null, c.name));
-      b.appendChild(el("span", "sub", `${c.graph.nodes.length} nodes`));
-      b.addEventListener("click", () => { void loadOntoCanvas(c.graph); });
-      list.appendChild(b);
-    }
-    picker.body.appendChild(list);
+    // keepPanelOpen threads through to every loadOntoCanvas call so the create-app
+    // flow keeps the side-panel up (the detail sheet still closes). The resolved
+    // boolean = "a graph actually landed", so createAppFromWorkflow hops only on a
+    // real load.
+    const keepPanelOpen = !!opts.keepPanelOpen;
+    if (uis.length === 1) return await loadOntoCanvas(uis[0].graph, undefined, { keepPanelOpen });
+    // several workflows in one archive — let the user pick.
+    return await new Promise((resolve) => {
+      let picking = false; // a pick is in flight — its closeSubModals teardown must not resolve false
+      const picker = openSubModal("Pick a workflow to load", () => { if (!picking) resolve(false); });
+      const list = el("div", "cmcp-cv-creators");
+      list.style.maxHeight = "24rem";
+      for (const c of uis) {
+        const b = el("button", "cmcp-cv-creator");
+        b.appendChild(el("span", null, c.name));
+        b.appendChild(el("span", "sub", `${c.graph.nodes.length} nodes`));
+        b.addEventListener("click", () => {
+          picking = true;
+          loadOntoCanvas(c.graph, undefined, { keepPanelOpen }).then((ok) => {
+            if (ok) resolve(true);
+            else picking = false; // failed — let another pick (or a close) settle it
+          });
+        });
+        list.appendChild(b);
+      }
+      picker.body.appendChild(list);
+    });
   }
 
   // ── model detail ─────────────────────────────────────────────────────
@@ -1186,6 +1234,18 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         b.title = `Download ${f.name}${size ? ` (${size})` : ""} and load it onto the canvas (Ctrl+Z undoes it).`;
         b.addEventListener("click", () => { void loadVersionWorkflow(version, f, { setStatus, signIn: () => accountFlow() }); });
         dl.appendChild(b);
+        // Same loadable-workflow condition as "Load onto canvas" (every wfFile is
+        // loadable): load the SELECTED version's workflow with the panel kept open,
+        // then hop to the Apps convert view seeded from the now-loaded canvas.
+        const appB = el("button", "cmcp-btn",
+          wfFiles.length > 1 ? `Create App — ${f.name}` : "Create App from workflow");
+        appB.title = "Download this workflow, load it onto the canvas, and package it as a one-click app.";
+        appB.addEventListener("click", () => {
+          void createAppFromWorkflow(
+            () => loadVersionWorkflow(version, f, { setStatus, signIn: () => accountFlow(), keepPanelOpen: true }),
+          );
+        });
+        dl.appendChild(appB);
       }
       if (have) {
         const note = el("span", null, "You already have this file locally.");
@@ -1303,17 +1363,11 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       sheet.body.innerHTML = "";
       const wrap = el("div", "cmcp-cv-filters");
 
-      const chipRow = (label, options, isOn, onToggle) => {
-        wrap.appendChild(el("div", "cmcp-cv-flabel", label));
-        const row = el("div", "cmcp-cv-frow");
-        for (const o of options) {
-          const chip = el("button", "cmcp-cv-chip", o.label);
-          if (isOn(o.value)) chip.classList.add("on");
-          chip.addEventListener("click", () => { onToggle(o.value); renderSheet(); update(); });
-          row.appendChild(chip);
-        }
-        wrap.appendChild(row);
-      };
+      // Delegates to the shared chip-row builder (cmcp-filter.js) — same DOM, same
+      // click semantics (toggle → re-render the sheet so the pressed state flips,
+      // then reload the feed behind it).
+      const chipRow = (label, options, isOn, onToggle) =>
+        filterChipRow(wrap, label, options, isOn, (v) => { onToggle(v); renderSheet(); update(); });
 
       chipRow("Time period", PERIODS.map((p) => ({ label: p, value: p })),
         (v) => f.period === v, (v) => { f.period = v; });
