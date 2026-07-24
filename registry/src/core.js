@@ -124,8 +124,9 @@ export function buildListQuery({ sort, q, creator, includeNsfw, limit, cursor })
   const scoreExpr =
     `(SELECT COUNT(*) FROM stars s WHERE s.app_id = a.id AND s.created_at > unixepoch() - 604800) * 3 ` +
     `+ (SELECT COUNT(*) FROM run_marks r WHERE r.app_id = a.id AND r.day > strftime('%Y-%m-%d', 'now', '-7 days'))`;
-  const cursorCol = sort === "stars" ? "star_count" : sort === "trending" ? "score" : "created_at";
-  const orderDir = cursorCol === "created_at" ? "DESC" : "DESC";
+  const CURSOR_COLS = { stars: "star_count", trending: "score", new: "created_at" };
+  const cursorCol = CURSOR_COLS[sort] || "created_at";
+  const orderDir = "DESC";
   const inner = `SELECT a.*, ${scoreExpr} AS score FROM apps a WHERE ${where.join(" AND ")}`;
 
   let outerWhere = "";
