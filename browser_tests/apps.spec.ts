@@ -610,10 +610,20 @@ test('explore: registry app opens straight into inputs — star icon, requiremen
   // object_info passes through to the real server — FancyCustomNode can't be
   // in it) — both rows must show as actionable, not a gate.
   await page.route(/\/models\/checkpoints/, (route) => route.fulfill({ json: ['sdxl.safetensors'] }))
-  // The download action goes through the bridge's whitelisted tool.
+  // The download action goes through the bridge's whitelisted tool; model
+  // install-state checks go through the SAME channel (list_local_models).
   const downloads: Record<string, unknown>[] = []
   mockBridge.onFrame((frame) => {
     if (frame.type !== 'call_tool') return
+    if (frame.tool === 'list_local_models') {
+      mockBridge.send({
+        type: 'tool_result',
+        cid: frame.cid,
+        ok: true,
+        result: [{ type: 'text', text: JSON.stringify({ checkpoints: ['sdxl.safetensors'] }) }]
+      })
+      return
+    }
     if (frame.tool === 'download_civitai_model') {
       downloads.push(frame.args as Record<string, unknown>)
       mockBridge.send({
@@ -645,9 +655,11 @@ test('explore: registry app opens straight into inputs — star icon, requiremen
   // The prompt input is there immediately.
   await expect(modal.locator('.cmcp-apps-field', { hasText: 'Prompt' }).locator('textarea')).toHaveValue('hello')
 
-  // Star icon sits next to the title (not an action-row button); it toggles.
+  // Star icon sits next to the title (not an action-row button); it stays
+  // disabled until the real starred state arrives, then toggles.
   const starBtn = modal.locator('.cmcp-apps-starbtn')
   await expect(starBtn).toBeVisible()
+  await expect(starBtn).toBeEnabled()
   await expect(starBtn).toHaveText('☆')
   await starBtn.click()
   await expect(starBtn).toHaveText('★')

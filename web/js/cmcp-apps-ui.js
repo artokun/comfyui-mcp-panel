@@ -771,29 +771,52 @@ export function createAppsContent(ctx, shell, opts = {}) {
   async function modelListFor(folder) {
     if (_modelListCache.has(folder)) return _modelListCache.get(folder);
     let names = [];
-    try {
-      const res = await fetch(`/models/${encodeURIComponent(folder)}`);
-      const j = await res.json();
-      if (Array.isArray(j)) names = j.map(String);
-    } catch { /* no folder / offline */ }
+    // Check through the SAME channel downloads use: the bridge (which targets
+    // the connected ComfyUI — local or pod). A local /models check beside a
+    // pod-side download would lie in both directions (codex finding).
+    if (typeof callTool === "function") {
+      try {
+        const res = await callTool("list_local_models", { model_type: folder });
+        names = parseModelList(res, folder);
+      } catch { /* bridge offline — fall back to the local HTTP list */ }
+    }
+    if (!names.length) {
+      try {
+        const res = await fetch(`/models/${encodeURIComponent(folder)}`);
+        const j = await res.json();
+        if (Array.isArray(j)) names = j.map(String);
+      } catch { /* no folder / offline */ }
+    }
     _modelListCache.set(folder, names);
     return names;
   }
-  const _base = (p) => String(p || "").split(/[\\/]/).pop().toLowerCase();
+  /** Normalize separators; compare the COMPLETE model path — basename-only
+   *  matching treats foo/x.safetensors and bar/x.safetensors as the same file
+   *  (codex finding). Case-insensitive only as a fallback (Windows rigs write
+   *  deps with different casing than Linux hosts store). */
+  const _normPath = (p) => String(p || "").replace(/\\/g, "/").replace(/^\/+/, "");
+  function modelInstalled(names, want) {
+    const w = _normPath(want);
+    if (names.some((n) => _normPath(n) === w)) return true;
+    const wl = w.toLowerCase();
+    return names.some((n) => _normPath(n).toLowerCase() === wl);
+  }
 
   /** Render the Requirements rows with install states + download actions. */
   async function buildRequirements(panel, models, nodes) {
     const types = await installedNodeTypes();
     for (const m of models) {
       const name = String(m.name || m);
-      const dir = modelDirForWidget(m.widget) || "checkpoints";
+      // An explicit target subfolder wins over the widget heuristic (a pinned
+      // LoRA with a nonstandard widget must not land in checkpoints — codex).
+      const dir = m.targetSubfolder || modelDirForWidget(m.widget) || "checkpoints";
       const row = el("div", "cmcp-apps-req-row");
       const nm = el("span", "nm", name);
       nm.title = name;
       row.append(nm);
       panel.append(row);
       const names = await modelListFor(dir);
-      const have = names.some((n) => _base(n) === _base(name));
+      const have = modelInstalled(names, name);
       if (closed) return;
       if (have) {
         row.append(el("span", "cmcp-apps-req-ok", "✓"));
@@ -806,10 +829,16 @@ export function createAppsContent(ctx, shell, opts = {}) {
           dl.disabled = true;
           dl.textContent = "…";
           try {
+            // Downloads routinely exceed the 60s default — the CivitAI
+            // downloader uses 20 minutes; match it or the UI reports failure
+            // while the backend keeps going (and invites a duplicate).
+            const DL_TIMEOUT = { timeout: 20 * 60 * 1000 };
             const res = m.civitaiVersionId
-              ? await callTool("download_civitai_model", { model_version_id: m.civitaiVersionId, target_subfolder: dir })
-              : await callTool("download_model", { url: m.url, target_subfolder: dir });
+              ? await callTool("download_civitai_model", { model_version_id: m.civitaiVersionId, target_subfolder: dir }, DL_TIMEOUT)
+              : await callTool("download_model", { url: m.url, target_subfolder: dir }, DL_TIMEOUT);
             if (res && res.ok === false) throw new Error(toolText(res));
+            // Keep the folder cache honest or a reopen shows it missing again.
+            _modelListCache.delete(dir);
             row.textContent = "";
             row.append(nm, el("span", "cmcp-apps-req-ok", "✓"));
           } catch (e) {
@@ -879,10 +908,17 @@ export function createAppsContent(ctx, shell, opts = {}) {
         starBtn.classList.toggle("starred", starred);
         starCount.textContent = String(count);
       };
+      // No clicks until the real state arrives — a click while the lookup is
+      // in flight would toggle from the WRONG initial value (star instead of
+      // unstar, corrupting the count — codex finding).
+      starBtn.disabled = true;
       registry.starred(regCtx.id).then((r) => {
         starred = !!r?.starred;
         paint();
-      }).catch(() => {});
+      }).catch(() => {})
+        .finally(() => {
+          starBtn.disabled = false;
+        });
       starBtn.addEventListener("click", async () => {
         starred = !starred;
         count = Math.max(0, count + (starred ? 1 : -1));
