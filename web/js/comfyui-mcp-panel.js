@@ -1786,7 +1786,7 @@ function panelSettingsList() {
       id: SETTING_FLAG_APPS,
       name: "Show Apps",
       category: cat("Features", "Show Apps"),
-      sortOrder: 150,
+      sortOrder: 147,
       tooltip:
         "Show the Apps button in the toolbar — the micro-app layer (convert a workflow into a one-click app, " +
         "run it locally or on a pod, publish/explore). Off by default; the flag is also sent to a connected mobile app.",
@@ -1801,7 +1801,7 @@ function panelSettingsList() {
       id: SETTING_FLAG_TRAINING,
       name: "Show Training",
       category: cat("Features", "Show Training"),
-      sortOrder: 151,
+      sortOrder: 148,
       tooltip:
         "Show the Training button in the toolbar — the LoRA training wizard (dataset gather/label/launch/monitor). " +
         "Off by default; the flag is also sent to a connected mobile app.",
@@ -1816,7 +1816,7 @@ function panelSettingsList() {
       id: SETTING_FLAG_RUNPOD,
       name: "Show RunPod / Local",
       category: cat("Features", "Show RunPod / Local"),
-      sortOrder: 152,
+      sortOrder: 149,
       tooltip:
         "Show the RunPod / Local host button in the toolbar — deploy/start/stop/connect a cloud GPU pod, or switch " +
         "back to local. Off by default; the flag is also sent to a connected mobile app.",
