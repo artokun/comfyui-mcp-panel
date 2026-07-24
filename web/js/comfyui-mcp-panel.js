@@ -11313,10 +11313,6 @@ function buildPanel() {
       state: materialize ? "queued" : "sending",
       materialize: materialize || null,
     });
-    // A real user_message is going out → a NEW turn is expected. Drop the
-    // stale-working guard here (NOT in appendUser, which also paints local slash
-    // commands like /help that must NOT re-open the resurrection window).
-    localEndPending = false;
     const ok = client.sendUserMessage(payload.text, payload.context, payload.images, mid);
     if (!ok) setMsgStatus(mid, "failed"); // socket wasn't open — instant fail
     else armDeliveryTimeout(mid);
@@ -12004,7 +12000,13 @@ function buildPanel() {
   let thinkingAction = null; // current tool/operation label (from `action` frames)
   let thinkingReconnecting = false; // transient bridge drop while a turn is live
   let lastActivityAt = 0; // Date.now() of the last real turn frame; bounds the backstop
-  let localEndPending = false; // a local end happened → ignore ONE stale turn:working
+  let localEndAt = 0; // Date.now() of the last LOCAL turn end (interrupt/disconnect/switch)
+  // A turn:working arriving within this window of a local end is treated as a
+  // straggler from the turn we just ended and ignored. Path-independent (no
+  // reliance on catching every send site) — a human can't end a turn and start a
+  // NEW one inside this window, so a genuine new turn is never dropped. (The fully
+  // correct fix needs per-turn ids on the orchestrator's frames; this is the bound.)
+  const STALE_WORKING_GUARD_MS = 300;
   // Backstop: if no activity (say/command/turn signal) for this long, auto-hide
   // — covers a missed turn:done (e.g. an older orchestrator, or an errored turn)
   // so the indicator never sticks forever.
@@ -12023,18 +12025,24 @@ function buildPanel() {
 
   // The 120s backstop must never make a STILL-RUNNING turn look finished (a
   // silent tool phase can exceed two minutes). While the turn is authoritative
-  // (working + connected) AND the silence is under budget, repair a detached
-  // indicator and re-arm — WITHOUT counting that as activity — so a long silent
-  // tool phase stays visible. Otherwise hide: that covers a permanent disconnect
-  // (bridgeConnected false) and a missed turn:done (silence budget exceeded), so
-  // the indicator can never spin forever.
+  // (agentWorking) AND the total silence is under budget, keep the indicator
+  // alive — WITHOUT counting the re-arm as activity — so a long silent tool phase
+  // OR a transient bridge outage stays visible up to the SAME 10-minute budget.
+  // A disconnect isn't special-cased: it's just silence, bounded by the budget,
+  // so a reconnect within it repairs rather than hitting a shorter 120s cliff.
+  // Once the budget is exceeded (or the turn already ended), reap.
   function onThinkingSafety() {
     thinkingSafety = null;
-    const liveTurn = agentWorking && bridgeConnected;
     const withinBudget = Date.now() - lastActivityAt < MAX_SILENT_TURN_MS;
-    if (liveTurn && withinBudget) {
+    if (agentWorking && withinBudget) {
       if (!thinkingEl) {
-        showThinking(); // detached by a mid-turn repaint — rebuild (also re-arms)
+        // Detached by a mid-turn repaint — rebuild. showThinking() calls
+        // armSafety(), which would reset lastActivityAt and let repeated
+        // repaint/repair cycles extend the budget forever; save/restore it so a
+        // repair never counts as real activity.
+        const clock = lastActivityAt;
+        showThinking();
+        lastActivityAt = clock;
       } else {
         // Re-arm directly, NOT via armSafety(), so the silence clock keeps running
         // toward MAX_SILENT_TURN_MS instead of resetting on a non-activity re-arm.
@@ -12042,11 +12050,11 @@ function buildPanel() {
       }
       return;
     }
-    // Reaping: we've concluded the turn isn't live (ended, disconnected, or silent
-    // past budget). Terminate it locally too — leaving agentWorking true would keep
-    // the composer "queued" forever and let a repaint/reconnect resurrect a dead
-    // indicator. A turn that IS still alive re-announces via turn:working on
-    // reconnect (localEndPending stays false), which re-shows it.
+    // Reaping: the turn isn't live (already ended, or silent past budget).
+    // Terminate it locally too — leaving agentWorking true would keep the composer
+    // "queued" forever and let a repaint/reconnect resurrect a dead indicator. A
+    // turn that IS still alive re-announces via turn:working on reconnect (outside
+    // the stale-working window), which re-shows it.
     if (agentWorking) {
       agentWorking = false;
       ssSet(MID_TASK_KEY, null);
@@ -12126,7 +12134,7 @@ function buildPanel() {
   // resurrect the indicator in the window before the orchestrator's turn:done.
   function endTurnLocally() {
     agentWorking = false;
-    localEndPending = true; // ignore a stale turn:working still in flight for this turn
+    localEndAt = Date.now(); // briefly ignore a straggler turn:working from this turn
     ssSet(MID_TASK_KEY, null); // turn stopped — nothing to resume
     hideThinking();
   }
@@ -12205,11 +12213,6 @@ function buildPanel() {
   // tray) rather than start immediately. Drives the tray-vs-inline decision so
   // an idle send doesn't briefly flash through the tray.
   let agentWorking = false;
-  // Best-effort "is the bridge live" flag (mirrors onStatus). The working
-  // indicator persists past the 120s backstop only while a turn is BOTH working
-  // AND connected — so a permanent bridge drop mid-turn still self-clears in
-  // ≤120s instead of spinning "Reconnecting…" forever.
-  let bridgeConnected = false;
 
   // Set by a Settings "Set … token" button just before it asks the agent to open
   // the secure input, so the resolved value can be marked set/not-set (timestamp
@@ -12284,7 +12287,6 @@ function buildPanel() {
       // (clicking Disconnect, or trying to send while disconnected) and live
       // at those call sites.
       const connected = state === "connected";
-      bridgeConnected = connected; // bounds the working-indicator backstop
       connectBtn.hidden = connected;
       disconnectBtn.hidden = !connected;
       connectBtn.disabled = state === "connecting";
@@ -12535,11 +12537,12 @@ function buildPanel() {
     },
     onTurn(state) {
       if (state === "working") {
-        // Ignore a stale turn:working left over from a turn we ended locally
-        // (interrupt / disconnect / backend switch). One-shot: a genuine new
-        // turn clears this guard on send (appendUser), so only an uncorrelated
-        // straggler is dropped, never a real new turn.
-        if (localEndPending) { localEndPending = false; return; }
+        // Ignore a straggler turn:working from a turn we just ended locally
+        // (interrupt / disconnect / backend switch) — one that was already in
+        // flight when we ended it. The time window is path-independent, so it
+        // works regardless of which send path (composer, card reply, slash) starts
+        // the NEXT turn, and a human can't end + restart a turn inside the window.
+        if (Date.now() - localEndAt < STALE_WORKING_GUARD_MS) return;
         agentWorking = true;
         showThinking();
         ssSet(MID_TASK_KEY, "1"); // a turn is in flight — arm the resume nudge
@@ -13964,7 +13967,6 @@ function buildPanel() {
     // client.stop() sets closed=true, so the socket onclose suppresses onStatus
     // — end the turn locally so the working indicator can't spin forever against
     // a turn the user just walked away from (no turn:done will ever arrive).
-    bridgeConnected = false;
     endTurnLocally();
     connectBtn.hidden = false;
     disconnectBtn.hidden = true;
