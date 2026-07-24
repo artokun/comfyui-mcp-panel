@@ -1039,6 +1039,11 @@ export class ChatHistoryStore {
         updatedAt: revision.updatedAt,
         revision,
       };
+      // A genuinely new thread needs a CAUSAL creation stamp: without one,
+      // normalization synthesizes createdRevision from createdAt, which a
+      // future-dated checkpoint then classifies as pre-checkpoint and drops
+      // (the whole fresh conversation vanishes on merge/reload — codex finding).
+      if (!thread.createdRevision) thread.createdRevision = revision;
       if (deleted) delete thread[field];
       else thread[field] = cloneJson(normalizedValue);
       newestAt = Math.max(newestAt, revision.updatedAt);
@@ -1053,6 +1058,9 @@ export class ChatHistoryStore {
     if (!message || typeof message !== "object") return message;
     this._observeRevision(message.revision || message);
     const revision = this.nextRevision(updatedAt);
+    // Same causal-creation guarantee as threads: a checkpoint at/ahead of wall
+    // clock must not read this genuinely-new message as pre-checkpoint.
+    if (!message.createdRevision) message.createdRevision = revision;
     message.updatedAt = revision.updatedAt;
     message.revision = revision;
     return message;
@@ -1270,18 +1278,27 @@ export class ChatHistoryStore {
       ) return;
       // Resolve through canonical IDB first so quarantined pre-v3 shadows never
       // transiently remount in another live panel.
-      void this.readCanonical().then(listener);
+      notify();
     };
     const onBroadcast = (event) => {
       if (
         !["history-changed", "history-reset"].includes(event?.data?.type) ||
         event.data.writerId === this.writerId
       ) return;
-      void this.readCanonical().then(listener);
+      notify();
+    };
+    let active = true;
+    // A read started before unsubscribe must not deliver into a dead panel —
+    // a slow IDB read can otherwise fire the stale listener AFTER a replacement
+    // panel mounted (it would clear shared session keys / push new_session on
+    // behalf of a delete that panel already handled — codex finding).
+    const notify = () => {
+      void this.readCanonical().then((snapshot) => {
+        if (active) listener(snapshot);
+      });
     };
     eventTarget?.addEventListener?.("storage", onStorage);
     this._broadcastChannel?.addEventListener?.("message", onBroadcast);
-    let active = true;
     const unsubscribe = () => {
       if (!active) return;
       active = false;
