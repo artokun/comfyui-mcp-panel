@@ -519,14 +519,25 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         const enabledMask = bitmask(levels);
         const colId = await resolveLikesCollectionId(client);
         if (req !== state.reqId) return;
-        const page = await client.fetchFavorites({
-          cursor: state.cursor,
-          levels: LEVELS.map((l) => l.level),
-          sort: f.imageSort, period: f.period,
+        const firstPage = state.cursor == null;
+        // Favorites is a personal collection; the shared period default ("Week")
+        // hides older likes → "no results". Fall back to All-Time when a period
+        // empties the FIRST page, and remember it (state.favPeriod) so paging keeps
+        // the same period. Still honors sort + the client-side filters below.
+        let usePeriod = firstPage ? f.period : (state.favPeriod || f.period);
+        const favArgs = (period, cursor) => ({
+          cursor, levels: LEVELS.map((l) => l.level), sort: f.imageSort, period,
           ...(colId ? { collectionId: colId } : {}),
           ...(state.favType !== "all" ? { types: [state.favType] } : {}),
         });
+        let page = await client.fetchFavorites(favArgs(usePeriod, state.cursor));
         if (req !== state.reqId) return;
+        if (firstPage && (page.items?.length ?? 0) === 0 && usePeriod !== "AllTime") {
+          usePeriod = "AllTime";
+          page = await client.fetchFavorites(favArgs("AllTime", null));
+          if (req !== state.reqId) return;
+        }
+        state.favPeriod = usePeriod;
         state.cursor = page.nextCursor; state.done = !page.nextCursor;
         // Dedup on id: the feed pages by "last item id" (see the client's
         // cursor quirk) — if CivitAI ever flips its keyset comparison to
