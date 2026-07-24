@@ -110,6 +110,22 @@ function injectStyle() {
   border-radius:8px;padding:0.55rem 0.65rem;}
 /* Fallback for danger buttons rendered outside .cmcp-apps-body (defensive). */
 .cmcp-btn.danger{border-color:rgba(248,113,113,0.5);color:#f87171;}
+.cmcp-apps-main{display:flex;gap:1rem;align-items:flex-start;min-height:0;}
+.cmcp-apps-main>.grow{flex:1;min-width:0;display:flex;flex-direction:column;gap:0.75rem;}
+.cmcp-apps-reqs{flex:0 0 240px;border:1px solid var(--p-content-border-color,#3f3f46);border-radius:10px;padding:0.6rem 0.7rem;
+  display:flex;flex-direction:column;gap:0.35rem;font-size:0.78rem;}
+@media (max-width:720px){.cmcp-apps-main{flex-direction:column;}.cmcp-apps-reqs{flex:1 1 auto;width:100%;}}
+.cmcp-apps-reqs h4{margin:0 0 0.15rem;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.05em;opacity:0.6;}
+.cmcp-apps-req-row{display:flex;align-items:center;gap:0.4rem;padding:0.15rem 0;}
+.cmcp-apps-req-row .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.cmcp-apps-req-ok{color:#22c55e;flex:0 0 auto;}
+.cmcp-apps-req-miss{color:#f59e0b;flex:0 0 auto;}
+.cmcp-apps-req-dl{flex:0 0 auto;font-size:0.72rem;padding:0.1rem 0.45rem;}
+.cmcp-apps-title-row{display:flex;align-items:center;gap:0.45rem;}
+.cmcp-apps-starbtn{border:none;background:none;color:inherit;font-size:1.05rem;cursor:pointer;padding:0 0.1rem;line-height:1;}
+.cmcp-apps-starbtn:hover{color:#facc15;}
+.cmcp-apps-starbtn.starred{color:#facc15;}
+.cmcp-apps-starcount{font-size:0.78rem;opacity:0.7;}
 `;
   const el = document.createElement("style");
   el.textContent = css;
@@ -538,6 +554,46 @@ export function createAppsContent(ctx, shell, opts = {}) {
 
   // ── Registry app detail (install view) ───────────────────────────────────
 
+  /** Silent, idempotent install of a registry bundle as a local app. The
+   *  registry id becomes the local id; an already-installed copy is left
+   *  alone (its published marker is refreshed so Update-published works). */
+  async function installRegistryBundle(regApp, bundle) {
+    let thumbnail_b64;
+    try {
+      const res = await fetch(registry.thumbnailUrl(regApp.id));
+      if (res.ok) {
+        const buf = new Uint8Array(await res.arrayBuffer());
+        let bin = "";
+        for (const b of buf) bin += String.fromCharCode(b);
+        thumbnail_b64 = btoa(bin);
+      }
+    } catch { /* no thumbnail — fine */ }
+    try {
+      await client.create({
+        manifest: {
+          ...bundle.manifest,
+          source: { type: "registry", workflowUuid: null, registryId: regApp.id },
+          published: { registryId: regApp.id, slug: regApp.slug, publishedVersion: regApp.version },
+        },
+        prompt: bundle.prompt,
+        ...(bundle.workflow ? { workflow: bundle.workflow } : {}),
+        ...(thumbnail_b64 ? { thumbnail_b64 } : {}),
+      });
+    } catch (e) {
+      if (!/already exists/.test(e.message || "")) throw e;
+      // Already installed — refresh the published marker so the detail's
+      // update path tracks the registry version the user is looking at.
+      try {
+        await client.update(regApp.id, {
+          manifest: { published: { registryId: regApp.id, slug: regApp.slug, publishedVersion: regApp.version } },
+        });
+      } catch { /* older copy without the app — proceed to detail anyway */ }
+    }
+  }
+
+  /** Registry app view: NO install gate — the bundle installs silently on
+   *  open and the local detail shows immediately (inputs right away). Deps
+   *  are visible in the Requirements panel before the first run. */
   async function showRegistryDetail(regApp) {
     if (closed) return;
     body.textContent = "";
@@ -545,106 +601,14 @@ export function createAppsContent(ctx, shell, opts = {}) {
     const back = makeBtn("← Explore");
     back.addEventListener("click", () => { _tab = "explore"; showGrid().catch(showError); });
     bar.append(back);
-    body.append(bar);
-
-    const detail = el("div", "cmcp-apps-detail");
-    const head = el("div", "cmcp-apps-detail-head");
-    const thumb = el("div", "thumb", "▶");
-    thumb.style.backgroundImage = `url("${registry.thumbnailUrl(regApp.id)}")`;
-    thumb.textContent = "";
-    const titles = el("div", "titles");
-    titles.append(el("h3", "", regApp.name || "Untitled"));
-    titles.append(el("div", "desc", `by ${regApp.creator || "anonymous"} · ★ ${regApp.stars || 0} · ${regApp.runs || 0} runs · v${regApp.version || 1}`));
-    if (regApp.description) titles.append(el("div", "desc", regApp.description));
-    head.append(thumb, titles);
-    detail.append(head);
-
-    if (regApp.hide_workflow) {
-      detail.append(
-        el(
-          "div",
-          "cmcp-apps-warn",
-          "Hidden workflow (best effort): the graph is never distributed with this app — but anyone technical " +
-            "who runs it can still intercept the prompt via ComfyUI's API. Real protection comes with hosted runs (coming soon).",
-        ),
-      );
+    body.append(bar, el("div", "cmcp-apps-empty", "Preparing…"));
+    try {
+      const bundle = await registry.bundle(regApp.id);
+      await installRegistryBundle(regApp, bundle);
+    } catch (e) {
+      return showError(e);
     }
-
-    const actions = el("div", "cmcp-apps-runbar");
-    const installBtn = makeBtn("⬇ Install", { primary: true });
-    const starBtn = makeBtn("☆ Star");
-    const status = el("span", "cmcp-apps-status");
-    actions.append(installBtn, starBtn, status);
-    detail.append(actions);
-    body.append(detail);
-
-    let starred = false;
-    starBtn.addEventListener("click", async () => {
-      starred = !starred;
-      starBtn.textContent = starred ? "★ Starred" : "☆ Star";
-      try {
-        await registry.star(regApp.id, starred);
-      } catch (e) {
-        status.textContent = e.message;
-        status.classList.add("err");
-      }
-    });
-
-    installBtn.addEventListener("click", async () => {
-      installBtn.disabled = true;
-      status.classList.remove("err");
-      try {
-        status.textContent = "Fetching bundle…";
-        const bundle = await registry.bundle(regApp.id);
-        const deps = bundle.manifest?.deps || {};
-        const models = Array.isArray(deps.models) ? deps.models : [];
-        const nodes = Array.isArray(deps.customNodes) ? deps.customNodes : [];
-        if (models.length || nodes.length) {
-          const ok = await confirmModal({
-            title: `Install “${regApp.name}”`,
-            message:
-              (models.length ? `Models (${models.length}):\n  ${models.map((m) => m.name || m).join("\n  ")}\n\n` : "") +
-              (nodes.length ? `Custom nodes (${nodes.length}):\n  ${nodes.join("\n  ")}\n\n` : "") +
-              "Anything missing must be installed before the app can run (ask the agent to install it, or install it yourself).",
-            confirmLabel: "Install",
-          });
-          if (!ok) {
-            installBtn.disabled = false;
-            status.textContent = "";
-            return;
-          }
-        }
-        status.textContent = "Installing…";
-        let thumbnail_b64;
-        try {
-          const res = await fetch(registry.thumbnailUrl(regApp.id));
-          if (res.ok) {
-            const buf = new Uint8Array(await res.arrayBuffer());
-            let bin = "";
-            for (const b of buf) bin += String.fromCharCode(b);
-            thumbnail_b64 = btoa(bin);
-          }
-        } catch { /* no thumbnail — fine */ }
-        await client.create({
-          manifest: {
-            ...bundle.manifest,
-            source: { type: "registry", workflowUuid: null, registryId: regApp.id },
-            published: { registryId: regApp.id, slug: regApp.slug, publishedVersion: regApp.version },
-          },
-          prompt: bundle.prompt,
-          ...(bundle.workflow ? { workflow: bundle.workflow } : {}),
-          ...(thumbnail_b64 ? { thumbnail_b64 } : {}),
-        });
-        _tab = "mine";
-        await showDetail(regApp.id);
-      } catch (e) {
-        status.textContent = e.message.includes("already exists")
-          ? "Already installed — find it in My Apps."
-          : e.message;
-        status.classList.add("err");
-        installBtn.disabled = false;
-      }
-    });
+    await showDetail(regApp.id, regApp);
   }
 
   // ── Convert view ─────────────────────────────────────────────────────────
@@ -790,14 +754,105 @@ export function createAppsContent(ctx, shell, opts = {}) {
 
   // ── Detail view ──────────────────────────────────────────────────────────
 
-  async function showDetail(id) {
+  /** Installed-state lookups for the Requirements panel (cached per open). */
+  let _objectInfoTypes = null;
+  async function installedNodeTypes() {
+    if (_objectInfoTypes) return _objectInfoTypes;
+    try {
+      const res = await fetch("/object_info");
+      const j = await res.json();
+      _objectInfoTypes = new Set(Object.keys(j || {}));
+    } catch {
+      _objectInfoTypes = new Set();
+    }
+    return _objectInfoTypes;
+  }
+  const _modelListCache = new Map(); // folder -> [names]
+  async function modelListFor(folder) {
+    if (_modelListCache.has(folder)) return _modelListCache.get(folder);
+    let names = [];
+    try {
+      const res = await fetch(`/models/${encodeURIComponent(folder)}`);
+      const j = await res.json();
+      if (Array.isArray(j)) names = j.map(String);
+    } catch { /* no folder / offline */ }
+    _modelListCache.set(folder, names);
+    return names;
+  }
+  const _base = (p) => String(p || "").split(/[\\/]/).pop().toLowerCase();
+
+  /** Render the Requirements rows with install states + download actions. */
+  async function buildRequirements(panel, models, nodes) {
+    const types = await installedNodeTypes();
+    for (const m of models) {
+      const name = String(m.name || m);
+      const dir = modelDirForWidget(m.widget) || "checkpoints";
+      const row = el("div", "cmcp-apps-req-row");
+      const nm = el("span", "nm", name);
+      nm.title = name;
+      row.append(nm);
+      panel.append(row);
+      const names = await modelListFor(dir);
+      const have = names.some((n) => _base(n) === _base(name));
+      if (closed) return;
+      if (have) {
+        row.append(el("span", "cmcp-apps-req-ok", "✓"));
+        continue;
+      }
+      if (m.civitaiVersionId || m.url) {
+        const dl = makeBtn("⬇", { title: `Download ${name} to ${dir}` });
+        dl.classList.add("cmcp-apps-req-dl");
+        dl.addEventListener("click", async () => {
+          dl.disabled = true;
+          dl.textContent = "…";
+          try {
+            const res = m.civitaiVersionId
+              ? await callTool("download_civitai_model", { model_version_id: m.civitaiVersionId, target_subfolder: dir })
+              : await callTool("download_model", { url: m.url, target_subfolder: dir });
+            if (res && res.ok === false) throw new Error(toolText(res));
+            row.textContent = "";
+            row.append(nm, el("span", "cmcp-apps-req-ok", "✓"));
+          } catch (e) {
+            dl.textContent = "⬇";
+            dl.disabled = false;
+            nm.title = `${name} — download failed: ${e.message}`;
+            row.append(el("span", "cmcp-apps-req-miss", "✗"));
+          }
+        });
+        row.append(dl);
+      } else {
+        const miss = el("span", "cmcp-apps-req-miss", "manual");
+        miss.title = "Not pinned to a download — find this file on CivitAI/HuggingFace and drop it in the matching models folder.";
+        row.append(miss);
+      }
+    }
+    for (const ct of nodes) {
+      const row = el("div", "cmcp-apps-req-row");
+      const nm = el("span", "nm", String(ct));
+      nm.title = String(ct);
+      row.append(nm);
+      if (types.has(ct)) {
+        row.append(el("span", "cmcp-apps-req-ok", "✓"));
+      } else {
+        const miss = el("span", "cmcp-apps-req-miss", "missing");
+        miss.title = "Needs a custom node pack providing this node — install it via ComfyUI-Manager or ask the agent.";
+        row.append(miss);
+      }
+      panel.append(row);
+    }
+  }
+
+  async function showDetail(id, regCtx = null) {
     const app = await client.get(id);
     if (closed) return;
     body.textContent = "";
 
     const bar = el("div", "cmcp-apps-toolbar");
-    const back = makeBtn("← My Apps");
-    back.addEventListener("click", () => showGrid().catch(showError));
+    const back = makeBtn(regCtx ? "← Explore" : "← My Apps");
+    back.addEventListener("click", () => {
+      if (regCtx) _tab = "explore";
+      showGrid().catch(showError);
+    });
     bar.append(back);
     body.append(bar);
 
@@ -809,7 +864,40 @@ export function createAppsContent(ctx, shell, opts = {}) {
       thumb.textContent = "";
     }
     const titles = el("div", "titles");
-    titles.append(el("h3", "", app.name || "Untitled app"));
+    // Title row: name + (registry apps) a star icon right beside it.
+    const titleRow = el("div", "cmcp-apps-title-row");
+    titleRow.append(el("h3", "", app.name || "Untitled app"));
+    if (regCtx) {
+      const starBtn = el("button", "cmcp-apps-starbtn", "☆");
+      starBtn.type = "button";
+      starBtn.title = "Star this app";
+      const starCount = el("span", "cmcp-apps-starcount", String(regCtx.stars || 0));
+      let starred = false;
+      let count = Number(regCtx.stars || 0);
+      const paint = () => {
+        starBtn.textContent = starred ? "★" : "☆";
+        starBtn.classList.toggle("starred", starred);
+        starCount.textContent = String(count);
+      };
+      registry.starred(regCtx.id).then((r) => {
+        starred = !!r?.starred;
+        paint();
+      }).catch(() => {});
+      starBtn.addEventListener("click", async () => {
+        starred = !starred;
+        count = Math.max(0, count + (starred ? 1 : -1));
+        paint();
+        try {
+          await registry.star(regCtx.id, starred);
+        } catch { /* star is cosmetic — the count resyncs on next open */ }
+      });
+      paint();
+      titleRow.append(starBtn, starCount);
+    }
+    titles.append(titleRow);
+    if (regCtx) {
+      titles.append(el("div", "desc", `by ${regCtx.creator || "anonymous"} · ${regCtx.runs || 0} runs · v${regCtx.version || 1}`));
+    }
     if (app.description) titles.append(el("div", "desc", app.description));
     head.append(thumb, titles);
     detail.append(head);
@@ -990,7 +1078,28 @@ export function createAppsContent(ctx, shell, opts = {}) {
     form.append(runRow);
 
     const outputs = el("div", "cmcp-apps-outputs");
-    detail.append(form, outputs);
+
+    // Requirements side panel: models + custom nodes this app needs, with a
+    // ✓ when installed, a ⬇ download action when we can fetch it (CivitAI-
+    // pinned or URL models), or a manual-install note otherwise. Shown
+    // whenever the manifest recorded deps — registry installs see it before
+    // their first run, replacing the old install-gate consent dialog.
+    const deps = app.deps || {};
+    const depModels = Array.isArray(deps.models) ? deps.models : [];
+    const depNodes = Array.isArray(deps.customNodes) ? deps.customNodes : [];
+    let reqsPanel = null;
+    if (depModels.length || depNodes.length) {
+      reqsPanel = el("div", "cmcp-apps-reqs");
+      reqsPanel.append(el("h4", "", "Requirements"));
+      buildRequirements(reqsPanel, depModels, depNodes);
+    }
+
+    const main = el("div", "cmcp-apps-main");
+    const grow = el("div", "grow");
+    grow.append(form, outputs);
+    main.append(grow);
+    if (reqsPanel) main.append(reqsPanel);
+    detail.append(main);
     body.append(detail);
 
     // Management row (metadata edit, publish, hide, delete) — below the fold.

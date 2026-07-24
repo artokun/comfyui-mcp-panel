@@ -525,12 +525,18 @@ async function stubRegistry(page: Page) {
               outputs: [],
               importedFromFrontend: false
             },
-            deps: { models: [], customNodes: [] }
+            deps: {
+              models: [{ name: 'flux.safetensors', widget: 'ckpt_name', civitaiVersionId: 12345 }],
+              customNodes: ['FancyCustomNode']
+            }
           },
           prompt: FIXTURE_PROMPT,
           workflow: FIXTURE_WORKFLOW
         }
       })
+    }
+    if (req.method() === 'GET' && url.pathname.endsWith('/starred')) {
+      return route.fulfill({ json: { starred: false } })
     }
     if (req.method() === 'GET' && url.pathname.endsWith('/thumbnail')) {
       return route.fulfill({ status: 404, json: { error: 'no thumbnail' } })
@@ -593,32 +599,73 @@ test('publish: bundle goes to the registry, local manifest records the slug', as
   expect(store.get(APP_ID)!.manifest.published).toMatchObject({ slug: 'tester/shareable' })
 })
 
-test('explore: registry cards render, install lands the app in My Apps', async ({
+test('explore: registry app opens straight into inputs — star icon, requirements, no install gate', async ({
   panel,
-  page
+  page,
+  mockBridge
 }) => {
   const { store } = await stubAppsBackend(page)
   await stubRegistry(page)
+  // Deps-state lookups: the pinned model is MISSING locally (fake model list;
+  // object_info passes through to the real server — FancyCustomNode can't be
+  // in it) — both rows must show as actionable, not a gate.
+  await page.route(/\/models\/checkpoints/, (route) => route.fulfill({ json: ['sdxl.safetensors'] }))
+  // The download action goes through the bridge's whitelisted tool.
+  const downloads: Record<string, unknown>[] = []
+  mockBridge.onFrame((frame) => {
+    if (frame.type !== 'call_tool') return
+    if (frame.tool === 'download_civitai_model') {
+      downloads.push(frame.args as Record<string, unknown>)
+      mockBridge.send({
+        type: 'tool_result',
+        cid: frame.cid,
+        ok: true,
+        result: [{ type: 'text', text: 'downloaded flux.safetensors' }]
+      })
+    }
+  })
 
   await panel.goto()
+  await panel.setBridgeUrl(mockBridge.url)
   await panel.openSidebar()
+  await panel.connect()
   await panel.root.getByRole('button', { name: 'Apps', exact: true }).click()
   const modal = page.locator('.cmcp-apps-modal')
 
   await modal.getByRole('button', { name: 'Explore', exact: true }).click()
   const card = modal.locator('.cmcp-app-card', { hasText: 'Cloud App' })
   await expect(card).toBeVisible()
-  await expect(card).toContainText('★ 12')
-  await expect(card).toContainText('340 runs')
   await card.click()
 
-  await expect(modal).toContainText('by maker')
-  await modal.getByRole('button', { name: /Install/ }).click()
-  // Installed → LOCAL detail view (the registry manifest became a local app).
-  // The registry detail also shows an h3 with the app name, so wait on the
-  // local-only Run button instead of racing the install's create POST.
+  // NO Install button anywhere — the app silently installed on open and the
+  // LOCAL detail (inputs!) shows right away.
   await expect(modal.getByRole('button', { name: '▶ Run' })).toBeVisible()
+  await expect(modal.getByRole('button', { name: /Install/ })).toHaveCount(0)
   await expect(modal.locator('h3')).toHaveText('Cloud App')
+  // The prompt input is there immediately.
+  await expect(modal.locator('.cmcp-apps-field', { hasText: 'Prompt' }).locator('textarea')).toHaveValue('hello')
+
+  // Star icon sits next to the title (not an action-row button); it toggles.
+  const starBtn = modal.locator('.cmcp-apps-starbtn')
+  await expect(starBtn).toBeVisible()
+  await expect(starBtn).toHaveText('☆')
+  await starBtn.click()
+  await expect(starBtn).toHaveText('★')
+  await expect(modal.locator('.cmcp-apps-starcount')).toHaveText('13')
+
+  // Requirements side panel: pinned model shows ⬇ (missing locally), custom
+  // node shows missing. Clicking ⬇ downloads via the bridge and flips to ✓.
+  const reqs = modal.locator('.cmcp-apps-reqs')
+  await expect(reqs).toBeVisible()
+  await expect(reqs).toContainText('flux.safetensors')
+  await expect(reqs).toContainText('FancyCustomNode')
+  await expect(reqs.locator('.cmcp-apps-req-miss', { hasText: 'missing' })).toBeVisible()
+  await reqs.locator('.cmcp-apps-req-dl').click()
+  await expect(reqs.locator('.cmcp-apps-req-ok').first()).toBeVisible()
+  expect(downloads).toHaveLength(1)
+  expect(downloads[0]).toMatchObject({ model_version_id: 12345, target_subfolder: 'checkpoints' })
+
+  // The silent install recorded registry provenance locally.
   expect(store.has(REG_ID)).toBe(true)
   const installed = store.get(REG_ID)!
   expect(installed.manifest.source).toMatchObject({ type: 'registry', registryId: REG_ID })
