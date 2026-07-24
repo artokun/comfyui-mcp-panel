@@ -152,6 +152,21 @@ def _sanitize_manifest(raw, *, for_update: bool = False) -> dict:
                 entry["choices"] = [str(c) for c in item["choices"]][:200]
             if "default" in item and isinstance(item["default"], (str, int, float, bool)):
                 entry["default"] = item["default"]
+            # Widget metadata for the richer run-form controls: numeric bounds
+            # for the slider, the seed 🎲 behavior, and the source node type so
+            # the model picker can read the connected server's live object_info.
+            # bool is a subclass of int — exclude it so a stray True can't pose
+            # as a numeric bound.
+            for f in ("min", "max", "step"):
+                v = item.get(f)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    entry[f] = v
+            if isinstance(item.get("seedBehavior"), str):
+                entry["seedBehavior"] = item["seedBehavior"][:32]
+            if isinstance(item.get("control_after_generate"), str):
+                entry["control_after_generate"] = item["control_after_generate"][:32]
+            if isinstance(item.get("nodeType"), str):
+                entry["nodeType"] = item["nodeType"][:128]
             inputs.append(entry)
         outputs = []
         for item in app_mode.get("outputs") or []:
