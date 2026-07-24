@@ -887,7 +887,9 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
             // then jump to the Apps tab's convert view seeded from the live canvas.
             const appBtn = el("button", "cmcp-btn", "Create App from workflow");
             appBtn.title = "Load this workflow onto the canvas and package it as a one-click app.";
-            appBtn.addEventListener("click", () => { void createAppFromWorkflow(wf.graph, closeLb); });
+            appBtn.addEventListener("click", () => {
+              void createAppFromWorkflow(() => loadOntoCanvas(wf.graph, closeLb, { keepPanelOpen: true }));
+            });
             actions.appendChild(appBtn);
           }
           const saveBtn = el("button", "cmcp-btn", "Save workflow");
@@ -1078,14 +1080,16 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     return true;
   }
 
-  /** "Create App from workflow": load a UI-format graph onto the canvas (reusing
-   *  loadOntoCanvas so the dirty-confirm + undoable graph_load + empty-guard are
-   *  identical to the plain "Load onto canvas" button), keep the side-panel open,
-   *  then hop to the Apps tab and open its convert view seeded from the now-loaded
-   *  canvas. `closeSurface` dismisses the originating lightbox so the user lands on
-   *  the convert form. */
-  async function createAppFromWorkflow(graph, closeSurface) {
-    const loaded = await loadOntoCanvas(graph, closeSurface, { keepPanelOpen: true });
+  /** "Create App from workflow": run `loadWorkflow` (a thunk that loads a UI-format
+   *  graph onto the canvas with the panel kept open — reusing whichever existing
+   *  load path the calling surface uses, so the dirty-confirm + undoable graph_load
+   *  + empty-guard stay identical to that surface's plain "Load onto canvas"
+   *  button), then hop to the Apps tab and open its convert view seeded from the
+   *  now-loaded canvas. The loader resolves truthy only when the graph actually
+   *  landed; on a failed/cancelled/gated load we stay put (the loader already
+   *  toasted). Both the media lightbox and the model-detail surface share this. */
+  async function createAppFromWorkflow(loadWorkflow) {
+    const loaded = await loadWorkflow();
     if (!loaded) return; // load failed / was cancelled — stay put (toast already shown)
     try {
       if (typeof shell.switchTab === "function") shell.switchTab("apps", { view: "convert" });
@@ -1100,7 +1104,10 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
    *  with a picker when an archive holds several. Reports progress and EVERY
    *  failure through `opts.setStatus` (an inline line in the detail sheet) as
    *  well as a toast, and NEVER closes the sheet on failure — only a genuine
-   *  canvas load (via loadOntoCanvas) dismisses the explorer. */
+   *  canvas load (via loadOntoCanvas) dismisses the explorer. `opts.keepPanelOpen`
+   *  threads through to loadOntoCanvas so the create-app-from-workflow hop keeps
+   *  the side-panel up. Resolves truthy only when a graph actually landed (the
+   *  single-file case, or a chosen entry from the multi-workflow picker). */
   async function loadVersionWorkflow(version, file, opts = {}) {
     const setStatus = opts.setStatus || (() => {});
     const say = (msg, kind = "err") => { setStatus(msg, kind); toast(msg); };
@@ -1151,19 +1158,33 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       return;
     }
     setStatus("", "info"); // clear before a successful load closes the explorer
-    if (uis.length === 1) { await loadOntoCanvas(uis[0].graph); return; }
-    // several workflows in one archive — let the user pick
-    const picker = openSubModal("Pick a workflow to load");
-    const list = el("div", "cmcp-cv-creators");
-    list.style.maxHeight = "24rem";
-    for (const c of uis) {
-      const b = el("button", "cmcp-cv-creator");
-      b.appendChild(el("span", null, c.name));
-      b.appendChild(el("span", "sub", `${c.graph.nodes.length} nodes`));
-      b.addEventListener("click", () => { void loadOntoCanvas(c.graph); });
-      list.appendChild(b);
-    }
-    picker.body.appendChild(list);
+    // keepPanelOpen threads through to every loadOntoCanvas call so the create-app
+    // flow keeps the side-panel up (the detail sheet still closes). The resolved
+    // boolean = "a graph actually landed", so createAppFromWorkflow hops only on a
+    // real load.
+    const keepPanelOpen = !!opts.keepPanelOpen;
+    if (uis.length === 1) return await loadOntoCanvas(uis[0].graph, undefined, { keepPanelOpen });
+    // several workflows in one archive — let the user pick.
+    return await new Promise((resolve) => {
+      let picking = false; // a pick is in flight — its closeSubModals teardown must not resolve false
+      const picker = openSubModal("Pick a workflow to load", () => { if (!picking) resolve(false); });
+      const list = el("div", "cmcp-cv-creators");
+      list.style.maxHeight = "24rem";
+      for (const c of uis) {
+        const b = el("button", "cmcp-cv-creator");
+        b.appendChild(el("span", null, c.name));
+        b.appendChild(el("span", "sub", `${c.graph.nodes.length} nodes`));
+        b.addEventListener("click", () => {
+          picking = true;
+          loadOntoCanvas(c.graph, undefined, { keepPanelOpen }).then((ok) => {
+            if (ok) resolve(true);
+            else picking = false; // failed — let another pick (or a close) settle it
+          });
+        });
+        list.appendChild(b);
+      }
+      picker.body.appendChild(list);
+    });
   }
 
   // ── model detail ─────────────────────────────────────────────────────
@@ -1213,6 +1234,18 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         b.title = `Download ${f.name}${size ? ` (${size})` : ""} and load it onto the canvas (Ctrl+Z undoes it).`;
         b.addEventListener("click", () => { void loadVersionWorkflow(version, f, { setStatus, signIn: () => accountFlow() }); });
         dl.appendChild(b);
+        // Same loadable-workflow condition as "Load onto canvas" (every wfFile is
+        // loadable): load the SELECTED version's workflow with the panel kept open,
+        // then hop to the Apps convert view seeded from the now-loaded canvas.
+        const appB = el("button", "cmcp-btn",
+          wfFiles.length > 1 ? `Create App — ${f.name}` : "Create App from workflow");
+        appB.title = "Download this workflow, load it onto the canvas, and package it as a one-click app.";
+        appB.addEventListener("click", () => {
+          void createAppFromWorkflow(
+            () => loadVersionWorkflow(version, f, { setStatus, signIn: () => accountFlow(), keepPanelOpen: true }),
+          );
+        });
+        dl.appendChild(appB);
       }
       if (have) {
         const note = el("span", null, "You already have this file locally.");
