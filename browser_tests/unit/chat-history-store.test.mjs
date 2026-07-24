@@ -1458,3 +1458,46 @@ test('unsubscribe suppresses a pending readCanonical delivery (codex: dead-panel
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.equal(calls, 0, 'a read started before unsubscribe must not deliver')
 })
+
+test('legacy-idless shadow-only threads are retained in the shadow, fenced out of canonical (no data loss)', async () => {
+  const now = Date.now()
+  const canonical = {
+    schemaVersion: CHAT_HISTORY_SCHEMA,
+    updatedAt: now - 1000,
+    meta: {
+      checkpoint: { generation: 3, revision: { updatedAt: now - 1000, writerId: 'w1', sequence: 1 } },
+      activeByScope: {},
+      workflowAliases: {}
+    },
+    threads: [
+      { id: 'marker', workflowKey: 'workflow:a', createdAt: now - 500, updatedAt: now - 500,
+        msgs: [{ id: 'm1', role: 'user', text: 'marker', createdAt: now - 500 }] }
+    ]
+  }
+  const storage = createMemoryStorage()
+  // Local shadow: marker (id-ed) + a legacy-idless foreign thread (pre-v3 shape).
+  storage.setItem('comfyui-mcp.panel.threads', JSON.stringify([
+    { id: 'marker', workflowKey: 'workflow:a', createdAt: now - 500, updatedAt: now - 500,
+      msgs: [{ id: 'm1', role: 'user', text: 'marker', createdAt: now - 500 }] },
+    { id: 'foreign-thread', ts: now + 10, workflowKey: 'workflow:other',
+      msgs: [{ role: 'user', text: 'legacy content with no ids' }] }
+  ]))
+  const indexedDb = createFakeIndexedDb(canonical)
+  const store = new ChatHistoryStore({ storage, indexedDb })
+
+  const merged = await store.load({ protectedThreadIds: ['foreign-thread'] })
+
+  // Retained in the merged view (history list), flagged as shadow-only.
+  const foreign = merged.threads.find((thread) => thread.id === 'foreign-thread')
+  assert.ok(foreign, 'shadow-only legacy thread must survive hydration')
+  assert.equal(foreign.legacyShadow, true)
+
+  // …but fenced OUT of the canonical write.
+  await store.flush()
+  const canonicalAfter = indexedDb.readState()
+  assert.equal(
+    (canonicalAfter?.threads || []).some((thread) => thread?.id === 'foreign-thread'),
+    false,
+    'legacyShadow threads must never enter the fenced canonical',
+  )
+})

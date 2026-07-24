@@ -800,6 +800,27 @@ function mergeUnderCanonicalCheckpoint(canonical, ...untrusted) {
   const accepted = untrusted.filter((snapshot) =>
     !(canonicalFenced && snapshot?.[LEGACY_IDLESS_SOURCE] === true));
   let canonicalBaseline = canonical && typeof canonical === "object" ? canonical : null;
+  // A legacy-idless snapshot can't merge into a fenced canonical (its messages
+  // have no ids, so a stale pre-v3 tab could resurrect deleted content). But
+  // rejecting it wholesale must not ERASE data the user legitimately owns:
+  // shadow-only threads are carried forward flagged `legacyShadow` — they stay
+  // in the local shadow (visible, scope-disabled) and are excluded from the
+  // canonical write in idbMergeWrite. Threads that already exist canonically
+  // are covered by the canonical copy, not duplicated.
+  let quarantined = [];
+  if (canonicalFenced) {
+    const canonicalIds = new Set(
+      (Array.isArray(canonicalBaseline?.threads) ? canonicalBaseline.threads : [])
+        .map((thread) => thread?.id)
+        .filter(Boolean),
+    );
+    quarantined = untrusted
+      .filter((snapshot) => snapshot?.[LEGACY_IDLESS_SOURCE] === true)
+      .flatMap((snapshot) => (Array.isArray(snapshot?.threads) ? snapshot.threads : []))
+      .filter((thread) => thread && typeof thread.id === "string" && thread.id && !canonicalIds.has(thread.id))
+      .map((thread) => normalizeThread({ ...thread, legacyShadow: true }))
+      .filter(Boolean);
+  }
   if (!canonicalFenced) {
     // Before the one-way schema-3 fence, a pre-v3 tab writes a complete thread.
     // Replace matching legacy threads as a unit; UUID-unioning independently
@@ -817,10 +838,18 @@ function mergeUnderCanonicalCheckpoint(canonical, ...untrusted) {
       };
     }
   }
-  return mergeHistorySnapshots(
+  const merged = mergeHistorySnapshots(
     canonicalBaseline,
     ...accepted.map(withoutCheckpoint),
   );
+  if (quarantined.length) {
+    const existingIds = new Set(merged.threads.map((thread) => thread.id));
+    merged.threads = [
+      ...merged.threads,
+      ...quarantined.filter((thread) => !existingIds.has(thread.id)),
+    ];
+  }
+  return merged;
 }
 
 function boundedSnapshot(snapshot, { maxThreads, maxMessages, protectedThreadIds = [] }) {
@@ -902,10 +931,16 @@ async function idbMergeWrite(indexedDb, snapshot, limits) {
       const tx = db.transaction("snapshots", "readwrite");
       const store = tx.objectStore("snapshots");
       const get = store.get(CHAT_HISTORY_STATE_KEY);
-      let merged = compactSnapshot(boundedSnapshot(withoutCheckpoint(snapshot), limits), limits);
+      // legacyShadow threads never enter canonical (the schema-3 fence) — they
+      // live only in the local shadow until the user migrates or deletes them.
+      const withoutLegacyShadow = (snap) =>
+        snap && Array.isArray(snap.threads)
+          ? { ...snap, threads: snap.threads.filter((thread) => !thread?.legacyShadow) }
+          : snap;
+      let merged = compactSnapshot(boundedSnapshot(withoutLegacyShadow(withoutCheckpoint(snapshot)), limits), limits);
       get.onsuccess = () => {
         merged = compactSnapshot(
-          boundedSnapshot(mergeUnderCanonicalCheckpoint(get.result, snapshot), limits),
+          boundedSnapshot(withoutLegacyShadow(mergeUnderCanonicalCheckpoint(get.result, snapshot)), limits),
           limits,
         );
         store.put(merged, CHAT_HISTORY_STATE_KEY);
