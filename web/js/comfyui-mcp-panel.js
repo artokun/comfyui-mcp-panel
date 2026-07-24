@@ -12013,9 +12013,16 @@ function buildPanel() {
   const THINKING_SAFETY_MS = 120000;
 
   function armSafety() {
-    lastActivityAt = Date.now(); // an explicit (re)arm marks REAL turn activity
+    // (Re)schedule the backstop timer ONLY — deliberately does NOT touch the
+    // silence clock. A repaint/repair/reconnect re-arm must never extend the
+    // 10-minute ceiling; only a genuine turn frame (noteActivity) resets it.
     if (thinkingSafety) clearTimeout(thinkingSafety);
     thinkingSafety = setTimeout(onThinkingSafety, THINKING_SAFETY_MS);
+  }
+  // A real turn frame arrived → reset the silence clock and (re)arm the backstop.
+  function noteActivity() {
+    lastActivityAt = Date.now();
+    armSafety();
   }
 
   // Absolute ceiling on how long the indicator may survive on the backstop with
@@ -12036,13 +12043,10 @@ function buildPanel() {
     const withinBudget = Date.now() - lastActivityAt < MAX_SILENT_TURN_MS;
     if (agentWorking && withinBudget) {
       if (!thinkingEl) {
-        // Detached by a mid-turn repaint — rebuild. showThinking() calls
-        // armSafety(), which would reset lastActivityAt and let repeated
-        // repaint/repair cycles extend the budget forever; save/restore it so a
-        // repair never counts as real activity.
-        const clock = lastActivityAt;
+        // Detached by a mid-turn repaint — rebuild. showThinking() only
+        // (re)schedules the timer; it no longer resets the silence clock, so a
+        // repaint/repair loop can't extend the budget.
         showThinking();
-        lastActivityAt = clock;
       } else {
         // Re-arm directly, NOT via armSafety(), so the silence clock keeps running
         // toward MAX_SILENT_TURN_MS instead of resetting on a non-activity re-arm.
@@ -12085,7 +12089,7 @@ function buildPanel() {
     thinkingAction = null; // live thinking supersedes the last tool's label
     if (!thinkingEl) showThinking();
     cycleWord();
-    armSafety();
+    noteActivity(); // a thinking frame is real turn activity → reset the clock
   }
 
   // Humanize an `action` frame name — "panel.panel_query_graph" → "Using query
@@ -12100,11 +12104,12 @@ function buildPanel() {
   function setThinkingAction(name) {
     thinkingAction = humanizeAction(name);
     thinkingTokens = 0; // a tool is running now, not extended thinking
-    if (!thinkingEl) showThinking(); // rebuilds + re-arms; cycleWord shows the label
+    if (!thinkingEl) showThinking(); // rebuilds; cycleWord shows the label
     else {
       cycleWord();
-      bumpThinking(); // re-pin below the newest activity + re-arm the safety timer
+      bumpThinking(); // re-pin below the newest activity
     }
+    noteActivity(); // an action frame is real turn activity → reset the clock
   }
 
   function hideThinking() {
@@ -12318,8 +12323,13 @@ function buildPanel() {
       if (!connected) {
         if (agentWorking) {
           thinkingReconnecting = true;
+          // Keep the indicator up with the reconnecting banner, but DON'T re-arm
+          // here: the self-perpetuating backstop (governed by the silence budget
+          // from the last real frame) already keeps it visible until the budget
+          // runs out. Re-arming on every drop would let a flapping bridge push the
+          // timer out forever and never reap a stale turn.
           if (!thinkingEl) showThinking();
-          else { cycleWord(); armSafety(); } // fresh grace period for THIS drop
+          else cycleWord();
         } else {
           hideThinking();
         }
@@ -12351,16 +12361,19 @@ function buildPanel() {
       }
       if (specs.length) paintFenceSpecs(specs);
       bumpThinking();
+      noteActivity(); // agent output is real turn activity → reset the silence clock
     },
     // Live streaming deltas (thinking + reply text) before the committed say.
     onStream(msg) {
       onStreamDelta(msg);
+      noteActivity(); // streaming output is real turn activity → reset the clock
     },
     // The agent called panel_ask — render a question card and resolve with the
     // user's pick. Keep the working indicator pinned below it while we wait.
     onAsk(msg) {
       const p = paintQuestion(msg);
       bumpThinking();
+      noteActivity(); // a panel_ask frame is real turn activity → reset the clock
       return p;
     },
     // The agent called panel_set_todo — render/update the live plan tray.
@@ -12545,6 +12558,7 @@ function buildPanel() {
         if (Date.now() - localEndAt < STALE_WORKING_GUARD_MS) return;
         agentWorking = true;
         showThinking();
+        noteActivity(); // turn start = real activity → seed the silence clock
         ssSet(MID_TASK_KEY, "1"); // a turn is in flight — arm the resume nudge
       } else if (state === "done") {
         agentWorking = false;
@@ -12563,6 +12577,7 @@ function buildPanel() {
     onCommand(cmd, msg, reply) {
       appendActivity(cmd, msg, reply);
       bumpThinking();
+      noteActivity(); // a tool/command frame is real turn activity → reset the clock
       // After an edit, follow the action: dart to the edited NODE (25% pad) so
       // the user watches the change land, then zoom back out to a full fit once
       // the burst goes quiet (focusFollowOnCommand handles both). Structural ops
