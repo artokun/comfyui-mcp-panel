@@ -11409,6 +11409,10 @@ function buildPanel() {
   }
 
   function newChat() {
+    // Abandoning the current conversation ends any in-flight turn from THIS
+    // tab's point of view — clear agentWorking first so resetFeed() below won't
+    // rebuild a working indicator onto the fresh, empty chat.
+    endTurnLocally();
     thread = null;
     turnAnchors = []; // fresh conversation → no rewind anchors
     ssSet(CURRENT_THREAD_KEY, null);
@@ -11706,7 +11710,10 @@ function buildPanel() {
   // no turn is in flight (covers a missed turn:done so it can't stick forever).
   function onThinkingSafety() {
     thinkingSafety = null;
-    if (agentWorking) {
+    // Persist only while the turn is genuinely live — working AND connected.
+    // A permanent disconnect leaves agentWorking true with no more frames, so
+    // gating on bridgeConnected too lets this backstop still hide it in ≤120s.
+    if (agentWorking && bridgeConnected) {
       if (!thinkingEl) showThinking(); // rebuilds the indicator AND re-arms
       else armSafety();
       return;
@@ -11864,6 +11871,11 @@ function buildPanel() {
   // tray) rather than start immediately. Drives the tray-vs-inline decision so
   // an idle send doesn't briefly flash through the tray.
   let agentWorking = false;
+  // Best-effort "is the bridge live" flag (mirrors onStatus). The working
+  // indicator persists past the 120s backstop only while a turn is BOTH working
+  // AND connected — so a permanent bridge drop mid-turn still self-clears in
+  // ≤120s instead of spinning "Reconnecting…" forever.
+  let bridgeConnected = false;
 
   // Set by a Settings "Set … token" button just before it asks the agent to open
   // the secure input, so the resolved value can be marked set/not-set (timestamp
@@ -11938,6 +11950,7 @@ function buildPanel() {
       // (clicking Disconnect, or trying to send while disconnected) and live
       // at those call sites.
       const connected = state === "connected";
+      bridgeConnected = connected; // bounds the working-indicator backstop
       connectBtn.hidden = connected;
       disconnectBtn.hidden = !connected;
       connectBtn.disabled = state === "connecting";
@@ -12124,8 +12137,11 @@ function buildPanel() {
     onRunpodAlert(frame) {
       panelRunpod?.onAlert(frame);
     },
-    // Live extended-thinking token count → update the working indicator.
+    // Live extended-thinking token count → update the working indicator. Gate
+    // on agentWorking (like onAction): a late thinking frame arriving AFTER a
+    // local interrupt must not resurrect the indicator the user just dismissed.
     onThinking(tokens) {
+      if (!agentWorking) return;
       setThinkingTokens(tokens);
     },
     // The agent called panel_request_secret — collect a token securely.
@@ -13589,6 +13605,11 @@ function buildPanel() {
     lsSet(AUTOCONNECT_KEY, null);
     setSetting(SETTING_AUTOCONNECT, false);
     client.stop();
+    // client.stop() sets closed=true, so the socket onclose suppresses onStatus
+    // — end the turn locally so the working indicator can't spin forever against
+    // a turn the user just walked away from (no turn:done will ever arrive).
+    bridgeConnected = false;
+    endTurnLocally();
     connectBtn.hidden = false;
     disconnectBtn.hidden = true;
     connectBtn.disabled = false;
