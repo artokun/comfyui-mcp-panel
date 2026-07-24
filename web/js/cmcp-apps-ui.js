@@ -328,6 +328,39 @@ function nodeInstalled(set, name) {
   return false;
 }
 
+/** Does a node def's python_module identify a core/built-in ComfyUI node?
+ *  Core defs load from "nodes" or "comfy_extras.*"; custom packs load from
+ *  "custom_nodes.*". Unknown/missing modules are NOT treated as core. */
+export function isCoreNodeModule(pythonModule) {
+  const m = String(pythonModule || "");
+  return m === "nodes" || m === "comfy_extras" || m.startsWith("comfy_extras.");
+}
+
+/** The connected frontend's live def for a class_type (same def sources as
+ *  liveWidgetChoices). Null when the frontend doesn't expose defs or the
+ *  class_type isn't registered on this server. */
+function liveNodeDef(getApp, classType) {
+  try {
+    if (!classType) return null;
+    const app = typeof getApp === "function" ? getApp() : null;
+    const defs = app?.nodeManager?.defs || app?.extensions?.nodeDefs || app?.nodeDefs;
+    return (defs && defs[classType]) || null;
+  } catch { return null; }
+}
+
+/** Authoritative fallback for liveNodeDef: the connected server's per-class
+ *  object_info route ({ "<class>": { …, python_module } }). Null on any miss
+ *  (unregistered class_type, offline, non-JSON) — never throws. */
+async function fetchNodeDef(classType) {
+  try {
+    if (!classType) return null;
+    const res = await fetch(`/object_info/${encodeURIComponent(classType)}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return (data && data[classType]) || null;
+  } catch { return null; }
+}
+
 /** De-dupe [{pack,installed}] by pack name (case-insensitive); installed wins. */
 function dedupePacks(packs) {
   const map = new Map();
@@ -942,8 +975,12 @@ export function createAppsContent(ctx, shell, opts = {}) {
 
     /** Resolve the declared node deps to [{pack, installed}]. Preferred path:
      *  extract_workflow_dependencies (maps class_type→pack + reports installed vs
-     *  missing authoritatively). Fallback when the prompt is unavailable: the
-     *  declared class_types vs list_installed_nodes (loose — see nodeInstalled). */
+     *  missing authoritatively). Fallback when the prompt is unavailable (e.g.
+     *  hidden-workflow apps): the connected frontend's live node defs first —
+     *  a registered core class_type (EmptyImage, PreviewImage, …) is not a
+     *  custom pack at all and a registered custom one is already installed —
+     *  then declared class_types vs list_installed_nodes (loose — see
+     *  nodeInstalled) for whatever the live defs can't answer. */
     async function resolveNodePacks(declared) {
       const wf = await workflow();
       if (wf) {
@@ -953,10 +990,21 @@ export function createAppsContent(ctx, shell, opts = {}) {
           if (coreOnly) return [];
         } catch { /* fall through to the declared-list heuristic */ }
       }
-      let installed = new Set();
-      try { installed = parseInstalledNodeSet(toolText(await callTool("list_installed_nodes", {}))); }
-      catch { /* older/offline bridge — everything reads as unknown */ }
-      return dedupePacks(declared.map((c) => ({ pack: c, installed: installed.size ? nodeInstalled(installed, c) : false })));
+      const resolved = [];
+      const unknown = [];
+      for (const c of declared) {
+        const def = liveNodeDef(getApp, c) || await fetchNodeDef(c);
+        if (!def) { unknown.push(c); continue; }
+        if (isCoreNodeModule(def.python_module)) continue; // core node — no pack to install
+        resolved.push({ pack: c, installed: true }); // registered live → its pack is present
+      }
+      if (unknown.length) {
+        let installed = new Set();
+        try { installed = parseInstalledNodeSet(toolText(await callTool("list_installed_nodes", {}))); }
+        catch { /* older/offline bridge — everything reads as unknown */ }
+        for (const c of unknown) resolved.push({ pack: c, installed: installed.size ? nodeInstalled(installed, c) : false });
+      }
+      return dedupePacks(resolved);
     }
   }
 
