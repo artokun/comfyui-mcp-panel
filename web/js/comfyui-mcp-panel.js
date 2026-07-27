@@ -11841,10 +11841,15 @@ function buildPanel() {
     // first record(), and even then silently, so viewing a workflow never dirties it.
     const historyKey = workflowStorageKey();
 
+    // Same workflow OBJECT, id flipped tmp:→wf: → ADOPT. Instance-based (like the
+    // RENAME case below), NOT wfkey-based: the unsaved tab id is now stable across
+    // wf.key churn, so a mid-life key change makes the case-1 early return skip
+    // refreshing currentWorkflowKey — a key comparison would then miss the adopt and
+    // misroute the save as a SWITCH (codex review). The instance survives the save.
     const adopting =
+      wf &&
+      wf === currentWorkflowRef &&
       currentWorkflowId &&
-      currentWorkflowKey &&
-      wfkey === currentWorkflowKey &&
       currentWorkflowId.startsWith("tmp:") &&
       wfid.startsWith("wf:");
     if (adopting) {
