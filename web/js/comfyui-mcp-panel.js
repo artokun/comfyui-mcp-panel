@@ -111,7 +111,7 @@ const DISCORD_INVITE_URL = "https://discord.gg/cW9arBhzCu";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
-const PANEL_VERSION = "0.11.0";
+const PANEL_VERSION = "0.11.1";
 
 // The connected orchestrator's console URL/token (captured off the `backends`
 // bridge message — see onBackends). Drives the "API Keys" credentials frame;
@@ -652,7 +652,14 @@ function getTabId() {
 // ones get a stable temp id for this app session (adopted into the file id on save,
 // see the workflow-change handler). Falls back to the legacy per-browser-session id
 // when no workflow service is present (headless / odd frontend).
-const _tempWorkflowIds = new Map(); // wf.key -> "tmp:<uuid>"
+// Unsaved workflows get a stable temp routing id keyed on the STABLE workflow
+// OBJECT INSTANCE, not wf.key. wf.key is derived and churns for unsaved tabs
+// (ComfyUI re-derives it as tabs open/close/rename), so keying the tmp: id on it
+// minted a FRESH id on the 600ms workflow poll — which re-helloed the socket in a
+// loop and produced a "connection dropped mid-task" nudge storm on idle unsaved
+// tabs. The instance is the only identity that survives that churn (cf.
+// currentWorkflowRef / _workflowObjectUuids).
+const _tempWorkflowInstanceIds = new WeakMap(); // wf object -> "tmp:<uuid>"
 const _workflowObjectUuids = new WeakMap();
 const _workflowUuidOwners = new Map();
 const WORKFLOW_UUID_ALIASES_KEY = "comfyui-mcp.panel.workflowUuidAliases";
@@ -834,11 +841,13 @@ function workflowTabId() {
   if (!wf) return getTabId();
   const saved = savedWorkflowPath(wf);
   if (saved) return "wf:" + wf.path;
-  const k = wf.key || wf.id || "unsaved";
-  let id = _tempWorkflowIds.get(k);
+  // Key on the STABLE object instance, not the mutable wf.key (see the note at
+  // _tempWorkflowInstanceIds): the same unsaved workflow must keep ONE tmp: id for
+  // its lifetime, or the 600ms poll churns it into a re-hello storm.
+  let id = _tempWorkflowInstanceIds.get(wf);
   if (!id) {
     id = "tmp:" + crypto.randomUUID();
-    _tempWorkflowIds.set(k, id);
+    _tempWorkflowInstanceIds.set(wf, id);
   }
   return id;
 }
@@ -11802,7 +11811,7 @@ function buildPanel() {
     if (sessionFollowsPanel()) {
       const initial = currentWorkflowId == null;
       // tmp→wf adopt bookkeeping (a save gave the unsaved workflow a real id).
-      if (wfid.startsWith("wf:") && wf && (wf.key || wf.id)) _tempWorkflowIds.delete(wf.key || wf.id);
+      if (wfid.startsWith("wf:") && wf) _tempWorkflowInstanceIds.delete(wf);
       if (thread) {
         historyStore.reviseThread(thread, { workflowKey: wfid }); // archive provenance
         setActiveThread("panel:global", thread.id);
@@ -11832,15 +11841,20 @@ function buildPanel() {
     // first record(), and even then silently, so viewing a workflow never dirties it.
     const historyKey = workflowStorageKey();
 
+    // Same workflow OBJECT, id flipped tmp:→wf: → ADOPT. Instance-based (like the
+    // RENAME case below), NOT wfkey-based: the unsaved tab id is now stable across
+    // wf.key churn, so a mid-life key change makes the case-1 early return skip
+    // refreshing currentWorkflowKey — a key comparison would then miss the adopt and
+    // misroute the save as a SWITCH (codex review). The instance survives the save.
     const adopting =
+      wf &&
+      wf === currentWorkflowRef &&
       currentWorkflowId &&
-      currentWorkflowKey &&
-      wfkey === currentWorkflowKey &&
       currentWorkflowId.startsWith("tmp:") &&
       wfid.startsWith("wf:");
     if (adopting) {
       const t = threadForWorkflow(historyKey);
-      if (wf && (wf.key || wf.id)) _tempWorkflowIds.delete(wf.key || wf.id);
+      if (wf) _tempWorkflowInstanceIds.delete(wf);
       currentWorkflowId = wfid;
       currentWorkflowKey = wfkey;
       currentWorkflowRef = wf;
