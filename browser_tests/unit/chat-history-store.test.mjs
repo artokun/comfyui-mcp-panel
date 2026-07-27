@@ -11,6 +11,7 @@ import {
   normalizeThread,
   retainBoundedThreads,
   selectPanelThread,
+  parseHistoryImport,
   selectRestoreThread,
   selectThreadForScope,
   updateMetadataEntry
@@ -142,6 +143,446 @@ test('merges browser and durable snapshots by newest thread update', () => {
   assert.equal(merged.threads[0].title, 'kept title')
   assert.equal(merged.meta.activeByScope['panel:global'], 'same')
   assert.equal(merged.meta.workflowAliases['workflows/a.json'], 'uuid-a')
+})
+
+test('accepts legacy array exports and rejects unrelated JSON', () => {
+  const imported = parseHistoryImport(JSON.stringify([{ id: 'one', ts: 1, msgs: [] }]))
+  assert.equal(imported.threads[0].id, 'one')
+  assert.throws(() => parseHistoryImport('{"hello":"world"}'), /not a ComfyUI Agent Panel/i)
+})
+
+test('exports and merges portable archive payloads without dropping existing chats', () => {
+  const store = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb: null,
+    broadcastFactory: null
+  })
+  const exported = store.exportPayload([
+    { id: 'portable', ts: 20, title: 'Portable chat', msgs: [] }
+  ])
+  const merged = store.importPayload(JSON.stringify(exported), [
+    { id: 'existing', ts: 10, title: 'Existing chat', msgs: [] }
+  ])
+  assert.equal(exported.format, 'comfyui-agent-panel-chat-history')
+  assert.equal(exported.schemaVersion, CHAT_HISTORY_SCHEMA)
+  assert.deepEqual(merged.threads.map((thread) => thread.id), ['existing', 'portable'])
+  store.close()
+})
+
+test('portable imports cannot carry checkpoints tombstones sessions or active pointers into local history', () => {
+  const store = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb: null,
+    broadcastFactory: null,
+    writerId: 'portable-import-test'
+  })
+  const currentThread = {
+    id: 'local',
+    createdAt: 100,
+    updatedAt: 100,
+    sessionId: 'local-provider-session',
+    provider: 'claude',
+    msgs: [{ id: 'local-message', role: 'user', text: 'must survive', createdAt: 100 }]
+  }
+  const currentMeta = {
+    workflowAliases: { 'workflows/local.json': 'local-uuid' },
+    activeByScope: { 'panel:global': 'local' },
+    checkpoint: {
+      generation: 2,
+      revision: { updatedAt: 200, writerId: 'local-checkpoint', sequence: 1 }
+    }
+  }
+  const maliciousPortable = {
+    format: 'comfyui-agent-panel-chat-history',
+    schemaVersion: CHAT_HISTORY_SCHEMA,
+    threads: [{
+      id: 'imported',
+      createdAt: 10,
+      updatedAt: 10,
+      sessionId: 'foreign-session',
+      provider: 'codex',
+      deletedMessages: { importedMessage: 999999 },
+      msgs: [{
+        id: 'imported-message',
+        role: 'user',
+        text: 'portable content',
+        createdAt: 10,
+        revision: { updatedAt: 999999, writerId: 'foreign', sequence: 9 }
+      }]
+    }],
+    meta: {
+      checkpoint: {
+        generation: 99,
+        revision: { updatedAt: 999999, writerId: 'foreign', sequence: 99 }
+      },
+      deletedThreads: {
+        local: {
+          value: null,
+          deleted: true,
+          updatedAt: 999999,
+          revision: { updatedAt: 999999, writerId: 'foreign', sequence: 100 }
+        }
+      },
+      activeByScope: { 'panel:global': 'imported' },
+      workflowAliases: {
+        'workflows/local.json': 'foreign-overwrite',
+        'workflows/imported.json': 'imported-uuid'
+      }
+    }
+  }
+
+  const merged = store.importPayload(
+    JSON.stringify(maliciousPortable),
+    [currentThread],
+    currentMeta
+  )
+  assert.deepEqual(merged.threads.map((thread) => thread.id), ['local', 'imported'])
+  assert.equal(merged.threads.find((thread) => thread.id === 'local').sessionId, 'local-provider-session')
+  assert.equal(merged.threads.find((thread) => thread.id === 'imported').sessionId, undefined)
+  assert.equal(merged.threads.find((thread) => thread.id === 'imported').msgs[0].text, 'portable content')
+  assert.equal(merged.meta.activeByScope['panel:global'], 'local')
+  assert.equal(merged.meta.workflowAliases['workflows/local.json'], 'local-uuid')
+  assert.equal(merged.meta.workflowAliases['workflows/imported.json'], 'imported-uuid')
+  assert.equal(merged.meta.checkpoint.generation, 2)
+  assert.equal(merged.importedCount, 1)
+
+  const exported = store.exportPayload(merged.threads, merged.meta)
+  const exportedImported = exported.threads.find((thread) => thread.id === 'imported')
+  assert.equal(exportedImported.sessionId, undefined)
+  assert.equal(exportedImported.createdRevision, undefined)
+  assert.equal(exportedImported.fieldOps, undefined)
+  assert.equal(exportedImported.msgs[0].revision, undefined)
+  assert.equal(exported.meta.checkpoint, undefined)
+  assert.equal(exported.meta.deletedThreads, undefined)
+  assert.equal(exported.meta.activeByScope, undefined)
+  store.close()
+})
+
+test('import fails closed instead of evicting local chats at the canonical cap', () => {
+  const store = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb: null,
+    maxThreads: 500,
+    writerId: 'import-cap-test'
+  })
+  const locals = Array.from({ length: 500 }, (_, index) => ({
+    id: `local-${index}`,
+    createdAt: index + 1,
+    updatedAt: index + 1,
+    msgs: []
+  }))
+  const payload = {
+    format: 'comfyui-agent-panel-chat-history',
+    schemaVersion: CHAT_HISTORY_SCHEMA,
+    threads: [{ id: 'imported-new', createdAt: 9999, updatedAt: 9999, msgs: [] }],
+    meta: {}
+  }
+
+  assert.throws(
+    () => store.importPayload(payload, locals, {}),
+    /only 0 of 500 are available.*no history was changed/i
+  )
+  assert.equal(locals.length, 500)
+  assert.equal(locals[0].id, 'local-0')
+  store.close()
+})
+
+test('import fails closed instead of evicting local messages at the per-thread cap', () => {
+  const store = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb: null,
+    maxMessages: 5,
+    writerId: 'import-message-cap-test'
+  })
+  const local = {
+    id: 'full-chat',
+    createdAt: 1,
+    updatedAt: 5,
+    msgs: Array.from({ length: 5 }, (_, index) => ({
+      id: `local-message-${index}`,
+      role: 'user',
+      text: `local ${index}`,
+      createdAt: index + 1
+    }))
+  }
+
+  assert.throws(
+    () => store.importPayload({
+      format: 'comfyui-agent-panel-chat-history',
+      schemaVersion: CHAT_HISTORY_SCHEMA,
+      threads: [{
+        id: 'full-chat',
+        createdAt: 1,
+        updatedAt: 99,
+        msgs: [{ id: 'imported-message', role: 'agent', text: 'would evict local', createdAt: 99 }]
+      }],
+      meta: {}
+    }, [local], {}),
+    /only 0 of 5 are available.*no history was changed/i
+  )
+  assert.equal(local.msgs.length, 5)
+  assert.equal(local.msgs[0].text, 'local 0')
+  store.close()
+})
+
+test('same-id imports are add-only and cannot replace local messages or thread fields', () => {
+  const store = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb: null,
+    writerId: 'import-collision-test'
+  })
+  const local = {
+    id: 'shared-thread',
+    createdAt: 100,
+    updatedAt: 100,
+    workflowKey: 'workflow:local',
+    workflowTitle: 'Local workflow',
+    provider: 'claude',
+    model: 'local-model',
+    title: 'Local title',
+    todos: [{ text: 'keep local todo', status: 'active' }],
+    workflowVersions: {
+      same: { hash: 'same', capturedAt: 100, nodeCount: 1, snapshot: { local: true } }
+    },
+    msgs: [{
+      id: 'same-message',
+      role: 'user',
+      text: 'local body',
+      createdAt: 100,
+      updatedAt: 100
+    }]
+  }
+  const futureRevision = { updatedAt: 999999, writerId: 'foreign', sequence: 1 }
+  const payload = {
+    format: 'comfyui-agent-panel-chat-history',
+    schemaVersion: CHAT_HISTORY_SCHEMA,
+    threads: [{
+      id: 'shared-thread',
+      createdAt: 100,
+      updatedAt: 999999,
+      workflowKey: 'workflow:foreign',
+      workflowTitle: 'Foreign workflow',
+      provider: 'codex',
+      model: 'foreign-model',
+      fieldOps: {
+        title: {
+          value: null,
+          deleted: true,
+          updatedAt: 999999,
+          revision: futureRevision
+        },
+        todos: {
+          value: null,
+          deleted: true,
+          updatedAt: 999999,
+          revision: { ...futureRevision, sequence: 2 }
+        }
+      },
+      workflowVersions: {
+        same: { hash: 'same', capturedAt: 999999, nodeCount: 999, snapshot: { foreign: true } },
+        added: { hash: 'added', capturedAt: 200, nodeCount: 2 }
+      },
+      msgs: [
+        {
+          id: 'same-message',
+          role: 'agent',
+          text: 'foreign replacement',
+          createdAt: 100,
+          updatedAt: 999999,
+          revision: { ...futureRevision, sequence: 3 }
+        },
+        {
+          id: 'new-message',
+          role: 'agent',
+          text: 'new portable addition',
+          createdAt: 200
+        }
+      ]
+    }],
+    meta: {}
+  }
+
+  const merged = store.importPayload(payload, [local], {})
+  const thread = merged.threads[0]
+  assert.equal(thread.workflowKey, 'workflow:local')
+  assert.equal(thread.workflowTitle, 'Local workflow')
+  assert.equal(thread.provider, 'claude')
+  assert.equal(thread.model, 'local-model')
+  assert.equal(thread.title, 'Local title')
+  assert.deepEqual(thread.todos, [{ text: 'keep local todo', status: 'active' }])
+  assert.equal(thread.msgs.find((message) => message.id === 'same-message').text, 'local body')
+  assert.equal(thread.msgs.find((message) => message.id === 'new-message').text, 'new portable addition')
+  assert.deepEqual(thread.workflowVersions.same.snapshot, { local: true })
+  assert.equal(thread.workflowVersions.added.nodeCount, 2)
+  store.close()
+})
+
+test('imported aliases fill bounded free slots without evicting local aliases', () => {
+  const store = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb: null,
+    maxMetadataOps: 512,
+    writerId: 'import-alias-cap-test'
+  })
+  const localAliases = Object.fromEntries(
+    Array.from({ length: 511 }, (_, index) => [`workflows/local-${index}.json`, `uuid-${index}`])
+  )
+  const importedAliases = Object.fromEntries(
+    Array.from({ length: 600 }, (_, index) => [`workflows/imported-${index}.json`, `imported-${index}`])
+  )
+  const merged = store.importPayload({
+    format: 'comfyui-agent-panel-chat-history',
+    schemaVersion: CHAT_HISTORY_SCHEMA,
+    threads: [],
+    meta: { workflowAliases: importedAliases }
+  }, [], { workflowAliases: localAliases })
+
+  assert.equal(Object.keys(merged.meta.workflowAliases).length, 512)
+  assert.equal(merged.meta.workflowAliases['workflows/local-0.json'], 'uuid-0')
+  assert.equal(merged.meta.workflowAliases['workflows/local-510.json'], 'uuid-510')
+  assert.equal(merged.meta.workflowAliases['workflows/imported-0.json'], 'imported-0')
+  assert.equal(merged.importedAliasCount, 1)
+  assert.equal(merged.skippedAliasCount, 599)
+  store.close()
+})
+
+test('duplicate imported records cannot crowd local workflow versions out of a colliding chat', () => {
+  const store = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb: null,
+    writerId: 'import-version-cap-test'
+  })
+  const localVersions = Object.fromEntries(
+    Array.from({ length: 19 }, (_, index) => [
+      `local-${index}`,
+      { hash: `local-${index}`, capturedAt: index + 1, nodeCount: index + 1 }
+    ])
+  )
+  const payload = {
+    format: 'comfyui-agent-panel-chat-history',
+    schemaVersion: CHAT_HISTORY_SCHEMA,
+    threads: [
+      {
+        id: 'shared-thread',
+        createdAt: 1,
+        updatedAt: 999,
+        workflowVersions: {
+          'imported-a': { hash: 'imported-a', capturedAt: 999_999, nodeCount: 100 }
+        },
+        msgs: []
+      },
+      {
+        id: 'shared-thread',
+        createdAt: 1,
+        updatedAt: 1_000,
+        workflowVersions: {
+          'imported-b': { hash: 'imported-b', capturedAt: 1_000_000, nodeCount: 101 }
+        },
+        msgs: []
+      }
+    ],
+    meta: {}
+  }
+
+  const merged = store.importPayload(payload, [{
+    id: 'shared-thread',
+    createdAt: 1,
+    updatedAt: 1,
+    workflowVersions: localVersions,
+    msgs: []
+  }], {})
+  const versions = merged.threads[0].workflowVersions
+
+  assert.equal(Object.keys(versions).length, 20)
+  for (const hash of Object.keys(localVersions)) assert.ok(versions[hash], `${hash} must survive`)
+  assert.ok(versions['imported-a'] || versions['imported-b'])
+  store.close()
+})
+
+test('rejects exports from a future history schema', () => {
+  assert.throws(
+    () => parseHistoryImport(JSON.stringify({
+      format: 'comfyui-agent-panel-chat-history',
+      schemaVersion: CHAT_HISTORY_SCHEMA + 1,
+      threads: []
+    })),
+    /newer than this panel supports/i
+  )
+})
+
+test('unions concurrent workflow versions instead of replacing the older map', () => {
+  const merged = mergeHistorySnapshots(
+    {
+      threads: [{
+        id: 'versioned',
+        createdAt: 1,
+        updatedAt: 10,
+        msgs: [],
+        workflowVersions: {
+          alpha: { hash: 'alpha', capturedAt: 10, nodeCount: 1 }
+        }
+      }],
+      meta: {}
+    },
+    {
+      threads: [{
+        id: 'versioned',
+        createdAt: 1,
+        updatedAt: 20,
+        msgs: [],
+        workflowVersions: {
+          beta: { hash: 'beta', capturedAt: 20, nodeCount: 2 }
+        }
+      }],
+      meta: {}
+    }
+  )
+  assert.deepEqual(Object.keys(merged.threads[0].workflowVersions).sort(), ['alpha', 'beta'])
+})
+
+test('bounds workflow versions and drops only oversized snapshots', () => {
+  const workflowVersions = Object.fromEntries(
+    Array.from({ length: 25 }, (_, index) => {
+      const hash = `version-${index}`
+      return [hash, {
+        hash,
+        capturedAt: index + 1,
+        nodeCount: index,
+        snapshot: index === 24 ? { payload: 'x'.repeat(300_001) } : { nodes: [] }
+      }]
+    })
+  )
+  const normalized = normalizeThread({
+    id: 'bounded-versions',
+    ts: 1,
+    msgs: [],
+    workflowVersions
+  })
+  assert.equal(Object.keys(normalized.workflowVersions).length, 20)
+  assert.ok(normalized.workflowVersions['version-24'])
+  assert.equal(normalized.workflowVersions['version-24'].snapshot, undefined)
+  assert.equal(normalized.workflowVersions['version-24'].nodeCount, 24)
+  assert.equal(normalized.workflowVersions['version-0'], undefined)
+})
+
+test('workflow snapshot cap counts UTF-8 bytes instead of UTF-16 code units', () => {
+  const normalized = normalizeThread({
+    id: 'unicode-version',
+    ts: 1,
+    msgs: [],
+    workflowVersions: {
+      unicode: {
+        hash: 'unicode',
+        capturedAt: 1,
+        nodeCount: 1,
+        // 120k CJK characters are 360k UTF-8 bytes, despite fitting in 120k
+        // JavaScript UTF-16 code units.
+        snapshot: { payload: '界'.repeat(120_000) }
+      }
+    }
+  })
+  assert.equal(normalized.workflowVersions.unicode.snapshot, undefined)
+  assert.equal(normalized.workflowVersions.unicode.nodeCount, 1)
 })
 
 test('merges concurrent messages in the same thread without dropping either tab', () => {
@@ -692,11 +1133,25 @@ test('localStorage shadow retains the active tab thread when IndexedDB is unavai
     updatedAt: 1000 + i,
     msgs: [{ id: `m${i}`, role: 'user', text: `message ${i}` }]
   }))
-  const store = new ChatHistoryStore({ storage, indexedDb: null })
+  const failures = []
+  const store = new ChatHistoryStore({
+    storage,
+    indexedDb: null,
+    onPersistenceError: (failure) => failures.push(failure)
+  })
   store.persist(threads, { activeByScope: { 'panel:global': 't0' } })
-  await store.flush()
+  const result = await store.flush()
 
   const shadow = JSON.parse(values.get('comfyui-mcp.panel.threads'))
+  assert.deepEqual(result, {
+    ok: false,
+    shadowCommitted: true,
+    canonicalCommitted: false,
+    retryable: true,
+    code: 'history-canonical-unavailable-shadow-truncated'
+  })
+  assert.equal(failures.length, 1)
+  assert.equal(store._dirtyWrite.snapshot.threads.length, 21)
   assert.equal(shadow.length, 20)
   assert.equal(shadow.some((thread) => thread.id === 't0'), true)
   assert.equal(shadow.some((thread) => thread.id === 't1'), false)
@@ -705,6 +1160,54 @@ test('localStorage shadow retains the active tab thread when IndexedDB is unavai
   const degradedReload = await degradedStore.load({ protectedThreadIds: ['t0'] })
   await degradedStore.flush()
   assert.equal(degradedReload.threads.some((thread) => thread.id === 't0'), true)
+})
+
+test('canonical compaction bounds materialized aliases as well as alias operations', async () => {
+  const indexedDb = createFakeIndexedDb()
+  const aliases = Object.fromEntries(
+    Array.from({ length: 600 }, (_, index) => [`workflows/alias-${index}.json`, `uuid-${index}`])
+  )
+  const store = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb,
+    maxMetadataOps: 512,
+    writerId: 'materialized-alias-cap-test'
+  })
+
+  store.persist([], { updatedAt: 1_000, workflowAliases: aliases })
+  assert.equal(await store.flush(), true)
+
+  const canonical = indexedDb.readState()
+  assert.equal(Object.keys(canonical.meta.workflowAliases).length, 512)
+  assert.equal(Object.keys(canonical.meta.aliasOps).length, 512)
+  assert.equal(canonical.meta.checkpoint.generation, 1)
+  const droppedPath = Object.keys(aliases).find(
+    (path) => !Object.hasOwn(canonical.meta.workflowAliases, path)
+  )
+  assert.ok(droppedPath)
+
+  const stale = new ChatHistoryStore({
+    storage: createMemoryStorage(),
+    indexedDb,
+    maxMetadataOps: 512,
+    writerId: 'stale-alias-writer'
+  })
+  stale.persist([], {
+    workflowAliases: { [droppedPath]: 'must-not-resurrect' },
+    aliasOps: {
+      [droppedPath]: {
+        value: 'must-not-resurrect',
+        deleted: false,
+        updatedAt: 1,
+        revision: { updatedAt: 1, writerId: 'stale-alias-writer', sequence: 1 }
+      }
+    }
+  })
+  await stale.flush()
+  const reloaded = await store.readCanonical()
+  assert.equal(Object.hasOwn(reloaded.meta.workflowAliases, droppedPath), false)
+  stale.close()
+  store.close()
 })
 
 test('canonical IndexedDB merge enforces thread and message limits after union', async () => {
@@ -1550,12 +2053,15 @@ test('the shadow cap exempts legacyShadow threads (their only copy)', async () =
     threads: []
   })
   const store = new ChatHistoryStore({ storage, indexedDb })
-  // A fully legacy (idless) shadow: 19 normal + 1 foreign = the 20-thread cap
-  // exactly. Without the exemption the oldest could still be evicted because
-  // legacyShadow threads are canonical-excluded (the shadow is their ONLY copy).
-  const many = Array.from({ length: 19 }, (_, i) => ({
+  // A fully legacy (idless) shadow above both ordinary local-shadow caps.
+  // These threads are canonical-excluded, so their shadow is the only copy.
+  const many = Array.from({ length: 21 }, (_, i) => ({
     id: `t${i}`, workflowKey: 'workflow:a', createdAt: now - i, updatedAt: now - i,
-    msgs: [{ role: 'user', text: `legacy msg ${i}`, createdAt: now - i }]
+    msgs: Array.from({ length: i === 0 ? 201 : 1 }, (_, j) => ({
+      role: 'user',
+      text: `legacy msg ${i}:${j}`,
+      createdAt: now - i + j,
+    })),
   }))
   storage.setItem('comfyui-mcp.panel.threads', JSON.stringify([
     ...many,
@@ -1567,14 +2073,62 @@ test('the shadow cap exempts legacyShadow threads (their only copy)', async () =
   await store.flush()
 
   const shadowThreads = JSON.parse(storage.values.get('comfyui-mcp.panel.threads'))
-  assert.ok(
-    shadowThreads.some((thread) => thread.id === 'foreign-thread'),
-    'the shadow cap must never evict a quarantined thread',
+  assert.equal(
+    shadowThreads.length,
+    22,
+    'the shadow cap must retain every quarantined thread',
   )
+  assert.equal(
+    shadowThreads.find((thread) => thread.id === 't0')?.msgs.length,
+    201,
+    'the message cap must retain the full only-copy transcript',
+  )
+  assert.ok(shadowThreads.some((thread) => thread.id === 'foreign-thread'))
   // And every quarantined thread keeps its shadow copy (none merged into canonical).
   const canonicalAfter = indexedDb.readState()
   assert.equal(
     (canonicalAfter?.threads || []).some((thread) => thread?.id === 'foreign-thread'),
     false,
   )
+})
+
+test('a canonical commit cannot hide failure to save a legacyShadow only-copy transcript', async () => {
+  const failures = []
+  const indexedDb = createFakeIndexedDb({
+    schemaVersion: CHAT_HISTORY_SCHEMA,
+    updatedAt: 1,
+    meta: { checkpoint: { generation: 1, revision: { updatedAt: 1, writerId: 'seed', sequence: 1 } } },
+    threads: []
+  })
+  const store = new ChatHistoryStore({
+    storage: createMemoryStorage({ throwOnSet: CHAT_HISTORY_LOCAL_SNAPSHOT_KEY }),
+    indexedDb,
+    writerId: 'legacy-shadow-quota-test',
+    onPersistenceError: (failure) => failures.push(failure)
+  })
+
+  store.persist([{
+    id: 'legacy-only',
+    legacyShadow: true,
+    createdAt: 10,
+    updatedAt: 10,
+    msgs: [{ id: 'legacy-message', role: 'user', text: 'only copy', createdAt: 10 }]
+  }], {})
+  const result = await store.flush()
+
+  assert.deepEqual(result, {
+    ok: false,
+    shadowCommitted: false,
+    canonicalCommitted: true,
+    retryable: true,
+    code: 'history-legacy-shadow-unavailable'
+  })
+  assert.equal(failures.length, 1)
+  assert.equal(store._dirtyWrite.snapshot.threads[0].id, 'legacy-only')
+  assert.equal(
+    (indexedDb.readState()?.threads || []).some((thread) => thread.id === 'legacy-only'),
+    false,
+    'the schema fence must still exclude the legacy-only transcript from canonical IndexedDB',
+  )
+  store.close()
 })

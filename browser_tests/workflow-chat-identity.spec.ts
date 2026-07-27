@@ -1,31 +1,47 @@
 import { test, expect } from './fixtures/panelTest'
+import { resolveHistoryStoreModuleUrl } from './fixtures/historyStoreModule'
 
 const THREADS_KEY = 'comfyui-mcp.panel.threads'
 const CURRENT_THREAD_KEY = 'comfyui-mcp.panel.currentThreadId'
 const SESSION_KEY = 'comfyui-mcp.panel.sessionId'
+
+async function setWorkflowScope(page: import('@playwright/test').Page) {
+  await page.waitForFunction(() => {
+    const w = window as any
+    const app = w.comfyAPI?.app?.app || w.app
+    return typeof app?.ui?.settings?.setSettingValue === 'function'
+  })
+  await page.evaluate(() => {
+    const w = window as any
+    const app = w.comfyAPI?.app?.app || w.app
+    const settings = app.ui.settings
+    if (!w.__cmcpOriginalGetSettingValue) {
+      w.__cmcpOriginalGetSettingValue = settings.getSettingValue.bind(settings)
+    }
+    settings.getSettingValue = (id: string) =>
+      id === 'comfyui-mcp.chatScope'
+        ? 'workflow'
+        : w.__cmcpOriginalGetSettingValue(id)
+  })
+  await expect.poll(() => page.evaluate(() => {
+    const w = window as any
+    const app = w.comfyAPI?.app?.app || w.app
+    return app?.ui?.settings?.getSettingValue?.('comfyui-mcp.chatScope')
+  })).toBe('workflow')
+}
 
 test('opening a workflow does not dirty it and first record embeds silently', async ({
   page,
   panel,
   mockBridge
 }) => {
-  await page.route(
-    (url) => /\/(api\/)?settings\/?$/.test(url.pathname),
-    async (route) => {
-      if (route.request().method() !== 'GET') return route.continue()
-      const response = await route.fetch()
-      const settings = await response.json() as Record<string, unknown>
-      settings['comfyui-mcp.sessionFollowsPanel'] = false
-      await route.fulfill({ response, json: settings })
-    }
-  )
-
   await panel.goto()
   await page.waitForFunction(() => {
     const w = window as any
     const app = w.comfyAPI?.app?.app || w.app
     return !!app?.graph && !!app?.extensionManager?.workflow?.activeWorkflow
   })
+  await setWorkflowScope(page)
   const before = await page.evaluate(() => {
     const w = window as any
     const app = w.comfyAPI?.app?.app || w.app
@@ -83,8 +99,9 @@ test('default mode opens pre-upgrade history without re-keying it', async ({
   page,
   panel
 }) => {
-  await panel.goto()
-  await page.evaluate(({ threadsKey, currentThreadKey }) => {
+  // Seed storage before navigation: ComfyUI may eagerly restore the Agent tab
+  // and mount the panel before openSidebar() is called.
+  await page.addInitScript(({ threadsKey, currentThreadKey }) => {
     localStorage.setItem(threadsKey, JSON.stringify([
       {
         id: 'old-current',
@@ -101,6 +118,7 @@ test('default mode opens pre-upgrade history without re-keying it', async ({
     ]))
     sessionStorage.setItem(currentThreadKey, 'old-current')
   }, { threadsKey: THREADS_KEY, currentThreadKey: CURRENT_THREAD_KEY })
+  await panel.goto()
 
   await panel.openSidebar()
   await expect(panel.userBubble('old current thread')).toBeVisible()
@@ -132,8 +150,8 @@ test('settings hydration never adopts a loose session into a workflow thread', a
     const originalGet = settings.getSettingValue.bind(settings)
     w.__cmcpPerWorkflowHydrated = false
     settings.getSettingValue = (id: string) =>
-      id === 'comfyui-mcp.sessionFollowsPanel'
-        ? !w.__cmcpPerWorkflowHydrated
+      id === 'comfyui-mcp.chatScope'
+        ? (w.__cmcpPerWorkflowHydrated ? 'workflow' : 'panel')
         : originalGet(id)
     localStorage.setItem(threadsKey, JSON.stringify([{
       id: 'workflow-before-hydration',
@@ -188,20 +206,10 @@ test('embeds a workflow UUID and blocks a foreign transcript pointer', async ({
   panel,
   mockBridge
 }) => {
-  // Make the legacy per-workflow setting available before the panel mounts and
-  // after reload; the shared fixture intentionally strips real user settings.
-  await page.route(
-    (url) => /\/(api\/)?settings\/?$/.test(url.pathname),
-    async (route) => {
-      if (route.request().method() !== 'GET') return route.continue()
-      const response = await route.fetch()
-      const settings = await response.json() as Record<string, unknown>
-      settings['comfyui-mcp.sessionFollowsPanel'] = false
-      await route.fulfill({ response, json: settings })
-    }
-  )
-
   await panel.goto()
+  // Make the per-workflow setting available before the panel mounts; the
+  // shared fixture intentionally strips real user settings.
+  await setWorkflowScope(page)
   await panel.setBridgeUrl(mockBridge.url)
   await panel.openSidebar()
   await panel.connect()
@@ -227,10 +235,10 @@ test('embeds a workflow UUID and blocks a foreign transcript pointer', async ({
   // do in this architecture: another tab writes it through the store, landing
   // in the shared canonical. (Direct localStorage writes are just this tab's
   // own cache and are legitimately overwritten by the owning panel's flush.)
+  const storeModuleUrl = await resolveHistoryStoreModuleUrl(page)
   const otherTab = await context.newPage()
   await otherTab.goto(page.url())
-  await otherTab.evaluate(async ({ threadsKey, currentThreadKey }) => {
-    const storeModuleUrl = '/extensions/comfyui-agent-panel/js/lib/chat-history-store.js'
+  await otherTab.evaluate(async ({ threadsKey, currentThreadKey, storeModuleUrl }) => {
     const { ChatHistoryStore } = await import(storeModuleUrl)
     const foreignStore = new ChatHistoryStore({ writerId: 'foreign-tab-test' })
     const existing = JSON.parse(localStorage.getItem(threadsKey) || '[]')
@@ -245,14 +253,17 @@ test('embeds a workflow UUID and blocks a foreign transcript pointer', async ({
     ], {})
     await foreignStore.flush()
     await foreignStore.close?.()
-  }, { threadsKey: THREADS_KEY, currentThreadKey: CURRENT_THREAD_KEY })
+  }, { threadsKey: THREADS_KEY, currentThreadKey: CURRENT_THREAD_KEY, storeModuleUrl })
   await otherTab.close()
 
   await page.reload()
+  await setWorkflowScope(page)
   await panel.openSidebar()
   await expect(panel.userBubble('must never restore on this workflow')).toHaveCount(0)
 
   await panel.root.locator('button[title="Chat history"]').click()
+  const currentOnly = panel.root.getByTestId('history-current-workflow')
+  if (await currentOnly.isVisible()) await currentOnly.uncheck()
   const foreign = panel.root.locator('.cmcp-hist-row').filter({ hasText: 'must never restore on this workflow' })
   await expect(foreign).toBeVisible()
   await expect(foreign.locator('.cmcp-hist-open')).toBeDisabled()

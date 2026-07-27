@@ -10,6 +10,8 @@ export const CHAT_HISTORY_SCHEMA = 3;
 export const CHAT_HISTORY_DB = "comfyui-mcp-panel-history";
 export const CHAT_HISTORY_STATE_KEY = "state";
 export const CHAT_HISTORY_LOCAL_SNAPSHOT_KEY = "comfyui-mcp.panel.historySnapshot";
+export const CHAT_HISTORY_MAX_IMPORT_BYTES = 25 * 1024 * 1024;
+export const CHAT_HISTORY_EXPORT_FORMAT = "comfyui-agent-panel-chat-history";
 
 const DEFAULT_THREADS_KEY = "comfyui-mcp.panel.threads";
 const DEFAULT_META_KEY = "comfyui-mcp.panel.historyMeta";
@@ -20,6 +22,8 @@ const LOCAL_SHADOW_MESSAGES = 200;
 const IDB_OPEN_TIMEOUT_MS = 2000;
 const DEFAULT_MAX_TOMBSTONES = 512;
 const DEFAULT_MAX_METADATA_OPS = 512;
+const DEFAULT_MAX_WORKFLOW_VERSIONS = 20;
+const MAX_WORKFLOW_SNAPSHOT_BYTES = 300_000;
 const BROADCAST_CHANNEL_NAME = "comfyui-mcp-panel-history-v3";
 const LEGACY_IDLESS_SOURCE = Symbol("legacy-idless-source");
 const THREAD_FIELDS = [
@@ -45,6 +49,10 @@ const THREAD_STRING_LIMITS = {
 };
 const MAX_TODOS = 100;
 const MAX_TODO_TEXT = 2000;
+
+function utf8ByteLength(value) {
+  return new TextEncoder().encode(String(value)).byteLength;
+}
 
 function finiteTs(value) {
   const n = Number(value);
@@ -77,6 +85,59 @@ function stableHash(value) {
     second = Math.imul(second ^ code, 0x85ebca6b) >>> 0;
   }
   return first.toString(16).padStart(8, "0") + second.toString(16).padStart(8, "0");
+}
+
+function normalizeWorkflowVersions(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return Object.create(null);
+  const versions = [];
+  for (const [key, value] of Object.entries(raw)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const hash = String(value.hash || key || "").trim().slice(0, 64);
+    if (!hash) continue;
+    const normalized = {
+      hash,
+      capturedAt: finiteTs(value.capturedAt),
+      nodeCount: Math.max(0, Math.min(1_000_000, Math.floor(Number(value.nodeCount) || 0))),
+    };
+    for (const [field, limit] of [
+      ["workflowKey", 512],
+      ["title", 240],
+      ["path", 1024],
+    ]) {
+      if (typeof value[field] === "string" && value[field]) {
+        normalized[field] = value[field].slice(0, limit);
+      }
+    }
+    if (value.snapshot && typeof value.snapshot === "object") {
+      try {
+        const encoded = JSON.stringify(value.snapshot);
+        if (utf8ByteLength(encoded) <= MAX_WORKFLOW_SNAPSHOT_BYTES) {
+          normalized.snapshot = JSON.parse(encoded);
+        }
+      } catch {
+        // Invalid/cyclic snapshots retain their lightweight version metadata.
+      }
+    }
+    versions.push(normalized);
+  }
+  versions.sort((a, b) => b.capturedAt - a.capturedAt || a.hash.localeCompare(b.hash));
+  const result = Object.create(null);
+  for (const version of versions.slice(0, DEFAULT_MAX_WORKFLOW_VERSIONS)) {
+    const previous = result[version.hash];
+    if (!previous || version.capturedAt >= previous.capturedAt) result[version.hash] = version;
+  }
+  return result;
+}
+
+function mergeWorkflowVersions(...maps) {
+  const combined = Object.create(null);
+  for (const map of maps) {
+    for (const [hash, version] of Object.entries(normalizeWorkflowVersions(map))) {
+      const previous = combined[hash];
+      if (!previous || version.capturedAt >= previous.capturedAt) combined[hash] = version;
+    }
+  }
+  return normalizeWorkflowVersions(combined);
 }
 
 function normalizeRevision(value, fallbackUpdatedAt = 0, fallbackWriterId = "legacy", fallbackSequence = 0) {
@@ -413,10 +474,29 @@ function boundedEntries(map, limit, revisionOf) {
   return [kept, dropped];
 }
 
+function boundedMetadataValues(values, operations, limit, fallbackRevision) {
+  const entries = Object.entries(values || {});
+  if (entries.length <= limit) return [Object.assign(safeMap(), values || {}), []];
+  entries.sort((left, right) =>
+    compareRevisions(
+      operationRevision(operations?.[left[0]]) || fallbackRevision,
+      operationRevision(operations?.[right[0]]) || fallbackRevision,
+    ) || left[0].localeCompare(right[0]),
+  );
+  const dropped = entries.slice(0, entries.length - limit);
+  const kept = safeMap();
+  for (const [key, value] of entries.slice(-limit)) kept[key] = value;
+  return [kept, dropped];
+}
+
 function compactSnapshot(snapshot, { maxTombstones, maxMetadataOps }) {
   const tombstoneLimit = Math.max(1, Math.floor(Number(maxTombstones) || DEFAULT_MAX_TOMBSTONES));
   const operationLimit = Math.max(1, Math.floor(Number(maxMetadataOps) || DEFAULT_MAX_METADATA_OPS));
   const meta = { ...(snapshot.meta || {}) };
+  const originalMetadataOps = {
+    activeOps: meta.activeOps,
+    aliasOps: meta.aliasOps,
+  };
   const droppedRevisions = [];
   let changed = false;
   [meta.deletedThreads, changed] = (() => {
@@ -428,6 +508,27 @@ function compactSnapshot(snapshot, { maxTombstones, maxMetadataOps }) {
     const [kept, dropped] = boundedEntries(meta[name], operationLimit, operationRevision);
     meta[name] = kept;
     for (const [, value] of dropped) droppedRevisions.push(operationRevision(value));
+    if (dropped.length) changed = true;
+  }
+  const fallbackMetadataRevision =
+    normalizeCheckpoint(meta).revision ||
+    normalizeRevision(null, finiteTs(meta.updatedAt) || 1, "metadata-baseline");
+  for (const [valuesName, opsName] of [
+    ["activeByScope", "activeOps"],
+    ["workflowAliases", "aliasOps"],
+  ]) {
+    const [kept, dropped] = boundedMetadataValues(
+      meta[valuesName],
+      originalMetadataOps[opsName],
+      operationLimit,
+      fallbackMetadataRevision,
+    );
+    meta[valuesName] = kept;
+    for (const [key] of dropped) {
+      droppedRevisions.push(
+        operationRevision(originalMetadataOps[opsName]?.[key]) || fallbackMetadataRevision,
+      );
+    }
     if (dropped.length) changed = true;
   }
   const threads = snapshot.threads.map((thread) => {
@@ -477,6 +578,7 @@ export function normalizeThread(raw) {
     ts: updatedAt,
     msgs,
     deletedMessages,
+    workflowVersions: normalizeWorkflowVersions(raw.workflowVersions),
     title: typeof raw.title === "string" ? raw.title.slice(0, 160) : undefined,
     workflowTitle: typeof raw.workflowTitle === "string" ? raw.workflowTitle.slice(0, 240) : undefined,
     provider: typeof raw.provider === "string" ? raw.provider : undefined,
@@ -700,7 +802,16 @@ export function mergeHistorySnapshots(...snapshots) {
         );
       const fieldOps = mergeMetadataOperationMaps(older.fieldOps, newer.fieldOps);
       byId.set(next.id, materializeThreadFields(
-        { ...older, ...overlay, msgs, deletedMessages },
+        {
+          ...older,
+          ...overlay,
+          msgs,
+          deletedMessages,
+          workflowVersions: mergeWorkflowVersions(
+            older.workflowVersions,
+            newer.workflowVersions,
+          ),
+        },
         fieldOps,
       ));
     }
@@ -873,6 +984,92 @@ function boundedSnapshot(snapshot, { maxThreads, maxMessages, protectedThreadIds
       msgs: messageLimit ? thread.msgs.slice(-messageLimit) : [],
     })),
   };
+}
+
+export function parseHistoryImport(value) {
+  let parsed = value;
+  if (typeof value === "string") {
+    if (utf8ByteLength(value) > CHAT_HISTORY_MAX_IMPORT_BYTES) {
+      throw new Error("Chat history import exceeds the 25 MB limit");
+    }
+    parsed = JSON.parse(value);
+  }
+  if (Array.isArray(parsed)) parsed = { threads: parsed, meta: {} };
+  if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.threads)) {
+    throw new Error("Not a ComfyUI Agent Panel history export");
+  }
+  if (parsed.format != null && parsed.format !== CHAT_HISTORY_EXPORT_FORMAT) {
+    throw new Error("Not a ComfyUI Agent Panel history export");
+  }
+  const schemaVersion = Number(parsed.schemaVersion);
+  if (Number.isFinite(schemaVersion) && schemaVersion > CHAT_HISTORY_SCHEMA) {
+    throw new Error(
+      `Chat history schema ${schemaVersion} is newer than this panel supports (${CHAT_HISTORY_SCHEMA})`,
+    );
+  }
+  return {
+    schemaVersion: CHAT_HISTORY_SCHEMA,
+    threads: parsed.threads.map(portableThread).filter(Boolean),
+    // Keep every validated portable alias through parsing so importPayload can
+    // account for (and report) entries skipped by the local metadata cap.
+    meta: {
+      workflowAliases: portableWorkflowAliases(
+        parsed.meta?.workflowAliases,
+        Number.MAX_SAFE_INTEGER,
+      ),
+    },
+  };
+}
+
+function portableWorkflowAliases(raw, limit = DEFAULT_MAX_METADATA_OPS) {
+  const aliases = safeMap();
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return aliases;
+  let count = 0;
+  for (const [rawPath, rawUuid] of Object.entries(raw)) {
+    if (count >= limit) break;
+    if (typeof rawPath !== "string" || !rawPath || rawPath.length > 1024) continue;
+    if (typeof rawUuid !== "string" || !rawUuid || rawUuid.length > 512) continue;
+    aliases[rawPath] = rawUuid;
+    count += 1;
+  }
+  return aliases;
+}
+
+function portableMessage(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const message = cloneJson(raw);
+  delete message.revision;
+  delete message.createdRevision;
+  return message;
+}
+
+/** Produce the portable transcript shape used by export and import.
+ *
+ * Session ids and causal bookkeeping are browser-local implementation details:
+ * carrying them to another installation can resume the wrong provider session,
+ * while a foreign checkpoint/tombstone can delete unrelated local history.
+ */
+function portableThread(raw) {
+  const normalized = normalizeThread(raw);
+  if (!normalized) return null;
+  const thread = {
+    id: normalized.id,
+    schemaVersion: CHAT_HISTORY_SCHEMA,
+    createdAt: normalized.createdAt,
+    updatedAt: normalized.updatedAt,
+    ts: normalized.ts,
+    msgs: normalized.msgs.map(portableMessage).filter(Boolean),
+    workflowKey: normalized.workflowKey,
+    workflowTitle: normalized.workflowTitle,
+    provider: normalized.provider,
+    model: normalized.model,
+    effort: normalized.effort,
+    pinned: normalized.pinned,
+    title: normalized.title,
+    todos: normalized.todos,
+    workflowVersions: normalized.workflowVersions,
+  };
+  return Object.fromEntries(Object.entries(thread).filter(([, field]) => field !== undefined));
 }
 
 function openDb(indexedDb) {
@@ -1166,21 +1363,28 @@ export class ChatHistoryStore {
   }
 
   _writeLocalSnapshot(snapshot, protectedThreadIds) {
-    // legacyShadow threads are exempt from the shadow cap: excluded from
-    // IndexedDB by the fence, the shadow copy is their ONLY copy — eviction
-    // would be silent data loss (codex finding).
-    const protectedWithLegacy = [
-      ...protectedThreadIds,
-      ...(Array.isArray(snapshot.threads) ? snapshot.threads : [])
-        .filter((thread) => thread?.legacyShadow && typeof thread.id === "string")
-        .map((thread) => thread.id),
-    ];
-    const shadow = retainBoundedThreads(
-      snapshot.threads,
+    // legacyShadow threads are excluded from IndexedDB by the schema fence, so
+    // the local shadow is their only copy. Preserve every such thread and all
+    // of its messages. A storage-quota failure is surfaced instead of claiming
+    // that a truncated only-copy transcript was saved durably.
+    const sourceThreads = Array.isArray(snapshot.threads) ? snapshot.threads : [];
+    const legacyThreads = sourceThreads.filter((thread) => thread?.legacyShadow === true);
+    const ordinaryThreads = sourceThreads.filter((thread) => thread?.legacyShadow !== true);
+    const boundedOrdinary = retainBoundedThreads(
+      ordinaryThreads,
       LOCAL_SHADOW_THREADS,
-      protectedWithLegacy,
-    ).map((thread) => ({ ...thread, msgs: thread.msgs.slice(-LOCAL_SHADOW_MESSAGES) }));
+      protectedThreadIds,
+    ).map((thread) => ({
+      ...thread,
+      msgs: thread.msgs.slice(-LOCAL_SHADOW_MESSAGES),
+    }));
+    const shadow = [...boundedOrdinary, ...legacyThreads]
+      .sort((a, b) => finiteTs(a.updatedAt || a.ts) - finiteTs(b.updatedAt || b.ts));
     const localSnapshot = { ...snapshot, threads: shadow };
+    const shadowById = new Map(shadow.map((thread) => [thread.id, thread]));
+    const complete = snapshot.threads.length === shadow.length &&
+      snapshot.threads.every((thread) =>
+        shadowById.get(thread.id)?.msgs?.length === thread.msgs.length);
     try {
       this.storage?.setItem(this.snapshotKey, JSON.stringify(localSnapshot));
       this.lastShadowWriteOk = true;
@@ -1189,7 +1393,7 @@ export class ChatHistoryStore {
       this.lastShadowWriteOk = false;
       this.lastShadowError = error;
       this.onShadowError?.(error);
-      return false;
+      return { committed: false, complete: false, legacyComplete: false };
     }
     try {
       this.storage?.setItem(this.threadsKey, JSON.stringify(shadow));
@@ -1201,7 +1405,7 @@ export class ChatHistoryStore {
     } catch {
       // The atomic shadow is already committed.
     }
-    return true;
+    return { committed: true, complete, legacyComplete: true };
   }
 
   persist(threads, meta = {}, options = {}) {
@@ -1230,7 +1434,7 @@ export class ChatHistoryStore {
       maxMetadataOps: options.maxMetadataOps ?? this.maxMetadataOps,
       protectedThreadIds,
     };
-    const shadowCommitted = this._writeLocalSnapshot(snapshot, protectedThreadIds);
+    const shadowWrite = this._writeLocalSnapshot(snapshot, protectedThreadIds);
     // Start the atomic merge immediately. Chat records are low-frequency and a
     // debounce creates an avoidable shutdown window in which the local shadow
     // exists but IndexedDB has not started its transaction yet.
@@ -1238,22 +1442,41 @@ export class ChatHistoryStore {
       .catch(() => null)
       .then(() => idbMergeWrite(this.indexedDb, snapshot, limits))
       .then((merged) => {
+        let postMergeShadowWrite = null;
         if (merged) {
           this._lastCommitted = merged;
           this._observeSnapshot(merged);
-          this._writeLocalSnapshot(merged, protectedThreadIds);
+          postMergeShadowWrite = this._writeLocalSnapshot(merged, protectedThreadIds);
           try {
             this._broadcastChannel?.postMessage({ type: "history-changed", writerId: this.writerId });
           } catch {
             // localStorage events remain available when the channel is blocked.
           }
         }
+        const shadowOnlyComplete = !merged && shadowWrite.committed && shadowWrite.complete;
+        const hasShadowOnlyLegacy = Boolean(
+          merged?.threads?.some((thread) => thread?.legacyShadow === true),
+        );
+        const legacyShadowCommitted = !hasShadowOnlyLegacy ||
+          shadowWrite.legacyComplete ||
+          postMergeShadowWrite?.legacyComplete;
+        const canonicalComplete = Boolean(merged) && legacyShadowCommitted;
+        const anyShadowCommitted = shadowWrite.committed ||
+          Boolean(postMergeShadowWrite?.committed);
         const result = {
-          ok: Boolean(merged || shadowCommitted),
-          shadowCommitted,
+          ok: Boolean(canonicalComplete || shadowOnlyComplete),
+          shadowCommitted: anyShadowCommitted,
           canonicalCommitted: Boolean(merged),
-          retryable: !merged && !shadowCommitted,
-          code: !merged && !shadowCommitted ? "history-persistence-unavailable" : null,
+          retryable: !canonicalComplete && !shadowOnlyComplete,
+          code: merged && !legacyShadowCommitted
+            ? "history-legacy-shadow-unavailable"
+            : !merged
+            ? shadowWrite.committed && !shadowWrite.complete
+              ? "history-canonical-unavailable-shadow-truncated"
+              : !shadowWrite.committed
+                ? "history-persistence-unavailable"
+                : null
+            : null,
         };
         if (result.ok) {
           this._dirtyWrite = null;
@@ -1306,7 +1529,7 @@ export class ChatHistoryStore {
         this._lastCommitted = reset;
         this._dirtyWrite = null;
         this._observeSnapshot(reset);
-        const shadowCommitted = this._writeLocalSnapshot(reset, []);
+        const shadowWrite = this._writeLocalSnapshot(reset, []);
         try {
           this._broadcastChannel?.postMessage({
             type: "history-reset",
@@ -1319,7 +1542,7 @@ export class ChatHistoryStore {
         return {
           ok: true,
           canonicalCommitted: true,
-          shadowCommitted,
+          shadowCommitted: shadowWrite.committed,
           retryable: false,
           code: null,
           snapshot: reset,
@@ -1396,6 +1619,193 @@ export class ChatHistoryStore {
       // Closing an already-detached native channel is harmless.
     }
     this._broadcastChannel = null;
+  }
+
+  exportPayload(threads, meta = {}) {
+    const snapshot = mergeHistorySnapshots({ threads, meta });
+    return {
+      format: CHAT_HISTORY_EXPORT_FORMAT,
+      schemaVersion: CHAT_HISTORY_SCHEMA,
+      exportedAt: new Date().toISOString(),
+      threads: snapshot.threads.map(portableThread).filter(Boolean),
+      // Workflow identity aliases are portable provenance. Active pointers,
+      // provider sessions, tombstones, checkpoints, and CRDT operations are not:
+      // importing those browser-local records could switch or delete local chats.
+      meta: {
+        workflowAliases: portableWorkflowAliases(snapshot.meta?.workflowAliases),
+      },
+    };
+  }
+
+  importPayload(value, currentThreads = [], currentMeta = {}) {
+    const incoming = parseHistoryImport(value);
+    const current = mergeHistorySnapshots({ threads: currentThreads, meta: currentMeta });
+    const currentById = new Map(current.threads.map((thread) => [thread.id, thread]));
+    const deletedThreadIds = new Set(Object.keys(current.meta?.deletedThreads || {}));
+    const newThreadIds = new Set(
+      incoming.threads
+        .map((thread) => thread.id)
+        .filter((id) => !deletedThreadIds.has(id) && !currentById.has(id)),
+    );
+    const retainedCount = current.threads.length;
+    if (retainedCount + newThreadIds.size > this.maxThreads) {
+      const error = new Error(
+        `Import needs ${newThreadIds.size} new chat slot(s), but only ` +
+        `${Math.max(0, this.maxThreads - retainedCount)} of ${this.maxThreads} are available. ` +
+        "Delete or export older chats first; no history was changed.",
+      );
+      error.code = "history-import-thread-limit";
+      throw error;
+    }
+    const incomingMessageIds = new Map();
+    for (const source of incoming.threads) {
+      if (deletedThreadIds.has(source.id)) continue;
+      const ids = incomingMessageIds.get(source.id) || new Set();
+      for (const message of source.msgs || []) {
+        if (typeof message?.id === "string" && message.id) ids.add(message.id);
+      }
+      incomingMessageIds.set(source.id, ids);
+    }
+    for (const [threadId, ids] of incomingMessageIds) {
+      const existingIds = new Set(
+        (currentById.get(threadId)?.msgs || []).map((message) => message.id),
+      );
+      let additions = 0;
+      for (const id of ids) if (!existingIds.has(id)) additions += 1;
+      if (existingIds.size + additions <= this.maxMessages) continue;
+      const error = new Error(
+        `Import needs ${additions} new message slot(s) in chat ${threadId}, but only ` +
+        `${Math.max(0, this.maxMessages - existingIds.size)} of ${this.maxMessages} are available. ` +
+        "Start a new chat or remove older entries first; no history was changed.",
+      );
+      error.code = "history-import-message-limit";
+      throw error;
+    }
+
+    this._observeSnapshot(current);
+    const rebased = [];
+    const importedVersionState = new Map();
+
+    for (const source of incoming.threads) {
+      const existing = currentById.get(source.id);
+      const thread = existing
+        ? cloneJson(existing)
+        : {
+          id: source.id,
+          schemaVersion: CHAT_HISTORY_SCHEMA,
+          createdAt: finiteTs(source.createdAt) || Date.now(),
+          updatedAt: 0,
+          ts: 0,
+          msgs: [],
+          deletedMessages: safeMap(),
+          workflowVersions: safeMap(),
+        };
+
+      if (!existing) {
+        const creation = this.nextRevision();
+        thread.createdRevision = creation;
+        thread.updatedAt = creation.updatedAt;
+        thread.ts = creation.updatedAt;
+      }
+
+      const messages = new Map(
+        (Array.isArray(thread.msgs) ? thread.msgs : []).map((message) => [message.id, message]),
+      );
+      for (const sourceMessage of source.msgs || []) {
+        const previous = messages.get(sourceMessage.id);
+        // Import is add-only for colliding ids. A portable archive can extend a
+        // known conversation, but can never replace an existing local message.
+        if (previous) continue;
+        const message = portableMessage(sourceMessage);
+        if (!message) continue;
+        this.touchMessage(message);
+        messages.set(message.id, message);
+        thread.updatedAt = Math.max(finiteTs(thread.updatedAt), finiteTs(message.updatedAt));
+      }
+      thread.msgs = [...messages.values()].sort(
+        (left, right) =>
+          finiteTs(left.createdAt || left.ts) - finiteTs(right.createdAt || right.ts) ||
+          String(left.id).localeCompare(String(right.id)),
+      );
+      if (existing) {
+        const versions = Object.assign(safeMap(), thread.workflowVersions || {});
+        let versionState = importedVersionState.get(source.id);
+        if (!versionState) {
+          versionState = {
+            hashes: new Set(Object.keys(versions)),
+            remaining: Math.max(
+              0,
+              DEFAULT_MAX_WORKFLOW_VERSIONS - Object.keys(versions).length,
+            ),
+          };
+          importedVersionState.set(source.id, versionState);
+        }
+        for (const [hash, version] of Object.entries(source.workflowVersions || {})) {
+          if (!versionState.remaining || versionState.hashes.has(hash)) continue;
+          versions[hash] = version;
+          versionState.hashes.add(hash);
+          versionState.remaining -= 1;
+        }
+        thread.workflowVersions = versions;
+      } else {
+        thread.workflowVersions = mergeWorkflowVersions(source.workflowVersions);
+      }
+
+      // A colliding thread id is add-only: every local field wins, even when the
+      // archive carries future timestamps or raw field tombstones. Only a
+      // genuinely new thread materializes portable archive metadata.
+      if (!existing) {
+        const fields = {
+          workflowKey: source.workflowKey,
+          workflowTitle: source.workflowTitle,
+          pinned: source.pinned,
+          title: source.title,
+          todos: source.todos,
+          provider: source.provider,
+          model: source.model,
+          effort: source.effort,
+        };
+        this.reviseThread(thread, fields);
+      }
+      thread.updatedAt = Math.max(finiteTs(thread.updatedAt), finiteTs(thread.createdAt));
+      thread.ts = thread.updatedAt;
+      rebased.push(thread);
+    }
+
+    const baseThreads = current.threads;
+    let meta = current.meta;
+    const localAliases = portableWorkflowAliases(
+      meta?.workflowAliases,
+      Number.MAX_SAFE_INTEGER,
+    );
+    let availableAliases = Math.max(
+      0,
+      this.maxMetadataOps - Object.keys(localAliases).length,
+    );
+    let importedAliasCount = 0;
+    let skippedAliasCount = 0;
+    for (const [path, workflowUuid] of Object.entries(incoming.meta?.workflowAliases || {})) {
+      if (Object.hasOwn(localAliases, path)) continue;
+      if (!availableAliases) {
+        skippedAliasCount += 1;
+        continue;
+      }
+      meta = updateMetadataEntry(meta, "workflowAliases", path, workflowUuid, this.nextRevision());
+      localAliases[path] = workflowUuid;
+      availableAliases -= 1;
+      importedAliasCount += 1;
+    }
+
+    const merged = mergeHistorySnapshots(
+      { threads: baseThreads, meta },
+      { threads: rebased, meta: {} },
+    );
+    return {
+      ...merged,
+      importedCount: incoming.threads.length,
+      importedAliasCount,
+      skippedAliasCount,
+    };
   }
 
 }
