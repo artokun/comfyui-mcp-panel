@@ -8408,6 +8408,12 @@ const PANEL_CSS = `
 .cmcp-modelrow .check { flex: none; width: 1rem; text-align: center; color: var(--p-primary-color, #60a5fa); visibility: hidden; }
 .cmcp-modelrow .check.on { visibility: visible; }
 .cmcp-modelempty { padding: 0.5rem; font-size: 0.75rem; color: var(--p-text-muted-color, #a1a1aa); }
+/* Recently-used section (non-virtualized; bounded to the last few picks). Rows
+   flow normally (override the absolute positioning the virtualized list uses). */
+.cmcp-modelrecents .cmcp-modelrow { position: static; }
+.cmcp-modelrecent-x { flex: none; margin-left: 0.15rem; padding: 0 0.2rem; background: none; border: none;
+  color: var(--p-text-muted-color, #a1a1aa); cursor: pointer; opacity: 0.55; font-size: 0.7rem; line-height: 1; }
+.cmcp-modelrecent-x:hover { opacity: 1; color: var(--p-text-color, #e4e4e7); }
 `;
 
 let styleInjected = false;
@@ -9975,6 +9981,11 @@ function buildPanel() {
   modelSearchInput.setAttribute("aria-label", "Search models across connected providers");
   const modelSearchCap = document.createElement("div");
   modelSearchCap.className = "cmcp-modelsearch-cap";
+  // Recently-used section (non-virtualized; bounded to RECENTS_CAP). Shown only in
+  // the empty-query view, above the caption + recommended list.
+  const modelRecents = document.createElement("div");
+  modelRecents.className = "cmcp-modelrecents";
+  modelRecents.hidden = true;
   const modelResults = document.createElement("div");
   modelResults.className = "cmcp-modelresults";
   const modelSizer = document.createElement("div");
@@ -9983,7 +9994,50 @@ function buildPanel() {
   const modelEmpty = document.createElement("div");
   modelEmpty.className = "cmcp-modelempty";
   modelEmpty.hidden = true;
-  modelSearchWrap.append(modelSearchInput, modelSearchCap, modelResults, modelEmpty);
+  modelSearchWrap.append(modelSearchInput, modelRecents, modelSearchCap, modelResults, modelEmpty);
+
+  // ---- Recently-used models (persisted across sessions) --------------------
+  // Keyed per provider+id (same dedupe key as aggregatedModels) so identical model
+  // ids across providers stay distinct. Display fields (label/providerLabel/small)
+  // are stored too, so a recent still renders even if its provider isn't currently
+  // connected (its live catalog absent).
+  const RECENTS_KEY = "comfyui-mcp.panel.modelRecents";
+  const RECENTS_CAP = 8;
+  const recentKeyOf = (provider, id) => provider + " " + id;
+  function loadRecents() {
+    try {
+      const arr = JSON.parse(window.localStorage.getItem(RECENTS_KEY) ?? "[]");
+      return Array.isArray(arr)
+        ? arr.filter((r) => r && typeof r.id === "string" && typeof r.provider === "string")
+        : [];
+    } catch {
+      return [];
+    }
+  }
+  function saveRecents(list) {
+    try {
+      window.localStorage.setItem(RECENTS_KEY, JSON.stringify(list.slice(0, RECENTS_CAP)));
+    } catch {
+      // localStorage unavailable — recents are session-only.
+    }
+  }
+  function pushRecent(m) {
+    if (!m || !m.provider || !m.id) return;
+    const key = recentKeyOf(m.provider, m.id);
+    const list = loadRecents().filter((r) => recentKeyOf(r.provider, r.id) !== key);
+    list.unshift({
+      provider: m.provider,
+      providerLabel: m.providerLabel || BACKEND_LABELS[m.provider] || m.provider,
+      id: m.id,
+      label: m.label || m.id,
+      small: m.small || "",
+    });
+    saveRecents(list);
+  }
+  function removeRecent(provider, id) {
+    const key = recentKeyOf(provider, id);
+    saveRecents(loadRecents().filter((r) => recentKeyOf(r.provider, r.id) !== key));
+  }
 
   /** The union of every connected/known provider's catalog, each row tagged with
    *  its provider. Active backend first (from the freshest live modelCatalog);
@@ -10077,6 +10131,7 @@ function buildPanel() {
    *  silent cross-provider state swap. A same-provider pick mirrors the old handler. */
   function pickModelRow(m) {
     modelPop.hidden = true;
+    pushRecent(m); // an actual selection — record it for the "Recently used" section
     const activeBk = connectedBackend || selectedBackend;
     if (m.provider && m.provider !== activeBk) {
       // Seed the target provider's group so seedPrefsForBackendSwitch adopts this
@@ -10107,12 +10162,8 @@ function buildPanel() {
     }
   }
 
-  /** Build one absolutely-positioned result row for the virtualized window. */
-  function buildModelRow(m, idx) {
-    const el = document.createElement("button");
-    el.type = "button";
-    el.className = "cmcp-modelrow" + (idx === modelActiveIdx ? " active" : "");
-    el.style.top = idx * MODEL_ROW_H + "px";
+  /** Fill a row element with the shared label + description + provider-tag layout. */
+  function modelRowInner(el, m) {
     const lbl = document.createElement("span");
     lbl.className = "lbl";
     lbl.textContent = m.label;
@@ -10127,15 +10178,82 @@ function buildPanel() {
     tag.className = "cmcp-provtag";
     tag.textContent = m.providerLabel;
     el.appendChild(tag);
+    el.title = `${m.label}${m.small ? " — " + m.small : ""} · ${m.providerLabel}`;
+  }
+
+  /** Build one absolutely-positioned result row for the virtualized window. */
+  function buildModelRow(m, idx) {
+    const el = document.createElement("button");
+    el.type = "button";
+    el.className = "cmcp-modelrow" + (idx === modelActiveIdx ? " active" : "");
+    el.style.top = idx * MODEL_ROW_H + "px";
+    modelRowInner(el, m);
     const c = document.createElement("i");
     c.className = "pi pi-check check" + (isModelRowSelected(m) ? " on" : "");
     el.appendChild(c);
-    el.title = `${m.label}${m.small ? " — " + m.small : ""} · ${m.providerLabel}`;
     el.addEventListener("mousedown", (mev) => {
       mev.preventDefault();
       pickModelRow(m);
     });
     return el;
+  }
+
+  /** Build one recently-used row (normal flow) with a secondary × remove control.
+   *  The row is a <div> (role button) so the real <button> × can nest legally; the
+   *  × is NOT in the ↑/↓ selection path — clicking it removes the entry and repaints
+   *  without selecting the model or closing the picker. */
+  function buildRecentRow(m) {
+    const el = document.createElement("div");
+    el.className = "cmcp-modelrow";
+    el.setAttribute("role", "button");
+    modelRowInner(el, m);
+    const c = document.createElement("i");
+    c.className = "pi pi-check check" + (isModelRowSelected(m) ? " on" : "");
+    el.appendChild(c);
+    const x = document.createElement("button");
+    x.type = "button";
+    x.className = "cmcp-modelrecent-x";
+    x.title = "Remove from recently used";
+    x.setAttribute("aria-label", "Remove from recently used");
+    const xi = document.createElement("i");
+    xi.className = "pi pi-times";
+    x.appendChild(xi);
+    x.addEventListener("mousedown", (mev) => {
+      mev.preventDefault();
+      mev.stopPropagation(); // must NOT select the model or close the picker
+      removeRecent(m.provider, m.id);
+      renderModelResults();
+    });
+    el.appendChild(x);
+    el.addEventListener("mousedown", (mev) => {
+      mev.preventDefault();
+      pickModelRow(m);
+    });
+    return el;
+  }
+
+  /** (Re)render the Recently-used section for the empty-query view. Returns the
+   *  number of recents shown (0 when hidden — non-empty query or no recents). */
+  function renderModelRecents(all) {
+    modelRecents.textContent = "";
+    const recents = loadRecents();
+    if (modelQuery.trim() || !recents.length) {
+      modelRecents.hidden = true;
+      return 0;
+    }
+    modelRecents.hidden = false;
+    const h = document.createElement("div");
+    h.className = "cmcp-pop-section";
+    h.textContent = "Recently used";
+    modelRecents.appendChild(h);
+    // Prefer the live aggregated row (fresh label/effort) when the provider is
+    // connected; otherwise fall back to the stored display fields.
+    const byKey = new Map(all.map((m) => [recentKeyOf(m.provider, m.id), m]));
+    for (const r of recents) {
+      const m = byKey.get(recentKeyOf(r.provider, r.id)) || { ...r };
+      modelRecents.appendChild(buildRecentRow(m));
+    }
+    return recents.length;
   }
 
   /** Render only the rows in view (+ buffer); positions come from the fixed row
@@ -10154,25 +10272,45 @@ function buildPanel() {
   /** Recompute the ordered row set for the current query and repaint the window. */
   function renderModelResults() {
     const all = aggregatedModels();
+    const recentCount = renderModelRecents(all); // empty-query section above the list
     const filtered = filterModels(all, modelQuery);
-    modelCurrentRows = filtered === null ? recommendedModels(all) : filtered;
+    const isSearch = filtered !== null;
+    if (isSearch) {
+      modelCurrentRows = filtered;
+    } else {
+      // Empty query: recommended list, minus anything already shown in Recently used
+      // (so a model never appears twice).
+      const recentKeys = new Set(recentCount ? loadRecents().map((r) => recentKeyOf(r.provider, r.id)) : []);
+      modelCurrentRows = recommendedModels(all).filter((m) => !recentKeys.has(recentKeyOf(m.provider, m.id)));
+    }
     if (modelActiveIdx >= modelCurrentRows.length) modelActiveIdx = modelCurrentRows.length - 1;
     if (modelActiveIdx < 0) modelActiveIdx = 0;
     const providerCount = new Set(all.map((m) => m.provider)).size;
     if (!modelCurrentRows.length) {
-      modelEmpty.hidden = false;
-      modelEmpty.textContent =
-        `No model matches “${modelQuery.trim()}” across ${providerCount} connected provider${providerCount === 1 ? "" : "s"}` +
-        (providerCount <= 1 ? " — connect more to search wider." : ".");
       modelResults.style.display = "none";
-      modelSearchCap.textContent = "";
+      modelSizer.style.height = "0px";
+      renderModelWindow();
+      if (isSearch) {
+        modelEmpty.hidden = false;
+        modelEmpty.textContent =
+          `No model matches “${modelQuery.trim()}” across ${providerCount} connected provider${providerCount === 1 ? "" : "s"}` +
+          (providerCount <= 1 ? " — connect more to search wider." : ".");
+        modelSearchCap.textContent = "";
+      } else {
+        // Empty query with nothing left to recommend (e.g. all models are recents).
+        modelEmpty.hidden = recentCount > 0;
+        if (!recentCount) modelEmpty.textContent = "No models yet — connect a provider to search.";
+        modelSearchCap.textContent = "";
+      }
       return;
     }
     modelEmpty.hidden = true;
     modelResults.style.display = "";
-    modelSearchCap.textContent = filtered === null
-      ? `Recommended · ${modelCurrentRows.length} model${modelCurrentRows.length === 1 ? "" : "s"} across ${providerCount} provider${providerCount === 1 ? "" : "s"}`
-      : `${modelCurrentRows.length} result${modelCurrentRows.length === 1 ? "" : "s"}`;
+    modelSearchCap.textContent = isSearch
+      ? `${modelCurrentRows.length} result${modelCurrentRows.length === 1 ? "" : "s"}`
+      : recentCount
+        ? "Recommended"
+        : `Recommended · ${modelCurrentRows.length} model${modelCurrentRows.length === 1 ? "" : "s"} across ${providerCount} provider${providerCount === 1 ? "" : "s"}`;
     modelSizer.style.height = modelCurrentRows.length * MODEL_ROW_H + "px";
     renderModelWindow();
   }
