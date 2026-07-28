@@ -7386,6 +7386,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           type: "hello",
           tab_id: workflowTabId(),
           title: getWorkflowTitle(),
+          // Our build version, so the orchestrator can auto-stamp it into the
+          // agent's ENV block (bug reports get version-pinned without digging).
+          panel_version: PANEL_VERSION,
           backend,
           // Blind content mode (issue #90): the orchestrator spawns this tab's
           // comfyui tool server with pixel-withholding env when true.
