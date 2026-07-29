@@ -6,6 +6,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-07-24
+
+### Fixed
+- **Registry listing description rendered mojibake.** The em dash in
+  `pyproject.toml`'s `description` had been decoded as CP1252 and re-encoded as
+  UTF-8, leaving a literal mojibake sequence (U+00E2 U+20AC U+201D) — visible
+  on the Comfy Registry listing and in
+  ComfyUI-Manager search, at the moment a user decides whether to install.
+
+### Changed
+- Registry `Tags` now claim `local`, `local-first`, `offline`, `self-hosted`,
+  `ollama`, `local-llm`, `no-api-key`, and `gemini`. The listing advertised
+  Claude/ChatGPT but nothing about running locally — the differentiators for
+  anyone browsing for a local option.
+
 ## [0.9.6] - 2026-07-19
 
 ### Fixed
