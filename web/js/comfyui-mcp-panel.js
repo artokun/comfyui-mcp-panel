@@ -87,6 +87,7 @@ import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import {
   isStaleAssetCandidate as isStaleAssetCandidateLib,
   reconcileUnknownWidgetNames,
+  reapplyDefsToLiveNodes,
 } from "./lib/asset-staleness.js";
 
 let app = null;
@@ -115,25 +116,46 @@ let lastExecFailure = null;
  * today's stale behaviour, never a thrown tool call).
  */
 let nodeDefRefreshInFlight = null;
+// True only AFTER a node-def + combo refresh has completed successfully. The
+// missing-asset combo cross-check is trusted only when this is set — a combo left
+// from page load can be stale (still listing a deleted file) and must never
+// suppress a genuine miss (codex WS-3 finding #4). Reset to false whenever the
+// backend socket drops, since the combos may be about to change under us.
+let nodeDefsRefreshConfirmed = false;
 async function refreshComfyNodeDefs() {
   if (nodeDefRefreshInFlight) return nodeDefRefreshInFlight;
   nodeDefRefreshInFlight = (async () => {
+    let ok = false;
     try {
       const a =
         typeof app !== "undefined" && app ? app : window.comfyAPI?.app?.app;
       if (!a) return;
       // Re-register node definitions so newly installed/updated classes and
       // their current widget schemas are known to LiteGraph (#221/#171).
+      let defs = null;
       if (typeof a.registerNodesFromDefs === "function" && typeof api?.getNodeDefs === "function") {
-        const defs = await api.getNodeDefs();
+        defs = await api.getNodeDefs();
         if (defs) await a.registerNodesFromDefs(defs);
+      }
+      // registerNodesFromDefs mints NEW classes; already-loaded node INSTANCES
+      // keep their old constructor and would never see the fresh schema. Stamp
+      // the fresh def onto existing instances + repair UNKNOWN widgets so old
+      // nodes are actually fixed, not just newly-created ones (finding #3).
+      if (defs) {
+        const rootGraph = a.graph ?? a.canvas?.graph;
+        if (rootGraph) reapplyDefsToLiveNodes(rootGraph, defs);
       }
       // Refresh combo widget option lists (model dropdowns etc.) so freshly
       // installed models resolve and stale entries clear (#185/#181/#223).
       if (typeof a.refreshComboInNodes === "function") await a.refreshComboInNodes();
+      ok = true;
     } catch (e) {
       console.warn("[comfyui-mcp-panel] node-def refresh after reconnect failed:", e);
     } finally {
+      // Only trust the live combos for suppressing missing-asset candidates once
+      // a refresh has FULLY succeeded — a swallowed failure must not license
+      // trusting a stale combo (finding #4).
+      nodeDefsRefreshConfirmed = ok;
       nodeDefRefreshInFlight = null;
     }
   })();
@@ -148,6 +170,15 @@ function setupListeners() {
     });
     api.addEventListener("execution_start", () => {
       lastExecFailure = null;
+    });
+    // While the backend socket is down, distrust the combos (they may be about
+    // to change) so a stale combo can't suppress a genuine miss (finding #4).
+    api.addEventListener("reconnecting", () => {
+      nodeDefsRefreshConfirmed = false;
+    });
+    api.addEventListener("status", (ev) => {
+      // A null status payload is ComfyUI's "backend connection lost" signal.
+      if (ev?.detail == null) nodeDefsRefreshConfirmed = false;
     });
     // ComfyUI's own socket to its backend re-establishing is the reliable
     // in-tab signal that the server came back after a restart — refresh the
@@ -3165,7 +3196,10 @@ function isStaleAssetCandidate(c) {
   } catch {
     return false; // no graph → can't prove stale, keep reporting
   }
-  return isStaleAssetCandidateLib(rootGraph, c);
+  // Only trust live combo membership to clear a candidate once a node-def refresh
+  // has confirmably succeeded — otherwise a stale combo could suppress a genuine
+  // miss (finding #4). The widget-still-references check is always safe.
+  return isStaleAssetCandidateLib(rootGraph, c, { trustCombo: nodeDefsRefreshConfirmed });
 }
 
 function collectMissingAssets() {

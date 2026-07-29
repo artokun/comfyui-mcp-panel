@@ -15,9 +15,23 @@
 const UNKNOWN_WIDGET_RE = /^UNKNOWN(_\d+)?$/;
 
 /**
- * Resolve a possibly subgraph-scoped node id ("6051:1913", or plain 42) against
- * the ROOT graph, walking one hop per ':' segment through `.subgraph`. Returns
- * the node or null.
+ * Look a node up by a single id segment. ComfyUI supports arbitrary STRING node
+ * ids (UUID-like), so we must NOT coerce to Number blindly (that would turn a
+ * UUID into NaN and never match). Try the raw segment first; only fall back to a
+ * numeric lookup for an all-digits segment, since some LiteGraph builds key
+ * `_nodes_by_id` by number.
+ */
+function getNodeBySegment(graph, seg) {
+  if (!graph?.getNodeById) return null;
+  let node = graph.getNodeById(seg) ?? null;
+  if (!node && /^\d+$/.test(seg)) node = graph.getNodeById(Number(seg)) ?? null;
+  return node;
+}
+
+/**
+ * Resolve a possibly subgraph-scoped node id ("6051:1913", a plain 42, or a
+ * string/UUID id) against the ROOT graph, walking one hop per ':' segment through
+ * `.subgraph`. Returns the node or null.
  */
 export function findNodeByScopedId(rootGraph, scopedId) {
   const parts = String(scopedId ?? "")
@@ -26,7 +40,7 @@ export function findNodeByScopedId(rootGraph, scopedId) {
   if (!parts.length) return null;
   let graph = rootGraph;
   for (let i = 0; i < parts.length; i++) {
-    const node = graph?.getNodeById?.(Number(parts[i])) ?? null;
+    const node = getNodeBySegment(graph, parts[i]);
     if (!node) return null;
     if (i === parts.length - 1) return node;
     graph = node.subgraph ?? null;
@@ -76,15 +90,22 @@ export function assetCandidateResolvesLive(rootGraph, nodeId, file, widgetName) 
 /**
  * A missing-asset store candidate is stale (should NOT be reported) when either
  * no widget still references the file (the value was changed to a fix) OR the
- * file now resolves against the node's live combo options (it appeared on disk).
+ * file resolves against the node's live combo options (it appeared on disk).
  * Anything else keeps it reported — genuine misses always survive.
+ *
+ * The combo-membership check is ONLY trusted when `trustCombo` is true — i.e.
+ * after a CONFIRMED successful node-def/combo refresh. A combo populated at page
+ * load can be STALE (still listing a since-deleted file); trusting it then would
+ * SUPPRESS a genuine `isMissing:true` candidate, which we must never do. Without
+ * a confirmed refresh we fall back to over-reporting via the still-referenced
+ * check alone.
  */
-export function isStaleAssetCandidate(rootGraph, candidate) {
+export function isStaleAssetCandidate(rootGraph, candidate, { trustCombo = false } = {}) {
   const nodeId = candidate?.nodeId;
   const file = candidate?.name;
   const widgetName = candidate?.widgetName;
   if (!assetCandidateStillReferenced(rootGraph, nodeId, file)) return true;
-  if (assetCandidateResolvesLive(rootGraph, nodeId, file, widgetName)) return true;
+  if (trustCombo && assetCandidateResolvesLive(rootGraph, nodeId, file, widgetName)) return true;
   return false;
 }
 
@@ -112,17 +133,23 @@ export function orderedWidgetInputNames(nodeData) {
 
 /**
  * Repair positional `UNKNOWN`/`UNKNOWN_n` widget placeholders in place by mapping
- * them to the node's live definition widget-input order — but ONLY in the
- * unambiguous case where the def's widget-input count equals the widget count, so
- * a mismatch never mis-assigns. Fails open (leaves names untouched) otherwise.
+ * them to the node's definition widget-input order — but ONLY in the unambiguous
+ * case where the def's widget-input count equals the widget count, so a mismatch
+ * never mis-assigns. Fails open (leaves names untouched) otherwise.
+ *
+ * `freshDef` lets a post-restart refresh pass the CURRENT def straight in: an
+ * already-loaded node keeps its old constructor after registerNodesFromDefs (each
+ * registration makes a new class), so `node.constructor.nodeData` alone is stale
+ * or absent for exactly the nodes that need repairing. Falls back to the
+ * constructor's nodeData when no fresh def is supplied.
  * Returns true if it renamed at least one widget.
  */
-export function reconcileUnknownWidgetNames(node) {
+export function reconcileUnknownWidgetNames(node, freshDef) {
   try {
     const widgets = node?.widgets;
     if (!Array.isArray(widgets) || !widgets.length) return false;
     if (!widgets.some((w) => UNKNOWN_WIDGET_RE.test(w?.name ?? ""))) return false;
-    const ordered = orderedWidgetInputNames(node.constructor?.nodeData);
+    const ordered = orderedWidgetInputNames(freshDef ?? node.constructor?.nodeData);
     if (ordered.length !== widgets.length) return false;
     let changed = false;
     widgets.forEach((w, i) => {
@@ -135,4 +162,65 @@ export function reconcileUnknownWidgetNames(node) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Every graph reachable from a root graph, including nested subgraphs (one entry
+ * per `.subgraph` on any node). Used to sweep ALL live node instances after a
+ * def refresh, not just the root canvas.
+ */
+export function collectAllGraphs(rootGraph) {
+  const out = [];
+  const seen = new Set();
+  const stack = [rootGraph];
+  while (stack.length) {
+    const g = stack.pop();
+    if (!g || seen.has(g)) continue;
+    seen.add(g);
+    out.push(g);
+    for (const node of g._nodes ?? []) {
+      if (node?.subgraph) stack.push(node.subgraph);
+    }
+  }
+  return out;
+}
+
+/**
+ * After a node-def refresh, re-apply the fresh definitions to ALREADY-LOADED node
+ * instances (finding #3): registerNodesFromDefs mints a NEW class per type, so
+ * existing instances keep their old/generic constructor and would otherwise never
+ * see the updated schema. For each live node we (a) stamp the fresh def onto its
+ * type-specific constructor's `nodeData` so schema reads are current, and (b)
+ * reconcile any UNKNOWN widget placeholders using the fresh def directly (works
+ * even when the instance sits on a generic fallback constructor with no nodeData).
+ * `defsByType` is the `class_type → def` map from api.getNodeDefs(). Returns the
+ * number of nodes whose UNKNOWN widgets were repaired. Fully defensive.
+ */
+export function reapplyDefsToLiveNodes(rootGraph, defsByType) {
+  let repaired = 0;
+  if (!defsByType) return repaired;
+  try {
+    for (const graph of collectAllGraphs(rootGraph)) {
+      for (const node of graph._nodes ?? []) {
+        const type = node?.type ?? node?.comfyClass;
+        const def = type ? defsByType[type] : null;
+        if (!def) continue;
+        // Stamp only onto a TYPE-SPECIFIC constructor (already carries nodeData
+        // for this type) — never onto a shared generic/unknown fallback class,
+        // which would corrupt every other unknown node.
+        const ctor = node.constructor;
+        if (ctor && ctor.nodeData) {
+          try {
+            ctor.nodeData = def;
+          } catch {
+            /* frozen / non-writable — skip */
+          }
+        }
+        if (reconcileUnknownWidgetNames(node, def)) repaired++;
+      }
+    }
+  } catch {
+    /* best-effort sweep */
+  }
+  return repaired;
 }

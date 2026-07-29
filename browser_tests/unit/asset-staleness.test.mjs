@@ -15,12 +15,15 @@ import {
   isStaleAssetCandidate,
   orderedWidgetInputNames,
   reconcileUnknownWidgetNames,
+  collectAllGraphs,
+  reapplyDefsToLiveNodes,
 } from "../../web/js/lib/asset-staleness.js";
 
-/** Minimal fake graph: a Map of id → node, with getNodeById + optional subgraph. */
+/** Minimal fake graph: id → node keyed as a STRING (so numeric AND string/UUID
+ *  ids both resolve), exposes _nodes + getNodeById + optional per-node subgraph. */
 function graphOf(nodes) {
-  const byId = new Map(nodes.map((n) => [Number(n.id), n]));
-  return { getNodeById: (id) => byId.get(Number(id)) ?? null };
+  const byId = new Map(nodes.map((n) => [String(n.id), n]));
+  return { _nodes: nodes, getNodeById: (id) => byId.get(String(id)) ?? null };
 }
 
 test("findNodeByScopedId resolves a plain id", () => {
@@ -102,6 +105,76 @@ test("isStaleAssetCandidate: NOT stale for a genuinely missing model", () => {
     isStaleAssetCandidate(graphOf([node]), { nodeId: 8, name: "gone.safetensors", widgetName: "ckpt_name" }),
     false,
   );
+});
+
+test("findNodeByScopedId resolves a string/UUID node id without NaN coercion (finding #5)", () => {
+  const n = { id: "a1b2c3d4-uuid", widgets: [] };
+  assert.equal(findNodeByScopedId(graphOf([n]), "a1b2c3d4-uuid"), n);
+});
+
+test("isStaleAssetCandidate clears a fixed candidate on a string/UUID-keyed graph (finding #5)", () => {
+  // Widget was pointed at a new file; the store still lists the old one. The
+  // still-referenced check must work even though the id is a non-numeric string.
+  const node = { id: "node-uuid-1", widgets: [{ name: "ckpt_name", value: "new.safetensors" }] };
+  assert.equal(
+    isStaleAssetCandidate(graphOf([node]), { nodeId: "node-uuid-1", name: "old.safetensors", widgetName: "ckpt_name" }),
+    true,
+  );
+});
+
+test("a STALE combo still listing a deleted file must NOT suppress a genuine miss (finding #4)", () => {
+  // The model was deleted, but the combo populated at page load still lists it.
+  // The widget still references it → still-referenced can't clear it. Combo
+  // membership could — but only when a refresh is CONFIRMED.
+  const node = {
+    id: 5,
+    widgets: [{ name: "ckpt_name", value: "deleted.safetensors", options: { values: ["deleted.safetensors"] } }],
+  };
+  const candidate = { nodeId: 5, name: "deleted.safetensors", widgetName: "ckpt_name" };
+  // Default (no confirmed refresh): must keep reporting the genuine miss.
+  assert.equal(isStaleAssetCandidate(graphOf([node]), candidate), false);
+  assert.equal(isStaleAssetCandidate(graphOf([node]), candidate, { trustCombo: false }), false);
+  // Only after a confirmed refresh is combo membership trusted to clear it.
+  assert.equal(isStaleAssetCandidate(graphOf([node]), candidate, { trustCombo: true }), true);
+});
+
+test("collectAllGraphs walks nested subgraphs", () => {
+  const inner = { id: 2, widgets: [] };
+  const innerGraph = graphOf([inner]);
+  const host = { id: 1, subgraph: innerGraph };
+  const root = graphOf([host]);
+  const graphs = collectAllGraphs(root);
+  assert.ok(graphs.includes(root));
+  assert.ok(graphs.includes(innerGraph));
+});
+
+test("reapplyDefsToLiveNodes repairs an ALREADY-LOADED node using fresh defs (finding #3)", () => {
+  // Existing instance: stale/generic constructor (nodeData absent), widgets came
+  // in as positional UNKNOWN placeholders. The fresh def must repair it in place.
+  const node = {
+    id: 7,
+    type: "LTXICLoRALoaderModelOnly",
+    widgets: [
+      { name: "UNKNOWN", value: "x.safetensors" },
+      { name: "UNKNOWN_1", value: 1.0 },
+    ],
+    constructor: {}, // generic fallback — no nodeData
+  };
+  const defs = {
+    LTXICLoRALoaderModelOnly: { input: { required: { lora_name: {}, strength_model: {} } } },
+  };
+  const repaired = reapplyDefsToLiveNodes(graphOf([node]), defs);
+  assert.equal(repaired, 1);
+  assert.deepEqual(node.widgets.map((w) => w.name), ["lora_name", "strength_model"]);
+});
+
+test("reapplyDefsToLiveNodes stamps fresh nodeData onto a type-specific constructor", () => {
+  const oldDef = { input: { required: { seed: {} } } };
+  const newDef = { input: { required: { seed: {}, box_toggle_max_frames: {} } } };
+  const shared = { nodeData: oldDef }; // type-specific constructor shared by instances
+  const node = { id: 9, type: "CyberpunkWindowNode", widgets: [], constructor: shared };
+  reapplyDefsToLiveNodes(graphOf([node]), { CyberpunkWindowNode: newDef });
+  assert.equal(node.constructor.nodeData, newDef);
 });
 
 test("orderedWidgetInputNames concatenates required then optional, honoring input_order", () => {
