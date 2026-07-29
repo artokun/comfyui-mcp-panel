@@ -2884,15 +2884,19 @@ function revertGraphToLastSnapshot() {
 // prepend a compact change-list to the agent's input so it isn't caught unaware
 // of edits the user made by hand (a bypassed node, a tweaked widget, a rewire).
 let lastAgentGraph = null;
-// The WORKFLOW IDENTITY (routing tab id: "wf:<path>" / "tmp:<uuid>") the snapshot
-// above was taken from. The snapshot is a single module-global, but a diff is only
-// meaningful against the SAME workflow: if the user switched tabs between the
-// agent's turn-end and their next message, diffing the now-active tab B against
-// tab A's snapshot attributed all of B's graph as "manual edits" to A — a bogus,
-// authoritative-framed change list that could drive the agent to edit the wrong
-// graph (panel #348/#198). We compare identity before diffing and, on a mismatch,
-// emit a tab-switch notice + reseed instead of a false diff.
-let lastAgentGraphTabId = null;
+// The WORKFLOW IDENTITY the snapshot above was taken from. The snapshot is a
+// single module-global, but a diff is only meaningful against the SAME workflow:
+// if the user switched tabs between the agent's turn-end and their next message,
+// diffing the now-active tab B against tab A's snapshot attributed all of B's graph
+// as "manual edits" to A — a bogus, authoritative-framed change list that could
+// drive the agent to edit the wrong graph (panel #348/#198). We compare identity
+// before diffing and, on a mismatch, emit a tab-switch notice + reseed instead of
+// a false diff.
+// We key on workflowStableUuid() — which FOLLOWS a workflow across save (tmp:→wf:)
+// and rename — rather than workflowTabId(), whose "wf:<path>" id CHURNS on those
+// same-workflow events and would otherwise drop a real manual edit made across a
+// save/rename as a spurious "different workflow".
+let lastAgentGraphKey = null;
 
 const MODE_NAME = { 0: "active", 2: "mute", 4: "bypass" };
 const modeName = (m) => MODE_NAME[m] ?? `mode${m ?? 0}`;
@@ -3037,25 +3041,24 @@ function manualChangeBanner() {
   // switched tabs — do NOT diff two different graphs (that produces a bogus
   // "manual edits" list, #348/#198). Reseed to the now-active graph and tell the
   // agent to re-read, rather than asserting a false ground-truth delta.
-  let currTabId = null;
+  let currKey = null;
   try {
-    currTabId = workflowTabId();
+    currKey = workflowStableUuid();
   } catch {
-    currTabId = null;
+    currKey = null;
   }
-  if (lastAgentGraphTabId && currTabId && currTabId !== lastAgentGraphTabId) {
-    const prev = lastAgentGraphTabId;
+  if (lastAgentGraphKey && currKey && currKey !== lastAgentGraphKey) {
     lastAgentGraph = curr;
-    lastAgentGraphTabId = currTabId;
+    lastAgentGraphKey = currKey;
     return (
-      `⟳ ACTIVE WORKFLOW CHANGED since your last turn (${prev} → ${currTabId}). ` +
+      `⟳ ACTIVE WORKFLOW CHANGED since your last turn. ` +
       `The canvas you're now bound to is a DIFFERENT workflow — your remembered ` +
       `node ids may not apply. Re-read with panel_graph_outline before editing.\n\n`
     );
   }
   const lines = diffGraphsForAgent(lastAgentGraph, curr, live);
   lastAgentGraph = curr;
-  lastAgentGraphTabId = currTabId;
+  lastAgentGraphKey = currKey;
   if (!lines.length) return "";
   const MAX = 40;
   const shown = lines.slice(0, MAX);
@@ -7215,7 +7218,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             if (typeof pinnedPath === "string" && pinnedPath.trim()) {
               const wf = activeWorkflowRef();
               const want = normalizedWorkflowPath(pinnedPath);
-              const have = [wf?.path, wf?.key, wf?.path ? "wf:" + wf.path : null]
+              // A pin identifier from panel_list_workflows / panel_set_workflow_target
+              // may be a path, a key, OR a filename (all three are documented as valid
+              // pin ids), so compare against every form the active workflow exposes —
+              // otherwise a legitimate filename-based pin is falsely rejected.
+              const wfFilename = typeof wf?.filename === "string" ? wf.filename : null;
+              const have = [
+                wf?.path,
+                wf?.key,
+                wf?.path ? "wf:" + wf.path : null,
+                wfFilename,
+                wfFilename ? wfFilename.replace(/\.json$/i, "") : null,
+              ]
                 .filter((x) => typeof x === "string" && x)
                 .map(normalizedWorkflowPath);
               if (have.length && !have.includes(want)) {
@@ -13550,12 +13564,12 @@ function buildPanel() {
         // the live graph against this to surface MANUAL edits made between turns.
         try {
           lastAgentGraph = getGraphCtx().rootGraph.serialize();
-          // Stamp the workflow identity so the next turn's diff only compares
-          // like-with-like (see manualChangeBanner / #348/#198).
+          // Stamp the rename-stable workflow identity so the next turn's diff only
+          // compares like-with-like (see manualChangeBanner / #348/#198).
           try {
-            lastAgentGraphTabId = workflowTabId();
+            lastAgentGraphKey = workflowStableUuid();
           } catch {
-            lastAgentGraphTabId = null;
+            lastAgentGraphKey = null;
           }
         } catch {}
       }
