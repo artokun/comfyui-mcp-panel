@@ -295,6 +295,13 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       browsingLevels: [...(opts.filters?.browsingLevels ?? DEFAULT_FILTERS.browsingLevels)],
     },
     items: [], models: [], cursor: null, loading: false, done: false, reqId: 0,
+    // Distinguishing an empty grid from a FAILURE (agent-facing, issues #190/#375):
+    //  error          — upstream fetch failed (e.g. { status:503, message }); an
+    //                    empty grid is because the request failed, not "no matches".
+    //  favoritesStatus — on the favorites tab: 'ok' | 'signed_out' |
+    //                    'no_likes_collection' | 'filtered_out', so an empty
+    //                    favorites feed is attributable rather than silent.
+    error: null, favoritesStatus: null,
     favOut: [], // favorites outside the enabled levels, held for the catchall
     searchSeq: 0, // searching-overlay ownership (see reload)
     signedIn: false, localNames: new Set(), localLoaded: false,
@@ -480,6 +487,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     state.highlightOrder = [];
     setLoading(false);
     state.items = []; state.models = []; state.cursor = null; state.done = false;
+    state.error = null; state.favoritesStatus = null; // cleared per generation
     state.favOut = []; // favorites outside the enabled levels, held for the catchall
     grid.innerHTML = ""; syncTabs();
     // Overlay ownership: only the NEWEST reload may hide the searching
@@ -514,7 +522,13 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       const levels = f.browsingLevels;
       const t = tabDef();
       if (t.fav) {
-        if (!state.signedIn) { sentinel.textContent = "Sign in to see your favorites."; setLoading(false); return; }
+        if (!state.signedIn) {
+          sentinel.textContent = "Sign in to see your favorites.";
+          // Distinct agent-facing status so an empty favorites feed isn't read as
+          // "you have no favourites" when the real cause is a signed-out session (#375).
+          state.favoritesStatus = "signed_out";
+          setLoading(false); return;
+        }
         // Fetch the WHOLE likes collection regardless of the browsing-level
         // mask, so a favorite whose rating is outside the enabled levels still
         // comes back instead of vanishing (the "Favorites shows 0 results"
@@ -529,6 +543,11 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         const enabledMask = bitmask(levels);
         const colId = await resolveLikesCollectionId(client);
         if (req !== state.reqId) return;
+        // The likes collection couldn't be auto-detected (>1 collection, none
+        // named fav/like) — the feed falls back to in-app reactions, which may
+        // legitimately be empty. Flag it so the agent doesn't confidently report
+        // "no favourites" when the real cause is an undetectable likes folder (#375).
+        if (!colId) state.favoritesStatus = "no_likes_collection";
         const firstPage = state.cursor == null;
         // Favorites is a personal collection; the shared period default ("Week")
         // hides older likes → "no results". Fall back to All-Time when a period
@@ -588,6 +607,18 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         }
         const filtering = !!q || bms.length > 0 || !!creator;
         stalled = !inLevel.length && !state.done && (filtering || enabledMask !== 31);
+        // Resolve the favorites status for the agent (unless a more specific one —
+        // signed_out / no_likes_collection — was already set): everything got
+        // filtered out by the active query/base-model/creator/level filters, vs. a
+        // genuine empty collection ('ok'). Only decide 'filtered_out' once the feed
+        // is exhausted with nothing shown but something WAS fetched-and-dropped.
+        if (state.favoritesStatus == null) {
+          if (state.done && state.items.length === 0) {
+            state.favoritesStatus = filtering ? "filtered_out" : "ok";
+          } else {
+            state.favoritesStatus = "ok";
+          }
+        }
       } else if (t.model) {
         if (!state.localLoaded) await refreshLocalModels(); // for "in library" marks
         const page = await client.fetchModels({
@@ -638,7 +669,15 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         }
       }
     } catch (e) {
-      if (req === state.reqId) sentinel.textContent = "CivitAI error: " + (e.message || e);
+      if (req === state.reqId) {
+        sentinel.textContent = "CivitAI error: " + (e.message || e);
+        // Record the failure so the agent-facing panel_civitai_results can report
+        // a distinct error state instead of an indistinguishable total:0 (#190).
+        // The client throws Errors carrying an HTTP `status` (see CivitaiClient);
+        // fall back to the message alone when it doesn't.
+        const status = e && typeof e.status === "number" ? e.status : null;
+        state.error = { status, message: e && e.message ? e.message : String(e) };
+      }
     } finally {
       if (req === state.reqId) setLoading(false);
     }
@@ -1847,12 +1886,24 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   // the interesting cards. Every method awaits the modal settling, throws on a
   // closed handle, and returns a small plain object; no dynamic exec (YARA safe).
   function _assertOpen() { if (!isOpen) throw new Error("civitai browser not open"); }
-  async function driveSwitchTab(key) {
+  function driveSwitchTab(key) {
     _assertOpen();
     if (!TABS.some((t) => t.key === key)) throw new Error(`unknown tab "${key}"`);
-    if (state.tab !== key) { state.tab = key; syncTabs(); await reload(); }
-    else syncTabs();
-    return { tab: state.tab, renderRev: state.renderRev };
+    if (state.tab !== key) {
+      state.tab = key; syncTabs();
+      // Resolve on DISPATCH, not on fetch completion (#173): awaiting the full
+      // reload (a cold first fetch, possibly while the ComfyUI tab is backgrounded)
+      // blew the 10s ctx.call bridge timeout, so a tab switch that actually
+      // succeeded surfaced to the agent as a timeout. reload() tracks its own
+      // promise (state.activeReloadPromise) for drive methods that need the first
+      // page, and _reload's reqId/renderRev bumps run synchronously before its
+      // first await, so state.renderRev below is already the new generation. The
+      // agent reads the loaded data via panel_civitai_results (loading/done flags).
+      void reload();
+      return { tab: state.tab, renderRev: state.renderRev, dispatched: true };
+    }
+    syncTabs();
+    return { tab: state.tab, renderRev: state.renderRev, dispatched: false };
   }
   async function driveSearch({ query, filters, browsingLevels } = {}) {
     _assertOpen();
@@ -1910,6 +1961,13 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       done: !!state.done,
       renderRev: state.renderRev,
       truncated: source.length > ser.items.length,
+      // Disambiguate an empty grid (issues #190/#375): `error` is a non-null
+      // upstream failure (retry, don't narrow filters); `authenticated` reflects
+      // the CivitAI session; on the favorites tab `favoritesStatus` explains an
+      // empty feed (signed_out / no_likes_collection / filtered_out / ok).
+      error: state.error || null,
+      authenticated: !!state.signedIn,
+      ...(tabDef().fav ? { favoritesStatus: state.favoritesStatus || "ok" } : {}),
     };
   }
   /** Highlight a set of ids (REPLACEMENT semantics). Awaits the in-flight

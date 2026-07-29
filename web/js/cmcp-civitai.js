@@ -280,7 +280,15 @@ export class CivitaiClient {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ url, method, body, auth, headers }),
     });
-    if (!res.ok) throw new Error(`civitai proxy ${res.status}`);
+    if (!res.ok) {
+      // Carry the upstream status as a property so callers (the UI's fetch
+      // catch) can surface a distinct error state instead of an empty grid
+      // (#190). The proxy forwards CivitAI's status, so res.status is the real
+      // upstream code (e.g. 503 when model search is overloaded).
+      throw Object.assign(new Error(`CivitAI API ${res.status}: ${res.statusText || "request failed"}`), {
+        status: res.status,
+      });
+    }
     return normalizeTrpcResponse(await res.json());
   }
 
