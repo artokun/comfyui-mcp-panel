@@ -66,6 +66,7 @@ import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
+import { toDisplayText } from "./lib/display-text.js";
 import {
   CHAT_HISTORY_MAX_IMPORT_BYTES,
   CHAT_HISTORY_SCHEMA,
@@ -11426,6 +11427,21 @@ function buildPanel() {
     return entry;
   }
 
+  // True while paintThread() is replaying a stored conversation, so the paint*
+  // helpers repaint without re-recording what they are replaying.
+  let replaying = false;
+
+  /** Record an image/video card so history can replay it (see paintThread).
+   *  Only SERVABLE urls are stored (ComfyUI /view links, http(s)) — a data:/blob:
+   *  URI from a user attachment can be megabytes and would blow the localStorage
+   *  quota, taking the whole thread down with it. Those still paint live; they
+   *  just don't survive a reload (tracked residual — see #177). */
+  function recordMedia(kind, url, caption) {
+    if (replaying) return;
+    if (typeof url !== "string" || url.startsWith("data:") || url.startsWith("blob:")) return;
+    record({ role: "media", kind, url, caption: caption || "" });
+  }
+
   /** Bind the agent's current session id to the open thread (for reload/resume). */
   function bindSession(sessionId) {
     const previousSessionId = thread?.sessionId || null;
@@ -11576,6 +11592,7 @@ function buildPanel() {
 
   function paintImage(url, name) {
     clearEmpty();
+    recordMedia("image", url, name);
     const card = document.createElement("div");
     card.className = "cmcp-bubble agent cmcp-imgcard";
     const img = document.createElement("img");
@@ -11650,6 +11667,7 @@ function buildPanel() {
 
   function paintVideo(url, name) {
     clearEmpty();
+    recordMedia("video", url, name);
     const card = document.createElement("div");
     card.className = "cmcp-bubble agent cmcp-imgcard";
     // Self-sizing holder: a live <video> when on-screen, a gray aspect-ratio box
@@ -12181,8 +12199,11 @@ function buildPanel() {
   }
 
   function appendAgent(text) {
-    paintAgent(text);
-    record({ role: "agent", text });
+    // Normalize before paint AND record so a structured payload never renders
+    // (or persists) as the literal "[object Object]" (#176).
+    const readable = toDisplayText(text);
+    paintAgent(readable);
+    record({ role: "agent", text: readable });
   }
 
   // ```a2ui fence fallback — for backends without panel tools (Ollama family).
@@ -12371,10 +12392,12 @@ function buildPanel() {
   }
 
   function appendSystem(text) {
-    // System notices are transient — painted, never recorded.
+    // System notices are transient — painted, never recorded. A structured
+    // payload (e.g. a backend failure object) is normalized to readable text so
+    // it never renders as the literal "[object Object]" (#176).
     const b = document.createElement("div");
     b.className = "cmcp-sys";
-    b.textContent = text;
+    b.textContent = toDisplayText(text);
     log.appendChild(b);
     scrollLog();
   }
@@ -12433,13 +12456,23 @@ function buildPanel() {
   function paintThread(t) {
     thread = t;
     resetFeed();
-    for (const m of t.msgs) {
-      if (m.role === "user") paintUser(m.text, { attachments: m.attachments, workflowVersion: m.workflowVersion });
-      else if (m.role === "agent") paintAgent(m.text);
-      else if (m.role === "card") {
-        if (m.kind === "a2ui") paintA2UIRecord(m);
-        else paintCard(m);
+    // Replaying stored history — the paint* helpers must NOT re-record what they
+    // are repainting (recordMedia is the media equivalent of the append* record).
+    replaying = true;
+    try {
+      for (const m of t.msgs) {
+        if (m.role === "user") paintUser(m.text, { attachments: m.attachments, workflowVersion: m.workflowVersion });
+        else if (m.role === "agent") paintAgent(m.text);
+        else if (m.role === "media") {
+          if (m.kind === "video") paintVideo(m.url, m.caption);
+          else paintImage(m.url, m.caption);
+        } else if (m.role === "card") {
+          if (m.kind === "a2ui") paintA2UIRecord(m);
+          else paintCard(m);
+        }
       }
+    } finally {
+      replaying = false;
     }
     // resetFeed() recreated the indicator (if a turn is live) ABOVE these
     // repainted messages — re-pin it to the bottom so it trails the newest one.
