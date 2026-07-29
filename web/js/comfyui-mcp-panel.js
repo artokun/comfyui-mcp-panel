@@ -2884,6 +2884,15 @@ function revertGraphToLastSnapshot() {
 // prepend a compact change-list to the agent's input so it isn't caught unaware
 // of edits the user made by hand (a bypassed node, a tweaked widget, a rewire).
 let lastAgentGraph = null;
+// The WORKFLOW IDENTITY (routing tab id: "wf:<path>" / "tmp:<uuid>") the snapshot
+// above was taken from. The snapshot is a single module-global, but a diff is only
+// meaningful against the SAME workflow: if the user switched tabs between the
+// agent's turn-end and their next message, diffing the now-active tab B against
+// tab A's snapshot attributed all of B's graph as "manual edits" to A — a bogus,
+// authoritative-framed change list that could drive the agent to edit the wrong
+// graph (panel #348/#198). We compare identity before diffing and, on a mismatch,
+// emit a tab-switch notice + reseed instead of a false diff.
+let lastAgentGraphTabId = null;
 
 const MODE_NAME = { 0: "active", 2: "mute", 4: "bypass" };
 const modeName = (m) => MODE_NAME[m] ?? `mode${m ?? 0}`;
@@ -3024,8 +3033,29 @@ function manualChangeBanner() {
   } catch {
     return "";
   }
+  // If the active workflow is not the one the snapshot came from, the user
+  // switched tabs — do NOT diff two different graphs (that produces a bogus
+  // "manual edits" list, #348/#198). Reseed to the now-active graph and tell the
+  // agent to re-read, rather than asserting a false ground-truth delta.
+  let currTabId = null;
+  try {
+    currTabId = workflowTabId();
+  } catch {
+    currTabId = null;
+  }
+  if (lastAgentGraphTabId && currTabId && currTabId !== lastAgentGraphTabId) {
+    const prev = lastAgentGraphTabId;
+    lastAgentGraph = curr;
+    lastAgentGraphTabId = currTabId;
+    return (
+      `⟳ ACTIVE WORKFLOW CHANGED since your last turn (${prev} → ${currTabId}). ` +
+      `The canvas you're now bound to is a DIFFERENT workflow — your remembered ` +
+      `node ids may not apply. Re-read with panel_graph_outline before editing.\n\n`
+    );
+  }
   const lines = diffGraphsForAgent(lastAgentGraph, curr, live);
   lastAgentGraph = curr;
+  lastAgentGraphTabId = currTabId;
   if (!lines.length) return "";
   const MAX = 40;
   const shown = lines.slice(0, MAX);
@@ -5491,7 +5521,12 @@ const GRAPH_TOOL_EXECUTORS = {
     });
     return {
       active: active ? { path: active.path, filename: active.filename, key: active.key } : null,
-      open: (s.openWorkflows ?? []).map(brief),
+      // Guard against nullish entries in openWorkflows: a tab mid-open/close can
+      // momentarily leave an undefined slot, and an unguarded `w.path` in `brief`
+      // threw "Cannot read properties of undefined (reading 'path')" — removing the
+      // only way to list open tabs exactly when it was needed to diagnose a desync
+      // (panel #197). Filter first so the list is best-effort rather than fatal.
+      open: (s.openWorkflows ?? []).filter(Boolean).map(brief),
     };
   },
 
@@ -7166,6 +7201,32 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           } else {
             const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];
             if (!executor) throw new Error(`Unknown command "${msg.cmd}"`);
+            // PINNED-TARGET GUARD (#349): a `workflow_path` on the command means the
+            // agent's session is pinned to a SPECIFIC workflow. But every executor
+            // runs against the ACTIVE canvas (getGraphCtx = app.canvas.graph) — the
+            // panel has no way to mutate a non-active workflow's graph. So if the
+            // pinned workflow is not the active one, executing would SILENTLY write
+            // to the wrong graph (the reported data corruption). Fail loudly with a
+            // retryable error instead. Only fires on a POSITIVE mismatch (active
+            // identity resolvable and none of its ids match), so an unresolvable
+            // frontend never spuriously rejects, and current-mode sessions (which
+            // never carry workflow_path) are wholly unaffected.
+            const pinnedPath = msg?.[WORKFLOW_PATH_FIELD];
+            if (typeof pinnedPath === "string" && pinnedPath.trim()) {
+              const wf = activeWorkflowRef();
+              const want = normalizedWorkflowPath(pinnedPath);
+              const have = [wf?.path, wf?.key, wf?.path ? "wf:" + wf.path : null]
+                .filter((x) => typeof x === "string" && x)
+                .map(normalizedWorkflowPath);
+              if (have.length && !have.includes(want)) {
+                throw new Error(
+                  `workflow mismatch: your session is pinned to "${pinnedPath}", but the active ` +
+                    `canvas is "${wf?.path || wf?.key || "unknown"}". The panel can only edit the ` +
+                    `active workflow — switch to the pinned tab (panel_open_workflow) or re-target ` +
+                    `with panel_set_workflow_target({mode:"current"}), then retry.`,
+                );
+              }
+            }
             result = await executor(msg);
             // ComfyUI's ChangeTracker snapshots on USER input events only —
             // graph.beforeChange/afterChange is not wired into it, so bridge-driven
@@ -13489,6 +13550,13 @@ function buildPanel() {
         // the live graph against this to surface MANUAL edits made between turns.
         try {
           lastAgentGraph = getGraphCtx().rootGraph.serialize();
+          // Stamp the workflow identity so the next turn's diff only compares
+          // like-with-like (see manualChangeBanner / #348/#198).
+          try {
+            lastAgentGraphTabId = workflowTabId();
+          } catch {
+            lastAgentGraphTabId = null;
+          }
         } catch {}
       }
     },
