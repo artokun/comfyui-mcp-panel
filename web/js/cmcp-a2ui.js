@@ -6,6 +6,8 @@
 // Component types and attributes come from the enums validated here. See
 // docs/superpowers/specs/2026-07-10-a2ui-chat-design.md.
 
+import { coerceMessageText } from "./lib/chat-serialize.js";
+
 export const A2UI_CAPS = Object.freeze({
   maxComponents: 64,
   maxDepth: 8,
@@ -552,8 +554,14 @@ export function renderA2UICard(spec, { onAction, onDismiss } = {}) {
     fields: [],
     isResolved: () => resolved,
     choose: (btn, text) => {
-      handle.resolve(text, btn);
-      onAction?.(text);
+      // A button's `reply`/`label` should be a string, but a malformed spec (or
+      // a submit-serialized object) can arrive as a non-string here. Normalize
+      // at this single chokepoint so an object never reaches resolve()'s
+      // choiceText.split() or the outgoing user_message as "[object Object]"
+      // (#219). Both the hand-rolled and Lit Button paths flow through choose().
+      const reply = coerceMessageText(text);
+      handle.resolve(reply, btn);
+      onAction?.(reply);
     },
   };
 

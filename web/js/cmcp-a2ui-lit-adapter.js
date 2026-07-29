@@ -28,6 +28,8 @@
 // module top level, so this file (and cmcp-a2ui.js, which imports it) stays
 // importable under `node --test` with no DOM/browser present.
 
+import { buttonReplyText } from "./lib/chat-serialize.js";
+
 let _bundlePromise = null;
 function loadBundle() {
   if (!_bundlePromise) _bundlePromise = import("./vendor/a2ui-lit.bundle.js");
@@ -129,12 +131,10 @@ export function mountStandardComponent(c, ctx) {
     const wrap = mountA2uiLeaf(c, {
       onFire: () => {
         if (ctx.isResolved()) return;
-        let text = c.reply ?? c.label;
-        if (c.submit) {
-          const lines = ctx.fields.map((f) => `${f.name}: ${f.read()}`);
-          if (lines.length) text = `${text}\n${lines.join("\n")}`;
-        }
-        ctx.choose(wrap, text);
+        // buttonReplyText coerces an object reply to a string BEFORE the submit
+        // fields template interpolates it, so a malformed spec can't bake
+        // "[object Object]" into the outgoing message (#219).
+        ctx.choose(wrap, buttonReplyText(c, ctx.fields));
       },
     });
     ctx.buttons.push(wrap);
