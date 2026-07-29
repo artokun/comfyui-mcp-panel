@@ -7551,6 +7551,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     },
     sendUserMessage(text, context, images, mid) {
       if (!sock || sock.readyState !== WebSocket.OPEN) return false;
+      // Blind mode withholds pixels from EVERY agent-facing path — including
+      // images explicitly attached to a typed user message. The sendFrame() gate
+      // below only covers agent_event, so without this a blind session still
+      // leaks user attachments into the user_message frame (#174, privacy).
+      if (AGENT_BLIND) images = undefined;
       // Merge any armed one-shot context (transcript replay) ahead of this
       // message's own context, then clear it so it's sent exactly once.
       const mergedContext =
