@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+- **Registry tags now claim the local/offline story.** The listing advertised
+  Claude/ChatGPT/GPT-5 but nothing about running locally, so a user browsing
+  ComfyUI-Manager for a self-hosted option had no way to find it. Adds `local`,
+  `local-first`, `offline`, `self-hosted`, `ollama`, `local-llm`, `no-api-key`,
+  and `gemini` — the differentiators against a cloud-only agent.
+
 ### Added
 - **Chat archive UI** — multiple named or pinned conversations per workflow,
   workflow-grouped search and filtering, JSON merge import/export, explicit

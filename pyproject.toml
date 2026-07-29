@@ -18,6 +18,6 @@ Discord = "https://discord.gg/cW9arBhzCu"
 [tool.comfy]
 PublisherId = "artokun"
 DisplayName = "ComfyUI MCP | Agent Panel"
-Tags = ["agent", "ai-agent", "assistant", "copilot", "claude", "chatgpt", "gpt-5", "codex", "mcp", "autonomous", "natural-language", "workflow", "sidebar", "automation"]
+Tags = ["agent", "ai-agent", "assistant", "copilot", "claude", "chatgpt", "gpt-5", "codex", "mcp", "autonomous", "natural-language", "workflow", "sidebar", "automation", "local", "local-first", "offline", "self-hosted", "ollama", "local-llm", "no-api-key", "gemini"]
 Icon = "https://raw.githubusercontent.com/artokun/comfyui-mcp-panel/main/assets/icon.png"
 Banner = "https://raw.githubusercontent.com/artokun/comfyui-mcp-panel/main/assets/banner.png"
