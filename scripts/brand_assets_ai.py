@@ -211,9 +211,15 @@ def render_og(W=1200, H=630):
     d.text((int(w * 0.5 - tgw / 2), ty2), tg, font=tf, fill=B.OFFWHITE)
 
     ty3 = ty2 + int(tf.size * 1.2) + int(30 * SS)
-    f_chip = B.font(B.F_SEMI, 30 * SS); f_or = B.font(B.F_REG, 28 * SS); f_mut = B.font(B.F_REG, 30 * SS)
-    dot_r = int(9 * SS); gap = int(12 * SS); pad = int(16 * SS)
-    seg = lambda l: dot_r * 2 + gap + B.measure_tracked(d, l, f_chip)
+    f_chip = B.font(B.F_SEMI, 30 * SS)
+    f_or = B.font(B.F_REG, 28 * SS)
+    f_mut = B.font(B.F_REG, 30 * SS)
+    dot_r = int(9 * SS)
+    gap = int(12 * SS)
+    pad = int(16 * SS)
+
+    def seg(l):
+        return dot_r * 2 + gap + B.measure_tracked(d, l, f_chip)
     parts_w = seg("Claude") + B.measure_tracked(d, "  or  ", f_or) + seg("ChatGPT")
     pill_w = int(parts_w + pad * 2)
     tail_w = B.measure_tracked(d, "your subscription · no API keys", f_mut)

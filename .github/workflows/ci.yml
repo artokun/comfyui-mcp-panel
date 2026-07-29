@@ -42,6 +42,34 @@ jobs:
       - name: Python compile check (__init__.py)
         run: python -m py_compile __init__.py
 
+      # comfy-cli parity: publishing already WARNS that "we will soon disable
+      # exec and eval, and multiple statements in a single line" — when that
+      # becomes a hard error it breaks `Publish to Comfy Registry`, i.e. we
+      # find out at release time. Fail here instead. AST-based on purpose: a
+      # grep for ";" matches semicolons inside string literals and would flag
+      # clean files (it did — every py/ hit was a false positive).
+      - name: comfy-cli parity — no exec/eval, no multi-statement lines
+        run: |
+          python - <<'PY'
+          import ast, collections, pathlib, sys
+          bad = []
+          for f in sorted(pathlib.Path(".").rglob("*.py")):
+              if any(p in f.parts for p in (".git", "node_modules", ".venv", "venv", "__pycache__")):
+                  continue
+              tree = ast.parse(f.read_text(encoding="utf-8"), str(f))
+              per_line = collections.Counter(
+                  n.lineno for n in ast.walk(tree) if isinstance(n, ast.stmt)
+              )
+              for line in sorted(l for l, c in per_line.items() if c > 1):
+                  bad.append(f"{f}:{line}: multiple statements on one line")
+              for n in ast.walk(tree):
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("exec", "eval"):
+                      bad.append(f"{f}:{n.lineno}: {n.func.id}() call")
+          for b in bad:
+              print(f"::error::{b}")
+          sys.exit(1 if bad else 0)
+          PY
+
       - name: Install bandit
         run: pip install bandit
 

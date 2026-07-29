@@ -382,9 +382,15 @@ def render_og(W=1200, H=630):
     ty3 = ty2 + int(tf.size * 1.2) + int(30 * SS)
     # measure pill row width using same logic as draw_chip_row
     dd = d
-    f_chip = font(F_SEMI, 30 * SS); f_or = font(F_REG, 28 * SS); f_mut = font(F_REG, 30 * SS)
-    dot_r = int(9 * SS); gap = int(12 * SS); pad = int(16 * SS)
-    seg = lambda l: dot_r * 2 + gap + measure_tracked(dd, l, f_chip)
+    f_chip = font(F_SEMI, 30 * SS)
+    f_or = font(F_REG, 28 * SS)
+    f_mut = font(F_REG, 30 * SS)
+    dot_r = int(9 * SS)
+    gap = int(12 * SS)
+    pad = int(16 * SS)
+
+    def seg(l):
+        return dot_r * 2 + gap + measure_tracked(dd, l, f_chip)
     parts_w = seg("Claude") + measure_tracked(dd, "  or  ", f_or) + seg("ChatGPT")
     pill_w = int(parts_w + pad * 2)
     tail = "your subscription · no API keys"

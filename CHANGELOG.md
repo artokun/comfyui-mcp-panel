@@ -6,6 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- **Pre-empt the coming comfy-cli hard error.** Publishing already warns that
+  "we will soon disable exec and eval, and multiple statements in a single
+  line"; when that lands it breaks `Publish to Comfy Registry`, i.e. we'd find
+  out at release time. Split the four semicolon-joined lines in the brand-asset
+  scripts and turned a `seg = lambda` into a `def`. No exec/eval existed
+  anywhere, and the shipped `__init__.py` / `py/*.py` were already clean.
+
+### Added
+- CI step enforcing comfy-cli parity (no exec/eval, no multi-statement lines).
+  AST-based rather than grep — a `;` search matches semicolons inside string
+  literals and reported false positives on every `py/` file.
+
 ### Changed
 - **Registry tags now claim the local/offline story.** The listing advertised
   Claude/ChatGPT/GPT-5 but nothing about running locally, so a user browsing
