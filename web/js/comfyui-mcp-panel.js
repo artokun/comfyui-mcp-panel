@@ -84,6 +84,10 @@ import {
 } from "./lib/workflow-chat-identity.js";
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
+import {
+  isStaleAssetCandidate as isStaleAssetCandidateLib,
+  reconcileUnknownWidgetNames,
+} from "./lib/asset-staleness.js";
 
 let app = null;
 let api = null;
@@ -93,6 +97,49 @@ let api = null;
 // setupListeners, called from registerExtensionWhenReady). execution_start clears
 // state for the new run.
 let lastExecFailure = null;
+
+/**
+ * After a ComfyUI restart (panel_restart_comfyui / Manager reboot), the browser
+ * tab stays loaded but the backend rescanned node packs and model folders. The
+ * ComfyUI frontend does NOT re-fetch its node definitions on its own when its
+ * websocket to the backend reconnects, so the live LiteGraph registry and the
+ * loader combo lists go stale:
+ *   - newly installed node classes are "Unknown node type" to panel_add_node,
+ *     and existing nodes keep the old input/widget schema (#221 / #171)
+ *   - freshly downloaded/rescanned models are absent from loader combos, so a
+ *     genuinely installed file still looks missing (#185 / #181), and the
+ *     collectMissingAssets live-combo cross-check can't clear stale candidates.
+ * Re-pull /object_info and re-register the defs + refresh every combo so graph
+ * tools resume against the current server. Fully defensive: each frontend method
+ * is optional across ComfyUI versions, and any failure is a no-op (worst case is
+ * today's stale behaviour, never a thrown tool call).
+ */
+let nodeDefRefreshInFlight = null;
+async function refreshComfyNodeDefs() {
+  if (nodeDefRefreshInFlight) return nodeDefRefreshInFlight;
+  nodeDefRefreshInFlight = (async () => {
+    try {
+      const a =
+        typeof app !== "undefined" && app ? app : window.comfyAPI?.app?.app;
+      if (!a) return;
+      // Re-register node definitions so newly installed/updated classes and
+      // their current widget schemas are known to LiteGraph (#221/#171).
+      if (typeof a.registerNodesFromDefs === "function" && typeof api?.getNodeDefs === "function") {
+        const defs = await api.getNodeDefs();
+        if (defs) await a.registerNodesFromDefs(defs);
+      }
+      // Refresh combo widget option lists (model dropdowns etc.) so freshly
+      // installed models resolve and stale entries clear (#185/#181/#223).
+      if (typeof a.refreshComboInNodes === "function") await a.refreshComboInNodes();
+    } catch (e) {
+      console.warn("[comfyui-mcp-panel] node-def refresh after reconnect failed:", e);
+    } finally {
+      nodeDefRefreshInFlight = null;
+    }
+  })();
+  return nodeDefRefreshInFlight;
+}
+
 function setupListeners() {
   if (!api) return;
   try {
@@ -101,6 +148,12 @@ function setupListeners() {
     });
     api.addEventListener("execution_start", () => {
       lastExecFailure = null;
+    });
+    // ComfyUI's own socket to its backend re-establishing is the reliable
+    // in-tab signal that the server came back after a restart — refresh the
+    // stale node registry + combos then (#221/#171/#185/#181).
+    api.addEventListener("reconnected", () => {
+      void refreshComfyNodeDefs();
     });
   } catch {
     // api unavailable — graph_get_errors reports null.
@@ -3097,6 +3150,24 @@ let lastInjectedValidationSig = null;
  * Shared by graph_get_errors and validationBanner so the tool and the proactive
  * turn-start injection can never drift apart again.
  */
+/** The missing-asset Pinia stores (`missingModel`/`missingMedia`) are populated
+ *  ONCE at workflow LOAD and never re-evaluated, so a candidate the user or the
+ *  agent has since fixed (set_widget) — or a file that has since appeared on disk
+ *  (download + restart) — keeps getting reported missing until a full reload.
+ *  Delegate the live-graph cross-check to the pure helper: drop a candidate when
+ *  no widget still references the file OR it now resolves against the node's live
+ *  combo. Fails toward over-reporting, never swallowing a genuine miss.
+ *  (#196/#352/#364/#203/#223/#185/#181) */
+function isStaleAssetCandidate(c) {
+  let rootGraph;
+  try {
+    rootGraph = getGraphCtx().rootGraph;
+  } catch {
+    return false; // no graph → can't prove stale, keep reporting
+  }
+  return isStaleAssetCandidateLib(rootGraph, c);
+}
+
 function collectMissingAssets() {
   const models = [];
   const media = [];
@@ -3105,6 +3176,7 @@ function collectMissingAssets() {
   try {
     for (const c of getPiniaStore("missingModel")?.missingModelCandidates ?? []) {
       if (c?.isMissing === false) continue;
+      if (isStaleAssetCandidate(c)) continue;
       models.push({
         node_id: c?.nodeId ?? null,
         file: c?.name ?? null,
@@ -3119,6 +3191,7 @@ function collectMissingAssets() {
   try {
     for (const c of getPiniaStore("missingMedia")?.missingMediaCandidates ?? []) {
       if (c?.isMissing === false) continue;
+      if (isStaleAssetCandidate(c)) continue;
       media.push({
         node_id: c?.nodeId ?? null,
         file: c?.name ?? null,
@@ -3350,6 +3423,7 @@ function resolveNode(graph, nodeId) {
   if (!node) throw new Error(`No node with id ${nodeId} in the current graph`);
   return node;
 }
+
 
 // ---- Subgraph boundary rails (input/output proxy nodes) -------------------
 // LiteGraph: subgraph.inputNode.id === SUBGRAPH_INPUT_ID (-10),
@@ -4967,6 +5041,9 @@ const GRAPH_TOOL_EXECUTORS = {
   graph_set_widget({ node_id, widget, value }) {
     const { app, graph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
+    // Repair positional UNKNOWN/UNKNOWN_n placeholders against the live def so
+    // the caller's real widget name resolves (#199) before we look it up.
+    reconcileUnknownWidgetNames(node);
     const w = (node.widgets ?? []).find(
       (cand) => cand?.name?.toLowerCase() === String(widget).toLowerCase(),
     );
