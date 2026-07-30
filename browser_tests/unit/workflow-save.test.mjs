@@ -613,6 +613,269 @@ test('P0-b: no-name save of an on-disk app-mode workflow COPIES to .app.json, so
   assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed the source')
 })
 
+// ---------------------------------------------------------------------------
+// ComfyUI frontend 1.47.x (issue #268). The workflow store no longer exposes
+// `saveWorkflowAs`; it exposes the low-level pair `saveAs(wf, path)` (builds a
+// NEW copy object at `path`, leaving the source object and its file untouched)
+// + `saveWorkflow(copy)` (persists it). `getWorkflowByPath` is backed by the
+// IN-MEMORY store, so it returns the open temporary tab at its
+// "workflows/Unsaved Workflow (N).json" path — it can NOT prove disk absence.
+// Only the authoritative `existsOnDisk` oracle (ComfyUI /userdata HEAD) can.
+//
+// CONTENT-FAITHFUL model of the 1.47 SAVE MECHANICS: ComfyWorkflow.save()
+// serializes `changeTracker?.activeState ?? null`, and the object `saveAs`
+// returns is UNLOADED (changeTracker === null). So a copy saved WITHOUT being
+// opened/activated first serializes the string "null" — a saved-but-empty file.
+// `disk` therefore stores the SERIALIZED CONTENT (path -> string), and the tests
+// assert the persisted content equals the source graph, catching a regression
+// to the null-content bug that a "path exists" check would miss.
+const SAMPLE_GRAPH = { nodes: [{ id: 1, type: 'KSampler' }], links: [], version: 1 }
+
+function makeStore147Service({ files = [], active, graph = SAMPLE_GRAPH } = {}) {
+  const disk = new Map() // path -> serialized content string
+  for (const f of files) disk.set(f, JSON.stringify({ seeded: f }))
+  const calls = []
+  const store = new Map() // path -> in-memory workflow object
+  // The active source tab is LOADED (the user is editing it): model its live
+  // graph via a changeTracker, exactly what save()/saveAs read.
+  if (active && active.changeTracker === undefined) {
+    active.changeTracker = { activeState: graph, prepareForSave() {} }
+  }
+  if (active) store.set(active.path, active)
+  const svc = {
+    activeWorkflow: active,
+    calls,
+    disk,
+    // In-memory oracle: returns whatever object the store holds at `path`,
+    // INCLUDING the open temporary tab. Never consults disk. Mirrors 1.47's
+    // `getWorkflowByPath = e => n.value[e] ?? null`.
+    getWorkflowByPath(path) {
+      return store.get(path) ?? null
+    },
+    // Low-level COPY: snapshots the SOURCE's current graph and builds a NEW,
+    // UNLOADED workflow object at `path` (changeTracker === null, so activeState
+    // is null until opened). The source object and its on-disk file are
+    // untouched. Mirrors 1.47 store `saveAs`.
+    saveAs(wf, path) {
+      calls.push(['saveAs', wf.path, path])
+      const snapshot = JSON.parse(JSON.stringify(wf.changeTracker?.activeState ?? null))
+      const copy = {
+        path,
+        filename: path.split('/').pop(),
+        directory: path.split('/').slice(0, -1).join('/') || 'workflows',
+        initialMode: wf.initialMode,
+        isPersisted: false, // not written yet (size === -1)
+        isTemporary: true,
+        changeTracker: null, // UNLOADED — activeState is null until openWorkflow
+        _pendingState: snapshot // what load() will populate the tracker with
+      }
+      store.set(path, copy)
+      return copy
+    },
+    // Opening LOADS the workflow (populates changeTracker/activeState from the
+    // graph) and makes it the active tab. Mirrors 1.47 store `openWorkflow`.
+    async openWorkflow(wf) {
+      calls.push(['openWorkflow', wf.path])
+      if (wf.changeTracker === null) {
+        wf.changeTracker = { activeState: wf._pendingState, prepareForSave() {} }
+      }
+      svc.activeWorkflow = wf
+      return wf
+    },
+    async saveWorkflow(wf) {
+      calls.push(['saveWorkflow', wf.path])
+      // save() serializes changeTracker?.activeState ?? null — the exact bug
+      // surface. An unopened copy writes "null".
+      disk.set(wf.path, JSON.stringify(wf.changeTracker?.activeState ?? null))
+      wf.isPersisted = true
+      wf.isTemporary = false
+    },
+    async renameWorkflow(wf, newPath) {
+      calls.push(['renameWorkflow', wf.path, newPath])
+      const content = disk.get(wf.path)
+      disk.delete(wf.path) // MOVE: consumes the source
+      store.delete(wf.path)
+      wf.path = newPath
+      wf.filename = newPath.split('/').pop()
+      store.set(newPath, wf)
+      if (content !== undefined) disk.set(newPath, content)
+    }
+    // NOTE: deliberately NO saveWorkflowAs — that is the whole point of 1.47.
+  }
+  // Authoritative filesystem oracle (what the panel backs with /userdata HEAD).
+  const existsOnDisk = async (p) => disk.has(p)
+  return { svc, existsOnDisk, graph }
+}
+
+test('1.47: a brand-new temp tab saves under a name via the saveAs+saveWorkflow COPY path (#268)', async () => {
+  const active = {
+    path: 'workflows/Unsaved Workflow (2).json',
+    filename: 'Unsaved Workflow (2).json',
+    directory: 'workflows',
+    isPersisted: false,
+    isTemporary: true
+  }
+  const { svc, existsOnDisk, graph } = makeStore147Service({ active }) // disk EMPTY
+
+  const saved = await saveActiveWorkflow(svc, 'My Workflow', {
+    autoWorkflowName: () => 'Untitled',
+    existsOnDisk
+  })
+
+  assert.ok(svc.disk.has('workflows/My Workflow.json'), 'new workflow persisted')
+  // The persisted content must be the REAL graph — NOT "null". This is the
+  // regression guard for the unopened-copy bug: without openWorkflow the copy's
+  // activeState is null and save() would serialize "null".
+  assert.deepEqual(
+    JSON.parse(svc.disk.get('workflows/My Workflow.json')),
+    graph,
+    'persisted content is the real graph, not null'
+  )
+  // The copy is opened/activated BEFORE it is saved, and becomes the active tab.
+  assert.ok(svc.calls.some((c) => c[0] === 'openWorkflow'), 'opened/activated the copy before save')
+  assert.equal(svc.activeWorkflow?.path, 'workflows/My Workflow.json', 'copy is the active tab')
+  assert.ok(svc.calls.some((c) => c[0] === 'saveAs'), 'used the store saveAs copy')
+  assert.ok(svc.calls.some((c) => c[0] === 'saveWorkflow'), 'persisted the copy')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never moved the temp')
+  assert.equal(saved, 'My Workflow')
+})
+
+test('1.47: a brand-new temp tab with NO args auto-names and saves (#268)', async () => {
+  const active = {
+    path: 'workflows/Unsaved Workflow (2).json',
+    filename: 'Unsaved Workflow (2).json',
+    directory: 'workflows',
+    isPersisted: false,
+    isTemporary: true
+  }
+  const { svc, existsOnDisk, graph } = makeStore147Service({ active }) // disk EMPTY
+
+  const saved = await saveActiveWorkflow(svc, undefined, {
+    autoWorkflowName: () => 'Untitled 2026-07-30',
+    existsOnDisk
+  })
+
+  assert.ok(svc.disk.has('workflows/Untitled 2026-07-30.json'), 'auto-named file persisted')
+  assert.deepEqual(
+    JSON.parse(svc.disk.get('workflows/Untitled 2026-07-30.json')),
+    graph,
+    'persisted content is the real graph, not null'
+  )
+  assert.equal(svc.activeWorkflow?.path, 'workflows/Untitled 2026-07-30.json', 'copy is the active tab')
+  assert.ok(svc.calls.some((c) => c[0] === 'saveAs'), 'used the store saveAs copy')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never moved the temp')
+  assert.equal(saved, 'Untitled 2026-07-30')
+})
+
+test('1.47: a persisted workflow Save-As COPIES via saveAs+saveWorkflow, source survives (#226)', async () => {
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const { svc, existsOnDisk, graph } = makeStore147Service({ files: [active.path], active })
+  const sourceContentBefore = svc.disk.get('workflows/Foo.json')
+
+  const saved = await saveActiveWorkflow(svc, 'Bar', { existsOnDisk })
+
+  assert.ok(svc.disk.has('workflows/Foo.json'), 'SOURCE FILE preserved (copy, not move)')
+  assert.equal(
+    svc.disk.get('workflows/Foo.json'),
+    sourceContentBefore,
+    'source file content untouched'
+  )
+  assert.ok(svc.disk.has('workflows/Bar.json'), 'copy created')
+  assert.deepEqual(
+    JSON.parse(svc.disk.get('workflows/Bar.json')),
+    graph,
+    'copy content is the real graph, not null'
+  )
+  assert.equal(svc.activeWorkflow?.path, 'workflows/Bar.json', 'copy is the active tab')
+  assert.ok(svc.calls.some((c) => c[0] === 'saveAs'), 'used the store saveAs copy')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed the source')
+  assert.equal(saved, 'Bar')
+})
+
+test('1.47: a drifted-temporary REAL file (on disk) is NEVER moved — refuse via disk oracle (#226/#215)', async () => {
+  // The exact #226 hole the #268 fix must not reopen: a PERSISTED file left
+  // flagged temporary. getWorkflowByPath returns that same non-persisted object
+  // (can't prove absence); only the /userdata oracle can — and it says the file
+  // EXISTS, so the classifier must say "persisted" → refuse, never copy/move.
+  const active = {
+    path: 'workflows/Real.json',
+    filename: 'Real.json',
+    directory: 'workflows',
+    isPersisted: false, // drifted
+    isTemporary: true // drifted
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ files: [active.path], active })
+  // Sanity: the in-memory oracle returns the SAME non-persisted object.
+  assert.equal(svc.getWorkflowByPath('workflows/Real.json'), active)
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'Copy', { existsOnDisk }),
+    /exists on disk/
+  )
+  assert.ok(svc.disk.has('workflows/Real.json'), 'real source preserved')
+  assert.ok(!svc.disk.has('workflows/Copy.json'), 'no rogue copy')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
+  assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflow'), 'never persisted a move')
+})
+
+test('1.47: a drifted-temporary path with an UNKNOWN disk oracle still refuses (fail safe, #226)', async () => {
+  // If /userdata is unreachable (oracle returns null), a flagged-temporary doc
+  // whose in-memory lookup is inconclusive stays "unknown" → refuse. Grounding
+  // only ever happens on a PROVEN 404.
+  const active = {
+    path: 'workflows/Real.json',
+    filename: 'Real.json',
+    directory: 'workflows',
+    isPersisted: false, // drifted
+    isTemporary: true // drifted
+  }
+  const { svc } = makeStore147Service({ files: [active.path], active })
+  const existsOnDisk = async () => null // oracle unreachable ⇒ unknown
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'Copy', { existsOnDisk }),
+    /cannot be proven absent from disk/
+  )
+  assert.ok(svc.disk.has('workflows/Real.json'), 'source preserved')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
+  assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflow'), 'never persisted a move')
+})
+
+test('1.47: saveAs+saveWorkflow but NO openWorkflow ⇒ refuse, never persist null content (#226)', async () => {
+  // A persisted source MUST be copied (never moved), and the copy from saveAs()
+  // is UNLOADED — so without openWorkflow to load its graph, saveWorkflow(copy)
+  // would serialize "null" (empty file) while reporting success. The adapter must
+  // NOT select this path — refuse BEFORE any saveAs/saveWorkflow, persisting
+  // nothing and leaving the source file intact.
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ files: [active.path], active })
+  const sourceContentBefore = svc.disk.get('workflows/Foo.json')
+  delete svc.openWorkflow // frontend without the activation API
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'Bar', { existsOnDisk }),
+    /save-as \(copy\) is unavailable on this frontend/
+  )
+  // NOTHING was copied or persisted — no null-content file; source untouched.
+  assert.ok(!svc.disk.has('workflows/Bar.json'), 'no null-content copy written')
+  assert.equal(svc.disk.get('workflows/Foo.json'), sourceContentBefore, 'source content untouched')
+  assert.ok(!svc.calls.some((c) => c[0] === 'saveAs'), 'never created a copy')
+  assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflow'), 'never persisted')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never moved')
+})
+
 test('refuses to rename-destroy a persisted workflow when no copy API exists', async () => {
   const active = {
     path: 'workflows/Foo.json',

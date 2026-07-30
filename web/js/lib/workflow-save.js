@@ -63,8 +63,19 @@ export function isDefaultWorkflowName(name) {
  *  `autoWorkflowName` mints a grounding name for a placeholder temporary
  *  workflow when no explicit name is supplied. Returns the resolved name, or
  *  null when nothing could be resolved (caller may fall back to a title).
+ *
+ *  `existsOnDisk(rawPath)` is an OPTIONAL authoritative filesystem oracle —
+ *  async `(path) => true | false | null` (null = unknown). It exists because the
+ *  frontend's in-memory `getWorkflowByPath` cannot tell a genuinely never-saved
+ *  temporary tab (whose path IS in the in-memory store, e.g.
+ *  "workflows/Unsaved Workflow (2).json") from a drifted real file at the same
+ *  path — both return a non-persisted object. Only the disk can (ComfyUI's
+ *  /userdata HEAD). A 404 PROVES no backing file (safe to ground); a 200 PROVES
+ *  a real file (must never be moved). This STRENGTHENS the #226 invariant — it
+ *  is only ever consulted after the in-memory oracles are inconclusive, and its
+ *  absence / failure leaves the classification "unknown" → refuse (fail safe).
  */
-export async function saveActiveWorkflow(svc, name, { autoWorkflowName } = {}) {
+export async function saveActiveWorkflow(svc, name, { autoWorkflowName, existsOnDisk } = {}) {
   const wf = svc?.activeWorkflow;
   if (!wf) throw new Error("no active workflow to save");
 
@@ -135,15 +146,24 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName } = {}) {
     // UNKNOWN must FAIL SAFE (refuse) — we only ever take a move path when the
     // source is PROVABLY never-persisted (no backing file to destroy).
     const sourcePath = wf.path;
-    const cls = classifySource(svc, wf, sourcePath);
+    const cls = await classifySource(svc, wf, sourcePath, existsOnDisk);
 
-    if (typeof svc.saveWorkflowAs === "function") {
+    // Resolve the copy (Save-As) API across frontend versions. On 1.45.x the
+    // workflow store exposes the high-level `saveWorkflowAs(wf,{filename})`. On
+    // 1.47.x that method was removed from `extensionManager.workflow`; the store
+    // instead exposes the low-level pair `saveAs(wf, path)` (creates a NEW copy
+    // object at `path`, leaving the source object AND its on-disk file untouched)
+    // + `saveWorkflow(copy)` (persists the copy). Both are true copies — neither
+    // moves/destroys the source — so both satisfy the #226 invariant.
+    const saveAsCopy = resolveSaveAsCopy(svc);
+
+    if (saveAsCopy) {
       // PREVENT the destructive move. saveWorkflowAs relocates-by-rename whenever
       // it treats the doc as temporary. That is only SAFE when the source is
       // provably never-persisted; for a persisted OR UNKNOWN source it would (or
       // might) destroy a real file — refuse instead (the sanctioned safe outcome).
       // A correctly-opened persisted workflow has isTemporary === false and hits
-      // saveWorkflowAs's COPY branch, so it is unaffected by this guard.
+      // the COPY branch, so it is unaffected by this guard.
       if (wf.isTemporary === true && cls !== "never-persisted") {
         throw new Error(
           `refusing to save: the active workflow is flagged unsaved but its source "${sourcePath}" ` +
@@ -151,25 +171,23 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName } = {}) {
             `saving now could MOVE (destroy) the original (issue #226). Re-open the workflow and try again.`,
         );
       }
-      // Copy path. For a persisted workflow saveWorkflowAs copies
-      // (workflowStore.saveAs → new file, original untouched); for a genuine
-      // temporary it renames the never-saved tab to a real file. `filename`
-      // skips the Save dialog.
-      await svc.saveWorkflowAs(wf, { filename: effectiveName });
-      // BACKSTOP: if saveWorkflowAs relocated a persisted source anyway, fail
-      // LOUDLY instead of reporting a phantom success (the prior fix's exact
-      // miss). Uses the SAME tri-state rule as classifySource: only a SUCCESSFUL,
-      // affirmative absence (getWorkflowByPath returns null/undefined at the path)
-      // proves the move. A getter THROW or a list-miss is UNKNOWN — a valid
-      // save-as copy must NOT be reported as "moved" (false alarm).
+      // Copy path. For a persisted workflow this copies (new file, original
+      // untouched); for a genuine (provably never-persisted) temporary it grounds
+      // the never-saved tab to a real file. No Save dialog.
+      const activeName = await saveAsCopy(wf, effectiveName, finalTargetPath);
+      // BACKSTOP: if the copy relocated a persisted source anyway, fail LOUDLY
+      // instead of reporting a phantom success (the prior fix's exact miss). Uses
+      // the SAME tri-state rule as classifySource: only a SUCCESSFUL, affirmative
+      // absence (getWorkflowByPath returns null/undefined at the path) proves the
+      // move. A getter THROW or a list-miss is UNKNOWN — a valid save-as copy must
+      // NOT be reported as "moved" (false alarm).
       if (cls === "persisted" && confirmedAbsentAt(svc, sourcePath)) {
         throw new Error(
           `save moved the original workflow "${sourcePath}" instead of copying it — ` +
             `the source no longer exists on disk (issue #226)`,
         );
       }
-      // saveWorkflowAs makes the new copy the active workflow.
-      return baseName(svc.activeWorkflow?.filename) || effectiveName;
+      return activeName;
     }
     // Fallback (older frontend with no copy API): renaming is a MOVE, so it is
     // only permitted when the source is PROVABLY never-persisted (an in-memory
@@ -207,6 +225,61 @@ function confirmedAbsentAt(svc, rawPath) {
   }
 }
 
+/** Resolve the frontend's Save-As (COPY) capability into a single async adapter
+ *  `(wf, effectiveName, finalTargetPath) => resolvedActiveName`, or null when no
+ *  copy API exists. Every branch is a genuine COPY that leaves the source file
+ *  on disk untouched (the #226 invariant) — the temporary-vs-persisted move
+ *  decision is made by the caller via classifySource, never here.
+ *
+ *   - 1.45.x: `svc.saveWorkflowAs(wf, { filename })` (high-level; makes the new
+ *     copy the active workflow, so read the resolved name back off it).
+ *   - 1.47.x: the store dropped `saveWorkflowAs` and exposes the low-level pair
+ *     `svc.saveAs(wf, path)` — which builds a NEW workflow object at `path`
+ *     (fresh id, source object and its file untouched) and returns it — plus
+ *     `svc.saveWorkflow(copy)` to persist that copy. We drive them together. */
+function resolveSaveAsCopy(svc) {
+  if (typeof svc?.saveWorkflowAs === "function") {
+    return async (wf, effectiveName) => {
+      await svc.saveWorkflowAs(wf, { filename: effectiveName });
+      // saveWorkflowAs makes the new copy the active workflow.
+      return baseName(svc.activeWorkflow?.filename) || effectiveName;
+    };
+  }
+  // `openWorkflow` is MANDATORY for this path, not optional. The object saveAs
+  // returns is UNLOADED (no changeTracker → activeState === null), and
+  // ComfyWorkflow.save() serializes `activeState ?? null` — so persisting a copy
+  // that was never opened writes the string "null" (a saved-but-empty workflow)
+  // while reporting success. Opening it first populates changeTracker/activeState
+  // from the graph AND makes it the active tab. If a frontend exposes saveAs +
+  // saveWorkflow but NOT openWorkflow, we CANNOT persist real content, so we must
+  // NOT select this adapter — return null and let the caller refuse rather than
+  // ever call saveWorkflow on an unopened copy.
+  if (
+    typeof svc?.saveAs === "function" &&
+    typeof svc?.saveWorkflow === "function" &&
+    typeof svc?.openWorkflow === "function"
+  ) {
+    return async (wf, effectiveName, finalTargetPath) => {
+      // saveAs builds the copy in memory at the resolved target path (source
+      // object untouched); the source's on-disk file is never referenced, so it
+      // cannot be moved/destroyed (#226).
+      const copy = svc.saveAs(wf, finalTargetPath);
+      if (!copy) {
+        throw new Error("save-as (copy) failed to create a copy on this frontend");
+      }
+      // Mirror the frontend's own Save-As sequence: OPEN/activate the copy
+      // (loads the graph into changeTracker/activeState, makes it active), THEN
+      // persist — so save() writes the real graph, not null. A throw here aborts
+      // BEFORE any saveWorkflow, so a failed open never persists null.
+      await svc.openWorkflow(copy);
+      copy.changeTracker?.prepareForSave?.();
+      await svc.saveWorkflow(copy);
+      return baseName(svc.activeWorkflow?.filename) || baseName(copy.filename) || effectiveName;
+    };
+  }
+  return null;
+}
+
 /** TRI-STATE classification of whether the source is backed by a real file on
  *  disk — independent of the volatile in-memory flags, which drift after an
  *  open-ack race (#215). Returns:
@@ -225,7 +298,7 @@ function confirmedAbsentAt(svc, rawPath) {
  *  would classify a drifted-temporary REAL file as never-persisted and then move
  *  (destroy) it (#226). With NO oracle we can prove nothing → "unknown" → refuse,
  *  so the only path that ever renames is one the oracle proves has no file. */
-function classifySource(svc, wf, rawPath) {
+async function classifySource(svc, wf, rawPath, existsOnDisk) {
   if (wf?.isPersisted === true) return "persisted";
 
   const norm = normalizePath(rawPath);
@@ -273,6 +346,27 @@ function classifySource(svc, wf, rawPath) {
   // grants move rights. No oracle / oracle threw ⇒ unknown ⇒ refuse.
   if (confirmedAbsent && wf?.isTemporary === true && wf?.isPersisted !== true) {
     return "never-persisted";
+  }
+
+  // The in-memory oracles were inconclusive. On 1.47.x `getWorkflowByPath` is
+  // backed by the in-memory store, which HOLDS open temporary tabs at their
+  // "workflows/Unsaved Workflow (N).json" path — so it returns the non-persisted
+  // temp object for BOTH a genuinely never-saved tab (issue #268) and a drifted
+  // real file (#226/#215). They are indistinguishable in memory; only the disk
+  // can tell them apart. Consult the authoritative filesystem oracle: a proven
+  // ABSENCE (404) means there is no backing file to destroy → never-persisted
+  // (safe to ground); a proven PRESENCE means a real file → persisted (refuse).
+  // Unknown/failure changes nothing (stays "unknown" → refuse), so this only
+  // ever ADDS safe grounds to save and never weakens the #226 refusal.
+  if (typeof existsOnDisk === "function" && wf?.isPersisted !== true) {
+    let exists = null;
+    try {
+      exists = await existsOnDisk(norm);
+    } catch {
+      exists = null; // probe failed ⇒ unknown ⇒ fall through to refuse
+    }
+    if (exists === false) return "never-persisted";
+    if (exists === true) return "persisted";
   }
   return "unknown";
 }
