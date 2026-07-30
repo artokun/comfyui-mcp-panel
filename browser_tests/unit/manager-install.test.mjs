@@ -12,6 +12,8 @@ import {
   buildInstallRequest,
   parseInstalled,
   nodeInstalledMatches,
+  queueFailureSignal,
+  classifyInstallOutcome,
 } from "../../web/js/lib/manager-install.js";
 
 test("looksLikeGitUrl recognizes every git protocol", () => {
@@ -131,43 +133,6 @@ test("parseInstalled normalizes the legacy array shape (and bare strings)", () =
   assert.equal(nodes[1].module, "rgthree-comfy");
 });
 
-// The install target the handler verifies is buildInstallRequest's id (already
-// the repo NAME for a git URL) — assert the land/didn't-land decision per dialect.
-for (const dialect of ["v2", "v2-batch", "legacy"]) {
-  const targetOf = (args) => {
-    const req = buildInstallRequest(dialect, args, "uid-1");
-    return dialect === "v2" ? req.params.id : req.body.id;
-  };
-
-  test(`${dialect}: registry install that LANDED verifies as success`, () => {
-    const target = targetOf({ id: "rgthree-comfy" });
-    const installed = { "rgthree-comfy": { ver: "1.0.0", cnr_id: "rgthree-comfy" } };
-    assert.equal(nodeInstalledMatches(target, installed), true);
-  });
-
-  test(`${dialect}: registry install that did NOT land is an error, not success`, () => {
-    const target = targetOf({ id: "rgthree-comfy" });
-    // Queue drained "done" but the pack is absent — the #232 silent-failure case.
-    const installed = { "some-other-pack": { ver: "1.0.0" } };
-    assert.equal(nodeInstalledMatches(target, installed), false);
-  });
-
-  test(`${dialect}: git-URL install that LANDED (matched by repo name) verifies`, () => {
-    const url = "https://github.com/rgthree/rgthree-comfy.git";
-    const target = targetOf({ repository: url });
-    // Manager records the git pack under its repo-name module dir.
-    const installed = { "rgthree-comfy": { ver: "nightly", aux_id: "rgthree/rgthree-comfy" } };
-    assert.equal(nodeInstalledMatches(target, installed), true);
-  });
-
-  test(`${dialect}: git-URL install that did NOT land is an error, not success`, () => {
-    const url = "https://github.com/TenStrip/10S-Comfy-nodes.git";
-    const target = targetOf({ repository: url });
-    const installed = {}; // nothing installed — exactly the #232 report
-    assert.equal(nodeInstalledMatches(target, installed), false);
-  });
-}
-
 test("nodeInstalledMatches accepts a full git URL directly and matches by repo name", () => {
   const installed = { "rgthree-comfy": { cnr_id: "rgthree-comfy" } };
   assert.equal(
@@ -177,3 +142,115 @@ test("nodeInstalledMatches accepts a full git URL directly and matches by repo n
   assert.equal(nodeInstalledMatches(undefined, installed), false);
   assert.equal(nodeInstalledMatches("rgthree-comfy", {}), false);
 });
+
+// --- queueFailureSignal: only explicit evidence counts ----------------------
+test("queueFailureSignal fires only on explicit error/failed evidence", () => {
+  assert.equal(queueFailureSignal({ error_count: 1 }), true);
+  assert.equal(queueFailureSignal({ failed_count: 2 }), true);
+  assert.equal(queueFailureSignal({ failed: ["x"] }), true);
+  // A clean/absent status is NOT failure evidence (the #232 trap).
+  assert.equal(queueFailureSignal({ is_processing: false, done_count: 1, total_count: 1 }), false);
+  assert.equal(queueFailureSignal({ error_count: 0, failed: [] }), false);
+  assert.equal(queueFailureSignal(null), false);
+});
+
+// --- classifyInstallOutcome: TRI-STATE, no false success / no false failure --
+// The handler verifies buildInstallRequest's id (already the repo NAME for a git
+// URL). Exercise the full outcome decision per dialect end-to-end.
+for (const dialect of ["v2", "v2-batch", "legacy"]) {
+  const targetOf = (args) => {
+    const req = buildInstallRequest(dialect, args, "uid-1");
+    return dialect === "v2" ? req.params.id : req.body.id;
+  };
+
+  test(`${dialect}: pack present ⇒ installed (registry)`, () => {
+    const o = classifyInstallOutcome({
+      target: targetOf({ id: "rgthree-comfy" }),
+      dialect,
+      drained: true,
+      listReadable: true,
+      installed: { "rgthree-comfy": { ver: "1.0.0", cnr_id: "rgthree-comfy" } },
+      status: { is_processing: false, done_count: 1, total_count: 1 },
+    });
+    assert.equal(o.state, "installed");
+  });
+
+  test(`${dialect}: pack present ⇒ installed (git URL, repo-name dir)`, () => {
+    const o = classifyInstallOutcome({
+      target: targetOf({ repository: "https://github.com/rgthree/rgthree-comfy.git" }),
+      dialect,
+      drained: true,
+      listReadable: true,
+      installed: { "rgthree-comfy": { ver: "nightly", aux_id: "rgthree/rgthree-comfy" } },
+      status: {},
+    });
+    assert.equal(o.state, "installed");
+  });
+
+  test(`${dialect}: drained + absent + explicit failure ⇒ failed (no false success)`, () => {
+    const o = classifyInstallOutcome({
+      target: targetOf({ repository: "https://github.com/TenStrip/10S-Comfy-nodes.git" }),
+      dialect,
+      drained: true,
+      listReadable: true,
+      installed: {}, // nothing landed — exactly the #232 report
+      status: { is_processing: false, error_count: 1 },
+    });
+    assert.equal(o.state, "failed");
+    assert.match(o.message, /FAILED/);
+  });
+
+  test(`${dialect}: drained + absent + NO failure signal ⇒ unverified (no false failure)`, () => {
+    const o = classifyInstallOutcome({
+      target: targetOf({ id: "rgthree-comfy" }),
+      dialect,
+      drained: true,
+      listReadable: true,
+      installed: { "some-other-pack": {} },
+      status: { is_processing: false, done_count: 1, total_count: 1 },
+    });
+    assert.equal(o.state, "unverified");
+    assert.notEqual(o.state, "failed");
+  });
+
+  test(`${dialect}: still processing at deadline ⇒ unverified, never failed (>120s install)`, () => {
+    const o = classifyInstallOutcome({
+      target: targetOf({ repository: "https://github.com/big/slow-pack.git" }),
+      dialect,
+      drained: false, // deadline hit while the clone was still running
+      listReadable: true,
+      installed: {},
+      status: { is_processing: true },
+    });
+    assert.equal(o.state, "unverified");
+    assert.match(o.message, /still in progress/);
+  });
+
+  test(`${dialect}: RENAMED install dir (bare module, ≠ repo name) ⇒ unverified, NOT hard-fail`, () => {
+    // The #232 report: TenStrip/10S-Comfy-nodes installs into dir 10S_Nodes.
+    // A bare module name with no cnr_id/aux_id can't positively match the repo
+    // name — that is INCONCLUSIVE, never proof the genuine install failed.
+    const o = classifyInstallOutcome({
+      target: targetOf({ repository: "https://github.com/TenStrip/10S-Comfy-nodes.git" }),
+      dialect,
+      drained: true,
+      listReadable: true,
+      installed: { "10S_Nodes": { ver: "nightly" } }, // it DID land, under a renamed dir
+      status: { is_processing: false, done_count: 1, total_count: 1 }, // no failure signal
+    });
+    assert.notEqual(o.state, "failed");
+    assert.equal(o.state, "unverified");
+  });
+
+  test(`${dialect}: installed-list unreadable ⇒ unverified, never failed`, () => {
+    const o = classifyInstallOutcome({
+      target: targetOf({ id: "rgthree-comfy" }),
+      dialect,
+      drained: true,
+      listReadable: false,
+      installed: null,
+      status: { error_count: 1 }, // even with a failure signal, unreadable list ⇒ inconclusive
+    });
+    assert.equal(o.state, "unverified");
+  });
+}

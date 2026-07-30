@@ -193,3 +193,70 @@ export function nodeInstalledMatches(idOrUrl, installed) {
     return candidates.includes(wanted) || candidates.includes(repoName);
   });
 }
+
+/** Positive evidence from a queue/status payload that the run actually FAILED.
+ *  Most Manager builds expose no per-task result on queue/status, so this only
+ *  fires on an explicit error/failed count or array — NEVER inferred from a
+ *  missing pack (that is inconclusive, not proof; #232). */
+export function queueFailureSignal(status) {
+  if (!status || typeof status !== "object") return false;
+  for (const k of ["error_count", "failed_count", "fail_count"]) {
+    if (typeof status[k] === "number" && status[k] > 0) return true;
+  }
+  if (Array.isArray(status.failed) && status.failed.length > 0) return true;
+  return false;
+}
+
+/**
+ * Decide the TRUE outcome of an install after it was queued+started (#232 /
+ * codex round 1). Pure so it is unit-testable without the browser Manager
+ * client. Three states — never a false success and never a false failure:
+ *   - "installed":  pack positively present in the installed list.
+ *   - "failed":     the queue truly drained AND the list was readable AND the
+ *                   Manager surfaced explicit failure evidence AND the pack is
+ *                   absent. Only then is absence proof.
+ *   - "unverified": everything else — still processing at the deadline, status
+ *                   or list unreadable, or drained-but-absent with no failure
+ *                   signal (e.g. a renamed install dir the name-match can't
+ *                   confirm). Honest "could not confirm", NOT success/failure.
+ * @param {{ target:string, dialect?:string, drained:boolean,
+ *           listReadable:boolean, installed:unknown, status:unknown }} input
+ */
+export function classifyInstallOutcome({
+  target,
+  dialect,
+  drained,
+  listReadable,
+  installed,
+  status,
+}) {
+  if (listReadable && nodeInstalledMatches(target, installed)) {
+    return { state: "installed", status };
+  }
+  if (drained && listReadable && queueFailureSignal(status)) {
+    return {
+      state: "failed",
+      status,
+      message:
+        `"${target}" install FAILED: the ComfyUI-Manager queue finished and reported ` +
+        `a failure, and the pack is not present in custom_nodes` +
+        (dialect ? ` (dialect ${dialect})` : "") +
+        `. Check the pack id / git URL and the ComfyUI server log (security_level ` +
+        `gating is a common cause).`,
+    };
+  }
+  const why = !drained
+    ? "the install is still in progress (the Manager queue had not drained)"
+    : !listReadable
+      ? "the installed-nodes list could not be read"
+      : "the pack was not found by name (its install directory may differ from the repo name)";
+  return {
+    state: "unverified",
+    status,
+    message:
+      `"${target}" was queued but could NOT be confirmed installed — ${why}. This is ` +
+      `not a reported failure. Poll panel_node_queue_status and VERIFY with ` +
+      `panel_list_nodes; a ComfyUI restart (comfy_reboot) is usually required to load ` +
+      `new nodes. If it still does not appear, check the ComfyUI server log.`,
+  };
+}
