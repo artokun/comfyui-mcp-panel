@@ -102,6 +102,12 @@ import {
 } from "./lib/asset-staleness.js";
 import { applyWidgetWrite, WidgetWriteError } from "./lib/widget-write.js";
 import { coerceMessageText, isDroppedAgentReplay } from "./lib/chat-serialize.js";
+import {
+  recordCopiedNodes,
+  getCopiedSnapshot,
+  diffCopiedVsPasted,
+  formatDroppedWarning,
+} from "./lib/paste-report.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
 import { saveActiveWorkflow } from "./lib/workflow-save.js";
 
@@ -6234,6 +6240,9 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!count) {
       throw new Error("nothing selected to copy — pass node_ids or select nodes first");
     }
+    // Snapshot the copied node types so the next graph_paste_nodes can detect
+    // any node the target frontend silently drops on paste (#261).
+    recordCopiedNodes(selected);
     canvas.copyToClipboard(selected);
     return { copied: count };
   },
@@ -6260,7 +6269,22 @@ const GRAPH_TOOL_EXECUTORS = {
     const pasted = (graph._nodes ?? [])
       .filter((n) => !before.has(n.id))
       .map((n) => summarizeNode(n));
-    return { pasted_count: pasted.length, pasted_node_ids: pasted.map((n) => n.id), pasted };
+    // Surface any node the frontend silently DROPPED on paste (an unregistered
+    // node type such as AudioCrop/AudioSeparation) instead of quietly reducing
+    // the count (#261). Diff the clipboard snapshot from the matching
+    // graph_copy_nodes against what actually landed, matched by node type.
+    const { dropped, dropped_count, dropped_types } = diffCopiedVsPasted(
+      getCopiedSnapshot(),
+      pasted,
+    );
+    const result = { pasted_count: pasted.length, pasted_node_ids: pasted.map((n) => n.id), pasted };
+    if (dropped_count > 0) {
+      result.dropped_count = dropped_count;
+      result.dropped_nodes = dropped;
+      result.dropped_types = dropped_types;
+      result.warning = formatDroppedWarning(dropped);
+    }
+    return result;
   },
 
   // ---- Subgraph blueprints (SAVE / LIST / ADD reusable subgraphs) -----------
