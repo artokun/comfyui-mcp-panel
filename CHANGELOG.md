@@ -30,7 +30,11 @@ All notable changes to this project are documented here. This project adheres to
   repo NAME is derived from the URL: v4 installs by `{id: repoName,
   selected_version: ref||"nightly", channel: "dev"}` (no `files`); v2-batch and
   legacy install the URL natively via `{id: repoName, version: "unknown",
-  files: [url]}`. Registry-id installs are unchanged.
+  files: [url]}`. Registry-id installs are unchanged. Recognizes every git
+  protocol (`https://`, `ssh://`, `git://`, `git+…`, scp-form
+  `git@host:owner/repo`, and `.git` suffix) whether the URL arrives via `id` or
+  `repository`. The routing helpers were extracted to
+  `web/js/lib/manager-install.js` with `node --test` unit coverage.
 - **Pre-empt the coming comfy-cli hard error.** Publishing already warns that
   "we will soon disable exec and eval, and multiple statements in a single
   line"; when that lands it breaks `Publish to Comfy Registry`, i.e. we'd find

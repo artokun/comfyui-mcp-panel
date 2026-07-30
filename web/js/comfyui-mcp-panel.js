@@ -66,6 +66,7 @@ import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
+import { buildInstallRequest } from "./lib/manager-install.js";
 import {
   CHAT_HISTORY_MAX_IMPORT_BYTES,
   CHAT_HISTORY_SCHEMA,
@@ -2579,66 +2580,6 @@ function assertBatchOk(res, id, op) {
         "gating is a common cause). The pack was NOT installed.",
     );
   }
-}
-
-/** Does this identifier look like a git URL (vs a registry id)? Mirrors the mcp
- *  orchestrator's looksLikeGitUrl. */
-function looksLikeGitUrl(s) {
-  return typeof s === "string" && (/^(https?:\/\/|git@|git\+)/i.test(s) || s.endsWith(".git"));
-}
-
-/** Derive the repo/pack NAME from a git URL — the Manager keys installs off this,
- *  NOT a full URL. Mirrors gitCheckoutDir: strip query/hash/trailing slash, take
- *  the basename, drop a trailing ".git". */
-function gitRepoName(url) {
-  const pathPart = url.includes(":") && !url.includes("://")
-    ? url.slice(url.lastIndexOf(":") + 1) // scp-style git@host:owner/repo
-    : url;
-  const clean = pathPart.replace(/[?#].*$/, "").replace(/\/+$/, "");
-  const base = clean.slice(clean.lastIndexOf("/") + 1);
-  return base.replace(/\.git$/i, "");
-}
-
-/**
- * Resolve the git URL for an install request, if any. The caller may pass the
- * URL as `repository` OR directly as `id`; either counts.
- */
-function installGitUrl({ id, repository }) {
-  if (repository && looksLikeGitUrl(repository)) return repository;
-  if (id && looksLikeGitUrl(id)) return id;
-  return null;
-}
-
-/**
- * Build the 3.x-shape install body used by the legacy + v2-batch dialects.
- * A REAL git URL installs natively via { version:'unknown', files:[url] }
- * (the 3.x semantics — the pip legacy-UI /v2 batch runs the same handlers);
- * a registry id keeps the versioned body. `id` is always the repo NAME, never
- * a full URL (a full URL is accepted into the batch but fails LATER while
- * resolving — a failure NOT in the immediate `failed` array).
- */
-function manager3xInstallBody({ id, version, repository, channel, mode, selected_version }, ui_id) {
-  const gitUrl = installGitUrl({ id, repository });
-  if (gitUrl) {
-    return {
-      ui_id,
-      id: gitRepoName(gitUrl),
-      version: "unknown",
-      selected_version: "unknown",
-      files: [gitUrl],
-      channel: channel || "default",
-      mode: mode || "cache",
-    };
-  }
-  const sel = selected_version || version || "latest";
-  return {
-    ui_id,
-    id,
-    version: version ?? sel,
-    selected_version: sel,
-    channel: channel || "default",
-    mode: mode || "cache",
-  };
 }
 
 /** Build a ComfyUI /view URL for an output image descriptor. */
@@ -6806,7 +6747,8 @@ const GRAPH_TOOL_EXECUTORS = {
     return { installed: await managerGet("customnode/installed") };
   },
 
-  async nodes_install({ id, version, repository, channel, mode, selected_version }) {
+  async nodes_install(args) {
+    const { id, repository } = args ?? {};
     if (!id && !repository) {
       throw new Error("id (registry id or author/repo) or repository (git URL) is required");
     }
@@ -6817,58 +6759,32 @@ const GRAPH_TOOL_EXECUTORS = {
       "Install queued. Poll nodes_queue_status, then VERIFY with panel_list_nodes " +
       "(the pack must appear on disk); a ComfyUI restart (comfy_reboot) is usually " +
       "required to load new nodes.";
-    const gitUrl = installGitUrl({ id, repository });
+    // buildInstallRequest (./lib/manager-install.js) derives the repo NAME for a
+    // git URL (arriving via id OR repository, any protocol) and picks the right
+    // per-dialect payload — issues #187/#182/#184. A full URL is never sent as
+    // `id` (v4 would silently mark it "done"; 3.x fails late, past `failed`).
+    const req = buildInstallRequest(dialect, args, ui_id);
     if (dialect === "v2") {
-      let params;
-      if (gitUrl) {
-        // Manager v4 resolves an install by the pack's REPO NAME / CNR id, NOT a
-        // full git URL (do_install splits `${id}@${selected_version}` and looks
-        // it up — a full URL matches nothing and the queue silently marks the
-        // task "done"). Mirror the frontend UI: id = repo name, selected_version
-        // = ref or "nightly" (git-HEAD channel for unclaimed packs), channel
-        // "dev", mode "cache". No `repository`/`files` for v4.
-        const selected = selected_version || version || "nightly";
-        params = {
-          id: gitRepoName(gitUrl),
-          version: selected,
-          selected_version: selected,
-          channel: channel || "dev",
-          mode: mode || "cache",
-        };
-      } else {
-        const sel = selected_version || version || "latest";
-        params = {
-          id,
-          version: version || sel,
-          selected_version: sel,
-          mode: mode || "remote",
-          channel: channel || "default",
-        };
-      }
       await managerV2("manager/queue/task", {
         method: "POST",
-        body: { kind: "install", params, ui_id, client_id },
+        body: { kind: "install", params: req.params, ui_id, client_id },
       });
       await managerV2("manager/queue/start", { method: "POST" });
-      return { queued: true, ui_id, id: params.id, dialect, note };
+      return { queued: true, ui_id, id: req.params.id, dialect, note };
     }
-    // v2-batch + legacy: 3.x body shapes (issues #187/#182/#184 — the unified
-    // /v2 task route 405s on both). A git URL installs natively via
-    // {version:'unknown', files:[url]}; id is always the repo NAME. Surface a
-    // batch `failed` instead of silently claiming success (the rgthree #184 no-op).
-    const body = manager3xInstallBody({ id, version, repository, channel, mode, selected_version }, ui_id);
     if (dialect === "v2-batch") {
       const res = await managerV2("manager/queue/batch", {
         method: "POST",
-        body: { install: [body] },
+        body: { install: [req.body] },
       });
-      assertBatchOk(res, body.id, "install");
+      // Surface a batch `failed` instead of silently claiming success (#184).
+      assertBatchOk(res, req.body.id, "install");
       await managerV2("manager/queue/start", { method: "POST" });
     } else {
-      await managerCall("manager/queue/install", { method: "POST", body });
+      await managerCall("manager/queue/install", { method: "POST", body: req.body });
       await managerCall("manager/queue/start", { method: "POST" });
     }
-    return { queued: true, ui_id, id: body.id, dialect, note };
+    return { queued: true, ui_id, id: req.body.id, dialect, note };
   },
 
   // Update an ALREADY-INSTALLED pack to latest/nightly via the built-in Manager.
