@@ -66,6 +66,7 @@ import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
+import { buildInstallRequest } from "./lib/manager-install.js";
 import {
   CHAT_HISTORY_MAX_IMPORT_BYTES,
   CHAT_HISTORY_SCHEMA,
@@ -2439,6 +2440,114 @@ async function managerV2(route, { method = "GET", body } = {}) {
   }
   const txt = await res.text();
   return txt ? JSON.parse(txt) : null;
+}
+
+/** Like managerV2 but hits an ABSOLUTE route (NO /v2 prefix). Used for the
+ *  released 3.x ComfyUI-Manager whose queue lives under /manager/* with
+ *  per-operation routes. Same error handling as managerV2. */
+async function managerCall(route, { method = "GET", body } = {}) {
+  const res = await api.fetchApi(`/${route}`, {
+    method,
+    ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
+  });
+  if (!res || res.status === 404) {
+    throw new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)");
+  }
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try {
+      const j = await res.json();
+      if (j?.message) msg = j.message;
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new Error(`Manager ${route}: ${msg}`);
+  }
+  const txt = await res.text();
+  return txt ? JSON.parse(txt) : null;
+}
+
+// --- Manager generation detection (issues #187 #182 #184) -------------------
+// The /v2/manager/* task API exists only on the Manager v4 lineage. Three
+// dialects appear in the wild (mirrors the mcp orchestrator's detectManagerApi
+// in src/services/node-management.ts):
+//   "v2"       pip comfyui_manager v4, normal mode — unified POST
+//              /v2/manager/queue/task envelope {ui_id, client_id, kind, params}.
+//   "v2-batch" pip v4 started with --enable-manager-legacy-ui: /v2 GET routes
+//              exist but POST /v2/manager/queue/task 405s (frontend catchall).
+//              Mutations go through POST /v2/manager/queue/batch with 3.x body
+//              shapes {<op>:[body]}; failures reported as {failed:[id]}.
+//   "legacy"   released 3.x custom-node Manager — NO /v2 prefix; per-operation
+//              routes /manager/queue/{install,update,start,status,...}.
+let managerDialectCache = null;
+
+/** Soft GET probe: parsed JSON, or null on any non-ok / 404 / throw. Never
+ *  throws — a probe must not blow up detection. */
+async function managerProbe(route) {
+  try {
+    const res = await api.fetchApi(route, { method: "GET" });
+    if (!res || !res.ok) return null;
+    const txt = await res.text();
+    return txt ? JSON.parse(txt) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A real queue/status payload — guards against SPA/index catchalls that answer
+ *  200 with HTML for unknown GETs. */
+function looksLikeQueueStatus(s) {
+  return (
+    !!s &&
+    typeof s === "object" &&
+    (typeof s.total_count === "number" || typeof s.is_processing === "boolean")
+  );
+}
+
+/** Detect (and cache per session) which Manager generation the connected
+ *  ComfyUI runs. See the dialect comment above. */
+async function detectManagerDialect() {
+  if (managerDialectCache) return managerDialectCache;
+  const v2 = await managerProbe("/v2/manager/queue/status");
+  if (looksLikeQueueStatus(v2)) {
+    const legacyUi = await managerProbe("/v2/manager/is_legacy_manager_ui");
+    managerDialectCache =
+      legacyUi && typeof legacyUi === "object" && legacyUi.is_legacy_manager_ui === true
+        ? "v2-batch"
+        : "v2";
+    return managerDialectCache;
+  }
+  const legacy = await managerProbe("/manager/queue/status");
+  if (looksLikeQueueStatus(legacy)) {
+    managerDialectCache = "legacy";
+    return managerDialectCache;
+  }
+  throw new Error(
+    "ComfyUI-Manager's queue API is not reachable (neither /v2/manager/queue/status " +
+      "nor /manager/queue/status answered with a queue status). Is the built-in " +
+      "Manager installed and enabled on the connected ComfyUI?",
+  );
+}
+
+/** GET the queue status / installed / getmappings surface for the detected
+ *  dialect. Legacy has NO /v2 prefix; both pip modes serve /v2. */
+async function managerGet(route) {
+  const dialect = await detectManagerDialect();
+  return dialect === "legacy" ? managerCall(route) : managerV2(route);
+}
+
+/** Throw if a /v2/manager/queue/batch response reported the target id as failed.
+ *  The batch runs synchronously and surfaces failures as {failed:[id,...]} — a
+ *  silent success on a failed op is exactly the #184 no-op bug. */
+function assertBatchOk(res, id, op) {
+  const failed = Array.isArray(res?.failed) ? res.failed : [];
+  if (failed.length && (id === undefined || failed.includes(id))) {
+    throw new Error(
+      `ComfyUI-Manager batch reported the ${op} of "${String(id ?? "?")}" as failed ` +
+        "(check the ComfyUI server log for the underlying error — security_level " +
+        "gating is a common cause). The pack was NOT installed.",
+    );
+  }
 }
 
 /** Build a ComfyUI /view URL for an output image descriptor. */
@@ -6579,7 +6688,7 @@ const GRAPH_TOOL_EXECUTORS = {
 
   // --- Custom-node management via the BUILT-IN ComfyUI Manager (/v2 API) ----
   async nodes_search({ query, limit }) {
-    const data = await managerV2("customnode/getmappings?mode=cache");
+    const data = await managerGet("customnode/getmappings?mode=cache");
     const q = String(query ?? "").toLowerCase();
     const out = [];
     const push = (id, title, desc) => {
@@ -6603,35 +6712,47 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   async nodes_list() {
-    return { installed: await managerV2("customnode/installed") };
+    return { installed: await managerGet("customnode/installed") };
   },
 
-  async nodes_install({ id, version, repository, channel, mode, selected_version }) {
+  async nodes_install(args) {
+    const { id, repository } = args ?? {};
     if (!id && !repository) {
       throw new Error("id (registry id or author/repo) or repository (git URL) is required");
     }
-    const sel = selected_version || version || (repository ? "nightly" : "latest");
-    const params = {
-      id: id ?? repository,
-      version: version || (sel === "nightly" ? "nightly" : "latest"),
-      selected_version: sel,
-      ...(repository ? { repository } : {}),
-      mode: mode || "remote",
-      channel: channel || "default",
-    };
+    const dialect = await detectManagerDialect();
     const ui_id = crypto.randomUUID();
     const client_id = api.clientId ?? api.initialClientId ?? "comfyui-mcp-panel";
-    await managerV2("manager/queue/task", {
-      method: "POST",
-      body: { kind: "install", params, ui_id, client_id },
-    });
-    await managerV2("manager/queue/start", { method: "POST" });
-    return {
-      queued: true,
-      ui_id,
-      id: params.id,
-      note: "Install queued. Poll nodes_queue_status; a ComfyUI restart (comfy_reboot) is usually required to load new nodes.",
-    };
+    const note =
+      "Install queued. Poll nodes_queue_status, then VERIFY with panel_list_nodes " +
+      "(the pack must appear on disk); a ComfyUI restart (comfy_reboot) is usually " +
+      "required to load new nodes.";
+    // buildInstallRequest (./lib/manager-install.js) derives the repo NAME for a
+    // git URL (arriving via id OR repository, any protocol) and picks the right
+    // per-dialect payload — issues #187/#182/#184. A full URL is never sent as
+    // `id` (v4 would silently mark it "done"; 3.x fails late, past `failed`).
+    const req = buildInstallRequest(dialect, args, ui_id);
+    if (dialect === "v2") {
+      await managerV2("manager/queue/task", {
+        method: "POST",
+        body: { kind: "install", params: req.params, ui_id, client_id },
+      });
+      await managerV2("manager/queue/start", { method: "POST" });
+      return { queued: true, ui_id, id: req.params.id, dialect, note };
+    }
+    if (dialect === "v2-batch") {
+      const res = await managerV2("manager/queue/batch", {
+        method: "POST",
+        body: { install: [req.body] },
+      });
+      // Surface a batch `failed` instead of silently claiming success (#184).
+      assertBatchOk(res, req.body.id, "install");
+      await managerV2("manager/queue/start", { method: "POST" });
+    } else {
+      await managerCall("manager/queue/install", { method: "POST", body: req.body });
+      await managerCall("manager/queue/start", { method: "POST" });
+    }
+    return { queued: true, ui_id, id: req.body.id, dialect, note };
   },
 
   // Update an ALREADY-INSTALLED pack to latest/nightly via the built-in Manager.
@@ -6642,34 +6763,47 @@ const GRAPH_TOOL_EXECUTORS = {
   async graph_update_node({ id, version, channel, mode }) {
     if (!id) throw new Error("id (installed pack name/dir or registry id) is required");
     const sel = version === "nightly" ? "nightly" : "latest";
-    const params = {
-      // The Manager's update task keys off node_name; include id too for
-      // correlation parity with install (harmless if the server ignores it).
-      node_name: id,
-      id,
-      selected_version: sel,
-      version: sel,
-      mode: mode || "remote",
-      channel: channel || "default",
-    };
+    const dialect = await detectManagerDialect();
     const ui_id = crypto.randomUUID();
     const client_id = api.clientId ?? api.initialClientId ?? "comfyui-mcp-panel";
-    await managerV2("manager/queue/task", {
-      method: "POST",
-      body: { kind: "update", params, ui_id, client_id },
-    });
-    await managerV2("manager/queue/start", { method: "POST" });
-    return {
-      queued: true,
-      ui_id,
-      id,
-      version: sel,
-      note: "Update queued. Poll nodes_queue_status; a ComfyUI restart (comfy_reboot) is usually required to load the updated node.",
-    };
+    const note =
+      "Update queued. Poll nodes_queue_status; a ComfyUI restart (comfy_reboot) is usually required to load the updated node.";
+    if (dialect === "v2") {
+      const params = {
+        // The Manager's update task keys off node_name; include id too for
+        // correlation parity with install (harmless if the server ignores it).
+        node_name: id,
+        id,
+        selected_version: sel,
+        version: sel,
+        mode: mode || "remote",
+        channel: channel || "default",
+      };
+      await managerV2("manager/queue/task", {
+        method: "POST",
+        body: { kind: "update", params, ui_id, client_id },
+      });
+      await managerV2("manager/queue/start", { method: "POST" });
+      return { queued: true, ui_id, id, version: sel, dialect, note };
+    }
+    // v2-batch + legacy: 3.x update body {ui_id, id, version} (issues #187/#182).
+    const body = { ui_id, id, version: sel };
+    if (dialect === "v2-batch") {
+      const res = await managerV2("manager/queue/batch", {
+        method: "POST",
+        body: { update: [body] },
+      });
+      assertBatchOk(res, id, "update");
+      await managerV2("manager/queue/start", { method: "POST" });
+    } else {
+      await managerCall("manager/queue/update", { method: "POST", body });
+      await managerCall("manager/queue/start", { method: "POST" });
+    }
+    return { queued: true, ui_id, id, version: sel, dialect, note };
   },
 
   async nodes_queue_status() {
-    return { status: await managerV2("manager/queue/status") };
+    return { status: await managerGet("manager/queue/status") };
   },
 
   async comfy_reboot({ force } = {}) {
