@@ -257,22 +257,51 @@ function bracedBlockAfter(text, fromIndex) {
   return null
 }
 
+// The member-access sub-pattern for method `m` in BOTH forms — dot `.m` and
+// bracket `["m"]` — so a guard/call written either way is recognised.
+function memberAccessPat(m) {
+  return `(?:\\.${m}\\b|\\[\\s*["']${m}["']\\s*\\])`
+}
+
+// The `if (…)` condition text that ENCLOSES the offset `from` (scan back to the
+// `(` at paren-depth 0), or null if `from` is not directly inside a parenthesised
+// condition. Used to prove a typeof guard truly gates its if-body.
+function enclosingConditionBefore(text, from) {
+  let depth = 0
+  for (let i = from - 1; i >= 0; i--) {
+    const ch = text[i]
+    if (ch === ')') depth++
+    else if (ch === '(') {
+      if (depth === 0) return { open: i, cond: text.slice(i + 1, from) }
+      depth--
+    }
+  }
+  return null
+}
+
 function guardRegionsFor(text, m) {
   const regions = []
+  const member = memberAccessPat(m)
   // typeof guard. Only bless a region the guard ACTUALLY controls — never merely
-  // "the next `{` after a typeof somewhere", and never a `||` tail (which CALLS
-  // the method precisely when it is ABSENT).
-  const typeofRe = new RegExp(`typeof\\s+[\\w.?$]*\\.${m}\\s*===?\\s*["']function["']`, 'g')
+  // "the next `{` after a typeof somewhere", and never an `||` condition/tail
+  // (which CALLS the method precisely when it is ABSENT).
+  const typeofRe = new RegExp(`typeof\\s+[\\w.?$]*${member}\\s*===?\\s*["']function["']`, 'g')
   let g
   while ((g = typeofRe.exec(text))) {
     const after = text.slice(typeofRe.lastIndex)
-    // (a) if-body: the typeof is the CLOSING (AND-)term of an `if (…)` whose body
-    //     opens immediately — only `)` + whitespace between the check and the `{`.
-    //     `if (!target && typeof s.m === "function") { … s.m() … }` matches; a
-    //     stray `typeof` elsewhere followed by an unrelated block does not.
+    // (a) if-body: the typeof is the CLOSING term of an `if (…)` whose body opens
+    //     immediately — only `)` + whitespace between the check and the `{` — AND
+    //     the whole condition is AND-composed (no `||`). `if (ready || typeof s.m
+    //     === "function") {` is REJECTED: the body runs with `ready` true even
+    //     when the method is absent. `if (!target && typeof s.m==="function") {`
+    //     is accepted.
     if (/^\s*\)\s*\{/.test(after)) {
-      const block = bracedBlockAfter(text, typeofRe.lastIndex)
-      if (block) regions.push(block)
+      const enc = enclosingConditionBefore(text, g.index)
+      const isIf = enc && /\b(?:else\s+)?if\s*$/.test(text.slice(Math.max(0, enc.open - 12), enc.open))
+      if (enc && isIf && !enc.cond.includes('||')) {
+        const block = bracedBlockAfter(text, typeofRe.lastIndex)
+        if (block) regions.push(block)
+      }
     }
     // (b) inline short-circuit: `typeof x.m === "function" && x.m()`. Require `&&`
     //     to the RIGHT so `typeof … === "function" || x.m()` (calls when ABSENT)
@@ -314,15 +343,20 @@ test('EVERY OPTIONAL-method call site is capability-guarded in source (per call 
   const src = stripComments(readFileSync(SAVE_LIB, 'utf8')) + '\n' + stripComments(readFileSync(PANEL, 'utf8'))
   for (const m of OPTIONAL_METHODS) {
     const regions = guardRegionsFor(src, m)
-    // Match both `<acc>.m(` and the self-guarding `<acc>.m?.(`. Group 1 present =>
-    // optional invocation => guarded regardless of surrounding region.
-    const callRe = new RegExp(`\\.${m}\\s*(\\?\\.)?\\(`, 'g')
+    // Match a CALL of the method in every form — dot `<acc>.m(`, bracket
+    // `<acc>["m"](`, and their self-guarding optional-invocation variants
+    // `<acc>.m?.(` / `<acc>["m"]?.(`. A captured `?.` (either group) => optional
+    // invocation => guarded regardless of surrounding region.
+    const callRe = new RegExp(
+      `(?:\\.${m}\\s*(\\?\\.)?\\(|\\[\\s*["']${m}["']\\s*\\]\\s*(\\?\\.)?\\()`,
+      'g'
+    )
     let call
     let sites = 0
     while ((call = callRe.exec(src))) {
       sites++
       const at = call.index
-      const optionalInvoke = Boolean(call[1])
+      const optionalInvoke = Boolean(call[1] || call[2])
       const inRegion = regions.some(([o, c]) => at >= o && at <= c)
       assert.ok(
         optionalInvoke || inRegion,
