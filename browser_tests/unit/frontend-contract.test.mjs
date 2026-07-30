@@ -279,15 +279,26 @@ function enclosingConditionBefore(text, from) {
   return null
 }
 
+// Normalise a receiver expression so a guard and a call written with slightly
+// different chaining punctuation compare equal: drop whitespace and optional-chain
+// `?`, so `app?.extensionManager?.workflow` === `app.extensionManager.workflow`.
+const normRecv = (r) => String(r || '').replace(/[\s?]/g, '')
+
+// Regions are receiver-AWARE. A typeof/inline guard only protects calls on the
+// SAME receiver it tested — `typeof other.m === "function"` does NOT guard
+// `s.m()`. A try/catch region uses recv=null, meaning "protects any receiver"
+// (the thrown TypeError is caught regardless of who the receiver was).
 function guardRegionsFor(text, m) {
   const regions = []
   const member = memberAccessPat(m)
   // typeof guard. Only bless a region the guard ACTUALLY controls — never merely
   // "the next `{` after a typeof somewhere", and never an `||` condition/tail
-  // (which CALLS the method precisely when it is ABSENT).
-  const typeofRe = new RegExp(`typeof\\s+[\\w.?$]*${member}\\s*===?\\s*["']function["']`, 'g')
+  // (which CALLS the method precisely when it is ABSENT). Group 1 = the receiver
+  // the guard tested.
+  const typeofRe = new RegExp(`typeof\\s+([\\w$][\\w$.?]*?)${member}\\s*===?\\s*["']function["']`, 'g')
   let g
   while ((g = typeofRe.exec(text))) {
+    const recv = normRecv(g[1])
     const after = text.slice(typeofRe.lastIndex)
     // (a) if-body: the typeof is the CLOSING term of an `if (…)` whose body opens
     //     immediately — only `)` + whitespace between the check and the `{` — AND
@@ -300,32 +311,40 @@ function guardRegionsFor(text, m) {
       const isIf = enc && /\b(?:else\s+)?if\s*$/.test(text.slice(Math.max(0, enc.open - 12), enc.open))
       if (enc && isIf && !enc.cond.includes('||')) {
         const block = bracedBlockAfter(text, typeofRe.lastIndex)
-        if (block) regions.push(block)
+        if (block) regions.push([block[0], block[1], recv])
       }
     }
     // (b) inline short-circuit: `typeof x.m === "function" && x.m()`. Require `&&`
     //     to the RIGHT so `typeof … === "function" || x.m()` (calls when ABSENT)
-    //     is NOT blessed. Guard the rest of the statement to the next `;`/newline.
+    //     is NOT blessed. Guard runs only to the next `;`/newline OR the next `||`
+    //     — once an `||` appears the AND-protection is over, so a trailing
+    //     `… && foo() || x.m()` does NOT cover the final call.
     if (/^\s*&&/.test(after)) {
       let end = text.length
       for (let i = typeofRe.lastIndex; i < text.length; i++) {
-        if (text[i] === ';' || text[i] === '\n') {
+        const ch = text[i]
+        if (ch === ';' || ch === '\n') {
+          end = i
+          break
+        }
+        if (ch === '|' && text[i + 1] === '|') {
           end = i
           break
         }
       }
-      regions.push([g.index, end])
+      regions.push([g.index, end, recv])
     }
   }
   // try { … } catch blocks — a TypeError from an absent method is caught ONLY if
   // a `catch` follows. A `try { … } finally { … }` re-throws, so it does NOT
-  // guard against the method being absent; require the catch explicitly.
+  // guard against the method being absent; require the catch explicitly. recv=null
+  // (catches regardless of receiver).
   const tryRe = /\btry\s*\{/g
   let t
   while ((t = tryRe.exec(text))) {
     const block = bracedBlockAfter(text, t.index)
     if (!block) continue
-    if (/^\s*catch\b/.test(text.slice(block[1] + 1))) regions.push(block)
+    if (/^\s*catch\b/.test(text.slice(block[1] + 1))) regions.push([block[0], block[1], null])
   }
   return regions
 }
@@ -347,8 +366,11 @@ test('EVERY OPTIONAL-method call site is capability-guarded in source (per call 
     // `<acc>["m"](`, and their self-guarding optional-invocation variants
     // `<acc>.m?.(` / `<acc>["m"]?.(`. A captured `?.` (either group) => optional
     // invocation => guarded regardless of surrounding region.
+    // Group 1 = receiver; groups 2/3 = the `?.` of an optional invocation (dot /
+    // bracket form). Receiver-awareness lets us require the CALL's receiver to
+    // match a guard that tested THAT receiver.
     const callRe = new RegExp(
-      `(?:\\.${m}\\s*(\\?\\.)?\\(|\\[\\s*["']${m}["']\\s*\\]\\s*(\\?\\.)?\\()`,
+      `([\\w$][\\w$.?\\[\\]'"]*?)(?:\\.${m}\\s*(\\?\\.)?\\(|\\[\\s*["']${m}["']\\s*\\]\\s*(\\?\\.)?\\()`,
       'g'
     )
     let call
@@ -356,8 +378,11 @@ test('EVERY OPTIONAL-method call site is capability-guarded in source (per call 
     while ((call = callRe.exec(src))) {
       sites++
       const at = call.index
-      const optionalInvoke = Boolean(call[1] || call[2])
-      const inRegion = regions.some(([o, c]) => at >= o && at <= c)
+      const callRecv = normRecv(call[1])
+      const optionalInvoke = Boolean(call[2] || call[3])
+      const inRegion = regions.some(
+        ([o, c, recv]) => at >= o && at <= c && (recv === null || recv === callRecv)
+      )
       assert.ok(
         optionalInvoke || inRegion,
         `OPTIONAL method "${m}" is called UNGUARDED at offset ${at} — not inside a ` +
