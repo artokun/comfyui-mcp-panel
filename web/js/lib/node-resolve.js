@@ -68,26 +68,35 @@ export function assertAddNodeResolvable(registry, class_type) {
 }
 
 /**
- * Guard for graph_set_widget: throw when the target `node`'s type is not a
- * resolved, registered class — an unregistered placeholder's widget list is not
- * the real schema, so echoing back {set:...} would report a change that didn't
- * happen. Subgraph nodes carry their own inner graph rather than a registered
- * class, so they are exempt.
+ * Guard for graph_set_widget, applied to the ACTUAL RESOLVED write target (the
+ * inner promoted node for a subgraph write, or the node's own for a direct
+ * write) — NOT the outer node. This is the load-bearing check: it must run on
+ * whatever `applyWidgetWrite` is about to mutate, so a placeholder can't slip
+ * through by being (or hosting) a subgraph.
+ *
+ * Fails CLOSED. A resolved target is writable ONLY when it has a string `type`
+ * that is registered in the live registry. Anything else — no type, or a type
+ * absent from the registry (an unresolved placeholder, whether it carries a
+ * `subgraph` property or not; or a genuinely missing custom node) — is refused,
+ * distinguishing "backend unreachable / defs not loaded" from "type not
+ * registered". A REAL subgraph parent is exempted authentically: its promoted
+ * widget resolves to a registered inner node, and THAT inner node is what gets
+ * passed here and passes the registry check.
  */
-export function assertNodeWidgetWritable(registry, node) {
-  if (!node || node.subgraph) return;
-  const type = node.type;
-  if (!type || isRegisteredNodeType(registry, type)) return;
+export function assertResolvedTargetRegistered(registry, targetNode) {
+  const type = targetNode?.type;
+  if (typeof type === "string" && isRegisteredNodeType(registry, type)) return;
+  const id = targetNode?.id ?? "(unknown)";
   if (!comfyNodeDefsLoaded(registry)) {
     throw new Error(
-      `Cannot set widget on node ${node.id} ("${type}"): ComfyUI node ` +
-        `definitions are not loaded (the backend is unreachable). Reconnect ` +
+      `Cannot set widget on node ${id}${type ? ` ("${type}")` : ""}: ComfyUI ` +
+        `node definitions are not loaded (the backend is unreachable). Reconnect ` +
         `ComfyUI and retry — refusing to write to an unresolved placeholder node.`,
     );
   }
   throw new Error(
-    `Cannot set widget on node ${node.id}: its type "${type}" is not registered ` +
-      `on this ComfyUI (missing custom node?) — refusing to write to an ` +
-      `unresolved placeholder node.`,
+    `Cannot set widget on node ${id}: its type ${type ? `"${type}" is` : "is"} ` +
+      `not registered on this ComfyUI (missing custom node, or an unresolved ` +
+      `placeholder) — refusing to write to it.`,
   );
 }

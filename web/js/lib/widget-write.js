@@ -278,7 +278,7 @@ export function applyWidgetWrite(
   node,
   widgetName,
   value,
-  { resolveSource, canvas, beforeChange, afterChange, setDirty } = {},
+  { resolveSource, canvas, beforeChange, afterChange, setDirty, assertTargetWritable } = {},
 ) {
   const { targetNode, widget: w, coerced, promotedFrom } = resolveWidgetWrite(
     node,
@@ -286,6 +286,12 @@ export function applyWidgetWrite(
     value,
     resolveSource,
   );
+
+  // Gate on the ACTUAL RESOLVED target (inner promoted node for a subgraph
+  // write, or the node's own) BEFORE any mutation, so a write can never land on
+  // an unregistered placeholder and be reported as success (#458). The panel
+  // injects a registry check here; it throws to refuse.
+  assertTargetWritable?.(targetNode);
 
   beforeChange?.();
   const previous = w.value;

@@ -18,8 +18,9 @@ import {
   isRegisteredNodeType,
   comfyNodeDefsLoaded,
   assertAddNodeResolvable,
-  assertNodeWidgetWritable,
+  assertResolvedTargetRegistered,
 } from "../../web/js/lib/node-resolve.js";
+import { applyWidgetWrite } from "../../web/js/lib/widget-write.js";
 
 // A registry shaped like LG.registered_node_types once /object_info loaded:
 // hundreds of classes; we only need the sentinels + a couple of extras here.
@@ -101,32 +102,124 @@ test("add_node: REAL type on a reachable server ⇒ resolves (no false negative)
   assert.doesNotThrow(() => assertAddNodeResolvable(reg, "KSamplerAdvanced"));
 });
 
-test("set_widget: unreachable + placeholder node ⇒ ERRORS (no fake set)", () => {
+// ---- assertResolvedTargetRegistered (the predicate, on a RESOLVED target) ----
+
+test("set_widget guard: unreachable + placeholder target ⇒ ERRORS (unreachable)", () => {
   const reg = unreachableRegistry();
-  const placeholder = { id: 1, type: "CheckpointLoaderSimple", widgets: [] };
+  const placeholder = { id: 1, type: "CheckpointLoaderSimple" };
+  assert.throws(() => assertResolvedTargetRegistered(reg, placeholder), /not loaded|unreachable/i);
+});
+
+test("set_widget guard: reachable but unregistered target ⇒ ERRORS (missing-node)", () => {
+  const reg = loadedRegistry();
   assert.throws(
-    () => assertNodeWidgetWritable(reg, placeholder),
-    /not loaded|unreachable/i,
+    () => assertResolvedTargetRegistered(reg, { id: 7, type: "SomeUninstalledCustomNode" }),
+    /not registered on this ComfyUI|missing custom node|placeholder/i,
   );
 });
 
-test("set_widget: reachable but unregistered (missing custom node) ⇒ ERRORS with missing-node", () => {
-  const reg = loadedRegistry();
-  const node = { id: 7, type: "SomeUninstalledCustomNode", widgets: [] };
+test("set_widget guard: type-less target ⇒ ERRORS (fail CLOSED, never open)", () => {
+  assert.throws(() => assertResolvedTargetRegistered(loadedRegistry(), { id: 5 }), /not registered/i);
+  assert.throws(() => assertResolvedTargetRegistered(loadedRegistry(), {}), /not registered/i);
+  // A truthy `subgraph` property must NOT buy an exemption here — only a
+  // registered resolved target passes.
   assert.throws(
-    () => assertNodeWidgetWritable(reg, node),
-    /not registered on this ComfyUI|missing custom node/i,
+    () => assertResolvedTargetRegistered(loadedRegistry(), { id: 8, subgraph: {} }),
+    /not registered/i,
   );
 });
 
-test("set_widget: registered node ⇒ passes the guard (no false negative)", () => {
-  const reg = loadedRegistry();
-  const node = { id: 3, type: "KSampler", widgets: [{ name: "seed", value: 0 }] };
-  assert.doesNotThrow(() => assertNodeWidgetWritable(reg, node));
+test("set_widget guard: registered target ⇒ passes (no false negative)", () => {
+  assert.doesNotThrow(() =>
+    assertResolvedTargetRegistered(loadedRegistry(), { id: 3, type: "KSampler" }),
+  );
 });
 
-test("set_widget: subgraph node is exempt (carries its own inner graph, no registered class)", () => {
+// ---- END-TO-END through applyWidgetWrite + the injected registry hook --------
+// These prove the guard runs on the ACTUAL RESOLVED target the write mutates,
+// which is where the outer-node check failed open (subgraph / promoted paths).
+
+const HOOKS = { beforeChange() {}, afterChange() {}, setDirty() {} };
+function hookFor(registry) {
+  return {
+    ...HOOKS,
+    assertTargetWritable: (t) => assertResolvedTargetRegistered(registry, t),
+  };
+}
+
+// A real SubgraphNode over an inner KSampler whose promoted widget "sched_alias"
+// maps to the inner "scheduler". innerType lets us flip the inner node between a
+// registered class (authentic) and an unregistered placeholder.
+function makeSubgraphFixture(innerType = "KSampler") {
+  const inner = {
+    id: 54,
+    type: innerType,
+    widgets: [{ name: "scheduler", type: "combo", options: { values: ["simple", "karras"] }, value: "simple" }],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "54" ? inner : null) };
+  const parent = {
+    id: 66,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "sched_alias", _subgraphSlot: { name: "sched_alias" } }],
+    widgets: [{ name: "scheduler", type: "combo", options: { values: ["simple"] }, value: 999 }],
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "sched_alias" ? { sourceNodeId: "54", sourceWidgetName: "scheduler" } : null;
+  return { parent, inner, resolveSource };
+}
+
+test("set_widget e2e: DIRECT registered node ⇒ write succeeds", () => {
   const reg = loadedRegistry();
-  const subgraphNode = { id: 9, type: "MyLocalSubgraph", subgraph: { _nodes: [] } };
-  assert.doesNotThrow(() => assertNodeWidgetWritable(reg, subgraphNode));
+  const node = { id: 3, type: "KSampler", widgets: [{ name: "steps", type: "INT", value: 0 }] };
+  const set = applyWidgetWrite(node, "steps", 20, hookFor(reg));
+  assert.equal(set.value, 20);
+});
+
+test("set_widget e2e: DIRECT unregistered placeholder (reachable) ⇒ REFUSE, no mutation", () => {
+  const reg = loadedRegistry();
+  const ghost = { id: 1, type: "GhostNode", widgets: [{ name: "value", type: "number", value: 0 }] };
+  assert.throws(() => applyWidgetWrite(ghost, "value", 5, hookFor(reg)), /not registered|placeholder/i);
+  assert.equal(ghost.widgets[0].value, 0);
+});
+
+test("set_widget e2e (case a): placeholder carrying `subgraph:{}` + generic widget ⇒ REFUSE", () => {
+  const reg = loadedRegistry();
+  // subgraph:{} is truthy but has no promoted inputs, so it resolves to its OWN
+  // generic widget — the exact fail-open the outer-node check allowed.
+  const ghost = { id: 2, type: "GhostNode", subgraph: {}, widgets: [{ name: "value", type: "number", value: 0 }] };
+  assert.throws(() => applyWidgetWrite(ghost, "value", 7, hookFor(reg)), /not registered|placeholder/i);
+  assert.equal(ghost.widgets[0].value, 0);
+});
+
+test("set_widget e2e (case b): real subgraph → UNREGISTERED inner placeholder ⇒ REFUSE, inner untouched", () => {
+  const reg = loadedRegistry();
+  const { parent, inner, resolveSource } = makeSubgraphFixture("GhostSampler");
+  assert.throws(
+    () => applyWidgetWrite(parent, "sched_alias", "karras", { ...hookFor(reg), resolveSource }),
+    /not registered|placeholder/i,
+  );
+  assert.equal(inner.widgets.find((w) => w.name === "scheduler").value, "simple");
+});
+
+test("set_widget e2e (case c): type-less node ⇒ REFUSE", () => {
+  const reg = loadedRegistry();
+  const node = { id: 5, widgets: [{ name: "value", type: "number", value: 0 }] };
+  assert.throws(() => applyWidgetWrite(node, "value", 3, hookFor(reg)), /not registered/i);
+});
+
+test("set_widget e2e (keep): real subgraph → REGISTERED inner node ⇒ still succeeds", () => {
+  const reg = loadedRegistry();
+  const { parent, inner, resolveSource } = makeSubgraphFixture("KSampler");
+  const set = applyWidgetWrite(parent, "sched_alias", "karras", { ...hookFor(reg), resolveSource });
+  assert.equal(set.value, "karras");
+  assert.equal(set.promoted_from.inner_node_id, 54);
+  assert.equal(inner.widgets.find((w) => w.name === "scheduler").value, "karras");
+});
+
+test("set_widget e2e: unreachable ⇒ REFUSE even for a would-be-core type, no mutation", () => {
+  const reg = unreachableRegistry();
+  const node = { id: 1, type: "CheckpointLoaderSimple", widgets: [{ name: "ckpt_name", type: "text", value: "" }] };
+  assert.throws(() => applyWidgetWrite(node, "ckpt_name", "x.safetensors", hookFor(reg)), /not loaded|unreachable/i);
+  assert.equal(node.widgets[0].value, "");
 });

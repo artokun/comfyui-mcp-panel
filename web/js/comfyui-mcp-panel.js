@@ -101,7 +101,7 @@ import {
   reapplyDefsToLiveNodes,
 } from "./lib/asset-staleness.js";
 import { applyWidgetWrite, WidgetWriteError } from "./lib/widget-write.js";
-import { assertAddNodeResolvable, assertNodeWidgetWritable } from "./lib/node-resolve.js";
+import { assertAddNodeResolvable, assertResolvedTargetRegistered } from "./lib/node-resolve.js";
 import { coerceMessageText, isDroppedAgentReplay } from "./lib/chat-serialize.js";
 import {
   recordCopiedNodes,
@@ -3655,10 +3655,12 @@ function resolveNode(graph, nodeId) {
 }
 
 // ---- Node-type resolution guard (#458) ------------------------------------
-// The graph WRITE tools resolve node types against LG.registered_node_types via
-// assertAddNodeResolvable / assertNodeWidgetWritable (web/js/lib/node-resolve.js)
-// so an unresolved type fails loudly instead of being reported as a fabricated
-// placeholder. The predicates take the raw registry object.
+// The graph WRITE tools resolve node types against LG.registered_node_types:
+// assertAddNodeResolvable gates graph_add_node on the class_type before create;
+// assertResolvedTargetRegistered gates graph_set_widget on the ACTUAL RESOLVED
+// write target (inner promoted node for a subgraph, else the node's own) so an
+// unresolved placeholder can never be reported as a fabricated success. Both
+// take the raw registry object (web/js/lib/node-resolve.js).
 
 
 // ---- Subgraph boundary rails (input/output proxy nodes) -------------------
@@ -5281,11 +5283,7 @@ const GRAPH_TOOL_EXECUTORS = {
   graph_set_widget({ node_id, widget, value }) {
     const { app, graph, LG } = getGraphCtx();
     const node = resolveNode(graph, node_id);
-    // Never fabricate a widget-write success against an UNRESOLVED node (#458):
-    // an unregistered placeholder's widget list is not the real schema, so
-    // echoing {set:...} would report a change that didn't happen. Throws with a
-    // clear unreachable-vs-missing-node message (subgraph nodes are exempt).
-    assertNodeWidgetWritable(LG?.registered_node_types ?? {}, node);
+    const registry = LG?.registered_node_types ?? {};
     // Repair positional UNKNOWN/UNKNOWN_n placeholders against the live def so
     // the caller's real widget name resolves (#199) before we look it up.
     reconcileUnknownWidgetNames(node);
@@ -5305,6 +5303,13 @@ const GRAPH_TOOL_EXECUTORS = {
         beforeChange: () => graph.beforeChange(),
         afterChange: () => graph.afterChange(),
         setDirty: () => graph.setDirtyCanvas(true, true),
+        // Refuse the write when the RESOLVED target (inner promoted node or the
+        // node's own) isn't a registered class — an unresolved placeholder,
+        // whether or not it hosts a `subgraph` (#458). Fails closed on type-less
+        // nodes; a real subgraph's promoted widget resolves to a registered
+        // inner node and passes.
+        assertTargetWritable: (targetNode) =>
+          assertResolvedTargetRegistered(registry, targetNode),
       });
       return { set };
     } catch (err) {
