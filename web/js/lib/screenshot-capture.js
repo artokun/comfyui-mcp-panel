@@ -26,6 +26,24 @@ export function isVueNodesEnabled(getSettingValue) {
   }
 }
 
+/** Whether the Vue node renderer is actually painting *right now*. Prefers the
+ *  live LiteGraph flag (`LiteGraph.vueNodesMode`), which the canvas draw path
+ *  reads synchronously, and falls back to the persisted setting when the flag is
+ *  absent.
+ *
+ *  This is the flag to save/restore DIRECTLY around a capture: toggling the
+ *  *setting* (`Comfy.VueNodes.Enabled`) is async — ComfyUI's compat setter kicks
+ *  off a store update and the renderer switches through a batched Vue watcher, so
+ *  a synchronous false→draw→true sequence coalesces and never actually forces the
+ *  LiteGraph paint path. Setting `LiteGraph.vueNodesMode = false` takes effect on
+ *  the very next `canvas.draw()`. */
+export function vueNodesActive(getSettingValue, litegraph) {
+  if (litegraph && typeof litegraph.vueNodesMode === "boolean") {
+    return litegraph.vueNodesMode === true;
+  }
+  return isVueNodesEnabled(getSettingValue);
+}
+
 /** Fit transform for framing the whole graph within the viewport.
  *
  *  ds.scale / ds.offset are in CSS pixels (LGraphCanvas scales the 2D context by

@@ -112,7 +112,7 @@ import {
 } from "./lib/paste-report.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
 import {
-  isVueNodesEnabled,
+  vueNodesActive,
   computeFitTransform,
   cssViewport,
   scopeChanged,
@@ -6701,7 +6701,7 @@ const GRAPH_TOOL_EXECUTORS = {
         "Blind mode is ON: screenshots are withheld from the agent. Ask the user to describe the canvas, or to turn Blind off.",
       );
     }
-    const { app, graph, canvas } = getGraphCtx();
+    const { app, graph, canvas, LG } = getGraphCtx();
     const cv = canvas?.canvas;
     const ds = canvas?.ds;
     if (!cv || typeof cv.toDataURL !== "function" || !ds) {
@@ -6751,16 +6751,21 @@ const GRAPH_TOOL_EXECUTORS = {
     const saved = { scale: ds.scale, ox: ds.offset[0], oy: ds.offset[1] };
     // Under the Vue node renderer, node bodies are DOM/Vue elements layered over
     // the canvas, so cv.toDataURL() would miss them (#335/#329/#189). Force the
-    // classic LiteGraph paint path (which draws node bodies on the 2D canvas) for
-    // the duration of the capture, then restore the user's setting.
-    const vueNodes = isVueNodesEnabled((id) => getSetting(id));
+    // classic LiteGraph paint path for the duration of the capture by flipping
+    // the LIVE LiteGraph flag (LiteGraph.vueNodesMode) — the one the canvas draw
+    // path reads synchronously. Toggling the Comfy.VueNodes.Enabled *setting*
+    // instead is async (batched Vue watcher) and would not take effect before the
+    // synchronous canvas.draw() below.
+    const vueNodes = vueNodesActive((id) => getSetting(id), LG);
+    const canForceVue = !!LG && typeof LG.vueNodesMode === "boolean";
+    const savedVueMode = canForceVue ? LG.vueNodesMode : undefined;
     let vueToggled = false;
     let dataUrl;
     let outW = cv.width;
     let outH = cv.height;
     try {
-      if (vueNodes) {
-        setSetting("Comfy.VueNodes.Enabled", false);
+      if (vueNodes && canForceVue) {
+        LG.vueNodesMode = false;
         vueToggled = true;
       }
       // ds.scale/ds.offset are CSS pixels — fit against CSS-pixel viewport dims,
@@ -6795,7 +6800,7 @@ const GRAPH_TOOL_EXECUTORS = {
         dataUrl = cv.toDataURL("image/png");
       }
     } finally {
-      if (vueToggled) setSetting("Comfy.VueNodes.Enabled", true);
+      if (vueToggled) LG.vueNodesMode = savedVueMode;
       ds.scale = saved.scale;
       ds.offset[0] = saved.ox;
       ds.offset[1] = saved.oy;
@@ -6818,7 +6823,9 @@ const GRAPH_TOOL_EXECUTORS = {
       mimeType: "image/png",
       width: outW,
       height: outH,
-      renderer: vueNodes ? "vue-nodes (forced litegraph paint for capture)" : "litegraph",
+      renderer: vueNodes
+        ? (vueToggled ? "vue-nodes (forced litegraph paint for capture)" : "vue-nodes (could not force litegraph paint)")
+        : "litegraph",
       viewing: describeActiveGraph(app?.canvas?.graph ?? graph),
     };
   },

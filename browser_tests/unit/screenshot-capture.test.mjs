@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   isVueNodesEnabled,
+  vueNodesActive,
   computeFitTransform,
   cssViewport,
   scopeChanged,
@@ -22,6 +23,21 @@ test("isVueNodesEnabled: true only when the setting is strictly true", () => {
 test("isVueNodesEnabled: swallows a throwing/missing getter", () => {
   assert.equal(isVueNodesEnabled(undefined), false);
   assert.equal(isVueNodesEnabled(() => { throw new Error("no store"); }), false);
+});
+
+// ---- vueNodesActive (live-flag preference; #335 async-setter finding) -------
+
+test("vueNodesActive: prefers the live LiteGraph.vueNodesMode flag over the setting", () => {
+  // Live flag wins even when it disagrees with the persisted setting — this is
+  // the flag the synchronous draw path reads and the one we save/restore.
+  assert.equal(vueNodesActive(() => true, { vueNodesMode: false }), false);
+  assert.equal(vueNodesActive(() => false, { vueNodesMode: true }), true);
+});
+
+test("vueNodesActive: falls back to the setting when no LiteGraph flag is present", () => {
+  assert.equal(vueNodesActive(() => true, null), true);
+  assert.equal(vueNodesActive(() => false, {}), false); // flag absent -> setting
+  assert.equal(vueNodesActive(() => true, undefined), true);
 });
 
 // ---- computeFitTransform (#335 CSS-vs-device-pixel framing) -----------------
