@@ -18,6 +18,7 @@ import {
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import { openSubModal as openSubModalBase, toast } from "./cmcp-modal.js";
 import { chipRow as filterChipRow, makeFilterButton } from "./cmcp-filter.js";
+import { coerceMessageText } from "./lib/chat-serialize.js";
 
 const TABS = [
   { key: "images", label: "Images", icon: "pi-image", media: "image" },
@@ -248,7 +249,10 @@ export function graphDirtyForConfirm(ctx) {
  *  exported for unit tests. `limit` is clamped to [1, 200]. */
 export const CIVITAI_PROMPT_CAP = 600; // chars — bound the agent's token budget
 function _capPrompt(p) {
-  if (typeof p !== "string" || !p) return p || null;
+  // Coerce a structured prompt so the outbound civitai_results contract never
+  // carries a raw object (would reach the agent as "[object Object]") (#276).
+  if (typeof p !== "string") p = coerceMessageText(p);
+  if (!p) return null;
   return p.length > CIVITAI_PROMPT_CAP ? p.slice(0, CIVITAI_PROMPT_CAP) + "…" : p;
 }
 export function serializeCivitaiResults(source, { model = false, limit = 20, loading = false } = {}) {
@@ -676,7 +680,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         // The client throws Errors carrying an HTTP `status` (see CivitaiClient);
         // fall back to the message alone when it doesn't.
         const status = e && typeof e.status === "number" ? e.status : null;
-        state.error = { status, message: e && e.message ? e.message : String(e) };
+        state.error = { status, message: coerceMessageText(e?.message ?? e) };
       }
     } finally {
       if (req === state.reqId) setLoading(false);
@@ -1058,7 +1062,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     }
     if (gen.meta?.prompt) {
       const p = el("div"); p.style.cssText = "font-size:.78rem;margin-top:.5rem;white-space:pre-wrap";
-      p.textContent = "Prompt: " + gen.meta.prompt; sheet.body.appendChild(p);
+      p.textContent = "Prompt: " + coerceMessageText(gen.meta.prompt); sheet.body.appendChild(p);
     }
   }
 
@@ -1068,8 +1072,10 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       "Recreate this CivitAI example as closely as you can — match the reference and use these settings (use our local model if we have it, else download it first):",
       "",
     ];
-    if (m.prompt) lines.push("Prompt: " + m.prompt);
-    if (m.negativePrompt) lines.push("Negative: " + m.negativePrompt);
+    // Coerce prompt fields — a structured prompt/negative must not reach the
+    // outbound share-with-agent caption as "[object Object]" (#276).
+    if (m.prompt) lines.push("Prompt: " + coerceMessageText(m.prompt));
+    if (m.negativePrompt) lines.push("Negative: " + coerceMessageText(m.negativePrompt));
     for (const [k, v] of CivitaiClient.params(m)) lines.push(`${k}: ${v}`);
     return lines.join("\n");
   }
@@ -1084,7 +1090,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       } else {
         const caption = buildCaption(gen);
         ctx.sendUserMessage(
-          `${caption}\n\nThe reference is uploaded to the ComfyUI input/ folder as \`${ref.filename}\` — use it as the target to match.`,
+          `${caption}\n\nThe reference is uploaded to the ComfyUI input/ folder as \`${coerceMessageText(ref.filename)}\` — use it as the target to match.`,
           undefined, [ref],
         );
         ctx.bringChatForward();

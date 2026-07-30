@@ -8,6 +8,8 @@
 // NOTE (parity, no NSFW gate): all browsing levels are freely selectable; there
 // is no sign-in clamp. OAuth only enables the Favorites tab.
 
+import { coerceMessageText } from "./lib/chat-serialize.js";
+
 // ── constants (mirror civitai_models.dart) ─────────────────────────────────
 export const LEVELS = [
   { label: "PG", level: 1 },
@@ -922,8 +924,11 @@ export class CivitaiClient {
     const rows = [
       ["Model", meta.Model], ["sampler", meta.sampler], ["scheduler", meta.scheduler],
       ["steps", meta.steps], ["cfg", meta.cfgScale], ["seed", meta.seed],
-      ["denoise", meta.denoise], ["size", meta.width && meta.height ? `${val(meta.width)}×${val(meta.height)}` : null],
+      ["denoise", meta.denoise],
+      ["size", meta.width && meta.height ? `${coerceMessageText(val(meta.width))}×${coerceMessageText(val(meta.height))}` : null],
     ];
-    return rows.filter(([, v]) => v != null && v !== "").map(([k, v]) => [k, String(val(v))]);
+    // coerceMessageText (not String) so a structured param value can never become
+    // "[object Object]" in the info panel or the outbound share-with-agent caption (#276).
+    return rows.filter(([, v]) => v != null && v !== "").map(([k, v]) => [k, coerceMessageText(val(v))]);
   }
 }

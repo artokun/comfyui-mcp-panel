@@ -49,6 +49,40 @@ export function coerceMessageText(value) {
   }
 }
 
+/** Serialize an outbound user_message `context` into the STRING the wire
+ *  contract requires (#276). The orchestrator only reads `context` when it is a
+ *  string (it prepends it above the user's text as grounding/transcript replay);
+ *  a non-string is either silently dropped (older orchestrators) or, once the
+ *  panel began joining context parts into one string, coerced by
+ *  `Array.prototype.join` into the literal "[object Object]" and prepended above
+ *  EVERY message — the exact #276 symptom (a lone "[object Object]" line over the
+ *  user's typed text).
+ *
+ *  The panel composes context as `{ workflow, subgraph }` to ground the agent in
+ *  what the user is viewing. Render that known shape as readable lines; fall back
+ *  to coerceMessageText for anything else so an object can never become
+ *  "[object Object]". A string passes through untouched (transcript replay).
+ */
+export function serializeContext(context) {
+  if (context == null) return "";
+  if (typeof context === "string") return context;
+  if (typeof context === "object" && !Array.isArray(context)) {
+    const lines = [];
+    if (typeof context.workflow === "string" && context.workflow) {
+      lines.push(`Workflow: ${context.workflow}`);
+    }
+    if (typeof context.subgraph === "string" && context.subgraph) {
+      lines.push(`Viewing subgraph: ${context.subgraph}`);
+    }
+    if (lines.length) return lines.join("\n");
+    // An empty object carries no context — drop it out of the join rather than
+    // emitting "{}" above the user's text.
+    if (Object.keys(context).length === 0) return "";
+  }
+  // Unknown shape: JSON/known-field serialize, never "[object Object]".
+  return coerceMessageText(context);
+}
+
 /** Decide whether a persisted assistant record should be dropped on history
  *  replay (#241). Drop ONLY a structured payload that coerced to nothing (an
  *  object with no extractable text / an unserializable value) — that's the

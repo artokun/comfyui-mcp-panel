@@ -1,7 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { coerceMessageText, buttonReplyText, isDroppedAgentReplay } from "../../web/js/lib/chat-serialize.js";
+import {
+  coerceMessageText,
+  buttonReplyText,
+  isDroppedAgentReplay,
+  serializeContext,
+} from "../../web/js/lib/chat-serialize.js";
 
 test("strings pass through unchanged", () => {
   assert.equal(coerceMessageText("hello"), "hello");
@@ -157,4 +162,59 @@ test("null/undefined persisted text is dropped, never rendered as literal 'null'
   // matches the predicate (a real empty STRING is the only empty kept).
   assert.equal(isDroppedAgentReplay(null), true);
   assert.equal(isDroppedAgentReplay(undefined), true);
+});
+
+// --- outbound user_message context serialization (#276) --------------------
+// The composer passes context as a `{ workflow, subgraph }` OBJECT, but the
+// orchestrator only reads STRING context (it prepends it above the user's
+// text). The panel joins context parts into one string, so a raw object would
+// coerce via Array.join to the literal "[object Object]" and land above EVERY
+// message — the reported #276 symptom. serializeContext() must render readable
+// text and NEVER "[object Object]".
+
+// Reproduces the exact pre-fix coercion: joining an object context with the
+// same [pending, context].join("\n\n") the bridge uses.
+test("PRE-FIX repro: raw join of an object context yields [object Object] (#276)", () => {
+  const context = { workflow: "My WF", subgraph: "Detailer" };
+  const raw = [null, context].filter(Boolean).join("\n\n");
+  assert.equal(raw, "[object Object]"); // this is the bug being fixed
+});
+
+test("an object context serializes to readable workflow/subgraph lines, never [object Object] (#276)", () => {
+  const out = serializeContext({ workflow: "My WF", subgraph: "Detailer" });
+  assert.notEqual(out, "[object Object]");
+  assert.ok(!out.includes("[object Object]"), `got: ${out}`);
+  assert.equal(out, "Workflow: My WF\nViewing subgraph: Detailer");
+});
+
+test("an object context with only a workflow renders a single line (#276)", () => {
+  assert.equal(serializeContext({ workflow: "Base" }), "Workflow: Base");
+});
+
+test("the merged-context join used on the send path stays a clean string (#276)", () => {
+  // Mirror bridge sendUserMessage: [pendingContext, serializeContext(context)]
+  const pendingContext = null;
+  const context = { workflow: "Base" };
+  const merged =
+    [pendingContext, serializeContext(context)].filter(Boolean).join("\n\n") || undefined;
+  assert.equal(merged, "Workflow: Base");
+  assert.ok(!String(merged).includes("[object Object]"));
+});
+
+test("a string context (transcript replay) passes through untouched (#276)", () => {
+  const replay = "USER: hi\nASSISTANT: hello";
+  assert.equal(serializeContext(replay), replay);
+});
+
+test("null/empty context serializes to '' so it drops out of the join (#276)", () => {
+  assert.equal(serializeContext(null), "");
+  assert.equal(serializeContext(undefined), "");
+  assert.equal(serializeContext({}), "");
+});
+
+test("an unknown-shape object context degrades to JSON, never [object Object] (#276)", () => {
+  const out = serializeContext({ foo: 1, bar: 2 });
+  assert.notEqual(out, "[object Object]");
+  assert.ok(!out.includes("[object Object]"), `got: ${out}`);
+  assert.equal(out, '{"foo":1,"bar":2}');
 });
