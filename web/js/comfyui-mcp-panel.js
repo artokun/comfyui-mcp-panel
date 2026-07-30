@@ -66,7 +66,7 @@ import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
-import { buildInstallRequest } from "./lib/manager-install.js";
+import { buildInstallRequest, classifyInstallOutcome, installGitUrl, queueDrained } from "./lib/manager-install.js";
 import {
   CHAT_HISTORY_MAX_IMPORT_BYTES,
   CHAT_HISTORY_SCHEMA,
@@ -2421,9 +2421,10 @@ async function clearSpuriousOpenModified(wf) {
  *  UI uses via useComfyManagerService). Because the panel runs inside the
  *  frontend, api.fetchApi resolves the identical URL the UI hits — so this works
  *  against the bundled Desktop Manager without the MCP/cm-cli path. */
-async function managerV2(route, { method = "GET", body } = {}) {
+async function managerV2(route, { method = "GET", body, signal } = {}) {
   const res = await api.fetchApi(`/v2/${route}`, {
     method,
+    ...(signal ? { signal } : {}),
     ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
   });
   if (!res || res.status === 404) {
@@ -2446,9 +2447,10 @@ async function managerV2(route, { method = "GET", body } = {}) {
 /** Like managerV2 but hits an ABSOLUTE route (NO /v2 prefix). Used for the
  *  released 3.x ComfyUI-Manager whose queue lives under /manager/* with
  *  per-operation routes. Same error handling as managerV2. */
-async function managerCall(route, { method = "GET", body } = {}) {
+async function managerCall(route, { method = "GET", body, signal } = {}) {
   const res = await api.fetchApi(`/${route}`, {
     method,
+    ...(signal ? { signal } : {}),
     ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
   });
   if (!res || res.status === 404) {
@@ -2482,11 +2484,20 @@ async function managerCall(route, { method = "GET", body } = {}) {
 //              routes /manager/queue/{install,update,start,status,...}.
 let managerDialectCache = null;
 
-/** Soft GET probe: parsed JSON, or null on any non-ok / 404 / throw. Never
- *  throws — a probe must not blow up detection. */
+/** Every Manager HTTP call is bounded by this timeout so a stalled request can
+ *  never hang the install path (codex round 2 #5 — probes, install, start,
+ *  status, list are ALL bounded). */
+const MANAGER_FETCH_TIMEOUT_MS = 15000;
+
+/** Soft GET probe: parsed JSON, or null on any non-ok / 404 / throw / stall.
+ *  Never throws — a probe must not blow up detection. Bounded by an AbortSignal
+ *  so a hanging probe can't wedge dialect detection. */
 async function managerProbe(route) {
   try {
-    const res = await api.fetchApi(route, { method: "GET" });
+    const res = await api.fetchApi(route, {
+      method: "GET",
+      signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS),
+    });
     if (!res || !res.ok) return null;
     const txt = await res.text();
     return txt ? JSON.parse(txt) : null;
@@ -2532,9 +2543,10 @@ async function detectManagerDialect() {
 
 /** GET the queue status / installed / getmappings surface for the detected
  *  dialect. Legacy has NO /v2 prefix; both pip modes serve /v2. */
-async function managerGet(route) {
+async function managerGet(route, { signal } = {}) {
   const dialect = await detectManagerDialect();
-  return dialect === "legacy" ? managerCall(route) : managerV2(route);
+  const opts = signal ? { signal } : {};
+  return dialect === "legacy" ? managerCall(route, opts) : managerV2(route, opts);
 }
 
 /** Throw if a /v2/manager/queue/batch response reported the target id as failed.
@@ -2549,6 +2561,64 @@ function assertBatchOk(res, id, op) {
         "gating is a common cause). The pack was NOT installed.",
     );
   }
+}
+
+/** Await a delay, but never longer than the remaining budget (>=0). */
+function boundedDelay(ms, deadline) {
+  const budget = Math.max(0, Math.min(ms, deadline - Date.now()));
+  return new Promise((r) => setTimeout(r, budget));
+}
+
+/** Poll the Manager queue/status until it POSITIVELY drains (queueDrained) or
+ *  the deadline passes. Each status fetch is bounded by an AbortSignal so a
+ *  stalled request cannot run past the deadline, and the initial settle-sleep
+ *  respects the remaining budget. Never throws. Returns the LAST status seen (or
+ *  null on a stall) — the caller's classifyInstallOutcome re-derives drained
+ *  from it via queueDrained, so a null/malformed status is never a false drain
+ *  (codex round 2 #1). */
+async function waitForQueueDrain({ timeoutMs = 120000, intervalMs = 1500 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let status = null;
+  // Give the queue a beat to register the task before the first poll, so we
+  // don't read a stale is_processing=false from before queue/start.
+  await boundedDelay(1000, deadline);
+  while (Date.now() < deadline) {
+    // Cap this individual fetch by whatever budget remains.
+    const perFetch = Math.max(1000, Math.min(MANAGER_FETCH_TIMEOUT_MS, deadline - Date.now()));
+    try {
+      status = await managerGet("manager/queue/status", {
+        signal: AbortSignal.timeout(perFetch),
+      });
+    } catch {
+      return status; // unreadable/aborted — inconclusive (not drained)
+    }
+    if (queueDrained(status)) return status;
+    await boundedDelay(intervalMs, deadline);
+  }
+  return status; // deadline hit
+}
+
+/**
+ * After an install is queued+started, resolve the TRUE outcome (#232 / codex
+ * rounds 1-2). Waits for the queue to drain (bounded), reads the installed-nodes
+ * list (bounded), then delegates the installed/failed/unverified decision to the
+ * pure classifyInstallOutcome (which re-derives drained + list-readability from
+ * the raw values — no false drain, no false-readable). `batchFailed` carries the
+ * synchronous v2-batch `failed[]` as failure EVIDENCE (still gated by the
+ * tri-state — never an early throw). Returns { state, status, message }.
+ */
+async function verifyInstalled(target, dialect, { batchFailed, renameProne } = {}) {
+  const status = await waitForQueueDrain();
+  let installed = null;
+  let listError = false;
+  try {
+    installed = await managerGet("customnode/installed", {
+      signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS),
+    });
+  } catch {
+    listError = true;
+  }
+  return classifyInstallOutcome({ target, dialect, status, installed, listError, batchFailed, renameProne });
 }
 
 /** Build a ComfyUI /view URL for an output image descriptor. */
@@ -6727,36 +6797,67 @@ const GRAPH_TOOL_EXECUTORS = {
     const dialect = await detectManagerDialect();
     const ui_id = crypto.randomUUID();
     const client_id = api.clientId ?? api.initialClientId ?? "comfyui-mcp-panel";
-    const note =
-      "Install queued. Poll nodes_queue_status, then VERIFY with panel_list_nodes " +
-      "(the pack must appear on disk); a ComfyUI restart (comfy_reboot) is usually " +
-      "required to load new nodes.";
     // buildInstallRequest (./lib/manager-install.js) derives the repo NAME for a
     // git URL (arriving via id OR repository, any protocol) and picks the right
     // per-dialect payload — issues #187/#182/#184. A full URL is never sent as
     // `id` (v4 would silently mark it "done"; 3.x fails late, past `failed`).
     const req = buildInstallRequest(dialect, args, ui_id);
+    // The install id we verify against on disk (already the repo NAME for a git
+    // URL). #232: the Manager queue reports every task "done" even when the
+    // clone/resolve fails, so after queueing we resolve the TRUE outcome instead
+    // of claiming success — installed / failed / unverified (see verifyInstalled).
+    const target = dialect === "v2" ? req.params.id : req.body.id;
+    // A git URL or an owner/repo id can install under a directory name that
+    // differs from the repo name (e.g. TenStrip/10S-Comfy-nodes → 10S_Nodes), so
+    // its on-disk presence can't be confirmed OR ruled out by name — absence is
+    // NOT proof of failure for such targets (codex round 3). A claimed registry
+    // id is identifiable (matched via cnr_id/aux_id), so its absence IS proof.
+    const renameProne = !!installGitUrl(args) || String(id ?? "").includes("/");
+    // Every Manager mutation is bounded (codex round 2 #5).
+    const post = (body) => ({ method: "POST", body, signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS) });
+    let batchFailed; // v2-batch synchronous failed[] — FEEDS the gate as evidence
     if (dialect === "v2") {
-      await managerV2("manager/queue/task", {
-        method: "POST",
-        body: { kind: "install", params: req.params, ui_id, client_id },
-      });
-      await managerV2("manager/queue/start", { method: "POST" });
-      return { queued: true, ui_id, id: req.params.id, dialect, note };
-    }
-    if (dialect === "v2-batch") {
-      const res = await managerV2("manager/queue/batch", {
-        method: "POST",
-        body: { install: [req.body] },
-      });
-      // Surface a batch `failed` instead of silently claiming success (#184).
-      assertBatchOk(res, req.body.id, "install");
-      await managerV2("manager/queue/start", { method: "POST" });
+      await managerV2("manager/queue/task", post({ kind: "install", params: req.params, ui_id, client_id }));
+      await managerV2("manager/queue/start", post());
+    } else if (dialect === "v2-batch") {
+      const res = await managerV2("manager/queue/batch", post({ install: [req.body] }));
+      // Capture the synchronous `failed[]` as failure EVIDENCE — but do NOT throw
+      // early (codex round 2 #4). The final outcome still goes through the
+      // tri-state gate (drained + list-readable + absent) below.
+      batchFailed = Array.isArray(res?.failed) ? res.failed : undefined;
+      await managerV2("manager/queue/start", post());
     } else {
-      await managerCall("manager/queue/install", { method: "POST", body: req.body });
-      await managerCall("manager/queue/start", { method: "POST" });
+      await managerCall("manager/queue/install", post(req.body));
+      await managerCall("manager/queue/start", post());
     }
-    return { queued: true, ui_id, id: req.body.id, dialect, note };
+    // Resolve the true outcome. Throw ONLY on positive failure evidence; an
+    // inconclusive result returns an honest unverified status (never a silent
+    // success, never a false failure). #232 + codex rounds 1-2.
+    const outcome = await verifyInstalled(target, dialect, { batchFailed, renameProne });
+    if (outcome.state === "failed") throw new Error(outcome.message);
+    if (outcome.state === "installed") {
+      return {
+        queued: true,
+        installed: true,
+        verified: true,
+        ui_id,
+        id: target,
+        dialect,
+        note:
+          "Installed and VERIFIED present in custom_nodes. A ComfyUI restart " +
+          "(comfy_reboot) is usually required to load new nodes.",
+      };
+    }
+    return {
+      queued: true,
+      installed: false,
+      verified: false,
+      pending: outcome.state === "unverified",
+      ui_id,
+      id: target,
+      dialect,
+      note: outcome.message,
+    };
   },
 
   // Update an ALREADY-INSTALLED pack to latest/nightly via the built-in Manager.
