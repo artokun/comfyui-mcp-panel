@@ -19,6 +19,11 @@ const {
   isReadableInstalledList,
   queueFailureSignal,
   classifyInstallOutcome,
+  installedListRoute,
+  isManagerUnreachable,
+  isMethodNotAllowed,
+  legacyUpdateBody,
+  rebootCandidates,
 } = ManagerInstall;
 
 test("looksLikeGitUrl recognizes every git protocol", () => {
@@ -539,4 +544,76 @@ test("waitForQueueDrain (real panel source) returns a drained status without Ref
   const status = await realWait({ timeoutMs: 5000, intervalMs: 10 });
   assert.equal(queueDrained(status), true, "should return a positively-drained status");
   assert.ok(polls >= 2, "should have polled until drained");
+});
+
+// ---------------------------------------------------------------------------
+// 3.x-LEGACY dialect completeness (#423 list / #424 update-self / #425 restart)
+// ---------------------------------------------------------------------------
+
+test("#423 installedListRoute passes ?mode=default and no /v2 prefix (managerGet/Call add it)", () => {
+  const route = installedListRoute();
+  assert.equal(route, "customnode/installed?mode=default");
+  assert.ok(!route.startsWith("/v2"), "route must not carry a /v2 prefix");
+  assert.ok(!route.startsWith("/"), "route is a tail managerGet/managerCall prefix");
+});
+
+test("#423 isManagerUnreachable flags 404 / not-reachable → triggers the absolute legacy list fallback", () => {
+  assert.equal(isManagerUnreachable(new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)")), true);
+  assert.equal(isManagerUnreachable(new Error("Manager customnode/installed: HTTP 404")), true);
+  // A genuine server error must NOT be swallowed by the fallback.
+  assert.equal(isManagerUnreachable(new Error("Manager customnode/installed: HTTP 500")), false);
+  assert.equal(isManagerUnreachable(new Error("Manager manager/queue/update: HTTP 405")), false);
+});
+
+test("#423 legacy list payload parses via parseInstalled (map + array shapes)", () => {
+  // released 3.x /customnode/installed returns the get_installed_node_packs MAP.
+  const legacyMap = {
+    "ComfyUI-Manager": { ver: "3.10", cnr_id: "comfyui-manager", enabled: true },
+    "rgthree-comfy": { ver: "1.0", cnr_id: "rgthree-comfy", enabled: true },
+  };
+  const parsed = parseInstalled(legacyMap);
+  assert.equal(parsed.length, 2);
+  assert.ok(nodeInstalledMatches("comfyui-manager", parsed), "Manager itself resolves from the legacy map");
+});
+
+test("#424 isMethodNotAllowed detects the /v2 envelope 405 that legacy self-update must dodge", () => {
+  assert.equal(isMethodNotAllowed(new Error("Manager manager/queue/task: HTTP 405")), true);
+  assert.equal(isMethodNotAllowed(new Error("405 Method Not Allowed")), true);
+  assert.equal(isMethodNotAllowed(new Error("Manager manager/queue/task: HTTP 403")), false);
+  assert.equal(isMethodNotAllowed(new Error("boom")), false);
+});
+
+test("#424 legacyUpdateBody targets the Manager self-update by id (unified_update keys off id)", () => {
+  // released-3.x update route: version !== 'unknown' ⇒ node_name = id.
+  assert.deepEqual(legacyUpdateBody({ ui_id: "u1", id: "comfyui-manager", version: "latest" }), {
+    ui_id: "u1",
+    id: "comfyui-manager",
+    version: "latest",
+  });
+  // nightly is preserved; anything else normalizes to latest.
+  assert.equal(legacyUpdateBody({ id: "x", version: "nightly" }).version, "nightly");
+  assert.equal(legacyUpdateBody({ id: "x", version: undefined }).version, "latest");
+  assert.equal(legacyUpdateBody({ id: "x", version: "1.2.3" }).version, "latest");
+});
+
+test("#425 rebootCandidates puts POST /manager/reboot first for legacy (never GET-only)", () => {
+  const legacy = rebootCandidates("legacy");
+  assert.deepEqual(legacy[0], { route: "/manager/reboot", method: "POST" });
+  // The released 3.x Manager has NO GET /manager/reboot — a POST route must be
+  // tried before the very-old GET fallback.
+  const idxPost = legacy.findIndex((c) => c.route === "/manager/reboot" && c.method === "POST");
+  const idxGet = legacy.findIndex((c) => c.route === "/manager/reboot" && c.method === "GET");
+  assert.ok(idxPost >= 0 && idxPost < idxGet, "legacy POST reboot precedes the GET fallback");
+});
+
+test("#425 rebootCandidates keeps POST /v2/manager/reboot first for pip dialects", () => {
+  for (const dialect of ["v2", "v2-batch", null, undefined]) {
+    const cands = rebootCandidates(dialect);
+    assert.deepEqual(cands[0], { route: "/v2/manager/reboot", method: "POST" });
+    // POST /manager/reboot is still present as a fallback for a legacy-UI build.
+    assert.ok(
+      cands.some((c) => c.route === "/manager/reboot" && c.method === "POST"),
+      `dialect ${dialect} must still offer POST /manager/reboot`,
+    );
+  }
 });
