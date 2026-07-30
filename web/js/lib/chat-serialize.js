@@ -9,15 +9,20 @@
 // stringified via Object.prototype.toString.
 
 // Preferred string-bearing fields, in priority order, for a structured payload
-// (card reply, backend error/message object, UI action).
-const STRING_FIELDS = ["reply", "text", "label", "value", "message", "error", "detail"];
+// (card reply, backend error/message object, UI action). `caption`/`filename`
+// let a completed render/output payload (#238) surface its media label rather
+// than JSON; `content` is handled specially below (codex-style parts array).
+const STRING_FIELDS = ["reply", "text", "label", "value", "message", "error", "detail", "caption", "filename"];
 
 /** Coerce an arbitrary chat payload to a human/agent-readable string.
  *  - strings pass through unchanged;
  *  - null/undefined become "";
  *  - primitives use String();
- *  - objects yield the first non-empty known string field, else JSON, else "".
- *  Never returns "[object Object]" for a plain object. */
+ *  - objects yield the first non-empty known string field, else the joined text
+ *    of a `content` parts array (codex app-server shape), else JSON, else "".
+ *  Never returns "[object Object]" for a plain object. Shared by the LIVE say
+ *  render (#238), the A2UI button path (#219), and persisted-message replay
+ *  (#241) so every path serializes structured payloads identically. */
 export function coerceMessageText(value) {
   if (typeof value === "string") return value;
   if (value == null) return "";
@@ -25,6 +30,15 @@ export function coerceMessageText(value) {
   for (const key of STRING_FIELDS) {
     const field = value[key];
     if (typeof field === "string" && field) return field;
+  }
+  // Codex/app-server assistant shapes carry the visible text in a `content`
+  // parts array (e.g. [{ type:"text", text:"…" }]). Older persisted records of
+  // this shape (#241) must replay as their joined text, not raw JSON.
+  if (Array.isArray(value.content)) {
+    const parts = value.content
+      .map((part) => (typeof part === "string" ? part : typeof part?.text === "string" ? part.text : ""))
+      .filter(Boolean);
+    if (parts.length) return parts.join("\n");
   }
   try {
     const json = JSON.stringify(value);

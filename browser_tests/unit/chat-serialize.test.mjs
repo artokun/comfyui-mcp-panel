@@ -86,3 +86,41 @@ test("a SUBMIT button with an object reply does NOT bake [object Object] into th
 test("falls back to label when reply is absent", () => {
   assert.equal(buttonReplyText({ label: "Cancel" }), "Cancel");
 });
+
+// --- sidebar render of a completed OUTPUT payload (#238) --------------------
+// The LIVE `say` handler now routes a structured payload through
+// coerceMessageText before onSay/paintAgent, so a completed render/output
+// object must serialize to readable text, never "[object Object]".
+test("a completed output payload renders as readable text in the sidebar path (#238)", () => {
+  const out = coerceMessageText({ caption: "portrait_00001.png", filename: "portrait_00001.png" });
+  assert.notEqual(out, "[object Object]");
+  assert.equal(out, "portrait_00001.png");
+});
+
+test("an output payload with no known label degrades to JSON, never [object Object] (#238)", () => {
+  const out = coerceMessageText({ type: "output", images: [{ subfolder: "", node: 9 }] });
+  assert.notEqual(out, "[object Object]");
+  assert.ok(!out.includes("[object Object]"), `got: ${out}`);
+  assert.ok(out.startsWith("{"), `expected JSON, got: ${out}`);
+});
+
+// --- persisted structured assistant message replay (#241) ------------------
+// paintAgent(m.text) on history replay now re-normalizes through the SAME
+// serializer, so a record whose `text` is a structured object rehydrates as
+// readable text after reload/restart instead of "[object Object]".
+test("a persisted structured assistant message rehydrates as readable text (#241)", () => {
+  const record = { role: "agent", text: { text: "Here are your outputs." } };
+  const out = coerceMessageText(record.text);
+  assert.notEqual(out, "[object Object]");
+  assert.equal(out, "Here are your outputs.");
+});
+
+test("a persisted codex-style content-parts assistant message replays as joined text (#241)", () => {
+  const record = {
+    role: "agent",
+    text: { content: [{ type: "text", text: "line one" }, { type: "text", text: "line two" }] },
+  };
+  const out = coerceMessageText(record.text);
+  assert.notEqual(out, "[object Object]");
+  assert.equal(out, "line one\nline two");
+});
