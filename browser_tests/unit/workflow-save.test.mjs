@@ -451,6 +451,32 @@ test('no-name save of a persisted workflow with a normal filename saves IN PLACE
   assert.equal(svc.disk.size, 1)
 })
 
+test('round-6: a THROWING post-save probe does NOT false-alarm — a valid copy reports SUCCESS (#226)', async () => {
+  // saveWorkflowAs copied the persisted source correctly, but the post-save
+  // getWorkflowByPath probe throws (and there are no lists). A throw is UNKNOWN,
+  // not proof the source vanished — the backstop must NOT report a valid save-as
+  // as "moved".
+  const active = {
+    path: 'workflows/zz226b-orig.json',
+    filename: 'zz226b-orig.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeFaithfulService({ files: [active.path], active })
+  // Probe throws AFTER the (successful, copying) saveWorkflowAs.
+  svc.getWorkflowByPath = () => {
+    throw new Error('store index unavailable')
+  }
+
+  const saved = await saveActiveWorkflow(svc, 'zz226b-copy', {})
+
+  assert.ok(svc.disk.has('workflows/zz226b-orig.json'), 'source survived (copy)')
+  assert.ok(svc.disk.has('workflows/zz226b-copy.json'), 'copy created')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
+  assert.equal(saved, 'zz226b-copy', 'reported success, not a false "moved" error')
+})
+
 test('P0 round-4: oracle returns the DRIFTED non-persisted wf for an on-disk path ⇒ unknown ⇒ REFUSE (#226)', async () => {
   // Source IS on disk, but its in-memory object is mis-flagged temporary. The
   // store's getWorkflowByPath returns that same non-persisted object. A RETURNED

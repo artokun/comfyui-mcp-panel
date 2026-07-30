@@ -158,9 +158,11 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName } = {}) {
       await svc.saveWorkflowAs(wf, { filename: effectiveName });
       // BACKSTOP: if saveWorkflowAs relocated a persisted source anyway, fail
       // LOUDLY instead of reporting a phantom success (the prior fix's exact
-      // miss). Only assert when we have a reliable existence oracle — otherwise
-      // we can't tell a copy from a move and must not false-alarm.
-      if (cls === "persisted" && hasExistenceOracle(svc) && !pathExists(svc, sourcePath)) {
+      // miss). Uses the SAME tri-state rule as classifySource: only a SUCCESSFUL,
+      // affirmative absence (getWorkflowByPath returns null/undefined at the path)
+      // proves the move. A getter THROW or a list-miss is UNKNOWN — a valid
+      // save-as copy must NOT be reported as "moved" (false alarm).
+      if (cls === "persisted" && confirmedAbsentAt(svc, sourcePath)) {
         throw new Error(
           `save moved the original workflow "${sourcePath}" instead of copying it — ` +
             `the source no longer exists on disk (issue #226)`,
@@ -189,34 +191,20 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName } = {}) {
   return desired || currentName || null;
 }
 
-/** Does `svc` expose any way to check whether a file exists on disk? Without one
- *  we cannot distinguish a Save-As copy from a destructive move, so the caller
- *  must not raise a data-loss alarm (avoids false positives on minimal doubles /
- *  older frontends). */
-function hasExistenceOracle(svc) {
-  return (
-    typeof svc?.getWorkflowByPath === "function" ||
-    Array.isArray(svc?.workflows) ||
-    Array.isArray(svc?.openWorkflows)
-  );
-}
-
-/** True when a workflow currently exists at `rawPath` according to whatever the
- *  frontend can tell us — the store's path index first, then the known-workflow
- *  lists. Paths are compared normalized so a "\\" vs "/" difference never reads
- *  as a vanished file. */
-function pathExists(svc, rawPath) {
+/** Tri-state existence probe for the post-save backstop, mirroring classifySource:
+ *  returns true ONLY when the oracle SUCCESSFULLY confirms nothing is at `rawPath`
+ *  (getWorkflowByPath returns null/undefined). A getter THROW or the absence of a
+ *  usable oracle is UNKNOWN → false (do not alarm) — so a valid save-as copy is
+ *  never misreported as a destructive move (#226). A list-miss is likewise not
+ *  proof of absence, so lists never trigger the alarm. */
+function confirmedAbsentAt(svc, rawPath) {
   if (!rawPath) return false;
-  if (typeof svc?.getWorkflowByPath === "function") {
-    try {
-      if (svc.getWorkflowByPath(rawPath)) return true;
-    } catch {
-      /* fall through to the list scan */
-    }
+  if (typeof svc?.getWorkflowByPath !== "function") return false;
+  try {
+    return svc.getWorkflowByPath(rawPath) == null;
+  } catch {
+    return false; // oracle threw ⇒ unknown ⇒ never alarm
   }
-  const norm = normalizePath(rawPath);
-  const all = [...(svc?.workflows ?? []), ...(svc?.openWorkflows ?? [])];
-  return all.some((w) => w && normalizePath(w.path) === norm);
 }
 
 /** TRI-STATE classification of whether the source is backed by a real file on
