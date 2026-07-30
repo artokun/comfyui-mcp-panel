@@ -84,83 +84,90 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName } = {}) {
   const needsAutoName = wasUnsaved && isDefaultWorkflowName(currentName);
   const desired = baseName(explicit ? name : needsAutoName && autoWorkflowName ? autoWorkflowName() : "");
 
-  // A Save-As is any save that would land at a DIFFERENT path than the one the
-  // workflow currently occupies on disk. Compare full, normalized target PATHS —
-  // NOT names. Comparing a twice-stripped filename is unsafe: ComfyUI strips the
-  // final ".json" from the on-disk name, so a file at "…/Foo.json.json" reports
-  // filename "Foo.json"; baseName() would strip it again to "Foo" and misjudge a
-  // Save-As to "Foo" as an in-place save. That routes to svc.saveWorkflow, which
-  // upstream detects as a path change and calls renameWorkflow — MOVING and
-  // destroying the persisted source. Path-vs-path comparison always sends a real
-  // relocation down the copy (saveWorkflowAs) branch instead.
-  const desiredPath = desired ? targetPath(wf, desired) : "";
+  // ANY save that would land at a DIFFERENT path than the one the workflow
+  // currently occupies on disk is a RELOCATION — and under ComfyUI 1.45.21 both
+  // `saveWorkflow` (in-place) and `saveWorkflowAs` relocate by RENAMING (moving)
+  // the source, which destroys the original file (#226). So relocation — not the
+  // narrower "user gave a new name" — is what must be routed down the safe path.
+  //
+  // Compare full, normalized target PATHS, not names. Comparing a twice-stripped
+  // filename is unsafe: ComfyUI strips the final ".json" from the on-disk name,
+  // so a file at "…/Foo.json.json" reports filename "Foo.json"; baseName() would
+  // strip it again to "Foo" and misjudge a Save-As to "Foo" as an in-place save.
+  //
+  // The effective target name is the explicit/auto name for a Save-As, else the
+  // workflow's CURRENT name — because even a no-name save relocates when the
+  // mode-derived extension differs from the on-disk path (P0-b): an on-disk
+  // "Foo.json" opened with initialMode "app" has a mode-derived target of
+  // "Foo.app.json", so a plain `saveWorkflow` would MOVE "Foo.json" → "Foo.app.json"
+  // and consume the source. targetPath() applies the mode-correct extension.
   const currentPath = normalizePath(wf.path);
-  const isSaveAs = !!desired && desiredPath !== currentPath;
+  const effectiveName = desired || currentName;
+  const finalTargetPath = effectiveName ? targetPath(wf, effectiveName) : "";
+  const relocates = !!finalTargetPath && finalTargetPath !== currentPath;
 
-  if (isSaveAs) {
-    // The invariant (issue #226): a Save-As must NEVER remove a file that exists
-    // on disk. We classify the source by its ACTUAL persisted state — whether a
-    // file currently backs it — NOT the in-memory `wasUnsaved`/`isTemporary`
-    // flag, which drifts. On ComfyUI 1.45.21 `isTemporary` is derived from
-    // `size` (`get isTemporary(){return this.size===-1}`), so after a
-    // panel_open_workflow ack-timeout race (#215) a workflow that IS on disk can
-    // be left flagged temporary. That matters because the frontend's own
-    // `saveWorkflowAs` branches on `isTemporary`: a temporary doc is MOVED
-    // (renameWorkflow) instead of copied — which is exactly how the original
-    // file gets destroyed. The prior fix (#231) trusted saveWorkflowAs to copy
-    // and never verified the source survived.
+  if (relocates) {
+    // The invariant (issue #226): a relocating save must NEVER remove a file that
+    // exists on disk. Classify the source by its ACTUAL persisted state as a
+    // TRI-STATE — "persisted" / "never-persisted" / "unknown" — NOT the in-memory
+    // `wasUnsaved`/`isTemporary` flag, which drifts. On 1.45.21 `isTemporary` is
+    // derived from `size` (`get isTemporary(){return this.size===-1}`), so after
+    // a panel_open_workflow ack-timeout race (#215) a workflow that IS on disk
+    // can be left flagged temporary. The frontend's `saveWorkflowAs` branches on
+    // `isTemporary`: a temporary doc is MOVED (renameWorkflow) instead of copied.
+    // UNKNOWN must FAIL SAFE (refuse) — we only ever take a move path when the
+    // source is PROVABLY never-persisted (no backing file to destroy).
     const sourcePath = wf.path;
-    const sourcePersisted = isPersistedOnDisk(svc, wf, sourcePath);
+    const cls = classifySource(svc, wf, sourcePath, currentName);
 
     if (typeof svc.saveWorkflowAs === "function") {
-      // PREVENT the destructive move. If the source is a real on-disk file yet
-      // the active doc claims to be temporary, delegating to saveWorkflowAs would
-      // take its renameWorkflow (move) branch and destroy the original. Refuse
-      // rather than move — the sanctioned safe outcome (#226). This fires ONLY in
-      // the inconsistent drift state; a correctly-opened persisted workflow has
-      // isTemporary === false and copies normally below.
-      if (sourcePersisted && wf.isTemporary === true) {
+      // PREVENT the destructive move. saveWorkflowAs relocates-by-rename whenever
+      // it treats the doc as temporary. That is only SAFE when the source is
+      // provably never-persisted; for a persisted OR UNKNOWN source it would (or
+      // might) destroy a real file — refuse instead (the sanctioned safe outcome).
+      // A correctly-opened persisted workflow has isTemporary === false and hits
+      // saveWorkflowAs's COPY branch, so it is unaffected by this guard.
+      if (wf.isTemporary === true && cls !== "never-persisted") {
         throw new Error(
-          `refusing to save-as: the active workflow is flagged unsaved but "${sourcePath}" ` +
-            `exists on disk — saving now would MOVE (destroy) the original (issue #226). ` +
-            `Re-open the workflow and try again.`,
+          `refusing to save: the active workflow is flagged unsaved but its source "${sourcePath}" ` +
+            `${cls === "persisted" ? "exists on disk" : "cannot be proven absent from disk"} — ` +
+            `saving now could MOVE (destroy) the original (issue #226). Re-open the workflow and try again.`,
         );
       }
       // Copy path. For a persisted workflow saveWorkflowAs copies
       // (workflowStore.saveAs → new file, original untouched); for a genuine
       // temporary it renames the never-saved tab to a real file. `filename`
       // skips the Save dialog.
-      await svc.saveWorkflowAs(wf, { filename: desired });
+      await svc.saveWorkflowAs(wf, { filename: effectiveName });
       // BACKSTOP: if saveWorkflowAs relocated a persisted source anyway, fail
       // LOUDLY instead of reporting a phantom success (the prior fix's exact
       // miss). Only assert when we have a reliable existence oracle — otherwise
       // we can't tell a copy from a move and must not false-alarm.
-      if (sourcePersisted && hasExistenceOracle(svc) && !pathExists(svc, sourcePath)) {
+      if (cls === "persisted" && hasExistenceOracle(svc) && !pathExists(svc, sourcePath)) {
         throw new Error(
-          `save-as moved the original workflow "${sourcePath}" instead of copying it — ` +
+          `save moved the original workflow "${sourcePath}" instead of copying it — ` +
             `the source no longer exists on disk (issue #226)`,
         );
       }
       // saveWorkflowAs makes the new copy the active workflow.
-      return baseName(svc.activeWorkflow?.filename) || desired;
+      return baseName(svc.activeWorkflow?.filename) || effectiveName;
     }
-    // Fallback only for a workflow that was NEVER persisted: renaming an
-    // in-memory temporary tab is safe (no source file to destroy). Guard on the
-    // ACTUAL persisted state — a persisted source must never be renamed even if
-    // the in-memory `wasUnsaved` flag (wrongly) says it was never saved (#226).
-    if (!sourcePersisted && wasUnsaved && typeof svc.renameWorkflow === "function") {
-      await svc.renameWorkflow(wf, targetPath(wf, desired));
+    // Fallback (older frontend with no copy API): renaming is a MOVE, so it is
+    // only permitted when the source is PROVABLY never-persisted (an in-memory
+    // temporary tab with no backing file). Persisted OR UNKNOWN → refuse (#226).
+    if (cls === "never-persisted" && typeof svc.renameWorkflow === "function") {
+      await svc.renameWorkflow(wf, finalTargetPath);
       await saveInPlace(svc, wf);
-      return desired;
+      return effectiveName;
     }
-    // A persisted workflow with no copy API: refuse rather than move/destroy the
-    // original. This is far safer than the old silent rename (issue #226).
+    // No safe way to relocate: refuse rather than move/destroy the original.
     throw new Error(
       "save-as (copy) is unavailable on this frontend; refusing to rename and destroy the original workflow",
     );
   }
 
-  // Save in place — overwrite the same file under the current name.
+  // No relocation — the target path equals the current on-disk path. Overwriting
+  // the same file in place is safe (no move can occur).
   await saveInPlace(svc, wf);
   return desired || currentName || null;
 }
@@ -195,14 +202,44 @@ function pathExists(svc, rawPath) {
   return all.some((w) => w && normalizePath(w.path) === norm);
 }
 
-/** ACTUAL persisted state of the source: is it a real file on disk, independent
- *  of the volatile in-memory `isTemporary`/`isPersisted` flags (which drift after
- *  an open-ack race, #215)? `wf.isPersisted === true` is a positive signal; we
- *  also treat a path the store still knows about as persisted. Used to decide
- *  whether a Save-As is allowed to fall back to a move (issue #226). */
-function isPersistedOnDisk(svc, wf, rawPath) {
-  if (wf?.isPersisted === true) return true;
-  return pathExists(svc, rawPath);
+/** TRI-STATE classification of whether the source is backed by a real file on
+ *  disk — independent of the volatile in-memory flags, which drift after an
+ *  open-ack race (#215). Returns:
+ *    "persisted"       — a real file provably backs it (must NEVER be moved);
+ *    "never-persisted" — provably no backing file (safe to rename/ground);
+ *    "unknown"         — cannot establish either way → callers FAIL SAFE (refuse).
+ *
+ *  Proof of "persisted": `wf.isPersisted === true`, or an existence oracle shows
+ *  a persisted workflow at this path. Proof of "never-persisted": a frontend
+ *  placeholder tab ("Unsaved Workflow …" / "Untitled …") that is flagged
+ *  temporary and not persisted — the ONLY case where the frontend guarantees no
+ *  file has ever been written. Everything else (e.g. a real filename flagged
+ *  temporary with no oracle — the exact #226 drift) is UNKNOWN, not safe. */
+function classifySource(svc, wf, rawPath, currentName) {
+  if (wf?.isPersisted === true) return "persisted";
+  if (hasExistenceOracle(svc)) {
+    const found =
+      typeof svc?.getWorkflowByPath === "function" ? safeGetByPath(svc, rawPath) : undefined;
+    if (found && found.isPersisted === true) return "persisted";
+    const norm = normalizePath(rawPath);
+    const listed = [...(svc?.workflows ?? []), ...(svc?.openWorkflows ?? [])].find(
+      (w) => w && normalizePath(w.path) === norm,
+    );
+    if (listed && listed.isPersisted === true) return "persisted";
+  }
+  // Provably never-persisted: a placeholder temporary tab with no real name.
+  if (wf?.isTemporary === true && wf?.isPersisted !== true && isDefaultWorkflowName(currentName)) {
+    return "never-persisted";
+  }
+  return "unknown";
+}
+
+function safeGetByPath(svc, rawPath) {
+  try {
+    return svc.getWorkflowByPath(rawPath);
+  } catch {
+    return undefined;
+  }
 }
 
 /** Directory prefix (with trailing slash) that a new sibling file should live in,
