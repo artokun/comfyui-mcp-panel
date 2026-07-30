@@ -1,17 +1,23 @@
 /**
  * Unit tests for web/js/lib/widget-write.js — run with `node --test`.
  *
+ * These drive applyWidgetWrite(), the SAME function graph_set_widget delegates
+ * to (resolve target → validate/coerce → write + callback → verify stuck), so
+ * the handler's real code path is exercised — not a parallel reimplementation.
+ *
  * Covers the graph_set_widget integrity fixes:
- *   #233 — a PROMOTED subgraph widget resolves to the correct INNER widget and
- *          the write leaves neighbouring inner widgets untouched; a numeric
- *          slot rejects a non-numeric value instead of silently corrupting it.
- *   #240 — a COMBO widget is set by EXACT value; an invalid value is rejected
- *          (not silently coerced to a different enum / an index).
+ *   #233 — a PROMOTED subgraph widget resolves to the correct INNER widget (even
+ *          when the promotion was RENAMED), leaves inner neighbours untouched,
+ *          rejects a non-numeric value into a numeric slot, and NEVER falls back
+ *          to the shifted parent slot when the promotion can't be resolved.
+ *   #240 — a COMBO widget is set by EXACT value; invalid / index / unreadable-
+ *          option-list cases are rejected, never silently coerced.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  applyWidgetWrite,
   coerceWidgetValue,
   comboOptions,
   isComboWidget,
@@ -19,6 +25,9 @@ import {
   resolvePromotedInnerTarget,
   WidgetWriteError,
 } from "../../web/js/lib/widget-write.js";
+
+// No-op graph hooks so applyWidgetWrite exercises the full write path.
+const HOOKS = {};
 
 // ---- combo classification + exact-value writes (#240) ---------------------
 
@@ -28,82 +37,147 @@ test("combo widget is classified by its option list", () => {
   assert.deepEqual(comboOptions(combo), ["euler", "dpmpp_2m"]);
 });
 
-test("combo: a valid value writes that EXACT value", () => {
-  const w = {
-    name: "lllite_name",
-    options: {
-      values: [
-        "ANIMA\\anima-lllite-pose-1.safetensors",
-        "ANIMA\\anima-lllite-any-test-like-v2.safetensors",
-      ],
-    },
+test("combo: a valid value writes that EXACT value (via handler path)", () => {
+  const node = {
+    id: 5,
+    type: "AnimaLLLiteApply",
+    widgets: [
+      {
+        name: "lllite_name",
+        options: {
+          values: [
+            "ANIMA\\anima-lllite-pose-1.safetensors",
+            "ANIMA\\anima-lllite-any-test-like-v2.safetensors",
+          ],
+        },
+        value: "ANIMA\\anima-lllite-any-test-like-v2.safetensors",
+      },
+    ],
   };
-  const out = coerceWidgetValue(w, "ANIMA\\anima-lllite-pose-1.safetensors");
-  assert.equal(out, "ANIMA\\anima-lllite-pose-1.safetensors");
+  const set = applyWidgetWrite(node, "lllite_name", "ANIMA\\anima-lllite-pose-1.safetensors", HOOKS);
+  assert.equal(set.value, "ANIMA\\anima-lllite-pose-1.safetensors");
+  assert.equal(node.widgets[0].value, "ANIMA\\anima-lllite-pose-1.safetensors");
 });
 
 test("combo: an invalid value is REJECTED, not coerced to another enum", () => {
-  const w = {
-    name: "lllite_name",
-    options: { values: ["pose-1.safetensors", "any-test-like-v2.safetensors"] },
+  const node = {
+    id: 5,
+    type: "AnimaLLLiteApply",
+    widgets: [
+      { name: "lllite_name", options: { values: ["pose-1.safetensors", "any-test-like-v2.safetensors"] }, value: "pose-1.safetensors" },
+    ],
   };
   assert.throws(
-    () => coerceWidgetValue(w, "not-a-real-file.safetensors"),
+    () => applyWidgetWrite(node, "lllite_name", "not-a-real-file.safetensors", HOOKS),
     (err) => err instanceof WidgetWriteError && /not a valid option/.test(err.message),
   );
+  assert.equal(node.widgets[0].value, "pose-1.safetensors", "must not have mutated on reject");
 });
 
 test("combo: a numeric index is NOT reinterpreted as a dropdown position", () => {
-  // options[1] would be the WRONG value if an index were honoured (#240 drift).
-  const w = { name: "combo", options: { values: ["alpha", "beta", "gamma"] } };
-  assert.throws(
-    () => coerceWidgetValue(w, 1),
-    (err) => err instanceof WidgetWriteError,
-  );
+  const node = { id: 1, type: "N", widgets: [{ name: "c", options: { values: ["alpha", "beta", "gamma"] }, value: "alpha" }] };
+  assert.throws(() => applyWidgetWrite(node, "c", 1, HOOKS), WidgetWriteError);
+  assert.equal(node.widgets[0].value, "alpha");
+});
+
+test("combo: numeric-STRING options reject the number 1 (strict, no coercion) but accept \"1\"", () => {
+  const mk = () => ({ id: 1, type: "N", widgets: [{ name: "c", options: { values: ["0", "1", "2"] }, value: "0" }] });
+  const nNum = mk();
+  assert.throws(() => applyWidgetWrite(nNum, "c", 1, HOOKS), WidgetWriteError);
+  const nStr = mk();
+  assert.equal(applyWidgetWrite(nStr, "c", "1", HOOKS).value, "1");
+});
+
+test("combo: numeric options [0,1,2] still accept the number 1", () => {
+  const node = { id: 1, type: "N", widgets: [{ name: "c", options: { values: [0, 1, 2] }, value: 0 }] };
+  assert.equal(applyWidgetWrite(node, "c", 1, HOOKS).value, 1);
 });
 
 test("combo: dynamic (function) option list resolves and validates", () => {
-  const w = { name: "ckpt", type: "combo", options: { values: () => ["a.ckpt", "b.ckpt"] } };
-  assert.equal(coerceWidgetValue(w, "b.ckpt"), "b.ckpt");
-  assert.throws(() => coerceWidgetValue(w, "c.ckpt"), WidgetWriteError);
+  const mk = () => ({ id: 1, type: "N", widgets: [{ name: "ckpt", type: "combo", options: { values: () => ["a.ckpt", "b.ckpt"] }, value: "a.ckpt" }] });
+  assert.equal(applyWidgetWrite(mk(), "ckpt", "b.ckpt", HOOKS).value, "b.ckpt");
+  assert.throws(() => applyWidgetWrite(mk(), "ckpt", "c.ckpt", HOOKS), WidgetWriteError);
 });
 
-// ---- numeric validation (the #233 corruption signature) -------------------
+test("combo: declared combo with UNREADABLE options is refused (fail-closed, HIGH #3)", () => {
+  // Missing options.values entirely.
+  const missing = { id: 1, type: "N", widgets: [{ name: "c", type: "combo", value: "x" }] };
+  assert.throws(
+    () => applyWidgetWrite(missing, "c", 1, HOOKS),
+    (err) => err instanceof WidgetWriteError && /no readable option list/.test(err.message),
+  );
+  // Dynamic options fn that throws.
+  const throwing = {
+    id: 1,
+    type: "N",
+    widgets: [{ name: "c", type: "combo", options: { values: () => { throw new Error("boom"); } }, value: "x" }],
+  };
+  assert.throws(() => applyWidgetWrite(throwing, "c", 1, HOOKS), WidgetWriteError);
+});
+
+// ---- numeric / boolean / string validation --------------------------------
 
 test("numeric widget accepts a number and a numeric string", () => {
-  const w = { name: "steps", type: "INT" };
-  assert.equal(isNumericWidget(w), true);
-  assert.equal(coerceWidgetValue(w, 20), 20);
-  assert.equal(coerceWidgetValue({ name: "cfg", type: "number" }, "7.5"), 7.5);
+  assert.equal(isNumericWidget({ name: "steps", type: "INT" }), true);
+  assert.equal(applyWidgetWrite({ id: 1, type: "N", widgets: [{ name: "steps", type: "INT", value: 0 }] }, "steps", 20, HOOKS).value, 20);
+  assert.equal(applyWidgetWrite({ id: 1, type: "N", widgets: [{ name: "cfg", type: "number", value: 0 }] }, "cfg", "7.5", HOOKS).value, 7.5);
 });
 
 test("numeric widget REJECTS a non-numeric string (no 'euler' into an INT)", () => {
-  const w = { name: "steps", type: "INT" };
+  const node = { id: 1, type: "N", widgets: [{ name: "steps", type: "INT", value: 1 }] };
   assert.throws(
-    () => coerceWidgetValue(w, "euler"),
+    () => applyWidgetWrite(node, "steps", "euler", HOOKS),
     (err) => err instanceof WidgetWriteError && /not a number/.test(err.message),
   );
+  assert.equal(node.widgets[0].value, 1);
 });
 
 test("boolean widget coerces true/false strings and rejects garbage", () => {
-  const w = { name: "enabled", type: "toggle" };
-  assert.equal(coerceWidgetValue(w, "true"), true);
-  assert.equal(coerceWidgetValue(w, false), false);
-  assert.throws(() => coerceWidgetValue(w, "maybe"), WidgetWriteError);
+  assert.equal(applyWidgetWrite({ id: 1, type: "N", widgets: [{ name: "e", type: "toggle", value: false }] }, "e", "true", HOOKS).value, true);
+  assert.throws(() => applyWidgetWrite({ id: 1, type: "N", widgets: [{ name: "e", type: "toggle", value: false }] }, "e", "maybe", HOOKS), WidgetWriteError);
 });
 
 test("string/text widget passes through unchanged", () => {
-  const w = { name: "text", type: "text" };
-  assert.equal(coerceWidgetValue(w, "hello world"), "hello world");
+  assert.equal(applyWidgetWrite({ id: 1, type: "N", widgets: [{ name: "t", type: "text", value: "" }] }, "t", "hello world", HOOKS).value, "hello world");
 });
 
-// ---- promoted-subgraph-widget target resolution (#233) --------------------
+test("missing widget on a plain node throws", () => {
+  assert.throws(
+    () => applyWidgetWrite({ id: 1, type: "N", widgets: [{ name: "steps" }] }, "nope", 1, HOOKS),
+    (err) => err instanceof WidgetWriteError && /has no widget/.test(err.message),
+  );
+});
+
+test("stuck-check fails when a widget callback drifts the value (#240)", () => {
+  // callback rewrites value to a different enum → applyWidgetWrite must throw.
+  const node = {
+    id: 1,
+    type: "N",
+    widgets: [
+      {
+        name: "c",
+        options: { values: ["a", "b"] },
+        value: "a",
+        callback() {
+          this.value = "b"; // silent drift
+        },
+      },
+    ],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "c", "a", HOOKS),
+    (err) => err instanceof WidgetWriteError && /did not retain the requested value/.test(err.message),
+  );
+});
+
+// ---- promoted-subgraph-widget resolution + writes (#233) -------------------
 
 /**
- * Build a mock parent SubgraphNode whose inner KSampler has its `seed`,
- * `sampler_name`, `scheduler`, `denoise` widgets promoted. `sampler_name` is
- * promoted; the parent's own widget array is deliberately SHIFTED (the upstream
- * bug) so writing on the parent by position would hit the wrong slot.
+ * Parent SubgraphNode over an inner KSampler. The promotion has been RENAMED:
+ * the OUTER promoted widget the caller sees is "sched_alias" but it maps to the
+ * inner "scheduler" widget. The parent ALSO has a decoy own-widget literally
+ * named "scheduler" (the shifted-slot corruption vector) — a correct write must
+ * never touch it. `resolveSource` mimics the live subgraph link walk.
  */
 function makeSubgraphFixture() {
   const inner = {
@@ -118,52 +192,113 @@ function makeSubgraphFixture() {
       { name: "denoise", type: "number", value: 1 },
     ],
   };
-  const subgraph = {
-    _nodes: [inner],
-    getNodeById: (id) => (String(id) === "54" ? inner : null),
-  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "54" ? inner : null) };
   const parent = {
     id: 66,
     type: "SubgraphNode",
     subgraph,
-    inputs: [{ name: "sampler_name", _subgraphSlot: { name: "sampler_name" } }],
-    // Parent's own promoted-view widgets are SHIFTED (reproduces the corruption
-    // vector): the widget named sampler_name here sits over the wrong value.
-    widgets: [{ name: "sampler_name", type: "combo", options: { values: ["euler"] }, value: 1 }],
+    inputs: [
+      // OUTER alias "sched_alias" (renamed) → inner "scheduler".
+      { name: "sched_alias", _subgraphSlot: { name: "sched_alias" } },
+    ],
+    // Decoy shifted parent slot named "scheduler" — must stay untouched.
+    widgets: [{ name: "scheduler", type: "combo", options: { values: ["simple"] }, value: 999 }],
   };
-  // Stub of the live-graph link walk: sampler_name promotes inner node 54's
-  // sampler_name widget.
   const resolveSource = (_node, subgraphInput) =>
-    subgraphInput?.name === "sampler_name"
-      ? { sourceNodeId: "54", sourceWidgetName: "sampler_name" }
+    subgraphInput?.name === "sched_alias"
+      ? { sourceNodeId: "54", sourceWidgetName: "scheduler" }
       : null;
   return { parent, inner, resolveSource };
 }
 
-test("promoted widget resolves to the correct INNER node + widget", () => {
+test("promoted (renamed) widget resolves to the correct INNER node + widget", () => {
   const { parent, inner, resolveSource } = makeSubgraphFixture();
-  const target = resolvePromotedInnerTarget(parent, "sampler_name", resolveSource);
-  assert.ok(target, "should resolve a promoted target");
-  assert.equal(target.node, inner);
-  assert.equal(target.widget.name, "sampler_name");
+  const res = resolvePromotedInnerTarget(parent, "sched_alias", resolveSource);
+  assert.equal(res.promoted, true);
+  assert.equal(res.target.node, inner);
+  assert.equal(res.target.widget.name, "scheduler");
 });
 
-test("writing the resolved promoted widget leaves inner NEIGHBOURS untouched", () => {
+test("writing a RENAMED promoted widget hits the inner target, not the decoy parent slot (#233 blocker 1)", () => {
   const { parent, inner, resolveSource } = makeSubgraphFixture();
   const before = inner.widgets.map((w) => w.value);
 
-  const target = resolvePromotedInnerTarget(parent, "sampler_name", resolveSource);
-  const coerced = coerceWidgetValue(target.widget, "dpmpp_2m");
-  target.widget.value = coerced;
+  const set = applyWidgetWrite(parent, "sched_alias", "karras", { resolveSource });
 
-  assert.equal(inner.widgets.find((w) => w.name === "sampler_name").value, "dpmpp_2m");
-  // Every OTHER inner widget is unchanged — no positional shift corruption.
+  // Wrote the INNER scheduler, reported as an inner-node write.
+  assert.equal(set.value, "karras");
+  assert.equal(set.promoted_from.subgraph_node_id, 66);
+  assert.equal(set.promoted_from.inner_node_id, 54);
+  assert.equal(inner.widgets.find((w) => w.name === "scheduler").value, "karras");
+  // The decoy parent widget literally named "scheduler" is untouched.
+  assert.equal(parent.widgets[0].value, 999);
+  // Every OTHER inner widget is unchanged — no positional-shift corruption.
   inner.widgets.forEach((w, i) => {
-    if (w.name !== "sampler_name") assert.equal(w.value, before[i], `${w.name} must be untouched`);
+    if (w.name !== "scheduler") assert.equal(w.value, before[i], `${w.name} must be untouched`);
   });
 });
 
-test("promoted resolution returns null for a plain (non-subgraph) node", () => {
-  const node = { id: 1, type: "KSampler", widgets: [{ name: "steps" }] };
-  assert.equal(resolvePromotedInnerTarget(node, "steps", () => null), null);
+test("promoted numeric slot REJECTS a non-numeric value (silent-corruption signature)", () => {
+  const { parent, inner, resolveSource } = makeSubgraphFixture();
+  // Re-point the promotion at inner numeric "steps".
+  parent.inputs = [{ name: "steps", _subgraphSlot: { name: "steps" } }];
+  const rs = (_n, si) => (si?.name === "steps" ? { sourceNodeId: "54", sourceWidgetName: "steps" } : null);
+  assert.throws(() => applyWidgetWrite(parent, "steps", "euler", { resolveSource: rs }), WidgetWriteError);
+  assert.equal(inner.widgets.find((w) => w.name === "steps").value, 1);
+});
+
+// ---- fail-CLOSED: promoted but unresolvable must NEVER write the parent slot (#233 blocker 2)
+
+test("promoted widget with empty linkIds → THROW, parent slot untouched", () => {
+  const { parent } = makeSubgraphFixture();
+  // Match the alias but resolver returns null (stale/empty linkIds).
+  parent.inputs = [{ name: "scheduler", _subgraphSlot: { name: "scheduler" } }];
+  const before = parent.widgets[0].value;
+  assert.throws(
+    () => applyWidgetWrite(parent, "scheduler", "simple", { resolveSource: () => null }),
+    (err) => err instanceof WidgetWriteError && /no resolvable inner link/.test(err.message),
+  );
+  assert.equal(parent.widgets[0].value, before, "parent slot must not be written on fail-closed");
+});
+
+test("promoted widget linking to a missing inner node → THROW (no parent fallback)", () => {
+  const { parent } = makeSubgraphFixture();
+  parent.inputs = [{ name: "scheduler", _subgraphSlot: { name: "scheduler" } }];
+  const rs = () => ({ sourceNodeId: "999", sourceWidgetName: "scheduler" });
+  assert.throws(
+    () => applyWidgetWrite(parent, "scheduler", "simple", { resolveSource: rs }),
+    (err) => err instanceof WidgetWriteError && /missing inner node/.test(err.message),
+  );
+});
+
+test("promoted widget linking to a missing inner widget → THROW", () => {
+  const { parent } = makeSubgraphFixture();
+  parent.inputs = [{ name: "scheduler", _subgraphSlot: { name: "scheduler" } }];
+  const rs = () => ({ sourceNodeId: "54", sourceWidgetName: "ghost_widget" });
+  assert.throws(
+    () => applyWidgetWrite(parent, "scheduler", "simple", { resolveSource: rs }),
+    (err) => err instanceof WidgetWriteError && /missing inner widget/.test(err.message),
+  );
+});
+
+test("AMBIGUOUS promoted aliases → THROW, no first-match-wins (#233 blocker 2c)", () => {
+  const { parent, resolveSource } = makeSubgraphFixture();
+  parent.inputs = [
+    { name: "scheduler", _subgraphSlot: { name: "scheduler" } },
+    { name: "scheduler", _subgraphSlot: { name: "scheduler_2" } },
+  ];
+  assert.throws(
+    () => applyWidgetWrite(parent, "scheduler", "simple", { resolveSource }),
+    (err) => err instanceof WidgetWriteError && /ambiguous/.test(err.message),
+  );
+});
+
+test("subgraph node's OWN non-promoted widget writes normally (case a)", () => {
+  const { parent } = makeSubgraphFixture();
+  // No input alias matches "scheduler" → not promoted → write parent's own widget.
+  parent.inputs = [];
+  parent.widgets = [{ name: "scheduler", options: { values: ["simple", "karras"] }, value: "simple" }];
+  const set = applyWidgetWrite(parent, "scheduler", "karras", { resolveSource: () => null });
+  assert.equal(set.value, "karras");
+  assert.equal(set.promoted_from, undefined);
 });

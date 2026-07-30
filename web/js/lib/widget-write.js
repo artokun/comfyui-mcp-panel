@@ -1,6 +1,7 @@
 // Widget-value validation + promoted-subgraph-widget target resolution for
 // graph_set_widget. Extracted so the write targets the RIGHT widget with the
-// RIGHT value and can be unit-tested without a live litegraph.
+// RIGHT value and can be unit-tested by driving the SAME code path the handler
+// runs (applyWidgetWrite), not a parallel reimplementation.
 //
 // Two graph-integrity bugs motivate this module:
 //   #233 — panel_set_widget on a SUBGRAPH node's PROMOTED widget wrote by a
@@ -9,10 +10,15 @@
 //   #240 — a COMBO widget set to a valid enum silently drifted to a different
 //          option (index-vs-value reinterpretation).
 //
-// Fixes: (a) resolve a parent promoted widget to its ACTUAL inner (node,widget)
-// and write there; (b) validate/coerce the value against the target widget's
-// declared type and REJECT a mismatch (combo must be an exact option, numeric
-// must be a number) instead of writing garbage.
+// Safety contract (both bugs are silent corruption; we NEVER fail open):
+//   * A promoted widget resolves to its ACTUAL inner (node, widget) and the
+//     write lands THERE. If it looks promoted but cannot be resolved
+//     unambiguously, we THROW before mutating — never fall back to the shifted
+//     parent slot.
+//   * The value is validated against the target widget's declared type and
+//     REJECTED on mismatch (combo must be an exact CURRENT option; numeric must
+//     be numeric; boolean must be boolean; a combo whose options we cannot read
+//     is refused, not written blindly).
 
 export class WidgetWriteError extends Error {
   constructor(message) {
@@ -22,9 +28,9 @@ export class WidgetWriteError extends Error {
 }
 
 /**
- * The current option list for a combo widget, or null if the widget is not a
- * combo / has no resolvable list. `options.values` may be an array or a
- * function `(widget) => string[]` (litegraph dynamic combos).
+ * The current option list for a combo widget, or null if it cannot be read.
+ * `options.values` may be an array or a function `(widget) => string[]`
+ * (litegraph dynamic combos). A function that throws yields null (unreadable).
  */
 export function comboOptions(widget) {
   const raw = widget?.options?.values;
@@ -40,7 +46,9 @@ export function comboOptions(widget) {
 }
 
 export function isComboWidget(widget) {
-  if (comboOptions(widget)) return true;
+  if (Array.isArray(widget?.options?.values) || typeof widget?.options?.values === "function") {
+    return true;
+  }
   return String(widget?.type ?? "").toLowerCase() === "combo";
 }
 
@@ -58,39 +66,37 @@ export function isBooleanWidget(widget) {
 /**
  * Validate + coerce `value` for `widget`, returning the value to write. Throws
  * WidgetWriteError (never silently coerces to a wrong value) when the value is
- * incompatible with the widget's declared type. This converts the class of
- * silent corruption in #233/#240 into an actionable error.
+ * incompatible with the widget's declared type.
  */
 export function coerceWidgetValue(widget, value) {
   const name = widget?.name ?? "(widget)";
 
   if (isComboWidget(widget)) {
     const options = comboOptions(widget);
-    if (options) {
-      // Require an EXACT value match against the CURRENT option list. Never
-      // reinterpret the value as a dropdown index (the #240 drift) and never
-      // fuzzy-match to a neighbouring option.
-      if (options.includes(value)) return value;
-      // Tolerate only lossless string identity (e.g. a number whose String()
-      // equals a string option), still an exact-value match, not an index.
-      const asStr = String(value);
-      const exact = options.find((o) => String(o) === asStr);
-      if (exact !== undefined) return exact;
-      const preview = options.slice(0, 40).map((o) => JSON.stringify(o)).join(", ");
+    // A declared combo whose option list we cannot read cannot be validated —
+    // refuse rather than write a value that may be reinterpreted as an index
+    // (#240 fail-open). Covers missing options.values and a throwing fn.
+    if (!options) {
       throw new WidgetWriteError(
-        `Value ${JSON.stringify(value)} is not a valid option for combo widget ` +
-          `"${name}". Valid options (${options.length}): ${preview}` +
-          (options.length > 40 ? ", …" : ""),
+        `Combo widget "${name}" has no readable option list; cannot validate ` +
+          `value ${JSON.stringify(value)} — refusing to write.`,
       );
     }
-    // Dynamic combo with no resolvable list: accept the exact value as given;
-    // do NOT coerce a string to an index.
-    return value;
+    // STRICT typed membership: no numeric<->string coercion. Numeric options
+    // [0,1,2] accept numeric 1; string options ["0","1","2"] require "1", never
+    // the number 1 (which would otherwise behave like an index).
+    if (options.includes(value)) return value;
+    const preview = options.slice(0, 40).map((o) => JSON.stringify(o)).join(", ");
+    throw new WidgetWriteError(
+      `Value ${JSON.stringify(value)} is not a valid option for combo widget ` +
+        `"${name}". Valid options (${options.length}): ${preview}` +
+        (options.length > 40 ? ", …" : ""),
+    );
   }
 
   if (isNumericWidget(widget)) {
     const num = typeof value === "number" ? value : Number(value);
-    if (value === null || value === "" || !Number.isFinite(num)) {
+    if (value === null || value === "" || typeof value === "boolean" || !Number.isFinite(num)) {
       throw new WidgetWriteError(
         `Widget "${name}" is numeric (type ${widget?.type}) but value ` +
           `${JSON.stringify(value)} is not a number.`,
@@ -115,56 +121,178 @@ export function coerceWidgetValue(widget, value) {
 }
 
 /**
- * Resolve a PARENT SubgraphNode's promoted widget to the ACTUAL inner
- * (node, widget) it stands for, so a write lands on the real target instead of
- * a positionally-shifted neighbour on the parent (root cause of #233).
+ * Classify a widget request on `subgraphNode` against `widgetName` and, when it
+ * is a PROMOTED subgraph widget, resolve it to the ACTUAL inner (node, widget).
  *
- * A promoted widget is backed by a SubgraphNode input whose `_subgraphSlot`
- * (subgraph input) links, inside the subgraph, to the inner node's widget
- * input. `resolveSource(subgraphNode, subgraphInput)` performs that link walk
- * (the panel injects its live-graph `sourceForSubgraphInput`) and returns
- * `{ sourceNodeId, sourceWidgetName }`.
+ * Detection matches ONLY the OUTER alias the caller sees on the parent
+ * (host-input name/label and the backing subgraph-input name/label) — never the
+ * inner source widget name — so a renamed promotion (`scheduler` on the parent
+ * mapping to inner `sampler_name`) is followed to the RIGHT inner widget.
  *
- * Returns `{ node, widget, input }` for the inner target, or null when the
- * widget is not a promoted subgraph widget (caller then writes on the node
- * directly).
+ * `resolveSource(subgraphNode, subgraphInput)` walks the subgraph link and
+ * returns `{ sourceNodeId, sourceWidgetName }` (the panel injects its live
+ * `sourceForSubgraphInput`).
+ *
+ * Returns a status object — the caller MUST honour it and never fall back to
+ * the parent slot when `promoted` is true but `target` is null:
+ *   { promoted: false }                             → not a promoted widget
+ *   { promoted: true, target: {node,widget,input} } → resolved inner target
+ *   { promoted: true, target: null, error }         → promoted but UNRESOLVABLE/ambiguous
  */
 export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSource) {
   const subgraph = subgraphNode?.subgraph;
-  if (!subgraph || typeof resolveSource !== "function") return null;
+  if (!subgraph) return { promoted: false };
   const wanted = String(widgetName).toLowerCase();
 
+  // All promoted inputs whose OUTER alias matches the requested name.
+  const matches = [];
   for (const input of subgraphNode.inputs ?? []) {
     const subgraphInput = input?._subgraphSlot;
     if (!subgraphInput) continue;
-
-    const source = resolveSource(subgraphNode, subgraphInput);
-    if (!source) continue;
-
-    // The promoted widget on the parent is named after the host input
-    // (input.name / label) which mirrors the inner source widget name. Match
-    // on any of them so a rename on either side still resolves.
-    const candidates = [
-      input.name,
-      input.label,
-      subgraphInput.name,
-      subgraphInput.label,
-      source.sourceWidgetName,
-    ].map((c) => (c == null ? null : String(c).toLowerCase()));
-    if (!candidates.includes(wanted)) continue;
-
-    const innerNode =
-      typeof subgraph.getNodeById === "function"
-        ? subgraph.getNodeById(source.sourceNodeId)
-        : (subgraph._nodes ?? []).find((n) => String(n?.id) === String(source.sourceNodeId));
-    if (!innerNode) continue;
-
-    const innerWidget = (innerNode.widgets ?? []).find(
-      (w) => w?.name === source.sourceWidgetName,
+    const aliases = [input.name, input.label, subgraphInput.name, subgraphInput.label].map(
+      (a) => (a == null ? null : String(a).toLowerCase()),
     );
-    if (!innerWidget) continue;
-
-    return { node: innerNode, widget: innerWidget, input };
+    if (aliases.includes(wanted)) matches.push({ input, subgraphInput });
   }
-  return null;
+
+  if (matches.length === 0) return { promoted: false };
+  if (matches.length > 1) {
+    return {
+      promoted: true,
+      target: null,
+      error: `promoted widget "${widgetName}" is ambiguous — ${matches.length} promoted inputs match; refusing to guess.`,
+    };
+  }
+
+  const { input, subgraphInput } = matches[0];
+  if (typeof resolveSource !== "function") {
+    return {
+      promoted: true,
+      target: null,
+      error: `no resolver available for promoted widget "${widgetName}".`,
+    };
+  }
+  const source = resolveSource(subgraphNode, subgraphInput);
+  if (!source) {
+    return {
+      promoted: true,
+      target: null,
+      error: `promoted widget "${widgetName}" has no resolvable inner link (stale/empty linkIds).`,
+    };
+  }
+  const innerNode =
+    typeof subgraph.getNodeById === "function"
+      ? subgraph.getNodeById(source.sourceNodeId)
+      : (subgraph._nodes ?? []).find((n) => String(n?.id) === String(source.sourceNodeId));
+  if (!innerNode) {
+    return {
+      promoted: true,
+      target: null,
+      error: `promoted widget "${widgetName}" links to missing inner node ${source.sourceNodeId}.`,
+    };
+  }
+  const innerWidget = (innerNode.widgets ?? []).find((w) => w?.name === source.sourceWidgetName);
+  if (!innerWidget) {
+    return {
+      promoted: true,
+      target: null,
+      error: `promoted widget "${widgetName}" links to missing inner widget "${source.sourceWidgetName}" on node ${source.sourceNodeId}.`,
+    };
+  }
+  return { promoted: true, target: { node: innerNode, widget: innerWidget, input } };
+}
+
+/**
+ * Resolve the true write target (inner promoted widget or the node's own
+ * widget) and validate/coerce the value. Throws WidgetWriteError on any
+ * unresolved-promotion, missing-widget, or value-mismatch condition — BEFORE
+ * any mutation. Pure: no graph side effects.
+ */
+export function resolveWidgetWrite(node, widgetName, value, resolveSource) {
+  let targetNode = node;
+  let widget = null;
+  let promotedFrom = null;
+
+  if (node?.subgraph) {
+    const res = resolvePromotedInnerTarget(node, widgetName, resolveSource);
+    if (res.promoted) {
+      // Promoted widget: use the resolved inner widget DIRECTLY. Never re-search
+      // the inner node by the OUTER name (a rename would hit the wrong inner
+      // widget), and never fall back to the shifted parent slot on failure.
+      if (!res.target) {
+        throw new WidgetWriteError(
+          res.error || `promoted widget "${widgetName}" could not be resolved to an inner widget.`,
+        );
+      }
+      targetNode = res.target.node;
+      widget = res.target.widget;
+      promotedFrom = { subgraph_node_id: node.id, inner_node_id: res.target.node.id };
+    }
+  }
+
+  if (!widget) {
+    widget = (targetNode.widgets ?? []).find(
+      (cand) => cand?.name?.toLowerCase() === String(widgetName).toLowerCase(),
+    );
+  }
+  if (!widget) {
+    const names = (targetNode.widgets ?? []).map((cand) => cand?.name).join(", ");
+    throw new WidgetWriteError(
+      `Node ${targetNode.id} (${targetNode.type}) has no widget "${widgetName}" (available: ${names || "none"}).`,
+    );
+  }
+
+  const coerced = coerceWidgetValue(widget, value);
+  return { targetNode, widget, coerced, promotedFrom };
+}
+
+/**
+ * The COMPLETE graph_set_widget body as a driveable unit: resolve target →
+ * validate/coerce → write (with the widget's own callback) → verify the value
+ * stuck EXACTLY (fail loudly on drift, #240). Graph hooks are injected so this
+ * runs both live and under unit test. Throws WidgetWriteError on any failure.
+ */
+export function applyWidgetWrite(
+  node,
+  widgetName,
+  value,
+  { resolveSource, canvas, beforeChange, afterChange, setDirty } = {},
+) {
+  const { targetNode, widget: w, coerced, promotedFrom } = resolveWidgetWrite(
+    node,
+    widgetName,
+    value,
+    resolveSource,
+  );
+
+  beforeChange?.();
+  const previous = w.value;
+  try {
+    w.value = coerced;
+    // Fire the widget's own callback so combo/number side effects run — the
+    // same path a manual UI edit takes.
+    w.callback?.(coerced, canvas, targetNode, targetNode.pos, undefined);
+  } finally {
+    afterChange?.();
+  }
+  setDirty?.();
+
+  // Verify the write stuck as the EXACT value. A combo callback that
+  // reinterprets an index can drift the value silently — fail rather than
+  // report a false success.
+  if (w.value !== coerced) {
+    throw new WidgetWriteError(
+      `Widget "${w.name}" on node ${targetNode.id} (${targetNode.type}) did not ` +
+        `retain the requested value: wrote ${JSON.stringify(coerced)} but it ` +
+        `became ${JSON.stringify(w.value)}.`,
+    );
+  }
+
+  return {
+    node_id: targetNode.id,
+    widget: w.name,
+    previous,
+    value: w.value,
+    ...(promotedFrom ? { promoted_from: promotedFrom } : {}),
+  };
 }

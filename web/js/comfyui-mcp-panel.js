@@ -90,11 +90,7 @@ import {
   reconcileUnknownWidgetNames,
   reapplyDefsToLiveNodes,
 } from "./lib/asset-staleness.js";
-import {
-  coerceWidgetValue,
-  resolvePromotedInnerTarget,
-  WidgetWriteError,
-} from "./lib/widget-write.js";
+import { applyWidgetWrite, WidgetWriteError } from "./lib/widget-write.js";
 import { coerceMessageText, isDroppedAgentReplay } from "./lib/chat-serialize.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
 import { saveActiveWorkflow } from "./lib/workflow-save.js";
@@ -5167,81 +5163,31 @@ const GRAPH_TOOL_EXECUTORS = {
     // the caller's real widget name resolves (#199) before we look it up.
     reconcileUnknownWidgetNames(node);
 
-    // #233: if this is a PARENT SubgraphNode and `widget` names a PROMOTED
-    // widget, the parent's own widget slot can be positionally shifted against
-    // the inner node — writing it silently corrupts a DIFFERENT inner widget.
-    // Resolve the promoted widget to its ACTUAL inner (node, widget) and write
-    // THERE, so the value always lands on the intended target. The parent view
-    // re-reads the inner value afterwards.
-    let targetNode = node;
-    let promotedFrom = null;
-    if (node.subgraph) {
-      const inner = resolvePromotedInnerTarget(node, widget, sourceForSubgraphInput);
-      if (inner) {
-        targetNode = inner.node;
-        promotedFrom = { subgraph_node_id: node.id, inner_node_id: inner.node.id };
-      }
-    }
-
-    const w = (targetNode.widgets ?? []).find(
-      (cand) => cand?.name?.toLowerCase() === String(widget).toLowerCase(),
-    );
-    if (!w) {
-      const names = (targetNode.widgets ?? []).map((cand) => cand?.name).join(", ");
-      throw new Error(
-        `Node ${targetNode.id} (${targetNode.type}) has no widget "${widget}" (available: ${names || "none"})`,
-      );
-    }
-
-    // Validate + coerce against the target widget's declared type BEFORE
-    // writing. A combo must be an exact option (no index reinterpretation —
-    // #240); a numeric widget must be a number (no "euler" into an INT slot —
-    // #233). Reject with an actionable message instead of corrupting the graph.
-    let coerced;
+    // applyWidgetWrite owns the whole write: for a PARENT SubgraphNode it
+    // resolves a PROMOTED widget to its ACTUAL inner (node, widget) and writes
+    // THERE — never the positionally-shifted parent slot (#233), throwing if
+    // the promotion can't be resolved unambiguously rather than falling open.
+    // It validates the value against the target's declared type (combo must be
+    // an exact CURRENT option — no index drift, #240; numeric must be numeric)
+    // and verifies the write stuck exactly. Same driveable path the unit tests
+    // exercise.
     try {
-      coerced = coerceWidgetValue(w, value);
+      const set = applyWidgetWrite(node, widget, value, {
+        resolveSource: sourceForSubgraphInput,
+        canvas: app.canvas,
+        beforeChange: () => graph.beforeChange(),
+        afterChange: () => graph.afterChange(),
+        setDirty: () => graph.setDirtyCanvas(true, true),
+      });
+      return { set };
     } catch (err) {
       if (err instanceof WidgetWriteError) {
         throw new Error(
-          `Refusing to set widget "${w.name}" on node ${targetNode.id} ` +
-            `(${targetNode.type}): ${err.message}`,
+          `panel_set_widget refused "${widget}" on node ${node.id} (${node.type}): ${err.message}`,
         );
       }
       throw err;
     }
-
-    graph.beforeChange();
-    const previous = w.value;
-    try {
-      w.value = coerced;
-      // Fire the widget's own callback so combo/number side effects run —
-      // the same path a manual UI edit takes.
-      w.callback?.(coerced, app.canvas, targetNode, targetNode.pos, undefined);
-    } finally {
-      graph.afterChange();
-    }
-    graph.setDirtyCanvas(true, true);
-
-    // #240: verify the write stuck as the EXACT value we resolved. Combo
-    // callbacks that reinterpret an index can drift the value silently — fail
-    // loudly rather than report a false success.
-    if (w.value !== coerced) {
-      throw new Error(
-        `Widget "${w.name}" on node ${targetNode.id} (${targetNode.type}) did ` +
-          `not retain the requested value: wrote ${JSON.stringify(coerced)} but ` +
-          `it became ${JSON.stringify(w.value)}.`,
-      );
-    }
-
-    return {
-      set: {
-        node_id: targetNode.id,
-        widget: w.name,
-        previous,
-        value: w.value,
-        ...(promotedFrom ? { promoted_from: promotedFrom } : {}),
-      },
-    };
   },
 
   graph_move_node({ node_id, pos }) {
