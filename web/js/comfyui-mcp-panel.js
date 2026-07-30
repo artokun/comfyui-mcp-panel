@@ -2484,11 +2484,20 @@ async function managerCall(route, { method = "GET", body, signal } = {}) {
 //              routes /manager/queue/{install,update,start,status,...}.
 let managerDialectCache = null;
 
-/** Soft GET probe: parsed JSON, or null on any non-ok / 404 / throw. Never
- *  throws — a probe must not blow up detection. */
+/** Every Manager HTTP call is bounded by this timeout so a stalled request can
+ *  never hang the install path (codex round 2 #5 — probes, install, start,
+ *  status, list are ALL bounded). */
+const MANAGER_FETCH_TIMEOUT_MS = 15000;
+
+/** Soft GET probe: parsed JSON, or null on any non-ok / 404 / throw / stall.
+ *  Never throws — a probe must not blow up detection. Bounded by an AbortSignal
+ *  so a hanging probe can't wedge dialect detection. */
 async function managerProbe(route) {
   try {
-    const res = await api.fetchApi(route, { method: "GET" });
+    const res = await api.fetchApi(route, {
+      method: "GET",
+      signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS),
+    });
     if (!res || !res.ok) return null;
     const txt = await res.text();
     return txt ? JSON.parse(txt) : null;
@@ -2560,13 +2569,13 @@ function boundedDelay(ms, deadline) {
   return new Promise((r) => setTimeout(r, budget));
 }
 
-/** Poll the Manager queue/status until it truly drains (nothing processing and
- *  every queued task accounted for) or the deadline passes. Each status fetch is
- *  bounded by an AbortSignal so a stalled request cannot run past the deadline,
- *  and the initial settle-sleep respects the remaining budget. Never throws.
- *  Returns { drained, status } — `drained` is true ONLY if a drained state was
- *  actually observed; false means the deadline was hit while still processing or
- *  the status was unreadable (INCONCLUSIVE, not proof of failure). */
+/** Poll the Manager queue/status until it POSITIVELY drains (queueDrained) or
+ *  the deadline passes. Each status fetch is bounded by an AbortSignal so a
+ *  stalled request cannot run past the deadline, and the initial settle-sleep
+ *  respects the remaining budget. Never throws. Returns the LAST status seen (or
+ *  null on a stall) — the caller's classifyInstallOutcome re-derives drained
+ *  from it via queueDrained, so a null/malformed status is never a false drain
+ *  (codex round 2 #1). */
 async function waitForQueueDrain({ timeoutMs = 120000, intervalMs = 1500 } = {}) {
   const deadline = Date.now() + timeoutMs;
   let status = null;
@@ -2575,44 +2584,41 @@ async function waitForQueueDrain({ timeoutMs = 120000, intervalMs = 1500 } = {})
   await boundedDelay(1000, deadline);
   while (Date.now() < deadline) {
     // Cap this individual fetch by whatever budget remains.
-    const perFetch = Math.max(1000, Math.min(15000, deadline - Date.now()));
+    const perFetch = Math.max(1000, Math.min(MANAGER_FETCH_TIMEOUT_MS, deadline - Date.now()));
     try {
       status = await managerGet("manager/queue/status", {
         signal: AbortSignal.timeout(perFetch),
       });
     } catch {
-      return { drained: false, status }; // unreadable/aborted — inconclusive
+      return status; // unreadable/aborted — inconclusive (not drained)
     }
-    const processing = status?.is_processing === true;
-    const drained =
-      !processing &&
-      (typeof status?.total_count !== "number" ||
-        (status?.done_count ?? 0) >= status.total_count);
-    if (drained) return { drained: true, status };
+    if (queueDrained(status)) return status;
     await boundedDelay(intervalMs, deadline);
   }
-  return { drained: false, status }; // deadline hit, still processing
+  return status; // deadline hit
 }
 
 /**
  * After an install is queued+started, resolve the TRUE outcome (#232 / codex
- * round 1). Gathers the (bounded) queue-drain result and the installed-nodes
- * list, then delegates the installed/failed/unverified decision to the pure
- * classifyInstallOutcome helper. Returns { state, status, message }; the caller
- * throws only on "failed".
+ * rounds 1-2). Waits for the queue to drain (bounded), reads the installed-nodes
+ * list (bounded), then delegates the installed/failed/unverified decision to the
+ * pure classifyInstallOutcome (which re-derives drained + list-readability from
+ * the raw values — no false drain, no false-readable). `batchFailed` carries the
+ * synchronous v2-batch `failed[]` as failure EVIDENCE (still gated by the
+ * tri-state — never an early throw). Returns { state, status, message }.
  */
-async function verifyInstalled(target, dialect) {
-  const { drained, status } = await waitForQueueDrain();
+async function verifyInstalled(target, dialect, batchFailed) {
+  const status = await waitForQueueDrain();
   let installed = null;
-  let listReadable = true;
+  let listError = false;
   try {
     installed = await managerGet("customnode/installed", {
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS),
     });
   } catch {
-    listReadable = false;
+    listError = true;
   }
-  return classifyInstallOutcome({ target, dialect, drained, listReadable, installed, status });
+  return classifyInstallOutcome({ target, dialect, status, installed, listError, batchFailed });
 }
 
 /** Build a ComfyUI /view URL for an output image descriptor. */
@@ -6801,28 +6807,27 @@ const GRAPH_TOOL_EXECUTORS = {
     // clone/resolve fails, so after queueing we resolve the TRUE outcome instead
     // of claiming success — installed / failed / unverified (see verifyInstalled).
     const target = dialect === "v2" ? req.params.id : req.body.id;
+    // Every Manager mutation is bounded (codex round 2 #5).
+    const post = (body) => ({ method: "POST", body, signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS) });
+    let batchFailed; // v2-batch synchronous failed[] — FEEDS the gate as evidence
     if (dialect === "v2") {
-      await managerV2("manager/queue/task", {
-        method: "POST",
-        body: { kind: "install", params: req.params, ui_id, client_id },
-      });
-      await managerV2("manager/queue/start", { method: "POST" });
+      await managerV2("manager/queue/task", post({ kind: "install", params: req.params, ui_id, client_id }));
+      await managerV2("manager/queue/start", post());
     } else if (dialect === "v2-batch") {
-      const res = await managerV2("manager/queue/batch", {
-        method: "POST",
-        body: { install: [req.body] },
-      });
-      // Surface a synchronous batch `failed` instead of silently claiming success (#184).
-      assertBatchOk(res, req.body.id, "install");
-      await managerV2("manager/queue/start", { method: "POST" });
+      const res = await managerV2("manager/queue/batch", post({ install: [req.body] }));
+      // Capture the synchronous `failed[]` as failure EVIDENCE — but do NOT throw
+      // early (codex round 2 #4). The final outcome still goes through the
+      // tri-state gate (drained + list-readable + absent) below.
+      batchFailed = Array.isArray(res?.failed) ? res.failed : undefined;
+      await managerV2("manager/queue/start", post());
     } else {
-      await managerCall("manager/queue/install", { method: "POST", body: req.body });
-      await managerCall("manager/queue/start", { method: "POST" });
+      await managerCall("manager/queue/install", post(req.body));
+      await managerCall("manager/queue/start", post());
     }
     // Resolve the true outcome. Throw ONLY on positive failure evidence; an
     // inconclusive result returns an honest unverified status (never a silent
-    // success, never a false failure). #232 + codex round 1.
-    const outcome = await verifyInstalled(target, dialect);
+    // success, never a false failure). #232 + codex rounds 1-2.
+    const outcome = await verifyInstalled(target, dialect, batchFailed);
     if (outcome.state === "failed") throw new Error(outcome.message);
     if (outcome.state === "installed") {
       return {

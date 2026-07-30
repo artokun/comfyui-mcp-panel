@@ -12,6 +12,8 @@ import {
   buildInstallRequest,
   parseInstalled,
   nodeInstalledMatches,
+  queueDrained,
+  isReadableInstalledList,
   queueFailureSignal,
   classifyInstallOutcome,
 } from "../../web/js/lib/manager-install.js";
@@ -143,11 +145,42 @@ test("nodeInstalledMatches accepts a full git URL directly and matches by repo n
   assert.equal(nodeInstalledMatches("rgthree-comfy", {}), false);
 });
 
-// --- queueFailureSignal: only explicit evidence counts ----------------------
-test("queueFailureSignal fires only on explicit error/failed evidence", () => {
+// --- queueDrained: POSITIVE evidence only (codex round 2 #1) ----------------
+test("queueDrained requires a well-formed stopped status with coherent counts", () => {
+  assert.equal(queueDrained({ is_processing: false, done_count: 1, total_count: 1 }), true);
+  assert.equal(queueDrained({ is_processing: false, done_count: 2, total_count: 1 }), true);
+  // Absence / malformed / missing counts ⇒ NOT drained.
+  assert.equal(queueDrained(null), false, "null is not drained");
+  assert.equal(queueDrained({}), false, "empty object is not drained");
+  assert.equal(queueDrained({ error_count: 1 }), false, "no is_processing/counts ⇒ not drained");
+  assert.equal(queueDrained({ is_processing: false }), false, "no counts ⇒ not drained");
+  assert.equal(queueDrained({ is_processing: false, done_count: 0 }), false, "missing total ⇒ not drained");
+  assert.equal(queueDrained({ is_processing: true, done_count: 1, total_count: 1 }), false, "still processing");
+  assert.equal(queueDrained({ is_processing: false, done_count: 0, total_count: 2 }), false, "done<total");
+  assert.equal(queueDrained("done"), false, "primitive ⇒ not drained");
+  assert.equal(queueDrained([]), false, "array ⇒ not drained");
+});
+
+// --- isReadableInstalledList: only a real array/map (codex round 2 #3) ------
+test("isReadableInstalledList trusts only a well-formed array or map", () => {
+  assert.equal(isReadableInstalledList([]), true);
+  assert.equal(isReadableInstalledList({}), true);
+  assert.equal(isReadableInstalledList({ "rgthree-comfy": {} }), true);
+  assert.equal(isReadableInstalledList(null), false);
+  assert.equal(isReadableInstalledList(undefined), false);
+  assert.equal(isReadableInstalledList("ok"), false);
+  assert.equal(isReadableInstalledList(42), false);
+});
+
+// --- queueFailureSignal: explicit evidence OR batch failed[] ----------------
+test("queueFailureSignal fires only on explicit evidence (status or batch)", () => {
   assert.equal(queueFailureSignal({ error_count: 1 }), true);
   assert.equal(queueFailureSignal({ failed_count: 2 }), true);
   assert.equal(queueFailureSignal({ failed: ["x"] }), true);
+  // batch failed[] naming the target is evidence.
+  assert.equal(queueFailureSignal({}, ["bar"], "bar"), true);
+  assert.equal(queueFailureSignal({}, ["other"], "bar"), false, "batch failed for a different id");
+  assert.equal(queueFailureSignal({}, [], "bar"), false);
   // A clean/absent status is NOT failure evidence (the #232 trap).
   assert.equal(queueFailureSignal({ is_processing: false, done_count: 1, total_count: 1 }), false);
   assert.equal(queueFailureSignal({ error_count: 0, failed: [] }), false);
@@ -155,102 +188,167 @@ test("queueFailureSignal fires only on explicit error/failed evidence", () => {
 });
 
 // --- classifyInstallOutcome: TRI-STATE, no false success / no false failure --
-// The handler verifies buildInstallRequest's id (already the repo NAME for a git
-// URL). Exercise the full outcome decision per dialect end-to-end.
+// Exercises the EXACT status/list shapes codex round 2 named, per dialect. The
+// handler verifies buildInstallRequest's id (already the repo NAME for a git URL).
+const DRAINED = { is_processing: false, done_count: 1, total_count: 1 };
 for (const dialect of ["v2", "v2-batch", "legacy"]) {
   const targetOf = (args) => {
     const req = buildInstallRequest(dialect, args, "uid-1");
     return dialect === "v2" ? req.params.id : req.body.id;
   };
 
-  test(`${dialect}: pack present ⇒ installed (registry)`, () => {
+  test(`${dialect}: drained + pack present ⇒ installed (registry)`, () => {
     const o = classifyInstallOutcome({
       target: targetOf({ id: "rgthree-comfy" }),
       dialect,
-      drained: true,
-      listReadable: true,
+      status: DRAINED,
       installed: { "rgthree-comfy": { ver: "1.0.0", cnr_id: "rgthree-comfy" } },
-      status: { is_processing: false, done_count: 1, total_count: 1 },
     });
     assert.equal(o.state, "installed");
   });
 
-  test(`${dialect}: pack present ⇒ installed (git URL, repo-name dir)`, () => {
+  test(`${dialect}: drained + pack present ⇒ installed (git URL, repo-name dir)`, () => {
     const o = classifyInstallOutcome({
       target: targetOf({ repository: "https://github.com/rgthree/rgthree-comfy.git" }),
       dialect,
-      drained: true,
-      listReadable: true,
+      status: DRAINED,
       installed: { "rgthree-comfy": { ver: "nightly", aux_id: "rgthree/rgthree-comfy" } },
-      status: {},
     });
     assert.equal(o.state, "installed");
   });
 
-  test(`${dialect}: drained + absent + explicit failure ⇒ failed (no false success)`, () => {
+  test(`${dialect}: drained + absent + explicit failure ⇒ failed`, () => {
     const o = classifyInstallOutcome({
       target: targetOf({ repository: "https://github.com/TenStrip/10S-Comfy-nodes.git" }),
       dialect,
-      drained: true,
-      listReadable: true,
+      status: { is_processing: false, done_count: 1, total_count: 1, error_count: 1 },
       installed: {}, // nothing landed — exactly the #232 report
-      status: { is_processing: false, error_count: 1 },
     });
     assert.equal(o.state, "failed");
     assert.match(o.message, /FAILED/);
   });
 
-  test(`${dialect}: drained + absent + NO failure signal ⇒ unverified (no false failure)`, () => {
+  test(`${dialect}: drained + absent + NO failure signal ⇒ unverified`, () => {
     const o = classifyInstallOutcome({
       target: targetOf({ id: "rgthree-comfy" }),
       dialect,
-      drained: true,
-      listReadable: true,
+      status: DRAINED,
       installed: { "some-other-pack": {} },
-      status: { is_processing: false, done_count: 1, total_count: 1 },
+    });
+    assert.equal(o.state, "unverified");
+  });
+
+  // codex #1: {error_count:1} alone is NOT a drain → must NOT become failed.
+  test(`${dialect}: {error_count:1} but NOT drained ⇒ unverified, never failed`, () => {
+    const o = classifyInstallOutcome({
+      target: targetOf({ id: "rgthree-comfy" }),
+      dialect,
+      status: { error_count: 1 }, // no is_processing:false + counts ⇒ not a positive drain
+      installed: {},
     });
     assert.equal(o.state, "unverified");
     assert.notEqual(o.state, "failed");
   });
 
-  test(`${dialect}: still processing at deadline ⇒ unverified, never failed (>120s install)`, () => {
+  // codex #1: null / {} status ⇒ never drained ⇒ unverified.
+  for (const [label, status] of [["null", null], ["empty {}", {}], ["primitive", "done"]]) {
+    test(`${dialect}: ${label} status ⇒ unverified (no false drain)`, () => {
+      const o = classifyInstallOutcome({
+        target: targetOf({ id: "rgthree-comfy" }),
+        dialect,
+        status,
+        installed: { "rgthree-comfy": { cnr_id: "rgthree-comfy" } }, // even if present!
+      });
+      assert.equal(o.state, "unverified");
+      assert.notEqual(o.state, "installed");
+    });
+  }
+
+  // codex #2: still-processing MUST NOT report installed even if the pack is
+  // already present (could be a stale/partial dir).
+  test(`${dialect}: still processing + pack present ⇒ unverified, NOT installed`, () => {
     const o = classifyInstallOutcome({
-      target: targetOf({ repository: "https://github.com/big/slow-pack.git" }),
+      target: targetOf({ id: "rgthree-comfy" }),
       dialect,
-      drained: false, // deadline hit while the clone was still running
-      listReadable: true,
-      installed: {},
-      status: { is_processing: true },
+      status: { is_processing: true, done_count: 0, total_count: 1 },
+      installed: { "rgthree-comfy": { cnr_id: "rgthree-comfy" } },
     });
     assert.equal(o.state, "unverified");
+    assert.notEqual(o.state, "installed");
     assert.match(o.message, /still in progress/);
   });
 
-  test(`${dialect}: RENAMED install dir (bare module, ≠ repo name) ⇒ unverified, NOT hard-fail`, () => {
-    // The #232 report: TenStrip/10S-Comfy-nodes installs into dir 10S_Nodes.
-    // A bare module name with no cnr_id/aux_id can't positively match the repo
-    // name — that is INCONCLUSIVE, never proof the genuine install failed.
+  // codex #3: a null/primitive list (200 but malformed) with a failure status
+  // must be unverified, not failed.
+  test(`${dialect}: drained + null list + failure status ⇒ unverified (malformed list)`, () => {
+    const o = classifyInstallOutcome({
+      target: targetOf({ id: "rgthree-comfy" }),
+      dialect,
+      status: { is_processing: false, done_count: 1, total_count: 1, error_count: 1 },
+      installed: null, // 200 but empty body coerced to null
+    });
+    assert.equal(o.state, "unverified");
+  });
+
+  test(`${dialect}: listError (fetch threw) ⇒ unverified, never failed`, () => {
+    const o = classifyInstallOutcome({
+      target: targetOf({ id: "rgthree-comfy" }),
+      dialect,
+      status: { is_processing: false, done_count: 1, total_count: 1, error_count: 1 },
+      installed: null,
+      listError: true,
+    });
+    assert.equal(o.state, "unverified");
+  });
+
+  // codex #3 / #232 point 3: RENAMED install dir — genuine install, bare module
+  // name ≠ repo name ⇒ unverified, NEVER a hard fail.
+  test(`${dialect}: RENAMED install dir (10S-Comfy-nodes → 10S_Nodes) ⇒ unverified, NOT failed`, () => {
     const o = classifyInstallOutcome({
       target: targetOf({ repository: "https://github.com/TenStrip/10S-Comfy-nodes.git" }),
       dialect,
-      drained: true,
-      listReadable: true,
+      status: DRAINED, // drained, no failure signal
       installed: { "10S_Nodes": { ver: "nightly" } }, // it DID land, under a renamed dir
-      status: { is_processing: false, done_count: 1, total_count: 1 }, // no failure signal
     });
     assert.notEqual(o.state, "failed");
     assert.equal(o.state, "unverified");
   });
-
-  test(`${dialect}: installed-list unreadable ⇒ unverified, never failed`, () => {
-    const o = classifyInstallOutcome({
-      target: targetOf({ id: "rgthree-comfy" }),
-      dialect,
-      drained: true,
-      listReadable: false,
-      installed: null,
-      status: { error_count: 1 }, // even with a failure signal, unreadable list ⇒ inconclusive
-    });
-    assert.equal(o.state, "unverified");
-  });
 }
+
+// --- codex #4: the v2-batch synchronous failed[] FEEDS the gate as evidence,
+// never an early throw; the tri-state still applies. ------------------------
+test("v2-batch: batch failed[] + drained + absent ⇒ failed (through the gate)", () => {
+  const target = buildInstallRequest("v2-batch", { id: "rgthree-comfy" }, "u").body.id;
+  const o = classifyInstallOutcome({
+    target,
+    dialect: "v2-batch",
+    status: DRAINED, // no error_count on status — the ONLY evidence is batchFailed
+    installed: {},
+    batchFailed: [target],
+  });
+  assert.equal(o.state, "failed");
+});
+
+test("v2-batch: batch failed[] but NOT drained ⇒ unverified (evidence still gated)", () => {
+  const target = buildInstallRequest("v2-batch", { id: "rgthree-comfy" }, "u").body.id;
+  const o = classifyInstallOutcome({
+    target,
+    dialect: "v2-batch",
+    status: { is_processing: true }, // not drained
+    installed: {},
+    batchFailed: [target],
+  });
+  assert.equal(o.state, "unverified");
+});
+
+test("v2-batch: batch failed[] but the pack IS present ⇒ installed (evidence ≠ absence)", () => {
+  const target = buildInstallRequest("v2-batch", { id: "rgthree-comfy" }, "u").body.id;
+  const o = classifyInstallOutcome({
+    target,
+    dialect: "v2-batch",
+    status: DRAINED,
+    installed: { "rgthree-comfy": { cnr_id: "rgthree-comfy" } },
+    batchFailed: [target], // stale/ignored — presence wins
+  });
+  assert.equal(o.state, "installed");
+});

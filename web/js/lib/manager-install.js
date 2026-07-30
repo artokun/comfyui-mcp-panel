@@ -194,11 +194,34 @@ export function nodeInstalledMatches(idOrUrl, installed) {
   });
 }
 
-/** Positive evidence from a queue/status payload that the run actually FAILED.
- *  Most Manager builds expose no per-task result on queue/status, so this only
- *  fires on an explicit error/failed count or array — NEVER inferred from a
- *  missing pack (that is inconclusive, not proof; #232). */
-export function queueFailureSignal(status) {
+/** Has the Manager queue POSITIVELY drained? True ONLY for a well-formed status
+ *  object that says it stopped AND accounts for every task with coherent counts
+ *  (is_processing===false, numeric done_count/total_count, done>=total). A null,
+ *  empty, or malformed status is NOT drained — absence of evidence is not
+ *  evidence of a drain (codex round 2 #1). */
+export function queueDrained(status) {
+  if (!status || typeof status !== "object" || Array.isArray(status)) return false;
+  if (status.is_processing !== false) return false;
+  const done = status.done_count;
+  const total = status.total_count;
+  if (typeof done !== "number" || typeof total !== "number") return false;
+  return done >= total;
+}
+
+/** Is a /customnode/installed payload well-formed enough to trust its ABSENCE of
+ *  a pack? Only a real array or a plain object (the map shape) counts. null, a
+ *  JSON primitive, or anything else ⇒ NOT readable ⇒ inconclusive (codex #3). */
+export function isReadableInstalledList(raw) {
+  return Array.isArray(raw) || (!!raw && typeof raw === "object");
+}
+
+/** Positive evidence that the run actually FAILED — an explicit error/failed
+ *  count or array on the queue status, OR the synchronous batch `failed[]`
+ *  naming our target. NEVER inferred from a missing pack (inconclusive; #232). */
+export function queueFailureSignal(status, batchFailed, target) {
+  if (Array.isArray(batchFailed) && batchFailed.length > 0) {
+    if (target === undefined || batchFailed.includes(target)) return true;
+  }
   if (!status || typeof status !== "object") return false;
   for (const k of ["error_count", "failed_count", "fail_count"]) {
     if (typeof status[k] === "number" && status[k] > 0) return true;
@@ -209,31 +232,50 @@ export function queueFailureSignal(status) {
 
 /**
  * Decide the TRUE outcome of an install after it was queued+started (#232 /
- * codex round 1). Pure so it is unit-testable without the browser Manager
- * client. Three states — never a false success and never a false failure:
- *   - "installed":  pack positively present in the installed list.
- *   - "failed":     the queue truly drained AND the list was readable AND the
- *                   Manager surfaced explicit failure evidence AND the pack is
- *                   absent. Only then is absence proof.
- *   - "unverified": everything else — still processing at the deadline, status
- *                   or list unreadable, or drained-but-absent with no failure
- *                   signal (e.g. a renamed install dir the name-match can't
- *                   confirm). Honest "could not confirm", NOT success/failure.
- * @param {{ target:string, dialect?:string, drained:boolean,
- *           listReadable:boolean, installed:unknown, status:unknown }} input
+ * codex rounds 1-2). Pure so it is unit-testable without the browser Manager
+ * client. DRAINED IS CHECKED FIRST — nothing is "installed" or "failed" until
+ * the queue positively drained. Three states, never a false success and never a
+ * false failure:
+ *   - "installed":  queue drained AND list readable AND pack positively present.
+ *   - "failed":     queue drained AND list readable AND pack absent AND explicit
+ *                   failure evidence (queue error/failed count, or the batch
+ *                   `failed[]`). Only then is absence proof.
+ *   - "unverified": everything else — not drained (still processing / no
+ *                   positive drain evidence), status/list unreadable or
+ *                   malformed, or drained-but-absent with no failure signal
+ *                   (e.g. a renamed install dir the name-match can't confirm).
+ * @param {{ target:string, dialect?:string, status:unknown, installed:unknown,
+ *           listError?:boolean, batchFailed?:unknown }} input
  */
 export function classifyInstallOutcome({
   target,
   dialect,
-  drained,
-  listReadable,
-  installed,
   status,
+  installed,
+  listError = false,
+  batchFailed,
 }) {
+  const drained = queueDrained(status);
+  const listReadable = !listError && isReadableInstalledList(installed);
+
+  // Not drained ⇒ inconclusive REGARDLESS of pack presence — the queue may
+  // still be cloning; a pack seen now could be a stale/partial dir (codex #2).
+  if (!drained) {
+    return {
+      state: "unverified",
+      status,
+      message: unverifiedMessage(
+        target,
+        "the install is still in progress (the Manager queue has not positively drained)",
+      ),
+    };
+  }
+
   if (listReadable && nodeInstalledMatches(target, installed)) {
     return { state: "installed", status };
   }
-  if (drained && listReadable && queueFailureSignal(status)) {
+
+  if (listReadable && queueFailureSignal(status, batchFailed, target)) {
     return {
       state: "failed",
       status,
@@ -245,18 +287,24 @@ export function classifyInstallOutcome({
         `gating is a common cause).`,
     };
   }
-  const why = !drained
-    ? "the install is still in progress (the Manager queue had not drained)"
-    : !listReadable
-      ? "the installed-nodes list could not be read"
-      : "the pack was not found by name (its install directory may differ from the repo name)";
+
   return {
     state: "unverified",
     status,
-    message:
-      `"${target}" was queued but could NOT be confirmed installed — ${why}. This is ` +
-      `not a reported failure. Poll panel_node_queue_status and VERIFY with ` +
-      `panel_list_nodes; a ComfyUI restart (comfy_reboot) is usually required to load ` +
-      `new nodes. If it still does not appear, check the ComfyUI server log.`,
+    message: unverifiedMessage(
+      target,
+      !listReadable
+        ? "the installed-nodes list could not be read"
+        : "the pack was not found by name (its install directory may differ from the repo name)",
+    ),
   };
+}
+
+function unverifiedMessage(target, why) {
+  return (
+    `"${target}" was queued but could NOT be confirmed installed — ${why}. This is ` +
+    `not a reported failure. Poll panel_node_queue_status and VERIFY with ` +
+    `panel_list_nodes; a ComfyUI restart (comfy_reboot) is usually required to load ` +
+    `new nodes. If it still does not appear, check the ComfyUI server log.`
+  );
 }
