@@ -208,11 +208,39 @@ export function queueDrained(status) {
   return done >= total;
 }
 
-/** Is a /customnode/installed payload well-formed enough to trust its ABSENCE of
- *  a pack? Only a real array or a plain object (the map shape) counts. null, a
- *  JSON primitive, or anything else ⇒ NOT readable ⇒ inconclusive (codex #3). */
+/** Keys a genuine installed-node entry object carries (manager_core
+ *  get_installed_node_packs + array/variant shapes). One is enough. */
+const NODE_ENTRY_KEYS = ["module", "cnr_id", "cnrId", "aux_id", "auxId", "name", "title", "ver", "version"];
+
+/** Is `v` a plausible installed-node ENTRY — a plain object with at least one
+ *  expected key? Guards against error envelopes and junk. */
+function isNodeEntry(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+  return NODE_ENTRY_KEYS.some((k) => k in v);
+}
+
+/** Is a /customnode/installed payload well-formed enough to TRUST its absence of
+ *  a pack? Validates SHAPE, not just container type (codex round 4). Readable
+ *  ONLY when it is:
+ *    - an EMPTY array or map (legitimately "nothing installed"), OR
+ *    - an ARRAY whose every element is a node-entry object, OR
+ *    - a plain object (MAP) whose every value is a node-entry object.
+ *  An error envelope ({error|detail|message:…} with no entries), an array
+ *  containing null/primitives/non-entry items, a no-entry-shape object, null, or
+ *  a JSON primitive ⇒ NOT readable ⇒ inconclusive (stays unverified). */
 export function isReadableInstalledList(raw) {
-  return Array.isArray(raw) || (!!raw && typeof raw === "object");
+  if (Array.isArray(raw)) {
+    // Bare-string arrays are a documented legacy shape (parseInstalled handles
+    // them); accept an array whose every element is a non-empty string OR a
+    // node-entry object. Mixed/primitive/null elements ⇒ not readable.
+    return raw.every(
+      (el) => (typeof el === "string" && el.length > 0) || isNodeEntry(el),
+    );
+  }
+  if (!raw || typeof raw !== "object") return false;
+  const values = Object.values(raw);
+  if (values.length === 0) return true; // empty map — nothing installed
+  return values.every((v) => isNodeEntry(v));
 }
 
 /** Positive evidence that the run actually FAILED — an explicit error/failed

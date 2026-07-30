@@ -161,11 +161,27 @@ test("queueDrained requires a well-formed stopped status with coherent counts", 
   assert.equal(queueDrained([]), false, "array ⇒ not drained");
 });
 
-// --- isReadableInstalledList: only a real array/map (codex round 2 #3) ------
-test("isReadableInstalledList trusts only a well-formed array or map", () => {
+// --- isReadableInstalledList: validate SHAPE, not just container (codex r4) --
+test("isReadableInstalledList trusts only a well-formed installed list", () => {
+  // Empty array/map ⇒ legitimately "nothing installed" ⇒ readable.
   assert.equal(isReadableInstalledList([]), true);
   assert.equal(isReadableInstalledList({}), true);
-  assert.equal(isReadableInstalledList({ "rgthree-comfy": {} }), true);
+  // Real map of entry objects ⇒ readable.
+  assert.equal(isReadableInstalledList({ "rgthree-comfy": { cnr_id: "rgthree-comfy" } }), true);
+  assert.equal(isReadableInstalledList({ "10S_Nodes": { ver: "nightly" } }), true);
+  // Real array of entry objects / legacy bare strings ⇒ readable.
+  assert.equal(isReadableInstalledList([{ module: "x", cnr_id: "x" }]), true);
+  assert.equal(isReadableInstalledList(["rgthree-comfy", "comfyui-manager"]), true);
+  // Error envelope ⇒ NOT readable.
+  assert.equal(isReadableInstalledList({ error: "unavailable" }), false);
+  assert.equal(isReadableInstalledList({ detail: "nope" }), false);
+  assert.equal(isReadableInstalledList({ message: "boom" }), false);
+  // No-entry-shape object / junk arrays ⇒ NOT readable.
+  assert.equal(isReadableInstalledList({ foo: "bar" }), false);
+  assert.equal(isReadableInstalledList([null]), false);
+  assert.equal(isReadableInstalledList([123]), false);
+  assert.equal(isReadableInstalledList([{ module: "x" }, null]), false);
+  // Container/primitive guards.
   assert.equal(isReadableInstalledList(null), false);
   assert.equal(isReadableInstalledList(undefined), false);
   assert.equal(isReadableInstalledList("ok"), false);
@@ -328,6 +344,27 @@ for (const dialect of ["v2", "v2-batch", "legacy"]) {
     });
     assert.equal(o.state, "unverified");
   });
+
+  // codex r4: a "200 but malformed" body (error envelope / junk array/object)
+  // is NOT a trustworthy installed list — must stay unverified even for an
+  // IDENTIFIABLE id with a drained failure status (would otherwise false-fail).
+  for (const [label, installed] of [
+    ["error envelope {error}", { error: "unavailable" }],
+    ["error envelope {detail}", { detail: "nope" }],
+    ["[null]", [null]],
+    ["[123]", [123]],
+    ["no-entry-shape {foo:bar}", { foo: "bar" }],
+  ]) {
+    test(`${dialect}: identifiable id + drained failure + ${label} ⇒ unverified, NOT failed`, () => {
+      const o = classifyInstallOutcome({
+        ...inputFor({ id: "no-such-registry-pack" }),
+        status: FAIL_STATUS,
+        installed,
+      });
+      assert.notEqual(o.state, "failed");
+      assert.equal(o.state, "unverified");
+    });
+  }
 
   test(`${dialect}: listError (fetch threw) ⇒ unverified, never failed`, () => {
     const o = classifyInstallOutcome({
