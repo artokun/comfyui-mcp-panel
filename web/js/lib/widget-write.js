@@ -70,12 +70,37 @@ export function isBooleanWidget(widget) {
 }
 
 /**
+ * True for a COMPOSITE widget whose value is a plain object rather than a scalar
+ * — e.g. the rgthree Power Lora Loader's `lora_N` rows ({on, lora, strength,
+ * strengthTwo, …}). Detected by the CURRENT value's shape (a non-null, non-array
+ * object) so it works without an rgthree-specific type tag. Combos are excluded
+ * upstream (they are matched before this runs). (#179)
+ */
+export function isCompositeObjectWidget(widget) {
+  const v = widget?.value;
+  return v != null && typeof v === "object" && !Array.isArray(v);
+}
+
+/**
  * Validate + coerce `value` for `widget`, returning the value to write. Throws
  * WidgetWriteError (never silently coerces to a wrong value) when the value is
  * incompatible with the widget's declared type.
  */
 export function coerceWidgetValue(widget, value) {
   const name = widget?.name ?? "(widget)";
+
+  // #347: distinguish "clear to empty" from "missing value". An EXPLICIT empty
+  // string is a valid request to empty a text/string widget (handled by the
+  // pass-through at the end); a MISSING value (undefined/null — e.g. an omitted
+  // or dropped arg) is not, and must fail loudly instead of silently writing
+  // `undefined`. The combo/numeric/boolean branches below still reject "" on
+  // their own terms, so #240 strictness is untouched.
+  if (value === undefined || value === null) {
+    throw new WidgetWriteError(
+      `No value provided for widget "${name}". To clear a text widget, pass an ` +
+        `explicit empty string ("").`,
+    );
+  }
 
   if (isComboWidget(widget)) {
     const options = comboOptions(widget);
@@ -131,7 +156,37 @@ export function coerceWidgetValue(widget, value) {
     );
   }
 
-  // STRING / text / unknown widget: pass through unchanged.
+  // #179: rgthree Power Lora Loader (and similar) expose a COMPOSITE widget whose
+  // value is a plain object ({on, lora, strength, …}), not a scalar. The MCP arg
+  // schema allows only string|number|boolean, so a composite is sent as a JSON
+  // STRING; writing that string verbatim corrupts the row (rgthree then reads
+  // lora=null and drops strength). Parse a JSON-string payload (or accept an
+  // object directly) and MERGE onto the current value so fields the caller did
+  // not specify (e.g. strengthTwo) are preserved.
+  if (isCompositeObjectWidget(widget)) {
+    let incoming = value;
+    if (typeof value === "string") {
+      try {
+        incoming = JSON.parse(value);
+      } catch {
+        throw new WidgetWriteError(
+          `Widget "${name}" holds a composite object value; the string ` +
+            `${JSON.stringify(value)} is not valid JSON for it.`,
+        );
+      }
+    }
+    if (incoming == null || typeof incoming !== "object" || Array.isArray(incoming)) {
+      throw new WidgetWriteError(
+        `Widget "${name}" is a composite object widget; value ${JSON.stringify(value)} ` +
+          `must be an object (or a JSON object string), e.g. ` +
+          `{"on":true,"lora":"name.safetensors","strength":1}.`,
+      );
+    }
+    return { ...widget.value, ...incoming };
+  }
+
+  // STRING / text / unknown widget: pass through unchanged (an explicit "" clears
+  // it, #347).
   return value;
 }
 
@@ -307,6 +362,14 @@ export function applyWidgetWrite(
     assertTargetWritable,
   );
 
+  // Snapshot the EXPECTED value BEFORE the callback runs. For a COMPOSITE object
+  // write (#179) `w.value` and `coerced` are the SAME reference, so a callback
+  // that mutates the object IN PLACE would change our "expected" too — making a
+  // post-hoc compare trivially pass and hiding real drift. A structural clone
+  // taken up front preserves the drift check (a scalar clones to itself).
+  const objectWrite = coerced !== null && typeof coerced === "object";
+  const expected = objectWrite ? JSON.parse(JSON.stringify(coerced)) : coerced;
+
   beforeChange?.();
   const previous = w.value;
   try {
@@ -319,13 +382,23 @@ export function applyWidgetWrite(
   }
   setDirty?.();
 
-  // Verify the write stuck as the EXACT value. A combo callback that
-  // reinterprets an index can drift the value silently — fail rather than
-  // report a false success.
-  if (w.value !== coerced) {
+  // Verify the write stuck. A combo callback that reinterprets an index can
+  // drift a SCALAR value silently — fail rather than report a false success, by
+  // strict identity (#240). For a COMPOSITE object value (#179) the callback may
+  // clone/normalize the object, so strict identity would false-fail; require
+  // instead that every field we set is present with the value we wrote, compared
+  // against the pre-callback snapshot so an in-place drift is still caught.
+  const stuck = objectWrite
+    ? w.value !== null &&
+      typeof w.value === "object" &&
+      Object.keys(expected).every(
+        (k) => JSON.stringify(w.value[k]) === JSON.stringify(expected[k]),
+      )
+    : w.value === expected;
+  if (!stuck) {
     throw new WidgetWriteError(
       `Widget "${w.name}" on node ${targetNode.id} (${targetNode.type}) did not ` +
-        `retain the requested value: wrote ${JSON.stringify(coerced)} but it ` +
+        `retain the requested value: wrote ${JSON.stringify(expected)} but it ` +
         `became ${JSON.stringify(w.value)}.`,
     );
   }

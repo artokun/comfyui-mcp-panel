@@ -21,6 +21,7 @@ import {
   coerceWidgetValue,
   comboOptions,
   isComboWidget,
+  isCompositeObjectWidget,
   isNumericWidget,
   resolvePromotedInnerTarget,
   WidgetWriteError,
@@ -28,6 +29,118 @@ import {
 
 // No-op graph hooks so applyWidgetWrite exercises the full write path.
 const HOOKS = {};
+
+// ---- #347: empty-string clear vs missing value -----------------------------
+
+test("#347: a text/string widget can be CLEARED with an explicit empty string", () => {
+  for (const type of ["customtext", "text", "string", undefined]) {
+    const node = {
+      id: 39,
+      type: "Florence2Run",
+      widgets: [{ name: "text_input", type, value: "some prompt" }],
+    };
+    const set = applyWidgetWrite(node, "text_input", "", HOOKS);
+    assert.equal(set.value, "");
+    assert.equal(node.widgets[0].value, "");
+  }
+});
+
+test("#347: a MISSING value (undefined/null) is refused, not silently written", () => {
+  const w = { name: "text_input", type: "customtext", value: "x" };
+  assert.throws(() => coerceWidgetValue(w, undefined), /No value provided/);
+  assert.throws(() => coerceWidgetValue(w, null), /No value provided/);
+});
+
+test("#347: clearing to '' does NOT weaken combo/numeric strictness (#240)", () => {
+  const combo = { name: "sampler", options: { values: ["euler", "dpmpp_2m"] } };
+  assert.throws(() => coerceWidgetValue(combo, ""), WidgetWriteError);
+  const num = { name: "steps", type: "INT", value: 20 };
+  assert.throws(() => coerceWidgetValue(num, ""), /not a number/);
+});
+
+// ---- #179: rgthree Power Lora Loader composite widget ----------------------
+
+test("#179: a composite lora_N widget is detected by its object value", () => {
+  const w = { name: "lora_10", value: { on: false, lora: null, strength: 1 } };
+  assert.equal(isCompositeObjectWidget(w), true);
+  assert.equal(isCompositeObjectWidget({ name: "text", value: "hello" }), false);
+});
+
+test("#179: setting a Power Lora row from a JSON STRING writes the composite object", () => {
+  const node = {
+    id: 77,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [
+      { name: "lora_10", value: { on: false, lora: null, strength: 1, strengthTwo: null } },
+    ],
+  };
+  const set = applyWidgetWrite(
+    node,
+    "lora_10",
+    '{"on":true,"lora":"some.safetensors","strength":0.6}',
+    HOOKS,
+  );
+  // The lora filename and strength are preserved (not lora:null / strength:1).
+  assert.equal(set.value.on, true);
+  assert.equal(set.value.lora, "some.safetensors");
+  assert.equal(set.value.strength, 0.6);
+  // Unspecified field carried over from the prior value.
+  assert.equal(set.value.strengthTwo, null);
+  assert.equal(node.widgets[0].value.lora, "some.safetensors");
+});
+
+test("#179: an rgthree callback that CLONES the object still verifies as stuck", () => {
+  const node = {
+    id: 78,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [
+      {
+        name: "lora_1",
+        value: { on: false, lora: null, strength: 1 },
+        // rgthree normalizes by replacing the object reference — must not
+        // false-fail the write-stuck check.
+        callback(v, _canvas, _node) {
+          this.value = { ...v };
+        },
+      },
+    ],
+  };
+  const set = applyWidgetWrite(node, "lora_1", '{"on":true,"lora":"x.safetensors","strength":0.8}', {});
+  assert.equal(set.value.lora, "x.safetensors");
+  assert.equal(node.widgets[0].value.strength, 0.8);
+});
+
+test("#179: a callback that DRIFTS a composite field is still caught (not false-pass)", () => {
+  const node = {
+    id: 80,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [
+      {
+        name: "lora_3",
+        value: { on: false, lora: null, strength: 1 },
+        // Malicious/buggy callback that mutates the object in place to a WRONG
+        // value — must be detected as drift (the expected snapshot is taken
+        // before the callback), never reported as retained.
+        callback(v) {
+          v.lora = "WRONG.safetensors";
+        },
+      },
+    ],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "lora_3", '{"on":true,"lora":"right.safetensors","strength":1}', {}),
+    /did not.*retain/s,
+  );
+});
+
+test("#179: a non-JSON string for a composite widget is refused, not written raw", () => {
+  const node = {
+    id: 79,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_2", value: { on: false, lora: null, strength: 1 } }],
+  };
+  assert.throws(() => applyWidgetWrite(node, "lora_2", "not-json", {}), /not valid JSON/);
+});
 
 // ---- combo classification + exact-value writes (#240) ---------------------
 
