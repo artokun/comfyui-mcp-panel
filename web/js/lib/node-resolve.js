@@ -85,20 +85,42 @@ export function assertAddNodeResolvable(registry, class_type) {
  */
 export function assertResolvedTargetRegistered(registry, targetNode) {
   const type = targetNode?.type;
-  if (typeof type === "string" && isRegisteredNodeType(registry, type)) return;
   const id = targetNode?.id ?? "(unknown)";
-  if (!comfyNodeDefsLoaded(registry)) {
+  if (typeof type !== "string" || !isRegisteredNodeType(registry, type)) {
+    if (!comfyNodeDefsLoaded(registry)) {
+      throw new Error(
+        `Cannot set widget on node ${id}${type ? ` ("${type}")` : ""}: ComfyUI ` +
+          `node definitions are not loaded (the backend is unreachable). Reconnect ` +
+          `ComfyUI and retry — refusing to write to an unresolved placeholder node.`,
+      );
+    }
     throw new Error(
-      `Cannot set widget on node ${id}${type ? ` ("${type}")` : ""}: ComfyUI ` +
-        `node definitions are not loaded (the backend is unreachable). Reconnect ` +
-        `ComfyUI and retry — refusing to write to an unresolved placeholder node.`,
+      `Cannot set widget on node ${id}: its type ${type ? `"${type}" is` : "is"} ` +
+        `not registered on this ComfyUI (missing custom node, or an unresolved ` +
+        `placeholder) — refusing to write to it.`,
     );
   }
-  throw new Error(
-    `Cannot set widget on node ${id}: its type ${type ? `"${type}" is` : "is"} ` +
-      `not registered on this ComfyUI (missing custom node, or an unresolved ` +
-      `placeholder) — refusing to write to it.`,
-  );
+  // The type IS registered — but the INSTANCE may still be a stale placeholder
+  // (#458). A workflow loaded while ComfyUI's defs were unavailable creates node
+  // instances on a GENERIC FALLBACK constructor with no nodeData; if the backend
+  // later comes back and registers the type, the type-string check now passes yet
+  // the instance still carries generic in0/out0/'*' slots and {value,text}
+  // widgets. registerNodesFromDefs mints a NEW class per type, so a genuinely
+  // resolved instance's own constructor carries the def while a stale placeholder
+  // does not. So: if the REGISTERED class has a real def (nodeData) but THIS
+  // instance's constructor does not, it is an unresolved placeholder — refuse.
+  // (Native/defless types have no registered nodeData to compare and are trusted,
+  // so this never false-negatives Note/Reroute/etc.)
+  const registeredDef = registry?.[type]?.nodeData;
+  const instanceDef = targetNode?.constructor?.nodeData;
+  if (registeredDef && !instanceDef) {
+    throw new Error(
+      `Cannot set widget on node ${id} ("${type}"): the node is an unresolved ` +
+        `placeholder — its live definition is missing even though the type is now ` +
+        `registered (the workflow was loaded while ComfyUI was unavailable). ` +
+        `Reload the workflow now that ComfyUI is reachable. Refusing to write.`,
+    );
+  }
 }
 
 /**

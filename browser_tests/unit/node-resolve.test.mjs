@@ -26,7 +26,10 @@ import { reconcileUnknownWidgetNames } from "../../web/js/lib/asset-staleness.js
 
 // A registry shaped like LG.registered_node_types once /object_info loaded:
 // hundreds of classes; we only need the sentinels + a couple of extras here.
-function loadedRegistry(extra = []) {
+// registerNodesFromDefs stamps the def onto each type-specific class, so a real
+// comfy class carries `.nodeData` — mirror that (used by the stale-placeholder
+// instance check). Native/defless types (see extraDefless) carry no nodeData.
+function loadedRegistry(extra = [], extraDefless = []) {
   const reg = {};
   for (const t of [
     "KSampler",
@@ -39,9 +42,25 @@ function loadedRegistry(extra = []) {
     "SaveImage",
     ...extra,
   ]) {
-    reg[t] = function NodeCtor() {};
+    const ctor = function NodeCtor() {};
+    ctor.nodeData = { input: { required: {} } };
+    reg[t] = ctor;
   }
+  for (const t of extraDefless) reg[t] = function NativeCtor() {};
   return reg;
+}
+
+// A GENUINELY-RESOLVED node instance: its own constructor carries the live def
+// (nodeData), exactly like a real litegraph node whose type registered from
+// /object_info. This is what distinguishes it from a stale placeholder instance.
+function regNode(type, widgets = [{ name: "steps", type: "INT", value: 0 }], extra = {}) {
+  return {
+    id: 3,
+    type,
+    widgets,
+    constructor: { nodeData: { input: { required: {} } } },
+    ...extra,
+  };
 }
 
 // Backend unreachable: /object_info never fetched, so no Comfy classes are
@@ -131,10 +150,28 @@ test("set_widget guard: type-less target ⇒ ERRORS (fail CLOSED, never open)", 
   );
 });
 
-test("set_widget guard: registered target ⇒ passes (no false negative)", () => {
-  assert.doesNotThrow(() =>
-    assertResolvedTargetRegistered(loadedRegistry(), { id: 3, type: "KSampler" }),
-  );
+test("set_widget guard: registered target (resolved instance) ⇒ passes (no false negative)", () => {
+  assert.doesNotThrow(() => assertResolvedTargetRegistered(loadedRegistry(), regNode("KSampler")));
+});
+
+// ---- stale PLACEHOLDER INSTANCE whose type is now registered (#458 r3) --------
+// A workflow loaded while ComfyUI was unavailable creates instances on a generic
+// fallback constructor (no nodeData). If the backend later registers the type,
+// the type-string check passes yet the instance is still a generic placeholder.
+
+test("set_widget guard: registered TYPE but placeholder INSTANCE (no def) ⇒ REFUSE", () => {
+  const reg = loadedRegistry(); // KSampler registered WITH nodeData
+  // Instance sits on the generic fallback constructor — no nodeData.
+  const stale = { id: 9, type: "KSampler", widgets: [{ name: "value", value: 0 }], constructor: { name: "GenericFallback" } };
+  assert.throws(() => assertResolvedTargetRegistered(reg, stale), /unresolved placeholder|live definition is missing/i);
+});
+
+test("set_widget guard: NATIVE/defless registered type (Note) ⇒ passes (no false negative)", () => {
+  // Note is registered but has NO nodeData (litegraph-native), so there is no def
+  // to compare against — a real instance with its own 'value' widget must pass.
+  const reg = loadedRegistry([], ["Note"]);
+  const note = { id: 4, type: "Note", widgets: [{ name: "value", type: "text", value: "hi" }], constructor: { name: "Note" } };
+  assert.doesNotThrow(() => assertResolvedTargetRegistered(reg, note));
 });
 
 // ---- END-TO-END through applyWidgetWrite + the injected registry hook --------
@@ -157,6 +194,8 @@ function makeSubgraphFixture(innerType = "KSampler") {
     id: 54,
     type: innerType,
     widgets: [{ name: "scheduler", type: "combo", options: { values: ["simple", "karras"] }, value: "simple" }],
+    // Genuinely-resolved inner instance carries its live def (nodeData).
+    constructor: { nodeData: { input: { required: {} } } },
   };
   const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "54" ? inner : null) };
   const parent = {
@@ -173,9 +212,51 @@ function makeSubgraphFixture(innerType = "KSampler") {
 
 test("set_widget e2e: DIRECT registered node ⇒ write succeeds", () => {
   const reg = loadedRegistry();
-  const node = { id: 3, type: "KSampler", widgets: [{ name: "steps", type: "INT", value: 0 }] };
+  const node = regNode("KSampler", [{ name: "steps", type: "INT", value: 0 }]);
   const set = applyWidgetWrite(node, "steps", 20, hookFor(reg));
   assert.equal(set.value, 20);
+});
+
+// FINDING #1: the guard must run BEFORE coerceWidgetValue, which reads (and thus
+// may INVOKE) a dynamic combo's options.values(widget) callback. On a placeholder
+// that callback must NEVER fire — the write is refused first.
+test("set_widget e2e (finding #1): placeholder w/ dynamic-combo widget ⇒ REFUSE before values() callback runs", () => {
+  const reg = loadedRegistry();
+  let valuesCalled = false;
+  const ghost = {
+    id: 2,
+    type: "GhostNode", // reachable but unregistered ⇒ refused
+    widgets: [
+      {
+        name: "opt",
+        type: "combo",
+        options: {
+          values: () => {
+            valuesCalled = true; // a side-effecting dynamic combo
+            return ["a", "b"];
+          },
+        },
+        value: "a",
+      },
+    ],
+  };
+  assert.throws(() => applyWidgetWrite(ghost, "opt", "b", hookFor(reg)), /not registered|placeholder/i);
+  assert.equal(valuesCalled, false, "combo values() callback must not run on a refused placeholder");
+  assert.equal(ghost.widgets[0].value, "a");
+});
+
+// FINDING #2 (e2e): a stale placeholder INSTANCE whose type is now registered
+// must be refused rather than accept a write to its generic 'value' widget.
+test("set_widget e2e (finding #2): registered TYPE but placeholder INSTANCE ⇒ REFUSE, no mutation", () => {
+  const reg = loadedRegistry(); // KSampler registered WITH nodeData
+  const stale = {
+    id: 9,
+    type: "KSampler",
+    widgets: [{ name: "value", type: "number", value: 0 }], // generic placeholder widget
+    constructor: { name: "GenericFallback" }, // no nodeData ⇒ unresolved instance
+  };
+  assert.throws(() => applyWidgetWrite(stale, "value", 5, hookFor(reg)), /unresolved placeholder|live definition is missing/i);
+  assert.equal(stale.widgets[0].value, 0);
 });
 
 test("set_widget e2e: DIRECT unregistered placeholder (reachable) ⇒ REFUSE, no mutation", () => {
