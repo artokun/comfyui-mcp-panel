@@ -2366,8 +2366,32 @@ function autoWorkflowName() {
  *  fallback. */
 async function programmaticSave(name) {
   const svc = app?.extensionManager?.workflow;
-  const saved = await saveActiveWorkflow(svc, name, { autoWorkflowName });
+  const saved = await saveActiveWorkflow(svc, name, {
+    autoWorkflowName,
+    existsOnDisk: workflowExistsOnDisk,
+  });
   return saved || getWorkflowTitle();
+}
+
+/** Authoritative filesystem oracle for saveActiveWorkflow's #226 classifier:
+ *  does a workflow file back `rawPath` on disk? ComfyUI persists workflows via
+ *  the /userdata API keyed by the workflow's store path (e.g.
+ *  "workflows/Foo.json"), so a HEAD there is the ground truth the in-memory
+ *  store cannot provide. Returns true (200), false (404), or null (unknown —
+ *  any other status, no api, or a network error) so the classifier fails safe. */
+async function workflowExistsOnDisk(rawPath) {
+  try {
+    if (!api || !rawPath) return null;
+    const res =
+      typeof api.getUserData === "function"
+        ? await api.getUserData(rawPath, { method: "HEAD" })
+        : await api.fetchApi(`/userdata/${encodeURIComponent(rawPath)}`, { method: "HEAD" });
+    if (res.status === 404) return false;
+    if (res.ok) return true;
+    return null; // inconclusive ⇒ classifier stays "unknown" ⇒ refuse
+  } catch {
+    return null; // network/other error ⇒ unknown ⇒ fail safe
+  }
 }
 
 /** If the open workflow was never saved to disk, save it (no dialog) so the
