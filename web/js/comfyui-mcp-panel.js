@@ -91,6 +91,7 @@ import {
 } from "./lib/asset-staleness.js";
 import { coerceMessageText } from "./lib/chat-serialize.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
+import { saveActiveWorkflow } from "./lib/workflow-save.js";
 
 let app = null;
 let api = null;
@@ -2341,53 +2342,20 @@ function autoWorkflowName() {
   return `Untitled ${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
 }
 
-/** True when `name` is a placeholder rather than a name the user/agent chose.
- *  ComfyUI's brand-new temporary tabs are pathed "Unsaved Workflow.json" (and
- *  "Unsaved Workflow (2).json", …); our own grounding auto-name is
- *  "Untitled <timestamp>". Anything else is a real, deliberate name (e.g. set
- *  via rename_workflow) and must NOT be clobbered by a fresh auto-name on save. */
-function isDefaultWorkflowName(name) {
-  const n = String(name || "").trim();
-  return !n || /^Unsaved Workflow\b/i.test(n) || /^Untitled\b/.test(n);
-}
-
-/** Programmatically save the active workflow — NO Save/Rename dialog. Uses the
- *  workflow STORE's saveWorkflow() (which calls workflow.save({force}); the
- *  dialog only comes from the Comfy.SaveWorkflow *command* path). If the
- *  workflow was never saved (or a `name` is given), it's renamed first so it
- *  lands as a real, named file. Best-effort + feature-detected. Returns the
- *  saved name, or null if it couldn't save. */
+/** Programmatically save the active workflow — NO Save/Rename dialog.
+ *
+ *  Delegates to the shared, unit-tested `saveActiveWorkflow` (web/js/lib/
+ *  workflow-save.js). Its one hard rule: saving an already-persisted workflow
+ *  under a DIFFERENT name is a Save-As (copy) — it writes a new file via
+ *  ComfyUI's own saveWorkflowAs/workflowStore.saveAs path and leaves the source
+ *  file on disk untouched. It must NEVER renameWorkflow() the source, which
+ *  moved and silently destroyed the original (issue #226). Saving under the
+ *  same name overwrites in place, as before. Returns the saved name, or a title
+ *  fallback. */
 async function programmaticSave(name) {
   const svc = app?.extensionManager?.workflow;
-  const wf = svc?.activeWorkflow;
-  if (!wf) throw new Error("no active workflow to save");
-  const wasUnsaved = wf.isTemporary === true || wf.isPersisted === false;
-  // Respect a name the workflow ALREADY carries. A workflow can be unsaved yet
-  // already named — e.g. rename_workflow set its title/path but it hasn't hit
-  // disk. In that case auto-naming would clobber the user's chosen name, so we
-  // only mint a fresh auto-name for a genuinely placeholder ("Unsaved Workflow"
-  // / "Untitled …") workflow. A named-but-unsaved workflow saves in place.
-  const currentName = (wf.filename || "").replace(/\.json$/i, "").trim();
-  const needsAutoName = wasUnsaved && isDefaultWorkflowName(currentName);
-  // Rename FIRST when we want a specific/auto name, so it persists under that
-  // name (renameWorkflow does the store bookkeeping; path needs the prefix).
-  const desired = (name ? String(name) : needsAutoName ? autoWorkflowName() : "")
-    .replace(/\.json$/i, "")
-    .trim();
-  if (desired && typeof svc.renameWorkflow === "function") {
-    const target = `workflows/${desired}.json`;
-    if (wf.path !== target) {
-      try {
-        await svc.renameWorkflow(wf, target);
-      } catch {
-        /* keep going — we'll still save under the current name */
-      }
-    }
-  }
-  if (typeof svc.saveWorkflow === "function") await svc.saveWorkflow(wf);
-  else if (typeof wf.save === "function") await wf.save();
-  else throw new Error("workflow save API unavailable on this frontend");
-  return desired || wf.filename || getWorkflowTitle();
+  const saved = await saveActiveWorkflow(svc, name, { autoWorkflowName });
+  return saved || getWorkflowTitle();
 }
 
 /** If the open workflow was never saved to disk, save it (no dialog) so the
