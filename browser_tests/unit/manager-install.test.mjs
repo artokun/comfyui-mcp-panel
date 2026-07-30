@@ -10,6 +10,8 @@ import {
   gitRepoName,
   installGitUrl,
   buildInstallRequest,
+  parseInstalled,
+  nodeInstalledMatches,
 } from "../../web/js/lib/manager-install.js";
 
 test("looksLikeGitUrl recognizes every git protocol", () => {
@@ -105,3 +107,73 @@ for (const dialect of ["v2-batch", "legacy"]) {
     assert.ok(!("files" in req.body), "registry install must NOT send files");
   });
 }
+
+// --- #232: verify the pack actually landed (no silent success) --------------
+// parseInstalled tolerates the Manager's several installed-nodes shapes.
+test("parseInstalled normalizes the v4 map shape", () => {
+  const nodes = parseInstalled({
+    "rgthree-comfy": { ver: "1.0.0", cnr_id: "rgthree-comfy", aux_id: "rgthree/rgthree-comfy", enabled: true },
+    "10S_Nodes": { ver: "nightly", aux_id: "TenStrip/10S-Comfy-nodes" },
+  });
+  assert.equal(nodes.length, 2);
+  const rg = nodes.find((n) => n.module === "rgthree-comfy");
+  assert.equal(rg.cnrId, "rgthree-comfy");
+  assert.equal(rg.auxId, "rgthree/rgthree-comfy");
+});
+
+test("parseInstalled normalizes the legacy array shape (and bare strings)", () => {
+  const nodes = parseInstalled([
+    { title: "ComfyUI-Impact-Pack", cnr_id: "comfyui-impact-pack" },
+    "rgthree-comfy",
+  ]);
+  assert.equal(nodes.length, 2);
+  assert.equal(nodes[0].module, "ComfyUI-Impact-Pack");
+  assert.equal(nodes[1].module, "rgthree-comfy");
+});
+
+// The install target the handler verifies is buildInstallRequest's id (already
+// the repo NAME for a git URL) — assert the land/didn't-land decision per dialect.
+for (const dialect of ["v2", "v2-batch", "legacy"]) {
+  const targetOf = (args) => {
+    const req = buildInstallRequest(dialect, args, "uid-1");
+    return dialect === "v2" ? req.params.id : req.body.id;
+  };
+
+  test(`${dialect}: registry install that LANDED verifies as success`, () => {
+    const target = targetOf({ id: "rgthree-comfy" });
+    const installed = { "rgthree-comfy": { ver: "1.0.0", cnr_id: "rgthree-comfy" } };
+    assert.equal(nodeInstalledMatches(target, installed), true);
+  });
+
+  test(`${dialect}: registry install that did NOT land is an error, not success`, () => {
+    const target = targetOf({ id: "rgthree-comfy" });
+    // Queue drained "done" but the pack is absent — the #232 silent-failure case.
+    const installed = { "some-other-pack": { ver: "1.0.0" } };
+    assert.equal(nodeInstalledMatches(target, installed), false);
+  });
+
+  test(`${dialect}: git-URL install that LANDED (matched by repo name) verifies`, () => {
+    const url = "https://github.com/rgthree/rgthree-comfy.git";
+    const target = targetOf({ repository: url });
+    // Manager records the git pack under its repo-name module dir.
+    const installed = { "rgthree-comfy": { ver: "nightly", aux_id: "rgthree/rgthree-comfy" } };
+    assert.equal(nodeInstalledMatches(target, installed), true);
+  });
+
+  test(`${dialect}: git-URL install that did NOT land is an error, not success`, () => {
+    const url = "https://github.com/TenStrip/10S-Comfy-nodes.git";
+    const target = targetOf({ repository: url });
+    const installed = {}; // nothing installed — exactly the #232 report
+    assert.equal(nodeInstalledMatches(target, installed), false);
+  });
+}
+
+test("nodeInstalledMatches accepts a full git URL directly and matches by repo name", () => {
+  const installed = { "rgthree-comfy": { cnr_id: "rgthree-comfy" } };
+  assert.equal(
+    nodeInstalledMatches("https://github.com/rgthree/rgthree-comfy", installed),
+    true,
+  );
+  assert.equal(nodeInstalledMatches(undefined, installed), false);
+  assert.equal(nodeInstalledMatches("rgthree-comfy", {}), false);
+});
