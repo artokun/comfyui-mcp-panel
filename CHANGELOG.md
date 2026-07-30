@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.9] - 2026-07-30
+
+### Fixed
+- **Complete the ComfyUI-Manager 3.x legacy dialect for restart / update-self / list.** A legacy Manager (released 3.x, or a pip build in `--enable-manager-legacy-ui` mode) serves reboot ONLY at `POST /manager/reboot`; the previous candidate list tried `POST /v2/manager/reboot` (405) then `GET /manager/reboot` (404), leaving a legacy Manager unrestartable (panel #214). `panel_restart_comfyui` now picks the reboot route by detected dialect (legacy → `POST /manager/reboot` first; v2/pip unchanged). Also: `panel_update_node` retries the absolute legacy `POST /manager/queue/update` on a `405` when updating ComfyUI-Manager itself, and `panel_list_nodes` falls back to the absolute `/customnode/installed` when a legacy build answers the `/v2` queue probe but not the `/v2` data GET. v2/v2-batch happy paths unchanged. (#250)
+
 ## [0.11.8] - 2026-07-30
 
 ### Fixed
