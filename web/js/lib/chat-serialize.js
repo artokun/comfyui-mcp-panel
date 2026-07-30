@@ -49,6 +49,16 @@ export function coerceMessageText(value) {
   }
 }
 
+/** Decide whether a persisted assistant record should be dropped on history
+ *  replay (#241). Drop ONLY a structured payload that coerced to nothing (an
+ *  object with no extractable text / an unserializable value) — that's the
+ *  "[object Object]" case being killed. A genuinely-empty STRING record is
+ *  valid stored input (chat-history-store accepts it; imports preserve it) and
+ *  must still render its empty bubble, so it is NEVER dropped. */
+export function isDroppedAgentReplay(text) {
+  return typeof text !== "string" && coerceMessageText(text) === "";
+}
+
 /** Compute the outgoing chat text for an A2UI Button click (#219).
  *
  *  The reply is `component.reply ?? component.label`, coerced to a string via

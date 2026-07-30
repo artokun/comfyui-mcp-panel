@@ -90,7 +90,7 @@ import {
   reconcileUnknownWidgetNames,
   reapplyDefsToLiveNodes,
 } from "./lib/asset-staleness.js";
-import { coerceMessageText } from "./lib/chat-serialize.js";
+import { coerceMessageText, isDroppedAgentReplay } from "./lib/chat-serialize.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
 import { saveActiveWorkflow } from "./lib/workflow-save.js";
 
@@ -11780,8 +11780,11 @@ function buildPanel() {
     // through the SHARED serializer so reload/restart cannot resurrect the
     // literal "[object Object]" that renderRichText's String() coercion would
     // otherwise produce, even after the live `say` path has been fixed (#241).
+    // Drop ONLY a structured payload that coerced to nothing (see
+    // isDroppedAgentReplay) — a genuinely-empty STRING record is valid stored
+    // input and must still render its empty bubble (#241).
+    if (isDroppedAgentReplay(text)) return;
     const safeText = coerceMessageText(text);
-    if (!safeText) return;
     clearEmpty();
     const b = document.createElement("div");
     b.className = "cmcp-bubble agent";
