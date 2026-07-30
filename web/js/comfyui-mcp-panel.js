@@ -102,7 +102,7 @@ import {
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvable } from "./lib/node-resolve.js";
 import { runSetWidget } from "./lib/set-widget.js";
-import { coerceMessageText, isDroppedAgentReplay } from "./lib/chat-serialize.js";
+import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
 import {
   recordCopiedNodes,
   getVerifiedSnapshot,
@@ -2663,12 +2663,31 @@ async function verifyInstalled(target, dialect, { batchFailed, renameProne } = {
   return classifyInstallOutcome({ target, dialect, status, installed, listError, batchFailed, renameProne });
 }
 
+/** Normalize an outbound image descriptor so its string-ish fields can never
+ *  reach the wire (user_message.images / agent_event.images) as a coerced
+ *  "[object Object]" — the orchestrator builds /view URLs and prompt notes from
+ *  these (#276). Non-descriptor fields (data URLs, refs) are preserved as-is. */
+function normalizeImageDescriptor(img) {
+  if (!img || typeof img !== "object" || Array.isArray(img)) return img;
+  const out = { ...img };
+  if ("filename" in out) out.filename = coerceMessageText(out.filename);
+  if ("subfolder" in out && out.subfolder != null) out.subfolder = coerceMessageText(out.subfolder);
+  if ("type" in out && out.type != null) out.type = coerceMessageText(out.type) || "output";
+  if ("format" in out && out.format != null) out.format = coerceMessageText(out.format);
+  return out;
+}
+function normalizeImageList(images) {
+  return Array.isArray(images) ? images.map(normalizeImageDescriptor) : images;
+}
+
 /** Build a ComfyUI /view URL for an output image descriptor. */
 function imageViewUrl(img) {
   const qs = new URLSearchParams({
-    filename: img.filename ?? "",
-    subfolder: img.subfolder ?? "",
-    type: img.type ?? "output",
+    // Coerce — a structured filename/subfolder must not become "[object Object]"
+    // in the media URL (which reaches the agent via imageRefs / notes) (#276).
+    filename: coerceMessageText(img.filename),
+    subfolder: coerceMessageText(img.subfolder),
+    type: coerceMessageText(img.type) || "output",
   }).toString();
   const path = `/view?${qs}`;
   try {
@@ -3496,15 +3515,19 @@ function validationBanner() {
   if (nodeErrors) {
     const lines = [];
     for (const [nid, info] of Object.entries(nodeErrors)) {
-      const ct = (info && info.class_type) || "?";
+      const ct = coerceMessageText(info && info.class_type) || "?";
       const errs = info && Array.isArray(info.errors) ? info.errors : [];
       if (!errs.length) {
         lines.push(`node ${nid} (${ct}): invalid`);
         continue;
       }
       for (const e of errs) {
-        const detail = e && e.details ? ` — ${e.details}` : "";
-        lines.push(`node ${nid} (${ct}): ${(e && (e.message || e.type)) || "error"}${detail}`);
+        // Coerce before interpolation — a structured details/message payload
+        // must not become "[object Object]" in this outbound banner (#276).
+        const detailStr = e && e.details != null ? coerceMessageText(e.details) : "";
+        const detail = detailStr ? ` — ${detailStr}` : "";
+        const head = coerceMessageText(e && (e.message || e.type)) || "error";
+        lines.push(`node ${nid} (${ct}): ${head}${detail}`);
       }
     }
     const MAX = 30;
@@ -3522,23 +3545,26 @@ function validationBanner() {
   }
   if (missing.any) {
     const lines = [];
+    // Coerce every interpolated descriptor field — no structured value may bake
+    // "[object Object]" into this outbound banner (#276).
+    const s = (v, dflt = "") => coerceMessageText(v) || dflt;
     for (const m of missing.models.slice(0, 12)) {
       lines.push(
-        `node ${m.node_id ?? "?"}: MODEL missing — ${m.file ?? "?"}` +
-          (m.directory ? ` (belongs in models/${m.directory})` : "") +
-          (m.widget ? ` [widget ${m.widget}]` : "") +
-          (m.download_url ? `\n    download: ${m.download_url}` : ""),
+        `node ${s(m.node_id, "?")}: MODEL missing — ${s(m.file, "?")}` +
+          (m.directory ? ` (belongs in models/${s(m.directory)})` : "") +
+          (m.widget ? ` [widget ${s(m.widget)}]` : "") +
+          (m.download_url ? `\n    download: ${s(m.download_url)}` : ""),
       );
     }
     for (const m of missing.media.slice(0, 12)) {
       lines.push(
-        `node ${m.node_id ?? "?"}: INPUT ${m.media_type ?? "file"} missing — ${m.file ?? "?"}` +
-          (m.widget ? ` [widget ${m.widget}]` : "") +
+        `node ${s(m.node_id, "?")}: INPUT ${s(m.media_type, "file")} missing — ${s(m.file, "?")}` +
+          (m.widget ? ` [widget ${s(m.widget)}]` : "") +
           ` (the user must re-upload it; it's their own asset, not a download)`,
       );
     }
     if (missing.nodeTypes.length) {
-      lines.push(`node types not installed: ${missing.nodeTypes.slice(0, 12).join(", ")}`);
+      lines.push(`node types not installed: ${missing.nodeTypes.slice(0, 12).map((t) => coerceMessageText(t)).join(", ")}`);
     } else if (missing.nodeCount) {
       lines.push(`${missing.nodeCount} node type(s) not installed on this ComfyUI`);
     }
@@ -3552,10 +3578,13 @@ function validationBanner() {
       `re-upload the input file. Full detail anytime with panel_get_errors.\n\n`;
   }
   if (execErr) {
-    const msg = execErr.exception_message || execErr.exception_type || "execution error";
-    const where = execErr.node_type
-      ? ` in ${execErr.node_type} (node ${execErr.node_id ?? "?"})`
-      : "";
+    const msg =
+      coerceMessageText(execErr.exception_message) ||
+      coerceMessageText(execErr.exception_type) ||
+      "execution error";
+    const nodeType = coerceMessageText(execErr.node_type);
+    const nodeId = execErr.node_id != null ? coerceMessageText(execErr.node_id) : "?";
+    const where = nodeType ? ` in ${nodeType} (node ${nodeId})` : "";
     out +=
       `⚠️ LAST RUN FAILED${where}: ${msg}\nThis is a RUNTIME error from the most recent ` +
       `execution (distinct from the validation errors above).\n\n`;
@@ -5028,7 +5057,7 @@ const GRAPH_TOOL_EXECUTORS = {
       try {
         data = JSON.parse(data);
       } catch (err) {
-        throw new Error(`graph is not valid JSON: ${err?.message ?? err}`);
+        throw new Error(`graph is not valid JSON: ${coerceMessageText(err?.message ?? err)}`);
       }
     }
     if (!data || typeof data !== "object") {
@@ -5721,8 +5750,8 @@ const GRAPH_TOOL_EXECUTORS = {
         for (const e of entry?.errors ?? []) {
           addReason(id, {
             kind: "validation",
-            message: e?.message ?? String(e),
-            ...(e?.details ? { details: e.details } : {}),
+            message: coerceMessageText(e?.message ?? e),
+            ...(e?.details ? { details: coerceMessageText(e.details) } : {}),
             ...(e?.extra_info?.input_name ? { input: e.extra_info.input_name } : {}),
           });
         }
@@ -5746,7 +5775,7 @@ const GRAPH_TOOL_EXECUTORS = {
         e = store?.["lastExecuti" + "on" + "Error"] ?? null;
       }
       if (e) {
-        const msg = String(e.exception_message ?? e.message ?? "").trim();
+        const msg = coerceMessageText(e.exception_message ?? e.message ?? "").trim();
         execFailure = {
           node_id: e.node_id ?? null,
           node_type: e.node_type ?? null,
@@ -6405,7 +6434,7 @@ const GRAPH_TOOL_EXECUTORS = {
       bp = store.getBlueprint(type);
     } catch (err) {
       throw new Error(
-        `No saved subgraph blueprint "${name}" (${err?.message ?? err}). List them with graph_list_subgraphs.`,
+        `No saved subgraph blueprint "${name}" (${coerceMessageText(err?.message ?? err)}). List them with graph_list_subgraphs.`,
       );
     }
     const position = placementFor(graph, pos);
@@ -7701,7 +7730,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           reply = {
             rid: msg.rid,
             ok: false,
-            error: err && err.message ? err.message : String(err),
+            // Never String(err) — a thrown plain object (or one with an OBJECT
+            // .message) would become the dead literal "[object Object]" on the
+            // wire (#276). coerceMessageText extracts .message/.error or JSONs.
+            error: coerceMessageText(err?.message ?? err),
           };
         }
         try {
@@ -8004,8 +8036,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       if (AGENT_BLIND) images = undefined;
       // Merge any armed one-shot context (transcript replay) ahead of this
       // message's own context, then clear it so it's sent exactly once.
+      // The composer passes context as a `{ workflow, subgraph }` OBJECT; the
+      // wire contract requires a STRING (the orchestrator only prepends string
+      // context). serializeContext() renders the object to readable lines so a
+      // raw join() can never coerce it to "[object Object]" above the user's
+      // text (#276). pendingContext is already a string (transcript replay).
       const mergedContext =
-        [pendingContext, context].filter(Boolean).join("\n\n") || undefined;
+        [pendingContext, serializeContext(context)].filter(Boolean).join("\n\n") || undefined;
       pendingContext = null;
       try {
         sock.send(
@@ -8013,7 +8050,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             type: "user_message",
             text,
             ...(mergedContext ? { context: mergedContext } : {}),
-            ...(images?.length ? { images } : {}),
+            ...(images?.length ? { images: normalizeImageList(images) } : {}),
             // Client message id — the orchestrator echoes it in the "working"
             // ack so the panel can mark this exact bubble delivered ("Seen").
             ...(mid ? { mid } : {}),
@@ -8034,6 +8071,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         if (AGENT_BLIND && "images" in frame) {            // keep the note, drop pixels
           const { images: _drop, ...rest } = frame;
           frame = rest;
+        } else if (Array.isArray(frame.images)) {
+          // Normalize descriptor fields so no object filename/subfolder/type/format
+          // reaches the wire as "[object Object]" (#276).
+          frame = { ...frame, images: normalizeImageList(frame.images) };
         }
       }
       try {
@@ -11923,7 +11964,7 @@ function buildPanel() {
   // Surrounding text renders verbatim too. Tokens with no matching attachment
   // content fall back to their literal text. Never throws into the render.
   function renderUserText(container, text, atts) {
-    const raw = text != null ? String(text) : "";
+    const raw = coerceMessageText(text);
     try {
       const byId = new Map();
       if (Array.isArray(atts)) {
@@ -11938,7 +11979,7 @@ function buildPanel() {
         if (att && att.content != null) {
           // Interpolate the pasted content INLINE as plain text — render the message
           // exactly as if the user had typed it (no chip / preview widget).
-          container.appendChild(document.createTextNode(att.content));
+          container.appendChild(document.createTextNode(coerceMessageText(att.content)));
         } else {
           container.appendChild(document.createTextNode(m[0])); // graceful fallback
         }
@@ -12017,6 +12058,10 @@ function buildPanel() {
   }
 
   function paintCard({ icon, text, detail, error }) {
+    // Coerce both slots: a structured error/detail (e.g. reply.error object) must
+    // never reach textContent as "[object Object]" — live OR on card replay (#276).
+    text = coerceMessageText(text);
+    detail = detail == null ? detail : coerceMessageText(detail);
     clearEmpty();
     const card = document.createElement("div");
     card.className = "cmcp-card" + (error ? " error" : "");
@@ -12041,6 +12086,9 @@ function buildPanel() {
   }
 
   function paintImage(url, name) {
+    // Coerce the caption at the painter boundary — a structured/persisted caption
+    // must never render (or re-persist) as "[object Object]", live OR on replay (#276).
+    name = name == null ? name : coerceMessageText(name);
     clearEmpty();
     const card = document.createElement("div");
     card.className = "cmcp-bubble agent cmcp-imgcard";
@@ -12117,6 +12165,8 @@ function buildPanel() {
   }
 
   function paintVideo(url, name) {
+    // Coerce the caption at the painter boundary — see paintImage (#276).
+    name = name == null ? name : coerceMessageText(name);
     clearEmpty();
     const card = document.createElement("div");
     card.className = "cmcp-bubble agent cmcp-imgcard";
@@ -12239,12 +12289,12 @@ function buildPanel() {
       const chip = document.createElement("div");
       chip.className = "cmcp-card-head";
       chip.style.cssText = "text-transform:uppercase;font-size:0.6rem;letter-spacing:0.05em;opacity:0.7;";
-      chip.textContent = msg.header;
+      chip.textContent = coerceMessageText(msg.header);
       card.appendChild(chip);
     }
     const q = document.createElement("div");
     q.style.cssText = "font-weight:600;margin:0.15rem 0 0.5rem;";
-    renderRichText(q, msg.question || "Pick one:");
+    renderRichText(q, coerceMessageText(msg.question) || "Pick one:");
     card.appendChild(q);
 
     const selected = new Set();
@@ -12260,18 +12310,22 @@ function buildPanel() {
       card.replaceChildren();
       card.classList.remove("cmcp-question");
       card.style.cssText = "border-left:3px solid var(--p-primary-color,#3a7bd5);opacity:0.9;";
-      if (msg.question) {
+      // Coerce question/answer — a structured question must not render (or record)
+      // as "[object Object]"; answer is already a coerced label / free text (#276).
+      const questionText = coerceMessageText(msg.question);
+      const answerText = coerceMessageText(answer);
+      if (questionText) {
         const q = document.createElement("div");
         q.style.cssText = "font-size:0.72rem;opacity:0.65;";
-        q.textContent = msg.question;
+        q.textContent = questionText;
         card.appendChild(q);
       }
       const a = document.createElement("div");
       a.style.cssText = "font-weight:600;margin-top:0.15rem;color:var(--p-primary-color,#6ea8fe);";
-      a.textContent = `✓ ${answer}`;
+      a.textContent = `✓ ${answerText}`;
       card.appendChild(a);
       // Record as a plain card so a reload restores it as static text, not a widget.
-      record({ role: "card", icon: "pi-check", text: msg.question || "Choice", detail: answer });
+      record({ role: "card", icon: "pi-check", text: questionText || "Choice", detail: answerText });
       scrollLog();
       resolveFn(answer);
     };
@@ -12287,22 +12341,22 @@ function buildPanel() {
         "background:var(--p-surface-800,#2a2a2a);color:inherit;cursor:pointer;font-size:0.8rem;";
       const lbl = document.createElement("div");
       lbl.style.fontWeight = "600";
-      lbl.textContent = opt.label ?? String(opt);
+      lbl.textContent = coerceMessageText(opt.label ?? opt);
       b.appendChild(lbl);
       if (opt.description) {
         const d = document.createElement("div");
         d.style.cssText = "font-size:0.7rem;opacity:0.7;margin-top:0.1rem;";
-        d.textContent = opt.description;
+        d.textContent = coerceMessageText(opt.description);
         b.appendChild(d);
       }
       b.addEventListener("click", () => {
         if (done) return;
         if (multi) {
-          const label = opt.label ?? String(opt);
+          const label = coerceMessageText(opt.label ?? opt);
           if (selected.has(label)) { selected.delete(label); b.style.borderColor = "var(--p-surface-500,#555)"; }
           else { selected.add(label); b.style.borderColor = "var(--p-primary-color,#3a7bd5)"; }
         } else {
-          finish(opt.label ?? String(opt));
+          finish(coerceMessageText(opt.label ?? opt));
         }
       });
       btnRow.appendChild(b);
@@ -12847,10 +12901,11 @@ function buildPanel() {
   }
 
   function appendSystem(text) {
-    // System notices are transient — painted, never recorded.
+    // System notices are transient — painted, never recorded. Coerce so a
+    // structured value can never render as "[object Object]" (#276).
     const b = document.createElement("div");
     b.className = "cmcp-sys";
-    b.textContent = text;
+    b.textContent = coerceMessageText(text);
     log.appendChild(b);
     scrollLog();
   }
@@ -13369,7 +13424,7 @@ function buildPanel() {
               : ""),
           );
         } catch (error) {
-          appendSystem(`History import failed: ${error?.message || error}`);
+          appendSystem(`History import failed: ${coerceMessageText(error?.message || error)}`);
         }
       }, { once: true });
       picker.click();
@@ -13868,7 +13923,7 @@ function buildPanel() {
     // The agent called panel_show_media — render images/videos directly in the chat.
     onShowMedia(items) {
       for (const item of items) {
-        const caption = item.caption || item.filename || "";
+        const caption = coerceMessageText(item.caption) || coerceMessageText(item.filename) || "";
         if (item.kind === "viewRef" && item.viewRef) {
           const url = imageViewUrl(item.viewRef);
           // Determine if ComfyUI ref is a video by extension
@@ -14019,7 +14074,7 @@ function buildPanel() {
             : `🔒 ${friendly} key saved — the provider is enabled now (stored by the orchestrator in ~/.comfyui-mcp, never in ComfyUI settings).`,
         );
       } else {
-        appendSystem(`Couldn't save the ${friendly} key: ${msg.error || "unknown error"}.`);
+        appendSystem(`Couldn't save the ${friendly} key: ${coerceMessageText(msg.error) || "unknown error"}.`);
       }
     },
     // The agent called panel_reload — perform the soft reload it asked for.
@@ -14363,16 +14418,19 @@ function buildPanel() {
     // with `type:"output"` is the real SAVED file; `type:"temp"` (save_output off)
     // is a throwaway preview. Be conservative — only explicit "output" is final.
     const isFinalVideo = m && m.type === "output";
+    // Coerce descriptor fields once — a structured filename/subfolder/format must
+    // never reach the outbound agent note as "[object Object]" (#276).
+    const fileName = coerceMessageText(m?.filename) || "video";
     const videoKind = isFinalVideo
-      ? `the FINAL saved video (file ${m.filename} — reference THIS filename)`
-      : `a PREVIEW video (file ${m.filename}, temporary — not a saved file; add/enable a save to persist it)`;
+      ? `the FINAL saved video (file ${fileName} — reference THIS filename)`
+      : `a PREVIEW video (file ${fileName}, temporary — not a saved file; add/enable a save to persist it)`;
     // ── Video metadata (gathered up front) ─────────────────────────────────
     // path (subfolder-relative), real frame metadata when the VHS/video output
     // payload carries it, render duration, and completion time. Capture the
     // render-start SYNCHRONOUSLY here (before any await / before the run's flush
     // retires it) so the duration survives a concurrent execution_success.
-    const subfolder = m?.subfolder || "";
-    const path = subfolder ? `${subfolder}/${m?.filename || ""}` : (m?.filename || "");
+    const subfolder = coerceMessageText(m?.subfolder);
+    const path = subfolder ? `${subfolder}/${fileName}` : fileName;
     const startTs = runStartTimes.get(promptKey(promptId));
     const duration = startTs != null ? formatDuration(Date.now() - startTs) : null;
     const finishedClock = formatClock(new Date());
@@ -14381,12 +14439,12 @@ function buildPanel() {
     // the payload doesn't carry it (it's not always populated).
     const realFrames = m?.frame_count ?? m?.frameCount ?? m?.frames ?? null;
     const realFps = m?.frame_rate ?? m?.frameRate ?? m?.fps ?? null;
-    const format = m?.format || null;
+    const format = coerceMessageText(m?.format) || null;
     // Compose the compact "· a · b · c" metadata suffix appended to a note.
     // sizeStr (async HEAD) and storyboardN are optional/contextual.
     const metaSuffix = (sizeStr, storyboardN) => {
       const parts = [`path: ${path}`];
-      if (format) parts.push(String(format));
+      if (format) parts.push(format);
       if (Number.isFinite(realFrames)) {
         parts.push(
           `${realFrames} frames` +
@@ -14398,7 +14456,7 @@ function buildPanel() {
       if (sizeStr) parts.push(sizeStr);
       if (duration) parts.push(`rendered in ${duration}`);
       if (finishedClock) parts.push(`finished ${finishedClock}`);
-      return parts.length ? `\n• ${m?.filename || "video"} — ${parts.join(" · ")}` : "";
+      return parts.length ? `\n• ${fileName} — ${parts.join(" · ")}` : "";
     };
     // ALWAYS notify the agent a video rendered — with a storyboard if we can build
     // one, else a note-only event (no images) so the agent still learns the render
@@ -14425,7 +14483,7 @@ function buildPanel() {
         noteOnly("couldn't sample a storyboard from it");
         return;
       }
-      const base = String(m.filename || "video").replace(/\.[^.]+$/, "");
+      const base = (coerceMessageText(m.filename) || "video").replace(/\.[^.]+$/, "");
       const ref = await uploadBlobToInput(blob, `storyboard_${base}.png`);
       if (!ref) {
         console.warn("[cmcp] storyboard: upload failed for", m.filename);
@@ -14537,7 +14595,7 @@ function buildPanel() {
     // Send EVERYTHING for vision (the agent should see previews too), but ordered
     // finals-first so the primary result is unambiguous as image #1.
     const images = [...finals, ...previews];
-    const finalNames = finals.map((m) => m?.filename).filter(Boolean);
+    const finalNames = finals.map((m) => coerceMessageText(m?.filename)).filter(Boolean);
     const previewCount = previews.length;
     let note;
     if (finalNames.length) {
@@ -14576,8 +14634,10 @@ function buildPanel() {
     try {
       metadata = await Promise.all(
         finals.map(async (m, idx) => {
-          const filename = m?.filename || "(unknown)";
-          const subfolder = m?.subfolder || "";
+          // Coerce descriptor fields — a structured filename/subfolder must not
+          // reach the outbound agent note as "[object Object]" (#276).
+          const filename = coerceMessageText(m?.filename) || "(unknown)";
+          const subfolder = coerceMessageText(m?.subfolder);
           const path = subfolder ? `${subfolder}/${filename}` : filename;
           const url = imageViewUrl(m);
           const [sizeRes, dimRes] = await Promise.allSettled([
@@ -14709,12 +14769,18 @@ function buildPanel() {
     clearRunImages(d.prompt_id);
     // Name the failing node so the agent (and the user) know WHERE it broke —
     // "Ideogram4PromptBuilderKJ (node 200)" beats a bare exception string.
-    const where = d.node_type
-      ? `${d.node_type} (node ${d.node_id})`
-      : d.node_id != null
-        ? `node ${d.node_id}`
+    // Coerce node descriptors too — never bake "[object Object]" into the
+    // outbound "where" string a structured node_type/node_id would produce (#276).
+    const nodeType = coerceMessageText(d.node_type);
+    const nodeId = d.node_id != null ? coerceMessageText(d.node_id) : "";
+    const where = nodeType
+      ? `${nodeType} (node ${nodeId})`
+      : nodeId
+        ? `node ${nodeId}`
         : "";
-    const msg = d.exception_message || d.exception_type || "execution error";
+    // Coerce before interpolation — a structured exception payload must not
+    // become "[object Object]" on the outbound agent_event or the card (#276).
+    const msg = coerceMessageText(d.exception_message) || coerceMessageText(d.exception_type) || "execution error";
     const error = where ? `${where}: ${msg}` : msg;
     // 1) Push it to the agent — the orchestrator INTERRUPTS its live turn and
     //    front-queues this so it stops and fixes the error instead of running blind.
@@ -15016,7 +15082,7 @@ function buildPanel() {
         }
       } catch (err) {
         if (myGen !== connectGen) return;
-        appendSystem(`Auto-restart failed: ${err?.message ?? err}`);
+        appendSystem(`Auto-restart failed: ${coerceMessageText(err?.message ?? err)}`);
         autoRespawnsLeft = 0; // can't reach the pack → don't loop
         client.start(); // resume the bare WS retry so the client isn't left idle
       } finally {
@@ -15083,7 +15149,7 @@ function buildPanel() {
         }
       } catch (err) {
         if (myGen !== connectGen) return;
-        appendSystem(`Auto-restart failed: ${err?.message ?? err}`);
+        appendSystem(`Auto-restart failed: ${coerceMessageText(err?.message ?? err)}`);
         autoReclaimsLeft = 0; // can't reach the pack → don't loop
       } finally {
         autoReclaiming = false;
@@ -15229,7 +15295,7 @@ function buildPanel() {
       if (myGen !== connectGen) return; // superseded → swallow the stale error too
       // No /connect route (older/headless host) — fall through and try the
       // bridge directly in case the user started the orchestrator themselves.
-      appendSystem(`Couldn't reach ComfyUI to start the agent: ${err?.message ?? err}`);
+      appendSystem(`Couldn't reach ComfyUI to start the agent: ${coerceMessageText(err?.message ?? err)}`);
     } finally {
       connecting = false;
     }
@@ -15412,7 +15478,7 @@ function buildPanel() {
     } catch (err) {
       ssSet(SOFT_RELOAD_KEY, null);
       clearSoftReloadGuard(); // POST failed → re-enable auto-respawn
-      appendSystem(`Couldn't reach ComfyUI to reload the agent: ${err?.message ?? err}`);
+      appendSystem(`Couldn't reach ComfyUI to reload the agent: ${coerceMessageText(err?.message ?? err)}`);
       return;
     } finally {
       reloading = false;
@@ -15450,7 +15516,7 @@ function buildPanel() {
         );
       }
     } catch (err) {
-      appendSystem(`Couldn't reach ComfyUI to restart the agent: ${err?.message ?? err}`);
+      appendSystem(`Couldn't reach ComfyUI to restart the agent: ${coerceMessageText(err?.message ?? err)}`);
     } finally {
       reloading = false;
     }
@@ -15501,7 +15567,7 @@ function buildPanel() {
       const result = await GRAPH_TOOL_EXECUTORS[cmd](args);
       appendActivity(cmd, args, { ok: true, result });
     } catch (err) {
-      appendActivity(cmd, args, { ok: false, error: err?.message ?? String(err) });
+      appendActivity(cmd, args, { ok: false, error: coerceMessageText(err?.message ?? err) });
     }
   }
 
