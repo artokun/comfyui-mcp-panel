@@ -24,6 +24,9 @@ const {
   isMethodNotAllowed,
   legacyUpdateBody,
   rebootCandidates,
+  parseNodeMappings,
+  managerUnavailableResult,
+  searchNodesVia,
 } = ManagerInstall;
 
 test("looksLikeGitUrl recognizes every git protocol", () => {
@@ -616,4 +619,108 @@ test("#425 rebootCandidates keeps POST /v2/manager/reboot first for pip dialects
       `dialect ${dialect} must still offer POST /manager/reboot`,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// #251/#255 — panel_search_nodes degrades gracefully against an unreachable /
+// legacy ComfyUI-Manager instead of surfacing a raw throw that blocks the whole
+// install-discovery flow. searchNodesVia is dependency-injected with the panel's
+// managerGet (dialect-routed) + managerCall (absolute) so the REAL decision path
+// is exercised here.
+// ---------------------------------------------------------------------------
+
+const GETMAPPINGS_MAP = {
+  "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation": [
+    ["RIFE VFI"],
+    { title: "ComfyUI Frame Interpolation", description: "RIFE frame interpolation and more" },
+  ],
+  "https://github.com/1038lab/ComfyUI-RMBG": [
+    ["RMBG", "BiRefNet"],
+    { title: "ComfyUI-RMBG", description: "Background removal with BiRefNet / RMBG" },
+  ],
+};
+const UNREACHABLE = new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)");
+
+test("#251 nodes_search returns results when the dialect-routed GET works", async () => {
+  const managerGet = async () => GETMAPPINGS_MAP;
+  const managerCall = async () => {
+    throw new Error("absolute route should not be reached");
+  };
+  const res = await searchNodesVia(managerGet, managerCall, { query: "RIFE" });
+  assert.equal(res.count, 1);
+  assert.equal(res.results[0].title, "ComfyUI Frame Interpolation");
+});
+
+test("#255 nodes_search falls back to the ABSOLUTE legacy route when /v2 is unreachable", async () => {
+  // Legacy-UI pip build (or real 3.x Manager): dialect-routed /v2 GET 404s /
+  // throws "not reachable" while the absolute /customnode/getmappings serves.
+  const managerGet = async () => {
+    throw UNREACHABLE;
+  };
+  const managerCall = async () => GETMAPPINGS_MAP;
+  const res = await searchNodesVia(managerGet, managerCall, { query: "BiRefNet" });
+  assert.equal(res.count, 1);
+  assert.equal(res.results[0].id.includes("RMBG"), true);
+});
+
+test("#251/#255 nodes_search returns a structured {supported:false} result when BOTH routes are unreachable — never throws", async () => {
+  const throwUnreachable = async () => {
+    throw UNREACHABLE;
+  };
+  const res = await searchNodesVia(throwUnreachable, throwUnreachable, {
+    query: "RIFE frame interpolation",
+  });
+  assert.equal(res.supported, false);
+  assert.equal(res.managerReachable, false);
+  assert.equal(res.count, 0);
+  assert.deepEqual(res.results, []);
+  assert.equal(res.query, "RIFE frame interpolation");
+  assert.match(res.message, /Manager/i);
+  assert.match(res.message, /panel_list_nodes/);
+});
+
+test("#251/#255 nodes_search does NOT swallow a genuine server error (HTTP 500 propagates)", async () => {
+  const boom = async () => {
+    throw new Error("Manager customnode/getmappings: HTTP 500");
+  };
+  await assert.rejects(
+    () => searchNodesVia(boom, boom, { query: "x" }),
+    /HTTP 500/,
+    "a real server error must propagate, not degrade to supported:false",
+  );
+});
+
+test("#251/#255 a non-unreachable error from the absolute fallback also propagates", async () => {
+  const managerGet = async () => {
+    throw UNREACHABLE;
+  };
+  const managerCall = async () => {
+    throw new Error("Manager customnode/getmappings: HTTP 403");
+  };
+  await assert.rejects(
+    () => searchNodesVia(managerGet, managerCall, { query: "x" }),
+    /HTTP 403/,
+  );
+});
+
+test("parseNodeMappings handles array + map shapes and caps the limit", () => {
+  const arr = [
+    { id: "a/one", title: "One", description: "first" },
+    { id: "b/two", title: "Two", description: "second" },
+  ];
+  assert.equal(parseNodeMappings(arr, "", 15).count, 2);
+  assert.equal(parseNodeMappings(GETMAPPINGS_MAP, "", 15).count, 2);
+  // Filter is case-insensitive across id/title/description.
+  assert.equal(parseNodeMappings(GETMAPPINGS_MAP, "background", 15).count, 1);
+  // limit capped at 40; default 15.
+  const many = Array.from({ length: 60 }, (_, i) => ({ id: `p/${i}`, title: `t${i}` }));
+  assert.equal(parseNodeMappings(many, "", 999).results.length, 40);
+  assert.equal(parseNodeMappings(many, "").results.length, 15);
+});
+
+test("managerUnavailableResult is a safe, actionable structured payload", () => {
+  const r = managerUnavailableResult(undefined, UNREACHABLE);
+  assert.equal(r.supported, false);
+  assert.equal(r.query, "");
+  assert.equal(r.reason, UNREACHABLE.message);
 });
