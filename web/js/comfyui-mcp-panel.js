@@ -14515,7 +14515,7 @@ function buildPanel() {
     const d = ev?.detail ?? {};
     // The run failed — drop any images we'd buffered for it so we don't deliver a
     // stale "here are your outputs" batch on top of the run_error interrupt below.
-    runCompletion.onExecutionError(d.prompt_id);
+    runCompletion.onExecutionFailed(d.prompt_id);
     // Name the failing node so the agent (and the user) know WHERE it broke —
     // "Ideogram4PromptBuilderKJ (node 200)" beats a bare exception string.
     // Coerce node descriptors too — never bake "[object Object]" into the

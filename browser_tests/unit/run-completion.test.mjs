@@ -264,7 +264,7 @@ test("execution_error drops the buffer — no stale batch delivered", () => {
   h.tracker.onExecutionStart(P);
   h.tracker.onExecutingNode(P, "x");
   h.tracker.onExecuted(P, imgs([img("half.png")]));
-  h.tracker.onExecutionError(P);
+  h.tracker.onExecutionFailed(P);
   h.tracker.onExecutingNull();
   h.tick(10000);
   assert.equal(h.flushes.length, 0, "failed run delivers no completion batch");

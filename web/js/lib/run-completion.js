@@ -187,7 +187,7 @@ export function createRunCompletionTracker({
     },
 
     /** ComfyUI `execution_error` — drop this prompt's buffer, deliver no batch. */
-    onExecutionError(id) {
+    onExecutionFailed(id) {
       const k = key(id);
       active.delete(k);
       const buf = buffers.get(k);
