@@ -21,9 +21,15 @@
 //     is refused, not written blindly).
 
 export class WidgetWriteError extends Error {
-  constructor(message) {
+  constructor(message, { combo = false } = {}) {
     super(message);
     this.name = "WidgetWriteError";
+    // `combo` marks the failure as "combo value rejected against the current
+    // option list" (unreadable OR not-a-member). runSetWidget uses this as the
+    // ONLY signal that a stale-combo refresh + single revalidation may help —
+    // no other validation failure (numeric/boolean/promotion/stuck-check) is
+    // retryable, so those still fail closed immediately.
+    this.combo = combo;
   }
 }
 
@@ -80,6 +86,7 @@ export function coerceWidgetValue(widget, value) {
       throw new WidgetWriteError(
         `Combo widget "${name}" has no readable option list; cannot validate ` +
           `value ${JSON.stringify(value)} — refusing to write.`,
+        { combo: true },
       );
     }
     // STRICT typed membership: no numeric<->string coercion. Numeric options
@@ -91,6 +98,7 @@ export function coerceWidgetValue(widget, value) {
       `Value ${JSON.stringify(value)} is not a valid option for combo widget ` +
         `"${name}". Valid options (${options.length}): ${preview}` +
         (options.length > 40 ? ", …" : ""),
+      { combo: true },
     );
   }
 

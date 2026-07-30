@@ -225,17 +225,17 @@ function makeSubgraphFixture(innerType = "KSampler") {
   return { parent, inner, resolveSource };
 }
 
-test("set_widget e2e: DIRECT registered node ⇒ write succeeds", () => {
+test("set_widget e2e: DIRECT registered node ⇒ write succeeds", async () => {
   const reg = loadedRegistry();
   const node = regNode("KSampler", [{ name: "steps", type: "INT", value: 0 }]);
-  const { set } = setViaHandler(reg, node, "steps", 20);
+  const { set } = await setViaHandler(reg, node, "steps", 20);
   assert.equal(set.value, 20);
 });
 
 // FINDING #1: the guard must run BEFORE coerceWidgetValue, which reads (and thus
 // may INVOKE) a dynamic combo's options.values(widget) callback. On a placeholder
 // that callback must NEVER fire — the write is refused first.
-test("set_widget e2e (finding #1): placeholder w/ dynamic-combo widget ⇒ REFUSE before values() callback runs", () => {
+test("set_widget e2e (finding #1): placeholder w/ dynamic-combo widget ⇒ REFUSE before values() callback runs", async () => {
   const reg = loadedRegistry();
   let valuesCalled = false;
   const ghost = {
@@ -257,14 +257,14 @@ test("set_widget e2e (finding #1): placeholder w/ dynamic-combo widget ⇒ REFUS
   };
   // Through the REAL handler body, so the guard's position ahead of coercion is
   // exercised in production order.
-  assert.throws(() => setViaHandler(reg, ghost, "opt", "b"), /not registered|placeholder/i);
+  await assert.rejects(() => setViaHandler(reg, ghost, "opt", "b"), /not registered|placeholder/i);
   assert.equal(valuesCalled, false, "combo values() callback must not run on a refused placeholder");
   assert.equal(ghost.widgets[0].value, "a");
 });
 
 // FINDING #2 (e2e): a stale placeholder INSTANCE whose type is now registered
 // must be refused rather than accept a write to its generic 'value' widget.
-test("set_widget e2e (finding #2): registered TYPE but placeholder INSTANCE ⇒ REFUSE, no mutation", () => {
+test("set_widget e2e (finding #2): registered TYPE but placeholder INSTANCE ⇒ REFUSE, no mutation", async () => {
   const reg = loadedRegistry(); // KSampler registered WITH nodeData
   const stale = {
     id: 9,
@@ -273,59 +273,59 @@ test("set_widget e2e (finding #2): registered TYPE but placeholder INSTANCE ⇒ 
     constructor: { name: "GenericFallback" }, // no nodeData ⇒ unresolved instance
   };
   // Through the REAL handler body (preflight → reconcile → guarded write).
-  assert.throws(() => setViaHandler(reg, stale, "value", 5), /unresolved placeholder|live definition is missing/i);
+  await assert.rejects(() => setViaHandler(reg, stale, "value", 5), /unresolved placeholder|live definition is missing/i);
   assert.equal(stale.widgets[0].value, 0);
 });
 
-test("set_widget e2e: DIRECT unregistered placeholder (reachable) ⇒ REFUSE, no mutation", () => {
+test("set_widget e2e: DIRECT unregistered placeholder (reachable) ⇒ REFUSE, no mutation", async () => {
   const reg = loadedRegistry();
   const ghost = { id: 1, type: "GhostNode", widgets: [{ name: "value", type: "number", value: 0 }] };
-  assert.throws(() => setViaHandler(reg, ghost, "value", 5), /not registered|placeholder/i);
+  await assert.rejects(() => setViaHandler(reg, ghost, "value", 5), /not registered|placeholder/i);
   assert.equal(ghost.widgets[0].value, 0);
 });
 
 // case a/b/keep go through the REAL handler (setViaHandler): the REFUSAL/PASS is
 // decided by the guard HOOK inside runSetWidget (these paths bypass outer
 // preflight), so dropping the shipped guard wiring FAILS these tests.
-test("set_widget e2e (case a): placeholder carrying `subgraph:{}` + generic widget ⇒ REFUSE (via handler)", () => {
+test("set_widget e2e (case a): placeholder carrying `subgraph:{}` + generic widget ⇒ REFUSE (via handler)", async () => {
   const reg = loadedRegistry();
   // subgraph:{} is truthy but has no promoted inputs, so it resolves to its OWN
   // generic widget — the exact fail-open the outer-node check allowed. Refusal
   // here comes from the guard hook, not outer preflight.
   const ghost = { id: 2, type: "GhostNode", subgraph: {}, widgets: [{ name: "value", type: "number", value: 0 }] };
-  assert.throws(() => setViaHandler(reg, ghost, "value", 7), /not registered|placeholder/i);
+  await assert.rejects(() => setViaHandler(reg, ghost, "value", 7), /not registered|placeholder/i);
   assert.equal(ghost.widgets[0].value, 0);
 });
 
-test("set_widget e2e (case b): real subgraph → UNREGISTERED inner placeholder ⇒ REFUSE (via handler), inner untouched", () => {
+test("set_widget e2e (case b): real subgraph → UNREGISTERED inner placeholder ⇒ REFUSE (via handler), inner untouched", async () => {
   const reg = loadedRegistry();
   const { parent, inner, resolveSource } = makeSubgraphFixture("GhostSampler");
-  assert.throws(
+  await assert.rejects(
     () => setViaHandler(reg, parent, "sched_alias", "karras", resolveSource),
     /not registered|placeholder/i,
   );
   assert.equal(inner.widgets.find((w) => w.name === "scheduler").value, "simple");
 });
 
-test("set_widget e2e (case c): type-less node ⇒ REFUSE", () => {
+test("set_widget e2e (case c): type-less node ⇒ REFUSE", async () => {
   const reg = loadedRegistry();
   const node = { id: 5, widgets: [{ name: "value", type: "number", value: 0 }] };
-  assert.throws(() => setViaHandler(reg, node, "value", 3), /not registered/i);
+  await assert.rejects(() => setViaHandler(reg, node, "value", 3), /not registered/i);
 });
 
-test("set_widget e2e (keep): real subgraph → REGISTERED inner node ⇒ still succeeds (via handler)", () => {
+test("set_widget e2e (keep): real subgraph → REGISTERED inner node ⇒ still succeeds (via handler)", async () => {
   const reg = loadedRegistry();
   const { parent, inner, resolveSource } = makeSubgraphFixture("KSampler");
-  const { set } = setViaHandler(reg, parent, "sched_alias", "karras", resolveSource);
+  const { set } = await setViaHandler(reg, parent, "sched_alias", "karras", resolveSource);
   assert.equal(set.value, "karras");
   assert.equal(set.promoted_from.inner_node_id, 54);
   assert.equal(inner.widgets.find((w) => w.name === "scheduler").value, "karras");
 });
 
-test("set_widget e2e: unreachable ⇒ REFUSE even for a would-be-core type, no mutation", () => {
+test("set_widget e2e: unreachable ⇒ REFUSE even for a would-be-core type, no mutation", async () => {
   const reg = unreachableRegistry();
   const node = { id: 1, type: "CheckpointLoaderSimple", widgets: [{ name: "ckpt_name", type: "text", value: "" }] };
-  assert.throws(() => setViaHandler(reg, node, "ckpt_name", "x.safetensors"), /not loaded|unreachable/i);
+  await assert.rejects(() => setViaHandler(reg, node, "ckpt_name", "x.safetensors"), /not loaded|unreachable/i);
   assert.equal(node.widgets[0].value, "");
 });
 
@@ -356,38 +356,38 @@ function nodeWithUnknownWidgets(type) {
   };
 }
 
-test("handler: a REGISTERED node's UNKNOWN widgets are reconciled THEN written", () => {
+test("handler: a REGISTERED node's UNKNOWN widgets are reconciled THEN written", async () => {
   const reg = loadedRegistry(["MyRegNode"]);
   const node = nodeWithUnknownWidgets("MyRegNode");
   // reconcile renames UNKNOWN→steps, UNKNOWN_1→cfg, then the write lands on "cfg".
-  const { set } = setViaHandler(reg, node, "cfg", 7.5);
+  const { set } = await setViaHandler(reg, node, "cfg", 7.5);
   assert.deepEqual(node.widgets.map((w) => w.name), ["steps", "cfg"]);
   assert.equal(set.value, 7.5);
 });
 
-test("handler: UNREGISTERED placeholder w/ UNKNOWN widgets ⇒ REFUSE, names UNCHANGED (reconcile never ran)", () => {
+test("handler: UNREGISTERED placeholder w/ UNKNOWN widgets ⇒ REFUSE, names UNCHANGED (reconcile never ran)", async () => {
   const reg = loadedRegistry(); // reachable, but type not registered
   const node = nodeWithUnknownWidgets("GhostNode");
-  assert.throws(() => setViaHandler(reg, node, "steps", 5), /not registered|placeholder/i);
+  await assert.rejects(() => setViaHandler(reg, node, "steps", 5), /not registered|placeholder/i);
   // The load-bearing assertion: reconcile never ran, so the UNKNOWN names stand.
   assert.deepEqual(node.widgets.map((w) => w.name), ["UNKNOWN", "UNKNOWN_1"]);
 });
 
-test("handler: TYPE-LESS node w/ UNKNOWN widgets ⇒ REFUSE, names UNCHANGED", () => {
+test("handler: TYPE-LESS node w/ UNKNOWN widgets ⇒ REFUSE, names UNCHANGED", async () => {
   const reg = loadedRegistry();
   const node = nodeWithUnknownWidgets(undefined);
-  assert.throws(() => setViaHandler(reg, node, "steps", 5), /not registered/i);
+  await assert.rejects(() => setViaHandler(reg, node, "steps", 5), /not registered/i);
   assert.deepEqual(node.widgets.map((w) => w.name), ["UNKNOWN", "UNKNOWN_1"]);
 });
 
-test("handler: unreachable placeholder w/ UNKNOWN widgets ⇒ REFUSE, names UNCHANGED", () => {
+test("handler: unreachable placeholder w/ UNKNOWN widgets ⇒ REFUSE, names UNCHANGED", async () => {
   const reg = unreachableRegistry();
   const node = nodeWithUnknownWidgets("CheckpointLoaderSimple");
-  assert.throws(() => setViaHandler(reg, node, "steps", 5), /not loaded|unreachable/i);
+  await assert.rejects(() => setViaHandler(reg, node, "steps", 5), /not loaded|unreachable/i);
   assert.deepEqual(node.widgets.map((w) => w.name), ["UNKNOWN", "UNKNOWN_1"]);
 });
 
-test("handler: stale placeholder INSTANCE (registered type, no instance def) ⇒ REFUSE before reconcile", () => {
+test("handler: stale placeholder INSTANCE (registered type, no instance def) ⇒ REFUSE before reconcile", async () => {
   const reg = loadedRegistry(); // KSampler registered WITH nodeData
   const stale = {
     id: 42,
@@ -395,18 +395,18 @@ test("handler: stale placeholder INSTANCE (registered type, no instance def) ⇒
     widgets: [{ name: "UNKNOWN", type: "number", value: 0 }],
     constructor: { name: "GenericFallback" }, // no nodeData ⇒ unresolved instance
   };
-  assert.throws(() => setViaHandler(reg, stale, "steps", 5), /unresolved placeholder|live definition is missing/i);
+  await assert.rejects(() => setViaHandler(reg, stale, "steps", 5), /unresolved placeholder|live definition is missing/i);
   assert.deepEqual(stale.widgets.map((w) => w.name), ["UNKNOWN"]);
 });
 
-test("handler: SUBGRAPH parent ⇒ reconcile SKIPPED (parent's own UNKNOWN widgets untouched), inner write lands", () => {
+test("handler: SUBGRAPH parent ⇒ reconcile SKIPPED (parent's own UNKNOWN widgets untouched), inner write lands", async () => {
   const reg = loadedRegistry();
   const { parent, inner, resolveSource } = makeSubgraphFixture("KSampler");
   // Give the parent its OWN UNKNOWN widgets + a def, so IF reconcile wrongly ran it
   // would rename them — it must not (reconcile is skipped for subgraph parents).
   parent.widgets.push({ name: "UNKNOWN", type: "number", value: 0 });
   parent.constructor = { nodeData: { input: { required: { foo: ["FLOAT", {}] } } } };
-  const { set } = setViaHandler(reg, parent, "sched_alias", "karras", resolveSource);
+  const { set } = await setViaHandler(reg, parent, "sched_alias", "karras", resolveSource);
   assert.equal(set.value, "karras");
   assert.equal(inner.widgets.find((w) => w.name === "scheduler").value, "karras");
   // Parent's own UNKNOWN widget name is untouched — reconcile did not run.

@@ -5298,6 +5298,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // reconcile-only-a-resolved-node → applyWidgetWrite with the resolved-target
     // registry guard (before coercion/mutation). A reorder or a dropped guard
     // therefore fails a test rather than silently regressing (#458).
+    //
+    // refreshCombos pulls the AUTHORITATIVE option list from the connected server
+    // (object_info re-register + refreshComboInNodes, mutating combos in place)
+    // so a just-downloaded model / uploaded image / staged output / freshly
+    // installed pack is accepted on a single revalidation, while a genuinely
+    // invalid value stays rejected against the FRESH list (#338/#317/#299/#288/
+    // #284/#304, keeping #240 strictness).
     return runSetWidget(node, widget, value, {
       registry: LG?.registered_node_types ?? {},
       resolveSource: sourceForSubgraphInput,
@@ -5305,6 +5312,7 @@ const GRAPH_TOOL_EXECUTORS = {
       beforeChange: () => graph.beforeChange(),
       afterChange: () => graph.afterChange(),
       setDirty: () => graph.setDirtyCanvas(true, true),
+      refreshCombos: () => refreshComfyNodeDefs(),
     });
   },
 
