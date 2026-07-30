@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 import {
   normalizeCopiedItems,
   recordCopiedNodes,
-  getCopiedSnapshot,
+  getVerifiedSnapshot,
   parseClipboardNodes,
   diffCopiedVsPasted,
   formatDroppedWarning,
@@ -50,9 +50,11 @@ test("normalizeCopiedItems keeps real nodes, drops groups/typeless selection ite
 
 test("no drop: every copied type is registered and pasted back", () => {
   const copied = [liveNode(1, "LoadAudio"), liveNode(2, "MultiTalkWav2VecEmbeds")];
-  recordCopiedNodes(copied);
+  const fp = "clipboard-A";
+  recordCopiedNodes(copied, fp);
   const pasted = [pastedNode(100, "LoadAudio"), pastedNode(101, "MultiTalkWav2VecEmbeds")];
-  const { dropped, dropped_count } = diffCopiedVsPasted(getCopiedSnapshot(), pasted);
+  // Clipboard unchanged since copy → snapshot verified.
+  const { dropped, dropped_count } = diffCopiedVsPasted(getVerifiedSnapshot(fp), pasted);
   assert.equal(dropped_count, 0);
   assert.deepEqual(dropped, []);
 });
@@ -66,7 +68,8 @@ test("the #261 bug: AudioCrop + AudioSeparation are reported as dropped, not sil
     liveNode(4, "MultiTalkWav2VecEmbeds"),
     liveNode(5, "VHS_VideoCombine"),
   ];
-  recordCopiedNodes(copied);
+  const fp = "clipboard-wan-multitalk";
+  recordCopiedNodes(copied, fp);
 
   // pasteFromClipboard skipped the two unknown types (fresh ids on the rest).
   const pasted = [
@@ -75,7 +78,10 @@ test("the #261 bug: AudioCrop + AudioSeparation are reported as dropped, not sil
     pastedNode(202, "VHS_VideoCombine"),
   ];
 
-  const { dropped, dropped_count, dropped_types } = diffCopiedVsPasted(getCopiedSnapshot(), pasted);
+  const { dropped, dropped_count, dropped_types } = diffCopiedVsPasted(
+    getVerifiedSnapshot(fp),
+    pasted,
+  );
   assert.equal(dropped_count, 2);
   assert.deepEqual(dropped_types.sort(), ["AudioCrop", "AudioSeparation"]);
   // Dropped records carry the ORIGINAL source ids so the agent can locate them.
@@ -171,6 +177,36 @@ test("AUTHORITATIVE clipboard: reading the real clipboard makes a native overwri
   const pasted = [pastedNode(40, "KSampler")];
   const { dropped_count } = diffCopiedVsPasted(clipboardNow, pasted, isRegistered);
   assert.equal(dropped_count, 0);
+});
+
+test("CODEX counterexample: stale UNREGISTERED snapshot + native copy yields ZERO drops via fingerprint guard", () => {
+  // Round-3 finding: tool-copy AudioCrop (unregistered), then a native Ctrl+C
+  // replaces the clipboard with KSampler, then paste lands KSampler. The
+  // clipboard fingerprint at paste ("clipboard-KSampler") differs from the one
+  // recorded at copy ("clipboard-AudioCrop"), so getVerifiedSnapshot returns []
+  // — the stale AudioCrop can never leak into the drop report.
+  recordCopiedNodes([liveNode(1, "AudioCrop")], "clipboard-AudioCrop");
+  const verified = getVerifiedSnapshot("clipboard-KSampler"); // clipboard changed
+  assert.deepEqual(verified, []);
+  const registered = new Set(["KSampler"]);
+  const { dropped_count } = diffCopiedVsPasted(verified, [pastedNode(9, "KSampler")], (t) =>
+    registered.has(t),
+  );
+  assert.equal(dropped_count, 0);
+});
+
+test("getVerifiedSnapshot only trusts the snapshot when the fingerprint matches and is non-null", () => {
+  recordCopiedNodes([liveNode(1, "AudioCrop")], "fp-1");
+  // Matching fingerprint → snapshot returned.
+  assert.deepEqual(getVerifiedSnapshot("fp-1"), [{ id: 1, type: "AudioCrop" }]);
+  // Changed fingerprint → empty.
+  assert.deepEqual(getVerifiedSnapshot("fp-2"), []);
+  // Null current fingerprint (clipboard unreadable at paste) → empty.
+  assert.deepEqual(getVerifiedSnapshot(null), []);
+  // Null recorded fingerprint (clipboard unreadable at copy) → never matches.
+  recordCopiedNodes([liveNode(2, "AudioCrop")], null);
+  assert.deepEqual(getVerifiedSnapshot(null), []);
+  assert.deepEqual(getVerifiedSnapshot("anything"), []);
 });
 
 test("stale snapshot + native copy of a DIFFERENT selection does NOT fabricate drops", () => {

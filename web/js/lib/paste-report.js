@@ -28,18 +28,44 @@ export function normalizeCopiedItems(items) {
   return out;
 }
 
-// Snapshot of the last clipboard write, so a later paste can diff against it.
+// Snapshot of the last clipboard write, so a later paste can diff against it —
+// paired with a FINGERPRINT of the raw clipboard at copy time. The snapshot is
+// only trustworthy while the clipboard still holds exactly what we copied; a
+// native Ctrl+C in between replaces the clipboard and invalidates it.
 let _clipboardSnapshot = [];
+let _clipboardFingerprint = null;
 
-/** Record what was just copied to the clipboard. Returns the normalized list. */
-export function recordCopiedNodes(items) {
+/** Record what was just copied. `fingerprint` is the raw clipboard payload
+ *  (e.g. the localStorage string) captured right AFTER the copy, used later to
+ *  detect whether the clipboard was replaced before the paste. */
+export function recordCopiedNodes(items, fingerprint = null) {
   _clipboardSnapshot = normalizeCopiedItems(items);
+  _clipboardFingerprint = fingerprint;
   return _clipboardSnapshot;
 }
 
 /** The most recent clipboard snapshot (empty array if nothing was copied). */
 export function getCopiedSnapshot() {
   return _clipboardSnapshot;
+}
+
+/**
+ * The snapshot, but ONLY if `currentFingerprint` proves the clipboard hasn't
+ * changed since it was recorded (non-null and byte-identical). Otherwise [].
+ * This is what lets the snapshot fallback be used safely: if a native Ctrl+C
+ * replaced the clipboard, the fingerprint won't match and no stale nodes leak
+ * into the drop report. A null fingerprint (clipboard unreadable at copy or
+ * paste) is never considered a match, so it can't fabricate drops either.
+ */
+export function getVerifiedSnapshot(currentFingerprint) {
+  if (
+    _clipboardFingerprint != null &&
+    currentFingerprint != null &&
+    currentFingerprint === _clipboardFingerprint
+  ) {
+    return _clipboardSnapshot;
+  }
+  return [];
 }
 
 /**

@@ -104,7 +104,7 @@ import { applyWidgetWrite, WidgetWriteError } from "./lib/widget-write.js";
 import { coerceMessageText, isDroppedAgentReplay } from "./lib/chat-serialize.js";
 import {
   recordCopiedNodes,
-  getCopiedSnapshot,
+  getVerifiedSnapshot,
   parseClipboardNodes,
   diffCopiedVsPasted,
   formatDroppedWarning,
@@ -6241,10 +6241,18 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!count) {
       throw new Error("nothing selected to copy — pass node_ids or select nodes first");
     }
-    // Snapshot the copied node types so the next graph_paste_nodes can detect
-    // any node the target frontend silently drops on paste (#261).
-    recordCopiedNodes(selected);
     canvas.copyToClipboard(selected);
+    // Snapshot the copied node types (plus a fingerprint of the raw clipboard
+    // AFTER the copy) so the next graph_paste_nodes can detect any node the
+    // target frontend silently drops on paste — and so a later native Ctrl+C
+    // that replaces the clipboard invalidates this snapshot (#261).
+    let fingerprint = null;
+    try {
+      fingerprint = window.localStorage?.getItem("litegrapheditor_clipboard") ?? null;
+    } catch {
+      /* localStorage unavailable — snapshot stays unverifiable, never trusted */
+    }
+    recordCopiedNodes(selected, fingerprint);
     return { copied: count };
   },
 
@@ -6276,16 +6284,18 @@ const GRAPH_TOOL_EXECUTORS = {
     // graph_copy_nodes against what actually landed, matched by node type.
     // Expected-node source of truth: parse the ACTUAL litegraph clipboard, which
     // reflects whatever paste just consumed (tool copy OR a native Ctrl+C), so it
-    // can't go stale. Fall back to the graph_copy_nodes snapshot only when the
-    // clipboard can't be read (frontend that keeps it off localStorage).
-    let expected = [];
+    // can't go stale. If the payload can't be parsed, fall back to the
+    // graph_copy_nodes snapshot — but ONLY when the raw clipboard is byte-
+    // identical to what it was at copy time (getVerifiedSnapshot), so a native
+    // Ctrl+C that replaced the clipboard can never resurrect a stale snapshot.
+    let rawClipboard = null;
     try {
-      const raw = window.localStorage?.getItem("litegrapheditor_clipboard");
-      expected = parseClipboardNodes(raw);
+      rawClipboard = window.localStorage?.getItem("litegrapheditor_clipboard") ?? null;
     } catch {
-      /* localStorage unavailable — fall back below */
+      /* localStorage unavailable */
     }
-    if (!expected.length) expected = getCopiedSnapshot();
+    let expected = parseClipboardNodes(rawClipboard);
+    if (!expected.length) expected = getVerifiedSnapshot(rawClipboard);
     // A type is a genuine drop only if it isn't a registered node class on this
     // frontend — this is the sole mechanism by which paste drops a node, and it
     // also filters any residual snapshot-fallback staleness.
