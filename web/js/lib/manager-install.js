@@ -387,6 +387,92 @@ export function legacyUpdateBody({ ui_id, id, version } = {}) {
   return { ui_id, id, version: version === "nightly" ? "nightly" : "latest" };
 }
 
+/**
+ * Normalize a ComfyUI-Manager `/customnode/getmappings` payload into the
+ * nodes_search result shape `{ count, results:[{id,title,description}] }`,
+ * filtered by `query` and capped at `limit` (default 15, max 40). Pure so the
+ * parse/filter is unit-testable away from the browser Manager client. Handles
+ * both wire shapes: an ARRAY of pack objects, or the documented MAP keyed by
+ * repo/url → [ [classNames…], { title, description, … } ]. Issues #251/#255.
+ */
+export function parseNodeMappings(data, query, limit) {
+  const q = String(query ?? "").toLowerCase();
+  const out = [];
+  const push = (id, title, desc) => {
+    if (!id) return;
+    const hay = `${id} ${title ?? ""} ${desc ?? ""}`.toLowerCase();
+    if (!q || hay.includes(q)) {
+      out.push({ id, title: title ?? id, description: String(desc ?? "").slice(0, 160) });
+    }
+  };
+  if (Array.isArray(data)) {
+    for (const p of data) push(p?.id ?? p?.reference ?? p?.title, p?.title, p?.description);
+  } else if (data && typeof data === "object") {
+    for (const [key, val] of Object.entries(data)) {
+      const meta = Array.isArray(val) ? val[1] : val;
+      push(meta?.id ?? meta?.title ?? key, meta?.title, meta?.description);
+    }
+  }
+  const max = Math.min(Number(limit) || 15, 40);
+  return { count: out.length, results: out.slice(0, max) };
+}
+
+/**
+ * Graceful-degradation result for nodes_search when the ComfyUI-Manager search
+ * backend can NOT be reached on ANY route (dialect-routed /v2 AND the absolute
+ * legacy route both threw "not reachable"). Instead of surfacing a raw throw —
+ * which blocks the whole install-discovery flow even though the agent can keep
+ * using already-registered nodes — return a STRUCTURED, actionable capability
+ * result the caller can branch on. Issues #251/#255.
+ */
+export function managerUnavailableResult(query, err) {
+  return {
+    supported: false,
+    managerReachable: false,
+    count: 0,
+    results: [],
+    query: query == null ? "" : String(query),
+    reason: String(err?.message ?? err ?? "ComfyUI-Manager not reachable"),
+    message:
+      "Node-registry search is unavailable: the built-in ComfyUI-Manager could not " +
+      "be reached on this ComfyUI (it may be disabled, or a legacy/partial Manager " +
+      "build without the search endpoint). Enable the built-in Manager to search the " +
+      "registry, or continue with the nodes already installed — inspect them with " +
+      "panel_list_nodes and the current graph with panel_get_graph.",
+  };
+}
+
+/**
+ * Run the nodes_search flow with graceful degradation against an unreachable /
+ * legacy ComfyUI-Manager (#251/#255). Dependency-injected `managerGet` (dialect-
+ * routed; adds /v2 for pip builds, strips it for legacy) and `managerCall`
+ * (absolute, no-/v2) so the whole decision path is unit-testable away from the
+ * browser Manager client. Order:
+ *   1. dialect-routed GET;
+ *   2. on an unreachable/404 signal, retry the ABSOLUTE legacy route (a legacy-
+ *      UI pip build or real 3.x Manager can serve /customnode/getmappings while
+ *      the /v2 route 404s, or detectManagerDialect's /v2 probe fails);
+ *   3. if the absolute route is ALSO unreachable, return the structured
+ *      {supported:false,…} capability result instead of throwing.
+ * Any non-"unreachable" error still propagates.
+ */
+export async function searchNodesVia(managerGet, managerCall, { query, limit } = {}) {
+  const route = "customnode/getmappings?mode=cache";
+  let data;
+  try {
+    data = await managerGet(route);
+  } catch (err) {
+    if (!isManagerUnreachable(err)) throw err;
+    try {
+      data = await managerCall(route);
+    } catch (err2) {
+      if (isManagerUnreachable(err2)) return managerUnavailableResult(query, err2);
+      throw err2;
+    }
+  }
+  return parseNodeMappings(data, query, limit);
+}
+
 /** #425 — ordered reboot {route, method} candidates for the detected dialect.
  *  The released 3.x Manager serves ONLY `POST /manager/reboot` (the pre-#230
  *  panel tried `GET /manager/reboot` → 404, after `POST /v2/manager/reboot` →

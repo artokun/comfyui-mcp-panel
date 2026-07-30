@@ -76,6 +76,7 @@ import {
   legacyUpdateBody,
   queueDrained,
   rebootCandidates,
+  searchNodesVia,
 } from "./lib/manager-install.js";
 import {
   CHAT_HISTORY_MAX_IMPORT_BYTES,
@@ -6846,27 +6847,14 @@ const GRAPH_TOOL_EXECUTORS = {
 
   // --- Custom-node management via the BUILT-IN ComfyUI Manager (/v2 API) ----
   async nodes_search({ query, limit }) {
-    const data = await managerGet("customnode/getmappings?mode=cache");
-    const q = String(query ?? "").toLowerCase();
-    const out = [];
-    const push = (id, title, desc) => {
-      if (!id) return;
-      const hay = `${id} ${title ?? ""} ${desc ?? ""}`.toLowerCase();
-      if (!q || hay.includes(q)) {
-        out.push({ id, title: title ?? id, description: String(desc ?? "").slice(0, 160) });
-      }
-    };
-    if (Array.isArray(data)) {
-      for (const p of data) push(p.id ?? p.reference ?? p.title, p.title, p.description);
-    } else if (data && typeof data === "object") {
-      // getmappings is keyed by repo/url → [ [classNames…], { title, description, … } ]
-      for (const [key, val] of Object.entries(data)) {
-        const meta = Array.isArray(val) ? val[1] : val;
-        push(meta?.id ?? meta?.title ?? key, meta?.title, meta?.description);
-      }
-    }
-    const max = Math.min(Number(limit) || 15, 40);
-    return { count: out.length, results: out.slice(0, max) };
+    // #251/#255: degrade gracefully against an unreachable / legacy Manager
+    // instead of surfacing a raw throw that blocks the whole install-discovery
+    // flow. searchNodesVia tries the dialect-routed GET, retries the ABSOLUTE
+    // (no-/v2) legacy route on an unreachable/404 signal (a legacy-UI pip build
+    // or real 3.x Manager can serve /customnode/getmappings while the /v2 route
+    // 404s — or detectManagerDialect's /v2 probe fails), and returns a
+    // structured {supported:false,…} capability result when BOTH are unreachable.
+    return searchNodesVia(managerGet, managerCall, { query, limit });
   },
 
   async nodes_list() {
