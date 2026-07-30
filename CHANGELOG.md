@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.20] - 2026-07-30
+
+### Fixed
+- **Session rebinds/preserves the active tab across a tool-triggered reboot, soft reload, or `free_vram` (#278, #334, #207, #332, #310).** Resume the active session after a reboot (gated so a benign WS blip never bounces a live session, and an explicit Disconnect is never overridden); rehello the connected tab after `free_vram`; bounded retry of transient `Failed to fetch` during the reconnect window; `graph_load` replaces the active tab in place (no `Unsaved Workflow` spawn) and `workflow_list` dedupes tab records; the embedded ComfyUI `base_path` is advertised in the session hello. (#349)
+- **panel_connect matches a valid `IMAGE→IMAGE` pair, and set_widget edges (#351, #179, #169; panel-side of #347).** `from_output` arriving JSON-stringified as `"0"` was read as a slot *named* `"0"` → 'no compatible pair' on a valid link; resolution is now name-first with a numeric-string→index fallback (#351). rgthree Power Lora composite widget values are parsed + merged instead of written verbatim (#179). Auto-match no longer clobbers an occupied dynamic-wildcard link (#169). `coerceWidgetValue` allows an explicit empty-string clear and rejects a genuinely-missing value (#347, panel side — the end-to-end empty-string fix also needs an orchestrator serialization change). Strict type-compat (#204) and combo/numeric strictness (#240) preserved. (#353)
+
 ## [0.11.19] - 2026-07-30
 
 ### Fixed
