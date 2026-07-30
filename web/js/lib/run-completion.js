@@ -197,16 +197,20 @@ export function createRunCompletionTracker({
     },
 
     /**
-     * Legacy/secondary run-end: `executing` with node===null. ComfyUI emits this
-     * exactly once when a prompt finishes and the queue goes idle — NOT mid-run —
-     * so it is an authoritative per-prompt end. Flush every remaining buffer
-     * under its own key (correct attribution) and clear liveness. On modern
-     * ComfyUI the buffer is already gone (execution_success flushed it); this is
-     * the completion path for legacy servers that emit no execution_success.
+     * Legacy/secondary run-end: `executing` with node===null (queue idle).
+     *
+     * This flushes ONLY buffers whose prompt is NOT currently active — it can
+     * never truncate a run ComfyUI still reports as in-flight (#200/#224). On
+     * modern ComfyUI the authoritative `execution_success` has already cleared
+     * `active` and flushed the buffer, so this is a no-op there; its remaining job
+     * is a backstop for an ORPHAN/non-active leftover (e.g. a legacy __no_prompt__
+     * buffer). Deliberately NOT trusting a possibly-spurious null to end an active
+     * run is what makes an early/partial completion from a stray null unreachable.
      */
     onExecutingNull() {
-      for (const k of [...buffers.keys()]) flush(k);
-      active.clear();
+      for (const k of [...buffers.keys()]) {
+        if (!active.has(k)) flush(k);
+      }
     },
 
     /**

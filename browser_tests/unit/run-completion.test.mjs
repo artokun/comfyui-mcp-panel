@@ -156,13 +156,29 @@ test("#224 missing prompt_id: back-to-back id-less runs do NOT merge", () => {
   assert.equal(h.flushes[0].key, NO_PROMPT_KEY);
   assert.deepEqual(h.flushes[0].images.map((m) => m.filename), ["run_a.png"]);
   h.tracker.onExecuted(undefined, imgs([img("run_b.png")]));
-  h.tracker.onExecutingNull(); // queue idle ends run B
+  h.tracker.onExecutionSuccess(undefined); // authoritative end of run B
   assert.equal(h.flushes.length, 2);
   assert.deepEqual(
     h.flushes[1].images.map((m) => m.filename),
     ["run_b.png"],
     "run B is its own batch — outputs never merged with run A",
   );
+});
+
+test("#200/#224: a spurious executing:null mid-run does NOT flush an active run", () => {
+  const h = makeHarness();
+  const P = "prompt-spurious-null";
+  h.tracker.onExecutionStart(P);
+  h.tracker.onExecutingNode(P, "canny");
+  h.tracker.onExecuted(P, imgs([img("preview.png", "temp")]));
+  // A stray null arrives while the KSampler is still running — must be ignored:
+  // the prompt is active, so no early/partial completion.
+  h.tracker.onExecutingNull();
+  assert.equal(h.flushes.length, 0, "active run untouched by a spurious null");
+  h.tracker.onExecuted(P, imgs([img("final.png")]));
+  h.tracker.onExecutionSuccess(P);
+  assert.equal(h.flushes.length, 1, "single complete event on the authoritative end");
+  assert.deepEqual(h.flushes[0].images.map((m) => m.filename), ["preview.png", "final.png"]);
 });
 
 test("missed execution_start: executing(node) keeps the timer from early-flushing", () => {
