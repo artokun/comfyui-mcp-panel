@@ -20,7 +20,6 @@ import {
   assertAddNodeResolvable,
   assertResolvedTargetRegistered,
 } from "../../web/js/lib/node-resolve.js";
-import { applyWidgetWrite } from "../../web/js/lib/widget-write.js";
 // The PRODUCTION graph_set_widget handler body — the executor and these tests
 // call it verbatim, so the tested ordering IS the shipped ordering (#458).
 import { runSetWidget } from "../../web/js/lib/set-widget.js";
@@ -175,22 +174,16 @@ test("set_widget guard: NATIVE/defless registered type (Note) ⇒ passes (no fal
   assert.doesNotThrow(() => assertResolvedTargetRegistered(reg, note));
 });
 
-// ---- END-TO-END through applyWidgetWrite + the injected registry hook --------
+// ---- END-TO-END through the REAL production handler body (runSetWidget) -------
 // These prove the guard runs on the ACTUAL RESOLVED target the write mutates,
 // which is where the outer-node check failed open (subgraph / promoted paths).
 
 const HOOKS = { beforeChange() {}, afterChange() {}, setDirty() {} };
-function hookFor(registry) {
-  return {
-    ...HOOKS,
-    assertTargetWritable: (t) => assertResolvedTargetRegistered(registry, t),
-  };
-}
 
 // Drive the ACTUAL production handler body (runSetWidget) — the same function
-// GRAPH_TOOL_EXECUTORS.graph_set_widget delegates to. Used for the regressions
-// whose correctness depends on the handler's full ORDERING (preflight → reconcile
-// → guarded write), so a reorder/hook-removal fails a test.
+// GRAPH_TOOL_EXECUTORS.graph_set_widget delegates to (it wires the assertTargetWritable
+// guard internally). So dropping the shipped guard wiring, or reordering
+// preflight/reconcile/guarded-write, FAILS these tests.
 function setViaHandler(registry, node, widgetName, value, resolveSource) {
   return runSetWidget(node, widgetName, value, { registry, resolveSource, ...HOOKS });
 }
@@ -222,7 +215,7 @@ function makeSubgraphFixture(innerType = "KSampler") {
 test("set_widget e2e: DIRECT registered node ⇒ write succeeds", () => {
   const reg = loadedRegistry();
   const node = regNode("KSampler", [{ name: "steps", type: "INT", value: 0 }]);
-  const set = applyWidgetWrite(node, "steps", 20, hookFor(reg));
+  const { set } = setViaHandler(reg, node, "steps", 20);
   assert.equal(set.value, 20);
 });
 
@@ -274,24 +267,28 @@ test("set_widget e2e (finding #2): registered TYPE but placeholder INSTANCE ⇒ 
 test("set_widget e2e: DIRECT unregistered placeholder (reachable) ⇒ REFUSE, no mutation", () => {
   const reg = loadedRegistry();
   const ghost = { id: 1, type: "GhostNode", widgets: [{ name: "value", type: "number", value: 0 }] };
-  assert.throws(() => applyWidgetWrite(ghost, "value", 5, hookFor(reg)), /not registered|placeholder/i);
+  assert.throws(() => setViaHandler(reg, ghost, "value", 5), /not registered|placeholder/i);
   assert.equal(ghost.widgets[0].value, 0);
 });
 
-test("set_widget e2e (case a): placeholder carrying `subgraph:{}` + generic widget ⇒ REFUSE", () => {
+// case a/b/keep go through the REAL handler (setViaHandler): the REFUSAL/PASS is
+// decided by the guard HOOK inside runSetWidget (these paths bypass outer
+// preflight), so dropping the shipped guard wiring FAILS these tests.
+test("set_widget e2e (case a): placeholder carrying `subgraph:{}` + generic widget ⇒ REFUSE (via handler)", () => {
   const reg = loadedRegistry();
   // subgraph:{} is truthy but has no promoted inputs, so it resolves to its OWN
-  // generic widget — the exact fail-open the outer-node check allowed.
+  // generic widget — the exact fail-open the outer-node check allowed. Refusal
+  // here comes from the guard hook, not outer preflight.
   const ghost = { id: 2, type: "GhostNode", subgraph: {}, widgets: [{ name: "value", type: "number", value: 0 }] };
-  assert.throws(() => applyWidgetWrite(ghost, "value", 7, hookFor(reg)), /not registered|placeholder/i);
+  assert.throws(() => setViaHandler(reg, ghost, "value", 7), /not registered|placeholder/i);
   assert.equal(ghost.widgets[0].value, 0);
 });
 
-test("set_widget e2e (case b): real subgraph → UNREGISTERED inner placeholder ⇒ REFUSE, inner untouched", () => {
+test("set_widget e2e (case b): real subgraph → UNREGISTERED inner placeholder ⇒ REFUSE (via handler), inner untouched", () => {
   const reg = loadedRegistry();
   const { parent, inner, resolveSource } = makeSubgraphFixture("GhostSampler");
   assert.throws(
-    () => applyWidgetWrite(parent, "sched_alias", "karras", { ...hookFor(reg), resolveSource }),
+    () => setViaHandler(reg, parent, "sched_alias", "karras", resolveSource),
     /not registered|placeholder/i,
   );
   assert.equal(inner.widgets.find((w) => w.name === "scheduler").value, "simple");
@@ -300,13 +297,13 @@ test("set_widget e2e (case b): real subgraph → UNREGISTERED inner placeholder 
 test("set_widget e2e (case c): type-less node ⇒ REFUSE", () => {
   const reg = loadedRegistry();
   const node = { id: 5, widgets: [{ name: "value", type: "number", value: 0 }] };
-  assert.throws(() => applyWidgetWrite(node, "value", 3, hookFor(reg)), /not registered/i);
+  assert.throws(() => setViaHandler(reg, node, "value", 3), /not registered/i);
 });
 
-test("set_widget e2e (keep): real subgraph → REGISTERED inner node ⇒ still succeeds", () => {
+test("set_widget e2e (keep): real subgraph → REGISTERED inner node ⇒ still succeeds (via handler)", () => {
   const reg = loadedRegistry();
   const { parent, inner, resolveSource } = makeSubgraphFixture("KSampler");
-  const set = applyWidgetWrite(parent, "sched_alias", "karras", { ...hookFor(reg), resolveSource });
+  const { set } = setViaHandler(reg, parent, "sched_alias", "karras", resolveSource);
   assert.equal(set.value, "karras");
   assert.equal(set.promoted_from.inner_node_id, 54);
   assert.equal(inner.widgets.find((w) => w.name === "scheduler").value, "karras");
@@ -315,7 +312,7 @@ test("set_widget e2e (keep): real subgraph → REGISTERED inner node ⇒ still s
 test("set_widget e2e: unreachable ⇒ REFUSE even for a would-be-core type, no mutation", () => {
   const reg = unreachableRegistry();
   const node = { id: 1, type: "CheckpointLoaderSimple", widgets: [{ name: "ckpt_name", type: "text", value: "" }] };
-  assert.throws(() => applyWidgetWrite(node, "ckpt_name", "x.safetensors", hookFor(reg)), /not loaded|unreachable/i);
+  assert.throws(() => setViaHandler(reg, node, "ckpt_name", "x.safetensors"), /not loaded|unreachable/i);
   assert.equal(node.widgets[0].value, "");
 });
 
