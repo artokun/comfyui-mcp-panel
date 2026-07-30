@@ -89,6 +89,8 @@ import {
   reconcileUnknownWidgetNames,
   reapplyDefsToLiveNodes,
 } from "./lib/asset-staleness.js";
+import { coerceMessageText } from "./lib/chat-serialize.js";
+import { createMediaRecorder } from "./lib/chat-media.js";
 
 let app = null;
 let api = null;
@@ -11541,6 +11543,16 @@ function buildPanel() {
     return entry;
   }
 
+  // Media persistence controller (#177): owns the record decision + replay
+  // guard (see lib/chat-media.js). paintImage/paintVideo call mediaRecorder.record
+  // after painting; paintThread wraps its replay loop in mediaRecorder.replay so
+  // stored media repaints without re-recording. Only DURABLE urls are persisted
+  // (ComfyUI /view / absolute http(s)); data:/blob:/other are rejected.
+  const mediaRecorder = createMediaRecorder(record);
+  function recordMedia(mkind, url, caption) {
+    mediaRecorder.record(mkind, url, caption);
+  }
+
   /** Bind the agent's current session id to the open thread (for reload/resume). */
   function bindSession(sessionId) {
     const previousSessionId = thread?.sessionId || null;
@@ -11708,6 +11720,8 @@ function buildPanel() {
     }
     log.appendChild(card);
     scrollLog();
+    // Persist servable images so they survive reload / thread switch (#177).
+    recordMedia("image", url, name);
   }
 
   // Lazy chat-video manager: only videos currently scrolled into view hold a live
@@ -11784,6 +11798,8 @@ function buildPanel() {
     log.appendChild(card);
     videoObserver().observe(holder);
     scrollLog();
+    // Persist servable videos so they survive reload / thread switch (#177).
+    recordMedia("video", url, name);
   }
 
   /** Decide whether a ComfyUI output descriptor is a VIDEO (render <video>) vs an
@@ -11806,8 +11822,14 @@ function buildPanel() {
 
   /** Round-trip: a card interaction becomes a normal, visible user message. */
   function sendCardReply(text) {
-    appendUser(text, {});
-    const ok = client?.sendUserMessage?.(text);
+    // Card interactions are supposed to hand us a string reply, but a malformed
+    // A2UI spec can send an object through this boundary — coerce it so neither
+    // the visible bubble nor the outgoing user_message becomes "[object Object]"
+    // (#219). cmcp-a2ui already normalizes at ctx.choose(); this is the panel's
+    // own guard for any other caller.
+    const reply = coerceMessageText(text);
+    appendUser(reply, {});
+    const ok = client?.sendUserMessage?.(reply);
     if (!ok) appendSystem("Card reply couldn't be sent — agent disconnected.");
   }
 
@@ -12548,14 +12570,22 @@ function buildPanel() {
   function paintThread(t) {
     thread = t;
     resetFeed();
-    for (const m of t.msgs) {
-      if (m.role === "user") paintUser(m.text, { attachments: m.attachments, workflowVersion: m.workflowVersion });
-      else if (m.role === "agent") paintAgent(m.text);
-      else if (m.role === "card") {
-        if (m.kind === "a2ui") paintA2UIRecord(m);
-        else paintCard(m);
+    // Replay guard: paintImage/paintVideo record servable media as they paint;
+    // during a stored-history replay they must repaint WITHOUT re-recording
+    // (which would duplicate the media on every reload / thread switch) (#177).
+    mediaRecorder.replay(() => {
+      for (const m of t.msgs) {
+        if (m.role === "user") paintUser(m.text, { attachments: m.attachments, workflowVersion: m.workflowVersion });
+        else if (m.role === "agent") paintAgent(m.text);
+        else if (m.role === "media") {
+          if (m.mkind === "video") paintVideo(m.url, m.caption);
+          else paintImage(m.url, m.caption);
+        } else if (m.role === "card") {
+          if (m.kind === "a2ui") paintA2UIRecord(m);
+          else paintCard(m);
+        }
       }
-    }
+    });
     // resetFeed() recreated the indicator (if a turn is live) ABOVE these
     // repainted messages — re-pin it to the bottom so it trails the newest one.
     if (agentWorking) bumpThinking();
