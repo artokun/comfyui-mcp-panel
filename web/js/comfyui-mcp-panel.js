@@ -112,6 +112,12 @@ import {
 } from "./lib/paste-report.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
 import {
+  isVueNodesEnabled,
+  computeFitTransform,
+  cssViewport,
+  scopeChanged,
+} from "./lib/screenshot-capture.js";
+import {
   nodeFocusBounds,
   boundsAroundNodes,
   groupMemberNodes,
@@ -6695,12 +6701,16 @@ const GRAPH_TOOL_EXECUTORS = {
         "Blind mode is ON: screenshots are withheld from the agent. Ask the user to describe the canvas, or to turn Blind off.",
       );
     }
-    const { graph, canvas } = getGraphCtx();
+    const { app, graph, canvas } = getGraphCtx();
     const cv = canvas?.canvas;
     const ds = canvas?.ds;
     if (!cv || typeof cv.toDataURL !== "function" || !ds) {
       throw new Error("canvas not available for screenshot");
     }
+    // #237: remember the viewing scope (root vs an opened subgraph) so the
+    // capture can't leave graph tools pointed at a different graph than where
+    // they started.
+    const scopeGraph = app?.canvas?.graph ?? graph;
     const nodes = graph._nodes ?? [];
     const groups = graph._groups ?? [];
     if (!nodes.length && !groups.length) throw new Error("nothing to screenshot (empty graph)");
@@ -6739,16 +6749,37 @@ const GRAPH_TOOL_EXECUTORS = {
     const bounds = [minX, minY, maxX - minX, maxY - minY];
     const pad = Number.isFinite(padding) ? Number(padding) : 60;
     const saved = { scale: ds.scale, ox: ds.offset[0], oy: ds.offset[1] };
+    // Under the Vue node renderer, node bodies are DOM/Vue elements layered over
+    // the canvas, so cv.toDataURL() would miss them (#335/#329/#189). Force the
+    // classic LiteGraph paint path (which draws node bodies on the 2D canvas) for
+    // the duration of the capture, then restore the user's setting.
+    const vueNodes = isVueNodesEnabled((id) => getSetting(id));
+    let vueToggled = false;
     let dataUrl;
     let outW = cv.width;
     let outH = cv.height;
     try {
-      const w = bounds[2] + pad * 2;
-      const h = bounds[3] + pad * 2;
-      const next = Math.min(cv.width / w, cv.height / h, 1.5);
-      ds.scale = next;
-      ds.offset[0] = -bounds[0] + pad + (cv.width / next - w) / 2;
-      ds.offset[1] = -bounds[1] + pad + (cv.height / next - h) / 2;
+      if (vueNodes) {
+        setSetting("Comfy.VueNodes.Enabled", false);
+        vueToggled = true;
+      }
+      // ds.scale/ds.offset are CSS pixels — fit against CSS-pixel viewport dims,
+      // NOT the DPR-scaled backing store cv.width/cv.height (#335 framing bug).
+      const { viewCssW, viewCssH } = cssViewport(cv);
+      const fit = computeFitTransform({
+        boundsX: bounds[0],
+        boundsY: bounds[1],
+        boundsW: bounds[2],
+        boundsH: bounds[3],
+        viewCssW,
+        viewCssH,
+        pad,
+        maxScale: 1.5,
+      });
+      ds.scale = fit.scale;
+      ds.offset[0] = fit.offsetX;
+      ds.offset[1] = fit.offsetY;
+      canvas.setDirty?.(true, true);
       canvas.draw(true, true); // synchronous redraw at the fitted transform
       const MAXW = 1600;
       if (cv.width > MAXW) {
@@ -6764,9 +6795,20 @@ const GRAPH_TOOL_EXECUTORS = {
         dataUrl = cv.toDataURL("image/png");
       }
     } finally {
+      if (vueToggled) setSetting("Comfy.VueNodes.Enabled", true);
       ds.scale = saved.scale;
       ds.offset[0] = saved.ox;
       ds.offset[1] = saved.oy;
+      // #237: if anything switched the active graph during capture, put it back
+      // so subsequent graph tools stay in the scope the caller was in.
+      const nowGraph = app?.canvas?.graph ?? null;
+      if (scopeChanged(scopeGraph, nowGraph) && typeof app?.canvas?.setGraph === "function") {
+        try {
+          app.canvas.setGraph(scopeGraph);
+        } catch {
+          // best-effort — restore of scale/offset below still runs
+        }
+      }
       canvas.setDirty?.(true, true);
       canvas.draw?.(true, true);
     }
@@ -6776,7 +6818,8 @@ const GRAPH_TOOL_EXECUTORS = {
       mimeType: "image/png",
       width: outW,
       height: outH,
-      viewing: describeActiveGraph(graph),
+      renderer: vueNodes ? "vue-nodes (forced litegraph paint for capture)" : "litegraph",
+      viewing: describeActiveGraph(app?.canvas?.graph ?? graph),
     };
   },
 
