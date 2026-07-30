@@ -20,11 +20,11 @@ import { applyWidgetWrite, WidgetWriteError } from "./widget-write.js";
 import { reconcileUnknownWidgetNames } from "./asset-staleness.js";
 import { preflightSetWidgetTarget, assertResolvedTargetRegistered } from "./node-resolve.js";
 
-export function runSetWidget(
+export async function runSetWidget(
   node,
   widgetName,
   value,
-  { registry = {}, resolveSource, canvas, beforeChange, afterChange, setDirty } = {},
+  { registry = {}, resolveSource, canvas, beforeChange, afterChange, setDirty, refreshCombos } = {},
 ) {
   // (1) Preflight the OUTER node before ANY mutation; decide whether reconcile
   //     may run (never on a placeholder; skipped for subgraph parents).
@@ -39,8 +39,8 @@ export function runSetWidget(
   // (#240) and verifies the write stuck exactly. The injected assertTargetWritable
   // runs on the RESOLVED target BEFORE coercion/mutation, so a placeholder is
   // refused before any side effect (#458).
-  try {
-    const set = applyWidgetWrite(node, widgetName, value, {
+  const write = () =>
+    applyWidgetWrite(node, widgetName, value, {
       resolveSource,
       canvas,
       beforeChange,
@@ -48,8 +48,37 @@ export function runSetWidget(
       setDirty,
       assertTargetWritable: (targetNode) => assertResolvedTargetRegistered(registry, targetNode),
     });
-    return { set };
+
+  try {
+    return { set: write() };
   } catch (err) {
+    // STALE-COMBO RECOVERY (#338/#317/#299/#288/#284/#304): the ONLY retryable
+    // failure is a COMBO value rejected against the widget's CURRENT option list
+    // — a just-downloaded model / uploaded image / staged output / freshly
+    // installed pack that the frontend combo snapshot doesn't list yet. When a
+    // refresh source is injected, pull the AUTHORITATIVE option list from the
+    // connected server (object_info + refreshComboInNodes, in place) and
+    // revalidate EXACTLY ONCE. This keeps #240's strictness intact: the retry
+    // validates against the FRESH list, so a genuinely-invalid value (still
+    // absent after refresh) is rejected, and no other error class is retried.
+    if (err instanceof WidgetWriteError && err.combo && typeof refreshCombos === "function") {
+      try {
+        await refreshCombos();
+      } catch {
+        /* refresh best-effort; fall through to re-raise the original rejection */
+      }
+      try {
+        return { set: write(), refreshed: true };
+      } catch (retryErr) {
+        if (retryErr instanceof WidgetWriteError) {
+          throw new Error(
+            `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}) ` +
+              `after refreshing combo options: ${retryErr.message}`,
+          );
+        }
+        throw retryErr;
+      }
+    }
     if (err instanceof WidgetWriteError) {
       throw new Error(
         `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ${err.message}`,
