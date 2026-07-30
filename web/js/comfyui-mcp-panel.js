@@ -66,7 +66,7 @@ import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
-import { buildInstallRequest, classifyInstallOutcome, installGitUrl } from "./lib/manager-install.js";
+import { buildInstallRequest, classifyInstallOutcome, installGitUrl, queueDrained } from "./lib/manager-install.js";
 import {
   CHAT_HISTORY_MAX_IMPORT_BYTES,
   CHAT_HISTORY_SCHEMA,

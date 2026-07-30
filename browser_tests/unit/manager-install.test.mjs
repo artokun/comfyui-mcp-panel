@@ -4,8 +4,11 @@
 // must resolve to the repo NAME and the correct per-dialect payload.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
-import {
+import * as ManagerInstall from "../../web/js/lib/manager-install.js";
+const {
   looksLikeGitUrl,
   gitRepoName,
   installGitUrl,
@@ -16,7 +19,7 @@ import {
   isReadableInstalledList,
   queueFailureSignal,
   classifyInstallOutcome,
-} from "../../web/js/lib/manager-install.js";
+} = ManagerInstall;
 
 test("looksLikeGitUrl recognizes every git protocol", () => {
   for (const u of [
@@ -445,4 +448,95 @@ test("v2-batch: git URL, stale batch failed[] + renamed-dir present ⇒ NOT fail
   });
   assert.notEqual(o.state, "failed");
   assert.equal(o.state, "unverified");
+});
+
+// --- codex round 5: handler WIRING guard ------------------------------------
+// The install runtime lives in comfyui-mcp-panel.js (waitForQueueDrain,
+// verifyInstalled, nodes_install) and calls manager-install.js exports at MODULE
+// scope. That file can't load under `node` (Comfy frontend globals), and the
+// direct-import unit tests above can't see its import statement — so a missing
+// import (e.g. queueDrained omitted → ReferenceError on the first status poll,
+// failing EVERY install) slipped past. This guard reads the panel SOURCE and
+// asserts every manager-install export it CALLS is actually imported.
+test("comfyui-mcp-panel imports every manager-install export it calls (no ReferenceError)", () => {
+  const panelPath = fileURLToPath(
+    new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
+  );
+  const src = readFileSync(panelPath, "utf8");
+
+  const importMatch = src.match(
+    /import\s*\{([^}]*)\}\s*from\s*["']\.\/lib\/manager-install\.js["']/,
+  );
+  assert.ok(importMatch, "panel must import from ./lib/manager-install.js");
+  const imported = new Set(
+    importMatch[1]
+      .split(",")
+      .map((s) => s.trim().split(/\s+as\s+/)[0].trim())
+      .filter(Boolean),
+  );
+
+  // Source with the import statement removed, so an imported name isn't counted
+  // as its own "call site".
+  const body = src.replace(importMatch[0], "");
+  const exports = Object.keys(ManagerInstall).filter(
+    (k) => typeof ManagerInstall[k] === "function",
+  );
+
+  const usedButNotImported = exports.filter(
+    (name) => new RegExp(`\\b${name}\\s*\\(`).test(body) && !imported.has(name),
+  );
+  assert.deepEqual(
+    usedButNotImported,
+    [],
+    `panel calls these manager-install exports without importing them: ${usedButNotImported.join(", ")}`,
+  );
+
+  // Sanity: the four we know the handler uses must be present (guards against
+  // the regex silently matching nothing if the import shape changes).
+  for (const name of ["buildInstallRequest", "classifyInstallOutcome", "installGitUrl", "queueDrained"]) {
+    assert.ok(imported.has(name), `expected panel to import ${name}`);
+  }
+});
+
+// Also drive the REAL waitForQueueDrain source against a mock managerGet, so the
+// drain loop's use of queueDrained is exercised end-to-end (a missing binding
+// would throw here too). We extract the function text from the panel source and
+// evaluate it with queueDrained + a stubbed managerGet in scope — mirroring the
+// module's own dependency wiring.
+test("waitForQueueDrain (real panel source) returns a drained status without ReferenceError", async () => {
+  const panelPath = fileURLToPath(
+    new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
+  );
+  const src = readFileSync(panelPath, "utf8");
+
+  const fnMatch = src.match(
+    /async function waitForQueueDrain\([\s\S]*?\n\}/,
+  );
+  assert.ok(fnMatch, "could not locate waitForQueueDrain in panel source");
+
+  // Provide the exact free identifiers the function closes over at module scope.
+  const MANAGER_FETCH_TIMEOUT_MS = 15000;
+  const boundedDelay = (ms, deadline) =>
+    new Promise((r) => setTimeout(r, Math.max(0, Math.min(ms, deadline - Date.now()))));
+  let polls = 0;
+  const managerGet = async () => {
+    // First poll: still processing; second: positively drained.
+    polls += 1;
+    return polls < 2
+      ? { is_processing: true, done_count: 0, total_count: 1 }
+      : { is_processing: false, done_count: 1, total_count: 1 };
+  };
+  const factory = new Function(
+    "queueDrained",
+    "managerGet",
+    "MANAGER_FETCH_TIMEOUT_MS",
+    "boundedDelay",
+    "AbortSignal",
+    `${fnMatch[0]}\nreturn waitForQueueDrain;`,
+  );
+  const realWait = factory(queueDrained, managerGet, MANAGER_FETCH_TIMEOUT_MS, boundedDelay, AbortSignal);
+
+  const status = await realWait({ timeoutMs: 5000, intervalMs: 10 });
+  assert.equal(queueDrained(status), true, "should return a positively-drained status");
+  assert.ok(polls >= 2, "should have polled until drained");
 });
