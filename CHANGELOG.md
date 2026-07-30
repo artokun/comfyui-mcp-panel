@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.7] - 2026-07-30
+
+### Fixed
+- **SEVERE graph corruption: `panel_set_widget` on a promoted subgraph widget + combo enums (#233, #240).** `graph_set_widget` did `w.value = value` with no target resolution or value validation. On a SubgraphNode the promoted widget's slot is positionally shifted vs the inner node, so writing by name clobbered a DIFFERENT inner widget (an INT `steps` slot ended up holding `"euler"`) while reporting success; and a combo write was later reinterpreted as a stale dropdown index, drifting to a neighbouring enum. New `web/js/lib/widget-write.js`: `resolvePromotedInnerTarget` walks the subgraph-input link to the ACTUAL inner `(node,widget)` and FAILS CLOSED (throws before any mutation) when a promoted widget can't be resolved or is ambiguous — never writing a shifted parent slot; `coerceWidgetValue` validates by declared type (combo = exact current option only, numeric rejects arrays/objects/blanks/non-finite) and the handler verifies the value stuck exactly. Live-verified: a valid combo value sets exactly, an invalid one is rejected (not silently coerced). (#244)
+- **`[object Object]` at the sidebar + persisted-replay sites (#238, #241).** WS-9 (#228) serialized the live chat but the sidebar output payload and the persisted-message rehydration path still stringified objects. Both now route through the shared `coerceMessageText`; replay drops only content-losing objects, never a legitimately empty message. Live-verified after reload. (#243)
+
 ## [0.11.6] - 2026-07-29
 
 ### Fixed
