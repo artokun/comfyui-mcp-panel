@@ -240,8 +240,16 @@ function classifySource(svc, wf, rawPath) {
   if (typeof svc?.getWorkflowByPath === "function") {
     try {
       const found = svc.getWorkflowByPath(rawPath);
-      if (found && found.isPersisted === true) persisted = true;
-      else confirmedAbsent = true; // successful call, no persisted file here
+      if (found && found.isPersisted === true) {
+        persisted = true;
+      } else if (found == null) {
+        // Successful call returned NOTHING — truly no workflow at this path.
+        confirmedAbsent = true;
+      }
+      // A RETURNED object that is not affirmatively persisted (e.g. the drifted
+      // temporary `wf` itself, isPersisted=false) is NOT proof of absence —
+      // something is at that path and we cannot prove there is no file. Leave
+      // both flags unset so the result stays "unknown" → refuse (#226).
     } catch {
       /* oracle threw → cannot confirm → neither flag set → unknown */
     }

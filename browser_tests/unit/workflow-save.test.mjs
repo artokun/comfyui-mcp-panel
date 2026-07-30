@@ -247,7 +247,14 @@ function makeFaithfulService({ files = [], active } = {}) {
     calls,
     disk,
     getWorkflowByPath(path) {
-      return disk.has(path) ? { path, isPersisted: true } : undefined
+      // Nothing on disk at this path ⇒ the store knows no workflow here.
+      if (!disk.has(path)) return undefined
+      // On disk: return whatever object the store currently holds for it. If the
+      // ACTIVE object claims this path, return IT — this models the #226 drift
+      // where a persisted file's in-memory object is mis-flagged temporary
+      // (isPersisted=false). Otherwise a persisted stub.
+      if (svc.activeWorkflow && svc.activeWorkflow.path === path) return svc.activeWorkflow
+      return { path, isPersisted: true }
     },
     async renameWorkflow(wf, newPath) {
       calls.push(['renameWorkflow', wf.path, newPath])
@@ -398,6 +405,67 @@ test('disk-existence backstop catches a saveWorkflowAs that moves a persisted so
     () => saveActiveWorkflow(svc, 'zz226b-copy', {}),
     /moved the original workflow .* instead of copying it/
   )
+})
+
+test('P0 round-4: oracle returns the DRIFTED non-persisted wf for an on-disk path ⇒ unknown ⇒ REFUSE (#226)', async () => {
+  // Source IS on disk, but its in-memory object is mis-flagged temporary. The
+  // store's getWorkflowByPath returns that same non-persisted object. A RETURNED
+  // object is NOT proof of absence — classifying it never-persisted would move
+  // (destroy) the real file with the backstop skipped. Must classify unknown.
+  const active = {
+    path: 'workflows/zz226b-orig.json',
+    filename: 'zz226b-orig.json',
+    directory: 'workflows',
+    isPersisted: false, // drifted
+    isTemporary: true // drifted
+  }
+  const svc = makeFaithfulService({ files: [active.path], active })
+  // Sanity: the oracle returns the drifted non-persisted active object here.
+  assert.equal(svc.getWorkflowByPath('workflows/zz226b-orig.json'), active)
+  assert.equal(active.isPersisted, false)
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'zz226b-copy', {}),
+    /cannot be proven absent from disk/
+  )
+  assert.ok(svc.disk.has('workflows/zz226b-orig.json'), 'real source preserved')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
+  assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflowAs'), 'never delegated a move')
+})
+
+test('P0 round-4: a LIST-miss is not proof of absence ⇒ unknown ⇒ REFUSE (#226)', async () => {
+  // The only oracle is the workflow lists, and the source path is absent from
+  // them. A list MISS cannot prove a file is absent from disk (an unlisted file
+  // may exist), so it must NOT confirm absence — classify unknown and refuse.
+  const active = {
+    path: 'workflows/zz226b-orig.json',
+    filename: 'zz226b-orig.json',
+    directory: 'workflows',
+    isPersisted: false, // drifted
+    isTemporary: true // drifted
+  }
+  const calls = []
+  const svc = {
+    activeWorkflow: active,
+    calls,
+    workflows: [], // present but empty ⇒ oracle available, source is a MISS
+    openWorkflows: [],
+    async renameWorkflow(wf, to) {
+      calls.push(['renameWorkflow', wf.path, to])
+    },
+    async saveWorkflow(wf) {
+      calls.push(['saveWorkflow', wf.path])
+    },
+    async saveWorkflowAs(wf, opts) {
+      calls.push(['saveWorkflowAs', wf.path, opts?.filename])
+    }
+  }
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'zz226b-copy', {}),
+    /cannot be proven absent from disk/
+  )
+  assert.equal(calls.length, 0, 'nothing was called — no move')
 })
 
 test('P0-a: no existence oracle + mis-flagged temporary + real name ⇒ REFUSE, never move (#226)', async () => {
