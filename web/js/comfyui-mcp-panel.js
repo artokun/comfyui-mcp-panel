@@ -90,6 +90,7 @@ import {
   reconcileUnknownWidgetNames,
   reapplyDefsToLiveNodes,
 } from "./lib/asset-staleness.js";
+import { applyWidgetWrite, WidgetWriteError } from "./lib/widget-write.js";
 import { coerceMessageText, isDroppedAgentReplay } from "./lib/chat-serialize.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
 import { saveActiveWorkflow } from "./lib/workflow-save.js";
@@ -5161,29 +5162,32 @@ const GRAPH_TOOL_EXECUTORS = {
     // Repair positional UNKNOWN/UNKNOWN_n placeholders against the live def so
     // the caller's real widget name resolves (#199) before we look it up.
     reconcileUnknownWidgetNames(node);
-    const w = (node.widgets ?? []).find(
-      (cand) => cand?.name?.toLowerCase() === String(widget).toLowerCase(),
-    );
-    if (!w) {
-      const names = (node.widgets ?? []).map((cand) => cand?.name).join(", ");
-      throw new Error(
-        `Node ${node.id} (${node.type}) has no widget "${widget}" (available: ${names || "none"})`,
-      );
-    }
-    graph.beforeChange();
-    const previous = w.value;
+
+    // applyWidgetWrite owns the whole write: for a PARENT SubgraphNode it
+    // resolves a PROMOTED widget to its ACTUAL inner (node, widget) and writes
+    // THERE — never the positionally-shifted parent slot (#233), throwing if
+    // the promotion can't be resolved unambiguously rather than falling open.
+    // It validates the value against the target's declared type (combo must be
+    // an exact CURRENT option — no index drift, #240; numeric must be numeric)
+    // and verifies the write stuck exactly. Same driveable path the unit tests
+    // exercise.
     try {
-      w.value = value;
-      // Fire the widget's own callback so combo/number side effects run —
-      // the same path a manual UI edit takes.
-      w.callback?.(value, app.canvas, node, node.pos, undefined);
-    } finally {
-      graph.afterChange();
+      const set = applyWidgetWrite(node, widget, value, {
+        resolveSource: sourceForSubgraphInput,
+        canvas: app.canvas,
+        beforeChange: () => graph.beforeChange(),
+        afterChange: () => graph.afterChange(),
+        setDirty: () => graph.setDirtyCanvas(true, true),
+      });
+      return { set };
+    } catch (err) {
+      if (err instanceof WidgetWriteError) {
+        throw new Error(
+          `panel_set_widget refused "${widget}" on node ${node.id} (${node.type}): ${err.message}`,
+        );
+      }
+      throw err;
     }
-    graph.setDirtyCanvas(true, true);
-    return {
-      set: { node_id: node.id, widget: w.name, previous, value: w.value },
-    };
   },
 
   graph_move_node({ node_id, pos }) {
