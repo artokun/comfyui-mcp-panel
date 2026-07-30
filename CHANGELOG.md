@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.11] - 2026-07-30
+
+### Fixed
+- **Regression: saving a brand-new workflow was broken on ComfyUI frontend 1.47.x (#268).** The 0.11.6 #226 data-loss guard routes the safe path through `svc.saveWorkflowAs`, which the 1.47 frontend removed from `extensionManager.workflow` — so the guard fail-safe refused and `panel_save_workflow` could not save any never-persisted workflow (no data loss, but the flow was dead). `resolveSaveAsCopy` now probes the copy API across frontends — `saveWorkflowAs` (1.45.x) or `saveAs`+`openWorkflow`+`saveWorkflow` (1.47.x, mirroring upstream's Save-As sequence so the copy is activated and its real graph is persisted, never `null`); and `classifySource` consults an authoritative `/userdata` filesystem oracle (404-only ⇒ never-persisted) to distinguish a genuinely-new tab from a drifted real file, which 1.47's in-memory store can't. The #226 invariant is fully preserved (a real on-disk source is never moved/destroyed). Live-verified: a new workflow saves real content; a save-as still preserves the original. (#273)
+
 ## [0.11.10] - 2026-07-30
 
 ### Fixed
