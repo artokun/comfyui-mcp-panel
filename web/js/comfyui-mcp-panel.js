@@ -97,15 +97,10 @@ import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, 
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import {
   isStaleAssetCandidate as isStaleAssetCandidateLib,
-  reconcileUnknownWidgetNames,
   reapplyDefsToLiveNodes,
 } from "./lib/asset-staleness.js";
-import { applyWidgetWrite, WidgetWriteError } from "./lib/widget-write.js";
-import {
-  assertAddNodeResolvable,
-  assertResolvedTargetRegistered,
-  preflightSetWidgetTarget,
-} from "./lib/node-resolve.js";
+import { assertAddNodeResolvable } from "./lib/node-resolve.js";
+import { runSetWidget } from "./lib/set-widget.js";
 import { coerceMessageText, isDroppedAgentReplay } from "./lib/chat-serialize.js";
 import {
   recordCopiedNodes,
@@ -3661,10 +3656,11 @@ function resolveNode(graph, nodeId) {
 // ---- Node-type resolution guard (#458) ------------------------------------
 // The graph WRITE tools resolve node types against LG.registered_node_types:
 // assertAddNodeResolvable gates graph_add_node on the class_type before create;
-// assertResolvedTargetRegistered gates graph_set_widget on the ACTUAL RESOLVED
-// write target (inner promoted node for a subgraph, else the node's own) so an
-// unresolved placeholder can never be reported as a fabricated success. Both
-// take the raw registry object (web/js/lib/node-resolve.js).
+// graph_set_widget delegates to runSetWidget (web/js/lib/set-widget.js), whose
+// shared body gates on the ACTUAL RESOLVED write target (inner promoted node for
+// a subgraph, else the node's own) BEFORE any coercion/mutation, so an unresolved
+// placeholder can never be reported as a fabricated success. The predicates live
+// in web/js/lib/node-resolve.js and take the raw registry object.
 
 
 // ---- Subgraph boundary rails (input/output proxy nodes) -------------------
@@ -5287,54 +5283,19 @@ const GRAPH_TOOL_EXECUTORS = {
   graph_set_widget({ node_id, widget, value }) {
     const { app, graph, LG } = getGraphCtx();
     const node = resolveNode(graph, node_id);
-    const registry = LG?.registered_node_types ?? {};
-    // NO mutation of any kind may touch an unresolved placeholder BEFORE we've
-    // confirmed the write target is registered (#458). reconcileUnknownWidgetNames
-    // RENAMES widgets in place against constructor.nodeData, so it must never run
-    // on a placeholder/type-less/unregistered node. For a DIRECT node the resolved
-    // target IS this node — assert it up front, then reconcile only a genuinely
-    // registered node. For a SUBGRAPH the write targets an INNER node (resolved +
-    // registry-checked inside applyWidgetWrite); reconcile only touches the OUTER
-    // parent's own widget names, which is irrelevant to a promoted write, so we
-    // skip it entirely rather than risk mutating a fake `subgraph:{}` placeholder.
-    const { reconcile } = preflightSetWidgetTarget(registry, node);
-    // Repair positional UNKNOWN/UNKNOWN_n placeholders against the live def so
-    // the caller's real widget name resolves (#199) — only on a genuinely
-    // registered direct node (never a placeholder; skipped for subgraphs).
-    if (reconcile) reconcileUnknownWidgetNames(node);
-
-    // applyWidgetWrite owns the whole write: for a PARENT SubgraphNode it
-    // resolves a PROMOTED widget to its ACTUAL inner (node, widget) and writes
-    // THERE — never the positionally-shifted parent slot (#233), throwing if
-    // the promotion can't be resolved unambiguously rather than falling open.
-    // It validates the value against the target's declared type (combo must be
-    // an exact CURRENT option — no index drift, #240; numeric must be numeric)
-    // and verifies the write stuck exactly. Same driveable path the unit tests
-    // exercise.
-    try {
-      const set = applyWidgetWrite(node, widget, value, {
-        resolveSource: sourceForSubgraphInput,
-        canvas: app.canvas,
-        beforeChange: () => graph.beforeChange(),
-        afterChange: () => graph.afterChange(),
-        setDirty: () => graph.setDirtyCanvas(true, true),
-        // Refuse the write when the RESOLVED target (inner promoted node or the
-        // node's own) isn't a registered class — an unresolved placeholder,
-        // whether or not it hosts a `subgraph` (#458). Fails closed on type-less
-        // nodes; a real subgraph's promoted widget resolves to a registered
-        // inner node and passes.
-        assertTargetWritable: (targetNode) =>
-          assertResolvedTargetRegistered(registry, targetNode),
-      });
-      return { set };
-    } catch (err) {
-      if (err instanceof WidgetWriteError) {
-        throw new Error(
-          `panel_set_widget refused "${widget}" on node ${node.id} (${node.type}): ${err.message}`,
-        );
-      }
-      throw err;
-    }
+    // Delegate to the shared handler body (web/js/lib/set-widget.js) so this
+    // production path and the unit tests run the IDENTICAL ordering: preflight →
+    // reconcile-only-a-resolved-node → applyWidgetWrite with the resolved-target
+    // registry guard (before coercion/mutation). A reorder or a dropped guard
+    // therefore fails a test rather than silently regressing (#458).
+    return runSetWidget(node, widget, value, {
+      registry: LG?.registered_node_types ?? {},
+      resolveSource: sourceForSubgraphInput,
+      canvas: app.canvas,
+      beforeChange: () => graph.beforeChange(),
+      afterChange: () => graph.afterChange(),
+      setDirty: () => graph.setDirtyCanvas(true, true),
+    });
   },
 
   graph_move_node({ node_id, pos }) {

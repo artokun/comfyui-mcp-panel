@@ -19,10 +19,11 @@ import {
   comfyNodeDefsLoaded,
   assertAddNodeResolvable,
   assertResolvedTargetRegistered,
-  preflightSetWidgetTarget,
 } from "../../web/js/lib/node-resolve.js";
 import { applyWidgetWrite } from "../../web/js/lib/widget-write.js";
-import { reconcileUnknownWidgetNames } from "../../web/js/lib/asset-staleness.js";
+// The PRODUCTION graph_set_widget handler body — the executor and these tests
+// call it verbatim, so the tested ordering IS the shipped ordering (#458).
+import { runSetWidget } from "../../web/js/lib/set-widget.js";
 
 // A registry shaped like LG.registered_node_types once /object_info loaded:
 // hundreds of classes; we only need the sentinels + a couple of extras here.
@@ -186,6 +187,14 @@ function hookFor(registry) {
   };
 }
 
+// Drive the ACTUAL production handler body (runSetWidget) — the same function
+// GRAPH_TOOL_EXECUTORS.graph_set_widget delegates to. Used for the regressions
+// whose correctness depends on the handler's full ORDERING (preflight → reconcile
+// → guarded write), so a reorder/hook-removal fails a test.
+function setViaHandler(registry, node, widgetName, value, resolveSource) {
+  return runSetWidget(node, widgetName, value, { registry, resolveSource, ...HOOKS });
+}
+
 // A real SubgraphNode over an inner KSampler whose promoted widget "sched_alias"
 // maps to the inner "scheduler". innerType lets us flip the inner node between a
 // registered class (authentic) and an unregistered placeholder.
@@ -240,7 +249,9 @@ test("set_widget e2e (finding #1): placeholder w/ dynamic-combo widget ⇒ REFUS
       },
     ],
   };
-  assert.throws(() => applyWidgetWrite(ghost, "opt", "b", hookFor(reg)), /not registered|placeholder/i);
+  // Through the REAL handler body, so the guard's position ahead of coercion is
+  // exercised in production order.
+  assert.throws(() => setViaHandler(reg, ghost, "opt", "b"), /not registered|placeholder/i);
   assert.equal(valuesCalled, false, "combo values() callback must not run on a refused placeholder");
   assert.equal(ghost.widgets[0].value, "a");
 });
@@ -255,7 +266,8 @@ test("set_widget e2e (finding #2): registered TYPE but placeholder INSTANCE ⇒ 
     widgets: [{ name: "value", type: "number", value: 0 }], // generic placeholder widget
     constructor: { name: "GenericFallback" }, // no nodeData ⇒ unresolved instance
   };
-  assert.throws(() => applyWidgetWrite(stale, "value", 5, hookFor(reg)), /unresolved placeholder|live definition is missing/i);
+  // Through the REAL handler body (preflight → reconcile → guarded write).
+  assert.throws(() => setViaHandler(reg, stale, "value", 5), /unresolved placeholder|live definition is missing/i);
   assert.equal(stale.widgets[0].value, 0);
 });
 
@@ -307,30 +319,23 @@ test("set_widget e2e: unreachable ⇒ REFUSE even for a would-be-core type, no m
   assert.equal(node.widgets[0].value, "");
 });
 
-// ---- HANDLER PRELUDE: no pre-write mutation on a placeholder (#458) ----------
-// reconcileUnknownWidgetNames RENAMES widgets in place. The graph_set_widget
-// HANDLER runs it before applyWidgetWrite, so the target-registration guard must
-// come FIRST. preflightSetWidgetTarget is the exact decision the handler uses;
-// these drive it together with the REAL reconcile to prove the ordering holds.
-
-// Mirror the handler prelude verbatim: preflight (throws to refuse) → reconcile
-// only when it says so.
-function runSetWidgetPrelude(registry, node) {
-  const { reconcile } = preflightSetWidgetTarget(registry, node);
-  if (reconcile) reconcileUnknownWidgetNames(node);
-}
+// ---- HANDLER ORDERING through the REAL runSetWidget (#458) -------------------
+// reconcileUnknownWidgetNames RENAMES widgets in place. The handler must preflight
+// (refuse a placeholder) BEFORE reconcile, and reconcile only a resolved direct
+// node. These drive the ACTUAL production runSetWidget so a reorder or a dropped
+// guard fails a test — not a locally-recreated prelude.
 
 // A node whose UNKNOWN/UNKNOWN_1 widgets WOULD be renamed by reconcile: its
-// constructor.nodeData exposes exactly two widget inputs (INT, FLOAT) matching
-// the two positional widgets. This is the mutation the guard must prevent on a
+// constructor.nodeData exposes exactly two widget inputs (steps, cfg) matching the
+// two positional widgets. This is the mutation the guard must prevent on a
 // placeholder.
 function nodeWithUnknownWidgets(type) {
   return {
     id: 42,
     ...(type === undefined ? {} : { type }),
     widgets: [
-      { name: "UNKNOWN", value: 0 },
-      { name: "UNKNOWN_1", value: 0 },
+      { name: "UNKNOWN", type: "INT", value: 0 },
+      { name: "UNKNOWN_1", type: "number", value: 0 },
     ],
     constructor: {
       nodeData: {
@@ -341,41 +346,59 @@ function nodeWithUnknownWidgets(type) {
   };
 }
 
-test("handler prelude (reconcile smoke): a REGISTERED node's UNKNOWN widgets ARE repaired", () => {
+test("handler: a REGISTERED node's UNKNOWN widgets are reconciled THEN written", () => {
   const reg = loadedRegistry(["MyRegNode"]);
   const node = nodeWithUnknownWidgets("MyRegNode");
-  runSetWidgetPrelude(reg, node);
+  // reconcile renames UNKNOWN→steps, UNKNOWN_1→cfg, then the write lands on "cfg".
+  const { set } = setViaHandler(reg, node, "cfg", 7.5);
   assert.deepEqual(node.widgets.map((w) => w.name), ["steps", "cfg"]);
+  assert.equal(set.value, 7.5);
 });
 
-test("handler prelude: UNREGISTERED placeholder w/ UNKNOWN widgets + nodeData ⇒ REFUSE, names UNCHANGED (no reconcile mutation)", () => {
+test("handler: UNREGISTERED placeholder w/ UNKNOWN widgets ⇒ REFUSE, names UNCHANGED (reconcile never ran)", () => {
   const reg = loadedRegistry(); // reachable, but type not registered
   const node = nodeWithUnknownWidgets("GhostNode");
-  assert.throws(() => runSetWidgetPrelude(reg, node), /not registered|placeholder/i);
+  assert.throws(() => setViaHandler(reg, node, "steps", 5), /not registered|placeholder/i);
   // The load-bearing assertion: reconcile never ran, so the UNKNOWN names stand.
   assert.deepEqual(node.widgets.map((w) => w.name), ["UNKNOWN", "UNKNOWN_1"]);
 });
 
-test("handler prelude: TYPE-LESS node w/ UNKNOWN widgets + nodeData ⇒ REFUSE, names UNCHANGED", () => {
+test("handler: TYPE-LESS node w/ UNKNOWN widgets ⇒ REFUSE, names UNCHANGED", () => {
   const reg = loadedRegistry();
   const node = nodeWithUnknownWidgets(undefined);
-  assert.throws(() => runSetWidgetPrelude(reg, node), /not registered/i);
+  assert.throws(() => setViaHandler(reg, node, "steps", 5), /not registered/i);
   assert.deepEqual(node.widgets.map((w) => w.name), ["UNKNOWN", "UNKNOWN_1"]);
 });
 
-test("handler prelude: unreachable placeholder w/ UNKNOWN widgets ⇒ REFUSE, names UNCHANGED", () => {
+test("handler: unreachable placeholder w/ UNKNOWN widgets ⇒ REFUSE, names UNCHANGED", () => {
   const reg = unreachableRegistry();
   const node = nodeWithUnknownWidgets("CheckpointLoaderSimple");
-  assert.throws(() => runSetWidgetPrelude(reg, node), /not loaded|unreachable/i);
+  assert.throws(() => setViaHandler(reg, node, "steps", 5), /not loaded|unreachable/i);
   assert.deepEqual(node.widgets.map((w) => w.name), ["UNKNOWN", "UNKNOWN_1"]);
 });
 
-test("handler prelude: SUBGRAPH parent ⇒ reconcile SKIPPED (parent widgets untouched), write guarded downstream", () => {
+test("handler: stale placeholder INSTANCE (registered type, no instance def) ⇒ REFUSE before reconcile", () => {
+  const reg = loadedRegistry(); // KSampler registered WITH nodeData
+  const stale = {
+    id: 42,
+    type: "KSampler",
+    widgets: [{ name: "UNKNOWN", type: "number", value: 0 }],
+    constructor: { name: "GenericFallback" }, // no nodeData ⇒ unresolved instance
+  };
+  assert.throws(() => setViaHandler(reg, stale, "steps", 5), /unresolved placeholder|live definition is missing/i);
+  assert.deepEqual(stale.widgets.map((w) => w.name), ["UNKNOWN"]);
+});
+
+test("handler: SUBGRAPH parent ⇒ reconcile SKIPPED (parent's own UNKNOWN widgets untouched), inner write lands", () => {
   const reg = loadedRegistry();
-  // A subgraph parent with its own UNKNOWN widgets + nodeData: prelude must NOT
-  // rename them (reconcile skipped for subgraphs); the inner-target guard runs in
-  // applyWidgetWrite instead.
-  const node = { ...nodeWithUnknownWidgets("SubgraphNode"), subgraph: { _nodes: [] } };
-  assert.doesNotThrow(() => runSetWidgetPrelude(reg, node));
-  assert.deepEqual(node.widgets.map((w) => w.name), ["UNKNOWN", "UNKNOWN_1"]);
+  const { parent, inner, resolveSource } = makeSubgraphFixture("KSampler");
+  // Give the parent its OWN UNKNOWN widgets + a def, so IF reconcile wrongly ran it
+  // would rename them — it must not (reconcile is skipped for subgraph parents).
+  parent.widgets.push({ name: "UNKNOWN", type: "number", value: 0 });
+  parent.constructor = { nodeData: { input: { required: { foo: ["FLOAT", {}] } } } };
+  const { set } = setViaHandler(reg, parent, "sched_alias", "karras", resolveSource);
+  assert.equal(set.value, "karras");
+  assert.equal(inner.widgets.find((w) => w.name === "scheduler").value, "karras");
+  // Parent's own UNKNOWN widget name is untouched — reconcile did not run.
+  assert.ok(parent.widgets.some((w) => w.name === "UNKNOWN"));
 });
