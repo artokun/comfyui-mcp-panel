@@ -90,7 +90,7 @@ import {
   reconcileUnknownWidgetNames,
   reapplyDefsToLiveNodes,
 } from "./lib/asset-staleness.js";
-import { coerceMessageText } from "./lib/chat-serialize.js";
+import { coerceMessageText, isDroppedAgentReplay } from "./lib/chat-serialize.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
 import { saveActiveWorkflow } from "./lib/workflow-save.js";
 
@@ -7524,9 +7524,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         }
         return;
       }
-      if (msg && msg.type === "say" && typeof msg.text === "string") {
+      if (msg && msg.type === "say" && msg.text != null) {
+        // A completed render/output frame can arrive as a structured payload,
+        // not a bare string (#238). Route it through the SAME serializer the
+        // A2UI/replay paths use so the sidebar shows readable text instead of a
+        // dropped frame or an "[object Object]" bubble.
         // `id` reconciles this committed reply with its live streaming preview.
-        onSay(msg.text, { id: msg.id, streamed: !!msg.streamed });
+        onSay(coerceMessageText(msg.text), { id: msg.id, streamed: !!msg.streamed });
       }
       // Live streaming deltas: incremental thinking / reply text before the final
       // `say` commits. phase: "think" | "text" | "end".
@@ -11771,10 +11775,20 @@ function buildPanel() {
   }
 
   function paintAgent(text) {
+    // History can contain structured assistant payloads persisted by an older
+    // runtime (e.g. codex app-server callback shapes). Re-normalize on replay
+    // through the SHARED serializer so reload/restart cannot resurrect the
+    // literal "[object Object]" that renderRichText's String() coercion would
+    // otherwise produce, even after the live `say` path has been fixed (#241).
+    // Drop ONLY a structured payload that coerced to nothing (see
+    // isDroppedAgentReplay) — a genuinely-empty STRING record is valid stored
+    // input and must still render its empty bubble (#241).
+    if (isDroppedAgentReplay(text)) return;
+    const safeText = coerceMessageText(text);
     clearEmpty();
     const b = document.createElement("div");
     b.className = "cmcp-bubble agent";
-    renderRichText(b, text);
+    renderRichText(b, safeText);
     log.appendChild(b);
     scrollLog();
   }

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { coerceMessageText, buttonReplyText } from "../../web/js/lib/chat-serialize.js";
+import { coerceMessageText, buttonReplyText, isDroppedAgentReplay } from "../../web/js/lib/chat-serialize.js";
 
 test("strings pass through unchanged", () => {
   assert.equal(coerceMessageText("hello"), "hello");
@@ -85,4 +85,76 @@ test("a SUBMIT button with an object reply does NOT bake [object Object] into th
 
 test("falls back to label when reply is absent", () => {
   assert.equal(buttonReplyText({ label: "Cancel" }), "Cancel");
+});
+
+// --- sidebar render of a completed OUTPUT payload (#238) --------------------
+// The LIVE `say` handler now routes a structured payload through
+// coerceMessageText before onSay/paintAgent, so a completed render/output
+// object must serialize to readable text, never "[object Object]".
+test("a completed output payload renders as readable text in the sidebar path (#238)", () => {
+  const out = coerceMessageText({ caption: "portrait_00001.png", filename: "portrait_00001.png" });
+  assert.notEqual(out, "[object Object]");
+  assert.equal(out, "portrait_00001.png");
+});
+
+test("an output payload with no known label degrades to JSON, never [object Object] (#238)", () => {
+  const out = coerceMessageText({ type: "output", images: [{ subfolder: "", node: 9 }] });
+  assert.notEqual(out, "[object Object]");
+  assert.ok(!out.includes("[object Object]"), `got: ${out}`);
+  assert.ok(out.startsWith("{"), `expected JSON, got: ${out}`);
+});
+
+// --- persisted structured assistant message replay (#241) ------------------
+// paintAgent(m.text) on history replay now re-normalizes through the SAME
+// serializer, so a record whose `text` is a structured object rehydrates as
+// readable text after reload/restart instead of "[object Object]".
+test("a persisted structured assistant message rehydrates as readable text (#241)", () => {
+  const record = { role: "agent", text: { text: "Here are your outputs." } };
+  const out = coerceMessageText(record.text);
+  assert.notEqual(out, "[object Object]");
+  assert.equal(out, "Here are your outputs.");
+});
+
+test("a persisted codex-style content-parts assistant message replays as joined text (#241)", () => {
+  const record = {
+    role: "agent",
+    text: { content: [{ type: "text", text: "line one" }, { type: "text", text: "line two" }] },
+  };
+  const out = coerceMessageText(record.text);
+  assert.notEqual(out, "[object Object]");
+  assert.equal(out, "line one\nline two");
+});
+
+// --- replay drop decision (#241 codex round-1 follow-up) -------------------
+// paintAgent drops a record on replay iff isDroppedAgentReplay(text) — ONLY an
+// object that coerced to nothing. A genuinely-empty STRING is valid stored
+// input and must still render its (empty) bubble.
+test("a persisted empty-STRING assistant record is NOT dropped on replay (renders empty bubble) (#241)", () => {
+  assert.equal(isDroppedAgentReplay(""), false);
+  // and it coerces to "" so the empty bubble is what renders
+  assert.equal(coerceMessageText(""), "");
+});
+
+test("a persisted structured object that coerces to '' IS dropped on replay (#241)", () => {
+  // Only a value that coerces to "" is dropped — e.g. an unserializable/cyclic
+  // object (the old "[object Object]" case). A serializable object like {} is
+  // NOT dropped; it coerces to readable JSON ("{}") and renders.
+  const cyclic = {};
+  cyclic.self = cyclic;
+  assert.equal(isDroppedAgentReplay(cyclic), true);
+  assert.equal(isDroppedAgentReplay({}), false);
+  assert.equal(coerceMessageText({}), "{}");
+});
+
+test("a persisted structured object WITH readable text is NOT dropped (#241)", () => {
+  assert.equal(isDroppedAgentReplay({ text: "hi" }), false);
+  assert.equal(isDroppedAgentReplay({ content: [{ text: "hi" }] }), false);
+});
+
+test("null/undefined persisted text is dropped, never rendered as literal 'null' (#241)", () => {
+  // These are non-string and carry no content; the pre-fix path rendered the
+  // literal "null"/"undefined" via String(). Dropping is strictly better and
+  // matches the predicate (a real empty STRING is the only empty kept).
+  assert.equal(isDroppedAgentReplay(null), true);
+  assert.equal(isDroppedAgentReplay(undefined), true);
 });
