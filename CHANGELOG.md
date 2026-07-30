@@ -6,7 +6,26 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.6] - 2026-07-29
+
 ### Fixed
+- **SEVERE data loss: save-as must never move a persisted source (#226, reopened).** The
+  earlier #231 fix trusted the frontend's `saveWorkflowAs` to copy, but on comfyui-frontend
+  1.45.21 that call MOVES a source flagged temporary — and a `panel_open_workflow` ack-timeout
+  race (#215) can leave a real on-disk workflow flagged temporary, so `save_workflow({name})`
+  silently deleted the original. `saveActiveWorkflow` now classifies the source by ACTUAL
+  on-disk state (tri-state: persisted / never-persisted / unknown; only a null oracle result or
+  a doc with no path proves absence — a returned object, a thrown lookup, or a list-miss all fail
+  safe) and REFUSES any rename/move of a persisted-or-unknown source; a persisted save-as copies
+  with the source verified surviving; an empty/unresolved target can no longer be recomputed into
+  a move. Verified by 238 unit tests + a Chrome live-test (the exact repro that destroyed a file
+  under #231 now preserves it). (#239)
+- **Chat media persistence + structured-payload serialization (WS-9).** Inline chat images/video
+  survive a panel reload, and structured error/user payloads render as readable text instead of
+  `[object Object]`. (#228)
+- **Invalidate stale caches/snapshots after a restart+edit (WS-3).** Graph tools see the live
+  graph after a restart instead of a stale snapshot. (#227)
+- **Stop leaking typed-message image attachments in Blind mode (#174).** (#217)
 - **Route panel node ops by Manager generation (#187, #182, #184).** The
   built-in Manager helpers hardcoded the `/v2/manager/queue/task` envelope, so
   `panel_install_node` / `panel_update_node` returned HTTP 405 against Manager
