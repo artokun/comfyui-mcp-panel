@@ -29,23 +29,72 @@ function getNodeBySegment(graph, seg) {
 }
 
 /**
- * Resolve a possibly subgraph-scoped node id ("6051:1913", a plain 42, or a
- * string/UUID id) against the ROOT graph, walking one hop per ':' segment through
- * `.subgraph`. Returns the node or null.
+ * Find a subgraph by its UUID anywhere in the graph hierarchy — mirrors the
+ * ComfyUI frontend's own `findSubgraphByUuid`. Prefers the root graph's O(1)
+ * `subgraphs` registry (a `uuid → Subgraph` Map on real LiteGraph builds), and
+ * falls back to a recursive walk matching each nested `subgraph.id`. Returns the
+ * subgraph or null.
+ */
+export function findSubgraphByUuid(graph, uuid) {
+  if (!graph || uuid == null) return null;
+  const reg = graph.subgraphs;
+  if (reg && typeof reg.get === "function") {
+    const hit = reg.get(uuid);
+    if (hit) return hit;
+  }
+  for (const node of graph._nodes ?? graph.nodes ?? []) {
+    const sub = node?.subgraph;
+    if (!sub) continue;
+    if (String(sub.id) === String(uuid)) return sub;
+    const found = findSubgraphByUuid(sub, uuid);
+    if (found) return found;
+  }
+  return null;
+}
+
+/**
+ * Resolve a store candidate's node id — a ComfyUI **NodeLocatorId** — against the
+ * ROOT graph. Two real shapes exist (see @/types/nodeIdentification):
+ *   - a plain local id ("42" / a UUID-like string) → a node in the root graph;
+ *   - "<subgraphUuid>:<localNodeId>" → a node inside a subgraph, where the FIRST
+ *     segment is that subgraph's globally-unique UUID (registered on the root
+ *     graph), NOT a host node id.
+ *
+ * The prior implementation walked one hop per ':' segment treating each segment
+ * as a node id (`rootGraph.getNodeById(uuid)`), which never resolves a real
+ * subgraph locator — so the missing-asset live cross-check failed OPEN and kept
+ * reporting a subgraph asset as missing long after a widget/checkpoint/LoadImage
+ * fix (#235 #247 #257 #352 #364). We now resolve the subgraph by UUID and read
+ * the local node inside it. A purely-NUMERIC multi-segment id (legacy group-node
+ * execution id, e.g. "6051:1913") keeps the old node-hop path for compatibility.
+ * Returns the node or null (null → cross-check fails open, i.e. keeps reporting).
  */
 export function findNodeByScopedId(rootGraph, scopedId) {
   const parts = String(scopedId ?? "")
     .split(":")
     .filter((p) => p !== "");
   if (!parts.length) return null;
-  let graph = rootGraph;
-  for (let i = 0; i < parts.length; i++) {
-    const node = getNodeBySegment(graph, parts[i]);
-    if (!node) return null;
-    if (i === parts.length - 1) return node;
-    graph = node.subgraph ?? null;
+  if (parts.length === 1) return getNodeBySegment(rootGraph, parts[0]);
+
+  const localId = parts[parts.length - 1];
+  const first = parts[0];
+  // A subgraph UUID contains non-digit characters; an all-digits first segment is
+  // a legacy node-id path (group nodes) and keeps the per-segment hop behaviour.
+  if (/^\d+$/.test(first)) {
+    let graph = rootGraph;
+    for (let i = 0; i < parts.length; i++) {
+      const node = getNodeBySegment(graph, parts[i]);
+      if (!node) return null;
+      if (i === parts.length - 1) return node;
+      graph = node.subgraph ?? null;
+      if (!graph) return null;
+    }
+    return null;
   }
-  return null;
+
+  const sub = findSubgraphByUuid(rootGraph, first);
+  if (!sub) return null;
+  return getNodeBySegment(sub, localId);
 }
 
 /**
