@@ -6,11 +6,36 @@
 // and consumes it — is only ever acceptable for a workflow that was never
 // persisted (a temporary tab has no source file to destroy).
 
-/** Strip a trailing .json (case-insensitive) and surrounding whitespace. */
+// ComfyUI persists a workflow with a mode-dependent extension: app-mode
+// (initialMode === "app") workflows are written as "<name>.app.json"; everything
+// else as "<name>.json". These mirror the frontend's formatUtil so our in-place-
+// vs-Save-As decision compares against the SAME path ComfyUI would actually
+// write — the ".json"/".app.json" mismatch was a third data-loss edge (#226).
+const JSON_EXT = ".json";
+const APP_JSON_EXT = ".app.json";
+
+/** Strip a trailing workflow extension (.app.json or .json) and surrounding
+ *  whitespace. Mirrors how ComfyUI derives a bare filename from a path. */
 function baseName(name) {
-  return String(name || "")
-    .replace(/\.json$/i, "")
-    .trim();
+  const s = String(name || "").trim();
+  const lower = s.toLowerCase();
+  if (lower.endsWith(APP_JSON_EXT)) return s.slice(0, -APP_JSON_EXT.length).trim();
+  if (lower.endsWith(JSON_EXT)) return s.slice(0, -JSON_EXT.length).trim();
+  return s;
+}
+
+/** The extension ComfyUI would write this workflow with, from its mode. */
+function workflowExt(wf) {
+  return wf?.initialMode === "app" ? APP_JSON_EXT : JSON_EXT;
+}
+
+/** The path ComfyUI would actually persist `base` to for this workflow — its own
+ *  directory + the mode-correct extension (mirrors appendWorkflowJsonExt +
+ *  workflow.directory). Used to classify a save as in-place vs Save-As by the
+ *  REAL target path, not a name, so an extension/mode difference never gets
+ *  misread as "same file" and turned into a destructive rename. */
+function targetPath(wf, base) {
+  return normalizePath(`${directoryOf(wf)}${base}${workflowExt(wf)}`);
 }
 
 /** True when `name` is a placeholder rather than a name the user/agent chose.
@@ -68,7 +93,7 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName } = {}) {
   // upstream detects as a path change and calls renameWorkflow — MOVING and
   // destroying the persisted source. Path-vs-path comparison always sends a real
   // relocation down the copy (saveWorkflowAs) branch instead.
-  const desiredPath = desired ? normalizePath(`${directoryOf(wf)}${desired}.json`) : "";
+  const desiredPath = desired ? targetPath(wf, desired) : "";
   const currentPath = normalizePath(wf.path);
   const isSaveAs = !!desired && desiredPath !== currentPath;
 
@@ -85,8 +110,7 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName } = {}) {
     // Fallback only for a workflow that was NEVER persisted: renaming an
     // in-memory temporary tab is safe (no source file to destroy).
     if (wasUnsaved && typeof svc.renameWorkflow === "function") {
-      const dir = directoryOf(wf);
-      await svc.renameWorkflow(wf, `${dir}${desired}.json`);
+      await svc.renameWorkflow(wf, targetPath(wf, desired));
       await saveInPlace(svc, wf);
       return desired;
     }

@@ -9,6 +9,18 @@ import {
 // A minimal ComfyUI workflow-service double that records what was called and
 // simulates the on-disk file set, so we can prove Save-As never consumes the
 // source file (issue #226).
+// Production-accurate extension derivation (mirrors ComfyUI formatUtil):
+// app-mode workflows persist as "<base>.app.json", everything else as
+// "<base>.json".
+const extFor = (wf) => (wf.initialMode === 'app' ? '.app.json' : '.json')
+const stripExt = (name) => {
+  const s = String(name || '')
+  const lower = s.toLowerCase()
+  if (lower.endsWith('.app.json')) return s.slice(0, -'.app.json'.length)
+  if (lower.endsWith('.json')) return s.slice(0, -'.json'.length)
+  return s
+}
+
 function makeService({ files = [], active } = {}) {
   const disk = new Set(files)
   const calls = []
@@ -16,7 +28,16 @@ function makeService({ files = [], active } = {}) {
     activeWorkflow: active,
     calls,
     disk,
+    // Mirrors ComfyUI's saveWorkflow: it recomputes the expected path from the
+    // workflow's mode-derived extension, and if that differs from the current
+    // path it RENAMES (moves) the file before saving. This is the exact upstream
+    // mechanism the panel must never trigger on a persisted source (#226).
     async saveWorkflow(wf) {
+      const dir = wf.directory || 'workflows'
+      const expected = `${dir}/${stripExt(wf.filename)}${extFor(wf)}`
+      if (wf.path !== expected) {
+        await svc.renameWorkflow(wf, expected)
+      }
       calls.push(['saveWorkflow', wf.path])
       disk.add(wf.path) // overwrite / create in place
     },
@@ -30,15 +51,19 @@ function makeService({ files = [], active } = {}) {
     },
     async saveWorkflowAs(wf, { filename }) {
       calls.push(['saveWorkflowAs', wf.path, filename])
-      // Copy: new file in the SOURCE's directory, original left untouched.
+      // Copy: new file in the SOURCE's directory, with the mode-correct
+      // extension; the original is left untouched.
       const dir = wf.directory || 'workflows'
-      const newPath = `${dir}/${filename}.json`
+      const base = stripExt(filename)
+      const newFilename = `${base}${extFor(wf)}`
+      const newPath = `${dir}/${newFilename}`
       disk.add(newPath)
       // The copy becomes the active workflow (mirrors the real frontend).
       svc.activeWorkflow = {
         path: newPath,
-        filename: `${filename}.json`,
+        filename: newFilename,
         directory: dir,
+        initialMode: wf.initialMode,
         isPersisted: true,
         isTemporary: false
       }
@@ -170,6 +195,33 @@ test('double-extension Save-As to the base name still COPIES, never renames (#22
 
   assert.ok(svc.disk.has('workflows/Foo.json.json'), 'original preserved')
   assert.ok(svc.disk.has('workflows/Foo.json'), 'copy created')
+  assert.ok(svc.calls.some((c) => c[0] === 'saveWorkflowAs'), 'used saveWorkflowAs')
+  assert.ok(
+    !svc.calls.some((c) => c[0] === 'renameWorkflow'),
+    'never renamed the source'
+  )
+})
+
+test('app-mode Save-As to the base name COPIES, never renames the source (#226)', async () => {
+  // App-mode workflows persist as "<name>.app.json". A source at "Foo.json"
+  // (filename "Foo") Save-As to "Foo" must NOT be read as in-place: ComfyUI's
+  // real target is "Foo.app.json", so an in-place save would upstream detect a
+  // path change and rename/move "Foo.json". The classifier must compare against
+  // the mode-derived target path.
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo',
+    directory: 'workflows',
+    initialMode: 'app',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeService({ files: [active.path], active })
+
+  await saveActiveWorkflow(svc, 'Foo', {})
+
+  assert.ok(svc.disk.has('workflows/Foo.json'), 'original preserved')
+  assert.ok(svc.disk.has('workflows/Foo.app.json'), 'app-mode copy created')
   assert.ok(svc.calls.some((c) => c[0] === 'saveWorkflowAs'), 'used saveWorkflowAs')
   assert.ok(
     !svc.calls.some((c) => c[0] === 'renameWorkflow'),
