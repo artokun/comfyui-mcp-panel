@@ -104,7 +104,24 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName } = {}) {
   const currentPath = normalizePath(wf.path);
   const effectiveName = desired || currentName;
   const finalTargetPath = effectiveName ? targetPath(wf, effectiveName) : "";
-  const relocates = !!finalTargetPath && finalTargetPath !== currentPath;
+
+  // A safe save requires a RESOLVED, non-empty target path. Without one — e.g. a
+  // persisted workflow whose filename is empty/unresolved and no name was given —
+  // the in-place branch must NOT run: the frontend's `saveWorkflow` would
+  // recompute the target from the empty name (→ a bare "…/.json") and RENAME
+  // (move) the source to it, a persisted MOVE with no absent-oracle proof (#226).
+  // Refuse instead — never let an unresolved name relocate a real file.
+  if (!finalTargetPath) {
+    if (!currentPath) {
+      throw new Error("name must not be blank — pass a non-whitespace workflow name");
+    }
+    throw new Error(
+      `refusing to save: cannot resolve a target filename for "${currentPath}" — saving now ` +
+        `could MOVE (destroy) the original (issue #226). Pass an explicit name.`,
+    );
+  }
+
+  const relocates = finalTargetPath !== currentPath;
 
   if (relocates) {
     // The invariant (issue #226): a relocating save must NEVER remove a file that

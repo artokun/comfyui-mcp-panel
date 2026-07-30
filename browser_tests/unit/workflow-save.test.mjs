@@ -407,6 +407,50 @@ test('disk-existence backstop catches a saveWorkflowAs that moves a persisted so
   )
 })
 
+test('P0 round-5: no-name save of a persisted workflow with an EMPTY filename refuses — never moves Orig.json → .json (#226)', async () => {
+  // Flow edge: an on-disk workflow whose in-memory filename is empty/unresolved,
+  // saved with NO name. effectiveName/finalTargetPath come out empty; the old
+  // code called saveInPlace unconditionally and the frontend's saveWorkflow
+  // recomputed the target from the empty name and MOVED "Orig.json" → ".json".
+  const active = {
+    path: 'workflows/Orig.json',
+    filename: '',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeService({ files: [active.path], active })
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, undefined, {}),
+    /cannot resolve a target filename/
+  )
+  // Source preserved; NOTHING was called that could relocate it.
+  assert.ok(svc.disk.has('workflows/Orig.json'), 'source preserved')
+  assert.ok(!svc.disk.has('workflows/.json'), 'never moved to a bare .json')
+  assert.equal(svc.calls.length, 0, 'no service call moved it')
+})
+
+test('no-name save of a persisted workflow with a normal filename saves IN PLACE to its own file (#226)', async () => {
+  // The healthy counterpart: filename resolves, so the target equals the current
+  // path and it is a true in-place save (no relocation) — the source file is the
+  // one written, never moved.
+  const active = {
+    path: 'workflows/Orig.json',
+    filename: 'Orig.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeService({ files: [active.path], active })
+
+  await saveActiveWorkflow(svc, undefined, {})
+
+  assert.deepEqual(svc.calls, [['saveWorkflow', 'workflows/Orig.json']], 'saved to its own path')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
+  assert.equal(svc.disk.size, 1)
+})
+
 test('P0 round-4: oracle returns the DRIFTED non-persisted wf for an on-disk path ⇒ unknown ⇒ REFUSE (#226)', async () => {
   // Source IS on disk, but its in-memory object is mis-flagged temporary. The
   // store's getWorkflowByPath returns that same non-persisted object. A RETURNED
