@@ -118,6 +118,7 @@ import {
   classifyRequestedMembership,
 } from "./lib/group-geometry.js";
 import { saveActiveWorkflow } from "./lib/workflow-save.js";
+import { createRunCompletionTracker } from "./lib/run-completion.js";
 
 let app = null;
 let api = null;
@@ -14444,7 +14445,7 @@ function buildPanel() {
     // retires it) so the duration survives a concurrent execution_success.
     const subfolder = coerceMessageText(m?.subfolder);
     const path = subfolder ? `${subfolder}/${fileName}` : fileName;
-    const startTs = runStartTimes.get(promptKey(promptId));
+    const startTs = runCompletion.startFor(promptId);
     const duration = startTs != null ? formatDuration(Date.now() - startTs) : null;
     const finishedClock = formatClock(new Date());
     // Real per-video frame metadata, when present on the descriptor (VHS-style
@@ -14530,69 +14531,38 @@ function buildPanel() {
   }
 
   // ── Per-run image batching ────────────────────────────────────────────────
-  // ComfyUI fires `executed` once PER output node, so a multi-output run used to
-  // inject several fragmented image turns into the agent. Instead we BUFFER each
-  // run's inline image refs by prompt_id as `executed` events arrive (still
-  // painting every image live for the user), then deliver ONE consolidated
-  // `executed` agent_event when that prompt finishes (`execution_success`, or the
-  // legacy `executing` with node===null). A short debounce flushes a buffer that
-  // never sees a run-end signal so images are never stranded.
-  const runImageBuffers = new Map(); // promptId -> { images: ImageRef[], timer }
-  const RUN_FLUSH_DEBOUNCE_MS = 1500;
-  const promptKey = (id) => id ?? "__no_prompt__";
+  // ComfyUI fires `executed` once PER output node, so a multi-output run would
+  // otherwise inject several fragmented image turns into the agent. We BUFFER
+  // each run's inline image refs by prompt_id (still painting every image live
+  // for the user), then deliver ONE consolidated `executed` agent_event when that
+  // prompt AUTHORITATIVELY finishes.
+  //
+  // The completion decision — WHEN to flush and for WHICH prompt_id — lives in
+  // lib/run-completion.js (createRunCompletionTracker), keyed on the ComfyUI
+  // execution lifecycle (execution_start → executed → execution_success) rather
+  // than a debounce timer. That is what stops a partial/early flush (#293, #200),
+  // a prior run's buffer being misattributed to the current prompt (#224), and
+  // the correct batch being dropped so the agent never resumes (#269, #468). The
+  // debounce survives only as a bounded safety net that re-arms while the prompt
+  // is still in-flight, so images from an interrupted run are never stranded.
+  //
+  // This closure owns ONLY presentation: it receives the full, correctly-scoped
+  // batch + duration for a completed prompt and composes the single agent_event.
+  const runCompletion = createRunCompletionTracker({
+    onFlush: (payload) => {
+      // Fire-and-forget: emitRunImages is async (metadata HEADs), but it already
+      // has the full batch — a failure inside it must never wedge the lifecycle.
+      emitRunImages(payload).catch((err) =>
+        console.warn("[cmcp] emitRunImages failed:", err),
+      );
+    },
+  });
 
-  // Render-duration tracking: promptKey -> start Date.now(). The primary start
-  // signal is ComfyUI's `execution_start` (carries prompt_id) — recorded the
-  // instant a run begins. Fallbacks (first `executing`/`executed` for that
-  // prompt) fill in if execution_start is missed, so we never invent a bogus
-  // start. duration = finish - start is computed at flush; the entry is cleaned
-  // up on flush / execution_success / clear. Clock-consistent: BOTH ends use the
-  // client's Date.now(), so a server/client clock skew can't distort it.
-  const runStartTimes = new Map();
-  function markRunStart(promptId) {
-    const key = promptKey(promptId);
-    // First signal wins — don't let a later per-node event reset an earlier start.
-    if (!runStartTimes.has(key)) runStartTimes.set(key, Date.now());
-    // Safety cap: runs are sequential, but if a run starts and never produces a
-    // run-end signal the entry would linger — bound the map so it can't grow.
-    if (runStartTimes.size > 20) {
-      const oldest = runStartTimes.keys().next().value;
-      if (oldest !== key) runStartTimes.delete(oldest);
-    }
-  }
-
-  function bufferRunImages(promptId, images) {
-    if (!images.length) return;
-    // Fallback render-start: if execution_start was missed, anchor the timer at
-    // the first output we see for this run (no-op if a start is already recorded).
-    markRunStart(promptId);
-    const key = promptKey(promptId);
-    let buf = runImageBuffers.get(key);
-    if (!buf) {
-      buf = { images: [], timer: null };
-      runImageBuffers.set(key, buf);
-    }
-    buf.images.push(...images);
-    // Debounce fallback: if no run-end signal lands, flush anyway after a beat.
-    if (buf.timer) clearTimeout(buf.timer);
-    buf.timer = setTimeout(() => flushRunImages(key), RUN_FLUSH_DEBOUNCE_MS);
-  }
-
-  async function flushRunImages(promptId) {
-    const key = promptKey(promptId);
-    const buf = runImageBuffers.get(key);
-    if (!buf) return;
-    if (buf.timer) clearTimeout(buf.timer);
-    runImageBuffers.delete(key);
-    // Render duration: read + retire the start time NOW (synchronously, before any
-    // await) so a concurrent flush can't double-count it. null start ⇒ omit.
-    const startTs = runStartTimes.get(key);
-    runStartTimes.delete(key);
-    const durationMs = startTs != null ? Date.now() - startTs : null;
+  async function emitRunImages({ images: bufImages, durationMs }) {
     const duration = formatDuration(durationMs);
     const finishedAt = new Date();
     const finishedClock = formatClock(finishedAt);
-    if (!buf.images.length) return;
+    if (!bufImages.length) return;
     // Classify by ComfyUI's output type: SaveImage writes `type:"output"` with a
     // real filename = the FINAL saved result; PreviewImage writes `type:"temp"`
     // (under a temp/ subfolder, throwaway /tmp-style names) = a preview frame.
@@ -14601,7 +14571,7 @@ function buildPanel() {
     // frame as the saved result. Don't crash on odd shapes.
     const finals = [];
     const previews = [];
-    for (const m of buf.images) {
+    for (const m of bufImages) {
       if (m && m.type === "output") finals.push(m);
       else previews.push(m);
     }
@@ -14724,17 +14694,6 @@ function buildPanel() {
     });
   }
 
-  function clearRunImages(promptId) {
-    const key = promptKey(promptId);
-    const buf = runImageBuffers.get(key);
-    if (buf?.timer) clearTimeout(buf.timer);
-    runImageBuffers.delete(key);
-    runStartTimes.delete(key);
-  }
-
-  function flushAllRunImages() {
-    for (const key of [...runImageBuffers.keys()]) flushRunImages(key);
-  }
 
   function onExecuted(ev) {
     const d = ev?.detail ?? {};
@@ -14763,10 +14722,10 @@ function buildPanel() {
     }
     // Buffer the directly-viewable images for THIS run instead of sending a turn
     // per node — they're flushed as one consolidated `executed` event when the
-    // prompt finishes (see flushRunImages). The image already painted above, so
+    // prompt finishes (see runCompletion/onFlush). The image already painted above, so
     // the user still sees it live; only the agent delivery is deferred+grouped.
     if (inlineImages.length) {
-      bufferRunImages(d.prompt_id, inlineImages);
+      runCompletion.onExecuted(d.prompt_id, inlineImages);
     } else if (!videos.length) {
       // No viewable images and no videos (shouldn't happen given the guard above).
       return;
@@ -14779,7 +14738,7 @@ function buildPanel() {
     const d = ev?.detail ?? {};
     // The run failed — drop any images we'd buffered for it so we don't deliver a
     // stale "here are your outputs" batch on top of the run_error interrupt below.
-    clearRunImages(d.prompt_id);
+    runCompletion.onExecutionError(d.prompt_id);
     // Name the failing node so the agent (and the user) know WHERE it broke —
     // "Ideogram4PromptBuilderKJ (node 200)" beats a bare exception string.
     // Coerce node descriptors too — never bake "[object Object]" into the
@@ -14807,33 +14766,30 @@ function buildPanel() {
       error: true,
     });
   }
-  // Run-end signal: ComfyUI emits `execution_success` (carrying prompt_id) when a
-  // prompt fully completes — flush THAT run's buffered images as one turn.
+  // Authoritative run-end: ComfyUI emits `execution_success` (carrying prompt_id)
+  // when a prompt FULLY completes — this is the signal completion is keyed on, so
+  // the flush carries the full output set for THAT prompt with the correct
+  // start→finish duration, and reliably wakes the agent on the real result.
   function onExecutionSuccess(ev) {
-    const id = ev?.detail?.prompt_id;
-    flushRunImages(id);
-    // Retire the render-start for runs that produced NO buffered inline images
-    // (e.g. video-only runs) — flushRunImages early-returns for those and leaves
-    // the start entry behind. The video storyboard already captured its duration
-    // synchronously, so deleting here is safe.
-    runStartTimes.delete(promptKey(id));
+    runCompletion.onExecutionSuccess(ev?.detail?.prompt_id);
   }
   // Primary render-duration start signal: ComfyUI emits `execution_start` with the
-  // prompt_id the instant a run begins — anchor the duration timer there.
+  // prompt_id the instant a run begins — anchor the duration timer there and flush
+  // any lingering prior-run buffer so it can't be misattributed to this run.
   function onExecutionStart(ev) {
-    markRunStart(ev?.detail?.prompt_id);
+    runCompletion.onExecutionStart(ev?.detail?.prompt_id);
   }
   // Legacy/secondary run-end: `executing` fires with the current node id, or null
-  // when nothing is left to run. The null event carries no prompt_id, so flush any
-  // remaining buffers (runs are sequential — nothing is executing now).
+  // when the queue is idle. The null event flushes only buffers whose prompt is
+  // NOT still in-flight — it can never truncate a mid-run prompt (#200/#224).
   function onExecuting(ev) {
     if (ev?.detail == null) {
-      flushAllRunImages();
+      runCompletion.onExecutingNull();
       return;
     }
     // Fallback render-start: the first per-node `executing` for a prompt anchors
     // the timer if execution_start was missed (no-op if already recorded).
-    if (ev?.detail?.prompt_id != null) markRunStart(ev.detail.prompt_id);
+    if (ev?.detail?.prompt_id != null) runCompletion.onExecutingNode(ev.detail.prompt_id);
   }
   // Post-restart autonomy (#3): ComfyUI's api fires `reconnecting` when the
   // server goes down (e.g. a Manager reboot) and `reconnected` when it's back.
