@@ -222,31 +222,46 @@ function pathExists(svc, rawPath) {
  *  so the only path that ever renames is one the oracle proves has no file. */
 function classifySource(svc, wf, rawPath) {
   if (wf?.isPersisted === true) return "persisted";
-  // Without an oracle we can prove NOTHING about the disk — fail safe.
-  if (!hasExistenceOracle(svc)) return "unknown";
 
   const norm = normalizePath(rawPath);
-  const found =
-    typeof svc?.getWorkflowByPath === "function" ? safeGetByPath(svc, rawPath) : undefined;
+  // A doc with NO backing path has nothing on disk to lose — it is provably
+  // never-persisted. This is the everyday "save my brand-new workflow" path and
+  // must always ground/save (do NOT require an oracle for it).
+  if (!norm) return "never-persisted";
+
+  // The doc HAS a path, so a real file MIGHT back it. We only trust an oracle
+  // call that SUCCEEDS: `persisted` if it shows a persisted workflow here,
+  // `confirmedAbsent` only if a successful lookup shows none. An oracle that
+  // THROWS proves nothing (a thrown lookup is not proof of absence, #226) — we
+  // leave both false so the result stays "unknown" → refuse.
+  let persisted = false;
+  let confirmedAbsent = false;
+
+  if (typeof svc?.getWorkflowByPath === "function") {
+    try {
+      const found = svc.getWorkflowByPath(rawPath);
+      if (found && found.isPersisted === true) persisted = true;
+      else confirmedAbsent = true; // successful call, no persisted file here
+    } catch {
+      /* oracle threw → cannot confirm → neither flag set → unknown */
+    }
+  }
+  // The known-workflow lists are a non-throwing oracle, but only a POSITIVE hit
+  // (a persisted entry at this path) is trustworthy — a list MISS cannot prove a
+  // file is absent from disk (an unlisted file may exist), so it never sets
+  // `confirmedAbsent`.
   const listed = [...(svc?.workflows ?? []), ...(svc?.openWorkflows ?? [])].find(
     (w) => w && normalizePath(w.path) === norm,
   );
-  if ((found && found.isPersisted === true) || (listed && listed.isPersisted === true)) {
-    return "persisted";
-  }
-  // Oracle available and affirmatively shows NO persisted workflow at this path.
-  // Only grant move rights to a doc that is actually acting as a temporary tab;
-  // anything else stays "unknown" (never move an ambiguous doc).
-  if (wf?.isTemporary === true && wf?.isPersisted !== true) return "never-persisted";
-  return "unknown";
-}
+  if (listed && listed.isPersisted === true) persisted = true;
 
-function safeGetByPath(svc, rawPath) {
-  try {
-    return svc.getWorkflowByPath(rawPath);
-  } catch {
-    return undefined;
+  if (persisted) return "persisted";
+  // Only a SUCCESSFUL oracle confirmation of absence, on a doc acting temporary,
+  // grants move rights. No oracle / oracle threw ⇒ unknown ⇒ refuse.
+  if (confirmedAbsent && wf?.isTemporary === true && wf?.isPersisted !== true) {
+    return "never-persisted";
   }
+  return "unknown";
 }
 
 /** Directory prefix (with trailing slash) that a new sibling file should live in,

@@ -309,7 +309,7 @@ test('refuses save-as when an on-disk source is mis-flagged temporary — never 
   assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflowAs'), 'never delegated a move')
 })
 
-test('a correctly-flagged persisted workflow still COPIES via the faithful frontend (#226)', async () => {
+test('a correctly-flagged persisted workflow still COPIES via the faithful frontend — SOURCE FILE survives (#226)', async () => {
   const active = {
     path: 'workflows/zz226b-orig.json',
     filename: 'zz226b-orig.json',
@@ -321,10 +321,58 @@ test('a correctly-flagged persisted workflow still COPIES via the faithful front
 
   const saved = await saveActiveWorkflow(svc, 'zz226b-copy', {})
 
-  assert.ok(svc.disk.has('workflows/zz226b-orig.json'), 'original preserved')
+  // Proves COPY semantics on the modeled 1.45.21 frontend: after saveWorkflowAs
+  // the SOURCE FILE is still on disk (persisted -> t.saveAs is a copy, #226).
+  assert.ok(svc.disk.has('workflows/zz226b-orig.json'), 'SOURCE FILE still exists after saveWorkflowAs')
   assert.ok(svc.disk.has('workflows/zz226b-copy.json'), 'copy created')
   assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
   assert.equal(saved, 'zz226b-copy')
+})
+
+test('item 1: an oracle that THROWS is NOT proof of absence ⇒ unknown ⇒ REFUSE (#226)', async () => {
+  // A drifted-temporary doc with a real path, whose getWorkflowByPath lookup
+  // throws. A thrown lookup proves nothing about the disk — it must NOT be read
+  // as "no file here" and must refuse rather than move.
+  const active = {
+    path: 'workflows/zz226b-orig.json',
+    filename: 'zz226b-orig.json',
+    directory: 'workflows',
+    isPersisted: false, // drifted
+    isTemporary: true // drifted
+  }
+  const svc = makeFaithfulService({ files: [active.path], active })
+  svc.getWorkflowByPath = () => {
+    throw new Error('store not ready')
+  }
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'zz226b-copy', {}),
+    /cannot be proven absent from disk/
+  )
+  assert.ok(svc.disk.has('workflows/zz226b-orig.json'), 'source preserved')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
+})
+
+test('item 2: a genuine NEW workflow with NO path grounds/saves (never refused) (#226)', async () => {
+  // The everyday "save my brand-new workflow" path: a temporary doc with no
+  // backing path at all. Nothing on disk to lose ⇒ provably never-persisted ⇒
+  // must SAVE, not refuse — even with no existence oracle consulted.
+  const active = {
+    path: undefined,
+    filename: 'Unsaved Workflow.json',
+    directory: 'workflows',
+    isPersisted: false,
+    isTemporary: true
+  }
+  const svc = makeFaithfulService({ active }) // disk empty
+
+  const saved = await saveActiveWorkflow(svc, undefined, {
+    autoWorkflowName: () => 'Untitled 2026-07-29'
+  })
+
+  assert.ok(svc.disk.has('workflows/Untitled 2026-07-29.json'), 'new workflow grounded to a file')
+  assert.ok(svc.calls.some((c) => c[0] === 'saveWorkflowAs'), 'delegated to saveWorkflowAs')
+  assert.equal(saved, 'Untitled 2026-07-29')
 })
 
 test('disk-existence backstop catches a saveWorkflowAs that moves a persisted source (#226)', async () => {
