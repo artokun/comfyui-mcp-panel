@@ -101,7 +101,11 @@ import {
   reapplyDefsToLiveNodes,
 } from "./lib/asset-staleness.js";
 import { applyWidgetWrite, WidgetWriteError } from "./lib/widget-write.js";
-import { assertAddNodeResolvable, assertResolvedTargetRegistered } from "./lib/node-resolve.js";
+import {
+  assertAddNodeResolvable,
+  assertResolvedTargetRegistered,
+  preflightSetWidgetTarget,
+} from "./lib/node-resolve.js";
 import { coerceMessageText, isDroppedAgentReplay } from "./lib/chat-serialize.js";
 import {
   recordCopiedNodes,
@@ -5284,9 +5288,20 @@ const GRAPH_TOOL_EXECUTORS = {
     const { app, graph, LG } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     const registry = LG?.registered_node_types ?? {};
+    // NO mutation of any kind may touch an unresolved placeholder BEFORE we've
+    // confirmed the write target is registered (#458). reconcileUnknownWidgetNames
+    // RENAMES widgets in place against constructor.nodeData, so it must never run
+    // on a placeholder/type-less/unregistered node. For a DIRECT node the resolved
+    // target IS this node — assert it up front, then reconcile only a genuinely
+    // registered node. For a SUBGRAPH the write targets an INNER node (resolved +
+    // registry-checked inside applyWidgetWrite); reconcile only touches the OUTER
+    // parent's own widget names, which is irrelevant to a promoted write, so we
+    // skip it entirely rather than risk mutating a fake `subgraph:{}` placeholder.
+    const { reconcile } = preflightSetWidgetTarget(registry, node);
     // Repair positional UNKNOWN/UNKNOWN_n placeholders against the live def so
-    // the caller's real widget name resolves (#199) before we look it up.
-    reconcileUnknownWidgetNames(node);
+    // the caller's real widget name resolves (#199) — only on a genuinely
+    // registered direct node (never a placeholder; skipped for subgraphs).
+    if (reconcile) reconcileUnknownWidgetNames(node);
 
     // applyWidgetWrite owns the whole write: for a PARENT SubgraphNode it
     // resolves a PROMOTED widget to its ACTUAL inner (node, widget) and writes

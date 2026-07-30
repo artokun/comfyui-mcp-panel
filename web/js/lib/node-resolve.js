@@ -100,3 +100,21 @@ export function assertResolvedTargetRegistered(registry, targetNode) {
       `placeholder) — refusing to write to it.`,
   );
 }
+
+/**
+ * graph_set_widget handler prelude: decide whether the OUTER node may be MUTATED
+ * (by reconcileUnknownWidgetNames, which RENAMES widgets in place) before the
+ * write, and refuse a direct placeholder UP FRONT so NO pre-write mutation ever
+ * touches an unresolved node (#458). Returns { reconcile }:
+ *   - subgraph parent → { reconcile: false }: the write targets an INNER node
+ *     (resolved + registry-checked inside applyWidgetWrite), and reconcile only
+ *     renames the OUTER parent's own widgets — irrelevant to a promoted write, so
+ *     it is skipped rather than risk mutating a fake `subgraph:{}` placeholder.
+ *   - direct node → asserts it's a registered write target (throws otherwise),
+ *     then { reconcile: true } so only a genuinely resolved node is repaired.
+ */
+export function preflightSetWidgetTarget(registry, node) {
+  if (node?.subgraph) return { reconcile: false };
+  assertResolvedTargetRegistered(registry, node);
+  return { reconcile: true };
+}
