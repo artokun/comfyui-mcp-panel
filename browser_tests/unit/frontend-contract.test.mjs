@@ -276,12 +276,15 @@ function guardRegionsFor(text, m) {
     }
     regions.push([g.index, end])
   }
-  // try { … } blocks — a TypeError from an absent method is caught here.
+  // try { … } catch blocks — a TypeError from an absent method is caught ONLY if
+  // a `catch` follows. A `try { … } finally { … }` re-throws, so it does NOT
+  // guard against the method being absent; require the catch explicitly.
   const tryRe = /\btry\s*\{/g
   let t
   while ((t = tryRe.exec(text))) {
     const block = bracedBlockAfter(text, t.index)
-    if (block) regions.push(block)
+    if (!block) continue
+    if (/^\s*catch\b/.test(text.slice(block[1] + 1))) regions.push(block)
   }
   return regions
 }
@@ -394,14 +397,19 @@ const LOCAL_FALLBACK_STATIC =
   'C:/Users/Artokun/ComfyUI-Installs/ComfyUI/ComfyUI/.venv/Lib/site-packages/comfyui_frontend_package/static'
 
 function resolveStaticDir() {
+  // Treat the variable as SET whenever it exists as an own property of
+  // process.env — including an explicitly-set empty string, which is a
+  // misconfiguration that must FAIL, not silently fall back or skip. Only a
+  // genuinely UNSET variable (undefined) is allowed to skip.
+  const isSet = Object.prototype.hasOwnProperty.call(process.env, 'COMFYUI_FRONTEND_STATIC')
   const fromEnv = process.env.COMFYUI_FRONTEND_STATIC
-  if (fromEnv) {
-    if (existsSync(join(fromEnv, 'assets'))) return fromEnv
+  if (isSet) {
+    if (fromEnv && existsSync(join(fromEnv, 'assets'))) return fromEnv
     throw new Error(
-      `COMFYUI_FRONTEND_STATIC is set to "${fromEnv}" but no assets/ directory exists there — ` +
-        `the frontend bundle is missing or its layout changed. CI sets this variable on purpose, ` +
-        `so this is a FAILURE, not a skip: fix the path or update the test. (Unset the variable ` +
-        `to allow skipping on a dev box without the frontend installed.)`
+      `COMFYUI_FRONTEND_STATIC is set to ${JSON.stringify(fromEnv)} but no assets/ directory ` +
+        `resolves there — the frontend bundle is missing or its layout changed. CI sets this ` +
+        `variable on purpose, so this is a FAILURE, not a skip: fix the path or update the test. ` +
+        `(Unset the variable entirely to allow skipping on a dev box without the frontend installed.)`
     )
   }
   // Unset: local dev. Skip is allowed only if the well-known install is absent too.
