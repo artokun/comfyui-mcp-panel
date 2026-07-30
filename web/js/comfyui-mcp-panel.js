@@ -105,6 +105,7 @@ import { coerceMessageText, isDroppedAgentReplay } from "./lib/chat-serialize.js
 import {
   recordCopiedNodes,
   getCopiedSnapshot,
+  parseClipboardNodes,
   diffCopiedVsPasted,
   formatDroppedWarning,
 } from "./lib/paste-report.js";
@@ -6273,13 +6274,25 @@ const GRAPH_TOOL_EXECUTORS = {
     // node type such as AudioCrop/AudioSeparation) instead of quietly reducing
     // the count (#261). Diff the clipboard snapshot from the matching
     // graph_copy_nodes against what actually landed, matched by node type.
+    // Expected-node source of truth: parse the ACTUAL litegraph clipboard, which
+    // reflects whatever paste just consumed (tool copy OR a native Ctrl+C), so it
+    // can't go stale. Fall back to the graph_copy_nodes snapshot only when the
+    // clipboard can't be read (frontend that keeps it off localStorage).
+    let expected = [];
+    try {
+      const raw = window.localStorage?.getItem("litegrapheditor_clipboard");
+      expected = parseClipboardNodes(raw);
+    } catch {
+      /* localStorage unavailable — fall back below */
+    }
+    if (!expected.length) expected = getCopiedSnapshot();
     // A type is a genuine drop only if it isn't a registered node class on this
-    // frontend — this also filters out stale-snapshot false positives (a native
-    // copy replacing the tool-recorded clipboard before paste).
+    // frontend — this is the sole mechanism by which paste drops a node, and it
+    // also filters any residual snapshot-fallback staleness.
     const registry = LG?.registered_node_types ?? {};
     const isRegisteredType = (t) => Object.prototype.hasOwnProperty.call(registry, t);
     const { dropped, dropped_count, dropped_types } = diffCopiedVsPasted(
-      getCopiedSnapshot(),
+      expected,
       pasted,
       isRegisteredType,
     );

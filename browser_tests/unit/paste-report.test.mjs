@@ -18,6 +18,7 @@ import {
   normalizeCopiedItems,
   recordCopiedNodes,
   getCopiedSnapshot,
+  parseClipboardNodes,
   diffCopiedVsPasted,
   formatDroppedWarning,
 } from "../../web/js/lib/paste-report.js";
@@ -136,6 +137,40 @@ test("genuine drops require an UNREGISTERED type when the registry predicate is 
   const { dropped_count, dropped_types } = diffCopiedVsPasted(copied, pasted, isRegistered);
   assert.equal(dropped_count, 2);
   assert.deepEqual(dropped_types.sort(), ["AudioCrop", "AudioSeparation"]);
+});
+
+test("parseClipboardNodes reads litegraph's serialized clipboard shape", () => {
+  // The real litegraph clipboard payload copyToClipboard writes to localStorage.
+  const raw = JSON.stringify({
+    nodes: [
+      { id: 1, type: "LoadAudio", pos: [0, 0] },
+      { id: 2, type: "AudioCrop", pos: [10, 0] },
+    ],
+    links: [],
+  });
+  assert.deepEqual(parseClipboardNodes(raw), [
+    { id: 1, type: "LoadAudio" },
+    { id: 2, type: "AudioCrop" },
+  ]);
+  // Bare array and pre-parsed object shapes also work; junk yields [].
+  assert.deepEqual(parseClipboardNodes([{ id: 5, type: "KSampler" }]), [{ id: 5, type: "KSampler" }]);
+  assert.deepEqual(parseClipboardNodes("not json"), []);
+  assert.deepEqual(parseClipboardNodes(null), []);
+});
+
+test("AUTHORITATIVE clipboard: reading the real clipboard makes a native overwrite self-correct", () => {
+  // Tool-copied AudioCrop earlier (stale snapshot), but the user then native-
+  // copied KSampler. The HANDLER diffs against the PARSED CLIPBOARD (KSampler),
+  // not the stale snapshot — so pasting KSampler reports zero drops even though
+  // the snapshot's AudioCrop is unregistered. This is the fix's core invariant.
+  const registered = new Set(["KSampler"]);
+  const isRegistered = (t) => registered.has(t);
+  const clipboardNow = parseClipboardNodes(
+    JSON.stringify({ nodes: [{ id: 9, type: "KSampler" }] }),
+  );
+  const pasted = [pastedNode(40, "KSampler")];
+  const { dropped_count } = diffCopiedVsPasted(clipboardNow, pasted, isRegistered);
+  assert.equal(dropped_count, 0);
 });
 
 test("stale snapshot + native copy of a DIFFERENT selection does NOT fabricate drops", () => {

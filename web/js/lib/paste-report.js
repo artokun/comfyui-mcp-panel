@@ -43,6 +43,30 @@ export function getCopiedSnapshot() {
 }
 
 /**
+ * Parse LiteGraph's serialized clipboard payload into `{id, type}` records.
+ * This is the AUTHORITATIVE source of what a paste will attempt — it reflects
+ * whatever is on the clipboard right now, whether it got there via
+ * graph_copy_nodes or a native Ctrl+C, so it can never go stale the way a
+ * remembered snapshot can. Accepts the raw JSON string, a parsed object, or an
+ * array; tolerates the `{nodes:[…]}` and bare-array shapes. Returns [] on any
+ * unrecognized / unreadable payload (caller then falls back to the snapshot).
+ */
+export function parseClipboardNodes(raw) {
+  let data = raw;
+  if (typeof raw === "string") {
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      return [];
+    }
+  }
+  if (!data) return [];
+  const nodes = Array.isArray(data) ? data : Array.isArray(data.nodes) ? data.nodes : null;
+  if (!nodes) return [];
+  return normalizeCopiedItems(nodes);
+}
+
+/**
  * Diff the copied clipboard nodes against the nodes that actually pasted.
  * Matches per node TYPE (a multiset subtraction) because paste assigns fresh
  * ids, so ids can't be compared directly. Any copied node whose type wasn't
