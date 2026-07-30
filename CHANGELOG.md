@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.19] - 2026-07-30
+
+### Fixed
+- **Run completion fires once on the authoritative lifecycle, with the full batch + correct duration + reliable resume (#293, #224, #200, #269, #468).** The completion `agent_event` was driven by a debounce timer, so it could flush mid-run (a partial image batch, a bogus `0.0s`/"no saved output node ran", or a previous run's output) and sometimes failed to resume the agent — leaving a TODO stuck. Completion now keys on the ComfyUI execution lifecycle for the specific `prompt_id` (flush on `execution_success`, full batch, real `execution_start→finish` duration), never flushes an active run, and never inherits a prior prompt's outputs. Mixed/multi-video runs emit exactly ONE combined event (stills + every video's storyboard folded into one `agent_event`, built in parallel with a per-video timeout so a stalled upload can't suppress completion) instead of a frame per output. Frame composition extracted to `web/js/lib/run-completion-frame.js` with headless tests. (#344)
+
 ## [0.11.18] - 2026-07-30
 
 ### Fixed
