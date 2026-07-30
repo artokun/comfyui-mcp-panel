@@ -14,6 +14,7 @@ import {
   assetCandidateStillReferenced,
   assetCandidateResolvesLive,
   isStaleAssetCandidate,
+  locatorIsRecognized,
   orderedWidgetInputNames,
   isWidgetInputSpec,
   reconcileUnknownWidgetNames,
@@ -272,6 +273,81 @@ test("a STALE combo still listing a deleted file must NOT suppress a genuine mis
   assert.equal(isStaleAssetCandidate(graphOf([node]), candidate, { trustCombo: false }), false);
   // Only after a confirmed refresh is combo membership trusted to clear it.
   assert.equal(isStaleAssetCandidate(graphOf([node]), candidate, { trustCombo: true }), true);
+});
+
+// ── #316: cross-tab / removed-node scoping ──────────────────────────────────
+test("locatorIsRecognized mirrors findNodeByScopedId's recognized shapes", () => {
+  assert.equal(locatorIsRecognized("66"), true); // plain local id
+  assert.equal(locatorIsRecognized("node-uuid-1"), true); // string/UUID-like id
+  assert.equal(locatorIsRecognized("6051:1913"), true); // legacy numeric hop
+  assert.equal(locatorIsRecognized(`${SG_UUID}:1913`), true); // real subgraph locator
+  assert.equal(locatorIsRecognized(""), false); // empty
+  assert.equal(locatorIsRecognized(`${SG_UUID}:x:6077`), false); // 3 segments
+  assert.equal(locatorIsRecognized(`${SG_UUID}::6077`), false); // empty middle
+  assert.equal(locatorIsRecognized(`${SG_UUID}:`), false); // empty local id
+  assert.equal(locatorIsRecognized("not-a-uuid:6077"), false); // bad UUID
+  assert.equal(locatorIsRecognized("6051:"), false); // trailing empty numeric hop
+});
+
+test("isStaleAssetCandidate: DROPS a candidate whose node isn't in the active graph (#316 cross-tab leak)", () => {
+  // Active workflow tab is a simple 8-node graph WITHOUT node 66. The missingModel
+  // store still holds node 66 from a previously-open tab → it must not be reported.
+  const active = graphOf([{ id: 3 }, { id: 5 }, { id: 6 }, { id: 16 }]);
+  assert.equal(
+    isStaleAssetCandidate(active, {
+      nodeId: "66",
+      name: "z_image_turbo_bf16.safetensors",
+      widgetName: "unet_name",
+    }),
+    true,
+  );
+});
+
+test("isStaleAssetCandidate: DROPS a foreign SUBGRAPH-scoped candidate whose subgraph isn't in the active graph (#316)", () => {
+  const active = rootWithSubgraphs([{ id: 3 }], []); // no subgraph registered
+  assert.equal(
+    isStaleAssetCandidate(active, {
+      nodeId: `${SG_UUID}:6077`,
+      name: "rife_v4.26.safetensors",
+      widgetName: "ckpt_name",
+    }),
+    true,
+  );
+});
+
+test("isStaleAssetCandidate: a foreign candidate is KEPT when scopeToActiveGraph is off (fail-open opt-out)", () => {
+  const active = graphOf([{ id: 3 }]);
+  const candidate = { nodeId: "66", name: "x.safetensors", widgetName: "unet_name" };
+  assert.equal(isStaleAssetCandidate(active, candidate, { scopeToActiveGraph: false }), false);
+});
+
+test("isStaleAssetCandidate: an UNPARSEABLE foreign-looking locator is NOT dropped by scoping (fail-open, #316 safety)", () => {
+  // A malformed locator with no matching node must fail OPEN, not be silently
+  // dropped as 'foreign' — otherwise a genuine miss on an odd id would vanish.
+  const active = graphOf([{ id: 3 }]);
+  assert.equal(
+    isStaleAssetCandidate(active, {
+      nodeId: `${SG_UUID}:x:6077`,
+      name: "gone.safetensors",
+      widgetName: "ckpt_name",
+    }),
+    false,
+  );
+});
+
+test("isStaleAssetCandidate: a genuine miss on a node PRESENT in the active graph still reports (scoping no-op)", () => {
+  const node = {
+    id: 66,
+    widgets: [{ name: "unet_name", value: "z_image_turbo_bf16.safetensors" }],
+  };
+  assert.equal(
+    isStaleAssetCandidate(graphOf([node]), {
+      nodeId: "66",
+      name: "z_image_turbo_bf16.safetensors",
+      widgetName: "unet_name",
+    }),
+    false,
+  );
 });
 
 test("collectAllGraphs walks nested subgraphs", () => {
