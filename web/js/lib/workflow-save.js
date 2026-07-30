@@ -248,14 +248,25 @@ function resolveSaveAsCopy(svc) {
   if (typeof svc?.saveAs === "function" && typeof svc?.saveWorkflow === "function") {
     return async (wf, effectiveName, finalTargetPath) => {
       // saveAs builds the copy in memory at the resolved target path (source
-      // object untouched); saveWorkflow writes THAT copy to disk. The source's
-      // on-disk file is never referenced, so it cannot be moved/destroyed (#226).
+      // object untouched); the source's on-disk file is never referenced, so it
+      // cannot be moved/destroyed (#226).
       const copy = svc.saveAs(wf, finalTargetPath);
       if (!copy) {
         throw new Error("save-as (copy) failed to create a copy on this frontend");
       }
+      // CRITICAL: the object saveAs returns is UNLOADED — it has no changeTracker,
+      // so `activeState` is null and ComfyWorkflow.save() would serialize the
+      // string "null" to disk (a saved-but-empty workflow). Mirror the frontend's
+      // own Save-As sequence: OPEN/activate the copy first (populates its
+      // changeTracker/activeState from the graph and makes it the active tab),
+      // THEN persist — so save() writes the real graph, not null. Opening also
+      // makes the copy the active workflow, matching the old saveWorkflowAs.
+      if (typeof svc.openWorkflow === "function") {
+        await svc.openWorkflow(copy);
+      }
+      copy.changeTracker?.prepareForSave?.();
       await svc.saveWorkflow(copy);
-      return baseName(copy.filename) || effectiveName;
+      return baseName(svc.activeWorkflow?.filename) || baseName(copy.filename) || effectiveName;
     };
   }
   return null;
