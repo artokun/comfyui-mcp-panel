@@ -230,7 +230,7 @@ const DISCORD_INVITE_URL = "https://discord.gg/cW9arBhzCu";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
-const PANEL_VERSION = "0.11.16";
+const PANEL_VERSION = "0.11.17";
 
 // The connected orchestrator's console URL/token (captured off the `backends`
 // bridge message — see onBackends). Drives the "API Keys" credentials frame;
@@ -4053,11 +4053,11 @@ function slotDiagnostic(origin, target, requested = {}) {
     const hint = SLOT_TYPE_HINTS[typeName];
     tail =
       `No input on node ${target.id} accepts type ${renderSlotType(failType)}. ` +
-      `Tip: ${hint ? hint + "; " : ""}check wiring with panel_get_graph.`;
+      `Tip: ${hint ? hint + "; " : ""}check wiring with panel_query_graph.`;
   } else {
     tail =
       `No compatible output→input pair found between node ${origin.id} and node ${target.id}. ` +
-      `Tip: check wiring with panel_get_graph.`;
+      `Tip: check wiring with panel_query_graph.`;
   }
 
   const oType = origin.type ?? origin.comfyClass ?? origin.title ?? "node";
@@ -4982,7 +4982,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const node = LG.createNode(class_type);
     if (!node) {
       throw new Error(
-        `Unknown node type "${class_type}" — check the exact class_type via panel_get_graph or panel_search_nodes`,
+        `Unknown node type "${class_type}" — check the exact class_type via panel_search_nodes`,
       );
     }
     graph.beforeChange();
@@ -5648,7 +5648,7 @@ const GRAPH_TOOL_EXECUTORS = {
           error:
             `node ${to_node_id} (${node.type}) is not an output node — "run to node" can ` +
             `only target an output node such as SaveImage, PreviewImage, or SaveVideo. Pick the ` +
-            `output node at the end of the branch you want to render (is_output:true in panel_get_graph).`,
+            `output node at the end of the branch you want to render (is_output:true in panel_query_graph).`,
         };
       }
       partialTargets = [String(to_node_id)];
@@ -6024,7 +6024,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const g = resolveGroupRef(graph, group);
     if (!g) {
       throw new Error(
-        `no group matching "${group}" — list groups via panel_get_graph (each has id, title, node_ids)`,
+        `no group matching "${group}" — list groups via panel_query_graph (each has id, title, node_ids)`,
       );
     }
     const ns = groupMemberNodes(graph, g);

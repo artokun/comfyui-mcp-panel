@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.17] - 2026-07-30
+
+### Fixed
+- **Error/tip messages no longer recommend the retired `panel_get_graph` tool (#318).** `panel_add_node`'s unknown-node-type error, plus several wiring/output-node/group-listing tips, pointed at `panel_get_graph`, which is no longer exposed. Unknown-node errors now point at `panel_search_nodes` (the node-type registry search), and graph-inspection tips point at `panel_query_graph` (the live-graph query that replaced the old full-JSON dump). Regression test asserts the unknown-type message never references the retired tool.
+
 ## [0.11.16] - 2026-07-30
 
 ### Fixed
