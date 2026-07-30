@@ -232,20 +232,22 @@ export function queueFailureSignal(status, batchFailed, target) {
 
 /**
  * Decide the TRUE outcome of an install after it was queued+started (#232 /
- * codex rounds 1-2). Pure so it is unit-testable without the browser Manager
- * client. DRAINED IS CHECKED FIRST — nothing is "installed" or "failed" until
- * the queue positively drained. Three states, never a false success and never a
- * false failure:
- *   - "installed":  queue drained AND list readable AND pack positively present.
- *   - "failed":     queue drained AND list readable AND pack absent AND explicit
- *                   failure evidence (queue error/failed count, or the batch
- *                   `failed[]`). Only then is absence proof.
- *   - "unverified": everything else — not drained (still processing / no
- *                   positive drain evidence), status/list unreadable or
- *                   malformed, or drained-but-absent with no failure signal
- *                   (e.g. a renamed install dir the name-match can't confirm).
+ * codex rounds 1-3). Pure so it is unit-testable without the browser Manager
+ * client. Precedence — never a false success and never a false failure:
+ *   1. present pack ⇒ "installed"  (gated: queue must have positively drained).
+ *   2. "failed" ONLY when: drained AND list readable AND explicit failure
+ *      evidence (queue error/failed count, or the batch `failed[]`) AND the
+ *      pack is DEFINITIVELY ABSENT — meaning the target is IDENTIFIABLE (a
+ *      claimed registry id whose cnr_id/aux_id the matcher would recognize if
+ *      present), not a rename-prone git/owner-repo install whose on-disk dir may
+ *      differ from its name. "Not name-matched" alone is NOT absence.
+ *   3. everything else ⇒ "unverified": not drained, unreadable/malformed list,
+ *      absent-but-no-failure-evidence, OR presence INCONCLUSIVE (a rename-prone
+ *      install we can neither confirm nor rule out) — even with a failure
+ *      signal / stale batchFailed. A genuine renamed-dir install (codex round 3)
+ *      lands here, never "failed".
  * @param {{ target:string, dialect?:string, status:unknown, installed:unknown,
- *           listError?:boolean, batchFailed?:unknown }} input
+ *           listError?:boolean, batchFailed?:unknown, renameProne?:boolean }} input
  */
 export function classifyInstallOutcome({
   target,
@@ -254,28 +256,31 @@ export function classifyInstallOutcome({
   installed,
   listError = false,
   batchFailed,
+  renameProne = false,
 }) {
   const drained = queueDrained(status);
   const listReadable = !listError && isReadableInstalledList(installed);
 
   // Not drained ⇒ inconclusive REGARDLESS of pack presence — the queue may
-  // still be cloning; a pack seen now could be a stale/partial dir (codex #2).
+  // still be cloning; a pack seen now could be a stale/partial dir (codex r2 #2).
   if (!drained) {
-    return {
-      state: "unverified",
+    return unverified(
+      target,
       status,
-      message: unverifiedMessage(
-        target,
-        "the install is still in progress (the Manager queue has not positively drained)",
-      ),
-    };
+      "the install is still in progress (the Manager queue has not positively drained)",
+    );
   }
 
+  // Positive presence wins outright.
   if (listReadable && nodeInstalledMatches(target, installed)) {
     return { state: "installed", status };
   }
 
-  if (listReadable && queueFailureSignal(status, batchFailed, target)) {
+  // Absence is only PROOF when the target is identifiable — otherwise a
+  // rename-prone pack (git URL / owner-repo) may have installed under a dir the
+  // name-match can't see. Presence is then INCONCLUSIVE, never "failed" (codex r3).
+  const definitivelyAbsent = listReadable && !renameProne;
+  if (definitivelyAbsent && queueFailureSignal(status, batchFailed, target)) {
     return {
       state: "failed",
       status,
@@ -288,16 +293,18 @@ export function classifyInstallOutcome({
     };
   }
 
-  return {
-    state: "unverified",
-    status,
-    message: unverifiedMessage(
-      target,
-      !listReadable
-        ? "the installed-nodes list could not be read"
-        : "the pack was not found by name (its install directory may differ from the repo name)",
-    ),
-  };
+  const why = !listReadable
+    ? "the installed-nodes list could not be read"
+    : renameProne
+      ? "its presence could not be confirmed — a git/owner-repo pack can install " +
+        "under a directory name that differs from the repo name, so the name-match " +
+        "can neither confirm nor rule it out"
+      : "the pack was not found by name and no failure was reported";
+  return unverified(target, status, why);
+}
+
+function unverified(target, status, why) {
+  return { state: "unverified", status, message: unverifiedMessage(target, why) };
 }
 
 function unverifiedMessage(target, why) {

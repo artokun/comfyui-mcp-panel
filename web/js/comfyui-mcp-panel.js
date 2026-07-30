@@ -66,7 +66,7 @@ import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
-import { buildInstallRequest, classifyInstallOutcome } from "./lib/manager-install.js";
+import { buildInstallRequest, classifyInstallOutcome, installGitUrl } from "./lib/manager-install.js";
 import {
   CHAT_HISTORY_MAX_IMPORT_BYTES,
   CHAT_HISTORY_SCHEMA,
@@ -2607,7 +2607,7 @@ async function waitForQueueDrain({ timeoutMs = 120000, intervalMs = 1500 } = {})
  * synchronous v2-batch `failed[]` as failure EVIDENCE (still gated by the
  * tri-state — never an early throw). Returns { state, status, message }.
  */
-async function verifyInstalled(target, dialect, batchFailed) {
+async function verifyInstalled(target, dialect, { batchFailed, renameProne } = {}) {
   const status = await waitForQueueDrain();
   let installed = null;
   let listError = false;
@@ -2618,7 +2618,7 @@ async function verifyInstalled(target, dialect, batchFailed) {
   } catch {
     listError = true;
   }
-  return classifyInstallOutcome({ target, dialect, status, installed, listError, batchFailed });
+  return classifyInstallOutcome({ target, dialect, status, installed, listError, batchFailed, renameProne });
 }
 
 /** Build a ComfyUI /view URL for an output image descriptor. */
@@ -6807,6 +6807,12 @@ const GRAPH_TOOL_EXECUTORS = {
     // clone/resolve fails, so after queueing we resolve the TRUE outcome instead
     // of claiming success — installed / failed / unverified (see verifyInstalled).
     const target = dialect === "v2" ? req.params.id : req.body.id;
+    // A git URL or an owner/repo id can install under a directory name that
+    // differs from the repo name (e.g. TenStrip/10S-Comfy-nodes → 10S_Nodes), so
+    // its on-disk presence can't be confirmed OR ruled out by name — absence is
+    // NOT proof of failure for such targets (codex round 3). A claimed registry
+    // id is identifiable (matched via cnr_id/aux_id), so its absence IS proof.
+    const renameProne = !!installGitUrl(args) || String(id ?? "").includes("/");
     // Every Manager mutation is bounded (codex round 2 #5).
     const post = (body) => ({ method: "POST", body, signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS) });
     let batchFailed; // v2-batch synchronous failed[] — FEEDS the gate as evidence
@@ -6827,7 +6833,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // Resolve the true outcome. Throw ONLY on positive failure evidence; an
     // inconclusive result returns an honest unverified status (never a silent
     // success, never a false failure). #232 + codex rounds 1-2.
-    const outcome = await verifyInstalled(target, dialect, batchFailed);
+    const outcome = await verifyInstalled(target, dialect, { batchFailed, renameProne });
     if (outcome.state === "failed") throw new Error(outcome.message);
     if (outcome.state === "installed") {
       return {

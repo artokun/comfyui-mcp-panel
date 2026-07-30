@@ -188,19 +188,28 @@ test("queueFailureSignal fires only on explicit evidence (status or batch)", () 
 });
 
 // --- classifyInstallOutcome: TRI-STATE, no false success / no false failure --
-// Exercises the EXACT status/list shapes codex round 2 named, per dialect. The
-// handler verifies buildInstallRequest's id (already the repo NAME for a git URL).
+// Exercises the EXACT status/list shapes codex named, per dialect. The handler
+// verifies buildInstallRequest's id (already the repo NAME for a git URL) and
+// computes renameProne the same way we mirror here.
 const DRAINED = { is_processing: false, done_count: 1, total_count: 1 };
+const FAIL_STATUS = { is_processing: false, done_count: 1, total_count: 1, error_count: 1 };
+// Mirror the handler's renameProne derivation exactly.
+const renameProneOf = (args) => !!installGitUrl(args) || String(args.id ?? "").includes("/");
+
 for (const dialect of ["v2", "v2-batch", "legacy"]) {
-  const targetOf = (args) => {
+  // Build the classifier input the handler would pass for these args.
+  const inputFor = (args) => {
     const req = buildInstallRequest(dialect, args, "uid-1");
-    return dialect === "v2" ? req.params.id : req.body.id;
+    return {
+      target: dialect === "v2" ? req.params.id : req.body.id,
+      dialect,
+      renameProne: renameProneOf(args),
+    };
   };
 
   test(`${dialect}: drained + pack present ⇒ installed (registry)`, () => {
     const o = classifyInstallOutcome({
-      target: targetOf({ id: "rgthree-comfy" }),
-      dialect,
+      ...inputFor({ id: "rgthree-comfy" }),
       status: DRAINED,
       installed: { "rgthree-comfy": { ver: "1.0.0", cnr_id: "rgthree-comfy" } },
     });
@@ -209,20 +218,20 @@ for (const dialect of ["v2", "v2-batch", "legacy"]) {
 
   test(`${dialect}: drained + pack present ⇒ installed (git URL, repo-name dir)`, () => {
     const o = classifyInstallOutcome({
-      target: targetOf({ repository: "https://github.com/rgthree/rgthree-comfy.git" }),
-      dialect,
+      ...inputFor({ repository: "https://github.com/rgthree/rgthree-comfy.git" }),
       status: DRAINED,
       installed: { "rgthree-comfy": { ver: "nightly", aux_id: "rgthree/rgthree-comfy" } },
     });
     assert.equal(o.state, "installed");
   });
 
-  test(`${dialect}: drained + absent + explicit failure ⇒ failed`, () => {
+  // Identifiable (claimed registry id) + drained + definitively absent + failure
+  // evidence ⇒ the ONE case that hard-fails.
+  test(`${dialect}: identifiable id, drained + absent + explicit failure ⇒ failed`, () => {
     const o = classifyInstallOutcome({
-      target: targetOf({ repository: "https://github.com/TenStrip/10S-Comfy-nodes.git" }),
-      dialect,
-      status: { is_processing: false, done_count: 1, total_count: 1, error_count: 1 },
-      installed: {}, // nothing landed — exactly the #232 report
+      ...inputFor({ id: "no-such-registry-pack" }),
+      status: FAIL_STATUS,
+      installed: { "rgthree-comfy": { cnr_id: "rgthree-comfy" } }, // real list, our pack absent
     });
     assert.equal(o.state, "failed");
     assert.match(o.message, /FAILED/);
@@ -230,19 +239,52 @@ for (const dialect of ["v2", "v2-batch", "legacy"]) {
 
   test(`${dialect}: drained + absent + NO failure signal ⇒ unverified`, () => {
     const o = classifyInstallOutcome({
-      target: targetOf({ id: "rgthree-comfy" }),
-      dialect,
+      ...inputFor({ id: "rgthree-comfy" }),
       status: DRAINED,
-      installed: { "some-other-pack": {} },
+      installed: { "some-other-pack": { cnr_id: "some-other-pack" } },
     });
+    assert.equal(o.state, "unverified");
+  });
+
+  // codex r3: a rename-prone (git URL) install that is absent-by-name is
+  // INCONCLUSIVE even WITH a failure signal — never failed.
+  test(`${dialect}: git URL, drained + absent-by-name + failure signal ⇒ unverified, NOT failed`, () => {
+    const o = classifyInstallOutcome({
+      ...inputFor({ repository: "https://github.com/TenStrip/10S-Comfy-nodes.git" }),
+      status: FAIL_STATUS,
+      installed: {}, // can't rule out a renamed dir landing later/elsewhere
+    });
+    assert.notEqual(o.state, "failed");
+    assert.equal(o.state, "unverified");
+  });
+
+  // codex r3 exact case: renamed-dir pack PRESENT-but-unmatched + error_count ⇒
+  // NOT failed (a genuine install must never be reported failed).
+  test(`${dialect}: git URL renamed-dir present-unmatched + error_count ⇒ NOT failed`, () => {
+    const o = classifyInstallOutcome({
+      ...inputFor({ repository: "https://github.com/TenStrip/10S-Comfy-nodes.git" }),
+      status: FAIL_STATUS,
+      installed: { "10S_Nodes": { ver: "nightly" } }, // it DID install, renamed dir
+    });
+    assert.notEqual(o.state, "failed");
+    assert.equal(o.state, "unverified");
+  });
+
+  // codex r3: owner/repo id is ALSO rename-prone (10S-Comfy-nodes → 10S_Nodes).
+  test(`${dialect}: owner/repo id renamed-dir + error_count ⇒ NOT failed`, () => {
+    const o = classifyInstallOutcome({
+      ...inputFor({ id: "TenStrip/10S-Comfy-nodes" }),
+      status: FAIL_STATUS,
+      installed: { "10S_Nodes": { ver: "nightly" } },
+    });
+    assert.notEqual(o.state, "failed");
     assert.equal(o.state, "unverified");
   });
 
   // codex #1: {error_count:1} alone is NOT a drain → must NOT become failed.
   test(`${dialect}: {error_count:1} but NOT drained ⇒ unverified, never failed`, () => {
     const o = classifyInstallOutcome({
-      target: targetOf({ id: "rgthree-comfy" }),
-      dialect,
+      ...inputFor({ id: "no-such-registry-pack" }),
       status: { error_count: 1 }, // no is_processing:false + counts ⇒ not a positive drain
       installed: {},
     });
@@ -250,12 +292,11 @@ for (const dialect of ["v2", "v2-batch", "legacy"]) {
     assert.notEqual(o.state, "failed");
   });
 
-  // codex #1: null / {} status ⇒ never drained ⇒ unverified.
+  // codex #1: null / {} / primitive status ⇒ never drained ⇒ unverified.
   for (const [label, status] of [["null", null], ["empty {}", {}], ["primitive", "done"]]) {
     test(`${dialect}: ${label} status ⇒ unverified (no false drain)`, () => {
       const o = classifyInstallOutcome({
-        target: targetOf({ id: "rgthree-comfy" }),
-        dialect,
+        ...inputFor({ id: "rgthree-comfy" }),
         status,
         installed: { "rgthree-comfy": { cnr_id: "rgthree-comfy" } }, // even if present!
       });
@@ -268,8 +309,7 @@ for (const dialect of ["v2", "v2-batch", "legacy"]) {
   // already present (could be a stale/partial dir).
   test(`${dialect}: still processing + pack present ⇒ unverified, NOT installed`, () => {
     const o = classifyInstallOutcome({
-      target: targetOf({ id: "rgthree-comfy" }),
-      dialect,
+      ...inputFor({ id: "rgthree-comfy" }),
       status: { is_processing: true, done_count: 0, total_count: 1 },
       installed: { "rgthree-comfy": { cnr_id: "rgthree-comfy" } },
     });
@@ -279,12 +319,11 @@ for (const dialect of ["v2", "v2-batch", "legacy"]) {
   });
 
   // codex #3: a null/primitive list (200 but malformed) with a failure status
-  // must be unverified, not failed.
+  // must be unverified, not failed — even for an identifiable id.
   test(`${dialect}: drained + null list + failure status ⇒ unverified (malformed list)`, () => {
     const o = classifyInstallOutcome({
-      target: targetOf({ id: "rgthree-comfy" }),
-      dialect,
-      status: { is_processing: false, done_count: 1, total_count: 1, error_count: 1 },
+      ...inputFor({ id: "no-such-registry-pack" }),
+      status: FAIL_STATUS,
       installed: null, // 200 but empty body coerced to null
     });
     assert.equal(o.state, "unverified");
@@ -292,23 +331,20 @@ for (const dialect of ["v2", "v2-batch", "legacy"]) {
 
   test(`${dialect}: listError (fetch threw) ⇒ unverified, never failed`, () => {
     const o = classifyInstallOutcome({
-      target: targetOf({ id: "rgthree-comfy" }),
-      dialect,
-      status: { is_processing: false, done_count: 1, total_count: 1, error_count: 1 },
+      ...inputFor({ id: "no-such-registry-pack" }),
+      status: FAIL_STATUS,
       installed: null,
       listError: true,
     });
     assert.equal(o.state, "unverified");
   });
 
-  // codex #3 / #232 point 3: RENAMED install dir — genuine install, bare module
-  // name ≠ repo name ⇒ unverified, NEVER a hard fail.
-  test(`${dialect}: RENAMED install dir (10S-Comfy-nodes → 10S_Nodes) ⇒ unverified, NOT failed`, () => {
+  // #232 point 3: RENAMED install dir, no failure signal ⇒ unverified.
+  test(`${dialect}: RENAMED install dir (10S-Comfy-nodes → 10S_Nodes), no failure ⇒ unverified`, () => {
     const o = classifyInstallOutcome({
-      target: targetOf({ repository: "https://github.com/TenStrip/10S-Comfy-nodes.git" }),
-      dialect,
-      status: DRAINED, // drained, no failure signal
-      installed: { "10S_Nodes": { ver: "nightly" } }, // it DID land, under a renamed dir
+      ...inputFor({ repository: "https://github.com/TenStrip/10S-Comfy-nodes.git" }),
+      status: DRAINED,
+      installed: { "10S_Nodes": { ver: "nightly" } },
     });
     assert.notEqual(o.state, "failed");
     assert.equal(o.state, "unverified");
@@ -316,39 +352,60 @@ for (const dialect of ["v2", "v2-batch", "legacy"]) {
 }
 
 // --- codex #4: the v2-batch synchronous failed[] FEEDS the gate as evidence,
-// never an early throw; the tri-state still applies. ------------------------
-test("v2-batch: batch failed[] + drained + absent ⇒ failed (through the gate)", () => {
-  const target = buildInstallRequest("v2-batch", { id: "rgthree-comfy" }, "u").body.id;
+// never an early throw; the tri-state (incl. identifiability) still applies. --
+const batchTarget = buildInstallRequest("v2-batch", { id: "rgthree-comfy" }, "u").body.id;
+
+test("v2-batch: identifiable id + batch failed[] + drained + absent ⇒ failed (through the gate)", () => {
   const o = classifyInstallOutcome({
-    target,
+    target: batchTarget,
     dialect: "v2-batch",
+    renameProne: false, // claimed registry id ⇒ identifiable
     status: DRAINED, // no error_count on status — the ONLY evidence is batchFailed
-    installed: {},
-    batchFailed: [target],
+    installed: { "other-pack": { cnr_id: "other-pack" } },
+    batchFailed: [batchTarget],
   });
   assert.equal(o.state, "failed");
 });
 
 test("v2-batch: batch failed[] but NOT drained ⇒ unverified (evidence still gated)", () => {
-  const target = buildInstallRequest("v2-batch", { id: "rgthree-comfy" }, "u").body.id;
   const o = classifyInstallOutcome({
-    target,
+    target: batchTarget,
     dialect: "v2-batch",
+    renameProne: false,
     status: { is_processing: true }, // not drained
     installed: {},
-    batchFailed: [target],
+    batchFailed: [batchTarget],
   });
   assert.equal(o.state, "unverified");
 });
 
 test("v2-batch: batch failed[] but the pack IS present ⇒ installed (evidence ≠ absence)", () => {
-  const target = buildInstallRequest("v2-batch", { id: "rgthree-comfy" }, "u").body.id;
   const o = classifyInstallOutcome({
-    target,
+    target: batchTarget,
     dialect: "v2-batch",
+    renameProne: false,
     status: DRAINED,
     installed: { "rgthree-comfy": { cnr_id: "rgthree-comfy" } },
-    batchFailed: [target], // stale/ignored — presence wins
+    batchFailed: [batchTarget], // stale/ignored — presence wins
   });
   assert.equal(o.state, "installed");
+});
+
+// codex r3: stale batchFailed[target] with a RENAMED pack present ⇒ NOT failed.
+test("v2-batch: git URL, stale batch failed[] + renamed-dir present ⇒ NOT failed", () => {
+  const gitTarget = buildInstallRequest(
+    "v2-batch",
+    { repository: "https://github.com/TenStrip/10S-Comfy-nodes.git" },
+    "u",
+  ).body.id;
+  const o = classifyInstallOutcome({
+    target: gitTarget,
+    dialect: "v2-batch",
+    renameProne: true, // git install ⇒ rename-prone
+    status: DRAINED,
+    installed: { "10S_Nodes": { ver: "nightly" } }, // it DID install
+    batchFailed: [gitTarget], // stale evidence — must NOT hard-fail a genuine install
+  });
+  assert.notEqual(o.state, "failed");
+  assert.equal(o.state, "unverified");
 });
