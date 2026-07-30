@@ -251,6 +251,29 @@ def _detect_comfyui_url():
     return "http://{}:{}".format(host, port)
 
 
+def _local_comfyui_path():
+    """Best-effort filesystem path of THIS ComfyUI install (folder_paths.base_path),
+    so the panel can advertise it in its session-init hello (#296/#291).
+
+    READ-ONLY/advisory only — never used to spawn or write. Prefers an explicit
+    COMFYUI_PATH override, then folder_paths.base_path. Returns "" when it cannot
+    be determined (headless/older host) so the panel advertises no local path and
+    the orchestrator falls back to its own workspace detection."""
+    override = (environ.get("COMFYUI_PATH") or "").strip()
+    if override:
+        return override
+    try:
+        import folder_paths  # type: ignore
+
+        base = getattr(folder_paths, "base_path", None)
+        if base and isinstance(base, str):
+            return base
+    except Exception:
+        # folder_paths not importable (headless / older host) — no local path.
+        return ""
+    return ""
+
+
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", _ANY_IPV4_HOST, ""}
 
 
@@ -383,6 +406,12 @@ def _register_routes():
                 "can_spawn": False,
                 "bridge_url": "ws://{}:{}".format(_BRIDGE_HOST, _BRIDGE_PORT),
                 "comfyui_url": detected,
+                # #296/#291 — the local ComfyUI workspace path (folder_paths.base_path
+                # of the ComfyUI this pack is embedded in). READ-ONLY/advisory: the
+                # panel advertises it in its session-init hello so an out-of-band
+                # orchestrator can register the live panel_* graph tools + local panel
+                # management even with no CLI workspace config. Never used to spawn.
+                "comfyui_path": _local_comfyui_path(),
                 "start_command": _start_command(detected),
             }
         )
