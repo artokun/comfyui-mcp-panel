@@ -126,6 +126,14 @@ import {
 import { saveActiveWorkflow } from "./lib/workflow-save.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
+import {
+  shouldResumeAfterComfyReconnect,
+  shouldRehelloAfterCommand,
+  retryDuringReconnect,
+  dedupeWorkflowTabRecords,
+  resolveLoadGraphArgs,
+  buildHelloPayload,
+} from "./lib/session-rebind.js";
 
 let app = null;
 let api = null;
@@ -1197,6 +1205,12 @@ function ssSet(key, val) {
 // open — until they explicitly Disconnect. localStorage so it survives a full
 // frontend reload, not just a tab session.
 const AUTOCONNECT_KEY = "comfyui-mcp.panel.autoConnect";
+// #278 — Persistent explicit-Disconnect latch. Set when the user clicks
+// Disconnect, cleared on any connect intent. localStorage (not just an in-memory
+// flag) so the opt-out SURVIVES a full frontend reload — otherwise a page reload
+// would reset it while SESSION_KEY persists, letting the blocked session-resume
+// path fire after a later ComfyUI restart.
+const USER_DISCONNECTED_KEY = "comfyui-mcp.panel.userDisconnected";
 function lsGet(key) {
   try {
     return window.localStorage.getItem(key) || null;
@@ -1612,6 +1626,23 @@ function comfyuiUrlForAgent() {
   } catch {
     return "";
   }
+}
+
+// #296/#291 — Local ComfyUI workspace path, learned from the read-only panel
+// status route (folder_paths.base_path of the ComfyUI this panel is embedded
+// in). Advertised in the session-init hello so the orchestrator can register the
+// live panel_* graph tools + local panel management even with no CLI workspace
+// config. Empty for a remote/pod ComfyUI (no local filesystem to manage).
+let _localComfyuiPath = "";
+// Settled once the local-path probe finishes (resolve or reject). connectAgent
+// awaits this before the first hello so the very first session advertises the
+// path, not just a later reconnect. Assigned by the mount-time probe below.
+let localComfyuiPathReady = Promise.resolve();
+function localComfyuiPathForAgent() {
+  // A manual remote-URL override means the agent is NOT driving this local
+  // ComfyUI's filesystem — don't advertise a path that isn't the live target.
+  if (remoteUrlSetting()) return "";
+  return typeof _localComfyuiPath === "string" ? _localComfyuiPath : "";
 }
 
 // Build the settings list registered on the extension. Defined as a function so
@@ -5100,7 +5131,15 @@ const GRAPH_TOOL_EXECUTORS = {
     // loadGraphData is async on current frontends — AWAIT it so follow-ups
     // (checkState for one-step undo, success toasts) run after the graph has
     // actually landed, and a load failure rejects instead of vanishing.
-    await app.loadGraphData(clone);
+    //
+    // #207/#334 — pass the ACTIVE workflow as the 4th arg so the load REPLACES
+    // the active tab in place (like workflow_open does) instead of spawning a
+    // new "Unsaved Workflow" tab. Repeated loads on the same named workflow
+    // otherwise appended duplicate tab records (panel_list_workflows showed the
+    // same active tab twice, and a later save 409'd), and a soft-reload-then-
+    // reload left graph routing stranded on a frozen Unsaved tab.
+    const activeWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
+    await app.loadGraphData(...resolveLoadGraphArgs(clone, activeWorkflow));
     return {
       loaded: true,
       node_count: clone.nodes.length,
@@ -5868,7 +5907,11 @@ const GRAPH_TOOL_EXECUTORS = {
       // threw "Cannot read properties of undefined (reading 'path')" — removing the
       // only way to list open tabs exactly when it was needed to diagnose a desync
       // (panel #197). Filter first so the list is best-effort rather than fatal.
-      open: (s.openWorkflows ?? []).filter(Boolean).map(brief),
+      //
+      // #207 — collapse records that share a stable workflow key so the same
+      // active tab is never reported twice (a repeated panel_load_workflow used
+      // to append duplicate active records, and a later save then 409'd).
+      open: dedupeWorkflowTabRecords((s.openWorkflows ?? []).filter(Boolean).map(brief)),
     };
   },
 
@@ -6975,12 +7018,19 @@ const GRAPH_TOOL_EXECUTORS = {
     // to the absolute (no-/v2) legacy list route instead of surfacing a generic
     // "unreachable" error.
     const route = installedListRoute();
-    try {
-      return { installed: await managerGet(route) };
-    } catch (err) {
-      if (!isManagerUnreachable(err)) throw err;
-      return { installed: await managerCall(route) };
-    }
+    // #332 — immediately after panel_restart_comfyui, a Manager fetch throws a
+    // bare transport error ("Failed to fetch") before any HTTP status exists, so
+    // the 404/unreachable fallback below never fires and the raw error leaked to
+    // the agent. Retry transient transport failures with a short bounded backoff,
+    // then reword into an actionable "still reconnecting" status.
+    return retryDuringReconnect(async () => {
+      try {
+        return { installed: await managerGet(route) };
+      } catch (err) {
+        if (!isManagerUnreachable(err)) throw err;
+        return { installed: await managerCall(route) };
+      }
+    });
   },
 
   async nodes_install(args) {
@@ -8003,20 +8053,24 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // so a bare `--panel-orchestrator` points the agent at whatever ComfyUI is open.
       const comfyuiUrl = comfyuiUrlForAgent();
       sock.send(
-        JSON.stringify({
-          type: "hello",
-          tab_id: workflowTabId(),
-          title: getWorkflowTitle(),
-          // Our build version, so the orchestrator can auto-stamp it into the
-          // agent's ENV block (bug reports get version-pinned without digging).
-          panel_version: PANEL_VERSION,
-          backend,
-          // Blind content mode (issue #90): the orchestrator spawns this tab's
-          // comfyui tool server with pixel-withholding env when true.
-          blind: AGENT_BLIND,
-          ...(comfyuiUrl ? { comfyui_url: comfyuiUrl } : {}),
-          ...(resume ? { resume } : {}),
-        }),
+        JSON.stringify(
+          buildHelloPayload({
+            tabId: workflowTabId(),
+            title: getWorkflowTitle(),
+            // Our build version, so the orchestrator can auto-stamp it into the
+            // agent's ENV block (bug reports get version-pinned without digging).
+            panelVersion: PANEL_VERSION,
+            backend,
+            // Blind content mode (issue #90): the orchestrator spawns this tab's
+            // comfyui tool server with pixel-withholding env when true.
+            blind: AGENT_BLIND,
+            comfyuiUrl,
+            // #296/#291 — advertise the embedded local ComfyUI path so the
+            // orchestrator registers panel_* tools + local panel management.
+            comfyuiPath: localComfyuiPathForAgent(),
+            resume,
+          }),
+        ),
       );
     } catch {
       // Reconnect path will retry.
@@ -14222,6 +14276,17 @@ function buildPanel() {
         ssSet(REBOOT_KEY, "1");
         appendSystem("Restarting ComfyUI to load new nodes — I'll reconnect and pick up automatically when it's back.");
       }
+      // #310 — free_vram unloads models and can BOUNCE the ComfyUI connection,
+      // which drops the orchestrator's tab mapping (the next graph tool then
+      // failed with "Connected: none"). Re-advertise this tab so the binding
+      // survives, exactly as the restart path re-establishes it on reconnect.
+      if (shouldRehelloAfterCommand(cmd, reply)) {
+        try {
+          client?.rehello?.();
+        } catch {
+          /* the reconnect path retries the hello */
+        }
+      }
     },
     onAgentStatus(s) {
       // Percentage of the context window used (label + ring), persisted so a
@@ -14639,16 +14704,36 @@ function buildPanel() {
   }
   function onComfyReconnected() {
     // After ComfyUI comes back (backend-only reboot — the page didn't reload),
-    // the orchestrator died with it. Respawn + reconnect if the agent was in use:
-    // either a restart WE triggered (REBOOT_KEY) or sticky auto-connect.
-    if (!ssGet(REBOOT_KEY) && !lsGet(AUTOCONNECT_KEY)) return;
+    // the orchestrator died with it. Respawn + reconnect if the agent was in use.
     // ComfyUI fires "reconnected" for BENIGN WS blips too — viewing assets,
     // checking an image's status, a tab refocus — and those do NOT kill the
     // orchestrator. If OUR bridge is still up, the agent is alive and well, so
     // do NOT bounce a live session (that was the spurious "you reconnected"). A
     // real ComfyUI restart drops the bridge (the orchestrator dies with it, and
     // the bridge's own retry can't respawn it) — only then do we respawn here.
-    if (client.isConnected()) return;
+    //
+    // #278: resume not only on an explicit restart marker (REBOOT_KEY) or sticky
+    // auto-connect, but also when the CURRENT conversation still has a resumable
+    // agent session. A tool-triggered reboot that lost REBOOT_KEY otherwise
+    // stranded a live workflow chat as "Connected: none" until a manual refresh.
+    const activeThread = threads.find((t) => t.id === ssGet(CURRENT_THREAD_KEY)) || null;
+    const hasResumableSession =
+      !lsGet(USER_DISCONNECTED_KEY) &&
+      Boolean(
+        resumableSessionId(
+          activeThread || { sessionId: ssGet(SESSION_KEY), provider: connectedBackend || selectedBackend },
+        ),
+      );
+    if (
+      !shouldResumeAfterComfyReconnect({
+        bridgeConnected: client.isConnected(),
+        rebootPending: !!ssGet(REBOOT_KEY),
+        autoConnect: !!lsGet(AUTOCONNECT_KEY),
+        hasResumableSession,
+      })
+    ) {
+      return;
+    }
     appendSystem("ComfyUI is back — reconnecting the agent…");
     connectAgent();
   }
@@ -14680,6 +14765,11 @@ function buildPanel() {
   // bridge_url / setUrl / start) — otherwise it could reconnect the PREVIOUS provider
   // after the user already picked a new one. Only the newest generation wins.
   let connectGen = 0;
+  // Monotonic explicit-Disconnect epoch: bumped on every user Disconnect. A
+  // connectAgent() that started BEFORE a Disconnect (and is parked on its entry
+  // awaits) must NOT resurrect the connection when it wakes — it snapshots this
+  // at entry and bails if a Disconnect bumped it during the await (#278 race).
+  let disconnectEpoch = 0;
   // The last ws URL the picker auto-applied (from /connect's bridge_url). Lets us
   // tell a MANUAL Advanced-URL override apart from an auto-managed one, so a user
   // who typed their own bridge URL isn't silently overwritten by the backend's port.
@@ -15008,9 +15098,20 @@ function buildPanel() {
   }
 
   async function connectAgent(opts = {}) {
-    // hello reads SESSION_KEY, so wait until reload reconciliation has made the
-    // single settings-aware thread/session binding for this browser tab.
+    // Entry awaits, grouped so NO async gap sits between the in-flight guard and
+    // `connecting = true` (that gap would let two connects race). (1) hello reads
+    // SESSION_KEY, so wait for reload reconciliation to make this tab's single
+    // settings-aware thread/session binding; (2) #296/#291 — ensure the local
+    // ComfyUI path probe has settled so the FIRST hello (not just a later
+    // reconnect) can advertise comfyui_path. localComfyuiPathReady is itself
+    // bounded to 2s and never rejects, so this can't stall Connect.
+    const myDisconnectEpoch = disconnectEpoch;
     await historyRestoreReady;
+    await localComfyuiPathReady;
+    // If the user hit Disconnect WHILE we were parked on the entry awaits, abort —
+    // do NOT clear the explicit-disconnect latch or start connecting. Honors the
+    // user's choice against the up-to-2s await window (#278 cancellation race).
+    if (disconnectEpoch !== myDisconnectEpoch) return;
     // A chip pick (opts.fromChip) is an EXPLICIT backend choice — it must always
     // (re)connect to that backend's port, so it bypasses the in-flight guard (which
     // a sticky-reconnect could otherwise hold) and the manual-URL override below.
@@ -15024,6 +15125,11 @@ function buildPanel() {
     // took over — re-arm normal auto-respawn).
     resetAutoReclaim();
     clearSoftReloadGuard();
+    // Any connect intent clears the explicit-disconnect latch so the post-reboot
+    // session-resume path (#278) is armed again for this fresh session. Done
+    // synchronously right before `connecting = true` (no await between) so an
+    // explicit Disconnect can't be straddled by this latch clear.
+    lsSet(USER_DISCONNECTED_KEY, null);
     connecting = true;
     connectBtn.disabled = true;
     connectBtn.textContent = "Starting…";
@@ -15345,6 +15451,17 @@ function buildPanel() {
     // Explicit Disconnect = opt out of sticky auto-reconnect (and the matching setting).
     lsSet(AUTOCONNECT_KEY, null);
     setSetting(SETTING_AUTOCONNECT, false);
+    // Latch the explicit opt-out (persistently, survives reload) so a later
+    // ComfyUI restart does NOT auto-resume via the #278 session-resume path.
+    // SESSION_KEY intentionally persists so a manual Reconnect can still resume —
+    // but only when the USER asks for it.
+    lsSet(USER_DISCONNECTED_KEY, "1");
+    // Bump the disconnect epoch so any connectAgent() parked on its entry awaits
+    // aborts instead of resurrecting the connection when it wakes.
+    disconnectEpoch += 1;
+    // Also cancel any pending tool-triggered reboot resume: an explicit Disconnect
+    // during a reboot window must not be overridden by a surviving REBOOT_KEY.
+    ssSet(REBOOT_KEY, null);
     client.stop();
     // client.stop() sets closed=true, so the socket onclose suppresses onStatus
     // — end the turn locally so the working indicator can't spin forever against
@@ -17057,6 +17174,30 @@ function buildPanel() {
   // below): shows the onboarding card if NEITHER provider is signed in, and
   // auto-picks a ready provider if the saved pick isn't usable.
   void loadBackends();
+
+  // #296/#291 — Learn the embedded local ComfyUI workspace path (read-only, from
+  // folder_paths.base_path) BEFORE the first hello so the session-init frame can
+  // advertise it. Runs independently of the connect decision below so the path is
+  // known whether we auto-connect or sit idle. Best-effort: a remote/pod ComfyUI
+  // or an older pack (no field) simply advertises no path.
+  const probeLocalComfyuiPath = async () => {
+    try {
+      const res = await api.fetchApi("/comfyui_mcp_panel/status");
+      const data = await res.json().catch(() => ({}));
+      if (typeof data?.comfyui_path === "string") _localComfyuiPath = data.comfyui_path;
+    } catch {
+      // No status route — advertise no local path (orchestrator falls back to
+      // its own workspace detection).
+    }
+  };
+  // Bounded: connectAgent awaits this before the first hello, so a slow/hung
+  // status route — OR a stalled res.json() — must never stall Connect. Race the
+  // WHOLE probe (fetch AND body read) against a 2s cap and proceed with no local
+  // path if it doesn't settle in time.
+  localComfyuiPathReady = Promise.race([
+    probeLocalComfyuiPath(),
+    new Promise((resolve) => setTimeout(resolve, 2000)),
+  ]);
 
   (async () => {
     await historyRestoreReady;
