@@ -236,6 +236,27 @@ test('contract has no dead method entries (each is referenced in executable sour
   }
 })
 
+test('OPTIONAL methods are genuinely capability-guarded in source (cannot be a bypass)', () => {
+  // OPTIONAL_METHODS are exempt from the bundle check precisely because the panel
+  // tolerates their absence — which is ONLY true if every use is behind a
+  // capability guard. Enforce that, so a maintainer cannot silence the contract
+  // guard by parking a new UNCONDITIONAL `s.removedMethod()` call in this array:
+  // an unguarded optional method would still crash a frontend that dropped it.
+  const src = stripComments(readFileSync(SAVE_LIB, 'utf8')) + '\n' + stripComments(readFileSync(PANEL, 'utf8'))
+  for (const m of OPTIONAL_METHODS) {
+    const guarded =
+      new RegExp(`typeof\\s+[\\w.?]*\\.${m}\\s*===?\\s*["']function["']`).test(src) || // typeof x.m === "function"
+      new RegExp(`if\\s*\\(\\s*!\\s*[\\w.?]*\\.${m}\\b`).test(src) || //                    if (!x.m) …
+      new RegExp(`[\\w.?]*\\.${m}\\s*&&`).test(src) //                                       x.m && …
+    assert.ok(
+      guarded,
+      `OPTIONAL method "${m}" has no capability guard (typeof …=== "function" / if(!…) / …&&) ` +
+        `in source — an optional frontend method MUST be guarded or it crashes when absent (#268). ` +
+        `If it is actually required, move it to REQUIRED_METHODS so the bundle check covers it.`
+    )
+  }
+})
+
 test('version-variable Save-As methods are only reached behind a typeof capability guard (never unconditionally)', () => {
   const saveLib = stripComments(readFileSync(SAVE_LIB, 'utf8'))
   const panel = stripComments(readFileSync(PANEL, 'utf8'))
