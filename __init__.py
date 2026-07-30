@@ -270,7 +270,7 @@ def _local_comfyui_path():
             return base
     except Exception:
         # folder_paths not importable (headless / older host) — no local path.
-        pass
+        return ""
     return ""
 
 
