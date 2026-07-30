@@ -101,6 +101,7 @@ import {
   reapplyDefsToLiveNodes,
 } from "./lib/asset-staleness.js";
 import { applyWidgetWrite, WidgetWriteError } from "./lib/widget-write.js";
+import { assertAddNodeResolvable, assertNodeWidgetWritable } from "./lib/node-resolve.js";
 import { coerceMessageText, isDroppedAgentReplay } from "./lib/chat-serialize.js";
 import {
   recordCopiedNodes,
@@ -3653,6 +3654,12 @@ function resolveNode(graph, nodeId) {
   return node;
 }
 
+// ---- Node-type resolution guard (#458) ------------------------------------
+// The graph WRITE tools resolve node types against LG.registered_node_types via
+// assertAddNodeResolvable / assertNodeWidgetWritable (web/js/lib/node-resolve.js)
+// so an unresolved type fails loudly instead of being reported as a fabricated
+// placeholder. The predicates take the raw registry object.
+
 
 // ---- Subgraph boundary rails (input/output proxy nodes) -------------------
 // LiteGraph: subgraph.inputNode.id === SUBGRAPH_INPUT_ID (-10),
@@ -4956,6 +4963,10 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!class_type || typeof class_type !== "string") {
       throw new Error("class_type (string) is required");
     }
+    // Resolve against the REAL registry BEFORE creating, so an unresolved type
+    // can never be added as a fabricated placeholder node (#458). Throws with a
+    // clear unreachable-vs-unknown-type message, mirroring the read-path hard error.
+    assertAddNodeResolvable(LG?.registered_node_types ?? {}, class_type);
     const node = LG.createNode(class_type);
     if (!node) {
       throw new Error(
@@ -5268,8 +5279,13 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   graph_set_widget({ node_id, widget, value }) {
-    const { app, graph } = getGraphCtx();
+    const { app, graph, LG } = getGraphCtx();
     const node = resolveNode(graph, node_id);
+    // Never fabricate a widget-write success against an UNRESOLVED node (#458):
+    // an unregistered placeholder's widget list is not the real schema, so
+    // echoing {set:...} would report a change that didn't happen. Throws with a
+    // clear unreachable-vs-missing-node message (subgraph nodes are exempt).
+    assertNodeWidgetWritable(LG?.registered_node_types ?? {}, node);
     // Repair positional UNKNOWN/UNKNOWN_n placeholders against the live def so
     // the caller's real widget name resolves (#199) before we look it up.
     reconcileUnknownWidgetNames(node);
