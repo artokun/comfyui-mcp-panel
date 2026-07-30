@@ -125,7 +125,12 @@ let nodeDefsRefreshConfirmed = false;
 async function refreshComfyNodeDefs() {
   if (nodeDefRefreshInFlight) return nodeDefRefreshInFlight;
   nodeDefRefreshInFlight = (async () => {
-    let ok = false;
+    // Trust the live combos for suppressing missing-asset candidates ONLY once
+    // the combo refresh has ACTUALLY RUN and succeeded. If refreshComboInNodes is
+    // absent on this ComfyUI build (or throws), the combos are still whatever
+    // page-load left them — possibly stale — so we must stay in over-report-safe
+    // mode and NOT trust them (finding #4).
+    let comboRefreshed = false;
     try {
       const a =
         typeof app !== "undefined" && app ? app : window.comfyAPI?.app?.app;
@@ -147,15 +152,14 @@ async function refreshComfyNodeDefs() {
       }
       // Refresh combo widget option lists (model dropdowns etc.) so freshly
       // installed models resolve and stale entries clear (#185/#181/#223).
-      if (typeof a.refreshComboInNodes === "function") await a.refreshComboInNodes();
-      ok = true;
+      if (typeof a.refreshComboInNodes === "function") {
+        await a.refreshComboInNodes();
+        comboRefreshed = true;
+      }
     } catch (e) {
       console.warn("[comfyui-mcp-panel] node-def refresh after reconnect failed:", e);
     } finally {
-      // Only trust the live combos for suppressing missing-asset candidates once
-      // a refresh has FULLY succeeded — a swallowed failure must not license
-      // trusting a stale combo (finding #4).
-      nodeDefsRefreshConfirmed = ok;
+      nodeDefsRefreshConfirmed = comboRefreshed;
       nodeDefRefreshInFlight = null;
     }
   })();

@@ -14,10 +14,23 @@ import {
   assetCandidateResolvesLive,
   isStaleAssetCandidate,
   orderedWidgetInputNames,
+  isWidgetInputSpec,
   reconcileUnknownWidgetNames,
   collectAllGraphs,
   reapplyDefsToLiveNodes,
 } from "../../web/js/lib/asset-staleness.js";
+
+/** The REAL LTXICLoRALoaderModelOnly schema: a `model` CONNECTION input plus two
+ *  WIDGET inputs. Connection inputs must not be counted as widgets (finding #3). */
+const LTX_ICLORA_DEF = {
+  input: {
+    required: {
+      model: ["MODEL"],
+      lora_name: [["lora_a.safetensors", "lora_b.safetensors"]],
+      strength_model: ["FLOAT", { default: 1.0 }],
+    },
+  },
+};
 
 /** Minimal fake graph: id → node keyed as a STRING (so numeric AND string/UUID
  *  ids both resolve), exposes _nodes + getNodeById + optional per-node subgraph. */
@@ -150,7 +163,9 @@ test("collectAllGraphs walks nested subgraphs", () => {
 
 test("reapplyDefsToLiveNodes repairs an ALREADY-LOADED node using fresh defs (finding #3)", () => {
   // Existing instance: stale/generic constructor (nodeData absent), widgets came
-  // in as positional UNKNOWN placeholders. The fresh def must repair it in place.
+  // in as positional UNKNOWN placeholders. The fresh def (which INCLUDES the
+  // `model` CONNECTION input, as the real schema does) must repair it in place —
+  // counting only the two WIDGET inputs, not the connection input.
   const node = {
     id: 7,
     type: "LTXICLoRALoaderModelOnly",
@@ -160,9 +175,7 @@ test("reapplyDefsToLiveNodes repairs an ALREADY-LOADED node using fresh defs (fi
     ],
     constructor: {}, // generic fallback — no nodeData
   };
-  const defs = {
-    LTXICLoRALoaderModelOnly: { input: { required: { lora_name: {}, strength_model: {} } } },
-  };
+  const defs = { LTXICLoRALoaderModelOnly: LTX_ICLORA_DEF };
   const repaired = reapplyDefsToLiveNodes(graphOf([node]), defs);
   assert.equal(repaired, 1);
   assert.deepEqual(node.widgets.map((w) => w.name), ["lora_name", "strength_model"]);
@@ -177,21 +190,38 @@ test("reapplyDefsToLiveNodes stamps fresh nodeData onto a type-specific construc
   assert.equal(node.constructor.nodeData, newDef);
 });
 
-test("orderedWidgetInputNames concatenates required then optional, honoring input_order", () => {
-  const nodeData = {
-    input: { required: { a: {}, b: {} }, optional: { c: {} } },
-    input_order: { required: ["b", "a"], optional: ["c"] },
-  };
-  assert.deepEqual(orderedWidgetInputNames(nodeData), ["b", "a", "c"]);
+test("isWidgetInputSpec: combos + primitive widget types are widgets; connections + forced inputs are not", () => {
+  assert.equal(isWidgetInputSpec([["a", "b"]]), true); // combo
+  assert.equal(isWidgetInputSpec(["FLOAT", { default: 1 }]), true);
+  assert.equal(isWidgetInputSpec(["INT"]), true);
+  assert.equal(isWidgetInputSpec(["MODEL"]), false); // connection
+  assert.equal(isWidgetInputSpec(["CLIP"]), false);
+  assert.equal(isWidgetInputSpec(["STRING", { forceInput: true }]), false);
+  assert.equal(isWidgetInputSpec(["INT", { widget: false }]), false);
 });
 
-test("reconcileUnknownWidgetNames renames placeholders when count matches (#199)", () => {
+test("orderedWidgetInputNames EXCLUDES connection inputs, honoring input_order (finding #3)", () => {
+  // The real LTX schema: `model` connection must be dropped; only the 2 widgets
+  // remain, in declaration order.
+  assert.deepEqual(orderedWidgetInputNames(LTX_ICLORA_DEF), ["lora_name", "strength_model"]);
+  const withOrder = {
+    input: {
+      required: { model: ["MODEL"], seed: ["INT"], name: ["STRING"] },
+    },
+    input_order: { required: ["model", "name", "seed"] },
+  };
+  assert.deepEqual(orderedWidgetInputNames(withOrder), ["name", "seed"]);
+});
+
+test("reconcileUnknownWidgetNames renames placeholders against the REAL schema with a connection input (#199 / finding #3)", () => {
+  // 2 UNKNOWN widgets vs a def with 3 inputs (1 connection + 2 widgets). Counting
+  // only widget inputs makes this the unambiguous 2==2 case and repairs it.
   const node = {
     widgets: [
       { name: "UNKNOWN", value: "x.safetensors" },
       { name: "UNKNOWN_1", value: 1.0 },
     ],
-    constructor: { nodeData: { input: { required: { lora_name: {}, strength_model: {} } } } },
+    constructor: { nodeData: LTX_ICLORA_DEF },
   };
   assert.equal(reconcileUnknownWidgetNames(node), true);
   assert.deepEqual(node.widgets.map((w) => w.name), ["lora_name", "strength_model"]);

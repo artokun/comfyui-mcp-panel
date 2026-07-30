@@ -109,26 +109,51 @@ export function isStaleAssetCandidate(rootGraph, candidate, { trustCombo = false
   return false;
 }
 
+// Input types that ComfyUI renders as a WIDGET rather than a connection socket.
+// A combo (the type spec is an array of option values) is also a widget.
+const WIDGET_INPUT_TYPES = new Set(["INT", "FLOAT", "STRING", "BOOLEAN", "COMBO"]);
+
 /**
- * Ordered widget-input names for a node definition (`node.constructor.nodeData`):
- * required inputs then optional, honoring `input_order` when present.
+ * True when an object_info input SPEC (`[type, config?]`) is rendered as a widget
+ * — i.e. it maps to a positional entry in the node's `widgets` array. Connection
+ * inputs (MODEL, CLIP, LATENT, IMAGE, …) and any input forced to a socket
+ * (`config.forceInput` / `config.widget === false`) are NOT widgets and must be
+ * excluded when counting/ordering widgets (codex WS-3 round-2 finding #3).
+ */
+export function isWidgetInputSpec(spec) {
+  const arr = Array.isArray(spec) ? spec : [spec];
+  const type = arr[0];
+  const config = arr[1];
+  if (config && typeof config === "object") {
+    if (config.forceInput) return false;
+    if (config.widget === false) return false;
+  }
+  if (Array.isArray(type)) return true; // combo: option list as the type
+  return WIDGET_INPUT_TYPES.has(String(type ?? "").toUpperCase());
+}
+
+/**
+ * Ordered WIDGET-input names for a node definition (`node.constructor.nodeData`):
+ * required inputs then optional, honoring `input_order` when present, and
+ * EXCLUDING connection-only inputs so the count lines up with the node's
+ * positional `widgets` array. LTXICLoRALoaderModelOnly = connection `model` +
+ * widgets `lora_name`,`strength_model` → ["lora_name","strength_model"].
  */
 export function orderedWidgetInputNames(nodeData) {
   const input = nodeData?.input;
   if (!input) return [];
-  const req =
-    input.required && typeof input.required === "object"
-      ? Object.keys(input.required)
-      : [];
-  const opt =
-    input.optional && typeof input.optional === "object"
-      ? Object.keys(input.optional)
-      : [];
+  const req = input.required && typeof input.required === "object" ? input.required : {};
+  const opt = input.optional && typeof input.optional === "object" ? input.optional : {};
   const order = nodeData?.input_order;
-  if (order && (Array.isArray(order.required) || Array.isArray(order.optional))) {
-    return [...(order.required ?? req), ...(order.optional ?? opt)];
-  }
-  return [...req, ...opt];
+  const reqNames =
+    order && Array.isArray(order.required) ? order.required : Object.keys(req);
+  const optNames =
+    order && Array.isArray(order.optional) ? order.optional : Object.keys(opt);
+  const ordered = [...reqNames, ...optNames];
+  return ordered.filter((name) => {
+    const spec = name in req ? req[name] : name in opt ? opt[name] : undefined;
+    return spec !== undefined && isWidgetInputSpec(spec);
+  });
 }
 
 /**
