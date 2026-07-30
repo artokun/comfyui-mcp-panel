@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.16] - 2026-07-30
+
+### Fixed
+- **Group tools report live, accurate membership instead of a stale/empty snapshot (#311, #312, #287, #297, #305).** LiteGraph group membership is purely geometric (a node belongs to a group when its bounds overlap the group's bounds) and has no per-node ownership, but the panel trusted the stale `group._nodes` cache — so members read empty after grouping pasted nodes (#312), went stale after moving nodes in/out or resizing (#287, #311, #305), and `create_group(node_ids)` could silently enclose unrelated neighbors in dense layouts (#297). A new `groupMemberNodes()` recomputes membership from live geometry on every read (edge-inclusive overlap mirroring LiteGraph's `overlapBounding`), routed through all read sites plus `graph_move_group` and auto-layout. `graph_create_group` builds a bounding box tight to exactly the requested nodes and reports honestly — `requested_node_ids` / `extra_node_ids` / `missing_node_ids` with a warning whenever geometry differs from the request, instead of silently mis-reporting. Live-verified on the rig: create-around-two-nodes returns exactly those two (third excluded); moving the third node into the group region re-reports it as a member. (#320)
+
 ## [0.11.15] - 2026-07-30
 
 ### Fixed
