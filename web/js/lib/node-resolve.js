@@ -63,7 +63,7 @@ export function assertAddNodeResolvable(registry, class_type) {
     );
   }
   throw new Error(
-    `Unknown node type "${class_type}" — check the exact class_type via panel_get_graph or panel_search_nodes`,
+    `Unknown node type "${class_type}" — check the exact class_type via panel_search_nodes`,
   );
 }
 

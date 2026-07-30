@@ -116,6 +116,19 @@ test("add_node: unknown type on a REACHABLE server ⇒ ERRORS with unknown-type"
   });
 });
 
+test("add_node: unknown-type error points at a LIVE tool, not the retired panel_get_graph (#318)", () => {
+  const reg = loadedRegistry();
+  try {
+    assertAddNodeResolvable(reg, "DefinitelyNotARealNode");
+    throw new Error("expected a throw");
+  } catch (e) {
+    // The retired panel_get_graph must never be recommended.
+    assert.doesNotMatch(e.message, /panel_get_graph/);
+    // Should steer the caller to the registry-search tool instead.
+    assert.match(e.message, /panel_search_nodes/);
+  }
+});
+
 test("add_node: REAL type on a reachable server ⇒ resolves (no false negative)", () => {
   const reg = loadedRegistry(["KSamplerAdvanced"]);
   assert.doesNotThrow(() => assertAddNodeResolvable(reg, "CheckpointLoaderSimple"));

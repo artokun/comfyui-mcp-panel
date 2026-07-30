@@ -438,7 +438,7 @@ export function managerUnavailableResult(query, err) {
       "be reached on this ComfyUI (it may be disabled, or a legacy/partial Manager " +
       "build without the search endpoint). Enable the built-in Manager to search the " +
       "registry, or continue with the nodes already installed — inspect them with " +
-      "panel_list_nodes and the current graph with panel_get_graph.",
+      "panel_list_nodes and the current graph with panel_query_graph.",
   };
 }
 
