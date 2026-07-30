@@ -116,6 +116,31 @@ export function findNodeByScopedId(rootGraph, scopedId) {
 }
 
 /**
+ * True when `scopedId` is a RECOGNIZED locator shape — exactly the shapes
+ * `findNodeByScopedId` knows how to resolve:
+ *   - a single non-empty segment (plain local id / UUID-like);
+ *   - an all-numeric first segment with 2+ segments (legacy group-node exec id);
+ *   - EXACTLY "<subgraphUUID>:<localNodeId>" (well-formed UUID first, non-empty
+ *     local id).
+ * Any other shape (extra segments, empty segment, malformed UUID) is UNrecognized.
+ *
+ * This lets callers distinguish "the locator is understood but the node is not in
+ * the active graph" (⇒ the candidate belongs to another workflow tab / was
+ * removed ⇒ safe to drop for the active workflow — #316) from "the locator itself
+ * is ambiguous" (⇒ must fail OPEN and keep reporting). Kept in lockstep with
+ * `findNodeByScopedId`'s parse so the two never disagree.
+ */
+export function locatorIsRecognized(scopedId) {
+  const raw = String(scopedId ?? "");
+  if (!raw) return false;
+  const parts = raw.split(":");
+  if (parts.length === 1) return true;
+  const first = parts[0];
+  if (/^\d+$/.test(first)) return parts.every((p) => p !== "");
+  return parts.length === 2 && UUID_RE.test(first) && parts[1] !== "";
+}
+
+/**
  * Keep a candidate only if some widget on the node STILL literally holds that
  * filename. Fails OPEN (returns true / "still referenced") on any unexpected
  * shape, so the worst case is over-reporting and a real miss is never swallowed.
@@ -166,11 +191,33 @@ export function assetCandidateResolvesLive(rootGraph, nodeId, file, widgetName) 
  * SUPPRESS a genuine `isMissing:true` candidate, which we must never do. Without
  * a confirmed refresh we fall back to over-reporting via the still-referenced
  * check alone.
+ *
+ * `scopeToActiveGraph` (default true) additionally drops a candidate whose
+ * RECOGNIZED locator resolves to NO node in `rootGraph` — the missing-asset Pinia
+ * stores are not cleared when the user switches workflow tabs, so a candidate from
+ * a previously-open tab (or a since-deleted node) otherwise leaks into the active
+ * workflow's errors (#316). This is guarded by `locatorIsRecognized`: an ambiguous
+ * / unparseable locator is NEVER dropped this way and still fails OPEN via the
+ * still-referenced check, so a genuine miss is never swallowed.
  */
-export function isStaleAssetCandidate(rootGraph, candidate, { trustCombo = false } = {}) {
+export function isStaleAssetCandidate(
+  rootGraph,
+  candidate,
+  { trustCombo = false, scopeToActiveGraph = true } = {},
+) {
   const nodeId = candidate?.nodeId;
   const file = candidate?.name;
   const widgetName = candidate?.widgetName;
+  // Cross-tab / removed-node scope check: a recognized locator that finds no node
+  // in the active graph cannot be a red node in the active workflow → drop it.
+  if (
+    scopeToActiveGraph &&
+    nodeId != null &&
+    locatorIsRecognized(nodeId) &&
+    findNodeByScopedId(rootGraph, nodeId) == null
+  ) {
+    return true;
+  }
   if (!assetCandidateStillReferenced(rootGraph, nodeId, file)) return true;
   if (trustCombo && assetCandidateResolvesLive(rootGraph, nodeId, file, widgetName)) return true;
   return false;
