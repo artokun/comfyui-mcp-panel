@@ -24,6 +24,13 @@ All notable changes to this project are documented here. This project adheres to
   target pack failed instead of reporting a queued success — the rgthree-comfy
   case where the queue drained "done" but the pack never hit disk. The queued
   note also tells the agent to VERIFY with `panel_list_nodes`.
+- **git-URL installs send valid per-dialect payloads.** A full git URL was
+  being placed in `id`, which resolves to nothing on v4 (queue silently marks
+  "done") and fails late on 3.x (past the immediate `failed` array). Now the
+  repo NAME is derived from the URL: v4 installs by `{id: repoName,
+  selected_version: ref||"nightly", channel: "dev"}` (no `files`); v2-batch and
+  legacy install the URL natively via `{id: repoName, version: "unknown",
+  files: [url]}`. Registry-id installs are unchanged.
 - **Pre-empt the coming comfy-cli hard error.** Publishing already warns that
   "we will soon disable exec and eval, and multiple statements in a single
   line"; when that lands it breaks `Publish to Comfy Registry`, i.e. we'd find

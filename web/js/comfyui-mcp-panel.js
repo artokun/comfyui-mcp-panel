@@ -2581,15 +2581,61 @@ function assertBatchOk(res, id, op) {
   }
 }
 
-/** Build the 3.x-shape install body used by the legacy + v2-batch dialects. */
-function legacyInstallBody({ id, version, repository, channel, mode, selected_version }, ui_id) {
-  const sel = selected_version || version || (repository ? "nightly" : "latest");
+/** Does this identifier look like a git URL (vs a registry id)? Mirrors the mcp
+ *  orchestrator's looksLikeGitUrl. */
+function looksLikeGitUrl(s) {
+  return typeof s === "string" && (/^(https?:\/\/|git@|git\+)/i.test(s) || s.endsWith(".git"));
+}
+
+/** Derive the repo/pack NAME from a git URL — the Manager keys installs off this,
+ *  NOT a full URL. Mirrors gitCheckoutDir: strip query/hash/trailing slash, take
+ *  the basename, drop a trailing ".git". */
+function gitRepoName(url) {
+  const pathPart = url.includes(":") && !url.includes("://")
+    ? url.slice(url.lastIndexOf(":") + 1) // scp-style git@host:owner/repo
+    : url;
+  const clean = pathPart.replace(/[?#].*$/, "").replace(/\/+$/, "");
+  const base = clean.slice(clean.lastIndexOf("/") + 1);
+  return base.replace(/\.git$/i, "");
+}
+
+/**
+ * Resolve the git URL for an install request, if any. The caller may pass the
+ * URL as `repository` OR directly as `id`; either counts.
+ */
+function installGitUrl({ id, repository }) {
+  if (repository && looksLikeGitUrl(repository)) return repository;
+  if (id && looksLikeGitUrl(id)) return id;
+  return null;
+}
+
+/**
+ * Build the 3.x-shape install body used by the legacy + v2-batch dialects.
+ * A REAL git URL installs natively via { version:'unknown', files:[url] }
+ * (the 3.x semantics — the pip legacy-UI /v2 batch runs the same handlers);
+ * a registry id keeps the versioned body. `id` is always the repo NAME, never
+ * a full URL (a full URL is accepted into the batch but fails LATER while
+ * resolving — a failure NOT in the immediate `failed` array).
+ */
+function manager3xInstallBody({ id, version, repository, channel, mode, selected_version }, ui_id) {
+  const gitUrl = installGitUrl({ id, repository });
+  if (gitUrl) {
+    return {
+      ui_id,
+      id: gitRepoName(gitUrl),
+      version: "unknown",
+      selected_version: "unknown",
+      files: [gitUrl],
+      channel: channel || "default",
+      mode: mode || "cache",
+    };
+  }
+  const sel = selected_version || version || "latest";
   return {
     ui_id,
-    id: id ?? repository,
+    id,
     version: version ?? sel,
     selected_version: sel,
-    ...(repository ? { repository } : {}),
     channel: channel || "default",
     mode: mode || "cache",
   };
@@ -6771,16 +6817,34 @@ const GRAPH_TOOL_EXECUTORS = {
       "Install queued. Poll nodes_queue_status, then VERIFY with panel_list_nodes " +
       "(the pack must appear on disk); a ComfyUI restart (comfy_reboot) is usually " +
       "required to load new nodes.";
+    const gitUrl = installGitUrl({ id, repository });
     if (dialect === "v2") {
-      const sel = selected_version || version || (repository ? "nightly" : "latest");
-      const params = {
-        id: id ?? repository,
-        version: version || (sel === "nightly" ? "nightly" : "latest"),
-        selected_version: sel,
-        ...(repository ? { repository } : {}),
-        mode: mode || "remote",
-        channel: channel || "default",
-      };
+      let params;
+      if (gitUrl) {
+        // Manager v4 resolves an install by the pack's REPO NAME / CNR id, NOT a
+        // full git URL (do_install splits `${id}@${selected_version}` and looks
+        // it up — a full URL matches nothing and the queue silently marks the
+        // task "done"). Mirror the frontend UI: id = repo name, selected_version
+        // = ref or "nightly" (git-HEAD channel for unclaimed packs), channel
+        // "dev", mode "cache". No `repository`/`files` for v4.
+        const selected = selected_version || version || "nightly";
+        params = {
+          id: gitRepoName(gitUrl),
+          version: selected,
+          selected_version: selected,
+          channel: channel || "dev",
+          mode: mode || "cache",
+        };
+      } else {
+        const sel = selected_version || version || "latest";
+        params = {
+          id,
+          version: version || sel,
+          selected_version: sel,
+          mode: mode || "remote",
+          channel: channel || "default",
+        };
+      }
       await managerV2("manager/queue/task", {
         method: "POST",
         body: { kind: "install", params, ui_id, client_id },
@@ -6789,9 +6853,10 @@ const GRAPH_TOOL_EXECUTORS = {
       return { queued: true, ui_id, id: params.id, dialect, note };
     }
     // v2-batch + legacy: 3.x body shapes (issues #187/#182/#184 — the unified
-    // /v2 task route 405s on both). Surface a batch `failed` instead of
-    // silently claiming success (the rgthree #184 no-op).
-    const body = legacyInstallBody({ id, version, repository, channel, mode, selected_version }, ui_id);
+    // /v2 task route 405s on both). A git URL installs natively via
+    // {version:'unknown', files:[url]}; id is always the repo NAME. Surface a
+    // batch `failed` instead of silently claiming success (the rgthree #184 no-op).
+    const body = manager3xInstallBody({ id, version, repository, channel, mode, selected_version }, ui_id);
     if (dialect === "v2-batch") {
       const res = await managerV2("manager/queue/batch", {
         method: "POST",
