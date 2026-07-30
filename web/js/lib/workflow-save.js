@@ -98,18 +98,57 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName } = {}) {
   const isSaveAs = !!desired && desiredPath !== currentPath;
 
   if (isSaveAs) {
-    // Copy path. saveWorkflowAs handles BOTH cases correctly: for a persisted
-    // workflow it copies (workflowStore.saveAs → new file, original untouched);
-    // for a temporary it renames the never-saved tab to a real file. We pass
-    // `filename` so it skips the Save dialog.
+    // The invariant (issue #226): a Save-As must NEVER remove a file that exists
+    // on disk. We classify the source by its ACTUAL persisted state — whether a
+    // file currently backs it — NOT the in-memory `wasUnsaved`/`isTemporary`
+    // flag, which drifts. On ComfyUI 1.45.21 `isTemporary` is derived from
+    // `size` (`get isTemporary(){return this.size===-1}`), so after a
+    // panel_open_workflow ack-timeout race (#215) a workflow that IS on disk can
+    // be left flagged temporary. That matters because the frontend's own
+    // `saveWorkflowAs` branches on `isTemporary`: a temporary doc is MOVED
+    // (renameWorkflow) instead of copied — which is exactly how the original
+    // file gets destroyed. The prior fix (#231) trusted saveWorkflowAs to copy
+    // and never verified the source survived.
+    const sourcePath = wf.path;
+    const sourcePersisted = isPersistedOnDisk(svc, wf, sourcePath);
+
     if (typeof svc.saveWorkflowAs === "function") {
+      // PREVENT the destructive move. If the source is a real on-disk file yet
+      // the active doc claims to be temporary, delegating to saveWorkflowAs would
+      // take its renameWorkflow (move) branch and destroy the original. Refuse
+      // rather than move — the sanctioned safe outcome (#226). This fires ONLY in
+      // the inconsistent drift state; a correctly-opened persisted workflow has
+      // isTemporary === false and copies normally below.
+      if (sourcePersisted && wf.isTemporary === true) {
+        throw new Error(
+          `refusing to save-as: the active workflow is flagged unsaved but "${sourcePath}" ` +
+            `exists on disk — saving now would MOVE (destroy) the original (issue #226). ` +
+            `Re-open the workflow and try again.`,
+        );
+      }
+      // Copy path. For a persisted workflow saveWorkflowAs copies
+      // (workflowStore.saveAs → new file, original untouched); for a genuine
+      // temporary it renames the never-saved tab to a real file. `filename`
+      // skips the Save dialog.
       await svc.saveWorkflowAs(wf, { filename: desired });
+      // BACKSTOP: if saveWorkflowAs relocated a persisted source anyway, fail
+      // LOUDLY instead of reporting a phantom success (the prior fix's exact
+      // miss). Only assert when we have a reliable existence oracle — otherwise
+      // we can't tell a copy from a move and must not false-alarm.
+      if (sourcePersisted && hasExistenceOracle(svc) && !pathExists(svc, sourcePath)) {
+        throw new Error(
+          `save-as moved the original workflow "${sourcePath}" instead of copying it — ` +
+            `the source no longer exists on disk (issue #226)`,
+        );
+      }
       // saveWorkflowAs makes the new copy the active workflow.
       return baseName(svc.activeWorkflow?.filename) || desired;
     }
     // Fallback only for a workflow that was NEVER persisted: renaming an
-    // in-memory temporary tab is safe (no source file to destroy).
-    if (wasUnsaved && typeof svc.renameWorkflow === "function") {
+    // in-memory temporary tab is safe (no source file to destroy). Guard on the
+    // ACTUAL persisted state — a persisted source must never be renamed even if
+    // the in-memory `wasUnsaved` flag (wrongly) says it was never saved (#226).
+    if (!sourcePersisted && wasUnsaved && typeof svc.renameWorkflow === "function") {
       await svc.renameWorkflow(wf, targetPath(wf, desired));
       await saveInPlace(svc, wf);
       return desired;
@@ -124,6 +163,46 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName } = {}) {
   // Save in place — overwrite the same file under the current name.
   await saveInPlace(svc, wf);
   return desired || currentName || null;
+}
+
+/** Does `svc` expose any way to check whether a file exists on disk? Without one
+ *  we cannot distinguish a Save-As copy from a destructive move, so the caller
+ *  must not raise a data-loss alarm (avoids false positives on minimal doubles /
+ *  older frontends). */
+function hasExistenceOracle(svc) {
+  return (
+    typeof svc?.getWorkflowByPath === "function" ||
+    Array.isArray(svc?.workflows) ||
+    Array.isArray(svc?.openWorkflows)
+  );
+}
+
+/** True when a workflow currently exists at `rawPath` according to whatever the
+ *  frontend can tell us — the store's path index first, then the known-workflow
+ *  lists. Paths are compared normalized so a "\\" vs "/" difference never reads
+ *  as a vanished file. */
+function pathExists(svc, rawPath) {
+  if (!rawPath) return false;
+  if (typeof svc?.getWorkflowByPath === "function") {
+    try {
+      if (svc.getWorkflowByPath(rawPath)) return true;
+    } catch {
+      /* fall through to the list scan */
+    }
+  }
+  const norm = normalizePath(rawPath);
+  const all = [...(svc?.workflows ?? []), ...(svc?.openWorkflows ?? [])];
+  return all.some((w) => w && normalizePath(w.path) === norm);
+}
+
+/** ACTUAL persisted state of the source: is it a real file on disk, independent
+ *  of the volatile in-memory `isTemporary`/`isPersisted` flags (which drift after
+ *  an open-ack race, #215)? `wf.isPersisted === true` is a positive signal; we
+ *  also treat a path the store still knows about as persisted. Used to decide
+ *  whether a Save-As is allowed to fall back to a move (issue #226). */
+function isPersistedOnDisk(svc, wf, rawPath) {
+  if (wf?.isPersisted === true) return true;
+  return pathExists(svc, rawPath);
 }
 
 /** Directory prefix (with trailing slash) that a new sibling file should live in,

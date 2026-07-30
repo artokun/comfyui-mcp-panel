@@ -229,6 +229,124 @@ test('app-mode Save-As to the base name COPIES, never renames the source (#226)'
   )
 })
 
+// A service double whose saveWorkflowAs mirrors ComfyUI 1.45.21 FAITHFULLY: it
+// COPIES a persisted source but MOVES (renameWorkflow) a source it considers
+// TEMPORARY — the exact branch that destroys the original (#226). It also
+// exposes getWorkflowByPath backed by `disk`, so the panel's disk-existence
+// guard has a real oracle.
+function makeFaithfulService({ files = [], active } = {}) {
+  const disk = new Set(files)
+  const calls = []
+  const svc = {
+    activeWorkflow: active,
+    calls,
+    disk,
+    getWorkflowByPath(path) {
+      return disk.has(path) ? { path, isPersisted: true } : undefined
+    },
+    async renameWorkflow(wf, newPath) {
+      calls.push(['renameWorkflow', wf.path, newPath])
+      disk.delete(wf.path) // MOVE: consumes the source path
+      wf.path = newPath
+      wf.filename = newPath.split('/').pop()
+      disk.add(newPath)
+    },
+    async saveWorkflow(wf) {
+      calls.push(['saveWorkflow', wf.path])
+      disk.add(wf.path)
+    },
+    async saveWorkflowAs(wf, { filename }) {
+      calls.push(['saveWorkflowAs', wf.path, filename, !!wf.isTemporary])
+      const dir = wf.directory || 'workflows'
+      const newPath = `${dir}/${stripExt(filename)}${extFor(wf)}`
+      if (wf.isTemporary) {
+        // Frontend's TEMPORARY branch: renameWorkflow(e, a) — MOVES the source.
+        await svc.renameWorkflow(wf, newPath)
+        svc.activeWorkflow = wf
+      } else {
+        // PERSISTED branch: copy, original untouched.
+        disk.add(newPath)
+        svc.activeWorkflow = {
+          path: newPath,
+          filename: newPath.split('/').pop(),
+          directory: dir,
+          initialMode: wf.initialMode,
+          isPersisted: true,
+          isTemporary: false
+        }
+      }
+    }
+  }
+  return svc
+}
+
+test('refuses save-as when an on-disk source is mis-flagged temporary — never moves it (#226)', async () => {
+  // The reproduced drift: panel_open_workflow left a PERSISTED workflow flagged
+  // temporary (isTemporary === true), but its file is on disk. Delegating to the
+  // frontend saveWorkflowAs here would MOVE (destroy) the original.
+  const active = {
+    path: 'workflows/zz226b-orig.json',
+    filename: 'zz226b-orig.json',
+    directory: 'workflows',
+    isPersisted: false, // drifted flag
+    isTemporary: true // drifted flag (frontend: size === -1)
+  }
+  const svc = makeFaithfulService({ files: [active.path], active })
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'zz226b-copy', {}),
+    /would MOVE \(destroy\) the original/
+  )
+  // Original stands, nothing was moved, saveWorkflowAs was never even invoked.
+  assert.ok(svc.disk.has('workflows/zz226b-orig.json'), 'original preserved')
+  assert.ok(!svc.disk.has('workflows/zz226b-copy.json'), 'no rogue copy')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
+  assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflowAs'), 'never delegated a move')
+})
+
+test('a correctly-flagged persisted workflow still COPIES via the faithful frontend (#226)', async () => {
+  const active = {
+    path: 'workflows/zz226b-orig.json',
+    filename: 'zz226b-orig.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeFaithfulService({ files: [active.path], active })
+
+  const saved = await saveActiveWorkflow(svc, 'zz226b-copy', {})
+
+  assert.ok(svc.disk.has('workflows/zz226b-orig.json'), 'original preserved')
+  assert.ok(svc.disk.has('workflows/zz226b-copy.json'), 'copy created')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
+  assert.equal(saved, 'zz226b-copy')
+})
+
+test('disk-existence backstop catches a saveWorkflowAs that moves a persisted source (#226)', async () => {
+  // Rogue frontend: even a NON-temporary persisted source gets moved by
+  // saveWorkflowAs. The pre-check can't foresee this, so the post-op
+  // disk-existence guard must catch it and throw rather than report success.
+  const active = {
+    path: 'workflows/zz226b-orig.json',
+    filename: 'zz226b-orig.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeFaithfulService({ files: [active.path], active })
+  // Force the move branch regardless of flags.
+  const origSaveAs = svc.saveWorkflowAs
+  svc.saveWorkflowAs = async (wf, opts) => {
+    wf.isTemporary = true
+    return origSaveAs(wf, opts)
+  }
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'zz226b-copy', {}),
+    /moved the original workflow .* instead of copying it/
+  )
+})
+
 test('refuses to rename-destroy a persisted workflow when no copy API exists', async () => {
   const active = {
     path: 'workflows/Foo.json',
