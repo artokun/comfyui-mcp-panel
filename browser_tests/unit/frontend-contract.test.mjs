@@ -146,9 +146,11 @@ function collectServiceMembers() {
   // Bind ONLY when the RHS is the workflow service itself — i.e. `…workflow` is
   // the tail of the expression, not `…workflow?.activeWorkflow` (which is a
   // workflow DOCUMENT, not the service). The negative lookahead excludes a
-  // further `.`/`?.` member access after `workflow`.
+  // further `.`/`?.` member access after `workflow`. Matches BOTH a declaration
+  // (`const s = …`) and a bare assignment to a pre-declared variable (`s = …`),
+  // so `let s; s = app.extensionManager.workflow; s.foo()` cannot bypass it.
   const aliasRe =
-    /\b(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*[\w.?]*extensionManager\??\.workflow(?!\s*\??\.)/g
+    /(?:\b(?:const|let|var)\s+)?([a-zA-Z_$][\w$]*)\s*=\s*[\w.?]*extensionManager\??\.workflow(?!\s*\??\.)/g
   while ((a = aliasRe.exec(panelRaw))) {
     const aliasName = a[1]
     const block = enclosingBlockAfter(panelRaw, aliasRe.lastIndex)
@@ -208,7 +210,26 @@ test('version-variable Save-As methods are only reached behind a typeof capabili
   const saveLib = stripComments(readFileSync(SAVE_LIB, 'utf8'))
   const panel = stripComments(readFileSync(PANEL, 'utf8'))
 
-  const count = (text, re) => (text.match(re) || []).length
+  // The `{ … }` regions gated by a `typeof svc?.<m> === "function"` guard: from
+  // each guard, the next `{` (the if-body / block open) brace-matched to its `}`.
+  const guardedRegions = (text, m) => {
+    const regions = []
+    const g = new RegExp(`typeof\\s+svc\\??\\.${m}\\s*===?\\s*["']function["']`, 'g')
+    let hit
+    while ((hit = g.exec(text))) {
+      const open = text.indexOf('{', hit.index)
+      if (open === -1) continue
+      let depth = 0
+      for (let i = open; i < text.length; i++) {
+        if (text[i] === '{') depth++
+        else if (text[i] === '}' && --depth === 0) {
+          regions.push([open, i])
+          break
+        }
+      }
+    }
+    return regions
+  }
 
   for (const m of VERSION_VARIABLE_METHODS) {
     // The panel delegates all saving to the shared lib; it must never call a
@@ -219,21 +240,24 @@ test('version-variable Save-As methods are only reached behind a typeof capabili
       `comfyui-mcp-panel.js calls .${m}() directly — route it through the shared, ` +
         `capability-guarded save lib instead (unconditional use is the #268 bug)`
     )
-    // In the shared lib, EVERY call site must be backed by a typeof guard. Not
-    // "a guard exists somewhere" — the count of `svc.<m>(` invocations must not
-    // exceed the count of `typeof svc?.<m> === "function"` guards, so adding a
-    // second, unguarded call while leaving the original guard in place FAILS.
-    const calls = count(saveLib, new RegExp(`\\bsvc\\??\\.${m}\\s*\\(`, 'g'))
-    const guards = count(
-      saveLib,
-      new RegExp(`typeof\\s+svc\\??\\.${m}\\s*===?\\s*["']function["']`, 'g')
-    )
-    assert.ok(
-      calls <= guards,
-      `workflow-save.js has ${calls} call(s) to svc.${m}() but only ${guards} ` +
-        `"typeof svc?.${m} === 'function'" guard(s) — every call to a version-variable ` +
-        `frontend method must be capability-guarded or a frontend missing it throws (#268)`
-    )
+    // In the shared lib, EVERY call site must sit INSIDE a block controlled by a
+    // `typeof svc?.<m> === "function"` guard — not merely be outnumbered by
+    // guards. We locate each call and require it to fall within some guarded
+    // region, so an unconditional call (even alongside an unrelated typeof check)
+    // FAILS.
+    const regions = guardedRegions(saveLib, m)
+    const callRe = new RegExp(`\\bsvc\\??\\.${m}\\s*\\(`, 'g')
+    let call
+    while ((call = callRe.exec(saveLib))) {
+      const at = call.index
+      const guarded = regions.some(([o, c]) => at > o && at < c)
+      assert.ok(
+        guarded,
+        `workflow-save.js calls svc.${m}() at offset ${at} OUTSIDE any ` +
+          `"typeof svc?.${m} === 'function'" guarded block — a frontend missing ${m} ` +
+          `would throw instead of falling back (the #268 bug)`
+      )
+    }
   }
 })
 
@@ -288,21 +312,39 @@ function eachJsChunk(staticDir, visit) {
 // workflow service specifically. (It remains a static approximation — a minified
 // bundle exposes no literal `extensionManager.workflow.<m>` chain — which is why
 // the behavioural doubles below independently cover the runtime route logic.)
+//
+// IMPORTANT — accepted static limitation: a MINIFIED bundle exposes no literal
+// `extensionManager.workflow.<method>` chain (the store is a renamed local), so
+// no static check can PROVE a given method key belongs to the workflow store
+// object specifically. The fingerprint narrows the search to the chunk(s) that
+// define the store, and route viability requires the route's methods to be
+// CO-LOCATED in one such chunk — but a determined false pass (an unrelated class
+// in the same chunk also named `saveAs`) is not fully excluded. This is exactly
+// the case the task says to "document why and cover with a version-shaped
+// double": the behavioural tests in section 3 are the AUTHORITATIVE check of the
+// route-selection mechanism; this bundle check is the best-effort early tripwire.
 const FINGERPRINT = ['openWorkflow', 'getWorkflowByPath', 'renameWorkflow']
-const _serviceTextCache = new Map()
-function serviceChunkText(staticDir) {
-  if (_serviceTextCache.has(staticDir)) return _serviceTextCache.get(staticDir)
-  const parts = []
+const _serviceChunksCache = new Map()
+function serviceChunks(staticDir) {
+  if (_serviceChunksCache.has(staticDir)) return _serviceChunksCache.get(staticDir)
+  const chunks = []
   eachJsChunk(staticDir, (text) => {
-    if (FINGERPRINT.every((m) => memberKeyRe(m).test(text))) parts.push(text)
+    if (FINGERPRINT.every((m) => memberKeyRe(m).test(text))) chunks.push(text)
   })
-  const joined = parts.join('\n')
-  _serviceTextCache.set(staticDir, joined)
-  return joined
+  _serviceChunksCache.set(staticDir, chunks)
+  return chunks
 }
 
+// A member present in ANY workflow-store chunk.
 function serviceHas(staticDir, token) {
-  return memberKeyRe(token).test(serviceChunkText(staticDir))
+  return serviceChunks(staticDir).some((c) => memberKeyRe(token).test(c))
+}
+
+// A whole route present TOGETHER in a SINGLE workflow-store chunk (co-located —
+// so a route cannot be "assembled" from methods scattered across unrelated
+// chunks).
+function routeCoLocated(staticDir, route) {
+  return serviceChunks(staticDir).some((c) => route.every((m) => memberKeyRe(m).test(c)))
 }
 
 test('installed frontend bundle exposes every REQUIRED workflow-service method', (t) => {
@@ -314,7 +356,7 @@ test('installed frontend bundle exposes every REQUIRED workflow-service method',
   // The fingerprint must resolve to a real workflow-store chunk first — an empty
   // result means the workflow service itself is absent from this bundle.
   assert.ok(
-    serviceChunkText(staticDir).length > 0,
+    serviceChunks(staticDir).length > 0,
     `could not locate the workflow-service chunk in the bundle at ${staticDir} ` +
       `(no chunk carries all of ${FINGERPRINT.join(', ')}) — the frontend layout changed; ` +
       `update the fingerprint`
@@ -334,9 +376,7 @@ test('installed frontend bundle exposes at least one viable Save-As route', (t) 
     t.skip('comfyui_frontend_package static bundle not found (set COMFYUI_FRONTEND_STATIC)')
     return
   }
-  const viable = SAVE_AS_ROUTES.filter((route) =>
-    route.every((m) => serviceHas(staticDir, m))
-  )
+  const viable = SAVE_AS_ROUTES.filter((route) => routeCoLocated(staticDir, route))
   assert.ok(
     viable.length > 0,
     `NO viable Save-As route exists on the workflow-service chunk of the installed bundle. ` +
