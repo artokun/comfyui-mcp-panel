@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.13] - 2026-07-30
+
+### Fixed
+- **SEVERE: write tools no longer fabricate success when the target can't be resolved (#458).** `graph_add_node` and `graph_set_widget` could return a plausible success payload — a full node schema, a "set" result — even when ComfyUI was unreachable, the node type was unknown, or the resolved target was a stale/unregistered placeholder, silently misleading the agent into thinking a write landed. Both tools now fail closed: `add_node` runs `assertAddNodeResolvable` before `LG.createNode` (distinguishing unreachable / defs-not-loaded from a genuinely unknown type via Comfy core sentinel types), and `set_widget` runs a resolved-target registration guard (`assertResolvedTargetRegistered`) *before* any coercion, hook, mutation, or widget callback — refusing type-less nodes, unresolved `subgraph:{}` placeholders, and stale instances while still trusting native/defless types (Note/Reroute). Shared handler extracted to `lib/set-widget.js` so the unit tests drive the exact production path. Live-verified: an unknown node type errors instead of returning a fabricated schema; a real node (KSampler) still succeeds with its true schema. (#281)
+
 ## [0.11.12] - 2026-07-30
 
 ### Fixed
