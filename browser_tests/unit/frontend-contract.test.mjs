@@ -259,22 +259,34 @@ function bracedBlockAfter(text, fromIndex) {
 
 function guardRegionsFor(text, m) {
   const regions = []
-  // typeof guard: braced block it gates + the inline short-circuit tail.
+  // typeof guard. Only bless a region the guard ACTUALLY controls — never merely
+  // "the next `{` after a typeof somewhere", and never a `||` tail (which CALLS
+  // the method precisely when it is ABSENT).
   const typeofRe = new RegExp(`typeof\\s+[\\w.?$]*\\.${m}\\s*===?\\s*["']function["']`, 'g')
   let g
   while ((g = typeofRe.exec(text))) {
-    const block = bracedBlockAfter(text, typeofRe.lastIndex)
-    if (block) regions.push(block)
-    // Inline `typeof x.m === "function" && x.m()` (no brace): guard the rest of
-    // the statement, up to the next `;` or newline.
-    let end = text.length
-    for (let i = typeofRe.lastIndex; i < text.length; i++) {
-      if (text[i] === ';' || text[i] === '\n') {
-        end = i
-        break
-      }
+    const after = text.slice(typeofRe.lastIndex)
+    // (a) if-body: the typeof is the CLOSING (AND-)term of an `if (…)` whose body
+    //     opens immediately — only `)` + whitespace between the check and the `{`.
+    //     `if (!target && typeof s.m === "function") { … s.m() … }` matches; a
+    //     stray `typeof` elsewhere followed by an unrelated block does not.
+    if (/^\s*\)\s*\{/.test(after)) {
+      const block = bracedBlockAfter(text, typeofRe.lastIndex)
+      if (block) regions.push(block)
     }
-    regions.push([g.index, end])
+    // (b) inline short-circuit: `typeof x.m === "function" && x.m()`. Require `&&`
+    //     to the RIGHT so `typeof … === "function" || x.m()` (calls when ABSENT)
+    //     is NOT blessed. Guard the rest of the statement to the next `;`/newline.
+    if (/^\s*&&/.test(after)) {
+      let end = text.length
+      for (let i = typeofRe.lastIndex; i < text.length; i++) {
+        if (text[i] === ';' || text[i] === '\n') {
+          end = i
+          break
+        }
+      }
+      regions.push([g.index, end])
+    }
   }
   // try { … } catch blocks — a TypeError from an absent method is caught ONLY if
   // a `catch` follows. A `try { … } finally { … }` re-throws, so it does NOT
