@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.14] - 2026-07-30
+
+### Fixed
+- **`panel_search_nodes` degrades gracefully against an unreachable or legacy ComfyUI-Manager (#251, #255).** Node search called the dialect-routed `customnode/getmappings` and threw `ComfyUI-Manager not reachable` whenever the built-in Manager was disabled or was an older/partial 3.x build — blocking the whole install-discovery flow. It now retries the absolute (no-`/v2`) legacy route on an unreachable/404 signal, and returns a structured `{supported:false, managerReachable:false, results:[]}` result (pointing at `panel_list_nodes`) instead of a raw throw when both routes are unreachable. Genuine server errors (500/403) still propagate. Logic extracted to a dependency-injected `searchNodesVia` so the unit tests exercise the real decision path. (#294)
+
 ## [0.11.13] - 2026-07-30
 
 ### Fixed
