@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.15] - 2026-07-30
+
+### Fixed
+- **Chat context no longer reaches the agent as the literal `[object Object]` (#276).** The real culprit was not attachments (those already travel over structured image/text channels) but the `{workflow, subgraph}` **context object**, which `sendUserMessage` `Array.join`-coerced to `[object Object]` and the orchestrator prepended above every user message (a regression from the transcript-replay change). A new `serializeContext()` renders it to readable text (`Workflow: <name>` / `Viewing subgraph: <name>`, JSON fallback for unknown shapes, string passthrough for transcript replay). Outbound image descriptors are normalized at the wire choke-points and every other plausibly-object outbound/inject field is routed through `coerceMessageText`. Live-verified on the rig: the agent now receives `"Workflow: <name>"` instead of `[object Object]`. (#313)
+- **Hardened the ordinary-card replay path** so structured panel messages can never render as `[object Object]` (#272 was already handled on main for the say/agent/card-reply paths; this closes the remaining replay sink).
+
 ## [0.11.14] - 2026-07-30
 
 ### Fixed
