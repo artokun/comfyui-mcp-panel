@@ -37,6 +37,26 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Anti-regression for the #268 class: the panel must never depend on a
+      # ComfyUI frontend workflow-service method that the INSTALLED
+      # comfyui_frontend_package does not expose. frontend-contract.test.mjs
+      # derives the depended-on set from source and verifies it against a real
+      # installed bundle — but only if one is present, so we install it here and
+      # point the test at its static dir. Without this step the bundle
+      # assertions would silently skip and could not catch #268 in CI.
+      - name: Install comfyui_frontend_package (for the frontend-contract test)
+        shell: bash
+        run: |
+          python -m pip install --quiet comfyui_frontend_package
+          static="$(python -c 'import comfyui_frontend_package, os; print(os.path.join(os.path.dirname(comfyui_frontend_package.__file__), "static"))')"
+          echo "COMFYUI_FRONTEND_STATIC=$static" >> "$GITHUB_ENV"
+          echo "using installed frontend static bundle at: $static"
+
+      - name: Unit tests (Node --test, incl. frontend contract)
+        run: |
+          npm ci
+          npm run test:unit
+
       # __init__.py must compile and (by design) only register read-only routes
       # at import time. py_compile catches syntax breakage.
       - name: Python compile check (__init__.py)
