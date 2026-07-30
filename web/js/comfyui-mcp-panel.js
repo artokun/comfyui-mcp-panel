@@ -102,6 +102,13 @@ import {
 } from "./lib/asset-staleness.js";
 import { applyWidgetWrite, WidgetWriteError } from "./lib/widget-write.js";
 import { coerceMessageText, isDroppedAgentReplay } from "./lib/chat-serialize.js";
+import {
+  recordCopiedNodes,
+  getVerifiedSnapshot,
+  parseClipboardNodes,
+  diffCopiedVsPasted,
+  formatDroppedWarning,
+} from "./lib/paste-report.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
 import { saveActiveWorkflow } from "./lib/workflow-save.js";
 
@@ -6235,6 +6242,17 @@ const GRAPH_TOOL_EXECUTORS = {
       throw new Error("nothing selected to copy — pass node_ids or select nodes first");
     }
     canvas.copyToClipboard(selected);
+    // Snapshot the copied node types (plus a fingerprint of the raw clipboard
+    // AFTER the copy) so the next graph_paste_nodes can detect any node the
+    // target frontend silently drops on paste — and so a later native Ctrl+C
+    // that replaces the clipboard invalidates this snapshot (#261).
+    let fingerprint = null;
+    try {
+      fingerprint = window.localStorage?.getItem("litegrapheditor_clipboard") ?? null;
+    } catch {
+      /* localStorage unavailable — snapshot stays unverifiable, never trusted */
+    }
+    recordCopiedNodes(selected, fingerprint);
     return { copied: count };
   },
 
@@ -6242,7 +6260,7 @@ const GRAPH_TOOL_EXECUTORS = {
   // before/after so the freshly-pasted node ids can be returned. connect_inputs
   // false (default) drops a disconnected copy; pos places the paste anchor.
   graph_paste_nodes({ pos, connect_inputs } = {}) {
-    const { graph, canvas } = getGraphCtx();
+    const { graph, canvas, LG } = getGraphCtx();
     if (!canvas) throw new Error("canvas unavailable");
     if (typeof canvas.pasteFromClipboard !== "function") {
       throw new Error("pasteFromClipboard unavailable on this frontend");
@@ -6260,7 +6278,42 @@ const GRAPH_TOOL_EXECUTORS = {
     const pasted = (graph._nodes ?? [])
       .filter((n) => !before.has(n.id))
       .map((n) => summarizeNode(n));
-    return { pasted_count: pasted.length, pasted_node_ids: pasted.map((n) => n.id), pasted };
+    // Surface any node the frontend silently DROPPED on paste (an unregistered
+    // node type such as AudioCrop/AudioSeparation) instead of quietly reducing
+    // the count (#261). Diff the clipboard snapshot from the matching
+    // graph_copy_nodes against what actually landed, matched by node type.
+    // Expected-node source of truth: parse the ACTUAL litegraph clipboard, which
+    // reflects whatever paste just consumed (tool copy OR a native Ctrl+C), so it
+    // can't go stale. If the payload can't be parsed, fall back to the
+    // graph_copy_nodes snapshot — but ONLY when the raw clipboard is byte-
+    // identical to what it was at copy time (getVerifiedSnapshot), so a native
+    // Ctrl+C that replaced the clipboard can never resurrect a stale snapshot.
+    let rawClipboard = null;
+    try {
+      rawClipboard = window.localStorage?.getItem("litegrapheditor_clipboard") ?? null;
+    } catch {
+      /* localStorage unavailable */
+    }
+    let expected = parseClipboardNodes(rawClipboard);
+    if (!expected.length) expected = getVerifiedSnapshot(rawClipboard);
+    // A type is a genuine drop only if it isn't a registered node class on this
+    // frontend — this is the sole mechanism by which paste drops a node, and it
+    // also filters any residual snapshot-fallback staleness.
+    const registry = LG?.registered_node_types ?? {};
+    const isRegisteredType = (t) => Object.prototype.hasOwnProperty.call(registry, t);
+    const { dropped, dropped_count, dropped_types } = diffCopiedVsPasted(
+      expected,
+      pasted,
+      isRegisteredType,
+    );
+    const result = { pasted_count: pasted.length, pasted_node_ids: pasted.map((n) => n.id), pasted };
+    if (dropped_count > 0) {
+      result.dropped_count = dropped_count;
+      result.dropped_nodes = dropped;
+      result.dropped_types = dropped_types;
+      result.warning = formatDroppedWarning(dropped);
+    }
+    return result;
   },
 
   // ---- Subgraph blueprints (SAVE / LIST / ADD reusable subgraphs) -----------
