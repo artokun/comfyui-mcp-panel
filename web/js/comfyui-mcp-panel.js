@@ -119,6 +119,7 @@ import {
 } from "./lib/group-geometry.js";
 import { saveActiveWorkflow } from "./lib/workflow-save.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
+import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
 
 let app = null;
 let api = null;
@@ -14422,116 +14423,6 @@ function buildPanel() {
     }
   }
 
-  // VIDEO-VISION: a video output just landed and was painted as a <video> for the
-  // user — but the agent can't see video bytes. Sample frames → contact sheet PNG
-  // → upload to input/ → deliver THAT as an inline image (own executed event), and
-  // paint it as a card so the user sees it too. Fully non-blocking + best-effort:
-  // any failure just logs and leaves the video player as-is (no agent image).
-  async function deliverVideoStoryboard(m, nodeId, promptId, durationMs) {
-    // Same final-vs-preview distinction as still images: a VHS-style video node
-    // with `type:"output"` is the real SAVED file; `type:"temp"` (save_output off)
-    // is a throwaway preview. Be conservative — only explicit "output" is final.
-    const isFinalVideo = m && m.type === "output";
-    // Coerce descriptor fields once — a structured filename/subfolder/format must
-    // never reach the outbound agent note as "[object Object]" (#276).
-    const fileName = coerceMessageText(m?.filename) || "video";
-    const videoKind = isFinalVideo
-      ? `the FINAL saved video (file ${fileName} — reference THIS filename)`
-      : `a PREVIEW video (file ${fileName}, temporary — not a saved file; add/enable a save to persist it)`;
-    // ── Video metadata (gathered up front) ─────────────────────────────────
-    // path (subfolder-relative), real frame metadata when the VHS/video output
-    // payload carries it, render duration, and completion time. The duration is
-    // the run's authoritative start→finish span, passed in by the completion
-    // flush (execution_success), NOT measured at this node's `executed` time — so
-    // a video is never reported with a truncated or premature duration.
-    const subfolder = coerceMessageText(m?.subfolder);
-    const path = subfolder ? `${subfolder}/${fileName}` : fileName;
-    const duration = durationMs != null ? formatDuration(durationMs) : null;
-    const finishedClock = formatClock(new Date());
-    // Real per-video frame metadata, when present on the descriptor (VHS-style
-    // video/gif outputs may include frame_count / frame_rate / format). Omit if
-    // the payload doesn't carry it (it's not always populated).
-    const realFrames = m?.frame_count ?? m?.frameCount ?? m?.frames ?? null;
-    const realFps = m?.frame_rate ?? m?.frameRate ?? m?.fps ?? null;
-    const format = coerceMessageText(m?.format) || null;
-    // Compose the compact "· a · b · c" metadata suffix appended to a note.
-    // sizeStr (async HEAD) and storyboardN are optional/contextual.
-    const metaSuffix = (sizeStr, storyboardN) => {
-      const parts = [`path: ${path}`];
-      if (format) parts.push(format);
-      if (Number.isFinite(realFrames)) {
-        parts.push(
-          `${realFrames} frames` +
-            (Number.isFinite(realFps) ? ` @ ${realFps} fps` : ""),
-        );
-      } else if (storyboardN) {
-        parts.push(`${storyboardN}-frame storyboard`);
-      }
-      if (sizeStr) parts.push(sizeStr);
-      if (duration) parts.push(`rendered in ${duration}`);
-      if (finishedClock) parts.push(`finished ${finishedClock}`);
-      return parts.length ? `\n• ${fileName} — ${parts.join(" · ")}` : "";
-    };
-    // ALWAYS notify the agent a video rendered — with a storyboard if we can build
-    // one, else a note-only event (no images) so the agent still learns the render
-    // landed even when the preview is off or sampling/upload fails.
-    const noteOnly = (why) =>
-      client.sendFrame({
-        type: "agent_event",
-        kind: "executed",
-        note:
-          `🎬 A video rendered — ${videoKind}. You can't view it directly` +
-          (why ? ` — ${why}` : "") +
-          `; tell the user it's ready and ask how it looks if you need to judge it.` +
-          metaSuffix(null, null),
-        node_id: nodeId,
-        ...(promptId != null ? { prompt_id: promptId } : {}),
-      });
-    if (prefs.videoStoryboard === false) {
-      noteOnly("storyboard preview is turned off in panel settings");
-      return;
-    }
-    try {
-      const blob = await buildVideoStoryboard(imageViewUrl(m));
-      if (!blob) {
-        console.warn("[cmcp] storyboard: could not sample frames from", m.filename);
-        noteOnly("couldn't sample a storyboard from it");
-        return;
-      }
-      const base = (coerceMessageText(m.filename) || "video").replace(/\.[^.]+$/, "");
-      const ref = await uploadBlobToInput(blob, `storyboard_${base}.png`);
-      if (!ref) {
-        console.warn("[cmcp] storyboard: upload failed for", m.filename);
-        noteOnly("couldn't upload its storyboard");
-        return;
-      }
-      const n = storyboardFrameCount();
-      // Best-effort file size of the SOURCE video via HEAD (resilient — null on
-      // any failure, never blocks the storyboard delivery).
-      const sizeStr = humanizeBytes(await fetchImageBytes(imageViewUrl(m)));
-      // Show the user the contact sheet next to the <video> player.
-      paintImage(imageViewUrl(ref), `Storyboard · ${n} frames`);
-      // Deliver the storyboard to BOTH backends via the existing inline-vision
-      // path: the ImageRef rides in the executed event's `images`; the `note`
-      // tells the agent what it's looking at. Do NOT include the raw video ref.
-      client.sendFrame({
-        type: "agent_event",
-        kind: "executed",
-        images: [ref],
-        note:
-          `📽️ ${n}-frame storyboard (contact sheet) of ${videoKind} — ` +
-          `frames run top-left→bottom-right = start→end. ` +
-          `Review motion, sharpness, and temporal consistency.` +
-          metaSuffix(sizeStr, n),
-        node_id: nodeId,
-        ...(promptId != null ? { prompt_id: promptId } : {}),
-      });
-    } catch (err) {
-      console.warn("[cmcp] storyboard pipeline failed:", err);
-      noteOnly("its storyboard preview failed to build");
-    }
-  }
-
   // ── Per-run image batching ────────────────────────────────────────────────
   // ComfyUI fires `executed` once PER output node, so a multi-output run would
   // otherwise inject several fragmented image turns into the agent. We BUFFER
@@ -14553,162 +14444,35 @@ function buildPanel() {
   // batch + duration for a completed prompt and composes the single agent_event.
   const runCompletion = createRunCompletionTracker({
     onFlush: ({ promptId, images: flImages, videos: flVideos, durationMs }) => {
-      // A completed prompt delivers its FULL batch here, exactly once. Stills go
-      // out as one consolidated agent_event; each video (routed through the same
-      // authoritative lifecycle — not a per-node timer) gets its storyboard with
-      // the run's real start→finish duration. Fire-and-forget: these are async
-      // (metadata HEADs / frame sampling), but the batch is already captured — a
-      // failure inside must never wedge the lifecycle.
-      if (flImages && flImages.length) {
-        emitRunImages({ promptId, images: flImages, durationMs }).catch((err) =>
-          console.warn("[cmcp] emitRunImages failed:", err),
-        );
-      }
-      for (const v of flVideos || []) {
-        deliverVideoStoryboard(v.m, v.nodeId, promptId, durationMs);
-      }
+      // A completed prompt delivers its FULL batch here, exactly once. Compose
+      // ONE consolidated agent_event for the whole run — stills AND every video's
+      // storyboard folded into a single images+note+metadata turn — so a mixed /
+      // multi-video run resumes the agent with EXACTLY ONE completion frame, never
+      // a stills frame plus one frame per video (#269/#468). The composer awaits
+      // ALL storyboards for this prompt before its single send. Fire-and-forget:
+      // it's async (metadata HEADs / frame sampling), but the batch is already
+      // captured — a failure inside must never wedge the lifecycle.
+      composeRunCompletionFrame(
+        { promptId, images: flImages, videos: flVideos, durationMs },
+        {
+          sendFrame: (frame) => client.sendFrame(frame),
+          coerceMessageText,
+          formatDuration,
+          formatClock,
+          imageViewUrl,
+          fetchImageBytes,
+          fetchImageDimensions,
+          humanizeBytes,
+          buildVideoStoryboard,
+          uploadBlobToInput,
+          storyboardFrameCount,
+          paintImage,
+          videoStoryboardEnabled: prefs.videoStoryboard !== false,
+          warn: (...a) => console.warn(...a),
+        },
+      ).catch((err) => console.warn("[cmcp] composeRunCompletionFrame failed:", err));
     },
   });
-
-  async function emitRunImages({ promptId, images: bufImages, durationMs }) {
-    const duration = formatDuration(durationMs);
-    const finishedAt = new Date();
-    const finishedClock = formatClock(finishedAt);
-    if (!bufImages.length) return;
-    // Classify by ComfyUI's output type: SaveImage writes `type:"output"` with a
-    // real filename = the FINAL saved result; PreviewImage writes `type:"temp"`
-    // (under a temp/ subfolder, throwaway /tmp-style names) = a preview frame.
-    // Be conservative: ONLY an explicit `type === "output"` counts as final, so a
-    // missing/unknown type defaults to preview and we never mislabel a throwaway
-    // frame as the saved result. Don't crash on odd shapes.
-    const finals = [];
-    const previews = [];
-    for (const m of bufImages) {
-      if (m && m.type === "output") finals.push(m);
-      else previews.push(m);
-    }
-    // Send EVERYTHING for vision (the agent should see previews too), but ordered
-    // finals-first so the primary result is unambiguous as image #1.
-    const images = [...finals, ...previews];
-    const finalNames = finals.map((m) => coerceMessageText(m?.filename)).filter(Boolean);
-    const previewCount = previews.length;
-    let note;
-    if (finalNames.length) {
-      const list = finalNames.join(", ");
-      const fileWord = finalNames.length === 1 ? "output" : "outputs";
-      note =
-        `Run finished. FINAL ${fileWord}: ${list} ` +
-        `(this is the saved result — reference THIS filename` +
-        (finalNames.length === 1 ? "" : "s") +
-        `).`;
-      if (previewCount) {
-        const frameWord = previewCount === 1 ? "preview frame" : "preview frames";
-        note += ` Also shown: ${previewCount} ${frameWord} (temporary, not the final file).`;
-      }
-    } else {
-      // No SaveImage (or equivalent output node) ran — everything we have is a
-      // throwaway preview. Tell the agent so it doesn't cite a /tmp name as final.
-      const previewClause =
-        previewCount === 1
-          ? `this image is a preview (temporary, not a final file)`
-          : `these ${previewCount} images are previews (temporary, not a final file)`;
-      note =
-        `Run finished, but no saved output node ran — ${previewClause}. ` +
-        `Add a SaveImage node to persist the result, or treat the preview as the result if that's intended.`;
-    }
-    // ── Rich per-output metadata ───────────────────────────────────────────
-    // Gather metadata for the FINAL outputs (size + dimensions fetched in
-    // PARALLEL and bounded via allSettled, so a single failed HEAD/decode never
-    // drops the agent_event). Weave a compact human-readable block into the note
-    // (the agent reads TEXT) AND attach a structured `metadata` array for future
-    // programmatic use. Every field is individually optional — omitted when
-    // unavailable rather than shown as a bogus value.
-    const total = finals.length;
-    const finalNameSet = finalNames; // sibling list source (asset set)
-    let metadata = [];
-    try {
-      metadata = await Promise.all(
-        finals.map(async (m, idx) => {
-          // Coerce descriptor fields — a structured filename/subfolder must not
-          // reach the outbound agent note as "[object Object]" (#276).
-          const filename = coerceMessageText(m?.filename) || "(unknown)";
-          const subfolder = coerceMessageText(m?.subfolder);
-          const path = subfolder ? `${subfolder}/${filename}` : filename;
-          const url = imageViewUrl(m);
-          const [sizeRes, dimRes] = await Promise.allSettled([
-            fetchImageBytes(url),
-            fetchImageDimensions(url),
-          ]);
-          const sizeBytes =
-            sizeRes.status === "fulfilled" ? sizeRes.value : null;
-          const dim = dimRes.status === "fulfilled" ? dimRes.value : null;
-          const siblings = finalNameSet.filter((n) => n !== filename);
-          return {
-            filename,
-            path,
-            subfolder,
-            sizeBytes,
-            size: humanizeBytes(sizeBytes),
-            width: dim?.w ?? null,
-            height: dim?.h ?? null,
-            dimensions: dim ? `${dim.w}×${dim.h}` : null,
-            index: idx + 1,
-            total,
-            siblings,
-            durationMs,
-            duration,
-            finishedAt: finishedAt.toISOString(),
-            finishedClock,
-          };
-        }),
-      );
-    } catch {
-      // Defensive: metadata gathering must never block the agent_event.
-      metadata = [];
-    }
-    // Append the readable metadata block (one bullet per final output).
-    if (metadata.length) {
-      const lines = metadata.map((meta) => {
-        const parts = [`path: ${meta.path}`];
-        if (meta.size) parts.push(meta.size);
-        if (meta.dimensions) parts.push(meta.dimensions);
-        // asset set (same-run grouping)
-        parts.push(
-          meta.total === 1
-            ? "single output"
-            : `output ${meta.index} of ${meta.total} from this run`,
-        );
-        if (meta.siblings.length) {
-          parts.push(`alongside: ${meta.siblings.join(", ")}`);
-        }
-        if (meta.duration) parts.push(`rendered in ${meta.duration}`);
-        if (meta.finishedClock) parts.push(`finished ${meta.finishedClock}`);
-        return `• ${meta.filename} — ${parts.join(" · ")}`;
-      });
-      note += `\n${lines.join("\n")}`;
-    } else if (duration || finishedClock) {
-      // Preview-only run (no finals to attach metadata to) — still surface the
-      // run-level render context if we have it.
-      const bits = [];
-      if (duration) bits.push(`rendered in ${duration}`);
-      if (finishedClock) bits.push(`finished ${finishedClock}`);
-      if (bits.length) note += `\n• ${bits.join(" · ")}`;
-    }
-    // One consolidated turn with ALL of the run's directly-viewable images,
-    // finals-first, plus a note naming which file(s) are the real saved output
-    // and the structured metadata array (one entry per final output).
-    client.sendFrame({
-      type: "agent_event",
-      kind: "executed",
-      images,
-      note,
-      metadata,
-      // Machine-readable attribution: which prompt this completion belongs to, so
-      // a delayed prior-run flush can never be mistaken for the current run (#224).
-      ...(promptId != null ? { prompt_id: promptId } : {}),
-    });
-  }
-
 
   function onExecuted(ev) {
     const d = ev?.detail ?? {};

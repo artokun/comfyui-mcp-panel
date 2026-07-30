@@ -17,6 +17,7 @@ import {
   createRunCompletionTracker,
   NO_PROMPT_KEY,
 } from "../../web/js/lib/run-completion.js";
+import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame.js";
 
 /** Deterministic scheduler: timers are held until tick() fires the due ones. */
 function makeHarness({ debounceMs = 1500, maxRearms = 40 } = {}) {
@@ -286,4 +287,150 @@ test("execution_success + executing:null ordering yields exactly one event", () 
   h.tracker.onExecutionSuccess(P); // flushes + clears
   h.tracker.onExecutingNull(); // buffer already gone → no-op
   assert.equal(h.flushes.length, 1, "no double delivery across the two end signals");
+});
+
+// ── Presentation layer: ONE combined agent_event per completed prompt ────────
+// The tracker delivers ONE flush per prompt (asserted above). composeRunCompletionFrame
+// (web/js/lib/run-completion-frame.js) turns that flush into the SINGLE outbound
+// agent_event. This guards the #269/#468 blocker: a mixed / multi-video run must
+// emit EXACTLY ONE completion frame carrying stills AND every video's storyboard,
+// never a stills frame plus one frame per video.
+
+/** Fake presentation deps — every I/O helper is deterministic and side-effect free. */
+function makeFrameDeps(overrides = {}) {
+  const frames = [];
+  const painted = [];
+  const deps = {
+    sendFrame: (f) => frames.push(f),
+    coerceMessageText: (v) => (v == null ? "" : typeof v === "string" ? v : String(v)),
+    formatDuration: (ms) => (ms == null ? null : `${Math.round(ms / 1000)}s`),
+    formatClock: () => "12:00:00",
+    imageViewUrl: (m) => `view://${m?.filename ?? "x"}`,
+    fetchImageBytes: async () => 2048,
+    fetchImageDimensions: async () => ({ w: 512, h: 512 }),
+    humanizeBytes: (n) => (n == null ? null : `${n} B`),
+    buildVideoStoryboard: async () => ({ fake: "blob" }),
+    uploadBlobToInput: async (_blob, name) => ({ filename: name, type: "input" }),
+    storyboardFrameCount: () => 20,
+    paintImage: (url, name) => painted.push({ url, name }),
+    videoStoryboardEnabled: true,
+    warn: () => {},
+    ...overrides,
+  };
+  return { deps, frames, painted };
+}
+
+test("#269/#468 presentation: a MIXED run (stills + 2 videos) emits EXACTLY ONE agent_event with all outputs", async () => {
+  const { deps, frames } = makeFrameDeps();
+  const P = "prompt-mixed-multi";
+  const frame = await composeRunCompletionFrame(
+    {
+      promptId: P,
+      images: [{ filename: "final.png", type: "output" }],
+      videos: [
+        { m: { filename: "v1.mp4", type: "output" }, nodeId: "7" },
+        { m: { filename: "v2.mp4", type: "output" }, nodeId: "9" },
+      ],
+      durationMs: 42000,
+    },
+    deps,
+  );
+  // The whole point: ONE send, not 1 stills + 1 per video (which was 3 before).
+  assert.equal(frames.length, 1, "exactly one completion agent_event for the whole run");
+  assert.equal(frames[0], frame, "returned frame is the one that was sent");
+  assert.equal(frames[0].type, "agent_event");
+  assert.equal(frames[0].kind, "executed");
+  assert.equal(frames[0].prompt_id, P, "attributed to the finishing prompt");
+  // All outputs ride in the single frame: the still + both storyboard refs.
+  const names = frames[0].images.map((m) => m.filename);
+  assert.deepEqual(
+    names,
+    ["final.png", "storyboard_v1.png", "storyboard_v2.png"],
+    "one still + BOTH video storyboards consolidated into the single images array",
+  );
+  // The note mentions the still result and both videos in one turn.
+  assert.match(frames[0].note, /final\.png/, "note names the still output");
+  assert.match(frames[0].note, /v1\.mp4/, "note names the first video");
+  assert.match(frames[0].note, /v2\.mp4/, "note names the second video");
+});
+
+test("presentation: a still-storyboard fallback (no blob) still yields ONE frame with the note", async () => {
+  const { deps, frames } = makeFrameDeps({ buildVideoStoryboard: async () => null });
+  const frame = await composeRunCompletionFrame(
+    {
+      promptId: "p-fallback",
+      images: [{ filename: "s.png", type: "output" }],
+      videos: [
+        { m: { filename: "a.mp4", type: "output" }, nodeId: "1" },
+        { m: { filename: "b.mp4", type: "output" }, nodeId: "2" },
+      ],
+      durationMs: 10000,
+    },
+    deps,
+  );
+  assert.equal(frames.length, 1, "still exactly one frame when storyboards fall back to note-only");
+  // Only the still image rides along (no storyboard refs were produced).
+  assert.deepEqual(frame.images.map((m) => m.filename), ["s.png"]);
+  assert.match(frame.note, /a\.mp4/);
+  assert.match(frame.note, /b\.mp4/);
+});
+
+test("presentation: a video-only run (2 videos) is still ONE frame", async () => {
+  const { deps, frames } = makeFrameDeps();
+  await composeRunCompletionFrame(
+    {
+      promptId: "p-video2",
+      images: [],
+      videos: [
+        { m: { filename: "x.mp4", type: "output" }, nodeId: "1" },
+        { m: { filename: "y.mp4", type: "output" }, nodeId: "2" },
+      ],
+      durationMs: 120000,
+    },
+    deps,
+  );
+  assert.equal(frames.length, 1, "two videos, one completion frame");
+  assert.deepEqual(
+    frames[0].images.map((m) => m.filename),
+    ["storyboard_x.png", "storyboard_y.png"],
+    "both storyboards in the single frame",
+  );
+});
+
+test("presentation: an empty batch emits NO frame", async () => {
+  const { deps, frames } = makeFrameDeps();
+  const frame = await composeRunCompletionFrame(
+    { promptId: "p-empty", images: [], videos: [], durationMs: 1000 },
+    deps,
+  );
+  assert.equal(frame, null);
+  assert.equal(frames.length, 0);
+});
+
+test("presentation: a STALLED storyboard upload still yields ONE frame (never wedges the completion)", async () => {
+  // Regression for the consolidation risk: because the single frame awaits every
+  // video segment, an unbounded upload must NOT be able to suppress the frame.
+  // A very short REAL timeout bounds the never-settling upload deterministically.
+  const { deps, frames } = makeFrameDeps({
+    uploadBlobToInput: () => new Promise(() => {}), // never settles
+    videoStoryboardTimeoutMs: 5,
+  });
+  const frame = await composeRunCompletionFrame(
+    {
+      promptId: "p-stall",
+      images: [{ filename: "s.png", type: "output" }],
+      videos: [
+        { m: { filename: "a.mp4", type: "output" }, nodeId: "1" },
+        { m: { filename: "b.mp4", type: "output" }, nodeId: "2" },
+      ],
+      durationMs: 5000,
+    },
+    deps,
+  );
+  assert.equal(frames.length, 1, "the single completion frame is sent despite the stalled upload");
+  assert.equal(frame.images.length, 1, "only the still rides along (storyboards timed out)");
+  assert.equal(frame.images[0].filename, "s.png");
+  assert.match(frame.note, /timed out/, "each stalled video degrades to a note-only fallback");
+  assert.match(frame.note, /a\.mp4/);
+  assert.match(frame.note, /b\.mp4/);
 });
