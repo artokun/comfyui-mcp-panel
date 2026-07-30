@@ -132,6 +132,21 @@ test("numeric widget REJECTS a non-numeric string (no 'euler' into an INT)", () 
   assert.equal(node.widgets[0].value, 1);
 });
 
+test("numeric widget REJECTS non-numeric JSON types (array/object/bool/blank), accepts 5 and \"5\"", () => {
+  const mk = () => ({ id: 1, type: "N", widgets: [{ name: "steps", type: "INT", value: 1 }] });
+  for (const bad of [[], [5], "  ", true, false, {}, null, "", Infinity, NaN]) {
+    const n = mk();
+    assert.throws(
+      () => applyWidgetWrite(n, "steps", bad, HOOKS),
+      WidgetWriteError,
+      `value ${JSON.stringify(bad)} must be rejected`,
+    );
+    assert.equal(n.widgets[0].value, 1, `slot untouched after rejecting ${JSON.stringify(bad)}`);
+  }
+  assert.equal(applyWidgetWrite(mk(), "steps", 5, HOOKS).value, 5);
+  assert.equal(applyWidgetWrite(mk(), "steps", "5", HOOKS).value, 5);
+});
+
 test("boolean widget coerces true/false strings and rejects garbage", () => {
   assert.equal(applyWidgetWrite({ id: 1, type: "N", widgets: [{ name: "e", type: "toggle", value: false }] }, "e", "true", HOOKS).value, true);
   assert.throws(() => applyWidgetWrite({ id: 1, type: "N", widgets: [{ name: "e", type: "toggle", value: false }] }, "e", "maybe", HOOKS), WidgetWriteError);
@@ -259,6 +274,19 @@ test("promoted widget with empty linkIds → THROW, parent slot untouched", () =
     (err) => err instanceof WidgetWriteError && /no resolvable inner link/.test(err.message),
   );
   assert.equal(parent.widgets[0].value, before, "parent slot must not be written on fail-closed");
+});
+
+test("promoted widget whose host input LACKS _subgraphSlot → THROW, parent untouched (round-2 HIGH #1)", () => {
+  const { parent } = makeSubgraphFixture();
+  // Host input matches the requested name but has NO _subgraphSlot — the
+  // missing-metadata case that previously fell open to the parent widget.
+  parent.inputs = [{ name: "scheduler" /* no _subgraphSlot */ }];
+  const before = parent.widgets[0].value;
+  assert.throws(
+    () => applyWidgetWrite(parent, "scheduler", "simple", { resolveSource: () => null }),
+    (err) => err instanceof WidgetWriteError && /no backing subgraph slot/.test(err.message),
+  );
+  assert.equal(parent.widgets[0].value, before, "parent widget must not be written");
 });
 
 test("promoted widget linking to a missing inner node → THROW (no parent fallback)", () => {

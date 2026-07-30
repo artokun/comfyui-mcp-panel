@@ -95,8 +95,15 @@ export function coerceWidgetValue(widget, value) {
   }
 
   if (isNumericWidget(widget)) {
-    const num = typeof value === "number" ? value : Number(value);
-    if (value === null || value === "" || typeof value === "boolean" || !Number.isFinite(num)) {
+    // Accept ONLY a finite number, or a non-blank numeric string. Reject
+    // arrays/objects/booleans/null/whitespace — Number([])===0 and
+    // Number([5])===5 would otherwise silently mutate an INT/FLOAT slot.
+    let num;
+    if (typeof value === "number" && Number.isFinite(value)) {
+      num = value;
+    } else if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) {
+      num = Number(value);
+    } else {
       throw new WidgetWriteError(
         `Widget "${name}" is numeric (type ${widget?.type}) but value ` +
           `${JSON.stringify(value)} is not a number.`,
@@ -144,17 +151,23 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
   if (!subgraph) return { promoted: false };
   const wanted = String(widgetName).toLowerCase();
 
-  // All promoted inputs whose OUTER alias matches the requested name.
+  // Host inputs whose OUTER alias matches the requested name. We match on the
+  // HOST input's own name/label AND (when present) its backing subgraph slot,
+  // so a promoted widget is DETECTED even if `_subgraphSlot` is missing — that
+  // must fail CLOSED, never fall through to the shifted parent widget.
   const matches = [];
   for (const input of subgraphNode.inputs ?? []) {
-    const subgraphInput = input?._subgraphSlot;
-    if (!subgraphInput) continue;
-    const aliases = [input.name, input.label, subgraphInput.name, subgraphInput.label].map(
-      (a) => (a == null ? null : String(a).toLowerCase()),
-    );
+    const subgraphInput = input?._subgraphSlot ?? null;
+    const aliases = [
+      input?.name,
+      input?.label,
+      subgraphInput?.name,
+      subgraphInput?.label,
+    ].map((a) => (a == null ? null : String(a).toLowerCase()));
     if (aliases.includes(wanted)) matches.push({ input, subgraphInput });
   }
 
+  // No matching host input at all ⇒ a genuine non-promoted own-widget.
   if (matches.length === 0) return { promoted: false };
   if (matches.length > 1) {
     return {
@@ -165,6 +178,15 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
   }
 
   const { input, subgraphInput } = matches[0];
+  // It IS a promoted widget, but its backing subgraph slot is absent — we
+  // cannot reach the inner target, so refuse rather than corrupt the parent.
+  if (!subgraphInput) {
+    return {
+      promoted: true,
+      target: null,
+      error: `promoted widget "${widgetName}" has no backing subgraph slot (_subgraphSlot missing) — cannot resolve inner target.`,
+    };
+  }
   if (typeof resolveSource !== "function") {
     return {
       promoted: true,
