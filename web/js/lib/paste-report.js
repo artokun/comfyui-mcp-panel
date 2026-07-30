@@ -48,11 +48,22 @@ export function getCopiedSnapshot() {
  * ids, so ids can't be compared directly. Any copied node whose type wasn't
  * produced by the paste is reported as dropped (carrying its ORIGINAL id/type).
  *
+ * A candidate drop is only REPORTED when its type is genuinely unregistered on
+ * the target frontend (that is the sole mechanism by which paste drops a node).
+ * This guards against a STALE snapshot: if the user tool-copied selection A but
+ * then native-copied selection B before pasting, the snapshot no longer matches
+ * the clipboard — but B's types are all registered (they just pasted), so the
+ * per-type subtraction against A can only leave REGISTERED leftovers, which the
+ * `isRegisteredType` filter discards instead of fabricating a false warning.
+ * When no predicate is supplied every leftover is reported (used by the pure
+ * multiset tests); the handler always supplies the frontend registry.
+ *
  * @param {Array<{id?:any,type?:string}>} copied  clipboard snapshot
  * @param {Array<{id?:any,type?:string}>} pasted  nodes that landed on the graph
+ * @param {(type:string)=>boolean} [isRegisteredType]  true if type is a known node class
  * @returns {{dropped: Array<{id:any,type:string}>, dropped_count: number, dropped_types: string[]}}
  */
-export function diffCopiedVsPasted(copied, pasted) {
+export function diffCopiedVsPasted(copied, pasted, isRegisteredType) {
   const pastedByType = new Map();
   for (const n of pasted ?? []) {
     const t = n?.type;
@@ -66,6 +77,10 @@ export function diffCopiedVsPasted(copied, pasted) {
     const avail = pastedByType.get(t) ?? 0;
     if (avail > 0) {
       pastedByType.set(t, avail - 1);
+    } else if (typeof isRegisteredType === "function" && isRegisteredType(t)) {
+      // Registered but absent from the paste → not a genuine drop; this is a
+      // stale-snapshot artifact (a different selection was actually pasted).
+      continue;
     } else {
       dropped.push({ id: item.id ?? null, type: t });
     }

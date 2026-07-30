@@ -120,3 +120,32 @@ test("empty clipboard snapshot never fabricates drops", () => {
   const { dropped_count } = diffCopiedVsPasted([], [pastedNode(1, "LoadAudio")]);
   assert.equal(dropped_count, 0);
 });
+
+test("genuine drops require an UNREGISTERED type when the registry predicate is supplied", () => {
+  // Only LoadAudio/MultiTalk are registered on the target; the two audio nodes
+  // are not — so exactly those two are reported as dropped.
+  const registered = new Set(["LoadAudio", "MultiTalkWav2VecEmbeds", "VHS_VideoCombine"]);
+  const isRegistered = (t) => registered.has(t);
+  const copied = [
+    liveNode(1, "LoadAudio"),
+    liveNode(2, "AudioCrop"),
+    liveNode(3, "AudioSeparation"),
+    liveNode(4, "MultiTalkWav2VecEmbeds"),
+  ];
+  const pasted = [pastedNode(9, "LoadAudio"), pastedNode(10, "MultiTalkWav2VecEmbeds")];
+  const { dropped_count, dropped_types } = diffCopiedVsPasted(copied, pasted, isRegistered);
+  assert.equal(dropped_count, 2);
+  assert.deepEqual(dropped_types.sort(), ["AudioCrop", "AudioSeparation"]);
+});
+
+test("stale snapshot + native copy of a DIFFERENT selection does NOT fabricate drops", () => {
+  // User tool-copied selection A (all registered), then native-copied selection
+  // B and pasted B. Snapshot is stale (still A). Because A's leftover types are
+  // all REGISTERED, the registry predicate discards them — no false warning.
+  const registered = new Set(["KSampler", "VAEDecode", "SaveImage", "CLIPTextEncode"]);
+  const isRegistered = (t) => registered.has(t);
+  const staleSnapshotA = [liveNode(1, "KSampler"), liveNode(2, "VAEDecode")];
+  const pastedB = [pastedNode(50, "SaveImage"), pastedNode(51, "CLIPTextEncode")];
+  const { dropped_count } = diffCopiedVsPasted(staleSnapshotA, pastedB, isRegistered);
+  assert.equal(dropped_count, 0);
+});
