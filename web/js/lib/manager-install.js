@@ -343,3 +343,62 @@ function unverifiedMessage(target, why) {
     `new nodes. If it still does not appear, check the ComfyUI server log.`
   );
 }
+
+// ---------------------------------------------------------------------------
+// 3.x-LEGACY dialect completeness (#423 list / #424 update-self / #425 restart)
+// #230 routed install/update/status by dialect but left three legacy-branch
+// gaps. These pure helpers keep the per-dialect route/method choices testable
+// under `node --test`, away from the browser Manager client.
+// ---------------------------------------------------------------------------
+
+/** #423 — the installed-node list route, WITHOUT the /v2 prefix (managerV2 adds
+ *  it for the pip dialects; managerCall hits it absolutely for legacy). The
+ *  released 3.x `/customnode/installed` handler reads `mode` (defaulting to
+ *  'default'); passing it explicitly matches the live-tested orchestrator
+ *  (listInstalledNodes) and keeps the legacy + pip shapes identical. */
+export function installedListRoute() {
+  return "customnode/installed?mode=default";
+}
+
+/** #423 — does a Manager error mean "route/prefix not present on this build"
+ *  (a 404 / the panel's "not reachable" throw), i.e. we should retry the
+ *  absolute (no-/v2) legacy route? A legacy-UI pip build can answer the queue
+ *  probe on /v2 yet NOT register the /v2 data GETs, so the dialect-routed
+ *  /v2/customnode/installed 404s while /customnode/installed serves fine. */
+export function isManagerUnreachable(err) {
+  const msg = String(err?.message ?? err ?? "");
+  return /not reachable/i.test(msg) || /HTTP\s*404\b/.test(msg);
+}
+
+/** #424 — did the Manager reject the method (HTTP 405)? Updating ComfyUI-Manager
+ *  ITSELF through a /v2 task/batch envelope 405s on a legacy Manager (the /v2
+ *  POST route is a frontend catchall); the fix is to retry the absolute legacy
+ *  `/manager/queue/update` self-update route. */
+export function isMethodNotAllowed(err) {
+  const msg = String(err?.message ?? err ?? "");
+  return /HTTP\s*405\b/.test(msg) || /method not allowed/i.test(msg);
+}
+
+/** #424 — the released-3.x `/manager/queue/update` body. The handler keys the
+ *  update off `id` when `version` !== 'unknown' (node_name = id), so a plain
+ *  installed pack name — including 'comfyui-manager' for a Manager self-update —
+ *  resolves via unified_update. Mirrors graph_update_node's legacy body. */
+export function legacyUpdateBody({ ui_id, id, version } = {}) {
+  return { ui_id, id, version: version === "nightly" ? "nightly" : "latest" };
+}
+
+/** #425 — ordered reboot {route, method} candidates for the detected dialect.
+ *  The released 3.x Manager serves ONLY `POST /manager/reboot` (the pre-#230
+ *  panel tried `GET /manager/reboot` → 404, after `POST /v2/manager/reboot` →
+ *  405, leaving a legacy Manager unrestartable — issue #214). pip builds keep
+ *  `POST /v2/manager/reboot` first; a very old `GET /manager/reboot` stays last
+ *  as a final fallback. Every candidate is a real, method-correct route so the
+ *  bridge from a legacy Manager to a freshly-staged v4 install works either way. */
+export function rebootCandidates(dialect) {
+  const v2 = { route: "/v2/manager/reboot", method: "POST" };
+  const legacyPost = { route: "/manager/reboot", method: "POST" };
+  const legacyGet = { route: "/manager/reboot", method: "GET" };
+  return dialect === "legacy"
+    ? [legacyPost, v2, legacyGet]
+    : [v2, legacyPost, legacyGet];
+}

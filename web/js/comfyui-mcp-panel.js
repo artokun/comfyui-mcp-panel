@@ -66,7 +66,17 @@ import { marked } from "./vendor/marked.esm.js";
 import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
-import { buildInstallRequest, classifyInstallOutcome, installGitUrl, queueDrained } from "./lib/manager-install.js";
+import {
+  buildInstallRequest,
+  classifyInstallOutcome,
+  installGitUrl,
+  installedListRoute,
+  isManagerUnreachable,
+  isMethodNotAllowed,
+  legacyUpdateBody,
+  queueDrained,
+  rebootCandidates,
+} from "./lib/manager-install.js";
 import {
   CHAT_HISTORY_MAX_IMPORT_BYTES,
   CHAT_HISTORY_SCHEMA,
@@ -6786,7 +6796,21 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   async nodes_list() {
-    return { installed: await managerGet("customnode/installed") };
+    // #423: route the installed-node list by dialect (managerGet strips /v2 for
+    // legacy) with an explicit ?mode=default — matching the live-tested
+    // orchestrator. A pip Manager in --enable-manager-legacy-ui mode can answer
+    // the /v2 queue probe yet NOT register the /v2 data GETs, so the dialect-
+    // routed /v2/customnode/installed 404s ("not reachable") while the absolute
+    // /customnode/installed serves fine. On that unreachable signal, fall back
+    // to the absolute (no-/v2) legacy list route instead of surfacing a generic
+    // "unreachable" error.
+    const route = installedListRoute();
+    try {
+      return { installed: await managerGet(route) };
+    } catch (err) {
+      if (!isManagerUnreachable(err)) throw err;
+      return { installed: await managerCall(route) };
+    }
   },
 
   async nodes_install(args) {
@@ -6873,6 +6897,17 @@ const GRAPH_TOOL_EXECUTORS = {
     const client_id = api.clientId ?? api.initialClientId ?? "comfyui-mcp-panel";
     const note =
       "Update queued. Poll nodes_queue_status; a ComfyUI restart (comfy_reboot) is usually required to load the updated node.";
+    // #424: the absolute (no-/v2) legacy self-update route. Updating the
+    // ComfyUI-Manager node ITSELF (id 'comfyui-manager') through a /v2 task or
+    // batch envelope 405s on a legacy Manager — that POST /v2 route is a
+    // frontend catchall. The released-3.x `/manager/queue/update` handler keys
+    // the update off `id` (unified_update) and DOES update the Manager itself,
+    // so we retry it whenever the /v2 envelope is method-rejected.
+    const legacyUpdate = async () => {
+      const body = legacyUpdateBody({ ui_id, id, version });
+      await managerCall("manager/queue/update", { method: "POST", body });
+      await managerCall("manager/queue/start", { method: "POST" });
+    };
     if (dialect === "v2") {
       const params = {
         // The Manager's update task keys off node_name; include id too for
@@ -6884,25 +6919,36 @@ const GRAPH_TOOL_EXECUTORS = {
         mode: mode || "remote",
         channel: channel || "default",
       };
-      await managerV2("manager/queue/task", {
-        method: "POST",
-        body: { kind: "update", params, ui_id, client_id },
-      });
-      await managerV2("manager/queue/start", { method: "POST" });
+      try {
+        await managerV2("manager/queue/task", {
+          method: "POST",
+          body: { kind: "update", params, ui_id, client_id },
+        });
+        await managerV2("manager/queue/start", { method: "POST" });
+      } catch (err) {
+        if (!isMethodNotAllowed(err)) throw err;
+        await legacyUpdate();
+        return { queued: true, ui_id, id, version: sel, dialect, via: "legacy-self-update", note };
+      }
       return { queued: true, ui_id, id, version: sel, dialect, note };
     }
     // v2-batch + legacy: 3.x update body {ui_id, id, version} (issues #187/#182).
     const body = { ui_id, id, version: sel };
     if (dialect === "v2-batch") {
-      const res = await managerV2("manager/queue/batch", {
-        method: "POST",
-        body: { update: [body] },
-      });
-      assertBatchOk(res, id, "update");
-      await managerV2("manager/queue/start", { method: "POST" });
+      try {
+        const res = await managerV2("manager/queue/batch", {
+          method: "POST",
+          body: { update: [body] },
+        });
+        assertBatchOk(res, id, "update");
+        await managerV2("manager/queue/start", { method: "POST" });
+      } catch (err) {
+        if (!isMethodNotAllowed(err)) throw err;
+        await legacyUpdate();
+        return { queued: true, ui_id, id, version: sel, dialect, via: "legacy-self-update", note };
+      }
     } else {
-      await managerCall("manager/queue/update", { method: "POST", body });
-      await managerCall("manager/queue/start", { method: "POST" });
+      await legacyUpdate();
     }
     return { queued: true, ui_id, id, version: sel, dialect, note };
   },
@@ -6947,8 +6993,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // INSIDE the live ComfyUI frontend, the server was demonstrably up a moment
     // ago, so a dropped connection here means the reboot fired (not that the
     // endpoint is unreachable). Treat that as success and let the auto-reconnect/
-    // resume flow take over. Try the canonical v2 route first, then the legacy
-    // GET route for older Manager builds. Classification of a real Response:
+    // resume flow take over. #425: the released 3.x Manager serves ONLY
+    // `POST /manager/reboot` — the old candidate list tried `POST /v2/manager/
+    // reboot` (405) then `GET /manager/reboot` (404), leaving a legacy Manager
+    // unrestartable and unable to bridge to a freshly-staged v4 install (issue
+    // #214). rebootCandidates() now orders real, method-correct routes by the
+    // detected dialect, so legacy gets `POST /manager/reboot` first. Detection is
+    // best-effort — a probe failure defaults to the pip (v2-first) ordering, and
+    // every route is still tried. Classification of a real Response:
     // 403 means Manager security blocked it (a real, actionable failure); a
     // 502/503/504 means we're reaching ComfyUI through a reverse proxy / tunnel
     // whose origin was just killed by the reboot (the proxy can't reach it) —
@@ -6956,10 +7008,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // non-OK (404, etc.) means "wrong route on this build" → try the next. On
     // total failure we RETURN a structured error (rebooting:false) rather than
     // throw, so the agent is told accurately AND the auto-resume flag is not armed.
-    const candidates = [
-      { route: "/v2/manager/reboot", method: "POST" },
-      { route: "/manager/reboot", method: "GET" },
-    ];
+    let dialect = null;
+    try {
+      dialect = await detectManagerDialect();
+    } catch {
+      // Detection unreachable — fall back to the pip-first ordering; every
+      // candidate is still attempted below.
+    }
+    const candidates = rebootCandidates(dialect);
     const errors = [];
     for (const { route, method } of candidates) {
       try {
