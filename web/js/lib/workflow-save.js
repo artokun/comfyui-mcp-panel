@@ -118,7 +118,7 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName } = {}) {
     // UNKNOWN must FAIL SAFE (refuse) — we only ever take a move path when the
     // source is PROVABLY never-persisted (no backing file to destroy).
     const sourcePath = wf.path;
-    const cls = classifySource(svc, wf, sourcePath, currentName);
+    const cls = classifySource(svc, wf, sourcePath);
 
     if (typeof svc.saveWorkflowAs === "function") {
       // PREVENT the destructive move. saveWorkflowAs relocates-by-rename whenever
@@ -206,31 +206,38 @@ function pathExists(svc, rawPath) {
  *  disk — independent of the volatile in-memory flags, which drift after an
  *  open-ack race (#215). Returns:
  *    "persisted"       — a real file provably backs it (must NEVER be moved);
- *    "never-persisted" — provably no backing file (safe to rename/ground);
+ *    "never-persisted" — an oracle AFFIRMATIVELY confirms no backing file exists
+ *                        (safe to rename/ground);
  *    "unknown"         — cannot establish either way → callers FAIL SAFE (refuse).
  *
  *  Proof of "persisted": `wf.isPersisted === true`, or an existence oracle shows
- *  a persisted workflow at this path. Proof of "never-persisted": a frontend
- *  placeholder tab ("Unsaved Workflow …" / "Untitled …") that is flagged
- *  temporary and not persisted — the ONLY case where the frontend guarantees no
- *  file has ever been written. Everything else (e.g. a real filename flagged
- *  temporary with no oracle — the exact #226 drift) is UNKNOWN, not safe. */
-function classifySource(svc, wf, rawPath, currentName) {
+ *  a persisted workflow at this path.
+ *
+ *  Proof of "never-persisted" requires the existence oracle to affirmatively
+ *  show NO file backs the path. A placeholder NAME ("Unsaved Workflow …" /
+ *  "Untitled …") is NEVER sufficient on its own — a user really can have
+ *  `workflows/Untitled 2026-07-12.json` on disk, and treating the name as proof
+ *  would classify a drifted-temporary REAL file as never-persisted and then move
+ *  (destroy) it (#226). With NO oracle we can prove nothing → "unknown" → refuse,
+ *  so the only path that ever renames is one the oracle proves has no file. */
+function classifySource(svc, wf, rawPath) {
   if (wf?.isPersisted === true) return "persisted";
-  if (hasExistenceOracle(svc)) {
-    const found =
-      typeof svc?.getWorkflowByPath === "function" ? safeGetByPath(svc, rawPath) : undefined;
-    if (found && found.isPersisted === true) return "persisted";
-    const norm = normalizePath(rawPath);
-    const listed = [...(svc?.workflows ?? []), ...(svc?.openWorkflows ?? [])].find(
-      (w) => w && normalizePath(w.path) === norm,
-    );
-    if (listed && listed.isPersisted === true) return "persisted";
+  // Without an oracle we can prove NOTHING about the disk — fail safe.
+  if (!hasExistenceOracle(svc)) return "unknown";
+
+  const norm = normalizePath(rawPath);
+  const found =
+    typeof svc?.getWorkflowByPath === "function" ? safeGetByPath(svc, rawPath) : undefined;
+  const listed = [...(svc?.workflows ?? []), ...(svc?.openWorkflows ?? [])].find(
+    (w) => w && normalizePath(w.path) === norm,
+  );
+  if ((found && found.isPersisted === true) || (listed && listed.isPersisted === true)) {
+    return "persisted";
   }
-  // Provably never-persisted: a placeholder temporary tab with no real name.
-  if (wf?.isTemporary === true && wf?.isPersisted !== true && isDefaultWorkflowName(currentName)) {
-    return "never-persisted";
-  }
+  // Oracle available and affirmatively shows NO persisted workflow at this path.
+  // Only grant move rights to a doc that is actually acting as a temporary tab;
+  // anything else stays "unknown" (never move an ambiguous doc).
+  if (wf?.isTemporary === true && wf?.isPersisted !== true) return "never-persisted";
   return "unknown";
 }
 

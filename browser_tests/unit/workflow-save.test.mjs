@@ -377,6 +377,33 @@ test('P0-a: no existence oracle + mis-flagged temporary + real name ⇒ REFUSE, 
   assert.equal(svc.calls.length, 0, 'nothing was called')
 })
 
+for (const realName of ['Untitled 2026-07-24', 'Unsaved Workflow 3']) {
+  test(`P0 name-vs-proof: a REAL on-disk "${realName}" drifted temporary + NO oracle ⇒ REFUSE, never moved (#226)`, async () => {
+    // The exact collision: a user really can have "workflows/Untitled ….json"
+    // (or "Unsaved Workflow 3.json") ON DISK. If its flags drift temporary and
+    // there is no existence oracle, the placeholder NAME must NOT be treated as
+    // proof of absence — that would classify a real file as never-persisted and
+    // then MOVE (destroy) it. With no oracle to confirm absence ⇒ unknown ⇒ refuse.
+    const active = {
+      path: `workflows/${realName}.json`,
+      filename: `${realName}.json`,
+      directory: 'workflows',
+      isPersisted: false, // drifted
+      isTemporary: true // drifted
+    }
+    // makeService ⇒ NO getWorkflowByPath, NO lists ⇒ no existence oracle.
+    const svc = makeService({ files: [active.path], active })
+
+    await assert.rejects(
+      () => saveActiveWorkflow(svc, 'a-copy', {}),
+      /cannot be proven absent from disk/
+    )
+    assert.ok(svc.disk.has(`workflows/${realName}.json`), 'real source preserved')
+    assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
+    assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflowAs'), 'never delegated a move')
+  })
+}
+
 test('P0-b: no-name save of an on-disk app-mode workflow COPIES to .app.json, source survives (#226)', async () => {
   // An on-disk "Foo.json" opened with initialMode "app" and NO supplied name:
   // the mode-derived target is "Foo.app.json" ≠ current path, so a plain
