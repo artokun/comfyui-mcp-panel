@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.8] - 2026-07-30
+
+### Fixed
+- **SEVERE: `panel_install_node` no longer silently reports success without installing (#232).** ComfyUI-Manager marks every queued task "done" even when the git clone fails, and its status surface exposes only aggregate counts — so a GitHub-repo install that never landed reported identically to a real success. Install now goes through a tri-state verifier: **installed** only on a positively-observed queue drain + the pack actually present in `/customnode/installed`; **failed** only when the queue drained with readable data, explicit failure evidence, and an identifiable target definitively absent; **unverified** (honest `pending`, never a false success or false failure) for everything else — a rename-prone install (git URL / `owner/repo` whose on-disk dir differs), a still-processing queue, or a malformed/unreadable status or installed-list. Every Manager request (dialect probe, install, start, status, list) is now timeout-bounded. Live-verified: a bogus git-URL install returns `installed:false, verified:false, pending:true` with no false success and no crash. (#246)
+
 ## [0.11.7] - 2026-07-30
 
 ### Fixed
