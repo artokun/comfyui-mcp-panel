@@ -90,6 +90,11 @@ import {
   reconcileUnknownWidgetNames,
   reapplyDefsToLiveNodes,
 } from "./lib/asset-staleness.js";
+import {
+  coerceWidgetValue,
+  resolvePromotedInnerTarget,
+  WidgetWriteError,
+} from "./lib/widget-write.js";
 import { coerceMessageText, isDroppedAgentReplay } from "./lib/chat-serialize.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
 import { saveActiveWorkflow } from "./lib/workflow-save.js";
@@ -5161,28 +5166,81 @@ const GRAPH_TOOL_EXECUTORS = {
     // Repair positional UNKNOWN/UNKNOWN_n placeholders against the live def so
     // the caller's real widget name resolves (#199) before we look it up.
     reconcileUnknownWidgetNames(node);
-    const w = (node.widgets ?? []).find(
+
+    // #233: if this is a PARENT SubgraphNode and `widget` names a PROMOTED
+    // widget, the parent's own widget slot can be positionally shifted against
+    // the inner node — writing it silently corrupts a DIFFERENT inner widget.
+    // Resolve the promoted widget to its ACTUAL inner (node, widget) and write
+    // THERE, so the value always lands on the intended target. The parent view
+    // re-reads the inner value afterwards.
+    let targetNode = node;
+    let promotedFrom = null;
+    if (node.subgraph) {
+      const inner = resolvePromotedInnerTarget(node, widget, sourceForSubgraphInput);
+      if (inner) {
+        targetNode = inner.node;
+        promotedFrom = { subgraph_node_id: node.id, inner_node_id: inner.node.id };
+      }
+    }
+
+    const w = (targetNode.widgets ?? []).find(
       (cand) => cand?.name?.toLowerCase() === String(widget).toLowerCase(),
     );
     if (!w) {
-      const names = (node.widgets ?? []).map((cand) => cand?.name).join(", ");
+      const names = (targetNode.widgets ?? []).map((cand) => cand?.name).join(", ");
       throw new Error(
-        `Node ${node.id} (${node.type}) has no widget "${widget}" (available: ${names || "none"})`,
+        `Node ${targetNode.id} (${targetNode.type}) has no widget "${widget}" (available: ${names || "none"})`,
       );
     }
+
+    // Validate + coerce against the target widget's declared type BEFORE
+    // writing. A combo must be an exact option (no index reinterpretation —
+    // #240); a numeric widget must be a number (no "euler" into an INT slot —
+    // #233). Reject with an actionable message instead of corrupting the graph.
+    let coerced;
+    try {
+      coerced = coerceWidgetValue(w, value);
+    } catch (err) {
+      if (err instanceof WidgetWriteError) {
+        throw new Error(
+          `Refusing to set widget "${w.name}" on node ${targetNode.id} ` +
+            `(${targetNode.type}): ${err.message}`,
+        );
+      }
+      throw err;
+    }
+
     graph.beforeChange();
     const previous = w.value;
     try {
-      w.value = value;
+      w.value = coerced;
       // Fire the widget's own callback so combo/number side effects run —
       // the same path a manual UI edit takes.
-      w.callback?.(value, app.canvas, node, node.pos, undefined);
+      w.callback?.(coerced, app.canvas, targetNode, targetNode.pos, undefined);
     } finally {
       graph.afterChange();
     }
     graph.setDirtyCanvas(true, true);
+
+    // #240: verify the write stuck as the EXACT value we resolved. Combo
+    // callbacks that reinterpret an index can drift the value silently — fail
+    // loudly rather than report a false success.
+    if (w.value !== coerced) {
+      throw new Error(
+        `Widget "${w.name}" on node ${targetNode.id} (${targetNode.type}) did ` +
+          `not retain the requested value: wrote ${JSON.stringify(coerced)} but ` +
+          `it became ${JSON.stringify(w.value)}.`,
+      );
+    }
+
     return {
-      set: { node_id: node.id, widget: w.name, previous, value: w.value },
+      set: {
+        node_id: targetNode.id,
+        widget: w.name,
+        previous,
+        value: w.value,
+        ...(promotedFrom ? { promoted_from: promotedFrom } : {}),
+      },
     };
   },
 
