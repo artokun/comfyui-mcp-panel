@@ -100,6 +100,55 @@ test("findNodeByScopedId returns null when the subgraph UUID is unknown (fails o
   assert.equal(findNodeByScopedId(root, `${SG_UUID}:1913`), null);
 });
 
+test("findNodeByScopedId STRICT-rejects malformed locators ⇒ null ⇒ fail-open (codex round-2 #1)", () => {
+  // The subgraph DOES contain node 6077 — a loose first/last-segment parse would
+  // wrongly resolve it and suppress a genuine miss. Strict parsing must return
+  // null for every malformed shape so the cross-check keeps reporting.
+  const inner = { id: 6077, widgets: [{ name: "image", value: "still-missing.png" }] };
+  const sub = subgraphOf(SG_UUID, [inner]);
+  const root = rootWithSubgraphs([], [sub]);
+  assert.equal(findNodeByScopedId(root, `${SG_UUID}:unexpected:6077`), null); // 3 segments
+  assert.equal(findNodeByScopedId(root, `${SG_UUID}::6077`), null); // empty middle
+  assert.equal(findNodeByScopedId(root, `${SG_UUID}:`), null); // empty local id
+  assert.equal(findNodeByScopedId(root, `not-a-uuid:6077`), null); // bad UUID
+  assert.equal(findNodeByScopedId(root, `${SG_UUID}:6077:extra:more`), null); // 4 segments
+  // The valid two-segment form still resolves.
+  assert.equal(findNodeByScopedId(root, `${SG_UUID}:6077`), inner);
+});
+
+test("isStaleAssetCandidate: a malformed 3-segment locator does NOT suppress a genuine miss (fail-open, codex round-2 #1)", () => {
+  const inner = { id: 6077, widgets: [{ name: "image", value: "moved.png" }] };
+  const sub = subgraphOf(SG_UUID, [inner]);
+  const root = rootWithSubgraphs([], [sub]);
+  // Even though no widget holds "gone.png", the locator is unrecognized ⇒ resolver
+  // returns null ⇒ still-referenced fails OPEN ⇒ candidate is NOT dropped.
+  assert.equal(
+    isStaleAssetCandidate(root, { nodeId: `${SG_UUID}:x:6077`, name: "gone.png", widgetName: "image" }),
+    false,
+  );
+});
+
+test("findSubgraphByUuid terminates on a cyclic subgraph graph (codex round-2 #2)", () => {
+  // Build a cycle: subgraph A hosts a node whose subgraph is B, and B hosts a
+  // node whose subgraph is A again. An unknown UUID must not recurse forever.
+  const a = subgraphOf("uuid-A", []);
+  const b = subgraphOf("uuid-B", []);
+  a._nodes = [{ id: 1, subgraph: b }];
+  b._nodes = [{ id: 2, subgraph: a }];
+  const root = graphOf([{ id: 10, subgraph: a }]);
+  assert.equal(findSubgraphByUuid(root, "does-not-exist"), null); // terminates, no overflow
+  assert.equal(findSubgraphByUuid(root, "uuid-B"), b); // still finds a real one
+});
+
+test("findNodeByScopedId fails open (null) on a cyclic graph with an unknown UUID (codex round-2 #2)", () => {
+  const a = subgraphOf("uuid-A", []);
+  const b = subgraphOf("uuid-B", []);
+  a._nodes = [{ id: 1, subgraph: b }];
+  b._nodes = [{ id: 2, subgraph: a }];
+  const root = graphOf([{ id: 10, subgraph: a }]);
+  assert.equal(findNodeByScopedId(root, `${SG_UUID}:6077`), null); // no overflow, fail-open
+});
+
 test("isStaleAssetCandidate: STALE once a subgraph LoadImage/model widget is fixed via a UUID locator (#247/#352)", () => {
   // LTX-style subgraph: the store still lists the pre-edit template filename, but
   // the live widget inside the subgraph now points at the installed alternative.
