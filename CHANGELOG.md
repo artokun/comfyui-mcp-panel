@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.10] - 2026-07-30
+
+### Fixed
+- **panel_get_errors no longer reports a stale missing-asset for a SUBGRAPH-hosted node after the asset is fixed.** Root-node missing-assets already recomputed live (WS-3), but a subgraph node's candidate id is a NodeLocatorId `<subgraphUUID>:<localNodeId>` (the first segment is the subgraph's global UUID, not a host node id); the previous resolver walked it as host ids, never resolved, and the live cross-check failed OPEN — so a subgraph LoadImage/checkpoint/template asset kept being reported missing even after a `set_widget` fixed it (#247, and the subgraph parts of #235/#257). `findNodeByScopedId` now resolves the locator the way ComfyUI's `getNodeByLocatorId` does (strict two-segment parse + UUID validation + cycle-safe subgraph lookup); malformed locators still fail open so genuine misses are never suppressed. (#260)
+
 ## [0.11.9] - 2026-07-30
 
 ### Fixed
