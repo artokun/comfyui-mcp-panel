@@ -135,6 +135,48 @@ test('a never-saved placeholder tab is grounded via the copy path (safe rename o
   assert.equal(saved, 'Untitled 2026-07-24')
 })
 
+test('rejects an explicit whitespace-only name and leaves the source untouched (#226)', async () => {
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeService({ files: [active.path], active })
+
+  await assert.rejects(() => saveActiveWorkflow(svc, '   ', {}), /must not be blank/)
+
+  // Nothing was saved or overwritten — the persisted source stands as-is.
+  assert.deepEqual(svc.calls, [])
+  assert.ok(svc.disk.has('workflows/Foo.json'))
+  assert.equal(svc.disk.size, 1)
+})
+
+test('double-extension Save-As to the base name still COPIES, never renames (#226)', async () => {
+  // ComfyUI strips the final ".json", so a file persisted at "Foo.json.json"
+  // reports filename "Foo.json". Save-As to "Foo" must copy, not be misread as
+  // an in-place save (which upstream would turn into a destructive rename).
+  const active = {
+    path: 'workflows/Foo.json.json',
+    filename: 'Foo.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeService({ files: [active.path], active })
+
+  await saveActiveWorkflow(svc, 'Foo', {})
+
+  assert.ok(svc.disk.has('workflows/Foo.json.json'), 'original preserved')
+  assert.ok(svc.disk.has('workflows/Foo.json'), 'copy created')
+  assert.ok(svc.calls.some((c) => c[0] === 'saveWorkflowAs'), 'used saveWorkflowAs')
+  assert.ok(
+    !svc.calls.some((c) => c[0] === 'renameWorkflow'),
+    'never renamed the source'
+  )
+})
+
 test('refuses to rename-destroy a persisted workflow when no copy API exists', async () => {
   const active = {
     path: 'workflows/Foo.json',

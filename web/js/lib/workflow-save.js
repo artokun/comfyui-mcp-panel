@@ -43,15 +43,34 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName } = {}) {
   const wf = svc?.activeWorkflow;
   if (!wf) throw new Error("no active workflow to save");
 
+  // An EXPLICIT name (any string, even "  ") must resolve to a real name. If it
+  // normalizes to empty, refuse — never silently reinterpret an explicit-but-
+  // blank name as "save the current workflow in place", which would overwrite
+  // (and, upstream, could rename/move) the persisted source (issue #226).
+  const explicit = typeof name === "string";
+  if (explicit && !baseName(name)) {
+    throw new Error("name must not be blank — pass a non-whitespace workflow name");
+  }
+
   const wasUnsaved = wf.isTemporary === true || wf.isPersisted === false;
   const currentName = baseName(wf.filename);
   // Only mint a fresh auto-name for a genuinely placeholder ("Unsaved Workflow"
   // / "Untitled …") workflow. A named-but-unsaved workflow saves under its name.
   const needsAutoName = wasUnsaved && isDefaultWorkflowName(currentName);
-  const desired = baseName(name ? name : needsAutoName && autoWorkflowName ? autoWorkflowName() : "");
+  const desired = baseName(explicit ? name : needsAutoName && autoWorkflowName ? autoWorkflowName() : "");
 
-  // A Save-As is any save that lands under a name other than the current one.
-  const isSaveAs = desired && desired !== currentName;
+  // A Save-As is any save that would land at a DIFFERENT path than the one the
+  // workflow currently occupies on disk. Compare full, normalized target PATHS —
+  // NOT names. Comparing a twice-stripped filename is unsafe: ComfyUI strips the
+  // final ".json" from the on-disk name, so a file at "…/Foo.json.json" reports
+  // filename "Foo.json"; baseName() would strip it again to "Foo" and misjudge a
+  // Save-As to "Foo" as an in-place save. That routes to svc.saveWorkflow, which
+  // upstream detects as a path change and calls renameWorkflow — MOVING and
+  // destroying the persisted source. Path-vs-path comparison always sends a real
+  // relocation down the copy (saveWorkflowAs) branch instead.
+  const desiredPath = desired ? normalizePath(`${directoryOf(wf)}${desired}.json`) : "";
+  const currentPath = normalizePath(wf.path);
+  const isSaveAs = !!desired && desiredPath !== currentPath;
 
   if (isSaveAs) {
     // Copy path. saveWorkflowAs handles BOTH cases correctly: for a persisted
@@ -86,8 +105,18 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName } = {}) {
 /** Directory prefix (with trailing slash) that a new sibling file should live in,
  *  preserving the workflow's containing folder. Defaults to the workflows root. */
 function directoryOf(wf) {
-  const dir = String(wf?.directory || "").replace(/\/+$/, "");
+  const dir = String(wf?.directory || "").replace(/[\\/]+$/, "");
   return dir ? `${dir}/` : "workflows/";
+}
+
+/** Normalize a workflow path for a stable same-file comparison: forward slashes,
+ *  no doubled/trailing separators. Case is preserved (a case-only difference is
+ *  treated as a Save-As, which is the safe direction — it copies). */
+function normalizePath(path) {
+  return String(path || "")
+    .replaceAll("\\", "/")
+    .replace(/\/{2,}/g, "/")
+    .replace(/\/+$/, "");
 }
 
 async function saveInPlace(svc, wf) {
