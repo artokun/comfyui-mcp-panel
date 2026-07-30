@@ -7,6 +7,23 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- **Route panel node ops by Manager generation (#187, #182, #184).** The
+  built-in Manager helpers hardcoded the `/v2/manager/queue/task` envelope, so
+  `panel_install_node` / `panel_update_node` returned HTTP 405 against Manager
+  v4 in legacy-UI mode (`--enable-manager-legacy-ui`, #187) and against the
+  released ComfyUI-Manager 3.x (#182). Added `detectManagerDialect()` (probes
+  `/v2/manager/queue/status` + `/v2/manager/is_legacy_manager_ui`, falls back to
+  `/manager/queue/status`; cached per session) and a `managerCall()` sibling
+  that hits absolute (non-`/v2`) routes. Install/update/queue-status/list/search
+  now pick per dialect: `v2` (unified task envelope), `v2-batch` (POST
+  `/v2/manager/queue/batch` with 3.x body shapes), or `legacy` (per-operation
+  `/manager/queue/*`, no `/v2` prefix). Mirrors the mcp orchestrator's
+  `detectManagerApi`.
+- **`panel_install_node` no longer silently no-ops (#184).** On the batch
+  dialect it now inspects the `{failed:[...]}` response and throws when the
+  target pack failed instead of reporting a queued success — the rgthree-comfy
+  case where the queue drained "done" but the pack never hit disk. The queued
+  note also tells the agent to VERIFY with `panel_list_nodes`.
 - **Pre-empt the coming comfy-cli hard error.** Publishing already warns that
   "we will soon disable exec and eval, and multiple statements in a single
   line"; when that lands it breaks `Publish to Comfy Registry`, i.e. we'd find
