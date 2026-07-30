@@ -2,55 +2,62 @@
 //
 // ComfyUI fires `executed` once PER output node, so a multi-output run would
 // otherwise inject several fragmented image turns into the agent. We BUFFER a
-// run's inline image refs by prompt_id as `executed` events arrive, then deliver
-// ONE consolidated `executed` agent_event when that prompt *authoritatively*
-// finishes.
+// run's inline image refs (and video descriptors) by prompt_id as `executed`
+// events arrive, then deliver ONE consolidated completion when that prompt
+// *authoritatively* finishes.
 //
-// "Authoritative" is the whole point of this module. Completion is keyed on the
-// ComfyUI execution lifecycle for a SPECIFIC prompt_id — execution_start →
-// executed(…) → execution_success — NOT on a debounce timer. Prior behaviour
-// flushed on a 1.5s debounce, which fired mid-run whenever two output nodes were
-// >1.5s apart (a fast PreviewImage upstream of a slow KSampler is the normal
-// shape of many graphs). That produced:
-//   • partial image batches + a wrong (~6× short) duration (#293),
-//   • a previous run's buffer delivered as the current run's FINAL output while
-//     the queued prompt was still executing (#224),
-//   • "no saved output node ran" while SaveImage was still seconds from writing
-//     (#200),
-//   • the correct, later batch being dropped so the agent never resumed on the
-//     real result (#269, #468).
+// "Authoritative" is the whole point. Completion is keyed on the ComfyUI
+// execution lifecycle for a SPECIFIC prompt_id — NOT on a debounce timer. The
+// prior implementation flushed on a 1.5s debounce, which fired mid-run whenever
+// two output nodes were >1.5s apart (a fast PreviewImage upstream of a slow
+// KSampler is the normal shape of many graphs), producing partial batches, wrong
+// durations, a prior run's buffer delivered as the current prompt's result, and
+// the correct batch being dropped so the agent never resumed (#293/#224/#200/
+// #269/#468).
 //
-// Rules enforced here:
-//   1. execution_success(prompt_id) is the authoritative flush for THAT prompt —
-//      it collects the FULL output set buffered for that prompt_id.
-//   2. The debounce is a bounded SAFETY NET only. While ComfyUI still reports the
-//      prompt in-flight, the timer RE-ARMS instead of flushing — it never emits a
-//      partial batch. Bounded re-arming (default 600 × 1.5s = 15 min) preserves
-//      the "never strand images" guarantee for an interrupted run that never
-//      delivers a run-end signal.
-//   3. A run beginning flushes any lingering buffer from the PRIOR (sequential)
-//      run first, so an older buffer can never be misattributed to the new run.
-//   4. The idle `executing:null` signal flushes only buffers whose prompt is NOT
-//      still active — it can never truncate a mid-flight run.
-//   5. duration = finish − start, both from the same clock, anchored on
-//      execution_start (with per-node fallbacks) and read at flush time.
+// Model (the invariants that make partial/misattributed completion unreachable):
+//   • A prompt is ACTIVE from the first sign it is running — `execution_start`
+//     OR `executing(node)` (which always precedes that node's `executed`). This
+//     is what closes the "missed execution_start" hole: even if the start frame
+//     is dropped, the per-node `executing` marks the prompt active before any
+//     output is buffered.
+//   • The debounce timer NEVER flushes an ACTIVE prompt. While active it simply
+//     re-arms (bounded, purely to cap timer churn) and then stops — it never
+//     emits a partial batch, so a legitimately long run (video gen can far
+//     exceed any fixed cutoff) is always completed by its real end signal with
+//     the full batch and correct duration.
+//   • The timer's ONLY flush is a last-resort safety net for an ORPHAN buffer we
+//     have NO evidence is running (outputs arrived but no start and no
+//     executing(node) — i.e. heavily dropped frames). Normal runs are always
+//     active, so this path never fires for them.
+//   • Authoritative flush triggers, each scoped to ONE prompt_id and carrying the
+//     full buffered set: `execution_success(prompt_id)` (primary), the queue
+//     going idle via `executing:null` (per-prompt end signal — ComfyUI emits it
+//     exactly once at prompt end, never mid-run), and a NEW run starting (which
+//     means every prior sequential run is done — flush them first so nothing
+//     bleeds into the new run, including a legacy __no_prompt__ buffer).
+//   • duration = finish − start, both from the same clock, anchored on the run
+//     start and read at flush; a missing start yields a null (omitted) duration,
+//     never a bogus 0.0s.
 //
 // The module owns ONLY lifecycle + buffering + timing. Presentation (note text,
-// metadata fetch, sendFrame) stays with the caller via the `onFlush` callback,
-// which receives the full, correctly-scoped batch exactly once per completion.
+// metadata fetch, sendFrame, video storyboard) stays with the caller via the
+// `onFlush` callback, which receives the full, correctly-scoped batch — plus the
+// prompt_id `key` for machine-readable attribution — exactly once per completion.
 
 export const NO_PROMPT_KEY = "__no_prompt__";
 
 /**
  * @param {object} opts
- * @param {(payload:{key:string, images:any[], durationMs:number|null, finishedAt:number}) => void} opts.onFlush
- *   Called exactly once per completed prompt that buffered ≥1 image, with the
- *   FULL batch for that prompt_id and the correct start→finish duration.
+ * @param {(payload:{key:string, promptId:(string|null), images:any[], videos:any[], durationMs:number|null, finishedAt:number}) => void} opts.onFlush
+ *   Called exactly once per completed prompt that buffered ≥1 image or video,
+ *   with the FULL batch for that prompt_id, the correct start→finish duration,
+ *   and the prompt_id (`key`/`promptId`) so the delivery can be attributed.
  * @param {() => number} [opts.now]        Clock (injectable for tests).
  * @param {(fn:Function, ms:number) => any} [opts.setTimer]
  * @param {(t:any) => void} [opts.clearTimer]
- * @param {number} [opts.debounceMs]       Safety-net interval (default 1500).
- * @param {number} [opts.maxRearms]        Re-arm ceiling (default 600 = ~15 min).
+ * @param {number} [opts.debounceMs]       Orphan-flush / re-arm interval (default 1500).
+ * @param {number} [opts.maxRearms]        Re-arm churn cap for an active buffer (default 40).
  */
 export function createRunCompletionTracker({
   onFlush,
@@ -58,14 +65,15 @@ export function createRunCompletionTracker({
   setTimer = (fn, ms) => setTimeout(fn, ms),
   clearTimer = (t) => clearTimeout(t),
   debounceMs = 1500,
-  maxRearms = 600,
+  maxRearms = 40,
 } = {}) {
   if (typeof onFlush !== "function") {
     throw new TypeError("createRunCompletionTracker requires an onFlush callback");
   }
   const key = (id) => id ?? NO_PROMPT_KEY;
-  const buffers = new Map(); // key -> { images: any[], timer, rearms }
-  const active = new Set(); // keys ComfyUI currently reports in-flight
+  const promptIdOf = (k) => (k === NO_PROMPT_KEY ? null : k);
+  const buffers = new Map(); // key -> { images: any[], videos: any[], timer, rearms }
+  const active = new Set(); // keys ComfyUI currently reports as running
   const starts = new Map(); // key -> start timestamp
 
   function markStart(id) {
@@ -86,14 +94,21 @@ export function createRunCompletionTracker({
     buf.timer = setTimer(() => {
       const b = buffers.get(k);
       if (!b) return;
-      // If ComfyUI still reports this prompt in-flight, the run is NOT done —
-      // re-arm rather than flush a partial batch (#293/#200). Bounded so an
-      // interrupted run that never delivers a run-end signal still flushes.
-      if (active.has(k) && b.rearms < maxRearms) {
-        b.rearms += 1;
-        arm(k);
+      b.timer = null;
+      if (active.has(k)) {
+        // The prompt is (still) running per ComfyUI — NEVER flush a partial batch
+        // (#293/#200). Re-arm a bounded number of times purely to cap timer churn,
+        // then stop and wait for the authoritative end signal (success / queue
+        // idle / next run). A legitimately long run is completed there, in full.
+        if (b.rearms < maxRearms) {
+          b.rearms += 1;
+          arm(k);
+        }
         return;
       }
+      // Not active: we have NO evidence this prompt is running (no start, no
+      // executing(node)) yet outputs arrived — an orphan from dropped frames.
+      // Flush it as a last resort so images are never permanently stranded.
       flush(k);
     }, debounceMs);
   }
@@ -108,47 +123,57 @@ export function createRunCompletionTracker({
     const startTs = starts.get(k);
     starts.delete(k);
     const durationMs = startTs != null ? now() - startTs : null;
-    if (!buf.images.length) return;
-    onFlush({ key: k, images: buf.images, durationMs, finishedAt: now() });
+    if (!buf.images.length && !buf.videos.length) return;
+    onFlush({
+      key: k,
+      promptId: promptIdOf(k),
+      images: buf.images,
+      videos: buf.videos,
+      durationMs,
+      finishedAt: now(),
+    });
+  }
+
+  function ensureBuffer(k) {
+    let buf = buffers.get(k);
+    if (!buf) {
+      buf = { images: [], videos: [], timer: null, rearms: 0 };
+      buffers.set(k, buf);
+    }
+    return buf;
   }
 
   return {
     /** ComfyUI `execution_start` — authoritative run-start for a prompt. */
     onExecutionStart(id) {
       const k = key(id);
-      // Runs are sequential: a new run beginning means EVERY prior run has ended,
-      // even one whose execution_success we missed (the exact #224 conditions).
-      // Finalize every other buffer NOW — attributed to ITS own prompt/timing —
-      // so an older buffer can never be carried into, and misreported as, this
-      // new run (#224). A stale prior prompt is also cleared from `active` so it
-      // can't linger and suppress a future idle flush. Never touch this run's own.
-      for (const other of [...buffers.keys()]) {
-        if (other !== k) {
-          active.delete(other);
-          flush(other);
-        }
-      }
-      // Drop any stale active marker with no buffer (e.g. a prior run that
-      // produced no images and never signalled end) so `active` can't leak.
-      for (const other of [...active]) {
-        if (other !== k) active.delete(other);
-      }
+      // Runs are sequential: a new run beginning means EVERY prior run has ended
+      // (even one whose end signal we missed). Flush every existing buffer under
+      // ITS OWN key/timing first, so an older buffer — including a legacy
+      // __no_prompt__ one from the previous run — can never bleed into, or be
+      // misreported as, this new run (#224). A run cannot have buffered output
+      // before its own start, so nothing belonging to THIS run is lost here.
+      for (const other of [...buffers.keys()]) flush(other);
+      active.clear();
       markStart(id);
       active.add(k);
     },
 
-    /** ComfyUI `executed` (per output node) — buffer this prompt's images. */
-    onExecuted(id, images) {
-      if (!images || !images.length) return;
+    /**
+     * ComfyUI `executed` (per output node) — buffer this prompt's outputs.
+     * @param {string|null} id
+     * @param {{images?: any[], videos?: any[]}} outputs
+     */
+    onExecuted(id, { images = [], videos = [] } = {}) {
+      if (!images.length && !videos.length) return;
       // Fallback render-start if execution_start was missed (no-op otherwise).
+      // Does NOT mark active: `executing(node)` is the run-liveness signal, so an
+      // output with no start AND no executing(node) is treated as an orphan.
       markStart(id);
       const k = key(id);
-      let buf = buffers.get(k);
-      if (!buf) {
-        buf = { images: [], timer: null, rearms: 0 };
-        buffers.set(k, buf);
-      }
-      buf.images.push(...images);
+      const buf = ensureBuffer(k);
+      if (images.length) buf.images.push(...images);
+      if (videos.length) buf.videos.push(...videos);
       arm(k);
     },
 
@@ -157,8 +182,7 @@ export function createRunCompletionTracker({
       const k = key(id);
       active.delete(k);
       flush(k);
-      // Retire start for runs that buffered no inline images (e.g. video-only),
-      // where flush early-returns and would otherwise leave the entry behind.
+      // Retire start for runs that buffered nothing (flush early-returns then).
       starts.delete(k);
     },
 
@@ -172,22 +196,32 @@ export function createRunCompletionTracker({
       starts.delete(k);
     },
 
-    /** Legacy idle signal: `executing` with node===null (no prompt_id). */
+    /**
+     * Legacy/secondary run-end: `executing` with node===null. ComfyUI emits this
+     * exactly once when a prompt finishes and the queue goes idle — NOT mid-run —
+     * so it is an authoritative per-prompt end. Flush every remaining buffer
+     * under its own key (correct attribution) and clear liveness. On modern
+     * ComfyUI the buffer is already gone (execution_success flushed it); this is
+     * the completion path for legacy servers that emit no execution_success.
+     */
     onExecutingNull() {
-      // The queue is idle. Flush only buffers whose prompt ComfyUI is NOT still
-      // running — an active prompt is flushed by execution_success and must
-      // never be truncated here (#200/#224).
-      for (const k of [...buffers.keys()]) {
-        if (!active.has(k)) flush(k);
-      }
+      for (const k of [...buffers.keys()]) flush(k);
+      active.clear();
     },
 
-    /** `executing` with a node id — fallback render-start anchor. */
+    /**
+     * `executing` with a node id. Anchors the render-start AND marks the prompt
+     * active — this is the run-liveness signal that closes the "missed
+     * execution_start" hole (it always precedes that node's `executed`), so the
+     * timer can never early-flush a run whose start frame was dropped.
+     */
     onExecutingNode(id) {
-      if (id != null) markStart(id);
+      if (id == null) return;
+      markStart(id);
+      active.add(key(id));
     },
 
-    /** Synchronous start lookup for the async video-storyboard duration path. */
+    /** Synchronous start lookup (diagnostics / fallbacks). */
     startFor(id) {
       return starts.get(key(id));
     },

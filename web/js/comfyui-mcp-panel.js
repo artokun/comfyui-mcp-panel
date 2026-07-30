@@ -14427,7 +14427,7 @@ function buildPanel() {
   // → upload to input/ → deliver THAT as an inline image (own executed event), and
   // paint it as a card so the user sees it too. Fully non-blocking + best-effort:
   // any failure just logs and leaves the video player as-is (no agent image).
-  async function deliverVideoStoryboard(m, nodeId, promptId) {
+  async function deliverVideoStoryboard(m, nodeId, promptId, durationMs) {
     // Same final-vs-preview distinction as still images: a VHS-style video node
     // with `type:"output"` is the real SAVED file; `type:"temp"` (save_output off)
     // is a throwaway preview. Be conservative — only explicit "output" is final.
@@ -14440,13 +14440,13 @@ function buildPanel() {
       : `a PREVIEW video (file ${fileName}, temporary — not a saved file; add/enable a save to persist it)`;
     // ── Video metadata (gathered up front) ─────────────────────────────────
     // path (subfolder-relative), real frame metadata when the VHS/video output
-    // payload carries it, render duration, and completion time. Capture the
-    // render-start SYNCHRONOUSLY here (before any await / before the run's flush
-    // retires it) so the duration survives a concurrent execution_success.
+    // payload carries it, render duration, and completion time. The duration is
+    // the run's authoritative start→finish span, passed in by the completion
+    // flush (execution_success), NOT measured at this node's `executed` time — so
+    // a video is never reported with a truncated or premature duration.
     const subfolder = coerceMessageText(m?.subfolder);
     const path = subfolder ? `${subfolder}/${fileName}` : fileName;
-    const startTs = runCompletion.startFor(promptId);
-    const duration = startTs != null ? formatDuration(Date.now() - startTs) : null;
+    const duration = durationMs != null ? formatDuration(durationMs) : null;
     const finishedClock = formatClock(new Date());
     // Real per-video frame metadata, when present on the descriptor (VHS-style
     // video/gif outputs may include frame_count / frame_rate / format). Omit if
@@ -14485,6 +14485,7 @@ function buildPanel() {
           `; tell the user it's ready and ask how it looks if you need to judge it.` +
           metaSuffix(null, null),
         node_id: nodeId,
+        ...(promptId != null ? { prompt_id: promptId } : {}),
       });
     if (prefs.videoStoryboard === false) {
       noteOnly("storyboard preview is turned off in panel settings");
@@ -14523,6 +14524,7 @@ function buildPanel() {
           `Review motion, sharpness, and temporal consistency.` +
           metaSuffix(sizeStr, n),
         node_id: nodeId,
+        ...(promptId != null ? { prompt_id: promptId } : {}),
       });
     } catch (err) {
       console.warn("[cmcp] storyboard pipeline failed:", err);
@@ -14543,22 +14545,32 @@ function buildPanel() {
   // than a debounce timer. That is what stops a partial/early flush (#293, #200),
   // a prior run's buffer being misattributed to the current prompt (#224), and
   // the correct batch being dropped so the agent never resumes (#269, #468). The
-  // debounce survives only as a bounded safety net that re-arms while the prompt
-  // is still in-flight, so images from an interrupted run are never stranded.
+  // debounce NEVER flushes a running prompt — it re-arms while active and only
+  // flushes a true orphan (outputs with no start/executing signal), so a partial
+  // batch can't be emitted for a legitimately long run.
   //
   // This closure owns ONLY presentation: it receives the full, correctly-scoped
   // batch + duration for a completed prompt and composes the single agent_event.
   const runCompletion = createRunCompletionTracker({
-    onFlush: (payload) => {
-      // Fire-and-forget: emitRunImages is async (metadata HEADs), but it already
-      // has the full batch — a failure inside it must never wedge the lifecycle.
-      emitRunImages(payload).catch((err) =>
-        console.warn("[cmcp] emitRunImages failed:", err),
-      );
+    onFlush: ({ promptId, images: flImages, videos: flVideos, durationMs }) => {
+      // A completed prompt delivers its FULL batch here, exactly once. Stills go
+      // out as one consolidated agent_event; each video (routed through the same
+      // authoritative lifecycle — not a per-node timer) gets its storyboard with
+      // the run's real start→finish duration. Fire-and-forget: these are async
+      // (metadata HEADs / frame sampling), but the batch is already captured — a
+      // failure inside must never wedge the lifecycle.
+      if (flImages && flImages.length) {
+        emitRunImages({ promptId, images: flImages, durationMs }).catch((err) =>
+          console.warn("[cmcp] emitRunImages failed:", err),
+        );
+      }
+      for (const v of flVideos || []) {
+        deliverVideoStoryboard(v.m, v.nodeId, promptId, durationMs);
+      }
     },
   });
 
-  async function emitRunImages({ images: bufImages, durationMs }) {
+  async function emitRunImages({ promptId, images: bufImages, durationMs }) {
     const duration = formatDuration(durationMs);
     const finishedAt = new Date();
     const finishedClock = formatClock(finishedAt);
@@ -14691,6 +14703,9 @@ function buildPanel() {
       images,
       note,
       metadata,
+      // Machine-readable attribution: which prompt this completion belongs to, so
+      // a delayed prior-run flush can never be mistaken for the current run (#224).
+      ...(promptId != null ? { prompt_id: promptId } : {}),
     });
   }
 
@@ -14714,25 +14729,23 @@ function buildPanel() {
       const url = imageViewUrl(m);
       if (isVideoOutput(m)) {
         paintVideo(url, m.filename);
-        videos.push(m);
+        // Carry the node id so the deferred storyboard event can name its node.
+        videos.push({ m, nodeId });
       } else {
         paintImage(url, m.filename);
         inlineImages.push(m);
       }
     }
-    // Buffer the directly-viewable images for THIS run instead of sending a turn
-    // per node — they're flushed as one consolidated `executed` event when the
-    // prompt finishes (see runCompletion/onFlush). The image already painted above, so
-    // the user still sees it live; only the agent delivery is deferred+grouped.
-    if (inlineImages.length) {
-      runCompletion.onExecuted(d.prompt_id, inlineImages);
-    } else if (!videos.length) {
-      // No viewable images and no videos (shouldn't happen given the guard above).
-      return;
+    // Buffer this run's outputs (images AND videos) instead of delivering per
+    // node — the tracker flushes them together as ONE completion when the prompt
+    // AUTHORITATIVELY finishes (execution_success / queue idle). Everything is
+    // already painted above, so the user sees it live; only the agent delivery is
+    // deferred+grouped. Routing videos through the SAME lifecycle (rather than a
+    // per-node timer) is what gives a video its real start→finish duration and
+    // guarantees exactly one completion per prompt (#269/#468).
+    if (inlineImages.length || videos.length) {
+      runCompletion.onExecuted(d.prompt_id, { images: inlineImages, videos });
     }
-    // Kick off a storyboard per video — non-blocking; onExecuted has already sent
-    // its event and painted everything. Each storyboard delivers its own event.
-    for (const m of videos) deliverVideoStoryboard(m, nodeId, d.prompt_id);
   }
   function onExecError(ev) {
     const d = ev?.detail ?? {};
