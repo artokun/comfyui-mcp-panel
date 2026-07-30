@@ -111,6 +111,12 @@ import {
   formatDroppedWarning,
 } from "./lib/paste-report.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
+import {
+  nodeFocusBounds,
+  boundsAroundNodes,
+  groupMemberNodes,
+  classifyRequestedMembership,
+} from "./lib/group-geometry.js";
 import { saveActiveWorkflow } from "./lib/workflow-save.js";
 
 let app = null;
@@ -3793,35 +3799,10 @@ function setGroupBounds(group, [x, y, w, h]) {
   }
 }
 
-/** [x, y, w, h] that wraps the given nodes, padded for the group + node titles. */
-function boundsAroundNodes(nodes, pad = 30, titlePad = 70) {
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-  for (const n of nodes) {
-    const x = n.pos?.[0] ?? 0;
-    const y = n.pos?.[1] ?? 0;
-    const w = n.size?.[0] ?? 200;
-    const h = n.size?.[1] ?? 100;
-    minX = Math.min(minX, x);
-    minY = Math.min(minY, y);
-    maxX = Math.max(maxX, x + w);
-    maxY = Math.max(maxY, y + h);
-  }
-  if (!Number.isFinite(minX)) return [100, 100, 400, 300];
-  return [minX - pad, minY - titlePad, maxX - minX + pad * 2, maxY - minY + titlePad + pad];
-}
-
 /** Compact JSON-friendly view of a group box. */
 function summarizeGroup(graph, g) {
   const b = g._bounding ?? [g.pos?.[0] ?? 0, g.pos?.[1] ?? 0, g.size?.[0] ?? 0, g.size?.[1] ?? 0];
-  // LiteGraph groups do NOT own their nodes — membership is purely geometric
-  // (which nodes sit inside the group box). Recompute it so the agent gets the
-  // actual member node_ids (to wrap a group into a subgraph, toggle it as a unit,
-  // etc.) instead of reconstructing membership from coordinates by hand.
-  g.recomputeInsideNodes?.();
-  const memberIds = (g._nodes ?? []).map((n) => n.id);
+  const memberIds = groupMemberNodes(graph, g).map((n) => n.id);
   return {
     id: g.id != null ? g.id : (graph._groups ?? []).indexOf(g),
     title: g.title ?? "",
@@ -4364,8 +4345,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const groupOf = new Map();
     const groupLines = [];
     for (const g of groups) {
-      g.recomputeInsideNodes?.();
-      const ids = (g._nodes ?? []).map((n) => n.id);
+      const ids = groupMemberNodes(graph, g).map((n) => n.id);
       const tag = { 2: " [mute]", 4: " [bypass]" }[g.mode] ?? "";
       groupLines.push(`  "${g.title ?? ""}"${tag} → ${ids.join(",") || "(empty)"}`);
       for (const id of ids) {
@@ -5418,8 +5398,7 @@ const GRAPH_TOOL_EXECUTORS = {
 
     // Group boxes (geometric membership recomputed, same as summarizeGroup).
     const groupBoxes = (graph._groups ?? []).map((g) => {
-      g.recomputeInsideNodes?.();
-      const memberIds = (g._nodes ?? []).map((n) => n.id).filter((id) => targetIds.has(id));
+      const memberIds = groupMemberNodes(graph, g).map((n) => n.id).filter((id) => targetIds.has(id));
       const collapsed = !!(g.flags?.collapsed || g.collapsed);
       return { g, memberIds, collapsed };
     });
@@ -5467,14 +5446,22 @@ const GRAPH_TOOL_EXECUTORS = {
 
     // Predicted group boxes (new member positions, current pos for un-moved
     // members). preserve + cluster re-fit; ignore leaves boxes untouched.
-    const predictGroupBounds = (g) => {
-      const members = (g._nodes ?? []).map((n) => {
-        const p = layout.positions.get(n.id);
-        return {
-          pos: p ? [p[0], p[1]] : [n.pos?.[0] ?? 0, n.pos?.[1] ?? 0],
-          size: [n.size?.[0] ?? 200, n.size?.[1] ?? 100],
-        };
-      });
+    // Predict from the PRE-MOVE member snapshot (gb.memberIds, captured before
+    // any node moved), not a live recompute — the apply path moves nodes first,
+    // and a member's NEW position may fall outside the OLD box, so recomputing
+    // live here would silently drop it and shrink the group box.
+    const nodeById = new Map((graph._nodes ?? []).map((n) => [n.id, n]));
+    const predictGroupBounds = (memberIds) => {
+      const members = memberIds
+        .map((id) => nodeById.get(id))
+        .filter(Boolean)
+        .map((n) => {
+          const p = layout.positions.get(n.id);
+          return {
+            pos: p ? [p[0], p[1]] : [n.pos?.[0] ?? 0, n.pos?.[1] ?? 0],
+            size: [n.size?.[0] ?? 200, n.size?.[1] ?? 100],
+          };
+        });
       return boundsAroundNodes(members);
     };
     const groupResults =
@@ -5485,7 +5472,7 @@ const GRAPH_TOOL_EXECUTORS = {
             .map((gb) => ({
               group_id: gb.g.id != null ? gb.g.id : (graph._groups ?? []).indexOf(gb.g),
               title: gb.g.title ?? "",
-              bounds: predictGroupBounds(gb.g).map(Math.round),
+              bounds: predictGroupBounds(gb.memberIds).map(Math.round),
             }));
 
     if (dry_run) {
@@ -5510,7 +5497,7 @@ const GRAPH_TOOL_EXECUTORS = {
       if (groups !== "ignore") {
         for (const gb of groupBoxes) {
           if (!gb.memberIds.length) continue;
-          setGroupBounds(gb.g, predictGroupBounds(gb.g));
+          setGroupBounds(gb.g, predictGroupBounds(gb.memberIds));
           gb.g.recomputeInsideNodes?.();
         }
       }
@@ -6040,8 +6027,7 @@ const GRAPH_TOOL_EXECUTORS = {
         `no group matching "${group}" — list groups via panel_get_graph (each has id, title, node_ids)`,
       );
     }
-    g.recomputeInsideNodes?.();
-    const ns = [...(g._nodes ?? [])];
+    const ns = groupMemberNodes(graph, g);
     if (!ns.length) {
       throw new Error(`group "${g.title}" has no nodes inside its box to wrap into a subgraph`);
     }
@@ -6472,9 +6458,14 @@ const GRAPH_TOOL_EXECUTORS = {
     if (typeof GroupCls !== "function") throw new Error("LGraphGroup unavailable on this frontend");
     const group = new GroupCls(typeof title === "string" && title ? title : "Group");
     let bbox;
+    let requestedIds = null;
     if (Array.isArray(node_ids) && node_ids.length) {
+      // Record EVERY requested id (including ids that don't resolve) so the
+      // honesty report below can list nonexistent ones as missing (#297).
+      requestedIds = node_ids.map(Number).filter(Number.isFinite);
       const ns = node_ids.map((id) => graph.getNodeById(Number(id))).filter(Boolean);
       if (!ns.length) throw new Error("none of the given node_ids exist in the current graph");
+      // Tight box around exactly the requested nodes that exist (title height + padding).
       bbox = boundsAroundNodes(ns);
     } else if (Array.isArray(bounds) && bounds.length === 4) {
       bbox = bounds.map(Number);
@@ -6493,7 +6484,27 @@ const GRAPH_TOOL_EXECUTORS = {
       graph.afterChange();
     }
     graph.setDirtyCanvas(true, true);
-    return { group: summarizeGroup(graph, group) };
+    const summary = summarizeGroup(graph, group);
+    // Honesty for dense layouts (#297): group membership is purely GEOMETRIC, so
+    // any unrelated node whose box overlaps the computed rectangle is now a member
+    // — LiteGraph has no per-node ownership to exclude it. When the live members
+    // differ from what was requested, surface both sets and a warning instead of
+    // silently reporting a misleading success.
+    if (requestedIds) {
+      const { extra, missing } = classifyRequestedMembership(requestedIds, summary.node_ids);
+      summary.requested_node_ids = requestedIds;
+      if (extra.length || missing.length) {
+        summary.extra_node_ids = extra;
+        summary.missing_node_ids = missing;
+        summary.warning =
+          "group membership is geometric: the box that wraps the requested nodes " +
+          `also overlaps ${extra.length} unrelated node(s)` +
+          (missing.length ? ` and misses ${missing.length} requested node(s)` : "") +
+          ". Move the intended nodes into a contiguous region (panel_move_node / " +
+          "panel_arrange) before grouping, or edit the group bounds, to get an exact set.";
+      }
+    }
+    return { group: summary };
   },
 
   // Move a group's box to [x,y]; by default the contained nodes move with it
@@ -6506,9 +6517,17 @@ const GRAPH_TOOL_EXECUTORS = {
     const dy = Number(pos[1]) - b[1];
     graph.beforeChange();
     try {
-      if (move_nodes !== false && typeof g.move === "function") {
-        g.recomputeInsideNodes?.();
-        g.move(dx, dy, false); // moves the box AND the nodes inside it
+      if (move_nodes !== false) {
+        // Move the box AND the LIVE geometric members together. We don't rely on
+        // g.move(), which shifts LiteGraph's cached g._nodes — that cache is stale
+        // or empty on affected builds (#287/#311/#312), so it would move the wrong
+        // nodes or none. Recompute membership from live geometry, then translate
+        // each member plus the box by the same delta.
+        const members = groupMemberNodes(graph, g);
+        setGroupBounds(g, [Number(pos[0]), Number(pos[1]), b[2], b[3]]);
+        for (const n of members) {
+          n.pos = [(n.pos?.[0] ?? 0) + dx, (n.pos?.[1] ?? 0) + dy];
+        }
       } else {
         setGroupBounds(g, [Number(pos[0]), Number(pos[1]), b[2], b[3]]);
       }
@@ -7206,17 +7225,6 @@ function focusFollowEnabled() {
 const FOCUS_TARGETS = {
   graph_set_widget: (m) => [m.node_id],
 };
-
-/** [x, y, w, h] for a node — prefer litegraph's boundingRect (includes title). */
-function nodeFocusBounds(node) {
-  const br = node.boundingRect;
-  if (Array.isArray(br) && br.length === 4 && (br[2] || br[3])) {
-    return [br[0], br[1], br[2], br[3]];
-  }
-  const w = node.size?.[0] ?? 200;
-  const h = node.size?.[1] ?? 100;
-  return [node.pos[0], node.pos[1] - 30, w, h + 30]; // title bar renders above pos
-}
 
 function unionBounds(list) {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -9046,8 +9054,13 @@ function describeCommand(cmd, msg, reply) {
         icon: "pi-th-large",
         text: `Auto-arranged ${r.node_count} node${r.node_count === 1 ? "" : "s"} (${r.columns} column${r.columns === 1 ? "" : "s"})`,
       };
-    case "graph_create_group":
-      return { icon: "pi-clone", text: `Created group “${r.group?.title}” (id ${r.group?.id})` };
+    case "graph_create_group": {
+      const extra = r.group?.extra_node_ids?.length ?? 0;
+      const suffix = extra
+        ? ` — ⚠ ${extra} unrelated node${extra === 1 ? "" : "s"} also enclosed (geometric)`
+        : "";
+      return { icon: "pi-clone", text: `Created group “${r.group?.title}” (id ${r.group?.id})${suffix}` };
+    }
     case "graph_move_group":
       return { icon: "pi-arrows-alt", text: `Moved group ${r.group?.id} (“${r.group?.title}”)` };
     case "graph_edit_group":
