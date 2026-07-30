@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.18] - 2026-07-30
+
+### Fixed
+- **`graph_screenshot` captures node bodies under ComfyUI's Vue node renderer (#335, #329, #189, #237).** With `Comfy.VueNodes.Enabled` (default-on) node bodies are DOM/Vue elements layered over the LiteGraph canvas, so `toDataURL()` captured only the LiteGraph-painted wires/groups/HUD — screenshots showed zero nodes. Capture now forces the classic LiteGraph paint path by saving/restoring the live `LiteGraph.vueNodesMode` flag (not the async `Comfy.VueNodes.Enabled` setting), fits against CSS-pixel viewport dims, and saves/restores the active subgraph scope in a `finally` (#237). Live-verified on the rig with Vue nodes active: painted node-body pixels rose ~10× (0.34% → 3.52%) with the toggle, and `vueNodesMode` is restored after. (#341)
+- **`panel_get_errors` no longer leaks stale missing-assets from another workflow tab (#316).** A missing-asset candidate whose recognized locator resolves to no node in the ACTIVE graph is now dropped, scoping errors to the currently-active workflow; unparseable/ambiguous locators still fail open so a genuine miss is never swallowed. (Widget-edit/appeared-on-disk staleness was already handled by the shipped #260 live recompute.) (#339)
+- **`panel_set_widget` refreshes stale combo options before validating (#338, #317, #299, #288, #284, #304).** A just-downloaded model / uploaded image / staged output / freshly-installed pack value was refused against the frontend's cached combo list. On a combo rejection only, `set_widget` now awaits an authoritative `/object_info` re-register and revalidates exactly once against the fresh options — a genuinely-invalid value is still rejected (the #240 strictness is preserved). (#340)
+
 ## [0.11.17] - 2026-07-30
 
 ### Fixed
