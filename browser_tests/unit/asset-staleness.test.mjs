@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 
 import {
   findNodeByScopedId,
+  findSubgraphByUuid,
   assetCandidateStillReferenced,
   assetCandidateResolvesLive,
   isStaleAssetCandidate,
@@ -54,6 +55,128 @@ test("findNodeByScopedId walks a subgraph-scoped id one hop per segment", () => 
 test("findNodeByScopedId returns null for a missing node", () => {
   assert.equal(findNodeByScopedId(graphOf([]), 7), null);
   assert.equal(findNodeByScopedId(graphOf([{ id: 6051 }]), "6051:9999"), null);
+});
+
+/** A subgraph whose UUID is its `id` (real LiteGraph shape), holding `nodes`. */
+function subgraphOf(id, nodes) {
+  const byId = new Map(nodes.map((n) => [String(n.id), n]));
+  return { id, _nodes: nodes, getNodeById: (nid) => byId.get(String(nid)) ?? null };
+}
+/** A root graph with a `subgraphs` UUID→Subgraph registry (real ComfyUI shape). */
+function rootWithSubgraphs(rootNodes, subgraphs) {
+  const byId = new Map(rootNodes.map((n) => [String(n.id), n]));
+  return {
+    _nodes: rootNodes,
+    getNodeById: (id) => byId.get(String(id)) ?? null,
+    subgraphs: new Map(subgraphs.map((s) => [s.id, s])),
+  };
+}
+
+const SG_UUID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+
+test("findSubgraphByUuid resolves via the root subgraphs registry", () => {
+  const sub = subgraphOf(SG_UUID, []);
+  const root = rootWithSubgraphs([], [sub]);
+  assert.equal(findSubgraphByUuid(root, SG_UUID), sub);
+});
+
+test("findSubgraphByUuid falls back to a recursive subgraph.id match", () => {
+  const inner = { id: 1913, widgets: [] };
+  const sub = subgraphOf(SG_UUID, [inner]);
+  const host = { id: 6051, subgraph: sub };
+  const root = graphOf([host]); // no registry
+  assert.equal(findSubgraphByUuid(root, SG_UUID), sub);
+});
+
+test("findNodeByScopedId resolves a REAL locator '<subgraphUuid>:<localId>' (#247)", () => {
+  const inner = { id: 1913, widgets: [] };
+  const sub = subgraphOf(SG_UUID, [inner]);
+  const root = rootWithSubgraphs([], [sub]);
+  assert.equal(findNodeByScopedId(root, `${SG_UUID}:1913`), inner);
+});
+
+test("findNodeByScopedId returns null when the subgraph UUID is unknown (fails open)", () => {
+  const root = rootWithSubgraphs([], []);
+  assert.equal(findNodeByScopedId(root, `${SG_UUID}:1913`), null);
+});
+
+test("findNodeByScopedId STRICT-rejects malformed locators ⇒ null ⇒ fail-open (codex round-2 #1)", () => {
+  // The subgraph DOES contain node 6077 — a loose first/last-segment parse would
+  // wrongly resolve it and suppress a genuine miss. Strict parsing must return
+  // null for every malformed shape so the cross-check keeps reporting.
+  const inner = { id: 6077, widgets: [{ name: "image", value: "still-missing.png" }] };
+  const sub = subgraphOf(SG_UUID, [inner]);
+  const root = rootWithSubgraphs([], [sub]);
+  assert.equal(findNodeByScopedId(root, `${SG_UUID}:unexpected:6077`), null); // 3 segments
+  assert.equal(findNodeByScopedId(root, `${SG_UUID}::6077`), null); // empty middle
+  assert.equal(findNodeByScopedId(root, `${SG_UUID}:`), null); // empty local id
+  assert.equal(findNodeByScopedId(root, `not-a-uuid:6077`), null); // bad UUID
+  assert.equal(findNodeByScopedId(root, `${SG_UUID}:6077:extra:more`), null); // 4 segments
+  // The valid two-segment form still resolves.
+  assert.equal(findNodeByScopedId(root, `${SG_UUID}:6077`), inner);
+});
+
+test("isStaleAssetCandidate: a malformed 3-segment locator does NOT suppress a genuine miss (fail-open, codex round-2 #1)", () => {
+  const inner = { id: 6077, widgets: [{ name: "image", value: "moved.png" }] };
+  const sub = subgraphOf(SG_UUID, [inner]);
+  const root = rootWithSubgraphs([], [sub]);
+  // Even though no widget holds "gone.png", the locator is unrecognized ⇒ resolver
+  // returns null ⇒ still-referenced fails OPEN ⇒ candidate is NOT dropped.
+  assert.equal(
+    isStaleAssetCandidate(root, { nodeId: `${SG_UUID}:x:6077`, name: "gone.png", widgetName: "image" }),
+    false,
+  );
+});
+
+test("findSubgraphByUuid terminates on a cyclic subgraph graph (codex round-2 #2)", () => {
+  // Build a cycle: subgraph A hosts a node whose subgraph is B, and B hosts a
+  // node whose subgraph is A again. An unknown UUID must not recurse forever.
+  const a = subgraphOf("uuid-A", []);
+  const b = subgraphOf("uuid-B", []);
+  a._nodes = [{ id: 1, subgraph: b }];
+  b._nodes = [{ id: 2, subgraph: a }];
+  const root = graphOf([{ id: 10, subgraph: a }]);
+  assert.equal(findSubgraphByUuid(root, "does-not-exist"), null); // terminates, no overflow
+  assert.equal(findSubgraphByUuid(root, "uuid-B"), b); // still finds a real one
+});
+
+test("findNodeByScopedId fails open (null) on a cyclic graph with an unknown UUID (codex round-2 #2)", () => {
+  const a = subgraphOf("uuid-A", []);
+  const b = subgraphOf("uuid-B", []);
+  a._nodes = [{ id: 1, subgraph: b }];
+  b._nodes = [{ id: 2, subgraph: a }];
+  const root = graphOf([{ id: 10, subgraph: a }]);
+  assert.equal(findNodeByScopedId(root, `${SG_UUID}:6077`), null); // no overflow, fail-open
+});
+
+test("isStaleAssetCandidate: STALE once a subgraph LoadImage/model widget is fixed via a UUID locator (#247/#352)", () => {
+  // LTX-style subgraph: the store still lists the pre-edit template filename, but
+  // the live widget inside the subgraph now points at the installed alternative.
+  const inner = { id: 6077, widgets: [{ name: "image", value: "ChatGPT Image.png" }] };
+  const sub = subgraphOf(SG_UUID, [inner]);
+  const root = rootWithSubgraphs([], [sub]);
+  assert.equal(
+    isStaleAssetCandidate(root, {
+      nodeId: `${SG_UUID}:6077`,
+      name: "sample_woman.png",
+      widgetName: "image",
+    }),
+    true,
+  );
+});
+
+test("isStaleAssetCandidate: a genuinely-missing subgraph asset STILL reports (UUID locator)", () => {
+  const inner = { id: 6077, widgets: [{ name: "ckpt_name", value: "ltx-2.3-22b-dev.safetensors" }] };
+  const sub = subgraphOf(SG_UUID, [inner]);
+  const root = rootWithSubgraphs([], [sub]);
+  assert.equal(
+    isStaleAssetCandidate(root, {
+      nodeId: `${SG_UUID}:6077`,
+      name: "ltx-2.3-22b-dev.safetensors",
+      widgetName: "ckpt_name",
+    }),
+    false,
+  );
 });
 
 test("assetCandidateStillReferenced: true while a widget still holds the file", () => {
