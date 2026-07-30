@@ -236,24 +236,89 @@ test('contract has no dead method entries (each is referenced in executable sour
   }
 })
 
-test('OPTIONAL methods are genuinely capability-guarded in source (cannot be a bypass)', () => {
+// Compute the union of source regions in which a call is protected against the
+// callee METHOD being absent at runtime — i.e. calling it cannot crash a frontend
+// that dropped it. Three guard shapes, matching the task's contract:
+//   • typeof <acc>.<m> === "function"  → the braced block it gates, AND (for the
+//     inline `&& <acc>.<m>()` short-circuit shape) the remainder of that same
+//     statement;
+//   • try { … }                        → a thrown TypeError from an absent method
+//     is caught, so the whole try body is a guarded region;
+// plus the per-call optional-invocation form `<acc>.<m>?.(` which is self-guarding
+// (returns undefined instead of throwing) and is handled at the call site.
+function bracedBlockAfter(text, fromIndex) {
+  const open = text.indexOf('{', fromIndex)
+  if (open === -1) return null
+  let depth = 0
+  for (let i = open; i < text.length; i++) {
+    if (text[i] === '{') depth++
+    else if (text[i] === '}' && --depth === 0) return [open, i]
+  }
+  return null
+}
+
+function guardRegionsFor(text, m) {
+  const regions = []
+  // typeof guard: braced block it gates + the inline short-circuit tail.
+  const typeofRe = new RegExp(`typeof\\s+[\\w.?$]*\\.${m}\\s*===?\\s*["']function["']`, 'g')
+  let g
+  while ((g = typeofRe.exec(text))) {
+    const block = bracedBlockAfter(text, typeofRe.lastIndex)
+    if (block) regions.push(block)
+    // Inline `typeof x.m === "function" && x.m()` (no brace): guard the rest of
+    // the statement, up to the next `;` or newline.
+    let end = text.length
+    for (let i = typeofRe.lastIndex; i < text.length; i++) {
+      if (text[i] === ';' || text[i] === '\n') {
+        end = i
+        break
+      }
+    }
+    regions.push([g.index, end])
+  }
+  // try { … } blocks — a TypeError from an absent method is caught here.
+  const tryRe = /\btry\s*\{/g
+  let t
+  while ((t = tryRe.exec(text))) {
+    const block = bracedBlockAfter(text, t.index)
+    if (block) regions.push(block)
+  }
+  return regions
+}
+
+test('EVERY OPTIONAL-method call site is capability-guarded in source (per call site, not existential)', () => {
   // OPTIONAL_METHODS are exempt from the bundle check precisely because the panel
-  // tolerates their absence — which is ONLY true if every use is behind a
-  // capability guard. Enforce that, so a maintainer cannot silence the contract
-  // guard by parking a new UNCONDITIONAL `s.removedMethod()` call in this array:
-  // an unguarded optional method would still crash a frontend that dropped it.
+  // tolerates their absence — which is ONLY true if EVERY call site is behind a
+  // capability guard. The old check was existential (one guard anywhere passed);
+  // this enumerates every `<acc>.<m>(` call and requires EACH to sit inside a
+  // guarding region (typeof block / inline short-circuit / try) or use optional
+  // invocation `<acc>.<m>?.(`. So a maintainer cannot silence the contract guard
+  // by parking a new UNCONDITIONAL `s.removedMethod()` call alongside one guard —
+  // that unguarded call now FAILS. An optional method with NO call site at all is
+  // fine (nothing to crash); the "no dead entries" test covers the reverse.
   const src = stripComments(readFileSync(SAVE_LIB, 'utf8')) + '\n' + stripComments(readFileSync(PANEL, 'utf8'))
   for (const m of OPTIONAL_METHODS) {
-    const guarded =
-      new RegExp(`typeof\\s+[\\w.?]*\\.${m}\\s*===?\\s*["']function["']`).test(src) || // typeof x.m === "function"
-      new RegExp(`if\\s*\\(\\s*!\\s*[\\w.?]*\\.${m}\\b`).test(src) || //                    if (!x.m) …
-      new RegExp(`[\\w.?]*\\.${m}\\s*&&`).test(src) //                                       x.m && …
-    assert.ok(
-      guarded,
-      `OPTIONAL method "${m}" has no capability guard (typeof …=== "function" / if(!…) / …&&) ` +
-        `in source — an optional frontend method MUST be guarded or it crashes when absent (#268). ` +
-        `If it is actually required, move it to REQUIRED_METHODS so the bundle check covers it.`
-    )
+    const regions = guardRegionsFor(src, m)
+    // Match both `<acc>.m(` and the self-guarding `<acc>.m?.(`. Group 1 present =>
+    // optional invocation => guarded regardless of surrounding region.
+    const callRe = new RegExp(`\\.${m}\\s*(\\?\\.)?\\(`, 'g')
+    let call
+    let sites = 0
+    while ((call = callRe.exec(src))) {
+      sites++
+      const at = call.index
+      const optionalInvoke = Boolean(call[1])
+      const inRegion = regions.some(([o, c]) => at >= o && at <= c)
+      assert.ok(
+        optionalInvoke || inRegion,
+        `OPTIONAL method "${m}" is called UNGUARDED at offset ${at} — not inside a ` +
+          `typeof "…function" block, an inline short-circuit, a try {}, and not via ` +
+          `optional invocation (.${m}?.(). An optional frontend method MUST be guarded ` +
+          `at EVERY call site or it crashes when absent (#268). If it is actually ` +
+          `required, move it to REQUIRED_METHODS so the bundle check covers it.`
+      )
+    }
+    void sites // call-count is informational; a zero-call optional is not a failure here.
   }
 })
 
@@ -316,15 +381,31 @@ test('version-variable Save-As methods are only reached behind a typeof capabili
 // 2. Verify the contract against the INSTALLED frontend static bundle.
 // ---------------------------------------------------------------------------
 
+// Resolve the installed frontend static dir, distinguishing two cases so CI can
+// never silently skip the bundle assertions:
+//   • COMFYUI_FRONTEND_STATIC is SET but does not resolve (no assets/ dir) → THROW.
+//     CI explicitly sets this variable, so a bad path or an upstream layout change
+//     is a REAL regression and must FAIL the test, not skip it (the #268 class of
+//     silent gap this whole file exists to close).
+//   • COMFYUI_FRONTEND_STATIC is UNSET → local dev. Try the well-known local
+//     install; if that is absent too, return null so the caller may SKIP (the only
+//     legitimate skip: a dev box without the frontend installed).
+const LOCAL_FALLBACK_STATIC =
+  'C:/Users/Artokun/ComfyUI-Installs/ComfyUI/ComfyUI/.venv/Lib/site-packages/comfyui_frontend_package/static'
+
 function resolveStaticDir() {
   const fromEnv = process.env.COMFYUI_FRONTEND_STATIC
-  const candidates = [
-    fromEnv,
-    'C:/Users/Artokun/ComfyUI-Installs/ComfyUI/ComfyUI/.venv/Lib/site-packages/comfyui_frontend_package/static'
-  ].filter(Boolean)
-  for (const c of candidates) {
-    if (existsSync(join(c, 'assets'))) return c
+  if (fromEnv) {
+    if (existsSync(join(fromEnv, 'assets'))) return fromEnv
+    throw new Error(
+      `COMFYUI_FRONTEND_STATIC is set to "${fromEnv}" but no assets/ directory exists there — ` +
+        `the frontend bundle is missing or its layout changed. CI sets this variable on purpose, ` +
+        `so this is a FAILURE, not a skip: fix the path or update the test. (Unset the variable ` +
+        `to allow skipping on a dev box without the frontend installed.)`
+    )
   }
+  // Unset: local dev. Skip is allowed only if the well-known install is absent too.
+  if (existsSync(join(LOCAL_FALLBACK_STATIC, 'assets'))) return LOCAL_FALLBACK_STATIC
   return null
 }
 
@@ -401,7 +482,7 @@ function routeCoLocated(staticDir, route) {
 test('installed frontend bundle exposes every REQUIRED workflow-service method', (t) => {
   const staticDir = resolveStaticDir()
   if (!staticDir) {
-    t.skip('comfyui_frontend_package static bundle not found (set COMFYUI_FRONTEND_STATIC)')
+    t.skip('COMFYUI_FRONTEND_STATIC unset and no local frontend install found — dev box without the frontend (set the var to make this a hard check)')
     return
   }
   // The fingerprint must resolve to a real workflow-store chunk first — an empty
@@ -424,7 +505,7 @@ test('installed frontend bundle exposes every REQUIRED workflow-service method',
 test('installed frontend bundle exposes at least one viable Save-As route', (t) => {
   const staticDir = resolveStaticDir()
   if (!staticDir) {
-    t.skip('comfyui_frontend_package static bundle not found (set COMFYUI_FRONTEND_STATIC)')
+    t.skip('COMFYUI_FRONTEND_STATIC unset and no local frontend install found — dev box without the frontend (set the var to make this a hard check)')
     return
   }
   const viable = SAVE_AS_ROUTES.filter((route) => routeCoLocated(staticDir, route))
@@ -439,7 +520,7 @@ test('installed frontend bundle exposes at least one viable Save-As route', (t) 
 test('installed frontend bundle exposes the store properties the panel reads', (t) => {
   const staticDir = resolveStaticDir()
   if (!staticDir) {
-    t.skip('comfyui_frontend_package static bundle not found (set COMFYUI_FRONTEND_STATIC)')
+    t.skip('COMFYUI_FRONTEND_STATIC unset and no local frontend install found — dev box without the frontend (set the var to make this a hard check)')
     return
   }
   for (const p of STORE_PROPS) {
