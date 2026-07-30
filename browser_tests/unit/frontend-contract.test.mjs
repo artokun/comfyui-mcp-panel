@@ -128,9 +128,39 @@ function collectServiceMembers() {
     }
   }
 
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+  // TRANSITIVE aliasing: a re-alias `const workflow = svc` (or `= s`) makes
+  // `workflow.newMethod()` an equally live dependency. Given a set of known
+  // accessor IDENTIFIER names in `text`, discover every `const|let|var X = <name>`
+  // (and bare `X = <name>`) re-alias to a fixpoint, then capture accesses off ALL
+  // of them. Bounded to whatever `text` scope is passed in (whole shared lib, or
+  // a single handler block for the panel), so it never reaches unrelated locals.
+  const expandNames = (text, seedNames) => {
+    const names = new Set(seedNames)
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const n of [...names]) {
+        const re = new RegExp(
+          `(?:\\b(?:const|let|var)\\s+)?([a-zA-Z_$][\\w$]*)\\s*=\\s*${esc(n)}\\s*(?:[;,)\\n]|$)`,
+          'g'
+        )
+        let m
+        while ((m = re.exec(text))) {
+          if (!names.has(m[1])) {
+            names.add(m[1])
+            changed = true
+          }
+        }
+      }
+    }
+    return names
+  }
+
   const saveLib = stripComments(readFileSync(SAVE_LIB, 'utf8'))
-  // `svc` is the sole service accessor in the shared lib.
-  captureAccessesIn(saveLib, 'svc')
+  // `svc` is the seed service accessor in the shared lib; expand re-aliases.
+  for (const n of expandNames(saveLib, ['svc'])) captureAccessesIn(saveLib, esc(n))
 
   const panelRaw = stripComments(readFileSync(PANEL, 'utf8'))
   // Direct `extensionManager?.workflow?.m` / `["m"]` / destructuring reaches.
@@ -139,9 +169,9 @@ function collectServiceMembers() {
   // Alias-scoped accesses: the panel binds the service to a local
   // (`const s = app?.extensionManager?.workflow`). Capture the alias NAME
   // dynamically (const/let/var, any identifier), then scan every access off that
-  // name within the handler block that CONTAINS the binding — bounded by brace
-  // matching (no fixed line cap), so a call anywhere later in the same handler is
-  // still caught, while unrelated locals in other functions stay out.
+  // name — and any re-alias of it — within the handler block that CONTAINS the
+  // binding, bounded by brace matching (no fixed line cap), so a call anywhere
+  // later in the same handler is caught while unrelated locals stay out.
   let a
   // Bind ONLY when the RHS is the workflow service itself — i.e. `…workflow` is
   // the tail of the expression, not `…workflow?.activeWorkflow` (which is a
@@ -154,7 +184,7 @@ function collectServiceMembers() {
   while ((a = aliasRe.exec(panelRaw))) {
     const aliasName = a[1]
     const block = enclosingBlockAfter(panelRaw, aliasRe.lastIndex)
-    captureAccessesIn(block, aliasName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    for (const n of expandNames(block, [aliasName])) captureAccessesIn(block, esc(n))
   }
 
   return found
