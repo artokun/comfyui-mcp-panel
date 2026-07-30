@@ -245,7 +245,20 @@ function resolveSaveAsCopy(svc) {
       return baseName(svc.activeWorkflow?.filename) || effectiveName;
     };
   }
-  if (typeof svc?.saveAs === "function" && typeof svc?.saveWorkflow === "function") {
+  // `openWorkflow` is MANDATORY for this path, not optional. The object saveAs
+  // returns is UNLOADED (no changeTracker → activeState === null), and
+  // ComfyWorkflow.save() serializes `activeState ?? null` — so persisting a copy
+  // that was never opened writes the string "null" (a saved-but-empty workflow)
+  // while reporting success. Opening it first populates changeTracker/activeState
+  // from the graph AND makes it the active tab. If a frontend exposes saveAs +
+  // saveWorkflow but NOT openWorkflow, we CANNOT persist real content, so we must
+  // NOT select this adapter — return null and let the caller refuse rather than
+  // ever call saveWorkflow on an unopened copy.
+  if (
+    typeof svc?.saveAs === "function" &&
+    typeof svc?.saveWorkflow === "function" &&
+    typeof svc?.openWorkflow === "function"
+  ) {
     return async (wf, effectiveName, finalTargetPath) => {
       // saveAs builds the copy in memory at the resolved target path (source
       // object untouched); the source's on-disk file is never referenced, so it
@@ -254,16 +267,11 @@ function resolveSaveAsCopy(svc) {
       if (!copy) {
         throw new Error("save-as (copy) failed to create a copy on this frontend");
       }
-      // CRITICAL: the object saveAs returns is UNLOADED — it has no changeTracker,
-      // so `activeState` is null and ComfyWorkflow.save() would serialize the
-      // string "null" to disk (a saved-but-empty workflow). Mirror the frontend's
-      // own Save-As sequence: OPEN/activate the copy first (populates its
-      // changeTracker/activeState from the graph and makes it the active tab),
-      // THEN persist — so save() writes the real graph, not null. Opening also
-      // makes the copy the active workflow, matching the old saveWorkflowAs.
-      if (typeof svc.openWorkflow === "function") {
-        await svc.openWorkflow(copy);
-      }
+      // Mirror the frontend's own Save-As sequence: OPEN/activate the copy
+      // (loads the graph into changeTracker/activeState, makes it active), THEN
+      // persist — so save() writes the real graph, not null. A throw here aborts
+      // BEFORE any saveWorkflow, so a failed open never persists null.
+      await svc.openWorkflow(copy);
       copy.changeTracker?.prepareForSave?.();
       await svc.saveWorkflow(copy);
       return baseName(svc.activeWorkflow?.filename) || baseName(copy.filename) || effectiveName;

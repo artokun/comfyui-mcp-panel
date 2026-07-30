@@ -847,6 +847,35 @@ test('1.47: a drifted-temporary path with an UNKNOWN disk oracle still refuses (
   assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflow'), 'never persisted a move')
 })
 
+test('1.47: saveAs+saveWorkflow but NO openWorkflow ⇒ refuse, never persist null content (#226)', async () => {
+  // A persisted source MUST be copied (never moved), and the copy from saveAs()
+  // is UNLOADED — so without openWorkflow to load its graph, saveWorkflow(copy)
+  // would serialize "null" (empty file) while reporting success. The adapter must
+  // NOT select this path — refuse BEFORE any saveAs/saveWorkflow, persisting
+  // nothing and leaving the source file intact.
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ files: [active.path], active })
+  const sourceContentBefore = svc.disk.get('workflows/Foo.json')
+  delete svc.openWorkflow // frontend without the activation API
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'Bar', { existsOnDisk }),
+    /save-as \(copy\) is unavailable on this frontend/
+  )
+  // NOTHING was copied or persisted — no null-content file; source untouched.
+  assert.ok(!svc.disk.has('workflows/Bar.json'), 'no null-content copy written')
+  assert.equal(svc.disk.get('workflows/Foo.json'), sourceContentBefore, 'source content untouched')
+  assert.ok(!svc.calls.some((c) => c[0] === 'saveAs'), 'never created a copy')
+  assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflow'), 'never persisted')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never moved')
+})
+
 test('refuses to rename-destroy a persisted workflow when no copy API exists', async () => {
   const active = {
     path: 'workflows/Foo.json',
