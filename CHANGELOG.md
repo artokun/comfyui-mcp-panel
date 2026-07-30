@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.12] - 2026-07-30
+
+### Fixed
+- **Copy/paste no longer SILENTLY drops unregistered node types (#261).** Pasting a graph that contains node types not registered on the current server (e.g. AudioCrop / AudioSeparation) used to lose them with no signal. `graph_paste_nodes` now diffs the clipboard against what actually landed (byte-identical-fingerprint-guarded snapshot fallback) and returns `dropped_nodes`/`dropped_types` + a clear warning, so the agent knows which nodes were dropped instead of silently continuing. (#275)
+
 ## [0.11.11] - 2026-07-30
 
 ### Fixed
