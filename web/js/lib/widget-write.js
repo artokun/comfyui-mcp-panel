@@ -230,7 +230,7 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
  * unresolved-promotion, missing-widget, or value-mismatch condition — BEFORE
  * any mutation. Pure: no graph side effects.
  */
-export function resolveWidgetWrite(node, widgetName, value, resolveSource) {
+export function resolveWidgetWrite(node, widgetName, value, resolveSource, assertTargetWritable) {
   let targetNode = node;
   let widget = null;
   let promotedFrom = null;
@@ -264,6 +264,13 @@ export function resolveWidgetWrite(node, widgetName, value, resolveSource) {
     );
   }
 
+  // Gate on the RESOLVED target BEFORE coercion (#458). coerceWidgetValue reads —
+  // and thus may INVOKE — a dynamic combo's `options.values(widget)` callback,
+  // which can mutate; so the registration/placeholder refusal must land here,
+  // before ANY value handling touches the (possibly placeholder) node. The panel
+  // injects a registry check; it throws to refuse.
+  assertTargetWritable?.(targetNode, widget);
+
   const coerced = coerceWidgetValue(widget, value);
   return { targetNode, widget, coerced, promotedFrom };
 }
@@ -278,13 +285,18 @@ export function applyWidgetWrite(
   node,
   widgetName,
   value,
-  { resolveSource, canvas, beforeChange, afterChange, setDirty } = {},
+  { resolveSource, canvas, beforeChange, afterChange, setDirty, assertTargetWritable } = {},
 ) {
+  // resolveWidgetWrite runs assertTargetWritable on the RESOLVED target (inner
+  // promoted node for a subgraph write, or the node's own) BEFORE it coerces the
+  // value, so no coercion callback and no mutation can touch an unregistered
+  // placeholder that is about to be refused (#458).
   const { targetNode, widget: w, coerced, promotedFrom } = resolveWidgetWrite(
     node,
     widgetName,
     value,
     resolveSource,
+    assertTargetWritable,
   );
 
   beforeChange?.();

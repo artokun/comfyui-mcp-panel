@@ -97,10 +97,10 @@ import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, 
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import {
   isStaleAssetCandidate as isStaleAssetCandidateLib,
-  reconcileUnknownWidgetNames,
   reapplyDefsToLiveNodes,
 } from "./lib/asset-staleness.js";
-import { applyWidgetWrite, WidgetWriteError } from "./lib/widget-write.js";
+import { assertAddNodeResolvable } from "./lib/node-resolve.js";
+import { runSetWidget } from "./lib/set-widget.js";
 import { coerceMessageText, isDroppedAgentReplay } from "./lib/chat-serialize.js";
 import {
   recordCopiedNodes,
@@ -3653,6 +3653,15 @@ function resolveNode(graph, nodeId) {
   return node;
 }
 
+// ---- Node-type resolution guard (#458) ------------------------------------
+// The graph WRITE tools resolve node types against LG.registered_node_types:
+// assertAddNodeResolvable gates graph_add_node on the class_type before create;
+// graph_set_widget delegates to runSetWidget (web/js/lib/set-widget.js), whose
+// shared body gates on the ACTUAL RESOLVED write target (inner promoted node for
+// a subgraph, else the node's own) BEFORE any coercion/mutation, so an unresolved
+// placeholder can never be reported as a fabricated success. The predicates live
+// in web/js/lib/node-resolve.js and take the raw registry object.
+
 
 // ---- Subgraph boundary rails (input/output proxy nodes) -------------------
 // LiteGraph: subgraph.inputNode.id === SUBGRAPH_INPUT_ID (-10),
@@ -4956,6 +4965,10 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!class_type || typeof class_type !== "string") {
       throw new Error("class_type (string) is required");
     }
+    // Resolve against the REAL registry BEFORE creating, so an unresolved type
+    // can never be added as a fabricated placeholder node (#458). Throws with a
+    // clear unreachable-vs-unknown-type message, mirroring the read-path hard error.
+    assertAddNodeResolvable(LG?.registered_node_types ?? {}, class_type);
     const node = LG.createNode(class_type);
     if (!node) {
       throw new Error(
@@ -5268,37 +5281,21 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   graph_set_widget({ node_id, widget, value }) {
-    const { app, graph } = getGraphCtx();
+    const { app, graph, LG } = getGraphCtx();
     const node = resolveNode(graph, node_id);
-    // Repair positional UNKNOWN/UNKNOWN_n placeholders against the live def so
-    // the caller's real widget name resolves (#199) before we look it up.
-    reconcileUnknownWidgetNames(node);
-
-    // applyWidgetWrite owns the whole write: for a PARENT SubgraphNode it
-    // resolves a PROMOTED widget to its ACTUAL inner (node, widget) and writes
-    // THERE — never the positionally-shifted parent slot (#233), throwing if
-    // the promotion can't be resolved unambiguously rather than falling open.
-    // It validates the value against the target's declared type (combo must be
-    // an exact CURRENT option — no index drift, #240; numeric must be numeric)
-    // and verifies the write stuck exactly. Same driveable path the unit tests
-    // exercise.
-    try {
-      const set = applyWidgetWrite(node, widget, value, {
-        resolveSource: sourceForSubgraphInput,
-        canvas: app.canvas,
-        beforeChange: () => graph.beforeChange(),
-        afterChange: () => graph.afterChange(),
-        setDirty: () => graph.setDirtyCanvas(true, true),
-      });
-      return { set };
-    } catch (err) {
-      if (err instanceof WidgetWriteError) {
-        throw new Error(
-          `panel_set_widget refused "${widget}" on node ${node.id} (${node.type}): ${err.message}`,
-        );
-      }
-      throw err;
-    }
+    // Delegate to the shared handler body (web/js/lib/set-widget.js) so this
+    // production path and the unit tests run the IDENTICAL ordering: preflight →
+    // reconcile-only-a-resolved-node → applyWidgetWrite with the resolved-target
+    // registry guard (before coercion/mutation). A reorder or a dropped guard
+    // therefore fails a test rather than silently regressing (#458).
+    return runSetWidget(node, widget, value, {
+      registry: LG?.registered_node_types ?? {},
+      resolveSource: sourceForSubgraphInput,
+      canvas: app.canvas,
+      beforeChange: () => graph.beforeChange(),
+      afterChange: () => graph.afterChange(),
+      setDirty: () => graph.setDirtyCanvas(true, true),
+    });
   },
 
   graph_move_node({ node_id, pos }) {
