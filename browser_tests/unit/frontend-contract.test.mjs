@@ -111,23 +111,48 @@ function collectServiceMembers() {
     while ((m = re.exec(text))) found.add(m[1])
   }
 
+  // Capture accesses off an accessor expression `acc`, in every shape that could
+  // introduce a NEW frontend dependency: dot (`acc.m` / `acc?.m`), bracket
+  // (`acc["m"]`), and destructuring (`const { a, b } = acc`). All feed the same
+  // `found` set so no access form can silently escape the contract.
+  const captureAccessesIn = (text, a) => {
+    push(new RegExp(`${a}(?:\\?\\.|\\.)([a-zA-Z_$][\\w$]*)`, 'g'), text) // acc.m / acc?.m
+    push(new RegExp(`${a}(?:\\?\\.)?\\[\\s*["']([^"']+)["']\\s*\\]`, 'g'), text) // acc["m"]
+    let d
+    const destr = new RegExp(`\\{([^{}]*)\\}\\s*=\\s*${a}\\b`, 'g')
+    while ((d = destr.exec(text))) {
+      for (const part of d[1].split(',')) {
+        const name = part.split(':')[0].trim().replace(/^\.\.\./, '')
+        if (/^[a-zA-Z_$][\w$]*$/.test(name)) found.add(name)
+      }
+    }
+  }
+
   const saveLib = stripComments(readFileSync(SAVE_LIB, 'utf8'))
-  // `svc.m` / `svc?.m` — the service is the sole `svc` in the shared lib.
-  push(/\bsvc\??\.([a-zA-Z_$][\w$]*)/g, saveLib)
+  // `svc` is the sole service accessor in the shared lib.
+  captureAccessesIn(saveLib, 'svc')
 
   const panelRaw = stripComments(readFileSync(PANEL, 'utf8'))
-  // Direct `extensionManager?.workflow?.m` reaches (unambiguous).
-  push(/extensionManager\??\.workflow\??\.([a-zA-Z_$][\w$]*)/g, panelRaw)
+  // Direct `extensionManager?.workflow?.m` / `["m"]` / destructuring reaches.
+  captureAccessesIn(panelRaw, 'extensionManager\\??\\.workflow')
 
-  // Alias-scoped `s.m`: only within the handler block that CONTAINS each
-  // `const s = …extensionManager?.workflow` binding — bounded by brace matching,
-  // not an arbitrary line window, so a `s.newMethod()` anywhere later in the same
-  // handler cannot escape while unrelated `s` locals in other functions stay out.
-  let idx
-  const aliasRe = /\bconst\s+s\s*=\s*[\w.?]*extensionManager\??\.workflow\b/g
-  while ((idx = aliasRe.exec(panelRaw))) {
+  // Alias-scoped accesses: the panel binds the service to a local
+  // (`const s = app?.extensionManager?.workflow`). Capture the alias NAME
+  // dynamically (const/let/var, any identifier), then scan every access off that
+  // name within the handler block that CONTAINS the binding — bounded by brace
+  // matching (no fixed line cap), so a call anywhere later in the same handler is
+  // still caught, while unrelated locals in other functions stay out.
+  let a
+  // Bind ONLY when the RHS is the workflow service itself — i.e. `…workflow` is
+  // the tail of the expression, not `…workflow?.activeWorkflow` (which is a
+  // workflow DOCUMENT, not the service). The negative lookahead excludes a
+  // further `.`/`?.` member access after `workflow`.
+  const aliasRe =
+    /\b(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*[\w.?]*extensionManager\??\.workflow(?!\s*\??\.)/g
+  while ((a = aliasRe.exec(panelRaw))) {
+    const aliasName = a[1]
     const block = enclosingBlockAfter(panelRaw, aliasRe.lastIndex)
-    push(/\bs\??\.([a-zA-Z_$][\w$]*)/g, block)
+    captureAccessesIn(block, aliasName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
   }
 
   return found
@@ -183,6 +208,8 @@ test('version-variable Save-As methods are only reached behind a typeof capabili
   const saveLib = stripComments(readFileSync(SAVE_LIB, 'utf8'))
   const panel = stripComments(readFileSync(PANEL, 'utf8'))
 
+  const count = (text, re) => (text.match(re) || []).length
+
   for (const m of VERSION_VARIABLE_METHODS) {
     // The panel delegates all saving to the shared lib; it must never call a
     // version-variable method directly. A direct `.saveWorkflowAs(` in the panel
@@ -192,14 +219,21 @@ test('version-variable Save-As methods are only reached behind a typeof capabili
       `comfyui-mcp-panel.js calls .${m}() directly — route it through the shared, ` +
         `capability-guarded save lib instead (unconditional use is the #268 bug)`
     )
-    // In the shared lib, every reference must be paired with a typeof guard.
-    if (new RegExp(`\\b${m}\\b`).test(saveLib)) {
-      assert.ok(
-        new RegExp(`typeof\\s+svc\\??\\.${m}\\s*===?\\s*["']function["']`).test(saveLib),
-        `workflow-save.js references "${m}" without a "typeof svc?.${m} === 'function'" ` +
-          `guard — a frontend missing it would throw instead of falling back (#268)`
-      )
-    }
+    // In the shared lib, EVERY call site must be backed by a typeof guard. Not
+    // "a guard exists somewhere" — the count of `svc.<m>(` invocations must not
+    // exceed the count of `typeof svc?.<m> === "function"` guards, so adding a
+    // second, unguarded call while leaving the original guard in place FAILS.
+    const calls = count(saveLib, new RegExp(`\\bsvc\\??\\.${m}\\s*\\(`, 'g'))
+    const guards = count(
+      saveLib,
+      new RegExp(`typeof\\s+svc\\??\\.${m}\\s*===?\\s*["']function["']`, 'g')
+    )
+    assert.ok(
+      calls <= guards,
+      `workflow-save.js has ${calls} call(s) to svc.${m}() but only ${guards} ` +
+        `"typeof svc?.${m} === 'function'" guard(s) — every call to a version-variable ` +
+        `frontend method must be capability-guarded or a frontend missing it throws (#268)`
+    )
   }
 })
 
@@ -219,36 +253,56 @@ function resolveStaticDir() {
   return null
 }
 
-// Grep the bundle for a token in a MEMBER/METHOD/KEY context — not a bare word
-// anywhere. Store method/property names are preserved through minification
-// because they are public object keys (Terser does not rename them); they appear
-// either as a member access `.saveWorkflowAs(` or as an object/class key/method
-// `saveWorkflowAs:` / `saveWorkflowAs(`. Requiring one of those shapes avoids a
-// false positive from the name merely appearing inside an unrelated string.
-// This is still a static approximation (a grep cannot prove the method is wired
-// onto `extensionManager.workflow` specifically) — the behavioural doubles below
-// cover the actual runtime route selection. Returns true on the first matching
-// asset chunk.
-function bundleHasToken(staticDir, token) {
-  const assets = join(staticDir, 'assets')
-  const re = new RegExp(`(?:\\.${token}\\b)|(?:\\b${token}\\s*[:(])`)
-  const stack = [assets]
+// A token in MEMBER/METHOD/KEY context (not a bare word anywhere): a member
+// access `.m(` / `.m` or an object/class key/method `m:` / `m(`. Store method
+// and property names survive minification because they are public object keys
+// (Terser does not rename them).
+function memberKeyRe(token) {
+  return new RegExp(`(?:\\.${token}\\b)|(?:\\b${token}\\s*[:(])`)
+}
+
+// Walk every real .js chunk (never .map — a name in a source map is not proof
+// the code ships it).
+function eachJsChunk(staticDir, visit) {
+  const stack = [join(staticDir, 'assets')]
   while (stack.length) {
     const dir = stack.pop()
     for (const name of readdirSync(dir)) {
       const p = join(dir, name)
-      const st = statSync(p)
-      if (st.isDirectory()) {
+      if (statSync(p).isDirectory()) {
         stack.push(p)
         continue
       }
-      // Only real JS chunks — never source maps (a name in a .map comment is not
-      // proof the code ships it).
       if (!name.endsWith('.js') || name.endsWith('.js.map')) continue
-      if (re.test(readFileSync(p, 'utf8'))) return true
+      visit(readFileSync(p, 'utf8'))
     }
   }
-  return false
+}
+
+// The workflow SERVICE is a single store object; a bare grep for `saveWorkflowAs`
+// anywhere could match an UNRELATED object that still carries the name after the
+// workflow store dropped it (a #268 false-pass). So we first isolate the chunk(s)
+// that actually define the workflow store — identified by the co-occurrence of a
+// strong fingerprint of members that only that store carries together — and then
+// verify every contract member WITHIN that text. This ties presence to the
+// workflow service specifically. (It remains a static approximation — a minified
+// bundle exposes no literal `extensionManager.workflow.<m>` chain — which is why
+// the behavioural doubles below independently cover the runtime route logic.)
+const FINGERPRINT = ['openWorkflow', 'getWorkflowByPath', 'renameWorkflow']
+const _serviceTextCache = new Map()
+function serviceChunkText(staticDir) {
+  if (_serviceTextCache.has(staticDir)) return _serviceTextCache.get(staticDir)
+  const parts = []
+  eachJsChunk(staticDir, (text) => {
+    if (FINGERPRINT.every((m) => memberKeyRe(m).test(text))) parts.push(text)
+  })
+  const joined = parts.join('\n')
+  _serviceTextCache.set(staticDir, joined)
+  return joined
+}
+
+function serviceHas(staticDir, token) {
+  return memberKeyRe(token).test(serviceChunkText(staticDir))
 }
 
 test('installed frontend bundle exposes every REQUIRED workflow-service method', (t) => {
@@ -257,11 +311,19 @@ test('installed frontend bundle exposes every REQUIRED workflow-service method',
     t.skip('comfyui_frontend_package static bundle not found (set COMFYUI_FRONTEND_STATIC)')
     return
   }
+  // The fingerprint must resolve to a real workflow-store chunk first — an empty
+  // result means the workflow service itself is absent from this bundle.
+  assert.ok(
+    serviceChunkText(staticDir).length > 0,
+    `could not locate the workflow-service chunk in the bundle at ${staticDir} ` +
+      `(no chunk carries all of ${FINGERPRINT.join(', ')}) — the frontend layout changed; ` +
+      `update the fingerprint`
+  )
   for (const m of REQUIRED_METHODS) {
     assert.ok(
-      bundleHasToken(staticDir, m),
-      `frontend method "${m}" is MISSING from the installed bundle at ${staticDir} — ` +
-        `the panel calls it unconditionally and would fail at runtime (the #268 class)`
+      serviceHas(staticDir, m),
+      `frontend method "${m}" is MISSING from the workflow-service chunk of the bundle at ` +
+        `${staticDir} — the panel calls it unconditionally and would fail at runtime (#268 class)`
     )
   }
 })
@@ -273,12 +335,12 @@ test('installed frontend bundle exposes at least one viable Save-As route', (t) 
     return
   }
   const viable = SAVE_AS_ROUTES.filter((route) =>
-    route.every((m) => bundleHasToken(staticDir, m))
+    route.every((m) => serviceHas(staticDir, m))
   )
   assert.ok(
     viable.length > 0,
-    `NO viable Save-As route exists on the installed frontend bundle. The panel ` +
-      `needs one of: ${SAVE_AS_ROUTES.map((r) => r.join('+')).join(' OR ')}. ` +
+    `NO viable Save-As route exists on the workflow-service chunk of the installed bundle. ` +
+      `The panel needs one of: ${SAVE_AS_ROUTES.map((r) => r.join('+')).join(' OR ')}. ` +
       `This is exactly the #268 failure: saveWorkflowAs was dropped on 1.47.x.`
   )
 })
@@ -291,8 +353,8 @@ test('installed frontend bundle exposes the store properties the panel reads', (
   }
   for (const p of STORE_PROPS) {
     assert.ok(
-      bundleHasToken(staticDir, p),
-      `frontend store property "${p}" is MISSING from the installed bundle at ${staticDir}`
+      serviceHas(staticDir, p),
+      `frontend store property "${p}" is MISSING from the workflow-service chunk at ${staticDir}`
     )
   }
 })
@@ -392,9 +454,11 @@ test('a frontend with NO Save-As route makes the panel REFUSE, not silently mis-
   }
   const disk = new Set([active.path])
   const calls = []
-  // A crippled frontend: only save-in-place. No saveWorkflowAs, no saveAs, no
-  // renameWorkflow. This is the runtime shape #268 hit — the panel must fail
-  // LOUDLY rather than move/destroy or fake success.
+  // A crippled frontend with NO copy API (no saveWorkflowAs, no saveAs) but which
+  // DOES expose the destructive renameWorkflow. This is the dangerous shape the
+  // #226 fallback gate must resist: for a PERSISTED source, renameWorkflow would
+  // MOVE (destroy) the original, so the panel must refuse — never rename. The
+  // rename spy proves the destructive path is not taken.
   const svc = {
     activeWorkflow: active,
     disk,
@@ -403,6 +467,12 @@ test('a frontend with NO Save-As route makes the panel REFUSE, not silently mis-
     async saveWorkflow(wf) {
       calls.push(['saveWorkflow', wf.path])
       disk.add(wf.path)
+    },
+    async renameWorkflow(wf, newPath) {
+      calls.push(['renameWorkflow', wf.path, newPath])
+      disk.delete(wf.path)
+      wf.path = newPath
+      disk.add(newPath)
     }
   }
 
@@ -410,6 +480,10 @@ test('a frontend with NO Save-As route makes the panel REFUSE, not silently mis-
     () => saveActiveWorkflow(svc, 'Bar', {}),
     /save-as \(copy\) is unavailable/i,
     'a relocating Save-As with no copy route must throw, not silently succeed'
+  )
+  assert.ok(
+    !svc.calls.some((c) => c[0] === 'renameWorkflow'),
+    'must NEVER renameWorkflow a persisted source (that is the #226 move-destroy)'
   )
   // Crucially: the refusal happened BEFORE any write — saveWorkflow was never
   // even invoked on the source (a regression that wrote through saveWorkflow and
