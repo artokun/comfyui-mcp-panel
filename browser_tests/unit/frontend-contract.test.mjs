@@ -72,14 +72,6 @@ const OPTIONAL_METHODS = ['syncWorkflows']
 // Reactive store PROPERTIES the panel reads off the service.
 const STORE_PROPS = ['activeWorkflow', 'workflows', 'openWorkflows']
 
-// Members intentionally NOT part of the service contract: they live on the
-// workflow DOCUMENT object (svc.activeWorkflow.*), not the service, so they are
-// excluded from the derivation guard.
-const DOC_MEMBERS = new Set([
-  'isTemporary', 'isPersisted', 'path', 'filename', 'directory', 'initialMode',
-  'changeTracker', 'save', 'activeState'
-])
-
 // Version-variable Save-As methods. The panel MUST only ever reach these behind
 // a `typeof … === "function"` capability check (never an unconditional call), so
 // that a frontend which dropped one degrades to another route instead of
@@ -127,37 +119,53 @@ function collectServiceMembers() {
   // Direct `extensionManager?.workflow?.m` reaches (unambiguous).
   push(/extensionManager\??\.workflow\??\.([a-zA-Z_$][\w$]*)/g, panelRaw)
 
-  // Alias-scoped `s.m`: only within the handler block that follows each
-  // `const s = …extensionManager?.workflow` binding (handlers are short; a
-  // generous window fully covers them without pulling in unrelated `s` locals
-  // elsewhere in the file).
-  const lines = panelRaw.split('\n')
-  const aliasRe = /\bconst\s+s\s*=\s*[\w.?]*extensionManager\??\.workflow\b/
-  for (let i = 0; i < lines.length; i++) {
-    if (!aliasRe.test(lines[i])) continue
-    const block = lines.slice(i + 1, i + 41).join('\n')
+  // Alias-scoped `s.m`: only within the handler block that CONTAINS each
+  // `const s = …extensionManager?.workflow` binding — bounded by brace matching,
+  // not an arbitrary line window, so a `s.newMethod()` anywhere later in the same
+  // handler cannot escape while unrelated `s` locals in other functions stay out.
+  let idx
+  const aliasRe = /\bconst\s+s\s*=\s*[\w.?]*extensionManager\??\.workflow\b/g
+  while ((idx = aliasRe.exec(panelRaw))) {
+    const block = enclosingBlockAfter(panelRaw, aliasRe.lastIndex)
     push(/\bs\??\.([a-zA-Z_$][\w$]*)/g, block)
   }
 
   return found
 }
 
+// Return the source from `from` up to (but excluding) the `}` that closes the
+// block the alias lives in — i.e. scan forward and stop at the first `}` seen at
+// brace-depth 0. Nested `{ … }` are consumed. This bounds the `s.` scan to the
+// exact handler, however long, with no fixed line cap.
+function enclosingBlockAfter(src, from) {
+  let depth = 0
+  for (let i = from; i < src.length; i++) {
+    const ch = src[i]
+    if (ch === '{') depth++
+    else if (ch === '}') {
+      if (depth === 0) return src.slice(from, i)
+      depth--
+    }
+  }
+  return src.slice(from)
+}
+
 test('every frontend workflow-service member the panel calls is in the contract', () => {
   const referenced = collectServiceMembers()
-  // STRICT: every referenced service member (minus document-object members that
-  // live on svc.activeWorkflow.*) must be in the vetted contract. No name-shape
-  // filter — a brand-new call like `s.remove(...)` or `s.load(...)` fails here,
-  // forcing the contract AND the bundle check to be updated deliberately.
-  const unknown = [...referenced]
-    .filter((m) => !CONTRACT_ALL.has(m) && !DOC_MEMBERS.has(m))
-    .sort()
+  // STRICT: the scanner only captures the FIRST member off the service accessor
+  // (`svc.X` / `s.X`), so document-object reaches like `svc.activeWorkflow.save()`
+  // contribute only `activeWorkflow` (a contracted store prop) — `save` is never
+  // captured. Therefore EVERY captured member must be in the vetted contract,
+  // with no exemption list to hide behind. A brand-new call like `s.remove(...)`
+  // or a direct `s.save(...)` on the service fails here, forcing the contract AND
+  // the bundle check to be updated deliberately.
+  const unknown = [...referenced].filter((m) => !CONTRACT_ALL.has(m)).sort()
   assert.deepEqual(
     unknown,
     [],
     `panel references frontend workflow-service members not in the contract: ${unknown.join(
       ', '
-    )} — add them to the contract AND the bundle check (or to DOC_MEMBERS if they ` +
-      `live on the workflow document), or they will silently break like #268`
+    )} — add them to the contract AND the bundle check, or they will silently break like #268`
   )
 })
 
