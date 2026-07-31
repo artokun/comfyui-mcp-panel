@@ -876,6 +876,265 @@ test('1.47: saveAs+saveWorkflow but NO openWorkflow ⇒ refuse, never persist nu
   assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never moved')
 })
 
+// ---------------------------------------------------------------------------
+// #285 — Save-As of a workflow loaded from an EXTERNAL absolute path (outside the
+// managed workflows dir, via panel_load_workflow path:<file>). The copy must land
+// in the USER workflows dir and the external original file must never be moved.
+
+test('#285: external-path Save-As COPIES into the user workflows dir, external original survives', async () => {
+  // A pack workflow loaded from an absolute path OUTSIDE workflows/. It is a live
+  // temporary tab whose graph the user is editing; its file is on disk externally.
+  const active = {
+    path: 'C:/packs/qwen/Product Label Repair.json',
+    filename: 'Product Label Repair.json',
+    directory: 'C:/packs/qwen',
+    isPersisted: false,
+    isTemporary: true,
+  }
+  const { svc, existsOnDisk, graph } = makeStore147Service({ files: [active.path], active })
+
+  const saved = await saveActiveWorkflow(svc, 'Product Label Repair - Qwen Edit Q5', {
+    autoWorkflowName: () => 'Untitled',
+    existsOnDisk,
+  })
+
+  // The copy lands in the USER workflows dir — NOT the external pack folder.
+  assert.ok(
+    svc.disk.has('workflows/Product Label Repair - Qwen Edit Q5.json'),
+    'copy created in the user workflows dir',
+  )
+  assert.ok(
+    !svc.disk.has('C:/packs/qwen/Product Label Repair - Qwen Edit Q5.json'),
+    'no copy written into the unwritable external folder',
+  )
+  // The external ORIGINAL is untouched (copy, never move).
+  assert.ok(svc.disk.has('C:/packs/qwen/Product Label Repair.json'), 'external original preserved')
+  // Real graph content, not null (regression guard for the unopened-copy bug).
+  assert.deepEqual(
+    JSON.parse(svc.disk.get('workflows/Product Label Repair - Qwen Edit Q5.json')),
+    graph,
+    'copy content is the real graph',
+  )
+  assert.ok(svc.calls.some((c) => c[0] === 'saveAs'), 'used the move-free explicit-target copy')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never moved the external original')
+  assert.equal(saved, 'Product Label Repair - Qwen Edit Q5')
+})
+
+test('#285: external-path Save-As REFUSES (never moves) when only the moving high-level copy exists', async () => {
+  // A 1.45-style frontend exposes ONLY saveWorkflowAs (which MOVES a temporary and
+  // cannot retarget the directory). For an external temporary source that would
+  // destroy the external original — refuse instead, leaving it on disk.
+  const active = {
+    path: 'C:/packs/qwen/External.json',
+    filename: 'External.json',
+    directory: 'C:/packs/qwen',
+    isPersisted: false,
+    isTemporary: true,
+  }
+  const svc = makeFaithfulService({ files: [active.path], active }) // saveWorkflowAs only
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'External Copy', {}),
+    /externally-loaded workflow|outside the workflows folder/,
+  )
+  assert.ok(svc.disk.has('C:/packs/qwen/External.json'), 'external original preserved')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never moved')
+  assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflowAs'), 'never delegated a move')
+})
+
+// ---------------------------------------------------------------------------
+// #309 — a Save-As whose server write 409-conflicts (name already exists) must not
+// leave the active tab rebound to the conflicting path.
+
+// A service double whose saveWorkflowAs OPTIMISTICALLY rebinds the active tab to
+// the target path (the reported bug) and THEN throws a 409 when the target file
+// already exists on disk. The rebind persists across the throw unless rolled back.
+function makeConflictService({ files = [], active } = {}) {
+  const disk = new Set(files)
+  const calls = []
+  const svc = {
+    activeWorkflow: active,
+    calls,
+    disk,
+    getWorkflowByPath(path) {
+      if (active && active.path === path) return active
+      if (disk.has(path)) return { path, isPersisted: true }
+      return null
+    },
+    async renameWorkflow(wf, to) {
+      calls.push(['renameWorkflow', wf.path, to])
+      wf.path = to
+      wf.filename = to.split('/').pop()
+    },
+    async saveWorkflow(wf) {
+      calls.push(['saveWorkflow', wf.path])
+      disk.add(wf.path)
+    },
+    async saveWorkflowAs(wf, { filename }) {
+      calls.push(['saveWorkflowAs', wf.path, filename])
+      const target = `workflows/${stripExt(filename)}${extFor(wf)}`
+      // OPTIMISTIC in-memory rebind BEFORE the server write (the #309 bug).
+      wf.path = target
+      wf.filename = target.split('/').pop()
+      wf.isPersisted = false
+      wf.isTemporary = true
+      svc.activeWorkflow = wf
+      if (disk.has(target)) {
+        const err = new Error(`Error storing user data file '${target}': 409 Conflict`)
+        err.status = 409
+        throw err // server rejected — nothing written on disk
+      }
+      disk.add(target)
+      svc.activeWorkflow = { path: target, filename: wf.filename, directory: 'workflows', isPersisted: true, isTemporary: false }
+    },
+  }
+  return svc
+}
+
+test('#309: a name collision is pre-empted before any rebind, and a re-save under a new name succeeds', async () => {
+  const active = {
+    path: 'workflows/Unsaved Workflow.json',
+    filename: 'Unsaved Workflow.json',
+    directory: 'workflows',
+    isPersisted: false,
+    isTemporary: true,
+  }
+  const svc = makeConflictService({ files: ['workflows/FourRef_Identity.json'], active })
+  const existsOnDisk = async (p) => svc.disk.has(p)
+
+  // Save under a name that already exists on disk ⇒ clean conflict.
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'FourRef_Identity', { existsOnDisk }),
+    /already exists \(409 Conflict\)|choose a different name/,
+  )
+
+  // The collision was caught UP FRONT: no save/copy API was ever called, so the
+  // tab was never optimistically rebound to the conflicting path (which is what
+  // tripped the #226 guard before). The tab stands exactly as it was.
+  assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflowAs'), 'never invoked the rebinding save')
+  assert.equal(active.path, 'workflows/Unsaved Workflow.json', 'tab path unchanged')
+  assert.equal(active.filename, 'Unsaved Workflow.json', 'tab filename unchanged')
+  assert.equal(svc.activeWorkflow, active, 'active reference unchanged')
+  assert.ok(svc.disk.has('workflows/FourRef_Identity.json'), 'the pre-existing file is untouched')
+
+  // Because the tab is consistent, saving under a DIFFERENT unique name now works
+  // (before the fix this refused via the #226 guard).
+  const saved = await saveActiveWorkflow(svc, 'FourRef_Identity_v2', { existsOnDisk })
+  assert.ok(svc.disk.has('workflows/FourRef_Identity_v2.json'), 're-save under a new name succeeded')
+  assert.equal(saved, 'FourRef_Identity_v2')
+})
+
+test('#309: post-write rollback on getter-only workflow flags never throws, restores active + path', async () => {
+  // The production hazard the pre-check net must also survive: a REAL ComfyUI
+  // workflow object exposes DERIVED, getter-only flags (get isTemporary(){...}).
+  // With NO disk oracle the pre-check can't fire, so saveWorkflowAs rebinds the tab
+  // and 409s; the rollback must restore the settable identity + active reference
+  // WITHOUT throwing a TypeError on the getter-only flags (which would swallow the
+  // clean 409 and abort the restore).
+  let size = -1 // -1 ⇒ temporary, mirrors the frontend's `get isTemporary(){return this.size===-1}`
+  const wf = {
+    path: 'workflows/Unsaved Workflow.json',
+    filename: 'Unsaved Workflow.json',
+    directory: 'workflows',
+    get isTemporary() {
+      return size === -1
+    },
+    get isPersisted() {
+      return size !== -1
+    },
+  }
+  const disk = new Set(['workflows/Existing.json'])
+  const calls = []
+  const svc = {
+    activeWorkflow: wf,
+    calls,
+    // Store doesn't index the never-saved temp ⇒ null ⇒ classifier proves absence.
+    getWorkflowByPath(p) {
+      return disk.has(p) ? { path: p, isPersisted: true } : null
+    },
+    async renameWorkflow() {},
+    async saveWorkflow() {},
+    async saveWorkflowAs(w, { filename }) {
+      calls.push(['saveWorkflowAs', w.path, filename])
+      const target = `workflows/${stripExt(filename)}.json`
+      // Optimistic in-memory rebind (settable fields), THEN a 409.
+      w.path = target
+      w.filename = target.split('/').pop()
+      svc.activeWorkflow = w
+      const err = new Error(`Error storing user data file '${target}': 409 Conflict`)
+      err.status = 409
+      throw err
+    },
+  }
+
+  // NO existsOnDisk ⇒ the pre-check is skipped and we exercise the rollback net.
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'Existing', {}),
+    /already exists \(409 Conflict\)/,
+  )
+
+  // The rollback ran to completion (no TypeError from the getter-only assignments):
+  // the active reference and settable path/filename are restored.
+  assert.equal(svc.activeWorkflow, wf, 'active reference restored')
+  assert.equal(wf.path, 'workflows/Unsaved Workflow.json', 'path rolled back')
+  assert.equal(wf.filename, 'Unsaved Workflow.json', 'filename rolled back')
+  assert.equal(wf.isTemporary, true, 'derived getter intact')
+})
+
+test('#309: low-level (1.47) copy that 409s on persist removes the orphaned copy tab, restores active', async () => {
+  // On a 1.47 store the copy is created + opened (becoming active) BEFORE its
+  // persist. If saveWorkflow(copy) 409s, the copy must be removed from the open
+  // tabs and the previously-active workflow restored — no phantom unsaved tab.
+  const active = {
+    path: 'workflows/Unsaved Workflow.json',
+    filename: 'Unsaved Workflow.json',
+    directory: 'workflows',
+    isPersisted: false,
+    isTemporary: true,
+  }
+  const openWorkflows = [active]
+  const disk = new Set(['workflows/Existing.json'])
+  const calls = []
+  const svc = {
+    activeWorkflow: active,
+    openWorkflows,
+    calls,
+    getWorkflowByPath(p) {
+      return disk.has(p) ? { path: p, isPersisted: true } : null
+    },
+    saveAs(wf, path) {
+      calls.push(['saveAs', wf.path, path])
+      const copy = { path, filename: path.split('/').pop(), directory: 'workflows', changeTracker: { prepareForSave() {} } }
+      openWorkflows.push(copy)
+      return copy
+    },
+    async openWorkflow(wf) {
+      calls.push(['openWorkflow', wf.path])
+      svc.activeWorkflow = wf
+    },
+    async saveWorkflow(wf) {
+      calls.push(['saveWorkflow', wf.path])
+      if (disk.has(wf.path)) {
+        const err = new Error(`Error storing user data file '${wf.path}': 409 Conflict`)
+        err.status = 409
+        throw err
+      }
+      disk.add(wf.path)
+    },
+    async renameWorkflow() {},
+  }
+
+  // No existsOnDisk ⇒ pre-check skipped; the 409 surfaces from saveWorkflow(copy).
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'Existing', {}),
+    /already exists \(409 Conflict\)/,
+  )
+
+  // The orphaned copy tab was removed and the original tab restored as active.
+  assert.deepEqual(openWorkflows, [active], 'orphaned copy tab removed from open tabs')
+  assert.equal(svc.activeWorkflow, active, 'original tab restored as active')
+})
+
 test('refuses to rename-destroy a persisted workflow when no copy API exists', async () => {
   const active = {
     path: 'workflows/Foo.json',

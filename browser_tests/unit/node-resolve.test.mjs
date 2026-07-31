@@ -18,6 +18,7 @@ import {
   isRegisteredNodeType,
   comfyNodeDefsLoaded,
   assertAddNodeResolvable,
+  assertAddNodeResolvableRefreshing,
   assertResolvedTargetRegistered,
 } from "../../web/js/lib/node-resolve.js";
 // The PRODUCTION graph_set_widget handler body — the executor and these tests
@@ -134,6 +135,79 @@ test("add_node: REAL type on a reachable server ⇒ resolves (no false negative)
   assert.doesNotThrow(() => assertAddNodeResolvable(reg, "CheckpointLoaderSimple"));
   assert.doesNotThrow(() => assertAddNodeResolvable(reg, "KSampler"));
   assert.doesNotThrow(() => assertAddNodeResolvable(reg, "KSamplerAdvanced"));
+});
+
+// ---- assertAddNodeResolvableRefreshing: stale node-def cache (#289) ----------
+// After install+restart the frontend registry predates the new pack's classes, so
+// a correct class_type reads Unknown until /object_info is re-fetched. The guard
+// must refresh once and re-check — but never fabricate a type (fail closed, #458).
+
+test("add_node refresh: a freshly-installed type unknown at first is RESOLVED after a refresh (#289)", async () => {
+  // Model the stale cache: the page-load registry has core sentinels but NOT the
+  // just-installed pack's class. The refresh re-registers node defs, adding it.
+  const reg = loadedRegistry(); // no SeedVR2* yet
+  let refreshed = 0;
+  const refresh = async () => {
+    refreshed++;
+    reg["SeedVR2LoadDiTModel"] = (() => {
+      const c = function NodeCtor() {};
+      c.nodeData = { input: { required: {} } };
+      return c;
+    })();
+  };
+  // Before the refresh the type is absent; the guard must NOT reject it outright.
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => reg, "SeedVR2LoadDiTModel", refresh),
+  );
+  assert.equal(refreshed, 1, "refreshed the node defs exactly once");
+  assert.ok(isRegisteredNodeType(reg, "SeedVR2LoadDiTModel"), "type registered after refresh");
+});
+
+test("add_node refresh: a GENUINELY-unknown type still ERRORS after a refresh (fail closed, #458)", async () => {
+  const reg = loadedRegistry();
+  let refreshed = 0;
+  const refresh = async () => {
+    refreshed++; // a real refresh that registers nothing new (server has no such type)
+  };
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "TotallyMadeUpNode", refresh),
+    /Unknown node type "TotallyMadeUpNode"/,
+  );
+  assert.equal(refreshed, 1, "attempted a refresh before failing closed");
+});
+
+test("add_node refresh: an ALREADY-registered type resolves WITHOUT refreshing", async () => {
+  const reg = loadedRegistry();
+  let refreshed = 0;
+  const refresh = async () => {
+    refreshed++;
+  };
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => reg, "KSampler", refresh),
+  );
+  assert.equal(refreshed, 0, "no refresh needed when the type is already registered");
+});
+
+test("add_node refresh: backend still unreachable after refresh ⇒ unreachable error (fail closed)", async () => {
+  const reg = unreachableRegistry(); // no core sentinels
+  const refresh = async () => {
+    /* backend still down — registers nothing, sentinels stay absent */
+  };
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "SeedVR2LoadDiTModel", refresh),
+    /node definitions are not loaded|backend is unreachable/i,
+  );
+});
+
+test("add_node refresh: a THROWING refresh does not crash — re-checks and fails closed", async () => {
+  const reg = loadedRegistry();
+  const refresh = async () => {
+    throw new Error("object_info fetch failed");
+  };
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "StillUnknown", refresh),
+    /Unknown node type "StillUnknown"/,
+  );
 });
 
 // ---- assertResolvedTargetRegistered (the predicate, on a RESOLVED target) ----

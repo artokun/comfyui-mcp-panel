@@ -146,6 +146,52 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName, existsOn
     // UNKNOWN must FAIL SAFE (refuse) — we only ever take a move path when the
     // source is PROVABLY never-persisted (no backing file to destroy).
     const sourcePath = wf.path;
+
+    // #309 — PRE-EMPT a filename collision BEFORE invoking any save/copy API. If the
+    // resolved target already exists on disk, the /userdata write would 409, and the
+    // frontend's saveWorkflowAs rebinds the tab (or the low-level path orphans a copy
+    // tab) BEFORE that failure surfaces — stranding the tab bound to a file it can't
+    // own (which then tripped the #226 guard so it could not be saved under any other
+    // name). Detecting the collision up front means NOTHING is mutated: no rebind, no
+    // copy, and a clean conflict is returned. Only an AUTHORITATIVE positive from the
+    // disk oracle acts here; an absent/unknown oracle falls through to the post-write
+    // rollback net below. The oracle is the same /userdata HEAD the #226 classifier
+    // uses, so it is available on the real panel path.
+    if (typeof existsOnDisk === "function") {
+      let targetExists = null;
+      try {
+        targetExists = await existsOnDisk(finalTargetPath);
+      } catch {
+        targetExists = null; // probe failed ⇒ unknown ⇒ fall through to rollback net
+      }
+      if (targetExists === true) {
+        throw conflictError(effectiveName);
+      }
+    }
+
+    // #285 — EXTERNAL source: a real file loaded from an ABSOLUTE path OUTSIDE the
+    // managed workflows dir (panel_load_workflow path:<file>). Two hazards make the
+    // normal copy path unsafe here: (a) /userdata cannot prove/relocate an external
+    // path, so the disk oracle can't classify it; and (b) the high-level
+    // saveWorkflowAs writes into the source's own (unwritable) directory and MOVES
+    // a temporary — either would misplace or DESTROY the external original (#226).
+    // So copy the CURRENT graph into the USER workflows dir via the move-free,
+    // explicit-target low-level copy (saveAs + openWorkflow + saveWorkflow), which
+    // never references the source's on-disk file. If that copy API is unavailable,
+    // REFUSE rather than risk moving the external original.
+    if (isExternalWorkflowPath(sourcePath)) {
+      const copyToUserDir = resolveSaveAsCopy(svc, { explicitTargetOnly: true });
+      if (!copyToUserDir) {
+        throw new Error(
+          "save-as (copy) is unavailable on this frontend for an externally-loaded workflow; " +
+            "refusing to move or destroy the original file outside the workflows folder (issue #285/#226)",
+        );
+      }
+      return await withConflictRollback(svc, wf, effectiveName, () =>
+        copyToUserDir(wf, effectiveName, finalTargetPath),
+      );
+    }
+
     const cls = await classifySource(svc, wf, sourcePath, existsOnDisk);
 
     // Resolve the copy (Save-As) API across frontend versions. On 1.45.x the
@@ -173,8 +219,12 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName, existsOn
       }
       // Copy path. For a persisted workflow this copies (new file, original
       // untouched); for a genuine (provably never-persisted) temporary it grounds
-      // the never-saved tab to a real file. No Save dialog.
-      const activeName = await saveAsCopy(wf, effectiveName, finalTargetPath);
+      // the never-saved tab to a real file. No Save dialog. Wrapped so a 409
+      // filename conflict rolls back any optimistic tab rebind instead of leaving
+      // the tab stranded on the conflicting path (#309).
+      const activeName = await withConflictRollback(svc, wf, effectiveName, () =>
+        saveAsCopy(wf, effectiveName, finalTargetPath),
+      );
       // BACKSTOP: if the copy relocated a persisted source anyway, fail LOUDLY
       // instead of reporting a phantom success (the prior fix's exact miss). Uses
       // the SAME tri-state rule as classifySource: only a SUCCESSFUL, affirmative
@@ -237,8 +287,13 @@ function confirmedAbsentAt(svc, rawPath) {
  *     `svc.saveAs(wf, path)` — which builds a NEW workflow object at `path`
  *     (fresh id, source object and its file untouched) and returns it — plus
  *     `svc.saveWorkflow(copy)` to persist that copy. We drive them together. */
-function resolveSaveAsCopy(svc) {
-  if (typeof svc?.saveWorkflowAs === "function") {
+function resolveSaveAsCopy(svc, { explicitTargetOnly = false } = {}) {
+  // The high-level `saveWorkflowAs(wf, { filename })` writes into the SOURCE's own
+  // directory and can MOVE a temporary — it cannot honour an explicit target path.
+  // For an EXTERNAL source (whose copy must land in the user workflows dir, never
+  // the source's unwritable external folder), the caller passes explicitTargetOnly
+  // so ONLY the move-free, explicit-path low-level copy is selected (#285).
+  if (!explicitTargetOnly && typeof svc?.saveWorkflowAs === "function") {
     return async (wf, effectiveName) => {
       await svc.saveWorkflowAs(wf, { filename: effectiveName });
       // saveWorkflowAs makes the new copy the active workflow.
@@ -271,9 +326,22 @@ function resolveSaveAsCopy(svc) {
       // (loads the graph into changeTracker/activeState, makes it active), THEN
       // persist — so save() writes the real graph, not null. A throw here aborts
       // BEFORE any saveWorkflow, so a failed open never persists null.
-      await svc.openWorkflow(copy);
-      copy.changeTracker?.prepareForSave?.();
-      await svc.saveWorkflow(copy);
+      //
+      // If OPEN or PERSIST throws (e.g. saveWorkflow 409s on a name collision), the
+      // copy exists only IN MEMORY (nothing was written to disk). Remove that
+      // orphaned copy tab and restore the previously-active workflow so a failed
+      // persist doesn't strand a phantom unsaved tab in the store (#309); then
+      // rethrow so withConflictRollback can surface a clean conflict.
+      const prevActive = svc.activeWorkflow;
+      try {
+        await svc.openWorkflow(copy);
+        copy.changeTracker?.prepareForSave?.();
+        await svc.saveWorkflow(copy);
+      } catch (err) {
+        removeInMemoryWorkflow(svc, copy);
+        if (prevActive !== undefined) svc.activeWorkflow = prevActive;
+        throw err;
+      }
       return baseName(svc.activeWorkflow?.filename) || baseName(copy.filename) || effectiveName;
     };
   }
@@ -371,11 +439,31 @@ async function classifySource(svc, wf, rawPath, existsOnDisk) {
   return "unknown";
 }
 
+/** The managed user workflows root — the only directory ComfyUI's /userdata API
+ *  can write to. Store paths are always relative under it ("workflows/…"). */
+const WORKFLOWS_ROOT = "workflows";
+
+/** True when `path` is an ABSOLUTE filesystem path — a Windows drive ("C:\\", "C:/"),
+ *  a UNC share ("\\\\server"), or a POSIX absolute ("/…"). Such a path is a workflow
+ *  loaded from OUTSIDE the managed workflows dir (panel_load_workflow path:<file>);
+ *  it can never be a /userdata store path, so a Save-As of it must copy into the
+ *  user workflows dir rather than the unwritable external directory (#285). Only
+ *  absolute paths qualify — a relative "workflows/…" store path is never external,
+ *  so the everyday save path is untouched. */
+function isExternalWorkflowPath(path) {
+  const raw = String(path || "");
+  if (!raw) return false;
+  return /^[a-zA-Z]:[\\/]/.test(raw) || /^[\\/]{2}/.test(raw) || /^\//.test(raw);
+}
+
 /** Directory prefix (with trailing slash) that a new sibling file should live in,
- *  preserving the workflow's containing folder. Defaults to the workflows root. */
+ *  preserving the workflow's containing folder. An EXTERNAL (absolute) source
+ *  directory is unwritable via /userdata, so its Save-As copy is redirected to the
+ *  user workflows root (#285). Defaults to the workflows root. */
 function directoryOf(wf) {
   const dir = String(wf?.directory || "").replace(/[\\/]+$/, "");
-  return dir ? `${dir}/` : "workflows/";
+  if (!dir || isExternalWorkflowPath(dir)) return `${WORKFLOWS_ROOT}/`;
+  return `${dir}/`;
 }
 
 /** Normalize a workflow path for a stable same-file comparison: forward slashes,
@@ -392,4 +480,109 @@ async function saveInPlace(svc, wf) {
   if (typeof svc.saveWorkflow === "function") await svc.saveWorkflow(wf);
   else if (typeof wf.save === "function") await wf.save();
   else throw new Error("workflow save API unavailable on this frontend");
+}
+
+/** True when `err` is a name-collision (HTTP 409) from the userdata write — the
+ *  target filename already exists on disk (#309). Recognised by an explicit
+ *  status field or the conflict wording ComfyUI's /userdata surfaces. */
+function isConflictError(err) {
+  if (!err) return false;
+  const status = err.status ?? err.statusCode ?? err.response?.status;
+  if (status === 409) return true;
+  const msg = String(err?.message ?? err).toLowerCase();
+  return msg.includes("409") || msg.includes("conflict") || msg.includes("already exists");
+}
+
+/** The clean, uniform filename-conflict error surfaced by both the pre-check and
+ *  the post-write rollback (#309). */
+function conflictError(desiredName) {
+  const nm = baseName(desiredName) || "that name";
+  return new Error(
+    `a workflow named "${nm}" already exists (409 Conflict) — choose a different name. ` +
+      `The active tab was left unchanged (issue #309).`,
+  );
+}
+
+/** Assign `obj[key] = value` WITHOUT throwing. Real ComfyUI workflow objects expose
+ *  DERIVED, getter-only flags (`get isTemporary(){return this.size===-1}`, etc.), and
+ *  a plain assignment to those throws a TypeError under ES-module strict mode — which
+ *  would replace the clean 409 and abort the rest of the rollback. Getter-only /
+ *  frozen properties are silently skipped: they are computed from store state we do
+ *  not restore here, so leaving them be is correct (restoring `path`/`filename` and
+ *  the active reference is what un-strands the tab). */
+function safeAssign(obj, key, value) {
+  try {
+    obj[key] = value;
+  } catch {
+    /* getter-only / non-writable — nothing to restore for a derived flag */
+  }
+}
+
+/** Run a relocating save (`fn`) and, on a 409 filename CONFLICT that slips past the
+ *  up-front pre-check (e.g. no disk oracle, or a TOCTOU race), ROLL BACK any
+ *  optimistic in-memory rebind before surfacing a clean error (#309).
+ *
+ *  The frontend's saveWorkflowAs renames/rebinds the active tab to the target path
+ *  BEFORE its server write; when that write 409s (name already exists) the tab was
+ *  left stranded — bound to a file it can't own and flagged unsaved, which then
+ *  tripped the #226 guard so it could no longer be saved under ANY other name
+ *  without a manual rename. We snapshot the tab's identity + the active reference up
+ *  front and, on a conflict, restore the ACTIVE REFERENCE FIRST (always settable),
+ *  then best-effort restore the settable identity fields (`path`/`filename`), so
+ *  panel_list_workflows shows the tab as it was and a re-save under a new name works.
+ *  Derived getter-only flags are skipped via safeAssign so restoration never throws.
+ *  A non-conflict error is rethrown untouched. Nothing on disk is modified here — a
+ *  409 means the server wrote nothing, and the pre-existing file is never our source. */
+async function withConflictRollback(svc, wf, desiredName, fn) {
+  const prevActive = svc?.activeWorkflow;
+  const snap = wf
+    ? {
+        path: wf.path,
+        filename: wf.filename,
+        key: wf.key,
+        directory: wf.directory,
+        isTemporary: wf.isTemporary,
+        isPersisted: wf.isPersisted,
+      }
+    : null;
+  try {
+    return await fn();
+  } catch (err) {
+    if (!isConflictError(err)) throw err;
+    // Restore the active reference FIRST — it is a plain store field and is the
+    // load-bearing fix (the conflicting/copy tab must not remain active), so it
+    // must happen even if a later field restore is a no-op.
+    if (svc && prevActive !== undefined) svc.activeWorkflow = prevActive;
+    if (wf && snap) {
+      safeAssign(wf, "path", snap.path);
+      safeAssign(wf, "filename", snap.filename);
+      if ("key" in wf) safeAssign(wf, "key", snap.key);
+      safeAssign(wf, "directory", snap.directory);
+      safeAssign(wf, "isTemporary", snap.isTemporary);
+      safeAssign(wf, "isPersisted", snap.isPersisted);
+    }
+    throw conflictError(desiredName);
+  }
+}
+
+/** Best-effort removal of an in-memory (never-persisted) workflow copy from the
+ *  store, used to undo an orphaned copy tab when its persist throws (#309). Prefers
+ *  a store close/remove API; falls back to splicing the known list arrays. */
+function removeInMemoryWorkflow(svc, wf) {
+  if (!svc || !wf) return;
+  if (typeof svc.closeWorkflow === "function") {
+    svc.closeWorkflow(wf);
+    return;
+  }
+  if (typeof svc.removeWorkflow === "function") {
+    svc.removeWorkflow(wf);
+    return;
+  }
+  for (const listName of ["openWorkflows", "workflows"]) {
+    const list = svc[listName];
+    if (Array.isArray(list)) {
+      const i = list.indexOf(wf);
+      if (i >= 0) list.splice(i, 1);
+    }
+  }
 }

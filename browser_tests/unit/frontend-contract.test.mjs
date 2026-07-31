@@ -67,7 +67,10 @@ const SAVE_AS_ROUTES = [
 
 // Optional, always called behind a `typeof … === "function"` guard, so its
 // absence is not a regression. Listed so the derivation guard does not flag it.
-const OPTIONAL_METHODS = ['syncWorkflows']
+// `removeWorkflow` is a best-effort orphan-copy cleanup on a failed 1.47 persist
+// (#309) — only called when the store exposes it (else it falls back to closeWorkflow
+// or splicing the open-tabs array), so it is optional, not required.
+const OPTIONAL_METHODS = ['syncWorkflows', 'removeWorkflow']
 
 // Reactive store PROPERTIES the panel reads off the service.
 const STORE_PROPS = ['activeWorkflow', 'workflows', 'openWorkflows']

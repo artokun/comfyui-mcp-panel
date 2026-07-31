@@ -68,6 +68,57 @@ export function assertAddNodeResolvable(registry, class_type) {
 }
 
 /**
+ * Async graph_add_node guard that TOLERATES a stale frontend node-def cache (#289).
+ *
+ * After ComfyUI installs a pack and restarts, the already-open frontend's
+ * LiteGraph registry still holds the PRE-INSTALL node set (it is populated from
+ * /object_info at page load and is not re-fetched on a websocket reconnect). So a
+ * correct class_type from a just-installed pack reads as "Unknown node type" even
+ * though the server defines it — the only recovery used to be a manual F5.
+ *
+ * This resolves the type against the live registry; if it is absent, it performs
+ * ONE node-def refresh (re-fetch /object_info + re-register defs) via `refresh`,
+ * then re-checks against the FRESH registry before deciding the type is unknown.
+ *
+ * The #458 fail-closed invariant is preserved end-to-end: the refresh only ever
+ * registers what the server actually returns (registerNodesFromDefs), so a
+ * GENUINELY-unknown type stays unregistered and still throws via
+ * assertAddNodeResolvable — with the SAME distinct unreachable-vs-unknown-type
+ * messages. The refresh never fabricates a type or a placeholder.
+ *
+ *   getRegistry : () => the LIVE registry object. It is re-invoked AFTER the
+ *                 refresh, because registerNodesFromDefs mutates the registry in
+ *                 place, so a fresh read observes the newly-registered classes.
+ *   refresh     : optional async node-def refresh. Best-effort — a throw or its
+ *                 absence just means we re-check the current registry and, if the
+ *                 type is still absent, fail closed exactly like the sync guard.
+ */
+export async function assertAddNodeResolvableRefreshing(getRegistry, class_type, refresh) {
+  const readRegistry = () =>
+    typeof getRegistry === "function" ? getRegistry() : getRegistry;
+  const before = readRegistry();
+  if (isRegisteredNodeType(before, class_type)) return;
+  // Absent from the CURRENT (possibly stale) registry. Before rejecting it as
+  // unknown, refresh node defs once and re-check — this is the whole point of
+  // #289: a freshly-installed pack's classes only become addressable after
+  // /object_info is re-fetched and re-registered.
+  if (typeof refresh === "function") {
+    try {
+      await refresh();
+    } catch {
+      /* refresh is best-effort — fall through to a fresh-registry re-check */
+    }
+    const after = readRegistry();
+    if (isRegisteredNodeType(after, class_type)) return;
+    // Still unresolved after a real refresh ⇒ the server does not define it
+    // either. Fail closed with the correct unreachable-vs-unknown distinction.
+    assertAddNodeResolvable(after, class_type);
+    return;
+  }
+  assertAddNodeResolvable(before, class_type);
+}
+
+/**
  * Guard for graph_set_widget, applied to the ACTUAL RESOLVED write target (the
  * inner promoted node for a subgraph write, or the node's own for a direct
  * write) — NOT the outer node. This is the load-bearing check: it must run on

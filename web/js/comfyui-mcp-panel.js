@@ -100,7 +100,7 @@ import {
   isStaleAssetCandidate as isStaleAssetCandidateLib,
   reapplyDefsToLiveNodes,
 } from "./lib/asset-staleness.js";
-import { assertAddNodeResolvable } from "./lib/node-resolve.js";
+import { assertAddNodeResolvableRefreshing } from "./lib/node-resolve.js";
 import {
   resolveScope,
   describeScope,
@@ -3776,7 +3776,8 @@ function resolveNode(graph, nodeId) {
 
 // ---- Node-type resolution guard (#458) ------------------------------------
 // The graph WRITE tools resolve node types against LG.registered_node_types:
-// assertAddNodeResolvable gates graph_add_node on the class_type before create;
+// assertAddNodeResolvableRefreshing gates graph_add_node on the class_type before
+// create (refreshing stale node defs once and re-checking, #289/#458);
 // graph_set_widget delegates to runSetWidget (web/js/lib/set-widget.js), whose
 // shared body gates on the ACTUAL RESOLVED write target (inner promoted node for
 // a subgraph, else the node's own) BEFORE any coercion/mutation, so an unresolved
@@ -4875,15 +4876,23 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
-  graph_add_node({ class_type, pos, title }) {
+  async graph_add_node({ class_type, pos, title }) {
     const { graph, LG } = getGraphCtx();
     if (!class_type || typeof class_type !== "string") {
       throw new Error("class_type (string) is required");
     }
     // Resolve against the REAL registry BEFORE creating, so an unresolved type
-    // can never be added as a fabricated placeholder node (#458). Throws with a
-    // clear unreachable-vs-unknown-type message, mirroring the read-path hard error.
-    assertAddNodeResolvable(LG?.registered_node_types ?? {}, class_type);
+    // can never be added as a fabricated placeholder node (#458). If the type is
+    // absent, refresh node defs (re-fetch /object_info + re-register) ONCE and
+    // re-check — a freshly-installed pack's classes are unknown to the stale
+    // page-load registry until then (#289). A type the server still doesn't
+    // define after a refresh stays unresolved and fails closed (unreachable-vs-
+    // unknown message preserved), never a fabricated placeholder.
+    await assertAddNodeResolvableRefreshing(
+      () => LG?.registered_node_types ?? {},
+      class_type,
+      refreshComfyNodeDefs,
+    );
     const node = LG.createNode(class_type);
     if (!node) {
       throw new Error(
