@@ -138,18 +138,28 @@ export function createRunCompletionTracker({
     if (!pending.has(k)) pending.set(k, { promptId: id, at: now() });
   }
 
-  // Drop every entry older than the TTL from BOTH fences. Each is kept in strict
-  // last-touched order (setters re-insert, below), so the expired entries are
-  // always a prefix — stop at the first fresh one. O(number actually pruned).
-  function pruneFence(map, cutoff) {
+  // Drop entries older than the TTL. Each fence is kept in strict last-touched
+  // order (setters re-insert, below); an entry the `retain` predicate keeps is
+  // skipped (not deleted) but scanning continues, and we still stop at the first
+  // FRESH entry (recency order). O(scanned) — bounded by the retained prefix +
+  // one fresh entry.
+  function pruneFence(map, cutoff, retain) {
     for (const [dk, at] of map) {
       if (at >= cutoff) break;
+      if (retain && retain(dk)) continue; // still needed — do NOT age it out
       map.delete(dk);
     }
   }
   function pruneFences() {
     const cutoff = now() - deliveredTtlMs;
-    pruneFence(terminal, cutoff);
+    // NEVER age out a `terminal` replay fence while its run is STILL PENDING
+    // recovery. A bridge-down completion can stay pending well past the TTL (long
+    // outage); pruning its fence would strip the replay guard out from under a
+    // still-pending prompt, and a later replayed execution_start for it would run
+    // the sequential-start loop and clobber a DIFFERENT active run's buffer (codex
+    // P1). The fence is refreshed when the run is finally delivered, then ages
+    // normally; a `delivered` entry is never in `pending`, so it needs no guard.
+    pruneFence(terminal, cutoff, (k) => pending.has(k));
     pruneFence(delivered, cutoff);
   }
 

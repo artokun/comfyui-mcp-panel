@@ -405,6 +405,60 @@ test("#370 P1 (codex): a RE-PENDED terminal P's replayed execution_start still d
   assert.equal(pFlushes.length, 2, "P re-delivered exactly once via reconcile after re-pend");
 });
 
+test("#370 P1 (codex): a terminal fence is NOT aged out while its run is still pending (prolonged outage)", async () => {
+  const TTL = 10 * 60 * 1000;
+  const h = makeHarness();
+  const { tracker, flushes } = h;
+  // P completes and delivers, but the frame can't send → re-pend (bridge down).
+  tracker.onExecutionStart("P");
+  tracker.onExecuted("P", { images: [{ filename: "P.png", type: "output" }] });
+  tracker.onExecutionSuccess("P");
+  tracker.markUndelivered("P");
+  assert.equal(tracker._pending.has("P"), true, "P still pending recovery");
+  assert.equal(tracker.wasTerminal("P"), true);
+
+  // Bridge stays down LONGER than the fence TTL, and a prune runs (its self-arming
+  // sweep fires). P is still pending, so its replay fence must be RETAINED — not
+  // aged out from under the still-pending completion.
+  h.advance(TTL + 1);
+  await h.fireDueTimers(); // fires the fence-prune sweep
+  assert.equal(tracker.wasTerminal("P"), true, "terminal fence retained while P still pending");
+
+  // A different run Q begins and buffers; a replayed execution_start(P) — arriving
+  // before /history(P) resolves — must STILL be fenced (not flush Q).
+  tracker.onExecutionStart("Q");
+  tracker.onExecuted("Q", { images: [{ filename: "Q_preview.png", type: "output" }] });
+  tracker.onExecutionStart("P");
+  assert.equal(tracker._active.has("Q"), true, "Q still active after replayed P start");
+  tracker.onExecuted("Q", { images: [{ filename: "Q_final.png", type: "output" }] });
+  tracker.onExecutionSuccess("Q");
+  const qFlush = flushes.find((f) => f.promptId === "Q");
+  assert.deepEqual(
+    qFlush.images.map((m) => m.filename),
+    ["Q_preview.png", "Q_final.png"],
+    "Q's full batch preserved despite a post-TTL replayed P start",
+  );
+
+  // P still re-delivers exactly once on reconnect.
+  const history = { P: successEntry({ 1: { images: [{ filename: "P.png", type: "output" }] } }) };
+  await tracker.reconcile({ fetchHistory: async (id) => history[id] ?? null, isVideo });
+  assert.equal(flushes.filter((f) => f.promptId === "P").length, 2, "P re-delivered once via reconcile");
+});
+
+test("#370 a terminal fence for a DELIVERED (not pending) run DOES age out (memory bounded)", async () => {
+  const TTL = 10 * 60 * 1000;
+  const h = makeHarness();
+  const { tracker } = h;
+  tracker.onExecutionStart("A");
+  tracker.onExecuted("A", { images: [{ filename: "A.png", type: "output" }] });
+  tracker.onExecutionSuccess("A"); // delivered AND confirmed (not re-pended) ⇒ not pending
+  assert.equal(tracker._pending.has("A"), false);
+  assert.equal(tracker.wasTerminal("A"), true);
+  h.advance(TTL + 1);
+  await h.fireDueTimers();
+  assert.equal(tracker.wasTerminal("A"), false, "a resolved (non-pending) fence ages out normally");
+});
+
 test("#370 P1-3: entire-run-in-drop + a transient /history miss then terminal → delivered once via retry", async () => {
   const h = makeHarness({ reconcileRetryMs: 3000, maxReconcileRetries: 5 });
   const { tracker, flushes } = h;
