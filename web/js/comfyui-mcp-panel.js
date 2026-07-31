@@ -95,9 +95,11 @@ import {
   updateMetadataEntry,
 } from "./lib/chat-history-store.js";
 import {
+  classifyPinnedTarget,
   normalizedWorkflowPath,
   shouldForkEmbeddedWorkflowUuid,
   workflowAliasForPath,
+  workflowIdentityForms,
 } from "./lib/workflow-chat-identity.js";
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
@@ -811,6 +813,12 @@ function getTabId() {
 // tabs. The instance is the only identity that survives that churn (cf.
 // currentWorkflowRef / _workflowObjectUuids).
 const _tempWorkflowInstanceIds = new WeakMap(); // wf object -> "tmp:<uuid>"
+// wf object -> its ORIGINAL "tmp:<uuid>" id, retained even after the tab is saved
+// (unlike _tempWorkflowInstanceIds, which the save-adopt bookkeeping clears). A
+// session pinned to the unsaved tab keeps the tmp: id after the save's tab-id
+// migration (the orchestrator moves the pin unchanged), so the guard must still
+// recognize it as naming this same instance (#186).
+const _priorTempWorkflowIds = new WeakMap();
 const _workflowObjectUuids = new WeakMap();
 const _workflowUuidOwners = new Map();
 const WORKFLOW_UUID_ALIASES_KEY = "comfyui-mcp.panel.workflowUuidAliases";
@@ -851,6 +859,36 @@ function savedWorkflowPath(wf = activeWorkflowRef()) {
   return wf?.isPersisted === true && wf?.isTemporary !== true && typeof wf.path === "string" && wf.path
     ? wf.path
     : null;
+}
+
+// Does this tab have a UNIQUE on-disk identity (a real path), so its path/key/
+// filename may authorize a pinned-target match or a tab lookup? Keyed on
+// `isPersisted` + a real path only — NOT `isTemporary`, which drifts to true for a
+// file that IS on disk after an open-ack race (#215). A never-saved tab has
+// isPersisted=false and is addressable ONLY by its per-instance routing id, which
+// is what keeps two "Unsaved Workflow" tabs from colliding (#186). Distinct from
+// savedWorkflowPath(), whose stricter `isTemporary` gate guards the destructive
+// Save-As move path (#226), a different concern.
+function workflowDiskIdentityPath(wf) {
+  return wf?.isPersisted === true && typeof wf?.path === "string" && wf.path ? wf.path : null;
+}
+
+// Does `sel` (a path / filename / native key / routing id) name workflow record
+// `w`? The per-instance routing id ALWAYS authorizes and is the ONLY authority for
+// an UNSAVED tab; a saved tab additionally answers to its unique on-disk forms.
+// The original tmp: id of a since-saved tab still authorizes it (see
+// _priorTempWorkflowIds) so a pre-save reference keeps working after the save.
+function workflowRecordMatchesSelector(w, sel) {
+  if (!w || typeof sel !== "string" || !sel) return false;
+  if (workflowTabId(w) === sel) return true;
+  if (_priorTempWorkflowIds.get(w) === sel) return true;
+  if (!workflowDiskIdentityPath(w)) return false;
+  return (
+    w.path === sel ||
+    w.filename === sel ||
+    w.key === sel ||
+    (typeof w.filename === "string" && w.filename.replace(/\.json$/i, "") === sel)
+  );
 }
 
 function activeWorkflowExtra(wf = activeWorkflowRef(), { create = false } = {}) {
@@ -988,8 +1026,7 @@ function workflowStorageKey({ embed = false } = {}) {
   return `workflow:${workflowStableUuid(activeWorkflowRef(), { embed })}`;
 }
 
-function workflowTabId() {
-  const wf = activeWorkflowRef();
+function workflowTabId(wf = activeWorkflowRef()) {
   if (!wf) return getTabId();
   const saved = savedWorkflowPath(wf);
   if (saved) return "wf:" + wf.path;
@@ -1000,6 +1037,12 @@ function workflowTabId() {
   if (!id) {
     id = "tmp:" + crypto.randomUUID();
     _tempWorkflowInstanceIds.set(wf, id);
+    // Retain the FIRST tmp: id ever minted for this object, for its whole life, so a
+    // create-time pin survives the tab's first save (tmp:→wf:) — see
+    // _priorTempWorkflowIds. Never overwrite it: save-adopt clears the routing map
+    // above, and a later isTemporary flag-drift (#215) would otherwise mint a fresh
+    // tmp: here and clobber the original create-time pin (guard-off-by-one).
+    if (!_priorTempWorkflowIds.has(wf)) _priorTempWorkflowIds.set(wf, id);
   }
   return id;
 }
@@ -5890,16 +5933,45 @@ const GRAPH_TOOL_EXECUTORS = {
     const s = app?.extensionManager?.workflow;
     if (!s) throw new Error("workflow service unavailable on this frontend");
     const active = s.activeWorkflow;
-    const brief = (w) => ({
-      path: w.path,
-      filename: w.filename,
-      key: w.key,
-      active: !!active && (w === active || w.key === active.key),
-      modified: !!w.isModified,
-      persisted: !!w.isPersisted,
-    });
+    const activeRoutingKey = active ? workflowTabId(active) : null;
+    // Every tab gets its per-instance routing id ("wf:<path>" saved, "tmp:<uuid>"
+    // unsaved). For an UNSAVED tab this is the ONLY unique, matchable handle —
+    // native ComfyUI reuses the "Unsaved Workflow" title/key/filename across unsaved
+    // tabs and a never-saved tab has no path. So for an unsaved tab report path AND
+    // filename as null and expose the routing id as the `key` (and always as
+    // `routing_key`); a human-readable label rides `title`. That makes two unsaved
+    // tabs distinguishable (both to dedupe and to the orchestrator's pin resolver,
+    // which matches records by path/filename/key) so a pin binds to exactly one
+    // graph (#186). A tab with a real on-disk path keeps its native path/filename/key.
+    const brief = (w) => {
+      const diskPath = workflowDiskIdentityPath(w);
+      const routingKey = workflowTabId(w);
+      return {
+        path: diskPath,
+        filename: diskPath ? w.filename : null,
+        // A per-record display label — never used for matching, so the shared
+        // "Unsaved Workflow" is fine here. Do NOT use getWorkflowTitle(): it reads
+        // the ACTIVE tab's document.title and would mislabel other tabs.
+        title: w.filename || "Unsaved Workflow",
+        key: diskPath ? w.key : routingKey,
+        routing_key: routingKey,
+        active: !!active && (w === active || routingKey === activeRoutingKey),
+        modified: !!w.isModified,
+        persisted: !!diskPath,
+      };
+    };
+    const openList = dedupeWorkflowTabRecords((s.openWorkflows ?? []).filter(Boolean).map(brief));
+    const activeDiskPath = workflowDiskIdentityPath(active);
     return {
-      active: active ? { path: active.path, filename: active.filename, key: active.key } : null,
+      active: active
+        ? {
+            path: activeDiskPath,
+            filename: activeDiskPath ? active.filename : null,
+            title: active.filename || getWorkflowTitle(),
+            key: activeDiskPath ? active.key : activeRoutingKey,
+            routing_key: activeRoutingKey,
+          }
+        : null,
       // Guard against nullish entries in openWorkflows: a tab mid-open/close can
       // momentarily leave an undefined slot, and an unguarded `w.path` in `brief`
       // threw "Cannot read properties of undefined (reading 'path')" — removing the
@@ -5909,7 +5981,15 @@ const GRAPH_TOOL_EXECUTORS = {
       // #207 — collapse records that share a stable workflow key so the same
       // active tab is never reported twice (a repeated panel_load_workflow used
       // to append duplicate active records, and a later save then 409'd).
-      open: dedupeWorkflowTabRecords((s.openWorkflows ?? []).filter(Boolean).map(brief)),
+      //
+      // Emit the SAME list under both `open` and `workflows`: the orchestrator's
+      // pin-canonicalizer (resolveOpenWorkflow, #512) enumerates `parsed.workflows`
+      // to verify a pin is open and fail closed (NOT_OPEN) when it isn't — with only
+      // `open` present it saw no list and fell back to the raw pin unverified. The
+      // alias lets a "tmp:<uuid>" pin resolve to its exact tab (#186); `open` stays
+      // for any existing reader.
+      open: openList,
+      workflows: openList,
     };
   },
 
@@ -5918,7 +5998,29 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!mgr?.command?.execute) throw new Error("command service unavailable");
     // Comfy.NewBlankWorkflow opens a fresh TAB — the current workflow is untouched.
     await mgr.command.execute("Comfy.NewBlankWorkflow");
-    return { created: true, active: getWorkflowTitle() };
+    // Bind a UNIQUE, stable routing identity to the just-created tab NOW, at
+    // creation, so a session pinned to this key routes subsequent graph_* edits to
+    // THIS graph and never a pre-existing "Unsaved Workflow" tab (#186). Native
+    // ComfyUI reuses the "Unsaved Workflow" TITLE/key across unsaved tabs, so the
+    // title is not a routing key — the per-instance tmp: id (keyed on the workflow
+    // object) is. FAIL CLOSED if the frontend did not surface the new workflow as
+    // active: without a resolvable object we cannot mint a unique key, and returning
+    // a title alone would invite the agent to edit whatever unsaved tab is active.
+    const wf = activeWorkflowRef();
+    if (!wf) {
+      throw new Error(
+        "workflow_new: created a blank workflow but the frontend did not expose it as the " +
+          "active workflow — cannot establish a unique routing target. Retry, or select the new " +
+          "tab before editing.",
+      );
+    }
+    // Mint the per-instance tmp: routing id (and seed the transcript uuid) eagerly so
+    // the key exists BEFORE the first edit and is returned for pinning.
+    const key = workflowTabId(wf);
+    workflowStableUuid(wf);
+    // `key`/`routing_key` are the unique handle the agent should pass to
+    // panel_set_workflow_target so its session pins to this exact graph.
+    return { created: true, active: getWorkflowTitle(), key, routing_key: key };
   },
 
   async workflow_open({ path }) {
@@ -5926,16 +6028,14 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!s?.openWorkflow) throw new Error("workflow service unavailable");
     const find = () => {
       const all = [...(s.openWorkflows ?? []), ...(s.workflows ?? [])];
+      // getWorkflowByPath resolves a real disk path only (returns null for a
+      // "tmp:<uuid>" routing id). The array scan then resolves EVERY documented
+      // selector — path/filename/key for a saved tab, and the per-instance routing
+      // id for an unsaved one (its ONLY valid selector — the shared filename/key
+      // must never select an arbitrary unsaved tab, #186).
       return (
         (typeof s.getWorkflowByPath === "function" && path && s.getWorkflowByPath(path)) ||
-        all.find(
-          (w) =>
-            w &&
-            (w.path === path ||
-              w.filename === path ||
-              w.key === path ||
-              (w.filename && w.filename.replace(/\.json$/i, "") === path)),
-        )
+        all.find((w) => workflowRecordMatchesSelector(w, path))
       );
     };
     let target = find();
@@ -5996,7 +6096,7 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!name) throw new Error("name is required");
     const all = [...(s.openWorkflows ?? []), ...(s.workflows ?? [])];
     const target = path
-      ? all.find((w) => w && (w.path === path || w.filename === path || w.key === path))
+      ? all.find((w) => workflowRecordMatchesSelector(w, path))
       : s.activeWorkflow;
     if (!target) throw new Error("no target workflow");
     const clean = name.replace(/\.json$/i, "");
@@ -6010,9 +6110,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const s = app?.extensionManager?.workflow;
     if (!s?.closeWorkflow) throw new Error("close unavailable on this frontend");
     const target = path
-      ? (s.openWorkflows ?? []).find(
-          (w) => w && (w.path === path || w.filename === path || w.key === path),
-        )
+      ? (s.openWorkflows ?? []).find((w) => workflowRecordMatchesSelector(w, path))
       : s.activeWorkflow;
     if (!target) throw new Error("no target workflow");
     // Guard against data loss: don't silently close a workflow with unsaved
@@ -7869,34 +7967,62 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // panel has no way to mutate a non-active workflow's graph. So if the
             // pinned workflow is not the active one, executing would SILENTLY write
             // to the wrong graph (the reported data corruption). Fail loudly with a
-            // retryable error instead. Only fires on a POSITIVE mismatch (active
-            // identity resolvable and none of its ids match), so an unresolvable
-            // frontend never spuriously rejects, and current-mode sessions (which
-            // never carry workflow_path) are wholly unaffected.
+            // retryable error instead. Fires on a POSITIVE mismatch (active identity
+            // resolvable and no form matches) AND when the active workflow is
+            // unresolvable while a pin is set (can't confirm the target → fail closed,
+            // #186). Current-mode sessions never carry workflow_path, so they never
+            // reach this branch.
             const pinnedPath = msg?.[WORKFLOW_PATH_FIELD];
             if (typeof pinnedPath === "string" && pinnedPath.trim()) {
               const wf = activeWorkflowRef();
-              const want = normalizedWorkflowPath(pinnedPath);
-              // A pin identifier from panel_list_workflows / panel_set_workflow_target
-              // may be a path, a key, OR a filename (all three are documented as valid
-              // pin ids), so compare against every form the active workflow exposes —
-              // otherwise a legitimate filename-based pin is falsely rejected.
-              const wfFilename = typeof wf?.filename === "string" ? wf.filename : null;
-              const have = [
-                wf?.path,
-                wf?.key,
-                wf?.path ? "wf:" + wf.path : null,
-                wfFilename,
-                wfFilename ? wfFilename.replace(/\.json$/i, "") : null,
-              ]
-                .filter((x) => typeof x === "string" && x)
-                .map(normalizedWorkflowPath);
-              if (have.length && !have.includes(want)) {
+              // A pin identifier from panel_list_workflows / panel_new_workflow /
+              // panel_set_workflow_target may be a path, a native key, a filename, OR
+              // the per-instance routing id ("tmp:<uuid>" / "wf:<path>"). The routing
+              // id is the ONLY form that distinguishes two "Unsaved Workflow" tabs
+              // (#186), so include it — otherwise a pin to one unsaved tab silently
+              // matches whichever unsaved tab is active. Only a POSITIVE mismatch
+              // rejects (active identity resolvable and no form matches), so an
+              // unresolvable frontend never spuriously fails and current-mode sessions
+              // (no workflow_path) are wholly unaffected.
+              // Authorize the active workflow's identity forms PLUS its original
+              // tmp: id: when a tab is saved WITHOUT swapping the underlying object
+              // (same-instance save), the orchestrator keeps injecting the pre-save
+              // "tmp:<uuid>" pin (it moves the pin unchanged across the save's tab-id
+              // migration), so this same instance must still be recognized (#186).
+              const priorTemp = wf ? _priorTempWorkflowIds.get(wf) : null;
+              const forms = wf ? workflowIdentityForms(wf, workflowTabId(wf), [priorTemp]) : [];
+              const verdict = classifyPinnedTarget(pinnedPath, forms);
+              if (verdict === "unknown") {
+                // Pinned, but the panel cannot read the active workflow right now, so
+                // it CANNOT confirm the pin names the live canvas. Editing anyway would
+                // write blindly to app.canvas.graph — exactly the silent misroute #186
+                // must prevent. Fail closed with a retryable error (a transient null
+                // active workflow resolves on retry; a truly serviceless frontend can
+                // never have pinned in the first place).
                 throw new Error(
-                  `workflow mismatch: your session is pinned to "${pinnedPath}", but the active ` +
-                    `canvas is "${wf?.path || wf?.key || "unknown"}". The panel can only edit the ` +
-                    `active workflow — switch to the pinned tab (panel_open_workflow) or re-target ` +
-                    `with panel_set_workflow_target({mode:"current"}), then retry.`,
+                  `workflow target unresolved: your session is pinned to "${pinnedPath}", but the ` +
+                    `panel cannot read the active workflow right now — retry in a moment, or re-target ` +
+                    `with panel_set_workflow_target({mode:"current"}).`,
+                );
+              }
+              if (verdict === "mismatch") {
+                // Fail CLOSED — never edit a graph the session isn't pinned to. The
+                // guidance stays GENERIC: the active canvas may be an UNRELATED tab the
+                // user switched to, so we must NOT claim it is the pinned workflow's
+                // saved successor or recommend pinning it (cross-object lineage is
+                // unknowable). A temporary pin that stopped resolving usually means the
+                // pinned tab was closed, or SAVED on a frontend whose Save-As replaces
+                // the workflow object (its "tmp:" id does not survive a save) — hence
+                // the neutral hint to re-list and re-select the intended workflow.
+                const tempHint = pinnedPath.startsWith("tmp:")
+                  ? ` A "tmp:" id names an UNSAVED tab and does not survive that tab being closed or saved.`
+                  : "";
+                throw new Error(
+                  `workflow mismatch: your session is pinned to "${pinnedPath}", but that is not the ` +
+                    `active canvas ("${wf?.path || wf?.key || "unknown"}").${tempHint} List the open ` +
+                    `workflows (panel_list_workflows) and re-target the intended one with ` +
+                    `panel_set_workflow_target, or switch to it (panel_open_workflow) — or, if you meant ` +
+                    `to edit the current canvas, re-target with panel_set_workflow_target({mode:"current"}). Then retry.`,
                 );
               }
             }
