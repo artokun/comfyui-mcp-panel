@@ -362,6 +362,16 @@ export function createRunCompletionTracker({
   function giveUpReconcile(promptId) {
     const k = key(promptId);
     clearReconcileRetry(k);
+    // Retire ALL live state for this key, exactly as a terminal outcome would.
+    // Otherwise a stale PARTIAL buffer left from pre-drop `executed` events would
+    // be flushed by the NEXT different execution_start's sequential-flush — emitting
+    // stale output that contradicts "status unknown", and leaking the buffered media
+    // until then (codex P1).
+    const buf = buffers.get(k);
+    if (buf?.timer) clearTimer(buf.timer);
+    buffers.delete(k);
+    active.delete(k);
+    starts.delete(k);
     pending.delete(k); // EVICT — bounds the ledger
     markTerminal(promptId); // fence any stray late execution_start; ages out (not pinned)
     if (typeof onReconcileGiveUp === "function") {
@@ -373,13 +383,31 @@ export function createRunCompletionTracker({
     }
   }
 
-  // Schedule a bounded, self-repolling retry for a prompt whose /history is not yet
-  // terminal (P1-3). Each attempt re-runs reconcileKey; it stops the instant the
-  // outcome is delivered or the prompt is otherwise resolved. When the attempt
-  // budget is spent WITHOUT a terminal outcome: an UNKNOWN (/history absent —
-  // couldn't even find it) is GIVEN UP + evicted so the ledger stays bounded, while
-  // a RUNNING render (confirmably in progress) is left pending for the live path /
-  // next reconnect edge. Uses the injected timer so it's deterministic under test.
+  // Decide what to do with a reconcileKey result. Terminal/resolved ⇒ stop. Still
+  // retriable with budget left ⇒ schedule another poll. Budget SPENT this episode
+  // without a terminal outcome ⇒ an UNKNOWN (/history absent — couldn't even find
+  // it) is GIVEN UP + evicted so the ledger stays bounded, while a RUNNING render
+  // (confirmably in progress) is left pending for the live path / next reconnect.
+  // Centralizing the decision here makes it fire even when maxReconcileRetries===0
+  // (give up immediately for an absent history) — codex P2.
+  function afterReconcileRow(row, promptId, fetchHistory, isVideo) {
+    const k = key(promptId);
+    if (!row || !row.retriable) {
+      clearReconcileRetry(k); // resolved (terminal / delivered)
+      return;
+    }
+    if ((retryCounts.get(k) ?? 0) >= maxReconcileRetries) {
+      if (row.status === "unknown") giveUpReconcile(promptId); // absent ⇒ evict
+      else clearReconcileRetry(k); // still "running" ⇒ leave pending, stop polling
+      return;
+    }
+    scheduleReconcileRetry(promptId, fetchHistory, isVideo);
+  }
+
+  // Arm one bounded, self-repolling retry for a prompt whose /history is not yet
+  // terminal (P1-3). The budget/give-up decision lives in afterReconcileRow; this
+  // just schedules the next poll. Uses the injected timer so it's deterministic
+  // under test.
   function scheduleReconcileRetry(promptId, fetchHistory, isVideo) {
     const k = key(promptId);
     if (k === NO_PROMPT_KEY) return; // id-less runs aren't reconcilable
@@ -388,27 +416,15 @@ export function createRunCompletionTracker({
       return;
     }
     if (retryTimers.has(k)) return; // one retry in flight per key
-    if ((retryCounts.get(k) ?? 0) >= maxReconcileRetries) return; // budget spent
     const timer = setTimer(async () => {
       retryTimers.delete(k);
-      const attempts = (retryCounts.get(k) ?? 0) + 1;
-      retryCounts.set(k, attempts);
+      retryCounts.set(k, (retryCounts.get(k) ?? 0) + 1);
       if (delivered.has(k) || !pending.has(k)) {
         clearReconcileRetry(k);
         return;
       }
       const row = await reconcileKey(promptId, fetchHistory, isVideo);
-      if (!row || !row.retriable) {
-        clearReconcileRetry(k); // resolved (terminal / delivered)
-        return;
-      }
-      if (attempts >= maxReconcileRetries) {
-        // Budget exhausted this episode without a terminal outcome.
-        if (row.status === "unknown") giveUpReconcile(promptId); // absent ⇒ evict
-        else clearReconcileRetry(k); // still "running" ⇒ leave pending, stop polling
-        return;
-      }
-      scheduleReconcileRetry(promptId, fetchHistory, isVideo);
+      afterReconcileRow(row, promptId, fetchHistory, isVideo);
     }, reconcileRetryMs);
     retryTimers.set(k, timer);
   }
@@ -614,18 +630,14 @@ export function createRunCompletionTracker({
         if (row.delivered !== undefined) clean.delivered = row.delivered;
         summary.push(clean);
         // A not-yet-terminal outcome (transient /history miss OR still running)
-        // must not be stranded: schedule a bounded retry that delivers once it
-        // turns terminal, instead of waiting for a reconnect edge that may never
-        // come again (P1-3). A terminal outcome cancels any prior retry. This
-        // reconcile call is itself a fresh episode (a reconnect edge / explicit
-        // poll), so reset the retry budget first — a prompt stranded by one
-        // episode's exhausted budget gets a fresh set of attempts on the next.
-        if (row.retriable) {
-          retryCounts.delete(key(promptId));
-          scheduleReconcileRetry(promptId, fetchHistory, isVideo);
-        } else {
-          clearReconcileRetry(key(promptId));
-        }
+        // must not be stranded: this reconcile call is a FRESH episode (a reconnect
+        // edge / explicit poll), so reset the retry budget first — a prompt stranded
+        // by one episode's exhausted budget gets a fresh set of attempts on the
+        // next. afterReconcileRow then either schedules a bounded retry, gives up +
+        // evicts an absent-history prompt, or leaves a running one pending (P1-3,
+        // and the memory-leak give-up — fires even when maxReconcileRetries===0).
+        if (row.retriable) retryCounts.delete(key(promptId));
+        afterReconcileRow(row, promptId, fetchHistory, isVideo);
       }
       return summary;
     },

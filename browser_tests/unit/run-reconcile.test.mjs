@@ -574,6 +574,43 @@ test("#370 P1 (codex): repeated cancelled queued prompts do NOT accumulate in th
   assert.equal(tracker._pending.size, 0, "pending drained — no unbounded growth");
 });
 
+test("#370 P1 (codex): give-up RETIRES a partial buffer so no stale output flushes on the next run", async () => {
+  const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 2 });
+  const { tracker, flushes, giveUps } = h;
+  // P emitted a partial preview, then went history-absent (cancelled mid-run).
+  tracker.onExecutionStart("P");
+  tracker.onExecuted("P", { images: [{ filename: "P_partial.png", type: "output" }] });
+  assert.equal(tracker._buffers.has("P"), true, "P has a buffered partial");
+
+  const fetchHistory = async () => null; // absent
+  await tracker.reconcile({ fetchHistory, isVideo });
+  for (let i = 0; i < 4; i++) {
+    h.advance(1000);
+    await h.fireDueTimers();
+  }
+  assert.deepEqual(giveUps, [{ promptId: "P" }], "P given up once");
+  assert.equal(tracker._buffers.has("P"), false, "P's stale buffer was RETIRED on give-up");
+  assert.equal(tracker._active.has("P"), false, "P no longer active");
+
+  // A different run Q starts — P's stale partial must NOT be flushed here.
+  tracker.onExecutionStart("Q");
+  assert.equal(
+    flushes.some((f) => f.promptId === "P"),
+    false,
+    "no stale P output ever delivered",
+  );
+});
+
+test("#370 P2 (codex): maxReconcileRetries=0 gives up an absent-history prompt IMMEDIATELY", async () => {
+  const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 0 });
+  const { tracker, giveUps } = h;
+  tracker.onQueued("Z");
+  const fetchHistory = async () => null; // absent
+  await tracker.reconcile({ fetchHistory, isVideo });
+  assert.deepEqual(giveUps, [{ promptId: "Z" }], "gave up immediately (zero retries)");
+  assert.equal(tracker._pending.has("Z"), false, "evicted — not stranded pending forever");
+});
+
 test("#370 P1-3: a RUNNING render whose retries exhaust is left pending (NOT given up)", async () => {
   const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 3 });
   const { tracker, giveUps } = h;
