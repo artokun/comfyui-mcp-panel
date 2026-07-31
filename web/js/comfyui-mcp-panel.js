@@ -15180,15 +15180,16 @@ function buildPanel() {
   }
   function onExecError(ev) {
     const d = ev?.detail ?? {};
-    // Idempotency fence (codex P1): if a /history reconcile already surfaced this
-    // run's outcome, a late live `execution_error` for the same prompt must NOT
-    // re-send run_error or re-paint the card. Check BEFORE onExecutionFailed marks
-    // it delivered (otherwise the check would always be true).
-    const alreadyDelivered = runCompletion.wasDelivered(d.prompt_id);
+    // Idempotency fence (codex P1): if this run already reached a TERMINAL outcome
+    // (e.g. a /history reconcile surfaced it — even if its delivery is being
+    // re-pended for retry), a late live `execution_error` for the same prompt must
+    // NOT re-send run_error or re-paint the card. Check BEFORE onExecutionFailed
+    // (otherwise it would always be true).
+    const alreadyTerminal = runCompletion.wasTerminal(d.prompt_id);
     // The run failed — drop any images we'd buffered for it so we don't deliver a
     // stale "here are your outputs" batch on top of the run_error interrupt below.
     runCompletion.onExecutionFailed(d.prompt_id);
-    if (alreadyDelivered) return;
+    if (alreadyTerminal) return;
     // Name the failing node so the agent (and the user) know WHERE it broke —
     // "Ideogram4PromptBuilderKJ (node 200)" beats a bare exception string.
     // Coerce node descriptors too — never bake "[object Object]" into the

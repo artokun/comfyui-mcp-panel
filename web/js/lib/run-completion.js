@@ -86,12 +86,26 @@ export function createRunCompletionTracker({
   // frame silently dropped by sendFrame), the run stays pending and can be
   // recovered on reconnect by reconciling its prompt_id against `/history`.
   const pending = new Map(); // key -> { promptId, at }  (real prompt_ids only)
-  // `delivered` is the IDEMPOTENCY FENCE: keys whose completion has been delivered
-  // (live or via reconcile). It exists to suppress a DUPLICATE from a late WS
-  // lifecycle replay for an already-delivered prompt (a reconnect replays the
-  // buffered executed/execution_success within seconds). key -> deliveredAt so the
-  // fence can be pruned by AGE — only once no late event could still arrive — which
-  // bounds memory WITHOUT ever evicting a fence that's still doing its job.
+  // Two SEPARATE fences, deliberately distinct (codex P1):
+  //
+  //  • `terminal` — the LIFECYCLE REPLAY fence. A key is here once the prompt has
+  //    reached a terminal outcome (success/error/reconcile), and it STAYS here even
+  //    if delivery of that outcome is later re-pended for retry. It suppresses a
+  //    late/replayed WS lifecycle event (execution_start / executed /
+  //    execution_success / execution_error) from re-opening a completed run — which
+  //    matters most for execution_start, whose sequential-flush would otherwise
+  //    truncate a DIFFERENT currently-active prompt's buffer (#293/#370).
+  //
+  //  • `delivered` — the DELIVERY / RECONCILE-dedup fence. A key is here once its
+  //    completion frame is CONFIRMED delivered. markUndelivered REMOVES it (only
+  //    this one) so a bridge-down completion is re-reconciled and re-delivered.
+  //
+  // Conflating the two (the previous single `delivered` map) meant markUndelivered
+  // deleted the replay fence too, so a re-pended prompt's late execution_start was
+  // no longer fenced and clobbered a live run. Keeping them separate closes that.
+  // Both are `key -> ts` so they can be pruned by AGE (never evicting a fence still
+  // doing its job) to bound memory.
+  const terminal = new Map();
   const delivered = new Map();
   // Far beyond any realistic WS-replay-after-reconnect delay, so pruning an entry
   // older than this can never re-open the double-delivery window it guards.
@@ -118,49 +132,70 @@ export function createRunCompletionTracker({
   function trackPending(id) {
     if (id == null) return; // no prompt_id ⇒ not reconcilable against /history
     const k = key(id);
-    if (delivered.has(k)) return;
+    // A prompt that already reached terminal must not be re-pended by a stray
+    // liveness signal — its pending state is owned by markDelivered/markUndelivered.
+    if (terminal.has(k)) return;
     if (!pending.has(k)) pending.set(k, { promptId: id, at: now() });
   }
 
-  // Drop every fence older than the TTL. `delivered` is kept in strict
-  // last-delivered order (markDelivered re-inserts, below), so the expired entries
-  // are always a prefix — stop at the first fresh one. O(number actually pruned),
-  // i.e. each entry is visited once over its lifetime.
-  function pruneDeliveredFence() {
-    const cutoff = now() - deliveredTtlMs;
-    for (const [dk, at] of delivered) {
+  // Drop every entry older than the TTL from BOTH fences. Each is kept in strict
+  // last-touched order (setters re-insert, below), so the expired entries are
+  // always a prefix — stop at the first fresh one. O(number actually pruned).
+  function pruneFence(map, cutoff) {
+    for (const [dk, at] of map) {
       if (at >= cutoff) break;
-      delivered.delete(dk);
+      map.delete(dk);
     }
+  }
+  function pruneFences() {
+    const cutoff = now() - deliveredTtlMs;
+    pruneFence(terminal, cutoff);
+    pruneFence(delivered, cutoff);
   }
 
   // Age fences out even when NO further completion arrives (idle): a single
   // self-disarming sweep that re-arms only while fences remain, so memory is
   // bounded without a perpetual timer.
-  let deliveredPruneTimer = null;
-  function scheduleDeliveredPrune() {
-    if (deliveredPruneTimer != null) return;
-    deliveredPruneTimer = setTimer(() => {
-      deliveredPruneTimer = null;
-      pruneDeliveredFence();
-      if (delivered.size) scheduleDeliveredPrune();
+  let fencePruneTimer = null;
+  function scheduleFencePrune() {
+    if (fencePruneTimer != null) return;
+    fencePruneTimer = setTimer(() => {
+      fencePruneTimer = null;
+      pruneFences();
+      if (terminal.size || delivered.size) scheduleFencePrune();
     }, deliveredTtlMs);
+  }
+
+  // Re-insert a key at the end of a fence map so it stays in strict recency order.
+  function touchFence(map, k) {
+    map.delete(k);
+    map.set(k, now());
+  }
+
+  // Record that `id` reached a TERMINAL outcome — the replay fence. Set whether or
+  // not its delivery is confirmed, and NEVER cleared by markUndelivered, so a late
+  // execution_start for it stays fenced across a re-pend (codex P1).
+  function markTerminal(id) {
+    const k = key(id);
+    if (k === NO_PROMPT_KEY) return; // reused key — never fence id-less runs (#224)
+    pruneFences();
+    touchFence(terminal, k);
+    scheduleFencePrune();
   }
 
   function markDelivered(id) {
     const k = key(id);
     // NO_PROMPT_KEY is a SHARED, reused key for every id-less run — it is never
-    // reconcilable and must never enter the `delivered` fence, or the first id-less
-    // run would permanently block all later ones (back-to-back id-less runs must
-    // still each deliver, #224). It's also never in `pending` (trackPending skips
-    // null ids), so there is nothing to retire here for it.
+    // reconcilable and must never enter either fence, or the first id-less run
+    // would permanently block all later ones (back-to-back id-less runs must still
+    // each deliver, #224). It's also never in `pending` (trackPending skips null
+    // ids), so there is nothing to retire here for it.
     if (k === NO_PROMPT_KEY) return;
-    pruneDeliveredFence(); // trim expired fences on every delivery (active path)
-    delivered.delete(k); // re-insert at the end so the map stays in delivery order
-    delivered.set(k, now());
+    // A confirmed delivery IS a terminal outcome — set BOTH fences.
+    markTerminal(id);
+    touchFence(delivered, k);
     pending.delete(k);
     clearReconcileRetry(k); // a delivery (any path) cancels a scheduled /history retry
-    scheduleDeliveredPrune(); // ensure idle fences also age out
   }
 
   function clearReconcileRetry(k) {
@@ -337,14 +372,15 @@ export function createRunCompletionTracker({
     /** ComfyUI `execution_start` — authoritative run-start for a prompt. */
     onExecutionStart(id) {
       const k = key(id);
-      // Idempotency fence (P1-2): a late / replayed execution_start for an ALREADY-
-      // DELIVERED prompt must be IGNORED — it must not run the sequential-flush
-      // below, which would truncate a DIFFERENT, currently-active prompt's buffer
-      // (delivering it partial) and clear active, losing that live run's final
-      // output (#293 buffering regression). A delivered prompt has already been
-      // completed; a stray "it's starting" for it is stale noise. NO_PROMPT_KEY is
-      // never in `delivered`, so id-less runs always proceed.
-      if (delivered.has(k)) return;
+      // Idempotency fence (P1-2, codex): a late / replayed execution_start for a
+      // prompt that already reached TERMINAL must be IGNORED — it must not run the
+      // sequential-flush below, which would truncate a DIFFERENT, currently-active
+      // prompt's buffer (delivering it partial) and clear active, losing that live
+      // run's final output (#293 buffering regression). This fences on `terminal`,
+      // NOT `delivered`, so it holds even when the terminal prompt's delivery is
+      // being RE-PENDED for retry (markUndelivered clears `delivered` but not
+      // `terminal`). NO_PROMPT_KEY is never in `terminal`, so id-less runs proceed.
+      if (terminal.has(k)) return;
       // Runs are sequential: a new run beginning means EVERY prior run has ended
       // (even one whose end signal we missed). Flush every existing buffer under
       // ITS OWN key/timing first, so an older buffer — including a legacy
@@ -373,11 +409,12 @@ export function createRunCompletionTracker({
      */
     onExecuted(id, { images = [], videos = [] } = {}) {
       if (!images.length && !videos.length) return;
-      // Idempotency fence: if this prompt was ALREADY delivered (a /history
+      // Idempotency fence: if this prompt already reached TERMINAL (a /history
       // reconcile beat the live WS, which then replayed a late `executed`), do NOT
       // re-buffer it — otherwise the trailing execution_success would flush a
-      // second, duplicate completion for the same run (codex P1).
-      if (delivered.has(key(id))) return;
+      // second, duplicate completion for the same run (codex P1). Fences on
+      // `terminal` so it still holds if delivery is being re-pended for retry.
+      if (terminal.has(key(id))) return;
       // Fallback render-start if execution_start was missed (no-op otherwise).
       // Does NOT mark active: `executing(node)` is the run-liveness signal, so an
       // output with no start AND no executing(node) is treated as an orphan.
@@ -394,9 +431,11 @@ export function createRunCompletionTracker({
     onExecutionSuccess(id) {
       const k = key(id);
       active.delete(k);
-      // Already delivered (e.g. via reconcile) — a late success must not deliver
-      // again. Just retire any residual live state (codex P1 idempotency fence).
-      if (delivered.has(k)) {
+      // Already terminal (e.g. delivered via reconcile, even if its delivery is
+      // being re-pended) — a late/replayed success must not re-flush or re-mark
+      // (which would clear the re-pend and lose the retry). Just retire residual
+      // live state (codex P1 idempotency fence; `terminal`, not `delivered`).
+      if (terminal.has(k)) {
         starts.delete(k);
         return;
       }
@@ -417,10 +456,10 @@ export function createRunCompletionTracker({
       if (buf?.timer) clearTimer(buf.timer);
       buffers.delete(k);
       starts.delete(k);
-      // If already delivered (reconcile surfaced this run's outcome), don't touch
-      // pending/delivered again — the caller uses wasDelivered() BEFORE calling
+      // If already terminal (reconcile surfaced this run's outcome), don't re-mark
+      // (which would clear a re-pend). The caller uses wasTerminal() BEFORE calling
       // this to suppress a duplicate run_error frame (codex P1).
-      if (!delivered.has(k)) markDelivered(k);
+      if (!terminal.has(k)) markDelivered(k);
     },
 
     /**
@@ -448,20 +487,21 @@ export function createRunCompletionTracker({
      */
     onExecutingNode(id) {
       if (id == null) return;
-      // A late `executing` for an already-delivered run must not re-open it.
-      if (delivered.has(key(id))) return;
+      // A late `executing` for an already-terminal run must not re-open it.
+      if (terminal.has(key(id))) return;
       markStart(id);
       active.add(key(id));
       trackPending(id);
     },
 
     /**
-     * Has this prompt's completion already been delivered (via live success or a
-     * /history reconcile)? The caller checks this BEFORE surfacing a live
-     * execution_error so a reconciled outcome isn't duplicated by a late WS event.
+     * Has this prompt already reached a TERMINAL outcome (via live success/error or
+     * a /history reconcile)? The caller checks this BEFORE surfacing a live
+     * execution_error so a reconciled/completed outcome isn't duplicated by a late
+     * WS event — true even while its delivery is being re-pended for retry.
      */
-    wasDelivered(id) {
-      return delivered.has(key(id));
+    wasTerminal(id) {
+      return terminal.has(key(id));
     },
 
     /**
@@ -492,7 +532,13 @@ export function createRunCompletionTracker({
     markUndelivered(id) {
       if (id == null) return;
       const k = key(id);
+      // Clear ONLY the delivery/reconcile fence so the outcome is re-reconciled and
+      // re-delivered. The `terminal` REPLAY fence is deliberately LEFT intact: the
+      // run already completed, so a late/replayed execution_start for it must stay
+      // fenced (or it would clobber a different live run's buffer — codex P1). Also
+      // cancel any in-flight retry so the re-pend restarts cleanly on the next edge.
       delivered.delete(k);
+      clearReconcileRetry(k);
       if (!pending.has(k)) pending.set(k, { promptId: id, at: now() });
     },
 
@@ -512,7 +558,7 @@ export function createRunCompletionTracker({
      */
     async reconcile({ fetchHistory, isVideo } = {}) {
       const summary = [];
-      pruneDeliveredFence(); // reconnect is a natural sweep point for old fences
+      pruneFences(); // reconnect is a natural sweep point for old fences
       if (typeof fetchHistory !== "function") return summary;
       for (const [, info] of [...pending.entries()]) {
         const promptId = info.promptId;
@@ -550,5 +596,6 @@ export function createRunCompletionTracker({
     _starts: starts,
     _pending: pending,
     _delivered: delivered,
+    _terminal: terminal,
   };
 }

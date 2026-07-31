@@ -236,7 +236,7 @@ test("#370 codex P1 (idempotency): a LATE executed+execution_success after recon
   const history = { pL: successEntry({ 9: { images: [{ filename: "final.png", type: "output" }] } }) };
   await tracker.reconcile({ fetchHistory: async (id) => history[id] ?? null, isVideo });
   assert.equal(flushes.length, 1, "reconcile delivered once");
-  assert.equal(tracker.wasDelivered("pL"), true);
+  assert.equal(tracker.wasTerminal("pL"), true);
 
   // The live WS now replays the buffered lifecycle for the SAME prompt. None of it
   // may produce a second completion.
@@ -246,13 +246,13 @@ test("#370 codex P1 (idempotency): a LATE executed+execution_success after recon
   assert.equal(flushes.length, 1, "no duplicate completion from the late live events");
 });
 
-test("#370 codex P1 (idempotency): wasDelivered fences a late execution_error after a reconciled error", async () => {
+test("#370 codex P1 (idempotency): wasTerminal fences a late execution_error after a reconciled error", async () => {
   const { tracker, flushes } = makeHarness();
   tracker.onExecutionStart("pX");
   const history = { pX: { outputs: {}, status: { status_str: "error" } } };
   await tracker.reconcile({ fetchHistory: async (id) => history[id] ?? null, isVideo });
-  assert.equal(tracker.wasDelivered("pX"), true, "reconciled error is marked delivered");
-  // Panel checks wasDelivered() BEFORE onExecutionFailed to skip the duplicate
+  assert.equal(tracker.wasTerminal("pX"), true, "reconciled error is marked delivered");
+  // Panel checks wasTerminal() BEFORE onExecutionFailed to skip the duplicate
   // run_error; the tracker-side late failed event re-buffers nothing.
   tracker.onExecuted("pX", { images: [{ filename: "late.png", type: "output" }] });
   tracker.onExecutionFailed("pX");
@@ -320,15 +320,15 @@ test("#370 delivered-fence ages out: an old fence is pruned once past the 10-min
   tracker.onExecutionStart("p1");
   tracker.onExecuted("p1", { images: [{ filename: "a.png", type: "output" }] });
   tracker.onExecutionSuccess("p1");
-  assert.equal(tracker.wasDelivered("p1"), true, "fenced right after delivery");
+  assert.equal(tracker.wasTerminal("p1"), true, "fenced right after delivery");
 
   // Well past the fence TTL, a new delivery prunes the stale fence (bounded memory).
   advance(10 * 60 * 1000 + 1);
   tracker.onExecutionStart("p2");
   tracker.onExecuted("p2", { images: [{ filename: "b.png", type: "output" }] });
   tracker.onExecutionSuccess("p2");
-  assert.equal(tracker.wasDelivered("p1"), false, "stale fence aged out");
-  assert.equal(tracker.wasDelivered("p2"), true, "recent fence retained");
+  assert.equal(tracker.wasTerminal("p1"), false, "stale fence aged out");
+  assert.equal(tracker.wasTerminal("p2"), true, "recent fence retained");
 });
 
 test("#370 P1-2: a late execution_start(delivered P) does NOT flush a DIFFERENT active run's buffer", async () => {
@@ -338,7 +338,7 @@ test("#370 P1-2: a late execution_start(delivered P) does NOT flush a DIFFERENT 
   const history = { P: successEntry({ 1: { images: [{ filename: "P.png", type: "output" }] } }) };
   await tracker.reconcile({ fetchHistory: async (id) => history[id] ?? null, isVideo });
   assert.equal(flushes.length, 1, "P delivered via reconcile");
-  assert.equal(tracker.wasDelivered("P"), true);
+  assert.equal(tracker.wasTerminal("P"), true);
 
   // A NEW run Q starts and buffers a preview (still in flight).
   tracker.onExecutionStart("Q");
@@ -360,6 +360,49 @@ test("#370 P1-2: a late execution_start(delivered P) does NOT flush a DIFFERENT 
     ["Q_preview.png", "Q_final.png"],
     "Q's full batch preserved (preview + final)",
   );
+});
+
+test("#370 P1 (codex): a RE-PENDED terminal P's replayed execution_start still does NOT flush active Q", async () => {
+  const { tracker, flushes } = makeHarness();
+  // P completes live and delivers…
+  tracker.onExecutionStart("P");
+  tracker.onExecuted("P", { images: [{ filename: "P.png", type: "output" }] });
+  tracker.onExecutionSuccess("P");
+  assert.equal(flushes.length, 1, "P delivered");
+  assert.equal(tracker.wasTerminal("P"), true);
+
+  // …but its completion frame failed to send (bridge down) → re-pend for retry.
+  // This must NOT clear P's terminal REPLAY fence.
+  tracker.markUndelivered("P");
+  assert.equal(tracker.wasTerminal("P"), true, "terminal replay fence survives re-pend");
+  assert.equal(tracker._pending.has("P"), true, "P re-pended for delivery retry");
+
+  // A DIFFERENT run Q starts and buffers a preview.
+  tracker.onExecutionStart("Q");
+  tracker.onExecuted("Q", { images: [{ filename: "Q_preview.png", type: "output" }] });
+
+  // A late/replayed execution_start(P) arrives. Because P is still TERMINAL-fenced
+  // (despite the re-pend), it must be ignored — not flush Q's partial buffer.
+  tracker.onExecutionStart("P");
+  assert.equal(flushes.length, 1, "re-pended P's stale start did not flush Q");
+  assert.equal(tracker._active.has("Q"), true, "Q still active");
+
+  // Q finishes and delivers its FULL batch — nothing lost.
+  tracker.onExecuted("Q", { images: [{ filename: "Q_final.png", type: "output" }] });
+  tracker.onExecutionSuccess("Q");
+  const qFlush = flushes.find((f) => f.promptId === "Q");
+  assert.ok(qFlush, "Q delivered");
+  assert.deepEqual(
+    qFlush.images.map((m) => m.filename),
+    ["Q_preview.png", "Q_final.png"],
+    "Q's full batch preserved despite P's re-pended replayed start",
+  );
+
+  // And P's re-pended delivery is still recoverable via reconcile (retry path).
+  const history = { P: successEntry({ 1: { images: [{ filename: "P.png", type: "output" }] } }) };
+  await tracker.reconcile({ fetchHistory: async (id) => history[id] ?? null, isVideo });
+  const pFlushes = flushes.filter((f) => f.promptId === "P");
+  assert.equal(pFlushes.length, 2, "P re-delivered exactly once via reconcile after re-pend");
 });
 
 test("#370 P1-3: entire-run-in-drop + a transient /history miss then terminal → delivered once via retry", async () => {
@@ -416,7 +459,7 @@ test("#370 P1-3 (codex): a transient /history miss that later resolves to an ERR
   await h.fireDueTimers();
   assert.equal(flushes.length, 0, "no completion batch for a failed run");
   assert.deepEqual(errors, [{ promptId: "F" }], "run_error surfaced exactly once via the retry");
-  assert.equal(tracker.wasDelivered("F"), true, "fenced so no duplicate");
+  assert.equal(tracker.wasTerminal("F"), true, "fenced so no duplicate");
 
   // No further retry, no duplicate error.
   h.advance(2000);
