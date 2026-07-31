@@ -209,10 +209,11 @@ test("#370 no mis-attribution: reconcile only delivers the queried prompt's outp
   assert.equal(delivered.length, 1);
   assert.equal(delivered[0].promptId, "pA");
   assert.equal(delivered[0].images[0].filename, "A.png");
-  // pB stays pending (unknown), pA delivered — no cross-contamination.
+  // pB stays pending (running — absent /history, queue unknown), pA delivered — no
+  // cross-contamination.
   const byId = Object.fromEntries(summary.map((r) => [r.promptId, r.status]));
   assert.equal(byId.pA, "success");
-  assert.equal(byId.pB, "unknown");
+  assert.equal(byId.pB, "running");
   // pB is still pending → a later reconcile with its history delivers ONLY pB.
   history.pB = successEntry({ 2: { images: [{ filename: "B.png", type: "output" }] } });
   await tracker.reconcile({ fetchHistory: async (id) => history[id] ?? null, isVideo });
@@ -468,7 +469,9 @@ test("#370 P1-3: entire-run-in-drop + a transient /history miss then terminal �
   // The whole lifecycle happened during the drop — only the queue-time id is known.
   tracker.onQueued("D");
 
-  // First reconcile (reconnect edge) hits a TRANSIENT /history miss (503/empty).
+  // First reconcile (reconnect edge) hits a TRANSIENT /history miss (503/empty) and
+  // the run has already left /queue (finished), so /history should become consistent
+  // shortly — the retry covers that window.
   let historyReady = false;
   const fetchHistory = async (id) => {
     if (id !== "D") return null;
@@ -476,7 +479,8 @@ test("#370 P1-3: entire-run-in-drop + a transient /history miss then terminal �
       ? successEntry({ 7: { images: [{ filename: "D_final.png", type: "output" }] } })
       : null; // transient: not yet populated
   };
-  const summary = await tracker.reconcile({ fetchHistory, isVideo });
+  const fetchQueued = async () => false; // not in /queue
+  const summary = await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
   assert.deepEqual(summary, [{ promptId: "D", status: "unknown" }], "transient miss reported");
   assert.equal(flushes.length, 0, "nothing delivered yet");
 
@@ -492,7 +496,7 @@ test("#370 P1-3: entire-run-in-drop + a transient /history miss then terminal �
   // No further retry fires, and no duplicate on a later reconcile (delivered fence).
   h.advance(3000);
   await h.fireDueTimers();
-  await tracker.reconcile({ fetchHistory, isVideo });
+  await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
   assert.equal(flushes.length, 1, "exactly once — no duplicate delivery");
 });
 
@@ -506,7 +510,8 @@ test("#370 P1-3 (codex): a transient /history miss that later resolves to an ERR
     if (state === "transient") return null; // 503/empty
     return { outputs: {}, status: { status_str: "error" } };
   };
-  const summary = await tracker.reconcile({ fetchHistory, isVideo });
+  const fetchQueued = async () => false; // not in /queue
+  const summary = await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
   assert.deepEqual(summary, [{ promptId: "F", status: "unknown" }]);
   assert.equal(errors.length, 0, "no error surfaced yet");
 
@@ -521,7 +526,7 @@ test("#370 P1-3 (codex): a transient /history miss that later resolves to an ERR
   // No further retry, no duplicate error.
   h.advance(2000);
   await h.fireDueTimers();
-  await tracker.reconcile({ fetchHistory, isVideo });
+  await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
   assert.equal(errors.length, 1, "exactly one run_error");
 });
 
@@ -539,8 +544,9 @@ test("#370 P1 (codex memory-leak): an exhausted-retry /history-ABSENT prompt is 
   const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 3 });
   const { tracker, flushes, giveUps } = h;
   tracker.onQueued("E");
-  const fetchHistory = async () => null; // /history stays absent (cancelled/gone)
-  await tracker.reconcile({ fetchHistory, isVideo });
+  const fetchHistory = async () => null; // absent from /history
+  const fetchQueued = async () => false; // AND absent from /queue ⇒ genuinely gone
+  await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
   assert.equal(tracker._pending.has("E"), true, "pending while retries are in flight");
   // Drain the retry budget.
   for (let i = 0; i < 6; i++) {
@@ -560,11 +566,12 @@ test("#370 P1 (codex memory-leak): an exhausted-retry /history-ABSENT prompt is 
 test("#370 P1 (codex): repeated cancelled queued prompts do NOT accumulate in the ledger", async () => {
   const h = makeHarness({ reconcileRetryMs: 500, maxReconcileRetries: 2 });
   const { tracker, giveUps } = h;
-  const fetchHistory = async () => null; // every one is cancelled/absent
+  const fetchHistory = async () => null; // absent from /history
+  const fetchQueued = async () => false; // AND absent from /queue ⇒ each is gone
   for (let n = 0; n < 5; n++) {
     const id = `c${n}`;
     tracker.onQueued(id);
-    await tracker.reconcile({ fetchHistory, isVideo });
+    await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
     for (let i = 0; i < 3; i++) {
       h.advance(500);
       await h.fireDueTimers();
@@ -582,8 +589,9 @@ test("#370 P1 (codex): give-up RETIRES a partial buffer so no stale output flush
   tracker.onExecuted("P", { images: [{ filename: "P_partial.png", type: "output" }] });
   assert.equal(tracker._buffers.has("P"), true, "P has a buffered partial");
 
-  const fetchHistory = async () => null; // absent
-  await tracker.reconcile({ fetchHistory, isVideo });
+  const fetchHistory = async () => null; // absent from /history
+  const fetchQueued = async () => false; // AND absent from /queue ⇒ gone
+  await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
   for (let i = 0; i < 4; i++) {
     h.advance(1000);
     await h.fireDueTimers();
@@ -605,24 +613,66 @@ test("#370 P2 (codex): maxReconcileRetries=0 gives up an absent-history prompt I
   const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 0 });
   const { tracker, giveUps } = h;
   tracker.onQueued("Z");
-  const fetchHistory = async () => null; // absent
-  await tracker.reconcile({ fetchHistory, isVideo });
+  const fetchHistory = async () => null; // absent from /history
+  const fetchQueued = async () => false; // AND absent from /queue ⇒ gone
+  await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
   assert.deepEqual(giveUps, [{ promptId: "Z" }], "gave up immediately (zero retries)");
   assert.equal(tracker._pending.has("Z"), false, "evicted — not stranded pending forever");
 });
 
-test("#370 P1-3: a RUNNING render whose retries exhaust is left pending (NOT given up)", async () => {
+test("#370 P1 (codex CRITICAL): absent /history BUT present in /queue (running) is NOT given up, and its later live output still delivers", async () => {
   const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 3 });
-  const { tracker, giveUps } = h;
-  tracker.onExecutionStart("R");
-  const fetchHistory = async () => ({ outputs: {}, status: {} }); // known, not terminal
-  await tracker.reconcile({ fetchHistory, isVideo });
+  const { tracker, flushes, giveUps } = h;
+  // A long render: queued during a drop, still RUNNING on reconnect — ComfyUI only
+  // writes /history on task_done, so /history/<id> is legitimately absent while the
+  // prompt sits in /queue. The reconciler MUST NOT give up / fence it.
+  tracker.onQueued("R");
+  const fetchHistory = async () => null; // absent — normal for a running prompt
+  const fetchQueued = async () => true; // BUT still in /queue (running)
+  await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
+  // Exhaust the retry budget while it stays running.
   for (let i = 0; i < 6; i++) {
     h.advance(1000);
     await h.fireDueTimers();
   }
-  assert.equal(giveUps.length, 0, "a confirmably-running render is NOT given up");
+  assert.equal(giveUps.length, 0, "a render still in /queue is NEVER given up");
   assert.equal(tracker._pending.has("R"), true, "left pending for the live path / next reconnect");
+  assert.equal(tracker.wasTerminal("R"), false, "NOT fenced — its live lifecycle must still be honored");
+
+  // The render finishes: its live executed + execution_success must STILL deliver
+  // (fails-before: the prompt was fenced/evicted and this output was dropped).
+  tracker.onExecutionStart("R");
+  tracker.onExecuted("R", { images: [{ filename: "R_final.png", type: "output" }] });
+  tracker.onExecutionSuccess("R");
+  const rFlush = flushes.find((f) => f.promptId === "R");
+  assert.ok(rFlush, "the long render's real output was delivered, not dropped");
+  assert.equal(rFlush.images[0].filename, "R_final.png");
+});
+
+test("#370 P1 (codex): a /history 503 (fetch throws) is UNCERTAIN → running, never given up even if /queue is absent", async () => {
+  const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 2 });
+  const { tracker, flushes, giveUps } = h;
+  // A finished render whose /history is transiently 503 AND already gone from /queue.
+  // The 503 must be treated as uncertain — NOT a clean absence — so it's never
+  // given up (its result may just be temporarily unreadable).
+  tracker.onQueued("H");
+  const fetchHistory = async () => {
+    throw new Error("503"); // /history unreachable
+  };
+  const fetchQueued = async () => false; // not in /queue
+  const summary = await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
+  assert.deepEqual(summary, [{ promptId: "H", status: "running" }], "503 ⇒ running (uncertain), not unknown");
+  for (let i = 0; i < 4; i++) {
+    h.advance(1000);
+    await h.fireDueTimers();
+  }
+  assert.equal(giveUps.length, 0, "a 503 /history is NEVER given up");
+  assert.equal(tracker._pending.has("H"), true, "left pending");
+  assert.equal(tracker.wasTerminal("H"), false, "not fenced");
+  // /history recovers as terminal on a later reconnect → delivered.
+  const okHistory = async (id) => ({ [id]: undefined }[id] ?? successEntry({ 1: { images: [{ filename: "H.png", type: "output" }] } }));
+  await tracker.reconcile({ fetchHistory: okHistory, fetchQueued, isVideo });
+  assert.equal(flushes.filter((f) => f.promptId === "H").length, 1, "delivered once /history recovered");
 });
 
 test("#370 still-running: reconcile leaves it pending and delivers nothing", async () => {

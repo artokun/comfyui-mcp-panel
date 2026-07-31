@@ -15133,9 +15133,32 @@ function buildPanel() {
           fetchHistory: async (promptId) => {
             if (typeof api?.fetchApi !== "function") return null;
             const res = await api.fetchApi(`/history/${encodeURIComponent(promptId)}`);
-            if (!res || !res.ok) return null;
+            // A non-OK response (e.g. 503 while the server is busy/restarting) is
+            // UNCERTAIN — NOT a clean "absent from history". THROW so the reconciler
+            // takes its "history unreachable → running" path and never gives up on a
+            // prompt whose result might just be temporarily unreadable (codex P1). A
+            // clean 200 with no entry for this id is the real absence → return null.
+            if (!res || !res.ok) {
+              throw new Error(`/history ${res ? res.status : "unreachable"}`);
+            }
             const j = await res.json();
             return (j && j[promptId]) ?? null;
+          },
+          // Is the prompt still in ComfyUI's /queue (running OR pending)? Absence
+          // from /history is NORMAL for a queued/running prompt — ComfyUI writes
+          // /history only on task_done — so the reconciler must not treat it as
+          // "gone" until /queue also lacks it. Returns true/false definitively, or
+          // null when /queue can't be read (then the reconciler stays conservative
+          // and never gives up). Queue rows are [number, prompt_id, prompt, …].
+          fetchQueued: async (promptId) => {
+            if (typeof api?.fetchApi !== "function") return null;
+            const res = await api.fetchApi("/queue");
+            if (!res || !res.ok) return null;
+            const j = await res.json();
+            const has = (arr) =>
+              Array.isArray(arr) &&
+              arr.some((item) => (Array.isArray(item) ? item[1] === promptId : item?.prompt_id === promptId));
+            return has(j?.queue_running) || has(j?.queue_pending);
           },
           isVideo: isVideoOutput,
         });

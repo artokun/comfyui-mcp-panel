@@ -293,7 +293,7 @@ export function createRunCompletionTracker({
   // once. Returns a status row; `retriable:true` means the outcome isn't known
   // yet (transient /history miss or still-running) so the caller should schedule
   // a retry rather than strand it.
-  async function reconcileKey(promptId, fetchHistory, isVideo) {
+  async function reconcileKey(promptId, fetchHistory, fetchQueued, isVideo) {
     const k = key(promptId);
     if (delivered.has(k) || !pending.has(k)) return null;
     let entry = null;
@@ -306,10 +306,35 @@ export function createRunCompletionTracker({
     // Re-check AFTER the await: a live execution_success/error may have delivered
     // and retired this prompt while /history was in flight — never double-deliver.
     if (delivered.has(k) || !pending.has(k)) return null;
-    if (fetchThrew) return { promptId, status: "unknown", retriable: true };
-    const parsed = parseHistoryEntry(entry, { isVideo });
-    if (!parsed) return { promptId, status: "unknown", retriable: true }; // 503/empty
-    if (!parsed.terminal) return { promptId, status: "running", retriable: true };
+
+    const parsed = fetchThrew ? null : parseHistoryEntry(entry, { isVideo });
+    if (!parsed || !parsed.terminal) {
+      // NOT terminal in /history. CRITICAL: absence from /history is NORMAL for a
+      // QUEUED or RUNNING prompt — ComfyUI only writes /history on task_done. So an
+      // absent /history must NOT be treated as "gone": consult /queue to tell a
+      // still-in-flight render apart from a genuinely cancelled/removed one, and
+      // NEVER fence/give up a prompt /queue still shows running (codex P1 — it would
+      // drop the live output of a legitimately long render).
+      if (fetchThrew) return { promptId, status: "running", retriable: true }; // /history unreachable ⇒ uncertain, keep polling
+      let queued = null; // null = couldn't determine; true/false = definitive
+      if (typeof fetchQueued === "function") {
+        try {
+          queued = await fetchQueued(promptId);
+        } catch {
+          queued = null;
+        }
+        if (delivered.has(k) || !pending.has(k)) return null; // re-check after 2nd await
+      }
+      if (queued === false) {
+        // DEFINITIVELY absent from BOTH /history AND /queue ⇒ genuinely gone
+        // (cancelled / interrupted). Only THIS is give-up eligible.
+        return { promptId, status: "unknown", retriable: true };
+      }
+      // Still queued/running, OR queue membership couldn't be confirmed — either
+      // way keep polling and NEVER give up (a live/uncertain render must not be
+      // fenced or evicted).
+      return { promptId, status: "running", retriable: true };
+    }
     // Terminal. Retire ALL live state for this key so a stale partial buffer (from
     // pre-drop `executed` events) can't double-deliver later, and mark it delivered
     // BEFORE onFlush so a concurrent reconcile can't race it.
@@ -351,14 +376,15 @@ export function createRunCompletionTracker({
     return { promptId, status: "success", delivered: hasBatch };
   }
 
-  // GIVE UP on a prompt whose outcome can't be confirmed after the retry budget is
-  // spent (P1 memory leak). Without this, a prompt whose /history stays ABSENT
-  // (cancelled / disconnected while queued) would sit in `pending` forever — and
-  // because the fence prune deliberately RETAINS a terminal fence while its run is
+  // GIVE UP on a prompt confirmed absent from BOTH /history AND /queue after the
+  // retry budget is spent (P1 memory leak) — i.e. genuinely cancelled/gone, NOT a
+  // still-queued/running render (which reconcileKey reports as "running", never
+  // reaching here). Without this, a truly-gone prompt would sit in `pending`
+  // forever — and because the fence prune RETAINS a terminal fence while its run is
   // pending, both `pending` and `terminal` would grow without bound. Evicting the
   // entry (once, with a one-time "couldn't confirm — safe to requeue" notice) keeps
-  // the ledger bounded to the live queue depth + in-flight retries; the terminal
-  // fence we stamp here is then no longer pinned, so it ages out normally.
+  // the ledger bounded; the terminal fence we stamp here is then no longer pinned,
+  // so it ages out normally.
   function giveUpReconcile(promptId) {
     const k = key(promptId);
     clearReconcileRetry(k);
@@ -385,30 +411,31 @@ export function createRunCompletionTracker({
 
   // Decide what to do with a reconcileKey result. Terminal/resolved ⇒ stop. Still
   // retriable with budget left ⇒ schedule another poll. Budget SPENT this episode
-  // without a terminal outcome ⇒ an UNKNOWN (/history absent — couldn't even find
-  // it) is GIVEN UP + evicted so the ledger stays bounded, while a RUNNING render
-  // (confirmably in progress) is left pending for the live path / next reconnect.
+  // without a terminal outcome ⇒ an "unknown" (confirmed absent from BOTH /history
+  // AND /queue ⇒ genuinely gone) is GIVEN UP + evicted so the ledger stays bounded,
+  // while a "running" render (still in /queue, or membership uncertain) is left
+  // PENDING for the live path / next reconnect — never fenced or dropped (codex P1).
   // Centralizing the decision here makes it fire even when maxReconcileRetries===0
-  // (give up immediately for an absent history) — codex P2.
-  function afterReconcileRow(row, promptId, fetchHistory, isVideo) {
+  // (give up immediately for a confirmed-gone prompt) — codex P2.
+  function afterReconcileRow(row, promptId, fetchHistory, fetchQueued, isVideo) {
     const k = key(promptId);
     if (!row || !row.retriable) {
       clearReconcileRetry(k); // resolved (terminal / delivered)
       return;
     }
     if ((retryCounts.get(k) ?? 0) >= maxReconcileRetries) {
-      if (row.status === "unknown") giveUpReconcile(promptId); // absent ⇒ evict
+      if (row.status === "unknown") giveUpReconcile(promptId); // gone ⇒ evict
       else clearReconcileRetry(k); // still "running" ⇒ leave pending, stop polling
       return;
     }
-    scheduleReconcileRetry(promptId, fetchHistory, isVideo);
+    scheduleReconcileRetry(promptId, fetchHistory, fetchQueued, isVideo);
   }
 
   // Arm one bounded, self-repolling retry for a prompt whose /history is not yet
   // terminal (P1-3). The budget/give-up decision lives in afterReconcileRow; this
   // just schedules the next poll. Uses the injected timer so it's deterministic
   // under test.
-  function scheduleReconcileRetry(promptId, fetchHistory, isVideo) {
+  function scheduleReconcileRetry(promptId, fetchHistory, fetchQueued, isVideo) {
     const k = key(promptId);
     if (k === NO_PROMPT_KEY) return; // id-less runs aren't reconcilable
     if (delivered.has(k) || !pending.has(k)) {
@@ -423,8 +450,8 @@ export function createRunCompletionTracker({
         clearReconcileRetry(k);
         return;
       }
-      const row = await reconcileKey(promptId, fetchHistory, isVideo);
-      afterReconcileRow(row, promptId, fetchHistory, isVideo);
+      const row = await reconcileKey(promptId, fetchHistory, fetchQueued, isVideo);
+      afterReconcileRow(row, promptId, fetchHistory, fetchQueued, isVideo);
     }, reconcileRetryMs);
     retryTimers.set(k, timer);
   }
@@ -612,19 +639,24 @@ export function createRunCompletionTracker({
      * @param {(promptId:string)=>Promise<object|null>} args.fetchHistory  Resolves
      *   the per-prompt `/history/<id>` entry (already unwrapped from `{[id]:…}`), or
      *   null when absent.
+     * @param {(promptId:string)=>Promise<boolean|null>} [args.fetchQueued]  Resolves
+     *   whether the prompt is still in ComfyUI's `/queue` (running OR pending): true
+     *   present, false definitively absent, null couldn't determine. Consulted only
+     *   when /history is non-terminal, to tell a still-running render apart from a
+     *   genuinely gone one — a running render is NEVER given up (codex P1).
      * @param {(m:object)=>boolean} [args.isVideo]  Output classifier (see parse).
      * @returns {Promise<Array<{promptId:string, status:string, delivered?:boolean}>>}
      *   One row per pending prompt inspected — the caller surfaces error/unknown
      *   notices; SUCCESS batches are delivered here via onFlush.
      */
-    async reconcile({ fetchHistory, isVideo } = {}) {
+    async reconcile({ fetchHistory, fetchQueued, isVideo } = {}) {
       const summary = [];
       pruneFences(); // reconnect is a natural sweep point for old fences
       if (typeof fetchHistory !== "function") return summary;
       for (const [, info] of [...pending.entries()]) {
         const promptId = info.promptId;
         if (promptId == null) continue;
-        const row = await reconcileKey(promptId, fetchHistory, isVideo);
+        const row = await reconcileKey(promptId, fetchHistory, fetchQueued, isVideo);
         if (!row) continue; // resolved by a live event meanwhile — nothing to report
         const clean = { promptId: row.promptId, status: row.status };
         if (row.delivered !== undefined) clean.delivered = row.delivered;
@@ -637,7 +669,7 @@ export function createRunCompletionTracker({
         // evicts an absent-history prompt, or leaves a running one pending (P1-3,
         // and the memory-leak give-up — fires even when maxReconcileRetries===0).
         if (row.retriable) retryCounts.delete(key(promptId));
-        afterReconcileRow(row, promptId, fetchHistory, isVideo);
+        afterReconcileRow(row, promptId, fetchHistory, fetchQueued, isVideo);
       }
       return summary;
     },
