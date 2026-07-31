@@ -106,6 +106,7 @@ import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import {
   isStaleAssetCandidate as isStaleAssetCandidateLib,
   reapplyDefsToLiveNodes,
+  refreshComboOptionsFromDefs,
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing } from "./lib/node-resolve.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
@@ -3959,14 +3960,22 @@ function resolveNode(graph, nodeId) {
 }
 
 // ---- Node-type resolution guard (#458) ------------------------------------
-// The graph WRITE tools resolve node types against LG.registered_node_types:
-// assertAddNodeResolvableRefreshing gates graph_add_node on the class_type before
-// create (refreshing stale node defs once and re-checking, #289/#458);
-// graph_set_widget delegates to runSetWidget (web/js/lib/set-widget.js), whose
-// shared body gates on the ACTUAL RESOLVED write target (inner promoted node for
-// a subgraph, else the node's own) BEFORE any coercion/mutation, so an unresolved
-// placeholder can never be reported as a fabricated success. The predicates live
-// in web/js/lib/node-resolve.js and take the raw registry object.
+// The graph WRITE tools authorize node types against the CURRENT backend
+// /object_info — NOT the mutable LG.registered_node_types registry, which keeps a
+// STALE POSITIVE for an uninstalled pack after a ComfyUI restart-without-reload:
+//   * assertAddNodeResolvableRefreshing gates graph_add_node on the class_type
+//     before create (fresh /object_info is the oracle; refresh stale defs once and
+//     re-check, #289/#458); and
+//   * graph_set_widget delegates to runSetWidget (web/js/lib/set-widget.js), which
+//     first authorizes the type of the ACTUAL RESOLVED write target against the SAME
+//     fresh oracle — the node's own type for a direct write, or the INNER promoted
+//     node's type for a subgraph write (resolved mutation-free up front) — failing
+//     closed on a removed/unverifiable type (#458 set_widget gap). It then gates on
+//     that resolved target's registry+placeholder state BEFORE any coercion/mutation,
+//     so an unresolved placeholder or a since-removed type can never be reported as a
+//     fabricated success.
+// The predicates live in web/js/lib/node-resolve.js and take the raw registry
+// object (plus, for the fresh-oracle path, a getFreshObjectInfo/refresh capability).
 
 
 // ---- Subgraph boundary rails (input/output proxy nodes) -------------------
@@ -5442,12 +5451,36 @@ const GRAPH_TOOL_EXECUTORS = {
     // #284/#304, keeping #240 strictness).
     return runSetWidget(node, widget, value, {
       registry: LG?.registered_node_types ?? {},
+      // Fresh-backend type authorization (#458 set_widget gap): the go/no-go for the
+      // resolved target node's TYPE is decided against the CURRENT /object_info — NOT
+      // the stale LiteGraph registry, which keeps a positive for an uninstalled pack
+      // after a restart-without-reload. Mirrors graph_add_node.
+      getRegistry: () => LG?.registered_node_types ?? {},
+      getFreshObjectInfo: () =>
+        typeof api?.getNodeDefs === "function" ? api.getNodeDefs() : null,
       resolveSource: sourceForSubgraphInput,
       canvas: app.canvas,
       beforeChange: () => graph.beforeChange(),
       afterChange: () => graph.afterChange(),
       setDirty: () => graph.setDirtyCanvas(true, true),
-      refreshCombos: () => refreshComfyNodeDefs(),
+      // Stale-combo retry: reuse the /object_info already fetched for authorization
+      // (passed by runSetWidget) to refresh THIS target's combo option lists in place
+      // — a single fetch total (#458 P2). When a payload IS present we NEVER re-fetch,
+      // even if nothing was updated (a dynamic function-combo is self-refreshing; a
+      // genuinely-invalid value simply stays rejected on the retry). Only a MISSING
+      // payload falls back to the full frontend refresh (refreshComfyNodeDefs →
+      // refreshComboInNodes), which re-fetches /object_info.
+      refreshCombos: (defs, target, concreteType, nameMap) => {
+        if (defs) {
+          // Key the combo options on the ULTIMATE CONCRETE type (resolved through the
+          // promotion chain), not the intermediate virtual node's type, and bridge a
+          // RENAMED nested promotion via nameMap, so a nested promoted combo is refreshed
+          // from the real backend def under the right input name (#458×#366).
+          refreshComboOptionsFromDefs(target, defs, concreteType, nameMap);
+          return;
+        }
+        return refreshComfyNodeDefs();
+      },
     });
   },
 

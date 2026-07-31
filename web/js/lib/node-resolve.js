@@ -159,6 +159,39 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
 }
 
 /**
+ * Fresh-backend authorization for graph_set_widget, applied to the type of the
+ * ACTUAL RESOLVED write target (the inner promoted node for a subgraph write, or
+ * the node's own for a direct write) — #458 set_widget gap, found in review of
+ * #375. graph_add_node already authorizes its class_type against the CURRENT
+ * /object_info; set_widget must do the SAME, because the LiteGraph registry keeps
+ * a STALE POSITIVE for an uninstalled pack when the browser tab was never reloaded
+ * after a ComfyUI restart. `freshDefs` is the freshly-fetched /object_info map (or
+ * null/undefined when the fetch failed). FAILS CLOSED in both directions:
+ *   - fetch unavailable (null/non-object) ⇒ "cannot verify against backend"; and
+ *   - type absent from the fresh map ⇒ "backend does not provide" (removed pack).
+ * Never authorizes from the stale registry. Pure — no side effects — so the caller
+ * can run it on the exact target it is about to mutate, before any mutation.
+ */
+export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknown)") {
+  const label = typeof type === "string" ? ` ("${type}")` : "";
+  if (!freshDefs || typeof freshDefs !== "object") {
+    throw new Error(
+      `Cannot set widget on node ${nodeId}${label}: cannot verify the node type against the ` +
+        `ComfyUI backend (object_info is unavailable — the backend is unreachable or the fetch ` +
+        `failed). Refusing to write rather than trust a possibly-stale node cache (#458). ` +
+        `Reconnect ComfyUI and retry.`,
+    );
+  }
+  if (typeof type !== "string" || !Object.prototype.hasOwnProperty.call(freshDefs, type)) {
+    throw new Error(
+      `Cannot set widget on node ${nodeId}${label}: the ComfyUI backend does not provide node ` +
+        `type "${type}" (not installed, or its pack was removed) — refusing to write to a node ` +
+        `the live backend no longer defines (#458). Check the exact class_type via panel_search_nodes.`,
+    );
+  }
+}
+
+/**
  * Guard for graph_set_widget, applied to the ACTUAL RESOLVED write target (the
  * inner promoted node for a subgraph write, or the node's own for a direct
  * write) — NOT the outer node. This is the load-bearing check: it must run on

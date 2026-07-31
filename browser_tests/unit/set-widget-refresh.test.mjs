@@ -30,6 +30,12 @@ import { runSetWidget } from "../../web/js/lib/set-widget.js";
 // type still resolves as registered.
 const REGISTRY = { LoadImage: {}, ControlNetLoader: {}, KSampler: {} };
 
+// Fresh /object_info oracle is REQUIRED by runSetWidget (#458): a live backend that
+// defines the fixture types, so the fresh-backend type gate is a no-op here and the
+// stale-COMBO recovery (the actual subject of this file) is what is exercised.
+const FRESH = { LoadImage: {}, ControlNetLoader: {}, KSampler: {} };
+const freshOracle = { getFreshObjectInfo: async () => FRESH };
+
 function makeNode(type, widget) {
   return { id: 105, type, widgets: [widget] };
 }
@@ -46,6 +52,7 @@ test("stale combo: a just-staged value ABSENT at first is accepted after refresh
 
   const res = await runSetWidget(node, "image", "ICEDTEA_scene_bg_inpaint_01.png", {
     registry: REGISTRY,
+    ...freshOracle,
     refreshCombos,
   });
 
@@ -64,6 +71,7 @@ test("EMPTY LoadImage combo (0 options) accepts the uploaded file after refresh 
 
   const res = await runSetWidget(node, "image", "wan_reference_woman.png", {
     registry: REGISTRY,
+    ...freshOracle,
     refreshCombos,
   });
   assert.equal(res.set.value, "wan_reference_woman.png");
@@ -82,6 +90,7 @@ test("ControlNetLoader stale 3-item list accepts the 4th model after refresh (#2
   };
   const res = await runSetWidget(node, "control_net_name", "mistoLine_rank256.safetensors", {
     registry: REGISTRY,
+    ...freshOracle,
     refreshCombos,
   });
   assert.equal(res.set.value, "mistoLine_rank256.safetensors");
@@ -101,6 +110,7 @@ test("GENUINELY-invalid value is STILL rejected after refresh (keeps #240 strict
     () =>
       runSetWidget(node, "image", "does_not_exist_anywhere.png", {
         registry: REGISTRY,
+        ...freshOracle,
         refreshCombos,
       }),
     (err) =>
@@ -117,7 +127,7 @@ test("without a refreshCombos injection, a stale-combo miss fails closed (no sil
   const widget = { name: "image", type: "combo", options: { values: ["old_a.png"] }, value: "old_a.png" };
   const node = makeNode("LoadImage", widget);
   await assert.rejects(
-    () => runSetWidget(node, "image", "new.png", { registry: REGISTRY }),
+    () => runSetWidget(node, "image", "new.png", { registry: REGISTRY, ...freshOracle }),
     (err) => err instanceof Error && /not a valid option/.test(err.message),
   );
 });
@@ -130,7 +140,7 @@ test("a NON-combo failure (numeric type mismatch) never triggers a refresh", asy
     refreshCalls += 1;
   };
   await assert.rejects(
-    () => runSetWidget(node, "steps", "euler", { registry: REGISTRY, refreshCombos }),
+    () => runSetWidget(node, "steps", "euler", { registry: REGISTRY, ...freshOracle, refreshCombos }),
     (err) => err instanceof Error && /not a number/.test(err.message),
   );
   assert.equal(refreshCalls, 0, "numeric mismatch must fail closed without refreshing");
@@ -142,6 +152,7 @@ test("a valid value on the FIRST try does not call refresh at all", async () => 
   let refreshCalls = 0;
   const res = await runSetWidget(node, "image", "b.png", {
     registry: REGISTRY,
+    ...freshOracle,
     refreshCombos: async () => {
       refreshCalls += 1;
     },

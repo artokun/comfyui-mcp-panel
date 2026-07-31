@@ -351,8 +351,29 @@ const HOOKS = { beforeChange() {}, afterChange() {}, setDirty() {} };
 // GRAPH_TOOL_EXECUTORS.graph_set_widget delegates to (it wires the assertTargetWritable
 // guard internally). So dropping the shipped guard wiring, or reordering
 // preflight/reconcile/guarded-write, FAILS these tests.
+// A permissive fresh /object_info oracle covering every fixture TARGET type used in
+// this file (core sentinels + the custom/ghost/subgraph types). runSetWidget REQUIRES
+// the oracle (#458); here it is intentionally a no-op gate — the fresh backend
+// "provides" every type — so these tests exercise the REGISTRY guard + handler
+// ordering (their subject), while the fresh-gate fail-closed behavior is covered by
+// set-widget-fresh-backend.test.mjs. Ghost/unregistered types are present in the
+// oracle so the fresh gate passes and the REGISTRY guard (which lacks them) is the
+// decider — preserving each test's original refusal message.
+const FRESH_ALL = objectInfo([
+  "MyRegNode",
+  "GhostNode",
+  "GhostSampler",
+  "SubgraphNode",
+  "Note",
+]);
+
 function setViaHandler(registry, node, widgetName, value, resolveSource) {
-  return runSetWidget(node, widgetName, value, { registry, resolveSource, ...HOOKS });
+  return runSetWidget(node, widgetName, value, {
+    registry,
+    getFreshObjectInfo: async () => FRESH_ALL,
+    resolveSource,
+    ...HOOKS,
+  });
 }
 
 // A real SubgraphNode over an inner KSampler whose promoted widget "sched_alias"
