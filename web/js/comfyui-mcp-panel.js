@@ -144,7 +144,7 @@ import {
   refreshNodeArea,
 } from "./lib/group-geometry.js";
 import { pickRevertSnapshot } from "./lib/graph-revert.js";
-import { saveActiveWorkflow } from "./lib/workflow-save.js";
+import { saveActiveWorkflow, shouldGroundBeforeTurn, groundActiveWorkflow } from "./lib/workflow-save.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
 import {
@@ -2571,9 +2571,16 @@ async function workflowExistsOnDisk(rawPath) {
  *  agent works from a grounded file. Best-effort. Returns the saved name or null. */
 async function groundUnsavedWorkflow() {
   try {
-    const wf = app?.extensionManager?.workflow?.activeWorkflow;
-    if (!wf || (wf.isPersisted !== false && wf.isTemporary !== true)) return null;
-    return await programmaticSave();
+    // #330: ground the active workflow ATOMICALLY — probe its on-disk state and save
+    // the EXACT SAME workflow (refusing if the user switched tabs during the async
+    // probe, so we can't authorize on tab A and overwrite tab B), single-flighted so
+    // concurrent turns can't create duplicate copies. Only a provably never-persisted
+    // source is saved; anything unprovable is left for a manual Ctrl+S.
+    return await groundActiveWorkflow(app?.extensionManager?.workflow, {
+      existsOnDisk: workflowExistsOnDisk,
+      autoWorkflowName,
+      reconcileSavedCopy: reconcileSavedWorkflowCopy,
+    });
   } catch {
     return null; // best-effort — never block the chat on a save hiccup
   }
@@ -17005,9 +17012,13 @@ function buildPanel() {
         `Load Video/file node or pass the path to the comfyui tools):\n${lines}]`;
     }
 
-    // Ground a brand-new chat: if the open workflow was never saved, save it
-    // first so the agent works from a real file (Ctrl+S / reload behave).
-    if (freshChat) {
+    // Ground an unsaved workflow before EVERY turn (#330) — NOT only a brand-new
+    // chat. Continuing an existing chat inside an unsaved tab still leaves the
+    // user's edits unprotected until they hit disk, so save first so the agent
+    // works from a real file (Ctrl+S / reload behave). groundUnsavedWorkflow is
+    // idempotent (a no-op once persisted); shouldGroundBeforeTurn ignores chat
+    // freshness so a per-turn continuation is protected too.
+    if (shouldGroundBeforeTurn(app?.extensionManager?.workflow?.activeWorkflow, { freshChat })) {
       const saved = await groundUnsavedWorkflow();
       if (saved) appendSystem(`Saved your workflow as “${saved}” — grounded base for the agent.`);
     }
