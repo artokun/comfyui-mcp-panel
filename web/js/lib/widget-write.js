@@ -363,12 +363,55 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
 }
 
 /**
+ * Follow a promoted write target through any NESTED SubgraphNodes to the ULTIMATE
+ * CONCRETE backend node (#458 nested-promotion false-failure). ComfyUI supports
+ * promoting an outer subgraph widget from an INNER subgraph that itself promotes from
+ * a real node (A → B → KSampler). The immediate resolved target of the outer
+ * promotion is the inner SubgraphNode (B) — a VIRTUAL node whose subgraph-id type is
+ * absent from /object_info, so authorizing THAT against the backend would wrongly
+ * refuse a valid write. Traverse the chain until a node with no `.subgraph` (the
+ * concrete backend node) is reached, and return it for fresh authorization; a virtual
+ * SubgraphNode type in the chain is TRAVERSED, never authorized. Pure: read-only.
+ *
+ * `target` is the immediate `{ node, widget }` from resolvePromotedInnerTarget.
+ * Returns (always carrying the widget reached at the terminal, for combo-refresh
+ * name mapping — nested promotions may RENAME the widget at each level, #366):
+ *   { node, widget }                        → the CONCRETE backend node + its widget
+ *   { node, widget, terminalVirtual: true } → chain ended on a virtual node's OWN
+ *                                             (non-promoted) widget; authorize its type
+ *   { node: null, widget: null, error }     → a deeper promotion link is unresolvable
+ *   { node, widget, cycle: true }           → a promotion cycle was detected (defensive)
+ */
+export function followPromotionToConcrete(target, resolveSource) {
+  let node = target?.node ?? null;
+  let widget = target?.widget ?? null;
+  const seen = new Set();
+  while (node && node.subgraph) {
+    if (seen.has(node)) return { node, widget, cycle: true };
+    seen.add(node);
+    const res = resolvePromotedInnerTarget(node, widget?.name, resolveSource);
+    if (!res.promoted) return { node, widget, terminalVirtual: true };
+    if (!res.target) return { node: null, widget: null, error: res.error };
+    node = res.target.node;
+    widget = res.target.widget;
+  }
+  return { node, widget };
+}
+
+/**
  * Resolve the true write target (inner promoted widget or the node's own
  * widget) and validate/coerce the value. Throws WidgetWriteError on any
  * unresolved-promotion, missing-widget, or value-mismatch condition — BEFORE
  * any mutation. Pure: no graph side effects.
  */
-export function resolveWidgetWrite(node, widgetName, value, resolveSource, assertTargetWritable) {
+export function resolveWidgetWrite(
+  node,
+  widgetName,
+  value,
+  resolveSource,
+  assertTargetWritable,
+  promotedResolution,
+) {
   let targetNode = node;
   let widget = null;
   let promotedFrom = null;
@@ -376,7 +419,12 @@ export function resolveWidgetWrite(node, widgetName, value, resolveSource, asser
   let promotedHostInput = null;
 
   if (node?.subgraph) {
-    const res = resolvePromotedInnerTarget(node, widgetName, resolveSource);
+    // Reuse a promotion resolution the caller already computed (graph_set_widget
+    // resolves it ONCE up front to fresh-authorize the inner target, #458), so the
+    // write targets the IDENTICAL inner node it authorized — a relink between the
+    // async /object_info fetch and the write can't swap in an unauthorized target.
+    // Falls back to resolving here for direct callers (e.g. unit fixtures).
+    const res = promotedResolution ?? resolvePromotedInnerTarget(node, widgetName, resolveSource);
     if (res.promoted) {
       // Promoted widget: use the resolved inner widget DIRECTLY. Never re-search
       // the inner node by the OUTER name (a rename would hit the wrong inner
@@ -453,14 +501,17 @@ export function applyWidgetWrite(
   node,
   widgetName,
   value,
-  { resolveSource, canvas, beforeChange, afterChange, setDirty, assertTargetWritable } = {},
+  { resolveSource, canvas, beforeChange, afterChange, setDirty, assertTargetWritable, promotedResolution } = {},
 ) {
   // resolveWidgetWrite runs assertTargetWritable on the RESOLVED target (inner
   // promoted node for a subgraph write, or the node's own) BEFORE it coerces the
   // value, so no coercion callback and no mutation can touch an unregistered
-  // placeholder that is about to be refused (#458).
+  // placeholder that is about to be refused (#458). A caller-supplied
+  // promotedResolution is reused so the write targets the EXACT node the fresh
+  // /object_info gate authorized (#458), and resolveWidgetWrite also fails closed if
+  // the AUTHORITATIVE parent rail widget can't be identified (#366).
   const { targetNode, widget: w, coerced, promotedFrom, promotedParentWidget, promotedHostInput } =
-    resolveWidgetWrite(node, widgetName, value, resolveSource, assertTargetWritable);
+    resolveWidgetWrite(node, widgetName, value, resolveSource, assertTargetWritable, promotedResolution);
 
   // #366: for a promoted subgraph widget the AUTHORITATIVE value lives on the
   // parent's OWN rail widget (resolved by the promotion RELATIONSHIP in

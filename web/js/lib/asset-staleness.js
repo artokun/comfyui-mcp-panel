@@ -335,6 +335,61 @@ export function collectAllGraphs(rootGraph) {
  * `defsByType` is the `class_type → def` map from api.getNodeDefs(). Returns the
  * number of nodes whose UNKNOWN widgets were repaired. Fully defensive.
  */
+/**
+ * Update a SINGLE node's COMBO widget option lists in place from an already-fetched
+ * /object_info payload (`class_type -> def`), WITHOUT a second network round-trip
+ * (#458 P2). The stale-combo set_widget retry re-validates a just-staged value (a
+ * downloaded model / uploaded image / staged output) against the AUTHORITATIVE list;
+ * that list is already in the /object_info the fresh-backend type gate just fetched,
+ * so we reuse it here instead of calling ComfyUI's refreshComboInNodes() (which
+ * re-fetches /object_info internally). ComfyUI's /object_info encodes a combo as an
+ * input spec whose first element is the array of options: `input[.required|.optional]
+ * [name] = [[opt, ...], {config}]`. Only ARRAY-backed combos are refreshed; a dynamic
+ * `options.values` FUNCTION is left untouched (it computes its own list). Returns the
+ * number of widgets whose option list was refreshed. Fully defensive.
+ *
+ * `defTypeKey` overrides which /object_info class_type the def is looked up under —
+ * REQUIRED for a nested/promoted write, where the widget being mutated lives on an
+ * intermediate VIRTUAL SubgraphNode (absent from /object_info) but its authoritative
+ * options come from the ULTIMATE CONCRETE backend type (#458 nested combo-refresh).
+ * The concrete type must be resolved through the promotion chain, never the virtual
+ * intermediate `node.type`. Defaults to the node's own type for direct writes.
+ *
+ * `widgetNameMap` (optional { nodeWidgetName -> defWidgetName }) bridges a RENAMED
+ * promotion: a nested promotion can rename the widget at each level, so the widget
+ * being mutated (`nodeWidgetName`) may not match the concrete def's input name — the
+ * map supplies the concrete-def key to look its options up under (#458×#366). Widgets
+ * not in the map fall back to their own name.
+ */
+export function refreshComboOptionsFromDefs(node, defsByType, defTypeKey, widgetNameMap) {
+  let refreshed = 0;
+  if (!node || !defsByType) return refreshed;
+  try {
+    const type = defTypeKey ?? node.type ?? node.comfyClass;
+    const def = type ? defsByType[type] : null;
+    if (!def) return refreshed;
+    const inputs = { ...(def.input?.required ?? {}), ...(def.input?.optional ?? {}) };
+    for (const w of node.widgets ?? []) {
+      if (w?.name == null) continue;
+      const defKey = (widgetNameMap && widgetNameMap[w.name]) ?? w.name;
+      const spec = inputs[defKey];
+      if (!spec) continue;
+      // A combo's spec is `[[opt, ...], config?]` — the first element is the option
+      // array. Anything else (a type string like "INT"/"STRING") is not a combo.
+      const first = Array.isArray(spec) ? spec[0] : undefined;
+      if (!Array.isArray(first)) continue;
+      // Never clobber a dynamic (function) option source — it derives its own list.
+      if (typeof w.options?.values === "function") continue;
+      if (!w.options || typeof w.options !== "object") w.options = {};
+      w.options.values = first.slice();
+      refreshed++;
+    }
+  } catch {
+    /* best-effort — a malformed def just means the retry falls back to failing closed */
+  }
+  return refreshed;
+}
+
 export function reapplyDefsToLiveNodes(rootGraph, defsByType) {
   let repaired = 0;
   if (!defsByType) return repaired;
