@@ -23,6 +23,48 @@ export function nodeFocusBounds(node) {
   return [node.pos[0], node.pos[1] - 30, w, h + 30]; // title bar renders above pos
 }
 
+/**
+ * Keep a node's cached boundingRect in lockstep with a programmatic position
+ * write. LiteGraph only refreshes boundingRect during its own render pass, so
+ * right after `node.pos = ...` the cached rect still describes the PRE-MOVE
+ * footprint — and because nodeFocusBounds (and LiteGraph's own
+ * recomputeInsideNodes → containsCentre) PREFER boundingRect, geometric group
+ * membership would then be computed against stale geometry (#355).
+ *
+ * `prevPos` is the node's [x, y] BEFORE the write. We first let the engine
+ * recompute via its own updateArea() (authoritative in a real ComfyUI/LiteGraph
+ * build); if that method is absent, throws, or leaves the cached rect at its old
+ * origin, we translate the rect by exactly the position delta — a pure move
+ * shifts the bounding-box origin by the same amount, so this correction is exact
+ * and build-independent. Dependency-free (no LiteGraph, no DOM) so it is
+ * unit-testable with plain object fixtures.
+ */
+export function refreshNodeArea(node, prevPos) {
+  if (!node) return;
+  const rectBefore = node.boundingRect;
+  const originBefore =
+    rectBefore && rectBefore.length === 4 ? [rectBefore[0], rectBefore[1]] : null;
+  try {
+    node.updateArea?.();
+  } catch {
+    /* some builds need a canvas ctx; the delta-sync below still corrects it */
+  }
+  const br = node.boundingRect;
+  if (!br || br.length !== 4) return;
+  // Engine already moved the rect origin → trust its authoritative recompute.
+  if (originBefore && (br[0] !== originBefore[0] || br[1] !== originBefore[1])) return;
+  if (!Array.isArray(prevPos) || prevPos.length !== 2) return;
+  const px = Number(prevPos[0]);
+  const py = Number(prevPos[1]);
+  if (!Number.isFinite(px) || !Number.isFinite(py)) return;
+  const dx = (node.pos?.[0] ?? 0) - px;
+  const dy = (node.pos?.[1] ?? 0) - py;
+  if (dx || dy) {
+    br[0] += dx;
+    br[1] += dy;
+  }
+}
+
 /** [x, y, w, h] that wraps the given nodes, padded for the group + node titles. */
 export function boundsAroundNodes(nodes, pad = 30, titlePad = 70) {
   let minX = Infinity;

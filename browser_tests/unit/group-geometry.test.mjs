@@ -18,6 +18,7 @@ import {
   groupBoundsOf,
   groupMemberNodes,
   classifyRequestedMembership,
+  refreshNodeArea,
 } from "../../web/js/lib/group-geometry.js";
 
 // Minimal fixtures. No boundingRect => nodeFocusBounds falls back to pos/size
@@ -135,6 +136,69 @@ test("nodeFocusBounds prefers boundingRect when present", () => {
 test("nodeFocusBounds accepts a typed-array boundingRect (current ComfyUI Rectangle)", () => {
   const br = Float32Array.from([1, 2, 3, 4]);
   assert.deepEqual(nodeFocusBounds({ boundingRect: br }), [1, 2, 3, 4]);
+});
+
+// ---- refreshNodeArea: keep boundingRect live after a programmatic move (#355) ----
+
+test("stale boundingRect gives WRONG membership until refreshNodeArea (#355)", () => {
+  // Node lived at [0,0]; its cached boundingRect reflects that old spot.
+  const n = { id: 1, pos: [0, 0], size: [300, 120], boundingRect: [0, -30, 300, 150] };
+  const graph = graphOf(n);
+  // A group box far to the right — the node is NOT in it while at [0,0].
+  const g = groupBox([400, 0, 300, 300]);
+  assert.deepEqual(groupMemberNodes(graph, g).map((x) => x.id), [], "node starts outside");
+
+  // Programmatic move INTO the group box, exactly like graph_move_node writes pos.
+  const prev = [n.pos[0], n.pos[1]];
+  n.pos = [450, 50];
+  // FAIL-BEFORE: without refreshing, the stale boundingRect (which nodeFocusBounds
+  // prefers) still says the node is at [0,-30] → membership misses it.
+  assert.deepEqual(
+    groupMemberNodes(graph, g).map((x) => x.id),
+    [],
+    "stale boundingRect wrongly excludes the moved-in node",
+  );
+
+  // PASS-AFTER: refresh translates the cached rect by the move delta.
+  refreshNodeArea(n, prev);
+  assert.deepEqual(n.boundingRect, [450, 20, 300, 150], "rect shifted by (+450,+50)");
+  assert.deepEqual(
+    groupMemberNodes(graph, g).map((x) => x.id),
+    [1],
+    "refreshed geometry now reports the node as a member",
+  );
+});
+
+test("refreshNodeArea trusts the engine's own updateArea() recompute (#355)", () => {
+  // A build whose updateArea() authoritatively recomputes boundingRect from pos.
+  const n = {
+    id: 7,
+    pos: [1000, 1000],
+    size: [200, 100],
+    boundingRect: [0, -30, 200, 130],
+    updateArea() {
+      this.boundingRect = [this.pos[0], this.pos[1] - 30, this.size[0], this.size[1] + 30];
+    },
+  };
+  refreshNodeArea(n, [0, 0]);
+  // Engine moved the origin → refresh must NOT also apply the delta (no double-shift).
+  assert.deepEqual(n.boundingRect, [1000, 970, 200, 130]);
+});
+
+test("refreshNodeArea is a no-op when there is no boundingRect to correct (#355)", () => {
+  // No boundingRect → nodeFocusBounds already uses fresh pos/size; nothing to do.
+  const n = { id: 9, pos: [10, 10], size: [200, 100] };
+  refreshNodeArea(n, [0, 0]);
+  assert.equal(n.boundingRect, undefined);
+  // Guard against throwing on odd inputs.
+  refreshNodeArea(null, [0, 0]);
+  refreshNodeArea(n, undefined);
+});
+
+test("refreshNodeArea supports a typed-array boundingRect (ComfyUI Rectangle)", () => {
+  const n = { id: 3, pos: [100, 200], size: [80, 40], boundingRect: Float32Array.from([0, 0, 80, 70]) };
+  refreshNodeArea(n, [0, 0]);
+  assert.deepEqual([...n.boundingRect], [100, 200, 80, 70], "typed-array origin shifted in place");
 });
 
 test("membership overlap is edge-inclusive (matches LiteGraph overlapBounding)", () => {
