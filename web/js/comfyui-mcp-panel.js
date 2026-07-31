@@ -101,6 +101,15 @@ import {
   reapplyDefsToLiveNodes,
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvable } from "./lib/node-resolve.js";
+import {
+  resolveScope,
+  describeScope,
+  findSubgraphOwner,
+  isSubgraphInRoot,
+  resolveRailNode,
+  railKindFor,
+  computeOrphanedBoundaries,
+} from "./lib/subgraph-scope.js";
 import { runSetWidget } from "./lib/set-widget.js";
 import { autoMatchSlots, slotDiagnostic } from "./lib/connect-match.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
@@ -2981,11 +2990,29 @@ function getWorkflowTitle() {
 const MAX_STATE_NODES = 100;
 
 function getGraphCtx() {
-  // app.canvas.graph is the graph the user is LOOKING at — the root graph or
-  // an opened subgraph — so reads and edits target what's on screen.
-  const graph = app?.canvas?.graph ?? app?.graph;
+  // app.canvas.graph is the graph the user is LOOKING at — the root graph or an
+  // opened subgraph — so reads and edits target what's on screen. But after a
+  // reconnect/tab-switch the canvas can still point at a subgraph object that the
+  // REBUILT root graph no longer owns; resolveScope detects that STALE reference
+  // and reconciles to root so graph READS and graph WRITES can never diverge
+  // (#220/#308). It is the ONE authoritative viewing-scope source.
   const LG = window.LiteGraph ?? globalThis.LiteGraph;
-  if (!app || !graph || !LG) {
+  if (!app || !app.graph || !LG) {
+    throw new Error("ComfyUI graph is not available (app.graph / LiteGraph missing)");
+  }
+  const scope = resolveScope(app);
+  // When the scope was stale, rebind the CANVAS to root too, so the physical view
+  // matches the graph reads/edits now target (keeps read + edit in lockstep).
+  if (scope.stale && typeof app.canvas?.setGraph === "function") {
+    try {
+      app.canvas.setGraph(scope.rootGraph);
+      app.canvas.setDirty?.(true, true);
+    } catch {
+      // best-effort — the resolved `graph` below is still the reconciled root
+    }
+  }
+  const graph = scope.graph ?? app.graph;
+  if (!graph) {
     throw new Error("ComfyUI graph is not available (app.graph / LiteGraph missing)");
   }
   return { app, graph, rootGraph: app.graph, canvas: app.canvas, LG };
@@ -3176,15 +3203,33 @@ function refreshPromotedParents(parents, canvas) {
   canvas?.setDirty?.(true, true);
 }
 
-/** Where is the user looking right now — root graph or inside a subgraph? */
+/** Where is the user looking right now — root graph or inside a subgraph? Uses the
+ *  SAME owner search as the authoritative resolver (findSubgraphOwner, nesting-aware)
+ *  so the reported `viewing` scope always agrees with the graph reads/edits act on.
+ *  A subgraph the live root no longer owns is a STALE reference (post-reconnect);
+ *  report root, matching getGraphCtx()'s reconciliation, so read+edit stay in
+ *  lockstep (#220/#308). */
 function describeActiveGraph(graph) {
-  if (!app?.graph || graph === app.graph) return { scope: "root" };
-  const owner = (app.graph._nodes ?? []).find((n) => n.subgraph === graph);
-  return {
-    scope: "subgraph",
-    owner_node_id: owner?.id ?? null,
-    title: owner?.title ?? graph?.name ?? "subgraph",
-  };
+  const root = app?.graph;
+  if (!root || !graph || graph === root) return { scope: "root" };
+  const owner = findSubgraphOwner(root, graph);
+  if (owner) {
+    return {
+      scope: "subgraph",
+      owner_node_id: owner.id ?? null,
+      title: owner.title ?? graph?.name ?? "subgraph",
+    };
+  }
+  // Ownerless but authoritatively part of the root via its subgraphs registry — a
+  // valid registry-owned subgraph, exactly what resolveScope keeps (NOT stale). Must
+  // report "subgraph" here too, else `viewing` would say root while reads/edits act
+  // on the subgraph — reintroducing the #308/#220 divergence.
+  if (isSubgraphInRoot(root, graph)) {
+    return { scope: "subgraph", owner_node_id: null, title: graph?.name ?? "subgraph" };
+  }
+  // Neither owned nor registered — a stale reference; report root to match
+  // getGraphCtx()'s reconciliation (read + edit stay in lockstep).
+  return { scope: "root" };
 }
 
 // ---- per-turn graph snapshots (rollback foundation, #44) -------------------
@@ -3768,6 +3813,73 @@ function resolveRail(graph, ref) {
       return { rail: "output", node: outNode };
   }
   return null;
+}
+
+/** Build the {inputs, outputs} boundary→interior link model for computeOrphanedBoundaries
+ *  (#234): resolve every boundary slot's linkIds to the INTERIOR node they touch, so
+ *  after an interior node is removed we can tell which boundary slots lost their only
+ *  consumer/producer. Keeps the live slot OBJECT on each entry so the pruner can pass
+ *  it straight to subgraph.removeInput/removeOutput. */
+function subgraphBoundaryModel(subgraph) {
+  const getLink = (id) =>
+    typeof subgraph?.getLink === "function"
+      ? subgraph.getLink(id)
+      : (subgraph?.links ?? []).find((l) => Number(l?.id ?? l?.[0]) === Number(id)) ?? null;
+  const endpointIds = (slot, key, arrIdx) =>
+    (slot?.linkIds ?? [])
+      .map((lid) => {
+        const l = getLink(lid);
+        if (!l) return null;
+        const v = l[key] ?? l[arrIdx];
+        return v == null ? null : Number(v);
+      })
+      .filter((n) => n != null && Number.isFinite(n));
+  return {
+    inputs: (subgraph?.inputs ?? []).map((s, index) => ({
+      name: s?.name ?? null,
+      index,
+      slot: s,
+      targetNodeIds: endpointIds(s, "target_id", 3),
+    })),
+    outputs: (subgraph?.outputs ?? []).map((s, index) => ({
+      name: s?.name ?? null,
+      index,
+      slot: s,
+      sourceNodeIds: endpointIds(s, "origin_id", 1),
+    })),
+  };
+}
+
+/** Remove any boundary slots the removal of `removedIds` orphaned (#234), pruning
+ *  the live subgraph's exposed input/output slots so no dangling `text` slot lingers
+ *  on the parent SubgraphNode. Only slots whose EVERY interior endpoint was removed
+ *  are pruned (a slot still feeding a surviving node is kept). The CALLER owns the
+ *  beforeChange/afterChange transaction so the node removal and this pruning collapse
+ *  into ONE Ctrl+Z step. Returns the removed slot names { inputs, outputs }. */
+function pruneOrphanedBoundaries(subgraph, model, removedIds) {
+  const orphans = computeOrphanedBoundaries({
+    inputs: model.inputs,
+    outputs: model.outputs,
+    removedNodeIds: removedIds,
+  });
+  const removedInputs = [];
+  const removedOutputs = [];
+  for (const s of orphans.inputs) {
+    if (typeof subgraph.removeInput === "function") {
+      subgraph.removeInput(s.slot);
+      removedInputs.push(s.name);
+    }
+  }
+  for (const s of orphans.outputs) {
+    if (typeof subgraph.removeOutput === "function") {
+      subgraph.removeOutput(s.slot);
+      removedOutputs.push(s.name);
+    }
+  }
+  if (removedInputs.length || removedOutputs.length) {
+    findSubgraphHostNode(subgraph)?.invalidatePromotedViews?.();
+  }
+  return { inputs: removedInputs, outputs: removedOutputs };
 }
 
 /** Detect rail INTENT independent of whether rails actually exist on the active
@@ -4791,17 +4903,46 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   graph_remove_node({ node_id }) {
-    const { graph } = getGraphCtx();
+    const { graph, rootGraph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     const summary = summarizeNode(node);
+    const removedId = node.id;
+    // #234: inside a subgraph, snapshot the boundary→interior link model BEFORE
+    // removal so we can prune any exposed input/output slot the removal orphans
+    // (whose only interior consumer/producer was this node) — otherwise a dangling
+    // `text` slot lingers on the parent SubgraphNode and re-exposing mints `text_1`.
+    const inSubgraph = graph !== rootGraph;
+    const boundaryModel = inSubgraph ? subgraphBoundaryModel(graph) : null;
+    // Node removal AND the orphan-boundary prune run inside ONE
+    // beforeChange/afterChange pair, so a single Ctrl+Z restores BOTH (otherwise
+    // one undo would resurrect only the slot and leave the node deleted).
+    let cleaned = null;
+    let removedOk = false;
     graph.beforeChange();
     try {
       graph.remove(node);
+      // graph.remove() is a NO-OP for protected nodes (ignore_remove). Only prune
+      // (and report success) once the node has ACTUALLY left the graph — otherwise
+      // we would delete boundary slots still connected to a surviving node.
+      removedOk = graph.getNodeById?.(Number(removedId)) !== node;
+      if (removedOk && inSubgraph && boundaryModel) {
+        cleaned = pruneOrphanedBoundaries(graph, boundaryModel, [removedId]);
+      }
     } finally {
       graph.afterChange();
     }
+    if (!removedOk) {
+      throw new Error(
+        `Node ${removedId} could not be removed (it may be protected / ignore_remove).`,
+      );
+    }
     graph.setDirtyCanvas(true, true);
-    return { removed: summary };
+    return {
+      removed: summary,
+      ...(cleaned && (cleaned.inputs.length || cleaned.outputs.length)
+        ? { cleaned_boundary_slots: cleaned }
+        : {}),
+    };
   },
 
   graph_clear() {
@@ -5118,9 +5259,45 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   graph_move_node({ node_id, pos }) {
-    const { graph } = getGraphCtx();
-    const node = resolveNode(graph, node_id);
+    const { graph, rootGraph } = getGraphCtx();
     if (!Array.isArray(pos) || pos.length !== 2) throw new Error("pos must be [x, y]");
+    // #302: accept the boundary RAIL ids (-10/-20, or the aliases) that
+    // panel_query_graph reports as rails.{input,output}.rail_node_id, moving the
+    // rail node exactly like graph_move_rail (they are NOT in graph._nodes_by_id,
+    // so resolveNode alone can't find them).
+    const rail = resolveRailNode(graph, node_id);
+    if (rail) {
+      const railNode = rail.node;
+      const prev = [railNode.pos?.[0], railNode.pos?.[1]];
+      graph.beforeChange?.();
+      try {
+        railNode.pos = [Number(pos[0]), Number(pos[1])];
+      } finally {
+        graph.afterChange?.();
+      }
+      graph.setDirtyCanvas?.(true, true);
+      return {
+        moved: { node_id: railNode.id, rail: rail.rail, from: prev, to: [railNode.pos[0], railNode.pos[1]] },
+      };
+    }
+    // A rail reference at the ROOT graph (rails only exist inside a subgraph) —
+    // give the precise reason instead of a bare "No node with id -10". But only
+    // when node_id isn't actually a REAL node: a normal node whose id happens to be
+    // -10/-20 must still move (ComfyUI permits any integer node id), so never let
+    // the reserved-id warning shadow it.
+    const numId = Number(node_id);
+    const realNode =
+      Number.isFinite(numId) && typeof graph.getNodeById === "function"
+        ? graph.getNodeById(numId)
+        : null;
+    const intent = realNode ? null : railKindFor(node_id);
+    if (intent && graph === rootGraph) {
+      throw new Error(
+        `${node_id} is the ${intent} boundary rail, which only exists INSIDE a subgraph — ` +
+          `enter the subgraph first (panel_enter_subgraph).`,
+      );
+    }
+    const node = resolveNode(graph, node_id);
     const previous = [node.pos[0], node.pos[1]];
     graph.beforeChange();
     try {
@@ -8884,8 +9061,12 @@ function describeCommand(cmd, msg, reply) {
       return { icon: "pi-copy", text: `Captured canvas — ${r.node_count} node${r.node_count === 1 ? "" : "s"}` };
     case "graph_add_node":
       return { icon: "pi-plus-circle", text: `Added ${r.added?.type ?? "node"} (id ${r.added?.id})` };
-    case "graph_remove_node":
-      return { icon: "pi-minus-circle", text: `Removed ${r.removed?.type ?? "node"} (id ${r.removed?.id})` };
+    case "graph_remove_node": {
+      const cb = r.cleaned_boundary_slots;
+      const cleaned = [...(cb?.inputs ?? []), ...(cb?.outputs ?? [])].filter(Boolean);
+      const suffix = cleaned.length ? ` — cleaned orphaned boundary ${cleaned.length === 1 ? "slot" : "slots"} ${cleaned.join(", ")}` : "";
+      return { icon: "pi-minus-circle", text: `Removed ${r.removed?.type ?? "node"} (id ${r.removed?.id})${suffix}` };
+    }
     case "graph_clear":
       return {
         icon: "pi-eraser",
