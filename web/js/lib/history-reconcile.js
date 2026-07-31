@@ -145,21 +145,27 @@ export function historyEntryFor(historyJson, promptId) {
 
 // Extract a row's prompt_id from a recognized ComfyUI queue-row shape. A genuine
 // array row is `[number(idx), prompt_id(string), prompt(dict), extra?, outputs?]`
-// — the prompt DICT at index 2 must be present, so a TRUNCATED `[number, string]`
-// row is MALFORMED (it must NOT masquerade as a valid id-absent row and enable a
-// false "definitive absence"). An object row must carry a string `prompt_id`.
-// Anything else ⇒ null (malformed).
+// — the prompt DICT at index 2 must be present AND a real object (a truncated
+// `[number, string]` row, or one whose index 2 is an ARRAY/primitive/null, is
+// MALFORMED and must NOT masquerade as a valid id-absent row and enable a false
+// "definitive absence"). An object row must carry a string `prompt_id`. Anything
+// else ⇒ null (malformed).
 function rowPromptId(item) {
   if (Array.isArray(item)) {
-    return typeof item[0] === "number" &&
-      typeof item[1] === "string" &&
-      item[2] !== null &&
-      typeof item[2] === "object"
+    return typeof item[0] === "number" && typeof item[1] === "string" && isPlainObject(item[2])
       ? item[1]
       : null;
   }
-  if (item && typeof item === "object") {
+  // Object-row form `{prompt_id, …}` — NOT an array (arrays handled above), and the
+  // prompt_id must be a string (an array/number/other ⇒ malformed ⇒ null).
+  if (isPlainObject(item)) {
     return typeof item.prompt_id === "string" ? item.prompt_id : null;
   }
   return null;
+}
+
+// A non-null, NON-ARRAY object. Guards the `typeof [] === "object"` gotcha so an
+// array can never pass where a real dict is required (codex P1).
+function isPlainObject(v) {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
 }
