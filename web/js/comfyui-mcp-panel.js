@@ -107,7 +107,8 @@ import {
   isStaleAssetCandidate as isStaleAssetCandidateLib,
   reapplyDefsToLiveNodes,
 } from "./lib/asset-staleness.js";
-import { assertAddNodeResolvable } from "./lib/node-resolve.js";
+import { assertAddNodeResolvableRefreshing } from "./lib/node-resolve.js";
+import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
 import {
   resolveScope,
   describeScope,
@@ -184,49 +185,56 @@ let nodeDefRefreshInFlight = null;
 // suppress a genuine miss (codex WS-3 finding #4). Reset to false whenever the
 // backend socket drops, since the combos may be about to change under us.
 let nodeDefsRefreshConfirmed = false;
-async function refreshComfyNodeDefs() {
-  if (nodeDefRefreshInFlight) return nodeDefRefreshInFlight;
-  nodeDefRefreshInFlight = (async () => {
-    // Trust the live combos for suppressing missing-asset candidates ONLY once
-    // the combo refresh has ACTUALLY RUN and succeeded. If refreshComboInNodes is
-    // absent on this ComfyUI build (or throws), the combos are still whatever
-    // page-load left them — possibly stale — so we must stay in over-report-safe
-    // mode and NOT trust them (finding #4).
-    let comboRefreshed = false;
-    try {
-      const a =
-        typeof app !== "undefined" && app ? app : window.comfyAPI?.app?.app;
-      if (!a) return;
-      // Re-register node definitions so newly installed/updated classes and
-      // their current widget schemas are known to LiteGraph (#221/#171).
-      let defs = null;
-      if (typeof a.registerNodesFromDefs === "function" && typeof api?.getNodeDefs === "function") {
+// The actual (idempotent) node-def registration; the coalescer owns the in-flight
+// slot lifecycle, so this MUST NOT clear it. Reuses a caller-supplied /object_info
+// payload when present (graph_add_node passes the fresh defs it just validated
+// against, #289) so a single add never round-trips /object_info twice.
+async function registerComfyNodeDefs(preloadedDefs) {
+  // Trust the live combos for suppressing missing-asset candidates ONLY once the
+  // combo refresh has ACTUALLY RUN and succeeded. If refreshComboInNodes is absent on
+  // this ComfyUI build (or throws), the combos are still whatever page-load left them
+  // — possibly stale — so we must stay in over-report-safe mode (finding #4).
+  let comboRefreshed = false;
+  try {
+    const a = typeof app !== "undefined" && app ? app : window.comfyAPI?.app?.app;
+    if (!a) return;
+    // Re-register node definitions so newly installed/updated classes and their
+    // current widget schemas are known to LiteGraph (#221/#171).
+    let defs = preloadedDefs ?? null;
+    if (typeof a.registerNodesFromDefs === "function") {
+      if (!defs && typeof api?.getNodeDefs === "function") {
         defs = await api.getNodeDefs();
-        if (defs) await a.registerNodesFromDefs(defs);
       }
-      // registerNodesFromDefs mints NEW classes; already-loaded node INSTANCES
-      // keep their old constructor and would never see the fresh schema. Stamp
-      // the fresh def onto existing instances + repair UNKNOWN widgets so old
-      // nodes are actually fixed, not just newly-created ones (finding #3).
-      if (defs) {
-        const rootGraph = a.graph ?? a.canvas?.graph;
-        if (rootGraph) reapplyDefsToLiveNodes(rootGraph, defs);
-      }
-      // Refresh combo widget option lists (model dropdowns etc.) so freshly
-      // installed models resolve and stale entries clear (#185/#181/#223).
-      if (typeof a.refreshComboInNodes === "function") {
-        await a.refreshComboInNodes();
-        comboRefreshed = true;
-      }
-    } catch (e) {
-      console.warn("[comfyui-mcp-panel] node-def refresh after reconnect failed:", e);
-    } finally {
-      nodeDefsRefreshConfirmed = comboRefreshed;
-      nodeDefRefreshInFlight = null;
+      if (defs) await a.registerNodesFromDefs(defs);
     }
-  })();
-  return nodeDefRefreshInFlight;
+    // registerNodesFromDefs mints NEW classes; already-loaded node INSTANCES keep
+    // their old constructor and would never see the fresh schema. Stamp the fresh
+    // def onto existing instances + repair UNKNOWN widgets (finding #3).
+    if (defs) {
+      const rootGraph = a.graph ?? a.canvas?.graph;
+      if (rootGraph) reapplyDefsToLiveNodes(rootGraph, defs);
+    }
+    // Refresh combo widget option lists (model dropdowns etc.) so freshly installed
+    // models resolve and stale entries clear (#185/#181/#223).
+    if (typeof a.refreshComboInNodes === "function") {
+      await a.refreshComboInNodes();
+      comboRefreshed = true;
+    }
+  } catch (e) {
+    console.warn("[comfyui-mcp-panel] node-def refresh after reconnect failed:", e);
+  } finally {
+    nodeDefsRefreshConfirmed = comboRefreshed;
+  }
 }
+
+// Single-flight refresh that never drops a caller-supplied fresh payload (#289 P2).
+const refreshComfyNodeDefs = makeRefreshCoalescer({
+  getInFlight: () => nodeDefRefreshInFlight,
+  setInFlight: (p) => {
+    nodeDefRefreshInFlight = p;
+  },
+  runRegister: registerComfyNodeDefs,
+});
 
 function setupListeners() {
   if (!api) return;
@@ -2480,8 +2488,59 @@ async function programmaticSave(name) {
   const saved = await saveActiveWorkflow(svc, name, {
     autoWorkflowName,
     existsOnDisk: workflowExistsOnDisk,
+    reconcileSavedCopy: reconcileSavedWorkflowCopy,
   });
   return saved || getWorkflowTitle();
+}
+
+/** Authoritative read-back oracle for saveActiveWorkflow's post-write guards.
+ *  Reads the on-disk /userdata file at `targetPath` and compares it against the
+ *  content the Save-As COPY was built from, returning:
+ *    "ours"    — the file exists and carries OUR copy's content (matched by the
+ *                workflow `id` the store's saveAs mints fresh, else raw content);
+ *    "foreign" — the file exists but is a DIFFERENT workflow (a concurrent clobber);
+ *    "absent"  — no file (404);
+ *    "unknown" — could not determine (no api / non-2xx-non-404 / network error /
+ *                content not comparable) ⇒ callers treat it as non-authoritative.
+ *  Backs P2 (adopt an on-disk copy after an ambiguous post-commit failure instead
+ *  of orphaning it) and P0 (detect a concurrent clobber of our just-written file).
+ *  ComfyUI's /userdata write is NOT exclusive-create, so this read-back is the only
+ *  way to detect a clobber of our write — it cannot protect a victim the server
+ *  already replaced (upstream-only). */
+async function reconcileSavedWorkflowCopy(targetPath, copy) {
+  try {
+    if (!api || !targetPath) return "unknown";
+    const res =
+      typeof api.getUserData === "function"
+        ? await api.getUserData(targetPath)
+        : await api.fetchApi(`/userdata/${encodeURIComponent(targetPath)}`);
+    if (res.status === 404) return "absent";
+    if (!res.ok) return "unknown";
+    const onDisk = await res.text();
+    const ourId = workflowContentId(copy?.content);
+    const diskId = workflowContentId(onDisk);
+    if (ourId && diskId) return ourId === diskId ? "ours" : "foreign";
+    // Fall back to a raw content compare when an id can't be extracted from either.
+    if (typeof copy?.content === "string" && typeof onDisk === "string") {
+      return onDisk === copy.content ? "ours" : "foreign";
+    }
+    return "unknown"; // can't compare ⇒ non-authoritative
+  } catch {
+    return "unknown";
+  }
+}
+
+/** Extract the workflow `id` (the store's saveAs mints a fresh UUID per copy) from a
+ *  serialized workflow JSON string, or null if not parseable. */
+function workflowContentId(content) {
+  if (typeof content !== "string") return null;
+  try {
+    const parsed = JSON.parse(content);
+    const id = parsed?.id;
+    return typeof id === "string" && id ? id : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Authoritative filesystem oracle for saveActiveWorkflow's #226 classifier:
@@ -3886,7 +3945,8 @@ function resolveNode(graph, nodeId) {
 
 // ---- Node-type resolution guard (#458) ------------------------------------
 // The graph WRITE tools resolve node types against LG.registered_node_types:
-// assertAddNodeResolvable gates graph_add_node on the class_type before create;
+// assertAddNodeResolvableRefreshing gates graph_add_node on the class_type before
+// create (refreshing stale node defs once and re-checking, #289/#458);
 // graph_set_widget delegates to runSetWidget (web/js/lib/set-widget.js), whose
 // shared body gates on the ACTUAL RESOLVED write target (inner promoted node for
 // a subgraph, else the node's own) BEFORE any coercion/mutation, so an unresolved
@@ -4985,15 +5045,23 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
-  graph_add_node({ class_type, pos, title }) {
+  async graph_add_node({ class_type, pos, title }) {
     const { graph, LG } = getGraphCtx();
     if (!class_type || typeof class_type !== "string") {
       throw new Error("class_type (string) is required");
     }
-    // Resolve against the REAL registry BEFORE creating, so an unresolved type
-    // can never be added as a fabricated placeholder node (#458). Throws with a
-    // clear unreachable-vs-unknown-type message, mirroring the read-path hard error.
-    assertAddNodeResolvable(LG?.registered_node_types ?? {}, class_type);
+    // Resolve BEFORE creating so an unresolved type can never be added as a
+    // fabricated placeholder (#458). The go/no-go is decided against the CURRENT
+    // backend /object_info (fetched fresh) — NOT the LiteGraph registry, which
+    // keeps STALE POSITIVES for uninstalled packs (#458/P1-C) and MISSES freshly-
+    // installed ones (#289). When the backend defines the type but the stale
+    // page-load registry lacks it, the defs are refreshed + re-registered so
+    // LG.createNode works; a type the live backend does not provide fails closed.
+    await assertAddNodeResolvableRefreshing(() => LG?.registered_node_types ?? {}, class_type, {
+      getFreshObjectInfo: () =>
+        typeof api?.getNodeDefs === "function" ? api.getNodeDefs() : null,
+      refresh: (defs) => refreshComfyNodeDefs(defs),
+    });
     const node = LG.createNode(class_type);
     if (!node) {
       throw new Error(

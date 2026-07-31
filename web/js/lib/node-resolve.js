@@ -68,6 +68,97 @@ export function assertAddNodeResolvable(registry, class_type) {
 }
 
 /**
+ * Async graph_add_node guard whose go/no-go decision is made against the CURRENT
+ * backend /object_info — NOT the mutated LiteGraph registry (#289 + #458/P1-C).
+ *
+ * The registry is unreliable in BOTH directions after a pack change + restart:
+ *   - it MISSES a freshly-installed pack's classes until /object_info is re-fetched
+ *     and re-registered — so a correct class_type reads "Unknown" (#289); and
+ *   - it KEEPS a STALE POSITIVE for an UNINSTALLED pack — an add-only refresh never
+ *     purges the removed class, so `LG.registered_node_types.GoneNode` survives and
+ *     the type would wrongly "add" against a backend that no longer provides it
+ *     (violating the #458 fail-closed invariant).
+ *
+ * So the AUTHORITATIVE oracle is the freshly-fetched /object_info payload:
+ *   1. Fetch fresh /object_info via `getFreshObjectInfo`.
+ *   2. If the backend does NOT define the type → fail closed (unknown/removed),
+ *      regardless of any stale registry entry.
+ *   3. If the backend DOES define it → ensure LiteGraph can construct it: if the
+ *      page-load registry predates it, `refresh` (re-register the fresh defs) and
+ *      re-check; if it still can't be registered, fail closed rather than let
+ *      LiteGraph mint a placeholder.
+ *   4. If a fresh-oracle IS wired but /object_info is UNAVAILABLE (fetch rejected /
+ *      returned nothing) → FAIL CLOSED with a "cannot verify against backend" error.
+ *      We must NOT fall back to the stale registry: a transient fetch failure would
+ *      otherwise authorize a since-removed type (#458/P1-2). Only a caller that
+ *      wires NO fresh-oracle at all degrades to the registry-only guard.
+ *
+ *   getRegistry        : () => the LIVE registry object (re-invoked after refresh).
+ *   getFreshObjectInfo : optional async () => the CURRENT /object_info map (keyed by
+ *                        class_type), or null when it can't be fetched.
+ *   refresh            : optional async (defs?) => re-register node defs into the
+ *                        registry; receives the already-fetched defs to avoid a
+ *                        second /object_info round-trip.
+ */
+export async function assertAddNodeResolvableRefreshing(getRegistry, class_type, opts = {}) {
+  const { getFreshObjectInfo, refresh } = opts;
+  const readRegistry = () =>
+    typeof getRegistry === "function" ? getRegistry() : getRegistry;
+
+  // When a fresh-oracle capability is wired (the panel always wires it), the FRESH
+  // /object_info is the ONLY authority. If it can't be consulted (fetch rejected /
+  // returned nothing), we must FAIL CLOSED — NOT fall back to the stale registry,
+  // which keeps positives for removed packs (a transient fetch failure would
+  // otherwise authorize a since-uninstalled type, #458/P1-2).
+  if (typeof getFreshObjectInfo === "function") {
+    let freshDefs = null;
+    try {
+      freshDefs = await getFreshObjectInfo();
+    } catch {
+      freshDefs = null;
+    }
+    if (!freshDefs || typeof freshDefs !== "object") {
+      throw new Error(
+        `cannot verify node type "${class_type}" against the ComfyUI backend ` +
+          `(object_info is unavailable — the backend is unreachable or the fetch failed). ` +
+          `Refusing to add rather than trust a possibly-stale node cache (#458). Reconnect ComfyUI and retry.`,
+      );
+    }
+    // AUTHORITATIVE: does the LIVE backend provide this type right now?
+    if (!Object.prototype.hasOwnProperty.call(freshDefs, class_type)) {
+      // Not defined by the current backend (never installed, or its pack was
+      // removed). Fail closed even if a stale registry entry survives (#458/P1-C).
+      throw new Error(
+        `Unknown node type "${class_type}" — the ComfyUI backend does not provide it ` +
+          `(not installed, or its pack was removed). Check the exact class_type via panel_search_nodes`,
+      );
+    }
+    // Backend HAS it. Make sure LiteGraph can construct it — refresh to register the
+    // fresh defs when the page-load registry predates the install (#289), re-check.
+    if (!isRegisteredNodeType(readRegistry(), class_type) && typeof refresh === "function") {
+      try {
+        await refresh(freshDefs);
+      } catch {
+        /* refresh best-effort — the post-refresh re-check decides go/no-go */
+      }
+    }
+    if (isRegisteredNodeType(readRegistry(), class_type)) return;
+    // Backend defines it but the frontend couldn't register it (refresh failed) —
+    // fail closed rather than let LiteGraph mint an unresolved placeholder (#458).
+    throw new Error(
+      `Node type "${class_type}" exists on the ComfyUI backend but could not be registered in the ` +
+        `frontend (node-def refresh failed) — reload the ComfyUI tab and retry. ` +
+        `Refusing to add an unresolved placeholder node.`,
+    );
+  }
+
+  // No fresh-oracle capability wired at all (a caller that does not supply
+  // getFreshObjectInfo — not the panel): degrade to the registry-only guard, which
+  // still fails closed for unknown types and names unreachable-vs-unknown (#458).
+  assertAddNodeResolvable(readRegistry(), class_type);
+}
+
+/**
  * Guard for graph_set_widget, applied to the ACTUAL RESOLVED write target (the
  * inner promoted node for a subgraph write, or the node's own for a direct
  * write) — NOT the outer node. This is the load-bearing check: it must run on
