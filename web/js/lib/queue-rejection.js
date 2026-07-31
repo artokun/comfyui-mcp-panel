@@ -76,7 +76,12 @@ function normalizeNodeErrors(ne) {
  * @param {number|null} [args.ranToNode]      Present for a run-to-node partial run.
  */
 export function buildQueueAcceptResult({ batchCount, promptIds = [], ranToNode = null } = {}) {
-  const ids = Array.isArray(promptIds) ? promptIds.filter((x) => x != null) : [];
+  // NORMALIZE to strings at this ingestion boundary (drop null/undefined) so the
+  // reported prompt_id(s), and everything that later reconciles against them, are
+  // string-vs-string — a numeric /prompt id can't slip through as a number (#370).
+  const ids = (Array.isArray(promptIds) ? promptIds : [])
+    .filter((x) => x != null)
+    .map((x) => String(x));
   return {
     queued: true,
     batch_count: batchCount,

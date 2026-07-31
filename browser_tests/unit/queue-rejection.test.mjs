@@ -147,3 +147,15 @@ test("no captured prompt_id (older frontend) still returns a valid accept", () =
   const r = buildQueueAcceptResult({ batchCount: 1, promptIds: [] });
   assert.deepEqual(r, { queued: true, batch_count: 1 });
 });
+
+test("a NUMERIC prompt_id is normalized to a string at ingestion (#370)", () => {
+  const r = buildQueueAcceptResult({ batchCount: 1, promptIds: [7] });
+  assert.strictEqual(r.prompt_id, "7"); // string, not number
+  const b = buildQueueAcceptResult({ batchCount: 2, promptIds: [7, 8] });
+  assert.strictEqual(b.prompt_id, "7");
+  assert.deepEqual(b.prompt_ids, ["7", "8"]); // all strings
+  // null/undefined ids are dropped before coercion (no "null"/"undefined" strings).
+  const c = buildQueueAcceptResult({ batchCount: 1, promptIds: [null, "p1", undefined] });
+  assert.strictEqual(c.prompt_id, "p1");
+  assert.equal(c.prompt_ids, undefined);
+});

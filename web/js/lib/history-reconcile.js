@@ -82,6 +82,10 @@ export function parseHistoryEntry(entry, { isVideo } = {}) {
  * @returns {boolean|null}  true present · false definitively absent · null uncertain
  */
 export function queueMembership(queueJson, promptId) {
+  // Defensive: a non-coercible lookup id is uncertain (never a definitive absence).
+  // Ingestion normalizes ids to strings, so in practice this is always a string.
+  const wantId = coerceLookupId(promptId);
+  if (wantId === null) return null;
   if (!queueJson || typeof queueJson !== "object") return null;
   const running = queueJson.queue_running;
   const pending = queueJson.queue_pending;
@@ -98,7 +102,7 @@ export function queueMembership(queueJson, promptId) {
         malformed = true;
         continue;
       }
-      if (id === promptId) present = true;
+      if (id === wantId) present = true;
     }
   };
   scan(running);
@@ -130,17 +134,31 @@ export function queueMembership(queueJson, promptId) {
  *     treats undefined as "running", never gives up).
  */
 export function historyEntryFor(historyJson, promptId) {
+  // Defensive: a non-coercible lookup id is UNCERTAIN (undefined ⇒ "running"),
+  // NEVER a clean absence — a give-up must never hinge on an unusable id. Ingestion
+  // normalizes ids to strings, so in practice this is always a string.
+  const wantId = coerceLookupId(promptId);
+  if (wantId === null) return undefined;
   if (historyJson === null || typeof historyJson !== "object" || Array.isArray(historyJson)) {
     return undefined; // malformed body ⇒ uncertain, never a clean absence
   }
   // Distinguish a GENUINELY ABSENT own key (clean absence ⇒ null) from a PRESENT
   // key carrying a null/undefined value (a malformed present record ⇒ uncertain).
   // Only a truly-absent key is give-up eligible (codex P1).
-  if (!Object.prototype.hasOwnProperty.call(historyJson, promptId)) {
+  if (!Object.prototype.hasOwnProperty.call(historyJson, wantId)) {
     return null; // key absent ⇒ clean absence
   }
-  const entry = historyJson[promptId];
+  const entry = historyJson[wantId];
   return entry == null ? undefined : entry; // present-but-null ⇒ uncertain
+}
+
+// Coerce a lookup prompt_id to a comparable STRING (ingestion already normalizes,
+// this is belt-and-suspenders). A string or a finite number coerces; null/
+// undefined/object/array/NaN/etc are non-coercible ⇒ null (uncertain lookup).
+function coerceLookupId(id) {
+  if (typeof id === "string") return id;
+  if (typeof id === "number" && Number.isFinite(id)) return String(id);
+  return null;
 }
 
 // Extract a row's prompt_id from a recognized ComfyUI queue-row shape. A genuine

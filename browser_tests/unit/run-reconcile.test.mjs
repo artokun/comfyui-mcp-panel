@@ -722,6 +722,22 @@ test("historyEntryFor: MALFORMED body (null/array/non-object) ⇒ undefined (unc
   assert.strictEqual(historyEntryFor(undefined, "R"), undefined);
 });
 
+test("queueMembership/historyEntryFor: a NUMERIC lookup id coerces to string (defensive)", () => {
+  // Belt-and-suspenders: even if a number reaches the pure helper, it compares as
+  // its string form (ingestion normalizes upstream, so normally it's already "7").
+  assert.equal(queueMembership({ queue_running: [[0, "7", {}]], queue_pending: [] }, 7), true);
+  assert.equal(queueMembership({ queue_running: [[0, "8", {}]], queue_pending: [] }, 7), false);
+  const entry = { status: { status_str: "success" } };
+  assert.strictEqual(historyEntryFor({ 7: entry }, 7), entry);
+  assert.strictEqual(historyEntryFor({ 8: entry }, 7), null);
+  // Non-coercible lookup ids: queueMembership ⇒ null (uncertain), historyEntryFor ⇒
+  // undefined (uncertain), NEVER a definitive absent/give-up signal.
+  assert.equal(queueMembership({ queue_running: [], queue_pending: [] }, null), null);
+  assert.equal(queueMembership({ queue_running: [], queue_pending: [] }, {}), null);
+  assert.strictEqual(historyEntryFor({}, null), undefined);
+  assert.strictEqual(historyEntryFor({}, {}), undefined);
+});
+
 test("historyEntryFor: id PRESENT with a null/undefined value ⇒ undefined (malformed present, NOT clean absence)", () => {
   assert.strictEqual(historyEntryFor({ R: null }, "R"), undefined); // present key, null value
   assert.strictEqual(historyEntryFor({ R: undefined }, "R"), undefined); // present key, undefined value
@@ -809,6 +825,36 @@ test("#370 P1 (codex): a /queue with ONLY TRUNCATED rows is uncertain → NOT gi
   tracker.onExecuted("R", { images: [{ filename: "R.png", type: "output" }] });
   tracker.onExecutionSuccess("R");
   assert.ok(flushes.find((f) => f.promptId === "R"), "output delivered, not dropped");
+});
+
+test("#370 P1 (codex): a NUMERIC prompt_id is normalized to a string at ingestion — matches a string /queue row, not dropped", async () => {
+  const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 0 });
+  const { tracker, flushes, giveUps } = h;
+  tracker.onQueued(7); // a NUMBER enters the ledger
+  assert.equal(tracker._pending.has("7"), true, "numeric id normalized to the string key '7'");
+  assert.equal(tracker._pending.has(7), false, "not stored under the raw number");
+
+  const fetchHistory = async () => null; // clean-absent /history
+  const fetchQueued = async (id) => {
+    // reconcile passes the NORMALIZED string id, so the string queue row matches.
+    assert.equal(id, "7", "reconcile passes the normalized string id");
+    return queueMembership({ queue_running: [[0, "7", { /* prompt */ }, {}, []]], queue_pending: [] }, id);
+  };
+  const summary = await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
+  // Was present in /queue as "7" ⇒ running, NOT given up (fails-before: number 7 !==
+  // string "7" ⇒ reported absent ⇒ evicted + dropped).
+  assert.deepEqual(summary, [{ promptId: "7", status: "running" }]);
+  assert.equal(giveUps.length, 0, "the present render is never given up");
+  assert.equal(tracker.wasTerminal("7"), false, "not fenced");
+
+  // Fence + delivery also key on the normalized string id — a numeric lifecycle id
+  // still resolves to "7".
+  tracker.onExecutionStart(7);
+  tracker.onExecuted(7, { images: [{ filename: "7.png", type: "output" }] });
+  tracker.onExecutionSuccess(7);
+  const f = flushes.find((x) => x.promptId === "7");
+  assert.ok(f, "delivered under the normalized string id");
+  assert.equal(f.promptId, "7", "completion carries the string id, not the number");
 });
 
 test("#370 P1 (codex): a /queue row whose idx2 is an ARRAY is malformed → NOT given up (typeof [] gotcha)", async () => {

@@ -76,7 +76,15 @@ export function createRunCompletionTracker({
   if (typeof onFlush !== "function") {
     throw new TypeError("createRunCompletionTracker requires an onFlush callback");
   }
-  const key = (id) => id ?? NO_PROMPT_KEY;
+  // INGESTION-BOUNDARY NORMALIZATION: every prompt_id becomes a STRING the instant
+  // it enters the tracker (a numeric /prompt id, e.g. 7, would otherwise never
+  // `=== "7"` the string ids in /history keys and /queue rows, so a running render
+  // would look absent and be given up — codex P1). Because this is the single
+  // choke-point for map keys AND the stored ledger id, EVERY downstream comparison
+  // (history key lookup, queue row match, fences, delivery) is string-vs-string,
+  // closing the whole number-vs-string class at the source. A null/undefined id
+  // (no real prompt) collapses to the shared NO_PROMPT_KEY.
+  const key = (id) => (id == null ? NO_PROMPT_KEY : String(id));
   const promptIdOf = (k) => (k === NO_PROMPT_KEY ? null : k);
   const buffers = new Map(); // key -> { images: any[], videos: any[], timer, rearms }
   const active = new Set(); // keys ComfyUI currently reports as running
@@ -136,7 +144,9 @@ export function createRunCompletionTracker({
     // A prompt that already reached terminal must not be re-pended by a stray
     // liveness signal — its pending state is owned by markDelivered/markUndelivered.
     if (terminal.has(k)) return;
-    if (!pending.has(k)) pending.set(k, { promptId: id, at: now() });
+    // Store the NORMALIZED string id (k), so reconcile passes a string to
+    // fetchHistory/fetchQueued and every downstream compare stays string-vs-string.
+    if (!pending.has(k)) pending.set(k, { promptId: k, at: now() });
   }
 
   // Drop entries older than the TTL. Each fence is kept in strict last-touched
@@ -641,7 +651,7 @@ export function createRunCompletionTracker({
       // cancel any in-flight retry so the re-pend restarts cleanly on the next edge.
       delivered.delete(k);
       clearReconcileRetry(k);
-      if (!pending.has(k)) pending.set(k, { promptId: id, at: now() });
+      if (!pending.has(k)) pending.set(k, { promptId: k, at: now() }); // normalized string id
     },
 
     /**
