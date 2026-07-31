@@ -177,7 +177,7 @@ let nodeDefRefreshInFlight = null;
 // suppress a genuine miss (codex WS-3 finding #4). Reset to false whenever the
 // backend socket drops, since the combos may be about to change under us.
 let nodeDefsRefreshConfirmed = false;
-async function refreshComfyNodeDefs() {
+async function refreshComfyNodeDefs(preloadedDefs) {
   if (nodeDefRefreshInFlight) return nodeDefRefreshInFlight;
   nodeDefRefreshInFlight = (async () => {
     // Trust the live combos for suppressing missing-asset candidates ONLY once
@@ -191,10 +191,15 @@ async function refreshComfyNodeDefs() {
         typeof app !== "undefined" && app ? app : window.comfyAPI?.app?.app;
       if (!a) return;
       // Re-register node definitions so newly installed/updated classes and
-      // their current widget schemas are known to LiteGraph (#221/#171).
-      let defs = null;
-      if (typeof a.registerNodesFromDefs === "function" && typeof api?.getNodeDefs === "function") {
-        defs = await api.getNodeDefs();
+      // their current widget schemas are known to LiteGraph (#221/#171). Reuse
+      // an already-fetched /object_info payload when the caller supplies one
+      // (graph_add_node passes the fresh defs it just validated against, #289) so
+      // we never round-trip /object_info twice for a single add.
+      let defs = preloadedDefs ?? null;
+      if (typeof a.registerNodesFromDefs === "function") {
+        if (!defs && typeof api?.getNodeDefs === "function") {
+          defs = await api.getNodeDefs();
+        }
         if (defs) await a.registerNodesFromDefs(defs);
       }
       // registerNodesFromDefs mints NEW classes; already-loaded node INSTANCES
@@ -4881,18 +4886,18 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!class_type || typeof class_type !== "string") {
       throw new Error("class_type (string) is required");
     }
-    // Resolve against the REAL registry BEFORE creating, so an unresolved type
-    // can never be added as a fabricated placeholder node (#458). If the type is
-    // absent, refresh node defs (re-fetch /object_info + re-register) ONCE and
-    // re-check — a freshly-installed pack's classes are unknown to the stale
-    // page-load registry until then (#289). A type the server still doesn't
-    // define after a refresh stays unresolved and fails closed (unreachable-vs-
-    // unknown message preserved), never a fabricated placeholder.
-    await assertAddNodeResolvableRefreshing(
-      () => LG?.registered_node_types ?? {},
-      class_type,
-      refreshComfyNodeDefs,
-    );
+    // Resolve BEFORE creating so an unresolved type can never be added as a
+    // fabricated placeholder (#458). The go/no-go is decided against the CURRENT
+    // backend /object_info (fetched fresh) — NOT the LiteGraph registry, which
+    // keeps STALE POSITIVES for uninstalled packs (#458/P1-C) and MISSES freshly-
+    // installed ones (#289). When the backend defines the type but the stale
+    // page-load registry lacks it, the defs are refreshed + re-registered so
+    // LG.createNode works; a type the live backend does not provide fails closed.
+    await assertAddNodeResolvableRefreshing(() => LG?.registered_node_types ?? {}, class_type, {
+      getFreshObjectInfo: () =>
+        typeof api?.getNodeDefs === "function" ? api.getNodeDefs() : null,
+      refresh: (defs) => refreshComfyNodeDefs(defs),
+    });
     const node = LG.createNode(class_type);
     if (!node) {
       throw new Error(

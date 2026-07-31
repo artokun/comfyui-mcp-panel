@@ -147,26 +147,18 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName, existsOn
     // source is PROVABLY never-persisted (no backing file to destroy).
     const sourcePath = wf.path;
 
-    // #309 — PRE-EMPT a filename collision BEFORE invoking any save/copy API. If the
-    // resolved target already exists on disk, the /userdata write would 409, and the
-    // frontend's saveWorkflowAs rebinds the tab (or the low-level path orphans a copy
-    // tab) BEFORE that failure surfaces — stranding the tab bound to a file it can't
-    // own (which then tripped the #226 guard so it could not be saved under any other
-    // name). Detecting the collision up front means NOTHING is mutated: no rebind, no
-    // copy, and a clean conflict is returned. Only an AUTHORITATIVE positive from the
-    // disk oracle acts here; an absent/unknown oracle falls through to the post-write
-    // rollback net below. The oracle is the same /userdata HEAD the #226 classifier
-    // uses, so it is available on the real panel path.
-    if (typeof existsOnDisk === "function") {
-      let targetExists = null;
-      try {
-        targetExists = await existsOnDisk(finalTargetPath);
-      } catch {
-        targetExists = null; // probe failed ⇒ unknown ⇒ fall through to rollback net
-      }
-      if (targetExists === true) {
-        throw conflictError(effectiveName);
-      }
+    // #309 — classify a filename COLLISION at the resolved target BEFORE invoking any
+    // save/copy API. Combines two oracles: a PERSISTED workflow already indexed at the
+    // target (store), and the authoritative /userdata disk probe. States:
+    //   "exists"    — a real workflow already occupies the target → refuse now, so
+    //                 NOTHING is mutated (no rebind, no copy, no overwrite prompt);
+    //   "absent"    — the disk oracle proved the target free → safe to proceed;
+    //   "unknown"   — an oracle was present but could not confirm (probe threw / a
+    //                 non-conclusive status) → AMBIGUOUS;
+    //   "no-oracle" — no disk oracle at all (older frontend / test) → legacy path.
+    const targetState = await probeTargetCollision(svc, finalTargetPath, existsOnDisk);
+    if (targetState === "exists") {
+      throw conflictError(effectiveName);
     }
 
     // #285 — EXTERNAL source: a real file loaded from an ABSOLUTE path OUTSIDE the
@@ -187,12 +179,28 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName, existsOn
             "refusing to move or destroy the original file outside the workflows folder (issue #285/#226)",
         );
       }
-      return await withConflictRollback(svc, wf, effectiveName, () =>
+      return await withConflictRollback(svc, wf, effectiveName, finalTargetPath, () =>
         copyToUserDir(wf, effectiveName, finalTargetPath),
       );
     }
 
     const cls = await classifySource(svc, wf, sourcePath, existsOnDisk);
+
+    // #309/P1-A — the high-level `saveWorkflowAs` (1.45.x) can OVERWRITE an existing
+    // target (it prompts, then DELETES the file on confirm) and it silently returns
+    // `false` on decline. It is only safe to reach when the target is PROVABLY free.
+    // If an oracle was present but could NOT confirm the target is free (unknown),
+    // refuse rather than fall through to that destructive/overwriting API (#226). The
+    // move-free low-level copy (overwrite:false → 409s) is unaffected, so this only
+    // gates the high-level route. A "no-oracle" frontend keeps the legacy path.
+    const willUseHighLevel = typeof svc?.saveWorkflowAs === "function";
+    if (willUseHighLevel && targetState === "unknown") {
+      throw new Error(
+        `cannot verify that "${baseName(effectiveName)}" is free — the workflows directory ` +
+          `could not be checked, and this frontend's Save-As can overwrite an existing workflow. ` +
+          `Refusing to save-as to avoid destroying another workflow (issue #226/#309); retry.`,
+      );
+    }
 
     // Resolve the copy (Save-As) API across frontend versions. On 1.45.x the
     // workflow store exposes the high-level `saveWorkflowAs(wf,{filename})`. On
@@ -222,7 +230,7 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName, existsOn
       // the never-saved tab to a real file. No Save dialog. Wrapped so a 409
       // filename conflict rolls back any optimistic tab rebind instead of leaving
       // the tab stranded on the conflicting path (#309).
-      const activeName = await withConflictRollback(svc, wf, effectiveName, () =>
+      const activeName = await withConflictRollback(svc, wf, effectiveName, finalTargetPath, () =>
         saveAsCopy(wf, effectiveName, finalTargetPath),
       );
       // BACKSTOP: if the copy relocated a persisted source anyway, fail LOUDLY
@@ -295,7 +303,20 @@ function resolveSaveAsCopy(svc, { explicitTargetOnly = false } = {}) {
   // so ONLY the move-free, explicit-path low-level copy is selected (#285).
   if (!explicitTargetOnly && typeof svc?.saveWorkflowAs === "function") {
     return async (wf, effectiveName) => {
-      await svc.saveWorkflowAs(wf, { filename: effectiveName });
+      // saveWorkflowAs returns `false` when the copy did NOT happen (the user
+      // declined the overwrite prompt, or the target already exists) — reporting the
+      // active filename as success in that case is a phantom save (#309/P1-A). HONOR
+      // the false return: treat it as a conflict so withConflictRollback rolls back
+      // and a clean error surfaces, never a false success.
+      const result = await svc.saveWorkflowAs(wf, { filename: effectiveName });
+      if (result === false) {
+        const err = new Error(
+          `save-as of "${effectiveName}" was not completed — the target already exists or the ` +
+            `overwrite was declined (409 Conflict)`,
+        );
+        err.status = 409;
+        throw err;
+      }
       // saveWorkflowAs makes the new copy the active workflow.
       return baseName(svc.activeWorkflow?.filename) || effectiveName;
     };
@@ -533,7 +554,7 @@ function safeAssign(obj, key, value) {
  *  Derived getter-only flags are skipped via safeAssign so restoration never throws.
  *  A non-conflict error is rethrown untouched. Nothing on disk is modified here — a
  *  409 means the server wrote nothing, and the pre-existing file is never our source. */
-async function withConflictRollback(svc, wf, desiredName, fn) {
+async function withConflictRollback(svc, wf, desiredName, finalTargetPath, fn) {
   const prevActive = svc?.activeWorkflow;
   const snap = wf
     ? {
@@ -545,6 +566,18 @@ async function withConflictRollback(svc, wf, desiredName, fn) {
         isPersisted: wf.isPersisted,
       }
     : null;
+  // Snapshot whatever object (if any) ALREADY occupied the target path BEFORE the
+  // save. This distinguishes a PRE-EXISTING real target (which must never be
+  // removed on rollback — e.g. an overwrite declined after a TOCTOU) from a copy
+  // the failing save NEWLY inserted at the target (#309/P1-B).
+  let targetBefore = null;
+  if (typeof svc?.getWorkflowByPath === "function") {
+    try {
+      targetBefore = svc.getWorkflowByPath(finalTargetPath) ?? null;
+    } catch {
+      targetBefore = null;
+    }
+  }
   try {
     return await fn();
   } catch (err) {
@@ -553,6 +586,12 @@ async function withConflictRollback(svc, wf, desiredName, fn) {
     // load-bearing fix (the conflicting/copy tab must not remain active), so it
     // must happen even if a later field restore is a no-op.
     if (svc && prevActive !== undefined) svc.activeWorkflow = prevActive;
+    // #309/P1-B — the frontend's saveWorkflowAs may have mutated its store INDEX
+    // (workflowLookup + open-tab list) before the 409: it either inserted an
+    // orphaned COPY at the target (persisted-source path) or REKEYED the source
+    // object to the target (temporary-source path). Reassigning fields on `wf`
+    // alone can't repair the store's path→object map, so repair the topology here.
+    await repairStoreAfterConflict(svc, wf, snap, finalTargetPath, targetBefore);
     if (wf && snap) {
       safeAssign(wf, "path", snap.path);
       safeAssign(wf, "filename", snap.filename);
@@ -562,6 +601,88 @@ async function withConflictRollback(svc, wf, desiredName, fn) {
       safeAssign(wf, "isPersisted", snap.isPersisted);
     }
     throw conflictError(desiredName);
+  }
+}
+
+/** Tri/quad-state collision classification for the resolved Save-As target, used to
+ *  pre-empt a destructive/overwriting save BEFORE any API call (#309). Returns
+ *  "exists" (a persisted workflow is already at the target — via the store index or
+ *  a 200 from the disk oracle), "absent" (the disk oracle 404'd — provably free),
+ *  "unknown" (an oracle was present but inconclusive — probe threw / ambiguous), or
+ *  "no-oracle" (no disk oracle at all). The store check runs first so a persisted
+ *  target is caught even when the disk probe is unavailable (the #309/P1-A repro). */
+async function probeTargetCollision(svc, finalTargetPath, existsOnDisk) {
+  if (typeof svc?.getWorkflowByPath === "function") {
+    try {
+      const atTarget = svc.getWorkflowByPath(finalTargetPath);
+      if (atTarget && atTarget.isPersisted === true) return "exists";
+    } catch {
+      /* store threw ⇒ no signal from this oracle */
+    }
+  }
+  if (typeof existsOnDisk === "function") {
+    let probe = null;
+    try {
+      probe = await existsOnDisk(finalTargetPath);
+    } catch {
+      probe = null; // oracle present but threw ⇒ ambiguous
+    }
+    if (probe === true) return "exists";
+    if (probe === false) return "absent";
+    return "unknown";
+  }
+  return "no-oracle";
+}
+
+/** Repair the frontend store's path→object index after a high-level saveWorkflowAs
+ *  409 (#309/P1-B). Two shapes the frontend leaves behind:
+ *   - an ORPHANED COPY inserted at the target (persisted-source path): a DIFFERENT
+ *     object now sits at the target path → remove it from the store + open tabs;
+ *   - a REKEYED SOURCE (temporary-source path): the SAME `wf` was rekeyed to the
+ *     target before the 409 → rekey it back to its original path via the store's own
+ *     rename (a TEMPORARY rename is a pure in-memory updatePath, no server write),
+ *     which also restores workflowLookup + the derived fullFilename/suffix that a
+ *     bare field reassignment cannot. Fully defensive; never throws. */
+async function repairStoreAfterConflict(svc, wf, snap, finalTargetPath, targetBefore) {
+  if (!svc || !finalTargetPath || typeof svc.getWorkflowByPath !== "function") return;
+  let atTarget = null;
+  try {
+    atTarget = svc.getWorkflowByPath(finalTargetPath);
+  } catch {
+    return; // store threw ⇒ nothing we can safely repair
+  }
+  if (!atTarget) return;
+  if (atTarget !== wf) {
+    // Something other than our source sits at the target. Only remove it if it is a
+    // PROVEN orphan our failing save NEWLY inserted — i.e. it was NOT already there
+    // before the op AND it is a never-persisted (temporary) copy. A PRE-EXISTING or
+    // PERSISTED workflow at the target (e.g. the real file after a declined
+    // overwrite TOCTOU) is a legitimate tab and MUST be left indexed/open (#309).
+    const isNewlyInserted = atTarget !== targetBefore;
+    const isTemporaryCopy = atTarget.isPersisted !== true;
+    if (isNewlyInserted && isTemporaryCopy) {
+      try {
+        removeInMemoryWorkflow(svc, atTarget);
+      } catch {
+        /* best-effort */
+      }
+    }
+    return;
+  }
+  // The SAME source object was rekeyed to the target — rekey it back. Guard on
+  // TEMPORARY so we never trigger a server moveUserData on a persisted doc.
+  const origPath = snap?.path;
+  if (
+    origPath &&
+    normalizePath(origPath) !== normalizePath(finalTargetPath) &&
+    wf?.isTemporary === true &&
+    typeof svc.renameWorkflow === "function"
+  ) {
+    try {
+      await svc.renameWorkflow(wf, origPath);
+    } catch {
+      /* best-effort — the field restore below still corrects path/filename */
+    }
   }
 }
 

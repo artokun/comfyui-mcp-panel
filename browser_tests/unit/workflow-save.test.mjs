@@ -1048,9 +1048,11 @@ test('#309: post-write rollback on getter-only workflow flags never throws, rest
   const svc = {
     activeWorkflow: wf,
     calls,
-    // Store doesn't index the never-saved temp ⇒ null ⇒ classifier proves absence.
-    getWorkflowByPath(p) {
-      return disk.has(p) ? { path: p, isPersisted: true } : null
+    // STALE registry: the store index knows neither the never-saved temp (source)
+    // nor the on-disk target — so the pre-check cannot pre-empt and we reach the
+    // rollback net. (getWorkflowByPath(source)=null also proves the source absent.)
+    getWorkflowByPath() {
+      return null
     },
     async renameWorkflow() {},
     async saveWorkflow() {},
@@ -1099,8 +1101,10 @@ test('#309: low-level (1.47) copy that 409s on persist removes the orphaned copy
     activeWorkflow: active,
     openWorkflows,
     calls,
-    getWorkflowByPath(p) {
-      return disk.has(p) ? { path: p, isPersisted: true } : null
+    // STALE registry: the store does not know the on-disk target, so neither the
+    // pre-check nor the classifier pre-empts — the 409 surfaces from saveWorkflow.
+    getWorkflowByPath() {
+      return null
     },
     saveAs(wf, path) {
       calls.push(['saveAs', wf.path, path])
@@ -1133,6 +1137,257 @@ test('#309: low-level (1.47) copy that 409s on persist removes the orphaned copy
   // The orphaned copy tab was removed and the original tab restored as active.
   assert.deepEqual(openWorkflows, [active], 'orphaned copy tab removed from open tabs')
   assert.equal(svc.activeWorkflow, active, 'original tab restored as active')
+})
+
+test('#309/P1-A: an UNKNOWN disk probe + a persisted target in the store ⇒ REFUSE, never call the overwriting saveWorkflowAs', async () => {
+  // The exact P1-A repro: the disk probe THROWS (unknown), but the store knows a
+  // PERSISTED workflow already sits at the target. The high-level saveWorkflowAs
+  // would prompt-and-overwrite (deleting the existing target) — so we must refuse
+  // up front, never reaching it.
+  const active = {
+    path: 'workflows/Orig.json',
+    filename: 'Orig.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const disk = new Set(['workflows/Orig.json', 'workflows/Copy.json'])
+  const calls = []
+  const svc = {
+    activeWorkflow: active,
+    calls,
+    disk,
+    getWorkflowByPath(p) {
+      if (p === active.path) return active
+      if (disk.has(p)) return { path: p, isPersisted: true } // Copy.json is a known persisted target
+      return null
+    },
+    async saveWorkflow() {},
+    async renameWorkflow() {},
+    async saveWorkflowAs() {
+      calls.push('saveWorkflowAs')
+    },
+  }
+  const existsOnDisk = async () => {
+    throw new Error('userdata unreachable') // probe is UNKNOWN
+  }
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'Copy', { existsOnDisk }),
+    /already exists \(409 Conflict\)|choose a different name/,
+  )
+  assert.ok(!calls.includes('saveWorkflowAs'), 'never invoked the overwriting Save-As')
+  assert.ok(svc.disk.has('workflows/Copy.json'), 'the existing target is untouched')
+  assert.ok(svc.disk.has('workflows/Orig.json'), 'the source is untouched')
+})
+
+test('#309/P1-A: an UNKNOWN disk probe with only the overwriting high-level API ⇒ REFUSE (no store signal)', async () => {
+  // Ambiguous collision (probe threw), store can't confirm either way, and the only
+  // Save-As is the OVERWRITING high-level one. Refuse rather than risk destroying a
+  // possibly-existing target (#226/#309).
+  const active = {
+    path: 'workflows/Orig.json',
+    filename: 'Orig.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const calls = []
+  const svc = {
+    activeWorkflow: active,
+    calls,
+    getWorkflowByPath: (p) => (p === active.path ? active : null), // no signal about the target
+    async saveWorkflow() {},
+    async renameWorkflow() {},
+    async saveWorkflowAs() {
+      calls.push('saveWorkflowAs')
+    },
+  }
+  const existsOnDisk = async () => {
+    throw new Error('userdata unreachable') // UNKNOWN
+  }
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'Copy', { existsOnDisk }),
+    /cannot verify that "Copy" is free|Refusing to save-as/,
+  )
+  assert.ok(!calls.includes('saveWorkflowAs'), 'never invoked the overwriting Save-As on an ambiguous probe')
+})
+
+test('#309/P1-A: saveWorkflowAs returning FALSE is a failure, and rollback leaves a REAL pre-existing target intact', async () => {
+  // Faithful decline: the pre-check sees the target absent (TOCTOU), then the real
+  // target appears + gets indexed/opened by the frontend and the OVERWRITE is
+  // DECLINED (saveWorkflowAs returns false). The rollback must NOT treat that real
+  // persisted target as an orphan and evict it — it is a legitimate workflow.
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const barTarget = {
+    path: 'workflows/Bar.json',
+    filename: 'Bar.json',
+    directory: 'workflows',
+    isPersisted: true, // a REAL persisted workflow, not a temporary copy
+    isTemporary: false,
+  }
+  const openWorkflows = [active]
+  let barIndexed = false // the real Bar isn't indexed until the (declined) save runs
+  const calls = []
+  const svc = {
+    activeWorkflow: active,
+    calls,
+    openWorkflows,
+    getWorkflowByPath(p) {
+      if (p === active.path) return active
+      if (p === 'workflows/Bar.json' && barIndexed) return barTarget
+      return null
+    },
+    async saveWorkflow() {},
+    async renameWorkflow() {},
+    async closeWorkflow(wf) {
+      const i = openWorkflows.indexOf(wf)
+      if (i >= 0) openWorkflows.splice(i, 1)
+    },
+    async saveWorkflowAs() {
+      calls.push('saveWorkflowAs')
+      // The real target appeared (TOCTOU): the frontend indexes + opens it, then
+      // the overwrite prompt is DECLINED, so nothing is written and false returns.
+      barIndexed = true
+      if (!openWorkflows.includes(barTarget)) openWorkflows.push(barTarget)
+      return false
+    },
+  }
+  const existsOnDisk = async () => false // pre-check sees Bar absent (TOCTOU)
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'Bar', { existsOnDisk }),
+    /was not completed|already exists|409/i,
+  )
+  assert.ok(calls.includes('saveWorkflowAs'), 'attempted the save')
+  // The REAL pre-existing target must remain indexed and open — never evicted as a
+  // phantom orphan.
+  assert.equal(svc.getWorkflowByPath('workflows/Bar.json'), barTarget, 'real target still indexed')
+  assert.ok(openWorkflows.includes(barTarget), 'real target still open (not evicted)')
+  // The original active tab is restored.
+  assert.equal(svc.activeWorkflow, active, 'active restored to the original')
+})
+
+test('#309/P1-B: a high-level saveWorkflowAs that INSERTS a copy then 409s ⇒ orphan removed, active restored, lookup repaired', async () => {
+  // Persisted-source path: the frontend inserts+opens a COPY at the target, indexes
+  // it under the target path, THEN persistence 409s. The rollback must remove that
+  // orphaned copy from the store lookup + open tabs and restore the original active.
+  const active = {
+    path: 'workflows/Orig.json',
+    filename: 'Orig.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const disk = new Set(['workflows/Orig.json', 'workflows/Copy.json'])
+  const store = new Map([['workflows/Orig.json', active]])
+  const openWorkflows = [active]
+  const calls = []
+  const svc = {
+    activeWorkflow: active,
+    openWorkflows,
+    calls,
+    disk,
+    // STALE: the store does not know the on-disk Copy.json until the frontend
+    // inserts its copy — so neither the pre-check nor classify pre-empts.
+    getWorkflowByPath: (p) => store.get(p) ?? null,
+    async saveWorkflow() {},
+    async renameWorkflow() {},
+    async closeWorkflow(wf) {
+      const i = openWorkflows.indexOf(wf)
+      if (i >= 0) openWorkflows.splice(i, 1)
+      store.delete(wf.path)
+    },
+    async saveWorkflowAs(w, { filename }) {
+      calls.push('saveWorkflowAs')
+      const target = `workflows/${stripExt(filename)}.json`
+      const copy = { path: target, filename: target.split('/').pop(), directory: 'workflows', isTemporary: true, isPersisted: false }
+      store.set(target, copy)
+      openWorkflows.push(copy)
+      svc.activeWorkflow = copy
+      const err = new Error(`Error storing user data file '${target}': 409 Conflict`)
+      err.status = 409
+      throw err
+    },
+  }
+
+  // No existsOnDisk ⇒ the store-stale path reaches the failing saveWorkflowAs.
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'Copy', {}),
+    /already exists \(409 Conflict\)/,
+  )
+  assert.deepEqual(openWorkflows, [active], 'orphaned copy removed from open tabs')
+  assert.equal(svc.activeWorkflow, active, 'original tab restored as active')
+  assert.equal(store.get('workflows/Copy.json'), undefined, 'orphan removed from the store lookup')
+  assert.ok(svc.disk.has('workflows/Copy.json'), 'the pre-existing target file is untouched')
+})
+
+test('#309/P1-B: a high-level REKEY of a temporary source that 409s ⇒ store rekeyed back to the original path', async () => {
+  // Temporary-source path: the frontend rekeys the SAME object to the target before
+  // the 409. Reassigning fields on wf does NOT rekey the store lookup — the rollback
+  // must rekey it back via the store's own (in-memory) rename.
+  const wf = {
+    path: 'workflows/Unsaved Workflow.json',
+    filename: 'Unsaved Workflow.json',
+    directory: 'workflows',
+    isTemporary: true,
+    isPersisted: false,
+  }
+  const store = new Map([[wf.path, wf]])
+  const openPaths = [wf.path]
+  const calls = []
+  const svc = {
+    activeWorkflow: wf,
+    calls,
+    getWorkflowByPath: (p) => store.get(p) ?? null,
+    async saveWorkflow() {},
+    async renameWorkflow(w, to) {
+      // A TEMPORARY rename is a pure in-memory updatePath + rekey (no server write).
+      calls.push(['renameWorkflow', w.path, to])
+      store.delete(w.path)
+      const i = openPaths.indexOf(w.path)
+      if (i >= 0) openPaths[i] = to
+      w.path = to
+      w.filename = to.split('/').pop()
+      store.set(to, w)
+    },
+    async saveWorkflowAs(w, { filename }) {
+      calls.push('saveWorkflowAs')
+      const target = `workflows/${stripExt(filename)}.json`
+      // REKEY the same object to the target BEFORE the 409.
+      store.delete(w.path)
+      const i = openPaths.indexOf(w.path)
+      if (i >= 0) openPaths[i] = target
+      w.path = target
+      w.filename = target.split('/').pop()
+      store.set(target, w)
+      svc.activeWorkflow = w
+      const err = new Error(`Error storing user data file '${target}': 409 Conflict`)
+      err.status = 409
+      throw err
+    },
+  }
+  // existsOnDisk reports everything absent (a TOCTOU: the target appeared after the
+  // probe), so the pre-check passes and the source classifies never-persisted.
+  const existsOnDisk = async () => false
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'Existing', { existsOnDisk }),
+    /already exists \(409 Conflict\)/,
+  )
+  // The store lookup + open-tab path were rekeyed BACK to the original.
+  assert.equal(store.get('workflows/Unsaved Workflow.json'), wf, 'source rekeyed back in the store lookup')
+  assert.equal(store.get('workflows/Existing.json'), undefined, 'no stale target key remains')
+  assert.equal(wf.path, 'workflows/Unsaved Workflow.json', 'path restored')
+  assert.deepEqual(openPaths, ['workflows/Unsaved Workflow.json'], 'open-tab path rekeyed back')
+  assert.equal(svc.activeWorkflow, wf, 'active reference restored')
 })
 
 test('refuses to rename-destroy a persisted workflow when no copy API exists', async () => {

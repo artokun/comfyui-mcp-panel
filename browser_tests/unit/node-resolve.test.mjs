@@ -137,75 +137,137 @@ test("add_node: REAL type on a reachable server ⇒ resolves (no false negative)
   assert.doesNotThrow(() => assertAddNodeResolvable(reg, "KSamplerAdvanced"));
 });
 
-// ---- assertAddNodeResolvableRefreshing: stale node-def cache (#289) ----------
-// After install+restart the frontend registry predates the new pack's classes, so
-// a correct class_type reads Unknown until /object_info is re-fetched. The guard
-// must refresh once and re-check — but never fabricate a type (fail closed, #458).
+// ---- assertAddNodeResolvableRefreshing: authoritative fresh /object_info --------
+// The go/no-go is decided against the CURRENT backend /object_info, never the
+// mutated add-only registry: it MISSES freshly-installed classes (#289) and KEEPS
+// stale positives for uninstalled ones (#458/P1-C). Fail closed on both edges.
 
-test("add_node refresh: a freshly-installed type unknown at first is RESOLVED after a refresh (#289)", async () => {
-  // Model the stale cache: the page-load registry has core sentinels but NOT the
-  // just-installed pack's class. The refresh re-registers node defs, adding it.
-  const reg = loadedRegistry(); // no SeedVR2* yet
+// Build a fresh /object_info map (class_type -> def) with the core set + extras.
+function objectInfo(extra = []) {
+  const info = {};
+  for (const t of [
+    "KSampler",
+    "CheckpointLoaderSimple",
+    "CLIPTextEncode",
+    "VAEDecode",
+    "VAELoader",
+    "EmptyLatentImage",
+    "LoadImage",
+    "SaveImage",
+    ...extra,
+  ]) {
+    info[t] = { input: { required: {} } };
+  }
+  return info;
+}
+
+const regCtor = () => {
+  const c = function NodeCtor() {};
+  c.nodeData = { input: { required: {} } };
+  return c;
+};
+
+test("#289: a freshly-installed type — in fresh object_info but NOT the stale registry — resolves after a refresh", async () => {
+  const reg = loadedRegistry(); // page-load registry: no SeedVR2* yet
+  const fresh = objectInfo(["SeedVR2LoadDiTModel"]); // backend now provides it
   let refreshed = 0;
-  const refresh = async () => {
-    refreshed++;
-    reg["SeedVR2LoadDiTModel"] = (() => {
-      const c = function NodeCtor() {};
-      c.nodeData = { input: { required: {} } };
-      return c;
-    })();
+  const opts = {
+    getFreshObjectInfo: async () => fresh,
+    refresh: async () => {
+      refreshed++;
+      reg["SeedVR2LoadDiTModel"] = regCtor(); // registerNodesFromDefs adds it
+    },
   };
-  // Before the refresh the type is absent; the guard must NOT reject it outright.
   await assert.doesNotReject(() =>
-    assertAddNodeResolvableRefreshing(() => reg, "SeedVR2LoadDiTModel", refresh),
+    assertAddNodeResolvableRefreshing(() => reg, "SeedVR2LoadDiTModel", opts),
   );
-  assert.equal(refreshed, 1, "refreshed the node defs exactly once");
+  assert.equal(refreshed, 1, "refreshed once to register the newly-installed class");
   assert.ok(isRegisteredNodeType(reg, "SeedVR2LoadDiTModel"), "type registered after refresh");
 });
 
-test("add_node refresh: a GENUINELY-unknown type still ERRORS after a refresh (fail closed, #458)", async () => {
-  const reg = loadedRegistry();
+test("#458/P1-C: a STALE registry positive absent from fresh object_info FAILS CLOSED (removed pack)", async () => {
+  // GoneNode's pack was uninstalled + backend restarted: the add-only refresh never
+  // purged it, so it survives in the registry — but the fresh /object_info does NOT
+  // list it. The go/no-go MUST use the fresh payload and refuse, not the stale reg.
+  const reg = loadedRegistry(["GoneNode"]); // stale positive still registered
+  assert.ok(isRegisteredNodeType(reg, "GoneNode"), "precondition: stale registry entry present")
+  const fresh = objectInfo(); // backend no longer provides GoneNode
   let refreshed = 0;
-  const refresh = async () => {
-    refreshed++; // a real refresh that registers nothing new (server has no such type)
-  };
   await assert.rejects(
-    () => assertAddNodeResolvableRefreshing(() => reg, "TotallyMadeUpNode", refresh),
-    /Unknown node type "TotallyMadeUpNode"/,
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, "GoneNode", {
+        getFreshObjectInfo: async () => fresh,
+        refresh: async () => {
+          refreshed++;
+        },
+      }),
+    /Unknown node type "GoneNode"|backend does not provide/i,
   );
-  assert.equal(refreshed, 1, "attempted a refresh before failing closed");
+  assert.equal(refreshed, 0, "never refreshed — the fresh backend simply lacks the type");
 });
 
-test("add_node refresh: an ALREADY-registered type resolves WITHOUT refreshing", async () => {
+test("#458: a type absent from BOTH fresh object_info and the registry FAILS CLOSED", async () => {
+  const reg = loadedRegistry();
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, "TotallyMadeUpNode", {
+        getFreshObjectInfo: async () => objectInfo(),
+        refresh: async () => {},
+      }),
+    /Unknown node type "TotallyMadeUpNode"|backend does not provide/i,
+  );
+});
+
+test("add_node: a type in BOTH fresh object_info and the registry resolves WITHOUT refreshing", async () => {
   const reg = loadedRegistry();
   let refreshed = 0;
-  const refresh = async () => {
-    refreshed++;
-  };
   await assert.doesNotReject(() =>
-    assertAddNodeResolvableRefreshing(() => reg, "KSampler", refresh),
+    assertAddNodeResolvableRefreshing(() => reg, "KSampler", {
+      getFreshObjectInfo: async () => objectInfo(),
+      refresh: async () => {
+        refreshed++;
+      },
+    }),
   );
-  assert.equal(refreshed, 0, "no refresh needed when the type is already registered");
+  assert.equal(refreshed, 0, "no refresh needed when already registered");
 });
 
-test("add_node refresh: backend still unreachable after refresh ⇒ unreachable error (fail closed)", async () => {
-  const reg = unreachableRegistry(); // no core sentinels
-  const refresh = async () => {
-    /* backend still down — registers nothing, sentinels stay absent */
-  };
+test("#458: backend defines the type but the refresh CANNOT register it ⇒ FAIL CLOSED (no placeholder)", async () => {
+  const reg = loadedRegistry(); // lacks NewNode
   await assert.rejects(
-    () => assertAddNodeResolvableRefreshing(() => reg, "SeedVR2LoadDiTModel", refresh),
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, "NewNode", {
+        getFreshObjectInfo: async () => objectInfo(["NewNode"]),
+        refresh: async () => {
+          /* refresh runs but fails to register NewNode into the registry */
+        },
+      }),
+    /could not be registered|Refusing to add an unresolved placeholder/i,
+  );
+});
+
+test("#458: no fresh object_info (backend unreachable) ⇒ degrade to registry guard, unknown fails closed", async () => {
+  const reg = unreachableRegistry(); // no core sentinels
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, "SeedVR2LoadDiTModel", {
+        getFreshObjectInfo: async () => null, // fetch failed
+        refresh: async () => {},
+      }),
     /node definitions are not loaded|backend is unreachable/i,
   );
 });
 
-test("add_node refresh: a THROWING refresh does not crash — re-checks and fails closed", async () => {
-  const reg = loadedRegistry();
-  const refresh = async () => {
-    throw new Error("object_info fetch failed");
-  };
+test("add_node: a THROWING object_info fetch degrades to the registry guard", async () => {
+  const reg = loadedRegistry(); // reachable per registry; type unknown
   await assert.rejects(
-    () => assertAddNodeResolvableRefreshing(() => reg, "StillUnknown", refresh),
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, "StillUnknown", {
+        getFreshObjectInfo: async () => {
+          throw new Error("object_info fetch failed");
+        },
+        refresh: async () => {},
+      }),
     /Unknown node type "StillUnknown"/,
   );
 });

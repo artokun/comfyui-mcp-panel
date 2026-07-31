@@ -68,54 +68,83 @@ export function assertAddNodeResolvable(registry, class_type) {
 }
 
 /**
- * Async graph_add_node guard that TOLERATES a stale frontend node-def cache (#289).
+ * Async graph_add_node guard whose go/no-go decision is made against the CURRENT
+ * backend /object_info — NOT the mutated LiteGraph registry (#289 + #458/P1-C).
  *
- * After ComfyUI installs a pack and restarts, the already-open frontend's
- * LiteGraph registry still holds the PRE-INSTALL node set (it is populated from
- * /object_info at page load and is not re-fetched on a websocket reconnect). So a
- * correct class_type from a just-installed pack reads as "Unknown node type" even
- * though the server defines it — the only recovery used to be a manual F5.
+ * The registry is unreliable in BOTH directions after a pack change + restart:
+ *   - it MISSES a freshly-installed pack's classes until /object_info is re-fetched
+ *     and re-registered — so a correct class_type reads "Unknown" (#289); and
+ *   - it KEEPS a STALE POSITIVE for an UNINSTALLED pack — an add-only refresh never
+ *     purges the removed class, so `LG.registered_node_types.GoneNode` survives and
+ *     the type would wrongly "add" against a backend that no longer provides it
+ *     (violating the #458 fail-closed invariant).
  *
- * This resolves the type against the live registry; if it is absent, it performs
- * ONE node-def refresh (re-fetch /object_info + re-register defs) via `refresh`,
- * then re-checks against the FRESH registry before deciding the type is unknown.
+ * So the AUTHORITATIVE oracle is the freshly-fetched /object_info payload:
+ *   1. Fetch fresh /object_info via `getFreshObjectInfo`.
+ *   2. If the backend does NOT define the type → fail closed (unknown/removed),
+ *      regardless of any stale registry entry.
+ *   3. If the backend DOES define it → ensure LiteGraph can construct it: if the
+ *      page-load registry predates it, `refresh` (re-register the fresh defs) and
+ *      re-check; if it still can't be registered, fail closed rather than let
+ *      LiteGraph mint a placeholder.
+ *   4. If fresh /object_info is UNAVAILABLE (backend unreachable / no fetch) →
+ *      degrade to the registry-only guard, which fails closed for unknown types and
+ *      distinguishes "unreachable" from "unknown".
  *
- * The #458 fail-closed invariant is preserved end-to-end: the refresh only ever
- * registers what the server actually returns (registerNodesFromDefs), so a
- * GENUINELY-unknown type stays unregistered and still throws via
- * assertAddNodeResolvable — with the SAME distinct unreachable-vs-unknown-type
- * messages. The refresh never fabricates a type or a placeholder.
- *
- *   getRegistry : () => the LIVE registry object. It is re-invoked AFTER the
- *                 refresh, because registerNodesFromDefs mutates the registry in
- *                 place, so a fresh read observes the newly-registered classes.
- *   refresh     : optional async node-def refresh. Best-effort — a throw or its
- *                 absence just means we re-check the current registry and, if the
- *                 type is still absent, fail closed exactly like the sync guard.
+ *   getRegistry        : () => the LIVE registry object (re-invoked after refresh).
+ *   getFreshObjectInfo : optional async () => the CURRENT /object_info map (keyed by
+ *                        class_type), or null when it can't be fetched.
+ *   refresh            : optional async (defs?) => re-register node defs into the
+ *                        registry; receives the already-fetched defs to avoid a
+ *                        second /object_info round-trip.
  */
-export async function assertAddNodeResolvableRefreshing(getRegistry, class_type, refresh) {
+export async function assertAddNodeResolvableRefreshing(getRegistry, class_type, opts = {}) {
+  const { getFreshObjectInfo, refresh } = opts;
   const readRegistry = () =>
     typeof getRegistry === "function" ? getRegistry() : getRegistry;
-  const before = readRegistry();
-  if (isRegisteredNodeType(before, class_type)) return;
-  // Absent from the CURRENT (possibly stale) registry. Before rejecting it as
-  // unknown, refresh node defs once and re-check — this is the whole point of
-  // #289: a freshly-installed pack's classes only become addressable after
-  // /object_info is re-fetched and re-registered.
-  if (typeof refresh === "function") {
+
+  let freshDefs = null;
+  if (typeof getFreshObjectInfo === "function") {
     try {
-      await refresh();
+      freshDefs = await getFreshObjectInfo();
     } catch {
-      /* refresh is best-effort — fall through to a fresh-registry re-check */
+      freshDefs = null; // fetch failed ⇒ fall back to the registry-only guard
     }
-    const after = readRegistry();
-    if (isRegisteredNodeType(after, class_type)) return;
-    // Still unresolved after a real refresh ⇒ the server does not define it
-    // either. Fail closed with the correct unreachable-vs-unknown distinction.
-    assertAddNodeResolvable(after, class_type);
-    return;
   }
-  assertAddNodeResolvable(before, class_type);
+
+  if (freshDefs && typeof freshDefs === "object") {
+    // AUTHORITATIVE: does the LIVE backend provide this type right now?
+    if (!Object.prototype.hasOwnProperty.call(freshDefs, class_type)) {
+      // Not defined by the current backend (never installed, or its pack was
+      // removed). Fail closed even if a stale registry entry survives (#458/P1-C).
+      throw new Error(
+        `Unknown node type "${class_type}" — the ComfyUI backend does not provide it ` +
+          `(not installed, or its pack was removed). Check the exact class_type via panel_search_nodes`,
+      );
+    }
+    // Backend HAS it. Make sure LiteGraph can construct it — refresh to register the
+    // fresh defs when the page-load registry predates the install (#289), re-check.
+    if (!isRegisteredNodeType(readRegistry(), class_type) && typeof refresh === "function") {
+      try {
+        await refresh(freshDefs);
+      } catch {
+        /* refresh best-effort — the post-refresh re-check decides go/no-go */
+      }
+    }
+    if (isRegisteredNodeType(readRegistry(), class_type)) return;
+    // Backend defines it but the frontend couldn't register it (refresh failed) —
+    // fail closed rather than let LiteGraph mint an unresolved placeholder (#458).
+    throw new Error(
+      `Node type "${class_type}" exists on the ComfyUI backend but could not be registered in the ` +
+        `frontend (node-def refresh failed) — reload the ComfyUI tab and retry. ` +
+        `Refusing to add an unresolved placeholder node.`,
+    );
+  }
+
+  // No fresh /object_info (backend unreachable, or no fetch capability): degrade to
+  // the registry-only guard — still fails closed for unknown types, and names the
+  // "backend unreachable" vs "unknown type" cases distinctly (#458).
+  assertAddNodeResolvable(readRegistry(), class_type);
 }
 
 /**
