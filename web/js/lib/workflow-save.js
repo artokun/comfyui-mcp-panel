@@ -72,27 +72,82 @@ export function shouldGroundBeforeTurn(wf, { freshChat } = {}) {
  *  (#215/#226). Grounding once per fresh chat made that a rare edge; grounding on
  *  EVERY turn (#330) would repeatedly reach saveActiveWorkflow's in-place branch and
  *  overwrite a REAL file with the current (possibly mid-load) canvas. So authorize a
- *  per-turn save only when the source is PROVABLY never-persisted — mirroring
- *  classifySource's tri-state proof — via an async disk oracle
+ *  per-turn save ONLY on POSITIVE disk proof that the source is never-persisted —
+ *  mirroring classifySource's tri-state proof — via an async disk oracle
  *  `existsOnDisk(rawPath) => true | false | null`:
  *    - isPersisted === true              → false (genuinely saved; never auto-ground)
- *    - no backing path                   → true  (brand-new tab, nothing to lose)
+ *    - no usable disk oracle             → false (cannot prove ⇒ refuse)
+ *    - no backing path to probe          → false (cannot prove absence ⇒ refuse; the
+ *                                          user can still Ctrl+S. An automatic save we
+ *                                          cannot verify could still collide.)
  *    - oracle proves ABSENT (404)        → true
- *    - oracle proves PRESENT / unknown   → false (fail safe — the user can Ctrl+S)
- *  With no usable oracle we can prove nothing → false (refuse), never a blind save. */
+ *    - oracle proves PRESENT / unknown   → false (fail safe)
+ *  Anything short of a proven absence refuses — never a blind auto-save. */
 export async function groundingIsSafe(wf, existsOnDisk) {
   if (!wf) return false;
   if (wf.isPersisted === true) return false;
+  if (typeof existsOnDisk !== "function") return false; // no oracle ⇒ cannot prove ⇒ refuse
   const raw = wf.path;
-  if (!raw) return true; // no path at all ⇒ nothing on disk to lose
-  if (typeof existsOnDisk !== "function") return false; // cannot prove ⇒ refuse
+  if (!raw) return false; // pathless ⇒ cannot probe ⇒ refuse (do not blanket-approve)
   let exists = null;
   try {
     exists = await existsOnDisk(raw);
   } catch {
     exists = null; // probe failed ⇒ unknown ⇒ refuse
   }
-  return exists === false; // ONLY a proven absence authorizes the save
+  return exists === false; // ONLY a proven absence (404) authorizes the save
+}
+
+// #330 single-flight: SERIALIZE grounding per workflow SERVICE, not per workflow
+// instance. The atomic copy-trio activates a FRESH temporary copy (openWorkflow)
+// BEFORE its write commits, so the active-workflow identity changes mid-save — a
+// concurrent turn keyed by instance would ground that pre-commit copy under a new
+// key and double-save. A per-service chain makes each grounding wait for the prior
+// one, then RE-EVALUATE the (now possibly persisted) active workflow.
+const _groundingChain = new Map(); // svc -> tail Promise<void>
+
+/** One grounding attempt: probe the ACTIVE workflow's on-disk state, then save the
+ *  EXACT SAME workflow it probed (`expect: wf` → saveActiveWorkflow refuses if the
+ *  active workflow changed during the async probe, so we never authorize on tab A
+ *  and write to tab B). Best-effort: any refusal/hiccup ⇒ null (leave ungrounded). */
+async function groundOnce(svc, { existsOnDisk, autoWorkflowName, reconcileSavedCopy } = {}) {
+  try {
+    const wf = svc?.activeWorkflow;
+    if (!needsGrounding(wf)) return null;
+    if (!(await groundingIsSafe(wf, existsOnDisk))) return null;
+    return await saveActiveWorkflow(svc, undefined, {
+      autoWorkflowName,
+      existsOnDisk,
+      reconcileSavedCopy,
+      expect: wf,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/** #330 — atomically ground the ACTIVE workflow on every agent turn, SERIALIZED per
+ *  service so concurrent turns can't create duplicate grounded copies. A later turn
+ *  waits for the in-flight grounding to finish and then re-evaluates against the
+ *  current active workflow (which, after a successful ground, is persisted → a no-op).
+ *  Returns the saved name, or null when nothing was (safely) saved. */
+export async function groundActiveWorkflow(svc, opts = {}) {
+  // Fast path: nothing to ground and no chain running → skip without touching state.
+  if (!needsGrounding(svc?.activeWorkflow) && !_groundingChain.get(svc)) return null;
+  const prior = _groundingChain.get(svc) ?? Promise.resolve();
+  // Chain AFTER the prior grounding (ignoring its outcome), then re-evaluate now.
+  const result = prior.then(() => groundOnce(svc, opts));
+  const tail = result.then(
+    () => {},
+    () => {},
+  );
+  _groundingChain.set(svc, tail);
+  try {
+    return await result;
+  } finally {
+    // Only clear if we're still the tail — a newer queued turn may have extended it.
+    if (_groundingChain.get(svc) === tail) _groundingChain.delete(svc);
+  }
 }
 
 /** Save the active workflow through ComfyUI's workflow service — NO dialog.
@@ -126,10 +181,26 @@ export async function groundingIsSafe(wf, existsOnDisk) {
 export async function saveActiveWorkflow(
   svc,
   name,
-  { autoWorkflowName, existsOnDisk, reconcileSavedCopy } = {},
+  { autoWorkflowName, existsOnDisk, reconcileSavedCopy, expect } = {},
 ) {
   const wf = svc?.activeWorkflow;
   if (!wf) throw new Error("no active workflow to save");
+
+  // #330 TOCTOU guard: a grounding caller passes `expect` — the exact workflow it
+  // probed on disk before this save. If the active workflow changed in between (the
+  // user switched tabs during the async /userdata HEAD), we'd authorize on workflow
+  // A but write to workflow B — an overwrite of a DIFFERENT, possibly persisted file.
+  // REFUSE instead. Re-checked again immediately before every write (assertExpect),
+  // since the classify/collision probes below also await. `expect` is undefined for
+  // ordinary (explicit) saves, so their behaviour is unchanged.
+  const assertExpect = () => {
+    if (expect !== undefined && svc?.activeWorkflow !== expect) {
+      throw new Error(
+        "active workflow changed during grounding — refusing to save the wrong workflow (issue #330)",
+      );
+    }
+  };
+  assertExpect();
 
   // An EXPLICIT name (any string, even "  ") must resolve to a real name. If it
   // normalizes to empty, refuse — never silently reinterpret an explicit-but-
@@ -231,6 +302,7 @@ export async function saveActiveWorkflow(
             "refusing to move or destroy the original file outside the workflows folder (issue #285/#226)",
         );
       }
+      assertExpect(); // #330: still the workflow we probed?
       return await withConflictRollback(svc, wf, effectiveName, finalTargetPath, () =>
         copyToUserDir(wf, effectiveName, finalTargetPath),
       );
@@ -275,6 +347,7 @@ export async function saveActiveWorkflow(
     // retroactively protect a victim file the server already replaced) is upstream-only.
     const atomicCopy = resolveSaveAsCopy(svc, { reconcileSavedCopy });
     if (atomicCopy) {
+      assertExpect(); // #330: still the workflow we probed?
       const activeName = await withConflictRollback(svc, wf, effectiveName, finalTargetPath, () =>
         atomicCopy(wf, effectiveName, finalTargetPath),
       );
@@ -309,6 +382,7 @@ export async function saveActiveWorkflow(
 
   // No relocation — the target path equals the current on-disk path. Overwriting
   // the same file in place is safe (no move can occur).
+  assertExpect(); // #330: never in-place-overwrite a workflow the user switched to
   await saveInPlace(svc, wf);
   return desired || currentName || null;
 }

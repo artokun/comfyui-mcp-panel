@@ -144,7 +144,7 @@ import {
   refreshNodeArea,
 } from "./lib/group-geometry.js";
 import { pickRevertSnapshot } from "./lib/graph-revert.js";
-import { saveActiveWorkflow, needsGrounding, shouldGroundBeforeTurn, groundingIsSafe } from "./lib/workflow-save.js";
+import { saveActiveWorkflow, shouldGroundBeforeTurn, groundActiveWorkflow } from "./lib/workflow-save.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
 import {
@@ -2571,13 +2571,16 @@ async function workflowExistsOnDisk(rawPath) {
  *  agent works from a grounded file. Best-effort. Returns the saved name or null. */
 async function groundUnsavedWorkflow() {
   try {
-    const wf = app?.extensionManager?.workflow?.activeWorkflow;
-    if (!needsGrounding(wf)) return null;
-    // #330: per-turn grounding must NOT overwrite a real on-disk file whose
-    // temporary flag merely drifted (#215/#226). Only save when the source is
-    // provably never-persisted, confirmed against the disk oracle.
-    if (!(await groundingIsSafe(wf, workflowExistsOnDisk))) return null;
-    return await programmaticSave();
+    // #330: ground the active workflow ATOMICALLY — probe its on-disk state and save
+    // the EXACT SAME workflow (refusing if the user switched tabs during the async
+    // probe, so we can't authorize on tab A and overwrite tab B), single-flighted so
+    // concurrent turns can't create duplicate copies. Only a provably never-persisted
+    // source is saved; anything unprovable is left for a manual Ctrl+S.
+    return await groundActiveWorkflow(app?.extensionManager?.workflow, {
+      existsOnDisk: workflowExistsOnDisk,
+      autoWorkflowName,
+      reconcileSavedCopy: reconcileSavedWorkflowCopy,
+    });
   } catch {
     return null; // best-effort — never block the chat on a save hiccup
   }
