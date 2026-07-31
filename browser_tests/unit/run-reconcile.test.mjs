@@ -15,7 +15,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { createRunCompletionTracker } from "../../web/js/lib/run-completion.js";
-import { parseHistoryEntry } from "../../web/js/lib/history-reconcile.js";
+import { parseHistoryEntry, queueMembership } from "../../web/js/lib/history-reconcile.js";
 
 const isVideo = (m) => /\.(mp4|webm|mov)$/i.test(String(m?.filename || ""));
 
@@ -695,6 +695,88 @@ test("#370 P1 (codex): give-up requires CLEAN-ABSENT /history (null), not a pres
   assert.deepEqual(giveUps, [{ promptId: "gone" }], "only null-history + absent-queue gives up");
   assert.equal(tracker._pending.has("present"), true, "present-non-terminal stays pending (never given up)");
   assert.equal(tracker._pending.has("gone"), false, "genuinely-gone prompt evicted (bounded memory)");
+});
+
+// ── queueMembership: strict-array /queue verdict ────────────────────────────────
+
+test("queueMembership: present in queue_running or queue_pending ⇒ true", () => {
+  assert.equal(queueMembership({ queue_running: [[0, "p1"]], queue_pending: [] }, "p1"), true);
+  assert.equal(queueMembership({ queue_running: [], queue_pending: [[1, "p2"]] }, "p2"), true);
+  // {prompt_id} object form is also matched.
+  assert.equal(queueMembership({ queue_running: [{ prompt_id: "p3" }], queue_pending: [] }, "p3"), true);
+});
+
+test("queueMembership: both arrays well-formed AND id absent ⇒ false (definitive)", () => {
+  assert.equal(queueMembership({ queue_running: [[0, "other"]], queue_pending: [] }, "p1"), false);
+  assert.equal(queueMembership({ queue_running: [], queue_pending: [] }, "p1"), false);
+});
+
+test("queueMembership: MALFORMED / missing fields ⇒ null (uncertain, NOT false)", () => {
+  // The exact repro: queue arrays are objects, not arrays.
+  assert.equal(queueMembership({ queue_running: {}, queue_pending: {} }, "p1"), null);
+  assert.equal(queueMembership({ queue_running: [], queue_pending: {} }, "p1"), null); // one bad
+  assert.equal(queueMembership({ queue_running: {}, queue_pending: [] }, "p1"), null);
+  assert.equal(queueMembership({}, "p1"), null); // both missing
+  assert.equal(queueMembership({ queue_running: null, queue_pending: null }, "p1"), null);
+  assert.equal(queueMembership(null, "p1"), null);
+  assert.equal(queueMembership("nonsense", "p1"), null);
+});
+
+test("queueMembership: MALFORMED ROWS (arrays are valid but a row is unreadable) ⇒ null", () => {
+  // Row missing the prompt_id slot / wrong types — can't trust an "absent" verdict.
+  assert.equal(queueMembership({ queue_running: [[0]], queue_pending: [] }, "p1"), null);
+  assert.equal(queueMembership({ queue_running: [null], queue_pending: [] }, "p1"), null);
+  assert.equal(queueMembership({ queue_running: [{}], queue_pending: [] }, "p1"), null);
+  assert.equal(queueMembership({ queue_running: [[0, 123]], queue_pending: [] }, "p1"), null); // id not a string
+  assert.equal(queueMembership({ queue_running: [], queue_pending: ["bare-string"] }, "p1"), null);
+  // Row's index-0 must be a number (the queue-row shape is [number, prompt_id, …]).
+  assert.equal(queueMembership({ queue_running: [["not-a-number", "other"]], queue_pending: [] }, "p1"), null);
+  // A well-formed [number, prompt_id] that simply doesn't match is a clean absence.
+  assert.equal(queueMembership({ queue_running: [[0, "other"]], queue_pending: [] }, "p1"), false);
+  // A POSITIVE match is trustworthy even if OTHER rows are malformed.
+  assert.equal(queueMembership({ queue_running: [[0, "p1"], [1]], queue_pending: [] }, "p1"), true);
+  // Only when EVERY row is well-formed AND the id is absent ⇒ definitive false.
+  assert.equal(queueMembership({ queue_running: [[0, "a"]], queue_pending: [{ prompt_id: "b" }] }, "p1"), false);
+});
+
+test("#370 P1 (codex): a MALFORMED /queue (non-array fields) is uncertain → NOT given up, later output delivers", async () => {
+  const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 1 });
+  const { tracker, flushes, giveUps } = h;
+  tracker.onQueued("m");
+  const fetchHistory = async () => null; // clean-absent /history
+  // /queue returns a 200 but with malformed (non-array) queue fields — the panel's
+  // queueMembership maps this to null (uncertain), so the tracker must NOT give up.
+  const fetchQueued = async (id) => queueMembership({ queue_running: {}, queue_pending: {} }, id);
+  const summary = await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
+  assert.deepEqual(summary, [{ promptId: "m", status: "running" }], "malformed queue ⇒ running, not unknown");
+  for (let i = 0; i < 3; i++) {
+    h.advance(1000);
+    await h.fireDueTimers();
+  }
+  assert.equal(giveUps.length, 0, "a malformed /queue never causes a give-up");
+  assert.equal(tracker._pending.has("m"), true, "left pending (uncertain)");
+  assert.equal(tracker.wasTerminal("m"), false, "not fenced");
+
+  // Its later live output still delivers.
+  tracker.onExecutionStart("m");
+  tracker.onExecuted("m", { images: [{ filename: "m.png", type: "output" }] });
+  tracker.onExecutionSuccess("m");
+  assert.ok(flushes.find((f) => f.promptId === "m"), "output delivered, not dropped");
+});
+
+test("#370 P1 (codex): give-up STILL fires when /history null AND /queue well-formed both-absent", async () => {
+  const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 1 });
+  const { tracker, giveUps } = h;
+  tracker.onQueued("gone");
+  const fetchHistory = async () => null;
+  const fetchQueued = async (id) => queueMembership({ queue_running: [], queue_pending: [] }, id); // valid + absent ⇒ false
+  await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
+  for (let i = 0; i < 3; i++) {
+    h.advance(1000);
+    await h.fireDueTimers();
+  }
+  assert.deepEqual(giveUps, [{ promptId: "gone" }], "well-formed both-absent still gives up (memory bound intact)");
+  assert.equal(tracker._pending.has("gone"), false, "evicted");
 });
 
 test("#370 P1 (codex): CONCURRENT reconciles give up a gone prompt exactly once (no double notice)", async () => {

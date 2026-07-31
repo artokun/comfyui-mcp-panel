@@ -63,3 +63,61 @@ export function parseHistoryEntry(entry, { isVideo } = {}) {
     videos,
   };
 }
+
+/**
+ * Is `promptId` present in ComfyUI's `/queue` (running OR pending)?
+ *
+ * STRICT, mirroring the strict-null /history discipline: a definitive "absent"
+ * (`false`) is returned ONLY when BOTH `queue_running` AND `queue_pending` are
+ * well-formed ARRAYS and neither contains the id. If the payload is missing, not
+ * an object, or EITHER field is absent / not an array / malformed, the answer is
+ * UNCERTAIN → `null` (the reconciler then treats the prompt as "running" and never
+ * gives up). Only a positively-confirmed absence permits give-up (codex P1).
+ *
+ * Queue rows are `[number, prompt_id, prompt, extra_data, outputs]`; some builds
+ * use `{prompt_id}` objects — both forms are matched.
+ *
+ * @param {any} queueJson  Parsed body of `GET /queue`.
+ * @param {string} promptId
+ * @returns {boolean|null}  true present · false definitively absent · null uncertain
+ */
+export function queueMembership(queueJson, promptId) {
+  if (!queueJson || typeof queueJson !== "object") return null;
+  const running = queueJson.queue_running;
+  const pending = queueJson.queue_pending;
+  // Both containers MUST be arrays for any trustworthy verdict.
+  if (!Array.isArray(running) || !Array.isArray(pending)) return null;
+  let present = false;
+  let malformed = false;
+  const scan = (arr) => {
+    for (const item of arr) {
+      const id = rowPromptId(item);
+      if (id == null) {
+        // A row we can't read a prompt_id from taints the "absent" verdict — we
+        // can't be sure this row isn't OUR prompt in an unrecognized shape.
+        malformed = true;
+        continue;
+      }
+      if (id === promptId) present = true;
+    }
+  };
+  scan(running);
+  scan(pending);
+  if (present) return true; // a positive match is trustworthy regardless of other rows
+  if (malformed) return null; // some row unreadable ⇒ can't trust "absent" ⇒ uncertain
+  return false; // every row well-formed AND id absent ⇒ DEFINITIVE absence
+}
+
+// Extract a row's prompt_id: array rows are `[number, prompt_id, …]` (index 0 a
+// number, index 1 a string), object rows are `{prompt_id: string}`. Anything that
+// doesn't match a recognized shape is malformed ⇒ null (so it can't masquerade as
+// a well-formed, id-absent row and enable a false "definitive absence").
+function rowPromptId(item) {
+  if (Array.isArray(item)) {
+    return typeof item[0] === "number" && typeof item[1] === "string" ? item[1] : null;
+  }
+  if (item && typeof item === "object") {
+    return typeof item.prompt_id === "string" ? item.prompt_id : null;
+  }
+  return null;
+}

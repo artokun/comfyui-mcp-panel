@@ -148,6 +148,7 @@ import { saveActiveWorkflow, shouldGroundBeforeTurn, groundActiveWorkflow } from
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
+import { queueMembership } from "./lib/history-reconcile.js";
 import {
   shouldResumeAfterComfyReconnect,
   shouldRehelloAfterCommand,
@@ -15154,11 +15155,10 @@ function buildPanel() {
             if (typeof api?.fetchApi !== "function") return null;
             const res = await api.fetchApi("/queue");
             if (!res || !res.ok) return null;
-            const j = await res.json();
-            const has = (arr) =>
-              Array.isArray(arr) &&
-              arr.some((item) => (Array.isArray(item) ? item[1] === promptId : item?.prompt_id === promptId));
-            return has(j?.queue_running) || has(j?.queue_pending);
+            // queueMembership returns false ONLY when both queue arrays are
+            // well-formed and lack the id; a missing/malformed payload ⇒ null
+            // (uncertain), so a malformed /queue never causes a give-up (codex P1).
+            return queueMembership(await res.json(), promptId);
           },
           isVideo: isVideoOutput,
         });
