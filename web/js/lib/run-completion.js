@@ -307,15 +307,24 @@ export function createRunCompletionTracker({
     // and retired this prompt while /history was in flight — never double-deliver.
     if (delivered.has(k) || !pending.has(k)) return null;
 
+    // parseHistoryEntry returns null for null/undefined/non-object entries.
     const parsed = fetchThrew ? null : parseHistoryEntry(entry, { isVideo });
+
+    // ── NON-terminal outcomes (never deliver here; decide retry vs give-up) ──
     if (!parsed || !parsed.terminal) {
-      // NOT terminal in /history. CRITICAL: absence from /history is NORMAL for a
-      // QUEUED or RUNNING prompt — ComfyUI only writes /history on task_done. So an
-      // absent /history must NOT be treated as "gone": consult /queue to tell a
-      // still-in-flight render apart from a genuinely cancelled/removed one, and
-      // NEVER fence/give up a prompt /queue still shows running (codex P1 — it would
-      // drop the live output of a legitimately long render).
-      if (fetchThrew) return { promptId, status: "running", retriable: true }; // /history unreachable ⇒ uncertain, keep polling
+      // /history unreachable (503/threw) ⇒ uncertain; keep polling, never give up.
+      if (fetchThrew) return { promptId, status: "running", retriable: true };
+      // STRICT: only a `null` entry is a clean 200-with-no-entry (give-up eligible
+      // below). ANYTHING else that isn't a terminal record — a present-but-non-
+      // terminal record (status running/pending), a malformed/unparseable record,
+      // OR an unexpected `undefined`/other value from a custom fetchHistory — is
+      // NOT a confirmed clean absence, so treat it as running/uncertain and NEVER
+      // give up (codex P1: it must not be evicted/fenced); keep polling so its live
+      // lifecycle / a later terminal record delivers it.
+      if (entry !== null) return { promptId, status: "running", retriable: true };
+      // entry === null ⇒ CLEANLY ABSENT from /history. Absence is NORMAL for a
+      // QUEUED/RUNNING prompt (ComfyUI writes /history only on task_done), so consult
+      // /queue to tell a still-in-flight render apart from a genuinely gone one.
       let queued = null; // null = couldn't determine; true/false = definitive
       if (typeof fetchQueued === "function") {
         try {
@@ -325,17 +334,15 @@ export function createRunCompletionTracker({
         }
         if (delivered.has(k) || !pending.has(k)) return null; // re-check after 2nd await
       }
-      if (queued === false) {
-        // DEFINITIVELY absent from BOTH /history AND /queue ⇒ genuinely gone
-        // (cancelled / interrupted). Only THIS is give-up eligible.
-        return { promptId, status: "unknown", retriable: true };
-      }
-      // Still queued/running, OR queue membership couldn't be confirmed — either
-      // way keep polling and NEVER give up (a live/uncertain render must not be
-      // fenced or evicted).
+      // DEFINITIVELY absent from BOTH /history (clean null) AND /queue ⇒ genuinely
+      // gone (cancelled / interrupted). This is the ONLY give-up-eligible state.
+      if (queued === false) return { promptId, status: "unknown", retriable: true };
+      // Still queued/running, OR queue membership couldn't be confirmed — keep
+      // polling and NEVER give up (a live/uncertain render must not be evicted).
       return { promptId, status: "running", retriable: true };
     }
-    // Terminal. Retire ALL live state for this key so a stale partial buffer (from
+
+    // ── Terminal. Retire ALL live state for this key so a stale partial buffer (from
     // pre-drop `executed` events) can't double-deliver later, and mark it delivered
     // BEFORE onFlush so a concurrent reconcile can't race it.
     const buf = buffers.get(k);
@@ -387,6 +394,13 @@ export function createRunCompletionTracker({
   // so it ages out normally.
   function giveUpReconcile(promptId) {
     const k = key(promptId);
+    // ONE-TIME ownership claim: two concurrent reconcile()/retry paths can each
+    // return "unknown" for the same gone prompt and both reach here — but only the
+    // FIRST (which still sees it in `pending`) may retire state + fire the notice.
+    // Any later caller finds it already evicted and no-ops, so onReconcileGiveUp
+    // (and the eviction) happen exactly once (codex P1). Synchronous from here on,
+    // so the has→delete claim is atomic.
+    if (!pending.has(k)) return;
     clearReconcileRetry(k);
     // Retire ALL live state for this key, exactly as a terminal outcome would.
     // Otherwise a stale PARTIAL buffer left from pre-drop `executed` events would

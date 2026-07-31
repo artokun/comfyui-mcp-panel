@@ -649,6 +649,90 @@ test("#370 P1 (codex CRITICAL): absent /history BUT present in /queue (running) 
   assert.equal(rFlush.images[0].filename, "R_final.png");
 });
 
+test("#370 P1 (codex): a PRESENT non-terminal /history entry is NEVER given up, even when /queue is absent", async () => {
+  const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 2 });
+  const { tracker, flushes, giveUps } = h;
+  // /history HAS a record for P but it's not terminal (status running) — a transient
+  // queue↔history handoff where /queue momentarily omits it. A PRESENT record means
+  // the prompt is confirmably NOT gone, so it must never be evicted/fenced.
+  tracker.onQueued("P");
+  const fetchHistory = async () => ({ status: { status_str: "running" }, outputs: {} });
+  const fetchQueued = async () => false; // /queue momentarily omits it
+  const summary = await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
+  assert.deepEqual(summary, [{ promptId: "P", status: "running" }], "present-non-terminal ⇒ running, NOT unknown");
+  for (let i = 0; i < 4; i++) {
+    h.advance(1000);
+    await h.fireDueTimers();
+  }
+  assert.equal(giveUps.length, 0, "a present /history record is NEVER given up");
+  assert.equal(tracker._pending.has("P"), true, "left pending");
+  assert.equal(tracker.wasTerminal("P"), false, "NOT fenced");
+
+  // Its later live output must still deliver (fails-before: it was evicted/fenced).
+  tracker.onExecutionStart("P");
+  tracker.onExecuted("P", { images: [{ filename: "P_final.png", type: "output" }] });
+  tracker.onExecutionSuccess("P");
+  const pFlush = flushes.find((f) => f.promptId === "P");
+  assert.ok(pFlush, "the render's real output delivered, not dropped");
+  assert.equal(pFlush.images[0].filename, "P_final.png");
+});
+
+test("#370 P1 (codex): give-up requires CLEAN-ABSENT /history (null), not a present non-terminal record", async () => {
+  const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 1 });
+  const { tracker, giveUps } = h;
+  const fetchQueued = async () => false; // /queue absent for both
+  // "present" always has a present-non-terminal /history record; "gone" is cleanly
+  // absent (null). Only the latter is give-up eligible.
+  const fetchHistory = async (id) => (id === "present" ? { status: { status_str: "pending" } } : null);
+
+  tracker.onQueued("present");
+  tracker.onQueued("gone");
+  await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
+  for (let i = 0; i < 3; i++) {
+    h.advance(1000);
+    await h.fireDueTimers();
+  }
+  assert.deepEqual(giveUps, [{ promptId: "gone" }], "only null-history + absent-queue gives up");
+  assert.equal(tracker._pending.has("present"), true, "present-non-terminal stays pending (never given up)");
+  assert.equal(tracker._pending.has("gone"), false, "genuinely-gone prompt evicted (bounded memory)");
+});
+
+test("#370 P1 (codex): CONCURRENT reconciles give up a gone prompt exactly once (no double notice)", async () => {
+  const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 0 });
+  const { tracker, giveUps } = h;
+  tracker.onQueued("g");
+  const fetchHistory = async () => null; // clean-absent
+  const fetchQueued = async () => false; // absent from /queue ⇒ gone
+  // Two reconcile passes race over the same pending prompt (both resolve "unknown"
+  // and, with a zero budget, both reach giveUpReconcile). The ownership claim must
+  // ensure the eviction + onReconcileGiveUp notice fire only ONCE.
+  await Promise.all([
+    tracker.reconcile({ fetchHistory, fetchQueued, isVideo }),
+    tracker.reconcile({ fetchHistory, fetchQueued, isVideo }),
+  ]);
+  assert.deepEqual(giveUps, [{ promptId: "g" }], "given up exactly once despite the race");
+  assert.equal(tracker._pending.has("g"), false, "evicted once");
+});
+
+test("#370 P1 (codex): only a STRICT null /history is give-up eligible — undefined stays running", async () => {
+  const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 1 });
+  const { tracker, giveUps } = h;
+  const fetchQueued = async () => false; // /queue absent for both
+  // A custom fetchHistory that resolves `undefined` (not null) must NOT be treated
+  // as a clean absence — undefined is uncertain, never give-up eligible.
+  const fetchHistory = async (id) => (id === "u" ? undefined : null);
+  tracker.onQueued("u");
+  tracker.onQueued("n");
+  await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
+  for (let i = 0; i < 3; i++) {
+    h.advance(1000);
+    await h.fireDueTimers();
+  }
+  assert.deepEqual(giveUps, [{ promptId: "n" }], "only strict-null history gives up (undefined does not)");
+  assert.equal(tracker._pending.has("u"), true, "undefined-history prompt stays pending (uncertain)");
+  assert.equal(tracker._pending.has("n"), false, "null-history + absent-queue evicted");
+});
+
 test("#370 P1 (codex): a /history 503 (fetch throws) is UNCERTAIN → running, never given up even if /queue is absent", async () => {
   const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 2 });
   const { tracker, flushes, giveUps } = h;
