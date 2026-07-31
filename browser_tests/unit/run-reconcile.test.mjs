@@ -25,9 +25,11 @@ function makeHarness(opts = {}) {
   let seq = 0;
   const flushes = [];
   const errors = [];
+  const giveUps = [];
   const tracker = createRunCompletionTracker({
     onFlush: (p) => flushes.push(p),
     onReconcileError: (e) => errors.push(e),
+    onReconcileGiveUp: (e) => giveUps.push(e),
     now: () => clock,
     setTimer: (fn, ms) => {
       const id = ++seq;
@@ -42,6 +44,7 @@ function makeHarness(opts = {}) {
     tracker,
     flushes,
     errors,
+    giveUps,
     advance: (ms) => {
       clock += ms;
     },
@@ -532,19 +535,57 @@ test("#370 reconcile-loop error also routes through onReconcileError (single del
   assert.deepEqual(errors, [{ promptId: "G" }], "error delivered via the hook, once");
 });
 
-test("#370 P1-3: reconcile retry gives up after the attempt budget (no infinite polling)", async () => {
+test("#370 P1 (codex memory-leak): an exhausted-retry /history-ABSENT prompt is EVICTED (given up once), not retained forever", async () => {
   const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 3 });
-  const { tracker, flushes } = h;
+  const { tracker, flushes, giveUps } = h;
   tracker.onQueued("E");
-  const fetchHistory = async () => null; // permanently transient
+  const fetchHistory = async () => null; // /history stays absent (cancelled/gone)
   await tracker.reconcile({ fetchHistory, isVideo });
-  // Drain more than the budget of retries.
+  assert.equal(tracker._pending.has("E"), true, "pending while retries are in flight");
+  // Drain the retry budget.
   for (let i = 0; i < 6; i++) {
     h.advance(1000);
     await h.fireDueTimers();
   }
   assert.equal(flushes.length, 0, "nothing delivered — history never terminal");
-  assert.equal(tracker._pending.has("E"), true, "still pending — a future reconnect edge can retry");
+  // Given up ONCE and evicted → the ledger does not grow without bound.
+  assert.deepEqual(giveUps, [{ promptId: "E" }], "gave up exactly once");
+  assert.equal(tracker._pending.has("E"), false, "EVICTED from pending (bounded memory)");
+  // Its stamped terminal fence is no longer pinned by pending, so it ages out.
+  h.advance(10 * 60 * 1000 + 1);
+  await h.fireDueTimers();
+  assert.equal(tracker.wasTerminal("E"), false, "given-up fence ages out (not retained forever)");
+});
+
+test("#370 P1 (codex): repeated cancelled queued prompts do NOT accumulate in the ledger", async () => {
+  const h = makeHarness({ reconcileRetryMs: 500, maxReconcileRetries: 2 });
+  const { tracker, giveUps } = h;
+  const fetchHistory = async () => null; // every one is cancelled/absent
+  for (let n = 0; n < 5; n++) {
+    const id = `c${n}`;
+    tracker.onQueued(id);
+    await tracker.reconcile({ fetchHistory, isVideo });
+    for (let i = 0; i < 3; i++) {
+      h.advance(500);
+      await h.fireDueTimers();
+    }
+  }
+  assert.equal(giveUps.length, 5, "each unconfirmable prompt given up once");
+  assert.equal(tracker._pending.size, 0, "pending drained — no unbounded growth");
+});
+
+test("#370 P1-3: a RUNNING render whose retries exhaust is left pending (NOT given up)", async () => {
+  const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 3 });
+  const { tracker, giveUps } = h;
+  tracker.onExecutionStart("R");
+  const fetchHistory = async () => ({ outputs: {}, status: {} }); // known, not terminal
+  await tracker.reconcile({ fetchHistory, isVideo });
+  for (let i = 0; i < 6; i++) {
+    h.advance(1000);
+    await h.fireDueTimers();
+  }
+  assert.equal(giveUps.length, 0, "a confirmably-running render is NOT given up");
+  assert.equal(tracker._pending.has("R"), true, "left pending for the live path / next reconnect");
 });
 
 test("#370 still-running: reconcile leaves it pending and delivers nothing", async () => {

@@ -64,6 +64,7 @@ export const NO_PROMPT_KEY = "__no_prompt__";
 export function createRunCompletionTracker({
   onFlush,
   onReconcileError,
+  onReconcileGiveUp,
   now = () => Date.now(),
   setTimer = (fn, ms) => setTimeout(fn, ms),
   clearTimer = (t) => clearTimeout(t),
@@ -350,11 +351,35 @@ export function createRunCompletionTracker({
     return { promptId, status: "success", delivered: hasBatch };
   }
 
+  // GIVE UP on a prompt whose outcome can't be confirmed after the retry budget is
+  // spent (P1 memory leak). Without this, a prompt whose /history stays ABSENT
+  // (cancelled / disconnected while queued) would sit in `pending` forever — and
+  // because the fence prune deliberately RETAINS a terminal fence while its run is
+  // pending, both `pending` and `terminal` would grow without bound. Evicting the
+  // entry (once, with a one-time "couldn't confirm — safe to requeue" notice) keeps
+  // the ledger bounded to the live queue depth + in-flight retries; the terminal
+  // fence we stamp here is then no longer pinned, so it ages out normally.
+  function giveUpReconcile(promptId) {
+    const k = key(promptId);
+    clearReconcileRetry(k);
+    pending.delete(k); // EVICT — bounds the ledger
+    markTerminal(promptId); // fence any stray late execution_start; ages out (not pinned)
+    if (typeof onReconcileGiveUp === "function") {
+      try {
+        onReconcileGiveUp({ promptId });
+      } catch {
+        /* presentation error must never wedge reconciliation */
+      }
+    }
+  }
+
   // Schedule a bounded, self-repolling retry for a prompt whose /history is not yet
   // terminal (P1-3). Each attempt re-runs reconcileKey; it stops the instant the
-  // outcome is delivered, the prompt is otherwise resolved, or the attempt budget
-  // is exhausted (then it waits for the next reconnect edge). Uses the injected
-  // timer so it's deterministic under test.
+  // outcome is delivered or the prompt is otherwise resolved. When the attempt
+  // budget is spent WITHOUT a terminal outcome: an UNKNOWN (/history absent —
+  // couldn't even find it) is GIVEN UP + evicted so the ledger stays bounded, while
+  // a RUNNING render (confirmably in progress) is left pending for the live path /
+  // next reconnect edge. Uses the injected timer so it's deterministic under test.
   function scheduleReconcileRetry(promptId, fetchHistory, isVideo) {
     const k = key(promptId);
     if (k === NO_PROMPT_KEY) return; // id-less runs aren't reconcilable
@@ -366,14 +391,24 @@ export function createRunCompletionTracker({
     if ((retryCounts.get(k) ?? 0) >= maxReconcileRetries) return; // budget spent
     const timer = setTimer(async () => {
       retryTimers.delete(k);
-      retryCounts.set(k, (retryCounts.get(k) ?? 0) + 1);
+      const attempts = (retryCounts.get(k) ?? 0) + 1;
+      retryCounts.set(k, attempts);
       if (delivered.has(k) || !pending.has(k)) {
         clearReconcileRetry(k);
         return;
       }
       const row = await reconcileKey(promptId, fetchHistory, isVideo);
-      if (row && row.retriable) scheduleReconcileRetry(promptId, fetchHistory, isVideo);
-      else clearReconcileRetry(k);
+      if (!row || !row.retriable) {
+        clearReconcileRetry(k); // resolved (terminal / delivered)
+        return;
+      }
+      if (attempts >= maxReconcileRetries) {
+        // Budget exhausted this episode without a terminal outcome.
+        if (row.status === "unknown") giveUpReconcile(promptId); // absent ⇒ evict
+        else clearReconcileRetry(k); // still "running" ⇒ leave pending, stop polling
+        return;
+      }
+      scheduleReconcileRetry(promptId, fetchHistory, isVideo);
     }, reconcileRetryMs);
     retryTimers.set(k, timer);
   }

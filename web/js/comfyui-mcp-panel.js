@@ -5857,7 +5857,14 @@ const GRAPH_TOOL_EXECUTORS = {
     if (typeof app.queuePrompt !== "function") {
       throw new Error("app.queuePrompt is unavailable on this frontend");
     }
-    const batch = Number(batch_count ?? 1);
+    // Clamp batch_count to a sane range: coerce to a positive integer and cap it,
+    // so an absurd value can't queue thousands of prompts (each of which would
+    // register a #370 recovery-ledger entry) — bounding memory + the ComfyUI queue.
+    const MAX_BATCH = 64;
+    const requestedBatch = Math.floor(Number(batch_count ?? 1));
+    const batch = Number.isFinite(requestedBatch)
+      ? Math.min(Math.max(requestedBatch, 1), MAX_BATCH)
+      : 1;
 
     // "Run to node" = ComfyUI partial execution. The server keeps an OUTPUT node
     // (SaveImage/PreviewImage/SaveVideo/…) as an execution root only when its id
@@ -15087,6 +15094,20 @@ function buildPanel() {
       // transport failure re-pends so the next reconnect/retry re-delivers it.
       else if (!AGENT_MUTED) runCompletion.markUndelivered(promptId);
     },
+    // #370 (P1 memory-leak): the tracker GAVE UP on a prompt whose outcome it
+    // couldn't confirm after the bounded retries (its /history stayed absent —
+    // cancelled/disconnected). It's been evicted from the ledger; surface a
+    // one-time "status unknown, safe to requeue" notice so the agent stops waiting.
+    onReconcileGiveUp: ({ promptId }) => {
+      client.sendFrame({
+        type: "agent_event",
+        kind: "run_error",
+        error:
+          `Render status for prompt ${promptId} could not be confirmed after reconnecting ` +
+          `(no history for it) — it was likely cancelled or interrupted. Safe to requeue.`,
+      });
+      appendSystem(`Render status unknown for prompt ${promptId} — safe to requeue.`);
+    },
   });
   runCompletionRef = runCompletion;
 
@@ -15118,20 +15139,13 @@ function buildPanel() {
           },
           isVideo: isVideoOutput,
         });
-        for (const row of summary) {
-          if (row.status === "unknown") {
-            // History couldn't confirm a terminal outcome — tell the user plainly.
-            // (A scheduled retry may still recover it; this is honest at this
-            // instant.)
-            appendSystem(
-              `Render status unknown after reconnect (prompt ${row.promptId}) — safe to requeue if no result arrives.`,
-            );
-          }
-          // A terminal ERROR is delivered via the tracker's onReconcileError hook
-          // (so a retry-discovered error is surfaced too). success+delivered ⇒ the
-          // completion frame was already sent via onFlush; success-without-batch
-          // and "running" need no message.
-        }
+        // Nothing to surface synchronously from `summary`: a terminal SUCCESS is
+        // delivered via onFlush, a terminal ERROR via the onReconcileError hook, an
+        // "unknown"/"running" schedules a bounded retry, and a definitively
+        // unconfirmable prompt is surfaced ONCE via the onReconcileGiveUp hook when
+        // its retries exhaust (not prematurely here — the retry may still recover
+        // it). `summary` is retained for diagnostics only.
+        void summary;
       } catch (err) {
         console.warn("[cmcp] run reconcile failed:", err);
       } finally {
