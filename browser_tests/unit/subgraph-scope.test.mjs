@@ -111,6 +111,24 @@ test("resolveRailNode: a normal node id is NOT a rail (move_node falls through t
   assert.equal(resolveRailNode(root, SUBGRAPH_INPUT_RAIL_ID), null);
 });
 
+test("#302 collision: a REAL node whose id is -10/-20 WINS over the reserved rail id (rail defers)", () => {
+  const sub = makeSubgraph();
+  const realNode = { id: SUBGRAPH_INPUT_RAIL_ID, type: "Note" };
+  sub.getNodeById = (n) => (Number(n) === SUBGRAPH_INPUT_RAIL_ID ? realNode : null);
+  // -10 now names a real interior node, so resolveRailNode must NOT claim it as a rail
+  // (else move_node would move the input rail instead of that node).
+  assert.equal(
+    resolveRailNode(sub, SUBGRAPH_INPUT_RAIL_ID),
+    null,
+    "a real node with id -10 must win over the input rail",
+  );
+  // -20 has no colliding node ⇒ still resolves to the output rail.
+  assert.equal(resolveRailNode(sub, SUBGRAPH_OUTPUT_RAIL_ID).rail, "output");
+  // The rail's OWN frontend id stays rail-first even when getNodeById is present.
+  sub.inputNode.id = 7;
+  assert.equal(resolveRailNode(sub, 7).rail, "input");
+});
+
 test("railKindFor: reports intent even when the graph has no rails (root-graph error path)", () => {
   assert.equal(railKindFor(SUBGRAPH_INPUT_RAIL_ID), "input");
   assert.equal(railKindFor(SUBGRAPH_OUTPUT_RAIL_ID), "output");

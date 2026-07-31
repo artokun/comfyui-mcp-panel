@@ -60,10 +60,22 @@ export function resolveRailNode(graph, ref) {
   }
   const num = Number(ref);
   if (Number.isFinite(num)) {
-    if (inNode && (Number(inNode.id) === num || num === SUBGRAPH_INPUT_RAIL_ID))
-      return { rail: "input", node: inNode };
-    if (outNode && (Number(outNode.id) === num || num === SUBGRAPH_OUTPUT_RAIL_ID))
-      return { rail: "output", node: outNode };
+    // A REAL node always wins a numeric reference: rail nodes are not in
+    // graph._nodes_by_id, so getNodeById only ever returns an ordinary node. When one
+    // owns this id the ref names that node — even if the id collides with a reserved
+    // rail id (-10/-20) or the rail's own id — so defer (return null) and let move_node
+    // resolve it as a normal node (#302 numeric collision; ComfyUI permits any integer
+    // node id). The `!== inNode/outNode` guard keeps a legit rail move working even if a
+    // build DID surface a rail through getNodeById.
+    const found =
+      typeof graph?.getNodeById === "function" ? graph.getNodeById(num) : null;
+    const collidingNode = found && found !== inNode && found !== outNode ? found : null;
+    if (!collidingNode) {
+      if (inNode && (Number(inNode.id) === num || num === SUBGRAPH_INPUT_RAIL_ID))
+        return { rail: "input", node: inNode };
+      if (outNode && (Number(outNode.id) === num || num === SUBGRAPH_OUTPUT_RAIL_ID))
+        return { rail: "output", node: outNode };
+    }
   }
   return null;
 }

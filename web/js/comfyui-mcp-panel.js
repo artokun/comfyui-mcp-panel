@@ -5281,8 +5281,16 @@ const GRAPH_TOOL_EXECUTORS = {
       };
     }
     // A rail reference at the ROOT graph (rails only exist inside a subgraph) —
-    // give the precise reason instead of a bare "No node with id -10".
-    const intent = railKindFor(node_id);
+    // give the precise reason instead of a bare "No node with id -10". But only
+    // when node_id isn't actually a REAL node: a normal node whose id happens to be
+    // -10/-20 must still move (ComfyUI permits any integer node id), so never let
+    // the reserved-id warning shadow it.
+    const numId = Number(node_id);
+    const realNode =
+      Number.isFinite(numId) && typeof graph.getNodeById === "function"
+        ? graph.getNodeById(numId)
+        : null;
+    const intent = realNode ? null : railKindFor(node_id);
     if (intent && graph === rootGraph) {
       throw new Error(
         `${node_id} is the ${intent} boundary rail, which only exists INSIDE a subgraph — ` +
