@@ -6,6 +6,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.21] - 2026-07-31
+
+### Fixed
+- **Save-As never clobbers or moves the original workflow (#285, #309, #289).** External-path Save-As writes with `overwrite:false` so an existing target returns a clean 409 instead of silently replacing/renaming the source, and the node-def cache is refreshed before `add_node` so a freshly-installed pack's nodes are addable. Live-verified on the rig against real ComfyUI: overwrite-refused → 409, original marker survived intact. (#375)
+- **A run's completion event fires reliably even across a connection drop, and top-level prompt rejections surface (#358, #370).** `graph_run` now surfaces a top-level ComfyUI prompt rejection instead of hanging, and run reconciliation gives up only when the prompt is absent from BOTH `/history` and `/queue` — so a WS blip mid-render can no longer strand a running render or drop its completion. (#425)
+- **`set_widget` fails closed on a removed or unverifiable node type (#458 set_widget gap).** A widget write against a node type that can't be verified via a fresh `/object_info` is now refused rather than fabricating success. (#423)
+- **Promoted subgraph writes update the authoritative parent-rail widget (#366).** A write to a promoted widget syncs the parent rail (the source of truth), not just the inner node. (#383)
+- **Unsaved-workflow tabs get a unique per-instance routing identity so graph edits never misroute (#186).** (#386)
+- Ground unsaved workflows on every agent turn, disk-safely (#432).
+- Live-geometry group membership after node moves (#355) + non-no-op revert (#327). (#431)
+- `panel_update_node` reports a Manager task failure instead of false success (#364). (#382)
+- Author/repo install shorthand, dead-collapse fallback, storyboard input litter. (#424)
+- Consistent subgraph scope tracking + rail-id move + boundary cleanup + read/edit scope lockstep (#308, #302, #234, #220). (#373)
+
+
 ## [0.11.20] - 2026-07-30
 
 ### Fixed
