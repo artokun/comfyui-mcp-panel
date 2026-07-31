@@ -144,7 +144,7 @@ import {
   refreshNodeArea,
 } from "./lib/group-geometry.js";
 import { pickRevertSnapshot } from "./lib/graph-revert.js";
-import { saveActiveWorkflow } from "./lib/workflow-save.js";
+import { saveActiveWorkflow, needsGrounding, shouldGroundBeforeTurn, groundingIsSafe } from "./lib/workflow-save.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
 import {
@@ -2572,7 +2572,11 @@ async function workflowExistsOnDisk(rawPath) {
 async function groundUnsavedWorkflow() {
   try {
     const wf = app?.extensionManager?.workflow?.activeWorkflow;
-    if (!wf || (wf.isPersisted !== false && wf.isTemporary !== true)) return null;
+    if (!needsGrounding(wf)) return null;
+    // #330: per-turn grounding must NOT overwrite a real on-disk file whose
+    // temporary flag merely drifted (#215/#226). Only save when the source is
+    // provably never-persisted, confirmed against the disk oracle.
+    if (!(await groundingIsSafe(wf, workflowExistsOnDisk))) return null;
     return await programmaticSave();
   } catch {
     return null; // best-effort — never block the chat on a save hiccup
@@ -17005,9 +17009,13 @@ function buildPanel() {
         `Load Video/file node or pass the path to the comfyui tools):\n${lines}]`;
     }
 
-    // Ground a brand-new chat: if the open workflow was never saved, save it
-    // first so the agent works from a real file (Ctrl+S / reload behave).
-    if (freshChat) {
+    // Ground an unsaved workflow before EVERY turn (#330) — NOT only a brand-new
+    // chat. Continuing an existing chat inside an unsaved tab still leaves the
+    // user's edits unprotected until they hit disk, so save first so the agent
+    // works from a real file (Ctrl+S / reload behave). groundUnsavedWorkflow is
+    // idempotent (a no-op once persisted); shouldGroundBeforeTurn ignores chat
+    // freshness so a per-turn continuation is protected too.
+    if (shouldGroundBeforeTurn(app?.extensionManager?.workflow?.activeWorkflow, { freshChat })) {
       const saved = await groundUnsavedWorkflow();
       if (saved) appendSystem(`Saved your workflow as “${saved}” — grounded base for the agent.`);
     }

@@ -47,6 +47,54 @@ export function isDefaultWorkflowName(name) {
   return !n || /^Unsaved Workflow\b/i.test(n) || /^Untitled\b/.test(n);
 }
 
+/** True when the active workflow has never been persisted to disk (a temporary /
+ *  unsaved tab), so grounding must save it. Mirrors saveActiveWorkflow's
+ *  `wasUnsaved` (isTemporary === true || isPersisted === false). */
+export function needsGrounding(wf) {
+  return !!wf && (wf.isPersisted === false || wf.isTemporary === true);
+}
+
+/** #330 — decide whether to ground (auto-save) the active workflow BEFORE an agent
+ *  turn. Grounding must run on EVERY turn that targets an unsaved tab, not only a
+ *  brand-new chat: continuing an existing chat inside an unsaved tab still leaves
+ *  the user's edits unprotected until they hit disk. `freshChat` is accepted (the
+ *  call site has it) but is DELIBERATELY NOT a factor — a future change that
+ *  reintroduces a fresh-chat-only gate would flip this contract and fail its test. */
+export function shouldGroundBeforeTurn(wf, { freshChat } = {}) {
+  void freshChat; // intentionally ignored — grounding is per-turn, see #330
+  return needsGrounding(wf);
+}
+
+/** #330 safety gate: is a per-turn grounding SAVE actually safe to perform?
+ *
+ *  needsGrounding() trusts the in-memory `isTemporary`/`isPersisted` flags, but
+ *  `isTemporary` DRIFTS true for a workflow already on disk after an open-ack race
+ *  (#215/#226). Grounding once per fresh chat made that a rare edge; grounding on
+ *  EVERY turn (#330) would repeatedly reach saveActiveWorkflow's in-place branch and
+ *  overwrite a REAL file with the current (possibly mid-load) canvas. So authorize a
+ *  per-turn save only when the source is PROVABLY never-persisted — mirroring
+ *  classifySource's tri-state proof — via an async disk oracle
+ *  `existsOnDisk(rawPath) => true | false | null`:
+ *    - isPersisted === true              → false (genuinely saved; never auto-ground)
+ *    - no backing path                   → true  (brand-new tab, nothing to lose)
+ *    - oracle proves ABSENT (404)        → true
+ *    - oracle proves PRESENT / unknown   → false (fail safe — the user can Ctrl+S)
+ *  With no usable oracle we can prove nothing → false (refuse), never a blind save. */
+export async function groundingIsSafe(wf, existsOnDisk) {
+  if (!wf) return false;
+  if (wf.isPersisted === true) return false;
+  const raw = wf.path;
+  if (!raw) return true; // no path at all ⇒ nothing on disk to lose
+  if (typeof existsOnDisk !== "function") return false; // cannot prove ⇒ refuse
+  let exists = null;
+  try {
+    exists = await existsOnDisk(raw);
+  } catch {
+    exists = null; // probe failed ⇒ unknown ⇒ refuse
+  }
+  return exists === false; // ONLY a proven absence authorizes the save
+}
+
 /** Save the active workflow through ComfyUI's workflow service — NO dialog.
  *
  *  Behaviour:
