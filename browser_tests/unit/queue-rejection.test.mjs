@@ -159,3 +159,19 @@ test("a NUMERIC prompt_id is normalized to a string at ingestion (#370)", () => 
   assert.strictEqual(c.prompt_id, "p1");
   assert.equal(c.prompt_ids, undefined);
 });
+
+test("a FALSY-but-valid prompt_id 0 is accepted and normalized to '0' (#370 falsy-0 gotcha)", () => {
+  const r = buildQueueAcceptResult({ batchCount: 1, promptIds: [0] });
+  assert.strictEqual(r.prompt_id, "0"); // NOT dropped, NOT the number 0
+  const b = buildQueueAcceptResult({ batchCount: 2, promptIds: [0, 1] });
+  assert.strictEqual(b.prompt_id, "0");
+  assert.deepEqual(b.prompt_ids, ["0", "1"]);
+});
+
+test("mixed-representation ids (0 and '0') dedupe to one after normalization (#370)", () => {
+  const r = buildQueueAcceptResult({ batchCount: 2, promptIds: [0, "0"] });
+  assert.strictEqual(r.prompt_id, "0");
+  assert.equal(r.prompt_ids, undefined, "0 and '0' are the SAME run — deduped to a single id");
+  const b = buildQueueAcceptResult({ batchCount: 3, promptIds: [7, "7", 8] });
+  assert.deepEqual(b.prompt_ids, ["7", "8"]);
+});

@@ -79,9 +79,12 @@ export function buildQueueAcceptResult({ batchCount, promptIds = [], ranToNode =
   // NORMALIZE to strings at this ingestion boundary (drop null/undefined) so the
   // reported prompt_id(s), and everything that later reconciles against them, are
   // string-vs-string — a numeric /prompt id can't slip through as a number (#370).
-  const ids = (Array.isArray(promptIds) ? promptIds : [])
-    .filter((x) => x != null)
-    .map((x) => String(x));
+  // Dedupe AFTER normalization (via Set) so a mixed 0 / "0" batch reports one id.
+  const ids = [
+    ...new Set(
+      (Array.isArray(promptIds) ? promptIds : []).filter((x) => x != null).map((x) => String(x)),
+    ),
+  ];
   return {
     queued: true,
     batch_count: batchCount,

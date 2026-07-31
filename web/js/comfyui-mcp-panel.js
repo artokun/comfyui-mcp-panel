@@ -5937,10 +5937,16 @@ const GRAPH_TOOL_EXECUTORS = {
               if (promptRejection == null && body && (body.error || body.node_errors)) {
                 promptRejection = { error: body.error ?? null, node_errors: body.node_errors ?? null };
               }
-            } else if (body && body.prompt_id && !queuedPromptIds.includes(body.prompt_id)) {
+            } else if (body && body.prompt_id != null) {
               // Accepted — remember EACH prompt_id so #370 reconcile can recover a
-              // run that starts AND finishes entirely inside a connection drop.
-              queuedPromptIds.push(body.prompt_id);
+              // run that starts AND finishes entirely inside a connection drop. Use a
+              // NULLISH presence check (!= null), NOT truthiness — a falsy-but-valid
+              // id like 0 must flow through ingestion, or a drop before lifecycle
+              // frames would lose the completion (#370). Normalize to a STRING AT
+              // CAPTURE so dedupe is canonical (0 and "0" are the same run) and
+              // everything downstream stays string-vs-string.
+              const pid = String(body.prompt_id);
+              if (!queuedPromptIds.includes(pid)) queuedPromptIds.push(pid);
             }
           }
         } catch {

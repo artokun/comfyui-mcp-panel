@@ -827,6 +827,49 @@ test("#370 P1 (codex): a /queue with ONLY TRUNCATED rows is uncertain → NOT gi
   assert.ok(flushes.find((f) => f.promptId === "R"), "output delivered, not dropped");
 });
 
+test("#370 P1 (codex): a FALSY prompt_id 0 is tracked as '0' — onQueued fires, drop→reconcile checks /queue+/history, delivers", async () => {
+  const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 0 });
+  const { tracker, flushes, giveUps } = h;
+  // The whole point of the falsy-0 sweep: onQueued(0) MUST register (a truthiness
+  // guard would skip it, leaving no "0" pending key so a drop loses the completion).
+  tracker.onQueued(0);
+  assert.equal(tracker._pending.has("0"), true, "0 tracked under the normalized string key '0'");
+
+  let queueChecked = false;
+  let historyChecked = false;
+  const fetchHistory = async (id) => {
+    historyChecked = true;
+    assert.equal(id, "0", "reconcile queries /history for the string '0'");
+    return null; // clean-absent (queued/running, not yet in history)
+  };
+  const fetchQueued = async (id) => {
+    queueChecked = true;
+    assert.equal(id, "0", "reconcile queries /queue for the string '0'");
+    return queueMembership({ queue_running: [[0, "0", {}, {}, []]], queue_pending: [] }, id); // present ⇒ true
+  };
+  const summary = await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
+  assert.ok(historyChecked && queueChecked, "a drop→reconcile checks BOTH /history and /queue for 0");
+  assert.deepEqual(summary, [{ promptId: "0", status: "running" }], "0 is present in /queue ⇒ running");
+  assert.equal(giveUps.length, 0, "0 is never given up (it's a real, present render)");
+
+  // And its later live output delivers under the normalized string id.
+  tracker.onExecutionStart(0);
+  tracker.onExecuted(0, { images: [{ filename: "0.png", type: "output" }] });
+  tracker.onExecutionSuccess(0);
+  const f = flushes.find((x) => x.promptId === "0");
+  assert.ok(f, "completion for id 0 delivered under '0'");
+  assert.equal(f.promptId, "0");
+});
+
+test("#370 the id-less (null/undefined) path is STILL excluded from the recovery ledger", () => {
+  const { tracker } = makeHarness();
+  tracker.onQueued(null);
+  tracker.onQueued(undefined);
+  assert.equal(tracker._pending.size, 0, "null/undefined ids are never tracked (NO_PROMPT_KEY, excluded)");
+  assert.equal(tracker._pending.has("null"), false);
+  assert.equal(tracker._pending.has("undefined"), false);
+});
+
 test("#370 P1 (codex): a NUMERIC prompt_id is normalized to a string at ingestion — matches a string /queue row, not dropped", async () => {
   const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 0 });
   const { tracker, flushes, giveUps } = h;
