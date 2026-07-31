@@ -3,18 +3,28 @@
 // RIGHT value and can be unit-tested by driving the SAME code path the handler
 // runs (applyWidgetWrite), not a parallel reimplementation.
 //
-// Two graph-integrity bugs motivate this module:
+// Three graph-integrity bugs motivate this module:
 //   #233 — panel_set_widget on a SUBGRAPH node's PROMOTED widget wrote by a
 //          positionally-shifted slot and silently corrupted a DIFFERENT inner
 //          widget (an INT slot ended up holding "euler"), reporting success.
 //   #240 — a COMBO widget set to a valid enum silently drifted to a different
 //          option (index-vs-value reinterpretation).
+//   #366 — a PROMOTED widget write landed on the INNER node only; the parent's
+//          own rail widget (what serializes at queue time) stayed stale, so the
+//          render used the OLD value while the tool reported success (silent
+//          wrong output).
 //
-// Safety contract (both bugs are silent corruption; we NEVER fail open):
+// Safety contract (all three bugs are silent corruption; we NEVER fail open):
 //   * A promoted widget resolves to its ACTUAL inner (node, widget) and the
 //     write lands THERE. If it looks promoted but cannot be resolved
 //     unambiguously, we THROW before mutating — never fall back to the shifted
 //     parent slot.
+//   * A promoted write also writes the AUTHORITATIVE parent rail widget —
+//     identified by the promotion RELATIONSHIP (host-input↔widget backlink), never
+//     a name/label guess — ATOMICALLY with the inner write (one undo; rollback +
+//     throw on any callback failure, so never inner=new/parent=stale). If the
+//     parent rail widget cannot be positively identified, we FAIL CLOSED (throw)
+//     rather than write inner-only and render silently stale (#366).
 //   * The value is validated against the target widget's declared type and
 //     REJECTED on mismatch (combo must be an exact CURRENT option; numeric must
 //     be numeric; boolean must be boolean; a combo whose options we cannot read
@@ -86,7 +96,7 @@ export function isCompositeObjectWidget(widget) {
  * WidgetWriteError (never silently coerces to a wrong value) when the value is
  * incompatible with the widget's declared type.
  */
-export function coerceWidgetValue(widget, value) {
+export function coerceWidgetValue(widget, value, mergeBaseWidget = widget) {
   const name = widget?.name ?? "(widget)";
 
   // #347: distinguish "clear to empty" from "missing value". An EXPLICIT empty
@@ -182,7 +192,16 @@ export function coerceWidgetValue(widget, value) {
           `{"on":true,"lora":"name.safetensors","strength":1}.`,
       );
     }
-    return { ...widget.value, ...incoming };
+    // #366×#179: for a PROMOTED composite, the AUTHORITATIVE base is the RAIL
+    // widget's current object (what serializes), not the inner widget's — merging
+    // onto a stale inner would clobber the rail's unspecified fields when the same
+    // coerced value is written to both. Prefer the rail's object; fall back to the
+    // target widget's own value when the rail base isn't a usable object.
+    const base =
+      mergeBaseWidget && mergeBaseWidget.value != null && typeof mergeBaseWidget.value === "object" && !Array.isArray(mergeBaseWidget.value)
+        ? mergeBaseWidget.value
+        : widget.value;
+    return { ...base, ...incoming };
   }
 
   // STRING / text / unknown widget: pass through unchanged (an explicit "" clears
@@ -191,8 +210,52 @@ export function coerceWidgetValue(widget, value) {
 }
 
 /**
+ * The parent SubgraphNode's OWN projected promoted widget that is backed by
+ * `hostInput` — i.e. the widget whose value serializes into the subgraph input
+ * rail at queue time (#366).
+ *
+ * Authenticated by OBJECT IDENTITY, never by a name/label lookup. In the ComfyUI
+ * frontend the host input slot stores only a `{ name }` STUB in `input.widget`;
+ * the real authoritative rail widget is the PROJECTION object litegraph builds for
+ * the slot (`input._widget`), whose get/set `value` proxies the subgraph widget
+ * value STORE that is serialized at queue time. `getWidgetFromSlot()` returns that
+ * projection when present but otherwise FALLS BACK to a name-based lookup — and a
+ * name match (even a unique one) could select an unrelated decoy own-widget while
+ * no authenticated rail object exists. So we accept ONLY a candidate that is an
+ * actual widget OBJECT AND is `===` a live member of `node.widgets`, and otherwise
+ * FAIL CLOSED (return null) — never write inner or parent on a name-only stub.
+ */
+export function resolveHostPromotedWidget(subgraphNode, hostInput) {
+  if (!subgraphNode || !hostInput) return null;
+
+  // EXTERNALLY-LINKED host input ⇒ the local projected widget is NOT authoritative.
+  // When the host input carries an outer link, ComfyUI's queue compiler IGNORES
+  // this node's projected widget and recursively follows the OUTER source (the
+  // enclosing subgraph's rail); ComfyUI's own promoted-widget control treats
+  // `input.link != null` as "host store is non-authoritative". Writing the local
+  // widget here would pass verification yet render the enclosing rail's OLD value —
+  // a false success. Refuse (→ caller FAILS CLOSED); the widget must be edited from
+  // the OUTERMOST subgraph node, where its host input has no outer link.
+  if (hostInput.link != null) return null;
+
+  const inWidgets = Array.isArray(subgraphNode.widgets) ? subgraphNode.widgets : [];
+
+  // OBJECT-IDENTITY authentication. The rail widget must be the actual projection
+  // object the host input LINKS to (`_widget`, or an `input.widget` that is itself a
+  // real widget object — NOT a `{ name }` stub) AND must be `===` a live member of
+  // this node's projected widgets. A name-only stub is an object too, but it is NOT
+  // a member of node.widgets, so it is rejected → FAIL CLOSED. This never resolves by
+  // name, so an unrelated same-named decoy can never be selected (#233/#366).
+  for (const cand of [hostInput._widget, hostInput.widget]) {
+    if (cand && typeof cand === "object" && inWidgets.includes(cand)) return cand;
+  }
+  return null;
+}
+
+/**
  * Classify a widget request on `subgraphNode` against `widgetName` and, when it
- * is a PROMOTED subgraph widget, resolve it to the ACTUAL inner (node, widget).
+ * is a PROMOTED subgraph widget, resolve it to the ACTUAL inner (node, widget)
+ * AND the authoritative parent rail widget (via the promotion relationship).
  *
  * Detection matches ONLY the OUTER alias the caller sees on the parent
  * (host-input name/label and the backing subgraph-input name/label) — never the
@@ -205,9 +268,10 @@ export function coerceWidgetValue(widget, value) {
  *
  * Returns a status object — the caller MUST honour it and never fall back to
  * the parent slot when `promoted` is true but `target` is null:
- *   { promoted: false }                             → not a promoted widget
- *   { promoted: true, target: {node,widget,input} } → resolved inner target
- *   { promoted: true, target: null, error }         → promoted but UNRESOLVABLE/ambiguous
+ *   { promoted: false }                                          → not a promoted widget
+ *   { promoted: true, target: {node,widget,input,parentWidget} } → resolved inner target
+ *                                                                  (parentWidget may be null)
+ *   { promoted: true, target: null, error }                      → promoted but UNRESOLVABLE/ambiguous
  */
 export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSource) {
   const subgraph = subgraphNode?.subgraph;
@@ -227,6 +291,10 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
       subgraphInput?.name,
       subgraphInput?.label,
     ].map((a) => (a == null ? null : String(a).toLowerCase()));
+    // Labels are used ONLY to DETECT which promotion the caller meant (a caller
+    // may address by a renamed promotion's display label). Locating the parent's
+    // authoritative rail widget is done LATER by the promotion RELATIONSHIP
+    // (host-input → backing widget), never by a name match (#366/#233).
     if (aliases.includes(wanted)) matches.push({ input, subgraphInput });
   }
 
@@ -284,7 +352,14 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
       error: `promoted widget "${widgetName}" links to missing inner widget "${source.sourceWidgetName}" on node ${source.sourceNodeId}.`,
     };
   }
-  return { promoted: true, target: { node: innerNode, widget: innerWidget, input } };
+  // AUTHENTICATE the parent's own rail widget by the PROMOTION RELATIONSHIP — the
+  // host-input's backing widget — not by any name/label match. This is the widget
+  // that serializes into the subgraph input rail at queue time (#366). May be null
+  // (e.g. the widget is further promoted OUTWARD to an enclosing subgraph and is
+  // exposed here as an input with no settable widget); the caller FAILS CLOSED on
+  // null rather than write inner-only and render silently stale.
+  const parentWidget = resolveHostPromotedWidget(subgraphNode, input);
+  return { promoted: true, target: { node: innerNode, widget: innerWidget, input, parentWidget } };
 }
 
 /**
@@ -297,6 +372,8 @@ export function resolveWidgetWrite(node, widgetName, value, resolveSource, asser
   let targetNode = node;
   let widget = null;
   let promotedFrom = null;
+  let promotedParentWidget = null;
+  let promotedHostInput = null;
 
   if (node?.subgraph) {
     const res = resolvePromotedInnerTarget(node, widgetName, resolveSource);
@@ -312,6 +389,28 @@ export function resolveWidgetWrite(node, widgetName, value, resolveSource, asser
       targetNode = res.target.node;
       widget = res.target.widget;
       promotedFrom = { subgraph_node_id: node.id, inner_node_id: res.target.node.id };
+      promotedHostInput = res.target.input;
+      // The AUTHORITATIVE parent rail widget (backed by the host input via the
+      // promotion relationship). Null ⇒ FAIL CLOSED right here — BEFORE the
+      // assertTargetWritable gate and BEFORE any (potentially side-effecting)
+      // coercion. coerceWidgetValue may INVOKE a dynamic combo's
+      // `options.values(widget)` callback which can mutate the inner widget; if we
+      // refused only after coercion, a missing/linked/ambiguous rail could leave an
+      // uncaptured inner mutation. Refusing first guarantees a promoted write with
+      // no authoritative rail performs NO side effect at all (#366).
+      promotedParentWidget = res.target.parentWidget ?? null;
+      if (!promotedParentWidget) {
+        throw new WidgetWriteError(
+          `promoted widget "${widgetName}" on subgraph node ${node.id} resolves to an inner ` +
+            `widget, but its AUTHORITATIVE parent rail widget could not be identified (the value ` +
+            `that serializes at queue time). This happens when the widget is further promoted to ` +
+            `an enclosing subgraph (fed by an outer link / exposed as an input, not a settable ` +
+            `widget), the promotion metadata is malformed, or its name is duplicated. Refusing to ` +
+            `write the inner widget alone, which would silently render the OLD value (#366). Edit ` +
+            `this widget from the outermost subgraph node, or disconnect the inner input to make ` +
+            `the inner value authoritative.`,
+        );
+      }
     }
   }
 
@@ -334,8 +433,14 @@ export function resolveWidgetWrite(node, widgetName, value, resolveSource, asser
   // injects a registry check; it throws to refuse.
   assertTargetWritable?.(targetNode, widget);
 
-  const coerced = coerceWidgetValue(widget, value);
-  return { targetNode, widget, coerced, promotedFrom };
+  // For a promoted COMPOSITE write, merge onto the AUTHORITATIVE rail widget's
+  // current object (#366×#179) so its unspecified fields are preserved; scalars are
+  // unaffected (they don't merge). Non-promoted writes merge onto their own value.
+  // (A promoted write with no authoritative rail already threw above, BEFORE this
+  // possibly side-effecting coercion — so `promotedParentWidget` is non-null here.)
+  const coerced = coerceWidgetValue(widget, value, promotedParentWidget ?? widget);
+
+  return { targetNode, widget, coerced, promotedFrom, promotedParentWidget, promotedHostInput };
 }
 
 /**
@@ -354,13 +459,17 @@ export function applyWidgetWrite(
   // promoted node for a subgraph write, or the node's own) BEFORE it coerces the
   // value, so no coercion callback and no mutation can touch an unregistered
   // placeholder that is about to be refused (#458).
-  const { targetNode, widget: w, coerced, promotedFrom } = resolveWidgetWrite(
-    node,
-    widgetName,
-    value,
-    resolveSource,
-    assertTargetWritable,
-  );
+  const { targetNode, widget: w, coerced, promotedFrom, promotedParentWidget, promotedHostInput } =
+    resolveWidgetWrite(node, widgetName, value, resolveSource, assertTargetWritable);
+
+  // #366: for a promoted subgraph widget the AUTHORITATIVE value lives on the
+  // parent's OWN rail widget (resolved by the promotion RELATIONSHIP in
+  // resolveWidgetWrite, which already FAILED CLOSED if it could not be identified).
+  // We now write BOTH the inner widget AND the parent rail widget ATOMICALLY inside
+  // one undo envelope: either both land, or neither does and we throw — a thrown
+  // callback on EITHER side must never leave inner=new / parent=stale (a silent
+  // partial write that renders the OLD value while reporting success).
+  const parentWidget = promotedFrom ? promotedParentWidget : null;
 
   // Snapshot the EXPECTED value BEFORE the callback runs. For a COMPOSITE object
   // write (#179) `w.value` and `coerced` are the SAME reference, so a callback
@@ -370,44 +479,236 @@ export function applyWidgetWrite(
   const objectWrite = coerced !== null && typeof coerced === "object";
   const expected = objectWrite ? JSON.parse(JSON.stringify(coerced)) : coerced;
 
-  beforeChange?.();
+  const matchesExpected = (actual) =>
+    objectWrite
+      ? actual !== null &&
+        typeof actual === "object" &&
+        Object.keys(expected).every((k) => JSON.stringify(actual[k]) === JSON.stringify(expected[k]))
+      : actual === expected;
+
+  // Snapshot the PRIOR values AND deep clones of them. Rollback restores the prior
+  // OBJECT REFERENCE (`previous`), but a subsequent afterChange hook could mutate
+  // that object IN PLACE (e.g. `inner.value.strength = …`), so an identity compare
+  // (Object.is) would pass while the restored object holds corrupted fields. We
+  // verify rollback STRUCTURALLY against the pre-mutation deep clone instead.
   const previous = w.value;
+  const previousParent = parentWidget ? parentWidget.value : undefined;
+  const deepClone = (v) => (v !== null && typeof v === "object" ? JSON.parse(JSON.stringify(v)) : v);
+  const structurallyEqual = (a, b) =>
+    (a !== null && typeof a === "object") || (b !== null && typeof b === "object")
+      ? JSON.stringify(a) === JSON.stringify(b)
+      : Object.is(a, b);
+  const previousClone = deepClone(previous);
+  const previousParentClone = parentWidget ? deepClone(previousParent) : undefined;
+  // The ACTUAL serialization binding for an unlinked subgraph input is its
+  // `widgetId` (the widget-value STORE key that queue compilation reads). A callback
+  // could keep the SAME host input and projection objects but re-point `widgetId` to
+  // another store entry holding the OLD value — passing every object-identity check
+  // while the render reads the stale entry. Snapshot it so the recheck can detect a
+  // swap (#366).
+  const promotedHostWidgetId = promotedHostInput ? promotedHostInput.widgetId : undefined;
+
+  // The undo hooks are BOOKKEEPING (litegraph history). Invoke them exception-SAFE
+  // so a throwing hook can never bypass our verification/rollback and leave a silent
+  // partial write; a stateful hook that mutates values is still caught because ALL
+  // verification runs AFTER the hook fires.
+  const safeBefore = () => {
+    try {
+      beforeChange?.();
+    } catch {
+      /* history hook is best-effort */
+    }
+  };
+  const safeAfter = () => {
+    try {
+      afterChange?.();
+    } catch {
+      /* history hook is best-effort */
+    }
+  };
+
+  // Perform the write + callbacks inside ONE undo envelope. A thrown callback is
+  // CAPTURED (not rethrown here) so that VERIFICATION runs AFTER afterChange has
+  // fired its hooks: an afterChange hook can itself re-stale a widget or change the
+  // promotion topology, and that must be caught too (not just callback-time drift).
+  let threw = null;
+  safeBefore();
   try {
+    // Assign BOTH values first. The parent's projected promoted widget is a VIEW of
+    // the inner widget; its own callback typically FORWARDS to the inner one, so we
+    // fire the SEMANTIC widget callback exactly ONCE (the inner target's), NOT the
+    // rail's — otherwise a forwarding view would double-invoke the side effect. The
+    // rail's value serializes directly from `parentWidget.value`, which we set here,
+    // so it needs no callback of its own.
     w.value = coerced;
-    // Fire the widget's own callback so combo/number side effects run — the
-    // same path a manual UI edit takes.
+    if (parentWidget) parentWidget.value = coerced;
+    // Fire the inner widget's own callback so combo/number side effects run — the
+    // same single invocation a manual UI edit of the promoted control performs.
     w.callback?.(coerced, canvas, targetNode, targetNode.pos, undefined);
+  } catch (err) {
+    threw = err;
   } finally {
-    afterChange?.();
+    safeAfter();
   }
+
+  // VERIFY AFTER afterChange. Compute the failure reason (if any) WITHOUT mutating,
+  // so rollback happens in its own envelope below. Order: a thrown callback; then a
+  // value that did not stick on the inner (#240) or the authoritative rail (#366);
+  // then a promotion-relationship change (re-resolved from the LIVE graph, catching
+  // an outer link, a replaced/detached host input, or a re-pointed slot→widget map).
+  let failure = null;
+  let originalErr = null;
+  let driftFailure = false;
+  if (threw) {
+    originalErr = threw instanceof WidgetWriteError ? threw : null;
+    failure =
+      threw instanceof WidgetWriteError
+        ? threw.message
+        : `a widget callback threw (${threw?.message ?? threw})`;
+  } else if (!matchesExpected(w.value)) {
+    failure =
+      `Widget "${w.name}" on node ${targetNode.id} (${targetNode.type}) did not retain the ` +
+      `requested value: wrote ${JSON.stringify(expected)} but it became ${JSON.stringify(w.value)}.`;
+  } else if (parentWidget && !matchesExpected(parentWidget.value)) {
+    failure =
+      `Promoted rail widget "${parentWidget.name}" on subgraph node ${node.id} did not retain ` +
+      `the requested value: wrote ${JSON.stringify(expected)} but it became ` +
+      `${JSON.stringify(parentWidget.value)}. Refusing to report success with a stale rail that ` +
+      `would render the OLD value (#366).`;
+  } else if (parentWidget) {
+    // RE-RESOLVE the promotion from the LIVE graph. This is wrapped so that ANY
+    // exception thrown DURING the recheck (e.g. a callback replaced `_subgraphSlot`
+    // and the injected resolveSource now THROWS for the replacement) is treated as a
+    // topology change and drives the FULL rollback below — a recheck throw must NEVER
+    // escape with inner/rail left mutated.
+    let recheck = null;
+    let recheckThrew = false;
+    try {
+      recheck = resolvePromotedInnerTarget(node, widgetName, resolveSource);
+    } catch {
+      recheckThrew = true;
+    }
+    const drifted =
+      recheckThrew ||
+      !recheck ||
+      !recheck.promoted ||
+      !recheck.target ||
+      recheck.target.input !== promotedHostInput ||
+      recheck.target.widget !== w ||
+      recheck.target.parentWidget !== parentWidget ||
+      // The host input's serialization binding (`widgetId`, the store key queue
+      // compilation reads) must be UNCHANGED — a swap re-points serialization to a
+      // different store entry even though the input/projection objects are identical.
+      !Object.is(promotedHostInput ? promotedHostInput.widgetId : undefined, promotedHostWidgetId);
+    if (drifted) {
+      driftFailure = true;
+      failure =
+        `Promotion of "${w.name}" on subgraph node ${node.id} CHANGED during the write (a widget ` +
+        `or afterChange hook altered the host input, its link, or the slot→widget mapping${
+          recheckThrew ? "; re-resolving the promotion threw" : ""
+        }), so the rail that was synced is no longer the value that serializes at queue time. Rolled ` +
+        `back to avoid a silently-stale render (#366).`;
+    }
+  }
+
+  if (failure) {
+    // ROLL BACK in its OWN (exception-safe) undo envelope. The restore assignments
+    // are each guarded, then we READ BACK the FINAL values AFTER the envelope closes
+    // — so a setter that throws OR silently ignores the restore, AND a stateful
+    // afterChange hook that re-stales the restored value, are ALL detected. `w.value`
+    // is a plain data property on real widgets so this normally succeeds; when it
+    // does not, we report an HONEST partial-state failure rather than falsely claim
+    // a clean rollback.
+    safeBefore();
+    try {
+      // Restore the serialization BINDING first (the store key queue compilation
+      // reads), so restoring the rail value below lands on the entry that actually
+      // serializes — a callback may have re-pointed it to a different store entry.
+      if (promotedHostInput) {
+        try {
+          promotedHostInput.widgetId = promotedHostWidgetId;
+        } catch {
+          /* restore best-effort; read-back below is authoritative */
+        }
+      }
+      try {
+        w.value = previous;
+      } catch {
+        /* restore best-effort; read-back below is authoritative */
+      }
+      if (parentWidget) {
+        try {
+          parentWidget.value = previousParent;
+        } catch {
+          /* restore best-effort; read-back below is authoritative */
+        }
+      }
+    } finally {
+      safeAfter();
+    }
+    // Authoritative read-back AFTER the rollback envelope, compared STRUCTURALLY
+    // against the pre-mutation deep clones — so a setter that throws or silently
+    // ignores the restore, AND a stateful afterChange hook that mutates the restored
+    // object IN PLACE (which an identity compare would miss), are ALL detected.
+    let rollbackFailed = null;
+    if (!structurallyEqual(w.value, previousClone)) rollbackFailed = `inner "${w.name}"`;
+    if (parentWidget && !structurallyEqual(parentWidget.value, previousParentClone)) {
+      rollbackFailed = rollbackFailed
+        ? `${rollbackFailed} and rail "${parentWidget.name}"`
+        : `rail "${parentWidget.name}"`;
+    }
+    // The serialization binding must be back to its original store key, else queue
+    // compilation still reads whatever entry a callback re-pointed it to.
+    if (promotedHostInput && !Object.is(promotedHostInput.widgetId, promotedHostWidgetId)) {
+      rollbackFailed = rollbackFailed
+        ? `${rollbackFailed} and the serialization binding (widgetId)`
+        : `the serialization binding (widgetId)`;
+    }
+    // On a TOPOLOGY DRIFT, the captured `parentWidget` we just restored may be
+    // DETACHED — a callback could have swapped in a DIFFERENT live authoritative
+    // rail. Restoring the old rail does not touch that replacement, so if the LIVE
+    // promotion now resolves to a different rail that holds the just-written value,
+    // the serialized value is NOT what our rollback restored: report a PARTIAL STATE
+    // rather than falsely claim a clean rollback.
+    if (driftFailure) {
+      let liveRail = null;
+      try {
+        const live = resolvePromotedInnerTarget(node, widgetName, resolveSource);
+        liveRail = live && live.target ? live.target.parentWidget : null;
+      } catch {
+        liveRail = null;
+      }
+      if (liveRail && liveRail !== parentWidget && structurallyEqual(liveRail.value, expected)) {
+        rollbackFailed = rollbackFailed
+          ? `${rollbackFailed} and a live replacement rail "${liveRail.name}"`
+          : `a live replacement rail "${liveRail.name}"`;
+      }
+    }
+    setDirty?.();
+    if (rollbackFailed) {
+      throw new WidgetWriteError(
+        `Widget "${w.name}" on node ${targetNode.id} (${targetNode.type}) write failed: ${failure} ` +
+          `Rollback of ${rollbackFailed} did not take effect (a value setter or history hook ` +
+          `rejected/overrode it) — the graph may be in a partial state; re-set the widget or undo.`,
+      );
+    }
+    // Rollback succeeded: preserve the original WidgetWriteError message where there
+    // was one, else throw the computed failure.
+    if (originalErr) throw originalErr;
+    throw new WidgetWriteError(failure);
+  }
+
   setDirty?.();
 
-  // Verify the write stuck. A combo callback that reinterprets an index can
-  // drift a SCALAR value silently — fail rather than report a false success, by
-  // strict identity (#240). For a COMPOSITE object value (#179) the callback may
-  // clone/normalize the object, so strict identity would false-fail; require
-  // instead that every field we set is present with the value we wrote, compared
-  // against the pre-callback snapshot so an in-place drift is still caught.
-  const stuck = objectWrite
-    ? w.value !== null &&
-      typeof w.value === "object" &&
-      Object.keys(expected).every(
-        (k) => JSON.stringify(w.value[k]) === JSON.stringify(expected[k]),
-      )
-    : w.value === expected;
-  if (!stuck) {
-    throw new WidgetWriteError(
-      `Widget "${w.name}" on node ${targetNode.id} (${targetNode.type}) did not ` +
-        `retain the requested value: wrote ${JSON.stringify(expected)} but it ` +
-        `became ${JSON.stringify(w.value)}.`,
-    );
-  }
-
+  // On success, a promoted write has ALWAYS synced the authoritative parent rail
+  // widget (verified AFTER afterChange, or it would have rolled back + thrown).
+  // parent_widget_synced is reported for observability / defense-in-depth in the
+  // panel summary.
   return {
     node_id: targetNode.id,
     widget: w.name,
     previous,
     value: w.value,
-    ...(promotedFrom ? { promoted_from: promotedFrom } : {}),
+    ...(promotedFrom ? { promoted_from: { ...promotedFrom, parent_widget_synced: parentWidget != null } } : {}),
   };
 }
