@@ -303,9 +303,13 @@ test("stuck-check fails when a widget callback drifts the value (#240)", () => {
 /**
  * Parent SubgraphNode over an inner KSampler. The promotion has been RENAMED:
  * the OUTER promoted widget the caller sees is "sched_alias" but it maps to the
- * inner "scheduler" widget. The parent ALSO has a decoy own-widget literally
- * named "scheduler" (the shifted-slot corruption vector) — a correct write must
- * never touch it. `resolveSource` mimics the live subgraph link walk.
+ * inner "scheduler" widget. The parent's AUTHORITATIVE rail widget is the litegraph
+ * PROJECTION object linked to the host input via `input._widget` (object identity)
+ * and present in `parent.widgets` — that is what serializes at queue time. There is
+ * ALSO a decoy own-widget literally named "scheduler" (the inner source name, the
+ * shifted-slot corruption vector) — a correct write syncs the rail projection by
+ * IDENTITY and never touches the decoy. `input.widget` is only a `{ name }` stub, as
+ * in real ComfyUI. `resolveSource` mimics the live subgraph link walk.
  */
 function makeSubgraphFixture() {
   const inner = {
@@ -321,22 +325,30 @@ function makeSubgraphFixture() {
     ],
   };
   const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "54" ? inner : null) };
+  // The AUTHORITATIVE rail projection (identity-linked from the host input).
+  const railWidget = { name: "sched_alias", type: "combo", options: { values: ["simple", "karras"] }, value: "simple" };
   const parent = {
     id: 66,
     type: "SubgraphNode",
     subgraph,
     inputs: [
-      // OUTER alias "sched_alias" (renamed) → inner "scheduler".
-      { name: "sched_alias", _subgraphSlot: { name: "sched_alias" } },
+      // OUTER alias "sched_alias" (renamed) → inner "scheduler". `_widget` is the
+      // OBJECT-IDENTITY link to the parent's authoritative rail projection; `widget`
+      // is only a name stub (real ComfyUI shape).
+      { name: "sched_alias", _widget: railWidget, widget: { name: "sched_alias" }, _subgraphSlot: { name: "sched_alias" } },
     ],
-    // Decoy shifted parent slot named "scheduler" — must stay untouched.
-    widgets: [{ name: "scheduler", type: "combo", options: { values: ["simple"] }, value: 999 }],
+    widgets: [
+      // Decoy own-widget named after the INNER source — must stay untouched (#233).
+      { name: "scheduler", type: "combo", options: { values: ["simple"] }, value: 999 },
+      // AUTHORITATIVE parent rail projection (===-linked from the host input).
+      railWidget,
+    ],
   };
   const resolveSource = (_node, subgraphInput) =>
     subgraphInput?.name === "sched_alias"
       ? { sourceNodeId: "54", sourceWidgetName: "scheduler" }
       : null;
-  return { parent, inner, resolveSource };
+  return { parent, inner, railWidget, resolveSource };
 }
 
 test("promoted (renamed) widget resolves to the correct INNER node + widget", () => {
@@ -347,7 +359,7 @@ test("promoted (renamed) widget resolves to the correct INNER node + widget", ()
   assert.equal(res.target.widget.name, "scheduler");
 });
 
-test("writing a RENAMED promoted widget hits the inner target, not the decoy parent slot (#233 blocker 1)", () => {
+test("writing a RENAMED promoted widget hits the inner target + syncs the rail, not the decoy parent slot (#233 blocker 1)", () => {
   const { parent, inner, resolveSource } = makeSubgraphFixture();
   const before = inner.widgets.map((w) => w.value);
 
@@ -358,6 +370,9 @@ test("writing a RENAMED promoted widget hits the inner target, not the decoy par
   assert.equal(set.promoted_from.subgraph_node_id, 66);
   assert.equal(set.promoted_from.inner_node_id, 54);
   assert.equal(inner.widgets.find((w) => w.name === "scheduler").value, "karras");
+  // The AUTHORITATIVE rail widget "sched_alias" is synced (what serializes at queue).
+  assert.equal(parent.widgets.find((w) => w.name === "sched_alias").value, "karras");
+  assert.equal(set.promoted_from.parent_widget_synced, true);
   // The decoy parent widget literally named "scheduler" is untouched.
   assert.equal(parent.widgets[0].value, 999);
   // Every OTHER inner widget is unchanged — no positional-shift corruption.
@@ -368,11 +383,18 @@ test("writing a RENAMED promoted widget hits the inner target, not the decoy par
 
 test("promoted numeric slot REJECTS a non-numeric value (silent-corruption signature)", () => {
   const { parent, inner, resolveSource } = makeSubgraphFixture();
-  // Re-point the promotion at inner numeric "steps".
-  parent.inputs = [{ name: "steps", _subgraphSlot: { name: "steps" } }];
+  // Re-point the promotion at inner numeric "steps", WITH a valid authoritative
+  // rail widget (identity-linked) so the write reaches coercion, not fail-closed.
+  const stepsRail = { name: "steps", type: "INT", value: 1 };
+  parent.inputs = [{ name: "steps", _widget: stepsRail, _subgraphSlot: { name: "steps" } }];
+  parent.widgets.push(stepsRail);
   const rs = (_n, si) => (si?.name === "steps" ? { sourceNodeId: "54", sourceWidgetName: "steps" } : null);
-  assert.throws(() => applyWidgetWrite(parent, "steps", "euler", { resolveSource: rs }), WidgetWriteError);
+  assert.throws(
+    () => applyWidgetWrite(parent, "steps", "euler", { resolveSource: rs }),
+    (err) => err instanceof WidgetWriteError && /is numeric/.test(err.message),
+  );
   assert.equal(inner.widgets.find((w) => w.name === "steps").value, 1);
+  assert.equal(parent.widgets.find((w) => w.name === "steps").value, 1, "rail not mutated on coercion reject");
 });
 
 // ---- fail-CLOSED: promoted but unresolvable must NEVER write the parent slot (#233 blocker 2)
@@ -442,4 +464,709 @@ test("subgraph node's OWN non-promoted widget writes normally (case a)", () => {
   const set = applyWidgetWrite(parent, "scheduler", "karras", { resolveSource: () => null });
   assert.equal(set.value, "karras");
   assert.equal(set.promoted_from, undefined);
+});
+
+// ---- #366: write the AUTHORITATIVE parent rail widget atomically with the inner
+//            widget; fail CLOSED (never silent inner-only) when it can't be found -
+
+/**
+ * Real LTX-2.3 shape: a SubgraphNode whose OWN promoted rail widget "value_2" is
+ * backed by an inner PrimitiveInt (id 257) whose widget is literally named
+ * "value". The rail projection is linked to the host input by OBJECT IDENTITY
+ * (`input._widget`) and present in `parent.widgets` — that is what serializes into
+ * the subgraph INPUT RAIL at queue time. `input.widget` is only a `{ name }` stub
+ * (real ComfyUI shape); we authenticate by identity, never by name.
+ */
+function makePromotedMirrorFixture() {
+  const inner = {
+    id: 257,
+    type: "PrimitiveInt",
+    widgets: [{ name: "value", type: "INT", value: 1280 }],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "257" ? inner : null) };
+  // The parent's OWN promoted rail projection — the authoritative value, stale.
+  const railWidget = { name: "value_2", type: "INT", value: 1280 };
+  const parent = {
+    id: 267,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "value_2", _widget: railWidget, widget: { name: "value_2" }, _subgraphSlot: { name: "value_2" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_node, subgraphInput) =>
+    subgraphInput?.name === "value_2" ? { sourceNodeId: "257", sourceWidgetName: "value" } : null;
+  return { parent, inner, railWidget, resolveSource };
+}
+
+test("#366: a promoted write syncs the AUTHORITATIVE parent rail widget (no stale render)", () => {
+  const { parent, inner, resolveSource } = makePromotedMirrorFixture();
+
+  const set = applyWidgetWrite(parent, "value_2", 704, { resolveSource });
+
+  // Inner write landed + is reported (unchanged behaviour).
+  assert.equal(set.value, 704);
+  assert.equal(set.node_id, 257);
+  assert.equal(set.widget, "value");
+  assert.equal(inner.widgets[0].value, 704);
+
+  // THE FIX: the parent's OWN "value_2" rail widget — what serializes at queue
+  // time — now holds the NEW value, not the stale 1280. Before the fix this
+  // assertion fails (parent stays 1280 → silent stale render).
+  assert.equal(parent.widgets[0].value, 704, "parent rail widget must reflect the new value");
+  assert.equal(set.promoted_from.subgraph_node_id, 267);
+  assert.equal(set.promoted_from.inner_node_id, 257);
+  assert.equal(set.promoted_from.parent_widget_synced, true);
+});
+
+test("#366: the rail widget is resolved by the promotion's own NAME — a DIFFERENTLY-named decoy is never selected (#233)", () => {
+  // The rail projection is identity-linked from the host input (`_widget`). A decoy
+  // own-widget shares NOTHING with the input link. Authentication is by IDENTITY, so
+  // only the linked projection is written — never the decoy — regardless of names.
+  const inner = { id: 257, type: "PrimitiveInt", widgets: [{ name: "value", type: "INT", value: 1280 }] };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "257" ? inner : null) };
+  const railWidget = { name: "value_2", type: "INT", value: 1280 };
+  const decoy = { name: "value_2", type: "INT", value: 9999 }; // SAME name — still never chosen (identity)
+  const parent = {
+    id: 267,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "value_2", _widget: railWidget, _subgraphSlot: { name: "value_2" } }],
+    widgets: [decoy, railWidget], // decoy first + same name, but the input links to railWidget by identity
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "value_2" ? { sourceNodeId: "257", sourceWidgetName: "value" } : null;
+
+  const set = applyWidgetWrite(parent, "value_2", 704, { resolveSource });
+
+  assert.equal(railWidget.value, 704, "authoritative rail projection synced by identity");
+  assert.equal(decoy.value, 9999, "a same-named decoy must never be written (identity, not name)");
+  assert.equal(set.promoted_from.parent_widget_synced, true);
+});
+
+test("#366 FAIL CLOSED runs BEFORE any side-effecting coercion — a dynamic-combo inner is never invoked when the rail is refused", () => {
+  // The inner is a DYNAMIC combo whose options.values() has a side effect. With a
+  // linked (non-authoritative) host input the write must fail closed BEFORE
+  // coercion invokes that callback — otherwise a missing-rail refusal could still
+  // leave an uncaptured inner mutation.
+  let optionsInvoked = false;
+  const innerWidget = {
+    name: "sampler",
+    type: "combo",
+    value: "euler",
+    options: {
+      values: () => {
+        optionsInvoked = true;
+        return ["euler", "dpmpp_2m"];
+      },
+    },
+  };
+  const inner = { id: 54, type: "KSampler", widgets: [innerWidget] };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "54" ? inner : null) };
+  const samplerRail = { name: "sampler", type: "combo", value: "euler", options: { values: ["euler", "dpmpp_2m"] } };
+  const parent = {
+    id: 66,
+    type: "SubgraphNode",
+    subgraph,
+    // linked host input ⇒ non-authoritative rail ⇒ fail closed (even though the
+    // projection is present, the outer link makes it non-authoritative).
+    inputs: [{ name: "sampler", link: 99, _widget: samplerRail, _subgraphSlot: { name: "sampler" } }],
+    widgets: [samplerRail],
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "sampler" ? { sourceNodeId: "54", sourceWidgetName: "sampler" } : null;
+
+  assert.throws(
+    () => applyWidgetWrite(parent, "sampler", "dpmpp_2m", { resolveSource }),
+    (err) => err instanceof WidgetWriteError && /parent rail widget could not be identified/.test(err.message),
+  );
+  assert.equal(optionsInvoked, false, "no dynamic-combo coercion side effect before the fail-closed refusal");
+});
+
+test("#366 FAIL CLOSED: an EXTERNALLY-LINKED host input (nested/further promotion) refuses — the local widget is not the authoritative rail", () => {
+  // The host input carries an OUTER link (this promoted widget is further promoted
+  // to an enclosing subgraph). Its projection `_widget` is a valid member, but queue
+  // compilation ignores it and follows the outer rail — so writing it would be a
+  // FALSE success. The link check refuses it.
+  const inner = { id: 257, type: "PrimitiveInt", widgets: [{ name: "value", type: "INT", value: 1280 }] };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "257" ? inner : null) };
+  const localWidget = { name: "value_2", type: "INT", value: 1280 };
+  const parent = {
+    id: 267,
+    type: "SubgraphNode",
+    subgraph,
+    // `link` is NON-NULL ⇒ fed by an enclosing subgraph's rail (non-authoritative).
+    inputs: [{ name: "value_2", link: 4242, _widget: localWidget, _subgraphSlot: { name: "value_2" } }],
+    widgets: [localWidget],
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "value_2" ? { sourceNodeId: "257", sourceWidgetName: "value" } : null;
+
+  assert.throws(
+    () => applyWidgetWrite(parent, "value_2", 704, { resolveSource }),
+    (err) => err instanceof WidgetWriteError && /parent rail widget could not be identified/.test(err.message),
+  );
+  assert.equal(localWidget.value, 1280, "non-authoritative local widget must not be written");
+  assert.equal(inner.widgets[0].value, 1280, "inner must not be written on fail-closed");
+});
+
+test("#366 SEVERE FAIL CLOSED: a NAME-ONLY `input.widget` stub + an unrelated same-named decoy is REFUSED (identity auth, never a name match)", () => {
+  // The exact severe repro: the host input carries ONLY a `{ name }` stub (no
+  // identity-linked projection), and the parent has ONE unrelated widget that
+  // happens to share that name. A name-based resolver (even unique) would select
+  // and write that decoy and report synced:true. Object-identity auth must refuse:
+  // the stub is not `===` any node.widgets member, so FAIL CLOSED, write nothing.
+  const inner = { id: 54, type: "KSampler", widgets: [{ name: "scheduler", type: "combo", options: { values: ["simple", "karras"] }, value: "simple" }] };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "54" ? inner : null) };
+  const decoy = { name: "scheduler", type: "combo", options: { values: ["simple", "karras"] }, value: "simple" };
+  const parent = {
+    id: 66,
+    type: "SubgraphNode",
+    subgraph,
+    // NAME-ONLY stub (a different object from `decoy`), no `_widget` projection.
+    inputs: [{ name: "scheduler", widget: { name: "scheduler" }, _subgraphSlot: { name: "scheduler" } }],
+    widgets: [decoy], // unrelated, coincidentally same-named
+    // Production litegraph's getWidgetFromSlot resolves BY NAME and would hand back
+    // the decoy — the exact trap. The fix must IGNORE this and authenticate by
+    // identity only, so the decoy is never written.
+    getWidgetFromSlot(input) {
+      return this.widgets.find((w) => w.name === input?.widget?.name) ?? null;
+    },
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "scheduler" ? { sourceNodeId: "54", sourceWidgetName: "scheduler" } : null;
+
+  assert.throws(
+    () => applyWidgetWrite(parent, "scheduler", "karras", { resolveSource }),
+    (err) => err instanceof WidgetWriteError && /parent rail widget could not be identified/.test(err.message),
+  );
+  assert.equal(decoy.value, "simple", "the unrelated same-named decoy must NOT be written (identity, not name)");
+  assert.equal(inner.widgets[0].value, "simple", "inner must not be written on fail-closed");
+});
+
+test("#366 FAIL CLOSED: a promoted write whose authoritative rail widget cannot be identified THROWS — never writes inner-only", () => {
+  // No litegraph backlink and no getWidgetFromSlot → the rail widget cannot be
+  // positively identified (the outward/double-promotion or malformed case). Even
+  // though a same-named widget exists, matching it by name is forbidden; we FAIL
+  // CLOSED so the render can never silently use the OLD value.
+  const inner = { id: 257, type: "PrimitiveInt", widgets: [{ name: "value", type: "INT", value: 1280 }] };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "257" ? inner : null) };
+  const parent = {
+    id: 267,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "value_2", _subgraphSlot: { name: "value_2" } }], // no `widget` backlink
+    widgets: [{ name: "value_2", type: "INT", value: 1280 }], // tempting same-named widget
+    // no getWidgetFromSlot
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "value_2" ? { sourceNodeId: "257", sourceWidgetName: "value" } : null;
+
+  assert.throws(
+    () => applyWidgetWrite(parent, "value_2", 704, { resolveSource }),
+    (err) => err instanceof WidgetWriteError && /parent rail widget could not be identified/.test(err.message),
+  );
+  // Neither the inner widget nor the tempting same-named parent widget was written.
+  assert.equal(inner.widgets[0].value, 1280, "inner must not be written on fail-closed");
+  assert.equal(parent.widgets[0].value, 1280, "same-named parent widget must not be written on fail-closed");
+});
+
+test("#366: a promotion addressed by its LABEL still syncs the rail widget (relationship, not name)", () => {
+  // Renamed promotion: display label "sched_label"; the parent rail widget carries
+  // the stable name "scheduler". The caller addresses by the LABEL. The rail widget
+  // is found by the promotion backlink regardless of the label.
+  const inner = {
+    id: 54,
+    type: "KSampler",
+    widgets: [{ name: "scheduler", type: "combo", options: { values: ["simple", "karras"] }, value: "simple" }],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "54" ? inner : null) };
+  const railWidget = { name: "scheduler", type: "combo", options: { values: ["simple", "karras"] }, value: "simple" };
+  const parent = {
+    id: 66,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [
+      { name: "scheduler", label: "sched_label", _widget: railWidget, _subgraphSlot: { name: "scheduler", label: "sched_label" } },
+    ],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "scheduler" ? { sourceNodeId: "54", sourceWidgetName: "scheduler" } : null;
+
+  // Address by the LABEL, not the stable name.
+  const set = applyWidgetWrite(parent, "sched_label", "karras", { resolveSource });
+
+  assert.equal(inner.widgets[0].value, "karras");
+  assert.equal(railWidget.value, "karras", "rail widget must be synced when addressed by label");
+  assert.equal(set.promoted_from.parent_widget_synced, true);
+});
+
+test("#366: the rail write lands INSIDE the undo envelope (before afterChange fires)", () => {
+  const { parent, inner, resolveSource } = makePromotedMirrorFixture();
+  let parentValueAtAfterChange;
+  applyWidgetWrite(parent, "value_2", 704, {
+    resolveSource,
+    beforeChange: () => {
+      // Envelope opened but nothing written yet.
+      assert.equal(parent.widgets[0].value, 1280);
+    },
+    afterChange: () => {
+      // BOTH inner and parent must already be written when the envelope closes,
+      // so the two mutations are one atomic undo.
+      parentValueAtAfterChange = parent.widgets[0].value;
+    },
+  });
+  assert.equal(inner.widgets[0].value, 704);
+  assert.equal(parentValueAtAfterChange, 704, "parent must be written before afterChange (single undo op)");
+});
+
+test("#366 ATOMIC: an INNER callback that throws rolls BOTH back — no partial write, surfaced as failure", () => {
+  const { parent, inner, resolveSource } = makePromotedMirrorFixture();
+  // Inner widget callback throws AFTER the inner value is assigned.
+  inner.widgets[0].callback = () => {
+    throw new Error("inner boom");
+  };
+  let afterChangeRan = false;
+  assert.throws(
+    () =>
+      applyWidgetWrite(parent, "value_2", 704, {
+        resolveSource,
+        afterChange: () => {
+          afterChangeRan = true;
+        },
+      }),
+    (err) => err instanceof WidgetWriteError && /callback threw|inner boom/.test(err.message),
+  );
+  // ROLLED BACK: neither inner nor parent rail left at the new value.
+  assert.equal(inner.widgets[0].value, 1280, "inner rolled back");
+  assert.equal(parent.widgets[0].value, 1280, "parent rolled back — never inner=new/parent=stale");
+  assert.equal(afterChangeRan, true, "afterChange still closes the envelope");
+});
+
+test("#366: the SEMANTIC widget callback fires EXACTLY ONCE (inner target) — a forwarding parent view is not double-invoked", () => {
+  // Real ComfyUI shape: the parent's projected promoted widget is a VIEW whose
+  // callback FORWARDS to the inner widget's callback. Firing both would double-run
+  // the side effect; the fix fires only the inner callback (with the inner node
+  // context) and sets the rail value directly.
+  let innerCalls = 0;
+  let innerCtx = null;
+  const inner = {
+    id: 257,
+    type: "PrimitiveInt",
+    widgets: [
+      {
+        name: "value",
+        type: "INT",
+        value: 1280,
+        callback(_v, _canvas, node) {
+          innerCalls += 1;
+          innerCtx = node;
+        },
+      },
+    ],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "257" ? inner : null) };
+  const railWidget = {
+    name: "value_2",
+    type: "INT",
+    value: 1280,
+    // A view whose callback forwards to the inner widget's callback.
+    callback: (...args) => inner.widgets[0].callback(...args),
+  };
+  const parent = {
+    id: 267,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "value_2", _widget: railWidget, _subgraphSlot: { name: "value_2" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "value_2" ? { sourceNodeId: "257", sourceWidgetName: "value" } : null;
+
+  const set = applyWidgetWrite(parent, "value_2", 704, { resolveSource });
+
+  assert.equal(innerCalls, 1, "the semantic callback must fire exactly once");
+  assert.equal(innerCtx, inner, "…with the INNER node as context");
+  assert.equal(inner.widgets[0].value, 704);
+  assert.equal(railWidget.value, 704, "rail value set directly (serializes)");
+  assert.equal(set.promoted_from.parent_widget_synced, true);
+});
+
+test("#366: a value setter that REJECTS the rollback surfaces an HONEST partial-state failure (never falsely claims 'rolled back')", () => {
+  const inner = { id: 257, type: "PrimitiveInt", widgets: [] };
+  // A widget whose `value` accepts the forward write but REJECTS the restore.
+  const w = {
+    name: "value",
+    type: "INT",
+    _v: 1280,
+    _touched: false,
+    get value() {
+      return this._v;
+    },
+    set value(x) {
+      if (x === 1280 && this._touched) throw new Error("setter refuses restore");
+      this._v = x;
+      this._touched = true;
+    },
+    callback() {
+      throw new Error("inner boom");
+    },
+  };
+  inner.widgets.push(w);
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "257" ? inner : null) };
+  const railWidget = { name: "value_2", type: "INT", value: 1280 };
+  const parent = {
+    id: 267,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "value_2", _widget: railWidget, _subgraphSlot: { name: "value_2" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "value_2" ? { sourceNodeId: "257", sourceWidgetName: "value" } : null;
+
+  assert.throws(
+    () => applyWidgetWrite(parent, "value_2", 704, { resolveSource }),
+    (err) => err instanceof WidgetWriteError && /partial state/.test(err.message) && !/rolled back to avoid/.test(err.message),
+  );
+});
+
+test("#366: a value setter that SILENTLY IGNORES the rollback (keeps the new value) is detected via read-back, not falsely claimed rolled back", () => {
+  const inner = { id: 257, type: "PrimitiveInt", widgets: [] };
+  // A widget whose setter accepts the forward write but silently REFUSES to go back.
+  const w = {
+    name: "value",
+    type: "INT",
+    _v: 1280,
+    get value() {
+      return this._v;
+    },
+    set value(x) {
+      // Ignore any attempt to restore the old value (silent no-op rollback).
+      if (x === 1280 && this._v === 704) return;
+      this._v = x;
+    },
+    callback() {
+      throw new Error("inner boom");
+    },
+  };
+  inner.widgets.push(w);
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "257" ? inner : null) };
+  const railWidget = { name: "value_2", type: "INT", value: 1280 };
+  const parent = {
+    id: 267,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "value_2", _widget: railWidget, _subgraphSlot: { name: "value_2" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "value_2" ? { sourceNodeId: "257", sourceWidgetName: "value" } : null;
+
+  assert.throws(
+    () => applyWidgetWrite(parent, "value_2", 704, { resolveSource }),
+    (err) =>
+      err instanceof WidgetWriteError && /partial state/.test(err.message) && !/rolled back to avoid/.test(err.message),
+  );
+});
+
+test("#366 ATOMIC: a THROWING afterChange hook does not bypass rollback", () => {
+  const { parent, inner, resolveSource } = makePromotedMirrorFixture();
+  inner.widgets[0].callback = () => {
+    throw new Error("inner boom");
+  };
+  const afterChange = () => {
+    throw new Error("afterChange boom");
+  };
+  assert.throws(
+    () => applyWidgetWrite(parent, "value_2", 704, { resolveSource, afterChange }),
+    (err) => err instanceof WidgetWriteError && /callback threw|inner boom/.test(err.message),
+  );
+  assert.equal(inner.widgets[0].value, 1280, "inner rolled back despite a throwing afterChange hook");
+  assert.equal(parent.widgets[0].value, 1280, "rail untouched / rolled back");
+});
+
+test("#366 HARD FAIL: an afterChange HOOK that re-stales the rail (after all callbacks) is still caught + rolled back", () => {
+  const { parent, inner, resolveSource } = makePromotedMirrorFixture();
+  // Verification must run AFTER afterChange: a hook that reverts the rail value must
+  // not escape detection and report success.
+  const afterChange = () => {
+    // Re-stale the rail to its OLD value after the write completed.
+    if (parent.widgets[0].value === 704) parent.widgets[0].value = 1280;
+  };
+  assert.throws(
+    () => applyWidgetWrite(parent, "value_2", 704, { resolveSource, afterChange }),
+    (err) => err instanceof WidgetWriteError && /did not retain the requested value/.test(err.message),
+  );
+  // Rolled back: inner restored too (never inner=new/rail=stale reported as success).
+  assert.equal(inner.widgets[0].value, 1280, "inner rolled back after afterChange re-stale");
+  assert.equal(parent.widgets[0].value, 1280, "rail left at its stale value, not the half-applied new one");
+});
+
+test("#366 HARD FAIL: a callback that CHANGES the promotion topology (adds an outer link) fails + rolls back — never a false synced success", () => {
+  const { parent, inner, resolveSource } = makePromotedMirrorFixture();
+  // The inner (semantic) callback keeps the requested VALUE but mutates the host
+  // input to be externally linked — so at queue time litegraph would follow the
+  // outer link and ignore this rail. The post-callback re-authentication catches it.
+  inner.widgets[0].callback = () => {
+    parent.inputs[0].link = 7777; // now non-authoritative
+  };
+  assert.throws(
+    () => applyWidgetWrite(parent, "value_2", 704, { resolveSource }),
+    (err) => err instanceof WidgetWriteError && /CHANGED during the write/.test(err.message),
+  );
+  assert.equal(inner.widgets[0].value, 1280, "inner rolled back on relationship drift");
+  assert.equal(parent.widgets[0].value, 1280, "rail rolled back on relationship drift");
+});
+
+test("#366 HARD FAIL: a callback that REPLACES node.inputs[i] with a new detached host input fails + rolls back", () => {
+  const { parent, inner, resolveSource } = makePromotedMirrorFixture();
+  // The inner (semantic) callback swaps the live host input for a NEW object (the
+  // captured one is now detached). Re-resolving from live node.inputs detects it.
+  inner.widgets[0].callback = () => {
+    parent.inputs[0] = { name: "value_2", link: 5, widget: { name: "value_2" }, _subgraphSlot: { name: "value_2" } };
+  };
+  assert.throws(
+    () => applyWidgetWrite(parent, "value_2", 704, { resolveSource }),
+    (err) => err instanceof WidgetWriteError && /CHANGED during the write/.test(err.message),
+  );
+  assert.equal(inner.widgets[0].value, 1280, "inner rolled back on host-input replacement");
+  assert.equal(parent.widgets[0].value, 1280, "rail rolled back on host-input replacement");
+});
+
+test("#366 HARD FAIL: a callback that installs a LIVE REPLACEMENT rail preloaded with the value is reported as PARTIAL STATE (not a clean rollback)", () => {
+  const { parent, inner, railWidget } = makePromotedMirrorFixture();
+  // The inner callback swaps in a WHOLE new promotion: a new host input + a new
+  // identity-authenticated rail projection already holding the requested value 704.
+  // Recheck detects the change; restoring the OLD captured rail does not touch the
+  // new live rail (which serializes 704), so this must be surfaced as partial state.
+  const newRail = { name: "value_2", type: "INT", value: 704 };
+  inner.widgets[0].callback = () => {
+    parent.inputs[0] = { name: "value_2", _widget: newRail, _subgraphSlot: { name: "value_2" } };
+    parent.widgets = [newRail];
+  };
+  const rs = (_n, si) => (si?.name === "value_2" ? { sourceNodeId: "257", sourceWidgetName: "value" } : null);
+  assert.throws(
+    () => applyWidgetWrite(parent, "value_2", 704, { resolveSource: rs }),
+    (err) => err instanceof WidgetWriteError && /partial state/.test(err.message) && /live replacement rail/.test(err.message),
+  );
+  assert.equal(railWidget.value, 1280, "the detached captured rail is restored");
+  assert.equal(newRail.value, 704, "the live replacement rail still holds the value — surfaced as partial state");
+});
+
+test("#366 HARD FAIL: a callback that swaps only `input.widgetId` (the serialization binding) is detected + rolled back", () => {
+  // Model ComfyUI's store-backed projection: the rail's value reads/writes a STORE
+  // by a bound id, but queue compilation reads `input.widgetId`. A callback keeps the
+  // same input + projection OBJECTS but re-points widgetId to another store entry
+  // holding the OLD value — object-identity checks all pass, yet the render would be
+  // stale. Snapshotting + verifying widgetId catches it.
+  // Harder case: store entry "b" is PRELOADED with the requested NEW value, so a
+  // swap to "b" would silently serialize the new value while we claim rollback.
+  const store = { a: { value: 1280 }, b: { value: 704 } };
+  const inner = { id: 257, type: "PrimitiveInt", widgets: [{ name: "value", type: "INT", value: 1280 }] };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "257" ? inner : null) };
+  const railWidget = {
+    name: "value_2",
+    type: "INT",
+    get value() {
+      return store.a.value; // projection bound to store entry "a" (closure id)
+    },
+    set value(v) {
+      store.a.value = v;
+    },
+  };
+  const hostInput = { name: "value_2", widgetId: "a", _widget: railWidget, _subgraphSlot: { name: "value_2" } };
+  const parent = { id: 267, type: "SubgraphNode", subgraph, inputs: [hostInput], widgets: [railWidget] };
+  // The inner callback re-points the serialization binding to "b".
+  inner.widgets[0].callback = () => {
+    hostInput.widgetId = "b";
+  };
+  const rs = (_n, si) => (si?.name === "value_2" ? { sourceNodeId: "257", sourceWidgetName: "value" } : null);
+
+  assert.throws(
+    () => applyWidgetWrite(parent, "value_2", 704, { resolveSource: rs }),
+    (err) => err instanceof WidgetWriteError && /CHANGED during the write/.test(err.message),
+  );
+  assert.equal(inner.widgets[0].value, 1280, "inner rolled back on widgetId swap");
+  // The binding is RESTORED to "a" and its entry to the OLD value, so queue
+  // compilation reads the old value — a clean rollback, not the preloaded "b".
+  assert.equal(hostInput.widgetId, "a", "serialization binding restored to the original store key");
+  assert.equal(store.a.value, 1280, "the serialized store entry holds the OLD value after rollback");
+});
+
+test("#366 ATOMIC: an EXCEPTION during the post-afterChange topology recheck triggers full rollback (never escapes with mutated state)", () => {
+  const { parent, inner, railWidget } = makePromotedMirrorFixture();
+  // The inner callback replaces the host input's _subgraphSlot so the recheck's
+  // resolveSource THROWS for the replacement — the recheck exception must drive the
+  // full rollback, not escape with inner=new / rail=new.
+  inner.widgets[0].callback = () => {
+    parent.inputs[0]._subgraphSlot = { name: "REPLACED" };
+  };
+  const rs = (_n, si) => {
+    if (si?.name === "REPLACED") throw new Error("no source for replaced slot");
+    return si?.name === "value_2" ? { sourceNodeId: "257", sourceWidgetName: "value" } : null;
+  };
+  assert.throws(
+    () => applyWidgetWrite(parent, "value_2", 704, { resolveSource: rs }),
+    (err) => err instanceof WidgetWriteError && /CHANGED during the write/.test(err.message),
+  );
+  assert.equal(inner.widgets[0].value, 1280, "inner rolled back after the recheck threw");
+  assert.equal(railWidget.value, 1280, "rail rolled back after the recheck threw");
+});
+
+test("#366 HARD FAIL: a rollback afterChange that mutates the RESTORED composite IN PLACE is caught by STRUCTURAL verification (Object.is would miss it)", () => {
+  const innerW = {
+    name: "value",
+    value: { on: true, lora: "a.safetensors", strength: 1 },
+    callback() {
+      throw new Error("inner boom"); // force entry into rollback
+    },
+  };
+  const inner = { id: 300, type: "Power Lora Loader (rgthree)", widgets: [innerW] };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "300" ? inner : null) };
+  const railWidget = { name: "value", value: { on: true, lora: "a.safetensors", strength: 1 } };
+  const parent = {
+    id: 267,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "value", _widget: railWidget, _subgraphSlot: { name: "value" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_n, si) => (si?.name === "value" ? { sourceNodeId: "300", sourceWidgetName: "value" } : null);
+  // afterChange fires twice (main envelope, then the rollback envelope). On the
+  // rollback pass it mutates the RESTORED old objects IN PLACE — Object.is against
+  // the same references would pass, but structural comparison against the deep
+  // clones detects the corruption.
+  let phase = 0;
+  const afterChange = () => {
+    phase += 1;
+    if (phase === 2) {
+      innerW.value.strength = 999;
+      railWidget.value.strength = 999;
+    }
+  };
+  assert.throws(
+    () => applyWidgetWrite(parent, "value", '{"strength":0.6}', { resolveSource, afterChange }),
+    (err) => err instanceof WidgetWriteError && /partial state/.test(err.message),
+  );
+});
+
+test("#366 HARD FAIL + ROLLBACK: a rail VALUE SETTER that DRIFTS (reverts) the value fails loudly AND rolls both back (never inner=new/parent=stale)", () => {
+  const inner = { id: 257, type: "PrimitiveInt", widgets: [{ name: "value", type: "INT", value: 1280 }] };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "257" ? inner : null) };
+  // The rail widget's value SETTER silently reverts a forward write to the old value
+  // (a drift signature) — the rail is authoritative, so this must be caught.
+  const railWidget = {
+    name: "value_2",
+    type: "INT",
+    _v: 1280,
+    get value() {
+      return this._v;
+    },
+    set value(x) {
+      this._v = x === 704 ? 1280 : x; // drift: refuse the new value
+    },
+  };
+  const parent = {
+    id: 267,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "value_2", _widget: railWidget, _subgraphSlot: { name: "value_2" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "value_2" ? { sourceNodeId: "257", sourceWidgetName: "value" } : null;
+
+  assert.throws(
+    () => applyWidgetWrite(parent, "value_2", 704, { resolveSource }),
+    (err) => err instanceof WidgetWriteError && /did not\s+retain the requested value/.test(err.message),
+  );
+  // Both restored — never inner=new / rail=stale reported as success.
+  assert.equal(inner.widgets[0].value, 1280, "inner rolled back on rail drift");
+  assert.equal(railWidget.value, 1280, "rail at its (stale) value, not half-applied");
+});
+
+test("#366 FAIL CLOSED: a NAME-only backlink pointing at a decoy (real rail absent) is refused, never written by name", () => {
+  // Host input has a `widget` NAME stub (not an object in node.widgets) and there
+  // is NO getWidgetFromSlot. A widget named "value_2" exists but is a DECOY — the
+  // true rail widget is absent. A name-based lookup would select the decoy and
+  // report success; identity/relationship authentication refuses and FAILS CLOSED.
+  const inner = { id: 257, type: "PrimitiveInt", widgets: [{ name: "value", type: "INT", value: 1280 }] };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "257" ? inner : null) };
+  const decoy = { name: "value_2", type: "INT", value: 9999 };
+  const parent = {
+    id: 267,
+    type: "SubgraphNode",
+    subgraph,
+    // `widget` is a NAME STUB, not one of node.widgets by identity.
+    inputs: [{ name: "value_2", widget: { name: "value_2" }, _subgraphSlot: { name: "value_2" } }],
+    widgets: [decoy],
+    // no getWidgetFromSlot
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "value_2" ? { sourceNodeId: "257", sourceWidgetName: "value" } : null;
+
+  assert.throws(
+    () => applyWidgetWrite(parent, "value_2", 704, { resolveSource }),
+    (err) => err instanceof WidgetWriteError && /parent rail widget could not be identified/.test(err.message),
+  );
+  assert.equal(decoy.value, 9999, "decoy must NOT be written by name");
+  assert.equal(inner.widgets[0].value, 1280, "inner must not be written on fail-closed");
+});
+
+test("#366: a promoted STRING widget also syncs the parent rail (prompt text)", () => {
+  const inner = {
+    id: 266,
+    type: "PrimitiveStringMultiline",
+    widgets: [{ name: "value", type: "customtext", value: "old landscape prompt" }],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "266" ? inner : null) };
+  const railWidget = { name: "value", type: "customtext", value: "old landscape prompt" };
+  const parent = {
+    id: 267,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "value", _widget: railWidget, _subgraphSlot: { name: "value" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "value" ? { sourceNodeId: "266", sourceWidgetName: "value" } : null;
+
+  const set = applyWidgetWrite(parent, "value", "new vertical prompt", { resolveSource });
+
+  assert.equal(inner.widgets[0].value, "new vertical prompt");
+  assert.equal(railWidget.value, "new vertical prompt", "parent prompt rail widget must reflect the new text");
+  assert.equal(set.promoted_from.parent_widget_synced, true);
+});
+
+test("#366×#179: a promoted COMPOSITE write merges onto the RAIL's current object — the rail's unspecified fields are NOT clobbered by the stale inner", () => {
+  // Inner (non-authoritative) and rail (authoritative) hold DIVERGENT composite
+  // values. A partial write {strength:0.6} must preserve the RAIL's `lora`
+  // ("current"), not resurrect the inner's stale `lora` ("old").
+  const inner = {
+    id: 300,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: { on: true, lora: "old.safetensors", strength: 1 } }],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "300" ? inner : null) };
+  const railWidget = { name: "lora_1", value: { on: true, lora: "current.safetensors", strength: 0.8 } };
+  const parent = {
+    id: 267,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "lora_1", _widget: railWidget, _subgraphSlot: { name: "lora_1" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "lora_1" ? { sourceNodeId: "300", sourceWidgetName: "lora_1" } : null;
+
+  const set = applyWidgetWrite(parent, "lora_1", '{"strength":0.6}', { resolveSource });
+
+  assert.equal(railWidget.value.lora, "current.safetensors", "rail's authoritative lora must be preserved, not clobbered by the stale inner");
+  assert.equal(railWidget.value.strength, 0.6, "requested field applied to the rail");
+  assert.equal(railWidget.value.on, true, "rail's other unspecified field preserved");
+  // Inner is written to the SAME authoritative merged value (read-consistency).
+  assert.equal(inner.widgets[0].value.lora, "current.safetensors");
+  assert.equal(inner.widgets[0].value.strength, 0.6);
+  assert.equal(set.promoted_from.parent_widget_synced, true);
 });

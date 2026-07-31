@@ -367,12 +367,20 @@ function makeSubgraphFixture(innerType = "KSampler") {
     constructor: { nodeData: { input: { required: {} } } },
   };
   const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "54" ? inner : null) };
+  // AUTHORITATIVE rail projection, identity-linked from the host input (#366).
+  const railWidget = { name: "sched_alias", type: "combo", options: { values: ["simple", "karras"] }, value: "simple" };
   const parent = {
     id: 66,
     type: "SubgraphNode",
     subgraph,
-    inputs: [{ name: "sched_alias", _subgraphSlot: { name: "sched_alias" } }],
-    widgets: [{ name: "scheduler", type: "combo", options: { values: ["simple"] }, value: 999 }],
+    // Host input carries the OBJECT-IDENTITY link (`_widget`) to the parent's own
+    // authoritative rail projection (#366) — what serializes at queue time.
+    inputs: [{ name: "sched_alias", _widget: railWidget, _subgraphSlot: { name: "sched_alias" } }],
+    widgets: [
+      // Decoy own-widget named after the INNER source — must stay untouched (#233).
+      { name: "scheduler", type: "combo", options: { values: ["simple"] }, value: 999 },
+      railWidget,
+    ],
   };
   const resolveSource = (_n, si) =>
     si?.name === "sched_alias" ? { sourceNodeId: "54", sourceWidgetName: "scheduler" } : null;
