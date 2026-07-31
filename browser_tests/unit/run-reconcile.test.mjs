@@ -15,7 +15,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { createRunCompletionTracker } from "../../web/js/lib/run-completion.js";
-import { parseHistoryEntry, queueMembership } from "../../web/js/lib/history-reconcile.js";
+import {
+  parseHistoryEntry,
+  queueMembership,
+  historyEntryFor,
+} from "../../web/js/lib/history-reconcile.js";
 
 const isVideo = (m) => /\.(mp4|webm|mov)$/i.test(String(m?.filename || ""));
 
@@ -697,6 +701,34 @@ test("#370 P1 (codex): give-up requires CLEAN-ABSENT /history (null), not a pres
   assert.equal(tracker._pending.has("gone"), false, "genuinely-gone prompt evicted (bounded memory)");
 });
 
+// ── historyEntryFor: strict /history map verdict ────────────────────────────────
+
+test("historyEntryFor: well-formed map WITH the id ⇒ the entry (present record)", () => {
+  const entry = { status: { status_str: "success" }, outputs: {} };
+  assert.strictEqual(historyEntryFor({ R: entry }, "R"), entry);
+});
+
+test("historyEntryFor: well-formed map LACKING the id ⇒ null (clean absence)", () => {
+  assert.strictEqual(historyEntryFor({}, "R"), null);
+  assert.strictEqual(historyEntryFor({ other: { status: {} } }, "R"), null);
+});
+
+test("historyEntryFor: MALFORMED body (null/array/non-object) ⇒ undefined (uncertain, NOT null)", () => {
+  assert.strictEqual(historyEntryFor(null, "R"), undefined); // the exact repro: 200 body `null`
+  assert.strictEqual(historyEntryFor([], "R"), undefined); // 200 body `[]`
+  assert.strictEqual(historyEntryFor([{ R: 1 }], "R"), undefined); // array, not a map
+  assert.strictEqual(historyEntryFor("nonsense", "R"), undefined);
+  assert.strictEqual(historyEntryFor(42, "R"), undefined);
+  assert.strictEqual(historyEntryFor(undefined, "R"), undefined);
+});
+
+test("historyEntryFor: id PRESENT with a null/undefined value ⇒ undefined (malformed present, NOT clean absence)", () => {
+  assert.strictEqual(historyEntryFor({ R: null }, "R"), undefined); // present key, null value
+  assert.strictEqual(historyEntryFor({ R: undefined }, "R"), undefined); // present key, undefined value
+  // A sibling present-null must not make an ABSENT id look present-null.
+  assert.strictEqual(historyEntryFor({ other: null }, "R"), null); // R's key genuinely absent ⇒ clean absence
+});
+
 // ── queueMembership: strict-array /queue verdict ────────────────────────────────
 
 test("queueMembership: present in queue_running or queue_pending ⇒ true", () => {
@@ -762,6 +794,48 @@ test("#370 P1 (codex): a MALFORMED /queue (non-array fields) is uncertain → NO
   tracker.onExecuted("m", { images: [{ filename: "m.png", type: "output" }] });
   tracker.onExecutionSuccess("m");
   assert.ok(flushes.find((f) => f.promptId === "m"), "output delivered, not dropped");
+});
+
+test("#370 P1 (codex): a MALFORMED /history 200 body (null) is uncertain → NOT given up, later output delivers", async () => {
+  const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 1 });
+  const { tracker, flushes, giveUps } = h;
+  tracker.onQueued("R");
+  // /history/R returns 200 with a malformed body (`null`) — historyEntryFor maps
+  // this to `undefined` (uncertain), so the reconciler must NOT give up even though
+  // /queue is well-formed-both-absent.
+  const fetchHistory = async (id) => historyEntryFor(null, id); // ⇒ undefined
+  const fetchQueued = async (id) => queueMembership({ queue_running: [], queue_pending: [] }, id); // false
+  const summary = await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
+  assert.deepEqual(summary, [{ promptId: "R", status: "running" }], "malformed history ⇒ running, not unknown");
+  for (let i = 0; i < 3; i++) {
+    h.advance(1000);
+    await h.fireDueTimers();
+  }
+  assert.equal(giveUps.length, 0, "a malformed /history never causes a give-up");
+  assert.equal(tracker._pending.has("R"), true, "left pending (uncertain)");
+  assert.equal(tracker.wasTerminal("R"), false, "not fenced");
+
+  // Its later live output still delivers.
+  tracker.onExecutionStart("R");
+  tracker.onExecuted("R", { images: [{ filename: "R.png", type: "output" }] });
+  tracker.onExecutionSuccess("R");
+  assert.ok(flushes.find((f) => f.promptId === "R"), "output delivered, not dropped");
+});
+
+test("#370 P1 (codex): give-up requires BOTH a well-formed absent /history map AND well-formed absent /queue", async () => {
+  const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 1 });
+  const { tracker, giveUps } = h;
+  // well-formed /history map lacking the id (⇒ null) AND well-formed empty /queue (⇒ false).
+  const fetchHistory = async (id) => historyEntryFor({}, id); // ⇒ null (clean absence)
+  const fetchQueued = async (id) => queueMembership({ queue_running: [], queue_pending: [] }, id); // ⇒ false
+  tracker.onQueued("gone");
+  await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
+  for (let i = 0; i < 3; i++) {
+    h.advance(1000);
+    await h.fireDueTimers();
+  }
+  assert.deepEqual(giveUps, [{ promptId: "gone" }], "both sides well-formed-absent ⇒ give up once (memory bound)");
+  assert.equal(tracker._pending.has("gone"), false, "evicted");
 });
 
 test("#370 P1 (codex): give-up STILL fires when /history null AND /queue well-formed both-absent", async () => {

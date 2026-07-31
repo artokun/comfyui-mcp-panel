@@ -108,6 +108,41 @@ export function queueMembership(queueJson, promptId) {
   return false; // every row well-formed AND id absent ⇒ DEFINITIVE absence
 }
 
+/**
+ * Extract the per-prompt entry from a `GET /history/<id>` response body, applying
+ * the SAME strictness as queueMembership so a give-up needs a positively-confirmed
+ * absence on BOTH sides.
+ *
+ * A well-formed /history response is a plain-object MAP keyed by prompt_id. Only
+ * then can a MISSING key be trusted as a clean absence.
+ *
+ * @param {any} historyJson  Parsed body of `GET /history/<id>`.
+ * @param {string} promptId
+ * @returns {object|null|undefined}
+ *   - the entry object when the map has the id with a usable record (reconciler
+ *     parses it);
+ *   - `null` when the body is a well-formed map that GENUINELY LACKS the id (its
+ *     own key is absent) — a CLEAN ABSENCE, the only history state that can make
+ *     give-up eligible;
+ *   - `undefined` when the body is MALFORMED — `null`, an array, any non-object,
+ *     OR the id's key is PRESENT but its value is null/undefined (a malformed
+ *     present record, NOT confirmed absence) — i.e. UNCERTAIN (the reconciler
+ *     treats undefined as "running", never gives up).
+ */
+export function historyEntryFor(historyJson, promptId) {
+  if (historyJson === null || typeof historyJson !== "object" || Array.isArray(historyJson)) {
+    return undefined; // malformed body ⇒ uncertain, never a clean absence
+  }
+  // Distinguish a GENUINELY ABSENT own key (clean absence ⇒ null) from a PRESENT
+  // key carrying a null/undefined value (a malformed present record ⇒ uncertain).
+  // Only a truly-absent key is give-up eligible (codex P1).
+  if (!Object.prototype.hasOwnProperty.call(historyJson, promptId)) {
+    return null; // key absent ⇒ clean absence
+  }
+  const entry = historyJson[promptId];
+  return entry == null ? undefined : entry; // present-but-null ⇒ uncertain
+}
+
 // Extract a row's prompt_id: array rows are `[number, prompt_id, …]` (index 0 a
 // number, index 1 a string), object rows are `{prompt_id: string}`. Anything that
 // doesn't match a recognized shape is malformed ⇒ null (so it can't masquerade as

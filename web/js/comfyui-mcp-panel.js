@@ -148,7 +148,7 @@ import { saveActiveWorkflow, shouldGroundBeforeTurn, groundActiveWorkflow } from
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
-import { queueMembership } from "./lib/history-reconcile.js";
+import { queueMembership, historyEntryFor } from "./lib/history-reconcile.js";
 import {
   shouldResumeAfterComfyReconnect,
   shouldRehelloAfterCommand,
@@ -15137,13 +15137,15 @@ function buildPanel() {
             // A non-OK response (e.g. 503 while the server is busy/restarting) is
             // UNCERTAIN — NOT a clean "absent from history". THROW so the reconciler
             // takes its "history unreachable → running" path and never gives up on a
-            // prompt whose result might just be temporarily unreadable (codex P1). A
-            // clean 200 with no entry for this id is the real absence → return null.
+            // prompt whose result might just be temporarily unreadable (codex P1).
             if (!res || !res.ok) {
               throw new Error(`/history ${res ? res.status : "unreachable"}`);
             }
-            const j = await res.json();
-            return (j && j[promptId]) ?? null;
+            // historyEntryFor applies the SAME strictness as /queue: only a
+            // WELL-FORMED history map lacking the id normalizes to null (clean
+            // absence, give-up eligible); a malformed 200 body (null/array/non-
+            // object) ⇒ undefined (uncertain → running, never given up).
+            return historyEntryFor(await res.json(), promptId);
           },
           // Is the prompt still in ComfyUI's /queue (running OR pending)? Absence
           // from /history is NORMAL for a queued/running prompt — ComfyUI writes
