@@ -101,6 +101,7 @@ import {
   reapplyDefsToLiveNodes,
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing } from "./lib/node-resolve.js";
+import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
 import {
   resolveScope,
   describeScope,
@@ -177,54 +178,56 @@ let nodeDefRefreshInFlight = null;
 // suppress a genuine miss (codex WS-3 finding #4). Reset to false whenever the
 // backend socket drops, since the combos may be about to change under us.
 let nodeDefsRefreshConfirmed = false;
-async function refreshComfyNodeDefs(preloadedDefs) {
-  if (nodeDefRefreshInFlight) return nodeDefRefreshInFlight;
-  nodeDefRefreshInFlight = (async () => {
-    // Trust the live combos for suppressing missing-asset candidates ONLY once
-    // the combo refresh has ACTUALLY RUN and succeeded. If refreshComboInNodes is
-    // absent on this ComfyUI build (or throws), the combos are still whatever
-    // page-load left them — possibly stale — so we must stay in over-report-safe
-    // mode and NOT trust them (finding #4).
-    let comboRefreshed = false;
-    try {
-      const a =
-        typeof app !== "undefined" && app ? app : window.comfyAPI?.app?.app;
-      if (!a) return;
-      // Re-register node definitions so newly installed/updated classes and
-      // their current widget schemas are known to LiteGraph (#221/#171). Reuse
-      // an already-fetched /object_info payload when the caller supplies one
-      // (graph_add_node passes the fresh defs it just validated against, #289) so
-      // we never round-trip /object_info twice for a single add.
-      let defs = preloadedDefs ?? null;
-      if (typeof a.registerNodesFromDefs === "function") {
-        if (!defs && typeof api?.getNodeDefs === "function") {
-          defs = await api.getNodeDefs();
-        }
-        if (defs) await a.registerNodesFromDefs(defs);
+// The actual (idempotent) node-def registration; the coalescer owns the in-flight
+// slot lifecycle, so this MUST NOT clear it. Reuses a caller-supplied /object_info
+// payload when present (graph_add_node passes the fresh defs it just validated
+// against, #289) so a single add never round-trips /object_info twice.
+async function registerComfyNodeDefs(preloadedDefs) {
+  // Trust the live combos for suppressing missing-asset candidates ONLY once the
+  // combo refresh has ACTUALLY RUN and succeeded. If refreshComboInNodes is absent on
+  // this ComfyUI build (or throws), the combos are still whatever page-load left them
+  // — possibly stale — so we must stay in over-report-safe mode (finding #4).
+  let comboRefreshed = false;
+  try {
+    const a = typeof app !== "undefined" && app ? app : window.comfyAPI?.app?.app;
+    if (!a) return;
+    // Re-register node definitions so newly installed/updated classes and their
+    // current widget schemas are known to LiteGraph (#221/#171).
+    let defs = preloadedDefs ?? null;
+    if (typeof a.registerNodesFromDefs === "function") {
+      if (!defs && typeof api?.getNodeDefs === "function") {
+        defs = await api.getNodeDefs();
       }
-      // registerNodesFromDefs mints NEW classes; already-loaded node INSTANCES
-      // keep their old constructor and would never see the fresh schema. Stamp
-      // the fresh def onto existing instances + repair UNKNOWN widgets so old
-      // nodes are actually fixed, not just newly-created ones (finding #3).
-      if (defs) {
-        const rootGraph = a.graph ?? a.canvas?.graph;
-        if (rootGraph) reapplyDefsToLiveNodes(rootGraph, defs);
-      }
-      // Refresh combo widget option lists (model dropdowns etc.) so freshly
-      // installed models resolve and stale entries clear (#185/#181/#223).
-      if (typeof a.refreshComboInNodes === "function") {
-        await a.refreshComboInNodes();
-        comboRefreshed = true;
-      }
-    } catch (e) {
-      console.warn("[comfyui-mcp-panel] node-def refresh after reconnect failed:", e);
-    } finally {
-      nodeDefsRefreshConfirmed = comboRefreshed;
-      nodeDefRefreshInFlight = null;
+      if (defs) await a.registerNodesFromDefs(defs);
     }
-  })();
-  return nodeDefRefreshInFlight;
+    // registerNodesFromDefs mints NEW classes; already-loaded node INSTANCES keep
+    // their old constructor and would never see the fresh schema. Stamp the fresh
+    // def onto existing instances + repair UNKNOWN widgets (finding #3).
+    if (defs) {
+      const rootGraph = a.graph ?? a.canvas?.graph;
+      if (rootGraph) reapplyDefsToLiveNodes(rootGraph, defs);
+    }
+    // Refresh combo widget option lists (model dropdowns etc.) so freshly installed
+    // models resolve and stale entries clear (#185/#181/#223).
+    if (typeof a.refreshComboInNodes === "function") {
+      await a.refreshComboInNodes();
+      comboRefreshed = true;
+    }
+  } catch (e) {
+    console.warn("[comfyui-mcp-panel] node-def refresh after reconnect failed:", e);
+  } finally {
+    nodeDefsRefreshConfirmed = comboRefreshed;
+  }
 }
+
+// Single-flight refresh that never drops a caller-supplied fresh payload (#289 P2).
+const refreshComfyNodeDefs = makeRefreshCoalescer({
+  getInFlight: () => nodeDefRefreshInFlight,
+  setInFlight: (p) => {
+    nodeDefRefreshInFlight = p;
+  },
+  runRegister: registerComfyNodeDefs,
+});
 
 function setupListeners() {
   if (!api) return;

@@ -246,19 +246,37 @@ test("#458: backend defines the type but the refresh CANNOT register it ⇒ FAIL
   );
 });
 
-test("#458: no fresh object_info (backend unreachable) ⇒ degrade to registry guard, unknown fails closed", async () => {
+test("#458: fresh object_info unavailable (null) ⇒ FAIL CLOSED, does not authorize from the registry", async () => {
   const reg = unreachableRegistry(); // no core sentinels
   await assert.rejects(
     () =>
       assertAddNodeResolvableRefreshing(() => reg, "SeedVR2LoadDiTModel", {
-        getFreshObjectInfo: async () => null, // fetch failed
+        getFreshObjectInfo: async () => null, // fetch failed / unavailable
         refresh: async () => {},
       }),
-    /node definitions are not loaded|backend is unreachable/i,
+    /cannot verify node type|object_info is unavailable|backend is unreachable/i,
   );
 });
 
-test("add_node: a THROWING object_info fetch degrades to the registry guard", async () => {
+test("#458/P1-2: a REGISTERED type + a REJECTING object_info fetch ⇒ FAIL CLOSED (no stale-registry authorization)", async () => {
+  // The exact P1-2 hole: GoneNode is still in the registry (pack removed but not
+  // purged), and the fresh /object_info fetch transiently REJECTS. The old fallback
+  // authorized from the registry and would construct GoneNode. It must fail closed.
+  const reg = loadedRegistry(["GoneNode"]); // registry HIT
+  assert.ok(isRegisteredNodeType(reg, "GoneNode"), "precondition: registry still holds GoneNode");
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, "GoneNode", {
+        getFreshObjectInfo: async () => {
+          throw new Error("object_info fetch failed (transient)");
+        },
+        refresh: async () => {},
+      }),
+    /cannot verify node type|object_info is unavailable/i,
+  );
+});
+
+test("add_node: a THROWING object_info fetch FAILS CLOSED (does not trust the registry)", async () => {
   const reg = loadedRegistry(); // reachable per registry; type unknown
   await assert.rejects(
     () =>
@@ -268,7 +286,7 @@ test("add_node: a THROWING object_info fetch degrades to the registry guard", as
         },
         refresh: async () => {},
       }),
-    /Unknown node type "StillUnknown"/,
+    /cannot verify node type|object_info is unavailable/i,
   );
 });
 

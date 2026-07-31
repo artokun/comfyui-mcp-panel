@@ -57,12 +57,13 @@ const REQUIRED_METHODS = [
   'renameWorkflow'
 ]
 
-// Save-As is version-variable. The panel is viable if ANY of these routes is
-// fully present. This is the crux of the #268 fix: never depend on a single
-// method that a future frontend may drop.
+// Save-As: the panel now uses ONLY the ATOMIC low-level trio. The high-level
+// `saveWorkflowAs` is DELIBERATELY not used — it writes by prompting and can
+// delete+overwrite an existing target (a TOCTOU data-loss no pre-check can close,
+// #226/#309 P1-1), so the panel refuses rather than route a collision-capable
+// Save-As through it. The trio must be present for Save-As to work.
 const SAVE_AS_ROUTES = [
-  ['saveWorkflowAs'], //                              1.45.x high-level copy
-  ['saveAs', 'saveWorkflow', 'openWorkflow'] //       1.47.x low-level copy trio
+  ['saveAs', 'saveWorkflow', 'openWorkflow'] //       1.47.x low-level atomic copy trio
 ]
 
 // Optional, always called behind a `typeof … === "function"` guard, so its

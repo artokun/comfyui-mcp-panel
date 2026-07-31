@@ -87,9 +87,11 @@ export function assertAddNodeResolvable(registry, class_type) {
  *      page-load registry predates it, `refresh` (re-register the fresh defs) and
  *      re-check; if it still can't be registered, fail closed rather than let
  *      LiteGraph mint a placeholder.
- *   4. If fresh /object_info is UNAVAILABLE (backend unreachable / no fetch) →
- *      degrade to the registry-only guard, which fails closed for unknown types and
- *      distinguishes "unreachable" from "unknown".
+ *   4. If a fresh-oracle IS wired but /object_info is UNAVAILABLE (fetch rejected /
+ *      returned nothing) → FAIL CLOSED with a "cannot verify against backend" error.
+ *      We must NOT fall back to the stale registry: a transient fetch failure would
+ *      otherwise authorize a since-removed type (#458/P1-2). Only a caller that
+ *      wires NO fresh-oracle at all degrades to the registry-only guard.
  *
  *   getRegistry        : () => the LIVE registry object (re-invoked after refresh).
  *   getFreshObjectInfo : optional async () => the CURRENT /object_info map (keyed by
@@ -103,16 +105,25 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
   const readRegistry = () =>
     typeof getRegistry === "function" ? getRegistry() : getRegistry;
 
-  let freshDefs = null;
+  // When a fresh-oracle capability is wired (the panel always wires it), the FRESH
+  // /object_info is the ONLY authority. If it can't be consulted (fetch rejected /
+  // returned nothing), we must FAIL CLOSED — NOT fall back to the stale registry,
+  // which keeps positives for removed packs (a transient fetch failure would
+  // otherwise authorize a since-uninstalled type, #458/P1-2).
   if (typeof getFreshObjectInfo === "function") {
+    let freshDefs = null;
     try {
       freshDefs = await getFreshObjectInfo();
     } catch {
-      freshDefs = null; // fetch failed ⇒ fall back to the registry-only guard
+      freshDefs = null;
     }
-  }
-
-  if (freshDefs && typeof freshDefs === "object") {
+    if (!freshDefs || typeof freshDefs !== "object") {
+      throw new Error(
+        `cannot verify node type "${class_type}" against the ComfyUI backend ` +
+          `(object_info is unavailable — the backend is unreachable or the fetch failed). ` +
+          `Refusing to add rather than trust a possibly-stale node cache (#458). Reconnect ComfyUI and retry.`,
+      );
+    }
     // AUTHORITATIVE: does the LIVE backend provide this type right now?
     if (!Object.prototype.hasOwnProperty.call(freshDefs, class_type)) {
       // Not defined by the current backend (never installed, or its pack was
@@ -141,9 +152,9 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
     );
   }
 
-  // No fresh /object_info (backend unreachable, or no fetch capability): degrade to
-  // the registry-only guard — still fails closed for unknown types, and names the
-  // "backend unreachable" vs "unknown type" cases distinctly (#458).
+  // No fresh-oracle capability wired at all (a caller that does not supply
+  // getFreshObjectInfo — not the panel): degrade to the registry-only guard, which
+  // still fails closed for unknown types and names unreachable-vs-unknown (#458).
   assertAddNodeResolvable(readRegistry(), class_type);
 }
 
