@@ -6,16 +6,29 @@
 // installCustomNode / looksLikeGitUrl / gitCheckoutDir logic
 // (src/services/node-management.ts).
 
-/** Does this identifier look like a git URL (vs a registry id)? Recognizes
+/** Does `s` look like a bare "author/repo" GitHub shorthand — no protocol/scp
+ *  prefix, no ".git" suffix, exactly one "/", plausible path-segment chars on
+ *  both sides? Distinguishes it from a slash-free registry id (e.g.
+ *  "rgthree-comfy") and from anything already caught by looksLikeGitUrl's other
+ *  branches (a "://" or "git@" form has more than one meaningful "/" or a colon
+ *  that this pattern's char class excludes). #301. */
+export function looksLikeOwnerRepoShorthand(s) {
+  return typeof s === "string" && /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(s);
+}
+
+/** Does this identifier look like a git URL (vs a plain registry id)? Recognizes
  *  https(s)://, ssh://, git:// (and git+…), the scp-form git@host:owner/repo,
- *  and any value ending in ".git". */
+ *  any value ending in ".git", and a bare "author/repo" shorthand (#301 — the
+ *  documented `id` form that a plain registry lookup can't resolve, so it must
+ *  route like a git install instead of being sent verbatim to Manager). */
 export function looksLikeGitUrl(s) {
   return (
     typeof s === "string" &&
     (/^(https?|ssh|git):\/\//i.test(s) ||
       /^git\+/i.test(s) ||
       /^git@/i.test(s) ||
-      s.endsWith(".git"))
+      s.endsWith(".git") ||
+      looksLikeOwnerRepoShorthand(s))
   );
 }
 
@@ -34,12 +47,17 @@ export function gitRepoName(url) {
 }
 
 /** Resolve the git URL for an install request, if any. A caller may pass the
- *  URL as `repository` OR directly as `id`; either counts. Returns null for a
- *  plain registry id. */
+ *  URL as `repository` OR directly as `id`; either counts. A bare "author/repo"
+ *  shorthand is expanded to a real, clonable GitHub URL (#301) — v4 only ever
+ *  uses the repo NAME (gitRepoName strips the expansion right back off), but
+ *  the v2-batch/legacy dialects put this value straight into Manager's `files`
+ *  clone list, where the bare shorthand alone is not a fetchable URL. Returns
+ *  null for a plain registry id. */
 export function installGitUrl({ id, repository } = {}) {
-  if (repository && looksLikeGitUrl(repository)) return repository;
-  if (id && looksLikeGitUrl(id)) return id;
-  return null;
+  const candidate =
+    repository && looksLikeGitUrl(repository) ? repository : id && looksLikeGitUrl(id) ? id : null;
+  if (!candidate) return null;
+  return looksLikeOwnerRepoShorthand(candidate) ? `https://github.com/${candidate}` : candidate;
 }
 
 /**

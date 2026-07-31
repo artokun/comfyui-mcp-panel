@@ -6823,8 +6823,16 @@ const GRAPH_TOOL_EXECUTORS = {
     try {
       const isCollapsed = !!(node.flags && node.flags.collapsed);
       if (isCollapsed !== want) {
-        if (typeof node.collapse === "function") node.collapse();
-        else {
+        // node.collapse() early-returns a silent no-op for a non-collapsible
+        // node unless a truthy `force` is passed — pass it, since an explicit
+        // tool call is a direct request for an exact state, not a UI gesture
+        // that should respect `collapsible` (#345). Then verify: if the flag
+        // still doesn't match `want` (collapse() missing, or an older build
+        // without the `force` parameter), write it directly — node.flags.collapsed
+        // is the single source of truth every other read site in this file
+        // already relies on, so this fallback is never a lie about state.
+        if (typeof node.collapse === "function") node.collapse(true);
+        if (!!(node.flags && node.flags.collapsed) !== want) {
           node.flags = node.flags || {};
           node.flags.collapsed = want;
         }
@@ -14797,18 +14805,24 @@ function buildPanel() {
   // When a run finishes with output images, show them in the chat and notify
   // the agent so it knows its render landed (the orchestrator drops the event
   // if no session is attending). On error, notify the agent to diagnose.
-  // Upload a Blob into ComfyUI's input/ folder via the SAME endpoint chat
-  // attachments use (/upload/image writes any blob verbatim) → returns an
-  // ImageRef ({filename, subfolder, type:"input"}) the vision path can resolve,
-  // or null on failure. Mirrors handleImageFile's upload.
-  async function uploadBlobToInput(blob, name) {
+  // Upload a Blob via the SAME endpoint chat attachments use (/upload/image
+  // writes any blob verbatim) → returns an ImageRef ({filename, subfolder, type})
+  // the vision path can resolve, or null on failure. Mirrors handleImageFile's
+  // upload. Defaults to ComfyUI's input/ folder — real user-facing uploads
+  // (chat/apps/civitai/training inputs) need that persistence. Pass
+  // `{ type: "temp" }` for ephemeral panel-generated artifacts (e.g. the
+  // storyboard contact sheet, #209) that must NOT accumulate in input/ —
+  // ComfyUI's own /upload/image + /view both understand `type=temp` and store it
+  // in ComfyUI's swept temp directory instead.
+  async function uploadBlobToInput(blob, name, { type } = {}) {
     try {
       const fd = new FormData();
       fd.append("image", blob, name);
+      if (type) fd.append("type", type);
       const res = await api.fetchApi("/upload/image", { method: "POST", body: fd });
       if (res.status !== 200) return null;
       const info = await res.json();
-      return { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || "input" };
+      return { filename: info.name, subfolder: info.subfolder || undefined, type: info.type || type || "input" };
     } catch {
       return null;
     }
