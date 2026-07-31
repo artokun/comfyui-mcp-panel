@@ -1,0 +1,117 @@
+/**
+ * Unit tests for web/js/lib/queue-rejection.js — run with `node --test`.
+ *
+ * Guards #358: graph_run must NEVER report `queued:true` when ComfyUI refused the
+ * prompt synchronously. ComfyUI rejects on two channels — per-node `node_errors`
+ * (which the frontend stashes on `app.lastNodeErrors`) AND a TOP-LEVEL `error`
+ * (e.g. `missing_node_type`) which the frontend shows in a dialog and then
+ * DISCARDS. The pre-fix code inspected only `lastNodeErrors`, so a pure top-level
+ * rejection left `lastNodeErrors` empty and produced a false `queued:true`. These
+ * tests pin that the top-level error is now surfaced as a real failure.
+ */
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import { summarizePromptRejection, formatTopError } from "../../web/js/lib/queue-rejection.js";
+
+// The exact top-level rejection body from issue #358.
+const MISSING_NODE_TYPE = {
+  type: "missing_node_type",
+  message: "Node 'ID #159' has no class_type. The workflow may be corrupted or a custom node is missing.",
+  details: "Node ID '#159'",
+  extra_info: { node_id: "159", class_type: null, node_title: null },
+};
+
+test("#358: top-level missing_node_type with EMPTY lastNodeErrors is a FAILURE, not queued", () => {
+  // This is the exact regression: pre-fix, lastNodeErrors={} ⇒ verdict null ⇒
+  // caller returned queued:true. Now the captured top-level error yields a failure.
+  const verdict = summarizePromptRejection({
+    rejection: { error: MISSING_NODE_TYPE, node_errors: {} },
+    lastNodeErrors: {},
+  });
+  assert.ok(verdict, "must produce a verdict (not null / not accepted)");
+  assert.equal(verdict.queued, false);
+  assert.equal(verdict.error_type, "missing_node_type");
+  assert.match(verdict.error, /has no class_type/);
+  assert.match(verdict.error, /Node ID '#159'/); // details folded in
+});
+
+test("a genuinely ACCEPTED prompt (no rejection, no node errors) is null ⇒ queued:true", () => {
+  assert.equal(
+    summarizePromptRejection({ rejection: null, lastNodeErrors: {} }),
+    null,
+  );
+  assert.equal(
+    summarizePromptRejection({ rejection: null, lastNodeErrors: null }),
+    null,
+  );
+  // An accepted 200 response carrying an empty node_errors map must NOT be a failure.
+  assert.equal(
+    summarizePromptRejection({ rejection: { error: null, node_errors: {} }, lastNodeErrors: {} }),
+    null,
+  );
+});
+
+test("per-node validation errors (from the rejection body) surface as node_errors", () => {
+  const nodeErrors = { 12: { errors: [{ message: "Value not in list", details: "bad.ckpt" }] } };
+  const verdict = summarizePromptRejection({
+    rejection: { error: null, node_errors: nodeErrors },
+    lastNodeErrors: {},
+  });
+  assert.ok(verdict);
+  assert.equal(verdict.queued, false);
+  assert.deepEqual(verdict.node_errors, nodeErrors);
+  assert.equal(verdict.error, undefined); // no top-level error string when only per-node
+});
+
+test("per-node validation errors from lastNodeErrors (top-level empty) still fail", () => {
+  const nodeErrors = { 7: { errors: [{ message: "required input missing" }] } };
+  const verdict = summarizePromptRejection({
+    rejection: null,
+    lastNodeErrors: nodeErrors,
+  });
+  assert.ok(verdict);
+  assert.equal(verdict.queued, false);
+  assert.deepEqual(verdict.node_errors, nodeErrors);
+});
+
+test("BOTH channels present: top-level error AND per-node errors are both reported", () => {
+  const nodeErrors = { 3: { errors: [{ message: "x" }] } };
+  const verdict = summarizePromptRejection({
+    rejection: { error: MISSING_NODE_TYPE, node_errors: nodeErrors },
+    lastNodeErrors: {},
+  });
+  assert.ok(verdict);
+  assert.equal(verdict.queued, false);
+  assert.equal(verdict.error_type, "missing_node_type");
+  assert.deepEqual(verdict.node_errors, nodeErrors);
+});
+
+test('a string top-level error ("prompt outputs failed validation") is surfaced', () => {
+  const verdict = summarizePromptRejection({
+    rejection: { error: "prompt outputs failed validation", node_errors: {} },
+    lastNodeErrors: {},
+  });
+  assert.ok(verdict);
+  assert.equal(verdict.queued, false);
+  assert.equal(verdict.error, "prompt outputs failed validation");
+  assert.equal(verdict.error_type, undefined); // no structured type for a bare string
+});
+
+test("formatTopError folds message + details and tolerates odd shapes", () => {
+  assert.equal(
+    formatTopError({ type: "t", message: "boom", details: "here" }),
+    "boom (here)",
+  );
+  assert.equal(formatTopError({ type: "only_type" }), "only_type");
+  assert.equal(formatTopError("plain"), "plain");
+  assert.equal(formatTopError(null), "prompt rejected");
+  assert.equal(formatTopError({}), "prompt rejected");
+});
+
+test("empty/whitespace top-level error is NOT treated as a rejection", () => {
+  assert.equal(
+    summarizePromptRejection({ rejection: { error: "   ", node_errors: {} }, lastNodeErrors: {} }),
+    null,
+  );
+});
