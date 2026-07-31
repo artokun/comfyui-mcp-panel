@@ -7132,11 +7132,34 @@ const GRAPH_TOOL_EXECUTORS = {
     // authoritative task-history record: a failure THROWS (surfaced to the agent
     // as a real error with the Manager reason); a real success still reports
     // success; anything inconclusive reports an honest "pending".
+    //
+    // The per-task terminal record is ONLY reachable on the real pip Manager v4
+    // (the "v2" dialect), whose /v2/manager/queue/history?ui_id= returns the task
+    // by id. Released 3.x ("legacy") has NO per-task history endpoint, and the
+    // bundled 3.x server used in --enable-manager-legacy-ui mode ("v2-batch")
+    // serves only BATCH-file history keyed by `id` and REJECTS a ui_id query — so
+    // a per-ui_id poll there would just burn the budget and still learn nothing.
+    // For those dialects keep the fast queued result (a v2-batch failure is
+    // already caught synchronously by assertBatchOk) and report honest pending;
+    // the #364 crash is a v4 do_update, so "v2" is the path that matters.
     const finalizeUpdate = async (via) => {
+      const base = { queued: true, ui_id, id, version: sel, dialect, ...(via ? { via } : {}) };
+      if (dialect !== "v2") {
+        return {
+          ...base,
+          updated: false,
+          verified: false,
+          pending: true,
+          note:
+            "Update queued. This ComfyUI-Manager build does not expose a per-task result, " +
+            "so the outcome could not be auto-verified — poll panel_node_queue_status " +
+            "(which surfaces any recent task failure), then a ComfyUI restart (comfy_reboot) " +
+            "is usually required to load the updated node.",
+        };
+      }
       const { item, status } = await waitForUpdateResult(ui_id);
       const outcome = classifyUpdateOutcome({ item, status, target: id, dialect });
       if (outcome.state === "failed") throw new Error(outcome.message);
-      const base = { queued: true, ui_id, id, version: sel, dialect, ...(via ? { via } : {}) };
       if (outcome.state === "updated") {
         return {
           ...base,
