@@ -69,14 +69,19 @@ import { computeLayout } from "./lib/layout-engine.js";
 import {
   buildInstallRequest,
   classifyInstallOutcome,
+  classifyUpdateOutcome,
+  collectRecentTaskFailures,
   installGitUrl,
   installedListRoute,
   isManagerUnreachable,
   isMethodNotAllowed,
   legacyUpdateBody,
+  parseTaskHistoryItem,
   queueDrained,
   rebootCandidates,
   searchNodesVia,
+  taskFailureReason,
+  taskSucceeded,
 } from "./lib/manager-install.js";
 import {
   CHAT_HISTORY_MAX_IMPORT_BYTES,
@@ -2716,6 +2721,68 @@ async function verifyInstalled(target, dialect, { batchFailed, renameProne } = {
     listError = true;
   }
   return classifyInstallOutcome({ target, dialect, status, installed, listError, batchFailed, renameProne });
+}
+
+/** Budget for the post-enqueue update verification (#364). Bounded well under
+ *  the orchestrator's per-command timeout (panel_update_node calls with 30s) so
+ *  a genuine, slow update reports an honest "unverified/pending" rather than
+ *  timing the whole command out. A crashed do_update records its error terminal
+ *  within a poll or two, so this comfortably catches the false-success bug. */
+const UPDATE_VERIFY_BUDGET_MS = 15000;
+
+/**
+ * After an update is queued+started, resolve the task's TRUE terminal outcome by
+ * polling the Manager's PER-TASK history (by ui_id) — the authoritative signal
+ * the aggregate queue/status cannot give (a crashed `do_update` still increments
+ * done_count and looks "done", #364). Bounded: never runs past the deadline, and
+ * returns the last { item, status } seen (item null if the task never reached a
+ * terminal record in the window — legacy Manager without /v2 history, still
+ * running, or an unrecognized shape). Never throws — classifyUpdateOutcome
+ * re-derives the verdict, so an absent/unreadable record is "unverified", never
+ * a false verdict.
+ */
+async function waitForUpdateResult(ui_id, { timeoutMs = UPDATE_VERIFY_BUDGET_MS, intervalMs = 1200 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  const route = `manager/queue/history?ui_id=${encodeURIComponent(ui_id)}`;
+  let item = null;
+  let status = null;
+  const readHistory = async () => {
+    const perFetch = Math.max(1000, Math.min(MANAGER_FETCH_TIMEOUT_MS, deadline - Date.now()));
+    try {
+      const resp = await managerGet(route, { signal: AbortSignal.timeout(perFetch) });
+      return parseTaskHistoryItem(resp, ui_id);
+    } catch {
+      // history endpoint absent (legacy Manager) or transient — inconclusive.
+      return null;
+    }
+  };
+  const readStatus = async () => {
+    const perFetch = Math.max(1000, Math.min(MANAGER_FETCH_TIMEOUT_MS, deadline - Date.now()));
+    try {
+      return await managerGet("manager/queue/status", { signal: AbortSignal.timeout(perFetch) });
+    } catch {
+      return null;
+    }
+  };
+  // Give the worker a beat to pick up the task before the first history read.
+  await boundedDelay(800, deadline);
+  while (Date.now() < deadline) {
+    item = await readHistory();
+    // A terminal per-task record (success OR failure) ends the wait immediately.
+    if (item && (taskSucceeded(item) || taskFailureReason(item))) {
+      status = await readStatus();
+      return { item, status };
+    }
+    // No terminal record yet. If the queue has POSITIVELY drained the worker is
+    // done, so one last history read then stop — no point waiting out the budget.
+    status = await readStatus();
+    if (queueDrained(status)) {
+      item = await readHistory();
+      return { item, status };
+    }
+    await boundedDelay(intervalMs, deadline);
+  }
+  return { item, status };
 }
 
 /** Normalize an outbound image descriptor so its string-ish fields can never
@@ -7046,8 +7113,6 @@ const GRAPH_TOOL_EXECUTORS = {
     const dialect = await detectManagerDialect();
     const ui_id = crypto.randomUUID();
     const client_id = api.clientId ?? api.initialClientId ?? "comfyui-mcp-panel";
-    const note =
-      "Update queued. Poll nodes_queue_status; a ComfyUI restart (comfy_reboot) is usually required to load the updated node.";
     // #424: the absolute (no-/v2) legacy self-update route. Updating the
     // ComfyUI-Manager node ITSELF (id 'comfyui-manager') through a /v2 task or
     // batch envelope 405s on a legacy Manager — that POST /v2 route is a
@@ -7058,6 +7123,54 @@ const GRAPH_TOOL_EXECUTORS = {
       const body = legacyUpdateBody({ ui_id, id, version });
       await managerCall("manager/queue/update", { method: "POST", body });
       await managerCall("manager/queue/start", { method: "POST" });
+    };
+    // #364: after the task is queued+started, VERIFY its terminal per-task status
+    // instead of blindly reporting `queued:true`. The aggregate queue/status
+    // marks a CRASHED do_update "done" (it still increments done_count), so a
+    // Manager-side failure — e.g. `AttributeError: 'InstallPackParams' object has
+    // no attribute 'node_name'` — used to be reported as a success. classify the
+    // authoritative task-history record: a failure THROWS (surfaced to the agent
+    // as a real error with the Manager reason); a real success still reports
+    // success; anything inconclusive reports an honest "pending".
+    //
+    // The per-task terminal record is ONLY reachable on the real pip Manager v4
+    // (the "v2" dialect), whose /v2/manager/queue/history?ui_id= returns the task
+    // by id. Released 3.x ("legacy") has NO per-task history endpoint, and the
+    // bundled 3.x server used in --enable-manager-legacy-ui mode ("v2-batch")
+    // serves only BATCH-file history keyed by `id` and REJECTS a ui_id query — so
+    // a per-ui_id poll there would just burn the budget and still learn nothing.
+    // For those dialects keep the fast queued result (a v2-batch failure is
+    // already caught synchronously by assertBatchOk) and report honest pending;
+    // the #364 crash is a v4 do_update, so "v2" is the path that matters.
+    const finalizeUpdate = async (via) => {
+      const base = { queued: true, ui_id, id, version: sel, dialect, ...(via ? { via } : {}) };
+      if (dialect !== "v2") {
+        return {
+          ...base,
+          updated: false,
+          verified: false,
+          pending: true,
+          note:
+            "Update queued. This ComfyUI-Manager build does not expose a per-task result, " +
+            "so the outcome could not be auto-verified — poll panel_node_queue_status " +
+            "(which surfaces any recent task failure), then a ComfyUI restart (comfy_reboot) " +
+            "is usually required to load the updated node.",
+        };
+      }
+      const { item, status } = await waitForUpdateResult(ui_id);
+      const outcome = classifyUpdateOutcome({ item, status, target: id, dialect });
+      if (outcome.state === "failed") throw new Error(outcome.message);
+      if (outcome.state === "updated") {
+        return {
+          ...base,
+          updated: true,
+          verified: true,
+          note:
+            "Update applied and VERIFIED by the ComfyUI-Manager task. A ComfyUI restart " +
+            "(comfy_reboot) is usually required to load the updated node.",
+        };
+      }
+      return { ...base, updated: false, verified: false, pending: true, note: outcome.message };
     };
     if (dialect === "v2") {
       const params = {
@@ -7079,9 +7192,9 @@ const GRAPH_TOOL_EXECUTORS = {
       } catch (err) {
         if (!isMethodNotAllowed(err)) throw err;
         await legacyUpdate();
-        return { queued: true, ui_id, id, version: sel, dialect, via: "legacy-self-update", note };
+        return finalizeUpdate("legacy-self-update");
       }
-      return { queued: true, ui_id, id, version: sel, dialect, note };
+      return finalizeUpdate();
     }
     // v2-batch + legacy: 3.x update body {ui_id, id, version} (issues #187/#182).
     const body = { ui_id, id, version: sel };
@@ -7096,16 +7209,42 @@ const GRAPH_TOOL_EXECUTORS = {
       } catch (err) {
         if (!isMethodNotAllowed(err)) throw err;
         await legacyUpdate();
-        return { queued: true, ui_id, id, version: sel, dialect, via: "legacy-self-update", note };
+        return finalizeUpdate("legacy-self-update");
       }
     } else {
       await legacyUpdate();
     }
-    return { queued: true, ui_id, id, version: sel, dialect, note };
+    return finalizeUpdate();
   },
 
   async nodes_queue_status() {
-    return { status: await managerGet("manager/queue/status") };
+    const status = await managerGet("manager/queue/status");
+    // #364: the aggregate status cannot reveal a FAILED task — a crashed
+    // do_update still counts toward done_count and looks "done". Surface the
+    // recent per-task FAILURES from the Manager task history so a post-hoc poll
+    // of an idle queue does not read a silent "done" over a task that errored.
+    // Best-effort: a legacy Manager without /v2 history (or a transient error)
+    // just returns the status alone, exactly as before.
+    let recentFailures = [];
+    try {
+      const hist = await managerGet("manager/queue/history?max_items=20", {
+        signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS),
+      });
+      recentFailures = collectRecentTaskFailures(hist);
+    } catch {
+      /* history endpoint absent/transient — status alone */
+    }
+    if (recentFailures.length) {
+      return {
+        status,
+        recent_failures: recentFailures,
+        note:
+          `${recentFailures.length} recent ComfyUI-Manager task(s) FAILED (see recent_failures). ` +
+          `A drained queue that shows "done" does NOT mean every task succeeded — check these ` +
+          `before reporting an install/update as successful.`,
+      };
+    }
+    return { status };
   },
 
   async comfy_reboot({ force } = {}) {
