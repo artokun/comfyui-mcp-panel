@@ -217,8 +217,18 @@ function makeSubgraphFixture(innerType = "KSampler") {
     id: 66,
     type: "SubgraphNode",
     subgraph,
-    inputs: [{ name: "sched_alias", _subgraphSlot: { name: "sched_alias" } }],
-    widgets: [{ name: "scheduler", type: "combo", options: { values: ["simple"] }, value: 999 }],
+    // Host input carries the litegraph `widget` backlink to the parent's own
+    // authoritative rail widget (#366) — what serializes at queue time.
+    inputs: [{ name: "sched_alias", widget: { name: "sched_alias" }, _subgraphSlot: { name: "sched_alias" } }],
+    widgets: [
+      // Decoy own-widget named after the INNER source — must stay untouched (#233).
+      { name: "scheduler", type: "combo", options: { values: ["simple"] }, value: 999 },
+      // AUTHORITATIVE parent rail widget (backed by the host input) — gets synced.
+      { name: "sched_alias", type: "combo", options: { values: ["simple", "karras"] }, value: "simple" },
+    ],
+    getWidgetFromSlot(input) {
+      return this.widgets.find((w) => w.name === input?.widget?.name) ?? null;
+    },
   };
   const resolveSource = (_n, si) =>
     si?.name === "sched_alias" ? { sourceNodeId: "54", sourceWidgetName: "scheduler" } : null;

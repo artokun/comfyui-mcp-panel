@@ -9346,12 +9346,25 @@ function describeCommand(cmd, msg, reply) {
       };
     case "graph_disconnect":
       return { icon: "pi-times-circle", text: `Disconnected ${r.disconnected?.node_id}.${r.disconnected?.input}` };
-    case "graph_set_widget":
-      return {
-        icon: "pi-sliders-h",
-        text: `Set ${r.set?.widget} = ${JSON.stringify(r.set?.value)} on node ${r.set?.node_id}`,
-        detail: `was ${JSON.stringify(r.set?.previous)}`,
-      };
+    case "graph_set_widget": {
+      // #366: a promoted-subgraph write is only truly applied when the parent RAIL
+      // widget (what serializes at queue time) was synced. The lib fails closed if
+      // it can't, so a success result normally has parent_widget_synced !== false;
+      // but guard defensively — never render an un-synced promoted write as a plain
+      // "Set …" success, or the summary would repeat the exact #366 lie.
+      const railStale = r.set?.promoted_from && r.set.promoted_from.parent_widget_synced === false;
+      return railStale
+        ? {
+            icon: "pi-exclamation-triangle",
+            text: `Set ${r.set?.widget} = ${JSON.stringify(r.set?.value)} on node ${r.set?.node_id} — WARNING: parent subgraph rail NOT synced; the render may use the OLD value (#366)`,
+            detail: `was ${JSON.stringify(r.set?.previous)}`,
+          }
+        : {
+            icon: "pi-sliders-h",
+            text: `Set ${r.set?.widget} = ${JSON.stringify(r.set?.value)} on node ${r.set?.node_id}`,
+            detail: `was ${JSON.stringify(r.set?.previous)}`,
+          };
+    }
     case "graph_get_subgraph":
       return {
         icon: "pi-sitemap",
