@@ -488,3 +488,172 @@ export function rebootCandidates(dialect) {
     ? [legacyPost, v2, legacyGet]
     : [v2, legacyPost, legacyGet];
 }
+
+// ---------------------------------------------------------------------------
+// Per-task terminal-status interpretation (#364)
+//
+// The aggregate /v2/manager/queue/status endpoint CANNOT reveal a failed task:
+// a task that crashed (e.g. `do_update` raising AttributeError) is still moved
+// into history and still counts toward `done_count` — so the queue reports
+// `done_count:1 / is_processing:false` and looks exactly like a success. The
+// AUTHORITATIVE per-task verdict lives in the Manager task history
+// (/v2/manager/queue/history), where each task carries a
+// `status: { status_str, completed, messages }` and a `result` string. On a
+// crash the worker records `status.status_str = "error"` (or `"failed"`) with
+// the exception text in `messages`/`result`. These pure helpers interpret that
+// record so `graph_update_node` can report a REAL failure instead of a blind
+// `queued:true`, and so `nodes_queue_status` can surface recent task failures.
+// Kept standalone (no browser globals) for `node --test`.
+// ---------------------------------------------------------------------------
+
+/** Manager OperationResult values (data_models/generated_models.py):
+ *  success | failed | skipped | error | skip. "success"/"skip"/"skipped" are
+ *  non-failure terminals; "error"/"failed" are failures. */
+const TASK_SUCCESS_STATUS = new Set(["success", "skip", "skipped"]);
+const TASK_FAILURE_STATUS = new Set(["error", "failed"]);
+
+/** Is `v` a plausible Manager task-history ENTRY — a plain object carrying at
+ *  least one recognizable task field? Guards map/array traversal and the
+ *  single-item (ui_id-queried) shape against error envelopes and junk. */
+function isTaskHistoryItem(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+  return "status" in v || "result" in v || "kind" in v || "ui_id" in v;
+}
+
+/** The task's `status.status_str` (an OperationResult value) if present. */
+function taskStatusStr(item) {
+  const status = item && typeof item === "object" ? item.status : undefined;
+  const s = status && typeof status === "object" ? status.status_str : undefined;
+  return typeof s === "string" ? s : undefined;
+}
+
+/**
+ * POSITIVE failure reason for a Manager task-history item, or null when the item
+ * is NOT a definitive failure. A failure is asserted ONLY on an explicit failure
+ * terminal (`status.status_str` ∈ {error, failed}) — never inferred from a
+ * missing/unknown status (that stays inconclusive, so a task still running or a
+ * shape we don't recognize can never become a FALSE failure). Prefers the
+ * `status.messages` (the crash/exception text) for the reason, then `result`.
+ */
+export function taskFailureReason(item) {
+  if (!isTaskHistoryItem(item)) return null;
+  if (!TASK_FAILURE_STATUS.has(taskStatusStr(item))) return null;
+  const status = item.status;
+  const messages =
+    status && Array.isArray(status.messages)
+      ? status.messages.filter((m) => typeof m === "string" && m.trim())
+      : [];
+  if (messages.length) return messages.join("; ");
+  if (typeof item.result === "string" && item.result.trim() && item.result !== "success") {
+    return item.result;
+  }
+  return "the Manager reported the task as failed (no detail provided)";
+}
+
+/** POSITIVE success terminal — an explicit success/skip status. A skip ("already
+ *  up to date") is a legitimate no-op success for an update. */
+export function taskSucceeded(item) {
+  return isTaskHistoryItem(item) && TASK_SUCCESS_STATUS.has(taskStatusStr(item));
+}
+
+/**
+ * Extract the single task-history item for `ui_id` from a /v2/manager/queue/history
+ * response. Handles BOTH server shapes:
+ *   - ui_id-queried: `{ history: <item> }` (the item itself), and
+ *   - unfiltered/map: `{ history: { <ui_id>: <item>, … } }`.
+ * A bare item (already unwrapped) is accepted too. Returns null when absent
+ * (task not yet recorded) or malformed — the caller then stays "unverified".
+ */
+export function parseTaskHistoryItem(resp, ui_id) {
+  const history =
+    resp && typeof resp === "object" && "history" in resp ? resp.history : resp;
+  if (!history || typeof history !== "object") return null;
+  // Single-item (ui_id-queried) shape: the item carries task fields directly.
+  if (isTaskHistoryItem(history)) {
+    const own = typeof history.ui_id === "string" ? history.ui_id : undefined;
+    if (ui_id && own && own !== ui_id) return null;
+    return history;
+  }
+  // Map keyed by ui_id.
+  if (ui_id && isTaskHistoryItem(history[ui_id])) return history[ui_id];
+  return null;
+}
+
+/** The pack id a task acted on, for correlation in surfaced failures. */
+function taskParamId(item) {
+  const p = item && typeof item === "object" ? item.params : undefined;
+  if (p && typeof p === "object") {
+    for (const k of ["node_name", "id", "cnr_id", "aux_id"]) {
+      if (typeof p[k] === "string" && p[k].trim()) return p[k];
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Collect the FAILED tasks from a /v2/manager/queue/history response (map or
+ * array form) as compact `{ ui_id, kind, id, result }` records. Used by
+ * nodes_queue_status so a post-hoc poll of an idle queue does not read a silent
+ * "done" over a task that actually errored (#364). Only positive failures
+ * (taskFailureReason) are included; capped to the most recent `limit`.
+ */
+export function collectRecentTaskFailures(resp, { limit = 20 } = {}) {
+  const history =
+    resp && typeof resp === "object" && "history" in resp ? resp.history : resp;
+  if (!history || typeof history !== "object") return [];
+  const items = Array.isArray(history) ? history : Object.values(history);
+  const out = [];
+  for (const item of items) {
+    const reason = taskFailureReason(item);
+    if (!reason) continue;
+    out.push({
+      ui_id: typeof item.ui_id === "string" ? item.ui_id : undefined,
+      kind: typeof item.kind === "string" ? item.kind : undefined,
+      id: taskParamId(item),
+      result: reason,
+    });
+  }
+  return out.slice(-limit);
+}
+
+/**
+ * Decide the TRUE outcome of an UPDATE after it was queued+started (#364). Pure,
+ * unit-testable. Precedence guarantees neither a false success nor a false
+ * failure:
+ *   1. "failed"    — the per-task history item is an explicit failure terminal
+ *                    (status_str error/failed). Surfaces the Manager reason.
+ *   2. "updated"   — the per-task item is an explicit success/skip terminal.
+ *   3. "unverified"— no terminal task record yet (still running, history not
+ *                    served by a legacy Manager, or a shape we don't recognize).
+ *                    Honest "queued, could not confirm" — NEVER a failure.
+ * @param {{ item?:unknown, status?:unknown, target:string, dialect?:string }} input
+ */
+export function classifyUpdateOutcome({ item, status, target, dialect } = {}) {
+  const reason = taskFailureReason(item);
+  if (reason) {
+    return {
+      state: "failed",
+      status,
+      message:
+        `Update of "${target}" FAILED: the ComfyUI-Manager task terminated with an ` +
+        `error` +
+        (dialect ? ` (dialect ${dialect})` : "") +
+        `: ${reason}. The pack was NOT updated — check the ComfyUI server log for the ` +
+        `full traceback.`,
+    };
+  }
+  if (taskSucceeded(item)) {
+    return { state: "updated", status };
+  }
+  return {
+    state: "unverified",
+    status,
+    message:
+      `Update of "${target}" was queued but its outcome could NOT be confirmed` +
+      (dialect ? ` (dialect ${dialect})` : "") +
+      ` — the Manager task has not reported a terminal result. This is NOT a reported ` +
+      `failure. Poll panel_node_queue_status; a ComfyUI restart (comfy_reboot) is ` +
+      `usually required to load an updated node. If it still misbehaves, check the ` +
+      `ComfyUI server log.`,
+  };
+}
