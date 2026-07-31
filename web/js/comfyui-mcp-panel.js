@@ -147,6 +147,8 @@ import { pickRevertSnapshot } from "./lib/graph-revert.js";
 import { saveActiveWorkflow, shouldGroundBeforeTurn, groundActiveWorkflow } from "./lib/workflow-save.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
+import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
+import { queueMembership, historyEntryFor } from "./lib/history-reconcile.js";
 import {
   shouldResumeAfterComfyReconnect,
   shouldRehelloAfterCommand,
@@ -158,6 +160,12 @@ import {
 
 let app = null;
 let api = null;
+
+// The live run-completion tracker (created in buildPanel). Held at module scope
+// so the module-level tool handlers (e.g. graph_run) can register a freshly
+// queued prompt_id for #370 reconnect reconciliation, even though the tracker
+// lives in buildPanel's closure.
+let runCompletionRef = null;
 
 // Execution-error capture so graph_get_errors can report the most recent failure
 // even if it predates the agent's question. Wired once `api` is ready (via
@@ -5850,7 +5858,14 @@ const GRAPH_TOOL_EXECUTORS = {
     if (typeof app.queuePrompt !== "function") {
       throw new Error("app.queuePrompt is unavailable on this frontend");
     }
-    const batch = Number(batch_count ?? 1);
+    // Clamp batch_count to a sane range: coerce to a positive integer and cap it,
+    // so an absurd value can't queue thousands of prompts (each of which would
+    // register a #370 recovery-ledger entry) — bounding memory + the ComfyUI queue.
+    const MAX_BATCH = 64;
+    const requestedBatch = Math.floor(Number(batch_count ?? 1));
+    const batch = Number.isFinite(requestedBatch)
+      ? Math.min(Math.max(requestedBatch, 1), MAX_BATCH)
+      : 1;
 
     // "Run to node" = ComfyUI partial execution. The server keeps an OUTPUT node
     // (SaveImage/PreviewImage/SaveVideo/…) as an execution root only when its id
@@ -5886,16 +5901,91 @@ const GRAPH_TOOL_EXECUTORS = {
 
     // app.queuePrompt(number, batchCount, queueNodeIds) — the 3rd arg becomes the
     // request's partial_execution_targets (queue-service signature; ComfyUI 0.26.2).
-    await app.queuePrompt(0, batch, partialTargets);
-    // queuePrompt swallows validation failures into lastNodeErrors.
-    const nodeErrors =
-      app.lastNodeErrors && Object.keys(app.lastNodeErrors).length ? app.lastNodeErrors : null;
-    if (nodeErrors) return { queued: false, node_errors: nodeErrors };
-    return {
-      queued: true,
-      batch_count: batch,
-      ...(partialTargets ? { ran_to_node: Number(to_node_id) } : {}),
-    };
+    //
+    // #358: app.queuePrompt SWALLOWS a synchronous rejection. It stores per-node
+    // validation errors on `lastNodeErrors`, but a TOP-LEVEL rejection (e.g.
+    // `missing_node_type` when a node has no resolvable class_type, or "prompt
+    // outputs failed validation") is shown in a dialog and then DISCARDED — it
+    // never reaches `lastNodeErrors` (which stays `{}`). Inspecting only
+    // `lastNodeErrors` therefore reports a false `queued:true` for a prompt
+    // ComfyUI refused ~1ms after "got prompt". Capture the raw non-200 /prompt
+    // body — the only place the top-level `error` exists — by wrapping fetchApi
+    // for the duration of THIS queue call, then let summarizePromptRejection turn
+    // it into a real failure. All queue paths POST /prompt through fetchApi, so
+    // this is version-robust regardless of app.queuePrompt's internal plumbing.
+    // Capture the FIRST top-level rejection (app.queuePrompt breaks its batch loop
+    // on the first rejected prompt, so there is at most one) plus EVERY accepted
+    // prompt_id — a batch>1 run queues N separate prompts, each of which needs its
+    // own #370 recovery-ledger entry. The panel dispatches agent commands serially
+    // (each command is replied to before the next tool runs), so graph_run's queue
+    // call does not overlap another graph_run; we save + restore the exact prior
+    // api.fetchApi so even a hypothetical nested wrap unwinds cleanly.
+    let promptRejection = null;
+    const queuedPromptIds = [];
+    const prevFetchApi =
+      typeof api?.fetchApi === "function" ? api.fetchApi : null;
+    const origFetchApi = prevFetchApi ? prevFetchApi.bind(api) : null;
+    if (origFetchApi) {
+      api.fetchApi = async (route, options) => {
+        const res = await origFetchApi(route, options);
+        try {
+          const method = String(options?.method || "GET").toUpperCase();
+          const path = typeof route === "string" ? route.split("?")[0] : "";
+          if (method === "POST" && path.endsWith("/prompt") && res) {
+            const body = await res.clone().json();
+            if (res.status !== 200) {
+              if (promptRejection == null && body && (body.error || body.node_errors)) {
+                promptRejection = { error: body.error ?? null, node_errors: body.node_errors ?? null };
+              }
+            } else if (body && body.prompt_id != null) {
+              // Accepted — remember EACH prompt_id so #370 reconcile can recover a
+              // run that starts AND finishes entirely inside a connection drop. Use a
+              // NULLISH presence check (!= null), NOT truthiness — a falsy-but-valid
+              // id like 0 must flow through ingestion, or a drop before lifecycle
+              // frames would lose the completion (#370). Normalize to a STRING AT
+              // CAPTURE so dedupe is canonical (0 and "0" are the same run) and
+              // everything downstream stays string-vs-string.
+              const pid = String(body.prompt_id);
+              if (!queuedPromptIds.includes(pid)) queuedPromptIds.push(pid);
+            }
+          }
+        } catch {
+          // non-JSON body / clone unsupported — fall back to lastNodeErrors below.
+        }
+        return res;
+      };
+    }
+    try {
+      await app.queuePrompt(0, batch, partialTargets);
+    } finally {
+      if (origFetchApi) api.fetchApi = prevFetchApi;
+    }
+    // Register EVERY accepted prompt_id for reconnect reconciliation (#370) —
+    // BEFORE the rejection check. With batch>1, app.queuePrompt breaks its loop on
+    // the first rejection, so an EARLIER repetition can be accepted (already
+    // queued + running) while a LATER one rejects. That accepted run still needs a
+    // recovery-ledger entry, or a disconnect that swallows its whole lifecycle
+    // would leave it unreconcilable even though we return a rejection here.
+    for (const pid of queuedPromptIds) {
+      try {
+        runCompletionRef?.onQueued(pid);
+      } catch {}
+    }
+    // Verdict from BOTH channels: the captured top-level rejection (#358) and the
+    // per-node errors the frontend stashed. null ⇒ genuinely accepted.
+    const rejection = summarizePromptRejection({
+      rejection: promptRejection,
+      lastNodeErrors: app.lastNodeErrors,
+    });
+    if (rejection) return rejection;
+    // Surface the queued prompt_id(s) so the agent can correlate/track the run —
+    // #370 reconciliation and mcp#531 (panel_run must return the prompt_id even
+    // when a render is already running) both depend on this being reported.
+    return buildQueueAcceptResult({
+      batchCount: batch,
+      promptIds: queuedPromptIds,
+      ranToNode: partialTargets ? Number(to_node_id) : null,
+    });
   },
 
   // WHY IS THAT NODE RED? — the single error surface. LiteGraph only sets a
@@ -14324,6 +14414,13 @@ function buildPanel() {
       // release the soft-reload interlock: the (possibly slow) reload's orchestrator
       // handshook, so auto-respawn can guard the next drop normally.
       if (connected) {
+        // Bridge came back after a drop — the completion frame for a run that
+        // finished while it was down was silently dropped by sendFrame, so
+        // reconcile pending runs against /history to redeliver it (#370).
+        if (bridgeWasDown) {
+          bridgeWasDown = false;
+          void reconcileRunsAfterReconnect();
+        }
         resetAutoReclaim();
         clearSoftReloadGuard();
         // Push the current render-stall threshold so a reused/just-connected
@@ -14343,6 +14440,8 @@ function buildPanel() {
       // here falsely reads as "turn finished", so keep it up (with a reconnecting
       // banner) while a turn is live; only hide when nothing is in flight.
       if (!connected) {
+        // Remember the drop so the next "connected" reconciles pending runs (#370).
+        bridgeWasDown = true;
         if (agentWorking) {
           thinkingReconnecting = true;
           // Keep the indicator up with the reconnecting banner, but DON'T re-arm
@@ -14928,6 +15027,12 @@ function buildPanel() {
   // batch + duration for a completed prompt and composes the single agent_event.
   const runCompletion = createRunCompletionTracker({
     onFlush: ({ promptId, images: flImages, videos: flVideos, durationMs }) => {
+      // #370: track whether the composed completion frame actually reached the
+      // agent. sendFrame returns false when the bridge socket is down — in that
+      // case the completion is LOST, so we re-pend the prompt (markUndelivered) so
+      // the next reconnect recovers it via /history. A confirmed send (or an empty
+      // batch that emits no frame) retires it from pending.
+      let framePushed = false;
       // A completed prompt delivers its FULL batch here, exactly once. Compose
       // ONE consolidated agent_event for the whole run — stills AND every video's
       // storyboard folded into a single images+note+metadata turn — so a mixed /
@@ -14939,7 +15044,11 @@ function buildPanel() {
       composeRunCompletionFrame(
         { promptId, images: flImages, videos: flVideos, durationMs },
         {
-          sendFrame: (frame) => client.sendFrame(frame),
+          sendFrame: (frame) => {
+            const ok = client.sendFrame(frame);
+            if (ok) framePushed = true;
+            return ok;
+          },
           coerceMessageText,
           formatDuration,
           formatClock,
@@ -14954,9 +15063,128 @@ function buildPanel() {
           videoStoryboardEnabled: prefs.videoStoryboard !== false,
           warn: (...a) => console.warn(...a),
         },
-      ).catch((err) => console.warn("[cmcp] composeRunCompletionFrame failed:", err));
+      )
+        .then((frame) => {
+          // frame===null ⇒ empty batch (nothing to deliver) ⇒ delivered. A frame
+          // that was pushed ⇒ delivered. A frame that FAILED to push ⇒ re-pend —
+          // UNLESS it failed because agents are MUTED, which is intentional,
+          // permanent suppression (sendFrame returns false for both a down socket
+          // AND AGENT_MUTED): a muted completion must NOT be recovered/replayed on
+          // a later unmute+reconnect, so treat it as delivered (codex P1).
+          if (frame == null || framePushed) runCompletion.markDelivered(promptId);
+          else if (AGENT_MUTED) runCompletion.markDelivered(promptId);
+          else runCompletion.markUndelivered(promptId);
+        })
+        .catch((err) => {
+          console.warn("[cmcp] composeRunCompletionFrame failed:", err);
+          // Composition threw before/around the send — treat as undelivered so a
+          // reconnect can recover the outcome from /history rather than lose it
+          // (but respect an intentional mute, as above).
+          if (framePushed || AGENT_MUTED) runCompletion.markDelivered(promptId);
+          else runCompletion.markUndelivered(promptId);
+        });
+    },
+    // #370: deliver a reconcile-discovered terminal ERROR. Routed through the
+    // tracker (not the reconcile summary) so it fires whether the error is found
+    // by the reconnect reconcile loop OR by a later /history RETRY — otherwise a
+    // transient-miss-then-error would fence the prompt but never surface a
+    // run_error to the agent (codex P1). Mute/re-pend mirror the completion path.
+    onReconcileError: ({ promptId }) => {
+      const sent = client.sendFrame({
+        type: "agent_event",
+        kind: "run_error",
+        error: `A queued render failed while the connection was down (prompt ${promptId}).`,
+      });
+      if (sent) appendSystem("A queued render failed while the connection was down.");
+      // A muted agent intentionally suppresses this (sendFrame also returns false);
+      // reconcileKey already marked it delivered, so leave it. Only a genuine
+      // transport failure re-pends so the next reconnect/retry re-delivers it.
+      else if (!AGENT_MUTED) runCompletion.markUndelivered(promptId);
+    },
+    // #370 (P1 memory-leak): the tracker GAVE UP on a prompt whose outcome it
+    // couldn't confirm after the bounded retries (its /history stayed absent —
+    // cancelled/disconnected). It's been evicted from the ledger; surface a
+    // one-time "status unknown, safe to requeue" notice so the agent stops waiting.
+    onReconcileGiveUp: ({ promptId }) => {
+      client.sendFrame({
+        type: "agent_event",
+        kind: "run_error",
+        error:
+          `Render status for prompt ${promptId} could not be confirmed after reconnecting ` +
+          `(no history for it) — it was likely cancelled or interrupted. Safe to requeue.`,
+      });
+      appendSystem(`Render status unknown for prompt ${promptId} — safe to requeue.`);
     },
   });
+  runCompletionRef = runCompletion;
+
+  // #370: recover run completions across a connection drop. When the WS drops
+  // mid-render the terminal `execution_success` can be missed, and when the
+  // bridge is down the composed completion frame is silently dropped by
+  // sendFrame — either way the run finishes with NO completion delivered and its
+  // status is unknowable. On reconnect we reconcile every still-pending prompt_id
+  // against ComfyUI's authoritative `/history/<id>` record and deliver the
+  // terminal outcome exactly once (the `delivered` set makes double-delivery and
+  // mis-attribution unreachable). A run still in flight is left pending; a run
+  // whose status can't be recovered surfaces a "safe to requeue" notice.
+  let reconcileInFlight = null;
+  // True once the bridge has been observed DOWN, so a later "connected" is a real
+  // reconnect (not one of the many handshake frames the bridge re-emits) and we
+  // reconcile exactly on the drop→reconnect edge.
+  let bridgeWasDown = false;
+  async function reconcileRunsAfterReconnect() {
+    if (reconcileInFlight) return reconcileInFlight;
+    reconcileInFlight = (async () => {
+      try {
+        const summary = await runCompletion.reconcile({
+          fetchHistory: async (promptId) => {
+            if (typeof api?.fetchApi !== "function") return null;
+            const res = await api.fetchApi(`/history/${encodeURIComponent(promptId)}`);
+            // A non-OK response (e.g. 503 while the server is busy/restarting) is
+            // UNCERTAIN — NOT a clean "absent from history". THROW so the reconciler
+            // takes its "history unreachable → running" path and never gives up on a
+            // prompt whose result might just be temporarily unreadable (codex P1).
+            if (!res || !res.ok) {
+              throw new Error(`/history ${res ? res.status : "unreachable"}`);
+            }
+            // historyEntryFor applies the SAME strictness as /queue: only a
+            // WELL-FORMED history map lacking the id normalizes to null (clean
+            // absence, give-up eligible); a malformed 200 body (null/array/non-
+            // object) ⇒ undefined (uncertain → running, never given up).
+            return historyEntryFor(await res.json(), promptId);
+          },
+          // Is the prompt still in ComfyUI's /queue (running OR pending)? Absence
+          // from /history is NORMAL for a queued/running prompt — ComfyUI writes
+          // /history only on task_done — so the reconciler must not treat it as
+          // "gone" until /queue also lacks it. Returns true/false definitively, or
+          // null when /queue can't be read (then the reconciler stays conservative
+          // and never gives up). Queue rows are [number, prompt_id, prompt, …].
+          fetchQueued: async (promptId) => {
+            if (typeof api?.fetchApi !== "function") return null;
+            const res = await api.fetchApi("/queue");
+            if (!res || !res.ok) return null;
+            // queueMembership returns false ONLY when both queue arrays are
+            // well-formed and lack the id; a missing/malformed payload ⇒ null
+            // (uncertain), so a malformed /queue never causes a give-up (codex P1).
+            return queueMembership(await res.json(), promptId);
+          },
+          isVideo: isVideoOutput,
+        });
+        // Nothing to surface synchronously from `summary`: a terminal SUCCESS is
+        // delivered via onFlush, a terminal ERROR via the onReconcileError hook, an
+        // "unknown"/"running" schedules a bounded retry, and a definitively
+        // unconfirmable prompt is surfaced ONCE via the onReconcileGiveUp hook when
+        // its retries exhaust (not prematurely here — the retry may still recover
+        // it). `summary` is retained for diagnostics only.
+        void summary;
+      } catch (err) {
+        console.warn("[cmcp] run reconcile failed:", err);
+      } finally {
+        reconcileInFlight = null;
+      }
+    })();
+    return reconcileInFlight;
+  }
 
   function onExecuted(ev) {
     const d = ev?.detail ?? {};
@@ -14997,9 +15225,16 @@ function buildPanel() {
   }
   function onExecError(ev) {
     const d = ev?.detail ?? {};
+    // Idempotency fence (codex P1): if this run already reached a TERMINAL outcome
+    // (e.g. a /history reconcile surfaced it — even if its delivery is being
+    // re-pended for retry), a late live `execution_error` for the same prompt must
+    // NOT re-send run_error or re-paint the card. Check BEFORE onExecutionFailed
+    // (otherwise it would always be true).
+    const alreadyTerminal = runCompletion.wasTerminal(d.prompt_id);
     // The run failed — drop any images we'd buffered for it so we don't deliver a
     // stale "here are your outputs" batch on top of the run_error interrupt below.
     runCompletion.onExecutionFailed(d.prompt_id);
+    if (alreadyTerminal) return;
     // Name the failing node so the agent (and the user) know WHERE it broke —
     // "Ideogram4PromptBuilderKJ (node 200)" beats a bare exception string.
     // Coerce node descriptors too — never bake "[object Object]" into the
@@ -15017,7 +15252,16 @@ function buildPanel() {
     const error = where ? `${where}: ${msg}` : msg;
     // 1) Push it to the agent — the orchestrator INTERRUPTS its live turn and
     //    front-queues this so it stops and fixes the error instead of running blind.
-    client.sendFrame({ type: "agent_event", kind: "run_error", error });
+    //    onExecutionFailed already retired this prompt from pending, so if the
+    //    bridge is down and this frame can't be delivered the error would be lost
+    //    with no way to recover it. Re-pend on a dropped send (mirroring the
+    //    completion + reconciled-error paths) so the next reconnect reconciles it
+    //    against /history and re-delivers the failure (codex P1).
+    const runErrorSent = client.sendFrame({ type: "agent_event", kind: "run_error", error });
+    // Re-pend only on a TRANSPORT failure. A muted agent intentionally suppresses
+    // this frame (sendFrame also returns false then) — onExecutionFailed already
+    // marked it delivered, so leaving it there keeps the mute permanent (codex P1).
+    if (!runErrorSent && !AGENT_MUTED) runCompletion.markUndelivered(d.prompt_id);
     // 2) Render it immediately as an error widget in the chat, so the user sees it
     //    even before the agent reacts (no waiting on a check-errors call).
     paintCard({
@@ -15064,6 +15308,10 @@ function buildPanel() {
     }
   }
   function onComfyReconnected() {
+    // ComfyUI's WS is back — this is exactly when a mid-render `execution_success`
+    // may have been missed, so reconcile pending runs against /history first,
+    // independent of whether we go on to resume the agent below (#370).
+    void reconcileRunsAfterReconnect();
     // After ComfyUI comes back (backend-only reboot — the page didn't reload),
     // the orchestrator died with it. Respawn + reconnect if the agent was in use.
     // ComfyUI fires "reconnected" for BENIGN WS blips too — viewing assets,
