@@ -63,6 +63,29 @@ function normalizeNodeErrors(ne) {
   return null;
 }
 
+/**
+ * Build the ACCEPT result for a queued run. Surfaces the queued prompt_id(s) so
+ * the agent can correlate/track the run — #370 reconciliation and mcp#531
+ * (panel_run must return the prompt_id, even when a render is already running)
+ * both depend on this. `prompt_id` is the first accepted id; `prompt_ids` is only
+ * added for a batch that queued more than one.
+ *
+ * @param {object} args
+ * @param {number} args.batchCount
+ * @param {(string|null)[]} [args.promptIds]  Accepted prompt_ids, in queue order.
+ * @param {number|null} [args.ranToNode]      Present for a run-to-node partial run.
+ */
+export function buildQueueAcceptResult({ batchCount, promptIds = [], ranToNode = null } = {}) {
+  const ids = Array.isArray(promptIds) ? promptIds.filter((x) => x != null) : [];
+  return {
+    queued: true,
+    batch_count: batchCount,
+    ...(ids.length ? { prompt_id: ids[0] } : {}),
+    ...(ids.length > 1 ? { prompt_ids: [...ids] } : {}),
+    ...(ranToNode != null ? { ran_to_node: ranToNode } : {}),
+  };
+}
+
 /** Human-readable one-liner for a top-level rejection object. */
 export function formatTopError(err) {
   if (err == null) return "prompt rejected";

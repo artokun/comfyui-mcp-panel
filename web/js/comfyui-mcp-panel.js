@@ -147,7 +147,7 @@ import { pickRevertSnapshot } from "./lib/graph-revert.js";
 import { saveActiveWorkflow, shouldGroundBeforeTurn, groundActiveWorkflow } from "./lib/workflow-save.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
-import { summarizePromptRejection } from "./lib/queue-rejection.js";
+import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
 import {
   shouldResumeAfterComfyReconnect,
   shouldRehelloAfterCommand,
@@ -5964,11 +5964,14 @@ const GRAPH_TOOL_EXECUTORS = {
       lastNodeErrors: app.lastNodeErrors,
     });
     if (rejection) return rejection;
-    return {
-      queued: true,
-      batch_count: batch,
-      ...(partialTargets ? { ran_to_node: Number(to_node_id) } : {}),
-    };
+    // Surface the queued prompt_id(s) so the agent can correlate/track the run —
+    // #370 reconciliation and mcp#531 (panel_run must return the prompt_id even
+    // when a render is already running) both depend on this being reported.
+    return buildQueueAcceptResult({
+      batchCount: batch,
+      promptIds: queuedPromptIds,
+      ranToNode: partialTargets ? Number(to_node_id) : null,
+    });
   },
 
   // WHY IS THAT NODE RED? — the single error surface. LiteGraph only sets a
@@ -15067,6 +15070,23 @@ function buildPanel() {
           else runCompletion.markUndelivered(promptId);
         });
     },
+    // #370: deliver a reconcile-discovered terminal ERROR. Routed through the
+    // tracker (not the reconcile summary) so it fires whether the error is found
+    // by the reconnect reconcile loop OR by a later /history RETRY — otherwise a
+    // transient-miss-then-error would fence the prompt but never surface a
+    // run_error to the agent (codex P1). Mute/re-pend mirror the completion path.
+    onReconcileError: ({ promptId }) => {
+      const sent = client.sendFrame({
+        type: "agent_event",
+        kind: "run_error",
+        error: `A queued render failed while the connection was down (prompt ${promptId}).`,
+      });
+      if (sent) appendSystem("A queued render failed while the connection was down.");
+      // A muted agent intentionally suppresses this (sendFrame also returns false);
+      // reconcileKey already marked it delivered, so leave it. Only a genuine
+      // transport failure re-pends so the next reconnect/retry re-delivers it.
+      else if (!AGENT_MUTED) runCompletion.markUndelivered(promptId);
+    },
   });
   runCompletionRef = runCompletion;
 
@@ -15099,29 +15119,18 @@ function buildPanel() {
           isVideo: isVideoOutput,
         });
         for (const row of summary) {
-          if (row.status === "error") {
-            // A run we never saw fail (missed execution_error) — surface it so the
-            // agent stops waiting on a render that already died. reconcile already
-            // retired this prompt from pending, so — exactly as the success path
-            // re-pends on a dropped completion frame — if THIS run_error frame
-            // can't be delivered (bridge dropped again mid-reconcile), re-pend it
-            // so the next reconnect retries. Otherwise the error would be lost
-            // permanently with no way to recover it (codex P1).
-            const sent = client.sendFrame({
-              type: "agent_event",
-              kind: "run_error",
-              error: `A queued render failed while the connection was down (prompt ${row.promptId}).`,
-            });
-            if (sent) appendSystem("A queued render failed while the connection was down.");
-            else if (!AGENT_MUTED) runCompletion.markUndelivered(row.promptId);
-          } else if (row.status === "unknown") {
+          if (row.status === "unknown") {
             // History couldn't confirm a terminal outcome — tell the user plainly.
+            // (A scheduled retry may still recover it; this is honest at this
+            // instant.)
             appendSystem(
               `Render status unknown after reconnect (prompt ${row.promptId}) — safe to requeue if no result arrives.`,
             );
           }
-          // success+delivered ⇒ the completion frame was already sent via onFlush;
-          // success without a batch and "running" need no message.
+          // A terminal ERROR is delivered via the tracker's onReconcileError hook
+          // (so a retry-discovered error is surfaced too). success+delivered ⇒ the
+          // completion frame was already sent via onFlush; success-without-batch
+          // and "running" need no message.
         }
       } catch (err) {
         console.warn("[cmcp] run reconcile failed:", err);

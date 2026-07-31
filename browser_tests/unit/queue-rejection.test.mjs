@@ -12,7 +12,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { summarizePromptRejection, formatTopError } from "../../web/js/lib/queue-rejection.js";
+import {
+  summarizePromptRejection,
+  formatTopError,
+  buildQueueAcceptResult,
+} from "../../web/js/lib/queue-rejection.js";
 
 // The exact top-level rejection body from issue #358.
 const MISSING_NODE_TYPE = {
@@ -114,4 +118,32 @@ test("empty/whitespace top-level error is NOT treated as a rejection", () => {
     summarizePromptRejection({ rejection: { error: "   ", node_errors: {} }, lastNodeErrors: {} }),
     null,
   );
+});
+
+// ── #358/mcp#531: the ACCEPT result must carry the queued prompt_id(s) ──────────
+
+test("mcp#531: a single accepted run returns the prompt_id", () => {
+  const r = buildQueueAcceptResult({ batchCount: 1, promptIds: ["p1"] });
+  assert.equal(r.queued, true);
+  assert.equal(r.batch_count, 1);
+  assert.equal(r.prompt_id, "p1");
+  assert.equal(r.prompt_ids, undefined, "no prompt_ids array for a single run");
+});
+
+test("a batch>1 accept returns prompt_id (first) AND prompt_ids (all)", () => {
+  const r = buildQueueAcceptResult({ batchCount: 3, promptIds: ["p1", "p2", "p3"] });
+  assert.equal(r.batch_count, 3);
+  assert.equal(r.prompt_id, "p1");
+  assert.deepEqual(r.prompt_ids, ["p1", "p2", "p3"]);
+});
+
+test("run-to-node carries ran_to_node alongside the prompt_id", () => {
+  const r = buildQueueAcceptResult({ batchCount: 1, promptIds: ["p9"], ranToNode: 42 });
+  assert.equal(r.prompt_id, "p9");
+  assert.equal(r.ran_to_node, 42);
+});
+
+test("no captured prompt_id (older frontend) still returns a valid accept", () => {
+  const r = buildQueueAcceptResult({ batchCount: 1, promptIds: [] });
+  assert.deepEqual(r, { queued: true, batch_count: 1 });
 });

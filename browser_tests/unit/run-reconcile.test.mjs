@@ -19,13 +19,15 @@ import { parseHistoryEntry } from "../../web/js/lib/history-reconcile.js";
 
 const isVideo = (m) => /\.(mp4|webm|mov)$/i.test(String(m?.filename || ""));
 
-function makeHarness() {
+function makeHarness(opts = {}) {
   let clock = 0;
   const timers = new Map();
   let seq = 0;
   const flushes = [];
+  const errors = [];
   const tracker = createRunCompletionTracker({
     onFlush: (p) => flushes.push(p),
+    onReconcileError: (e) => errors.push(e),
     now: () => clock,
     setTimer: (fn, ms) => {
       const id = ++seq;
@@ -34,12 +36,25 @@ function makeHarness() {
     },
     clearTimer: (id) => timers.delete(id),
     debounceMs: 1500,
+    ...opts,
   });
   return {
     tracker,
     flushes,
+    errors,
     advance: (ms) => {
       clock += ms;
+    },
+    // Fire (and await) every timer whose deadline is due at the current clock.
+    // A fired timer may schedule another; the caller advances + fires again.
+    fireDueTimers: async () => {
+      const due = [...timers].filter(([, t]) => t.at <= clock);
+      const proms = [];
+      for (const [id, t] of due) {
+        timers.delete(id);
+        proms.push(t.fn());
+      }
+      await Promise.all(proms);
     },
   };
 }
@@ -314,6 +329,125 @@ test("#370 delivered-fence ages out: an old fence is pruned once past the 10-min
   tracker.onExecutionSuccess("p2");
   assert.equal(tracker.wasDelivered("p1"), false, "stale fence aged out");
   assert.equal(tracker.wasDelivered("p2"), true, "recent fence retained");
+});
+
+test("#370 P1-2: a late execution_start(delivered P) does NOT flush a DIFFERENT active run's buffer", async () => {
+  const { tracker, flushes } = makeHarness();
+  // P finished during a drop and was recovered via reconcile (delivered).
+  tracker.onQueued("P");
+  const history = { P: successEntry({ 1: { images: [{ filename: "P.png", type: "output" }] } }) };
+  await tracker.reconcile({ fetchHistory: async (id) => history[id] ?? null, isVideo });
+  assert.equal(flushes.length, 1, "P delivered via reconcile");
+  assert.equal(tracker.wasDelivered("P"), true);
+
+  // A NEW run Q starts and buffers a preview (still in flight).
+  tracker.onExecutionStart("Q");
+  tracker.onExecuted("Q", { images: [{ filename: "Q_preview.png", type: "output" }] });
+
+  // A DELAYED execution_start(P) — for the already-delivered prompt — arrives. It
+  // must be IGNORED: it must not flush Q's partial buffer or clear Q's active.
+  tracker.onExecutionStart("P");
+  assert.equal(flushes.length, 1, "stale execution_start(P) did not flush Q's partial batch");
+  assert.equal(tracker._active.has("Q"), true, "Q is still active");
+
+  // Q now finishes normally and delivers its FULL output — nothing was lost.
+  tracker.onExecuted("Q", { images: [{ filename: "Q_final.png", type: "output" }] });
+  tracker.onExecutionSuccess("Q");
+  const qFlush = flushes.find((f) => f.promptId === "Q");
+  assert.ok(qFlush, "Q delivered");
+  assert.deepEqual(
+    qFlush.images.map((m) => m.filename),
+    ["Q_preview.png", "Q_final.png"],
+    "Q's full batch preserved (preview + final)",
+  );
+});
+
+test("#370 P1-3: entire-run-in-drop + a transient /history miss then terminal → delivered once via retry", async () => {
+  const h = makeHarness({ reconcileRetryMs: 3000, maxReconcileRetries: 5 });
+  const { tracker, flushes } = h;
+  // The whole lifecycle happened during the drop — only the queue-time id is known.
+  tracker.onQueued("D");
+
+  // First reconcile (reconnect edge) hits a TRANSIENT /history miss (503/empty).
+  let historyReady = false;
+  const fetchHistory = async (id) => {
+    if (id !== "D") return null;
+    return historyReady
+      ? successEntry({ 7: { images: [{ filename: "D_final.png", type: "output" }] } })
+      : null; // transient: not yet populated
+  };
+  const summary = await tracker.reconcile({ fetchHistory, isVideo });
+  assert.deepEqual(summary, [{ promptId: "D", status: "unknown" }], "transient miss reported");
+  assert.equal(flushes.length, 0, "nothing delivered yet");
+
+  // /history becomes terminal WITHOUT another reconnect edge — the scheduled retry
+  // must pick it up and deliver.
+  historyReady = true;
+  h.advance(3000);
+  await h.fireDueTimers();
+  assert.equal(flushes.length, 1, "retry delivered the completion once /history turned terminal");
+  assert.equal(flushes[0].promptId, "D");
+  assert.equal(flushes[0].images[0].filename, "D_final.png");
+
+  // No further retry fires, and no duplicate on a later reconcile (delivered fence).
+  h.advance(3000);
+  await h.fireDueTimers();
+  await tracker.reconcile({ fetchHistory, isVideo });
+  assert.equal(flushes.length, 1, "exactly once — no duplicate delivery");
+});
+
+test("#370 P1-3 (codex): a transient /history miss that later resolves to an ERROR is surfaced via retry", async () => {
+  const h = makeHarness({ reconcileRetryMs: 2000, maxReconcileRetries: 5 });
+  const { tracker, flushes, errors } = h;
+  tracker.onQueued("F");
+  let state = "transient"; // transient → error
+  const fetchHistory = async (id) => {
+    if (id !== "F") return null;
+    if (state === "transient") return null; // 503/empty
+    return { outputs: {}, status: { status_str: "error" } };
+  };
+  const summary = await tracker.reconcile({ fetchHistory, isVideo });
+  assert.deepEqual(summary, [{ promptId: "F", status: "unknown" }]);
+  assert.equal(errors.length, 0, "no error surfaced yet");
+
+  // History turns terminal-ERROR — the scheduled retry must surface run_error.
+  state = "error";
+  h.advance(2000);
+  await h.fireDueTimers();
+  assert.equal(flushes.length, 0, "no completion batch for a failed run");
+  assert.deepEqual(errors, [{ promptId: "F" }], "run_error surfaced exactly once via the retry");
+  assert.equal(tracker.wasDelivered("F"), true, "fenced so no duplicate");
+
+  // No further retry, no duplicate error.
+  h.advance(2000);
+  await h.fireDueTimers();
+  await tracker.reconcile({ fetchHistory, isVideo });
+  assert.equal(errors.length, 1, "exactly one run_error");
+});
+
+test("#370 reconcile-loop error also routes through onReconcileError (single delivery path)", async () => {
+  const { tracker, flushes, errors } = makeHarness();
+  tracker.onExecutionStart("G");
+  const history = { G: { outputs: {}, status: { status_str: "error" } } };
+  const summary = await tracker.reconcile({ fetchHistory: async (id) => history[id] ?? null, isVideo });
+  assert.deepEqual(summary, [{ promptId: "G", status: "error" }]);
+  assert.equal(flushes.length, 0);
+  assert.deepEqual(errors, [{ promptId: "G" }], "error delivered via the hook, once");
+});
+
+test("#370 P1-3: reconcile retry gives up after the attempt budget (no infinite polling)", async () => {
+  const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 3 });
+  const { tracker, flushes } = h;
+  tracker.onQueued("E");
+  const fetchHistory = async () => null; // permanently transient
+  await tracker.reconcile({ fetchHistory, isVideo });
+  // Drain more than the budget of retries.
+  for (let i = 0; i < 6; i++) {
+    h.advance(1000);
+    await h.fireDueTimers();
+  }
+  assert.equal(flushes.length, 0, "nothing delivered — history never terminal");
+  assert.equal(tracker._pending.has("E"), true, "still pending — a future reconnect edge can retry");
 });
 
 test("#370 still-running: reconcile leaves it pending and delivers nothing", async () => {

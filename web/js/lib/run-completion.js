@@ -63,11 +63,14 @@ export const NO_PROMPT_KEY = "__no_prompt__";
  */
 export function createRunCompletionTracker({
   onFlush,
+  onReconcileError,
   now = () => Date.now(),
   setTimer = (fn, ms) => setTimeout(fn, ms),
   clearTimer = (t) => clearTimeout(t),
   debounceMs = 1500,
   maxRearms = 40,
+  reconcileRetryMs = 3000,
+  maxReconcileRetries = 5,
 } = {}) {
   if (typeof onFlush !== "function") {
     throw new TypeError("createRunCompletionTracker requires an onFlush callback");
@@ -93,6 +96,14 @@ export function createRunCompletionTracker({
   // Far beyond any realistic WS-replay-after-reconnect delay, so pruning an entry
   // older than this can never re-open the double-delivery window it guards.
   const deliveredTtlMs = 10 * 60 * 1000;
+  // #370 P1-3: reconnect only fires reconcile on its EDGE. If `/history` is
+  // transiently unavailable at that instant (503/empty while the server catches
+  // up), a run whose ENTIRE lifecycle happened during the drop would be stranded
+  // until the next reconnect that may never come. So a transient/non-terminal
+  // reconcile result schedules a bounded self-repolling retry that delivers once
+  // /history turns terminal — still exactly once, via the same `delivered` fence.
+  const retryTimers = new Map(); // key -> timer
+  const retryCounts = new Map(); // key -> attempts already made
 
   // Pending is a RECOVERY LEDGER, not a debounce cache: it holds exactly the runs
   // whose completion has NOT been confirmed delivered. Every entry is removed the
@@ -148,7 +159,15 @@ export function createRunCompletionTracker({
     delivered.delete(k); // re-insert at the end so the map stays in delivery order
     delivered.set(k, now());
     pending.delete(k);
+    clearReconcileRetry(k); // a delivery (any path) cancels a scheduled /history retry
     scheduleDeliveredPrune(); // ensure idle fences also age out
+  }
+
+  function clearReconcileRetry(k) {
+    const t = retryTimers.get(k);
+    if (t != null) clearTimer(t);
+    retryTimers.delete(k);
+    retryCounts.delete(k);
   }
 
   function markStart(id) {
@@ -222,10 +241,110 @@ export function createRunCompletionTracker({
     return buf;
   }
 
+  // Reconcile ONE pending prompt against `/history`. Idempotent: a no-op (returns
+  // null) if the prompt was resolved (delivered/removed) meanwhile, incl. across
+  // the fetch await (TOCTOU). Delivers a terminal SUCCESS via onFlush exactly
+  // once. Returns a status row; `retriable:true` means the outcome isn't known
+  // yet (transient /history miss or still-running) so the caller should schedule
+  // a retry rather than strand it.
+  async function reconcileKey(promptId, fetchHistory, isVideo) {
+    const k = key(promptId);
+    if (delivered.has(k) || !pending.has(k)) return null;
+    let entry = null;
+    let fetchThrew = false;
+    try {
+      entry = await fetchHistory(promptId);
+    } catch {
+      fetchThrew = true;
+    }
+    // Re-check AFTER the await: a live execution_success/error may have delivered
+    // and retired this prompt while /history was in flight — never double-deliver.
+    if (delivered.has(k) || !pending.has(k)) return null;
+    if (fetchThrew) return { promptId, status: "unknown", retriable: true };
+    const parsed = parseHistoryEntry(entry, { isVideo });
+    if (!parsed) return { promptId, status: "unknown", retriable: true }; // 503/empty
+    if (!parsed.terminal) return { promptId, status: "running", retriable: true };
+    // Terminal. Retire ALL live state for this key so a stale partial buffer (from
+    // pre-drop `executed` events) can't double-deliver later, and mark it delivered
+    // BEFORE onFlush so a concurrent reconcile can't race it.
+    const buf = buffers.get(k);
+    if (buf?.timer) clearTimer(buf.timer);
+    buffers.delete(k);
+    active.delete(k);
+    const startTs = starts.get(k);
+    starts.delete(k);
+    markDelivered(k); // also clears any scheduled retry for this key
+    if (parsed.status === "error") {
+      // Deliver the terminal error through the SAME hook whether we're in the
+      // reconcile loop OR a scheduled retry — otherwise a transient /history miss
+      // that later resolves to an error (only discovered by a retry) would fence
+      // the prompt but NEVER surface a run_error to the agent (codex P1). The hook
+      // owns frame delivery (+ mute/re-pend); the returned row is for diagnostics.
+      if (typeof onReconcileError === "function") {
+        try {
+          onReconcileError({ promptId });
+        } catch {
+          /* presentation error must never wedge reconciliation */
+        }
+      }
+      return { promptId, status: "error" };
+    }
+    const hasBatch = parsed.images.length > 0 || parsed.videos.length > 0;
+    if (hasBatch) {
+      const durationMs = startTs != null ? now() - startTs : null;
+      onFlush({
+        key: k,
+        promptId,
+        images: parsed.images,
+        videos: parsed.videos,
+        durationMs,
+        finishedAt: now(),
+        reconciled: true,
+      });
+    }
+    return { promptId, status: "success", delivered: hasBatch };
+  }
+
+  // Schedule a bounded, self-repolling retry for a prompt whose /history is not yet
+  // terminal (P1-3). Each attempt re-runs reconcileKey; it stops the instant the
+  // outcome is delivered, the prompt is otherwise resolved, or the attempt budget
+  // is exhausted (then it waits for the next reconnect edge). Uses the injected
+  // timer so it's deterministic under test.
+  function scheduleReconcileRetry(promptId, fetchHistory, isVideo) {
+    const k = key(promptId);
+    if (k === NO_PROMPT_KEY) return; // id-less runs aren't reconcilable
+    if (delivered.has(k) || !pending.has(k)) {
+      clearReconcileRetry(k);
+      return;
+    }
+    if (retryTimers.has(k)) return; // one retry in flight per key
+    if ((retryCounts.get(k) ?? 0) >= maxReconcileRetries) return; // budget spent
+    const timer = setTimer(async () => {
+      retryTimers.delete(k);
+      retryCounts.set(k, (retryCounts.get(k) ?? 0) + 1);
+      if (delivered.has(k) || !pending.has(k)) {
+        clearReconcileRetry(k);
+        return;
+      }
+      const row = await reconcileKey(promptId, fetchHistory, isVideo);
+      if (row && row.retriable) scheduleReconcileRetry(promptId, fetchHistory, isVideo);
+      else clearReconcileRetry(k);
+    }, reconcileRetryMs);
+    retryTimers.set(k, timer);
+  }
+
   return {
     /** ComfyUI `execution_start` — authoritative run-start for a prompt. */
     onExecutionStart(id) {
       const k = key(id);
+      // Idempotency fence (P1-2): a late / replayed execution_start for an ALREADY-
+      // DELIVERED prompt must be IGNORED — it must not run the sequential-flush
+      // below, which would truncate a DIFFERENT, currently-active prompt's buffer
+      // (delivering it partial) and clear active, losing that live run's final
+      // output (#293 buffering regression). A delivered prompt has already been
+      // completed; a stray "it's starting" for it is stale noise. NO_PROMPT_KEY is
+      // never in `delivered`, so id-less runs always proceed.
+      if (delivered.has(k)) return;
       // Runs are sequential: a new run beginning means EVERY prior run has ended
       // (even one whose end signal we missed). Flush every existing buffer under
       // ITS OWN key/timing first, so an older buffer — including a legacy
@@ -395,67 +514,27 @@ export function createRunCompletionTracker({
       const summary = [];
       pruneDeliveredFence(); // reconnect is a natural sweep point for old fences
       if (typeof fetchHistory !== "function") return summary;
-      for (const [k, info] of [...pending.entries()]) {
-        if (delivered.has(k)) {
-          pending.delete(k);
-          continue;
-        }
+      for (const [, info] of [...pending.entries()]) {
         const promptId = info.promptId;
         if (promptId == null) continue;
-        let entry = null;
-        try {
-          entry = await fetchHistory(promptId);
-        } catch {
-          // A live lifecycle event may have delivered+retired this prompt while
-          // we awaited /history — don't emit an "unknown" for an already-resolved
-          // run (TOCTOU across the await).
-          if (delivered.has(k) || !pending.has(k)) continue;
-          summary.push({ promptId, status: "unknown" });
-          continue; // leave pending — a later reconnect can retry
+        const row = await reconcileKey(promptId, fetchHistory, isVideo);
+        if (!row) continue; // resolved by a live event meanwhile — nothing to report
+        const clean = { promptId: row.promptId, status: row.status };
+        if (row.delivered !== undefined) clean.delivered = row.delivered;
+        summary.push(clean);
+        // A not-yet-terminal outcome (transient /history miss OR still running)
+        // must not be stranded: schedule a bounded retry that delivers once it
+        // turns terminal, instead of waiting for a reconnect edge that may never
+        // come again (P1-3). A terminal outcome cancels any prior retry. This
+        // reconcile call is itself a fresh episode (a reconnect edge / explicit
+        // poll), so reset the retry budget first — a prompt stranded by one
+        // episode's exhausted budget gets a fresh set of attempts on the next.
+        if (row.retriable) {
+          retryCounts.delete(key(promptId));
+          scheduleReconcileRetry(promptId, fetchHistory, isVideo);
+        } else {
+          clearReconcileRetry(key(promptId));
         }
-        // Re-check AFTER the await: if a live `execution_success`/`execution_error`
-        // delivered and retired this prompt while /history was in flight, deliver
-        // nothing here — otherwise we'd emit the same batch or run_error twice
-        // (codex P1, reconcile TOCTOU).
-        if (delivered.has(k) || !pending.has(k)) continue;
-        const parsed = parseHistoryEntry(entry, { isVideo });
-        if (!parsed) {
-          summary.push({ promptId, status: "unknown" });
-          continue; // leave pending
-        }
-        if (!parsed.terminal) {
-          summary.push({ promptId, status: "running" });
-          continue; // still in flight — the live lifecycle will complete it
-        }
-        // Terminal. Retire ALL live state for this key so a stale partial buffer
-        // (from the pre-drop `executed` events) can never double-deliver later,
-        // and mark it delivered BEFORE onFlush so a concurrent reconcile can't
-        // race it.
-        const buf = buffers.get(k);
-        if (buf?.timer) clearTimer(buf.timer);
-        buffers.delete(k);
-        active.delete(k);
-        const startTs = starts.get(k);
-        starts.delete(k);
-        markDelivered(k);
-        if (parsed.status === "error") {
-          summary.push({ promptId, status: "error" });
-          continue; // no batch for a failed run (mirrors onExecutionFailed)
-        }
-        const hasBatch = parsed.images.length > 0 || parsed.videos.length > 0;
-        if (hasBatch) {
-          const durationMs = startTs != null ? now() - startTs : null;
-          onFlush({
-            key: k,
-            promptId,
-            images: parsed.images,
-            videos: parsed.videos,
-            durationMs,
-            finishedAt: now(),
-            reconciled: true,
-          });
-        }
-        summary.push({ promptId, status: "success", delivered: hasBatch });
       }
       return summary;
     },
