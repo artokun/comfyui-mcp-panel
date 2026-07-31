@@ -140,7 +140,9 @@ import {
   boundsAroundNodes,
   groupMemberNodes,
   classifyRequestedMembership,
+  refreshNodeArea,
 } from "./lib/group-geometry.js";
+import { pickRevertSnapshot } from "./lib/graph-revert.js";
 import { saveActiveWorkflow } from "./lib/workflow-save.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
@@ -3431,9 +3433,22 @@ function restoreSnapshot(snap) {
   }
 }
 
-// Restore the canvas to the most recent pre-turn snapshot (undo the last turn's edits).
+// Restore the canvas to the most recent pre-turn snapshot that ACTUALLY DIFFERS
+// from the current graph (undo the last turn's edits). Skipping an identical
+// latest snapshot fixes the no-op revert (#327): after a turn replaced/cleared
+// the graph, the next message snapshots the already-changed graph, so the newest
+// snapshot equals the canvas and reverting to it recovers nothing. Returns null
+// when nothing genuinely differs — the caller surfaces "nothing to revert".
 function revertGraphToLastSnapshot() {
-  return restoreSnapshot(graphSnapshots[graphSnapshots.length - 1]);
+  try {
+    const current = getGraphCtx().rootGraph.serialize();
+    const snap = pickRevertSnapshot(graphSnapshots, current);
+    return snap ? restoreSnapshot(snap) : null;
+  } catch {
+    // graph unavailable (can't serialize current state) — fall back to the
+    // legacy newest-snapshot behavior rather than silently doing nothing.
+    return restoreSnapshot(graphSnapshots[graphSnapshots.length - 1]);
+  }
 }
 
 // ---- manual-edit awareness --------------------------------------------------
@@ -5450,6 +5465,9 @@ const GRAPH_TOOL_EXECUTORS = {
       graph.beforeChange?.();
       try {
         railNode.pos = [Number(pos[0]), Number(pos[1])];
+        // #355: refresh the cached boundingRect NOW so any later geometric
+        // group-membership read sees the moved footprint, not the pre-move one.
+        refreshNodeArea(railNode, prev);
       } finally {
         graph.afterChange?.();
       }
@@ -5480,6 +5498,9 @@ const GRAPH_TOOL_EXECUTORS = {
     graph.beforeChange();
     try {
       node.pos = [Number(pos[0]), Number(pos[1])];
+      // #355: keep the cached boundingRect live so a follow-up group-membership
+      // read (summarizeGroup / graph_outline / graph_query) uses the NEW footprint.
+      refreshNodeArea(node, previous);
     } finally {
       graph.afterChange();
     }
@@ -5656,7 +5677,12 @@ const GRAPH_TOOL_EXECUTORS = {
     try {
       for (const [id, [nx, ny]] of layout.positions) {
         const n = byId.get(id);
-        if (n) n.pos = [nx, ny];
+        if (!n) continue;
+        const prevPos = [n.pos?.[0] ?? 0, n.pos?.[1] ?? 0];
+        n.pos = [nx, ny];
+        // #355: refresh boundingRect per moved node BEFORE the group re-fit below
+        // (and any later membership read) so recomputeInsideNodes sees live geometry.
+        refreshNodeArea(n, prevPos);
       }
       if (groups !== "ignore") {
         for (const gb of groupBoxes) {
