@@ -1421,83 +1421,519 @@ test('#226/#309 P1-1: a frontend with ONLY the overwriting high-level saveWorkfl
   assert.ok(!calls.includes('saveWorkflowAs'), 'never invoked the overwriting Save-As')
 })
 
-test('#226/#309 P1-1: atomic Save-As — target appears AFTER the pre-check, overwrite:false 409s, NO delete of the real target', async () => {
-  // The TOCTOU repro P1-1 is about: the disk oracle reports the target ABSENT, then a
-  // real persisted target appears BEFORE the write. The atomic low-level saveWorkflow
-  // (overwrite:false) 409s WITHOUT deleting/overwriting the pre-existing target — the
-  // exact property a non-atomic pre-check + overwriting API could not guarantee.
-  const active = {
-    path: 'workflows/Foo.json',
-    filename: 'Foo.json',
-    directory: 'workflows',
-    isPersisted: true,
-    isTemporary: false,
+// A minimal 1.47-style low-level store double whose saveWorkflow is NON-atomic
+// (mirrors the real server: overwrite:false does exists→await→os.replace, so it does
+// NOT 409 a target that appears during the body-read). Parameterized by a saveWorkflow
+// implementation so a test can model commit/reject/clobber precisely.
+function makeLowLevelStore({ active, saveWorkflowImpl } = {}) {
+  const store = new Map() // path -> RAW object (like reactive workflowLookup's targets)
+  const openWorkflows = [] // holds PROXIES (like the store's computed open-tabs array)
+  // Model Vue/Pinia reactivity: the RAW object goes into the lookup, but reads come
+  // back as a STABLE reactive PROXY that is NOT === the raw object (Vue's documented
+  // proxy-vs-raw identity). getWorkflowByPath returns the proxy; saveAs returns the raw.
+  const proxies = new WeakMap()
+  const proxyOf = (raw) => {
+    if (!raw) return raw
+    let p = proxies.get(raw)
+    if (!p) {
+      p = new Proxy(raw, {}) // transparent proxy: reflects props (incl. our token), !== raw
+      proxies.set(raw, p)
+    }
+    return p
   }
-  // The real target that appears mid-flight (its content stands in for its file).
-  const barContent = 'REAL-BAR-CONTENT'
-  const disk = new Map([['workflows/Foo.json', 'FOO']])
-  const store = new Map([['workflows/Foo.json', active]])
-  const openWorkflows = [active]
+  if (active) {
+    store.set(active.path, active)
+    openWorkflows.push(proxyOf(active))
+  }
   const calls = []
-  let probed = false
   const svc = {
     activeWorkflow: active,
     openWorkflows,
     calls,
-    getWorkflowByPath: (p) => store.get(p) ?? null,
+    getWorkflowByPath: (p) => (store.has(p) ? proxyOf(store.get(p)) : null),
     saveAs(wf, path) {
-      calls.push(['saveAs', wf.path, path])
-      const copy = { path, filename: path.split('/').pop(), directory: 'workflows', isPersisted: false, isTemporary: true, changeTracker: { prepareForSave() {} } }
-      store.set(path, copy)
-      openWorkflows.push(copy)
-      return copy
+      calls.push(['saveAs', path])
+      // Faithful UserFile shape: isTemporary/isPersisted are DERIVED from `size`
+      // (get isTemporary(){return size===-1}); a fresh copy starts temporary.
+      const copy = {
+        path,
+        filename: path.split('/').pop(),
+        directory: 'workflows',
+        size: -1,
+        get isTemporary() {
+          return this.size === -1
+        },
+        get isPersisted() {
+          return this.size !== -1
+        },
+        content: '{"id":"OUR-ID"}',
+        changeTracker: { prepareForSave() {} }
+      }
+      store.set(path, copy) // raw into the lookup
+      openWorkflows.push(proxyOf(copy)) // computed open-tabs hold the proxy
+      return copy // saveAs returns the RAW object (like the real store)
     },
     async openWorkflow(copy) {
       svc.activeWorkflow = copy
     },
+    // Real 1.47 closeWorkflow, KEYED BY PATH: remove from open tabs; TEMPORARY → delete
+    // the lookup entry; PERSISTED → merely unload (lookup record REMAINS). Never disk.
     async closeWorkflow(wf) {
-      const i = openWorkflows.indexOf(wf)
-      if (i >= 0) openWorkflows.splice(i, 1)
-      store.delete(wf.path)
+      const path = wf.path
+      for (let i = openWorkflows.length - 1; i >= 0; i--) {
+        if (openWorkflows[i] && openWorkflows[i].path === path) openWorkflows.splice(i, 1)
+      }
+      const raw = store.get(path)
+      if (raw && raw.isTemporary) store.delete(path)
+      else if (raw) raw.content = null
     },
     async saveWorkflow(wf) {
       calls.push(['saveWorkflow', wf.path])
-      // overwrite:false semantics — the server 409s if the target already exists,
-      // WITHOUT deleting it (no prompt/overwrite).
-      if (disk.has(wf.path)) {
-        const err = new Error(`Error storing user data file '${wf.path}': 409 Conflict`)
-        err.status = 409
-        throw err
+      if (saveWorkflowImpl) await saveWorkflowImpl(wf) // may throw (pre/post-commit)
+      wf.size = 100 // a successful write marks the copy PERSISTED (size from resp.json)
+      // Upstream 1.47: after a SUCCESSFUL save, re-baseline the change tracker to the
+      // LIVE canvas and mark the workflow clean — the behavior our success-path
+      // bookkeeping must OVERRIDE when an edit happened during the save await.
+      wf.changeTracker?.reset?.()
+      try {
+        wf.isModified = false
+      } catch {
+        /* getter-only ⇒ tracker reset above already re-baselined */
       }
-      disk.set(wf.path, 'COPY')
     },
     async renameWorkflow() {},
   }
-  const existsOnDisk = async (p) => {
-    // First probe (the pre-check) says the target is ABSENT; the real Bar then
-    // appears on disk BEFORE the write (TOCTOU).
-    if (p === 'workflows/Bar.json' && !probed) {
-      probed = true
-      return false
-    }
-    return disk.has(p)
-  }
-  // The real Bar appears right after the pre-check.
-  const origSaveAs = svc.saveAs
-  svc.saveAs = (wf, path) => {
-    disk.set('workflows/Bar.json', barContent) // TOCTOU: real target now exists
-    return origSaveAs(wf, path)
-  }
+  return { svc, store, openWorkflows, calls }
+}
+
+test('#226/#309 P0: a concurrent clobber of our just-written file is DETECTED, not silently reported as success (upstream os.replace race)', async () => {
+  // ComfyUI's /userdata write is NOT exclusive-create — the server does
+  // os.path.exists → await request.read() → os.replace, so a target appearing during
+  // the body-read is silently overwritten (200, not 409). The residual we CAN detect:
+  // our persist reports success, but a concurrent save then clobbered the target with
+  // a DIFFERENT workflow. The post-write read-back returns "foreign" ⇒ surface a
+  // detected error instead of a false success.
+  const active = { path: 'workflows/Foo.json', filename: 'Foo.json', directory: 'workflows', isPersisted: true, isTemporary: false }
+  const { svc } = makeLowLevelStore({ active, saveWorkflowImpl: async () => {} /* 200, non-atomic */ })
+  const existsOnDisk = async () => false // target absent at the pre-check
+  const reconcileSavedCopy = async () => 'foreign' // a concurrent save clobbered ours
 
   await assert.rejects(
-    () => saveActiveWorkflow(svc, 'Bar', { existsOnDisk }),
-    /already exists \(409 Conflict\)/,
+    () => saveActiveWorkflow(svc, 'Bar', { existsOnDisk, reconcileSavedCopy }),
+    /does not contain the saved workflow|concurrent save clobbered|not exclusive-create/i,
   )
-  // The pre-existing real target was NOT deleted/overwritten — its content stands.
-  assert.equal(disk.get('workflows/Bar.json'), barContent, 'real target untouched (no overwrite/delete)')
-  // The orphaned copy the atomic path created is cleaned up; source stays active.
-  assert.deepEqual(openWorkflows, [active], 'orphaned copy removed')
+})
+
+test('P0: a reported-success save whose read-back confirms OUR content reports SUCCESS (no false alarm)', async () => {
+  const active = { path: 'workflows/Foo.json', filename: 'Foo.json', directory: 'workflows', isPersisted: true, isTemporary: false }
+  const { svc } = makeLowLevelStore({ active, saveWorkflowImpl: async () => {} })
+  const existsOnDisk = async () => false
+  const reconcileSavedCopy = async () => 'ours'
+
+  const saved = await saveActiveWorkflow(svc, 'Bar', { existsOnDisk, reconcileSavedCopy })
+  assert.equal(saved, 'Bar', 'a verified-ours save reports success')
+})
+
+test('#226 P1: post-write "foreign" detection removes our copy + restores active, so a later in-place Save does NOT overwrite the foreign target', async () => {
+  // After a reported-success persist, the copy is ACTIVE and PERSISTED. If read-back
+  // proves the on-disk target is FOREIGN (a concurrent clobber), merely throwing but
+  // leaving the copy active+persisted is itself a data-loss setup: a later plain Save
+  // (no new name) takes the in-place branch and ComfyUI's persisted save uses
+  // overwrite:this.isPersisted → it would SILENTLY OVERWRITE the foreign file. So the
+  // copy must be identity-safely removed and prevActive restored BEFORE throwing.
+  const active = { path: 'workflows/Foo.json', filename: 'Foo.json', directory: 'workflows', isPersisted: true, isTemporary: false }
+  const diskWrites = []
+  const { svc, store, openWorkflows } = makeLowLevelStore({
+    active,
+    // A successful write marks the copy PERSISTED (the store's saveWorkflow sets its
+    // size); we only record the write here.
+    saveWorkflowImpl: async (wf) => {
+      diskWrites.push(wf.path)
+    },
+  })
+  const existsOnDisk = async () => false
+
+  // First save: succeeds on the wire, but a concurrent writer replaced Bar before
+  // our read-back ⇒ "foreign".
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'Bar', { existsOnDisk, reconcileSavedCopy: async () => 'foreign' }),
+    /a concurrent save clobbered it|does not contain the saved workflow/i,
+  )
+  // The Bar copy is NOT left active/owned: active restored to Foo, copy gone.
+  assert.equal(svc.activeWorkflow, active, 'active restored to the original (not the foreign Bar copy)')
+  assert.equal(store.get('workflows/Bar.json'), undefined, 'our (persisted) copy PURGED from the store lookup')
+  assert.ok(!openWorkflows.some((w) => w.path === 'workflows/Bar.json'), 'copy removed from open tabs')
+
+  // A subsequent plain Save (no new name) now saves FOO in place — it must NEVER
+  // touch the foreign Bar.
+  diskWrites.length = 0
+  await saveActiveWorkflow(svc, undefined, { existsOnDisk, reconcileSavedCopy: async () => 'ours' })
+  assert.ok(!diskWrites.includes('workflows/Bar.json'), 'later in-place Save never overwrote the foreign Bar')
+  assert.deepEqual(diskWrites, ['workflows/Foo.json'], 'later in-place Save wrote only the original Foo')
+})
+
+test('#226 P1: foreign-detection PURGES a now-PERSISTED copy from the store lookup, so a later Save-As to the same name is not blocked', async () => {
+  // ComfyUI 1.47's closeWorkflow deletes the lookup entry ONLY for a TEMPORARY
+  // workflow; a PERSISTED one is merely unloaded and LINGERS in workflowLookup. After
+  // a reported-success write, our copy is persisted — so the foreign-detection cleanup
+  // must COERCE it temporary so closeWorkflow fully purges the lookup, else the stale
+  // record blocks a future Save-As to that name (getWorkflowByPath still returns it).
+  const active = { path: 'workflows/Foo.json', filename: 'Foo.json', directory: 'workflows', isPersisted: true, isTemporary: false }
+  const { svc, store } = makeLowLevelStore({ active, saveWorkflowImpl: async () => {} })
+  const existsOnDisk = async () => false
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'Bar', { existsOnDisk, reconcileSavedCopy: async () => 'foreign' }),
+    /a concurrent save clobbered it|does not contain the saved workflow/i,
+  )
+  // The now-PERSISTED copy is FULLY purged from the lookup (not merely unloaded).
+  assert.equal(svc.getWorkflowByPath('workflows/Bar.json'), null, 'persisted copy purged from the store lookup')
+  assert.equal(store.get('workflows/Bar.json'), undefined, 'lookup entry deleted')
+  assert.equal(svc.activeWorkflow, active, 'active restored to the original')
+
+  // A later Save-As to the SAME name is NOT blocked by a lingering stale record.
+  const saved = await saveActiveWorkflow(svc, 'Bar', { existsOnDisk, reconcileSavedCopy: async () => 'ours' })
+  assert.equal(saved, 'Bar', 'later Save-As to the same name succeeds (not blocked by a stale record)')
+})
+
+test('#226 P1: the purge identifies "our copy" by a proxy-safe token, NOT object === (Vue reactive store returns a proxy)', async () => {
+  // Guards the exact bug: the real reactive store returns getWorkflowByPath as a Vue
+  // PROXY that is NOT === the raw object saveAs returned. A `===` identity check makes
+  // the purge a no-op. This double models that (getWorkflowByPath ≠ the raw copy);
+  // the cleanup must still purge our copy via its stable token.
+  const active = { path: 'workflows/Foo.json', filename: 'Foo.json', directory: 'workflows', isPersisted: true, isTemporary: false }
+  const { svc } = makeLowLevelStore({ active, saveWorkflowImpl: async () => {} })
+  const existsOnDisk = async () => false
+
+  // Sanity: the store returns a PROXY, not the raw object — proving === would fail.
+  const before = svc.getWorkflowByPath('workflows/Foo.json')
+  assert.equal(before === active, false, 'store getter returns a proxy, not === the raw object')
+  assert.equal(before.path, 'workflows/Foo.json', 'proxy transparently reflects the raw properties')
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'Bar', { existsOnDisk, reconcileSavedCopy: async () => 'foreign' }),
+    /a concurrent save clobbered it|does not contain the saved workflow/i,
+  )
+  // Purged despite the proxy-vs-raw identity mismatch.
+  assert.equal(svc.getWorkflowByPath('workflows/Bar.json'), null, 'copy purged via proxy-safe token match')
+})
+
+test('#226 P2: an AMBIGUOUS post-commit persist failure that actually COMMITTED is ADOPTED, not orphaned', async () => {
+  // A persist can COMMIT to disk and THEN reject (connection reset after commit, or a
+  // resp.json() parse error — the frontend updates persisted metadata only after
+  // parsing). Blindly removing the copy would ORPHAN the on-disk file (a retry then
+  // 409s). The reconcile read-back shows OUR content landed ⇒ adopt the copy, report
+  // success, never orphan it.
+  const active = { path: 'workflows/Foo.json', filename: 'Foo.json', directory: 'workflows', isPersisted: true, isTemporary: false }
+  const committed = new Set()
+  const { svc, store, openWorkflows } = makeLowLevelStore({
+    active,
+    saveWorkflowImpl: async (wf) => {
+      committed.add(wf.path) // the write LANDS on disk...
+      throw new Error('connection reset after commit') // ...then the response is lost
+    },
+  })
+  const existsOnDisk = async () => false
+  const reconcileSavedCopy = async (p) => (committed.has(p) ? 'ours' : 'absent')
+
+  const saved = await saveActiveWorkflow(svc, 'Bar', { existsOnDisk, reconcileSavedCopy })
+  assert.equal(saved, 'Bar', 'reported success (the write DID commit)')
+  assert.ok(store.get('workflows/Bar.json') != null, 'copy ADOPTED in the store lookup (not orphaned)')
+  assert.ok(openWorkflows.some((w) => w.path === 'workflows/Bar.json'), 'copy still open (not removed)')
+})
+
+test('#309 P2: an adopted copy is marked PERSISTED (size != -1) so a later in-place Save does not 409 and close does not purge it', async () => {
+  // On 1.47 isTemporary/isPersisted are GETTER-ONLY, derived from `size`; the adopt
+  // path must update `size`, not assign the getters (silently discarded). Otherwise
+  // the adopted copy stays "temporary": a later in-place Save uses overwrite:false and
+  // 409s, and closing it takes the temporary-purge path (dropping the saved copy).
+  const active = { path: 'workflows/Foo.json', filename: 'Foo.json', directory: 'workflows', isPersisted: true, isTemporary: false }
+  const committed = new Set()
+  let firstSave = true
+  const { svc, store } = makeLowLevelStore({
+    active,
+    saveWorkflowImpl: async (wf) => {
+      if (firstSave) {
+        firstSave = false
+        committed.add(wf.path) // the write COMMITS to disk...
+        throw new Error('resp.json parse error after commit') // ...then the response fails
+      }
+      // A subsequent in-place save models the real overwrite:this.isPersisted — a
+      // TEMPORARY workflow saved in place onto an EXISTING target 409s (overwrite:false).
+      if (committed.has(wf.path) && wf.isTemporary) {
+        const e = new Error(`Error storing user data file '${wf.path}': 409 Conflict`)
+        e.status = 409
+        throw e
+      }
+    },
+  })
+  const existsOnDisk = async () => false
+  const reconcileSavedCopy = async (p) => (committed.has(p) ? 'ours' : 'absent')
+
+  // First save: post-commit reject → read-back "ours" → ADOPT.
+  const saved = await saveActiveWorkflow(svc, 'Bar', { existsOnDisk, reconcileSavedCopy })
+  assert.equal(saved, 'Bar', 'adoption reports success')
+
+  // The adopted copy is active and marked PERSISTED via `size` (not the getter-only flags).
+  const adopted = svc.activeWorkflow
+  assert.equal(adopted.path, 'workflows/Bar.json', 'adopted copy is the active workflow')
+  assert.notEqual(adopted.size, -1, 'size is non-(-1) ⇒ persisted')
+  assert.equal(adopted.isPersisted, true, 'isPersisted derives true')
+  assert.equal(adopted.isTemporary, false, 'isTemporary derives false')
+
+  // A subsequent ordinary in-place Save (no new name) must NOT 409 (overwrite:true now).
+  await assert.doesNotReject(
+    () => saveActiveWorkflow(svc, undefined, { existsOnDisk, reconcileSavedCopy: async () => 'ours' }),
+    'in-place Save of the adopted (persisted) copy does not 409',
+  )
+
+  // Closing the adopted copy must NOT take the TEMPORARY purge path — persisted, so
+  // its lookup record remains (unload only).
+  await svc.closeWorkflow(adopted)
+  assert.notEqual(store.get('workflows/Bar.json'), undefined, 'persisted copy not purged by close (lookup remains)')
+})
+
+// Attach a faithful ComfyWorkflow change tracker to a copy: `content` is the COMMITTED
+// snapshot (what the write persisted); the tracker's initialState is the baseline and
+// activeState the live canvas; updateModified sets isModified = !graphEqual(initial,
+// active) (JSON compare here). reset() re-baselines to activeState (the WRONG direction
+// the fix must avoid). undo() restores the previous state and recomputes.
+function attachChangeTracker(copy, { committedContent, activeState, undoStack = [] }) {
+  copy.content = committedContent
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b)
+  const ct = {
+    initialState: JSON.parse(committedContent),
+    activeState,
+    _undo: [...undoStack],
+    updateModified() {
+      copy.isModified = !eq(ct.initialState, ct.activeState)
+    },
+    reset() {
+      ct.initialState = ct.activeState
+      ct.updateModified()
+    },
+    undo() {
+      const prev = ct._undo.pop()
+      if (prev !== undefined) {
+        ct.activeState = prev
+        ct.updateModified()
+      }
+    },
+    prepareForSave() {},
+  }
+  copy.isModified = false
+  copy.changeTracker = ct
+  return ct
+}
+
+test('#309 P1: adoption keeps the copy DIRTY when the canvas was edited DURING the save (baseline = COMMITTED snapshot, not live)', async () => {
+  // The race the previous (reset-to-activeState) direction introduced: the save
+  // committed S1, but the user edited the live canvas to S2 WHILE the persist awaited;
+  // the response then failed and read-back returned "ours". Re-baselining to the LIVE
+  // activeState (S2) and forcing clean would let workflow_close silently drop the
+  // unsaved S2 edit. The baseline must be the COMMITTED snapshot (S1), so isModified
+  // reflects that the canvas has DIVERGED ⇒ the copy stays DIRTY.
+  const active = { path: 'workflows/Foo.json', filename: 'Foo.json', directory: 'workflows', isPersisted: true, isTemporary: false }
+  const { svc } = makeLowLevelStore({
+    active,
+    saveWorkflowImpl: async () => {
+      throw new Error('resp.json parse error after commit') // committed S1, response lost
+    },
+  })
+  const origSaveAs = svc.saveAs
+  svc.saveAs = (wf, path) => {
+    const copy = origSaveAs(wf, path)
+    // The write committed S1; the user edited the live canvas to S2 during the await.
+    attachChangeTracker(copy, { committedContent: JSON.stringify({ v: 'S1' }), activeState: { v: 'S2' } })
+    return copy
+  }
+  const existsOnDisk = async () => false
+  const reconcileSavedCopy = async () => 'ours'
+
+  const saved = await saveActiveWorkflow(svc, 'Bar', { existsOnDisk, reconcileSavedCopy })
+  assert.equal(saved, 'Bar', 'adoption reports success')
+  const adopted = svc.activeWorkflow
+
+  // The live canvas (S2) diverged from what committed (S1) ⇒ the copy stays DIRTY.
+  assert.equal(adopted.isModified, true, 'in-flight edit ⇒ copy stays DIRTY (holds the unsaved S2)')
+
+  // workflow_close's clean-guard must NOT silently unload a modified workflow.
+  let unloaded = false
+  const closeIfClean = (wf) => {
+    if (!wf.isModified) unloaded = true
+  }
+  closeIfClean(adopted)
+  assert.equal(unloaded, false, 'workflow_close does NOT silently unload the unsaved in-flight edit')
+})
+
+test('#309 P1: adoption sets isModified on OUR copy directly — a distinct late occupant that claimed the path is NOT marked clean', async () => {
+  // During the reconcile read-back await, a distinct DIRTY workflow B claims copy A's
+  // path. 1.47's ct.updateModified() re-resolves BY PATH and would write isModified on
+  // B (marking B falsely clean → workflow_close unloads B's unsaved graph). Adoption
+  // must set isModified on OUR copy A directly, never path-resolving, so B stays dirty.
+  const active = { path: 'workflows/Foo.json', filename: 'Foo.json', directory: 'workflows', isPersisted: true, isTemporary: false }
+  const B = { path: 'workflows/Bar.json', filename: 'Bar.json', isModified: true } // distinct, UNSAVED
+  const { svc, store } = makeLowLevelStore({
+    active,
+    saveWorkflowImpl: async () => {
+      throw new Error('resp.json parse error after commit')
+    },
+  })
+  const origSaveAs = svc.saveAs
+  svc.saveAs = (wf, path) => {
+    const copy = origSaveAs(wf, path)
+    copy.content = JSON.stringify({ v: 'S1' }) // committed S1; A itself is clean (active S1)
+    copy.changeTracker = {
+      initialState: JSON.parse(copy.content),
+      activeState: { v: 'S1' },
+      workflow: copy,
+      // Faithful 1.47: resolve the workflow BY PATH and write isModified on it.
+      updateModified() {
+        const resolved = svc.getWorkflowByPath(this.workflow.path)
+        if (resolved) resolved.isModified = false // (initial == active for A)
+      },
+    }
+    copy.isModified = false
+    return copy
+  }
+  const existsOnDisk = async () => false
+  // During the reconcile await, B claims A's path in the store lookup.
+  const reconcileSavedCopy = async (p) => {
+    store.set(p, B)
+    return 'ours'
+  }
+
+  await saveActiveWorkflow(svc, 'Bar', { existsOnDisk, reconcileSavedCopy })
+  // The distinct late occupant B (now at the path) must NOT have been marked clean.
+  assert.equal(B.isModified, true, 'a distinct late occupant is NOT marked clean by adoption (no path-resolving write)')
+})
+
+test('#309 P1: adoption with NO in-flight edit is CLEAN, and a later Undo makes it correctly DIRTY', async () => {
+  // The healthy case: the live canvas still equals what committed (S1) ⇒ clean. A later
+  // Undo restores an earlier UNSAVED state (S0) ⇒ correctly DIRTY (baseline = committed
+  // S1, not re-based to S0), so close won't silently drop it.
+  const active = { path: 'workflows/Foo.json', filename: 'Foo.json', directory: 'workflows', isPersisted: true, isTemporary: false }
+  const { svc } = makeLowLevelStore({
+    active,
+    saveWorkflowImpl: async () => {
+      throw new Error('resp.json parse error after commit')
+    },
+  })
+  const origSaveAs = svc.saveAs
+  svc.saveAs = (wf, path) => {
+    const copy = origSaveAs(wf, path)
+    // Committed S1; live canvas still S1 (no edit during the await); undo stack has S0.
+    attachChangeTracker(copy, {
+      committedContent: JSON.stringify({ v: 'S1' }),
+      activeState: { v: 'S1' },
+      undoStack: [{ v: 'S0' }],
+    })
+    return copy
+  }
+  const existsOnDisk = async () => false
+  const reconcileSavedCopy = async () => 'ours'
+
+  await saveActiveWorkflow(svc, 'Bar', { existsOnDisk, reconcileSavedCopy })
+  const adopted = svc.activeWorkflow
+
+  // Canvas equals committed ⇒ clean.
+  assert.equal(adopted.isModified, false, 'no in-flight edit ⇒ clean (canvas equals the committed snapshot)')
+
+  // Undo to the earlier UNSAVED state ⇒ correctly DIRTY.
+  adopted.changeTracker.undo()
+  assert.equal(adopted.isModified, true, 'after Undo the copy is correctly DIRTY (unsaved change)')
+})
+
+test('#309 P1: a SUCCESSFUL Save-As with an in-flight edit keeps the copy DIRTY (mirror of the adoption fix, success branch)', async () => {
+  // The success-path mirror: ComfyUI's saveWorkflow(copy) captures S1, awaits the write,
+  // THEN reset()s the tracker to the LIVE canvas and marks clean. If the user edited to
+  // S2 DURING the successful save await, upstream would mark the copy "clean" at the
+  // UNSAVED S2 (disk has S1) → close silently unloads S2. Our success-path bookkeeping
+  // must OVERRIDE that: baseline to the COMMITTED snapshot (S1) so the copy stays DIRTY.
+  const active = { path: 'workflows/Foo.json', filename: 'Foo.json', directory: 'workflows', isPersisted: true, isTemporary: false }
+  const { svc } = makeLowLevelStore({
+    active,
+    // The write PERSISTS S1; the user edits the live canvas to S2 during the (successful)
+    // save await.
+    saveWorkflowImpl: async (wf) => {
+      wf.changeTracker.activeState = { v: 'S2' }
+    },
+  })
+  const origSaveAs = svc.saveAs
+  svc.saveAs = (wf, path) => {
+    const copy = origSaveAs(wf, path)
+    attachChangeTracker(copy, { committedContent: JSON.stringify({ v: 'S1' }), activeState: { v: 'S1' } })
+    return copy
+  }
+  const existsOnDisk = async () => false
+  const reconcileSavedCopy = async () => 'ours' // P0 read-back: our content is on disk
+
+  const saved = await saveActiveWorkflow(svc, 'Bar', { existsOnDisk, reconcileSavedCopy })
+  assert.equal(saved, 'Bar', 'save reports success')
+  const copy = svc.activeWorkflow
+  // The live canvas (S2) diverged from what committed (S1) ⇒ DIRTY despite the success.
+  assert.equal(copy.isModified, true, 'in-flight edit ⇒ copy stays DIRTY after a SUCCESSFUL save')
+  let unloaded = false
+  const closeIfClean = (wf) => {
+    if (!wf.isModified) unloaded = true
+  }
+  closeIfClean(copy)
+  assert.equal(unloaded, false, 'close does NOT silently unload the unsaved in-flight edit')
+})
+
+test('#309 P1: a SUCCESSFUL Save-As with NO in-flight edit leaves the copy CLEAN', async () => {
+  const active = { path: 'workflows/Foo.json', filename: 'Foo.json', directory: 'workflows', isPersisted: true, isTemporary: false }
+  const { svc } = makeLowLevelStore({ active, saveWorkflowImpl: async () => {} }) // no edit during save
+  const origSaveAs = svc.saveAs
+  svc.saveAs = (wf, path) => {
+    const copy = origSaveAs(wf, path)
+    attachChangeTracker(copy, { committedContent: JSON.stringify({ v: 'S1' }), activeState: { v: 'S1' } })
+    return copy
+  }
+  const existsOnDisk = async () => false
+  const reconcileSavedCopy = async () => 'ours'
+
+  const saved = await saveActiveWorkflow(svc, 'Bar', { existsOnDisk, reconcileSavedCopy })
+  assert.equal(saved, 'Bar', 'save reports success')
+  assert.equal(svc.activeWorkflow.isModified, false, 'no in-flight edit ⇒ clean (canvas equals committed)')
+})
+
+test('#226 P2: a persist failure whose read-back proves ABSENT removes the copy and rethrows (safe)', async () => {
+  const active = { path: 'workflows/Foo.json', filename: 'Foo.json', directory: 'workflows', isPersisted: true, isTemporary: false }
+  const { svc, store, openWorkflows } = makeLowLevelStore({
+    active,
+    saveWorkflowImpl: async () => {
+      throw new Error('write failed before commit')
+    },
+  })
+  const existsOnDisk = async () => false
+  const reconcileSavedCopy = async () => 'absent' // the write did NOT land
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'Bar', { existsOnDisk, reconcileSavedCopy }),
+    /write failed before commit/,
+  )
+  assert.equal(store.get('workflows/Bar.json'), undefined, 'orphan copy removed from the store')
+  assert.ok(!openWorkflows.some((w) => w.path === 'workflows/Bar.json'), 'copy removed from open tabs')
   assert.equal(svc.activeWorkflow, active, 'source restored as active')
+})
+
+test('#226 P2: a persist failure whose read-back shows FOREIGN content surfaces a clobber error, removes the copy', async () => {
+  const active = { path: 'workflows/Foo.json', filename: 'Foo.json', directory: 'workflows', isPersisted: true, isTemporary: false }
+  const { svc, store } = makeLowLevelStore({
+    active,
+    saveWorkflowImpl: async () => {
+      throw new Error('connection reset after commit')
+    },
+  })
+  const existsOnDisk = async () => false
+  const reconcileSavedCopy = async () => 'foreign' // the target holds someone else's content
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'Bar', { existsOnDisk, reconcileSavedCopy }),
+    /a concurrent save clobbered it|holds a DIFFERENT workflow/i,
+  )
+  assert.equal(store.get('workflows/Bar.json'), undefined, 'our copy removed (target is not ours)')
 })
 
 test('#226: a persisted target already indexed in the store pre-empts with a clean conflict (never evicted)', async () => {

@@ -2440,8 +2440,59 @@ async function programmaticSave(name) {
   const saved = await saveActiveWorkflow(svc, name, {
     autoWorkflowName,
     existsOnDisk: workflowExistsOnDisk,
+    reconcileSavedCopy: reconcileSavedWorkflowCopy,
   });
   return saved || getWorkflowTitle();
+}
+
+/** Authoritative read-back oracle for saveActiveWorkflow's post-write guards.
+ *  Reads the on-disk /userdata file at `targetPath` and compares it against the
+ *  content the Save-As COPY was built from, returning:
+ *    "ours"    — the file exists and carries OUR copy's content (matched by the
+ *                workflow `id` the store's saveAs mints fresh, else raw content);
+ *    "foreign" — the file exists but is a DIFFERENT workflow (a concurrent clobber);
+ *    "absent"  — no file (404);
+ *    "unknown" — could not determine (no api / non-2xx-non-404 / network error /
+ *                content not comparable) ⇒ callers treat it as non-authoritative.
+ *  Backs P2 (adopt an on-disk copy after an ambiguous post-commit failure instead
+ *  of orphaning it) and P0 (detect a concurrent clobber of our just-written file).
+ *  ComfyUI's /userdata write is NOT exclusive-create, so this read-back is the only
+ *  way to detect a clobber of our write — it cannot protect a victim the server
+ *  already replaced (upstream-only). */
+async function reconcileSavedWorkflowCopy(targetPath, copy) {
+  try {
+    if (!api || !targetPath) return "unknown";
+    const res =
+      typeof api.getUserData === "function"
+        ? await api.getUserData(targetPath)
+        : await api.fetchApi(`/userdata/${encodeURIComponent(targetPath)}`);
+    if (res.status === 404) return "absent";
+    if (!res.ok) return "unknown";
+    const onDisk = await res.text();
+    const ourId = workflowContentId(copy?.content);
+    const diskId = workflowContentId(onDisk);
+    if (ourId && diskId) return ourId === diskId ? "ours" : "foreign";
+    // Fall back to a raw content compare when an id can't be extracted from either.
+    if (typeof copy?.content === "string" && typeof onDisk === "string") {
+      return onDisk === copy.content ? "ours" : "foreign";
+    }
+    return "unknown"; // can't compare ⇒ non-authoritative
+  } catch {
+    return "unknown";
+  }
+}
+
+/** Extract the workflow `id` (the store's saveAs mints a fresh UUID per copy) from a
+ *  serialized workflow JSON string, or null if not parseable. */
+function workflowContentId(content) {
+  if (typeof content !== "string") return null;
+  try {
+    const parsed = JSON.parse(content);
+    const id = parsed?.id;
+    return typeof id === "string" && id ? id : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Authoritative filesystem oracle for saveActiveWorkflow's #226 classifier:

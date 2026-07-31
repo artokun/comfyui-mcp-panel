@@ -75,7 +75,11 @@ export function isDefaultWorkflowName(name) {
  *  is only ever consulted after the in-memory oracles are inconclusive, and its
  *  absence / failure leaves the classification "unknown" → refuse (fail safe).
  */
-export async function saveActiveWorkflow(svc, name, { autoWorkflowName, existsOnDisk } = {}) {
+export async function saveActiveWorkflow(
+  svc,
+  name,
+  { autoWorkflowName, existsOnDisk, reconcileSavedCopy } = {},
+) {
   const wf = svc?.activeWorkflow;
   if (!wf) throw new Error("no active workflow to save");
 
@@ -172,7 +176,7 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName, existsOn
     // never references the source's on-disk file. If that copy API is unavailable,
     // REFUSE rather than risk moving the external original.
     if (isExternalWorkflowPath(sourcePath)) {
-      const copyToUserDir = resolveSaveAsCopy(svc);
+      const copyToUserDir = resolveSaveAsCopy(svc, { reconcileSavedCopy });
       if (!copyToUserDir) {
         throw new Error(
           "save-as (copy) is unavailable on this frontend for an externally-loaded workflow; " +
@@ -201,14 +205,27 @@ export async function saveActiveWorkflow(svc, name, { autoWorkflowName, existsOn
 
     // #226/#309 P1-1 — a relocating Save-As can COLLIDE with an existing file, and a
     // non-atomic HEAD pre-check can NEVER make an OVERWRITING write safe (a target can
-    // appear between the check and the write — TOCTOU). So the ONLY sanctioned write
-    // is the ATOMIC low-level trio: saveAs builds an explicit-target copy and
-    // saveWorkflow persists it with overwrite:false — which the server 409s if the
-    // target already exists, WITHOUT any prompt/delete. No TOCTOU window remains. This
-    // is exactly the route the real (1.47.x) frontend exposes. A 409 (whether the
-    // pre-check missed it or a TOCTOU created it) surfaces as a clean conflict via
-    // withConflictRollback, and the low-level adapter removes its own orphaned copy.
-    const atomicCopy = resolveSaveAsCopy(svc);
+    // appear between the check and the write — TOCTOU). So the ONLY sanctioned write is
+    // the low-level trio: saveAs builds an explicit-target copy and saveWorkflow
+    // persists it with overwrite:false, which asks the server NOT to overwrite an
+    // existing target and never prompts/deletes. This is the route the real 1.47.x
+    // frontend exposes.
+    //
+    // ACCEPTED UPSTREAM LIMITATION (documented, not fixable from the panel): ComfyUI's
+    // /userdata POST is NOT exclusive-create — user_manager.py does
+    // `os.path.exists(target)` → `await request.read()` → `os.replace(tmp, target)`,
+    // and neither the server nor the frontend `storeUserData` exposes an
+    // exclusive-create/no-replace/conditional flag (only the boolean `overwrite`
+    // query). So a target CREATED during the server's request-body-read await gap is
+    // silently overwritten (200, not 409). We do everything a client CAN — store+disk
+    // pre-check, a final SYNCHRONOUS re-check immediately before saveAs, the atomic
+    // trio only, no prompting/deleting API — and POST-WRITE DETECTION (below) that
+    // reads the target back and verifies it is OUR content, converting a silent
+    // clobber-of-our-write into a surfaced error. The user's OWN original is never
+    // touched. The residual (a concurrent save to the identical brand-new name within
+    // that sub-second window, which cannot occur in a single-user session, and cannot
+    // retroactively protect a victim file the server already replaced) is upstream-only.
+    const atomicCopy = resolveSaveAsCopy(svc, { reconcileSavedCopy });
     if (atomicCopy) {
       const activeName = await withConflictRollback(svc, wf, effectiveName, finalTargetPath, () =>
         atomicCopy(wf, effectiveName, finalTargetPath),
@@ -270,15 +287,28 @@ function confirmedAbsentAt(svc, rawPath) {
  *
  *  ONLY the low-level trio is offered — `saveAs(wf, path)` builds a NEW copy object
  *  at an explicit `path` (source object + file untouched), `openWorkflow` loads its
- *  graph, and `saveWorkflow(copy)` persists it with overwrite:false (the server
- *  409s if the target already exists, with NO prompt/delete). This is a genuine
- *  COPY (never moves/destroys the source, #226) AND atomic against a colliding
- *  target (no TOCTOU window, #309 P1-1).
+ *  graph, and `saveWorkflow(copy)` persists it with overwrite:false (asks the server
+ *  not to overwrite an existing target; NO prompt/delete). This is a genuine COPY
+ *  (never moves/destroys the source, #226).
  *
  *  The high-level `saveWorkflowAs` is DELIBERATELY NOT used: it writes by prompting
  *  and can DELETE+overwrite an existing target, which no pre-check can make safe.
- *  The caller refuses a collision-capable Save-As when only that API exists. */
-function resolveSaveAsCopy(svc) {
+ *  The caller refuses a collision-capable Save-As when only that API exists.
+ *
+ *  `reconcileSavedCopy(targetPath, copy)` is an OPTIONAL authoritative read-back
+ *  oracle → "ours" | "foreign" | "absent" | "unknown". It backs two guards the
+ *  server's non-exclusive-create /userdata write demands:
+ *   - AMBIGUOUS post-commit failure (P2): a persist can COMMIT to disk and THEN
+ *     reject while receiving/parsing the response (connection reset / resp.json()
+ *     error — the frontend updates persisted metadata only AFTER parsing). Blindly
+ *     removing the copy on every rejection would ORPHAN the on-disk file. On a
+ *     NON-conflict failure we reconcile: if the target holds OUR content the write
+ *     landed → ADOPT the copy (never orphan) and report success.
+ *   - POST-WRITE CLOBBER DETECTION (P0): after a "successful" persist, verify the
+ *     target still holds OUR content; a concurrent save in the server's body-read
+ *     window can silently overwrite it (200, not 409) → surface a detected error
+ *     instead of a false success. */
+function resolveSaveAsCopy(svc, { reconcileSavedCopy } = {}) {
   // `openWorkflow` is MANDATORY for this path, not optional. The object saveAs
   // returns is UNLOADED (no changeTracker → activeState === null), and
   // ComfyWorkflow.save() serializes `activeState ?? null` — so persisting a copy
@@ -331,6 +361,12 @@ function resolveSaveAsCopy(svc) {
       // object untouched); the source's on-disk file is never referenced, so it
       // cannot be moved/destroyed (#226).
       const copy = svc.saveAs(wf, finalTargetPath);
+      // STAMP a stable, proxy-safe token on OUR copy. The real store inserts the raw
+      // object into a reactive `workflowLookup`, and reading it back via
+      // getWorkflowByPath returns Vue's REACTIVE PROXY — which is NOT `===` the raw
+      // object. So later cleanup must identify "our copy" by this token (which reads
+      // through the proxy) rather than object identity, or the purge silently no-ops.
+      stampCopyToken(copy);
       if (!copy) {
         throw new Error("save-as (copy) failed to create a copy on this frontend");
       }
@@ -338,23 +374,103 @@ function resolveSaveAsCopy(svc) {
       // (loads the graph into changeTracker/activeState, makes it active), THEN
       // persist — so save() writes the real graph, not null. A throw here aborts
       // BEFORE any saveWorkflow, so a failed open never persists null.
-      //
-      // If OPEN or PERSIST throws (e.g. saveWorkflow 409s on a name collision), the
-      // copy exists only IN MEMORY (nothing was written to disk). Remove that
-      // orphaned copy tab and restore the previously-active workflow so a failed
-      // persist doesn't strand a phantom unsaved tab in the store (#309); then
-      // rethrow so withConflictRollback can surface a clean conflict.
       const prevActive = svc.activeWorkflow;
+      const resolvedName = () =>
+        baseName(svc.activeWorkflow?.filename) || baseName(copy.filename) || effectiveName;
       try {
         await svc.openWorkflow(copy);
         copy.changeTracker?.prepareForSave?.();
         await svc.saveWorkflow(copy);
       } catch (err) {
+        // P2 — distinguish a CONFIRMED pre-commit failure (409 conflict, or the
+        // target is provably absent afterward → the server wrote nothing) from an
+        // AMBIGUOUS post-commit failure (the persist COMMITTED to disk, then the
+        // response was lost/failed to parse). Blindly removing the copy on ambiguity
+        // ORPHANS the on-disk file (a later retry then 409s). So on a NON-conflict
+        // failure, RECONCILE by reading the target back:
+        if (!isConflictError(err) && typeof reconcileSavedCopy === "function") {
+          let state = "unknown";
+          try {
+            state = await reconcileSavedCopy(finalTargetPath, copy);
+          } catch {
+            state = "unknown";
+          }
+          if (state === "ours") {
+            // The write LANDED despite the failed response — the workflow IS saved.
+            // Adopt the copy (never orphan it) and mark it PERSISTED by updating the
+            // REAL backing field the store's getters derive from: on 1.47 `isTemporary`
+            // and `isPersisted` are GETTER-ONLY (isTemporary === size===-1), so
+            // assigning them is a silent no-op — we must set `size`. Without this the
+            // adopted copy stays "temporary": a later in-place Save uses overwrite:false
+            // and 409s, and closing the tab takes the temporary-purge path (dropping the
+            // saved copy). markCopyPersisted sets size + resyncs originalContent so the
+            // store treats it as a normal saved, unmodified workflow. Report success.
+            markCopyPersisted(copy);
+            return resolvedName();
+          }
+          if (state === "foreign") {
+            // The target holds SOMEONE ELSE's content — our write was clobbered or
+            // never landed. Remove our orphan, restore active, and surface a
+            // clobber-aware error (never a false success).
+            removeInMemoryWorkflow(svc, copy);
+            if (prevActive !== undefined) svc.activeWorkflow = prevActive;
+            throw new Error(
+              `save-as could not save "${finalTargetPath}": the target now holds a DIFFERENT ` +
+                `workflow (a concurrent save clobbered it). Retry with a new name (#226).`,
+            );
+          }
+          // "absent"/"unknown" ⇒ the write did not land (or can't be confirmed) ⇒
+          // fall through to the safe removal below.
+        }
         removeInMemoryWorkflow(svc, copy);
         if (prevActive !== undefined) svc.activeWorkflow = prevActive;
         throw err;
       }
-      return baseName(svc.activeWorkflow?.filename) || baseName(copy.filename) || effectiveName;
+      // SUCCESS-PATH BOOKKEEPING (#309 P1, mirror of the adoption branch). ComfyUI's own
+      // saveWorkflow(copy) captures copy.content, awaits the write, THEN calls
+      // changeTracker.reset() (re-baselining to the LIVE canvas) and forces
+      // isModified=false. If the user edited the graph DURING the successful save await,
+      // the live canvas advanced past what committed (disk holds S1, canvas is S2), so
+      // upstream marks the copy "clean" at S2 while S2 is UNSAVED — workflow_close then
+      // silently unloads it (data loss). Re-run our committed-vs-live bookkeeping to
+      // OVERRIDE that: baseline to the COMMITTED snapshot (copy.content) and set
+      // isModified DIRECTLY on OUR copy (never path-resolving). Identical to upstream
+      // when no edit occurred; strictly more correct when an in-flight edit happened.
+      markCopyPersisted(copy);
+      // P0 — POST-WRITE CLOBBER DETECTION. The server's overwrite:false is NOT
+      // exclusive-create (os.path.exists → await body-read → os.replace), so a target
+      // created during the body-read window is silently overwritten (200, not 409).
+      // After a reported-success persist, verify the target still holds OUR content;
+      // if not, a concurrent save clobbered ours → surface a detected error rather
+      // than a false success. (This detects a clobber OF our write; it cannot
+      // retroactively protect a victim file the server already replaced — that is
+      // upstream-only. Best-effort: "unknown" leaves the reported success intact.)
+      if (typeof reconcileSavedCopy === "function") {
+        let state = "unknown";
+        try {
+          state = await reconcileSavedCopy(finalTargetPath, copy);
+        } catch {
+          state = "unknown";
+        }
+        if (state === "foreign" || state === "absent") {
+          // The copy is currently ACTIVE and (from the reported-success persist) would
+          // read as PERSISTED, but the on-disk target is proven NOT ours. Leaving the
+          // tab bound to it is itself a data-loss setup: a later plain Save (no new
+          // name) takes the in-place branch, and ComfyUI's persisted save uses
+          // overwrite:this.isPersisted → it would SILENTLY OVERWRITE the foreign file.
+          // So IDENTITY-SAFELY remove our copy and restore the previously-active
+          // workflow BEFORE surfacing the error — never retain ownership of a target
+          // we just proved isn't ours (#226).
+          removeInMemoryWorkflow(svc, copy);
+          if (prevActive !== undefined) svc.activeWorkflow = prevActive;
+          throw new Error(
+            `save-as reported success but "${finalTargetPath}" does not contain the saved ` +
+              `workflow — a concurrent save clobbered it (ComfyUI's /userdata write is not ` +
+              `exclusive-create). Retry with a new name (#226).`,
+          );
+        }
+      }
+      return resolvedName();
     };
   }
   return null;
@@ -616,52 +732,198 @@ async function probeTargetCollision(svc, wf, finalTargetPath, existsOnDisk) {
   return "no-oracle";
 }
 
-/** IDENTITY-SAFE removal of an in-memory (never-persisted) workflow copy from the
- *  store — used to undo an orphaned copy tab when its persist throws (#309).
+/** IDENTITY-SAFE removal of a workflow copy from the store — used to undo an
+ *  orphaned/clobbered copy tab (#309/#226). The IN-MEMORY record is dropped; the
+ *  copy's on-disk file is NEVER deleted.
  *
- *  The store's path-keyed removers (the real 1.47 `closeWorkflow` does
- *  `delete workflowLookup[wf.path]`) would evict WHATEVER currently occupies
- *  `wf.path`. If a DISTINCT late occupant claimed that path while we awaited
- *  openWorkflow/saveWorkflow, closing by path would delete IT (orphaning its unsaved
- *  graph, a data loss #226). So the path-keyed removers are used ONLY when the store
- *  lookup STILL points to `wf`; otherwise `wf` is spliced out of the open-tab arrays
- *  by IDENTITY and the occupant's lookup entry is left untouched. */
+ *  Two hazards this navigates:
+ *   1. LATE OCCUPANT — the store's path-keyed removers (the real 1.47 `closeWorkflow`
+ *      does `delete workflowLookup[wf.path]`) would evict WHATEVER occupies `wf.path`.
+ *      If a DISTINCT late occupant claimed that path while we awaited, closing by path
+ *      would delete IT. So path-keyed removal runs ONLY when the store lookup STILL
+ *      points to `wf`; otherwise `wf` is spliced out of the open-tab arrays by
+ *      IDENTITY and the occupant's lookup entry is left untouched.
+ *   2. PERSISTED COPY LINGERS — ComfyUI 1.47's `closeWorkflow` deletes the lookup
+ *      entry ONLY for a TEMPORARY workflow (`get isTemporary(){return size===-1}`); a
+ *      PERSISTED one is merely `unload()`ed and its record STAYS in workflowLookup,
+ *      where it would block a future Save-As to that name. When our copy is persisted
+ *      (a reported-success write set its `size`), we COERCE it back to temporary
+ *      (`size = -1`) BEFORE closing so `closeWorkflow`'s temporary branch fully purges
+ *      the lookup — an IN-MEMORY-only change; `closeWorkflow` never touches disk. */
 function removeInMemoryWorkflow(svc, wf) {
   if (!svc || !wf) return;
-  // Does the store's path→object lookup still point at OUR copy?
-  let stillOurs = true;
-  if (typeof svc.getWorkflowByPath === "function") {
+  // Proxy-safe "is this record OUR copy?": read the record's token (reflected
+  // through Vue's reactive proxy) and compare to ours. Falls back to `===` only when
+  // our copy carries no token (un-stamped callers/tests).
+  const lookupIsOurs = () => {
+    if (typeof svc.getWorkflowByPath !== "function") return null; // unknown
     try {
-      stillOurs = svc.getWorkflowByPath(wf.path) === wf;
+      return isSameCopy(wf, svc.getWorkflowByPath(wf.path));
     } catch {
-      stillOurs = false; // can't confirm ⇒ don't risk a path-keyed delete
+      return null; // unknown
     }
-  }
+  };
+  // Does the store's path→object lookup still point at OUR copy?
+  const stillOurs = lookupIsOurs() === true;
   if (stillOurs) {
+    // Coerce to TEMPORARY so the store's path-keyed removal fully purges the lookup
+    // entry even for a copy that a successful write marked persisted (#226). `size`
+    // === -1 is the frontend's temporary marker; flipping it changes only the
+    // in-memory record — the on-disk file is untouched by closeWorkflow.
+    safeAssign(wf, "size", -1);
+    safeAssign(wf, "isTemporary", true);
+    safeAssign(wf, "isPersisted", false);
     if (typeof svc.closeWorkflow === "function") {
       try {
         svc.closeWorkflow(wf);
-        return;
+        if (lookupIsOurs() !== true) return; // purged (or unknown) ⇒ done
       } catch {
-        /* fall through to identity splice */
+        /* fall through */
       }
     }
     if (typeof svc.removeWorkflow === "function") {
       try {
         svc.removeWorkflow(wf);
-        return;
+        if (lookupIsOurs() !== true) return;
       } catch {
-        /* fall through to identity splice */
+        /* fall through */
       }
     }
   }
-  // Identity-only cleanup: remove OUR object from the known list arrays without
-  // touching any path-keyed lookup entry a distinct occupant may now own.
+  // Identity-only cleanup: remove OUR object from the known list arrays. Match by the
+  // proxy-safe token (the arrays may hold the REACTIVE PROXY, not the raw copy), so a
+  // distinct occupant is never touched.
   for (const listName of ["openWorkflows", "workflows"]) {
     const list = svc[listName];
     if (Array.isArray(list)) {
-      const i = list.indexOf(wf);
-      if (i >= 0) list.splice(i, 1);
+      for (let i = list.length - 1; i >= 0; i--) {
+        if (isSameCopy(wf, list[i])) list.splice(i, 1);
+      }
     }
   }
+}
+
+/** Structural (best-effort) equality of two graph states, via a stable JSON encode.
+ *  Only a fallback for builds/doubles without ChangeTracker.updateModified. */
+function stateContentEqual(a, b) {
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
+
+/** Mark an ADOPTED copy (whose write committed but whose response was lost, #309 P2)
+ *  as a normal PERSISTED workflow — mirroring the bookkeeping a SUCCESSFUL saveWorkflow
+ *  does. On ComfyUI 1.47 `isTemporary` / `isPersisted` are DERIVED getters (isTemporary
+ *  === size===-1), so assigning them is a no-op — the REAL field is `size`.
+ *
+ *  For the MODIFIED flag the baseline MUST be the COMMITTED SNAPSHOT (what was written
+ *  to disk — the content the write used, i.e. `copy.content`), NOT the current live
+ *  activeState. A plain `changeTracker.reset()` re-baselines to activeState, which is
+ *  WRONG when the user edited the graph DURING the save await: activeState advanced past
+ *  what committed, so resetting-to-activeState marks that UNSAVED edit "clean" and
+ *  workflow_close then silently UNLOADS it (data loss). Instead we set the tracker's
+ *  baseline to the committed snapshot and RECOMPUTE isModified from (committed vs live
+ *  activeState): clean iff the canvas still equals what was saved, else DIRTY — exactly
+ *  what a real save leaves. All best-effort / getter-safe / in-memory only. */
+function markCopyPersisted(copy) {
+  if (!copy || typeof copy !== "object") return;
+  try {
+    if (copy.size === -1 || copy.size == null) {
+      const len = typeof copy.content === "string" ? copy.content.length : 0;
+      copy.size = len > 0 ? len : 1; // any non-(-1) value ⇒ isTemporary false
+    }
+  } catch {
+    /* size not settable ⇒ best-effort */
+  }
+  try {
+    if (typeof copy.content === "string") copy.originalContent = copy.content;
+  } catch {
+    /* best-effort */
+  }
+  // Baseline the change tracker to the COMMITTED SNAPSHOT, then recompute modified.
+  try {
+    const ct = copy.changeTracker;
+    if (ct && typeof copy.content === "string") {
+      let committed;
+      try {
+        committed = JSON.parse(copy.content);
+      } catch {
+        committed = undefined;
+      }
+      if (committed !== undefined) {
+        ct.initialState = committed; // baseline := the SAVED snapshot (not live activeState)
+        // Set isModified DIRECTLY on OUR copy — do NOT call ct.updateModified(), which on
+        // 1.47 RE-RESOLVES the workflow by `this.workflow.path` and writes isModified on
+        // whatever object occupies that path. A distinct late occupant that claimed the
+        // path during the reconcile await would be wrongly marked clean → workflow_close
+        // could then unload ITS unsaved graph (#226). Compute clean = (committed baseline
+        // equals live activeState) using the frontend's own graphEqual when reachable
+        // (via the tracker class) for precision, else a JSON structural compare — but
+        // only when we actually have a live activeState to compare against.
+        if (ct.activeState !== undefined) {
+          const graphEqual =
+            typeof ct.constructor?.graphEqual === "function" ? ct.constructor.graphEqual : null;
+          let clean;
+          try {
+            clean = graphEqual
+              ? graphEqual(committed, ct.activeState)
+              : stateContentEqual(committed, ct.activeState);
+          } catch {
+            clean = stateContentEqual(committed, ct.activeState);
+          }
+          safeAssign(copy, "isModified", !clean);
+        }
+      }
+    }
+  } catch {
+    /* best-effort */
+  }
+  safeAssign(copy, "isPersisted", true);
+  safeAssign(copy, "isTemporary", false);
+}
+
+// A stable, proxy-safe token stamped on each Save-As COPY so later cleanup can
+// identify "our copy" even when the store returns a Vue reactive PROXY (which is not
+// `===` the raw object). Reading the token through the proxy reflects the raw value.
+const COPY_TOKEN_KEY = "__cmcpSaveCopyToken";
+let copyTokenCounter = 0;
+function stampCopyToken(copy) {
+  if (!copy || typeof copy !== "object") return;
+  try {
+    // Non-enumerable so it never leaks into spreads/Object.keys/serialization. (The
+    // workflow's disk content is serialized from changeTracker.activeState, not this
+    // object, so a token here can never reach disk regardless.)
+    Object.defineProperty(copy, COPY_TOKEN_KEY, {
+      value: `cmcp-copy-${Date.now()}-${++copyTokenCounter}`,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  } catch {
+    /* frozen/sealed ⇒ token-less; isSameCopy falls back to === */
+  }
+}
+
+/** True when `candidate` (possibly a reactive proxy read back from the store) is OUR
+ *  copy `wf`. Prefers the stable stamped token (reflected through the proxy); falls
+ *  back to object identity only when `wf` carries no token. Never matches a distinct
+ *  record that lacks our token. */
+function isSameCopy(wf, candidate) {
+  if (!candidate) return false;
+  let token;
+  try {
+    token = wf?.[COPY_TOKEN_KEY];
+  } catch {
+    token = undefined;
+  }
+  if (token != null) {
+    try {
+      return candidate[COPY_TOKEN_KEY] === token;
+    } catch {
+      return false;
+    }
+  }
+  return candidate === wf; // fallback: un-stamped copy
 }
