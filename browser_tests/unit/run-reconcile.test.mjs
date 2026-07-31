@@ -731,15 +731,18 @@ test("historyEntryFor: id PRESENT with a null/undefined value ⇒ undefined (mal
 
 // ── queueMembership: strict-array /queue verdict ────────────────────────────────
 
+// Full ComfyUI queue rows carry the prompt dict at index 2: [num, prompt_id, prompt, …].
+const qrow = (n, id) => [n, id, { /* prompt dict */ }, {}, []];
+
 test("queueMembership: present in queue_running or queue_pending ⇒ true", () => {
-  assert.equal(queueMembership({ queue_running: [[0, "p1"]], queue_pending: [] }, "p1"), true);
-  assert.equal(queueMembership({ queue_running: [], queue_pending: [[1, "p2"]] }, "p2"), true);
+  assert.equal(queueMembership({ queue_running: [qrow(0, "p1")], queue_pending: [] }, "p1"), true);
+  assert.equal(queueMembership({ queue_running: [], queue_pending: [qrow(1, "p2")] }, "p2"), true);
   // {prompt_id} object form is also matched.
   assert.equal(queueMembership({ queue_running: [{ prompt_id: "p3" }], queue_pending: [] }, "p3"), true);
 });
 
 test("queueMembership: both arrays well-formed AND id absent ⇒ false (definitive)", () => {
-  assert.equal(queueMembership({ queue_running: [[0, "other"]], queue_pending: [] }, "p1"), false);
+  assert.equal(queueMembership({ queue_running: [qrow(0, "other")], queue_pending: [] }, "p1"), false);
   assert.equal(queueMembership({ queue_running: [], queue_pending: [] }, "p1"), false);
 });
 
@@ -763,12 +766,77 @@ test("queueMembership: MALFORMED ROWS (arrays are valid but a row is unreadable)
   assert.equal(queueMembership({ queue_running: [], queue_pending: ["bare-string"] }, "p1"), null);
   // Row's index-0 must be a number (the queue-row shape is [number, prompt_id, …]).
   assert.equal(queueMembership({ queue_running: [["not-a-number", "other"]], queue_pending: [] }, "p1"), null);
-  // A well-formed [number, prompt_id] that simply doesn't match is a clean absence.
-  assert.equal(queueMembership({ queue_running: [[0, "other"]], queue_pending: [] }, "p1"), false);
-  // A POSITIVE match is trustworthy even if OTHER rows are malformed.
-  assert.equal(queueMembership({ queue_running: [[0, "p1"], [1]], queue_pending: [] }, "p1"), true);
+  // A TRUNCATED [number, prompt_id] row (missing the prompt dict at index 2) is
+  // MALFORMED — it must NOT be read as a valid id-absent entry (codex P1).
+  assert.equal(queueMembership({ queue_running: [[0, "other"]], queue_pending: [] }, "p1"), null);
+  // Index 2 must be a PRESENT object (the prompt dict); null/non-object ⇒ malformed.
+  assert.equal(queueMembership({ queue_running: [[0, "other", null]], queue_pending: [] }, "p1"), null);
+  assert.equal(queueMembership({ queue_running: [[0, "other", 7]], queue_pending: [] }, "p1"), null);
+  // A FULL valid row that simply doesn't match is a clean absence ⇒ false.
+  assert.equal(queueMembership({ queue_running: [qrow(0, "other")], queue_pending: [] }, "p1"), false);
+  // A POSITIVE match is trustworthy even if OTHER rows are malformed (truncated).
+  assert.equal(queueMembership({ queue_running: [qrow(0, "p1"), [1]], queue_pending: [] }, "p1"), true);
   // Only when EVERY row is well-formed AND the id is absent ⇒ definitive false.
-  assert.equal(queueMembership({ queue_running: [[0, "a"]], queue_pending: [{ prompt_id: "b" }] }, "p1"), false);
+  assert.equal(queueMembership({ queue_running: [qrow(0, "a")], queue_pending: [{ prompt_id: "b" }] }, "p1"), false);
+});
+
+test("#370 P1 (codex): a /queue with ONLY TRUNCATED rows is uncertain → NOT given up, later output delivers", async () => {
+  const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 1 });
+  const { tracker, flushes, giveUps } = h;
+  tracker.onQueued("R");
+  const fetchHistory = async () => null; // clean-absent /history
+  // /queue returns 200 with a TRUNCATED row (missing the prompt dict) — malformed,
+  // so queueMembership ⇒ null (uncertain); the tracker must NOT give up.
+  const fetchQueued = async (id) => queueMembership({ queue_running: [[0, "other"]], queue_pending: [] }, id);
+  const summary = await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
+  assert.deepEqual(summary, [{ promptId: "R", status: "running" }], "truncated-row queue ⇒ running, not unknown");
+  for (let i = 0; i < 3; i++) {
+    h.advance(1000);
+    await h.fireDueTimers();
+  }
+  assert.equal(giveUps.length, 0, "a truncated-row /queue never causes a give-up");
+  assert.equal(tracker._pending.has("R"), true, "left pending (uncertain)");
+  assert.equal(tracker.wasTerminal("R"), false, "not fenced");
+
+  // Its later live output still delivers.
+  tracker.onExecutionStart("R");
+  tracker.onExecuted("R", { images: [{ filename: "R.png", type: "output" }] });
+  tracker.onExecutionSuccess("R");
+  assert.ok(flushes.find((f) => f.promptId === "R"), "output delivered, not dropped");
+});
+
+test("#370 P1 (codex): give-up fires on FULL valid /history-map-absent + FULL valid /queue-row-absent; a matching full row ⇒ running", async () => {
+  const full = (n, id) => [n, id, {}, {}, []];
+  // (a) gone: /history well-formed map lacking id, /queue full valid row lacking id ⇒ give up once.
+  {
+    const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 1 });
+    const { tracker, giveUps } = h;
+    tracker.onQueued("gone");
+    const fetchHistory = async (id) => historyEntryFor({}, id); // ⇒ null
+    const fetchQueued = async (id) => queueMembership({ queue_running: [full(0, "x")], queue_pending: [] }, id); // full valid, absent ⇒ false
+    await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
+    for (let i = 0; i < 3; i++) {
+      h.advance(1000);
+      await h.fireDueTimers();
+    }
+    assert.deepEqual(giveUps, [{ promptId: "gone" }], "full-valid-absent both sides ⇒ give up once");
+    assert.equal(tracker._pending.has("gone"), false, "evicted");
+  }
+  // (b) present: a full valid /queue row MATCHING the id ⇒ running (positive wins amid a malformed sibling), never given up.
+  {
+    const h = makeHarness({ reconcileRetryMs: 1000, maxReconcileRetries: 1 });
+    const { tracker, giveUps } = h;
+    tracker.onQueued("R");
+    const fetchHistory = async () => null; // clean-absent
+    const fetchQueued = async (id) => queueMembership({ queue_running: [full(0, "R"), [9]], queue_pending: [] }, id); // match + malformed sibling ⇒ true
+    await tracker.reconcile({ fetchHistory, fetchQueued, isVideo });
+    for (let i = 0; i < 3; i++) {
+      h.advance(1000);
+      await h.fireDueTimers();
+    }
+    assert.equal(giveUps.length, 0, "a matched (running) prompt is never given up");
+    assert.equal(tracker._pending.has("R"), true, "left pending");
+  }
 });
 
 test("#370 P1 (codex): a MALFORMED /queue (non-array fields) is uncertain → NOT given up, later output delivers", async () => {

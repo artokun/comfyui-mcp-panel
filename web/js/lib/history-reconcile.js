@@ -143,13 +143,20 @@ export function historyEntryFor(historyJson, promptId) {
   return entry == null ? undefined : entry; // present-but-null ⇒ uncertain
 }
 
-// Extract a row's prompt_id: array rows are `[number, prompt_id, …]` (index 0 a
-// number, index 1 a string), object rows are `{prompt_id: string}`. Anything that
-// doesn't match a recognized shape is malformed ⇒ null (so it can't masquerade as
-// a well-formed, id-absent row and enable a false "definitive absence").
+// Extract a row's prompt_id from a recognized ComfyUI queue-row shape. A genuine
+// array row is `[number(idx), prompt_id(string), prompt(dict), extra?, outputs?]`
+// — the prompt DICT at index 2 must be present, so a TRUNCATED `[number, string]`
+// row is MALFORMED (it must NOT masquerade as a valid id-absent row and enable a
+// false "definitive absence"). An object row must carry a string `prompt_id`.
+// Anything else ⇒ null (malformed).
 function rowPromptId(item) {
   if (Array.isArray(item)) {
-    return typeof item[0] === "number" && typeof item[1] === "string" ? item[1] : null;
+    return typeof item[0] === "number" &&
+      typeof item[1] === "string" &&
+      item[2] !== null &&
+      typeof item[2] === "object"
+      ? item[1]
+      : null;
   }
   if (item && typeof item === "object") {
     return typeof item.prompt_id === "string" ? item.prompt_id : null;
