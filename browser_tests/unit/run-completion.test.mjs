@@ -300,24 +300,28 @@ test("execution_success + executing:null ordering yields exactly one event", () 
 function makeFrameDeps(overrides = {}) {
   const frames = [];
   const painted = [];
+  const uploadCalls = [];
   const deps = {
     sendFrame: (f) => frames.push(f),
     coerceMessageText: (v) => (v == null ? "" : typeof v === "string" ? v : String(v)),
     formatDuration: (ms) => (ms == null ? null : `${Math.round(ms / 1000)}s`),
     formatClock: () => "12:00:00",
-    imageViewUrl: (m) => `view://${m?.filename ?? "x"}`,
+    imageViewUrl: (m) => `view://${m?.filename ?? "x"}?type=${m?.type ?? "output"}`,
     fetchImageBytes: async () => 2048,
     fetchImageDimensions: async () => ({ w: 512, h: 512 }),
     humanizeBytes: (n) => (n == null ? null : `${n} B`),
     buildVideoStoryboard: async () => ({ fake: "blob" }),
-    uploadBlobToInput: async (_blob, name) => ({ filename: name, type: "input" }),
+    uploadBlobToInput: async (_blob, name, opts) => {
+      uploadCalls.push({ name, opts });
+      return { filename: name, type: opts?.type || "input" };
+    },
     storyboardFrameCount: () => 20,
     paintImage: (url, name) => painted.push({ url, name }),
     videoStoryboardEnabled: true,
     warn: () => {},
     ...overrides,
   };
-  return { deps, frames, painted };
+  return { deps, frames, painted, uploadCalls };
 }
 
 test("#269/#468 presentation: a MIXED run (stills + 2 videos) emits EXACTLY ONE agent_event with all outputs", async () => {
@@ -395,6 +399,36 @@ test("presentation: a video-only run (2 videos) is still ONE frame", async () =>
     ["storyboard_x.png", "storyboard_y.png"],
     "both storyboards in the single frame",
   );
+});
+
+// #209 — the storyboard contact sheet is a panel-generated PREVIEW, never a
+// real user input, so it must upload into ComfyUI's swept temp/ namespace
+// (type:"temp") instead of permanently littering input/. FAIL-before: the OLD
+// call site (`uploadBlobToInput(blob, name)`, no options) left `opts` undefined,
+// so this test's stub would have recorded `opts: undefined` and the ImageRef
+// would fall back to `type: "input"`.
+test("#209 storyboard upload requests ComfyUI's temp namespace, never input/", async () => {
+  const { deps, frames, uploadCalls } = makeFrameDeps();
+  await composeRunCompletionFrame(
+    {
+      promptId: "p-storyboard-temp",
+      images: [{ filename: "final.png", type: "output" }],
+      videos: [{ m: { filename: "clip.mp4", type: "output" }, nodeId: "7" }],
+      durationMs: 5000,
+    },
+    deps,
+  );
+  assert.equal(uploadCalls.length, 1, "one storyboard upload for the one video");
+  assert.equal(uploadCalls[0].name, "storyboard_clip.png");
+  assert.equal(uploadCalls[0].opts?.type, "temp", "must request the temp namespace, not input/");
+
+  // The resulting ImageRef must carry type:"temp" all the way into the sent
+  // frame, so the chat preview resolves via /view?...&type=temp — never silently
+  // falls back to type:"input" (which would defeat the fix even if the upload
+  // call itself requested temp).
+  const storyboardImg = frames[0].images.find((m) => m.filename === "storyboard_clip.png");
+  assert.ok(storyboardImg, "storyboard ref must be present in the sent frame");
+  assert.equal(storyboardImg.type, "temp");
 });
 
 test("presentation: an empty batch emits NO frame", async () => {

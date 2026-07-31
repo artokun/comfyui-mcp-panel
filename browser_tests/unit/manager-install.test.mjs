@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import * as ManagerInstall from "../../web/js/lib/manager-install.js";
 const {
   looksLikeGitUrl,
+  looksLikeOwnerRepoShorthand,
   gitRepoName,
   installGitUrl,
   buildInstallRequest,
@@ -29,7 +30,7 @@ const {
   searchNodesVia,
 } = ManagerInstall;
 
-test("looksLikeGitUrl recognizes every git protocol", () => {
+test("looksLikeGitUrl recognizes every git protocol, plus author/repo shorthand (#301)", () => {
   for (const u of [
     "https://github.com/foo/bar",
     "http://example.com/foo/bar.git",
@@ -39,13 +40,30 @@ test("looksLikeGitUrl recognizes every git protocol", () => {
     "git@github.com:foo/bar.git",
     "git@github.com:foo/bar",
     "something.git",
+    "kijai/ComfyUI-Hunyuan3DWrapper", // #301 — bare author/repo shorthand
+    "ltdrdata/ComfyUI-Manager",
   ]) {
     assert.equal(looksLikeGitUrl(u), true, `expected git URL: ${u}`);
   }
-  for (const id of ["rgthree-comfy", "comfyui-manager", "author/pack", ""]) {
+  for (const id of ["rgthree-comfy", "comfyui-manager", ""]) {
     assert.equal(looksLikeGitUrl(id), false, `expected registry id: ${id}`);
   }
   assert.equal(looksLikeGitUrl(undefined), false);
+});
+
+test("looksLikeOwnerRepoShorthand matches only a bare, single-slash owner/repo (#301)", () => {
+  for (const s of ["kijai/ComfyUI-Hunyuan3DWrapper", "a/b", "foo-bar/baz_qux.thing"]) {
+    assert.equal(looksLikeOwnerRepoShorthand(s), true, `expected shorthand: ${s}`);
+  }
+  for (const s of [
+    "rgthree-comfy", // no slash — plain registry id
+    "https://github.com/foo/bar", // already a full URL
+    "git@github.com:foo/bar", // scp-form, has a colon
+    "foo/bar/baz", // more than one slash
+    "", undefined, null,
+  ]) {
+    assert.equal(looksLikeOwnerRepoShorthand(s), false, `expected non-shorthand: ${s}`);
+  }
 });
 
 test("gitRepoName derives the repo name for every form", () => {
@@ -68,6 +86,23 @@ test("installGitUrl accepts a git URL via id OR repository, null for registry id
   assert.equal(installGitUrl({}), null);
 });
 
+// #301 — regression: panel_install_node({id:"author/repo"}) used to fall through
+// to the plain registry-id branch (sent verbatim to Manager → 502 on v4, silent
+// failure on 3.x) because looksLikeGitUrl didn't recognize the shorthand. It must
+// now be expanded to a real, clonable GitHub URL via id OR repository.
+test("installGitUrl expands a bare author/repo shorthand to a clonable GitHub URL (#301)", () => {
+  assert.equal(
+    installGitUrl({ id: "kijai/ComfyUI-Hunyuan3DWrapper" }),
+    "https://github.com/kijai/ComfyUI-Hunyuan3DWrapper",
+  );
+  assert.equal(
+    installGitUrl({ repository: "ltdrdata/ComfyUI-Manager" }),
+    "https://github.com/ltdrdata/ComfyUI-Manager",
+  );
+  // A real registry id (no slash) must NOT be reinterpreted as a shorthand.
+  assert.equal(installGitUrl({ id: "rgthree-comfy" }), null);
+});
+
 // --- v2 (Manager v4) ---------------------------------------------------------
 test("v2 git URL → id is repo name, no files, channel dev (via id and via repository)", () => {
   for (const src of [
@@ -86,6 +121,29 @@ test("v2 git URL → id is repo name, no files, channel dev (via id and via repo
     assert.ok(!looksLikeGitUrl(req.params.id), "id must not be a full URL");
   }
 });
+
+// #301 — author/repo shorthand must route exactly like an equivalent full git
+// URL would: v4 by repo name only (no files), v2-batch/legacy via a real
+// clonable files[] URL derived from the shorthand.
+test("v2 author/repo shorthand → id is repo name, no files, channel dev (#301)", () => {
+  const req = buildInstallRequest("v2", { id: "kijai/ComfyUI-Hunyuan3DWrapper" }, "uid-1");
+  assert.equal(req.envelope, "task");
+  assert.equal(req.params.id, "ComfyUI-Hunyuan3DWrapper");
+  assert.equal(req.params.selected_version, "nightly");
+  assert.equal(req.params.channel, "dev");
+  assert.ok(!("files" in req.params), "v4 must NOT send files");
+  assert.ok(!looksLikeGitUrl(req.params.id), "id must not be a full URL or shorthand");
+});
+
+for (const dialect of ["v2-batch", "legacy"]) {
+  test(`${dialect} author/repo shorthand → native files install with a real clonable URL (#301)`, () => {
+    const req = buildInstallRequest(dialect, { id: "kijai/ComfyUI-Hunyuan3DWrapper" }, "uid-1");
+    assert.equal(req.body.id, "ComfyUI-Hunyuan3DWrapper");
+    assert.deepEqual(req.body.files, ["https://github.com/kijai/ComfyUI-Hunyuan3DWrapper"]);
+    assert.equal(req.body.version, "unknown");
+    assert.equal(req.body.ui_id, "uid-1");
+  });
+}
 
 test("v2 registry id keeps the versioned body", () => {
   const req = buildInstallRequest("v2", { id: "rgthree-comfy" }, "uid-1");

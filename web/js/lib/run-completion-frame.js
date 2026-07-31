@@ -339,7 +339,12 @@ async function buildVideoSegment(v, deps) {
         return { ref: null, note: noteOnly("couldn't sample a storyboard from it") };
       }
       const base = (coerceMessageText(m?.filename) || "video").replace(/\.[^.]+$/, "");
-      const ref = await uploadBlobToInput(blob, `storyboard_${base}.png`);
+      // #209 — the storyboard contact sheet is a PANEL-GENERATED preview, not a
+      // real user input; upload it into ComfyUI's swept temp/ namespace (NOT
+      // input/) so it never accumulates as permanent input litter. imageViewUrl
+      // reads ref.type through to the /view request, so the chat preview still
+      // resolves correctly.
+      const ref = await uploadBlobToInput(blob, `storyboard_${base}.png`, { type: "temp" });
       if (!ref) {
         warn("[cmcp] storyboard: upload failed for", m?.filename);
         return { ref: null, note: noteOnly("couldn't upload its storyboard") };
