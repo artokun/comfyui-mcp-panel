@@ -906,6 +906,32 @@ export function applyWidgetWrite(
       ? promotedParentWidgets.filter((dw) => dw && dw !== w && dw !== parentWidget)
       : [];
 
+  // #507 (codex round-3, MODERATE): coerceWidgetValue validated the value against the
+  // IMMEDIATE inner widget's option list only — but a promoted write assigns the SAME
+  // value to the parent's authoritative RAIL widget and to every display proxy, whose
+  // own option lists can DIFFER from the inner's. That is harmless while the inner list
+  // is authoritative, but the empty-list acceptance deliberately writes a value nothing
+  // validated, so an inner combo that is (server-declared) EMPTY could push an OFF-LIST
+  // value into a rail/proxy that DOES have a real list. Scoped strictly to that path:
+  // when acceptEmptyComboOptions is in force, every OTHER mutated combo with a readable
+  // NON-EMPTY list must contain the value, or the whole write fails closed BEFORE any
+  // mutation. A rail whose own list is unreadable or empty adds no information and is
+  // skipped (the inner's server declaration already governs).
+  if (acceptEmptyComboOptions) {
+    for (const other of [parentWidget, ...displayWidgets]) {
+      if (!other || !isComboWidget(other)) continue;
+      const otherOptions = comboOptions(other);
+      if (!Array.isArray(otherOptions) || otherOptions.length === 0) continue;
+      if (otherOptions.includes(coerced)) continue;
+      throw new WidgetWriteError(
+        `Value ${JSON.stringify(coerced)} is not a valid option for the parent subgraph's ` +
+          `combo widget "${other.name}" (${otherOptions.length} options), which this promoted ` +
+          `write also mutates — the inner widget's option list is empty, but this one is not. ` +
+          `Refusing to write.`,
+      );
+    }
+  }
+
   // Snapshot the EXPECTED value BEFORE the callback runs. For a COMPOSITE object
   // write (#179) `w.value` and `coerced` are the SAME reference, so a callback
   // that mutates the object IN PLACE would change our "expected" too — making a

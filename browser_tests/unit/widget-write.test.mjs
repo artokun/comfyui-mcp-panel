@@ -2026,3 +2026,85 @@ test("#507: an UNRESOLVED widget/node still gets no fabricated success (#281/#45
     (err) => err instanceof WidgetWriteError && /did not retain the requested value/i.test(err.message),
   );
 });
+
+// ---- #507 codex round-3 (MODERATE): a PROMOTED write also mutates the parent's rail /
+//      display-proxy combos, whose option lists can DIFFER from the inner's. The
+//      empty-list acceptance must not push an off-list value into one of those. --------
+
+// Same shape as makeSubgraphFixture above (identity-linked rail via input._widget), but
+// the INNER combo is EMPTY — the StarNodes-style dynamic input promoted out of a subgraph.
+function makeEmptyInnerPromotedFixture(railOptions) {
+  const inner = {
+    id: 301,
+    type: "StarOllamaPromptHelper",
+    widgets: [{ name: "model", type: "combo", options: { values: [] }, value: "" }],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) };
+  const railWidget = { name: "model_alias", type: "combo", options: railOptions, value: "" };
+  const parent = {
+    id: 320,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [
+      { name: "model_alias", _widget: railWidget, widget: { name: "model_alias" }, _subgraphSlot: { name: "model_alias" } },
+    ],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_node, subgraphInput) =>
+    subgraphInput?.name === "model_alias" ? { sourceNodeId: "301", sourceWidgetName: "model" } : null;
+  return { parent, inner, railWidget, resolveSource };
+}
+
+test("#507 round-3: an empty INNER combo must not write an off-list value into a NON-EMPTY parent rail", () => {
+  const { parent, inner, railWidget, resolveSource } = makeEmptyInnerPromotedFixture({
+    values: ["qwen3-vl:8b", "llama3.2:3b"],
+  });
+  assert.throws(
+    () =>
+      applyWidgetWrite(parent, "model_alias", "off-list:70b", {
+        ...HOOKS,
+        resolveSource,
+        acceptEmptyComboOptions: true,
+      }),
+    (err) => err instanceof WidgetWriteError && /not a valid option for the parent subgraph/.test(err.message),
+  );
+  assert.equal(inner.widgets[0].value, "", "inner untouched — refused before any mutation");
+  assert.equal(railWidget.value, "", "rail untouched");
+});
+
+test("#507 round-3: the SAME promoted shape writes fine when the value IS on the parent rail's list", () => {
+  const { parent, inner, railWidget, resolveSource } = makeEmptyInnerPromotedFixture({
+    values: ["qwen3-vl:8b", "llama3.2:3b"],
+  });
+  const set = applyWidgetWrite(parent, "model_alias", "llama3.2:3b", {
+    ...HOOKS,
+    resolveSource,
+    acceptEmptyComboOptions: true,
+  });
+  assert.equal(set.value, "llama3.2:3b");
+  assert.equal(inner.widgets[0].value, "llama3.2:3b");
+  assert.equal(railWidget.value, "llama3.2:3b", "the rail is synced (#366/#477)");
+});
+
+test("#507 round-3: a parent rail whose list is EMPTY or UNREADABLE adds no constraint", () => {
+  for (const railOptions of [{ values: [] }, { values: () => { throw new Error("boom"); } }, {}]) {
+    const { parent, inner, resolveSource } = makeEmptyInnerPromotedFixture(railOptions);
+    const set = applyWidgetWrite(parent, "model_alias", "qwen3-vl:8b", {
+      ...HOOKS,
+      resolveSource,
+      acceptEmptyComboOptions: true,
+    });
+    assert.equal(set.value, "qwen3-vl:8b");
+    assert.equal(inner.widgets[0].value, "qwen3-vl:8b");
+  }
+});
+
+test("#507 round-3: the rail cross-check is SCOPED to the empty-list path (ordinary promoted writes unchanged)", () => {
+  // Pre-existing behaviour: the INNER list is authoritative, so a value on the inner list
+  // but NOT on the rail's still writes. The new cross-check must not tighten this.
+  const { parent, inner, railWidget, resolveSource } = makeSubgraphFixture();
+  railWidget.options.values = ["simple"]; // rail list now EXCLUDES "karras"
+  const set = applyWidgetWrite(parent, "sched_alias", "karras", { ...HOOKS, resolveSource });
+  assert.equal(set.value, "karras");
+  assert.equal(inner.widgets.find((w) => w.name === "scheduler").value, "karras");
+});
