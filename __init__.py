@@ -74,6 +74,7 @@ _BACKEND_PORTS = {
     "kimi": _BRIDGE_PORT,  # single-port multi-provider — same orchestrator
     "moonshot": _BRIDGE_PORT,  # hosted (Moonshot / Kimi K3) — same orchestrator, key-gated
     "glm": _BRIDGE_PORT,  # hosted (z.ai coding plan / GLM) — same orchestrator, key-gated
+    "minimax": _BRIDGE_PORT,  # hosted (MiniMax platform) — same orchestrator, key-gated
     "ollama": _BRIDGE_PORT,  # single-port multi-provider — same orchestrator
     "openrouter": _BRIDGE_PORT,  # hosted (OpenRouter) — same orchestrator, key-gated
 }
