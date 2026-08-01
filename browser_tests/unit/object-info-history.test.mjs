@@ -20,6 +20,19 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { createObjectInfoHistory } from "../../web/js/lib/object-info-history.js";
+// The guard-side contract this oracle feeds: an unseeded history returns a TRUTHY
+// sentinel, which the shared classifier reports as "unseeded" (refuse, but diagnose it
+// as a missing baseline rather than a removed pack).
+import { HISTORY_UNSEEDED, backendHistoryVerdict, isRemovedBackendType } from "../../web/js/lib/node-resolve.js";
+
+// Assert the FULL fail-closed contract for a type in a no-baseline history.
+const assertUnseededClosed = (h, type, msg) => {
+  const verdict = h.wasTypeEverDefined(type);
+  assert.equal(verdict, HISTORY_UNSEEDED, msg);
+  assert.ok(verdict, "the sentinel must be TRUTHY so a truth-testing consumer still fails closed");
+  assert.equal(backendHistoryVerdict(type, (t) => h.wasTypeEverDefined(t)), "unseeded");
+  assert.equal(isRemovedBackendType(type, (t) => h.wasTypeEverDefined(t)), false, "not a REMOVED claim — it is an unknown-baseline claim");
+};
 
 const defs = (...types) => Object.fromEntries(types.map((t) => [t, { input: { required: {} } }]));
 
@@ -27,12 +40,12 @@ test("#458 rule 1: an UNSEEDED history fails CLOSED — every type reads as ever
   const h = createObjectInfoHistory();
   assert.equal(h.seeded, false);
   // Nothing observed at all.
-  assert.equal(h.wasTypeEverDefined("MarkdownNote"), true, "unseeded ⇒ refuse (treat as removed)");
-  assert.equal(h.wasTypeEverDefined("AnythingAtAll"), true);
+  assertUnseededClosed(h, "MarkdownNote", "unseeded ⇒ refuse");
+  assertUnseededClosed(h, "AnythingAtAll");
   // Even after RECORDING types, an unseeded history still refuses everything: recording
   // is evidence, promoting it to a baseline is a separate, explicit claim.
   h.recordTypes(defs("KSampler"));
-  assert.equal(h.wasTypeEverDefined("MarkdownNote"), true, "recording alone is not a baseline");
+  assertUnseededClosed(h, "MarkdownNote", "recording alone is not a baseline");
 });
 
 test("#458 rule 1: once SEEDED, only genuinely-observed types read as ever-defined", () => {
@@ -54,12 +67,25 @@ test("#458 rule 2 (SEVERE): a LOST baseline is LATCHED — a later successful ob
   assert.equal(h.baselineLost, true);
   // "MarkdownNote" was NEVER in the late payload — but we cannot conclude it never
   // existed, so it must still read as ever-defined and stay refused by the guards.
-  assert.equal(
-    h.wasTypeEverDefined("MarkdownNote"),
-    true,
-    "a post-loss history must never authorize the frontend-only exemption",
-  );
-  assert.equal(h.wasTypeEverDefined("KSampler"), true);
+  assertUnseededClosed(h, "MarkdownNote", "a post-loss history must never authorize the frontend-only exemption");
+  assertUnseededClosed(h, "KSampler");
+});
+
+test("#458 rule 2 (SEVERE, production ordering): a post-gap observation recorded BEFORE any guard runs does not establish a baseline", () => {
+  // The ordering codex round-4 flagged: the startup seed hangs (so nothing has latched
+  // yet), the pack is removed, and a RECONNECT / refresh_nodes / download refresh lands a
+  // current /object_info. That payload is RECORDED — recording only ever adds evidence —
+  // but it must NOT be promoted to a baseline, because it cannot support the claim
+  // "anything absent here was never backend-defined this session".
+  const h = createObjectInfoHistory();
+  h.recordTypes(defs("KSampler", "CLIPTextEncode")); // post-removal payload, no markSeeded
+  assert.equal(h.seeded, false, "recording alone never seeds — only the startup seed may");
+  assertUnseededClosed(h, "MarkdownNote", "with no startup baseline, nothing can be concluded");
+  // The guard that eventually runs latches the loss, and it stays latched afterwards.
+  h.loseBaseline();
+  h.recordTypes(defs("KSampler"));
+  assert.equal(h.markSeeded(), false);
+  assertUnseededClosed(h, "MarkdownNote");
 });
 
 test("#458 rule 2: losing the baseline AFTER it was legitimately established also closes the gate", () => {
@@ -71,7 +97,7 @@ test("#458 rule 2: losing the baseline AFTER it was legitimately established als
   // markSeeded is now inert, so a subsequent re-register cannot re-open the exemption.
   assert.equal(h.markSeeded(), false);
   assert.equal(h.seeded, false);
-  assert.equal(h.wasTypeEverDefined("MarkdownNote"), true, "latched closed for the session");
+  assertUnseededClosed(h, "MarkdownNote", "latched closed for the session");
 });
 
 test("#458: recordTypes is NOT latched — recording can only ever ADD evidence (refuse more)", () => {

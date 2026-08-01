@@ -320,6 +320,9 @@ function monotonicNow() {
 // unit-testable rather than loose module state in this bundle.
 const objectInfoHistory = createObjectInfoHistory();
 const recordObjectInfoTypes = (defs) => objectInfoHistory.recordTypes(defs);
+// ONLY seedObjectInfoHistory() may call this. See the RECORD ONLY note in
+// registerComfyNodeDefs: any observation taken after an unobserved window cannot support
+// the "never backend-defined this session" claim a baseline makes.
 const markObjectInfoHistorySeeded = () => objectInfoHistory.markSeeded();
 // Resolves once the STARTUP baseline seed attempt sequence has finished (success or all
 // retries exhausted). The graph tools AWAIT this (bounded) before authorizing.
@@ -345,6 +348,11 @@ function seedObjectInfoHistory() {
       }
       await new Promise((resolve) => setTimeout(resolve, 150));
     }
+    // Every attempt failed: the STARTUP baseline is definitively missed, and this is the
+    // ONLY function permitted to establish one. Latch the loss now rather than waiting
+    // for a graph tool to notice — otherwise nothing marks the session unsafe and a later
+    // observation could look authoritative (codex round-4, SEVERE).
+    objectInfoHistory.loseBaseline();
   })();
   return objectInfoHistorySeed;
 }
@@ -400,17 +408,19 @@ async function registerComfyNodeDefs(preloadedDefs) {
       defs = await api.getNodeDefs();
     }
     // Record observed backend history (#458 trust root) — covers reconnect, the forced
-    // refresh_nodes path, add_node payloads, and download-triggered refreshes. A valid
-    // payload here also establishes a reliable baseline (marks history seeded), so a
-    // reconnect after a failed startup seed restores the ever-seen gate to normal.
+    // refresh_nodes path, add_node payloads, and download-triggered refreshes.
+    //
+    // RECORD ONLY — this must NEVER establish the baseline (codex round-4, SEVERE).
+    // Recording can only ADD evidence that a type existed, which can only make the gate
+    // refuse MORE, so it is always safe. Claiming a BASELINE is the opposite: it asserts
+    // "anything not in this map was never backend-defined this session", which this
+    // payload cannot support — it may have been fetched AFTER a pack removal we never
+    // observed (startup seed hung, pack removed, then a reconnect/refresh_nodes lands
+    // here). Marking seeded from it would make the removed type read "never seen" and
+    // let a provenance-stripped husk squatting a reserved allowlisted name through the
+    // frontend-only exemption. ONLY seedObjectInfoHistory() — the STARTUP baseline, whose
+    // observation window begins at page load — may call markObjectInfoHistorySeeded().
     recordObjectInfoTypes(defs);
-    if (defs && typeof defs === "object" && Object.keys(defs).length > 0) {
-      // Honours the baseline-lost LATCH: a reconnect must NOT restore the ever-seen gate
-      // once the startup baseline was missed, because this payload may already be
-      // POST-removal (codex round-3, SEVERE). Recording the types above is still correct
-      // and useful — it can only ever ADD evidence that a type existed.
-      markObjectInfoHistorySeeded();
-    }
     // Re-register node definitions so newly installed/updated classes and their
     // current widget schemas are known to LiteGraph (#221/#171).
     if (defs && typeof a.registerNodesFromDefs === "function") {

@@ -162,10 +162,48 @@ export function isAuthorizedFrontendOnlyType(registry, type, node) {
  * and itself fails closed while the session baseline is unseeded.
  */
 export function isRemovedBackendType(type, wasTypeEverDefined) {
+  return backendHistoryVerdict(type, wasTypeEverDefined) === "removed";
+}
+
+/**
+ * The sentinel an injected `wasTypeEverDefined` returns instead of `true` when it has NO
+ * trustworthy session baseline at all (the panel never established one, or latched it as
+ * lost). It is TRUTHY, so any consumer that merely tests for truth still fails CLOSED —
+ * recognizing it only buys a HONEST error message. Without it every refusal in that state
+ * claims "its backend was removed (pack uninstalled/disabled)", which for a MarkdownNote
+ * is simply false and misdiagnoses a transient backend problem as a broken install —
+ * exactly the misleading-error complaint #496 was filed about.
+ */
+export const HISTORY_UNSEEDED = "history-unseeded";
+
+/**
+ * Classify a type against the observed-backend-history oracle. ONE shared classifier for
+ * the whole guard family (#496), so all three guards agree on both the verdict and the
+ * diagnosis they report:
+ *   "unseeded"   — no trustworthy baseline exists; nothing can be concluded ⇒ refuse, and
+ *                  tell the user to reload the tab rather than blame a missing pack.
+ *   "removed"    — the backend reported this type earlier this session and does not now
+ *                  ⇒ its pack was uninstalled/disabled ⇒ refuse.
+ *   "never-seen" — genuinely never backend-defined this session ⇒ the frontend-only
+ *                  exemption may be considered (it has its own further requirements).
+ *   "no-oracle"  — no history oracle was injected at all. Treated as NOT never-seen, so
+ *                  callers that require positive history evidence fail closed.
+ */
+export function backendHistoryVerdict(type, wasTypeEverDefined) {
+  if (typeof wasTypeEverDefined !== "function" || typeof type !== "string") return "no-oracle";
+  const seen = wasTypeEverDefined(type);
+  if (seen === HISTORY_UNSEEDED) return "unseeded";
+  return seen ? "removed" : "never-seen";
+}
+
+/** The shared, honest refusal for the "no trustworthy baseline" state. */
+function unseededHistoryMessage(what) {
   return (
-    typeof wasTypeEverDefined === "function" &&
-    typeof type === "string" &&
-    wasTypeEverDefined(type)
+    `${what}: the panel has no trustworthy record of what this ComfyUI backend defined ` +
+    `earlier this session (the /object_info baseline never loaded — the backend was ` +
+    `unreachable or too slow at page load), so a genuinely frontend-only node cannot be ` +
+    `told apart from one whose pack was removed. Reload the ComfyUI tab to re-establish ` +
+    `the baseline, then retry. Refusing to write rather than guess (#458).`
   );
 }
 
@@ -232,7 +270,11 @@ export function assertMutatedNodeAuthorized(freshDefs, registry, node, role = "t
   if (typeof type === "string" && Object.prototype.hasOwnProperty.call(freshDefs, type)) return;
   // ABSENT from fresh object_info. EVER-SEEN GATE: if the backend reported this type
   // earlier this session, its backend was REMOVED — refuse (non-forgeable, #458).
-  if (isRemovedBackendType(type, wasTypeEverDefined)) {
+  const verdict = backendHistoryVerdict(type, wasTypeEverDefined);
+  if (verdict === "unseeded") {
+    throw new Error(unseededHistoryMessage(`Cannot set widget on node ${id}${label} (${role} node)`));
+  }
+  if (verdict === "removed") {
     throw new Error(
       `Cannot set widget on node ${id}${label}: the ${role} node type was defined by the ComfyUI ` +
         `backend earlier this session but is ABSENT from the current /object_info — its backend was ` +
@@ -349,7 +391,11 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
       // as the set_widget guards): the backend reported this type earlier this session
       // but no longer does ⇒ its pack was REMOVED. Refuse, even under a reserved
       // allowlisted name, before the frontend-only exemption below is consulted.
-      if (isRemovedBackendType(class_type, wasTypeEverDefined)) {
+      const verdict = backendHistoryVerdict(class_type, wasTypeEverDefined);
+      if (verdict === "unseeded") {
+        throw new Error(unseededHistoryMessage(`Cannot add "${class_type}"`));
+      }
+      if (verdict === "removed") {
         throw new Error(
           `Cannot add "${class_type}": the ComfyUI backend defined this node type earlier this ` +
             `session but it is ABSENT from the current /object_info — its backend was removed ` +
@@ -464,7 +510,11 @@ export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknow
     // that carries no nodeData/comfyClass is caught here, because a client husk cannot
     // un-see what the backend already reported. This is what the client-side allowlist +
     // provenance markers CANNOT prove on their own.
-    if (isRemovedBackendType(type, wasTypeEverDefined)) {
+    const verdict = backendHistoryVerdict(type, wasTypeEverDefined);
+    if (verdict === "unseeded") {
+      throw new Error(unseededHistoryMessage(`Cannot set widget on node ${nodeId}${label}`));
+    }
+    if (verdict === "removed") {
       throw new Error(
         `Cannot set widget on node ${nodeId}${label}: node type "${type}" was defined by the ComfyUI ` +
           `backend earlier this session but is ABSENT from the current /object_info — its backend was ` +

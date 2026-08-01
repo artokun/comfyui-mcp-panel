@@ -32,6 +32,8 @@
 // type existed, which can only ever make the gate refuse MORE. Only the "this history is
 // trustworthy enough to conclude never-seen" claim is latched.
 
+import { HISTORY_UNSEEDED } from "./node-resolve.js";
+
 export function createObjectInfoHistory() {
   const seen = new Set();
   let seeded = false;
@@ -67,9 +69,15 @@ export function createObjectInfoHistory() {
     },
 
     /** The oracle the #458 guards inject. TRUE ⇒ "treat as defined earlier this session",
-     *  which for a type absent from the CURRENT /object_info means REMOVED ⇒ refuse. */
+     *  which for a type absent from the CURRENT /object_info means REMOVED ⇒ refuse.
+     *  With NO trustworthy baseline it returns the HISTORY_UNSEEDED sentinel instead —
+     *  still TRUTHY, so a consumer that only tests for truth still fails closed, but a
+     *  guard that recognizes it can say "reload the tab" rather than falsely blaming a
+     *  removed pack (which for a MarkdownNote is nonsense and is exactly the misleading
+     *  diagnosis #496 was filed about). */
     wasTypeEverDefined(type) {
-      return !seeded || seen.has(type);
+      if (!seeded) return HISTORY_UNSEEDED;
+      return seen.has(type);
     },
 
     get seeded() {

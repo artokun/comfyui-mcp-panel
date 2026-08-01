@@ -28,6 +28,8 @@ import {
   FRONTEND_ONLY_NODE_TYPES,
   isAuthorizedFrontendOnlyType,
   isRemovedBackendType,
+  HISTORY_UNSEEDED,
+  backendHistoryVerdict,
 } from "../../web/js/lib/node-resolve.js";
 // The PRODUCTION graph_set_widget handler body — the executor and these tests
 // call it verbatim, so the tested ordering IS the shipped ordering (#458).
@@ -1395,4 +1397,84 @@ test("#507 codex round-2 (MODERATE): a real failure on the FINAL attempt propaga
       }),
     /did not retain the requested value/i,
   );
+});
+
+// ---- #496 / #458: an UNSEEDED history must refuse with an HONEST diagnosis. Previously
+//      every refusal in that state claimed "its backend was removed (pack uninstalled)",
+//      which for a MarkdownNote is false and misdiagnoses a transient backend problem as
+//      a broken install — the same misleading-error complaint #496 was filed about. -----
+
+// The oracle the panel injects when it has no trustworthy baseline.
+const NO_BASELINE = () => HISTORY_UNSEEDED;
+
+test("#496: all three guards refuse an unseeded history with a RELOAD-THE-TAB diagnosis, never a false 'pack removed'", async () => {
+  const reg = registryWithNatives();
+  const fresh = objectInfo();
+  const node = { id: 11, type: "MarkdownNote", widgets: [{ name: "text", type: "string", value: "" }], constructor: reg["MarkdownNote"] };
+  const honest = /no trustworthy record|Reload the ComfyUI tab/i;
+  const falseClaim = /pack uninstalled|its backend was removed/i;
+
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS(fresh, NO_BASELINE)),
+    (err) => honest.test(err.message) && !falseClaim.test(err.message),
+  );
+  assert.throws(
+    () => assertTypeAgainstFreshBackend(fresh, "MarkdownNote", 11, { registry: reg, node, wasTypeEverDefined: NO_BASELINE }),
+    (err) => honest.test(err.message) && !falseClaim.test(err.message),
+  );
+  assert.throws(
+    () => assertMutatedNodeAuthorized(fresh, reg, node, "target", NO_BASELINE),
+    (err) => honest.test(err.message) && !falseClaim.test(err.message),
+  );
+});
+
+test("#496: the unseeded sentinel still FAILS CLOSED — it is truthy and never authorizes", async () => {
+  const reg = registryWithNatives();
+  const fresh = objectInfo();
+  const node = { id: 11, type: "MarkdownNote", widgets: [{ name: "text", type: "string", value: "" }], constructor: reg["MarkdownNote"] };
+  // The SAME fixture succeeds with a real baseline — only the oracle differs, so the
+  // refusal below is attributable to the missing baseline and nothing else.
+  await assert.doesNotReject(() => assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS(fresh)));
+  assert.doesNotThrow(() =>
+    assertTypeAgainstFreshBackend(fresh, "MarkdownNote", 11, { registry: reg, node, wasTypeEverDefined: () => false }),
+  );
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "text", "# README", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => fresh,
+        wasTypeEverDefined: NO_BASELINE,
+        ...HOOKS,
+      }),
+    /no trustworthy record|Reload the ComfyUI tab/i,
+  );
+  assert.equal(node.widgets[0].value, "", "no write without a baseline");
+});
+
+test("#496: a REAL removed pack still gets the removed-pack diagnosis (the honest message did not replace it)", () => {
+  const reg = registryWithNatives();
+  const fresh = objectInfo();
+  const node = { id: 11, type: "MarkdownNote", widgets: [{ name: "text", type: "string", value: "" }], constructor: reg["MarkdownNote"] };
+  assert.throws(
+    () =>
+      assertTypeAgainstFreshBackend(fresh, "MarkdownNote", 11, {
+        registry: reg,
+        node,
+        wasTypeEverDefined: (t) => t === "MarkdownNote", // a genuine ever-seen positive
+      }),
+    /its backend was removed|pack uninstalled/i,
+  );
+});
+
+test("#496: backendHistoryVerdict — the one classifier all three guards share", () => {
+  assert.equal(backendHistoryVerdict("X", () => HISTORY_UNSEEDED), "unseeded");
+  assert.equal(backendHistoryVerdict("X", () => true), "removed");
+  assert.equal(backendHistoryVerdict("X", () => false), "never-seen");
+  assert.equal(backendHistoryVerdict("X", undefined), "no-oracle", "no oracle wired");
+  assert.equal(backendHistoryVerdict(undefined, () => true), "no-oracle", "a non-string type");
+  // isRemovedBackendType is the NARROW "REMOVED" claim only — an unseeded history is a
+  // refusal, but it is not a claim that the pack was removed.
+  assert.equal(isRemovedBackendType("X", () => HISTORY_UNSEEDED), false);
+  assert.equal(isRemovedBackendType("X", () => true), true);
 });
