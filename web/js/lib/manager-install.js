@@ -412,6 +412,17 @@ export function legacyUpdateBody({ ui_id, id, version } = {}) {
  * parse/filter is unit-testable away from the browser Manager client. Handles
  * both wire shapes: an ARRAY of pack objects, or the documented MAP keyed by
  * repo/url → [ [classNames…], { title, description, … } ]. Issues #251/#255.
+ *
+ * The `id` MUST be a value panel_install_node can actually consume (#394): a
+ * cnr/registry id or a git-routable repo URL. In the MAP shape the meta object
+ * carries only { title, description } — NO installable id — while the object KEY
+ * is the pack's repo URL (git-routable via buildInstallRequest). Deriving the id
+ * from the human `title` (e.g. "Impact Pack") produced a display name with a
+ * space and no slash/protocol that looksLikeGitUrl rejects → it was sent verbatim
+ * to Manager, which silently no-ops on v4 (queue drains "done", nothing installs).
+ * So the id is taken from an explicit cnr/reference id when present, else the
+ * repo-URL KEY — NEVER the title. The title is still returned separately for
+ * display.
  */
 export function parseNodeMappings(data, query, limit) {
   const q = String(query ?? "").toLowerCase();
@@ -424,11 +435,15 @@ export function parseNodeMappings(data, query, limit) {
     }
   };
   if (Array.isArray(data)) {
+    // Array shape: an explicit cnr `id` or a repo-URL `reference` are both
+    // installable; only fall back to `title` when neither is present (#394).
     for (const p of data) push(p?.id ?? p?.reference ?? p?.title, p?.title, p?.description);
   } else if (data && typeof data === "object") {
     for (const [key, val] of Object.entries(data)) {
       const meta = Array.isArray(val) ? val[1] : val;
-      push(meta?.id ?? meta?.title ?? key, meta?.title, meta?.description);
+      // #394: prefer an installable id (cnr/reference), else the repo-URL KEY.
+      // NEVER the display title — that is not resolvable by panel_install_node.
+      push(meta?.id ?? meta?.reference ?? key, meta?.title, meta?.description);
     }
   }
   const max = Math.min(Number(limit) || 15, 40);

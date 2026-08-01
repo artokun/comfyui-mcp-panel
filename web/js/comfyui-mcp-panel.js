@@ -110,6 +110,7 @@ import {
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing } from "./lib/node-resolve.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
+import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
 import {
   resolveScope,
   describeScope,
@@ -260,6 +261,12 @@ const refreshComfyNodeDefs = makeRefreshCoalescer({
   },
   runRegister: registerComfyNodeDefs,
 });
+
+// #396: download ids already counted as done, so each COMPLETED model download
+// triggers a live-combo refresh exactly once (a lingering done row won't re-fire;
+// a pruned-then-re-downloaded id can). Fed by the download_progress frame in
+// onDownloads.
+let seenDoneDownloads = new Set();
 
 function setupListeners() {
   if (!api) return;
@@ -14723,6 +14730,22 @@ function buildPanel() {
     // Orchestrator pushed live download progress → render rows in the tray.
     onDownloads(list) {
       renderDownloads(list);
+      // #396: when a model download COMPLETES, its file has landed in models/…
+      // but the live-canvas loader combos (vae_name, lora_name, ckpt_name, …)
+      // were populated from /object_info at page-load and stay stale — so the
+      // freshly downloaded file reads as "not a valid option" until a manual
+      // reload / ComfyUI restart. Re-pull fresh /object_info and re-register the
+      // node defs + refreshComboInNodes so the new file is immediately SELECTABLE.
+      // Fire ONCE per completed download (reconcileCompletedDownloads dedupes the
+      // lingering done rows); refreshComfyNodeDefs is coalesced single-flight and
+      // fully defensive (no-op when no canvas / on any frontend-API gap — worst
+      // case is today's stale behaviour, never a throw). force:true so a completion
+      // arriving while an UNRELATED refresh is already in flight is not silently
+      // dropped by joining that older /object_info fetch — it guarantees a trailing
+      // fresh fetch that reflects the just-landed file (#396 completion race).
+      const { nextSeen, newlyDone } = reconcileCompletedDownloads(list, seenDoneDownloads);
+      seenDoneDownloads = nextSeen;
+      if (newlyDone.length) void refreshComfyNodeDefs(undefined, { force: true });
     },
     // Live RunPod pod status → the host pill + open control modal.
     onRunpodStatus(frame) {

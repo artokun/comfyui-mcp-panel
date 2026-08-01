@@ -776,6 +776,47 @@ test("parseNodeMappings handles array + map shapes and caps the limit", () => {
   assert.equal(parseNodeMappings(many, "").results.length, 15);
 });
 
+test("#394 parseNodeMappings MAP-shape id is INSTALLABLE (repo URL), never the display title", () => {
+  const res = parseNodeMappings(GETMAPPINGS_MAP, "", 15);
+  // The meta objects carry only { title, description } — no installable id — so
+  // the id MUST fall through to the repo-URL KEY, not the human title.
+  const byTitle = Object.fromEntries(res.results.map((r) => [r.title, r]));
+  const impactish = byTitle["ComfyUI-RMBG"];
+  assert.ok(impactish, "expected a result keyed by its display title");
+  assert.equal(impactish.id, "https://github.com/1038lab/ComfyUI-RMBG");
+  // A title with a space ("ComfyUI Frame Interpolation") is the exact shape that
+  // used to leak into `id` and defeat install (no slash/protocol). Assert it does
+  // NOT: the id is the repo URL and the title stays separate for display.
+  const fi = byTitle["ComfyUI Frame Interpolation"];
+  assert.ok(fi);
+  assert.equal(fi.id, "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation");
+  assert.notEqual(fi.id, fi.title);
+  // Every derived id must be consumable by panel_install_node — routed as a git
+  // install and matched on disk under the repo name.
+  for (const r of res.results) {
+    assert.equal(looksLikeGitUrl(r.id), true, `id ${r.id} must be git-routable`);
+    assert.equal(installGitUrl({ id: r.id }), r.id, `installGitUrl must resolve ${r.id}`);
+    const req = buildInstallRequest("v2", { id: r.id, version: "latest" });
+    assert.equal(req.params.id, gitRepoName(r.id), "v2 install routes by the repo name");
+  }
+});
+
+test("#394 parseNodeMappings prefers an explicit cnr/reference id over the title/key", () => {
+  // A Manager build that DOES carry a cnr id in meta must keep it (installable),
+  // and a `reference` repo URL wins over the human title too.
+  const withCnr = {
+    "https://github.com/ltdrdata/ComfyUI-Impact-Pack": [
+      ["ImpactWildcardProcessor"],
+      { id: "comfyui-impact-pack", title: "Impact Pack", description: "detailer" },
+    ],
+  };
+  assert.equal(parseNodeMappings(withCnr, "", 15).results[0].id, "comfyui-impact-pack");
+  const arrWithRef = [
+    { reference: "https://github.com/foo/bar", title: "Foo Bar", description: "x" },
+  ];
+  assert.equal(parseNodeMappings(arrWithRef, "", 15).results[0].id, "https://github.com/foo/bar");
+});
+
 test("managerUnavailableResult is a safe, actionable structured payload", () => {
   const r = managerUnavailableResult(undefined, UNREACHABLE);
   assert.equal(r.supported, false);

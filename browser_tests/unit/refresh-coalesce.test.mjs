@@ -77,6 +77,48 @@ test("a single call registers its payload and clears the in-flight slot", async 
   assert.equal(getInFlight(), null, "in-flight slot cleared after settle");
 });
 
+test("#396 a FORCED payload-less call while a refresh is in flight runs a TRAILING fresh run", async () => {
+  // The download-completion case: an unrelated refresh (e.g. reconnect) is in
+  // flight when a model finishes; its /object_info fetch predates the new file, so
+  // a plain join would miss it. force:true must guarantee a second (trailing) run.
+  const gate = deferred();
+  const { coalescer, registered } = makeHarness(async () => {
+    if (registered.length === 1) await gate.promise; // hold ONLY the first run in flight
+  });
+
+  const inflight = coalescer(); // unrelated refresh, now in flight (held by gate)
+  const forced = coalescer(undefined, { force: true }); // download completion
+
+  gate.resolve();
+  await Promise.all([inflight, forced]);
+
+  assert.equal(registered.length, 2, "the forced call ran its OWN trailing refresh, not just a join");
+});
+
+test("#396 many FORCED calls during one in-flight run coalesce into ONE trailing run", async () => {
+  const gate = deferred();
+  const { coalescer, registered } = makeHarness(async () => {
+    if (registered.length === 1) await gate.promise;
+  });
+
+  const inflight = coalescer(); // held in flight
+  const f1 = coalescer(undefined, { force: true });
+  const f2 = coalescer(undefined, { force: true });
+  const f3 = coalescer(undefined, { force: true });
+
+  gate.resolve();
+  await Promise.all([inflight, f1, f2, f3]);
+
+  assert.equal(registered.length, 2, "three forced calls collapsed to a single trailing run");
+});
+
+test("#396 a FORCED call with NO refresh in flight runs immediately (leading edge)", async () => {
+  const { coalescer, registered, getInFlight } = makeHarness();
+  await coalescer(undefined, { force: true });
+  assert.equal(registered.length, 1, "forced call ran once");
+  assert.equal(getInFlight(), null, "in-flight slot cleared after settle");
+});
+
 test("a payload call still runs even if the in-flight refresh REJECTS", async () => {
   const gate = deferred();
   let first = true;
