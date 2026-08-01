@@ -28,7 +28,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { createObjectInfoHistory } from "../../web/js/lib/object-info-history.js";
+import { createObjectInfoHistory, awaitHistoryBaseline } from "../../web/js/lib/object-info-history.js";
 // The guard-side contract this oracle feeds: both no-baseline states return a TRUTHY
 // sentinel (so a truth-testing consumer still fails closed) and the shared classifier
 // turns them into distinct, honest diagnoses.
@@ -163,4 +163,64 @@ test("#458: recordTypes is defensive and returns its argument (so it can wrap a 
   assert.equal(h.wasTypeEverDefined("KSampler"), true);
   // A null payload recorded nothing, so an unobserved type is still 'never seen'.
   assert.equal(h.wasTypeEverDefined("MarkdownNote"), false);
+});
+
+
+// ---- awaitHistoryBaseline: the PRODUCTION bounded wait. These are the load-bearing
+//      tests for the coordinator-found HIGH — reintroducing a loseBaseline() call inside
+//      this helper must FAIL here, not merely be caught by review. ---------------------
+
+const never = () => new Promise(() => {}); // a getNodeDefs() that never settles
+
+test("#496 HIGH: a bounded wait that EXPIRES must not mutate the history (no latch, no seed)", async () => {
+  const h = createObjectInfoHistory();
+  const seeded = await awaitHistoryBaseline(h, never(), 5);
+  assert.equal(seeded, false, "reports 'not seeded' so the caller refuses this one call");
+  assert.equal(h.baselineLost, false, "a TIMEOUT is the absence of evidence — it must never latch");
+  assert.equal(h.seeded, false);
+  // …and the state is the RECOVERABLE one, so the refusal reads as temporary.
+  assert.equal(h.wasTypeEverDefined("MarkdownNote"), HISTORY_PENDING);
+});
+
+test("#496 HIGH: the seed keeps running past the bound — a late response still restores normal operation", async () => {
+  const h = createObjectInfoHistory();
+  // A seed that resolves well AFTER the caller's bound, exactly like an 8.1s getNodeDefs
+  // against an 8s wait.
+  const slowSeed = new Promise((resolve) => setTimeout(resolve, 40)).then(() => {
+    h.recordTypes({ KSampler: {}, CLIPTextEncode: {} });
+    h.markSeeded();
+  });
+  assert.equal(await awaitHistoryBaseline(h, slowSeed, 5), false, "gave up waiting");
+  assert.equal(h.baselineLost, false, "…without burning the session");
+  await slowSeed; // the response lands
+  // The NEXT call sees a real baseline: no reload, and the exemption works again.
+  assert.equal(await awaitHistoryBaseline(h, slowSeed, 5), true);
+  assert.equal(h.wasTypeEverDefined("MarkdownNote"), false, "MarkdownNote addable/writable again");
+  assert.equal(h.wasTypeEverDefined("KSampler"), true, "and the baseline is a REAL one");
+});
+
+test("awaitHistoryBaseline: a seed that RESOLVES within the bound reports seeded immediately", async () => {
+  const h = createObjectInfoHistory();
+  const seed = Promise.resolve().then(() => {
+    h.recordTypes({ KSampler: {} });
+    h.markSeeded();
+  });
+  assert.equal(await awaitHistoryBaseline(h, seed, 1000), true);
+  assert.equal(h.baselineLost, false);
+});
+
+test("awaitHistoryBaseline: a REJECTED seed neither throws nor latches (the seed itself owns that decision)", async () => {
+  const h = createObjectInfoHistory();
+  const rejected = Promise.reject(new Error("network"));
+  assert.equal(await awaitHistoryBaseline(h, rejected, 1000), false, "no unhandled rejection, no throw");
+  assert.equal(h.baselineLost, false, "only seedObjectInfoHistory, after ALL attempts finish, may latch");
+  assert.equal(h.wasTypeEverDefined("MarkdownNote"), HISTORY_PENDING);
+});
+
+test("awaitHistoryBaseline: an ALREADY-LATCHED history is reported as not seeded and stays latched", async () => {
+  const h = createObjectInfoHistory();
+  h.loseBaseline();
+  assert.equal(await awaitHistoryBaseline(h, never(), 5), false);
+  assert.equal(h.baselineLost, true);
+  assert.equal(h.wasTypeEverDefined("MarkdownNote"), HISTORY_UNSEEDED, "still the reload-the-tab state");
 });

@@ -125,3 +125,42 @@ export function createObjectInfoHistory() {
     },
   };
 }
+
+/**
+ * Wait (BOUNDED) for the startup baseline seed, then return REGARDLESS of whether it
+ * landed. Extracted from the panel so the rule below is directly testable — the bug it
+ * encodes was found in review, not by a test, precisely because this logic had no seam.
+ *
+ * THE RULE, AND THE WHOLE REASON THIS FUNCTION EXISTS: it must NEVER mutate `history`.
+ * The bound exists only so a getNodeDefs() that never settles cannot hang a graph tool
+ * forever; giving up on the WAIT teaches us nothing about the backend. If this called
+ * history.loseBaseline(), a fetch that merely took a moment longer than the bound would
+ * latch the session closed and every subsequent legitimate add/write would be refused
+ * until the user reloaded the tab — ordinary latency causing permanent breakage, the same
+ * false-refusal bug class (#496/#507) this guard family was fixed to stop producing.
+ *
+ * Nor may it start a REPLACEMENT seed: that fetch would be anchored after an unobserved
+ * window, and installing its map as the baseline is exactly the removed-pack hole.
+ *
+ * So: on return the history is either SEEDED (proceed normally) or PENDING (refuse this
+ * one call, temporarily). `seedPromise` keeps running either way, and a late response
+ * still calls markSeeded(), so the next call authorizes with no reload. `history` is
+ * accepted only so callers and tests can state that invariant explicitly.
+ */
+export async function awaitHistoryBaseline(history, seedPromise, timeoutMs) {
+  let timer;
+  try {
+    await Promise.race([
+      // A rejected seed is not an error here — it simply leaves the history unseeded.
+      Promise.resolve(seedPromise).catch(() => {}),
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+      }),
+    ]);
+  } finally {
+    // Clear the losing timer so a fast seed does not pin a handle per graph tool call.
+    clearTimeout(timer);
+  }
+  // Deliberately no state change. See the rule above before adding one.
+  return history?.seeded ?? false;
+}

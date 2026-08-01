@@ -121,7 +121,7 @@ import {
   resolveMissingModelDirectory,
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing } from "./lib/node-resolve.js";
-import { createObjectInfoHistory } from "./lib/object-info-history.js";
+import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
 import { todoItemGlyph } from "./lib/plan-glyph.js";
@@ -371,34 +371,13 @@ function seedObjectInfoHistory() {
 // timeout safe to have at all: without a recoverable pending state it would convert
 // ordinary latency into a permanent, session-long false refusal.
 const OBJECT_INFO_SEED_WAIT_MS = 8000;
-async function awaitObjectInfoHistorySeed() {
-  const bounded = (p) => {
-    let timer;
-    return Promise.race([
-      Promise.resolve(p).catch(() => {}),
-      new Promise((resolve) => {
-        timer = setTimeout(resolve, OBJECT_INFO_SEED_WAIT_MS);
-      }),
-      // Clear the losing timer either way so a fast seed does not leave an 8s handle
-      // pinned for every graph tool call.
-    ]).finally(() => clearTimeout(timer));
-  };
-  await bounded(objectInfoHistorySeed);
-  // Deliberately nothing else. If the seed has not landed yet the history reports
-  // PENDING, the guards refuse this ONE call with "retry in a moment", and the seed keeps
-  // running: a response arriving AFTER the bound still calls markSeeded(), so the next
-  // call authorizes normally with no tab reload.
-  //
-  // We must NOT latch here. Timing out is the ABSENCE of evidence, not evidence — an
-  // /object_info fetch that merely took longer than the bound would otherwise burn the
-  // whole session, refusing every legitimate add/write afterwards even though the request
-  // came back with perfectly healthy definitions. That is the same false-refusal bug
-  // (#496/#507) this work exists to fix. Only seedObjectInfoHistory, whose attempt
-  // sequence has actually FINISHED empty, has the evidence to arm the latch.
-  //
-  // We must also NOT start a replacement seed: that fetch would be anchored AFTER an
-  // unobserved window, and installing its map as the baseline is the removed-pack hole.
-}
+// Delegates to the extracted, unit-tested helper, whose contract is that it NEVER mutates
+// the history: giving up on the WAIT is the absence of evidence, so it must not latch and
+// must not start a replacement seed. If the baseline has not landed the history reports
+// PENDING and the guards refuse this ONE call with "retry in a moment"; the seed keeps
+// running and a late response still seeds, so the next call succeeds with no tab reload.
+const awaitObjectInfoHistorySeed = () =>
+  awaitHistoryBaseline(objectInfoHistory, objectInfoHistorySeed, OBJECT_INFO_SEED_WAIT_MS);
 
 async function registerComfyNodeDefs(preloadedDefs) {
   // Trust the live combos for suppressing missing-asset candidates ONLY once the
