@@ -1114,3 +1114,60 @@ test("#370 still-running: reconcile leaves it pending and delivers nothing", asy
   assert.equal(flushes.length, 1);
   assert.equal(flushes[0].promptId, "pR");
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// panel#356 Bug 2 — hasPending() gate for the periodic SAFETY-SWEEP reconcile
+//
+// The reconnect reconcile is EDGE-triggered only (ComfyUI `reconnected` / bridge
+// back). If the ComfyUI WS silently drops and reopens during an idle gap between
+// agent turns WITHOUT firing `reconnected`, the terminal `execution_success` is
+// missed and NO edge fires — the run finishes but the agent is never notified.
+// The panel arms a periodic sweep that re-runs reconcile WHILE `hasPending()`, so
+// such a completion is recovered even with no reconnect edge. These lock the gate
+// the panel's self-disarming sweep loop depends on.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("panel#356: hasPending() false with no runs, true once a prompt is queued", () => {
+  const { tracker } = makeHarness();
+  assert.equal(tracker.hasPending(), false, "no runs ⇒ nothing to sweep");
+  tracker.onQueued("Q1");
+  assert.equal(tracker.hasPending(), true, "a queued prompt arms the sweep");
+});
+
+test("panel#356: a LIVE, delivered success drains the ledger so the sweep disarms", () => {
+  const { tracker, flushes } = makeHarness();
+  tracker.onQueued("L1");
+  tracker.onExecutionStart("L1");
+  tracker.onExecuted("L1", { images: [{ filename: "a.png", type: "output" }] });
+  assert.equal(tracker.hasPending(), true, "pending until the terminal signal");
+  tracker.onExecutionSuccess("L1"); // observed live ⇒ flush + markDelivered
+  assert.equal(flushes.length, 1, "delivered live");
+  assert.equal(tracker.hasPending(), false, "delivered ⇒ ledger drained ⇒ sweep self-disarms");
+});
+
+test("panel#356: a MISSED terminal success keeps hasPending() true; a sweep reconcile recovers it and drains", async () => {
+  const { tracker, flushes } = makeHarness();
+  // Idle-gap WS drop: the run queues + starts, but its execution_success is NEVER
+  // observed (no reconnect edge fires), so it stays pending — exactly the stall.
+  tracker.onQueued("M1");
+  tracker.onExecutionStart("M1");
+  assert.equal(tracker.hasPending(), true, "still pending — the sweep would stay armed");
+
+  // Simulate the panel's self-disarming sweep loop: reconcile against /history
+  // while anything is pending. The run has since finished on the server.
+  const history = {
+    M1: successEntry({ 1: { images: [{ filename: "m1.png", type: "output" }] } }),
+  };
+  let sweeps = 0;
+  while (tracker.hasPending() && sweeps < 5) {
+    sweeps += 1;
+    await tracker.reconcile({
+      fetchHistory: async (id) => history[id] ?? null,
+      fetchQueued: async () => false,
+      isVideo,
+    });
+  }
+  assert.equal(flushes.filter((f) => f.promptId === "M1").length, 1, "sweep recovered the missed completion exactly once");
+  assert.equal(tracker.hasPending(), false, "recovery drained the ledger ⇒ sweep disarms");
+  assert.equal(sweeps, 1, "one sweep sufficed once /history was terminal");
+});
