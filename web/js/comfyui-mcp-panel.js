@@ -241,14 +241,25 @@ let nodeDefRefreshInFlight = null;
 // suppress a genuine miss (codex WS-3 finding #4). Reset to false whenever the
 // backend socket drops, since the combos may be about to change under us.
 let nodeDefsRefreshConfirmed = false;
-// #433: when ComfyUI's own socket last RECONNECTED (backend restart). For a short
-// window after this, the frontend may have restored a DIFFERENT active tab than the
-// user was last viewing, so workflow_list / graph_outline flag `active` as possibly
+// #433: track ComfyUI backend RECONNECTS (backend restart). For a short window
+// after one, the frontend may have restored a DIFFERENT active tab than the user
+// was last viewing, so workflow_list / graph_outline flag `active` as possibly
 // stale until an explicit panel_open_workflow / panel_new_workflow re-points it.
+// Ordering is by EPOCH (a pre-reconnect resync can't clear the new window); the
+// window is measured on a MONOTONIC clock (performance.now) so a wall-clock
+// adjustment can't spuriously suppress or expire the warning (codex P1 x2).
+let backendReconnectEpoch = 0;
 let backendReconnectedAt = null;
-// When the active tab was last authoritatively (re)bound by an explicit open/new —
-// clears the possibly-stale flag above the moment the agent resyncs.
-let activeWorkflowResyncedAt = null;
+// The reconnect epoch value at the last authoritative (re)bind by an explicit
+// open/new; when it's >= backendReconnectEpoch the active pointer is trusted again.
+let activeWorkflowResyncEpoch = 0;
+// Monotonic "now" — performance.now() when available (never runs backwards),
+// falling back to Date.now() only if the environment lacks it.
+function monotonicNow() {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
 // The actual (idempotent) node-def registration; the coalescer owns the in-flight
 // slot lifecycle, so this MUST NOT clear it. Reuses a caller-supplied /object_info
 // payload when present (graph_add_node passes the fresh defs it just validated
@@ -328,9 +339,12 @@ function setupListeners() {
     // in-tab signal that the server came back after a restart — refresh the
     // stale node registry + combos then (#221/#171/#185/#181).
     api.addEventListener("reconnected", () => {
-      // #433: the frontend may now restore a stale/wrong active tab — arm the
-      // possibly-stale window until an explicit open/new re-points `active`.
-      backendReconnectedAt = Date.now();
+      // #433: the frontend may now restore a stale/wrong active tab — bump the
+      // epoch and arm the monotonic possibly-stale window. Bumping the epoch
+      // invalidates any EARLIER resync so a pre-reconnect open can't clear this
+      // new window (codex P1); only an open/new AFTER this reconnect will.
+      backendReconnectEpoch += 1;
+      backendReconnectedAt = monotonicNow();
       void refreshComfyNodeDefs();
     });
   } catch {
@@ -4687,9 +4701,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // #433: warn if ComfyUI reconnected recently — `viewing`/`active` may point at a
     // tab the frontend restored rather than the one the user was last looking at.
     const activeMaybeStale = activeWorkflowPossiblyStale({
+      reconnectEpoch: backendReconnectEpoch,
+      resyncEpoch: activeWorkflowResyncEpoch,
       reconnectedAt: backendReconnectedAt,
-      resyncedAt: activeWorkflowResyncedAt,
-      now: Date.now(),
+      now: monotonicNow(),
     });
     const staleBanner = activeMaybeStale ? `⚠ ${activeStaleHint()}\n\n` : "";
     const outline =
@@ -6558,9 +6573,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // DIFFERENT active tab than the user was last viewing — warn the agent so it
     // double-checks `active` instead of silently reading/editing the wrong graph.
     const activeMaybeStale = activeWorkflowPossiblyStale({
+      reconnectEpoch: backendReconnectEpoch,
+      resyncEpoch: activeWorkflowResyncEpoch,
       reconnectedAt: backendReconnectedAt,
-      resyncedAt: activeWorkflowResyncedAt,
-      now: Date.now(),
+      now: monotonicNow(),
     });
     return {
       active: active
@@ -6621,9 +6637,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // the key exists BEFORE the first edit and is returned for pinning.
     const key = workflowTabId(wf);
     workflowStableUuid(wf);
-    // #433: an explicit new-tab authoritatively re-points `active` — clear any
-    // post-reconnect possibly-stale window so later reads trust `active` again.
-    activeWorkflowResyncedAt = Date.now();
+    // #433: an explicit new-tab authoritatively re-points `active` — record it
+    // against the CURRENT reconnect epoch so later reads trust `active` again.
+    activeWorkflowResyncEpoch = backendReconnectEpoch;
     // `key`/`routing_key` are the unique handle the agent should pass to
     // panel_set_workflow_target so its session pins to this exact graph.
     return { created: true, active: getWorkflowTitle(), key, routing_key: key };
@@ -6690,9 +6706,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // Opening alone must not dirty the tab (a spurious post-load change-tracker
     // diff otherwise flips it to modified:true and blocks an unforced close).
     await clearSpuriousOpenModified(target);
-    // #433: an explicit open authoritatively re-points `active` — clear any
-    // post-reconnect possibly-stale window so later reads trust `active` again.
-    activeWorkflowResyncedAt = Date.now();
+    // #433: an explicit open authoritatively re-points `active` — record it against
+    // the CURRENT reconnect epoch so later reads trust `active` again.
+    activeWorkflowResyncEpoch = backendReconnectEpoch;
     return {
       opened: { path: target.path, filename: target.filename },
       modified: !!target.isModified,
