@@ -91,18 +91,24 @@ export function selectorTargetsNonActiveWorkflow({ resolved, active } = {}) {
  *  refuses a command whose stamped workflow_uuid ≠ the ACTIVE workflow's uuid, so it must cover
  *  everything that runs against the active canvas — every graph_* op AND the active-workflow
  *  mutators workflow_save / workflow_save_as / workflow_rename / workflow_close (workflow_save*
- *  ignore any path, so they are ALWAYS active). It must NOT fire for:
- *   • a PINNED command (`hasPin` — a workflow_path is present): the #349 pin guard is its
- *     authority (covers pinned graph_* and path-targeted workflow_* ops);
+ *  ignore any path, so they are ALWAYS active).
+ *
+ *  A PINNED command (workflow_path present) is NOT exempt (codex): the #349 pin guard authorizes
+ *  by PATH/key/filename, which cannot distinguish workflow A from a DIFFERENT workflow B saved to
+ *  the SAME path after an in-place replacement — a stale command stamped for A still carries a
+ *  matching workflow_path but a mismatching uuid, and only the uuid fence catches it. The pin
+ *  guard runs as an ADDITIONAL check (it catches a switch to a DIFFERENT path the uuid alone
+ *  can't); both must pass. The fence fires for pinned ops too.
+ *
+ *  It must NOT fire only for:
  *   • workflow_open / workflow_new: navigation/creation with their own explicit/new target;
  *   • workflow_rename / workflow_close whose selector resolves to a genuinely NON-active open
- *     workflow (`targetsNonActive` — computed via selectorTargetsNonActiveWorkflow): a
- *     deterministic close/rename of a DIFFERENT workflow must run. A non-empty path that resolves
- *     to the ACTIVE workflow (incl. after an in-place replacement) is NOT exempt — it is fenced.
+ *     workflow (`targetsNonActive` — via selectorTargetsNonActiveWorkflow): a deterministic
+ *     close/rename of a DIFFERENT workflow must run. A path that resolves to the ACTIVE workflow
+ *     (incl. after an in-place replacement) is NOT exempt — it is fenced.
  *  Reads (graph_get_state, …) still return true here — harmlessly fenced (fail-closed); their
  *  reply is server-fenced anyway, and a read can only run against the active canvas regardless. */
-export function activeWorkflowFenceApplies({ cmd, hasPin = false, targetsNonActive = false } = {}) {
-  if (hasPin) return false;
+export function activeWorkflowFenceApplies({ cmd, targetsNonActive = false } = {}) {
   if (cmd === 'workflow_open' || cmd === 'workflow_new') return false;
   if ((cmd === 'workflow_rename' || cmd === 'workflow_close') && targetsNonActive) return false;
   return true;

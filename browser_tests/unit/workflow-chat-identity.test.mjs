@@ -42,16 +42,30 @@ test('#570 fence applies to every graph_* op and all four workflow mutators (act
   assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_close', targetsNonActive: false }), true)
 })
 
-test('#570 fence does NOT apply to pinned / navigation / resolved-non-active workflow ops', () => {
-  // Pinned → the #349 workflow_path guard is the authority.
-  assert.equal(activeWorkflowFenceApplies({ cmd: 'graph_add_node', hasPin: true }), false)
-  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_close', hasPin: true }), false)
+test('#570 fence ALSO applies to PINNED commands (the pin guard authorizes by path, not uuid)', () => {
+  // A pinned command (workflow_path present) is NOT exempt: after an in-place replacement at the
+  // SAME saved path the pin still matches but the uuid does not, and only the uuid fence catches
+  // it. activeWorkflowFenceApplies no longer takes a pin — the fence fires for pinned ops too.
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'graph_add_node' }), true)
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_save' }), true)
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'graph_set_widget' }), true)
+})
+
+test('#570 fence does NOT apply to navigation / resolved-non-active workflow ops', () => {
   // Navigation / creation.
   assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_open' }), false)
   assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_new' }), false)
   // Selector RESOLVED to a genuinely non-active open workflow → deterministic target → runs.
   assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_close', targetsNonActive: true }), false)
   assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_rename', targetsNonActive: true }), false)
+})
+
+test('#570 pinned command after in-place replacement at the same path: uuid mismatch ⇒ REFUSED', () => {
+  // A pinned graph write stamped for A (uuid-A) whose workflow_path still matches the active
+  // canvas — but the workflow at that path was replaced in place by B (uuid-B). The fence APPLIES
+  // (pinned no longer exempt) and the uuid mismatch refuses it, protecting B.
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'graph_add_node' }), true)
+  assert.equal(commandWorkflowMismatch({ commandUuid: 'uuid-A', activeUuid: 'uuid-B' }), true)
 })
 
 // #570 — WORKFLOW-INSTANCE FENCE. A command stamped for workflow A must not execute against
