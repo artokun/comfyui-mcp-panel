@@ -245,9 +245,12 @@ export function graphDirtyForConfirm(ctx) {
 
 /** Serialize result rows — `state.items` (media) or `state.models` (models) —
  *  to the agent's `civitai_results` contract shape: id, kind, title, creator,
- *  baseModel/type, stats, prompt, and media URL(s). Metadata + URLs ONLY — never
- *  image bytes (the agent reasons from text; the human clicks to view). Pure and
- *  exported for unit tests. `limit` is clamped to [1, 200]. */
+ *  baseModel/type, stats, prompt, media URL(s), and `gated`. Metadata + URLs
+ *  ONLY — never image bytes (the agent reasons from text + can fetch the sample
+ *  thumbnail via the URLs; the human clicks to view). `gated` flags a result the
+ *  grid BLURS (rating outside the enabled browsing levels) so a downstream vision
+ *  consumer withholds its sample pixels — see mcp#623. Pure and exported for unit
+ *  tests. `limit` is clamped to [1, 200]. */
 export const CIVITAI_PROMPT_CAP = 600; // chars — bound the agent's token budget
 function _capPrompt(p) {
   // Coerce a structured prompt so the outbound civitai_results contract never
@@ -265,6 +268,11 @@ export function serializeCivitaiResults(source, { model = false, limit = 20, loa
     baseModel: x.baseModel || null, type: x.type || null,
     stats: { downloadCount: x.downloadCount ?? null, thumbsUp: x.thumbsUp ?? null },
     prompt: null, urls: x.coverUrl ? [x.coverUrl] : [],
+    // `gated` mirrors the grid's blur decision (mediaCard/lightbox: `x.gated ===
+    // true || !<cover/thumb>`), so an agent-vision consumer (mcp#623) can withhold
+    // the sample image for anything the human-facing UI renders as a blurred
+    // placeholder — the NSFW/browsing-level gate is never bypassed downstream.
+    gated: x.gated === true || !x.coverUrl,
   } : {
     id: x.id, kind: x.type === "video" ? "video" : "image",
     title: null, creator: x.author || null,
@@ -272,6 +280,7 @@ export function serializeCivitaiResults(source, { model = false, limit = 20, loa
     stats: { reactions: x.reactions ?? null },
     prompt: _capPrompt(x.prompt), // bounded — token budget (audit item 3)
     urls: [x.thumbnailUrl, x.fullUrl].filter(Boolean),
+    gated: x.gated === true || !x.thumbnailUrl,
   });
   return { items, total: rows.length, loading: !!loading };
 }
