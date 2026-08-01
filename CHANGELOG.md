@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.22] - 2026-08-01
+
+### Fixed
+- **`set_widget` refuses a scalar/wrong-typed write to a composite widget instead of silently corrupting it (#560), and warns when a value is governed by `control_after_generate` (#558).** rgthree Power Lora Loader slots (`{on, lora, strength, strengthTwo}`) are now written via schema-validated sub-field addressing (`lora_1.on`) that fails closed on unknown fields and enforces each field's declared type independent of its current value — a bare scalar or wrong-typed write no longer overwrites part of the object and reports success, and a partially-corrupt row is repaired forward. `set_widget` also detects a governed `control_after_generate` control (side-effect-free) and warns that the written value will be overwritten on the next run; `graph_outline` annotates the widget. Verified by an independent 3-round adversarial codex review.
+- **`panel_save_workflow` reports its Save-As outcome so a rename-vs-copy is never silent, with no false data-loss alarms (#579, #363).** The result now describes what happened (`saved_as` / `copied_from` / `original_on_disk` / `first_save`) instead of a bare `{saved:true}`, and a post-write disk check flags a genuine loss — while never false-throwing on a legitimate first save, a transient probe failure, a non-200 2xx pre-probe, a root-relative external path, or a tab switch during the pre-probe. The Save-As copy semantics themselves (never move/clobber the source) were already in place from #375; this locks the reporting around them. Naming a workflow created by `panel_new_workflow` is accepted as a first save (#363). Verified by an independent 3-round adversarial codex review.
+
+
 ## [0.11.21] - 2026-07-31
 
 ### Fixed
