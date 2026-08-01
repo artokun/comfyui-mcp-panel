@@ -32,15 +32,17 @@ test('#570 a new workflow reusing a freed path slot does NOT inherit the old uui
   assert.equal(r.changed, true)
 })
 
-test('#570 lenient path-only fallback when a graph id is unavailable', () => {
-  // gid unknown on either side → key on the path alone (best-effort durability).
-  assert.equal(resolveUnsavedWorkflowUuid({ stored: { u: 'u', g: '' }, gid: 'g', mint: 'm' }).uuid, 'u')
-  assert.equal(resolveUnsavedWorkflowUuid({ stored: { u: 'u', g: 'g' }, gid: '', mint: 'm' }).uuid, 'u')
+test('#570 FAILS CLOSED when a graph id is unavailable (mints fresh, never path-only reuse)', () => {
+  // A missing gid on either side can't prove continuity — reusing by path alone would
+  // let a new workflow inherit a closed one that reused the path slot. Mint fresh.
+  assert.equal(resolveUnsavedWorkflowUuid({ stored: { u: 'u', g: '' }, gid: 'g', mint: 'm' }).uuid, 'm')
+  assert.equal(resolveUnsavedWorkflowUuid({ stored: { u: 'u', g: 'g' }, gid: '', mint: 'm' }).uuid, 'm')
 })
 
-test('#570 a read-only probe (no mint) returns null on a miss/mismatch', () => {
+test('#570 a read-only probe (no mint) returns null unless BOTH graph ids match', () => {
   assert.equal(resolveUnsavedWorkflowUuid({ stored: null, gid: 'g' }).uuid, null)
   assert.equal(resolveUnsavedWorkflowUuid({ stored: { u: 'u', g: 'gid-old' }, gid: 'gid-new' }).uuid, null)
+  assert.equal(resolveUnsavedWorkflowUuid({ stored: { u: 'u', g: '' }, gid: 'g' }).uuid, null)
   assert.equal(resolveUnsavedWorkflowUuid({ stored: { u: 'u', g: 'g' }, gid: 'g' }).uuid, 'u')
 })
 

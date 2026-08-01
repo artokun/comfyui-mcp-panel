@@ -44,15 +44,17 @@ export function shouldForkEmbeddedWorkflowUuid({
  *  stored (path,graph-id) alias. `stored` is the localStorage entry for this ComfyUI
  *  tab path ({ u: uuid, g: graphId } | null); `gid` is the workflow's current
  *  reload-stable graph id; `mint` is a fresh uuid to adopt on a miss (null in a
- *  read-only probe). Reuse the stored uuid ONLY when it names the SAME instance — the
- *  graph ids match, or either is unknown (a lenient path-only fallback). A stored
- *  entry with a DIFFERENT graph id is a different workflow that REUSED a freed path
- *  slot, so it must NOT inherit the uuid → adopt `mint`. A cold import lands on a
- *  brand-new (deduped) path with no stored entry → also `mint`. Returns { uuid,
- *  changed } where `changed` asks the caller to (re)persist the entry. */
+ *  read-only probe). Reuse the stored uuid ONLY when it names the SAME instance —
+ *  BOTH graph ids present AND equal. This FAILS CLOSED: a stored entry with a DIFFERENT
+ *  graph id (a different workflow that REUSED a freed path slot), OR a missing graph id
+ *  on either side (can't prove continuity), mints fresh rather than risk inheriting a
+ *  closed workflow's session. A cold import also lands on a brand-new (deduped) path
+ *  with no stored entry → `mint`. Returns { uuid, changed } where `changed` asks the
+ *  caller to (re)persist the entry. (Trade-off: an unsaved workflow whose graph id is
+ *  ever unavailable forgoes durable disk resume — a lost resume, never a wrong one.) */
 export function resolveUnsavedWorkflowUuid({ stored, gid, mint = null } = {}) {
   const valid = stored && typeof stored.u === "string" && stored.u ? stored : null;
-  const gidMatches = valid ? !valid.g || !gid || valid.g === gid : false;
+  const gidMatches = Boolean(valid && valid.g && gid && valid.g === gid);
   const uuid = valid && gidMatches ? valid.u : mint;
   const changed = uuid ? !valid || valid.u !== uuid || (valid.g || "") !== (gid || "") : false;
   return { uuid, changed };
