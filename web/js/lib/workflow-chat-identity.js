@@ -64,13 +64,15 @@ export function shouldForkEmbeddedWorkflowUuid({
  *  A mis-classified reuse only loses durability (P1, a fresh session); a mis-classified
  *  creation that INHERITED the source identity would be a wrong-resume (P0) — so, faced
  *  with an ambiguous arg, fork. */
-/** #570 P0b — the embedded unsaved-workflow uuid to TRUST as this instance's identity, or
- *  null to FORK. Trust the embedded uuid ONLY when it carries the fork-ownership marker
- *  (`embeddedOwned` — minted by the create-boundary wrapper or a prior fork). A legacy /
- *  pre-rollout embed (no marker) may be a DUPLICATE carried by a copy/import made before the
- *  fork existed, so it is NOT trusted → null → the caller mints a fresh identity. */
-export function trustedUnsavedEmbeddedUuid({ embeddedId, embeddedOwned } = {}) {
-  return embeddedOwned && typeof embeddedId === "string" && embeddedId ? embeddedId : null;
+/** #570 P0b — should an IN-PLACE graph load (loadGraphData into an EXISTING workflow object)
+ *  FORK the per-instance identity? A stale object-cache must NEVER override the identity of
+ *  newly-loaded content, and ownership is anchored on the LIVE object (not copyable
+ *  graph.extra). Fork when the object already has a cached uuid AND the incoming graph's
+ *  embedded uuid DIFFERS from it (a workflow REPLACED in place) — or the incoming has none.
+ *  Same uuid → the same content reloaded/undone → keep. The embedded value is used only to
+ *  DETECT the change; the caller mints a FRESH uuid (never adopts the copyable embedded one). */
+export function shouldForkInPlaceReload({ cachedUuid, incomingUuid } = {}) {
+  return Boolean(cachedUuid) && incomingUuid !== cachedUuid;
 }
 
 export function isWorkflowCreationLoad({ workflowArg, openSource, noFork = false } = {}) {

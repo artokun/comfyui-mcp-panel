@@ -99,7 +99,7 @@ import {
   isWorkflowCreationLoad,
   normalizedWorkflowPath,
   shouldForkEmbeddedWorkflowUuid,
-  trustedUnsavedEmbeddedUuid,
+  shouldForkInPlaceReload,
   workflowAliasForPath,
   workflowIdentityForms,
 } from "./lib/workflow-chat-identity.js";
@@ -969,13 +969,6 @@ const _workflowUuidOwners = new Map();
 const WORKFLOW_UUID_ALIASES_KEY = "comfyui-mcp.panel.workflowUuidAliases";
 const WORKFLOW_META_NAMESPACE = "comfyui_mcp";
 const WORKFLOW_UUID_FIELD = "workflow_uuid";
-// #570 P0b — marker proving the embedded uuid was MINTED by our fork mechanism (the
-// create-boundary loadGraphData wrapper, or the unsaved-branch fork), so it is a UNIQUE
-// per-instance identity. A pre-rollout/legacy embedded uuid (written by the old transcript
-// recorder, which never set this) may be a DUPLICATE carried by a copied/imported graph —
-// a creation-time-only fork can't repair those, so on load of an UNSAVED graph we trust the
-// embedded uuid ONLY when this marker is present, and otherwise FORK to a fresh identity.
-const WORKFLOW_UUID_OWNED_FIELD = "workflow_uuid_forked";
 const WORKFLOW_PATH_FIELD = "workflow_path";
 let _workflowUuidAliases = (() => {
   try {
@@ -1066,14 +1059,6 @@ function embeddedWorkflowUuid(wf = activeWorkflowRef()) {
   return typeof id === "string" && id ? id : null;
 }
 
-// #570 P0b — true only when the embedded uuid carries our fork-ownership marker (minted by
-// the create-boundary wrapper or the unsaved-branch fork). A legacy/pre-rollout embed lacks
-// it, so it must not be trusted as a unique per-instance identity.
-function embeddedWorkflowUuidOwned(wf = activeWorkflowRef()) {
-  const ns = activeWorkflowExtra(wf)?.[WORKFLOW_META_NAMESPACE];
-  return ns?.[WORKFLOW_UUID_OWNED_FIELD] === true;
-}
-
 function embeddedWorkflowPath(wf = activeWorkflowRef()) {
   const ns = activeWorkflowExtra(wf)?.[WORKFLOW_META_NAMESPACE];
   const path = ns?.[WORKFLOW_PATH_FIELD];
@@ -1107,20 +1092,39 @@ function installCreateBoundaryFork(appRef) {
     const orig = appRef.loadGraphData.bind(appRef);
     appRef.loadGraphData = function (graphData, clean, restoreView, workflow, options = {}) {
       try {
-        const creation = isWorkflowCreationLoad({
-          workflowArg: workflow,
-          openSource: options ? options.openSource : undefined,
-          noFork: Boolean(options && options.__cmcpNoFork),
-        });
-        if (creation && graphData && typeof graphData === "object" && !Array.isArray(graphData)) {
-          const extra =
-            graphData.extra && typeof graphData.extra === "object" ? graphData.extra : (graphData.extra = {});
-          const prev = extra[WORKFLOW_META_NAMESPACE];
-          extra[WORKFLOW_META_NAMESPACE] = {
-            ...(prev && typeof prev === "object" ? prev : {}),
-            [WORKFLOW_UUID_FIELD]: crypto.randomUUID(),
-            [WORKFLOW_UUID_OWNED_FIELD]: true, // fork-minted → a unique per-instance identity
-          };
+        if (graphData && typeof graphData === "object" && !Array.isArray(graphData)) {
+          const noFork = Boolean(options && options.__cmcpNoFork);
+          const creation =
+            !noFork &&
+            isWorkflowCreationLoad({ workflowArg: workflow, openSource: options ? options.openSource : undefined });
+          // #570 P0b — a stale PER-OBJECT uuid cache must NEVER override the identity of the
+          // newly-loaded content, and we KEEP nothing derived from the copyable graph.extra.
+          //  • CREATION (import/paste/duplicate/new) → mint a fresh identity.
+          //  • IN-PLACE load into an EXISTING object whose cached uuid DIFFERS from the incoming
+          //    graph's embedded uuid (or the incoming has none) → the workflow was REPLACED in
+          //    place: INVALIDATE the object cache and mint fresh, so the replacement can't keep
+          //    the prior instance's identity. The embedded value is used ONLY to DETECT the
+          //    change; the minted uuid is fresh (never adopted from graph.extra).
+          let fork = false;
+          if (creation) {
+            fork = true;
+          } else if (!noFork && workflow && typeof workflow === "object") {
+            const cached = _workflowObjectUuids.get(workflow);
+            const incoming = graphData.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD];
+            if (shouldForkInPlaceReload({ cachedUuid: cached, incomingUuid: incoming })) {
+              _workflowObjectUuids.delete(workflow); // content replaced in place → drop stale cache
+              fork = true;
+            }
+          }
+          if (fork) {
+            const extra =
+              graphData.extra && typeof graphData.extra === "object" ? graphData.extra : (graphData.extra = {});
+            const prev = extra[WORKFLOW_META_NAMESPACE];
+            extra[WORKFLOW_META_NAMESPACE] = {
+              ...(prev && typeof prev === "object" ? prev : {}),
+              [WORKFLOW_UUID_FIELD]: crypto.randomUUID(),
+            };
+          }
         }
       } catch {
         // Never let identity bookkeeping break a graph load.
@@ -1163,30 +1167,24 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
   const path = savedWorkflowPath(wf);
   const objectUuid = _workflowObjectUuids.get(identityObject);
 
-  // #570 P0/P1 — UNSAVED workflow: the durable per-instance identity is the EMBEDDED
-  // graph.extra uuid, which installCreateBoundaryFork REGENERATES at every creation
-  // (import/paste/duplicate/new) — so it is fresh for a copy yet round-tripped verbatim by
-  // ComfyUI's draft persistence across a reload (durable regardless of chat scope). Prefer
-  // the in-session objectUuid, then the embedded uuid — but TRUST the embedded uuid ONLY
-  // when it carries our fork-ownership marker (WORKFLOW_UUID_OWNED_FIELD). A pre-rollout /
-  // legacy embedded uuid (no marker) may be a DUPLICATE carried by a graph copied/imported
-  // BEFORE the create-boundary fork existed — a creation-time-only fork can't repair those,
-  // so FORK it here (mint fresh) rather than adopt the source's identity (#570 P0b). This is
-  // a one-time strip on the first unsaved load post-upgrade: a lost resume, never a
-  // cross-workflow leak. We then STAMP uuid + marker so a reload trusts it thereafter, and
-  // it stays distinct per live object so two concurrently-open copies never collide.
+  // #570 P0/P1 — UNSAVED workflow: the per-instance identity is the in-session objectUuid
+  // (the LIVE-object WeakMap — a copy/import does NOT share it), else the EMBEDDED graph.extra
+  // uuid for DURABILITY across a reload. Ownership/KEEP is anchored on the live object: the
+  // loadGraphData wrapper INVALIDATES a stale object-cache and re-mints whenever the content
+  // loaded into an existing instance changes (in-place replace), and forks every creation —
+  // so the embedded uuid can only survive as a genuine reload of the SAME content, never a
+  // copy or an in-place replacement. We therefore read the embedded uuid ONLY when the object
+  // cache is empty (a fresh reload), and never let it override a live cache.
   const isUnsaved = !path && wf && wf.isPersisted !== true;
   if (isUnsaved) {
     const embeddedId = embeddedWorkflowUuid(wf);
-    const embeddedOwned = embeddedWorkflowUuidOwned(wf);
-    const trustedEmbedded = trustedUnsavedEmbeddedUuid({ embeddedId, embeddedOwned }); // legacy/unmarked → null → fork
-    const id = objectUuid || trustedEmbedded || crypto.randomUUID();
+    const id = objectUuid || embeddedId || crypto.randomUUID();
     _workflowObjectUuids.set(identityObject, id);
     rememberWorkflowUuidOwner(id, identityObject);
-    if (embeddedId !== id || !embeddedOwned) {
-      // Persist the identity + ownership marker into extra (so a reload keeps + trusts it,
-      // AND a later SAVE carries it into the saved file across the tmp:→wf: transition).
-      // Never dirties the graph.
+    if (embeddedId !== id) {
+      // Persist the identity into extra (so a reload of the SAME content keeps it, AND a later
+      // SAVE carries it into the saved file across the tmp:→wf: transition). Never dirties the
+      // graph. Not a KEEP authority — the wrapper's live-object invalidation is.
       try {
         const extra = activeWorkflowExtra(wf, { create: true });
         const previous = extra?.[WORKFLOW_META_NAMESPACE];
@@ -1194,7 +1192,6 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
           extra[WORKFLOW_META_NAMESPACE] = {
             ...(previous && typeof previous === "object" ? previous : {}),
             [WORKFLOW_UUID_FIELD]: id,
-            [WORKFLOW_UUID_OWNED_FIELD]: true,
           };
         }
       } catch {

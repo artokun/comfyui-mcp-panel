@@ -6,22 +6,26 @@ import {
   isWorkflowCreationLoad,
   normalizedWorkflowPath,
   shouldForkEmbeddedWorkflowUuid,
-  trustedUnsavedEmbeddedUuid,
+  shouldForkInPlaceReload,
   workflowAliasForPath
 } from '../../web/js/lib/workflow-chat-identity.js'
 
-// #570 P0b — trust an unsaved workflow's embedded uuid ONLY when it carries the fork marker.
-test('#570 P0b a MARKED embedded uuid is trusted (fork-minted → unique per-instance)', () => {
-  assert.equal(trustedUnsavedEmbeddedUuid({ embeddedId: 'uuid-A', embeddedOwned: true }), 'uuid-A')
+// #570 P0b — an in-place load into an existing object must FORK when the content identity
+// changed; a stale object-cache must never override the newly-loaded graph identity.
+test('#570 P0b in-place replace (cached uuid, DIFFERENT incoming) → fork', () => {
+  assert.equal(shouldForkInPlaceReload({ cachedUuid: 'uuid-A', incomingUuid: 'uuid-B' }), true)
+  // Incoming has no embedded uuid at all → still fork (can't prove same content).
+  assert.equal(shouldForkInPlaceReload({ cachedUuid: 'uuid-A', incomingUuid: undefined }), true)
 })
 
-test('#570 P0b a LEGACY unmarked embedded uuid is NOT trusted → fork (null)', () => {
-  // A pre-rollout copy carries the source uuid with no marker → must not be adopted.
-  assert.equal(trustedUnsavedEmbeddedUuid({ embeddedId: 'uuid-A', embeddedOwned: false }), null)
-  assert.equal(trustedUnsavedEmbeddedUuid({ embeddedId: 'uuid-A' }), null)
-  // No embedded id at all → null (mint fresh).
-  assert.equal(trustedUnsavedEmbeddedUuid({ embeddedOwned: true }), null)
-  assert.equal(trustedUnsavedEmbeddedUuid({}), null)
+test('#570 P0b same content reloaded/undone (cached === incoming) → keep', () => {
+  assert.equal(shouldForkInPlaceReload({ cachedUuid: 'uuid-A', incomingUuid: 'uuid-A' }), false)
+})
+
+test('#570 P0b a fresh object (no cache) is NOT an in-place replace here → false', () => {
+  // A brand-new object (reload-restore/copy) has no cache; creation/embedded handling covers it.
+  assert.equal(shouldForkInPlaceReload({ cachedUuid: undefined, incomingUuid: 'uuid-A' }), false)
+  assert.equal(shouldForkInPlaceReload({}), false)
 })
 
 // Fakes for the ComfyWorkflow 4th arg: a REUSE passes a ComfyWorkflow OBJECT; a CREATION
