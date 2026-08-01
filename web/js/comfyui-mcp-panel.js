@@ -146,6 +146,7 @@ import {
   groupMemberNodes,
   classifyRequestedMembership,
   refreshNodeArea,
+  syncNodeArea,
 } from "./lib/group-geometry.js";
 import { pickRevertSnapshot } from "./lib/graph-revert.js";
 import {
@@ -6956,6 +6957,12 @@ const GRAPH_TOOL_EXECUTORS = {
       requestedIds = node_ids.map(Number).filter(Number.isFinite);
       const ns = node_ids.map((id) => graph.getNodeById(Number(id))).filter(Boolean);
       if (!ns.length) throw new Error("none of the given node_ids exist in the current graph");
+      // Sync each node's cached boundingRect to its live pos/size BEFORE we build
+      // the box and recompute membership. The box is derived from pos/size but
+      // membership is tested boundingRect-first, so a stale cached rect (from a
+      // prior render, or never rendered at this position) would make geometry miss
+      // nodes the box plainly wraps → an empty group despite valid node_ids (#391).
+      ns.forEach(syncNodeArea);
       // Tight box around exactly the requested nodes that exist (title height + padding).
       bbox = boundsAroundNodes(ns);
     } else if (Array.isArray(bounds) && bounds.length === 4) {

@@ -119,18 +119,52 @@ export function groupMemberNodes(graph, g) {
 }
 
 /**
+ * Rewrite a node's cached boundingRect to match its CURRENT pos/size so a
+ * geometric membership test taken RIGHT AFTER a programmatic group create
+ * doesn't miss the node because its cached rect is stale from a previous render
+ * or was never rendered at its live position (#391).
+ *
+ * The group box is built from pos/size (boundsAroundNodes) but membership is
+ * tested against boundingRect-first (nodeFocusBounds); when the two disagree the
+ * box visually wraps the node yet geometry excludes it, yielding an empty group.
+ * Syncing the cached rect to the pos-based footprint (title band included, exactly
+ * matching nodeFocusBounds' fallback) makes the two bases agree. No-op when there
+ * is no cached rect — nodeFocusBounds already uses live pos/size in that case.
+ * Mutates in place so it works on plain arrays AND typed-array rects (ComfyUI
+ * Rectangle). Dependency-free for unit testing with plain object fixtures.
+ */
+export function syncNodeArea(node) {
+  const br = node?.boundingRect;
+  if (!br || br.length !== 4) return;
+  const w = node.size?.[0] ?? 200;
+  const h = node.size?.[1] ?? 100;
+  br[0] = node.pos?.[0] ?? 0;
+  br[1] = (node.pos?.[1] ?? 0) - 30; // title bar renders above pos
+  br[2] = w;
+  br[3] = h + 30;
+}
+
+/**
  * Compare the node ids actually enclosed (geometric) against the ids the caller
  * asked to group. Returns { requested, members, extra, missing } so a create
  * handler can warn honestly in dense layouts (#297) instead of reporting a
  * misleading success.
+ *
+ * Ids are compared by their STRING form: requested ids arrive as numbers (the
+ * tool schema is number[]) while live LiteGraph ids are strings ("9"), so a raw
+ * Set/SameValueZero compare (9 !== "9") would put every id in BOTH extra and
+ * missing on every call — the honest-reporting feature inverted (#566, #388).
+ * Normalizing to a common key fixes that; the returned arrays keep each id's
+ * ORIGINAL representation so callers see the ids in their native form.
  */
 export function classifyRequestedMembership(requestedIds, memberIds) {
-  const req = new Set(requestedIds);
-  const members = new Set(memberIds);
+  const key = (id) => String(id);
+  const reqKeys = new Set(requestedIds.map(key));
+  const memberKeys = new Set(memberIds.map(key));
   return {
     requested: [...requestedIds],
     members: [...memberIds],
-    extra: memberIds.filter((id) => !req.has(id)),
-    missing: requestedIds.filter((id) => !members.has(id)),
+    extra: memberIds.filter((id) => !reqKeys.has(key(id))),
+    missing: requestedIds.filter((id) => !memberKeys.has(key(id))),
   };
 }
