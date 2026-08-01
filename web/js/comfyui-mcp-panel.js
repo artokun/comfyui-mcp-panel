@@ -128,6 +128,11 @@ import {
 } from "./lib/subgraph-scope.js";
 import { runSetWidget } from "./lib/set-widget.js";
 import {
+  classifyLtxTimelineWrite,
+  applyLtxTimelineWrite,
+  derivedTimelineRefusal,
+} from "./lib/ltx-director.js";
+import {
   controlAfterGenerateModes,
   controlAfterGenerateEntries,
 } from "./lib/control-after-generate.js";
@@ -5574,6 +5579,27 @@ const GRAPH_TOOL_EXECUTORS = {
   graph_set_widget({ node_id, widget, value }) {
     const { app, graph, LG } = getGraphCtx();
     const node = resolveNode(graph, node_id);
+    // #314: the LTXDirector custom node owns its timeline widgets through an in-browser
+    // TimelineEditor whose in-memory `this.timeline` is the source of truth. A raw widget
+    // write "succeeds" (panel_query_graph shows it) but never reaches the editor/UI and is
+    // reverted on the next commit. Route a `timeline_data` write through the node's OWN
+    // _applyLoadedTimeline re-hydration (drives the UI + regenerates the derived widgets),
+    // and REFUSE the derived widgets loudly. Keyed strictly to node.type === "LTXDirector",
+    // so no other node is affected; a general widget-replay is deliberately NOT attempted.
+    const ltxKind = classifyLtxTimelineWrite(node, widget);
+    if (ltxKind === "derived") {
+      throw new Error(derivedTimelineRefusal(widget, node.id));
+    }
+    if (ltxKind === "master") {
+      // Bracket in the SAME undo envelope the normal write path uses so this route
+      // honors panel_set_widget's "Undoable with Ctrl+Z" contract (the node's own
+      // _applyLoadedTimeline only schedules async state capture, no pre-change snapshot).
+      return applyLtxTimelineWrite(node, value, {
+        beforeChange: () => graph.beforeChange(),
+        afterChange: () => graph.afterChange(),
+        setDirty: () => graph.setDirtyCanvas(true, true),
+      });
+    }
     // Delegate to the shared handler body (web/js/lib/set-widget.js) so this
     // production path and the unit tests run the IDENTICAL ordering: preflight →
     // reconcile-only-a-resolved-node → applyWidgetWrite with the resolved-target
@@ -5700,6 +5726,31 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     graph.setDirtyCanvas(true, true);
     return { moved: { node_id: node.id, from: previous, to: [node.pos[0], node.pos[1]] } };
+  },
+
+  // #530: resize a node to [width, height]. Note/MarkdownNote nodes are created at
+  // LiteGraph's 140×60 default and are unreadable until enlarged — panel_move_node
+  // only repositions. setSize() (not a raw node.size assignment) is preferred so a
+  // node that clamps to a computed minimum, and DOM-widget nodes like MarkdownNote,
+  // reflow correctly. Mirrors graph_move_node's beforeChange/afterChange undo envelope.
+  graph_resize_node({ node_id, size }) {
+    const { graph } = getGraphCtx();
+    const node = resolveNode(graph, node_id);
+    if (!Array.isArray(size) || size.length !== 2) throw new Error("size must be [width, height]");
+    const w = Number(size[0]);
+    const h = Number(size[1]);
+    if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0)
+      throw new Error("size must be two positive numbers");
+    const previous = [node.size?.[0], node.size?.[1]];
+    graph.beforeChange();
+    try {
+      if (typeof node.setSize === "function") node.setSize([w, h]);
+      else node.size = [w, h];
+    } finally {
+      graph.afterChange();
+    }
+    graph.setDirtyCanvas(true, true);
+    return { resized: { node_id: node.id, from: previous, to: [node.size[0], node.size[1]] } };
   },
 
   // Dependency-aware auto-layout of the active graph (or a `node_ids` subset).
@@ -10000,6 +10051,18 @@ function describeCommand(cmd, msg, reply) {
     case "graph_disconnect":
       return { icon: "pi-times-circle", text: `Disconnected ${r.disconnected?.node_id}.${r.disconnected?.input}` };
     case "graph_set_widget": {
+      // #314: an LTXDirector timeline_data write was routed through the node's own
+      // re-hydration, which also regenerated the derived prompt/length widgets.
+      if (r.ltx_timeline) {
+        const seg = r.ltx_timeline.segments;
+        return {
+          icon: "pi-sliders-h",
+          text:
+            `Drove LTXDirector timeline on node ${r.ltx_timeline.node_id}` +
+            (seg != null ? ` (${seg} segment${seg === 1 ? "" : "s"})` : "") +
+            ` — UI re-synced, derived prompt/length widgets regenerated`,
+        };
+      }
       // #366: a promoted-subgraph write is only truly applied when the parent RAIL
       // widget (what serializes at queue time) was synced. The lib fails closed if
       // it can't, so a success result normally has parent_widget_synced !== false;
@@ -10029,6 +10092,11 @@ function describeCommand(cmd, msg, reply) {
         : { icon: "pi-arrow-up", text: `Promoted “${r.promoted}” to the subgraph node` };
     case "graph_move_node":
       return { icon: "pi-arrows-alt", text: `Moved node ${r.moved?.node_id} to [${r.moved?.to?.map(Math.round)}]` };
+    case "graph_resize_node":
+      return {
+        icon: "pi-arrows-alt",
+        text: `Resized node ${r.resized?.node_id} to [${r.resized?.to?.map(Math.round)}]`,
+      };
     case "graph_auto_layout":
       return {
         icon: "pi-th-large",
