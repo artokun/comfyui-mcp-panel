@@ -395,7 +395,7 @@ test("#442 defect-2 wiring: the re-read is gated on a FRESH dirty re-check (no s
   // The gate must be the FRESH value, and there must be no await between it and the gate.
   const between = stripComments(body.slice(dirtyAt, reloadAt));
   assert.ok(!/\bawait\b/.test(between), "no await may sit between the dirty re-check and the reload gate");
-  assert.match(body, /isModified: dirtyNow/, "the staleness decision must use the fresh dirty value");
+  assert.match(body, /isModified: dirtyNow \|\| wasDirty/, "the staleness decision must honour BOTH dirty signals");
   assert.match(body, /conflict: true/, "stale + unsaved edits must surface a CONFLICT, not a silent pick");
   assert.match(body, /reloaded,/, "the reply must state whether the canvas was actually re-read");
   assert.match(body, /reloadError = coerceMessageText/, "a failed re-read must never be reported as reloaded");
@@ -440,6 +440,30 @@ test("#442 codex P1: the destructive re-read freezes canvas interaction and ALWA
   assert.equal(/\bcanvas\.allow_interaction/.test(body), false);
 });
 
+test("#442 codex R7: a tab that arrived DIRTY is never re-baselined and never reloaded", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const body = handlerBody(src, "async workflow_open({");
+  // clearSpuriousOpenModified captures the canvas as the new baseline and FORCES
+  // isModified=false. On a tab that already had unsaved edits that does not clear a
+  // spurious flag — it erases a REAL one, after which every later dirty check reads clean
+  // and the destructive reload is authorized over the user's work.
+  const wasDirtyAt = body.indexOf("const wasDirty = !!target.isModified;");
+  const openAt = body.indexOf("await s.openWorkflow(target);");
+  assert.notEqual(wasDirtyAt, -1, "the pre-open dirty state must be snapshotted");
+  assert.ok(wasDirtyAt < openAt, "…BEFORE any await, since it cannot be recovered afterwards");
+  assert.match(
+    body,
+    /if \(!wasDirty\) await clearSpuriousOpenModified\(target\);/,
+    "a genuinely dirty tab must never be re-baselined",
+  );
+  // BOTH reload gates must require the pre-open snapshot to be clean too.
+  const gates = [...body.matchAll(/if \(staleInfo\.reload && !dirtyNow[^)]*\)/g)].map((m) => m[0]);
+  assert.ok(gates.length >= 2, "both the skip and the reload branch must be gated");
+  for (const g of gates) assert.match(g, /!wasDirty/, `gate must honour the pre-open snapshot: ${g}`);
+  // …and the conflict report must fire for either signal.
+  assert.match(body, /: dirtyNow \|\| wasDirty/, "a pre-open dirty tab must be reported as a CONFLICT");
+});
+
 test("#442 codex P1: with NO reliable freeze available, the destructive reload is SKIPPED", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const body = handlerBody(src, "async workflow_open({");
@@ -447,7 +471,7 @@ test("#442 codex P1: with NO reliable freeze available, the destructive reload i
   // during an unrequested load is not. So an absent allow_interaction must skip the reload.
   assert.match(
     body,
-    /if \(staleInfo\.reload && !dirtyNow && priorInteraction === null\) \{/,
+    /if \(staleInfo\.reload && !dirtyNow && !wasDirty && priorInteraction === null\) \{/,
     "no interaction flag ⇒ no automatic reload",
   );
   assert.match(body, /could not be protected against a concurrent edit and was skipped/);

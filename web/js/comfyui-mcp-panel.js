@@ -7643,48 +7643,22 @@ const GRAPH_TOOL_EXECUTORS = {
     // reads it fresh from disk. openWorkflow does NOT mutate originalContent for an
     // already-open tab (its load() early-returns), so the baseline stays valid.
     const wasOpen = !!target.changeTracker;
-    try {
-      await s.openWorkflow(target);
-    } catch (err) {
-      // The native switch itself failed — nothing was applied. Journal the negative so a
-      // lost reply can still be answered truthfully, then surface the error unchanged.
-      throw failOpen(err instanceof Error ? err : new Error(coerceMessageText(err)));
-    }
-    // We deliberately do NOT auto-reload the canvas from disk here: switching to an
-    // already-open tab must not silently discard the user's in-memory graph, and a
-    // re-read could race a concurrent canvas edit and clobber it. Instead the staleness
-    // is SURFACED (below) so the caller refreshes deliberately with panel_load_workflow
-    // — exactly the recovery the issue reporter uses. The load-bearing fix is turning a
-    // SILENT stale serve into a loud, actionable signal.
-    // openWorkflow sets the tab ACTIVE but does NOT repaint the canvas for an
-    // ALREADY-OPEN instance — the graph load normally rides the frontend's
-    // workflow *service* tab-switch, which the panel can't reach (it's a Vue
-    // composable, not on the store or window). So switching to an open tab left
-    // the PREVIOUS tab's graph frozen on the canvas ("all tabs show the same
-    // graph" — issue #65), and the earlier in-place-load attempts corrupted tab
-    // buffers (#63/#64). Force the repaint the way a real tab-click does: load
-    // the target's OWN live buffer (changeTracker.activeState — preserves its
-    // unsaved edits, NOT the on-disk copy) into ITS tab. The 4th arg (the
-    // workflow) associates the load with the target so it does NOT spawn a new
-    // "Unsaved Workflow" tab. Verified live in-browser (2026-07-08): switching
-    // among 12/39-node tabs repaints to the correct graph each time, no dup
-    // tabs, no cross-tab clobber. NOTE: getWorkflowByPath returns the SAME
-    // object as the open instance (verified), so find() needs no reorder — the
-    // #63 find() patch was a no-op that only regressed things.
-    //
-    // #442 / codex — FREEZE canvas interaction from HERE, before the repaint, and hold it
-    // through the staleness decision. `clearSpuriousOpenModified` below awaits a frame and
-    // then RE-BASELINES the change tracker (capture → reset → force isModified=false): an
-    // edit the user makes during that frame is absorbed as the new CLEAN baseline, so the
-    // later dirty gate reads false and would authorize the disk reload to overwrite that
-    // very edit. Sampling the flag later cannot fix that — the signal is already gone — so
-    // the window has to be closed instead. Scoped to `wasOpen` (the only case that can
-    // reload) so a plain first-time open never freezes, and always restored in a finally.
+    // #442 / codex — SNAPSHOT the tab's unsaved-edit state BEFORE any await. It cannot be
+    // recovered later: `clearSpuriousOpenModified` below force-clears `isModified`, so by
+    // the time the reload gate samples the flag, a tab that arrived here WITH unsaved
+    // edits (or was edited during `openWorkflow`) already reads clean. That erased signal
+    // is what would authorize the destructive re-read to discard the user's work.
+    const wasDirty = !!target.isModified;
     // Bound to a local whose name does NOT end in "s": the #268 frontend-contract scanner
     // captures members off the workflow-service alias `s` with an unanchored `s\.` pattern,
     // so `canvas.<member>` would be misread as a new workflow-SERVICE dependency. This is a
     // LiteGraph canvas flag, not a workflow-service member.
     const canvasView = app?.canvas;
+    // FREEZE canvas interaction across the WHOLE mutating sequence — the tab switch, the
+    // repaint, the re-baseline, the bounded disk read and the reload — so no edit can land
+    // in a window whose dirty signal we are about to overwrite. Scoped to `wasOpen` (the
+    // only case that can reload) so a plain first-time open never freezes, and restored in
+    // a finally on every path.
     const priorInteraction =
       wasOpen && typeof canvasView?.allow_interaction === "boolean"
         ? canvasView.allow_interaction
@@ -7694,113 +7668,165 @@ const GRAPH_TOOL_EXECUTORS = {
     let staleInfo = { stale: false, reload: false };
     let reloaded = false;
     let reloadError = null;
+    let openFailed = null;
     if (priorInteraction !== null) canvasView.allow_interaction = false;
     try {
       try {
-        const st = target.changeTracker?.activeState;
-        if (st && typeof app.loadGraphData === "function") {
-          await app.loadGraphData(JSON.parse(JSON.stringify(st)), true, true, target);
-        }
+        await s.openWorkflow(target);
       } catch (err) {
-        console.warn("[comfyui-mcp-panel] workflow_open repaint failed:", err?.message ?? err);
+        // The native switch itself failed — nothing was applied. Recorded, then rethrown
+        // through failOpen below (outside the freeze) so the negative is journaled.
+        openFailed = err instanceof Error ? err : new Error(coerceMessageText(err));
       }
-      // Opening alone must not dirty the tab (a spurious post-load change-tracker
-      // diff otherwise flips it to modified:true and blocks an unforced close).
-      await clearSpuriousOpenModified(target);
-      // #433: an explicit open authoritatively re-points `active` — record it against
-      // the epoch we STARTED on, but only if no reconnect intervened during the async
-      // open (else its tab-restore may have overridden us — leave the window armed).
-      if (backendReconnectEpoch === openedForEpoch) activeWorkflowResyncEpoch = openedForEpoch;
-    // #442 — read the on-disk bytes AS LATE AS POSSIBLE (after openWorkflow + repaint),
-    // so an external write during those awaits is still detected. wasOpen was captured
-    // before openWorkflow; the baseline (originalContent) is unchanged by an already-open
-    // open.
-    //
-    // #402 — BOUND this read. The open has ALREADY been applied by the time we get here,
-    // so the only thing still outstanding is a staleness HINT — yet the read is an HTTP
-    // round-trip to ComfyUI, and in the exact #402 window ComfyUI's HTTP layer is what is
-    // flaky (the same report's panel_save_workflow returned "Failed to fetch"). Unbounded,
-    // a server that accepts the connection and never answers parks a known-good outcome
-    // for the whole browser timeout — which is precisely how a routine reconnect blip gets
-    // long enough to turn into "disconnected mid-command … OUTCOME UNKNOWN". withDeadline
-    // never rejects: a timeout degrades to the ALREADY-SUPPORTED honest `stale:"unknown"`,
-    // exactly like an unreadable disk, and never to a false "fresh".
-      // codex P2 — the deadline stops US waiting; it cannot stop the REQUEST. So also
-      // (a) hand the read an AbortSignal and fire it when the budget expires, and
-      // (b) SINGLE-FLIGHT per workflow path, because one of the two read paths
-      // (api.getUserData) takes no signal at all. Together these cap the outstanding
-      // reads at one per workflow instead of leaking one per open against a server that
-      // accepts requests and never answers.
-      const readAbort = typeof AbortController === "function" ? new AbortController() : null;
-      onDiskContent = wasOpen
-        ? await withDeadline(
-            staleReadFlight.run(target.path, () =>
-              workflowDiskContent(target.path, { signal: readAbort?.signal }),
-            ),
-            OPEN_DISK_READ_BUDGET_MS,
-            null,
-            { onTimeout: () => readAbort?.abort() },
-          )
-        : null;
-      // #442 defect 2 — RE-READ the file when it provably changed and nothing is at stake.
-      // Re-check `isModified` HERE, immediately before deciding, rather than trusting the
-      // value from before the disk read: reloading over unsaved edits is data-loss class —
-      // strictly worse than serving a stale graph. There is NO await between this re-check
-      // and the reload decision below. (Interaction is frozen across this whole block, so
-      // this is a belt-and-braces second line of defence, not the only one.)
-      dirtyNow = !!target.isModified;
-      staleInfo = decideOpenStaleness({
-        wasOpen,
-        isModified: dirtyNow,
-        onDiskContent,
-        baselineContent:
-          typeof target.originalContent === "string" ? target.originalContent : null,
-      });
-      // `reload` is true only for "the file changed AND this tab has nothing unsaved", so
-      // the re-read is lossless. A stale tab WITH unsaved edits is a genuine conflict: we
-      // refuse and surface both sides rather than picking for the user.
+      if (!openFailed) {
+      // We deliberately do NOT auto-reload the canvas from disk here: switching to an
+      // already-open tab must not silently discard the user's in-memory graph, and a
+      // re-read could race a concurrent canvas edit and clobber it. Instead the staleness
+      // is SURFACED (below) so the caller refreshes deliberately with panel_load_workflow
+      // — exactly the recovery the issue reporter uses. The load-bearing fix is turning a
+      // SILENT stale serve into a loud, actionable signal.
+      // openWorkflow sets the tab ACTIVE but does NOT repaint the canvas for an
+      // ALREADY-OPEN instance — the graph load normally rides the frontend's
+      // workflow *service* tab-switch, which the panel can't reach (it's a Vue
+      // composable, not on the store or window). So switching to an open tab left
+      // the PREVIOUS tab's graph frozen on the canvas ("all tabs show the same
+      // graph" — issue #65), and the earlier in-place-load attempts corrupted tab
+      // buffers (#63/#64). Force the repaint the way a real tab-click does: load
+      // the target's OWN live buffer (changeTracker.activeState — preserves its
+      // unsaved edits, NOT the on-disk copy) into ITS tab. The 4th arg (the
+      // workflow) associates the load with the target so it does NOT spawn a new
+      // "Unsaved Workflow" tab. Verified live in-browser (2026-07-08): switching
+      // among 12/39-node tabs repaints to the correct graph each time, no dup
+      // tabs, no cross-tab clobber. NOTE: getWorkflowByPath returns the SAME
+      // object as the open instance (verified), so find() needs no reorder — the
+      // #63 find() patch was a no-op that only regressed things.
       //
-      // The earlier no-await-before-return invariant is intact: this block runs ONLY when
-      // staleInfo.stale === true, and it never downgrades that to "fresh" — so the
-      // false-fresh window codex closed (read stale → file changes → report fresh) still
-      // cannot open. The provably-fresh and "unknown" paths reach the return with no await.
-      if (staleInfo.reload && !dirtyNow && priorInteraction === null) {
-        // NO reliable freeze on this frontend ⇒ do NOT perform the automatic destructive
-        // reload at all (codex). Serving a stale graph with a loud flag is recoverable;
-        // silently eating an edit the user made during an unrequested load is not.
-        reloadError =
-          "this frontend does not expose the canvas interaction flag, so an automatic reload " +
-          "could not be protected against a concurrent edit and was skipped";
-      } else if (staleInfo.reload && !dirtyNow) {
-        const diskGraph = JSON.parse(onDiskContent);
-        // 4th arg associates the load with THIS tab (same as the repaint above), so the
-        // on-disk graph replaces the tab's buffer in place instead of spawning a new
-        // "Unsaved Workflow" tab.
-        //
-        // #570 P0b — `__cmcpKeepInstance` is MANDATORY here, exactly as on graph_load.
-        // This is an in-place reload of the SAME tab from a file that was written
-        // OUT OF BAND, so its embedded workflow uuid may be absent or belong to
-        // something else. Without the flag the create-boundary fork would see
-        // cached-uuid ≠ incoming-uuid, treat the refresh as an in-place REPLACEMENT and
-        // mint a NEW identity for this tab mid-open — after which the very next stamped
-        // command would be refused as a "workflow instance mismatch" against the session
-        // that asked for the open. The flag keeps the LIVE OBJECT's identity (the
-        // non-forgeable source) and stamps it over whatever the file carried.
-        await app.loadGraphData(diskGraph, true, true, target, { __cmcpKeepInstance: true });
-        // The tab now holds exactly the on-disk bytes — re-baseline so this same change
-        // isn't re-reported as stale forever. Best-effort: `originalContent` is a plain
-        // field on current builds but may be getter-only elsewhere.
+      // #442 / codex — FREEZE canvas interaction from HERE, before the repaint, and hold it
+      // through the staleness decision. `clearSpuriousOpenModified` below awaits a frame and
+      // then RE-BASELINES the change tracker (capture → reset → force isModified=false): an
+      // edit the user makes during that frame is absorbed as the new CLEAN baseline, so the
+      // later dirty gate reads false and would authorize the disk reload to overwrite that
+      // very edit. Sampling the flag later cannot fix that — the signal is already gone — so
+      // the window has to be closed instead. Scoped to `wasOpen` (the only case that can
+      // reload) so a plain first-time open never freezes, and always restored in a finally.
+      // Bound to a local whose name does NOT end in "s": the #268 frontend-contract scanner
+      // captures members off the workflow-service alias `s` with an unanchored `s\.` pattern,
+      // so `canvas.<member>` would be misread as a new workflow-SERVICE dependency. This is a
+      // LiteGraph canvas flag, not a workflow-service member.
         try {
-          target.originalContent = onDiskContent;
-        } catch {
-          /* getter-only — the stale flag simply re-reports until the next save */
+          const st = target.changeTracker?.activeState;
+          if (st && typeof app.loadGraphData === "function") {
+            await app.loadGraphData(JSON.parse(JSON.stringify(st)), true, true, target);
+          }
+        } catch (err) {
+          console.warn("[comfyui-mcp-panel] workflow_open repaint failed:", err?.message ?? err);
         }
-        // A programmatic load dirties the change tracker; clear that so the re-read does
-        // not leave the tab looking edited (which would block an unforced close). Still
-        // inside the freeze — it re-baselines, so an edit made during its frame would be
-        // adopted as "not modified" and could later be discarded without a prompt.
-        await clearSpuriousOpenModified(target);
-        reloaded = true;
+        // Opening alone must not dirty the tab (a spurious post-load change-tracker
+        // diff otherwise flips it to modified:true and blocks an unforced close).
+        //
+        // …but ONLY when the tab arrived here CLEAN. This helper captures the current canvas
+        // as the new baseline and forces isModified=false, so running it on a tab that
+        // already HAD unsaved edits does not clear a spurious flag — it erases a REAL one,
+        // hiding the user's work from every later check (codex). Leaving a genuinely dirty
+        // tab marked dirty is both truthful and what keeps the reload gate below closed.
+        if (!wasDirty) await clearSpuriousOpenModified(target);
+        // #433: an explicit open authoritatively re-points `active` — record it against
+        // the epoch we STARTED on, but only if no reconnect intervened during the async
+        // open (else its tab-restore may have overridden us — leave the window armed).
+        if (backendReconnectEpoch === openedForEpoch) activeWorkflowResyncEpoch = openedForEpoch;
+      // #442 — read the on-disk bytes AS LATE AS POSSIBLE (after openWorkflow + repaint),
+      // so an external write during those awaits is still detected. wasOpen was captured
+      // before openWorkflow; the baseline (originalContent) is unchanged by an already-open
+      // open.
+      //
+      // #402 — BOUND this read. The open has ALREADY been applied by the time we get here,
+      // so the only thing still outstanding is a staleness HINT — yet the read is an HTTP
+      // round-trip to ComfyUI, and in the exact #402 window ComfyUI's HTTP layer is what is
+      // flaky (the same report's panel_save_workflow returned "Failed to fetch"). Unbounded,
+      // a server that accepts the connection and never answers parks a known-good outcome
+      // for the whole browser timeout — which is precisely how a routine reconnect blip gets
+      // long enough to turn into "disconnected mid-command … OUTCOME UNKNOWN". withDeadline
+      // never rejects: a timeout degrades to the ALREADY-SUPPORTED honest `stale:"unknown"`,
+      // exactly like an unreadable disk, and never to a false "fresh".
+        // codex P2 — the deadline stops US waiting; it cannot stop the REQUEST. So also
+        // (a) hand the read an AbortSignal and fire it when the budget expires, and
+        // (b) SINGLE-FLIGHT per workflow path, because one of the two read paths
+        // (api.getUserData) takes no signal at all. Together these cap the outstanding
+        // reads at one per workflow instead of leaking one per open against a server that
+        // accepts requests and never answers.
+        const readAbort = typeof AbortController === "function" ? new AbortController() : null;
+        onDiskContent = wasOpen
+          ? await withDeadline(
+              staleReadFlight.run(target.path, () =>
+                workflowDiskContent(target.path, { signal: readAbort?.signal }),
+              ),
+              OPEN_DISK_READ_BUDGET_MS,
+              null,
+              { onTimeout: () => readAbort?.abort() },
+            )
+          : null;
+        // #442 defect 2 — RE-READ the file when it provably changed and nothing is at stake.
+        // Re-check `isModified` HERE, immediately before deciding, rather than trusting the
+        // value from before the disk read: reloading over unsaved edits is data-loss class —
+        // strictly worse than serving a stale graph. There is NO await between this re-check
+        // and the reload decision below. (Interaction is frozen across this whole block, so
+        // this is a belt-and-braces second line of defence, not the only one.)
+        dirtyNow = !!target.isModified;
+        staleInfo = decideOpenStaleness({
+          wasOpen,
+          // EITHER signal counts as unsaved work: the flag as it reads NOW, and the snapshot
+          // taken before any await (which clearSpuriousOpenModified can no longer erase).
+          isModified: dirtyNow || wasDirty,
+          onDiskContent,
+          baselineContent:
+            typeof target.originalContent === "string" ? target.originalContent : null,
+        });
+        // `reload` is true only for "the file changed AND this tab has nothing unsaved", so
+        // the re-read is lossless. A stale tab WITH unsaved edits is a genuine conflict: we
+        // refuse and surface both sides rather than picking for the user.
+        //
+        // The earlier no-await-before-return invariant is intact: this block runs ONLY when
+        // staleInfo.stale === true, and it never downgrades that to "fresh" — so the
+        // false-fresh window codex closed (read stale → file changes → report fresh) still
+        // cannot open. The provably-fresh and "unknown" paths reach the return with no await.
+        if (staleInfo.reload && !dirtyNow && !wasDirty && priorInteraction === null) {
+          // NO reliable freeze on this frontend ⇒ do NOT perform the automatic destructive
+          // reload at all (codex). Serving a stale graph with a loud flag is recoverable;
+          // silently eating an edit the user made during an unrequested load is not.
+          reloadError =
+            "this frontend does not expose the canvas interaction flag, so an automatic reload " +
+            "could not be protected against a concurrent edit and was skipped";
+        } else if (staleInfo.reload && !dirtyNow && !wasDirty) {
+          const diskGraph = JSON.parse(onDiskContent);
+          // 4th arg associates the load with THIS tab (same as the repaint above), so the
+          // on-disk graph replaces the tab's buffer in place instead of spawning a new
+          // "Unsaved Workflow" tab.
+          //
+          // #570 P0b — `__cmcpKeepInstance` is MANDATORY here, exactly as on graph_load.
+          // This is an in-place reload of the SAME tab from a file that was written
+          // OUT OF BAND, so its embedded workflow uuid may be absent or belong to
+          // something else. Without the flag the create-boundary fork would see
+          // cached-uuid ≠ incoming-uuid, treat the refresh as an in-place REPLACEMENT and
+          // mint a NEW identity for this tab mid-open — after which the very next stamped
+          // command would be refused as a "workflow instance mismatch" against the session
+          // that asked for the open. The flag keeps the LIVE OBJECT's identity (the
+          // non-forgeable source) and stamps it over whatever the file carried.
+          await app.loadGraphData(diskGraph, true, true, target, { __cmcpKeepInstance: true });
+          // The tab now holds exactly the on-disk bytes — re-baseline so this same change
+          // isn't re-reported as stale forever. Best-effort: `originalContent` is a plain
+          // field on current builds but may be getter-only elsewhere.
+          try {
+            target.originalContent = onDiskContent;
+          } catch {
+            /* getter-only — the stale flag simply re-reports until the next save */
+          }
+          // A programmatic load dirties the change tracker; clear that so the re-read does
+          // not leave the tab looking edited (which would block an unforced close). Still
+          // inside the freeze — it re-baselines, so an edit made during its frame would be
+          // adopted as "not modified" and could later be discarded without a prompt.
+          await clearSpuriousOpenModified(target);
+          reloaded = true;
+        }
       }
     } catch (err) {
       // NEVER claim a reload we did not complete — report the failure and leave the caller
@@ -7813,6 +7839,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // user with a frozen graph.
       if (priorInteraction !== null) canvasView.allow_interaction = priorInteraction;
     }
+    if (openFailed) throw failOpen(openFailed);
     const receipt = noteOpenAttempt({
       cmd: "workflow_open",
       rid,
@@ -7848,7 +7875,7 @@ const GRAPH_TOOL_EXECUTORS = {
                   stale_hint:
                     "The file had changed on disk since this tab loaded it, and this tab had no unsaved edits, so the canvas was RELOADED from the on-disk version. Re-read the graph (panel_graph_outline / panel_query_graph) — node ids and geometry may differ from before.",
                 }
-              : dirtyNow
+              : dirtyNow || wasDirty
                 ? {
                     conflict: true,
                     stale_hint:
