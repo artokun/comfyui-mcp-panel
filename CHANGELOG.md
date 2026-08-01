@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- `panel_copy_nodes` no longer throws `QuotaExceededError` ("The quota has been exceeded.") when copying many nodes with large widget payloads — the cross-workflow clipboard is backed by a non-quota in-memory store instead of only `localStorage`, so a big copy survives the workflow switch and `panel_paste_nodes` reconstructs every node and intra-set link (native Ctrl+C still wins when it replaces the clipboard after a tool copy) (#500)
+
 ## [0.11.31] - 2026-08-01
 
 ### Fixed

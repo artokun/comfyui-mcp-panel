@@ -164,6 +164,11 @@ import {
   registryTypePredicate,
   formatUnpasteableCopyWarning,
 } from "./lib/paste-report.js";
+import {
+  withInMemoryClipboard,
+  getInMemoryClipboard,
+  getEffectiveClipboard,
+} from "./lib/clipboard-store.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
 import { createLightboxModel } from "./lib/lightbox-gallery.js";
 import {
@@ -7668,17 +7673,27 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!count) {
       throw new Error("nothing selected to copy — pass node_ids or select nodes first");
     }
-    canvas.copyToClipboard(selected);
-    // Snapshot the copied node types (plus a fingerprint of the raw clipboard
-    // AFTER the copy) so the next graph_paste_nodes can detect any node the
-    // target frontend silently drops on paste — and so a later native Ctrl+C
-    // that replaces the clipboard invalidates this snapshot (#261).
-    let fingerprint = null;
+    // panel#500: copyToClipboard persists the payload in localStorage, which
+    // throws QuotaExceededError ("The quota has been exceeded.") once a large
+    // multi-node selection overflows the ~5–10 MB quota — the copy then failed
+    // and the next paste pasted zero nodes. Back the clipboard key with a
+    // non-quota-limited in-memory store for the duration of the copy: the write
+    // is captured in-memory (localStorage still mirrored best-effort so native
+    // Ctrl+V keeps working when it fits), so an overflow can no longer break it.
+    let storage = null;
     try {
-      fingerprint = window.localStorage?.getItem("litegrapheditor_clipboard") ?? null;
+      storage = window.localStorage ?? null;
     } catch {
-      /* localStorage unavailable — snapshot stays unverifiable, never trusted */
+      storage = null;
     }
+    withInMemoryClipboard(storage, () => canvas.copyToClipboard(selected));
+    // Snapshot the copied node types (plus a fingerprint of the clipboard
+    // payload AFTER the copy) so the next graph_paste_nodes can detect any node
+    // the target frontend silently drops on paste — and so a later native
+    // Ctrl+C that replaces the clipboard invalidates this snapshot (#261). The
+    // fingerprint comes from the in-memory store, so it's stable even when the
+    // localStorage mirror was refused for quota.
+    const fingerprint = getInMemoryClipboard();
     recordCopiedNodes(selected, fingerprint);
     // #286: never report a clean copy that can't round-trip. Any copied node
     // whose type is unregistered on THIS frontend (uninstalled custom-node pack)
@@ -7710,9 +7725,19 @@ const GRAPH_TOOL_EXECUTORS = {
     const before = new Set((graph._nodes ?? []).map((n) => n.id));
     const options = { connectInputs: connect_inputs ?? false };
     if (Array.isArray(pos) && pos.length === 2) options.position = [Number(pos[0]), Number(pos[1])];
+    // panel#500: read the clipboard through the in-memory store so a payload
+    // that overflowed localStorage on copy is still available to paste (reads
+    // of the clipboard key resolve to the in-memory copy, or to localStorage
+    // when a native Ctrl+C has since replaced it).
+    let storage = null;
+    try {
+      storage = window.localStorage ?? null;
+    } catch {
+      storage = null;
+    }
     graph.beforeChange?.();
     try {
-      canvas.pasteFromClipboard(options);
+      withInMemoryClipboard(storage, () => canvas.pasteFromClipboard(options));
     } finally {
       graph.afterChange?.();
     }
@@ -7730,12 +7755,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // graph_copy_nodes snapshot — but ONLY when the raw clipboard is byte-
     // identical to what it was at copy time (getVerifiedSnapshot), so a native
     // Ctrl+C that replaced the clipboard can never resurrect a stale snapshot.
-    let rawClipboard = null;
-    try {
-      rawClipboard = window.localStorage?.getItem("litegrapheditor_clipboard") ?? null;
-    } catch {
-      /* localStorage unavailable */
-    }
+    // Effective payload = in-memory copy (authoritative after a quota overflow)
+    // or localStorage when a native Ctrl+C replaced it since the tool copy.
+    const rawClipboard = getEffectiveClipboard(storage);
     let expected = parseClipboardNodes(rawClipboard);
     if (!expected.length) expected = getVerifiedSnapshot(rawClipboard);
     // A type is a genuine drop only if it isn't a registered node class on this
