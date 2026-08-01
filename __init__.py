@@ -32,6 +32,7 @@ Env knobs:
 - ``COMFYUI_URL`` — the ComfyUI the agent targets (auto-detected otherwise).
 """
 
+import json
 import os
 import shutil
 import sys
@@ -151,8 +152,28 @@ def _provider_auth(provider):
     backend is an actual login."""
     home = os.path.expanduser("~")
     if provider == "claude":
-        if os.path.isfile(os.path.join(home, ".claude", ".credentials.json")):
-            return True
+        # File-presence alone is NOT a login (#378): after `claude` signs out, or
+        # on a stale install, ~/.claude/.credentials.json can remain with an empty
+        # claudeAiOauth (accessToken/refreshToken both ""), and `claude auth
+        # status` reports loggedIn:false. Treating the bare file as ready made the
+        # panel offer Claude sessions that then failed authentication. Require a
+        # genuinely-present OAuth token.
+        credentials_path = os.path.join(home, ".claude", ".credentials.json")
+        if os.path.isfile(credentials_path):
+            try:
+                with open(credentials_path, encoding="utf-8") as credentials_file:
+                    oauth = json.load(credentials_file).get("claudeAiOauth", {})
+                # A usable token is a non-blank STRING; a whitespace-only value or
+                # a non-string (true / [..] / number) is not a real OAuth token and
+                # must not read as ready.
+                def _token(value):
+                    return isinstance(value, str) and value.strip() != ""
+
+                return _token(oauth.get("accessToken")) or _token(oauth.get("refreshToken"))
+            except (OSError, AttributeError, TypeError, ValueError):
+                # Unreadable / malformed / not-an-object → treat as not-signed-in
+                # rather than falsely ready.
+                return False
         # macOS stores the OAuth token in Keychain — unreadable from here. Report
         # unknown so a CLI-present mac user is taken as ready rather than nagged.
         if sys.platform == "darwin":

@@ -166,6 +166,12 @@ import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
 import { queueMembership, historyEntryFor } from "./lib/history-reconcile.js";
 import {
+  normalizeModels,
+  presentableModels,
+  pickDefaultModel,
+  modelLabel,
+} from "./lib/model-catalog.js";
+import {
   shouldResumeAfterComfyReconnect,
   shouldRehelloAfterCommand,
   retryDuringReconnect,
@@ -2433,52 +2439,12 @@ function nearestInList(effort, list) {
   return best;
 }
 
-/** Normalize a ModelInfo list (or the fallback) to picker rows. `efforts`:
- *  an array of effort ids, or null when the model supports effort but didn't
- *  enumerate levels, or [] when it has no effort control. */
-function normalizeModels(list) {
-  return (Array.isArray(list) ? list : []).map((m) => {
-    let efforts;
-    if (Array.isArray(m.supportedEffortLevels)) efforts = m.supportedEffortLevels;
-    else if (m.supportsEffort) efforts = null; // unknown → offer the standard set
-    else efforts = []; // no effort control
-    const desc = typeof m.description === "string" ? m.description : "";
-    return {
-      id: m.value,
-      label: m.displayName || m.value,
-      small: desc.length > 28 ? desc.slice(0, 27) + "…" : desc,
-      efforts,
-      // Concrete model id behind an alias/pinned value (SDK resolvedModel) —
-      // presentableModels dedupes on this instead of pattern-matching ids.
-      resolved: typeof m.resolvedModel === "string" ? m.resolvedModel : undefined,
-    };
-  });
-}
+// normalizeModels / presentableModels / pickDefaultModel / modelLabel live in
+// ./lib/model-catalog.js (unit-tested; family-aware canonicalization for #377).
 function effortMeta(id) {
   return EFFORT_META[id] ?? { label: id.charAt(0).toUpperCase() + id.slice(1), small: "" };
 }
 
-// Show the clean family aliases (Opus / Sonnet / Haiku / Fable): drop the
-// synthetic "default", and drop a pinned version id (claude-*) ONLY when an
-// alias row resolves to the SAME model (claude-opus-4-8 duplicating "opus").
-// A model that exists solely as a pinned id must survive — Fable ships as
-// value "claude-fable-5[1m]" with NO family alias, and the old blanket
-// /^claude-/ filter silently removed it from the picker.
-function presentableModels(rows) {
-  const noDefault = rows.filter((r) => r.id !== "default");
-  const aliasResolved = new Set(
-    noDefault.filter((r) => !/^claude-/.test(r.id)).map((r) => r.resolved).filter(Boolean),
-  );
-  const kept = noDefault.filter(
-    (r) => !/^claude-/.test(r.id) || !r.resolved || !aliasResolved.has(r.resolved),
-  );
-  if (kept.length) return kept;
-  return noDefault.length ? noDefault : rows;
-}
-// Pre-select Opus when the user hasn't chosen.
-function pickDefaultModel(rows) {
-  return (rows.find((r) => /opus/i.test(r.id)) ?? rows[0])?.id;
-}
 const PREFS_KEY = "comfyui-mcp.panel.prefs";
 function loadPrefs() {
   try {
@@ -2495,10 +2461,6 @@ function savePrefs(prefs) {
     // localStorage unavailable — prefs are session-only.
   }
 }
-function modelLabel(catalog, id) {
-  return catalog.find((m) => m.id === id)?.label ?? id ?? "Claude";
-}
-
 /** A readable auto name for grounding an unsaved workflow. */
 function autoWorkflowName() {
   const d = new Date();
