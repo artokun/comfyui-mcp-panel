@@ -50,7 +50,11 @@
 // (`overwrote_uncommitted_edit`) and a timeline_data copy that lost to the editor
 // (`superseded_timeline_data`). Both carry the prior prompts PER SEGMENT, and both are decided
 // by comparing segment ARRAYS (sameSegmentContent), never the derived `" | "` join, which is
-// lossy and would hide a real overwrite whenever a prompt contains a literal "|".
+// lossy and would hide a real overwrite whenever a prompt contains a literal "|". The same limit
+// governs WHICH copy is authoritative: a join comparison can only ask "could this widget hold
+// this timeline's serialization?", never "which of two colliding timelines is current?" — so
+// chooseMergeBase uses it as a filter and, when it cannot separate the two, keeps the live
+// editor's copy (the only one that can hold unsaved text) and says so.
 // Anything PromptRelay's python would encode differently from
 // what the timeline shows (a blank prompt, a literal "|", padding whitespace) comes back as a
 // warning. The invariant: the panel never leaves the timeline saying A, the prompts saying B,
