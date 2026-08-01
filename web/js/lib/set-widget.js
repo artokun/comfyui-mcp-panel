@@ -233,7 +233,7 @@ export async function runSetWidget(
   // resolveWidgetWrite — a real widget whose own name contains a dot still wins, and a
   // dotted form is only interpreted when no exact widget matches — so the split can
   // never silently misroute to a different widget.
-  const write = () =>
+  const write = (extra = {}) =>
     applyWidgetWrite(node, widgetName, value, {
       resolveSource,
       canvas,
@@ -242,6 +242,7 @@ export async function runSetWidget(
       setDirty,
       assertTargetWritable: (targetNode) => assertResolvedTargetRegistered(liveRegistry(), targetNode),
       promotedResolution,
+      ...extra,
     });
 
   // #558: the value widget being written may be governed by a non-`fixed`
@@ -359,6 +360,32 @@ export async function runSetWidget(
         }
         throw confErr;
       }
+    }
+
+    // #507 DYNAMIC CLIENT-POPULATED COMBO, the LAST resort — deliberately after every
+    // authoritative mechanism above has been tried and failed. Some custom nodes declare
+    // a combo with an EMPTY option list on purpose (StarNodes' `"model": ((), {...})`
+    // ⇒ /object_info reports `[[], {...}]`) and let the node's own frontend JS fill the
+    // dropdown at runtime. `comboOptions()` returns `[]` — TRUTHY — so the "no readable
+    // option list" guard never fired and `[].includes(value)` rejected EVERY value,
+    // making the widget permanently unwritable by the agent.
+    //
+    // ZERO options after the authoritative refresh means the option set is genuinely NOT
+    // KNOWABLE, which is not the same as "no value is valid"; and #240's reason for
+    // strict membership (a number being reinterpreted as an INDEX into a real list)
+    // cannot apply when there is no list to index into. So take the value as written.
+    // This runs LAST precisely so a merely-STALE empty list is refreshed first and a
+    // server-confirmable upload asset is confirmed first; a NON-EMPTY list (from either
+    // source) still enforces exact membership, and an object/array value still fails
+    // closed. If the write still cannot land, the freshest rejection is re-raised below.
+    try {
+      return withWarning({
+        set: write({ acceptEmptyComboOptions: true }),
+        ...(typeof refreshCombos === "function" ? { refreshed: true } : {}),
+        empty_option_list: true,
+      });
+    } catch {
+      /* not the empty-combo case (or still invalid) — fall through and refuse honestly */
     }
 
     // No recovery succeeded — refuse honestly with the freshest rejection.

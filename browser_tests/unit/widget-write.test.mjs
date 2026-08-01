@@ -1883,3 +1883,146 @@ test("#477 P1: a STATEFUL afterChange that RE-ADDS a replacement proxy every fir
   // the extra replacement stays live — surfaced as partial state, never a clean rollback.
   assert.ok(parent.widgets.includes(newProxy), "the stateful afterChange keeps the replacement live — honestly reported, not masked");
 });
+
+// ---- #507: a DYNAMIC, CLIENT-POPULATED combo whose option list is EMPTY.
+//      `comboOptions()` returns `[]`, which is TRUTHY, so the "no readable option list"
+//      guard never fired and `[].includes(value)` rejected EVERY value — the widget was
+//      permanently unwritable. Zero options means the option set is not KNOWABLE, not
+//      that nothing is valid. But an empty LIVE list can also be merely STALE, so
+//      applyWidgetWrite refuses RETRYABLY by default and only accepts once the caller
+//      (runSetWidget, after its authoritative refresh) opts in. -----------------------
+
+// StarNodes' StarOllamaPromptHelper declares `"model": ((), {...})`, so /object_info
+// reports `"model": [[], {...}]` and the node's own "Refresh Models" button fills the
+// dropdown client-side.
+const emptyComboNode = (value = "") => ({
+  id: 9,
+  type: "StarOllamaPromptHelper",
+  widgets: [{ name: "model", type: "combo", options: { values: [] }, value }],
+});
+const ACCEPT_EMPTY = { ...HOOKS, acceptEmptyComboOptions: true };
+
+test("#507: an EMPTY option list is a RETRYABLE combo rejection by default (a stale list must be refreshed first)", () => {
+  const node = emptyComboNode("orig");
+  assert.throws(
+    () => applyWidgetWrite(node, "model", "qwen3-vl:8b", HOOKS),
+    (err) => err instanceof WidgetWriteError && err.combo === true && /EMPTY option list/.test(err.message),
+  );
+  assert.equal(node.widgets[0].value, "orig", "no mutation while the list is still being resolved");
+});
+
+test("#507: once the list is confirmed STILL empty, the write PROCEEDS with the exact value", () => {
+  const node = emptyComboNode();
+  const set = applyWidgetWrite(node, "model", "qwen3-vl:8b", ACCEPT_EMPTY);
+  assert.equal(set.value, "qwen3-vl:8b");
+  assert.equal(node.widgets[0].value, "qwen3-vl:8b", "the exact value is written, uncoerced");
+});
+
+test("#507: an empty DYNAMIC (function) option list behaves exactly like an empty array", () => {
+  const mk = () => ({
+    id: 9,
+    type: "StarOllamaPromptHelper",
+    widgets: [{ name: "model", type: "combo", options: { values: () => [] }, value: "" }],
+  });
+  assert.throws(() => applyWidgetWrite(mk(), "model", "llama3.2:3b", HOOKS), WidgetWriteError);
+  assert.equal(applyWidgetWrite(mk(), "model", "llama3.2:3b", ACCEPT_EMPTY).value, "llama3.2:3b");
+});
+
+test("#507: a NON-EMPTY list still refuses an off-list value even with acceptEmptyComboOptions (#240 intact)", () => {
+  // The opt-in is scoped to the EMPTY case only — it is not a blanket 'skip validation'.
+  const node = {
+    id: 9,
+    type: "StarOllamaPromptHelper",
+    widgets: [{ name: "model", type: "combo", options: { values: ["qwen3-vl:8b", "llama3.2:3b"] }, value: "qwen3-vl:8b" }],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "model", "not-installed:70b", ACCEPT_EMPTY),
+    (err) => err instanceof WidgetWriteError && /not a valid option/.test(err.message),
+  );
+  assert.equal(node.widgets[0].value, "qwen3-vl:8b", "must not have mutated on reject");
+  // …and a valid member of that same non-empty list still succeeds.
+  assert.equal(applyWidgetWrite(node, "model", "llama3.2:3b", ACCEPT_EMPTY).value, "llama3.2:3b");
+});
+
+test("#507: the LIVE client-populated list is what gets validated (richer than the server's empty one)", () => {
+  // comboOptions reads the LIVE widget, so once the node's own "Refresh Models" button
+  // has filled the dropdown, that list is authoritative for membership.
+  const node = {
+    id: 9,
+    type: "StarOllamaPromptHelper",
+    widgets: [{ name: "model", type: "combo", options: { values: ["qwen3-vl:8b"] }, value: "" }],
+  };
+  assert.equal(applyWidgetWrite(node, "model", "qwen3-vl:8b", ACCEPT_EMPTY).value, "qwen3-vl:8b");
+  assert.throws(() => applyWidgetWrite(node, "model", "ghost:1b", ACCEPT_EMPTY), WidgetWriteError);
+});
+
+test("#507: an UNREADABLE option list is STILL refused — empty is not the same as unreadable", () => {
+  // The pre-existing fail-closed guard is untouched: a missing options.values and a
+  // throwing dynamic fn both still refuse, even with the opt-in — they may be hiding a
+  // real, non-empty list.
+  const missing = { id: 9, type: "N", widgets: [{ name: "model", type: "combo", value: "x" }] };
+  assert.throws(
+    () => applyWidgetWrite(missing, "model", "anything", ACCEPT_EMPTY),
+    (err) => err instanceof WidgetWriteError && /no readable option list/.test(err.message),
+  );
+  const throwing = {
+    id: 9,
+    type: "N",
+    widgets: [{ name: "model", type: "combo", options: { values: () => { throw new Error("boom"); } }, value: "x" }],
+  };
+  assert.throws(() => applyWidgetWrite(throwing, "model", "anything", ACCEPT_EMPTY), WidgetWriteError);
+});
+
+test("#507: an empty option list accepts only a SCALAR — objects/arrays fail closed and are NOT retryable", () => {
+  for (const bad of [{ a: 1 }, ["a"]]) {
+    const node = emptyComboNode("orig");
+    assert.throws(
+      () => applyWidgetWrite(node, "model", bad, ACCEPT_EMPTY),
+      (err) => err instanceof WidgetWriteError && err.combo !== true,
+      `#507: ${JSON.stringify(bad)} must not be written to a combo, and a refresh cannot help`,
+    );
+    assert.equal(node.widgets[0].value, "orig", "must not have mutated on reject");
+  }
+  // A MISSING value is still refused by the pre-existing #347 guard, before the combo branch.
+  assert.throws(() => applyWidgetWrite(emptyComboNode("orig"), "model", undefined, ACCEPT_EMPTY), WidgetWriteError);
+  // Non-string scalars are fine — a dynamic combo may legitimately hold a number/boolean.
+  assert.equal(applyWidgetWrite(emptyComboNode(), "model", 7, ACCEPT_EMPTY).value, 7);
+  assert.equal(applyWidgetWrite(emptyComboNode(), "model", true, ACCEPT_EMPTY).value, true);
+});
+
+test("#507: an UNRESOLVED widget/node still gets no fabricated success (#281/#458)", () => {
+  // No such widget at all: the empty-list path must never be reached by inventing one.
+  const none = { id: 9, type: "StarOllamaPromptHelper", widgets: [] };
+  assert.throws(
+    () => applyWidgetWrite(none, "model", "qwen3-vl:8b", ACCEPT_EMPTY),
+    (err) => err instanceof WidgetWriteError && /has no widget/.test(err.message),
+  );
+  // The injected #458 target guard still runs before any empty-list handling.
+  assert.throws(
+    () =>
+      applyWidgetWrite(emptyComboNode(), "model", "qwen3-vl:8b", {
+        ...ACCEPT_EMPTY,
+        assertTargetWritable: () => {
+          throw new Error("unresolved placeholder node");
+        },
+      }),
+    /unresolved placeholder node/,
+  );
+  // A write that does not STICK is reported as a failure, never a success.
+  const frozen = {
+    id: 9,
+    type: "StarOllamaPromptHelper",
+    widgets: [
+      Object.defineProperty({ name: "model", type: "combo", options: { values: [] } }, "value", {
+        get: () => "frozen",
+        set: () => {},
+        enumerable: true,
+        configurable: true,
+      }),
+    ],
+  };
+  assert.throws(
+    () => applyWidgetWrite(frozen, "model", "qwen3-vl:8b", ACCEPT_EMPTY),
+    (err) => err instanceof WidgetWriteError && /did not retain the requested value/i.test(err.message),
+  );
+});

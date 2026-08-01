@@ -1112,9 +1112,151 @@ test("#496 SINGLE SOURCE OF TRUTH: all three guards read the SAME allowlist Set 
   assert.deepEqual(await guardVerdicts(reg, fresh, SYNTHETIC, node), [false, false, false]);
 });
 
+test("#496 add_node (codex SEVERE): the frontend-only exemption REQUIRES the ever-seen oracle — without it, nothing absent from object_info is exempted", async () => {
+  // Client-side name + provenance markers are FORGEABLE: a removed pack whose frontend
+  // class had .nodeData/.comfyClass stripped and which squats a reserved allowlisted
+  // name is indistinguishable from a genuine native by those signals alone. Only the
+  // non-forgeable observed-backend-history gate can rule it out, so with NO history
+  // oracle wired there is no exemption at all — pre-#496 fail-closed behaviour.
+  const reg = registryWithNatives();
+  const fresh = objectInfo();
+  for (const t of ["Note", "MarkdownNote", "Reroute", "PrimitiveNode"]) {
+    await assert.rejects(
+      () =>
+        assertAddNodeResolvableRefreshing(() => reg, t, {
+          getFreshObjectInfo: async () => fresh,
+          refresh: async () => {},
+          // wasTypeEverDefined deliberately OMITTED
+        }),
+      /Unknown node type|does not provide/i,
+      `#496: "${t}" must NOT be exempted without the observed-backend-history oracle`,
+    );
+  }
+  // Wiring the oracle (and only then) enables the exemption.
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS(fresh)),
+  );
+});
+
 test("#496: isRemovedBackendType — the shared ever-seen gate is inert without an injected oracle and never guesses", () => {
   assert.equal(isRemovedBackendType("KSampler", () => true), true);
   assert.equal(isRemovedBackendType("KSampler", () => false), false);
   assert.equal(isRemovedBackendType("KSampler", undefined), false, "no oracle wired ⇒ no removal claim");
   assert.equal(isRemovedBackendType(undefined, () => true), false, "a non-string type is never 'removed'");
+});
+
+// ---- #507 END-TO-END through the PRODUCTION graph_set_widget body: a dynamic
+//      client-populated combo (empty server option list) must become writable, and the
+//      empty-list acceptance must be the LAST resort — the authoritative /object_info
+//      refresh gets first refusal, so a merely-STALE empty list is refreshed and then
+//      validated strictly. ------------------------------------------------------------
+
+// StarNodes' StarOllamaPromptHelper: `"model": ((), {...})` ⇒ /object_info reports
+// `[[], {...}]`, and the node's own "Refresh Models" button fills the dropdown.
+function starNodesFixture(liveOptions = []) {
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const widget = { name: "model", type: "combo", options: { values: liveOptions }, value: "" };
+  const node = { id: 9, type: "StarOllamaPromptHelper", widgets: [widget], constructor: reg["StarOllamaPromptHelper"] };
+  return { reg, node, widget };
+}
+// /object_info in which StarOllamaPromptHelper's `model` input carries `serverOptions`.
+function starObjectInfo(serverOptions = []) {
+  const info = objectInfo();
+  info["StarOllamaPromptHelper"] = { input: { required: { model: [serverOptions, {}] } } };
+  return info;
+}
+// A refreshCombos that does what the panel's does: overwrite the live option list with
+// the server's, from the ALREADY-FETCHED /object_info payload.
+const refreshFromServer = (fresh, targetNode) => {
+  const def = fresh?.[targetNode?.type]?.input?.required;
+  for (const w of targetNode?.widgets ?? []) {
+    const spec = def?.[w.name];
+    if (Array.isArray(spec?.[0])) w.options.values = spec[0];
+  }
+};
+
+test("#507 e2e: a combo whose SERVER option list is empty becomes writable (the StarNodes repro)", async () => {
+  const { reg, node, widget } = starNodesFixture([]);
+  const res = await runSetWidget(node, "model", "qwen3-vl:8b", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => starObjectInfo([]), // server publishes ZERO options
+    wasTypeEverDefined: () => true, // a real backend node, present in object_info
+    refreshCombos: refreshFromServer,
+    ...HOOKS,
+  });
+  assert.equal(res.set.value, "qwen3-vl:8b");
+  assert.equal(widget.value, "qwen3-vl:8b");
+  assert.equal(res.empty_option_list, true, "reported honestly as an unvalidatable empty list");
+});
+
+test("#507 e2e: a merely-STALE empty list is REFRESHED first, then validated STRICTLY (not blindly accepted)", async () => {
+  // The live widget is empty only because the frontend combo snapshot is stale; the
+  // SERVER does publish a real list. The refresh must run and decide — a member is
+  // accepted through the normal path (no empty-list fallback), a NON-member is refused.
+  const ok = starNodesFixture([]);
+  const res = await runSetWidget(ok.node, "model", "llama3.2:3b", {
+    registry: ok.reg,
+    getRegistry: () => ok.reg,
+    getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b", "llama3.2:3b"]),
+    wasTypeEverDefined: () => true,
+    refreshCombos: refreshFromServer,
+    ...HOOKS,
+  });
+  assert.equal(res.set.value, "llama3.2:3b");
+  assert.equal(res.refreshed, true, "the authoritative refresh is what accepted it");
+  assert.equal(res.empty_option_list, undefined, "NOT the empty-list path — a real list existed");
+
+  const bad = starNodesFixture([]);
+  await assert.rejects(
+    () =>
+      runSetWidget(bad.node, "model", "not-installed:70b", {
+        registry: bad.reg,
+        getRegistry: () => bad.reg,
+        getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b", "llama3.2:3b"]),
+        wasTypeEverDefined: () => true,
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+    /not a valid option/i,
+    "#240: once the server publishes a real list, an off-list value is still refused",
+  );
+  assert.equal(bad.widget.value, "", "must not have mutated on reject");
+});
+
+test("#507 e2e: an object value into an empty combo still fails closed (no fabricated success)", async () => {
+  const { reg, node, widget } = starNodesFixture([]);
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "model", { model: "qwen3-vl:8b" }, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => starObjectInfo([]),
+        wasTypeEverDefined: () => true,
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+    /refused|only a scalar/i,
+  );
+  assert.equal(widget.value, "", "must not have mutated on reject");
+});
+
+test("#507 e2e: the empty-list fallback does NOT bypass the #458 type authorization", async () => {
+  // A since-REMOVED backend node that happens to expose an empty combo must still be
+  // refused BEFORE any write — the empty-list path is inside the write, downstream of
+  // the fresh-backend gate, and must not become a way around it.
+  const { reg, node, widget } = starNodesFixture([]);
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "model", "qwen3-vl:8b", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // backend no longer provides the type
+        wasTypeEverDefined: (t) => t === "StarOllamaPromptHelper", // …but it did earlier
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+    /removed|since-removed/i,
+  );
+  assert.equal(widget.value, "", "no write behind a refused authorization");
 });

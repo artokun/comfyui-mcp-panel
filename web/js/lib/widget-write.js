@@ -215,7 +215,13 @@ function mergeCompositeFields(widgetName, base, incoming) {
  * WidgetWriteError (never silently coerces to a wrong value) when the value is
  * incompatible with the widget's declared type.
  */
-export function coerceWidgetValue(widget, value, mergeBaseWidget = widget, subFieldPath = null) {
+export function coerceWidgetValue(
+  widget,
+  value,
+  mergeBaseWidget = widget,
+  subFieldPath = null,
+  { acceptEmptyComboOptions = false } = {},
+) {
   const name = widget?.name ?? "(widget)";
 
   // #347: distinguish "clear to empty" from "missing value". An EXPLICIT empty
@@ -292,6 +298,47 @@ export function coerceWidgetValue(widget, value, mergeBaseWidget = widget, subFi
       throw new WidgetWriteError(
         `Combo widget "${name}" has no readable option list; cannot validate ` +
           `value ${JSON.stringify(value)} — refusing to write.`,
+        { combo: true },
+      );
+    }
+    // #507: a DYNAMIC, CLIENT-POPULATED combo declared with an EMPTY option list —
+    // e.g. StarNodes' `"model": ((), {...})`, which /object_info reports as
+    // `[[], {...}]` and whose dropdown the node's own frontend JS fills at runtime
+    // (a "Refresh Models" button). `comboOptions` returns `[]`, which is TRUTHY, so
+    // the `!options` guard above never fired and `[].includes(value)` rejected EVERY
+    // value — the widget was permanently unwritable by the agent.
+    //
+    // ZERO options means the option set is NOT KNOWABLE from here — the same state
+    // the guard above names, NOT "no value is valid". And the #240 reason for strict
+    // membership does not apply: that rule exists so a numeric value cannot be
+    // silently reinterpreted as an INDEX into a real list, and with an empty list
+    // there is no list to index into. So accept the value as written.
+    //
+    // This does NOT loosen #233/#240. An empty LIVE list is ambiguous — it can also
+    // simply be STALE (never populated yet) while the SERVER publishes a real list —
+    // so acceptance is NOT automatic: by default the empty case throws a RETRYABLE
+    // combo error, which drives runSetWidget's authoritative /object_info refresh
+    // first. Only if the list is STILL empty after that (`acceptEmptyComboOptions`)
+    // is the value taken as written. The moment the list is NON-EMPTY — from the
+    // server or from the node's own client-side refresh, whichever is richer, since
+    // `options` is read from the LIVE widget — strict membership below applies
+    // unchanged and an off-list value is refused.
+    //
+    // Only a SCALAR is ever accepted: an object/array could never be an option under
+    // any list and would corrupt the widget, so it fails closed and is marked
+    // NON-retryable (no refresh can make it valid).
+    if (options.length === 0) {
+      if (typeof value === "object") {
+        throw new WidgetWriteError(
+          `Combo widget "${name}" has an EMPTY option list (a dynamic, client-populated ` +
+            `combo), so ${JSON.stringify(value)} cannot be validated against it — and only a ` +
+            `scalar (string/number/boolean) can be written to a combo. Refusing to write.`,
+        );
+      }
+      if (acceptEmptyComboOptions) return value;
+      throw new WidgetWriteError(
+        `Combo widget "${name}" has an EMPTY option list; the server's option list may ` +
+          `simply be stale — refreshing it before deciding.`,
         { combo: true },
       );
     }
@@ -649,6 +696,7 @@ export function resolveWidgetWrite(
   resolveSource,
   assertTargetWritable,
   promotedResolution,
+  coerceOpts,
 ) {
   let targetNode = node;
   let widget = null;
@@ -791,7 +839,7 @@ export function resolveWidgetWrite(
   // unaffected (they don't merge). Non-promoted writes merge onto their own value.
   // (A promoted write with no authoritative rail already threw above, BEFORE this
   // possibly side-effecting coercion — so `promotedParentWidget` is non-null here.)
-  const coerced = coerceWidgetValue(widget, value, promotedParentWidget ?? widget, subFieldPath);
+  const coerced = coerceWidgetValue(widget, value, promotedParentWidget ?? widget, subFieldPath, coerceOpts);
 
   return { targetNode, widget, coerced, promotedFrom, promotedParentWidget, promotedParentWidgets, promotedHostInput };
 }
@@ -806,7 +854,20 @@ export function applyWidgetWrite(
   node,
   widgetName,
   value,
-  { resolveSource, canvas, beforeChange, afterChange, setDirty, assertTargetWritable, promotedResolution } = {},
+  {
+    resolveSource,
+    canvas,
+    beforeChange,
+    afterChange,
+    setDirty,
+    assertTargetWritable,
+    promotedResolution,
+    // #507: only the FINAL attempt (after the authoritative /object_info combo refresh
+    // has had its chance) may treat a still-EMPTY combo option list as "not knowable"
+    // and take the value as written. Default false ⇒ the empty case is a RETRYABLE
+    // combo rejection, so a merely-stale empty list is refreshed before any decision.
+    acceptEmptyComboOptions = false,
+  } = {},
 ) {
   // resolveWidgetWrite runs assertTargetWritable on the RESOLVED target (inner
   // promoted node for a subgraph write, or the node's own) BEFORE it coerces the
@@ -816,7 +877,9 @@ export function applyWidgetWrite(
   // /object_info gate authorized (#458), and resolveWidgetWrite also fails closed if
   // the AUTHORITATIVE parent rail widget can't be identified (#366).
   const { targetNode, widget: w, coerced, promotedFrom, promotedParentWidget, promotedParentWidgets, promotedHostInput } =
-    resolveWidgetWrite(node, widgetName, value, resolveSource, assertTargetWritable, promotedResolution);
+    resolveWidgetWrite(node, widgetName, value, resolveSource, assertTargetWritable, promotedResolution, {
+      acceptEmptyComboOptions,
+    });
 
   // #366: for a promoted subgraph widget the AUTHORITATIVE value lives on the
   // parent's OWN rail widget (resolved by the promotion RELATIONSHIP in

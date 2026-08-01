@@ -313,12 +313,11 @@ export function assertAddNodeResolvable(registry, class_type) {
  *   refresh            : optional async (defs?) => re-register node defs into the
  *                        registry; receives the already-fetched defs to avoid a
  *                        second /object_info round-trip.
- *   wasTypeEverDefined : optional (type) => did any /object_info this session report
- *                        this type? The #458 observed-backend-history trust root,
- *                        shared with graph_set_widget. Omitting it does NOT loosen the
- *                        backend-presence rule — it only removes the extra rejection
- *                        that distinguishes a since-REMOVED pack from a never-installed
- *                        one, which matters solely for the frontend-only exemption.
+ *   wasTypeEverDefined : (type) => did any /object_info this session report this type?
+ *                        The #458 observed-backend-history trust root, shared with
+ *                        graph_set_widget. REQUIRED for the frontend-only exemption:
+ *                        omit it and NOTHING absent from fresh /object_info is ever
+ *                        exempted (fail closed, pre-#496 behaviour).
  */
 export async function assertAddNodeResolvableRefreshing(getRegistry, class_type, opts = {}) {
   const { getFreshObjectInfo, refresh, wasTypeEverDefined } = opts;
@@ -366,7 +365,22 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
       // (isAuthorizedFrontendOnlyType), which requires live-registry membership, reserved
       // allowlist membership and a provenance-clean registered class. Registry membership
       // is also precisely what LG.createNode needs, so the caller can construct it.
-      if (isAuthorizedFrontendOnlyType(readRegistry(), class_type)) return;
+      //
+      // The exemption additionally REQUIRES the observed-backend-history oracle to be
+      // WIRED (codex round-1, SEVERE): client-side name + provenance markers alone are
+      // forgeable — a removed pack whose frontend class had its .nodeData/.comfyClass
+      // stripped and which squats a reserved allowlisted name would otherwise be added
+      // as a stale/generic node and reported as success. Only the non-forgeable
+      // ever-seen gate can rule that out, so WITHOUT it there is no exemption at all
+      // and every type absent from fresh /object_info fails closed exactly as before
+      // this change. The panel always wires it; this makes add's exemption strictly
+      // stronger than a bare allowlist check.
+      if (
+        typeof wasTypeEverDefined === "function" &&
+        isAuthorizedFrontendOnlyType(readRegistry(), class_type)
+      ) {
+        return;
+      }
       // Not defined by the current backend (never installed, or its pack was
       // removed). Fail closed even if a stale registry entry survives (#458/P1-C).
       throw new Error(

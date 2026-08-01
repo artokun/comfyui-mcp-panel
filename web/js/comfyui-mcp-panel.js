@@ -356,6 +356,26 @@ function seedObjectInfoHistory() {
   return objectInfoHistorySeed;
 }
 
+// How long a graph tool will WAIT for the startup baseline seed before giving up on it.
+// The seed's own retry loop only advances once each api.getNodeDefs() SETTLES, so a
+// request that never settles (a hung/half-open connection) would otherwise block the
+// awaiting tool FOREVER (codex round-1, MODERATE). Bounding the wait converts that
+// availability failure into the correct fail-CLOSED outcome: objectInfoHistorySeeded is
+// still false when we stop waiting, so wasTypeEverDefined treats every absent-from-current
+// type as removed and the write/add is refused with an honest error instead of hanging.
+const OBJECT_INFO_SEED_WAIT_MS = 8000;
+async function awaitObjectInfoHistorySeed() {
+  const bounded = (p) =>
+    Promise.race([
+      Promise.resolve(p).catch(() => {}),
+      new Promise((resolve) => setTimeout(resolve, OBJECT_INFO_SEED_WAIT_MS)),
+    ]);
+  await bounded(objectInfoHistorySeed);
+  // Not seeded by the startup attempt? Try ONCE more here (the backend may have come
+  // up since page load), still bounded. Failure leaves the history unseeded ⇒ closed.
+  if (!objectInfoHistorySeeded) await bounded(seedObjectInfoHistory());
+}
+
 async function registerComfyNodeDefs(preloadedDefs) {
   // Trust the live combos for suppressing missing-asset candidates ONLY once the
   // combo refresh has ACTUALLY RUN and succeeded. If refreshComboInNodes is absent on
@@ -5855,12 +5875,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // the same reason set_widget does: an un-seeded history must never let a write/add
     // decide "never seen". If the seed still cannot land (backend down),
     // objectInfoHistorySeeded stays false and wasTypeEverDefined fails CLOSED.
-    try {
-      await objectInfoHistorySeed;
-      if (!objectInfoHistorySeeded) await seedObjectInfoHistory();
-    } catch {
-      /* seed is best-effort; an unseeded history makes wasTypeEverDefined fail closed */
-    }
+    await awaitObjectInfoHistorySeed();
     await assertAddNodeResolvableRefreshing(() => LG?.registered_node_types ?? {}, class_type, {
       getFreshObjectInfo: async () =>
         recordObjectInfoTypes(
@@ -6297,12 +6312,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // false and wasTypeEverDefined fails CLOSED (absent types refused) — never allowed
     // against an empty history (codex round-10). A backend that is up now succeeds and
     // establishes the baseline for all currently-present types.
-    try {
-      await objectInfoHistorySeed;
-      if (!objectInfoHistorySeeded) await seedObjectInfoHistory();
-    } catch {
-      /* seed is best-effort; an unseeded history makes wasTypeEverDefined fail closed */
-    }
+    // (BOUNDED — a getNodeDefs request that never settles must not hang the tool; the
+    // wait gives up and leaves the history unseeded, which fails CLOSED.)
+    await awaitObjectInfoHistorySeed();
     // Delegate to the shared handler body (web/js/lib/set-widget.js) so this
     // production path and the unit tests run the IDENTICAL ordering: preflight →
     // reconcile-only-a-resolved-node → applyWidgetWrite with the resolved-target
