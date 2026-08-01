@@ -146,6 +146,9 @@ import {
   parseClipboardNodes,
   diffCopiedVsPasted,
   formatDroppedWarning,
+  unregisteredCopiedTypes,
+  registryTypePredicate,
+  formatUnpasteableCopyWarning,
 } from "./lib/paste-report.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
 import { createLightboxModel } from "./lib/lightbox-gallery.js";
@@ -6920,7 +6923,7 @@ const GRAPH_TOOL_EXECUTORS = {
   // no ids: copy the current canvas selection. The clipboard survives a workflow
   // switch, so the next graph_paste_nodes can drop them into a DIFFERENT workflow.
   graph_copy_nodes({ node_ids } = {}) {
-    const { graph, canvas } = getGraphCtx();
+    const { graph, canvas, LG } = getGraphCtx();
     if (!canvas) throw new Error("canvas unavailable");
     if (typeof canvas.copyToClipboard !== "function") {
       throw new Error("copyToClipboard unavailable on this frontend");
@@ -6954,7 +6957,22 @@ const GRAPH_TOOL_EXECUTORS = {
       /* localStorage unavailable — snapshot stays unverifiable, never trusted */
     }
     recordCopiedNodes(selected, fingerprint);
-    return { copied: count };
+    // #286: never report a clean copy that can't round-trip. Any copied node
+    // whose type is unregistered on THIS frontend (uninstalled custom-node pack)
+    // will be silently dropped by a later paste — the destination is the same
+    // frontend, so that's knowable now. Surface it here instead of only warning
+    // after the paste has already produced an incomplete graph.
+    // Only judge round-trippability when a USABLE registry exists — if it's
+    // missing/empty (frontend not fully loaded) registryTypePredicate returns
+    // undefined and we report nothing rather than falsely flagging every node.
+    const isRegisteredType = registryTypePredicate(LG?.registered_node_types);
+    const unregistered = unregisteredCopiedTypes(selected, isRegisteredType);
+    const result = { copied: count };
+    if (unregistered.length) {
+      result.unregistered_types = unregistered;
+      result.warning = formatUnpasteableCopyWarning(unregistered);
+    }
+    return result;
   },
 
   // Paste the litegraph clipboard onto the CURRENT graph. Snapshots node ids
