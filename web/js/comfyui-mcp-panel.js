@@ -2997,6 +2997,30 @@ async function fetchObjectInfo() {
   return txt ? JSON.parse(txt) : null;
 }
 
+/** Start (or POST another control on) the Manager queue, negotiating the HTTP
+ *  method on a 405. Some released 3.x Manager builds register `queue/start` (and
+ *  peer control routes) as GET-only, so our POST comes back HTTP 405 (#486 —
+ *  reproduced on ComfyUI 0.27.0). On a Manager route a 405 means "wrong method
+ *  for THIS route on THIS build" — NEVER "the Manager is unreachable" and NEVER a
+ *  different Manager generation — so retry the SAME route once as GET. The pip v4
+ *  Manager and the released 3.41 build register `queue/start` as POST and keep
+ *  answering it (no 405, no GET retry); a GET-only build then starts its queue
+ *  instead of failing the whole install. Mirrors the orchestrator's
+ *  managerQueueControl (src/services/node-management.ts, #551). `call` is
+ *  managerV2 (adds the /v2 prefix) or managerCall (absolute legacy route). */
+async function managerQueueControl(call, route) {
+  try {
+    await call(route, { method: "POST", signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS) });
+  } catch (err) {
+    // Only a 405 is a method signal we can negotiate; a 404 ("not reachable") or
+    // any other error means the route/POST genuinely failed — surface it. A 405
+    // leaves the route REGISTERED, so the GET retry hits the real GET handler
+    // (not ComfyUI's frontend catchall, which only serves UNREGISTERED GETs).
+    if (!isMethodNotAllowed(err)) throw err;
+    await call(route, { signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS) });
+  }
+}
+
 /** Throw if a /v2/manager/queue/batch response reported the target id as failed.
  *  The batch runs synchronously and surfaces failures as {failed:[id,...]} — a
  *  silent success on a failed op is exactly the #184 no-op bug. */
@@ -3023,8 +3047,10 @@ function boundedDelay(ms, deadline) {
  *  respects the remaining budget. Never throws. Returns the LAST status seen (or
  *  null on a stall) — the caller's classifyInstallOutcome re-derives drained
  *  from it via queueDrained, so a null/malformed status is never a false drain
- *  (codex round 2 #1). */
-async function waitForQueueDrain({ timeoutMs = 120000, intervalMs = 1500 } = {}) {
+ *  (codex round 2 #1). `get` defaults to the dialect-routed managerGet; the
+ *  install verifier passes a dialect-PINNED getter so a post-#485-fallback verify
+ *  reads the SAME routes the install actually landed on (codex P1). */
+async function waitForQueueDrain({ timeoutMs = 120000, intervalMs = 1500, get = managerGet } = {}) {
   const deadline = Date.now() + timeoutMs;
   let status = null;
   // Give the queue a beat to register the task before the first poll, so we
@@ -3034,7 +3060,7 @@ async function waitForQueueDrain({ timeoutMs = 120000, intervalMs = 1500 } = {})
     // Cap this individual fetch by whatever budget remains.
     const perFetch = Math.max(1000, Math.min(MANAGER_FETCH_TIMEOUT_MS, deadline - Date.now()));
     try {
-      status = await managerGet("manager/queue/status", {
+      status = await get("manager/queue/status", {
         signal: AbortSignal.timeout(perFetch),
       });
     } catch {
@@ -3056,11 +3082,19 @@ async function waitForQueueDrain({ timeoutMs = 120000, intervalMs = 1500 } = {})
  * tri-state — never an early throw). Returns { state, status, message }.
  */
 async function verifyInstalled(target, dialect, { batchFailed, renameProne } = {}) {
-  const status = await waitForQueueDrain();
+  // Pin the status/list reads to the dialect the install ACTUALLY landed on. In
+  // the normal case this equals managerGet's cached detection; after the #485
+  // legacy fallback the cache still holds the detected v2 dialect, so re-deriving
+  // via managerGet would read the /v2 routes that don't serve on that hybrid
+  // build (→ a false "unverified"). Route by the effective dialect instead
+  // (codex P1).
+  const get = (route, opts) =>
+    dialect === "legacy" ? managerCall(route, opts) : managerV2(route, opts);
+  const status = await waitForQueueDrain({ get });
   let installed = null;
   let listError = false;
   try {
-    installed = await managerGet("customnode/installed", {
+    installed = await get("customnode/installed", {
       signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS),
     });
   } catch {
@@ -8370,19 +8404,9 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!id && !repository) {
       throw new Error("id (registry id or author/repo) or repository (git URL) is required");
     }
-    const dialect = await detectManagerDialect();
+    const detected = await detectManagerDialect();
     const ui_id = crypto.randomUUID();
     const client_id = api.clientId ?? api.initialClientId ?? "comfyui-mcp-panel";
-    // buildInstallRequest (./lib/manager-install.js) derives the repo NAME for a
-    // git URL (arriving via id OR repository, any protocol) and picks the right
-    // per-dialect payload — issues #187/#182/#184. A full URL is never sent as
-    // `id` (v4 would silently mark it "done"; 3.x fails late, past `failed`).
-    const req = buildInstallRequest(dialect, args, ui_id);
-    // The install id we verify against on disk (already the repo NAME for a git
-    // URL). #232: the Manager queue reports every task "done" even when the
-    // clone/resolve fails, so after queueing we resolve the TRUE outcome instead
-    // of claiming success — installed / failed / unverified (see verifyInstalled).
-    const target = dialect === "v2" ? req.params.id : req.body.id;
     // A git URL or an owner/repo id can install under a directory name that
     // differs from the repo name (e.g. TenStrip/10S-Comfy-nodes → 10S_Nodes), so
     // its on-disk presence can't be confirmed OR ruled out by name — absence is
@@ -8391,21 +8415,57 @@ const GRAPH_TOOL_EXECUTORS = {
     const renameProne = !!installGitUrl(args) || String(id ?? "").includes("/");
     // Every Manager mutation is bounded (codex round 2 #5).
     const post = (body) => ({ method: "POST", body, signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS) });
-    let batchFailed; // v2-batch synchronous failed[] — FEEDS the gate as evidence
-    if (dialect === "v2") {
-      await managerV2("manager/queue/task", post({ kind: "install", params: req.params, ui_id, client_id }));
-      await managerV2("manager/queue/start", post());
-    } else if (dialect === "v2-batch") {
-      const res = await managerV2("manager/queue/batch", post({ install: [req.body] }));
-      // Capture the synchronous `failed[]` as failure EVIDENCE — but do NOT throw
-      // early (codex round 2 #4). The final outcome still goes through the
-      // tri-state gate (drained + list-readable + absent) below.
-      batchFailed = Array.isArray(res?.failed) ? res.failed : undefined;
-      await managerV2("manager/queue/start", post());
-    } else {
-      await managerCall("manager/queue/install", post(req.body));
-      await managerCall("manager/queue/start", post());
+    // SUBMIT the install (enqueue only — NOT start) for a given dialect. Kept
+    // separate from queue/start so the #485 unreachable-fallback below can never
+    // re-run a submission that already landed (a start failure must not double-
+    // fire the install — codex P0). Returns the on-disk `target` (already the
+    // repo NAME for a git URL — #232 verifies against it) plus the v2-batch
+    // synchronous `failed[]` (FEEDS the tri-state gate as EVIDENCE — never an
+    // early throw, codex round 2 #4).
+    const submitInstall = async (dialect) => {
+      // buildInstallRequest (./lib/manager-install.js) derives the repo NAME for
+      // a git URL (arriving via id OR repository, any protocol) and picks the
+      // right per-dialect payload — issues #187/#182/#184. A full URL is never
+      // sent as `id` (v4 would silently mark it "done"; 3.x fails late).
+      const req = buildInstallRequest(dialect, args, ui_id);
+      const target = dialect === "v2" ? req.params.id : req.body.id;
+      let batchFailed;
+      if (dialect === "v2") {
+        await managerV2("manager/queue/task", post({ kind: "install", params: req.params, ui_id, client_id }));
+      } else if (dialect === "v2-batch") {
+        const res = await managerV2("manager/queue/batch", post({ install: [req.body] }));
+        batchFailed = Array.isArray(res?.failed) ? res.failed : undefined;
+      } else {
+        await managerCall("manager/queue/install", post(req.body));
+      }
+      return { target, batchFailed };
+    };
+    // #485: a dialect-routed SUBMIT that reports the Manager "unreachable" (a /v2
+    // mutation 404s) can still succeed on the ABSOLUTE released-3.x routes — a
+    // build can answer the /v2 queue-status probe (so detection picks v2 /
+    // v2-batch) yet 404 the /v2 MUTATION routes while /manager/queue/install
+    // serves fine. nodes_list already degrades this way for the installed-node
+    // list; without the same fallback here, install threw a false "not reachable"
+    // even though panel_list_nodes worked. So on an unreachable signal from a
+    // non-legacy dialect, retry the SUBMIT via the legacy dialect before
+    // surfacing the error. The fallback wraps ONLY the enqueue: if the submit
+    // already succeeded, a later queue/start failure must NOT re-submit.
+    let dialect = detected;
+    let submitted;
+    try {
+      submitted = await submitInstall(dialect);
+    } catch (err) {
+      if (dialect === "legacy" || !isManagerUnreachable(err)) throw err;
+      dialect = "legacy";
+      submitted = await submitInstall("legacy");
     }
+    // The submission landed. NOW start the queue on the SAME (possibly
+    // fallen-back) dialect. queue/start goes through managerQueueControl so a
+    // GET-only 3.x build negotiates POST→GET on HTTP 405 instead of failing the
+    // install (#486). A start failure here is surfaced as-is — the install is
+    // already queued, so re-running the submit would double-fire it.
+    await managerQueueControl(dialect === "legacy" ? managerCall : managerV2, "manager/queue/start");
+    const { target, batchFailed } = submitted;
     // Resolve the true outcome. Throw ONLY on positive failure evidence; an
     // inconclusive result returns an honest unverified status (never a silent
     // success, never a false failure). #232 + codex rounds 1-2.
