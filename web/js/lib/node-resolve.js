@@ -46,28 +46,74 @@ export function comfyNodeDefsLoaded(registry) {
   );
 }
 
+// POSITIVE allowlist of genuinely FRONTEND-ONLY / native node types — nodes that a
+// frontend extension (or litegraph itself) registers WITHOUT any /object_info-derived
+// backend def BY DESIGN. This is the load-bearing #458-safe marker: absence of
+// `nodeData` ALONE is NOT a safe signal, because a REMOVED backend pack can leave a
+// DEFLESS husk registered in the frontend (e.g. its JS registered a bare class, or a
+// replacement stripped nodeData) — trusting "defless" there would fabricate success on
+// a node the backend no longer defines (the exact #458 hole). Membership here is the
+// POSITIVE signal that distinguishes a genuine frontend-native from a removed-backend
+// husk. A type NOT on this list that is absent from fresh /object_info still FAILS
+// CLOSED, even if its registered class is defless. New frontend-only nodes must be
+// added here explicitly (safe default = refuse). rgthree's Power Lora Loader / Context
+// are NOT here — they DO have backend defs, so a removed one must still fail closed.
+export const FRONTEND_ONLY_NODE_TYPES = new Set([
+  // ComfyUI / litegraph native frontend nodes (no backend def by design).
+  "Note",
+  "MarkdownNote",
+  "Reroute",
+  "PrimitiveNode",
+  // rgthree FRONTEND-ONLY control nodes (bypass/mute toggles, labels, reroutes) — pure
+  // litegraph, never enumerated by /object_info.
+  "Fast Bypasser (rgthree)",
+  "Fast Muter (rgthree)",
+  "Fast Groups Bypasser (rgthree)",
+  "Fast Groups Muter (rgthree)",
+  "Label (rgthree)",
+  "Reroute (rgthree)",
+  "Node Collector (rgthree)",
+]);
+
 /**
- * True for a genuinely FRONTEND-ONLY / native node type — one an extension
- * registered in the live LiteGraph registry WITHOUT any /object_info-derived
- * backend def (rgthree "Fast Bypasser (rgthree)", "Fast Muter (rgthree)", and
- * native litegraph nodes like Note / Reroute / PrimitiveNode). These legitimately
- * have NO /object_info entry, so a set_widget on one must NOT be refused merely for
- * being absent from the backend registry (#475).
+ * True for a genuinely FRONTEND-ONLY / native node type — one that is registered in
+ * the live LiteGraph registry AND is on the POSITIVE frontend-only allowlist
+ * (FRONTEND_ONLY_NODE_TYPES). These legitimately have NO /object_info entry, so a
+ * set_widget on one must NOT be refused merely for being absent from the backend
+ * registry (#475).
  *
- * The distinguishing signal is the registered class's `nodeData`: ComfyUI's
- * registerNodesFromDefs mints a per-type class and stamps `class.nodeData = def`
- * for every BACKEND node, so a backend-derived class ALWAYS carries nodeData. A
- * frontend-only node is registered by an extension via LiteGraph.registerNodeType
- * with NO such def, so its registered class has NO nodeData. Crucially, a REMOVED
- * backend node keeps a STALE-POSITIVE registered class that STILL carries its old
- * nodeData (the tab was never reloaded after the pack was uninstalled) — so this
- * returns FALSE for it and the #458 fail-closed guard still refuses the removed
- * type. Mirrors the same nodeData probe assertResolvedTargetRegistered already uses
- * to trust native/defless types.
+ * #458 SAFETY (why the allowlist, not just "defless"): a REMOVED backend pack can
+ * leave a DEFLESS husk registered in the frontend registry, so keying "safe to write"
+ * SOLELY on the absence of `nodeData` would authorize a write to a node the backend no
+ * longer defines — reopening the fail-closed hole. The exemption therefore requires
+ * TWO independent positive signals, and any doubt fails closed:
+ *   1. RESERVED-NAMESPACE ALLOWLIST membership — the type is one of a fixed set of
+ *      ComfyUI/litegraph core built-ins (Note/Reroute/…) or vendor-namespaced frontend
+ *      nodes ("… (rgthree)"). These names are reserved by convention, so a third-party
+ *      backend pack does not legitimately register under them.
+ *   2. NO BACKEND-REGISTRATION PROVENANCE on the class. ComfyUI's registerNodesFromDefs
+ *      stamps BOTH `.nodeData` AND `.comfyClass` on every backend-derived class, so a
+ *      class bearing EITHER marker came from a backend def (a live pack, or a removed
+ *      pack whose stale class was not purged) and is NOT frontend-only — even if its
+ *      name collides with the allowlist. Only a class with NEITHER marker (a genuine
+ *      frontend/native registration) is exempted.
+ * A removed-backend type is refused by (1) (its arbitrary pack name is not reserved)
+ * and, when its stale class is retained, also by (2).
  */
+/** True when a node CLASS carries ComfyUI backend-registration provenance —
+ *  registerNodesFromDefs stamps BOTH `.nodeData` and `.comfyClass` on every
+ *  backend-derived class, so EITHER marker proves the class came from a backend def
+ *  (a live pack, or a removed pack's stale/unpurged class). A genuine frontend/native
+ *  registration carries neither. */
+export function hasBackendProvenance(ctor) {
+  return !!(ctor && (ctor.nodeData || ctor.comfyClass));
+}
+
 export function isFrontendOnlyRegisteredType(registry, type) {
   if (!isRegisteredNodeType(registry, type)) return false;
-  return !registry?.[type]?.nodeData;
+  if (typeof type !== "string" || !FRONTEND_ONLY_NODE_TYPES.has(type)) return false;
+  // Refuse anything carrying backend-registration provenance on the REGISTERED class.
+  return !hasBackendProvenance(registry[type]);
 }
 
 /**
@@ -199,19 +245,23 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
  * FRONTEND-ONLY EXEMPTION (#475): when object_info IS available (a real map was
  * fetched) but the type is simply ABSENT from it, the type is still permitted iff it
  * is a genuine frontend-only / native registered type (isFrontendOnlyRegisteredType:
- * registered in the live registry with NO backend-derived nodeData — rgthree Fast
- * Bypasser, Note, Reroute, …). Such a node's widget write is a reversible frontend
- * canvas edit and legitimately has no /object_info entry. This does NOT reopen the
- * #458 hole: a REMOVED backend node keeps a stale-positive class that STILL carries
- * nodeData, so it is NOT frontend-only and is still refused; and the exemption
- * applies ONLY when object_info was fetched — a genuinely UNVERIFIABLE type (fetch
- * unavailable, null map) always fails closed below, for every type.
+ * registered in the live registry AND on the POSITIVE frontend-only allowlist —
+ * rgthree Fast Bypasser, Note, Reroute, …). Such a node's widget write is a reversible
+ * frontend canvas edit and legitimately has no /object_info entry. This does NOT
+ * reopen the #458 hole: a REMOVED backend node (whether it keeps a stale-positive
+ * class WITH nodeData, or is left as a DEFLESS husk) is NOT on the allowlist and is
+ * still refused; and the exemption applies ONLY when object_info was fetched — a
+ * genuinely UNVERIFIABLE type (fetch unavailable, null map) always fails closed below,
+ * for every type.
  *
  * `opts.registry` is the live LiteGraph registry used to recognize a frontend-only
- * type; omit it to keep the strict backend-only behaviour.
+ * type; `opts.node` is the actual write-target node whose OWN constructor is also
+ * checked for backend provenance (a stale backend INSTANCE under a bare native class
+ * of the same name must not slip through). Omit `registry` to keep the strict
+ * backend-only behaviour.
  */
 export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknown)", opts = {}) {
-  const { registry } = opts;
+  const { registry, node } = opts;
   const label = typeof type === "string" ? ` ("${type}")` : "";
   if (!freshDefs || typeof freshDefs !== "object") {
     throw new Error(
@@ -222,12 +272,21 @@ export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknow
     );
   }
   if (typeof type !== "string" || !Object.prototype.hasOwnProperty.call(freshDefs, type)) {
-    // #475: object_info WAS fetched but lacks this type. Allow a genuine
-    // frontend-only / native registered node (defless registered class) — its
-    // widget write is a frontend canvas edit with no backend def by design. A
-    // removed backend node's stale-positive class still carries nodeData, so it is
-    // NOT exempted here and still fails closed.
-    if (registry && isFrontendOnlyRegisteredType(registry, type)) return;
+    // #475: object_info WAS fetched but lacks this type. Allow a genuine frontend-only
+    // / native node — reserved-namespace allowlisted AND with NO backend provenance on
+    // EITHER the registered class OR the write-target INSTANCE's own constructor. The
+    // instance check closes the reserved-name-collision + stale-backend-instance path:
+    // a node whose class_type collides with an allowlisted name but whose OWN
+    // constructor carries a backend def (nodeData/comfyClass) is a removed backend
+    // node, not a frontend-only one, and still fails closed. A removed backend node's
+    // arbitrary pack name is not allowlisted regardless.
+    if (
+      registry &&
+      isFrontendOnlyRegisteredType(registry, type) &&
+      !hasBackendProvenance(node?.constructor)
+    ) {
+      return;
+    }
     throw new Error(
       `Cannot set widget on node ${nodeId}${label}: the ComfyUI backend does not provide node ` +
         `type "${type}" (not installed, or its pack was removed) — refusing to write to a node ` +

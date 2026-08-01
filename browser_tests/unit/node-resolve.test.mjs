@@ -717,3 +717,123 @@ test("#475 set_widget: a frontend-only node with object_info UNAVAILABLE ⇒ FAI
   );
   assert.equal(node.widgets[0].value, true, "unverifiable ⇒ no write even for a frontend-only type");
 });
+
+// ---- #475 P0 (adversarial, #458 fail-closed): absence of nodeData ALONE must NOT
+//      authorize a write. A REMOVED backend pack can leave a DEFLESS HUSK registered;
+//      it is NOT on the frontend-only allowlist, so it must STILL fail closed. --------
+
+test("#475 P0: isFrontendOnlyRegisteredType — a DEFLESS husk NOT on the allowlist is NOT frontend-only (removed-backend husk stays refused)", () => {
+  // A removed backend pack's frontend registration left a bare (defless) class named
+  // "RemovedBackendNode". It is defless AND registered — but NOT allowlisted, so it is
+  // NOT treated as frontend-only. Only genuinely-known frontend types are.
+  const reg = loadedRegistry([], ["RemovedBackendNode", "Note"]);
+  assert.equal(isFrontendOnlyRegisteredType(reg, "RemovedBackendNode"), false, "defless husk is NOT frontend-only without a positive allowlist marker");
+  assert.equal(isFrontendOnlyRegisteredType(reg, "Note"), true, "an allowlisted native IS frontend-only");
+});
+
+test("#475 P0: assertTypeAgainstFreshBackend — a DEFLESS husk absent from object_info STILL fails closed (allowlist is the positive marker, not nodeData-absence)", () => {
+  const reg = loadedRegistry([], ["RemovedBackendNode"]); // registered, defless, NOT allowlisted
+  const fresh = objectInfo(); // backend no longer provides it
+  assert.throws(
+    () => assertTypeAgainstFreshBackend(fresh, "RemovedBackendNode", 9, { registry: reg }),
+    /backend does not provide/i,
+    "a defless husk must not be exempted merely for lacking nodeData (#458)",
+  );
+});
+
+test("#475 P0 set_widget: a REMOVED backend node left as a DEFLESS HUSK ⇒ FAIL CLOSED (no fabricated success)", async () => {
+  // The exact adversarial #458 case the naive `!nodeData` exemption reopened: the pack
+  // was uninstalled but its frontend registration survives as a bare defless class, and
+  // a live node of that type sits on the canvas. object_info no longer lists it. The
+  // write MUST be refused, not authorized+reported as success.
+  const reg = loadedRegistry();
+  const ctor = function DeflessHusk() {}; // NO nodeData — but also NOT allowlisted
+  reg["RemovedBackendNode"] = ctor;
+  const node = { id: 405, type: "RemovedBackendNode", widgets: [{ name: "steps", type: "INT", value: 20 }], constructor: ctor };
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "steps", 30, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // backend does NOT provide it
+        ...HOOKS,
+      }),
+    (err) => err instanceof Error && /backend does not provide/i.test(err.message),
+  );
+  assert.equal(node.widgets[0].value, 20, "a removed-backend defless husk is never mutated (#458 stays closed)");
+});
+
+test("#475 P0 provenance: an ALLOWLISTED name whose class carries BACKEND provenance (comfyClass, even with no nodeData) is NOT frontend-only (name-collision husk stays refused)", () => {
+  // Codex-adversarial: a removed backend pack that used a reserved allowlisted name
+  // (e.g. "MarkdownNote") and left a class WITHOUT nodeData but still bearing the
+  // registerNodesFromDefs `.comfyClass` marker must NOT be exempted by name alone.
+  const reg = loadedRegistry();
+  const husk = function MarkdownNoteHusk() {};
+  husk.comfyClass = "MarkdownNote"; // backend-registration provenance (no nodeData)
+  reg["MarkdownNote"] = husk;
+  assert.equal(
+    isFrontendOnlyRegisteredType(reg, "MarkdownNote"),
+    false,
+    "a backend-provenance class is not frontend-only even under an allowlisted name",
+  );
+  // And end-to-end: the write is refused, not fabricated as success.
+  const node = { id: 406, type: "MarkdownNote", widgets: [{ name: "text", type: "string", value: "x" }], constructor: husk };
+  return assert.rejects(
+    () =>
+      runSetWidget(node, "text", "y", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // backend does not provide MarkdownNote
+        beforeChange() {},
+        afterChange() {},
+        setDirty() {},
+      }),
+    /backend does not provide/i,
+  );
+});
+
+test("#475 P0 instance-provenance: a STALE BACKEND INSTANCE under an allowlisted name (bare registry class, but the INSTANCE constructor carries a backend def) ⇒ FAIL CLOSED", async () => {
+  // Codex round-3 path: the registry entry for "MarkdownNote" is a bare native class
+  // (passes the registry-class check), but the actual write-target NODE was created from
+  // a backend def and its OWN constructor still carries nodeData/comfyClass. That is a
+  // removed backend node, not a frontend-only one — the instance-provenance gate refuses
+  // it even though the registry class looks frontend-only.
+  const reg = loadedRegistry();
+  reg["MarkdownNote"] = function BareNative() {}; // bare registry class (looks frontend-only)
+  const backendCtor = function MarkdownNoteBackend() {};
+  backendCtor.nodeData = { input: { required: {} } }; // INSTANCE carries backend provenance
+  const node = {
+    id: 407,
+    type: "MarkdownNote",
+    widgets: [{ name: "text", type: "string", value: "x" }],
+    constructor: backendCtor,
+  };
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "text", "y", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // backend does NOT provide MarkdownNote
+        ...HOOKS,
+      }),
+    (err) => err instanceof Error && /backend does not provide/i.test(err.message),
+  );
+  assert.equal(node.widgets[0].value, "x", "a stale backend instance is never mutated (#458 stays closed)");
+});
+
+test("#475 instance-provenance: a GENUINE frontend-only node (bare instance constructor === bare registry class) is STILL writable", async () => {
+  // Guard against over-refusal: a real frontend node's instance constructor IS the bare
+  // registered class, so the instance-provenance gate passes and the write proceeds.
+  const reg = loadedRegistry();
+  const ctor = function FastBypasser() {}; // bare — no nodeData/comfyClass
+  reg["Fast Bypasser (rgthree)"] = ctor;
+  const node = { id: 408, type: "Fast Bypasser (rgthree)", widgets: [{ name: "Enabled", type: "toggle", value: true }], constructor: ctor };
+  const { set } = await runSetWidget(node, "Enabled", false, {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => objectInfo(),
+    ...HOOKS,
+  });
+  assert.equal(set.value, false);
+  assert.equal(node.widgets[0].value, false);
+});

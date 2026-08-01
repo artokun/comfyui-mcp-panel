@@ -1752,3 +1752,32 @@ test("#477 HARD FAIL: a callback that swaps `input.widget` to a NEW live same-na
   assert.equal(inner.widgets[0].value, 1280, "inner rolled back");
   assert.equal(railWidget.value, 1280, "rail rolled back");
 });
+
+test("#477 P1: after a rolled-back proxy-swap, the promotion TOPOLOGY (hostInput.widget) is restored to the ORIGINAL proxy (not left with the replacement wired)", () => {
+  // Atomic-rollback contract: a callback that swaps hostInput.widget to a replacement
+  // proxy is detected + thrown, AND the rollback must re-wire the original proxy — the
+  // replacement must not stay installed after a "clean" rollback.
+  const inner = { id: 257, type: "PrimitiveInt", widgets: [{ name: "value", type: "INT", value: 1280 }] };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "257" ? inner : null) };
+  const railWidget = { name: "value_2", type: "INT", value: 1280 };
+  const oldProxy = { name: "value_2", type: "INT", value: 1280 };
+  const newProxy = { name: "value_2", type: "INT", value: 1280 }; // replacement preloaded with OLD value
+  const hostInput = { name: "value_2", _widget: railWidget, widget: oldProxy, _subgraphSlot: { name: "value_2" } };
+  const parent = { id: 267, type: "SubgraphNode", subgraph, inputs: [hostInput], widgets: [railWidget, oldProxy, newProxy] };
+  inner.widgets[0].callback = () => {
+    hostInput.widget = newProxy; // swap the display proxy mid-write
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "value_2" ? { sourceNodeId: "257", sourceWidgetName: "value" } : null;
+
+  assert.throws(
+    () => applyWidgetWrite(parent, "value_2", 704, { resolveSource }),
+    (err) => err instanceof WidgetWriteError && /CHANGED during the write|partial state|promotion topology/.test(err.message),
+  );
+  // THE #477 P1 FIX: the host input's display-proxy reference is restored to oldProxy —
+  // the replacement is no longer wired to the outer node.
+  assert.equal(hostInput.widget, oldProxy, "hostInput.widget restored to the original proxy after rollback");
+  assert.equal(oldProxy.value, 1280, "original proxy holds its pre-write value");
+  assert.equal(inner.widgets[0].value, 1280, "inner rolled back");
+  assert.equal(railWidget.value, 1280, "rail rolled back");
+});

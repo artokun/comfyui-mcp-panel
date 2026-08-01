@@ -852,6 +852,13 @@ export function applyWidgetWrite(
   // while the render reads the stale entry. Snapshot it so the recheck can detect a
   // swap (#366).
   const promotedHostWidgetId = promotedHostInput ? promotedHostInput.widgetId : undefined;
+  // #477: snapshot the promotion TOPOLOGY (the host input's projection references), so
+  // a rollback restores not just the values but the WIRING. A callback can swap
+  // `hostInput.widget`/`_widget` to a live replacement proxy; the drift recheck catches
+  // it and throws, but without restoring these refs the replacement stays installed
+  // after a "clean" rollback — violating the atomic snapshot→verify→rollback contract.
+  const promotedHostWidgetRef = promotedHostInput ? promotedHostInput.widget : undefined;
+  const promotedHostProjectionRef = promotedHostInput ? promotedHostInput._widget : undefined;
 
   // The undo hooks are BOOKKEEPING (litegraph history). Invoke them exception-SAFE
   // so a throwing hook can never bypass our verification/rollback and leave a silent
@@ -994,12 +1001,24 @@ export function applyWidgetWrite(
     // a clean rollback.
     safeBefore();
     try {
-      // Restore the serialization BINDING first (the store key queue compilation
-      // reads), so restoring the rail value below lands on the entry that actually
-      // serializes — a callback may have re-pointed it to a different store entry.
+      // Restore the serialization BINDING + the promotion TOPOLOGY first (the store key
+      // queue compilation reads, and the projection references the outer node exposes),
+      // so restoring the rail value below lands on the entry that actually serializes and
+      // the original proxies are re-wired — a callback may have re-pointed the store entry
+      // OR swapped in a replacement proxy (#366/#477).
       if (promotedHostInput) {
         try {
           promotedHostInput.widgetId = promotedHostWidgetId;
+        } catch {
+          /* restore best-effort; read-back below is authoritative */
+        }
+        try {
+          promotedHostInput.widget = promotedHostWidgetRef;
+        } catch {
+          /* restore best-effort; read-back below is authoritative */
+        }
+        try {
+          promotedHostInput._widget = promotedHostProjectionRef;
         } catch {
           /* restore best-effort; read-back below is authoritative */
         }
@@ -1053,6 +1072,19 @@ export function applyWidgetWrite(
       rollbackFailed = rollbackFailed
         ? `${rollbackFailed} and the serialization binding (widgetId)`
         : `the serialization binding (widgetId)`;
+    }
+    // #477: the promotion TOPOLOGY (the host input's projection references) must be back
+    // to the originals too, else a callback-swapped replacement proxy stays wired to the
+    // outer node after a supposedly-clean rollback.
+    if (promotedHostInput && !Object.is(promotedHostInput.widget, promotedHostWidgetRef)) {
+      rollbackFailed = rollbackFailed
+        ? `${rollbackFailed} and the promotion topology (host input.widget)`
+        : `the promotion topology (host input.widget)`;
+    }
+    if (promotedHostInput && !Object.is(promotedHostInput._widget, promotedHostProjectionRef)) {
+      rollbackFailed = rollbackFailed
+        ? `${rollbackFailed} and the promotion topology (host input._widget)`
+        : `the promotion topology (host input._widget)`;
     }
     // On a TOPOLOGY DRIFT, the captured `parentWidget` we just restored may be
     // DETACHED — a callback could have swapped in a DIFFERENT live authoritative

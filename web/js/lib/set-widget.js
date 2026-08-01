@@ -157,12 +157,14 @@ export async function runSetWidget(
 
   if (authTarget && typeof authTarget.type === "string") {
     // Pass the live registry so a genuine FRONTEND-ONLY node (rgthree Fast Bypasser,
-    // Note, Reroute — registered but absent from /object_info by design) is permitted
-    // when object_info was fetched, WITHOUT reopening the #458 removed-type hole (a
-    // removed backend type keeps a stale-positive class WITH nodeData and is still
-    // refused; an unavailable object_info still fails closed for everything). #475.
+    // Note, Reroute — registered + on the POSITIVE frontend-only allowlist, absent from
+    // /object_info by design) is permitted when object_info was fetched, WITHOUT
+    // reopening the #458 removed-type hole (a removed backend type — stale class WITH
+    // nodeData OR a defless husk — is not allowlisted and is still refused; an
+    // unavailable object_info still fails closed for everything). #475.
     assertTypeAgainstFreshBackend(freshDefs, authTarget.type, authTarget.id, {
       registry: liveRegistry(),
+      node: authTarget,
     });
   }
 
