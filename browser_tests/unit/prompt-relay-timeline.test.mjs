@@ -19,6 +19,7 @@ import {
   normalizePromptRelayTimelineValue,
   parsePromptRelayTimeline,
   derivePromptRelayWidgets,
+  sameSegmentContent,
   promptRelayDerivedRefusal,
   applyPromptRelayTimelineWrite,
   PromptRelayTimelineWriteError,
@@ -296,8 +297,12 @@ test("MID-TYPING: an explicit segments write that DISCARDS in-flight text says s
 
   const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("agent set", 20)] }));
   assert.equal(res.merge_base, "editor");
-  assert.equal(res.overwrote_uncommitted_edit, "user was typing this | b");
-  assert.ok(res.warnings.some((w) => w.includes("UNCOMMITTED prompt edit")));
+  // Handed back PER SEGMENT, not as the lossy join, so the caller can actually restore it.
+  assert.deepEqual(res.overwrote_uncommitted_edit, {
+    prompts: ["user was typing this", "b"],
+    lengths: [24, 36],
+  });
+  assert.ok(res.warnings.some((w) => w.includes("UNCOMMITTED timeline edit")));
   assert.equal(widgets.local_prompts.value, "agent set");
 });
 
@@ -327,7 +332,10 @@ test("a PERSISTED #506 stale-master state discloses the timeline_data prompts it
 
   const res = relay(applyPromptRelayTimelineWrite(node, { zoom: 4 }));
   assert.equal(res.merge_base, "editor");
-  assert.equal(res.superseded_timeline_data, "raw write never applied");
+  assert.deepEqual(res.superseded_timeline_data, {
+    prompts: ["raw write never applied"],
+    lengths: [24],
+  });
   assert.ok(res.warnings.some((w) => w.includes("superseded_timeline_data")));
   assert.equal(widgets.local_prompts.value, "a | b");
   assert.equal(editor.timeline.zoom, 4);
@@ -338,7 +346,88 @@ test("a write that reproduces the timeline_data prompts reports no supersede", (
   widgets.timeline_data.value = JSON.stringify({ segments: [seg("wanted", 24)] });
   const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("wanted", 24)] }));
   assert.equal(res.superseded_timeline_data, undefined);
+  // The editor's own copy IS discarded by this write, and that is still disclosed.
+  assert.deepEqual(res.overwrote_uncommitted_edit, { prompts: ["a", "b"], lengths: [24, 36] });
   assert.equal(widgets.local_prompts.value, "wanted");
+});
+
+// ─── The lossy " | " join must never gate a data-loss disclosure ───
+
+test("PIPE COLLISION: an overwrite is disclosed even when the joined local_prompts is IDENTICAL", () => {
+  // The exact hazard the join hides. Persisted timeline is ["old", "c"]. During the 120ms
+  // debounce the user types segment 0 as the perfectly valid prompt "a | b", so the live editor
+  // holds ["a | b", "c"] and local_prompts is already "a | b | c". An incoming write supplies
+  // ["a", "b | c"] with the same lengths — a COMPLETELY different segmentation that joins to the
+  // SAME string. Gating on the join would report a clean success while the user's single
+  // authored prompt "a | b" was silently split into two different segment prompts.
+  const { node, widgets, editor } = makeRelayNode({
+    timelineSegments: [seg("old", 24), seg("c", 36)],
+  });
+  editor.timeline.segments[0].prompt = "a | b";
+  widgets.local_prompts.value = "a | b | c";
+  widgets.segment_lengths.value = "24, 36";
+
+  const res = relay(
+    applyPromptRelayTimelineWrite(node, { segments: [seg("a", 24), seg("b | c", 36)] }),
+  );
+
+  // Same join on both sides — the ONLY thing that distinguishes them is the segment structure.
+  assert.equal(res.local_prompts, "a | b | c");
+  assert.equal(derivePromptRelayWidgets(editor.timeline.segments).local_prompts, res.local_prompts);
+  assert.deepEqual(res.overwrote_uncommitted_edit, { prompts: ["a | b", "c"], lengths: [24, 36] });
+  assert.ok(res.warnings.some((w) => w.includes("UNCOMMITTED timeline edit")));
+});
+
+test("PIPE COLLISION mirror: genuinely identical segments report NO overwrite", () => {
+  // Same starting state, but the write reproduces the in-flight segments exactly. Nothing is
+  // lost, so the disclosure must stay silent — a structural compare, not a join compare, is the
+  // only thing that can tell these two cases apart.
+  const { node, widgets, editor } = makeRelayNode({
+    timelineSegments: [seg("old", 24), seg("c", 36)],
+  });
+  editor.timeline.segments[0].prompt = "a | b";
+  widgets.local_prompts.value = "a | b | c";
+  widgets.segment_lengths.value = "24, 36";
+
+  const res = relay(
+    applyPromptRelayTimelineWrite(node, { segments: [seg("a | b", 24), seg("c", 36)] }),
+  );
+  assert.equal(res.overwrote_uncommitted_edit, undefined);
+  // The stale timeline_data copy (["old","c"]) IS still set aside, and that is disclosed.
+  assert.deepEqual(res.superseded_timeline_data, { prompts: ["old", "c"], lengths: [24, 36] });
+});
+
+test("PIPE COLLISION: a length-only change is disclosed despite identical prompt joins", () => {
+  const { node, widgets, editor } = makeRelayNode({
+    timelineSegments: [seg("old", 24), seg("c", 36)],
+  });
+  editor.timeline.segments[0].prompt = "a | b";
+  widgets.local_prompts.value = "a | b | c";
+  widgets.segment_lengths.value = "24, 36";
+
+  const res = relay(
+    applyPromptRelayTimelineWrite(node, { segments: [seg("a | b", 90), seg("c", 36)] }),
+  );
+  assert.equal(res.local_prompts, "a | b | c");
+  assert.deepEqual(res.overwrote_uncommitted_edit, { prompts: ["a | b", "c"], lengths: [24, 36] });
+});
+
+test("sameSegmentContent compares structurally, never through the join", () => {
+  const A = [seg("a | b", 24), seg("c", 36)];
+  const B = [seg("a", 24), seg("b | c", 36)];
+  // Identical derived strings…
+  assert.equal(
+    derivePromptRelayWidgets(A).local_prompts,
+    derivePromptRelayWidgets(B).local_prompts,
+  );
+  // …but not the same content.
+  assert.equal(sameSegmentContent(A, B), false);
+  assert.equal(sameSegmentContent(A, [seg("a | b", 24), seg("c", 36)]), true);
+  // A numeric-string length matches its normalized number; a real change does not.
+  assert.equal(sameSegmentContent([{ prompt: "p", length: "24" }], [{ prompt: "p", length: 24 }]), true);
+  assert.equal(sameSegmentContent([{ prompt: "p", length: 24 }], [{ prompt: "p", length: 25 }]), false);
+  assert.equal(sameSegmentContent(A, A.slice(0, 1)), false);
+  assert.equal(sameSegmentContent(A, null), false);
 });
 
 test("MID-TYPING: a pending debounce commit AFTER our write is a no-op (no rollback)", () => {

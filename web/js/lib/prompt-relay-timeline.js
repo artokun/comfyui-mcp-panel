@@ -48,7 +48,10 @@
 // envelope before being replaced, so no prompt text ever disappears without the caller being
 // told — as is an UNCOMMITTED edit the user was still typing when the write landed
 // (`overwrote_uncommitted_edit`) and a timeline_data copy that lost to the editor
-// (`superseded_timeline_data`). Anything PromptRelay's python would encode differently from
+// (`superseded_timeline_data`). Both carry the prior prompts PER SEGMENT, and both are decided
+// by comparing segment ARRAYS (sameSegmentContent), never the derived `" | "` join, which is
+// lossy and would hide a real overwrite whenever a prompt contains a literal "|".
+// Anything PromptRelay's python would encode differently from
 // what the timeline shows (a blank prompt, a literal "|", padding whitespace) comes back as a
 // warning. The invariant: the panel never leaves the timeline saying A, the prompts saying B,
 // and the caller told nothing.
@@ -199,6 +202,12 @@ export function parsePromptRelayTimeline(raw) {
  *   segment_lengths = segments.map(s => s.length).join(", ")
  * Keeping this in ONE exported place means the production path and the tests agree, and any
  * drift from the pack is a one-line change here.
+ *
+ * THE JOIN IS LOSSY AND MUST NEVER DECIDE WHETHER CONTENT CHANGED. `" | "` is not an
+ * injection: `["a | b", "c"]` and `["a", "b | c"]` both join to `"a | b | c"`. It is only
+ * valid to compare a derived string against a WIDGET, because the widget itself stores nothing
+ * but the join — asking "is this widget consistent with this timeline?". Asking "did the user's
+ * segments change?" requires the STRUCTURAL comparison in sameSegmentContent().
  */
 export function derivePromptRelayWidgets(segments) {
   const segs = Array.isArray(segments) ? segments : [];
@@ -363,6 +372,37 @@ function timelineWarnings(segments) {
   return warnings;
 }
 
+/**
+ * Do two segment lists carry the SAME user content? Compared element-by-element on the fields
+ * that hold authored data — never through `derivePromptRelayWidgets`, whose `" | "` join is
+ * lossy: `["a | b", "c"]` and `["a", "b | c"]` produce an identical `local_prompts` while being
+ * completely different timelines. Every "did the content change?" decision goes through here,
+ * so a prompt containing a literal "|" can never make a real overwrite look like a no-op.
+ * Lengths are compared as strings so a numeric-string base ("24") matches a normalized 24 and
+ * two NaNs match, without NaN !== NaN reporting a phantom difference.
+ */
+export function sameSegmentContent(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i]?.prompt !== b[i]?.prompt) return false;
+    if (String(a[i]?.length) !== String(b[i]?.length)) return false;
+  }
+  return true;
+}
+
+/**
+ * A RECOVERABLE snapshot of a segment list for the result envelope: the authored prompt
+ * strings themselves, per segment, plus their lengths. Deliberately NOT the joined
+ * `local_prompts` — handing back `"a | b | c"` for a timeline whose real segments were
+ * `["a | b", "c"]` would tell the caller their text was lost without telling them what it was.
+ */
+function contentSnapshot(segments) {
+  return {
+    prompts: segments.map((s) => (typeof s?.prompt === "string" ? s.prompt : "")),
+    lengths: segments.map((s) => s?.length),
+  };
+}
+
 /** Locate a widget by name on a LiteGraph node. */
 function findWidget(node, name) {
   const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
@@ -488,7 +528,7 @@ export function applyPromptRelayTimelineWrite(
   // RE-RECONCILE of the node's existing timeline — which is also the repair path for a node
   // that is already desynced — and is refused only when there is no current timeline to keep.
   const editor = typeof getEditor === "function" ? getEditor(node) : node?._timelineEditor;
-  const { base, baseSource, fromWidget } = chooseMergeBase(editor, widgets);
+  const { base, baseSource, fromWidget, fromEditor } = chooseMergeBase(editor, widgets);
   const merged = base ? { ...base, ...overlay } : { ...overlay };
   const segments = normalizeSegments(merged, Array.isArray(base?.segments) ? base.segments : null);
   const finalTimeline = { ...merged, segments };
@@ -513,42 +553,43 @@ export function applyPromptRelayTimelineWrite(
   const timelineJson = JSON.stringify(finalTimeline);
   const warnings = timelineWarnings(segments);
 
-  // chooseMergeBase only falls back to the editor when the timeline_data widget has gone
-  // stale, which means a prompt edit was IN FLIGHT (typed into the node's prompt box, not yet
-  // committed). Merging preserves it — but a caller who supplies `segments` REPLACES the list,
-  // and that legitimately discards the in-flight text. That is the caller's stated intent, so
-  // it is applied rather than refused, but it is never left silent.
+  // The node keeps TWO copies of the timeline (the editor's in-memory one and the
+  // timeline_data widget), and either can be the current one — see chooseMergeBase. When they
+  // agree there is nothing hidden: the caller read the node, and discarding the old content is
+  // exactly what they asked for. When they DISAGREE the node is in an anomalous state and one
+  // copy holds content the caller may never have seen — an edit still being typed, or prompts a
+  // raw timeline_data write left behind (the #506 state itself). So whenever the two copies
+  // diverge, any copy this write does not reproduce is handed back.
+  //
+  // Every comparison here is STRUCTURAL (sameSegmentContent), never the derived join. Gating on
+  // the joined local_prompts would miss a real overwrite whenever a prompt contains a literal
+  // "|": the persisted pair ["old","c"], an in-flight edit turning segment 0 into "a | b", and
+  // an incoming write of ["a","b | c"] all reduce to the SAME string "a | b | c" while being
+  // three different timelines.
+  const editorSegs = Array.isArray(fromEditor?.segments) ? fromEditor.segments : null;
+  const widgetSegs = Array.isArray(fromWidget?.segments) ? fromWidget.segments : null;
+  const copiesDiverge = !!editorSegs && !!widgetSegs && !sameSegmentContent(editorSegs, widgetSegs);
+
   const overwroteInFlight =
-    baseSource === "editor" && baseDerived && baseDerived.local_prompts !== derived.local_prompts
-      ? baseDerived.local_prompts
-      : null;
-  if (overwroteInFlight !== null) {
+    copiesDiverge && !sameSegmentContent(editorSegs, segments) ? contentSnapshot(editorSegs) : null;
+  if (overwroteInFlight) {
     warnings.push(
-      `this node had an UNCOMMITTED prompt edit in progress (text typed into the node's prompt box ` +
-        `that had not yet reached timeline_data). The segments you supplied REPLACED it; the text ` +
-        `that was in flight is returned as "overwrote_uncommitted_edit". Re-read the node and write ` +
-        `again if you meant to keep it.`,
+      `this node held an UNCOMMITTED timeline edit — the live editor's segments (what the node ` +
+        `would execute right now) did not match its timeline_data, typically text typed into the ` +
+        `prompt box that had not yet been committed. The segments you supplied REPLACED it. The ` +
+        `prompts that were in flight are returned PER SEGMENT as ` +
+        `"overwrote_uncommitted_edit.prompts" — write those back if you meant to keep them.`,
     );
   }
 
-  // Deferring to the editor also means the timeline_data widget's OWN copy was set aside. Two
-  // states look identical from here: the widget is merely a pre-keystroke snapshot (normal), or
-  // it holds prompts a raw timeline_data write put there that never reached the editor — the
-  // #506 state itself, e.g. a workflow touched by an older panel. The editor copy wins because
-  // it is what the node would EXECUTE right now, but the prompts being set aside are handed
-  // back either way rather than disappearing.
-  const supersededMaster =
-    baseSource === "editor" && fromWidget
-      ? derivePromptRelayWidgets(fromWidget.segments).local_prompts
-      : null;
   const supersededTimelineData =
-    supersededMaster !== null && supersededMaster !== derived.local_prompts ? supersededMaster : null;
-  if (supersededTimelineData !== null) {
+    copiesDiverge && !sameSegmentContent(widgetSegs, segments) ? contentSnapshot(widgetSegs) : null;
+  if (supersededTimelineData) {
     warnings.push(
-      `the node's timeline_data widget held DIFFERENT prompts from the timeline editor, and the ` +
-        `editor's copy was used because it is what the node would execute right now. The prompts ` +
-        `that timeline_data held are returned as "superseded_timeline_data" — if those were the ones ` +
-        `you wanted, write them explicitly as "${PROMPT_RELAY_MASTER_WIDGET}" segments.`,
+      `the node's timeline_data widget held DIFFERENT segments from the timeline editor, and your ` +
+        `write did not reproduce them. They are returned PER SEGMENT as ` +
+        `"superseded_timeline_data.prompts" — if those were the prompts you wanted, write them ` +
+        `explicitly as "${PROMPT_RELAY_MASTER_WIDGET}" segments.`,
     );
   }
   if (Object.keys(replaced).length) {
@@ -614,8 +655,8 @@ export function applyPromptRelayTimelineWrite(
       local_prompts: derived.local_prompts,
       segment_lengths: derived.segment_lengths,
       ...(Object.keys(replaced).length ? { replaced_out_of_band: replaced } : {}),
-      ...(overwroteInFlight !== null ? { overwrote_uncommitted_edit: overwroteInFlight } : {}),
-      ...(supersededTimelineData !== null ? { superseded_timeline_data: supersededTimelineData } : {}),
+      ...(overwroteInFlight ? { overwrote_uncommitted_edit: overwroteInFlight } : {}),
+      ...(supersededTimelineData ? { superseded_timeline_data: supersededTimelineData } : {}),
       ...(uiRefreshError ? { ui_refresh_error: uiRefreshError } : {}),
       ...(warnings.length ? { warnings } : {}),
     },
