@@ -46,6 +46,161 @@ export function comfyNodeDefsLoaded(registry) {
   );
 }
 
+// POSITIVE allowlist of genuinely FRONTEND-ONLY / native node types — nodes that a
+// frontend extension (or litegraph itself) registers WITHOUT any /object_info-derived
+// backend def BY DESIGN. This is the load-bearing #458-safe marker: absence of
+// `nodeData` ALONE is NOT a safe signal, because a REMOVED backend pack can leave a
+// DEFLESS husk registered in the frontend (e.g. its JS registered a bare class, or a
+// replacement stripped nodeData) — trusting "defless" there would fabricate success on
+// a node the backend no longer defines (the exact #458 hole). Membership here is the
+// POSITIVE signal that distinguishes a genuine frontend-native from a removed-backend
+// husk. A type NOT on this list that is absent from fresh /object_info still FAILS
+// CLOSED, even if its registered class is defless. New frontend-only nodes must be
+// added here explicitly (safe default = refuse). rgthree's Power Lora Loader / Context
+// are NOT here — they DO have backend defs, so a removed one must still fail closed.
+export const FRONTEND_ONLY_NODE_TYPES = new Set([
+  // ComfyUI / litegraph native frontend nodes (no backend def by design).
+  "Note",
+  "MarkdownNote",
+  "Reroute",
+  "PrimitiveNode",
+  // rgthree FRONTEND-ONLY control nodes (bypass/mute toggles, labels, reroutes) — pure
+  // litegraph, never enumerated by /object_info.
+  "Fast Bypasser (rgthree)",
+  "Fast Muter (rgthree)",
+  "Fast Groups Bypasser (rgthree)",
+  "Fast Groups Muter (rgthree)",
+  "Label (rgthree)",
+  "Reroute (rgthree)",
+  "Node Collector (rgthree)",
+]);
+
+/**
+ * True for a genuinely FRONTEND-ONLY / native node type — one that is registered in
+ * the live LiteGraph registry AND is on the POSITIVE frontend-only allowlist
+ * (FRONTEND_ONLY_NODE_TYPES). These legitimately have NO /object_info entry, so a
+ * set_widget on one must NOT be refused merely for being absent from the backend
+ * registry (#475).
+ *
+ * #458 SAFETY (why the allowlist, not just "defless"): a REMOVED backend pack can
+ * leave a DEFLESS husk registered in the frontend registry, so keying "safe to write"
+ * SOLELY on the absence of `nodeData` would authorize a write to a node the backend no
+ * longer defines — reopening the fail-closed hole. The exemption therefore requires
+ * TWO independent positive signals, and any doubt fails closed:
+ *   1. RESERVED-NAMESPACE ALLOWLIST membership — the type is one of a fixed set of
+ *      ComfyUI/litegraph core built-ins (Note/Reroute/…) or vendor-namespaced frontend
+ *      nodes ("… (rgthree)"). These names are reserved by convention, so a third-party
+ *      backend pack does not legitimately register under them.
+ *   2. NO BACKEND-REGISTRATION PROVENANCE on the class. ComfyUI's registerNodesFromDefs
+ *      stamps BOTH `.nodeData` AND `.comfyClass` on every backend-derived class, so a
+ *      class bearing EITHER marker came from a backend def (a live pack, or a removed
+ *      pack whose stale class was not purged) and is NOT frontend-only — even if its
+ *      name collides with the allowlist. Only a class with NEITHER marker (a genuine
+ *      frontend/native registration) is exempted.
+ * A removed-backend type is refused by (1) (its arbitrary pack name is not reserved)
+ * and, when its stale class is retained, also by (2).
+ */
+/** True when a node CLASS carries ComfyUI backend-registration provenance —
+ *  registerNodesFromDefs stamps BOTH `.nodeData` and `.comfyClass` on every
+ *  backend-derived class, so EITHER marker proves the class came from a backend def
+ *  (a live pack, or a removed pack's stale/unpurged class). A genuine frontend/native
+ *  registration carries neither. */
+export function hasBackendProvenance(ctor) {
+  return !!(ctor && (ctor.nodeData || ctor.comfyClass));
+}
+
+export function isFrontendOnlyRegisteredType(registry, type) {
+  if (!isRegisteredNodeType(registry, type)) return false;
+  if (typeof type !== "string" || !FRONTEND_ONLY_NODE_TYPES.has(type)) return false;
+  // Refuse anything carrying backend-registration provenance on the REGISTERED class.
+  return !hasBackendProvenance(registry[type]);
+}
+
+/**
+ * Positive signal that `node` is a genuine VIRTUAL SUBGRAPH CONTAINER — a litegraph
+ * SubgraphNode. Prefers the UPSTREAM identity markers ComfyUI_frontend's SubgraphNode
+ * exposes (`isVirtualNode === true`, `isSubgraphNode()`), falling back to a REAL nested
+ * graph (`.subgraph` exposing `_nodes`/`getNodeById`), NOT a bare `subgraph:{}` marker.
+ *
+ * NOTE: container SHAPE alone is client-forgeable and is NOT the fail-closed trust root
+ * for #458 — the OBSERVED-BACKEND-HISTORY gate (wasTypeEverDefined) is. This is one
+ * defense-in-depth signal (distinguishing a container from a leaf) layered on top.
+ */
+export function isVirtualSubgraphContainer(node) {
+  if (!node) return false;
+  if (node.isVirtualNode === true) return true;
+  if (typeof node.isSubgraphNode === "function") {
+    try {
+      if (node.isSubgraphNode()) return true;
+    } catch {
+      /* fall through to the structural check */
+    }
+  }
+  const sg = node.subgraph;
+  if (!sg || typeof sg !== "object") return false;
+  return Array.isArray(sg._nodes) || typeof sg.getNodeById === "function";
+}
+
+/**
+ * Fresh-authorize a node whose OWN widget / projection is ACTUALLY MUTATED by a
+ * graph_set_widget write — the OUTER subgraph parent (its rail/proxy widgets) and the
+ * IMMEDIATE inner promoted node (its widget) — NOT just the terminal traversal target
+ * (#458 nested-intermediate). A nested promotion mutates + reports success on the
+ * INTERMEDIATE virtual node, which is never the terminal `authTarget`, so it must be
+ * authorized independently.
+ *
+ * Fails CLOSED unless ONE of:
+ *   - the type is PRESENT in fresh /object_info (a live backend node); OR
+ *   - the type was NEVER seen in any /object_info this session (per wasTypeEverDefined,
+ *     the OBSERVED-BACKEND-HISTORY trust root) AND is a positive frontend-only signal:
+ *     a provenance-clean virtual subgraph container, or a frontend-only leaf.
+ *
+ * #458 EVER-SEEN GATE (the non-forgeable anchor): a type ABSENT from the CURRENT
+ * /object_info that WAS EVER reported by the backend this session is a REMOVED backend
+ * node → REFUSE. A client husk cannot un-see what the backend already reported, so this
+ * catches every removed-backend case — including one masquerading as a container or a
+ * pure-JS frontend class under a reserved allowlisted name — that client-side shape /
+ * name / provenance markers cannot. The provenance + container-shape checks remain as
+ * DEFENSE-IN-DEPTH for the never-seen case, never as the sole gate. A null/unavailable
+ * fresh map fails closed.
+ */
+export function assertMutatedNodeAuthorized(freshDefs, registry, node, role = "target", wasTypeEverDefined) {
+  const type = node?.type;
+  const id = node?.id ?? "(unknown)";
+  const label = typeof type === "string" ? ` ("${type}")` : "";
+  if (!freshDefs || typeof freshDefs !== "object") {
+    throw new Error(
+      `Cannot set widget on node ${id}${label}: cannot verify the ${role} node against the ` +
+        `ComfyUI backend (object_info is unavailable). Refusing to write rather than trust a ` +
+        `possibly-stale node cache (#458).`,
+    );
+  }
+  // PRESENT in the fresh backend → a live node, authorized by presence.
+  if (typeof type === "string" && Object.prototype.hasOwnProperty.call(freshDefs, type)) return;
+  // ABSENT from fresh object_info. EVER-SEEN GATE: if the backend reported this type
+  // earlier this session, its backend was REMOVED — refuse (non-forgeable, #458).
+  if (typeof wasTypeEverDefined === "function" && typeof type === "string" && wasTypeEverDefined(type)) {
+    throw new Error(
+      `Cannot set widget on node ${id}${label}: the ${role} node type was defined by the ComfyUI ` +
+        `backend earlier this session but is ABSENT from the current /object_info — its backend was ` +
+        `removed (pack uninstalled/disabled). Refusing to write to a since-removed node (#458).`,
+    );
+  }
+  // NEVER seen this session → genuinely frontend-only/native. Permit only with a
+  // positive, provenance-clean signal (defense-in-depth on top of the ever-seen gate).
+  const provenanceClean =
+    !hasBackendProvenance(typeof type === "string" ? registry?.[type] : undefined) &&
+    !hasBackendProvenance(node?.constructor);
+  if (provenanceClean && isVirtualSubgraphContainer(node)) return;
+  if (registry && isFrontendOnlyRegisteredType(registry, type) && !hasBackendProvenance(node?.constructor)) return;
+  throw new Error(
+    `Cannot set widget on node ${id}${label}: the ${role} node is not defined by the ComfyUI ` +
+      `backend and is not a verifiable frontend-only / virtual-subgraph node (a removed or ` +
+      `unverifiable node type, or a backend node masquerading as a subgraph container) — ` +
+      `refusing to write (#458).`,
+  );
+}
+
 /**
  * Guard for graph_add_node: throw (mirroring the read-path hard error) when
  * `class_type` cannot be resolved against the live registry, distinguishing
@@ -171,8 +326,27 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
  *   - type absent from the fresh map ⇒ "backend does not provide" (removed pack).
  * Never authorizes from the stale registry. Pure — no side effects — so the caller
  * can run it on the exact target it is about to mutate, before any mutation.
+ *
+ * FRONTEND-ONLY EXEMPTION (#475): when object_info IS available (a real map was
+ * fetched) but the type is simply ABSENT from it, the type is still permitted iff it
+ * is a genuine frontend-only / native registered type (isFrontendOnlyRegisteredType:
+ * registered in the live registry AND on the POSITIVE frontend-only allowlist —
+ * rgthree Fast Bypasser, Note, Reroute, …). Such a node's widget write is a reversible
+ * frontend canvas edit and legitimately has no /object_info entry. This does NOT
+ * reopen the #458 hole: a REMOVED backend node (whether it keeps a stale-positive
+ * class WITH nodeData, or is left as a DEFLESS husk) is NOT on the allowlist and is
+ * still refused; and the exemption applies ONLY when object_info was fetched — a
+ * genuinely UNVERIFIABLE type (fetch unavailable, null map) always fails closed below,
+ * for every type.
+ *
+ * `opts.registry` is the live LiteGraph registry used to recognize a frontend-only
+ * type; `opts.node` is the actual write-target node whose OWN constructor is also
+ * checked for backend provenance (a stale backend INSTANCE under a bare native class
+ * of the same name must not slip through). Omit `registry` to keep the strict
+ * backend-only behaviour.
  */
-export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknown)") {
+export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknown)", opts = {}) {
+  const { registry, node, wasTypeEverDefined } = opts;
   const label = typeof type === "string" ? ` ("${type}")` : "";
   if (!freshDefs || typeof freshDefs !== "object") {
     throw new Error(
@@ -183,6 +357,31 @@ export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknow
     );
   }
   if (typeof type !== "string" || !Object.prototype.hasOwnProperty.call(freshDefs, type)) {
+    // #458 EVER-SEEN GATE (the non-forgeable trust root): object_info WAS fetched but
+    // lacks this type. If the backend reported this type EARLIER this session, its
+    // backend was REMOVED (pack uninstalled) → refuse — even a pure-JS frontend class
+    // registered under a reserved allowlisted name (MarkdownNote from a removed pack)
+    // that carries no nodeData/comfyClass is caught here, because a client husk cannot
+    // un-see what the backend already reported. This is what the client-side allowlist +
+    // provenance markers CANNOT prove on their own.
+    if (typeof wasTypeEverDefined === "function" && typeof type === "string" && wasTypeEverDefined(type)) {
+      throw new Error(
+        `Cannot set widget on node ${nodeId}${label}: node type "${type}" was defined by the ComfyUI ` +
+          `backend earlier this session but is ABSENT from the current /object_info — its backend was ` +
+          `removed (pack uninstalled/disabled). Refusing to write to a since-removed node (#458).`,
+      );
+    }
+    // #475: NEVER seen this session → genuinely frontend-only/native. Allow a reserved-
+    // namespace allowlisted node with NO backend provenance on the registered class OR
+    // the write-target INSTANCE's own constructor (defense-in-depth on top of the
+    // ever-seen gate). A removed backend node's arbitrary pack name is not allowlisted.
+    if (
+      registry &&
+      isFrontendOnlyRegisteredType(registry, type) &&
+      !hasBackendProvenance(node?.constructor)
+    ) {
+      return;
+    }
     throw new Error(
       `Cannot set widget on node ${nodeId}${label}: the ComfyUI backend does not provide node ` +
         `type "${type}" (not installed, or its pack was removed) — refusing to write to a node ` +

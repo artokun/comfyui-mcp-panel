@@ -21,12 +21,14 @@ import {
   WidgetWriteError,
   resolvePromotedInnerTarget,
   followPromotionToConcrete,
+  collectPromotionIntermediates,
 } from "./widget-write.js";
 import { reconcileUnknownWidgetNames } from "./asset-staleness.js";
 import {
   preflightSetWidgetTarget,
   assertResolvedTargetRegistered,
   assertTypeAgainstFreshBackend,
+  assertMutatedNodeAuthorized,
 } from "./node-resolve.js";
 import { controlAfterGenerateWarning } from "./control-after-generate.js";
 import { uploadInputConfig, uploadInputAccepts, addComboOption } from "./input-asset.js";
@@ -39,6 +41,7 @@ export async function runSetWidget(
     registry = {},
     getRegistry,
     getFreshObjectInfo,
+    wasTypeEverDefined,
     resolveSource,
     canvas,
     beforeChange,
@@ -156,7 +159,20 @@ export async function runSetWidget(
   }
 
   if (authTarget && typeof authTarget.type === "string") {
-    assertTypeAgainstFreshBackend(freshDefs, authTarget.type, authTarget.id);
+    // Pass the live registry so a genuine FRONTEND-ONLY node (rgthree Fast Bypasser,
+    // Note, Reroute — registered + on the POSITIVE frontend-only allowlist, absent from
+    // /object_info by design) is permitted when object_info was fetched, WITHOUT
+    // reopening the #458 removed-type hole (a removed backend type — stale class WITH
+    // nodeData OR a defless husk — is not allowlisted and is still refused; an
+    // unavailable object_info still fails closed for everything). #475.
+    assertTypeAgainstFreshBackend(freshDefs, authTarget.type, authTarget.id, {
+      registry: liveRegistry(),
+      node: authTarget,
+      // #458 OBSERVED-BACKEND-HISTORY: a type ever reported by the backend this session
+      // but absent from the current /object_info is a REMOVED backend node — refuse
+      // (the non-forgeable trust root; client shape/name/markers cannot prove this).
+      wasTypeEverDefined,
+    });
   }
 
   // #458 stale-INSTANCE guard on the ULTIMATE CONCRETE node. applyWidgetWrite runs the
@@ -171,6 +187,31 @@ export async function runSetWidget(
   // target — single-level/direct — since applyWidgetWrite already checks it.)
   if (isResolvedPromotion && authTarget && authTarget !== resolvedTargetNode) {
     assertResolvedTargetRegistered(liveRegistry(), authTarget);
+  }
+
+  // #458 NESTED-INTERMEDIATE (found in adversarial review of #475): fresh-auth above
+  // authorizes only the TERMINAL concrete node (authTarget), but applyWidgetWrite
+  // actually MUTATES — and reports success on — the IMMEDIATE inner promoted node (its
+  // widget) AND the OUTER subgraph parent (its rail/proxy widgets). For a NESTED
+  // promotion the immediate inner is an INTERMEDIATE virtual node that is NOT the
+  // terminal, and it was previously trusted merely for being "defless with subgraph
+  // metadata" — the same defless≠safe mistake fixed at the terminal. Authorize EVERY
+  // mutated node: absent from fresh /object_info is permitted ONLY as a provenance-clean
+  // virtual-subgraph container (or frontend-only leaf), never a removed/stale backend
+  // node masquerading with a subgraph field.
+  if (isResolvedPromotion) {
+    // The OUTER subgraph parent (its rail/proxy widgets are mutated).
+    assertMutatedNodeAuthorized(freshDefs, liveRegistry(), node, "outer subgraph", wasTypeEverDefined);
+    // EVERY intermediate virtual container the promotion is driven THROUGH — not just
+    // the immediate inner. A deeper intermediate (A→B→C→concrete's C) is otherwise
+    // never authorized, so a removed-backend node forwarded-through would be trusted.
+    // Each must be present in fresh /object_info, or NEVER seen this session AND a
+    // provenance-clean virtual container; a since-removed (ever-seen) type is refused.
+    for (const intermediate of collectPromotionIntermediates(promotedResolution.target, resolveSource)) {
+      if (intermediate !== authTarget) {
+        assertMutatedNodeAuthorized(freshDefs, liveRegistry(), intermediate, "intermediate promoted", wasTypeEverDefined);
+      }
+    }
   }
 
   // (1) Preflight the OUTER node before ANY mutation; decide whether reconcile

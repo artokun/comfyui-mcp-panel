@@ -294,6 +294,56 @@ function monotonicNow() {
 // slot lifecycle, so this MUST NOT clear it. Reuses a caller-supplied /object_info
 // payload when present (graph_add_node passes the fresh defs it just validated
 // against, #289) so a single add never round-trips /object_info twice.
+// #458 OBSERVED-BACKEND-HISTORY (the non-forgeable trust root for frontend-only
+// authorization): the session-scoped set of every node class_type that has appeared in
+// ANY backend /object_info response during this session. Populated at every point a
+// real defs payload is obtained (registerComfyNodeDefs, the set_widget/add_node fresh
+// oracle, the full-object_info fetch, and the refresh_nodes path which flows through
+// registerComfyNodeDefs). A write to a type ABSENT from the CURRENT /object_info that
+// was EVER seen here is a REMOVED backend node (refuse, #458) — a client husk cannot
+// un-see what the backend already reported; a type NEVER seen is genuinely frontend-only.
+const seenObjectInfoTypes = new Set();
+function recordObjectInfoTypes(defs) {
+  if (defs && typeof defs === "object") {
+    for (const key of Object.keys(defs)) seenObjectInfoTypes.add(key);
+  }
+  return defs;
+}
+// True once at least ONE authoritative /object_info observation has been recorded as a
+// baseline (the startup seed, or a reconnect/refresh_nodes re-register). Until then the
+// ever-seen history is UNRELIABLE — a write must NOT decide "never seen" against it, so
+// wasTypeEverDefined below FAILS CLOSED (treats every absent-from-current type as
+// removed) while this is false. A seed FAILURE therefore never opens a hole (codex
+// round-10): it leaves this false, so absent types are refused, not allowed.
+let objectInfoHistorySeeded = false;
+// Resolves once the STARTUP baseline seed attempt sequence has finished (success or all
+// retries exhausted). graph_set_widget AWAITS this before authorizing.
+let objectInfoHistorySeed = Promise.resolve();
+function seedObjectInfoHistory() {
+  objectInfoHistorySeed = (async () => {
+    // Retry a transient getNodeDefs failure a few times (short backoff) so a flaky
+    // startup fetch self-heals BEFORE any pack could be removed mid-session. If the
+    // backend is genuinely down, all attempts fail and objectInfoHistorySeeded stays
+    // false → fail closed (and the write's own oracle also fails closed).
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        if (typeof api?.getNodeDefs === "function") {
+          const defs = await api.getNodeDefs();
+          if (defs && typeof defs === "object" && Object.keys(defs).length > 0) {
+            recordObjectInfoTypes(defs);
+            objectInfoHistorySeeded = true;
+            return;
+          }
+        }
+      } catch {
+        /* transient — retry below */
+      }
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+  })();
+  return objectInfoHistorySeed;
+}
+
 async function registerComfyNodeDefs(preloadedDefs) {
   // Trust the live combos for suppressing missing-asset candidates ONLY once the
   // combo refresh has ACTUALLY RUN and succeeded. If refreshComboInNodes is absent on
@@ -310,6 +360,14 @@ async function registerComfyNodeDefs(preloadedDefs) {
     let defs = preloadedDefs ?? null;
     if (!defs && typeof api?.getNodeDefs === "function") {
       defs = await api.getNodeDefs();
+    }
+    // Record observed backend history (#458 trust root) — covers reconnect, the forced
+    // refresh_nodes path, add_node payloads, and download-triggered refreshes. A valid
+    // payload here also establishes a reliable baseline (marks history seeded), so a
+    // reconnect after a failed startup seed restores the ever-seen gate to normal.
+    recordObjectInfoTypes(defs);
+    if (defs && typeof defs === "object" && Object.keys(defs).length > 0) {
+      objectInfoHistorySeeded = true;
     }
     // Re-register node definitions so newly installed/updated classes and their
     // current widget schemas are known to LiteGraph (#221/#171).
@@ -2995,7 +3053,8 @@ async function fetchObjectInfo() {
   });
   if (!res || !res.ok) throw new Error(`/object_info HTTP ${res ? res.status : "no response"}`);
   const txt = await res.text();
-  return txt ? JSON.parse(txt) : null;
+  // Record observed backend history (#458 trust root) from this authoritative fetch too.
+  return recordObjectInfoTypes(txt ? JSON.parse(txt) : null);
 }
 
 /** Start (or POST another control on) the Manager queue, negotiating the HTTP
@@ -5602,8 +5661,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // page-load registry lacks it, the defs are refreshed + re-registered so
     // LG.createNode works; a type the live backend does not provide fails closed.
     await assertAddNodeResolvableRefreshing(() => LG?.registered_node_types ?? {}, class_type, {
-      getFreshObjectInfo: () =>
-        typeof api?.getNodeDefs === "function" ? api.getNodeDefs() : null,
+      getFreshObjectInfo: async () =>
+        recordObjectInfoTypes(
+          typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null,
+        ),
       refresh: (defs) => refreshComfyNodeDefs(defs),
     });
     const node = LG.createNode(class_type);
@@ -6012,6 +6073,20 @@ const GRAPH_TOOL_EXECUTORS = {
         setDirty: () => graph.setDirtyCanvas(true, true),
       });
     }
+    // #458: WAIT for the startup baseline history seed to land before authorizing, so a
+    // write can never decide "never seen" against an un-seeded history — a pack present
+    // at page load that is removed mid-session is thus recorded before its removal and
+    // refused. If the startup seed did NOT establish a baseline (transient failure), try
+    // ONCE more here; if it still can't (backend down), objectInfoHistorySeeded stays
+    // false and wasTypeEverDefined fails CLOSED (absent types refused) — never allowed
+    // against an empty history (codex round-10). A backend that is up now succeeds and
+    // establishes the baseline for all currently-present types.
+    try {
+      await objectInfoHistorySeed;
+      if (!objectInfoHistorySeeded) await seedObjectInfoHistory();
+    } catch {
+      /* seed is best-effort; an unseeded history makes wasTypeEverDefined fail closed */
+    }
     // Delegate to the shared handler body (web/js/lib/set-widget.js) so this
     // production path and the unit tests run the IDENTICAL ordering: preflight →
     // reconcile-only-a-resolved-node → applyWidgetWrite with the resolved-target
@@ -6031,8 +6106,16 @@ const GRAPH_TOOL_EXECUTORS = {
       // the stale LiteGraph registry, which keeps a positive for an uninstalled pack
       // after a restart-without-reload. Mirrors graph_add_node.
       getRegistry: () => LG?.registered_node_types ?? {},
-      getFreshObjectInfo: () =>
-        typeof api?.getNodeDefs === "function" ? api.getNodeDefs() : null,
+      getFreshObjectInfo: async () =>
+        recordObjectInfoTypes(
+          typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null,
+        ),
+      // #458 OBSERVED-BACKEND-HISTORY trust root: a type absent from the CURRENT
+      // /object_info that the backend reported earlier this session is a REMOVED backend
+      // node — refuse (non-forgeable; client shape/name/provenance can't prove this).
+      // While the history is NOT reliably seeded, FAIL CLOSED (treat every absent type as
+      // ever-seen) so a failed/empty baseline never opens a hole (codex round-10).
+      wasTypeEverDefined: (t) => !objectInfoHistorySeeded || seenObjectInfoTypes.has(t),
       resolveSource: sourceForSubgraphInput,
       canvas: app.canvas,
       beforeChange: () => graph.beforeChange(),
@@ -19563,6 +19646,15 @@ function registerExtensionWhenReady(tries = 0) {
     // never persist a raw value here. See panelSettingsList() above.
     settings: panelSettingsList(),
     async setup() {
+      // #458 SEED OBSERVED-BACKEND-HISTORY at startup with the FULL baseline /object_info.
+      // This runs after ComfyUI's core has already fetched /object_info (extensions set
+      // up post-init), so it records every pack PRESENT at page load — BEFORE any of them
+      // can be removed later this session. Without this seed, a pack that existed at load
+      // and is uninstalled before the first panel-owned fetch would read as "never seen"
+      // and its since-removed node could be written. graph_set_widget AWAITS the seed
+      // (objectInfoHistorySeed) before authorizing, so no write decides against an empty
+      // history; the reconnect / refresh_nodes / fresh-oracle paths keep it current after.
+      seedObjectInfoHistory();
       const tabId = "comfyui-mcp.agent";
       let mounted = null; // { root, destroy }
 
