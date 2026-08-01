@@ -208,6 +208,7 @@ import {
   latestOpenReceipt,
   markOpenReceiptReplySent,
   summarizeOpenReceipt,
+  createSingleFlight,
 } from "./lib/open-outcome.js";
 import {
   classifyUndeliveredReply,
@@ -320,6 +321,11 @@ let activeWorkflowResyncEpoch = 0;
 // own (#433), which explains a matching `active` without our command ever running.
 const openReceipts = [];
 let openReceiptSeq = 0;
+// #402 / codex P2 — at most ONE outstanding staleness disk-read per workflow path. The
+// read is bounded by a deadline, but a deadline only stops US waiting: one of the two
+// read paths takes no AbortSignal, so without this a server that accepts requests and
+// never answers would leak a live request on every open of the same workflow.
+const staleReadFlight = createSingleFlight();
 // #508 — outcomes whose reply could NOT be written back. Replayed on the next socket and
 // summarized to the user, so a command that really ran is never silently swallowed.
 const lostReplies = createLostReplyJournal();
@@ -3032,18 +3038,22 @@ async function workflowExistsOnDisk(rawPath) {
  *  the frontend's own listing sync advances a workflow's `lastModified` without
  *  reloading its graph (which would defeat an mtime check) and timestamp-preserving
  *  writes would evade one. Fails safe (null ⇒ no false staleness). */
-async function workflowDiskContent(rawPath) {
+async function workflowDiskContent(rawPath, { signal } = {}) {
   try {
     if (!api || !rawPath) return null;
     // Prefer getUserData, but FALL BACK to fetchApi (mirrors workflowExistsOnDisk) so a
     // frontend that exposes only fetchApi — or where getUserData is momentarily absent —
     // still reads disk. Without this the read returned null and the staleness/overwrite
     // checks silently degraded (codex P2). null only for a genuinely unavailable api.
+    //
+    // `signal` (optional) lets a bounded caller CANCEL a read that outlived its deadline
+    // instead of leaving it running. It only reaches the fetchApi path — getUserData takes
+    // no options — which is why the bounded caller ALSO single-flights its reads.
     const res =
       typeof api.getUserData === "function"
         ? await api.getUserData(rawPath)
         : typeof api.fetchApi === "function"
-          ? await api.fetchApi(`/userdata/${encodeURIComponent(rawPath)}`)
+          ? await api.fetchApi(`/userdata/${encodeURIComponent(rawPath)}`, signal ? { signal } : undefined)
           : null;
     if (!res || res.status !== 200) return null;
     return await res.text();
@@ -7715,8 +7725,22 @@ const GRAPH_TOOL_EXECUTORS = {
     // long enough to turn into "disconnected mid-command … OUTCOME UNKNOWN". withDeadline
     // never rejects: a timeout degrades to the ALREADY-SUPPORTED honest `stale:"unknown"`,
     // exactly like an unreadable disk, and never to a false "fresh".
+      // codex P2 — the deadline stops US waiting; it cannot stop the REQUEST. So also
+      // (a) hand the read an AbortSignal and fire it when the budget expires, and
+      // (b) SINGLE-FLIGHT per workflow path, because one of the two read paths
+      // (api.getUserData) takes no signal at all. Together these cap the outstanding
+      // reads at one per workflow instead of leaking one per open against a server that
+      // accepts requests and never answers.
+      const readAbort = typeof AbortController === "function" ? new AbortController() : null;
       onDiskContent = wasOpen
-        ? await withDeadline(workflowDiskContent(target.path), OPEN_DISK_READ_BUDGET_MS, null)
+        ? await withDeadline(
+            staleReadFlight.run(target.path, () =>
+              workflowDiskContent(target.path, { signal: readAbort?.signal }),
+            ),
+            OPEN_DISK_READ_BUDGET_MS,
+            null,
+            { onTimeout: () => readAbort?.abort() },
+          )
         : null;
       // #442 defect 2 — RE-READ the file when it provably changed and nothing is at stake.
       // Re-check `isModified` HERE, immediately before deciding, rather than trusting the

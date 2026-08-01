@@ -53,7 +53,7 @@ export function withDeadline(
   promise,
   ms,
   fallback,
-  { setTimer = setTimeout, clearTimer = clearTimeout } = {},
+  { setTimer = setTimeout, clearTimer = clearTimeout, onTimeout } = {},
 ) {
   const settleValue = (v) => v;
   if (!Number.isFinite(ms) || ms <= 0) {
@@ -65,6 +65,15 @@ export function withDeadline(
     const timer = setTimer(() => {
       if (settled) return;
       settled = true;
+      // Give the caller a chance to CANCEL the underlying work (codex P2). Resolving the
+      // wrapper only stops US waiting — without this the request itself keeps running, so
+      // repeated opens against a server that accepts and never answers would pile up live
+      // requests behind a deadline that only ever looked like it bounded them.
+      try {
+        onTimeout?.();
+      } catch {
+        /* cancellation is best-effort — it must never change the deadline's outcome */
+      }
       resolve(fallback);
     }, ms);
     Promise.resolve(promise).then(
@@ -82,6 +91,52 @@ export function withDeadline(
       },
     );
   });
+}
+
+/**
+ * Coalesce concurrent work by key: while a call for `key` is outstanding, every further
+ * caller gets THAT promise instead of starting another.
+ *
+ * Why the staleness read needs it (codex P2): `withDeadline` stops us WAITING but cannot
+ * abort work it did not create, and one of the two disk-read paths (`api.getUserData`)
+ * takes no AbortSignal at all. Against a server that accepts requests and never answers,
+ * repeated opens of the same workflow would otherwise leave one live request behind each
+ * time. Single-flighting caps that at ONE outstanding read per workflow, whether or not
+ * cancellation is available.
+ */
+export function createSingleFlight() {
+  const inFlight = new Map();
+  return {
+    run(key, start) {
+      const existing = inFlight.get(key);
+      if (existing) return existing;
+      let tracked;
+      const done = () => {
+        if (inFlight.get(key) === tracked) inFlight.delete(key);
+      };
+      let started;
+      try {
+        started = Promise.resolve(start());
+      } catch (err) {
+        return Promise.reject(err);
+      }
+      tracked = started.then(
+        (v) => {
+          done();
+          return v;
+        },
+        (err) => {
+          done();
+          throw err;
+        },
+      );
+      inFlight.set(key, tracked);
+      return tracked;
+    },
+    size() {
+      return inFlight.size;
+    },
+  };
 }
 
 function textOrNull(v) {

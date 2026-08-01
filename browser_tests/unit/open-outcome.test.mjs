@@ -31,6 +31,7 @@ import {
   markOpenReceiptReplySent,
   summarizeOpenReceipt,
   receiptMatchesRequest,
+  createSingleFlight,
   receiptAnswersCommand,
   classifyOpenOutcome,
 } from "../../web/js/lib/open-outcome.js";
@@ -99,6 +100,69 @@ test("withDeadline clears its timer on the fast path (no dangling timer in a lon
 test("withDeadline with a non-positive/absent deadline still neutralizes rejection", async () => {
   assert.equal(await withDeadline(Promise.reject(new Error("x")), 0, "fb"), "fb");
   assert.equal(await withDeadline(Promise.reject(new Error("x")), NaN, "fb"), "fb");
+});
+
+test("codex P2: the deadline CANCELS the work it abandons, and a throwing hook cannot change the outcome", async () => {
+  let cancelled = 0;
+  assert.equal(
+    await withDeadline(new Promise(() => {}), 5, "unknown", { onTimeout: () => cancelled++ }),
+    "unknown",
+  );
+  assert.equal(cancelled, 1, "abandoning a read must cancel it, not leave it running");
+  // A throwing cancel hook must not corrupt the deadline's result.
+  assert.equal(
+    await withDeadline(new Promise(() => {}), 5, "unknown", {
+      onTimeout: () => {
+        throw new Error("abort failed");
+      },
+    }),
+    "unknown",
+  );
+  // …and a read that BEATS the deadline is never cancelled.
+  let late = 0;
+  assert.equal(await withDeadline(Promise.resolve("v"), 10000, null, { onTimeout: () => late++ }), "v");
+  assert.equal(late, 0);
+});
+
+test("codex P2: createSingleFlight caps concurrent reads at one per key and clears on settle", async () => {
+  const flight = createSingleFlight();
+  let starts = 0;
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const start = () => {
+    starts++;
+    return gate;
+  };
+  const a = flight.run("wf.json", start);
+  const b = flight.run("wf.json", start);
+  assert.equal(starts, 1, "a second caller must join the outstanding read, not start another");
+  assert.equal(a, b, "both callers share the same promise");
+  assert.equal(flight.size(), 1);
+  // A DIFFERENT key is independent (its own outstanding read, its own slot).
+  const otherPending = flight.run("other.json", () => {
+    starts++;
+    return new Promise(() => {});
+  });
+  assert.ok(otherPending);
+  assert.equal(starts, 2);
+  assert.equal(flight.size(), 2);
+  release("done");
+  assert.equal(await a, "done");
+  assert.equal(flight.size(), 1, "a settled key must be released so the next open can read again");
+  // A rejected read must also release its slot (and stay rejected for its waiters).
+  await assert.rejects(
+    flight.run("boom.json", () => Promise.reject(new Error("nope"))),
+    /nope/,
+  );
+  assert.equal(flight.size(), 1, "a rejected read must not hold its slot forever");
+  // A synchronously throwing starter must not occupy a slot either.
+  await assert.rejects(
+    flight.run("sync.json", () => {
+      throw new Error("sync boom");
+    }),
+    /sync boom/,
+  );
+  assert.equal(flight.size(), 1);
 });
 
 // --- the receipt journal --------------------------------------------------
@@ -290,9 +354,14 @@ test("#402 wiring: workflow_open BOUNDS the post-open disk read and never claims
   assert.ok(body, "workflow_open must exist");
   assert.match(
     body,
-    /withDeadline\(\s*workflowDiskContent\(target\.path\),\s*OPEN_DISK_READ_BUDGET_MS,\s*null\s*\)/,
+    /withDeadline\(\s*\n?\s*staleReadFlight\.run\(target\.path,[\s\S]{0,200}?OPEN_DISK_READ_BUDGET_MS,/,
     "the #442 staleness read must be bounded — the open already applied, so it must not park the reply",
   );
+  // codex P2: a deadline only stops US waiting. The read must also be cancellable and
+  // single-flighted, or a server that accepts and never answers leaks a request per open.
+  assert.match(body, /onTimeout: \(\) => readAbort\?\.abort\(\)/, "the deadline must cancel the read it abandoned");
+  assert.match(body, /staleReadFlight\.run\(target\.path/, "reads must be single-flighted per workflow path");
+  assert.match(body, /workflowDiskContent\(target\.path, \{ signal: readAbort\?\.signal \}\)/);
   // A null read must still land on the honest "unknown", never on a fresh claim.
   assert.match(body, /stale === "unknown"/, "a timed-out/unreadable disk read must degrade to stale:\"unknown\"");
   assert.ok(OPEN_DISK_READ_BUDGET_MS > 0 && OPEN_DISK_READ_BUDGET_MS <= 10000);
