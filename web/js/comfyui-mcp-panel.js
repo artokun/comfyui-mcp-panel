@@ -7445,7 +7445,12 @@ const GRAPH_TOOL_EXECUTORS = {
       // execution fact, `requested`/`resolved` prove WHICH workflow it was, and
       // `reply_sent:false` says the caller never heard the answer. A matching `active`
       // is NOT a substitute — after a reconnect the frontend restores a tab by itself.
-      // NO matching receipt ⇒ the honest verdict is UNDETERMINED, never "opened".
+      //
+      // CORRELATE BY `rid` (codex P1). The receipt's `rid` is the server-minted id of the
+      // command it belongs to; only an EXACT rid match makes it an answer about YOUR
+      // command. Selector equality is not enough — an earlier successful open of the SAME
+      // workflow would otherwise be read as proof that a LATER, dropped open ran.
+      // No correlating receipt ⇒ the honest verdict is UNDETERMINED, never "opened".
       ...(lastOpen ? { last_open: lastOpen } : {}),
       ...(activeMaybeStale
         ? { active_possibly_stale: true, stale_hint: activeStaleHint() }
@@ -7653,7 +7658,23 @@ const GRAPH_TOOL_EXECUTORS = {
     let reloaded = false;
     let reloadError = null;
     if (staleInfo.reload && !dirtyNow) {
+      // The clean sample above authorizes the load, but `loadGraphData` is AWAITED — if it
+      // yields before it replaces the graph, a canvas edit made in that window would be
+      // destroyed by a load the user never asked for (codex P1). Nobody requested this
+      // reload, so it must not be able to take work with it: freeze canvas interaction for
+      // the duration and restore it in a finally, whatever happens. Best-effort by design
+      // (the flag name is a LiteGraph detail that may move), so it NARROWS the window
+      // rather than proving it shut — which is why the last-instant `dirtyNow` re-check
+      // above stays, and why a dirty tab is never reloaded at all.
+      // Bound to a local whose name does NOT end in "s": the #268 frontend-contract
+      // scanner captures members off the workflow-service alias `s` with an unanchored
+      // `s\.` pattern, so `canvas.<member>` would be misread as a new workflow-SERVICE
+      // dependency. This is a LiteGraph canvas flag, not a workflow-service member.
+      const canvasView = app?.canvas;
+      const priorInteraction =
+        typeof canvasView?.allow_interaction === "boolean" ? canvasView.allow_interaction : null;
       try {
+        if (priorInteraction !== null) canvasView.allow_interaction = false;
         const diskGraph = JSON.parse(onDiskContent);
         // 4th arg associates the load with THIS tab (same as the repaint above), so the
         // on-disk graph replaces the tab's buffer in place instead of spawning a new
@@ -7677,16 +7698,21 @@ const GRAPH_TOOL_EXECUTORS = {
         } catch {
           /* getter-only — the stale flag simply re-reports until the next save */
         }
-        // A programmatic load dirties the change tracker; clear that so the re-read does
-        // not leave the tab looking edited (which would block an unforced close).
-        await clearSpuriousOpenModified(target);
         reloaded = true;
       } catch (err) {
         // NEVER claim a reload we did not complete — report the failure and leave the
         // caller with the honest `stale:true, reloaded:false`.
         reloadError = coerceMessageText(err?.message ?? err);
         console.warn("[comfyui-mcp-panel] workflow_open disk re-read failed:", reloadError);
+      } finally {
+        // Hand the canvas back on EVERY path — a throw here must never leave the user
+        // with a frozen graph.
+        if (priorInteraction !== null) canvasView.allow_interaction = priorInteraction;
       }
+      // A programmatic load dirties the change tracker; clear that so the re-read does not
+      // leave the tab looking edited (which would block an unforced close). Outside the
+      // interaction lock: it awaits a frame, and the canvas must be live by then.
+      if (reloaded) await clearSpuriousOpenModified(target);
     }
     const receipt = noteOpenAttempt({
       cmd: "workflow_open",

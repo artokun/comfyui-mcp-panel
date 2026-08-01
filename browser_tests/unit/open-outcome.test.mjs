@@ -31,6 +31,7 @@ import {
   markOpenReceiptReplySent,
   summarizeOpenReceipt,
   receiptMatchesRequest,
+  receiptAnswersCommand,
   classifyOpenOutcome,
 } from "../../web/js/lib/open-outcome.js";
 
@@ -137,6 +138,7 @@ test('#402 CORE: a matching `active` alone is NOT success — verdict stays "und
   // workflow as active, the agent's workflow_open drops mid-command and never ran.
   const v = classifyOpenOutcome({
     requested: "workflows/x.json",
+    rid: "rid-1",
     receipt: null,
     activeMatchesRequest: true,
     activeConfirmed: true,
@@ -145,36 +147,83 @@ test('#402 CORE: a matching `active` alone is NOT success — verdict stays "und
   assert.match(v.detail, /does NOT prove/i);
   assert.match(v.detail, /UNDETERMINED/);
   assert.equal(v.evidence.active_matches_request, true);
+  assert.equal(v.evidence.correlated_by_rid, false);
 });
 
-test("#402: a receipt for THIS request that applied ⇒ applied (authoritative)", () => {
+test("#402: THIS command's receipt, applied ⇒ applied (authoritative)", () => {
   const v = classifyOpenOutcome({
     requested: "workflows/x.json",
+    rid: "rid-1",
     receipt: receiptFor("workflows/x.json"),
     activeMatchesRequest: false,
     activeConfirmed: false,
   });
   assert.equal(v.outcome, "applied");
+  assert.equal(v.evidence.correlated_by_rid, true);
   assert.match(v.detail, /could not deliver the reply/);
 });
 
 test("#402: a receipt that FAILED ⇒ not_applied, carrying the real error (a true negative)", () => {
   const v = classifyOpenOutcome({
     requested: "workflows/x.json",
+    rid: "rid-1",
     receipt: receiptFor("workflows/x.json", { applied: false, error: "workflow service unavailable" }),
   });
   assert.equal(v.outcome, "not_applied");
   assert.match(v.detail, /workflow service unavailable/);
 });
 
-test("#570-class: ANOTHER workflow's receipt can never answer for this request", () => {
+test("#402 codex P1: an EARLIER open of the SAME workflow can never answer for a later command", () => {
+  // Command A opened x.json and succeeded. Command B asks for x.json again and is dropped
+  // BEFORE the executor ran, so it has no receipt of its own. Selector equality alone would
+  // read A's receipt as proof that B applied — the exact fabrication #402 must not produce.
   const v = classifyOpenOutcome({
     requested: "workflows/x.json",
+    rid: "rid-B",
+    receipt: receiptFor("workflows/x.json", { rid: "rid-A" }),
+    activeMatchesRequest: true,
+    activeConfirmed: true,
+  });
+  assert.equal(v.outcome, "undetermined");
+  assert.equal(v.evidence.correlated_by_rid, false);
+  assert.match(v.detail, /belongs to a DIFFERENT command/);
+  assert.equal(v.evidence.latest_receipt.rid, "rid-A", "the receipt is offered as evidence, not as the verdict");
+});
+
+test("#402 codex P1: with NO rid to correlate, the verdict is undetermined — never applied", () => {
+  const v = classifyOpenOutcome({
+    requested: "workflows/x.json",
+    receipt: receiptFor("workflows/x.json"),
+    activeMatchesRequest: true,
+    activeConfirmed: true,
+  });
+  assert.equal(v.outcome, "undetermined");
+});
+
+test("#570-class: ANOTHER workflow's receipt can never answer, even on a rid match", () => {
+  const v = classifyOpenOutcome({
+    requested: "workflows/x.json",
+    rid: "rid-1",
     receipt: receiptFor("workflows/OTHER.json"),
     activeMatchesRequest: true,
     activeConfirmed: true,
   });
-  assert.equal(v.outcome, "undetermined", "a receipt for a different workflow must not count");
+  assert.equal(v.outcome, "undetermined", "a rid match with a mismatched workflow must refuse, not answer");
+  assert.equal(receiptAnswersCommand(receiptFor("workflows/OTHER.json"), { requested: "workflows/x.json", rid: "rid-1" }), false);
+});
+
+test("receiptAnswersCommand demands an exact rid and rejects every weaker form", () => {
+  const r = receiptFor("workflows/x.json");
+  assert.equal(receiptAnswersCommand(r, { requested: "workflows/x.json", rid: "rid-1" }), true);
+  assert.equal(receiptAnswersCommand(r, { requested: "workflows/x.json" }), false, "no rid ⇒ no answer");
+  assert.equal(receiptAnswersCommand(r, { requested: "workflows/x.json", rid: "" }), false);
+  assert.equal(receiptAnswersCommand(r, { rid: "rid-1" }), true, "rid alone answers when no workflow is asserted");
+  assert.equal(receiptAnswersCommand(null, { rid: "rid-1" }), false);
+});
+
+test("the exported receipt summary carries the rid (without it nothing can correlate)", () => {
+  const s = summarizeOpenReceipt(receiptFor("workflows/x.json"), { now: 2000 });
+  assert.equal(s.rid, "rid-1");
 });
 
 test("receiptMatchesRequest accepts any RESOLVED identity form of the same open", () => {
@@ -235,6 +284,27 @@ test("#442 defect-2 wiring: the re-read is gated on a FRESH dirty re-check (no s
   assert.match(body, /conflict: true/, "stale + unsaved edits must surface a CONFLICT, not a silent pick");
   assert.match(body, /reloaded,/, "the reply must state whether the canvas was actually re-read");
   assert.match(body, /reloadError = coerceMessageText/, "a failed re-read must never be reported as reloaded");
+});
+
+test("#442 codex P1: the destructive re-read freezes canvas interaction and ALWAYS restores it", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const body = handlerBody(src, "async workflow_open({");
+  // The clean sample authorizes the load, but loadGraphData is awaited — an edit made
+  // while it yields would be destroyed by a reload nobody asked for.
+  const lockAt = body.indexOf("canvasView.allow_interaction = false;");
+  const loadAt = body.indexOf("await app.loadGraphData(diskGraph");
+  const restoreAt = body.indexOf("canvasView.allow_interaction = priorInteraction;");
+  assert.ok(lockAt !== -1 && loadAt !== -1 && restoreAt !== -1, "the load must be bracketed by an interaction lock");
+  assert.ok(lockAt < loadAt && loadAt < restoreAt, "lock → load → restore");
+  // The restore must live in a `finally`, so a throwing load can never strand a frozen canvas.
+  const tail = body.slice(loadAt, restoreAt + 200);
+  assert.match(tail, /\} finally \{[\s\S]*allow_interaction = priorInteraction;/, "the restore must be in a finally");
+  // …and only when we actually captured a boolean to restore.
+  assert.match(body, /typeof canvasView\?\.allow_interaction === "boolean"/);
+  // The local must NOT be named so that it ends in "s": the #268 contract scanner
+  // captures `s\.<member>` unanchored, so `canvas.allow_interaction` reads as a new
+  // workflow-SERVICE dependency and fails that gate.
+  assert.equal(/\bcanvas\.allow_interaction/.test(body), false);
 });
 
 test("#570 P0b: the #442 re-read must KEEP this tab's instance identity (no mid-open fork)", () => {

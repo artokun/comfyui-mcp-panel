@@ -176,6 +176,12 @@ export function summarizeOpenReceipt(receipt, { now = 0 } = {}) {
   return {
     seq: receipt.seq,
     cmd: receipt.cmd,
+    // The SERVER-MINTED command id this receipt belongs to. Exported deliberately: it is
+    // the ONLY thing that ties a receipt to a SPECIFIC dispatch. Selector equality is not
+    // enough — an earlier successful open of the same workflow would otherwise answer for
+    // a later command that never ran (codex P1). A consumer that cannot match this rid
+    // must treat the outcome as undetermined.
+    rid: receipt.rid,
     requested: receipt.requested,
     resolved: receipt.resolved,
     applied: receipt.applied,
@@ -187,7 +193,11 @@ export function summarizeOpenReceipt(receipt, { now = 0 } = {}) {
 
 /** Does `receipt` describe an attempt at `requested`? Matches on the RAW selector first
  *  (the exact string the caller sent), then on any resolved identity form — so a caller
- *  that asked by filename still recognizes a receipt resolved to a full path. */
+ *  that asked by filename still recognizes a receipt resolved to a full path.
+ *
+ *  NOT SUFFICIENT ON ITS OWN for a verdict: two commands can name the SAME workflow, so
+ *  this answers "is this receipt about that workflow?", never "is this receipt MINE?".
+ *  Use receiptAnswersCommand() for the latter. */
 export function receiptMatchesRequest(receipt, requested) {
   const want = textOrNull(requested);
   if (!receipt || !want) return false;
@@ -197,21 +207,48 @@ export function receiptMatchesRequest(receipt, requested) {
 }
 
 /**
- * The honest verdict for "did the open of `requested` happen?", from the panel's OWN
- * execution record. Never upgrades a guess to a success.
+ * Does `receipt` answer for THIS SPECIFIC dispatch? Requires the server-minted `rid` to
+ * match EXACTLY, and (belt and braces) the workflow to match too.
  *
- *  - "applied"      — a receipt for this request completed. Authoritative.
- *  - "not_applied"  — a receipt for this request FAILED. Authoritative; carries the error.
- *  - "undetermined" — no receipt for this request. This is the verdict EVEN WHEN the
- *                     requested workflow is currently active: after a backend reconnect
- *                     the frontend restores a tab by itself (#433), so a matching
- *                     `active` is fully explained without our command ever running.
- *                     The evidence is returned alongside so the caller can decide, but
- *                     the VERDICT stays "undetermined" — reporting "opened" here is the
- *                     fabrication #402 must never produce.
+ * Why the rid is mandatory (codex P1): selector equality alone lets an EARLIER command's
+ * receipt answer for a LATER one. Concretely — command A opens `x.json` and succeeds;
+ * command B asks for `x.json` again, is dropped BEFORE the executor ever runs, and a
+ * verifier reads the journal: A's receipt matches the selector, says `applied:true`, and
+ * B is reported as having opened. That is precisely the fabricated success #402 exists to
+ * prevent. Without a rid to correlate, the only truthful verdict is "undetermined".
+ */
+export function receiptAnswersCommand(receipt, { requested, rid } = {}) {
+  const wantRid = textOrNull(rid);
+  if (!receipt || !wantRid) return false;
+  if (receipt.rid !== wantRid) return false;
+  // A rid match with a MISMATCHED workflow means the journal is inconsistent — refuse
+  // rather than answer, so a mis-stamped receipt can never speak for another workflow.
+  const wantRequested = textOrNull(requested);
+  if (wantRequested && !receiptMatchesRequest(receipt, wantRequested)) return false;
+  return true;
+}
+
+/**
+ * The honest verdict for "did MY open (the dispatch identified by `rid`) happen?", from
+ * the panel's OWN execution record. Never upgrades a guess to a success.
+ *
+ *  - "applied"      — THIS command's receipt completed. Authoritative.
+ *  - "not_applied"  — THIS command's receipt FAILED. Authoritative; carries the error.
+ *  - "undetermined" — no receipt correlates to this command. This is the verdict in TWO
+ *                     important cases, and both would otherwise fabricate success:
+ *                       * the caller cannot supply a `rid`, or the journal's latest
+ *                         receipt belongs to a DIFFERENT dispatch — an earlier open of
+ *                         the SAME workflow must never answer for a later one (codex);
+ *                       * the requested workflow is currently active. After a backend
+ *                         reconnect the frontend restores a tab by itself (#433), so a
+ *                         matching `active` is fully explained without our command ever
+ *                         having run.
+ *                     The evidence is returned alongside so the caller can decide what to
+ *                     do, but the VERDICT stays "undetermined".
  */
 export function classifyOpenOutcome({
   requested,
+  rid,
   receipt,
   activeMatchesRequest = false,
   activeConfirmed = false,
@@ -219,8 +256,10 @@ export function classifyOpenOutcome({
   const evidence = {
     active_matches_request: Boolean(activeMatchesRequest),
     active_confirmed: Boolean(activeConfirmed),
+    correlated_by_rid: false,
   };
-  if (receiptMatchesRequest(receipt, requested)) {
+  if (receiptAnswersCommand(receipt, { requested, rid })) {
+    evidence.correlated_by_rid = true;
     if (receipt.applied) {
       return {
         outcome: "applied",
@@ -238,16 +277,28 @@ export function classifyOpenOutcome({
       evidence: { ...evidence, receipt: summarizeOpenReceipt(receipt) },
     };
   }
+  // Explain WHY it is undetermined, because the two reasons need different follow-ups —
+  // and because "a receipt exists for this workflow" is exactly the evidence a reader
+  // would otherwise over-read into a success.
+  const sameWorkflowOtherCommand = receiptMatchesRequest(receipt, requested);
   return {
     outcome: "undetermined",
     detail:
-      `The panel has no completed open on record for "${textOrNull(requested) ?? requested}". ` +
+      `The panel has no receipt correlating to this open of "${textOrNull(requested) ?? requested}". ` +
+      (sameWorkflowOtherCommand
+        ? "There IS a receipt for that workflow, but it belongs to a DIFFERENT command " +
+          "(or could not be correlated by command id), so it cannot answer for this one — " +
+          "an earlier open of the same workflow says nothing about whether this one ran. "
+        : "") +
       (activeMatchesRequest
         ? "That workflow IS the active canvas right now, but the frontend restores a tab on its " +
           "own after a reconnect, so that does NOT prove the requested open ran. "
         : "") +
       "Treat the outcome as UNDETERMINED and re-issue panel_open_workflow (opening an " +
       "already-open workflow is safe and idempotent) rather than assuming either result.",
-    evidence,
+    evidence: {
+      ...evidence,
+      ...(receipt ? { latest_receipt: summarizeOpenReceipt(receipt) } : {}),
+    },
   };
 }
