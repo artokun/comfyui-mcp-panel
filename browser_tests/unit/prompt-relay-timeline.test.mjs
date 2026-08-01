@@ -317,6 +317,30 @@ test("a normal (non-debounce) write never reports overwrote_uncommitted_edit", (
   assert.equal(res.overwrote_uncommitted_edit, undefined);
 });
 
+test("a PERSISTED #506 stale-master state discloses the timeline_data prompts it sets aside", () => {
+  // timeline_data holds prompts a raw write put there that never reached the editor (the #506
+  // state). The editor + derived widgets still hold the previous prompts, so the editor is what
+  // the node would execute and it wins — but the prompts in timeline_data are handed back.
+  const { node, widgets, editor } = makeRelayNode();
+  widgets.timeline_data.value = JSON.stringify({ segments: [seg("raw write never applied", 24)] });
+  assert.equal(widgets.local_prompts.value, "a | b"); // editor + derived still the old pair
+
+  const res = relay(applyPromptRelayTimelineWrite(node, { zoom: 4 }));
+  assert.equal(res.merge_base, "editor");
+  assert.equal(res.superseded_timeline_data, "raw write never applied");
+  assert.ok(res.warnings.some((w) => w.includes("superseded_timeline_data")));
+  assert.equal(widgets.local_prompts.value, "a | b");
+  assert.equal(editor.timeline.zoom, 4);
+});
+
+test("a write that reproduces the timeline_data prompts reports no supersede", () => {
+  const { node, widgets } = makeRelayNode();
+  widgets.timeline_data.value = JSON.stringify({ segments: [seg("wanted", 24)] });
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("wanted", 24)] }));
+  assert.equal(res.superseded_timeline_data, undefined);
+  assert.equal(widgets.local_prompts.value, "wanted");
+});
+
 test("MID-TYPING: a pending debounce commit AFTER our write is a no-op (no rollback)", () => {
   const { node, widgets, editor } = makeRelayNode();
   editor.timeline.segments[0].prompt = "in flight";

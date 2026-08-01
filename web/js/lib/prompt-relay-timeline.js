@@ -47,7 +47,8 @@
 // e.g. written with the #506 workaround), the pre-existing value is RETURNED in the result
 // envelope before being replaced, so no prompt text ever disappears without the caller being
 // told — as is an UNCOMMITTED edit the user was still typing when the write landed
-// (`overwrote_uncommitted_edit`). Anything PromptRelay's python would encode differently from
+// (`overwrote_uncommitted_edit`) and a timeline_data copy that lost to the editor
+// (`superseded_timeline_data`). Anything PromptRelay's python would encode differently from
 // what the timeline shows (a blank prompt, a literal "|", padding whitespace) comes back as a
 // warning. The invariant: the panel never leaves the timeline saying A, the prompts saying B,
 // and the caller told nothing.
@@ -411,13 +412,14 @@ function derivedMatchesWidgets(timeline, widgets) {
 function chooseMergeBase(editor, widgets) {
   const fromEditor = liveEditorTimeline(editor);
   const fromWidget = parsePromptRelayTimeline(widgets[PROMPT_RELAY_MASTER_WIDGET].value);
-  if (derivedMatchesWidgets(fromWidget, widgets)) return { base: fromWidget, baseSource: "timeline_data" };
-  if (derivedMatchesWidgets(fromEditor, widgets)) return { base: fromEditor, baseSource: "editor" };
+  const pick = (base, baseSource) => ({ base, baseSource, fromWidget, fromEditor });
+  if (derivedMatchesWidgets(fromWidget, widgets)) return pick(fromWidget, "timeline_data");
+  if (derivedMatchesWidgets(fromEditor, widgets)) return pick(fromEditor, "editor");
   // Neither agrees with what the node would execute: it is genuinely desynced. The master
   // field wins and the out-of-band text is reported back to the caller.
-  if (fromWidget) return { base: fromWidget, baseSource: "timeline_data" };
-  if (fromEditor) return { base: fromEditor, baseSource: "editor" };
-  return { base: null, baseSource: "none" };
+  if (fromWidget) return pick(fromWidget, "timeline_data");
+  if (fromEditor) return pick(fromEditor, "editor");
+  return pick(null, "none");
 }
 
 /** The refusal message for a DERIVED-widget write — explains why + points at timeline_data. */
@@ -486,7 +488,7 @@ export function applyPromptRelayTimelineWrite(
   // RE-RECONCILE of the node's existing timeline — which is also the repair path for a node
   // that is already desynced — and is refused only when there is no current timeline to keep.
   const editor = typeof getEditor === "function" ? getEditor(node) : node?._timelineEditor;
-  const { base, baseSource } = chooseMergeBase(editor, widgets);
+  const { base, baseSource, fromWidget } = chooseMergeBase(editor, widgets);
   const merged = base ? { ...base, ...overlay } : { ...overlay };
   const segments = normalizeSegments(merged, Array.isArray(base?.segments) ? base.segments : null);
   const finalTimeline = { ...merged, segments };
@@ -526,6 +528,27 @@ export function applyPromptRelayTimelineWrite(
         `that had not yet reached timeline_data). The segments you supplied REPLACED it; the text ` +
         `that was in flight is returned as "overwrote_uncommitted_edit". Re-read the node and write ` +
         `again if you meant to keep it.`,
+    );
+  }
+
+  // Deferring to the editor also means the timeline_data widget's OWN copy was set aside. Two
+  // states look identical from here: the widget is merely a pre-keystroke snapshot (normal), or
+  // it holds prompts a raw timeline_data write put there that never reached the editor — the
+  // #506 state itself, e.g. a workflow touched by an older panel. The editor copy wins because
+  // it is what the node would EXECUTE right now, but the prompts being set aside are handed
+  // back either way rather than disappearing.
+  const supersededMaster =
+    baseSource === "editor" && fromWidget
+      ? derivePromptRelayWidgets(fromWidget.segments).local_prompts
+      : null;
+  const supersededTimelineData =
+    supersededMaster !== null && supersededMaster !== derived.local_prompts ? supersededMaster : null;
+  if (supersededTimelineData !== null) {
+    warnings.push(
+      `the node's timeline_data widget held DIFFERENT prompts from the timeline editor, and the ` +
+        `editor's copy was used because it is what the node would execute right now. The prompts ` +
+        `that timeline_data held are returned as "superseded_timeline_data" — if those were the ones ` +
+        `you wanted, write them explicitly as "${PROMPT_RELAY_MASTER_WIDGET}" segments.`,
     );
   }
   if (Object.keys(replaced).length) {
@@ -592,6 +615,7 @@ export function applyPromptRelayTimelineWrite(
       segment_lengths: derived.segment_lengths,
       ...(Object.keys(replaced).length ? { replaced_out_of_band: replaced } : {}),
       ...(overwroteInFlight !== null ? { overwrote_uncommitted_edit: overwroteInFlight } : {}),
+      ...(supersededTimelineData !== null ? { superseded_timeline_data: supersededTimelineData } : {}),
       ...(uiRefreshError ? { ui_refresh_error: uiRefreshError } : {}),
       ...(warnings.length ? { warnings } : {}),
     },
