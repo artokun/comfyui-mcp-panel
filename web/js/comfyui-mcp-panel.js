@@ -111,6 +111,7 @@ import {
 import { assertAddNodeResolvableRefreshing } from "./lib/node-resolve.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
+import { todoItemGlyph } from "./lib/plan-glyph.js";
 import {
   resolveScope,
   describeScope,
@@ -10934,8 +10935,12 @@ function buildPanel() {
         const row = document.createElement("div");
         row.className = "cmcp-todo-item " + status;
         const icon = document.createElement("i");
-        icon.className =
-          "pi " + (status === "done" ? "pi-check-circle" : status === "active" ? "pi-spin pi-spinner" : "pi-circle");
+        // #492: the "active" step only SPINS while the agent is actually working.
+        // set_todo persists the plan on the thread, so a step left "active" when a
+        // turn ends (or is stopped) would otherwise keep its spinner turning forever
+        // — the box "shows activity when none is happening". Between turns / on idle
+        // the current step is a static filled dot ("you are here"), not motion.
+        icon.className = "pi " + todoItemGlyph(status, agentWorking);
         const txt = document.createElement("span");
         txt.textContent = (it && it.text) || "";
         row.append(icon, txt);
@@ -14492,6 +14497,9 @@ function buildPanel() {
     thinkingTokens = 0; // reset so the next turn doesn't show a stale count
     thinkingAction = null;
     thinkingReconnecting = false;
+    // #492: the plan tray's "active" spinner mirrors real agent activity — the
+    // turn just stopped (done / interrupt / disconnect), so repaint it static.
+    renderTray();
   }
 
   // A user-initiated local stop (Esc / Ctrl+C, or discarding the last turn).
@@ -14523,6 +14531,8 @@ function buildPanel() {
     cycleWord();
     if (!workWordTimer) workWordTimer = setInterval(cycleWord, 2600);
     ensureSafety(); // DOM rebuild — don't postpone the budget check
+    // #492: a turn is now live → let the plan tray's "active" step spin.
+    renderTray();
     scrollLog();
   }
 
