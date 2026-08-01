@@ -56,7 +56,7 @@ Could not connect node 4 (CheckpointLoaderSimple) → node 3 (KSampler).
 Requested: from_output="CLIP" → to_input=auto.
 Node 4 outputs: [0] "MODEL" (MODEL), [1] "CLIP" (CLIP), [2] "VAE" (VAE)
 Node 3 inputs:  [0] "model" (MODEL) [connected], [1] "positive" (CONDITIONING), [2] "negative" (CONDITIONING), [3] "latent_image" (LATENT), [4] "seed" (COMBO/widget)
-No input on node 3 accepts type CLIP. Tip: CLIP outputs typically feed CLIPTextEncode.clip; check wiring with panel_get_graph.
+No input on node 3 accepts type CLIP. Tip: CLIP outputs typically feed CLIPTextEncode.clip; inspect the target's slots with panel_query_graph {ids:[3],fields:"detail"}.
 ```
 
 Built by a new helper `slotDiagnostic(origin, target, requested)` beside `resolveSlot` (~2400), and **also reused by the existing explicit-connect refusal path** (~2897) so even an explicit-index type rejection lists all slots. The tip line is generic plus one type-specific hint when the failing type is unambiguous.

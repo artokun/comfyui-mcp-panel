@@ -39,47 +39,137 @@ jobs:
       # SUSP_SVG_Onload_Onerror fires on "svg" + ("onload"|"onerror") co-occurring
       # in any file (nocase). Flagged every release 0.1.0→0.6.1. Fix: use
       # addEventListener("load"/"error") and keep onload/onerror tokens out of code+comments.
-      - name: Registry YARA parity (SUSP_SVG) — block a would-be-flagged publish
+      # ONE enumeration of the published archive, BOTH YARA parity rules.
+      #
+      # They were two steps with two different file sets, and that duplication is what
+      # produced four rounds of drift: each fix corrected one set and left the other
+      # behind. The SVG rule ended up computing tracked-minus-.comfyignore while the
+      # exec rule still used hardcoded roots — so `.gitignore`, which IS tracked and is
+      # NOT .comfyignore'd, shipped while being scanned by neither. Sharing the
+      # enumeration makes that class of divergence impossible rather than unlikely.
+      - name: Security scan (Comfy Registry parity — YARA over the published archive)
         shell: bash
         run: |
-          set -e
-          shopt -s globstar nullglob
-          fail=0
-          for f in web/js/**/*.js; do
-            if grep -qi 'svg' "$f" && grep -qiE 'onload|onerror' "$f"; then
-              echo "::error file=$f::svg + onload/onerror co-occur — registry will flag. Aborting publish."
-              fail=1
-            fi
-          done
-          [ "$fail" = "0" ] || exit 1
+          python3 - <<'PY'
+          import fnmatch, pathlib, re, subprocess, sys
+
+          tracked = subprocess.run(
+              ["git", "ls-files", "-z"], capture_output=True, text=True, check=True
+          ).stdout.split("\0")
+          patterns = [
+              l.strip()
+              for l in pathlib.Path(".comfyignore").read_text(encoding="utf-8").splitlines()
+              if l.strip() and not l.strip().startswith("#")
+          ]
+
+          def shipped(p: str) -> bool:
+              for pat in patterns:
+                  if pat.endswith("/") and (p + "/").startswith(pat):
+                      return False
+                  if fnmatch.fnmatch(p, pat) or fnmatch.fnmatch(pathlib.PurePath(p).name, pat):
+                      return False
+              return True
+
+          # CHANGELOG.md must stay ignored: it documents security fixes, so it will always
+          # quote the very literals the scanner flags.
+          if "CHANGELOG.md" not in patterns:
+              print("::error file=.comfyignore::CHANGELOG.md must stay .comfyignore'd — its prose quotes exec-call literals the registry YARA scan flags.")
+              sys.exit(1)
+
+          EXEC = re.compile(r"subprocess\.(?:Popen|run|call|check_output|check_call)\s*\(|os\.system\s*\(")
+          archive = [p for p in tracked if p and shipped(p)]
+          bad = []
+          for p in archive:
+              try:
+                  raw = pathlib.Path(p).read_text(encoding="utf-8", errors="replace")
+              except OSError:
+                  continue  # unreadable; nothing to assert
+              low = raw.lower()
+              if "svg" in low and ("onload" in low or "onerror" in low):
+                  bad.append((p, "SUSP_SVG_Onload_Onerror (svg + onload/onerror in one shipped file) — use addEventListener('load'/'error') and drop literal onload/onerror tokens"))
+              if EXEC.search(raw):
+                  bad.append((p, "process-spawn call literal — the registry YARA scan ($subprocess_popen_direct et al.) flags this in ANY shipped file, prose included"))
+
+          for p, why in bad:
+              print(f"::error file={p}::{why}")
+          print(f"scanned {len(archive)} shipped files", file=sys.stderr)
+          sys.exit(1 if bad else 0)
+          PY
 
       # 0.6.2 proved the scanner also matches call-shaped literals in shipped
       # markdown PROSE (CHANGELOG.md quoting the removed spawn call → flagged,
       # any-code-execute). CHANGELOG.md must stay .comfyignore'd and no shipped
       # file may contain a process-spawn literal.
-      - name: Registry YARA parity (exec literals) — block a would-be-flagged publish
-        shell: bash
-        run: |
-          set -e
-          grep -q '^CHANGELOG.md' .comfyignore || {
-            echo "::error file=.comfyignore::CHANGELOG.md must stay .comfyignore'd — its prose quotes exec-call literals the registry YARA scan flags."
-            exit 1
-          }
-          fail=0
-          while IFS= read -r -d '' f; do
-            if grep -qE 'subprocess\.(Popen|run|call|check_output|check_call)\s*\(|os\.system\s*\(' "$f"; then
-              echo "::error file=$f::contains a process-spawn call literal — the registry YARA scan flags this in ANY shipped file, prose included. Aborting publish."
-              fail=1
-            fi
-          done < <(find __init__.py README.md pyproject.toml web -type f \( -name '*.py' -o -name '*.js' -o -name '*.md' -o -name '*.toml' -o -name '*.json' -o -name '*.html' -o -name '*.css' \) -print0)
-          [ "$fail" = "0" ] || exit 1
 
+      # Absent until now, so a publish could ship what CI would have blocked: this
+      # job's header says it mirrors CI, and it can also be invoked manually or race
+      # the push-triggered CI run — a red vocabulary check there does not stop this
+      # job. A publish path that enforces less than CI makes CI advisory.
+      # Pure node + git, so it needs no install.
+      - name: Tool vocabulary (no calls to tools that don't exist)
+        run: node scripts/check-tool-vocabulary.mjs
+
+      # Python + the real frontend bundle must come BEFORE the tests, exactly as in
+      # ci.yml. They used to run after, so browser_tests/unit/frontend-contract.test.mjs —
+      # which is written to SKIP when COMFYUI_FRONTEND_STATIC and a local install are both
+      # absent — silently skipped its bundle assertions here while being mandatory in CI.
+      # A publish path where a test quietly downgrades itself to a no-op is worse than one
+      # that omits the test, because the summary still says it ran.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      - name: Install comfyui_frontend_package (for the frontend-contract test)
+        shell: bash
+        run: |
+          python -m pip install --quiet comfyui_frontend_package
+          static="$(python -c 'import comfyui_frontend_package, os; print(os.path.join(os.path.dirname(comfyui_frontend_package.__file__), "static"))')"
+          echo "COMFYUI_FRONTEND_STATIC=$static" >> "$GITHUB_ENV"
+          echo "using installed frontend static bundle at: $static"
+
+      - run: npm ci
+      - run: npm run typecheck
+      - name: Unit tests (Node --test, incl. frontend contract)
+        run: npm run test:unit
+
       - name: Python compile check (__init__.py)
         run: python -m py_compile __init__.py
+
+      # CI parses EVERY Python file and runs Bandit; this job compiled only
+      # __init__.py, which does not parse the modules it imports. So a syntax error or
+      # an eval() in shipped py/apps_routes.py passed here and was rejected by CI —
+      # the publish path being weaker than CI in a third way.
+      - name: comfy-cli parity — no exec/eval, no multi-statement lines
+        run: |
+          python - <<'PY'
+          import ast, collections, pathlib, sys
+          bad = []
+          for f in sorted(pathlib.Path(".").rglob("*.py")):
+              if any(p in f.parts for p in (".git", "node_modules", ".venv", "venv", "__pycache__")):
+                  continue
+              try:
+                  tree = ast.parse(f.read_text(encoding="utf-8"), str(f))
+              except SyntaxError as e:
+                  bad.append(f"{f}:{e.lineno}: syntax error: {e.msg}")
+                  continue
+              per_line = collections.Counter(
+                  n.lineno for n in ast.walk(tree) if isinstance(n, ast.stmt)
+              )
+              for line in sorted(l for l, c in per_line.items() if c > 1):
+                  bad.append(f"{f}:{line}: multiple statements on one line")
+              for n in ast.walk(tree):
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("exec", "eval"):
+                      bad.append(f"{f}:{n.lineno}: {n.func.id}() call")
+          for b in bad:
+              print(f"::error::{b}")
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Install bandit
+        run: pip install bandit
+
+      - name: Security scan (Comfy Registry parity — Bandit)
+        run: bandit -r . -s B101,B112,B311
 
       - name: pyproject.toml is valid + has registry fields + JS version matches
         run: |

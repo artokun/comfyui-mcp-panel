@@ -126,7 +126,8 @@ hosts for the ChatGPT/Codex backend, so feature parity is automatic.
 
 | Tool | Effect |
 |---|---|
-| `panel_get_graph` | Read the graph you're viewing — subgraphs summarized shallowly |
+| `panel_graph_outline` | Orient in the graph you're viewing — a compact structural overview |
+| `panel_query_graph` | Query the live canvas — filter, traverse, and project, token-bounded |
 | `panel_get_subgraph` | Read inside a subgraph node's inner graph |
 | `panel_get_errors` | Read the last execution error + per-node validation errors |
 | `panel_list_workflows` | List open workflow tabs and which is active |

@@ -18,6 +18,10 @@ package-lock.json
 tsconfig.json
 # Dev-only tooling — keep the published (security-scanned) archive minimal
 scripts/
+# Build-time vocabulary artefact vendored from comfyui-mcp. Consumed only by
+# scripts/check-tool-vocabulary.mjs in CI; shipping a list of ~270 tool names in
+# the pack would add nothing for users and give the registry scanner more surface.
+vendor/
 .githooks/
 # The Cloudflare registry worker (deploy infra, not part of the custom-node
 # pack; its fetch/crypto calls would only manufacture scanner findings)

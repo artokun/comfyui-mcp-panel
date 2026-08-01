@@ -5945,7 +5945,7 @@ const GRAPH_TOOL_EXECUTORS = {
       const ref = toIntent && !toRail ? to_node_id : from_node_id;
       throw new Error(
         `Rail endpoint "${ref}" is only valid inside a subgraph — enter the subgraph first ` +
-          `(graph_enter_subgraph), then expose I/O with graph_expose_subgraph_output / graph_expose_subgraph_input.`,
+          `(panel_enter_subgraph), then expose I/O with panel_expose_subgraph_output / panel_expose_subgraph_input.`,
       );
     }
 
@@ -7924,7 +7924,7 @@ const GRAPH_TOOL_EXECUTORS = {
       bp = store.getBlueprint(type);
     } catch (err) {
       throw new Error(
-        `No saved subgraph blueprint "${name}" (${coerceMessageText(err?.message ?? err)}). List them with graph_list_subgraphs.`,
+        `No saved subgraph blueprint "${name}" (${coerceMessageText(err?.message ?? err)}). List them with panel_list_subgraphs.`,
       );
     }
     const position = placementFor(graph, pos);
@@ -8019,7 +8019,7 @@ const GRAPH_TOOL_EXECUTORS = {
           `also captures ${extra.length} unrelated node(s) (their centre falls inside)` +
           (missing.length ? ` and misses ${missing.length} requested node(s)` : "") +
           ". Move the intended nodes into a contiguous region (panel_move_node / " +
-          "panel_arrange) before grouping, or edit the group bounds, to get an exact set.";
+          "panel_auto_layout) before grouping, or edit the group bounds, to get an exact set.";
       }
     }
     return { group: summary };
@@ -8444,7 +8444,7 @@ const GRAPH_TOOL_EXECUTORS = {
   graph_move_rail({ rail, pos }) {
     const { graph, rootGraph } = getGraphCtx();
     if (graph === rootGraph) {
-      throw new Error("graph_move_rail must run INSIDE a subgraph — call graph_enter_subgraph first");
+      throw new Error("panel_move_rail must run INSIDE a subgraph — call panel_enter_subgraph first");
     }
     const node =
       rail === "input" ? (graph.inputNode ?? graph._inputNode) :
@@ -8471,7 +8471,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const { graph, canvas, rootGraph } = getGraphCtx();
     if (graph === rootGraph) {
       throw new Error(
-        "Enter the subgraph first (graph_enter_subgraph) — promotion exposes an INNER widget on the parent node.",
+        "Enter the subgraph first (panel_enter_subgraph) — promotion exposes an INNER widget on the parent node.",
       );
     }
     const node = resolveNode(graph, node_id);
@@ -8643,7 +8643,7 @@ const GRAPH_TOOL_EXECUTORS = {
         dialect,
         note:
           "Installed and VERIFIED present in custom_nodes. A ComfyUI restart " +
-          "(comfy_reboot) is usually required to load new nodes.",
+          "(panel_restart_comfyui) is usually required to load new nodes.",
       };
     }
     return {
@@ -8709,7 +8709,7 @@ const GRAPH_TOOL_EXECUTORS = {
           note:
             "Update queued. This ComfyUI-Manager build does not expose a per-task result, " +
             "so the outcome could not be auto-verified — poll panel_node_queue_status " +
-            "(which surfaces any recent task failure), then a ComfyUI restart (comfy_reboot) " +
+            "(which surfaces any recent task failure), then a ComfyUI restart (panel_restart_comfyui) " +
             "is usually required to load the updated node.",
         };
       }
@@ -8723,7 +8723,7 @@ const GRAPH_TOOL_EXECUTORS = {
           verified: true,
           note:
             "Update applied and VERIFIED by the ComfyUI-Manager task. A ComfyUI restart " +
-            "(comfy_reboot) is usually required to load the updated node.",
+            "(panel_restart_comfyui) is usually required to load the updated node.",
         };
       }
       return { ...base, updated: false, verified: false, pending: true, note: outcome.message };
