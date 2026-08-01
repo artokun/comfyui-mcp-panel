@@ -5847,12 +5847,28 @@ const GRAPH_TOOL_EXECUTORS = {
     // installed ones (#289). When the backend defines the type but the stale
     // page-load registry lacks it, the defs are refreshed + re-registered so
     // LG.createNode works; a type the live backend does not provide fails closed.
+    //
+    // #496: genuinely FRONTEND-ONLY types (Note/MarkdownNote/Reroute/…) are never in
+    // /object_info by design, so the guard exempts them via the SAME shared predicate
+    // graph_set_widget uses — but only behind the observed-backend-history gate below,
+    // so a since-REMOVED pack is still refused. WAIT for the startup baseline seed for
+    // the same reason set_widget does: an un-seeded history must never let a write/add
+    // decide "never seen". If the seed still cannot land (backend down),
+    // objectInfoHistorySeeded stays false and wasTypeEverDefined fails CLOSED.
+    try {
+      await objectInfoHistorySeed;
+      if (!objectInfoHistorySeeded) await seedObjectInfoHistory();
+    } catch {
+      /* seed is best-effort; an unseeded history makes wasTypeEverDefined fail closed */
+    }
     await assertAddNodeResolvableRefreshing(() => LG?.registered_node_types ?? {}, class_type, {
       getFreshObjectInfo: async () =>
         recordObjectInfoTypes(
           typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null,
         ),
       refresh: (defs) => refreshComfyNodeDefs(defs),
+      // #458 OBSERVED-BACKEND-HISTORY trust root, identical to graph_set_widget's.
+      wasTypeEverDefined: (t) => !objectInfoHistorySeeded || seenObjectInfoTypes.has(t),
     });
     const node = LG.createNode(class_type);
     if (!node) {

@@ -21,7 +21,13 @@ import {
   assertAddNodeResolvableRefreshing,
   assertResolvedTargetRegistered,
   assertTypeAgainstFreshBackend,
+  assertMutatedNodeAuthorized,
   isFrontendOnlyRegisteredType,
+  // #496: the ONE shared frontend-only allowlist + the predicates every
+  // /object_info-oracle guard decides with.
+  FRONTEND_ONLY_NODE_TYPES,
+  isAuthorizedFrontendOnlyType,
+  isRemovedBackendType,
 } from "../../web/js/lib/node-resolve.js";
 // The PRODUCTION graph_set_widget handler body — the executor and these tests
 // call it verbatim, so the tested ordering IS the shipped ordering (#458).
@@ -896,4 +902,219 @@ test("#458 EVER-SEEN: a frontend-only rgthree node NEVER in object_info ⇒ stil
     ...HOOKS,
   });
   assert.equal(set.value, false);
+});
+
+// ---- #496: ONE shared frontend-only allowlist across the WHOLE /object_info-oracle
+//      guard family. The set_widget guards exempted genuine frontend-only types
+//      (Note/MarkdownNote/Reroute/…); assertAddNodeResolvableRefreshing did NOT, so a
+//      MarkdownNote was writable but not ADDABLE on a perfectly healthy backend — the
+//      exact drift #496 reports. All three now decide via isAuthorizedFrontendOnlyType.
+//      These lock BOTH halves: the frontend-only types succeed, and every
+//      graph-corruption case the guards reject today is still rejected. ---------------
+
+// A live registry in which the frontend-only natives are registered by LiteGraph
+// (defless / provenance-clean), exactly as ComfyUI's frontend registers them.
+function registryWithNatives(natives = ["Note", "MarkdownNote", "Reroute", "PrimitiveNode"]) {
+  return loadedRegistry([], natives);
+}
+const ADD_OPTS = (fresh, wasTypeEverDefined = () => false) => ({
+  getFreshObjectInfo: async () => fresh,
+  refresh: async () => {},
+  wasTypeEverDefined,
+});
+
+test("#496 add_node: frontend-only natives (Note/MarkdownNote/Reroute/PrimitiveNode) are ADDABLE on a healthy backend that does not list them", async () => {
+  const reg = registryWithNatives();
+  const fresh = objectInfo(); // healthy backend — genuinely never lists these types
+  for (const t of ["Note", "MarkdownNote", "Reroute", "PrimitiveNode"]) {
+    await assert.doesNotReject(
+      () => assertAddNodeResolvableRefreshing(() => reg, t, ADD_OPTS(fresh)),
+      `#496: "${t}" is frontend-only and must be addable`,
+    );
+  }
+  // The rgthree frontend control nodes are on the same shared allowlist.
+  const reg2 = loadedRegistry([], ["Fast Bypasser (rgthree)"]);
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => reg2, "Fast Bypasser (rgthree)", ADD_OPTS(fresh)),
+  );
+});
+
+test("#496 add_node: a genuinely INVALID target still fails closed (unknown type, defless husk, provenance-bearing allowlisted name)", async () => {
+  const fresh = objectInfo();
+  // (a) never installed / typo — not on the allowlist.
+  const reg = registryWithNatives();
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "TotallyMadeUpNode", ADD_OPTS(fresh)),
+    /Unknown node type|does not provide/i,
+  );
+  // (b) a REMOVED pack that left a DEFLESS husk registered: defless is NOT the signal —
+  //     it is not on the allowlist, so it stays refused (the #458 hole stays closed).
+  const reg2 = loadedRegistry([], ["RemovedBackendNode"]);
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg2, "RemovedBackendNode", ADD_OPTS(fresh)),
+    /Unknown node type|does not provide/i,
+  );
+  // (c) a class squatting an ALLOWLISTED name but carrying backend provenance
+  //     (nodeData/comfyClass) is NOT frontend-only — refuse.
+  const reg3 = loadedRegistry(["MarkdownNote"]); // registered WITH nodeData
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg3, "MarkdownNote", ADD_OPTS(fresh)),
+    /Unknown node type|does not provide/i,
+  );
+  // (d) an allowlisted name that is NOT registered in the live registry at all — the
+  //     exemption requires registry membership (which is also what createNode needs).
+  const reg4 = loadedRegistry();
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg4, "MarkdownNote", ADD_OPTS(fresh)),
+    /Unknown node type|does not provide/i,
+  );
+});
+
+test("#496 add_node: the EVER-SEEN gate still wins — an allowlisted name whose backend was REMOVED this session fails closed", async () => {
+  // A pack registered a backend node literally named "MarkdownNote" and was then
+  // uninstalled, leaving a provenance-clean husk. The observed-backend-history trust
+  // root refuses it: a client husk cannot un-see what the backend already reported.
+  const reg = registryWithNatives();
+  const fresh = objectInfo(); // current object_info no longer lists it
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(
+        () => reg,
+        "MarkdownNote",
+        ADD_OPTS(fresh, (t) => t === "MarkdownNote"),
+      ),
+    /defined this node type earlier this session|removed/i,
+  );
+  // …and the gate does NOT over-reach: a sibling native never reported stays addable.
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => reg, "Note", ADD_OPTS(fresh, (t) => t === "MarkdownNote")),
+  );
+});
+
+test("#496 add_node: object_info UNAVAILABLE still fails closed, even for a frontend-only type", async () => {
+  // The exemption is scoped to "object_info WAS fetched but lacks the type". An
+  // unverifiable backend must never authorize anything (#458).
+  const reg = registryWithNatives();
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", {
+        getFreshObjectInfo: async () => null,
+        refresh: async () => {},
+        wasTypeEverDefined: () => false,
+      }),
+    /cannot verify|object_info is unavailable/i,
+  );
+});
+
+test("#496 set_widget: MarkdownNote's text widget is writable end-to-end (the reported repro)", async () => {
+  const reg = registryWithNatives();
+  const node = {
+    id: 11,
+    type: "MarkdownNote",
+    widgets: [{ name: "text", type: "string", value: "" }],
+    constructor: reg["MarkdownNote"],
+  };
+  const { set } = await runSetWidget(node, "text", "# README", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => objectInfo(), // healthy backend, no MarkdownNote
+    wasTypeEverDefined: () => false,
+    ...HOOKS,
+  });
+  assert.equal(set.value, "# README");
+  assert.equal(node.widgets[0].value, "# README");
+});
+
+// The three guards whose oracle is /object_info. Each is reduced to a boolean
+// "would this LEAF node type be authorized?" so they can be compared directly.
+// (Container-shaped nodes are excluded on purpose: assertMutatedNodeAuthorized has an
+// ADDITIONAL virtual-subgraph-container branch the other two must not have, so parity
+// is asserted over LEAF nodes, where the frontend-only allowlist is the only exemption.)
+function guardVerdicts(reg, fresh, type, node, wasTypeEverDefined = () => false) {
+  const ok = async (fn) => {
+    try {
+      await fn();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  return Promise.all([
+    ok(() => assertAddNodeResolvableRefreshing(() => reg, type, ADD_OPTS(fresh, wasTypeEverDefined))),
+    ok(() => assertTypeAgainstFreshBackend(fresh, type, node?.id, { registry: reg, node, wasTypeEverDefined })),
+    ok(() => assertMutatedNodeAuthorized(fresh, reg, node, "target", wasTypeEverDefined)),
+  ]);
+}
+
+test("#496 PARITY: all three /object_info-oracle guards reach the SAME verdict for the same leaf node type", async () => {
+  const fresh = objectInfo();
+  const leaf = (type, ctor) => ({
+    id: 42,
+    type,
+    widgets: [{ name: "text", type: "string", value: "" }],
+    constructor: ctor,
+  });
+  const natives = registryWithNatives();
+  const husk = loadedRegistry([], ["RemovedBackendNode"]);
+  const squat = loadedRegistry(["MarkdownNote"]); // allowlisted NAME, backend provenance
+  const cases = [
+    // [label, registry, type, expected verdict, wasTypeEverDefined]
+    ["MarkdownNote (frontend-only)", natives, "MarkdownNote", true, () => false],
+    ["Note (frontend-only)", natives, "Note", true, () => false],
+    ["Reroute (frontend-only)", natives, "Reroute", true, () => false],
+    ["KSampler (live backend node)", natives, "KSampler", true, () => false],
+    ["TotallyMadeUpNode (unknown)", natives, "TotallyMadeUpNode", false, () => false],
+    ["RemovedBackendNode (defless husk, not allowlisted)", husk, "RemovedBackendNode", false, () => false],
+    ["MarkdownNote (squatted, backend provenance)", squat, "MarkdownNote", false, () => false],
+    ["MarkdownNote (backend REMOVED this session)", natives, "MarkdownNote", false, (t) => t === "MarkdownNote"],
+  ];
+  for (const [label, reg, type, expected, everSeen] of cases) {
+    const [add, freshAuth, mutated] = await guardVerdicts(reg, fresh, type, leaf(type, reg[type]), everSeen);
+    assert.deepEqual(
+      { add, freshAuth, mutated },
+      { add: expected, freshAuth: expected, mutated: expected },
+      `#496 guard drift on ${label}: all three guards must agree (expected ${expected})`,
+    );
+  }
+});
+
+test("#496 SINGLE SOURCE OF TRUTH: all three guards read the SAME allowlist Set (no second copy)", async () => {
+  // Mutating the ONE exported allowlist must move all three guards together. If a guard
+  // ever hard-codes its own copy of the list, its verdict stops tracking this Set and
+  // this test fails — which is precisely the regression #496 was.
+  const SYNTHETIC = "ZZFrontendOnlyProbe (test)";
+  const reg = loadedRegistry([], [SYNTHETIC]);
+  const fresh = objectInfo();
+  const node = {
+    id: 77,
+    type: SYNTHETIC,
+    widgets: [{ name: "text", type: "string", value: "" }],
+    constructor: reg[SYNTHETIC],
+  };
+  // Not on the allowlist yet ⇒ every guard refuses.
+  assert.deepEqual(
+    await guardVerdicts(reg, fresh, SYNTHETIC, node),
+    [false, false, false],
+    "a defless, non-allowlisted type must be refused by all three guards",
+  );
+  FRONTEND_ONLY_NODE_TYPES.add(SYNTHETIC);
+  try {
+    assert.deepEqual(
+      await guardVerdicts(reg, fresh, SYNTHETIC, node),
+      [true, true, true],
+      "adding to the ONE allowlist must authorize all three guards — they share it",
+    );
+    assert.equal(isAuthorizedFrontendOnlyType(reg, SYNTHETIC, node), true);
+  } finally {
+    FRONTEND_ONLY_NODE_TYPES.delete(SYNTHETIC);
+  }
+  // Removed again ⇒ back to refused everywhere (no guard cached the membership).
+  assert.deepEqual(await guardVerdicts(reg, fresh, SYNTHETIC, node), [false, false, false]);
+});
+
+test("#496: isRemovedBackendType — the shared ever-seen gate is inert without an injected oracle and never guesses", () => {
+  assert.equal(isRemovedBackendType("KSampler", () => true), true);
+  assert.equal(isRemovedBackendType("KSampler", () => false), false);
+  assert.equal(isRemovedBackendType("KSampler", undefined), false, "no oracle wired ⇒ no removal claim");
+  assert.equal(isRemovedBackendType(undefined, () => true), false, "a non-string type is never 'removed'");
 });
