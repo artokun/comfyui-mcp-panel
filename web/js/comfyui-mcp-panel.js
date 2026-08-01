@@ -111,6 +111,7 @@ import {
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
   findNodeByScopedId,
+  resolveMissingModelDirectory,
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing } from "./lib/node-resolve.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
@@ -4008,7 +4009,9 @@ function collectMissingAssets(trustComboOverride) {
       models.push({
         node_id: c?.nodeId ?? null,
         file: c?.name ?? null,
-        directory: c?.directory ?? null,
+        // The Ultralytics detector combo value's bbox/segm prefix, not the store's
+        // single default folder, authoritatively picks the subfolder (#487).
+        directory: resolveMissingModelDirectory(c?.directory ?? null, c?.name ?? null),
         ...(c?.widgetName ? { widget: c.widgetName } : {}),
         ...(c?.url ? { download_url: c.url } : {}),
       });

@@ -285,6 +285,39 @@ export function isStaleAssetCandidate(
 }
 
 /**
+ * Correct the missing-model `directory` for an Impact-Subpack UltralyticsDetectorProvider
+ * model so it points at the RIGHT bbox/segm subfolder (#487).
+ *
+ * `UltralyticsDetectorProvider.model_name` draws its combo from TWO separately-registered
+ * folders — `ultralytics/bbox` and `ultralytics/segm` — and the combo VALUE authoritatively
+ * carries the subfolder as a prefix (`bbox/…` or `segm/…`). ComfyUI's missing-model store,
+ * however, reports a SINGLE default directory for the input (observed: `ultralytics/bbox`)
+ * regardless of the value's prefix, so a missing `segm/…` model is mis-reported as belonging
+ * in `models/ultralytics/bbox`; downloading there leaves the node red because the loader
+ * resolves `segm/…` through `models/ultralytics/segm`.
+ *
+ * Given the store's `directory` and the missing `file` (the combo value), return the CORRECTED
+ * directory: when the directory is an ultralytics folder (`ultralytics`, `ultralytics/bbox`,
+ * or `ultralytics/segm`) AND the file carries a `bbox/`/`segm/` prefix, force the subfolder to
+ * match that prefix. Every other case — a non-ultralytics directory (checkpoints, loras, …),
+ * a null directory, or a file with no recognizable prefix — is passed through UNCHANGED, so
+ * non-ultralytics missing-asset resolution never regresses. Pure + fully defensive.
+ */
+export function resolveMissingModelDirectory(directory, file) {
+  try {
+    if (directory == null) return directory;
+    const dir = String(directory).replace(/\\/g, "/").replace(/\/+$/, "");
+    // Only touch the known ultralytics folders so nothing else can be rewritten.
+    if (!/^ultralytics(\/(bbox|segm))?$/i.test(dir)) return directory;
+    const m = /^\s*(bbox|segm)\//i.exec(String(file ?? "").replace(/\\/g, "/"));
+    if (!m) return directory;
+    return `ultralytics/${m[1].toLowerCase()}`;
+  } catch {
+    return directory;
+  }
+}
+
+/**
  * Blame each LIVE node whose type is one of the uninstalled `missingNodeTypes`. The
  * missing-nodes store only yields type NAMES; on their own they never land on a node,
  * so a red "node type not installed" node — INCLUDING a bypassed/muted one that
