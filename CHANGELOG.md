@@ -6,8 +6,25 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.31] - 2026-08-01
+
 ### Fixed
 - group membership matches LiteGraph's `containsCentre` rule (group box contains the node's centre point), not box overlap — a node whose centre is moved out of a group is no longer reported as a member by `panel_graph_outline` / `panel_edit_group` (#497)
+
+### Added
+- expose per-item `gated` + cap the media proxy read (supports mcp#623)
+- refresh_nodes executor — force /object_info re-register on demand (#608)
+
+### Fixed
+- frontend-only rgthree nodes (#475) + outer promoted display-proxy sync (#477) (#479)
+- legacy Manager 3.x install — negotiate queue/start method + unreachable fallback (#485, #486)
+- derive Ultralytics bbox/segm dir from combo prefix (#487)
+- in-place-overwrite gate must compare RAW BYTES, not decoded text (#442 defect 3)
+- content-equality gate for in-place save + late stale read (#442 defects 2,3)
+- stale-tab detection on open + in-place save 409 (#442 defects 2,3)
+- report EFFECTIVE widget state + stop blobs starving the node you asked for (#607, #609) (#482)
+- recover run-completion missed on unobserved reconnect (#356) + refuse false-clean empty-graph reads (#389)
+
 
 ## [0.11.30] - 2026-08-01
 
