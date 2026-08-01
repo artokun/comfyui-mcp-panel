@@ -292,6 +292,10 @@ def register(routes, web):
                         return web.json_response({"error": str(e)}, status=502)
         return web.json_response({"error": "unreachable"}, status=502)
 
+    # Upper bound on a single proxied media body (thumbs + full images). Generous
+    # for any real CivitAI asset; caps memory for a hostile/oversize upstream.
+    _MEDIA_CAP = 32 * 1024 * 1024
+
     @routes.get("/comfyui_mcp_panel/civitai/media")
     async def _civitai_media(request):
         # ?uuid=&transform=&ext=  → stream the CDN bytes with bot-gate headers.
@@ -307,9 +311,21 @@ def register(routes, web):
                     if resp.status != 200:
                         return web.Response(status=resp.status)
                     ctype = resp.headers.get("Content-Type", "application/octet-stream")
-                    payload = await resp.read()
+                    # Bound memory: refuse an over-cap body up front, and read in
+                    # chunks so a length-less/lying upstream can't stream past the
+                    # cap into an unbounded buffer. Media (thumbs + full images) is
+                    # comfortably under _MEDIA_CAP; abuse is truncated to a 413.
+                    if (resp.content_length or 0) > _MEDIA_CAP:
+                        return web.Response(status=413, text="media too large")
+                    chunks = []
+                    total = 0
+                    async for chunk in resp.content.iter_chunked(1 << 16):
+                        total += len(chunk)
+                        if total > _MEDIA_CAP:
+                            return web.Response(status=413, text="media too large")
+                        chunks.append(chunk)
                     return web.Response(
-                        body=payload,
+                        body=b"".join(chunks),
                         content_type=ctype.split(";")[0],
                         headers={"Cache-Control": "public, max-age=86400"},
                     )

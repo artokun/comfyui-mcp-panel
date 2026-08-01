@@ -43,6 +43,7 @@ test("media serialization matches the contract shape", () => {
     baseModel: "FLUX.1-dev", type: "image",
     stats: { reactions: 42 }, prompt: "a cat astronaut",
     urls: ["/proxy/thumb/101.jpeg", "/proxy/full/101.jpeg"],
+    gated: false, // has a thumbnail + not flagged → visible
   });
   assert.equal(b.kind, "video"); // type:"video" → kind:"video"
   assert.equal(b.prompt, null);
@@ -58,7 +59,30 @@ test("model serialization matches the contract shape", () => {
     baseModel: "SDXL 1.0", type: "LORA",
     stats: { downloadCount: 1234, thumbsUp: 88 },
     prompt: null, urls: ["/proxy/cover/5.jpeg"],
+    gated: false, // has a cover + not flagged → visible
   });
+});
+
+test("gated / blurred results are flagged so a vision consumer withholds pixels (mcp#623)", () => {
+  // Media: an item flagged gated (rating outside enabled levels), and one with no
+  // thumbnail at all (also rendered as a blurred placeholder by the grid).
+  const media = [
+    { id: 1, type: "image", author: "a", reactions: 0, gated: true, thumbnailUrl: "/t/1", fullUrl: "/f/1" },
+    { id: 2, type: "image", author: "b", reactions: 0, thumbnailUrl: null, fullUrl: null },
+    { id: 3, type: "image", author: "c", reactions: 0, thumbnailUrl: "/t/3", fullUrl: "/f/3" },
+  ];
+  const out = serializeCivitaiResults(media, { model: false });
+  assert.equal(out.items[0].gated, true); // explicitly gated
+  assert.equal(out.items[1].gated, true); // no thumbnail → blurred placeholder
+  assert.equal(out.items[2].gated, false); // visible
+  // Models: a model with no usable cover is treated as gated too.
+  const models = [
+    { id: 9, name: "No Cover", creator: "d", coverUrl: null },
+    { id: 10, name: "Has Cover", creator: "e", coverUrl: "/c/10" },
+  ];
+  const mout = serializeCivitaiResults(models, { model: true });
+  assert.equal(mout.items[0].gated, true);
+  assert.equal(mout.items[1].gated, false);
 });
 
 test("every serialized url is a string, never image bytes/blobs", () => {
