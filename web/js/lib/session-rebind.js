@@ -296,6 +296,7 @@ export function buildHelloPayload({
   comfyuiUrl,
   comfyuiPath,
   resume,
+  workflowUuid,
 } = {}) {
   const frame = {
     type: "hello",
@@ -310,5 +311,13 @@ export function buildHelloPayload({
     frame.comfyui_path = comfyuiPath.trim();
   }
   if (resume) frame.resume = resume;
+  // #570 — the durable, globally-unique per-instance workflow uuid (survives the
+  // tmp:<uuid> tab-id churn across a reload, unlike the tab id and the default
+  // title). Lets the orchestrator key an UNSAVED workflow's resume on a stable
+  // identity that never collides with a DIFFERENT unsaved workflow of the same
+  // title (the reopened cross-resume). Omitted when unknown so old behavior stands.
+  if (typeof workflowUuid === "string" && workflowUuid.trim()) {
+    frame.workflow_uuid = workflowUuid.trim();
+  }
   return frame;
 }

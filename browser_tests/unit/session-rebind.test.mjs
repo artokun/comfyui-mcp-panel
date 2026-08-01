@@ -257,6 +257,19 @@ test("#296: resume rides the hello only when present", () => {
   assert.equal(buildHelloPayload({ tabId: "t", resume: "sess-1" }).resume, "sess-1");
 });
 
+test("#570: the durable per-instance workflow uuid rides the hello when present", () => {
+  // Lets the orchestrator key an UNSAVED workflow's resume on a globally-unique id
+  // that survives the tmp:<uuid> tab-id churn — so a same-title sibling can't
+  // cross-resume its conversation (the reopened #570 residual).
+  const frame = buildHelloPayload({ tabId: "tmp:abc", title: "Unsaved Workflow", workflowUuid: "wf-uuid-1" });
+  assert.equal(frame.workflow_uuid, "wf-uuid-1");
+});
+
+test("#570: workflow_uuid is omitted (never blank) when unknown, so old behavior stands", () => {
+  assert.equal("workflow_uuid" in buildHelloPayload({ tabId: "t" }), false);
+  assert.equal("workflow_uuid" in buildHelloPayload({ tabId: "t", workflowUuid: "   " }), false);
+});
+
 // ---- #379 soft-reload recovery: never leave the bridge dead -----------------
 
 test("#379: a REFUSED reload (by-design 503) still reconnects, dropping the interlock", () => {

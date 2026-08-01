@@ -9538,6 +9538,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // orchestrator registers panel_* tools + local panel management.
             comfyuiPath: localComfyuiPathForAgent(),
             resume,
+            // #570 — the durable per-instance workflow uuid (the SAME identity that
+            // keys the durable chat transcript). Unlike workflowTabId()'s ephemeral
+            // tmp:<uuid> and the non-unique default title, it survives a reload, so
+            // the orchestrator can resume an UNSAVED workflow's conversation without
+            // cross-resuming a DIFFERENT same-title unsaved workflow.
+            workflowUuid: workflowStableUuid(),
           }),
         ),
       );
