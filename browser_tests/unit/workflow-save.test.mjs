@@ -176,9 +176,9 @@ test('#442 in-place save of a DRIFTED tab whose disk STILL matches its baseline:
     originalContent: baseline
   }
   const svc = makeService({ files: [active.path], active })
-  const readDiskContent = async () => baseline // disk unchanged since load
+  const readDiskBytes = async () => new TextEncoder().encode(baseline) // disk unchanged since load
 
-  const saved = await saveActiveWorkflow(svc, 'Krea', { readDiskContent })
+  const saved = await saveActiveWorkflow(svc, 'Krea', { readDiskBytes })
 
   assert.deepEqual(svc.calls, [['saveWorkflow', 'workflows/Krea.json']], 'saved in place over its own file')
   assert.equal(active.isPersisted, true, 'drift repaired ⇒ ComfyUI now writes with overwrite:true')
@@ -198,10 +198,10 @@ test('#442 P0 — in-place save of a DRIFTED tab whose disk CHANGED under it is 
     originalContent: loadedA
   }
   const svc = makeService({ files: [active.path], active })
-  const readDiskContent = async () => diskB // file changed on disk since load
+  const readDiskBytes = async () => new TextEncoder().encode(diskB) // file changed on disk since load
 
   await assert.rejects(
-    () => saveActiveWorkflow(svc, 'Krea', { readDiskContent }),
+    () => saveActiveWorkflow(svc, 'Krea', { readDiskBytes }),
     /changed on disk since this tab loaded it/,
     'must surface a conflict rather than clobber the newer on-disk content'
   )

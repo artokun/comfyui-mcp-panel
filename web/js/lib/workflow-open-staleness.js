@@ -24,6 +24,38 @@ export function workflowContentEqual(a, b) {
   return typeof a === "string" && typeof b === "string" && a === b;
 }
 
+/** LOSSLESS byte-vs-text equality for the SAVE-side in-place-overwrite gate (#442
+ *  defect 3). `Response.text()` silently CONSUMES a UTF-8 BOM, so a decoded-string
+ *  compare treats `A` and `BOM+A` as equal — which would authorize a forced overwrite
+ *  that clobbers an external BOM-bearing change (codex P0). This compares the disk file's
+ *  RAW BYTES (`diskBytes`, a Uint8Array read via arrayBuffer — BOM preserved) against the
+ *  UTF-8 encoding of the loaded baseline TEXT.
+ *
+ *  Why re-encoding the baseline is the right baseline here: ComfyUI writes workflow files
+ *  as CANONICAL UTF-8 with NO BOM (JSON.stringify → verbatim POST body), so for ANY
+ *  ComfyUI-written file the loaded bytes are exactly `TextEncoder().encode(originalContent)`
+ *  — this reconstruction is EXACT. The only case it can't reconstruct is a file that was
+ *  externally created WITH a BOM and then loaded (originalContent lost the BOM): there this
+ *  returns false → the caller treats it as a CONFLICT and REFUSES, i.e. it FAILS CLOSED
+ *  (never a false authorize). So it authorizes iff the on-disk bytes are byte-identical to
+ *  a canonical encoding of what the tab loaded, and refuses on any deviation. */
+export function diskBytesEqualText(diskBytes, baselineText) {
+  if (typeof baselineText !== "string") return false;
+  const bytes =
+    diskBytes instanceof Uint8Array
+      ? diskBytes
+      : diskBytes && typeof diskBytes.byteLength === "number"
+        ? new Uint8Array(diskBytes) // accept a raw ArrayBuffer too
+        : null;
+  if (!bytes) return false;
+  const enc = new TextEncoder().encode(baselineText); // canonical UTF-8, no BOM
+  if (enc.length !== bytes.length) return false;
+  for (let i = 0; i < enc.length; i++) {
+    if (enc[i] !== bytes[i]) return false;
+  }
+  return true;
+}
+
 /** Decide whether an already-open tab's buffer is stale relative to disk, and whether
  *  it is SAFE to re-read.
  *

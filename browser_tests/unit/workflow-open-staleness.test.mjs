@@ -5,7 +5,33 @@
 // is CONTENT-based so it survives the frontend's mtime-only listing sync.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { decideOpenStaleness } from "../../web/js/lib/workflow-open-staleness.js";
+import { decideOpenStaleness, diskBytesEqualText } from "../../web/js/lib/workflow-open-staleness.js";
+
+const enc = new TextEncoder();
+const withBom = (text) => {
+  const body = enc.encode(text);
+  const out = new Uint8Array(body.length + 3);
+  out.set([0xef, 0xbb, 0xbf], 0);
+  out.set(body, 3);
+  return out;
+};
+
+test("diskBytesEqualText: canonical UTF-8 (no BOM) of the baseline ⇒ equal (the ComfyUI-written case)", () => {
+  assert.equal(diskBytesEqualText(enc.encode("hello"), "hello"), true);
+  // Accepts a raw ArrayBuffer too.
+  assert.equal(diskBytesEqualText(enc.encode("hello").buffer, "hello"), true);
+});
+
+test("diskBytesEqualText: a UTF-8 BOM on disk is NOT equal to the (BOM-stripped) baseline text (codex P0)", () => {
+  assert.equal(diskBytesEqualText(withBom("hello"), "hello"), false);
+});
+
+test("diskBytesEqualText: any byte difference ⇒ false; non-bytes / non-string ⇒ false (fail closed)", () => {
+  assert.equal(diskBytesEqualText(enc.encode("hello!"), "hello"), false);
+  assert.equal(diskBytesEqualText(null, "hello"), false);
+  assert.equal(diskBytesEqualText(enc.encode("hello"), null), false);
+  assert.equal(diskBytesEqualText("hello", "hello"), false); // a string is not raw bytes
+});
 
 const A = JSON.stringify({ nodes: [{ id: 1, pos: [0, 0] }] });
 const B = JSON.stringify({ nodes: [{ id: 1, pos: [500, 300] }] }); // edited on disk

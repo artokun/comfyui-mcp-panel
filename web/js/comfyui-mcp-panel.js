@@ -2602,11 +2602,11 @@ async function programmaticSave(name) {
   const saved = await saveActiveWorkflow(svc, name, {
     autoWorkflowName,
     existsOnDisk: workflowExistsOnDisk,
-    // #442 — content oracle for the in-place-overwrite gate: authorize a forced
-    // overwrite of a drifted tab's OWN file ONLY when the on-disk bytes still match
-    // what it loaded (else refuse, never clobber an external change). Same reader the
-    // defect-2 staleness check uses — one probe.
-    readDiskContent: workflowDiskContent,
+    // #442 — RAW-BYTE oracle for the in-place-overwrite gate: authorize a forced
+    // overwrite of a drifted tab's OWN file ONLY when the on-disk BYTES still match a
+    // canonical encoding of what it loaded (else refuse, never clobber an external change
+    // — including a BOM a decoded-string compare would miss, codex P0).
+    readDiskBytes: workflowDiskBytes,
     reconcileSavedCopy: reconcileSavedWorkflowCopy,
     details,
     expect: expectWf, // #330: refuse if the user switched tabs during our pre-save HEAD
@@ -2752,6 +2752,28 @@ async function workflowDiskContent(rawPath) {
     return await res.text();
   } catch {
     return null; // unknown ⇒ fail safe (surfaced as stale:"unknown", never false-fresh)
+  }
+}
+
+/** #442 defect 3 — the CURRENT on-disk file as RAW BYTES (Uint8Array), or null when it
+ *  can't be read. The in-place-overwrite gate MUST compare raw bytes, not decoded text:
+ *  Response.text() consumes a UTF-8 BOM, so a decoded compare treats `A` and `BOM+A` as
+ *  equal and would authorize a clobber of the BOM-bearing external change (codex P0).
+ *  arrayBuffer() preserves every byte. Same api.getUserData→fetchApi resolution as the
+ *  text reader; null on any error/absence ⇒ the gate leaves overwrite:false (fails safe). */
+async function workflowDiskBytes(rawPath) {
+  try {
+    if (!api || !rawPath) return null;
+    const res =
+      typeof api.getUserData === "function"
+        ? await api.getUserData(rawPath)
+        : typeof api.fetchApi === "function"
+          ? await api.fetchApi(`/userdata/${encodeURIComponent(rawPath)}`)
+          : null;
+    if (!res || res.status !== 200) return null;
+    return new Uint8Array(await res.arrayBuffer());
+  } catch {
+    return null; // unknown ⇒ fail safe (gate leaves overwrite:false — never a forced clobber)
   }
 }
 

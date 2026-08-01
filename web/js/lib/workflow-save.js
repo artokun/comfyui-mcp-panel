@@ -1,9 +1,10 @@
 // Programmatic workflow saving — shared by the panel and unit tests.
 //
-// #442 defect 3 — the in-place-overwrite gate compares the on-disk bytes against the
-// tab's loaded baseline using the SAME byte-exact primitive the open-side staleness
-// check uses, so "did the file change under us?" is judged identically on both paths.
-import { workflowContentEqual } from "./workflow-open-staleness.js";
+// #442 defect 3 — the in-place-overwrite gate compares the on-disk file's RAW BYTES
+// against a canonical UTF-8 encoding of the tab's loaded baseline text, so a BOM (or any
+// byte-level) difference a decoded-string compare would miss cannot authorize a
+// destructive overwrite. See diskBytesEqualText for why raw bytes are required.
+import { diskBytesEqualText } from "./workflow-open-staleness.js";
 
 // The one hard rule here exists because of a silent data-loss bug (issue #226):
 // "save this workflow as X" MUST write a NEW file and leave the original file on
@@ -266,7 +267,7 @@ export async function groundActiveWorkflow(svc, opts = {}) {
 export async function saveActiveWorkflow(
   svc,
   name,
-  { autoWorkflowName, existsOnDisk, readDiskContent, reconcileSavedCopy, expect, details } = {},
+  { autoWorkflowName, existsOnDisk, readDiskBytes, reconcileSavedCopy, expect, details } = {},
 ) {
   const wf = svc?.activeWorkflow;
   if (!wf) throw new Error("no active workflow to save");
@@ -537,7 +538,7 @@ export async function saveActiveWorkflow(
   // assert would leave the FORMER tab marked persisted, and a later save of it would
   // skip the oracle and send overwrite:true from an aborted authorization (codex P2).
   // So: probe → assertExpect → THEN coerce synchronously, after the tab is re-verified.
-  const inPlace = await classifyInPlaceOverwrite(wf, currentPath, readDiskContent);
+  const inPlace = await classifyInPlaceOverwrite(wf, currentPath, readDiskBytes);
   assertExpect(); // the disk read above awaited — re-check the tab didn't switch
   // A same-OBJECT rename during the await keeps object identity (so assertExpect
   // passes) but changes wf.path — the captured currentPath would no longer identify
@@ -575,26 +576,37 @@ export async function saveActiveWorkflow(
  *     runs), no reader / no path / no baseline to compare, or the file is absent
  *     (disk read null ⇒ overwrite:false safely CREATES it). Leaves behaviour unchanged.
  *
- *  PURE async probe: it never mutates `wf`. `readDiskContent(path) => string | null`
- *  is the authoritative on-disk content oracle (null = absent/unreadable). The caller
- *  applies markPersistedForOverwrite ONLY on "authorize", AFTER re-asserting the tab. */
-export async function classifyInPlaceOverwrite(wf, currentPath, readDiskContent) {
+ *  PURE async probe: it never mutates `wf`. `readDiskBytes(path) => Uint8Array | null`
+ *  is the authoritative on-disk RAW-BYTE oracle (null = absent/unreadable). Raw bytes —
+ *  not decoded text — because Response.text() strips a UTF-8 BOM, so a string compare
+ *  would treat `A` and `BOM+A` as equal and authorize a clobber of the BOM-bearing change
+ *  (codex P0). The caller applies markPersistedForOverwrite ONLY on "authorize", AFTER
+ *  re-asserting the tab. */
+export async function classifyInPlaceOverwrite(wf, currentPath, readDiskBytes) {
   if (!wf || wf.isPersisted === true) return "skip"; // already overwrite:true — untouched
-  if (typeof readDiskContent !== "function" || !currentPath) return "skip"; // no oracle ⇒ leave as-is
+  if (typeof readDiskBytes !== "function" || !currentPath) return "skip"; // no oracle ⇒ leave as-is
   const baseline = typeof wf.originalContent === "string" ? wf.originalContent : null;
   if (baseline == null) return "skip"; // no baseline to compare ⇒ cannot prove safe ⇒ leave as-is
   let disk = null;
   try {
-    disk = await readDiskContent(currentPath);
+    disk = await readDiskBytes(currentPath);
   } catch {
     disk = null; // read threw ⇒ unknown ⇒ do not force (server 409s honestly if it exists)
   }
-  if (typeof disk !== "string") return "skip"; // absent (create) / unreadable ⇒ leave as-is
-  // Content-equality gate (BYTE-EXACT): only when disk STILL equals what this tab loaded
-  // is the forced overwrite non-destructive. Any external change — including a change we
-  // can't distinguish by value — ⇒ conflict, never a clobber. Exact (not JSON-normalized)
-  // so a genuinely different file can never compare equal and slip through (codex P0).
-  return workflowContentEqual(disk, baseline) ? "authorize" : "conflict";
+  // Absent (create) / unreadable / not raw bytes ⇒ leave as-is (never a forced overwrite).
+  const bytes =
+    disk instanceof Uint8Array
+      ? disk
+      : disk && typeof disk.byteLength === "number"
+        ? new Uint8Array(disk)
+        : null;
+  if (!bytes) return "skip";
+  // Content-equality gate on RAW BYTES vs a canonical UTF-8 encoding of the baseline:
+  // only when the on-disk bytes are byte-identical to what this tab loaded is the forced
+  // overwrite non-destructive. Any external change — a different graph, or merely an added
+  // BOM / re-encoding a string compare would miss — ⇒ conflict, never a clobber. FAILS
+  // CLOSED (conflict) if it can't be proven byte-identical (diskBytesEqualText, codex P0).
+  return diskBytesEqualText(bytes, baseline) ? "authorize" : "conflict";
 }
 
 /** #442 — SYNCHRONOUS mutation that clears a drifted `isTemporary` so ComfyUI's
