@@ -610,6 +610,137 @@ test("waitForQueueDrain (real panel source) returns a drained status without Ref
 });
 
 // ---------------------------------------------------------------------------
+// #486 / #485 — legacy Manager 3.x install dialect. The install runtime lives in
+// comfyui-mcp-panel.js (managerQueueControl + nodes_install); we extract the real
+// source and assert its wiring so the fixes can't silently regress.
+// ---------------------------------------------------------------------------
+
+function readPanelSource() {
+  const panelPath = fileURLToPath(
+    new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
+  );
+  return readFileSync(panelPath, "utf8");
+}
+
+// #486 — queue/start is POST on pip v4 and the released 3.41 build, but GET-only
+// on some older released 3.x builds (ComfyUI 0.27.0 → HTTP 405 on POST). Drive
+// the REAL managerQueueControl source against mock `call`s to prove: POST first;
+// a 405 negotiates a single GET retry on the SAME route; any non-405 propagates
+// with NO GET retry.
+test("#486 managerQueueControl (real panel source): POST, then GET-retry ONLY on 405", async () => {
+  const src = readPanelSource();
+  const fnMatch = src.match(/async function managerQueueControl\([\s\S]*?\n\}/);
+  assert.ok(fnMatch, "could not locate managerQueueControl in panel source");
+
+  const isMethodNotAllowed = (err) => /HTTP\s*405\b/.test(String(err?.message ?? err ?? ""));
+  const MANAGER_FETCH_TIMEOUT_MS = 15000;
+  const factory = new Function(
+    "isMethodNotAllowed",
+    "MANAGER_FETCH_TIMEOUT_MS",
+    "AbortSignal",
+    `${fnMatch[0]}\nreturn managerQueueControl;`,
+  );
+  const managerQueueControl = factory(isMethodNotAllowed, MANAGER_FETCH_TIMEOUT_MS, AbortSignal);
+
+  // (a) POST succeeds ⇒ exactly one POST, no GET retry.
+  {
+    const calls = [];
+    const call = async (route, opts) => {
+      calls.push(opts?.method ?? "GET");
+    };
+    await managerQueueControl(call, "manager/queue/start");
+    assert.deepEqual(calls, ["POST"], "a working POST must NOT trigger a GET retry");
+  }
+
+  // (b) POST 405s (GET-only build) ⇒ negotiate a single GET retry on the SAME route.
+  {
+    const calls = [];
+    const call = async (route, opts) => {
+      const method = opts?.method ?? "GET";
+      calls.push({ route, method });
+      if (method === "POST") throw new Error("Manager manager/queue/start: HTTP 405");
+    };
+    await managerQueueControl(call, "manager/queue/start");
+    assert.deepEqual(
+      calls,
+      [
+        { route: "manager/queue/start", method: "POST" },
+        { route: "manager/queue/start", method: "GET" },
+      ],
+      "a 405 must negotiate POST→GET on the same route",
+    );
+  }
+
+  // (c) A non-405 error (e.g. 404 'not reachable') propagates with NO GET retry —
+  // a 405 is the ONLY method signal we negotiate.
+  {
+    let posts = 0;
+    let gets = 0;
+    const call = async (route, opts) => {
+      if ((opts?.method ?? "GET") === "POST") {
+        posts += 1;
+        throw new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)");
+      }
+      gets += 1;
+    };
+    await assert.rejects(() => managerQueueControl(call, "manager/queue/start"), /not reachable/);
+    assert.equal(posts, 1);
+    assert.equal(gets, 0, "a 404/unreachable must NOT be retried as GET");
+  }
+});
+
+// #486 — nodes_install must start the queue through managerQueueControl (which
+// negotiates POST→GET on 405), never a raw POST (the exact HTTP-405 bug). Guard
+// the install block's source.
+test("#486 nodes_install starts the queue via managerQueueControl, never a raw POST", () => {
+  const src = readPanelSource();
+  const fnMatch = src.match(/async nodes_install\(args\)\s*\{[\s\S]*?\n {2}\},/);
+  assert.ok(fnMatch, "could not locate nodes_install in panel source");
+  const body = fnMatch[0];
+  // The start goes through the negotiator, routed to the effective dialect's caller.
+  assert.match(
+    body,
+    /managerQueueControl\(\s*dialect === "legacy" \? managerCall : managerV2,\s*"manager\/queue\/start"\s*\)/,
+  );
+  // No raw start POST survives in the install path (the #486 regression).
+  assert.ok(
+    !/manager(V2|Call)\(\s*"manager\/queue\/start"\s*,\s*post\(\)\s*\)/.test(body),
+    "install must not send a raw POST to manager/queue/start",
+  );
+  // Exactly ONE start is issued (not one per dialect branch) — the submit is
+  // separated from start so the #485 fallback can't double-fire (codex P0).
+  const starts = body.match(/"manager\/queue\/start"/g) ?? [];
+  assert.equal(starts.length, 1, "install must start the queue exactly once");
+});
+
+// #485 — a non-legacy dialect whose /v2 mutation reports the Manager unreachable
+// (404) must fall back to the ABSOLUTE legacy install SUBMIT, exactly as
+// nodes_list already degrades — never surface a false 'not reachable'. The
+// fallback must wrap ONLY the enqueue (submit), never the start, so an already-
+// landed submission can't be re-fired (codex P0). Guard the wiring in source.
+test("#485 nodes_install falls back to the legacy dialect on an unreachable signal", () => {
+  const src = readPanelSource();
+  const fnMatch = src.match(/async nodes_install\(args\)\s*\{[\s\S]*?\n {2}\},/);
+  assert.ok(fnMatch, "could not locate nodes_install in panel source");
+  const body = fnMatch[0];
+  // The submit is attempted, and on an unreachable error from a non-legacy
+  // dialect, retried as legacy (mirrors nodes_list's absolute fallback).
+  assert.match(body, /let dialect = detected;/);
+  assert.match(body, /submitInstall\(dialect\)/);
+  assert.match(body, /submitInstall\("legacy"\)/);
+  assert.match(
+    body,
+    /dialect === "legacy" \|\| !isManagerUnreachable\(err\)/,
+    "must rethrow when already legacy or the error is not an unreachable signal",
+  );
+  // The single queue/start MUST live OUTSIDE the try/catch (after it) so a start
+  // failure never re-runs the submit (codex P0 — no double-fire).
+  const catchIdx = body.indexOf("catch (err)");
+  const startIdx = body.indexOf('managerQueueControl(dialect === "legacy"');
+  assert.ok(catchIdx >= 0 && startIdx > catchIdx, "queue/start must run after the submit try/catch");
+});
+
+// ---------------------------------------------------------------------------
 // 3.x-LEGACY dialect completeness (#423 list / #424 update-self / #425 restart)
 // ---------------------------------------------------------------------------
 
