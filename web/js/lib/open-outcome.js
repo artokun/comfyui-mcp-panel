@@ -98,9 +98,15 @@ function textOrNull(v) {
  * is not the same claim as "MY open, of THAT workflow, happened" (the wrong-workflow
  * failure mode the #570 identity work exists to prevent).
  *
- * `applied` is the load-bearing field: true only when the executor ran to completion.
- * A thrown open records `applied:false` WITH its error — that is a genuine NEGATIVE
- * signal, and it is just as important as the positive one.
+ * `applied` is the load-bearing field, and it is TRI-STATE:
+ *   true        — the executor ran to completion.
+ *   false       — it failed BEFORE changing anything. A genuine negative, just as
+ *                 important as the positive.
+ *   "unknown"   — it got far enough that something MAY have taken effect but the panel
+ *                 cannot confirm it (e.g. workflow_new's blank tab was created and then
+ *                 the frontend would not surface it). Recording `false` there would
+ *                 invite a retry, and workflow_new is NOT idempotent — a retry makes a
+ *                 SECOND blank workflow. Omitting the receipt entirely would do the same.
  */
 export function makeOpenReceipt({
   seq = 0,
@@ -124,7 +130,7 @@ export function makeOpenReceipt({
       filename: textOrNull(r.filename),
       routing_key: textOrNull(r.routing_key ?? r.routingKey),
     },
-    applied: Boolean(applied),
+    applied: applied === "unknown" ? "unknown" : Boolean(applied),
     error: textOrNull(error),
     at: Number.isFinite(at) ? at : 0,
     reconnect_epoch: Number.isFinite(reconnectEpoch) ? reconnectEpoch : 0,
@@ -217,7 +223,7 @@ export function receiptMatchesRequest(receipt, requested) {
  * B is reported as having opened. That is precisely the fabricated success #402 exists to
  * prevent. Without a rid to correlate, the only truthful verdict is "undetermined".
  */
-export function receiptAnswersCommand(receipt, { requested, rid } = {}) {
+export function receiptAnswersCommand(receipt, { requested, rid, expectedTarget } = {}) {
   const wantRid = textOrNull(rid);
   if (!receipt || !wantRid) return false;
   if (receipt.rid !== wantRid) return false;
@@ -225,6 +231,14 @@ export function receiptAnswersCommand(receipt, { requested, rid } = {}) {
   // rather than answer, so a mis-stamped receipt can never speak for another workflow.
   const wantRequested = textOrNull(requested);
   if (wantRequested && !receiptMatchesRequest(receipt, wantRequested)) return false;
+  // OPTIONAL canonical target (codex): a SELECTOR is not an identity. workflow_open may
+  // refresh the frontend's workflow list mid-command and re-resolve an ambiguous selector,
+  // so a caller that knows the canonical target it meant (path / routing key, e.g. from
+  // the dispatch-time pin) can require the receipt to have LANDED there. Without it the
+  // receipt still tells the truth — `resolved` names what was actually opened — but the
+  // caller must read it; this makes the check enforceable instead of advisory.
+  const wantTarget = textOrNull(expectedTarget);
+  if (wantTarget && !receiptMatchesRequest(receipt, wantTarget)) return false;
   return true;
 }
 
@@ -249,6 +263,7 @@ export function receiptAnswersCommand(receipt, { requested, rid } = {}) {
 export function classifyOpenOutcome({
   requested,
   rid,
+  expectedTarget,
   receipt,
   activeMatchesRequest = false,
   activeConfirmed = false,
@@ -258,14 +273,36 @@ export function classifyOpenOutcome({
     active_confirmed: Boolean(activeConfirmed),
     correlated_by_rid: false,
   };
-  if (receiptAnswersCommand(receipt, { requested, rid })) {
+  if (receiptAnswersCommand(receipt, { requested, rid, expectedTarget })) {
     evidence.correlated_by_rid = true;
-    if (receipt.applied) {
+    // WHICH workflow it landed on is part of the verdict, never a footnote: a selector can
+    // resolve differently after a mid-command list refresh, so "applied" alone would let a
+    // reader assume the workflow they named (codex).
+    const landed =
+      receipt.resolved?.path || receipt.resolved?.routing_key || receipt.resolved?.filename || null;
+    if (receipt.applied === "unknown") {
+      return {
+        outcome: "undetermined",
+        possibly_applied: true,
+        opened: receipt.resolved,
+        detail:
+          `The panel STARTED "${receipt.cmd}" and cannot confirm whether it took effect` +
+          (receipt.error ? ` (${receipt.error})` : ".") +
+          ` Do NOT blindly retry: "${receipt.cmd}" is not idempotent, so a retry can leave a ` +
+          `second workflow behind. Read the open workflow list and decide from what is there.`,
+        evidence: { ...evidence, receipt: summarizeOpenReceipt(receipt) },
+      };
+    }
+    if (receipt.applied === true) {
       return {
         outcome: "applied",
+        opened: receipt.resolved,
         detail:
-          `The panel completed "${receipt.cmd}" for "${receipt.requested ?? requested}"` +
-          (receipt.reply_sent ? "." : " but could not deliver the reply."),
+          `The panel completed "${receipt.cmd}" and it landed on ${landed ? `"${landed}"` : "the reported workflow"}` +
+          (receipt.requested && landed && receipt.requested !== landed
+            ? ` (asked for "${receipt.requested}" — confirm this is the workflow you meant)`
+            : "") +
+          (receipt.reply_sent ? "." : ", but could not deliver the reply."),
         evidence: { ...evidence, receipt: summarizeOpenReceipt(receipt) },
       };
     }

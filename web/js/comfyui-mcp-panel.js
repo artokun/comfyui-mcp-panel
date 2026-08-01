@@ -7465,9 +7465,35 @@ const GRAPH_TOOL_EXECUTORS = {
     // P1). We only claim authoritative below when the epoch is UNCHANGED.
     const openedForEpoch = backendReconnectEpoch;
     const mgr = app?.extensionManager;
-    if (!mgr?.command?.execute) throw new Error("command service unavailable");
+    if (!mgr?.command?.execute) {
+      // Nothing ran — a clean negative (#402): safe to retry.
+      noteOpenAttempt({
+        cmd: "workflow_new",
+        rid,
+        requested: null,
+        resolved: null,
+        applied: false,
+        error: "command service unavailable",
+      });
+      throw new Error("command service unavailable");
+    }
     // Comfy.NewBlankWorkflow opens a fresh TAB — the current workflow is untouched.
-    await mgr.command.execute("Comfy.NewBlankWorkflow");
+    try {
+      await mgr.command.execute("Comfy.NewBlankWorkflow");
+    } catch (err) {
+      // The creation command itself threw. It may have got partway, and workflow_new is
+      // NOT idempotent — a blind retry can leave a second blank tab. Journal it as
+      // UNKNOWN, never as a clean failure (#402 / codex).
+      noteOpenAttempt({
+        cmd: "workflow_new",
+        rid,
+        requested: null,
+        resolved: null,
+        applied: "unknown",
+        error: coerceMessageText(err?.message ?? err),
+      });
+      throw err instanceof Error ? err : new Error(coerceMessageText(err));
+    }
     // Bind a UNIQUE, stable routing identity to the just-created tab NOW, at
     // creation, so a session pinned to this key routes subsequent graph_* edits to
     // THIS graph and never a pre-existing "Unsaved Workflow" tab (#186). Native
@@ -7478,11 +7504,23 @@ const GRAPH_TOOL_EXECUTORS = {
     // a title alone would invite the agent to edit whatever unsaved tab is active.
     const wf = activeWorkflowRef();
     if (!wf) {
-      throw new Error(
+      // #402 / codex — the blank tab WAS created; only the routing identity is missing. If
+      // this reply is lost, "no receipt" and "applied:false" would both read as "nothing
+      // happened" and invite a retry — and workflow_new is NOT idempotent, so that retry
+      // leaves a SECOND blank workflow behind. Journal it as UNKNOWN instead.
+      const error =
         "workflow_new: created a blank workflow but the frontend did not expose it as the " +
-          "active workflow — cannot establish a unique routing target. Retry, or select the new " +
-          "tab before editing.",
-      );
+        "active workflow — cannot establish a unique routing target. Retry, or select the new " +
+        "tab before editing.";
+      noteOpenAttempt({
+        cmd: "workflow_new",
+        rid,
+        requested: null,
+        resolved: null,
+        applied: "unknown",
+        error,
+      });
+      throw new Error(error);
     }
     // Mint the per-instance tmp: routing id (and seed the transcript uuid) eagerly so
     // the key exists BEFORE the first edit and is returned for pinning.
@@ -7655,26 +7693,32 @@ const GRAPH_TOOL_EXECUTORS = {
     // staleInfo.stale === true, and it never downgrades that to "fresh" — so the
     // false-fresh window codex closed (read stale → file changes → report fresh) still
     // cannot open. The provably-fresh and "unknown" paths reach the return with no await.
+    // The clean sample above authorizes the load, but everything that follows is AWAITED —
+    // `loadGraphData` may yield before it replaces the graph, and clearSpuriousOpenModified
+    // awaits a frame and then RE-BASELINES the change tracker (capture → reset → force
+    // isModified=false). A canvas edit landing in EITHER window would be destroyed by, or
+    // silently absorbed into, a reload the user never asked for (codex P1 x2). Nobody
+    // requested this reload, so it must not be able to take work with it: freeze canvas
+    // interaction across the WHOLE sequence — load AND re-baseline — and restore it in a
+    // finally. Bound to a local whose name does NOT end in "s": the #268 frontend-contract
+    // scanner captures members off the workflow-service alias `s` with an unanchored `s\.`
+    // pattern, so `canvas.<member>` would be misread as a new workflow-SERVICE dependency.
+    // This is a LiteGraph canvas flag, not a workflow-service member.
+    const canvasView = app?.canvas;
+    const priorInteraction =
+      typeof canvasView?.allow_interaction === "boolean" ? canvasView.allow_interaction : null;
     let reloaded = false;
     let reloadError = null;
-    if (staleInfo.reload && !dirtyNow) {
-      // The clean sample above authorizes the load, but `loadGraphData` is AWAITED — if it
-      // yields before it replaces the graph, a canvas edit made in that window would be
-      // destroyed by a load the user never asked for (codex P1). Nobody requested this
-      // reload, so it must not be able to take work with it: freeze canvas interaction for
-      // the duration and restore it in a finally, whatever happens. Best-effort by design
-      // (the flag name is a LiteGraph detail that may move), so it NARROWS the window
-      // rather than proving it shut — which is why the last-instant `dirtyNow` re-check
-      // above stays, and why a dirty tab is never reloaded at all.
-      // Bound to a local whose name does NOT end in "s": the #268 frontend-contract
-      // scanner captures members off the workflow-service alias `s` with an unanchored
-      // `s\.` pattern, so `canvas.<member>` would be misread as a new workflow-SERVICE
-      // dependency. This is a LiteGraph canvas flag, not a workflow-service member.
-      const canvasView = app?.canvas;
-      const priorInteraction =
-        typeof canvasView?.allow_interaction === "boolean" ? canvasView.allow_interaction : null;
+    if (staleInfo.reload && !dirtyNow && priorInteraction === null) {
+      // NO reliable freeze on this frontend ⇒ do NOT perform the automatic destructive
+      // reload at all (codex). Serving a stale graph with a loud flag is recoverable;
+      // silently eating an edit the user made during an unrequested load is not.
+      reloadError =
+        "this frontend does not expose the canvas interaction flag, so an automatic reload " +
+        "could not be protected against a concurrent edit and was skipped";
+    } else if (staleInfo.reload && !dirtyNow) {
       try {
-        if (priorInteraction !== null) canvasView.allow_interaction = false;
+        canvasView.allow_interaction = false;
         const diskGraph = JSON.parse(onDiskContent);
         // 4th arg associates the load with THIS tab (same as the repaint above), so the
         // on-disk graph replaces the tab's buffer in place instead of spawning a new
@@ -7698,6 +7742,11 @@ const GRAPH_TOOL_EXECUTORS = {
         } catch {
           /* getter-only — the stale flag simply re-reports until the next save */
         }
+        // A programmatic load dirties the change tracker; clear that so the re-read does
+        // not leave the tab looking edited (which would block an unforced close). INSIDE
+        // the freeze on purpose: it re-baselines, so an edit made during its frame would be
+        // adopted as "not modified" and could later be discarded without a prompt.
+        await clearSpuriousOpenModified(target);
         reloaded = true;
       } catch (err) {
         // NEVER claim a reload we did not complete — report the failure and leave the
@@ -7707,12 +7756,8 @@ const GRAPH_TOOL_EXECUTORS = {
       } finally {
         // Hand the canvas back on EVERY path — a throw here must never leave the user
         // with a frozen graph.
-        if (priorInteraction !== null) canvasView.allow_interaction = priorInteraction;
+        canvasView.allow_interaction = priorInteraction;
       }
-      // A programmatic load dirties the change tracker; clear that so the re-read does not
-      // leave the tab looking edited (which would block an unforced close). Outside the
-      // interaction lock: it awaits a frame, and the canvas must be live by then.
-      if (reloaded) await clearSpuriousOpenModified(target);
     }
     const receipt = noteOpenAttempt({
       cmd: "workflow_open",

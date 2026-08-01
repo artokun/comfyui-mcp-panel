@@ -226,6 +226,52 @@ test("the exported receipt summary carries the rid (without it nothing can corre
   assert.equal(s.rid, "rid-1");
 });
 
+test('#402 codex P1: applied:"unknown" ⇒ undetermined + possibly_applied + a do-not-retry warning', () => {
+  // workflow_new created the blank tab but the frontend never surfaced it. Reporting a
+  // clean failure (or nothing) would invite a retry, and workflow_new is NOT idempotent.
+  const receipt = makeOpenReceipt({
+    seq: 3,
+    cmd: "workflow_new",
+    rid: "rid-N",
+    applied: "unknown",
+    error: "frontend did not expose the new workflow",
+    at: 10,
+  });
+  assert.equal(receipt.applied, "unknown", "the tri-state must survive normalization");
+  const v = classifyOpenOutcome({ rid: "rid-N", receipt });
+  assert.equal(v.outcome, "undetermined");
+  assert.equal(v.possibly_applied, true);
+  assert.match(v.detail, /not idempotent/);
+  assert.match(v.detail, /Do NOT blindly retry/);
+});
+
+test('#402 codex P1: "applied" names the workflow it LANDED on, and flags a re-resolved selector', () => {
+  // A selector can resolve differently after a mid-command list refresh, so "applied"
+  // alone would let a reader assume the workflow they named.
+  const receipt = makeOpenReceipt({
+    seq: 4,
+    cmd: "workflow_open",
+    rid: "rid-1",
+    requested: "x",
+    resolved: { path: "workflows/b.json", filename: "b.json", routing_key: "wf:workflows/b.json" },
+    applied: true,
+    at: 5,
+  });
+  const v = classifyOpenOutcome({ requested: "x", rid: "rid-1", receipt });
+  assert.equal(v.outcome, "applied");
+  assert.equal(v.opened.path, "workflows/b.json");
+  assert.match(v.detail, /landed on "workflows\/b\.json"/);
+  assert.match(v.detail, /confirm this is the workflow you meant/);
+  // …and a caller that knows its canonical target can make that check ENFORCEABLE.
+  const strict = classifyOpenOutcome({
+    requested: "x",
+    rid: "rid-1",
+    expectedTarget: "workflows/a.json",
+    receipt,
+  });
+  assert.equal(strict.outcome, "undetermined", "a receipt that landed elsewhere must not answer");
+});
+
 test("receiptMatchesRequest accepts any RESOLVED identity form of the same open", () => {
   const r = receiptFor("workflows/x.json");
   assert.equal(receiptMatchesRequest(r, "workflows/x.json"), true);
@@ -293,18 +339,61 @@ test("#442 codex P1: the destructive re-read freezes canvas interaction and ALWA
   // while it yields would be destroyed by a reload nobody asked for.
   const lockAt = body.indexOf("canvasView.allow_interaction = false;");
   const loadAt = body.indexOf("await app.loadGraphData(diskGraph");
+  const rebaselineAt = body.indexOf("await clearSpuriousOpenModified(target);", loadAt);
   const restoreAt = body.indexOf("canvasView.allow_interaction = priorInteraction;");
   assert.ok(lockAt !== -1 && loadAt !== -1 && restoreAt !== -1, "the load must be bracketed by an interaction lock");
-  assert.ok(lockAt < loadAt && loadAt < restoreAt, "lock → load → restore");
+  // clearSpuriousOpenModified awaits a frame and then RE-BASELINES the change tracker, so
+  // an edit made during it would be adopted as "not modified" and later dropped silently.
+  // The freeze must therefore cover the re-baseline too, not just the load (codex).
+  assert.notEqual(rebaselineAt, -1, "the reload must re-baseline the change tracker");
+  assert.ok(
+    lockAt < loadAt && loadAt < rebaselineAt && rebaselineAt < restoreAt,
+    "lock → load → re-baseline → restore (the freeze must span the re-baseline)",
+  );
   // The restore must live in a `finally`, so a throwing load can never strand a frozen canvas.
   const tail = body.slice(loadAt, restoreAt + 200);
   assert.match(tail, /\} finally \{[\s\S]*allow_interaction = priorInteraction;/, "the restore must be in a finally");
-  // …and only when we actually captured a boolean to restore.
   assert.match(body, /typeof canvasView\?\.allow_interaction === "boolean"/);
   // The local must NOT be named so that it ends in "s": the #268 contract scanner
   // captures `s\.<member>` unanchored, so `canvas.allow_interaction` reads as a new
   // workflow-SERVICE dependency and fails that gate.
   assert.equal(/\bcanvas\.allow_interaction/.test(body), false);
+});
+
+test("#442 codex P1: with NO reliable freeze available, the destructive reload is SKIPPED", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const body = handlerBody(src, "async workflow_open({");
+  // Serving a stale graph behind a loud flag is recoverable; silently eating an edit made
+  // during an unrequested load is not. So an absent allow_interaction must skip the reload.
+  assert.match(
+    body,
+    /if \(staleInfo\.reload && !dirtyNow && priorInteraction === null\) \{/,
+    "no interaction flag ⇒ no automatic reload",
+  );
+  assert.match(body, /could not be protected against a concurrent edit and was skipped/);
+});
+
+test("#402 codex P1: workflow_new records UNKNOWN (never a clean failure) once creation started", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const body = handlerBody(src, "async workflow_new({");
+  assert.ok(body, "workflow_new must exist");
+  // Before the creation command runs, a failure is a clean negative — safe to retry.
+  assert.match(body, /applied: false,\s*\n\s*error: "command service unavailable"/);
+  // After it runs, a blank tab may exist. workflow_new is NOT idempotent, so neither
+  // "no receipt" nor applied:false is acceptable — both read as "nothing happened".
+  const created = body.indexOf('await mgr.command.execute("Comfy.NewBlankWorkflow");');
+  assert.notEqual(created, -1);
+  const afterCreate = body.slice(created);
+  assert.equal(
+    /applied: false/.test(afterCreate),
+    false,
+    "no path after the creation command may record a clean failure",
+  );
+  assert.equal(
+    (afterCreate.match(/applied: "unknown"/g) || []).length >= 1,
+    true,
+    "a post-creation failure must be journaled as UNKNOWN",
+  );
 });
 
 test("#570 P0b: the #442 re-read must KEEP this tab's instance identity (no mid-open fork)", () => {
