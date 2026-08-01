@@ -40,21 +40,39 @@ export function isLinkPersisted(graph, target, inIdx, link) {
 }
 
 /**
- * Best-effort removal of a NON-persisted phantom link so a failed connect leaves the
- * graph clean (no dangling half-link the next serialize would trip over). Fully
- * defensive: tries the graph's own removeLink, else clears a matching stored entry.
- * Never throws.
+ * Best-effort removal of the DANGLING remnant of a FAILED connect attempt so the graph
+ * is left clean (no half-link the next serialize would trip over). Removes the link ID
+ * ONLY when it is the debris of the attempt we just made — the stored link still claims
+ * to target the EXACT (target node, input slot) we tried, yet that input does not
+ * back-reference it. If a dynamic node RE-SLOTTED the link to a DIFFERENT input (the
+ * stored link's target points elsewhere), that is a LEGITIMATE connection and is NEVER
+ * deleted — deleting it would destroy a real wire the node deliberately moved. Fully
+ * defensive; never throws. Takes the same (graph, target, inIdx, link) the persistence
+ * check used so the "is this our debris?" decision is grounded in the live link store.
  */
-export function removePhantomLink(graph, link) {
+export function removePhantomLink(graph, target, inIdx, link) {
   const linkId = link?.id;
   if (linkId == null || !graph) return;
   try {
+    const links = graph.links;
+    if (!links) return;
+    const stored = typeof links.get === "function" ? links.get(linkId) : links[linkId];
+    // Nothing stored under this id ⇒ the connect was fully reverted; nothing to clean up.
+    if (stored == null) return;
+    // The stored link must still point at the SLOT we attempted; only then is an
+    // unreferenced input the signature of our dangling attempt. LLink exposes
+    // target_id/target_slot (array-form links use [3]/[4]).
+    const targetId = stored.target_id ?? stored[3];
+    const targetSlot = stored.target_slot ?? stored[4];
+    const sameSlot =
+      String(targetId) === String(target?.id) && Number(targetSlot) === Number(inIdx);
+    const inputReferencesIt = target?.inputs?.[inIdx]?.link === linkId;
+    // Re-slotted elsewhere (not our slot) OR actually attached ⇒ a real link; keep it.
+    if (!sameSlot || inputReferencesIt) return;
     if (typeof graph.removeLink === "function") {
       graph.removeLink(linkId);
       return;
     }
-    const links = graph.links;
-    if (!links) return;
     if (typeof links.delete === "function") links.delete(linkId);
     else if (Object.prototype.hasOwnProperty.call(links, linkId)) delete links[linkId];
   } catch {

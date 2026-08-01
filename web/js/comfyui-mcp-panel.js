@@ -5543,7 +5543,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // socket like LatentSwitch does persist). Verify the link actually landed on the
     // live graph; if not, clean up the phantom and FAIL HONESTLY.
     if (!isLinkPersisted(graph, target, inIdx, link)) {
-      removePhantomLink(graph, link);
+      // Clean up ONLY the dangling remnant of THIS attempt — never a link a dynamic
+      // node re-slotted to another input (removePhantomLink guards that internally).
+      removePhantomLink(graph, target, inIdx, link);
       graph.setDirtyCanvas(true, true);
       const inputSlot = target.inputs?.[inIdx];
       const widgetHint = isWidgetBackedInput(inputSlot)
