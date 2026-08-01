@@ -126,6 +126,7 @@ import {
   controlAfterGenerateEntries,
 } from "./lib/control-after-generate.js";
 import { autoMatchSlots, slotDiagnostic } from "./lib/connect-match.js";
+import { isLinkPersisted, removePhantomLink, isWidgetBackedInput } from "./lib/connect-verify.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
 import { isImeComposing } from "./lib/ime.js";
 import {
@@ -5533,6 +5534,33 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!link) {
       throw new Error(slotDiagnostic(origin, target, { from_output, to_input }));
     }
+    // #397 CONNECT HONESTY: origin.connect() can return a truthy link that LiteGraph
+    // does NOT persist — a WIDGET-backed target input (rgthree/Impact nodes expose
+    // e.g. ImpactSwitch "select" as an INT widget, not a real socket) accepts the
+    // link momentarily and then reverts/re-slots it away, leaving the live graph
+    // disconnected. Reporting success on the truthy return alone FALSELY claimed a
+    // persisted wire (the exact ImpactSwitch bug; the same Reroute→select on a real
+    // socket like LatentSwitch does persist). Verify the link actually landed on the
+    // live graph; if not, clean up the phantom and FAIL HONESTLY.
+    if (!isLinkPersisted(graph, target, inIdx, link)) {
+      // Clean up ONLY the dangling remnant of THIS attempt — never a link a dynamic
+      // node re-slotted to another input (removePhantomLink guards that internally).
+      removePhantomLink(graph, target, inIdx, link);
+      graph.setDirtyCanvas(true, true);
+      const inputSlot = target.inputs?.[inIdx];
+      const widgetHint = isWidgetBackedInput(inputSlot)
+        ? ` The target input "${inputSlot?.name ?? inIdx}" is a WIDGET-backed input that ` +
+          `did not accept a persistent link — set its value directly with panel_set_widget, ` +
+          `or convert the widget to an input slot in the ComfyUI UI first, then connect.`
+        : "";
+      throw new Error(
+        `panel_connect reported no persisted link: node ${origin.id} output ` +
+          `"${origin.outputs?.[outIdx]?.name ?? outIdx}" (${origin.outputs?.[outIdx]?.type}) → ` +
+          `node ${target.id} input "${target.inputs?.[inIdx]?.name ?? inIdx}". LiteGraph accepted ` +
+          `the connection but the live graph shows no wire, so refusing to report a false success.` +
+          widgetHint,
+      );
+    }
     return {
       connected: {
         from: {
@@ -5614,6 +5642,30 @@ const GRAPH_TOOL_EXECUTORS = {
           return;
         }
         return refreshComfyNodeDefs();
+      },
+      // #387: last-resort probe for an UPLOAD input value the refreshed /object_info
+      // combo still cannot list — a LoadImage image uploaded under a SUBFOLDER (ComfyUI
+      // enumerates only TOP-LEVEL input files in LoadImage.INPUT_TYPES, but load_image
+      // resolves the nested path). Confirm the file EXISTS in the server's input
+      // directory via /view?type=input; a 2xx means it is a valid, loadable asset and
+      // set-widget.js accepts it. Range-limited so we do not download the whole file.
+      confirmServerAsset: async (assetValue) => {
+        try {
+          const v = String(assetValue ?? "").replace(/\\/g, "/");
+          const i = v.lastIndexOf("/");
+          const subfolder = i >= 0 ? v.slice(0, i) : "";
+          const filename = i >= 0 ? v.slice(i + 1) : v;
+          if (!filename) return false;
+          const qs = new URLSearchParams({ filename, subfolder, type: "input" }).toString();
+          const res = await api.fetchApi(`/view?${qs}`, {
+            method: "GET",
+            cache: "no-store",
+            headers: { Range: "bytes=0-0" },
+          });
+          return !!res && (res.ok || res.status === 206);
+        } catch {
+          return false;
+        }
       },
     });
   },

@@ -29,6 +29,7 @@ import {
   assertTypeAgainstFreshBackend,
 } from "./node-resolve.js";
 import { controlAfterGenerateWarning } from "./control-after-generate.js";
+import { uploadInputConfig, uploadInputAccepts, addComboOption } from "./input-asset.js";
 
 export async function runSetWidget(
   node,
@@ -44,6 +45,7 @@ export async function runSetWidget(
     afterChange,
     setDirty,
     refreshCombos,
+    confirmServerAsset,
   } = {},
 ) {
   const liveRegistry = () => (typeof getRegistry === "function" ? getRegistry() : registry);
@@ -216,31 +218,68 @@ export async function runSetWidget(
     return warning ? { ...result, warning } : result;
   };
 
+  // #387 UPLOAD-ASSET fallback: a value rejected by the combo list even AFTER the
+  // authoritative /object_info refresh may still be a VALID, loadable input asset the
+  // server has on disk but /object_info never enumerates — specifically a LoadImage
+  // image uploaded under a SUBFOLDER (ComfyUI's LoadImage.INPUT_TYPES lists only
+  // TOP-LEVEL input files, yet load_image resolves a nested `subfolder/name.png`).
+  // When the mutated widget is an UPLOAD input (per the fresh def's config flags) and
+  // the injected probe CONFIRMS the file exists in the server's input directory, add
+  // it to the live option list and revalidate ONCE. Gated to upload inputs AND to
+  // server-confirmed files, so #240 strictness holds (never a blanket accept).
+  const tryUploadAssetAccept = async () => {
+    if (typeof confirmServerAsset !== "function") return false;
+    const cfg = uploadInputConfig(
+      freshDefs ?? undefined,
+      authTarget?.type,
+      concreteWidgetName ?? writeTargetWidgetName ?? widgetName,
+    );
+    if (!cfg) return false;
+    // #240 strictness: a server-existence probe alone is too loose — `/view?type=input`
+    // serves ANY input file, so accept ONLY a value whose extension is a loadable asset
+    // of THIS input's upload kind (e.g. an image extension for an image_upload combo),
+    // never a stray `.txt` the LoadImage combo would never list.
+    if (!uploadInputAccepts(cfg, value)) return false;
+    const uploadWidget = (resolvedTargetNode?.widgets ?? []).find(
+      (w) => w?.name === (writeTargetWidgetName ?? widgetName),
+    );
+    if (!uploadWidget) return false;
+    let exists = false;
+    try {
+      exists = await confirmServerAsset(value);
+    } catch {
+      exists = false;
+    }
+    if (!exists) return false;
+    return addComboOption(uploadWidget, value);
+  };
+
   try {
     return withWarning({ set: write() });
   } catch (err) {
-    // STALE-COMBO RECOVERY (#338/#317/#299/#288/#284/#304): the ONLY retryable
-    // failure is a COMBO value rejected against the widget's CURRENT option list
-    // — a just-downloaded model / uploaded image / staged output / freshly
-    // installed pack that the frontend combo snapshot doesn't list yet. When a
-    // refresh source is injected, pull the AUTHORITATIVE option list from the
-    // connected server (object_info + refreshComboInNodes, in place) and
-    // revalidate EXACTLY ONCE. This keeps #240's strictness intact: the retry
-    // validates against the FRESH list, so a genuinely-invalid value (still
-    // absent after refresh) is rejected, and no other error class is retried.
-    if (err instanceof WidgetWriteError && err.combo && typeof refreshCombos === "function") {
+    // Only a COMBO rejection is EVER retryable — every other WidgetWriteError
+    // (numeric/boolean/promotion/composite/stuck-check) fails closed immediately.
+    if (!(err instanceof WidgetWriteError)) throw err;
+    if (!err.combo) {
+      throw new Error(
+        `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ${err.message}`,
+      );
+    }
+
+    // STALE-COMBO RECOVERY (#338/#317/#299/#288/#284/#304): a just-downloaded model /
+    // TOP-LEVEL uploaded image / staged output / freshly installed pack the frontend
+    // combo snapshot doesn't list yet. Pull the AUTHORITATIVE option list from the
+    // connected server and revalidate EXACTLY ONCE, then fall back to the #387
+    // upload-asset probe for a value the refreshed list still cannot contain.
+    let latest = err;
+    if (typeof refreshCombos === "function") {
       try {
         // Reuse the /object_info payload already fetched for type authorization so a
-        // combo miss does not round-trip /object_info a SECOND time (#458 P2): the
-        // production refreshCombos refreshes THIS target's combo options from the
-        // passed defs instead of calling refreshComboInNodes (which re-fetches). The
-        // resolved WRITE target (the intermediate inner node for a nested promotion) is
-        // the node whose widget is mutated, but its authoritative options must be keyed
-        // on the ULTIMATE CONCRETE type (authTarget) — a virtual intermediate is absent
-        // from /object_info, so keying on it would refresh nothing and reject a valid
-        // just-staged value (#458 nested combo-refresh). A RENAMED nested promotion also
-        // needs the mutated widget's name bridged to the concrete def's input name (#366
-        // rename support). When defs are unavailable it falls back to a full refresh.
+        // combo miss does not round-trip /object_info a SECOND time (#458 P2). Key the
+        // options on the ULTIMATE CONCRETE type (authTarget) — a virtual intermediate is
+        // absent from /object_info — and bridge a RENAMED nested promotion's widget name
+        // to the concrete def input name (#366). A missing payload falls back to a full
+        // refresh inside the injected callback.
         const comboNameMap =
           writeTargetWidgetName && concreteWidgetName
             ? { [writeTargetWidgetName]: concreteWidgetName }
@@ -252,20 +291,39 @@ export async function runSetWidget(
       try {
         return withWarning({ set: write(), refreshed: true });
       } catch (retryErr) {
-        if (retryErr instanceof WidgetWriteError) {
+        if (!(retryErr instanceof WidgetWriteError)) throw retryErr;
+        // A NON-combo failure on the retry is terminal — fail closed loudly.
+        if (!retryErr.combo) {
           throw new Error(
             `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}) ` +
               `after refreshing combo options: ${retryErr.message}`,
           );
         }
-        throw retryErr;
+        // Still a combo miss after the refresh — keep the freshest reason and try the
+        // upload-asset fallback below.
+        latest = retryErr;
       }
     }
-    if (err instanceof WidgetWriteError) {
-      throw new Error(
-        `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ${err.message}`,
-      );
+
+    // #387: server-confirmed upload asset (e.g. a subfolder-nested LoadImage image).
+    if (await tryUploadAssetAccept()) {
+      try {
+        return withWarning({ set: write(), refreshed: true, server_confirmed: true });
+      } catch (confErr) {
+        if (confErr instanceof WidgetWriteError) {
+          throw new Error(
+            `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}) ` +
+              `after confirming the uploaded asset exists on the server: ${confErr.message}`,
+          );
+        }
+        throw confErr;
+      }
     }
-    throw err;
+
+    // No recovery succeeded — refuse honestly with the freshest rejection.
+    throw new Error(
+      `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type})` +
+        `${typeof refreshCombos === "function" ? " after refreshing combo options" : ""}: ${latest.message}`,
+    );
   }
 }
