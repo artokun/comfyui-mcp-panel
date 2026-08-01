@@ -137,6 +137,7 @@ import {
   formatDroppedWarning,
 } from "./lib/paste-report.js";
 import { createMediaRecorder } from "./lib/chat-media.js";
+import { createLightboxModel } from "./lib/lightbox-gallery.js";
 import {
   vueNodesActive,
   computeFitTransform,
@@ -9171,6 +9172,70 @@ const PANEL_CSS = `
 .cmcp-modal-scope input { margin-top: 0.15rem; }
 .cmcp-modal-btns { display: flex; justify-content: flex-end; gap: 0.4rem; }
 .cmcp-btn-primary { background: var(--p-primary-color, #3a7bd5); color: #fff; border: none; }
+/* In-panel media lightbox (#163): clicking a chat image (or a video card's
+   expand button) opens this full-window overlay instead of a raw new tab. It is
+   body-mounted (covers the whole ComfyUI window for a true "full size" view) and
+   theme-aware via the inherited PrimeVue --p-* tokens. Every pointer event is
+   stopped inside it so nothing leaks to the ComfyUI canvas underneath. */
+.cmcp-lightbox {
+  position: fixed; inset: 0; z-index: 10040; display: flex; flex-direction: column;
+  background: rgba(0,0,0,0.82); outline: none;
+}
+.cmcp-lightbox-stage {
+  position: relative; flex: 1 1 auto; min-height: 0;
+  display: flex; align-items: center; justify-content: center; padding: 2.5rem;
+}
+.cmcp-lightbox-media { display: flex; align-items: center; justify-content: center; max-width: 100%; max-height: 100%; }
+.cmcp-lightbox-el {
+  max-width: 100%; max-height: calc(100vh - 6rem); width: auto; height: auto;
+  display: block; border-radius: 6px; box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+  background: var(--p-surface-950, #111113);
+}
+.cmcp-lightbox-nav {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  width: 2.6rem; height: 2.6rem; border-radius: 50%; cursor: pointer;
+  font-size: 1.6rem; line-height: 1; display: flex; align-items: center; justify-content: center;
+  color: var(--p-text-color, #fafafa);
+  background: rgba(0,0,0,0.45); border: 1px solid var(--p-content-border-color, #3f3f46);
+}
+.cmcp-lightbox-nav:hover { background: var(--p-primary-color, #3a7bd5); color: #fff; }
+.cmcp-lightbox-prev { left: 0.75rem; }
+.cmcp-lightbox-next { right: 0.75rem; }
+.cmcp-lightbox-close {
+  position: absolute; top: 0.75rem; right: 0.75rem;
+  width: 2.2rem; height: 2.2rem; border-radius: 50%; cursor: pointer;
+  font-size: 1.1rem; line-height: 1; display: flex; align-items: center; justify-content: center;
+  color: var(--p-text-color, #fafafa);
+  background: rgba(0,0,0,0.45); border: 1px solid var(--p-content-border-color, #3f3f46);
+}
+.cmcp-lightbox-close:hover { background: var(--p-red-400, #f87171); color: #fff; }
+.cmcp-lightbox-bar {
+  flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 0.75rem;
+  padding: 0.6rem 0.9rem; background: var(--p-surface-900, #18181b);
+  border-top: 1px solid var(--p-content-border-color, #3f3f46);
+}
+.cmcp-lightbox-caption {
+  font-size: 0.75rem; color: var(--p-text-muted-color, #a1a1aa);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cmcp-lightbox-open {
+  flex: 0 0 auto; cursor: pointer; font-size: 0.72rem; padding: 0.3rem 0.6rem; border-radius: 6px;
+  color: var(--p-text-color, #fafafa);
+  background: var(--p-surface-800, #27272a); border: 1px solid var(--p-content-border-color, #3f3f46);
+}
+.cmcp-lightbox-open:hover { border-color: var(--p-primary-color, #60a5fa); color: var(--p-primary-color, #60a5fa); }
+/* Expand affordance on video cards — images open on click, but a video's own
+   surface is owned by its native controls, so it gets a dedicated button. */
+.cmcp-imgcard { position: relative; }
+.cmcp-media-expand {
+  position: absolute; top: 0.4rem; right: 0.4rem; z-index: 2;
+  width: 1.8rem; height: 1.8rem; border-radius: 6px; cursor: pointer;
+  font-size: 0.95rem; line-height: 1; display: flex; align-items: center; justify-content: center;
+  color: #fff; background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.25);
+  opacity: 0; transition: opacity 0.12s ease;
+}
+.cmcp-imgcard:hover .cmcp-media-expand, .cmcp-media-expand:focus-visible { opacity: 1; }
+.cmcp-media-expand:hover { background: var(--p-primary-color, #3a7bd5); }
 /* Agent text flows freely — no card/bubble. Only user messages are boxed. */
 .cmcp-bubble.agent {
   align-self: stretch; max-width: 100%;
@@ -12907,6 +12972,153 @@ function buildPanel() {
     scrollLog();
   }
 
+  // ── In-panel media lightbox (#163) ────────────────────────────────────────
+  // Chat media cards (images + videos) used to open in a raw new browser tab on
+  // click. #163 opens them in an in-app overlay viewer: full-size, prev/next
+  // across ALL media in the log, Esc / backdrop / button close, image+video,
+  // theme-aware. window.open (openMediaUrl) stays as an explicit "Open original"
+  // fallback. Only one lightbox is ever live; a second open tears down the first.
+  let _activeLightboxClose = null; // teardown of the live lightbox (owns its doc keydown)
+
+  // Every media card stashes its {url,type,caption} on `card._cmcpMedia` at paint
+  // time. Collect them all, in visual order, so a click opens the lightbox at the
+  // clicked card with prev/next reaching every other image/video in the chat.
+  function collectChatGallery(clickedCard) {
+    const items = [];
+    let index = 0;
+    for (const card of log.querySelectorAll(".cmcp-imgcard")) {
+      const m = card._cmcpMedia;
+      if (!m || !m.url) continue;
+      if (card === clickedCard) index = items.length;
+      items.push(m);
+    }
+    return { items, index };
+  }
+
+  function openMediaLightbox(items, startIndex) {
+    // At-most-one lightbox: tear down any prior one (and its doc keydown listener)
+    // before opening, so a second open can't strand the older listener.
+    if (_activeLightboxClose) {
+      try { _activeLightboxClose(); } catch { /* already gone */ }
+      _activeLightboxClose = null;
+    }
+    const model = createLightboxModel(items, startIndex);
+    if (!model.length) return; // nothing renderable
+
+    const overlay = document.createElement("div");
+    overlay.className = "cmcp-lightbox";
+    overlay.tabIndex = -1; // focusable → receives key events immediately
+    const stage = document.createElement("div");
+    stage.className = "cmcp-lightbox-stage";
+    const mediaWrap = document.createElement("div");
+    mediaWrap.className = "cmcp-lightbox-media";
+    const mkBtn = (cls, html, title) => {
+      const b = document.createElement("button");
+      b.type = "button"; b.className = cls; b.innerHTML = html; if (title) b.title = title;
+      return b;
+    };
+    const prevBtn = mkBtn("cmcp-lightbox-nav cmcp-lightbox-prev", "‹", "Previous");
+    const nextBtn = mkBtn("cmcp-lightbox-nav cmcp-lightbox-next", "›", "Next");
+    const closeBtn = mkBtn("cmcp-lightbox-close", "✕", "Close (Esc)");
+    const caption = document.createElement("div");
+    caption.className = "cmcp-lightbox-caption";
+    const openBtn = document.createElement("button");
+    openBtn.type = "button"; openBtn.className = "cmcp-lightbox-open";
+    openBtn.textContent = "Open original"; openBtn.title = "Open in a new browser tab";
+
+    // Release any decoded <video> before it leaves the DOM (memory + stop audio).
+    const releaseVideo = () => {
+      try {
+        const v = mediaWrap.querySelector("video");
+        if (v) { v.pause(); v.removeAttribute("src"); v.load(); }
+      } catch { /* best-effort */ }
+    };
+
+    const closeLb = () => {
+      releaseVideo();
+      overlay.remove();
+      window.removeEventListener("keydown", onKey, true);
+      if (_activeLightboxClose === closeLb) _activeLightboxClose = null;
+    };
+    _activeLightboxClose = closeLb;
+
+    const render = () => {
+      const it = model.current();
+      if (!it) { closeLb(); return; }
+      releaseVideo();
+      mediaWrap.innerHTML = "";
+      if (it.type === "video") {
+        const v = document.createElement("video");
+        v.src = it.url; v.controls = true; v.autoplay = true; v.loop = true;
+        v.playsInline = true; v.className = "cmcp-lightbox-el";
+        mediaWrap.appendChild(v);
+        v.play?.().catch(() => {}); // opened by a user gesture; ignore if blocked
+      } else {
+        const img = document.createElement("img");
+        img.src = it.url; img.alt = it.caption || "media"; img.className = "cmcp-lightbox-el";
+        mediaWrap.appendChild(img);
+      }
+      caption.textContent = it.caption || "";
+      caption.style.display = it.caption ? "" : "none";
+      const multi = model.hasMultiple();
+      prevBtn.style.display = multi ? "" : "none";
+      nextBtn.style.display = multi ? "" : "none";
+      openBtn._url = it.url;
+    };
+    const step = (d) => { model.step(d); render(); };
+
+    const onKey = (e) => {
+      // Respect IME composition: an Enter/Escape mid-CJK-compose commits a
+      // candidate — it must NOT close the viewer (mirror lib/ime.js, #385). We
+      // return WITHOUT stopping so the keystroke still reaches the IME/composer.
+      if (isImeComposing(e)) return;
+      // Registered on WINDOW capture so it runs before any document-level panel
+      // handler (the turn-interrupt Esc, ComfyUI's own Esc) — for keys we own,
+      // stopImmediatePropagation prevents those from also firing (e.g. Escape
+      // aborting a running agent turn instead of just closing the viewer).
+      let handled = true;
+      if (e.key === "Escape") closeLb();
+      else if (e.key === "ArrowRight" || e.key === "ArrowDown") step(1);
+      else if (e.key === "ArrowLeft" || e.key === "ArrowUp") step(-1);
+      else handled = false;
+      if (handled) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); }
+    };
+
+    prevBtn.addEventListener("click", (e) => { e.stopPropagation(); step(-1); });
+    nextBtn.addEventListener("click", (e) => { e.stopPropagation(); step(1); });
+    closeBtn.addEventListener("click", (e) => { e.stopPropagation(); closeLb(); });
+    openBtn.addEventListener("click", (e) => { e.stopPropagation(); openMediaUrl(openBtn._url); });
+    // Keep every interaction inside the overlay — never leak a click/scroll to the
+    // ComfyUI canvas underneath (#163). Swallow the WHOLE pointer gesture
+    // (mousedown+mouseup+click); close the viewer on the fully-consumed CLICK, not
+    // on mousedown — removing the overlay mid-gesture would let the trailing
+    // mouseup/click hit-test against (and reach) the canvas now exposed beneath it.
+    overlay.addEventListener("mousedown", (e) => { e.stopPropagation(); });
+    overlay.addEventListener("mouseup", (e) => { e.stopPropagation(); });
+    overlay.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (e.target === overlay || e.target === stage || e.target === mediaWrap) closeLb();
+    });
+    overlay.addEventListener("wheel", (e) => { e.stopPropagation(); }, { passive: true });
+
+    stage.append(mediaWrap, prevBtn, nextBtn, closeBtn);
+    const bar = document.createElement("div");
+    bar.className = "cmcp-lightbox-bar";
+    bar.append(caption, openBtn);
+    overlay.append(stage, bar);
+    document.body.appendChild(overlay);
+    window.addEventListener("keydown", onKey, true);
+    overlay.focus();
+    render();
+  }
+
+  // Open the lightbox from a media card, gathering the whole chat gallery so
+  // prev/next span every image/video in the log.
+  function openLightboxFromCard(card) {
+    const { items, index } = collectChatGallery(card);
+    openMediaLightbox(items, index);
+  }
+
   function paintImage(url, name) {
     // Coerce the caption at the painter boundary — a structured/persisted caption
     // must never render (or re-persist) as "[object Object]", live OR on replay (#276).
@@ -12914,12 +13126,13 @@ function buildPanel() {
     clearEmpty();
     const card = document.createElement("div");
     card.className = "cmcp-bubble agent cmcp-imgcard";
+    card._cmcpMedia = { url, type: "image", caption: name || "" };
     const img = document.createElement("img");
     img.src = url;
     img.alt = name || "output";
     img.loading = "lazy";
     img.style.cssText = "max-width:100%;border-radius:6px;display:block;cursor:zoom-in;";
-    img.addEventListener("click", () => openMediaUrl(url));
+    img.addEventListener("click", (e) => { e.stopPropagation(); openLightboxFromCard(card); });
     card.appendChild(img);
     if (name) {
       const cap = document.createElement("div");
@@ -12992,6 +13205,7 @@ function buildPanel() {
     clearEmpty();
     const card = document.createElement("div");
     card.className = "cmcp-bubble agent cmcp-imgcard";
+    card._cmcpMedia = { url, type: "video", caption: name || "" };
     // Self-sizing holder: a live <video> when on-screen, a gray aspect-ratio box
     // when off-screen. Defaults to 16/9 until the first mount learns real dimensions.
     const holder = document.createElement("div");
@@ -13000,6 +13214,17 @@ function buildPanel() {
     holder.style.cssText =
       "width:100%;aspect-ratio:16 / 9;border-radius:6px;background:var(--p-content-hover-background,#2a2a2e);";
     card.appendChild(holder);
+    // A video's own surface is owned by its native controls, so it can't be
+    // "click to zoom" like an image — give it a dedicated expand button that opens
+    // the same in-panel lightbox (#163). The video still plays inline in the chat.
+    const expandBtn = document.createElement("button");
+    expandBtn.type = "button";
+    expandBtn.className = "cmcp-media-expand";
+    expandBtn.title = "View full size";
+    expandBtn.setAttribute("aria-label", "View full size");
+    expandBtn.innerHTML = "⛶";
+    expandBtn.addEventListener("click", (e) => { e.stopPropagation(); openLightboxFromCard(card); });
+    card.appendChild(expandBtn);
     if (name) {
       const cap = document.createElement("div");
       cap.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
@@ -18187,6 +18412,14 @@ function buildPanel() {
       if (workWordTimer) { clearInterval(workWordTimer); workWordTimer = null; }
       if (thinkingSafety) { clearTimeout(thinkingSafety); thinkingSafety = null; }
       document.removeEventListener("keydown", onInterruptKeydown, true);
+      // Tear down a live media lightbox (#163): it's body-mounted with its own
+      // window keydown listener, so without this an unmount/remount would strand
+      // the overlay + listener (and a remount's fresh _activeLightboxClose tracker
+      // could never dismiss the old one).
+      if (_activeLightboxClose) {
+        try { _activeLightboxClose(); } catch { /* already gone */ }
+        _activeLightboxClose = null;
+      }
       document.removeEventListener("visibilitychange", onVisibilityChange);
       window.removeEventListener("pagehide", onPageHide);
       unsubscribeHistorySync();
