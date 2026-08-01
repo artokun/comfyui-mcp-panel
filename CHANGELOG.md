@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.27] - 2026-08-01
+
+### Fixed
+- **`panel_run` no longer crashes on a VHS node with a null widget value, and the CivitAI browser stops 400ing on reopen (#445, #459).** VHS_VideoCombine's `serializeValue` calls `.replace` directly on a null `filename_prefix` inside ComfyUI's `graphToPrompt`; a serializer-level null-safe wrap on `app.graphToPrompt` coerces null/undefined widget values to a safe default for the serialization window only (live workflow left byte-identical, reference-counted for overlapping serializations). And CivitAI's REST list endpoints reject an out-of-enum `sort`/`period`; those are now clamped to the offered enums at the client dispatch boundary.
+- **`panel_get_errors` re-evaluates missing-asset + red-node state so a stale "missing"/red never persists (#407, #410, #415, #418).** A valid subfolder-registered model is no longer flagged missing (authoritative `/object_info` pull on a flagged candidate), the `missingMedia` store + red flags are recomputed against a freshly-refreshed graph at query time (a fixed/renamed/exposed asset clears), and `set_widget` clears LiteGraph's `has_errors` after a successful write when nothing still blames the node.
+- **Codex readiness resolves the CLI under ComfyUI Desktop's minimal GUI PATH (#434).** Desktop launches with `/usr/bin:/bin:…` only, so `shutil.which` missed a Codex CLI in `~/.local/bin` / `/usr/local/bin` / `/opt/homebrew/bin` and reported it absent (silent Ollama fallback); readiness now probes those well-known bin dirs (exec-bit checked, non-Windows).
+
 ## [0.11.26] - 2026-08-01
 
 ### Fixed
