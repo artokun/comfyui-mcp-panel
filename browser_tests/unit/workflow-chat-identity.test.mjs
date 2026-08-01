@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   activeWorkflowFenceApplies,
+  selectorSearchIncludesListed,
   selectorTargetsNonActiveWorkflow,
   commandWorkflowMismatch,
   isThreadInScope,
@@ -26,6 +27,23 @@ test('#570 selectorTargetsNonActiveWorkflow: exempt ONLY when the selector resol
   // Resolves to NOTHING → can't prove non-active → NOT exempt (false) → fenced (fail-closed).
   assert.equal(selectorTargetsNonActiveWorkflow({ resolved: null, active }), false)
   assert.equal(selectorTargetsNonActiveWorkflow({ resolved: undefined, active }), false)
+})
+
+test('#570 P1: the fence/executor selector scope includes CLOSED-but-listed workflows for rename, open-only for close', () => {
+  // The shared resolver keys the search collection on this, so the fence resolves over EXACTLY
+  // what the executor searches — rename over [...openWorkflows, ...workflows], close over open only.
+  assert.equal(selectorSearchIncludesListed('workflow_rename'), true)
+  assert.equal(selectorSearchIncludesListed('workflow_close'), false)
+})
+
+test('#570 P1: a CLOSED-but-listed rename target (resolved via the executor collection) is exempt (not over-fenced)', () => {
+  // workflow_rename resolves over [...openWorkflows, ...workflows], so a target present only in
+  // `workflows` (closed but listed) DOES resolve to a genuine non-active workflow — the executor
+  // would rename it — so the fence must exempt it. Models the resolved record the shared helper
+  // returns for that selector (a real record distinct from the active object).
+  const active = { path: 'workflows/foo.json' } // active canvas
+  const closedButListed = { path: 'workflows/archived.json' } // only in s.workflows, not openWorkflows
+  assert.equal(selectorTargetsNonActiveWorkflow({ resolved: closedButListed, active }), true)
 })
 
 // #570 P0c — the panel fence must cover ALL four active-workflow mutators, not just graph_*,

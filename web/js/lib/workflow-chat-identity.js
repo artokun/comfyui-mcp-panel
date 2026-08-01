@@ -75,6 +75,16 @@ export function shouldForkInPlaceReload({ cachedUuid, incomingUuid } = {}) {
   return Boolean(cachedUuid) && incomingUuid !== cachedUuid;
 }
 
+/** #570 P1 — does the path-selector search scope for `cmd` include CLOSED-but-LISTED workflows
+ *  (s.workflows) in addition to the OPEN ones (s.openWorkflows)? workflow_rename can rename a
+ *  closed-but-listed workflow, so it searches both; workflow_close can only close an OPEN one, so
+ *  it searches openWorkflows alone. The fence and the executor share the ONE resolver keyed on
+ *  this so their target decision matches exactly (a closed-but-listed rename target resolves in
+ *  BOTH → correctly exempted, never over-fenced). */
+export function selectorSearchIncludesListed(cmd) {
+  return cmd !== 'workflow_close';
+}
+
 /** #570 — a path-selectored active-targeting mutator (workflow_rename / workflow_close) is exempt
  *  from the active-workflow uuid fence ONLY when its selector resolves to a REAL open workflow
  *  that is NOT the active one. Decide by the RESOLVED TARGET, never by raw path presence: the

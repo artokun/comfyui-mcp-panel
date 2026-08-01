@@ -98,6 +98,7 @@ import {
   activeWorkflowFenceApplies,
   classifyPinnedTarget,
   commandWorkflowMismatch,
+  selectorSearchIncludesListed,
   selectorTargetsNonActiveWorkflow,
   isWorkflowCreationLoad,
   normalizedWorkflowPath,
@@ -1038,6 +1039,21 @@ function workflowRecordMatchesSelector(w, sel) {
     w.key === sel ||
     (typeof w.filename === "string" && w.filename.replace(/\.json$/i, "") === sel)
   );
+}
+
+// #570 — resolve a path/selector to the workflow record a path-selectored active-workflow mutator
+// (workflow_rename / workflow_close) will act on, over the EXACT collection that command's
+// executor searches — so the #570 fence's "does this resolve to the active workflow?" decision
+// matches execution EXACTLY (no over- or under-fencing). workflow_rename can target a
+// closed-but-listed workflow, so it searches openWorkflows + workflows; workflow_close can only
+// close an OPEN workflow, so it searches openWorkflows alone. Selector semantics are unchanged
+// (workflowRecordMatchesSelector). Returns the matched record or null.
+function resolveWorkflowSelectorTarget(cmd, s, selector) {
+  if (typeof selector !== "string" || !selector) return null;
+  const list = selectorSearchIncludesListed(cmd)
+    ? [...(s?.openWorkflows ?? []), ...(s?.workflows ?? [])]
+    : (s?.openWorkflows ?? []);
+  return list.find((w) => workflowRecordMatchesSelector(w, selector)) || null;
 }
 
 function activeWorkflowExtra(wf = activeWorkflowRef(), { create = false } = {}) {
@@ -7358,10 +7374,8 @@ const GRAPH_TOOL_EXECUTORS = {
     const s = app?.extensionManager?.workflow;
     if (!s?.renameWorkflow) throw new Error("rename unavailable on this frontend");
     if (!name) throw new Error("name is required");
-    const all = [...(s.openWorkflows ?? []), ...(s.workflows ?? [])];
-    const target = path
-      ? all.find((w) => workflowRecordMatchesSelector(w, path))
-      : s.activeWorkflow;
+    // Resolve via the shared helper so the #570 fence sees the SAME target this executor will.
+    const target = path ? resolveWorkflowSelectorTarget("workflow_rename", s, path) : s.activeWorkflow;
     if (!target) throw new Error("no target workflow");
     const clean = name.replace(/\.json$/i, "");
     const slash = target.path ? target.path.lastIndexOf("/") : -1;
@@ -7373,9 +7387,8 @@ const GRAPH_TOOL_EXECUTORS = {
   async workflow_close({ path, force }) {
     const s = app?.extensionManager?.workflow;
     if (!s?.closeWorkflow) throw new Error("close unavailable on this frontend");
-    const target = path
-      ? (s.openWorkflows ?? []).find((w) => workflowRecordMatchesSelector(w, path))
-      : s.activeWorkflow;
+    // Resolve via the shared helper so the #570 fence sees the SAME target this executor will.
+    const target = path ? resolveWorkflowSelectorTarget("workflow_close", s, path) : s.activeWorkflow;
     if (!target) throw new Error("no target workflow");
     // Guard against data loss: don't silently close a workflow with unsaved
     // changes (closeWorkflow bypasses the UI's save prompt). Save first.
@@ -9422,8 +9435,14 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
               const pathArg = typeof msg?.path === "string" ? msg.path.trim() : "";
               if (pathArg) {
                 const active = activeWorkflowRef();
-                const open = app?.extensionManager?.workflow?.openWorkflows ?? [];
-                const resolved = open.find((w) => workflowRecordMatchesSelector(w, pathArg)) || null;
+                // Resolve over the SAME collection the executor will (rename: open+listed;
+                // close: open only) so the fence's target decision matches execution exactly —
+                // a closed-but-listed rename target resolves here too and is correctly exempted.
+                const resolved = resolveWorkflowSelectorTarget(
+                  msg.cmd,
+                  app?.extensionManager?.workflow,
+                  pathArg,
+                );
                 targetsNonActive = selectorTargetsNonActiveWorkflow({ resolved, active });
               }
             }
