@@ -411,8 +411,8 @@ export function coerceWidgetValue(widget, value, mergeBaseWidget = widget, subFi
  * actual widget OBJECT AND is `===` a live member of `node.widgets`, and otherwise
  * FAIL CLOSED (return null) — never write inner or parent on a name-only stub.
  */
-export function resolveHostPromotedWidget(subgraphNode, hostInput) {
-  if (!subgraphNode || !hostInput) return null;
+export function resolveHostPromotedWidgets(subgraphNode, hostInput) {
+  if (!subgraphNode || !hostInput) return [];
 
   // EXTERNALLY-LINKED host input ⇒ the local projected widget is NOT authoritative.
   // When the host input carries an outer link, ComfyUI's queue compiler IGNORES
@@ -422,20 +422,41 @@ export function resolveHostPromotedWidget(subgraphNode, hostInput) {
   // widget here would pass verification yet render the enclosing rail's OLD value —
   // a false success. Refuse (→ caller FAILS CLOSED); the widget must be edited from
   // the OUTERMOST subgraph node, where its host input has no outer link.
-  if (hostInput.link != null) return null;
+  if (hostInput.link != null) return [];
 
   const inWidgets = Array.isArray(subgraphNode.widgets) ? subgraphNode.widgets : [];
 
-  // OBJECT-IDENTITY authentication. The rail widget must be the actual projection
+  // OBJECT-IDENTITY authentication. A rail/proxy widget must be an actual projection
   // object the host input LINKS to (`_widget`, or an `input.widget` that is itself a
   // real widget object — NOT a `{ name }` stub) AND must be `===` a live member of
-  // this node's projected widgets. A name-only stub is an object too, but it is NOT
-  // a member of node.widgets, so it is rejected → FAIL CLOSED. This never resolves by
-  // name, so an unrelated same-named decoy can never be selected (#233/#366).
+  // this node's projected widgets. A name-only stub is an object too, but it is NOT a
+  // member of node.widgets, so it is rejected. This never resolves by name, so an
+  // unrelated same-named decoy can never be selected (#233/#366).
+  //
+  // #477: a single host input can reference TWO distinct authenticated widgets — the
+  // serializing rail PROJECTION (`_widget`) AND the parent-facing DISPLAY proxy
+  // (`input.widget`, a real widget in newer ComfyUI). BOTH belong to this exact
+  // promotion by identity and must be synced, or the display proxy renders/queries
+  // the OLD value while the tool reports success. Returned in priority order — the
+  // FIRST element is the AUTHORITATIVE serializing rail (what #366 verifies).
+  const out = [];
   for (const cand of [hostInput._widget, hostInput.widget]) {
-    if (cand && typeof cand === "object" && inWidgets.includes(cand)) return cand;
+    if (cand && typeof cand === "object" && inWidgets.includes(cand) && !out.includes(cand)) {
+      out.push(cand);
+    }
   }
-  return null;
+  return out;
+}
+
+/**
+ * The single AUTHORITATIVE parent rail widget for `hostInput` — the projection whose
+ * value serializes at queue time (#366). This is the FIRST identity-authenticated
+ * widget resolveHostPromotedWidgets returns, or null when none can be authenticated
+ * (→ caller FAILS CLOSED). Kept as the load-bearing #366 accessor; #477's additional
+ * display-proxy widgets are synced via resolveHostPromotedWidgets.
+ */
+export function resolveHostPromotedWidget(subgraphNode, hostInput) {
+  return resolveHostPromotedWidgets(subgraphNode, hostInput)[0] ?? null;
 }
 
 /**
@@ -455,8 +476,11 @@ export function resolveHostPromotedWidget(subgraphNode, hostInput) {
  * Returns a status object — the caller MUST honour it and never fall back to
  * the parent slot when `promoted` is true but `target` is null:
  *   { promoted: false }                                          → not a promoted widget
- *   { promoted: true, target: {node,widget,input,parentWidget} } → resolved inner target
- *                                                                  (parentWidget may be null)
+ *   { promoted: true, target: {node,widget,input,parentWidget,parentWidgets} } → resolved
+ *                                                                  inner target (parentWidget
+ *                                                                  may be null; parentWidgets
+ *                                                                  is every identity-authenticated
+ *                                                                  rail/display proxy, #477)
  *   { promoted: true, target: null, error }                      → promoted but UNRESOLVABLE/ambiguous
  */
 export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSource) {
@@ -544,8 +568,9 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
   // (e.g. the widget is further promoted OUTWARD to an enclosing subgraph and is
   // exposed here as an input with no settable widget); the caller FAILS CLOSED on
   // null rather than write inner-only and render silently stale.
-  const parentWidget = resolveHostPromotedWidget(subgraphNode, input);
-  return { promoted: true, target: { node: innerNode, widget: innerWidget, input, parentWidget } };
+  const parentWidgets = resolveHostPromotedWidgets(subgraphNode, input);
+  const parentWidget = parentWidgets[0] ?? null;
+  return { promoted: true, target: { node: innerNode, widget: innerWidget, input, parentWidget, parentWidgets } };
 }
 
 /**
@@ -602,6 +627,7 @@ export function resolveWidgetWrite(
   let widget = null;
   let promotedFrom = null;
   let promotedParentWidget = null;
+  let promotedParentWidgets = [];
   let promotedHostInput = null;
   // #560: sub-field addressing ("lora_1.on") is derived AFTER an exact-name lookup
   // fails — never by pre-splitting the caller's name — so a real widget whose own
@@ -637,6 +663,16 @@ export function resolveWidgetWrite(
       // uncaptured inner mutation. Refusing first guarantees a promoted write with
       // no authoritative rail performs NO side effect at all (#366).
       promotedParentWidget = res.target.parentWidget ?? null;
+      // #477: EVERY identity-authenticated projection this host input references —
+      // the serializing rail AND the parent-facing display proxy. All are synced +
+      // rolled back atomically so no proxy renders/queries the stale value. Falls
+      // back to the single primary for older resolutions that omit the list.
+      promotedParentWidgets =
+        Array.isArray(res.target.parentWidgets) && res.target.parentWidgets.length
+          ? res.target.parentWidgets
+          : promotedParentWidget
+            ? [promotedParentWidget]
+            : [];
       if (!promotedParentWidget) {
         throw new WidgetWriteError(
           `promoted widget "${widgetName}" on subgraph node ${node.id} resolves to an inner ` +
@@ -730,7 +766,7 @@ export function resolveWidgetWrite(
   // possibly side-effecting coercion — so `promotedParentWidget` is non-null here.)
   const coerced = coerceWidgetValue(widget, value, promotedParentWidget ?? widget, subFieldPath);
 
-  return { targetNode, widget, coerced, promotedFrom, promotedParentWidget, promotedHostInput };
+  return { targetNode, widget, coerced, promotedFrom, promotedParentWidget, promotedParentWidgets, promotedHostInput };
 }
 
 /**
@@ -752,7 +788,7 @@ export function applyWidgetWrite(
   // promotedResolution is reused so the write targets the EXACT node the fresh
   // /object_info gate authorized (#458), and resolveWidgetWrite also fails closed if
   // the AUTHORITATIVE parent rail widget can't be identified (#366).
-  const { targetNode, widget: w, coerced, promotedFrom, promotedParentWidget, promotedHostInput } =
+  const { targetNode, widget: w, coerced, promotedFrom, promotedParentWidget, promotedParentWidgets, promotedHostInput } =
     resolveWidgetWrite(node, widgetName, value, resolveSource, assertTargetWritable, promotedResolution);
 
   // #366: for a promoted subgraph widget the AUTHORITATIVE value lives on the
@@ -763,6 +799,17 @@ export function applyWidgetWrite(
   // callback on EITHER side must never leave inner=new / parent=stale (a silent
   // partial write that renders the OLD value while reporting success).
   const parentWidget = promotedFrom ? promotedParentWidget : null;
+  // #477: the SECONDARY parent-facing DISPLAY proxy widgets this promotion references
+  // by identity (every authenticated projection beyond the authoritative rail). #366
+  // synced only the primary rail, leaving a distinct display proxy stale so a query of
+  // the parent node saw the OLD value even though the tool reported success. Sync +
+  // roll them back alongside the rail, atomically. Empty for the common single-widget
+  // shape (all existing #366/#233 fixtures), so those paths are byte-identical; and
+  // resolved by IDENTITY, never by name, so a same-named decoy is never touched (#233).
+  const displayWidgets =
+    promotedFrom && Array.isArray(promotedParentWidgets)
+      ? promotedParentWidgets.filter((dw) => dw && dw !== w && dw !== parentWidget)
+      : [];
 
   // Snapshot the EXPECTED value BEFORE the callback runs. For a COMPOSITE object
   // write (#179) `w.value` and `coerced` are the SAME reference, so a callback
@@ -793,6 +840,11 @@ export function applyWidgetWrite(
       : Object.is(a, b);
   const previousClone = deepClone(previous);
   const previousParentClone = parentWidget ? deepClone(previousParent) : undefined;
+  // #477: prior values (+ deep clones) of the secondary display proxies, so rollback
+  // restores them exactly and a stateful hook mutating a restored object in place is
+  // caught structurally, mirroring the rail's rollback rigor.
+  const previousDisplays = displayWidgets.map((dw) => dw.value);
+  const previousDisplayClones = displayWidgets.map((dw) => deepClone(dw.value));
   // The ACTUAL serialization binding for an unlinked subgraph input is its
   // `widgetId` (the widget-value STORE key that queue compilation reads). A callback
   // could keep the SAME host input and projection objects but re-point `widgetId` to
@@ -835,6 +887,10 @@ export function applyWidgetWrite(
     // so it needs no callback of its own.
     w.value = coerced;
     if (parentWidget) parentWidget.value = coerced;
+    // #477: sync the parent-facing DISPLAY proxies too. They are VIEWS of the same
+    // promoted value (no semantic callback of their own — the inner target's fires
+    // once below), so we assign their value directly, same as the rail.
+    for (const dw of displayWidgets) dw.value = coerced;
     // Fire the inner widget's own callback so combo/number side effects run — the
     // same single invocation a manual UI edit of the promoted control performs.
     w.callback?.(coerced, canvas, targetNode, targetNode.pos, undefined);
@@ -868,6 +924,15 @@ export function applyWidgetWrite(
       `the requested value: wrote ${JSON.stringify(expected)} but it became ` +
       `${JSON.stringify(parentWidget.value)}. Refusing to report success with a stale rail that ` +
       `would render the OLD value (#366).`;
+  } else if (displayWidgets.some((dw) => !matchesExpected(dw.value))) {
+    // #477: a parent-facing display proxy did not retain the value. Fail closed +
+    // roll back rather than report success while the parent node still shows/queries
+    // the OLD value (the exact stale-outer-widget symptom).
+    const bad = displayWidgets.find((dw) => !matchesExpected(dw.value));
+    failure =
+      `Promoted display widget "${bad.name}" on subgraph node ${node.id} did not retain the ` +
+      `requested value: wrote ${JSON.stringify(expected)} but it became ${JSON.stringify(bad.value)}. ` +
+      `Refusing to report success with a stale parent-facing widget (#477).`;
   } else if (parentWidget) {
     // RE-RESOLVE the promotion from the LIVE graph. This is wrapped so that ANY
     // exception thrown DURING the recheck (e.g. a callback replaced `_subgraphSlot`
@@ -881,6 +946,20 @@ export function applyWidgetWrite(
     } catch {
       recheckThrew = true;
     }
+    // #477: the FULL identity-authenticated projection set (rail + display proxies)
+    // must be UNCHANGED too. A callback can swap `hostInput.widget` to a NEW live
+    // same-named display proxy holding the OLD value while leaving `_widget`, the
+    // inner widget, and our CAPTURED old proxy untouched — every rail-only check would
+    // pass yet the current outer-facing proxy renders/queries stale. Re-resolve the
+    // whole set and identity-compare it (fixed order [_widget, widget]) against what we
+    // synced; any membership/identity difference is drift.
+    const reWidgets = Array.isArray(recheck?.target?.parentWidgets)
+      ? recheck.target.parentWidgets
+      : [];
+    const capturedWidgets = Array.isArray(promotedParentWidgets) ? promotedParentWidgets : [];
+    const projectionSetDrifted =
+      reWidgets.length !== capturedWidgets.length ||
+      reWidgets.some((rw, i) => rw !== capturedWidgets[i]);
     const drifted =
       recheckThrew ||
       !recheck ||
@@ -889,6 +968,7 @@ export function applyWidgetWrite(
       recheck.target.input !== promotedHostInput ||
       recheck.target.widget !== w ||
       recheck.target.parentWidget !== parentWidget ||
+      projectionSetDrifted ||
       // The host input's serialization binding (`widgetId`, the store key queue
       // compilation reads) must be UNCHANGED — a swap re-points serialization to a
       // different store entry even though the input/projection objects are identical.
@@ -936,6 +1016,15 @@ export function applyWidgetWrite(
           /* restore best-effort; read-back below is authoritative */
         }
       }
+      // #477: restore the secondary display proxies too, so no proxy is left holding
+      // the just-written value after a failed write.
+      for (let i = 0; i < displayWidgets.length; i++) {
+        try {
+          displayWidgets[i].value = previousDisplays[i];
+        } catch {
+          /* restore best-effort; read-back below is authoritative */
+        }
+      }
     } finally {
       safeAfter();
     }
@@ -949,6 +1038,14 @@ export function applyWidgetWrite(
       rollbackFailed = rollbackFailed
         ? `${rollbackFailed} and rail "${parentWidget.name}"`
         : `rail "${parentWidget.name}"`;
+    }
+    // #477: a display proxy whose rollback did not take effect is an honest partial
+    // state too — report it rather than falsely claim a clean rollback.
+    for (let i = 0; i < displayWidgets.length; i++) {
+      if (!structurallyEqual(displayWidgets[i].value, previousDisplayClones[i])) {
+        const label = `display "${displayWidgets[i].name}"`;
+        rollbackFailed = rollbackFailed ? `${rollbackFailed} and ${label}` : label;
+      }
     }
     // The serialization binding must be back to its original store key, else queue
     // compilation still reads whatever entry a callback re-pointed it to.
@@ -965,16 +1062,35 @@ export function applyWidgetWrite(
     // rather than falsely claim a clean rollback.
     if (driftFailure) {
       let liveRail = null;
+      let liveWidgets = [];
       try {
         const live = resolvePromotedInnerTarget(node, widgetName, resolveSource);
         liveRail = live && live.target ? live.target.parentWidget : null;
+        liveWidgets =
+          live && live.target && Array.isArray(live.target.parentWidgets)
+            ? live.target.parentWidgets
+            : [];
       } catch {
         liveRail = null;
+        liveWidgets = [];
       }
       if (liveRail && liveRail !== parentWidget && structurallyEqual(liveRail.value, expected)) {
         rollbackFailed = rollbackFailed
           ? `${rollbackFailed} and a live replacement rail "${liveRail.name}"`
           : `a live replacement rail "${liveRail.name}"`;
+      }
+      // #477: a callback could also have swapped in a NEW live DISPLAY PROXY (a member
+      // of the freshly-resolved set that was NOT in our captured set) holding the
+      // just-written value. Restoring our captured proxies does not touch it — so if
+      // any such replacement still carries `expected`, report a PARTIAL STATE rather
+      // than falsely claim a clean rollback.
+      const capturedSet = Array.isArray(promotedParentWidgets) ? promotedParentWidgets : [];
+      for (const lw of liveWidgets) {
+        if (lw && lw !== liveRail && !capturedSet.includes(lw) && structurallyEqual(lw.value, expected)) {
+          rollbackFailed = rollbackFailed
+            ? `${rollbackFailed} and a live replacement display proxy "${lw.name}"`
+            : `a live replacement display proxy "${lw.name}"`;
+        }
       }
     }
     setDirty?.();
@@ -996,12 +1112,21 @@ export function applyWidgetWrite(
   // On success, a promoted write has ALWAYS synced the authoritative parent rail
   // widget (verified AFTER afterChange, or it would have rolled back + thrown).
   // parent_widget_synced is reported for observability / defense-in-depth in the
-  // panel summary.
+  // panel summary. display_widgets_synced counts the additional parent-facing display
+  // proxies also synced so the outer node no longer shows a stale value (#477).
   return {
     node_id: targetNode.id,
     widget: w.name,
     previous,
     value: w.value,
-    ...(promotedFrom ? { promoted_from: { ...promotedFrom, parent_widget_synced: parentWidget != null } } : {}),
+    ...(promotedFrom
+      ? {
+          promoted_from: {
+            ...promotedFrom,
+            parent_widget_synced: parentWidget != null,
+            ...(displayWidgets.length ? { display_widgets_synced: displayWidgets.length } : {}),
+          },
+        }
+      : {}),
   };
 }

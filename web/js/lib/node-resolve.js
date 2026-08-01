@@ -47,6 +47,30 @@ export function comfyNodeDefsLoaded(registry) {
 }
 
 /**
+ * True for a genuinely FRONTEND-ONLY / native node type — one an extension
+ * registered in the live LiteGraph registry WITHOUT any /object_info-derived
+ * backend def (rgthree "Fast Bypasser (rgthree)", "Fast Muter (rgthree)", and
+ * native litegraph nodes like Note / Reroute / PrimitiveNode). These legitimately
+ * have NO /object_info entry, so a set_widget on one must NOT be refused merely for
+ * being absent from the backend registry (#475).
+ *
+ * The distinguishing signal is the registered class's `nodeData`: ComfyUI's
+ * registerNodesFromDefs mints a per-type class and stamps `class.nodeData = def`
+ * for every BACKEND node, so a backend-derived class ALWAYS carries nodeData. A
+ * frontend-only node is registered by an extension via LiteGraph.registerNodeType
+ * with NO such def, so its registered class has NO nodeData. Crucially, a REMOVED
+ * backend node keeps a STALE-POSITIVE registered class that STILL carries its old
+ * nodeData (the tab was never reloaded after the pack was uninstalled) — so this
+ * returns FALSE for it and the #458 fail-closed guard still refuses the removed
+ * type. Mirrors the same nodeData probe assertResolvedTargetRegistered already uses
+ * to trust native/defless types.
+ */
+export function isFrontendOnlyRegisteredType(registry, type) {
+  if (!isRegisteredNodeType(registry, type)) return false;
+  return !registry?.[type]?.nodeData;
+}
+
+/**
  * Guard for graph_add_node: throw (mirroring the read-path hard error) when
  * `class_type` cannot be resolved against the live registry, distinguishing
  * "backend unreachable / defs not loaded" from "type genuinely unknown". Returns
@@ -171,8 +195,23 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
  *   - type absent from the fresh map ⇒ "backend does not provide" (removed pack).
  * Never authorizes from the stale registry. Pure — no side effects — so the caller
  * can run it on the exact target it is about to mutate, before any mutation.
+ *
+ * FRONTEND-ONLY EXEMPTION (#475): when object_info IS available (a real map was
+ * fetched) but the type is simply ABSENT from it, the type is still permitted iff it
+ * is a genuine frontend-only / native registered type (isFrontendOnlyRegisteredType:
+ * registered in the live registry with NO backend-derived nodeData — rgthree Fast
+ * Bypasser, Note, Reroute, …). Such a node's widget write is a reversible frontend
+ * canvas edit and legitimately has no /object_info entry. This does NOT reopen the
+ * #458 hole: a REMOVED backend node keeps a stale-positive class that STILL carries
+ * nodeData, so it is NOT frontend-only and is still refused; and the exemption
+ * applies ONLY when object_info was fetched — a genuinely UNVERIFIABLE type (fetch
+ * unavailable, null map) always fails closed below, for every type.
+ *
+ * `opts.registry` is the live LiteGraph registry used to recognize a frontend-only
+ * type; omit it to keep the strict backend-only behaviour.
  */
-export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknown)") {
+export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknown)", opts = {}) {
+  const { registry } = opts;
   const label = typeof type === "string" ? ` ("${type}")` : "";
   if (!freshDefs || typeof freshDefs !== "object") {
     throw new Error(
@@ -183,6 +222,12 @@ export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknow
     );
   }
   if (typeof type !== "string" || !Object.prototype.hasOwnProperty.call(freshDefs, type)) {
+    // #475: object_info WAS fetched but lacks this type. Allow a genuine
+    // frontend-only / native registered node (defless registered class) — its
+    // widget write is a frontend canvas edit with no backend def by design. A
+    // removed backend node's stale-positive class still carries nodeData, so it is
+    // NOT exempted here and still fails closed.
+    if (registry && isFrontendOnlyRegisteredType(registry, type)) return;
     throw new Error(
       `Cannot set widget on node ${nodeId}${label}: the ComfyUI backend does not provide node ` +
         `type "${type}" (not installed, or its pack was removed) — refusing to write to a node ` +
