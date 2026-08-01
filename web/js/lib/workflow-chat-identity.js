@@ -75,6 +75,33 @@ export function shouldForkInPlaceReload({ cachedUuid, incomingUuid } = {}) {
   return Boolean(cachedUuid) && incomingUuid !== cachedUuid;
 }
 
+/** #570 — does the per-command workflow-instance uuid fence APPLY to this command? The fence
+ *  refuses a command whose stamped workflow_uuid ≠ the ACTIVE workflow's uuid, so it must cover
+ *  everything that runs against the active canvas — every graph_* op AND the active-workflow
+ *  mutators workflow_save / workflow_save_as / workflow_rename / workflow_close (workflow_save*
+ *  ignore any path, so they are ALWAYS active). It must NOT fire for:
+ *   • a PINNED command (`hasPin` — a workflow_path is present): the #349 pin guard is its
+ *     authority (covers pinned graph_* and path-targeted workflow_* ops);
+ *   • workflow_open / workflow_new: navigation/creation with their own explicit/new target;
+ *   • workflow_rename / workflow_close carrying an EXPLICIT non-empty `path` ARG: that names a
+ *     DETERMINISTIC open workflow to rename/close (the executor does openWorkflows.find(path)),
+ *     not the active one, so fencing it against the active uuid would wrongly reject a valid
+ *     close/rename of a non-active workflow.
+ *  Reads (graph_get_state, …) still return true here — harmlessly fenced (fail-closed); their
+ *  reply is server-fenced anyway, and a read can only run against the active canvas regardless. */
+export function activeWorkflowFenceApplies({ cmd, hasPin = false, pathArg } = {}) {
+  if (hasPin) return false;
+  if (cmd === 'workflow_open' || cmd === 'workflow_new') return false;
+  if (
+    (cmd === 'workflow_rename' || cmd === 'workflow_close') &&
+    typeof pathArg === 'string' &&
+    pathArg.trim().length > 0
+  ) {
+    return false;
+  }
+  return true;
+}
+
 /** #570 — should the panel REFUSE to execute a command stamped for a specific workflow
  *  instance? The orchestrator stamps each dispatched command with the trusted per-instance
  *  `workflow_uuid` it was ISSUED FOR. Every graph executor runs against the ACTIVE canvas, so

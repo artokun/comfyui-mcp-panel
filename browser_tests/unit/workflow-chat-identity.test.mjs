@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  activeWorkflowFenceApplies,
   commandWorkflowMismatch,
   isThreadInScope,
   isWorkflowCreationLoad,
@@ -11,6 +12,31 @@ import {
   shouldForkInPlaceReload,
   workflowAliasForPath
 } from '../../web/js/lib/workflow-chat-identity.js'
+
+// #570 P0c — the panel fence must cover ALL four active-workflow mutators, not just graph_*,
+// so a panel advertising enforces_workflow_stamp honestly fences everything the server admits.
+test('#570 fence applies to every graph_* op and all four workflow mutators (active-workflow ops)', () => {
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'graph_add_node' }), true)
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'graph_get_state' }), true) // reads harmlessly fenced too
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_save' }), true)
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_save_as' }), true)
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_rename' }), true) // no explicit path
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_close' }), true)
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_close', pathArg: '' }), true) // empty ⇒ active
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_close', pathArg: '  ' }), true) // whitespace ⇒ active
+})
+
+test('#570 fence does NOT apply to pinned / navigation / explicit-path workflow ops', () => {
+  // Pinned → the #349 workflow_path guard is the authority.
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'graph_add_node', hasPin: true }), false)
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_close', hasPin: true }), false)
+  // Navigation / creation.
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_open' }), false)
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_new' }), false)
+  // Explicit non-empty path arg names a deterministic non-active target (must not be fenced to active).
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_close', pathArg: 'workflows/other.json' }), false)
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_rename', pathArg: 'workflows/a.json' }), false)
+})
 
 // #570 — WORKFLOW-INSTANCE FENCE. A command stamped for workflow A must not execute against
 // a canvas the user has since switched to (B). The generation-bound-command leak: the server
