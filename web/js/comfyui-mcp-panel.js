@@ -7845,8 +7845,9 @@ const GRAPH_TOOL_EXECUTORS = {
     graph.setDirtyCanvas(true, true);
     const summary = summarizeGroup(graph, group);
     // Honesty for dense layouts (#297): group membership is purely GEOMETRIC, so
-    // any unrelated node whose box overlaps the computed rectangle is now a member
-    // — LiteGraph has no per-node ownership to exclude it. When the live members
+    // any unrelated node whose CENTRE falls within the computed rectangle is now a
+    // member (LiteGraph's containsCentre rule, #497) — LiteGraph has no per-node
+    // ownership to exclude it. When the live members
     // differ from what was requested, surface both sets and a warning instead of
     // silently reporting a misleading success.
     if (requestedIds) {
@@ -7857,7 +7858,7 @@ const GRAPH_TOOL_EXECUTORS = {
         summary.missing_node_ids = missing;
         summary.warning =
           "group membership is geometric: the box that wraps the requested nodes " +
-          `also overlaps ${extra.length} unrelated node(s)` +
+          `also captures ${extra.length} unrelated node(s) (their centre falls inside)` +
           (missing.length ? ` and misses ${missing.length} requested node(s)` : "") +
           ". Move the intended nodes into a contiguous region (panel_move_node / " +
           "panel_arrange) before grouping, or edit the group bounds, to get an exact set.";

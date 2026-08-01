@@ -367,16 +367,96 @@ test("moveGroupMembers skips nodes without a usable pos and never throws", () =>
   moveGroupMembers(null, 1, 1); // must not throw
 });
 
-test("membership overlap is edge-inclusive (matches LiteGraph overlapBounding)", () => {
-  // Node's right edge exactly touches the group's left edge.
-  const n = { id: 1, boundingRect: [0, 0, 100, 100] }; // spans x:0..100
+// ---------------------------------------------------------------------------
+// #497: membership must match LiteGraph's containsCentre rule (the group box
+// contains the node bounding-box's CENTRE point), NOT a box OVERLAP. A node
+// moved so its centre leaves the group is dropped even if an edge still pokes
+// into the box — the "still reported as a member after moving it out" symptom.
+// LiteGraph never recomputes group._nodes when a MEMBER node moves (only when
+// the GROUP is created/moved/resized), so the panel recomputes live at read.
+// ---------------------------------------------------------------------------
+test("membership is centre-in-rect, not box overlap (#497)", () => {
+  // Node spans x:0..100 (centre x=50). Group starts at x=60, so the two boxes
+  // OVERLAP (x:60..100) but the node's centre (50) is OUTSIDE the box. The old
+  // overlap rule wrongly counted this as a member; containsCentre does not.
+  const n = { id: 1, boundingRect: [0, 0, 100, 100] }; // centre (50,50)
   const graph = graphOf(n);
-  const g = groupBox([100, 0, 200, 200]); // starts exactly at x=100
+  const overlapping = groupBox([60, 0, 200, 200]); // x:60..260 — overlaps but no centre
   assert.deepEqual(
-    groupMemberNodes(graph, g).map((x) => x.id),
-    [1],
-    "edge contact counts as membership",
+    groupMemberNodes(graph, overlapping).map((x) => x.id),
+    [],
+    "a box that only overlaps (centre outside) is NOT a member",
   );
+  // Same node, a box that actually contains its centre → member.
+  const containing = groupBox([0, 0, 200, 200]); // x:0..200 contains centre (50,50)
+  assert.deepEqual(
+    groupMemberNodes(graph, containing).map((x) => x.id),
+    [1],
+    "a box containing the centre IS a member",
+  );
+});
+
+test("centre-in-rect is min-edge inclusive, max-edge exclusive (matches isInRect) (#497)", () => {
+  // Node centre lands EXACTLY on the group's min corner → inclusive (member).
+  const onMin = { id: 1, boundingRect: [0, 0, 200, 200] }; // centre (100,100)
+  assert.deepEqual(
+    groupMemberNodes(graphOf(onMin), groupBox([100, 100, 300, 300])).map((n) => n.id),
+    [1],
+    "centre on the min edge (>=) counts as inside",
+  );
+  // Node centre lands EXACTLY on the group's RIGHT (x-max) edge → exclusive.
+  const onMaxX = { id: 2, boundingRect: [50, 0, 100, 100] }; // centre (100,50)
+  assert.deepEqual(
+    groupMemberNodes(graphOf(onMaxX), groupBox([0, 0, 100, 100])).map((n) => n.id),
+    [],
+    "centre on the x-max edge (<) is excluded",
+  );
+  // Node centre lands EXACTLY on the group's BOTTOM (y-max) edge → exclusive. This
+  // is an INDEPENDENT condition in isInRect; the box overlaps on both axes here, so
+  // the old overlap rule would wrongly include it.
+  const onMaxY = { id: 3, boundingRect: [0, 50, 100, 100] }; // centre (50,100)
+  assert.deepEqual(
+    groupMemberNodes(graphOf(onMaxY), groupBox([0, 0, 100, 100])).map((n) => n.id),
+    [],
+    "centre on the y-max edge (<) is excluded",
+  );
+});
+
+test("a node moved OUT of a group by CENTRE stops being a member (#497)", () => {
+  // The report's shape: a node whose box still OVERLAPS a nearby group but whose
+  // CENTRE has moved out. The old edge-overlap rule reported it in every box its
+  // edge touched (the #497 bug); containsCentre reports it only where its centre is.
+  // Both panel_graph_outline and panel_edit_group (summarizeGroup) funnel through
+  // groupMemberNodes, so this shared recompute keeps the two readers in agreement.
+  const n = node(7, 600, 560, 287, 122); // focus bounds x600..887, centre ≈ (743.5, 606)
+  const g3 = groupBox([560, 265, 360, 460]); // x560..920 — holds the centre
+  // g4 OVERLAPS the node (x800..1100 vs node x600..887 → shared 800..887) but the
+  // centre (743.5) is LEFT of it: old overlap = member (WRONG), containsCentre = no.
+  const g4 = groupBox([800, 500, 300, 300]); // x800..1100 y500..800
+  const graph = graphOf(n);
+  const membersOf = (g) => groupMemberNodes(graph, g).map((x) => x.id);
+
+  assert.deepEqual(membersOf(g4), [], "overlapping box WITHOUT the centre drops the node");
+  assert.deepEqual(membersOf(g3), [7], "the box that holds the centre keeps it");
+
+  // Move the node's centre INTO g4 → member there, and out of g3.
+  n.pos = [850, 550]; // focus x850..1137, centre ≈ (993.5, 596) — inside g4, right of g3
+  assert.deepEqual(membersOf(g4), [7], "moved-in node reported by live centre geometry");
+  assert.deepEqual(membersOf(g3), [], "and no longer reported by the box it left");
+});
+
+test("membership follows a group's OWN moved bounds, not a stale cache (#497)", () => {
+  // The dual of the node-move case: the NODE stays put and the GROUP box moves
+  // (as panel_edit_group(bounds=…) / panel_move_group mutate g._bounding). The
+  // live read must reflect the new box even though groupBox's recomputeInsideNodes
+  // is a no-op that leaves the _nodes cache stale.
+  const n = node(1, 600, 560, 200, 100); // focus bounds x600..800, centre (700, 595)
+  const graph = graphOf(n);
+  const g = groupBox([1000, 0, 300, 300]); // starts far from the node (x1000..1300)
+  assert.deepEqual(groupMemberNodes(graph, g).map((x) => x.id), [], "node outside the group's start bounds");
+  // Reposition the SAME group's box so it now covers the node's centre.
+  g._bounding = [650, 500, 300, 200]; // x650..950 y500..700 — holds centre (700,595)
+  assert.deepEqual(groupMemberNodes(graph, g).map((x) => x.id), [1], "moved group box gains the node by live geometry");
 });
 
 // ---------------------------------------------------------------------------
