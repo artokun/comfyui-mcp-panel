@@ -137,9 +137,38 @@ def _antigravity_installed():
     return os.path.isfile(os.path.join(os.path.expanduser("~"), ".local", "bin", "agy"))
 
 
+def _gui_fallback_bin_dirs():
+    """Well-known user/local bin dirs a GUI launcher's minimal PATH omits (#434).
+
+    ComfyUI Desktop launches its Python server with a restricted GUI PATH
+    (``/usr/bin:/bin:/usr/sbin:/sbin`` on macOS), so ``shutil.which()`` misses a
+    CLI the user installed under ``~/.local/bin`` (the official installer's
+    target), Homebrew, or an npm global prefix — and the panel then falsely
+    reports the provider's CLI absent and silently falls back to another backend.
+    Windows resolves via PATHEXT and has no equivalent GUI-PATH gap, so keep the
+    fallback non-Windows only (mirrors ``_ollama_installed`` / ``_antigravity_installed``)."""
+    if sys.platform == "win32":
+        return ()
+    home = os.path.expanduser("~")
+    return (
+        os.path.join(home, ".local", "bin"),
+        "/usr/local/bin",
+        "/opt/homebrew/bin",
+    )
+
+
 def _provider_cli(provider):
-    """True if the provider's CLI binary is resolvable on PATH."""
-    return any(shutil.which(name) for name in _PROVIDER_CLIS.get(provider, ()))
+    """True if the provider's CLI binary is resolvable — on PATH, or in a
+    well-known user/local bin dir a GUI launcher's minimal PATH omits (#434)."""
+    names = _PROVIDER_CLIS.get(provider, ())
+    if any(shutil.which(name) for name in names):
+        return True
+    for directory in _gui_fallback_bin_dirs():
+        for name in names:
+            candidate = os.path.join(directory, name)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return True
+    return False
 
 
 def _provider_auth(provider):
