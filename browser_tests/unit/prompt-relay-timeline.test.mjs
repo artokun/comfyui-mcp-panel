@@ -232,12 +232,92 @@ test("a segment without a color inherits the same-index color, else a stable fal
   assert.ok(colors[2].length > 0);
 });
 
-test("an unreadable current timeline_data falls back to a pure replace", () => {
-  const { node, widgets } = makeRelayNode();
+test("per-segment fields that exist ONLY on the current timeline are NOT index-merged back", () => {
+  // Deliberate: supplying `segments` REPLACES the list, and index-matching unknown metadata
+  // across a reordered/resized list would attach it to the wrong segment. `color` is the one
+  // documented exception (purely cosmetic, and the canvas needs it).
+  const { node, widgets } = makeRelayNode({
+    timelineSegments: [seg("a", 24, { legacyMeta: "old" }), seg("b", 36)],
+  });
+  applyPromptRelayTimelineWrite(node, { segments: [{ prompt: "a2", length: 24 }, seg("b", 36)] });
+  const written = JSON.parse(widgets.timeline_data.value).segments;
+  assert.equal(written[0].legacyMeta, undefined);
+  assert.equal(written[0].color, "#4f8edc"); // colour DID carry over by index
+});
+
+test("an unreadable current timeline_data AND no editor falls back to a pure replace", () => {
+  const { node, widgets } = makeRelayNode({ withEditor: false });
   widgets.timeline_data.value = "corrupt {{{";
   const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("fresh", 11)] }));
   assert.equal(res.merged_onto_current, false);
+  assert.equal(res.merge_base, "none");
   assert.equal(widgets.local_prompts.value, "fresh");
+});
+
+test("an unreadable current timeline_data still merges from the LIVE editor", () => {
+  const { node, widgets } = makeRelayNode({ extraTimelineFields: { zoom: 2 } });
+  widgets.timeline_data.value = "corrupt {{{";
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("fresh", 11)] }));
+  assert.equal(res.merge_base, "editor");
+  assert.equal(JSON.parse(widgets.timeline_data.value).zoom, 2);
+});
+
+// ─── The merge base: whichever copy of the timeline is actually current ───
+
+test("MID-TYPING: the live editor wins over a timeline_data widget lagging by the 120ms debounce", () => {
+  // Reproduces the pack's textarea handler: it writes seg.prompt + local_prompts IMMEDIATELY
+  // and defers the timeline_data JSON by 120ms. Merging onto the stale widget would DESTROY
+  // the text the user just typed.
+  const { node, widgets, editor } = makeRelayNode();
+  editor.timeline.segments[0].prompt = "just typed, not yet committed";
+  widgets.local_prompts.value = derivePromptRelayWidgets(editor.timeline.segments).local_prompts;
+  // timeline_data still holds the pre-keystroke JSON ("a | b").
+
+  // A write that does not mention segments must PRESERVE the in-flight text, not roll it back.
+  const res = relay(applyPromptRelayTimelineWrite(node, {}));
+  assert.equal(res.merge_base, "editor");
+  assert.equal(widgets.local_prompts.value, "just typed, not yet committed | b");
+  assert.deepEqual(JSON.parse(widgets.timeline_data.value).segments.map((s) => s.prompt), [
+    "just typed, not yet committed",
+    "b",
+  ]);
+  // The in-flight text is current, not "out of band" — no bogus data-loss report.
+  assert.equal(res.replaced_out_of_band, undefined);
+});
+
+test("MID-TYPING: a pending debounce commit AFTER our write is a no-op (no rollback)", () => {
+  const { node, widgets, editor } = makeRelayNode();
+  editor.timeline.segments[0].prompt = "in flight";
+  widgets.local_prompts.value = derivePromptRelayWidgets(editor.timeline.segments).local_prompts;
+  applyPromptRelayTimelineWrite(node, { segments: [seg("agent set", 20)] });
+  // Replay the pack's commit() → syncWidgetsFromTimeline against the re-hydrated editor.
+  const before = { ...widgets.timeline_data, ...widgets.local_prompts };
+  const segs = editor.timeline.segments;
+  assert.equal(JSON.stringify(editor.timeline), widgets.timeline_data.value);
+  assert.equal(segs.map((s) => s.prompt).join(" | "), widgets.local_prompts.value);
+  assert.equal(segs.map((s) => s.length).join(", "), widgets.segment_lengths.value);
+  assert.ok(before);
+});
+
+test("POST-LOAD: the timeline_data widget wins over an editor still holding the OLD workflow", () => {
+  // onConfigure restores the widgets first and re-parses the editor ~10ms later. Merging onto
+  // the editor in that window would resurrect the previous workflow's timeline.
+  const { node, widgets, editor } = makeRelayNode({ timelineSegments: [seg("restored", 50)] });
+  editor.timeline = { segments: [seg("previous workflow", 99)] };
+  const res = relay(applyPromptRelayTimelineWrite(node, {}));
+  assert.equal(res.merge_base, "timeline_data");
+  assert.equal(widgets.local_prompts.value, "restored");
+  assert.equal(widgets.segment_lengths.value, "50");
+});
+
+test("the live editor never has its segment objects aliased into the written timeline", () => {
+  const { node, widgets, editor } = makeRelayNode();
+  const originalSeg = editor.timeline.segments[0];
+  applyPromptRelayTimelineWrite(node, {});
+  assert.notEqual(editor.timeline.segments[0], originalSeg);
+  // Mutating the pre-write object must not change what was written.
+  originalSeg.prompt = "mutated after the fact";
+  assert.equal(widgets.local_prompts.value, "a | b");
 });
 
 // ─── Refusals: everything the node would silently coerce or reset ───
@@ -294,8 +374,9 @@ test("REFUSES a missing/non-string prompt — the node would coerce it to \"\" (
   assert.equal(widgets.local_prompts.value, " | b");
 });
 
-test("REFUSES a length the node would clamp/truncate; accepts integers and integer strings", () => {
-  for (const bad of [undefined, null, 0, -5, 12.5, "24px", "", NaN, Infinity, {}]) {
+test("REFUSES a length the node would clamp/truncate; accepts every LOSSLESS integer form", () => {
+  // "24.7" is the important one: parseInt TRUNCATES it to 24, silently shortening the segment.
+  for (const bad of [undefined, null, 0, -5, 12.5, "24px", "24.7", "", NaN, Infinity, {}]) {
     const { node, widgets } = makeRelayNode();
     assert.throws(
       () => applyPromptRelayTimelineWrite(node, { segments: [{ prompt: "p", length: bad }] }),
@@ -303,10 +384,32 @@ test("REFUSES a length the node would clamp/truncate; accepts integers and integ
     );
     assert.equal(widgets.segment_lengths.value, "24, 36");
   }
+  // Forms parseInt handles losslessly are accepted and stored as real numbers.
   const { node, widgets } = makeRelayNode();
-  applyPromptRelayTimelineWrite(node, { segments: [{ prompt: "p", length: "30" }, seg("q", 1)] });
-  assert.equal(widgets.segment_lengths.value, "30, 1");
-  assert.equal(typeof JSON.parse(widgets.timeline_data.value).segments[0].length, "number");
+  applyPromptRelayTimelineWrite(node, {
+    segments: [
+      { prompt: "p", length: "30" },
+      { prompt: "q", length: "+12" },
+      { prompt: "r", length: "8.0" },
+      { prompt: "s", length: " 5 " },
+      seg("t", 1),
+    ],
+  });
+  assert.equal(widgets.segment_lengths.value, "30, 12, 8, 5, 1");
+  for (const s of JSON.parse(widgets.timeline_data.value).segments) {
+    assert.equal(typeof s.length, "number");
+  }
+});
+
+test("REFUSES a PRESENT non-string colour (the node would swap in a palette entry)", () => {
+  for (const bad of [42, null, {}, ["#fff"]]) {
+    const { node, widgets } = makeRelayNode();
+    assert.throws(
+      () => applyPromptRelayTimelineWrite(node, { segments: [{ prompt: "p", length: 5, color: bad }] }),
+      PromptRelayTimelineWriteError,
+    );
+    assert.equal(widgets.segment_lengths.value, "24, 36");
+  }
 });
 
 test("REFUSES when any of the three widgets is missing (a reconcile would be impossible)", () => {
@@ -360,6 +463,19 @@ test("WARNS about a literal | inside a prompt — the python side splits on it",
   const { node } = makeRelayNode();
   const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("a cat | a dog", 24)] }));
   assert.ok(res.warnings.some((w) => w.includes('literal "|"')));
+});
+
+test("WARNS about leading/trailing whitespace — the python side strips each entry", () => {
+  const { node } = makeRelayNode();
+  const res = relay(
+    applyPromptRelayTimelineWrite(node, { segments: [seg("  red fox  ", 24), seg("clean", 24)] }),
+  );
+  assert.ok(res.warnings.some((w) => w.includes("leading/trailing whitespace")));
+  // The prompt is stored VERBATIM; only the note about what the encoder will do is added.
+  assert.equal(res.local_prompts, "  red fox   | clean");
+  // A fully-blank prompt is reported by the stronger blank-prompt warning, not this one.
+  const clean = relay(applyPromptRelayTimelineWrite(makeRelayNode().node, { segments: [seg("   ", 24)] }));
+  assert.equal(clean.warnings.filter((w) => w.includes("leading/trailing whitespace")).length, 0);
 });
 
 test("a UI-refresh failure does NOT fail the write, and is reported", () => {

@@ -40,11 +40,14 @@
 // Anything the node's own parser would COERCE (a missing prompt → "", a bogus length → 1) or
 // that would make it RESET to a blank two-segment default (absent/empty/malformed segments)
 // is REFUSED LOUDLY instead of applied — a loud, safe failure over silent destruction. Fields
-// the caller does not mention are MERGED from the node's current timeline, never defaulted
-// away. And when the node is found ALREADY desynced (out-of-band `local_prompts` text that
-// the current timeline does not produce — e.g. written with the #506 workaround), the
-// pre-existing value is RETURNED in the result envelope before being replaced, so no prompt
-// text ever disappears without the caller being told.
+// the caller does not mention are MERGED from the node's CURRENT timeline — and "current"
+// deliberately means the live editor's copy when the user is mid-keystroke, because the
+// timeline_data widget lags a typed prompt by up to 120 ms (see chooseMergeBase). And when the
+// node is found ALREADY desynced (out-of-band `local_prompts` text that no timeline produces —
+// e.g. written with the #506 workaround), the pre-existing value is RETURNED in the result
+// envelope before being replaced, so no prompt text ever disappears without the caller being
+// told. Anything PromptRelay's python would encode differently from what the timeline shows
+// (a blank prompt, a literal "|", padding whitespace) comes back as a warning.
 
 export const PROMPT_RELAY_TIMELINE_NODE_TYPE = "PromptRelayEncodeTimeline";
 
@@ -131,18 +134,22 @@ function isPlainObject(v) {
 /**
  * The node's segment length, normalized to the integer frame count it stores — or null when
  * the value is one the node's `Math.max(1, parseInt(v, 10) || 1)` would silently MANGLE
- * (missing, fractional, zero/negative, non-numeric). A numeric integer STRING is accepted
- * because parseInt handles it losslessly; everything else is refused rather than coerced.
+ * (missing, fractional, zero/negative, non-numeric).
+ * A STRING is accepted only in the forms parseInt handles LOSSLESSLY: optional leading "+",
+ * digits, and an all-zero fraction ("24", "+24", "24.0"). A non-zero fraction ("24.7") is
+ * refused because parseInt would TRUNCATE it — silently shortening a segment.
  */
+const LOSSLESS_INT_STRING = /^\+?\d+(?:\.0+)?$/;
+
 function normalizeSegmentLength(v) {
   if (typeof v === "number") {
     return Number.isInteger(v) && v >= MIN_SEGMENT_LENGTH ? v : null;
   }
-  if (typeof v === "string" && /^\s*\d+\s*$/.test(v)) {
-    const n = Number(v.trim());
-    return Number.isInteger(n) && n >= MIN_SEGMENT_LENGTH ? n : null;
-  }
-  return null;
+  if (typeof v !== "string") return null;
+  const trimmed = v.trim();
+  if (!LOSSLESS_INT_STRING.test(trimmed)) return null;
+  const n = Number.parseInt(trimmed, 10);
+  return Number.isInteger(n) && n >= MIN_SEGMENT_LENGTH ? n : null;
 }
 
 function describe(v) {
@@ -250,13 +257,30 @@ function normalizeSegments(timeline, baseSegments) {
           `silently corrupting the segment lengths that drive the render — refusing.`,
       );
     }
+    // A PRESENT `color` must be a string. The node would swap a non-string for a
+    // palette entry, so accepting it would mean applying a value the caller did not ask for.
+    if (seg.color !== undefined && typeof seg.color !== "string") {
+      throw new PromptRelayTimelineWriteError(
+        `timeline_data.segments[${i}].color, when present, must be a colour STRING (got ` +
+          `${describe(seg.color)}). The node replaces a non-string colour with a palette entry — ` +
+          `refusing rather than applying a colour you did not ask for. Omit the field to keep the ` +
+          `segment's current colour.`,
+      );
+    }
+    // An OMITTED colour keeps the colour the segment at this position already has, so an edit
+    // that only rewrites prompts does not reshuffle the block colours; with no current
+    // timeline to inherit from, fall back to the palette position (what the node itself would
+    // pick). Either way we WRITE the colour, so the node never has to re-derive it.
     const color =
-      typeof seg.color === "string"
-        ? seg.color
-        : typeof baseSegments?.[i]?.color === "string"
-          ? baseSegments[i].color
-          : FALLBACK_SEGMENT_COLORS[i % FALLBACK_SEGMENT_COLORS.length];
-    // Spread first so any field a future pack version adds survives the round-trip.
+      seg.color ??
+      (typeof baseSegments?.[i]?.color === "string"
+        ? baseSegments[i].color
+        : FALLBACK_SEGMENT_COLORS[i % FALLBACK_SEGMENT_COLORS.length]);
+    // Spread the CALLER's segment first so any field a future pack version adds survives.
+    // Deliberately NOT merged with the same-index segment of the current timeline: supplying
+    // `segments` REPLACES the list, and index-matching unknown per-segment metadata across a
+    // reordered or resized list would attach it to the wrong segment. `color` is the sole
+    // exception because it is purely cosmetic and must be present for the canvas to draw.
     return { ...seg, prompt: seg.prompt, length, color };
   });
 }
@@ -273,9 +297,12 @@ function timelineWarnings(segments) {
   const warnings = [];
   const blank = [];
   const piped = [];
+  const padded = [];
   for (let i = 0; i < segments.length; i++) {
-    if (segments[i].prompt.trim() === "") blank.push(i);
-    if (segments[i].prompt.includes("|")) piped.push(i);
+    const p = segments[i].prompt;
+    if (p.trim() === "") blank.push(i);
+    else if (p.trim() !== p) padded.push(i);
+    if (p.includes("|")) piped.push(i);
   }
   if (blank.length) {
     warnings.push(
@@ -292,6 +319,13 @@ function timelineWarnings(segments) {
         `"|" characters from the prompt text.`,
     );
   }
+  if (padded.length) {
+    warnings.push(
+      `segment(s) ${padded.join(", ")} have leading/trailing whitespace. PromptRelay strips each entry ` +
+        `after splitting local_prompts, so the text it actually encodes is the TRIMMED prompt — the ` +
+        `padding you set is not part of the render.`,
+    );
+  }
   return warnings;
 }
 
@@ -299,6 +333,43 @@ function timelineWarnings(segments) {
 function findWidget(node, name) {
   const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
   return widgets.find((w) => w?.name === name) ?? null;
+}
+
+/** The live editor's in-memory timeline, when it is a usable one; otherwise null. */
+function liveEditorTimeline(editor) {
+  const tl = editor && typeof editor === "object" ? editor.timeline : null;
+  if (!isPlainObject(tl) || !Array.isArray(tl.segments) || tl.segments.length === 0) return null;
+  return tl;
+}
+
+/**
+ * Pick which timeline the write MERGES onto — the single trickiest decision here, because the
+ * two candidates can each be the stale one:
+ *
+ *   * The `timeline_data` WIDGET lags while the user is typing. The editor's textarea handler
+ *     updates `this.timeline` and `local_prompts` IMMEDIATELY but debounces the timeline_data
+ *     JSON write by 120 ms. Merging onto the widget in that window would rebuild from the
+ *     pre-keystroke timeline and DESTROY the text the user just typed.
+ *   * The EDITOR's `this.timeline` lags right after a workflow load: `onConfigure` restores the
+ *     widgets first and re-parses the editor 10 ms later. Merging onto the editor in that
+ *     window would resurrect the PREVIOUS workflow's timeline.
+ *
+ * `local_prompts` breaks the tie: it is the value the node would EXECUTE right now, and both
+ * update paths (the editor's live keystroke handler, and a workflow load restoring the saved
+ * widgets) keep it in step with whichever timeline is current. So prefer the candidate whose
+ * derived prompts match it. If neither matches, the node is genuinely desynced and the
+ * timeline_data widget — the node's master field — wins, with the out-of-band text reported.
+ */
+function chooseMergeBase(editor, widgets) {
+  const currentPrompts = widgets.local_prompts.value;
+  const fromEditor = liveEditorTimeline(editor);
+  const fromWidget = parsePromptRelayTimeline(widgets[PROMPT_RELAY_MASTER_WIDGET].value);
+  if (fromEditor && derivePromptRelayWidgets(fromEditor.segments).local_prompts === currentPrompts) {
+    return { base: fromEditor, baseSource: "editor" };
+  }
+  if (fromWidget) return { base: fromWidget, baseSource: "timeline_data" };
+  if (fromEditor) return { base: fromEditor, baseSource: "editor" };
+  return { base: null, baseSource: "none" };
 }
 
 /** The refusal message for a DERIVED-widget write — explains why + points at timeline_data. */
@@ -321,8 +392,9 @@ export function promptRelayDerivedRefusal(widgetName, nodeId) {
  * interleave between the read of the current timeline and the write of the new one):
  *   1. validate the caller's value,
  *   2. resolve ALL THREE widgets (refuse if any is missing — a reconcile would be impossible),
- *   3. MERGE the caller's top-level fields onto the node's CURRENT timeline so anything they
- *      did not mention is preserved (never defaulted away),
+ *   3. MERGE the caller's top-level fields onto the node's CURRENT timeline — see
+ *      chooseMergeBase for which of the editor / widget copies is the current one — so
+ *      anything they did not mention is preserved (never defaulted away),
  *   4. validate + normalize the merged segments (refusing every coerce/reset case),
  *   5. COMPUTE all three final widget values,
  *   6. only then MUTATE — three plain assignments that cannot throw, so there is no path that
@@ -365,15 +437,16 @@ export function applyPromptRelayTimelineWrite(
   // OMISSION preserves. An overlay that omits `segments` entirely is therefore an idempotent
   // RE-RECONCILE of the node's existing timeline — which is also the repair path for a node
   // that is already desynced — and is refused only when there is no current timeline to keep.
-  const base = parsePromptRelayTimeline(widgets[PROMPT_RELAY_MASTER_WIDGET].value);
+  const editor = typeof getEditor === "function" ? getEditor(node) : node?._timelineEditor;
+  const { base, baseSource } = chooseMergeBase(editor, widgets);
   const merged = base ? { ...base, ...overlay } : { ...overlay };
   const segments = normalizeSegments(merged, Array.isArray(base?.segments) ? base.segments : null);
   const finalTimeline = { ...merged, segments };
 
   // The node is ALREADY out of sync when its current local_prompts / segment_lengths are not
-  // what its current timeline_data produces — e.g. prompt text written straight into
-  // local_prompts with the #506 workaround, which exists ONLY there. That text is about to be
-  // replaced, so hand it back rather than letting it vanish silently.
+  // what the base timeline produces — e.g. prompt text written straight into local_prompts with
+  // the #506 workaround, which exists ONLY there (and which the node's next commit would revert
+  // anyway). That text is about to be replaced, so hand it back rather than let it vanish.
   const baseDerived = base ? derivePromptRelayWidgets(base.segments) : null;
   const replaced = {};
   if (baseDerived) {
@@ -405,9 +478,9 @@ export function applyPromptRelayTimelineWrite(
     widgets.local_prompts.value = derived.local_prompts;
     widgets.segment_lengths.value = derived.segment_lengths;
 
-    // Re-hydrate the live editor from the SAME object so its next commit re-derives exactly
-    // what we just wrote (a no-op) instead of reverting to the stale in-memory timeline.
-    const editor = typeof getEditor === "function" ? getEditor(node) : node?._timelineEditor;
+    // Re-hydrate the live editor from the SAME object so its next commit — including a
+    // still-pending 120 ms textarea debounce — re-derives exactly what we just wrote (a no-op)
+    // instead of reverting to the stale in-memory timeline.
     if (editor && typeof editor === "object") {
       editor.timeline = finalTimeline;
       const last = segments.length - 1;
@@ -444,6 +517,7 @@ export function applyPromptRelayTimelineWrite(
       reconciled: true,
       segments: segments.length,
       merged_onto_current: base != null,
+      merge_base: baseSource,
       editor_synced: editorSynced,
       local_prompts: derived.local_prompts,
       segment_lengths: derived.segment_lengths,
