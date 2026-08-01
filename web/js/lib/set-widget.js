@@ -29,7 +29,7 @@ import {
   assertTypeAgainstFreshBackend,
 } from "./node-resolve.js";
 import { controlAfterGenerateWarning } from "./control-after-generate.js";
-import { uploadInputConfig, addComboOption } from "./input-asset.js";
+import { uploadInputConfig, uploadInputAccepts, addComboOption } from "./input-asset.js";
 
 export async function runSetWidget(
   node,
@@ -235,6 +235,11 @@ export async function runSetWidget(
       concreteWidgetName ?? writeTargetWidgetName ?? widgetName,
     );
     if (!cfg) return false;
+    // #240 strictness: a server-existence probe alone is too loose — `/view?type=input`
+    // serves ANY input file, so accept ONLY a value whose extension is a loadable asset
+    // of THIS input's upload kind (e.g. an image extension for an image_upload combo),
+    // never a stray `.txt` the LoadImage combo would never list.
+    if (!uploadInputAccepts(cfg, value)) return false;
     const uploadWidget = (resolvedTargetNode?.widgets ?? []).find(
       (w) => w?.name === (writeTargetWidgetName ?? widgetName),
     );

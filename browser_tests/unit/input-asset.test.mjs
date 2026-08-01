@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 
 import {
   uploadInputConfig,
+  uploadInputAccepts,
   splitInputAssetRef,
   addComboOption,
 } from "../../web/js/lib/input-asset.js";
@@ -55,6 +56,31 @@ test("uploadInputConfig is defensive: missing defs / type / widget → null", ()
   assert.equal(uploadInputConfig(DEFS, "NopeNode", "image"), null);
   assert.equal(uploadInputConfig(DEFS, "LoadImage", "nope"), null);
   assert.equal(uploadInputConfig(DEFS, "LoadImage", null), null);
+});
+
+test("uploadInputAccepts: image_upload accepts image extensions, rejects a .txt (#240 strictness)", () => {
+  const cfg = { image_upload: true };
+  assert.equal(uploadInputAccepts(cfg, "xyr_canvas/foo.png"), true);
+  assert.equal(uploadInputAccepts(cfg, "sub/pic.JPEG"), true);
+  assert.equal(uploadInputAccepts(cfg, "sub/clip.webp"), true);
+  // A server-EXISTING but wrong-kind / non-loadable file must be refused.
+  assert.equal(uploadInputAccepts(cfg, "xyr_canvas/notes.txt"), false);
+  assert.equal(uploadInputAccepts(cfg, "sub/data.json"), false);
+  assert.equal(uploadInputAccepts(cfg, "sub/clip.mp4"), false);
+});
+
+test("uploadInputAccepts: video_upload / audio_upload gate to their own kinds", () => {
+  assert.equal(uploadInputAccepts({ video_upload: true }, "a/clip.mp4"), true);
+  assert.equal(uploadInputAccepts({ video_upload: true }, "a/pic.png"), false);
+  assert.equal(uploadInputAccepts({ audio_upload: true }, "a/song.mp3"), true);
+  assert.equal(uploadInputAccepts({ audio_upload: true }, "a/pic.png"), false);
+});
+
+test("uploadInputAccepts: extensionless / dotfile / null config → false", () => {
+  assert.equal(uploadInputAccepts({ image_upload: true }, "sub/noext"), false);
+  assert.equal(uploadInputAccepts({ image_upload: true }, "sub/.hidden"), false);
+  assert.equal(uploadInputAccepts({ image_upload: true }, "sub/trailingdot."), false);
+  assert.equal(uploadInputAccepts(null, "sub/foo.png"), false);
 });
 
 test("splitInputAssetRef: nested subfolder path", () => {

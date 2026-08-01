@@ -105,6 +105,28 @@ test("an upload value the server does NOT have stays rejected (#240 strictness)"
   assert.equal(widget.value, "example.png", "must not mutate on an unconfirmed value");
 });
 
+test("a server-EXISTING but non-image file (.txt) into an image combo is refused (#240 strictness, codex P1)", async () => {
+  const widget = { name: "image", type: "combo", options: { values: ["example.png"] }, value: "example.png" };
+  const node = { id: 191, type: "LoadImage", widgets: [widget] };
+  let probed = false;
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "image", "xyr_canvas/notes.txt", {
+        registry: REGISTRY,
+        ...freshOracle,
+        refreshCombos: refreshFromFreshDefs,
+        confirmServerAsset: async () => {
+          probed = true;
+          return true; // even though the server HAS the file, the extension is wrong
+        },
+      }),
+    (err) => err instanceof Error && /not a valid option/.test(err.message),
+  );
+  assert.equal(probed, false, "a wrong-kind extension must be rejected BEFORE any server probe");
+  assert.equal(widget.value, "example.png");
+  assert.ok(!widget.options.values.includes("xyr_canvas/notes.txt"));
+});
+
 test("a TOP-LEVEL uploaded file the refresh CAN list is accepted by refresh, never probing the server", async () => {
   const widget = { name: "image", type: "combo", options: { values: [] }, value: "" };
   const node = { id: 191, type: "LoadImage", widgets: [widget] };

@@ -22,6 +22,30 @@
 // audio / 3d), whose valid values live on DISK, not only in the combo snapshot.
 const UPLOAD_CONFIG_FLAGS = ["image_upload", "video_upload", "audio_upload", "model_upload"];
 
+// Extension allowlist PER upload kind. A successful `/view?type=input` probe proves a
+// file EXISTS, not that it is a LOADABLE asset of the RIGHT kind — `/view` serves any
+// input file regardless of type, so a bare existence check would let a `foo.txt` (or a
+// stray file) be accepted into a LoadImage's image combo and then fail at execution,
+// weakening #240's strict combo validation. Gating the fallback on an extension that
+// matches the input's upload kind keeps the accept tight: only a plausibly-loadable
+// image/video/audio/model file of the correct family is admitted. `gif` intentionally
+// appears under both image and video.
+const UPLOAD_KIND_EXTENSIONS = {
+  image_upload: new Set([
+    "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "jfif", "ppm",
+    "avif", "ico", "apng", "heic", "heif",
+  ]),
+  video_upload: new Set([
+    "mp4", "webm", "mkv", "mov", "avi", "m4v", "gif", "mpg", "mpeg", "wmv", "flv", "ogv",
+  ]),
+  audio_upload: new Set([
+    "mp3", "wav", "flac", "ogg", "oga", "m4a", "aac", "opus", "wma", "aiff", "aif",
+  ]),
+  model_upload: new Set([
+    "safetensors", "ckpt", "pt", "pth", "bin", "gguf", "sft", "onnx",
+  ]),
+};
+
 /**
  * The config object for `widgetName` on the fresh /object_info def for `type`, when
  * that input is an UPLOAD input; otherwise null. ComfyUI encodes an input spec as
@@ -44,6 +68,31 @@ export function uploadInputConfig(defsByType, type, widgetName) {
     return UPLOAD_CONFIG_FLAGS.some((f) => config[f]) ? config : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * True when `value`'s file extension is a plausibly-LOADABLE asset for the upload
+ * `config`'s kind (image/video/audio/model). This is the strictness gate on top of a
+ * mere server-existence probe (#240): `/view?type=input` confirms the file is on disk
+ * but NOT that it is a loadable image, so a LoadImage image combo must still refuse a
+ * `.txt`/`.json`/extensionless file even if the server has one. A config may carry
+ * more than one upload flag; the value is accepted if its extension matches ANY of the
+ * present kinds. Defensive: a null config or an extensionless value returns false.
+ */
+export function uploadInputAccepts(config, value) {
+  try {
+    if (!config) return false;
+    const { filename } = splitInputAssetRef(value);
+    const dot = filename.lastIndexOf(".");
+    if (dot <= 0 || dot === filename.length - 1) return false; // no usable extension
+    const ext = filename.slice(dot + 1).toLowerCase();
+    for (const flag of UPLOAD_CONFIG_FLAGS) {
+      if (config[flag] && UPLOAD_KIND_EXTENSIONS[flag]?.has(ext)) return true;
+    }
+    return false;
+  } catch {
+    return false;
   }
 }
 
