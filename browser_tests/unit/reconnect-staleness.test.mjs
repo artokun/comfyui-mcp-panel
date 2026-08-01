@@ -164,7 +164,9 @@ test("#433 wiring: reconnect bumps the epoch on a MONOTONIC clock; open/new/read
 
   // Each explicit resync site (open AND new) must stamp the epoch GUARDED by the
   // TOCTOU check (codex P1): only when no reconnect intervened during the async op.
-  for (const sig of ["async workflow_new()", "async workflow_open({"]) {
+  // Both executors now also take the command `rid` (#402 open receipts), so match on the
+  // signature PREFIX rather than the exact old zero-arg form.
+  for (const sig of ["async workflow_new({", "async workflow_open({"]) {
     const body = handlerBody(src, sig);
     assert.ok(body, `${sig} must exist`);
     const snapAt = body.indexOf("const openedForEpoch = backendReconnectEpoch;");

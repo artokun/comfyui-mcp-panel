@@ -1,0 +1,176 @@
+// Unit tests for web/js/lib/command-liveness.js — run with `node --test`.
+//
+// #508: the sidebar chat stayed CONNECTED and accepted the user's request, yet EVERY
+// frontend command timed out with no reply from the registered tab — set_todo (5000 ms),
+// graph_outline (6000 ms), workflow_list (6000 ms) — while the orchestrator kept
+// targeting the same wf: id. A row of identical timeouts, forever.
+//
+// The load-bearing invariants locked here:
+//   * a command frame ALWAYS produces a reply attempt on the socket it arrived on, and
+//     no host callback can suppress it (the pre-reply throw, and the superseded-socket
+//     early return, were both silent no-reply paths);
+//   * an undelivered reply is journaled with its ACTUAL cause and replayed, rather than
+//     leaving the caller with the orchestrator's guess that the tab is "frozen";
+//   * self-heal re-registration is BOUNDED, and it can only ever re-advertise THIS tab's
+//     own current identity — retargeting to a different workflow's tab is corruption
+//     class and strictly worse than staying wedged.
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+import {
+  LOST_REPLY_CAP,
+  RE_REGISTER_MAX,
+  RE_REGISTER_WINDOW_MS,
+  classifyUndeliveredReply,
+  describeUndeliveredReply,
+  createLostReplyJournal,
+  pruneAttempts,
+  shouldReRegister,
+  reRegisterExhaustedHint,
+} from "../../web/js/lib/command-liveness.js";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
+
+// --- honest cause reporting ----------------------------------------------
+
+test("#508: the cause is REPORTED, not guessed", () => {
+  assert.equal(classifyUndeliveredReply({ socketOpen: false }), "socket_closed");
+  assert.equal(classifyUndeliveredReply({ socketOpen: false, superseded: true }), "socket_superseded");
+  assert.equal(classifyUndeliveredReply({ socketOpen: true, sendThrew: true }), "send_failed");
+  assert.equal(classifyUndeliveredReply({ socketOpen: true }), null, "a healthy write has nothing to report");
+});
+
+test("#508: the user-facing line separates 'the command ran' from 'the reply was lost'", () => {
+  const line = describeUndeliveredReply({ cmd: "workflow_open", ok: true, reason: "socket_closed" });
+  assert.match(line, /completed "workflow_open"/);
+  assert.match(line, /unknown outcome, not as a failure to act/);
+  const superseded = describeUndeliveredReply({ cmd: "graph_outline", ok: true, reason: "socket_superseded" });
+  assert.match(superseded, /replaced mid-command/);
+  assert.equal(describeUndeliveredReply(null), "");
+});
+
+// --- the journal ----------------------------------------------------------
+
+test("the lost-reply journal is bounded, keeps the newest, and drains exactly once", () => {
+  const j = createLostReplyJournal();
+  for (let i = 0; i < LOST_REPLY_CAP + 4; i++) {
+    j.record({ reply: { rid: `r${i}`, ok: true, result: {} }, cmd: "graph_outline", at: i });
+  }
+  assert.equal(j.size(), LOST_REPLY_CAP);
+  assert.equal(j.list()[j.size() - 1].rid, `r${LOST_REPLY_CAP + 3}`);
+  assert.equal(j.drain().length, LOST_REPLY_CAP);
+  assert.equal(j.size(), 0, "a drained journal must not replay again");
+});
+
+test("the journal keeps the EXACT reply frame (replayable verbatim) but omits it from summaries", () => {
+  const j = createLostReplyJournal();
+  const reply = { rid: "abc", ok: true, result: { opened: { path: "x.json" } } };
+  j.record({ reply, cmd: "workflow_open", reason: "socket_closed", at: 7 });
+  assert.deepEqual(j.list()[0].reply, reply, "the frame must survive intact for a verbatim replay");
+  assert.deepEqual(j.summaries(), [{ rid: "abc", cmd: "workflow_open", ok: true, reason: "socket_closed", at: 7 }]);
+});
+
+test("the journal refuses a frame with no rid (nothing could ever correlate it)", () => {
+  const j = createLostReplyJournal();
+  assert.equal(j.record({ reply: { ok: true }, cmd: "x" }), null);
+  assert.equal(j.record({ cmd: "x" }), null);
+  assert.equal(j.size(), 0);
+});
+
+// --- bounded self-heal ----------------------------------------------------
+
+test("#508: self-heal is BOUNDED — never a re-registration storm", () => {
+  const now = 100000;
+  const base = { socketOpen: true, lostCount: 1, now };
+  assert.equal(shouldReRegister({ ...base, attempts: [] }), true);
+  const spent = Array.from({ length: RE_REGISTER_MAX }, (_, i) => now - i * 100);
+  assert.equal(shouldReRegister({ ...base, attempts: spent }), false, "budget spent inside the window");
+  // …and the budget REFRESHES once the window has rolled past.
+  const old = spent.map((t) => t - RE_REGISTER_WINDOW_MS - 1);
+  assert.equal(shouldReRegister({ ...base, attempts: old }), true);
+});
+
+test("#508: no live socket ⇒ no re-registration (the reconnect path owns that recovery)", () => {
+  assert.equal(shouldReRegister({ socketOpen: false, lostCount: 3, attempts: [], now: 1 }), false);
+});
+
+test("#508: nothing lost ⇒ no re-registration (never hello on speculation)", () => {
+  assert.equal(shouldReRegister({ socketOpen: true, lostCount: 0, attempts: [], now: 1 }), false);
+});
+
+test("pruneAttempts drops only entries outside the window and never mutates the input", () => {
+  const now = 50000;
+  const input = [now - 1, now - RE_REGISTER_WINDOW_MS - 1, now - 10];
+  const out = pruneAttempts(input, now);
+  assert.deepEqual(out, [now - 1, now - 10]);
+  assert.equal(input.length, 3, "input must be untouched");
+  assert.deepEqual(pruneAttempts(null, now), []);
+});
+
+test("#508: the exhausted hint is an ACTIONABLE instruction, not another timeout", () => {
+  const hint = reRegisterExhaustedHint();
+  assert.match(hint, /Reconnect/);
+  assert.match(hint, /reload the ComfyUI page/);
+});
+
+// --- wiring contract in the panel -----------------------------------------
+
+test("#508 wiring: the turn-activity host callback can no longer suppress a reply", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const at = src.indexOf("onCommandReceived?.();");
+  assert.notEqual(at, -1, "the command handler must still mark turn activity");
+  // It must sit inside its OWN try, so a throw is contained rather than aborting the
+  // async listener before the reply is ever built.
+  const before = src.slice(Math.max(0, at - 200), at);
+  assert.match(before, /try \{\s*$/, "onCommandReceived must be wrapped in its own try");
+  const after = src.slice(at, at + 260);
+  assert.match(after, /catch \(err\) \{[\s\S]*onCommandReceived threw/, "the throw must be caught and logged, not swallowed silently");
+});
+
+test("#508 wiring: a SUPERSEDED socket still gets its reply — only the UI continuation is dropped", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const supersededAt = src.indexOf("const superseded = !isActive();");
+  assert.notEqual(supersededAt, -1, "the instance guard must be captured, not used as an early return");
+  const block = src.slice(supersededAt, supersededAt + 2200);
+  const sendAt = block.indexOf("thisSock.send(JSON.stringify(reply));");
+  const gateAt = block.indexOf("if (superseded) return;");
+  assert.notEqual(sendAt, -1, "the reply must still be written to the socket it arrived on");
+  assert.notEqual(gateAt, -1, "the UI continuation must still be gated on the instance guard");
+  assert.ok(sendAt < gateAt, "the reply must be sent BEFORE the superseded early return");
+  // And the pre-#508 shape (returning before the reply) must not come back.
+  assert.equal(
+    /if \(!isActive\(\)\) return;\s*\n\s*try \{\s*\n\s*if \(thisSock\.readyState/.test(src),
+    false,
+    "the superseded early-return must not precede the reply write again",
+  );
+});
+
+test("#508 wiring: an undelivered reply is journaled, replayed after hello, and self-heals boundedly", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  assert.match(src, /lostReplies\.record\(\{/, "an undelivered reply must be journaled");
+  assert.match(src, /handleUndeliveredReply\(/, "…and routed to the bounded self-heal");
+  assert.match(src, /shouldReRegister\(\{/, "self-heal must consult the bounded decision");
+  // Replay must come AFTER sendHello() on the new socket (the tab must be registered
+  // before its late outcomes arrive).
+  const openHandler = src.slice(src.indexOf('thisSock.addEventListener("open"'));
+  const helloAt = openHandler.indexOf("sendHello();");
+  const replayAt = openHandler.indexOf("replayLostReplies(thisSock);");
+  assert.notEqual(replayAt, -1, "lost outcomes must be replayed on the next socket");
+  assert.ok(helloAt !== -1 && helloAt < replayAt, "replay must follow the hello");
+});
+
+test("#508 wiring: self-heal re-registers via sendHello ONLY — it can never pick another tab", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const start = src.indexOf("function handleUndeliveredReply(entry) {");
+  assert.notEqual(start, -1);
+  const body = src.slice(start, src.indexOf("\n  }", start));
+  assert.match(body, /\bsendHello\(\);/, "re-registration must reuse the existing hello path");
+  // Nothing in this path may reference a tab id it did not derive from the live active
+  // workflow — no id argument, no list lookup, no adoption of another tab.
+  assert.equal(/tab_id|tabMigrations|attach_tab|openWorkflows/.test(body), false, "self-heal must not select a target tab");
+  assert.match(body, /reRegisterExhaustedHint\(\)/, "an exhausted budget must surface a user action");
+});

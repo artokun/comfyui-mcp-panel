@@ -297,6 +297,7 @@ export function buildHelloPayload({
   comfyuiPath,
   resume,
   workflowUuid,
+  lostReplies,
 } = {}) {
   const frame = {
     type: "hello",
@@ -330,6 +331,14 @@ export function buildHelloPayload({
   // title (the reopened cross-resume). Omitted when unknown so old behavior stands.
   if (typeof workflowUuid === "string" && workflowUuid.trim()) {
     frame.workflow_uuid = workflowUuid.trim();
+  }
+  // #508 — command outcomes this tab COMPLETED but could not deliver (the socket closed
+  // or was superseded mid-command). Advertising them at re-registration lets the other
+  // end reconcile "the reply was lost" against its own timed-out commands instead of
+  // asserting the unestablished "the tab may be backgrounded or frozen". Omitted when
+  // empty so the common hello is unchanged.
+  if (Array.isArray(lostReplies) && lostReplies.length) {
+    frame.lost_replies = lostReplies;
   }
   return frame;
 }
