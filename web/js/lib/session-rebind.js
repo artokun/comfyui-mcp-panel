@@ -310,6 +310,9 @@ export function buildHelloPayload({
     // active canvas). The orchestrator FAILS CLOSED for mutating graph commands unless a
     // connected panel confirms this, so an OLD panel that would silently ignore the stamp and
     // apply a stale write to the wrong canvas gets read-only graph access until updated.
+    // SCOPE: this is ACCIDENTAL version-skew protection for an honest user, NOT a security
+    // boundary — the flag is self-asserted, so a modified panel can spoof it, but that only
+    // leaks the user's own workflow into their own workflow (self-attack). No attestation.
     enforces_workflow_stamp: true,
   };
   if (comfyuiUrl) frame.comfyui_url = comfyuiUrl;
