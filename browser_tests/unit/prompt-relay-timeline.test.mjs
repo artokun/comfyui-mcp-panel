@@ -536,10 +536,10 @@ test("WARNS about leading/trailing whitespace — the python side strips each en
   assert.equal(clean.warnings.filter((w) => w.includes("leading/trailing whitespace")).length, 0);
 });
 
-test("the whitespace notice covers characters PYTHON strips but JS trim() does not", () => {
-  // python's str.strip() also removes U+001C…U+001F and U+0085; JS trim() does not. A prompt
-  // padded with one of those is dropped/shifted by the encoder, so it must still be reported.
-  for (const pad of ["\u001c", "\u001d", "\u001e", "\u001f", "\u0085", "\ufeff"]) {
+test("the whitespace notice tracks PYTHON str.strip(), not JS trim()", () => {
+  // python's str.strip() also removes U+001C…U+001F and U+0085, which JS trim() keeps. A
+  // prompt padded with one of those IS dropped/shifted by the encoder, so it must be reported.
+  for (const pad of ["\u001c", "\u001d", "\u001e", "\u001f", "\u0085", "\u00a0", "\u3000"]) {
     const res = relay(
       applyPromptRelayTimelineWrite(makeRelayNode().node, { segments: [seg(pad + "fox" + pad, 24)] }),
     );
@@ -548,7 +548,13 @@ test("the whitespace notice covers characters PYTHON strips but JS trim() does n
       `no whitespace warning for U+${pad.codePointAt(0).toString(16)}`,
     );
   }
-  // A prompt made only of those characters counts as BLANK (python drops it entirely).
+  // U+FEFF goes the OTHER way: JS trim() strips it but python does NOT, so the render keeps it
+  // verbatim and warning would be a lie.
+  const bom = relay(
+    applyPromptRelayTimelineWrite(makeRelayNode().node, { segments: [seg("\ufefffox\ufeff", 24)] }),
+  );
+  assert.equal(bom.warnings, undefined);
+  // A prompt made only of python-whitespace counts as BLANK (python drops it entirely).
   const blank = relay(
     applyPromptRelayTimelineWrite(makeRelayNode().node, { segments: [seg("\u001c\u0085", 24), seg("b")] }),
   );

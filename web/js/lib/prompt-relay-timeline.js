@@ -308,15 +308,21 @@ function normalizeSegments(timeline, baseSegments) {
  *     prompt count disagree with the length count and shifts every later segment.
  *   * `local_prompts` is split on "|", so a literal "|" inside a prompt becomes TWO prompts.
  */
-// The edge characters that get stripped before encoding. Python's `str.strip()` and JS's
-// `String.trim()` do NOT agree — python also strips the C1/separator controls U+001C…U+001F
-// and U+0085, while JS also strips U+FEFF — so the UNION is used, and the padding/blank
-// notices fire for anything EITHER side would remove. (Using JS trim() alone would miss a
-// prompt padded with U+001C: python drops it, shifting every later segment, with no warning.)
-const STRIPPED_EDGE_CHARS = /^[\s\u001c-\u001f\u0085\ufeff]+|[\s\u001c-\u001f\u0085\ufeff]+$/g;
+// The edge characters PromptRelay's PYTHON strips before encoding: `str.strip()` with no
+// argument, i.e. exactly the characters `str.isspace()` accepts. Spelled out rather than
+// reusing JS `\s`, because the two sets differ in BOTH directions and these notices describe
+// what PYTHON will do:
+//   * python strips the separator/C1 controls U+001C-U+001F and U+0085; JS trim() does not,
+//     so `\s` alone would MISS a prompt python drops entirely (shifting every later segment)
+//     - the exact silent mismatch this warning exists to catch;
+//   * JS trim() strips U+FEFF; python does NOT, so including it would warn that text will be
+//     trimmed when the render actually keeps it verbatim.
+const PY_STRIP_CLASS =
+  "[\\t\\n\\v\\f\\r \\u001c-\\u001f\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]";
+const PY_STRIPPED_EDGE_CHARS = new RegExp(`^${PY_STRIP_CLASS}+|${PY_STRIP_CLASS}+$`, "g");
 
 function edgeTrim(s) {
-  return s.replace(STRIPPED_EDGE_CHARS, "");
+  return s.replace(PY_STRIPPED_EDGE_CHARS, "");
 }
 
 function timelineWarnings(segments) {
