@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.26] - 2026-08-01
+
+### Fixed
+- **`panel_remove_node` no longer crashes on reroute/subgraph-boundary nodes, and the "manual changes" notice stops contradicting the live graph (#420, #369).** Node removal recovers from the `findInputSlot is not a function` TypeError (severs residual links at the record level, preferring reroute/layout-aware `LLink.disconnect()`), and the manual-change diff runs only when the reconnect epoch + workflow identity both match — so a reload/resume reseeds silently instead of emitting a false per-node delta.
+- **Group read tools use live geometry, and read tools flag a stale "active" workflow briefly after a reconnect (#429, #433).** The group-membership read/consume handlers (`graph_get_state`/`graph_outline`/`graph_query`/`graph_auto_layout`/`graph_edit_group`/…) resync node rects to live pos/size before computing geometric membership (no staleness after a non-panel paste/load/drag), and `panel_list_workflows`/`panel_graph_outline` surface an `active_possibly_stale` hint for a bounded window after a ComfyUI reconnect (epoch-ordered + monotonic-clock-windowed, TOCTOU-guarded).
+- **Every open sidebar tab's bridge reconnects after a soft-reload (#419).** Hardens the #379 fix so `softReload()` guarantees `client.start()` on every path (extracted to a DI-testable `performSoftReloadRecovery()`), with an N-tab independence regression test — no tab left permanently disconnected.
+- **Regression-locked the shipped subgraph run/set_widget behavior (#438, #439, #435).** `panel_run` targeting an output node inside the active/nested subgraph and `set_widget` firing a promoted widget's inner callback were already fixed in 0.11.25; extracted `resolveRunToNodeTarget()` and added non-vacuous regression tests so they can't silently regress.
+
 ## [0.11.25] - 2026-08-01
 
 ### Added
