@@ -75,6 +75,19 @@ export function shouldForkInPlaceReload({ cachedUuid, incomingUuid } = {}) {
   return Boolean(cachedUuid) && incomingUuid !== cachedUuid;
 }
 
+/** #570 — should the panel REFUSE to execute a command stamped for a specific workflow
+ *  instance? The orchestrator stamps each dispatched command with the trusted per-instance
+ *  `workflow_uuid` it was ISSUED FOR. Every graph executor runs against the ACTIVE canvas, so
+ *  if the user switched/replaced the workflow after the command was dispatched (a frame the
+ *  server can no longer retract), applying it would silently mutate the WRONG graph. Reject
+ *  when the command carries a non-empty uuid that does NOT equal the active workflow's uuid —
+ *  including when the active uuid is unresolvable (fail closed, #186). A command with no
+ *  stamp (old orchestrator / identity-less tab) is never fenced here. */
+export function commandWorkflowMismatch({ commandUuid, activeUuid } = {}) {
+  if (typeof commandUuid !== 'string' || !commandUuid.trim()) return false;
+  return activeUuid !== commandUuid;
+}
+
 /** #570 — resolve the per-instance uuid for an UNSAVED workflow, failing CLOSED on the
  *  copyable durability carrier. Precedence:
  *   1. `objectUuid` — the LIVE-object WeakMap value. A copy/import never shares the live

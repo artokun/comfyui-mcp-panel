@@ -96,6 +96,7 @@ import {
 } from "./lib/chat-history-store.js";
 import {
   classifyPinnedTarget,
+  commandWorkflowMismatch,
   isWorkflowCreationLoad,
   normalizedWorkflowPath,
   resolveUnsavedInstanceUuid,
@@ -9352,6 +9353,25 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           } else {
             const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];
             if (!executor) throw new Error(`Unknown command "${msg.cmd}"`);
+            // WORKFLOW-INSTANCE FENCE (#570): the orchestrator stamps each command with the
+            // trusted per-instance workflow_uuid it was ISSUED FOR. Every executor runs
+            // against the ACTIVE canvas, so a command that arrives AFTER the user switched or
+            // replaced the workflow (a frame the server already delivered and cannot retract)
+            // would silently mutate the WRONG graph. Refuse when the stamped uuid does not
+            // match the active workflow's uuid (fail closed when unresolvable, #186). This
+            // catches the CURRENT-mode leak that the workflow_path pin guard below cannot —
+            // a default (unpinned) session carries no path but still must not cross-apply.
+            const commandUuid = msg?.[WORKFLOW_UUID_FIELD];
+            if (
+              commandWorkflowMismatch({ commandUuid, activeUuid: workflowStableUuid() })
+            ) {
+              throw new Error(
+                `workflow instance mismatch: this command targets a different workflow than the ` +
+                  `active canvas — the workflow was switched or replaced after it was issued. ` +
+                  `Re-select the intended workflow (panel_open_workflow) or re-target with ` +
+                  `panel_set_workflow_target({mode:"current"}), then retry.`,
+              );
+            }
             // PINNED-TARGET GUARD (#349): a `workflow_path` on the command means the
             // agent's session is pinned to a SPECIFIC workflow. But every executor
             // runs against the ACTIVE canvas (getGraphCtx = app.canvas.graph) — the

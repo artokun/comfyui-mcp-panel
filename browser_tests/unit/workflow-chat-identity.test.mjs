@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  commandWorkflowMismatch,
   isThreadInScope,
   isWorkflowCreationLoad,
   normalizedWorkflowPath,
@@ -10,6 +11,29 @@ import {
   shouldForkInPlaceReload,
   workflowAliasForPath
 } from '../../web/js/lib/workflow-chat-identity.js'
+
+// #570 — WORKFLOW-INSTANCE FENCE. A command stamped for workflow A must not execute against
+// a canvas the user has since switched to (B). The generation-bound-command leak: the server
+// cannot retract a delivered frame, so the panel declines to apply a stale one.
+test('#570 fence: stamped uuid matches the active workflow → execute', () => {
+  assert.equal(commandWorkflowMismatch({ commandUuid: 'uuid-A', activeUuid: 'uuid-A' }), false)
+})
+
+test('#570 fence: stamped uuid differs from active (post-switch) → REJECT (no cross-apply)', () => {
+  assert.equal(commandWorkflowMismatch({ commandUuid: 'uuid-A', activeUuid: 'uuid-B' }), true)
+})
+
+test('#570 fence: stamped uuid but active is UNRESOLVABLE → REJECT (fail closed, #186)', () => {
+  assert.equal(commandWorkflowMismatch({ commandUuid: 'uuid-A', activeUuid: undefined }), true)
+  assert.equal(commandWorkflowMismatch({ commandUuid: 'uuid-A', activeUuid: null }), true)
+})
+
+test('#570 fence: NO stamp (old orchestrator / identity-less tab) → never fenced', () => {
+  assert.equal(commandWorkflowMismatch({ commandUuid: undefined, activeUuid: 'uuid-B' }), false)
+  assert.equal(commandWorkflowMismatch({ commandUuid: '', activeUuid: 'uuid-B' }), false)
+  assert.equal(commandWorkflowMismatch({ commandUuid: '   ', activeUuid: 'uuid-B' }), false)
+  assert.equal(commandWorkflowMismatch({}), false)
+})
 
 // #570 — FAIL-CLOSED durability carrier. The embedded graph.extra uuid is only trustworthy
 // when the creation-boundary wrapper (the sanitizer that re-mints graph.extra on every copy)
