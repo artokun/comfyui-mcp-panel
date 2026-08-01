@@ -32,6 +32,7 @@ import {
   subgraphInstancePath,
   buildNodeExecutionId,
   findNodeInScopes,
+  resolveRunToNodeTarget,
   unsafeBypassMappings,
 } from "../../web/js/lib/subgraph-scope.js";
 
@@ -259,32 +260,65 @@ test("#411 e2e: viewing a nested subgraph, an inner output node yields its full 
   assert.equal(buildNodeExecutionId(root, hit.ownerGraph, hit.node.id), "10:15:359");
 });
 
-test("#438/#439 e2e: viewing the ACTIVE first-level subgraph, an inner output node yields the owner:leaf path (not 'not on the root graph')", () => {
+// An output node as ComfyUI tags it: node.constructor.nodeData.output_node === true.
+// resolveRunToNodeTarget gates on this exactly like graph_run does.
+function makeOutputNode(id, type) {
+  return { id, type, constructor: { nodeData: { output_node: true } } };
+}
+
+test("#438/#439 resolveRunToNodeTarget: an output node in the ACTIVE first-level subgraph yields the owner:leaf path (the exact graph_run resolution)", () => {
   // Reporter scenario (dup of #411, verified fixed in 0.11.25): the user ENTERED a
   // first-level subgraph (owner instance id 76) containing an output node — a
-  // PreviewImage (#438, id 34) / MaskPreview (#439, id 74). graph_run passes the
-  // ACTIVE viewing graph as preferGraph, so findNodeInScopes resolves the inner
-  // output in that scope and buildNodeExecutionId produces the "76:34" path used as
-  // partial_execution_targets — instead of the OLD root-only rejection
-  // ("node 34 is not on the root graph"). This locks the ACTIVE first-level case the
-  // #411 e2e (a NESTED subgraph) did not exercise directly.
-  const preview = { id: 34, type: "PreviewImage" };
-  const active = makeSubgraph({ name: "LAB 07 — ANIMA INPAINT", nodes: [preview] });
+  // PreviewImage (#438, id 34) / MaskPreview (#439, id 74). graph_run passes the ACTIVE
+  // viewing graph so the inner output resolves IN THAT SCOPE and the "76:34" colon path
+  // is used as partial_execution_targets — instead of the OLD root-only rejection
+  // ("node 34 is not on the root graph"). Drives the SAME helper graph_run calls,
+  // through the real output-eligibility + colon-path build, not just findNodeInScopes.
+  const preview = makeOutputNode(34, "PreviewImage");
+  const maskPreview = makeOutputNode(74, "MaskPreview");
+  const active = makeSubgraph({ name: "LAB 07 — ANIMA INPAINT", nodes: [preview, maskPreview] });
   const root = { _nodes: [{ id: 76, subgraph: active }] };
-  // preferGraph = the active first-level subgraph (graph !== rootGraph).
-  const hit = findNodeInScopes(root, 34, active);
-  assert.equal(hit.node, preview, "inner output resolves in the ACTIVE viewing scope");
-  assert.equal(hit.ownerGraph, active);
-  assert.equal(
-    buildNodeExecutionId(root, hit.ownerGraph, hit.node.id),
-    "76:34",
-    "first-level active-subgraph output → owner:leaf partial_execution_target",
-  );
-  // Same for the #439 MaskPreview id shape.
-  const maskPreview = { id: 74, type: "MaskPreview" };
-  active._nodes.push(maskPreview);
-  const hit2 = findNodeInScopes(root, 74, active);
-  assert.equal(buildNodeExecutionId(root, hit2.ownerGraph, hit2.node.id), "76:74");
+
+  const r34 = resolveRunToNodeTarget(root, active, 34);
+  assert.equal(r34.ok, true, "an output node in the active subgraph is runnable");
+  assert.equal(r34.node, preview);
+  assert.equal(r34.execId, "76:34", "#438: first-level active-subgraph output → owner:leaf target");
+
+  const r74 = resolveRunToNodeTarget(root, active, 74);
+  assert.equal(r74.execId, "76:74", "#439: MaskPreview inside the active subgraph resolves too");
+});
+
+test("#438/#439 NON-VACUOUS: the ACTIVE-scope PREFERENCE is what reaches the inner output — dropping it targets the wrong (root) node", () => {
+  // The SAME id 34 exists at BOTH the root AND inside the active subgraph, and both are
+  // output nodes. This is the case that only the viewing-scope preference disambiguates:
+  //  - viewing the active subgraph → the INNER output, target "76:34" (correct branch).
+  //  - NO viewing scope (as if graph_run stopped passing the active graph) → the ROOT
+  //    node, target "34" — a DIFFERENT branch. So this test FAILS if the fix is reverted.
+  const innerOut = makeOutputNode(34, "PreviewImage");
+  const active = makeSubgraph({ name: "LAB", nodes: [innerOut] });
+  const rootOut = makeOutputNode(34, "SaveImage");
+  const root = { _nodes: [{ id: 76, subgraph: active }, rootOut] };
+
+  const viewing = resolveRunToNodeTarget(root, active, 34);
+  assert.equal(viewing.node, innerOut, "viewing the active subgraph resolves the INNER output");
+  assert.equal(viewing.execId, "76:34", "the active-scope preference targets the inner branch");
+
+  const noScope = resolveRunToNodeTarget(root, root, 34);
+  assert.equal(noScope.node, rootOut, "without the active scope the ROOT node wins");
+  assert.equal(noScope.execId, "34", "→ a DIFFERENT (root) target: the preference is load-bearing");
+});
+
+test("#438/#439: a NON-output node in the active subgraph is refused with the not_output code (never queued as a bad root)", () => {
+  const notOutput = { id: 34, type: "CLIPTextEncode", constructor: { nodeData: { output_node: false } } };
+  const active = makeSubgraph({ name: "LAB", nodes: [notOutput] });
+  const root = { _nodes: [{ id: 76, subgraph: active }] };
+  const res = resolveRunToNodeTarget(root, active, 34);
+  assert.equal(res.ok, false);
+  assert.equal(res.code, "not_output");
+  assert.equal(res.node, notOutput, "carries the node so graph_run can name its type in the error");
+
+  // Unknown id → not_found (graph_run's first guard).
+  assert.deepEqual(resolveRunToNodeTarget(root, active, 999), { ok: false, code: "not_found", node: null });
 });
 
 // ---- #409: reject unsafe bypass on a multi-input subgraph ------------------
