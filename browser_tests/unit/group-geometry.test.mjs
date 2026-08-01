@@ -378,3 +378,50 @@ test("membership overlap is edge-inclusive (matches LiteGraph overlapBounding)",
     "edge contact counts as membership",
   );
 });
+
+// ---------------------------------------------------------------------------
+// #429: group-membership READ paths must resync live rects before computing
+// membership. A node moved by a path the panel didn't own (paste/load/manual
+// drag, or an older move that never refreshed the rect) leaves a STALE cached
+// boundingRect; because nodeFocusBounds prefers boundingRect, a bounds-derived
+// read (graph_outline / graph_query / edit_group / auto_layout) would report the
+// PRE-move membership. syncGraphNodeAreas(graph) — which every membership read
+// handler now runs first — makes the read reflect the CURRENT layout.
+// ---------------------------------------------------------------------------
+test("stale cached rect yields wrong members; syncGraphNodeAreas repairs the read (#429)", () => {
+  // Five nodes were moved DOWN into a vertical column (pos updated), but their
+  // cached rects still describe the pre-move positions — three of them stale
+  // OUTSIDE the box the caller now wants, exactly the "reported only two" symptom.
+  const mk = (id, x, y, staleY) => ({
+    id,
+    pos: [x, y],
+    size: [200, 100],
+    boundingRect: [x, staleY - 30, 200, 130], // rect frozen at the OLD y (staleY)
+  });
+  const a = mk(299, 100, 100, 100); // already correct (rect matches pos)
+  const b = mk(300, 100, 260, 260); // already correct
+  const c = mk(301, 100, 420, -900); // rect stale far above the box
+  const d = mk(302, 100, 580, -900); // rect stale far above the box
+  const e = mk(303, 100, 740, -900); // rect stale far above the box
+  const graph = graphOf(a, b, c, d, e);
+
+  // The box the caller built (boundsAroundNodes uses live pos/size) wraps all five.
+  const box = boundsAroundNodes([a, b, c, d, e]);
+  const g = groupBox(box);
+
+  // BEFORE syncing: membership is computed against stale rects → only the two
+  // whose rects already matched are inside. This is the reported bug.
+  assert.deepEqual(
+    groupMemberNodes(graph, g).map((n) => n.id).sort((x, y) => x - y),
+    [299, 300],
+    "stale rects report only the two un-moved members (the #429 symptom)",
+  );
+
+  // AFTER the resync every read handler now performs: all five are members.
+  syncGraphNodeAreas(graph);
+  assert.deepEqual(
+    groupMemberNodes(graph, g).map((n) => n.id).sort((x, y) => x - y),
+    [299, 300, 301, 302, 303],
+    "post-sync membership reflects the live column layout — all five wrapped",
+  );
+});

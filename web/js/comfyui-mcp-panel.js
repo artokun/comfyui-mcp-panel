@@ -169,6 +169,10 @@ import {
   syncGraphNodeAreas,
   moveGroupMembers,
 } from "./lib/group-geometry.js";
+import {
+  activeWorkflowPossiblyStale,
+  activeStaleHint,
+} from "./lib/reconnect-staleness.js";
 import { pickRevertSnapshot } from "./lib/graph-revert.js";
 import {
   saveActiveWorkflow,
@@ -237,6 +241,14 @@ let nodeDefRefreshInFlight = null;
 // suppress a genuine miss (codex WS-3 finding #4). Reset to false whenever the
 // backend socket drops, since the combos may be about to change under us.
 let nodeDefsRefreshConfirmed = false;
+// #433: when ComfyUI's own socket last RECONNECTED (backend restart). For a short
+// window after this, the frontend may have restored a DIFFERENT active tab than the
+// user was last viewing, so workflow_list / graph_outline flag `active` as possibly
+// stale until an explicit panel_open_workflow / panel_new_workflow re-points it.
+let backendReconnectedAt = null;
+// When the active tab was last authoritatively (re)bound by an explicit open/new —
+// clears the possibly-stale flag above the moment the agent resyncs.
+let activeWorkflowResyncedAt = null;
 // The actual (idempotent) node-def registration; the coalescer owns the in-flight
 // slot lifecycle, so this MUST NOT clear it. Reuses a caller-supplied /object_info
 // payload when present (graph_add_node passes the fresh defs it just validated
@@ -316,6 +328,9 @@ function setupListeners() {
     // in-tab signal that the server came back after a restart — refresh the
     // stale node registry + combos then (#221/#171/#185/#181).
     api.addEventListener("reconnected", () => {
+      // #433: the frontend may now restore a stale/wrong active tab — arm the
+      // possibly-stale window until an explicit open/new re-points `active`.
+      backendReconnectedAt = Date.now();
       void refreshComfyNodeDefs();
     });
   } catch {
@@ -4454,6 +4469,9 @@ const GRAPH_TOOL_EXECUTORS = {
 
   graph_get_state() {
     const { graph, rootGraph } = getGraphCtx();
+    // #429: resync cached node rects to live geometry before reading geometric
+    // group membership, so a non-panel move (paste/load/drag) can't report stale ids.
+    syncGraphNodeAreas(graph);
     const nodes = (graph._nodes ?? []).slice(0, MAX_STATE_NODES).map(summarizeNode);
     const groups = (graph._groups ?? []).map((g) => summarizeGroup(graph, g));
     const inSubgraph = graph !== rootGraph;
@@ -4586,6 +4604,11 @@ const GRAPH_TOOL_EXECUTORS = {
   // raw node dump makes you reconstruct). Read-only.
   graph_outline() {
     const { graph } = getGraphCtx();
+    // #429: geometric group membership is tested boundingRect-first, so resync every
+    // node's cached rect to its live pos/size BEFORE computing membership — a node
+    // moved by a path the panel didn't own (paste/load/manual drag) otherwise reports
+    // stale group members (mirrors the create/move write paths).
+    syncGraphNodeAreas(graph);
     const nodes = graph._nodes ?? [];
     const byId = new Map(nodes.map((n) => [n.id, n]));
     const links = graph.links ?? {};
@@ -4661,7 +4684,16 @@ const GRAPH_TOOL_EXECUTORS = {
     const va = describeActiveGraph(graph);
     const viewingStr = va && va.scope === "subgraph" ? `subgraph "${va.title ?? ""}"` : (va?.scope ?? "root");
     const header = `${nodes.length} nodes · ${groups.length} group(s) · viewing: ${viewingStr}`;
+    // #433: warn if ComfyUI reconnected recently — `viewing`/`active` may point at a
+    // tab the frontend restored rather than the one the user was last looking at.
+    const activeMaybeStale = activeWorkflowPossiblyStale({
+      reconnectedAt: backendReconnectedAt,
+      resyncedAt: activeWorkflowResyncedAt,
+      now: Date.now(),
+    });
+    const staleBanner = activeMaybeStale ? `⚠ ${activeStaleHint()}\n\n` : "";
     const outline =
+      staleBanner +
       header +
       (groupLines.length ? `\n\nGROUPS (title → member node ids):\n${groupLines.join("\n")}` : "") +
       `\n\nNODES (data flows top→down; ← inputs from, → outputs to):\n${lines.join("\n")}`;
@@ -4671,6 +4703,9 @@ const GRAPH_TOOL_EXECUTORS = {
       group_count: groups.length,
       viewing: describeActiveGraph(graph),
       outline,
+      ...(activeMaybeStale
+        ? { active_possibly_stale: true, stale_hint: activeStaleHint() }
+        : {}),
     };
   },
 
@@ -4686,6 +4721,9 @@ const GRAPH_TOOL_EXECUTORS = {
   // graph_get_state stays registered for BACK-COMPAT with older orchestrators.
   graph_query({ types, title, where, ids, upstream_of, downstream_of, depth, fields, group_by, limit, max_chars }) {
     const { graph, rootGraph } = getGraphCtx();
+    // #429: resync cached node rects to live geometry before the `groups` block
+    // recomputes geometric membership (summarizeGroup), so it never reports stale ids.
+    syncGraphNodeAreas(graph);
     const nodes = graph._nodes ?? [];
     const links = graph.links ?? {};
     const byId = new Map(nodes.map((n) => [String(n.id), n]));
@@ -5825,6 +5863,9 @@ const GRAPH_TOOL_EXECUTORS = {
     dry_run = false,
   } = {}) {
     const { graph } = getGraphCtx();
+    // #429: resync live rects before deriving group membership for clustering, so a
+    // non-panel move can't cluster the wrong nodes (or drop members) during layout.
+    syncGraphNodeAreas(graph);
     const allNodes = (graph._nodes ?? []).filter(
       (n) => n.id !== SUBGRAPH_INPUT_RAIL_ID && n.id !== SUBGRAPH_OUTPUT_RAIL_ID,
     );
@@ -6513,6 +6554,14 @@ const GRAPH_TOOL_EXECUTORS = {
     };
     const openList = dedupeWorkflowTabRecords((s.openWorkflows ?? []).filter(Boolean).map(brief));
     const activeDiskPath = workflowDiskIdentityPath(active);
+    // #433: right after a backend reconnect the frontend may have restored a
+    // DIFFERENT active tab than the user was last viewing — warn the agent so it
+    // double-checks `active` instead of silently reading/editing the wrong graph.
+    const activeMaybeStale = activeWorkflowPossiblyStale({
+      reconnectedAt: backendReconnectedAt,
+      resyncedAt: activeWorkflowResyncedAt,
+      now: Date.now(),
+    });
     return {
       active: active
         ? {
@@ -6541,6 +6590,9 @@ const GRAPH_TOOL_EXECUTORS = {
       // for any existing reader.
       open: openList,
       workflows: openList,
+      ...(activeMaybeStale
+        ? { active_possibly_stale: true, stale_hint: activeStaleHint() }
+        : {}),
     };
   },
 
@@ -6569,6 +6621,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // the key exists BEFORE the first edit and is returned for pinning.
     const key = workflowTabId(wf);
     workflowStableUuid(wf);
+    // #433: an explicit new-tab authoritatively re-points `active` — clear any
+    // post-reconnect possibly-stale window so later reads trust `active` again.
+    activeWorkflowResyncedAt = Date.now();
     // `key`/`routing_key` are the unique handle the agent should pass to
     // panel_set_workflow_target so its session pins to this exact graph.
     return { created: true, active: getWorkflowTitle(), key, routing_key: key };
@@ -6635,6 +6690,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // Opening alone must not dirty the tab (a spurious post-load change-tracker
     // diff otherwise flips it to modified:true and blocks an unforced close).
     await clearSpuriousOpenModified(target);
+    // #433: an explicit open authoritatively re-points `active` — clear any
+    // post-reconnect possibly-stale window so later reads trust `active` again.
+    activeWorkflowResyncedAt = Date.now();
     return {
       opened: { path: target.path, filename: target.filename },
       modified: !!target.isModified,
@@ -6733,6 +6791,9 @@ const GRAPH_TOOL_EXECUTORS = {
         `no group matching "${group}" — list groups via panel_query_graph (each has id, title, node_ids)`,
       );
     }
+    // #429: resync live rects before computing which nodes the box encloses, so a
+    // non-panel move doesn't wrap the WRONG set (or nothing) into the subgraph.
+    syncGraphNodeAreas(graph);
     const ns = groupMemberNodes(graph, g);
     if (!ns.length) {
       throw new Error(`group "${g.title}" has no nodes inside its box to wrap into a subgraph`);
@@ -7321,6 +7382,10 @@ const GRAPH_TOOL_EXECUTORS = {
   graph_edit_group({ group_id, title, color, font_size, bounds }) {
     const { graph } = getGraphCtx();
     const g = resolveGroup(graph, group_id);
+    // #429: resync live rects before re-bounding + recomputing membership so the
+    // returned node_ids reflect the CURRENT layout, not a stale cached rect (the
+    // exact "edit_group still reported the old members" symptom in the report).
+    syncGraphNodeAreas(graph);
     graph.beforeChange();
     try {
       if (typeof title === "string") g.title = title;
@@ -7339,6 +7404,9 @@ const GRAPH_TOOL_EXECUTORS = {
   graph_remove_group({ group_id }) {
     const { graph } = getGraphCtx();
     const g = resolveGroup(graph, group_id);
+    // #429: resync live rects so the removed-group summary reports the members that
+    // were ACTUALLY inside the box, not a stale cached set.
+    syncGraphNodeAreas(graph);
     const summary = summarizeGroup(graph, g);
     graph.beforeChange();
     try {
