@@ -357,7 +357,7 @@ function unverifiedMessage(target, why) {
   return (
     `"${target}" was queued but could NOT be confirmed installed — ${why}. This is ` +
     `not a reported failure. Poll panel_node_queue_status and VERIFY with ` +
-    `panel_list_nodes; a ComfyUI restart (comfy_reboot) is usually required to load ` +
+    `panel_list_nodes; a ComfyUI restart (panel_restart_comfyui) is usually required to load ` +
     `new nodes. If it still does not appear, check the ComfyUI server log.`
   );
 }
@@ -756,7 +756,7 @@ export function classifyUpdateOutcome({ item, status, target, dialect } = {}) {
       `Update of "${target}" was queued but its outcome could NOT be confirmed` +
       (dialect ? ` (dialect ${dialect})` : "") +
       ` — the Manager task has not reported a terminal result. This is NOT a reported ` +
-      `failure. Poll panel_node_queue_status; a ComfyUI restart (comfy_reboot) is ` +
+      `failure. Poll panel_node_queue_status; a ComfyUI restart (panel_restart_comfyui) is ` +
       `usually required to load an updated node. If it still misbehaves, check the ` +
       `ComfyUI server log.`,
   };
