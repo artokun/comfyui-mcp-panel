@@ -122,8 +122,7 @@ import {
   resolveRailNode,
   railKindFor,
   computeOrphanedBoundaries,
-  findNodeInScopes,
-  buildNodeExecutionId,
+  resolveRunToNodeTarget,
   unsafeBypassMappings,
 } from "./lib/subgraph-scope.js";
 import { runSetWidget } from "./lib/set-widget.js";
@@ -6157,31 +6156,32 @@ const GRAPH_TOOL_EXECUTORS = {
     // a root-level target yields String(id), the same value as before).
     let partialTargets;
     if (to_node_id != null) {
+      // Resolve the run-to-node target in the CURRENT viewing scope first (the reporter
+      // added / is targeting the output node INSIDE the subgraph they are viewing —
+      // active first-level #438/#439, nested #411). resolveRunToNodeTarget encapsulates
+      // the SAME find→output-eligibility→colon-path resolution the tests drive.
       const viewing = graph !== rootGraph ? graph : null;
-      const hit = findNodeInScopes(rootGraph, to_node_id, viewing);
-      if (!hit) {
-        return {
-          queued: false,
-          error:
-            `node ${to_node_id} was not found on the root graph or in any subgraph — ` +
-            `run-to-node targets an output node in the current workflow (check the id in panel_query_graph)`,
-        };
-      }
-      const node = hit.node;
-      // isOutputNode mirrors ComfyUI's util: node.constructor.nodeData.output_node.
-      if (!node.constructor?.nodeData?.output_node) {
-        return {
-          queued: false,
-          error:
-            `node ${to_node_id} (${node.type}) is not an output node — "run to node" can ` +
-            `only target an output node such as SaveImage, PreviewImage, or SaveVideo. Pick the ` +
-            `output node at the end of the branch you want to render (is_output:true in panel_query_graph).`,
-        };
-      }
-      // Colon path for a nested node ("10:15:359"), or String(id) at root. null
-      // means the owning subgraph is unreachable from the live root (stale view).
-      const execId = buildNodeExecutionId(rootGraph, hit.ownerGraph, node.id);
-      if (execId == null) {
+      const res = resolveRunToNodeTarget(rootGraph, viewing, to_node_id);
+      if (!res.ok) {
+        if (res.code === "not_found") {
+          return {
+            queued: false,
+            error:
+              `node ${to_node_id} was not found on the root graph or in any subgraph — ` +
+              `run-to-node targets an output node in the current workflow (check the id in panel_query_graph)`,
+          };
+        }
+        // isOutputNode mirrors ComfyUI's util: node.constructor.nodeData.output_node.
+        if (res.code === "not_output") {
+          return {
+            queued: false,
+            error:
+              `node ${to_node_id} (${res.node.type}) is not an output node — "run to node" can ` +
+              `only target an output node such as SaveImage, PreviewImage, or SaveVideo. Pick the ` +
+              `output node at the end of the branch you want to render (is_output:true in panel_query_graph).`,
+          };
+        }
+        // "unreachable": the owning subgraph isn't reachable from the live root (stale view).
         return {
           queued: false,
           error:
@@ -6189,7 +6189,9 @@ const GRAPH_TOOL_EXECUTORS = {
             `workflow root (stale view) — re-open the workflow and try again`,
         };
       }
-      partialTargets = [execId];
+      // Colon path for a nested node ("10:15:359") / first-level ("76:34"), or
+      // String(id) at root.
+      partialTargets = [res.execId];
     }
 
     // app.queuePrompt(number, batchCount, queueNodeIds) — the 3rd arg becomes the

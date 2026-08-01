@@ -181,6 +181,43 @@ export function findNodeInScopes(rootGraph, id, preferGraph = null) {
   return null;
 }
 
+/** Resolve panel_run's `to_node_id` ("run to node") to a runnable partial-execution
+ *  target, in the CURRENT viewing scope FIRST. This is the exact resolution graph_run
+ *  performs, extracted so the SAME logic the tool runs is unit-testable headlessly (the
+ *  live app.queuePrompt path can't be driven from `node --test`) — the test path IS the
+ *  production path.
+ *
+ *  `viewingGraph` is the graph the user is LOOKING at (an entered subgraph, or the root).
+ *  It is searched FIRST so an output node the user added INSIDE the subgraph they are
+ *  viewing resolves to THAT node — not a same-id node elsewhere — which is what makes
+ *  run-to-node reach an output inside the ACTIVE subgraph (#438/#439) and a nested one
+ *  (#411). Dropping this preference would resolve a colliding root id instead and target
+ *  the WRONG branch.
+ *
+ *  Returns a discriminated result (never throws):
+ *   - { ok: true,  execId, node, ownerGraph }        → runnable; execId is the colon
+ *       path ("76:34" for a first-level subgraph output, "10:15:359" nested, "34" at
+ *       root) to pass in partial_execution_targets.
+ *   - { ok: false, code: "not_found", node: null }   → id resolves to no node in any scope
+ *   - { ok: false, code: "not_output", node }        → resolved, but not an OUTPUT node
+ *       (only SaveImage/PreviewImage/SaveVideo/… can be a partial-execution root)
+ *   - { ok: false, code: "unreachable", node }        → owning subgraph is unreachable
+ *       from the live root (stale view) so no execution path exists
+ *
+ *  Output-node eligibility mirrors ComfyUI's util: node.constructor.nodeData.output_node. */
+export function resolveRunToNodeTarget(rootGraph, viewingGraph, toNodeId) {
+  const viewing = viewingGraph && viewingGraph !== rootGraph ? viewingGraph : null;
+  const hit = findNodeInScopes(rootGraph, toNodeId, viewing);
+  if (!hit) return { ok: false, code: "not_found", node: null };
+  const node = hit.node;
+  if (!node?.constructor?.nodeData?.output_node) {
+    return { ok: false, code: "not_output", node };
+  }
+  const execId = buildNodeExecutionId(rootGraph, hit.ownerGraph, node.id);
+  if (execId == null) return { ok: false, code: "unreachable", node };
+  return { ok: true, execId, node, ownerGraph: hit.ownerGraph };
+}
+
 /** Types are compatible for a BYPASS forward when equal (case-insensitive) or either
  *  side is a wildcard ('*' or ''). */
 function bypassTypeCompatible(a, b) {
