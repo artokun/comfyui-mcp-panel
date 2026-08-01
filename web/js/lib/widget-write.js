@@ -610,6 +610,33 @@ export function followPromotionToConcrete(target, resolveSource) {
 }
 
 /**
+ * Collect EVERY INTERMEDIATE virtual SubgraphNode traversed from `target` (the
+ * immediate promoted inner) down to — but EXCLUDING — the ultimate concrete node. A
+ * nested promotion drives the value THROUGH each of these containers, so each must be
+ * authorized (#458 nested-intermediate) — not just the immediate inner and the
+ * terminal. Returns nodes in order [immediate, …deeper]; the concrete terminal (no
+ * `.subgraph`) is never included, and traversal stops on an unresolvable/cyclic chain
+ * (those fail closed elsewhere). Pure: read-only. Mirrors followPromotionToConcrete's
+ * walk so the SAME chain is authorized that the write actually drives.
+ */
+export function collectPromotionIntermediates(target, resolveSource) {
+  const out = [];
+  let node = target?.node ?? null;
+  let widget = target?.widget ?? null;
+  const seen = new Set();
+  while (node && node.subgraph) {
+    if (seen.has(node)) break;
+    seen.add(node);
+    out.push(node);
+    const res = resolvePromotedInnerTarget(node, widget?.name, resolveSource);
+    if (!res.promoted || !res.target) break;
+    node = res.target.node;
+    widget = res.target.widget;
+  }
+  return out;
+}
+
+/**
  * Resolve the true write target (inner promoted widget or the node's own
  * widget) and validate/coerce the value. Throws WidgetWriteError on any
  * unresolved-promotion, missing-widget, or value-mismatch condition — BEFORE
@@ -859,6 +886,15 @@ export function applyWidgetWrite(
   // after a "clean" rollback — violating the atomic snapshot→verify→rollback contract.
   const promotedHostWidgetRef = promotedHostInput ? promotedHostInput.widget : undefined;
   const promotedHostProjectionRef = promotedHostInput ? promotedHostInput._widget : undefined;
+  // #477 P1: snapshot the OUTER node's widget-LIST membership too. Authentication of a
+  // rail/proxy is by identity-membership in node.widgets (resolveHostPromotedWidgets),
+  // so a callback that not only swaps hostInput.widget but ALSO replaces/reorders
+  // node.widgets (natural cleanup when substituting a live proxy) detaches a captured
+  // proxy while leaving a replacement live. Restoring only the host refs would leave
+  // node.widgets corrupt yet pass read-back. Snapshot the array REFERENCE + its contents
+  // so rollback re-points and refills it, and read-back verifies membership/order.
+  const prevOuterWidgetsRef = promotedFrom && Array.isArray(node.widgets) ? node.widgets : null;
+  const prevOuterWidgets = prevOuterWidgetsRef ? prevOuterWidgetsRef.slice() : null;
 
   // The undo hooks are BOOKKEEPING (litegraph history). Invoke them exception-SAFE
   // so a throwing hook can never bypass our verification/rollback and leave a silent
@@ -999,6 +1035,14 @@ export function applyWidgetWrite(
     // is a plain data property on real widgets so this normally succeeds; when it
     // does not, we report an HONEST partial-state failure rather than falsely claim
     // a clean rollback.
+    //
+    // #477 P1: only restore the OUTER widget-list membership when the ORIGINAL host
+    // input is STILL wired into node.inputs. If a callback replaced the host input
+    // ENTIRELY (a new promotion), restoring node.widgets would DETACH the live
+    // replacement while it still serializes via the changed input — masking a genuine
+    // partial state. In that case we leave node.widgets and REPORT partial-state below.
+    const hostStillWired =
+      !!promotedHostInput && Array.isArray(node.inputs) && node.inputs.includes(promotedHostInput);
     safeBefore();
     try {
       // Restore the serialization BINDING + the promotion TOPOLOGY first (the store key
@@ -1019,6 +1063,20 @@ export function applyWidgetWrite(
         }
         try {
           promotedHostInput._widget = promotedHostProjectionRef;
+        } catch {
+          /* restore best-effort; read-back below is authoritative */
+        }
+      }
+      // #477 P1: restore the OUTER node's widget-list membership/order — undo any
+      // replacement/reorder a callback did, so a detached captured proxy is re-attached
+      // and a swapped-in replacement is dropped. ONLY when the original host input is
+      // still wired (else a wholesale-replaced promotion is left for partial-state
+      // reporting rather than masked).
+      if (prevOuterWidgetsRef && hostStillWired) {
+        try {
+          prevOuterWidgetsRef.length = 0;
+          for (const wd of prevOuterWidgets) prevOuterWidgetsRef.push(wd);
+          if (node.widgets !== prevOuterWidgetsRef) node.widgets = prevOuterWidgetsRef;
         } catch {
           /* restore best-effort; read-back below is authoritative */
         }
@@ -1085,6 +1143,41 @@ export function applyWidgetWrite(
       rollbackFailed = rollbackFailed
         ? `${rollbackFailed} and the promotion topology (host input._widget)`
         : `the promotion topology (host input._widget)`;
+    }
+    // #477 P1: after rollback the OUTER promotion topology must be intact — every
+    // captured rail/display proxy must still be a live member of node.widgets, AND the
+    // live-resolved projection set must EXACTLY match the captured set (identity+order).
+    // A callback that replaced/reordered node.widgets (detaching a captured proxy) or
+    // left a live replacement projection is surfaced as partial state, never a falsely-
+    // clean rollback. This holds whether or not the gated restore above ran.
+    if (promotedFrom) {
+      const capturedSet = Array.isArray(promotedParentWidgets) ? promotedParentWidgets : [];
+      const liveMembers = Array.isArray(node.widgets) ? node.widgets : [];
+      const anyDetached = capturedSet.some((cw) => cw && !liveMembers.includes(cw));
+      let liveSet = [];
+      let liveInput = undefined;
+      try {
+        const live = resolvePromotedInnerTarget(node, widgetName, resolveSource);
+        if (live && live.target) {
+          liveInput = live.target.input;
+          if (Array.isArray(live.target.parentWidgets)) liveSet = live.target.parentWidgets;
+        }
+      } catch {
+        liveSet = [];
+        liveInput = undefined;
+      }
+      const setMatches =
+        liveSet.length === capturedSet.length && liveSet.every((lw, i) => lw === capturedSet[i]);
+      // The LIVE host input must still be the CAPTURED one. A callback that REPLACED the
+      // host input (even with one referencing the same _widget/proxies but a different
+      // `widgetId`) leaves a live input that serializes differently — an honest partial
+      // state, never a clean rollback (the captured input we restored is detached).
+      const inputReplaced = promotedHostInput != null && liveInput !== promotedHostInput;
+      if (anyDetached || !setMatches || inputReplaced) {
+        rollbackFailed = rollbackFailed
+          ? `${rollbackFailed} and the promotion host input / projection set (node.inputs/widgets)`
+          : `the promotion host input / projection set (node.inputs/widgets)`;
+      }
     }
     // On a TOPOLOGY DRIFT, the captured `parentWidget` we just restored may be
     // DETACHED — a callback could have swapped in a DIFFERENT live authoritative

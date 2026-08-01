@@ -117,6 +117,66 @@ export function isFrontendOnlyRegisteredType(registry, type) {
 }
 
 /**
+ * POSITIVE structural proof that `node` is a genuine VIRTUAL SUBGRAPH CONTAINER — a
+ * litegraph SubgraphNode whose `.subgraph` is a REAL nested graph (an object exposing
+ * `_nodes` and/or `getNodeById`), NOT merely a truthy `subgraph:{}` marker. A removed
+ * backend node that carries a fake `subgraph` field is rejected because it holds no
+ * real nested graph. Used with hasBackendProvenance to authorize an INTERMEDIATE node
+ * of a nested promotion (its widget is mutated but its virtual type is absent from
+ * /object_info by design) WITHOUT trusting "defless + subgraph metadata" (#458).
+ */
+export function isVirtualSubgraphContainer(node) {
+  const sg = node?.subgraph;
+  if (!sg || typeof sg !== "object") return false;
+  return Array.isArray(sg._nodes) || typeof sg.getNodeById === "function";
+}
+
+/**
+ * Fresh-authorize a node whose OWN widget / projection is ACTUALLY MUTATED by a
+ * graph_set_widget write — the OUTER subgraph parent (its rail/proxy widgets) and the
+ * IMMEDIATE inner promoted node (its widget) — NOT just the terminal traversal target
+ * (#458 nested-intermediate). A nested promotion mutates + reports success on the
+ * INTERMEDIATE virtual node, which is never the terminal `authTarget`, so it must be
+ * authorized independently.
+ *
+ * Fails CLOSED unless ONE of:
+ *   - the type is PRESENT in fresh /object_info (a live backend node); OR
+ *   - the node is a PROVENANCE-CLEAN virtual subgraph container (real `.subgraph`, no
+ *     backend provenance on its registered class OR its own instance constructor) — a
+ *     genuine litegraph SubgraphNode has no backend def; a removed/stale BACKEND node
+ *     masquerading with a subgraph field retains nodeData/comfyClass and is refused; OR
+ *   - the node is a frontend-only leaf (reserved allowlist + class & instance
+ *     provenance) — belt-and-suspenders for a directly-promoted frontend leaf.
+ * A null/unavailable fresh map fails closed (never trust a stale cache).
+ */
+export function assertMutatedNodeAuthorized(freshDefs, registry, node, role = "target") {
+  const type = node?.type;
+  const id = node?.id ?? "(unknown)";
+  const label = typeof type === "string" ? ` ("${type}")` : "";
+  if (!freshDefs || typeof freshDefs !== "object") {
+    throw new Error(
+      `Cannot set widget on node ${id}${label}: cannot verify the ${role} node against the ` +
+        `ComfyUI backend (object_info is unavailable). Refusing to write rather than trust a ` +
+        `possibly-stale node cache (#458).`,
+    );
+  }
+  // PRESENT in the fresh backend → a live node, authorized by presence.
+  if (typeof type === "string" && Object.prototype.hasOwnProperty.call(freshDefs, type)) return;
+  // ABSENT from fresh object_info — permit ONLY with a positive, provenance-clean signal.
+  const provenanceClean =
+    !hasBackendProvenance(typeof type === "string" ? registry?.[type] : undefined) &&
+    !hasBackendProvenance(node?.constructor);
+  if (provenanceClean && isVirtualSubgraphContainer(node)) return;
+  if (registry && isFrontendOnlyRegisteredType(registry, type) && !hasBackendProvenance(node?.constructor)) return;
+  throw new Error(
+    `Cannot set widget on node ${id}${label}: the ${role} node is not defined by the ComfyUI ` +
+      `backend and is not a verifiable frontend-only / virtual-subgraph node (a removed or ` +
+      `unverifiable node type, or a backend node masquerading as a subgraph container) — ` +
+      `refusing to write (#458).`,
+  );
+}
+
+/**
  * Guard for graph_add_node: throw (mirroring the read-path hard error) when
  * `class_type` cannot be resolved against the live registry, distinguishing
  * "backend unreachable / defs not loaded" from "type genuinely unknown". Returns

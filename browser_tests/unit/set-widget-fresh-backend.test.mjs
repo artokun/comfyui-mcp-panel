@@ -803,3 +803,239 @@ test("#458×#366 set_widget: promoted write reuses the THREADED resolution AND s
   assert.equal(railWidget.value, "karras", "#366: authoritative parent rail synced");
   assert.equal(gone.widgets.find((w) => w.name === "scheduler").value, "simple", "the decoy sibling was never touched");
 });
+
+// ---- #458 NESTED-INTERMEDIATE (adversarial review of #475): a nested promotion must
+//      authorize the INTERMEDIATE node whose widget is actually mutated, not only the
+//      terminal traversal target. A removed-backend husk sitting as the intermediate
+//      must be REFUSED (never "defless + subgraph metadata" = trusted). --------------
+
+// Outer subgraph A promotes "val" through an INTERMEDIATE node to a terminal KSampler
+// widget. `intermediate` is parameterized so the test can make it a genuine virtual
+// container OR a removed-backend husk. `reg` is mutated to register the intermediate.
+function makeNestedIntermediateFixture(reg, { intermediateType, intermediateBackend, intermediateRealSubgraph = true }) {
+  const terminal = {
+    id: 90,
+    type: "KSampler",
+    widgets: [{ name: "steps", type: "INT", value: 20 }],
+    constructor: { nodeData: { input: { required: {} } } },
+  };
+  const midSubgraph = intermediateRealSubgraph
+    ? { _nodes: [terminal], getNodeById: (id) => (String(id) === "90" ? terminal : null) }
+    : {}; // FAKE subgraph marker — not a real container
+  const mid = {
+    id: 80,
+    type: intermediateType,
+    widgets: [{ name: "steps", type: "INT", value: 20 }],
+    subgraph: midSubgraph,
+    inputs: [{ name: "steps", _subgraphSlot: { name: "steps" } }],
+  };
+  // The intermediate's registered class + instance provenance.
+  const midCtor = function MidCtor() {};
+  if (intermediateBackend) {
+    midCtor.nodeData = { input: { required: {} } }; // BACKEND provenance (removed pack's stale class)
+    mid.constructor = midCtor;
+  }
+  reg[intermediateType] = midCtor;
+
+  const aRail = { name: "steps", type: "INT", value: 20 };
+  const a = {
+    id: 70,
+    type: "SubgraphA",
+    widgets: [aRail],
+    subgraph: { _nodes: [mid], getNodeById: (id) => (String(id) === "80" ? mid : null) },
+    inputs: [{ name: "steps", _widget: aRail, widget: { name: "steps" }, _subgraphSlot: { name: "steps" } }],
+  };
+  reg.SubgraphA = function SubgraphA() {}; // A is a genuine virtual container (defless, no backend provenance)
+  const resolveSource = (subgraphNode, si) => {
+    if (subgraphNode === a && si?.name === "steps") return { sourceNodeId: "80", sourceWidgetName: "steps" };
+    if (subgraphNode === mid && si?.name === "steps") return { sourceNodeId: "90", sourceWidgetName: "steps" };
+    return null;
+  };
+  return { a, mid, terminal, resolveSource };
+}
+
+test("#458 NESTED-INTERMEDIATE: a REMOVED-BACKEND husk intermediate (backend provenance, real subgraph, absent from object_info) ⇒ FAIL CLOSED — no fabricated success", async () => {
+  // Exact trigger: outer A promotes through a stale removed-backend `GoneNode` (which
+  // still carries a real subgraph + promotion metadata AND backend provenance) to a
+  // genuine terminal KSampler. Fresh object_info lacks GoneNode. The terminal passes,
+  // but the write MUTATES GoneNode's own widget — it must be refused on GoneNode.
+  const reg = loadedRegistry(["GoneNode"]); // GoneNode registered WITH nodeData (backend provenance)
+  const { a, mid, resolveSource } = makeNestedIntermediateFixture(reg, {
+    intermediateType: "GoneNode",
+    intermediateBackend: true,
+  });
+  await assert.rejects(
+    () =>
+      runSetWidget(a, "steps", 30, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // KSampler present, GoneNode absent
+        resolveSource,
+        ...HOOKS,
+      }),
+    (err) =>
+      err instanceof Error &&
+      /Cannot set widget on node 80 \("GoneNode"\)/.test(err.message) &&
+      /not a verifiable frontend-only \/ virtual-subgraph node|masquerading/i.test(err.message),
+  );
+  assert.equal(mid.widgets.find((w) => w.name === "steps").value, 20, "the removed-backend intermediate is never mutated (#458)");
+});
+
+test("#458 NESTED-INTERMEDIATE: a defless husk intermediate with a FAKE `subgraph:{}` (no real nested graph) ⇒ FAIL CLOSED", async () => {
+  // A bare husk (no backend provenance) carrying only a truthy `subgraph:{}` marker is
+  // NOT a real virtual container (no _nodes/getNodeById), so it must not be trusted.
+  const reg = loadedRegistry();
+  // Build with a REAL subgraph first so followPromotionToConcrete can traverse to the
+  // terminal, then swap the intermediate's subgraph to a fake marker to model the husk.
+  const { a, mid, resolveSource } = makeNestedIntermediateFixture(reg, {
+    intermediateType: "BareHusk",
+    intermediateBackend: false,
+  });
+  mid.subgraph = {}; // fake marker — not a real container
+  await assert.rejects(
+    () =>
+      runSetWidget(a, "steps", 30, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(),
+        resolveSource,
+        ...HOOKS,
+      }),
+    // Refused — either by the new intermediate guard or the pre-existing
+    // concrete-resolution guard (a fake subgraph can't be traversed to a concrete node).
+    (err) => err instanceof Error && /refusing to write|could not be resolved to a concrete backend node|not a verifiable frontend-only/i.test(err.message),
+  );
+  assert.equal(mid.widgets.find((w) => w.name === "steps").value, 20, "a fake-subgraph husk intermediate is never mutated");
+});
+
+test("#458 NESTED-INTERMEDIATE REGRESSION: a GENUINE virtual-container intermediate (real subgraph, no backend provenance) ⇒ still SUCCEEDS", async () => {
+  const reg = loadedRegistry();
+  const { a, mid, resolveSource } = makeNestedIntermediateFixture(reg, {
+    intermediateType: "SubgraphB",
+    intermediateBackend: false,
+  });
+  const { set } = await runSetWidget(a, "steps", 30, {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => objectInfo(),
+    resolveSource,
+    ...HOOKS,
+  });
+  assert.equal(set.value, 30, "a genuine nested promotion through a virtual container still writes");
+  assert.equal(mid.widgets.find((w) => w.name === "steps").value, 30);
+});
+
+test("#458 NESTED-INTERMEDIATE (3-level A→B→C→concrete): a REMOVED-BACKEND husk as the DEEPER intermediate C ⇒ FAIL CLOSED (every driven-through container is authorized, not just the immediate inner)", async () => {
+  // The value is driven A→B→C→KSampler. B is a genuine virtual container, but C is a
+  // removed-backend node (backend provenance) carrying a real subgraph. The terminal
+  // KSampler passes; the immediate inner B passes; C must STILL be authorized and refused.
+  const reg = loadedRegistry(["GoneNode"]);
+  const terminal = {
+    id: 90,
+    type: "KSampler",
+    widgets: [{ name: "steps", type: "INT", value: 20 }],
+    constructor: { nodeData: { input: { required: {} } } },
+  };
+  // C — removed-backend husk with a REAL nested graph AND backend provenance.
+  const cCtor = function GoneNodeCtor() {};
+  cCtor.nodeData = { input: { required: {} } }; // backend provenance (class + instance)
+  const c = {
+    id: 85,
+    type: "GoneNode",
+    widgets: [{ name: "steps", type: "INT", value: 20 }],
+    subgraph: { _nodes: [terminal], getNodeById: (id) => (String(id) === "90" ? terminal : null) },
+    inputs: [{ name: "steps", _subgraphSlot: { name: "steps" } }],
+    constructor: cCtor,
+  };
+  reg["GoneNode"] = cCtor;
+  // B — genuine virtual container (defless, no backend provenance).
+  const b = {
+    id: 80,
+    type: "SubgraphB",
+    widgets: [{ name: "steps", type: "INT", value: 20 }],
+    subgraph: { _nodes: [c], getNodeById: (id) => (String(id) === "85" ? c : null) },
+    inputs: [{ name: "steps", _subgraphSlot: { name: "steps" } }],
+  };
+  reg.SubgraphB = function SubgraphB() {};
+  const aRail = { name: "steps", type: "INT", value: 20 };
+  const a = {
+    id: 70,
+    type: "SubgraphA",
+    widgets: [aRail],
+    subgraph: { _nodes: [b], getNodeById: (id) => (String(id) === "80" ? b : null) },
+    inputs: [{ name: "steps", _widget: aRail, widget: { name: "steps" }, _subgraphSlot: { name: "steps" } }],
+  };
+  reg.SubgraphA = function SubgraphA() {};
+  const resolveSource = (subgraphNode, si) => {
+    if (subgraphNode === a && si?.name === "steps") return { sourceNodeId: "80", sourceWidgetName: "steps" };
+    if (subgraphNode === b && si?.name === "steps") return { sourceNodeId: "85", sourceWidgetName: "steps" };
+    if (subgraphNode === c && si?.name === "steps") return { sourceNodeId: "90", sourceWidgetName: "steps" };
+    return null;
+  };
+  await assert.rejects(
+    () =>
+      runSetWidget(a, "steps", 30, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // KSampler present; GoneNode/SubgraphA/B absent
+        resolveSource,
+        ...HOOKS,
+      }),
+    (err) =>
+      err instanceof Error &&
+      /Cannot set widget on node 85 \("GoneNode"\)/.test(err.message) &&
+      /not a verifiable frontend-only \/ virtual-subgraph node|masquerading/i.test(err.message),
+  );
+  assert.equal(b.widgets.find((w) => w.name === "steps").value, 20, "no mutation when a deeper intermediate is a removed-backend node");
+  assert.equal(c.widgets.find((w) => w.name === "steps").value, 20);
+});
+
+test("#458 NESTED-INTERMEDIATE (3-level): all-genuine virtual containers A→B→C→KSampler ⇒ still SUCCEEDS", async () => {
+  const reg = loadedRegistry();
+  const terminal = {
+    id: 90,
+    type: "KSampler",
+    widgets: [{ name: "steps", type: "INT", value: 20 }],
+    constructor: { nodeData: { input: { required: {} } } },
+  };
+  const c = {
+    id: 85,
+    type: "SubgraphC",
+    widgets: [{ name: "steps", type: "INT", value: 20 }],
+    subgraph: { _nodes: [terminal], getNodeById: (id) => (String(id) === "90" ? terminal : null) },
+    inputs: [{ name: "steps", _subgraphSlot: { name: "steps" } }],
+  };
+  reg.SubgraphC = function SubgraphC() {};
+  const b = {
+    id: 80,
+    type: "SubgraphB",
+    widgets: [{ name: "steps", type: "INT", value: 20 }],
+    subgraph: { _nodes: [c], getNodeById: (id) => (String(id) === "85" ? c : null) },
+    inputs: [{ name: "steps", _subgraphSlot: { name: "steps" } }],
+  };
+  reg.SubgraphB = function SubgraphB() {};
+  const aRail = { name: "steps", type: "INT", value: 20 };
+  const a = {
+    id: 70,
+    type: "SubgraphA",
+    widgets: [aRail],
+    subgraph: { _nodes: [b], getNodeById: (id) => (String(id) === "80" ? b : null) },
+    inputs: [{ name: "steps", _widget: aRail, widget: { name: "steps" }, _subgraphSlot: { name: "steps" } }],
+  };
+  reg.SubgraphA = function SubgraphA() {};
+  const resolveSource = (subgraphNode, si) => {
+    if (subgraphNode === a && si?.name === "steps") return { sourceNodeId: "80", sourceWidgetName: "steps" };
+    if (subgraphNode === b && si?.name === "steps") return { sourceNodeId: "85", sourceWidgetName: "steps" };
+    if (subgraphNode === c && si?.name === "steps") return { sourceNodeId: "90", sourceWidgetName: "steps" };
+    return null;
+  };
+  const { set } = await runSetWidget(a, "steps", 30, {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => objectInfo(),
+    resolveSource,
+    ...HOOKS,
+  });
+  assert.equal(set.value, 30, "a fully-virtual 3-level promotion still writes");
+  assert.equal(b.widgets.find((w) => w.name === "steps").value, 30);
+});

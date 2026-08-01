@@ -1781,3 +1781,69 @@ test("#477 P1: after a rolled-back proxy-swap, the promotion TOPOLOGY (hostInput
   assert.equal(inner.widgets[0].value, 1280, "inner rolled back");
   assert.equal(railWidget.value, 1280, "rail rolled back");
 });
+
+test("#477 P1: a callback that swaps hostInput.widget AND replaces parent.widgets is caught as drift AND rolled back to the ORIGINAL widget list (no detached proxy, honest state)", () => {
+  // Coordinator-adversarial: the inner callback substitutes a live replacement proxy —
+  // swapping hostInput.widget to newProxy AND replacing parent.widgets = [rail, newProxy]
+  // (the natural cleanup). The full-set recheck correctly fails, but without restoring
+  // node.widgets the rollback would leave oldProxy DETACHED and newProxy live while
+  // claiming a clean rollback. The P1 fix restores the widget-list membership + order.
+  const inner = { id: 257, type: "PrimitiveInt", widgets: [{ name: "value", type: "INT", value: 1280 }] };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "257" ? inner : null) };
+  const railWidget = { name: "value_2", type: "INT", value: 1280 };
+  const oldProxy = { name: "value_2", type: "INT", value: 1280 };
+  const newProxy = { name: "value_2", type: "INT", value: 1280 };
+  const hostInput = { name: "value_2", _widget: railWidget, widget: oldProxy, _subgraphSlot: { name: "value_2" } };
+  const originalWidgets = [railWidget, oldProxy];
+  const parent = { id: 267, type: "SubgraphNode", subgraph, inputs: [hostInput], widgets: originalWidgets };
+  inner.widgets[0].callback = () => {
+    hostInput.widget = newProxy;
+    parent.widgets = [railWidget, newProxy]; // replace the array wholesale (cleanup)
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "value_2" ? { sourceNodeId: "257", sourceWidgetName: "value" } : null;
+
+  assert.throws(
+    () => applyWidgetWrite(parent, "value_2", 704, { resolveSource }),
+    (err) => err instanceof WidgetWriteError && /CHANGED during the write|partial state|topology|parent widget list/.test(err.message),
+  );
+  // THE P1 FIX: node.widgets is restored to the ORIGINAL membership + order.
+  assert.equal(parent.widgets.length, 2, "widget list restored to original length");
+  assert.equal(parent.widgets[0], railWidget, "rail restored in place");
+  assert.equal(parent.widgets[1], oldProxy, "original proxy re-attached (not the replacement)");
+  assert.ok(!parent.widgets.includes(newProxy), "the swapped-in replacement proxy is dropped from the widget list");
+  assert.equal(hostInput.widget, oldProxy, "host ref restored to the original proxy");
+  assert.equal(inner.widgets[0].value, 1280, "inner rolled back");
+  assert.equal(railWidget.value, 1280, "rail rolled back");
+});
+
+test("#477 P1: a callback that REPLACES the host input (same rail proxy, different widgetId) is reported as PARTIAL STATE — the captured input we restored is detached, never a clean rollback", () => {
+  // Codex-adversarial: rather than swapping input.widget, the callback replaces
+  // parent.inputs[0] with a NEW host input referencing the SAME rail projection but a
+  // CHANGED widgetId — the new input stays live and serializes from a different store
+  // key while the OLD (captured) input we restore is detached. Read-back must require
+  // the LIVE host input to be the captured one, else report partial state.
+  const inner = { id: 257, type: "PrimitiveInt", widgets: [{ name: "value", type: "INT", value: 1280 }] };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "257" ? inner : null) };
+  const railWidget = { name: "value_2", type: "INT", value: 1280 };
+  const hostInput = { name: "value_2", widgetId: "a", _widget: railWidget, _subgraphSlot: { name: "value_2" } };
+  const parent = { id: 267, type: "SubgraphNode", subgraph, inputs: [hostInput], widgets: [railWidget] };
+  inner.widgets[0].callback = () => {
+    // Replace the host input entirely — same rail projection, DIFFERENT widgetId.
+    parent.inputs[0] = { name: "value_2", widgetId: "b", _widget: railWidget, _subgraphSlot: { name: "value_2" } };
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "value_2" ? { sourceNodeId: "257", sourceWidgetName: "value" } : null;
+
+  assert.throws(
+    () => applyWidgetWrite(parent, "value_2", 704, { resolveSource }),
+    // Must be an HONEST partial-state report naming the host input — NOT a plain
+    // "CHANGED during the write" clean-rollback claim (which is all the pre-fix code
+    // produced, since the same rail projections make the widget-set look unchanged).
+    (err) =>
+      err instanceof WidgetWriteError &&
+      /partial state/.test(err.message) &&
+      /host input/.test(err.message),
+  );
+  assert.equal(railWidget.value, 1280, "the captured rail value is restored");
+});

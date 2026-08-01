@@ -21,12 +21,14 @@ import {
   WidgetWriteError,
   resolvePromotedInnerTarget,
   followPromotionToConcrete,
+  collectPromotionIntermediates,
 } from "./widget-write.js";
 import { reconcileUnknownWidgetNames } from "./asset-staleness.js";
 import {
   preflightSetWidgetTarget,
   assertResolvedTargetRegistered,
   assertTypeAgainstFreshBackend,
+  assertMutatedNodeAuthorized,
 } from "./node-resolve.js";
 import { controlAfterGenerateWarning } from "./control-after-generate.js";
 import { uploadInputConfig, uploadInputAccepts, addComboOption } from "./input-asset.js";
@@ -180,6 +182,31 @@ export async function runSetWidget(
   // target — single-level/direct — since applyWidgetWrite already checks it.)
   if (isResolvedPromotion && authTarget && authTarget !== resolvedTargetNode) {
     assertResolvedTargetRegistered(liveRegistry(), authTarget);
+  }
+
+  // #458 NESTED-INTERMEDIATE (found in adversarial review of #475): fresh-auth above
+  // authorizes only the TERMINAL concrete node (authTarget), but applyWidgetWrite
+  // actually MUTATES — and reports success on — the IMMEDIATE inner promoted node (its
+  // widget) AND the OUTER subgraph parent (its rail/proxy widgets). For a NESTED
+  // promotion the immediate inner is an INTERMEDIATE virtual node that is NOT the
+  // terminal, and it was previously trusted merely for being "defless with subgraph
+  // metadata" — the same defless≠safe mistake fixed at the terminal. Authorize EVERY
+  // mutated node: absent from fresh /object_info is permitted ONLY as a provenance-clean
+  // virtual-subgraph container (or frontend-only leaf), never a removed/stale backend
+  // node masquerading with a subgraph field.
+  if (isResolvedPromotion) {
+    // The OUTER subgraph parent (its rail/proxy widgets are mutated).
+    assertMutatedNodeAuthorized(freshDefs, liveRegistry(), node, "outer subgraph");
+    // EVERY intermediate virtual container the promotion is driven THROUGH — not just
+    // the immediate inner. A deeper intermediate (A→B→C→concrete's C) is otherwise
+    // never authorized, so a removed-backend node forwarded-through would be trusted.
+    // Each must be present in fresh /object_info OR a provenance-clean virtual-subgraph
+    // container; the concrete terminal is excluded here (fresh-authorized as authTarget).
+    for (const intermediate of collectPromotionIntermediates(promotedResolution.target, resolveSource)) {
+      if (intermediate !== authTarget) {
+        assertMutatedNodeAuthorized(freshDefs, liveRegistry(), intermediate, "intermediate promoted");
+      }
+    }
   }
 
   // (1) Preflight the OUTER node before ANY mutation; decide whether reconcile
