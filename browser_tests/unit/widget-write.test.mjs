@@ -901,6 +901,63 @@ test("#366: the rail widget is resolved by the promotion's own NAME — a DIFFER
   assert.equal(set.promoted_from.parent_widget_synced, true);
 });
 
+// ---- #435: a promoted write must FIRE the INNER node's own widget callback so
+//            callback-driven side effects (LoadImage showImage → node.imgs) run,
+//            not merely propagate the value (verified fixed in 0.11.25) ----------
+
+test("#435: a promoted LoadImage 'image' write FIRES the INNER widget's callback (showImage side effect runs; node.imgs no longer stale)", () => {
+  // Reporter scenario: subgraph node 76 promotes inner LoadImage (id 68) 'image'.
+  // The pre-0.11.25 inline handler fired the PROMOTED VIEW's callback — forwarding the
+  // value down but NEVER invoking the inner widget's OWN callback — so showImage() was
+  // skipped, node.imgs stayed stale, and MaskEditor opened the OLD image (silent).
+  // The extracted applyWidgetWrite resolves to the inner (node, widget) and fires the
+  // INNER callback (#244) while syncing the authoritative rail (#366). This locks that
+  // the SIDE EFFECT runs — the exact thing #435 needed — not just the value landing.
+  const OLD = "clipspace/clipspace-painted-masked-A.png";
+  const NEW = "SHOWCASE_11a_cinematic_grade_00012_.png";
+  const fired = [];
+  const innerImageWidget = {
+    name: "image",
+    type: "combo",
+    options: { values: [OLD, NEW] },
+    value: OLD,
+    // Models LoadImage's image-widget callback: showImage(this.value) repopulates node.imgs.
+    callback(v, _canvas, node) {
+      fired.push(v);
+      node.imgs = [{ src: v }]; // showImage() side effect MaskEditor reads
+    },
+  };
+  const inner = { id: 68, type: "LoadImage", imgs: [{ src: OLD }], widgets: [innerImageWidget] };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "68" ? inner : null) };
+  // The parent's OWN promoted rail projection (identity-linked from the host input).
+  const railWidget = { name: "image", type: "combo", options: { values: [OLD, NEW] }, value: OLD };
+  const parent = {
+    id: 76,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "image", _widget: railWidget, widget: { name: "image" }, _subgraphSlot: { name: "image" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "image" ? { sourceNodeId: "68", sourceWidgetName: "image" } : null;
+
+  const set = applyWidgetWrite(parent, "image", NEW, { resolveSource });
+
+  // Value landed on the inner widget AND the authoritative rail (no stale render, #366).
+  assert.equal(innerImageWidget.value, NEW, "inner LoadImage image widget holds the new value");
+  assert.equal(railWidget.value, NEW, "authoritative rail synced (#366)");
+  assert.equal(set.promoted_from.inner_node_id, 68);
+  assert.equal(set.promoted_from.parent_widget_synced, true);
+  // THE #435 FIX: the INNER widget's OWN callback fired EXACTLY ONCE with the new value…
+  assert.deepEqual(fired, [NEW], "inner LoadImage callback fires once with the new value");
+  // …and its SIDE EFFECT ran — node.imgs repopulated, so MaskEditor reads the NEW image.
+  assert.deepEqual(
+    inner.imgs,
+    [{ src: NEW }],
+    "showImage side effect repopulated node.imgs (MaskEditor no longer opens the stale image)",
+  );
+});
+
 test("#366 FAIL CLOSED runs BEFORE any side-effecting coercion — a dynamic-combo inner is never invoked when the rail is refused", () => {
   // The inner is a DYNAMIC combo whose options.values() has a side effect. With a
   // linked (non-authoritative) host input the write must fail closed BEFORE

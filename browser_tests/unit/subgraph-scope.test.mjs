@@ -259,6 +259,34 @@ test("#411 e2e: viewing a nested subgraph, an inner output node yields its full 
   assert.equal(buildNodeExecutionId(root, hit.ownerGraph, hit.node.id), "10:15:359");
 });
 
+test("#438/#439 e2e: viewing the ACTIVE first-level subgraph, an inner output node yields the owner:leaf path (not 'not on the root graph')", () => {
+  // Reporter scenario (dup of #411, verified fixed in 0.11.25): the user ENTERED a
+  // first-level subgraph (owner instance id 76) containing an output node — a
+  // PreviewImage (#438, id 34) / MaskPreview (#439, id 74). graph_run passes the
+  // ACTIVE viewing graph as preferGraph, so findNodeInScopes resolves the inner
+  // output in that scope and buildNodeExecutionId produces the "76:34" path used as
+  // partial_execution_targets — instead of the OLD root-only rejection
+  // ("node 34 is not on the root graph"). This locks the ACTIVE first-level case the
+  // #411 e2e (a NESTED subgraph) did not exercise directly.
+  const preview = { id: 34, type: "PreviewImage" };
+  const active = makeSubgraph({ name: "LAB 07 — ANIMA INPAINT", nodes: [preview] });
+  const root = { _nodes: [{ id: 76, subgraph: active }] };
+  // preferGraph = the active first-level subgraph (graph !== rootGraph).
+  const hit = findNodeInScopes(root, 34, active);
+  assert.equal(hit.node, preview, "inner output resolves in the ACTIVE viewing scope");
+  assert.equal(hit.ownerGraph, active);
+  assert.equal(
+    buildNodeExecutionId(root, hit.ownerGraph, hit.node.id),
+    "76:34",
+    "first-level active-subgraph output → owner:leaf partial_execution_target",
+  );
+  // Same for the #439 MaskPreview id shape.
+  const maskPreview = { id: 74, type: "MaskPreview" };
+  active._nodes.push(maskPreview);
+  const hit2 = findNodeInScopes(root, 74, active);
+  assert.equal(buildNodeExecutionId(root, hit2.ownerGraph, hit2.node.id), "76:74");
+});
+
 // ---- #409: reject unsafe bypass on a multi-input subgraph ------------------
 
 test("#409 unsafeBypassMappings: reorder that forwards a wrong-type input is flagged", () => {
