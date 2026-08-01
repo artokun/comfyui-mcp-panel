@@ -2165,3 +2165,61 @@ test("#507 round-5: the dynamic-rail refusal is SCOPED to the empty-list path", 
   assert.equal(set.value, "karras");
   assert.equal(inner.widgets[0].value, "karras");
 });
+
+test("#507 final round: when the INNER list validated the value normally, the dynamic-rail refusal does not fire", () => {
+  // A stateful inner options function that was empty for the earlier attempts but holds a
+  // real list containing the value by the final one: ordinary membership validated the
+  // write, so a dynamic parent rail needs no extra scrutiny and must not be refused —
+  // that would be the same "guard rejects a legitimate case" bug #496/#507 are about.
+  const inner = {
+    id: 301,
+    type: "StarOllamaPromptHelper",
+    widgets: [{ name: "model", type: "combo", options: { values: () => ["qwen3-vl:8b"] }, value: "" }],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) };
+  const railWidget = { name: "model_alias", type: "combo", options: { values: () => ["qwen3-vl:8b"] }, value: "" };
+  const parent = {
+    id: 320,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "model_alias", _widget: railWidget, widget: { name: "model_alias" }, _subgraphSlot: { name: "model_alias" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_node, si) =>
+    si?.name === "model_alias" ? { sourceNodeId: "301", sourceWidgetName: "model" } : null;
+  const set = applyWidgetWrite(parent, "model_alias", "qwen3-vl:8b", {
+    ...HOOKS,
+    resolveSource,
+    acceptEmptyComboOptions: true,
+  });
+  assert.equal(set.value, "qwen3-vl:8b");
+  assert.equal(inner.widgets[0].value, "qwen3-vl:8b");
+  assert.equal(railWidget.value, "qwen3-vl:8b");
+});
+
+test("#507 final round: an OFF-list value against a non-empty inner list is still refused with the flag set", () => {
+  // The narrowing must not become an escape hatch: if the inner list is non-empty and
+  // does NOT contain the value, coerceWidgetValue already refuses (before the rail check).
+  const inner = {
+    id: 301,
+    type: "StarOllamaPromptHelper",
+    widgets: [{ name: "model", type: "combo", options: { values: ["qwen3-vl:8b"] }, value: "" }],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) };
+  const railWidget = { name: "model_alias", type: "combo", options: { values: () => ["anything"] }, value: "" };
+  const parent = {
+    id: 320,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "model_alias", _widget: railWidget, widget: { name: "model_alias" }, _subgraphSlot: { name: "model_alias" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_node, si) =>
+    si?.name === "model_alias" ? { sourceNodeId: "301", sourceWidgetName: "model" } : null;
+  assert.throws(
+    () => applyWidgetWrite(parent, "model_alias", "off-list:70b", { ...HOOKS, resolveSource, acceptEmptyComboOptions: true }),
+    (err) => err instanceof WidgetWriteError && /not a valid option/.test(err.message),
+  );
+  assert.equal(inner.widgets[0].value, "");
+  assert.equal(railWidget.value, "");
+});

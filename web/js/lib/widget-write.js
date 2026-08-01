@@ -917,7 +917,17 @@ export function applyWidgetWrite(
   // NON-EMPTY list must contain the value, or the whole write fails closed BEFORE any
   // mutation. A rail whose own list is unreadable or empty adds no information and is
   // skipped (the inner's server declaration already governs).
-  if (acceptEmptyComboOptions) {
+  // …and ONLY when the empty-list acceptance was actually what let `coerced` through.
+  // Keying on the FLAG alone over-reached (codex final round, MINOR): a stateful inner
+  // options function can return [] for the first attempts and a real list containing the
+  // value by the final one, in which case ordinary membership validated the write and the
+  // rail needs no extra scrutiny — refusing there would be the very "guard rejects a
+  // legitimate case" bug this PR exists to fix. Re-reading the inner list decides it, and
+  // an inner list that is (still) empty/unreadable falls into the strict branch.
+  const innerOptions = acceptEmptyComboOptions && isComboWidget(w) ? comboOptions(w) : null;
+  const innerValidatedIt =
+    Array.isArray(innerOptions) && innerOptions.length > 0 && innerOptions.includes(coerced);
+  if (acceptEmptyComboOptions && !innerValidatedIt) {
     for (const other of [parentWidget, ...displayWidgets]) {
       if (!other || !isComboWidget(other)) continue;
       // A DYNAMIC (function) sibling list is UNVERIFIABLE from here (codex round-5): it
