@@ -5,7 +5,8 @@ import {
   isDefaultWorkflowName,
   saveActiveWorkflow,
   describeSaveOutcome,
-  classifyOriginalOnDisk
+  classifyOriginalOnDisk,
+  diskExistenceFromStatus
 } from '../../web/js/lib/workflow-save.js'
 
 // A minimal ComfyUI workflow-service double that records what was called and
@@ -437,7 +438,10 @@ test('item 2: a genuine NEW workflow with NO path grounds/saves (never refused) 
 test('disk-existence backstop catches a low-level copy that moves a persisted source (#226)', async () => {
   // Rogue frontend: the low-level saveAs ALSO deletes the source (a move). The pre-
   // check can't foresee this, so the post-op disk-existence backstop must catch the
-  // vanished source and throw rather than report success.
+  // vanished source and throw rather than report success. The backstop is now gated on
+  // CONFIRMED disk evidence (200 before -> 404 after), so the test supplies a disk
+  // oracle backed by svc.disk (an in-memory-only signal must NOT trip it — see the
+  // dedicated no-false-throw test below).
   const active = {
     path: 'workflows/zz226b-orig.json',
     filename: 'zz226b-orig.json',
@@ -446,6 +450,7 @@ test('disk-existence backstop catches a low-level copy that moves a persisted so
     isTemporary: false
   }
   const svc = makeFaithfulService({ files: [active.path], active })
+  const existsOnDisk = async (p) => svc.disk.has(p) // 200 while on disk, 404 once deleted
   const origSaveAs = svc.saveAs
   svc.saveAs = (wf, path) => {
     svc.disk.delete(wf.path) // ROGUE: consumes (moves) the source
@@ -453,7 +458,7 @@ test('disk-existence backstop catches a low-level copy that moves a persisted so
   }
 
   await assert.rejects(
-    () => saveActiveWorkflow(svc, 'zz226b-copy', {}),
+    () => saveActiveWorkflow(svc, 'zz226b-copy', { existsOnDisk }),
     /moved the original workflow .* instead of copying it/
   )
 })
@@ -2272,5 +2277,78 @@ test('outcome: a WINDOWS ROOT-RELATIVE external source ("\\packs\\Foo.json") is 
   // Copy landed in the USER workflows dir, external original untouched.
   assert.ok(svc.disk.has('workflows/Foo Copy.json'), 'copy in the user workflows dir')
   assert.ok(svc.disk.has(srcPath), 'external original preserved')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never moved the external original')
+})
+
+// ---------------------------------------------------------------------------
+// Round-2 re-review: two MORE false-throw routes had to be closed.
+
+test('P1 #1b: an IN-MEMORY-absent source with an UNKNOWN disk oracle does NOT throw (backstop is disk-gated, #226)', async () => {
+  // The old backstop threw whenever getWorkflowByPath(source)==null after a copy — an
+  // in-memory signal that drifts stale once the copy activates. Here the copy succeeds,
+  // the source's in-memory lookup is null (stale), and the disk oracle is UNKNOWN for
+  // the source (a timed-out HEAD). That is NOT proof of on-disk loss ⇒ must NOT throw.
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const { svc } = makeStore147Service({ files: ['workflows/Foo.json'], active })
+  // Source disk-state UNKNOWN (null); everything else resolves via the seeded disk.
+  const existsOnDisk = async (p) => (p === 'workflows/Foo.json' ? null : svc.disk.has(p))
+  // Simulate in-memory staleness: the SOURCE lookup returns null (as if evicted), while
+  // target lookups behave normally (free).
+  const realGWBP = svc.getWorkflowByPath.bind(svc)
+  svc.getWorkflowByPath = (p) => (p === 'workflows/Foo.json' ? null : realGWBP(p))
+
+  const saved = await saveActiveWorkflow(svc, 'Bar', { existsOnDisk })
+
+  assert.equal(saved, 'Bar', 'reported success — no false "moved" throw')
+  assert.ok(svc.disk.has('workflows/Foo.json'), 'source still on disk (the copy never moved it)')
+  assert.ok(svc.disk.has('workflows/Bar.json'), 'copy created')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
+})
+
+test('P1 #1c: diskExistenceFromStatus treats ONLY 200 as present; non-200 2xx / redirects / 5xx are indeterminate', () => {
+  assert.equal(diskExistenceFromStatus(200), true, '200 ⇒ present')
+  assert.equal(diskExistenceFromStatus(404), false, '404 ⇒ absent')
+  // A non-200 2xx a proxy might return must NOT count as the confirmed 200 the data-loss
+  // gate requires — else a 204-then-404 pair would read as "lost".
+  assert.equal(diskExistenceFromStatus(204), null, '204 ⇒ indeterminate')
+  assert.equal(diskExistenceFromStatus(206), null, '206 ⇒ indeterminate')
+  assert.equal(diskExistenceFromStatus(301), null, '301 ⇒ indeterminate')
+  assert.equal(diskExistenceFromStatus(500), null, '500 ⇒ indeterminate')
+  assert.equal(diskExistenceFromStatus(undefined), null, 'missing ⇒ indeterminate')
+  // And a 204 pre / 404 post must classify UNVERIFIED, never lost:
+  assert.equal(
+    classifyOriginalOnDisk({ preExisted: diskExistenceFromStatus(204), postExists: diskExistenceFromStatus(404) }),
+    'unverified',
+    'non-200 pre-probe never yields a data-loss verdict'
+  )
+})
+
+test('P2: a Windows DRIVE-RELATIVE source ("C:Foo.json", no separator) is external ⇒ save-as-copy + sourceExternal', async () => {
+  const active = {
+    path: 'C:Foo.json',
+    filename: 'Foo.json',
+    directory: 'C:',
+    isPersisted: false,
+    isTemporary: true,
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ files: [active.path], active })
+
+  const details = {}
+  await saveActiveWorkflow(svc, 'Foo Copy', {
+    autoWorkflowName: () => 'Untitled',
+    existsOnDisk,
+    details,
+  })
+
+  assert.equal(details.mode, 'save-as-copy', 'drive-relative external source ⇒ save-as-copy, not first-save')
+  assert.equal(details.sourceExternal, true, 'flagged external so the /userdata HEAD is skipped')
+  assert.ok(svc.disk.has('workflows/Foo Copy.json'), 'copy landed in the user workflows dir')
+  assert.ok(svc.disk.has('C:Foo.json'), 'external original preserved')
   assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never moved the external original')
 })

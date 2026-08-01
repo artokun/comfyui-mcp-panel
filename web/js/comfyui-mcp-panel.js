@@ -150,6 +150,7 @@ import {
   groundActiveWorkflow,
   describeSaveOutcome,
   classifyOriginalOnDisk,
+  diskExistenceFromStatus,
   normalizePath,
 } from "./lib/workflow-save.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
@@ -2511,12 +2512,18 @@ async function programmaticSave(name) {
   // AUTHORITATIVE `details` sink (the branch it actually took), NOT inferred from the
   // mutable active workflow afterward — so a tab switch during the await can't fool it.
   //
-  // Capture POSITIVE pre-save evidence of the source file's existence FIRST: a
-  // confirmed 200 is the ONLY basis on which a post-save 404 may be treated as a real
-  // move/deletion of a persisted original. Without it, a source that 404s afterward
-  // simply never existed (a never-persisted tab whose classification was inconclusive),
-  // and throwing would be a false data-loss error on a legitimate first save.
-  const preSourcePath = svc?.activeWorkflow?.path ?? null;
+  // Snapshot the target workflow SYNCHRONOUSLY (before any await), so the pre-save HEAD
+  // below cannot let a tab switch redirect the save to a DIFFERENT workflow. It is
+  // passed to saveActiveWorkflow as `expect` (#330), which refuses if the active
+  // workflow changed during our pre-probe — restoring the "capture A before the first
+  // await" guarantee the pre-probe would otherwise have widened into a wrong-tab window.
+  const expectWf = svc?.activeWorkflow;
+  // Capture POSITIVE pre-save evidence of the source file's existence: a confirmed 200
+  // is the ONLY basis on which a post-save 404 may be treated as a real move/deletion
+  // of a persisted original. Without it, a source that 404s afterward simply never
+  // existed (a never-persisted tab whose classification was inconclusive), and throwing
+  // would be a false data-loss error on a legitimate first save.
+  const preSourcePath = expectWf?.path ?? null;
   let preExisted = null; // true = confirmed 200, false = confirmed 404, null = unknown
   if (preSourcePath) {
     try {
@@ -2531,6 +2538,7 @@ async function programmaticSave(name) {
     existsOnDisk: workflowExistsOnDisk,
     reconcileSavedCopy: reconcileSavedWorkflowCopy,
     details,
+    expect: expectWf, // #330: refuse if the user switched tabs during our pre-save HEAD
   });
   const outcome = describeSaveOutcome(details);
   // INDEPENDENT post-save verification (a second backstop, at the tool layer) for a
@@ -2640,9 +2648,11 @@ async function workflowExistsOnDisk(rawPath) {
       typeof api.getUserData === "function"
         ? await api.getUserData(rawPath, { method: "HEAD" })
         : await api.fetchApi(`/userdata/${encodeURIComponent(rawPath)}`, { method: "HEAD" });
-    if (res.status === 404) return false;
-    if (res.ok) return true;
-    return null; // inconclusive ⇒ classifier stays "unknown" ⇒ refuse
+    // STRICT: only a true 200 is positive existence evidence; a non-200 2xx (204/206/…)
+    // from a proxy/intermediary is INDETERMINATE (null), never "present" — else it could
+    // stand in for the confirmed pre-save 200 the data-loss gate requires and, paired
+    // with a later 404, yield a FALSE "moved" verdict. 404 ⇒ false; anything else ⇒ null.
+    return diskExistenceFromStatus(res.status);
   } catch {
     return null; // network/other error ⇒ unknown ⇒ fail safe
   }
