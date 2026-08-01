@@ -15,6 +15,12 @@
  * a pack is removed → a later fetch succeeds → without the latch that POST-removal map
  * becomes the baseline, the removed type reads "never seen", and a provenance-stripped
  * husk squatting a reserved allowlisted name (MarkdownNote) is exempted.
+ *
+ * SCOPE NOTE: these tests cover this module's POLICY. They do NOT — and cannot — cover the
+ * residual race in which a pack is removed inside the window between page load and the
+ * panel's first successful /object_info response, since the baseline can only ever come
+ * from an asynchronous fetch. See the KNOWN, ACCEPTED RESIDUAL note in
+ * web/js/lib/object-info-history.js for why that is bounded and out of scope.
  */
 import test from "node:test";
 import assert from "node:assert/strict";

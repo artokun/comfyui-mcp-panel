@@ -31,6 +31,19 @@
 // recordTypes() is deliberately NOT latched: recording can only ever ADD evidence that a
 // type existed, which can only ever make the gate refuse MORE. Only the "this history is
 // trustworthy enough to conclude never-seen" claim is latched.
+//
+// KNOWN, ACCEPTED RESIDUAL — do not "fix" it by weakening the rules above. The baseline
+// can only ever be established from an ASYNCHRONOUS /object_info response, so it is a
+// snapshot as of the fetch, not of page load. A pack removed inside that window (page load
+// → the first successful fetch; the seed's whole retry sequence is sub-second) is never
+// observed, so it would read "never seen". Exploiting that requires a third-party pack to
+// squat a ComfyUI-core-RESERVED name (Note/MarkdownNote/Reroute/PrimitiveNode or a
+// "… (rgthree)" control node), strip its own frontend class's .nodeData/.comfyClass, AND
+// be uninstalled inside that sub-second window — an adversarial construction, not an
+// accidental failure, in a product where the panel, orchestrator and user share one
+// machine and one trust domain. There is no synchronous page-load oracle that would close
+// it. The reserved-name allowlist and the provenance checks are the layered defenses that
+// keep the residual to exactly that construction.
 
 import { HISTORY_UNSEEDED } from "./node-resolve.js";
 
