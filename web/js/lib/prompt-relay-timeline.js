@@ -496,12 +496,15 @@ export function applyPromptRelayTimelineWrite(
   // the #506 workaround, which exists ONLY there (and which the node's next commit would revert
   // anyway). That text is about to be replaced, so hand it back rather than let it vanish.
   const baseDerived = base ? derivePromptRelayWidgets(base.segments) : null;
+  // With NO readable base (no editor yet, unreadable timeline_data) there is no timeline that
+  // could have produced the current derived values, so ANY non-empty one is out-of-band by
+  // definition — compare against empty rather than skipping the check, which would let a
+  // hand-written local_prompts be overwritten with no report at all.
+  const expectedDerived = baseDerived ?? { local_prompts: "", segment_lengths: "" };
   const replaced = {};
-  if (baseDerived) {
-    for (const name of PROMPT_RELAY_DERIVED_WIDGETS) {
-      const current = widgets[name].value;
-      if (typeof current === "string" && current !== baseDerived[name]) replaced[name] = current;
-    }
+  for (const name of PROMPT_RELAY_DERIVED_WIDGETS) {
+    const current = widgets[name].value;
+    if (typeof current === "string" && current !== expectedDerived[name]) replaced[name] = current;
   }
 
   const derived = derivePromptRelayWidgets(segments);

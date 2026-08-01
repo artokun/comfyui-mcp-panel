@@ -394,6 +394,30 @@ test("an overlay with NO segments key is an idempotent RE-RECONCILE, not a wipe"
   assert.deepEqual(res.replaced_out_of_band, { local_prompts: "stale text" });
 });
 
+test("with NO readable base at all, an existing derived value is still reported before replacement", () => {
+  // No editor yet (it is built in a setTimeout(0)) and no readable timeline_data, but the node
+  // carries hand-written local_prompts. Nothing could have derived that, so it is out-of-band
+  // by definition and must not be overwritten silently.
+  const { node, widgets } = makeRelayNode({ timelineSegments: null, withEditor: false });
+  widgets.local_prompts.value = "hand written | prompts";
+  widgets.segment_lengths.value = "10, 10";
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("from the agent", 7)] }));
+  assert.equal(res.merge_base, "none");
+  assert.deepEqual(res.replaced_out_of_band, {
+    local_prompts: "hand written | prompts",
+    segment_lengths: "10, 10",
+  });
+  assert.ok(res.warnings.some((w) => w.includes("ALREADY desynced")));
+  assert.equal(widgets.local_prompts.value, "from the agent");
+});
+
+test("a first write onto a truly EMPTY node reports nothing replaced", () => {
+  const { node } = makeRelayNode({ timelineSegments: null, withEditor: false });
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("first", 5)] }));
+  assert.equal(res.replaced_out_of_band, undefined);
+  assert.equal(res.warnings, undefined);
+});
+
 test("an overlay with no segments AND no readable current timeline is REFUSED", () => {
   const { node } = makeRelayNode({ timelineSegments: null });
   assert.throws(() => applyPromptRelayTimelineWrite(node, {}), PromptRelayTimelineWriteError);
