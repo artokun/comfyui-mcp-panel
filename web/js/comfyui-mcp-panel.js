@@ -2851,6 +2851,21 @@ async function managerGet(route, { signal } = {}) {
   return dialect === "legacy" ? managerCall(route, opts) : managerV2(route, opts);
 }
 
+/** #426 — fetch the connected ComfyUI's full `/object_info` map (node CLASS →
+ *  metadata). Always present on a running ComfyUI (no Manager needed), so it is
+ *  the installed-node fallback for nodes_search when the Manager registry search
+ *  is unreachable. Bounded by the shared Manager timeout; throws on any non-ok /
+ *  parse failure (searchNodesVia's fallback swallows it and degrades). */
+async function fetchObjectInfo() {
+  const res = await api.fetchApi("/object_info", {
+    method: "GET",
+    signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS),
+  });
+  if (!res || !res.ok) throw new Error(`/object_info HTTP ${res ? res.status : "no response"}`);
+  const txt = await res.text();
+  return txt ? JSON.parse(txt) : null;
+}
+
 /** Throw if a /v2/manager/queue/batch response reported the target id as failed.
  *  The batch runs synchronously and surfaces failures as {failed:[id,...]} — a
  *  silent success on a failed op is exactly the #184 no-op bug. */
@@ -7722,9 +7737,12 @@ const GRAPH_TOOL_EXECUTORS = {
     // flow. searchNodesVia tries the dialect-routed GET, retries the ABSOLUTE
     // (no-/v2) legacy route on an unreachable/404 signal (a legacy-UI pip build
     // or real 3.x Manager can serve /customnode/getmappings while the /v2 route
-    // 404s — or detectManagerDialect's /v2 probe fails), and returns a
-    // structured {supported:false,…} capability result when BOTH are unreachable.
-    return searchNodesVia(managerGet, managerCall, { query, limit });
+    // 404s — or detectManagerDialect's /v2 probe fails). When BOTH are
+    // unreachable it falls back to an INSTALLED-node search over the connected
+    // ComfyUI's /object_info (#426) so a legacy/disabled Manager still returns
+    // usable, already-installed matches; on a miss it returns the structured
+    // {supported:false,…} capability result.
+    return searchNodesVia(managerGet, managerCall, { query, limit, objectInfoGet: fetchObjectInfo });
   },
 
   async nodes_list() {

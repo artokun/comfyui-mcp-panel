@@ -215,6 +215,37 @@ export function resolveExplicitSlot(slots, ref) {
   return { error: "name" };
 }
 
+/** #406 — indices of the slots whose TYPE (not name) equals the string `ref`,
+ *  case-insensitively/trimmed. Lets a caller address a port by its displayed type
+ *  ("IMAGE", "LATENT") when no slot bears that literal name. Only string-typed
+ *  slots participate (a combo/enum whose `type` is an array or number is never a
+ *  type-name target). Returns [] when `ref` is not a usable string. */
+export function typeMatchedIndices(slots, ref) {
+  if (ref == null || typeof ref === "number") return [];
+  const want = String(ref).trim().toLowerCase();
+  if (!want) return [];
+  const hits = [];
+  (slots ?? []).forEach((s, i) => {
+    if (typeof s?.type === "string" && s.type.trim().toLowerCase() === want) hits.push(i);
+  });
+  return hits;
+}
+
+/** #406 — resolve a slot ref that matched no NAME against slot TYPES. EXACTLY one
+ *  type match → that { index }; SEVERAL → refuse as ambiguous (never guess a
+ *  same-typed sibling — symmetric with the input auto-match ambiguity guard); ZERO
+ *  → the honest name-miss diagnostic. `side` is "output"/"input" for the message. */
+function resolveTypeRef(slots, ref, origin, target, requested, side) {
+  const ti = typeMatchedIndices(slots, ref);
+  if (ti.length === 1) return { index: ti[0] };
+  if (ti.length === 0) throw new Error(slotDiagnostic(origin, target, requested));
+  const names = ti.map((i) => slots[i]?.name).filter(Boolean);
+  const reason =
+    `ambiguous: ${ti.length} ${renderSlotType(slots[ti[0]]?.type)} ${side}s` +
+    `${names.length ? ` (${names.join(", ")})` : ""} — name one by slot name or index`;
+  throw new Error(slotDiagnostic(origin, target, { ...requested, reason }));
+}
+
 /** Resolve output/input slot indices for graph_connect, auto-matching omitted
  *  sides by type. Returns { outIdx, inIdx, autoMatched: [...] } or throws a
  *  diagnostic Error (range error for a bad index; slotDiagnostic otherwise:
@@ -229,13 +260,24 @@ export function autoMatchSlots(origin, target, fromRef, toRef) {
   const inp = resolveExplicitSlot(inputs, toRef);
   if (out?.error === "range")
     throw new Error(`output slot index ${fromRef} out of range (node has ${outputs.length})`);
-  if (out?.error === "name") throw new Error(slotDiagnostic(origin, target, requested));
   if (inp?.error === "range")
     throw new Error(`input slot index ${toRef} out of range (node has ${inputs.length})`);
-  if (inp?.error === "name") throw new Error(slotDiagnostic(origin, target, requested));
 
-  const outIdxFixed = out ? out.index : null;
-  const inIdxFixed = inp ? inp.index : null;
+  // #406: a string ref that matched no slot NAME may instead name a slot's TYPE —
+  // the caller addressed the port by its displayed type ("IMAGE") rather than its
+  // slot name ("output_0"). Before failing, re-resolve the ref against slot TYPES:
+  // EXACTLY ONE slot of that type → treat it as an explicit index; SEVERAL → refuse
+  // as ambiguous (never guess a same-typed sibling — that could wire the wrong
+  // IMAGE branch); ZERO → a genuine name miss, keep the honest diagnostic.
+  const outFix = out?.error === "name"
+    ? resolveTypeRef(outputs, fromRef, origin, target, requested, "output")
+    : out;
+  const inFix = inp?.error === "name"
+    ? resolveTypeRef(inputs, toRef, origin, target, requested, "input")
+    : inp;
+
+  const outIdxFixed = outFix ? outFix.index : null;
+  const inIdxFixed = inFix ? inFix.index : null;
 
   // Both explicit → straight through, no auto-match.
   if (outIdxFixed != null && inIdxFixed != null) {
