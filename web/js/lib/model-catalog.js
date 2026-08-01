@@ -18,12 +18,15 @@
 const CLAUDE_FAMILIES = ["opus", "sonnet", "haiku", "fable", "mythos"];
 const FAMILY_LABEL = { opus: "Opus", sonnet: "Sonnet", haiku: "Haiku", fable: "Fable", mythos: "Mythos" };
 
-/** Strip a trailing context marker (`[1m]`) and a `-fast` speed suffix so the
- *  family/version parse sees the bare model id. */
+/** Strip a trailing context marker (`[1m]`) so the family/version parse sees the
+ *  bare model id. A `-fast` speed suffix is deliberately NOT stripped: a
+ *  `claude-opus-5-fast` is a distinct selectable variant (different speed/price),
+ *  so it must not parse identically to `claude-opus-5` and get collapsed away —
+ *  leaving `-fast` in the id makes it fail the pinned-id regex, so it passes
+ *  through the picker untouched (kept, exactly as the pre-#377 code did). */
 function stripModelSuffix(id) {
   return String(id ?? "")
     .replace(/\[[^\]]*\]\s*$/, "")
-    .replace(/-fast$/i, "")
     .trim();
 }
 

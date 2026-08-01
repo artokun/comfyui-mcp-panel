@@ -121,6 +121,22 @@ test("versionless alias (no resolvedModel) is NOT dropped just because a newer p
   assert.equal(rows.find((r) => r.id === "claude-opus-5").label, "Opus 5");
 });
 
+test("a `-fast` speed variant is a distinct model — never collapsed into its base version", () => {
+  // Codex self-gate catch: claude-opus-5-fast must survive alongside claude-opus-5.
+  const rows = presentableModels(
+    normalizeModels([
+      { value: "opus", displayName: "Opus", resolvedModel: "claude-opus-5", supportsEffort: true },
+      { value: "claude-opus-5", resolvedModel: "claude-opus-5", supportsEffort: true },
+      { value: "claude-opus-5-fast", displayName: "Opus 5 (fast)", resolvedModel: "claude-opus-5-fast", supportsEffort: true },
+    ]),
+  );
+  const ids = rows.map((r) => r.id);
+  assert.ok(ids.includes("opus"), "the alias at the newest version is kept");
+  assert.ok(!ids.includes("claude-opus-5"), "the pinned duplicate of the alias is dropped");
+  assert.ok(ids.includes("claude-opus-5-fast"), "the -fast variant is a distinct model, kept");
+  assert.equal(rows.find((r) => r.id === "claude-opus-5-fast").label, "Opus 5 (fast)");
+});
+
 test("#70 regression: Fable advertised only as a pinned id (no alias) survives", () => {
   const rows = presentableModels(
     normalizeModels([

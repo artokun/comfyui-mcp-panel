@@ -65,6 +65,16 @@ class ProviderAuthClaude(unittest.TestCase):
         self._write({"claudeAiOauth": {"accessToken": "", "refreshToken": ""}})
         self.assertIs(mod._provider_auth("claude"), False)
 
+    def test_whitespace_only_token_is_not_ready(self):
+        self._write({"claudeAiOauth": {"accessToken": "   ", "refreshToken": ""}})
+        self.assertIs(mod._provider_auth("claude"), False)
+
+    def test_non_string_token_is_not_ready(self):
+        # true / [..] / number are truthy but not usable OAuth tokens.
+        for bad in (True, ["x"], 123, {"k": "v"}):
+            self._write({"claudeAiOauth": {"accessToken": bad, "refreshToken": ""}})
+            self.assertIs(mod._provider_auth("claude"), False, msg=repr(bad))
+
     def test_missing_oauth_key_is_not_ready(self):
         self._write({"something_else": True})
         self.assertIs(mod._provider_auth("claude"), False)

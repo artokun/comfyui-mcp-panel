@@ -163,7 +163,13 @@ def _provider_auth(provider):
             try:
                 with open(credentials_path, encoding="utf-8") as credentials_file:
                     oauth = json.load(credentials_file).get("claudeAiOauth", {})
-                return bool(oauth.get("accessToken") or oauth.get("refreshToken"))
+                # A usable token is a non-blank STRING; a whitespace-only value or
+                # a non-string (true / [..] / number) is not a real OAuth token and
+                # must not read as ready.
+                def _token(value):
+                    return isinstance(value, str) and value.strip() != ""
+
+                return _token(oauth.get("accessToken")) or _token(oauth.get("refreshToken"))
             except (OSError, AttributeError, TypeError, ValueError):
                 # Unreadable / malformed / not-an-object → treat as not-signed-in
                 # rather than falsely ready.
