@@ -1,5 +1,11 @@
 // Programmatic workflow saving — shared by the panel and unit tests.
 //
+// #442 defect 3 — the in-place-overwrite gate compares the on-disk file's RAW BYTES
+// against a canonical UTF-8 encoding of the tab's loaded baseline text, so a BOM (or any
+// byte-level) difference a decoded-string compare would miss cannot authorize a
+// destructive overwrite. See diskBytesEqualText for why raw bytes are required.
+import { diskBytesEqualText } from "./workflow-open-staleness.js";
+
 // The one hard rule here exists because of a silent data-loss bug (issue #226):
 // "save this workflow as X" MUST write a NEW file and leave the original file on
 // disk untouched (copy / Save-As semantics). Renaming the source — which moves
@@ -261,7 +267,7 @@ export async function groundActiveWorkflow(svc, opts = {}) {
 export async function saveActiveWorkflow(
   svc,
   name,
-  { autoWorkflowName, existsOnDisk, reconcileSavedCopy, expect, details } = {},
+  { autoWorkflowName, existsOnDisk, readDiskBytes, reconcileSavedCopy, expect, details } = {},
 ) {
   const wf = svc?.activeWorkflow;
   if (!wf) throw new Error("no active workflow to save");
@@ -497,10 +503,128 @@ export async function saveActiveWorkflow(
 
   // No relocation — the target path equals the current on-disk path. Overwriting
   // the same file in place is safe (no move can occur).
+  //
+  // #442 — an in-place save can spuriously 409 ("Error storing user data file
+  // '…': 409 Conflict") over the workflow's OWN name. ComfyUI's UserFile.save()
+  // writes with `overwrite: this.isPersisted`, and `isPersisted` is a getter
+  // derived from `size` (`isTemporary = size === -1`). After a panel_open_workflow
+  // open-ack race the loaded workflow's `size` DRIFTS to -1 (#215/#226), so
+  // `isPersisted` reads false, the write goes out with overwrite:false, and the
+  // server rejects it because the file already exists.
+  //
+  // DATA-LOSS GUARD (codex P0): existence alone must NOT authorize the forced
+  // overwrite. If the file changed on disk under us (another tab/agent/process
+  // wrote B while this tab holds A), forcing overwrite:true would silently CLOBBER
+  // B — and the very 409 we're removing was, in that sub-case, correctly protecting
+  // it. ComfyUI's /userdata has no If-Match/ETag conditional write, so the achievable
+  // guarantee is a byte-exact CONTENT-EQUALITY gate: force the overwrite only when the
+  // on-disk bytes STILL MATCH what this tab loaded (wf.originalContent). If disk DIFFERS
+  // from the baseline, REFUSE with a surfaced conflict rather than overwrite (the caller
+  // reloads or saves under a new name). We are in the NON-relocating branch
+  // (finalTargetPath === currentPath === wf.path), so this only ever concerns the
+  // tab's OWN file.
+  //
+  // ACCEPTED RESIDUAL (upstream-only, unchanged from ComfyUI's normal saves): the
+  // read→write is not atomic, so a write that lands in the sub-ms window BETWEEN our
+  // read and saveInPlace's overwrite:true is not caught — but this is EXACTLY the same
+  // non-atomic overwrite:true a normal PERSISTED save already performs on every
+  // Ctrl+S, so the drift-repair introduces no window ComfyUI doesn't already have.
+  // A true guarantee needs a server-side conditional/version token ComfyUI does not
+  // expose; the pre-check closes the realistic "already changed before the save" case.
   assertExpect(); // #330: never in-place-overwrite a workflow the user switched to
+  // Split PROBE (async) from MUTATION (sync): the disk read below awaits, so the
+  // persistence coercion must NOT run inside it. If the active tab switches during
+  // the probe, the trailing assertExpect throws — but a coercion applied before that
+  // assert would leave the FORMER tab marked persisted, and a later save of it would
+  // skip the oracle and send overwrite:true from an aborted authorization (codex P2).
+  // So: probe → assertExpect → THEN coerce synchronously, after the tab is re-verified.
+  const inPlace = await classifyInPlaceOverwrite(wf, currentPath, readDiskBytes);
+  assertExpect(); // the disk read above awaited — re-check the tab didn't switch
+  // A same-OBJECT rename during the await keeps object identity (so assertExpect
+  // passes) but changes wf.path — the captured currentPath would no longer identify
+  // this tab's file. Refuse rather than authorize/write against a stale path.
+  if (normalizePath(wf.path) !== currentPath) {
+    throw new Error(
+      `refusing to save: the active workflow's path changed during the save (now "${wf.path}") — retry.`,
+    );
+  }
+  if (inPlace === "conflict") {
+    throw new Error(
+      `refusing to save "${effectiveName}": its file "${currentPath}" changed on disk since this tab ` +
+        `loaded it, so saving in place would OVERWRITE those external changes. ComfyUI has no ` +
+        `conditional (If-Match) write, so this is guarded by a content-equality check. Reload the ` +
+        `on-disk version (panel_load_workflow) to pick it up, or save under a NEW name to keep both ` +
+        `(issue #442).`,
+    );
+  }
+  if (inPlace === "authorize") markPersistedForOverwrite(wf); // sync (post-assert) ⇒ no leak window
   recordOutcome(details, "in-place", { sourcePath: currentPath, targetPath: finalTargetPath });
   await saveInPlace(svc, wf);
   return desired || currentName || null;
+}
+
+/** #442 — CLASSIFY (no mutation) an IN-PLACE save against a DRIFTED `isPersisted`,
+ *  content-equality gated to prevent a destructive overwrite (codex P0). Returns:
+ *   - `"authorize"` — the workflow reads non-persisted (drifted) AND the on-disk bytes
+ *     STILL MATCH the tab's loaded baseline (`wf.originalContent`). Forcing
+ *     overwrite:true here re-saves the user's edits over the SAME file they loaded — no
+ *     external content is at risk. This is the case defect 3 fixes.
+ *   - `"conflict"` — drifted AND the on-disk bytes DIFFER from the baseline (the file
+ *     changed under us). Forcing overwrite would clobber the newer content, so the
+ *     caller must refuse and surface a conflict instead.
+ *   - `"skip"` — nothing to do: already persisted (ComfyUI's own overwrite:true path
+ *     runs), no reader / no path / no baseline to compare, or the file is absent
+ *     (disk read null ⇒ overwrite:false safely CREATES it). Leaves behaviour unchanged.
+ *
+ *  PURE async probe: it never mutates `wf`. `readDiskBytes(path) => Uint8Array | null`
+ *  is the authoritative on-disk RAW-BYTE oracle (null = absent/unreadable). Raw bytes —
+ *  not decoded text — because Response.text() strips a UTF-8 BOM, so a string compare
+ *  would treat `A` and `BOM+A` as equal and authorize a clobber of the BOM-bearing change
+ *  (codex P0). The caller applies markPersistedForOverwrite ONLY on "authorize", AFTER
+ *  re-asserting the tab. */
+export async function classifyInPlaceOverwrite(wf, currentPath, readDiskBytes) {
+  if (!wf || wf.isPersisted === true) return "skip"; // already overwrite:true — untouched
+  if (typeof readDiskBytes !== "function" || !currentPath) return "skip"; // no oracle ⇒ leave as-is
+  const baseline = typeof wf.originalContent === "string" ? wf.originalContent : null;
+  if (baseline == null) return "skip"; // no baseline to compare ⇒ cannot prove safe ⇒ leave as-is
+  let disk = null;
+  try {
+    disk = await readDiskBytes(currentPath);
+  } catch {
+    disk = null; // read threw ⇒ unknown ⇒ do not force (server 409s honestly if it exists)
+  }
+  // Absent (create) / unreadable / not raw bytes ⇒ leave as-is (never a forced overwrite).
+  const bytes =
+    disk instanceof Uint8Array
+      ? disk
+      : disk && typeof disk.byteLength === "number"
+        ? new Uint8Array(disk)
+        : null;
+  if (!bytes) return "skip";
+  // Content-equality gate on RAW BYTES vs a canonical UTF-8 encoding of the baseline:
+  // only when the on-disk bytes are byte-identical to what this tab loaded is the forced
+  // overwrite non-destructive. Any external change — a different graph, or merely an added
+  // BOM / re-encoding a string compare would miss — ⇒ conflict, never a clobber. FAILS
+  // CLOSED (conflict) if it can't be proven byte-identical (diskBytesEqualText, codex P0).
+  return diskBytesEqualText(bytes, baseline) ? "authorize" : "conflict";
+}
+
+/** #442 — SYNCHRONOUS mutation that clears a drifted `isTemporary` so ComfyUI's
+ *  save() uses `overwrite:true`. `isPersisted`/`isTemporary` derive from `size`
+ *  (`isTemporary = size === -1`), so the correction sets the REAL backing field
+ *  `size` to a non-(-1) value; the subsequent save() replaces it with the server's
+ *  authoritative size. Must be called ONLY after the caller re-asserted the expected
+ *  tab (it is synchronous, so no tab switch can interleave). Best-effort + getter-safe
+ *  — a frozen/derived `size` is left untouched (the assigns cover plain-object doubles). */
+export function markPersistedForOverwrite(wf) {
+  if (!wf) return;
+  try {
+    if (wf.size === -1 || wf.size == null) wf.size = 1;
+  } catch {
+    /* size not settable ⇒ best-effort */
+  }
+  safeAssign(wf, "isTemporary", false);
+  safeAssign(wf, "isPersisted", true);
 }
 
 /** Authoritative tri-state DISK probe for the post-save backstop — the ONLY evidence

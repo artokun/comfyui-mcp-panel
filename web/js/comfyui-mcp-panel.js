@@ -186,6 +186,7 @@ import {
   activeStaleHint,
 } from "./lib/reconnect-staleness.js";
 import { pickRevertSnapshot } from "./lib/graph-revert.js";
+import { decideOpenStaleness } from "./lib/workflow-open-staleness.js";
 import {
   saveActiveWorkflow,
   shouldGroundBeforeTurn,
@@ -2610,6 +2611,11 @@ async function programmaticSave(name) {
   const saved = await saveActiveWorkflow(svc, name, {
     autoWorkflowName,
     existsOnDisk: workflowExistsOnDisk,
+    // #442 — RAW-BYTE oracle for the in-place-overwrite gate: authorize a forced
+    // overwrite of a drifted tab's OWN file ONLY when the on-disk BYTES still match a
+    // canonical encoding of what it loaded (else refuse, never clobber an external change
+    // — including a BOM a decoded-string compare would miss, codex P0).
+    readDiskBytes: workflowDiskBytes,
     reconcileSavedCopy: reconcileSavedWorkflowCopy,
     details,
     expect: expectWf, // #330: refuse if the user switched tabs during our pre-save HEAD
@@ -2729,6 +2735,54 @@ async function workflowExistsOnDisk(rawPath) {
     return diskExistenceFromStatus(res.status);
   } catch {
     return null; // network/other error ⇒ unknown ⇒ fail safe
+  }
+}
+
+/** #442 — the CURRENT on-disk text of a workflow's /userdata file, or null when it
+ *  can't be read (no api, non-200, or a network error). Used to detect an out-of-band
+ *  edit by comparing against the tab's loaded baseline — CONTENT, not mtime, because
+ *  the frontend's own listing sync advances a workflow's `lastModified` without
+ *  reloading its graph (which would defeat an mtime check) and timestamp-preserving
+ *  writes would evade one. Fails safe (null ⇒ no false staleness). */
+async function workflowDiskContent(rawPath) {
+  try {
+    if (!api || !rawPath) return null;
+    // Prefer getUserData, but FALL BACK to fetchApi (mirrors workflowExistsOnDisk) so a
+    // frontend that exposes only fetchApi — or where getUserData is momentarily absent —
+    // still reads disk. Without this the read returned null and the staleness/overwrite
+    // checks silently degraded (codex P2). null only for a genuinely unavailable api.
+    const res =
+      typeof api.getUserData === "function"
+        ? await api.getUserData(rawPath)
+        : typeof api.fetchApi === "function"
+          ? await api.fetchApi(`/userdata/${encodeURIComponent(rawPath)}`)
+          : null;
+    if (!res || res.status !== 200) return null;
+    return await res.text();
+  } catch {
+    return null; // unknown ⇒ fail safe (surfaced as stale:"unknown", never false-fresh)
+  }
+}
+
+/** #442 defect 3 — the CURRENT on-disk file as RAW BYTES (Uint8Array), or null when it
+ *  can't be read. The in-place-overwrite gate MUST compare raw bytes, not decoded text:
+ *  Response.text() consumes a UTF-8 BOM, so a decoded compare treats `A` and `BOM+A` as
+ *  equal and would authorize a clobber of the BOM-bearing external change (codex P0).
+ *  arrayBuffer() preserves every byte. Same api.getUserData→fetchApi resolution as the
+ *  text reader; null on any error/absence ⇒ the gate leaves overwrite:false (fails safe). */
+async function workflowDiskBytes(rawPath) {
+  try {
+    if (!api || !rawPath) return null;
+    const res =
+      typeof api.getUserData === "function"
+        ? await api.getUserData(rawPath)
+        : typeof api.fetchApi === "function"
+          ? await api.fetchApi(`/userdata/${encodeURIComponent(rawPath)}`)
+          : null;
+    if (!res || res.status !== 200) return null;
+    return new Uint8Array(await res.arrayBuffer());
+  } catch {
+    return null; // unknown ⇒ fail safe (gate leaves overwrite:false — never a forced clobber)
   }
 }
 
@@ -7043,7 +7097,26 @@ const GRAPH_TOOL_EXECUTORS = {
           `For a file outside the workflows folder, load it with panel_load_workflow path:<file>.`,
       );
     }
+    // #442 — an ALREADY-OPEN tab is repainted from its OWN in-memory buffer below,
+    // never re-read from disk. If the .json changed on disk out-of-band the canvas
+    // would silently keep the pre-edit graph and this open would report a bland
+    // success. We detect it by comparing the CURRENT on-disk bytes against the bytes
+    // the tab LOADED (its originalContent baseline). Capture `wasOpen` NOW (before
+    // openWorkflow, which loads a not-yet-open tab and would make changeTracker
+    // non-null); the actual disk read happens LATE (after openWorkflow + repaint) so
+    // an external write during those awaits is still caught (codex — otherwise a read
+    // taken here could baseline against A, the file change to B during openWorkflow,
+    // and the result falsely report fresh). A not-yet-open tab is skipped — openWorkflow
+    // reads it fresh from disk. openWorkflow does NOT mutate originalContent for an
+    // already-open tab (its load() early-returns), so the baseline stays valid.
+    const wasOpen = !!target.changeTracker;
     await s.openWorkflow(target);
+    // We deliberately do NOT auto-reload the canvas from disk here: switching to an
+    // already-open tab must not silently discard the user's in-memory graph, and a
+    // re-read could race a concurrent canvas edit and clobber it. Instead the staleness
+    // is SURFACED (below) so the caller refreshes deliberately with panel_load_workflow
+    // — exactly the recovery the issue reporter uses. The load-bearing fix is turning a
+    // SILENT stale serve into a loud, actionable signal.
     // openWorkflow sets the tab ACTIVE but does NOT repaint the canvas for an
     // ALREADY-OPEN instance — the graph load normally rides the frontend's
     // workflow *service* tab-switch, which the panel can't reach (it's a Vue
@@ -7074,9 +7147,41 @@ const GRAPH_TOOL_EXECUTORS = {
     // the epoch we STARTED on, but only if no reconnect intervened during the async
     // open (else its tab-restore may have overridden us — leave the window armed).
     if (backendReconnectEpoch === openedForEpoch) activeWorkflowResyncEpoch = openedForEpoch;
+    // #442 — read the on-disk bytes AS LATE AS POSSIBLE (after openWorkflow + repaint),
+    // so an external write during those awaits is still detected. There is NO await
+    // between this read and the return below, so nothing can interleave and turn a
+    // freshly-read stale result into a false-fresh (codex). wasOpen was captured before
+    // openWorkflow; the baseline (originalContent) is unchanged by an already-open open.
+    const onDiskContent = wasOpen ? await workflowDiskContent(target.path) : null;
+    const staleInfo = decideOpenStaleness({
+      wasOpen,
+      isModified: !!target.isModified,
+      onDiskContent,
+      baselineContent: typeof target.originalContent === "string" ? target.originalContent : null,
+    });
     return {
       opened: { path: target.path, filename: target.filename },
       modified: !!target.isModified,
+      // #442 — surface out-of-band staleness so a caller switching to an already-open
+      // tab is never fooled by a bland success while the canvas shows a pre-edit graph.
+      // `stale:true` = the on-disk file differs from what this tab loaded; `stale:"unknown"`
+      // = we could NOT verify (disk unreadable / no baseline) and must NOT claim fresh
+      // (codex P2). The canvas always shows the LOADED version (we never auto-reload —
+      // see above); `stale_hint` says how to refresh, and whether unsaved edits are at stake.
+      ...(staleInfo.stale === true
+        ? {
+            stale: true,
+            stale_hint: staleInfo.reload
+              ? "The file changed on disk since this tab loaded it; the canvas still shows the loaded version. Call panel_load_workflow to load the on-disk version."
+              : "The file changed on disk since this tab loaded it, AND this tab has unsaved edits. Save first (panel_save_workflow) to keep them, or call panel_load_workflow to discard them and load the on-disk version.",
+          }
+        : staleInfo.stale === "unknown"
+          ? {
+              stale: "unknown",
+              stale_hint:
+                "Could not verify whether the on-disk file still matches this tab (disk read unavailable). Treat the canvas as possibly stale; call panel_load_workflow to be sure you have the on-disk version.",
+            }
+          : {}),
     };
   },
 
