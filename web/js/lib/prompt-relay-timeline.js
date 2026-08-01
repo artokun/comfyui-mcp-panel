@@ -378,14 +378,24 @@ function timelineWarnings(segments) {
  * lossy: `["a | b", "c"]` and `["a", "b | c"]` produce an identical `local_prompts` while being
  * completely different timelines. Every "did the content change?" decision goes through here,
  * so a prompt containing a literal "|" can never make a real overwrite look like a no-op.
- * Lengths are compared as strings so a numeric-string base ("24") matches a normalized 24 and
- * two NaNs match, without NaN !== NaN reporting a phantom difference.
  */
+function sameLength(x, y) {
+  // Identical values (including two absent ones) match outright. Otherwise ONLY numerically:
+  // a numeric-string base ("24") must match a normalized 24, but nothing else is coerced —
+  // stringifying instead would make a `null` length compare equal to a `"null"` one.
+  if (x === y) return true;
+  const num = (v) =>
+    typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+  const nx = num(x);
+  const ny = num(y);
+  return Number.isFinite(nx) && Number.isFinite(ny) && nx === ny;
+}
+
 export function sameSegmentContent(a, b) {
   if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) {
     if (a[i]?.prompt !== b[i]?.prompt) return false;
-    if (String(a[i]?.length) !== String(b[i]?.length)) return false;
+    if (!sameLength(a[i]?.length, b[i]?.length)) return false;
   }
   return true;
 }
@@ -568,10 +578,18 @@ export function applyPromptRelayTimelineWrite(
   // three different timelines.
   const editorSegs = Array.isArray(fromEditor?.segments) ? fromEditor.segments : null;
   const widgetSegs = Array.isArray(fromWidget?.segments) ? fromWidget.segments : null;
-  const copiesDiverge = !!editorSegs && !!widgetSegs && !sameSegmentContent(editorSegs, widgetSegs);
+  // ANOMALOUS = the node's records do not corroborate each other:
+  //   * both readable but DIFFERENT — one of them holds content the caller may not have seen;
+  //   * an editor copy with an UNREADABLE timeline_data — the editor is then the only record
+  //     of that content anywhere, so discarding it is exactly the case that must be reported.
+  // A headless node (no editor, readable widget) is NOT anomalous: the widget is the single
+  // normal record and the caller read it, so an ordinary write there stays quiet.
+  const anomalous = editorSegs && widgetSegs ? !sameSegmentContent(editorSegs, widgetSegs) : !!editorSegs;
 
   const overwroteInFlight =
-    copiesDiverge && !sameSegmentContent(editorSegs, segments) ? contentSnapshot(editorSegs) : null;
+    anomalous && editorSegs && !sameSegmentContent(editorSegs, segments)
+      ? contentSnapshot(editorSegs)
+      : null;
   if (overwroteInFlight) {
     warnings.push(
       `this node held an UNCOMMITTED timeline edit — the live editor's segments (what the node ` +
@@ -583,7 +601,9 @@ export function applyPromptRelayTimelineWrite(
   }
 
   const supersededTimelineData =
-    copiesDiverge && !sameSegmentContent(widgetSegs, segments) ? contentSnapshot(widgetSegs) : null;
+    anomalous && widgetSegs && !sameSegmentContent(widgetSegs, segments)
+      ? contentSnapshot(widgetSegs)
+      : null;
   if (supersededTimelineData) {
     warnings.push(
       `the node's timeline_data widget held DIFFERENT segments from the timeline editor, and your ` +

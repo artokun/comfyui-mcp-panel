@@ -265,6 +265,35 @@ test("an unreadable current timeline_data still merges from the LIVE editor", ()
   assert.equal(JSON.parse(widgets.timeline_data.value).zoom, 2);
 });
 
+test("CORRUPT MASTER: discarding the editor copy is disclosed when timeline_data is unreadable", () => {
+  // With timeline_data unreadable the editor holds the ONLY record of that content, so a write
+  // that does not reproduce it must hand it back — there is no second copy to recover it from.
+  const { node, widgets } = makeRelayNode();
+  widgets.timeline_data.value = "corrupt {{{";
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("replacement", 11)] }));
+  assert.equal(res.merge_base, "editor");
+  assert.deepEqual(res.overwrote_uncommitted_edit, { prompts: ["a", "b"], lengths: [24, 36] });
+  assert.ok(res.warnings.some((w) => w.includes("UNCOMMITTED timeline edit")));
+  // Nothing to supersede: there was no readable timeline_data copy.
+  assert.equal(res.superseded_timeline_data, undefined);
+});
+
+test("CORRUPT MASTER: a write that reproduces the editor copy stays quiet", () => {
+  const { node, widgets } = makeRelayNode();
+  widgets.timeline_data.value = "corrupt {{{";
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("a", 24), seg("b", 36)] }));
+  assert.equal(res.overwrote_uncommitted_edit, undefined);
+});
+
+test("HEADLESS: an ordinary write with no editor never fires an overwrite disclosure", () => {
+  // Not an anomaly — the widget is the single normal record and the caller read it.
+  const { node } = makeRelayNode({ withEditor: false });
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("brand new", 5)] }));
+  assert.equal(res.overwrote_uncommitted_edit, undefined);
+  assert.equal(res.superseded_timeline_data, undefined);
+  assert.equal(res.warnings, undefined);
+});
+
 // ─── The merge base: whichever copy of the timeline is actually current ───
 
 test("MID-TYPING: the live editor wins over a timeline_data widget lagging by the 120ms debounce", () => {
@@ -428,6 +457,12 @@ test("sameSegmentContent compares structurally, never through the join", () => {
   assert.equal(sameSegmentContent([{ prompt: "p", length: 24 }], [{ prompt: "p", length: 25 }]), false);
   assert.equal(sameSegmentContent(A, A.slice(0, 1)), false);
   assert.equal(sameSegmentContent(A, null), false);
+  // Lengths are NOT compared by stringifying — that would make null equal "null".
+  assert.equal(sameSegmentContent([{ prompt: "p", length: null }], [{ prompt: "p", length: "null" }]), false);
+  assert.equal(sameSegmentContent([{ prompt: "p", length: NaN }], [{ prompt: "p", length: 24 }]), false);
+  assert.equal(sameSegmentContent([{ prompt: "p" }], [{ prompt: "p" }]), true);
+  // Prompts are compared strictly — no coercion, and an empty prompt is distinct from absent.
+  assert.equal(sameSegmentContent([{ prompt: "", length: 1 }], [{ length: 1 }]), false);
 });
 
 test("MID-TYPING: a pending debounce commit AFTER our write is a no-op (no rollback)", () => {
