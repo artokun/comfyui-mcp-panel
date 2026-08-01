@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.29] - 2026-08-01
+
+### Added
+- refresh_nodes executor — force /object_info re-register on demand (#608)
+
+### Fixed
+- report EFFECTIVE widget state + stop blobs starving the node you asked for (#607, #609) (#482)
+- recover run-completion missed on unobserved reconnect (#356) + refuse false-clean empty-graph reads (#389)
+
+
 ## [0.11.28] - 2026-08-01
 
 ### Added
