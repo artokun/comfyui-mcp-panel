@@ -497,10 +497,75 @@ export async function saveActiveWorkflow(
 
   // No relocation — the target path equals the current on-disk path. Overwriting
   // the same file in place is safe (no move can occur).
+  //
+  // #442 — an in-place save can spuriously 409 ("Error storing user data file
+  // '…': 409 Conflict") over the workflow's OWN name. ComfyUI's UserFile.save()
+  // writes with `overwrite: this.isPersisted`, and `isPersisted` is a getter
+  // derived from `size` (`isTemporary = size === -1`). After a panel_open_workflow
+  // open-ack race the loaded workflow's `size` DRIFTS to -1 (#215/#226), so
+  // `isPersisted` reads false, the write goes out with overwrite:false, and the
+  // server rejects it because the file already exists. Repair the drift so the
+  // overwrite of the tab's OWN file is allowed — but ONLY on POSITIVE disk proof
+  // (existsOnDisk 200) that a file backs this exact path. We are in the
+  // NON-relocating branch (finalTargetPath === currentPath === wf.path), so this
+  // can only ever authorize overwriting the tab's own file, never a different tab's
+  // (a distinct tab has a distinct path). A 404/unknown leaves overwrite:false
+  // untouched, so a genuine first save still creates and a real collision still
+  // 409s honestly.
   assertExpect(); // #330: never in-place-overwrite a workflow the user switched to
+  // Split PROBE (async) from MUTATION (sync): the disk HEAD below awaits, so the
+  // persistence coercion must NOT run inside it. If the active tab switches during
+  // the probe, the trailing assertExpect throws — but a coercion applied before that
+  // assert would leave the FORMER tab marked persisted, and a later save of it would
+  // skip the oracle and send overwrite:true from an aborted authorization (codex P2).
+  // So: probe → assertExpect → THEN coerce synchronously, after the tab is re-verified.
+  const overwriteOwnFile = await inPlaceOverwriteAuthorized(wf, currentPath, existsOnDisk);
+  assertExpect(); // the disk probe above awaited — re-check the tab didn't switch
+  if (overwriteOwnFile) markPersistedForOverwrite(wf); // sync (post-assert) ⇒ no leak window
   recordOutcome(details, "in-place", { sourcePath: currentPath, targetPath: finalTargetPath });
   await saveInPlace(svc, wf);
   return desired || currentName || null;
+}
+
+/** #442 — PROBE (no mutation) whether an IN-PLACE save should force `overwrite:true`.
+ *  ComfyUI's UserFile.save() writes with `overwrite: this.isPersisted`, and
+ *  `isPersisted`/`isTemporary` are getters derived from `size` (`isTemporary =
+ *  size === -1`). After a panel_open_workflow open-ack race the loaded workflow's
+ *  `size` DRIFTS to -1 (#215/#226), so `isPersisted` reads false → overwrite:false →
+ *  the server 409s on the workflow's OWN existing file. Returns true ONLY when the
+ *  workflow currently reads non-persisted AND the disk oracle POSITIVELY confirms
+ *  (200) a file already backs `currentPath` — matching classifySource's "exists ⇒
+ *  persisted" stance. 404 / unknown / no oracle ⇒ false (a genuine first save keeps
+ *  overwrite:false / create, and a real collision still 409s honestly). PURE async
+ *  probe — the caller mutates only AFTER re-asserting the expected tab. */
+export async function inPlaceOverwriteAuthorized(wf, currentPath, existsOnDisk) {
+  if (!wf || wf.isPersisted === true) return false; // already overwrite:true
+  if (typeof existsOnDisk !== "function" || !currentPath) return false; // no proof ⇒ leave as-is
+  let exists = null;
+  try {
+    exists = await existsOnDisk(currentPath);
+  } catch {
+    exists = null; // probe threw ⇒ unknown ⇒ do not force an overwrite
+  }
+  return exists === true; // ONLY a CONFIRMED 200 authorizes overwriting the own file
+}
+
+/** #442 — SYNCHRONOUS mutation that clears a drifted `isTemporary` so ComfyUI's
+ *  save() uses `overwrite:true`. `isPersisted`/`isTemporary` derive from `size`
+ *  (`isTemporary = size === -1`), so the correction sets the REAL backing field
+ *  `size` to a non-(-1) value; the subsequent save() replaces it with the server's
+ *  authoritative size. Must be called ONLY after the caller re-asserted the expected
+ *  tab (it is synchronous, so no tab switch can interleave). Best-effort + getter-safe
+ *  — a frozen/derived `size` is left untouched (the assigns cover plain-object doubles). */
+export function markPersistedForOverwrite(wf) {
+  if (!wf) return;
+  try {
+    if (wf.size === -1 || wf.size == null) wf.size = 1;
+  } catch {
+    /* size not settable ⇒ best-effort */
+  }
+  safeAssign(wf, "isTemporary", false);
+  safeAssign(wf, "isPersisted", true);
 }
 
 /** Authoritative tri-state DISK probe for the post-save backstop — the ONLY evidence

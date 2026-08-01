@@ -177,6 +177,7 @@ import {
   activeStaleHint,
 } from "./lib/reconnect-staleness.js";
 import { pickRevertSnapshot } from "./lib/graph-revert.js";
+import { decideOpenStaleness } from "./lib/workflow-open-staleness.js";
 import {
   saveActiveWorkflow,
   shouldGroundBeforeTurn,
@@ -2720,6 +2721,23 @@ async function workflowExistsOnDisk(rawPath) {
     return diskExistenceFromStatus(res.status);
   } catch {
     return null; // network/other error ⇒ unknown ⇒ fail safe
+  }
+}
+
+/** #442 — the CURRENT on-disk text of a workflow's /userdata file, or null when it
+ *  can't be read (no api, non-200, or a network error). Used to detect an out-of-band
+ *  edit by comparing against the tab's loaded baseline — CONTENT, not mtime, because
+ *  the frontend's own listing sync advances a workflow's `lastModified` without
+ *  reloading its graph (which would defeat an mtime check) and timestamp-preserving
+ *  writes would evade one. Fails safe (null ⇒ no false staleness). */
+async function workflowDiskContent(rawPath) {
+  try {
+    if (!api || !rawPath || typeof api.getUserData !== "function") return null;
+    const res = await api.getUserData(rawPath);
+    if (!res || res.status !== 200) return null;
+    return await res.text();
+  } catch {
+    return null; // unknown ⇒ fail safe (no false staleness)
   }
 }
 
@@ -6990,7 +7008,28 @@ const GRAPH_TOOL_EXECUTORS = {
           `For a file outside the workflows folder, load it with panel_load_workflow path:<file>.`,
       );
     }
+    // #442 — an ALREADY-OPEN tab is repainted from its OWN in-memory buffer below,
+    // never re-read from disk. If the .json changed on disk out-of-band the canvas
+    // would silently keep the pre-edit graph and this open would report a bland
+    // success. Detect it by comparing the CURRENT on-disk bytes against the bytes the
+    // tab LOADED (its originalContent baseline) — content, not mtime, since the
+    // frontend's listing sync advances lastModified without reloading the graph. A
+    // not-yet-open tab is skipped — openWorkflow reads it fresh from disk.
+    const wasOpen = !!target.changeTracker;
+    const onDiskContent = wasOpen ? await workflowDiskContent(target.path) : null;
+    const staleInfo = decideOpenStaleness({
+      wasOpen,
+      isModified: !!target.isModified,
+      onDiskContent,
+      baselineContent: typeof target.originalContent === "string" ? target.originalContent : null,
+    });
     await s.openWorkflow(target);
+    // We deliberately do NOT auto-reload the canvas from disk here: switching to an
+    // already-open tab must not silently discard the user's in-memory graph, and a
+    // re-read could race a concurrent canvas edit and clobber it. Instead the staleness
+    // is SURFACED (below) so the caller refreshes deliberately with panel_load_workflow
+    // — exactly the recovery the issue reporter uses. The load-bearing fix is turning a
+    // SILENT stale serve into a loud, actionable signal.
     // openWorkflow sets the tab ACTIVE but does NOT repaint the canvas for an
     // ALREADY-OPEN instance — the graph load normally rides the frontend's
     // workflow *service* tab-switch, which the panel can't reach (it's a Vue
@@ -7024,6 +7063,19 @@ const GRAPH_TOOL_EXECUTORS = {
     return {
       opened: { path: target.path, filename: target.filename },
       modified: !!target.isModified,
+      // #442 — surface out-of-band staleness so a caller switching to an already-open
+      // tab is never fooled by a bland success while the canvas shows a pre-edit graph.
+      // `stale` = the on-disk file differs from what this tab loaded; the canvas still
+      // shows the LOADED version (we never auto-reload — see above). `stale_hint`
+      // tells the caller how to refresh, and whether unsaved edits are at stake.
+      ...(staleInfo.stale
+        ? {
+            stale: true,
+            stale_hint: staleInfo.reload
+              ? "The file changed on disk since this tab loaded it; the canvas still shows the loaded version. Call panel_load_workflow to load the on-disk version."
+              : "The file changed on disk since this tab loaded it, AND this tab has unsaved edits. Save first (panel_save_workflow) to keep them, or call panel_load_workflow to discard them and load the on-disk version.",
+          }
+        : {}),
     };
   },
 
