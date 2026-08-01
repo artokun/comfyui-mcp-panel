@@ -9869,6 +9869,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
   // so the panel won't lie "connected" when there's no agent behind the socket.
   let handshakeTimer = null;
   let handshakeDone = false;
+  // The exact socket INSTANCE that completed a handshake (codex). A boolean cannot express
+  // this: replays are also triggered off the command path, where the current socket may be
+  // open but not yet handshaken — or may not be an orchestrator at all. Identity closes
+  // that race, because a replacement socket is a different object.
+  let handshakenSock = null;
   // Handshake (models-frame) window AFTER the WS opens. Backend-aware: Codex's
   // app-server can still be booting its agent after the bridge accepts the socket,
   // so it gets a wider window before we treat the open socket as wedged (FIX 2).
@@ -9886,6 +9891,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
   }
   function markConnected() {
     handshakeDone = true;
+    handshakenSock = sock;
     clearHandshake();
     // Remember the user wants the agent connected, so we auto-reconnect after a
     // ComfyUI reboot / panel reopen (until they explicitly Disconnect). Mirror it
@@ -9960,6 +9966,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
    *  pending resolves it with the command's TRUE outcome instead of an OUTCOME-UNKNOWN
    *  guess. Only drained once every entry went out, so a partial replay is retried. */
   function replayLostReplies(target) {
+    // ONLY onto a socket that has proven itself with a real handshake (codex). An OPEN
+    // socket merely proves something is bound to the port — it can be a different
+    // orchestrator session at the same URL, or a non-orchestrator listener, and it can be
+    // open before its `models` frame arrives. This is checked HERE rather than only at the
+    // call sites so no future caller can bypass it; anything still journaled simply waits
+    // for markConnected().
+    if (!target || target !== handshakenSock || target.readyState !== WebSocket.OPEN) return;
     const lost = lostReplies.list();
     if (!lost.length) return;
     // The bridge THIS socket belongs to (stamped at creation), not the mutable current
@@ -10896,6 +10909,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         sock?.close();
       } catch {}
       sock = null;
+      handshakenSock = null;
       connect();
     },
     currentUrl() {
@@ -10919,6 +10933,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         sock?.close();
       } catch {}
       sock = null;
+      handshakenSock = null;
     },
     destroy() {
       closed = true;
@@ -10931,6 +10946,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         sock?.close();
       } catch {}
       sock = null;
+      handshakenSock = null;
     },
   };
 }

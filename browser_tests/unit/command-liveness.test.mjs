@@ -186,6 +186,37 @@ test("codex R11: hello summaries obey the SAME cross-bridge/age rule as the repl
   );
 });
 
+test("codex R12: replay only ever writes to a socket that PROVED itself with a handshake", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const start = src.indexOf("function replayLostReplies(target) {");
+  assert.notEqual(start, -1);
+  const body = src.slice(start, src.indexOf("\n  }", start));
+  // An OPEN socket only proves something is bound to the port — it can be a different
+  // orchestrator session at the same URL, or a non-orchestrator listener, and it can be
+  // open before its `models` frame arrives. The check lives in the function (not only at
+  // the call sites) so no caller can bypass it.
+  assert.match(
+    body,
+    /if \(!target \|\| target !== handshakenSock \|\| target\.readyState !== WebSocket\.OPEN\) return;/,
+    "replay must require the handshaken socket INSTANCE",
+  );
+  const gateAt = body.indexOf("target !== handshakenSock");
+  const sendAt = body.indexOf("target.send(");
+  assert.ok(gateAt !== -1 && sendAt !== -1 && gateAt < sendAt, "the gate must precede any write");
+  // Identity, not a boolean: a replacement socket is a different object, which is what
+  // closes the "open but not yet handshaken" race.
+  assert.match(src, /handshakenSock = sock;/, "markConnected must record the proven instance");
+  const markConnected = src.slice(src.indexOf("function markConnected() {"));
+  const recordAt = markConnected.indexOf("handshakenSock = sock;");
+  const replayAt = markConnected.indexOf("replayLostReplies(sock);");
+  assert.ok(recordAt !== -1 && replayAt !== -1 && recordAt < replayAt, "record the instance, then replay");
+  // Dropping the socket must forget it too.
+  assert.ok(
+    (src.match(/handshakenSock = null;/g) || []).length >= 3,
+    "setUrl/stop/destroy must all forget the proven socket",
+  );
+});
+
 test("codex R11: the tracker re-baseline aborts if exclusivity was lost across its own frame", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const start = src.indexOf("async function clearSpuriousOpenModified(wf");
