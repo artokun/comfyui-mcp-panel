@@ -121,6 +121,8 @@ import {
   computeOrphanedBoundaries,
 } from "./lib/subgraph-scope.js";
 import { runSetWidget } from "./lib/set-widget.js";
+import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
+import { safeRemoveNode } from "./lib/safe-remove-node.js";
 import {
   controlAfterGenerateModes,
   controlAfterGenerateEntries,
@@ -3584,6 +3586,15 @@ let lastAgentGraph = null;
 // same-workflow events and would otherwise drop a real manual edit made across a
 // save/rename as a spurious "different workflow".
 let lastAgentGraphKey = null;
+// #369: the SESSION-BINDING generation the baseline was captured in. sessionEpoch is
+// bumped on every orchestrator socket (re)connect (see the bridge client's "open"
+// handler) — i.e. on a reconnect / session resume / reload. The manual-change diff is
+// trusted ONLY when the baseline's epoch still matches the current one; a baseline
+// captured before a session boundary is discarded (reseeded) rather than diffed
+// against a possibly rebound / mid-reload canvas, which previously produced a false
+// "100+ nodes removed" notice that the very next live graph read contradicted.
+let lastAgentGraphEpoch = -1;
+let sessionEpoch = 0;
 
 const MODE_NAME = { 0: "active", 2: "mute", 4: "bypass" };
 const modeName = (m) => MODE_NAME[m] ?? `mode${m ?? 0}`;
@@ -3724,19 +3735,41 @@ function manualChangeBanner() {
   } catch {
     return "";
   }
-  // If the active workflow is not the one the snapshot came from, the user
-  // switched tabs — do NOT diff two different graphs (that produces a bogus
-  // "manual edits" list, #348/#198). Reseed to the now-active graph and tell the
-  // agent to re-read, rather than asserting a false ground-truth delta.
   let currKey = null;
   try {
     currKey = workflowStableUuid();
   } catch {
     currKey = null;
   }
-  if (lastAgentGraphKey && currKey && currKey !== lastAgentGraphKey) {
+  // Gate the diff (#369, #348/#198): only diff when the baseline was captured in the
+  // SAME session generation (no reconnect / resume / reload since) AND the bound
+  // workflow's identity is confirmed unchanged. Otherwise reseed silently (stale
+  // epoch / unknown identity) or emit a workflow-switch notice — never a bogus
+  // per-node delta between two different or stale-vs-live graphs.
+  const reseed = () => {
     lastAgentGraph = curr;
     lastAgentGraphKey = currKey;
+    lastAgentGraphEpoch = sessionEpoch;
+  };
+  const decision = classifyManualChangeBaseline({
+    hasBaseline: true,
+    baselineKey: lastAgentGraphKey,
+    baselineEpoch: lastAgentGraphEpoch,
+    currentKey: currKey,
+    currentEpoch: sessionEpoch,
+  });
+  if (decision.action === "reseed") {
+    // A session boundary was crossed since the baseline was captured, or the
+    // workflow identity can't be confirmed — adopt the current graph as the new
+    // baseline WITHOUT asserting a (false) delta.
+    reseed();
+    return "";
+  }
+  if (decision.action === "workflow-changed") {
+    // The active workflow is not the one the baseline came from — the user switched
+    // tabs. Reseed and tell the agent to re-read rather than diff two different
+    // graphs (that produced a bogus "manual edits" list, #348/#198).
+    reseed();
     return (
       `⟳ ACTIVE WORKFLOW CHANGED since your last turn. ` +
       `The canvas you're now bound to is a DIFFERENT workflow — your remembered ` +
@@ -3744,8 +3777,7 @@ function manualChangeBanner() {
     );
   }
   const lines = diffGraphsForAgent(lastAgentGraph, curr, live);
-  lastAgentGraph = curr;
-  lastAgentGraphKey = currKey;
+  reseed();
   if (!lines.length) return "";
   const MAX = 40;
   const shown = lines.slice(0, MAX);
@@ -5257,7 +5289,11 @@ const GRAPH_TOOL_EXECUTORS = {
     let removedOk = false;
     graph.beforeChange();
     try {
-      graph.remove(node);
+      // #420: robust against the intermittent litegraph link-disconnect crash
+      // ("t.findInputSlot is not a function") seen on rapid batched removals — on a
+      // first-attempt throw it severs this node's links via the record path and
+      // retries once, instead of aborting the removal.
+      safeRemoveNode(graph, node);
       // graph.remove() is a NO-OP for protected nodes (ignore_remove). Only prune
       // (and report success) once the node has ACTUALLY left the graph — otherwise
       // we would delete boundary slots still connected to a surviving node.
@@ -5289,7 +5325,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // than graph.clear(): the whole wipe becomes a single Ctrl+Z step.
     graph.beforeChange();
     try {
-      for (const node of nodes) graph.remove(node);
+      // #420: same robust removal as graph_remove_node — clearing IS a batch, the
+      // exact condition that intermittently throws "t.findInputSlot is not a
+      // function" mid-disconnect on some litegraph builds.
+      for (const node of nodes) safeRemoveNode(graph, node);
     } finally {
       graph.afterChange();
     }
@@ -8279,6 +8318,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
 
     sock.addEventListener("open", () => {
       handshakeDone = false;
+      // #369: a new orchestrator socket is a (re)connect / session-resume boundary.
+      // Bump the session generation so the manual-change tracker discards any
+      // baseline captured before this boundary instead of diffing it against a
+      // possibly rebound / mid-reload canvas (a false "manual edits" delta).
+      sessionEpoch++;
       // A bare WS open is NOT progress — the orchestrator handshake (`models`)
       // hasn't arrived yet. Do NOT reset attempt/gaveUp here (only markConnected
       // does), so an open-then-close-before-`models` cycle still INCREMENTS toward
@@ -15012,6 +15056,10 @@ function buildPanel() {
           } catch {
             lastAgentGraphKey = null;
           }
+          // Stamp the session generation this baseline belongs to (#369): the next
+          // turn's diff is trusted only if no reconnect/resume/reload has happened
+          // since (sessionEpoch unchanged).
+          lastAgentGraphEpoch = sessionEpoch;
         } catch {}
       }
     },
