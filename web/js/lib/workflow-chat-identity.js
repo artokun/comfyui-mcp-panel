@@ -55,11 +55,24 @@ export function shouldForkEmbeddedWorkflowUuid({
  *
  *  A rare legacy single-tab restore (a string 4th arg, no openSource) is treated as a
  *  creation and re-mints — harmless: it already forks into a fresh temporary, and the
- *  common multi-tab reload passes an object so it is never misclassified. */
+ *  common multi-tab reload passes an object so it is never misclassified.
+ *
+ *  FAIL SAFE (bias to fork): a REUSE is recognized ONLY when the 4th arg is genuinely a
+ *  ComfyWorkflow — a non-array object exposing a string `path` (every open workflow,
+ *  including a temporary "workflows/Unsaved Workflow.json", has one). Anything else — a
+ *  primitive, an array, or an unrecognized/mis-shaped object — is treated as a CREATION.
+ *  A mis-classified reuse only loses durability (P1, a fresh session); a mis-classified
+ *  creation that INHERITED the source identity would be a wrong-resume (P0) — so, faced
+ *  with an ambiguous arg, fork. */
 export function isWorkflowCreationLoad({ workflowArg, openSource, noFork = false } = {}) {
   if (noFork) return false;
   if (openSource != null) return true;
-  return !(workflowArg !== null && typeof workflowArg === "object");
+  const looksLikeWorkflow =
+    workflowArg !== null &&
+    typeof workflowArg === "object" &&
+    !Array.isArray(workflowArg) &&
+    typeof workflowArg.path === "string";
+  return !looksLikeWorkflow;
 }
 
 /** Every identity string the ACTIVE workflow answers to, for pinned-target

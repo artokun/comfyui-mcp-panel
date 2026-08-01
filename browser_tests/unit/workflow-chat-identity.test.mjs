@@ -37,6 +37,17 @@ test('#570 the panel\'s own same-workflow reload opts out via noFork (snapshot r
   assert.equal(isWorkflowCreationLoad({ workflowArg: 'x.json', openSource: 'file_button', noFork: true }), false)
 })
 
+test('#570 FAIL-SAFE: an unrecognized/mis-shaped object 4th arg is forked (bias to fork)', () => {
+  // A real reuse passes a ComfyWorkflow with a string `path`; anything else — an object
+  // WITHOUT a path, or an array — is ambiguous and must fork rather than risk inheriting.
+  assert.equal(isWorkflowCreationLoad({ workflowArg: {} }), true)
+  assert.equal(isWorkflowCreationLoad({ workflowArg: { notAPath: 1 } }), true)
+  assert.equal(isWorkflowCreationLoad({ workflowArg: { path: 123 } }), true) // path not a string
+  assert.equal(isWorkflowCreationLoad({ workflowArg: [] }), true)
+  // Only a ComfyWorkflow-shaped object (string path) is trusted as a reuse.
+  assert.equal(isWorkflowCreationLoad({ workflowArg: { path: 'workflows/x.json' } }), false)
+})
+
 test('normalizes Windows paths for stable identity comparisons', () => {
   assert.equal(
     normalizedWorkflowPath('Workflows\\Portrait.JSON'),
