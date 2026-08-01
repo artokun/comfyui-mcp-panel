@@ -190,6 +190,12 @@ export function openSidePanel(ctx = {}, opts = {}) {
   overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
   closeBtn.addEventListener("click", close);
   _onEscape = (e) => {
+    // A composing CJK IME's Escape CANCELS the candidate window; it bubbles here
+    // from the shared search input, and closing the whole side panel (losing the
+    // browsing/filter session) on that keystroke is wrong (#385). Let the IME
+    // own it — the search-input guard returns without stopPropagation, so this
+    // document-level handler is the one that must yield.
+    if (isImeComposing(e)) return;
     if (e.key !== "Escape") return;
     // Yield to a content-owned stacked layer (the Civitai lightbox / sub-modals).
     const active = contents.get(activeKey);
