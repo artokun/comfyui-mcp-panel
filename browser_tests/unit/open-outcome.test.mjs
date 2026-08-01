@@ -317,9 +317,9 @@ test("#402 wiring: workflow_open journals BOTH outcomes, and every early throw i
 test("#442 defect-2 wiring: the re-read is gated on a FRESH dirty re-check (no silent data loss)", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const body = handlerBody(src, "async workflow_open({");
-  const dirtyAt = body.indexOf("const dirtyNow = !!target.isModified;");
-  const decideAt = body.indexOf("const staleInfo = decideOpenStaleness({");
-  const reloadAt = body.indexOf("if (staleInfo.reload && !dirtyNow)");
+  const dirtyAt = body.indexOf("dirtyNow = !!target.isModified;");
+  const decideAt = body.indexOf("staleInfo = decideOpenStaleness({");
+  const reloadAt = body.indexOf("if (staleInfo.reload && !dirtyNow");
   assert.notEqual(dirtyAt, -1, "isModified must be re-read after the disk await, not reused from before it");
   assert.notEqual(reloadAt, -1, "the re-read must be gated");
   assert.ok(dirtyAt < decideAt && decideAt < reloadAt, "order: re-check dirty → decide → maybe reload");
@@ -338,18 +338,29 @@ test("#442 codex P1: the destructive re-read freezes canvas interaction and ALWA
   // The clean sample authorizes the load, but loadGraphData is awaited — an edit made
   // while it yields would be destroyed by a reload nobody asked for.
   const lockAt = body.indexOf("canvasView.allow_interaction = false;");
+  const firstRebaselineAt = body.indexOf("await clearSpuriousOpenModified(target);");
   const loadAt = body.indexOf("await app.loadGraphData(diskGraph");
   const rebaselineAt = body.indexOf("await clearSpuriousOpenModified(target);", loadAt);
   const restoreAt = body.indexOf("canvasView.allow_interaction = priorInteraction;");
   assert.ok(lockAt !== -1 && loadAt !== -1 && restoreAt !== -1, "the load must be bracketed by an interaction lock");
   // clearSpuriousOpenModified awaits a frame and then RE-BASELINES the change tracker, so
-  // an edit made during it would be adopted as "not modified" and later dropped silently.
-  // The freeze must therefore cover the re-baseline too, not just the load (codex).
+  // an edit made during it is absorbed as the new CLEAN baseline — which would make the
+  // dirty gate read false and authorize the reload to overwrite that edit. The freeze must
+  // therefore start BEFORE the FIRST (post-switch) re-baseline, not just before the load,
+  // and must still be held across the second one (codex R2 + R4).
+  assert.notEqual(firstRebaselineAt, -1, "the open must re-baseline after its repaint");
   assert.notEqual(rebaselineAt, -1, "the reload must re-baseline the change tracker");
   assert.ok(
-    lockAt < loadAt && loadAt < rebaselineAt && rebaselineAt < restoreAt,
-    "lock → load → re-baseline → restore (the freeze must span the re-baseline)",
+    lockAt < firstRebaselineAt,
+    "the freeze must start before the FIRST re-baseline, whose frame could otherwise absorb an edit",
   );
+  assert.ok(
+    firstRebaselineAt < loadAt && loadAt < rebaselineAt && rebaselineAt < restoreAt,
+    "lock → repaint/re-baseline → disk decision → load → re-baseline → restore",
+  );
+  // The dirty sample must live INSIDE the frozen region.
+  const dirtySampleAt = body.indexOf("dirtyNow = !!target.isModified;");
+  assert.ok(lockAt < dirtySampleAt && dirtySampleAt < restoreAt, "the dirty sample must be taken under the freeze");
   // The restore must live in a `finally`, so a throwing load can never strand a frozen canvas.
   const tail = body.slice(loadAt, restoreAt + 200);
   assert.match(tail, /\} finally \{[\s\S]*allow_interaction = priorInteraction;/, "the restore must be in a finally");
@@ -417,4 +428,10 @@ test("#402 wiring: workflow_list exposes the receipt + the POSITIVE trust flag",
   assert.match(body, /active_confirmed: !activeMaybeStale/, "trust must be reported positively, not inferred from silence");
   assert.match(body, /last_open: lastOpen/, "the last open receipt must be reachable after a lost reply");
   assert.match(body, /summarizeOpenReceipt\(latestOpenReceipt\(openReceipts\)/);
+  // The consumer is in ANOTHER process, so the reading rule ships WITH the data — a
+  // receipt that merely names the right workflow is the most over-readable thing here.
+  assert.match(body, /answers_only_command_rid: lastOpenReceipt\.rid/);
+  assert.match(body, /interpretation:/, "last_open must state how it may be read");
+  assert.match(body, /answers ONLY for the command/);
+  assert.match(body, /do not infer success from `active` matching your target/);
 });
