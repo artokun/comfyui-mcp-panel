@@ -3167,12 +3167,17 @@ function nextFrame() {
  *  (changeTracker.reset(); isModified = false), minus the disk write — opening
  *  from disk means the loaded graph already IS the saved state. Best-effort +
  *  feature-detected; never throws. */
-async function clearSpuriousOpenModified(wf) {
+async function clearSpuriousOpenModified(wf, { stillOwns } = {}) {
   if (!wf) return;
   try {
     // Wait for the load's post-render state capture to settle, otherwise we'd
     // re-baseline before the spurious modification is recorded.
     await nextFrame();
+    // codex — the re-baseline below CAPTURES the current canvas and forces isModified=false,
+    // so it must not run once the caller has lost its exclusive window: an edit made in this
+    // very frame would be adopted as the new clean baseline and could later be discarded
+    // with no conflict shown. Checking before the await is not enough — the frame IS the gap.
+    if (typeof stillOwns === "function" && !stillOwns()) return;
     const ct = wf.changeTracker;
     // Bring activeState up to date with the loaded graph, then make that the
     // baseline so initialState === activeState (graphEqual → not modified).
@@ -7786,7 +7791,9 @@ const GRAPH_TOOL_EXECUTORS = {
         // still held exclusivity. Leaving the tab spuriously "modified" is cosmetic; racing
         // a concurrent edit is not.
         if (!wasDirty && ownsWorkflowReloadGuard(reloadGuardToken)) {
-          await clearSpuriousOpenModified(target);
+          await clearSpuriousOpenModified(target, {
+            stillOwns: () => ownsWorkflowReloadGuard(reloadGuardToken),
+          });
         }
         // #433: an explicit open authoritatively re-points `active` — record it against
         // the epoch we STARTED on, but only if no reconnect intervened during the async
@@ -7883,20 +7890,31 @@ const GRAPH_TOOL_EXECUTORS = {
           // that asked for the open. The flag keeps the LIVE OBJECT's identity (the
           // non-forgeable source) and stamps it over whatever the file carried.
           await app.loadGraphData(diskGraph, true, true, target, { __cmcpKeepInstance: true });
-          // The tab now holds exactly the on-disk bytes — re-baseline so this same change
-          // isn't re-reported as stale forever. Best-effort: `originalContent` is a plain
-          // field on current builds but may be getter-only elsewhere.
-          try {
-            target.originalContent = onDiskContent;
-          } catch {
-            /* getter-only — the stale flag simply re-reports until the next save */
-          }
-          // A programmatic load dirties the change tracker; clear that so the re-read does
-          // not leave the tab looking edited (which would block an unforced close). Still
-          // inside the freeze — it re-baselines, so an edit made during its frame would be
-          // adopted as "not modified" and could later be discarded without a prompt.
-          await clearSpuriousOpenModified(target);
+          // The reload HAPPENED — record that before anything else can fail. Understating a
+          // completed destructive act would be its own lie.
           reloaded = true;
+          if (ownsWorkflowReloadGuard(reloadGuardToken)) {
+            // The tab now holds exactly the on-disk bytes — re-baseline so this same change
+            // isn't re-reported as stale forever. Best-effort: `originalContent` is a plain
+            // field on current builds but may be getter-only elsewhere.
+            try {
+              target.originalContent = onDiskContent;
+            } catch {
+              /* getter-only — the stale flag simply re-reports until the next save */
+            }
+            // A programmatic load dirties the change tracker; clear that so the re-read does
+            // not leave the tab looking edited (which would block an unforced close). Still
+            // inside the freeze, and ownership-aware across its own frame.
+            await clearSpuriousOpenModified(target, {
+              stillOwns: () => ownsWorkflowReloadGuard(reloadGuardToken),
+            });
+          } else {
+            // Lost exclusivity while the load was in flight. The canvas IS the on-disk
+            // version, but we must not re-baseline over whatever ran in the meantime.
+            reloadError =
+              "the canvas was reloaded from the on-disk file, but the panel lost its exclusive " +
+              "window before it could re-baseline the tab, so the tab may still show as modified";
+          }
         }
       }
     } catch (err) {
@@ -7945,7 +7963,8 @@ const GRAPH_TOOL_EXECUTORS = {
             ...(reloaded
               ? {
                   stale_hint:
-                    "The file had changed on disk since this tab loaded it, and this tab had no unsaved edits, so the canvas was RELOADED from the on-disk version. Re-read the graph (panel_graph_outline / panel_query_graph) — node ids and geometry may differ from before.",
+                    "The file had changed on disk since this tab loaded it, and this tab had no unsaved edits, so the canvas was RELOADED from the on-disk version. Re-read the graph (panel_graph_outline / panel_query_graph) — node ids and geometry may differ from before." +
+                    (reloadError ? ` NOTE: ${reloadError}.` : ""),
                 }
               : dirtyNow || wasDirty
                 ? {
@@ -10637,7 +10656,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // #508 — command outcomes this tab produced but could NOT send back. Advertised
             // so the other end can say "the tab answered and the reply was lost" instead of
             // asserting the unestablished "the tab may be backgrounded or frozen".
-            lostReplies: lostReplies.summaries(),
+            // Same cross-bridge/age rule the replay uses (codex): these summaries ride the
+            // hello, so an unfiltered list would tell a bridge that never owned these
+            // commands their ids, names and outcomes even though the replies are withheld.
+            lostReplies: lostReplies.summaries({
+              now: Date.now(),
+              targetUrl: sock?.__cmcpBridgeUrl ?? url,
+            }),
           }),
         ),
       );

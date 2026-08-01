@@ -407,9 +407,9 @@ test("#442 codex P1: the destructive re-read freezes canvas interaction and ALWA
   // The clean sample authorizes the load, but loadGraphData is awaited — an edit made
   // while it yields would be destroyed by a reload nobody asked for.
   const lockAt = body.indexOf("canvasView.allow_interaction = false;");
-  const firstRebaselineAt = body.indexOf("await clearSpuriousOpenModified(target);");
+  const firstRebaselineAt = body.indexOf("await clearSpuriousOpenModified(target, {");
   const loadAt = body.indexOf("await app.loadGraphData(diskGraph");
-  const rebaselineAt = body.indexOf("await clearSpuriousOpenModified(target);", loadAt);
+  const rebaselineAt = body.indexOf("await clearSpuriousOpenModified(target, {", loadAt);
   const restoreAt = body.indexOf("canvasView.allow_interaction = priorInteraction;");
   assert.ok(lockAt !== -1 && loadAt !== -1 && restoreAt !== -1, "the load must be bracketed by an interaction lock");
   // clearSpuriousOpenModified awaits a frame and then RE-BASELINES the change tracker, so
@@ -453,7 +453,7 @@ test("#442 codex R7: a tab that arrived DIRTY is never re-baselined and never re
   assert.ok(wasDirtyAt < openAt, "…BEFORE any await, since it cannot be recovered afterwards");
   assert.match(
     body,
-    /if \(!wasDirty && ownsWorkflowReloadGuard\(reloadGuardToken\)\) \{[\s\S]{0,80}?await clearSpuriousOpenModified\(target\);/,
+    /if \(!wasDirty && ownsWorkflowReloadGuard\(reloadGuardToken\)\) \{[\s\S]{0,80}?await clearSpuriousOpenModified\(target, \{/,
     "a genuinely dirty tab must never be re-baselined, nor one we no longer hold exclusively",
   );
   // BOTH reload gates must require the pre-open snapshot to be clean too.

@@ -161,6 +161,44 @@ test("codex R10: isReplayable demands the SAME bridge and a recent entry, and fa
   assert.equal(isReplayable({ url: URL_A, at: NaN }, { now, targetUrl: URL_A }), false);
 });
 
+test("codex R11: hello summaries obey the SAME cross-bridge/age rule as the replay", () => {
+  // The summaries ride the hello, so an unfiltered list would tell a bridge that never
+  // owned these commands their ids, names and outcomes — even though replayLostReplies
+  // correctly withholds the replies themselves.
+  const j = createLostReplyJournal();
+  const now = 1_000_000;
+  j.record({ reply: { rid: "mine", ok: true }, cmd: "graph_outline", at: now - 1000, url: "ws://a" });
+  j.record({ reply: { rid: "theirs", ok: true }, cmd: "graph_outline", at: now - 1000, url: "ws://b" });
+  j.record({ reply: { rid: "ancient", ok: true }, cmd: "graph_outline", at: now - REPLAY_MAX_AGE_MS - 1, url: "ws://a" });
+  assert.deepEqual(
+    j.summaries({ now, targetUrl: "ws://a" }).map((e) => e.rid),
+    ["mine"],
+    "only this bridge's recent outcomes may be advertised",
+  );
+  // No target ⇒ unfiltered (the journal's own bookkeeping view).
+  assert.equal(j.summaries().length, 3);
+
+  const src = readFileSync(PANEL_JS, "utf8");
+  assert.match(
+    src,
+    /lostReplies\.summaries\(\{\s*\n\s*now: Date\.now\(\),\s*\n\s*targetUrl: sock\?\.__cmcpBridgeUrl \?\? url,\s*\n\s*\}\)/,
+    "sendHello must filter the summaries by THIS socket's bridge",
+  );
+});
+
+test("codex R11: the tracker re-baseline aborts if exclusivity was lost across its own frame", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const start = src.indexOf("async function clearSpuriousOpenModified(wf");
+  assert.notEqual(start, -1);
+  const body = src.slice(start, start + 1400);
+  const frameAt = body.indexOf("await nextFrame();");
+  const guardAt = body.indexOf('if (typeof stillOwns === "function" && !stillOwns()) return;');
+  const captureAt = body.indexOf("captureCanvasState");
+  assert.ok(frameAt !== -1 && guardAt !== -1 && captureAt !== -1);
+  // Checking before the await is not enough — the frame IS the gap in which an edit lands.
+  assert.ok(frameAt < guardAt && guardAt < captureAt, "the ownership check must sit AFTER the frame");
+});
+
 test("the journal's replace() keeps only what it is given, still bounded", () => {
   const j = createLostReplyJournal({ cap: 3 });
   for (let i = 0; i < 3; i++) j.record({ reply: { rid: `r${i}`, ok: true }, cmd: "graph_outline" });

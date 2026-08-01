@@ -158,9 +158,15 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
       return entries.slice();
     },
     /** Wire summaries — the raw `reply` payload is NOT included (it can be large, and for
-     *  a sensitive command it is exactly what must not travel). */
-    summaries() {
-      return entries.map(({ rid, cmd, ok, reason, at }) => ({ rid, cmd, ok, reason, at }));
+     *  a sensitive command it is exactly what must not travel).
+     *
+     *  Pass `{ now, targetUrl }` to apply the SAME cross-bridge/age rule the replay uses
+     *  (codex): the summaries ride the hello, so without this a bridge that never owned
+     *  these commands would still learn their ids, names and outcomes even though the
+     *  replies themselves are correctly withheld. */
+    summaries({ now, targetUrl } = {}) {
+      const visible = targetUrl ? entries.filter((e) => isReplayable(e, { now, targetUrl })) : entries;
+      return visible.map(({ rid, cmd, ok, reason, at }) => ({ rid, cmd, ok, reason, at }));
     },
     /** Take everything and empty the journal (used when replaying onto a new socket, so
      *  a replay can never loop). */
