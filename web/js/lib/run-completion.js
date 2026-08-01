@@ -703,6 +703,19 @@ export function createRunCompletionTracker({
       return starts.get(key(id));
     },
 
+    /**
+     * True while ANY run's completion has not yet been confirmed delivered — i.e.
+     * the recovery ledger is non-empty. Drives the panel's periodic SAFETY-SWEEP
+     * reconcile (panel#356 Bug 2): the reconnect reconcile is EDGE-triggered
+     * (ComfyUI `reconnected` / bridge back), so a completion that lands during an
+     * UNOBSERVED WS reconnect in an idle gap between agent turns is never recovered.
+     * A sweep that re-runs `reconcile()` while this stays true closes that hole, and
+     * self-disarms the instant the ledger drains (so an idle panel keeps no timer).
+     */
+    hasPending() {
+      return pending.size > 0;
+    },
+
     // Introspection for tests / diagnostics.
     _active: active,
     _buffers: buffers,

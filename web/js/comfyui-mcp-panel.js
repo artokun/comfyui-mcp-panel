@@ -188,6 +188,8 @@ import {
 } from "./lib/workflow-save.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
+import { createRunReconcileSweep } from "./lib/run-reconcile-sweep.js";
+import { activeWorkflowNodeCount, graphReadDesynced } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
 import { queueMembership, historyEntryFor } from "./lib/history-reconcile.js";
 import {
@@ -214,6 +216,20 @@ let api = null;
 // queued prompt_id for #370 reconnect reconciliation, even though the tracker
 // lives in buildPanel's closure.
 let runCompletionRef = null;
+// panel#356 Bug 2: arms the periodic run-completion SAFETY SWEEP. The reconnect
+// reconcile is EDGE-triggered only (ComfyUI `reconnected` / bridge back); if the
+// ComfyUI WS silently drops and reopens during an idle gap between agent turns
+// WITHOUT firing `reconnected`, the terminal `execution_success` is missed and no
+// edge fires — the run finishes, images paint for the user, but the agent is never
+// notified and stalls indefinitely. The graph_run handler calls this the instant a
+// prompt is queued so the sweep re-reconciles pending runs against /history until
+// they drain. Set in buildPanel; null while unmounted.
+let armRunReconcileSweepRef = null;
+// How often the safety sweep re-reconciles while any run is still pending delivery.
+// Only runs while `hasPending()` is true (self-disarming), so an idle panel carries
+// no perpetual timer; a redundant sweep is harmless (reconcile is idempotent — the
+// delivered/terminal fences make double-delivery unreachable).
+const RUN_RECONCILE_SWEEP_MS = 20000;
 
 // Execution-error capture so graph_get_errors can report the most recent failure
 // even if it predates the agent's question. Wired once `api` is ready (via
@@ -3352,6 +3368,33 @@ function getGraphCtx() {
   return { app, graph, rootGraph: app.graph, canvas: app.canvas, LG };
 }
 
+// panel#389: a graph READ can land while the live root graph is bound to a
+// DIFFERENT, empty graph object than the one the active workflow describes (a
+// load / tab-switch / post-reconnect canvas rebuild that left the read on an empty
+// graph). The read then returns `node_count: 0` while the workflow service still
+// reports the workflow active with red missing-model nodes — a silent false-clean
+// that misleads the agent (e.g. into telling the user to ignore genuinely-wired red
+// nodes). Detect that provable desync from the active workflow's OWN serialized
+// node count and THROW an actionable, recoverable error instead of returning the
+// misleading empty graph — mirroring #587's "reads throw on a dead binding rather
+// than return empty". Fail-safe: fires ONLY when the workflow reports N>0 nodes at
+// ROOT scope while the live root graph is empty, so a genuinely-empty / brand-new
+// workflow (and any descended-into empty subgraph) reads `node_count: 0` as before.
+function assertGraphBoundToActiveWorkflow(graph, rootGraph) {
+  const liveNodeCount = rootGraph?._nodes?.length ?? 0;
+  const inSubgraph = !!rootGraph && graph !== rootGraph;
+  const activeWorkflow = activeWorkflowRef();
+  if (graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph })) {
+    const expected = activeWorkflowNodeCount(activeWorkflow);
+    throw new Error(
+      `The live graph is out of sync with the active workflow: the workflow reports ${expected} node(s) ` +
+        `but the canvas graph is empty. A load, tab switch, or reconnect left this read bound to an empty ` +
+        `graph, so an empty/clean result here would be WRONG. Re-open the active workflow tab ` +
+        `(panel_open_workflow) or reload the panel to rebind the graph, then retry.`,
+    );
+  }
+}
+
 /** Reach a Pinia store by id. Pinia attaches itself as `$pinia` on the Vue app's
  *  globalProperties; the Vue app instance hangs off its mount element (#vue-app)
  *  as `__vue_app__`; `_s` is pinia's id→store map. Returns null if unavailable. */
@@ -4716,7 +4759,10 @@ const GRAPH_TOOL_EXECUTORS = {
   // Far cheaper to read than the full JSON state, and shows the WIRING (which the
   // raw node dump makes you reconstruct). Read-only.
   graph_outline() {
-    const { graph } = getGraphCtx();
+    const { graph, rootGraph } = getGraphCtx();
+    // panel#389: refuse a false-clean empty read when the live graph is desynced
+    // from the active workflow (empty canvas graph while the workflow reports nodes).
+    assertGraphBoundToActiveWorkflow(graph, rootGraph);
     // #429: geometric group membership is tested boundingRect-first, so resync every
     // node's cached rect to its live pos/size BEFORE computing membership — a node
     // moved by a path the panel didn't own (paste/load/manual drag) otherwise reports
@@ -6500,6 +6546,15 @@ const GRAPH_TOOL_EXECUTORS = {
         runCompletionRef?.onQueued(pid);
       } catch {}
     }
+    // panel#356 Bug 2: kick the periodic safety-sweep reconcile now that a run is
+    // pending, so a completion landing during an UNOBSERVED WS reconnect (idle gap,
+    // no `reconnected` edge) is still recovered. No-op if the sweep is already armed
+    // or the ledger is empty; self-disarms when every pending run drains.
+    if (queuedPromptIds.length) {
+      try {
+        armRunReconcileSweepRef?.();
+      } catch {}
+    }
     // Verdict from BOTH channels: the captured top-level rejection (#358) and the
     // per-node errors the frontend stashed. null ⇒ genuinely accepted.
     const rejection = summarizePromptRejection({
@@ -6588,7 +6643,12 @@ const GRAPH_TOOL_EXECUTORS = {
     // would otherwise mix the pre-await graph's nodes/red flags with the new workflow's
     // asset+validation state, fabricating and omitting per-node errors (codex round-9 P1).
     // Reading it here binds every downstream surface to ONE consistent post-await graph.
-    const { app: comfy, graph } = getGraphCtx();
+    const { app: comfy, graph, rootGraph } = getGraphCtx();
+    // panel#389: refuse a false-clean empty read when the live graph is desynced
+    // from the active workflow (empty canvas graph while the workflow reports nodes)
+    // — otherwise get_errors reports "no errors" for a workflow whose red nodes the
+    // agent then wrongly tells the user to ignore.
+    assertGraphBoundToActiveWorkflow(graph, rootGraph);
     const nodes = graph._nodes ?? [];
     const byId = new Map(nodes.map((n) => [String(n.id), n]));
     const reasons = new Map();
@@ -16389,6 +16449,25 @@ function buildPanel() {
     return reconcileInFlight;
   }
 
+  // panel#356 Bug 2: periodic SAFETY SWEEP. reconcileRunsAfterReconnect only fires
+  // on an OBSERVED reconnect edge (ComfyUI `reconnected` / bridge back). If the
+  // ComfyUI WS silently drops and reopens during an idle gap between agent turns
+  // WITHOUT ComfyUI emitting `reconnected` (background-tab throttling, a socket the
+  // client library swaps on a visibility change), the terminal `execution_success`
+  // is missed and NO edge fires — the run completes, images paint for the user, but
+  // no `agent_event` is ever sent and the agent stalls forever. This sweep re-runs
+  // the SAME /history reconcile on a timer while any run is still pending delivery,
+  // so such a completion is recovered even with no reconnect edge. Self-disarming +
+  // dispose-safe (an unmount landing mid-await can't resurrect it — see the lib).
+  const runReconcileSweep = createRunReconcileSweep({
+    hasPending: () => runCompletion.hasPending(),
+    reconcile: () => reconcileRunsAfterReconnect(),
+    onSweepError: (err) => console.warn("[cmcp] run reconcile sweep failed:", err),
+    intervalMs: RUN_RECONCILE_SWEEP_MS,
+  });
+  const armRunReconcileSweep = () => runReconcileSweep.arm();
+  armRunReconcileSweepRef = armRunReconcileSweep;
+
   function onExecuted(ev) {
     const d = ev?.detail ?? {};
     const out = d.output || {};
@@ -19155,6 +19234,14 @@ function buildPanel() {
       } catch {
         // already detached
       }
+      // panel#356 Bug 2: dispose the run-completion safety sweep and drop the module-
+      // level hooks so a torn-down panel can't keep reconciling. dispose() also stops
+      // an in-flight sweep from re-arming even if the unmount lands DURING its async
+      // reconcile await (codex P1 unmount-resurrection leak). Only null the shared
+      // refs if they still point at THIS instance — a newer mount may already own them.
+      runReconcileSweep.dispose();
+      if (armRunReconcileSweepRef === armRunReconcileSweep) armRunReconcileSweepRef = null;
+      if (runCompletionRef === runCompletion) runCompletionRef = null;
       // Drop the Settings→panel hooks so the dialog can't drive a torn-down panel
       // (a freshly-mounted panel re-registers them).
       panelHooks.applyBackend = null;
