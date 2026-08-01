@@ -99,6 +99,7 @@ import {
   isWorkflowCreationLoad,
   normalizedWorkflowPath,
   shouldForkEmbeddedWorkflowUuid,
+  trustedUnsavedEmbeddedUuid,
   workflowAliasForPath,
   workflowIdentityForms,
 } from "./lib/workflow-chat-identity.js";
@@ -968,6 +969,13 @@ const _workflowUuidOwners = new Map();
 const WORKFLOW_UUID_ALIASES_KEY = "comfyui-mcp.panel.workflowUuidAliases";
 const WORKFLOW_META_NAMESPACE = "comfyui_mcp";
 const WORKFLOW_UUID_FIELD = "workflow_uuid";
+// #570 P0b — marker proving the embedded uuid was MINTED by our fork mechanism (the
+// create-boundary loadGraphData wrapper, or the unsaved-branch fork), so it is a UNIQUE
+// per-instance identity. A pre-rollout/legacy embedded uuid (written by the old transcript
+// recorder, which never set this) may be a DUPLICATE carried by a copied/imported graph —
+// a creation-time-only fork can't repair those, so on load of an UNSAVED graph we trust the
+// embedded uuid ONLY when this marker is present, and otherwise FORK to a fresh identity.
+const WORKFLOW_UUID_OWNED_FIELD = "workflow_uuid_forked";
 const WORKFLOW_PATH_FIELD = "workflow_path";
 let _workflowUuidAliases = (() => {
   try {
@@ -1058,6 +1066,14 @@ function embeddedWorkflowUuid(wf = activeWorkflowRef()) {
   return typeof id === "string" && id ? id : null;
 }
 
+// #570 P0b — true only when the embedded uuid carries our fork-ownership marker (minted by
+// the create-boundary wrapper or the unsaved-branch fork). A legacy/pre-rollout embed lacks
+// it, so it must not be trusted as a unique per-instance identity.
+function embeddedWorkflowUuidOwned(wf = activeWorkflowRef()) {
+  const ns = activeWorkflowExtra(wf)?.[WORKFLOW_META_NAMESPACE];
+  return ns?.[WORKFLOW_UUID_OWNED_FIELD] === true;
+}
+
 function embeddedWorkflowPath(wf = activeWorkflowRef()) {
   const ns = activeWorkflowExtra(wf)?.[WORKFLOW_META_NAMESPACE];
   const path = ns?.[WORKFLOW_PATH_FIELD];
@@ -1103,6 +1119,7 @@ function installCreateBoundaryFork(appRef) {
           extra[WORKFLOW_META_NAMESPACE] = {
             ...(prev && typeof prev === "object" ? prev : {}),
             [WORKFLOW_UUID_FIELD]: crypto.randomUUID(),
+            [WORKFLOW_UUID_OWNED_FIELD]: true, // fork-minted → a unique per-instance identity
           };
         }
       } catch {
@@ -1150,19 +1167,26 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
   // graph.extra uuid, which installCreateBoundaryFork REGENERATES at every creation
   // (import/paste/duplicate/new) — so it is fresh for a copy yet round-tripped verbatim by
   // ComfyUI's draft persistence across a reload (durable regardless of chat scope). Prefer
-  // the in-session objectUuid, then the embedded uuid; if neither (a workflow that predates
-  // the wrapper, or a fresh blank created before it installed), mint one and STAMP it into
-  // extra so it is durable — and distinct per live object, so two concurrently-open copies
-  // never collide.
+  // the in-session objectUuid, then the embedded uuid — but TRUST the embedded uuid ONLY
+  // when it carries our fork-ownership marker (WORKFLOW_UUID_OWNED_FIELD). A pre-rollout /
+  // legacy embedded uuid (no marker) may be a DUPLICATE carried by a graph copied/imported
+  // BEFORE the create-boundary fork existed — a creation-time-only fork can't repair those,
+  // so FORK it here (mint fresh) rather than adopt the source's identity (#570 P0b). This is
+  // a one-time strip on the first unsaved load post-upgrade: a lost resume, never a
+  // cross-workflow leak. We then STAMP uuid + marker so a reload trusts it thereafter, and
+  // it stays distinct per live object so two concurrently-open copies never collide.
   const isUnsaved = !path && wf && wf.isPersisted !== true;
   if (isUnsaved) {
     const embeddedId = embeddedWorkflowUuid(wf);
-    const id = objectUuid || embeddedId || crypto.randomUUID();
+    const embeddedOwned = embeddedWorkflowUuidOwned(wf);
+    const trustedEmbedded = trustedUnsavedEmbeddedUuid({ embeddedId, embeddedOwned }); // legacy/unmarked → null → fork
+    const id = objectUuid || trustedEmbedded || crypto.randomUUID();
     _workflowObjectUuids.set(identityObject, id);
     rememberWorkflowUuidOwner(id, identityObject);
-    if (embeddedId !== id) {
-      // Persist the identity into extra (so a reload keeps it AND a later SAVE carries it
-      // into the saved file across the tmp:→wf: transition). Never dirties the graph.
+    if (embeddedId !== id || !embeddedOwned) {
+      // Persist the identity + ownership marker into extra (so a reload keeps + trusts it,
+      // AND a later SAVE carries it into the saved file across the tmp:→wf: transition).
+      // Never dirties the graph.
       try {
         const extra = activeWorkflowExtra(wf, { create: true });
         const previous = extra?.[WORKFLOW_META_NAMESPACE];
@@ -1170,6 +1194,7 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
           extra[WORKFLOW_META_NAMESPACE] = {
             ...(previous && typeof previous === "object" ? previous : {}),
             [WORKFLOW_UUID_FIELD]: id,
+            [WORKFLOW_UUID_OWNED_FIELD]: true,
           };
         }
       } catch {

@@ -6,8 +6,23 @@ import {
   isWorkflowCreationLoad,
   normalizedWorkflowPath,
   shouldForkEmbeddedWorkflowUuid,
+  trustedUnsavedEmbeddedUuid,
   workflowAliasForPath
 } from '../../web/js/lib/workflow-chat-identity.js'
+
+// #570 P0b — trust an unsaved workflow's embedded uuid ONLY when it carries the fork marker.
+test('#570 P0b a MARKED embedded uuid is trusted (fork-minted → unique per-instance)', () => {
+  assert.equal(trustedUnsavedEmbeddedUuid({ embeddedId: 'uuid-A', embeddedOwned: true }), 'uuid-A')
+})
+
+test('#570 P0b a LEGACY unmarked embedded uuid is NOT trusted → fork (null)', () => {
+  // A pre-rollout copy carries the source uuid with no marker → must not be adopted.
+  assert.equal(trustedUnsavedEmbeddedUuid({ embeddedId: 'uuid-A', embeddedOwned: false }), null)
+  assert.equal(trustedUnsavedEmbeddedUuid({ embeddedId: 'uuid-A' }), null)
+  // No embedded id at all → null (mint fresh).
+  assert.equal(trustedUnsavedEmbeddedUuid({ embeddedOwned: true }), null)
+  assert.equal(trustedUnsavedEmbeddedUuid({}), null)
+})
 
 // Fakes for the ComfyWorkflow 4th arg: a REUSE passes a ComfyWorkflow OBJECT; a CREATION
 // passes null/undefined/string.

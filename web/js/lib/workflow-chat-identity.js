@@ -64,6 +64,15 @@ export function shouldForkEmbeddedWorkflowUuid({
  *  A mis-classified reuse only loses durability (P1, a fresh session); a mis-classified
  *  creation that INHERITED the source identity would be a wrong-resume (P0) — so, faced
  *  with an ambiguous arg, fork. */
+/** #570 P0b — the embedded unsaved-workflow uuid to TRUST as this instance's identity, or
+ *  null to FORK. Trust the embedded uuid ONLY when it carries the fork-ownership marker
+ *  (`embeddedOwned` — minted by the create-boundary wrapper or a prior fork). A legacy /
+ *  pre-rollout embed (no marker) may be a DUPLICATE carried by a copy/import made before the
+ *  fork existed, so it is NOT trusted → null → the caller mints a fresh identity. */
+export function trustedUnsavedEmbeddedUuid({ embeddedId, embeddedOwned } = {}) {
+  return embeddedOwned && typeof embeddedId === "string" && embeddedId ? embeddedId : null;
+}
+
 export function isWorkflowCreationLoad({ workflowArg, openSource, noFork = false } = {}) {
   if (noFork) return false;
   if (openSource != null) return true;
