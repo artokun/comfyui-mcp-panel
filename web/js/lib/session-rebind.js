@@ -305,6 +305,12 @@ export function buildHelloPayload({
     panel_version: panelVersion,
     backend: backend || "claude",
     blind: Boolean(blind),
+    // #570 P0c — advertise that THIS panel build enforces the per-command workflow-instance
+    // stamp (it refuses to run a graph command whose stamped workflow_uuid does not match the
+    // active canvas). The orchestrator FAILS CLOSED for mutating graph commands unless a
+    // connected panel confirms this, so an OLD panel that would silently ignore the stamp and
+    // apply a stale write to the wrong canvas gets read-only graph access until updated.
+    enforces_workflow_stamp: true,
   };
   if (comfyuiUrl) frame.comfyui_url = comfyuiUrl;
   if (typeof comfyuiPath === "string" && comfyuiPath.trim()) {

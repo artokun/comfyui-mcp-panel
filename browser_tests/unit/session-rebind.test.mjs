@@ -257,6 +257,17 @@ test("#296: resume rides the hello only when present", () => {
   assert.equal(buildHelloPayload({ tabId: "t", resume: "sess-1" }).resume, "sess-1");
 });
 
+test("#570 P0c: hello ALWAYS advertises enforces_workflow_stamp so the orchestrator won't gate this build's graph edits", () => {
+  // A current build unconditionally enforces the per-command workflow stamp; the flag must
+  // ride every hello (not gated behind any optional field) so the server never fails closed
+  // on our mutating graph commands.
+  assert.equal(buildHelloPayload({ tabId: "t" }).enforces_workflow_stamp, true);
+  assert.equal(
+    buildHelloPayload({ tabId: "wf:x.json", title: "x", backend: "codex" }).enforces_workflow_stamp,
+    true,
+  );
+});
+
 test("#570: the durable per-instance workflow uuid rides the hello when present", () => {
   // Lets the orchestrator key an UNSAVED workflow's resume on a globally-unique id
   // that survives the tmp:<uuid> tab-id churn — so a same-title sibling can't

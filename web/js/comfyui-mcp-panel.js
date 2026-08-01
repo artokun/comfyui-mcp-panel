@@ -1096,8 +1096,19 @@ function installCreateBoundaryFork(appRef) {
       try {
         if (graphData && typeof graphData === "object" && !Array.isArray(graphData)) {
           const noFork = Boolean(options && options.__cmcpNoFork);
+          // #570 P0b — an UNTRUSTED in-place replacement: the agent's graph_load drops
+          // ARBITRARY external JSON onto the ACTIVE workflow object. That JSON's graph.extra
+          // uuid is forgeable/copyable (a copied/exported graph can carry ANY workflow's uuid),
+          // so it must NEVER be adopted as identity — but the load is still an agent tool
+          // running INSIDE the live session on this tab, so changing the tab's identity would
+          // reset the very conversation the agent is executing in. We therefore KEEP the LIVE
+          // OBJECT's identity (the WeakMap value — the only non-forgeable ownership source) and
+          // OVERWRITE the incoming graph.extra uuid with it, stripping the copied value so it
+          // can neither be adopted now nor resurface via the embedded fallback or a later save.
+          const keepInstance = Boolean(options && options.__cmcpKeepInstance);
           const creation =
             !noFork &&
+            !keepInstance &&
             isWorkflowCreationLoad({ workflowArg: workflow, openSource: options ? options.openSource : undefined });
           // #570 P0b — a stale PER-OBJECT uuid cache must NEVER override the identity of the
           // newly-loaded content, and we KEEP nothing derived from the copyable graph.extra.
@@ -1108,7 +1119,20 @@ function installCreateBoundaryFork(appRef) {
           //    the prior instance's identity. The embedded value is used ONLY to DETECT the
           //    change; the minted uuid is fresh (never adopted from graph.extra).
           let fork = false;
-          if (creation) {
+          if (keepInstance && workflow && typeof workflow === "object") {
+            // Authoritative identity = the live object's cached uuid (mint one only if this
+            // object has never been seen). Stamp it over the incoming value; do NOT fork.
+            const cached = _workflowObjectUuids.get(workflow);
+            const authoritative = cached || crypto.randomUUID();
+            if (!cached) _workflowObjectUuids.set(workflow, authoritative);
+            const extra =
+              graphData.extra && typeof graphData.extra === "object" ? graphData.extra : (graphData.extra = {});
+            const prev = extra[WORKFLOW_META_NAMESPACE];
+            extra[WORKFLOW_META_NAMESPACE] = {
+              ...(prev && typeof prev === "object" ? prev : {}),
+              [WORKFLOW_UUID_FIELD]: authoritative,
+            };
+          } else if (creation) {
             fork = true;
           } else if (!noFork && workflow && typeof workflow === "object") {
             const cached = _workflowObjectUuids.get(workflow);
@@ -5856,7 +5880,20 @@ const GRAPH_TOOL_EXECUTORS = {
     // same active tab twice, and a later save 409'd), and a soft-reload-then-
     // reload left graph routing stranded on a frozen Unsaved tab.
     const activeWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
-    await app.loadGraphData(...resolveLoadGraphArgs(clone, activeWorkflow));
+    // #570 P0b — this replaces the ACTIVE canvas with UNTRUSTED external JSON in place. Keep
+    // the live workflow instance's identity (so the agent's live session/fence stays intact —
+    // re-minting here would reject the agent's own follow-up commands and reset the very
+    // conversation running this tool) and STRIP the incoming graph.extra uuid so a copied
+    // source uuid is never adopted as this instance's identity. The __cmcpKeepInstance option
+    // only rides the IN-PLACE (active-workflow) load — resolveLoadGraphArgs returns a 4-arg
+    // form then, so options lands in its proper 5th slot; a blank-canvas load (single arg) is
+    // a genuine creation and takes the normal fresh-mint path.
+    const loadArgs = resolveLoadGraphArgs(clone, activeWorkflow);
+    if (activeWorkflow && typeof activeWorkflow === "object") {
+      await app.loadGraphData(...loadArgs, { __cmcpKeepInstance: true });
+    } else {
+      await app.loadGraphData(...loadArgs);
+    }
     return {
       loaded: true,
       node_count: clone.nodes.length,
