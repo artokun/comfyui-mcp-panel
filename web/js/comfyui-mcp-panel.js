@@ -9821,6 +9821,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // Budget spent with a live socket — stop retrying and hand the user a real action.
       onLog(reRegisterExhaustedHint());
     }
+    // codex — DELIVER IT NOW, on the live socket. The replacement socket runs its replay
+    // once, at open; a long command still running on the retired socket finishes AFTER
+    // that, so the journal was empty when the replay fired and this entry would otherwise
+    // sit there until some future reconnect that may never come — leaving the original
+    // caller with the unknown outcome this whole change exists to remove. Unconditional
+    // (not gated on the re-registration budget): telling the truth is not a retry.
+    replayLostReplies(sock);
   }
 
   /** #508/#402 — re-send outcomes we could not deliver, onto a freshly-opened socket.

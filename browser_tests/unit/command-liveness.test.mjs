@@ -185,6 +185,37 @@ test("#508 wiring: an undelivered reply is journaled, replayed after hello, and 
   assert.ok(helloAt !== -1 && helloAt < replayAt, "replay must follow the hello");
 });
 
+test("#508 codex R6: an outcome journaled AFTER the replacement socket replayed is delivered anyway", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const start = src.indexOf("function handleUndeliveredReply(entry) {");
+  assert.notEqual(start, -1);
+  const body = src.slice(start, src.indexOf("\n  }", start));
+  // The replacement socket replays ONCE, at open. A long command still running on the
+  // retired socket finishes after that, so the journal was empty when the replay fired —
+  // without this the entry would wait for a reconnect that may never come.
+  assert.match(body, /replayLostReplies\(sock\);/, "a live socket must receive the outcome immediately");
+  // …and it must NOT be gated on the re-registration budget: telling the truth is not a retry.
+  const replayAt = body.indexOf("replayLostReplies(sock);");
+  const elseAt = body.indexOf("} else {");
+  assert.ok(elseAt !== -1 && replayAt > body.indexOf("reRegisterExhaustedHint()"), "replay must follow both branches");
+  assert.equal(
+    /\} else \{[\s\S]*replayLostReplies\(sock\);[\s\S]*\}\s*$/.test(body),
+    false,
+    "replay must sit outside the budget branches, not inside one",
+  );
+});
+
+test("#508 wiring: replay is idempotent — it drains only after every entry went out", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const start = src.indexOf("function replayLostReplies(target) {");
+  assert.notEqual(start, -1);
+  const body = src.slice(start, src.indexOf("\n  }", start));
+  assert.match(body, /if \(sent === lost\.length\) lostReplies\.drain\(\);/, "a partial replay must be retried, not lost");
+  assert.match(body, /target\.readyState !== WebSocket\.OPEN/, "never write to a closed socket");
+  // It must not re-enter the journal path (which would recurse through handleUndeliveredReply).
+  assert.equal(/lostReplies\.record\(/.test(body), false, "replay must not re-journal, or it would recurse");
+});
+
 test("#508 wiring: self-heal re-registers via sendHello ONLY — it can never pick another tab", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const start = src.indexOf("function handleUndeliveredReply(entry) {");
