@@ -331,7 +331,15 @@ let objectInfoHistorySeeded = false;
 // Resolves once the STARTUP baseline seed attempt sequence has finished (success or all
 // retries exhausted). graph_set_widget AWAITS this before authorizing.
 let objectInfoHistorySeed = Promise.resolve();
+// True once the CURRENT seed attempt sequence has actually FINISHED (settled), as opposed
+// to still being in flight. A bounded waiter must not start a REPLACEMENT seed while the
+// original is still running: a fetch issued after a mid-wait pack removal would observe an
+// /object_info that never contained the removed type and install THAT as the session
+// baseline, making a removed type look "never seen" — exactly the hole the ever-seen gate
+// exists to close (codex round-2, SEVERE).
+let objectInfoHistorySeedSettled = true;
 function seedObjectInfoHistory() {
+  objectInfoHistorySeedSettled = false;
   objectInfoHistorySeed = (async () => {
     // Retry a transient getNodeDefs failure a few times (short backoff) so a flaky
     // startup fetch self-heals BEFORE any pack could be removed mid-session. If the
@@ -352,7 +360,9 @@ function seedObjectInfoHistory() {
       }
       await new Promise((resolve) => setTimeout(resolve, 150));
     }
-  })();
+  })().finally(() => {
+    objectInfoHistorySeedSettled = true;
+  });
   return objectInfoHistorySeed;
 }
 
@@ -365,15 +375,28 @@ function seedObjectInfoHistory() {
 // type as removed and the write/add is refused with an honest error instead of hanging.
 const OBJECT_INFO_SEED_WAIT_MS = 8000;
 async function awaitObjectInfoHistorySeed() {
-  const bounded = (p) =>
-    Promise.race([
+  const bounded = (p) => {
+    let timer;
+    return Promise.race([
       Promise.resolve(p).catch(() => {}),
-      new Promise((resolve) => setTimeout(resolve, OBJECT_INFO_SEED_WAIT_MS)),
-    ]);
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, OBJECT_INFO_SEED_WAIT_MS);
+      }),
+      // Clear the losing timer either way so a fast seed does not leave an 8s handle
+      // pinned for every graph tool call.
+    ]).finally(() => clearTimeout(timer));
+  };
   await bounded(objectInfoHistorySeed);
-  // Not seeded by the startup attempt? Try ONCE more here (the backend may have come
-  // up since page load), still bounded. Failure leaves the history unseeded ⇒ closed.
-  if (!objectInfoHistorySeeded) await bounded(seedObjectInfoHistory());
+  if (objectInfoHistorySeeded) return;
+  // Not seeded. Retry ONCE (the backend may have come up since page load) — but ONLY if
+  // the previous attempt has actually FINISHED. If we merely TIMED OUT on an in-flight
+  // request, a replacement fetch could observe an /object_info taken AFTER a pack was
+  // removed during the wait and install it as the session baseline, so the removed type
+  // would read "never seen" and sail through the frontend-only exemption (codex round-2,
+  // SEVERE). Returning here leaves objectInfoHistorySeeded false, which makes
+  // wasTypeEverDefined treat every absent-from-current type as removed — fail CLOSED.
+  if (!objectInfoHistorySeedSettled) return;
+  await bounded(seedObjectInfoHistory());
 }
 
 async function registerComfyNodeDefs(preloadedDefs) {

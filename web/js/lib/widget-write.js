@@ -31,9 +31,14 @@
 //     is refused, not written blindly).
 
 export class WidgetWriteError extends Error {
-  constructor(message, { combo = false } = {}) {
+  constructor(message, { combo = false, emptyOptions = false } = {}) {
     super(message);
     this.name = "WidgetWriteError";
+    // `emptyOptions` narrows `combo` to the ONE case runSetWidget's #507 last-resort
+    // path may act on: the option list was READ successfully and is EMPTY. It is set
+    // ONLY by that branch, so the caller never has to pattern-match a message, and a
+    // plain "not a valid option" rejection can never be mistaken for it.
+    this.emptyOptions = emptyOptions;
     // `combo` marks the failure as "combo value rejected against the current
     // option list" (unreadable OR not-a-member). runSetWidget uses this as the
     // ONLY signal that a stale-combo refresh + single revalidation may help —
@@ -339,7 +344,7 @@ export function coerceWidgetValue(
       throw new WidgetWriteError(
         `Combo widget "${name}" has an EMPTY option list; the server's option list may ` +
           `simply be stale — refreshing it before deciding.`,
-        { combo: true },
+        { combo: true, emptyOptions: true },
       );
     }
     // STRICT typed membership: no numeric<->string coercion. Numeric options

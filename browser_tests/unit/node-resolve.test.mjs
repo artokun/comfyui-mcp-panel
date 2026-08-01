@@ -32,6 +32,10 @@ import {
 // The PRODUCTION graph_set_widget handler body — the executor and these tests
 // call it verbatim, so the tested ordering IS the shipped ordering (#458).
 import { runSetWidget } from "../../web/js/lib/set-widget.js";
+// The PRODUCTION combo refresh + the authoritative "server says this combo is empty"
+// oracle that gates #507's last-resort acceptance.
+import { refreshComboOptionsFromDefs } from "../../web/js/lib/asset-staleness.js";
+import { serverDeclaresEmptyComboOptions } from "../../web/js/lib/input-asset.js";
 
 // A registry shaped like LG.registered_node_types once /object_info loaded:
 // hundreds of classes; we only need the sentinels + a couple of extras here.
@@ -1165,15 +1169,12 @@ function starObjectInfo(serverOptions = []) {
   info["StarOllamaPromptHelper"] = { input: { required: { model: [serverOptions, {}] } } };
   return info;
 }
-// A refreshCombos that does what the panel's does: overwrite the live option list with
-// the server's, from the ALREADY-FETCHED /object_info payload.
-const refreshFromServer = (fresh, targetNode) => {
-  const def = fresh?.[targetNode?.type]?.input?.required;
-  for (const w of targetNode?.widgets ?? []) {
-    const spec = def?.[w.name];
-    if (Array.isArray(spec?.[0])) w.options.values = spec[0];
-  }
-};
+// The PRODUCTION combo refresh (the same function the panel injects as refreshCombos),
+// so these tests inherit its real semantics — notably that it deliberately NEVER clobbers
+// a dynamic (function) option source. A hand-rolled stand-in that overwrote functions
+// would hide exactly the path codex round-2 flagged.
+const refreshFromServer = (fresh, targetNode, defTypeKey, nameMap) =>
+  refreshComboOptionsFromDefs(targetNode, fresh, defTypeKey, nameMap);
 
 test("#507 e2e: a combo whose SERVER option list is empty becomes writable (the StarNodes repro)", async () => {
   const { reg, node, widget } = starNodesFixture([]);
@@ -1259,4 +1260,139 @@ test("#507 e2e: the empty-list fallback does NOT bypass the #458 type authorizat
     /removed|since-removed/i,
   );
   assert.equal(widget.value, "", "no write behind a refused authorization");
+});
+
+// ---- #507 codex round-2 (SEVERE): the last-resort acceptance is gated on the SERVER
+//      declaring the option list empty, never on the LIVE widget alone. -----------------
+
+test("#507 SEVERE: a DYNAMIC (function) source returning [] while the SERVER publishes a real list is still REFUSED", () => {
+  // The exact fail-open codex found: refreshComboOptionsFromDefs deliberately never
+  // clobbers a function option source, so a dynamic combo that currently returns []
+  // stays "empty" through the refresh. If the empty-list fallback keyed on the LIVE
+  // widget it would then write an OFF-LIST value against a real server list (#240).
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const widget = { name: "model", type: "combo", options: { values: () => [] }, value: "" };
+  const node = { id: 9, type: "StarOllamaPromptHelper", widgets: [widget], constructor: reg["StarOllamaPromptHelper"] };
+  const fresh = starObjectInfo(["allowed:1b"]); // the SERVER does publish a list
+  // Precondition: the production refresh leaves a function source alone.
+  refreshComboOptionsFromDefs(node, fresh, "StarOllamaPromptHelper");
+  assert.equal(typeof widget.options.values, "function", "production refresh must not clobber a dynamic source");
+  // And the authoritative oracle correctly says the server list is NOT empty.
+  assert.equal(serverDeclaresEmptyComboOptions(fresh, "StarOllamaPromptHelper", "model"), false);
+  return assert.rejects(
+    () =>
+      runSetWidget(node, "model", "off-list:70b", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => fresh,
+        wasTypeEverDefined: () => true,
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+    /not a valid option|EMPTY option list/i,
+  ).then(() => {
+    assert.equal(widget.value, "", "must not have mutated — the server list is real");
+  });
+});
+
+test("#507: a dynamic source returning [] AND a server-declared empty list DOES write", () => {
+  // The legitimate StarNodes shape, dynamic-source variant: both the live source and
+  // /object_info agree there is nothing to validate against.
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const widget = { name: "model", type: "combo", options: { values: () => [] }, value: "" };
+  const node = { id: 9, type: "StarOllamaPromptHelper", widgets: [widget], constructor: reg["StarOllamaPromptHelper"] };
+  return runSetWidget(node, "model", "qwen3-vl:8b", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => starObjectInfo([]),
+    wasTypeEverDefined: () => true,
+    refreshCombos: refreshFromServer,
+    ...HOOKS,
+  }).then((res) => {
+    assert.equal(res.set.value, "qwen3-vl:8b");
+    assert.equal(res.empty_option_list, true);
+  });
+});
+
+test("#507: with NO server def for the type (or a non-combo input), the empty list is NOT accepted", async () => {
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  // (a) the type IS in object_info but declares `model` as a plain STRING input.
+  const stringInput = objectInfo();
+  stringInput["StarOllamaPromptHelper"] = { input: { required: { model: ["STRING", {}] } } };
+  const a = starNodesFixture([]);
+  await assert.rejects(
+    () =>
+      runSetWidget(a.node, "model", "qwen3-vl:8b", {
+        registry: a.reg,
+        getRegistry: () => a.reg,
+        getFreshObjectInfo: async () => stringInput,
+        wasTypeEverDefined: () => true,
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+    /EMPTY option list|refused/i,
+  );
+  assert.equal(a.widget.value, "", "no write without an authoritative empty-combo declaration");
+  // (b) the def exists but has no such input at all.
+  const noInput = objectInfo();
+  noInput["StarOllamaPromptHelper"] = { input: { required: {} } };
+  const b = starNodesFixture([]);
+  await assert.rejects(
+    () =>
+      runSetWidget(b.node, "model", "qwen3-vl:8b", {
+        registry: b.reg,
+        getRegistry: () => b.reg,
+        getFreshObjectInfo: async () => noInput,
+        wasTypeEverDefined: () => true,
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+    /EMPTY option list|refused/i,
+  );
+  assert.equal(b.widget.value, "");
+  void reg;
+});
+
+test("#507: serverDeclaresEmptyComboOptions — TRUE only for an explicitly EMPTY declared combo list", () => {
+  const defs = {
+    T: {
+      input: {
+        required: { empty: [[], {}], full: [["a"], {}], str: ["STRING", {}] },
+        optional: { optEmpty: [[], {}] },
+      },
+    },
+  };
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "empty"), true);
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "optEmpty"), true, "optional inputs count too");
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "full"), false);
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "str"), false);
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "nope"), false);
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "Missing", "empty"), false);
+  assert.equal(serverDeclaresEmptyComboOptions(null, "T", "empty"), false);
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", undefined), false);
+});
+
+test("#507 codex round-2 (MODERATE): a real failure on the FINAL attempt propagates, not the earlier combo rejection", async () => {
+  // The empty-list attempt is a genuine write. If it fails for a REAL reason (here the
+  // value does not stick), that error must surface — it must not be swallowed and
+  // replaced by the stale "EMPTY option list" rejection.
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const widget = Object.defineProperty(
+    { name: "model", type: "combo", options: { values: [] } },
+    "value",
+    { get: () => "frozen", set: () => {}, enumerable: true, configurable: true },
+  );
+  const node = { id: 9, type: "StarOllamaPromptHelper", widgets: [widget], constructor: reg["StarOllamaPromptHelper"] };
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "model", "qwen3-vl:8b", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => starObjectInfo([]),
+        wasTypeEverDefined: () => true,
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+    /did not retain the requested value/i,
+  );
 });

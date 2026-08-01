@@ -31,7 +31,12 @@ import {
   assertMutatedNodeAuthorized,
 } from "./node-resolve.js";
 import { controlAfterGenerateWarning } from "./control-after-generate.js";
-import { uploadInputConfig, uploadInputAccepts, addComboOption } from "./input-asset.js";
+import {
+  uploadInputConfig,
+  uploadInputAccepts,
+  addComboOption,
+  serverDeclaresEmptyComboOptions,
+} from "./input-asset.js";
 
 export async function runSetWidget(
   node,
@@ -370,22 +375,40 @@ export async function runSetWidget(
     // option list" guard never fired and `[].includes(value)` rejected EVERY value,
     // making the widget permanently unwritable by the agent.
     //
-    // ZERO options after the authoritative refresh means the option set is genuinely NOT
-    // KNOWABLE, which is not the same as "no value is valid"; and #240's reason for
-    // strict membership (a number being reinterpreted as an INDEX into a real list)
-    // cannot apply when there is no list to index into. So take the value as written.
-    // This runs LAST precisely so a merely-STALE empty list is refreshed first and a
-    // server-confirmable upload asset is confirmed first; a NON-EMPTY list (from either
-    // source) still enforces exact membership, and an object/array value still fails
-    // closed. If the write still cannot land, the freshest rejection is re-raised below.
-    try {
+    // ZERO options means the option set is genuinely NOT KNOWABLE, which is not the same
+    // as "no value is valid"; and #240's reason for strict membership (a number being
+    // reinterpreted as an INDEX into a real list) cannot apply when there is no list to
+    // index into. So take the value as written — but ONLY under two hard conditions:
+    //
+    //   1. The rejection really WAS the empty-list case (err.emptyOptions, set solely by
+    //      that branch) — never a "not a valid option" miss against a real list.
+    //   2. The freshly-fetched /object_info AUTHORITATIVELY declares this input's option
+    //      list EMPTY (serverDeclaresEmptyComboOptions). The LIVE widget alone is not
+    //      enough (codex round-2, SEVERE): a widget whose `options.values` is a FUNCTION
+    //      is deliberately never clobbered by the combo refresh, so a dynamic source that
+    //      returns [] right now would look "empty" even while the server publishes a real
+    //      list — and an off-list value would be written. Keyed on the ULTIMATE CONCRETE
+    //      type + its concrete input name, exactly like the #387 probe above, so a renamed
+    //      nested promotion still looks the right def input up.
+    //
+    // It also runs LAST, so a merely-STALE empty list is refreshed first and a
+    // server-confirmable upload asset is confirmed first. NOT wrapped in a catch: this is
+    // a real write attempt, and a genuine failure from it (a rejected value, a partial/
+    // rolled-back write) must propagate UNCHANGED rather than be masked by the earlier
+    // combo rejection.
+    if (
+      latest?.emptyOptions &&
+      serverDeclaresEmptyComboOptions(
+        freshDefs ?? undefined,
+        authTarget?.type,
+        concreteWidgetName ?? writeTargetWidgetName ?? widgetName,
+      )
+    ) {
       return withWarning({
         set: write({ acceptEmptyComboOptions: true }),
         ...(typeof refreshCombos === "function" ? { refreshed: true } : {}),
         empty_option_list: true,
       });
-    } catch {
-      /* not the empty-combo case (or still invalid) — fall through and refuse honestly */
     }
 
     // No recovery succeeded — refuse honestly with the freshest rejection.

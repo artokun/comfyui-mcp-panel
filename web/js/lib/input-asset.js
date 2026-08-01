@@ -72,6 +72,39 @@ export function uploadInputConfig(defsByType, type, widgetName) {
 }
 
 /**
+ * TRUE only when the freshly-fetched /object_info AUTHORITATIVELY declares `widgetName`
+ * on `type` to be a combo whose option list is EMPTY — i.e. the SERVER itself says there
+ * is nothing to validate against (StarNodes' `"model": ((), {...})` ⇒ `[[], {...}]`).
+ *
+ * This is the gate on #507's last-resort "an empty option list is not knowable, so take
+ * the value as written". Reading the LIVE widget alone is NOT sufficient (codex round-2,
+ * SEVERE): a widget whose `options.values` is a FUNCTION is deliberately never clobbered
+ * by the combo refresh (refreshComboOptionsFromDefs skips function sources), so a dynamic
+ * source that happens to return `[]` right now would otherwise look "empty" even while
+ * /object_info publishes a real, non-empty list — and an off-list value would be written,
+ * violating #240. Requiring the SERVER to declare the list empty makes that impossible.
+ *
+ * Fails CLOSED on every uncertainty: no defs, no def for the type, no such input, a
+ * non-combo spec (a type string like "INT"/"STRING"), or a NON-EMPTY declared list all
+ * return false, so the value simply stays rejected exactly as before.
+ */
+export function serverDeclaresEmptyComboOptions(defsByType, type, widgetName) {
+  try {
+    if (!defsByType || !type || !widgetName) return false;
+    const input = defsByType[type]?.input;
+    if (!input) return false;
+    const spec =
+      (input.required && input.required[widgetName]) ??
+      (input.optional && input.optional[widgetName]);
+    if (!Array.isArray(spec)) return false;
+    const options = spec[0];
+    return Array.isArray(options) && options.length === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * True when `value`'s file extension is a plausibly-LOADABLE asset for the upload
  * `config`'s kind (image/video/audio/model). This is the strictness gate on top of a
  * mere server-existence probe (#240): `/view?type=input` confirms the file is on disk
