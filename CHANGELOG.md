@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.28] - 2026-08-01
+
+### Added
+- refresh_nodes executor — force /object_info re-register on demand (#608)
+
+### Fixed
+- recover run-completion missed on unobserved reconnect (#356) + refuse false-clean empty-graph reads (#389)
+
+
 ## [0.11.27] - 2026-08-01
 
 ### Fixed
