@@ -121,6 +121,9 @@ import {
   resolveRailNode,
   railKindFor,
   computeOrphanedBoundaries,
+  findNodeInScopes,
+  buildNodeExecutionId,
+  unsafeBypassMappings,
 } from "./lib/subgraph-scope.js";
 import { runSetWidget } from "./lib/set-widget.js";
 import {
@@ -6014,7 +6017,7 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   async graph_run({ batch_count, to_node_id }) {
-    const { app } = getGraphCtx();
+    const { app, graph, rootGraph } = getGraphCtx();
     if (typeof app.queuePrompt !== "function") {
       throw new Error("app.queuePrompt is unavailable on this frontend");
     }
@@ -6031,21 +6034,27 @@ const GRAPH_TOOL_EXECUTORS = {
     // (SaveImage/PreviewImage/SaveVideo/…) as an execution root only when its id
     // is in partial_execution_targets, then walks back through that node's
     // dependencies — so only that branch renders. A non-output node can't be a
-    // root (the prompt would have "no outputs"), and an output node nested in a
-    // subgraph needs a path-style NodeExecutionId we don't build yet — reject
-    // both with guidance instead of silently running the whole graph. Stays
-    // undefined for a normal full run (byte-identical to the prior behaviour).
+    // root (the prompt would have "no outputs"). An output node nested in a
+    // subgraph is targeted by a PATH-style NodeExecutionId — the colon-joined
+    // chain of subgraph-instance ids from root down to the node ("10:15:359"),
+    // exactly what ComfyUI's own flattened prompt uses (#411). We resolve the id
+    // in the CURRENT viewing scope first (the reporter added the output node
+    // INSIDE the subgraph they were viewing), then root, then any nested subgraph.
+    // Stays undefined for a normal full run (byte-identical to the prior behaviour;
+    // a root-level target yields String(id), the same value as before).
     let partialTargets;
     if (to_node_id != null) {
-      const node = app.graph?.getNodeById?.(Number(to_node_id));
-      if (!node) {
+      const viewing = graph !== rootGraph ? graph : null;
+      const hit = findNodeInScopes(rootGraph, to_node_id, viewing);
+      if (!hit) {
         return {
           queued: false,
           error:
-            `node ${to_node_id} is not on the root graph — run-to-node targets a ` +
-            `root-level output node (output nodes inside subgraphs aren't supported yet)`,
+            `node ${to_node_id} was not found on the root graph or in any subgraph — ` +
+            `run-to-node targets an output node in the current workflow (check the id in panel_query_graph)`,
         };
       }
+      const node = hit.node;
       // isOutputNode mirrors ComfyUI's util: node.constructor.nodeData.output_node.
       if (!node.constructor?.nodeData?.output_node) {
         return {
@@ -6056,7 +6065,18 @@ const GRAPH_TOOL_EXECUTORS = {
             `output node at the end of the branch you want to render (is_output:true in panel_query_graph).`,
         };
       }
-      partialTargets = [String(to_node_id)];
+      // Colon path for a nested node ("10:15:359"), or String(id) at root. null
+      // means the owning subgraph is unreachable from the live root (stale view).
+      const execId = buildNodeExecutionId(rootGraph, hit.ownerGraph, node.id);
+      if (execId == null) {
+        return {
+          queued: false,
+          error:
+            `node ${to_node_id} is inside a subgraph that isn't reachable from the current ` +
+            `workflow root (stale view) — re-open the workflow and try again`,
+        };
+      }
+      partialTargets = [execId];
     }
 
     // app.queuePrompt(number, batchCount, queueNodeIds) — the 3rd arg becomes the
@@ -6769,8 +6789,19 @@ const GRAPH_TOOL_EXECUTORS = {
   // external links. node_id is the SubgraphNode in the CURRENT (parent) graph.
   // Ref: ComfyUI_frontend LGraph.ts unpackSubgraph ~1932 (wraps its own
   // beforeChange/afterChange) and _unpackSubgraphImpl ~1950.
-  graph_unpack_subgraph({ node_id }) {
-    const { graph, canvas } = getGraphCtx();
+  //
+  // ATOMICITY (#405): on some graph shapes the frontend's unpackSubgraph throws
+  // PART WAY THROUGH — it had already removed the wrapper and inlined the inner
+  // nodes, but then threw while rewiring external links (observed:
+  // `t.findInputSlot is not a function` on an external endpoint that isn't a
+  // normal node). The old handler let that exception propagate AFTER the graph was
+  // half-mutated, so the tool reported failure while leaving a corrupt,
+  // half-unpacked graph. Now we snapshot the WHOLE root workflow first and, if
+  // unpackSubgraph throws, ROLL THE WORKFLOW BACK to that snapshot before
+  // reporting — the operation either fully completes or leaves the graph exactly
+  // as it was (never a silent partial). async because the rollback load awaits.
+  async graph_unpack_subgraph({ node_id }) {
+    const { app, graph, canvas, rootGraph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     if (!node.subgraph) {
       throw new Error(`Node ${node.id} (${node.type}) is not a subgraph`);
@@ -6778,10 +6809,40 @@ const GRAPH_TOOL_EXECUTORS = {
     if (typeof graph.unpackSubgraph !== "function") {
       throw new Error("unpackSubgraph is unavailable on this ComfyUI frontend");
     }
+    // Faithful pre-mutation snapshot of the entire workflow (root serialize is the
+    // same JSON save/load round-trips), captured BEFORE any mutation so a
+    // mid-unpack throw can be undone. Deep-cloned so the live graph can't mutate it.
+    let rollback = null;
+    try {
+      rollback = JSON.parse(JSON.stringify(rootGraph.serialize()));
+    } catch {
+      rollback = null; // couldn't snapshot — we'll still surface a clean error below
+    }
     const before = new Set((graph._nodes ?? []).map((n) => n.id));
     // unpackSubgraph wraps its own beforeChange/afterChange for undo, so don't
     // nest another pair here.
-    graph.unpackSubgraph(node, { skipMissingNodes: true });
+    try {
+      graph.unpackSubgraph(node, { skipMissingNodes: true });
+    } catch (err) {
+      // Half-unpacked graph — restore the pre-unpack workflow so the failure is
+      // atomic (no partial mutation left behind), then report a real error.
+      let rolledBack = false;
+      if (rollback && typeof app?.loadGraphData === "function") {
+        try {
+          const activeWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
+          await app.loadGraphData(...resolveLoadGraphArgs(rollback, activeWorkflow));
+          rolledBack = true;
+        } catch {
+          rolledBack = false;
+        }
+      }
+      const reason = err?.message ? String(err.message) : String(err);
+      throw new Error(
+        rolledBack
+          ? `unpack_subgraph failed and the graph was rolled back to its pre-unpack state (no partial changes left): ${reason}`
+          : `unpack_subgraph failed AFTER partially modifying the graph and the automatic rollback did not complete — undo (Ctrl+Z) to restore: ${reason}`,
+      );
+    }
     const newNodeIds = (graph._nodes ?? []).filter((n) => !before.has(n.id)).map((n) => n.id);
     graph.setDirtyCanvas?.(true, true);
     canvas?.setDirty?.(true, true);
@@ -7247,7 +7308,7 @@ const GRAPH_TOOL_EXECUTORS = {
   // "mute" (the node and everything downstream of it is skipped — mode 2). Also
   // accepts the raw numeric LiteGraph modes 0/2/4 defensively. Undo-able like the
   // other graph_set_node_* edits.
-  graph_set_node_mode({ node_id, mode }) {
+  graph_set_node_mode({ node_id, mode, force }) {
     const { graph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     const MODE_TO_NUM = { active: 0, bypass: 4, mute: 2 };
@@ -7266,6 +7327,40 @@ const GRAPH_TOOL_EXECUTORS = {
       }
       target = MODE_TO_NUM[key];
     }
+    // #409 — bypassing a SUBGRAPH node is unsafe when its boundary inputs are ordered
+    // differently from its outputs: ComfyUI forwards each output from the input at the
+    // SAME index (positional), so an IMAGE output backed by a BBOX_DETECTOR input at
+    // the same index silently feeds a detector where an image is expected. Inspect the
+    // boundary slot types and REJECT such a bypass with guidance (pass force:true to
+    // proceed anyway). Only outputs that actually feed a downstream node can mis-wire.
+    let bypassWarning = null;
+    if (target === MODE_TO_NUM.bypass && node.subgraph) {
+      const boundaryInputs = (node.inputs ?? []).map((s) => ({ name: s?.name, type: s?.type }));
+      const boundaryOutputs = (node.outputs ?? []).map((s) => ({
+        name: s?.name,
+        type: s?.type,
+        connected: (s?.links?.length ?? 0) > 0,
+      }));
+      const mismatches = unsafeBypassMappings({ inputs: boundaryInputs, outputs: boundaryOutputs });
+      if (mismatches.length) {
+        const detail = mismatches
+          .map(
+            (m) =>
+              `output "${m.output_name}" (${m.output_type}) would be fed by input "${m.input_name ?? "none"}" (${m.input_type ?? "none"})`,
+          )
+          .join("; ");
+        if (!force) {
+          throw new Error(
+            `Refusing to bypass subgraph node ${node.id} (${node.title ?? node.type}): ComfyUI bypass forwards each ` +
+              `output from the input at the SAME index, which here would mis-wire — ${detail}. Use an explicit ` +
+              `switch (e.g. ImpactSwitch selecting the processed vs original signal) to choose the passthrough, or ` +
+              `re-order the boundary inputs so each output's index lines up with a same-type input. Pass force:true ` +
+              `to bypass anyway.`,
+          );
+        }
+        bypassWarning = `bypassed despite unsafe boundary mapping (force) — ${detail}`;
+      }
+    }
     const prevNum = typeof node.mode === "number" ? node.mode : 0;
     const previous_mode = NUM_TO_MODE[prevNum] ?? prevNum;
     graph.beforeChange?.();
@@ -7275,7 +7370,12 @@ const GRAPH_TOOL_EXECUTORS = {
       graph.afterChange?.();
     }
     graph.setDirtyCanvas?.(true, true);
-    return { node_id: node.id, mode: NUM_TO_MODE[target], previous_mode };
+    return {
+      node_id: node.id,
+      mode: NUM_TO_MODE[target],
+      previous_mode,
+      ...(bypassWarning ? { warning: bypassWarning } : {}),
+    };
   },
 
   // Render the CURRENT graph view (root graph or the open subgraph) to a PNG and
@@ -7436,14 +7536,22 @@ const GRAPH_TOOL_EXECUTORS = {
     return { entered: node.id, viewing: describeActiveGraph(getGraphCtx().graph) };
   },
 
-  // Leave the current subgraph and return to the root graph.
+  // Leave the current subgraph and return to its IMMEDIATE parent graph. For a
+  // first-level subgraph the parent IS the root; for a nested subgraph it is the
+  // enclosing subgraph, NOT the root — jumping straight to root (graph.rootGraph)
+  // skipped the parent, so the next graph_enter_subgraph targeted a node id that
+  // only exists inside the skipped parent and navigated nowhere useful (#412).
   graph_exit_subgraph() {
     const { graph, canvas, rootGraph } = getGraphCtx();
     if (graph === rootGraph) return { viewing: { scope: "root" }, note: "already at root" };
     if (typeof canvas.setGraph !== "function") {
       throw new Error("subgraph navigation unavailable on this frontend");
     }
-    canvas.setGraph(graph.rootGraph ?? rootGraph);
+    // The immediate parent is the graph that directly owns this subgraph's
+    // SubgraphNode. Fall back to graph.rootGraph/rootGraph only when the owner walk
+    // can't reach it (e.g. a stale/ownerless subgraph) so exit never dead-ends.
+    const parentGraph = findSubgraphOwner(rootGraph, graph)?.parentGraph ?? graph.rootGraph ?? rootGraph;
+    canvas.setGraph(parentGraph);
     canvas.setDirty?.(true, true);
     return { viewing: describeActiveGraph(getGraphCtx().graph) };
   },
