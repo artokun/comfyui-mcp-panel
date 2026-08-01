@@ -17516,6 +17516,12 @@ function buildPanel() {
   // editing a node widget). Removed in destroy() so remounts can't stack it.
   function onInterruptKeydown(ev) {
     if (!thinkingEl && !agentWorking) return; // no turn in flight
+    // This is a DOCUMENT CAPTURE listener, so it runs BEFORE the composer's own
+    // target-phase keydown guard. During CJK IME composition the Escape that
+    // CANCELS the candidate window (and the commit Enter) must not be read as
+    // "interrupt the turn" — otherwise cancelling an IME candidate aborts the
+    // agent's in-flight work (#385). Let the IME own the keystroke.
+    if (isImeComposing(ev)) return;
     const isCopy = (ev.ctrlKey || ev.metaKey) && !ev.altKey && (ev.key === "c" || ev.key === "C");
     const isEsc = ev.key === "Escape";
     if (!isCopy && !isEsc) return;

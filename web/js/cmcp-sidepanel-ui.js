@@ -17,6 +17,7 @@
 // mount(bodyEl), onSearch(v,opts), subnavExtras(), drive, driveKind, update(),
 // onActivate(), onDeactivate(), teardown(), escapeBlocked() }`.
 
+import { isImeComposing } from "./lib/ime.js";
 import { createCivitaiContent } from "./cmcp-civitai-ui.js";
 import { createAppsContent } from "./cmcp-apps-ui.js";
 import { createTrainingContent } from "./cmcp-training-ui.js";
@@ -255,6 +256,10 @@ export function openSidePanel(ctx = {}, opts = {}) {
     if (c && typeof c.onSearch === "function") c.onSearch(searchEl.value, {});
   });
   searchEl.addEventListener("keydown", (e) => {
+    // Don't let a CJK IME's commit Enter trigger the search before the syllable
+    // is actually committed (#385) — this shared row backs the CivitAI header
+    // search whose Enter calls applySearch()/reloads immediately.
+    if (isImeComposing(e)) return;
     if (e.key !== "Enter") return;
     const c = contents.get(activeKey);
     if (c && typeof c.onSearch === "function") c.onSearch(searchEl.value, { enter: true });
