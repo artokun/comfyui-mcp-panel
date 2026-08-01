@@ -330,6 +330,30 @@ const staleReadFlight = createSingleFlight();
 // summarized to the user, so a command that really ran is never silently swallowed.
 const lostReplies = createLostReplyJournal();
 
+// #442 / codex — WORKFLOW SWITCH+RELOAD CRITICAL SECTION. Freezing the CANVAS keeps the
+// USER out of the window between the dirty check and the destructive re-read, but the
+// bridge is a second writer: the socket listener is async and re-entrant, so a perfectly
+// valid, correctly-stamped graph_* command can land mid-reload. It would either be
+// overwritten by the load, or — worse — land during the tracker re-baseline and be marked
+// CLEAN, so the next out-of-band disk change silently discards it with no conflict shown.
+// While this guard is held, every graph/workflow executor is REFUSED with a retryable
+// error (nothing applied) rather than queued: refusing cannot reorder or double-apply, and
+// the window is a fraction of a second.
+let workflowReloadGuard = null;
+// Defensive ceiling: a guard can only ever be cleared by workflow_open's finally, so if
+// some pathological path ever failed to run it, an un-expiring guard would wedge every
+// command in the tab. Age it out instead.
+const WORKFLOW_RELOAD_GUARD_MAX_MS = 30000;
+/** The guard, or null when none is held (expiring a stuck one on the way). */
+function activeWorkflowReloadGuard() {
+  if (!workflowReloadGuard) return null;
+  if (Date.now() - workflowReloadGuard.since > WORKFLOW_RELOAD_GUARD_MAX_MS) {
+    workflowReloadGuard = null;
+    return null;
+  }
+  return workflowReloadGuard;
+}
+
 /** Journal one open attempt and return its receipt. `applied:false` (with the error) is
  *  recorded too — a genuine negative is as load-bearing as a positive here. */
 function noteOpenAttempt({ cmd, rid, requested, resolved, applied, error }) {
@@ -7670,6 +7694,13 @@ const GRAPH_TOOL_EXECUTORS = {
     let reloadError = null;
     let openFailed = null;
     if (priorInteraction !== null) canvasView.allow_interaction = false;
+    // Hold the switch+reload critical section across the WHOLE mutating sequence. The canvas
+    // freeze keeps the USER out; this keeps the BRIDGE out, so a concurrent graph_* command
+    // can neither be overwritten by the reload nor be silently re-baselined as clean.
+    workflowReloadGuard = {
+      key: workflowTabId(target) || target.path || "the active workflow",
+      since: Date.now(),
+    };
     try {
       try {
         await s.openWorkflow(target);
@@ -7835,8 +7866,9 @@ const GRAPH_TOOL_EXECUTORS = {
       reloadError = coerceMessageText(err?.message ?? err);
       console.warn("[comfyui-mcp-panel] workflow_open disk re-read failed:", reloadError);
     } finally {
-      // Hand the canvas back on EVERY path — a throw anywhere above must never leave the
-      // user with a frozen graph.
+      // Release BOTH on EVERY path — a throw anywhere above must never leave the user with
+      // a frozen graph or the tab refusing every command.
+      workflowReloadGuard = null;
       if (priorInteraction !== null) canvasView.allow_interaction = priorInteraction;
     }
     if (openFailed) throw failOpen(openFailed);
@@ -9865,6 +9897,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
   function replayLostReplies(target) {
     const lost = lostReplies.list();
     if (!lost.length) return;
+    // The bridge THIS socket belongs to (stamped at creation), not the mutable current
+    // `url` — after setUrl the two can differ while the old socket is still closing.
+    const targetUrl = target?.__cmcpBridgeUrl ?? url;
     let sent = 0;
     let dropped = 0;
     const keep = [];
@@ -9875,7 +9910,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // not a recovery. Such an entry is also meaningless there — its rid is unknown — so
       // it is dropped rather than carried forever. (Sensitive results are additionally
       // redacted at journal time and never travel at all.)
-      if (entry.url && entry.url !== url) {
+      if (entry.url && entry.url !== targetUrl) {
         dropped++;
         continue;
       }
@@ -9916,9 +9951,14 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // on each background retry — that latched "disconnected" is what stops the
     // connecting↔disconnected flicker.
     if (!gaveUp) emitStatus("connecting");
+    // codex — capture the URL THIS socket dials. `url` is mutable (setUrl swaps it before
+    // the old socket closes), so a command still finishing on a retired socket would
+    // otherwise journal its result under the NEW bridge's URL and sail past the
+    // cross-bridge check that exists to stop exactly that.
+    const socketUrl = url;
     let thisSock;
     try {
-      thisSock = new WebSocket(url);
+      thisSock = new WebSocket(socketUrl);
     } catch (err) {
       // Constructor threw before a socket exists → no open/close will fire, so we
       // drive the retry directly. Keep the status steady (scheduleReconnect decides
@@ -9927,6 +9967,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       return;
     }
     sock = thisSock;
+    // Stamp the socket with the bridge it belongs to, so a replay onto it can be checked
+    // against the entry's origin rather than against the mutable current `url`.
+    try {
+      thisSock.__cmcpBridgeUrl = socketUrl;
+    } catch {
+      /* exotic WebSocket impl — replayLostReplies falls back to the current url */
+    }
 
     // INSTANCE GUARD (panel #379 race): every listener below is bound to THIS socket
     // instance and no-ops unless it is still the active `sock`. A soft-reload / restart
@@ -10013,8 +10060,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           cmd,
           reason: classifyUndeliveredReply({ socketOpen, superseded, sendThrew }),
           at: Date.now(),
-          // Stamp the bridge this outcome belongs to so a replay can never cross it.
-          url,
+          // Stamp the bridge this outcome belongs to so a replay can never cross it. THIS
+          // socket's url, never the mutable current one (codex).
+          url: socketUrl,
         }),
       );
       return false;
@@ -10144,6 +10192,19 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           } else {
             const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];
             if (!executor) throw new Error(`Unknown command "${msg.cmd}"`);
+            // #442 / codex — the panel is mid switch-and-reload of a workflow. Running now
+            // would either be overwritten by the incoming graph, or land during the change
+            // tracker's re-baseline and be recorded as CLEAN — after which a later
+            // out-of-band disk change would discard it with no conflict reported. REFUSE
+            // (nothing applied, safe to retry) rather than queue: refusing cannot reorder
+            // or double-apply, and the section lasts a fraction of a second.
+            const reloadGuard = activeWorkflowReloadGuard();
+            if (reloadGuard) {
+              throw new Error(
+                `the panel is switching/refreshing "${reloadGuard.key}" right now, so "${msg.cmd}" ` +
+                  `was NOT applied — nothing changed. Retry in a moment.`,
+              );
+            }
             // WORKFLOW-INSTANCE FENCE (#570): the orchestrator stamps each command with the
             // trusted per-instance workflow_uuid it was ISSUED FOR. A command that runs against
             // the ACTIVE workflow but arrives AFTER the user switched or replaced it (a frame the

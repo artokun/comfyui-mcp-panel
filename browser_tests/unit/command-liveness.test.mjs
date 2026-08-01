@@ -119,13 +119,24 @@ test("codex R8: replay never crosses a bridge change — entries for another bri
   const body = src.slice(start, src.indexOf("\n  }", start));
   assert.match(
     body,
-    /if \(entry\.url && entry\.url !== url\) \{\s*\n\s*dropped\+\+;\s*\n\s*continue;/,
+    /if \(entry\.url && entry\.url !== targetUrl\) \{\s*\n\s*dropped\+\+;\s*\n\s*continue;/,
     "an outcome belonging to a previous bridge must never be volunteered to a different agent",
   );
   assert.match(body, /lostReplies\.replace\(keep\)/, "only undeliverable-but-still-ours entries are retried");
   assert.match(body, /Discarded \$\{dropped\}/, "the user must be told what was discarded");
-  // And the record site must stamp the bridge.
-  assert.match(src, /reason: classifyUndeliveredReply\(\{ socketOpen, superseded, sendThrew \}\),[\s\S]{0,200}?\n\s*url,/);
+  // codex R9 — the comparison must use the SOCKET's own bridge, not the mutable current
+  // `url`: setUrl swaps `url` before the old socket closes, so a command finishing on the
+  // retired socket would otherwise be stamped with (and compared against) the NEW bridge.
+  assert.match(body, /const targetUrl = target\?\.__cmcpBridgeUrl \?\? url;/);
+  assert.match(src, /const socketUrl = url;/, "each socket must capture the url it dialed");
+  assert.match(src, /thisSock = new WebSocket\(socketUrl\)/, "…and dial exactly that url");
+  assert.match(src, /thisSock\.__cmcpBridgeUrl = socketUrl;/, "…and carry it for the replay check");
+  assert.match(src, /url: socketUrl,/, "the journal must stamp THIS socket's bridge, not the current one");
+  assert.equal(
+    /at: Date\.now\(\),\s*\n(?:\s*\/\/[^\n]*\n)*\s*url,\s*\n/.test(src),
+    false,
+    "the mutable current url must not be what gets journaled",
+  );
 });
 
 test("the journal's replace() keeps only what it is given, still bounded", () => {

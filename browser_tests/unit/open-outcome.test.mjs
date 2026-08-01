@@ -464,6 +464,35 @@ test("#442 codex R7: a tab that arrived DIRTY is never re-baselined and never re
   assert.match(body, /: dirtyNow \|\| wasDirty/, "a pre-open dirty tab must be reported as a CONFLICT");
 });
 
+test("#442 codex R9: the switch+reload holds a critical section that REFUSES concurrent commands", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const body = handlerBody(src, "async workflow_open({");
+  // Freezing the canvas keeps the USER out of the window; the bridge is a second writer.
+  // A valid graph_* command landing mid-reload is either overwritten by the load or —
+  // worse — recorded as CLEAN by the tracker re-baseline, so the next out-of-band disk
+  // change discards it with no conflict shown.
+  const acquireAt = body.indexOf("workflowReloadGuard = {");
+  const openAt = body.indexOf("await s.openWorkflow(target);");
+  const releaseAt = body.indexOf("workflowReloadGuard = null;");
+  assert.ok(acquireAt !== -1 && releaseAt !== -1, "the section must be acquired and released");
+  assert.ok(acquireAt < openAt, "held from before the switch, so the whole mutating sequence is covered");
+  assert.ok(openAt < releaseAt);
+  // Release must be in the SAME finally as the canvas restore — a throw must never leave
+  // the tab refusing every command.
+  const tail = body.slice(body.indexOf("} finally {", openAt));
+  assert.match(tail, /workflowReloadGuard = null;[\s\S]{0,200}allow_interaction = priorInteraction;/);
+
+  // The dispatcher must refuse executors while it is held — nothing applied, retryable.
+  const guardAt = src.indexOf("const reloadGuard = activeWorkflowReloadGuard();");
+  const execAt = src.indexOf("result = await executor(msg);");
+  assert.notEqual(guardAt, -1, "the command dispatcher must consult the section");
+  assert.ok(guardAt < execAt, "…BEFORE running the executor");
+  const refusal = src.slice(guardAt, execAt);
+  assert.match(refusal, /was NOT applied — nothing changed\. Retry in a moment\./);
+  // A stuck guard must age out rather than wedge the tab forever.
+  assert.match(src, /Date\.now\(\) - workflowReloadGuard\.since > WORKFLOW_RELOAD_GUARD_MAX_MS/);
+});
+
 test("#442 codex P1: with NO reliable freeze available, the destructive reload is SKIPPED", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const body = handlerBody(src, "async workflow_open({");
