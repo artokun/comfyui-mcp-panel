@@ -20,6 +20,7 @@ import assert from "node:assert/strict";
 import {
   autoMatchSlots,
   resolveExplicitSlot,
+  typeMatchedIndices,
   isTypeCompatible,
   isWildcardSlotType,
   slotDiagnostic,
@@ -192,4 +193,90 @@ test("#169: a typed occupied input (reconnect) is NOT blocked by the wildcard gu
   };
   const m = autoMatchSlots(sourceNode(), target, "0", null);
   assert.equal(m.inIdx, 0);
+});
+
+// ---- #406: a token that names a TYPE (not a slot name) resolves by type ------
+// The reporter addressed the output as "IMAGE" though its slot is NAMED
+// "output_0" (type IMAGE). resolveExplicitSlot alone name-misses; autoMatchSlots
+// must re-resolve it against slot TYPES instead of throwing the generic "no
+// compatible pair" diagnostic.
+
+// ProPostApplyLUT-shaped: sole output NAMED "output_0" but TYPED IMAGE.
+function lutNode() {
+  return { id: 54, type: "ProPostApplyLUT", outputs: [{ name: "output_0", type: "IMAGE" }] };
+}
+// SaveImageNoMetaNode-shaped: input named "image" (type IMAGE).
+function saveNode() {
+  return { id: 222, type: "SaveImageNoMetaNode", inputs: [{ name: "image", type: "IMAGE", link: null }] };
+}
+
+test("#406: typeMatchedIndices finds slots by TYPE when no name matches", () => {
+  assert.deepEqual(typeMatchedIndices(lutNode().outputs, "IMAGE"), [0]);
+  assert.deepEqual(typeMatchedIndices(lutNode().outputs, "image"), [0]); // case-insensitive
+  assert.deepEqual(typeMatchedIndices(lutNode().outputs, "LATENT"), []); // no such type
+  assert.deepEqual(typeMatchedIndices(lutNode().outputs, 0), []); // numbers are indices, not types
+});
+
+test("#406: from_output addressed by TYPE name connects (was: no compatible pair)", () => {
+  const m = autoMatchSlots(lutNode(), saveNode(), "IMAGE", "image");
+  assert.equal(m.outIdx, 0);
+  assert.equal(m.inIdx, 0);
+});
+
+test("#406: BOTH sides addressed by type name resolve", () => {
+  const origin = { id: 1, outputs: [{ name: "out", type: "IMAGE" }] };
+  const target = { id: 2, inputs: [{ name: "in", type: "IMAGE", link: null }] };
+  const m = autoMatchSlots(origin, target, "IMAGE", "IMAGE");
+  assert.equal(m.outIdx, 0);
+  assert.equal(m.inIdx, 0);
+});
+
+test("#406: a token that matches NEITHER a name NOR a type still refuses", () => {
+  assert.throws(
+    () => autoMatchSlots(lutNode(), saveNode(), "MODEL", "image"),
+    /no compatible|MODEL/i,
+  );
+});
+
+test("#406: an ambiguous type token (2 inputs of that type) is refused, not guessed", () => {
+  const origin = { id: 1, outputs: [{ name: "out", type: "IMAGE" }] };
+  const target = {
+    id: 2,
+    inputs: [
+      { name: "a", type: "IMAGE", link: null },
+      { name: "b", type: "IMAGE", link: null },
+    ],
+  };
+  assert.throws(() => autoMatchSlots(origin, target, "IMAGE", "IMAGE"), /ambiguous/i);
+});
+
+test("#406: an ambiguous OUTPUT type token (2 IMAGE outputs) is refused even with an explicit input", () => {
+  // Two IMAGE outputs + an explicit IMAGE input: the scorer would have silently
+  // picked output 0, wiring a possibly-wrong same-typed branch. Refuse instead.
+  const origin = {
+    id: 1,
+    outputs: [
+      { name: "sharp", type: "IMAGE" },
+      { name: "blurred", type: "IMAGE" },
+    ],
+  };
+  const target = { id: 2, inputs: [{ name: "image", type: "IMAGE", link: null }] };
+  assert.throws(
+    () => autoMatchSlots(origin, target, "IMAGE", "image"),
+    /ambiguous.*IMAGE outputs.*sharp.*blurred/is,
+  );
+});
+
+test("#406: a slot literally NAMED like a type still wins by name first", () => {
+  // Output 0 is NAMED "IMAGE" (type MASK); output 1 is TYPED IMAGE. Name wins.
+  const origin = {
+    id: 1,
+    outputs: [
+      { name: "IMAGE", type: "MASK" },
+      { name: "pixels", type: "IMAGE" },
+    ],
+  };
+  const target = { id: 2, inputs: [{ name: "mask", type: "MASK", link: null }] };
+  const m = autoMatchSlots(origin, target, "IMAGE", "mask");
+  assert.equal(m.outIdx, 0); // resolved by NAME to the MASK slot, not by type
 });

@@ -28,6 +28,8 @@ const {
   parseNodeMappings,
   managerUnavailableResult,
   searchNodesVia,
+  parseObjectInfoSearch,
+  objectInfoSearchFallback,
 } = ManagerInstall;
 
 test("looksLikeGitUrl recognizes every git protocol, plus author/repo shorthand (#301)", () => {
@@ -822,4 +824,97 @@ test("managerUnavailableResult is a safe, actionable structured payload", () => 
   assert.equal(r.supported, false);
   assert.equal(r.query, "");
   assert.equal(r.reason, UNREACHABLE.message);
+});
+
+// ---- #426: /object_info installed-node fallback when Manager is unreachable ---
+// On a legacy 3.x Manager without the registry search endpoint (or Manager
+// disabled), nodes_search used to return a bare "unavailable" message. Now, when
+// BOTH Manager routes are unreachable, it searches the connected ComfyUI's core
+// /object_info for INSTALLED nodes matching the query so the agent still gets
+// usable results.
+
+const OBJECT_INFO = {
+  ControlNetApplyAdvanced: {
+    display_name: "Apply ControlNet (Advanced)",
+    category: "conditioning/controlnet",
+    description: "Apply a ControlNet to conditioning.",
+  },
+  ControlNetLoader: {
+    display_name: "Load ControlNet Model",
+    category: "loaders",
+    description: "",
+  },
+  KSampler: { display_name: "KSampler", category: "sampling", description: "" },
+};
+
+test("#426 parseObjectInfoSearch filters installed nodes by query across name/display/category/desc", () => {
+  const r = parseObjectInfoSearch(OBJECT_INFO, "controlnet", 15);
+  assert.equal(r.count, 2);
+  const ids = r.results.map((x) => x.id).sort();
+  assert.deepEqual(ids, ["ControlNetApplyAdvanced", "ControlNetLoader"]);
+  assert.equal(r.results[0].installed, true);
+  // A query that only appears in the display name still hits.
+  assert.equal(parseObjectInfoSearch(OBJECT_INFO, "apply", 15).count, 1);
+  // No match → empty.
+  assert.equal(parseObjectInfoSearch(OBJECT_INFO, "flux", 15).count, 0);
+  // Empty query returns all, capped by limit.
+  assert.equal(parseObjectInfoSearch(OBJECT_INFO, "", 2).results.length, 2);
+});
+
+test("#426 parseObjectInfoSearch tolerates junk input", () => {
+  assert.deepEqual(parseObjectInfoSearch(null, "x", 5), { count: 0, results: [] });
+  assert.deepEqual(parseObjectInfoSearch(undefined, "x", 5), { count: 0, results: [] });
+});
+
+test("#426 searchNodesVia falls back to /object_info when BOTH Manager routes are unreachable", async () => {
+  const throwUnreachable = async () => {
+    throw UNREACHABLE;
+  };
+  const objectInfoGet = async () => OBJECT_INFO;
+  const res = await searchNodesVia(throwUnreachable, throwUnreachable, {
+    query: "ControlNet",
+    objectInfoGet,
+  });
+  assert.equal(res.supported, true);
+  assert.equal(res.managerReachable, false);
+  assert.equal(res.installedOnly, true);
+  assert.equal(res.source, "object_info");
+  assert.equal(res.count, 2);
+  assert.match(res.message, /object_info|installed/i);
+});
+
+test("#426 falls back to the structured unavailable result when /object_info has NO match", async () => {
+  const throwUnreachable = async () => {
+    throw UNREACHABLE;
+  };
+  const res = await searchNodesVia(throwUnreachable, throwUnreachable, {
+    query: "no-such-node-xyz",
+    objectInfoGet: async () => OBJECT_INFO,
+  });
+  assert.equal(res.supported, false);
+  assert.equal(res.count, 0);
+});
+
+test("#426 a failing /object_info fetch degrades to the unavailable result, never throws", async () => {
+  const throwUnreachable = async () => {
+    throw UNREACHABLE;
+  };
+  const res = await objectInfoSearchFallback(
+    async () => {
+      throw new Error("object_info 503");
+    },
+    "ControlNet",
+    15,
+    UNREACHABLE,
+  );
+  assert.equal(res.supported, false);
+  assert.equal(res.managerReachable, false);
+});
+
+test("#426 with no objectInfoGet injected, behavior is unchanged (structured unavailable)", async () => {
+  const throwUnreachable = async () => {
+    throw UNREACHABLE;
+  };
+  const res = await searchNodesVia(throwUnreachable, throwUnreachable, { query: "ControlNet" });
+  assert.equal(res.supported, false);
 });

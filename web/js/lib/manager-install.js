@@ -451,6 +451,70 @@ export function parseNodeMappings(data, query, limit) {
 }
 
 /**
+ * #426 — INSTALLED-node search over ComfyUI's core `/object_info` map, the last
+ * resort when the Manager registry backend is unreachable (legacy 3.x without the
+ * search endpoint, or Manager disabled). `/object_info` is keyed by node CLASS
+ * name → { display_name, category, description, ... } and is ALWAYS present on any
+ * running ComfyUI, so an agent can still discover the nodes it can use RIGHT NOW.
+ * Filters by `query` across class name / display_name / category / description and
+ * caps at `limit` (default 15, max 40). Pure so it is unit-testable off-browser.
+ * `id` is the node class name (usable directly as a node type); these are already
+ * installed, so no registry install id is needed.
+ */
+export function parseObjectInfoSearch(objectInfo, query, limit) {
+  const q = String(query ?? "").toLowerCase();
+  const out = [];
+  if (objectInfo && typeof objectInfo === "object") {
+    for (const [cls, meta] of Object.entries(objectInfo)) {
+      const title = meta?.display_name || cls;
+      const desc = meta?.description ?? "";
+      const category = meta?.category ?? "";
+      const hay = `${cls} ${title} ${category} ${desc}`.toLowerCase();
+      if (!q || hay.includes(q)) {
+        out.push({ id: cls, title, description: String(desc).slice(0, 160), installed: true });
+      }
+    }
+  }
+  const max = Math.min(Number(limit) || 15, 40);
+  return { count: out.length, results: out.slice(0, max) };
+}
+
+/**
+ * #426 — when BOTH Manager registry routes are unreachable, try the installed-node
+ * `/object_info` search before giving up. On a hit, return a supported result the
+ * agent can act on (installed-only); otherwise fall through to the structured
+ * "Manager unavailable" capability result. `objectInfoGet` is dependency-injected
+ * (the panel wires the live /object_info fetch) so this stays unit-testable, and
+ * NEVER throws — any /object_info failure degrades to managerUnavailableResult.
+ */
+export async function objectInfoSearchFallback(objectInfoGet, query, limit, err) {
+  if (typeof objectInfoGet !== "function") return managerUnavailableResult(query, err);
+  let info;
+  try {
+    info = await objectInfoGet();
+  } catch {
+    return managerUnavailableResult(query, err);
+  }
+  const parsed = parseObjectInfoSearch(info, query, limit);
+  if (!parsed.count) return managerUnavailableResult(query, err);
+  return {
+    supported: true,
+    managerReachable: false,
+    source: "object_info",
+    installedOnly: true,
+    count: parsed.count,
+    results: parsed.results,
+    query: query == null ? "" : String(query),
+    message:
+      "ComfyUI-Manager's registry search is unavailable (the built-in Manager is " +
+      "disabled, or a legacy/partial build without the search endpoint), so these are " +
+      "INSTALLED nodes matching your query from the connected ComfyUI's /object_info — " +
+      "already available to use directly (add with panel_add_node). Searching/installing " +
+      "NEW packs from the registry needs the built-in Manager (v4+) enabled.",
+  };
+}
+
+/**
  * Graceful-degradation result for nodes_search when the ComfyUI-Manager search
  * backend can NOT be reached on ANY route (dialect-routed /v2 AND the absolute
  * legacy route both threw "not reachable"). Instead of surfacing a raw throw —
@@ -485,11 +549,17 @@ export function managerUnavailableResult(query, err) {
  *   2. on an unreachable/404 signal, retry the ABSOLUTE legacy route (a legacy-
  *      UI pip build or real 3.x Manager can serve /customnode/getmappings while
  *      the /v2 route 404s, or detectManagerDialect's /v2 probe fails);
- *   3. if the absolute route is ALSO unreachable, return the structured
- *      {supported:false,…} capability result instead of throwing.
+ *   3. if the absolute route is ALSO unreachable, try the installed-node
+ *      /object_info search (#426) via the injected `objectInfoGet`; on a miss,
+ *      return the structured {supported:false,…} capability result instead of
+ *      throwing.
  * Any non-"unreachable" error still propagates.
  */
-export async function searchNodesVia(managerGet, managerCall, { query, limit } = {}) {
+export async function searchNodesVia(
+  managerGet,
+  managerCall,
+  { query, limit, objectInfoGet } = {},
+) {
   const route = "customnode/getmappings?mode=cache";
   let data;
   try {
@@ -499,7 +569,8 @@ export async function searchNodesVia(managerGet, managerCall, { query, limit } =
     try {
       data = await managerCall(route);
     } catch (err2) {
-      if (isManagerUnreachable(err2)) return managerUnavailableResult(query, err2);
+      if (isManagerUnreachable(err2))
+        return objectInfoSearchFallback(objectInfoGet, query, limit, err2);
       throw err2;
     }
   }

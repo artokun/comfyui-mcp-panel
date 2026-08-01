@@ -10,6 +10,12 @@
 
 import { coerceMessageText } from "./lib/chat-serialize.js";
 
+/** #417 — client-side abort budget for a single proxied CivitAI request. The
+ *  Python proxy already bounds each upstream ATTEMPT at 30s but retries 3× on
+ *  429/503, so a stalled search can outlast the agent's bridge read; this caps
+ *  the whole browser-side call so _loadMore's catch/finally always runs. */
+export const CIVITAI_REQUEST_TIMEOUT_MS = 15000;
+
 // ── constants (mirror civitai_models.dart) ─────────────────────────────────
 export const LEVELS = [
   { label: "PG", level: 1 },
@@ -277,11 +283,32 @@ export class CivitaiClient {
   }
 
   async _request({ url, method = "GET", body, auth = false, headers }) {
-    const res = await this.api.fetchApi("/comfyui_mcp_panel/civitai/api", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ url, method, body, auth, headers }),
-    });
+    // #417: bound EVERY proxied CivitAI call with a client-side abort. Without it,
+    // a proxy/upstream request that never settles leaves this fetch pending
+    // forever, so _loadMore never reaches its catch/finally — the docked browser
+    // and panel_civitai_results stay {loading:true, total:0, error:null} with no
+    // way to recover. On timeout we THROW a plain Error (no AbortError leaking to
+    // callers) so the existing catch sets state.error and clears loading.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), CIVITAI_REQUEST_TIMEOUT_MS);
+    let res;
+    try {
+      res = await this.api.fetchApi("/comfyui_mcp_panel/civitai/api", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ url, method, body, auth, headers }),
+        signal: controller.signal,
+      });
+    } catch (e) {
+      if (e?.name === "AbortError") {
+        throw new Error(
+          `CivitAI request timed out after ${Math.round(CIVITAI_REQUEST_TIMEOUT_MS / 1000)} seconds`,
+        );
+      }
+      throw e;
+    } finally {
+      clearTimeout(timeout);
+    }
     if (!res.ok) {
       // Carry the upstream status as a property so callers (the UI's fetch
       // catch) can surface a distinct error state instead of an empty grid
