@@ -441,16 +441,34 @@ function liveEditorTimeline(editor) {
  *     window would resurrect the PREVIOUS workflow's timeline — including its lengths and any
  *     per-segment metadata, not just its prompts.
  *
- * The DERIVED widgets break the tie, and the rule is "widget first, editor only as the
- * exception". `timeline_data` is the node's master field, so it wins WHENEVER it still agrees
- * with the derived widgets. The debounce window is the one moment it does not: the keystroke
- * handler has already advanced `local_prompts` past the pre-keystroke JSON. Deferring to the
- * editor only in that case means a stale post-load editor can never be chosen — after a load
- * the restored widgets agree with each other, so the widget wins even if the old editor
- * happens to derive the same strings.
+ * The derived widgets narrow the choice, but they can only ever act as a FILTER, never as a
+ * tie-break. A join comparison answers exactly one question — "could this widget hold this
+ * timeline's serialization?" — and it is NOT able to answer "which of two timelines is
+ * current?", because `" | "` is lossy: `["a", "b | c"]` and `["a | b", "c"]` with equal
+ * lengths produce byte-identical `local_prompts` AND `segment_lengths`, so both candidates
+ * look consistent while being different timelines. Settling authority on that equality is how
+ * a metadata-only overlay (say `{ "zoom": 4 }`) could rebuild from a stale master and destroy
+ * a live two-box edit without ever being asked to change a segment.
  *
- * Both derived widgets are compared, not just `local_prompts`: two different timelines can
- * share a prompt join while differing in segment lengths.
+ * So the order is:
+ *   1. only one candidate readable  → it wins;
+ *   2. both readable and STRUCTURALLY identical → no authority question exists; the master
+ *      field is canonical;
+ *   3. they differ and exactly ONE is consistent with the derived widgets → that one is
+ *      current (this is what separates the debounce window from the post-load window);
+ *   4. they differ and the filter CANNOT separate them (both consistent — colliding joins — or
+ *      neither) → prefer the LIVE EDITOR. It is the only copy that can hold text existing
+ *      nowhere else; a superseded master is still on disk, an uncommitted keystroke is not.
+ *      The choice is flagged (`merge_base_ambiguous`) and the losing copy is handed back, so a
+ *      tie is never resolved silently.
+ *
+ * Both derived widgets are compared, not just `local_prompts`: two timelines can share a
+ * prompt join while differing in segment lengths, and that difference is worth catching even
+ * though the reverse collision above is not detectable this way at all.
+ */
+/**
+ * COULD this timeline's serialization be what the derived widgets currently hold? That is the
+ * only question this can answer. It is a FILTER, never a tie-break — see chooseMergeBase.
  */
 function derivedMatchesWidgets(timeline, widgets) {
   if (!timeline) return false;
@@ -464,14 +482,33 @@ function derivedMatchesWidgets(timeline, widgets) {
 function chooseMergeBase(editor, widgets) {
   const fromEditor = liveEditorTimeline(editor);
   const fromWidget = parsePromptRelayTimeline(widgets[PROMPT_RELAY_MASTER_WIDGET].value);
-  const pick = (base, baseSource) => ({ base, baseSource, fromWidget, fromEditor });
-  if (derivedMatchesWidgets(fromWidget, widgets)) return pick(fromWidget, "timeline_data");
-  if (derivedMatchesWidgets(fromEditor, widgets)) return pick(fromEditor, "editor");
-  // Neither agrees with what the node would execute: it is genuinely desynced. The master
-  // field wins and the out-of-band text is reported back to the caller.
-  if (fromWidget) return pick(fromWidget, "timeline_data");
-  if (fromEditor) return pick(fromEditor, "editor");
-  return pick(null, "none");
+  const pick = (base, baseSource, ambiguous = false) => ({
+    base,
+    baseSource,
+    fromWidget,
+    fromEditor,
+    ambiguous,
+  });
+  // 1. Only one record to merge onto (or none).
+  if (!fromEditor && !fromWidget) return pick(null, "none");
+  if (!fromEditor) return pick(fromWidget, "timeline_data");
+  if (!fromWidget) return pick(fromEditor, "editor");
+  // 2. The two records carry the SAME content, so there is no authority to settle. The master
+  //    field is canonical (it also carries the persisted non-segment fields).
+  if (sameSegmentContent(fromEditor.segments, fromWidget.segments)) {
+    return pick(fromWidget, "timeline_data");
+  }
+  // 3. They differ. Use the derived widgets as a FILTER: whichever record could NOT have
+  //    produced what the node would execute right now is the stale one.
+  const editorConsistent = derivedMatchesWidgets(fromEditor, widgets);
+  const widgetConsistent = derivedMatchesWidgets(fromWidget, widgets);
+  if (widgetConsistent && !editorConsistent) return pick(fromWidget, "timeline_data");
+  if (editorConsistent && !widgetConsistent) return pick(fromEditor, "editor");
+  // 4. The filter cannot separate them — either both serialize to the same derived strings
+  //    (the lossy-join collision) or neither matches at all. Prefer the LIVE EDITOR: losing a
+  //    superseded master is recoverable from the saved workflow, losing an uncommitted edit is
+  //    not. Flagged as ambiguous, and the copy that lost is returned to the caller.
+  return pick(fromEditor, "editor", true);
 }
 
 /** The refusal message for a DERIVED-widget write — explains why + points at timeline_data. */
@@ -540,7 +577,13 @@ export function applyPromptRelayTimelineWrite(
   // RE-RECONCILE of the node's existing timeline — which is also the repair path for a node
   // that is already desynced — and is refused only when there is no current timeline to keep.
   const editor = typeof getEditor === "function" ? getEditor(node) : node?._timelineEditor;
-  const { base, baseSource, fromWidget, fromEditor } = chooseMergeBase(editor, widgets);
+  const {
+    base,
+    baseSource,
+    fromWidget,
+    fromEditor,
+    ambiguous: baseAmbiguous,
+  } = chooseMergeBase(editor, widgets);
   const merged = base ? { ...base, ...overlay } : { ...overlay };
   const segments = normalizeSegments(merged, Array.isArray(base?.segments) ? base.segments : null);
   const finalTimeline = { ...merged, segments };
@@ -606,6 +649,15 @@ export function applyPromptRelayTimelineWrite(
     anomalous && widgetSegs && !sameSegmentContent(widgetSegs, segments)
       ? contentSnapshot(widgetSegs)
       : null;
+  if (baseAmbiguous) {
+    warnings.push(
+      `the node's two records of the timeline held DIFFERENT segments and its derived widgets ` +
+        `could not tell which is current (the " | " join is lossy, so different segment splits ` +
+        `serialize identically). The LIVE EDITOR's copy was used, because it is the only one that ` +
+        `can hold text not yet saved anywhere; the timeline_data copy is returned as ` +
+        `"superseded_timeline_data" if this write did not reproduce it.`,
+    );
+  }
   if (supersededTimelineData) {
     warnings.push(
       `the node's timeline_data widget held DIFFERENT segments from the timeline editor, and your ` +
@@ -673,6 +725,7 @@ export function applyPromptRelayTimelineWrite(
       segments: segments.length,
       merged_onto_current: base != null,
       merge_base: baseSource,
+      ...(baseAmbiguous ? { merge_base_ambiguous: true } : {}),
       editor_synced: editorSynced,
       local_prompts: derived.local_prompts,
       segment_lengths: derived.segment_lengths,

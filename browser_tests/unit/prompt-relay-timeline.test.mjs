@@ -441,6 +441,60 @@ test("PIPE COLLISION: a length-only change is disclosed despite identical prompt
   assert.deepEqual(res.overwrote_uncommitted_edit, { prompts: ["a | b", "c"], lengths: [24, 36] });
 });
 
+test("PIPE COLLISION: a metadata-only overlay must NOT rebuild from a stale master", () => {
+  // The join cannot decide AUTHORITY either. Persisted timeline_data + widgets are
+  // ["a", "b | c"] / [24, 36]. Within one debounce interval the user edits BOTH prompt boxes,
+  // leaving the live editor at ["a | b", "c"] with the same lengths — which derives the SAME
+  // "a | b | c" and "24, 36", so the stale master still looks perfectly consistent. A caller
+  // then writes a metadata-only overlay that asks for no segment change at all. Choosing the
+  // master on join equality would rebuild the node from ["a", "b | c"] and destroy the edit.
+  const { node, widgets, editor } = makeRelayNode({
+    timelineSegments: [seg("a", 24), seg("b | c", 36)],
+  });
+  editor.timeline.segments = [seg("a | b", 24), seg("c", 36)];
+  // Both candidates serialize to byte-identical derived widget values.
+  assert.equal(widgets.local_prompts.value, "a | b | c");
+  assert.equal(
+    derivePromptRelayWidgets(editor.timeline.segments).local_prompts,
+    widgets.local_prompts.value,
+  );
+  assert.equal(
+    derivePromptRelayWidgets(editor.timeline.segments).segment_lengths,
+    widgets.segment_lengths.value,
+  );
+
+  const res = relay(applyPromptRelayTimelineWrite(node, { zoom: 4 }));
+
+  // The live edit SURVIVES — the whole point.
+  assert.deepEqual(JSON.parse(widgets.timeline_data.value).segments.map((s) => s.prompt), ["a | b", "c"]);
+  assert.deepEqual(editor.timeline.segments.map((s) => s.prompt), ["a | b", "c"]);
+  assert.equal(JSON.parse(widgets.timeline_data.value).zoom, 4);
+  // Nothing was overwritten, and the tie is declared rather than resolved silently.
+  assert.equal(res.merge_base, "editor");
+  assert.equal(res.merge_base_ambiguous, true);
+  assert.equal(res.overwrote_uncommitted_edit, undefined);
+  assert.deepEqual(res.superseded_timeline_data, { prompts: ["a", "b | c"], lengths: [24, 36] });
+  assert.ok(res.warnings.some((w) => w.includes("could not tell which is current")));
+  // The derived join is unchanged by all of this — proof it could never have detected the case.
+  assert.equal(widgets.local_prompts.value, "a | b | c");
+});
+
+test("an unresolvable tie is flagged; an ordinary write is not", () => {
+  // Neither record matches the derived widgets (a genuinely desynced node) and they differ
+  // structurally: still unresolvable, so the live editor wins and the tie is flagged.
+  const { node, widgets } = makeRelayNode({ localPrompts: "hand written | text" });
+  widgets.timeline_data.value = JSON.stringify({ segments: [seg("master only", 24)] });
+  const tied = relay(applyPromptRelayTimelineWrite(node, { zoom: 1 }));
+  assert.equal(tied.merge_base, "editor");
+  assert.equal(tied.merge_base_ambiguous, true);
+  assert.deepEqual(tied.replaced_out_of_band, { local_prompts: "hand written | text" });
+
+  // A node whose two records agree has no tie to declare.
+  const plain = relay(applyPromptRelayTimelineWrite(makeRelayNode().node, { segments: [seg("x", 3)] }));
+  assert.equal(plain.merge_base, "timeline_data");
+  assert.equal(plain.merge_base_ambiguous, undefined);
+});
+
 test("sameSegmentContent compares structurally, never through the join", () => {
   const A = [seg("a | b", 24), seg("c", 36)];
   const B = [seg("a", 24), seg("b | c", 36)];
