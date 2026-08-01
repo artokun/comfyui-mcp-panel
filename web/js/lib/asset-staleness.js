@@ -223,6 +223,58 @@ export function isStaleAssetCandidate(
   return false;
 }
 
+/**
+ * Blame each LIVE node whose type is one of the uninstalled `missingNodeTypes`. The
+ * missing-nodes store only yields type NAMES; on their own they never land on a node,
+ * so a red "node type not installed" node — INCLUDING a bypassed/muted one that
+ * LiteGraph may not flag `has_errors` — otherwise vanishes from graph_get_errors,
+ * which then reports a falsely-clean state that contradicts the sidebar's own
+ * load-time MISSING ASSETS warning (#399). This maps the type names back onto the
+ * actual node ids so each such node surfaces with a `missing_node_type` reason.
+ * Iterates EVERY node regardless of mode (bypass/mute never filtered). Returns
+ * `[{ nodeId, type }, ...]`. Fully defensive — a malformed node/list yields fewer
+ * (never throws).
+ */
+export function collectMissingNodeTypeReasons(nodes, missingNodeTypes) {
+  const out = [];
+  try {
+    if (!Array.isArray(nodes) || !nodes.length) return out;
+    const set = new Set(Array.isArray(missingNodeTypes) ? missingNodeTypes : []);
+    if (!set.size) return out;
+    for (const n of nodes) {
+      const t = n?.type ?? n?.comfyClass;
+      if (t != null && set.has(t)) out.push({ nodeId: n.id, type: t });
+    }
+  } catch {
+    /* best-effort — partial mapping is better than none */
+  }
+  return out;
+}
+
+/**
+ * True when a `graph_get_errors` RESULT payload represents a genuinely CLEAN graph —
+ * no per-node validation errors, no execution failure, no errored nodes, AND no
+ * missing-asset surface of ANY kind (models / media / node-types / node-count). Every
+ * consumer that summarizes the result — the command-summary label, banners, etc. —
+ * must derive "errors vs none" from THIS, so a missing-asset-ONLY result (e.g. a red or
+ * BYPASSED uninstalled node, #399/#356) is never labelled "none" while its own payload
+ * carries a populated missing_* / errored_count field. Fully defensive: an absent or
+ * non-object result is treated as clean.
+ */
+export function graphErrorsResultIsClean(result) {
+  if (!result || typeof result !== "object") return true;
+  const len = (v) => (Array.isArray(v) ? v.length : 0);
+  return (
+    !result.node_errors &&
+    !result.last_execution_error &&
+    !(Number(result.errored_count) > 0) &&
+    !len(result.missing_models) &&
+    !len(result.missing_media) &&
+    !len(result.missing_node_types) &&
+    !(Number(result.missing_node_count) > 0)
+  );
+}
+
 // Input types that ComfyUI renders as a WIDGET rather than a connection socket.
 // A combo (the type spec is an array of option values) is also a widget.
 const WIDGET_INPUT_TYPES = new Set(["INT", "FLOAT", "STRING", "BOOLEAN", "COMBO"]);

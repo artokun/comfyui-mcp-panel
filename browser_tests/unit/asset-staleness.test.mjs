@@ -20,6 +20,8 @@ import {
   reconcileUnknownWidgetNames,
   collectAllGraphs,
   reapplyDefsToLiveNodes,
+  collectMissingNodeTypeReasons,
+  graphErrorsResultIsClean,
 } from "../../web/js/lib/asset-staleness.js";
 
 /** The REAL LTXICLoRALoaderModelOnly schema: a `model` CONNECTION input plus two
@@ -441,4 +443,90 @@ test("reconcileUnknownWidgetNames is a no-op when there are no placeholders", ()
     constructor: { nodeData: { input: { required: { seed: {} } } } },
   };
   assert.equal(reconcileUnknownWidgetNames(node), false);
+});
+
+// ---------------------------------------------------------------------------
+// collectMissingNodeTypeReasons — per-node missing-node-type blame (#399)
+// ---------------------------------------------------------------------------
+
+test("collectMissingNodeTypeReasons: blames a node whose type is uninstalled (#399)", () => {
+  const nodes = [
+    { id: 5239, type: "RIFEInterpolation" },
+    { id: 3, type: "KSampler" },
+  ];
+  assert.deepEqual(collectMissingNodeTypeReasons(nodes, ["RIFEInterpolation"]), [
+    { nodeId: 5239, type: "RIFEInterpolation" },
+  ]);
+});
+
+test("collectMissingNodeTypeReasons: surfaces a BYPASSED/MUTED missing node (mode never filters) (#399)", () => {
+  // mode 4 = bypass, mode 2 = mute — the exact case the reporter hit. The helper must
+  // still blame it; graph_get_errors' has_errors-based flagging would otherwise miss it.
+  const nodes = [
+    { id: 5239, type: "RIFEInterpolation", mode: 4 },
+    { id: 7, type: "RIFEInterpolation", mode: 2 },
+  ];
+  assert.deepEqual(collectMissingNodeTypeReasons(nodes, ["RIFEInterpolation"]), [
+    { nodeId: 5239, type: "RIFEInterpolation" },
+    { nodeId: 7, type: "RIFEInterpolation" },
+  ]);
+});
+
+test("collectMissingNodeTypeReasons: matches on comfyClass when type is absent", () => {
+  const nodes = [{ id: 9, comfyClass: "SomeMissingNode" }];
+  assert.deepEqual(collectMissingNodeTypeReasons(nodes, ["SomeMissingNode"]), [
+    { nodeId: 9, type: "SomeMissingNode" },
+  ]);
+});
+
+test("collectMissingNodeTypeReasons: empty for no missing types / no nodes / no match", () => {
+  assert.deepEqual(collectMissingNodeTypeReasons([{ id: 1, type: "KSampler" }], []), []);
+  assert.deepEqual(collectMissingNodeTypeReasons([], ["RIFEInterpolation"]), []);
+  assert.deepEqual(
+    collectMissingNodeTypeReasons([{ id: 1, type: "KSampler" }], ["RIFEInterpolation"]),
+    [],
+  );
+});
+
+test("collectMissingNodeTypeReasons: defensive against malformed inputs (never throws)", () => {
+  assert.deepEqual(collectMissingNodeTypeReasons(null, ["X"]), []);
+  assert.deepEqual(collectMissingNodeTypeReasons([{ id: 1, type: "X" }], null), []);
+  // A node with no type/comfyClass is skipped, not blamed.
+  assert.deepEqual(collectMissingNodeTypeReasons([{ id: 1 }], ["X"]), []);
+});
+
+// ---------------------------------------------------------------------------
+// graphErrorsResultIsClean — honest "errors vs none" for the command summary (#399/#356)
+// ---------------------------------------------------------------------------
+
+test("graphErrorsResultIsClean: TRUE only for a truly empty result", () => {
+  assert.equal(graphErrorsResultIsClean({ errored_count: 0, node_errors: null, last_execution_error: null }), true);
+  assert.equal(graphErrorsResultIsClean({}), true);
+  assert.equal(graphErrorsResultIsClean(null), true);
+});
+
+test("graphErrorsResultIsClean: FALSE for a missing-node-type-ONLY result (bypassed node — #399)", () => {
+  // The exact false-clean the summary label produced: no node_errors / exec error, but
+  // a populated missing_node_types (and errored_count from the attached per-node reason).
+  assert.equal(
+    graphErrorsResultIsClean({
+      errored_count: 1,
+      node_errors: null,
+      last_execution_error: null,
+      missing_node_types: ["RIFEInterpolation"],
+    }),
+    false,
+  );
+});
+
+test("graphErrorsResultIsClean: FALSE for missing_models / missing_media / missing_node_count only", () => {
+  assert.equal(graphErrorsResultIsClean({ missing_models: [{ file: "x.safetensors" }] }), false);
+  assert.equal(graphErrorsResultIsClean({ missing_media: [{ file: "in.png" }] }), false);
+  assert.equal(graphErrorsResultIsClean({ missing_node_count: 2 }), false);
+});
+
+test("graphErrorsResultIsClean: FALSE for raw validation / execution errors", () => {
+  assert.equal(graphErrorsResultIsClean({ node_errors: { 3: { errors: [] } } }), false);
+  assert.equal(graphErrorsResultIsClean({ last_execution_error: { node_id: 5 } }), false);
+  assert.equal(graphErrorsResultIsClean({ errored_count: 2 }), false);
 });

@@ -107,6 +107,8 @@ import {
   isStaleAssetCandidate as isStaleAssetCandidateLib,
   reapplyDefsToLiveNodes,
   refreshComboOptionsFromDefs,
+  collectMissingNodeTypeReasons,
+  graphErrorsResultIsClean,
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing } from "./lib/node-resolve.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
@@ -6198,6 +6200,23 @@ const GRAPH_TOOL_EXECUTORS = {
       addReason(node_id, { kind: "missing_media", ...rest });
     }
 
+    // 2) Uninstalled node TYPES, attached PER NODE (#399). collectMissingAssets only
+    //    reports the type NAMES at the top level (missing_node_types, above); on their
+    //    own they never land on a node, so a red "node type not installed" node —
+    //    especially a BYPASSED or MUTED one, which LiteGraph may not flag has_errors —
+    //    fell through the union below and graph_get_errors returned a clean, empty state
+    //    that CONTRADICTED the sidebar's own load-time MISSING ASSETS warning. Blame
+    //    every node on the CURRENTLY-VIEWED graph whose type is in the missing set, so it
+    //    surfaces with a missing_node_type reason instead of vanishing. Iterating `nodes`
+    //    covers bypass/mute (mode is never filtered) and mirrors the exact scope of the
+    //    missing_model/missing_media per-node join above — a type nested inside an
+    //    un-entered subgraph is still reported BY NAME at the top level (missing_node_types
+    //    lists it), and gets its per-node reason once the user drills into that subgraph,
+    //    identical to how a subgraph-hosted missing model behaves here.
+    for (const { nodeId, type } of collectMissingNodeTypeReasons(nodes, missingNodeTypes)) {
+      addReason(nodeId, { kind: "missing_node_type", type });
+    }
+
     // 3) Per-node VALIDATION errors from the last queue attempt. `app.lastNodeErrors`
     //    is the classic surface; the execution-error store carries the same map and
     //    outlives some app-level resets, so it's the fallback (verified live: both
@@ -6275,7 +6294,20 @@ const GRAPH_TOOL_EXECUTORS = {
           : { note: "Flagged by LiteGraph but no source explained it — it may be stale; re-run to refresh, or check the node's widget values." }),
       }));
 
-    const clean = !nodeErrors && !lastExecFailure && !erroredNodes.length;
+    // "clean" must reflect EVERY surface, not just per-node/exec errors — a workflow
+    // whose only defect is a missing asset (model/media/node-type) that didn't land on
+    // an erroredNode (e.g. a top-level missing-type count with no mappable node) must
+    // NOT emit the "no errors recorded" note alongside a populated missing_* field
+    // (#399/#356 self-contradiction). Fold the asset surfaces in so the note and the
+    // reported misses can never disagree in one payload.
+    const clean =
+      !nodeErrors &&
+      !lastExecFailure &&
+      !erroredNodes.length &&
+      !missingModels.length &&
+      !missingMedia.length &&
+      !missingNodeTypes.length &&
+      !missingNodeCount;
     return {
       viewing: describeActiveGraph(graph),
       node_count: nodes.length,
@@ -9906,11 +9938,27 @@ function describeCommand(cmd, msg, reply) {
         icon: "pi-search",
         text: `Found ${r.count}${r.truncated ? "+" : ""} of ${r.total} node${r.total === 1 ? "" : "s"}`,
       };
-    case "graph_get_errors":
+    case "graph_get_errors": {
+      // Label from the COMPLETE error surface, not just raw validation/exec fields:
+      // a missing-asset-ONLY result (e.g. a bypassed uninstalled node — #399) carries
+      // neither node_errors nor last_execution_error, so the old check mislabelled it
+      // "none" while the payload actually reported missing_node_types/models/media.
+      if (graphErrorsResultIsClean(r)) {
+        return { icon: "pi-info-circle", text: "Checked errors — none" };
+      }
+      const missingAssets =
+        (r.missing_models?.length || 0) +
+        (r.missing_media?.length || 0) +
+        (r.missing_node_types?.length || 0) +
+        (Number(r.missing_node_count) || 0);
+      const parts = [];
+      if (r.errored_count) parts.push(`${r.errored_count} node${r.errored_count === 1 ? "" : "s"}`);
+      if (missingAssets) parts.push(`${missingAssets} missing asset${missingAssets === 1 ? "" : "s"}`);
       return {
-        icon: "pi-info-circle",
-        text: r.node_errors || r.last_execution_error ? "Read execution errors" : "Checked errors — none",
+        icon: "pi-exclamation-triangle",
+        text: parts.length ? `Found errors — ${parts.join(", ")}` : "Read execution errors",
       };
+    }
     case "free_vram":
       return { icon: "pi-bolt", text: "Unloaded models — freed VRAM" };
     case "workflow_save":
