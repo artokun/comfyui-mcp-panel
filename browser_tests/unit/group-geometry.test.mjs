@@ -19,6 +19,7 @@ import {
   groupMemberNodes,
   classifyRequestedMembership,
   refreshNodeArea,
+  syncNodeArea,
 } from "../../web/js/lib/group-geometry.js";
 
 // Minimal fixtures. No boundingRect => nodeFocusBounds falls back to pos/size
@@ -114,6 +115,59 @@ test("classifyRequestedMembership reports missing requested nodes", () => {
   const cls = classifyRequestedMembership([1, 2, 3], [1, 3]);
   assert.deepEqual(cls.missing, [2]);
   assert.deepEqual(cls.extra, []);
+});
+
+test("classifyRequestedMembership matches number requests to string live ids (#566/#388)", () => {
+  // Tool schema sends node_ids as numbers; live LiteGraph ids are strings. A raw
+  // Set compare (9 !== "9") would put every id in BOTH extra and missing and fire
+  // the geometric warning on every clean grouping. Type-normalized compare = clean.
+  const cls = classifyRequestedMembership([9, 10], ["9", "10"]);
+  assert.deepEqual(cls.extra, [], "no member is spuriously 'extra'");
+  assert.deepEqual(cls.missing, [], "no requested id is spuriously 'missing'");
+});
+
+test("classifyRequestedMembership still flags genuine extra/missing across id types", () => {
+  // Requested numbers; live string ids: one requested node absent, one neighbor captured.
+  const cls = classifyRequestedMembership([9, 10, 11], ["9", "10", "999"]);
+  assert.deepEqual(cls.extra, ["999"], "captured neighbor reported once, original string form");
+  assert.deepEqual(cls.missing, [11], "absent requested node reported once, original number form");
+});
+
+test("syncNodeArea makes create-group membership include nodes with a stale rect (#391)", () => {
+  // Node lives at [3400,0] but its cached boundingRect is stale at the origin
+  // (loaded/rendered elsewhere). boundsAroundNodes uses pos/size → correct box,
+  // but groupMemberNodes tests boundingRect-first → misses the node → empty group.
+  const n = { id: 278, pos: [3400, 0], size: [300, 120], boundingRect: [0, -30, 300, 150] };
+  const graph = graphOf(n);
+  const bbox = boundsAroundNodes([n]); // box wraps the LIVE pos, far from origin
+  const g = groupBox(bbox);
+
+  // FAIL-BEFORE: stale rect (preferred by nodeFocusBounds) sits at the origin,
+  // outside the box → node is wrongly excluded and the group looks empty.
+  assert.deepEqual(
+    groupMemberNodes(graph, g).map((x) => x.id),
+    [],
+    "stale boundingRect wrongly yields an empty group",
+  );
+
+  // PASS-AFTER: the create path syncs the cached rect to live pos/size first.
+  syncNodeArea(n);
+  assert.deepEqual(n.boundingRect, [3400, -30, 300, 150], "rect resynced to live pos/size");
+  assert.deepEqual(
+    groupMemberNodes(graph, g).map((x) => x.id),
+    [278],
+    "requested node is now a geometric member of its own box",
+  );
+});
+
+test("syncNodeArea is a no-op without a cached rect and supports typed arrays", () => {
+  const fresh = { id: 1, pos: [10, 10], size: [200, 100] };
+  syncNodeArea(fresh);
+  assert.equal(fresh.boundingRect, undefined, "nothing to sync when nodeFocusBounds uses live pos/size");
+  syncNodeArea(null); // must not throw
+  const typed = { id: 2, pos: [50, 60], size: [80, 40], boundingRect: Float32Array.from([0, 0, 1, 1]) };
+  syncNodeArea(typed);
+  assert.deepEqual([...typed.boundingRect], [50, 30, 80, 70], "typed-array rect resynced in place");
 });
 
 test("groupBoundsOf handles _bounding and pos/size, rejects garbage", () => {
