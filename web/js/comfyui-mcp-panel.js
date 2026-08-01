@@ -6613,6 +6613,11 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   async workflow_new() {
+    // #433 TOCTOU: snapshot the reconnect epoch BEFORE the async native work. If a
+    // reconnect lands mid-operation it advances the epoch, and stamping the NEW
+    // epoch at the end would suppress the warning that reconnect must raise (codex
+    // P1). We only claim authoritative below when the epoch is UNCHANGED.
+    const openedForEpoch = backendReconnectEpoch;
     const mgr = app?.extensionManager;
     if (!mgr?.command?.execute) throw new Error("command service unavailable");
     // Comfy.NewBlankWorkflow opens a fresh TAB — the current workflow is untouched.
@@ -6638,14 +6643,18 @@ const GRAPH_TOOL_EXECUTORS = {
     const key = workflowTabId(wf);
     workflowStableUuid(wf);
     // #433: an explicit new-tab authoritatively re-points `active` — record it
-    // against the CURRENT reconnect epoch so later reads trust `active` again.
-    activeWorkflowResyncEpoch = backendReconnectEpoch;
+    // against the epoch we STARTED on, but only if no reconnect intervened during
+    // the async work (else its tab-restore may have overridden us — leave armed).
+    if (backendReconnectEpoch === openedForEpoch) activeWorkflowResyncEpoch = openedForEpoch;
     // `key`/`routing_key` are the unique handle the agent should pass to
     // panel_set_workflow_target so its session pins to this exact graph.
     return { created: true, active: getWorkflowTitle(), key, routing_key: key };
   },
 
   async workflow_open({ path }) {
+    // #433 TOCTOU: snapshot the reconnect epoch BEFORE the async open (see
+    // workflow_new) so a reconnect landing mid-operation is not masked by our stamp.
+    const openedForEpoch = backendReconnectEpoch;
     const s = app?.extensionManager?.workflow;
     if (!s?.openWorkflow) throw new Error("workflow service unavailable");
     const find = () => {
@@ -6707,8 +6716,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // diff otherwise flips it to modified:true and blocks an unforced close).
     await clearSpuriousOpenModified(target);
     // #433: an explicit open authoritatively re-points `active` — record it against
-    // the CURRENT reconnect epoch so later reads trust `active` again.
-    activeWorkflowResyncEpoch = backendReconnectEpoch;
+    // the epoch we STARTED on, but only if no reconnect intervened during the async
+    // open (else its tab-restore may have overridden us — leave the window armed).
+    if (backendReconnectEpoch === openedForEpoch) activeWorkflowResyncEpoch = openedForEpoch;
     return {
       opened: { path: target.path, filename: target.filename },
       modified: !!target.isModified,

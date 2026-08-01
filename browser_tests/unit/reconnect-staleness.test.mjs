@@ -134,9 +134,25 @@ test("activeStaleHint names the risk and the recovery action", () => {
 // --- Wiring guards (close the codex "tests don't exercise the wiring" gap) ------
 // The handlers need the real ComfyUI `app`/canvas to run, so we can't unit-invoke
 // them here. Instead assert on the SOURCE that the wiring is present, so removing
-// any of it fails a test rather than silently reintroducing the bug.
+// any of it fails a test rather than silently reintroducing the bug. To avoid a
+// false-pass from a NEIGHBOUR handler's code (codex P2), each body is extracted up
+// to the NEXT executor-method declaration, and ordering (sync BEFORE the membership
+// read) is asserted explicitly.
 
-test("#433 wiring: reconnect bumps the epoch on a MONOTONIC clock, open/new record it", () => {
+/** Body of an object method from its `sig` up to the next 2-space-indented method
+ *  declaration (executor methods are indented exactly 2 spaces; nested code is 4+),
+ *  so the slice contains ONLY this handler — never a neighbour's. */
+function handlerBody(src, sig) {
+  const start = src.indexOf(sig);
+  if (start === -1) return null;
+  const after = start + sig.length;
+  // Next `\n  name(` / `\n  async name(` — the following executor method.
+  const m = src.slice(after).match(/\n {2}(?:async )?[A-Za-z_][A-Za-z0-9_]*\s*\(/);
+  const end = m ? after + m.index : src.length;
+  return src.slice(start, end);
+}
+
+test("#433 wiring: reconnect bumps the epoch on a MONOTONIC clock; open/new/readers wire it", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   // Epoch bump + monotonic timestamp live inside the `reconnected` listener.
   const reconnectBlock = src.slice(
@@ -145,20 +161,32 @@ test("#433 wiring: reconnect bumps the epoch on a MONOTONIC clock, open/new reco
   );
   assert.match(reconnectBlock, /backendReconnectEpoch \+= 1/, "reconnect must bump the epoch");
   assert.match(reconnectBlock, /backendReconnectedAt = monotonicNow\(\)/, "reconnect must arm the monotonic window");
-  // Both explicit resync sites stamp the CURRENT epoch (not a wall-clock time).
-  const resyncStamps = src.match(/activeWorkflowResyncEpoch = backendReconnectEpoch/g) ?? [];
-  assert.ok(resyncStamps.length >= 2, `open AND new must record the resync epoch (found ${resyncStamps.length})`);
-  // The read tools consult the helper with the epoch pair + monotonic now.
-  const readerCalls = src.match(/activeWorkflowPossiblyStale\(\{/g) ?? [];
-  assert.ok(readerCalls.length >= 2, `workflow_list + graph_outline must both check staleness (found ${readerCalls.length})`);
-  assert.match(src, /reconnectEpoch: backendReconnectEpoch/, "readers pass the epoch for ordering");
-  assert.match(src, /now: monotonicNow\(\)/, "readers use the monotonic clock");
+
+  // Each explicit resync site (open AND new) must stamp the epoch GUARDED by the
+  // TOCTOU check (codex P1): only when no reconnect intervened during the async op.
+  for (const sig of ["async workflow_new()", "async workflow_open({"]) {
+    const body = handlerBody(src, sig);
+    assert.ok(body, `${sig} must exist`);
+    assert.match(body, /const openedForEpoch = backendReconnectEpoch;/, `${sig} must snapshot the epoch before awaiting`);
+    assert.match(
+      body,
+      /if \(backendReconnectEpoch === openedForEpoch\) activeWorkflowResyncEpoch = openedForEpoch;/,
+      `${sig} must stamp the resync epoch ONLY if unchanged (TOCTOU guard)`,
+    );
+  }
+
+  // BOTH readers must consult the helper — checked in their OWN bodies, not globally.
+  for (const sig of ["workflow_list()", "graph_outline()"]) {
+    const body = handlerBody(src, sig);
+    assert.ok(body, `${sig} must exist`);
+    assert.match(body, /activeWorkflowPossiblyStale\(\{/, `${sig} must check post-reconnect staleness`);
+    assert.match(body, /reconnectEpoch: backendReconnectEpoch/, `${sig} must pass the epoch for ordering`);
+    assert.match(body, /now: monotonicNow\(\)/, `${sig} must use the monotonic clock`);
+  }
 });
 
-test("#429 wiring: every group-membership READ handler resyncs live rects first", () => {
+test("#429 wiring: every group-membership READ handler resyncs live rects BEFORE the read", () => {
   const src = readFileSync(PANEL_JS, "utf8");
-  // For each handler, take the slice from its declaration to the next handler and
-  // assert syncGraphNodeAreas appears before the geometric membership read.
   const handlers = [
     "graph_get_state()",
     "graph_outline()",
@@ -169,14 +197,16 @@ test("#429 wiring: every group-membership READ handler resyncs live rects first"
     "graph_remove_group({",
   ];
   for (const sig of handlers) {
-    const start = src.indexOf(sig);
-    assert.notEqual(start, -1, `handler ${sig} must exist`);
-    // Bound the slice to a reasonable handler size so we test THIS handler's body.
-    const body = src.slice(start, start + 2200);
-    assert.match(
-      body,
-      /syncGraphNodeAreas\(graph\)/,
-      `handler ${sig} must resync live rects before reading geometric membership (#429)`,
+    const body = handlerBody(src, sig);
+    assert.ok(body, `handler ${sig} must exist`);
+    const syncAt = body.indexOf("syncGraphNodeAreas(graph)");
+    assert.notEqual(syncAt, -1, `handler ${sig} must resync live rects (#429)`);
+    // The membership read is via summarizeGroup(...) or groupMemberNodes(...).
+    const readMatch = body.match(/summarizeGroup\(graph|groupMemberNodes\(graph/);
+    assert.ok(readMatch, `handler ${sig} must read geometric membership`);
+    assert.ok(
+      syncAt < readMatch.index,
+      `handler ${sig} must resync BEFORE computing membership (sync@${syncAt} vs read@${readMatch.index})`,
     );
   }
 });
