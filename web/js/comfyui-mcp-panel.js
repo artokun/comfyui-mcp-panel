@@ -5951,7 +5951,29 @@ const GRAPH_TOOL_EXECUTORS = {
       case "zoom": {
         const s = Number(scale);
         if (!(s > 0.05 && s <= 4)) throw new Error("scale must be in (0.05, 4]");
+        // #401: preserve the graph-space point currently at the viewport CENTER.
+        // Naively writing ds.scale keeps the graph ORIGIN (top-left, at -ds.offset)
+        // pinned, so changing scale slides the center away — silently undoing a
+        // preceding center_on_node. The viewport center in graph space is
+        //   c = -ds.offset + cssSize / (2 * scale)     (see graph_view_nodes_in_viewport)
+        // Holding c constant across the scale change gives
+        //   offset += (cssSize / 2) * (1/newScale - 1/oldScale).
+        // ds.scale/ds.offset are CSS pixels, so measure the element's CSS rect
+        // (matches graph_view_nodes_in_viewport), not the DPR-scaled backing store.
+        const prev = Number(ds.scale);
+        const el = canvas.canvas;
+        const rect = typeof el?.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+        const cssW = rect && rect.width > 0 ? rect.width : Number(el?.clientWidth) || Number(el?.width) || 0;
+        const cssH = rect && rect.height > 0 ? rect.height : Number(el?.clientHeight) || Number(el?.height) || 0;
         ds.scale = s;
+        // ds.offset is a Float32Array on ComfyUI's LiteGraph canvas (not a plain
+        // Array), so gate on "indexable pair" — the other branches index it the
+        // same way — rather than Array.isArray, which would skip typed offsets
+        // and leave every real zoom pinning the origin (codex P1).
+        if (Number.isFinite(prev) && prev > 0 && cssW > 0 && cssH > 0 && Number(ds.offset?.length) >= 2) {
+          ds.offset[0] += (cssW / 2) * (1 / s - 1 / prev);
+          ds.offset[1] += (cssH / 2) * (1 / s - 1 / prev);
+        }
         break;
       }
       default:
@@ -10995,11 +11017,78 @@ function buildPanel() {
     ringTitle.textContent = `Context window ~${pct}% used`;
     ctxLabel.textContent = clamped > 0 ? `${pct}%` : "—";
   }
-  // Restore last % across reloads (orchestrator also re-pushes on connect).
-  {
-    const p0 = Number(ssGet(CTX_KEY));
-    if (p0 > 0) setContextPct(p0);
+  // #381: the ring is persisted PER conversation, not globally. A single global
+  // key showed the PREVIOUS conversation's fill against the newly-switched one
+  // until the next agent_status push (a near-full context could read as having
+  // headroom). The ring describes a CONVERSATION == thread, and one workflow can
+  // hold several saved conversations, so key STRICTLY by the active thread id —
+  // stable across workflow rename/save-as and a follows-panel canvas switch (same
+  // thread), distinct per conversation so neither a workflow switch nor picking an
+  // older history entry in the same workflow leaks a stale fill (codex P2). There
+  // is deliberately NO workflow-scope fallback: the pre-first-message view has no
+  // conversation, so it has no key — the ring stays "—" and nothing is persisted
+  // or painted against it, so a re-push in that gap can't leak into the thread the
+  // first message then mints (codex P2). Returns null when no thread is shown.
+  function ctxScopeKey() {
+    return thread?.id ? `${CTX_KEY}:${thread.id}` : null;
   }
+  // Where an agent_status fill is PERSISTED. Attribute it to the conversation
+  // that owns the live turn (liveTurnThreadId, captured at turn start), not the
+  // currently-displayed `thread` (codex P2): when the user switches history
+  // mid-turn, a late status frame draining from the interrupted agent must land
+  // under ITS conversation, never the newly-selected one. resume_session /
+  // new_session only ARM a switch (no status frame is pushed for the new
+  // conversation until its own turn begins), so a frame arriving in that gap is
+  // always the old turn's. Outside a live turn (e.g. the reconnect re-push)
+  // liveTurnThreadId is null and the current conversation is the right target.
+  function ctxPersistKey() {
+    return liveTurnThreadId ? `${CTX_KEY}:${liveTurnThreadId}` : ctxScopeKey();
+  }
+  // Whether an incoming usage frame should REPAINT the visible ring. It should
+  // only when it belongs to the conversation on screen — either there is no live
+  // turn (reconnect re-push for the shown chat) or the live turn's owner IS the
+  // shown chat. A frame draining from a BACKGROUND turn (owner ≠ shown chat, e.g.
+  // the user switched history mid-turn) is still persisted to its owner but must
+  // NOT overwrite the freshly-restored ring of the chat now on screen (codex P2).
+  function ctxFrameForActiveView() {
+    // No live turn: only the shown conversation's own re-push should paint — and
+    // only if a conversation is actually shown (an empty pre-thread view stays
+    // "—"). During a turn: paint only when its owner is the shown conversation.
+    if (!liveTurnThreadId) return Boolean(thread?.id);
+    return liveTurnThreadId === (thread?.id ?? null);
+  }
+  // Repaint the ring from the shown conversation's persisted value, or blank it
+  // when it has none (or none is shown). Called on a genuine workflow switch,
+  // on a history/thread switch, and after restore so the ring always describes
+  // the conversation currently on screen (#381).
+  function refreshContextRingForScope() {
+    const key = ctxScopeKey();
+    const v = key ? Number(ssGet(key)) : 0;
+    if (v > 0) setContextPct(v);
+    else {
+      setContextPct(0);
+      ctxLabel.textContent = "—";
+    }
+  }
+  // Drop every scope's persisted fill — used when clearing ALL history, which
+  // removes the conversations those values described (also sweeps the pre-#381
+  // global key so an upgraded tab can't restore it).
+  function clearAllCtxScopes() {
+    try {
+      const store = window.sessionStorage;
+      for (let i = store.length - 1; i >= 0; i--) {
+        const k = store.key(i);
+        if (k && (k === CTX_KEY || k.startsWith(`${CTX_KEY}:`))) store.removeItem(k);
+      }
+    } catch {
+      // sessionStorage unavailable — nothing persisted to clear.
+    }
+  }
+  // NOTE: no restore here. No thread is bound during panel construction, so
+  // ctxScopeKey() is null and there is nothing to read; the ring is restored
+  // post-hydration by the history-restore pass (once the durable thread is
+  // selected) and repainted on every history/workflow switch. The orchestrator
+  // also re-pushes the live figure on connect.
 
   // Model + effort picker. The orchestrator forwards these to the Agent SDK,
   // so the chip actually drives the background agent (model live, effort on a
@@ -12412,6 +12501,10 @@ function buildPanel() {
       client?.sendFrame?.({ type: "new_session" });
     }
     persistThreads();
+    // #381 codex-P2: a sync from another tab just replaced or removed the active
+    // conversation — repaint the ring for the replacement (or blank it when the
+    // conversation was cleared) instead of leaving the deleted chat's fill up.
+    refreshContextRingForScope();
     return replacement;
   }
 
@@ -13633,7 +13726,9 @@ function buildPanel() {
     turnAnchors = []; // fresh conversation → no rewind anchors
     ssSet(CURRENT_THREAD_KEY, null);
     ssSet(SESSION_KEY, null);
-    ssSet(CTX_KEY, null);
+    // #381: the ring is keyed per THREAD, and `thread` is already null here, so
+    // there is nothing to clear — the outgoing conversation keeps its own fill
+    // (correct if reopened from history). The fresh empty view just blanks below.
     if (typeof resetAttachments === "function") resetAttachments();
     resetFeed();
     renderTodo([]); // fresh chat → empty plan tray
@@ -13707,6 +13802,10 @@ function buildPanel() {
     setActiveThread(followsPanel ? "panel:global" : (t.workflowKey || scopeKey), t.id);
     persistThreads();
     paintThread(t);
+    // #381/codex-P2: `thread` is now `t`, so repaint the ring from THIS
+    // conversation's own last-known fill (blank if none) — selecting an older
+    // history entry in the same workflow must not keep the prior chat's usage.
+    refreshContextRingForScope();
     // Resume this conversation's agent session (or start fresh if it has none),
     // so typing continues THIS chat rather than whatever was last active.
     ssSet(SESSION_KEY, sessionId);
@@ -13872,6 +13971,10 @@ function buildPanel() {
         );
       } catch { /* armContext unavailable — awareness rides the title instead */ }
     }
+    // #381: a genuine switch changed the conversation scope — repaint the ring
+    // from the newly-active scope's own last-known fill (or blank it) so it never
+    // keeps showing the previous workflow's value.
+    refreshContextRingForScope();
   }
 
   function renderHistory() {
@@ -14164,7 +14267,7 @@ function buildPanel() {
       turnAnchors = [];
       ssSet(CURRENT_THREAD_KEY, null);
       ssSet(SESSION_KEY, null);
-      ssSet(CTX_KEY, null);
+      clearAllCtxScopes(); // #381: clearing ALL history drops every scope's fill
       if (typeof resetAttachments === "function") resetAttachments();
       resetFeed();
       renderTodo([], { persist: false });
@@ -14442,6 +14545,11 @@ function buildPanel() {
   // tray) rather than start immediately. Drives the tray-vs-inline decision so
   // an idle send doesn't briefly flash through the tray.
   let agentWorking = false;
+  // Conversation that owns the in-flight turn, captured at turn start so a status
+  // frame is persisted under it even if the user switches history mid-turn (#381
+  // codex-P2). Null between turns; a page reload resets it. Set on onTurn
+  // "working", overwritten by the next turn's owner.
+  let liveTurnThreadId = null;
 
   // Set by a Settings "Set … token" button just before it asks the agent to open
   // the secure input, so the resolved value can be marked set/not-set (timestamp
@@ -14790,11 +14898,19 @@ function buildPanel() {
         // the NEXT turn, and a human can't end + restart a turn inside the window.
         if (Date.now() - localEndAt < STALE_WORKING_GUARD_MS) return;
         agentWorking = true;
+        // Pin the turn's owner so its usage frames persist under THIS
+        // conversation even if the user switches history before it ends (#381).
+        liveTurnThreadId = thread?.id ?? null;
         showThinking();
         noteActivity(); // turn start = real activity → seed the silence clock
         ssSet(MID_TASK_KEY, "1"); // a turn is in flight — arm the resume nudge
       } else if (state === "done") {
         agentWorking = false;
+        // Turn over: drop the owner so a later reconnect re-push (which has no
+        // live turn) is attributed to the conversation THEN on screen, not this
+        // completed one (#381 codex-P2). `done` is terminal — no more usage
+        // frames trail it — so clearing here cannot orphan a late frame.
+        liveTurnThreadId = null;
         hideThinking(); // authoritative terminal frame — clears the action label too
         ssSet(MID_TASK_KEY, null); // turn finished cleanly — nothing to resume
         // Snapshot the graph the agent is leaving behind; the next user turn diffs
@@ -14858,9 +14974,15 @@ function buildPanel() {
       // Percentage of the context window used (label + ring), persisted so a
       // reload isn't blank. % is what the user wants — not raw token counts.
       if (typeof s.context_pct === "number") {
-        setContextPct(s.context_pct);
-        ssSet(CTX_KEY, String(s.context_pct));
-        if (typeof s.cost_usd === "number") {
+        // Persist under the turn's OWNER always; repaint the ring only when the
+        // frame belongs to the conversation on screen (#381 codex-P2) — a
+        // background turn draining after a history switch must not overwrite the
+        // freshly-restored ring of the chat now displayed.
+        const forActiveView = ctxFrameForActiveView();
+        if (forActiveView) setContextPct(s.context_pct);
+        const persistKey = ctxPersistKey();
+        if (persistKey) ssSet(persistKey, String(s.context_pct)); // skip when no conversation owns it yet
+        if (forActiveView && typeof s.cost_usd === "number") {
           ringTitle.textContent = `Context ~${Math.round(s.context_pct * 100)}% used · $${s.cost_usd.toFixed(3)}`;
         }
       }
@@ -17743,6 +17865,7 @@ function buildPanel() {
       resetFeed();
       renderTodo([]);
       persistThreads();
+      refreshContextRingForScope(); // #381: restore this scope's fill post-hydration (blank if none)
       return;
     }
 
@@ -17765,6 +17888,7 @@ function buildPanel() {
     paintThread(durableActive);
     if (foreignSession) armVisibleTranscriptReplay();
     persistThreads();
+    refreshContextRingForScope(); // #381: restore this scope's fill post-hydration
   })();
 
   // ---- Settings dialog → live panel hooks ----
@@ -17800,6 +17924,7 @@ function buildPanel() {
     else newChat({ notifyBackend: false });
     currentWorkflowId = null;
     onWorkflowMaybeChanged();
+    refreshContextRingForScope(); // #381: the scope mode changed — reflect the target scope's fill
     appendSystem(
       mode === "panel"
         ? "Chat scope → panel-wide conversation."
