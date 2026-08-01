@@ -225,7 +225,7 @@ export function coerceWidgetValue(
   value,
   mergeBaseWidget = widget,
   subFieldPath = null,
-  { acceptEmptyComboOptions = false } = {},
+  { acceptEmptyComboOptions = false, out } = {},
 ) {
   const name = widget?.name ?? "(widget)";
 
@@ -340,7 +340,15 @@ export function coerceWidgetValue(
             `scalar (string/number/boolean) can be written to a combo. Refusing to write.`,
         );
       }
-      if (acceptEmptyComboOptions) return value;
+      if (acceptEmptyComboOptions) {
+        // Record that THIS acceptance — not ordinary membership — is what admitted the
+        // value, so applyWidgetWrite can decide the sibling cross-check from the
+        // COERCION-TIME verdict. It must never re-read the list to infer this: a
+        // stateful dynamic source can answer differently on a second call and would
+        // become an escape hatch around the check (codex confirmation round).
+        if (out) out.emptyAcceptanceUsed = true;
+        return value;
+      }
       throw new WidgetWriteError(
         `Combo widget "${name}" has an EMPTY option list; the server's option list may ` +
           `simply be stale — refreshing it before deciding.`,
@@ -881,9 +889,13 @@ export function applyWidgetWrite(
   // promotedResolution is reused so the write targets the EXACT node the fresh
   // /object_info gate authorized (#458), and resolveWidgetWrite also fails closed if
   // the AUTHORITATIVE parent rail widget can't be identified (#366).
+  const coerceOutcome = {};
   const { targetNode, widget: w, coerced, promotedFrom, promotedParentWidget, promotedParentWidgets, promotedHostInput } =
     resolveWidgetWrite(node, widgetName, value, resolveSource, assertTargetWritable, promotedResolution, {
       acceptEmptyComboOptions,
+      // Filled in by coerceWidgetValue when the EMPTY-LIST acceptance (not ordinary
+      // membership) is what admitted the value. Read below — never re-derived.
+      out: coerceOutcome,
     });
 
   // #366: for a promoted subgraph widget the AUTHORITATIVE value lives on the
@@ -917,17 +929,15 @@ export function applyWidgetWrite(
   // NON-EMPTY list must contain the value, or the whole write fails closed BEFORE any
   // mutation. A rail whose own list is unreadable or empty adds no information and is
   // skipped (the inner's server declaration already governs).
-  // …and ONLY when the empty-list acceptance was actually what let `coerced` through.
-  // Keying on the FLAG alone over-reached (codex final round, MINOR): a stateful inner
-  // options function can return [] for the first attempts and a real list containing the
-  // value by the final one, in which case ordinary membership validated the write and the
-  // rail needs no extra scrutiny — refusing there would be the very "guard rejects a
-  // legitimate case" bug this PR exists to fix. Re-reading the inner list decides it, and
-  // an inner list that is (still) empty/unreadable falls into the strict branch.
-  const innerOptions = acceptEmptyComboOptions && isComboWidget(w) ? comboOptions(w) : null;
-  const innerValidatedIt =
-    Array.isArray(innerOptions) && innerOptions.length > 0 && innerOptions.includes(coerced);
-  if (acceptEmptyComboOptions && !innerValidatedIt) {
+  // …and ONLY when the EMPTY-LIST acceptance is what actually admitted the value. Keying
+  // on the caller's FLAG alone over-reached: with a stateful inner options function the
+  // final attempt may have been validated by ordinary membership, and refusing the rail
+  // then would be the very "guard rejects a legitimate case" bug this PR exists to fix.
+  // The verdict is taken from COERCION TIME (coerceOutcome, set inside coerceWidgetValue)
+  // and never re-derived by reading the list again: a second read of a stateful dynamic
+  // source can disagree with the first, which would turn the narrowing into an escape
+  // hatch around this very check (codex confirmation round).
+  if (coerceOutcome.emptyAcceptanceUsed) {
     for (const other of [parentWidget, ...displayWidgets]) {
       if (!other || !isComboWidget(other)) continue;
       // A DYNAMIC (function) sibling list is UNVERIFIABLE from here (codex round-5): it

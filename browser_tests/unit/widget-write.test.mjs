@@ -2167,10 +2167,10 @@ test("#507 round-5: the dynamic-rail refusal is SCOPED to the empty-list path", 
 });
 
 test("#507 final round: when the INNER list validated the value normally, the dynamic-rail refusal does not fire", () => {
-  // A stateful inner options function that was empty for the earlier attempts but holds a
-  // real list containing the value by the final one: ordinary membership validated the
-  // write, so a dynamic parent rail needs no extra scrutiny and must not be refused —
-  // that would be the same "guard rejects a legitimate case" bug #496/#507 are about.
+  // The inner list is non-empty and CONTAINS the value, so ordinary membership admitted it
+  // and the empty-list acceptance was never used — a dynamic parent rail then needs no
+  // extra scrutiny and must not be refused, which would be the same "guard rejects a
+  // legitimate case" bug #496/#507 are about. The flag being set is not itself the trigger.
   const inner = {
     id: 301,
     type: "StarOllamaPromptHelper",
@@ -2222,4 +2222,60 @@ test("#507 final round: an OFF-list value against a non-empty inner list is stil
   );
   assert.equal(inner.widgets[0].value, "");
   assert.equal(railWidget.value, "");
+});
+
+test("#507 confirmation round: a STATEFUL inner options fn cannot be used to skip the parent-rail check", () => {
+  // The escape hatch codex found: if the sibling cross-check decided by RE-READING the
+  // inner list after coercion, a function that returns [] at coercion time (so the
+  // empty-list acceptance is what admitted the value) and a NON-EMPTY list containing the
+  // value on the next read would look "normally validated" — and an off-list value would
+  // then land on a static parent rail and be reported as success. The verdict must come
+  // from COERCION TIME, so this must still be refused.
+  let call = 0;
+  const inner = {
+    id: 301,
+    type: "StarOllamaPromptHelper",
+    // 1st call (coercion): empty ⇒ the empty-list acceptance admits the value.
+    // Every later call: a list that CONTAINS the value, which a re-read would trust.
+    widgets: [{ name: "model", type: "combo", options: { values: () => (call++ === 0 ? [] : ["off-list:70b"]) }, value: "" }],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) };
+  const railWidget = { name: "model_alias", type: "combo", options: { values: ["allowed:1b"] }, value: "" };
+  const parent = {
+    id: 320,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "model_alias", _widget: railWidget, widget: { name: "model_alias" }, _subgraphSlot: { name: "model_alias" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_node, si) =>
+    si?.name === "model_alias" ? { sourceNodeId: "301", sourceWidgetName: "model" } : null;
+  assert.throws(
+    () => applyWidgetWrite(parent, "model_alias", "off-list:70b", { ...HOOKS, resolveSource, acceptEmptyComboOptions: true }),
+    (err) => err instanceof WidgetWriteError && /not a valid option for the parent subgraph/.test(err.message),
+  );
+  assert.equal(inner.widgets[0].value, "", "inner untouched");
+  assert.equal(railWidget.value, "", "the off-list value never reached the rail");
+});
+
+test("#507 confirmation round: coerceWidgetValue reports empty-list acceptance ONLY when it was used", () => {
+  // The signal the cross-check keys on, asserted directly so a future refactor that stops
+  // setting it (silently disabling the rail check) fails here.
+  const empty = { name: "model", type: "combo", options: { values: [] }, value: "" };
+  const outEmpty = {};
+  assert.equal(coerceWidgetValue(empty, "anything", empty, null, { acceptEmptyComboOptions: true, out: outEmpty }), "anything");
+  assert.equal(outEmpty.emptyAcceptanceUsed, true, "the empty-list acceptance admitted it");
+
+  const full = { name: "model", type: "combo", options: { values: ["a", "b"] }, value: "a" };
+  const outFull = {};
+  assert.equal(coerceWidgetValue(full, "b", full, null, { acceptEmptyComboOptions: true, out: outFull }), "b");
+  assert.equal(outFull.emptyAcceptanceUsed, undefined, "ordinary membership admitted it — acceptance unused");
+
+  // And with the flag OFF an empty list is still a retryable refusal, never an acceptance.
+  const outOff = {};
+  assert.throws(
+    () => coerceWidgetValue(empty, "anything", empty, null, { out: outOff }),
+    (err) => err instanceof WidgetWriteError && err.emptyOptions === true && err.combo === true,
+  );
+  assert.equal(outOff.emptyAcceptanceUsed, undefined);
 });
