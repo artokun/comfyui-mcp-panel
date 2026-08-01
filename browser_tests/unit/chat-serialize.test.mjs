@@ -156,6 +156,19 @@ test("a persisted structured object WITH readable text is NOT dropped (#241)", (
   assert.equal(isDroppedAgentReplay({ content: [{ text: "hi" }] }), false);
 });
 
+test("a legacy persisted literal '[object Object]' string IS dropped on replay (#393)", () => {
+  // An older panel build stringified a structured payload via
+  // Object.prototype.toString and persisted the literal string
+  // "[object Object]". Because it IS a string, the coerce-based predicate would
+  // keep it and render a visible "[object Object]" bubble. Drop the exact
+  // legacy artifact.
+  assert.equal(isDroppedAgentReplay("[object Object]"), true);
+  // A normal string that merely CONTAINS those words (or differs by a char) is
+  // real user content and must NOT be dropped.
+  assert.equal(isDroppedAgentReplay("look: [object Object] appeared"), false);
+  assert.equal(isDroppedAgentReplay("[object Array]"), false);
+});
+
 test("null/undefined persisted text is dropped, never rendered as literal 'null' (#241)", () => {
   // These are non-string and carry no content; the pre-fix path rendered the
   // literal "null"/"undefined" via String(). Dropping is strictly better and

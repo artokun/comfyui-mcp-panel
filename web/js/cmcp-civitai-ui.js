@@ -19,6 +19,7 @@ import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import { openSubModal as openSubModalBase, toast } from "./cmcp-modal.js";
 import { chipRow as filterChipRow, makeFilterButton } from "./cmcp-filter.js";
 import { coerceMessageText } from "./lib/chat-serialize.js";
+import { isImeComposing } from "./lib/ime.js";
 
 const TABS = [
   { key: "images", label: "Images", icon: "pi-image", media: "image" },
@@ -1617,6 +1618,9 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       bmSearch.addEventListener("input", () => { renderOpts(); dd.classList.add("open"); });
       bmSearch.addEventListener("blur", closeDd);
       bmSearch.addEventListener("keydown", (e) => {
+        // A composing CJK IME owns Enter/arrows/Escape to navigate and commit
+        // its candidate window; don't hijack them to drive the dropdown (#385).
+        if (isImeComposing(e)) return;
         if (e.key === "Escape") {
           // Escape MUST stop here. The sheet is mounted inside ComfyUI's own
           // document, so an un-stopped Escape closes the whole filter sheet
