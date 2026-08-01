@@ -6,8 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.25] - 2026-08-01
+
+### Added
+- **`panel_resize_node` resizes a node on the live canvas, and `set_widget` can drive the LTXDirector timeline (#530, #314).** Resize prefers `setSize()` so a Note/MarkdownNote reflows to a readable size (undo-enveloped). LTXDirector's timeline is driven through the node's own `_applyLoadedTimeline` re-hydration, keyed strictly to the `LTXDirector` node type and merged onto the current snapshot (never a general widget-replay), so omitted tracks are preserved and derived widgets are refused loudly.
+
 ### Fixed
-- **`panel_copy_nodes` no longer reports a clean copy that can't round-trip (#286).** When a workflow's custom-node packs aren't installed, copying those nodes used to return a bare `copied: N` even though a later paste silently drops every unregistered type (the packs aren't registered on this frontend, so `LiteGraph.createNode` returns null). `graph_copy_nodes` now checks the copied selection against the frontend's registered node types up front and returns `unregistered_types` + a `warning` naming exactly which types won't paste — so an agent knows before it builds an incomplete graph, complementing the paste-side drop report shipped in #261.
+- **Subgraph exit/run/unpack are scope-aware and safe (#412, #411, #405, #409).** Exiting a nested subgraph pops to the immediate parent (not the workflow root); `panel_run` can target an output node inside a nested subgraph; `panel_unpack_subgraph` is atomic (fully unpacks or rolls back on error instead of leaving a half-unpacked graph); and an unsafe positional bypass of a multi-input subgraph is refused unless `force:true`.
+- **`softReload()` no longer wedges the bridge (#379).** The by-design `503` from `/comfyui_mcp_panel/reload` always hit the failure branch and returned after stopping the client without restarting it (permanent connected-chip/dead-bridge). It now reconnects on every path (bounded), with bridge-lifecycle hardening (instance-guarded listeners, async-reply guard, handshake-timer guard).
+- **The PLAN box spinner stops when the agent is idle (#492).** A plan step left `active` when a turn ended kept spinning forever; the glyph now spins only while the agent is actually working and reverts to a static dot on turn-end/interrupt/disconnect.
+- **`panel_copy_nodes` warns at copy time when copied nodes can't round-trip (#286)** — an unregistered/uninstalled pack type is surfaced as `unregistered_types` + a warning instead of a bare `copied:N` that then silently drops on paste.
+- **Type-name slot addressing, CivitAI search timeout, legacy-Manager node search (#406, #417, #426).** `panel_connect` resolves `from_output="IMAGE"` (a type name) against slot types instead of refusing it (ambiguous type → refuse, not guess); the CivitAI workflow search has a 15s timeout (no more infinite `loading`); and `panel_search_nodes` falls back to an `/object_info` search when a legacy Manager is unreachable.
 
 ## [0.11.24] - 2026-08-01
 
