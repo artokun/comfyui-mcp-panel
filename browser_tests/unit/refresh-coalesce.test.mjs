@@ -140,3 +140,59 @@ test("a payload call still runs even if the in-flight refresh REJECTS", async ()
 
   assert.ok(registered.includes(NEW_DEFS), "the payload was registered despite the older refresh failing");
 });
+
+// #608: panel_refresh_nodes' frontend executor (refresh_nodes) awaits a FORCED
+// no-payload refresh and reports its freshness verdict back to the tool. The
+// executor is `refreshComfyNodeDefs(undefined, { force:true })` -> `{ refreshed:
+// !!verdict }`, so the coalescer MUST resolve a forced refresh to runRegister's
+// OWN return value (registerComfyNodeDefs returns true only when it authoritatively
+// fetched /object_info AND refreshed combos). If the coalescer swallowed that
+// value, panel_refresh_nodes would always report refreshed:false and an agent
+// couldn't tell a real refresh from a no-op after stage_output_as_input.
+test("#608: a forced (no-payload) refresh resolves to runRegister's freshness verdict", async () => {
+  let verdict = true;
+  const { coalescer } = makeHarnessReturning(() => verdict);
+
+  assert.equal(await coalescer(undefined, { force: true }), true, "forced refresh forwards a true verdict");
+
+  verdict = false;
+  assert.equal(await coalescer(undefined, { force: true }), false, "forced refresh forwards a false verdict");
+});
+
+test("#608: a forced refresh queued BEHIND an in-flight run resolves to the trailing run's verdict", async () => {
+  const gate = deferred();
+  let verdict = false;
+  const { coalescer } = makeHarnessReturning(async (defs) => {
+    if (defs == null) {
+      // First (in-flight) run blocks; its stale verdict must NOT be what the
+      // trailing forced call reports.
+      await gate.promise;
+    }
+    return verdict;
+  });
+
+  const inflight = coalescer(); // holds the slot
+  const forced = coalescer(undefined, { force: true }); // must run its OWN trailing pass
+  verdict = true; // the authoritative post-change fetch now sees the new asset
+  gate.resolve();
+
+  await inflight;
+  assert.equal(await forced, true, "the trailing forced refresh reports its own fresh verdict, not the stale join");
+});
+
+// Harness variant whose runRegister RETURNS a value (the freshness verdict), so a
+// test can assert what a caller (refresh_nodes) receives from the coalescer.
+function makeHarnessReturning(verdictImpl) {
+  let inFlight = null;
+  const coalescer = makeRefreshCoalescer({
+    getInFlight: () => inFlight,
+    setInFlight: (p) => {
+      inFlight = p;
+    },
+    runRegister: async (defs) => {
+      const v = verdictImpl(defs);
+      return v && typeof v.then === "function" ? await v : v;
+    },
+  });
+  return { coalescer };
+}
