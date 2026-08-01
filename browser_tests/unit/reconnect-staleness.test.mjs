@@ -167,11 +167,21 @@ test("#433 wiring: reconnect bumps the epoch on a MONOTONIC clock; open/new/read
   for (const sig of ["async workflow_new()", "async workflow_open({"]) {
     const body = handlerBody(src, sig);
     assert.ok(body, `${sig} must exist`);
-    assert.match(body, /const openedForEpoch = backendReconnectEpoch;/, `${sig} must snapshot the epoch before awaiting`);
+    const snapAt = body.indexOf("const openedForEpoch = backendReconnectEpoch;");
+    assert.notEqual(snapAt, -1, `${sig} must snapshot the epoch`);
     assert.match(
       body,
       /if \(backendReconnectEpoch === openedForEpoch\) activeWorkflowResyncEpoch = openedForEpoch;/,
       `${sig} must stamp the resync epoch ONLY if unchanged (TOCTOU guard)`,
+    );
+    // The snapshot MUST precede the first `await` — otherwise a reconnect during the
+    // native work would advance the epoch before we capture it, reintroducing the
+    // TOCTOU P1 with the guard still "present". Ordering, not mere presence.
+    const firstAwaitAt = body.indexOf("await ");
+    assert.notEqual(firstAwaitAt, -1, `${sig} is async and must contain an await`);
+    assert.ok(
+      snapAt < firstAwaitAt,
+      `${sig} must snapshot openedForEpoch BEFORE the first await (snap@${snapAt} vs await@${firstAwaitAt})`,
     );
   }
 
