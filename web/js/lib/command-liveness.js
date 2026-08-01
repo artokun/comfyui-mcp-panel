@@ -91,6 +91,37 @@ export function describeUndeliveredReply(entry) {
   );
 }
 
+/**
+ * Commands whose RESULT is the user's own private input, not a description of a graph
+ * operation: `request_secret` returns the pasted secret verbatim, and `ask_user` returns
+ * whatever the user typed. The panel already treats both as unspeakable elsewhere (they
+ * are never echoed as activity cards and never recorded to history).
+ *
+ * They must therefore NEVER be journaled as raw frames for cross-socket replay (codex).
+ * A replay lands on whatever socket is current later — which can be a DIFFERENT
+ * orchestrator entirely after a backend switch or a Bridge-URL change — so replaying the
+ * raw frame would hand one session's secret to another process. Redacted instead: the
+ * outcome is still reported truthfully, and for a secret "you never received it" is
+ * exactly right, because the orchestrator only stores what actually reaches it.
+ */
+export const SENSITIVE_RESULT_CMDS = new Set(["request_secret", "ask_user"]);
+
+/** The frame that is safe to journal for `cmd`. Non-sensitive commands pass through
+ *  unchanged; sensitive ones are replaced by a rid-correlated, payload-free failure that
+ *  tells the caller to re-request on the current connection. */
+export function redactSensitiveReply(reply, cmd) {
+  if (!reply || !SENSITIVE_RESULT_CMDS.has(cmd)) return reply;
+  return {
+    rid: reply.rid,
+    ok: false,
+    error:
+      `the panel collected the "${cmd}" response, but the connection dropped before it could be ` +
+      `returned. Its content is deliberately NOT replayed across a reconnect (it is the user's ` +
+      `own input, and the connection it was meant for is gone). Nothing was applied and nothing ` +
+      `was stored — ask again on the current connection.`,
+  };
+}
+
 /** Bounded journal of command outcomes whose reply could not be delivered. */
 export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
   const limit = Number.isFinite(cap) && cap > 0 ? cap : LOST_REPLY_CAP;
@@ -100,15 +131,23 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
      *  it can be re-sent verbatim on the next socket: rids are random UUIDs, so an
      *  orchestrator that no longer knows the rid simply drops it, and one that still has
      *  the command pending resolves it with its TRUE outcome. */
-    record({ reply, cmd, reason, at = 0 } = {}) {
+    record({ reply, cmd, reason, at = 0, url } = {}) {
       if (!reply || typeof reply !== "object" || typeof reply.rid !== "string") return null;
+      const safe = redactSensitiveReply(reply, cmd);
       const entry = {
-        rid: reply.rid,
+        rid: safe.rid,
         cmd: typeof cmd === "string" && cmd ? cmd : "unknown",
-        ok: Boolean(reply.ok),
+        // Report the outcome of what we JOURNALED, so a redacted entry never advertises a
+        // success it will not deliver.
+        ok: Boolean(safe.ok),
         reason: typeof reason === "string" && reason ? reason : "socket_closed",
         at: Number.isFinite(at) ? at : 0,
-        reply,
+        // The bridge this outcome BELONGS to. A replay must never cross it: after a backend
+        // switch or a Bridge-URL change the next socket is a different orchestrator, and
+        // volunteering another session's result to it is a leak, not a recovery (codex).
+        url: typeof url === "string" && url ? url : null,
+        redacted: safe !== reply,
+        reply: safe,
       };
       entries.push(entry);
       while (entries.length > limit) entries.shift();
@@ -118,8 +157,8 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
     list() {
       return entries.slice();
     },
-    /** Wire summaries — the raw `reply` payload is NOT included (it can be large and the
-     *  summary is only meant to say WHICH outcomes were lost). */
+    /** Wire summaries — the raw `reply` payload is NOT included (it can be large, and for
+     *  a sensitive command it is exactly what must not travel). */
     summaries() {
       return entries.map(({ rid, cmd, ok, reason, at }) => ({ rid, cmd, ok, reason, at }));
     },
@@ -129,6 +168,12 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
       const out = entries;
       entries = [];
       return out;
+    },
+    /** Replace the contents wholesale — used by a replay that delivered SOME entries,
+     *  dropped others as un-replayable, and must keep only the rest for a later attempt. */
+    replace(next) {
+      entries = Array.isArray(next) ? next.slice(-limit) : [];
+      return entries.length;
     },
     size() {
       return entries.length;

@@ -9866,19 +9866,39 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     const lost = lostReplies.list();
     if (!lost.length) return;
     let sent = 0;
+    let dropped = 0;
+    const keep = [];
     for (const entry of lost) {
-      if (!target || target.readyState !== WebSocket.OPEN) break;
+      // NEVER replay across a bridge change (codex). An entry belongs to the orchestrator
+      // it was produced for; after a backend switch or a Bridge-URL edit the current socket
+      // is a DIFFERENT process, and volunteering another session's result to it is a leak,
+      // not a recovery. Such an entry is also meaningless there — its rid is unknown — so
+      // it is dropped rather than carried forever. (Sensitive results are additionally
+      // redacted at journal time and never travel at all.)
+      if (entry.url && entry.url !== url) {
+        dropped++;
+        continue;
+      }
+      if (!target || target.readyState !== WebSocket.OPEN) {
+        keep.push(entry);
+        continue;
+      }
       try {
         target.send(JSON.stringify(entry.reply));
         sent++;
       } catch {
-        break;
+        keep.push(entry);
       }
     }
-    if (sent === lost.length) lostReplies.drain();
+    if (sent || dropped) lostReplies.replace(keep);
     if (sent) {
       onLog(
         `Re-sent ${sent} command result${sent === 1 ? "" : "s"} the panel completed but could not deliver while the bridge was down.`,
+      );
+    }
+    if (dropped) {
+      onLog(
+        `Discarded ${dropped} undelivered command result${dropped === 1 ? "" : "s"} belonging to a previous bridge — they are not replayed to a different agent.`,
       );
     }
   }
@@ -9993,6 +10013,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           cmd,
           reason: classifyUndeliveredReply({ socketOpen, superseded, sendThrew }),
           at: Date.now(),
+          // Stamp the bridge this outcome belongs to so a replay can never cross it.
+          url,
         }),
       );
       return false;

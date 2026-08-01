@@ -27,6 +27,8 @@ import {
   classifyUndeliveredReply,
   describeUndeliveredReply,
   createLostReplyJournal,
+  SENSITIVE_RESULT_CMDS,
+  redactSensitiveReply,
   pruneAttempts,
   shouldReRegister,
   reRegisterExhaustedHint,
@@ -72,6 +74,68 @@ test("the journal keeps the EXACT reply frame (replayable verbatim) but omits it
   j.record({ reply, cmd: "workflow_open", reason: "socket_closed", at: 7 });
   assert.deepEqual(j.list()[0].reply, reply, "the frame must survive intact for a verbatim replay");
   assert.deepEqual(j.summaries(), [{ rid: "abc", cmd: "workflow_open", ok: true, reason: "socket_closed", at: 7 }]);
+});
+
+test("codex R8: a SENSITIVE result is never journaled in the clear (it must not survive to a replay)", () => {
+  // request_secret's result IS the pasted secret; ask_user's is whatever the user typed.
+  // A journaled raw frame is replayed on whatever socket is current later — which can be a
+  // DIFFERENT orchestrator after a backend switch — so the payload must not be kept at all.
+  for (const cmd of ["request_secret", "ask_user"]) {
+    assert.ok(SENSITIVE_RESULT_CMDS.has(cmd), `${cmd} must be classified sensitive`);
+    const j = createLostReplyJournal();
+    const entry = j.record({
+      reply: { rid: "r1", ok: true, result: "sk-live-SUPERSECRET" },
+      cmd,
+      at: 1,
+      url: "ws://127.0.0.1:9180",
+    });
+    assert.equal(entry.redacted, true);
+    assert.equal(entry.ok, false, "a redacted entry must not advertise a success it will not deliver");
+    assert.equal(
+      JSON.stringify(j.list()).includes("SUPERSECRET"),
+      false,
+      "the secret must not exist anywhere in the journal",
+    );
+    assert.match(entry.reply.error, /ask again on the current connection/);
+    assert.equal(entry.reply.rid, "r1", "the refusal must still correlate to the command");
+  }
+});
+
+test("codex R8: a NON-sensitive result is journaled verbatim so it can be replayed as-is", () => {
+  const j = createLostReplyJournal();
+  const reply = { rid: "r2", ok: true, result: { opened: { path: "x.json" } } };
+  const entry = j.record({ reply, cmd: "workflow_open", at: 1, url: "ws://127.0.0.1:9180" });
+  assert.equal(entry.redacted, false);
+  assert.deepEqual(entry.reply, reply);
+  assert.equal(entry.ok, true);
+  assert.equal(entry.url, "ws://127.0.0.1:9180", "the owning bridge must be stamped on the entry");
+  assert.equal(redactSensitiveReply(reply, "workflow_open"), reply, "pass-through must be identity");
+});
+
+test("codex R8: replay never crosses a bridge change — entries for another bridge are DROPPED", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const start = src.indexOf("function replayLostReplies(target) {");
+  assert.notEqual(start, -1);
+  const body = src.slice(start, src.indexOf("\n  }", start));
+  assert.match(
+    body,
+    /if \(entry\.url && entry\.url !== url\) \{\s*\n\s*dropped\+\+;\s*\n\s*continue;/,
+    "an outcome belonging to a previous bridge must never be volunteered to a different agent",
+  );
+  assert.match(body, /lostReplies\.replace\(keep\)/, "only undeliverable-but-still-ours entries are retried");
+  assert.match(body, /Discarded \$\{dropped\}/, "the user must be told what was discarded");
+  // And the record site must stamp the bridge.
+  assert.match(src, /reason: classifyUndeliveredReply\(\{ socketOpen, superseded, sendThrew \}\),[\s\S]{0,200}?\n\s*url,/);
+});
+
+test("the journal's replace() keeps only what it is given, still bounded", () => {
+  const j = createLostReplyJournal({ cap: 3 });
+  for (let i = 0; i < 3; i++) j.record({ reply: { rid: `r${i}`, ok: true }, cmd: "graph_outline" });
+  const kept = j.list().slice(0, 1);
+  assert.equal(j.replace(kept), 1);
+  assert.equal(j.size(), 1);
+  assert.equal(j.list()[0].rid, "r0");
+  assert.equal(j.replace(null), 0, "a non-array clears the journal rather than corrupting it");
 });
 
 test("the journal refuses a frame with no rid (nothing could ever correlate it)", () => {
@@ -205,12 +269,15 @@ test("#508 codex R6: an outcome journaled AFTER the replacement socket replayed 
   );
 });
 
-test("#508 wiring: replay is idempotent — it drains only after every entry went out", () => {
+test("#508 wiring: replay keeps what it could not send, so a partial replay is retried not lost", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const start = src.indexOf("function replayLostReplies(target) {");
   assert.notEqual(start, -1);
   const body = src.slice(start, src.indexOf("\n  }", start));
-  assert.match(body, /if \(sent === lost\.length\) lostReplies\.drain\(\);/, "a partial replay must be retried, not lost");
+  // An entry that could not be written (socket closed / send threw) goes back in `keep`;
+  // only the delivered ones and the cross-bridge drops leave the journal.
+  assert.match(body, /keep\.push\(entry\);/, "an undeliverable entry must be retained for a later attempt");
+  assert.match(body, /if \(sent \|\| dropped\) lostReplies\.replace\(keep\);/, "a partial replay must be retried, not lost");
   assert.match(body, /target\.readyState !== WebSocket\.OPEN/, "never write to a closed socket");
   // It must not re-enter the journal path (which would recurse through handleUndeliveredReply).
   assert.equal(/lostReplies\.record\(/.test(body), false, "replay must not re-journal, or it would recurse");
