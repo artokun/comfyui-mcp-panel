@@ -98,6 +98,7 @@ import {
   activeWorkflowFenceApplies,
   classifyPinnedTarget,
   commandWorkflowMismatch,
+  selectorTargetsNonActiveWorkflow,
   isWorkflowCreationLoad,
   normalizedWorkflowPath,
   resolveUnsavedInstanceUuid,
@@ -9398,17 +9399,33 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // including workflow_close discarding the new workflow's unsaved work, or
             // workflow_save/save_as/rename overwriting it. Refuse when the stamped uuid does not
             // match the active workflow's uuid (fail closed when unresolvable, #186). This covers
-            // EVERY active-canvas op — graph_* AND the four workflow mutators — so it matches the
+            // EVERY active-canvas op — graph_* AND the four workflow mutators — matching the
             // server's enforcement contract (a panel advertising enforces_workflow_stamp fences
             // all of them, not only graph commands). activeWorkflowFenceApplies() scopes OUT the
-            // cases that are NOT active-workflow ops: a pinned command (workflow_path → #349 guard
-            // below), navigation/creation (workflow_open/new), and a path-targeted
-            // workflow_rename/close (explicit path arg names a deterministic non-active target).
+            // NON-active-workflow ops: a pinned command (workflow_path → #349 guard below),
+            // navigation/creation (workflow_open/new), and a path-selectored workflow_rename/close
+            // whose selector RESOLVES to a genuinely non-active OPEN workflow.
+            //
+            // Decide the rename/close exemption by the RESOLVED TARGET, never by raw path presence:
+            // resolve the selector the same way the executor will (openWorkflows.find) and exempt
+            // ONLY when it lands on a real open workflow that is NOT the active one. A non-empty
+            // path that resolves to the ACTIVE workflow — e.g. its file was replaced IN PLACE with
+            // a different workflow at the same path — still hits the active canvas, so it is fenced.
             const commandUuid = msg?.[WORKFLOW_UUID_FIELD];
             const explicitTargetPath = msg?.[WORKFLOW_PATH_FIELD];
             const hasPin = typeof explicitTargetPath === "string" && explicitTargetPath.trim();
+            let targetsNonActive = false;
+            if (msg.cmd === "workflow_rename" || msg.cmd === "workflow_close") {
+              const pathArg = typeof msg?.path === "string" ? msg.path.trim() : "";
+              if (pathArg) {
+                const active = activeWorkflowRef();
+                const open = app?.extensionManager?.workflow?.openWorkflows ?? [];
+                const resolved = open.find((w) => workflowRecordMatchesSelector(w, pathArg)) || null;
+                targetsNonActive = selectorTargetsNonActiveWorkflow({ resolved, active });
+              }
+            }
             if (
-              activeWorkflowFenceApplies({ cmd: msg.cmd, hasPin: Boolean(hasPin), pathArg: msg?.path }) &&
+              activeWorkflowFenceApplies({ cmd: msg.cmd, hasPin: Boolean(hasPin), targetsNonActive }) &&
               commandWorkflowMismatch({ commandUuid, activeUuid: workflowStableUuid() })
             ) {
               throw new Error(

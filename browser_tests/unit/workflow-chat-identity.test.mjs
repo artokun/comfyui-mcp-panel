@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   activeWorkflowFenceApplies,
+  selectorTargetsNonActiveWorkflow,
   commandWorkflowMismatch,
   isThreadInScope,
   isWorkflowCreationLoad,
@@ -13,6 +14,20 @@ import {
   workflowAliasForPath
 } from '../../web/js/lib/workflow-chat-identity.js'
 
+// #570 P0c — the exemption is decided by the RESOLVED TARGET, not raw path presence.
+test('#570 selectorTargetsNonActiveWorkflow: exempt ONLY when the selector resolves to a NON-active open workflow', () => {
+  const active = { path: 'workflows/foo.json' }
+  const other = { path: 'workflows/bar.json' }
+  // Resolves to a DIFFERENT open workflow → non-active → exempt (true).
+  assert.equal(selectorTargetsNonActiveWorkflow({ resolved: other, active }), true)
+  // Resolves to the ACTIVE workflow (incl. after an in-place replacement at the same path: the
+  // active object is what the selector lands on) → NOT exempt (false) → will be fenced.
+  assert.equal(selectorTargetsNonActiveWorkflow({ resolved: active, active }), false)
+  // Resolves to NOTHING → can't prove non-active → NOT exempt (false) → fenced (fail-closed).
+  assert.equal(selectorTargetsNonActiveWorkflow({ resolved: null, active }), false)
+  assert.equal(selectorTargetsNonActiveWorkflow({ resolved: undefined, active }), false)
+})
+
 // #570 P0c — the panel fence must cover ALL four active-workflow mutators, not just graph_*,
 // so a panel advertising enforces_workflow_stamp honestly fences everything the server admits.
 test('#570 fence applies to every graph_* op and all four workflow mutators (active-workflow ops)', () => {
@@ -20,22 +35,23 @@ test('#570 fence applies to every graph_* op and all four workflow mutators (act
   assert.equal(activeWorkflowFenceApplies({ cmd: 'graph_get_state' }), true) // reads harmlessly fenced too
   assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_save' }), true)
   assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_save_as' }), true)
-  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_rename' }), true) // no explicit path
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_rename' }), true) // path-less ⇒ active
   assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_close' }), true)
-  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_close', pathArg: '' }), true) // empty ⇒ active
-  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_close', pathArg: '  ' }), true) // whitespace ⇒ active
+  // A rename/close whose selector RESOLVED to the active workflow is fenced (the P0: an explicit
+  // path that, after in-place replacement, names the active workflow).
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_close', targetsNonActive: false }), true)
 })
 
-test('#570 fence does NOT apply to pinned / navigation / explicit-path workflow ops', () => {
+test('#570 fence does NOT apply to pinned / navigation / resolved-non-active workflow ops', () => {
   // Pinned → the #349 workflow_path guard is the authority.
   assert.equal(activeWorkflowFenceApplies({ cmd: 'graph_add_node', hasPin: true }), false)
   assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_close', hasPin: true }), false)
   // Navigation / creation.
   assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_open' }), false)
   assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_new' }), false)
-  // Explicit non-empty path arg names a deterministic non-active target (must not be fenced to active).
-  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_close', pathArg: 'workflows/other.json' }), false)
-  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_rename', pathArg: 'workflows/a.json' }), false)
+  // Selector RESOLVED to a genuinely non-active open workflow → deterministic target → runs.
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_close', targetsNonActive: true }), false)
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_rename', targetsNonActive: true }), false)
 })
 
 // #570 — WORKFLOW-INSTANCE FENCE. A command stamped for workflow A must not execute against
