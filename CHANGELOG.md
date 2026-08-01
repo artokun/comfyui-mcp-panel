@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.23] - 2026-08-01
+
+### Fixed
+- **`panel_create_group` correctly builds a group from the requested nodes (#566, #388, #391).** Requested `node_ids` (numbers) were compared against live LiteGraph member ids (strings) with raw sets, so `9 !== "9"` — every member was reported as *both* extra and missing (#566), a spurious "membership is geometric" warning fired on every call (#388), and a stale cached bounding rect made the group come up empty (#391). Membership is now compared on a normalized key, and each node's cached rect is resynced to its live position/size before the group box is computed — so the requested nodes are provably enclosed and the warning fires only on a genuine difference.
+- **Chat composer no longer leaks pastes to the canvas, sends early on a CJK IME, or renders legacy `[object Object]` (#384, #385, #393).** Pasting an image into the composer now stops the event from bubbling to ComfyUI's canvas paste-to-node handler (no more duplicate `LoadImage` per paste); a new IME guard (`isImeComposing`) is applied across every composition-context keydown (composer, slash/mention menu, model + side-panel search, `panel_ask`, secret input, RunPod pod-id, and the document-level interrupt/Escape handlers) so a Korean/CJK commit-Enter no longer sends early and leaks a trailing syllable; and legacy persisted `"[object Object]"` chat artifacts are dropped on replay.
+- **Freshly downloaded models are selectable on the live canvas without a reload (#396), and a Manager search result installs by its id (#394).** After `download_model` completes, the loader combos now get a guaranteed trailing re-registration of node defs (coalesced, with a completion-race guard) so the new file appears immediately; `panel_install_node` derives the installable id from the pack's repo URL/reference instead of the human title, so a titled search result no longer becomes a silent no-op.
+
+
 ## [0.11.22] - 2026-08-01
 
 ### Fixed
