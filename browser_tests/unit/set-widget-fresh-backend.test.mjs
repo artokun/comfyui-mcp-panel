@@ -1039,3 +1039,50 @@ test("#458 NESTED-INTERMEDIATE (3-level): all-genuine virtual containers A→B�
   assert.equal(set.value, 30, "a fully-virtual 3-level promotion still writes");
   assert.equal(b.widgets.find((w) => w.name === "steps").value, 30);
 });
+
+test("#458 EVER-SEEN INTERMEDIATE: a PROVENANCE-CLEAN, real-subgraph intermediate whose type was EVER in object_info ⇒ REFUSED (forged-container concern closed by observed history)", async () => {
+  // The forged-virtual-container concern: a removed-backend node can be made
+  // provenance-clean (generic placeholder) with a real `.subgraph`, passing every
+  // client-side shape/provenance check. The ever-seen gate refuses it: the backend
+  // reported this type earlier this session, so its absence now = removed.
+  const reg = loadedRegistry();
+  const { a, mid, resolveSource } = makeNestedIntermediateFixture(reg, {
+    intermediateType: "WasBackendContainer",
+    intermediateBackend: false, // provenance-clean, real subgraph (looks like a virtual container)
+  });
+  const everSeen = new Set(["WasBackendContainer"]); // backend reported it earlier this session
+  await assert.rejects(
+    () =>
+      runSetWidget(a, "steps", 30, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // KSampler present; WasBackendContainer absent now
+        wasTypeEverDefined: (t) => everSeen.has(t),
+        resolveSource,
+        ...HOOKS,
+      }),
+    (err) =>
+      err instanceof Error &&
+      /Cannot set widget on node 80 \("WasBackendContainer"\)/.test(err.message) &&
+      /was defined by the ComfyUI backend earlier this session|since-removed/i.test(err.message),
+  );
+  assert.equal(mid.widgets.find((w) => w.name === "steps").value, 20, "a since-removed container intermediate is never driven-through");
+});
+
+test("#458 EVER-SEEN INTERMEDIATE: a genuine virtual container (type NEVER in object_info) ⇒ still SUCCEEDS with the gate wired", async () => {
+  const reg = loadedRegistry();
+  const { a, mid, resolveSource } = makeNestedIntermediateFixture(reg, {
+    intermediateType: "SubgraphB",
+    intermediateBackend: false,
+  });
+  const { set } = await runSetWidget(a, "steps", 30, {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => objectInfo(),
+    wasTypeEverDefined: () => false, // virtual subgraph ids are never in /object_info
+    resolveSource,
+    ...HOOKS,
+  });
+  assert.equal(set.value, 30);
+  assert.equal(mid.widgets.find((w) => w.name === "steps").value, 30);
+});

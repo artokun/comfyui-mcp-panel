@@ -1847,3 +1847,39 @@ test("#477 P1: a callback that REPLACES the host input (same rail proxy, differe
   );
   assert.equal(railWidget.value, 1280, "the captured rail value is restored");
 });
+
+test("#477 P1: a STATEFUL afterChange that RE-ADDS a replacement proxy every fire is reported as PARTIAL STATE (exact widget-list identity, not just membership)", () => {
+  // Coordinator-adversarial: captured proxies stay members and the host input/projection
+  // still point to the captured objects, so membership/set checks pass — but an extra
+  // (reordered/added) widget stays live. The EXACT-list check catches it: node.widgets
+  // must be the SAME array with the SAME members in the SAME order as the snapshot.
+  const inner = { id: 257, type: "PrimitiveInt", widgets: [{ name: "value", type: "INT", value: 1280 }] };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "257" ? inner : null) };
+  const railWidget = { name: "value_2", type: "INT", value: 1280 };
+  const oldProxy = { name: "value_2", type: "INT", value: 1280 };
+  const newProxy = { name: "value_2", type: "INT", value: 1280 };
+  const hostInput = { name: "value_2", _widget: railWidget, widget: oldProxy, _subgraphSlot: { name: "value_2" } };
+  const parent = { id: 267, type: "SubgraphNode", subgraph, inputs: [hostInput], widgets: [railWidget, oldProxy] };
+  // Inner callback throws → forces rollback.
+  inner.widgets[0].callback = () => {
+    throw new Error("inner callback boom");
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "value_2" ? { sourceNodeId: "257", sourceWidgetName: "value" } : null;
+  // Stateful afterChange re-adds newProxy every time it fires (incl. inside the rollback
+  // envelope, AFTER our restore) — so a membership-only read-back would pass falsely.
+  const afterChange = () => {
+    if (!parent.widgets.includes(newProxy)) parent.widgets.push(newProxy);
+  };
+
+  assert.throws(
+    () => applyWidgetWrite(parent, "value_2", 704, { resolveSource, afterChange }),
+    (err) =>
+      err instanceof WidgetWriteError &&
+      /did not take effect|partial state/.test(err.message) &&
+      /widget list|node\.inputs\/widgets/.test(err.message),
+  );
+  // The captured proxies are still members (membership alone would falsely pass), but
+  // the extra replacement stays live — surfaced as partial state, never a clean rollback.
+  assert.ok(parent.widgets.includes(newProxy), "the stateful afterChange keeps the replacement live — honestly reported, not masked");
+});

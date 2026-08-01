@@ -837,3 +837,63 @@ test("#475 instance-provenance: a GENUINE frontend-only node (bare instance cons
   assert.equal(set.value, false);
   assert.equal(node.widgets[0].value, false);
 });
+
+// ---- #458 OBSERVED-BACKEND-HISTORY (ever-seen) gate: the non-forgeable trust root.
+//      A type ABSENT from CURRENT object_info that was EVER seen this session = a
+//      REMOVED backend node ⇒ REFUSE; a NEVER-seen type = genuinely frontend-only. -----
+
+test("#458 EVER-SEEN: an ALLOWLISTED-name PURE-JS husk (provenance-clean) that was EVER in object_info ⇒ REFUSED (the case client shape/name/provenance cannot catch)", async () => {
+  // Codex P0: a backend pack can register a bare frontend class for a reserved
+  // allowlisted type (e.g. MarkdownNote) with NO nodeData/comfyClass. After its backend
+  // def disappears it passes allowlist + class + instance provenance. The ever-seen gate
+  // is exactly what refuses it: the backend reported "MarkdownNote" earlier this session.
+  const reg = loadedRegistry();
+  const bare = function BareMarkdownNote() {}; // provenance-clean, allowlisted name
+  reg["MarkdownNote"] = bare;
+  const node = { id: 501, type: "MarkdownNote", widgets: [{ name: "text", type: "string", value: "x" }], constructor: bare };
+  const everSeen = new Set(["MarkdownNote"]); // backend reported it earlier this session
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "text", "y", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // CURRENT object_info lacks MarkdownNote
+        wasTypeEverDefined: (t) => everSeen.has(t),
+        ...HOOKS,
+      }),
+    (err) => err instanceof Error && /was defined by the ComfyUI backend earlier this session|since-removed/i.test(err.message),
+  );
+  assert.equal(node.widgets[0].value, "x", "a since-removed allowlisted-name husk is never mutated (#458)");
+});
+
+test("#458 EVER-SEEN: a GENUINE native allowlisted type that was NEVER in object_info ⇒ ALLOWED (frontend-only)", async () => {
+  const reg = loadedRegistry();
+  const bare = function BareMarkdownNote() {};
+  reg["MarkdownNote"] = bare;
+  const node = { id: 502, type: "MarkdownNote", widgets: [{ name: "text", type: "string", value: "x" }], constructor: bare };
+  const everSeen = new Set(); // never reported by the backend this session
+  const { set } = await runSetWidget(node, "text", "y", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => objectInfo(),
+    wasTypeEverDefined: (t) => everSeen.has(t),
+    ...HOOKS,
+  });
+  assert.equal(set.value, "y");
+  assert.equal(node.widgets[0].value, "y", "a genuinely-never-seen native/frontend node is writable");
+});
+
+test("#458 EVER-SEEN: a frontend-only rgthree node NEVER in object_info ⇒ still ALLOWED with the gate wired", async () => {
+  const reg = loadedRegistry();
+  const ctor = function FastBypasser() {};
+  reg["Fast Bypasser (rgthree)"] = ctor;
+  const node = { id: 503, type: "Fast Bypasser (rgthree)", widgets: [{ name: "Enabled", type: "toggle", value: true }], constructor: ctor };
+  const { set } = await runSetWidget(node, "Enabled", false, {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => objectInfo(),
+    wasTypeEverDefined: () => false, // rgthree control nodes are never in /object_info
+    ...HOOKS,
+  });
+  assert.equal(set.value, false);
+});

@@ -117,16 +117,26 @@ export function isFrontendOnlyRegisteredType(registry, type) {
 }
 
 /**
- * POSITIVE structural proof that `node` is a genuine VIRTUAL SUBGRAPH CONTAINER — a
- * litegraph SubgraphNode whose `.subgraph` is a REAL nested graph (an object exposing
- * `_nodes` and/or `getNodeById`), NOT merely a truthy `subgraph:{}` marker. A removed
- * backend node that carries a fake `subgraph` field is rejected because it holds no
- * real nested graph. Used with hasBackendProvenance to authorize an INTERMEDIATE node
- * of a nested promotion (its widget is mutated but its virtual type is absent from
- * /object_info by design) WITHOUT trusting "defless + subgraph metadata" (#458).
+ * Positive signal that `node` is a genuine VIRTUAL SUBGRAPH CONTAINER — a litegraph
+ * SubgraphNode. Prefers the UPSTREAM identity markers ComfyUI_frontend's SubgraphNode
+ * exposes (`isVirtualNode === true`, `isSubgraphNode()`), falling back to a REAL nested
+ * graph (`.subgraph` exposing `_nodes`/`getNodeById`), NOT a bare `subgraph:{}` marker.
+ *
+ * NOTE: container SHAPE alone is client-forgeable and is NOT the fail-closed trust root
+ * for #458 — the OBSERVED-BACKEND-HISTORY gate (wasTypeEverDefined) is. This is one
+ * defense-in-depth signal (distinguishing a container from a leaf) layered on top.
  */
 export function isVirtualSubgraphContainer(node) {
-  const sg = node?.subgraph;
+  if (!node) return false;
+  if (node.isVirtualNode === true) return true;
+  if (typeof node.isSubgraphNode === "function") {
+    try {
+      if (node.isSubgraphNode()) return true;
+    } catch {
+      /* fall through to the structural check */
+    }
+  }
+  const sg = node.subgraph;
   if (!sg || typeof sg !== "object") return false;
   return Array.isArray(sg._nodes) || typeof sg.getNodeById === "function";
 }
@@ -141,15 +151,20 @@ export function isVirtualSubgraphContainer(node) {
  *
  * Fails CLOSED unless ONE of:
  *   - the type is PRESENT in fresh /object_info (a live backend node); OR
- *   - the node is a PROVENANCE-CLEAN virtual subgraph container (real `.subgraph`, no
- *     backend provenance on its registered class OR its own instance constructor) — a
- *     genuine litegraph SubgraphNode has no backend def; a removed/stale BACKEND node
- *     masquerading with a subgraph field retains nodeData/comfyClass and is refused; OR
- *   - the node is a frontend-only leaf (reserved allowlist + class & instance
- *     provenance) — belt-and-suspenders for a directly-promoted frontend leaf.
- * A null/unavailable fresh map fails closed (never trust a stale cache).
+ *   - the type was NEVER seen in any /object_info this session (per wasTypeEverDefined,
+ *     the OBSERVED-BACKEND-HISTORY trust root) AND is a positive frontend-only signal:
+ *     a provenance-clean virtual subgraph container, or a frontend-only leaf.
+ *
+ * #458 EVER-SEEN GATE (the non-forgeable anchor): a type ABSENT from the CURRENT
+ * /object_info that WAS EVER reported by the backend this session is a REMOVED backend
+ * node → REFUSE. A client husk cannot un-see what the backend already reported, so this
+ * catches every removed-backend case — including one masquerading as a container or a
+ * pure-JS frontend class under a reserved allowlisted name — that client-side shape /
+ * name / provenance markers cannot. The provenance + container-shape checks remain as
+ * DEFENSE-IN-DEPTH for the never-seen case, never as the sole gate. A null/unavailable
+ * fresh map fails closed.
  */
-export function assertMutatedNodeAuthorized(freshDefs, registry, node, role = "target") {
+export function assertMutatedNodeAuthorized(freshDefs, registry, node, role = "target", wasTypeEverDefined) {
   const type = node?.type;
   const id = node?.id ?? "(unknown)";
   const label = typeof type === "string" ? ` ("${type}")` : "";
@@ -162,7 +177,17 @@ export function assertMutatedNodeAuthorized(freshDefs, registry, node, role = "t
   }
   // PRESENT in the fresh backend → a live node, authorized by presence.
   if (typeof type === "string" && Object.prototype.hasOwnProperty.call(freshDefs, type)) return;
-  // ABSENT from fresh object_info — permit ONLY with a positive, provenance-clean signal.
+  // ABSENT from fresh object_info. EVER-SEEN GATE: if the backend reported this type
+  // earlier this session, its backend was REMOVED — refuse (non-forgeable, #458).
+  if (typeof wasTypeEverDefined === "function" && typeof type === "string" && wasTypeEverDefined(type)) {
+    throw new Error(
+      `Cannot set widget on node ${id}${label}: the ${role} node type was defined by the ComfyUI ` +
+        `backend earlier this session but is ABSENT from the current /object_info — its backend was ` +
+        `removed (pack uninstalled/disabled). Refusing to write to a since-removed node (#458).`,
+    );
+  }
+  // NEVER seen this session → genuinely frontend-only/native. Permit only with a
+  // positive, provenance-clean signal (defense-in-depth on top of the ever-seen gate).
   const provenanceClean =
     !hasBackendProvenance(typeof type === "string" ? registry?.[type] : undefined) &&
     !hasBackendProvenance(node?.constructor);
@@ -321,7 +346,7 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
  * backend-only behaviour.
  */
 export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknown)", opts = {}) {
-  const { registry, node } = opts;
+  const { registry, node, wasTypeEverDefined } = opts;
   const label = typeof type === "string" ? ` ("${type}")` : "";
   if (!freshDefs || typeof freshDefs !== "object") {
     throw new Error(
@@ -332,14 +357,24 @@ export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknow
     );
   }
   if (typeof type !== "string" || !Object.prototype.hasOwnProperty.call(freshDefs, type)) {
-    // #475: object_info WAS fetched but lacks this type. Allow a genuine frontend-only
-    // / native node — reserved-namespace allowlisted AND with NO backend provenance on
-    // EITHER the registered class OR the write-target INSTANCE's own constructor. The
-    // instance check closes the reserved-name-collision + stale-backend-instance path:
-    // a node whose class_type collides with an allowlisted name but whose OWN
-    // constructor carries a backend def (nodeData/comfyClass) is a removed backend
-    // node, not a frontend-only one, and still fails closed. A removed backend node's
-    // arbitrary pack name is not allowlisted regardless.
+    // #458 EVER-SEEN GATE (the non-forgeable trust root): object_info WAS fetched but
+    // lacks this type. If the backend reported this type EARLIER this session, its
+    // backend was REMOVED (pack uninstalled) → refuse — even a pure-JS frontend class
+    // registered under a reserved allowlisted name (MarkdownNote from a removed pack)
+    // that carries no nodeData/comfyClass is caught here, because a client husk cannot
+    // un-see what the backend already reported. This is what the client-side allowlist +
+    // provenance markers CANNOT prove on their own.
+    if (typeof wasTypeEverDefined === "function" && typeof type === "string" && wasTypeEverDefined(type)) {
+      throw new Error(
+        `Cannot set widget on node ${nodeId}${label}: node type "${type}" was defined by the ComfyUI ` +
+          `backend earlier this session but is ABSENT from the current /object_info — its backend was ` +
+          `removed (pack uninstalled/disabled). Refusing to write to a since-removed node (#458).`,
+      );
+    }
+    // #475: NEVER seen this session → genuinely frontend-only/native. Allow a reserved-
+    // namespace allowlisted node with NO backend provenance on the registered class OR
+    // the write-target INSTANCE's own constructor (defense-in-depth on top of the
+    // ever-seen gate). A removed backend node's arbitrary pack name is not allowlisted.
     if (
       registry &&
       isFrontendOnlyRegisteredType(registry, type) &&

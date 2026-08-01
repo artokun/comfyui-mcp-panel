@@ -41,6 +41,7 @@ export async function runSetWidget(
     registry = {},
     getRegistry,
     getFreshObjectInfo,
+    wasTypeEverDefined,
     resolveSource,
     canvas,
     beforeChange,
@@ -167,6 +168,10 @@ export async function runSetWidget(
     assertTypeAgainstFreshBackend(freshDefs, authTarget.type, authTarget.id, {
       registry: liveRegistry(),
       node: authTarget,
+      // #458 OBSERVED-BACKEND-HISTORY: a type ever reported by the backend this session
+      // but absent from the current /object_info is a REMOVED backend node — refuse
+      // (the non-forgeable trust root; client shape/name/markers cannot prove this).
+      wasTypeEverDefined,
     });
   }
 
@@ -196,15 +201,15 @@ export async function runSetWidget(
   // node masquerading with a subgraph field.
   if (isResolvedPromotion) {
     // The OUTER subgraph parent (its rail/proxy widgets are mutated).
-    assertMutatedNodeAuthorized(freshDefs, liveRegistry(), node, "outer subgraph");
+    assertMutatedNodeAuthorized(freshDefs, liveRegistry(), node, "outer subgraph", wasTypeEverDefined);
     // EVERY intermediate virtual container the promotion is driven THROUGH — not just
     // the immediate inner. A deeper intermediate (A→B→C→concrete's C) is otherwise
     // never authorized, so a removed-backend node forwarded-through would be trusted.
-    // Each must be present in fresh /object_info OR a provenance-clean virtual-subgraph
-    // container; the concrete terminal is excluded here (fresh-authorized as authTarget).
+    // Each must be present in fresh /object_info, or NEVER seen this session AND a
+    // provenance-clean virtual container; a since-removed (ever-seen) type is refused.
     for (const intermediate of collectPromotionIntermediates(promotedResolution.target, resolveSource)) {
       if (intermediate !== authTarget) {
-        assertMutatedNodeAuthorized(freshDefs, liveRegistry(), intermediate, "intermediate promoted");
+        assertMutatedNodeAuthorized(freshDefs, liveRegistry(), intermediate, "intermediate promoted", wasTypeEverDefined);
       }
     }
   }

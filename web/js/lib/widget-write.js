@@ -1144,39 +1144,34 @@ export function applyWidgetWrite(
         ? `${rollbackFailed} and the promotion topology (host input._widget)`
         : `the promotion topology (host input._widget)`;
     }
-    // #477 P1: after rollback the OUTER promotion topology must be intact — every
-    // captured rail/display proxy must still be a live member of node.widgets, AND the
-    // live-resolved projection set must EXACTLY match the captured set (identity+order).
-    // A callback that replaced/reordered node.widgets (detaching a captured proxy) or
-    // left a live replacement projection is surfaced as partial state, never a falsely-
-    // clean rollback. This holds whether or not the gated restore above ran.
+    // #477 P1: after rollback the OUTER promotion topology must be EXACTLY intact.
+    // node.widgets must be the SAME array reference AND hold the SAME members in the
+    // SAME order as the pre-write snapshot — so a stateful afterChange that RE-ADDS a
+    // replacement proxy (leaving the captured members present but adding an extra/
+    // reordered one), a replaced array, or an in-place push are ALL surfaced as partial
+    // state, never a falsely-clean rollback. The LIVE host input must also still be the
+    // captured one (a replaced input — even one referencing the same proxies but a
+    // different widgetId — serializes differently). This holds whether or not the gated
+    // restore above ran.
     if (promotedFrom) {
-      const capturedSet = Array.isArray(promotedParentWidgets) ? promotedParentWidgets : [];
-      const liveMembers = Array.isArray(node.widgets) ? node.widgets : [];
-      const anyDetached = capturedSet.some((cw) => cw && !liveMembers.includes(cw));
-      let liveSet = [];
+      const listExact =
+        prevOuterWidgets == null ||
+        (node.widgets === prevOuterWidgetsRef &&
+          Array.isArray(node.widgets) &&
+          node.widgets.length === prevOuterWidgets.length &&
+          node.widgets.every((wd, i) => wd === prevOuterWidgets[i]));
       let liveInput = undefined;
       try {
         const live = resolvePromotedInnerTarget(node, widgetName, resolveSource);
-        if (live && live.target) {
-          liveInput = live.target.input;
-          if (Array.isArray(live.target.parentWidgets)) liveSet = live.target.parentWidgets;
-        }
+        if (live && live.target) liveInput = live.target.input;
       } catch {
-        liveSet = [];
         liveInput = undefined;
       }
-      const setMatches =
-        liveSet.length === capturedSet.length && liveSet.every((lw, i) => lw === capturedSet[i]);
-      // The LIVE host input must still be the CAPTURED one. A callback that REPLACED the
-      // host input (even with one referencing the same _widget/proxies but a different
-      // `widgetId`) leaves a live input that serializes differently — an honest partial
-      // state, never a clean rollback (the captured input we restored is detached).
       const inputReplaced = promotedHostInput != null && liveInput !== promotedHostInput;
-      if (anyDetached || !setMatches || inputReplaced) {
+      if (!listExact || inputReplaced) {
         rollbackFailed = rollbackFailed
-          ? `${rollbackFailed} and the promotion host input / projection set (node.inputs/widgets)`
-          : `the promotion host input / projection set (node.inputs/widgets)`;
+          ? `${rollbackFailed} and the promotion host input / parent widget list (node.inputs/widgets)`
+          : `the promotion host input / parent widget list (node.inputs/widgets)`;
       }
     }
     // On a TOPOLOGY DRIFT, the captured `parentWidget` we just restored may be
