@@ -109,6 +109,8 @@ import {
   refreshComboOptionsFromDefs,
   collectMissingNodeTypeReasons,
   graphErrorsResultIsClean,
+  nodeRedFlagIsStale,
+  findNodeByScopedId,
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing } from "./lib/node-resolve.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
@@ -235,15 +237,19 @@ async function registerComfyNodeDefs(preloadedDefs) {
   let comboRefreshed = false;
   try {
     const a = typeof app !== "undefined" && app ? app : window.comfyAPI?.app?.app;
-    if (!a) return;
+    if (!a) return false;
+    // Obtain an AUTHORITATIVE /object_info payload up front (preloaded, or a fresh
+    // getNodeDefs) — this is the OBSERVABLE proof of a real server fetch that gates
+    // combo trust below. Decoupled from registerNodesFromDefs so the trust signal
+    // doesn't hinge on that method existing (codex #2).
+    let defs = preloadedDefs ?? null;
+    if (!defs && typeof api?.getNodeDefs === "function") {
+      defs = await api.getNodeDefs();
+    }
     // Re-register node definitions so newly installed/updated classes and their
     // current widget schemas are known to LiteGraph (#221/#171).
-    let defs = preloadedDefs ?? null;
-    if (typeof a.registerNodesFromDefs === "function") {
-      if (!defs && typeof api?.getNodeDefs === "function") {
-        defs = await api.getNodeDefs();
-      }
-      if (defs) await a.registerNodesFromDefs(defs);
+    if (defs && typeof a.registerNodesFromDefs === "function") {
+      await a.registerNodesFromDefs(defs);
     }
     // registerNodesFromDefs mints NEW classes; already-loaded node INSTANCES keep
     // their old constructor and would never see the fresh schema. Stamp the fresh
@@ -254,15 +260,30 @@ async function registerComfyNodeDefs(preloadedDefs) {
     }
     // Refresh combo widget option lists (model dropdowns etc.) so freshly installed
     // models resolve and stale entries clear (#185/#181/#223).
+    let comboRan = false;
     if (typeof a.refreshComboInNodes === "function") {
       await a.refreshComboInNodes();
-      comboRefreshed = true;
+      comboRan = true;
     }
+    // Trust the live combos for suppressing missing-asset candidates ONLY when BOTH an
+    // authoritative /object_info payload was actually obtained this call AND the combo
+    // lists were refreshed from it. refreshComboInNodes resolving alone is not proof —
+    // without a fetched `defs`, combos may still be the stale page-load snapshot, and
+    // trusting them could suppress a genuine miss (finding #4 / codex #2). Failing to
+    // the FALSE side keeps us in over-report-safe mode.
+    comboRefreshed = !!defs && comboRan;
   } catch (e) {
     console.warn("[comfyui-mcp-panel] node-def refresh after reconnect failed:", e);
   } finally {
     nodeDefsRefreshConfirmed = comboRefreshed;
   }
+  // RETURN this run's own verdict so a caller can trust the combo based on the result
+  // of ITS refresh, independent of the shared nodeDefsRefreshConfirmed global — which a
+  // CONCURRENT refresh (reconnect / add_node payload / download) can overwrite. The
+  // coalescer forwards this through a forced trailing run, so get_errors' awaited
+  // `force:true` refresh resolves to the freshness verdict of the fetch IT triggered
+  // (codex round-6 P0).
+  return comboRefreshed;
 }
 
 // Single-flight refresh that never drops a caller-supplied fresh payload (#289 P2).
@@ -3759,7 +3780,7 @@ let lastInjectedValidationSig = null;
  *  no widget still references the file OR it now resolves against the node's live
  *  combo. Fails toward over-reporting, never swallowing a genuine miss.
  *  (#196/#352/#364/#203/#223/#185/#181) */
-function isStaleAssetCandidate(c) {
+function isStaleAssetCandidate(c, trustComboOverride) {
   let rootGraph;
   try {
     rootGraph = getGraphCtx().rootGraph;
@@ -3769,10 +3790,15 @@ function isStaleAssetCandidate(c) {
   // Only trust live combo membership to clear a candidate once a node-def refresh
   // has confirmably succeeded — otherwise a stale combo could suppress a genuine
   // miss (finding #4). The widget-still-references check is always safe.
-  return isStaleAssetCandidateLib(rootGraph, c, { trustCombo: nodeDefsRefreshConfirmed });
+  // `trustComboOverride` (when defined) lets a caller substitute a LOCALLY-computed
+  // trust verdict for the shared global — get_errors uses this so a concurrent older
+  // refresh flipping the global true can't re-trust a stale combo (codex round-5 P0).
+  const trustCombo =
+    trustComboOverride == null ? nodeDefsRefreshConfirmed : trustComboOverride;
+  return isStaleAssetCandidateLib(rootGraph, c, { trustCombo });
 }
 
-function collectMissingAssets() {
+function collectMissingAssets(trustComboOverride) {
   const models = [];
   const media = [];
   let nodeTypes = [];
@@ -3780,7 +3806,7 @@ function collectMissingAssets() {
   try {
     for (const c of getPiniaStore("missingModel")?.missingModelCandidates ?? []) {
       if (c?.isMissing === false) continue;
-      if (isStaleAssetCandidate(c)) continue;
+      if (isStaleAssetCandidate(c, trustComboOverride)) continue;
       models.push({
         node_id: c?.nodeId ?? null,
         file: c?.name ?? null,
@@ -3795,7 +3821,7 @@ function collectMissingAssets() {
   try {
     for (const c of getPiniaStore("missingMedia")?.missingMediaCandidates ?? []) {
       if (c?.isMissing === false) continue;
-      if (isStaleAssetCandidate(c)) continue;
+      if (isStaleAssetCandidate(c, trustComboOverride)) continue;
       media.push({
         node_id: c?.nodeId ?? null,
         file: c?.name ?? null,
@@ -3826,6 +3852,54 @@ function collectMissingAssets() {
   return { models, media, nodeTypes, nodeCount, any: !!(models.length || media.length || nodeTypes.length || nodeCount) };
 }
 
+/** True when EITHER missing-asset store holds a RAW candidate (isMissing !== false),
+ *  BEFORE the live cross-check filters it. get_errors keys its authoritative refresh
+ *  on THIS, not on collectMissingAssets() — the collector already trusts a possibly-
+ *  stale combo once nodeDefsRefreshConfirmed is set, so a candidate for an asset that
+ *  reappeared-then-was-deleted (stale combo still lists it) would be dropped by the
+ *  collector and never trigger the corrective refresh. Reading raw candidates makes the
+ *  refresh fire whenever the store has ANYTHING to adjudicate, so the combo is made
+ *  authoritative before the verdict (codex #1). */
+function hasRawMissingAssetCandidates() {
+  try {
+    for (const c of getPiniaStore("missingModel")?.missingModelCandidates ?? []) {
+      if (c?.isMissing !== false) return true;
+    }
+  } catch {
+    /* store unavailable */
+  }
+  try {
+    for (const c of getPiniaStore("missingMedia")?.missingMediaCandidates ?? []) {
+      if (c?.isMissing !== false) return true;
+    }
+  } catch {
+    /* optional */
+  }
+  return false;
+}
+
+// Upper bound on the authoritative /object_info refresh get_errors awaits: a stalled
+// or backgrounded ComfyUI must never wedge the error query. On timeout we resolve (not
+// reject) and fall through to the load-time snapshot — worst case is today's staleness,
+// never a hung tool call (codex #5). The refresh promise itself keeps running (the
+// coalescer owns it) and benefits a later call.
+const GET_ERRORS_REFRESH_TIMEOUT_MS = 4000;
+// Resolves to the refresh's OWN freshness verdict (registerComfyNodeDefs returns TRUE
+// only when it authoritatively fetched /object_info AND refreshed combos), or FALSE if
+// the refresh errored or the timeout wins first. get_errors trusts the combo on this
+// returned value — NOT the shared nodeDefsRefreshConfirmed global, which a concurrent
+// refresh can overwrite mid-await against a stale combo (codex round-5/6 P0). Never
+// rejects; a timeout or failure falls to FALSE ⇒ distrust ⇒ over-report.
+function withRefreshTimeout(promise) {
+  return Promise.race([
+    Promise.resolve(promise).then(
+      (v) => v === true,
+      () => false,
+    ),
+    new Promise((resolve) => setTimeout(() => resolve(false), GET_ERRORS_REFRESH_TIMEOUT_MS)),
+  ]);
+}
+
 function validationBanner() {
   let nodeErrors = null;
   try {
@@ -3842,6 +3916,30 @@ function validationBanner() {
   // canvas is already red. Bailing on those two alone left the agent blind
   // exactly when the user could see the problem — reported from the field.
   const missing = collectMissingAssets();
+  // #415: the ⚠️ MISSING ASSETS block reads as authoritative at turn start, but the
+  // stores are LOAD-TIME only and the live combo can drift BOTH ways — a since-uploaded
+  // asset the banner still calls missing, OR a since-deleted asset a prior-confirmed
+  // (now stale) combo still lists, which would make the banner falsely clean. This is a
+  // SYNCHRONOUS surface, so it cannot await a fetch; instead, whenever the STORE holds a
+  // raw candidate, kick a NON-BLOCKING FORCED authoritative refresh (single-flight,
+  // coalesced) so the combo is reconciled for the NEXT turn — no latency here. Keyed on
+  // raw candidates and NOT gated on nodeDefsRefreshConfirmed, so a delete-after-confirm
+  // is re-checked too (codex round-7 P0). graph_get_errors remains the AUTHORITATIVE,
+  // awaited surface; the banner is a best-effort proactive hint that self-heals.
+  try {
+    if (hasRawMissingAssetCandidates()) {
+      // REVOKE combo trust up front (this turn's `missing` was already computed above
+      // with the prior trust, so the revoke bites only on FUTURE reads): if this forced
+      // refresh STALLS and never settles, trust stays false and later banners DISTRUST
+      // the stale combo — keeping a genuinely-missing raw candidate reported instead of
+      // suppressing it indefinitely (codex round-8 P1). A completed refresh restores
+      // trust from its fresh fetch via registerComfyNodeDefs' finally.
+      nodeDefsRefreshConfirmed = false;
+      void refreshComfyNodeDefs(undefined, { force: true });
+    }
+  } catch {
+    /* best-effort */
+  }
   if (!nodeErrors && !execErr && !missing.any) {
     lastInjectedValidationSig = null; // clean → let a future re-appearance inject again
     return "";
@@ -5563,8 +5661,8 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
-  graph_set_widget({ node_id, widget, value }) {
-    const { app, graph, LG } = getGraphCtx();
+  async graph_set_widget({ node_id, widget, value }) {
+    const { app, graph, LG, rootGraph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     // Delegate to the shared handler body (web/js/lib/set-widget.js) so this
     // production path and the unit tests run the IDENTICAL ordering: preflight →
@@ -5578,7 +5676,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // installed pack is accepted on a single revalidation, while a genuinely
     // invalid value stays rejected against the FRESH list (#338/#317/#299/#288/
     // #284/#304, keeping #240 strictness).
-    return runSetWidget(node, widget, value, {
+    const result = await runSetWidget(node, widget, value, {
       registry: LG?.registered_node_types ?? {},
       // Fresh-backend type authorization (#458 set_widget gap): the go/no-go for the
       // resolved target node's TYPE is decided against the CURRENT /object_info — NOT
@@ -5635,6 +5733,73 @@ const GRAPH_TOOL_EXECUTORS = {
         }
       },
     });
+
+    // #418: LiteGraph's `has_errors` red flag is STICKY — repointing a widget from a
+    // missing asset (or an invalid value) to a valid one drops the missing-asset
+    // candidate and clears the validation error, but the boolean stays true and
+    // graph_get_errors keeps painting the node red with an empty `reasons: []`.
+    // Clear it here ONLY when neither the live missing-asset collector nor the last
+    // validation map still blames this node — nodeRedFlagIsStale fails toward KEEPING
+    // the flag on any doubt, so a genuinely-errored node is never de-flagged.
+    try {
+      // A workflow-tab SWITCH during the awaited /object_info fetch above would make this
+      // cleanup adjudicate the OLD `node` against the NEW workflow's stores/graph, wrongly
+      // clearing a still-missing old node's flag. Bail unless the graph we captured before
+      // the await is STILL the active one (codex round-11 P1).
+      const stillActive = (() => {
+        try {
+          return getGraphCtx().graph === graph;
+        } catch {
+          return false;
+        }
+      })();
+      // Only clear the flag on a DIRECT (non-container) node. `node` here is what was
+      // resolved from the caller's node_id in the CURRENT graph; for a PROMOTED write it
+      // is the OUTER subgraph wrapper while the value actually changes an INNER node, so
+      // the outer's redness can't be adjudicated from the inner candidates (they resolve
+      // to the inner node, not this wrapper) — clearing it could hide a still-missing
+      // inner sibling asset (codex round-7 P1). Skip wrappers: leaving the flag is the
+      // safe over-report direction. A DIRECT write to a plain node (the #418 repro) and a
+      // write to an inner node while inside its subgraph both have no `.subgraph` here.
+      if (stillActive && node?.has_errors && !node.subgraph) {
+        // DISTRUST the live combo here (trustComboOverride=false): clearing a red flag is
+        // DESTRUCTIVE, so it must never rely on possibly-stale combo membership. #418's
+        // real signal is the still-REFERENCED check — the repointed widget no longer holds
+        // the missing filename, so the candidate drops regardless of combo. An asset that
+        // reappeared, was confirmed, then DELETED (widget value unchanged) is still
+        // referenced ⇒ candidate kept ⇒ flag KEPT, never cleared off a stale combo that
+        // still lists it (codex round-9 P0).
+        const assets = collectMissingAssets(false);
+        // Use the SAME validation surface graph_get_errors trusts: app.lastNodeErrors
+        // PLUS the execution-error Pinia store's lastNodeErrors, which outlives some
+        // app-level resets (codex #4). Only clear when NEITHER still blames this node.
+        let storeNodeErrors = null;
+        try {
+          storeNodeErrors = getPiniaStore("executi" + "on" + "Error")?.lastNodeErrors ?? null;
+        } catch {
+          /* optional */
+        }
+        // Pass both maps SEPARATELY (OR semantics) so a node blamed by EITHER source
+        // keeps its red flag — never a shallow merge, whose empty entry could shadow the
+        // other map's live error and wrongly clear it (codex round-2 P0).
+        if (
+          nodeRedFlagIsStale(node.id, {
+            missingItems: [...assets.models, ...assets.media],
+            nodeErrorsMaps: [app?.lastNodeErrors ?? null, storeNodeErrors],
+            // A nested candidate is keyed by a SCOPED locator that never string-equals
+            // this inner node's local id — resolve it and compare identity so a still-
+            // missing nested asset keeps the flag (codex round-3 P0).
+            resolvesToNode: (scopedId) => findNodeByScopedId(rootGraph, scopedId) === node,
+          })
+        ) {
+          node.has_errors = false;
+          graph.setDirtyCanvas?.(true, true);
+        }
+      }
+    } catch {
+      /* best-effort visual cleanup — never fail the write over it */
+    }
+    return result;
   },
 
   graph_move_node({ node_id, pos }) {
@@ -6168,7 +6333,57 @@ const GRAPH_TOOL_EXECUTORS = {
   // hunts for (paired with "svg" — and this file is full of inline SVG). Writing
   // it literally would get the PUBLISHED pack flagged, so it's assembled at
   // runtime. CI enforces this, and this comment never spells the token either.
-  graph_get_errors() {
+  async graph_get_errors() {
+    // The missing-asset stores (missingModel/missingMedia) are populated at workflow
+    // LOAD and never re-evaluated, so an asset that has since appeared on disk — via an
+    // upload the tab never observed (external HTTP POST /upload/image), a completed
+    // download, or a ComfyUI restart the tab didn't reconnect through — stays falsely
+    // reported and keeps the node red forever (#407/#415/#410). When something is still
+    // flagged, pull the AUTHORITATIVE /object_info + refresh combos ONCE, then let the
+    // collector below re-evaluate: a FRESH combo reflects real on-disk state, so the
+    // (now-trusted) live cross-check clears a since-resolved asset WITHOUT ever
+    // suppressing a genuine miss — a truly-absent file is still not an offered value.
+    // Bounded: only when the STORE has a raw candidate to adjudicate (not the already-
+    // filtered collector result, which can hide a stale-combo suppression — codex #1),
+    // single-flight (coalesced) so concurrent calls never stampede, and time-boxed so a
+    // stalled backend never wedges the query (codex #5).
+    // Trust verdict for THIS query's combo cross-check. Derived SOLELY from the return
+    // value of the forced refresh get_errors itself triggers — never from the shared
+    // nodeDefsRefreshConfirmed global, which a concurrent refresh (reconnect / add_node
+    // payload / download) can overwrite against a stale combo mid-await (codex round-6
+    // P0). Defaults to FALSE (distrust ⇒ over-report) unless MY refresh proves freshness.
+    let comboTrustedForQuery = false;
+    try {
+      if (hasRawMissingAssetCandidates()) {
+        // force:true so we never JOIN an /object_info fetch that began BEFORE the current
+        // asset state (a joined stale run would trust a combo snapshot predating a just-
+        // deleted asset and suppress the now-genuine miss). The coalescer guarantees a
+        // trailing fetch that STARTS after the in-flight run settles and dedups concurrent
+        // forced calls into one (#396 / codex round-4 P0), and FORWARDS that trailing run's
+        // own freshness verdict back here — so the value below reflects the fetch THIS call
+        // triggered, not any concurrent run's global write.
+        comboTrustedForQuery = await withRefreshTimeout(
+          refreshComfyNodeDefs(undefined, { force: true }),
+        );
+        // …AND only if no OTHER refresh is still in flight at this synchronous point. The
+        // shared coalescer lets a concurrent PAYLOAD refresh (graph_add_node) run its own
+        // registration alongside our forced one; if that payload carries an older combo
+        // snapshot and its refreshComboInNodes lands LAST, the live combos are stale even
+        // though our forced refresh returned true. When the slot still holds a run after
+        // ours settled, it points at that other in-flight registration — distrust and keep
+        // the raw candidate reported rather than risk suppressing a genuine miss off a
+        // combo another run may still overwrite (codex round-10 P0). Read synchronously,
+        // no intervening await, so the value is current for the collect below.
+        comboTrustedForQuery = comboTrustedForQuery && nodeDefRefreshInFlight === null;
+      }
+    } catch {
+      // best-effort; on any failure distrust the combo and keep raw candidates reported.
+      comboTrustedForQuery = false;
+    }
+    // Resolve the graph AFTER the refresh await — a workflow-tab SWITCH during the wait
+    // would otherwise mix the pre-await graph's nodes/red flags with the new workflow's
+    // asset+validation state, fabricating and omitting per-node errors (codex round-9 P1).
+    // Reading it here binds every downstream surface to ONE consistent post-await graph.
     const { app: comfy, graph } = getGraphCtx();
     const nodes = graph._nodes ?? [];
     const byId = new Map(nodes.map((n) => [String(n.id), n]));
@@ -6184,7 +6399,7 @@ const GRAPH_TOOL_EXECUTORS = {
     //    proactive injection can never disagree. These are detected AT WORKFLOW
     //    LOAD, which is why they explain a red canvas long before anything is
     //    queued (see collectMissingAssets).
-    const assets = collectMissingAssets();
+    const assets = collectMissingAssets(comboTrustedForQuery);
     const missingModels = assets.models.map((m) => ({ ...m, kind: "missing_model" }));
     const missingMedia = assets.media.map((m) => ({ ...m, kind: "missing_media" }));
     const missingNodeTypes = assets.nodeTypes;

@@ -173,7 +173,68 @@ export function assetCandidateResolvesLive(rootGraph, nodeId, file, widgetName) 
     if (!w) return false;
     const raw = w.options?.values;
     const list = typeof raw === "function" ? raw(w, node) : raw;
+    // EXACT membership only. A subfolder-registered model (Impact Subpack's
+    // `segm/yolov8m-seg.pt`, #407) is listed by /object_info with the SAME separator
+    // the widget value carries, so an exact match resolves it once the combo is
+    // trusted (the get_errors authoritative refresh) — no separator normalization,
+    // which on POSIX could equate a literal-backslash filename with a distinct
+    // forward-slash one and SUPPRESS a genuine miss.
     return Array.isArray(list) && list.includes(file);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when a LiteGraph `has_errors` red flag on `nodeId` is NO LONGER justified —
+ * neither the live missing-asset collector nor the last validation map still blames
+ * that node — so the stale red outline may be cleared (#418). After panel_set_widget
+ * repoints a widget from a missing asset to a valid one, `assetCandidateStillReferenced`
+ * already drops the missing candidate, but LiteGraph's boolean `has_errors` is sticky
+ * and keeps painting the node red with an empty `reasons: []`. Callers clear the flag
+ * only when this returns true.
+ *
+ * `missingItems` is the flat list of `{ node_id }` from collectMissingAssets (models +
+ * media). Validation errors come from `nodeErrorsMaps` — an ARRAY of independent
+ * `{ [id]: { errors: [...] } }` maps (e.g. `app.lastNodeErrors` AND the execution-error
+ * Pinia store, which can each blame a node the other does not). They are checked with
+ * OR semantics — a live error in ANY map keeps the flag — deliberately NOT shallow-
+ * merged: a merge would let one map's EMPTY `{id:{errors:[]}}` overwrite another map's
+ * live entry and wrongly clear a genuine error (codex round-2 P0). `nodeErrorsMap`
+ * (singular) is still accepted for one-map callers/tests. `resolvesToNode(scopedId)` is
+ * an optional predicate that returns true when a candidate's (possibly SCOPED/nested)
+ * node id resolves to the SAME live node whose flag is being tested — needed because a
+ * nested candidate id never string-equals the inner node's local id. Fails toward KEEPING
+ * the flag (returns false) on any doubt, so a genuinely-errored node is never de-flagged.
+ */
+export function nodeRedFlagIsStale(
+  nodeId,
+  { missingItems = [], nodeErrorsMap = null, nodeErrorsMaps = null, resolvesToNode = null } = {},
+) {
+  try {
+    if (nodeId == null) return false;
+    const id = String(nodeId);
+    const stillMissing = (Array.isArray(missingItems) ? missingItems : []).some((it) => {
+      if (it?.node_id == null) return false;
+      // Direct id match is enough for a root node; a NESTED candidate is keyed by a
+      // SCOPED locator ("6105:6077" / "<subgraphUUID>:6077") that never string-equals
+      // the inner node's own local id, so `resolvesToNode` (which resolves the locator
+      // and compares object identity) must catch it — otherwise a still-missing nested
+      // asset would slip past and wrongly clear the flag (codex round-3 P0).
+      if (String(it.node_id) === id) return true;
+      return typeof resolvesToNode === "function" ? resolvesToNode(it.node_id) === true : false;
+    });
+    if (stillMissing) return false;
+    const maps = Array.isArray(nodeErrorsMaps)
+      ? nodeErrorsMaps
+      : nodeErrorsMap
+        ? [nodeErrorsMap]
+        : [];
+    const stillInvalid = maps.some((mp) => {
+      const errs = mp?.[id]?.errors;
+      return Array.isArray(errs) && errs.length > 0;
+    });
+    return !stillInvalid;
   } catch {
     return false;
   }
