@@ -29,8 +29,10 @@ import {
   isAuthorizedFrontendOnlyType,
   isRemovedBackendType,
   HISTORY_UNSEEDED,
+  HISTORY_PENDING,
   backendHistoryVerdict,
 } from "../../web/js/lib/node-resolve.js";
+import { createObjectInfoHistory } from "../../web/js/lib/object-info-history.js";
 // The PRODUCTION graph_set_widget handler body — the executor and these tests
 // call it verbatim, so the tested ordering IS the shipped ordering (#458).
 import { runSetWidget } from "../../web/js/lib/set-widget.js";
@@ -1477,4 +1479,123 @@ test("#496: backendHistoryVerdict — the one classifier all three guards share"
   // refusal, but it is not a claim that the pack was removed.
   assert.equal(isRemovedBackendType("X", () => HISTORY_UNSEEDED), false);
   assert.equal(isRemovedBackendType("X", () => true), true);
+});
+
+// ---- #496 REGRESSION (coordinator review): a merely SLOW /object_info must not burn the
+//      session. A caller's bounded wait can expire while the fetch is still in flight;
+//      that is the ABSENCE of evidence, not evidence, so it yields a TEMPORARY refusal
+//      and a late-arriving seed restores normal operation with no tab reload. Latching
+//      there would make ordinary latency a permanent false refusal — the same bug class
+//      as #496 and #507 themselves. -----------------------------------------------------
+
+test("#496 REGRESSION: a seed that resolves AFTER the bound ⇒ the next MarkdownNote add SUCCEEDS", async () => {
+  // Drives the REAL history object through the real guard, so the state machine and the
+  // guard's reading of it are exercised together.
+  const history = createObjectInfoHistory();
+  const reg = registryWithNatives();
+  const fresh = objectInfo(); // healthy backend; never lists MarkdownNote (by design)
+  const opts = ADD_OPTS(fresh, (t) => history.wasTypeEverDefined(t));
+
+  // t = 0..bound — the startup getNodeDefs() is still in flight and the tool gave up
+  // waiting. Refused, but TEMPORARILY: the message must say "retry in a moment" and must
+  // NOT blame a removed pack or tell the user to reload.
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", opts),
+    (err) =>
+      /still loading|retry in a moment/i.test(err.message) &&
+      !/pack uninstalled|its backend was removed/i.test(err.message) &&
+      !/Reload the ComfyUI tab/i.test(err.message),
+  );
+  assert.equal(history.baselineLost, false, "a bounded wait must not latch the session");
+
+  // t = bound+ε — the slow response lands and seeds the baseline (this is what
+  // seedObjectInfoHistory does when its in-flight fetch finally returns).
+  history.recordTypes(fresh);
+  assert.equal(history.markSeeded(), true);
+
+  // The very SAME add now succeeds. No tab reload, nothing burned.
+  await assert.doesNotReject(
+    () => assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", opts),
+    "a late seed must restore normal operation",
+  );
+  // …and so does the write path, on the same recovered baseline.
+  const node = { id: 11, type: "MarkdownNote", widgets: [{ name: "text", type: "string", value: "" }], constructor: reg["MarkdownNote"] };
+  const { set } = await runSetWidget(node, "text", "# README", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => fresh,
+    wasTypeEverDefined: (t) => history.wasTypeEverDefined(t),
+    ...HOOKS,
+  });
+  assert.equal(set.value, "# README");
+  // The recovered baseline is a REAL one, not a blanket allow: a type it DID observe is
+  // still refused once it disappears from /object_info.
+  const gone = objectInfo(); // KSampler is in `fresh` (observed) but we drop it here
+  delete gone["KSampler"];
+  assert.throws(
+    () =>
+      assertTypeAgainstFreshBackend(gone, "KSampler", 12, {
+        registry: reg,
+        wasTypeEverDefined: (t) => history.wasTypeEverDefined(t),
+      }),
+    /its backend was removed|pack uninstalled/i,
+  );
+});
+
+test("#496 REGRESSION: PENDING and LATCHED are reported DIFFERENTLY by all three guards", async () => {
+  // "hasn't loaded yet, retry" and "never loaded, reload the tab" are different problems
+  // with different user actions. Both refuse; only the diagnosis differs.
+  const reg = registryWithNatives();
+  const fresh = objectInfo();
+  const node = { id: 11, type: "MarkdownNote", widgets: [{ name: "text", type: "string", value: "" }], constructor: reg["MarkdownNote"] };
+  const PENDING = () => HISTORY_PENDING;
+  const LATCHED = () => HISTORY_UNSEEDED;
+  const temporary = (m) => /still loading|retry in a moment/i.test(m) && !/Reload the ComfyUI tab/i.test(m);
+  const permanent = (m) => /Reload the ComfyUI tab/i.test(m) && !/retry in a moment/i.test(m);
+
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS(fresh, PENDING)),
+    (err) => temporary(err.message),
+  );
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS(fresh, LATCHED)),
+    (err) => permanent(err.message),
+  );
+  assert.throws(
+    () => assertTypeAgainstFreshBackend(fresh, "MarkdownNote", 11, { registry: reg, node, wasTypeEverDefined: PENDING }),
+    (err) => temporary(err.message),
+  );
+  assert.throws(
+    () => assertTypeAgainstFreshBackend(fresh, "MarkdownNote", 11, { registry: reg, node, wasTypeEverDefined: LATCHED }),
+    (err) => permanent(err.message),
+  );
+  assert.throws(
+    () => assertMutatedNodeAuthorized(fresh, reg, node, "target", PENDING),
+    (err) => temporary(err.message),
+  );
+  assert.throws(
+    () => assertMutatedNodeAuthorized(fresh, reg, node, "target", LATCHED),
+    (err) => permanent(err.message),
+  );
+});
+
+test("#496 REGRESSION: the PENDING sentinel still FAILS CLOSED — it never authorizes anything", async () => {
+  // The recoverable state must not become a hole: while pending, NOTHING is exempted.
+  const reg = registryWithNatives();
+  const fresh = objectInfo();
+  const node = { id: 11, type: "MarkdownNote", widgets: [{ name: "text", type: "string", value: "" }], constructor: reg["MarkdownNote"] };
+  assert.equal(backendHistoryVerdict("MarkdownNote", () => HISTORY_PENDING), "pending");
+  assert.notEqual(backendHistoryVerdict("MarkdownNote", () => HISTORY_PENDING), "never-seen");
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "text", "# README", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => fresh,
+        wasTypeEverDefined: () => HISTORY_PENDING,
+        ...HOOKS,
+      }),
+    /still loading|retry in a moment/i,
+  );
+  assert.equal(node.widgets[0].value, "", "no write while the baseline is pending");
 });

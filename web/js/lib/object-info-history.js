@@ -17,16 +17,26 @@
 //      reports EVERY absent-from-current type as removed. A failed seed therefore never
 //      opens a hole; it only refuses more.
 //
-//   2. BASELINE LOST ⇒ LATCHED CLOSED FOR THE SESSION. Once the STARTUP baseline is
-//      missed — the seed failed, or a tool bounded its wait and gave up — there is a
-//      window we never observed, and NO later observation can prove a type was "never
-//      defined earlier this session": the removal may have happened inside that window.
-//      So after loseBaseline() nothing may mark the history seeded, not even a successful
-//      reconnect/refresh_nodes re-register. Reloading the tab is what re-establishes a
-//      real baseline. (Without this latch: startup fetch hangs → pack removed during the
-//      wait → a later fetch installs the POST-removal map as the baseline → a
-//      provenance-stripped husk squatting a reserved allowlisted name reads "never seen"
-//      and is exempted — the exact hole the ever-seen gate exists to close.)
+//   2. BASELINE LOST ⇒ LATCHED CLOSED FOR THE SESSION. Once the page-load-anchored
+//      observation window has POSITIVELY closed with no data, no later observation can
+//      prove a type was "never defined earlier this session": a removal may have happened
+//      inside the gap. So after loseBaseline() nothing may mark the history seeded, not
+//      even a successful reconnect/refresh_nodes re-register. (Without this latch: the
+//      startup fetch fails → a pack is removed → a later fetch installs the POST-removal
+//      map as the baseline → a provenance-stripped husk squatting a reserved allowlisted
+//      name reads "never seen" and is exempted — the hole the ever-seen gate exists to
+//      close.)
+//
+//      THE LATCH IS ARMED BY EVIDENCE ONLY, NEVER BY A TIMEOUT. "Not seeded yet" and
+//      "proven unanchored" are different states and get different handling, because
+//      conflating them created a third false refusal on top of the two this work fixes:
+//      an /object_info fetch that merely took longer than a tool's bounded wait would
+//      latch the session closed, and every subsequent legitimate add/write was refused
+//      until the user reloaded the tab — even though the request then returned perfectly
+//      healthy definitions. A timeout is the ABSENCE of evidence. The PENDING state
+//      (rule 1, below) covers it and is fully RECOVERABLE: the in-flight seed keeps
+//      running, a late response still calls markSeeded(), and normal operation resumes
+//      on the next call with no reload.
 //
 // recordTypes() is deliberately NOT latched: recording can only ever ADD evidence that a
 // type existed, which can only ever make the gate refuse MORE. Only the "this history is
@@ -45,7 +55,7 @@
 // it. The reserved-name allowlist and the provenance checks are the layered defenses that
 // keep the residual to exactly that construction.
 
-import { HISTORY_UNSEEDED } from "./node-resolve.js";
+import { HISTORY_PENDING, HISTORY_UNSEEDED } from "./node-resolve.js";
 
 export function createObjectInfoHistory() {
   const seen = new Set();
@@ -70,12 +80,17 @@ export function createObjectInfoHistory() {
       return true;
     },
 
-    /** Latch: we reached a guard without a trustworthy baseline. IRREVERSIBLE, and it
-     *  also DEMOTES any existing baseline, so the invariant is the simple one — any
-     *  admitted observation gap closes the gate for the session, no case analysis about
-     *  which side of the gap the baseline fell on. In practice the panel only calls this
-     *  when the history is already unseeded (the waiter returns early when it is seeded),
-     *  so a healthy session never reaches it. */
+    /** Latch: POSITIVE EVIDENCE that the page-load-anchored observation window closed
+     *  WITHOUT data, so no later fetch can serve as a baseline. IRREVERSIBLE, and it
+     *  demotes any existing baseline.
+     *
+     *  ARM THIS ONLY ON EVIDENCE, NEVER ON A TIMEOUT. A timeout is the ABSENCE of
+     *  evidence, not evidence: the request may still be in flight and about to return
+     *  perfectly healthy definitions. Latching on one would turn ordinary latency into a
+     *  permanent, session-long false refusal of every legitimate add/write — the exact
+     *  bug class (#496/#507) this module's consumers exist to fix. Use the recoverable
+     *  PENDING state for "no baseline yet"; the only caller here is the startup seed
+     *  after its whole attempt sequence has finished with nothing. */
     loseBaseline() {
       baselineLost = true;
       seeded = false;
@@ -83,14 +98,19 @@ export function createObjectInfoHistory() {
 
     /** The oracle the #458 guards inject. TRUE ⇒ "treat as defined earlier this session",
      *  which for a type absent from the CURRENT /object_info means REMOVED ⇒ refuse.
-     *  With NO trustworthy baseline it returns the HISTORY_UNSEEDED sentinel instead —
-     *  still TRUTHY, so a consumer that only tests for truth still fails closed, but a
-     *  guard that recognizes it can say "reload the tab" rather than falsely blaming a
-     *  removed pack (which for a MarkdownNote is nonsense and is exactly the misleading
-     *  diagnosis #496 was filed about). */
+     *
+     *  Without a baseline it returns one of two TRUTHY sentinels — truthy so a consumer
+     *  that only tests for truth still fails closed, distinct so the guards can say what
+     *  is actually wrong instead of falsely blaming a removed pack (nonsense for a
+     *  MarkdownNote, and exactly the misleading diagnosis #496 was filed about):
+     *    HISTORY_PENDING  — the baseline has not ARRIVED yet. TEMPORARY and RECOVERABLE:
+     *                       a late /object_info response still calls markSeeded(), after
+     *                       which the very next call authorizes normally, no tab reload.
+     *    HISTORY_UNSEEDED — the observation window closed with nothing (latched). Only a
+     *                       reload can re-establish a baseline. */
     wasTypeEverDefined(type) {
-      if (!seeded) return HISTORY_UNSEEDED;
-      return seen.has(type);
+      if (seeded) return seen.has(type);
+      return baselineLost ? HISTORY_UNSEEDED : HISTORY_PENDING;
     },
 
     get seeded() {

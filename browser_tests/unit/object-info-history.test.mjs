@@ -2,19 +2,22 @@
  * Unit tests for web/js/lib/object-info-history.js — run with `node --test`.
  *
  * This is the OBSERVED-BACKEND-HISTORY trust root the whole #458 guard family rests on
- * (node-resolve.js's isRemovedBackendType / the frontend-only exemption). Its two
- * fail-closed rules are what stop a removed backend pack from being written to or added:
+ * (node-resolve.js's backendHistoryVerdict / the frontend-only exemption). It has THREE
+ * states, and keeping two of them apart is the whole point of the module:
  *
- *   1. UNSEEDED ⇒ CLOSED — until a trustworthy baseline exists, "never seen" proves
- *      nothing, so every absent-from-current type reads as removed.
- *   2. BASELINE LOST ⇒ LATCHED CLOSED — once the startup baseline is missed, no LATER
- *      observation may re-establish it, because the removal could have happened inside
- *      the window we never observed.
+ *   SEEDED   — a page-load-anchored /object_info was observed. "Never seen" is meaningful,
+ *              so the frontend-only exemption may be considered.
+ *   PENDING  — no baseline YET (the fetch is in flight, or a caller bounded its wait).
+ *              Refuse, but TEMPORARILY and RECOVERABLY: a late response still seeds and
+ *              the next call authorizes normally, with no tab reload.
+ *   LATCHED  — the observation window POSITIVELY closed with no data. Refuse for the whole
+ *              session; no later observation may re-establish a baseline.
  *
- * Rule 2 is the sequence adversarial review flagged twice: startup fetch hangs/fails →
- * a pack is removed → a later fetch succeeds → without the latch that POST-removal map
- * becomes the baseline, the removed type reads "never seen", and a provenance-stripped
- * husk squatting a reserved allowlisted name (MarkdownNote) is exempted.
+ * PENDING vs LATCHED is an evidence distinction, not a convenience. A TIMEOUT is the
+ * ABSENCE of evidence: latching on one turns an /object_info fetch that merely took a
+ * moment too long into a permanent, session-long refusal of every legitimate add and
+ * write — a third false refusal on top of the two (#496, #507) this work fixes. Only a
+ * seed whose attempt sequence has FINISHED empty has the evidence to latch.
  *
  * SCOPE NOTE: these tests cover this module's POLICY. They do NOT — and cannot — cover the
  * residual race in which a pack is removed inside the window between page load and the
@@ -26,32 +29,44 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { createObjectInfoHistory } from "../../web/js/lib/object-info-history.js";
-// The guard-side contract this oracle feeds: an unseeded history returns a TRUTHY
-// sentinel, which the shared classifier reports as "unseeded" (refuse, but diagnose it
-// as a missing baseline rather than a removed pack).
-import { HISTORY_UNSEEDED, backendHistoryVerdict, isRemovedBackendType } from "../../web/js/lib/node-resolve.js";
-
-// Assert the FULL fail-closed contract for a type in a no-baseline history.
-const assertUnseededClosed = (h, type, msg) => {
-  const verdict = h.wasTypeEverDefined(type);
-  assert.equal(verdict, HISTORY_UNSEEDED, msg);
-  assert.ok(verdict, "the sentinel must be TRUTHY so a truth-testing consumer still fails closed");
-  assert.equal(backendHistoryVerdict(type, (t) => h.wasTypeEverDefined(t)), "unseeded");
-  assert.equal(isRemovedBackendType(type, (t) => h.wasTypeEverDefined(t)), false, "not a REMOVED claim — it is an unknown-baseline claim");
-};
+// The guard-side contract this oracle feeds: both no-baseline states return a TRUTHY
+// sentinel (so a truth-testing consumer still fails closed) and the shared classifier
+// turns them into distinct, honest diagnoses.
+import {
+  HISTORY_PENDING,
+  HISTORY_UNSEEDED,
+  backendHistoryVerdict,
+  isRemovedBackendType,
+} from "../../web/js/lib/node-resolve.js";
 
 const defs = (...types) => Object.fromEntries(types.map((t) => [t, { input: { required: {} } }]));
+const oracle = (h) => (t) => h.wasTypeEverDefined(t);
 
-test("#458 rule 1: an UNSEEDED history fails CLOSED — every type reads as ever-defined", () => {
+// Assert the full fail-closed contract for a type in a given no-baseline state.
+const assertClosed = (h, type, sentinel, verdict, msg) => {
+  const answer = h.wasTypeEverDefined(type);
+  assert.equal(answer, sentinel, msg);
+  assert.ok(answer, "the sentinel must be TRUTHY so a truth-testing consumer fails closed");
+  assert.equal(backendHistoryVerdict(type, oracle(h)), verdict);
+  assert.equal(
+    isRemovedBackendType(type, oracle(h)),
+    false,
+    "no baseline is not a REMOVED claim — it is an unknown-baseline claim",
+  );
+};
+const assertPending = (h, type, msg) => assertClosed(h, type, HISTORY_PENDING, "pending", msg);
+const assertLatched = (h, type, msg) => assertClosed(h, type, HISTORY_UNSEEDED, "unseeded", msg);
+
+test("#458 rule 1: a history with no baseline yet is PENDING and fails CLOSED", () => {
   const h = createObjectInfoHistory();
   assert.equal(h.seeded, false);
-  // Nothing observed at all.
-  assertUnseededClosed(h, "MarkdownNote", "unseeded ⇒ refuse");
-  assertUnseededClosed(h, "AnythingAtAll");
-  // Even after RECORDING types, an unseeded history still refuses everything: recording
-  // is evidence, promoting it to a baseline is a separate, explicit claim.
+  assert.equal(h.baselineLost, false);
+  assertPending(h, "MarkdownNote", "no baseline yet ⇒ refuse");
+  assertPending(h, "AnythingAtAll");
+  // Even after RECORDING types, an unseeded history still refuses: recording is evidence,
+  // promoting it to a baseline is a separate, explicit claim.
   h.recordTypes(defs("KSampler"));
-  assertUnseededClosed(h, "MarkdownNote", "recording alone is not a baseline");
+  assertPending(h, "MarkdownNote", "recording alone is not a baseline");
 });
 
 test("#458 rule 1: once SEEDED, only genuinely-observed types read as ever-defined", () => {
@@ -60,38 +75,58 @@ test("#458 rule 1: once SEEDED, only genuinely-observed types read as ever-defin
   assert.equal(h.markSeeded(), true);
   assert.equal(h.wasTypeEverDefined("KSampler"), true, "observed ⇒ removed if now absent");
   assert.equal(h.wasTypeEverDefined("MarkdownNote"), false, "never observed ⇒ genuinely frontend-only");
+  assert.equal(backendHistoryVerdict("MarkdownNote", oracle(h)), "never-seen");
+  assert.equal(backendHistoryVerdict("KSampler", oracle(h)), "removed");
 });
 
-test("#458 rule 2 (SEVERE): a LOST baseline is LATCHED — a later successful observation cannot restore it", () => {
-  // The exact hole: the startup seed fails / times out, the pack is removed during the
-  // gap, and a later fetch returns the POST-removal /object_info.
+test("#496 REGRESSION: a LATE seed (arriving after a caller's bounded wait) restores normal operation", () => {
+  // The exact scenario a bounded wait creates: api.getNodeDefs() takes longer than the
+  // bound, a graph tool gives up waiting and refuses THIS call, and the response then
+  // lands with perfectly healthy definitions. The next call MUST authorize normally.
+  // Latching at the timeout instead would refuse every legitimate add/write for the rest
+  // of the session — ordinary latency causing permanent breakage, which is the very
+  // false-refusal bug class #496/#507 are about.
   const h = createObjectInfoHistory();
-  h.loseBaseline(); // a graph tool gave up waiting for the startup seed
-  h.recordTypes(defs("KSampler", "CLIPTextEncode")); // a later, post-removal payload
+  // t = 0..bound: the tool gives up waiting. It must NOT latch — it learned nothing.
+  assertPending(h, "MarkdownNote", "still loading ⇒ a TEMPORARY refusal");
+  assert.equal(h.baselineLost, false, "a bounded wait must never latch the session");
+  // t = bound+ε: the slow response lands and seeds the baseline.
+  h.recordTypes(defs("KSampler", "CLIPTextEncode"));
+  assert.equal(h.markSeeded(), true, "a late seed is still a valid page-load-anchored baseline");
+  // The very next authorization succeeds — no tab reload, nothing burned.
+  assert.equal(h.seeded, true);
+  assert.equal(h.wasTypeEverDefined("MarkdownNote"), false, "MarkdownNote is addable/writable again");
+  assert.equal(backendHistoryVerdict("MarkdownNote", oracle(h)), "never-seen");
+  // …and the recovered baseline is a REAL one: a type it did observe still reads removed.
+  assert.equal(backendHistoryVerdict("KSampler", oracle(h)), "removed");
+});
+
+test("#458 rule 2 (SEVERE): a LATCHED baseline cannot be restored by a later successful observation", () => {
+  // The evidence case: the seed's whole attempt sequence finished with nothing, so the
+  // page-load-anchored window is positively closed. A later fetch may be POST-removal, so
+  // it must never become the baseline.
+  const h = createObjectInfoHistory();
+  h.loseBaseline(); // the startup seed exhausted every attempt
+  h.recordTypes(defs("KSampler", "CLIPTextEncode")); // a later, possibly post-removal payload
   assert.equal(h.markSeeded(), false, "the latch refuses to promote a post-loss observation");
   assert.equal(h.seeded, false);
   assert.equal(h.baselineLost, true);
-  // "MarkdownNote" was NEVER in the late payload — but we cannot conclude it never
-  // existed, so it must still read as ever-defined and stay refused by the guards.
-  assertUnseededClosed(h, "MarkdownNote", "a post-loss history must never authorize the frontend-only exemption");
-  assertUnseededClosed(h, "KSampler");
+  // "MarkdownNote" was never in the late payload — but we cannot conclude it never
+  // existed, so it stays refused, and with the reload-the-tab diagnosis rather than the
+  // temporary one.
+  assertLatched(h, "MarkdownNote", "a post-loss history must never authorize the exemption");
+  assertLatched(h, "KSampler");
 });
 
 test("#458 rule 2 (SEVERE, production ordering): a post-gap observation recorded BEFORE any guard runs does not establish a baseline", () => {
-  // The ordering codex round-4 flagged: the startup seed hangs (so nothing has latched
-  // yet), the pack is removed, and a RECONNECT / refresh_nodes / download refresh lands a
-  // current /object_info. That payload is RECORDED — recording only ever adds evidence —
-  // but it must NOT be promoted to a baseline, because it cannot support the claim
-  // "anything absent here was never backend-defined this session".
+  // The ordering adversarial review flagged: nothing has latched yet, a pack is removed,
+  // and a RECONNECT / refresh_nodes / download refresh lands a current /object_info. That
+  // payload is RECORDED — recording only ever adds evidence — but it must NOT be promoted
+  // to a baseline, because only the startup seed may call markSeeded().
   const h = createObjectInfoHistory();
   h.recordTypes(defs("KSampler", "CLIPTextEncode")); // post-removal payload, no markSeeded
   assert.equal(h.seeded, false, "recording alone never seeds — only the startup seed may");
-  assertUnseededClosed(h, "MarkdownNote", "with no startup baseline, nothing can be concluded");
-  // The guard that eventually runs latches the loss, and it stays latched afterwards.
-  h.loseBaseline();
-  h.recordTypes(defs("KSampler"));
-  assert.equal(h.markSeeded(), false);
-  assertUnseededClosed(h, "MarkdownNote");
+  assertPending(h, "MarkdownNote", "with no startup baseline, nothing can be concluded");
 });
 
 test("#458 rule 2: losing the baseline AFTER it was legitimately established also closes the gate", () => {
@@ -103,7 +138,7 @@ test("#458 rule 2: losing the baseline AFTER it was legitimately established als
   // markSeeded is now inert, so a subsequent re-register cannot re-open the exemption.
   assert.equal(h.markSeeded(), false);
   assert.equal(h.seeded, false);
-  assertUnseededClosed(h, "MarkdownNote", "latched closed for the session");
+  assertLatched(h, "MarkdownNote", "latched closed for the session");
 });
 
 test("#458: recordTypes is NOT latched — recording can only ever ADD evidence (refuse more)", () => {

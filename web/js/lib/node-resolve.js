@@ -177,33 +177,65 @@ export function isRemovedBackendType(type, wasTypeEverDefined) {
 export const HISTORY_UNSEEDED = "history-unseeded";
 
 /**
+ * The other no-baseline sentinel: the baseline has not ARRIVED yet (the /object_info fetch
+ * is still in flight, or a caller bounded its wait on it). Also TRUTHY, so it fails closed
+ * identically — but it is TEMPORARY and RECOVERABLE, and must be reported that way.
+ *
+ * Keeping it distinct from HISTORY_UNSEEDED is not cosmetic. Treating "hasn't loaded yet"
+ * as "proven untrustworthy" turns ordinary latency into a permanent, session-long refusal
+ * of every legitimate add/write — a THIRD false refusal on top of the two (#496, #507)
+ * this guard family was fixed to stop making. A slow fetch must yield "retry in a moment",
+ * never "reload the tab".
+ */
+export const HISTORY_PENDING = "history-pending";
+
+/**
  * Classify a type against the observed-backend-history oracle. ONE shared classifier for
  * the whole guard family (#496), so all three guards agree on both the verdict and the
  * diagnosis they report:
- *   "unseeded"   — no trustworthy baseline exists; nothing can be concluded ⇒ refuse, and
- *                  tell the user to reload the tab rather than blame a missing pack.
+ *   "pending"    — the baseline has not arrived YET ⇒ refuse, but say it is temporary and
+ *                  to retry; the state clears itself when the fetch lands.
+ *   "unseeded"   — the observation window closed with no data ⇒ refuse, and tell the user
+ *                  to reload the tab rather than blame a missing pack.
  *   "removed"    — the backend reported this type earlier this session and does not now
  *                  ⇒ its pack was uninstalled/disabled ⇒ refuse.
  *   "never-seen" — genuinely never backend-defined this session ⇒ the frontend-only
  *                  exemption may be considered (it has its own further requirements).
  *   "no-oracle"  — no history oracle was injected at all. Treated as NOT never-seen, so
  *                  callers that require positive history evidence fail closed.
+ * Every verdict except "never-seen" refuses, so a consumer that cannot tell them apart is
+ * still safe — the distinction only buys an accurate diagnosis.
  */
 export function backendHistoryVerdict(type, wasTypeEverDefined) {
   if (typeof wasTypeEverDefined !== "function" || typeof type !== "string") return "no-oracle";
   const seen = wasTypeEverDefined(type);
+  if (seen === HISTORY_PENDING) return "pending";
   if (seen === HISTORY_UNSEEDED) return "unseeded";
   return seen ? "removed" : "never-seen";
 }
 
-/** The shared, honest refusal for the "no trustworthy baseline" state. */
+/** The shared refusal for a baseline that simply has not ARRIVED yet — TEMPORARY, so it
+ *  must read as "retry in a moment", never as "this node type can't be verified" or
+ *  "reload the tab". Getting this wrong is what makes ordinary latency look like a broken
+ *  install to the user. */
+function pendingHistoryMessage(what) {
+  return (
+    `${what}: the panel is still loading this ComfyUI's node-type baseline (the ` +
+    `/object_info fetch has not come back yet), so a genuinely frontend-only node cannot ` +
+    `yet be told apart from one whose pack was removed. This is TEMPORARY — retry in a ` +
+    `moment and it will resolve itself; no reload is needed. Refusing to write until the ` +
+    `backend can be verified (#458).`
+  );
+}
+
+/** The shared, honest refusal for a baseline that was never established at all. */
 function unseededHistoryMessage(what) {
   return (
     `${what}: the panel has no trustworthy record of what this ComfyUI backend defined ` +
     `earlier this session (the /object_info baseline never loaded — the backend was ` +
-    `unreachable or too slow at page load), so a genuinely frontend-only node cannot be ` +
-    `told apart from one whose pack was removed. Reload the ComfyUI tab to re-establish ` +
-    `the baseline, then retry. Refusing to write rather than guess (#458).`
+    `unreachable at page load), so a genuinely frontend-only node cannot be told apart ` +
+    `from one whose pack was removed. Reload the ComfyUI tab to re-establish the ` +
+    `baseline, then retry. Refusing to write rather than guess (#458).`
   );
 }
 
@@ -271,6 +303,9 @@ export function assertMutatedNodeAuthorized(freshDefs, registry, node, role = "t
   // ABSENT from fresh object_info. EVER-SEEN GATE: if the backend reported this type
   // earlier this session, its backend was REMOVED — refuse (non-forgeable, #458).
   const verdict = backendHistoryVerdict(type, wasTypeEverDefined);
+  if (verdict === "pending") {
+    throw new Error(pendingHistoryMessage(`Cannot set widget on node ${id}${label} (${role} node)`));
+  }
   if (verdict === "unseeded") {
     throw new Error(unseededHistoryMessage(`Cannot set widget on node ${id}${label} (${role} node)`));
   }
@@ -392,6 +427,9 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
       // but no longer does ⇒ its pack was REMOVED. Refuse, even under a reserved
       // allowlisted name, before the frontend-only exemption below is consulted.
       const verdict = backendHistoryVerdict(class_type, wasTypeEverDefined);
+      if (verdict === "pending") {
+        throw new Error(pendingHistoryMessage(`Cannot add "${class_type}"`));
+      }
       if (verdict === "unseeded") {
         throw new Error(unseededHistoryMessage(`Cannot add "${class_type}"`));
       }
@@ -511,6 +549,9 @@ export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknow
     // un-see what the backend already reported. This is what the client-side allowlist +
     // provenance markers CANNOT prove on their own.
     const verdict = backendHistoryVerdict(type, wasTypeEverDefined);
+    if (verdict === "pending") {
+      throw new Error(pendingHistoryMessage(`Cannot set widget on node ${nodeId}${label}`));
+    }
     if (verdict === "unseeded") {
       throw new Error(unseededHistoryMessage(`Cannot set widget on node ${nodeId}${label}`));
     }
