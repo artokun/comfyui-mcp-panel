@@ -75,6 +75,28 @@ export function shouldForkInPlaceReload({ cachedUuid, incomingUuid } = {}) {
   return Boolean(cachedUuid) && incomingUuid !== cachedUuid;
 }
 
+/** #570 — resolve the per-instance uuid for an UNSAVED workflow, failing CLOSED on the
+ *  copyable durability carrier. Precedence:
+ *   1. `objectUuid` — the LIVE-object WeakMap value. A copy/import never shares the live
+ *      object, so this is always a safe per-instance identity.
+ *   2. `embeddedId` — the graph.extra uuid. Trustworthy ONLY when `forkActive` is true,
+ *      because the creation-boundary wrapper is what re-mints graph.extra on every
+ *      copy/import/in-place replace. If the sanitizer is not provably installed
+ *      (`forkActive` false), a pasted graph could still carry the SOURCE's uuid, so the
+ *      embedded value is IGNORED and a fresh uuid is minted (lost-resume, never wrong-resume).
+ *   3. a freshly minted uuid.
+ *  `mint` is injected for deterministic tests; defaults to crypto.randomUUID. */
+export function resolveUnsavedInstanceUuid({
+  objectUuid,
+  embeddedId,
+  forkActive,
+  mint = () => crypto.randomUUID(),
+} = {}) {
+  if (objectUuid) return objectUuid;
+  if (forkActive && embeddedId) return embeddedId;
+  return mint();
+}
+
 export function isWorkflowCreationLoad({ workflowArg, openSource, noFork = false } = {}) {
   if (noFork) return false;
   if (openSource != null) return true;

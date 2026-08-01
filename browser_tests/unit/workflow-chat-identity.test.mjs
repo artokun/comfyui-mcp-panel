@@ -5,10 +5,48 @@ import {
   isThreadInScope,
   isWorkflowCreationLoad,
   normalizedWorkflowPath,
+  resolveUnsavedInstanceUuid,
   shouldForkEmbeddedWorkflowUuid,
   shouldForkInPlaceReload,
   workflowAliasForPath
 } from '../../web/js/lib/workflow-chat-identity.js'
+
+// #570 — FAIL-CLOSED durability carrier. The embedded graph.extra uuid is only trustworthy
+// when the creation-boundary wrapper (the sanitizer that re-mints graph.extra on every copy)
+// is provably installed. If it is NOT, a pasted/imported unsaved graph could still carry the
+// SOURCE uuid, so it must be ignored and a fresh per-instance uuid minted.
+test('#570 unsaved uuid: live-object WeakMap value always wins (copy-safe)', () => {
+  assert.equal(
+    resolveUnsavedInstanceUuid({ objectUuid: 'live-A', embeddedId: 'copied-src', forkActive: true, mint: () => 'FRESH' }),
+    'live-A'
+  )
+  // Even with the sanitizer off, the live object is authoritative.
+  assert.equal(
+    resolveUnsavedInstanceUuid({ objectUuid: 'live-A', embeddedId: 'copied-src', forkActive: false, mint: () => 'FRESH' }),
+    'live-A'
+  )
+})
+
+test('#570 unsaved uuid: embedded uuid trusted ONLY when the fork wrapper is installed (durable reload)', () => {
+  assert.equal(
+    resolveUnsavedInstanceUuid({ objectUuid: undefined, embeddedId: 'wf-uuid', forkActive: true, mint: () => 'FRESH' }),
+    'wf-uuid'
+  )
+})
+
+test('#570 unsaved uuid: fork wrapper NOT installed → embedded uuid ignored, mint fresh (no cross-resume)', () => {
+  // The critical regression: loadGraphData unavailable / wrapping threw → a copied graph must
+  // NOT adopt its source graph.extra uuid.
+  assert.equal(
+    resolveUnsavedInstanceUuid({ objectUuid: undefined, embeddedId: 'copied-src-uuid', forkActive: false, mint: () => 'FRESH' }),
+    'FRESH'
+  )
+})
+
+test('#570 unsaved uuid: no live object and no embedded → mint fresh regardless of fork state', () => {
+  assert.equal(resolveUnsavedInstanceUuid({ forkActive: true, mint: () => 'FRESH' }), 'FRESH')
+  assert.equal(resolveUnsavedInstanceUuid({ forkActive: false, mint: () => 'FRESH' }), 'FRESH')
+})
 
 // #570 P0b — an in-place load into an existing object must FORK when the content identity
 // changed; a stale object-cache must never override the newly-loaded graph identity.

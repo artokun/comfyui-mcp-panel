@@ -98,6 +98,7 @@ import {
   classifyPinnedTarget,
   isWorkflowCreationLoad,
   normalizedWorkflowPath,
+  resolveUnsavedInstanceUuid,
   shouldForkEmbeddedWorkflowUuid,
   shouldForkInPlaceReload,
   workflowAliasForPath,
@@ -1132,9 +1133,18 @@ function installCreateBoundaryFork(appRef) {
       return orig(graphData, clean, restoreView, workflow, options);
     };
     _loadGraphDataForkInstalled = true;
-  } catch {
-    // If wrapping fails, workflowStableUuid's lazy per-object stamping still keeps two
-    // concurrently-open copies distinct — the fork is a durability/robustness upgrade.
+  } catch (err) {
+    // Surface the failure: with the sanitizer inactive, workflowStableUuid fails CLOSED for
+    // unsaved workflows (ignores the copyable embedded uuid, mints fresh per instance). Two
+    // concurrently-open copies stay distinct, but durable resume across a reload is disabled
+    // — a deliberate lost-resume, never a wrong-resume.
+    _loadGraphDataForkInstalled = false;
+    try {
+      console.warn(
+        "[comfyui-mcp] creation-boundary fork failed to install; unsaved-workflow resume disabled (fail-closed)",
+        err,
+      );
+    } catch {}
   }
 }
 
@@ -1177,8 +1187,21 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
   // cache is empty (a fresh reload), and never let it override a live cache.
   const isUnsaved = !path && wf && wf.isPersisted !== true;
   if (isUnsaved) {
+    // FAIL CLOSED on the durability carrier: the embedded graph.extra uuid is trustworthy
+    // ONLY because the creation-boundary wrapper re-mints it on every copy/import/in-place
+    // replace — that sanitizer is what makes a persisted uuid a faithful projection of the
+    // live-object identity rather than a copyable source uuid. If the wrapper is not provably
+    // installed, that guarantee is void, so a pasted/imported graph could still be carrying
+    // the SOURCE's graph.extra uuid; adopting it would cross-resume the source's conversation
+    // (#570). When the sanitizer is inactive we therefore ignore the embedded value entirely
+    // and mint a fresh per-instance uuid — durable resume is disabled (lost-resume), never a
+    // wrong-resume. The live-object WeakMap (objectUuid) is always safe: a copy never shares it.
     const embeddedId = embeddedWorkflowUuid(wf);
-    const id = objectUuid || embeddedId || crypto.randomUUID();
+    const id = resolveUnsavedInstanceUuid({
+      objectUuid,
+      embeddedId,
+      forkActive: _loadGraphDataForkInstalled,
+    });
     _workflowObjectUuids.set(identityObject, id);
     rememberWorkflowUuidOwner(id, identityObject);
     if (embeddedId !== id) {
