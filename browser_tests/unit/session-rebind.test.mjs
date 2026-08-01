@@ -9,6 +9,7 @@ import {
   shouldResumeAfterComfyReconnect,
   shouldRehelloAfterCommand,
   planSoftReloadRecovery,
+  performSoftReloadRecovery,
   isTransientReconnectError,
   retryDuringReconnect,
   workflowTabKey,
@@ -292,4 +293,193 @@ test("#379: reconnect is unconditional across every outcome (no dead-bridge path
   const d = planSoftReloadRecovery();
   assert.equal(d.reconnect, true);
   assert.equal(d.keepResumeInterlock, false);
+});
+
+// ---- #419 soft-reload LIFECYCLE: a reload never leaves a bridge dead ---------
+// #419 reported panel_reload leaving open sidebar tabs permanently disconnected.
+// The fix guarantee is at the stop→start level: whatever the reload POST does,
+// the dropped bridge is ALWAYS restarted. The pure planSoftReloadRecovery truth
+// table (above) can't lock this, because softReload() does not branch on
+// `reconnect` — it drives performSoftReloadRecovery(), which owns the sequence.
+// These tests spy on ONE client's stop/start across every outcome, and — since
+// the lifecycle is per-tab, state-free, and shares nothing — that same guarantee
+// holds independently for each of N open tabs (no subset, or all, left dead).
+
+// Drive the lifecycle with a spy client + injected postReload, returning the
+// recorded stop/start order and which interlock branch ran.
+async function runLifecycle(postReload) {
+  const events = [];
+  const client = {
+    stop: () => events.push("stop"),
+    start: () => events.push("start"),
+  };
+  let kept = false;
+  let cleared = false;
+  let noted = null;
+  const result = await performSoftReloadRecovery({
+    client,
+    postReload,
+    onKeepInterlock: () => {
+      kept = true;
+    },
+    onClearInterlock: () => {
+      cleared = true;
+    },
+    note: (outcome) => {
+      noted = outcome;
+    },
+  });
+  return { events, kept, cleared, noted, result };
+}
+
+test("#419: an ACCEPTED reload stops THEN restarts the bridge and keeps the interlock", async () => {
+  const { events, kept, cleared, result } = await runLifecycle(async () => ({
+    ok: true,
+    reachable: true,
+  }));
+  assert.deepEqual(events, ["stop", "start"]); // bridge always restored
+  assert.equal(kept, true);
+  assert.equal(cleared, false);
+  assert.equal(result.accepted, true);
+  assert.equal(result.keepResumeInterlock, true);
+});
+
+test("#419: a REFUSED 503 reload stops THEN restarts the bridge and clears the interlock", async () => {
+  const { events, kept, cleared, noted, result } = await runLifecycle(async () => ({
+    ok: false, // by-design 503: reachable response, not ok
+    reachable: true,
+    startCommand: "node dist/index.js",
+  }));
+  assert.deepEqual(events, ["stop", "start"]); // NEVER left dead (the #379 wedge)
+  assert.equal(kept, false);
+  assert.equal(cleared, true);
+  assert.equal(noted.error, undefined); // refused, not a transport error
+  assert.equal(noted.startCommand, "node dist/index.js"); // manual-restart hint surfaced
+  assert.equal(result.keepResumeInterlock, false);
+});
+
+test("#419: a THROWN/timed-out reload POST still stops THEN restarts the bridge", async () => {
+  const { events, cleared, noted, result } = await runLifecycle(async () => {
+    throw new Error("reload request timed out");
+  });
+  assert.deepEqual(events, ["stop", "start"]); // unreachable → still reconnects
+  assert.equal(cleared, true);
+  assert.equal(noted.error instanceof Error, true);
+  assert.match(noted.error.message, /timed out/);
+  assert.equal(result.accepted, false);
+  assert.equal(result.keepResumeInterlock, false);
+});
+
+test("#419: the bridge is restarted even if the interlock callback throws", async () => {
+  // The hard guarantee: nothing between stop() and start() can strand the bridge.
+  const events = [];
+  const client = {
+    stop: () => events.push("stop"),
+    start: () => events.push("start"),
+  };
+  await performSoftReloadRecovery({
+    client,
+    postReload: async () => ({ ok: false, reachable: true }),
+    onClearInterlock: () => {
+      throw new Error("interlock callback blew up");
+    },
+    note: () => {
+      throw new Error("note blew up (should not be reached — interlock threw first)");
+    },
+  });
+  assert.deepEqual(events, ["stop", "start"]); // start() still fires from the finally
+});
+
+test("#419: the bridge is restarted even if the note callback throws (interlock ran)", async () => {
+  // Distinct from above: onClearInterlock SUCCEEDS, then note throws — start() must
+  // STILL fire (the note is a downstream best-effort effect).
+  const events = [];
+  const client = {
+    stop: () => events.push("stop"),
+    start: () => events.push("start"),
+  };
+  let cleared = false;
+  await performSoftReloadRecovery({
+    client,
+    postReload: async () => ({ ok: false, reachable: true }),
+    onClearInterlock: () => {
+      cleared = true;
+    },
+    note: () => {
+      throw new Error("note blew up");
+    },
+  });
+  assert.equal(cleared, true); // the interlock effect DID run
+  assert.deepEqual(events, ["stop", "start"]); // and the bridge still reconnected
+});
+
+test("#419: a THROWING plan() still stops THEN restarts the bridge (never rejects)", async () => {
+  // The DI contract: nothing between stop() and start() — including a throwing
+  // injected plan — may strand the bridge or reject the reload.
+  const events = [];
+  const client = {
+    stop: () => events.push("stop"),
+    start: () => events.push("start"),
+  };
+  let planCalled = false;
+  const result = await performSoftReloadRecovery({
+    client,
+    postReload: async () => ({ ok: true, reachable: true }),
+    plan: () => {
+      planCalled = true;
+      throw new Error("plan blew up");
+    },
+  });
+  assert.equal(planCalled, true); // the injected plan WAS invoked (not bypassed)
+  assert.deepEqual(events, ["stop", "start"]); // reconnect still guaranteed
+  assert.equal(result.reconnect, true); // contract value survives a thrown plan
+});
+
+test("#419: a stop() that throws does NOT skip the reconnect", async () => {
+  const events = [];
+  const client = {
+    stop: () => {
+      events.push("stop-throw");
+      throw new Error("socket close failed");
+    },
+    start: () => events.push("start"),
+  };
+  await performSoftReloadRecovery({
+    client,
+    postReload: async () => ({ ok: true, reachable: true }),
+  });
+  assert.deepEqual(events, ["stop-throw", "start"]); // start still reached
+});
+
+test("#419: beforeStart runs immediately BEFORE start (pre-extraction ordering)", async () => {
+  // The caller clears its `reloading` re-entrancy flag in beforeStart; it MUST run
+  // before the reconnect so the ordering matches the pre-extraction code.
+  const events = [];
+  const client = {
+    stop: () => events.push("stop"),
+    start: () => events.push("start"),
+  };
+  await performSoftReloadRecovery({
+    client,
+    postReload: async () => ({ ok: true, reachable: true }),
+    beforeStart: () => events.push("beforeStart"),
+  });
+  assert.deepEqual(events, ["stop", "beforeStart", "start"]);
+});
+
+test("#419: N open tabs each independently reconnect — no subset left dead", async () => {
+  // Each tab runs its OWN lifecycle on its OWN spy client with a DIFFERENT POST
+  // outcome; the lifecycle shares no state, so every tab is restarted.
+  const outcomes = [
+    async () => ({ ok: true, reachable: true }), // accepted
+    async () => ({ ok: false, reachable: true }), // by-design 503
+    async () => {
+      throw new Error("unreachable"); // POST never answered
+    },
+  ];
+  const runs = await Promise.all(outcomes.map((p) => runLifecycle(p)));
+  for (const r of runs) {
+    assert.deepEqual(r.events, ["stop", "start"]); // this tab reconnected
+    assert.equal(r.result.reconnect, true);
+  }
 });

@@ -191,7 +191,7 @@ import {
 import {
   shouldResumeAfterComfyReconnect,
   shouldRehelloAfterCommand,
-  planSoftReloadRecovery,
+  performSoftReloadRecovery,
   retryDuringReconnect,
   dedupeWorkflowTabRecords,
   resolveLoadGraphArgs,
@@ -16816,53 +16816,64 @@ function buildPanel() {
     setSoftReloadGuard();
     appendSystem("Soft-reloading the agent (new code, no ComfyUI restart)…");
     try {
-      client.stop(); // drop the bridge so the old orchestrator can release the port
-      // Bound the POST: a hung ComfyUI handler / stalled network would otherwise never
-      // settle, so the await never returns, `reloading` stays true, and client.start()
-      // below is never reached — a permanent wedge (codex). On timeout we reject into
-      // the catch, which clears the interlock and reconnects the dropped bridge.
-      const res = await Promise.race([
-        api.fetchApi("/comfyui_mcp_panel/reload", { method: "POST" }),
-        new Promise((_resolve, reject) =>
-          setTimeout(() => reject(new Error("reload request timed out")), RELOAD_POST_TIMEOUT_MS),
-        ),
-      ]);
-      const data = await res.json().catch(() => ({}));
-      const plan = planSoftReloadRecovery({ ok: data?.ok, reachable: true });
-      if (!plan.keepResumeInterlock) {
-        // Reload REFUSED. This pack's /reload route is a by-design 503: the
-        // orchestrator runs out-of-band and never stopped — only our bridge socket
-        // did (client.stop above). We do NOT own a respawn, so stand the interlock
-        // down and reconnect the dropped bridge (below) instead of leaving the
-        // panel wedged "connected chip / dead bridge" (#379). The old code told the
-        // user to restart a healthy orchestrator; surface that only as an OPTIONAL
-        // "load new code" hint, not a required recovery step.
-        ssSet(SOFT_RELOAD_KEY, null);
-        clearSoftReloadGuard();
-        const cmd = typeof data?.start_command === "string" ? data.start_command.trim() : "";
-        appendSystem(
-          "Reconnecting the panel bridge…" +
-            (cmd ? `\n(To load new orchestrator code, restart it manually: ${cmd})` : ""),
-        );
-      }
-    } catch (err) {
-      // Couldn't even reach the reload route. The orchestrator may still be alive,
-      // so stand the interlock down and reconnect the dropped bridge (below) rather
-      // than leaving it dead (#379).
-      ssSet(SOFT_RELOAD_KEY, null);
-      clearSoftReloadGuard();
-      appendSystem(
-        `Couldn't reach ComfyUI to reload the agent — reconnecting the bridge: ${coerceMessageText(err?.message ?? err)}`,
-      );
+      // Whole lifecycle (stop → bounded POST → decide interlock → ALWAYS start) lives
+      // in performSoftReloadRecovery so the "reload never leaves the bridge dead"
+      // guarantee is unit-tested at the stop/start level (#379/#419). It reconnects
+      // EITHER WAY (mirrors hardRestart): on an accepted reload the guard/
+      // SOFT_RELOAD_KEY stay set so the fresh orchestrator binds and onAck resumes;
+      // on a refused (by-design 503) or unreachable/timed-out reload the interlock is
+      // cleared and the dropped bridge is restored against the still-running
+      // orchestrator — the panel never wedges "connected chip / dead bridge".
+      await performSoftReloadRecovery({
+        client,
+        // Bound the POST: a hung ComfyUI handler / stalled network would otherwise
+        // never settle. On timeout we reject → treated as unreachable (clear interlock
+        // + reconnect). A real Response (incl. the by-design 503) is REACHABLE.
+        postReload: async () => {
+          const res = await Promise.race([
+            api.fetchApi("/comfyui_mcp_panel/reload", { method: "POST" }),
+            new Promise((_resolve, reject) =>
+              setTimeout(() => reject(new Error("reload request timed out")), RELOAD_POST_TIMEOUT_MS),
+            ),
+          ]);
+          const data = await res.json().catch(() => ({}));
+          return {
+            ok: Boolean(data?.ok),
+            reachable: true,
+            startCommand: typeof data?.start_command === "string" ? data.start_command.trim() : "",
+          };
+        },
+        // Accepted respawn we own — keep SOFT_RELOAD_KEY + guard (already armed above).
+        onKeepInterlock: () => {},
+        // Refused/unreachable — this pack's /reload is a by-design 503 (orchestrator
+        // out-of-band, never stopped); only our socket dropped. Stand the interlock
+        // down so the reconnect + hello.resume restores the session.
+        onClearInterlock: () => {
+          ssSet(SOFT_RELOAD_KEY, null);
+          clearSoftReloadGuard();
+        },
+        note: (outcome) => {
+          if (outcome?.error) {
+            appendSystem(
+              `Couldn't reach ComfyUI to reload the agent — reconnecting the bridge: ${coerceMessageText(outcome.error?.message ?? outcome.error)}`,
+            );
+          } else {
+            const cmd = outcome?.startCommand || "";
+            appendSystem(
+              "Reconnecting the panel bridge…" +
+                (cmd ? `\n(To load new orchestrator code, restart it manually: ${cmd})` : ""),
+            );
+          }
+        },
+        // Clear the re-entrancy flag right BEFORE the reconnect (pre-extraction
+        // ordering); the outer finally is a backstop in case the helper ever throws.
+        beforeStart: () => {
+          reloading = false;
+        },
+      });
     } finally {
       reloading = false;
     }
-    // Reconnect EITHER WAY (mirrors hardRestart, #379): on an accepted reload the
-    // guard/SOFT_RELOAD_KEY are still set so the fresh orchestrator binds and onAck
-    // resumes; on a refused/failed reload the interlock was cleared above and this
-    // restores the bridge we dropped against the still-running orchestrator — the
-    // panel never wedges "connected but dead".
-    client.start();
   }
 
   // Hard restart: recover a wedged/unresponsive agent. Unlike soft reload (which

@@ -110,6 +110,95 @@ export function planSoftReloadRecovery({ ok = false, reachable = true } = {}) {
   return { accepted, reconnect: true, keepResumeInterlock: accepted };
 }
 
+// #379 / #419 — the soft-reload LIFECYCLE, extracted from softReload() so the
+// "a reload never leaves a bridge dead" guarantee is unit-testable at the
+// stop→start level (the pure planSoftReloadRecovery decision alone can't lock it,
+// because reconnect is unconditional and not branched on). #419 reported a reload
+// leaving open sidebar tabs permanently disconnected; the guarantee that fixes it
+// is exactly this: EVERY tab that runs a reload drops its bridge and is ALWAYS
+// restored, whatever the POST outcome (accepted respawn we own, a by-design 503
+// refusal, an unreachable/timed-out POST, or a throw from the effect callbacks).
+//
+// Pure control-flow over injected effects (so a test drives it with spies, and so
+// each open tab runs the SAME sequence independently on its own bridge — there is
+// no shared state one tab could leave dead for the others):
+//   1. client.stop()      — drop the bridge so the old orchestrator frees the port
+//   2. postReload()       — the bounded reload POST → { ok, reachable } | throws
+//   3. planSoftReloadRecovery(outcome) — keep the resume interlock ONLY for an
+//      accepted respawn we own; otherwise clear it + surface a reconnect note
+//   4. client.start()     — ALWAYS, in a finally, even if a callback throws, so the
+//      bridge can never be stranded stopped (the #419 no-dead-bridge invariant)
+export async function performSoftReloadRecovery({
+  client,
+  postReload,
+  onKeepInterlock,
+  onClearInterlock,
+  note,
+  // Runs immediately BEFORE client.start(), inside the same finally — the caller
+  // uses it to clear its `reloading` re-entrancy flag right before the reconnect,
+  // preserving the pre-extraction ordering (flag cleared, THEN start). Best-effort:
+  // a throw here never blocks the start below.
+  beforeStart,
+  plan = planSoftReloadRecovery,
+} = {}) {
+  // Drop the bridge; a throw here must NOT skip the client.start() below.
+  try {
+    client.stop();
+  } catch {
+    /* stop is best-effort — start() still runs so the bridge is never stranded */
+  }
+  let outcome;
+  try {
+    const res = await postReload();
+    // A response (any HTTP status, incl. the by-design 503) means the route was
+    // REACHABLE; only a throw/timeout is unreachable.
+    outcome = {
+      ok: Boolean(res && res.ok),
+      reachable: !res || res.reachable !== false,
+      startCommand: (res && res.startCommand) || "",
+    };
+  } catch (error) {
+    outcome = { ok: false, reachable: false, startCommand: "", error };
+  }
+  let decision;
+  try {
+    // The recovery DECISION and its best-effort UI/state effects are all inside
+    // this try so that NOTHING between the stop above and the start below — not a
+    // throwing injected `plan`, not a throwing interlock/note callback — can strand
+    // the bridge or surface as a "reload failed". The finally guarantees reconnect.
+    decision = plan({ ok: outcome.ok, reachable: outcome.reachable });
+    if (decision.keepResumeInterlock) {
+      // Accepted respawn we own — keep SOFT_RELOAD_KEY + guard so the fresh
+      // orchestrator binds and onAck resumes; nothing else to do here.
+      onKeepInterlock?.(outcome);
+    } else {
+      // Refused/unreachable — stand the interlock down and reconnect the dropped
+      // bridge against the still-running orchestrator (no wedge).
+      onClearInterlock?.(outcome);
+      note?.(outcome);
+    }
+  } catch {
+    /* decision/effects are best-effort — never block the reconnect below */
+  } finally {
+    // The invariant: reconnect on EVERY path, even if the decision/effects threw.
+    // beforeStart runs first (the caller clears its `reloading` flag here, matching
+    // the pre-extraction "flag cleared THEN start" ordering); both are isolated so
+    // neither can strand the bridge.
+    try {
+      beforeStart?.();
+    } catch {
+      /* best-effort pre-start hook — never block the reconnect */
+    }
+    try {
+      client.start();
+    } catch {
+      /* start scheduling is best-effort; a throw here must not mask the outcome */
+    }
+  }
+  // reconnect is always true by contract; keep it present even if `plan` threw.
+  return { reconnect: true, ...(decision || {}), outcome };
+}
+
 // #207 / #334 — Stable identity for a workflow tab record. A load that replaces
 // the active canvas can flip the tab id (tmp: → wf:) or re-add the same file, so
 // dedupe on the rename-stable identity. Strip the tmp:/wf: scheme prefix so the
