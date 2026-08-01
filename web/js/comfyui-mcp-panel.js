@@ -6233,6 +6233,59 @@ const GRAPH_TOOL_EXECUTORS = {
     return result;
   },
 
+  // #488: set a node's LiteGraph PROPERTY (the right-click → Properties panel), the
+  // counterpart to graph_set_widget which only reaches `widgets`. Many custom nodes are
+  // configured entirely through node.properties — e.g. the rgthree Fast Groups Bypasser's
+  // matchTitle/matchColors/sort/toggleRestriction filters are properties, not widgets, and
+  // without matchTitle the node enumerates EVERY group in the workflow (a footgun). Unlike
+  // graph_set_widget, properties are a pure FRONTEND/LiteGraph concept (not backend
+  // /object_info), so there is no fail-closed-against-backend authorization here (#458) —
+  // but we still resolveNode() so a missing/unresolvable node id is REFUSED (throws) rather
+  // than fabricating success. When the node defines onPropertyChanged (rgthree and many
+  // LiteGraph nodes do) we invoke it so the change takes effect LIVE (rgthree re-filters
+  // its group list); mirroring LiteGraph's LGraphNode.setProperty, a callback that returns
+  // false reverts the write, so the reported `to` reflects reality.
+  graph_set_node_property({ node_id, name, value }) {
+    const { graph } = getGraphCtx();
+    const node = resolveNode(graph, node_id); // throws on an unresolvable id — no fabricated success
+    if (typeof name !== "string" || !name) throw new Error("name must be a non-empty property name");
+    // `__proto__` has a magic SETTER on a plain object: assigning to it mutates the bag's
+    // prototype instead of creating an own property, so the read-back below would MISREPORT
+    // the write (and could pollute the prototype). LiteGraph node properties never use this
+    // key — refuse it loudly rather than silently corrupt the object (codex P1).
+    if (name === "__proto__") throw new Error('property name "__proto__" is not allowed');
+    let from;
+    let liveEffectError = null;
+    graph.beforeChange();
+    try {
+      // Create the properties bag INSIDE the undo envelope so a Ctrl+Z restores the node's
+      // prior "no properties bag" state, not an already-created empty one (codex P1).
+      if (!node.properties || typeof node.properties !== "object") node.properties = {};
+      from = node.properties[name];
+      node.properties[name] = value;
+      if (typeof node.onPropertyChanged === "function") {
+        try {
+          // LiteGraph convention: onPropertyChanged(name, value, prevValue); a strict
+          // `false` return means "rejected" — honor it by reverting, exactly like
+          // LGraphNode.setProperty, so we never report a value the node refused.
+          if (node.onPropertyChanged(name, value, from) === false) {
+            node.properties[name] = from;
+          }
+        } catch (err) {
+          // The node's OWN reactive callback threw. The raw property IS written, but the
+          // LIVE effect (e.g. rgthree re-filtering its group list) may not have applied —
+          // so keep the write yet SURFACE the failure rather than fabricate clean success.
+          liveEffectError = err instanceof Error ? err.message : String(err);
+        }
+      }
+    } finally {
+      graph.afterChange();
+    }
+    graph.setDirtyCanvas(true, true);
+    const set = { node_id: node.id, name, from, to: node.properties[name] };
+    return liveEffectError ? { set, live_effect_error: liveEffectError } : { set };
+  },
+
   graph_move_node({ node_id, pos }) {
     const { graph, rootGraph } = getGraphCtx();
     if (!Array.isArray(pos) || pos.length !== 2) throw new Error("pos must be [x, y]");
@@ -10875,6 +10928,18 @@ function describeCommand(cmd, msg, reply) {
         : { icon: "pi-arrow-up", text: `Promoted “${r.promoted}” to the subgraph node` };
     case "graph_move_node":
       return { icon: "pi-arrows-alt", text: `Moved node ${r.moved?.node_id} to [${r.moved?.to?.map(Math.round)}]` };
+    case "graph_set_node_property":
+      return r.live_effect_error
+        ? {
+            icon: "pi-exclamation-triangle",
+            text: `Set property ${r.set?.name} = ${JSON.stringify(r.set?.to)} on node ${r.set?.node_id} — WARNING: the node's onPropertyChanged callback failed, so the live effect may not have applied`,
+            detail: `was ${JSON.stringify(r.set?.from)} — ${r.live_effect_error}`,
+          }
+        : {
+            icon: "pi-sliders-h",
+            text: `Set property ${r.set?.name} = ${JSON.stringify(r.set?.to)} on node ${r.set?.node_id}`,
+            detail: `was ${JSON.stringify(r.set?.from)}`,
+          };
     case "graph_resize_node":
       return {
         icon: "pi-arrows-alt",
