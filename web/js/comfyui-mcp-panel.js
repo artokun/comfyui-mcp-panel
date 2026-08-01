@@ -128,6 +128,15 @@ import {
   unsafeBypassMappings,
 } from "./lib/subgraph-scope.js";
 import { runSetWidget } from "./lib/set-widget.js";
+import {
+  drivenWidgetsFor,
+  drivenTag,
+  capSummaryWidgets,
+  clipLine,
+  fitDetailLine,
+  isLineProtected,
+  truncationTail,
+} from "./lib/graph-read.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
 import { safeRemoveNode } from "./lib/safe-remove-node.js";
 import {
@@ -4235,6 +4244,11 @@ function summarizeNode(node) {
   // EXPLICIT, seed-associated map (governed-widget → mode) so the mode is visible and
   // an agent can verify a "fixed" seed actually holds.
   const controlAfterGenerate = controlAfterGenerateModes(node);
+  // #607: a widget whose SAME-NAMED input is link-connected is DRIVEN BY THE LINK at
+  // execution — the stored `w.value` is stale (e.g. a KSampler steps/cfg fed from a
+  // Primitive/switch rail). Surface which widgets are overridden and by whom so the
+  // read flags the stale value rather than reporting it as if it were effective.
+  const drivenByLink = drivenWidgetsFor(node, Object.keys(widgets));
   const summary = {
     id: node.id,
     type: node.type,
@@ -4255,6 +4269,9 @@ function summarizeNode(node) {
       ? { control_after_generate: controlAfterGenerate }
       : {}),
     widgets,
+    // #607: names here are OVERRIDDEN by a link at run time — the value in `widgets`
+    // is the stale stored value, NOT what executes. Each entry names the source.
+    ...(Object.keys(drivenByLink).length ? { driven_by_link: drivenByLink } : {}),
     inputs,
     outputs,
   };
@@ -4807,12 +4824,15 @@ const GRAPH_TOOL_EXECUTORS = {
           .filter((e) => e.widget !== e.control)
           .map((e) => [e.widget, e.mode]),
       );
+      // #607: flag widgets overridden by a link so the stored value isn't read as effective.
+      const driven = drivenWidgetsFor(n, (n.widgets ?? []).map((w) => w?.name).filter(Boolean));
       const widgets = (n.widgets ?? [])
         .filter((w) => w && typeof w.name === "string")
         .map((w) => {
           const base = `${w.name}=${fmtVal(w.value)}`;
           const mode = cagMode.get(w.name);
-          return mode ? `${base} [after_gen=${mode}]` : base;
+          const withMode = mode ? `${base} [after_gen=${mode}]` : base;
+          return driven[w.name] ? `${withMode}${drivenTag(driven[w.name])}` : withMode;
         })
         .join(" ");
       lines.push(
@@ -4928,14 +4948,17 @@ const GRAPH_TOOL_EXECUTORS = {
     // 1) Traversal scope.
     let scope = null;
     const maxDepth = depth != null && depth >= 0 ? Number(depth) : Infinity;
+    // #609: clip caller-supplied values echoed in diagnostics so an oversized seed /
+    // predicate can't flood the read.
+    const clipDiag = (s) => { const x = String(s); return x.length > 120 ? x.slice(0, 120) + "…" : x; };
     if (upstream_of != null) {
       const seed = String(upstream_of);
-      if (!byId.has(seed)) return { total, candidates: 0, matched: 0, shown: 0, truncated: false, text: `upstream_of node ${seed} not found (${total} nodes in view).` };
+      if (!byId.has(seed)) return { total, candidates: 0, matched: 0, shown: 0, truncated: false, text: `upstream_of node ${clipDiag(seed)} not found (${total} nodes in view).` };
       scope = closure(up, seed, maxDepth);
     }
     if (downstream_of != null) {
       const seed = String(downstream_of);
-      if (!byId.has(seed)) return { total, candidates: 0, matched: 0, shown: 0, truncated: false, text: `downstream_of node ${seed} not found (${total} nodes in view).` };
+      if (!byId.has(seed)) return { total, candidates: 0, matched: 0, shown: 0, truncated: false, text: `downstream_of node ${clipDiag(seed)} not found (${total} nodes in view).` };
       const d = closure(down, seed, maxDepth);
       scope = scope ? new Set([...scope].filter((x) => d.has(x))) : d;
     }
@@ -4948,7 +4971,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const preds = (Array.isArray(where) ? where : []).map((w) => {
       const m = /^\s*([A-Za-z0-9_.]+)\s*(>=|<=|!=|=|>|<|~)\s*(.*?)\s*$/.exec(String(w));
       // A value starting with an operator char means a mistyped op ("cfg >> 7").
-      if (!m || /^[=<>~]/.test(m[3])) throw new Error(`Bad predicate "${w}" — expected "name op value" with op one of = != >= <= > < ~`);
+      if (!m || /^[=<>~]/.test(m[3])) throw new Error(`Bad predicate "${clipDiag(w)}" — expected "name op value" with op one of = != >= <= > < ~`);
       return { name: m[1], op: m[2], rhs: m[3] };
     });
     const matchPred = (value, op, rhs) => {
@@ -5007,11 +5030,24 @@ const GRAPH_TOOL_EXECUTORS = {
     if (group_by === "type") {
       const hist = new Map();
       for (const n of matched) hist.set(n.type ?? "?", (hist.get(n.type ?? "?") ?? 0) + 1);
-      const lines = [...hist.entries()].sort((a, b) => b[1] - a[1]).map(([t, c]) => `${c}× ${t}`);
+      // #609: bound the aggregate too — clip each type and char-bound the list so a graph
+      // with thousands of distinct/long node types can't flood the read.
+      const clipType = (t) => { const s = String(t); return s.length > 200 ? s.slice(0, 200) + "…" : s; };
+      const allLines = [...hist.entries()].sort((a, b) => b[1] - a[1]).map(([t, c]) => `${c}× ${clipType(t)}`);
+      const head = `${matched.length} node(s) across ${hist.size} type(s):`;
+      const kept = [];
+      let used = head.length;
+      let aggTruncated = false;
+      for (const l of allLines) {
+        if (used + l.length + 1 > maxChars) { aggTruncated = true; break; }
+        kept.push(l);
+        used += l.length + 1;
+      }
+      const aggTail = aggTruncated ? `\n…(${allLines.length - kept.length} more type(s) omitted; raise max_chars)` : "";
       return {
         ...meta, total, candidates: candidates.length, matched: matched.length,
-        shown: matched.length, truncated: false,
-        text: `${matched.length} node(s) across ${hist.size} type(s):\n${lines.join("\n")}`,
+        shown: matched.length, truncated: aggTruncated,
+        text: `${head}\n${kept.join("\n")}${aggTail}`,
       };
     }
 
@@ -5034,24 +5070,41 @@ const GRAPH_TOOL_EXECUTORS = {
       if (shown >= lim) { truncated = true; break; }
       let line;
       if (proj === "ids") {
-        line = String(n.id);
+        line = clipLine(String(n.id), maxChars); // #609: bound even a pathological long id
       } else if (proj === "detail") {
-        line = JSON.stringify(summarizeNode(n));
+        // #609: bound each widget value AND the total widgets size so a
+        // ResolutionMaster/LTXDirector/VHS blob (or a many-widget node) can't consume
+        // the entire budget in one node's detail — even the protected first line.
+        const summary = capSummaryWidgets(summarizeNode(n), undefined, maxChars);
+        line = JSON.stringify(summary);
+        // Final guard: if the fully-capped detail STILL exceeds max_chars (a node with
+        // very many/large slots, which capSummaryWidgets doesn't touch), degrade the
+        // protected line to a bounded valid-JSON stub so it's never dropped yet can't
+        // flood — every rendered detail line ends up ≤ max_chars.
+        line = fitDetailLine(line, { id: summary.id, type: summary.type, title: summary.title }, maxChars);
       } else {
-        const w = Object.entries(widgetsOf(n)).map(([k, v]) => `${k}=${clip(v)}`).join(" ");
+        // #607: flag link-driven widgets in the compact line too.
+        const driven = drivenWidgetsFor(n, (n.widgets ?? []).map((w) => w?.name).filter(Boolean));
+        const w = Object.entries(widgetsOf(n))
+          .map(([k, v]) => `${k}=${clip(v)}${driven[k] ? drivenTag(driven[k]) : ""}`)
+          .join(" ");
         const ins = [...(up.get(String(n.id)) ?? [])].join(",");
         const outs = [...(down.get(String(n.id)) ?? [])].join(",");
         const t = n.title && n.title !== n.type ? ` "${clip(n.title, 40)}"` : "";
         line = `#${n.id} ${n.type ?? "?"}${t}${modeTag(n)}${outTag(n)}` + (w ? ` · ${w}` : "") + (ins ? `  ← ${ins}` : "") + (outs ? `  → ${outs}` : "");
+        // #609: bound the compact line by widget COUNT too (the protected first line
+        // bypasses the running budget, so a thousands-of-widgets node would else be
+        // unbounded). Plain string ⇒ a tail ellipsis is safe.
+        line = clipLine(line, maxChars);
       }
-      if (chars + line.length + 1 > maxChars) { truncated = true; break; }
+      // #609: protect ONLY the first match from the char budget so a single-id query
+      // never returns shown:0. Later lines stay budget-governed (output stays bounded).
+      if (!isLineProtected(shown) && chars + line.length + 1 > maxChars) { truncated = true; break; }
       chars += line.length + 1;
       lines.push(line);
       shown++;
     }
-    const tail = truncated
-      ? `\n… truncated at ${shown} of ${matched.length} — narrow with types/where/ids/depth, use group_by:"type", or raise limit/max_chars.`
-      : "";
+    const tail = truncated ? truncationTail(shown, matched.length, !!(wantIds && wantIds.length)) : "";
     const body = proj === "ids" ? lines.join(",") : lines.join("\n");
     return {
       ...meta, total, candidates: candidates.length, matched: matched.length, shown, truncated,
