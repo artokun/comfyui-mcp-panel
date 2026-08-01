@@ -19,6 +19,8 @@
 // Pod control inspired by gpu-cli.sh (https://gpu-cli.sh) — a cloud-GPU CLI
 // worth checking out; this backend is our own (runs the user's real canvas).
 
+import { isImeComposing } from "./lib/ime.js";
+
 const GPU_CLI_URL = "https://gpu-cli.sh";
 
 let styleInjected = false;
@@ -143,6 +145,7 @@ export function createLocalContent(ctx, shell, opts = {}) {
   manualRow.append(podInput);
   // Enter in the manual-ID field connects, matching the primary button.
   podInput.addEventListener("keydown", (e) => {
+    if (isImeComposing(e)) return; // don't connect on a CJK IME commit Enter (#385)
     if (e.key === "Enter") {
       e.preventDefault();
       connectBtn.click();
