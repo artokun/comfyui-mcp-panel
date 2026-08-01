@@ -22,6 +22,7 @@ import {
   reapplyDefsToLiveNodes,
   collectMissingNodeTypeReasons,
   graphErrorsResultIsClean,
+  nodeRedFlagIsStale,
 } from "../../web/js/lib/asset-staleness.js";
 
 /** The REAL LTXICLoRALoaderModelOnly schema: a `model` CONNECTION input plus two
@@ -529,4 +530,96 @@ test("graphErrorsResultIsClean: FALSE for raw validation / execution errors", ()
   assert.equal(graphErrorsResultIsClean({ node_errors: { 3: { errors: [] } } }), false);
   assert.equal(graphErrorsResultIsClean({ last_execution_error: { node_id: 5 } }), false);
   assert.equal(graphErrorsResultIsClean({ errored_count: 2 }), false);
+});
+
+// ---- #407: a subfolder-registered model resolves against the live combo -----
+// A custom-model root registered under a SUBFOLDER (Impact Subpack's
+// `segm/yolov8m-seg.pt`) is a valid /object_info combo value; once the combo is
+// trusted it must NOT be flagged missing. Match is EXACT (no separator munging —
+// see the helper's comment on the POSIX literal-backslash hazard).
+test("assetCandidateResolvesLive: resolves a subfolder model listed in the live combo (#407)", () => {
+  const node = {
+    id: 9,
+    widgets: [
+      { name: "model_name", options: { values: ["bbox/face.pt", "segm/yolov8m-seg.pt"] } },
+    ],
+  };
+  const g = graphOf([node]);
+  assert.equal(assetCandidateResolvesLive(g, 9, "segm/yolov8m-seg.pt", "model_name"), true);
+  // a genuinely-absent nested model still fails CLOSED (kept as missing)
+  assert.equal(assetCandidateResolvesLive(g, 9, "segm/not-here.pt", "model_name"), false);
+  // a literal backslash filename is NOT equated with the forward-slash one (POSIX safety)
+  const bs = String.fromCharCode(92);
+  assert.equal(assetCandidateResolvesLive(g, 9, `segm${bs}yolov8m-seg.pt`, "model_name"), false);
+});
+
+// ---- #418: stale red-flag clearing after a set_widget fix ------------------
+test("nodeRedFlagIsStale: TRUE when no missing asset and no validation error remain (#418)", () => {
+  assert.equal(nodeRedFlagIsStale(5, { missingItems: [], nodeErrorsMap: null }), true);
+  assert.equal(
+    nodeRedFlagIsStale(5, { missingItems: [{ node_id: 7 }], nodeErrorsMap: { 9: { errors: [{}] } } }),
+    true,
+  );
+});
+
+test("nodeRedFlagIsStale: FALSE while the node is still a missing-asset target (#418)", () => {
+  assert.equal(
+    nodeRedFlagIsStale(5, { missingItems: [{ node_id: 5, file: "x.safetensors" }] }),
+    false,
+  );
+  // id compared as a STRING so numeric/string node ids both match
+  assert.equal(nodeRedFlagIsStale("5", { missingItems: [{ node_id: 5 }] }), false);
+});
+
+test("nodeRedFlagIsStale: FALSE while the node still has a live validation error (#418)", () => {
+  assert.equal(
+    nodeRedFlagIsStale(5, { nodeErrorsMap: { 5: { errors: [{ message: "bad" }] } } }),
+    false,
+  );
+  // an EMPTY errors array is not a live error → stale (clearable)
+  assert.equal(nodeRedFlagIsStale(5, { nodeErrorsMap: { 5: { errors: [] } } }), true);
+});
+
+test("nodeRedFlagIsStale: fails toward KEEPING the flag on a null/absent node id", () => {
+  assert.equal(nodeRedFlagIsStale(null, {}), false);
+  assert.equal(nodeRedFlagIsStale(undefined, {}), false);
+});
+
+test("nodeRedFlagIsStale: a NESTED still-missing asset (scoped locator) keeps the flag via resolvesToNode (#418 codex round-3 P0)", () => {
+  const inner = { id: 6077, widgets: [{ name: "image", value: "gone.png" }] };
+  // Candidate is keyed by a scoped locator "6105:6077" — does NOT string-equal 6077.
+  const missingItems = [{ node_id: "6105:6077", file: "gone.png" }];
+  // Without a resolver, the scoped id can't be matched → would wrongly read as stale.
+  assert.equal(nodeRedFlagIsStale(6077, { missingItems }), true);
+  // With a resolver that maps the scoped locator to THIS inner node, the still-missing
+  // asset is recognized → flag KEPT (not stale).
+  assert.equal(
+    nodeRedFlagIsStale(6077, {
+      missingItems,
+      resolvesToNode: (scopedId) => (scopedId === "6105:6077" ? inner : null) === inner,
+    }),
+    false,
+  );
+  // A resolver that maps to a DIFFERENT node does not keep this node's flag.
+  assert.equal(
+    nodeRedFlagIsStale(6077, {
+      missingItems,
+      resolvesToNode: () => false,
+    }),
+    true,
+  );
+});
+
+test("nodeRedFlagIsStale: OR across multiple maps — an EMPTY entry in one must not shadow a live error in another (#418 codex round-2 P0)", () => {
+  const appMap = { 5: { errors: [] } }; // app reset to empty for node 5
+  const storeMap = { 5: { errors: [{ message: "still bad" }] } }; // store still blames it
+  // A shallow merge {...store, ...app} would drop the live store error → wrong clear.
+  assert.equal(nodeRedFlagIsStale(5, { nodeErrorsMaps: [appMap, storeMap] }), false);
+  // Order-independent — the live map second is also honored.
+  assert.equal(nodeRedFlagIsStale(5, { nodeErrorsMaps: [storeMap, appMap] }), false);
+  // Both empty → stale (clearable).
+  assert.equal(
+    nodeRedFlagIsStale(5, { nodeErrorsMaps: [{ 5: { errors: [] } }, null] }),
+    true,
+  );
 });
