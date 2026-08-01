@@ -81,24 +81,156 @@ export function resolveRailNode(graph, ref) {
 }
 
 /** Walk the root graph (through nested subgraphs) to find the SubgraphNode that
- *  owns `subgraph`. Returns { id, node, title } or null when unreachable — the
- *  signal that a canvas graph reference is STALE (its owner was replaced when the
- *  root graph was rebuilt on reconnect). */
+ *  owns `subgraph`. Returns { id, node, title, parentGraph } or null when
+ *  unreachable — the signal that a canvas graph reference is STALE (its owner was
+ *  replaced when the root graph was rebuilt on reconnect).
+ *
+ *  `parentGraph` is the graph that DIRECTLY contains the owner node (the IMMEDIATE
+ *  parent of `subgraph`, which is the root graph for a first-level subgraph and an
+ *  intermediate subgraph for a nested one). graph_exit_subgraph uses it to pop to
+ *  the immediate parent instead of jumping straight to the root (#412). We traverse
+ *  by GRAPH (not a flat node stack) so each owner node is paired with its container
+ *  graph; `seen` guards against a subgraph reachable by more than one path. */
 export function findSubgraphOwner(rootGraph, subgraph) {
   if (!rootGraph || !subgraph) return null;
-  const stack = [...(rootGraph._nodes ?? [])];
+  const stack = [rootGraph];
   const seen = new Set();
   while (stack.length) {
-    const node = stack.pop();
-    if (!node || seen.has(node)) continue;
-    seen.add(node);
-    if (node.subgraph === subgraph) {
-      return { id: node.id ?? null, node, title: node.title ?? subgraph?.name ?? "subgraph" };
+    const graph = stack.pop();
+    if (!graph || seen.has(graph)) continue;
+    seen.add(graph);
+    for (const node of graph._nodes ?? []) {
+      if (!node) continue;
+      if (node.subgraph === subgraph) {
+        return {
+          id: node.id ?? null,
+          node,
+          title: node.title ?? subgraph?.name ?? "subgraph",
+          parentGraph: graph,
+        };
+      }
+      if (node.subgraph) stack.push(node.subgraph);
     }
-    const inner = node.subgraph?._nodes;
-    if (inner?.length) stack.push(...inner);
   }
   return null;
+}
+
+/** Ordered list of subgraph INSTANCE node ids from the root graph down to (but not
+ *  including) `graph` — OUTERMOST first. [] when `graph` IS the root. null when
+ *  `graph` is unreachable from root (a stale/ghost subgraph). This is exactly the
+ *  prefix ComfyUI joins with a leaf node id to form a NodeExecutionId
+ *  (ExecutableNodeDTO: `[...subgraphNodePath, node.id].join(':')`) — e.g. path
+ *  [10,15] + leaf 359 → "10:15:359" (node 359 in subgraph-instance 15 in
+ *  subgraph-instance 10). Used to target run-to-node at an output nested in a
+ *  subgraph (#411). */
+export function subgraphInstancePath(rootGraph, graph) {
+  if (!rootGraph || !graph) return null;
+  if (graph === rootGraph) return [];
+  const path = [];
+  const seen = new Set();
+  let g = graph;
+  while (g && g !== rootGraph) {
+    if (seen.has(g)) return null;
+    seen.add(g);
+    const owner = findSubgraphOwner(rootGraph, g);
+    if (!owner) return null; // unreachable → stale/ghost view
+    path.unshift(owner.id);
+    g = owner.parentGraph;
+  }
+  return path;
+}
+
+/** Build the ComfyUI NodeExecutionId (colon path, outermost-first) for a leaf node
+ *  living in `ownerGraph`. Returns String(leafId) for a root node, "a:b:leafId" for
+ *  a nested one, or null when ownerGraph is unreachable from root (#411). */
+export function buildNodeExecutionId(rootGraph, ownerGraph, leafId) {
+  const path = subgraphInstancePath(rootGraph, ownerGraph);
+  if (path == null) return null;
+  return [...path, leafId].join(":");
+}
+
+/** Deep-search the root graph and every nested subgraph for the node whose id is
+ *  `id`, returning { node, ownerGraph } or null. `preferGraph` (the graph currently
+ *  being VIEWED) is searched FIRST so an id present in more than one scope resolves
+ *  to what the user is looking at (the reporter added the output node INSIDE the
+ *  subgraph they were viewing, #411). */
+export function findNodeInScopes(rootGraph, id, preferGraph = null) {
+  const num = Number(id);
+  const tryGraph = (g) => {
+    if (!g) return null;
+    const n =
+      (typeof g.getNodeById === "function" ? g.getNodeById(num) : null) ??
+      (g._nodes ?? []).find((x) => Number(x?.id) === num) ??
+      null;
+    return n ? { node: n, ownerGraph: g } : null;
+  };
+  if (preferGraph) {
+    const hit = tryGraph(preferGraph);
+    if (hit) return hit;
+  }
+  const stack = [rootGraph];
+  const seen = new Set();
+  while (stack.length) {
+    const g = stack.pop();
+    if (!g || seen.has(g)) continue;
+    seen.add(g);
+    const hit = tryGraph(g);
+    if (hit) return hit;
+    for (const node of g._nodes ?? []) if (node?.subgraph) stack.push(node.subgraph);
+  }
+  return null;
+}
+
+/** Types are compatible for a BYPASS forward when equal (case-insensitive) or either
+ *  side is a wildcard ('*' or ''). */
+function bypassTypeCompatible(a, b) {
+  const na = String(a ?? "").trim();
+  const nb = String(b ?? "").trim();
+  if (na === "" || nb === "" || na === "*" || nb === "*") return true;
+  return na.toUpperCase() === nb.toUpperCase();
+}
+
+/** ComfyUI forwards a BYPASSED node's output slot i from the INPUT at the SAME index
+ *  i (ExecutableNodeDTO._getBypassSlotIndex short-circuits to positional for a
+ *  wildcard downstream type). For a subgraph whose boundary inputs are ordered
+ *  differently from its outputs, that silently forwards a WRONG-TYPE input through an
+ *  output (#409: inputs [BBOX_DETECTOR, IMAGE, MASK] with a single IMAGE output
+ *  forwarded the BBOX_DETECTOR at input 0 through the IMAGE output, so the next node
+ *  received a detector where it expected an image). Returns the CONNECTED outputs
+ *  whose positional source input is missing or type-incompatible — the unsafe
+ *  forwards a bypass would make. `inputs`/`outputs` are the node's boundary slots as
+ *  [{ name, type, connected }]; only outputs that actually feed a downstream node can
+ *  mis-wire, so unconnected outputs are ignored. */
+export function unsafeBypassMappings({ inputs = [], outputs = [] } = {}) {
+  const out = [];
+  outputs.forEach((o, i) => {
+    if (!o?.connected) return;
+    const inp = inputs[i];
+    if (!inp) {
+      out.push({
+        output_index: i,
+        output_name: o?.name ?? i,
+        output_type: o?.type ?? null,
+        input_index: i,
+        input_name: null,
+        input_type: null,
+        reason: "no boundary input at the same index to forward through this output",
+      });
+      return;
+    }
+    if (!bypassTypeCompatible(inp.type, o.type)) {
+      out.push({
+        output_index: i,
+        output_name: o?.name ?? i,
+        output_type: o?.type ?? null,
+        input_index: i,
+        input_name: inp?.name ?? i,
+        input_type: inp?.type ?? null,
+        reason: "positional bypass would forward a different-type input through this output",
+      });
+    }
+  });
+  return out;
 }
 
 /** Whether `subgraph` is authoritatively part of `rootGraph` via the root's

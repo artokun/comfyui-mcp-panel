@@ -29,6 +29,10 @@ import {
   resolveScope,
   describeScope,
   computeOrphanedBoundaries,
+  subgraphInstancePath,
+  buildNodeExecutionId,
+  findNodeInScopes,
+  unsafeBypassMappings,
 } from "../../web/js/lib/subgraph-scope.js";
 
 // ---- Fixtures --------------------------------------------------------------
@@ -202,6 +206,101 @@ test("#234 e2e: removing the interior owner prunes the orphaned `text` slot off 
   assert.deepEqual(sub.inputs.map((s) => s.name), ["seed"]);
 });
 
+// ---- #411: run-to-node targeting an output nested in a subgraph ------------
+
+test("#411 subgraphInstancePath: outermost-first instance-id path, [] at root, null when unreachable", () => {
+  const deep = makeSubgraph({ name: "inner" });
+  const midSub = makeSubgraph({ name: "mid", nodes: [{ id: 15, subgraph: deep }] });
+  const root = { _nodes: [{ id: 10, subgraph: midSub }] };
+  assert.deepEqual(subgraphInstancePath(root, root), [], "root graph → empty path");
+  assert.deepEqual(subgraphInstancePath(root, midSub), [10], "first-level → [outerInstanceId]");
+  assert.deepEqual(subgraphInstancePath(root, deep), [10, 15], "nested → outermost-first chain");
+  // A subgraph the root can't reach (stale) → null.
+  assert.equal(subgraphInstancePath(root, makeSubgraph({ name: "ghost" })), null);
+});
+
+test("#411 buildNodeExecutionId: colon path outermost→leaf; String(id) at root; null when stale", () => {
+  const deep = makeSubgraph({ name: "inner", nodes: [{ id: 359 }] });
+  const midSub = makeSubgraph({ name: "mid", nodes: [{ id: 15, subgraph: deep }] });
+  const root = { _nodes: [{ id: 10, subgraph: midSub }, { id: 7 }] };
+  assert.equal(buildNodeExecutionId(root, deep, 359), "10:15:359", "nested leaf → full colon path");
+  assert.equal(buildNodeExecutionId(root, root, 7), "7", "root leaf → plain id (no regression)");
+  assert.equal(buildNodeExecutionId(root, makeSubgraph({ name: "ghost" }), 1), null);
+});
+
+test("#411 findNodeInScopes: resolves the VIEWING scope first, then root, then nested", () => {
+  const target = { id: 359, type: "ShowText|pysssss" };
+  const deep = makeSubgraph({ name: "inner", nodes: [target] });
+  const midSub = makeSubgraph({ name: "mid", nodes: [{ id: 15, subgraph: deep }] });
+  const root = { _nodes: [{ id: 10, subgraph: midSub }, { id: 359, type: "RootNote" }] };
+  // Same id 359 exists at root AND in the deep subgraph — viewing the deep subgraph
+  // must resolve to the INNER node (what the user is looking at), not the root one.
+  const hit = findNodeInScopes(root, 359, deep);
+  assert.equal(hit.node, target);
+  assert.equal(hit.ownerGraph, deep);
+  // Without a preferred scope, the root node wins (searched before descending).
+  assert.equal(findNodeInScopes(root, 359).ownerGraph, root);
+  // A truly nested-only id resolves via the deep walk even from root.
+  const deepOnly = { id: 900 };
+  deep._nodes.push(deepOnly);
+  const hit2 = findNodeInScopes(root, 900);
+  assert.equal(hit2.node, deepOnly);
+  assert.equal(hit2.ownerGraph, deep);
+  // Unknown id → null.
+  assert.equal(findNodeInScopes(root, 12345), null);
+});
+
+test("#411 e2e: viewing a nested subgraph, an inner output node yields its full colon path", () => {
+  const out = { id: 359, type: "ShowText|pysssss" };
+  const deep = makeSubgraph({ name: "inner", nodes: [out] });
+  const midSub = makeSubgraph({ name: "mid", nodes: [{ id: 15, subgraph: deep }] });
+  const root = { _nodes: [{ id: 10, subgraph: midSub }] };
+  const hit = findNodeInScopes(root, 359, deep);
+  assert.equal(buildNodeExecutionId(root, hit.ownerGraph, hit.node.id), "10:15:359");
+});
+
+// ---- #409: reject unsafe bypass on a multi-input subgraph ------------------
+
+test("#409 unsafeBypassMappings: reorder that forwards a wrong-type input is flagged", () => {
+  // The reported shape: inputs [BBOX_DETECTOR, IMAGE, MASK], one IMAGE output. Bypass
+  // forwards output[0] from input[0] (BBOX_DETECTOR) — a type mismatch.
+  const inputs = [{ name: "bbox_detector", type: "BBOX_DETECTOR" }, { name: "image", type: "IMAGE" }, { name: "mask", type: "MASK" }];
+  const outputs = [{ name: "image", type: "IMAGE", connected: true }];
+  const bad = unsafeBypassMappings({ inputs, outputs });
+  assert.equal(bad.length, 1);
+  assert.equal(bad[0].output_type, "IMAGE");
+  assert.equal(bad[0].input_type, "BBOX_DETECTOR");
+});
+
+test("#409 unsafeBypassMappings: aligned same-type positional mapping is SAFE", () => {
+  // input[0]=IMAGE lines up with output[0]=IMAGE → no mismatch.
+  const inputs = [{ name: "image", type: "IMAGE" }, { name: "mask", type: "MASK" }];
+  const outputs = [{ name: "image", type: "IMAGE", connected: true }];
+  assert.deepEqual(unsafeBypassMappings({ inputs, outputs }), []);
+});
+
+test("#409 unsafeBypassMappings: an UNCONNECTED output can't mis-wire (ignored)", () => {
+  const inputs = [{ name: "bbox_detector", type: "BBOX_DETECTOR" }];
+  const outputs = [{ name: "image", type: "IMAGE", connected: false }];
+  assert.deepEqual(unsafeBypassMappings({ inputs, outputs }), []);
+});
+
+test("#409 unsafeBypassMappings: wildcard (*/'') passes; missing positional input flagged", () => {
+  // Wildcard output type is compatible with anything.
+  assert.deepEqual(
+    unsafeBypassMappings({ inputs: [{ type: "BBOX_DETECTOR" }], outputs: [{ type: "*", connected: true }] }),
+    [],
+  );
+  // Two connected outputs but only one input → the 2nd output has no positional source.
+  const bad = unsafeBypassMappings({
+    inputs: [{ name: "image", type: "IMAGE" }],
+    outputs: [{ name: "image", type: "IMAGE", connected: true }, { name: "extra", type: "MASK", connected: true }],
+  });
+  assert.equal(bad.length, 1);
+  assert.equal(bad[0].output_index, 1);
+  assert.equal(bad[0].input_name, null);
+});
+
 // ---- #220 / #308: ONE authoritative scope for reads AND writes -------------
 
 test("findSubgraphOwner: locates the owning SubgraphNode (incl. nested)", () => {
@@ -214,6 +313,29 @@ test("findSubgraphOwner: locates the owning SubgraphNode (incl. nested)", () => 
   assert.equal(owner.id, 9);
   // An unrelated graph has no owner.
   assert.equal(findSubgraphOwner(root, makeSubgraph({ name: "orphan" })), null);
+});
+
+// #412: exit_subgraph must pop to the IMMEDIATE parent graph, not the root. The
+// owner walk now reports the parent graph that DIRECTLY contains the owner node.
+test("#412 findSubgraphOwner: parentGraph is the IMMEDIATE parent (root for L1, the mid subgraph for L2)", () => {
+  const deep = makeSubgraph({ name: "inner" });
+  const midSub = makeSubgraph({ name: "mid", nodes: [{ id: 9, subgraph: deep }] });
+  const midOwner = { id: 5, subgraph: midSub };
+  const root = { _nodes: [{ id: 1 }, midOwner] };
+
+  // A first-level subgraph's parent IS the root graph.
+  const l1 = findSubgraphOwner(root, midSub);
+  assert.ok(l1);
+  assert.equal(l1.id, 5);
+  assert.equal(l1.parentGraph, root, "first-level parent is the root graph");
+
+  // The nested subgraph's parent is the MID subgraph — NOT the root (the #412 bug
+  // set the canvas to the root instead of this parent).
+  const l2 = findSubgraphOwner(root, deep);
+  assert.ok(l2);
+  assert.equal(l2.id, 9);
+  assert.equal(l2.parentGraph, midSub, "nested parent is the enclosing subgraph, not root");
+  assert.notEqual(l2.parentGraph, root, "exit must NOT jump straight to root (#412)");
 });
 
 test("resolveScope: valid open subgraph ⇒ scope 'subgraph', not stale", () => {
