@@ -12,17 +12,16 @@
 // out-of-band writes evade it entirely). Comparing the on-disk bytes to the bytes the
 // tab loaded (its baseline) is authoritative and immune to both.
 
-/** Normalize a serialized-workflow string for comparison: trim, and (when it parses)
- *  round-trip through JSON so a pure reformat (e.g. a Python rewrite with indentation)
- *  isn't reported as a content change. Falls back to the trimmed raw text when the
- *  content isn't valid JSON. */
-function normalizeWorkflowContent(text) {
-  const s = String(text).trim();
-  try {
-    return JSON.stringify(JSON.parse(s));
-  } catch {
-    return s;
-  }
+/** EXACT text equality of two serialized-workflow strings — the shared content-equality
+ *  primitive for both the open-side staleness check and the save-side in-place-overwrite
+ *  gate (#442). Deliberately NOT a JSON round-trip: `JSON.parse`→`JSON.stringify` collapses
+ *  distinct valid JSON values (e.g. large integer seeds beyond 2^53 round to the same
+ *  IEEE-754 double), which would let a genuinely-changed file compare EQUAL and either be
+ *  reported fresh or authorize a destructive overwrite (codex P0). Byte-exact comparison
+ *  errs only in the SAFE direction: a formatting-only difference is treated as "changed"
+ *  (an over-cautious stale flag / a refused in-place save — never data loss). */
+export function workflowContentEqual(a, b) {
+  return typeof a === "string" && typeof b === "string" && a === b;
 }
 
 /** Decide whether an already-open tab's buffer is stale relative to disk, and whether
@@ -39,14 +38,16 @@ function normalizeWorkflowContent(text) {
  *                      baseline — updated on save), or null/undefined if unknown.
  *
  *  Returns `{ stale, reload }`:
- *   - `stale`  is true ONLY when both texts are known and DIFFER (the file on disk is
- *     no longer what the tab loaded).
- *   - `reload` is true only when it is stale AND there are no unsaved edits to clobber
- *     (isModified falsy) — a safe, lossless re-read.
+ *   - `stale` is `true` when both texts are known and DIFFER (the file on disk is no
+ *     longer what the tab loaded); `false` only when both are known and MATCH; and the
+ *     string `"unknown"` when the tab was open but staleness could NOT be determined
+ *     (disk unreadable / baseline missing). "unknown" must NEVER be reported as fresh —
+ *     a transient read failure or a frontend without a content-read API would otherwise
+ *     mask a genuine out-of-band change (codex P2).
+ *   - `reload` is true only when `stale === true` AND there are no unsaved edits to
+ *     clobber (isModified falsy) — a safe, lossless re-read.
  *
- *  Every indeterminate case (not open, either text unknown, identical) returns
- *  `{ stale:false, reload:false }` — never a false staleness signal and never an
- *  unsafe reload that could discard the user's unsaved edits. */
+ *  A not-open tab is never stale (openWorkflow reads it fresh) ⇒ `{stale:false}`. */
 export function decideOpenStaleness({
   wasOpen,
   isModified,
@@ -55,10 +56,10 @@ export function decideOpenStaleness({
 } = {}) {
   if (!wasOpen) return { stale: false, reload: false };
   if (typeof onDiskContent !== "string" || typeof baselineContent !== "string") {
-    return { stale: false, reload: false };
+    // Open tab but we could not read disk or lack a baseline ⇒ cannot prove fresh.
+    return { stale: "unknown", reload: false };
   }
-  const stale =
-    normalizeWorkflowContent(onDiskContent) !== normalizeWorkflowContent(baselineContent);
+  const stale = !workflowContentEqual(onDiskContent, baselineContent);
   if (!stale) return { stale: false, reload: false };
   // Stale. Re-read only when nothing unsaved would be lost; otherwise surface the
   // flag and let the caller force a fresh read (panel_load_workflow) if they choose.

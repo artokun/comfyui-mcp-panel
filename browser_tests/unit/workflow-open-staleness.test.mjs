@@ -38,11 +38,14 @@ test("identical on-disk content ⇒ not stale", () => {
   );
 });
 
-test("pure reformat (whitespace/indent only) is NOT reported as stale", () => {
-  const pretty = JSON.stringify(JSON.parse(A), null, 2); // same data, indented
+test("byte-exact: a reformat (or any byte change) is treated as stale (safe over-caution, never false-fresh)", () => {
+  // Comparison is byte-exact (a JSON round-trip could collapse distinct large-int seeds
+  // and falsely report fresh — codex P0). A pure reformat therefore reads as changed:
+  // an over-cautious stale flag, never a missed change.
+  const pretty = JSON.stringify(JSON.parse(A), null, 2); // same data, different bytes
   assert.deepEqual(
     decideOpenStaleness({ wasOpen: true, isModified: false, onDiskContent: pretty, baselineContent: A }),
-    { stale: false, reload: false },
+    { stale: true, reload: true },
   );
 });
 
@@ -57,7 +60,7 @@ test("non-JSON content falls back to a raw compare (differs ⇒ stale, same ⇒ 
   );
 });
 
-test("unreadable disk / missing baseline fail safe (no false staleness)", () => {
+test("unreadable disk / missing baseline on an OPEN tab ⇒ stale:'unknown' (never false-fresh)", () => {
   for (const [onDiskContent, baselineContent] of [
     [null, A],
     [B, null],
@@ -66,12 +69,19 @@ test("unreadable disk / missing baseline fail safe (no false staleness)", () => 
   ]) {
     assert.deepEqual(
       decideOpenStaleness({ wasOpen: true, isModified: false, onDiskContent, baselineContent }),
-      { stale: false, reload: false },
+      { stale: "unknown", reload: false },
     );
   }
 });
 
-test("no-arg / missing fields do not throw and default to not-stale", () => {
+test("not-open tab is never 'unknown' — it's read fresh regardless", () => {
+  assert.deepEqual(
+    decideOpenStaleness({ wasOpen: false, isModified: false, onDiskContent: null, baselineContent: null }),
+    { stale: false, reload: false },
+  );
+});
+
+test("no-arg / missing fields do not throw and default to not-stale (not open)", () => {
   assert.deepEqual(decideOpenStaleness(), { stale: false, reload: false });
   assert.deepEqual(decideOpenStaleness({}), { stale: false, reload: false });
 });
