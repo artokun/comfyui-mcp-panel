@@ -380,15 +380,17 @@ function timelineWarnings(segments) {
  * so a prompt containing a literal "|" can never make a real overwrite look like a no-op.
  */
 function sameLength(x, y) {
-  // Identical values (including two absent ones) match outright. Otherwise ONLY numerically:
-  // a numeric-string base ("24") must match a normalized 24, but nothing else is coerced —
-  // stringifying instead would make a `null` length compare equal to a `"null"` one.
+  // Identical values (including two absent ones) match outright. Otherwise the two sides are
+  // equal only when they normalize to the SAME stored frame count through the very rule the
+  // write path uses — so "24" matches 24, while "2e3" does NOT match 2000 (the pack's
+  // parseInt reads "2e3" as 2, so treating them as equal would suppress the disclosure while
+  // a live 2000-frame segment was replaced by a 2-frame one). A plain Number() coercion would
+  // do exactly that; stringifying would make `null` equal `"null"`. Anything this cannot
+  // prove equal counts as DIFFERENT, which errs toward disclosing rather than hiding a loss.
   if (x === y) return true;
-  const num = (v) =>
-    typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
-  const nx = num(x);
-  const ny = num(y);
-  return Number.isFinite(nx) && Number.isFinite(ny) && nx === ny;
+  const nx = normalizeSegmentLength(x);
+  const ny = normalizeSegmentLength(y);
+  return nx !== null && ny !== null && nx === ny;
 }
 
 export function sameSegmentContent(a, b) {

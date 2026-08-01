@@ -461,6 +461,16 @@ test("sameSegmentContent compares structurally, never through the join", () => {
   assert.equal(sameSegmentContent([{ prompt: "p", length: null }], [{ prompt: "p", length: "null" }]), false);
   assert.equal(sameSegmentContent([{ prompt: "p", length: NaN }], [{ prompt: "p", length: 24 }]), false);
   assert.equal(sameSegmentContent([{ prompt: "p" }], [{ prompt: "p" }]), true);
+  // …nor by a plain Number() coercion. The pack's parseInt reads "2e3" as 2, so calling it equal
+  // to 2000 would suppress the disclosure while a 2000-frame segment was replaced by a 2-frame
+  // one. Only the LOSSLESS forms the write path accepts count as equal.
+  const len = (x, y) => sameSegmentContent([{ prompt: "p", length: x }], [{ prompt: "p", length: y }]);
+  assert.equal(len("2e3", 2000), false);
+  assert.equal(len("0x10", 16), false);
+  assert.equal(len("24.7", 24), false);
+  assert.equal(len("24.0", 24), true);
+  assert.equal(len("+24", 24), true);
+  assert.equal(len(" 24 ", 24), true);
   // Prompts are compared strictly — no coercion, and an empty prompt is distinct from absent.
   assert.equal(sameSegmentContent([{ prompt: "", length: 1 }], [{ length: 1 }]), false);
 });
