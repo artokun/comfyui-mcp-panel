@@ -150,6 +150,8 @@ import {
   classifyRequestedMembership,
   refreshNodeArea,
   syncNodeArea,
+  syncGraphNodeAreas,
+  moveGroupMembers,
 } from "./lib/group-geometry.js";
 import { pickRevertSnapshot } from "./lib/graph-revert.js";
 import {
@@ -6993,6 +6995,14 @@ const GRAPH_TOOL_EXECUTORS = {
     const GroupCls = LG.LGraphGroup;
     if (typeof GroupCls !== "function") throw new Error("LGraphGroup unavailable on this frontend");
     const group = new GroupCls(typeof title === "string" && title ? title : "Group");
+    // Resync every node's cached boundingRect to its live pos/size BEFORE we build
+    // the box and compute membership. The box is derived from pos/size but
+    // membership is tested boundingRect-first (nodeFocusBounds), so any stale
+    // cached rect — from a prior render, a paste/load, or a move the panel didn't
+    // own — makes bounds-derived membership return nodes that have moved OUT of the
+    // box (or miss ones plainly inside), i.e. the wrong node_ids (#416/#391). One
+    // pass over the graph makes both bases agree on the current layout.
+    syncGraphNodeAreas(graph);
     let bbox;
     let requestedIds = null;
     if (Array.isArray(node_ids) && node_ids.length) {
@@ -7001,12 +7011,11 @@ const GRAPH_TOOL_EXECUTORS = {
       requestedIds = node_ids.map(Number).filter(Number.isFinite);
       const ns = node_ids.map((id) => graph.getNodeById(Number(id))).filter(Boolean);
       if (!ns.length) throw new Error("none of the given node_ids exist in the current graph");
-      // Sync each node's cached boundingRect to its live pos/size BEFORE we build
-      // the box and recompute membership. The box is derived from pos/size but
-      // membership is tested boundingRect-first, so a stale cached rect (from a
-      // prior render, or never rendered at this position) would make geometry miss
-      // nodes the box plainly wraps → an empty group despite valid node_ids (#391).
-      ns.forEach(syncNodeArea);
+      // Force-sync each REQUESTED node's cached rect to its live pos/size — even if
+      // collapsed — so it is a geometric member of the box we build around it. The
+      // sync-all above skips collapsed nodes (to avoid overstating unrelated ones),
+      // but a requested collapsed node with a stale rect must still be included (#391).
+      ns.forEach((n) => syncNodeArea(n, /* forceCollapsed */ true));
       // Tight box around exactly the requested nodes that exist (title height + padding).
       bbox = boundsAroundNodes(ns);
     } else if (Array.isArray(bounds) && bounds.length === 4) {
@@ -7063,13 +7072,17 @@ const GRAPH_TOOL_EXECUTORS = {
         // Move the box AND the LIVE geometric members together. We don't rely on
         // g.move(), which shifts LiteGraph's cached g._nodes — that cache is stale
         // or empty on affected builds (#287/#311/#312), so it would move the wrong
-        // nodes or none. Recompute membership from live geometry, then translate
-        // each member plus the box by the same delta.
+        // nodes or none. Resync live geometry first so we capture the members that
+        // are ACTUALLY inside the box now (not a stale cache), recompute membership,
+        // then translate each member plus the box by the same delta.
+        syncGraphNodeAreas(graph);
         const members = groupMemberNodes(graph, g);
         setGroupBounds(g, [Number(pos[0]), Number(pos[1]), b[2], b[3]]);
-        for (const n of members) {
-          n.pos = [(n.pos?.[0] ?? 0) + dx, (n.pos?.[1] ?? 0) + dy];
-        }
+        // Move each member AND refresh its cached boundingRect by the same delta.
+        // Without the rect refresh the box moves but the members "stay behind" for
+        // the immediate summarizeGroup below and any later panel_query_graph read,
+        // which then reports stale node_ids (#408); mirrors the move_node path (#355).
+        moveGroupMembers(members, dx, dy);
       } else {
         setGroupBounds(g, [Number(pos[0]), Number(pos[1]), b[2], b[3]]);
       }

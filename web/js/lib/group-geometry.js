@@ -133,15 +133,65 @@ export function groupMemberNodes(graph, g) {
  * Mutates in place so it works on plain arrays AND typed-array rects (ComfyUI
  * Rectangle). Dependency-free for unit testing with plain object fixtures.
  */
-export function syncNodeArea(node) {
+export function syncNodeArea(node, forceCollapsed = false) {
   const br = node?.boundingRect;
   if (!br || br.length !== 4) return;
+  // A COLLAPSED node's real footprint is just its title band (a small pill), not
+  // its full pos/size. When syncing UNREQUESTED nodes in bulk (syncGraphNodeAreas,
+  // used before a bounds/query membership read) overwriting a collapsed node's
+  // cached rect with the full footprint would OVERSTATE its area and could wrongly
+  // pull it into a nearby group box — so skip it and leave its (already-small)
+  // rect to the engine (#416). But when the caller explicitly REQUESTED this node
+  // (create-by-node_ids), force the sync: the group box is built around the node's
+  // full pos/size (boundsAroundNodes), so its rect must match to be a member of its
+  // own box — otherwise a requested collapsed node with a stale rect is dropped (#391).
+  if (node.flags?.collapsed && !forceCollapsed) return;
   const w = node.size?.[0] ?? 200;
   const h = node.size?.[1] ?? 100;
   br[0] = node.pos?.[0] ?? 0;
   br[1] = (node.pos?.[1] ?? 0) - 30; // title bar renders above pos
   br[2] = w;
   br[3] = h + 30;
+}
+
+/**
+ * Resync EVERY node's cached boundingRect to its live pos/size before a
+ * geometric membership read that is NOT scoped to an explicit node set — i.e.
+ * creating/querying a group by BOUNDS. move_node / move_group / auto_layout each
+ * refresh the rect at their own write site, but nodes moved by paths the panel
+ * does not own (paste, graph load, manual canvas drags) can still carry a stale
+ * cached rect. Because bounds-derived membership tests every graph node's
+ * boundingRect-first footprint (nodeFocusBounds), a single stale rect makes the
+ * box wrap a node the geometry misses — or capture one that has moved away —
+ * yielding the wrong node_ids (#416). Syncing all rects to live geometry first
+ * makes the membership reflect the CURRENT layout. Collapsed nodes are left
+ * untouched by syncNodeArea (see above). Dependency-free for unit testing.
+ */
+export function syncGraphNodeAreas(graph) {
+  for (const n of graph?._nodes ?? []) syncNodeArea(n);
+}
+
+/**
+ * Translate a group's geometric members by (dx, dy) AND keep each moved node's
+ * cached boundingRect live, so the very next membership read (summarizeGroup /
+ * graph_query) sees the moved footprint instead of the pre-move one.
+ *
+ * graph_move_group used to write node.pos directly and rely on a later render to
+ * refresh boundingRect; because nodeFocusBounds (and LiteGraph's own
+ * recomputeInsideNodes) PREFER the cached rect, membership computed right after
+ * the move was tested against stale geometry — the box moved but its members
+ * "stayed behind", and a follow-up panel_query_graph reported stale node_ids
+ * (#408). refreshNodeArea shifts each rect by the exact move delta (mirroring the
+ * move_node path, #355). `prevPos` is captured per node BEFORE its pos write so
+ * the delta correction is exact and build-independent. Dependency-free.
+ */
+export function moveGroupMembers(members, dx, dy) {
+  for (const n of members ?? []) {
+    if (!n || !Array.isArray(n.pos)) continue;
+    const prev = [n.pos[0], n.pos[1]];
+    n.pos = [(n.pos[0] ?? 0) + dx, (n.pos[1] ?? 0) + dy];
+    refreshNodeArea(n, prev);
+  }
 }
 
 /**

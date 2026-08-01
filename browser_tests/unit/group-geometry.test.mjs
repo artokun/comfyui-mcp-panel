@@ -20,6 +20,8 @@ import {
   classifyRequestedMembership,
   refreshNodeArea,
   syncNodeArea,
+  syncGraphNodeAreas,
+  moveGroupMembers,
 } from "../../web/js/lib/group-geometry.js";
 
 // Minimal fixtures. No boundingRect => nodeFocusBounds falls back to pos/size
@@ -253,6 +255,116 @@ test("refreshNodeArea supports a typed-array boundingRect (ComfyUI Rectangle)", 
   const n = { id: 3, pos: [100, 200], size: [80, 40], boundingRect: Float32Array.from([0, 0, 80, 70]) };
   refreshNodeArea(n, [0, 0]);
   assert.deepEqual([...n.boundingRect], [100, 200, 80, 70], "typed-array origin shifted in place");
+});
+
+// ---- syncNodeArea collapse guard + syncGraphNodeAreas: bounds-create live geometry (#416) ----
+
+test("syncNodeArea leaves an UNREQUESTED collapsed node's cached rect untouched (#416)", () => {
+  // A collapsed node's real footprint is a small title pill; overwriting it with
+  // the full pos/size footprint would overstate its area and risk pulling it into
+  // a nearby group box on a bulk (sync-all) bounds/query read. Default = skip it.
+  const collapsed = {
+    id: 5,
+    pos: [1000, 1000],
+    size: [300, 200],
+    flags: { collapsed: true },
+    boundingRect: [1000, 970, 120, 30], // small title-only pill
+  };
+  syncNodeArea(collapsed);
+  assert.deepEqual([...collapsed.boundingRect], [1000, 970, 120, 30], "collapsed rect preserved by default");
+});
+
+test("syncNodeArea(node, true) FORCE-syncs a REQUESTED collapsed node into its own box (#391)", () => {
+  // A collapsed node the caller explicitly asked to group: its box is built around
+  // the full pos/size, so its stale pill rect must be resynced to the full footprint
+  // to be a member — otherwise create-by-node_ids silently drops a requested node.
+  const n = {
+    id: 8,
+    pos: [3400, 0],
+    size: [300, 120],
+    flags: { collapsed: true },
+    boundingRect: [0, -30, 120, 30], // stale pill at the origin
+  };
+  const graph = graphOf(n);
+  const g = groupBox(boundsAroundNodes([n])); // box wraps the LIVE full footprint
+  assert.deepEqual(groupMemberNodes(graph, g).map((x) => x.id), [], "stale pill excludes it");
+  syncNodeArea(n, true);
+  assert.deepEqual([...n.boundingRect], [3400, -30, 300, 150], "forced to full live footprint");
+  assert.deepEqual(groupMemberNodes(graph, g).map((x) => x.id), [8], "requested collapsed node included");
+});
+
+test("syncGraphNodeAreas resyncs stale rects so bounds membership is LIVE (#416)", () => {
+  // Reproduce #416: nodes were moved (e.g. via paste / a path that didn't refresh
+  // the rect) so their cached boundingRect still describes the OLD spot. Creating a
+  // group by bounds around the LIVE positions then returns the wrong node_ids: it
+  // captures a node that has moved AWAY and misses one that is now inside.
+  const inside = { id: 27, pos: [0, 60], size: [300, 120], boundingRect: [360, 30, 300, 150] }; // stale-far
+  const outside = { id: 4, pos: [360, 60], size: [300, 120], boundingRect: [0, 30, 300, 150] }; // stale-near
+  const graph = graphOf(inside, outside);
+  const g = groupBox([-50, 0, 325, 360]); // x:[-50,275] — wraps LIVE 27, excludes LIVE 4
+
+  // FAIL-BEFORE: stale rects invert membership → returns [4] (moved-away) not [27].
+  assert.deepEqual(
+    groupMemberNodes(graph, g).map((n) => n.id).sort(),
+    [4],
+    "stale cached rects yield the wrong node_ids",
+  );
+
+  // PASS-AFTER: resync all rects to live pos/size → membership reflects the layout.
+  syncGraphNodeAreas(graph);
+  assert.deepEqual(
+    groupMemberNodes(graph, g).map((n) => n.id).sort(),
+    [27],
+    "live geometry returns exactly the enclosed node",
+  );
+});
+
+test("syncGraphNodeAreas tolerates a missing/empty graph", () => {
+  syncGraphNodeAreas(null); // must not throw
+  syncGraphNodeAreas({}); // no _nodes
+  syncGraphNodeAreas(graphOf()); // empty
+});
+
+// ---- moveGroupMembers: move box + members together, keep rects live (#408) ----
+
+test("moveGroupMembers translates members AND keeps membership live at the new box (#408)", () => {
+  // A group with two members; move the whole group by a delta. Without refreshing
+  // the cached rect the members "stay behind" for the very next membership read.
+  const a = { id: 1, pos: [200, 200], size: [300, 120], boundingRect: [200, 170, 300, 150] };
+  const b = { id: 2, pos: [200, 400], size: [300, 120], boundingRect: [200, 370, 300, 150] };
+  const graph = graphOf(a, b);
+  const oldBox = [140, 120, 500, 480]; // wraps both at their start
+  assert.deepEqual(groupMemberNodes(graph, groupBox(oldBox)).map((n) => n.id).sort(), [1, 2]);
+
+  const dx = 1000;
+  const dy = 500;
+  moveGroupMembers([a, b], dx, dy);
+
+  // Nodes AND their cached rects both shifted by the delta.
+  assert.deepEqual(a.pos, [1200, 700]);
+  assert.deepEqual([...a.boundingRect], [1200, 670, 300, 150], "rect shifted with pos");
+  assert.deepEqual(b.pos, [1200, 900]);
+
+  // The moved box (old box + same delta) still encloses both members...
+  const newBox = [oldBox[0] + dx, oldBox[1] + dy, oldBox[2], oldBox[3]];
+  assert.deepEqual(
+    groupMemberNodes(graph, groupBox(newBox)).map((n) => n.id).sort(),
+    [1, 2],
+    "members travel with the box (no stale membership)",
+  );
+  // ...and they are NO LONGER inside the old box position.
+  assert.deepEqual(
+    groupMemberNodes(graph, groupBox(oldBox)).map((n) => n.id),
+    [],
+    "nothing left behind at the old box location",
+  );
+});
+
+test("moveGroupMembers skips nodes without a usable pos and never throws", () => {
+  const ok = { id: 1, pos: [10, 10], size: [200, 100] };
+  moveGroupMembers([ok, null, { id: 2 }, { id: 3, pos: null }], 5, 7);
+  assert.deepEqual(ok.pos, [15, 17], "valid member moved");
+  moveGroupMembers(null, 1, 1); // must not throw
 });
 
 test("membership overlap is edge-inclusive (matches LiteGraph overlapBounding)", () => {
