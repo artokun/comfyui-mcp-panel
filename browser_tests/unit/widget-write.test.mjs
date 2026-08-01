@@ -142,6 +142,364 @@ test("#179: a non-JSON string for a composite widget is refused, not written raw
   assert.throws(() => applyWidgetWrite(node, "lora_2", "not-json", {}), /not valid JSON/);
 });
 
+// ---- #560: scalar-to-composite corruption is REFUSED; sub-field writes MERGE -----
+
+test("#560: a BARE SCALAR to a composite slot is REFUSED, leaving every field intact", () => {
+  const node = {
+    id: 128,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [
+      { name: "lora_1", value: { on: true, lora: "motion.safetensors", strength: 1, strengthTwo: null } },
+    ],
+  };
+  // The exact #560 repro: value=false must NOT null the lora / clobber the row.
+  assert.throws(
+    () => applyWidgetWrite(node, "lora_1", false, {}),
+    (err) =>
+      err instanceof WidgetWriteError &&
+      /composite object widget/.test(err.message) &&
+      /bare scalar would corrupt it/.test(err.message) &&
+      /"lora_1\.on"/.test(err.message), // points at the sub-field syntax
+  );
+  // The ORIGINAL value survives verbatim — no partial write happened.
+  assert.deepEqual(node.widgets[0].value, {
+    on: true,
+    lora: "motion.safetensors",
+    strength: 1,
+    strengthTwo: null,
+  });
+});
+
+test("#560: a sub-field write (lora_1.on=false) MERGES only that field; lora/strength/strengthTwo SURVIVE", () => {
+  const node = {
+    id: 128,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [
+      { name: "lora_1", value: { on: true, lora: "motion.safetensors", strength: 1, strengthTwo: 0.5 } },
+    ],
+  };
+  const set = applyWidgetWrite(node, "lora_1.on", false, {});
+  assert.equal(set.value.on, false);
+  // Every OTHER field is preserved — the core anti-corruption assertion.
+  assert.equal(node.widgets[0].value.lora, "motion.safetensors");
+  assert.equal(node.widgets[0].value.strength, 1);
+  assert.equal(node.widgets[0].value.strengthTwo, 0.5);
+});
+
+test("#560: a numeric sub-field write (lora_1.strength=0.8) preserves the filename + toggle", () => {
+  const node = {
+    id: 128,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: { on: true, lora: "x.safetensors", strength: 1, strengthTwo: null } }],
+  };
+  const set = applyWidgetWrite(node, "lora_1.strength", 0.8, {});
+  assert.equal(set.value.strength, 0.8);
+  assert.equal(node.widgets[0].value.lora, "x.safetensors");
+  assert.equal(node.widgets[0].value.on, true);
+  assert.equal(node.widgets[0].value.strengthTwo, null);
+});
+
+test("#560: a string sub-field write (lora_1.lora=name) preserves on/strength", () => {
+  const node = {
+    id: 128,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: { on: true, lora: "old.safetensors", strength: 0.7, strengthTwo: null } }],
+  };
+  const set = applyWidgetWrite(node, "lora_1.lora", "new.safetensors", {});
+  assert.equal(set.value.lora, "new.safetensors");
+  assert.equal(node.widgets[0].value.on, true);
+  assert.equal(node.widgets[0].value.strength, 0.7);
+});
+
+test("#560: sub-field addressing on a NON-composite widget FAILS LOUDLY (never a wrong write)", () => {
+  const node = { id: 40, type: "KSampler", widgets: [{ name: "seed", type: "INT", value: 5 }] };
+  assert.throws(
+    () => applyWidgetWrite(node, "seed.on", 9, {}),
+    (err) => err instanceof WidgetWriteError && /not a composite object widget/.test(err.message),
+  );
+  assert.equal(node.widgets[0].value, 5, "the scalar widget must be untouched");
+});
+
+test("#560 EXACT-FIRST: a widget whose OWN name contains a dot is targeted exactly, never split", () => {
+  // A (contrived) widget literally named "lora.on" must win over a base "lora" split.
+  const node = {
+    id: 41,
+    type: "CustomNode",
+    widgets: [
+      { name: "lora", value: { on: true, lora: "keep.safetensors", strength: 1 } },
+      { name: "lora.on", type: "text", value: "literal" },
+    ],
+  };
+  const set = applyWidgetWrite(node, "lora.on", "written", {});
+  assert.equal(set.value, "written");
+  assert.equal(node.widgets[1].value, "written");
+  // The composite base was NOT touched.
+  assert.deepEqual(node.widgets[0].value, { on: true, lora: "keep.safetensors", strength: 1 });
+});
+
+test("#560 EMPTY SUFFIX: 'lora_1.' is refused loudly, base is NOT silently written", () => {
+  const node = {
+    id: 42,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: { on: true, lora: "a.safetensors", strength: 1 } }],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "lora_1.", false, {}),
+    (err) => err instanceof WidgetWriteError && /empty sub-field/.test(err.message),
+  );
+  assert.deepEqual(node.widgets[0].value, { on: true, lora: "a.safetensors", strength: 1 });
+});
+
+test("#560: coerceWidgetValue merges a sub-field onto the CURRENT object", () => {
+  const w = { name: "lora_1", value: { on: true, lora: "a.safetensors", strength: 1, strengthTwo: null } };
+  const merged = coerceWidgetValue(w, false, w, "on");
+  assert.deepEqual(merged, { on: false, lora: "a.safetensors", strength: 1, strengthTwo: null });
+});
+
+test("#560: a nested sub-field path is refused (no per-node schema to shape it)", () => {
+  const w = { name: "lora_1", value: { on: true, lora: "a", strength: 1 } };
+  assert.throws(() => coerceWidgetValue(w, 1, w, "a.b"), /Nested sub-field path/);
+});
+
+test("#560 HARDEN: a sub-field write to an UNKNOWN field is refused, never ADDED", () => {
+  const node = {
+    id: 43,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: { on: true, lora: "a.safetensors", strength: 1, strengthTwo: null } }],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "lora_1.strenght", 1, {}), // typo
+    (err) => err instanceof WidgetWriteError && /has no field "strenght"/.test(err.message),
+  );
+  // No junk member was added and the row is unchanged.
+  assert.deepEqual(node.widgets[0].value, { on: true, lora: "a.safetensors", strength: 1, strengthTwo: null });
+});
+
+test("#560 HARDEN: a boolean-string ('false') for a boolean field COERCES to boolean, not a string", () => {
+  const node = {
+    id: 44,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: { on: true, lora: "a.safetensors", strength: 1 } }],
+  };
+  const set = applyWidgetWrite(node, "lora_1.on", "false", {});
+  assert.strictEqual(set.value.on, false); // boolean false, NOT the string "false"
+  assert.equal(node.widgets[0].value.lora, "a.safetensors");
+});
+
+test("#560 HARDEN: a non-numeric value for a numeric field is refused", () => {
+  const node = {
+    id: 45,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: { on: true, lora: "a.safetensors", strength: 1 } }],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "lora_1.strength", "loud", {}),
+    (err) => err instanceof WidgetWriteError && /is numeric but value/.test(err.message),
+  );
+  assert.equal(node.widgets[0].value.strength, 1, "unchanged on reject");
+});
+
+test("#560 HARDEN: a number into a STRING field (lora filename) is refused", () => {
+  const node = {
+    id: 46,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: { on: true, lora: "a.safetensors", strength: 1 } }],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "lora_1.lora", 5, {}),
+    (err) => err instanceof WidgetWriteError && /is a string but value/.test(err.message),
+  );
+});
+
+test("#560 HARDEN: a FULL JSON-object write also rejects unknown fields + mistypes (not just dotted)", () => {
+  const node = {
+    id: 48,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: { on: true, lora: "a.safetensors", strength: 1, strengthTwo: null } }],
+  };
+  // Unknown field in the object payload is refused (no junk added).
+  assert.throws(
+    () => applyWidgetWrite(node, "lora_1", '{"strenght":2}', {}),
+    (err) => err instanceof WidgetWriteError && /has no field "strenght"/.test(err.message),
+  );
+  // A mistyped known field (string into boolean) COERCES rather than storing "false".
+  const set = applyWidgetWrite(node, "lora_1", '{"on":"false"}', {});
+  assert.strictEqual(set.value.on, false);
+  assert.equal(node.widgets[0].value.lora, "a.safetensors");
+  assert.equal(node.widgets[0].value.strength, 1);
+});
+
+test("#560 P0: a null-valued field ENFORCES its DECLARED type — number into a null `lora` is refused", () => {
+  // Empty rgthree row: lora/strengthTwo are null. Type must come from the schema, NOT
+  // the (null) current value — otherwise a wrong-typed scalar is silently accepted.
+  const node = {
+    id: 50,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: { on: true, lora: null, strength: 1, strengthTwo: null } }],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "lora_1.lora", 5, {}), // number into string|null field
+    (err) => err instanceof WidgetWriteError && /is a string but value/.test(err.message),
+  );
+  assert.throws(
+    () => applyWidgetWrite(node, "lora_1", '{"strengthTwo":"bad"}', {}), // string into number|null
+    (err) => err instanceof WidgetWriteError && /is numeric but value/.test(err.message),
+  );
+  assert.deepEqual(node.widgets[0].value, { on: true, lora: null, strength: 1, strengthTwo: null });
+});
+
+test("#560 P0: a null-valued field still ACCEPTS a correctly-typed value", () => {
+  const node = {
+    id: 51,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: { on: true, lora: null, strength: 1, strengthTwo: null } }],
+  };
+  const set = applyWidgetWrite(node, "lora_1.lora", "face.safetensors", {});
+  assert.equal(set.value.lora, "face.safetensors");
+  const set2 = applyWidgetWrite(node, "lora_1.strengthTwo", 0.5, {});
+  assert.equal(set2.value.strengthTwo, 0.5);
+});
+
+test("#560 P2: clearing a NULLABLE field to null is accepted (lora, strengthTwo)", () => {
+  const node = {
+    id: 52,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: { on: true, lora: "x.safetensors", strength: 1, strengthTwo: 0.5 } }],
+  };
+  const set = applyWidgetWrite(node, "lora_1", '{"lora":null}', {});
+  assert.equal(set.value.lora, null);
+  assert.equal(node.widgets[0].value.strength, 1); // sibling preserved
+  const set2 = applyWidgetWrite(node, "lora_1", '{"strengthTwo":null}', {});
+  assert.equal(set2.value.strengthTwo, null);
+});
+
+test("#560 P0: an rgthree-KEY-SHAPED row enforces the schema even when a current value is CORRUPT (repair-forward)", () => {
+  // The key set is rgthree's, but `on` currently holds a wrong-typed string (from a prior
+  // bad write). Classification is by KEY SHAPE, not value validity, so the schema is still
+  // ENFORCED: a further wrong-type write to `on` is refused, and a valid boolean REPAIRS it.
+  const node = {
+    id: 54,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: { on: "yes", lora: "x.safetensors", strength: 1 } }],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "lora_1.on", "active", {}), // still a string → refused
+    (err) => err instanceof WidgetWriteError && /is boolean but value/.test(err.message),
+  );
+  const set = applyWidgetWrite(node, "lora_1.on", true, {}); // valid boolean repairs it
+  assert.strictEqual(set.value.on, true);
+  assert.equal(node.widgets[0].value.lora, "x.safetensors");
+});
+
+test("#560 P0: a partially-corrupt row rejects a further wrong-type FULL-OBJECT write, repairs a valid one", () => {
+  // `lora` is corruptly numeric (5). The schema (string) must still be enforced from the
+  // KEY SHAPE — a further numeric write is refused (would deepen corruption), a string repairs.
+  const node = {
+    id: 58,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: { on: true, lora: 5, strength: 1, strengthTwo: null } }],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "lora_1", '{"lora":6}', {}),
+    (err) => err instanceof WidgetWriteError && /is a string but value/.test(err.message),
+  );
+  const set = applyWidgetWrite(node, "lora_1", '{"lora":"real.safetensors"}', {});
+  assert.equal(set.value.lora, "real.safetensors");
+});
+
+test("#560 P1: a foreign composite's UNTYPED (null) field is REFUSED, not accepted with a guessed type", () => {
+  const node = {
+    id: 56,
+    type: "SomeOtherNode",
+    widgets: [{ name: "cfg", value: { on: true, lora: null, strength: 1, extra: "x" } }],
+  };
+  // `extra` is not an rgthree key → schema NOT applied → lora is null → type unknowable →
+  // refuse LOUDLY (no silent wrong-typed write).
+  assert.throws(
+    () => applyWidgetWrite(node, "cfg.lora", "anything", {}),
+    (err) => err instanceof WidgetWriteError && /cannot validate the value/.test(err.message),
+  );
+  // A NON-null field of the same foreign composite is still writable (type inferred).
+  const set = applyWidgetWrite(node, "cfg.strength", 0.5, {});
+  assert.equal(set.value.strength, 0.5);
+});
+
+test("#560 P0: an rgthree-key-shaped row with an undefined field is REPAIRED-FORWARD by the schema", () => {
+  // `on: undefined` — the key shape is still rgthree's, so the boolean schema is enforced:
+  // a boolean-string 'false' coerces to boolean false (repairing the field), and a foreign
+  // value would be refused. Classification never depends on the current value's validity.
+  const node = {
+    id: 57,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: { on: undefined, lora: null, strength: 1 } }],
+  };
+  const set = applyWidgetWrite(node, "lora_1.on", "false", {});
+  assert.strictEqual(set.value.on, false); // coerced to boolean, not the string "false"
+});
+
+test("#560 P2: a DOTTED null clears a nullable field (lora); non-nullable (on) is still refused", () => {
+  const node = {
+    id: 55,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: { on: true, lora: "x.safetensors", strength: 1, strengthTwo: 0.5 } }],
+  };
+  const set = applyWidgetWrite(node, "lora_1.lora", null, {});
+  assert.equal(set.value.lora, null);
+  assert.equal(node.widgets[0].value.strength, 1);
+  assert.throws(
+    () => applyWidgetWrite(node, "lora_1.on", null, {}),
+    (err) => err instanceof WidgetWriteError && /not nullable/.test(err.message),
+  );
+});
+
+test("#560 P2: clearing a NON-nullable field to null is refused (on, strength)", () => {
+  const node = {
+    id: 53,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: { on: true, lora: "x.safetensors", strength: 1, strengthTwo: null } }],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "lora_1", '{"on":null}', {}),
+    (err) => err instanceof WidgetWriteError && /not nullable/.test(err.message),
+  );
+  assert.throws(
+    () => applyWidgetWrite(node, "lora_1", '{"strength":null}', {}),
+    (err) => err instanceof WidgetWriteError && /not nullable/.test(err.message),
+  );
+  assert.equal(node.widgets[0].value.on, true);
+  assert.equal(node.widgets[0].value.strength, 1);
+});
+
+test("#179 REGRESSION: a valid full-object write still merges + preserves unspecified fields", () => {
+  const node = {
+    id: 49,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: { on: false, lora: null, strength: 1, strengthTwo: null } }],
+  };
+  const set = applyWidgetWrite(node, "lora_1", '{"on":true,"lora":"x.safetensors","strength":0.6}', {});
+  assert.equal(set.value.on, true);
+  assert.equal(set.value.lora, "x.safetensors");
+  assert.equal(set.value.strength, 0.6);
+  assert.equal(set.value.strengthTwo, null); // preserved
+});
+
+test("#560 SAFETY: dotted addressing on a SUBGRAPH parent is refused (never a rail-only write)", () => {
+  // A subgraph-shaped node whose "lora_1" is NOT resolvable as a promotion alias here:
+  // the dotted form must fail closed rather than write the parent rail directly (#366).
+  const node = {
+    id: 47,
+    type: "MySubgraph",
+    subgraph: {},
+    inputs: [],
+    widgets: [{ name: "lora_1", value: { on: true, lora: "a.safetensors", strength: 1 } }],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "lora_1.on", false, { resolveSource: () => null }),
+    (err) => err instanceof WidgetWriteError && /not supported on subgraph node/.test(err.message),
+  );
+  assert.deepEqual(node.widgets[0].value, { on: true, lora: "a.safetensors", strength: 1 });
+});
+
 // ---- combo classification + exact-value writes (#240) ---------------------
 
 test("combo widget is classified by its option list", () => {
@@ -1169,4 +1527,36 @@ test("#366×#179: a promoted COMPOSITE write merges onto the RAIL's current obje
   assert.equal(inner.widgets[0].value.lora, "current.safetensors");
   assert.equal(inner.widgets[0].value.strength, 0.6);
   assert.equal(set.promoted_from.parent_widget_synced, true);
+});
+
+test("#560 P1: a promoted composite whose INNER value went STALE-SCALAR is still detected via the RAIL (no raw-string clobber)", () => {
+  // The inner widget value is a stale SCALAR while the authoritative rail still holds the
+  // composite object. A JSON payload must be recognized as composite via the rail and
+  // MERGED onto it — never fall through as a raw string that clobbers the rail (#179/#366).
+  const inner = {
+    id: 301,
+    type: "Power Lora Loader (rgthree)",
+    widgets: [{ name: "lora_1", value: "STALE" }], // scalar, not an object
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) };
+  const railWidget = { name: "lora_1", value: { on: true, lora: "current.safetensors", strength: 0.8, strengthTwo: null } };
+  const parent = {
+    id: 268,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "lora_1", _widget: railWidget, _subgraphSlot: { name: "lora_1" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "lora_1" ? { sourceNodeId: "301", sourceWidgetName: "lora_1" } : null;
+
+  const set = applyWidgetWrite(parent, "lora_1", '{"strength":0.6}', { resolveSource });
+
+  // Rail merged onto its object — NOT overwritten by the raw string "{\"strength\":0.6}".
+  assert.equal(typeof railWidget.value, "object");
+  assert.equal(railWidget.value.strength, 0.6);
+  assert.equal(railWidget.value.lora, "current.safetensors");
+  assert.equal(railWidget.value.on, true);
+  assert.equal(railWidget.value.strengthTwo, null);
+  assert.equal(inner.widgets[0].value.strength, 0.6);
 });

@@ -120,6 +120,10 @@ import {
   computeOrphanedBoundaries,
 } from "./lib/subgraph-scope.js";
 import { runSetWidget } from "./lib/set-widget.js";
+import {
+  controlAfterGenerateModes,
+  controlAfterGenerateEntries,
+} from "./lib/control-after-generate.js";
 import { autoMatchSlots, slotDiagnostic } from "./lib/connect-match.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
 import {
@@ -3931,6 +3935,13 @@ function summarizeNode(node) {
   if (fullHeight == null && node.size) {
     fullHeight = node.flags && node.flags.collapsed ? 30 : Math.round(node.size[1] + 30);
   }
+  // #558: control_after_generate governs seed/INT/COMBO widgets and SILENTLY rewrites
+  // their value after each generation — a value the agent explicitly set will not hold.
+  // The ComfyUI frontend adds it as a serialize:false/canvasOnly widget that renders
+  // unassociated from the seed it controls, so it is easy to miss. Surface it as an
+  // EXPLICIT, seed-associated map (governed-widget → mode) so the mode is visible and
+  // an agent can verify a "fixed" seed actually holds.
+  const controlAfterGenerate = controlAfterGenerateModes(node);
   const summary = {
     id: node.id,
     type: node.type,
@@ -3947,6 +3958,9 @@ function summarizeNode(node) {
     // OUTPUT nodes (SaveImage/PreviewImage/SaveVideo/…) are the only valid
     // targets for panel_run's to_node_id ("run to node" partial execution).
     ...(node.constructor?.nodeData?.output_node ? { is_output: true } : {}),
+    ...(Object.keys(controlAfterGenerate).length
+      ? { control_after_generate: controlAfterGenerate }
+      : {}),
     widgets,
     inputs,
     outputs,
@@ -4480,9 +4494,22 @@ const GRAPH_TOOL_EXECUTORS = {
       const title = n.title && n.title !== n.type ? ` "${n.title}"` : "";
       const grps = groupOf.get(n.id);
       const groupTag = grps?.length ? ` · group:${grps.join("/")}` : "";
+      // #558: MARK the seed/value widget with its control_after_generate mode
+      // (`seed=… [after_gen=randomize]`) — visible like [bypass]/[mute] so a silently-
+      // rewritten value is obvious. The control combo token is NOT hidden (folding could
+      // hide a real combo that merely shares the mode option set), only annotated.
+      const cagMode = new Map(
+        controlAfterGenerateEntries(n)
+          .filter((e) => e.widget !== e.control)
+          .map((e) => [e.widget, e.mode]),
+      );
       const widgets = (n.widgets ?? [])
         .filter((w) => w && typeof w.name === "string")
-        .map((w) => `${w.name}=${fmtVal(w.value)}`)
+        .map((w) => {
+          const base = `${w.name}=${fmtVal(w.value)}`;
+          const mode = cagMode.get(w.name);
+          return mode ? `${base} [after_gen=${mode}]` : base;
+        })
         .join(" ");
       lines.push(
         `${n.id}  ${n.type}${title}${modeTag(n)}${outTag(n)}${groupTag}${widgets ? "  " + widgets : ""}`,
