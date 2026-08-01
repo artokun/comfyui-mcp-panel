@@ -142,6 +142,7 @@ hosts for the ChatGPT/Codex backend, so feature parity is automatic.
 | `panel_remove_node` | Remove a node |
 | `panel_connect` / `panel_disconnect` | Wire / unwire slots (by name or index) |
 | `panel_set_widget` | Change a widget value (steps, cfg, prompts, …) |
+| `panel_set_property` | Set a node **property** (right-click → Properties), e.g. rgthree Fast Groups Bypasser `matchTitle` — the counterpart to `panel_set_widget` |
 | `panel_move_node` | Move a node on the canvas |
 | `panel_set_node_title` | Rename a node's header title |
 | `panel_clear` | Remove every node — the whole wipe is one Ctrl+Z |
