@@ -20,6 +20,7 @@ import {
   parsePromptRelayTimeline,
   derivePromptRelayWidgets,
   sameSegmentContent,
+  recordPreLoadPromptRelayEditors,
   promptRelayDerivedRefusal,
   applyPromptRelayTimelineWrite,
   PromptRelayTimelineWriteError,
@@ -573,48 +574,120 @@ test("POST-LOAD: the timeline_data widget wins over an editor still holding the 
   assert.equal(widgets.segment_lengths.value, "50");
 });
 
-test("POST-LOAD: a stale editor is NOT reported as an overwritten uncommitted edit", () => {
-  // The routine post-load window: onConfigure restores the widgets ~10ms before it re-parses the
-  // editor, so the editor still holds the PREVIOUS workflow. An ordinary metadata-only write
-  // arrives. Case 3 rejects the editor on positive evidence (it could not have produced what the
-  // node executes), so calling its content an overwritten uncommitted edit would cry wolf on a
-  // routine write — and this disclosure is the safety net for the genuine collision case, so it
-  // must not become noise. The content is still returned, just classified honestly.
-  const { node, widgets, editor } = makeRelayNode({ timelineSegments: [seg("restored", 50)] });
-  editor.timeline = { segments: [seg("previous workflow", 99)] };
+/**
+ * Model a real workflow load: the panel's app.loadGraphData fork snapshots what every
+ * PromptRelay editor holds RIGHT NOW (still the previous workflow), then the load restores the
+ * widgets to the new workflow's values. The editor's own re-parse is ~10ms later, so between
+ * those two points it still holds the old timeline.
+ */
+function simulateWorkflowLoad({ node, widgets, editor }, restoredSegments) {
+  recordPreLoadPromptRelayEditors([node]); // the fork, firing before the graph is replaced
+  const timeline = { segments: restoredSegments };
+  widgets.timeline_data.value = JSON.stringify(timeline);
+  const derived = derivePromptRelayWidgets(restoredSegments);
+  widgets.local_prompts.value = derived.local_prompts;
+  widgets.segment_lengths.value = derived.segment_lengths;
+  return { node, widgets, editor };
+}
 
-  const res = relay(applyPromptRelayTimelineWrite(node, { zoom: 4 }));
+test("POST-LOAD: an editor PROVEN to predate the load is not reported as an overwritten edit", () => {
+  // The routine post-load window. The pre-load snapshot proves the editor still holds exactly
+  // what it held before the load — it has not been re-parsed OR typed into — so calling its
+  // content an overwritten uncommitted edit would cry wolf on a routine write, and this
+  // disclosure is the safety net for the genuine collision case.
+  const n = makeRelayNode({ timelineSegments: [seg("previous workflow", 99)] });
+  simulateWorkflowLoad(n, [seg("restored", 50)]);
+
+  const res = relay(applyPromptRelayTimelineWrite(n.node, { zoom: 4 }));
 
   assert.equal(res.merge_base, "timeline_data");
   assert.equal(res.merge_base_reason, "filter-rejected-editor");
-  // NO data-loss claim, and no warning at all — nothing was typed and nothing was lost.
+  // NO data-loss claim, and no warning at all — staleness is PROVEN, not assumed.
   assert.equal(res.overwrote_uncommitted_edit, undefined);
+  assert.equal(res.discarded_unverified_editor_copy, undefined);
   assert.equal(res.warnings, undefined);
   // The payload is still handed back, under a name that says what it actually is.
   assert.deepEqual(res.discarded_stale_editor, { prompts: ["previous workflow"], lengths: [99] });
-  assert.equal(widgets.local_prompts.value, "restored");
-  assert.equal(widgets.segment_lengths.value, "50");
+  assert.equal(n.widgets.local_prompts.value, "restored");
+  assert.equal(n.widgets.segment_lengths.value, "50");
 });
 
 test("POST-LOAD: an explicit segments write does not claim the master was superseded", () => {
   // Case 3 selected the master; replacing its segments is the caller's plain intent, not a copy
   // set aside behind their back.
-  const { node, widgets, editor } = makeRelayNode({ timelineSegments: [seg("restored", 50)] });
-  editor.timeline = { segments: [seg("previous workflow", 99)] };
-  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("caller wrote this", 10)] }));
+  const n = makeRelayNode({ timelineSegments: [seg("previous workflow", 99)] });
+  simulateWorkflowLoad(n, [seg("restored", 50)]);
+  const res = relay(applyPromptRelayTimelineWrite(n.node, { segments: [seg("caller wrote this", 10)] }));
   assert.equal(res.merge_base, "timeline_data");
   assert.equal(res.superseded_timeline_data, undefined);
   assert.equal(res.overwrote_uncommitted_edit, undefined);
   assert.deepEqual(res.discarded_stale_editor, { prompts: ["previous workflow"], lengths: [99] });
-  assert.equal(widgets.local_prompts.value, "caller wrote this");
+  assert.equal(n.widgets.local_prompts.value, "caller wrote this");
 });
 
 test("a stale editor whose content the write happens to reproduce reports nothing", () => {
-  const { node, editor } = makeRelayNode({ timelineSegments: [seg("restored", 50)] });
-  editor.timeline = { segments: [seg("previous workflow", 99)] };
-  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("previous workflow", 99)] }));
+  const n = makeRelayNode({ timelineSegments: [seg("previous workflow", 99)] });
+  simulateWorkflowLoad(n, [seg("restored", 50)]);
+  const res = relay(applyPromptRelayTimelineWrite(n.node, { segments: [seg("previous workflow", 99)] }));
   assert.equal(res.discarded_stale_editor, undefined);
   assert.equal(res.overwrote_uncommitted_edit, undefined);
+  assert.equal(res.discarded_unverified_editor_copy, undefined);
+});
+
+// ─── The filter cannot tell a stale editor from an uncommitted edit; only the load can ───
+
+test("UNCOMMITTED TEXT whose derived widgets were refreshed back to the master is NOT suppressed", () => {
+  // The mirror of the post-load case, and indistinguishable from it by the derived widgets: the
+  // master and both derived widgets describe ["old","b"], while the editor holds text the user
+  // typed. The filter rejects the editor exactly as it does for a stale one — but the pre-load
+  // snapshot does NOT match, so the editor changed after the load and this is a real edit.
+  const n = makeRelayNode({ timelineSegments: [seg("before the load", 24), seg("b", 36)] });
+  simulateWorkflowLoad(n, [seg("old", 24), seg("b", 36)]);
+  // …the load settles, the editor re-parses, the user types, and the derived widgets end up back
+  // at the master's values (a refresh, or a commit that did not survive).
+  n.editor.timeline = { segments: [seg("user typed this", 24), seg("b", 36)] };
+
+  const res = relay(applyPromptRelayTimelineWrite(n.node, { zoom: 4 }));
+
+  assert.equal(res.merge_base_reason, "filter-rejected-editor");
+  // NOT silently dropped: the content comes back AND the caller is warned.
+  assert.equal(res.discarded_stale_editor, undefined);
+  assert.deepEqual(res.discarded_unverified_editor_copy, {
+    prompts: ["user typed this", "b"],
+    lengths: [24, 36],
+  });
+  assert.ok(res.warnings.some((w) => w.includes("could NOT be determined")));
+});
+
+test("with NO load ever observed, a discarded editor copy WARNS (unknown is never treated as safe)", () => {
+  // No pre-load snapshot exists (the fork never ran, or the load recreated the node). Staleness
+  // is unproven, so the fail-safe direction is to warn and return the content.
+  const { node } = makeRelayNode({ timelineSegments: [seg("restored", 50)] });
+  node._timelineEditor.timeline = { segments: [seg("unknown provenance", 99)] };
+  const res = relay(applyPromptRelayTimelineWrite(node, { zoom: 4 }));
+  assert.equal(res.merge_base_reason, "filter-rejected-editor");
+  assert.equal(res.discarded_stale_editor, undefined);
+  assert.deepEqual(res.discarded_unverified_editor_copy, {
+    prompts: ["unknown provenance"],
+    lengths: [99],
+  });
+  assert.ok(res.warnings.some((w) => w.includes("could NOT be determined")));
+});
+
+test("recordPreLoadPromptRelayEditors only touches PromptRelay nodes, and tolerates junk", () => {
+  const { node } = makeRelayNode();
+  const other = { id: 2, type: "KSampler", widgets: [], _timelineEditor: { timeline: { segments: [seg("x", 1)] } } };
+  const noEditor = { id: 3, type: PROMPT_RELAY_TIMELINE_NODE_TYPE, widgets: [] };
+  assert.equal(recordPreLoadPromptRelayEditors([node, other, noEditor]), 2);
+  assert.equal(other.__cmcpPromptRelayPreLoadSegments, undefined);
+  // A PromptRelay node with no live editor records an explicit "nothing was there".
+  assert.equal(noEditor.__cmcpPromptRelayPreLoadSegments, null);
+  assert.deepEqual(node.__cmcpPromptRelayPreLoadSegments, [
+    { prompt: "a", length: 24 },
+    { prompt: "b", length: 36 },
+  ]);
+  assert.equal(recordPreLoadPromptRelayEditors(null), 0);
+  assert.equal(recordPreLoadPromptRelayEditors([null, undefined, 5]), 0);
 });
 
 test("the live editor never has its segment objects aliased into the written timeline", () => {
@@ -911,6 +984,20 @@ test("graph_set_widget's PromptRelay branch exists and is ordered before the gen
   // Must intercept BEFORE the generic raw write, and must not displace the LTXDirector route.
   assert.ok(relayAt < genericAt, "PromptRelay branch must run before runSetWidget");
   assert.ok(ltxAt < relayAt, "the LTXDirector route (#314) must keep its position");
+});
+
+test("the pre-load snapshot is taken inside the app.loadGraphData fork, BEFORE the load runs", () => {
+  // The signal only works if it is recorded before the graph is replaced. Pin both the call and
+  // its position relative to the original loadGraphData, and that it cannot break a load.
+  assert.match(panelSrc, /recordPreLoadPromptRelayEditors,\n\} from "\.\/lib\/prompt-relay-timeline\.js";/);
+  const callAt = panelSrc.indexOf("recordPreLoadPromptRelayEditors(appRef?.graph?._nodes");
+  const origAt = panelSrc.indexOf("return orig(graphData, clean, restoreView, workflow, options);");
+  assert.ok(callAt > 0, "recorder is not called from the loadGraphData fork");
+  assert.ok(origAt > 0);
+  assert.ok(callAt < origAt, "the snapshot must be taken BEFORE the load is delegated");
+  // Wrapped so bookkeeping can never break a graph load.
+  const between = panelSrc.slice(callAt - 400, origAt);
+  assert.ok(/try \{\s*\n\s*recordPreLoadPromptRelayEditors\(/.test(between));
 });
 
 test("graph_set_widget routes master → apply, derived → refusal, everything else → fall through", () => {

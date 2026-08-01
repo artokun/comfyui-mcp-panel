@@ -48,10 +48,16 @@
 // envelope before being replaced, so no prompt text ever disappears without the caller being
 // told — as is an UNCOMMITTED edit the user was still typing when the write landed
 // (`overwrote_uncommitted_edit`) and a timeline_data copy that lost to the editor
-// (`superseded_timeline_data`). Which name a discarded copy gets depends on WHICH branch
-// settled authority: a copy the derived-widget filter REJECTED is stale on positive evidence,
-// so it comes back as `discarded_stale_editor` with no warning — the ordinary post-load window
-// must not fire a data-loss alarm, or the alarm stops meaning anything. Both carry the prior prompts PER SEGMENT, and both are decided
+// (`superseded_timeline_data`). Which name a discarded copy gets depends on WHICH branch settled
+// authority and, for a copy the derived-widget filter rejected, on the PRE-LOAD SNAPSHOT: the
+// filter proves only that a copy disagrees with the widgets, never WHY, and a stale post-load
+// editor is indistinguishable from an uncommitted edit whose derived values were refreshed back
+// to the master. So recordPreLoadPromptRelayEditors observes what each editor held before the
+// current load; an editor still holding exactly that is PROVEN stale (`discarded_stale_editor`,
+// no warning — the routine post-load window must not fire a data-loss alarm or the alarm stops
+// meaning anything), and anything else is `discarded_unverified_editor_copy` WITH a warning that
+// says plainly that we could not tell. Unknown is never treated as safe: a false warning costs
+// attention, a suppressed loss costs the user's work. Both carry the prior prompts PER SEGMENT, and both are decided
 // by comparing segment ARRAYS (sameSegmentContent), never the derived `" | "` join, which is
 // lossy and would hide a real overwrite whenever a prompt contains a literal "|". The same limit
 // governs WHICH copy is authoritative: a join comparison can only ask "could this widget hold
@@ -422,6 +428,51 @@ function contentSnapshot(segments) {
   };
 }
 
+// Where the PRE-LOAD editor snapshot lives, stamped on the node itself (never serialized —
+// LiteGraph.serialize() writes only its known fields, so this cannot leak into a workflow).
+const PRE_LOAD_SEGMENTS_KEY = "__cmcpPromptRelayPreLoadSegments";
+
+/**
+ * Snapshot every PromptRelayEncodeTimeline editor's CURRENT segments just BEFORE a workflow
+ * load replaces the graph. Called from the panel's app.loadGraphData fork.
+ *
+ * WHY THIS EXISTS. The derived widgets can prove that an editor copy does not match what the
+ * node executes — they can NEVER prove WHY. A stale editor left over from the previous
+ * workflow (onConfigure restores the widgets ~10ms before it re-parses the editor) and an
+ * uncommitted edit whose derived values were refreshed back to the master are indistinguishable
+ * from the widget values alone, yet they demand opposite disclosures: a warning on the second
+ * would be noise, silence on the first would suppress real loss. No threshold between them can
+ * be right, so this records an OBSERVATION instead: the content the editor held before the
+ * current load began. An editor still holding exactly that content has not been re-parsed or
+ * typed into since — positive evidence of staleness. Anything else changed after the load.
+ */
+export function recordPreLoadPromptRelayEditors(nodes, { getEditor } = {}) {
+  if (!Array.isArray(nodes)) return 0;
+  let stamped = 0;
+  for (const node of nodes) {
+    if (!isPromptRelayTimelineNode(node)) continue;
+    const ed = typeof getEditor === "function" ? getEditor(node) : node?._timelineEditor;
+    const tl = liveEditorTimeline(ed);
+    // Store only the authored fields — the same ones sameSegmentContent compares.
+    node[PRE_LOAD_SEGMENTS_KEY] = tl
+      ? tl.segments.map((seg) => ({ prompt: seg?.prompt, length: seg?.length }))
+      : null;
+    stamped++;
+  }
+  return stamped;
+}
+
+/**
+ * Is this editor copy PROVEN to predate the current workflow load? True only when a pre-load
+ * snapshot was actually recorded AND the editor still holds exactly that content. With no
+ * snapshot (no load observed yet, a node recreated by the load, the fork not installed) the
+ * answer is NOT "stale" but "unknown" — and unknown must never be treated as safe.
+ */
+function editorProvenStale(node, editorSegs) {
+  const preLoad = node?.[PRE_LOAD_SEGMENTS_KEY];
+  return Array.isArray(preLoad) && sameSegmentContent(preLoad, editorSegs);
+}
+
 /** Locate a widget by name on a LiteGraph node. */
 function findWidget(node, name) {
   const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
@@ -657,9 +708,26 @@ export function applyPromptRelayTimelineWrite(
   const editorDiscarded = !!editorSegs && !sameSegmentContent(editorSegs, segments);
 
   const overwroteInFlight = editorWasAuthority && editorDiscarded ? contentSnapshot(editorSegs) : null;
-  // Quiet channel: proven-stale, so payload only.
-  const discardedStaleEditor =
-    !editorWasAuthority && anomalous && editorDiscarded ? contentSnapshot(editorSegs) : null;
+  // The filter rejected this editor copy. That alone does NOT say whether it was a stale
+  // leftover or text the user typed, so the pre-load snapshot decides:
+  //   PROVEN stale (still holds exactly what it held before the current load) → payload only;
+  //   UNPROVEN (no snapshot, or the content changed since the load) → payload AND a warning.
+  // Unknown is never treated as safe: a false warning costs attention, a suppressed loss costs
+  // the user's work.
+  const editorSetAside = !editorWasAuthority && anomalous && editorDiscarded;
+  const staleProven = editorSetAside && editorProvenStale(node, editorSegs);
+  const discardedStaleEditor = staleProven ? contentSnapshot(editorSegs) : null;
+  const discardedUnverifiedEditor =
+    editorSetAside && !staleProven ? contentSnapshot(editorSegs) : null;
+  if (discardedUnverifiedEditor) {
+    warnings.push(
+      `a live editor copy that did not match this node's derived widgets was DISCARDED, and it ` +
+        `could NOT be determined whether it was a stale leftover (an editor not yet re-parsed after ` +
+        `a workflow load) or prompt text typed into the node that had not been committed — the two ` +
+        `look identical from the widget values alone. Its prompts are returned PER SEGMENT as ` +
+        `"discarded_unverified_editor_copy.prompts"; write them back if they were yours.`,
+    );
+  }
   if (overwroteInFlight) {
     warnings.push(
       `this node held an UNCOMMITTED timeline edit — the live editor's segments (what the node ` +
@@ -761,6 +829,9 @@ export function applyPromptRelayTimelineWrite(
       ...(Object.keys(replaced).length ? { replaced_out_of_band: replaced } : {}),
       ...(overwroteInFlight ? { overwrote_uncommitted_edit: overwroteInFlight } : {}),
       ...(discardedStaleEditor ? { discarded_stale_editor: discardedStaleEditor } : {}),
+      ...(discardedUnverifiedEditor
+        ? { discarded_unverified_editor_copy: discardedUnverifiedEditor }
+        : {}),
       ...(supersededTimelineData ? { superseded_timeline_data: supersededTimelineData } : {}),
       ...(uiRefreshError ? { ui_refresh_error: uiRefreshError } : {}),
       ...(warnings.length ? { warnings } : {}),

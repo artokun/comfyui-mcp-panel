@@ -156,6 +156,7 @@ import {
   classifyPromptRelayTimelineWrite,
   applyPromptRelayTimelineWrite,
   promptRelayDerivedRefusal,
+  recordPreLoadPromptRelayEditors,
 } from "./lib/prompt-relay-timeline.js";
 import {
   controlAfterGenerateModes,
@@ -1242,6 +1243,19 @@ function installCreateBoundaryFork(appRef) {
         }
       } catch {
         // Never let identity bookkeeping break a graph load.
+      }
+      // #506 — record what every PromptRelayEncodeTimeline editor holds RIGHT NOW, before the
+      // load replaces the graph. That node's editor is re-parsed from timeline_data ~10ms
+      // AFTER onConfigure restores the widgets, so for a moment it still holds the previous
+      // workflow's timeline. An editor that still matches this snapshot has not been re-parsed
+      // or typed into since the load — the only positive evidence that separates a stale
+      // leftover from an uncommitted edit, which are otherwise identical from the widgets alone
+      // and demand opposite disclosures. Taken here because this fork is the one place that
+      // observes a load BEFORE it happens.
+      try {
+        recordPreLoadPromptRelayEditors(appRef?.graph?._nodes ?? appRef?.graph?.nodes);
+      } catch {
+        // Never let disclosure bookkeeping break a graph load either.
       }
       return orig(graphData, clean, restoreView, workflow, options);
     };
