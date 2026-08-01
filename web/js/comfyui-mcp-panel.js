@@ -144,7 +144,12 @@ import {
   refreshNodeArea,
 } from "./lib/group-geometry.js";
 import { pickRevertSnapshot } from "./lib/graph-revert.js";
-import { saveActiveWorkflow, shouldGroundBeforeTurn, groundActiveWorkflow } from "./lib/workflow-save.js";
+import {
+  saveActiveWorkflow,
+  shouldGroundBeforeTurn,
+  groundActiveWorkflow,
+  describeSaveOutcome,
+} from "./lib/workflow-save.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
@@ -2496,12 +2501,54 @@ function autoWorkflowName() {
  *  fallback. */
 async function programmaticSave(name) {
   const svc = app?.extensionManager?.workflow;
+  // Report what the save actually DID (in-place / first-save / Save-As copy) instead
+  // of the old opaque {saved:true} — the silent, unrecoverable move is what made
+  // mcp#579 a data-loss footgun. saveActiveWorkflow itself NEVER moves a persisted
+  // source (it copies via the atomic overwrite:false trio and throws on a detected
+  // move); this only enriches the RESULT. The mode is taken from saveActiveWorkflow's
+  // AUTHORITATIVE `details` sink (the branch it actually took), NOT inferred from the
+  // mutable active workflow afterward — so a tab switch during the await can't fool it.
+  const details = {};
   const saved = await saveActiveWorkflow(svc, name, {
     autoWorkflowName,
     existsOnDisk: workflowExistsOnDisk,
     reconcileSavedCopy: reconcileSavedWorkflowCopy,
+    details,
   });
-  return saved || getWorkflowTitle();
+  const outcome = describeSaveOutcome(details);
+  // INDEPENDENT post-save verification (a second backstop, at the tool layer): for a
+  // Save-As COPY the REAL source file must still be on disk. Probe /userdata for the
+  // exact source path saveActiveWorkflow reported — if it is GONE, a move happened
+  // despite everything upstream: surface it as a hard error rather than a phantom
+  // success (mcp#579). This attests PATH PRESENCE (`original_on_disk`), not content
+  // identity — an honest, disk-checked fact, not an inferred "preserved" claim; a
+  // 404 is the actionable data-loss signal. An inconclusive probe ⇒ "unverified".
+  //
+  // EXTERNAL sources (absolute paths, #285) are NOT /userdata-addressable, so the HEAD
+  // would 404 for a perfectly-preserved external original. The external copy path never
+  // references the source file (it copies the live graph into the user dir), so the
+  // external original is intact — just unverifiable from here. Report "unverified" and
+  // NEVER throw a false data-loss error for it.
+  if (outcome.saved_as && details.sourcePath) {
+    if (details.sourceExternal) {
+      outcome.original_on_disk = "unverified";
+    } else {
+      let stillOnDisk = null;
+      try {
+        stillOnDisk = await workflowExistsOnDisk(details.sourcePath);
+      } catch {
+        stillOnDisk = null;
+      }
+      if (stillOnDisk === false) {
+        throw new Error(
+          `save-as of "${saved}" appears to have MOVED/destroyed the original "${outcome.copied_from ?? details.sourcePath}" ` +
+            `— it is no longer on disk. Aborting to surface data loss (issue #579).`,
+        );
+      }
+      outcome.original_on_disk = stillOnDisk === true ? true : "unverified";
+    }
+  }
+  return { name: saved || getWorkflowTitle(), ...outcome };
 }
 
 /** Authoritative read-back oracle for saveActiveWorkflow's post-write guards.
@@ -6140,14 +6187,16 @@ const GRAPH_TOOL_EXECUTORS = {
   async workflow_save({ name } = {}) {
     // Fully programmatic — no Save/Rename dialog. Auto-names a never-saved
     // workflow; saves in place otherwise.
-    const saved = await programmaticSave(name);
-    return { saved: true, workflow: saved };
+    const { name: workflow, ...outcome } = await programmaticSave(name);
+    // outcome surfaces WHAT happened (saved_as/copied_from/original_preserved or
+    // first_save) so a rename-vs-copy is never silent (mcp#579).
+    return { saved: true, workflow, ...outcome };
   },
 
   async workflow_save_as({ name }) {
     if (!name || typeof name !== "string") throw new Error("name (string) is required");
-    const saved = await programmaticSave(name);
-    return { saved: true, workflow: saved };
+    const { name: workflow, ...outcome } = await programmaticSave(name);
+    return { saved: true, workflow, ...outcome };
   },
 
   // --- Workflow tabs: new / list / open / switch / rename / close ----------

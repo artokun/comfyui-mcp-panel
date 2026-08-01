@@ -3,7 +3,8 @@ import test from 'node:test'
 
 import {
   isDefaultWorkflowName,
-  saveActiveWorkflow
+  saveActiveWorkflow,
+  describeSaveOutcome
 } from '../../web/js/lib/workflow-save.js'
 
 // A minimal ComfyUI workflow-service double that records what was called and
@@ -2050,4 +2051,165 @@ test('refuses to rename-destroy a persisted workflow when no copy API exists', a
   // Source untouched; nothing moved.
   assert.ok(svc.disk.has('workflows/Foo.json'))
   assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'))
+})
+
+// ---------------------------------------------------------------------------
+// EXACT-SCENARIO regressions for mcp#579 and panel#363 (reported on panel 0.11.6
+// against a ComfyUI 0.28.3 / frontend-1.47.x store). Both are reproduced through
+// the SAME saveActiveWorkflow path that panel_save_workflow → workflow_save_as →
+// programmaticSave invokes, on the 1.47 store double that mirrors that frontend.
+// They must NOT move/destroy the original and must NOT refuse a new-workflow save.
+
+test('mcp#579: Save-As of an open PERSISTED workflow COPIES — the original file survives, never moved (1.47)', async () => {
+  // The literal reported case: an on-disk "UGC - 01 …" workflow is open; the agent
+  // calls panel_save_workflow({name:"UGC - 06 …"}) intending a Save-As. The original
+  // must remain on disk (the ComfyUI log's `moving 'UGC - 01…' -> 'UGC - 06…'` must
+  // NOT happen), and a NEW file must be written with the real graph content.
+  const active = {
+    path: 'workflows/UGC - 01 Imagem para Video (TI2V-5B).json',
+    filename: 'UGC - 01 Imagem para Video (TI2V-5B).json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const { svc, existsOnDisk, graph } = makeStore147Service({ files: [active.path], active })
+  const originalContentBefore = svc.disk.get(active.path)
+
+  const details = {}
+  const saved = await saveActiveWorkflow(svc, 'UGC - 06 Cena 1 Leticia (TI2V-5B + Wav2Lip)', {
+    existsOnDisk,
+    details
+  })
+
+  // AUTHORITATIVE outcome the tool result is built from: a Save-As COPY of the real
+  // source, with the source path/name recorded for the caller's disk re-verification.
+  assert.equal(details.mode, 'save-as-copy', 'reported as a Save-As copy (not silent, not first-save)')
+  assert.equal(details.sourcePath, 'workflows/UGC - 01 Imagem para Video (TI2V-5B).json')
+  assert.deepEqual(describeSaveOutcome(details), {
+    saved_as: true,
+    copied_from: 'UGC - 01 Imagem para Video (TI2V-5B)'
+  })
+
+  // The ORIGINAL is untouched on disk — copy, not move (the #579 data-loss guard).
+  assert.ok(
+    svc.disk.has('workflows/UGC - 01 Imagem para Video (TI2V-5B).json'),
+    'ORIGINAL preserved on disk — not moved/renamed (mcp#579)'
+  )
+  assert.equal(
+    svc.disk.get('workflows/UGC - 01 Imagem para Video (TI2V-5B).json'),
+    originalContentBefore,
+    'original file content byte-identical (untouched)'
+  )
+  // The new file exists with the real graph.
+  assert.ok(
+    svc.disk.has('workflows/UGC - 06 Cena 1 Leticia (TI2V-5B + Wav2Lip).json'),
+    'new Save-As file created'
+  )
+  assert.deepEqual(
+    JSON.parse(svc.disk.get('workflows/UGC - 06 Cena 1 Leticia (TI2V-5B + Wav2Lip).json')),
+    graph,
+    'new file holds the real graph, not "null"'
+  )
+  // It took the move-free atomic copy path; the source was NEVER renamed/moved.
+  assert.ok(svc.calls.some((c) => c[0] === 'saveAs'), 'used the atomic low-level saveAs copy')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'source was NEVER renamed (no MOVE)')
+  assert.equal(saved, 'UGC - 06 Cena 1 Leticia (TI2V-5B + Wav2Lip)')
+})
+
+test('panel#363: naming a workflow created by panel_new_workflow (temp tab) SUCCEEDS as a first save (1.47)', async () => {
+  // panel_new_workflow opens a blank temporary tab (isTemporary=true, no on-disk
+  // file). Its path 404s on disk. panel_save_workflow({name}) must persist it as a
+  // NEW file — NOT refuse with the destructive-rename guard (the panel#363 bug).
+  const active = {
+    path: 'workflows/Unsaved Workflow.json',
+    filename: 'Unsaved Workflow.json',
+    directory: 'workflows',
+    isPersisted: false,
+    isTemporary: true
+  }
+  const { svc, existsOnDisk, graph } = makeStore147Service({ active }) // disk EMPTY ⇒ 404
+
+  const details = {}
+  const saved = await saveActiveWorkflow(svc, 'Video Face Detail - Second Stage', {
+    autoWorkflowName: () => 'Untitled',
+    existsOnDisk,
+    details
+  })
+
+  // Reported as a FIRST save (no prior file to preserve) — never a Save-As move.
+  assert.equal(details.mode, 'first-save', 'a never-persisted temp tab first-save (panel#363)')
+  assert.deepEqual(describeSaveOutcome(details), { first_save: true })
+  assert.ok(
+    svc.disk.has('workflows/Video Face Detail - Second Stage.json'),
+    'new-workflow tab was named + persisted (panel#363 no longer refuses)'
+  )
+  assert.deepEqual(
+    JSON.parse(svc.disk.get('workflows/Video Face Detail - Second Stage.json')),
+    graph,
+    'persisted content is the real graph, not "null"'
+  )
+  assert.ok(svc.calls.some((c) => c[0] === 'saveAs'), 'used the atomic low-level saveAs copy')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'no source file to move — never renamed')
+  assert.equal(saved, 'Video Face Detail - Second Stage')
+})
+
+// ---------------------------------------------------------------------------
+// describeSaveOutcome — the pure mapper from saveActiveWorkflow's AUTHORITATIVE
+// `details.mode` to the tool-result fields, so panel_save_workflow reports what a
+// save did (mcp#579's "at minimum (2)": a rename-vs-copy must never be silent).
+// It maps the DECIDED mode, never an after-the-fact guess from the mutable tab.
+
+test('describeSaveOutcome: save-as-copy mode ⇒ saved_as + copied_from, extension stripped (mcp#579)', () => {
+  const out = describeSaveOutcome({
+    mode: 'save-as-copy',
+    copiedFrom: 'UGC - 01 Imagem para Video (TI2V-5B).json'
+  })
+  assert.deepEqual(out, { saved_as: true, copied_from: 'UGC - 01 Imagem para Video (TI2V-5B)' })
+  // It does NOT assert original_on_disk — that is a disk fact the caller verifies.
+  assert.ok(!('original_on_disk' in out), 'preservation is disk-checked by the caller, not inferred')
+})
+
+test('describeSaveOutcome: first-save mode (temp/new_workflow) ⇒ first_save (panel#363)', () => {
+  assert.deepEqual(describeSaveOutcome({ mode: 'first-save' }), { first_save: true })
+})
+
+test('describeSaveOutcome: in-place mode ⇒ no special flags', () => {
+  assert.deepEqual(describeSaveOutcome({ mode: 'in-place', sourcePath: 'workflows/Foo.json' }), {})
+})
+
+test('describeSaveOutcome: absent/undefined mode ⇒ no special flags', () => {
+  assert.deepEqual(describeSaveOutcome({}), {})
+  assert.deepEqual(describeSaveOutcome(), {})
+})
+
+test('outcome: an EXTERNAL-path Save-As reports save-as-copy (NOT first-save), even though the source is non-persisted (mcp#579/#285)', async () => {
+  // Finding-2 guard: an externally-loaded file is isPersisted:false/isTemporary:true
+  // yet is a REAL existing file being COPIED into the user dir — it must report a
+  // Save-As copy, never a first-save (which would wrongly imply "nothing to preserve").
+  const active = {
+    path: 'C:/packs/qwen/Product Label Repair.json',
+    filename: 'Product Label Repair.json',
+    directory: 'C:/packs/qwen',
+    isPersisted: false,
+    isTemporary: true,
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ files: [active.path], active })
+
+  const details = {}
+  await saveActiveWorkflow(svc, 'Product Label Repair - Qwen Edit Q5', {
+    autoWorkflowName: () => 'Untitled',
+    existsOnDisk,
+    details,
+  })
+
+  assert.equal(details.mode, 'save-as-copy', 'external real file copied ⇒ save-as-copy, not first-save')
+  assert.equal(details.sourcePath, 'C:/packs/qwen/Product Label Repair.json', 'source path recorded for re-verification')
+  // sourceExternal must be flagged so the panel-level post-save HEAD is SKIPPED — a
+  // /userdata HEAD 404s on an absolute path and would else throw a false data-loss
+  // error for a perfectly-preserved external original (codex round-2 P1).
+  assert.equal(details.sourceExternal, true, 'external source flagged so the /userdata HEAD is not misread as a move')
+  assert.deepEqual(describeSaveOutcome(details), {
+    saved_as: true,
+    copied_from: 'Product Label Repair'
+  })
 })

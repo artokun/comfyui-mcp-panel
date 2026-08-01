@@ -54,6 +54,49 @@ export function needsGrounding(wf) {
   return !!wf && (wf.isPersisted === false || wf.isTemporary === true);
 }
 
+/** Map the AUTHORITATIVE save outcome that `saveActiveWorkflow` reports (via its
+ *  optional `details` sink) into the tool-result fields, so `panel_save_workflow`
+ *  no longer returns the opaque `{saved:true}` (mcp#579's "at minimum (2)": a
+ *  silent rename-vs-copy is what made the bug unrecoverable). This is a PURE
+ *  mapper over the mode saveActiveWorkflow DECIDED — NOT an after-the-fact guess
+ *  from the (mutable, race-prone) active workflow — so it can never be fooled by
+ *  a tab switch during the save await.
+ *
+ *  `details.mode`:
+ *   - "save-as-copy" → a NEW file was written from a REAL existing source (an
+ *     already-persisted workflow OR an externally-loaded file, #285) which stays
+ *     put ⇒ `{ saved_as: true, copied_from }`. The caller then disk-verifies the
+ *     source path and stamps `original_on_disk` (a disk claim must be disk-checked).
+ *   - "first-save"   → a never-persisted temp / new_workflow tab got its first real
+ *     name+file; there is no prior file to preserve (panel#363) ⇒ `{ first_save: true }`.
+ *   - "in-place" / anything else → same-path overwrite or no-name grounding ⇒ `{}`. */
+export function describeSaveOutcome(details = {}) {
+  const mode = details?.mode;
+  if (mode === "save-as-copy") {
+    return { saved_as: true, copied_from: baseName(details.copiedFrom) || null };
+  }
+  if (mode === "first-save") {
+    return { first_save: true };
+  }
+  return {};
+}
+
+/** Record the authoritative outcome into an optional `details` sink (a plain object
+ *  the caller passes to saveActiveWorkflow). No-op when absent, so behaviour and the
+ *  return value are unchanged for every existing caller/test. */
+function recordOutcome(details, mode, { sourcePath, targetPath: tPath, copiedFrom, sourceExternal } = {}) {
+  if (!details || typeof details !== "object") return;
+  details.mode = mode;
+  if (sourcePath !== undefined) details.sourcePath = sourcePath;
+  if (tPath !== undefined) details.targetPath = tPath;
+  if (copiedFrom !== undefined) details.copiedFrom = copiedFrom;
+  // `sourceExternal` marks a source path OUTSIDE the managed workflows dir (an
+  // absolute path, #285). The /userdata HEAD oracle cannot address such a path, so a
+  // caller must NOT read its 404 as data loss — the external copy path never touches
+  // the source file, so the external original is intact but simply unverifiable here.
+  if (sourceExternal !== undefined) details.sourceExternal = sourceExternal;
+}
+
 /** #330 — decide whether to ground (auto-save) the active workflow BEFORE an agent
  *  turn. Grounding must run on EVERY turn that targets an unsaved tab, not only a
  *  brand-new chat: continuing an existing chat inside an unsaved tab still leaves
@@ -181,7 +224,7 @@ export async function groundActiveWorkflow(svc, opts = {}) {
 export async function saveActiveWorkflow(
   svc,
   name,
-  { autoWorkflowName, existsOnDisk, reconcileSavedCopy, expect } = {},
+  { autoWorkflowName, existsOnDisk, reconcileSavedCopy, expect, details } = {},
 ) {
   const wf = svc?.activeWorkflow;
   if (!wf) throw new Error("no active workflow to save");
@@ -303,6 +346,15 @@ export async function saveActiveWorkflow(
         );
       }
       assertExpect(); // #330: still the workflow we probed?
+      // An external source is a REAL existing file (absolute path) copied into the
+      // user dir — Save-As COPY semantics, never a first-save (#285). Record it as
+      // such so the tool result reports the copy (fixes a first_save mislabel).
+      recordOutcome(details, "save-as-copy", {
+        sourcePath,
+        targetPath: finalTargetPath,
+        copiedFrom: currentName,
+        sourceExternal: true, // absolute external path — not /userdata-verifiable
+      });
       return await withConflictRollback(svc, wf, effectiveName, finalTargetPath, () =>
         copyToUserDir(wf, effectiveName, finalTargetPath),
       );
@@ -348,6 +400,16 @@ export async function saveActiveWorkflow(
     const atomicCopy = resolveSaveAsCopy(svc, { reconcileSavedCopy });
     if (atomicCopy) {
       assertExpect(); // #330: still the workflow we probed?
+      // Authoritative outcome: a "never-persisted" source (a temp / new_workflow tab
+      // with no backing file) is a FIRST SAVE (panel#363 — no original to preserve);
+      // a "persisted" source is a Save-As COPY of a real file that stays put (#579).
+      // (cls is only ever "persisted" or "never-persisted" here — the #226 guard above
+      // has already thrown for a temporary source that isn't provably never-persisted.)
+      recordOutcome(details, cls === "never-persisted" ? "first-save" : "save-as-copy", {
+        sourcePath,
+        targetPath: finalTargetPath,
+        copiedFrom: cls === "never-persisted" ? undefined : currentName,
+      });
       const activeName = await withConflictRollback(svc, wf, effectiveName, finalTargetPath, () =>
         atomicCopy(wf, effectiveName, finalTargetPath),
       );
@@ -383,6 +445,7 @@ export async function saveActiveWorkflow(
   // No relocation — the target path equals the current on-disk path. Overwriting
   // the same file in place is safe (no move can occur).
   assertExpect(); // #330: never in-place-overwrite a workflow the user switched to
+  recordOutcome(details, "in-place", { sourcePath: currentPath, targetPath: finalTargetPath });
   await saveInPlace(svc, wf);
   return desired || currentName || null;
 }
