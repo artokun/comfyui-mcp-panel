@@ -91,6 +91,25 @@ export async function retryDuringReconnect(
   throw lastErr;
 }
 
+// #379 — softReload() drops the bridge (client.stop) BEFORE the /reload POST so
+// the old orchestrator can free the port, then OWNS the respawn (client.start →
+// onAck resumes the conversation). But this published pack's /reload route is a
+// by-design 503 (the orchestrator runs out-of-band and never stops), so the POST
+// is ALWAYS refused — and the old code `return`ed on that path with the bridge
+// still stopped, wedging the panel "connected chip / dead bridge" with no
+// auto-recovery, every time. This decides the recovery from the POST outcome:
+//   - reconnect is ALWAYS true — the dropped bridge must be restored on every
+//     path (accepted → the fresh orchestrator binds; refused/unreachable → the
+//     orchestrator never stopped, so reconnecting restores the live bridge).
+//   - keepResumeInterlock (SOFT_RELOAD_KEY + soft-reload guard) is kept ONLY for
+//     an accepted respawn we own; a refused reload has no respawn to interlock,
+//     so it is cleared and the normal reconnect + hello.resume restores the
+//     session against the still-running orchestrator.
+export function planSoftReloadRecovery({ ok = false, reachable = true } = {}) {
+  const accepted = Boolean(reachable && ok);
+  return { accepted, reconnect: true, keepResumeInterlock: accepted };
+}
+
 // #207 / #334 — Stable identity for a workflow tab record. A load that replaces
 // the active canvas can flip the tab id (tmp: → wf:) or re-add the same file, so
 // dedupe on the rename-stable identity. Strip the tmp:/wf: scheme prefix so the

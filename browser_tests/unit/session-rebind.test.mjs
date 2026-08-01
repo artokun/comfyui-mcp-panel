@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import {
   shouldResumeAfterComfyReconnect,
   shouldRehelloAfterCommand,
+  planSoftReloadRecovery,
   isTransientReconnectError,
   retryDuringReconnect,
   workflowTabKey,
@@ -253,4 +254,42 @@ test("#296: comfyui_path is omitted (never blank) when unknown", () => {
 test("#296: resume rides the hello only when present", () => {
   assert.equal("resume" in buildHelloPayload({ tabId: "t" }), false);
   assert.equal(buildHelloPayload({ tabId: "t", resume: "sess-1" }).resume, "sess-1");
+});
+
+// ---- #379 soft-reload recovery: never leave the bridge dead -----------------
+
+test("#379: a REFUSED reload (by-design 503) still reconnects, dropping the interlock", () => {
+  // This pack's /reload returns { ok:false } — the orchestrator never stops.
+  const plan = planSoftReloadRecovery({ ok: false, reachable: true });
+  assert.equal(plan.accepted, false);
+  assert.equal(plan.reconnect, true); // bridge MUST be restored — no wedge
+  assert.equal(plan.keepResumeInterlock, false); // no respawn to interlock
+});
+
+test("#379: an unreachable reload POST still reconnects the dropped bridge", () => {
+  const plan = planSoftReloadRecovery({ ok: true, reachable: false });
+  assert.equal(plan.accepted, false);
+  assert.equal(plan.reconnect, true);
+  assert.equal(plan.keepResumeInterlock, false);
+});
+
+test("#379: an ACCEPTED reload keeps the resume interlock and reconnects", () => {
+  // A pack that DOES own the orchestrator: reload accepted → keep SOFT_RELOAD_KEY
+  // + guard so the fresh orchestrator binds and onAck resumes the conversation.
+  const plan = planSoftReloadRecovery({ ok: true, reachable: true });
+  assert.equal(plan.accepted, true);
+  assert.equal(plan.reconnect, true);
+  assert.equal(plan.keepResumeInterlock, true);
+});
+
+test("#379: reconnect is unconditional across every outcome (no dead-bridge path)", () => {
+  for (const ok of [true, false]) {
+    for (const reachable of [true, false]) {
+      assert.equal(planSoftReloadRecovery({ ok, reachable }).reconnect, true);
+    }
+  }
+  // Defaults are the safe path: refused + reconnect.
+  const d = planSoftReloadRecovery();
+  assert.equal(d.reconnect, true);
+  assert.equal(d.keepResumeInterlock, false);
 });
