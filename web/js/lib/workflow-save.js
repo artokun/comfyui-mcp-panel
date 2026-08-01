@@ -54,6 +54,86 @@ export function needsGrounding(wf) {
   return !!wf && (wf.isPersisted === false || wf.isTemporary === true);
 }
 
+/** Map the AUTHORITATIVE save outcome that `saveActiveWorkflow` reports (via its
+ *  optional `details` sink) into the tool-result fields, so `panel_save_workflow`
+ *  no longer returns the opaque `{saved:true}` (mcp#579's "at minimum (2)": a
+ *  silent rename-vs-copy is what made the bug unrecoverable). This is a PURE
+ *  mapper over the mode saveActiveWorkflow DECIDED — NOT an after-the-fact guess
+ *  from the (mutable, race-prone) active workflow — so it can never be fooled by
+ *  a tab switch during the save await.
+ *
+ *  `details.mode`:
+ *   - "save-as-copy" → a NEW file was written from a REAL existing source (an
+ *     already-persisted workflow OR an externally-loaded file, #285) which stays
+ *     put ⇒ `{ saved_as: true, copied_from }`. The caller then disk-verifies the
+ *     source path and stamps `original_on_disk` (a disk claim must be disk-checked).
+ *   - "first-save"   → a never-persisted temp / new_workflow tab got its first real
+ *     name+file; there is no prior file to preserve (panel#363) ⇒ `{ first_save: true }`.
+ *   - "in-place" / anything else → same-path overwrite or no-name grounding ⇒ `{}`. */
+export function describeSaveOutcome(details = {}) {
+  const mode = details?.mode;
+  if (mode === "save-as-copy") {
+    return { saved_as: true, copied_from: baseName(details.copiedFrom) || null };
+  }
+  if (mode === "first-save") {
+    return { first_save: true };
+  }
+  return {};
+}
+
+/** Decide what to report about a Save-As COPY's ORIGINAL source file from two disk
+ *  probes, and — critically — WHEN a missing source is a genuine data-loss event vs
+ *  a benign "never existed / can't tell". Pure + total, so the panel's throw decision
+ *  is unit-testable and can never fire on a transient/indeterminate classification.
+ *
+ *  A data-loss THROW ("lost") requires POSITIVE prior evidence the source existed —
+ *  a CONFIRMED pre-save 200 (`preExisted === true`) that is now a CONFIRMED 404
+ *  (`postExists === false`). Every weaker combination degrades to "unverified":
+ *   - `preExisted` unknown/false (the source was never proven present — e.g. a
+ *     non-temporary yet never-persisted tab whose classification was `unknown`, or a
+ *     phantom "workflows/Unsaved Workflow.json" that 404s simply because it never
+ *     existed) ⇒ NEVER throw, even if postExists is false;
+ *   - `postExists` true ⇒ "present";
+ *   - anything else (post probe inconclusive) ⇒ "unverified".
+ *  This closes a false data-loss throw on a legitimate first save and avoids blaming
+ *  this Save-As for an unrelated deletion we cannot attribute to it. */
+export function classifyOriginalOnDisk({ preExisted, postExists } = {}) {
+  if (preExisted === true && postExists === false) return "lost";
+  if (postExists === true) return "present";
+  return "unverified";
+}
+
+/** Map a /userdata HEAD status to the tri-state existence oracle used everywhere a
+ *  save decision is made. Deliberately STRICT: ONLY `200` is positive proof a file is
+ *  present; `404` is proof of absence; ANY other status — including a non-200 2xx a
+ *  proxy/intermediary might return (204/206/…), a redirect, or a 5xx — is INDETERMINATE
+ *  (null), never "present". A loose `res.ok` (200–299) mapping let a 2xx-non-200
+ *  pre-save probe count as a confirmed 200, which — paired with a real 404 later —
+ *  produced a FALSE "lost" data-loss verdict. Both the pre- and post-save existence
+ *  probes flow through this, so the "confirmed 200" the data-loss gate requires is a
+ *  true 200. */
+export function diskExistenceFromStatus(status) {
+  if (status === 200) return true;
+  if (status === 404) return false;
+  return null;
+}
+
+/** Record the authoritative outcome into an optional `details` sink (a plain object
+ *  the caller passes to saveActiveWorkflow). No-op when absent, so behaviour and the
+ *  return value are unchanged for every existing caller/test. */
+function recordOutcome(details, mode, { sourcePath, targetPath: tPath, copiedFrom, sourceExternal } = {}) {
+  if (!details || typeof details !== "object") return;
+  details.mode = mode;
+  if (sourcePath !== undefined) details.sourcePath = sourcePath;
+  if (tPath !== undefined) details.targetPath = tPath;
+  if (copiedFrom !== undefined) details.copiedFrom = copiedFrom;
+  // `sourceExternal` marks a source path OUTSIDE the managed workflows dir (an
+  // absolute path, #285). The /userdata HEAD oracle cannot address such a path, so a
+  // caller must NOT read its 404 as data loss — the external copy path never touches
+  // the source file, so the external original is intact but simply unverifiable here.
+  if (sourceExternal !== undefined) details.sourceExternal = sourceExternal;
+}
+
 /** #330 — decide whether to ground (auto-save) the active workflow BEFORE an agent
  *  turn. Grounding must run on EVERY turn that targets an unsaved tab, not only a
  *  brand-new chat: continuing an existing chat inside an unsaved tab still leaves
@@ -181,22 +261,22 @@ export async function groundActiveWorkflow(svc, opts = {}) {
 export async function saveActiveWorkflow(
   svc,
   name,
-  { autoWorkflowName, existsOnDisk, reconcileSavedCopy, expect } = {},
+  { autoWorkflowName, existsOnDisk, reconcileSavedCopy, expect, details } = {},
 ) {
   const wf = svc?.activeWorkflow;
   if (!wf) throw new Error("no active workflow to save");
 
-  // #330 TOCTOU guard: a grounding caller passes `expect` — the exact workflow it
-  // probed on disk before this save. If the active workflow changed in between (the
-  // user switched tabs during the async /userdata HEAD), we'd authorize on workflow
-  // A but write to workflow B — an overwrite of a DIFFERENT, possibly persisted file.
-  // REFUSE instead. Re-checked again immediately before every write (assertExpect),
-  // since the classify/collision probes below also await. `expect` is undefined for
-  // ordinary (explicit) saves, so their behaviour is unchanged.
+  // #330 TOCTOU guard: a caller passes `expect` — the exact workflow it snapshotted
+  // BEFORE any async work (a grounding disk probe, or the tool layer's pre-save HEAD).
+  // If the active workflow changed in between (the user switched tabs during that async
+  // gap), we'd authorize on workflow A but write to workflow B — an overwrite of a
+  // DIFFERENT, possibly persisted file. REFUSE instead. Re-checked immediately before
+  // every write (assertExpect), since the classify/collision probes below also await.
+  // `expect` is undefined only when a caller opts out, leaving behaviour unchanged.
   const assertExpect = () => {
     if (expect !== undefined && svc?.activeWorkflow !== expect) {
       throw new Error(
-        "active workflow changed during grounding — refusing to save the wrong workflow (issue #330)",
+        "active workflow changed during save — refusing to save the wrong workflow (issue #330)",
       );
     }
   };
@@ -303,6 +383,15 @@ export async function saveActiveWorkflow(
         );
       }
       assertExpect(); // #330: still the workflow we probed?
+      // An external source is a REAL existing file (absolute path) copied into the
+      // user dir — Save-As COPY semantics, never a first-save (#285). Record it as
+      // such so the tool result reports the copy (fixes a first_save mislabel).
+      recordOutcome(details, "save-as-copy", {
+        sourcePath,
+        targetPath: finalTargetPath,
+        copiedFrom: currentName,
+        sourceExternal: true, // absolute external path — not /userdata-verifiable
+      });
       return await withConflictRollback(svc, wf, effectiveName, finalTargetPath, () =>
         copyToUserDir(wf, effectiveName, finalTargetPath),
       );
@@ -348,16 +437,42 @@ export async function saveActiveWorkflow(
     const atomicCopy = resolveSaveAsCopy(svc, { reconcileSavedCopy });
     if (atomicCopy) {
       assertExpect(); // #330: still the workflow we probed?
+      // Authoritative outcome: a "never-persisted" source (a temp / new_workflow tab
+      // with no backing file) is a FIRST SAVE (panel#363 — no original to preserve);
+      // a "persisted" source is a Save-As COPY of a real file that stays put (#579).
+      // (cls is only ever "persisted" or "never-persisted" here — the #226 guard above
+      // has already thrown for a temporary source that isn't provably never-persisted.)
+      recordOutcome(details, cls === "never-persisted" ? "first-save" : "save-as-copy", {
+        sourcePath,
+        targetPath: finalTargetPath,
+        copiedFrom: cls === "never-persisted" ? undefined : currentName,
+      });
+      // Capture POSITIVE pre-copy DISK evidence of the source, so the post-copy
+      // backstop can only fire on a CONFIRMED 200 → 404 (a genuine move). An in-memory
+      // getWorkflowByPath()==null is NOT proof of on-disk loss (it can be transiently
+      // stale after the copy activates), so the old in-memory backstop could throw
+      // "save moved the original" on a file that is still on disk. Gate on disk only.
+      const sourceNorm = normalizePath(sourcePath);
+      const sourceOnDiskBefore = await probeSourceOnDisk(existsOnDisk, sourceNorm);
+      assertExpect(); // #330: the extra pre-copy probe must not open a switch window
       const activeName = await withConflictRollback(svc, wf, effectiveName, finalTargetPath, () =>
         atomicCopy(wf, effectiveName, finalTargetPath),
       );
-      // BACKSTOP: if the copy somehow relocated a persisted source, fail LOUDLY
-      // rather than report a phantom success (#226).
-      if (cls === "persisted" && confirmedAbsentAt(svc, sourcePath)) {
-        throw new Error(
-          `save moved the original workflow "${sourcePath}" instead of copying it — ` +
-            `the source no longer exists on disk (issue #226)`,
-        );
+      // BACKSTOP: fail LOUDLY only if the copy actually REMOVED a source we CONFIRMED
+      // (disk 200) was present and is now CONFIRMED absent (disk 404) — classifyOriginalOnDisk
+      // "lost". Every indeterminate case (no oracle / unknown pre or post / in-memory-only
+      // signal) is a NO-OP, never a false "moved" (#226).
+      if (cls === "persisted") {
+        const sourceOnDiskAfter = await probeSourceOnDisk(existsOnDisk, sourceNorm);
+        if (
+          classifyOriginalOnDisk({ preExisted: sourceOnDiskBefore, postExists: sourceOnDiskAfter }) ===
+          "lost"
+        ) {
+          throw new Error(
+            `save moved the original workflow "${sourcePath}" instead of copying it — ` +
+              `the source no longer exists on disk (issue #226)`,
+          );
+        }
       }
       return activeName;
     }
@@ -383,23 +498,24 @@ export async function saveActiveWorkflow(
   // No relocation — the target path equals the current on-disk path. Overwriting
   // the same file in place is safe (no move can occur).
   assertExpect(); // #330: never in-place-overwrite a workflow the user switched to
+  recordOutcome(details, "in-place", { sourcePath: currentPath, targetPath: finalTargetPath });
   await saveInPlace(svc, wf);
   return desired || currentName || null;
 }
 
-/** Tri-state existence probe for the post-save backstop, mirroring classifySource:
- *  returns true ONLY when the oracle SUCCESSFULLY confirms nothing is at `rawPath`
- *  (getWorkflowByPath returns null/undefined). A getter THROW or the absence of a
- *  usable oracle is UNKNOWN → false (do not alarm) — so a valid save-as copy is
- *  never misreported as a destructive move (#226). A list-miss is likewise not
- *  proof of absence, so lists never trigger the alarm. */
-function confirmedAbsentAt(svc, rawPath) {
-  if (!rawPath) return false;
-  if (typeof svc?.getWorkflowByPath !== "function") return false;
+/** Authoritative tri-state DISK probe for the post-save backstop — the ONLY evidence
+ *  trusted to declare a source moved. Returns `true` (confirmed present), `false`
+ *  (confirmed absent), or `null` (no oracle / probe threw / inconclusive). Deliberately
+ *  NOT backed by the in-memory `getWorkflowByPath`: an in-memory absence is not proof of
+ *  on-disk loss (it drifts stale after the copy activates), and treating it as proof
+ *  produced a false "save moved the original" on a file still on disk (#226). */
+async function probeSourceOnDisk(existsOnDisk, normPath) {
+  if (typeof existsOnDisk !== "function" || !normPath) return null;
   try {
-    return svc.getWorkflowByPath(rawPath) == null;
+    const r = await existsOnDisk(normPath);
+    return r === true ? true : r === false ? false : null;
   } catch {
-    return false; // oracle threw ⇒ unknown ⇒ never alarm
+    return null; // probe threw ⇒ unknown ⇒ never alarm
   }
 }
 
@@ -693,17 +809,27 @@ async function classifySource(svc, wf, rawPath, existsOnDisk) {
  *  can write to. Store paths are always relative under it ("workflows/…"). */
 const WORKFLOWS_ROOT = "workflows";
 
-/** True when `path` is an ABSOLUTE filesystem path — a Windows drive ("C:\\", "C:/"),
- *  a UNC share ("\\\\server"), or a POSIX absolute ("/…"). Such a path is a workflow
- *  loaded from OUTSIDE the managed workflows dir (panel_load_workflow path:<file>);
- *  it can never be a /userdata store path, so a Save-As of it must copy into the
- *  user workflows dir rather than the unwritable external directory (#285). Only
- *  absolute paths qualify — a relative "workflows/…" store path is never external,
- *  so the everyday save path is untouched. */
+/** True when `path` is an ABSOLUTE or ROOT-RELATIVE filesystem path — a Windows drive
+ *  ("C:\\", "C:/"), a UNC share ("\\\\server"), a POSIX absolute ("/…"), OR a Windows
+ *  root-relative path with a single leading separator ("\packs\…" / "/packs/…", which
+ *  resolves against the current drive root). Such a path is a workflow loaded from
+ *  OUTSIDE the managed workflows dir (panel_load_workflow path:<file>); it can never be
+ *  a /userdata store path (those are relative "workflows/…"), so a Save-As of it must
+ *  copy into the user workflows dir rather than the unwritable external directory
+ *  (#285). A single leading "\" was previously MISSED, so an external file at
+ *  "\packs\Foo.json" was mis-classified as a managed never-persisted tab and reported
+ *  as a first save (hiding that a real external source was copied). A managed store
+ *  path never begins with a separator, so this never touches the everyday save path. */
 function isExternalWorkflowPath(path) {
   const raw = String(path || "");
   if (!raw) return false;
-  return /^[a-zA-Z]:[\\/]/.test(raw) || /^[\\/]{2}/.test(raw) || /^\//.test(raw);
+  // A leading "\" or "/" (single, double/UNC, or POSIX absolute) is external/root-
+  // relative; ANY "<letter>:" drive prefix is external — INCLUDING drive-relative
+  // "C:Foo.json" (no following separator), which resolves against the drive's current
+  // directory and is still outside the managed /userdata store. A managed store path is
+  // always relative "workflows/…" (no drive letter, no leading separator), so this
+  // never touches the everyday save path.
+  return /^[a-zA-Z]:/.test(raw) || /^[\\/]/.test(raw);
 }
 
 /** Directory prefix (with trailing slash) that a new sibling file should live in,
@@ -719,7 +845,7 @@ function directoryOf(wf) {
 /** Normalize a workflow path for a stable same-file comparison: forward slashes,
  *  no doubled/trailing separators. Case is preserved (a case-only difference is
  *  treated as a Save-As, which is the safe direction — it copies). */
-function normalizePath(path) {
+export function normalizePath(path) {
   return String(path || "")
     .replaceAll("\\", "/")
     .replace(/\/{2,}/g, "/")

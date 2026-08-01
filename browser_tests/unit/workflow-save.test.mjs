@@ -3,7 +3,10 @@ import test from 'node:test'
 
 import {
   isDefaultWorkflowName,
-  saveActiveWorkflow
+  saveActiveWorkflow,
+  describeSaveOutcome,
+  classifyOriginalOnDisk,
+  diskExistenceFromStatus
 } from '../../web/js/lib/workflow-save.js'
 
 // A minimal ComfyUI workflow-service double that records what was called and
@@ -435,7 +438,10 @@ test('item 2: a genuine NEW workflow with NO path grounds/saves (never refused) 
 test('disk-existence backstop catches a low-level copy that moves a persisted source (#226)', async () => {
   // Rogue frontend: the low-level saveAs ALSO deletes the source (a move). The pre-
   // check can't foresee this, so the post-op disk-existence backstop must catch the
-  // vanished source and throw rather than report success.
+  // vanished source and throw rather than report success. The backstop is now gated on
+  // CONFIRMED disk evidence (200 before -> 404 after), so the test supplies a disk
+  // oracle backed by svc.disk (an in-memory-only signal must NOT trip it — see the
+  // dedicated no-false-throw test below).
   const active = {
     path: 'workflows/zz226b-orig.json',
     filename: 'zz226b-orig.json',
@@ -444,6 +450,7 @@ test('disk-existence backstop catches a low-level copy that moves a persisted so
     isTemporary: false
   }
   const svc = makeFaithfulService({ files: [active.path], active })
+  const existsOnDisk = async (p) => svc.disk.has(p) // 200 while on disk, 404 once deleted
   const origSaveAs = svc.saveAs
   svc.saveAs = (wf, path) => {
     svc.disk.delete(wf.path) // ROGUE: consumes (moves) the source
@@ -451,7 +458,7 @@ test('disk-existence backstop catches a low-level copy that moves a persisted so
   }
 
   await assert.rejects(
-    () => saveActiveWorkflow(svc, 'zz226b-copy', {}),
+    () => saveActiveWorkflow(svc, 'zz226b-copy', { existsOnDisk }),
     /moved the original workflow .* instead of copying it/
   )
 })
@@ -2050,4 +2057,298 @@ test('refuses to rename-destroy a persisted workflow when no copy API exists', a
   // Source untouched; nothing moved.
   assert.ok(svc.disk.has('workflows/Foo.json'))
   assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'))
+})
+
+// ---------------------------------------------------------------------------
+// EXACT-SCENARIO regressions for mcp#579 and panel#363 (reported on panel 0.11.6
+// against a ComfyUI 0.28.3 / frontend-1.47.x store). Both are reproduced through
+// the SAME saveActiveWorkflow path that panel_save_workflow → workflow_save_as →
+// programmaticSave invokes, on the 1.47 store double that mirrors that frontend.
+// They must NOT move/destroy the original and must NOT refuse a new-workflow save.
+
+test('mcp#579: Save-As of an open PERSISTED workflow COPIES — the original file survives, never moved (1.47)', async () => {
+  // The literal reported case: an on-disk "UGC - 01 …" workflow is open; the agent
+  // calls panel_save_workflow({name:"UGC - 06 …"}) intending a Save-As. The original
+  // must remain on disk (the ComfyUI log's `moving 'UGC - 01…' -> 'UGC - 06…'` must
+  // NOT happen), and a NEW file must be written with the real graph content.
+  const active = {
+    path: 'workflows/UGC - 01 Imagem para Video (TI2V-5B).json',
+    filename: 'UGC - 01 Imagem para Video (TI2V-5B).json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const { svc, existsOnDisk, graph } = makeStore147Service({ files: [active.path], active })
+  const originalContentBefore = svc.disk.get(active.path)
+
+  const details = {}
+  const saved = await saveActiveWorkflow(svc, 'UGC - 06 Cena 1 Leticia (TI2V-5B + Wav2Lip)', {
+    existsOnDisk,
+    details
+  })
+
+  // AUTHORITATIVE outcome the tool result is built from: a Save-As COPY of the real
+  // source, with the source path/name recorded for the caller's disk re-verification.
+  assert.equal(details.mode, 'save-as-copy', 'reported as a Save-As copy (not silent, not first-save)')
+  assert.equal(details.sourcePath, 'workflows/UGC - 01 Imagem para Video (TI2V-5B).json')
+  assert.deepEqual(describeSaveOutcome(details), {
+    saved_as: true,
+    copied_from: 'UGC - 01 Imagem para Video (TI2V-5B)'
+  })
+
+  // The ORIGINAL is untouched on disk — copy, not move (the #579 data-loss guard).
+  assert.ok(
+    svc.disk.has('workflows/UGC - 01 Imagem para Video (TI2V-5B).json'),
+    'ORIGINAL preserved on disk — not moved/renamed (mcp#579)'
+  )
+  assert.equal(
+    svc.disk.get('workflows/UGC - 01 Imagem para Video (TI2V-5B).json'),
+    originalContentBefore,
+    'original file content byte-identical (untouched)'
+  )
+  // The new file exists with the real graph.
+  assert.ok(
+    svc.disk.has('workflows/UGC - 06 Cena 1 Leticia (TI2V-5B + Wav2Lip).json'),
+    'new Save-As file created'
+  )
+  assert.deepEqual(
+    JSON.parse(svc.disk.get('workflows/UGC - 06 Cena 1 Leticia (TI2V-5B + Wav2Lip).json')),
+    graph,
+    'new file holds the real graph, not "null"'
+  )
+  // It took the move-free atomic copy path; the source was NEVER renamed/moved.
+  assert.ok(svc.calls.some((c) => c[0] === 'saveAs'), 'used the atomic low-level saveAs copy')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'source was NEVER renamed (no MOVE)')
+  assert.equal(saved, 'UGC - 06 Cena 1 Leticia (TI2V-5B + Wav2Lip)')
+})
+
+test('panel#363: naming a workflow created by panel_new_workflow (temp tab) SUCCEEDS as a first save (1.47)', async () => {
+  // panel_new_workflow opens a blank temporary tab (isTemporary=true, no on-disk
+  // file). Its path 404s on disk. panel_save_workflow({name}) must persist it as a
+  // NEW file — NOT refuse with the destructive-rename guard (the panel#363 bug).
+  const active = {
+    path: 'workflows/Unsaved Workflow.json',
+    filename: 'Unsaved Workflow.json',
+    directory: 'workflows',
+    isPersisted: false,
+    isTemporary: true
+  }
+  const { svc, existsOnDisk, graph } = makeStore147Service({ active }) // disk EMPTY ⇒ 404
+
+  const details = {}
+  const saved = await saveActiveWorkflow(svc, 'Video Face Detail - Second Stage', {
+    autoWorkflowName: () => 'Untitled',
+    existsOnDisk,
+    details
+  })
+
+  // Reported as a FIRST save (no prior file to preserve) — never a Save-As move.
+  assert.equal(details.mode, 'first-save', 'a never-persisted temp tab first-save (panel#363)')
+  assert.deepEqual(describeSaveOutcome(details), { first_save: true })
+  assert.ok(
+    svc.disk.has('workflows/Video Face Detail - Second Stage.json'),
+    'new-workflow tab was named + persisted (panel#363 no longer refuses)'
+  )
+  assert.deepEqual(
+    JSON.parse(svc.disk.get('workflows/Video Face Detail - Second Stage.json')),
+    graph,
+    'persisted content is the real graph, not "null"'
+  )
+  assert.ok(svc.calls.some((c) => c[0] === 'saveAs'), 'used the atomic low-level saveAs copy')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'no source file to move — never renamed')
+  assert.equal(saved, 'Video Face Detail - Second Stage')
+})
+
+// ---------------------------------------------------------------------------
+// describeSaveOutcome — the pure mapper from saveActiveWorkflow's AUTHORITATIVE
+// `details.mode` to the tool-result fields, so panel_save_workflow reports what a
+// save did (mcp#579's "at minimum (2)": a rename-vs-copy must never be silent).
+// It maps the DECIDED mode, never an after-the-fact guess from the mutable tab.
+
+test('describeSaveOutcome: save-as-copy mode ⇒ saved_as + copied_from, extension stripped (mcp#579)', () => {
+  const out = describeSaveOutcome({
+    mode: 'save-as-copy',
+    copiedFrom: 'UGC - 01 Imagem para Video (TI2V-5B).json'
+  })
+  assert.deepEqual(out, { saved_as: true, copied_from: 'UGC - 01 Imagem para Video (TI2V-5B)' })
+  // It does NOT assert original_on_disk — that is a disk fact the caller verifies.
+  assert.ok(!('original_on_disk' in out), 'preservation is disk-checked by the caller, not inferred')
+})
+
+test('describeSaveOutcome: first-save mode (temp/new_workflow) ⇒ first_save (panel#363)', () => {
+  assert.deepEqual(describeSaveOutcome({ mode: 'first-save' }), { first_save: true })
+})
+
+test('describeSaveOutcome: in-place mode ⇒ no special flags', () => {
+  assert.deepEqual(describeSaveOutcome({ mode: 'in-place', sourcePath: 'workflows/Foo.json' }), {})
+})
+
+test('describeSaveOutcome: absent/undefined mode ⇒ no special flags', () => {
+  assert.deepEqual(describeSaveOutcome({}), {})
+  assert.deepEqual(describeSaveOutcome(), {})
+})
+
+test('outcome: an EXTERNAL-path Save-As reports save-as-copy (NOT first-save), even though the source is non-persisted (mcp#579/#285)', async () => {
+  // Finding-2 guard: an externally-loaded file is isPersisted:false/isTemporary:true
+  // yet is a REAL existing file being COPIED into the user dir — it must report a
+  // Save-As copy, never a first-save (which would wrongly imply "nothing to preserve").
+  const active = {
+    path: 'C:/packs/qwen/Product Label Repair.json',
+    filename: 'Product Label Repair.json',
+    directory: 'C:/packs/qwen',
+    isPersisted: false,
+    isTemporary: true,
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ files: [active.path], active })
+
+  const details = {}
+  await saveActiveWorkflow(svc, 'Product Label Repair - Qwen Edit Q5', {
+    autoWorkflowName: () => 'Untitled',
+    existsOnDisk,
+    details,
+  })
+
+  assert.equal(details.mode, 'save-as-copy', 'external real file copied ⇒ save-as-copy, not first-save')
+  assert.equal(details.sourcePath, 'C:/packs/qwen/Product Label Repair.json', 'source path recorded for re-verification')
+  // sourceExternal must be flagged so the panel-level post-save HEAD is SKIPPED — a
+  // /userdata HEAD 404s on an absolute path and would else throw a false data-loss
+  // error for a perfectly-preserved external original (codex round-2 P1).
+  assert.equal(details.sourceExternal, true, 'external source flagged so the /userdata HEAD is not misread as a move')
+  assert.deepEqual(describeSaveOutcome(details), {
+    saved_as: true,
+    copied_from: 'Product Label Repair'
+  })
+})
+
+// ---------------------------------------------------------------------------
+// classifyOriginalOnDisk — the throw/report decision for a Save-As COPY's source.
+// A hard data-loss throw ("lost") requires POSITIVE pre-save evidence (a confirmed
+// 200) now confirmed gone (404). Everything indeterminate degrades to "unverified"
+// so a legitimate first save / phantom source never false-alarms (codex P1 #1).
+
+test('classifyOriginalOnDisk: confirmed present-then-gone ⇒ lost (the only throw case)', () => {
+  assert.equal(classifyOriginalOnDisk({ preExisted: true, postExists: false }), 'lost')
+})
+
+test('classifyOriginalOnDisk: source never proven present ⇒ NEVER lost (no false data-loss throw)', () => {
+  // The exact P1 #1 repro: a non-temporary yet never-persisted tab whose source path
+  // 404s afterward simply because it never existed. preExisted is false/unknown ⇒
+  // must NOT be "lost".
+  assert.equal(classifyOriginalOnDisk({ preExisted: false, postExists: false }), 'unverified')
+  assert.equal(classifyOriginalOnDisk({ preExisted: null, postExists: false }), 'unverified')
+  assert.equal(classifyOriginalOnDisk({ preExisted: undefined, postExists: false }), 'unverified')
+})
+
+test('classifyOriginalOnDisk: source present afterward ⇒ present', () => {
+  assert.equal(classifyOriginalOnDisk({ preExisted: true, postExists: true }), 'present')
+  assert.equal(classifyOriginalOnDisk({ preExisted: null, postExists: true }), 'present')
+})
+
+test('classifyOriginalOnDisk: inconclusive post probe ⇒ unverified (never throws)', () => {
+  assert.equal(classifyOriginalOnDisk({ preExisted: true, postExists: null }), 'unverified')
+  assert.equal(classifyOriginalOnDisk({ preExisted: null, postExists: null }), 'unverified')
+  assert.equal(classifyOriginalOnDisk({}), 'unverified')
+})
+
+test('outcome: a WINDOWS ROOT-RELATIVE external source ("\\packs\\Foo.json") is external ⇒ save-as-copy + sourceExternal (codex P1 #2)', async () => {
+  // A single leading backslash is root-relative on the current drive — an EXTERNAL
+  // file, not a managed store path. It must copy into the user dir and report
+  // save-as-copy + sourceExternal, NEVER first-save (which would hide the real source
+  // and route the post-save HEAD into a false 404 alarm).
+  const srcPath = String.raw`\packs\Foo.json` // real single backslashes (root-relative)
+  const active = {
+    path: srcPath,
+    filename: 'Foo.json',
+    directory: String.raw`\packs`,
+    isPersisted: false,
+    isTemporary: true,
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ files: [active.path], active })
+
+  const details = {}
+  await saveActiveWorkflow(svc, 'Foo Copy', {
+    autoWorkflowName: () => 'Untitled',
+    existsOnDisk,
+    details,
+  })
+
+  assert.equal(details.mode, 'save-as-copy', 'root-relative external source ⇒ save-as-copy, not first-save')
+  assert.equal(details.sourceExternal, true, 'flagged external so the /userdata HEAD is skipped')
+  // Copy landed in the USER workflows dir, external original untouched.
+  assert.ok(svc.disk.has('workflows/Foo Copy.json'), 'copy in the user workflows dir')
+  assert.ok(svc.disk.has(srcPath), 'external original preserved')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never moved the external original')
+})
+
+// ---------------------------------------------------------------------------
+// Round-2 re-review: two MORE false-throw routes had to be closed.
+
+test('P1 #1b: an IN-MEMORY-absent source with an UNKNOWN disk oracle does NOT throw (backstop is disk-gated, #226)', async () => {
+  // The old backstop threw whenever getWorkflowByPath(source)==null after a copy — an
+  // in-memory signal that drifts stale once the copy activates. Here the copy succeeds,
+  // the source's in-memory lookup is null (stale), and the disk oracle is UNKNOWN for
+  // the source (a timed-out HEAD). That is NOT proof of on-disk loss ⇒ must NOT throw.
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const { svc } = makeStore147Service({ files: ['workflows/Foo.json'], active })
+  // Source disk-state UNKNOWN (null); everything else resolves via the seeded disk.
+  const existsOnDisk = async (p) => (p === 'workflows/Foo.json' ? null : svc.disk.has(p))
+  // Simulate in-memory staleness: the SOURCE lookup returns null (as if evicted), while
+  // target lookups behave normally (free).
+  const realGWBP = svc.getWorkflowByPath.bind(svc)
+  svc.getWorkflowByPath = (p) => (p === 'workflows/Foo.json' ? null : realGWBP(p))
+
+  const saved = await saveActiveWorkflow(svc, 'Bar', { existsOnDisk })
+
+  assert.equal(saved, 'Bar', 'reported success — no false "moved" throw')
+  assert.ok(svc.disk.has('workflows/Foo.json'), 'source still on disk (the copy never moved it)')
+  assert.ok(svc.disk.has('workflows/Bar.json'), 'copy created')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never renamed')
+})
+
+test('P1 #1c: diskExistenceFromStatus treats ONLY 200 as present; non-200 2xx / redirects / 5xx are indeterminate', () => {
+  assert.equal(diskExistenceFromStatus(200), true, '200 ⇒ present')
+  assert.equal(diskExistenceFromStatus(404), false, '404 ⇒ absent')
+  // A non-200 2xx a proxy might return must NOT count as the confirmed 200 the data-loss
+  // gate requires — else a 204-then-404 pair would read as "lost".
+  assert.equal(diskExistenceFromStatus(204), null, '204 ⇒ indeterminate')
+  assert.equal(diskExistenceFromStatus(206), null, '206 ⇒ indeterminate')
+  assert.equal(diskExistenceFromStatus(301), null, '301 ⇒ indeterminate')
+  assert.equal(diskExistenceFromStatus(500), null, '500 ⇒ indeterminate')
+  assert.equal(diskExistenceFromStatus(undefined), null, 'missing ⇒ indeterminate')
+  // And a 204 pre / 404 post must classify UNVERIFIED, never lost:
+  assert.equal(
+    classifyOriginalOnDisk({ preExisted: diskExistenceFromStatus(204), postExists: diskExistenceFromStatus(404) }),
+    'unverified',
+    'non-200 pre-probe never yields a data-loss verdict'
+  )
+})
+
+test('P2: a Windows DRIVE-RELATIVE source ("C:Foo.json", no separator) is external ⇒ save-as-copy + sourceExternal', async () => {
+  const active = {
+    path: 'C:Foo.json',
+    filename: 'Foo.json',
+    directory: 'C:',
+    isPersisted: false,
+    isTemporary: true,
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ files: [active.path], active })
+
+  const details = {}
+  await saveActiveWorkflow(svc, 'Foo Copy', {
+    autoWorkflowName: () => 'Untitled',
+    existsOnDisk,
+    details,
+  })
+
+  assert.equal(details.mode, 'save-as-copy', 'drive-relative external source ⇒ save-as-copy, not first-save')
+  assert.equal(details.sourceExternal, true, 'flagged external so the /userdata HEAD is skipped')
+  assert.ok(svc.disk.has('workflows/Foo Copy.json'), 'copy landed in the user workflows dir')
+  assert.ok(svc.disk.has('C:Foo.json'), 'external original preserved')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never moved the external original')
 })

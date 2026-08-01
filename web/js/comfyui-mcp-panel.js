@@ -144,7 +144,15 @@ import {
   refreshNodeArea,
 } from "./lib/group-geometry.js";
 import { pickRevertSnapshot } from "./lib/graph-revert.js";
-import { saveActiveWorkflow, shouldGroundBeforeTurn, groundActiveWorkflow } from "./lib/workflow-save.js";
+import {
+  saveActiveWorkflow,
+  shouldGroundBeforeTurn,
+  groundActiveWorkflow,
+  describeSaveOutcome,
+  classifyOriginalOnDisk,
+  diskExistenceFromStatus,
+  normalizePath,
+} from "./lib/workflow-save.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
@@ -2496,12 +2504,85 @@ function autoWorkflowName() {
  *  fallback. */
 async function programmaticSave(name) {
   const svc = app?.extensionManager?.workflow;
+  // Report what the save actually DID (in-place / first-save / Save-As copy) instead
+  // of the old opaque {saved:true} — the silent, unrecoverable move is what made
+  // mcp#579 a data-loss footgun. saveActiveWorkflow itself NEVER moves a persisted
+  // source (it copies via the atomic overwrite:false trio and throws on a detected
+  // move); this only enriches the RESULT. The mode is taken from saveActiveWorkflow's
+  // AUTHORITATIVE `details` sink (the branch it actually took), NOT inferred from the
+  // mutable active workflow afterward — so a tab switch during the await can't fool it.
+  //
+  // Snapshot the target workflow SYNCHRONOUSLY (before any await), so the pre-save HEAD
+  // below cannot let a tab switch redirect the save to a DIFFERENT workflow. It is
+  // passed to saveActiveWorkflow as `expect` (#330), which refuses if the active
+  // workflow changed during our pre-probe — restoring the "capture A before the first
+  // await" guarantee the pre-probe would otherwise have widened into a wrong-tab window.
+  const expectWf = svc?.activeWorkflow;
+  // Capture POSITIVE pre-save evidence of the source file's existence: a confirmed 200
+  // is the ONLY basis on which a post-save 404 may be treated as a real move/deletion
+  // of a persisted original. Without it, a source that 404s afterward simply never
+  // existed (a never-persisted tab whose classification was inconclusive), and throwing
+  // would be a false data-loss error on a legitimate first save.
+  const preSourcePath = expectWf?.path ?? null;
+  let preExisted = null; // true = confirmed 200, false = confirmed 404, null = unknown
+  if (preSourcePath) {
+    try {
+      preExisted = await workflowExistsOnDisk(preSourcePath);
+    } catch {
+      preExisted = null;
+    }
+  }
+  const details = {};
   const saved = await saveActiveWorkflow(svc, name, {
     autoWorkflowName,
     existsOnDisk: workflowExistsOnDisk,
     reconcileSavedCopy: reconcileSavedWorkflowCopy,
+    details,
+    expect: expectWf, // #330: refuse if the user switched tabs during our pre-save HEAD
   });
-  return saved || getWorkflowTitle();
+  const outcome = describeSaveOutcome(details);
+  // INDEPENDENT post-save verification (a second backstop, at the tool layer) for a
+  // Save-As COPY: attest whether the REAL source file is still on disk. This reports
+  // PATH PRESENCE (`original_on_disk`), not content identity — an honest, disk-checked
+  // fact, not an inferred "preserved" claim.
+  //
+  // EXTERNAL sources (absolute / root-relative paths, #285) are NOT /userdata-
+  // addressable, so a HEAD would 404 for a perfectly-preserved external original. The
+  // external copy path never references the source file, so it is intact — just
+  // unverifiable from here ⇒ "unverified", NEVER a throw.
+  //
+  // Managed sources: only a source CONFIRMED present before the save (preExisted===true,
+  // same path) that is now CONFIRMED gone is a genuine data-loss event → throw. Every
+  // indeterminate case degrades to "unverified" (classifyOriginalOnDisk enforces this),
+  // so a transient classification or a never-existed phantom source never false-alarms.
+  if (outcome.saved_as && details.sourcePath) {
+    if (details.sourceExternal) {
+      outcome.original_on_disk = "unverified";
+    } else {
+      let postExists = null;
+      try {
+        postExists = await workflowExistsOnDisk(details.sourcePath);
+      } catch {
+        postExists = null;
+      }
+      // Only trust pre-save evidence when it was measured on the SAME source path.
+      const samePath =
+        !!preSourcePath && normalizePath(preSourcePath) === normalizePath(details.sourcePath);
+      const status = classifyOriginalOnDisk({
+        preExisted: samePath ? preExisted : null,
+        postExists,
+      });
+      if (status === "lost") {
+        throw new Error(
+          `the original workflow "${outcome.copied_from ?? details.sourcePath}" is no longer on disk ` +
+            `after saving "${saved}". The save was performed as a COPY and should not have removed it — ` +
+            `surfacing a possible data-loss event rather than reporting a phantom success (issue #579).`,
+        );
+      }
+      outcome.original_on_disk = status === "present" ? true : "unverified";
+    }
+  }
+  return { name: saved || getWorkflowTitle(), ...outcome };
 }
 
 /** Authoritative read-back oracle for saveActiveWorkflow's post-write guards.
@@ -2567,9 +2648,11 @@ async function workflowExistsOnDisk(rawPath) {
       typeof api.getUserData === "function"
         ? await api.getUserData(rawPath, { method: "HEAD" })
         : await api.fetchApi(`/userdata/${encodeURIComponent(rawPath)}`, { method: "HEAD" });
-    if (res.status === 404) return false;
-    if (res.ok) return true;
-    return null; // inconclusive ⇒ classifier stays "unknown" ⇒ refuse
+    // STRICT: only a true 200 is positive existence evidence; a non-200 2xx (204/206/…)
+    // from a proxy/intermediary is INDETERMINATE (null), never "present" — else it could
+    // stand in for the confirmed pre-save 200 the data-loss gate requires and, paired
+    // with a later 404, yield a FALSE "moved" verdict. 404 ⇒ false; anything else ⇒ null.
+    return diskExistenceFromStatus(res.status);
   } catch {
     return null; // network/other error ⇒ unknown ⇒ fail safe
   }
@@ -6140,14 +6223,16 @@ const GRAPH_TOOL_EXECUTORS = {
   async workflow_save({ name } = {}) {
     // Fully programmatic — no Save/Rename dialog. Auto-names a never-saved
     // workflow; saves in place otherwise.
-    const saved = await programmaticSave(name);
-    return { saved: true, workflow: saved };
+    const { name: workflow, ...outcome } = await programmaticSave(name);
+    // outcome surfaces WHAT happened (saved_as/copied_from/original_preserved or
+    // first_save) so a rename-vs-copy is never silent (mcp#579).
+    return { saved: true, workflow, ...outcome };
   },
 
   async workflow_save_as({ name }) {
     if (!name || typeof name !== "string") throw new Error("name (string) is required");
-    const saved = await programmaticSave(name);
-    return { saved: true, workflow: saved };
+    const { name: workflow, ...outcome } = await programmaticSave(name);
+    return { saved: true, workflow, ...outcome };
   },
 
   // --- Workflow tabs: new / list / open / switch / rename / close ----------
