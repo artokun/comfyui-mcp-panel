@@ -198,10 +198,20 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
  * same one reconnecting, which is precisely the case replay exists to serve. Proving
  * session continuity needs a server-issued connection epoch in the handshake, i.e. an
  * orchestrator-side change (tracked as a follow-up). Until then the exposure is bounded
- * three ways: sensitive results never enter the journal at all, replay waits for a real
- * handshake rather than firing at bare socket-open, and entries age out here.
+ * four ways: sensitive results never enter the journal at all; replay goes ONLY to the
+ * exact socket instance that completed a handshake; entries age out here; and the window
+ * is deliberately tight — a drop, reconnect and handshake take a couple of seconds, so 20s
+ * is generous for the case this serves while leaving little room for an orchestrator to
+ * restart and re-bind inside it.
+ *
+ * The residual, stated plainly: if the orchestrator restarts on the SAME address within
+ * this window, its successor can receive one non-sensitive result belonging to the previous
+ * session. It cannot resolve any of its own commands with it (rids are random UUIDs) and it
+ * cannot double-apply anything (a reply is not a command). Closing the residual entirely
+ * requires the handshake epoch above; discarding on unprovable continuity instead would
+ * discard the ordinary reconnect too, which is the whole case this exists to serve.
  */
-export const REPLAY_MAX_AGE_MS = 60000;
+export const REPLAY_MAX_AGE_MS = 20000;
 
 /**
  * May this journaled outcome be replayed onto a socket for `targetUrl` right now?
