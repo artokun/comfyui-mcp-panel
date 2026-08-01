@@ -299,6 +299,25 @@ test("MID-TYPING: a pending debounce commit AFTER our write is a no-op (no rollb
   assert.ok(before);
 });
 
+test("POST-LOAD: a stale editor is rejected even when its derived strings COLLIDE with the widgets", () => {
+  // The dangerous near-miss: after a load the restored widgets agree with each other, but the
+  // old editor's timeline happens to derive the SAME prompt join and length list while
+  // differing in per-segment data. Preferring the widget whenever it is self-consistent means
+  // the stale editor can never win, so its timeline is not resurrected.
+  const { node, widgets, editor } = makeRelayNode({
+    timelineSegments: [seg("a", 24, { color: "#new" }), seg("b", 36, { color: "#new2" })],
+  });
+  editor.timeline = {
+    stalePreviousWorkflow: true,
+    segments: [seg("a", 24, { color: "#old" }), seg("b", 36, { color: "#old2" })],
+  };
+  const res = relay(applyPromptRelayTimelineWrite(node, {}));
+  assert.equal(res.merge_base, "timeline_data");
+  const written = JSON.parse(widgets.timeline_data.value);
+  assert.equal(written.stalePreviousWorkflow, undefined);
+  assert.deepEqual(written.segments.map((s) => s.color), ["#new", "#new2"]);
+});
+
 test("POST-LOAD: the timeline_data widget wins over an editor still holding the OLD workflow", () => {
   // onConfigure restores the widgets first and re-parses the editor ~10ms later. Merging onto
   // the editor in that window would resurrect the previous workflow's timeline.
@@ -476,6 +495,25 @@ test("WARNS about leading/trailing whitespace — the python side strips each en
   // A fully-blank prompt is reported by the stronger blank-prompt warning, not this one.
   const clean = relay(applyPromptRelayTimelineWrite(makeRelayNode().node, { segments: [seg("   ", 24)] }));
   assert.equal(clean.warnings.filter((w) => w.includes("leading/trailing whitespace")).length, 0);
+});
+
+test("the whitespace notice covers characters PYTHON strips but JS trim() does not", () => {
+  // python's str.strip() also removes U+001C…U+001F and U+0085; JS trim() does not. A prompt
+  // padded with one of those is dropped/shifted by the encoder, so it must still be reported.
+  for (const pad of ["\u001c", "\u001d", "\u001e", "\u001f", "\u0085", "\ufeff"]) {
+    const res = relay(
+      applyPromptRelayTimelineWrite(makeRelayNode().node, { segments: [seg(pad + "fox" + pad, 24)] }),
+    );
+    assert.ok(
+      res.warnings?.some((w) => w.includes("leading/trailing whitespace")),
+      `no whitespace warning for U+${pad.codePointAt(0).toString(16)}`,
+    );
+  }
+  // A prompt made only of those characters counts as BLANK (python drops it entirely).
+  const blank = relay(
+    applyPromptRelayTimelineWrite(makeRelayNode().node, { segments: [seg("\u001c\u0085", 24), seg("b")] }),
+  );
+  assert.ok(blank.warnings.some((w) => w.includes("EMPTY prompt")));
 });
 
 test("a UI-refresh failure does NOT fail the write, and is reported", () => {

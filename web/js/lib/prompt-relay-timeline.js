@@ -136,10 +136,10 @@ function isPlainObject(v) {
  * the value is one the node's `Math.max(1, parseInt(v, 10) || 1)` would silently MANGLE
  * (missing, fractional, zero/negative, non-numeric).
  * A STRING is accepted only in the forms parseInt handles LOSSLESSLY: optional leading "+",
- * digits, and an all-zero fraction ("24", "+24", "24.0"). A non-zero fraction ("24.7") is
- * refused because parseInt would TRUNCATE it — silently shortening a segment.
+ * digits, and a zero-valued fraction ("24", "+24", "24.0", "24."). A non-zero fraction
+ * ("24.7") is refused because parseInt would TRUNCATE it — silently shortening a segment.
  */
-const LOSSLESS_INT_STRING = /^\+?\d+(?:\.0+)?$/;
+const LOSSLESS_INT_STRING = /^\+?\d+(?:\.0*)?$/;
 
 function normalizeSegmentLength(v) {
   if (typeof v === "number") {
@@ -293,6 +293,17 @@ function normalizeSegments(timeline, baseSegments) {
  *     prompt count disagree with the length count and shifts every later segment.
  *   * `local_prompts` is split on "|", so a literal "|" inside a prompt becomes TWO prompts.
  */
+// The edge characters that get stripped before encoding. Python's `str.strip()` and JS's
+// `String.trim()` do NOT agree — python also strips the C1/separator controls U+001C…U+001F
+// and U+0085, while JS also strips U+FEFF — so the UNION is used, and the padding/blank
+// notices fire for anything EITHER side would remove. (Using JS trim() alone would miss a
+// prompt padded with U+001C: python drops it, shifting every later segment, with no warning.)
+const STRIPPED_EDGE_CHARS = /^[\s\u001c-\u001f\u0085\ufeff]+|[\s\u001c-\u001f\u0085\ufeff]+$/g;
+
+function edgeTrim(s) {
+  return s.replace(STRIPPED_EDGE_CHARS, "");
+}
+
 function timelineWarnings(segments) {
   const warnings = [];
   const blank = [];
@@ -300,8 +311,9 @@ function timelineWarnings(segments) {
   const padded = [];
   for (let i = 0; i < segments.length; i++) {
     const p = segments[i].prompt;
-    if (p.trim() === "") blank.push(i);
-    else if (p.trim() !== p) padded.push(i);
+    const trimmed = edgeTrim(p);
+    if (trimmed === "") blank.push(i);
+    else if (trimmed !== p) padded.push(i);
     if (p.includes("|")) piped.push(i);
   }
   if (blank.length) {
@@ -352,21 +364,36 @@ function liveEditorTimeline(editor) {
  *     pre-keystroke timeline and DESTROY the text the user just typed.
  *   * The EDITOR's `this.timeline` lags right after a workflow load: `onConfigure` restores the
  *     widgets first and re-parses the editor 10 ms later. Merging onto the editor in that
- *     window would resurrect the PREVIOUS workflow's timeline.
+ *     window would resurrect the PREVIOUS workflow's timeline — including its lengths and any
+ *     per-segment metadata, not just its prompts.
  *
- * `local_prompts` breaks the tie: it is the value the node would EXECUTE right now, and both
- * update paths (the editor's live keystroke handler, and a workflow load restoring the saved
- * widgets) keep it in step with whichever timeline is current. So prefer the candidate whose
- * derived prompts match it. If neither matches, the node is genuinely desynced and the
- * timeline_data widget — the node's master field — wins, with the out-of-band text reported.
+ * The DERIVED widgets break the tie, and the rule is "widget first, editor only as the
+ * exception". `timeline_data` is the node's master field, so it wins WHENEVER it still agrees
+ * with the derived widgets. The debounce window is the one moment it does not: the keystroke
+ * handler has already advanced `local_prompts` past the pre-keystroke JSON. Deferring to the
+ * editor only in that case means a stale post-load editor can never be chosen — after a load
+ * the restored widgets agree with each other, so the widget wins even if the old editor
+ * happens to derive the same strings.
+ *
+ * Both derived widgets are compared, not just `local_prompts`: two different timelines can
+ * share a prompt join while differing in segment lengths.
  */
+function derivedMatchesWidgets(timeline, widgets) {
+  if (!timeline) return false;
+  const d = derivePromptRelayWidgets(timeline.segments);
+  return (
+    d.local_prompts === widgets.local_prompts.value &&
+    d.segment_lengths === widgets.segment_lengths.value
+  );
+}
+
 function chooseMergeBase(editor, widgets) {
-  const currentPrompts = widgets.local_prompts.value;
   const fromEditor = liveEditorTimeline(editor);
   const fromWidget = parsePromptRelayTimeline(widgets[PROMPT_RELAY_MASTER_WIDGET].value);
-  if (fromEditor && derivePromptRelayWidgets(fromEditor.segments).local_prompts === currentPrompts) {
-    return { base: fromEditor, baseSource: "editor" };
-  }
+  if (derivedMatchesWidgets(fromWidget, widgets)) return { base: fromWidget, baseSource: "timeline_data" };
+  if (derivedMatchesWidgets(fromEditor, widgets)) return { base: fromEditor, baseSource: "editor" };
+  // Neither agrees with what the node would execute: it is genuinely desynced. The master
+  // field wins and the out-of-band text is reported back to the caller.
   if (fromWidget) return { base: fromWidget, baseSource: "timeline_data" };
   if (fromEditor) return { base: fromEditor, baseSource: "editor" };
   return { base: null, baseSource: "none" };
