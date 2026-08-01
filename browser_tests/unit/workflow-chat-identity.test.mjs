@@ -3,47 +3,38 @@ import test from 'node:test'
 
 import {
   isThreadInScope,
+  isWorkflowCreationLoad,
   normalizedWorkflowPath,
-  resolveUnsavedWorkflowUuid,
   shouldForkEmbeddedWorkflowUuid,
   workflowAliasForPath
 } from '../../web/js/lib/workflow-chat-identity.js'
 
-// #570 P0b/P1 — unsaved-workflow durable uuid keyed on (path, graph-id).
-test('#570 reload of the same unsaved workflow reuses its stored uuid (P1 durability)', () => {
-  const stored = { u: 'uuid-A', g: 'gid-A' }
-  const r = resolveUnsavedWorkflowUuid({ stored, gid: 'gid-A', mint: 'fresh' })
-  assert.equal(r.uuid, 'uuid-A') // same path + same graph id → continuity
-  assert.equal(r.changed, false)
+// Fakes for the ComfyWorkflow 4th arg: a REUSE passes a ComfyWorkflow OBJECT; a CREATION
+// passes null/undefined/string.
+class FakeComfyWorkflow { constructor (path) { this.path = path } }
+
+// #570 P0 — fork the per-instance identity at the workflow CREATION boundary.
+test('#570 a CREATION (non-object 4th arg) is forked so a copy cannot inherit the source uuid', () => {
+  // paste/new-blank pass null; open-file/duplicate/template pass a string filename.
+  assert.equal(isWorkflowCreationLoad({ workflowArg: null }), true)
+  assert.equal(isWorkflowCreationLoad({ workflowArg: undefined }), true)
+  assert.equal(isWorkflowCreationLoad({ workflowArg: 'workflows/Unsaved Workflow.json' }), true)
 })
 
-test('#570 a cold import (no stored entry for its deduped path) mints fresh (P0b)', () => {
-  // The imported copy carries the SOURCE embedded uuid, but it lands on a brand-new
-  // deduped path with no stored alias → it must NOT inherit the source identity.
-  const r = resolveUnsavedWorkflowUuid({ stored: null, gid: 'gid-A', mint: 'fresh' })
-  assert.equal(r.uuid, 'fresh')
-  assert.equal(r.changed, true)
+test('#570 an external import with an openSource is a creation', () => {
+  assert.equal(isWorkflowCreationLoad({ workflowArg: 'x.json', openSource: 'file_button' }), true)
+  // Even if some future path passed an object, an explicit openSource still forks.
+  assert.equal(isWorkflowCreationLoad({ workflowArg: new FakeComfyWorkflow('a'), openSource: 'file_drop' }), true)
 })
 
-test('#570 a new workflow reusing a freed path slot does NOT inherit the old uuid (graph-id guard)', () => {
-  const stored = { u: 'uuid-old', g: 'gid-old' }
-  const r = resolveUnsavedWorkflowUuid({ stored, gid: 'gid-new', mint: 'fresh' })
-  assert.equal(r.uuid, 'fresh') // same path, DIFFERENT graph id → different workflow
-  assert.equal(r.changed, true)
+test('#570 a REUSE (ComfyWorkflow object 4th arg, no openSource) is NOT forked — durable reload', () => {
+  // reload-restore / tab-switch / undo / reroute-migration all pass the workflow OBJECT.
+  assert.equal(isWorkflowCreationLoad({ workflowArg: new FakeComfyWorkflow('workflows/Unsaved Workflow.json') }), false)
 })
 
-test('#570 FAILS CLOSED when a graph id is unavailable (mints fresh, never path-only reuse)', () => {
-  // A missing gid on either side can't prove continuity — reusing by path alone would
-  // let a new workflow inherit a closed one that reused the path slot. Mint fresh.
-  assert.equal(resolveUnsavedWorkflowUuid({ stored: { u: 'u', g: '' }, gid: 'g', mint: 'm' }).uuid, 'm')
-  assert.equal(resolveUnsavedWorkflowUuid({ stored: { u: 'u', g: 'g' }, gid: '', mint: 'm' }).uuid, 'm')
-})
-
-test('#570 a read-only probe (no mint) returns null unless BOTH graph ids match', () => {
-  assert.equal(resolveUnsavedWorkflowUuid({ stored: null, gid: 'g' }).uuid, null)
-  assert.equal(resolveUnsavedWorkflowUuid({ stored: { u: 'u', g: 'gid-old' }, gid: 'gid-new' }).uuid, null)
-  assert.equal(resolveUnsavedWorkflowUuid({ stored: { u: 'u', g: '' }, gid: 'g' }).uuid, null)
-  assert.equal(resolveUnsavedWorkflowUuid({ stored: { u: 'u', g: 'g' }, gid: 'g' }).uuid, 'u')
+test('#570 the panel\'s own same-workflow reload opts out via noFork (snapshot revert)', () => {
+  assert.equal(isWorkflowCreationLoad({ workflowArg: null, noFork: true }), false)
+  assert.equal(isWorkflowCreationLoad({ workflowArg: 'x.json', openSource: 'file_button', noFork: true }), false)
 })
 
 test('normalizes Windows paths for stable identity comparisons', () => {

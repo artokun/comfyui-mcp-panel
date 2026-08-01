@@ -96,8 +96,8 @@ import {
 } from "./lib/chat-history-store.js";
 import {
   classifyPinnedTarget,
+  isWorkflowCreationLoad,
   normalizedWorkflowPath,
-  resolveUnsavedWorkflowUuid,
   shouldForkEmbeddedWorkflowUuid,
   workflowAliasForPath,
   workflowIdentityForms,
@@ -966,26 +966,6 @@ const _priorTempWorkflowIds = new WeakMap();
 const _workflowObjectUuids = new WeakMap();
 const _workflowUuidOwners = new Map();
 const WORKFLOW_UUID_ALIASES_KEY = "comfyui-mcp.panel.workflowUuidAliases";
-// #570 P0b/P1 — durable per-instance uuid for an UNSAVED workflow, keyed on the pair
-// (ComfyUI tab path, reload-stable graph id). An unsaved workflow's `path`
-// ("workflows/Unsaved Workflow.json") is reused verbatim when ITS tab is restored on a
-// reload, but DEDUPED ("... (2).json") for a fresh import/duplicate — so keying on the
-// path both keeps the identity across a reload (P1) and mints a fresh one for a cold
-// import that merely carries a SOURCE workflow's embedded uuid (P0b). The graph id
-// (activeState.id, reload-stable but import-PRESERVED) is a second guard: a DIFFERENT
-// new unsaved workflow that later REUSES a freed path slot has a different graph id, so
-// it can't inherit the closed workflow's identity. Persisted in localStorage; graph
-// `extra` is deliberately NOT the source of truth for unsaved tabs (a copy carries it).
-const WORKFLOW_UNSAVED_IDS_KEY = "comfyui-mcp.panel.unsavedWorkflowIds";
-const WORKFLOW_UNSAVED_IDS_CAP = 200; // bound growth (keyed by transient unsaved paths)
-let _unsavedWorkflowIds = (() => {
-  try {
-    const parsed = JSON.parse(window.localStorage.getItem(WORKFLOW_UNSAVED_IDS_KEY) || "{}");
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
-  } catch {
-    return {};
-  }
-})();
 const WORKFLOW_META_NAMESPACE = "comfyui_mcp";
 const WORKFLOW_UUID_FIELD = "workflow_uuid";
 const WORKFLOW_PATH_FIELD = "workflow_path";
@@ -1092,60 +1072,49 @@ function persistWorkflowAliases() {
   }
 }
 
-// #570 P0b/P1 — the ComfyUI tab path of an UNSAVED (never-saved) workflow, e.g.
-// "workflows/Unsaved Workflow.json". Reload-stable (restored to the SAME path) and
-// import-distinct (a fresh open/duplicate is deduped to "... (2).json"). null for a
-// saved tab (which uses savedWorkflowPath) or when no path is exposed.
-function unsavedWorkflowPath(wf) {
-  if (!wf || wf.isPersisted === true) return null;
-  return typeof wf.path === "string" && wf.path ? wf.path : null;
-}
-
-// The reload-stable, per-workflow graph id ComfyUI mints (activeState.id via
-// ensureWorkflowId). It is PRESERVED across an import/copy (so it can't tell a copy
-// from the original by itself), but it DOES differ between two genuinely different
-// unsaved workflows — the guard that stops a new workflow reusing a freed path slot
-// from inheriting the closed workflow's uuid. "" when unavailable (older format).
-function unsavedWorkflowGraphId(wf) {
+// #570 P0 — CREATE-BOUNDARY FORK. Wrap app.loadGraphData so that at every workflow
+// CREATION (import / open-file / drag-drop / template / shared-url / DUPLICATE / PASTE /
+// new-blank) — but NOT a reload-restore / tab-switch / undo / in-place repaint — we mint
+// a FRESH embedded per-instance uuid into the incoming graph BEFORE it goes live. Paste
+// and duplicate keep the SOURCE graph's embedded uuid AND can land on the same synthesized
+// "Unsaved Workflow.json" path, so without this a copy would present the source's identity
+// and inherit its session (the reopened cross-resume). Regenerating at creation makes the
+// embedded uuid a trustworthy per-instance identity: fresh for a copy, and round-tripped
+// verbatim by ComfyUI's draft persistence across a reload (durable — P1). isWorkflowCreationLoad
+// reads the discriminators (loadGraphData's 4th `workflow` arg is a ComfyWorkflow object only
+// on a REUSE; creations pass null/undefined/string; external imports also set openSource).
+// loadGraphData clones graphData internally AFTER we mutate, so our stamp flows into configure.
+let _loadGraphDataForkInstalled = false;
+function installCreateBoundaryFork(appRef) {
   try {
-    const id = wf?.activeState?.id ?? wf?.initialState?.id ?? wf?.workflow?.id ?? null;
-    return typeof id === "string" && id ? id : "";
+    if (_loadGraphDataForkInstalled || !appRef || typeof appRef.loadGraphData !== "function") return;
+    const orig = appRef.loadGraphData.bind(appRef);
+    appRef.loadGraphData = function (graphData, clean, restoreView, workflow, options = {}) {
+      try {
+        const creation = isWorkflowCreationLoad({
+          workflowArg: workflow,
+          openSource: options ? options.openSource : undefined,
+          noFork: Boolean(options && options.__cmcpNoFork),
+        });
+        if (creation && graphData && typeof graphData === "object" && !Array.isArray(graphData)) {
+          const extra =
+            graphData.extra && typeof graphData.extra === "object" ? graphData.extra : (graphData.extra = {});
+          const prev = extra[WORKFLOW_META_NAMESPACE];
+          extra[WORKFLOW_META_NAMESPACE] = {
+            ...(prev && typeof prev === "object" ? prev : {}),
+            [WORKFLOW_UUID_FIELD]: crypto.randomUUID(),
+          };
+        }
+      } catch {
+        // Never let identity bookkeeping break a graph load.
+      }
+      return orig(graphData, clean, restoreView, workflow, options);
+    };
+    _loadGraphDataForkInstalled = true;
   } catch {
-    return "";
+    // If wrapping fails, workflowStableUuid's lazy per-object stamping still keeps two
+    // concurrently-open copies distinct — the fork is a durability/robustness upgrade.
   }
-}
-
-function persistUnsavedWorkflowIds() {
-  try {
-    // Bound growth: unsaved paths are transient, so evict arbitrary old entries when
-    // over the cap (a dropped entry only costs a lost resume for a long-idle tab).
-    const keys = Object.keys(_unsavedWorkflowIds);
-    if (keys.length > WORKFLOW_UNSAVED_IDS_CAP) {
-      for (const k of keys.slice(0, keys.length - WORKFLOW_UNSAVED_IDS_CAP)) delete _unsavedWorkflowIds[k];
-    }
-    window.localStorage.setItem(WORKFLOW_UNSAVED_IDS_KEY, JSON.stringify(_unsavedWorkflowIds));
-  } catch {
-    // In-memory identity still holds for this session.
-  }
-}
-
-// Resolve (and optionally persist) the durable uuid for an unsaved workflow at
-// (path, gid) via the pure resolveUnsavedWorkflowUuid. A read-only probe (no `assign`)
-// returns the stored uuid only when it names the SAME instance, else null; with
-// `assign` it adopts that fresh uuid on a miss and persists the (path,gid) entry.
-function unsavedWorkflowUuid(path, gid, assign) {
-  if (!path) return assign ?? null;
-  const stored = _unsavedWorkflowIds[path] || null;
-  const { uuid, changed } = resolveUnsavedWorkflowUuid({
-    stored,
-    gid,
-    mint: assign === undefined ? null : assign,
-  });
-  if (assign !== undefined && changed && uuid) {
-    _unsavedWorkflowIds[path] = { u: uuid, g: gid || "" };
-    persistUnsavedWorkflowIds();
-  }
-  return uuid;
 }
 
 function workflowUuidOwner(id) {
@@ -1177,33 +1146,34 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
   const path = savedWorkflowPath(wf);
   const objectUuid = _workflowObjectUuids.get(identityObject);
 
-  // #570 P0b/P1 — UNSAVED workflow: the DURABLE, import-distinct identity is the panel's
-  // own (path, graph-id) alias, NOT the embedded graph.extra uuid (which a COPIED graph
-  // carries verbatim → cross-resume). Resolve from that alias; a cold import (new deduped
-  // path) or a path-slot reuse (different graph id) misses → mint fresh; a reload (same
-  // path + graph id) hits → same uuid. The embedded uuid is deliberately ignored here.
-  const unsavedPath = path ? null : unsavedWorkflowPath(wf);
-  if (unsavedPath) {
-    const gid = unsavedWorkflowGraphId(wf);
-    const resolved = objectUuid || unsavedWorkflowUuid(unsavedPath, gid) || crypto.randomUUID();
-    const id = unsavedWorkflowUuid(unsavedPath, gid, resolved); // persist/refresh the alias
+  // #570 P0/P1 — UNSAVED workflow: the durable per-instance identity is the EMBEDDED
+  // graph.extra uuid, which installCreateBoundaryFork REGENERATES at every creation
+  // (import/paste/duplicate/new) — so it is fresh for a copy yet round-tripped verbatim by
+  // ComfyUI's draft persistence across a reload (durable regardless of chat scope). Prefer
+  // the in-session objectUuid, then the embedded uuid; if neither (a workflow that predates
+  // the wrapper, or a fresh blank created before it installed), mint one and STAMP it into
+  // extra so it is durable — and distinct per live object, so two concurrently-open copies
+  // never collide.
+  const isUnsaved = !path && wf && wf.isPersisted !== true;
+  if (isUnsaved) {
+    const embeddedId = embeddedWorkflowUuid(wf);
+    const id = objectUuid || embeddedId || crypto.randomUUID();
     _workflowObjectUuids.set(identityObject, id);
     rememberWorkflowUuidOwner(id, identityObject);
-    if (embed) {
-      // Keep writing the in-graph metadata (harmless — not authoritative for an unsaved
-      // tab) so a subsequent user-initiated SAVE carries the identity into the saved
-      // file and the conversation survives the tmp:→wf: transition.
+    if (embeddedId !== id) {
+      // Persist the identity into extra (so a reload keeps it AND a later SAVE carries it
+      // into the saved file across the tmp:→wf: transition). Never dirties the graph.
       try {
         const extra = activeWorkflowExtra(wf, { create: true });
         const previous = extra?.[WORKFLOW_META_NAMESPACE];
-        if (extra && previous?.[WORKFLOW_UUID_FIELD] !== id) {
+        if (extra) {
           extra[WORKFLOW_META_NAMESPACE] = {
             ...(previous && typeof previous === "object" ? previous : {}),
             [WORKFLOW_UUID_FIELD]: id,
           };
         }
       } catch {
-        // The (path, graph-id) alias still makes the identity durable in this browser.
+        // In-memory objectUuid still keeps this instance stable for the session.
       }
     }
     return id;
@@ -3805,7 +3775,11 @@ function restoreSnapshot(snap) {
   if (!snap) return null;
   try {
     // Deep-clone so the stored snapshot isn't mutated by the live graph after load.
-    getGraphCtx().app.loadGraphData(JSON.parse(JSON.stringify(snap.data)));
+    // __cmcpNoFork: this reloads the SAME active workflow (a revert), so the create-
+    // boundary fork must NOT re-mint its per-instance identity (#570 P0).
+    getGraphCtx().app.loadGraphData(JSON.parse(JSON.stringify(snap.data)), true, true, activeWorkflowRef(), {
+      __cmcpNoFork: true,
+    });
     return snap;
   } catch {
     return null;
@@ -19604,6 +19578,9 @@ function registerExtensionWhenReady(tries = 0) {
   }
   app = comfyApp;
   api = window.comfyAPI?.api?.api || window.api || null;
+  // #570 P0 — wrap app.loadGraphData so every workflow CREATION (import/paste/duplicate/
+  // new) mints a fresh per-instance uuid, so a copy can't inherit the source's session.
+  installCreateBoundaryFork(app);
   setupListeners();
 
   // TODO(v2): replace with `defineExtension({ name, setup() {...} })`.
