@@ -4570,6 +4570,20 @@ function placementFor(graph, pos) {
 let activePanelRoot = null;
 
 const GRAPH_TOOL_EXECUTORS = {
+  // #608: force a fresh /object_info re-register + combo refresh so an asset that
+  // appeared server-side AFTER page-load — a stage_output_as_input input, a freshly
+  // downloaded model/LoRA/VAE, a newly installed node pack — becomes selectable in
+  // loaders/combos WITHOUT a manual reload (press-R) or restart. Reuses the #396
+  // forced re-register (refreshComfyNodeDefs force), the SAME non-destructive path a
+  // completed download already triggers automatically. GLOBAL (not tied to the active
+  // graph, so it carries no workflow_path and skips the pinned-target guard),
+  // undo-neutral, idempotent. Resolves to the refresh's OWN freshness verdict —
+  // refreshComfyNodeDefs returns true only when it authoritatively fetched /object_info
+  // AND refreshed combos — so the tool reply reflects a real fetch, not just a no-op.
+  async refresh_nodes() {
+    const refreshed = await refreshComfyNodeDefs(undefined, { force: true });
+    return { ok: true, refreshed: !!refreshed };
+  },
   // Full-fidelity capture of the live canvas — the ROOT graph's serialized UI
   // JSON (the same shape ComfyUI writes to disk on save), so the orchestrator
   // can strip/slice/save what the user ACTUALLY has open without asking them to
