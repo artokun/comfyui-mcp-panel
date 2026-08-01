@@ -9882,15 +9882,70 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       }, handshakeMs());
     });
 
+    /** #508 — write `reply` back on the socket the command ARRIVED on, and if that is
+     *  impossible, journal the outcome (for replay) and run the bounded self-heal.
+     *  Returns true only when the frame was actually handed to an open socket. */
+    const deliverReply = (reply, cmd, superseded) => {
+      const socketOpen = thisSock.readyState === WebSocket.OPEN;
+      let sendThrew = false;
+      if (socketOpen) {
+        try {
+          thisSock.send(JSON.stringify(reply));
+        } catch {
+          sendThrew = true;
+        }
+      }
+      if (socketOpen && !sendThrew) return true;
+      // The command was answered and its answer has nowhere to go. Name the ACTUAL cause
+      // instead of leaving the caller with the orchestrator's guess that the tab "may be
+      // backgrounded or frozen" — it was neither; it answered and we could not send.
+      handleUndeliveredReply(
+        lostReplies.record({
+          reply,
+          cmd,
+          reason: classifyUndeliveredReply({ socketOpen, superseded, sendThrew }),
+          at: Date.now(),
+        }),
+      );
+      return false;
+    };
+
     thisSock.addEventListener("message", async (ev) => {
-      if (!isActive()) return; // superseded socket — ignore its late frames
       let msg;
       try {
         msg = JSON.parse(typeof ev.data === "string" ? ev.data : "");
       } catch {
         return;
       }
-      if (msg && typeof msg.rid === "string" && typeof msg.cmd === "string") {
+      const isCommandFrame = msg && typeof msg.rid === "string" && typeof msg.cmd === "string";
+      if (!isActive()) {
+        // Superseded socket — a soft-reload/reconnect replaced it. Its late frames must NOT
+        // be processed: this belongs to the DEAD session, and running it would drive the
+        // fresh session's canvas and paint into its chat.
+        //
+        // #508 — but SILENCE is not an option either. Dropping a command frame outright is
+        // exactly the "registered tab that never acknowledges anything" wedge: the sender
+        // waits out its whole timeout and reports an unknown outcome for a command that
+        // provably never ran. Refuse it EXPLICITLY instead — nothing was executed, so this
+        // is a clean, safe-to-retry negative — and deliver/journal that refusal like any
+        // other reply.
+        if (isCommandFrame) {
+          deliverReply(
+            {
+              rid: msg.rid,
+              ok: false,
+              error:
+                `panel tab superseded before "${msg.cmd}" ran — this browser tab reconnected ` +
+                `(reload / soft reload / restart) and this command arrived on the retired ` +
+                `connection. NOTHING was applied; it is safe to re-issue on the current connection.`,
+            },
+            msg.cmd,
+            true,
+          );
+        }
+        return;
+      }
+      if (isCommandFrame) {
         // Agent command — execute against the graph, reply with the rid.
         // Executors may be async (run, save) — await uniformly.
         // ANY command frame is real turn activity (incl. the SILENT_CMDS that
@@ -10132,33 +10187,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // sender with no outcome at all — the "registered tab that never acknowledges
         // anything" wedge. So: always attempt the reply; gate only the UI continuation.
         const superseded = !isActive();
-        const socketOpen = thisSock.readyState === WebSocket.OPEN;
-        let sendThrew = false;
-        if (socketOpen) {
-          try {
-            thisSock.send(JSON.stringify(reply));
-          } catch {
-            sendThrew = true;
-          }
-        }
-        if (socketOpen && !sendThrew) {
+        if (deliverReply(reply, msg.cmd, superseded)) {
           // #402 — the open receipt records that its answer was handed to a live socket.
           // ADVISORY only: a socket can still die before the bytes land, so this never
           // becomes a claim about what the caller received — only `applied` is that.
           markOpenReceiptReplySent(openReceipts, msg.rid);
-        } else {
-          // #508/#402 — the command RAN and its result has nowhere to go. Journal the
-          // exact frame (replayed on the next socket) and name the ACTUAL cause instead
-          // of leaving the caller with the orchestrator's guess that the tab "may be
-          // backgrounded or frozen" — it was neither; it answered and we could not send.
-          handleUndeliveredReply(
-            lostReplies.record({
-              reply,
-              cmd: msg.cmd,
-              reason: classifyUndeliveredReply({ socketOpen, superseded, sendThrew }),
-              at: Date.now(),
-            }),
-          );
         }
         if (superseded) return;
         // ask_user / request_secret paint their OWN cards and their replies carry

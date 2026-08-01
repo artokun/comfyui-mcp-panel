@@ -135,8 +135,8 @@ test("#508 wiring: a SUPERSEDED socket still gets its reply — only the UI cont
   const src = readFileSync(PANEL_JS, "utf8");
   const supersededAt = src.indexOf("const superseded = !isActive();");
   assert.notEqual(supersededAt, -1, "the instance guard must be captured, not used as an early return");
-  const block = src.slice(supersededAt, supersededAt + 2200);
-  const sendAt = block.indexOf("thisSock.send(JSON.stringify(reply));");
+  const block = src.slice(supersededAt, supersededAt + 1200);
+  const sendAt = block.indexOf("deliverReply(reply, msg.cmd, superseded)");
   const gateAt = block.indexOf("if (superseded) return;");
   assert.notEqual(sendAt, -1, "the reply must still be written to the socket it arrived on");
   assert.notEqual(gateAt, -1, "the UI continuation must still be gated on the instance guard");
@@ -147,6 +147,28 @@ test("#508 wiring: a SUPERSEDED socket still gets its reply — only the UI cont
     false,
     "the superseded early-return must not precede the reply write again",
   );
+});
+
+test("#508 codex R3: a command arriving on an ALREADY-superseded socket is refused, never dropped", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  // The listener must PARSE first: returning before parsing discards a queued command
+  // frame outright — neither executed, nor replied to, nor journaled — which is the very
+  // "registered tab that never acknowledges anything" wedge this change exists to remove.
+  const listenerAt = src.indexOf('thisSock.addEventListener("message"');
+  const listener = src.slice(listenerAt, listenerAt + 3000);
+  const parseAt = listener.indexOf("msg = JSON.parse(");
+  const guardAt = listener.indexOf("if (!isActive()) {");
+  assert.ok(parseAt !== -1 && guardAt !== -1, "the listener must parse before the instance guard");
+  assert.ok(parseAt < guardAt, "the frame must be parsed BEFORE the superseded early return");
+  // …and the refusal must be rid-correlated, explicitly NOT-APPLIED, and delivered/journaled.
+  const guarded = listener.slice(guardAt, guardAt + 1600);
+  assert.match(guarded, /if \(isCommandFrame\) \{/, "only command frames get a refusal");
+  assert.match(guarded, /rid: msg\.rid/, "the refusal must correlate to the command");
+  assert.match(guarded, /ok: false/, "a stale command is refused, never reported as done");
+  assert.match(guarded, /NOTHING was applied/, "the refusal must say it is safe to re-issue");
+  assert.match(guarded, /deliverReply\(/, "the refusal goes through the same deliver+journal path");
+  // The stale command must NOT be executed.
+  assert.equal(/GRAPH_TOOL_EXECUTORS/.test(guarded), false, "a superseded socket must never execute");
 });
 
 test("#508 wiring: an undelivered reply is journaled, replayed after hello, and self-heals boundedly", () => {
