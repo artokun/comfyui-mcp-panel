@@ -28,6 +28,7 @@ import {
   assertResolvedTargetRegistered,
   assertTypeAgainstFreshBackend,
 } from "./node-resolve.js";
+import { controlAfterGenerateWarning } from "./control-after-generate.js";
 
 export async function runSetWidget(
   node,
@@ -184,6 +185,11 @@ export async function runSetWidget(
   // runs on the RESOLVED target BEFORE coercion/mutation, so a placeholder is
   // refused before any side effect (#458). promotedResolution is reused so the
   // write lands on the exact inner node the fresh oracle authorized.
+  // The full (possibly dotted) widgetName is passed through UNCHANGED (#560): sub-field
+  // addressing ("lora_1.on") is resolved EXACT-NAME-FIRST inside applyWidgetWrite /
+  // resolveWidgetWrite — a real widget whose own name contains a dot still wins, and a
+  // dotted form is only interpreted when no exact widget matches — so the split can
+  // never silently misroute to a different widget.
   const write = () =>
     applyWidgetWrite(node, widgetName, value, {
       resolveSource,
@@ -195,8 +201,23 @@ export async function runSetWidget(
       promotedResolution,
     });
 
+  // #558: the value widget being written may be governed by a non-`fixed`
+  // control_after_generate (seed randomize/increment/…), which SILENTLY overwrites
+  // it after the next generation. Warn HONESTLY on success — the write "took", but it
+  // will not hold — pointing at the exact control widget to make it stick. Computed on
+  // the ULTIMATE CONCRETE node + its concrete widget name (where control_after_generate
+  // actually lives): a nested promotion A→B→KSampler exposes `seed` on B virtually, but
+  // the control combo is on KSampler — `authTarget`/`concreteWidgetName` follow the
+  // promotion chain to it (both are the node itself for a direct write).
+  const withWarning = (result) => {
+    const warnNode = authTarget ?? resolvedTargetNode;
+    const warnWidget = concreteWidgetName ?? writeTargetWidgetName ?? widgetName;
+    const warning = controlAfterGenerateWarning(warnNode, warnWidget);
+    return warning ? { ...result, warning } : result;
+  };
+
   try {
-    return { set: write() };
+    return withWarning({ set: write() });
   } catch (err) {
     // STALE-COMBO RECOVERY (#338/#317/#299/#288/#284/#304): the ONLY retryable
     // failure is a COMBO value rejected against the widget's CURRENT option list
@@ -229,7 +250,7 @@ export async function runSetWidget(
         /* refresh best-effort; fall through to re-raise the original rejection */
       }
       try {
-        return { set: write(), refreshed: true };
+        return withWarning({ set: write(), refreshed: true });
       } catch (retryErr) {
         if (retryErr instanceof WidgetWriteError) {
           throw new Error(

@@ -91,12 +91,131 @@ export function isCompositeObjectWidget(widget) {
   return v != null && typeof v === "object" && !Array.isArray(v);
 }
 
+// DECLARED field schema for known composite widgets. Types are enforced from THIS
+// schema, never inferred from the current value — a field whose current value is `null`
+// still enforces the correct type, so a scalar of the wrong type (e.g. a number into a
+// `lora` filename) can never be written on an EMPTY/cleared row (#560 P0). `nullable`
+// marks fields that legitimately hold `null` (an empty slot), so clearing them is
+// allowed (#560 P2). rgthree Power Lora Loader slot: {on, lora, strength, strengthTwo}.
+const RGTHREE_LORA_SLOT_SCHEMA = {
+  on: { type: "boolean", nullable: false },
+  lora: { type: "string", nullable: true },
+  strength: { type: "number", nullable: false },
+  strengthTwo: { type: "number", nullable: true },
+};
+
+// True for an rgthree Power Lora Loader slot object. Identified by its KEY-SET SHAPE
+// ONLY — the keys are a SUBSET of the rgthree slot keys {on, lora, strength, strengthTwo}
+// and include the core {on, lora, strength}. The classification does NOT depend on the
+// current VALUES being well-formed: a PARTIALLY-CORRUPT row (e.g. lora already holding a
+// number from a prior bad write) must STILL be recognized so the schema is ENFORCED and
+// the row is repaired-forward — never fall back to inferring a type from a corrupt value,
+// which would accept a further wrong-type write and deepen the corruption.
+const RGTHREE_LORA_SLOT_KEYS = new Set(["on", "lora", "strength", "strengthTwo"]);
+function isLoraSlotObject(obj) {
+  if (obj == null || typeof obj !== "object" || Array.isArray(obj)) return false;
+  const keys = Object.keys(obj);
+  if (keys.length === 0) return false;
+  if (!keys.every((k) => RGTHREE_LORA_SLOT_KEYS.has(k))) return false; // no foreign/extra keys
+  for (const core of ["on", "lora", "strength"]) {
+    if (!Object.prototype.hasOwnProperty.call(obj, core)) return false;
+  }
+  return true;
+}
+
+// The declared {type, nullable} schema for `field` of composite `base`, or null when the
+// composite is unknown (no declared schema).
+function compositeFieldSchema(base, field) {
+  if (isLoraSlotObject(base) && Object.prototype.hasOwnProperty.call(RGTHREE_LORA_SLOT_SCHEMA, field)) {
+    return RGTHREE_LORA_SLOT_SCHEMA[field];
+  }
+  return null;
+}
+
+// STRICT type coercion to a declared primitive type. Mirrors the whole-widget #240
+// strictness. Throws WidgetWriteError on mismatch.
+function coerceByType(type, value, where) {
+  if (type === "boolean") {
+    if (typeof value === "boolean") return value;
+    const s = String(value).toLowerCase();
+    if (s === "true" || s === "1") return true;
+    if (s === "false" || s === "0") return false;
+    throw new WidgetWriteError(`${where} is boolean but value ${JSON.stringify(value)} is not a boolean.`);
+  }
+  if (type === "number") {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) return Number(value);
+    throw new WidgetWriteError(`${where} is numeric but value ${JSON.stringify(value)} is not a number.`);
+  }
+  if (type === "string") {
+    if (typeof value === "string") return value;
+    throw new WidgetWriteError(`${where} is a string but value ${JSON.stringify(value)} is not a string.`);
+  }
+  return value;
+}
+
+/**
+ * Validate + coerce a composite field value. The expected type comes FIRST from the
+ * declared schema (so a null current field still enforces the right type, #560 P0), and
+ * `null` is accepted only for a nullable field (#560 P2). For an UNKNOWN composite with
+ * no schema, fall back to the existing NON-null value's type; a null/undefined current
+ * value with no schema is genuinely untyped, so only a primitive is accepted verbatim.
+ * Throws WidgetWriteError on a mismatch.
+ */
+function coerceCompositeFieldValue(widgetName, base, field, value) {
+  const where = `sub-field "${widgetName}.${field}"`;
+  const schema = compositeFieldSchema(base, field);
+  if (schema) {
+    if (value === null) {
+      if (schema.nullable) return null;
+      throw new WidgetWriteError(`${where} is not nullable (expected ${schema.type}).`);
+    }
+    return coerceByType(schema.type, value, where);
+  }
+  // Unknown composite: infer the expected type from the EXISTING non-null value.
+  const existing = base?.[field];
+  if (typeof existing === "boolean") return coerceByType("boolean", value, where);
+  if (typeof existing === "number") return coerceByType("number", value, where);
+  if (typeof existing === "string") return coerceByType("string", value, where);
+  // No schema AND an untyped current value (null/undefined/object): the field's type is
+  // genuinely unknowable, so we REFUSE rather than write a possibly-wrong-typed value —
+  // #560's principle is a loud, safe failure over silent corruption. (A KNOWN composite,
+  // e.g. rgthree, is handled by the schema above and its nullable fields still clear.)
+  throw new WidgetWriteError(
+    `${where}: cannot validate the value — this composite is not a recognized type and the ` +
+      `field's current value is ${existing === undefined ? "undefined" : JSON.stringify(existing)}, ` +
+      `so its expected type is unknown. Set a correctly-typed value only if the field already ` +
+      `holds one, or edit this widget from the node UI.`,
+  );
+}
+
+/**
+ * Merge `incoming` fields onto composite `base`, FAILING CLOSED on any field that does
+ * not already exist (never ADD a member) and validating each value against the field's
+ * DECLARED type / an unknown composite's existing type (#560 hardening). Used by BOTH
+ * the dotted single-field path and the #179 full-JSON-object path so neither can silently
+ * mistype or junk-up a composite row.
+ */
+function mergeCompositeFields(widgetName, base, incoming) {
+  const out = { ...base };
+  for (const key of Object.keys(incoming)) {
+    if (!Object.prototype.hasOwnProperty.call(base, key)) {
+      throw new WidgetWriteError(
+        `Composite widget "${widgetName}" has no field "${key}" ` +
+          `(fields: ${Object.keys(base).join(", ") || "none"}). Refusing to add an unknown field.`,
+      );
+    }
+    out[key] = coerceCompositeFieldValue(widgetName, base, key, incoming[key]);
+  }
+  return out;
+}
+
 /**
  * Validate + coerce `value` for `widget`, returning the value to write. Throws
  * WidgetWriteError (never silently coerces to a wrong value) when the value is
  * incompatible with the widget's declared type.
  */
-export function coerceWidgetValue(widget, value, mergeBaseWidget = widget) {
+export function coerceWidgetValue(widget, value, mergeBaseWidget = widget, subFieldPath = null) {
   const name = widget?.name ?? "(widget)";
 
   // #347: distinguish "clear to empty" from "missing value". An EXPLICIT empty
@@ -105,11 +224,63 @@ export function coerceWidgetValue(widget, value, mergeBaseWidget = widget) {
   // or dropped arg) is not, and must fail loudly instead of silently writing
   // `undefined`. The combo/numeric/boolean branches below still reject "" on
   // their own terms, so #240 strictness is untouched.
-  if (value === undefined || value === null) {
+  // A MISSING value (undefined) is always refused. An explicit `null` for a WHOLE-widget
+  // write is also refused (#347: clear a text widget with ""); but for a SUB-FIELD write
+  // `null` is a legitimate CLEAR of a nullable composite field (e.g. `lora_1.lora=null`),
+  // so it is allowed through to coerceCompositeFieldValue, which enforces the schema's
+  // nullability (a non-nullable field still rejects null).
+  if (value === undefined || (value === null && subFieldPath == null)) {
     throw new WidgetWriteError(
-      `No value provided for widget "${name}". To clear a text widget, pass an ` +
-        `explicit empty string ("").`,
+      subFieldPath != null
+        ? `No value provided for sub-field "${name}.${subFieldPath}".`
+        : `No value provided for widget "${name}". To clear a text widget, pass an ` +
+            `explicit empty string ("").`,
     );
+  }
+
+  // #560: EXPLICIT sub-field addressing (widget "lora_1.on" / "lora_1.strength").
+  // Writing a bare scalar to a COMPOSITE object widget (rgthree Power Lora Loader's
+  // `lora_N` rows: {on, lora, strength, strengthTwo}) previously corrupted the row —
+  // a scalar toggled one field and nulled the rest. Addressing ONE field merges that
+  // field onto the CURRENT object and PRESERVES every other field. This runs BEFORE
+  // the combo/numeric/boolean branches so a sub-field write is never reinterpreted by
+  // the base widget's declared type.
+  if (subFieldPath != null && subFieldPath !== "") {
+    // Only single-level fields are supported; a nested path needs a per-node schema
+    // we do not have — refuse LOUDLY rather than write a wrongly-shaped object.
+    if (subFieldPath.includes(".")) {
+      throw new WidgetWriteError(
+        `Nested sub-field path "${name}.${subFieldPath}" is not supported. Address ONE ` +
+          `top-level field (e.g. "${name}.on", "${name}.strength") or pass a full JSON object.`,
+      );
+    }
+    // The AUTHORITATIVE base object to merge onto: the promoted rail's current object
+    // when present (#366×#179), else the target widget's own value. The field is only
+    // addressable when that base is a real (non-array) object.
+    const railBase =
+      mergeBaseWidget &&
+      mergeBaseWidget.value != null &&
+      typeof mergeBaseWidget.value === "object" &&
+      !Array.isArray(mergeBaseWidget.value)
+        ? mergeBaseWidget.value
+        : null;
+    const ownBase =
+      widget?.value != null && typeof widget.value === "object" && !Array.isArray(widget.value)
+        ? widget.value
+        : null;
+    const base = railBase ?? ownBase;
+    if (base == null) {
+      throw new WidgetWriteError(
+        `Widget "${name}" is not a composite object widget, so its sub-field ` +
+          `"${subFieldPath}" cannot be addressed. Sub-field writes (e.g. "lora_1.on") are ` +
+          `only valid on widgets whose current value is an object.`,
+      );
+    }
+    // Merge ONLY the addressed field: FAIL CLOSED on an unknown field (a typo like
+    // "lora_1.strenght" must not create junk) and validate the value against the
+    // existing field's type (no silent mistyping — "false" into a boolean, a number
+    // into a filename), mirroring #240 whole-widget strictness. All other fields survive.
+    return mergeCompositeFields(name, base, { [subFieldPath]: value });
   }
 
   if (isComboWidget(widget)) {
@@ -173,7 +344,13 @@ export function coerceWidgetValue(widget, value, mergeBaseWidget = widget) {
   // lora=null and drops strength). Parse a JSON-string payload (or accept an
   // object directly) and MERGE onto the current value so fields the caller did
   // not specify (e.g. strengthTwo) are preserved.
-  if (isCompositeObjectWidget(widget)) {
+  //
+  // Detect the composite from the inner widget OR the AUTHORITATIVE promoted RAIL widget
+  // (mergeBaseWidget): the value that SERIALIZES is the rail's, so if the rail still holds
+  // a composite object while the inner value has gone stale/scalar, the write must STILL
+  // be treated as composite — otherwise the JSON payload would fall through as a raw
+  // string and clobber the rail (#179/#366 rail-authoritative guarantee).
+  if (isCompositeObjectWidget(widget) || isCompositeObjectWidget(mergeBaseWidget)) {
     let incoming = value;
     if (typeof value === "string") {
       try {
@@ -181,15 +358,19 @@ export function coerceWidgetValue(widget, value, mergeBaseWidget = widget) {
       } catch {
         throw new WidgetWriteError(
           `Widget "${name}" holds a composite object value; the string ` +
-            `${JSON.stringify(value)} is not valid JSON for it.`,
+            `${JSON.stringify(value)} is not valid JSON for it. To change ONE field, ` +
+            `address it directly (e.g. "${name}.on" or "${name}.strength"), or pass a full ` +
+            `JSON object like {"on":false}.`,
         );
       }
     }
     if (incoming == null || typeof incoming !== "object" || Array.isArray(incoming)) {
       throw new WidgetWriteError(
-        `Widget "${name}" is a composite object widget; value ${JSON.stringify(value)} ` +
-          `must be an object (or a JSON object string), e.g. ` +
-          `{"on":true,"lora":"name.safetensors","strength":1}.`,
+        `Widget "${name}" is a composite object widget; a bare scalar would corrupt it. ` +
+          `Value ${JSON.stringify(value)} must be an object (or JSON object string), e.g. ` +
+          `{"on":true,"lora":"name.safetensors","strength":1}. To change ONE field and keep ` +
+          `the rest, address it directly: "${name}.on"=false, "${name}.strength"=0.8, or pass ` +
+          `a JSON object {"on":false}.`,
       );
     }
     // #366×#179: for a PROMOTED composite, the AUTHORITATIVE base is the RAIL
@@ -201,7 +382,12 @@ export function coerceWidgetValue(widget, value, mergeBaseWidget = widget) {
       mergeBaseWidget && mergeBaseWidget.value != null && typeof mergeBaseWidget.value === "object" && !Array.isArray(mergeBaseWidget.value)
         ? mergeBaseWidget.value
         : widget.value;
-    return { ...base, ...incoming };
+    // Validate EACH incoming key against the existing row (fail closed on an unknown
+    // field, type-check each value) so a full-object write cannot silently mistype `on`
+    // or add junk members either — the same strictness the dotted path enforces (#560).
+    const mergeBase =
+      base != null && typeof base === "object" && !Array.isArray(base) ? base : {};
+    return mergeCompositeFields(name, mergeBase, incoming);
   }
 
   // STRING / text / unknown widget: pass through unchanged (an explicit "" clears
@@ -417,6 +603,10 @@ export function resolveWidgetWrite(
   let promotedFrom = null;
   let promotedParentWidget = null;
   let promotedHostInput = null;
+  // #560: sub-field addressing ("lora_1.on") is derived AFTER an exact-name lookup
+  // fails — never by pre-splitting the caller's name — so a real widget whose own
+  // name contains a dot is never hijacked.
+  let subFieldPath = null;
 
   if (node?.subgraph) {
     // Reuse a promotion resolution the caller already computed (graph_set_widget
@@ -463,9 +653,61 @@ export function resolveWidgetWrite(
   }
 
   if (!widget) {
+    // EXACT-NAME FIRST: a widget whose own name is literally `widgetName` (dots and
+    // all) always wins — the split is never taken when an exact match exists.
     widget = (targetNode.widgets ?? []).find(
       (cand) => cand?.name?.toLowerCase() === String(widgetName).toLowerCase(),
     );
+  }
+  if (!widget && node?.subgraph) {
+    // #560 SAFETY: on a SUBGRAPH parent, a dotted name that did not resolve as a
+    // promotion alias must NOT fall through to the base-name dotted fallback below —
+    // that would write the parent's projected RAIL widget DIRECTLY, bypassing the
+    // atomic inner+rail #366 path (inner left stale, silent partial). A promoted
+    // composite is driven with a FULL JSON object on the promoted widget instead,
+    // which goes through the #366 merge. Refuse the dotted form loudly here.
+    const nameStr = String(widgetName);
+    if (nameStr.indexOf(".") > 0) {
+      const baseName = nameStr.slice(0, nameStr.indexOf("."));
+      throw new WidgetWriteError(
+        `Dotted sub-field addressing ("${widgetName}") is not supported on subgraph node ` +
+          `${node.id}. If "${baseName}" is a promoted composite widget, set it with a full JSON ` +
+          `object (e.g. {"on":false}) so the promoted inner + rail update atomically (#366); ` +
+          `otherwise address it from the node that owns the widget.`,
+      );
+    }
+  }
+  if (!widget) {
+    // #560: no exact widget — try DOTTED sub-field addressing ("lora_1.on") on a DIRECT
+    // node. Resolve the BASE widget (before the first dot); the field is only
+    // addressable when the base is a COMPOSITE object widget. An empty suffix ("foo.")
+    // is rejected LOUDLY rather than silently degrading to a bare write on the base.
+    const nameStr = String(widgetName);
+    const dot = nameStr.indexOf(".");
+    if (dot > 0) {
+      const baseName = nameStr.slice(0, dot);
+      const sub = nameStr.slice(dot + 1);
+      const baseWidget = (targetNode.widgets ?? []).find(
+        (cand) => cand?.name?.toLowerCase() === baseName.toLowerCase(),
+      );
+      if (baseWidget) {
+        if (sub === "") {
+          throw new WidgetWriteError(
+            `Widget "${widgetName}" has an empty sub-field after the dot. Address a field, ` +
+              `e.g. "${baseName}.on" or "${baseName}.strength".`,
+          );
+        }
+        if (!isCompositeObjectWidget(baseWidget)) {
+          throw new WidgetWriteError(
+            `Widget "${baseName}" is not a composite object widget, so its sub-field ` +
+              `"${sub}" cannot be addressed. Sub-field writes are only valid on widgets ` +
+              `whose current value is an object (e.g. an rgthree Power Lora Loader row).`,
+          );
+        }
+        widget = baseWidget;
+        subFieldPath = sub;
+      }
+    }
   }
   if (!widget) {
     const names = (targetNode.widgets ?? []).map((cand) => cand?.name).join(", ");
@@ -486,7 +728,7 @@ export function resolveWidgetWrite(
   // unaffected (they don't merge). Non-promoted writes merge onto their own value.
   // (A promoted write with no authoritative rail already threw above, BEFORE this
   // possibly side-effecting coercion — so `promotedParentWidget` is non-null here.)
-  const coerced = coerceWidgetValue(widget, value, promotedParentWidget ?? widget);
+  const coerced = coerceWidgetValue(widget, value, promotedParentWidget ?? widget, subFieldPath);
 
   return { targetNode, widget, coerced, promotedFrom, promotedParentWidget, promotedHostInput };
 }
