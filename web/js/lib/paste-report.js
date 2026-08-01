@@ -139,6 +139,65 @@ export function diffCopiedVsPasted(copied, pasted, isRegisteredType) {
   return { dropped, dropped_count: dropped.length, dropped_types };
 }
 
+/**
+ * The DISTINCT node types among the copied items that are NOT registered on the
+ * current frontend — i.e. exactly the types a subsequent paste will silently
+ * DROP (LiteGraph.createNode returns null for an unregistered type). Empty array
+ * when every copied type round-trips.
+ *
+ * #286: a workflow loaded with uninstalled custom-node packs can be copied whole
+ * (`graph_copy_nodes` reports `copied: 47`), but paste later drops the 25 nodes
+ * whose packs aren't installed. Because the destination frontend is the SAME one
+ * doing the copy, the round-trip-ability is knowable AT COPY TIME — so copy can
+ * warn instead of silently promising a clean copy that can't round-trip. Order
+ * is first-seen; each type appears once.
+ *
+ * @param {Iterable<{id?:any,type?:string}>|Set} items  copied selection
+ * @param {(type:string)=>boolean} isRegisteredType  true if type is a known node class
+ * @returns {string[]} distinct unregistered node types (empty if all round-trip)
+ */
+export function unregisteredCopiedTypes(items, isRegisteredType) {
+  if (typeof isRegisteredType !== "function") return [];
+  const seen = new Set();
+  const out = [];
+  for (const it of normalizeCopiedItems(items)) {
+    if (!isRegisteredType(it.type) && !seen.has(it.type)) {
+      seen.add(it.type);
+      out.push(it.type);
+    }
+  }
+  return out;
+}
+
+/**
+ * Build the `isRegisteredType` predicate for {@link unregisteredCopiedTypes} from
+ * a LiteGraph registry object (`LiteGraph.registered_node_types`), or `undefined`
+ * when no USABLE registry exists — missing, not an object, or EMPTY.
+ *
+ * The empty/missing case is the important one (#286): if the frontend's registry
+ * hasn't loaded, a bare `{}` predicate would report EVERY copied type as
+ * unregistered and warn it "will be DROPPED" — a false alarm on a copy that may
+ * paste back fine. Returning `undefined` makes unregisteredCopiedTypes fall back
+ * to its no-predicate safety (it reports nothing), so we only ever warn when we
+ * have a real registry to prove a type genuinely isn't registered.
+ */
+export function registryTypePredicate(registry) {
+  if (!registry || typeof registry !== "object") return undefined;
+  if (Object.keys(registry).length === 0) return undefined;
+  return (t) => Object.prototype.hasOwnProperty.call(registry, t);
+}
+
+/** Human-readable one-liner warning for copied node types that cannot round-trip
+ *  (they'll be dropped on paste), or null when the list is empty. */
+export function formatUnpasteableCopyWarning(types) {
+  if (!types || !types.length) return null;
+  return (
+    `${types.length} copied node type${types.length > 1 ? "s are" : " is"} not registered on ` +
+    `this ComfyUI frontend and will be DROPPED on paste (install the pack that provides ` +
+    `${types.length > 1 ? "them" : "it"}, then re-copy): ${types.join(", ")}`
+  );
+}
+
 /** Human-readable one-liner for a dropped-node report, or null if none. */
 export function formatDroppedWarning(dropped) {
   if (!dropped || !dropped.length) return null;

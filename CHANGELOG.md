@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- **`panel_copy_nodes` no longer reports a clean copy that can't round-trip (#286).** When a workflow's custom-node packs aren't installed, copying those nodes used to return a bare `copied: N` even though a later paste silently drops every unregistered type (the packs aren't registered on this frontend, so `LiteGraph.createNode` returns null). `graph_copy_nodes` now checks the copied selection against the frontend's registered node types up front and returns `unregistered_types` + a `warning` naming exactly which types won't paste — so an agent knows before it builds an incomplete graph, complementing the paste-side drop report shipped in #261.
+
 ## [0.11.24] - 2026-08-01
 
 ### Added

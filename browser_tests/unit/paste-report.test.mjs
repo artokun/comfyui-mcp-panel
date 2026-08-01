@@ -21,6 +21,9 @@ import {
   parseClipboardNodes,
   diffCopiedVsPasted,
   formatDroppedWarning,
+  unregisteredCopiedTypes,
+  registryTypePredicate,
+  formatUnpasteableCopyWarning,
 } from "../../web/js/lib/paste-report.js";
 
 // A trimmed but realistic slice of the wan-multitalk clipboard: live LiteGraph
@@ -219,4 +222,93 @@ test("stale snapshot + native copy of a DIFFERENT selection does NOT fabricate d
   const pastedB = [pastedNode(50, "SaveImage"), pastedNode(51, "CLIPTextEncode")];
   const { dropped_count } = diffCopiedVsPasted(staleSnapshotA, pastedB, isRegistered);
   assert.equal(dropped_count, 0);
+});
+
+// ---- #286: copy-time round-trip check ------------------------------------
+// graph_copy_nodes must not report a clean copy when some copied nodes can't
+// round-trip. On the SAME frontend, an unregistered type (uninstalled custom
+// pack) is exactly what a later paste silently drops — so copy warns up front.
+
+test("unregisteredCopiedTypes flags copied types missing from the frontend registry", () => {
+  // #286 shape: a workflow with uninstalled packs — KSampler is registered,
+  // WanVideoSampler / AudioCrop are not (packs not installed).
+  const registered = new Set(["KSampler", "VAEDecode"]);
+  const isRegistered = (t) => registered.has(t);
+  const copied = new Set([
+    liveNode(1, "KSampler"),
+    liveNode(2, "WanVideoSampler"),
+    liveNode(3, "AudioCrop"),
+    liveNode(4, "VAEDecode"),
+  ]);
+  assert.deepEqual(unregisteredCopiedTypes(copied, isRegistered), [
+    "WanVideoSampler",
+    "AudioCrop",
+  ]);
+});
+
+test("unregisteredCopiedTypes de-dupes per type and returns [] when all round-trip", () => {
+  const registered = new Set(["KSampler"]);
+  const isRegistered = (t) => registered.has(t);
+  // All registered → empty.
+  assert.deepEqual(
+    unregisteredCopiedTypes([liveNode(1, "KSampler"), liveNode(2, "KSampler")], isRegistered),
+    [],
+  );
+  // Two nodes of the same unregistered type collapse to one entry.
+  assert.deepEqual(
+    unregisteredCopiedTypes(
+      [liveNode(1, "AudioCrop"), liveNode(2, "AudioCrop"), liveNode(3, "KSampler")],
+      isRegistered,
+    ),
+    ["AudioCrop"],
+  );
+});
+
+test("unregisteredCopiedTypes ignores groups/typeless items and a missing predicate", () => {
+  const isRegistered = () => false;
+  const items = new Set([liveNode(1, "AudioCrop"), { id: null, title: "grp" }, { id: 9 }]);
+  assert.deepEqual(unregisteredCopiedTypes(items, isRegistered), ["AudioCrop"]);
+  // No predicate → we can't prove anything unregistered → empty (never a false warning).
+  assert.deepEqual(unregisteredCopiedTypes(items, undefined), []);
+});
+
+test("registryTypePredicate returns undefined for a missing/empty registry, a working predicate otherwise", () => {
+  // Missing / non-object → undefined (no usable registry, never fabricate drops).
+  assert.equal(registryTypePredicate(undefined), undefined);
+  assert.equal(registryTypePredicate(null), undefined);
+  assert.equal(registryTypePredicate("nope"), undefined);
+  // EMPTY registry (frontend not loaded) → undefined. This is the #286 P2: the
+  // executor must NOT flag every copied node as "will be dropped" when the
+  // registry didn't load. Feeding the result into unregisteredCopiedTypes yields [].
+  assert.equal(registryTypePredicate({}), undefined);
+  assert.deepEqual(
+    unregisteredCopiedTypes(
+      [liveNode(1, "KSampler"), liveNode(2, "AudioCrop")],
+      registryTypePredicate({}),
+    ),
+    [],
+  );
+  // Populated registry → predicate that reports only genuinely-unregistered types.
+  const pred = registryTypePredicate({ KSampler: {}, VAEDecode: {} });
+  assert.equal(typeof pred, "function");
+  assert.equal(pred("KSampler"), true);
+  assert.equal(pred("AudioCrop"), false);
+  assert.deepEqual(
+    unregisteredCopiedTypes(
+      [liveNode(1, "KSampler"), liveNode(2, "AudioCrop")],
+      registryTypePredicate({ KSampler: {}, VAEDecode: {} }),
+    ),
+    ["AudioCrop"],
+  );
+});
+
+test("formatUnpasteableCopyWarning summarizes the un-round-trippable types (or null)", () => {
+  assert.equal(formatUnpasteableCopyWarning([]), null);
+  assert.equal(formatUnpasteableCopyWarning(null), null);
+  const one = formatUnpasteableCopyWarning(["AudioCrop"]);
+  assert.match(one, /1 copied node type is not registered/);
+  assert.match(one, /AudioCrop/);
+  const many = formatUnpasteableCopyWarning(["AudioCrop", "AudioSeparation"]);
+  assert.match(many, /2 copied node types are not registered/);
+  assert.match(many, /AudioCrop, AudioSeparation/);
 });
