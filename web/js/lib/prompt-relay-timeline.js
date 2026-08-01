@@ -48,7 +48,10 @@
 // envelope before being replaced, so no prompt text ever disappears without the caller being
 // told — as is an UNCOMMITTED edit the user was still typing when the write landed
 // (`overwrote_uncommitted_edit`) and a timeline_data copy that lost to the editor
-// (`superseded_timeline_data`). Both carry the prior prompts PER SEGMENT, and both are decided
+// (`superseded_timeline_data`). Which name a discarded copy gets depends on WHICH branch
+// settled authority: a copy the derived-widget filter REJECTED is stale on positive evidence,
+// so it comes back as `discarded_stale_editor` with no warning — the ordinary post-load window
+// must not fire a data-loss alarm, or the alarm stops meaning anything. Both carry the prior prompts PER SEGMENT, and both are decided
 // by comparing segment ARRAYS (sameSegmentContent), never the derived `" | "` join, which is
 // lossy and would hide a real overwrite whenever a prompt contains a literal "|". The same limit
 // governs WHICH copy is authoritative: a join comparison can only ask "could this widget hold
@@ -486,33 +489,38 @@ function derivedMatchesWidgets(timeline, widgets) {
 function chooseMergeBase(editor, widgets) {
   const fromEditor = liveEditorTimeline(editor);
   const fromWidget = parsePromptRelayTimeline(widgets[PROMPT_RELAY_MASTER_WIDGET].value);
-  const pick = (base, baseSource, ambiguous = false) => ({
+  // `reason` records WHICH branch settled authority. That matters downstream: a copy set aside
+  // by the case-3 filter was proven stale, while one set aside by a tie or by being superseded
+  // was not — and the two deserve very different disclosures.
+  const pick = (base, baseSource, reason, ambiguous = false) => ({
     base,
     baseSource,
+    reason,
     fromWidget,
     fromEditor,
     ambiguous,
   });
   // 1. Only one record to merge onto (or none).
-  if (!fromEditor && !fromWidget) return pick(null, "none");
-  if (!fromEditor) return pick(fromWidget, "timeline_data");
-  if (!fromWidget) return pick(fromEditor, "editor");
+  if (!fromEditor && !fromWidget) return pick(null, "none", "no-readable-copy");
+  if (!fromEditor) return pick(fromWidget, "timeline_data", "only-readable-copy");
+  if (!fromWidget) return pick(fromEditor, "editor", "only-readable-copy");
   // 2. The two records carry the SAME content, so there is no authority to settle. The master
   //    field is canonical (it also carries the persisted non-segment fields).
   if (sameSegmentContent(fromEditor.segments, fromWidget.segments)) {
-    return pick(fromWidget, "timeline_data");
+    return pick(fromWidget, "timeline_data", "copies-identical");
   }
   // 3. They differ. Use the derived widgets as a FILTER: whichever record could NOT have
-  //    produced what the node would execute right now is the stale one.
+  //    produced what the node would execute right now is the stale one. A record REJECTED here
+  //    is stale on positive evidence, not merely different.
   const editorConsistent = derivedMatchesWidgets(fromEditor, widgets);
   const widgetConsistent = derivedMatchesWidgets(fromWidget, widgets);
-  if (widgetConsistent && !editorConsistent) return pick(fromWidget, "timeline_data");
-  if (editorConsistent && !widgetConsistent) return pick(fromEditor, "editor");
+  if (widgetConsistent && !editorConsistent) return pick(fromWidget, "timeline_data", "filter-rejected-editor");
+  if (editorConsistent && !widgetConsistent) return pick(fromEditor, "editor", "filter-rejected-master");
   // 4. The filter cannot separate them — either both serialize to the same derived strings
   //    (the lossy-join collision) or neither matches at all. Prefer the LIVE EDITOR: losing a
   //    superseded master is recoverable from the saved workflow, losing an uncommitted edit is
   //    not. Flagged as ambiguous, and the copy that lost is returned to the caller.
-  return pick(fromEditor, "editor", true);
+  return pick(fromEditor, "editor", "unresolved-tie", true);
 }
 
 /** The refusal message for a DERIVED-widget write — explains why + points at timeline_data. */
@@ -584,6 +592,7 @@ export function applyPromptRelayTimelineWrite(
   const {
     base,
     baseSource,
+    reason: baseReason,
     fromWidget,
     fromEditor,
     ambiguous: baseAmbiguous,
@@ -635,10 +644,22 @@ export function applyPromptRelayTimelineWrite(
   // normal record and the caller read it, so an ordinary write there stays quiet.
   const anomalous = editorSegs && widgetSegs ? !sameSegmentContent(editorSegs, widgetSegs) : !!editorSegs;
 
-  const overwroteInFlight =
-    anomalous && editorSegs && !sameSegmentContent(editorSegs, segments)
-      ? contentSnapshot(editorSegs)
-      : null;
+  // HOW a discarded copy is CLASSIFIED depends on WHICH branch settled authority — not merely
+  // on the two copies differing. When the case-3 filter chose the master precisely BECAUSE the
+  // editor could not have produced what the node executes, the editor is stale on positive
+  // evidence: the ordinary post-load window, where onConfigure restores the widgets ~10ms
+  // before it re-parses the editor. Calling that an overwritten uncommitted edit would fire a
+  // data-loss warning on a routine write and train callers to ignore the signal exactly when it
+  // is real — and this disclosure is the safety net for the one residual we accept (a stale
+  // post-load editor whose joins collide with a newer master). So its content is still handed
+  // back, under a name that says what it is and with NO warning attached.
+  const editorWasAuthority = baseSource === "editor";
+  const editorDiscarded = !!editorSegs && !sameSegmentContent(editorSegs, segments);
+
+  const overwroteInFlight = editorWasAuthority && editorDiscarded ? contentSnapshot(editorSegs) : null;
+  // Quiet channel: proven-stale, so payload only.
+  const discardedStaleEditor =
+    !editorWasAuthority && anomalous && editorDiscarded ? contentSnapshot(editorSegs) : null;
   if (overwroteInFlight) {
     warnings.push(
       `this node held an UNCOMMITTED timeline edit — the live editor's segments (what the node ` +
@@ -649,8 +670,11 @@ export function applyPromptRelayTimelineWrite(
     );
   }
 
+  // Symmetrically: the master is only 'superseded' when it did NOT win authority. When case 3
+  // selected it and the caller then replaced its segments, that is the caller's plain intent,
+  // not a copy being set aside behind their back.
   const supersededTimelineData =
-    anomalous && widgetSegs && !sameSegmentContent(widgetSegs, segments)
+    editorWasAuthority && widgetSegs && !sameSegmentContent(widgetSegs, segments)
       ? contentSnapshot(widgetSegs)
       : null;
   if (baseAmbiguous) {
@@ -729,12 +753,14 @@ export function applyPromptRelayTimelineWrite(
       segments: segments.length,
       merged_onto_current: base != null,
       merge_base: baseSource,
+      merge_base_reason: baseReason,
       ...(baseAmbiguous ? { merge_base_ambiguous: true } : {}),
       editor_synced: editorSynced,
       local_prompts: derived.local_prompts,
       segment_lengths: derived.segment_lengths,
       ...(Object.keys(replaced).length ? { replaced_out_of_band: replaced } : {}),
       ...(overwroteInFlight ? { overwrote_uncommitted_edit: overwroteInFlight } : {}),
+      ...(discardedStaleEditor ? { discarded_stale_editor: discardedStaleEditor } : {}),
       ...(supersededTimelineData ? { superseded_timeline_data: supersededTimelineData } : {}),
       ...(uiRefreshError ? { ui_refresh_error: uiRefreshError } : {}),
       ...(warnings.length ? { warnings } : {}),

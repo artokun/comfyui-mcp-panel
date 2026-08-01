@@ -573,6 +573,50 @@ test("POST-LOAD: the timeline_data widget wins over an editor still holding the 
   assert.equal(widgets.segment_lengths.value, "50");
 });
 
+test("POST-LOAD: a stale editor is NOT reported as an overwritten uncommitted edit", () => {
+  // The routine post-load window: onConfigure restores the widgets ~10ms before it re-parses the
+  // editor, so the editor still holds the PREVIOUS workflow. An ordinary metadata-only write
+  // arrives. Case 3 rejects the editor on positive evidence (it could not have produced what the
+  // node executes), so calling its content an overwritten uncommitted edit would cry wolf on a
+  // routine write — and this disclosure is the safety net for the genuine collision case, so it
+  // must not become noise. The content is still returned, just classified honestly.
+  const { node, widgets, editor } = makeRelayNode({ timelineSegments: [seg("restored", 50)] });
+  editor.timeline = { segments: [seg("previous workflow", 99)] };
+
+  const res = relay(applyPromptRelayTimelineWrite(node, { zoom: 4 }));
+
+  assert.equal(res.merge_base, "timeline_data");
+  assert.equal(res.merge_base_reason, "filter-rejected-editor");
+  // NO data-loss claim, and no warning at all — nothing was typed and nothing was lost.
+  assert.equal(res.overwrote_uncommitted_edit, undefined);
+  assert.equal(res.warnings, undefined);
+  // The payload is still handed back, under a name that says what it actually is.
+  assert.deepEqual(res.discarded_stale_editor, { prompts: ["previous workflow"], lengths: [99] });
+  assert.equal(widgets.local_prompts.value, "restored");
+  assert.equal(widgets.segment_lengths.value, "50");
+});
+
+test("POST-LOAD: an explicit segments write does not claim the master was superseded", () => {
+  // Case 3 selected the master; replacing its segments is the caller's plain intent, not a copy
+  // set aside behind their back.
+  const { node, widgets, editor } = makeRelayNode({ timelineSegments: [seg("restored", 50)] });
+  editor.timeline = { segments: [seg("previous workflow", 99)] };
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("caller wrote this", 10)] }));
+  assert.equal(res.merge_base, "timeline_data");
+  assert.equal(res.superseded_timeline_data, undefined);
+  assert.equal(res.overwrote_uncommitted_edit, undefined);
+  assert.deepEqual(res.discarded_stale_editor, { prompts: ["previous workflow"], lengths: [99] });
+  assert.equal(widgets.local_prompts.value, "caller wrote this");
+});
+
+test("a stale editor whose content the write happens to reproduce reports nothing", () => {
+  const { node, editor } = makeRelayNode({ timelineSegments: [seg("restored", 50)] });
+  editor.timeline = { segments: [seg("previous workflow", 99)] };
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("previous workflow", 99)] }));
+  assert.equal(res.discarded_stale_editor, undefined);
+  assert.equal(res.overwrote_uncommitted_edit, undefined);
+});
+
 test("the live editor never has its segment objects aliased into the written timeline", () => {
   const { node, widgets, editor } = makeRelayNode();
   const originalSeg = editor.timeline.segments[0];
