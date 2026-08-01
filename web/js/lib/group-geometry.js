@@ -1,11 +1,15 @@
 // Pure geometry helpers for LiteGraph GROUP membership.
 //
 // LiteGraph groups do NOT own their nodes. Membership is purely GEOMETRIC: a
-// node belongs to a group when its bounding box overlaps the group's bounding
-// box. Several ComfyUI frontend builds leave LGraphGroup._nodes stale or empty
-// after programmatic bounds / pos / paste changes, so the panel must recompute
-// membership from LIVE node + group geometry on every read rather than trust the
-// cached _nodes array (issues #287, #305, #311, #312).
+// node belongs to a group when the group's bounding box contains the CENTRE
+// point of the node's bounding box — the exact rule ComfyUI's @comfyorg/litegraph
+// applies in LGraphGroup.recomputeInsideNodes (containsCentre → isInRect), so the
+// panel's reported members match what the user sees on the canvas (issue #497).
+// Several ComfyUI frontend builds leave LGraphGroup._nodes stale or empty after
+// programmatic bounds / pos / paste changes (and never recompute when a MEMBER
+// node moves — only when the GROUP is created/moved/resized), so the panel must
+// recompute membership from LIVE node + group geometry on every read rather than
+// trust the cached _nodes array (issues #287, #305, #311, #312, #497).
 //
 // These functions are intentionally dependency-free (no LiteGraph, no DOM) so
 // they can be unit-tested with plain object fixtures.
@@ -95,15 +99,20 @@ export function groupBoundsOf(g) {
 /**
  * LIVE geometric membership of a LiteGraph group.
  *
- * Recomputes from the CURRENT node + group geometry (overlap test, mirroring
- * LiteGraph's own overlapBounding) instead of trusting the cached g._nodes.
- * Best-effort calls g.recomputeInsideNodes?.() first to keep LiteGraph's own
- * cache (used by convertToSubgraph / canvas selection) in sync, but never
- * depends on its result.
+ * Recomputes from the CURRENT node + group geometry instead of trusting the
+ * cached g._nodes (which LiteGraph only refreshes when the GROUP moves, never
+ * when a member node moves — the #497 stale-membership root cause). Membership
+ * mirrors @comfyorg/litegraph's LGraphGroup.recomputeInsideNodes: a node is IN
+ * the group when the group box contains the node bounding-box's CENTRE point
+ * (containsCentre → isInRect), NOT when the two boxes merely overlap. A node
+ * moved so its centre leaves the box is dropped even if an edge still pokes in —
+ * matching what the user sees on the canvas. Best-effort calls
+ * g.recomputeInsideNodes?.() first to keep LiteGraph's own cache (used by
+ * convertToSubgraph / canvas selection) in sync, but never depends on its result.
  *
- * NOTE (dense-layout limitation, #297): because membership is purely geometric,
- * ANY unrelated node whose box overlaps the group rectangle IS a member — there
- * is no per-node ownership to exclude it. Callers creating a group around a
+ * NOTE (dense-layout limitation, #297): membership is purely geometric, so ANY
+ * unrelated node whose CENTRE falls within the group rectangle IS a member —
+ * there is no per-node ownership to exclude it. Callers creating a group around a
  * specific node set must report requested-vs-actual honestly.
  */
 export function groupMemberNodes(graph, g) {
@@ -113,8 +122,11 @@ export function groupMemberNodes(graph, g) {
   const [gx, gy, gw, gh] = gb;
   return (graph?._nodes ?? []).filter((n) => {
     const [nx, ny, nw, nh] = nodeFocusBounds(n);
-    // Inclusive overlap, matching LiteGraph's overlapBounding (edge contact counts).
-    return nx <= gx + gw && nx + nw >= gx && ny <= gy + gh && ny + nh >= gy;
+    // Centre-in-rect, matching LiteGraph's containsCentre → isInRect: the centre
+    // is inclusive on the min edges (>=) and exclusive on the max edges (<).
+    const cx = nx + nw / 2;
+    const cy = ny + nh / 2;
+    return cx >= gx && cx < gx + gw && cy >= gy && cy < gy + gh;
   });
 }
 

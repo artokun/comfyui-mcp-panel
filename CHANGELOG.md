@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- group membership matches LiteGraph's `containsCentre` rule (group box contains the node's centre point), not box overlap — a node whose centre is moved out of a group is no longer reported as a member by `panel_graph_outline` / `panel_edit_group` (#497)
+
 ## [0.11.30] - 2026-08-01
 
 ### Added
