@@ -159,7 +159,7 @@ export function resolveUnsavedInstanceUuid({
   return mint();
 }
 
-export function isWorkflowCreationLoad({ workflowArg, openSource, noFork = false } = {}) {
+export function isNewWorkflowLoad({ workflowArg, openSource, noFork = false } = {}) {
   if (noFork) return false;
   if (openSource != null) return true;
   const looksLikeWorkflow =

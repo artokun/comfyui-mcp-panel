@@ -100,7 +100,7 @@ import {
   commandWorkflowMismatch,
   selectorSearchIncludesListed,
   selectorTargetsNonActiveWorkflow,
-  isWorkflowCreationLoad,
+  isNewWorkflowLoad,
   normalizedWorkflowPath,
   resolveUnsavedInstanceUuid,
   shouldForkEmbeddedWorkflowUuid,
@@ -1101,7 +1101,7 @@ function persistWorkflowAliases() {
 // "Unsaved Workflow.json" path, so without this a copy would present the source's identity
 // and inherit its session (the reopened cross-resume). Regenerating at creation makes the
 // embedded uuid a trustworthy per-instance identity: fresh for a copy, and round-tripped
-// verbatim by ComfyUI's draft persistence across a reload (durable — P1). isWorkflowCreationLoad
+// verbatim by ComfyUI's draft persistence across a reload (durable — P1). isNewWorkflowLoad
 // reads the discriminators (loadGraphData's 4th `workflow` arg is a ComfyWorkflow object only
 // on a REUSE; creations pass null/undefined/string; external imports also set openSource).
 // loadGraphData clones graphData internally AFTER we mutate, so our stamp flows into configure.
@@ -1127,7 +1127,7 @@ function installCreateBoundaryFork(appRef) {
           const creation =
             !noFork &&
             !keepInstance &&
-            isWorkflowCreationLoad({ workflowArg: workflow, openSource: options ? options.openSource : undefined });
+            isNewWorkflowLoad({ workflowArg: workflow, openSource: options ? options.openSource : undefined });
           // #570 P0b — a stale PER-OBJECT uuid cache must NEVER override the identity of the
           // newly-loaded content, and we KEEP nothing derived from the copyable graph.extra.
           //  • CREATION (import/paste/duplicate/new) → mint a fresh identity.
