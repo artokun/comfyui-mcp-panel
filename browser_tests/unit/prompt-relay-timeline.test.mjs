@@ -8,6 +8,8 @@
 // derived writes. These tests drive the REAL shipped lib.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
   PROMPT_RELAY_TIMELINE_NODE_TYPE,
   PROMPT_RELAY_MASTER_WIDGET,
@@ -394,8 +396,15 @@ test("REFUSES a missing/non-string prompt — the node would coerce it to \"\" (
 });
 
 test("REFUSES a length the node would clamp/truncate; accepts every LOSSLESS integer form", () => {
-  // "24.7" is the important one: parseInt TRUNCATES it to 24, silently shortening the segment.
-  for (const bad of [undefined, null, 0, -5, 12.5, "24px", "24.7", "", NaN, Infinity, {}]) {
+  // "24.7"  — parseInt TRUNCATES it to 24, silently shortening the segment.
+  // "2e3"   — parseInt stops at the "e" and yields 2, so a caller meaning 2000 would get 2.
+  //           "24e0" is refused with it: allowing the harmless form would open the lossy one.
+  // 1e21    — String() renders it as "1e+21", which python's int() rejects outright and the
+  //           pack's own parseInt reads back as 1. Anything past MAX_SAFE_INTEGER is refused.
+  for (const bad of [
+    undefined, null, 0, -5, 12.5, "24px", "24.7", "2e3", "24e0", "", NaN, Infinity,
+    1e21, Number.MAX_SAFE_INTEGER + 2, {},
+  ]) {
     const { node, widgets } = makeRelayNode();
     assert.throws(
       () => applyPromptRelayTimelineWrite(node, { segments: [{ prompt: "p", length: bad }] }),
@@ -556,6 +565,77 @@ test("fires NO undo hooks when a refusal happens (no empty undo step)", () => {
     () => applyPromptRelayTimelineWrite(makeRelayNode({ omitWidgets: ["local_prompts"] }).node, { segments: [seg("p")] }, hooks),
   );
   assert.deepEqual(order, []);
+});
+
+// ─── The route is actually WIRED into graph_set_widget ───
+//
+// The lib is only reached through the branch inside graph_set_widget in
+// comfyui-mcp-panel.js. That method references browser/ComfyUI globals, so (following the
+// graph-resize-node.test.mjs convention) the PromptRelay branch is extracted from the REAL
+// panel source and evaluated with injected stubs — a deleted or misordered route fails here
+// rather than shipping a panel that silently falls through to the raw widget write (#506).
+
+// Normalized to LF: the working copy is checked out CRLF on Windows.
+const panelSrc = readFileSync(
+  fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
+  "utf8",
+).replace(/\r\n/g, "\n");
+
+const relayBranch = panelSrc.match(
+  /const relayKind = classifyPromptRelayTimelineWrite\(node, widget\);[\s\S]*?\n {6}\}\);\n {4}\}/,
+);
+
+test("graph_set_widget's PromptRelay branch exists and is ordered before the generic write", () => {
+  assert.ok(relayBranch, "PromptRelay branch not found in graph_set_widget");
+  assert.match(panelSrc, /import \{[\s\S]*?\} from "\.\/lib\/prompt-relay-timeline\.js";/);
+  const relayAt = panelSrc.indexOf("const relayKind = classifyPromptRelayTimelineWrite");
+  const genericAt = panelSrc.indexOf("await runSetWidget(node, widget, value");
+  const ltxAt = panelSrc.indexOf("const ltxKind = classifyLtxTimelineWrite");
+  assert.ok(relayAt > 0 && genericAt > 0 && ltxAt > 0);
+  // Must intercept BEFORE the generic raw write, and must not displace the LTXDirector route.
+  assert.ok(relayAt < genericAt, "PromptRelay branch must run before runSetWidget");
+  assert.ok(ltxAt < relayAt, "the LTXDirector route (#314) must keep its position");
+});
+
+test("graph_set_widget routes master → apply, derived → refusal, everything else → fall through", () => {
+  const run = (kind) => {
+    const calls = [];
+    const factory = new Function(
+      "classifyPromptRelayTimelineWrite",
+      "promptRelayDerivedRefusal",
+      "applyPromptRelayTimelineWrite",
+      "node",
+      "widget",
+      "value",
+      "graph",
+      `return () => { ${relayBranch[0]}\n return "fell-through"; };`,
+    );
+    const fn = factory(
+      () => kind,
+      (w, id) => `refused ${w} on ${id}`,
+      (n, v, hooks) => {
+        calls.push({ n: n.id, v, hooks: Object.keys(hooks).sort() });
+        return { applied: true };
+      },
+      { id: 3 },
+      "timeline_data",
+      { segments: [] },
+      { beforeChange() {}, afterChange() {}, setDirtyCanvas() {} },
+    );
+    return { fn, calls };
+  };
+
+  const master = run("master");
+  assert.deepEqual(master.fn(), { applied: true });
+  assert.deepEqual(master.calls[0].hooks, ["afterChange", "beforeChange", "setDirty"]);
+
+  const derived = run("derived");
+  assert.throws(() => derived.fn(), /refused timeline_data on 3/);
+  assert.equal(derived.calls.length, 0);
+
+  const other = run(null);
+  assert.equal(other.fn(), "fell-through");
+  assert.equal(other.calls.length, 0);
 });
 
 test("honors an injected getEditor", () => {

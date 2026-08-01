@@ -136,20 +136,32 @@ function isPlainObject(v) {
  * the value is one the node's `Math.max(1, parseInt(v, 10) || 1)` would silently MANGLE
  * (missing, fractional, zero/negative, non-numeric).
  * A STRING is accepted only in the forms parseInt handles LOSSLESSLY: optional leading "+",
- * digits, and a zero-valued fraction ("24", "+24", "24.0", "24."). A non-zero fraction
- * ("24.7") is refused because parseInt would TRUNCATE it — silently shortening a segment.
+ * digits, and a zero-valued fraction ("24", "+24", "24.0", "24."). Deliberately refused:
+ *   * a non-zero fraction ("24.7") — parseInt TRUNCATES it, silently shortening a segment;
+ *   * EXPONENT notation ("2e3") — parseInt stops at the "e" and yields 2, i.e. a caller who
+ *     means 2000 frames would get 2. Refusing the whole form (including the harmless "24e0")
+ *     is the only way to make that impossible.
+ * The result must also be a SAFE integer: `String()` switches to exponent notation at 1e21,
+ * and `segment_lengths` is consumed by python's `int()`, which rejects "1e+21" outright while
+ * the pack's own parseInt would read it back as 1.
  */
 const LOSSLESS_INT_STRING = /^\+?\d+(?:\.0*)?$/;
 
 function normalizeSegmentLength(v) {
+  let n;
   if (typeof v === "number") {
-    return Number.isInteger(v) && v >= MIN_SEGMENT_LENGTH ? v : null;
+    n = v;
+  } else if (typeof v === "string") {
+    const trimmed = v.trim();
+    if (!LOSSLESS_INT_STRING.test(trimmed)) return null;
+    n = Number.parseInt(trimmed, 10);
+  } else {
+    return null;
   }
-  if (typeof v !== "string") return null;
-  const trimmed = v.trim();
-  if (!LOSSLESS_INT_STRING.test(trimmed)) return null;
-  const n = Number.parseInt(trimmed, 10);
-  return Number.isInteger(n) && n >= MIN_SEGMENT_LENGTH ? n : null;
+  if (!Number.isSafeInteger(n) || n < MIN_SEGMENT_LENGTH) return null;
+  // Belt-and-braces: only a plain decimal string is round-trippable through the joined
+  // `segment_lengths` value that python's int() parses.
+  return /^\d+$/.test(String(n)) ? n : null;
 }
 
 function describe(v) {
