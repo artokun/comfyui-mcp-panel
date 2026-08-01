@@ -141,6 +141,7 @@ import { autoMatchSlots, slotDiagnostic } from "./lib/connect-match.js";
 import { isLinkPersisted, removePhantomLink, isWidgetBackedInput } from "./lib/connect-verify.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
 import { isImeComposing } from "./lib/ime.js";
+import { installGraphToPromptNullSafety } from "./lib/widget-null-safety.js";
 import {
   recordCopiedNodes,
   getVerifiedSnapshot,
@@ -6306,6 +6307,18 @@ const GRAPH_TOOL_EXECUTORS = {
         return res;
       };
     }
+    // #445: guard the VHS null-widget serialization crash. ComfyUI core / node
+    // extensions (notably VHS_VideoCombine) serialize EVERY node's widgets when
+    // building the prompt — even unused branches, even under "run to node" — and
+    // call string ops like `.replace()` on those values (in graphToPrompt via the
+    // node's own serializeValue). A null widget value (e.g. VHS
+    // `filename_prefix:null`) throws `Cannot read properties of null (reading
+    // 'replace')` DURING serialization, killing the run before it queues. Install
+    // an idempotent, self-restoring wrap on app.graphToPrompt so every prompt
+    // build is null-safe for exactly its serialization window (which also covers
+    // the deferred serialization queuePrompt runs when its processor is already
+    // busy) without permanently altering the live workflow.
+    installGraphToPromptNullSafety(app);
     try {
       await app.queuePrompt(0, batch, partialTargets);
     } finally {

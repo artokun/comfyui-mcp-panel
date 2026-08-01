@@ -42,6 +42,22 @@ export function levelLabel(n) {
 export const PERIODS = ["Day", "Week", "Month", "Year", "AllTime"];
 export const IMAGE_SORTS = ["Most Reactions", "Most Comments", "Most Collected", "Newest", "Oldest"];
 export const MODEL_SORTS = ["Most Downloaded", "Highest Rated", "Most Liked", "Newest", "Oldest"];
+
+// #459: CivitAI's REST list endpoints (/v1/models, /v1/images) ZodError-reject
+// ANY `sort`/`period` value outside their enum with a hard `400 Bad Request`
+// that dead-ends the docked browser with "No data". A stale, renamed, or
+// CROSS-TAB value — most notably an IMAGE sort such as "Most Reactions" reaching
+// the /v1/models endpoint (which only accepts MODEL sorts) — must be clamped to
+// a supported value BEFORE dispatch instead of surfacing as an opaque 400. These
+// clamp against the panel's own offered sets (the only values its UI produces),
+// falling back to the default at index 0, so the request is always well-formed.
+// NOTE: an agent-supplied sort that is API-valid but NOT in the panel's offered
+// subset (e.g. "Most Collected" for models) is normalized to the default too —
+// a deliberate tradeoff: the docked browser only ever dispatches sorts it also
+// exposes in its dropdown, so the dispatched request and the visible UI agree.
+export const normalizeModelSort = (s) => (MODEL_SORTS.includes(s) ? s : MODEL_SORTS[0]);
+export const normalizeImageSort = (s) => (IMAGE_SORTS.includes(s) ? s : IMAGE_SORTS[0]);
+export const normalizePeriod = (p) => (PERIODS.includes(p) ? p : "Week");
 /**
  * Civitai's full `BaseModel` enum. The site accepts ONLY these strings for
  * `baseModels=` — anything else silently returns nothing, so this list is the
@@ -459,7 +475,7 @@ export class CivitaiClient {
   async fetchFeed({ type = "image", period = "Week", sort = "Most Reactions", levels = [1], limit = 100, cursor, username } = {}) {
     const q = new URLSearchParams({
       limit: String(limit), browsingLevel: String(bitmask(levels)),
-      period, type, sort,
+      period: normalizePeriod(period), type, sort: normalizeImageSort(sort), // #459: clamp to enum
     });
     if (username) q.set("username", username); // narrow to one creator's posts
     if (cursor) q.set("cursor", cursor);
@@ -473,7 +489,7 @@ export class CivitaiClient {
   async fetchModelImages(modelVersionId, { levels = [1], sort = "Most Reactions", limit = 30 } = {}) {
     const q = new URLSearchParams({
       limit: String(limit), modelVersionId: String(modelVersionId),
-      browsingLevel: String(bitmask(levels)), sort,
+      browsingLevel: String(bitmask(levels)), sort: normalizeImageSort(sort), // #459: clamp to enum
       nsfw: bitmask(levels) > 2 ? "X" : "None",
     });
     const data = await this._get(`${API}/v1/images?${q.toString()}`);
@@ -586,7 +602,8 @@ export class CivitaiClient {
 
   async fetchModels({ type, sort = "Most Downloaded", period = "Week", baseModels = [], levels = [1], limit = 100, cursor, query, username } = {}) {
     const base = new URLSearchParams({
-      limit: String(limit), types: type, sort, period,
+      limit: String(limit), types: type,
+      sort: normalizeModelSort(sort), period: normalizePeriod(period), // #459: clamp to enum
       nsfw: bitmask(levels) > 2 ? "true" : "false",
     });
     for (const b of baseModels) base.append("baseModels", b);
