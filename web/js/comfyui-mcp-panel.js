@@ -149,6 +149,8 @@ import {
   shouldGroundBeforeTurn,
   groundActiveWorkflow,
   describeSaveOutcome,
+  classifyOriginalOnDisk,
+  normalizePath,
 } from "./lib/workflow-save.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
@@ -2508,6 +2510,21 @@ async function programmaticSave(name) {
   // move); this only enriches the RESULT. The mode is taken from saveActiveWorkflow's
   // AUTHORITATIVE `details` sink (the branch it actually took), NOT inferred from the
   // mutable active workflow afterward — so a tab switch during the await can't fool it.
+  //
+  // Capture POSITIVE pre-save evidence of the source file's existence FIRST: a
+  // confirmed 200 is the ONLY basis on which a post-save 404 may be treated as a real
+  // move/deletion of a persisted original. Without it, a source that 404s afterward
+  // simply never existed (a never-persisted tab whose classification was inconclusive),
+  // and throwing would be a false data-loss error on a legitimate first save.
+  const preSourcePath = svc?.activeWorkflow?.path ?? null;
+  let preExisted = null; // true = confirmed 200, false = confirmed 404, null = unknown
+  if (preSourcePath) {
+    try {
+      preExisted = await workflowExistsOnDisk(preSourcePath);
+    } catch {
+      preExisted = null;
+    }
+  }
   const details = {};
   const saved = await saveActiveWorkflow(svc, name, {
     autoWorkflowName,
@@ -2516,36 +2533,45 @@ async function programmaticSave(name) {
     details,
   });
   const outcome = describeSaveOutcome(details);
-  // INDEPENDENT post-save verification (a second backstop, at the tool layer): for a
-  // Save-As COPY the REAL source file must still be on disk. Probe /userdata for the
-  // exact source path saveActiveWorkflow reported — if it is GONE, a move happened
-  // despite everything upstream: surface it as a hard error rather than a phantom
-  // success (mcp#579). This attests PATH PRESENCE (`original_on_disk`), not content
-  // identity — an honest, disk-checked fact, not an inferred "preserved" claim; a
-  // 404 is the actionable data-loss signal. An inconclusive probe ⇒ "unverified".
+  // INDEPENDENT post-save verification (a second backstop, at the tool layer) for a
+  // Save-As COPY: attest whether the REAL source file is still on disk. This reports
+  // PATH PRESENCE (`original_on_disk`), not content identity — an honest, disk-checked
+  // fact, not an inferred "preserved" claim.
   //
-  // EXTERNAL sources (absolute paths, #285) are NOT /userdata-addressable, so the HEAD
-  // would 404 for a perfectly-preserved external original. The external copy path never
-  // references the source file (it copies the live graph into the user dir), so the
-  // external original is intact — just unverifiable from here. Report "unverified" and
-  // NEVER throw a false data-loss error for it.
+  // EXTERNAL sources (absolute / root-relative paths, #285) are NOT /userdata-
+  // addressable, so a HEAD would 404 for a perfectly-preserved external original. The
+  // external copy path never references the source file, so it is intact — just
+  // unverifiable from here ⇒ "unverified", NEVER a throw.
+  //
+  // Managed sources: only a source CONFIRMED present before the save (preExisted===true,
+  // same path) that is now CONFIRMED gone is a genuine data-loss event → throw. Every
+  // indeterminate case degrades to "unverified" (classifyOriginalOnDisk enforces this),
+  // so a transient classification or a never-existed phantom source never false-alarms.
   if (outcome.saved_as && details.sourcePath) {
     if (details.sourceExternal) {
       outcome.original_on_disk = "unverified";
     } else {
-      let stillOnDisk = null;
+      let postExists = null;
       try {
-        stillOnDisk = await workflowExistsOnDisk(details.sourcePath);
+        postExists = await workflowExistsOnDisk(details.sourcePath);
       } catch {
-        stillOnDisk = null;
+        postExists = null;
       }
-      if (stillOnDisk === false) {
+      // Only trust pre-save evidence when it was measured on the SAME source path.
+      const samePath =
+        !!preSourcePath && normalizePath(preSourcePath) === normalizePath(details.sourcePath);
+      const status = classifyOriginalOnDisk({
+        preExisted: samePath ? preExisted : null,
+        postExists,
+      });
+      if (status === "lost") {
         throw new Error(
-          `save-as of "${saved}" appears to have MOVED/destroyed the original "${outcome.copied_from ?? details.sourcePath}" ` +
-            `— it is no longer on disk. Aborting to surface data loss (issue #579).`,
+          `the original workflow "${outcome.copied_from ?? details.sourcePath}" is no longer on disk ` +
+            `after saving "${saved}". The save was performed as a COPY and should not have removed it — ` +
+            `surfacing a possible data-loss event rather than reporting a phantom success (issue #579).`,
         );
       }
-      outcome.original_on_disk = stillOnDisk === true ? true : "unverified";
+      outcome.original_on_disk = status === "present" ? true : "unverified";
     }
   }
   return { name: saved || getWorkflowTitle(), ...outcome };

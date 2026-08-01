@@ -81,6 +81,28 @@ export function describeSaveOutcome(details = {}) {
   return {};
 }
 
+/** Decide what to report about a Save-As COPY's ORIGINAL source file from two disk
+ *  probes, and — critically — WHEN a missing source is a genuine data-loss event vs
+ *  a benign "never existed / can't tell". Pure + total, so the panel's throw decision
+ *  is unit-testable and can never fire on a transient/indeterminate classification.
+ *
+ *  A data-loss THROW ("lost") requires POSITIVE prior evidence the source existed —
+ *  a CONFIRMED pre-save 200 (`preExisted === true`) that is now a CONFIRMED 404
+ *  (`postExists === false`). Every weaker combination degrades to "unverified":
+ *   - `preExisted` unknown/false (the source was never proven present — e.g. a
+ *     non-temporary yet never-persisted tab whose classification was `unknown`, or a
+ *     phantom "workflows/Unsaved Workflow.json" that 404s simply because it never
+ *     existed) ⇒ NEVER throw, even if postExists is false;
+ *   - `postExists` true ⇒ "present";
+ *   - anything else (post probe inconclusive) ⇒ "unverified".
+ *  This closes a false data-loss throw on a legitimate first save and avoids blaming
+ *  this Save-As for an unrelated deletion we cannot attribute to it. */
+export function classifyOriginalOnDisk({ preExisted, postExists } = {}) {
+  if (preExisted === true && postExists === false) return "lost";
+  if (postExists === true) return "present";
+  return "unverified";
+}
+
 /** Record the authoritative outcome into an optional `details` sink (a plain object
  *  the caller passes to saveActiveWorkflow). No-op when absent, so behaviour and the
  *  return value are unchanged for every existing caller/test. */
@@ -756,17 +778,23 @@ async function classifySource(svc, wf, rawPath, existsOnDisk) {
  *  can write to. Store paths are always relative under it ("workflows/…"). */
 const WORKFLOWS_ROOT = "workflows";
 
-/** True when `path` is an ABSOLUTE filesystem path — a Windows drive ("C:\\", "C:/"),
- *  a UNC share ("\\\\server"), or a POSIX absolute ("/…"). Such a path is a workflow
- *  loaded from OUTSIDE the managed workflows dir (panel_load_workflow path:<file>);
- *  it can never be a /userdata store path, so a Save-As of it must copy into the
- *  user workflows dir rather than the unwritable external directory (#285). Only
- *  absolute paths qualify — a relative "workflows/…" store path is never external,
- *  so the everyday save path is untouched. */
+/** True when `path` is an ABSOLUTE or ROOT-RELATIVE filesystem path — a Windows drive
+ *  ("C:\\", "C:/"), a UNC share ("\\\\server"), a POSIX absolute ("/…"), OR a Windows
+ *  root-relative path with a single leading separator ("\packs\…" / "/packs/…", which
+ *  resolves against the current drive root). Such a path is a workflow loaded from
+ *  OUTSIDE the managed workflows dir (panel_load_workflow path:<file>); it can never be
+ *  a /userdata store path (those are relative "workflows/…"), so a Save-As of it must
+ *  copy into the user workflows dir rather than the unwritable external directory
+ *  (#285). A single leading "\" was previously MISSED, so an external file at
+ *  "\packs\Foo.json" was mis-classified as a managed never-persisted tab and reported
+ *  as a first save (hiding that a real external source was copied). A managed store
+ *  path never begins with a separator, so this never touches the everyday save path. */
 function isExternalWorkflowPath(path) {
   const raw = String(path || "");
   if (!raw) return false;
-  return /^[a-zA-Z]:[\\/]/.test(raw) || /^[\\/]{2}/.test(raw) || /^\//.test(raw);
+  // A leading "\" or "/" (single, double/UNC, or POSIX absolute) is external/root-
+  // relative; a drive-qualified prefix ("C:\" / "C:/") is external too.
+  return /^[a-zA-Z]:[\\/]/.test(raw) || /^[\\/]/.test(raw);
 }
 
 /** Directory prefix (with trailing slash) that a new sibling file should live in,
@@ -782,7 +810,7 @@ function directoryOf(wf) {
 /** Normalize a workflow path for a stable same-file comparison: forward slashes,
  *  no doubled/trailing separators. Case is preserved (a case-only difference is
  *  treated as a Save-As, which is the safe direction — it copies). */
-function normalizePath(path) {
+export function normalizePath(path) {
   return String(path || "")
     .replaceAll("\\", "/")
     .replace(/\/{2,}/g, "/")

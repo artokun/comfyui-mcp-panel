@@ -4,7 +4,8 @@ import test from 'node:test'
 import {
   isDefaultWorkflowName,
   saveActiveWorkflow,
-  describeSaveOutcome
+  describeSaveOutcome,
+  classifyOriginalOnDisk
 } from '../../web/js/lib/workflow-save.js'
 
 // A minimal ComfyUI workflow-service double that records what was called and
@@ -2212,4 +2213,64 @@ test('outcome: an EXTERNAL-path Save-As reports save-as-copy (NOT first-save), e
     saved_as: true,
     copied_from: 'Product Label Repair'
   })
+})
+
+// ---------------------------------------------------------------------------
+// classifyOriginalOnDisk — the throw/report decision for a Save-As COPY's source.
+// A hard data-loss throw ("lost") requires POSITIVE pre-save evidence (a confirmed
+// 200) now confirmed gone (404). Everything indeterminate degrades to "unverified"
+// so a legitimate first save / phantom source never false-alarms (codex P1 #1).
+
+test('classifyOriginalOnDisk: confirmed present-then-gone ⇒ lost (the only throw case)', () => {
+  assert.equal(classifyOriginalOnDisk({ preExisted: true, postExists: false }), 'lost')
+})
+
+test('classifyOriginalOnDisk: source never proven present ⇒ NEVER lost (no false data-loss throw)', () => {
+  // The exact P1 #1 repro: a non-temporary yet never-persisted tab whose source path
+  // 404s afterward simply because it never existed. preExisted is false/unknown ⇒
+  // must NOT be "lost".
+  assert.equal(classifyOriginalOnDisk({ preExisted: false, postExists: false }), 'unverified')
+  assert.equal(classifyOriginalOnDisk({ preExisted: null, postExists: false }), 'unverified')
+  assert.equal(classifyOriginalOnDisk({ preExisted: undefined, postExists: false }), 'unverified')
+})
+
+test('classifyOriginalOnDisk: source present afterward ⇒ present', () => {
+  assert.equal(classifyOriginalOnDisk({ preExisted: true, postExists: true }), 'present')
+  assert.equal(classifyOriginalOnDisk({ preExisted: null, postExists: true }), 'present')
+})
+
+test('classifyOriginalOnDisk: inconclusive post probe ⇒ unverified (never throws)', () => {
+  assert.equal(classifyOriginalOnDisk({ preExisted: true, postExists: null }), 'unverified')
+  assert.equal(classifyOriginalOnDisk({ preExisted: null, postExists: null }), 'unverified')
+  assert.equal(classifyOriginalOnDisk({}), 'unverified')
+})
+
+test('outcome: a WINDOWS ROOT-RELATIVE external source ("\\packs\\Foo.json") is external ⇒ save-as-copy + sourceExternal (codex P1 #2)', async () => {
+  // A single leading backslash is root-relative on the current drive — an EXTERNAL
+  // file, not a managed store path. It must copy into the user dir and report
+  // save-as-copy + sourceExternal, NEVER first-save (which would hide the real source
+  // and route the post-save HEAD into a false 404 alarm).
+  const srcPath = String.raw`\packs\Foo.json` // real single backslashes (root-relative)
+  const active = {
+    path: srcPath,
+    filename: 'Foo.json',
+    directory: String.raw`\packs`,
+    isPersisted: false,
+    isTemporary: true,
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ files: [active.path], active })
+
+  const details = {}
+  await saveActiveWorkflow(svc, 'Foo Copy', {
+    autoWorkflowName: () => 'Untitled',
+    existsOnDisk,
+    details,
+  })
+
+  assert.equal(details.mode, 'save-as-copy', 'root-relative external source ⇒ save-as-copy, not first-save')
+  assert.equal(details.sourceExternal, true, 'flagged external so the /userdata HEAD is skipped')
+  // Copy landed in the USER workflows dir, external original untouched.
+  assert.ok(svc.disk.has('workflows/Foo Copy.json'), 'copy in the user workflows dir')
+  assert.ok(svc.disk.has(srcPath), 'external original preserved')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never moved the external original')
 })
