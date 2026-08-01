@@ -2086,8 +2086,8 @@ test("#507 round-3: the SAME promoted shape writes fine when the value IS on the
   assert.equal(railWidget.value, "llama3.2:3b", "the rail is synced (#366/#477)");
 });
 
-test("#507 round-3: a parent rail whose list is EMPTY or UNREADABLE adds no constraint", () => {
-  for (const railOptions of [{ values: [] }, { values: () => { throw new Error("boom"); } }, {}]) {
+test("#507 round-3: a parent rail whose list is EMPTY or ABSENT adds no constraint", () => {
+  for (const railOptions of [{ values: [] }, {}]) {
     const { parent, inner, resolveSource } = makeEmptyInnerPromotedFixture(railOptions);
     const set = applyWidgetWrite(parent, "model_alias", "qwen3-vl:8b", {
       ...HOOKS,
@@ -2107,4 +2107,61 @@ test("#507 round-3: the rail cross-check is SCOPED to the empty-list path (ordin
   const set = applyWidgetWrite(parent, "sched_alias", "karras", { ...HOOKS, resolveSource });
   assert.equal(set.value, "karras");
   assert.equal(inner.widgets.find((w) => w.name === "scheduler").value, "karras");
+});
+
+test("#507 round-5: a DYNAMIC parent-rail option source is UNVERIFIABLE on the empty-list path ⇒ fail closed", () => {
+  // codex round-5: a one-shot read of a function source proves nothing — it can return []
+  // during the cross-check and a real list immediately afterwards, so the off-list value
+  // would still land on the mutated, serializing rail. Refuse instead.
+  let call = 0;
+  const { parent, inner, railWidget, resolveSource } = makeEmptyInnerPromotedFixture({
+    values: () => (call++ === 0 ? [] : ["allowed"]), // [] first, real list after
+  });
+  assert.throws(
+    () =>
+      applyWidgetWrite(parent, "model_alias", "off-list:70b", {
+        ...HOOKS,
+        resolveSource,
+        acceptEmptyComboOptions: true,
+      }),
+    (err) => err instanceof WidgetWriteError && /computed dynamically/.test(err.message),
+  );
+  assert.equal(inner.widgets[0].value, "", "inner untouched");
+  assert.equal(railWidget.value, "", "rail untouched — no value assigned behind an unverifiable list");
+  // A stable dynamic source is refused too: the rule is about verifiability, not about
+  // catching this particular stateful source.
+  const stable = makeEmptyInnerPromotedFixture({ values: () => ["allowed"] });
+  assert.throws(
+    () =>
+      applyWidgetWrite(stable.parent, "model_alias", "allowed", {
+        ...HOOKS,
+        resolveSource: stable.resolveSource,
+        acceptEmptyComboOptions: true,
+      }),
+    (err) => err instanceof WidgetWriteError && /computed dynamically/.test(err.message),
+  );
+});
+
+test("#507 round-5: the dynamic-rail refusal is SCOPED to the empty-list path", () => {
+  // An ordinary promoted write against a dynamic rail is untouched — the inner list is
+  // authoritative there, so nothing about the rail needs verifying.
+  const inner = {
+    id: 301,
+    type: "N",
+    widgets: [{ name: "scheduler", type: "combo", options: { values: ["simple", "karras"] }, value: "simple" }],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) };
+  const railWidget = { name: "sched_alias", type: "combo", options: { values: () => ["simple", "karras"] }, value: "simple" };
+  const parent = {
+    id: 320,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "sched_alias", _widget: railWidget, widget: { name: "sched_alias" }, _subgraphSlot: { name: "sched_alias" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_node, si) =>
+    si?.name === "sched_alias" ? { sourceNodeId: "301", sourceWidgetName: "scheduler" } : null;
+  const set = applyWidgetWrite(parent, "sched_alias", "karras", { ...HOOKS, resolveSource });
+  assert.equal(set.value, "karras");
+  assert.equal(inner.widgets[0].value, "karras");
 });

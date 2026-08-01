@@ -920,6 +920,19 @@ export function applyWidgetWrite(
   if (acceptEmptyComboOptions) {
     for (const other of [parentWidget, ...displayWidgets]) {
       if (!other || !isComboWidget(other)) continue;
+      // A DYNAMIC (function) sibling list is UNVERIFIABLE from here (codex round-5): it
+      // can return [] during this check and a real, non-empty list immediately afterwards
+      // — a one-shot read proves nothing, and the off-list value would still land on the
+      // mutated, serializing rail. Only the value's membership matters, and we cannot
+      // establish it, so fail closed rather than report a success we cannot stand behind.
+      if (typeof other.options?.values === "function") {
+        throw new WidgetWriteError(
+          `Cannot verify value ${JSON.stringify(coerced)} against the parent subgraph's combo ` +
+            `widget "${other.name}", which this promoted write also mutates: its option list is ` +
+            `computed dynamically and the inner widget's list is empty, so nothing authoritative ` +
+            `validates the value. Refusing to write.`,
+        );
+      }
       const otherOptions = comboOptions(other);
       if (!Array.isArray(otherOptions) || otherOptions.length === 0) continue;
       if (otherOptions.includes(coerced)) continue;
