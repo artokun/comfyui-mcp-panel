@@ -287,6 +287,36 @@ test("MID-TYPING: the live editor wins over a timeline_data widget lagging by th
   assert.equal(res.replaced_out_of_band, undefined);
 });
 
+test("MID-TYPING: an explicit segments write that DISCARDS in-flight text says so", () => {
+  // Replacing `segments` is the caller's stated intent, so it is applied — but the prompt text
+  // the user had typed and not yet committed is handed back rather than vanishing silently.
+  const { node, widgets, editor } = makeRelayNode();
+  editor.timeline.segments[0].prompt = "user was typing this";
+  widgets.local_prompts.value = derivePromptRelayWidgets(editor.timeline.segments).local_prompts;
+
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("agent set", 20)] }));
+  assert.equal(res.merge_base, "editor");
+  assert.equal(res.overwrote_uncommitted_edit, "user was typing this | b");
+  assert.ok(res.warnings.some((w) => w.includes("UNCOMMITTED prompt edit")));
+  assert.equal(widgets.local_prompts.value, "agent set");
+});
+
+test("MID-TYPING: a write that PRESERVES the in-flight text reports no overwrite", () => {
+  const { node, widgets, editor } = makeRelayNode();
+  editor.timeline.segments[0].prompt = "user was typing this";
+  widgets.local_prompts.value = derivePromptRelayWidgets(editor.timeline.segments).local_prompts;
+  const res = relay(applyPromptRelayTimelineWrite(node, { zoom: 4 }));
+  assert.equal(res.overwrote_uncommitted_edit, undefined);
+  assert.equal(widgets.local_prompts.value, "user was typing this | b");
+});
+
+test("a normal (non-debounce) write never reports overwrote_uncommitted_edit", () => {
+  const { node } = makeRelayNode();
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("totally different", 3)] }));
+  assert.equal(res.merge_base, "timeline_data");
+  assert.equal(res.overwrote_uncommitted_edit, undefined);
+});
+
 test("MID-TYPING: a pending debounce commit AFTER our write is a no-op (no rollback)", () => {
   const { node, widgets, editor } = makeRelayNode();
   editor.timeline.segments[0].prompt = "in flight";

@@ -46,8 +46,11 @@
 // node is found ALREADY desynced (out-of-band `local_prompts` text that no timeline produces —
 // e.g. written with the #506 workaround), the pre-existing value is RETURNED in the result
 // envelope before being replaced, so no prompt text ever disappears without the caller being
-// told. Anything PromptRelay's python would encode differently from what the timeline shows
-// (a blank prompt, a literal "|", padding whitespace) comes back as a warning.
+// told — as is an UNCOMMITTED edit the user was still typing when the write landed
+// (`overwrote_uncommitted_edit`). Anything PromptRelay's python would encode differently from
+// what the timeline shows (a blank prompt, a literal "|", padding whitespace) comes back as a
+// warning. The invariant: the panel never leaves the timeline saying A, the prompts saying B,
+// and the caller told nothing.
 
 export const PROMPT_RELAY_TIMELINE_NODE_TYPE = "PromptRelayEncodeTimeline";
 
@@ -498,6 +501,24 @@ export function applyPromptRelayTimelineWrite(
   const derived = derivePromptRelayWidgets(segments);
   const timelineJson = JSON.stringify(finalTimeline);
   const warnings = timelineWarnings(segments);
+
+  // chooseMergeBase only falls back to the editor when the timeline_data widget has gone
+  // stale, which means a prompt edit was IN FLIGHT (typed into the node's prompt box, not yet
+  // committed). Merging preserves it — but a caller who supplies `segments` REPLACES the list,
+  // and that legitimately discards the in-flight text. That is the caller's stated intent, so
+  // it is applied rather than refused, but it is never left silent.
+  const overwroteInFlight =
+    baseSource === "editor" && baseDerived && baseDerived.local_prompts !== derived.local_prompts
+      ? baseDerived.local_prompts
+      : null;
+  if (overwroteInFlight !== null) {
+    warnings.push(
+      `this node had an UNCOMMITTED prompt edit in progress (text typed into the node's prompt box ` +
+        `that had not yet reached timeline_data). The segments you supplied REPLACED it; the text ` +
+        `that was in flight is returned as "overwrote_uncommitted_edit". Re-read the node and write ` +
+        `again if you meant to keep it.`,
+    );
+  }
   if (Object.keys(replaced).length) {
     warnings.push(
       `this node was ALREADY desynced: its ${Object.keys(replaced).join(" / ")} did not match its ` +
@@ -561,6 +582,7 @@ export function applyPromptRelayTimelineWrite(
       local_prompts: derived.local_prompts,
       segment_lengths: derived.segment_lengths,
       ...(Object.keys(replaced).length ? { replaced_out_of_band: replaced } : {}),
+      ...(overwroteInFlight !== null ? { overwrote_uncommitted_edit: overwroteInFlight } : {}),
       ...(uiRefreshError ? { ui_refresh_error: uiRefreshError } : {}),
       ...(warnings.length ? { warnings } : {}),
     },
