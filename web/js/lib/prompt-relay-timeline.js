@@ -1,0 +1,455 @@
+// Targeted support for driving the ComfyUI-PromptRelay `PromptRelayEncodeTimeline` node
+// via panel_set_widget (#506). Sibling of ltx-director.js (#314), but a DIFFERENT node with
+// DIFFERENT mechanics — kept in its own module so neither can regress the other.
+//
+// THE PROBLEM (#506). PromptRelayEncodeTimeline has three HIDDEN widgets:
+//   * `timeline_data`    — JSON `{ segments: [ { prompt, length, color }, … ] }`; the state
+//                          the node's own TimelineEditor parses ONCE (constructor / onConfigure)
+//                          into the in-memory `this.timeline` that the canvas draws.
+//   * `local_prompts`    — DERIVED: `segments.map(s => s.prompt).join(" | ")`
+//   * `segment_lengths`  — DERIVED: `segments.map(s => s.length).join(", ")`
+// The editor regenerates BOTH derived widgets from `this.timeline` on every commit
+// (`syncWidgetsFromTimeline`).
+//
+// The node's PYTHON `execute()` reads ONLY `global_prompt`, `local_prompts` and
+// `segment_lengths`. It NEVER reads `timeline_data`. So a raw panel_set_widget on
+// `timeline_data`:
+//   * writes the widget value, so panel_query_graph reflects it (the tool "succeeds"),
+//   * does NOT reach the editor's `this.timeline`, so the node UI still shows the old blocks,
+//   * leaves `local_prompts` / `segment_lengths` STALE, so the RENDER USES THE OLD PROMPTS, and
+//   * is silently REVERTED on the next commit (any UI touch re-derives timeline_data from the
+//     stale in-memory timeline).
+// That is exactly #506: "timeline_data contains the new prompt while local_prompts still
+// contains the prior prompt", and the executed prompt is the stale one.
+//
+// WHY RECONCILE (regenerate) RATHER THAN REJECT. The derived widgets are a TOTAL, PURE
+// function of `timeline.segments` — the node itself defines them that way. And since
+// execute() never looks at `timeline_data`, rejecting a `timeline_data` write outright would
+// leave NO way to drive this node at all. So a `timeline_data` write regenerates
+// `local_prompts` + `segment_lengths` from the SAME segments and writes all three ATOMICALLY,
+// then re-hydrates the live editor so the UI matches and the next commit is a no-op.
+//
+// UNLIKE LTXDirector, this pack exposes NO re-hydration entry point (`_applyLoadedTimeline`
+// has no equivalent here). We therefore compute the authoritative values ourselves — the
+// derivation is two `join()`s, mirrored verbatim from `syncWidgetsFromTimeline` — and assign
+// them. A consequence is that the write is correct EVEN WHEN NO EDITOR EXISTS (node never
+// rendered, pack JS not loaded): the widgets are consistent, and the editor's constructor
+// re-parses our `timeline_data` when it eventually runs.
+//
+// DATA-LOSS STANCE. User-authored prompt TEXT lives in `timeline_data.segments[].prompt`.
+// Anything the node's own parser would COERCE (a missing prompt → "", a bogus length → 1) or
+// that would make it RESET to a blank two-segment default (absent/empty/malformed segments)
+// is REFUSED LOUDLY instead of applied — a loud, safe failure over silent destruction. Fields
+// the caller does not mention are MERGED from the node's current timeline, never defaulted
+// away. And when the node is found ALREADY desynced (out-of-band `local_prompts` text that
+// the current timeline does not produce — e.g. written with the #506 workaround), the
+// pre-existing value is RETURNED in the result envelope before being replaced, so no prompt
+// text ever disappears without the caller being told.
+
+export const PROMPT_RELAY_TIMELINE_NODE_TYPE = "PromptRelayEncodeTimeline";
+
+// The master widget: the JSON the editor parses into its source-of-truth timeline.
+export const PROMPT_RELAY_MASTER_WIDGET = "timeline_data";
+
+// Derived OUTPUTS of the editor's syncWidgetsFromTimeline(). A direct write shows up in
+// panel_query_graph but is reverted on the next commit AND desyncs the node the other way
+// round ("prompts say A, timeline says B"), so these are refused and redirected.
+export const PROMPT_RELAY_DERIVED_WIDGETS = Object.freeze(["local_prompts", "segment_lengths"]);
+
+// Every widget this route reads or writes. All three must exist for a reconcile to be
+// possible at all.
+const REQUIRED_WIDGETS = Object.freeze([PROMPT_RELAY_MASTER_WIDGET, ...PROMPT_RELAY_DERIVED_WIDGETS]);
+
+// The exact separators the node uses on both sides of the wire: the editor joins with these,
+// and the Python `_encode_relay` splits `local_prompts` on "|" and `segment_lengths` on ",".
+const PROMPT_JOIN = " | ";
+const LENGTH_JOIN = ", ";
+
+// The node clamps every segment to at least one pixel-space frame.
+const MIN_SEGMENT_LENGTH = 1;
+
+// COSMETIC ONLY. Mirrors the pack's block palette so a segment that arrives without a
+// `color` gets a stable one instead of an undefined fill. If the pack's palette ever drifts,
+// the sole effect is a different block colour — no derived value depends on this.
+const FALLBACK_SEGMENT_COLORS = Object.freeze([
+  "#4f8edc",
+  "#e07b3a",
+  "#5cb85c",
+  "#d9534f",
+  "#9b6cd6",
+  "#a07060",
+  "#e377c2",
+  "#7f7f7f",
+  "#c4c447",
+  "#3fbac4",
+]);
+
+/**
+ * True for a PromptRelayEncodeTimeline node (matched on the ComfyUI class, never a value
+ * shape). Matches when EITHER `type` OR `comfyClass` is the class name — not
+ * `type ?? comfyClass`, which would ignore a matching `comfyClass` whenever `type` holds a
+ * different non-null value (the #314 review finding, same trap here).
+ */
+export function isPromptRelayTimelineNode(node) {
+  return (
+    node?.type === PROMPT_RELAY_TIMELINE_NODE_TYPE ||
+    node?.comfyClass === PROMPT_RELAY_TIMELINE_NODE_TYPE
+  );
+}
+
+/**
+ * Classify a set_widget request against the PromptRelay timeline widgets:
+ *   "master"  → timeline_data (reconcile: write all three widgets + re-hydrate the editor)
+ *   "derived" → local_prompts / segment_lengths (refuse, redirect to timeline_data)
+ *   null      → not a PromptRelay timeline widget; use the normal write path
+ * Non-PromptRelayEncodeTimeline nodes always return null, so no other node is perturbed.
+ */
+export function classifyPromptRelayTimelineWrite(node, widgetName) {
+  if (!isPromptRelayTimelineNode(node)) return null;
+  if (widgetName === PROMPT_RELAY_MASTER_WIDGET) return "master";
+  if (PROMPT_RELAY_DERIVED_WIDGETS.includes(widgetName)) return "derived";
+  return null;
+}
+
+export class PromptRelayTimelineWriteError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "PromptRelayTimelineWriteError";
+  }
+}
+
+// A PLAIN JSON object (`{}` literal / Object.create(null)) — not an array, not a Map/Set/
+// Date/class instance. The value round-trips through JSON.stringify into the widget, which
+// turns any exotic object into `{}` (an empty timeline the node then resets to its blank
+// default). Rejecting those up front means we never report success for a wipe.
+function isPlainObject(v) {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
+ * The node's segment length, normalized to the integer frame count it stores — or null when
+ * the value is one the node's `Math.max(1, parseInt(v, 10) || 1)` would silently MANGLE
+ * (missing, fractional, zero/negative, non-numeric). A numeric integer STRING is accepted
+ * because parseInt handles it losslessly; everything else is refused rather than coerced.
+ */
+function normalizeSegmentLength(v) {
+  if (typeof v === "number") {
+    return Number.isInteger(v) && v >= MIN_SEGMENT_LENGTH ? v : null;
+  }
+  if (typeof v === "string" && /^\s*\d+\s*$/.test(v)) {
+    const n = Number(v.trim());
+    return Number.isInteger(n) && n >= MIN_SEGMENT_LENGTH ? n : null;
+  }
+  return null;
+}
+
+function describe(v) {
+  if (v === undefined) return "undefined";
+  if (v === null) return "null";
+  if (Array.isArray(v)) return "an array";
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+
+/**
+ * Parse a timeline_data widget string into a plain object, or null when it is empty/invalid.
+ * Used both for the merge base and for detecting a pre-existing desync.
+ */
+export function parsePromptRelayTimeline(raw) {
+  if (typeof raw !== "string" || raw.trim() === "") return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return isPlainObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The node's own derivation, mirrored verbatim from `syncWidgetsFromTimeline`:
+ *   local_prompts   = segments.map(s => s.prompt).join(" | ")
+ *   segment_lengths = segments.map(s => s.length).join(", ")
+ * Keeping this in ONE exported place means the production path and the tests agree, and any
+ * drift from the pack is a one-line change here.
+ */
+export function derivePromptRelayWidgets(segments) {
+  const segs = Array.isArray(segments) ? segments : [];
+  return {
+    local_prompts: segs.map((s) => s?.prompt ?? "").join(PROMPT_JOIN),
+    segment_lengths: segs.map((s) => s?.length ?? "").join(LENGTH_JOIN),
+  };
+}
+
+/**
+ * Validate + normalize the caller's value into a plain timeline object.
+ * Accepts an object OR a JSON-object string (the MCP arg schema carries it as a string).
+ * Throws PromptRelayTimelineWriteError on anything the node would silently coerce or reset.
+ */
+export function normalizePromptRelayTimelineValue(value) {
+  let obj = value;
+  if (typeof value === "string") {
+    try {
+      obj = JSON.parse(value);
+    } catch {
+      throw new PromptRelayTimelineWriteError(
+        `timeline_data must be the PromptRelayEncodeTimeline timeline as a JSON object, but the ` +
+          `string is not valid JSON. Pass e.g. {"segments":[{"prompt":"…","length":24}]}.`,
+      );
+    }
+  }
+  if (!isPlainObject(obj)) {
+    throw new PromptRelayTimelineWriteError(
+      `timeline_data must be a JSON OBJECT describing the timeline (with a "segments" array), ` +
+        `not ${describe(obj)}.`,
+    );
+  }
+  return obj;
+}
+
+/**
+ * Validate the EFFECTIVE (post-merge) timeline and return its segments normalized to the
+ * shape the node stores. Every rejection below is a case where the node's own parseInitial
+ * would either RESET to a blank two-segment default (wiping every prompt) or COERCE a field
+ * (destroying that segment's prompt / length) while the tool reported success.
+ */
+function normalizeSegments(timeline, baseSegments) {
+  const segments = timeline.segments;
+  if (!Array.isArray(segments) || segments.length === 0) {
+    throw new PromptRelayTimelineWriteError(
+      `timeline_data.segments must be a NON-EMPTY array of segment objects (got ${describe(segments)}). ` +
+        `The PromptRelayEncodeTimeline editor resets an absent/empty segment list to a blank ` +
+        `two-segment default, which would WIPE every prompt on the node while reporting success — ` +
+        `refusing. Read the node's current timeline_data, edit it, and write the whole object back.`,
+    );
+  }
+  return segments.map((seg, i) => {
+    if (!isPlainObject(seg)) {
+      throw new PromptRelayTimelineWriteError(
+        `timeline_data.segments[${i}] must be a segment OBJECT, not ${describe(seg)}. The node's ` +
+          `parser falls back to a blank two-segment timeline on a malformed segment, WIPING every ` +
+          `prompt — refusing.`,
+      );
+    }
+    if (typeof seg.prompt !== "string") {
+      throw new PromptRelayTimelineWriteError(
+        `timeline_data.segments[${i}].prompt must be a STRING (got ${describe(seg.prompt)}). The node ` +
+          `coerces a missing/non-string prompt to "", which would silently DESTROY that segment's ` +
+          `prompt text — refusing. Pass the prompt explicitly, or "" if you really mean empty.`,
+      );
+    }
+    const length = normalizeSegmentLength(seg.length);
+    if (length === null) {
+      throw new PromptRelayTimelineWriteError(
+        `timeline_data.segments[${i}].length must be a whole number of frames >= ${MIN_SEGMENT_LENGTH} ` +
+          `(got ${describe(seg.length)}). The node clamps anything else to ${MIN_SEGMENT_LENGTH} frame, ` +
+          `silently corrupting the segment lengths that drive the render — refusing.`,
+      );
+    }
+    const color =
+      typeof seg.color === "string"
+        ? seg.color
+        : typeof baseSegments?.[i]?.color === "string"
+          ? baseSegments[i].color
+          : FALLBACK_SEGMENT_COLORS[i % FALLBACK_SEGMENT_COLORS.length];
+    // Spread first so any field a future pack version adds survives the round-trip.
+    return { ...seg, prompt: seg.prompt, length, color };
+  });
+}
+
+/**
+ * Non-fatal notes about states where the node's PYTHON side would execute something other
+ * than what the timeline shows. These are legitimate states the node's own UI can produce, so
+ * they are reported rather than refused — but they are never left silent.
+ *   * `_encode_relay` drops blank entries (`if p.strip()`), so an empty prompt makes the
+ *     prompt count disagree with the length count and shifts every later segment.
+ *   * `local_prompts` is split on "|", so a literal "|" inside a prompt becomes TWO prompts.
+ */
+function timelineWarnings(segments) {
+  const warnings = [];
+  const blank = [];
+  const piped = [];
+  for (let i = 0; i < segments.length; i++) {
+    if (segments[i].prompt.trim() === "") blank.push(i);
+    if (segments[i].prompt.includes("|")) piped.push(i);
+  }
+  if (blank.length) {
+    warnings.push(
+      `segment(s) ${blank.join(", ")} have an EMPTY prompt. PromptRelay drops blank entries when it ` +
+        `splits local_prompts, so the node will run ${segments.length - blank.length} prompt(s) against ` +
+        `${segments.length} segment length(s) and every later segment shifts. Give each segment a prompt, ` +
+        `or delete the empty segments.`,
+    );
+  }
+  if (piped.length) {
+    warnings.push(
+      `segment(s) ${piped.join(", ")} contain a literal "|". PromptRelay splits local_prompts on "|", so ` +
+        `each of those becomes MORE than one prompt at run time and the segments misalign. Remove the ` +
+        `"|" characters from the prompt text.`,
+    );
+  }
+  return warnings;
+}
+
+/** Locate a widget by name on a LiteGraph node. */
+function findWidget(node, name) {
+  const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
+  return widgets.find((w) => w?.name === name) ?? null;
+}
+
+/** The refusal message for a DERIVED-widget write — explains why + points at timeline_data. */
+export function promptRelayDerivedRefusal(widgetName, nodeId) {
+  return (
+    `panel_set_widget cannot drive "${widgetName}" on PromptRelayEncodeTimeline node ${nodeId}: it is a ` +
+    `DERIVED OUTPUT that the node's timeline editor REGENERATES from "${PROMPT_RELAY_MASTER_WIDGET}" on ` +
+    `every commit — a direct write shows in panel_query_graph but never reaches the timeline UI and is ` +
+    `reverted the moment the node is touched, leaving the prompts and the timeline disagreeing (#506). ` +
+    `Set the whole timeline instead: panel_set_widget on "${PROMPT_RELAY_MASTER_WIDGET}" with the timeline ` +
+    `JSON ({"segments":[{"prompt":"…","length":24}, …]}), which drives the editor and regenerates ` +
+    `"${PROMPT_RELAY_DERIVED_WIDGETS.join('", "')}" for you.`
+  );
+}
+
+/**
+ * Reconcile a `timeline_data` write on PromptRelayEncodeTimeline.
+ *
+ * ORDERING (all synchronous — JavaScript is single-threaded, so no concurrent UI edit can
+ * interleave between the read of the current timeline and the write of the new one):
+ *   1. validate the caller's value,
+ *   2. resolve ALL THREE widgets (refuse if any is missing — a reconcile would be impossible),
+ *   3. MERGE the caller's top-level fields onto the node's CURRENT timeline so anything they
+ *      did not mention is preserved (never defaulted away),
+ *   4. validate + normalize the merged segments (refusing every coerce/reset case),
+ *   5. COMPUTE all three final widget values,
+ *   6. only then MUTATE — three plain assignments that cannot throw, so there is no path that
+ *      leaves timeline_data updated with the derived widgets stale,
+ *   7. re-hydrate the live editor (if any) from the same object and repaint.
+ *
+ * Hooks are injected so this is unit-testable without a browser and so the lib owns the
+ * ordering (mirroring ltx-director.js): `getEditor(node)` (default `node._timelineEditor`),
+ * `beforeChange`/`afterChange` bracket the mutation in litegraph's undo envelope so the route
+ * honors panel_set_widget's "Undoable with Ctrl+Z" contract, and `setDirty` repaints.
+ * beforeChange fires only AFTER every refusal has been cleared, so a rejected write leaves no
+ * empty undo step; afterChange always runs.
+ */
+export function applyPromptRelayTimelineWrite(
+  node,
+  value,
+  { getEditor, beforeChange, afterChange, setDirty } = {},
+) {
+  const overlay = normalizePromptRelayTimelineValue(value);
+
+  const widgets = {};
+  const missing = [];
+  for (const name of REQUIRED_WIDGETS) {
+    const w = findWidget(node, name);
+    if (w) widgets[name] = w;
+    else missing.push(name);
+  }
+  if (missing.length) {
+    throw new PromptRelayTimelineWriteError(
+      `PromptRelayEncodeTimeline node ${node?.id} is missing the widget(s) ${missing.join(", ")}, so ` +
+        `"${PROMPT_RELAY_MASTER_WIDGET}" cannot be reconciled with the prompts the node actually ` +
+        `executes. Writing timeline_data alone would leave the render using the OLD prompts (#506) — ` +
+        `refusing. Check that the ComfyUI-PromptRelay pack is installed and this node is up to date.`,
+    );
+  }
+
+  // Merge onto the node's CURRENT timeline: a caller who sends only `segments` keeps every
+  // other field, matching panel_set_widget's "change this" intent. Providing `segments`
+  // explicitly REPLACES the segment list (that is the whole point of the write); only
+  // OMISSION preserves. An overlay that omits `segments` entirely is therefore an idempotent
+  // RE-RECONCILE of the node's existing timeline — which is also the repair path for a node
+  // that is already desynced — and is refused only when there is no current timeline to keep.
+  const base = parsePromptRelayTimeline(widgets[PROMPT_RELAY_MASTER_WIDGET].value);
+  const merged = base ? { ...base, ...overlay } : { ...overlay };
+  const segments = normalizeSegments(merged, Array.isArray(base?.segments) ? base.segments : null);
+  const finalTimeline = { ...merged, segments };
+
+  // The node is ALREADY out of sync when its current local_prompts / segment_lengths are not
+  // what its current timeline_data produces — e.g. prompt text written straight into
+  // local_prompts with the #506 workaround, which exists ONLY there. That text is about to be
+  // replaced, so hand it back rather than letting it vanish silently.
+  const baseDerived = base ? derivePromptRelayWidgets(base.segments) : null;
+  const replaced = {};
+  if (baseDerived) {
+    for (const name of PROMPT_RELAY_DERIVED_WIDGETS) {
+      const current = widgets[name].value;
+      if (typeof current === "string" && current !== baseDerived[name]) replaced[name] = current;
+    }
+  }
+
+  const derived = derivePromptRelayWidgets(segments);
+  const timelineJson = JSON.stringify(finalTimeline);
+  const warnings = timelineWarnings(segments);
+  if (Object.keys(replaced).length) {
+    warnings.push(
+      `this node was ALREADY desynced: its ${Object.keys(replaced).join(" / ")} did not match its ` +
+        `timeline_data (typically a direct write to a derived widget, which the node reverts anyway). ` +
+        `Those values have been REPLACED by the ones derived from the timeline you just set; the ` +
+        `previous text is returned as "replaced_out_of_band" so nothing is lost silently.`,
+    );
+  }
+
+  // ── MUTATE ── Everything above either threw or produced final values, so from here on
+  // there are only assignments; no path can leave the three widgets disagreeing.
+  beforeChange?.();
+  let editorSynced = false;
+  let uiRefreshError = null;
+  try {
+    widgets[PROMPT_RELAY_MASTER_WIDGET].value = timelineJson;
+    widgets.local_prompts.value = derived.local_prompts;
+    widgets.segment_lengths.value = derived.segment_lengths;
+
+    // Re-hydrate the live editor from the SAME object so its next commit re-derives exactly
+    // what we just wrote (a no-op) instead of reverting to the stale in-memory timeline.
+    const editor = typeof getEditor === "function" ? getEditor(node) : node?._timelineEditor;
+    if (editor && typeof editor === "object") {
+      editor.timeline = finalTimeline;
+      const last = segments.length - 1;
+      const sel = Number.isInteger(editor.selectedIndex) ? editor.selectedIndex : 0;
+      editor.selectedIndex = Math.max(0, Math.min(sel, last));
+      // Drop the block-position animation state: it is keyed by segment INDEX, so stale
+      // entries would animate the new blocks from the old layout. render() falls back to the
+      // true position for any index it cannot find, so clearing simply snaps them correct.
+      editor._displayedX?.clear?.();
+      editor._targetX?.clear?.();
+      editor._settling = false;
+      editorSynced = true;
+      try {
+        // updateUIFromSelection refreshes the prompt textarea + length input from the new
+        // timeline (and clears the in-progress length-edit baseline, which refers to the old
+        // lengths); render repaints the blocks.
+        editor.updateUIFromSelection?.();
+        editor.render?.();
+      } catch (err) {
+        // The widgets and editor.timeline are already consistent, so execution is correct;
+        // only the repaint failed. Report it instead of failing the whole write.
+        uiRefreshError = err?.message ? String(err.message) : String(err);
+      }
+    }
+  } finally {
+    afterChange?.();
+  }
+  setDirty?.();
+
+  return {
+    prompt_relay_timeline: {
+      node_id: node?.id,
+      widget: PROMPT_RELAY_MASTER_WIDGET,
+      reconciled: true,
+      segments: segments.length,
+      merged_onto_current: base != null,
+      editor_synced: editorSynced,
+      local_prompts: derived.local_prompts,
+      segment_lengths: derived.segment_lengths,
+      ...(Object.keys(replaced).length ? { replaced_out_of_band: replaced } : {}),
+      ...(uiRefreshError ? { ui_refresh_error: uiRefreshError } : {}),
+      ...(warnings.length ? { warnings } : {}),
+    },
+  };
+}

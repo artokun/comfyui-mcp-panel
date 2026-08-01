@@ -153,6 +153,11 @@ import {
   derivedTimelineRefusal,
 } from "./lib/ltx-director.js";
 import {
+  classifyPromptRelayTimelineWrite,
+  applyPromptRelayTimelineWrite,
+  promptRelayDerivedRefusal,
+} from "./lib/prompt-relay-timeline.js";
+import {
   controlAfterGenerateModes,
   controlAfterGenerateEntries,
 } from "./lib/control-after-generate.js";
@@ -6268,6 +6273,25 @@ const GRAPH_TOOL_EXECUTORS = {
       // honors panel_set_widget's "Undoable with Ctrl+Z" contract (the node's own
       // _applyLoadedTimeline only schedules async state capture, no pre-change snapshot).
       return applyLtxTimelineWrite(node, value, {
+        beforeChange: () => graph.beforeChange(),
+        afterChange: () => graph.afterChange(),
+        setDirty: () => graph.setDirtyCanvas(true, true),
+      });
+    }
+    // #506: the ComfyUI-PromptRelay "PromptRelayEncodeTimeline" node has the same shape of
+    // problem but DIFFERENT mechanics, and a worse consequence. Its python execute() reads
+    // ONLY local_prompts + segment_lengths — never timeline_data — and both are DERIVED from
+    // timeline_data by the node's in-browser editor. A raw timeline_data write therefore
+    // "succeeds" while the RENDER still uses the old prompts. This pack exposes no re-hydration
+    // entry point, so the route regenerates the derived widgets itself (the node's own two
+    // join()s) and writes all three atomically, then re-hydrates the live editor. Derived
+    // writes are refused loudly. Keyed strictly to the PromptRelayEncodeTimeline node type.
+    const relayKind = classifyPromptRelayTimelineWrite(node, widget);
+    if (relayKind === "derived") {
+      throw new Error(promptRelayDerivedRefusal(widget, node.id));
+    }
+    if (relayKind === "master") {
+      return applyPromptRelayTimelineWrite(node, value, {
         beforeChange: () => graph.beforeChange(),
         afterChange: () => graph.afterChange(),
         setDirty: () => graph.setDirtyCanvas(true, true),

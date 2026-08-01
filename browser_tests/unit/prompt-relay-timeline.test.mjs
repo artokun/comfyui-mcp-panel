@@ -1,0 +1,413 @@
+// #506: driving the ComfyUI-PromptRelay "PromptRelayEncodeTimeline" node via panel_set_widget.
+//
+// The node's python execute() reads ONLY local_prompts + segment_lengths, both DERIVED by the
+// in-browser editor from timeline_data. A raw timeline_data write therefore reports success
+// while the RENDER still uses the previous prompts. The lib reconciles: it regenerates the
+// derived widgets from the new timeline and writes all three atomically, re-hydrates the live
+// editor, refuses every value the node would silently coerce or reset, and refuses direct
+// derived writes. These tests drive the REAL shipped lib.
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  PROMPT_RELAY_TIMELINE_NODE_TYPE,
+  PROMPT_RELAY_MASTER_WIDGET,
+  PROMPT_RELAY_DERIVED_WIDGETS,
+  isPromptRelayTimelineNode,
+  classifyPromptRelayTimelineWrite,
+  normalizePromptRelayTimelineValue,
+  parsePromptRelayTimeline,
+  derivePromptRelayWidgets,
+  promptRelayDerivedRefusal,
+  applyPromptRelayTimelineWrite,
+  PromptRelayTimelineWriteError,
+} from "../../web/js/lib/prompt-relay-timeline.js";
+
+const seg = (prompt, length = 24, extra = {}) => ({ prompt, length, color: "#4f8edc", ...extra });
+
+/**
+ * A fake node matching the real one's widget layout. `timelineSegments` seeds timeline_data
+ * AND (unless overridden) the two derived widgets, i.e. a node that starts in sync.
+ */
+function makeRelayNode({
+  id = 7,
+  timelineSegments = [seg("a"), seg("b", 36)],
+  extraTimelineFields = {},
+  localPrompts,
+  segmentLengths,
+  withEditor = true,
+  omitWidgets = [],
+} = {}) {
+  const timeline = timelineSegments ? { ...extraTimelineFields, segments: timelineSegments } : null;
+  const derived = derivePromptRelayWidgets(timelineSegments ?? []);
+  const all = {
+    timeline_data: { name: "timeline_data", value: timeline ? JSON.stringify(timeline) : "" },
+    local_prompts: { name: "local_prompts", value: localPrompts ?? derived.local_prompts },
+    segment_lengths: { name: "segment_lengths", value: segmentLengths ?? derived.segment_lengths },
+  };
+  const widgets = Object.values(all).filter((w) => !omitWidgets.includes(w.name));
+  const editor = withEditor
+    ? {
+        timeline: timeline ? JSON.parse(JSON.stringify(timeline)) : { segments: [] },
+        selectedIndex: 0,
+        _displayedX: new Map([[0, 5]]),
+        _targetX: new Map([[0, 5]]),
+        _settling: true,
+        uiCalls: [],
+        updateUIFromSelection() {
+          this.uiCalls.push("updateUIFromSelection");
+        },
+        render() {
+          this.uiCalls.push("render");
+        },
+      }
+    : null;
+  const node = { id, type: PROMPT_RELAY_TIMELINE_NODE_TYPE, widgets, _timelineEditor: editor };
+  return { node, widgets: all, editor };
+}
+
+const relay = (r) => r.prompt_relay_timeline;
+
+test("isPromptRelayTimelineNode matches on type or comfyClass, nothing else", () => {
+  assert.equal(isPromptRelayTimelineNode({ type: PROMPT_RELAY_TIMELINE_NODE_TYPE }), true);
+  assert.equal(isPromptRelayTimelineNode({ comfyClass: PROMPT_RELAY_TIMELINE_NODE_TYPE }), true);
+  // A non-matching `type` must NOT mask a matching `comfyClass` (the `type ?? comfyClass` trap).
+  assert.equal(
+    isPromptRelayTimelineNode({ type: "SomeVirtualType", comfyClass: PROMPT_RELAY_TIMELINE_NODE_TYPE }),
+    true,
+  );
+  // The NON-timeline sibling in the same pack has no editor and no timeline_data — never match it.
+  assert.equal(isPromptRelayTimelineNode({ type: "PromptRelayEncode" }), false);
+  assert.equal(isPromptRelayTimelineNode({ type: "LTXDirector" }), false);
+  assert.equal(isPromptRelayTimelineNode(null), false);
+  assert.equal(isPromptRelayTimelineNode({}), false);
+});
+
+test("classifyPromptRelayTimelineWrite: master / derived / null", () => {
+  const node = { type: PROMPT_RELAY_TIMELINE_NODE_TYPE };
+  assert.equal(classifyPromptRelayTimelineWrite(node, PROMPT_RELAY_MASTER_WIDGET), "master");
+  for (const w of PROMPT_RELAY_DERIVED_WIDGETS) {
+    assert.equal(classifyPromptRelayTimelineWrite(node, w), "derived");
+  }
+  // Ordinary widgets on the SAME node take the normal write path.
+  for (const w of ["global_prompt", "max_frames", "epsilon", "fps", "time_units"]) {
+    assert.equal(classifyPromptRelayTimelineWrite(node, w), null);
+  }
+  // Other node types are never perturbed — including LTXDirector, which owns its own route.
+  assert.equal(classifyPromptRelayTimelineWrite({ type: "LTXDirector" }, "timeline_data"), null);
+  assert.equal(classifyPromptRelayTimelineWrite({ type: "KSampler" }, "local_prompts"), null);
+});
+
+test("derivePromptRelayWidgets mirrors the node's syncWidgetsFromTimeline joins", () => {
+  const d = derivePromptRelayWidgets([seg("a cat", 10), seg("a dog", 20), seg("a bird", 30)]);
+  assert.equal(d.local_prompts, "a cat | a dog | a bird");
+  assert.equal(d.segment_lengths, "10, 20, 30");
+});
+
+test("parsePromptRelayTimeline: object / empty / invalid / non-object", () => {
+  assert.deepEqual(parsePromptRelayTimeline('{"segments":[]}'), { segments: [] });
+  assert.equal(parsePromptRelayTimeline(""), null);
+  assert.equal(parsePromptRelayTimeline("   "), null);
+  assert.equal(parsePromptRelayTimeline("not json"), null);
+  assert.equal(parsePromptRelayTimeline("[1,2]"), null);
+  assert.equal(parsePromptRelayTimeline(null), null);
+});
+
+test("normalizePromptRelayTimelineValue accepts an object or a JSON string, refuses the rest", () => {
+  assert.deepEqual(normalizePromptRelayTimelineValue({ segments: [] }), { segments: [] });
+  assert.deepEqual(normalizePromptRelayTimelineValue('{"segments":[]}'), { segments: [] });
+  assert.throws(() => normalizePromptRelayTimelineValue("nope"), PromptRelayTimelineWriteError);
+  assert.throws(() => normalizePromptRelayTimelineValue("[]"), PromptRelayTimelineWriteError);
+  assert.throws(() => normalizePromptRelayTimelineValue(42), PromptRelayTimelineWriteError);
+  assert.throws(() => normalizePromptRelayTimelineValue(null), PromptRelayTimelineWriteError);
+});
+
+// ─── The #506 core: the derived widgets never stay stale ───
+
+test("a timeline_data write REGENERATES local_prompts and segment_lengths (#506)", () => {
+  const { node, widgets, editor } = makeRelayNode();
+  assert.equal(widgets.local_prompts.value, "a | b");
+
+  const res = relay(
+    applyPromptRelayTimelineWrite(node, JSON.stringify({ segments: [seg("new one", 40), seg("b", 36)] })),
+  );
+
+  assert.equal(widgets.local_prompts.value, "new one | b");
+  assert.equal(widgets.segment_lengths.value, "40, 36");
+  assert.deepEqual(JSON.parse(widgets.timeline_data.value).segments.map((s) => s.prompt), ["new one", "b"]);
+  assert.equal(res.reconciled, true);
+  assert.equal(res.segments, 2);
+  assert.equal(res.local_prompts, "new one | b");
+  assert.equal(res.segment_lengths, "40, 36");
+  // The live editor is re-hydrated so its next commit re-derives the SAME values instead of
+  // reverting to the stale in-memory timeline.
+  assert.equal(res.editor_synced, true);
+  assert.deepEqual(editor.timeline.segments.map((s) => s.prompt), ["new one", "b"]);
+  assert.deepEqual(editor.uiCalls, ["updateUIFromSelection", "render"]);
+});
+
+test("the three widgets always agree — timeline_data JSON re-derives to the written values", () => {
+  const { node, widgets } = makeRelayNode();
+  applyPromptRelayTimelineWrite(node, { segments: [seg("x", 1), seg("y", 2), seg("z", 3)] });
+  const back = derivePromptRelayWidgets(JSON.parse(widgets.timeline_data.value).segments);
+  assert.equal(back.local_prompts, widgets.local_prompts.value);
+  assert.equal(back.segment_lengths, widgets.segment_lengths.value);
+});
+
+test("the editor's own commit after our write is a NO-OP (no silent revert)", () => {
+  const { node, widgets, editor } = makeRelayNode();
+  applyPromptRelayTimelineWrite(node, { segments: [seg("driven", 12)] });
+  // Replay the node's syncWidgetsFromTimeline against the re-hydrated editor.
+  const segs = editor.timeline.segments;
+  assert.equal(JSON.stringify(editor.timeline), widgets.timeline_data.value);
+  assert.equal(segs.map((s) => s.prompt).join(" | "), widgets.local_prompts.value);
+  assert.equal(segs.map((s) => s.length).join(", "), widgets.segment_lengths.value);
+});
+
+test("a write with NO live editor still leaves all three widgets consistent", () => {
+  const { node, widgets } = makeRelayNode({ withEditor: false });
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("headless", 9)] }));
+  assert.equal(res.editor_synced, false);
+  assert.equal(res.reconciled, true);
+  assert.equal(widgets.local_prompts.value, "headless");
+  assert.equal(widgets.segment_lengths.value, "9");
+});
+
+test("segment count SHRINKS and GROWS cleanly (derived lists track exactly)", () => {
+  const { node, widgets, editor } = makeRelayNode({
+    timelineSegments: [seg("a"), seg("b"), seg("c")],
+  });
+  applyPromptRelayTimelineWrite(node, { segments: [seg("only", 5)] });
+  assert.equal(widgets.local_prompts.value, "only");
+  assert.equal(widgets.segment_lengths.value, "5");
+  // selectedIndex is clamped into the shrunken list rather than dangling past the end.
+  assert.equal(editor.selectedIndex, 0);
+
+  applyPromptRelayTimelineWrite(node, { segments: [seg("p", 1), seg("q", 2), seg("r", 3), seg("s", 4)] });
+  assert.equal(widgets.local_prompts.value, "p | q | r | s");
+  assert.equal(widgets.segment_lengths.value, "1, 2, 3, 4");
+});
+
+test("selectedIndex past the end of a shrunken timeline is clamped, and anim state is reset", () => {
+  const { node, editor } = makeRelayNode({ timelineSegments: [seg("a"), seg("b"), seg("c")] });
+  editor.selectedIndex = 2;
+  applyPromptRelayTimelineWrite(node, { segments: [seg("a"), seg("b")] });
+  assert.equal(editor.selectedIndex, 1);
+  assert.equal(editor._displayedX.size, 0);
+  assert.equal(editor._targetX.size, 0);
+  assert.equal(editor._settling, false);
+});
+
+// ─── Merge: omitted fields preserved, never defaulted away ───
+
+test("a partial write MERGES onto the current timeline (unmentioned fields preserved)", () => {
+  const { node, widgets } = makeRelayNode({ extraTimelineFields: { zoom: 3, note: "keep me" } });
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("changed", 7)] }));
+  const written = JSON.parse(widgets.timeline_data.value);
+  assert.equal(written.zoom, 3);
+  assert.equal(written.note, "keep me");
+  assert.equal(res.merged_onto_current, true);
+});
+
+test("per-segment fields the caller does not know about survive the round-trip", () => {
+  const { node, widgets } = makeRelayNode();
+  applyPromptRelayTimelineWrite(node, {
+    segments: [{ prompt: "p", length: 8, color: "#abcdef", futureField: { a: 1 } }],
+  });
+  const s = JSON.parse(widgets.timeline_data.value).segments[0];
+  assert.equal(s.color, "#abcdef");
+  assert.deepEqual(s.futureField, { a: 1 });
+});
+
+test("a segment without a color inherits the same-index color, else a stable fallback", () => {
+  const { node, widgets } = makeRelayNode({
+    timelineSegments: [seg("a", 24, { color: "#111111" }), seg("b", 24, { color: "#222222" })],
+  });
+  applyPromptRelayTimelineWrite(node, {
+    segments: [{ prompt: "a2", length: 24 }, { prompt: "b2", length: 24 }, { prompt: "c2", length: 24 }],
+  });
+  const colors = JSON.parse(widgets.timeline_data.value).segments.map((s) => s.color);
+  assert.equal(colors[0], "#111111");
+  assert.equal(colors[1], "#222222");
+  assert.equal(typeof colors[2], "string");
+  assert.ok(colors[2].length > 0);
+});
+
+test("an unreadable current timeline_data falls back to a pure replace", () => {
+  const { node, widgets } = makeRelayNode();
+  widgets.timeline_data.value = "corrupt {{{";
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("fresh", 11)] }));
+  assert.equal(res.merged_onto_current, false);
+  assert.equal(widgets.local_prompts.value, "fresh");
+});
+
+// ─── Refusals: everything the node would silently coerce or reset ───
+
+test("REFUSES an empty / non-array segments list (node resets to a blank default)", () => {
+  for (const bad of [{ segments: [] }, { segments: null }, { segments: "a|b" }, { segments: {} }]) {
+    const { node, widgets } = makeRelayNode();
+    assert.throws(() => applyPromptRelayTimelineWrite(node, bad), PromptRelayTimelineWriteError);
+    // Nothing was touched — a refusal never half-writes.
+    assert.equal(widgets.local_prompts.value, "a | b");
+    assert.equal(widgets.segment_lengths.value, "24, 36");
+    assert.equal(JSON.parse(widgets.timeline_data.value).segments.length, 2);
+  }
+});
+
+test("an overlay with NO segments key is an idempotent RE-RECONCILE, not a wipe", () => {
+  // `segments` is merged from the node's current timeline, so nothing is defaulted away. This
+  // doubles as the repair path for a node that is already desynced.
+  const { node, widgets } = makeRelayNode({ localPrompts: "stale text" });
+  const res = relay(applyPromptRelayTimelineWrite(node, {}));
+  assert.equal(res.segments, 2);
+  assert.equal(widgets.local_prompts.value, "a | b");
+  assert.deepEqual(res.replaced_out_of_band, { local_prompts: "stale text" });
+});
+
+test("an overlay with no segments AND no readable current timeline is REFUSED", () => {
+  const { node } = makeRelayNode({ timelineSegments: null });
+  assert.throws(() => applyPromptRelayTimelineWrite(node, {}), PromptRelayTimelineWriteError);
+});
+
+test("REFUSES a non-object segment (node falls back to a blank timeline, wiping prompts)", () => {
+  for (const bad of [null, undefined, "a prompt", 5, ["x"]]) {
+    const { node, widgets } = makeRelayNode();
+    assert.throws(
+      () => applyPromptRelayTimelineWrite(node, { segments: [seg("ok"), bad] }),
+      PromptRelayTimelineWriteError,
+    );
+    assert.equal(widgets.local_prompts.value, "a | b");
+  }
+});
+
+test("REFUSES a missing/non-string prompt — the node would coerce it to \"\" (data loss)", () => {
+  for (const bad of [undefined, null, 42, { text: "hi" }, ["hi"]]) {
+    const { node, widgets } = makeRelayNode();
+    assert.throws(
+      () => applyPromptRelayTimelineWrite(node, { segments: [{ prompt: bad, length: 24 }] }),
+      PromptRelayTimelineWriteError,
+    );
+    assert.equal(widgets.local_prompts.value, "a | b");
+  }
+  // An EXPLICIT empty string is a legitimate value and is accepted.
+  const { node, widgets } = makeRelayNode();
+  applyPromptRelayTimelineWrite(node, { segments: [{ prompt: "", length: 24 }, seg("b")] });
+  assert.equal(widgets.local_prompts.value, " | b");
+});
+
+test("REFUSES a length the node would clamp/truncate; accepts integers and integer strings", () => {
+  for (const bad of [undefined, null, 0, -5, 12.5, "24px", "", NaN, Infinity, {}]) {
+    const { node, widgets } = makeRelayNode();
+    assert.throws(
+      () => applyPromptRelayTimelineWrite(node, { segments: [{ prompt: "p", length: bad }] }),
+      PromptRelayTimelineWriteError,
+    );
+    assert.equal(widgets.segment_lengths.value, "24, 36");
+  }
+  const { node, widgets } = makeRelayNode();
+  applyPromptRelayTimelineWrite(node, { segments: [{ prompt: "p", length: "30" }, seg("q", 1)] });
+  assert.equal(widgets.segment_lengths.value, "30, 1");
+  assert.equal(typeof JSON.parse(widgets.timeline_data.value).segments[0].length, "number");
+});
+
+test("REFUSES when any of the three widgets is missing (a reconcile would be impossible)", () => {
+  for (const missing of ["timeline_data", "local_prompts", "segment_lengths"]) {
+    const { node } = makeRelayNode({ omitWidgets: [missing] });
+    assert.throws(
+      () => applyPromptRelayTimelineWrite(node, { segments: [seg("p")] }),
+      (err) => err instanceof PromptRelayTimelineWriteError && err.message.includes(missing),
+    );
+  }
+});
+
+test("REFUSES a direct write to a derived widget and redirects to timeline_data", () => {
+  for (const w of PROMPT_RELAY_DERIVED_WIDGETS) {
+    const msg = promptRelayDerivedRefusal(w, 7);
+    assert.ok(msg.includes(w));
+    assert.ok(msg.includes(PROMPT_RELAY_MASTER_WIDGET));
+    assert.ok(msg.includes("#506"));
+  }
+});
+
+// ─── Honesty: nothing diverges silently ───
+
+test("a PRE-EXISTING desync is reported, not silently overwritten (#506 workaround recovery)", () => {
+  // A node whose local_prompts was written directly (the issue's workaround): that text exists
+  // ONLY there and the node would revert it anyway. Our reconcile replaces it — and says so.
+  const { node, widgets } = makeRelayNode({ localPrompts: "hand written | prompts" });
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("timeline says", 24)] }));
+  assert.deepEqual(res.replaced_out_of_band, { local_prompts: "hand written | prompts" });
+  assert.ok(res.warnings.some((w) => w.includes("ALREADY desynced")));
+  assert.equal(widgets.local_prompts.value, "timeline says");
+});
+
+test("an IN-SYNC node reports no replaced_out_of_band and no desync warning", () => {
+  const { node } = makeRelayNode();
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("a"), seg("b", 36)] }));
+  assert.equal(res.replaced_out_of_band, undefined);
+  assert.equal(res.warnings, undefined);
+});
+
+test("WARNS about an empty prompt — the python side drops blanks and shifts every later segment", () => {
+  const { node } = makeRelayNode();
+  const res = relay(
+    applyPromptRelayTimelineWrite(node, { segments: [seg("a"), seg("   ", 12), seg("c")] }),
+  );
+  assert.ok(res.warnings.some((w) => w.includes("EMPTY prompt")));
+  assert.equal(res.local_prompts, "a |     | c");
+});
+
+test("WARNS about a literal | inside a prompt — the python side splits on it", () => {
+  const { node } = makeRelayNode();
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("a cat | a dog", 24)] }));
+  assert.ok(res.warnings.some((w) => w.includes('literal "|"')));
+});
+
+test("a UI-refresh failure does NOT fail the write, and is reported", () => {
+  const { node, widgets, editor } = makeRelayNode();
+  editor.render = () => {
+    throw new Error("canvas gone");
+  };
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("still applied", 15)] }));
+  // The values the node EXECUTES are correct; only the repaint failed.
+  assert.equal(widgets.local_prompts.value, "still applied");
+  assert.equal(widgets.segment_lengths.value, "15");
+  assert.equal(res.editor_synced, true);
+  assert.equal(res.ui_refresh_error, "canvas gone");
+});
+
+// ─── Undo envelope ───
+
+test("wraps the mutation in one undo envelope: before → write → after → dirty", () => {
+  const { node } = makeRelayNode();
+  const order = [];
+  applyPromptRelayTimelineWrite(node, { segments: [seg("p")] }, {
+    beforeChange: () => order.push("before"),
+    afterChange: () => order.push("after"),
+    setDirty: () => order.push("dirty"),
+  });
+  assert.deepEqual(order, ["before", "after", "dirty"]);
+});
+
+test("fires NO undo hooks when a refusal happens (no empty undo step)", () => {
+  const order = [];
+  const hooks = {
+    beforeChange: () => order.push("before"),
+    afterChange: () => order.push("after"),
+    setDirty: () => order.push("dirty"),
+  };
+  const { node } = makeRelayNode();
+  assert.throws(() => applyPromptRelayTimelineWrite(node, "not json", hooks));
+  assert.throws(() => applyPromptRelayTimelineWrite(node, { segments: [] }, hooks));
+  assert.throws(
+    () => applyPromptRelayTimelineWrite(makeRelayNode({ omitWidgets: ["local_prompts"] }).node, { segments: [seg("p")] }, hooks),
+  );
+  assert.deepEqual(order, []);
+});
+
+test("honors an injected getEditor", () => {
+  const { node } = makeRelayNode({ withEditor: false });
+  const editor = { timeline: null, selectedIndex: 0, uiCalls: [], render() { this.uiCalls.push("render"); } };
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("p")] }, { getEditor: () => editor }));
+  assert.equal(res.editor_synced, true);
+  assert.deepEqual(editor.timeline.segments.map((s) => s.prompt), ["p"]);
+});
