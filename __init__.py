@@ -70,6 +70,7 @@ _BACKEND_PORTS = {
     "codex": 9181,
     "gemini": 9182,
     "antigravity": _BRIDGE_PORT,  # Google Antigravity (agy) — single-port multi-provider
+    "pi": _BRIDGE_PORT,  # pi.dev (pi) — single-port multi-provider, same orchestrator (#491)
     "grok": _BRIDGE_PORT,  # single-port multi-provider — same orchestrator
     "kimi": _BRIDGE_PORT,  # single-port multi-provider — same orchestrator
     "moonshot": _BRIDGE_PORT,  # hosted (Moonshot / Kimi K3) — same orchestrator, key-gated
@@ -104,6 +105,7 @@ _PROVIDER_CLIS = {
     "codex": ("codex", "codex.cmd", "codex.exe"),
     "gemini": ("gemini", "gemini.cmd", "gemini.exe"),
     "antigravity": ("agy", "agy.exe"),
+    "pi": ("pi", "pi.cmd", "pi.exe"),
     "grok": ("grok", "grok.cmd", "grok.exe"),
     "kimi": ("kimi", "kimi.cmd", "kimi.exe"),
     "ollama": ("ollama", "ollama.exe"),
@@ -136,6 +138,23 @@ def _antigravity_installed():
         local = environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
         return os.path.isfile(os.path.join(local, "agy", "bin", "agy.exe"))
     return os.path.isfile(os.path.join(os.path.expanduser("~"), ".local", "bin", "agy"))
+
+
+def _pi_installed():
+    """pi.dev CLI (pi) at COMFYUI_MCP_PI_PATH, on PATH, or in its well-known
+    install locations (the official installer targets ~/.local/bin; the env
+    override mirrors the orchestrator's resolvePiBin so an env-var-only install
+    doesn't read "not installed" in onboarding until the orchestrator's readiness
+    frame corrects it)."""
+    override = (environ.get("COMFYUI_MCP_PI_PATH") or "").strip()
+    if override and os.path.isfile(override):
+        return True
+    if _provider_cli("pi"):
+        return True
+    if sys.platform == "win32":
+        local = environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+        return os.path.isfile(os.path.join(local, "pi", "bin", "pi.exe"))
+    return os.path.isfile(os.path.join(os.path.expanduser("~"), ".local", "bin", "pi"))
 
 
 def _gui_fallback_bin_dirs():
@@ -223,6 +242,16 @@ def _provider_auth(provider):
         # installed (the orchestrator's model probe verifies auth at connect);
         # without the CLI there is nothing to be signed in to.
         return None if _antigravity_installed() else False
+    if provider == "pi":
+        # pi keeps provider credentials in ~/.pi/agent/auth.json (API keys +
+        # `/login` subscriptions) or provider env vars. A present auth.json is a
+        # definite login; otherwise report unknown when the CLI is installed (pi
+        # may be configured via env we can't cheaply see — the orchestrator's
+        # readiness/connect verifies), and not-signed-in when it isn't.
+        if not _pi_installed():
+            return False
+        auth_json = os.path.join(home, ".pi", "agent", "auth.json")
+        return True if os.path.isfile(auth_json) else None
     if provider == "ollama":
         # No login concept — a local daemon. Installed = usable; a stopped daemon
         # surfaces at connect time (the orchestrator's model probe).
@@ -239,6 +268,8 @@ def _provider_state(provider):
         cli = _ollama_installed()
     elif provider == "antigravity":
         cli = _antigravity_installed()
+    elif provider == "pi":
+        cli = _pi_installed()
     else:
         cli = _provider_cli(provider)
     auth = _provider_auth(provider)
