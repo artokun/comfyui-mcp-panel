@@ -14726,10 +14726,13 @@ function buildPanel() {
       // Fire ONCE per completed download (reconcileCompletedDownloads dedupes the
       // lingering done rows); refreshComfyNodeDefs is coalesced single-flight and
       // fully defensive (no-op when no canvas / on any frontend-API gap — worst
-      // case is today's stale behaviour, never a throw).
+      // case is today's stale behaviour, never a throw). force:true so a completion
+      // arriving while an UNRELATED refresh is already in flight is not silently
+      // dropped by joining that older /object_info fetch — it guarantees a trailing
+      // fresh fetch that reflects the just-landed file (#396 completion race).
       const { nextSeen, newlyDone } = reconcileCompletedDownloads(list, seenDoneDownloads);
       seenDoneDownloads = nextSeen;
-      if (newlyDone.length) void refreshComfyNodeDefs();
+      if (newlyDone.length) void refreshComfyNodeDefs(undefined, { force: true });
     },
     // Live RunPod pod status → the host pill + open control modal.
     onRunpodStatus(frame) {
