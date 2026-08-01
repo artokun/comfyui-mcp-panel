@@ -183,6 +183,7 @@ import {
 import {
   shouldResumeAfterComfyReconnect,
   shouldRehelloAfterCommand,
+  planSoftReloadRecovery,
   retryDuringReconnect,
   dedupeWorkflowTabRecords,
   resolveLoadGraphArgs,
@@ -1119,6 +1120,9 @@ const REBOOT_KEY = "comfyui-mcp.panel.rebootResume";
 // agent-triggered reload mid-task — nudge it to continue. Survives the bridge
 // drop via sessionStorage.
 const SOFT_RELOAD_KEY = "comfyui-mcp.panel.softReloadResume";
+// Upper bound on the soft-reload POST so a hung /reload handler can't wedge the
+// reconnect (the await must always settle → client.start() always runs). #379.
+const RELOAD_POST_TIMEOUT_MS = 10000;
 // Set while the agent is mid-turn (working), cleared when the turn finishes. If
 // the connection drops while it's set — an UNEXPECTED bounce (another agent
 // rebooting ComfyUI, a crash, an SDK self-heal) — the reconnect nudges the
@@ -8384,8 +8388,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // on each background retry — that latched "disconnected" is what stops the
     // connecting↔disconnected flicker.
     if (!gaveUp) emitStatus("connecting");
+    let thisSock;
     try {
-      sock = new WebSocket(url);
+      thisSock = new WebSocket(url);
     } catch (err) {
       // Constructor threw before a socket exists → no open/close will fire, so we
       // drive the retry directly. Keep the status steady (scheduleReconnect decides
@@ -8393,8 +8398,21 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       scheduleReconnect();
       return;
     }
+    sock = thisSock;
 
-    sock.addEventListener("open", () => {
+    // INSTANCE GUARD (panel #379 race): every listener below is bound to THIS socket
+    // instance and no-ops unless it is still the active `sock`. A soft-reload / restart
+    // does stop()→start() (drop the old socket, open a new one); the OLD socket's
+    // asynchronous `close`/`open`/`message` can arrive AFTER the new socket is assigned.
+    // Without this guard the stale `close` handler would `sock = null` the FRESH socket
+    // (and scheduleReconnect), leaving the new socket unable to send its hello — an
+    // unhandshaken, untracked connection plus a duplicate reconnect. Now on the hot
+    // path because this pack's /reload is a by-design 503, so every soft reload
+    // reconnects. Guarding by instance makes a superseded socket's events inert.
+    const isActive = () => sock === thisSock;
+
+    thisSock.addEventListener("open", () => {
+      if (!isActive()) return; // superseded socket — ignore its late open
       handshakeDone = false;
       // A bare WS open is NOT progress — the orchestrator handshake (`models`)
       // hasn't arrived yet. Do NOT reset attempt/gaveUp here (only markConnected
@@ -8413,6 +8431,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       clearHandshake();
       handshakeTimer = setTimeout(() => {
         if (handshakeDone) return;
+        // A SUPERSEDED socket's stale handshake timer must not drive recovery against
+        // the replacement connection (onHandshakeTimeout can setUrl/redial or trigger
+        // a reclaim). Only the still-active socket's timeout is real. (stop() also
+        // clears this timer now, but a socket replaced by a fast reconnect can leave a
+        // timer armed between stop and the next open.)
+        if (!isActive()) return;
         // The WS is OPEN but no orchestrator handshake (models frame) arrived
         // within the generous cold-start window. Two causes: (1) a WEDGED
         // orchestrator — alive, bridge up, agent dead — or (2) some non-orchestrator
@@ -8429,7 +8453,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       }, handshakeMs());
     });
 
-    sock.addEventListener("message", async (ev) => {
+    thisSock.addEventListener("message", async (ev) => {
+      if (!isActive()) return; // superseded socket — ignore its late frames
       let msg;
       try {
         msg = JSON.parse(typeof ev.data === "string" ? ev.data : "");
@@ -8600,8 +8625,15 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             error: coerceMessageText(err?.message ?? err),
           };
         }
+        // A command executor can be ASYNC (ask_user/request_secret block on the user;
+        // graph run/save await). If a soft-reload/restart swapped this socket out while
+        // we were suspended, this reply belongs to the DEAD session A — it must NOT be
+        // injected into the fresh session B (whose sock the global now points at), and
+        // its activity card must not paint. Drop the whole continuation, and always send
+        // the reply on THIS socket (never the mutable global), only while it's open.
+        if (!isActive()) return;
         try {
-          sock.send(JSON.stringify(reply));
+          if (thisSock.readyState === WebSocket.OPEN) thisSock.send(JSON.stringify(reply));
         } catch {
           // Socket died between receive and reply — agent side times out.
         }
@@ -8762,7 +8794,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // "echo" frames are ignored — we render the user bubble locally on send.
     });
 
-    sock.addEventListener("close", () => {
+    thisSock.addEventListener("close", () => {
+      // A SUPERSEDED socket closing must NOT touch the fresh connection: don't null
+      // the active `sock`, don't reject its pending calls, don't scheduleReconnect
+      // (that would orphan the new socket and spawn a duplicate). Just let it die.
+      if (!isActive()) return;
       sock = null;
       handshakeDone = false;
       // Fail any in-flight direct tool calls — the reply can never arrive now.
@@ -8781,7 +8817,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       }
     });
 
-    sock.addEventListener("error", () => {
+    thisSock.addEventListener("error", () => {
       // close fires after error; reconnect handled there.
     });
   }
@@ -9064,6 +9100,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
+      // Cancel the shared handshake timer so a stopped-before-handshake socket can't
+      // fire onHandshakeTimeout against a later reconnect (#379 race hardening).
+      clearHandshake();
       try {
         sock?.close();
       } catch {}
@@ -16674,24 +16713,51 @@ function buildPanel() {
     appendSystem("Soft-reloading the agent (new code, no ComfyUI restart)…");
     try {
       client.stop(); // drop the bridge so the old orchestrator can release the port
-      const res = await api.fetchApi("/comfyui_mcp_panel/reload", { method: "POST" });
+      // Bound the POST: a hung ComfyUI handler / stalled network would otherwise never
+      // settle, so the await never returns, `reloading` stays true, and client.start()
+      // below is never reached — a permanent wedge (codex). On timeout we reject into
+      // the catch, which clears the interlock and reconnects the dropped bridge.
+      const res = await Promise.race([
+        api.fetchApi("/comfyui_mcp_panel/reload", { method: "POST" }),
+        new Promise((_resolve, reject) =>
+          setTimeout(() => reject(new Error("reload request timed out")), RELOAD_POST_TIMEOUT_MS),
+        ),
+      ]);
       const data = await res.json().catch(() => ({}));
-      if (!data?.ok) {
+      const plan = planSoftReloadRecovery({ ok: data?.ok, reachable: true });
+      if (!plan.keepResumeInterlock) {
+        // Reload REFUSED. This pack's /reload route is a by-design 503: the
+        // orchestrator runs out-of-band and never stopped — only our bridge socket
+        // did (client.stop above). We do NOT own a respawn, so stand the interlock
+        // down and reconnect the dropped bridge (below) instead of leaving the
+        // panel wedged "connected chip / dead bridge" (#379). The old code told the
+        // user to restart a healthy orchestrator; surface that only as an OPTIONAL
+        // "load new code" hint, not a required recovery step.
         ssSet(SOFT_RELOAD_KEY, null);
-        clearSoftReloadGuard(); // never started respawning → re-enable auto-respawn
-        appendSystem(data?.message || "Soft reload failed — try Disconnect then Connect.");
-        return;
+        clearSoftReloadGuard();
+        const cmd = typeof data?.start_command === "string" ? data.start_command.trim() : "";
+        appendSystem(
+          "Reconnecting the panel bridge…" +
+            (cmd ? `\n(To load new orchestrator code, restart it manually: ${cmd})` : ""),
+        );
       }
     } catch (err) {
+      // Couldn't even reach the reload route. The orchestrator may still be alive,
+      // so stand the interlock down and reconnect the dropped bridge (below) rather
+      // than leaving it dead (#379).
       ssSet(SOFT_RELOAD_KEY, null);
-      clearSoftReloadGuard(); // POST failed → re-enable auto-respawn
-      appendSystem(`Couldn't reach ComfyUI to reload the agent: ${coerceMessageText(err?.message ?? err)}`);
-      return;
+      clearSoftReloadGuard();
+      appendSystem(
+        `Couldn't reach ComfyUI to reload the agent — reconnecting the bridge: ${coerceMessageText(err?.message ?? err)}`,
+      );
     } finally {
       reloading = false;
     }
-    // Reconnect with backoff until the fresh orchestrator binds; onAck resumes. The
-    // soft-reload guard keeps auto-respawn from racing this backoff window.
+    // Reconnect EITHER WAY (mirrors hardRestart, #379): on an accepted reload the
+    // guard/SOFT_RELOAD_KEY are still set so the fresh orchestrator binds and onAck
+    // resumes; on a refused/failed reload the interlock was cleared above and this
+    // restores the bridge we dropped against the still-running orchestrator — the
+    // panel never wedges "connected but dead".
     client.start();
   }
 
