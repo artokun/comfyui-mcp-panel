@@ -296,6 +296,7 @@ export function buildHelloPayload({
   comfyuiUrl,
   comfyuiPath,
   resume,
+  workflowUuid,
 } = {}) {
   const frame = {
     type: "hello",
@@ -304,11 +305,31 @@ export function buildHelloPayload({
     panel_version: panelVersion,
     backend: backend || "claude",
     blind: Boolean(blind),
+    // #570 P0c — advertise that THIS panel build enforces the per-command workflow-instance
+    // stamp: it refuses to run ANY active-workflow op whose stamped workflow_uuid does not match
+    // the active canvas — every graph_* command AND the four active-workflow mutators
+    // (workflow_save / workflow_save_as / workflow_rename / workflow_close). The fence is in the
+    // command handler (activeWorkflowFenceApplies), before every executor, so it spans all of
+    // them. The orchestrator FAILS CLOSED for those mutations unless a connected panel confirms
+    // this, so an OLD panel that would silently ignore the stamp and apply a stale write to the
+    // wrong workflow gets read-only graph access until updated.
+    // SCOPE: this is ACCIDENTAL version-skew protection for an honest user, NOT a security
+    // boundary — the flag is self-asserted, so a modified panel can spoof it, but that only
+    // leaks the user's own workflow into their own workflow (self-attack). No attestation.
+    enforces_workflow_stamp: true,
   };
   if (comfyuiUrl) frame.comfyui_url = comfyuiUrl;
   if (typeof comfyuiPath === "string" && comfyuiPath.trim()) {
     frame.comfyui_path = comfyuiPath.trim();
   }
   if (resume) frame.resume = resume;
+  // #570 — the durable, globally-unique per-instance workflow uuid (survives the
+  // tmp:<uuid> tab-id churn across a reload, unlike the tab id and the default
+  // title). Lets the orchestrator key an UNSAVED workflow's resume on a stable
+  // identity that never collides with a DIFFERENT unsaved workflow of the same
+  // title (the reopened cross-resume). Omitted when unknown so old behavior stands.
+  if (typeof workflowUuid === "string" && workflowUuid.trim()) {
+    frame.workflow_uuid = workflowUuid.trim();
+  }
   return frame;
 }

@@ -95,9 +95,16 @@ import {
   updateMetadataEntry,
 } from "./lib/chat-history-store.js";
 import {
+  activeWorkflowFenceApplies,
   classifyPinnedTarget,
+  commandWorkflowMismatch,
+  selectorSearchIncludesListed,
+  selectorTargetsNonActiveWorkflow,
+  isNewWorkflowLoad,
   normalizedWorkflowPath,
+  resolveUnsavedInstanceUuid,
   shouldForkEmbeddedWorkflowUuid,
+  shouldForkInPlaceReload,
   workflowAliasForPath,
   workflowIdentityForms,
 } from "./lib/workflow-chat-identity.js";
@@ -1099,6 +1106,21 @@ function workflowRecordMatchesSelector(w, sel) {
   );
 }
 
+// #570 — resolve a path/selector to the workflow record a path-selectored active-workflow mutator
+// (workflow_rename / workflow_close) will act on, over the EXACT collection that command's
+// executor searches — so the #570 fence's "does this resolve to the active workflow?" decision
+// matches execution EXACTLY (no over- or under-fencing). workflow_rename can target a
+// closed-but-listed workflow, so it searches openWorkflows + workflows; workflow_close can only
+// close an OPEN workflow, so it searches openWorkflows alone. Selector semantics are unchanged
+// (workflowRecordMatchesSelector). Returns the matched record or null.
+function resolveWorkflowSelectorTarget(cmd, s, selector) {
+  if (typeof selector !== "string" || !selector) return null;
+  const list = selectorSearchIncludesListed(cmd)
+    ? [...(s?.openWorkflows ?? []), ...(s?.workflows ?? [])]
+    : (s?.openWorkflows ?? []);
+  return list.find((w) => workflowRecordMatchesSelector(w, selector)) || null;
+}
+
 function activeWorkflowExtra(wf = activeWorkflowRef(), { create = false } = {}) {
   try {
     const root = app?.graph;
@@ -1136,6 +1158,104 @@ function persistWorkflowAliases() {
   }
 }
 
+// #570 P0 — CREATE-BOUNDARY FORK. Wrap app.loadGraphData so that at every workflow
+// CREATION (import / open-file / drag-drop / template / shared-url / DUPLICATE / PASTE /
+// new-blank) — but NOT a reload-restore / tab-switch / undo / in-place repaint — we mint
+// a FRESH embedded per-instance uuid into the incoming graph BEFORE it goes live. Paste
+// and duplicate keep the SOURCE graph's embedded uuid AND can land on the same synthesized
+// "Unsaved Workflow.json" path, so without this a copy would present the source's identity
+// and inherit its session (the reopened cross-resume). Regenerating at creation makes the
+// embedded uuid a trustworthy per-instance identity: fresh for a copy, and round-tripped
+// verbatim by ComfyUI's draft persistence across a reload (durable — P1). isNewWorkflowLoad
+// reads the discriminators (loadGraphData's 4th `workflow` arg is a ComfyWorkflow object only
+// on a REUSE; creations pass null/undefined/string; external imports also set openSource).
+// loadGraphData clones graphData internally AFTER we mutate, so our stamp flows into configure.
+let _loadGraphDataForkInstalled = false;
+function installCreateBoundaryFork(appRef) {
+  try {
+    if (_loadGraphDataForkInstalled || !appRef || typeof appRef.loadGraphData !== "function") return;
+    const orig = appRef.loadGraphData.bind(appRef);
+    appRef.loadGraphData = function (graphData, clean, restoreView, workflow, options = {}) {
+      try {
+        if (graphData && typeof graphData === "object" && !Array.isArray(graphData)) {
+          const noFork = Boolean(options && options.__cmcpNoFork);
+          // #570 P0b — an UNTRUSTED in-place replacement: the agent's graph_load drops
+          // ARBITRARY external JSON onto the ACTIVE workflow object. That JSON's graph.extra
+          // uuid is forgeable/copyable (a copied/exported graph can carry ANY workflow's uuid),
+          // so it must NEVER be adopted as identity — but the load is still an agent tool
+          // running INSIDE the live session on this tab, so changing the tab's identity would
+          // reset the very conversation the agent is executing in. We therefore KEEP the LIVE
+          // OBJECT's identity (the WeakMap value — the only non-forgeable ownership source) and
+          // OVERWRITE the incoming graph.extra uuid with it, stripping the copied value so it
+          // can neither be adopted now nor resurface via the embedded fallback or a later save.
+          const keepInstance = Boolean(options && options.__cmcpKeepInstance);
+          const creation =
+            !noFork &&
+            !keepInstance &&
+            isNewWorkflowLoad({ workflowArg: workflow, openSource: options ? options.openSource : undefined });
+          // #570 P0b — a stale PER-OBJECT uuid cache must NEVER override the identity of the
+          // newly-loaded content, and we KEEP nothing derived from the copyable graph.extra.
+          //  • CREATION (import/paste/duplicate/new) → mint a fresh identity.
+          //  • IN-PLACE load into an EXISTING object whose cached uuid DIFFERS from the incoming
+          //    graph's embedded uuid (or the incoming has none) → the workflow was REPLACED in
+          //    place: INVALIDATE the object cache and mint fresh, so the replacement can't keep
+          //    the prior instance's identity. The embedded value is used ONLY to DETECT the
+          //    change; the minted uuid is fresh (never adopted from graph.extra).
+          let fork = false;
+          if (keepInstance && workflow && typeof workflow === "object") {
+            // Authoritative identity = the live object's cached uuid (mint one only if this
+            // object has never been seen). Stamp it over the incoming value; do NOT fork.
+            const cached = _workflowObjectUuids.get(workflow);
+            const authoritative = cached || crypto.randomUUID();
+            if (!cached) _workflowObjectUuids.set(workflow, authoritative);
+            const extra =
+              graphData.extra && typeof graphData.extra === "object" ? graphData.extra : (graphData.extra = {});
+            const prev = extra[WORKFLOW_META_NAMESPACE];
+            extra[WORKFLOW_META_NAMESPACE] = {
+              ...(prev && typeof prev === "object" ? prev : {}),
+              [WORKFLOW_UUID_FIELD]: authoritative,
+            };
+          } else if (creation) {
+            fork = true;
+          } else if (!noFork && workflow && typeof workflow === "object") {
+            const cached = _workflowObjectUuids.get(workflow);
+            const incoming = graphData.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD];
+            if (shouldForkInPlaceReload({ cachedUuid: cached, incomingUuid: incoming })) {
+              _workflowObjectUuids.delete(workflow); // content replaced in place → drop stale cache
+              fork = true;
+            }
+          }
+          if (fork) {
+            const extra =
+              graphData.extra && typeof graphData.extra === "object" ? graphData.extra : (graphData.extra = {});
+            const prev = extra[WORKFLOW_META_NAMESPACE];
+            extra[WORKFLOW_META_NAMESPACE] = {
+              ...(prev && typeof prev === "object" ? prev : {}),
+              [WORKFLOW_UUID_FIELD]: crypto.randomUUID(),
+            };
+          }
+        }
+      } catch {
+        // Never let identity bookkeeping break a graph load.
+      }
+      return orig(graphData, clean, restoreView, workflow, options);
+    };
+    _loadGraphDataForkInstalled = true;
+  } catch (err) {
+    // Surface the failure: with the sanitizer inactive, workflowStableUuid fails CLOSED for
+    // unsaved workflows (ignores the copyable embedded uuid, mints fresh per instance). Two
+    // concurrently-open copies stay distinct, but durable resume across a reload is disabled
+    // — a deliberate lost-resume, never a wrong-resume.
+    _loadGraphDataForkInstalled = false;
+    try {
+      console.warn(
+        "[comfyui-mcp] creation-boundary fork failed to install; unsaved-workflow resume disabled (fail-closed)",
+        err,
+      );
+    } catch {}
+  }
+}
+
 function workflowUuidOwner(id) {
   const stored = _workflowUuidOwners.get(id);
   const owner = stored && typeof stored.deref === "function" ? stored.deref() ?? null : stored ?? null;
@@ -1164,6 +1284,54 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
   if (!identityObject || typeof identityObject !== "object") return getTabId();
   const path = savedWorkflowPath(wf);
   const objectUuid = _workflowObjectUuids.get(identityObject);
+
+  // #570 P0/P1 — UNSAVED workflow: the per-instance identity is the in-session objectUuid
+  // (the LIVE-object WeakMap — a copy/import does NOT share it), else the EMBEDDED graph.extra
+  // uuid for DURABILITY across a reload. Ownership/KEEP is anchored on the live object: the
+  // loadGraphData wrapper INVALIDATES a stale object-cache and re-mints whenever the content
+  // loaded into an existing instance changes (in-place replace), and forks every creation —
+  // so the embedded uuid can only survive as a genuine reload of the SAME content, never a
+  // copy or an in-place replacement. We therefore read the embedded uuid ONLY when the object
+  // cache is empty (a fresh reload), and never let it override a live cache.
+  const isUnsaved = !path && wf && wf.isPersisted !== true;
+  if (isUnsaved) {
+    // FAIL CLOSED on the durability carrier: the embedded graph.extra uuid is trustworthy
+    // ONLY because the creation-boundary wrapper re-mints it on every copy/import/in-place
+    // replace — that sanitizer is what makes a persisted uuid a faithful projection of the
+    // live-object identity rather than a copyable source uuid. If the wrapper is not provably
+    // installed, that guarantee is void, so a pasted/imported graph could still be carrying
+    // the SOURCE's graph.extra uuid; adopting it would cross-resume the source's conversation
+    // (#570). When the sanitizer is inactive we therefore ignore the embedded value entirely
+    // and mint a fresh per-instance uuid — durable resume is disabled (lost-resume), never a
+    // wrong-resume. The live-object WeakMap (objectUuid) is always safe: a copy never shares it.
+    const embeddedId = embeddedWorkflowUuid(wf);
+    const id = resolveUnsavedInstanceUuid({
+      objectUuid,
+      embeddedId,
+      forkActive: _loadGraphDataForkInstalled,
+    });
+    _workflowObjectUuids.set(identityObject, id);
+    rememberWorkflowUuidOwner(id, identityObject);
+    if (embeddedId !== id) {
+      // Persist the identity into extra (so a reload of the SAME content keeps it, AND a later
+      // SAVE carries it into the saved file across the tmp:→wf: transition). Never dirties the
+      // graph. Not a KEEP authority — the wrapper's live-object invalidation is.
+      try {
+        const extra = activeWorkflowExtra(wf, { create: true });
+        const previous = extra?.[WORKFLOW_META_NAMESPACE];
+        if (extra) {
+          extra[WORKFLOW_META_NAMESPACE] = {
+            ...(previous && typeof previous === "object" ? previous : {}),
+            [WORKFLOW_UUID_FIELD]: id,
+          };
+        }
+      } catch {
+        // In-memory objectUuid still keeps this instance stable for the session.
+      }
+    }
+    return id;
+  }
+
   const embedded = embeddedWorkflowUuid(wf);
   const embeddedPath = embeddedWorkflowPath(wf);
   const pathAlias = workflowAliasForPath(_workflowUuidAliases, path);
@@ -3804,7 +3972,11 @@ function restoreSnapshot(snap) {
   if (!snap) return null;
   try {
     // Deep-clone so the stored snapshot isn't mutated by the live graph after load.
-    getGraphCtx().app.loadGraphData(JSON.parse(JSON.stringify(snap.data)));
+    // __cmcpNoFork: this reloads the SAME active workflow (a revert), so the create-
+    // boundary fork must NOT re-mint its per-instance identity (#570 P0).
+    getGraphCtx().app.loadGraphData(JSON.parse(JSON.stringify(snap.data)), true, true, activeWorkflowRef(), {
+      __cmcpNoFork: true,
+    });
     return snap;
   } catch {
     return null;
@@ -5839,7 +6011,20 @@ const GRAPH_TOOL_EXECUTORS = {
     // same active tab twice, and a later save 409'd), and a soft-reload-then-
     // reload left graph routing stranded on a frozen Unsaved tab.
     const activeWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
-    await app.loadGraphData(...resolveLoadGraphArgs(clone, activeWorkflow));
+    // #570 P0b — this replaces the ACTIVE canvas with UNTRUSTED external JSON in place. Keep
+    // the live workflow instance's identity (so the agent's live session/fence stays intact —
+    // re-minting here would reject the agent's own follow-up commands and reset the very
+    // conversation running this tool) and STRIP the incoming graph.extra uuid so a copied
+    // source uuid is never adopted as this instance's identity. The __cmcpKeepInstance option
+    // only rides the IN-PLACE (active-workflow) load — resolveLoadGraphArgs returns a 4-arg
+    // form then, so options lands in its proper 5th slot; a blank-canvas load (single arg) is
+    // a genuine creation and takes the normal fresh-mint path.
+    const loadArgs = resolveLoadGraphArgs(clone, activeWorkflow);
+    if (activeWorkflow && typeof activeWorkflow === "object") {
+      await app.loadGraphData(...loadArgs, { __cmcpKeepInstance: true });
+    } else {
+      await app.loadGraphData(...loadArgs);
+    }
     return {
       loaded: true,
       node_count: clone.nodes.length,
@@ -7377,10 +7562,8 @@ const GRAPH_TOOL_EXECUTORS = {
     const s = app?.extensionManager?.workflow;
     if (!s?.renameWorkflow) throw new Error("rename unavailable on this frontend");
     if (!name) throw new Error("name is required");
-    const all = [...(s.openWorkflows ?? []), ...(s.workflows ?? [])];
-    const target = path
-      ? all.find((w) => workflowRecordMatchesSelector(w, path))
-      : s.activeWorkflow;
+    // Resolve via the shared helper so the #570 fence sees the SAME target this executor will.
+    const target = path ? resolveWorkflowSelectorTarget("workflow_rename", s, path) : s.activeWorkflow;
     if (!target) throw new Error("no target workflow");
     const clean = name.replace(/\.json$/i, "");
     const slash = target.path ? target.path.lastIndexOf("/") : -1;
@@ -7392,9 +7575,8 @@ const GRAPH_TOOL_EXECUTORS = {
   async workflow_close({ path, force }) {
     const s = app?.extensionManager?.workflow;
     if (!s?.closeWorkflow) throw new Error("close unavailable on this frontend");
-    const target = path
-      ? (s.openWorkflows ?? []).find((w) => workflowRecordMatchesSelector(w, path))
-      : s.activeWorkflow;
+    // Resolve via the shared helper so the #570 fence sees the SAME target this executor will.
+    const target = path ? resolveWorkflowSelectorTarget("workflow_close", s, path) : s.activeWorkflow;
     if (!target) throw new Error("no target workflow");
     // Guard against data loss: don't silently close a workflow with unsaved
     // changes (closeWorkflow bypasses the UI's save prompt). Save first.
@@ -9455,6 +9637,58 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           } else {
             const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];
             if (!executor) throw new Error(`Unknown command "${msg.cmd}"`);
+            // WORKFLOW-INSTANCE FENCE (#570): the orchestrator stamps each command with the
+            // trusted per-instance workflow_uuid it was ISSUED FOR. A command that runs against
+            // the ACTIVE workflow but arrives AFTER the user switched or replaced it (a frame the
+            // server already delivered and cannot retract) would hit the WRONG workflow —
+            // including workflow_close discarding the new workflow's unsaved work, or
+            // workflow_save/save_as/rename overwriting it. Refuse when the stamped uuid does not
+            // match the active workflow's uuid (fail closed when unresolvable, #186). This covers
+            // EVERY active-canvas op — graph_* AND the four workflow mutators — matching the
+            // server's enforcement contract (a panel advertising enforces_workflow_stamp fences
+            // all of them, not only graph commands).
+            //
+            // PINNED commands are fenced TOO (codex): the #349 pin guard below authorizes by
+            // PATH, which can't tell workflow A from a different B saved to the SAME path after an
+            // in-place replacement — the stale command's workflow_path still matches but its uuid
+            // does not, and only this uuid fence catches it. The pin guard stays as an ADDITIONAL
+            // check (it catches a switch to a different PATH); both must pass.
+            //
+            // activeWorkflowFenceApplies() exempts only the genuinely-non-active ops: navigation/
+            // creation (workflow_open/new) and a path-selectored workflow_rename/close whose
+            // selector RESOLVES to a non-active OPEN workflow. Decide that by the RESOLVED TARGET,
+            // never raw path presence: resolve the selector the same way the executor will
+            // (openWorkflows.find) and exempt ONLY when it lands on a real open workflow that is
+            // NOT the active one — a path that resolves to the ACTIVE workflow (e.g. replaced in
+            // place at the same path) still hits the active canvas, so it is fenced.
+            const commandUuid = msg?.[WORKFLOW_UUID_FIELD];
+            let targetsNonActive = false;
+            if (msg.cmd === "workflow_rename" || msg.cmd === "workflow_close") {
+              const pathArg = typeof msg?.path === "string" ? msg.path.trim() : "";
+              if (pathArg) {
+                const active = activeWorkflowRef();
+                // Resolve over the SAME collection the executor will (rename: open+listed;
+                // close: open only) so the fence's target decision matches execution exactly —
+                // a closed-but-listed rename target resolves here too and is correctly exempted.
+                const resolved = resolveWorkflowSelectorTarget(
+                  msg.cmd,
+                  app?.extensionManager?.workflow,
+                  pathArg,
+                );
+                targetsNonActive = selectorTargetsNonActiveWorkflow({ resolved, active });
+              }
+            }
+            if (
+              activeWorkflowFenceApplies({ cmd: msg.cmd, targetsNonActive }) &&
+              commandWorkflowMismatch({ commandUuid, activeUuid: workflowStableUuid() })
+            ) {
+              throw new Error(
+                `workflow instance mismatch: this command targets a different workflow than the ` +
+                  `active canvas — the workflow was switched or replaced after it was issued. ` +
+                  `Re-select the intended workflow (panel_open_workflow) or re-target with ` +
+                  `panel_set_workflow_target({mode:"current"}), then retry.`,
+              );
+            }
             // PINNED-TARGET GUARD (#349): a `workflow_path` on the command means the
             // agent's session is pinned to a SPECIFIC workflow. But every executor
             // runs against the ACTIVE canvas (getGraphCtx = app.canvas.graph) — the
@@ -9770,6 +10004,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // orchestrator registers panel_* tools + local panel management.
             comfyuiPath: localComfyuiPathForAgent(),
             resume,
+            // #570 — the durable per-instance workflow uuid (the SAME identity that
+            // keys the durable chat transcript). Unlike workflowTabId()'s ephemeral
+            // tmp:<uuid> and the non-unique default title, it survives a reload, so
+            // the orchestrator can resume an UNSAVED workflow's conversation without
+            // cross-resuming a DIFFERENT same-title unsaved workflow.
+            workflowUuid: workflowStableUuid(),
           }),
         ),
       );
@@ -19748,6 +19988,9 @@ function registerExtensionWhenReady(tries = 0) {
   }
   app = comfyApp;
   api = window.comfyAPI?.api?.api || window.api || null;
+  // #570 P0 — wrap app.loadGraphData so every workflow CREATION (import/paste/duplicate/
+  // new) mints a fresh per-instance uuid, so a copy can't inherit the source's session.
+  installCreateBoundaryFork(app);
   setupListeners();
 
   // TODO(v2): replace with `defineExtension({ name, setup() {...} })`.
