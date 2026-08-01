@@ -9391,15 +9391,26 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];
             if (!executor) throw new Error(`Unknown command "${msg.cmd}"`);
             // WORKFLOW-INSTANCE FENCE (#570): the orchestrator stamps each command with the
-            // trusted per-instance workflow_uuid it was ISSUED FOR. Every executor runs
-            // against the ACTIVE canvas, so a command that arrives AFTER the user switched or
-            // replaced the workflow (a frame the server already delivered and cannot retract)
-            // would silently mutate the WRONG graph. Refuse when the stamped uuid does not
-            // match the active workflow's uuid (fail closed when unresolvable, #186). This
-            // catches the CURRENT-mode leak that the workflow_path pin guard below cannot —
-            // a default (unpinned) session carries no path but still must not cross-apply.
+            // trusted per-instance workflow_uuid it was ISSUED FOR. A command that mutates the
+            // ACTIVE workflow but arrives AFTER the user switched or replaced it (a frame the
+            // server already delivered and cannot retract) would hit the WRONG workflow —
+            // including workflow_close discarding the new workflow's unsaved work. Refuse when
+            // the stamped uuid does not match the active workflow's uuid (fail closed when
+            // unresolvable, #186). Scope, so navigation and pinned edits are not falsely fenced:
+            //  • an explicit workflow_path names a SPECIFIC target → the #349 pin guard below is
+            //    its authority (covers pinned graph_* and path-targeted workflow_* ops);
+            //  • workflow_open / workflow_new are navigation/creation with their OWN explicit or
+            //    new target, not an active-content mutation, so the stamp must not gate them.
+            // Everything else (unpinned graph_* + path-less workflow_save/save_as/rename/close +
+            // reads) runs against the active canvas and IS fenced.
             const commandUuid = msg?.[WORKFLOW_UUID_FIELD];
+            const explicitTargetPath = msg?.[WORKFLOW_PATH_FIELD];
+            const hasExplicitTarget =
+              typeof explicitTargetPath === "string" && explicitTargetPath.trim();
+            const isNavigationOrCreate = msg.cmd === "workflow_open" || msg.cmd === "workflow_new";
             if (
+              !hasExplicitTarget &&
+              !isNavigationOrCreate &&
               commandWorkflowMismatch({ commandUuid, activeUuid: workflowStableUuid() })
             ) {
               throw new Error(
