@@ -126,6 +126,7 @@ import {
 } from "./lib/control-after-generate.js";
 import { autoMatchSlots, slotDiagnostic } from "./lib/connect-match.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
+import { isImeComposing } from "./lib/ime.js";
 import {
   recordCopiedNodes,
   getVerifiedSnapshot,
@@ -11597,6 +11598,9 @@ function buildPanel() {
     renderModelResults();
   });
   modelSearchInput.addEventListener("keydown", (ev) => {
+    // Let a composing IME drive candidate navigation (arrows/Enter) instead of
+    // hijacking those keys to move the model list / pick a row (#385).
+    if (isImeComposing(ev)) return;
     if (ev.key === "ArrowDown") {
       ev.preventDefault();
       if (modelActiveIdx < modelCurrentRows.length - 1) modelActiveIdx++;
@@ -13064,6 +13068,7 @@ function buildPanel() {
       "flex:1;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
       "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:0.8rem;";
     other.addEventListener("keydown", (e) => {
+      if (isImeComposing(e)) return; // don't commit mid-IME-composition (#385)
       if (e.key === "Enter" && other.value.trim()) { e.preventDefault(); finish(other.value.trim()); }
     });
     otherRow.appendChild(other);
@@ -13155,6 +13160,7 @@ function buildPanel() {
     };
 
     input.addEventListener("keydown", (e) => {
+      if (isImeComposing(e)) return; // don't commit mid-IME-composition (#385)
       if (e.key === "Enter") { e.preventDefault(); finish(input.value.trim()); }
     });
     row.appendChild(input);
@@ -16896,6 +16902,13 @@ function buildPanel() {
       const file = fileItem.getAsFile();
       if (file) {
         ev.preventDefault();
+        // Once the composer has claimed a pasted file, stop the event here.
+        // Without stopPropagation it keeps bubbling to `document`, where
+        // ComfyUI core's own global paste-to-canvas listener also inspects the
+        // clipboard and drops a duplicate, unwanted LoadImage node onto the
+        // live graph for every screenshot/image attached to a chat message
+        // (#384).
+        ev.stopPropagation();
         handleFile(file);
         return;
       }
@@ -16903,6 +16916,11 @@ function buildPanel() {
     const text = dt.getData("text/plain");
     if (text && (text.length > PASTE_TEXT_THRESHOLD || (text.match(/\n/g) || []).length >= 12)) {
       ev.preventDefault();
+      // Same rationale as the file branch (#384): the composer has claimed this
+      // large paste as an attachment, so keep it from bubbling to ComfyUI's
+      // document-level paste handler (which would try to paste graph JSON /
+      // nodes onto the canvas).
+      ev.stopPropagation();
       handlePastedText(text);
     }
   });
@@ -17428,6 +17446,11 @@ function buildPanel() {
   });
 
   input.addEventListener("keydown", (ev) => {
+    // While a CJK IME is composing, the commit keystroke also fires this keydown
+    // (Enter with isComposing/keyCode 229). Let the IME own it — otherwise the
+    // Enter below submits early and the trailing syllable leaks as a stray
+    // one-char message, and the slash/mention menu picks the wrong item (#385).
+    if (isImeComposing(ev)) return;
     if (!menuPop.hidden && menuItems.length) {
       if (ev.key === "ArrowDown") {
         ev.preventDefault();
@@ -17500,6 +17523,12 @@ function buildPanel() {
   // editing a node widget). Removed in destroy() so remounts can't stack it.
   function onInterruptKeydown(ev) {
     if (!thinkingEl && !agentWorking) return; // no turn in flight
+    // This is a DOCUMENT CAPTURE listener, so it runs BEFORE the composer's own
+    // target-phase keydown guard. During CJK IME composition the Escape that
+    // CANCELS the candidate window (and the commit Enter) must not be read as
+    // "interrupt the turn" — otherwise cancelling an IME candidate aborts the
+    // agent's in-flight work (#385). Let the IME own the keystroke.
+    if (isImeComposing(ev)) return;
     const isCopy = (ev.ctrlKey || ev.metaKey) && !ev.altKey && (ev.key === "c" || ev.key === "C");
     const isEsc = ev.key === "Escape";
     if (!isCopy && !isEsc) return;

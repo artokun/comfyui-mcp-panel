@@ -90,6 +90,13 @@ export function serializeContext(context) {
  *  valid stored input (chat-history-store accepts it; imports preserve it) and
  *  must still render its empty bubble, so it is NEVER dropped. */
 export function isDroppedAgentReplay(text) {
+  // Legacy artifact (#393): an OLDER panel build persisted a structured payload
+  // by stringifying it via Object.prototype.toString, storing the literal string
+  // "[object Object]". Because that record IS a string, the structured-payload
+  // check below treats it as valid input and it survives replay as a visible
+  // "[object Object]" bubble. The original object is unrecoverable, so drop the
+  // exact legacy literal before the structured check runs.
+  if (text === "[object Object]") return true;
   return typeof text !== "string" && coerceMessageText(text) === "";
 }
 
