@@ -23,6 +23,7 @@ import {
   collectMissingNodeTypeReasons,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
+  resolveMissingModelDirectory,
 } from "../../web/js/lib/asset-staleness.js";
 
 /** The REAL LTXICLoRALoaderModelOnly schema: a `model` CONNECTION input plus two
@@ -622,4 +623,47 @@ test("nodeRedFlagIsStale: OR across multiple maps — an EMPTY entry in one must
     nodeRedFlagIsStale(5, { nodeErrorsMaps: [{ 5: { errors: [] } }, null] }),
     true,
   );
+});
+
+// --- resolveMissingModelDirectory (#487) — Ultralytics bbox/segm subfolder ---
+
+test("resolveMissingModelDirectory: segm/ combo value overrides a default ultralytics/bbox directory", () => {
+  assert.equal(
+    resolveMissingModelDirectory("ultralytics/bbox", "segm/ntd11_anime_nsfw_segm_v5.pt"),
+    "ultralytics/segm",
+  );
+});
+
+test("resolveMissingModelDirectory: bbox/ combo value stays in ultralytics/bbox", () => {
+  assert.equal(
+    resolveMissingModelDirectory("ultralytics/bbox", "bbox/face_yolov8m.pt"),
+    "ultralytics/bbox",
+  );
+});
+
+test("resolveMissingModelDirectory: bare `ultralytics` directory gains the prefix subfolder", () => {
+  assert.equal(resolveMissingModelDirectory("ultralytics", "segm/x.pt"), "ultralytics/segm");
+  assert.equal(resolveMissingModelDirectory("ultralytics", "bbox/x.pt"), "ultralytics/bbox");
+});
+
+test("resolveMissingModelDirectory: a store directory already ultralytics/segm is corrected by a bbox/ value", () => {
+  assert.equal(resolveMissingModelDirectory("ultralytics/segm", "bbox/x.pt"), "ultralytics/bbox");
+});
+
+test("resolveMissingModelDirectory: Windows backslashes are normalized before matching", () => {
+  assert.equal(resolveMissingModelDirectory("ultralytics\\bbox", "segm\\x.pt"), "ultralytics/segm");
+});
+
+test("resolveMissingModelDirectory: file WITHOUT a bbox/segm prefix is left unchanged", () => {
+  assert.equal(resolveMissingModelDirectory("ultralytics/bbox", "yolov8m.pt"), "ultralytics/bbox");
+  assert.equal(resolveMissingModelDirectory("ultralytics/bbox", null), "ultralytics/bbox");
+});
+
+test("resolveMissingModelDirectory: NON-ultralytics directories never regress", () => {
+  // A checkpoint/lora subfolder that merely happens to start with bbox/segm-looking text
+  // must be passed through untouched — only ultralytics folders are rewritten.
+  assert.equal(resolveMissingModelDirectory("checkpoints", "segm/x.pt"), "checkpoints");
+  assert.equal(resolveMissingModelDirectory("loras", "bbox/x.pt"), "loras");
+  assert.equal(resolveMissingModelDirectory("ultralytics_extra", "segm/x.pt"), "ultralytics_extra");
+  assert.equal(resolveMissingModelDirectory(null, "segm/x.pt"), null);
 });
