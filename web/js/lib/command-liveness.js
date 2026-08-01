@@ -181,6 +181,36 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
   };
 }
 
+/**
+ * How long an undelivered outcome stays replayable. A genuine mid-command drop and its
+ * reconnect happen in seconds; anything older almost certainly belongs to an orchestrator
+ * that is gone.
+ *
+ * This bounds a residual the panel cannot fully close on its own (codex): a bridge is
+ * identified by its URL, and URL equality is ENDPOINT identity, not SESSION identity — a
+ * newly started orchestrator listening at the same address is indistinguishable from the
+ * same one reconnecting, which is precisely the case replay exists to serve. Proving
+ * session continuity needs a server-issued connection epoch in the handshake, i.e. an
+ * orchestrator-side change (tracked as a follow-up). Until then the exposure is bounded
+ * three ways: sensitive results never enter the journal at all, replay waits for a real
+ * handshake rather than firing at bare socket-open, and entries age out here.
+ */
+export const REPLAY_MAX_AGE_MS = 60000;
+
+/**
+ * May this journaled outcome be replayed onto a socket for `targetUrl` right now?
+ * Requires the SAME bridge and a recent enough entry. An entry with no recorded bridge is
+ * refused: unattributable outcomes are never volunteered.
+ */
+export function isReplayable(entry, { now = 0, targetUrl = null, maxAgeMs = REPLAY_MAX_AGE_MS } = {}) {
+  if (!entry) return false;
+  if (!entry.url || !targetUrl || entry.url !== targetUrl) return false;
+  const age = Number.isFinite(now) && Number.isFinite(entry.at) ? now - entry.at : null;
+  if (age === null) return false;
+  const limit = Number.isFinite(maxAgeMs) && maxAgeMs > 0 ? maxAgeMs : REPLAY_MAX_AGE_MS;
+  return age >= 0 && age <= limit;
+}
+
 /** Drop attempt timestamps older than `windowMs`. Returns a NEW array. */
 export function pruneAttempts(attempts, now, windowMs = RE_REGISTER_WINDOW_MS) {
   if (!Array.isArray(attempts)) return [];

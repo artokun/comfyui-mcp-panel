@@ -453,8 +453,8 @@ test("#442 codex R7: a tab that arrived DIRTY is never re-baselined and never re
   assert.ok(wasDirtyAt < openAt, "…BEFORE any await, since it cannot be recovered afterwards");
   assert.match(
     body,
-    /if \(!wasDirty\) await clearSpuriousOpenModified\(target\);/,
-    "a genuinely dirty tab must never be re-baselined",
+    /if \(!wasDirty && ownsWorkflowReloadGuard\(reloadGuardToken\)\) \{[\s\S]{0,80}?await clearSpuriousOpenModified\(target\);/,
+    "a genuinely dirty tab must never be re-baselined, nor one we no longer hold exclusively",
   );
   // BOTH reload gates must require the pre-open snapshot to be clean too.
   const gates = [...body.matchAll(/if \(staleInfo\.reload && !dirtyNow[^)]*\)/g)].map((m) => m[0]);
@@ -471,16 +471,21 @@ test("#442 codex R9: the switch+reload holds a critical section that REFUSES con
   // A valid graph_* command landing mid-reload is either overwritten by the load or —
   // worse — recorded as CLEAN by the tracker re-baseline, so the next out-of-band disk
   // change discards it with no conflict shown.
-  const acquireAt = body.indexOf("workflowReloadGuard = {");
+  const acquireAt = body.indexOf("acquireWorkflowReloadGuard(");
   const openAt = body.indexOf("await s.openWorkflow(target);");
-  const releaseAt = body.indexOf("workflowReloadGuard = null;");
+  const releaseAt = body.indexOf("releaseWorkflowReloadGuard(reloadGuardToken);");
   assert.ok(acquireAt !== -1 && releaseAt !== -1, "the section must be acquired and released");
   assert.ok(acquireAt < openAt, "held from before the switch, so the whole mutating sequence is covered");
   assert.ok(openAt < releaseAt);
   // Release must be in the SAME finally as the canvas restore — a throw must never leave
   // the tab refusing every command.
   const tail = body.slice(body.indexOf("} finally {", openAt));
-  assert.match(tail, /workflowReloadGuard = null;[\s\S]{0,200}allow_interaction = priorInteraction;/);
+  assert.match(tail, /releaseWorkflowReloadGuard\(reloadGuardToken\);[\s\S]{0,200}allow_interaction = priorInteraction;/);
+  // codex R10 — token-scoped: an expired-then-superseded holder must not release a NEWER
+  // holder's section, and must not keep mutating once it has lost it.
+  assert.match(src, /if \(workflowReloadGuard && workflowReloadGuard\.token === token\) workflowReloadGuard = null;/);
+  assert.match(body, /!ownsWorkflowReloadGuard\(reloadGuardToken\)/, "losing the section must abort the destructive reload");
+  assert.match(body, /lost its exclusive switch\/reload window/);
 
   // The dispatcher must refuse executors while it is held — nothing applied, retryable.
   const guardAt = src.indexOf("const reloadGuard = activeWorkflowReloadGuard();");

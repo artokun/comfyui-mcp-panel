@@ -27,6 +27,8 @@ import {
   classifyUndeliveredReply,
   describeUndeliveredReply,
   createLostReplyJournal,
+  isReplayable,
+  REPLAY_MAX_AGE_MS,
   SENSITIVE_RESULT_CMDS,
   redactSensitiveReply,
   pruneAttempts,
@@ -119,8 +121,8 @@ test("codex R8: replay never crosses a bridge change — entries for another bri
   const body = src.slice(start, src.indexOf("\n  }", start));
   assert.match(
     body,
-    /if \(entry\.url && entry\.url !== targetUrl\) \{\s*\n\s*dropped\+\+;\s*\n\s*continue;/,
-    "an outcome belonging to a previous bridge must never be volunteered to a different agent",
+    /if \(!isReplayable\(entry, \{ now: Date\.now\(\), targetUrl \}\)\) \{\s*\n\s*dropped\+\+;\s*\n\s*continue;/,
+    "an outcome belonging to a previous bridge (or too old) must never be volunteered",
   );
   assert.match(body, /lostReplies\.replace\(keep\)/, "only undeliverable-but-still-ours entries are retried");
   assert.match(body, /Discarded \$\{dropped\}/, "the user must be told what was discarded");
@@ -137,6 +139,26 @@ test("codex R8: replay never crosses a bridge change — entries for another bri
     false,
     "the mutable current url must not be what gets journaled",
   );
+});
+
+test("codex R10: isReplayable demands the SAME bridge and a recent entry, and fails closed", () => {
+  const URL_A = "ws://127.0.0.1:9180";
+  const now = 1_000_000;
+  const fresh = { url: URL_A, at: now - 1000 };
+  assert.equal(isReplayable(fresh, { now, targetUrl: URL_A }), true);
+  // Different endpoint — never volunteered.
+  assert.equal(isReplayable(fresh, { now, targetUrl: "ws://127.0.0.1:9181" }), false);
+  // Unattributable entries are refused rather than guessed at.
+  assert.equal(isReplayable({ at: now }, { now, targetUrl: URL_A }), false, "no recorded bridge ⇒ refuse");
+  assert.equal(isReplayable(fresh, { now }), false, "no target bridge ⇒ refuse");
+  assert.equal(isReplayable(null, { now, targetUrl: URL_A }), false);
+  // Age bound: a real drop-and-reconnect takes seconds; anything older is very likely a
+  // different orchestrator that happens to share the address.
+  assert.equal(isReplayable({ url: URL_A, at: now - REPLAY_MAX_AGE_MS - 1 }, { now, targetUrl: URL_A }), false);
+  assert.equal(isReplayable({ url: URL_A, at: now - REPLAY_MAX_AGE_MS }, { now, targetUrl: URL_A }), true);
+  // A negative age (clock moved) fails closed rather than replaying.
+  assert.equal(isReplayable({ url: URL_A, at: now + 5000 }, { now, targetUrl: URL_A }), false);
+  assert.equal(isReplayable({ url: URL_A, at: NaN }, { now, targetUrl: URL_A }), false);
 });
 
 test("the journal's replace() keeps only what it is given, still bounded", () => {
@@ -251,13 +273,18 @@ test("#508 wiring: an undelivered reply is journaled, replayed after hello, and 
   assert.match(src, /lostReplies\.record\(\{/, "an undelivered reply must be journaled");
   assert.match(src, /handleUndeliveredReply\(/, "…and routed to the bounded self-heal");
   assert.match(src, /shouldReRegister\(\{/, "self-heal must consult the bounded decision");
-  // Replay must come AFTER sendHello() on the new socket (the tab must be registered
-  // before its late outcomes arrive).
+  // codex R10 — replay must fire on the real HANDSHAKE, not at bare socket-open: an open
+  // socket only proves something is listening on the port, while the `models` frame proves
+  // a real orchestrator is behind it. The hello already went out at open.
   const openHandler = src.slice(src.indexOf('thisSock.addEventListener("open"'));
-  const helloAt = openHandler.indexOf("sendHello();");
-  const replayAt = openHandler.indexOf("replayLostReplies(thisSock);");
-  assert.notEqual(replayAt, -1, "lost outcomes must be replayed on the next socket");
-  assert.ok(helloAt !== -1 && helloAt < replayAt, "replay must follow the hello");
+  assert.match(openHandler.slice(0, 2000), /sendHello\(\);/, "the hello still rides socket-open");
+  assert.equal(
+    /replayLostReplies\(thisSock\);/.test(src),
+    false,
+    "replay must not fire at bare socket-open",
+  );
+  const markConnected = src.slice(src.indexOf("function markConnected() {"));
+  assert.match(markConnected.slice(0, 1600), /replayLostReplies\(sock\);/, "replay rides the handshake");
 });
 
 test("#508 codex R6: an outcome journaled AFTER the replacement socket replayed is delivered anyway", () => {

@@ -214,6 +214,7 @@ import {
   classifyUndeliveredReply,
   describeUndeliveredReply,
   createLostReplyJournal,
+  isReplayable,
   pruneAttempts,
   shouldReRegister,
   reRegisterExhaustedHint,
@@ -340,10 +341,30 @@ const lostReplies = createLostReplyJournal();
 // error (nothing applied) rather than queued: refusing cannot reorder or double-apply, and
 // the window is a fraction of a second.
 let workflowReloadGuard = null;
+let workflowReloadGuardSeq = 0;
 // Defensive ceiling: a guard can only ever be cleared by workflow_open's finally, so if
 // some pathological path ever failed to run it, an un-expiring guard would wedge every
 // command in the tab. Age it out instead.
 const WORKFLOW_RELOAD_GUARD_MAX_MS = 30000;
+/** Take the section and return an OWNERSHIP TOKEN. Sections are token-scoped (codex): an
+ *  expired-then-superseded holder must never release a NEWER holder's section, and a holder
+ *  that has lost the section must not go on mutating as though it still had it. */
+function acquireWorkflowReloadGuard(key) {
+  const token = ++workflowReloadGuardSeq;
+  workflowReloadGuard = { token, key, since: Date.now() };
+  return token;
+}
+/** Release ONLY if `token` still owns the section. */
+function releaseWorkflowReloadGuard(token) {
+  if (workflowReloadGuard && workflowReloadGuard.token === token) workflowReloadGuard = null;
+}
+/** Does `token` still own the section? Re-checked after every await before any further
+ *  mutation, so an operation that outlived its own section stops instead of racing the
+ *  commands that were let through when it expired. */
+function ownsWorkflowReloadGuard(token) {
+  const held = activeWorkflowReloadGuard();
+  return !!held && held.token === token;
+}
 /** The guard, or null when none is held (expiring a stuck one on the way). */
 function activeWorkflowReloadGuard() {
   if (!workflowReloadGuard) return null;
@@ -7697,10 +7718,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // Hold the switch+reload critical section across the WHOLE mutating sequence. The canvas
     // freeze keeps the USER out; this keeps the BRIDGE out, so a concurrent graph_* command
     // can neither be overwritten by the reload nor be silently re-baselined as clean.
-    workflowReloadGuard = {
-      key: workflowTabId(target) || target.path || "the active workflow",
-      since: Date.now(),
-    };
+    const reloadGuardToken = acquireWorkflowReloadGuard(
+      workflowTabId(target) || target.path || "the active workflow",
+    );
     try {
       try {
         await s.openWorkflow(target);
@@ -7760,7 +7780,14 @@ const GRAPH_TOOL_EXECUTORS = {
         // already HAD unsaved edits does not clear a spurious flag — it erases a REAL one,
         // hiding the user's work from every later check (codex). Leaving a genuinely dirty
         // tab marked dirty is both truthful and what keeps the reload gate below closed.
-        if (!wasDirty) await clearSpuriousOpenModified(target);
+        // Ownership re-check before EVERY re-baseline / destructive step: if this open
+        // outlived its own section (the 30s safety expiry, or a newer open taking over),
+        // other commands have been let through and we must not keep mutating as though we
+        // still held exclusivity. Leaving the tab spuriously "modified" is cosmetic; racing
+        // a concurrent edit is not.
+        if (!wasDirty && ownsWorkflowReloadGuard(reloadGuardToken)) {
+          await clearSpuriousOpenModified(target);
+        }
         // #433: an explicit open authoritatively re-points `active` — record it against
         // the epoch we STARTED on, but only if no reconnect intervened during the async
         // open (else its tab-restore may have overridden us — leave the window armed).
@@ -7827,6 +7854,19 @@ const GRAPH_TOOL_EXECUTORS = {
           reloadError =
             "this frontend does not expose the canvas interaction flag, so an automatic reload " +
             "could not be protected against a concurrent edit and was skipped";
+        } else if (
+          staleInfo.reload &&
+          !dirtyNow &&
+          !wasDirty &&
+          !ownsWorkflowReloadGuard(reloadGuardToken)
+        ) {
+          // Lost the section (expired, or superseded by a newer open) — concurrent commands
+          // may already have run against this canvas, so the "nothing unsaved" evidence is
+          // no longer trustworthy. Refuse the destructive reload and say so.
+          reloadError =
+            "the panel lost its exclusive switch/reload window (it took too long, or another " +
+            "open superseded it), so the automatic reload was skipped rather than risk " +
+            "overwriting work done in the meantime";
         } else if (staleInfo.reload && !dirtyNow && !wasDirty) {
           const diskGraph = JSON.parse(onDiskContent);
           // 4th arg associates the load with THIS tab (same as the repaint above), so the
@@ -7868,7 +7908,7 @@ const GRAPH_TOOL_EXECUTORS = {
     } finally {
       // Release BOTH on EVERY path — a throw anywhere above must never leave the user with
       // a frozen graph or the tab refusing every command.
-      workflowReloadGuard = null;
+      releaseWorkflowReloadGuard(reloadGuardToken);
       if (priorInteraction !== null) canvasView.allow_interaction = priorInteraction;
     }
     if (openFailed) throw failOpen(openFailed);
@@ -9841,6 +9881,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     attempt = 0;
     gaveUp = false;
     loggedWaiting = false;
+    // #508/#402 — replay the outcomes the previous socket could not deliver, so a command
+    // that genuinely ran is never silently swallowed by the reconnect. Deliberately HERE,
+    // on the real handshake, and not at bare socket-open (codex): an open socket only proves
+    // something is listening on the port, while a `models` frame proves a real orchestrator
+    // is behind it. The hello already went out at open, so the tab is registered by now.
+    replayLostReplies(sock);
     emitStatus("connected");
   }
 
@@ -9910,7 +9956,14 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // not a recovery. Such an entry is also meaningless there — its rid is unknown — so
       // it is dropped rather than carried forever. (Sensitive results are additionally
       // redacted at journal time and never travel at all.)
-      if (entry.url && entry.url !== targetUrl) {
+      // Replayable = SAME bridge AND recent enough (codex). A bridge is identified by its
+      // URL, and URL equality is ENDPOINT identity, not SESSION identity — a newly started
+      // orchestrator on the same address looks exactly like the old one reconnecting, which
+      // is the very case replay exists to serve. Proving session continuity needs a
+      // server-issued connection epoch in the handshake (an orchestrator-side follow-up), so
+      // until then the exposure is bounded: sensitive results never enter the journal at
+      // all, this runs only AFTER a real handshake, and stale entries age out here.
+      if (!isReplayable(entry, { now: Date.now(), targetUrl })) {
         dropped++;
         continue;
       }
@@ -9933,7 +9986,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     }
     if (dropped) {
       onLog(
-        `Discarded ${dropped} undelivered command result${dropped === 1 ? "" : "s"} belonging to a previous bridge — they are not replayed to a different agent.`,
+        `Discarded ${dropped} undelivered command result${dropped === 1 ? "" : "s"} that belong to a previous bridge or are too old to replay — they are not offered to a different agent.`,
       );
     }
   }
@@ -10008,10 +10061,6 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         onLog(`Connected to ${redactBridgeUrl(url)} — waiting for the panel agent…`);
       }
       sendHello();
-      // #508/#402 — AFTER the hello (the orchestrator must know this tab first), replay
-      // any command outcome the previous socket could not deliver, so a command that
-      // genuinely ran is never silently swallowed by the reconnect.
-      replayLostReplies(thisSock);
       clearHandshake();
       handshakeTimer = setTimeout(() => {
         if (handshakeDone) return;
