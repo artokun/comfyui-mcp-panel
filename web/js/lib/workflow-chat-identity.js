@@ -40,6 +40,24 @@ export function shouldForkEmbeddedWorkflowUuid({
   );
 }
 
+/** #570 P0b/P1 — resolve an UNSAVED workflow's durable per-instance uuid from its
+ *  stored (path,graph-id) alias. `stored` is the localStorage entry for this ComfyUI
+ *  tab path ({ u: uuid, g: graphId } | null); `gid` is the workflow's current
+ *  reload-stable graph id; `mint` is a fresh uuid to adopt on a miss (null in a
+ *  read-only probe). Reuse the stored uuid ONLY when it names the SAME instance — the
+ *  graph ids match, or either is unknown (a lenient path-only fallback). A stored
+ *  entry with a DIFFERENT graph id is a different workflow that REUSED a freed path
+ *  slot, so it must NOT inherit the uuid → adopt `mint`. A cold import lands on a
+ *  brand-new (deduped) path with no stored entry → also `mint`. Returns { uuid,
+ *  changed } where `changed` asks the caller to (re)persist the entry. */
+export function resolveUnsavedWorkflowUuid({ stored, gid, mint = null } = {}) {
+  const valid = stored && typeof stored.u === "string" && stored.u ? stored : null;
+  const gidMatches = valid ? !valid.g || !gid || valid.g === gid : false;
+  const uuid = valid && gidMatches ? valid.u : mint;
+  const changed = uuid ? !valid || valid.u !== uuid || (valid.g || "") !== (gid || "") : false;
+  return { uuid, changed };
+}
+
 /** Every identity string the ACTIVE workflow answers to, for pinned-target
  *  matching (#186/#349). `routingKey` is the per-instance opaque id — "wf:<path>"
  *  for a saved tab, "tmp:<uuid>" for an unsaved one — and ALWAYS authorizes.

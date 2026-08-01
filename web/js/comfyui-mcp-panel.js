@@ -97,6 +97,7 @@ import {
 import {
   classifyPinnedTarget,
   normalizedWorkflowPath,
+  resolveUnsavedWorkflowUuid,
   shouldForkEmbeddedWorkflowUuid,
   workflowAliasForPath,
   workflowIdentityForms,
@@ -965,6 +966,26 @@ const _priorTempWorkflowIds = new WeakMap();
 const _workflowObjectUuids = new WeakMap();
 const _workflowUuidOwners = new Map();
 const WORKFLOW_UUID_ALIASES_KEY = "comfyui-mcp.panel.workflowUuidAliases";
+// #570 P0b/P1 — durable per-instance uuid for an UNSAVED workflow, keyed on the pair
+// (ComfyUI tab path, reload-stable graph id). An unsaved workflow's `path`
+// ("workflows/Unsaved Workflow.json") is reused verbatim when ITS tab is restored on a
+// reload, but DEDUPED ("... (2).json") for a fresh import/duplicate — so keying on the
+// path both keeps the identity across a reload (P1) and mints a fresh one for a cold
+// import that merely carries a SOURCE workflow's embedded uuid (P0b). The graph id
+// (activeState.id, reload-stable but import-PRESERVED) is a second guard: a DIFFERENT
+// new unsaved workflow that later REUSES a freed path slot has a different graph id, so
+// it can't inherit the closed workflow's identity. Persisted in localStorage; graph
+// `extra` is deliberately NOT the source of truth for unsaved tabs (a copy carries it).
+const WORKFLOW_UNSAVED_IDS_KEY = "comfyui-mcp.panel.unsavedWorkflowIds";
+const WORKFLOW_UNSAVED_IDS_CAP = 200; // bound growth (keyed by transient unsaved paths)
+let _unsavedWorkflowIds = (() => {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(WORKFLOW_UNSAVED_IDS_KEY) || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+})();
 const WORKFLOW_META_NAMESPACE = "comfyui_mcp";
 const WORKFLOW_UUID_FIELD = "workflow_uuid";
 const WORKFLOW_PATH_FIELD = "workflow_path";
@@ -1071,6 +1092,62 @@ function persistWorkflowAliases() {
   }
 }
 
+// #570 P0b/P1 — the ComfyUI tab path of an UNSAVED (never-saved) workflow, e.g.
+// "workflows/Unsaved Workflow.json". Reload-stable (restored to the SAME path) and
+// import-distinct (a fresh open/duplicate is deduped to "... (2).json"). null for a
+// saved tab (which uses savedWorkflowPath) or when no path is exposed.
+function unsavedWorkflowPath(wf) {
+  if (!wf || wf.isPersisted === true) return null;
+  return typeof wf.path === "string" && wf.path ? wf.path : null;
+}
+
+// The reload-stable, per-workflow graph id ComfyUI mints (activeState.id via
+// ensureWorkflowId). It is PRESERVED across an import/copy (so it can't tell a copy
+// from the original by itself), but it DOES differ between two genuinely different
+// unsaved workflows — the guard that stops a new workflow reusing a freed path slot
+// from inheriting the closed workflow's uuid. "" when unavailable (older format).
+function unsavedWorkflowGraphId(wf) {
+  try {
+    const id = wf?.activeState?.id ?? wf?.initialState?.id ?? wf?.workflow?.id ?? null;
+    return typeof id === "string" && id ? id : "";
+  } catch {
+    return "";
+  }
+}
+
+function persistUnsavedWorkflowIds() {
+  try {
+    // Bound growth: unsaved paths are transient, so evict arbitrary old entries when
+    // over the cap (a dropped entry only costs a lost resume for a long-idle tab).
+    const keys = Object.keys(_unsavedWorkflowIds);
+    if (keys.length > WORKFLOW_UNSAVED_IDS_CAP) {
+      for (const k of keys.slice(0, keys.length - WORKFLOW_UNSAVED_IDS_CAP)) delete _unsavedWorkflowIds[k];
+    }
+    window.localStorage.setItem(WORKFLOW_UNSAVED_IDS_KEY, JSON.stringify(_unsavedWorkflowIds));
+  } catch {
+    // In-memory identity still holds for this session.
+  }
+}
+
+// Resolve (and optionally persist) the durable uuid for an unsaved workflow at
+// (path, gid) via the pure resolveUnsavedWorkflowUuid. A read-only probe (no `assign`)
+// returns the stored uuid only when it names the SAME instance, else null; with
+// `assign` it adopts that fresh uuid on a miss and persists the (path,gid) entry.
+function unsavedWorkflowUuid(path, gid, assign) {
+  if (!path) return assign ?? null;
+  const stored = _unsavedWorkflowIds[path] || null;
+  const { uuid, changed } = resolveUnsavedWorkflowUuid({
+    stored,
+    gid,
+    mint: assign === undefined ? null : assign,
+  });
+  if (assign !== undefined && changed && uuid) {
+    _unsavedWorkflowIds[path] = { u: uuid, g: gid || "" };
+    persistUnsavedWorkflowIds();
+  }
+  return uuid;
+}
+
 function workflowUuidOwner(id) {
   const stored = _workflowUuidOwners.get(id);
   const owner = stored && typeof stored.deref === "function" ? stored.deref() ?? null : stored ?? null;
@@ -1099,6 +1176,39 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
   if (!identityObject || typeof identityObject !== "object") return getTabId();
   const path = savedWorkflowPath(wf);
   const objectUuid = _workflowObjectUuids.get(identityObject);
+
+  // #570 P0b/P1 — UNSAVED workflow: the DURABLE, import-distinct identity is the panel's
+  // own (path, graph-id) alias, NOT the embedded graph.extra uuid (which a COPIED graph
+  // carries verbatim → cross-resume). Resolve from that alias; a cold import (new deduped
+  // path) or a path-slot reuse (different graph id) misses → mint fresh; a reload (same
+  // path + graph id) hits → same uuid. The embedded uuid is deliberately ignored here.
+  const unsavedPath = path ? null : unsavedWorkflowPath(wf);
+  if (unsavedPath) {
+    const gid = unsavedWorkflowGraphId(wf);
+    const resolved = objectUuid || unsavedWorkflowUuid(unsavedPath, gid) || crypto.randomUUID();
+    const id = unsavedWorkflowUuid(unsavedPath, gid, resolved); // persist/refresh the alias
+    _workflowObjectUuids.set(identityObject, id);
+    rememberWorkflowUuidOwner(id, identityObject);
+    if (embed) {
+      // Keep writing the in-graph metadata (harmless — not authoritative for an unsaved
+      // tab) so a subsequent user-initiated SAVE carries the identity into the saved
+      // file and the conversation survives the tmp:→wf: transition.
+      try {
+        const extra = activeWorkflowExtra(wf, { create: true });
+        const previous = extra?.[WORKFLOW_META_NAMESPACE];
+        if (extra && previous?.[WORKFLOW_UUID_FIELD] !== id) {
+          extra[WORKFLOW_META_NAMESPACE] = {
+            ...(previous && typeof previous === "object" ? previous : {}),
+            [WORKFLOW_UUID_FIELD]: id,
+          };
+        }
+      } catch {
+        // The (path, graph-id) alias still makes the identity durable in this browser.
+      }
+    }
+    return id;
+  }
+
   const embedded = embeddedWorkflowUuid(wf);
   const embeddedPath = embeddedWorkflowPath(wf);
   const pathAlias = workflowAliasForPath(_workflowUuidAliases, path);

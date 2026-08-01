@@ -4,9 +4,45 @@ import test from 'node:test'
 import {
   isThreadInScope,
   normalizedWorkflowPath,
+  resolveUnsavedWorkflowUuid,
   shouldForkEmbeddedWorkflowUuid,
   workflowAliasForPath
 } from '../../web/js/lib/workflow-chat-identity.js'
+
+// #570 P0b/P1 — unsaved-workflow durable uuid keyed on (path, graph-id).
+test('#570 reload of the same unsaved workflow reuses its stored uuid (P1 durability)', () => {
+  const stored = { u: 'uuid-A', g: 'gid-A' }
+  const r = resolveUnsavedWorkflowUuid({ stored, gid: 'gid-A', mint: 'fresh' })
+  assert.equal(r.uuid, 'uuid-A') // same path + same graph id → continuity
+  assert.equal(r.changed, false)
+})
+
+test('#570 a cold import (no stored entry for its deduped path) mints fresh (P0b)', () => {
+  // The imported copy carries the SOURCE embedded uuid, but it lands on a brand-new
+  // deduped path with no stored alias → it must NOT inherit the source identity.
+  const r = resolveUnsavedWorkflowUuid({ stored: null, gid: 'gid-A', mint: 'fresh' })
+  assert.equal(r.uuid, 'fresh')
+  assert.equal(r.changed, true)
+})
+
+test('#570 a new workflow reusing a freed path slot does NOT inherit the old uuid (graph-id guard)', () => {
+  const stored = { u: 'uuid-old', g: 'gid-old' }
+  const r = resolveUnsavedWorkflowUuid({ stored, gid: 'gid-new', mint: 'fresh' })
+  assert.equal(r.uuid, 'fresh') // same path, DIFFERENT graph id → different workflow
+  assert.equal(r.changed, true)
+})
+
+test('#570 lenient path-only fallback when a graph id is unavailable', () => {
+  // gid unknown on either side → key on the path alone (best-effort durability).
+  assert.equal(resolveUnsavedWorkflowUuid({ stored: { u: 'u', g: '' }, gid: 'g', mint: 'm' }).uuid, 'u')
+  assert.equal(resolveUnsavedWorkflowUuid({ stored: { u: 'u', g: 'g' }, gid: '', mint: 'm' }).uuid, 'u')
+})
+
+test('#570 a read-only probe (no mint) returns null on a miss/mismatch', () => {
+  assert.equal(resolveUnsavedWorkflowUuid({ stored: null, gid: 'g' }).uuid, null)
+  assert.equal(resolveUnsavedWorkflowUuid({ stored: { u: 'u', g: 'gid-old' }, gid: 'gid-new' }).uuid, null)
+  assert.equal(resolveUnsavedWorkflowUuid({ stored: { u: 'u', g: 'g' }, gid: 'g' }).uuid, 'u')
+})
 
 test('normalizes Windows paths for stable identity comparisons', () => {
   assert.equal(
