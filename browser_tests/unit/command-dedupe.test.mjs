@@ -110,3 +110,39 @@ test("settle is idempotent — a second settle cannot rewrite the recorded reply
   settle({ rid: "r1", ok: false, error: "bogus" });
   assert.equal(await ledger.get("r1"), reply);
 });
+
+test("an in-flight entry is NEVER evicted past cap — its replay is still deduped (#517 re-gate)", async () => {
+  const ledger = createCommandDedupeLedger(200);
+  let applied = 0;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const deliver = makeDispatch(ledger, async (msg) => {
+    if (msg.rid === "r-first") await gate; // the first command stays in flight
+    return { added: { id: ++applied } };
+  });
+
+  const first = deliver({ rid: "r-first", cmd: "graph_add_node" }); // in-flight
+  // 200 more commands complete while the first is still applying → 201 entries,
+  // over cap. Eviction must skip the in-flight first entry, not drop it.
+  for (let i = 1; i <= 200; i += 1) {
+    await deliver({ rid: `r${i}`, cmd: "graph_add_node" });
+  }
+  const replayP = deliver({ rid: "r-first", cmd: "graph_add_node" });
+  release();
+  const [orig, replay] = await Promise.all([first, replayP]);
+  assert.equal(replay.executed, false, "the 201st command did not evict the in-flight first");
+  assert.equal(applied, 201, "the replay added nothing — executor count stays at one per rid");
+  assert.equal(replay.reply, orig.reply);
+});
+
+test("settled entries still evict oldest-first while an in-flight one is kept", async () => {
+  const ledger = createCommandDedupeLedger(3);
+  const deliver = makeDispatch(ledger, async () => ({ ok: true }));
+  const settleLive = ledger.begin("r-live"); // stays in flight
+  for (const rid of ["r1", "r2", "r3"]) await deliver({ rid, cmd: "graph_add_node" });
+  // 4 entries > cap 3 → the oldest SETTLED (r1) evicts; in-flight r-live survives.
+  assert.notEqual(ledger.get("r-live"), undefined, "in-flight entry is kept past cap");
+  assert.equal(ledger.get("r1"), undefined, "oldest settled entry still evicts — memory stays bounded");
+  assert.notEqual(ledger.get("r3"), undefined, "newer settled entries are still remembered");
+  settleLive({ rid: "r-live", ok: true, result: {} });
+});

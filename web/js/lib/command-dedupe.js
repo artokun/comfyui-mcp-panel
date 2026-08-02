@@ -13,14 +13,18 @@
 // awaited first if the first execution is still in flight — and never runs the
 // executor again (so no second mutation and no duplicate activity card).
 //
-// Bounded (oldest-first eviction) so a long session can't grow it without
-// limit. Eviction fails OPEN: a replay older than the cap re-executes, which is
-// exactly today's pre-ledger behaviour — never a new failure mode.
+// Bounded: oldest-first eviction of SETTLED entries keeps a long session from
+// growing it without limit. An IN-FLIGHT entry is NEVER evicted — dropping an
+// unsettled command would let its replay re-execute and double-apply a mutation
+// — so past `cap` CONCURRENT in-flight commands the ledger simply grows (bounded
+// by real concurrency, which is tiny); the settled cap still applies. Settled
+// eviction fails OPEN: a replay older than the cap re-executes, which is exactly
+// the pre-ledger behaviour — never a new failure mode.
 //
 // Dependency-free (no LiteGraph, no DOM). Unit-testable with plain fixtures.
 
 /**
- * @param {number} cap  max remembered rids (oldest evicted first)
+ * @param {number} cap  max remembered SETTLED rids (oldest evicted first)
  * @returns {{
  *   get(rid: string): object | Promise<object> | undefined,
  *   begin(rid: string): (reply: object) => void,
@@ -30,32 +34,45 @@
  *    settle(reply) function.
  */
 export function createCommandDedupeLedger(cap = 200) {
-  // rid → settled reply object | in-flight promise of the reply. Map preserves
+  // rid → { inflight: true, promise } | { inflight: false, reply }. Map preserves
   // insertion order, so the oldest rid is always the first key.
   const entries = new Map();
 
   return {
     get(rid) {
-      if (!entries.has(rid)) return undefined;
-      const value = entries.get(rid);
+      const entry = entries.get(rid);
+      if (entry === undefined) return undefined;
       // LRU touch: a replayed rid is by definition still relevant — keep it
       // from ageing out while the bridge may still re-deliver it.
       entries.delete(rid);
-      entries.set(rid, value);
-      return value;
+      entries.set(rid, entry);
+      return entry.inflight ? entry.promise : entry.reply;
     },
     begin(rid) {
       let settle;
-      entries.set(rid, new Promise((resolve) => { settle = resolve; }));
-      while (entries.size > cap) entries.delete(entries.keys().next().value);
+      entries.set(rid, { inflight: true, promise: new Promise((resolve) => { settle = resolve; }) });
+      // Evict oldest-first while over cap, but NEVER an in-flight entry (see
+      // header): with every entry in flight this grows the ledger past cap
+      // instead of evicting, which is the safe direction.
+      for (const [key, entry] of entries) {
+        if (entries.size <= cap) break;
+        if (entry.inflight) continue;
+        entries.delete(key);
+      }
       let settled = false;
       return (reply) => {
         if (settled) return; // settle exactly once — later calls can't rewrite history
         settled = true;
         settle(reply);
-        // Collapse the in-flight promise to the settled reply itself so later
-        // replays read it synchronously (and `await` on either form is the same).
-        if (entries.get(rid) !== undefined) entries.set(rid, reply);
+        // Collapse to the settled reply itself so later replays read it
+        // synchronously (and `await` on either form is the same). The entry is
+        // provably still present — in-flight entries are never evicted.
+        const entry = entries.get(rid);
+        if (entry !== undefined) {
+          entry.inflight = false;
+          entry.reply = reply;
+          delete entry.promise;
+        }
       };
     },
   };
