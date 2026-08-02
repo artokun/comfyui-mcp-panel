@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- `panel_add_node` / `panel_set_widget` unknown-type errors now point at `get_node_info` (the live /object_info node-class oracle) instead of `panel_search_nodes`, which searches installable Manager packs and can never resolve an exact class_type (mcp#741)
+
 ## [0.11.36] - 2026-08-03
 
 ### Fixed
