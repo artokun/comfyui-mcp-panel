@@ -80,11 +80,14 @@ export function commandFingerprint(msg) {
  *    bridge reused a request id for different work (anomalous; worth a log).
  * @returns {{
  *   get(rid: string, fingerprint: string): object | Promise<object> | undefined,
+ *   lookupRetry(rid: string, fingerprint: string): { status: "match", reply: object | Promise<object> } | { status: "mismatch" } | { status: "unknown" },
  *   begin(rid: string, fingerprint: string): (reply: object) => void,
  * }} get() returns undefined for a fresh rid+fingerprint, the settled reply
  *    object once the command completed, or a promise of it while the first
- *    execution is still in flight. begin() records a fresh rid+fingerprint as
- *    in-flight and returns its settle(reply) function.
+ *    execution is still in flight. lookupRetry() additionally distinguishes an
+ *    unknown/evicted token from a remembered token for different work. begin()
+ *    records a fresh rid+fingerprint as in-flight and returns its settle(reply)
+ *    function.
  */
 export function createCommandDedupeLedger(cap = 200, onRidReuse) {
   // `${rid}\n${fingerprint}` → { rid, inflight: true, promise } in-flight |
@@ -116,6 +119,18 @@ export function createCommandDedupeLedger(cap = 200, onRidReuse) {
       entries.delete(key);
       entries.set(key, entry);
       return entry.inflight ? entry.promise : entry.reply;
+    },
+    lookupRetry(rid, fingerprint) {
+      const reply = this.get(rid, fingerprint);
+      if (reply !== undefined) return { status: "match", reply };
+      // A retry token that is still retained but has no entry for this
+      // fingerprint names different work. It must not fail open onto whichever
+      // workflow is active now. In contrast, an unknown or evicted token has no
+      // entry at all and intentionally retains the ledger's fail-open behaviour.
+      for (const entry of entries.values()) {
+        if (entry.rid === rid) return { status: "mismatch" };
+      }
+      return { status: "unknown" };
     },
     begin(rid, fingerprint) {
       // begin() only runs after get() missed, so any same-rid entry exists
