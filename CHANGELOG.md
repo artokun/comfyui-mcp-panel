@@ -6,6 +6,76 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.34] - 2026-08-02
+
+### Added
+- add pi.dev provider chip across the panel (#491)
+- wire MiniMax as a first-class hosted-API-key provider (#355)
+- 0.49.0 vocabulary gate rebased onto 0.11.32 main
+- graph_set_node_property — set a node's LiteGraph property live (#488) (#501)
+- expose per-item `gated` + cap the media proxy read (supports mcp#623)
+- refresh_nodes executor — force /object_info re-register on demand (#608)
+
+### Fixed
+- gate pi ready ack on backends state
+- leave pi readiness to orchestrator
+- require verified local pi auth for ready state
+- reject pi shell shims during readiness
+- resolve case-colliding names exactly (#524)
+- align pi CLI probe with shell-less spawn
+- dedupe bridge command rids so a replayed mutation can't double-apply (#517) (#521)
+- invalidate in-flight reorder/drag state when a push rehydrates the editor (#506)
+- keep panel_open_workflow's outcome truthful across the mid-command disconnect (#402, #508, #442 defect 2) (#514)
+- fail closed on unresolved ties even with explicit segments; key the per-segment field carry on content (#506)
+- verify nested input media before reporting missing (#518)
+- refuse an explicit-segments push that would destroy a detected in-flight edit (#506)
+- authorize promoted subgraph containers via the resolved concrete inner target (#512) (#523)
+- fail closed on merge-base ties; preserve fields the editor does not model (#506)
+- drop model-level nsfw:true entries under SFW browsing masks (#515) (#520)
+- replace literal NUL map-key sentinels with printable form (#510) (#519)
+- share one frontend-only-node allowlist between the sibling widget guards (#496) + writable empty dynamic combo (#507) (#511)
+- add a pre-load editor snapshot so stale-vs-uncommitted is observed, not inferred (#506)
+- classify a discarded timeline copy by which branch settled authority (#506)
+- stop settling merge-base authority on the lossy prompt join (#506)
+- length equality reuses the lossless write-path rule ("2e3" != 2000) (#506)
+- disclose a discarded editor copy when timeline_data is unreadable (#506)
+- decide overwrite disclosure structurally, never via the lossy prompt join (#506)
+- disclose the timeline_data copy set aside when the editor wins the merge base (#506 codex round 7)
+- report an out-of-band derived value even with no readable base timeline (#506 codex round 6)
+- whitespace notice tracks python str.strip() exactly, not JS trim() (#506 codex round 5)
+- disclose an in-flight prompt edit replaced by an explicit segments write (#506 codex round 4)
+- refuse unsafe/exponent segment lengths + pin the graph_set_widget wiring (#506 codex round 3)
+- widget-first merge base + python-parity whitespace notice (#506 codex round 2)
+- prefer the live editor timeline as the merge base + refuse coerced colour/length (#506 codex round 1)
+- reconcile local_prompts when timeline_data updates on PromptRelayEncodeTimeline (#506)
+- rename isWorkflowCreationLoad → isNewWorkflowLoad (YARA SUSP_SVG false-positive on 'onload' substring)
+- resolve the workflow selector over the executor's exact collection (no over-fence) (#570 P1)
+- fence PINNED commands too — the pin guard authorizes by path, not uuid (#570 P0)
+- fence workflow_rename/close by RESOLVED TARGET, not raw path presence (#570 P0)
+- fence all four workflow mutators + stop over-fencing explicit-path ops (#570 P0c)
+- back cross-workflow node clipboard with a non-quota in-memory store (#500) (#502)
+- scope the workflow-instance fence to active-workflow mutations (#570 P0c)
+- keep-instance identity for graph_load + advertise stamp enforcement (#570 P0b/P0c)
+- frontend-only rgthree nodes (#475) + outer promoted display-proxy sync (#477) (#479)
+- match LiteGraph containsCentre rule for group membership (#497)
+- fence command execution to the active workflow instance (#570 P0)
+- fail closed when the creation-boundary fork is not installed (#570 P0)
+- anchor unsaved identity on the live object, invalidate stale cache on in-place reload (#570 P0b)
+- fork legacy/unmarked embedded uuids on unsaved reload (#570 P0b)
+- legacy Manager 3.x install — negotiate queue/start method + unreachable fallback (#485, #486)
+- make the creation-load classifier fail-safe — fork on any non-ComfyWorkflow arg (#570 P0)
+- derive Ultralytics bbox/segm dir from combo prefix (#487)
+- fork per-instance identity at the workflow CREATION boundary (#570 P0)
+- unsaved uuid reuse fails closed on a missing graph id (#570 P0b)
+- durable per-instance uuid for unsaved workflows; fork on cold import (#570 P0b/P1)
+- emit the durable per-instance workflow uuid in every hello (#570)
+- in-place-overwrite gate must compare RAW BYTES, not decoded text (#442 defect 3)
+- content-equality gate for in-place save + late stale read (#442 defects 2,3)
+- stale-tab detection on open + in-place save 409 (#442 defects 2,3)
+- report EFFECTIVE widget state + stop blobs starving the node you asked for (#607, #609) (#482)
+- recover run-completion missed on unobserved reconnect (#356) + refuse false-clean empty-graph reads (#389)
+
+
 ## [0.11.33] - 2026-08-02
 
 ### Fixed
