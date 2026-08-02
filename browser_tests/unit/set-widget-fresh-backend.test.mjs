@@ -1086,3 +1086,195 @@ test("#458 EVER-SEEN INTERMEDIATE: a genuine virtual container (type NEVER in ob
   assert.equal(set.value, 30);
   assert.equal(mid.widgets.find((w) => w.name === "steps").value, 30);
 });
+
+// ---- #512: outer UUID subgraph node whose class carries the frontend's SYNTHESIZED
+//      def markers. Current ComfyUI_frontend's registerSubgraphNodeDef stamps static
+//      nodeData + comfyClass on EVERY subgraph node's registered class (registered
+//      under the subgraph's UUID), so the #458 provenance heuristic false-fired on the
+//      genuine container and refused a CORRECT promoted write as an "unverifiable
+//      virtual-subgraph node". The container must instead be authorized through its
+//      RESOLVED, fresh-authorized concrete inner target — while a promotion that does
+//      NOT resolve (or an ever-seen/removed container type) must still fail closed. ----
+
+// The bundled ltx-2.3-img2vid repro: outer node 320, type is the subgraph's UUID.
+const SUBGRAPH_UUID = "2454ad83-157c-40dd-9f19-5daaf4041ce0";
+
+// A SubgraphNode shaped the way current ComfyUI_frontend actually builds one: the type
+// is the subgraph's UUID (never in /object_info), and BOTH the registered class and the
+// instance's own constructor carry the synthesized nodeDef (nodeData + comfyClass) that
+// registerSubgraphNodeDef stamps BY DESIGN. `innerType` flips the inner node between a
+// live and a removed backend type. Returns null resolveSource when `resolvable` is
+// false to model a stale/empty promoted link.
+function makeUuidSubgraphFixture(reg, innerType, { resolvable = true } = {}) {
+  const inner = {
+    id: 301,
+    type: innerType,
+    widgets: [{ name: "value_4", type: "INT", value: 20 }],
+    constructor: { nodeData: { input: { required: {} } } },
+  };
+  // #366: the AUTHORITATIVE parent rail projection — identity-linked from the host
+  // input (`_widget`) and a live member of parent.widgets.
+  const railWidget = { name: "value_4", type: "INT", value: 20 };
+  const parent = {
+    id: 320,
+    type: SUBGRAPH_UUID,
+    subgraph: { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) },
+    inputs: [{ name: "value_4", _widget: railWidget, widget: { name: "value_4" }, _subgraphSlot: { name: "value_4" } }],
+    widgets: [railWidget],
+  };
+  // registerSubgraphNodeDef: the synthesized def is stamped on the class, which is
+  // registered under the subgraph's UUID — the "backend provenance" that false-fired.
+  const ctor = function ComfySubgraphNode() {};
+  ctor.nodeData = { input: { required: {} }, name: SUBGRAPH_UUID };
+  ctor.comfyClass = SUBGRAPH_UUID;
+  parent.constructor = ctor;
+  reg[SUBGRAPH_UUID] = ctor;
+  const resolveSource = (_n, si) =>
+    resolvable && si?.name === "value_4" ? { sourceNodeId: "301", sourceWidgetName: "value_4" } : null;
+  return { parent, inner, railWidget, resolveSource };
+}
+
+test("#512: promoted write on an outer UUID subgraph node (synthesized-def provenance) ⇒ SUCCEEDS via the resolved inner target", async () => {
+  // The exact reported repro: the guard refused this as "not a verifiable frontend-only
+  // / virtual-subgraph node" purely because the class carries the frontend-stamped def.
+  // The promotion resolves to a live, fresh-authorized inner node — the write is correct
+  // and must proceed, landing on the inner node + syncing the authoritative rail.
+  const reg = loadedRegistry();
+  const { parent, inner, railWidget, resolveSource } = makeUuidSubgraphFixture(reg, "KSampler");
+  const { set } = await runSetWidget(parent, "value_4", 42, {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => objectInfo(), // KSampler present; the UUID never is
+    wasTypeEverDefined: () => false, // UUID subgraph types are never backend-defined
+    resolveSource,
+    ...HOOKS,
+  });
+  assert.equal(set.value, 42);
+  assert.equal(inner.widgets.find((w) => w.name === "value_4").value, 42, "write landed on the resolved inner node");
+  assert.equal(railWidget.value, 42, "#366: authoritative parent rail synced");
+});
+
+test("#512: promoted write on a UUID subgraph node whose inner type is REMOVED ⇒ still FAIL CLOSED", async () => {
+  // The relaxation authorizes the CONTAINER through the resolved inner target — it says
+  // nothing about the target itself. A removed inner type is still refused by the fresh
+  // oracle, exactly as before.
+  const reg = loadedRegistry(["GoneNode"]);
+  const { parent, inner, railWidget, resolveSource } = makeUuidSubgraphFixture(reg, "GoneNode");
+  await assert.rejects(
+    () =>
+      runSetWidget(parent, "value_4", 42, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // backend no longer provides GoneNode
+        wasTypeEverDefined: () => false,
+        resolveSource,
+        ...HOOKS,
+      }),
+    (err) =>
+      err instanceof Error &&
+      /Cannot set widget on node 301 \("GoneNode"\)/.test(err.message) &&
+      /backend does not provide/i.test(err.message),
+  );
+  assert.equal(inner.widgets.find((w) => w.name === "value_4").value, 20, "inner untouched");
+  assert.equal(railWidget.value, 20, "rail untouched");
+});
+
+test("#512: UNRESOLVABLE promotion on a UUID subgraph node ⇒ still REFUSED (no concrete target, no write)", async () => {
+  // The exemption is scoped to a POSITIVELY-resolved, concrete-authorized promotion. A
+  // promoted widget whose inner link is stale/empty never earns it — fail closed.
+  const reg = loadedRegistry();
+  const { parent, inner, railWidget, resolveSource } = makeUuidSubgraphFixture(reg, "KSampler", { resolvable: false });
+  await assert.rejects(
+    () =>
+      runSetWidget(parent, "value_4", 42, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(),
+        wasTypeEverDefined: () => false,
+        resolveSource, // stale/empty linkIds — the promotion cannot be resolved
+        ...HOOKS,
+      }),
+    (err) => err instanceof Error && /refused.*no resolvable inner link|no resolvable inner link/i.test(err.message),
+  );
+  assert.equal(inner.widgets.find((w) => w.name === "value_4").value, 20, "inner untouched");
+  assert.equal(railWidget.value, 20, "rail untouched");
+});
+
+test("#512: the EVER-SEEN gate still REFUSES a container type the backend reported earlier (the flag never bypasses the trust root)", async () => {
+  // If the backend DID report this type earlier this session and it is now absent, the
+  // node is a removed backend node masquerading as a subgraph container — refused before
+  // the resolved-promotion exemption is ever consulted (#458 stays closed).
+  const reg = loadedRegistry();
+  const { parent, inner, railWidget, resolveSource } = makeUuidSubgraphFixture(reg, "KSampler");
+  await assert.rejects(
+    () =>
+      runSetWidget(parent, "value_4", 42, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // the type is ABSENT now…
+        wasTypeEverDefined: (t) => t === SUBGRAPH_UUID, // …but was reported EARLIER this session
+        resolveSource,
+        ...HOOKS,
+      }),
+    (err) =>
+      err instanceof Error &&
+      /Cannot set widget on node 320/.test(err.message) &&
+      /was defined by the ComfyUI backend earlier this session|since-removed/i.test(err.message),
+  );
+  assert.equal(inner.widgets.find((w) => w.name === "value_4").value, 20, "inner untouched");
+  assert.equal(railWidget.value, 20, "rail untouched");
+});
+
+test("#512: NESTED promotion through a provenance-stamped UUID intermediate ⇒ SUCCEEDS (every driven-through container authorized via the chain)", async () => {
+  // On current frontends EVERY subgraph node in the chain carries the synthesized def,
+  // not just the outer one — a nested A→B→KSampler promotion must authorize the
+  // intermediate B through the same resolved-chain evidence or it false-refuses too.
+  const reg = loadedRegistry();
+  const INNER_UUID = "bbbbbbbb-1111-4222-8333-cccccccccccc";
+  const concrete = {
+    id: 90,
+    type: "KSampler",
+    widgets: [{ name: "steps", type: "INT", value: 20 }],
+    constructor: { nodeData: { input: { required: {} } } },
+  };
+  const stamp = (node, uuid) => {
+    const ctor = function ComfySubgraphNode() {};
+    ctor.nodeData = { input: { required: {} }, name: uuid };
+    ctor.comfyClass = uuid;
+    node.constructor = ctor;
+    reg[uuid] = ctor;
+  };
+  const b = {
+    id: 80,
+    type: INNER_UUID,
+    widgets: [{ name: "steps", type: "INT", value: 20 }],
+    subgraph: { _nodes: [concrete], getNodeById: (id) => (String(id) === "90" ? concrete : null) },
+    inputs: [{ name: "steps", _subgraphSlot: { name: "steps" } }],
+  };
+  stamp(b, INNER_UUID);
+  const aRail = { name: "steps", type: "INT", value: 20 };
+  const a = {
+    id: 70,
+    type: SUBGRAPH_UUID,
+    widgets: [aRail],
+    subgraph: { _nodes: [b], getNodeById: (id) => (String(id) === "80" ? b : null) },
+    inputs: [{ name: "steps", _widget: aRail, widget: { name: "steps" }, _subgraphSlot: { name: "steps" } }],
+  };
+  stamp(a, SUBGRAPH_UUID);
+  const resolveSource = (subgraphNode, si) => {
+    if (subgraphNode === a && si?.name === "steps") return { sourceNodeId: "80", sourceWidgetName: "steps" };
+    if (subgraphNode === b && si?.name === "steps") return { sourceNodeId: "90", sourceWidgetName: "steps" };
+    return null;
+  };
+  const { set } = await runSetWidget(a, "steps", 30, {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => objectInfo(), // KSampler present; both UUIDs absent
+    wasTypeEverDefined: () => false,
+    resolveSource,
+    ...HOOKS,
+  });
+  assert.equal(set.value, 30, "nested promoted write authorized via the resolved concrete chain");
+  assert.equal(b.widgets.find((w) => w.name === "steps").value, 30, "the intermediate forwarded the write");
+  assert.equal(aRail.value, 30, "#366: authoritative outer rail synced");
+});
