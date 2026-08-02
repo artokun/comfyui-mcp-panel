@@ -145,6 +145,41 @@ export function splitInputAssetRef(value) {
 }
 
 /**
+ * Remove missing-media candidates for NESTED input files the server confirms are
+ * present. ComfyUI's LoadImage combo only lists files at the input root, while
+ * its validator can load `subfolder/file.png`; exact combo membership therefore
+ * cannot adjudicate these candidates (#513).
+ *
+ * `confirmServerAsset(value)` is injected by the panel because this pure module
+ * must not own a ComfyUI API client. The helper fails CLOSED: an unavailable,
+ * rejected, or throwing probe keeps the original candidate reported. Root-level
+ * values are not probed because the live combo is already authoritative there.
+ */
+export async function filterServerConfirmedInputSubfolderCandidates(candidates, confirmServerAsset) {
+  if (!Array.isArray(candidates)) return [];
+  if (typeof confirmServerAsset !== "function") return candidates;
+  const probes = new Map();
+  const filtered = await Promise.all(
+    candidates.map(async (candidate) => {
+      const file = candidate?.file;
+      if (typeof file !== "string") return candidate;
+      const { subfolder, filename } = splitInputAssetRef(file);
+      if (!subfolder || !filename) return candidate;
+      const key = `${subfolder}/${filename}`;
+      let probe = probes.get(key);
+      if (!probe) {
+        probe = Promise.resolve()
+          .then(() => confirmServerAsset(file))
+          .then((present) => present === true, () => false);
+        probes.set(key, probe);
+      }
+      return (await probe) ? null : candidate;
+    }),
+  );
+  return filtered.filter(Boolean);
+}
+
+/**
  * Add `value` to a combo widget's option list in place (so a following revalidation
  * accepts it) WITHOUT clobbering a dynamic function-valued option source. Returns
  * true if the option list now contains the value. Defensive; no-op on a bad widget.

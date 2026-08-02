@@ -138,6 +138,10 @@ import {
 } from "./lib/subgraph-scope.js";
 import { runSetWidget } from "./lib/set-widget.js";
 import {
+  splitInputAssetRef,
+  filterServerConfirmedInputSubfolderCandidates,
+} from "./lib/input-asset.js";
+import {
   drivenWidgetsFor,
   drivenTag,
   capSummaryWidgets,
@@ -4362,6 +4366,33 @@ function collectMissingAssets(trustComboOverride) {
   return { models, media, nodeTypes, nodeCount, any: !!(models.length || media.length || nodeTypes.length || nodeCount) };
 }
 
+/**
+ * `/object_info` cannot list LoadImage input files below the input root, although
+ * `/view?type=input` and LoadImage's validator can resolve them. Confirm only
+ * those nested missing-media candidates against the server before telling the
+ * agent that the user must re-upload an asset (#513). A failed probe deliberately
+ * leaves the candidate in place, preserving the prior fail-closed warning.
+ */
+async function filterServerConfirmedInputSubfolderMedia(media) {
+  return filterServerConfirmedInputSubfolderCandidates(media, async (assetValue) => {
+    try {
+      if (typeof api?.fetchApi !== "function") return false;
+      const { subfolder, filename } = splitInputAssetRef(assetValue);
+      if (!subfolder || !filename) return false;
+      const qs = new URLSearchParams({ filename, subfolder, type: "input" }).toString();
+      const res = await api.fetchApi(`/view?${qs}`, {
+        method: "GET",
+        cache: "no-store",
+        headers: { Range: "bytes=0-0" },
+        signal: AbortSignal.timeout(GET_ERRORS_REFRESH_TIMEOUT_MS),
+      });
+      return !!res && (res.ok || res.status === 206);
+    } catch {
+      return false;
+    }
+  });
+}
+
 /** True when EITHER missing-asset store holds a RAW candidate (isMissing !== false),
  *  BEFORE the live cross-check filters it. get_errors keys its authoritative refresh
  *  on THIS, not on collectMissingAssets() — the collector already trusts a possibly-
@@ -4410,7 +4441,7 @@ function withRefreshTimeout(promise) {
   ]);
 }
 
-function validationBanner() {
+async function validationBanner() {
   let nodeErrors = null;
   try {
     nodeErrors =
@@ -4426,6 +4457,8 @@ function validationBanner() {
   // canvas is already red. Bailing on those two alone left the agent blind
   // exactly when the user could see the problem — reported from the field.
   const missing = collectMissingAssets();
+  missing.media = await filterServerConfirmedInputSubfolderMedia(missing.media);
+  missing.any = !!(missing.models.length || missing.media.length || missing.nodeTypes.length || missing.nodeCount);
   // #415: the ⚠️ MISSING ASSETS block reads as authoritative at turn start, but the
   // stores are LOAD-TIME only and the live combo can drift BOTH ways — a since-uploaded
   // asset the banner still calls missing, OR a since-deleted asset a prior-confirmed
@@ -7194,6 +7227,8 @@ const GRAPH_TOOL_EXECUTORS = {
     //    LOAD, which is why they explain a red canvas long before anything is
     //    queued (see collectMissingAssets).
     const assets = collectMissingAssets(comboTrustedForQuery);
+    assets.media = await filterServerConfirmedInputSubfolderMedia(assets.media);
+    assets.any = !!(assets.models.length || assets.media.length || assets.nodeTypes.length || assets.nodeCount);
     const missingModels = assets.models.map((m) => ({ ...m, kind: "missing_model" }));
     const missingMedia = assets.media.map((m) => ({ ...m, kind: "missing_media" }));
     const missingNodeTypes = assets.nodeTypes;
@@ -19330,7 +19365,7 @@ function buildPanel() {
     // value_not_in_list, broken links) the instant they appear — the same data the
     // user sees in the frontend's error panel — so the agent isn't blind to a broken
     // graph until it independently re-runs. Conditional + deduped (event-driven).
-    const valBanner = validationBanner();
+    const valBanner = await validationBanner();
     if (valBanner) sendText = valBanner + sendText;
     // Track delivery: trackSend marks "Sending…", then the working ack flips it
     // to "✓ Seen" (or a timeout / closed socket flips it to "Not delivered").

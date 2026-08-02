@@ -9,6 +9,7 @@ import {
   uploadInputConfig,
   uploadInputAccepts,
   splitInputAssetRef,
+  filterServerConfirmedInputSubfolderCandidates,
   addComboOption,
 } from "../../web/js/lib/input-asset.js";
 
@@ -103,6 +104,30 @@ test("splitInputAssetRef: Windows backslashes normalized to forward slashes", ()
     subfolder: "xyr_canvas",
     filename: "foo.png",
   });
+});
+
+test("#513: server-confirmed nested input media is not reported missing", async () => {
+  const candidates = [
+    { node_id: 11, file: "root.png" },
+    { node_id: 12, file: "codex_stage\\mask.png" },
+    { node_id: 13, file: "codex_stage/missing.png" },
+    { node_id: 14, file: "codex_stage/mask.png" },
+  ];
+  const probes = [];
+  const result = await filterServerConfirmedInputSubfolderCandidates(candidates, async (file) => {
+    probes.push(file);
+    return file.includes("mask.png");
+  });
+  assert.deepEqual(result, [candidates[0], candidates[2]]);
+  assert.deepEqual(probes, ["codex_stage\\mask.png", "codex_stage/missing.png"]);
+});
+
+test("#513: nested input media stays missing when the server probe fails", async () => {
+  const candidate = { node_id: 12, file: "codex_stage/mask.png" };
+  const result = await filterServerConfirmedInputSubfolderCandidates([candidate], async () => {
+    throw new Error("offline");
+  });
+  assert.deepEqual(result, [candidate]);
 });
 
 test("addComboOption adds a value to an array-backed combo in place", () => {
