@@ -12941,7 +12941,7 @@ function buildPanel() {
       if (!bk || !Array.isArray(list)) return;
       const plabel = BACKEND_LABELS[bk] || bk;
       for (const m of list) {
-        const key = bk + " " + m.id;
+        const key = bk + "\x00" + m.id;
         if (seen.has(key)) continue;
         seen.add(key);
         rows.push({ ...m, provider: bk, providerLabel: plabel });
@@ -12992,7 +12992,7 @@ function buildPanel() {
     const out = [];
     const pushed = new Set();
     const take = (m) => {
-      const key = m.provider + " " + m.id;
+      const key = m.provider + "\x00" + m.id;
       if (pushed.has(key)) return;
       pushed.add(key);
       out.push(m);
