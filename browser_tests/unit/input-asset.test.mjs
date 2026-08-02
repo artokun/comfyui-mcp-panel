@@ -145,9 +145,23 @@ test("splitInputAssetRef: POSIX semantics keep a backslash literal (#513 review)
   });
 });
 
-test("inputPathsUseWindowsSeparators: only os.name 'nt' enables Windows semantics", () => {
+test("inputPathsUseWindowsSeparators: sys.platform 'win32' AND legacy os.name 'nt' enable Windows semantics", () => {
+  // ComfyUI ≥ 0.4.0 reports Python's sys.platform ("win32" on Windows) in
+  // /system_stats; older servers reported os.name ("nt"). BOTH must read as
+  // Windows — the nt-only check sent EVERY modern Windows server down the POSIX
+  // branch, so an existing `dir\file.png` stayed falsely reported missing on the
+  // platform this PR exists for (#513 review regression).
+  assert.equal(inputPathsUseWindowsSeparators({ system: { os: "win32" } }), true);
   assert.equal(inputPathsUseWindowsSeparators({ system: { os: "nt" } }), true);
+  // POSIX servers keep POSIX semantics — including Cygwin/MSYS2 Pythons
+  // (sys.platform "cygwin"/"msys"), whose os.path is posixpath, so a backslash
+  // is a literal filename character there.
   assert.equal(inputPathsUseWindowsSeparators({ system: { os: "posix" } }), false);
+  assert.equal(inputPathsUseWindowsSeparators({ system: { os: "linux" } }), false);
+  assert.equal(inputPathsUseWindowsSeparators({ system: { os: "darwin" } }), false);
+  assert.equal(inputPathsUseWindowsSeparators({ system: { os: "cygwin" } }), false);
+  assert.equal(inputPathsUseWindowsSeparators({ system: { os: "msys" } }), false);
+  // Unknown / malformed payloads fail CLOSED to POSIX semantics.
   assert.equal(inputPathsUseWindowsSeparators({ system: {} }), false);
   assert.equal(inputPathsUseWindowsSeparators({}), false);
   assert.equal(inputPathsUseWindowsSeparators(null), false);

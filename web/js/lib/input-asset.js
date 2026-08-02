@@ -154,14 +154,22 @@ export function splitInputAssetRef(value, { backslashIsSeparator = true } = {}) 
 }
 
 /**
- * Interpret a ComfyUI `/system_stats` payload for the input-path split above:
- * `system.os` is Python's `os.name` — "nt" on Windows, "posix" elsewhere. Any
- * missing/malformed shape returns false (POSIX semantics), so an unreadable
- * stats payload can never enable a split the server would not perform.
+ * Interpret a ComfyUI `/system_stats` payload for the input-path split above.
+ * `system.os` is Python's `sys.platform` on ComfyUI ≥ 0.4.0 — "win32" on
+ * Windows — while older servers report `os.name` ("nt" on Windows); BOTH
+ * Windows spellings are accepted, or every modern Windows server falls
+ * through to the POSIX branch and a genuinely-present `dir\file.png` stays
+ * falsely reported missing (#513 review). Cygwin/MSYS2 Pythons report
+ * sys.platform "cygwin"/"msys" but their os.path is posixpath — a backslash
+ * is NOT a separator there — so they correctly fall through to POSIX
+ * semantics, as do "linux"/"darwin". Any missing/malformed shape returns
+ * false (POSIX semantics), so an unreadable stats payload can never enable a
+ * split the server would not perform.
  */
 export function inputPathsUseWindowsSeparators(systemStats) {
   try {
-    return String(systemStats?.system?.os ?? "").toLowerCase() === "nt";
+    const os = String(systemStats?.system?.os ?? "").toLowerCase();
+    return os === "win32" || os === "nt";
   } catch {
     return false;
   }

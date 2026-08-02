@@ -4376,11 +4376,12 @@ function collectMissingAssets(trustComboOverride) {
 // filename character. The /view probe must split the value exactly the way the
 // server will, or an existing `dir/file.png` falsely clears a genuinely missing
 // `dir\file.png` on a POSIX server (#513 review). The verdict comes from
-// /system_stats (`system.os` is Python's os.name) and is fetched once and cached —
-// the backend's OS cannot change within a page session. An UNKNOWN platform fails
-// CLOSED: POSIX semantics keep a backslash literal, so a value is never
-// re-interpreted into a path the server would not resolve (over-report, never
-// suppress — the same fail direction as the probe itself).
+// /system_stats (`system.os` is Python's sys.platform on ComfyUI ≥ 0.4.0 —
+// "win32" on Windows — os.name "nt" on older servers) and is fetched once and
+// cached — the backend's OS cannot change within a page session. An UNKNOWN
+// platform fails CLOSED: POSIX semantics keep a backslash literal, so a value
+// is never re-interpreted into a path the server would not resolve
+// (over-report, never suppress — the same fail direction as the probe itself).
 let serverInputPathsAreWindows = null;
 async function inputAssetServerUsesWindowsPaths() {
   if (serverInputPathsAreWindows !== null) return serverInputPathsAreWindows;
@@ -4496,7 +4497,37 @@ async function validationBanner() {
   // canvas is already red. Bailing on those two alone left the agent blind
   // exactly when the user could see the problem — reported from the field.
   const missing = collectMissingAssets();
+  // The probe below awaits SERVER state while everything above was captured from
+  // the PRE-await workflow. A workflow-tab switch during the await would join A's
+  // missing/validation banner onto B's turn and send it into B's session (#513
+  // review). Same correlation as graph_get_errors: snapshot the active-workflow
+  // instance and the bound root graph before the await, re-read after, discard on
+  // a provable change. The banner is best-effort, so a mismatch skips it SILENTLY
+  // (no recoverable-error retry) — B's next turn recomputes from B's own state.
+  let preProbeRootGraph = null;
+  try {
+    preProbeRootGraph = getGraphCtx().rootGraph ?? null;
+  } catch {
+    preProbeRootGraph = null; // unresolvable now → correlate on the workflow alone
+  }
+  const preProbeWorkflow = activeWorkflowRef();
   missing.media = await filterServerConfirmedInputSubfolderMedia(missing.media);
+  let postProbeRootGraph = null;
+  try {
+    postProbeRootGraph = getGraphCtx().rootGraph ?? null;
+  } catch {
+    postProbeRootGraph = null; // binding gone mid-read → treated as changed below
+  }
+  if (
+    graphReadBindingChanged({
+      beforeWorkflow: preProbeWorkflow,
+      afterWorkflow: activeWorkflowRef(),
+      beforeRootGraph: preProbeRootGraph,
+      afterRootGraph: postProbeRootGraph,
+    })
+  ) {
+    return "";
+  }
   missing.any = !!(missing.models.length || missing.media.length || missing.nodeTypes.length || missing.nodeCount);
   // #415: the ⚠️ MISSING ASSETS block reads as authoritative at turn start, but the
   // stores are LOAD-TIME only and the live combo can drift BOTH ways — a since-uploaded
