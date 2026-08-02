@@ -16,6 +16,8 @@ const legacyMoveMatch = panelSrc.match(/graph_move_node\(\{ node_id, pos \}\) \{
 assert.ok(legacyMoveMatch, "could not locate graph_move_node in panel source");
 const legacyResizeMatch = panelSrc.match(/graph_resize_node\(\{ node_id, size \}\) \{[\s\S]*?\n  \},/);
 assert.ok(legacyResizeMatch, "could not locate graph_resize_node in panel source");
+const legacyTitleMatch = panelSrc.match(/graph_set_title\(\{ node_id, title \}\) \{[\s\S]*?\n  \},/);
+assert.ok(legacyTitleMatch, "could not locate graph_set_title in panel source");
 const legacyCollapsedMatch = panelSrc.match(/graph_set_node_collapsed\(\{ node_id, collapsed \}\) \{[\s\S]*?\n  \},/);
 assert.ok(legacyCollapsedMatch, "could not locate graph_set_node_collapsed in panel source");
 const legacyModeMatch = panelSrc.match(/graph_set_node_mode\(\{ node_id, mode, force \}\) \{[\s\S]*?\n  \},/);
@@ -42,7 +44,7 @@ function realLegacyColor(getGraphCtx, resolveNode) {
   )(getGraphCtx, resolveNode);
 }
 
-function realLegacyMotion(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor) {
+function realLegacyMotion(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId) {
   return new Function(
     "getGraphCtx",
     "resolveNode",
@@ -50,12 +52,13 @@ function realLegacyMotion(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypas
     "unsafeBypassMappings",
     "resolveRailNode",
     "railKindFor",
+    "normalizeLegacyNodeId",
     `const GRAPH_TOOL_EXECUTORS = { ${methodMatch[0]} ${legacyMoveMatch[0]} ${legacyResizeMatch[0]} };
      return { move: GRAPH_TOOL_EXECUTORS.graph_move_node, resize: GRAPH_TOOL_EXECUTORS.graph_resize_node };`,
-  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor);
+  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId);
 }
 
-function realLegacyCollapsed(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor) {
+function realLegacyTitle(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId) {
   return new Function(
     "getGraphCtx",
     "resolveNode",
@@ -63,8 +66,22 @@ function realLegacyCollapsed(getGraphCtx, resolveNode, refreshNodeArea, unsafeBy
     "unsafeBypassMappings",
     "resolveRailNode",
     "railKindFor",
+    "normalizeLegacyNodeId",
+    `const GRAPH_TOOL_EXECUTORS = { ${methodMatch[0]} ${legacyTitleMatch[0]} }; return GRAPH_TOOL_EXECUTORS.graph_set_title;`,
+  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId);
+}
+
+function realLegacyCollapsed(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId) {
+  return new Function(
+    "getGraphCtx",
+    "resolveNode",
+    "refreshNodeArea",
+    "unsafeBypassMappings",
+    "resolveRailNode",
+    "railKindFor",
+    "normalizeLegacyNodeId",
     `const GRAPH_TOOL_EXECUTORS = { ${methodMatch[0]} ${legacyCollapsedMatch[0]} }; return GRAPH_TOOL_EXECUTORS.graph_set_node_collapsed;`,
-  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor);
+  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId);
 }
 
 function realLegacyMode(getGraphCtx, resolveNode, unsafeBypassMappings) {
@@ -90,6 +107,15 @@ function makeNode(id, { pos = [0, 0], size = [140, 60], collapsible = true } = {
       this.flags.collapsed = !this.flags.collapsed;
     },
   };
+}
+
+function normalizeLegacyNodeId(nodeId) {
+  if (typeof nodeId === "number" && Number.isInteger(nodeId)) return nodeId;
+  if (typeof nodeId === "string" && /^-?(?:0|[1-9]\d*)$/.test(nodeId)) {
+    const normalized = Number(nodeId);
+    if (Number.isSafeInteger(normalized)) return normalized;
+  }
+  throw new Error("node_id must be an integer");
 }
 
 function setup(nodes, { palette = { blue: { color: "#123456", bgcolor: "#654321" } }, unsafeBypassMappings = () => [], resolveRailNode = () => null, railKindFor = () => null, rootGraph = false, onResolve = () => {} } = {}) {
@@ -154,8 +180,32 @@ function setupLegacyMotion(nodes, { resolveRailNode = () => null } = {}) {
     () => [],
     resolveRailNode,
     () => null,
+    normalizeLegacyNodeId,
   );
   return { ...fns, events };
+}
+
+function setupLegacyTitle(node) {
+  const events = [];
+  const graph = {
+    beforeChange: () => events.push("before"),
+    afterChange: () => events.push("after"),
+    setDirtyCanvas: () => events.push("dirty"),
+    getNodeById: (id) => id === node.id ? node : null,
+  };
+  const fn = realLegacyTitle(
+    () => ({ graph, LG: { LGraphCanvas: { node_colors: {} } } }),
+    (_graph, id) => {
+      if (id !== node.id) throw new Error(`No node with id ${id}`);
+      return node;
+    },
+    () => events.push("area"),
+    () => [],
+    () => null,
+    () => null,
+    normalizeLegacyNodeId,
+  );
+  return { fn, events };
 }
 
 function setupLegacyCollapsed(node) {
@@ -176,6 +226,7 @@ function setupLegacyCollapsed(node) {
     () => [],
     () => null,
     () => null,
+    normalizeLegacyNodeId,
   );
   return { fn, events };
 }
@@ -380,7 +431,7 @@ test("#538 retains every legacy presentation bridge command for old MCP servers"
 test("#538 legacy title wrapper preserves nullish-title compatibility", () => {
   assert.match(
     panelSrc,
-    /graph_set_title\(\{ node_id, title \}\) \{[\s\S]*?graph_edit_node\(\{ node_id, title: title == null \? "" : String\(title\) \}\)/,
+    /graph_set_title\(\{ node_id, title \}\) \{[\s\S]*?graph_edit_node\(\{ node_id: normalizeLegacyNodeId\(node_id\), title: title == null \? "" : String\(title\) \}\)/,
     "legacy titles must clear nullish values and retain historical coercion while direct graph_edit_node stays strict",
   );
 });
@@ -442,4 +493,29 @@ test("#538 legacy move preserves rail responses and numeric-string geometry", ()
     resized: { node_id: 1, from: [140, 60], to: [300, 150] },
   });
   assert.deepEqual(node.size, [300, 150]);
+});
+
+test("#538 legacy wrappers normalize canonical numeric node-id strings without weakening graph_edit_node", () => {
+  const motionNode = makeNode(7, { pos: [1, 2], size: [140, 60] });
+  const { move, resize } = setupLegacyMotion([motionNode]);
+  assert.deepEqual(move({ node_id: "7", pos: ["30", "40"] }), {
+    moved: { node_id: 7, from: [1, 2], to: [30, 40] },
+  });
+  assert.deepEqual(resize({ node_id: "7", size: ["300", "150"] }), {
+    resized: { node_id: 7, from: [140, 60], to: [300, 150] },
+  });
+
+  const titleNode = makeNode(8);
+  const { fn: title } = setupLegacyTitle(titleNode);
+  assert.deepEqual(title({ node_id: "8", title: "Legacy title" }), {
+    node_id: 8, previous: "Node 8", title: "Legacy title",
+  });
+
+  const collapsedNode = makeNode(9);
+  const { fn: collapsed } = setupLegacyCollapsed(collapsedNode);
+  assert.deepEqual(collapsed({ node_id: "9", collapsed: true }), { node_id: 9, collapsed: true });
+
+  assert.throws(() => move({ node_id: "07", pos: [1, 2] }), /node_id must be an integer/);
+  assert.throws(() => title({ node_id: "8.0", title: "wrong" }), /node_id must be an integer/);
+  assert.equal(titleNode.title, "Legacy title", "invalid legacy forms are rejected before the strict editor mutates");
 });

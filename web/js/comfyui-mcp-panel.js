@@ -5053,6 +5053,19 @@ function resolveNode(graph, nodeId) {
   return node;
 }
 
+// The consolidated editor intentionally takes only real integer ids. A handful of
+// older bridge commands historically accepted canonical numeric strings through
+// resolveNode's Number() conversion, so normalize that compatibility surface here
+// rather than weakening the new editor's target validation.
+function normalizeLegacyNodeId(nodeId) {
+  if (typeof nodeId === "number" && Number.isInteger(nodeId)) return nodeId;
+  if (typeof nodeId === "string" && /^-?(?:0|[1-9]\d*)$/.test(nodeId)) {
+    const normalized = Number(nodeId);
+    if (Number.isSafeInteger(normalized)) return normalized;
+  }
+  throw new Error("node_id must be an integer");
+}
+
 // ---- Node-type resolution guard (#458) ------------------------------------
 // The graph WRITE tools authorize node types against the CURRENT backend
 // /object_info — NOT the mutable LG.registered_node_types registry, which keeps a
@@ -7121,7 +7134,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // Legacy callers may address a subgraph rail by its "input"/"output" alias.
     // Resolve it here, then send the rail's real numeric node id through the strict
     // consolidated editor rather than weakening that editor's target contract.
-    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id: rail ? rail.node.id : node_id, pos: [Number(pos[0]), Number(pos[1])] });
+    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id: rail ? rail.node.id : normalizeLegacyNodeId(node_id), pos: [Number(pos[0]), Number(pos[1])] });
     const edit = result.edited[0];
     return {
       moved: {
@@ -7136,7 +7149,7 @@ const GRAPH_TOOL_EXECUTORS = {
   graph_resize_node({ node_id, size }) {
     if (!Array.isArray(size) || size.length !== 2) throw new Error("size must be [width, height]");
     // Same legacy numeric-string compatibility as the standalone resize command.
-    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id, size: [Number(size[0]), Number(size[1])] });
+    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id: normalizeLegacyNodeId(node_id), size: [Number(size[0]), Number(size[1])] });
     const edit = result.edited[0];
     return { resized: { node_id: edit.after.node_id, from: edit.before.size, to: edit.after.size } };
   },
@@ -7145,14 +7158,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // Match the legacy command's nullish-title behavior: it clears the visible
     // title rather than serializing a literal "null"/"undefined" label; retain
     // legacy coercion here while graph_edit_node stays strict for new callers.
-    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id, title: title == null ? "" : String(title) });
+    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id: normalizeLegacyNodeId(node_id), title: title == null ? "" : String(title) });
     const edit = result.edited[0];
     return { node_id: edit.after.node_id, previous: edit.before.title, title: edit.after.title };
   },
 
   graph_set_node_collapsed({ node_id, collapsed }) {
     if (collapsed !== undefined && typeof collapsed !== "boolean") throw new Error("collapsed must be a boolean");
-    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id, collapsed: collapsed !== false });
+    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id: normalizeLegacyNodeId(node_id), collapsed: collapsed !== false });
     const edit = result.edited[0];
     return { node_id: edit.after.node_id, collapsed: edit.after.collapsed };
   },
