@@ -6,8 +6,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.33] - 2026-08-02
+
 ### Fixed
 - `panel_set_widget` on `PromptRelayEncodeTimeline.timeline_data` no longer leaves the node rendering the PREVIOUS prompts. That node's Python `execute()` reads only `local_prompts` + `segment_lengths` — never `timeline_data` — and both are derived by the in-browser timeline editor, so a raw `timeline_data` write reported success while the render silently kept the old prompts (and was reverted on the next UI touch). The write now regenerates both derived widgets from the new timeline and applies all three atomically, re-hydrates the live editor so its next commit is a no-op, merges onto the node's current timeline so unmentioned fields are preserved, and REFUSES any value the node would silently coerce or reset to a blank default. Direct writes to the derived widgets are refused with a redirect, and a node found already out of sync returns its previous prompt text rather than dropping it silently (#506)
+- Bridge command dedupe: every command frame is recorded by rid + payload fingerprint, and a duplicate delivery (a bridge-timeout retry) is answered with the ORIGINAL reply instead of re-executing — a retried mutation can no longer double-apply and create duplicate nodes (#517)
+- `panel_open_workflow` stays truthful across a mid-command disconnect: outcome is correlated by rid/last_open (never inferred from `workflow_list.active`), the reload guard can no longer expire while a load is genuinely in flight (a late disk reload can't clobber an acknowledged edit), a post-NewBlankWorkflow error says "Do NOT retry" instead of inviting a second blank tab, and the modified-tracker is never re-baselined without the interaction freeze (#402, #508, #442 defect 2)
+- `panel_get_errors` verifies nested input media before reporting `missing_media`: files in input SUBFOLDERS are probed, backslash is only a separator on Windows servers (`sys.platform` — not POSIX), and a workflow switch mid-probe discards the stale verdict instead of reporting it for the wrong workflow (#513)
+- `panel_set_widget` authorizes promoted widgets on outer UUID subgraph containers through their resolved, authorized concrete inner target instead of refusing every virtual-subgraph node; genuinely unresolvable promotions still refuse (#512)
+- SFW CivitAI browsing drops model-level `nsfw: true` entries (the API returns them even with `nsfw=false`); adult-inclusive masks are unaffected (#515)
+- `panel_set_widget` shares ONE frontend-only-node allowlist between the sibling guards (MarkdownNote/Note/Reroute + rgthree types) and can write a dynamic combo whose server-side option list is empty (StarNodes Ollama "model") (#496, #507)
+- `web/js/comfyui-mcp-panel.js` carries no literal NUL bytes — the two map-key sentinels are printable `"\x00"` escapes, byte-identical at runtime, so the file diffs as text again (#510)
+
+### Changed
+- Re-vendored `tool-vocabulary.json` from comfyui-mcp 0.49.0 (169 core / 90 panel / 19 dead names, covering the bisect and snapshots/batch/apps consolidations) — the lint gate now rejects any live reference to a retired tool name (#522)
 
 ## [0.11.32] - 2026-08-01
 
