@@ -72,6 +72,18 @@ const OUR_SIGNATURE = promptSignature(OUR_OUTPUT);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Node 22's test runner exits the process early — cancelling every pending
+// test with "Promise resolution is still pending but the event loop has
+// already resolved" — when a test's pending promise depends SOLELY on UNREF'd
+// timers (the guard's verify-timeout and sentinel linger are unref'd BY DESIGN
+// so they never hold a real process's event loop; that production behavior
+// must not change). A REF'd interval keeps the loop alive for the duration of
+// an integration test; cleared in finally so it never leaks past the test.
+function keepAlive() {
+  const ka = setInterval(() => {}, 25);
+  return () => clearInterval(ka);
+}
+
 // Bodies the way the frontend's api.queuePrompt builds them.
 function frontendBody({ output = OUR_OUTPUT, number = SCOPED_QUEUE_MARK, targets = null }) {
   const body = { prompt: output, client_id: "x" };
@@ -292,128 +304,163 @@ test("#556 r3 P0-3: hard-private queueItems builds ⇒ inaccessible (caller keep
 // ---------------------------------------------------------------------------
 
 test("#556 integration: happy path — marked scoped dispatch observed, prompt_id captured, fetchApi restored", async () => {
-  const apiTarget = { fetchApi: makeServer() };
-  const prev = apiTarget.fetchApi;
-  const app = makeFrontend({ shape: "shim", apiTarget });
-  const ids = [];
-  const result = await dispatchScopedRun({
-    app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
-    onPromptId: (p) => ids.push(p),
-  });
-  assert.equal(result.outcome, "dispatched");
-  assert.deepEqual(ids, ["srv-1"]);
-  assert.equal(apiTarget.fetchApi, prev, "guard restored after observation");
-  assert.equal(app.posted.length, 1, "first arg shape worked — no retry");
-  assert.equal(app.posted[0].number, SCOPED_QUEUE_MARK, "our posts carry the queue mark");
-  assert.deepEqual(app.posted[0].partial_execution_targets, ["14"]);
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const prev = apiTarget.fetchApi;
+    const app = makeFrontend({ shape: "shim", apiTarget });
+    const ids = [];
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+      onPromptId: (p) => ids.push(p),
+    });
+    assert.equal(result.outcome, "dispatched");
+    assert.deepEqual(ids, ["srv-1"]);
+    assert.equal(apiTarget.fetchApi, prev, "guard restored after observation");
+    assert.equal(app.posted.length, 1, "first arg shape worked — no retry");
+    assert.equal(app.posted[0].number, SCOPED_QUEUE_MARK, "our posts carry the queue mark");
+    assert.deepEqual(app.posted[0].partial_execution_targets, ["14"]);
+  } finally {
+    stop();
+  }
 });
 
 test("#556 integration: a shim-less options build drops the legacy array — attempt 1 refused with ZERO dispatch, attempt 2 delivers", async () => {
-  const apiTarget = { fetchApi: makeServer() };
-  const app = makeFrontend({ shape: "shimless", apiTarget });
-  const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
-  assert.equal(result.outcome, "dispatched");
-  assert.equal(app.posted.length, 2, "both shapes attempted");
-  assert.equal(app.posted[0].partial_execution_targets, undefined, "attempt 1 (array) dropped by this build");
-  assert.equal(apiTarget.fetchApi.calls.length, 1, "only the correctly-shaped dispatch reached the server");
-  assert.deepEqual(apiTarget.fetchApi.calls[0].options.body && JSON.parse(apiTarget.fetchApi.calls[0].options.body).partial_execution_targets, ["14"]);
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeFrontend({ shape: "shimless", apiTarget });
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+    assert.equal(result.outcome, "dispatched");
+    assert.equal(app.posted.length, 2, "both shapes attempted");
+    assert.equal(app.posted[0].partial_execution_targets, undefined, "attempt 1 (array) dropped by this build");
+    assert.equal(apiTarget.fetchApi.calls.length, 1, "only the correctly-shaped dispatch reached the server");
+    assert.deepEqual(apiTarget.fetchApi.calls[0].options.body && JSON.parse(apiTarget.fetchApi.calls[0].options.body).partial_execution_targets, ["14"]);
+  } finally {
+    stop();
+  }
 });
 
 test("#556 integration: a build honoring NEITHER shape ⇒ truthful refusal, ZERO dispatches", async () => {
-  const apiTarget = { fetchApi: makeServer() };
-  const app = makeFrontend({ shape: "positional", apiTarget });
-  // positional honors the array… force neither by overriding queuePrompt to always drop targets
-  app.queuePrompt = async (number, batch) => {
-    const body = frontendBody({ output: OUR_OUTPUT, number, targets: null });
-    app.posted.push(body);
-    await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
-    return true;
-  };
-  const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
-  assert.equal(result.outcome, "refused");
-  assert.match(result.error, /node 14/);
-  assert.match(result.error, /Nothing was queued/);
-  assert.equal(apiTarget.fetchApi.calls.length, 0, "no full-graph prompt ever left the tab");
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeFrontend({ shape: "positional", apiTarget });
+    // positional honors the array… force neither by overriding queuePrompt to always drop targets
+    app.queuePrompt = async (number, batch) => {
+      const body = frontendBody({ output: OUR_OUTPUT, number, targets: null });
+      app.posted.push(body);
+      await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+      return true;
+    };
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+    assert.equal(result.outcome, "refused");
+    assert.match(result.error, /node 14/);
+    assert.match(result.error, /Nothing was queued/);
+    assert.equal(apiTarget.fetchApi.calls.length, 0, "no full-graph prompt ever left the tab");
+  } finally {
+    stop();
+  }
 });
 
 test("#556 r3 P0-1 integration: THE SENTINEL ACTUALLY INSTALLS — after a give-up timeout, api.fetchApi is STILL the guard and refuses the late scope-dropped post with zero dispatch", async () => {
-  const apiTarget = { fetchApi: makeServer() };
-  const prev = apiTarget.fetchApi;
-  // Busy SHIM-LESS frontend (drops the legacy array ⇒ the deferred item has no
-  // scope), and queueItems NOT accessible (hard-private build) ⇒ cancel impossible.
-  const app = makeFrontend({ shape: "shimless", defer: true, apiTarget });
-  delete app.queueItems;
-  const result = await dispatchScopedRun({
-    app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
-    verifyTimeoutMs: 50, lingerMs: 120,
-  });
-  assert.equal(result.outcome, "unverified");
-  assert.match(result.error, /sentinel/);
-  assert.notEqual(apiTarget.fetchApi, prev, "the sentinel guard is STILL installed after the run returned");
-  // The deferred item finally posts — through the sentinel — scope dropped.
-  const res = await app.postDeferred(app.deferredItem);
-  assert.equal(res.status, 400, "the sentinel refuses the late scope-dropped dispatch");
-  assert.equal(prev.calls.length, 0, "no full-graph dispatch escapes — even after the timeout");
-  // …and the sentinel self-removes at the long bound.
-  await sleep(160);
-  assert.equal(apiTarget.fetchApi, prev, "sentinel self-removes at the linger bound");
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const prev = apiTarget.fetchApi;
+    // Busy SHIM-LESS frontend (drops the legacy array ⇒ the deferred item has no
+    // scope), and queueItems NOT accessible (hard-private build) ⇒ cancel impossible.
+    const app = makeFrontend({ shape: "shimless", defer: true, apiTarget });
+    delete app.queueItems;
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+      verifyTimeoutMs: 50, lingerMs: 120,
+    });
+    assert.equal(result.outcome, "unverified");
+    assert.match(result.error, /sentinel/);
+    assert.notEqual(apiTarget.fetchApi, prev, "the sentinel guard is STILL installed after the run returned");
+    // The deferred item finally posts — through the sentinel — scope dropped.
+    const res = await app.postDeferred(app.deferredItem);
+    assert.equal(res.status, 400, "the sentinel refuses the late scope-dropped dispatch");
+    assert.equal(prev.calls.length, 0, "no full-graph dispatch escapes — even after the timeout");
+    // …and the sentinel self-removes at the long bound.
+    await sleep(160);
+    assert.equal(apiTarget.fetchApi, prev, "sentinel self-removes at the linger bound");
+  } finally {
+    stop();
+  }
 });
 
 test("#556 r3 P0-3 integration: timeout CANCELS our tagged pending item (assert the removal) — guard restored, no sentinel", async () => {
-  const apiTarget = { fetchApi: makeServer() };
-  const prev = apiTarget.fetchApi;
-  const app = makeFrontend({ shape: "shim", defer: true, apiTarget });
-  // A foreign identical-scope item also pending — must survive.
-  app.queueItems.push({ number: 0, batchCount: 1, queueNodeIds: ["14"] });
-  const result = await dispatchScopedRun({
-    app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
-    verifyTimeoutMs: 50, lingerMs: 1000,
-  });
-  assert.equal(result.outcome, "unverified");
-  assert.match(result.error, /REMOVED/);
-  assert.equal(app.queueItems.length, 1, "ONLY our tagged item was removed");
-  assert.deepEqual(app.queueItems[0].queueNodeIds, ["14"]);
-  assert.equal(apiTarget.fetchApi, prev, "guard restored — no sentinel needed after a successful cancel");
-  assert.equal(apiTarget.fetchApi.calls.length, 0, "nothing was ever dispatched");
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const prev = apiTarget.fetchApi;
+    const app = makeFrontend({ shape: "shim", defer: true, apiTarget });
+    // A foreign identical-scope item also pending — must survive.
+    app.queueItems.push({ number: 0, batchCount: 1, queueNodeIds: ["14"] });
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+      verifyTimeoutMs: 50, lingerMs: 1000,
+    });
+    assert.equal(result.outcome, "unverified");
+    assert.match(result.error, /REMOVED/);
+    assert.equal(app.queueItems.length, 1, "ONLY our tagged item was removed");
+    assert.deepEqual(app.queueItems[0].queueNodeIds, ["14"]);
+    assert.equal(apiTarget.fetchApi, prev, "guard restored — no sentinel needed after a successful cancel");
+    assert.equal(apiTarget.fetchApi.calls.length, 0, "nothing was ever dispatched");
+  } finally {
+    stop();
+  }
 });
 
 test("#556 r3 P0-2 integration: degraded mode FAILS CLOSED — graphToPrompt failure refuses BEFORE queuePrompt (never 'dispatch and hope')", async () => {
-  const apiTarget = { fetchApi: makeServer() };
-  const app = makeFrontend({ shape: "shim", apiTarget, failGraphToPrompt: true });
-  let queuePromptCalled = false;
-  const origQP = app.queuePrompt;
-  app.queuePrompt = async (...a) => { queuePromptCalled = true; return origQP(...a); };
-  const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
-  assert.equal(result.outcome, "unverifiable");
-  assert.match(result.error, /cannot be dispatched safely/);
-  assert.equal(queuePromptCalled, false, "queuePrompt is never called without a signature");
-  assert.equal(apiTarget.fetchApi.calls.length, 0, "nothing dispatched — the failure is closed, not open");
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeFrontend({ shape: "shim", apiTarget, failGraphToPrompt: true });
+    let queuePromptCalled = false;
+    const origQP = app.queuePrompt;
+    app.queuePrompt = async (...a) => { queuePromptCalled = true; return origQP(...a); };
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+    assert.equal(result.outcome, "unverifiable");
+    assert.match(result.error, /cannot be dispatched safely/);
+    assert.equal(queuePromptCalled, false, "queuePrompt is never called without a signature");
+    assert.equal(apiTarget.fetchApi.calls.length, 0, "nothing dispatched — the failure is closed, not open");
+  } finally {
+    stop();
+  }
 });
 
 test("#556 r3 P0-3 integration: foreign traffic during our window is untouched — same-graph user full run + identical-scope foreign scoped run; only OUR marked post is observed and captured", async () => {
-  const server = makeServer();
-  const apiTarget = { fetchApi: server };
-  const app = makeFrontend({ shape: "shim", defer: true, apiTarget });
-  const ids = [];
-  const promise = dispatchScopedRun({
-    app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
-    verifyTimeoutMs: 500, lingerMs: 1000,
-    onPromptId: (p) => ids.push(p),
-  });
-  await sleep(20); // guard is installed, waiting for observation
-  // A user queues a full run of the SAME graph (UI: number=0 ⇒ unmarked).
-  const userRes = await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(frontendBody({ number: 0, targets: null })) });
-  assert.equal(userRes.status, 200, "the user's run is dispatched normally");
-  // A foreign scoped run with the SAME targets (also unmarked).
-  const foreignRes = await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(frontendBody({ number: 0, targets: ["14"] })) });
-  assert.equal(foreignRes.status, 200);
-  assert.equal(server.calls.length, 2, "both foreign posts dispatched untouched");
-  // Now OUR deferred item posts (marked, scoped) — observed.
-  await app.postDeferred(app.deferredItem);
-  const result = await promise;
-  assert.equal(result.outcome, "dispatched");
-  assert.deepEqual(ids, ["srv-3"], "only OUR prompt_id was captured (srv-1/2 were the foreign posts)");
-  assert.equal(server.calls.length, 3);
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "shim", defer: true, apiTarget });
+    const ids = [];
+    const promise = dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+      verifyTimeoutMs: 500, lingerMs: 1000,
+      onPromptId: (p) => ids.push(p),
+    });
+    await sleep(20); // guard is installed, waiting for observation
+    // A user queues a full run of the SAME graph (UI: number=0 ⇒ unmarked).
+    const userRes = await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(frontendBody({ number: 0, targets: null })) });
+    assert.equal(userRes.status, 200, "the user's run is dispatched normally");
+    // A foreign scoped run with the SAME targets (also unmarked).
+    const foreignRes = await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(frontendBody({ number: 0, targets: ["14"] })) });
+    assert.equal(foreignRes.status, 200);
+    assert.equal(server.calls.length, 2, "both foreign posts dispatched untouched");
+    // Now OUR deferred item posts (marked, scoped) — observed.
+    await app.postDeferred(app.deferredItem);
+    const result = await promise;
+    assert.equal(result.outcome, "dispatched");
+    assert.deepEqual(ids, ["srv-3"], "only OUR prompt_id was captured (srv-1/2 were the foreign posts)");
+    assert.equal(server.calls.length, 3);
+  } finally {
+    stop();
+  }
 });
 
 // ---------------------------------------------------------------------------
