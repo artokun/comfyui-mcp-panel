@@ -22,7 +22,7 @@ function methodSource(name, args) {
 const createSource = methodSource("graph_create_subgraph", "\\{ node_ids \\}");
 const groupSource = methodSource("graph_subgraph_group", "\\{ group \\}");
 const setWidgetSource = methodSource("async graph_set_widget", "\\{ node_id, widget, value \\}");
-const cleanupMatch = panelSrc.match(/function clearStaleRedFlag\(node, \{ app, graph, rootGraph \}\) \{[\s\S]*?\n\}\n\n\/\*\*/);
+const cleanupMatch = panelSrc.match(/function clearStaleRedFlag\(node, \{ app, graph, rootGraph \}\) \{[\s\S]*?\n\}\r?\n\r?\n\/\*\*/);
 assert.ok(cleanupMatch, "could not locate clearStaleRedFlag in panel source");
 const cleanupSource = cleanupMatch[0].replace(/\n\/\*\*$/, "");
 
