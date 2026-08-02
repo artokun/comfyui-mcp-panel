@@ -10337,6 +10337,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // The bridge THIS socket belongs to (stamped at creation), not the mutable current
     // `url` — after setUrl the two can differ while the old socket is still closing.
     const targetUrl = target?.__cmcpBridgeUrl ?? url;
+    // #694 — the orchestrator SESSION this socket belongs to (stamped from its models
+    // handshake), so a restart at the same URL never inherits its predecessor's journal.
+    const targetEpoch = target?.__cmcpBridgeEpoch;
     let sent = 0;
     let dropped = 0;
     const keep = [];
@@ -10347,14 +10350,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // not a recovery. Such an entry is also meaningless there — its rid is unknown — so
       // it is dropped rather than carried forever. (Sensitive results are additionally
       // redacted at journal time and never travel at all.)
-      // Replayable = SAME bridge AND recent enough (codex). A bridge is identified by its
-      // URL, and URL equality is ENDPOINT identity, not SESSION identity — a newly started
-      // orchestrator on the same address looks exactly like the old one reconnecting, which
-      // is the very case replay exists to serve. Proving session continuity needs a
-      // server-issued connection epoch in the handshake (an orchestrator-side follow-up), so
-      // until then the exposure is bounded: sensitive results never enter the journal at
-      // all, this runs only AFTER a real handshake, and stale entries age out here.
-      if (!isReplayable(entry, { now: Date.now(), targetUrl })) {
+      // Replayable = SAME bridge AND SAME session AND recent enough (codex, #694).
+      // A bridge is identified by its URL, and URL equality is ENDPOINT identity,
+      // not SESSION identity — a newly started orchestrator on the same address
+      // looks exactly like the old one reconnecting, which is the very case replay
+      // exists to serve. Session continuity is now PROVEN by the server-issued
+      // epoch on the models handshake (#694): a restart mints a fresh epoch, so a
+      // predecessor session's entry fails the check and is dropped. A legacy
+      // orchestrator sends no epoch — absent on both sides compares equal, and
+      // the residual bounds below are exactly the pre-epoch ones: sensitive
+      // results never enter the journal at all, this runs only AFTER a real
+      // handshake, and stale entries age out here.
+      if (!isReplayable(entry, { now: Date.now(), targetUrl, targetEpoch })) {
         dropped++;
         continue;
       }
@@ -10503,6 +10510,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           // Stamp the bridge this outcome belongs to so a replay can never cross it. THIS
           // socket's url, never the mutable current one (codex).
           url: socketUrl,
+          // #694 — …and the orchestrator SESSION (the models-handshake epoch stamped
+          // on THIS socket), so a replay can never cross a RESTART at the same URL
+          // either. Absent on a legacy orchestrator — recorded as absent, which
+          // compares equal to an epoch-less target and replays exactly as before.
+          epoch: thisSock.__cmcpBridgeEpoch,
         }),
       );
       return false;
@@ -10572,8 +10584,20 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // execution is still in flight) on THIS socket — no second executor
         // run, no second activity card — while a rid reused for DIFFERENT work
         // falls through and executes fresh (logged once by the ledger).
+        // #694 — the orchestrator never REUSES a rid (#683/#687): a timed-out
+        // command is retried under a FRESH rid plus `retry_of` naming the
+        // original. `retry_of` is excluded from the fingerprint, so the retry
+        // fingerprints identically and is answered from the ORIGINAL's ledger
+        // entry (settled reply or in-flight promise — the await below handles
+        // both). An unknown/evicted retry_of misses and falls through to
+        // begin + execute fresh — the ledger fails open, never closed.
         const fingerprint = commandFingerprint(msg);
-        const priorRidReply = commandRidLedger.get(msg.rid, fingerprint);
+        let priorRidReply = commandRidLedger.get(msg.rid, fingerprint);
+        let retryOfHit = false;
+        if (priorRidReply === undefined && typeof msg.retry_of === "string") {
+          priorRidReply = commandRidLedger.get(msg.retry_of, fingerprint);
+          retryOfHit = priorRidReply !== undefined;
+        }
         if (priorRidReply !== undefined) {
           let dupReply;
           try {
@@ -10582,8 +10606,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             return; // ledger promises never reject — defensive only
           }
           if (!isActive()) return; // superseded socket — ignore its late frames
+          // Rid REWRITE on a retry hit (#694): the ledger reply is correlated
+          // to the ORIGINAL rid, but the orchestrator's pending map is waiting
+          // on the retry's fresh rid — answer under THAT rid or the retry
+          // still times out.
+          const outReply = retryOfHit ? { ...dupReply, rid: msg.rid } : dupReply;
           try {
-            if (thisSock.readyState === WebSocket.OPEN) thisSock.send(JSON.stringify(dupReply));
+            if (thisSock.readyState === WebSocket.OPEN) thisSock.send(JSON.stringify(outReply));
           } catch {
             // Socket died between receive and reply — agent side times out.
           }
@@ -10904,6 +10933,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // orchestrator HANDSHAKE — receiving it proves a real panel agent is behind
       // the socket, so it's the moment we truthfully flip to "connected".
       if (msg && msg.type === "models" && Array.isArray(msg.models)) {
+        // #694 — stamp the orchestrator's SESSION epoch BEFORE markConnected()
+        // fires the lost-reply replay: isReplayable compares each journaled
+        // entry's epoch against THIS socket's, so an orchestrator RESTART (which
+        // mints a fresh epoch) drops its predecessor's journal instead of
+        // replaying another session's replies into it. A legacy orchestrator
+        // sends no epoch — undefined on both sides compares equal, preserving
+        // the pre-epoch behaviour exactly.
+        try {
+          thisSock.__cmcpBridgeEpoch = msg.epoch;
+        } catch {
+          /* exotic WebSocket impl — epoch matching stays absent/absent */
+        }
         markConnected();
         onModels?.(
           msg.models,
@@ -11064,6 +11105,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             lostReplies: lostReplies.summaries({
               now: Date.now(),
               targetUrl: sock?.__cmcpBridgeUrl ?? url,
+              // #694 — the SAME session rule as the replay: an orchestrator that
+              // restarted (new handshake epoch) learns nothing about its
+              // predecessor's lost outcomes.
+              targetEpoch: sock?.__cmcpBridgeEpoch,
             }),
           }),
         ),

@@ -131,7 +131,7 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
      *  it can be re-sent verbatim on the next socket: rids are random UUIDs, so an
      *  orchestrator that no longer knows the rid simply drops it, and one that still has
      *  the command pending resolves it with its TRUE outcome. */
-    record({ reply, cmd, reason, at = 0, url } = {}) {
+    record({ reply, cmd, reason, at = 0, url, epoch } = {}) {
       if (!reply || typeof reply !== "object" || typeof reply.rid !== "string") return null;
       const safe = redactSensitiveReply(reply, cmd);
       const entry = {
@@ -146,6 +146,13 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
         // switch or a Bridge-URL change the next socket is a different orchestrator, and
         // volunteering another session's result to it is a leak, not a recovery (codex).
         url: typeof url === "string" && url ? url : null,
+        // #694 — the orchestrator SESSION this outcome belongs to (the epoch stamped on
+        // the models handshake). URL equality is only ENDPOINT identity: a restarted
+        // orchestrator at the same address mints a fresh epoch, and its predecessor's
+        // journal must never replay into the new session. A legacy orchestrator sends
+        // no epoch — absent here and absent on the target socket compare EQUAL, which
+        // preserves the pre-epoch (URL-only) behaviour exactly.
+        epoch: typeof epoch === "string" || typeof epoch === "number" ? epoch : undefined,
         redacted: safe !== reply,
         reply: safe,
       };
@@ -160,12 +167,14 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
     /** Wire summaries — the raw `reply` payload is NOT included (it can be large, and for
      *  a sensitive command it is exactly what must not travel).
      *
-     *  Pass `{ now, targetUrl }` to apply the SAME cross-bridge/age rule the replay uses
-     *  (codex): the summaries ride the hello, so without this a bridge that never owned
-     *  these commands would still learn their ids, names and outcomes even though the
-     *  replies themselves are correctly withheld. */
-    summaries({ now, targetUrl } = {}) {
-      const visible = targetUrl ? entries.filter((e) => isReplayable(e, { now, targetUrl })) : entries;
+     *  Pass `{ now, targetUrl, targetEpoch }` to apply the SAME cross-bridge/session/age
+     *  rule the replay uses (codex, #694): the summaries ride the hello, so without this
+     *  a bridge that never owned these commands would still learn their ids, names and
+     *  outcomes even though the replies themselves are correctly withheld. */
+    summaries({ now, targetUrl, targetEpoch } = {}) {
+      const visible = targetUrl
+        ? entries.filter((e) => isReplayable(e, { now, targetUrl, targetEpoch }))
+        : entries;
       return visible.map(({ rid, cmd, ok, reason, at }) => ({ rid, cmd, ok, reason, at }));
     },
     /** Take everything and empty the journal (used when replaying onto a new socket, so
@@ -192,35 +201,37 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
  * reconnect happen in seconds; anything older almost certainly belongs to an orchestrator
  * that is gone.
  *
- * This bounds a residual the panel cannot fully close on its own (codex): a bridge is
- * identified by its URL, and URL equality is ENDPOINT identity, not SESSION identity — a
- * newly started orchestrator listening at the same address is indistinguishable from the
- * same one reconnecting, which is precisely the case replay exists to serve. Proving
- * session continuity needs a server-issued connection epoch in the handshake, i.e. an
- * orchestrator-side change (tracked as a follow-up). Until then the exposure is bounded
- * four ways: sensitive results never enter the journal at all; replay goes ONLY to the
- * exact socket instance that completed a handshake; entries age out here; and the window
- * is deliberately tight — a drop, reconnect and handshake take a couple of seconds, so 20s
+ * Session continuity is proven by the server-issued epoch on the models handshake
+ * (#694): an orchestrator RESTART mints a fresh epoch, so a predecessor session's
+ * journal entries fail isReplayable and are dropped rather than replayed into the new
+ * session at the same address. The age bound here remains the backstop for a LEGACY
+ * orchestrator that sends no epoch (absent on both sides compares equal — URL-only
+ * matching, exactly the pre-epoch behaviour), bounding that residual four ways:
+ * sensitive results never enter the journal at all; replay goes ONLY to the exact
+ * socket instance that completed a handshake; entries age out here; and the window is
+ * deliberately tight — a drop, reconnect and handshake take a couple of seconds, so 20s
  * is generous for the case this serves while leaving little room for an orchestrator to
  * restart and re-bind inside it.
- *
- * The residual, stated plainly: if the orchestrator restarts on the SAME address within
- * this window, its successor can receive one non-sensitive result belonging to the previous
- * session. It cannot resolve any of its own commands with it (rids are random UUIDs) and it
- * cannot double-apply anything (a reply is not a command). Closing the residual entirely
- * requires the handshake epoch above; discarding on unprovable continuity instead would
- * discard the ordinary reconnect too, which is the whole case this exists to serve.
  */
 export const REPLAY_MAX_AGE_MS = 20000;
 
 /**
  * May this journaled outcome be replayed onto a socket for `targetUrl` right now?
- * Requires the SAME bridge and a recent enough entry. An entry with no recorded bridge is
- * refused: unattributable outcomes are never volunteered.
+ * Requires the SAME bridge, the SAME orchestrator session (#694 — entry.epoch must
+ * equal the target socket's handshake epoch; both absent compares equal, so a legacy
+ * epoch-less orchestrator keeps the pre-epoch URL-only behaviour) and a recent enough
+ * entry. An entry with no recorded bridge is refused: unattributable outcomes are
+ * never volunteered.
  */
-export function isReplayable(entry, { now = 0, targetUrl = null, maxAgeMs = REPLAY_MAX_AGE_MS } = {}) {
+export function isReplayable(entry, { now = 0, targetUrl = null, targetEpoch, maxAgeMs = REPLAY_MAX_AGE_MS } = {}) {
   if (!entry) return false;
   if (!entry.url || !targetUrl || entry.url !== targetUrl) return false;
+  // #694 — SESSION identity on top of endpoint identity: an orchestrator that
+  // restarted at the same URL handshakes with a FRESH epoch, so its predecessor's
+  // entries must not replay into it. One-sided presence (an epoch'd entry vs an
+  // epoch-less target, or vice versa) fails CLOSED — that pairing can never prove
+  // session continuity.
+  if (entry.epoch !== targetEpoch) return false;
   const age = Number.isFinite(now) && Number.isFinite(entry.at) ? now - entry.at : null;
   if (age === null) return false;
   const limit = Number.isFinite(maxAgeMs) && maxAgeMs > 0 ? maxAgeMs : REPLAY_MAX_AGE_MS;

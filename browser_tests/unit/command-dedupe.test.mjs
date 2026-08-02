@@ -11,8 +11,19 @@
 // The dedupe identity is rid + payload fingerprint: the bridge's re-dispatch of
 // the SAME logical command dedupes, but a rid reused for DIFFERENT work must
 // execute fresh (never answered from the ledger) and is logged once.
+//
+// #694: the orchestrator never REUSES a rid (#683/#687) — a timed-out command is
+// retried under a FRESH rid plus `retry_of` naming the original. `retry_of` is
+// excluded from the fingerprint, so the retry dedupes against the ORIGINAL's
+// ledger entry (settled or still in flight) and is answered with the rid
+// rewritten to the retry's — never a second execution. An unknown retry_of
+// misses and executes fresh (fail-open), and a genuinely fresh command with
+// identical args (no retry_of) executes again as it should.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
 import { commandFingerprint, createCommandDedupeLedger } from "../../web/js/lib/command-dedupe.js";
 
@@ -23,6 +34,37 @@ function makeDispatch(ledger, executor) {
     const prior = ledger.get(msg.rid, commandFingerprint(msg));
     if (prior !== undefined) return { reply: await prior, executed: false };
     const settle = ledger.begin(msg.rid, commandFingerprint(msg));
+    let reply;
+    try {
+      reply = { rid: msg.rid, ok: true, result: await executor(msg) };
+    } catch (err) {
+      reply = { rid: msg.rid, ok: false, error: String(err?.message ?? err) };
+    }
+    settle(reply);
+    return { reply, executed: true };
+  };
+}
+
+// #694 — the SAME stand-in EXTENDED with the panel's retry path: a retry carries
+// a FRESH rid plus `retry_of` naming the original (the orchestrator never reuses
+// rids, #683/#687). A miss on the retry's own rid falls back to the original's
+// ledger entry; a hit there is answered with the rid REWRITTEN to the retry's
+// (the orchestrator's pending map waits on the fresh rid). An unknown retry_of
+// misses too and falls through to begin + execute fresh — the ledger fails open.
+function makeRetryDispatch(ledger, executor) {
+  return async function deliver(msg) {
+    const fingerprint = commandFingerprint(msg);
+    let prior = ledger.get(msg.rid, fingerprint);
+    let retryOfHit = false;
+    if (prior === undefined && typeof msg.retry_of === "string") {
+      prior = ledger.get(msg.retry_of, fingerprint);
+      retryOfHit = prior !== undefined;
+    }
+    if (prior !== undefined) {
+      const reply = await prior;
+      return { reply: retryOfHit ? { ...reply, rid: msg.rid } : reply, executed: false };
+    }
+    const settle = ledger.begin(msg.rid, fingerprint);
     let reply;
     try {
       reply = { rid: msg.rid, ok: true, result: await executor(msg) };
@@ -236,4 +278,122 @@ test("a past-cap in-flight burst is swept back to the cap as entries settle (#51
   assert.notEqual(ledger.get("r200", "fp200"), undefined, "newest settled entry is kept");
   assert.notEqual(ledger.get("r-live", "fp-live"), undefined, "the in-flight entry is never evicted");
   settleLive({ rid: "r-live", ok: true, result: {} });
+});
+
+// --- #694: retry under a FRESH rid + retry_of (the orchestrator never reuses rids) ---
+
+test("the fingerprint excludes retry_of — a retry fingerprints identically to its original (#694)", () => {
+  const original = { rid: "r1", cmd: "graph_add_node", class_type: "X", pos: [1, 2], workflow_uuid: "wfA" };
+  const retry = { rid: "r2", retry_of: "r1", cmd: "graph_add_node", class_type: "X", pos: [1, 2], workflow_uuid: "wfA" };
+  assert.equal(commandFingerprint(retry), commandFingerprint(original));
+  // …and a fresh command with identical args but NO retry_of shares that fingerprint
+  // (it is still distinguished by its rid — see the executes-again test below).
+  const fresh = { rid: "r3", cmd: "graph_add_node", class_type: "X", pos: [1, 2], workflow_uuid: "wfA" };
+  assert.equal(commandFingerprint(fresh), commandFingerprint(original));
+});
+
+test("a retry of a SETTLED command gets the ORIGINAL reply with the rid REWRITTEN — the executor never re-runs (#694)", async () => {
+  const ledger = createCommandDedupeLedger();
+  let applied = 0;
+  const deliver = makeRetryDispatch(ledger, async () => ({ added: { id: ++applied } }));
+
+  const first = await deliver({ rid: "r1", cmd: "graph_add_node", workflow_uuid: "wfA" });
+  assert.equal(first.executed, true);
+  assert.equal(applied, 1);
+
+  const retry = await deliver({ rid: "r2", retry_of: "r1", cmd: "graph_add_node", workflow_uuid: "wfA" });
+  assert.equal(retry.executed, false, "the retry is answered from the ledger, not executed again");
+  assert.equal(applied, 1, "the mutation is still applied exactly once — no duplicate node");
+  assert.equal(retry.reply.rid, "r2", "the reply is correlated to the RETRY's rid, not the original's");
+  assert.deepEqual(
+    { ...retry.reply, rid: "r1" },
+    first.reply,
+    "…and is otherwise the ORIGINAL reply verbatim",
+  );
+});
+
+test("a retry of an IN-FLIGHT command awaits the first execution and shares its result (#694)", async () => {
+  const ledger = createCommandDedupeLedger();
+  let applied = 0;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const deliver = makeRetryDispatch(ledger, async () => {
+    await gate; // still applying when the retry arrives (the timed-out-then-retried window)
+    return { added: { id: ++applied } };
+  });
+
+  const p1 = deliver({ rid: "r1", cmd: "graph_add_node" });
+  const p2 = deliver({ rid: "r2", retry_of: "r1", cmd: "graph_add_node" });
+  release();
+  const [first, retry] = await Promise.all([p1, p2]);
+  assert.equal(applied, 1, "one execution even when the retry lands mid-apply");
+  assert.equal(retry.executed, false);
+  assert.equal(retry.reply.rid, "r2", "the awaited reply is rewritten to the retry's rid");
+  assert.deepEqual({ ...retry.reply, rid: "r1" }, first.reply, "both resolve to the same outcome");
+});
+
+test("a retry naming an UNKNOWN retry_of executes fresh — the ledger fails open (#694)", async () => {
+  const ledger = createCommandDedupeLedger();
+  let applied = 0;
+  const deliver = makeRetryDispatch(ledger, async () => ({ added: { id: ++applied } }));
+
+  const retry = await deliver({ rid: "r2", retry_of: "r-unknown", cmd: "graph_add_node" });
+  assert.equal(retry.executed, true, "an unknown/evicted retry token can never SUPPRESS execution");
+  assert.equal(retry.reply.rid, "r2");
+  assert.equal(applied, 1);
+});
+
+test("a genuinely FRESH command with identical args after a settled one EXECUTES again (#694)", async () => {
+  const ledger = createCommandDedupeLedger();
+  let applied = 0;
+  const deliver = makeRetryDispatch(ledger, async () => ({ added: { id: ++applied } }));
+
+  const first = await deliver({ rid: "r1", cmd: "graph_add_node", pos: [0, 0] });
+  const fresh = await deliver({ rid: "r2", cmd: "graph_add_node", pos: [0, 0] }); // same args, NO retry_of
+  assert.equal(first.executed, true);
+  assert.equal(fresh.executed, true, "identical args without retry_of is a NEW command — it must run");
+  assert.equal(applied, 2, "the user really did ask for two identical nodes");
+});
+
+test("a same-rid verbatim replay is still answered with the UNREWITTEN original reply (#521 unchanged)", async () => {
+  const ledger = createCommandDedupeLedger();
+  let applied = 0;
+  const deliver = makeRetryDispatch(ledger, async () => ({ added: { id: ++applied } }));
+
+  const first = await deliver({ rid: "r1", cmd: "graph_add_node" });
+  const replay = await deliver({ rid: "r1", cmd: "graph_add_node" }); // no retry_of — the #521 replay
+  assert.equal(replay.executed, false);
+  assert.equal(applied, 1);
+  assert.equal(replay.reply, first.reply, "same-rid replay returns the original reply object verbatim");
+});
+
+test("#694 wiring: the panel handler falls back to retry_of and REWRITES the rid on a retry hit", () => {
+  const HERE = dirname(fileURLToPath(import.meta.url));
+  const src = readFileSync(join(HERE, "../../web/js/comfyui-mcp-panel.js"), "utf8");
+  // The dedupe block: a miss on the frame's own rid must consult retry_of BEFORE
+  // falling through to begin + execute.
+  const fpAt = src.indexOf("const fingerprint = commandFingerprint(msg);");
+  assert.notEqual(fpAt, -1, "the command handler must fingerprint the frame");
+  const block = src.slice(fpAt, fpAt + 2400);
+  assert.match(
+    block,
+    /let priorRidReply = commandRidLedger\.get\(msg\.rid, fingerprint\);/,
+    "the frame's own rid is consulted first",
+  );
+  assert.match(
+    block,
+    /if \(priorRidReply === undefined && typeof msg\.retry_of === "string"\) \{\s*priorRidReply = commandRidLedger\.get\(msg\.retry_of, fingerprint\);/,
+    "a retry misses on its fresh rid, then looks up the ORIGINAL rid it names",
+  );
+  assert.match(
+    block,
+    /\{ \.\.\.dupReply, rid: msg\.rid \}/,
+    "a retry hit is answered with the rid REWRITTEN to the retry's fresh rid",
+  );
+  // The rewrite must sit on the dedupe-reply path, BEFORE the reply is sent.
+  const rewriteAt = block.indexOf("{ ...dupReply, rid: msg.rid }");
+  const sendAt = block.indexOf("thisSock.send(");
+  assert.ok(rewriteAt !== -1 && sendAt !== -1 && rewriteAt < sendAt, "the rewrite precedes the reply write");
+  // begin() must still key the retry's OWN rid when every lookup missed (fail-open).
+  assert.match(block, /commandRidLedger\.begin\(msg\.rid, fingerprint\);/);
 });
