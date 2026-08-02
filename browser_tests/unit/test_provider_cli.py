@@ -127,6 +127,29 @@ class ProviderCliGuiPath(unittest.TestCase):
             else:
                 mod.environ["COMFYUI_MCP_PI_PATH"] = old_override
 
+    def test_pi_requires_positive_auth_before_reporting_ready(self):
+        # #491: a found pi binary with no locally observed credential must stay
+        # unready until the MCP's authoritative provider probe arrives. This is a
+        # state-policy test, not a duplicate parser for pi's auth/models files.
+        old_pi_installed = mod._pi_installed
+        old_provider_auth = mod._provider_auth
+        mod._pi_installed = lambda: True
+        try:
+            mod._provider_auth = lambda provider: None
+            self.assertEqual(
+                mod._provider_state("pi"),
+                {"cli": True, "auth": None, "ready": False},
+            )
+            # Preserve the positive path for an observed local auth record.
+            mod._provider_auth = lambda provider: True
+            self.assertEqual(
+                mod._provider_state("pi"),
+                {"cli": True, "auth": True, "ready": True},
+            )
+        finally:
+            mod._pi_installed = old_pi_installed
+            mod._provider_auth = old_provider_auth
+
     def test_provider_state_ready_when_cli_in_fallback_and_auth_present(self):
         # End-to-end: cli found via fallback + ~/.codex/auth.json present => ready.
         self._install("codex")

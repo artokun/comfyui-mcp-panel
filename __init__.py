@@ -280,7 +280,8 @@ def _provider_state(provider):
     """Per-provider readiness for the panel onboarding flow. `ready` = CLI on
     PATH AND a login exists; `cli`/`auth` are reported separately so the panel
     can tell 'install the CLI' apart from 'sign in'; `auth` is null when unknown
-    (macOS Keychain), and unknown-with-cli still counts as ready."""
+    (macOS Keychain). Unknown-with-cli normally counts as ready, except pi: its
+    multi-provider credential sources need the orchestrator's authoritative probe."""
     if provider == "ollama":
         cli = _ollama_installed()
     elif provider == "antigravity":
@@ -290,7 +291,12 @@ def _provider_state(provider):
     else:
         cli = _provider_cli(provider)
     auth = _provider_auth(provider)
-    ready = bool(cli and auth is not False)
+    # Unlike Keychain-backed subscriptions, pi's local `auth is None` means no
+    # credential source was positively observed. Do not preempt the MCP's stricter
+    # auth.json/models.json/env validation with a green panel state; a later bridge
+    # readiness frame remains authoritative. A present local auth record can still
+    # provide an optimistic ready state until that frame arrives.
+    ready = bool(cli and (auth is True if provider == "pi" else auth is not False))
     return {"cli": cli, "auth": auth, "ready": ready}
 
 
