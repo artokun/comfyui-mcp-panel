@@ -605,10 +605,13 @@ export class CivitaiClient {
     return { items, nextCursor: useIdCursor ? String(lastRawId) : String(next) };
   }
 
-  async fetchModels({ type, sort = "Most Downloaded", period = "Week", baseModels = [], levels = [1], limit = 100, cursor, query, username } = {}) {
+  async fetchModels({ type, sort = "Most Downloaded", period = null, baseModels = [], levels = [1], limit = 100, cursor, query, username } = {}) {
     const base = new URLSearchParams({
       limit: String(limit), types: type,
-      sort: normalizeModelSort(sort), period: normalizePeriod(period), // #459: clamp to enum
+      // A keyword search must not silently narrow itself to the last week:
+      // CivitAI intersects query with period, so use AllTime unless the caller
+      // explicitly selected a period in the UI.
+      sort: normalizeModelSort(sort), period: normalizePeriod(period || (query ? "AllTime" : "Week")), // #459: clamp to enum
       nsfw: bitmask(levels) > 2 ? "true" : "false",
     });
     for (const b of baseModels) base.append("baseModels", b);
@@ -621,9 +624,9 @@ export class CivitaiClient {
     const kw = clientFilter ? String(query).toLowerCase() : null;
     let next = cursor || null;
     let models = [];
-    // Exactly ONE request on every path except keyword×creator, whose
-    // client-side matching can empty a page — that combo (and ONLY that
-    // combo) chases a few more pages so a thinned page isn't a dead end.
+    // An empty page with a cursor is not the end of a search: /v1/models can
+    // thin pages server-side, and keyword×creator additionally filters them
+    // client-side. Chase a bounded number of continuable empty pages.
     for (let hop = 0; ; hop++) {
       const q = new URLSearchParams(base);
       if (next) q.set("cursor", next);
@@ -633,7 +636,7 @@ export class CivitaiClient {
         .filter(Boolean);
       if (kw) models = models.filter((m) => (m.name || "").toLowerCase().includes(kw));
       next = data.metadata?.nextCursor || null;
-      if (!clientFilter || models.length || !next || hop >= 4) break;
+      if (models.length || !next || hop >= 4) break;
     }
     return { models, nextCursor: next };
   }

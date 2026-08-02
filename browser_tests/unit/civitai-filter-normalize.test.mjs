@@ -69,6 +69,20 @@ test("fetchModels never dispatches an invalid model sort/period (the #459 400)",
   assert.equal(u.searchParams.get("period"), "Week"); // clamped, not "Forever"
 });
 
+test("fetchModels defaults a keyword search to AllTime but honors an explicit period", async () => {
+  const { client, calls } = captureClient();
+  await client.fetchModels({ type: "LORA", query: "game asset" });
+  assert.equal(new URL(calls[0]).searchParams.get("period"), "AllTime");
+
+  calls.length = 0;
+  await client.fetchModels({ type: "LORA", query: "game asset", period: "Month" });
+  assert.equal(new URL(calls[0]).searchParams.get("period"), "Month");
+
+  calls.length = 0;
+  await client.fetchModels({ type: "LORA" });
+  assert.equal(new URL(calls[0]).searchParams.get("period"), "Week");
+});
+
 test("fetchFeed never dispatches an invalid image sort/period", async () => {
   const { client, calls } = captureClient();
   await client.fetchFeed({ type: "image", sort: "Most Downloaded", period: "Nope" });

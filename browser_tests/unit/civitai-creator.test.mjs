@@ -76,25 +76,27 @@ test("fetchModels QUIRK: query+username sends only username, filters keyword cli
   assert.equal(calls.length, 1); // matched on page one — no chase
 });
 
-test("fetchModels default path is ONE request — even on an empty page with a cursor", async () => {
-  // no creator filter → no page-chasing, identical to pre-creator behavior
+test("fetchModels chases continuable empty pages on every path", async () => {
   const empty = { items: [], metadata: { nextCursor: "c2" } };
   {
-    const { client, calls } = stub(empty);
+    const { client, calls } = stub([empty, { items: [modelItem("Found")], metadata: {} }]);
     const page = await client.fetchModels({ type: "LORA" });
-    assert.equal(calls.length, 1);
-    assert.equal(page.nextCursor, "c2");
+    assert.equal(calls.length, 2);
+    assert.equal(new URL(calls[1].url).searchParams.get("cursor"), "c2");
+    assert.deepEqual(page.models.map((m) => m.name), ["Found"]);
   }
   {
-    const { client, calls } = stub(empty);
-    await client.fetchModels({ type: "LORA", query: "anime" }); // keyword only
-    assert.equal(calls.length, 1);
+    const { client, calls } = stub([empty, { items: [modelItem("Anime Style")], metadata: {} }]);
+    const page = await client.fetchModels({ type: "LORA", query: "anime" });
+    assert.equal(calls.length, 2);
     assert.equal(new URL(calls[0].url).searchParams.get("query"), "anime");
+    assert.deepEqual(page.models.map((m) => m.name), ["Anime Style"]);
   }
   {
-    const { client, calls } = stub(empty);
-    await client.fetchModels({ type: "LORA", username: "artist" }); // creator only
-    assert.equal(calls.length, 1);
+    const { client, calls } = stub([empty, { items: [modelItem("Found")], metadata: {} }]);
+    const page = await client.fetchModels({ type: "LORA", username: "artist" });
+    assert.equal(calls.length, 2);
+    assert.deepEqual(page.models.map((m) => m.name), ["Found"]);
   }
 });
 
@@ -110,12 +112,12 @@ test("fetchModels keyword×creator chases past client-side-emptied pages", async
   assert.equal(page.nextCursor, "c3"); // resumes AFTER the matched page
 });
 
-test("fetchModels keyword×creator chase is capped (initial + 4 hops)", async () => {
+test("fetchModels empty-page chase is capped (initial + 4 hops)", async () => {
   const { client, calls } = stub({
-    items: [modelItem("Realism Pack")], // never matches "anime"
+    items: [],
     metadata: { nextCursor: "again" },
   });
-  const page = await client.fetchModels({ type: "LORA", query: "anime", username: "artist" });
+  const page = await client.fetchModels({ type: "LORA", query: "anime" });
   assert.equal(calls.length, 5);
   assert.deepEqual(page.models, []);
   assert.equal(page.nextCursor, "again"); // caller can keep going explicitly
