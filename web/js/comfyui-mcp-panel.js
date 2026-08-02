@@ -256,7 +256,7 @@ import {
   graphReadBindingChanged,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
-import { queuePromptScopeArgs, createRunFetchInterceptor, createScopedRunGuard, promptSignature, scopeUnverifiedError } from "./lib/run-scope-guard.js";
+import { queuePromptScopeArgs, createRunFetchInterceptor, createScopedRunGuard, promptSignature, scopeUnverifiedError, cancelPendingScopedQueueItem } from "./lib/run-scope-guard.js";
 import { queueMembership, historyEntryFor } from "./lib/history-reconcile.js";
 import {
   normalizeModels,
@@ -7883,11 +7883,16 @@ const GRAPH_TOOL_EXECUTORS = {
       // we keep the guard installed waiting for OUR dispatch to surface. The
       // pending item is popped LIFO, so it normally surfaces in well under this.
       const SCOPED_DISPATCH_VERIFY_TIMEOUT_MS = 5000;
+      // When the pending item can't be cancelled on timeout, the guard stays
+      // installed this much longer as a sentinel — a late scope-dropped
+      // dispatch is still refused whenever it posts.
+      const SCOPED_DISPATCH_LINGER_MS = 10 * 60 * 1000;
       let scopeDropped = null;
       for (const scopeArg of queuePromptScopeArgs(partialTargets)) {
         scopeDropped = null;
         promptRejection = null;
         queuedPromptIds.length = 0;
+        let keepGuardInstalled = false;
         const guard = createScopedRunGuard({
           origFetchApi,
           execIds: partialTargets,
@@ -7908,7 +7913,7 @@ const GRAPH_TOOL_EXECUTORS = {
             await guard.waitForVerdict(SCOPED_DISPATCH_VERIFY_TIMEOUT_MS);
           }
         } finally {
-          api.fetchApi = prevFetchApi;
+          if (!keepGuardInstalled) api.fetchApi = prevFetchApi;
         }
         // Verifiably dispatched with our scope — proceed to the ledger/verdict.
         if (guard.state.observed > 0) {
@@ -7922,14 +7927,40 @@ const GRAPH_TOOL_EXECUTORS = {
           scopeDropped = guard.state.dropped;
           continue;
         }
-        // Nothing surfaced. A deferred dispatch may still land later but can
-        // no longer be attributed/verified — report a truthful UNVERIFIED
-        // outcome, never queued:true (#556).
+        // Nothing surfaced — but the deferred item may STILL be live in the
+        // frontend's pending queue, and restoring the guard would let its
+        // scope-dropped dispatch escape later. Try to REMOVE the pending item
+        // (the server-side /queue never saw it — it never posted). When that's
+        // impossible (some builds hard-privatize queueItems, and a
+        // scope-dropped item may carry no attributable targets to match), keep
+        // the surgical guard installed as a sentinel until the long bound
+        // expires, then report the truthful unverified outcome — never
+        // queued:true (#556).
+        const cancel = cancelPendingScopedQueueItem(app, partialTargets);
+        if (cancel.removed > 0) {
+          return {
+            queued: false,
+            error: scopeUnverifiedError({
+              toNodeId: to_node_id,
+              timeoutMs: SCOPED_DISPATCH_VERIFY_TIMEOUT_MS,
+              cancelled: true,
+            }),
+          };
+        }
+        keepGuardInstalled = true;
+        setTimeout(() => {
+          // Self-remove only if nothing newer has wrapped over the sentinel —
+          // a guard left underneath a newer wrap is inert (surgical + budgeted)
+          // and simply remains in the chain.
+          if (api.fetchApi === guard) api.fetchApi = prevFetchApi;
+        }, SCOPED_DISPATCH_LINGER_MS);
         return {
           queued: false,
           error: scopeUnverifiedError({
             toNodeId: to_node_id,
             timeoutMs: SCOPED_DISPATCH_VERIFY_TIMEOUT_MS,
+            cancelled: false,
+            lingerMs: SCOPED_DISPATCH_LINGER_MS,
           }),
         };
       }

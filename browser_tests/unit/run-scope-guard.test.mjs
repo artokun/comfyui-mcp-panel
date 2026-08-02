@@ -28,6 +28,7 @@ import {
   scopeUnverifiedError,
   createRunFetchInterceptor,
   createScopedRunGuard,
+  cancelPendingScopedQueueItem,
 } from "../../web/js/lib/run-scope-guard.js";
 import { resolveRunToNodeTarget } from "../../web/js/lib/subgraph-scope.js";
 
@@ -125,12 +126,15 @@ test("#556 scopeDroppedError: names the node and states NOTHING was queued", () 
 });
 
 test("#556 scopeUnverifiedError: truthful — nothing CONFIRMED queued, never claims a scoped run happened", () => {
-  const msg = scopeUnverifiedError({ toNodeId: 14, timeoutMs: 5000 });
-  assert.match(msg, /node 14/);
-  assert.match(msg, /could not be verified/);
-  assert.match(msg, /CONFIRMED queued/i);
-  assert.doesNotMatch(msg, /queued:\s*true/);
-  assert.doesNotMatch(msg, /Nothing was queued/, "a deferred post may still land — must not claim otherwise");
+  const lingering = scopeUnverifiedError({ toNodeId: 14, timeoutMs: 5000, cancelled: false, lingerMs: 600000 });
+  assert.match(lingering, /node 14/);
+  assert.match(lingering, /could not be verified/);
+  assert.match(lingering, /CONFIRMED queued/i);
+  assert.match(lingering, /sentinel/, "says the guard stays installed when cancellation was impossible");
+  assert.doesNotMatch(lingering, /Nothing was queued/, "a deferred post may still land — must not claim otherwise");
+  const cancelled = scopeUnverifiedError({ toNodeId: 14, timeoutMs: 5000, cancelled: true });
+  assert.match(cancelled, /REMOVED/);
+  assert.match(cancelled, /nothing was queued/i, "after a successful cancel, 'nothing was queued' is literally true");
 });
 
 // ---------------------------------------------------------------------------
@@ -230,19 +234,60 @@ test("#556 P1: an UNRELATED full run (different signature) during the window pas
   assert.equal(guard.state.dropped, null);
 });
 
-test("#556 P1: an unrelated SCOPED run (someone else's targets) passes through untouched", async () => {
+test("#556 P1: an unrelated SCOPED run (foreign signature, its own targets) passes through untouched", async () => {
   const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "other-scoped" }));
   let captured = null;
   const guard = createScopedRunGuard({
     origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
     onPromptId: (p) => (captured = p),
   });
-  const body = { prompt: OUR_OUTPUT, client_id: "x", partial_execution_targets: ["9"] };
+  const body = { prompt: { "1": { class_type: "LoadImage" }, "2": { class_type: "PreviewImage" } }, client_id: "x", partial_execution_targets: ["2"] };
   const res = await guard(...promptPost(body));
   assert.equal(spy.calls.length, 1);
   assert.equal(res.status, 200);
   assert.equal(captured, null, "another scope's prompt_id is never claimed as ours");
   assert.equal(guard.state.observed, 0);
+});
+
+test("#556 r2 P0-1: OUR signature with WRONG/EXTRA/PARTIAL targets is OUR corrupted dispatch — REFUSED with zero dispatch (not forwarded as 'someone else's')", async () => {
+  for (const badTargets of [["14", "9"], ["9"], ["14", "76:34"]]) {
+    const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "must-never-happen" }));
+    let dropped = null;
+    const guard = createScopedRunGuard({
+      origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
+      onScopeDropped: (m) => (dropped = m),
+    });
+    const body = { prompt: OUR_OUTPUT, client_id: "x", partial_execution_targets: badTargets };
+    const res = await guard(...promptPost(body));
+    assert.equal(spy.calls.length, 0, `targets ${JSON.stringify(badTargets)} must never leave the tab`);
+    assert.equal(res.status, 400);
+    assert.match(dropped, /node 14/);
+    assert.match(dropped, /instead of/, "scope_mismatch names what the body carried");
+    assert.equal(guard.state.observed, 0, "a corrupted dispatch never counts as observed");
+  }
+});
+
+test("#556 r2 P0-2: a FOREIGN post carrying the SAME targets does NOT satisfy observation — our deferred corrupted post is still refused afterwards", async () => {
+  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "foreign-pid" }));
+  let captured = null;
+  const guard = createScopedRunGuard({
+    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
+    onPromptId: (p) => (captured = p),
+  });
+  // Another workflow whose prompt ALSO carries ["14"] but has a different node set.
+  const foreign = { prompt: { "14": { class_type: "SaveImage" }, "2": { class_type: "LoadImage" } }, client_id: "x", partial_execution_targets: ["14"] };
+  const foreignRes = await guard(...promptPost(foreign));
+  assert.equal(spy.calls.length, 1, "the foreign scoped run passes through");
+  assert.equal(foreignRes.status, 200);
+  assert.equal(guard.state.observed, 0, "same targets + different signature is NOT our dispatch");
+  assert.equal(captured, null, "its prompt_id is never claimed as ours");
+  // graph_run would still be waiting (observed==0) — and when OUR deferred
+  // corrupted post finally surfaces, the guard is still there to refuse it.
+  assert.equal(guard.state.dropped, null);
+  const spy2 = spy;
+  const res = await guard(...promptPost(OUR_FULL_BODY));
+  assert.equal(res.status, 400, "our scope-dropped dispatch is still refused");
+  assert.equal(spy2.calls.length, 1, "and never dispatches");
 });
 
 test("#556 P1: refusal is bounded by the batch — a same-signature full body BEYOND our batch count passes through", async () => {
@@ -308,10 +353,46 @@ test("#556 P0 TIMEOUT: nothing surfaces within the window ⇒ waitForVerdict fal
   assert.equal(guard.state.observed, 0);
   assert.equal(guard.state.dropped, null);
   assert.equal(spy.calls.length, 0);
-  // This is exactly the condition graph_run maps to scopeUnverifiedError:
-  // a truthful "could not verify — nothing confirmed queued", not queued:true.
-  const msg = scopeUnverifiedError({ toNodeId: 14, timeoutMs: 5000 });
-  assert.match(msg, /could not be verified/);
+});
+
+test("#556 r2 P0-3: timeout CANCELS our still-pending queue item — the deferred scope-dropped dispatch can never execute", () => {
+  // The frontend's pending list holds OUR deferred item (targets stored in
+  // either shape) plus a user's targetless full-run item and a foreign scoped
+  // item — only ours may be removed.
+  const ourItemArray = { number: 0, batchCount: 1, queueNodeIds: ["14"] };
+  const ourItemOptions = { number: 0, batchCount: 1, queueNodeIds: { queueNodeIds: ["14"] } };
+  const userFullRun = { number: 0, batchCount: 1, queueNodeIds: undefined };
+  const foreignScoped = { number: 0, batchCount: 1, queueNodeIds: ["9"] };
+  const app = { queueItems: [userFullRun, ourItemArray, foreignScoped, ourItemOptions] };
+  const res = cancelPendingScopedQueueItem(app, ["14"]);
+  assert.equal(res.accessible, true);
+  assert.equal(res.removed, 2, "both of our pending items are removed, in either stored shape");
+  assert.deepEqual(app.queueItems, [userFullRun, foreignScoped], "foreign items are never touched");
+});
+
+test("#556 r2 P0-3: cancellation is impossible on builds that hard-privatize queueItems ⇒ reported inaccessible (caller keeps the sentinel guard)", () => {
+  const res = cancelPendingScopedQueueItem({}, ["14"]);
+  assert.deepEqual(res, { accessible: false, removed: 0 });
+  assert.deepEqual(cancelPendingScopedQueueItem(null, ["14"]), { accessible: false, removed: 0 });
+});
+
+test("#556 r2 P0-3 SENTINEL: when cancellation failed, the guard (never restored) still refuses the late scope-dropped dispatch — zero dispatch post-timeout", async () => {
+  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "must-never-happen" }));
+  let dropped = null;
+  const guard = createScopedRunGuard({
+    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
+    onScopeDropped: (m) => (dropped = m),
+  });
+  // The give-up path: timeout expired, cancelPendingScopedQueueItem removed
+  // nothing, so graph_run leaves THIS guard installed and returns unverified.
+  const seen = await guard.waitForVerdict(50);
+  assert.equal(seen, false, "timed out unverified");
+  // …the deferred item finally posts, well after the run returned.
+  await sleep(20);
+  const res = await guard(...promptPost(OUR_FULL_BODY));
+  assert.equal(res.status, 400, "the sentinel still refuses the scope-dropped dispatch");
+  assert.equal(spy.calls.length, 0, "no full-graph dispatch ever escapes — even after the timeout");
+  assert.match(dropped, /node 14/);
 });
 
 // ---------------------------------------------------------------------------
