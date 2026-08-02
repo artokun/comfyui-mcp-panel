@@ -57,8 +57,21 @@ function makeRetryDispatch(ledger, executor) {
     let prior = ledger.get(msg.rid, fingerprint);
     let retryOfHit = false;
     if (prior === undefined && typeof msg.retry_of === "string") {
-      prior = ledger.get(msg.retry_of, fingerprint);
-      retryOfHit = prior !== undefined;
+      const retryLookup = ledger.lookupRetry(msg.retry_of, fingerprint);
+      if (retryLookup.status === "mismatch") {
+        return {
+          reply: {
+            rid: msg.rid,
+            ok: false,
+            error: "Retry rejected: retry_of refers to a different command or workflow.",
+          },
+          executed: false,
+        };
+      }
+      if (retryLookup.status === "match") {
+        prior = retryLookup.reply;
+        retryOfHit = true;
+      }
     }
     if (prior !== undefined) {
       const reply = await prior;
@@ -343,6 +356,43 @@ test("a retry naming an UNKNOWN retry_of executes fresh — the ledger fails ope
   assert.equal(applied, 1);
 });
 
+test("a retry naming an EVICTED retry_of also executes fresh (#543)", async () => {
+  const ledger = createCommandDedupeLedger(1);
+  const executedRids = [];
+  const deliver = makeRetryDispatch(ledger, async (msg) => {
+    executedRids.push(msg.rid);
+    return { appliedTo: msg.workflow_uuid };
+  });
+
+  await deliver({ rid: "r1", cmd: "graph_set_title", title: "A", workflow_uuid: "wfA" });
+  await deliver({ rid: "r-fill", cmd: "graph_set_title", title: "fill", workflow_uuid: "wfA" });
+  const retry = await deliver({ rid: "r2", retry_of: "r1", cmd: "graph_set_title", title: "B", workflow_uuid: "wfB" });
+
+  assert.equal(retry.executed, true, "an evicted retry token retains fail-open behaviour");
+  assert.deepEqual(executedRids, ["r1", "r-fill", "r2"]);
+});
+
+test("a retained retry_of with another workflow fingerprint is rejected before it executes (#543)", async () => {
+  const ledger = createCommandDedupeLedger();
+  const executedWorkflows = [];
+  const deliver = makeRetryDispatch(ledger, async (msg) => {
+    executedWorkflows.push(msg.workflow_uuid);
+    return { appliedTo: msg.workflow_uuid };
+  });
+
+  // r1 applied to workflow A, but the orchestrator timed out before seeing its
+  // reply. It switches to workflow B, then retries r1 under r2. The retained
+  // token proves this is not an unknown/evicted fail-open case.
+  const first = await deliver({ rid: "r1", cmd: "graph_set_title", title: "A", workflow_uuid: "wfA" });
+  assert.equal(first.executed, true);
+  const retry = await deliver({ rid: "r2", retry_of: "r1", cmd: "graph_set_title", title: "B", workflow_uuid: "wfB" });
+
+  assert.equal(retry.executed, false, "the cross-workflow retry is stopped before the executor");
+  assert.equal(retry.reply.ok, false);
+  assert.match(retry.reply.error, /retry_of.*different command or workflow/i);
+  assert.deepEqual(executedWorkflows, ["wfA"], "workflow B never receives r2");
+});
+
 test("a genuinely FRESH command with identical args after a settled one EXECUTES again (#694)", async () => {
   const ledger = createCommandDedupeLedger();
   let applied = 0;
@@ -382,9 +432,11 @@ test("#694 wiring: the panel handler falls back to retry_of and REWRITES the rid
   );
   assert.match(
     block,
-    /if \(priorRidReply === undefined && typeof msg\.retry_of === "string"\) \{\s*priorRidReply = commandRidLedger\.get\(msg\.retry_of, fingerprint\);/,
-    "a retry misses on its fresh rid, then looks up the ORIGINAL rid it names",
+    /const retryLookup = commandRidLedger\.lookupRetry\(msg\.retry_of, fingerprint\);/,
+    "a retry misses on its fresh rid, then distinguishes the ORIGINAL token's state",
   );
+  assert.match(block, /if \(retryLookup\.status === "mismatch"\)/, "a retained mismatched retry token is rejected");
+  assert.match(block, /error: "Retry rejected: retry_of refers to a different command or workflow\."/, "the mismatch produces a truthful retry error");
   assert.match(
     block,
     /\{ \.\.\.dupReply, rid: msg\.rid \}/,
@@ -392,8 +444,11 @@ test("#694 wiring: the panel handler falls back to retry_of and REWRITES the rid
   );
   // The rewrite must sit on the dedupe-reply path, BEFORE the reply is sent.
   const rewriteAt = block.indexOf("{ ...dupReply, rid: msg.rid }");
-  const sendAt = block.indexOf("thisSock.send(");
+  const sendAt = block.indexOf("thisSock.send(", rewriteAt);
   assert.ok(rewriteAt !== -1 && sendAt !== -1 && rewriteAt < sendAt, "the rewrite precedes the reply write");
-  // begin() must still key the retry's OWN rid when every lookup missed (fail-open).
+  // begin() must still key the retry's OWN rid when the token was unknown/evicted (fail-open).
   assert.match(block, /commandRidLedger\.begin\(msg\.rid, fingerprint\);/);
+  const rejectAt = block.indexOf('retryLookup.status === "mismatch"');
+  const beginAt = block.indexOf("commandRidLedger.begin(msg.rid, fingerprint)");
+  assert.ok(rejectAt !== -1 && beginAt !== -1 && rejectAt < beginAt, "mismatched retries return before begin + execute");
 });

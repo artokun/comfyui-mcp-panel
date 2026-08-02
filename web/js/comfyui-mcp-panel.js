@@ -10807,13 +10807,34 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // fingerprints identically and is answered from the ORIGINAL's ledger
         // entry (settled reply or in-flight promise — the await below handles
         // both). An unknown/evicted retry_of misses and falls through to
-        // begin + execute fresh — the ledger fails open, never closed.
+        // begin + execute fresh — the ledger fails open. A RETAINED retry_of
+        // for a different fingerprint, however, is rejected before execution:
+        // executing it would apply the old command's retry to the active,
+        // wrong workflow.
         const fingerprint = commandFingerprint(msg);
         let priorRidReply = commandRidLedger.get(msg.rid, fingerprint);
         let retryOfHit = false;
         if (priorRidReply === undefined && typeof msg.retry_of === "string") {
-          priorRidReply = commandRidLedger.get(msg.retry_of, fingerprint);
-          retryOfHit = priorRidReply !== undefined;
+          const retryLookup = commandRidLedger.lookupRetry(msg.retry_of, fingerprint);
+          if (retryLookup.status === "mismatch") {
+            if (!isActive()) return; // superseded socket — ignore its late frames
+            try {
+              if (thisSock.readyState === WebSocket.OPEN) {
+                thisSock.send(JSON.stringify({
+                  rid: msg.rid,
+                  ok: false,
+                  error: "Retry rejected: retry_of refers to a different command or workflow.",
+                }));
+              }
+            } catch {
+              // Socket died between receive and reply — agent side times out.
+            }
+            return;
+          }
+          if (retryLookup.status === "match") {
+            priorRidReply = retryLookup.reply;
+            retryOfHit = true;
+          }
         }
         if (priorRidReply !== undefined) {
           let dupReply;
