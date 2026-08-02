@@ -318,21 +318,54 @@ test("MID-TYPING: the live editor wins over a timeline_data widget lagging by th
   assert.equal(res.replaced_out_of_band, undefined);
 });
 
-test("MID-TYPING: an explicit segments write that DISCARDS in-flight text says so", () => {
-  // Replacing `segments` is the caller's stated intent, so it is applied — but the prompt text
-  // the user had typed and not yet committed is handed back rather than vanishing silently.
+test("MID-TYPING: an explicit segments write that would DISCARD in-flight text FAILS CLOSED", () => {
+  // The review finding: a push with explicit segments landing inside the 120 ms debounce
+  // DETECTED the newer editor text (the filter makes the editor authoritative), then reported
+  // success anyway and overwrote every widget AND the editor — the user's in-progress edit
+  // survived only as a result-envelope disclosure. Silent loss is the bug; a loud conflict is
+  // the contract. No non-guessing merge of two conflicting segment lists exists, so the write
+  // is REFUSED with both states disclosed per segment and NOTHING mutated.
   const { node, widgets, editor } = makeRelayNode();
   editor.timeline.segments[0].prompt = "user was typing this";
   widgets.local_prompts.value = derivePromptRelayWidgets(editor.timeline.segments).local_prompts;
+  const timelineBefore = widgets.timeline_data.value;
+  const editorTimelineBefore = editor.timeline;
 
+  const order = [];
+  assert.throws(
+    () =>
+      applyPromptRelayTimelineWrite(node, { segments: [seg("agent set", 20)] }, {
+        beforeChange: () => order.push("before"),
+        afterChange: () => order.push("after"),
+        setDirty: () => order.push("dirty"),
+      }),
+    (err) => {
+      assert.ok(err instanceof PromptRelayTimelineWriteError);
+      assert.match(err.message, /UNCOMMITTED timeline edit/);
+      // BOTH states are disclosed PER SEGMENT — the in-flight edit and the supplied segments.
+      assert.ok(
+        err.message.includes('"user was typing this","b"'),
+        "editor copy missing from the refusal",
+      );
+      assert.ok(err.message.includes('"agent set"'), "supplied segments missing from the refusal");
+      return true;
+    },
+  );
+  // ZERO mutation — not the widgets, not the editor, not the undo history. The edit SURVIVES.
+  assert.equal(widgets.timeline_data.value, timelineBefore);
+  assert.equal(widgets.local_prompts.value, "user was typing this | b");
+  assert.equal(widgets.segment_lengths.value, "24, 36");
+  assert.equal(editor.timeline, editorTimelineBefore);
+  assert.deepEqual(editor.timeline.segments.map((s) => s.prompt), ["user was typing this", "b"]);
+  assert.deepEqual(order, []);
+
+  // The remedy the refusal documents: once the debounce has settled (the editor's commit has
+  // reached timeline_data, so the node's two records agree), the very same write succeeds as
+  // an ordinary one — no livelock.
+  widgets.timeline_data.value = JSON.stringify(editor.timeline);
   const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("agent set", 20)] }));
-  assert.equal(res.merge_base, "editor");
-  // Handed back PER SEGMENT, not as the lossy join, so the caller can actually restore it.
-  assert.deepEqual(res.overwrote_uncommitted_edit, {
-    prompts: ["user was typing this", "b"],
-    lengths: [24, 36],
-  });
-  assert.ok(res.warnings.some((w) => w.includes("UNCOMMITTED timeline edit")));
+  assert.equal(res.reconciled, true);
+  assert.equal(res.overwrote_uncommitted_edit, undefined);
   assert.equal(widgets.local_prompts.value, "agent set");
 });
 
@@ -413,41 +446,85 @@ test("a PERSISTED #506 stale-master state discloses the timeline_data prompts it
   assert.equal(editor.timeline.zoom, 4);
 });
 
-test("a write that reproduces the timeline_data prompts reports no supersede", () => {
+test("a write reproducing timeline_data while the editor holds the current text FAILS CLOSED — then converges", () => {
+  // The persisted #506 state: a raw write put "wanted" into timeline_data but it never reached
+  // the editor, so the editor still holds (and the node still executes) "a | b". Re-asserting
+  // the master's prompts through this route would DISCARD the text the node would run right
+  // now — structurally identical to a mid-debounce edit, so the same fail-closed rule applies:
+  // the filter cannot tell "editor holds an in-flight edit" from "master holds an out-of-band
+  // raw write", and unknown is never treated as safe. The documented remedy then converges the
+  // node deterministically: first write the editor's disclosed segments verbatim (nothing is
+  // discarded, so it applies), after which the intended write is an ordinary one.
   const { node, widgets } = makeRelayNode();
   widgets.timeline_data.value = JSON.stringify({ segments: [seg("wanted", 24)] });
+  const timelineBefore = widgets.timeline_data.value;
+
+  assert.throws(
+    () => applyPromptRelayTimelineWrite(node, { segments: [seg("wanted", 24)] }),
+    (err) => {
+      assert.ok(err instanceof PromptRelayTimelineWriteError);
+      assert.match(err.message, /UNCOMMITTED timeline edit/);
+      assert.ok(err.message.includes('"a","b"'), "editor copy missing from the refusal");
+      assert.ok(err.message.includes('"wanted"'), "supplied segments missing from the refusal");
+      return true;
+    },
+  );
+  // Nothing moved: the master still holds the raw write, the editor still holds what executes.
+  assert.equal(widgets.timeline_data.value, timelineBefore);
+  assert.equal(widgets.local_prompts.value, "a | b");
+
+  // Remedy, step 1: converge the node's two records onto the editor's current text. The write
+  // reproduces the editor's segments, so nothing is discarded and it applies — disclosing the
+  // out-of-band master copy it sets aside.
+  const converge = relay(
+    applyPromptRelayTimelineWrite(node, { segments: [seg("a", 24), seg("b", 36)] }),
+  );
+  assert.equal(converge.reconciled, true);
+  assert.deepEqual(converge.superseded_timeline_data, { prompts: ["wanted"], lengths: [24] });
+  // Remedy, step 2: with the records agreeing, the intended write is ordinary — no conflict,
+  // no disclosures.
   const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("wanted", 24)] }));
+  assert.equal(res.merge_base, "timeline_data");
   assert.equal(res.superseded_timeline_data, undefined);
-  // The editor's own copy IS discarded by this write, and that is still disclosed.
-  assert.deepEqual(res.overwrote_uncommitted_edit, { prompts: ["a", "b"], lengths: [24, 36] });
+  assert.equal(res.overwrote_uncommitted_edit, undefined);
   assert.equal(widgets.local_prompts.value, "wanted");
 });
 
 // ─── The lossy " | " join must never gate a data-loss disclosure ───
 
-test("PIPE COLLISION: an overwrite is disclosed even when the joined local_prompts is IDENTICAL", () => {
+test("PIPE COLLISION: an overwrite is REFUSED even when the joined local_prompts is IDENTICAL", () => {
   // The exact hazard the join hides. Persisted timeline is ["old", "c"]. During the 120ms
   // debounce the user types segment 0 as the perfectly valid prompt "a | b", so the live editor
   // holds ["a | b", "c"] and local_prompts is already "a | b | c". An incoming write supplies
   // ["a", "b | c"] with the same lengths — a COMPLETELY different segmentation that joins to the
-  // SAME string. Gating on the join would report a clean success while the user's single
-  // authored prompt "a | b" was silently split into two different segment prompts.
+  // SAME string. The detection is STRUCTURAL, never the join: the editor is provably current
+  // and the supplied segments do not reproduce it, so the write is REFUSED and the user's
+  // single authored prompt "a | b" is not silently split into two different segment prompts.
   const { node, widgets, editor } = makeRelayNode({
     timelineSegments: [seg("old", 24), seg("c", 36)],
   });
   editor.timeline.segments[0].prompt = "a | b";
   widgets.local_prompts.value = "a | b | c";
   widgets.segment_lengths.value = "24, 36";
+  const timelineBefore = widgets.timeline_data.value;
 
-  const res = relay(
-    applyPromptRelayTimelineWrite(node, { segments: [seg("a", 24), seg("b | c", 36)] }),
+  assert.throws(
+    () => applyPromptRelayTimelineWrite(node, { segments: [seg("a", 24), seg("b | c", 36)] }),
+    (err) => {
+      assert.ok(err instanceof PromptRelayTimelineWriteError);
+      assert.match(err.message, /UNCOMMITTED timeline edit/);
+      // Same join on both sides — the ONLY thing that distinguishes them is the segment
+      // structure, and BOTH structures are disclosed per segment.
+      assert.ok(err.message.includes('"a | b","c"'), "editor copy missing from the refusal");
+      assert.ok(err.message.includes('"a","b | c"'), "supplied segments missing from the refusal");
+      return true;
+    },
   );
-
-  // Same join on both sides — the ONLY thing that distinguishes them is the segment structure.
-  assert.equal(res.local_prompts, "a | b | c");
-  assert.equal(derivePromptRelayWidgets(editor.timeline.segments).local_prompts, res.local_prompts);
-  assert.deepEqual(res.overwrote_uncommitted_edit, { prompts: ["a | b", "c"], lengths: [24, 36] });
-  assert.ok(res.warnings.some((w) => w.includes("UNCOMMITTED timeline edit")));
+  // Nothing mutated: the in-flight edit survives byte-for-byte.
+  assert.equal(widgets.timeline_data.value, timelineBefore);
+  assert.equal(widgets.local_prompts.value, "a | b | c");
+  assert.equal(widgets.segment_lengths.value, "24, 36");
+  assert.deepEqual(editor.timeline.segments.map((s) => s.prompt), ["a | b", "c"]);
 });
 
 test("PIPE COLLISION mirror: genuinely identical segments report NO overwrite", () => {
@@ -469,19 +546,32 @@ test("PIPE COLLISION mirror: genuinely identical segments report NO overwrite", 
   assert.deepEqual(res.superseded_timeline_data, { prompts: ["old", "c"], lengths: [24, 36] });
 });
 
-test("PIPE COLLISION: a length-only change is disclosed despite identical prompt joins", () => {
+test("PIPE COLLISION: a length-only change to in-flight text is REFUSED despite identical prompt joins", () => {
+  // Reproducing the in-flight PROMPTS is not reproducing the in-flight CONTENT: the supplied
+  // segments change the user's first segment from 24 to 90 frames, so the write still discards
+  // the editor's current content and fails closed.
   const { node, widgets, editor } = makeRelayNode({
     timelineSegments: [seg("old", 24), seg("c", 36)],
   });
   editor.timeline.segments[0].prompt = "a | b";
   widgets.local_prompts.value = "a | b | c";
   widgets.segment_lengths.value = "24, 36";
+  const timelineBefore = widgets.timeline_data.value;
 
-  const res = relay(
-    applyPromptRelayTimelineWrite(node, { segments: [seg("a | b", 90), seg("c", 36)] }),
+  assert.throws(
+    () => applyPromptRelayTimelineWrite(node, { segments: [seg("a | b", 90), seg("c", 36)] }),
+    (err) => {
+      assert.ok(err instanceof PromptRelayTimelineWriteError);
+      assert.match(err.message, /UNCOMMITTED timeline edit/);
+      // Prompts match on both sides; the LENGTHS are what conflicts — and both lists disclose them.
+      assert.ok(err.message.includes('"a | b","c"'));
+      assert.ok(err.message.includes("(lengths [24,36])"), "editor lengths missing from the refusal");
+      assert.ok(err.message.includes("(lengths [90,36])"), "supplied lengths missing from the refusal");
+      return true;
+    },
   );
-  assert.equal(res.local_prompts, "a | b | c");
-  assert.deepEqual(res.overwrote_uncommitted_edit, { prompts: ["a | b", "c"], lengths: [24, 36] });
+  assert.equal(widgets.timeline_data.value, timelineBefore);
+  assert.deepEqual(editor.timeline.segments.map((s) => s.length), [24, 36]);
 });
 
 test("PIPE COLLISION: a metadata-only overlay on an unresolvable tie FAILS CLOSED", () => {
@@ -595,18 +685,31 @@ test("sameSegmentContent compares structurally, never through the join", () => {
   assert.equal(sameSegmentContent([{ prompt: "", length: 1 }], [{ length: 1 }]), false);
 });
 
-test("MID-TYPING: a pending debounce commit AFTER our write is a no-op (no rollback)", () => {
+test("MID-TYPING: after a REFUSED push, the editor's pending debounce commit lands normally", () => {
+  // The old contract applied the push and re-hydrated the editor so its pending commit became
+  // a no-op — at the cost of the in-flight text. The new contract refuses the push, so the
+  // pending commit is not a no-op: it is the whole point. The user's text commits to
+  // timeline_data exactly as if the push had never arrived.
   const { node, widgets, editor } = makeRelayNode();
   editor.timeline.segments[0].prompt = "in flight";
   widgets.local_prompts.value = derivePromptRelayWidgets(editor.timeline.segments).local_prompts;
-  applyPromptRelayTimelineWrite(node, { segments: [seg("agent set", 20)] });
-  // Replay the pack's commit() → syncWidgetsFromTimeline against the re-hydrated editor.
-  const before = { ...widgets.timeline_data, ...widgets.local_prompts };
-  const segs = editor.timeline.segments;
-  assert.equal(JSON.stringify(editor.timeline), widgets.timeline_data.value);
-  assert.equal(segs.map((s) => s.prompt).join(" | "), widgets.local_prompts.value);
-  assert.equal(segs.map((s) => s.length).join(", "), widgets.segment_lengths.value);
-  assert.ok(before);
+  assert.throws(
+    () => applyPromptRelayTimelineWrite(node, { segments: [seg("agent set", 20)] }),
+    PromptRelayTimelineWriteError,
+  );
+  // Replay the pack's commit() → syncWidgetsFromTimeline against the UNTOUCHED editor: the
+  // in-flight text becomes the persisted state, undisturbed by the refused write.
+  widgets.timeline_data.value = JSON.stringify(editor.timeline);
+  const d = derivePromptRelayWidgets(editor.timeline.segments);
+  widgets.local_prompts.value = d.local_prompts;
+  widgets.segment_lengths.value = d.segment_lengths;
+  assert.equal(widgets.local_prompts.value, "in flight | b");
+  assert.deepEqual(JSON.parse(widgets.timeline_data.value).segments.map((s) => s.prompt), [
+    "in flight",
+    "b",
+  ]);
+  // …and the same push, re-issued after the settle, is an ordinary write (see the FAILS CLOSED
+  // test above for the full remedy path).
 });
 
 test("POST-LOAD: a stale editor is rejected even when its derived strings COLLIDE with the widgets", () => {

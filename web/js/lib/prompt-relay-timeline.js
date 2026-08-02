@@ -46,10 +46,19 @@
 // node is found ALREADY desynced (out-of-band `local_prompts` text that no timeline produces —
 // e.g. written with the #506 workaround), the pre-existing value is RETURNED in the result
 // envelope before being replaced, so no prompt text ever disappears without the caller being
-// told — as is an UNCOMMITTED edit the user was still typing when the write landed
-// (`overwrote_uncommitted_edit`) and a timeline_data copy that lost to the editor
-// (`superseded_timeline_data`). Which name a discarded copy gets depends on WHICH branch settled
-// authority and, for a copy the derived-widget filter rejected, on the PRE-LOAD SNAPSHOT: the
+// told — as is a timeline_data copy that lost to the editor (`superseded_timeline_data`) and an
+// editor copy set aside while it was NOT the proven-current record (`overwrote_uncommitted_edit`
+// when timeline_data is unreadable and the editor holds the only copy; `discarded_stale_editor` /
+// `discarded_unverified_editor_copy` when the filter rejected it). The one state that is REFUSED
+// rather than disclosed-after-the-fact is a DETECTED in-flight edit: when the derived-widget
+// filter PROVES the live editor holds the text the node would execute right now (timeline_data
+// could not have produced it — the mid-debounce signature, indistinguishable from an out-of-band
+// master) and the write's explicit `segments` do not reproduce that text, applying them would
+// destroy the edit while reporting success. No non-guessing merge of two conflicting segment
+// lists exists, so the write FAILS CLOSED with both states disclosed per segment and nothing
+// mutated — the same discipline as an unresolved tie. Which name a discarded copy gets depends
+// on WHICH branch settled authority and, for a copy the derived-widget filter rejected, on the
+// PRE-LOAD SNAPSHOT: the
 // filter proves only that a copy disagrees with the widgets, never WHY, and a stale post-load
 // editor is indistinguishable from an uncommitted edit whose derived values were refreshed back
 // to the master. So recordPreLoadPromptRelayEditors observes what each editor held before the
@@ -661,7 +670,11 @@ export function promptRelayDerivedRefusal(widgetName, nodeId) {
  *      chooseMergeBase for which of the editor / widget copies is the current one — so
  *      anything they did not mention is preserved (never defaulted away). When neither copy
  *      can be PROVEN current (an unresolved tie) this step fails closed: refused outright
- *      unless the caller supplied `segments` explicitly,
+ *      unless the caller supplied `segments` explicitly. Symmetrically, when the editor is
+ *      PROVEN current (the mid-debounce signature) but the write's explicit `segments` would
+ *      not reproduce its text, the write fails closed too — refused with both states
+ *      disclosed, because applying it would destroy the in-flight edit while reporting
+ *      success,
  *   4. validate + normalize the merged segments (refusing every coerce/reset case),
  *   5. COMPUTE all three final widget values,
  *   6. only then MUTATE — three plain assignments that cannot throw, so there is no path that
@@ -773,7 +786,9 @@ export function applyPromptRelayTimelineWrite(
   // exactly what they asked for. When they DISAGREE the node is in an anomalous state and one
   // copy holds content the caller may never have seen — an edit still being typed, or prompts a
   // raw timeline_data write left behind (the #506 state itself). So whenever the two copies
-  // diverge, any copy this write does not reproduce is handed back.
+  // diverge, any copy this write does not reproduce is handed back — and when the discarded
+  // copy is the one PROVEN current (the mid-debounce signature below), the write is refused
+  // outright instead, because a disclosure cannot un-destroy text.
   //
   // Every comparison here is STRUCTURAL (sameSegmentContent), never the derived join. Gating on
   // the joined local_prompts would miss a real overwrite whenever a prompt contains a literal
@@ -802,7 +817,54 @@ export function applyPromptRelayTimelineWrite(
   const editorWasAuthority = baseSource === "editor";
   const editorDiscarded = !!editorSegs && !sameSegmentContent(editorSegs, segments);
 
-  const overwroteInFlight = editorWasAuthority && editorDiscarded ? contentSnapshot(editorSegs) : null;
+  // The MIRROR of the post-load case FAILS CLOSED instead of disclosing after the fact. Here
+  // the case-3 filter PROVED the editor is the current record — it matches what the node would
+  // execute right now, and the persisted master could not have produced those derived values.
+  // That is the signature of an edit still inside the editor's ~120 ms commit debounce, but a
+  // timeline_data written out of band (the persisted #506 state) presents identically, and in
+  // BOTH the editor's text is the current one. A write whose explicit `segments` do not
+  // reproduce that text would destroy it while reporting a successful reconcile — the exact
+  // silent loss this route exists to prevent, and handing the text back in the result envelope
+  // does not un-destroy it. There is no non-guessing merge of two conflicting segment lists
+  // (each is a TOTAL claim on the list; zipping or concatenating would invent a timeline
+  // neither party wrote), so — the same discipline as an unresolved tie — the write is REFUSED
+  // with both states disclosed per segment and NOTHING mutated. Every remedy is deterministic:
+  // incorporate the editor's text and re-issue; or wait out the debounce, after which the
+  // editor's commit has converged the node and the write is ordinary; or, when the state
+  // persists — proving no edit is in flight — write the editor's disclosed segments back
+  // verbatim to converge the two records first, then re-issue.
+  if (editorWasAuthority && baseReason === "filter-rejected-master" && editorDiscarded) {
+    const editorCopy = contentSnapshot(editorSegs);
+    const suppliedCopy = contentSnapshot(segments);
+    throw new PromptRelayTimelineWriteError(
+      `PromptRelayEncodeTimeline node ${node?.id} holds an UNCOMMITTED timeline edit: its live ` +
+        `editor's segments are what the node would execute right now, but they differ from its ` +
+        `timeline_data — either text still inside the editor's ~120 ms commit debounce, or a ` +
+        `timeline_data written out of band; the widget values cannot tell which, and either way ` +
+        `the editor's text is the current one. This write's explicit "segments" do not reproduce ` +
+        `that text, so applying them would DESTROY it while reporting success — REFUSED, and ` +
+        `nothing was written (#506). The editor holds prompts ` +
+        `${JSON.stringify(editorCopy.prompts)} (lengths ${JSON.stringify(editorCopy.lengths)}); ` +
+        `the segments you supplied are prompts ${JSON.stringify(suppliedCopy.prompts)} (lengths ` +
+        `${JSON.stringify(suppliedCopy.lengths)}). To keep the editor's text, re-issue with ` +
+        `segments that incorporate it. To overwrite it deliberately: wait ~120 ms for the ` +
+        `editor's pending commit to reach timeline_data and re-issue — or, when no edit is ` +
+        `actually in flight (this state persists), first write the editor's disclosed segments ` +
+        `back verbatim to converge the node's two records, then re-issue your segments as an ` +
+        `ordinary write.`,
+    );
+  }
+
+  // After that throw, this disclosure covers the ONE remaining case where the editor is
+  // authoritative WITHOUT being proven newer than a readable master: an UNREADABLE
+  // timeline_data, where the editor's copy is the only record of that content anywhere.
+  // Refusing there could wedge the node (with no readable master there is nothing to converge
+  // first, and the lossy join cannot reconstruct the editor's segments reliably), so the write
+  // proceeds and hands the replaced copy back.
+  const overwroteInFlight =
+    editorWasAuthority && editorDiscarded && baseReason !== "filter-rejected-master"
+      ? contentSnapshot(editorSegs)
+      : null;
   // The filter rejected this editor copy. That alone does NOT say whether it was a stale
   // leftover or text the user typed, so the pre-load snapshot decides:
   //   PROVEN stale (still holds exactly what it held before the current load) → payload only;
@@ -825,10 +887,10 @@ export function applyPromptRelayTimelineWrite(
   }
   if (overwroteInFlight) {
     warnings.push(
-      `this node held an UNCOMMITTED timeline edit — the live editor's segments (what the node ` +
-        `would execute right now) did not match its timeline_data, typically text typed into the ` +
-        `prompt box that had not yet been committed. The segments you supplied REPLACED it. The ` +
-        `prompts that were in flight are returned PER SEGMENT as ` +
+      `this node's live editor held segments (what the node would execute right now) that exist ` +
+        `in no READABLE timeline_data — an UNCOMMITTED timeline edit, typically text typed into ` +
+        `the prompt box that had not yet been committed. The segments you supplied REPLACED them. ` +
+        `Their prompts are returned PER SEGMENT as ` +
         `"overwrote_uncommitted_edit.prompts" — write those back if you meant to keep them.`,
     );
   }
