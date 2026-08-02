@@ -453,7 +453,7 @@ test("#442 codex R7: a tab that arrived DIRTY is never re-baselined and never re
   assert.ok(wasDirtyAt < openAt, "…BEFORE any await, since it cannot be recovered afterwards");
   assert.match(
     body,
-    /if \(\s*!wasDirty &&\s*\(!wasOpen \|\| priorInteraction !== null\) &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,400}?await clearSpuriousOpenModified\(target, \{/,
+    /if \(\s*!wasDirty &&\s*priorInteraction !== null &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,400}?await clearSpuriousOpenModified\(target, \{/,
     "a genuinely dirty tab must never be re-baselined, nor one we no longer hold exclusively",
   );
   // BOTH reload gates must require the pre-open snapshot to be clean too.
@@ -630,8 +630,8 @@ test("#442 round-2: with NO freeze available the tracker is NOT re-baselined eit
   // makes that frame safe. On a frontend WITHOUT the flag the reload is skipped for
   // exactly that reason (priorInteraction === null) — so the tracker must not be
   // re-baselined either: an edit landing in the unprotected frame would be adopted as
-  // clean, erasing unsaved-work protection and inviting later silent loss. (A first-time
-  // open — !wasOpen — can never reload, so its spurious-flag cleanup is unchanged.)
+  // clean, erasing unsaved-work protection and inviting later silent loss. (Round 3
+  // extended the same exclusion to the first-time open — see the round-3 test below.)
   const skipGate = body.indexOf("if (staleInfo.reload && !dirtyNow && !wasDirty && priorInteraction === null)");
   const firstRebaseline = body.indexOf("await clearSpuriousOpenModified(target, {");
   assert.notEqual(skipGate, -1, "the no-freeze skip gate must exist");
@@ -639,7 +639,7 @@ test("#442 round-2: with NO freeze available the tracker is NOT re-baselined eit
   assert.ok(firstRebaseline < skipGate, "fixture order: the re-baseline precedes the reload decision");
   assert.match(
     body,
-    /if \(\s*!wasDirty &&\s*\(!wasOpen \|\| priorInteraction !== null\) &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,400}?await clearSpuriousOpenModified\(target, \{/,
+    /if \(\s*!wasDirty &&\s*priorInteraction !== null &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,400}?await clearSpuriousOpenModified\(target, \{/,
     "the pre-reload re-baseline must be gated on the freeze holding — the same condition whose absence skips the reload",
   );
   // The only OTHER re-baseline is the post-reload one, and it stays gated on the reload
@@ -653,6 +653,39 @@ test("#442 round-2: with NO freeze available the tracker is NOT re-baselined eit
     2,
     "workflow_open re-baselines the tracker exactly twice, each behind a gate",
   );
+});
+
+test("#442 round-3: a FIRST-TIME open never re-baselines without the freeze (edit in the frame stays dirty)", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const body = handlerBody(src, "async workflow_open({");
+  // The freeze handle is non-null ONLY for an already-open tab on a frontend exposing
+  // allow_interaction — exactly the case where the freeze below is actually applied.
+  assert.match(
+    body,
+    /const priorInteraction =\s*wasOpen && typeof canvasView\?\.allow_interaction === "boolean"/,
+    "priorInteraction !== null ⟺ the freeze is held",
+  );
+  // clearSpuriousOpenModified awaits a frame, then captures the canvas as the CLEAN
+  // baseline and forces isModified=false. A first-time open holds NO freeze by design,
+  // so if the cleanup ran there an edit landing in that frame would be adopted as
+  // clean — and a later stale open could then auto-reload the disk file over that
+  // unsaved work (the round-3 DATA-LOSS finding). The gate must require the freeze
+  // with NO !wasOpen exception; the fresh tab keeps a spurious flag (loud, cosmetic)
+  // instead of a silent clean-slate.
+  const gate = body.match(
+    /if \(\s*!wasDirty &&\s*priorInteraction !== null &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,400}?await clearSpuriousOpenModified\(target, \{/,
+  );
+  assert.ok(gate, "the pre-reload re-baseline must be gated on the freeze holding");
+  assert.doesNotMatch(
+    gate[0],
+    /!wasOpen/,
+    "no first-time-open exception may re-open the unprotected frame",
+  );
+  // …which means a first-time open (wasOpen false ⇒ priorInteraction null) can NEVER
+  // reach the capture/reset: an in-frame edit keeps the tracker dirty, so BOTH reload
+  // paths below (each requires !dirtyNow && !wasDirty) stay closed over that work.
+  const gates = [...body.matchAll(/if \(staleInfo\.reload && !dirtyNow[^)]*\)/g)].map((m) => m[0]);
+  assert.ok(gates.length >= 2, "both reload paths stay gated on the fresh dirty re-check");
 });
 
 test("#402 codex P1: workflow_new records UNKNOWN (never a clean failure) once creation started", () => {

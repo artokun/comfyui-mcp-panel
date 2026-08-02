@@ -3236,7 +3236,13 @@ function nextFrame() {
  *  open stays modified:false. This mirrors what the frontend's own save() does
  *  (changeTracker.reset(); isModified = false), minus the disk write — opening
  *  from disk means the loaded graph already IS the saved state. Best-effort +
- *  feature-detected; never throws. */
+ *  feature-detected; never throws.
+ *
+ *  Callers must hold the canvas interaction freeze around this — the awaited
+ *  frame below is exactly the gap in which an UNPROTECTED edit would be adopted
+ *  as the new clean baseline (a silent clean-slate over real work). A first-time
+ *  open is never frozen by design, so it does not get this cleanup at all: it
+ *  keeps the spurious flag (loud, cosmetic) instead. */
 async function clearSpuriousOpenModified(wf, { stillOwns } = {}) {
   if (!wf) return;
   try {
@@ -7871,14 +7877,16 @@ const GRAPH_TOOL_EXECUTORS = {
         // already HAD unsaved edits does not clear a spurious flag — it erases a REAL one,
         // hiding the user's work from every later check (codex). Leaving a genuinely dirty
         // tab marked dirty is both truthful and what keeps the reload gate below closed.
-        // …and ONLY when either no reload is possible (!wasOpen) or the canvas freeze is
-        // holding (priorInteraction !== null). On a frontend WITHOUT allow_interaction the
-        // helper's awaited frame is unprotected: an edit landing in it would be captured as
-        // the new CLEAN baseline, silently erasing unsaved-work protection — and that same
-        // condition (priorInteraction === null) is what skips the reload below, so the
-        // re-baseline would be a silent clean-slate in service of a reload that never
-        // happens. Leave the tracker alone there: a spurious "modified" flag is cosmetic
-        // and keeps the dirty signal alive for the conflict report below.
+        // …and ONLY while the canvas freeze is holding (priorInteraction !== null). The
+        // helper's awaited frame is otherwise unprotected: an edit landing in it would be
+        // captured as the new CLEAN baseline, silently erasing unsaved-work protection —
+        // and a later stale open could then auto-reload the disk file over that work.
+        // That excludes BOTH the no-freeze frontend (priorInteraction === null, the same
+        // condition that skips the reload below) AND the first-time open, which is never
+        // frozen by design (the freeze stays scoped to wasOpen — see above). A spurious
+        // "modified" flag on a fresh open is cosmetic (it may block an unforced close
+        // until a save) and keeps the dirty signal alive; a silent clean-slate over a
+        // real edit is neither.
         // Ownership re-check before EVERY re-baseline / destructive step: if this open
         // outlived its own section (the 30s safety expiry, or a newer open taking over),
         // other commands have been let through and we must not keep mutating as though we
@@ -7886,7 +7894,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // a concurrent edit is not.
         if (
           !wasDirty &&
-          (!wasOpen || priorInteraction !== null) &&
+          priorInteraction !== null &&
           ownsWorkflowReloadGuard(reloadGuardToken)
         ) {
           // The helper awaits a frame before re-baselining — hold the fence across that
