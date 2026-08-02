@@ -211,6 +211,20 @@ test("#694: the journal records the session epoch and summaries filter by it ide
   assert.equal(j.summaries().length, 3);
 });
 
+test("#694 wiring: the epoch stamps from ANY epoch-carrying frame, before the models branch", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const genericAt = src.indexOf('typeof msg.epoch === "string"');
+  const modelsAt = src.indexOf('msg.type === "models"');
+  assert.notEqual(genericAt, -1, "the generic epoch stamp must exist (epoch-first session frame)");
+  assert.notEqual(modelsAt, -1);
+  assert.ok(
+    genericAt < modelsAt,
+    "the generic stamp must run BEFORE the models branch so an early session frame advances the epoch",
+  );
+  const branch = src.slice(genericAt, genericAt + 400);
+  assert.match(branch, /thisSock\.__cmcpBridgeEpoch = msg\.epoch;/, "it stamps the socket's epoch from the frame");
+});
+
 test("#694 wiring: the models handshake stamps the socket's session epoch BEFORE the replay fires", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const modelsAt = src.indexOf('msg.type === "models"');
