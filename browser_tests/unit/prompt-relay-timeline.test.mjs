@@ -201,6 +201,65 @@ test("selectedIndex past the end of a shrunken timeline is clamped, and anim sta
   assert.equal(editor._settling, false);
 });
 
+test("a SHRINK push during an ACTIVE reorder/drag invalidates it — no stale-index splice, no throw", () => {
+  // The pack's editor keys its in-flight pointer interactions on segment INDICES: an active
+  // reorder splices `sourceIdx`→`targetIdx` on pointer-up and a boundary drag resizes from
+  // `dragStart.initialLengths[handle]` on pointer-move. A push that SHRINKS the timeline
+  // between pointer-down and pointer-up leaves those indices pointing past the end of the new
+  // list: the release would splice `undefined` into segments and the editor's own commit()
+  // would throw on `s.prompt` BEFORE the derived widgets update — timeline_data corrupted and
+  // desynced. Rehydration must end the interaction instead.
+  const { node, widgets, editor } = makeRelayNode({
+    timelineSegments: [seg("a"), seg("b", 36), seg("c", 48)],
+  });
+  // Mid-reorder of block 2 toward slot 0, AND mid boundary-drag — both index-keyed.
+  editor.reorder = {
+    sourceIdx: 2,
+    targetIdx: 0,
+    startX: 0,
+    startY: 0,
+    cursorX: 5,
+    dragOffsetPx: 2,
+    active: true,
+  };
+  editor.dragHandle = 1;
+  editor.dragStart = { x: 0, initialLengths: [24, 36, 48] };
+
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("only one", 5)] }));
+
+  assert.equal(res.editor_synced, true);
+  // The interaction is over, at exactly the pack's idle values.
+  assert.equal(editor.reorder, null);
+  assert.equal(editor.dragHandle, -1);
+  assert.equal(editor.dragStart, null);
+
+  // Replay the pack's onPointerUp VERBATIM against the released pointer: with no drag state
+  // it is a no-op. (Mirrors prompt_relay_timeline.js — splice(sourceIdx,1)[0] then
+  // splice(targetIdx,0,seg), then commit()'s segments.map(s => s.prompt), which is what threw.)
+  const packPointerUp = (ed) => {
+    if (ed.dragHandle >= 0) {
+      ed.dragHandle = -1;
+      ed.dragStart = null;
+    }
+    if (ed.reorder) {
+      if (ed.reorder.active && ed.reorder.sourceIdx !== ed.reorder.targetIdx) {
+        const segm = ed.timeline.segments.splice(ed.reorder.sourceIdx, 1)[0];
+        ed.timeline.segments.splice(ed.reorder.targetIdx, 0, segm);
+        ed.committedPrompts = ed.timeline.segments.map((s) => s.prompt).join(" | ");
+      }
+      ed.reorder = null;
+    }
+  };
+  assert.doesNotThrow(() => packPointerUp(editor));
+  // No splice happened: the pushed list is untouched, no undefined was inserted.
+  assert.deepEqual(editor.timeline.segments.map((s) => s.prompt), ["only one"]);
+  assert.equal(editor.committedPrompts, undefined);
+  // …and timeline_data still re-derives to exactly the derived widgets (consistent triplet).
+  const back = derivePromptRelayWidgets(JSON.parse(widgets.timeline_data.value).segments);
+  assert.equal(back.local_prompts, widgets.local_prompts.value);
+  assert.equal(back.segment_lengths, widgets.segment_lengths.value);
+});
+
 // ─── Merge: omitted fields preserved, never defaulted away ───
 
 test("a partial write MERGES onto the current timeline (unmentioned fields preserved)", () => {

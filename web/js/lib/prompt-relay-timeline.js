@@ -989,6 +989,19 @@ export function applyPromptRelayTimelineWrite(
       editor._displayedX?.clear?.();
       editor._targetX?.clear?.();
       editor._settling = false;
+      // Invalidate any IN-FLIGHT pointer interaction: the reorder state and the boundary-drag
+      // state both key on segment INDICES into the OLD list. Left intact across this write,
+      // the pointer's release would splice sourceIdx→targetIdx of a list that may no longer
+      // have those positions — splicing `undefined` into a shrunken list and throwing inside
+      // the editor's own commit() BEFORE the derived widgets update — and a boundary drag
+      // would keep resizing at stale indices from its stale length snapshot. With the state
+      // reset to the pack's idle values, the editor's pointer handlers treat the release as a
+      // no-op (pointer capture auto-releases on pointerup), so the drag simply ends. Only the
+      // REHYDRATION path does this: a refused write mutates nothing, so a drag in progress
+      // there continues undisturbed.
+      editor.dragHandle = -1;
+      editor.dragStart = null;
+      editor.reorder = null;
       editorSynced = true;
       try {
         // updateUIFromSelection refreshes the prompt textarea + length input from the new
