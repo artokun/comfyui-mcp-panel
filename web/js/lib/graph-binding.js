@@ -164,6 +164,14 @@ function graphShape(state) {
  * guard never manufactures a mismatch from partial state.
  */
 export function graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow } = {}) {
+  // #545 — ChangeTracker's activeState is a useful *clean-tab* binding witness,
+  // but it is not a synchronous mirror of every manual LiteGraph edit. A dirty
+  // workflow can therefore legitimately serialize differently from the root it
+  // owns (including a different node count). Treat that comparison as
+  // inconclusive while dirty rather than permanently rejecting every graph tool.
+  // Callers can still use a durable per-workflow identity to prove a dirty root
+  // belongs to a different tab.
+  if (activeWorkflow?.isModified === true) return false;
   const activeState = activeWorkflowCurrentState(activeWorkflow);
   const expected = activeState?.nodes;
   const live = rootGraph?._nodes;
@@ -195,6 +203,22 @@ export function graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow } 
   const expectedSet = new Set(expectedShapes);
   if (expectedSet.size !== expectedShapes.length) return false;
   return liveShapes.some((entry) => !expectedSet.has(entry));
+}
+
+/**
+ * True only when a root graph carries a durable workflow UUID that conflicts
+ * with the active workflow object's already-established UUID. Missing identity
+ * on either side is inconclusive: older frontends and first observation must
+ * never manufacture a false refusal.
+ *
+ * This is deliberately separate from ChangeTracker state comparison. It remains
+ * trustworthy for a dirty workflow, where activeState may lag manual edits but a
+ * root from another tab still carries that other tab's identity.
+ */
+export function graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid } = {}) {
+  if (typeof activeWorkflowUuid !== "string" || !activeWorkflowUuid) return false;
+  const rootUuid = rootGraph?.extra?.comfyui_mcp?.workflow_uuid;
+  return typeof rootUuid === "string" && rootUuid && rootUuid !== activeWorkflowUuid;
 }
 
 /**

@@ -19,6 +19,7 @@ import {
   activeWorkflowNodeCount,
   graphReadDesynced,
   graphRootMismatchesActiveWorkflow,
+  graphRootWorkflowUuidMismatches,
   graphReadBindingChanged,
 } from "../../web/js/lib/graph-binding.js";
 
@@ -301,6 +302,65 @@ test("graphRootMismatchesActiveWorkflow: FALSE - initialState is a baseline, not
       activeWorkflow,
     }),
     false,
+  );
+});
+
+test("#545: a DIRTY workflow's tracker state may lag legitimate canvas edits, so it is never a binding refusal", () => {
+  const staleTrackerState = {
+    nodes: Array.from({ length: 27 }, (_, i) => ({ id: i + 1, type: "KSampler" })),
+    links: [],
+  };
+  const actualDirtyCanvas = {
+    nodes: Array.from({ length: 30 }, (_, i) => ({ id: i + 1, type: "KSampler" })),
+    links: [],
+  };
+  const activeWorkflow = wf({ changeTracker: { activeState: staleTrackerState }, isModified: true });
+  assert.equal(
+    graphRootMismatchesActiveWorkflow({ rootGraph: serializedRoot(actualDirtyCanvas), activeWorkflow }),
+    false,
+    "a dirty tab's cached ChangeTracker state is not proof that its live canvas is another workflow",
+  );
+});
+
+test("#545: a DIRTY workflow still rejects a root positively identified as another workflow", () => {
+  const rootGraph = {
+    _nodes: [{ id: 1, type: "KSampler" }],
+    extra: { comfyui_mcp: { workflow_uuid: "workflow-B" } },
+  };
+  assert.equal(
+    graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid: "workflow-A" }),
+    true,
+    "a durable root UUID disagreement remains a real wrong-canvas proof even while dirty",
+  );
+  assert.equal(graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid: "workflow-B" }), false);
+  assert.equal(graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid: null }), false);
+  assert.equal(graphRootWorkflowUuidMismatches({ rootGraph: {}, activeWorkflowUuid: "workflow-A" }), false);
+});
+
+test("#545 wiring: dirty tracker state is inconclusive, but an established workflow UUID still fences a foreign root", () => {
+  const src = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
+  const start = src.indexOf("function assertGraphBoundToActiveWorkflow(");
+  assert.notEqual(start, -1);
+  const body = src.slice(start, src.indexOf("\n}\n", start));
+  assert.match(
+    body,
+    /const activeWorkflowUuid = activeWorkflow \? _workflowObjectUuids\.get\(activeWorkflow\) : null;/,
+    "the fence must use only the already-established object UUID, never derive one from a possibly stale root",
+  );
+  assert.match(
+    body,
+    /graphRootWorkflowUuidMismatches\(\{ rootGraph, activeWorkflowUuid \}\)/,
+    "a dirty tab retains the positive foreign-root identity fence",
+  );
+  assert.match(
+    body,
+    /const currentStateTrustworthy = activeWorkflow\?\.isModified !== true;/,
+    "a dirty ChangeTracker snapshot is not trustworthy as a binding proof",
+  );
+  assert.match(
+    body,
+    /currentStateTrustworthy &&\s*includeBaselineReadGuard &&\s*graphReadDesynced/,
+    "the old node-count baseline guard must not reject a dirty canvas from stale tracker state",
   );
 });
 

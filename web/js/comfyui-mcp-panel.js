@@ -250,6 +250,7 @@ import {
   activeWorkflowNodeCount,
   graphReadDesynced,
   graphRootMismatchesActiveWorkflow,
+  graphRootWorkflowUuidMismatches,
   graphReadBindingChanged,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
@@ -3949,9 +3950,18 @@ function assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineRea
   const liveNodeCount = rootGraph?._nodes?.length ?? 0;
   const inSubgraph = !!rootGraph && graph !== rootGraph;
   const activeWorkflow = activeWorkflowRef();
+  // #545 — the WeakMap value is the only live-object identity we have already
+  // established for this workflow. Do NOT mint/read one here: if a stale root is
+  // currently mounted, deriving from its embedded metadata would adopt exactly
+  // the wrong graph we are trying to detect. Missing identity stays inconclusive.
+  const activeWorkflowUuid = activeWorkflow ? _workflowObjectUuids.get(activeWorkflow) : null;
+  const currentStateTrustworthy = activeWorkflow?.isModified !== true;
   if (
+    graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid }) ||
     graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow }) ||
-    (includeBaselineReadGuard && graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph }))
+    (currentStateTrustworthy &&
+      includeBaselineReadGuard &&
+      graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph }))
   ) {
     const expected = activeWorkflowNodeCount(activeWorkflow);
     throw new Error(
