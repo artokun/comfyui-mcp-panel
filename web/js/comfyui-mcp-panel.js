@@ -95,9 +95,8 @@ import {
   updateMetadataEntry,
 } from "./lib/chat-history-store.js";
 import {
-  activeWorkflowFenceApplies,
   classifyPinnedTarget,
-  commandWorkflowMismatch,
+  commandTargetsActiveWorkflow,
   selectorSearchIncludesListed,
   selectorTargetsNonActiveWorkflow,
   isNewWorkflowLoad,
@@ -668,7 +667,7 @@ const DISCORD_INVITE_URL = "https://discord.gg/cW9arBhzCu";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
-const PANEL_VERSION = "0.11.34";
+const PANEL_VERSION = "0.11.35";
 
 // The connected orchestrator's console URL/token (captured off the `backends`
 // bridge message — see onBackends). Drives the "API Keys" credentials frame;
@@ -1655,6 +1654,28 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
     }
   }
   return id;
+}
+
+/** Refuse a command whose bridge-owned stamp no longer names this active canvas.
+ * This runs at dispatch and can be injected into an async graph executor's
+ * mutation boundary after that executor has awaited external state (#718). */
+function assertActiveWorkflowCommandTarget(msg, targetsNonActive = false) {
+  const commandUuid = msg?.[WORKFLOW_UUID_FIELD];
+  if (
+    !commandTargetsActiveWorkflow({
+      cmd: msg?.cmd,
+      commandUuid,
+      activeUuid: workflowStableUuid(),
+      targetsNonActive,
+    })
+  ) {
+    throw new Error(
+      `workflow instance mismatch: this command targets a different workflow than the ` +
+        `active canvas â€” the workflow was switched or replaced after it was issued. ` +
+        `Re-select the intended workflow (panel_open_workflow) or re-target with ` +
+        `panel_set_workflow_target({mode:"current"}), then retry.`,
+    );
+  }
 }
 
 function workflowStorageKey({ embed = false } = {}) {
@@ -6789,7 +6810,7 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
-  async graph_set_widget({ node_id, widget, value }) {
+  async graph_set_widget({ node_id, widget, value, workflow_uuid }) {
     const { app, graph, LG, rootGraph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     // #314: the LTXDirector custom node owns its timeline widgets through an in-browser
@@ -6875,6 +6896,15 @@ const GRAPH_TOOL_EXECUTORS = {
       beforeChange: () => graph.beforeChange(),
       afterChange: () => graph.afterChange(),
       setDirty: () => graph.setDirtyCanvas(true, true),
+      // #718: the first command-handler fence ran before awaitObjectInfoHistorySeed()
+      // and the fresh /object_info request. A user can switch workflows while either
+      // promise is pending, so re-read the ACTIVE uuid at the exact shared write
+      // boundary. runSetWidget calls this synchronously before every write path.
+      assertTargetStillCurrent: () =>
+        assertActiveWorkflowCommandTarget({
+          cmd: "graph_set_widget",
+          [WORKFLOW_UUID_FIELD]: workflow_uuid,
+        }),
       // Stale-combo retry: reuse the /object_info already fetched for authorization
       // (passed by runSetWidget) to refresh THIS target's combo option lists in place
       // — a single fetch total (#458 P2). When a payload IS present we NEVER re-fetch,
@@ -11175,7 +11205,6 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // (openWorkflows.find) and exempt ONLY when it lands on a real open workflow that is
             // NOT the active one — a path that resolves to the ACTIVE workflow (e.g. replaced in
             // place at the same path) still hits the active canvas, so it is fenced.
-            const commandUuid = msg?.[WORKFLOW_UUID_FIELD];
             let targetsNonActive = false;
             if (msg.cmd === "workflow_rename" || msg.cmd === "workflow_close") {
               const pathArg = typeof msg?.path === "string" ? msg.path.trim() : "";
@@ -11193,8 +11222,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
               }
             }
             if (
-              activeWorkflowFenceApplies({ cmd: msg.cmd, targetsNonActive }) &&
-              commandWorkflowMismatch({ commandUuid, activeUuid: workflowStableUuid() })
+              !commandTargetsActiveWorkflow({
+                cmd: msg.cmd,
+                commandUuid: msg?.[WORKFLOW_UUID_FIELD],
+                activeUuid: workflowStableUuid(),
+                targetsNonActive,
+              })
             ) {
               throw new Error(
                 `workflow instance mismatch: this command targets a different workflow than the ` +

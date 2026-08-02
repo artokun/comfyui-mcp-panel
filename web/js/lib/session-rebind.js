@@ -319,6 +319,11 @@ export function buildHelloPayload({
     // boundary — the flag is self-asserted, so a modified panel can spoof it, but that only
     // leaks the user's own workflow into their own workflow (self-attack). No attestation.
     enforces_workflow_stamp: true,
+    // #718: graph_set_widget awaits fresh backend metadata before its write and
+    // must recheck the stamp after that await. This separate capability lets a
+    // newer orchestrator fail closed for an older bundle that only fences at
+    // initial dispatch.
+    enforces_workflow_stamp_at_write: true,
   };
   // #709 — a browser-tab-scoped identity, deliberately separate from the
   // workflow routing id. `tab_id` is normally a workflow path and can therefore

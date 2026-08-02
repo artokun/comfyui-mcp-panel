@@ -33,9 +33,14 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import { runSetWidget } from "../../web/js/lib/set-widget.js";
 import { refreshComboOptionsFromDefs } from "../../web/js/lib/asset-staleness.js";
+import { commandTargetsActiveWorkflow } from "../../web/js/lib/workflow-chat-identity.js";
+
+const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 
 // A registry shaped like LG.registered_node_types once /object_info loaded. Each
 // entry carries a `.nodeData` def (registerNodesFromDefs stamps one per class), so
@@ -93,6 +98,141 @@ function regNode(type, widgets, extra = {}) {
 }
 
 const HOOKS = { beforeChange() {}, afterChange() {}, setDirty() {} };
+
+test("#718 graph_set_widget: a workflow switch during fresh-object-info wait refuses before the write", async () => {
+  const reg = loadedRegistry();
+  const node = regNode("KSampler", [{ name: "steps", type: "INT", value: 20 }]);
+  let activeUuid = "workflow-A";
+  let releaseFetch;
+  let markFetchStarted;
+  const fetchStarted = new Promise((resolve) => {
+    markFetchStarted = resolve;
+  });
+
+  const pending = runSetWidget(node, "steps", 30, {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: () => {
+      markFetchStarted();
+      return new Promise((resolve) => {
+        releaseFetch = () => resolve(objectInfo());
+      });
+    },
+    assertTargetStillCurrent: () => {
+      if (!commandTargetsActiveWorkflow({
+        cmd: "graph_set_widget",
+        commandUuid: "workflow-A",
+        activeUuid,
+      })) {
+        throw new Error("workflow instance mismatch");
+      }
+    },
+    ...HOOKS,
+  });
+
+  await fetchStarted;
+  // The command was fenced for A at dispatch, then the user changed the active
+  // canvas while graph_set_widget awaited its required fresh backend oracle.
+  activeUuid = "workflow-B";
+  releaseFetch();
+
+  await assert.rejects(pending, /workflow instance mismatch/);
+  assert.equal(node.widgets[0].value, 20, "the stale command must not mutate workflow B");
+});
+
+test("#718 graph_set_widget: a switch during fresh-object-info wait cannot reconcile stale widget names", async () => {
+  const reg = loadedRegistry();
+  const node = regNode("KSampler", [{ name: "UNKNOWN", type: "INT", value: 20 }]);
+  node.constructor.nodeData = { input: { required: { steps: ["INT"] } } };
+  let activeUuid = "workflow-A";
+  let releaseFetch;
+  let markFetchStarted;
+  const fetchStarted = new Promise((resolve) => {
+    markFetchStarted = resolve;
+  });
+
+  const pending = runSetWidget(node, "steps", 30, {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: () => {
+      markFetchStarted();
+      return new Promise((resolve) => {
+        releaseFetch = () => resolve(objectInfo());
+      });
+    },
+    assertTargetStillCurrent: () => {
+      if (!commandTargetsActiveWorkflow({
+        cmd: "graph_set_widget",
+        commandUuid: "workflow-A",
+        activeUuid,
+      })) {
+        throw new Error("workflow instance mismatch");
+      }
+    },
+    ...HOOKS,
+  });
+
+  await fetchStarted;
+  activeUuid = "workflow-B";
+  releaseFetch();
+
+  await assert.rejects(pending, /workflow instance mismatch/);
+  assert.equal(node.widgets[0].name, "UNKNOWN", "the stale command must not repair workflow B's widget metadata");
+  assert.equal(node.widgets[0].value, 20);
+});
+
+for (const commandUuid of [undefined, "   "]) {
+  test(`#718 graph_set_widget: ${commandUuid === undefined ? "missing" : "blank"} stamp refuses at the post-await write boundary`, async () => {
+    const reg = loadedRegistry();
+    const node = regNode("KSampler", [{ name: "steps", type: "INT", value: 20 }]);
+    let releaseFetch;
+    let markFetchStarted;
+    const fetchStarted = new Promise((resolve) => {
+      markFetchStarted = resolve;
+    });
+
+    const pending = runSetWidget(node, "steps", 30, {
+      registry: reg,
+      getRegistry: () => reg,
+      getFreshObjectInfo: () => {
+        markFetchStarted();
+        return new Promise((resolve) => {
+          releaseFetch = () => resolve(objectInfo());
+        });
+      },
+      assertTargetStillCurrent: () => {
+        if (!commandTargetsActiveWorkflow({
+          cmd: "graph_set_widget",
+          commandUuid,
+          activeUuid: "workflow-A",
+        })) {
+          throw new Error("workflow instance mismatch");
+        }
+      },
+      ...HOOKS,
+    });
+
+    await fetchStarted;
+    releaseFetch();
+
+    await assert.rejects(pending, /workflow instance mismatch/);
+    assert.equal(node.widgets[0].value, 20, "an unstamped command must not mutate after its await");
+  });
+}
+
+test("#718 wiring: graph_set_widget passes the execution-time workflow fence into runSetWidget", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const start = src.indexOf("async graph_set_widget({ node_id, widget, value, workflow_uuid })");
+  const end = src.indexOf("\n  graph_set_node_property(", start);
+  assert.notEqual(start, -1, "graph_set_widget executor must accept the bridge-owned stamp");
+  assert.notEqual(end, -1, "graph_set_widget executor boundary must exist");
+  const body = src.slice(start, end);
+  assert.match(
+    body,
+    /assertTargetStillCurrent:\s*\(\)\s*=>\s*assertActiveWorkflowCommandTarget\([\s\S]*workflow_uuid/,
+    "the post-await write boundary must recheck the exact command stamp",
+  );
+});
 
 test("#458 set_widget: REMOVED type (stale registry positive, absent from fresh object_info) ⇒ FAIL CLOSED, no mutation", async () => {
   // GoneNode's pack was uninstalled + ComfyUI restarted WITHOUT a tab reload: the

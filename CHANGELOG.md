@@ -6,6 +6,37 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.35] - 2026-08-02
+
+### Added
+- stamp the session epoch from any epoch-carrying frame (#694) (#549)
+- add atomic node editor
+
+### Fixed
+- recheck graph_set_widget workflow targeting at the post-await write boundary (#718)
+- recover dirty graph reads
+- bind restart readiness to browser tab identity
+- scope command retries to session epoch (#550)
+- prevent dirty graph-binding false positives (#545) (#546)
+- reject mismatched retry tokens (#547)
+- retry identity via retry_of + session-epoch replay gating (#694) (#543)
+- validate legacy color and mode targets
+- normalize legacy numeric node ids
+- retain legacy rail aliases
+- validate consolidated node targets
+- validate consolidated title input
+- validate legacy presentation inputs
+- preserve legacy motion compatibility
+- preserve legacy color behavior
+- preserve legacy title and color nulls
+- preserve atomic edit rollback and legacy commands
+- fence stale nonempty workflow graph (#349)
+- centralize stale outline cleanup
+- retain missing-node-type outlines
+- clear stale root outlines after subgraph conversion (#516)
+- restore CivitAI keyword search results
+
+
 ## [0.11.34] - 2026-08-02
 
 ### Added

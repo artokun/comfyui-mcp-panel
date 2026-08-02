@@ -131,10 +131,29 @@ export function activeWorkflowFenceApplies({ cmd, targetsNonActive = false } = {
  *  server can no longer retract), applying it would silently mutate the WRONG graph. Reject
  *  when the command carries a non-empty uuid that does NOT equal the active workflow's uuid —
  *  including when the active uuid is unresolvable (fail closed, #186). A command with no
- *  stamp (old orchestrator / identity-less tab) is never fenced here. */
+ *  stamp is also a mismatch for an active-workflow mutation: this panel advertises the
+ *  workflow-stamp capability, so accepting an unstamped protected command would make that
+ *  advertised fence fail open (#718). */
 export function commandWorkflowMismatch({ commandUuid, activeUuid } = {}) {
-  if (typeof commandUuid !== 'string' || !commandUuid.trim()) return false;
+  if (typeof commandUuid !== 'string' || !commandUuid.trim()) return true;
   return activeUuid !== commandUuid;
+}
+
+/**
+ * Does this command still name the active workflow at the instant it is about
+ * to mutate it? Most graph executors are synchronous, so their dispatch-time
+ * fence is sufficient. An executor that awaits an external oracle before its
+ * write must ask this again after that await: a user can switch canvases while
+ * the promise is pending. Keeping the rule pure makes both checks identical.
+ */
+export function commandTargetsActiveWorkflow({
+  cmd,
+  commandUuid,
+  activeUuid,
+  targetsNonActive = false,
+} = {}) {
+  return !activeWorkflowFenceApplies({ cmd, targetsNonActive }) ||
+    !commandWorkflowMismatch({ commandUuid, activeUuid });
 }
 
 /** #570 — resolve the per-instance uuid for an UNSAVED workflow, failing CLOSED on the
