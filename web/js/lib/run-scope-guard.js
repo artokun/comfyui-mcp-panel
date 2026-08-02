@@ -139,15 +139,16 @@ const fnv1aHex = (s) =>
  * in between (a changed widget value, a rewired link) leaves the topology
  * untouched while rendering a DIFFERENT workflow.
  *
- * The ONLY values excluded are the inputs of widgets that SELF-MUTATE at
+ * The ONLY values excluded are inputs whose OWNING widget self-mutates at
  * queue time (a `beforeQueued` hook — stock seed widgets with
  * control_after_generate, etc.): those change between any two serializations
  * of the SAME graph by design, so hashing them would refuse our own dispatch.
- * collectSelfMutatingInputNames derives the exclusion set from the live
- * graph; name-level exclusion (not per-node) trades a little precision for
- * not having to map flattened colon-path prompt ids back to live nodes.
+ * Exclusions are PER-NODE pairs (prompt node id + input name, r8): an edit to
+ * a NON-hook node's same-named input is still detected as drift, and a prompt
+ * node that can't be resolved to a live node carrying the hook gets NO
+ * exclusions (fail toward detecting drift).
  */
-export function promptContentHash(output, excludeInputNames = null) {
+export function promptContentHash(output, volatileInputs = null) {
   if (!output || typeof output !== "object") return null;
   const keys = Object.keys(output).sort();
   if (!keys.length) return null;
@@ -155,7 +156,7 @@ export function promptContentHash(output, excludeInputNames = null) {
     const node = output[k] ?? {};
     const inputs = node.inputs && typeof node.inputs === "object" ? node.inputs : {};
     const names = Object.keys(inputs)
-      .filter((n) => !excludeInputNames?.has(n))
+      .filter((n) => !volatileInputs?.has(`${k} ${n}`))
       .sort();
     return [k, node.class_type ?? null, names.map((n) => [n, inputs[n]])];
   });
@@ -163,38 +164,44 @@ export function promptContentHash(output, excludeInputNames = null) {
 }
 
 /** Content hash of a raw POST /prompt body, or null when unparseable/odd. */
-export function promptContentHashFromBody(bodyText, excludeInputNames = null) {
+export function promptContentHashFromBody(bodyText, volatileInputs = null) {
   let body;
   try {
     body = JSON.parse(bodyText);
   } catch {
     return null;
   }
-  return promptContentHash(body?.prompt, excludeInputNames);
+  return promptContentHash(body?.prompt, volatileInputs);
 }
 
 /**
- * Names of inputs whose owning widgets SELF-MUTATE at queue time (a
- * `beforeQueued` hook), collected from the live root graph and every nested
- * subgraph. These are the ONLY values the content hash excludes — everything
- * a user can edit is covered.
+ * The "execId inputName" pairs whose owning widgets SELF-MUTATE at queue time
+ * (a `beforeQueued` hook), collected from the live root graph and every nested
+ * subgraph. execId is the flattened prompt id: String(node.id) at root, the
+ * colon-joined subgraph-instance path for nested nodes ("10:15:359") — the
+ * same path buildNodeExecutionId produces, so pairs line up with the keys of
+ * the API prompt. These are the ONLY values the content hash excludes —
+ * everything a user can edit, on any other node, is covered.
  */
-export function collectSelfMutatingInputNames(rootGraph) {
-  const names = new Set();
+export function collectVolatileInputs(rootGraph) {
+  const pairs = new Set();
   const seen = new Set();
-  const walk = (g) => {
-    if (!g || seen.has(g)) return;
-    seen.add(g);
-    for (const node of g._nodes ?? []) {
-      if (!node) continue;
+  const walk = (graph, prefix) => {
+    if (!graph || seen.has(graph)) return;
+    seen.add(graph);
+    for (const node of graph._nodes ?? []) {
+      if (!node || node.id == null) continue;
+      const execId = prefix ? `${prefix}:${node.id}` : String(node.id);
       for (const w of node.widgets ?? []) {
-        if (typeof w?.beforeQueued === "function" && w.name != null) names.add(String(w.name));
+        if (typeof w?.beforeQueued === "function" && w.name != null) {
+          pairs.add(`${execId} ${String(w.name)}`);
+        }
       }
-      if (node.subgraph) walk(node.subgraph);
+      if (node.subgraph) walk(node.subgraph, execId);
     }
   };
-  walk(rootGraph);
-  return names;
+  walk(rootGraph, "");
+  return pairs;
 }
 
 /** The body's queue-position `number` as a Number, or null when absent/unparseable. */
@@ -465,7 +472,7 @@ export function createScopedRunGuard({
   origFetchApi,
   execIds,
   contentHash,
-  volatileNames = null,
+  volatileInputs = null,
   batch = 1,
   toNodeId = null,
   queueMark,
@@ -491,7 +498,7 @@ export function createScopedRunGuard({
     }
     const targets = targetsFromBody(options?.body);
     const contentOk =
-      contentHash && promptContentHashFromBody(options?.body, volatileNames) === contentHash;
+      contentHash && promptContentHashFromBody(options?.body, volatileInputs) === contentHash;
     if (contentOk && targets && sameSet(targets, expected)) {
       // OUR scoped dispatch. It counts as VERIFIED only when the fetch itself
       // completes with a real 200 + prompt_id (r6) — a thrown fetch or a
@@ -658,11 +665,13 @@ export async function dispatchScopedRun({
   // inputs that change between any two serializations by design. No hash ⇒
   // no attribution ⇒ fail closed BEFORE dispatch.
   let contentHash = null;
-  let volatileNames = null;
+  let volatileInputs = null;
   try {
     if (typeof app.graphToPrompt === "function") {
-      volatileNames = collectSelfMutatingInputNames(app?.rootGraph);
-      contentHash = promptContentHash((await app.graphToPrompt())?.output, volatileNames);
+      // This panel's live root is app.graph (r8) — app.rootGraph only as a
+      // fallback for frontends that expose it instead.
+      volatileInputs = collectVolatileInputs(app?.graph ?? app?.rootGraph ?? null);
+      contentHash = promptContentHash((await app.graphToPrompt())?.output, volatileInputs);
     }
   } catch {
     contentHash = null;
@@ -685,7 +694,7 @@ export async function dispatchScopedRun({
       origFetchApi,
       execIds,
       contentHash,
-      volatileNames,
+      volatileInputs,
       batch,
       toNodeId,
       queueMark: mark,

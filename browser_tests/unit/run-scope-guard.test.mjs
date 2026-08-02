@@ -20,7 +20,7 @@ import {
   queuePromptScopeArgs,
   promptContentHash,
   promptContentHashFromBody,
-  collectSelfMutatingInputNames,
+  collectVolatileInputs,
   verifyScopedPromptBody,
   scopeDroppedError,
   scopeUnverifiedError,
@@ -177,26 +177,30 @@ test("#556 r7 promptContentHash: full CONTENT covered (ids, class types, links, 
   assert.notEqual(promptContentHash({ "9": { class_type: "B", inputs: { steps: 20, model: ["4", 0] } }, "3": { class_type: "A", inputs: {} } }), a,
     "a changed LINK changes the hash");
   assert.notEqual(promptContentHash({ "3": { class_type: "A" } }), a, "a changed node set changes the hash");
-  // The ONLY tolerance: inputs whose widgets self-mutate at queue time.
-  const withSeed = (seed) => promptContentHash(
-    { "3": { class_type: "KSampler", inputs: { seed, steps: 20 } } },
-    new Set(["seed"]),
+  // The ONLY tolerance: inputs whose OWNING widget self-mutates at queue
+  // time — PER-NODE pairs (r8), never a global input name.
+  const withSeed = (seed, node = "3") => promptContentHash(
+    { "3": { class_type: "KSampler", inputs: { seed, steps: 20 } }, "5": { class_type: "KSampler", inputs: { seed: 222, steps: 20 } } },
+    new Set([`${node} seed`]),
   );
-  assert.equal(withSeed(1), withSeed(999), "a self-mutating (beforeQueued) input is excluded — our own dispatch isn't refused over a rerolled seed");
+  assert.equal(withSeed(1), withSeed(999), "the hook node's rerolled seed is excluded");
+  assert.notEqual(withSeed(1, "3"), withSeed(999, "5"),
+    "excluding node 3's 'seed' does NOT hide an edit to node 5's same-named input");
   assert.equal(promptContentHashFromBody(JSON.stringify({ prompt: OUR_OUTPUT })), OUR_HASH);
   assert.equal(promptContentHashFromBody("not-json{"), null);
 });
 
-test("#556 r7 collectSelfMutatingInputNames: finds beforeQueued widgets across the root graph and nested subgraphs", () => {
+test("#556 r8 collectVolatileInputs: per-NODE pairs (execId + input name) across the root graph and nested subgraphs", () => {
   const root = {
     _nodes: [
       { id: 1, widgets: [{ name: "seed", beforeQueued() {} }, { name: "steps" }] },
       { id: 2, widgets: null, subgraph: { _nodes: [{ id: 3, widgets: [{ name: "noise_seed", beforeQueued() {} }] }] } },
     ],
   };
-  const names = collectSelfMutatingInputNames(root);
-  assert.deepEqual([...names].sort(), ["noise_seed", "seed"]);
-  assert.equal(collectSelfMutatingInputNames(null).size, 0);
+  const pairs = collectVolatileInputs(root);
+  assert.deepEqual([...pairs].sort(), ["1 seed", "2:3 noise_seed"],
+    "root node ⇒ String(id); nested node ⇒ colon-joined subgraph-instance path");
+  assert.equal(collectVolatileInputs(null).size, 0);
 });
 
 test("#556 verifyScopedPromptBody: exact scope passes; missing/empty/wrong/extra/unparseable all refuse", () => {
@@ -559,8 +563,9 @@ test("#556 r7 integration: a deferred post differing ONLY in a self-mutating (be
     };
     // The live graph has a beforeQueued seed widget — its value is excluded
     // from the content hash, so a rerolled seed can't refuse our own dispatch.
+    // app.graph is the panel's live root (production shape, r8).
     const app = makeFrontend({ shape: "shim", defer: true, apiTarget, output: outputAtQueue });
-    app.rootGraph = { _nodes: [{ id: 3, widgets: [{ name: "seed", beforeQueued() {} }, { name: "steps" }] }] };
+    app.graph = { _nodes: [{ id: 3, widgets: [{ name: "seed", beforeQueued() {} }, { name: "steps" }] }] };
     const ids = [];
     const promise = dispatchScopedRun({
       app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
@@ -583,6 +588,56 @@ test("#556 r7 integration: a deferred post differing ONLY in a self-mutating (be
     assert.equal(result.outcome, "dispatched", "a rerolled seed does not refuse our own dispatch");
     assert.deepEqual(ids, ["srv-1"]);
     assert.equal(server.calls.length, 1);
+  } finally {
+    stop();
+  }
+});
+
+test("#556 r8 integration: an edit to a NON-hook node's same-named input is STILL detected as drift (per-node exclusions) — while the hook node's reroll is tolerated", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const outputAtQueue = {
+      "3": { class_type: "KSampler", inputs: { seed: 111, steps: 20 } }, // hook node
+      "5": { class_type: "KSampler", inputs: { seed: 222, steps: 20 } }, // NON-hook node, same input name
+      "14": { class_type: "PreviewAny", inputs: {} },
+    };
+    const app = makeFrontend({ shape: "shim", defer: true, apiTarget, output: outputAtQueue });
+    // app.graph is the panel's live root (production shape): only node 3 has the hook.
+    app.graph = {
+      _nodes: [
+        { id: 3, widgets: [{ name: "seed", beforeQueued() {} }, { name: "steps" }] },
+        { id: 5, widgets: [{ name: "seed" }, { name: "steps" }] },
+      ],
+    };
+    const promise = dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+      verifyTimeoutMs: 500,
+    });
+    await sleep(20);
+    // The deferred post: node 3's seed rerolled (legitimate beforeQueued) AND
+    // node 5's seed edited (a real user edit — must NOT hide behind node 3's
+    // exclusion).
+    app.postDeferred = async (item) => {
+      const body = frontendBody({
+        output: {
+          ...outputAtQueue,
+          "3": { class_type: "KSampler", inputs: { seed: 999999, steps: 20 } },
+          "5": { class_type: "KSampler", inputs: { seed: 777, steps: 20 } },
+        },
+        number: item.number,
+        targets: ["14"],
+      });
+      app.posted.push(body);
+      return apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+    };
+    const res = await app.postDeferred(app.deferredItem);
+    const result = await promise;
+    assert.equal(res.status, 400, "the edit to the NON-hook node's seed is drift — refused");
+    assert.equal(result.outcome, "refused");
+    assert.match(result.error, /graph CHANGED/i);
+    assert.equal(server.calls.length, 0, "the edited workflow never left the tab");
   } finally {
     stop();
   }
