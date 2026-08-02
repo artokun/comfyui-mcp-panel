@@ -205,7 +205,7 @@ import {
   activeStaleHint,
 } from "./lib/reconnect-staleness.js";
 import { pickRevertSnapshot } from "./lib/graph-revert.js";
-import { createCommandDedupeLedger } from "./lib/command-dedupe.js";
+import { commandFingerprint, createCommandDedupeLedger } from "./lib/command-dedupe.js";
 import { decideOpenStaleness } from "./lib/workflow-open-staleness.js";
 import {
   OPEN_DISK_READ_BUDGET_MS,
@@ -10075,10 +10075,14 @@ function redactBridgeUrl(u) {
 // rid (a replay after reconnect, or an orchestrator retry that reuses the
 // request id) is answered with the ORIGINAL reply instead of being executed
 // again — a re-applied graph_add_node / graph_remove_node is how a timed-out
-// mutation plus its retry lands twice (duplicate / orphan nodes). Module-scoped
-// so the ledger survives a socket supersede: the replay can arrive on the
-// REPLACEMENT socket while the first execution was still in flight on the old.
-const commandRidLedger = createCommandDedupeLedger();
+// mutation plus its retry lands twice (duplicate / orphan nodes). Dedupe keys
+// on rid + PAYLOAD FINGERPRINT: the bridge's re-dispatch of the SAME logical
+// command reproduces the frame exactly, while a rid reused for DIFFERENT work
+// (anomalous — logged once via onRidReuse) executes fresh instead of receiving
+// the old reply. Module-scoped so the ledger survives a socket supersede: the
+// replay can arrive on the REPLACEMENT socket while the first execution was
+// still in flight on the old.
+const commandRidLedger = createCommandDedupeLedger(200, (m) => console.warn(m));
 
 function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCommandReceived, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert }) {
   let sock = null;
@@ -10484,12 +10488,15 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             err?.message ?? err,
           );
         }
-        // #517 — refuse to APPLY the same rid twice. A duplicate delivery of an
-        // already-seen command frame is answered with the ORIGINAL reply
-        // (awaited first if the first execution is still in flight) on THIS
-        // socket — no second executor run, no second activity card — so a
-        // replayed mutation can never double-apply.
-        const priorRidReply = commandRidLedger.get(msg.rid);
+        // #517 — refuse to APPLY the same command twice. Dedupe keys on rid +
+        // payload fingerprint: the bridge's re-dispatch of the SAME logical
+        // command reproduces the frame exactly, so a duplicate delivery is
+        // answered with the ORIGINAL reply (awaited first if the first
+        // execution is still in flight) on THIS socket — no second executor
+        // run, no second activity card — while a rid reused for DIFFERENT work
+        // falls through and executes fresh (logged once by the ledger).
+        const fingerprint = commandFingerprint(msg);
+        const priorRidReply = commandRidLedger.get(msg.rid, fingerprint);
         if (priorRidReply !== undefined) {
           let dupReply;
           try {
@@ -10505,7 +10512,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           }
           return;
         }
-        const settleRid = commandRidLedger.begin(msg.rid);
+        const settleRid = commandRidLedger.begin(msg.rid, fingerprint);
         let reply;
         try {
           let result;

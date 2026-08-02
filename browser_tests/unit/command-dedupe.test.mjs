@@ -7,18 +7,22 @@
 // duplicate / orphaned nodes. The ledger makes every rid-correlated command
 // idempotent at the point of application: the first delivery executes, any
 // later delivery of the same rid is answered with the ORIGINAL reply.
+//
+// The dedupe identity is rid + payload fingerprint: the bridge's re-dispatch of
+// the SAME logical command dedupes, but a rid reused for DIFFERENT work must
+// execute fresh (never answered from the ledger) and is logged once.
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { createCommandDedupeLedger } from "../../web/js/lib/command-dedupe.js";
+import { commandFingerprint, createCommandDedupeLedger } from "../../web/js/lib/command-dedupe.js";
 
 // Minimal stand-in for the panel's bridge message handler: the same
 // get → (replay | begin → execute → settle) flow the real dispatch runs.
 function makeDispatch(ledger, executor) {
   return async function deliver(msg) {
-    const prior = ledger.get(msg.rid);
+    const prior = ledger.get(msg.rid, commandFingerprint(msg));
     if (prior !== undefined) return { reply: await prior, executed: false };
-    const settle = ledger.begin(msg.rid);
+    const settle = ledger.begin(msg.rid, commandFingerprint(msg));
     let reply;
     try {
       reply = { rid: msg.rid, ok: true, result: await executor(msg) };
@@ -94,21 +98,22 @@ test("distinct rids execute independently", async () => {
 
 test("the ledger forgets rids beyond its cap (bounded, fail-open)", async () => {
   const ledger = createCommandDedupeLedger(3);
+  const fp = commandFingerprint({ cmd: "graph_add_node" });
   const deliver = makeDispatch(ledger, async () => ({ ok: true }));
   for (const rid of ["r1", "r2", "r3", "r4"]) await deliver({ rid, cmd: "graph_add_node" });
-  assert.equal(ledger.get("r1"), undefined, "oldest rid is evicted once over cap");
-  assert.notEqual(ledger.get("r4"), undefined, "recent rids are still remembered");
+  assert.equal(ledger.get("r1", fp), undefined, "oldest rid is evicted once over cap");
+  assert.notEqual(ledger.get("r4", fp), undefined, "recent rids are still remembered");
   // Fail-open: an evicted replay would simply re-execute — the pre-ledger
   // behaviour, never a new failure mode.
 });
 
 test("settle is idempotent — a second settle cannot rewrite the recorded reply", async () => {
   const ledger = createCommandDedupeLedger();
-  const settle = ledger.begin("r1");
+  const settle = ledger.begin("r1", "fp");
   const reply = { rid: "r1", ok: true, result: { added: { id: 1 } } };
   settle(reply);
   settle({ rid: "r1", ok: false, error: "bogus" });
-  assert.equal(await ledger.get("r1"), reply);
+  assert.equal(await ledger.get("r1", "fp"), reply);
 });
 
 test("an in-flight entry is NEVER evicted past cap — its replay is still deduped (#517 re-gate)", async () => {
@@ -137,12 +142,78 @@ test("an in-flight entry is NEVER evicted past cap — its replay is still dedup
 
 test("settled entries still evict oldest-first while an in-flight one is kept", async () => {
   const ledger = createCommandDedupeLedger(3);
+  const fp = commandFingerprint({ cmd: "graph_add_node" });
   const deliver = makeDispatch(ledger, async () => ({ ok: true }));
-  const settleLive = ledger.begin("r-live"); // stays in flight
+  const settleLive = ledger.begin("r-live", "fp-live"); // stays in flight
   for (const rid of ["r1", "r2", "r3"]) await deliver({ rid, cmd: "graph_add_node" });
   // 4 entries > cap 3 → the oldest SETTLED (r1) evicts; in-flight r-live survives.
-  assert.notEqual(ledger.get("r-live"), undefined, "in-flight entry is kept past cap");
-  assert.equal(ledger.get("r1"), undefined, "oldest settled entry still evicts — memory stays bounded");
-  assert.notEqual(ledger.get("r3"), undefined, "newer settled entries are still remembered");
+  assert.notEqual(ledger.get("r-live", "fp-live"), undefined, "in-flight entry is kept past cap");
+  assert.equal(ledger.get("r1", fp), undefined, "oldest settled entry still evicts — memory stays bounded");
+  assert.notEqual(ledger.get("r3", fp), undefined, "newer settled entries are still remembered");
   settleLive({ rid: "r-live", ok: true, result: {} });
+});
+
+test("same rid + DIFFERENT payload is NOT answered from the ledger — it executes fresh (#517 re-gate)", async () => {
+  const warnings = [];
+  const ledger = createCommandDedupeLedger(200, (m) => warnings.push(m));
+  let applied = 0;
+  const deliver = makeDispatch(ledger, async (msg) => ({ added: { id: ++applied, pos: msg.pos } }));
+
+  const a = await deliver({ rid: "r1", cmd: "graph_add_node", pos: [0, 0] });
+  const b = await deliver({ rid: "r1", cmd: "graph_add_node", pos: [9, 9] });
+  assert.equal(a.executed, true);
+  assert.equal(b.executed, true, "a reused rid with a different payload must execute, not replay the old reply");
+  assert.equal(applied, 2, "the new command was NOT lost to the ledger");
+  assert.notEqual(b.reply, a.reply, "each command gets its OWN truthful reply");
+  assert.equal(warnings.length, 1, "rid reuse for different work logs a warning");
+
+  // …and each payload still dedupes its OWN replays against its own reply.
+  const aReplay = await deliver({ rid: "r1", cmd: "graph_add_node", pos: [0, 0] });
+  const bReplay = await deliver({ rid: "r1", cmd: "graph_add_node", pos: [9, 9] });
+  assert.equal(aReplay.executed, false);
+  assert.equal(bReplay.executed, false);
+  assert.equal(applied, 2, "neither payload's replay re-executes");
+  assert.equal(aReplay.reply, a.reply);
+  assert.equal(bReplay.reply, b.reply);
+});
+
+test("fingerprint mismatch logs ONCE — the new payload's own replays dedupe silently", async () => {
+  const warnings = [];
+  const ledger = createCommandDedupeLedger(200, (m) => warnings.push(m));
+  const deliver = makeDispatch(ledger, async () => ({ ok: true }));
+
+  await deliver({ rid: "r1", cmd: "graph_add_node" });
+  const fresh = await deliver({ rid: "r1", cmd: "graph_remove_node", node_id: 7 }); // mismatch → warn
+  const replay = await deliver({ rid: "r1", cmd: "graph_remove_node", node_id: 7 }); // replay of new → dedupe
+  assert.equal(fresh.executed, true);
+  assert.equal(replay.executed, false);
+  assert.equal(warnings.length, 1, "one warning per rid-reuse event, not per retry");
+});
+
+test("fingerprint is key-order independent — the same payload re-serialized still dedupes", async () => {
+  const ledger = createCommandDedupeLedger();
+  let applied = 0;
+  const deliver = makeDispatch(ledger, async () => ({ added: { id: ++applied } }));
+
+  const first = await deliver({ rid: "r1", cmd: "graph_add_node", class_type: "LoraLoaderModelOnly", pos: [1, 2] });
+  // Same logical command, fields in a different insertion order (a re-serialized
+  // re-dispatch): identical fingerprint, so it dedupes.
+  const replay = await deliver({ pos: [1, 2], class_type: "LoraLoaderModelOnly", cmd: "graph_add_node", rid: "r1" });
+  assert.equal(replay.executed, false);
+  assert.equal(applied, 1);
+  assert.equal(replay.reply, first.reply);
+});
+
+test("a different bridge-stamped workflow_uuid is a DIFFERENT command even with identical args", async () => {
+  const warnings = [];
+  const ledger = createCommandDedupeLedger(200, (m) => warnings.push(m));
+  let ran = 0;
+  const deliver = makeDispatch(ledger, async () => ++ran);
+
+  const a = await deliver({ rid: "r1", cmd: "graph_add_node", class_type: "X", workflow_uuid: "wfA" });
+  const b = await deliver({ rid: "r1", cmd: "graph_add_node", class_type: "X", workflow_uuid: "wfB" });
+  assert.equal(a.executed, true);
+  assert.equal(b.executed, true, "same rid+args on another workflow must execute, not replay");
+  assert.equal(ran, 2);
+  assert.equal(warnings.length, 1);
 });
