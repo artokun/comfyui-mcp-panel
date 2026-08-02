@@ -3,13 +3,18 @@ import test from 'node:test'
 
 import {
   activeWorkflowFenceApplies,
+  commandWorkflowMismatch,
+  hasEmbeddedUuidSuccessionEvidence,
   selectorSearchIncludesListed,
   selectorTargetsNonActiveWorkflow,
-  commandWorkflowMismatch,
   isThreadInScope,
   isNewWorkflowLoad,
   normalizedWorkflowPath,
+  rawWorkflowObject,
   resolveUnsavedInstanceUuid,
+  sameWorkflowObject,
+  shouldCarryIdentityAcrossSaveSwap,
+  shouldForkEmbeddedUuidForLiveOwner,
   shouldForkEmbeddedWorkflowUuid,
   shouldForkInPlaceReload,
   workflowAliasForPath
@@ -162,6 +167,211 @@ test('#570 P0b a fresh object (no cache) is NOT an in-place replace here → fal
   // A brand-new object (reload-restore/copy) has no cache; creation/embedded handling covers it.
   assert.equal(shouldForkInPlaceReload({ cachedUuid: undefined, incomingUuid: 'uuid-A' }), false)
   assert.equal(shouldForkInPlaceReload({}), false)
+})
+
+// #557 — a save replaces the active ComfyWorkflow object. The successor parses the
+// same embedded uuid from the just-saved file while the REPLACED object is still the
+// registered owner: fork ONLY while that owner is still a live OPEN tab.
+test('#557 fork away from an owned embedded uuid ONLY while the owner is still open', () => {
+  const owner = { path: 'workflows/x.json' }
+  const successor = { path: 'workflows/x.json' }
+  // Owner replaced (no longer an open workflow) AND succession proven →
+  // successor INHERITS, no fork — minting fresh here desynced the object from
+  // the root tag and blocked every graph tool until a frontend reload.
+  assert.equal(shouldForkEmbeddedUuidForLiveOwner({
+    embeddedUuid: 'uuid-A', embeddedOwner: owner, identityObject: successor,
+    ownerIsOpenWorkflow: false, successionProven: true
+  }), false)
+  // Owner still open alongside → a genuine co-open copy → fork (#570).
+  assert.equal(shouldForkEmbeddedUuidForLiveOwner({
+    embeddedUuid: 'uuid-A', embeddedOwner: owner, identityObject: successor, ownerIsOpenWorkflow: true
+  }), true)
+  // The owner IS this object (rename/Save-As continuity) → never fork.
+  assert.equal(shouldForkEmbeddedUuidForLiveOwner({
+    embeddedUuid: 'uuid-A', embeddedOwner: owner, identityObject: owner, ownerIsOpenWorkflow: true
+  }), false)
+  // Missing identity/owner data is inconclusive → never fork.
+  assert.equal(shouldForkEmbeddedUuidForLiveOwner({
+    embeddedUuid: null, embeddedOwner: owner, identityObject: successor, ownerIsOpenWorkflow: true
+  }), false)
+  assert.equal(shouldForkEmbeddedUuidForLiveOwner({
+    embeddedUuid: 'uuid-A', embeddedOwner: null, identityObject: successor, ownerIsOpenWorkflow: true
+  }), false)
+  assert.equal(shouldForkEmbeddedUuidForLiveOwner(), false)
+})
+
+// #558 r9 P0 — a CLOSED owner is not succession: without positive evidence this
+// object continues the owner's FILE, a different-path copy must FORK, never
+// inherit (inheriting re-keys the uuid's owner record to the copy and lets
+// stale uuid-scoped commands for the old workflow pass the fence against it).
+test('#557 r9: closed-owner inheritance requires positive succession evidence', () => {
+  const owner = { isPersisted: true, path: 'workflows/x.json' }
+  const copy = { isPersisted: true, path: 'workflows/y.json' }
+  // Closed owner + NO succession evidence (default fails safe) → FORK.
+  assert.equal(shouldForkEmbeddedUuidForLiveOwner({
+    embeddedUuid: 'uuid-A', embeddedOwner: owner, identityObject: copy, ownerIsOpenWorkflow: false
+  }), true)
+  assert.equal(shouldForkEmbeddedUuidForLiveOwner({
+    embeddedUuid: 'uuid-A', embeddedOwner: owner, identityObject: copy,
+    ownerIsOpenWorkflow: false, successionProven: false
+  }), true)
+  // Closed owner + proven succession (same-file successor) → INHERIT.
+  assert.equal(shouldForkEmbeddedUuidForLiveOwner({
+    embeddedUuid: 'uuid-A', embeddedOwner: owner, identityObject: copy,
+    ownerIsOpenWorkflow: false, successionProven: true
+  }), false)
+})
+
+test('#557 r9/r10: hasEmbeddedUuidSuccessionEvidence — file path record or alias ONLY', () => {
+  const owner = { isPersisted: true, path: 'workflows/x.json' }
+  // 1. The file's own recorded workflow_path ties the uuid to this object's file.
+  assert.equal(hasEmbeddedUuidSuccessionEvidence({
+    embeddedUuid: 'uuid-A', embeddedPath: 'workflows/x.json', currentPath: 'workflows/x.json'
+  }), true)
+  assert.equal(hasEmbeddedUuidSuccessionEvidence({
+    embeddedUuid: 'uuid-A', embeddedPath: 'workflows\\x.json', currentPath: 'workflows/x.json'
+  }), true, 'separator normalization still ties the same file')
+  // 2. The canonical path alias ties this object's path to the uuid.
+  assert.equal(hasEmbeddedUuidSuccessionEvidence({
+    embeddedUuid: 'uuid-A', currentPath: 'workflows/y.json', pathAlias: 'uuid-A'
+  }), true)
+  // r10 P0: the owner's file MATCHING this object's path is NOT evidence — a
+  // closed→reopened object at the same path is a NEW identity, and its resume
+  // heal belongs to the unregistered-embedded path, not registered-owner
+  // inheritance.
+  assert.equal(hasEmbeddedUuidSuccessionEvidence({
+    embeddedUuid: 'uuid-A', embeddedPath: null, currentPath: 'workflows/x.json',
+    pathAlias: null, embeddedOwner: owner
+  }), false)
+  // The r9 hole: different-path copy, file carries ONLY workflow_uuid (no
+  // workflow_path), no alias → NO evidence → fork.
+  assert.equal(hasEmbeddedUuidSuccessionEvidence({
+    embeddedUuid: 'uuid-A', embeddedPath: null, currentPath: 'workflows/y.json',
+    pathAlias: null, embeddedOwner: owner
+  }), false)
+  // An UNSAVED owner has no unique path (#186) — never evidence.
+  assert.equal(hasEmbeddedUuidSuccessionEvidence({
+    embeddedUuid: 'uuid-A', currentPath: 'workflows/Unsaved Workflow.json',
+    embeddedOwner: { isPersisted: false, path: 'workflows/Unsaved Workflow.json' }
+  }), false)
+  assert.equal(hasEmbeddedUuidSuccessionEvidence(), false)
+})
+
+// #558 r2 — openWorkflows holds Vue PROXIES while the owner/uuid WeakMaps can hold
+// RAW objects (the workflow-save.test.mjs store double models exactly this), so
+// identity across those carriers must be proxy-safe.
+test('rawWorkflowObject: unwraps __v_raw, passes raw objects and transparent proxies through', () => {
+  const raw = { path: 'workflows/x.json' }
+  assert.equal(rawWorkflowObject(raw), raw)
+  const proxy = new Proxy(raw, {})
+  assert.equal(rawWorkflowObject(proxy), proxy, 'a transparent proxy has no raw back-pointer')
+  assert.equal(rawWorkflowObject({ __v_raw: raw }), raw)
+  assert.equal(rawWorkflowObject(null), null)
+  assert.equal(rawWorkflowObject(undefined), null)
+})
+
+test('sameWorkflowObject: a Vue proxy and its raw target are the SAME workflow', () => {
+  const raw = { isPersisted: true, path: 'workflows/b.json', changeTracker: { activeState: null } }
+  const proxy = new Proxy(raw, {}) // transparent proxy — the repo's store-double idiom
+  assert.equal(sameWorkflowObject(raw, proxy), true)
+  assert.equal(sameWorkflowObject(proxy, raw), true)
+  assert.equal(sameWorkflowObject(proxy, proxy), true)
+  // A Vue-style proxy exposing the raw target as __v_raw.
+  const vueProxy = { __v_raw: raw }
+  assert.equal(sameWorkflowObject(vueProxy, raw), true)
+  assert.equal(sameWorkflowObject(raw, vueProxy), true)
+})
+
+test('sameWorkflowObject: distinct workflows never match — incl. same-path unsaved tabs (#186)', () => {
+  const raw = { isPersisted: true, path: 'workflows/b.json', changeTracker: {} }
+  assert.equal(sameWorkflowObject(raw, { isPersisted: true, path: 'workflows/c.json' }), false)
+  // Two UNSAVED tabs share the synthetic path; identity falls to the per-instance
+  // changeTracker object, which differs.
+  const unsavedA = { isPersisted: false, path: 'workflows/Unsaved Workflow.json', changeTracker: {} }
+  const unsavedB = { isPersisted: false, path: 'workflows/Unsaved Workflow.json', changeTracker: {} }
+  assert.equal(sameWorkflowObject(unsavedA, unsavedB), false)
+  assert.equal(sameWorkflowObject(unsavedA, new Proxy(unsavedA, {})), true)
+  // Two not-yet-loaded unsaved tabs (no tracker) can never be proven same.
+  assert.equal(sameWorkflowObject({ isPersisted: false }, { isPersisted: false }), false)
+  assert.equal(sameWorkflowObject(null, raw), false)
+  assert.equal(sameWorkflowObject(raw, null), false)
+  assert.equal(sameWorkflowObject(null, null), false)
+})
+
+// #558 r3 P0 — path equality alone must NOT prove object identity: two distinct
+// objects sharing a path are the same identity ONLY across a continuous-lifetime
+// replacement (the save-swap, threaded via the replacement event). A
+// closed→reopened object at the same path is a NEW workflow.
+test('sameWorkflowObject r3: same-path distinct objects are NOT one identity (closed→reopened is new)', () => {
+  assert.equal(sameWorkflowObject(
+    { isPersisted: true, path: 'workflows/b.json', changeTracker: { activeState: null } },
+    { isPersisted: true, path: 'workflows/b.json', changeTracker: { activeState: null } }
+  ), false)
+  assert.equal(sameWorkflowObject(
+    { isPersisted: true, path: 'workflows/b.json', changeTracker: {} },
+    { isPersisted: true, path: 'workflows/b.json', changeTracker: null }
+  ), false)
+  assert.equal(sameWorkflowObject(
+    { isPersisted: true, path: 'workflows/b.json' },
+    { isPersisted: true, path: 'workflows/b.json' }
+  ), false)
+})
+
+test('#557 r3/r4/r8: identity carries across a save object-swap ONLY with save-produced-record continuity', () => {
+  const pre = { isPersisted: true, path: 'workflows/x.json', changeTracker: {} }
+  const successor = { isPersisted: true, path: 'workflows/x.json', changeTracker: {} }
+  // In-place / first save that swapped the object, predecessor GONE from the open
+  // tabs, and the post-save active object IS the service's record for the file
+  // this save wrote (save-produced-record continuity) → carry.
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: false, postWfIsSaveProducedRecord: true
+  }), true)
+  // r8 P0: static tracker/state evidence is NOT continuity — a lagging
+  // activeState carrying the pre-save uuid can be a closed/reopened tab's
+  // residue. Without the target-record thread, never carry.
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: false, successorCarriesPreUuid: true
+  }), false)
+  // r5 P0: tab-slot occupancy is NOT continuity — a closed-then-compacted list
+  // can seat a foreign B in A's old slot with zero A lineage.
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: false, successorInPreSlot: true
+  }), false)
+  // r7 P0: an established, DIFFERENT identity on the successor vetoes the carry —
+  // overwriting it would promote the stamp over the object's own identity and
+  // poison the owner map (the r6 stale-lineage bypass via registration).
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: false,
+    postWfIsSaveProducedRecord: true, postWfHasConflictingEstablishedIdentity: true
+  }), false)
+  // r4 P0: the predecessor is STILL OPEN — a user/reconnect tab switch during the
+  // awaited save lands on a DISTINCT workflow; seeding it with A's uuid would
+  // bypass the #349 wrong-canvas fence → never carry.
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: true, postWfIsSaveProducedRecord: true
+  }), false)
+  // No continuity evidence → never carry (an unknown predecessor state defaults
+  // to still-open, fail-safe).
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({ preWf: pre, postWf: successor, savedAs: false }), false)
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: false
+  }), false)
+  // A Save-As COPY starts a new workflow → never carry (#226/#570).
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: pre, postWf: successor, savedAs: true, preWfStillOpen: false, postWfIsSaveProducedRecord: true
+  }), false)
+  // Same object (no swap) / a proxy form of the same object → nothing to carry.
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: pre, postWf: pre, savedAs: false, preWfStillOpen: false, postWfIsSaveProducedRecord: true
+  }), false)
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: pre, postWf: { __v_raw: pre }, savedAs: false, preWfStillOpen: false, postWfIsSaveProducedRecord: true
+  }), false)
+  // Missing sides → no carry.
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: null, postWf: successor, savedAs: false, preWfStillOpen: false, postWfIsSaveProducedRecord: true
+  }), false)
+  assert.equal(shouldCarryIdentityAcrossSaveSwap(), false)
 })
 
 // Fakes for the ComfyWorkflow 4th arg: a REUSE passes a ComfyWorkflow OBJECT; a CREATION

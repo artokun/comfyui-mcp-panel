@@ -251,6 +251,38 @@ export function graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid } =
 }
 
 /**
+ * #545/#557 — a root-tag/active-identity UUID conflict is not always a wrong
+ * canvas. The tag is panel-owned bookkeeping, and a save or reconnect can drift
+ * it from the ACTIVE workflow's resolved identity while the root is still that
+ * workflow's own canvas. For that case the guard must be RECOVERABLE: re-stamp
+ * the root with the active identity instead of hard-blocking every graph tool
+ * until a frontend reload.
+ *
+ * Returns:
+ *   "none"     — no UUID conflict (missing identity on either side stays
+ *                inconclusive, exactly like graphRootWorkflowUuidMismatches);
+ *   "rebind"   — the ACTIVE workflow ITSELF claims the tag (its resolver
+ *                identity, its own serialized state, or its registered owner
+ *                record ties it to the tag): the tag is the active tab's own
+ *                lineage, stale relative to its current identity, so the root
+ *                is provably its own canvas — re-stamp and proceed;
+ *   "conflict" — anything else. A tag claimed by a FOREIGN open workflow is the
+ *                #349 wrong-canvas case, and a tag NOBODY claims may be a
+ *                closed tab's stale canvas — re-stamping either would authorize
+ *                writes to a graph that is not the active workflow's (r4/r5
+ *                P0). Both fail closed; the remedy for a genuinely drifted
+ *                binding is panel_open_workflow's proven repaint re-stamp.
+ */
+export function resolveGraphRootUuidRebind({
+  rootGraph,
+  activeWorkflowUuid,
+  rootTagClaimedByActiveWorkflow = false,
+} = {}) {
+  if (!graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid })) return "none";
+  return rootTagClaimedByActiveWorkflow ? "rebind" : "conflict";
+}
+
+/**
  * Whether a bridge graph command can change durable workflow state.
  *
  * A dirty workflow without a root UUID is not sufficiently proven for a graph

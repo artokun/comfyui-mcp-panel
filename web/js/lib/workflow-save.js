@@ -559,7 +559,11 @@ export async function saveActiveWorkflow(
   }
   if (inPlace === "authorize") markPersistedForOverwrite(wf); // sync (post-assert) ⇒ no leak window
   recordOutcome(details, "in-place", { sourcePath: currentPath, targetPath: finalTargetPath });
-  await saveInPlace(svc, wf);
+  const savedRecord = await saveInPlace(svc, wf);
+  // r10 — thread the save API's own produced record (when it returns one) through
+  // details, so the identity carry can prove succession from the replacement
+  // EVENT. An empty/non-object return simply carries no thread (fail safe).
+  if (details && savedRecord && typeof savedRecord === "object") details.savedRecord = savedRecord;
   return desired || currentName || null;
 }
 
@@ -977,9 +981,13 @@ export function normalizePath(path) {
 }
 
 async function saveInPlace(svc, wf) {
-  if (typeof svc.saveWorkflow === "function") await svc.saveWorkflow(wf);
-  else if (typeof wf.save === "function") await wf.save();
-  else throw new Error("workflow save API unavailable on this frontend");
+  // Return the save API's own result: when it yields the workflow record it
+  // PRODUCED (a re-registered successor object), that is the one unambiguous
+  // replacement-event thread the identity carry can use (r10) — path occupancy
+  // proves nothing (a close→reopen occupies the same path with a new identity).
+  if (typeof svc.saveWorkflow === "function") return await svc.saveWorkflow(wf);
+  if (typeof wf.save === "function") return await wf.save();
+  throw new Error("workflow save API unavailable on this frontend");
 }
 
 /** True when `err` is a name-collision (HTTP 409) from the userdata write — the

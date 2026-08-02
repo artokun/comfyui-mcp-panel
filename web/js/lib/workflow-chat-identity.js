@@ -14,6 +14,86 @@ export function workflowAliasForPath(aliases, path) {
   return typeof match?.[1] === "string" && match[1] ? match[1] : null;
 }
 
+/** Vue reactive proxies expose their raw target as `__v_raw`; everything else is
+ *  returned as-is. The workflow service hands out reactive PROXIES in computed
+ *  lists (openWorkflows) while RAW objects flow through other paths (store
+ *  returns, the uuid owner/object WeakMaps), so identity comparisons across
+ *  those carriers must normalize first — a raw `===`/`includes` misreads a live
+ *  proxy as a different object (#558 r2). A transparent (non-Vue) proxy has no
+ *  raw back-pointer and passes through; sameWorkflowObject's property identity
+ *  covers that form. */
+export function rawWorkflowObject(w) {
+  try {
+    return w?.__v_raw ?? w ?? null;
+  } catch {
+    return w ?? null;
+  }
+}
+
+/** Proxy-safe identity between two workflow references. Layers, strongest first:
+ *  object identity (after unwrapping Vue proxies), then the per-instance
+ *  changeTracker OBJECT — the strongest shared identity a proxy reflects, and
+ *  the only one available for an UNSAVED tab (whose synthetic path is shared by
+ *  every unsaved tab, #186). PATH IS DELIBERATELY NOT EVIDENCE: two distinct
+ *  objects can share a path across a close→reopen, and that reopened object is
+ *  a NEW workflow — treating path as identity let a live foreign owner read as
+ *  self (#558 r3 P0). The one legitimate same-path identity continuation, a
+ *  save swapping the active object, is threaded through the replacement event
+ *  instead (shouldCarryIdentityAcrossSaveSwap). Two references that share NONE
+ *  of these carriers can never be proven same → false. */
+export function sameWorkflowObject(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (rawWorkflowObject(a) === rawWorkflowObject(b)) return true;
+  const ctA = rawWorkflowObject(a)?.changeTracker ?? a?.changeTracker;
+  const ctB = rawWorkflowObject(b)?.changeTracker ?? b?.changeTracker;
+  return Boolean(ctA) && ctA === ctB;
+}
+
+/** #557 r3/r4 — should the pre-save identity be carried onto the post-save active
+ *  object? True ONLY for a continuous-lifetime replacement: an in-place or
+ *  first save (NOT a Save-As copy — that starts a new workflow) that swapped
+ *  the active ComfyWorkflow object. The swap is provable ONLY at the
+ *  replacement event, where the predecessor and successor objects are both
+ *  known; static path equality cannot decide it — a closed→reopened object at
+ *  the same path is a NEW workflow (r3 P0), while a swapped successor is the
+ *  same tab. A proxy/raw form of the SAME object is no swap at all.
+ *
+ *  CONTINUITY (r4/r5/r8/r10 P0): "whatever is active after the awaited save" is
+ *  not enough — a user/reconnect tab switch DURING the await lands on a DISTINCT
+ *  workflow, and seeding it with the pre-save uuid would align that foreign tab
+ *  with the old root tag, bypassing the #349 wrong-canvas fence. The carry
+ *  therefore requires the predecessor to be GONE from the open tabs (a genuine
+ *  swap removes it; a switch keeps it open) AND continuity threaded from the
+ *  save's own replacement EVENT: the post-save active object must be the record
+ *  the save API itself PRODUCED. STATIC evidence is deliberately excluded:
+ *  tab-slot occupancy can seat a foreign tab in the predecessor's old slot
+ *  (r5), a lagging tracker state carrying the pre-save uuid can be residue
+ *  (r8), and path occupancy is satisfied by any close→reopen of the same file —
+ *  which is a NEW identity, not a successor (r10). A successor the event thread
+ *  can't prove fails SAFE (no carry); the lazy backstop / proven repaint heals
+ *  the genuine case afterward. Unknown predecessor state defaults to still-open
+ *  (fail-safe: no carry). */
+export function shouldCarryIdentityAcrossSaveSwap({
+  preWf,
+  postWf,
+  savedAs = false,
+  preWfStillOpen = true,
+  postWfHasConflictingEstablishedIdentity = false,
+  postWfIsSaveProducedRecord = false,
+} = {}) {
+  if (savedAs) return false;
+  if (!preWf || !postWf || typeof postWf !== "object") return false;
+  if (preWf === postWf || sameWorkflowObject(preWf, postWf)) return false;
+  if (preWfStillOpen) return false;
+  // r7 P0 — an established, DIFFERENT identity on the successor is a conflict:
+  // overwriting it would promote the pre-save stamp over the object's own
+  // identity and poison the owner map (the r6 stale-lineage bypass, via
+  // registration this time). Fail closed; the proven-repaint remedy heals.
+  if (postWfHasConflictingEstablishedIdentity) return false;
+  return postWfIsSaveProducedRecord === true;
+}
+
 /** Return true when an embedded UUID belongs to a different workflow file.
  *  An existing objectUuid means ComfyUI mutated the same live workflow object
  *  during rename/Save-As, so continuity wins. Otherwise an embedded path or a
@@ -64,6 +144,66 @@ export function shouldForkEmbeddedWorkflowUuid({
  *  A mis-classified reuse only loses durability (P1, a fresh session); a mis-classified
  *  creation that INHERITED the source identity would be a wrong-resume (P0) — so, faced
  *  with an ambiguous arg, fork. */
+/** #557 — should a previously-unseen workflow object FORK away from an embedded
+ *  UUID that is still owned by a DIFFERENT live object? Fork while that owner
+ *  is still an OPEN workflow tab — the genuine co-open copy case (#570) — and
+ *  ALSO when the owner is closed but succession is NOT proven (r9 P0): "the
+ *  owner is gone" alone does not make this object the successor — a
+ *  different-path copy of the file qualifies just as well, and inheriting
+ *  re-keys the uuid's owner record to the copy so stale uuid-scoped commands
+ *  for the old workflow pass the command fence against it. Only a closed owner
+ *  WITH positive succession evidence (hasEmbeddedUuidSuccessionEvidence) lets
+ *  this object INHERIT — the save re-registers/replaces the active
+ *  ComfyWorkflow object and the successor parses the same embedded uuid from
+ *  the just-saved file while the REPLACED object is still the registered
+ *  owner; minting fresh there desyncs it from the root graph tag the
+ *  graph-binding guard compares against (#557). */
+export function shouldForkEmbeddedUuidForLiveOwner({
+  embeddedUuid,
+  embeddedOwner,
+  identityObject,
+  ownerIsOpenWorkflow = false,
+  successionProven = false,
+} = {}) {
+  if (!embeddedUuid || !embeddedOwner || embeddedOwner === identityObject) return false;
+  if (ownerIsOpenWorkflow === true) return true; // a LIVE co-open owner → genuine copy
+  // r9 P0 — a CLOSED owner is not succession: without positive evidence this
+  // object continues the owner's file, fork rather than inherit.
+  return successionProven !== true;
+}
+
+/** #557 r9/r10 — POSITIVE succession evidence for inheriting a CLOSED owner's
+ *  embedded uuid. "The owner is gone" alone does not make this object the
+ *  successor — a different-path COPY of the file qualifies just as well, and
+ *  inheriting would re-key the uuid's owner record to the copy, letting stale
+ *  uuid-scoped commands for the old workflow pass the command fence against it
+ *  (r9 P0). Evidence:
+ *   1. the file's OWN recorded workflow_path ties the uuid to THIS object's file;
+ *   2. the canonical path alias ties THIS object's path to the uuid.
+ *  The owner's file MATCHING this object's path is deliberately NOT evidence
+ *  (r10 P0): a closed→reopened object at the same path is a NEW identity, not a
+ *  successor — the resume heal for that case belongs to the
+ *  UNREGISTERED-embedded path (no owner record), never to registered-owner
+ *  inheritance. Absent both layers — notably a file carrying only
+ *  workflow_uuid, saved from an unsaved tab whose embed omitted workflow_path —
+ *  fail toward FORKING. */
+export function hasEmbeddedUuidSuccessionEvidence({
+  embeddedUuid,
+  embeddedPath,
+  currentPath,
+  pathAlias,
+} = {}) {
+  if (
+    embeddedPath &&
+    currentPath &&
+    normalizedWorkflowPath(embeddedPath) === normalizedWorkflowPath(currentPath)
+  ) {
+    return true;
+  }
+  if (typeof pathAlias === "string" && pathAlias && pathAlias === embeddedUuid) return true;
+  return false;
+}
+
 /** #570 P0b — should an IN-PLACE graph load (loadGraphData into an EXISTING workflow object)
  *  FORK the per-instance identity? A stale object-cache must NEVER override the identity of
  *  newly-loaded content, and ownership is anchored on the LIVE object (not copyable
