@@ -122,6 +122,14 @@ test("#572 rejects ambiguous, incomplete, and unsafe inputs before mutation", ()
   assert.deepEqual(events, []);
 });
 
+test("#538 rejects inherited mode names without mutating the node", () => {
+  const node = makeNode(1);
+  const { fn, events } = setup([node]);
+  assert.throws(() => fn({ node_id: 1, mode: "toString" }), /mode must be/);
+  assert.equal(node.mode, undefined);
+  assert.deepEqual(events, []);
+});
+
 test("#572 preserves the subgraph bypass preflight and force warning", () => {
   const node = { ...makeNode(1), subgraph: {}, inputs: [{ name: "image", type: "IMAGE" }], outputs: [{ name: "mask", type: "MASK", links: [9] }] };
   const mismatch = [{ output_name: "mask", output_type: "MASK", input_name: "image", input_type: "IMAGE" }];
@@ -160,15 +168,29 @@ test("#572 does not mistake a real root-graph node id for a boundary rail", () =
 test("#572 restores all presentation state when a later target throws", () => {
   const first = makeNode(1, { pos: [1, 2] });
   const second = makeNode(2, { pos: [3, 4] });
+  const firstSetSizes = [];
+  first.setSize = (next) => {
+    firstSetSizes.push([...next]);
+    first.size = [...next];
+    first.widgetLayoutSize = [...next];
+  };
   second.setSize = () => { throw new Error("reject resize"); };
   const { fn, events } = setup([first, second]);
 
   assert.throws(() => fn({ node_ids: [1, 2], pos: [50, 60], size: [300, 150], title: "changed" }), /reject resize/);
   assert.deepEqual(first.pos, [1, 2]);
   assert.deepEqual(first.size, [140, 60]);
+  assert.deepEqual(first.widgetLayoutSize, [140, 60], "rollback must restore setSize-driven widget/layout state");
+  assert.deepEqual(firstSetSizes, [[300, 150], [140, 60]], "rollback reuses setSize for an already-applied node");
   assert.equal(first.title, "Node 1");
   assert.deepEqual(second.pos, [3, 4]);
   assert.equal(second.title, "Node 2");
   assert.deepEqual(events.filter((e) => e === "before" || e === "after"), ["before", "after"]);
-  assert.equal(events.includes("dirty"), false, "a failed atomic edit must not claim a clean redraw/success");
+  assert.equal(events.at(-1), "dirty", "a failed atomic edit redraws its restored state before surfacing the error");
+});
+
+test("#538 retains every legacy presentation bridge command for old MCP servers", () => {
+  for (const command of ["graph_move_node", "graph_resize_node", "graph_set_title", "graph_set_node_collapsed", "graph_set_node_color", "graph_set_node_mode"]) {
+    assert.match(panelSrc, new RegExp(`\\n  ${command}\\(`));
+  }
 });

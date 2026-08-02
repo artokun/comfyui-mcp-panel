@@ -6947,12 +6947,14 @@ const GRAPH_TOOL_EXECUTORS = {
       throw new Error(`${args.node_id} is a subgraph boundary rail, which only exists inside a subgraph — enter the subgraph first (panel_enter_subgraph).`);
     }
     const nodes = rail ? [rail.node] : ids.map((id) => resolveNode(graph, id));
-    const MODE_TO_NUM = { active: 0, bypass: 4, mute: 2 };
+    const MODE_TO_NUM = Object.assign(Object.create(null), { active: 0, bypass: 4, mute: 2 });
     const NUM_TO_MODE = { 0: "active", 2: "mute", 4: "bypass" };
     let targetMode = null;
     const modeWarnings = [];
     if (own("mode")) {
-      if (!(args.mode in MODE_TO_NUM)) throw new Error('mode must be "active", "bypass", or "mute"');
+      if (typeof args.mode !== "string" || !Object.prototype.hasOwnProperty.call(MODE_TO_NUM, args.mode)) {
+        throw new Error('mode must be "active", "bypass", or "mute"');
+      }
       targetMode = MODE_TO_NUM[args.mode];
       for (const node of nodes) {
         if (targetMode !== MODE_TO_NUM.bypass || !node.subgraph) continue;
@@ -6995,10 +6997,20 @@ const GRAPH_TOOL_EXECUTORS = {
       const node = s.node;
       const currentPos = [...(node.pos ?? [])];
       node.pos = [...s.pos];
-      // Rollback must not call the same extension hook that just threw. Restore the
-      // authoritative saved geometry directly so a failing second target cannot trap
-      // an earlier target in a half-applied multi-node edit.
-      node.size = [...s.size];
+      // Re-run LiteGraph's geometry path for targets that already accepted the edit:
+      // setSize carries widget/layout side effects which a raw node.size assignment
+      // cannot undo. If an extension rejects restoration too, preserve the captured
+      // geometry directly rather than leaving a partial transaction behind.
+      let restoredSize = false;
+      if (typeof node.setSize === "function") {
+        try {
+          node.setSize([...s.size]);
+          restoredSize = node.size?.[0] === s.size[0] && node.size?.[1] === s.size[1];
+        } catch {
+          // Fall through to the authoritative snapshot assignment below.
+        }
+      }
+      if (!restoredSize) node.size = [...s.size];
       refreshNodeArea(node, currentPos);
       node.title = s.title;
       if (s.hasColor) node.color = s.color;
@@ -7025,6 +7037,7 @@ const GRAPH_TOOL_EXECUTORS = {
       mode: NUM_TO_MODE[typeof node.mode === "number" ? node.mode : 0] ?? node.mode,
     });
 
+    let failed = false;
     graph.beforeChange?.();
     try {
       for (const node of nodes) {
@@ -7065,9 +7078,13 @@ const GRAPH_TOOL_EXECUTORS = {
       }
     } catch (error) {
       for (const state of before) restore(state);
+      failed = true;
       throw error;
     } finally {
       graph.afterChange?.();
+      // A failure has restored state but may have already caused node/widget layout
+      // side effects. Paint the restored canvas before surfacing the error.
+      if (failed) graph.setDirtyCanvas?.(true, true);
     }
     graph.setDirtyCanvas?.(true, true);
     const summarizeBefore = (state) => ({
@@ -7083,6 +7100,43 @@ const GRAPH_TOOL_EXECUTORS = {
       mode: NUM_TO_MODE[typeof state.mode === "number" ? state.mode : 0] ?? state.mode,
     });
     return { edited: nodes.map((node, i) => ({ before: summarizeBefore(before[i]), after: summarize(node) })), ...(modeWarnings.length ? { warnings: modeWarnings } : {}) };
+  },
+
+  // Legacy bridge names stay registered for MCP servers paired with older panel
+  // releases. Newer panels funnel their presentation writes through graph_edit_node
+  // while retaining the legacy response shapes expected by existing callers.
+  graph_move_node({ node_id, pos }) {
+    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id, pos });
+    const edit = result.edited[0];
+    return { moved: { node_id: edit.after.node_id, from: edit.before.pos, to: edit.after.pos } };
+  },
+
+  graph_resize_node({ node_id, size }) {
+    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id, size });
+    const edit = result.edited[0];
+    return { resized: { node_id: edit.after.node_id, from: edit.before.size, to: edit.after.size } };
+  },
+
+  graph_set_title({ node_id, title }) {
+    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id, title });
+    const edit = result.edited[0];
+    return { node_id: edit.after.node_id, previous: edit.before.title, title: edit.after.title };
+  },
+
+  graph_set_node_collapsed({ node_id, collapsed }) {
+    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id, collapsed: collapsed !== false });
+    const edit = result.edited[0];
+    return { node_id: edit.after.node_id, collapsed: edit.after.collapsed };
+  },
+
+  graph_set_node_color({ node_id, color, bgcolor, preset }) {
+    const args = { node_id };
+    if (preset !== undefined) args.preset = preset;
+    if (color !== undefined) args.color = color;
+    if (bgcolor !== undefined) args.bgcolor = bgcolor;
+    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node(args);
+    const edit = result.edited[0];
+    return { node_id: edit.after.node_id, color: edit.after.color, bgcolor: edit.after.bgcolor };
   },
 
   // Dependency-aware auto-layout of the active graph (or a `node_ids` subset).
@@ -9236,7 +9290,7 @@ const GRAPH_TOOL_EXECUTORS = {
   graph_set_node_mode({ node_id, mode, force }) {
     const { graph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
-    const MODE_TO_NUM = { active: 0, bypass: 4, mute: 2 };
+    const MODE_TO_NUM = Object.assign(Object.create(null), { active: 0, bypass: 4, mute: 2 });
     const NUM_TO_MODE = { 0: "active", 2: "mute", 4: "bypass" };
     let target;
     if (typeof mode === "number" || (typeof mode === "string" && /^\d+$/.test(mode.trim()))) {
@@ -9247,7 +9301,7 @@ const GRAPH_TOOL_EXECUTORS = {
       target = n;
     } else {
       const key = String(mode ?? "").toLowerCase();
-      if (!(key in MODE_TO_NUM)) {
+      if (!Object.prototype.hasOwnProperty.call(MODE_TO_NUM, key)) {
         throw new Error(`invalid mode "${mode}" (valid: "active", "bypass", "mute")`);
       }
       target = MODE_TO_NUM[key];
@@ -12346,6 +12400,16 @@ function describeCommand(cmd, msg, reply) {
       const suffix = edited.length === 1 ? `node ${edited[0]?.after?.node_id}` : `${edited.length} nodes`;
       return { icon: "pi-pencil", text: `Edited ${suffix} presentation` };
     }
+    case "graph_move_node":
+      return { icon: "pi-arrows-alt", text: `Moved node ${r.moved?.node_id} to [${r.moved?.to?.map(Math.round)}]` };
+    case "graph_resize_node":
+      return { icon: "pi-expand", text: `Resized node ${r.resized?.node_id} to [${r.resized?.to?.map(Math.round)}]` };
+    case "graph_set_title":
+      return { icon: "pi-pencil", text: `Renamed node ${r.node_id}` };
+    case "graph_set_node_collapsed":
+      return { icon: r.collapsed ? "pi-minus-circle" : "pi-plus-circle", text: `${r.collapsed ? "Collapsed" : "Expanded"} node ${r.node_id}` };
+    case "graph_set_node_color":
+      return { icon: "pi-palette", text: `Set node ${r.node_id} colors` };
     case "graph_set_node_property":
       return r.live_effect_error
         ? {
