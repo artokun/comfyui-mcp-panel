@@ -4107,6 +4107,30 @@ function getGraphCtx() {
 // than return empty". Fail-safe: fires ONLY when the workflow reports N>0 nodes at
 // ROOT scope while the live root graph is empty, so a genuinely-empty / brand-new
 // workflow (and any descended-into empty subgraph) reads `node_count: 0` as before.
+// #349 — does OPEN workflow `w` claim rootUuid as its identity? Checked two ways,
+// because the identity carriers can lag: (1) the root-blind resolver — the same
+// identity the command fence uses for that tab; (2) the tab's OWN serialized
+// state, which still carries the graph stamp a CREATION made before any resolver
+// or owner record existed for it (creation loadGraphData calls pass no workflow
+// object, so nothing is registered in _workflowObjectUuids/_workflowUuidOwners at
+// stamp time). Either claim makes the tag that tab's live identity — never stale
+// bookkeeping the desync guard may rebind over.
+function workflowOwnsRootUuidTag(w, rootUuid) {
+  if (!w || typeof rootUuid !== "string" || !rootUuid) return false;
+  try {
+    if (workflowStableUuid(w) === rootUuid) return true;
+  } catch {
+    // Fall through to the serialized-state claim.
+  }
+  try {
+    const state = w?.changeTracker?.activeState ?? w?.activeState;
+    const stamped = state?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD];
+    return typeof stamped === "string" && stamped === rootUuid;
+  } catch {
+    return false;
+  }
+}
+
 function assertGraphBoundToActiveWorkflow(
   graph,
   rootGraph,
@@ -4125,22 +4149,27 @@ function assertGraphBoundToActiveWorkflow(
     : null;
   // #545/#557 — a root-tag UUID conflict is not self-healing: a save or reconnect
   // can REPLACE the live ComfyWorkflow object, leaving the root stamped with an
-  // identity whose owner no longer exists as an open tab. Unless another LIVE
-  // open workflow owns the tag, the mismatch is stale bookkeeping rather than a
-  // foreign canvas — re-stamp the root with the active identity and proceed,
-  // instead of hard-blocking every graph tool until a frontend reload. A tag
-  // owned by another OPEN workflow is the genuine #349 wrong-canvas case: it
-  // still throws below, preserving the data-loss protection.
+  // identity no live open tab claims. Such an orphaned tag is stale bookkeeping
+  // rather than a foreign canvas — re-stamp the root with the active identity
+  // and proceed, instead of hard-blocking every graph tool until a frontend
+  // reload. A tag claimed by another LIVE OPEN workflow is the genuine #349
+  // wrong-canvas case: it still throws below, preserving the data-loss
+  // protection.
   let rootUuidMismatch = graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid });
   if (rootUuidMismatch) {
     const rootUuid = rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD];
-    const tagOwner = workflowUuidOwner(rootUuid);
+    // The tag stays a hard wrong-canvas refusal whenever ANY OTHER LIVE OPEN
+    // workflow claims it (#349). Decide by ENUMERATING the open tabs, never the
+    // owner map alone: a creation stamps the graph without any owner/uuid-cache
+    // record (creation loadGraphData passes no workflow object), and a save can
+    // leave the owner map pointing at the replaced predecessor — so a missing or
+    // stale owner record must never be what authorizes a rebind over a live
+    // tab's canvas (codex P0). Fail closed when the open-tab list itself is
+    // unavailable: an unverifiable claim is a claim.
     const openWorkflows = app?.extensionManager?.workflow?.openWorkflows;
     const rootTagOwnedByForeignOpenWorkflow =
-      !!tagOwner &&
-      tagOwner !== activeWorkflow &&
-      Array.isArray(openWorkflows) &&
-      openWorkflows.includes(tagOwner);
+      !Array.isArray(openWorkflows) ||
+      openWorkflows.some((w) => w && w !== activeWorkflow && workflowOwnsRootUuidTag(w, rootUuid));
     if (
       resolveGraphRootUuidRebind({ rootGraph, activeWorkflowUuid, rootTagOwnedByForeignOpenWorkflow }) ===
       "rebind"

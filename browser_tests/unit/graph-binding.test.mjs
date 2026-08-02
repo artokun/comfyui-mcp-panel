@@ -43,30 +43,45 @@ function panelFunctionSource(src, name, nextName) {
   return src.slice(start, end);
 }
 
-// tagOwnerKind models WHO owns the root graph's stamped uuid when it conflicts
-// with the active workflow's identity (#545/#557):
-//   "foreign-open" — another LIVE OPEN workflow tab (the genuine #349 wrong
-//                    canvas): the guard must keep throwing;
-//   "orphaned"     — an object that is no longer an open tab (a save/reconnect
-//                    replaced it): stale bookkeeping — the guard must rebind;
-//   "untracked"    — no owner record at all: also stale bookkeeping — rebind.
-function buildDirtyStaleRouteHarness({ rootUuid = "workflow-B", tagOwnerKind = "foreign-open" } = {}) {
+// foreignClaim models WHETHER a live open tab claims the root tag when it
+// conflicts with the active workflow's identity (#349/#545/#557):
+//   "identity"      — tab B is OPEN and the root-blind resolver returns the tag
+//                     for it: the guard must keep throwing;
+//   "tracker-stamp" — tab B is OPEN, the resolver mints a DIFFERENT identity for
+//                     it, but B's OWN serialized state still carries the tag (a
+//                     creation stamp no resolver run or owner record observed —
+//                     creation loadGraphData passes no workflow object, so the
+//                     stamp was never registered): the guard must keep throwing;
+//   "none"          — NO live open tab claims the tag (a closed/replaced tab's
+//                     leftover): genuine stale bookkeeping — the guard rebinds.
+function buildDirtyStaleRouteHarness({ rootUuid = "workflow-B", foreignClaim = "identity" } = {}) {
   const src = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
   const stableSource = panelFunctionSource(src, "workflowStableUuid", "workflowStorageKey");
   const fenceSource = panelFunctionSource(src, "assertGraphBoundToActiveWorkflow", "getPiniaStore");
+  const ownsTagSource = panelFunctionSource(src, "workflowOwnsRootUuidTag", "assertGraphBoundToActiveWorkflow");
   const workflowA = { isPersisted: false, isModified: true, changeTracker: { activeState: state(27) } };
-  const workflowB = { isPersisted: true, path: "workflows/b.json", changeTracker: { activeState: state(30) } };
-  const replacedPredecessor = { isPersisted: true, path: "workflows/a.json" };
+  const workflowB = {
+    isPersisted: true,
+    path: "workflows/b.json",
+    changeTracker: {
+      activeState: {
+        ...state(30),
+        // A creation-stamped graph carries the tag in the tab's own serialized
+        // state even when no resolver/owner record ever observed it.
+        ...(foreignClaim === "tracker-stamp" && rootUuid
+          ? { extra: { comfyui_mcp: { workflow_uuid: rootUuid } } }
+          : {}),
+      },
+    },
+  };
   const rootB = {
     _nodes: Array.from({ length: 30 }, (_, i) => ({ id: i + 1, type: "KSampler" })),
     ...(rootUuid ? { extra: { comfyui_mcp: { workflow_uuid: rootUuid } } } : {}),
   };
-  const tagOwner =
-    tagOwnerKind === "foreign-open" ? workflowB : tagOwnerKind === "orphaned" ? replacedPredecessor : null;
-  const openWorkflows = tagOwnerKind === "foreign-open" ? [workflowA, workflowB] : [workflowA];
+  const openWorkflows = foreignClaim === "none" ? [workflowA] : [workflowA, workflowB];
   const objectUuids = new WeakMap();
   let minted = 0;
-  const stableUuid = new Function(
+  const stableUuidA = new Function(
     "app",
     "getTabId",
     "savedWorkflowPath",
@@ -90,6 +105,18 @@ function buildDirtyStaleRouteHarness({ rootUuid = "workflow-B", tagOwnerKind = "
     () => null,
     { randomUUID: () => `workflow-A-${++minted}` },
   );
+  // Per-tab established identities as the real resolver would produce them: A
+  // through the real (unsaved-branch) source; B returns its recorded identity —
+  // under "identity" that IS the root tag; under "tracker-stamp" the resolver
+  // minted a different identity and never observed B's graph stamp.
+  const stableUuid = (wf) =>
+    wf === workflowB ? (foreignClaim === "identity" ? rootUuid : "workflow-B-minted") : stableUuidA(wf);
+  const ownsTag = new Function(
+    "workflowStableUuid",
+    "WORKFLOW_META_NAMESPACE",
+    "WORKFLOW_UUID_FIELD",
+    `${ownsTagSource}\nreturn workflowOwnsRootUuidTag;`,
+  )(stableUuid, "comfyui_mcp", "workflow_uuid");
   const assertBound = new Function(
     "activeWorkflowRef",
     "_workflowObjectUuids",
@@ -99,7 +126,7 @@ function buildDirtyStaleRouteHarness({ rootUuid = "workflow-B", tagOwnerKind = "
     "graphRootMismatchesActiveWorkflow",
     "graphReadDesynced",
     "activeWorkflowNodeCount",
-    "workflowUuidOwner",
+    "workflowOwnsRootUuidTag",
     "rememberWorkflowUuidOwner",
     "resolveGraphRootUuidRebind",
     "WORKFLOW_META_NAMESPACE",
@@ -115,7 +142,7 @@ function buildDirtyStaleRouteHarness({ rootUuid = "workflow-B", tagOwnerKind = "
     graphRootMismatchesActiveWorkflow,
     graphReadDesynced,
     activeWorkflowNodeCount,
-    (id) => (id && id === rootUuid ? tagOwner : null),
+    ownsTag,
     () => {},
     resolveGraphRootUuidRebind,
     "comfyui_mcp",
@@ -609,7 +636,7 @@ test("resolveGraphRootUuidRebind: none without a conflict, conflict for a foreig
   assert.equal(
     resolveGraphRootUuidRebind({ rootGraph: tagged, activeWorkflowUuid: "workflow-A" }),
     "rebind",
-    "an orphaned/untracked tag is stale bookkeeping, not a wrong canvas",
+    "a tag no LIVE OPEN workflow claims is stale bookkeeping, not a wrong canvas",
   );
   assert.equal(
     resolveGraphRootUuidRebind({
@@ -630,12 +657,12 @@ test("resolveGraphRootUuidRebind: none without a conflict, conflict for a foreig
   assert.equal(resolveGraphRootUuidRebind({ rootGraph: tagged, activeWorkflowUuid: null }), "none");
 });
 
-test("#545: an ORPHANED root tag (owner replaced, no longer open) rebinds instead of blocking every tool", () => {
-  const h = buildDirtyStaleRouteHarness({ rootUuid: "workflow-B", tagOwnerKind: "orphaned" });
+test("#545: a root tag NO LIVE OPEN workflow claims (closed/replaced tab's leftover) rebinds instead of blocking every tool", () => {
+  const h = buildDirtyStaleRouteHarness({ rootUuid: "workflow-B", foreignClaim: "none" });
   h.objectUuids.set(h.workflowA, "workflow-A");
   assert.doesNotThrow(
     () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: false }),
-    "a stale tag whose owner is no longer an open workflow must not hard-block reads",
+    "a leftover tag no open tab claims must not hard-block reads",
   );
   assert.equal(
     h.rootB.extra.comfyui_mcp.workflow_uuid,
@@ -652,11 +679,44 @@ test("#545: an ORPHANED root tag (owner replaced, no longer open) rebinds instea
   );
 });
 
-test("#545: an UNTRACKED root tag (no owner record) also rebinds rather than blocking forever", () => {
-  const h = buildDirtyStaleRouteHarness({ rootUuid: "workflow-B", tagOwnerKind: "untracked" });
+test("#349: a root tag a LIVE OPEN workflow claims through the resolver must throw", () => {
+  const h = buildDirtyStaleRouteHarness({ rootUuid: "workflow-B", foreignClaim: "identity" });
   h.objectUuids.set(h.workflowA, "workflow-A");
-  assert.doesNotThrow(() => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: false }));
-  assert.equal(h.rootB.extra.comfyui_mcp.workflow_uuid, "workflow-A");
+  assert.throws(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: false }),
+    /NOT applied/,
+    "B's live open tab claims the tag — rebinding over it would authorize mutating B (#349)",
+  );
+  assert.equal(h.rootB.extra.comfyui_mcp.workflow_uuid, "workflow-B", "the foreign tag must NOT be rewritten");
+});
+
+test("#349 P0: a root tag claimed ONLY by a live open tab's serialized state (unregistered creation stamp) must throw", () => {
+  // The codex-gate hole: a CREATION stamps the graph uuid without any owner/
+  // object-cache record (creation loadGraphData passes no workflow object), so
+  // the owner map says nothing while B is LIVE in openWorkflows. The rebind must
+  // treat B's own serialized-state stamp as a foreign claim — never re-stamp B's
+  // canvas as A's.
+  const h = buildDirtyStaleRouteHarness({ rootUuid: "workflow-B", foreignClaim: "tracker-stamp" });
+  h.objectUuids.set(h.workflowA, "workflow-A");
+  assert.throws(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: false }),
+    /NOT applied/,
+    "a live but UNTRACKED foreign owner must stay fail-closed (#349)",
+  );
+  assert.throws(
+    () =>
+      h.assertBound(h.rootB, h.rootB, {
+        includeBaselineReadGuard: false,
+        requireDirtyMutationBinding: graphCommandMayMutateWorkflow("graph_set_node_property"),
+      }),
+    /NOT applied/,
+    "the same live-untracked foreign root must refuse a dirty mutation",
+  );
+  assert.equal(
+    h.rootB.extra.comfyui_mcp.workflow_uuid,
+    "workflow-B",
+    "an unregistered live creation stamp must NOT be rewritten",
+  );
 });
 
 // ── #557: save replaces the active workflow object — identity must follow ────

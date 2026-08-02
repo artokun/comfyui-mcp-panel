@@ -262,13 +262,16 @@ export function graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid } =
  * Returns:
  *   "none"     — no UUID conflict (missing identity on either side stays
  *                inconclusive, exactly like graphRootWorkflowUuidMismatches);
- *   "conflict" — the tag is positively owned by ANOTHER currently-open
+ *   "conflict" — the tag is positively claimed by ANOTHER currently-open
  *                workflow: the live root may genuinely be that tab's canvas
- *                (#349), so the data-loss protection stays fail-closed;
- *   "rebind"   — the tag is orphaned (dead/replaced/untracked owner) or names
- *                the active object itself under a former identity: the caller
- *                should re-stamp the root with the active workflow's uuid and
- *                proceed instead of throwing.
+ *                (#349), so the data-loss protection stays fail-closed. The
+ *                CALLER must establish this by enumerating the live open tabs —
+ *                a missing owner/uuid-cache record is NOT proof of orphanhood
+ *                (a creation stamps the graph before any record exists);
+ *   "rebind"   — no live open workflow claims the tag (a closed/replaced tab's
+ *                leftover, or the active object's own former identity): the
+ *                caller should re-stamp the root with the active workflow's
+ *                uuid and proceed instead of throwing.
  */
 export function resolveGraphRootUuidRebind({
   rootGraph,
