@@ -10349,12 +10349,17 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // advertised set IS the replayable set — the two can never diverge. A legacy
     // (epoch-less) orchestrator gets exactly the pre-epoch URL+age-filtered list,
     // one frame later than the hello used to carry it.
+    // ONE captured `now` for the summary frame AND the per-entry replay checks:
+    // two Date.now() reads let an entry at the age boundary be advertised and
+    // then dropped (or vice versa) — the advertised set and the delivered set
+    // must be computed against the SAME instant (codex).
+    const now = Date.now();
     try {
       target.send(
         JSON.stringify({
           type: "lost_replies",
           tab_id: workflowTabId(),
-          entries: lostReplies.summaries({ now: Date.now(), targetUrl, targetEpoch }),
+          entries: lostReplies.summaries({ now, targetUrl, targetEpoch }),
         }),
       );
     } catch {
@@ -10381,7 +10386,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // the residual bounds below are exactly the pre-epoch ones: sensitive
       // results never enter the journal at all, this runs only AFTER a real
       // handshake, and stale entries age out here.
-      if (!isReplayable(entry, { now: Date.now(), targetUrl, targetEpoch })) {
+      if (!isReplayable(entry, { now, targetUrl, targetEpoch })) {
         dropped++;
         continue;
       }
