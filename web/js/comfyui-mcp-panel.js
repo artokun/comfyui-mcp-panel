@@ -4570,6 +4570,16 @@ function clearStaleRedFlag(node, { app, graph, rootGraph }) {
     // Clearing is destructive, so do not trust a possibly stale combo list. A
     // live missing candidate is retained whenever its widget still references it.
     const assets = collectMissingAssets(false);
+    // `missingNodesError` carries TYPE names rather than per-node records. Turn
+    // that source into the same per-node blame graph_get_errors reports before
+    // clearing: a surviving root neighbour with an uninstalled type may be red
+    // even when it has no missing model/media candidate or validation entry.
+    // This must veto clearing just like either validation map does (#516 P1).
+    const missingNodeTypeStillBlamesNode = collectMissingNodeTypeReasons(
+      graph?._nodes ?? [],
+      assets.nodeTypes,
+    ).some(({ nodeId }) => String(nodeId) === String(node.id));
+    if (missingNodeTypeStillBlamesNode) return false;
     let storeNodeErrors = null;
     try {
       storeNodeErrors = getPiniaStore("executi" + "on" + "Error")?.lastNodeErrors ?? null;

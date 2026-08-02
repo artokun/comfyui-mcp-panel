@@ -5,6 +5,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import {
+  collectMissingNodeTypeReasons,
+  nodeRedFlagIsStale,
+} from "../../web/js/lib/asset-staleness.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
@@ -17,6 +21,9 @@ function methodSource(name, args) {
 
 const createSource = methodSource("graph_create_subgraph", "\\{ node_ids \\}");
 const groupSource = methodSource("graph_subgraph_group", "\\{ group \\}");
+const cleanupMatch = panelSrc.match(/function clearStaleRedFlag\(node, \{ app, graph, rootGraph \}\) \{[\s\S]*?\n\}\n\n\/\*\*/);
+assert.ok(cleanupMatch, "could not locate clearStaleRedFlag in panel source");
+const cleanupSource = cleanupMatch[0].replace(/\n\/\*\*$/, "");
 
 function realCreate(getGraphCtx, clearStaleRedFlagsAfterSubgraphConversion) {
   return new Function(
@@ -46,6 +53,24 @@ function realGroup(
     syncGraphNodeAreas,
     groupMemberNodes,
     clearStaleRedFlagsAfterSubgraphConversion,
+  );
+}
+
+/** Run the actual shipped cleanup body with deterministic live-source stubs. */
+function realClearStaleRedFlag({ assets, storeNodeErrors = null } = {}) {
+  return new Function(
+    "collectMissingAssets",
+    "collectMissingNodeTypeReasons",
+    "getPiniaStore",
+    "nodeRedFlagIsStale",
+    "findNodeByScopedId",
+    `${cleanupSource}; return clearStaleRedFlag;`,
+  )(
+    () => assets,
+    collectMissingNodeTypeReasons,
+    () => ({ lastNodeErrors: storeNodeErrors }),
+    nodeRedFlagIsStale,
+    () => null,
   );
 }
 
@@ -117,4 +142,28 @@ test("graph_subgraph_group applies the same post-conversion stale-outline cleanu
   assert.equal(cleanups[0].args.app, ctx.app);
   assert.deepEqual(ctx.events, ["sync", "before", "convert:2", "after", "cleanup", "dirty"]);
   assert.deepEqual(out.subgraph.from_nodes, [17, 18]);
+});
+
+test("real stale-outline cleanup preserves a node still blamed by missingNodesError (#516 P1)", () => {
+  const node = { id: 7, type: "MissingCustom", has_errors: true };
+  let dirtied = 0;
+  const graph = { _nodes: [node], setDirtyCanvas: () => { dirtied += 1; } };
+  const clear = realClearStaleRedFlag({
+    assets: { models: [], media: [], nodeTypes: ["MissingCustom"] },
+  });
+
+  assert.equal(clear(node, { app: { lastNodeErrors: {} }, graph, rootGraph: graph }), false);
+  assert.equal(node.has_errors, true, "a real missing-node-type red flag is never cleared");
+  assert.equal(dirtied, 0);
+});
+
+test("real stale-outline cleanup clears only an unblamed direct node (#516)", () => {
+  const node = { id: 7, type: "LoadImage", has_errors: true };
+  let dirtied = 0;
+  const graph = { _nodes: [node], setDirtyCanvas: () => { dirtied += 1; } };
+  const clear = realClearStaleRedFlag({ assets: { models: [], media: [], nodeTypes: [] } });
+
+  assert.equal(clear(node, { app: { lastNodeErrors: {} }, graph, rootGraph: graph }), true);
+  assert.equal(node.has_errors, false);
+  assert.equal(dirtied, 1);
 });
