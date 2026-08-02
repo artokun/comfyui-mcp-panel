@@ -6896,86 +6896,193 @@ const GRAPH_TOOL_EXECUTORS = {
     return liveEffectError ? { set, live_effect_error: liveEffectError } : { set };
   },
 
-  graph_move_node({ node_id, pos }) {
-    const { graph, rootGraph } = getGraphCtx();
-    if (!Array.isArray(pos) || pos.length !== 2) throw new Error("pos must be [x, y]");
-    // #302: accept the boundary RAIL ids (-10/-20, or the aliases) that
-    // panel_query_graph reports as rails.{input,output}.rail_node_id, moving the
-    // rail node exactly like graph_move_rail (they are NOT in graph._nodes_by_id,
-    // so resolveNode alone can't find them).
-    const rail = resolveRailNode(graph, node_id);
-    if (rail) {
-      const railNode = rail.node;
-      const prev = [railNode.pos?.[0], railNode.pos?.[1]];
-      graph.beforeChange?.();
-      try {
-        railNode.pos = [Number(pos[0]), Number(pos[1])];
-        // #355: refresh the cached boundingRect NOW so any later geometric
-        // group-membership read sees the moved footprint, not the pre-move one.
-        refreshNodeArea(railNode, prev);
-      } finally {
-        graph.afterChange?.();
-      }
-      graph.setDirtyCanvas?.(true, true);
-      return {
-        moved: { node_id: railNode.id, rail: rail.rail, from: prev, to: [railNode.pos[0], railNode.pos[1]] },
-      };
-    }
-    // A rail reference at the ROOT graph (rails only exist inside a subgraph) —
-    // give the precise reason instead of a bare "No node with id -10". But only
-    // when node_id isn't actually a REAL node: a normal node whose id happens to be
-    // -10/-20 must still move (ComfyUI permits any integer node id), so never let
-    // the reserved-id warning shadow it.
-    const numId = Number(node_id);
-    const realNode =
-      Number.isFinite(numId) && typeof graph.getNodeById === "function"
-        ? graph.getNodeById(numId)
-        : null;
-    const intent = realNode ? null : railKindFor(node_id);
-    if (intent && graph === rootGraph) {
-      throw new Error(
-        `${node_id} is the ${intent} boundary rail, which only exists INSIDE a subgraph — ` +
-          `enter the subgraph first (panel_enter_subgraph).`,
-      );
-    }
-    const node = resolveNode(graph, node_id);
-    const previous = [node.pos[0], node.pos[1]];
-    graph.beforeChange();
-    try {
-      node.pos = [Number(pos[0]), Number(pos[1])];
-      // #355: keep the cached boundingRect live so a follow-up group-membership
-      // read (summarizeGroup / graph_outline / graph_query) uses the NEW footprint.
-      refreshNodeArea(node, previous);
-    } finally {
-      graph.afterChange();
-    }
-    graph.setDirtyCanvas(true, true);
-    return { moved: { node_id: node.id, from: previous, to: [node.pos[0], node.pos[1]] } };
-  },
+  // #572: one presentation editor replaces the single-property move/resize/title/
+  // color/collapse/mode tools. It deliberately leaves widgets, node properties, links,
+  // and slot ordering to their dedicated tools. Resolve EVERY target
+  // and preflight EVERY input before opening the single undo envelope, then restore
+  // the captured presentation state if any node rejects an apply step: a caller can
+  // never get a half-restyled graph reported as success.
+  graph_edit_node(args = {}) {
+    const { graph, LG, rootGraph } = getGraphCtx();
+    const own = (key) => Object.prototype.hasOwnProperty.call(args, key);
+    const hasNodeId = own("node_id") && args.node_id != null;
+    const hasNodeIds = own("node_ids") && args.node_ids != null;
+    if (hasNodeId === hasNodeIds) throw new Error("provide exactly one of node_id or node_ids");
+    const ids = hasNodeId ? [args.node_id] : args.node_ids;
+    if (!Array.isArray(ids) || ids.length === 0) throw new Error("node_ids must be a non-empty array");
+    if (new Set(ids.map(Number)).size !== ids.length) throw new Error("node_ids must not contain duplicates");
 
-  // #530: resize a node to [width, height]. Note/MarkdownNote nodes are created at
-  // LiteGraph's 140×60 default and are unreadable until enlarged — panel_move_node
-  // only repositions. setSize() (not a raw node.size assignment) is preferred so a
-  // node that clamps to a computed minimum, and DOM-widget nodes like MarkdownNote,
-  // reflow correctly. Mirrors graph_move_node's beforeChange/afterChange undo envelope.
-  graph_resize_node({ node_id, size }) {
-    const { graph } = getGraphCtx();
-    const node = resolveNode(graph, node_id);
-    if (!Array.isArray(size) || size.length !== 2) throw new Error("size must be [width, height]");
-    const w = Number(size[0]);
-    const h = Number(size[1]);
-    if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0)
-      throw new Error("size must be two positive numbers");
-    const previous = [node.size?.[0], node.size?.[1]];
-    graph.beforeChange();
-    try {
-      if (typeof node.setSize === "function") node.setSize([w, h]);
-      else node.size = [w, h];
-    } finally {
-      graph.afterChange();
+    const fields = ["pos", "size", "title", "preset", "color", "bgcolor", "shape", "collapsed", "pinned", "mode"];
+    if (!fields.some(own)) throw new Error("provide at least one presentation field to edit");
+    if (own("preset") && (own("color") || own("bgcolor"))) {
+      throw new Error("preset cannot be combined with color or bgcolor");
     }
-    graph.setDirtyCanvas(true, true);
-    return { resized: { node_id: node.id, from: previous, to: [node.size[0], node.size[1]] } };
+    if (own("pos") && (!Array.isArray(args.pos) || args.pos.length !== 2 || !args.pos.every(Number.isFinite))) {
+      throw new Error("pos must be [x, y] finite numbers");
+    }
+    if (own("size") && (!Array.isArray(args.size) || args.size.length !== 2 || !args.size.every((n) => Number.isFinite(n) && n > 0))) {
+      throw new Error("size must be two positive numbers");
+    }
+    if (own("shape") && !["default", "box", "round", "card"].includes(args.shape)) {
+      throw new Error("shape must be default, box, round, or card");
+    }
+    if (own("color") && args.color !== null && (typeof args.color !== "string" || !/^#[0-9a-fA-F]{3,8}$/.test(args.color))) {
+      throw new Error("color must be a hex color or null");
+    }
+    if (own("bgcolor") && args.bgcolor !== null && (typeof args.bgcolor !== "string" || !/^#[0-9a-fA-F]{3,8}$/.test(args.bgcolor))) {
+      throw new Error("bgcolor must be a hex color or null");
+    }
+
+    // Keep panel_move_node's rail compatibility: graph outlines expose the two
+    // subgraph boundary rails as -10/-20 aliases, although they are not ordinary
+    // graph nodes. A rail can only be repositioned, never styled or resized.
+    const rail = hasNodeId ? resolveRailNode(graph, args.node_id) : null;
+    if (rail && fields.some((field) => field !== "pos" && own(field))) {
+      throw new Error("a subgraph boundary rail only supports pos edits");
+    }
+    const realNode = !rail && hasNodeId && Number.isFinite(Number(args.node_id)) && typeof graph.getNodeById === "function"
+      ? graph.getNodeById(Number(args.node_id))
+      : null;
+    if (!rail && !realNode && hasNodeId && graph === rootGraph && railKindFor(args.node_id)) {
+      throw new Error(`${args.node_id} is a subgraph boundary rail, which only exists inside a subgraph — enter the subgraph first (panel_enter_subgraph).`);
+    }
+    const nodes = rail ? [rail.node] : ids.map((id) => resolveNode(graph, id));
+    const MODE_TO_NUM = { active: 0, bypass: 4, mute: 2 };
+    const NUM_TO_MODE = { 0: "active", 2: "mute", 4: "bypass" };
+    let targetMode = null;
+    const modeWarnings = [];
+    if (own("mode")) {
+      if (!(args.mode in MODE_TO_NUM)) throw new Error('mode must be "active", "bypass", or "mute"');
+      targetMode = MODE_TO_NUM[args.mode];
+      for (const node of nodes) {
+        if (targetMode !== MODE_TO_NUM.bypass || !node.subgraph) continue;
+        const mismatches = unsafeBypassMappings({
+          inputs: (node.inputs ?? []).map((s) => ({ name: s?.name, type: s?.type })),
+          outputs: (node.outputs ?? []).map((s) => ({ name: s?.name, type: s?.type, connected: (s?.links?.length ?? 0) > 0 })),
+        });
+        if (!mismatches.length) continue;
+        const detail = mismatches.map((m) => `output "${m.output_name}" (${m.output_type}) would be fed by input "${m.input_name ?? "none"}" (${m.input_type ?? "none"})`).join("; ");
+        if (!args.force) {
+          throw new Error(`Refusing to bypass subgraph node ${node.id} (${node.title ?? node.type}): positional boundary forwarding would mis-wire — ${detail}. Re-order the boundary inputs, add an explicit switch, or pass force:true to bypass anyway.`);
+        }
+        modeWarnings.push({ node_id: node.id, warning: `bypassed despite unsafe boundary mapping (force) — ${detail}` });
+      }
+    }
+    let palette = null;
+    if (own("preset")) {
+      const LGC = LG?.LGraphCanvas ?? globalThis.LGraphCanvas;
+      palette = LGC?.node_colors?.[args.preset];
+      if (!palette) throw new Error(`unknown color preset "${args.preset}"`);
+    }
+    const snapshot = (node) => ({
+      node,
+      pos: [...(node.pos ?? [])],
+      size: [...(node.size ?? [])],
+      title: node.title,
+      hasColor: Object.prototype.hasOwnProperty.call(node, "color"),
+      color: node.color,
+      hasBgcolor: Object.prototype.hasOwnProperty.call(node, "bgcolor"),
+      bgcolor: node.bgcolor,
+      hasShape: Object.prototype.hasOwnProperty.call(node, "shape"),
+      shape: node.shape,
+      hasFlags: Object.prototype.hasOwnProperty.call(node, "flags"),
+      flags: node.flags ? { ...node.flags } : node.flags,
+      hasMode: Object.prototype.hasOwnProperty.call(node, "mode"),
+      mode: node.mode,
+    });
+    const before = nodes.map(snapshot);
+    const restore = (s) => {
+      const node = s.node;
+      const currentPos = [...(node.pos ?? [])];
+      node.pos = [...s.pos];
+      // Rollback must not call the same extension hook that just threw. Restore the
+      // authoritative saved geometry directly so a failing second target cannot trap
+      // an earlier target in a half-applied multi-node edit.
+      node.size = [...s.size];
+      refreshNodeArea(node, currentPos);
+      node.title = s.title;
+      if (s.hasColor) node.color = s.color;
+      else delete node.color;
+      if (s.hasBgcolor) node.bgcolor = s.bgcolor;
+      else delete node.bgcolor;
+      if (s.hasShape) node.shape = s.shape;
+      else delete node.shape;
+      if (s.hasFlags) node.flags = s.flags ? { ...s.flags } : s.flags;
+      else delete node.flags;
+      if (s.hasMode) node.mode = s.mode;
+      else delete node.mode;
+    };
+    const summarize = (node) => ({
+      node_id: node.id,
+      pos: [...(node.pos ?? [])],
+      size: [...(node.size ?? [])],
+      title: node.title,
+      color: node.color ?? null,
+      bgcolor: node.bgcolor ?? null,
+      shape: node.shape ?? "default",
+      collapsed: !!node.flags?.collapsed,
+      pinned: !!node.flags?.pinned,
+      mode: NUM_TO_MODE[typeof node.mode === "number" ? node.mode : 0] ?? node.mode,
+    });
+
+    graph.beforeChange?.();
+    try {
+      for (const node of nodes) {
+        if (own("pos")) {
+          const previous = [...(node.pos ?? [])];
+          node.pos = [Number(args.pos[0]), Number(args.pos[1])];
+          refreshNodeArea(node, previous);
+        }
+        if (own("size")) {
+          const size = [Number(args.size[0]), Number(args.size[1])];
+          if (typeof node.setSize === "function") node.setSize(size);
+          else node.size = size;
+        }
+        if (own("title")) node.title = String(args.title);
+        if (palette) {
+          node.color = palette.color;
+          node.bgcolor = palette.bgcolor;
+        } else {
+          if (own("color")) args.color === null ? delete node.color : (node.color = args.color);
+          if (own("bgcolor")) args.bgcolor === null ? delete node.bgcolor : (node.bgcolor = args.bgcolor);
+        }
+        if (own("shape")) args.shape === "default" ? delete node.shape : (node.shape = args.shape);
+        if (own("collapsed")) {
+          const want = args.collapsed;
+          if (!!node.flags?.collapsed !== want) {
+            if (typeof node.collapse === "function") node.collapse(true);
+            if (!!node.flags?.collapsed !== want) {
+              node.flags = node.flags || {};
+              node.flags.collapsed = want;
+            }
+          }
+        }
+        if (own("pinned")) {
+          node.flags = node.flags || {};
+          node.flags.pinned = args.pinned;
+        }
+        if (targetMode !== null) node.mode = targetMode;
+      }
+    } catch (error) {
+      for (const state of before) restore(state);
+      throw error;
+    } finally {
+      graph.afterChange?.();
+    }
+    graph.setDirtyCanvas?.(true, true);
+    const summarizeBefore = (state) => ({
+      node_id: state.node.id,
+      pos: [...state.pos],
+      size: [...state.size],
+      title: state.title,
+      color: state.hasColor ? state.color ?? null : null,
+      bgcolor: state.hasBgcolor ? state.bgcolor ?? null : null,
+      shape: state.hasShape ? state.shape ?? "default" : "default",
+      collapsed: !!state.flags?.collapsed,
+      pinned: !!state.flags?.pinned,
+      mode: NUM_TO_MODE[typeof state.mode === "number" ? state.mode : 0] ?? state.mode,
+    });
+    return { edited: nodes.map((node, i) => ({ before: summarizeBefore(before[i]), after: summarize(node) })), ...(modeWarnings.length ? { warnings: modeWarnings } : {}) };
   },
 
   // Dependency-aware auto-layout of the active graph (or a `node_ids` subset).
@@ -9034,7 +9141,7 @@ const GRAPH_TOOL_EXECUTORS = {
           "group membership is geometric: the box that wraps the requested nodes " +
           `also captures ${extra.length} unrelated node(s) (their centre falls inside)` +
           (missing.length ? ` and misses ${missing.length} requested node(s)` : "") +
-          ". Move the intended nodes into a contiguous region (panel_move_node / " +
+          ". Move the intended nodes into a contiguous region (panel_edit_node / " +
           "panel_auto_layout) before grouping, or edit the group bounds, to get an exact set.";
       }
     }
@@ -9119,84 +9226,6 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     graph.setDirtyCanvas(true, true);
     return { removed: summary };
-  },
-
-  // Rename a node's TITLE (the label on its header) — distinct from widget values.
-  graph_set_title({ node_id, title }) {
-    const { graph } = getGraphCtx();
-    const node = resolveNode(graph, node_id);
-    const previous = node.title;
-    graph.beforeChange?.();
-    try {
-      node.title = String(title ?? "");
-    } finally {
-      graph.afterChange?.();
-    }
-    graph.setDirtyCanvas?.(true, true);
-    return { node_id: node.id, previous, title: node.title };
-  },
-
-  // Collapse (minimize) or expand a node. `collapsed` defaults to true.
-  graph_set_node_collapsed({ node_id, collapsed }) {
-    const { graph } = getGraphCtx();
-    const node = resolveNode(graph, node_id);
-    const want = collapsed !== false;
-    graph.beforeChange?.();
-    try {
-      const isCollapsed = !!(node.flags && node.flags.collapsed);
-      if (isCollapsed !== want) {
-        // node.collapse() early-returns a silent no-op for a non-collapsible
-        // node unless a truthy `force` is passed — pass it, since an explicit
-        // tool call is a direct request for an exact state, not a UI gesture
-        // that should respect `collapsible` (#345). Then verify: if the flag
-        // still doesn't match `want` (collapse() missing, or an older build
-        // without the `force` parameter), write it directly — node.flags.collapsed
-        // is the single source of truth every other read site in this file
-        // already relies on, so this fallback is never a lie about state.
-        if (typeof node.collapse === "function") node.collapse(true);
-        if (!!(node.flags && node.flags.collapsed) !== want) {
-          node.flags = node.flags || {};
-          node.flags.collapsed = want;
-        }
-      }
-    } finally {
-      graph.afterChange?.();
-    }
-    graph.setDirtyCanvas?.(true, true);
-    return { node_id: node.id, collapsed: !!(node.flags && node.flags.collapsed) };
-  },
-
-  // Set a node's title-bar color and/or body color. Pass a `preset` name from
-  // LiteGraph's palette (red, brown, green, blue, pale_blue, cyan, purple,
-  // yellow, black) for matched title+body colors, or explicit `color` (title)
-  // and/or `bgcolor` (body) hex strings. Pass null for a field to clear it.
-  graph_set_node_color({ node_id, color, bgcolor, preset }) {
-    const { graph, LG } = getGraphCtx();
-    const node = resolveNode(graph, node_id);
-    graph.beforeChange?.();
-    try {
-      if (preset != null) {
-        const LGC = LG?.LGraphCanvas ?? window.LGraphCanvas ?? globalThis.LGraphCanvas;
-        const presets = LGC?.node_colors;
-        const p = presets && presets[preset];
-        if (!p) {
-          throw new Error(
-            `unknown color preset "${preset}" (available: ${presets ? Object.keys(presets).join(", ") : "none"})`,
-          );
-        }
-        node.color = p.color;
-        node.bgcolor = p.bgcolor;
-      } else {
-        if (color === null) delete node.color;
-        else if (color != null) node.color = String(color);
-        if (bgcolor === null) delete node.bgcolor;
-        else if (bgcolor != null) node.bgcolor = String(bgcolor);
-      }
-    } finally {
-      graph.afterChange?.();
-    }
-    graph.setDirtyCanvas?.(true, true);
-    return { node_id: node.id, color: node.color ?? null, bgcolor: node.bgcolor ?? null };
   },
 
   // Set a node's execution MODE: "active" (runs normally), "bypass" (the node is
@@ -12312,8 +12341,11 @@ function describeCommand(cmd, msg, reply) {
       return r.demoted
         ? { icon: "pi-arrow-down", text: `Un-promoted “${r.demoted}” from the subgraph node` }
         : { icon: "pi-arrow-up", text: `Promoted “${r.promoted}” to the subgraph node` };
-    case "graph_move_node":
-      return { icon: "pi-arrows-alt", text: `Moved node ${r.moved?.node_id} to [${r.moved?.to?.map(Math.round)}]` };
+    case "graph_edit_node": {
+      const edited = r.edited ?? [];
+      const suffix = edited.length === 1 ? `node ${edited[0]?.after?.node_id}` : `${edited.length} nodes`;
+      return { icon: "pi-pencil", text: `Edited ${suffix} presentation` };
+    }
     case "graph_set_node_property":
       return r.live_effect_error
         ? {
@@ -12326,11 +12358,6 @@ function describeCommand(cmd, msg, reply) {
             text: `Set property ${r.set?.name} = ${JSON.stringify(r.set?.to)} on node ${r.set?.node_id}`,
             detail: `was ${JSON.stringify(r.set?.from)}`,
           };
-    case "graph_resize_node":
-      return {
-        icon: "pi-arrows-alt",
-        text: `Resized node ${r.resized?.node_id} to [${r.resized?.to?.map(Math.round)}]`,
-      };
     case "graph_auto_layout":
       return {
         icon: "pi-th-large",
@@ -12351,13 +12378,6 @@ function describeCommand(cmd, msg, reply) {
       return { icon: "pi-minus-circle", text: `Removed group “${r.removed?.title}”` };
     case "graph_move_rail":
       return { icon: "pi-arrows-h", text: `Moved ${r.rail} rail to [${r.pos?.map(Math.round)}]` };
-    case "graph_set_node_collapsed":
-      return {
-        icon: r.collapsed ? "pi-chevron-right" : "pi-chevron-down",
-        text: `${r.collapsed ? "Collapsed" : "Expanded"} node ${r.node_id}`,
-      };
-    case "graph_set_node_color":
-      return { icon: "pi-palette", text: `Recolored node ${r.node_id}` };
     case "graph_set_node_mode":
       return {
         icon: r.mode === "active" ? "pi-play-circle" : r.mode === "mute" ? "pi-volume-off" : "pi-ban",

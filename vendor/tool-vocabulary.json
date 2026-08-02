@@ -4,7 +4,7 @@
   "maxTools": 153,
   "counts": {
     "core": 153,
-    "panel": 90,
+    "panel": 91,
     "dead": 38
   },
   "core": [
@@ -185,6 +185,7 @@
     "panel_disable_adult_mode",
     "panel_disconnect",
     "panel_edit_group",
+    "panel_edit_node",
     "panel_enter_subgraph",
     "panel_exit_subgraph",
     "panel_expose_subgraph_input",

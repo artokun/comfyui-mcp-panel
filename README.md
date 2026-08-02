@@ -144,8 +144,7 @@ hosts for the ChatGPT/Codex backend, so feature parity is automatic.
 | `panel_connect` / `panel_disconnect` | Wire / unwire slots (by name or index) |
 | `panel_set_widget` | Change a widget value (steps, cfg, prompts, …) |
 | `panel_set_property` | Set a node **property** (right-click → Properties), e.g. rgthree Fast Groups Bypasser `matchTitle` — the counterpart to `panel_set_widget` |
-| `panel_move_node` | Move a node on the canvas |
-| `panel_set_node_title` | Rename a node's header title |
+| `panel_edit_node` | Atomically move, resize, retitle, recolor, reshape, collapse, or pin one or more nodes |
 | `panel_clear` | Remove every node — the whole wipe is one Ctrl+Z |
 
 **Subgraphs**
@@ -163,8 +162,6 @@ hosts for the ChatGPT/Codex backend, so feature parity is automatic.
 |---|---|
 | `panel_move_rail` | Move a subgraph's input / output rail so boundary wires stay short |
 | `panel_create_group` / `panel_move_group` / `panel_edit_group` / `panel_remove_group` | Create, move, retitle/recolor, or delete a labeled group box |
-| `panel_set_node_color` | Color-code a node (named LiteGraph preset or hex) |
-| `panel_set_node_collapsed` | Collapse / expand a node to a title chip |
 | `panel_screenshot` | Render the canvas to a PNG so the agent can verify its own layout |
 
 **Workflow tabs**

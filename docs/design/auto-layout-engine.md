@@ -6,7 +6,7 @@
 
 ## Motivation
 
-Agents currently place nodes with `placementFor`'s naive "cascade right of the last node" default and fix things up with dozens of `panel_move_node` round-trips. One `graph_auto_layout` call produces a readable graph; `dry_run` additionally gives the agent a planner — propose positions, inspect, then apply — replacing FL-MCP's separate `preCalculatePositions` API for about-to-be-created nodes.
+Agents currently place nodes with `placementFor`'s naive "cascade right of the last node" default and fix things up with many `panel_edit_node` round-trips. One `graph_auto_layout` call produces a readable graph; `dry_run` additionally gives the agent a planner — propose positions, inspect, then apply — replacing FL-MCP's separate `preCalculatePositions` API for about-to-be-created nodes.
 
 ## Bridge command API
 
