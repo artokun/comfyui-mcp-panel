@@ -134,14 +134,37 @@ export function uploadInputAccepts(config, value) {
  * ComfyUI `/view?type=input` existence probe. ComfyUI stores uploaded inputs at
  * `input/<subfolder>/<filename>` and the widget value is the POSIX-joined
  * `subfolder/filename` (or a bare `filename` at the root). Splits on the LAST slash;
- * a value with no slash is a root-level filename. Backslashes are normalized to
- * forward slashes so a Windows-style path still probes correctly.
+ * a value with no slash is a root-level filename.
+ *
+ * `backslashIsSeparator` (default true) mirrors how the SERVER resolves the value:
+ * ComfyUI joins it with `os.path`, where a backslash is a path separator ONLY on
+ * Windows — on a POSIX server it is a literal filename character. Normalizing it
+ * away unconditionally would probe a DIFFERENT path than LoadImage resolves, so an
+ * existing `dir/file.png` could falsely clear a genuinely missing `dir\file.png`
+ * on a POSIX server (#513 review). Pass the server platform's verdict; when the
+ * platform is unknown, pass false (POSIX semantics) so a backslash value is never
+ * re-interpreted into a path the server would not resolve.
  */
-export function splitInputAssetRef(value) {
-  const v = String(value ?? "").replace(/\\/g, "/");
+export function splitInputAssetRef(value, { backslashIsSeparator = true } = {}) {
+  const raw = String(value ?? "");
+  const v = backslashIsSeparator ? raw.replace(/\\/g, "/") : raw;
   const i = v.lastIndexOf("/");
   if (i < 0) return { subfolder: "", filename: v };
   return { subfolder: v.slice(0, i), filename: v.slice(i + 1) };
+}
+
+/**
+ * Interpret a ComfyUI `/system_stats` payload for the input-path split above:
+ * `system.os` is Python's `os.name` — "nt" on Windows, "posix" elsewhere. Any
+ * missing/malformed shape returns false (POSIX semantics), so an unreadable
+ * stats payload can never enable a split the server would not perform.
+ */
+export function inputPathsUseWindowsSeparators(systemStats) {
+  try {
+    return String(systemStats?.system?.os ?? "").toLowerCase() === "nt";
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -154,8 +177,17 @@ export function splitInputAssetRef(value) {
  * must not own a ComfyUI API client. The helper fails CLOSED: an unavailable,
  * rejected, or throwing probe keeps the original candidate reported. Root-level
  * values are not probed because the live combo is already authoritative there.
+ *
+ * `backslashIsSeparator` must match the SERVER's platform (see splitInputAssetRef):
+ * on a POSIX server a `dir\file.png` value is a literal filename, NOT a nested
+ * path, so it is left un-split and un-probed — the candidate stays reported,
+ * which is the truthful verdict for a file LoadImage cannot resolve there.
  */
-export async function filterServerConfirmedInputSubfolderCandidates(candidates, confirmServerAsset) {
+export async function filterServerConfirmedInputSubfolderCandidates(
+  candidates,
+  confirmServerAsset,
+  { backslashIsSeparator = true } = {},
+) {
   if (!Array.isArray(candidates)) return [];
   if (typeof confirmServerAsset !== "function") return candidates;
   const probes = new Map();
@@ -163,7 +195,7 @@ export async function filterServerConfirmedInputSubfolderCandidates(candidates, 
     candidates.map(async (candidate) => {
       const file = candidate?.file;
       if (typeof file !== "string") return candidate;
-      const { subfolder, filename } = splitInputAssetRef(file);
+      const { subfolder, filename } = splitInputAssetRef(file, { backslashIsSeparator });
       if (!subfolder || !filename) return candidate;
       const key = `${subfolder}/${filename}`;
       let probe = probes.get(key);

@@ -75,3 +75,26 @@ export function graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph = 
   if (Number(liveNodeCount) !== 0) return false;
   return activeWorkflowNodeCount(activeWorkflow) > 0;
 }
+
+/**
+ * True when the graph READ's binding changed across an AWAIT: the active-workflow
+ * instance or the bound root-graph object captured before the await no longer
+ * matches after it. Used to detect a workflow-tab SWITCH that interleaved with a
+ * server probe mid-read (graph_get_errors' nested-input /view probe, #513 review)
+ * — without it, the read would join the PRE-switch workflow's asset verdicts onto
+ * the now-active workflow and return workflow A's result while B is active.
+ *
+ * Identity-based, not value-based: ComfyUI mutates a workflow instance's path in
+ * place on rename/Save-As, so the INSTANCE is the only stable identity (a rename
+ * alone leaves it intact and correctly reads as NO switch). Fires only on a
+ * provable change — both snapshots unresolvable (null/null) compares equal and
+ * never manufactures a mismatch.
+ */
+export function graphReadBindingChanged({
+  beforeWorkflow,
+  afterWorkflow,
+  beforeRootGraph,
+  afterRootGraph,
+} = {}) {
+  return beforeWorkflow !== afterWorkflow || beforeRootGraph !== afterRootGraph;
+}

@@ -12,7 +12,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { activeWorkflowNodeCount, graphReadDesynced } from "../../web/js/lib/graph-binding.js";
+import {
+  activeWorkflowNodeCount,
+  graphReadDesynced,
+  graphReadBindingChanged,
+} from "../../web/js/lib/graph-binding.js";
 
 // A ComfyUI ChangeTracker-shaped workflow: serialized graph states hang off
 // `changeTracker.activeState` / `.initialState` (and some builds hang them flat).
@@ -118,4 +122,51 @@ test("graphReadDesynced: FALSE — descended into an empty subgraph (legitimatel
 test("graphReadDesynced: defensive — missing args never throw, default to not-desynced", () => {
   assert.equal(graphReadDesynced(), false);
   assert.equal(graphReadDesynced({}), false);
+});
+
+test("graphReadBindingChanged: FALSE — same workflow instance and root graph across the await", () => {
+  const w = wf();
+  const g = {};
+  assert.equal(
+    graphReadBindingChanged({ beforeWorkflow: w, afterWorkflow: w, beforeRootGraph: g, afterRootGraph: g }),
+    false,
+  );
+});
+
+test("graphReadBindingChanged: TRUE — a tab switch swapped the active workflow instance mid-probe (#513 review)", () => {
+  const g = {};
+  assert.equal(
+    graphReadBindingChanged({ beforeWorkflow: wf(), afterWorkflow: wf(), beforeRootGraph: g, afterRootGraph: g }),
+    true,
+  );
+});
+
+test("graphReadBindingChanged: TRUE — the root graph was rebound across the await", () => {
+  const w = wf();
+  assert.equal(
+    graphReadBindingChanged({ beforeWorkflow: w, afterWorkflow: w, beforeRootGraph: {}, afterRootGraph: {} }),
+    true,
+  );
+});
+
+test("graphReadBindingChanged: TRUE — the binding went unresolvable mid-read (one side null)", () => {
+  const w = wf();
+  const g = {};
+  assert.equal(
+    graphReadBindingChanged({ beforeWorkflow: w, afterWorkflow: null, beforeRootGraph: g, afterRootGraph: g }),
+    true,
+  );
+});
+
+test("graphReadBindingChanged: FALSE — both snapshots unresolvable never manufactures a mismatch", () => {
+  assert.equal(graphReadBindingChanged(), false);
+  assert.equal(
+    graphReadBindingChanged({
+      beforeWorkflow: null,
+      afterWorkflow: null,
+      beforeRootGraph: null,
+      afterRootGraph: null,
+    }),
+    false,
+  );
 });

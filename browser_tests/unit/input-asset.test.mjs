@@ -10,6 +10,7 @@ import {
   uploadInputAccepts,
   splitInputAssetRef,
   filterServerConfirmedInputSubfolderCandidates,
+  inputPathsUseWindowsSeparators,
   addComboOption,
 } from "../../web/js/lib/input-asset.js";
 
@@ -128,6 +129,73 @@ test("#513: nested input media stays missing when the server probe fails", async
     throw new Error("offline");
   });
   assert.deepEqual(result, [candidate]);
+});
+
+test("splitInputAssetRef: POSIX semantics keep a backslash literal (#513 review)", () => {
+  // On a POSIX server ComfyUI resolves `dir\file.png` as a LITERAL filename, not
+  // a nested path — the split must NOT invent a subfolder the server won't use.
+  assert.deepEqual(splitInputAssetRef("dir\\missing.png", { backslashIsSeparator: false }), {
+    subfolder: "",
+    filename: "dir\\missing.png",
+  });
+  // A forward slash still splits on POSIX.
+  assert.deepEqual(splitInputAssetRef("dir/missing.png", { backslashIsSeparator: false }), {
+    subfolder: "dir",
+    filename: "missing.png",
+  });
+});
+
+test("inputPathsUseWindowsSeparators: only os.name 'nt' enables Windows semantics", () => {
+  assert.equal(inputPathsUseWindowsSeparators({ system: { os: "nt" } }), true);
+  assert.equal(inputPathsUseWindowsSeparators({ system: { os: "posix" } }), false);
+  assert.equal(inputPathsUseWindowsSeparators({ system: {} }), false);
+  assert.equal(inputPathsUseWindowsSeparators({}), false);
+  assert.equal(inputPathsUseWindowsSeparators(null), false);
+});
+
+test("#513 review: POSIX server — a backslash value is NEVER probed as a nested path", async () => {
+  // The false-PASS from the review: `dir\missing.png` is genuinely missing on a
+  // POSIX server (LoadImage looks for the literal name), while `dir/missing.png`
+  // EXISTS. Splitting the backslash away would probe the existing file and
+  // suppress a real miss. POSIX semantics must leave the value un-probed and the
+  // candidate reported.
+  const candidate = { node_id: 12, file: "dir\\missing.png" };
+  let probed = 0;
+  const result = await filterServerConfirmedInputSubfolderCandidates(
+    [candidate],
+    async () => {
+      probed += 1;
+      return true; // would confirm dir/missing.png — must never be consulted
+    },
+    { backslashIsSeparator: false },
+  );
+  assert.equal(probed, 0);
+  assert.deepEqual(result, [candidate]);
+});
+
+test("#513 review: POSIX server — a forward-slash nested value is still probed and cleared", async () => {
+  const candidate = { node_id: 12, file: "dir/mask.png" };
+  const result = await filterServerConfirmedInputSubfolderCandidates(
+    [candidate],
+    async () => true,
+    { backslashIsSeparator: false },
+  );
+  assert.deepEqual(result, []);
+});
+
+test("#513 review: Windows server — a backslash value splits and probes as nested", async () => {
+  const candidate = { node_id: 12, file: "dir\\mask.png" };
+  const probes = [];
+  const result = await filterServerConfirmedInputSubfolderCandidates(
+    [candidate],
+    async (file) => {
+      probes.push(file);
+      return true;
+    },
+    { backslashIsSeparator: true },
+  );
+  assert.deepEqual(probes, ["dir\\mask.png"]);
+  assert.deepEqual(result, []);
 });
 
 test("addComboOption adds a value to an array-backed combo in place", () => {
