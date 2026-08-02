@@ -7668,8 +7668,9 @@ const GRAPH_TOOL_EXECUTORS = {
       // leaves a SECOND blank workflow behind. Journal it as UNKNOWN instead.
       const error =
         "workflow_new: created a blank workflow but the frontend did not expose it as the " +
-        "active workflow — cannot establish a unique routing target. Retry, or select the new " +
-        "tab before editing.";
+        "active workflow — cannot establish a unique routing target. Do NOT retry — " +
+        "workflow_new is not idempotent, so a retry would create a SECOND blank tab. Check " +
+        "workflow_list / the canvas state first, then select the new tab before editing.";
       noteOpenAttempt({
         cmd: "workflow_new",
         rid,
@@ -7870,12 +7871,24 @@ const GRAPH_TOOL_EXECUTORS = {
         // already HAD unsaved edits does not clear a spurious flag — it erases a REAL one,
         // hiding the user's work from every later check (codex). Leaving a genuinely dirty
         // tab marked dirty is both truthful and what keeps the reload gate below closed.
+        // …and ONLY when either no reload is possible (!wasOpen) or the canvas freeze is
+        // holding (priorInteraction !== null). On a frontend WITHOUT allow_interaction the
+        // helper's awaited frame is unprotected: an edit landing in it would be captured as
+        // the new CLEAN baseline, silently erasing unsaved-work protection — and that same
+        // condition (priorInteraction === null) is what skips the reload below, so the
+        // re-baseline would be a silent clean-slate in service of a reload that never
+        // happens. Leave the tracker alone there: a spurious "modified" flag is cosmetic
+        // and keeps the dirty signal alive for the conflict report below.
         // Ownership re-check before EVERY re-baseline / destructive step: if this open
         // outlived its own section (the 30s safety expiry, or a newer open taking over),
         // other commands have been let through and we must not keep mutating as though we
         // still held exclusivity. Leaving the tab spuriously "modified" is cosmetic; racing
         // a concurrent edit is not.
-        if (!wasDirty && ownsWorkflowReloadGuard(reloadGuardToken)) {
+        if (
+          !wasDirty &&
+          (!wasOpen || priorInteraction !== null) &&
+          ownsWorkflowReloadGuard(reloadGuardToken)
+        ) {
           // The helper awaits a frame before re-baselining — hold the fence across that
           // frame too, so the guard cannot age out inside it and let a command through.
           beginWorkflowReloadStep(reloadGuardToken);

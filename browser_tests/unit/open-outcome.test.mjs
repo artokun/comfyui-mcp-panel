@@ -453,7 +453,7 @@ test("#442 codex R7: a tab that arrived DIRTY is never re-baselined and never re
   assert.ok(wasDirtyAt < openAt, "…BEFORE any await, since it cannot be recovered afterwards");
   assert.match(
     body,
-    /if \(!wasDirty && ownsWorkflowReloadGuard\(reloadGuardToken\)\) \{[\s\S]{0,400}?await clearSpuriousOpenModified\(target, \{/,
+    /if \(\s*!wasDirty &&\s*\(!wasOpen \|\| priorInteraction !== null\) &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,400}?await clearSpuriousOpenModified\(target, \{/,
     "a genuinely dirty tab must never be re-baselined, nor one we no longer hold exclusively",
   );
   // BOTH reload gates must require the pre-open snapshot to be clean too.
@@ -622,6 +622,39 @@ test("#442 codex P1: with NO reliable freeze available, the destructive reload i
   assert.match(body, /could not be protected against a concurrent edit and was skipped/);
 });
 
+test("#442 round-2: with NO freeze available the tracker is NOT re-baselined either (no silent clean-slate)", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const body = handlerBody(src, "async workflow_open({");
+  // clearSpuriousOpenModified awaits a frame, then captures the canvas as the CLEAN
+  // baseline and forces isModified=false. The canvas freeze (allow_interaction) is what
+  // makes that frame safe. On a frontend WITHOUT the flag the reload is skipped for
+  // exactly that reason (priorInteraction === null) — so the tracker must not be
+  // re-baselined either: an edit landing in the unprotected frame would be adopted as
+  // clean, erasing unsaved-work protection and inviting later silent loss. (A first-time
+  // open — !wasOpen — can never reload, so its spurious-flag cleanup is unchanged.)
+  const skipGate = body.indexOf("if (staleInfo.reload && !dirtyNow && !wasDirty && priorInteraction === null)");
+  const firstRebaseline = body.indexOf("await clearSpuriousOpenModified(target, {");
+  assert.notEqual(skipGate, -1, "the no-freeze skip gate must exist");
+  assert.notEqual(firstRebaseline, -1, "the post-repaint re-baseline must exist");
+  assert.ok(firstRebaseline < skipGate, "fixture order: the re-baseline precedes the reload decision");
+  assert.match(
+    body,
+    /if \(\s*!wasDirty &&\s*\(!wasOpen \|\| priorInteraction !== null\) &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,400}?await clearSpuriousOpenModified\(target, \{/,
+    "the pre-reload re-baseline must be gated on the freeze holding — the same condition whose absence skips the reload",
+  );
+  // The only OTHER re-baseline is the post-reload one, and it stays gated on the reload
+  // actually having run: `reloaded = true` precedes it, under the same exclusive window.
+  const reloadedAt = body.indexOf("reloaded = true;");
+  const secondRebaseline = body.indexOf("await clearSpuriousOpenModified(target, {", firstRebaseline + 1);
+  assert.ok(reloadedAt !== -1 && reloadedAt < secondRebaseline, "the second re-baseline must follow a completed reload");
+  // Two call sites, both gated — no third, ungated re-baseline may creep in.
+  assert.equal(
+    (body.match(/await clearSpuriousOpenModified\(target, \{/g) || []).length,
+    2,
+    "workflow_open re-baselines the tracker exactly twice, each behind a gate",
+  );
+});
+
 test("#402 codex P1: workflow_new records UNKNOWN (never a clean failure) once creation started", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const body = handlerBody(src, "async workflow_new({");
@@ -643,6 +676,28 @@ test("#402 codex P1: workflow_new records UNKNOWN (never a clean failure) once c
     true,
     "a post-creation failure must be journaled as UNKNOWN",
   );
+});
+
+test("#402 round-2: once NewBlankWorkflow has run, the guidance forbids a retry (no SECOND blank tab)", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const body = handlerBody(src, "async workflow_new({");
+  const created = body.indexOf('await mgr.command.execute("Comfy.NewBlankWorkflow");');
+  assert.notEqual(created, -1);
+  // Retrying workflow_new creates a SECOND blank tab and routes later edits to the wrong
+  // workflow. Once creation has run the receipt truthfully records applied:"unknown" — so
+  // the guidance must match it: do NOT retry, check workflow_list / canvas state first.
+  const afterCreate = stripComments(body.slice(created));
+  const errBlock = afterCreate.match(/const error =\s*\n?([\s\S]*?);/);
+  assert.ok(errBlock, "the post-creation failure must build an explicit message");
+  // Reassemble the concatenated literal so the check reads the message the caller gets.
+  const msg = [...errBlock[1].matchAll(/"([^"\n]*)"/g)].map((m) => m[1]).join("");
+  assert.doesNotMatch(
+    msg,
+    /(^|[.!?]\s+)Retry\b/,
+    `no sentence may open with a blanket Retry once the blank tab exists: "${msg}"`,
+  );
+  assert.match(msg, /Do NOT retry/i, "the guidance must forbid the retry outright");
+  assert.match(msg, /workflow_list/, "…and point at workflow_list / the canvas state instead");
 });
 
 test("#570 P0b: the #442 re-read must KEEP this tab's instance identity (no mid-open fork)", () => {
