@@ -12,6 +12,10 @@ const methodMatch = panelSrc.match(/graph_edit_node\(args = \{\}\) \{[\s\S]*?\n 
 assert.ok(methodMatch, "could not locate graph_edit_node in panel source");
 const legacyColorMatch = panelSrc.match(/graph_set_node_color\(\{ node_id, color, bgcolor, preset \}\) \{[\s\S]*?\n  \},/);
 assert.ok(legacyColorMatch, "could not locate graph_set_node_color in panel source");
+const legacyMoveMatch = panelSrc.match(/graph_move_node\(\{ node_id, pos \}\) \{[\s\S]*?\n  \},/);
+assert.ok(legacyMoveMatch, "could not locate graph_move_node in panel source");
+const legacyResizeMatch = panelSrc.match(/graph_resize_node\(\{ node_id, size \}\) \{[\s\S]*?\n  \},/);
+assert.ok(legacyResizeMatch, "could not locate graph_resize_node in panel source");
 
 function realGraphEditNode(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor) {
   const factory = new Function(
@@ -32,6 +36,19 @@ function realLegacyColor(getGraphCtx, resolveNode) {
     "resolveNode",
     `const executors = { ${legacyColorMatch[0]} }; return executors.graph_set_node_color;`,
   )(getGraphCtx, resolveNode);
+}
+
+function realLegacyMotion(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor) {
+  return new Function(
+    "getGraphCtx",
+    "resolveNode",
+    "refreshNodeArea",
+    "unsafeBypassMappings",
+    "resolveRailNode",
+    "railKindFor",
+    `const GRAPH_TOOL_EXECUTORS = { ${methodMatch[0]} ${legacyMoveMatch[0]} ${legacyResizeMatch[0]} };
+     return { move: GRAPH_TOOL_EXECUTORS.graph_move_node, resize: GRAPH_TOOL_EXECUTORS.graph_resize_node };`,
+  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor);
 }
 
 function makeNode(id, { pos = [0, 0], size = [140, 60], collapsible = true } = {}) {
@@ -89,6 +106,30 @@ function setupLegacyColor(node, palette = { blue: { color: "#123456", bgcolor: "
     },
   );
   return { fn, events };
+}
+
+function setupLegacyMotion(nodes, { resolveRailNode = () => null } = {}) {
+  const events = [];
+  const graph = {
+    beforeChange: () => events.push("before"),
+    afterChange: () => events.push("after"),
+    setDirtyCanvas: () => events.push("dirty"),
+    getNodeById: (id) => nodes.find((candidate) => candidate.id === id) ?? null,
+  };
+  const resolver = (_graph, id) => {
+    const node = nodes.find((candidate) => candidate.id === id);
+    if (!node) throw new Error(`No node with id ${id}`);
+    return node;
+  };
+  const fns = realLegacyMotion(
+    () => ({ graph, LG: { LGraphCanvas: { node_colors: {} } } }),
+    resolver,
+    () => events.push("area"),
+    () => [],
+    resolveRailNode,
+    () => null,
+  );
+  return { ...fns, events };
 }
 
 test("#572 applies move, resize, title, color, shape, collapse, and pin in one undo envelope", () => {
@@ -246,4 +287,20 @@ test("#538 legacy colors retain preset:null no-op and permissive CSS values", ()
   assert.deepEqual(changed, { node_id: 1, color: "red", bgcolor: null });
   assert.equal(node.color, "red", "legacy callers may use non-hex CSS colors");
   assert.equal(Object.hasOwn(node, "bgcolor"), false, "null clears a legacy body color");
+});
+
+test("#538 legacy move preserves rail responses and numeric-string geometry", () => {
+  const node = makeNode(1, { pos: [1, 2], size: [140, 60] });
+  const railNode = makeNode(-10, { pos: [3, 4] });
+  const { move, resize } = setupLegacyMotion([node], {
+    resolveRailNode: (_graph, id) => id === -10 ? { node: railNode, rail: "input" } : null,
+  });
+
+  assert.deepEqual(move({ node_id: -10, pos: ["30", "40"] }), {
+    moved: { node_id: -10, rail: "input", from: [3, 4], to: [30, 40] },
+  });
+  assert.deepEqual(resize({ node_id: 1, size: ["300", "150"] }), {
+    resized: { node_id: 1, from: [140, 60], to: [300, 150] },
+  });
+  assert.deepEqual(node.size, [300, 150]);
 });

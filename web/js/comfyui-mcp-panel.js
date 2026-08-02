@@ -7106,13 +7106,27 @@ const GRAPH_TOOL_EXECUTORS = {
   // releases. Newer panels funnel their presentation writes through graph_edit_node
   // while retaining the legacy response shapes expected by existing callers.
   graph_move_node({ node_id, pos }) {
-    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id, pos });
+    const { graph } = getGraphCtx();
+    if (!Array.isArray(pos) || pos.length !== 2) throw new Error("pos must be [x, y]");
+    // Legacy bridge callers may supply numeric strings. Normalize only this wrapper;
+    // the consolidated graph_edit_node deliberately remains strict for new callers.
+    const rail = resolveRailNode(graph, node_id);
+    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id, pos: [Number(pos[0]), Number(pos[1])] });
     const edit = result.edited[0];
-    return { moved: { node_id: edit.after.node_id, from: edit.before.pos, to: edit.after.pos } };
+    return {
+      moved: {
+        node_id: edit.after.node_id,
+        ...(rail ? { rail: rail.rail } : {}),
+        from: edit.before.pos,
+        to: edit.after.pos,
+      },
+    };
   },
 
   graph_resize_node({ node_id, size }) {
-    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id, size });
+    if (!Array.isArray(size) || size.length !== 2) throw new Error("size must be [width, height]");
+    // Same legacy numeric-string compatibility as the standalone resize command.
+    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id, size: [Number(size[0]), Number(size[1])] });
     const edit = result.edited[0];
     return { resized: { node_id: edit.after.node_id, from: edit.before.size, to: edit.after.size } };
   },
