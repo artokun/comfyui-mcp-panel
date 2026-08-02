@@ -1883,3 +1883,399 @@ test("#477 P1: a STATEFUL afterChange that RE-ADDS a replacement proxy every fir
   // the extra replacement stays live — surfaced as partial state, never a clean rollback.
   assert.ok(parent.widgets.includes(newProxy), "the stateful afterChange keeps the replacement live — honestly reported, not masked");
 });
+
+// ---- #507: a DYNAMIC, CLIENT-POPULATED combo whose option list is EMPTY.
+//      `comboOptions()` returns `[]`, which is TRUTHY, so the "no readable option list"
+//      guard never fired and `[].includes(value)` rejected EVERY value — the widget was
+//      permanently unwritable. Zero options means the option set is not KNOWABLE, not
+//      that nothing is valid. But an empty LIVE list can also be merely STALE, so
+//      applyWidgetWrite refuses RETRYABLY by default and only accepts once the caller
+//      (runSetWidget, after its authoritative refresh) opts in. -----------------------
+
+// StarNodes' StarOllamaPromptHelper declares `"model": ((), {...})`, so /object_info
+// reports `"model": [[], {...}]` and the node's own "Refresh Models" button fills the
+// dropdown client-side.
+const emptyComboNode = (value = "") => ({
+  id: 9,
+  type: "StarOllamaPromptHelper",
+  widgets: [{ name: "model", type: "combo", options: { values: [] }, value }],
+});
+const ACCEPT_EMPTY = { ...HOOKS, acceptEmptyComboOptions: true };
+
+test("#507: an EMPTY option list is a RETRYABLE combo rejection by default (a stale list must be refreshed first)", () => {
+  const node = emptyComboNode("orig");
+  assert.throws(
+    () => applyWidgetWrite(node, "model", "qwen3-vl:8b", HOOKS),
+    (err) => err instanceof WidgetWriteError && err.combo === true && /EMPTY option list/.test(err.message),
+  );
+  assert.equal(node.widgets[0].value, "orig", "no mutation while the list is still being resolved");
+});
+
+test("#507: once the list is confirmed STILL empty, the write PROCEEDS with the exact value", () => {
+  const node = emptyComboNode();
+  const set = applyWidgetWrite(node, "model", "qwen3-vl:8b", ACCEPT_EMPTY);
+  assert.equal(set.value, "qwen3-vl:8b");
+  assert.equal(node.widgets[0].value, "qwen3-vl:8b", "the exact value is written, uncoerced");
+});
+
+test("#507: an empty DYNAMIC (function) option list behaves exactly like an empty array", () => {
+  const mk = () => ({
+    id: 9,
+    type: "StarOllamaPromptHelper",
+    widgets: [{ name: "model", type: "combo", options: { values: () => [] }, value: "" }],
+  });
+  assert.throws(() => applyWidgetWrite(mk(), "model", "llama3.2:3b", HOOKS), WidgetWriteError);
+  assert.equal(applyWidgetWrite(mk(), "model", "llama3.2:3b", ACCEPT_EMPTY).value, "llama3.2:3b");
+});
+
+test("#507: a NON-EMPTY list still refuses an off-list value even with acceptEmptyComboOptions (#240 intact)", () => {
+  // The opt-in is scoped to the EMPTY case only — it is not a blanket 'skip validation'.
+  const node = {
+    id: 9,
+    type: "StarOllamaPromptHelper",
+    widgets: [{ name: "model", type: "combo", options: { values: ["qwen3-vl:8b", "llama3.2:3b"] }, value: "qwen3-vl:8b" }],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "model", "not-installed:70b", ACCEPT_EMPTY),
+    (err) => err instanceof WidgetWriteError && /not a valid option/.test(err.message),
+  );
+  assert.equal(node.widgets[0].value, "qwen3-vl:8b", "must not have mutated on reject");
+  // …and a valid member of that same non-empty list still succeeds.
+  assert.equal(applyWidgetWrite(node, "model", "llama3.2:3b", ACCEPT_EMPTY).value, "llama3.2:3b");
+});
+
+test("#507: the LIVE client-populated list is what gets validated (richer than the server's empty one)", () => {
+  // comboOptions reads the LIVE widget, so once the node's own "Refresh Models" button
+  // has filled the dropdown, that list is authoritative for membership.
+  const node = {
+    id: 9,
+    type: "StarOllamaPromptHelper",
+    widgets: [{ name: "model", type: "combo", options: { values: ["qwen3-vl:8b"] }, value: "" }],
+  };
+  assert.equal(applyWidgetWrite(node, "model", "qwen3-vl:8b", ACCEPT_EMPTY).value, "qwen3-vl:8b");
+  assert.throws(() => applyWidgetWrite(node, "model", "ghost:1b", ACCEPT_EMPTY), WidgetWriteError);
+});
+
+test("#507: an UNREADABLE option list is STILL refused — empty is not the same as unreadable", () => {
+  // The pre-existing fail-closed guard is untouched: a missing options.values and a
+  // throwing dynamic fn both still refuse, even with the opt-in — they may be hiding a
+  // real, non-empty list.
+  const missing = { id: 9, type: "N", widgets: [{ name: "model", type: "combo", value: "x" }] };
+  assert.throws(
+    () => applyWidgetWrite(missing, "model", "anything", ACCEPT_EMPTY),
+    (err) => err instanceof WidgetWriteError && /no readable option list/.test(err.message),
+  );
+  const throwing = {
+    id: 9,
+    type: "N",
+    widgets: [{ name: "model", type: "combo", options: { values: () => { throw new Error("boom"); } }, value: "x" }],
+  };
+  assert.throws(() => applyWidgetWrite(throwing, "model", "anything", ACCEPT_EMPTY), WidgetWriteError);
+});
+
+test("#507: an empty option list accepts only a SCALAR — objects/arrays fail closed and are NOT retryable", () => {
+  for (const bad of [{ a: 1 }, ["a"]]) {
+    const node = emptyComboNode("orig");
+    assert.throws(
+      () => applyWidgetWrite(node, "model", bad, ACCEPT_EMPTY),
+      (err) => err instanceof WidgetWriteError && err.combo !== true,
+      `#507: ${JSON.stringify(bad)} must not be written to a combo, and a refresh cannot help`,
+    );
+    assert.equal(node.widgets[0].value, "orig", "must not have mutated on reject");
+  }
+  // A MISSING value is still refused by the pre-existing #347 guard, before the combo branch.
+  assert.throws(() => applyWidgetWrite(emptyComboNode("orig"), "model", undefined, ACCEPT_EMPTY), WidgetWriteError);
+  // Non-string scalars are fine — a dynamic combo may legitimately hold a number/boolean.
+  assert.equal(applyWidgetWrite(emptyComboNode(), "model", 7, ACCEPT_EMPTY).value, 7);
+  assert.equal(applyWidgetWrite(emptyComboNode(), "model", true, ACCEPT_EMPTY).value, true);
+});
+
+test("#507: an UNRESOLVED widget/node still gets no fabricated success (#281/#458)", () => {
+  // No such widget at all: the empty-list path must never be reached by inventing one.
+  const none = { id: 9, type: "StarOllamaPromptHelper", widgets: [] };
+  assert.throws(
+    () => applyWidgetWrite(none, "model", "qwen3-vl:8b", ACCEPT_EMPTY),
+    (err) => err instanceof WidgetWriteError && /has no widget/.test(err.message),
+  );
+  // The injected #458 target guard still runs before any empty-list handling.
+  assert.throws(
+    () =>
+      applyWidgetWrite(emptyComboNode(), "model", "qwen3-vl:8b", {
+        ...ACCEPT_EMPTY,
+        assertTargetWritable: () => {
+          throw new Error("unresolved placeholder node");
+        },
+      }),
+    /unresolved placeholder node/,
+  );
+  // A write that does not STICK is reported as a failure, never a success.
+  const frozen = {
+    id: 9,
+    type: "StarOllamaPromptHelper",
+    widgets: [
+      Object.defineProperty({ name: "model", type: "combo", options: { values: [] } }, "value", {
+        get: () => "frozen",
+        set: () => {},
+        enumerable: true,
+        configurable: true,
+      }),
+    ],
+  };
+  assert.throws(
+    () => applyWidgetWrite(frozen, "model", "qwen3-vl:8b", ACCEPT_EMPTY),
+    (err) => err instanceof WidgetWriteError && /did not retain the requested value/i.test(err.message),
+  );
+});
+
+// ---- #507 codex round-3 (MODERATE): a PROMOTED write also mutates the parent's rail /
+//      display-proxy combos, whose option lists can DIFFER from the inner's. The
+//      empty-list acceptance must not push an off-list value into one of those. --------
+
+// Same shape as makeSubgraphFixture above (identity-linked rail via input._widget), but
+// the INNER combo is EMPTY — the StarNodes-style dynamic input promoted out of a subgraph.
+function makeEmptyInnerPromotedFixture(railOptions) {
+  const inner = {
+    id: 301,
+    type: "StarOllamaPromptHelper",
+    widgets: [{ name: "model", type: "combo", options: { values: [] }, value: "" }],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) };
+  const railWidget = { name: "model_alias", type: "combo", options: railOptions, value: "" };
+  const parent = {
+    id: 320,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [
+      { name: "model_alias", _widget: railWidget, widget: { name: "model_alias" }, _subgraphSlot: { name: "model_alias" } },
+    ],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_node, subgraphInput) =>
+    subgraphInput?.name === "model_alias" ? { sourceNodeId: "301", sourceWidgetName: "model" } : null;
+  return { parent, inner, railWidget, resolveSource };
+}
+
+test("#507 round-3: an empty INNER combo must not write an off-list value into a NON-EMPTY parent rail", () => {
+  const { parent, inner, railWidget, resolveSource } = makeEmptyInnerPromotedFixture({
+    values: ["qwen3-vl:8b", "llama3.2:3b"],
+  });
+  assert.throws(
+    () =>
+      applyWidgetWrite(parent, "model_alias", "off-list:70b", {
+        ...HOOKS,
+        resolveSource,
+        acceptEmptyComboOptions: true,
+      }),
+    (err) => err instanceof WidgetWriteError && /not a valid option for the parent subgraph/.test(err.message),
+  );
+  assert.equal(inner.widgets[0].value, "", "inner untouched — refused before any mutation");
+  assert.equal(railWidget.value, "", "rail untouched");
+});
+
+test("#507 round-3: the SAME promoted shape writes fine when the value IS on the parent rail's list", () => {
+  const { parent, inner, railWidget, resolveSource } = makeEmptyInnerPromotedFixture({
+    values: ["qwen3-vl:8b", "llama3.2:3b"],
+  });
+  const set = applyWidgetWrite(parent, "model_alias", "llama3.2:3b", {
+    ...HOOKS,
+    resolveSource,
+    acceptEmptyComboOptions: true,
+  });
+  assert.equal(set.value, "llama3.2:3b");
+  assert.equal(inner.widgets[0].value, "llama3.2:3b");
+  assert.equal(railWidget.value, "llama3.2:3b", "the rail is synced (#366/#477)");
+});
+
+test("#507 round-3: a parent rail whose list is EMPTY or ABSENT adds no constraint", () => {
+  for (const railOptions of [{ values: [] }, {}]) {
+    const { parent, inner, resolveSource } = makeEmptyInnerPromotedFixture(railOptions);
+    const set = applyWidgetWrite(parent, "model_alias", "qwen3-vl:8b", {
+      ...HOOKS,
+      resolveSource,
+      acceptEmptyComboOptions: true,
+    });
+    assert.equal(set.value, "qwen3-vl:8b");
+    assert.equal(inner.widgets[0].value, "qwen3-vl:8b");
+  }
+});
+
+test("#507 round-3: the rail cross-check is SCOPED to the empty-list path (ordinary promoted writes unchanged)", () => {
+  // Pre-existing behaviour: the INNER list is authoritative, so a value on the inner list
+  // but NOT on the rail's still writes. The new cross-check must not tighten this.
+  const { parent, inner, railWidget, resolveSource } = makeSubgraphFixture();
+  railWidget.options.values = ["simple"]; // rail list now EXCLUDES "karras"
+  const set = applyWidgetWrite(parent, "sched_alias", "karras", { ...HOOKS, resolveSource });
+  assert.equal(set.value, "karras");
+  assert.equal(inner.widgets.find((w) => w.name === "scheduler").value, "karras");
+});
+
+test("#507 round-5: a DYNAMIC parent-rail option source is UNVERIFIABLE on the empty-list path ⇒ fail closed", () => {
+  // codex round-5: a one-shot read of a function source proves nothing — it can return []
+  // during the cross-check and a real list immediately afterwards, so the off-list value
+  // would still land on the mutated, serializing rail. Refuse instead.
+  let call = 0;
+  const { parent, inner, railWidget, resolveSource } = makeEmptyInnerPromotedFixture({
+    values: () => (call++ === 0 ? [] : ["allowed"]), // [] first, real list after
+  });
+  assert.throws(
+    () =>
+      applyWidgetWrite(parent, "model_alias", "off-list:70b", {
+        ...HOOKS,
+        resolveSource,
+        acceptEmptyComboOptions: true,
+      }),
+    (err) => err instanceof WidgetWriteError && /computed dynamically/.test(err.message),
+  );
+  assert.equal(inner.widgets[0].value, "", "inner untouched");
+  assert.equal(railWidget.value, "", "rail untouched — no value assigned behind an unverifiable list");
+  // A stable dynamic source is refused too: the rule is about verifiability, not about
+  // catching this particular stateful source.
+  const stable = makeEmptyInnerPromotedFixture({ values: () => ["allowed"] });
+  assert.throws(
+    () =>
+      applyWidgetWrite(stable.parent, "model_alias", "allowed", {
+        ...HOOKS,
+        resolveSource: stable.resolveSource,
+        acceptEmptyComboOptions: true,
+      }),
+    (err) => err instanceof WidgetWriteError && /computed dynamically/.test(err.message),
+  );
+});
+
+test("#507 round-5: the dynamic-rail refusal is SCOPED to the empty-list path", () => {
+  // An ordinary promoted write against a dynamic rail is untouched — the inner list is
+  // authoritative there, so nothing about the rail needs verifying.
+  const inner = {
+    id: 301,
+    type: "N",
+    widgets: [{ name: "scheduler", type: "combo", options: { values: ["simple", "karras"] }, value: "simple" }],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) };
+  const railWidget = { name: "sched_alias", type: "combo", options: { values: () => ["simple", "karras"] }, value: "simple" };
+  const parent = {
+    id: 320,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "sched_alias", _widget: railWidget, widget: { name: "sched_alias" }, _subgraphSlot: { name: "sched_alias" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_node, si) =>
+    si?.name === "sched_alias" ? { sourceNodeId: "301", sourceWidgetName: "scheduler" } : null;
+  const set = applyWidgetWrite(parent, "sched_alias", "karras", { ...HOOKS, resolveSource });
+  assert.equal(set.value, "karras");
+  assert.equal(inner.widgets[0].value, "karras");
+});
+
+test("#507 final round: when the INNER list validated the value normally, the dynamic-rail refusal does not fire", () => {
+  // The inner list is non-empty and CONTAINS the value, so ordinary membership admitted it
+  // and the empty-list acceptance was never used — a dynamic parent rail then needs no
+  // extra scrutiny and must not be refused, which would be the same "guard rejects a
+  // legitimate case" bug #496/#507 are about. The flag being set is not itself the trigger.
+  const inner = {
+    id: 301,
+    type: "StarOllamaPromptHelper",
+    widgets: [{ name: "model", type: "combo", options: { values: () => ["qwen3-vl:8b"] }, value: "" }],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) };
+  const railWidget = { name: "model_alias", type: "combo", options: { values: () => ["qwen3-vl:8b"] }, value: "" };
+  const parent = {
+    id: 320,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "model_alias", _widget: railWidget, widget: { name: "model_alias" }, _subgraphSlot: { name: "model_alias" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_node, si) =>
+    si?.name === "model_alias" ? { sourceNodeId: "301", sourceWidgetName: "model" } : null;
+  const set = applyWidgetWrite(parent, "model_alias", "qwen3-vl:8b", {
+    ...HOOKS,
+    resolveSource,
+    acceptEmptyComboOptions: true,
+  });
+  assert.equal(set.value, "qwen3-vl:8b");
+  assert.equal(inner.widgets[0].value, "qwen3-vl:8b");
+  assert.equal(railWidget.value, "qwen3-vl:8b");
+});
+
+test("#507 final round: an OFF-list value against a non-empty inner list is still refused with the flag set", () => {
+  // The narrowing must not become an escape hatch: if the inner list is non-empty and
+  // does NOT contain the value, coerceWidgetValue already refuses (before the rail check).
+  const inner = {
+    id: 301,
+    type: "StarOllamaPromptHelper",
+    widgets: [{ name: "model", type: "combo", options: { values: ["qwen3-vl:8b"] }, value: "" }],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) };
+  const railWidget = { name: "model_alias", type: "combo", options: { values: () => ["anything"] }, value: "" };
+  const parent = {
+    id: 320,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "model_alias", _widget: railWidget, widget: { name: "model_alias" }, _subgraphSlot: { name: "model_alias" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_node, si) =>
+    si?.name === "model_alias" ? { sourceNodeId: "301", sourceWidgetName: "model" } : null;
+  assert.throws(
+    () => applyWidgetWrite(parent, "model_alias", "off-list:70b", { ...HOOKS, resolveSource, acceptEmptyComboOptions: true }),
+    (err) => err instanceof WidgetWriteError && /not a valid option/.test(err.message),
+  );
+  assert.equal(inner.widgets[0].value, "");
+  assert.equal(railWidget.value, "");
+});
+
+test("#507 confirmation round: a STATEFUL inner options fn cannot be used to skip the parent-rail check", () => {
+  // The escape hatch codex found: if the sibling cross-check decided by RE-READING the
+  // inner list after coercion, a function that returns [] at coercion time (so the
+  // empty-list acceptance is what admitted the value) and a NON-EMPTY list containing the
+  // value on the next read would look "normally validated" — and an off-list value would
+  // then land on a static parent rail and be reported as success. The verdict must come
+  // from COERCION TIME, so this must still be refused.
+  let call = 0;
+  const inner = {
+    id: 301,
+    type: "StarOllamaPromptHelper",
+    // 1st call (coercion): empty ⇒ the empty-list acceptance admits the value.
+    // Every later call: a list that CONTAINS the value, which a re-read would trust.
+    widgets: [{ name: "model", type: "combo", options: { values: () => (call++ === 0 ? [] : ["off-list:70b"]) }, value: "" }],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) };
+  const railWidget = { name: "model_alias", type: "combo", options: { values: ["allowed:1b"] }, value: "" };
+  const parent = {
+    id: 320,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "model_alias", _widget: railWidget, widget: { name: "model_alias" }, _subgraphSlot: { name: "model_alias" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_node, si) =>
+    si?.name === "model_alias" ? { sourceNodeId: "301", sourceWidgetName: "model" } : null;
+  assert.throws(
+    () => applyWidgetWrite(parent, "model_alias", "off-list:70b", { ...HOOKS, resolveSource, acceptEmptyComboOptions: true }),
+    (err) => err instanceof WidgetWriteError && /not a valid option for the parent subgraph/.test(err.message),
+  );
+  assert.equal(inner.widgets[0].value, "", "inner untouched");
+  assert.equal(railWidget.value, "", "the off-list value never reached the rail");
+});
+
+test("#507 confirmation round: coerceWidgetValue reports empty-list acceptance ONLY when it was used", () => {
+  // The signal the cross-check keys on, asserted directly so a future refactor that stops
+  // setting it (silently disabling the rail check) fails here.
+  const empty = { name: "model", type: "combo", options: { values: [] }, value: "" };
+  const outEmpty = {};
+  assert.equal(coerceWidgetValue(empty, "anything", empty, null, { acceptEmptyComboOptions: true, out: outEmpty }), "anything");
+  assert.equal(outEmpty.emptyAcceptanceUsed, true, "the empty-list acceptance admitted it");
+
+  const full = { name: "model", type: "combo", options: { values: ["a", "b"] }, value: "a" };
+  const outFull = {};
+  assert.equal(coerceWidgetValue(full, "b", full, null, { acceptEmptyComboOptions: true, out: outFull }), "b");
+  assert.equal(outFull.emptyAcceptanceUsed, undefined, "ordinary membership admitted it — acceptance unused");
+
+  // And with the flag OFF an empty list is still a retryable refusal, never an acceptance.
+  const outOff = {};
+  assert.throws(
+    () => coerceWidgetValue(empty, "anything", empty, null, { out: outOff }),
+    (err) => err instanceof WidgetWriteError && err.emptyOptions === true && err.combo === true,
+  );
+  assert.equal(outOff.emptyAcceptanceUsed, undefined);
+});

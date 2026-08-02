@@ -31,9 +31,14 @@
 //     is refused, not written blindly).
 
 export class WidgetWriteError extends Error {
-  constructor(message, { combo = false } = {}) {
+  constructor(message, { combo = false, emptyOptions = false } = {}) {
     super(message);
     this.name = "WidgetWriteError";
+    // `emptyOptions` narrows `combo` to the ONE case runSetWidget's #507 last-resort
+    // path may act on: the option list was READ successfully and is EMPTY. It is set
+    // ONLY by that branch, so the caller never has to pattern-match a message, and a
+    // plain "not a valid option" rejection can never be mistaken for it.
+    this.emptyOptions = emptyOptions;
     // `combo` marks the failure as "combo value rejected against the current
     // option list" (unreadable OR not-a-member). runSetWidget uses this as the
     // ONLY signal that a stale-combo refresh + single revalidation may help —
@@ -215,7 +220,13 @@ function mergeCompositeFields(widgetName, base, incoming) {
  * WidgetWriteError (never silently coerces to a wrong value) when the value is
  * incompatible with the widget's declared type.
  */
-export function coerceWidgetValue(widget, value, mergeBaseWidget = widget, subFieldPath = null) {
+export function coerceWidgetValue(
+  widget,
+  value,
+  mergeBaseWidget = widget,
+  subFieldPath = null,
+  { acceptEmptyComboOptions = false, out } = {},
+) {
   const name = widget?.name ?? "(widget)";
 
   // #347: distinguish "clear to empty" from "missing value". An EXPLICIT empty
@@ -293,6 +304,55 @@ export function coerceWidgetValue(widget, value, mergeBaseWidget = widget, subFi
         `Combo widget "${name}" has no readable option list; cannot validate ` +
           `value ${JSON.stringify(value)} — refusing to write.`,
         { combo: true },
+      );
+    }
+    // #507: a DYNAMIC, CLIENT-POPULATED combo declared with an EMPTY option list —
+    // e.g. StarNodes' `"model": ((), {...})`, which /object_info reports as
+    // `[[], {...}]` and whose dropdown the node's own frontend JS fills at runtime
+    // (a "Refresh Models" button). `comboOptions` returns `[]`, which is TRUTHY, so
+    // the `!options` guard above never fired and `[].includes(value)` rejected EVERY
+    // value — the widget was permanently unwritable by the agent.
+    //
+    // ZERO options means the option set is NOT KNOWABLE from here — the same state
+    // the guard above names, NOT "no value is valid". And the #240 reason for strict
+    // membership does not apply: that rule exists so a numeric value cannot be
+    // silently reinterpreted as an INDEX into a real list, and with an empty list
+    // there is no list to index into. So accept the value as written.
+    //
+    // This does NOT loosen #233/#240. An empty LIVE list is ambiguous — it can also
+    // simply be STALE (never populated yet) while the SERVER publishes a real list —
+    // so acceptance is NOT automatic: by default the empty case throws a RETRYABLE
+    // combo error, which drives runSetWidget's authoritative /object_info refresh
+    // first. Only if the list is STILL empty after that (`acceptEmptyComboOptions`)
+    // is the value taken as written. The moment the list is NON-EMPTY — from the
+    // server or from the node's own client-side refresh, whichever is richer, since
+    // `options` is read from the LIVE widget — strict membership below applies
+    // unchanged and an off-list value is refused.
+    //
+    // Only a SCALAR is ever accepted: an object/array could never be an option under
+    // any list and would corrupt the widget, so it fails closed and is marked
+    // NON-retryable (no refresh can make it valid).
+    if (options.length === 0) {
+      if (typeof value === "object") {
+        throw new WidgetWriteError(
+          `Combo widget "${name}" has an EMPTY option list (a dynamic, client-populated ` +
+            `combo), so ${JSON.stringify(value)} cannot be validated against it — and only a ` +
+            `scalar (string/number/boolean) can be written to a combo. Refusing to write.`,
+        );
+      }
+      if (acceptEmptyComboOptions) {
+        // Record that THIS acceptance — not ordinary membership — is what admitted the
+        // value, so applyWidgetWrite can decide the sibling cross-check from the
+        // COERCION-TIME verdict. It must never re-read the list to infer this: a
+        // stateful dynamic source can answer differently on a second call and would
+        // become an escape hatch around the check (codex confirmation round).
+        if (out) out.emptyAcceptanceUsed = true;
+        return value;
+      }
+      throw new WidgetWriteError(
+        `Combo widget "${name}" has an EMPTY option list; the server's option list may ` +
+          `simply be stale — refreshing it before deciding.`,
+        { combo: true, emptyOptions: true },
       );
     }
     // STRICT typed membership: no numeric<->string coercion. Numeric options
@@ -649,6 +709,7 @@ export function resolveWidgetWrite(
   resolveSource,
   assertTargetWritable,
   promotedResolution,
+  coerceOpts,
 ) {
   let targetNode = node;
   let widget = null;
@@ -791,7 +852,7 @@ export function resolveWidgetWrite(
   // unaffected (they don't merge). Non-promoted writes merge onto their own value.
   // (A promoted write with no authoritative rail already threw above, BEFORE this
   // possibly side-effecting coercion — so `promotedParentWidget` is non-null here.)
-  const coerced = coerceWidgetValue(widget, value, promotedParentWidget ?? widget, subFieldPath);
+  const coerced = coerceWidgetValue(widget, value, promotedParentWidget ?? widget, subFieldPath, coerceOpts);
 
   return { targetNode, widget, coerced, promotedFrom, promotedParentWidget, promotedParentWidgets, promotedHostInput };
 }
@@ -806,7 +867,20 @@ export function applyWidgetWrite(
   node,
   widgetName,
   value,
-  { resolveSource, canvas, beforeChange, afterChange, setDirty, assertTargetWritable, promotedResolution } = {},
+  {
+    resolveSource,
+    canvas,
+    beforeChange,
+    afterChange,
+    setDirty,
+    assertTargetWritable,
+    promotedResolution,
+    // #507: only the FINAL attempt (after the authoritative /object_info combo refresh
+    // has had its chance) may treat a still-EMPTY combo option list as "not knowable"
+    // and take the value as written. Default false ⇒ the empty case is a RETRYABLE
+    // combo rejection, so a merely-stale empty list is refreshed before any decision.
+    acceptEmptyComboOptions = false,
+  } = {},
 ) {
   // resolveWidgetWrite runs assertTargetWritable on the RESOLVED target (inner
   // promoted node for a subgraph write, or the node's own) BEFORE it coerces the
@@ -815,8 +889,14 @@ export function applyWidgetWrite(
   // promotedResolution is reused so the write targets the EXACT node the fresh
   // /object_info gate authorized (#458), and resolveWidgetWrite also fails closed if
   // the AUTHORITATIVE parent rail widget can't be identified (#366).
+  const coerceOutcome = {};
   const { targetNode, widget: w, coerced, promotedFrom, promotedParentWidget, promotedParentWidgets, promotedHostInput } =
-    resolveWidgetWrite(node, widgetName, value, resolveSource, assertTargetWritable, promotedResolution);
+    resolveWidgetWrite(node, widgetName, value, resolveSource, assertTargetWritable, promotedResolution, {
+      acceptEmptyComboOptions,
+      // Filled in by coerceWidgetValue when the EMPTY-LIST acceptance (not ordinary
+      // membership) is what admitted the value. Read below — never re-derived.
+      out: coerceOutcome,
+    });
 
   // #366: for a promoted subgraph widget the AUTHORITATIVE value lives on the
   // parent's OWN rail widget (resolved by the promotion RELATIONSHIP in
@@ -837,6 +917,53 @@ export function applyWidgetWrite(
     promotedFrom && Array.isArray(promotedParentWidgets)
       ? promotedParentWidgets.filter((dw) => dw && dw !== w && dw !== parentWidget)
       : [];
+
+  // #507 (codex round-3, MODERATE): coerceWidgetValue validated the value against the
+  // IMMEDIATE inner widget's option list only — but a promoted write assigns the SAME
+  // value to the parent's authoritative RAIL widget and to every display proxy, whose
+  // own option lists can DIFFER from the inner's. That is harmless while the inner list
+  // is authoritative, but the empty-list acceptance deliberately writes a value nothing
+  // validated, so an inner combo that is (server-declared) EMPTY could push an OFF-LIST
+  // value into a rail/proxy that DOES have a real list. Scoped strictly to that path:
+  // when acceptEmptyComboOptions is in force, every OTHER mutated combo with a readable
+  // NON-EMPTY list must contain the value, or the whole write fails closed BEFORE any
+  // mutation. A rail whose own list is unreadable or empty adds no information and is
+  // skipped (the inner's server declaration already governs).
+  // …and ONLY when the EMPTY-LIST acceptance is what actually admitted the value. Keying
+  // on the caller's FLAG alone over-reached: with a stateful inner options function the
+  // final attempt may have been validated by ordinary membership, and refusing the rail
+  // then would be the very "guard rejects a legitimate case" bug this PR exists to fix.
+  // The verdict is taken from COERCION TIME (coerceOutcome, set inside coerceWidgetValue)
+  // and never re-derived by reading the list again: a second read of a stateful dynamic
+  // source can disagree with the first, which would turn the narrowing into an escape
+  // hatch around this very check (codex confirmation round).
+  if (coerceOutcome.emptyAcceptanceUsed) {
+    for (const other of [parentWidget, ...displayWidgets]) {
+      if (!other || !isComboWidget(other)) continue;
+      // A DYNAMIC (function) sibling list is UNVERIFIABLE from here (codex round-5): it
+      // can return [] during this check and a real, non-empty list immediately afterwards
+      // — a one-shot read proves nothing, and the off-list value would still land on the
+      // mutated, serializing rail. Only the value's membership matters, and we cannot
+      // establish it, so fail closed rather than report a success we cannot stand behind.
+      if (typeof other.options?.values === "function") {
+        throw new WidgetWriteError(
+          `Cannot verify value ${JSON.stringify(coerced)} against the parent subgraph's combo ` +
+            `widget "${other.name}", which this promoted write also mutates: its option list is ` +
+            `computed dynamically and the inner widget's list is empty, so nothing authoritative ` +
+            `validates the value. Refusing to write.`,
+        );
+      }
+      const otherOptions = comboOptions(other);
+      if (!Array.isArray(otherOptions) || otherOptions.length === 0) continue;
+      if (otherOptions.includes(coerced)) continue;
+      throw new WidgetWriteError(
+        `Value ${JSON.stringify(coerced)} is not a valid option for the parent subgraph's ` +
+          `combo widget "${other.name}" (${otherOptions.length} options), which this promoted ` +
+          `write also mutates — the inner widget's option list is empty, but this one is not. ` +
+          `Refusing to write.`,
+      );
+    }
+  }
 
   // Snapshot the EXPECTED value BEFORE the callback runs. For a COMPOSITE object
   // write (#179) `w.value` and `coerced` are the SAME reference, so a callback
