@@ -98,8 +98,8 @@ def _backend_port(backend):
     return _BACKEND_PORTS.get((backend or _DEFAULT_BACKEND).lower(), _BRIDGE_PORT)
 
 
-# Provider-CLI binary names per backend (Windows resolves .cmd/.exe via PATHEXT,
-# but probe the variants too).
+# Provider-CLI binary names per backend. Most Windows CLIs can use a .cmd shim;
+# pi is the exception because the MCP starts it with shell-less spawn.
 _PROVIDER_CLIS = {
     "claude": ("claude", "claude.cmd", "claude.exe"),
     "codex": ("codex", "codex.cmd", "codex.exe"),
@@ -148,15 +148,30 @@ def _pi_installed():
     override mirrors the orchestrator's resolvePiBin so an env-var-only install
     doesn't read "not installed" in onboarding until the orchestrator's readiness
     frame corrects it)."""
+    def spawnable(path):
+        # Python's shutil.which("pi") can resolve pi.cmd through PATHEXT, but
+        # Node's shell-less spawn cannot execute batch shims. Keep the panel's
+        # optimistic discovery aligned with the MCP resolver: only a real binary
+        # (extensionless pi or pi.exe) can advertise this backend as installed.
+        return bool(path) and not str(path).strip().lower().endswith((".cmd", ".bat"))
+
     override = (environ.get("COMFYUI_MCP_PI_PATH") or "").strip()
-    if override and os.path.isfile(override):
+    if spawnable(override) and os.path.isfile(override):
         return True
-    if _provider_cli("pi"):
-        return True
+    for name in _PROVIDER_CLIS["pi"]:
+        if spawnable(shutil.which(name)):
+            return True
+    for directory in _gui_fallback_bin_dirs():
+        for name in _PROVIDER_CLIS["pi"]:
+            candidate = os.path.join(directory, name)
+            if spawnable(candidate) and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return True
     if sys.platform == "win32":
         local = environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
-        return os.path.isfile(os.path.join(local, "pi", "bin", "pi.exe"))
-    return os.path.isfile(os.path.join(os.path.expanduser("~"), ".local", "bin", "pi"))
+        candidate = os.path.join(local, "pi", "bin", "pi.exe")
+    else:
+        candidate = os.path.join(os.path.expanduser("~"), ".local", "bin", "pi")
+    return spawnable(candidate) and os.path.isfile(candidate)
 
 
 def _gui_fallback_bin_dirs():

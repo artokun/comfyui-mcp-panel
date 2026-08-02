@@ -85,10 +85,47 @@ class ProviderCliGuiPath(unittest.TestCase):
         self.assertTrue(mod._provider_cli("codex"))
 
     def test_pi_cmd_shim_is_not_reported_as_runnable(self):
-        # #491: the MCP uses shell-less spawn for pi, so `pi.cmd` cannot run.
-        # The panel must not show pi as installed from that Windows shim alone.
-        mod.shutil.which = lambda name: "C:/bin/pi.cmd" if name == "pi.cmd" else None
-        self.assertFalse(mod._provider_cli("pi"))
+        # #491: `which("pi")` may resolve pi.cmd through PATHEXT, but the MCP
+        # uses shell-less spawn and cannot execute that shim. A real pi.exe remains
+        # valid, proving this isn't merely a false-negative test.
+        old_override = mod.environ.get("COMFYUI_MCP_PI_PATH")
+        old_isfile = mod.os.path.isfile
+        mod._gui_fallback_bin_dirs = lambda: ()
+        mod.os.path.isfile = lambda path: False
+        mod.environ.pop("COMFYUI_MCP_PI_PATH", None)
+        try:
+            mod.shutil.which = lambda name: "C:/bin/pi.cmd" if name == "pi" else None
+            self.assertFalse(mod._pi_installed())
+            mod.shutil.which = lambda name: "C:/bin/pi.exe" if name == "pi" else None
+            self.assertTrue(mod._pi_installed())
+        finally:
+            mod.os.path.isfile = old_isfile
+            if old_override is None:
+                mod.environ.pop("COMFYUI_MCP_PI_PATH", None)
+            else:
+                mod.environ["COMFYUI_MCP_PI_PATH"] = old_override
+
+    def test_pi_cmd_override_is_not_reported_as_runnable(self):
+        # The explicit override is passed straight to shell-less spawn too, so it
+        # needs the same .cmd rejection as PATH/PATHEXT discovery.
+        old_override = mod.environ.get("COMFYUI_MCP_PI_PATH")
+        old_isfile = mod.os.path.isfile
+        mod._gui_fallback_bin_dirs = lambda: ()
+        mod.shutil.which = lambda name: None
+        mod.os.path.isfile = lambda path: path in {"C:/bin/pi.cmd", "C:/bin/pi.exe"}
+        try:
+            mod.environ["COMFYUI_MCP_PI_PATH"] = "C:/bin/pi.cmd"
+            self.assertFalse(mod._pi_installed())
+            mod.environ["COMFYUI_MCP_PI_PATH"] = "C:/bin/pi.bat"
+            self.assertFalse(mod._pi_installed())
+            mod.environ["COMFYUI_MCP_PI_PATH"] = "C:/bin/pi.exe"
+            self.assertTrue(mod._pi_installed())
+        finally:
+            mod.os.path.isfile = old_isfile
+            if old_override is None:
+                mod.environ.pop("COMFYUI_MCP_PI_PATH", None)
+            else:
+                mod.environ["COMFYUI_MCP_PI_PATH"] = old_override
 
     def test_provider_state_ready_when_cli_in_fallback_and_auth_present(self):
         # End-to-end: cli found via fallback + ~/.codex/auth.json present => ready.
