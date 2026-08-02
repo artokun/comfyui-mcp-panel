@@ -10431,7 +10431,10 @@ function redactBridgeUrl(u) {
 // (anomalous — logged once via onRidReuse) executes fresh instead of receiving
 // the old reply. Module-scoped so the ledger survives a socket supersede: the
 // replay can arrive on the REPLACEMENT socket while the first execution was
-// still in flight on the old.
+// still in flight on the old. Each operation additionally owns the epoch
+// stamped on its receiving socket: a retained predecessor-process rid is
+// unknown in the new epoch and therefore fails open instead of replaying or
+// rejecting a prior session's command.
 const commandRidLedger = createCommandDedupeLedger(200, (m) => console.warn(m));
 
 function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCommandReceived, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert }) {
@@ -10825,6 +10828,19 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       } catch {
         return;
       }
+      // #694/#713 (epoch-first) — stamp every epoch-carrying frame before any
+      // command dedupe work. The orchestrator sends `session_epoch` immediately
+      // after hello, before slow model discovery, so a command received after
+      // that tiny frame is already scoped to the fresh process. This is also
+      // deliberately before isCommandFrame: an epoch-bearing command cannot
+      // accidentally consult a predecessor process's retained ledger state.
+      if (msg && typeof msg.epoch === "string") {
+        try {
+          thisSock.__cmcpBridgeEpoch = msg.epoch;
+        } catch {
+          /* exotic WebSocket impl — epoch matching stays absent/absent */
+        }
+      }
       const isCommandFrame = msg && typeof msg.rid === "string" && typeof msg.cmd === "string";
       if (!isActive()) {
         // Superseded socket — a soft-reload/reconnect replaced it. Its late frames must NOT
@@ -10893,7 +10909,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // executing it would apply the old command's retry to the active,
         // wrong workflow.
         const fingerprint = commandFingerprint(msg);
-        let priorRidReply = commandRidLedger.get(msg.rid, fingerprint);
+        // Capture THIS frame's session owner before any async executor work.
+        // The ledger remains shared across socket supersedes in one process,
+        // but never crosses a server-issued epoch after an orchestrator restart.
+        // A `session_epoch` frame is stamped generically above (before models),
+        // so the first command after that early frame already gets its new owner.
+        const commandEpoch = thisSock.__cmcpBridgeEpoch;
+        let priorRidReply = commandRidLedger.get(msg.rid, fingerprint, commandEpoch);
         let retryOfHit = false;
         // Validate retry_of even when this retry rid is already remembered. A
         // token may have failed open while its original was evicted, then the
@@ -10901,7 +10923,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // duplicated. Replaying the retry's own old reply must not bypass the
         // newly-known cross-workflow mismatch.
         if (typeof msg.retry_of === "string") {
-          const retryLookup = commandRidLedger.lookupRetry(msg.retry_of, fingerprint);
+          const retryLookup = commandRidLedger.lookupRetry(msg.retry_of, fingerprint, commandEpoch);
           if (retryLookup.status === "mismatch") {
             if (!isActive()) return; // superseded socket — ignore its late frames
             try {
@@ -10942,7 +10964,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           }
           return;
         }
-        const settleRid = commandRidLedger.begin(msg.rid, fingerprint);
+        const settleRid = commandRidLedger.begin(msg.rid, fingerprint, commandEpoch);
         let reply;
         try {
           let result;
@@ -11264,19 +11286,6 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // later "rewind conversation to here" can fork the session at that point.
       if (msg && msg.type === "turn_anchor" && typeof msg.uuid === "string") {
         onTurnAnchor?.(msg.uuid);
-      }
-      // #694 (epoch-first) — stamp the session epoch from ANY frame that
-      // carries it: the orchestrator now sends a tiny "session_epoch" frame
-      // the instant a hello lands (before async model discovery), so the epoch
-      // advances immediately instead of only when the `models` frame arrives.
-      // A legacy orchestrator sends no epoch on those early frames — the
-      // models-frame stamp below still covers them.
-      if (msg && typeof msg.epoch === "string") {
-        try {
-          thisSock.__cmcpBridgeEpoch = msg.epoch;
-        } catch {
-          /* exotic WebSocket impl — epoch matching stays absent/absent */
-        }
       }
       // Live model catalog from the orchestrator (SDK-probed). This is also the
       // orchestrator HANDSHAKE — receiving it proves a real panel agent is behind

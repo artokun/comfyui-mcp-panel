@@ -51,13 +51,14 @@ function makeDispatch(ledger, executor) {
 // ledger entry; a hit there is answered with the rid REWRITTEN to the retry's
 // (the orchestrator's pending map waits on the fresh rid). An unknown retry_of
 // misses too and falls through to begin + execute fresh — the ledger fails open.
-function makeRetryDispatch(ledger, executor) {
+function makeRetryDispatch(ledger, executor, getScope = () => undefined) {
   return async function deliver(msg) {
     const fingerprint = commandFingerprint(msg);
-    let prior = ledger.get(msg.rid, fingerprint);
+    const scope = getScope();
+    let prior = ledger.get(msg.rid, fingerprint, scope);
     let retryOfHit = false;
     if (typeof msg.retry_of === "string") {
-      const retryLookup = ledger.lookupRetry(msg.retry_of, fingerprint);
+      const retryLookup = ledger.lookupRetry(msg.retry_of, fingerprint, scope);
       if (retryLookup.status === "mismatch") {
         return {
           reply: {
@@ -77,7 +78,7 @@ function makeRetryDispatch(ledger, executor) {
       const reply = await prior;
       return { reply: retryOfHit ? { ...reply, rid: msg.rid } : reply, executed: false };
     }
-    const settle = ledger.begin(msg.rid, fingerprint);
+    const settle = ledger.begin(msg.rid, fingerprint, scope);
     let reply;
     try {
       reply = { rid: msg.rid, ok: true, result: await executor(msg) };
@@ -356,6 +357,75 @@ test("a retry naming an UNKNOWN retry_of executes fresh — the ledger fails ope
   assert.equal(applied, 1);
 });
 
+test("a retained predecessor-epoch retry token is unknown and executes fresh (#713)", async () => {
+  const ledger = createCommandDedupeLedger();
+  let applied = 0;
+  let epoch = "epoch-before-restart";
+  const deliver = makeRetryDispatch(
+    ledger,
+    async (msg) => ({ applied: ++applied, workflow: msg.workflow_uuid }),
+    () => epoch,
+  );
+
+  await deliver({ rid: "original-rid", cmd: "graph_set_title", title: "old", workflow_uuid: "wf-old" });
+  epoch = "epoch-after-restart";
+
+  // The later process can legitimately retry with the old correlation token.
+  // Its retained predecessor entry must be UNKNOWN, never a replay hit.
+  const retry = await deliver({
+    rid: "retry-rid",
+    retry_of: "original-rid",
+    cmd: "graph_set_title",
+    title: "old",
+    workflow_uuid: "wf-old",
+  });
+
+  assert.equal(retry.executed, true, "a prior session's token must fail open in the new epoch");
+  assert.equal(applied, 2, "the new process receives its own fresh execution");
+  assert.equal(retry.reply.result.workflow, "wf-old");
+});
+
+test("a same-rid predecessor-epoch replay also executes fresh (#713)", async () => {
+  const ledger = createCommandDedupeLedger();
+  let epoch = "epoch-before-restart";
+  let applied = 0;
+  const deliver = makeRetryDispatch(ledger, async () => ({ applied: ++applied }), () => epoch);
+
+  await deliver({ rid: "same-rid", cmd: "graph_add_node", workflow_uuid: "wf" });
+  epoch = "epoch-after-restart";
+  const current = await deliver({ rid: "same-rid", cmd: "graph_add_node", workflow_uuid: "wf" });
+
+  assert.equal(current.executed, true, "the old process's exact rid is not an own-rid replay now");
+  assert.equal(applied, 2);
+});
+
+test("a predecessor-epoch retry token cannot reject different current work (#713)", async () => {
+  const ledger = createCommandDedupeLedger();
+  let epoch = "epoch-before-restart";
+  const executed = [];
+  const deliver = makeRetryDispatch(
+    ledger,
+    async (msg) => {
+      executed.push(msg.workflow_uuid);
+      return { workflow: msg.workflow_uuid };
+    },
+    () => epoch,
+  );
+
+  await deliver({ rid: "original-rid", cmd: "graph_set_title", title: "old", workflow_uuid: "wf-old" });
+  epoch = "epoch-after-restart";
+  const retry = await deliver({
+    rid: "retry-rid",
+    retry_of: "original-rid",
+    cmd: "graph_set_title",
+    title: "current",
+    workflow_uuid: "wf-current",
+  });
+
+  assert.equal(retry.executed, true, "old-session mismatch state must not reject current work");
+  assert.deepEqual(executed, ["wf-old", "wf-current"]);
+});
+
 test("a retry naming an EVICTED retry_of also executes fresh (#543)", async () => {
   const ledger = createCommandDedupeLedger(1);
   const executedRids = [];
@@ -456,15 +526,16 @@ test("#694 wiring: the panel handler falls back to retry_of and REWRITES the rid
   const fpAt = src.indexOf("const fingerprint = commandFingerprint(msg);");
   assert.notEqual(fpAt, -1, "the command handler must fingerprint the frame");
   const block = src.slice(fpAt, fpAt + 3600);
+  assert.match(block, /const commandEpoch = thisSock\.__cmcpBridgeEpoch;/, "the command snapshots its socket epoch");
   assert.match(
     block,
-    /let priorRidReply = commandRidLedger\.get\(msg\.rid, fingerprint\);/,
-    "the frame's own rid is consulted first",
+    /let priorRidReply = commandRidLedger\.get\(msg\.rid, fingerprint, commandEpoch\);/,
+    "the frame's own rid is consulted in its session epoch",
   );
   assert.match(
     block,
-    /const retryLookup = commandRidLedger\.lookupRetry\(msg\.retry_of, fingerprint\);/,
-    "a retry misses on its fresh rid, then distinguishes the ORIGINAL token's state",
+    /const retryLookup = commandRidLedger\.lookupRetry\(msg\.retry_of, fingerprint, commandEpoch\);/,
+    "a retry distinguishes the original token only in its current session epoch",
   );
   assert.match(block, /if \(retryLookup\.status === "mismatch"\)/, "a retained mismatched retry token is rejected");
   assert.match(block, /error: "Retry rejected: retry_of refers to a different command or workflow\."/, "the mismatch produces a truthful retry error");
@@ -478,10 +549,10 @@ test("#694 wiring: the panel handler falls back to retry_of and REWRITES the rid
   const sendAt = block.indexOf("thisSock.send(", rewriteAt);
   assert.ok(rewriteAt !== -1 && sendAt !== -1 && rewriteAt < sendAt, "the rewrite precedes the reply write");
   // begin() must still key the retry's OWN rid when the token was unknown/evicted (fail-open).
-  assert.match(block, /commandRidLedger\.begin\(msg\.rid, fingerprint\);/);
+  assert.match(block, /commandRidLedger\.begin\(msg\.rid, fingerprint, commandEpoch\);/);
   const rejectAt = block.indexOf('retryLookup.status === "mismatch"');
   const ownReplyAt = block.indexOf("if (priorRidReply !== undefined)");
-  const beginAt = block.indexOf("commandRidLedger.begin(msg.rid, fingerprint)");
+  const beginAt = block.indexOf("commandRidLedger.begin(msg.rid, fingerprint, commandEpoch)");
   assert.ok(rejectAt !== -1 && ownReplyAt !== -1 && rejectAt < ownReplyAt, "mismatched retries return before their own-rid reply can replay");
   assert.ok(rejectAt !== -1 && beginAt !== -1 && rejectAt < beginAt, "mismatched retries return before begin + execute");
 });

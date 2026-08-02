@@ -14,11 +14,14 @@
 // awaited first if the first execution is still in flight — and never runs the
 // executor again (so no second mutation and no duplicate activity card).
 //
-// The dedupe identity is rid + PAYLOAD FINGERPRINT (commandFingerprint below:
-// the frame minus `rid` and `retry_of`, canonical-stringified). The bridge's
-// re-dispatch of the SAME logical command reproduces the frame exactly, so it
-// dedupes — but a rid arriving with a MISMATCHED fingerprint is NOT the same
-// command (a genuinely new command that happens to reuse a prior rid:
+// The dedupe identity is optional OWNER SCOPE + rid + PAYLOAD FINGERPRINT
+// (commandFingerprint below: the frame minus `rid` and `retry_of`,
+// canonical-stringified). The panel's owner scope is the server-issued session
+// epoch: the same process can reconnect and dedupe safely, while a retained rid
+// from a restarted process is unknown and fails open. Within a scope, the
+// bridge's re-dispatch of the SAME logical command reproduces the frame exactly,
+// so it dedupes — but a rid arriving with a MISMATCHED fingerprint is NOT the
+// same command (a genuinely new command that happens to reuse a prior rid:
 // re-targeted or replaced socket, different workflow). It is never answered
 // from the ledger: it executes fresh, and the reuse is logged once via
 // onRidReuse (the bridge should only ever re-dispatch the SAME command under a
@@ -79,22 +82,29 @@ export function commandFingerprint(msg) {
  *    arrives under a DIFFERENT fingerprint than a remembered entry — i.e. the
  *    bridge reused a request id for different work (anomalous; worth a log).
  * @returns {{
- *   get(rid: string, fingerprint: string): object | Promise<object> | undefined,
- *   lookupRetry(rid: string, fingerprint: string): { status: "match", reply: object | Promise<object> } | { status: "mismatch" } | { status: "unknown" },
- *   begin(rid: string, fingerprint: string): (reply: object) => void,
+ *   get(rid: string, fingerprint: string, scope?: unknown): object | Promise<object> | undefined,
+ *   lookupRetry(rid: string, fingerprint: string, scope?: unknown): { status: "match", reply: object | Promise<object> } | { status: "mismatch" } | { status: "unknown" },
+ *   begin(rid: string, fingerprint: string, scope?: unknown): (reply: object) => void,
  * }} get() returns undefined for a fresh rid+fingerprint, the settled reply
  *    object once the command completed, or a promise of it while the first
  *    execution is still in flight. lookupRetry() additionally distinguishes an
  *    unknown/evicted token from a remembered token for different work. begin()
  *    records a fresh rid+fingerprint as in-flight and returns its settle(reply)
- *    function.
+ *    function. `scope` is an optional owner dimension. The panel supplies the
+ *    orchestrator session epoch, so a retained rid from a predecessor process
+ *    is unknown (and therefore fails open) rather than replayed or rejected in
+ *    the new process.
  */
 export function createCommandDedupeLedger(cap = 200, onRidReuse) {
-  // `${rid}\n${fingerprint}` → { rid, inflight: true, promise } in-flight |
-  // { rid, inflight: false, reply } settled. Map preserves insertion order, so
-  // the oldest entry is always the first key. (The \n separator is safe: rids
-  // are UUIDs and canonical JSON never contains a raw newline.)
+  // JSON tuple `[scope, rid, fingerprint]` →
+  // { scope, rid, inflight: true, promise } in-flight |
+  // { scope, rid, inflight: false, reply } settled. The scope is deliberately
+  // an owned ledger dimension rather than part of the command fingerprint: a
+  // predecessor session's retry token must be unknown in a new session, not a
+  // retained token with a mismatched fingerprint. Map preserves insertion
+  // order, so the oldest entry is always the first key.
   const entries = new Map();
+  const keyFor = (scope, rid, fingerprint) => JSON.stringify([scope, rid, fingerprint]);
 
   // Evict oldest-first while over cap, but NEVER an in-flight entry (see
   // header): with every entry in flight this grows the ledger past cap
@@ -110,8 +120,8 @@ export function createCommandDedupeLedger(cap = 200, onRidReuse) {
   };
 
   return {
-    get(rid, fingerprint) {
-      const key = `${rid}\n${fingerprint}`;
+    get(rid, fingerprint, scope) {
+      const key = keyFor(scope, rid, fingerprint);
       const entry = entries.get(key);
       if (entry === undefined) return undefined;
       // LRU touch: a replayed entry is by definition still relevant — keep it
@@ -120,25 +130,25 @@ export function createCommandDedupeLedger(cap = 200, onRidReuse) {
       entries.set(key, entry);
       return entry.inflight ? entry.promise : entry.reply;
     },
-    lookupRetry(rid, fingerprint) {
-      const reply = this.get(rid, fingerprint);
+    lookupRetry(rid, fingerprint, scope) {
+      const reply = this.get(rid, fingerprint, scope);
       if (reply !== undefined) return { status: "match", reply };
       // A retry token that is still retained but has no entry for this
       // fingerprint names different work. It must not fail open onto whichever
       // workflow is active now. In contrast, an unknown or evicted token has no
       // entry at all and intentionally retains the ledger's fail-open behaviour.
       for (const entry of entries.values()) {
-        if (entry.rid === rid) return { status: "mismatch" };
+        if (entry.scope === scope && entry.rid === rid) return { status: "mismatch" };
       }
       return { status: "unknown" };
     },
-    begin(rid, fingerprint) {
+    begin(rid, fingerprint, scope) {
       // begin() only runs after get() missed, so any same-rid entry exists
       // under a DIFFERENT fingerprint — the bridge reused a request id for
       // different work. Warn ONCE: this new entry dedupes its own replays, so
       // a retry of THIS command can't re-fire the warning.
       for (const e of entries.values()) {
-        if (e.rid === rid) {
+        if (e.scope === scope && e.rid === rid) {
           onRidReuse?.(
             `[comfyui-mcp-panel] bridge rid "${rid}" reused for a DIFFERENT command payload — ` +
               `treating it as a new command (the original reply stays bound to its own payload)`,
@@ -146,9 +156,9 @@ export function createCommandDedupeLedger(cap = 200, onRidReuse) {
           break;
         }
       }
-      const key = `${rid}\n${fingerprint}`;
+      const key = keyFor(scope, rid, fingerprint);
       let settle;
-      entries.set(key, { rid, inflight: true, promise: new Promise((resolve) => { settle = resolve; }) });
+      entries.set(key, { scope, rid, inflight: true, promise: new Promise((resolve) => { settle = resolve; }) });
       evictSettled();
       let settled = false;
       return (reply) => {
