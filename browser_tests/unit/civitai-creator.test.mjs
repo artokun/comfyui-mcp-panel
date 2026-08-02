@@ -121,6 +121,21 @@ test("fetchModels keyword×creator chase is capped (initial + 4 hops)", async ()
   assert.equal(page.nextCursor, "again"); // caller can keep going explicitly
 });
 
+// #515: /v1/models returns nsfw:true entries even with nsfw=false — SFW
+// browsing masks must drop them client-side, not just filter their covers.
+test("fetchModels SFW mask [1,2] drops model-level nsfw:true, keeps clean models", async () => {
+  const nsfwItem = { ...modelItem("Adult Pack"), id: 1932929, nsfw: true };
+  const sfwItem = modelItem("Camera Motion");
+  const { client } = stub({ items: [nsfwItem, sfwItem], metadata: {} });
+  const page = await client.fetchModels({ type: "LORA", levels: [1, 2] });
+  assert.deepEqual(page.models.map((m) => m.name), ["Camera Motion"]);
+
+  // an adult-inclusive mask must NOT apply the model-level rejection
+  const { client: adult } = stub({ items: [{ ...nsfwItem, modelVersions: [{ baseModel: "Wan Video", images: [{ url: "u9", nsfwLevel: 8 }], files: [] }] }], metadata: {} });
+  const grown = await adult.fetchModels({ type: "LORA", levels: [1, 2, 8] });
+  assert.deepEqual(grown.models.map((m) => m.name), ["Adult Pack"]);
+});
+
 test("fetchTopCreators parses the leaderboard tRPC shape", async () => {
   const entry = (username, position, extra = {}) => ({
     position, score: position * 100,
