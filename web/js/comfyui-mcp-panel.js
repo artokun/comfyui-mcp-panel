@@ -7118,7 +7118,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // Legacy bridge callers may supply numeric strings. Normalize only this wrapper;
     // the consolidated graph_edit_node deliberately remains strict for new callers.
     const rail = resolveRailNode(graph, node_id);
-    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id, pos: [Number(pos[0]), Number(pos[1])] });
+    // Legacy callers may address a subgraph rail by its "input"/"output" alias.
+    // Resolve it here, then send the rail's real numeric node id through the strict
+    // consolidated editor rather than weakening that editor's target contract.
+    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id: rail ? rail.node.id : node_id, pos: [Number(pos[0]), Number(pos[1])] });
     const edit = result.edited[0];
     return {
       moved: {

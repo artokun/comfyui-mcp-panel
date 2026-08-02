@@ -429,12 +429,15 @@ test("#538 legacy move preserves rail responses and numeric-string geometry", ()
   const node = makeNode(1, { pos: [1, 2], size: [140, 60] });
   const railNode = makeNode(-10, { pos: [3, 4] });
   const { move, resize } = setupLegacyMotion([node], {
-    resolveRailNode: (_graph, id) => id === -10 ? { node: railNode, rail: "input" } : null,
+    resolveRailNode: (_graph, id) => id === -10 || id === "input" ? { node: railNode, rail: "input" } : null,
   });
 
   assert.deepEqual(move({ node_id: -10, pos: ["30", "40"] }), {
     moved: { node_id: -10, rail: "input", from: [3, 4], to: [30, 40] },
   });
+  assert.deepEqual(move({ node_id: "input", pos: ["50", "60"] }), {
+    moved: { node_id: -10, rail: "input", from: [30, 40], to: [50, 60] },
+  }, "legacy input alias resolves to the rail's numeric id before strict graph_edit_node dispatch");
   assert.deepEqual(resize({ node_id: 1, size: ["300", "150"] }), {
     resized: { node_id: 1, from: [140, 60], to: [300, 150] },
   });
