@@ -1326,14 +1326,26 @@ function activeWorkflowExtra(wf = activeWorkflowRef(), { create = false } = {}) 
   return candidate && typeof candidate === "object" ? candidate : null;
 }
 
-function embeddedWorkflowUuid(wf = activeWorkflowRef()) {
-  const ns = activeWorkflowExtra(wf)?.[WORKFLOW_META_NAMESPACE];
+// Metadata hung directly off the ComfyWorkflow object is safe to use to identify
+// that object. `app.graph.extra` is deliberately NOT included here: during a
+// tab-switch/reconnect race it can still be the prior tab's graph, so letting it
+// establish a previously-unseen workflow object's UUID would adopt that prior
+// tab before the graph-binding fence can reject it (#545 P1).
+function workflowOwnedExtra(wf = activeWorkflowRef()) {
+  const candidate = wf?.extra || wf?.workflow?.extra || wf?.data?.extra;
+  return candidate && typeof candidate === "object" ? candidate : null;
+}
+
+function embeddedWorkflowUuid(wf = activeWorkflowRef(), { allowGraph = true } = {}) {
+  const extra = allowGraph ? activeWorkflowExtra(wf) : workflowOwnedExtra(wf);
+  const ns = extra?.[WORKFLOW_META_NAMESPACE];
   const id = ns?.[WORKFLOW_UUID_FIELD];
   return typeof id === "string" && id ? id : null;
 }
 
-function embeddedWorkflowPath(wf = activeWorkflowRef()) {
-  const ns = activeWorkflowExtra(wf)?.[WORKFLOW_META_NAMESPACE];
+function embeddedWorkflowPath(wf = activeWorkflowRef(), { allowGraph = true } = {}) {
+  const extra = allowGraph ? activeWorkflowExtra(wf) : workflowOwnedExtra(wf);
+  const ns = extra?.[WORKFLOW_META_NAMESPACE];
   const path = ns?.[WORKFLOW_PATH_FIELD];
   return typeof path === "string" && path ? path : null;
 }
@@ -1390,6 +1402,7 @@ function installCreateBoundaryFork(appRef) {
           //    the prior instance's identity. The embedded value is used ONLY to DETECT the
           //    change; the minted uuid is fresh (never adopted from graph.extra).
           let fork = false;
+          let cacheIncomingUuid = null;
           if (keepInstance && workflow && typeof workflow === "object") {
             // Authoritative identity = the live object's cached uuid (mint one only if this
             // object has never been seen). Stamp it over the incoming value; do NOT fork.
@@ -1411,16 +1424,29 @@ function installCreateBoundaryFork(appRef) {
             if (shouldForkInPlaceReload({ cachedUuid: cached, incomingUuid: incoming })) {
               _workflowObjectUuids.delete(workflow); // content replaced in place → drop stale cache
               fork = true;
+            } else if (!cached && typeof incoming === "string" && incoming) {
+              // The load call itself binds this serialized graph to `workflow`.
+              // Seed from that authoritative pairing, never later from whichever
+              // app.graph happens to be mounted when a command arrives.
+              cacheIncomingUuid = incoming;
             }
           }
           if (fork) {
             const extra =
               graphData.extra && typeof graphData.extra === "object" ? graphData.extra : (graphData.extra = {});
             const prev = extra[WORKFLOW_META_NAMESPACE];
+            const freshUuid = crypto.randomUUID();
             extra[WORKFLOW_META_NAMESPACE] = {
               ...(prev && typeof prev === "object" ? prev : {}),
-              [WORKFLOW_UUID_FIELD]: crypto.randomUUID(),
+              [WORKFLOW_UUID_FIELD]: freshUuid,
             };
+            if (workflow && typeof workflow === "object") {
+              _workflowObjectUuids.set(workflow, freshUuid);
+              rememberWorkflowUuidOwner(freshUuid, workflow);
+            }
+          } else if (cacheIncomingUuid) {
+            _workflowObjectUuids.set(workflow, cacheIncomingUuid);
+            rememberWorkflowUuidOwner(cacheIncomingUuid, workflow);
           }
         }
       } catch {
@@ -1505,7 +1531,12 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
     // (#570). When the sanitizer is inactive we therefore ignore the embedded value entirely
     // and mint a fresh per-instance uuid — durable resume is disabled (lost-resume), never a
     // wrong-resume. The live-object WeakMap (objectUuid) is always safe: a copy never shares it.
-    const embeddedId = embeddedWorkflowUuid(wf);
+    // Do not read app.graph.extra here. Command dispatch resolves this identity
+    // before assertGraphBoundToActiveWorkflow(), so a stale root must never get
+    // a chance to define the active workflow's identity. A known loadGraphData
+    // pairing above seeds the object cache; otherwise minting loses continuity
+    // but cannot turn a foreign graph into an authorized target.
+    const embeddedId = embeddedWorkflowUuid(wf, { allowGraph: false });
     const id = resolveUnsavedInstanceUuid({
       objectUuid,
       embeddedId,
@@ -1518,7 +1549,7 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
       // SAVE carries it into the saved file across the tmp:→wf: transition). Never dirties the
       // graph. Not a KEEP authority — the wrapper's live-object invalidation is.
       try {
-        const extra = activeWorkflowExtra(wf, { create: true });
+        const extra = workflowOwnedExtra(wf);
         const previous = extra?.[WORKFLOW_META_NAMESPACE];
         if (extra) {
           extra[WORKFLOW_META_NAMESPACE] = {
@@ -1533,8 +1564,10 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
     return id;
   }
 
-  const embedded = embeddedWorkflowUuid(wf);
-  const embeddedPath = embeddedWorkflowPath(wf);
+  // Same root-blind rule for saved workflows. A path alias or a UUID recorded
+  // on the workflow object is usable; a stale mounted root is not.
+  const embedded = embeddedWorkflowUuid(wf, { allowGraph: false });
+  const embeddedPath = embeddedWorkflowPath(wf, { allowGraph: false });
   const pathAlias = workflowAliasForPath(_workflowUuidAliases, path);
   let id = objectUuid || embedded || pathAlias || crypto.randomUUID();
 
@@ -1580,7 +1613,7 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
   }
   if (embed) {
     try {
-      const extra = activeWorkflowExtra(wf, { create: true });
+      const extra = workflowOwnedExtra(wf);
       const previous = extra?.[WORKFLOW_META_NAMESPACE];
       const pathChanged = path && normalizedWorkflowPath(previous?.[WORKFLOW_PATH_FIELD]) !== normalizedWorkflowPath(path);
       if (extra && (previous?.[WORKFLOW_UUID_FIELD] !== id || pathChanged)) {
