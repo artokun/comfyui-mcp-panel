@@ -1136,13 +1136,18 @@ test("#557 r3/r4 wiring: programmaticSave threads the pre-save identity across a
   );
   assert.match(
     body,
-    /successorCarriesPreUuid =\s*successorState\?\.extra\?\.\[WORKFLOW_META_NAMESPACE\]\?\.\[WORKFLOW_UUID_FIELD\] === preSwapUuid/,
-    "the successor must prove continuity via the pre-save uuid in its serialized state",
+    /postWfIsSaveTargetRecord = Boolean\(targetRecord\) && sameWorkflowObject\(targetRecord, postSwapWf\)/,
+    "continuity must be threaded from the save's own replacement event — the service's record for the file this save wrote (r8 P0)",
+  );
+  assert.doesNotMatch(
+    body,
+    /successorCarriesPreUuid/,
+    "static tracker/serialized-state evidence is NOT continuity (r8 P0) — it must not appear in the carry",
   );
   assert.match(
     body,
-    /shouldCarryIdentityAcrossSaveSwap\(\{\s*preWf: expectWf,\s*postWf: postSwapWf,\s*savedAs: outcome\.saved_as,\s*preWfStillOpen,\s*successorCarriesPreUuid,\s*postWfHasConflictingEstablishedIdentity,\s*\}\)/,
-    "the carry must pass ALL continuity evidence to the pure rule (never a Save-As copy, never a mid-save switch, never over an established conflict)",
+    /shouldCarryIdentityAcrossSaveSwap\(\{\s*preWf: expectWf,\s*postWf: postSwapWf,\s*savedAs: outcome\.saved_as,\s*preWfStillOpen,\s*postWfHasConflictingEstablishedIdentity,\s*postWfIsSaveTargetRecord,\s*\}\)/,
+    "the carry must pass ALL continuity evidence to the pure rule (never a Save-As copy, never a mid-save switch, never over an established conflict, never on stale residue)",
   );
   assert.doesNotMatch(
     body,
@@ -1222,6 +1227,7 @@ function buildProgrammaticSaveHarness({ onSave } = {}) {
     async (svcArg, _name, opts) => {
       onSave?.({ svc: svcArg, A, B }); // the mid-await switch / swap / reconnect
       opts.details.mode = "in-place";
+      opts.details.targetPath = "workflows/a.json"; // the save wrote A's file (mirrors recordOutcome)
       return "a.json";
     },
     () => "Untitled",
@@ -1316,6 +1322,47 @@ test("#349 r5 P0: a CLOSE mid-await that compacts the tab list (B lands in A's o
     }),
     "conflict",
     "with the carry aborted, writes to A's stale root stay fenced while B is active",
+  );
+});
+
+test("#349 r8 P0: a foreign tab whose LAGGING tracker carries the pre-save uuid must not inherit the carry", async () => {
+  // The r8 spoof: A closed mid-await; B — a FOREIGN tab (different file), with
+  // no WeakMap cache (so the r7 conflict veto cannot fire) — becomes active,
+  // and its lagging activeState still carries A's uuid as residue. Static
+  // tracker evidence is indistinguishable from "the successor parsed the
+  // just-saved file" (the r6 evidence class, one layer up), so the carry must
+  // require event-threaded continuity instead: the post-save ACTIVE object
+  // must be the service's current record for the file THIS save wrote.
+  const foreignB = {
+    isPersisted: true,
+    path: "workflows/b.json",
+    isModified: true,
+    changeTracker: {
+      activeState: { ...state(5), extra: { comfyui_mcp: { workflow_uuid: "uuid-A" } } }, // stale residue
+    },
+  };
+  const { save, svc, A, objectUuids, owners, activeClaims } = buildProgrammaticSaveHarness({
+    onSave: ({ svc }) => {
+      svc.openWorkflows = [foreignB]; // A closed; foreign B activated
+      svc.activeWorkflow = foreignB;
+    },
+  });
+  await save();
+  assert.equal(objectUuids.get(foreignB), undefined, "B must NOT be seeded with A's uuid on stale residue");
+  assert.notEqual(owners.get("uuid-A"), foreignB, "A's owner record must stay intact");
+  assert.equal(
+    activeClaims("uuid-A"),
+    false,
+    "B must not claim A's tag — the guard cannot heal an A-tagged stale canvas onto B",
+  );
+  assert.equal(
+    resolveGraphRootUuidRebind({
+      rootGraph: { extra: { comfyui_mcp: { workflow_uuid: "uuid-A" } } },
+      activeWorkflowUuid: "uuid-B",
+      rootTagClaimedByActiveWorkflow: activeClaims("uuid-A"),
+    }),
+    "conflict",
+    "with the carry vetoed, writes to A's stale canvas stay fenced while B is active",
   );
 });
 

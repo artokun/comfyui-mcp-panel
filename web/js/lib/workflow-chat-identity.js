@@ -59,18 +59,19 @@ export function sameWorkflowObject(a, b) {
  *  the same path is a NEW workflow (r3 P0), while a swapped successor is the
  *  same tab. A proxy/raw form of the SAME object is no swap at all.
  *
- *  CONTINUITY (r4/r5 P0): "whatever is active after the awaited save" is not
+ *  CONTINUITY (r4/r5/r8 P0): "whatever is active after the awaited save" is not
  *  enough — a user/reconnect tab switch DURING the await lands on a DISTINCT
  *  workflow, and seeding it with the pre-save uuid would align that foreign tab
  *  with the old root tag, bypassing the #349 wrong-canvas fence. The carry
- *  therefore also requires the predecessor to be GONE from the open tabs (a
- *  genuine swap removes it; a switch keeps it open) AND the successor to CARRY
- *  the pre-save uuid in its serialized state — the genuine #557 successor
- *  parses the just-saved file, which embeds the pre-save uuid. Tab-SLOT
- *  occupancy is deliberately NOT evidence: a closed-then-compacted list can
- *  seat a foreign tab in the predecessor's old slot with zero lineage (r5 P0).
- *  A successor whose tracker/state is lagging or unreadable fails SAFE (no
- *  carry); the lazy owner-not-open inheritance in workflowStableUuid heals that
+ *  therefore requires the predecessor to be GONE from the open tabs (a genuine
+ *  swap removes it; a switch keeps it open) AND continuity threaded from the
+ *  save's own replacement EVENT: the post-save active object must be the
+ *  service's current record for the file THIS save wrote. STATIC evidence is
+ *  deliberately excluded: tab-slot occupancy can seat a foreign tab in the
+ *  predecessor's old slot (r5), and a lagging tracker state carrying the
+ *  pre-save uuid can be a closed/reopened tab's residue (r8) — neither proves
+ *  succession. A successor the event thread can't prove fails SAFE (no carry);
+ *  the lazy owner-not-open inheritance in workflowStableUuid heals the genuine
  *  case on next resolve. Unknown predecessor state defaults to still-open
  *  (fail-safe: no carry). */
 export function shouldCarryIdentityAcrossSaveSwap({
@@ -78,8 +79,8 @@ export function shouldCarryIdentityAcrossSaveSwap({
   postWf,
   savedAs = false,
   preWfStillOpen = true,
-  successorCarriesPreUuid = false,
   postWfHasConflictingEstablishedIdentity = false,
+  postWfIsSaveTargetRecord = false,
 } = {}) {
   if (savedAs) return false;
   if (!preWf || !postWf || typeof postWf !== "object") return false;
@@ -90,7 +91,7 @@ export function shouldCarryIdentityAcrossSaveSwap({
   // identity and poison the owner map (the r6 stale-lineage bypass, via
   // registration this time). Fail closed; the proven-repaint remedy heals.
   if (postWfHasConflictingEstablishedIdentity) return false;
-  return successorCarriesPreUuid === true;
+  return postWfIsSaveTargetRecord === true;
 }
 
 /** Return true when an embedded UUID belongs to a different workflow file.

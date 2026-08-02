@@ -3298,40 +3298,47 @@ async function programmaticSave(name) {
     expect: expectWf, // #330: refuse if the user switched tabs during our pre-save HEAD
   });
   const outcome = describeSaveOutcome(details);
-  // #557 r3/r4/r5 — thread the identity across the swap ONLY with positive
-  // CONTINUITY, verified at the seed point (postWf is read from the service
-  // HERE, after the awaited save): the predecessor must be GONE from the open
-  // tabs — a user/reconnect tab switch during the await keeps it open and must
-  // abort the carry entirely, or a distinct foreign tab gets seeded with A's
-  // uuid and the #349 wrong-canvas fence aligns on the wrong identity — and
-  // the successor must CARRY the pre-save uuid in its serialized state (the
-  // genuine #557 successor parses the just-saved file, which embeds it). Tab
-  // SLOT occupancy is NOT evidence: a closed-then-compacted list can seat a
-  // foreign tab in the predecessor's old slot with zero lineage (r5 P0). A
-  // successor whose tracker is lagging/unreadable fails SAFE (no carry); the
-  // lazy owner-not-open inheritance heals that case on next resolve.
+  // #557 r3/r4/r5/r7/r8 — thread the identity across the swap ONLY with
+  // CONTINUITY PROVEN FROM THE SAVE'S OWN REPLACEMENT EVENT, verified at the
+  // seed point (postWf is read from the service HERE, after the awaited save):
+  // the predecessor must be GONE from the open tabs — a user/reconnect tab
+  // switch during the await keeps it open and must abort the carry entirely —
+  // and the post-save ACTIVE object must be the service's current record for
+  // the file THIS save wrote (details.targetPath, the lib's authoritative
+  // record of what was written). STATIC evidence is never accepted: tab-slot
+  // occupancy can seat a foreign tab in the predecessor's old slot (r5), and a
+  // lagging tracker state carrying the pre-save uuid can be a closed/reopened
+  // tab's residue (r8). A successor the event thread can't prove fails SAFE
+  // (no carry); the lazy owner-not-open inheritance heals it on next resolve.
   const postSwapWf = svc?.activeWorkflow;
   if (preSwapUuid) {
     const openList = svc?.openWorkflows;
     const preWfStillOpen =
       !Array.isArray(openList) || openList.some((w) => sameWorkflowObject(w, expectWf));
-    const successorState = postSwapWf?.changeTracker?.activeState ?? postSwapWf?.activeState;
-    const successorCarriesPreUuid =
-      successorState?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD] === preSwapUuid;
     // r7 P0 — even with continuity proven, never overwrite an established,
     // DIFFERENT identity on the successor: that is a conflicting tab, not A's
     // continuation, and seeding it would poison the owner map.
     const postWfHasConflictingEstablishedIdentity = Boolean(
       postSwapWf && _workflowObjectUuids.get(postSwapWf) && _workflowObjectUuids.get(postSwapWf) !== preSwapUuid
     );
+    // r8 P0 — ask the SERVICE which record now owns the file the save wrote,
+    // and require the post-save active object to BE that record.
+    const saveTargetPath =
+      typeof details?.targetPath === "string" && details.targetPath ? details.targetPath : null;
+    const targetRecord = saveTargetPath
+      ? ((typeof svc?.getWorkflowByPath === "function" && svc.getWorkflowByPath(saveTargetPath)) ||
+          (Array.isArray(openList) ? openList.find((w) => w && w.path === saveTargetPath) : null) ||
+          null)
+      : null;
+    const postWfIsSaveTargetRecord = Boolean(targetRecord) && sameWorkflowObject(targetRecord, postSwapWf);
     if (
       shouldCarryIdentityAcrossSaveSwap({
         preWf: expectWf,
         postWf: postSwapWf,
         savedAs: outcome.saved_as,
         preWfStillOpen,
-        successorCarriesPreUuid,
         postWfHasConflictingEstablishedIdentity,
+        postWfIsSaveTargetRecord,
       })
     ) {
       if (!_workflowObjectUuids.get(postSwapWf)) _workflowObjectUuids.set(postSwapWf, preSwapUuid);

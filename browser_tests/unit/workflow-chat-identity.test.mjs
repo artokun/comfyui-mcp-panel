@@ -258,14 +258,21 @@ test('sameWorkflowObject r3: same-path distinct objects are NOT one identity (cl
   ), false)
 })
 
-test('#557 r3/r4: identity carries across a save object-swap ONLY with positive continuity', () => {
+test('#557 r3/r4/r8: identity carries across a save object-swap ONLY with event-threaded continuity', () => {
   const pre = { isPersisted: true, path: 'workflows/x.json', changeTracker: {} }
   const successor = { isPersisted: true, path: 'workflows/x.json', changeTracker: {} }
   // In-place / first save that swapped the object, predecessor GONE from the open
-  // tabs, successor carrying the pre-save uuid in its serialized state → carry.
+  // tabs, and the post-save active object IS the service's record for the file
+  // this save wrote (event-threaded continuity) → carry.
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: false, postWfIsSaveTargetRecord: true
+  }), true)
+  // r8 P0: static tracker/state evidence is NOT continuity — a lagging
+  // activeState carrying the pre-save uuid can be a closed/reopened tab's
+  // residue. Without the target-record thread, never carry.
   assert.equal(shouldCarryIdentityAcrossSaveSwap({
     preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: false, successorCarriesPreUuid: true
-  }), true)
+  }), false)
   // r5 P0: tab-slot occupancy is NOT continuity — a closed-then-compacted list
   // can seat a foreign B in A's old slot with zero A lineage.
   assert.equal(shouldCarryIdentityAcrossSaveSwap({
@@ -276,13 +283,13 @@ test('#557 r3/r4: identity carries across a save object-swap ONLY with positive 
   // poison the owner map (the r6 stale-lineage bypass via registration).
   assert.equal(shouldCarryIdentityAcrossSaveSwap({
     preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: false,
-    successorCarriesPreUuid: true, postWfHasConflictingEstablishedIdentity: true
+    postWfIsSaveTargetRecord: true, postWfHasConflictingEstablishedIdentity: true
   }), false)
   // r4 P0: the predecessor is STILL OPEN — a user/reconnect tab switch during the
   // awaited save lands on a DISTINCT workflow; seeding it with A's uuid would
   // bypass the #349 wrong-canvas fence → never carry.
   assert.equal(shouldCarryIdentityAcrossSaveSwap({
-    preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: true, successorCarriesPreUuid: true
+    preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: true, postWfIsSaveTargetRecord: true
   }), false)
   // No continuity evidence → never carry (an unknown predecessor state defaults
   // to still-open, fail-safe).
@@ -292,18 +299,18 @@ test('#557 r3/r4: identity carries across a save object-swap ONLY with positive 
   }), false)
   // A Save-As COPY starts a new workflow → never carry (#226/#570).
   assert.equal(shouldCarryIdentityAcrossSaveSwap({
-    preWf: pre, postWf: successor, savedAs: true, preWfStillOpen: false, successorCarriesPreUuid: true
+    preWf: pre, postWf: successor, savedAs: true, preWfStillOpen: false, postWfIsSaveTargetRecord: true
   }), false)
   // Same object (no swap) / a proxy form of the same object → nothing to carry.
   assert.equal(shouldCarryIdentityAcrossSaveSwap({
-    preWf: pre, postWf: pre, savedAs: false, preWfStillOpen: false, successorCarriesPreUuid: true
+    preWf: pre, postWf: pre, savedAs: false, preWfStillOpen: false, postWfIsSaveTargetRecord: true
   }), false)
   assert.equal(shouldCarryIdentityAcrossSaveSwap({
-    preWf: pre, postWf: { __v_raw: pre }, savedAs: false, preWfStillOpen: false, successorCarriesPreUuid: true
+    preWf: pre, postWf: { __v_raw: pre }, savedAs: false, preWfStillOpen: false, postWfIsSaveTargetRecord: true
   }), false)
   // Missing sides → no carry.
   assert.equal(shouldCarryIdentityAcrossSaveSwap({
-    preWf: null, postWf: successor, savedAs: false, preWfStillOpen: false, successorCarriesPreUuid: true
+    preWf: null, postWf: successor, savedAs: false, preWfStillOpen: false, postWfIsSaveTargetRecord: true
   }), false)
   assert.equal(shouldCarryIdentityAcrossSaveSwap(), false)
 })
