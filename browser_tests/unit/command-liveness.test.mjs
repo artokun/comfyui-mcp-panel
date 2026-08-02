@@ -121,8 +121,8 @@ test("codex R8: replay never crosses a bridge change — entries for another bri
   const body = src.slice(start, src.indexOf("\n  }", start));
   assert.match(
     body,
-    /if \(!isReplayable\(entry, \{ now: Date\.now\(\), targetUrl \}\)\) \{\s*\n\s*dropped\+\+;\s*\n\s*continue;/,
-    "an outcome belonging to a previous bridge (or too old) must never be volunteered",
+    /if \(!isReplayable\(entry, \{ now, targetUrl, targetEpoch \}\)\) \{\s*\n\s*dropped\+\+;\s*\n\s*continue;/,
+    "an outcome belonging to a previous bridge, session, or too old must never be volunteered",
   );
   assert.match(body, /lostReplies\.replace\(keep\)/, "only undeliverable-but-still-ours entries are retried");
   assert.match(body, /Discarded \$\{dropped\}/, "the user must be told what was discarded");
@@ -161,10 +161,88 @@ test("codex R10: isReplayable demands the SAME bridge and a recent entry, and fa
   assert.equal(isReplayable({ url: URL_A, at: NaN }, { now, targetUrl: URL_A }), false);
 });
 
-test("codex R11: hello summaries obey the SAME cross-bridge/age rule as the replay", () => {
-  // The summaries ride the hello, so an unfiltered list would tell a bridge that never
-  // owned these commands their ids, names and outcomes — even though replayLostReplies
-  // correctly withholds the replies themselves.
+test("#694: isReplayable demands the SAME session epoch — match replays, mismatch drops, both-absent replays (legacy)", () => {
+  const URL_A = "ws://127.0.0.1:9180";
+  const now = 1_000_000;
+  const fresh = { url: URL_A, at: now - 1000, epoch: "epoch-1" };
+  // Same session (the ordinary reconnect within one orchestrator run) — replays.
+  assert.equal(isReplayable(fresh, { now, targetUrl: URL_A, targetEpoch: "epoch-1" }), true);
+  // A RESTARTED orchestrator at the same URL handshakes with a fresh epoch — dropped.
+  assert.equal(
+    isReplayable(fresh, { now, targetUrl: URL_A, targetEpoch: "epoch-2" }),
+    false,
+    "a predecessor session's journal must never replay into the new session",
+  );
+  // Legacy on BOTH sides (an epoch-less orchestrator): absent === absent — exactly
+  // the pre-epoch URL+age behaviour.
+  assert.equal(isReplayable({ url: URL_A, at: now - 1000 }, { now, targetUrl: URL_A }), true);
+  // One-sided presence can never prove session continuity — fail CLOSED.
+  assert.equal(
+    isReplayable(fresh, { now, targetUrl: URL_A }),
+    false,
+    "an epoch'd entry must not replay to an epoch-less target",
+  );
+  assert.equal(
+    isReplayable({ url: URL_A, at: now - 1000 }, { now, targetUrl: URL_A, targetEpoch: "epoch-1" }),
+    false,
+    "an epoch-less entry must not replay to an epoch'd target",
+  );
+});
+
+test("#694: the journal records the session epoch and summaries filter by it identically", () => {
+  const j = createLostReplyJournal();
+  const now = 1_000_000;
+  j.record({ reply: { rid: "same-session", ok: true }, cmd: "graph_outline", at: now - 1000, url: "ws://a", epoch: "e1" });
+  j.record({ reply: { rid: "prior-session", ok: true }, cmd: "graph_outline", at: now - 1000, url: "ws://a", epoch: "e0" });
+  j.record({ reply: { rid: "legacy", ok: true }, cmd: "graph_outline", at: now - 1000, url: "ws://a" });
+  assert.equal(j.list()[0].epoch, "e1", "the entry must carry the session it belongs to");
+  assert.equal(j.list()[2].epoch, undefined, "a legacy socket records no epoch (absent, not null)");
+  assert.deepEqual(
+    j.summaries({ now, targetUrl: "ws://a", targetEpoch: "e1" }).map((e) => e.rid),
+    ["same-session"],
+    "the advertised summaries must obey the same session rule as the replay",
+  );
+  assert.deepEqual(
+    j.summaries({ now, targetUrl: "ws://a" }).map((e) => e.rid),
+    ["legacy"],
+    "an epoch-less target (legacy orchestrator) sees only epoch-less entries",
+  );
+  // No target ⇒ unfiltered (the journal's own bookkeeping view).
+  assert.equal(j.summaries().length, 3);
+});
+
+test("#694 wiring: the models handshake stamps the socket's session epoch BEFORE the replay fires", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const modelsAt = src.indexOf('msg.type === "models"');
+  assert.notEqual(modelsAt, -1, "the models handshake branch must exist");
+  const branch = src.slice(modelsAt, modelsAt + 1200);
+  const stampAt = branch.indexOf("thisSock.__cmcpBridgeEpoch = msg.epoch;");
+  const markAt = branch.indexOf("markConnected();");
+  assert.notEqual(stampAt, -1, "the handshake must stamp the orchestrator's epoch on the socket");
+  assert.notEqual(markAt, -1);
+  assert.ok(
+    stampAt < markAt,
+    "the epoch must be stamped BEFORE markConnected() fires the lost-reply replay",
+  );
+});
+
+test("#694 wiring: a journaled outcome stamps THIS socket's epoch, and the replay checks it", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  assert.match(src, /epoch: thisSock\.__cmcpBridgeEpoch,/, "the journal must record the socket's session epoch");
+  const start = src.indexOf("function replayLostReplies(target) {");
+  assert.notEqual(start, -1);
+  const body = src.slice(start, src.indexOf("\n  }", start));
+  assert.match(
+    body,
+    /const targetEpoch = target\?\.__cmcpBridgeEpoch;/,
+    "the replay must compare against the TARGET socket's epoch, like the url check",
+  );
+});
+
+test("codex R11 / #694: summaries obey the SAME cross-bridge/session/age rule as the replay — and ride the post-handshake frame, never the hello", () => {
+  // The summaries advertise "the tab answered and the reply was lost", so an unfiltered
+  // list would tell a bridge that never owned these commands their ids, names and
+  // outcomes — even though replayLostReplies correctly withholds the replies themselves.
   const j = createLostReplyJournal();
   const now = 1_000_000;
   j.record({ reply: { rid: "mine", ok: true }, cmd: "graph_outline", at: now - 1000, url: "ws://a" });
@@ -179,11 +257,68 @@ test("codex R11: hello summaries obey the SAME cross-bridge/age rule as the repl
   assert.equal(j.summaries().length, 3);
 
   const src = readFileSync(PANEL_JS, "utf8");
-  assert.match(
-    src,
-    /lostReplies\.summaries\(\{\s*\n\s*now: Date\.now\(\),\s*\n\s*targetUrl: sock\?\.__cmcpBridgeUrl \?\? url,\s*\n\s*\}\)/,
-    "sendHello must filter the summaries by THIS socket's bridge",
+  // #694 — the hello fires at socket-open, BEFORE the models handshake stamps the
+  // socket's epoch: a summary computed there is filtered with an UNKNOWN epoch and can
+  // contradict the epoch-filtered replay. The hello must therefore carry NO summaries…
+  const helloStart = src.indexOf("function sendHello() {");
+  assert.notEqual(helloStart, -1);
+  const helloBody = src.slice(helloStart, src.indexOf("\n  }", helloStart));
+  assert.equal(
+    /lostReplies|lost_replies/.test(helloBody.replace(/\/\/[^\n]*/g, "")),
+    false,
+    "sendHello must not advertise lost-reply summaries computed before the epoch is known",
   );
+  // …they ride the post-handshake `lost_replies` frame, sent from INSIDE the replay with
+  // the SAME targetUrl/targetEpoch locals the replay loop uses — agreement by construction.
+  const replayStart = src.indexOf("function replayLostReplies(target) {");
+  assert.notEqual(replayStart, -1);
+  const replayBody = src.slice(replayStart, src.indexOf("\n  }", replayStart));
+  assert.match(replayBody, /type: "lost_replies",/, "the summaries frame must exist");
+  assert.match(
+    replayBody,
+    /entries: lostReplies\.summaries\(\{ now, targetUrl, targetEpoch \}\)/,
+    "the summaries must be filtered with the SAME url+epoch the replay loop uses",
+  );
+  const epochAt = replayBody.indexOf("const targetEpoch = target?.__cmcpBridgeEpoch;");
+  const summaryAt = replayBody.indexOf('type: "lost_replies"');
+  const loopAt = replayBody.indexOf("for (const entry of lost) {");
+  const nowAt = replayBody.indexOf("const now = Date.now();");
+  assert.ok(nowAt !== -1 && nowAt < summaryAt, "one captured instant must serve BOTH the summary frame and the replay checks");
+  assert.ok(epochAt !== -1 && summaryAt !== -1 && loopAt !== -1);
+  assert.ok(
+    epochAt < summaryAt && summaryAt < loopAt,
+    "the epoch must be stamped, THEN the summaries sent, THEN the replay attempted",
+  );
+});
+
+test("#694: the advertised summaries and the replay delivery set can never disagree — four epoch cases", () => {
+  // The replay loop delivers entry.reply for exactly the entries where isReplayable
+  // passes; the summaries frame advertises summaries() over the SAME filter. Lock the
+  // equality across every epoch pairing so a future refactor can't split them.
+  const now = 1_000_000;
+  const URL_A = "ws://a";
+  const build = () => {
+    const j = createLostReplyJournal();
+    j.record({ reply: { rid: "this-session", ok: true }, cmd: "graph_outline", at: now - 1000, url: URL_A, epoch: "e1" });
+    j.record({ reply: { rid: "prior-session", ok: true }, cmd: "graph_outline", at: now - 1000, url: URL_A, epoch: "e0" });
+    j.record({ reply: { rid: "legacy", ok: true }, cmd: "graph_outline", at: now - 1000, url: URL_A });
+    j.record({ reply: { rid: "other-bridge", ok: true }, cmd: "graph_outline", at: now - 1000, url: "ws://b", epoch: "e1" });
+    j.record({ reply: { rid: "stale", ok: true }, cmd: "graph_outline", at: now - REPLAY_MAX_AGE_MS - 1, url: URL_A, epoch: "e1" });
+    return j;
+  };
+  const cases = [
+    ["(a) epoch match — same-session reconnect", { now, targetUrl: URL_A, targetEpoch: "e1" }, ["this-session"]],
+    ["(b) epoch mismatch — restarted orchestrator", { now, targetUrl: URL_A, targetEpoch: "e2" }, []],
+    ["(c) both-absent — legacy orchestrator", { now, targetUrl: URL_A }, ["legacy"]],
+    ["(d) one-sided — epoch'd target, epoch'd entries only", { now, targetUrl: URL_A, targetEpoch: "e0" }, ["prior-session"]],
+  ];
+  for (const [name, filter, expected] of cases) {
+    const j = build();
+    const advertised = j.summaries(filter).map((e) => e.rid);
+    const delivered = j.list().filter((e) => isReplayable(e, filter)).map((e) => e.rid);
+    assert.deepEqual(advertised, delivered, `${name}: advertised set must equal the replayed set`);
+    assert.deepEqual(advertised, expected, `${name}: the filter itself picks the right entries`);
+  }
 });
 
 test("codex R12: replay only ever writes to a socket that PROVED itself with a handshake", () => {

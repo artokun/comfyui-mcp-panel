@@ -15,13 +15,24 @@
 // executor again (so no second mutation and no duplicate activity card).
 //
 // The dedupe identity is rid + PAYLOAD FINGERPRINT (commandFingerprint below:
-// the frame minus `rid`, canonical-stringified). The bridge's re-dispatch of
-// the SAME logical command reproduces the frame exactly, so it dedupes — but a
-// rid arriving with a MISMATCHED fingerprint is NOT the same command (a
-// genuinely new command that happens to reuse a prior rid: re-targeted or
-// replaced socket, different workflow). It is never answered from the ledger:
-// it executes fresh, and the reuse is logged once via onRidReuse (the bridge
-// should only ever re-dispatch the SAME command under a reused rid).
+// the frame minus `rid` and `retry_of`, canonical-stringified). The bridge's
+// re-dispatch of the SAME logical command reproduces the frame exactly, so it
+// dedupes — but a rid arriving with a MISMATCHED fingerprint is NOT the same
+// command (a genuinely new command that happens to reuse a prior rid:
+// re-targeted or replaced socket, different workflow). It is never answered
+// from the ledger: it executes fresh, and the reuse is logged once via
+// onRidReuse (the bridge should only ever re-dispatch the SAME command under a
+// reused rid).
+//
+// #694 — the orchestrator NEVER reuses rids (#683/#687): a timed-out command is
+// retried under a FRESH rid plus `retry_of` pointing at the original rid.
+// `retry_of` is correlation metadata, the same class as `rid`, so it is
+// excluded from the fingerprint too — a retry fingerprints IDENTICALLY to the
+// command it retries, and the handler answers it from the original's ledger
+// entry (with the rid rewritten to the retry's, which is what the
+// orchestrator's pending map is waiting on). A genuinely fresh command with
+// identical args carries no `retry_of`: it shares the fingerprint but misses
+// on its new rid, so it executes.
 //
 // Bounded: oldest-first eviction of SETTLED entries — swept on every begin AND
 // every settle (a past-cap burst of concurrent in-flight commands has nothing
@@ -46,14 +57,18 @@ function stableStringify(value) {
 
 /**
  * Fingerprint of a command frame's IDENTITY: every field except the transport
- * `rid` (cmd + all args + the bridge-stamped workflow_uuid), canonicalized so
- * key insertion order doesn't matter. The bridge's re-dispatch of the SAME
- * logical command yields an identical fingerprint; any genuinely different
- * command — even one differing only in workflow_uuid — differs here too.
+ * `rid` and the retry-correlation `retry_of` (#694 — both are metadata, not
+ * command identity), i.e. cmd + all args + the bridge-stamped workflow_uuid,
+ * canonicalized so key insertion order doesn't matter. The bridge's re-dispatch
+ * of the SAME logical command yields an identical fingerprint — including a
+ * retry under a FRESH rid, which differs from the original ONLY in rid +
+ * retry_of — while any genuinely different command, even one differing only in
+ * workflow_uuid, differs here too.
  */
 export function commandFingerprint(msg) {
   const identity = { ...msg };
   delete identity.rid; // transport correlation only — NOT part of command identity
+  delete identity.retry_of; // #694 — retry correlation only — same class as rid
   return stableStringify(identity);
 }
 
