@@ -22,9 +22,12 @@ function methodSource(name, args) {
 const createSource = methodSource("graph_create_subgraph", "\\{ node_ids \\}");
 const groupSource = methodSource("graph_subgraph_group", "\\{ group \\}");
 const setWidgetSource = methodSource("async graph_set_widget", "\\{ node_id, widget, value \\}");
-const cleanupMatch = panelSrc.match(/function clearStaleRedFlag\(node, \{ app, graph, rootGraph \}\) \{[\s\S]*?\n\}\n\n\/\*\*/);
+// Extract the actual helper through its unindented closing brace. Do not depend on
+// the following doc comment or on checkout line endings: Windows worktrees retain
+// CRLF, while the test runner reads the source verbatim.
+const cleanupMatch = panelSrc.match(/function clearStaleRedFlag\(node, \{ app, graph, rootGraph \}\) \{[\s\S]*?\r?\n\}/);
 assert.ok(cleanupMatch, "could not locate clearStaleRedFlag in panel source");
-const cleanupSource = cleanupMatch[0].replace(/\n\/\*\*$/, "");
+const cleanupSource = cleanupMatch[0];
 
 function realCreate(getGraphCtx, clearStaleRedFlagsAfterSubgraphConversion) {
   return new Function(
