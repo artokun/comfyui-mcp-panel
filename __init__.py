@@ -70,6 +70,7 @@ _BACKEND_PORTS = {
     "codex": 9181,
     "gemini": 9182,
     "antigravity": _BRIDGE_PORT,  # Google Antigravity (agy) — single-port multi-provider
+    "pi": _BRIDGE_PORT,  # pi.dev (pi) — single-port multi-provider, same orchestrator (#491)
     "grok": _BRIDGE_PORT,  # single-port multi-provider — same orchestrator
     "kimi": _BRIDGE_PORT,  # single-port multi-provider — same orchestrator
     "moonshot": _BRIDGE_PORT,  # hosted (Moonshot / Kimi K3) — same orchestrator, key-gated
@@ -97,13 +98,16 @@ def _backend_port(backend):
     return _BACKEND_PORTS.get((backend or _DEFAULT_BACKEND).lower(), _BRIDGE_PORT)
 
 
-# Provider-CLI binary names per backend (Windows resolves .cmd/.exe via PATHEXT,
-# but probe the variants too).
+# Provider-CLI binary names per backend. Most Windows CLIs can use a .cmd shim;
+# pi is the exception because the MCP starts it with shell-less spawn.
 _PROVIDER_CLIS = {
     "claude": ("claude", "claude.cmd", "claude.exe"),
     "codex": ("codex", "codex.cmd", "codex.exe"),
     "gemini": ("gemini", "gemini.cmd", "gemini.exe"),
     "antigravity": ("agy", "agy.exe"),
+    # The MCP spawns pi without a shell, so a Windows .cmd shim is not runnable.
+    # Keep this probe aligned with its executable-only resolver (#491).
+    "pi": ("pi", "pi.exe"),
     "grok": ("grok", "grok.cmd", "grok.exe"),
     "kimi": ("kimi", "kimi.cmd", "kimi.exe"),
     "ollama": ("ollama", "ollama.exe"),
@@ -136,6 +140,38 @@ def _antigravity_installed():
         local = environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
         return os.path.isfile(os.path.join(local, "agy", "bin", "agy.exe"))
     return os.path.isfile(os.path.join(os.path.expanduser("~"), ".local", "bin", "agy"))
+
+
+def _pi_installed():
+    """pi.dev CLI (pi) at COMFYUI_MCP_PI_PATH, on PATH, or in its well-known
+    install locations (the official installer targets ~/.local/bin; the env
+    override mirrors the orchestrator's resolvePiBin so an env-var-only install
+    doesn't read "not installed" in onboarding until the orchestrator's readiness
+    frame corrects it)."""
+    def spawnable(path):
+        # Python's shutil.which("pi") can resolve pi.cmd through PATHEXT, but
+        # Node's shell-less spawn cannot execute batch shims. Keep the panel's
+        # optimistic discovery aligned with the MCP resolver: only a real binary
+        # (extensionless pi or pi.exe) can advertise this backend as installed.
+        return bool(path) and not str(path).strip().lower().endswith((".cmd", ".bat"))
+
+    override = (environ.get("COMFYUI_MCP_PI_PATH") or "").strip()
+    if spawnable(override) and os.path.isfile(override):
+        return True
+    for name in _PROVIDER_CLIS["pi"]:
+        if spawnable(shutil.which(name)):
+            return True
+    for directory in _gui_fallback_bin_dirs():
+        for name in _PROVIDER_CLIS["pi"]:
+            candidate = os.path.join(directory, name)
+            if spawnable(candidate) and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return True
+    if sys.platform == "win32":
+        local = environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+        candidate = os.path.join(local, "pi", "bin", "pi.exe")
+    else:
+        candidate = os.path.join(os.path.expanduser("~"), ".local", "bin", "pi")
+    return spawnable(candidate) and os.path.isfile(candidate)
 
 
 def _gui_fallback_bin_dirs():
@@ -223,6 +259,11 @@ def _provider_auth(provider):
         # installed (the orchestrator's model probe verifies auth at connect);
         # without the CLI there is nothing to be signed in to.
         return None if _antigravity_installed() else False
+    if provider == "pi":
+        # Do not infer a credential from auth.json: it can be empty, malformed,
+        # stale, or name a provider that cannot run. The MCP's pi probe is the
+        # sole positive readiness authority; this local check is only advisory.
+        return None if _pi_installed() else False
     if provider == "ollama":
         # No login concept — a local daemon. Installed = usable; a stopped daemon
         # surfaces at connect time (the orchestrator's model probe).
@@ -234,15 +275,21 @@ def _provider_state(provider):
     """Per-provider readiness for the panel onboarding flow. `ready` = CLI on
     PATH AND a login exists; `cli`/`auth` are reported separately so the panel
     can tell 'install the CLI' apart from 'sign in'; `auth` is null when unknown
-    (macOS Keychain), and unknown-with-cli still counts as ready."""
+    (macOS Keychain). Unknown-with-cli normally counts as ready, except pi: its
+    multi-provider credential sources are ready only after the orchestrator's
+    authoritative probe."""
     if provider == "ollama":
         cli = _ollama_installed()
     elif provider == "antigravity":
         cli = _antigravity_installed()
+    elif provider == "pi":
+        cli = _pi_installed()
     else:
         cli = _provider_cli(provider)
     auth = _provider_auth(provider)
-    ready = bool(cli and auth is not False)
+    # Pi's local state intentionally has no positive-ready path. Its bridge frame
+    # applies the MCP's provider-aware credential verdict after connection.
+    ready = False if provider == "pi" else bool(cli and auth is not False)
     return {"cli": cli, "auth": auth, "ready": ready}
 
 
