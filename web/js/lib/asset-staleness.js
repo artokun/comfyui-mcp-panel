@@ -241,6 +241,43 @@ export function nodeRedFlagIsStale(
 }
 
 /**
+ * Node ids directly WIRED to `node` — the sources of its input links and the targets
+ * of its output links — resolved through the graph's `links` container (keyed by link
+ * id; values are live LLink objects `{ origin_id, target_id, ... }` or serialized
+ * arrays `[id, origin_id, origin_slot, target_id, target_slot, type]`). Used after
+ * convertToSubgraph (#516): conversion reroutes the SURVIVING nodes' wires onto the
+ * new wrapper node without revalidating them, so these neighbours are exactly the
+ * nodes whose sticky LiteGraph `has_errors` red outline must be re-adjudicated with
+ * the #418 `nodeRedFlagIsStale` check. Pure + fully defensive — unknown shapes
+ * contribute nothing and it never throws. Returns a Set (ids in their raw type).
+ */
+export function collectLinkedNeighborNodeIds(node, links) {
+  const out = new Set();
+  try {
+    const lookup = (id) => {
+      if (id == null || !links) return null;
+      if (typeof links.get === "function") return links.get(id) ?? null;
+      return links[id] ?? null;
+    };
+    const originId = (l) => (l ? (l.origin_id ?? l[1]) : undefined);
+    const targetId = (l) => (l ? (l.target_id ?? l[3]) : undefined);
+    for (const input of node?.inputs ?? []) {
+      const id = originId(lookup(input?.link));
+      if (id != null) out.add(id);
+    }
+    for (const output of node?.outputs ?? []) {
+      for (const linkId of output?.links ?? []) {
+        const id = targetId(lookup(linkId));
+        if (id != null) out.add(id);
+      }
+    }
+  } catch {
+    /* best-effort — a malformed node/links shape just yields fewer neighbours */
+  }
+  return out;
+}
+
+/**
  * A missing-asset store candidate is stale (should NOT be reported) when either
  * no widget still references the file (the value was changed to a fix) OR the
  * file resolves against the node's live combo options (it appeared on disk).

@@ -23,6 +23,7 @@ import {
   collectMissingNodeTypeReasons,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
+  collectLinkedNeighborNodeIds,
   resolveMissingModelDirectory,
 } from "../../web/js/lib/asset-staleness.js";
 
@@ -666,4 +667,49 @@ test("resolveMissingModelDirectory: NON-ultralytics directories never regress", 
   assert.equal(resolveMissingModelDirectory("loras", "bbox/x.pt"), "loras");
   assert.equal(resolveMissingModelDirectory("ultralytics_extra", "segm/x.pt"), "ultralytics_extra");
   assert.equal(resolveMissingModelDirectory(null, "segm/x.pt"), null);
+});
+
+// --- collectLinkedNeighborNodeIds (#516) — post-conversion re-adjudication set ---
+
+test("collectLinkedNeighborNodeIds: a fresh subgraph wrapper yields its upstream AND downstream neighbours", () => {
+  // The #516 repro shape: upstream LoadImage (7) now feeds the wrapper's input;
+  // two downstream consumers (11, 12) are fed by the wrapper's outputs.
+  const links = {
+    101: { id: 101, origin_id: 7, origin_slot: 0, target_id: 900, target_slot: 0 },
+    102: { id: 102, origin_id: 900, origin_slot: 0, target_id: 11, target_slot: 0 },
+    103: { id: 103, origin_id: 900, origin_slot: 0, target_id: 12, target_slot: 1 },
+  };
+  const wrapper = {
+    id: 900,
+    inputs: [{ link: 101 }, { link: null }],
+    outputs: [{ links: [102, 103] }, { links: [] }],
+  };
+  assert.deepEqual([...collectLinkedNeighborNodeIds(wrapper, links)].sort((a, b) => a - b), [7, 11, 12]);
+});
+
+test("collectLinkedNeighborNodeIds: serialized ARRAY links ([id, origin_id, origin_slot, target_id, ...]) resolve too", () => {
+  const links = {
+    55: [55, 7, 0, 900, 0, "IMAGE"],
+  };
+  const wrapper = { id: 900, inputs: [{ link: 55 }], outputs: [] };
+  assert.deepEqual([...collectLinkedNeighborNodeIds(wrapper, links)], [7]);
+});
+
+test("collectLinkedNeighborNodeIds: a Map-based links container (graph.getLink shape) resolves", () => {
+  const links = new Map([[77, { origin_id: 3, target_id: 900 }]]);
+  const wrapper = { id: 900, inputs: [{ link: 77 }], outputs: [] };
+  assert.deepEqual([...collectLinkedNeighborNodeIds(wrapper, links)], [3]);
+});
+
+test("collectLinkedNeighborNodeIds: dangling/unknown link ids contribute nothing, never throw", () => {
+  const wrapper = { id: 900, inputs: [{ link: 404 }], outputs: [{ links: [405] }] };
+  assert.deepEqual([...collectLinkedNeighborNodeIds(wrapper, {})], []);
+  assert.deepEqual([...collectLinkedNeighborNodeIds(wrapper, { 404: null, 405: {} })], []);
+});
+
+test("collectLinkedNeighborNodeIds: defensive on missing node/links — empty set, never throws", () => {
+  assert.deepEqual([...collectLinkedNeighborNodeIds(null, {})], []);
+  assert.deepEqual([...collectLinkedNeighborNodeIds(undefined, null)], []);
+  assert.deepEqual([...collectLinkedNeighborNodeIds({}, undefined)], []);
+  assert.deepEqual([...collectLinkedNeighborNodeIds({ inputs: null, outputs: null }, {})], []);
 });

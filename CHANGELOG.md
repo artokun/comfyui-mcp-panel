@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- clear the stale red outline left on rewired surviving nodes after subgraph conversion (#516)
+
 ## [0.11.34] - 2026-08-02
 
 ### Added

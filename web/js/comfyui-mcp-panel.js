@@ -117,6 +117,7 @@ import {
   collectMissingNodeTypeReasons,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
+  collectLinkedNeighborNodeIds,
   findNodeByScopedId,
   resolveMissingModelDirectory,
 } from "./lib/asset-staleness.js";
@@ -4556,6 +4557,82 @@ function collectMissingAssets(trustComboOverride) {
   return { models, media, nodeTypes, nodeCount, any: !!(models.length || media.length || nodeTypes.length || nodeCount) };
 }
 
+/**
+ * #418/#516: LiteGraph's `has_errors` red flag is STICKY — it survives the change that
+ * removed the underlying cause (a widget repoint, or a subgraph conversion that rerouted
+ * the node's wires), so the node keeps painting red with an empty `reasons: []` until
+ * something re-adjudicates it. Clear the node's flag ONLY when neither the live
+ * missing-asset collector nor the last validation maps still blame it —
+ * nodeRedFlagIsStale fails toward KEEPING the flag on any doubt, so a genuinely-errored
+ * node is never de-flagged. A WRAPPER node (has `.subgraph`) is never adjudicated from
+ * inner candidates: they resolve to the inner nodes, not the wrapper, so clearing could
+ * hide a still-missing inner sibling asset (codex round-7 P1) — leaving the wrapper's
+ * flag is the safe over-report direction. Shared by graph_set_widget (#418) and the
+ * subgraph-conversion handlers (#516). Returns true when the flag was cleared.
+ * Best-effort visual cleanup: never throws.
+ */
+function clearStaleRedFlag(node, { app, graph, rootGraph }) {
+  try {
+    if (!node?.has_errors || node.subgraph) return false;
+    // DISTRUST the live combo here (trustComboOverride=false): clearing a red flag is
+    // DESTRUCTIVE, so it must never rely on possibly-stale combo membership. #418's
+    // real signal is the still-REFERENCED check — the repointed widget no longer holds
+    // the missing filename, so the candidate drops regardless of combo. An asset that
+    // reappeared, was confirmed, then DELETED (widget value unchanged) is still
+    // referenced ⇒ candidate kept ⇒ flag KEPT, never cleared off a stale combo that
+    // still lists it (codex round-9 P0).
+    const assets = collectMissingAssets(false);
+    // Use the SAME validation surface graph_get_errors trusts: app.lastNodeErrors
+    // PLUS the execution-error Pinia store's lastNodeErrors, which outlives some
+    // app-level resets (codex #4). Only clear when NEITHER still blames this node.
+    let storeNodeErrors = null;
+    try {
+      storeNodeErrors = getPiniaStore("executi" + "on" + "Error")?.lastNodeErrors ?? null;
+    } catch {
+      /* optional */
+    }
+    // Pass both maps SEPARATELY (OR semantics) so a node blamed by EITHER source
+    // keeps its red flag — never a shallow merge, whose empty entry could shadow the
+    // other map's live error and wrongly clear it (codex round-2 P0).
+    if (
+      nodeRedFlagIsStale(node.id, {
+        missingItems: [...assets.models, ...assets.media],
+        nodeErrorsMaps: [app?.lastNodeErrors ?? null, storeNodeErrors],
+        // A nested candidate is keyed by a SCOPED locator that never string-equals
+        // this inner node's local id — resolve it and compare identity so a still-
+        // missing nested asset keeps the flag (codex round-3 P0).
+        resolvesToNode: (scopedId) => findNodeByScopedId(rootGraph, scopedId) === node,
+      })
+    ) {
+      node.has_errors = false;
+      graph?.setDirtyCanvas?.(true, true);
+      return true;
+    }
+  } catch {
+    /* best-effort visual cleanup — never fail the caller over it */
+  }
+  return false;
+}
+
+/**
+ * #516: convertToSubgraph reroutes the SURVIVING nodes' wires onto the new wrapper
+ * node but never revalidates them — LiteGraph's sticky `has_errors` red outline
+ * (observed on an upstream LoadImage whose link was rerouted into the subgraph)
+ * otherwise lingers until a no-op panel_set_widget trips the #418 cleanup. Run the
+ * same conservative adjudication (clearStaleRedFlag) on the wrapper's direct link
+ * neighbours — exactly the surviving nodes conversion just rewired. Best-effort
+ * visual cleanup: never throws.
+ */
+function clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph }) {
+  try {
+    for (const id of collectLinkedNeighborNodeIds(res?.node, graph?.links ?? {})) {
+      clearStaleRedFlag(graph.getNodeById?.(id), { app, graph, rootGraph });
+    }
+  } catch {
+    /* best-effort visual cleanup — never fail the conversion over it */
+  }
+}
+
 // ComfyUI resolves an input-asset value on the SERVER's platform (os.path.join):
 // a backslash is a path separator ONLY on Windows; on POSIX it is a literal
 // filename character. The /view probe must split the value exactly the way the
@@ -6712,9 +6789,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // missing asset (or an invalid value) to a valid one drops the missing-asset
     // candidate and clears the validation error, but the boolean stays true and
     // graph_get_errors keeps painting the node red with an empty `reasons: []`.
-    // Clear it here ONLY when neither the live missing-asset collector nor the last
-    // validation map still blames this node — nodeRedFlagIsStale fails toward KEEPING
-    // the flag on any doubt, so a genuinely-errored node is never de-flagged.
+    // Re-adjudicate via the shared conservative cleanup (clearStaleRedFlag).
     try {
       // A workflow-tab SWITCH during the awaited /object_info fetch above would make this
       // cleanup adjudicate the OLD `node` against the NEW workflow's stores/graph, wrongly
@@ -6727,49 +6802,12 @@ const GRAPH_TOOL_EXECUTORS = {
           return false;
         }
       })();
-      // Only clear the flag on a DIRECT (non-container) node. `node` here is what was
-      // resolved from the caller's node_id in the CURRENT graph; for a PROMOTED write it
-      // is the OUTER subgraph wrapper while the value actually changes an INNER node, so
-      // the outer's redness can't be adjudicated from the inner candidates (they resolve
-      // to the inner node, not this wrapper) — clearing it could hide a still-missing
-      // inner sibling asset (codex round-7 P1). Skip wrappers: leaving the flag is the
-      // safe over-report direction. A DIRECT write to a plain node (the #418 repro) and a
-      // write to an inner node while inside its subgraph both have no `.subgraph` here.
-      if (stillActive && node?.has_errors && !node.subgraph) {
-        // DISTRUST the live combo here (trustComboOverride=false): clearing a red flag is
-        // DESTRUCTIVE, so it must never rely on possibly-stale combo membership. #418's
-        // real signal is the still-REFERENCED check — the repointed widget no longer holds
-        // the missing filename, so the candidate drops regardless of combo. An asset that
-        // reappeared, was confirmed, then DELETED (widget value unchanged) is still
-        // referenced ⇒ candidate kept ⇒ flag KEPT, never cleared off a stale combo that
-        // still lists it (codex round-9 P0).
-        const assets = collectMissingAssets(false);
-        // Use the SAME validation surface graph_get_errors trusts: app.lastNodeErrors
-        // PLUS the execution-error Pinia store's lastNodeErrors, which outlives some
-        // app-level resets (codex #4). Only clear when NEITHER still blames this node.
-        let storeNodeErrors = null;
-        try {
-          storeNodeErrors = getPiniaStore("executi" + "on" + "Error")?.lastNodeErrors ?? null;
-        } catch {
-          /* optional */
-        }
-        // Pass both maps SEPARATELY (OR semantics) so a node blamed by EITHER source
-        // keeps its red flag — never a shallow merge, whose empty entry could shadow the
-        // other map's live error and wrongly clear it (codex round-2 P0).
-        if (
-          nodeRedFlagIsStale(node.id, {
-            missingItems: [...assets.models, ...assets.media],
-            nodeErrorsMaps: [app?.lastNodeErrors ?? null, storeNodeErrors],
-            // A nested candidate is keyed by a SCOPED locator that never string-equals
-            // this inner node's local id — resolve it and compare identity so a still-
-            // missing nested asset keeps the flag (codex round-3 P0).
-            resolvesToNode: (scopedId) => findNodeByScopedId(rootGraph, scopedId) === node,
-          })
-        ) {
-          node.has_errors = false;
-          graph.setDirtyCanvas?.(true, true);
-        }
-      }
+      // Only clear the flag on a DIRECT (non-container) node — for a PROMOTED write
+      // `node` is the OUTER subgraph wrapper while the value actually changes an INNER
+      // node; clearStaleRedFlag skips wrappers (codex round-7 P1). A DIRECT write to a
+      // plain node (the #418 repro) and a write to an inner node while inside its
+      // subgraph both have no `.subgraph` here.
+      if (stillActive) clearStaleRedFlag(node, { app, graph, rootGraph });
     } catch {
       /* best-effort visual cleanup — never fail the write over it */
     }
@@ -8355,7 +8393,7 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   graph_create_subgraph({ node_ids }) {
-    const { graph, canvas } = getGraphCtx();
+    const { app, graph, canvas, rootGraph } = getGraphCtx();
     if (typeof graph.convertToSubgraph !== "function") {
       throw new Error("convertToSubgraph unavailable on this frontend");
     }
@@ -8373,6 +8411,9 @@ const GRAPH_TOOL_EXECUTORS = {
       graph.afterChange?.();
     }
     graph.setDirtyCanvas?.(true, true);
+    // #516: conversion rewires the surviving nodes' links onto the wrapper without
+    // revalidating them — re-adjudicate their sticky red outlines now (#418 cleanup).
+    clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph });
     return {
       subgraph: {
         node_id: res?.node?.id ?? null,
@@ -8387,7 +8428,7 @@ const GRAPH_TOOL_EXECUTORS = {
   // same convertToSubgraph path as graph_create_subgraph. This is how a region
   // like a "REPLACEMENT MODE" group becomes one toggleable subgraph node.
   graph_subgraph_group({ group }) {
-    const { graph, canvas } = getGraphCtx();
+    const { app, graph, canvas, rootGraph } = getGraphCtx();
     if (typeof graph.convertToSubgraph !== "function") {
       throw new Error("convertToSubgraph unavailable on this frontend");
     }
@@ -8414,6 +8455,9 @@ const GRAPH_TOOL_EXECUTORS = {
       graph.afterChange?.();
     }
     graph.setDirtyCanvas?.(true, true);
+    // #516: conversion rewires the surviving nodes' links onto the wrapper without
+    // revalidating them — re-adjudicate their sticky red outlines now (#418 cleanup).
+    clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph });
     return {
       subgraph: {
         node_id: res?.node?.id ?? null,
