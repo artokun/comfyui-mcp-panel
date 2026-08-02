@@ -251,6 +251,35 @@ export function graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid } =
 }
 
 /**
+ * #545/#557 — a root-tag/active-identity UUID conflict is not always a wrong
+ * canvas. The tag is panel-owned bookkeeping, and a save or reconnect can
+ * REPLACE the live ComfyWorkflow object: the root then keeps a stamp whose
+ * owning object no longer exists as an open tab, while the successor object
+ * resolves a different identity. That orphan is stale bookkeeping, not a live
+ * foreign canvas — and a guard that can only throw on it blocks every graph
+ * tool until a frontend reload, with no working remedy.
+ *
+ * Returns:
+ *   "none"     — no UUID conflict (missing identity on either side stays
+ *                inconclusive, exactly like graphRootWorkflowUuidMismatches);
+ *   "conflict" — the tag is positively owned by ANOTHER currently-open
+ *                workflow: the live root may genuinely be that tab's canvas
+ *                (#349), so the data-loss protection stays fail-closed;
+ *   "rebind"   — the tag is orphaned (dead/replaced/untracked owner) or names
+ *                the active object itself under a former identity: the caller
+ *                should re-stamp the root with the active workflow's uuid and
+ *                proceed instead of throwing.
+ */
+export function resolveGraphRootUuidRebind({
+  rootGraph,
+  activeWorkflowUuid,
+  rootTagOwnedByForeignOpenWorkflow = false,
+} = {}) {
+  if (!graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid })) return "none";
+  return rootTagOwnedByForeignOpenWorkflow ? "conflict" : "rebind";
+}
+
+/**
  * Whether a bridge graph command can change durable workflow state.
  *
  * A dirty workflow without a root UUID is not sufficiently proven for a graph

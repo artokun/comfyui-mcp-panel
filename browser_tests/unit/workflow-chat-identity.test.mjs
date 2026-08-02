@@ -10,6 +10,7 @@ import {
   isNewWorkflowLoad,
   normalizedWorkflowPath,
   resolveUnsavedInstanceUuid,
+  shouldForkEmbeddedUuidForLiveOwner,
   shouldForkEmbeddedWorkflowUuid,
   shouldForkInPlaceReload,
   workflowAliasForPath
@@ -162,6 +163,36 @@ test('#570 P0b a fresh object (no cache) is NOT an in-place replace here → fal
   // A brand-new object (reload-restore/copy) has no cache; creation/embedded handling covers it.
   assert.equal(shouldForkInPlaceReload({ cachedUuid: undefined, incomingUuid: 'uuid-A' }), false)
   assert.equal(shouldForkInPlaceReload({}), false)
+})
+
+// #557 — a save replaces the active ComfyWorkflow object. The successor parses the
+// same embedded uuid from the just-saved file while the REPLACED object is still the
+// registered owner: fork ONLY while that owner is still a live OPEN tab.
+test('#557 fork away from an owned embedded uuid ONLY while the owner is still open', () => {
+  const owner = { path: 'workflows/x.json' }
+  const successor = { path: 'workflows/x.json' }
+  // Owner replaced (no longer an open workflow) → successor INHERITS, no fork —
+  // minting fresh here desynced the object from the root tag and blocked every
+  // graph tool until a frontend reload.
+  assert.equal(shouldForkEmbeddedUuidForLiveOwner({
+    embeddedUuid: 'uuid-A', embeddedOwner: owner, identityObject: successor, ownerIsOpenWorkflow: false
+  }), false)
+  // Owner still open alongside → a genuine co-open copy → fork (#570).
+  assert.equal(shouldForkEmbeddedUuidForLiveOwner({
+    embeddedUuid: 'uuid-A', embeddedOwner: owner, identityObject: successor, ownerIsOpenWorkflow: true
+  }), true)
+  // The owner IS this object (rename/Save-As continuity) → never fork.
+  assert.equal(shouldForkEmbeddedUuidForLiveOwner({
+    embeddedUuid: 'uuid-A', embeddedOwner: owner, identityObject: owner, ownerIsOpenWorkflow: true
+  }), false)
+  // Missing identity/owner data is inconclusive → never fork.
+  assert.equal(shouldForkEmbeddedUuidForLiveOwner({
+    embeddedUuid: null, embeddedOwner: owner, identityObject: successor, ownerIsOpenWorkflow: true
+  }), false)
+  assert.equal(shouldForkEmbeddedUuidForLiveOwner({
+    embeddedUuid: 'uuid-A', embeddedOwner: null, identityObject: successor, ownerIsOpenWorkflow: true
+  }), false)
+  assert.equal(shouldForkEmbeddedUuidForLiveOwner(), false)
 })
 
 // Fakes for the ComfyWorkflow 4th arg: a REUSE passes a ComfyWorkflow OBJECT; a CREATION

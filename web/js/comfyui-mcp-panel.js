@@ -102,6 +102,7 @@ import {
   isNewWorkflowLoad,
   normalizedWorkflowPath,
   resolveUnsavedInstanceUuid,
+  shouldForkEmbeddedUuidForLiveOwner,
   shouldForkEmbeddedWorkflowUuid,
   shouldForkInPlaceReload,
   workflowAliasForPath,
@@ -254,6 +255,7 @@ import {
   graphRootMatchesState,
   graphCommandMayMutateWorkflow,
   graphReadBindingChanged,
+  resolveGraphRootUuidRebind,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
 import { queueMembership, historyEntryFor } from "./lib/history-reconcile.js";
@@ -1424,6 +1426,10 @@ function installCreateBoundaryFork(appRef) {
             const cached = _workflowObjectUuids.get(workflow);
             const authoritative = cached || crypto.randomUUID();
             if (!cached) _workflowObjectUuids.set(workflow, authoritative);
+            // Record ownership too: every root tag must have a resolvable owner or
+            // the desync guard's orphaned-tag rebind (#545/#557) cannot tell this
+            // live tag apart from stale bookkeeping.
+            rememberWorkflowUuidOwner(authoritative, workflow);
             const extra =
               graphData.extra && typeof graphData.extra === "object" ? graphData.extra : (graphData.extra = {});
             const prev = extra[WORKFLOW_META_NAMESPACE];
@@ -1596,7 +1602,28 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
   let id = objectUuid || embedded || pathAlias || crypto.randomUUID();
 
   const embeddedOwner = embedded ? workflowUuidOwner(embedded) : null;
-  if (!objectUuid && embeddedOwner && embeddedOwner !== identityObject) id = crypto.randomUUID();
+  // #557 — fork away from a live owner's embedded uuid ONLY while that owner is
+  // still an OPEN workflow tab (a genuine co-open copy, #570). A save (or a
+  // reconnect) can REPLACE the active ComfyWorkflow object: the successor parses
+  // the same embedded uuid from the just-saved file while the replaced object is
+  // still the registered owner. Minting a fresh identity here desyncs the object
+  // from the root graph tag the desync guard compares, and every graph tool then
+  // hard-fails until a frontend reload. An owner that is no longer open was
+  // replaced — this object is its successor and INHERITS the identity, which
+  // keeps the WeakMap cache and the root tag aligned.
+  const openWorkflowsForOwnerCheck = app?.extensionManager?.workflow?.openWorkflows;
+  if (
+    !objectUuid &&
+    shouldForkEmbeddedUuidForLiveOwner({
+      embeddedUuid: embedded,
+      embeddedOwner,
+      identityObject,
+      ownerIsOpenWorkflow:
+        Array.isArray(openWorkflowsForOwnerCheck) && openWorkflowsForOwnerCheck.includes(embeddedOwner),
+    })
+  ) {
+    id = crypto.randomUUID();
+  }
   if (
     wf !== currentWorkflowRef &&
     shouldForkEmbeddedWorkflowUuid({
@@ -4096,6 +4123,43 @@ function assertGraphBoundToActiveWorkflow(
   const activeWorkflowUuid = activeWorkflow
     ? (_workflowObjectUuids.get(activeWorkflow) || workflowStableUuid(activeWorkflow))
     : null;
+  // #545/#557 — a root-tag UUID conflict is not self-healing: a save or reconnect
+  // can REPLACE the live ComfyWorkflow object, leaving the root stamped with an
+  // identity whose owner no longer exists as an open tab. Unless another LIVE
+  // open workflow owns the tag, the mismatch is stale bookkeeping rather than a
+  // foreign canvas — re-stamp the root with the active identity and proceed,
+  // instead of hard-blocking every graph tool until a frontend reload. A tag
+  // owned by another OPEN workflow is the genuine #349 wrong-canvas case: it
+  // still throws below, preserving the data-loss protection.
+  let rootUuidMismatch = graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid });
+  if (rootUuidMismatch) {
+    const rootUuid = rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD];
+    const tagOwner = workflowUuidOwner(rootUuid);
+    const openWorkflows = app?.extensionManager?.workflow?.openWorkflows;
+    const rootTagOwnedByForeignOpenWorkflow =
+      !!tagOwner &&
+      tagOwner !== activeWorkflow &&
+      Array.isArray(openWorkflows) &&
+      openWorkflows.includes(tagOwner);
+    if (
+      resolveGraphRootUuidRebind({ rootGraph, activeWorkflowUuid, rootTagOwnedByForeignOpenWorkflow }) ===
+      "rebind"
+    ) {
+      try {
+        const extra =
+          rootGraph.extra && typeof rootGraph.extra === "object" ? rootGraph.extra : (rootGraph.extra = {});
+        const priorMeta = extra[WORKFLOW_META_NAMESPACE];
+        extra[WORKFLOW_META_NAMESPACE] = {
+          ...(priorMeta && typeof priorMeta === "object" ? priorMeta : {}),
+          [WORKFLOW_UUID_FIELD]: activeWorkflowUuid,
+        };
+        rememberWorkflowUuidOwner(activeWorkflowUuid, activeWorkflow);
+        rootUuidMismatch = false;
+      } catch {
+        // A root that refuses the re-stamp stays mismatched and throws below.
+      }
+    }
+  }
   const currentStateTrustworthy = activeWorkflow?.isModified !== true;
   // On a dirty tab, ChangeTracker's activeState can lag the live canvas (#545),
   // so it cannot prove the root belongs to this workflow. Reads remain
@@ -4106,7 +4170,7 @@ function assertGraphBoundToActiveWorkflow(
     activeWorkflow?.isModified === true &&
     !graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid });
   if (
-    graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid }) ||
+    rootUuidMismatch ||
     dirtyMutationBindingUnproven ||
     graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow }) ||
     (currentStateTrustworthy &&

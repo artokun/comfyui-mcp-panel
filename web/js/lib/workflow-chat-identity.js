@@ -64,6 +64,27 @@ export function shouldForkEmbeddedWorkflowUuid({
  *  A mis-classified reuse only loses durability (P1, a fresh session); a mis-classified
  *  creation that INHERITED the source identity would be a wrong-resume (P0) — so, faced
  *  with an ambiguous arg, fork. */
+/** #557 — should a previously-unseen workflow object FORK away from an embedded
+ *  UUID that is still owned by a DIFFERENT live object? Fork ONLY while that
+ *  owner is still an OPEN workflow tab — the genuine co-open copy case (#570).
+ *  A save re-registers/replaces the active ComfyWorkflow object: the successor
+ *  parses the same embedded uuid from the just-saved file while the REPLACED
+ *  object is still the registered owner. Minting a fresh identity for the
+ *  successor desyncs it from the root graph tag the graph-binding guard
+ *  compares against, so every panel_* graph tool hard-fails until a frontend
+ *  reload (#557). An owner that is no longer an open workflow was replaced, so
+ *  this object is its successor and must INHERIT the identity (and with it the
+ *  root tag), keeping the object cache and the root stamp aligned. */
+export function shouldForkEmbeddedUuidForLiveOwner({
+  embeddedUuid,
+  embeddedOwner,
+  identityObject,
+  ownerIsOpenWorkflow = false,
+} = {}) {
+  if (!embeddedUuid || !embeddedOwner || embeddedOwner === identityObject) return false;
+  return ownerIsOpenWorkflow === true;
+}
+
 /** #570 P0b — should an IN-PLACE graph load (loadGraphData into an EXISTING workflow object)
  *  FORK the per-instance identity? A stale object-cache must NEVER override the identity of
  *  newly-loaded content, and ownership is anchored on the LIVE object (not copyable
