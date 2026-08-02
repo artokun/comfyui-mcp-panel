@@ -18,20 +18,23 @@
 //     enforced at the one place every build must pass through: the POST /prompt
 //     request body.
 //
-// RUN IDENTITY (codex gate r3). Content alone cannot always tell our dispatch
+// RUN IDENTITY (codex gate r3/r4). Content alone cannot always tell our dispatch
 // from a stranger's: an identical-node-set foreign post is indistinguishable
 // from ours, and a user's full run of the same graph looks exactly like our
-// scope-dropped dispatch. So this run MARKS its own work end to end:
+// scope-dropped dispatch. So each run MARKS its own work end to end:
 //
-//  - QUEUE POSITION MARK: graph_run queues with number = SCOPED_QUEUE_MARK.
-//    Every frontend build's api.queuePrompt copies a nonzero `number` into the
-//    POST body verbatim (`body.number = number` — present since at least the
-//    1.28-era frontend), and the server treats it as a priority that with
-//    2^30-1 always sorts to the END of the pending queue — the same append
-//    position today's number=0 produces. A body WITHOUT our mark is FOREIGN:
-//    passed through untouched, never captured, never refused, never counted
-//    as our observation — even with an identical node set and identical
-//    targets. A body WITH our mark is this run: signature+targets exact ⇒
+//  - QUEUE POSITION MARK: each scoped run queues with its OWN unique number
+//    (newScopedQueueMark). Every frontend build's api.queuePrompt copies a
+//    nonzero `number` into the POST body verbatim (`body.number = number` —
+//    present since at least the 1.28-era frontend), and the server treats it
+//    as a priority that near 2^30 always sorts to the END of the pending
+//    queue — the same append position today's number=0 produces. The mark is
+//    UNIQUE PER RUN (r4): a fixed mark would let one run's leftover guard
+//    attribute a LATER run's posts to itself — refusing/capturing traffic that
+//    was never its own. A body WITHOUT this run's mark is FOREIGN: passed
+//    through untouched, never captured, never refused, never counted as our
+//    observation — even with an identical node set and identical targets. A
+//    body WITH this run's mark is this run: signature+targets exact ⇒
 //    observed; anything else (scope missing/wrong/extra, or a graph that
 //    changed under a deferred item) ⇒ OUR corrupted dispatch, refused before
 //    it leaves (batch-bounded).
@@ -39,11 +42,19 @@
 //  - QUEUE ITEM TAG: the targets array carries a non-enumerable per-run Symbol
 //    tag. Frontend builds store the array by reference in queueItems (either
 //    directly or inside the options object), so on timeout the still-pending
-//    item can be found and REMOVED with exact ownership — an identical-scope
-//    item from another run is never touched. When the item can't be found
-//    (hard-private #queueItems builds, or a build that copied the array), the
-//    surgical guard stays installed as a long-bound sentinel instead, so the
-//    late corrupted dispatch is still refused whenever it posts.
+//    item can be found and REMOVED with exact ownership (tag AND this run's
+//    mark both checked) — an identical-scope item from another run is never
+//    touched. When the item can't be found (hard-private #queueItems builds,
+//    or a build that copied the array), the surgical guard stays installed
+//    for the PAGE LIFETIME as a sentinel — NO expiry timer (r4: an expiring
+//    sentinel re-opens the hole, because the uncancellable item can post its
+//    scope-dropped full graph whenever the stalled processor resumes). A
+//    permanent install is safe BY CONSTRUCTION: the guard only ever acts on
+//    its own run's unique mark, which no future run (or user, or UI) will
+//    ever carry, so foreign traffic passes through untouched forever. Multiple
+//    sentinels simply CHAIN through whatever wrap is current — each restores
+//    only inside its own synchronous dispatch, and an old sentinel has no
+//    cleanup that could clobber a newer run's guard.
 //
 // OTHER DISPATCH REALITIES (gate rounds 1–2):
 //
@@ -62,14 +73,22 @@
 // Extracted as a pure module so the SAME orchestration graph_run runs is
 // drivable from `node --test` (the live app.queuePrompt path can't be).
 
+let queueMarkCounter = 0;
+
 /**
- * The queue-position number every scoped panel_run dispatches with. Copied
+ * A UNIQUE queue-position number for one scoped run (module header). Copied
  * into the POST body as `number` by every frontend build's api.queuePrompt,
- * making OUR posts identifiable among every /prompt in the tab. 2^30-1 sorts
- * to the END of the server's priority queue (lower number = earlier), which
- * matches the append behavior of the historical number=0.
+ * making THIS run's posts identifiable among every /prompt in the tab. Near
+ * 2^30 so the server's priority queue (lower number = earlier) always sorts
+ * it to the END — the append behavior of the historical number=0 — and
+ * decremented per run so no two runs in the page session share a mark (a
+ * leftover sentinel can then never attribute a later run's traffic). Safe
+ * integer, nonzero, copied verbatim by the frontend.
  */
-export const SCOPED_QUEUE_MARK = 2 ** 30 - 1;
+export function newScopedQueueMark() {
+  queueMarkCounter++;
+  return 2 ** 30 - 1 - queueMarkCounter;
+}
 
 /** Property key for the per-run ownership tag on the targets array (non-enumerable). */
 export const QUEUE_ITEM_TAG = Symbol("cmcp-scoped-run-tag");
@@ -208,11 +227,12 @@ export function scopeUnattributableError({ toNodeId }) {
  * the prompt build failed silently).
  *  - cancelled:  the still-pending frontend queue item was located by its
  *    ownership tag and REMOVED — "nothing was queued" is then literally true.
- *  - lingering:  removal was impossible, so the surgical guard stays installed
- *    for lingerMs as a sentinel — a late scope-dropped dispatch is still
+ *  - sentinel:   removal was impossible, so the surgical guard stays installed
+ *    for the REST OF THE PAGE SESSION (no expiry — an expiring sentinel would
+ *    re-open the hole) — a late scope-dropped dispatch of THIS run is still
  *    refused whenever it posts. Only "nothing CONFIRMED queued" is claimed.
  */
-export function scopeUnverifiedError({ toNodeId, timeoutMs, cancelled = false, lingerMs = 0 }) {
+export function scopeUnverifiedError({ toNodeId, timeoutMs, cancelled = false }) {
   const base =
     `run-to-node scope for node ${toNodeId} could not be verified: no scoped ` +
     `dispatch was observed within ${Math.round(timeoutMs / 1000)}s of queueing ` +
@@ -227,8 +247,9 @@ export function scopeUnverifiedError({ toNodeId, timeoutMs, cancelled = false, l
   return (
     base +
     `The pending queue item could not be removed on this frontend, so the scope ` +
-    `guard stays installed for up to ${Math.round(lingerMs / 60000)}min as a sentinel — ` +
-    `any late dispatch of this run WITHOUT the scope will still be refused. ` +
+    `guard stays installed for the rest of this page session as a sentinel — ` +
+    `any late dispatch of THIS run WITHOUT the scope will still be refused (it ` +
+    `cannot touch any other run's traffic). ` +
     `Nothing is CONFIRMED queued — check the ComfyUI queue before retrying (#556).`
   );
 }
@@ -306,7 +327,7 @@ export function createScopedRunGuard({
   signature,
   batch = 1,
   toNodeId = null,
-  queueMark = SCOPED_QUEUE_MARK,
+  queueMark,
   onRejection = null,
   onPromptId = null,
   onScopeDropped = null,
@@ -379,25 +400,26 @@ export function createScopedRunGuard({
 /**
  * Best-effort removal of THIS run's still-pending item(s) from the frontend's
  * in-memory queueItems (the not-yet-posted deferred dispatch — the server-side
- * /queue never saw it, so server queue control can't help). Ownership is by
- * the non-enumerable QUEUE_ITEM_TAG dispatchScopedRun stamped on the targets
- * array (frontend builds store the array by reference, either directly or
- * inside the options object), so an identical-scope item from ANOTHER run is
- * never removed. The array is runtime-accessible as app.queueItems on
- * TS-`private` builds; older builds hard-privatize it (#queueItems), and a
- * build that COPIED the array loses the tag — then this reports 0 removed and
- * the caller keeps the guard installed as a sentinel instead (module header).
+ * /queue never saw it, so server queue control can't help). Ownership requires
+ * BOTH: the non-enumerable QUEUE_ITEM_TAG dispatchScopedRun stamped on the
+ * targets array (frontend builds store the array by reference, either directly
+ * or inside the options object) AND the item's queue-position number equal to
+ * THIS run's unique mark — an identical-scope item from ANOTHER run is never
+ * removed. The array is runtime-accessible as app.queueItems on TS-`private`
+ * builds; older builds hard-privatize it (#queueItems), and a build that
+ * COPIED the array loses the tag — then this reports 0 removed and the caller
+ * keeps the guard installed as a sentinel instead (module header).
  *
  * @returns {{accessible: boolean, removed: number}}
  */
-export function cancelPendingScopedQueueItem(app, runTag) {
+export function cancelPendingScopedQueueItem(app, { runTag, queueMark } = {}) {
   const items = app?.queueItems;
   if (!Array.isArray(items)) return { accessible: false, removed: 0 };
   let removed = 0;
   for (let i = items.length - 1; i >= 0; i--) {
     const raw = items[i]?.queueNodeIds;
     const arr = Array.isArray(raw) ? raw : raw && Array.isArray(raw.queueNodeIds) ? raw.queueNodeIds : null;
-    if (arr && arr[QUEUE_ITEM_TAG] === runTag) {
+    if (arr && arr[QUEUE_ITEM_TAG] === runTag && Number(items[i]?.number) === queueMark) {
       items.splice(i, 1);
       removed++;
     }
@@ -410,17 +432,18 @@ export function cancelPendingScopedQueueItem(app, runTag) {
  * REAL control flow (guard install, queuePrompt, observation wait, cancel/
  * sentinel decision, and the finally-restore) is what the unit tests drive.
  *
- * Returns a discriminated result (never throws for queue outcomes):
- *  - { outcome: "dispatched" }              our scoped dispatch was OBSERVED
+ * Returns a discriminated result (never throws for queue outcomes), always
+ * carrying the run's unique `queueMark`:
+ *  - { outcome: "dispatched",   queueMark }  our scoped dispatch was OBSERVED
  *    (prompt_ids / a server rejection captured via the callbacks);
- *  - { outcome: "refused",   error }        every argument shape produced OUR
- *    corrupted dispatch, all blocked — nothing was queued;
- *  - { outcome: "unverified", error }       no scoped dispatch surfaced in
- *    time; our pending item was cancelled, or a sentinel guard remains for
- *    lingerMs (the error says which);
- *  - { outcome: "unverifiable", error }     no attribution possible (no
- *    fetchApi to observe through, or no prompt signature) — refused BEFORE
- *    dispatch, nothing queued.
+ *  - { outcome: "refused",      queueMark, error }  every argument shape
+ *    produced OUR corrupted dispatch, all blocked — nothing was queued;
+ *  - { outcome: "unverified",   queueMark, error }  no scoped dispatch
+ *    surfaced in time; our pending item was cancelled, or a sentinel guard
+ *    remains installed for the page session (the error says which);
+ *  - { outcome: "unverifiable", queueMark?, error }  no attribution possible
+ *    (no fetchApi to observe through, or no prompt signature) — refused
+ *    BEFORE dispatch, nothing queued.
  */
 export async function dispatchScopedRun({
   app,
@@ -429,15 +452,17 @@ export async function dispatchScopedRun({
   batch = 1,
   toNodeId = null,
   verifyTimeoutMs = 5000,
-  lingerMs = 10 * 60 * 1000,
+  queueMark = null,
   onRejection = null,
   onPromptId = null,
 } = {}) {
+  const mark = queueMark ?? newScopedQueueMark();
   const prevFetchApi = typeof apiTarget?.fetchApi === "function" ? apiTarget.fetchApi : null;
   const origFetchApi = prevFetchApi ? prevFetchApi.bind(apiTarget) : null;
   if (!origFetchApi) {
     return {
       outcome: "unverifiable",
+      queueMark: mark,
       error:
         `run-to-node scope for node ${toNodeId} cannot be verified — api.fetchApi is ` +
         `unavailable on this frontend, so there is no way to confirm the scope reaches the ` +
@@ -455,7 +480,7 @@ export async function dispatchScopedRun({
     signature = null;
   }
   if (!signature) {
-    return { outcome: "unverifiable", error: scopeUnattributableError({ toNodeId }) };
+    return { outcome: "unverifiable", queueMark: mark, error: scopeUnattributableError({ toNodeId }) };
   }
   // Ownership tag for the timeout cancellation (see QUEUE_ITEM_TAG).
   const runTag = Symbol("cmcp-scoped-run");
@@ -474,13 +499,13 @@ export async function dispatchScopedRun({
       signature,
       batch,
       toNodeId,
-      queueMark: SCOPED_QUEUE_MARK,
+      queueMark: mark,
       onRejection,
       onPromptId,
     });
     apiTarget.fetchApi = guard;
     try {
-      await app.queuePrompt(SCOPED_QUEUE_MARK, batch, scopeArg);
+      await app.queuePrompt(mark, batch, scopeArg);
       if (!(guard.state.observed > 0 || guard.state.dropped)) {
         // queuePrompt returned without our dispatch surfacing — the
         // frontend's processor was busy and will serialize/post the item
@@ -491,38 +516,36 @@ export async function dispatchScopedRun({
       if (!(guard.state.observed > 0 || guard.state.dropped)) {
         // GIVE-UP — decided HERE, inside the try, so the finally below honors
         // keepGuardInstalled. The deferred item may still be live in the
-        // frontend's pending queue: try to REMOVE it (ownership-tagged), and
-        // only when that's impossible keep the surgical guard installed as a
-        // sentinel so the late scope-dropped dispatch is still refused.
-        const cancel = cancelPendingScopedQueueItem(app, runTag);
+        // frontend's pending queue: try to REMOVE it (ownership tag AND this
+        // run's mark both checked), and only when that's impossible keep the
+        // surgical guard installed for the PAGE SESSION as a sentinel — NO
+        // expiry timer (r4): the uncancellable item can post whenever the
+        // stalled processor resumes, so the refusal must not go away. Safe by
+        // construction: the sentinel only ever acts on THIS run's unique mark.
+        const cancel = cancelPendingScopedQueueItem(app, { runTag, queueMark: mark });
         if (cancel.removed > 0) {
           return {
             outcome: "unverified",
+            queueMark: mark,
             error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: true }),
           };
         }
         keepGuardInstalled = true;
-        const timer = setTimeout(() => {
-          // Self-remove only if nothing newer has wrapped over the sentinel —
-          // a guard left underneath a newer wrap is inert (mark-scoped +
-          // batch-bounded) and simply remains in the chain.
-          if (apiTarget.fetchApi === guard) apiTarget.fetchApi = prevFetchApi;
-        }, lingerMs);
-        if (typeof timer.unref === "function") timer.unref();
         return {
           outcome: "unverified",
-          error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: false, lingerMs }),
+          queueMark: mark,
+          error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: false }),
         };
       }
     } finally {
       if (!keepGuardInstalled) apiTarget.fetchApi = prevFetchApi;
     }
     // Verifiably dispatched with our scope.
-    if (guard.state.observed > 0) return { outcome: "dispatched" };
+    if (guard.state.observed > 0) return { outcome: "dispatched", queueMark: mark };
     // OUR dispatch surfaced WITHOUT the scope and was refused before it left
     // the tab — nothing was queued, so retrying the other arg shape can never
     // double-queue.
     dropped = guard.state.dropped;
   }
-  return { outcome: "refused", error: dropped };
+  return { outcome: "refused", queueMark: mark, error: dropped };
 }

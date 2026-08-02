@@ -15,7 +15,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  SCOPED_QUEUE_MARK,
+  newScopedQueueMark,
   QUEUE_ITEM_TAG,
   queuePromptScopeArgs,
   promptSignature,
@@ -84,8 +84,12 @@ function keepAlive() {
   return () => clearInterval(ka);
 }
 
+// Two run marks for the tests (what newScopedQueueMark hands out per run).
+const MARK_A = 2 ** 30 - 1 - 1;
+const MARK_B = 2 ** 30 - 1 - 2;
+
 // Bodies the way the frontend's api.queuePrompt builds them.
-function frontendBody({ output = OUR_OUTPUT, number = SCOPED_QUEUE_MARK, targets = null }) {
+function frontendBody({ output = OUR_OUTPUT, number = MARK_A, targets = null }) {
   const body = { prompt: output, client_id: "x" };
   if (targets) body.partial_execution_targets = targets;
   if (number === -1) body.front = true;
@@ -187,7 +191,7 @@ test("#556 error messages: dropped names the node + nothing queued; unverified d
   const cancelled = scopeUnverifiedError({ toNodeId: 14, timeoutMs: 5000, cancelled: true });
   assert.match(cancelled, /REMOVED/);
   assert.match(cancelled, /nothing was queued/i);
-  const sentinel = scopeUnverifiedError({ toNodeId: 14, timeoutMs: 5000, cancelled: false, lingerMs: 600000 });
+  const sentinel = scopeUnverifiedError({ toNodeId: 14, timeoutMs: 5000, cancelled: false });
   assert.match(sentinel, /sentinel/);
   assert.match(sentinel, /CONFIRMED queued/i);
   const unattributable = scopeUnattributableError({ toNodeId: 14 });
@@ -223,7 +227,7 @@ test("#556 unscoped interceptor: captures top-level rejection and prompt_id, lea
 test("#556 guard: OUR marked post with signature+exact targets ⇒ observed, dispatched verbatim, prompt_id captured", async () => {
   const spy = makeServer();
   const ids = [];
-  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14, onPromptId: (p) => ids.push(p) });
+  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14, queueMark: MARK_A, onPromptId: (p) => ids.push(p) });
   const [route, options] = promptPost(frontendBody({ targets: ["14"] }));
   const res = await guard(route, options);
   assert.equal(spy.calls.length, 1);
@@ -237,7 +241,7 @@ test("#556 guard: OUR marked post with MISSING or WRONG/EXTRA targets ⇒ refuse
   for (const bad of [null, ["9"], ["14", "9"]]) {
     const spy = makeServer();
     let dropped = null;
-    const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14, onScopeDropped: (m) => (dropped = m) });
+    const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14, queueMark: MARK_A, onScopeDropped: (m) => (dropped = m) });
     const res = await guard(...promptPost(frontendBody({ targets: bad })));
     assert.equal(spy.calls.length, 0, `targets ${JSON.stringify(bad)} must never leave the tab`);
     assert.equal(res.status, 400);
@@ -269,7 +273,7 @@ test("#556 r3 P0-3: an UNMARKED post is FOREIGN even with our node set AND our t
 
 test("#556 guard: a marked post whose graph CHANGED under the deferred item (signature mismatch) is corrupted ⇒ refused", async () => {
   const spy = makeServer();
-  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14 });
+  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14, queueMark: MARK_A });
   const changedOutput = { "3": { class_type: "KSampler" }, "20": { class_type: "SaveImage" } };
   const res = await guard(...promptPost(frontendBody({ output: changedOutput, targets: ["14"] })));
   assert.equal(res.status, 400, "scope is unverifiable against the changed graph — refuse");
@@ -280,23 +284,37 @@ test("#556 guard: a marked post whose graph CHANGED under the deferred item (sig
 // cancelPendingScopedQueueItem — ownership-tagged removal
 // ---------------------------------------------------------------------------
 
-test("#556 r3 P0-3: cancellation removes ONLY the ownership-tagged item — an identical-scope foreign item stays", () => {
+test("#556 r3/r4: cancellation removes ONLY the ownership-tagged item with THIS run's mark — tag without the mark, and foreign items, stay", () => {
   const runTag = Symbol("t");
   const ourArray = ["14"];
   Object.defineProperty(ourArray, QUEUE_ITEM_TAG, { value: runTag, enumerable: false });
-  const ourOptionsItem = { number: 1, batchCount: 1, queueNodeIds: { queueNodeIds: ourArray } };
-  const ourDirectItem = { number: 1, batchCount: 1, queueNodeIds: ourArray };
+  const ourOptionsItem = { number: MARK_A, batchCount: 1, queueNodeIds: { queueNodeIds: ourArray } };
+  const ourDirectItem = { number: MARK_A, batchCount: 1, queueNodeIds: ourArray };
+  // Same tag but a DIFFERENT run's mark — never ours (paranoia; can't happen
+  // in practice since tag and mark are minted together).
+  const wrongMarkItem = { number: MARK_B, batchCount: 1, queueNodeIds: ourArray };
   const foreignSameScope = { number: 0, batchCount: 1, queueNodeIds: ["14"] };
   const userFullRun = { number: 0, batchCount: 1, queueNodeIds: undefined };
-  const app = { queueItems: [userFullRun, foreignSameScope, ourDirectItem, ourOptionsItem] };
-  const res = cancelPendingScopedQueueItem(app, runTag);
+  const app = { queueItems: [userFullRun, wrongMarkItem, foreignSameScope, ourDirectItem, ourOptionsItem] };
+  const res = cancelPendingScopedQueueItem(app, { runTag, queueMark: MARK_A });
   assert.equal(res.accessible, true);
   assert.equal(res.removed, 2, "our item removed in either stored shape");
-  assert.deepEqual(app.queueItems, [userFullRun, foreignSameScope], "identical-scope foreign item and user run stay");
+  assert.deepEqual(app.queueItems, [userFullRun, wrongMarkItem, foreignSameScope], "mark-mismatched and foreign items stay");
 });
 
 test("#556 r3 P0-3: hard-private queueItems builds ⇒ inaccessible (caller keeps the sentinel)", () => {
-  assert.deepEqual(cancelPendingScopedQueueItem({}, Symbol("t")), { accessible: false, removed: 0 });
+  assert.deepEqual(cancelPendingScopedQueueItem({}, { runTag: Symbol("t"), queueMark: MARK_A }), { accessible: false, removed: 0 });
+});
+
+test("#556 r4 P0-2: newScopedQueueMark is unique per run, nonzero, a safe integer near 2^30 (sorts to the queue end)", () => {
+  const a = newScopedQueueMark();
+  const b = newScopedQueueMark();
+  assert.notEqual(a, b, "two runs never share a mark — a sentinel can't claim a later run's traffic");
+  for (const m of [a, b]) {
+    assert.ok(Number.isSafeInteger(m));
+    assert.ok(m > 0);
+    assert.ok(m <= 2 ** 30 - 1 && m > 2 ** 29, "large enough to always append at the priority-queue end");
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -318,7 +336,7 @@ test("#556 integration: happy path — marked scoped dispatch observed, prompt_i
     assert.deepEqual(ids, ["srv-1"]);
     assert.equal(apiTarget.fetchApi, prev, "guard restored after observation");
     assert.equal(app.posted.length, 1, "first arg shape worked — no retry");
-    assert.equal(app.posted[0].number, SCOPED_QUEUE_MARK, "our posts carry the queue mark");
+    assert.equal(app.posted[0].number, result.queueMark, "our posts carry THIS run's queue mark");
     assert.deepEqual(app.posted[0].partial_execution_targets, ["14"]);
   } finally {
     stop();
@@ -363,7 +381,7 @@ test("#556 integration: a build honoring NEITHER shape ⇒ truthful refusal, ZER
   }
 });
 
-test("#556 r3 P0-1 integration: THE SENTINEL ACTUALLY INSTALLS — after a give-up timeout, api.fetchApi is STILL the guard and refuses the late scope-dropped post with zero dispatch", async () => {
+test("#556 r4 P0-1 integration: THE SENTINEL INSTALLS AND NEVER EXPIRES — still installed past the old linger bound, still refusing the late scope-dropped post with zero dispatch", async () => {
   const stop = keepAlive();
   try {
     const apiTarget = { fetchApi: makeServer() };
@@ -374,18 +392,61 @@ test("#556 r3 P0-1 integration: THE SENTINEL ACTUALLY INSTALLS — after a give-
     delete app.queueItems;
     const result = await dispatchScopedRun({
       app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
-      verifyTimeoutMs: 50, lingerMs: 120,
+      verifyTimeoutMs: 50,
     });
     assert.equal(result.outcome, "unverified");
     assert.match(result.error, /sentinel/);
+    assert.match(result.error, /page session/);
     assert.notEqual(apiTarget.fetchApi, prev, "the sentinel guard is STILL installed after the run returned");
+    // Well past where the r3 linger timer would have restored fetchApi (120ms).
+    await sleep(200);
+    assert.notEqual(apiTarget.fetchApi, prev, "NO expiry — an expiring sentinel re-opens the hole: the uncancellable item can post whenever the stalled processor resumes");
     // The deferred item finally posts — through the sentinel — scope dropped.
     const res = await app.postDeferred(app.deferredItem);
-    assert.equal(res.status, 400, "the sentinel refuses the late scope-dropped dispatch");
-    assert.equal(prev.calls.length, 0, "no full-graph dispatch escapes — even after the timeout");
-    // …and the sentinel self-removes at the long bound.
-    await sleep(160);
-    assert.equal(apiTarget.fetchApi, prev, "sentinel self-removes at the linger bound");
+    assert.equal(res.status, 400, "the sentinel STILL refuses the late scope-dropped dispatch");
+    assert.equal(prev.calls.length, 0, "no full-graph dispatch escapes — ever");
+    assert.notEqual(apiTarget.fetchApi, prev, "installed for the rest of the page session");
+  } finally {
+    stop();
+  }
+});
+
+test("#556 r4 P0-2 integration: two overlapping scoped runs — B's traffic passes A's sentinel untouched, B is observed by its own guard, A's sentinel still only constrains A's items, guards chain without clobbering", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const prev = apiTarget.fetchApi;
+    // RUN A: busy shim-less frontend, deferred, uncancellable ⇒ sentinel.
+    const appA = makeFrontend({ shape: "shimless", defer: true, apiTarget });
+    delete appA.queueItems;
+    const resultA = await dispatchScopedRun({
+      app: appA, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+      verifyTimeoutMs: 50,
+    });
+    assert.equal(resultA.outcome, "unverified");
+    const sentinelA = apiTarget.fetchApi;
+    assert.notEqual(sentinelA, prev, "run A left its sentinel installed");
+
+    // RUN B: a normal retry to a DIFFERENT node through the SAME apiTarget.
+    // B's posts carry B's OWN unique mark — foreign to A's sentinel.
+    const appB = makeFrontend({ shape: "shim", apiTarget });
+    const idsB = [];
+    const resultB = await dispatchScopedRun({
+      app: appB, apiTarget, execIds: ["15"], batch: 1, toNodeId: 15,
+      onPromptId: (p) => idsB.push(p),
+    });
+    assert.equal(resultB.outcome, "dispatched", "B runs normally behind A's sentinel");
+    assert.notEqual(resultB.queueMark, resultA.queueMark, "each run has its own mark");
+    assert.deepEqual(idsB, ["srv-1"], "B's prompt_id captured by B's guard, never by A's sentinel");
+    assert.equal(server.calls.length, 1, "B's scoped dispatch reached the server THROUGH A's sentinel, untouched");
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["15"]);
+    // Chaining: B restored the wrap that was current when IT installed — A's sentinel.
+    assert.equal(apiTarget.fetchApi, sentinelA, "B's cleanup did not clobber A's sentinel");
+    // A's late scope-dropped post is STILL refused by A's sentinel.
+    const resA = await appA.postDeferred(appA.deferredItem);
+    assert.equal(resA.status, 400, "A's sentinel still constrains exactly A's items");
+    assert.equal(server.calls.length, 1, "A's corrupted dispatch never escapes");
   } finally {
     stop();
   }
@@ -401,7 +462,7 @@ test("#556 r3 P0-3 integration: timeout CANCELS our tagged pending item (assert 
     app.queueItems.push({ number: 0, batchCount: 1, queueNodeIds: ["14"] });
     const result = await dispatchScopedRun({
       app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
-      verifyTimeoutMs: 50, lingerMs: 1000,
+      verifyTimeoutMs: 50,
     });
     assert.equal(result.outcome, "unverified");
     assert.match(result.error, /REMOVED/);
@@ -441,7 +502,7 @@ test("#556 r3 P0-3 integration: foreign traffic during our window is untouched �
     const ids = [];
     const promise = dispatchScopedRun({
       app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
-      verifyTimeoutMs: 500, lingerMs: 1000,
+      verifyTimeoutMs: 500,
       onPromptId: (p) => ids.push(p),
     });
     await sleep(20); // guard is installed, waiting for observation
