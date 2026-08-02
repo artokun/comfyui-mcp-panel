@@ -11266,8 +11266,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         onTurnAnchor?.(msg.uuid);
       }
       // #694 (epoch-first) — stamp the session epoch from ANY frame that
-      // carries it: the orchestrator now sends a tiny `session` frame the
-      // instant a hello lands (before async model discovery), so the epoch
+      // carries it: the orchestrator now sends a tiny "session_epoch" frame
+      // the instant a hello lands (before async model discovery), so the epoch
       // advances immediately instead of only when the `models` frame arrives.
       // A legacy orchestrator sends no epoch on those early frames — the
       // models-frame stamp below still covers them.
