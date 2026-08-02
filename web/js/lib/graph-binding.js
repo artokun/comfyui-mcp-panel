@@ -222,6 +222,18 @@ export function graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid 
 }
 
 /**
+ * True only when both sides carry the same established workflow identity. This
+ * is stronger than `graphRootWorkflowUuidMismatches`: missing metadata is
+ * inconclusive for reads, but a dirty graph mutation cannot safely use an
+ * inconclusive root because ChangeTracker may lag the user's real canvas.
+ */
+export function graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid } = {}) {
+  if (typeof activeWorkflowUuid !== "string" || !activeWorkflowUuid) return false;
+  const rootUuid = rootGraph?.extra?.comfyui_mcp?.workflow_uuid;
+  return typeof rootUuid === "string" && rootUuid === activeWorkflowUuid;
+}
+
+/**
  * True when the graph READ's binding changed across an AWAIT: the active-workflow
  * instance or the bound root-graph object captured before the await no longer
  * matches after it. Used to detect a workflow-tab SWITCH that interleaved with a

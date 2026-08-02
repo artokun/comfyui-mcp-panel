@@ -251,6 +251,7 @@ import {
   graphReadDesynced,
   graphRootMismatchesActiveWorkflow,
   graphRootWorkflowUuidMismatches,
+  graphRootWorkflowUuidMatches,
   graphReadBindingChanged,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
@@ -1424,11 +1425,20 @@ function installCreateBoundaryFork(appRef) {
             if (shouldForkInPlaceReload({ cachedUuid: cached, incomingUuid: incoming })) {
               _workflowObjectUuids.delete(workflow); // content replaced in place → drop stale cache
               fork = true;
-            } else if (!cached && typeof incoming === "string" && incoming) {
+            } else if (!cached) {
               // The load call itself binds this serialized graph to `workflow`.
               // Seed from that authoritative pairing, never later from whichever
-              // app.graph happens to be mounted when a command arrives.
-              cacheIncomingUuid = incoming;
+              // app.graph happens to be mounted when a command arrives. Legacy
+              // graph data without an embedded UUID gets a fresh one here, while
+              // this load-to-workflow pairing is still known to be valid.
+              cacheIncomingUuid = typeof incoming === "string" && incoming ? incoming : crypto.randomUUID();
+              const extra =
+                graphData.extra && typeof graphData.extra === "object" ? graphData.extra : (graphData.extra = {});
+              const prev = extra[WORKFLOW_META_NAMESPACE];
+              extra[WORKFLOW_META_NAMESPACE] = {
+                ...(prev && typeof prev === "object" ? prev : {}),
+                [WORKFLOW_UUID_FIELD]: cacheIncomingUuid,
+              };
             }
           }
           if (fork) {
@@ -3979,7 +3989,11 @@ function getGraphCtx() {
 // than return empty". Fail-safe: fires ONLY when the workflow reports N>0 nodes at
 // ROOT scope while the live root graph is empty, so a genuinely-empty / brand-new
 // workflow (and any descended-into empty subgraph) reads `node_count: 0` as before.
-function assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard = true } = {}) {
+function assertGraphBoundToActiveWorkflow(
+  graph,
+  rootGraph,
+  { includeBaselineReadGuard = true, requireDirtyMutationBinding = false } = {},
+) {
   const liveNodeCount = rootGraph?._nodes?.length ?? 0;
   const inSubgraph = !!rootGraph && graph !== rootGraph;
   const activeWorkflow = activeWorkflowRef();
@@ -3992,8 +4006,17 @@ function assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineRea
     ? (_workflowObjectUuids.get(activeWorkflow) || workflowStableUuid(activeWorkflow))
     : null;
   const currentStateTrustworthy = activeWorkflow?.isModified !== true;
+  // On a dirty tab, ChangeTracker's activeState can lag the live canvas (#545),
+  // so it cannot prove the root belongs to this workflow. Reads remain
+  // availability-oriented, but mutations need a positive UUID match: otherwise
+  // a stale, untagged root B is indistinguishable from A and could be changed.
+  const dirtyMutationBindingUnproven =
+    requireDirtyMutationBinding &&
+    activeWorkflow?.isModified === true &&
+    !graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid });
   if (
     graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid }) ||
+    dirtyMutationBindingUnproven ||
     graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow }) ||
     (currentStateTrustworthy &&
       includeBaselineReadGuard &&
@@ -4245,7 +4268,10 @@ function captureGraphSnapshot(mid, label) {
       (state) => state && Array.isArray(state.nodes),
     );
     if (!currentState) return null;
-    assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: false });
+    assertGraphBoundToActiveWorkflow(graph, rootGraph, {
+      includeBaselineReadGuard: false,
+      requireDirtyMutationBinding: true,
+    });
     const data = rootGraph.serialize();
     graphSnapshots.push({ mid, ts: Date.now(), label: (label || "").slice(0, 80), data, workflowRef });
     while (graphSnapshots.length > GRAPH_SNAPSHOTS_MAX) graphSnapshots.shift();
@@ -4266,7 +4292,10 @@ function restoreSnapshot(snap) {
     if (!snap.workflowRef || snap.workflowRef !== activeWorkflowRef()) return null;
     // Revert is a direct local load, not a bridge command. Do not restore a
     // snapshot into a canvas proven to belong to a different active workflow.
-    assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: false });
+    assertGraphBoundToActiveWorkflow(graph, rootGraph, {
+      includeBaselineReadGuard: false,
+      requireDirtyMutationBinding: true,
+    });
     // Deep-clone so the stored snapshot isn't mutated by the live graph after load.
     // __cmcpNoFork: this reloads the SAME active workflow (a revert), so the create-
     // boundary fork must NOT re-mint its per-instance identity (#570 P0).
@@ -6434,7 +6463,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // This executor is also called directly by the CivitAI workflow picker,
     // bypassing bridge dispatch. Refuse before snapshot/load so that path cannot
     // report a successful load into a stale prior tab (#349).
-    assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: false });
+    assertGraphBoundToActiveWorkflow(graph, rootGraph, {
+      includeBaselineReadGuard: false,
+      requireDirtyMutationBinding: true,
+    });
     // Accept a JSON string or an object.
     let data = incoming;
     if (typeof data === "string") {
@@ -7574,7 +7606,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // Queueing a stale root would render the wrong workflow even though no graph
     // mutation occurs, so enforce the same current-state binding before prompt
     // construction or queuePrompt can report success (#349).
-    assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: false });
+    assertGraphBoundToActiveWorkflow(graph, rootGraph, {
+      includeBaselineReadGuard: false,
+      requireDirtyMutationBinding: true,
+    });
     if (typeof app.queuePrompt !== "function") {
       throw new Error("app.queuePrompt is unavailable on this frontend");
     }
@@ -11021,7 +11056,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // against the active workflow's serialized root before its executor.
             if (msg.cmd.startsWith("graph_")) {
               const { graph, rootGraph } = getGraphCtx();
-              assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: false });
+              assertGraphBoundToActiveWorkflow(graph, rootGraph, {
+                includeBaselineReadGuard: false,
+                requireDirtyMutationBinding: true,
+              });
             }
             // PINNED-TARGET GUARD (#349): a `workflow_path` on the command means the
             // agent's session is pinned to a SPECIFIC workflow. But every executor
