@@ -243,6 +243,7 @@ import {
 } from "./lib/workflow-save.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
+import { readyAckCanPromoteBackend } from "./lib/pi-readiness.js";
 import { createRunReconcileSweep } from "./lib/run-reconcile-sweep.js";
 import {
   activeWorkflowNodeCount,
@@ -12741,6 +12742,9 @@ function buildPanel() {
   // that actually RUNS the agents — authoritative), the ComfyUI-side Python probe
   // (GET /backends, blind to the laptop behind a remote pod) must not override it.
   let readinessFromOrchestrator = false;
+  // A generic `ready` ack can arrive before the authoritative `backends` snapshot.
+  // Pi must stay conservative until that snapshot has landed for this connection.
+  let piBackendsReadinessReceived = false;
   // Short per-provider hint shown under each provider row in the popup.
   const BACKEND_HINTS = { claude: "Fable · Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", antigravity: "Gemini 3 · Google subscription", pi: "pi.dev · multi-provider CLI · no ComfyUI tools", grok: "Grok Composer · Build", kimi: "Kimi (Moonshot)", moonshot: "Kimi K3 · Moonshot", glm: "GLM · z.ai coding plan", minimax: "MiniMax M3 · 1M context", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)", lmstudio: "Local LLMs · no account", llamacpp: "Local LLMs · no account", custom: "DeepSeek · vLLM · any OpenAI-compatible API" };
 
@@ -17377,6 +17381,7 @@ function buildPanel() {
       // here falsely reads as "turn finished", so keep it up (with a reconnecting
       // banner) while a turn is live; only hide when nothing is in flight.
       if (!connected) {
+        piBackendsReadinessReceived = false;
         // Remember the drop so the next "connected" reconciles pending runs (#370).
         bridgeWasDown = true;
         if (agentWorking) {
@@ -17807,6 +17812,9 @@ function buildPanel() {
       // cmcpOpenCredentialsFrame) — sent alongside backends/any_ready.
       if (data && typeof data.console_url === "string") cmcpConsoleUrl = data.console_url;
       if (data && typeof data.console_token === "string") cmcpConsoleToken = data.console_token;
+      // This callback runs only for a real bridge `backends` frame with an array
+      // payload. From now on a ready ack may refine that authoritative Pi state.
+      piBackendsReadinessReceived = true;
       // Authoritative readiness from the connected orchestrator — the machine that
       // runs the agents. Wins over the ComfyUI-side probe (which false-flags "CLI
       // not installed" behind a remote pod). Repaint the chips so hints refresh.
@@ -17851,7 +17859,7 @@ function buildPanel() {
       // below still need to run on this same ack.
       if (ack?.kind === "ready") {
         const b = typeof ack.backend === "string" ? ack.backend : connectedBackend;
-        if (b) {
+        if (b && readyAckCanPromoteBackend(b, piBackendsReadinessReceived)) {
           backendReady[b] = { cli: true, auth: true, ready: true };
           readinessFromOrchestrator = true;
           anyReady = true;
