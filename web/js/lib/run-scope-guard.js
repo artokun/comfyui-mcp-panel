@@ -297,6 +297,22 @@ function isPromptPost(route, options) {
   return method === "POST" && path.endsWith("/prompt");
 }
 
+/**
+ * The truthful DISPATCH-FAILURE outcome (r6): an ATTRIBUTED /prompt post (our
+ * mark, our signature, our exact targets) whose fetch threw or whose response
+ * was malformed (no parseable prompt_id, no rejection body). That post is NOT
+ * verified and NOT a server rejection — the run must never report queued:true
+ * for it. Names what failed and how much of the batch was confirmed first.
+ */
+export function scopeDispatchError({ toNodeId, detail, verified, batch }) {
+  return (
+    `run-to-node scope for node ${toNodeId}: a verified-scoped /prompt request ` +
+    `FAILED to complete — ${detail}. ${verified} of ${batch} batch prompts were ` +
+    `confirmed queued before the failure. The run is NOT reported as queued: ` +
+    `this prompt did not reach ComfyUI, and no full-graph dispatch occurred (#556).`
+  );
+}
+
 // Capture the #358 top-level rejection / #370 prompt_id out of a /prompt
 // response that is ATTRIBUTED to this run. prompt_id is normalized to a string
 // at capture (0 and "0" are the same run).
@@ -312,6 +328,33 @@ async function captureRunResponse(res, { onRejection, onPromptId }) {
     }
   } catch {
     // non-JSON body / clone unsupported — the caller falls back to lastNodeErrors.
+  }
+}
+
+// Classify the response to an ATTRIBUTED scoped post (r6): "accepted" ONLY
+// when it is a real 200 with a parseable prompt_id (captured); "rejected" when
+// it is a genuine server rejection (non-200 with an error / node_errors body —
+// captured through the established #358 channel); "malformed" for anything
+// else (2xx without a prompt_id, non-200 without a rejection body, unparseable
+// body, missing response). Only "accepted" may ever count as verified.
+async function classifyRunResponse(res, { onRejection, onPromptId }) {
+  if (!res) return "malformed";
+  try {
+    const body = await res.clone().json();
+    if (res.status === 200) {
+      if (body && body.prompt_id != null) {
+        onPromptId?.(String(body.prompt_id));
+        return "accepted";
+      }
+      return "malformed";
+    }
+    if (body && (body.error || body.node_errors)) {
+      onRejection?.({ error: body.error ?? null, node_errors: body.node_errors ?? null });
+      return "rejected";
+    }
+    return "malformed";
+  } catch {
+    return "malformed";
   }
 }
 
@@ -360,7 +403,7 @@ export function createScopedRunGuard({
 } = {}) {
   const expected = (execIds ?? []).map(String);
   const maxBatch = Math.max(1, Math.floor(Number(batch)) || 1);
-  const state = { observed: 0, refused: 0, dropped: null };
+  const state = { observed: 0, rejected: 0, refused: 0, dropped: null, failed: null };
   const waiters = new Set();
   const notify = () => {
     for (const fire of [...waiters]) fire();
@@ -377,12 +420,38 @@ export function createScopedRunGuard({
     const targets = targetsFromBody(options?.body);
     const sigOk = signature && promptSignatureFromBody(options?.body) === signature;
     if (sigOk && targets && sameSet(targets, expected)) {
-      // OUR scoped dispatch, verifiably delivered. The run is only
-      // "dispatched" when ALL `batch` posts verify — a batch is never
-      // declared complete on a partial count (r5).
-      state.observed++;
-      const res = await origFetchApi(route, options);
-      if (res) await captureRunResponse(res, { onRejection, onPromptId });
+      // OUR scoped dispatch. It counts as VERIFIED only when the fetch itself
+      // completes with a real 200 + prompt_id (r6) — a thrown fetch or a
+      // malformed response is a terminal dispatch FAILURE, never a success;
+      // a genuine server rejection flows through the established #358 channel.
+      let res;
+      try {
+        res = await origFetchApi(route, options);
+      } catch (err) {
+        if (state.failed == null) {
+          state.failed = scopeDispatchError({
+            toNodeId,
+            detail: `the /prompt request itself threw (${String(err?.message ?? err)})`,
+            verified: state.observed,
+            batch: maxBatch,
+          });
+        }
+        notify();
+        throw err; // the frontend sees exactly the failure it would have seen
+      }
+      const verdict = await classifyRunResponse(res, { onRejection, onPromptId });
+      if (verdict === "accepted") {
+        state.observed++;
+      } else if (verdict === "rejected") {
+        state.rejected++;
+      } else if (state.failed == null) {
+        state.failed = scopeDispatchError({
+          toNodeId,
+          detail: `the /prompt response was malformed (HTTP ${res?.status ?? "?"}, no prompt_id and no rejection body)`,
+          verified: state.observed,
+          batch: maxBatch,
+        });
+      }
       notify();
       return res;
     }
@@ -408,11 +477,16 @@ export function createScopedRunGuard({
     return origFetchApi(route, options);
   };
   guard.state = state;
-  // Verdict = the FULL batch verified, or ANY corrupted post (which ends the
-  // attempt: the frontend's batch loop breaks on the first refusal — the
-  // caller distinguishes shape-drop (0 verified ⇒ retry shape) from mid-batch
-  // corruption (some verified ⇒ terminal partial, r5)).
-  const verdictReached = () => state.observed >= maxBatch || state.dropped != null;
+  // Verdict = the run reached a TERMINAL state: the whole batch verified, a
+  // genuine server rejection arrived, a dispatch failure occurred (r6), or a
+  // corrupted post ended the attempt (the frontend's batch loop breaks on the
+  // first refusal — the caller distinguishes shape-drop (0 verified ⇒ retry
+  // shape) from mid-batch corruption (some verified ⇒ terminal partial, r5)).
+  const verdictReached = () =>
+    state.failed != null ||
+    state.rejected > 0 ||
+    state.observed >= maxBatch ||
+    state.dropped != null;
   guard.verdictReached = verdictReached;
   guard.waitForVerdict = (ms) =>
     new Promise((resolve) => {
@@ -575,8 +649,38 @@ export async function dispatchScopedRun({
           error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: false, verified, batch }),
         };
       }
+      // r6: a dispatch FAILURE with the batch not fully accounted — the
+      // frontend CONTINUES its queue loop on generic submission failures, so
+      // later posts of this batch can still come. Keep the guard installed as
+      // a page-session sentinel so a later CORRUPTED post is still refused
+      // (decided HERE so the finally below honors it).
+      if (
+        guard.state.failed != null &&
+        guard.state.observed + guard.state.rejected + guard.state.refused < batch
+      ) {
+        keepGuardInstalled = true;
+      }
     } finally {
       if (!keepGuardInstalled) apiTarget.fetchApi = prevFetchApi;
+    }
+    // r6: the dispatch itself failed (fetch threw / malformed response) —
+    // terminal, truthful, NEVER queued:true.
+    if (guard.state.failed != null) {
+      return {
+        outcome: "failed",
+        queueMark: mark,
+        verified: guard.state.observed,
+        error: guard.state.failed +
+          (keepGuardInstalled
+            ? " The scope guard stays installed as a sentinel for the rest of this page session."
+            : ""),
+      };
+    }
+    // A genuine SERVER rejection (#358) is terminal and flows through the
+    // established rejection channel — the run "dispatched" and ComfyUI said
+    // no; graph_run's summarizePromptRejection surfaces it, never queued:true.
+    if (guard.state.rejected > 0) {
+      return { outcome: "dispatched", queueMark: mark, verified: guard.state.observed };
     }
     // The FULL batch verified — genuinely dispatched (r5: never on a partial).
     if (guard.state.observed >= batch) {

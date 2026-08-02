@@ -237,6 +237,42 @@ test("#556 guard: OUR marked post with signature+exact targets ⇒ observed, dis
   assert.deepEqual(ids, ["srv-1"]);
 });
 
+test("#556 r6: an attributed post whose fetch THROWS is a dispatch FAILURE — never counted as verified, never captured", async () => {
+  const spy = makeServer(async () => { throw new Error("connection reset"); });
+  let captured = null;
+  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14, queueMark: MARK_A, onPromptId: (p) => (captured = p) });
+  await assert.rejects(guard(...promptPost(frontendBody({ targets: ["14"] }))), /connection reset/);
+  assert.equal(guard.state.observed, 0, "a thrown fetch never satisfies the batch verdict");
+  assert.match(guard.state.failed, /connection reset/);
+  assert.match(guard.state.failed, /NOT reported as queued/);
+  assert.equal(captured, null, "no prompt_id claimed");
+});
+
+test("#556 r6: an attributed post with a MALFORMED response (200 without prompt_id, or non-200 without a rejection body) is a dispatch FAILURE", async () => {
+  for (const bad of [jsonResponse(200, {}), jsonResponse(500, {}), jsonResponse(200, { prompt_id: null })]) {
+    const spy = makeServer(async () => bad);
+    let captured = null;
+    const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14, queueMark: MARK_A, onPromptId: (p) => (captured = p) });
+    const res = await guard(...promptPost(frontendBody({ targets: ["14"] })));
+    assert.equal(res, bad, "the real response passes back to the frontend");
+    assert.equal(guard.state.observed, 0, `HTTP ${bad.status} malformed ⇒ not verified`);
+    assert.match(guard.state.failed, /malformed/);
+    assert.equal(captured, null);
+  }
+});
+
+test("#556 r6: a GENUINE server rejection still flows through the established #358 rejection channel (not a dispatch failure)", async () => {
+  const rejectionBody = { error: { type: "prompt_outputs_failed_validation", message: "bad input" } };
+  const spy = makeServer(async () => jsonResponse(400, rejectionBody));
+  let rejection = null;
+  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14, queueMark: MARK_A, onRejection: (r) => (rejection = r) });
+  await guard(...promptPost(frontendBody({ targets: ["14"] })));
+  assert.equal(guard.state.rejected, 1);
+  assert.equal(guard.state.failed, null, "a server rejection is NOT a dispatch failure");
+  assert.equal(guard.state.observed, 0);
+  assert.deepEqual(rejection, { error: rejectionBody.error, node_errors: null });
+});
+
 test("#556 guard: OUR marked post with MISSING or WRONG/EXTRA targets ⇒ refused with zero dispatch", async () => {
   for (const bad of [null, ["9"], ["14", "9"]]) {
     const spy = makeServer();
@@ -254,7 +290,7 @@ test("#556 r3 P0-3: an UNMARKED post is FOREIGN even with our node set AND our t
   const spy = makeServer();
   let captured = null, dropped = null;
   const guard = createScopedRunGuard({
-    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
+    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14, queueMark: MARK_A,
     onPromptId: (p) => (captured = p), onScopeDropped: (m) => (dropped = m),
   });
   // A foreign scoped run to the same node (number=0 ⇒ no body.number ⇒ unmarked).
@@ -547,6 +583,85 @@ test("#556 r5 integration: batch=2 where the second post NEVER arrives ⇒ unver
     });
     assert.equal(res.status, 400, "the sentinel refuses the late scope-dropped batch post");
     assert.equal(server.calls.length, 1, "only the one verified scoped post ever left the tab");
+  } finally {
+    stop();
+  }
+});
+
+test("#556 r6 integration: batch=1 whose /prompt fetch THROWS ⇒ 'failed' outcome (never dispatched/queued:true), sentinel guards the incomplete batch", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer(async () => { throw new Error("connection reset"); });
+    const apiTarget = { fetchApi: server };
+    const prev = apiTarget.fetchApi;
+    const app = makeFrontend({ shape: "shim", apiTarget });
+    // The frontend catches generic submission failures and returns normally.
+    app.queuePrompt = async (number, batch, arg) => {
+      const body = frontendBody({ output: OUR_OUTPUT, number, targets: ["14"] });
+      app.posted.push(body);
+      try {
+        await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+      } catch { /* frontend swallows generic submission failures */ }
+      return true;
+    };
+    const ids = [];
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+      onPromptId: (p) => ids.push(p),
+    });
+    assert.equal(result.outcome, "failed");
+    assert.notEqual(result.outcome, "dispatched");
+    assert.equal(result.verified, 0);
+    assert.match(result.error, /connection reset/);
+    assert.match(result.error, /NOT reported as queued/);
+    assert.deepEqual(ids, [], "no prompt_id claimed");
+    assert.notEqual(apiTarget.fetchApi, prev, "batch unaccounted ⇒ sentinel stays (the frontend may keep looping)");
+    // A late CORRUPTED post of this run is still refused by the sentinel.
+    const res = await apiTarget.fetchApi("/prompt", {
+      method: "POST",
+      body: JSON.stringify(frontendBody({ output: OUR_OUTPUT, number: result.queueMark, targets: null })),
+    });
+    assert.equal(res.status, 400);
+    assert.equal(server.calls.length, 1, "nothing ever dispatched successfully");
+  } finally {
+    stop();
+  }
+});
+
+test("#556 r6 integration: batch=2 where post 1's fetch throws and post 2 verifies (frontend continues its loop) ⇒ still 'failed', post 2 captured for the ledger but the run is not claimed", async () => {
+  const stop = keepAlive();
+  try {
+    let call = 0;
+    const server = makeServer(async () => {
+      call++;
+      if (call === 1) throw new Error("connection reset");
+      return jsonResponse(200, { prompt_id: "srv-2" });
+    });
+    const apiTarget = { fetchApi: server };
+    const prev = apiTarget.fetchApi;
+    const app = makeFrontend({ shape: "shim", apiTarget });
+    app.queuePrompt = async (number, batch, arg) => {
+      for (let i = 0; i < batch; i++) {
+        const body = frontendBody({ output: OUR_OUTPUT, number, targets: ["14"] });
+        app.posted.push(body);
+        try {
+          await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+        } catch { /* generic failure: the frontend CONTINUES its batch loop */ }
+      }
+      return true;
+    };
+    const ids = [];
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 2, toNodeId: 14,
+      onPromptId: (p) => ids.push(p),
+    });
+    assert.equal(result.outcome, "failed", "the first post's failure terminates the run truthfully");
+    assert.match(result.error, /connection reset/);
+    assert.match(result.error, /0 of 2/);
+    assert.notEqual(result.outcome, "dispatched");
+    assert.deepEqual(ids, ["srv-2"], "post 2's prompt_id is ledger-captured (it IS queued) but the run is not reported as queued");
+    assert.equal(server.calls.length, 2);
+    assert.notEqual(apiTarget.fetchApi, prev, "batch not fully accounted ⇒ sentinel stays");
   } finally {
     stop();
   }
