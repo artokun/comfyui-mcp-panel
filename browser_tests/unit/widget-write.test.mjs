@@ -58,6 +58,38 @@ test("#347: clearing to '' does NOT weaken combo/numeric strictness (#240)", () 
   assert.throws(() => coerceWidgetValue(num, ""), /not a number/);
 });
 
+test("#524: exact case wins when two widgets differ only by case", () => {
+  const backgroundToggle = { name: "Background", type: "BOOLEAN", value: false };
+  const backgroundMode = { name: "background", type: "COMBO", options: { values: ["Alpha", "Color"] }, value: "Alpha" };
+  const node = { id: 26, type: "ClothesSegment", widgets: [backgroundToggle, backgroundMode] };
+
+  const set = applyWidgetWrite(node, "background", "Color", HOOKS);
+
+  assert.equal(set.widget, "background");
+  assert.equal(backgroundMode.value, "Color");
+  assert.equal(backgroundToggle.value, false, "must not write the first case-insensitive match");
+});
+
+test("#524: ambiguous case-insensitive widget name refuses before mutation", () => {
+  const backgroundToggle = { name: "Background", type: "BOOLEAN", value: false };
+  const backgroundMode = { name: "background", type: "COMBO", options: { values: ["Alpha", "Color"] }, value: "Alpha" };
+  const node = { id: 26, type: "ClothesSegment", widgets: [backgroundToggle, backgroundMode] };
+
+  assert.throws(
+    () => applyWidgetWrite(node, "BACKGROUND", "Color", HOOKS),
+    /case-insensitively.*Background, background.*exact widget name/i,
+  );
+  assert.equal(backgroundToggle.value, false);
+  assert.equal(backgroundMode.value, "Alpha");
+});
+
+test("#524: a unique case-insensitive widget name remains supported", () => {
+  const node = { id: 27, type: "Any", widgets: [{ name: "Prompt", type: "STRING", value: "old" }] };
+  const set = applyWidgetWrite(node, "prompt", "new", HOOKS);
+  assert.equal(set.widget, "Prompt");
+  assert.equal(node.widgets[0].value, "new");
+});
+
 // ---- #179: rgthree Power Lora Loader composite widget ----------------------
 
 test("#179: a composite lora_N widget is detected by its object value", () => {
