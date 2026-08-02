@@ -453,7 +453,7 @@ test("#442 codex R7: a tab that arrived DIRTY is never re-baselined and never re
   assert.ok(wasDirtyAt < openAt, "…BEFORE any await, since it cannot be recovered afterwards");
   assert.match(
     body,
-    /if \(!wasDirty && ownsWorkflowReloadGuard\(reloadGuardToken\)\) \{[\s\S]{0,80}?await clearSpuriousOpenModified\(target, \{/,
+    /if \(!wasDirty && ownsWorkflowReloadGuard\(reloadGuardToken\)\) \{[\s\S]{0,400}?await clearSpuriousOpenModified\(target, \{/,
     "a genuinely dirty tab must never be re-baselined, nor one we no longer hold exclusively",
   );
   // BOTH reload gates must require the pre-open snapshot to be clean too.
@@ -496,6 +496,117 @@ test("#442 codex R9: the switch+reload holds a critical section that REFUSES con
   assert.match(refusal, /was NOT applied — nothing changed\. Retry in a moment\./);
   // A stuck guard must age out rather than wedge the tab forever.
   assert.match(src, /Date\.now\(\) - workflowReloadGuard\.since > WORKFLOW_RELOAD_GUARD_MAX_MS/);
+});
+
+// The reload-guard block (let/const + the five functions) lives inline in
+// comfyui-mcp-panel.js, so — per the "real panel source" extraction convention of
+// graph-resize-node.test.mjs — it is regexed out of the file and evaluated with a FAKE
+// Date injected, letting the tests drive the ACTUAL shipped logic across the 30s ceiling.
+const reloadGuardMatch = readFileSync(PANEL_JS, "utf8").match(
+  /let workflowReloadGuard = null;[\s\S]*?function activeWorkflowReloadGuard\(\) \{[\s\S]*?\n\}/,
+);
+assert.ok(reloadGuardMatch, "could not locate the workflow reload guard block in panel source");
+
+/** Build a fresh guard section from the REAL panel source, with time driven by `now.t`. */
+function realReloadGuard(now) {
+  const factory = new Function(
+    "Date",
+    `${reloadGuardMatch[0]}\nreturn { acquireWorkflowReloadGuard, releaseWorkflowReloadGuard, ` +
+      `beginWorkflowReloadStep, endWorkflowReloadStep, ownsWorkflowReloadGuard, activeWorkflowReloadGuard };`,
+  );
+  return factory({ now: () => now.t });
+}
+
+test("#442 DATA-LOSS: the guard CANNOT expire while a reload is genuinely in flight", () => {
+  const now = { t: 1_000_000 };
+  const g = realReloadGuard(now);
+  const token = g.acquireWorkflowReloadGuard("wf:a.json");
+  // The reload's loadGraphData await starts. Pre-fix, the 30s defensive ceiling fired
+  // DURING this await: activeWorkflowReloadGuard() returned null, the dispatcher's fence
+  // dropped, a graph command ran and was ACKNOWLEDGED — and the late-completing load then
+  // overwrote that edit. The guard is now tied to the step's settle instead.
+  assert.equal(g.beginWorkflowReloadStep(token), true, "the owner may mark a step in flight");
+  now.t += 31_000; // past WORKFLOW_RELOAD_GUARD_MAX_MS, load still awaiting
+  const held = g.activeWorkflowReloadGuard();
+  assert.ok(held, "a step in flight must SUSPEND the ageing ceiling — the fence stays up");
+  assert.equal(held.token, token, "…for the SAME holder");
+  assert.equal(
+    g.ownsWorkflowReloadGuard(token),
+    true,
+    "the reload's post-await ownership re-check still passes, so it may re-baseline",
+  );
+  // The load settles; the idle ceiling runs from the SETTLE, not from acquire, so a long
+  // multi-step section cannot expire in the synchronous gap between two of its steps.
+  g.endWorkflowReloadStep(token);
+  now.t += 29_000;
+  assert.ok(g.activeWorkflowReloadGuard(), "idle time is measured from the last step's settle");
+  // …and the fence comes down ONLY through the open's own finally.
+  g.releaseWorkflowReloadGuard(token);
+  assert.equal(g.activeWorkflowReloadGuard(), null, "released by its owner — commands may run again");
+});
+
+test("#442 DATA-LOSS: the defensive ceiling still ages out a guard stuck BETWEEN steps", () => {
+  const now = { t: 1_000_000 };
+  const g = realReloadGuard(now);
+  const token = g.acquireWorkflowReloadGuard("wf:a.json");
+  g.beginWorkflowReloadStep(token);
+  g.endWorkflowReloadStep(token);
+  // No step in flight and no settle for 30s+ — the holder must have VANISHED without its
+  // finally; age the guard out rather than wedge every command in the tab.
+  now.t += 31_000;
+  assert.equal(g.activeWorkflowReloadGuard(), null, "a guard idle past the ceiling still ages out");
+  assert.equal(g.ownsWorkflowReloadGuard(token), false, "an outlived holder's re-checks fail closed");
+  assert.equal(g.beginWorkflowReloadStep(token), false, "a non-owner must not start a step");
+  // Token scoping is intact: the stale holder must not release a NEWER section.
+  const newer = g.acquireWorkflowReloadGuard("wf:b.json");
+  g.releaseWorkflowReloadGuard(token);
+  assert.equal(g.activeWorkflowReloadGuard()?.token, newer, "a stale holder cannot release the newer section");
+  // A balanced begin/finally-end never strands a pending hold.
+  assert.equal(g.beginWorkflowReloadStep(newer), true);
+  g.endWorkflowReloadStep(newer);
+  g.endWorkflowReloadStep(newer); // over-ending is a no-op, never negative
+  now.t += 31_000;
+  assert.equal(g.activeWorkflowReloadGuard(), null, "balanced begin/end leaves the idle ceiling working");
+});
+
+test("#442 DATA-LOSS: every mutating await of the section is held across its own await", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const body = handlerBody(src, "async workflow_open({");
+  const begins = (body.match(/beginWorkflowReloadStep\(reloadGuardToken\);/g) || []).length;
+  const ends = (body.match(/endWorkflowReloadStep\(reloadGuardToken\);/g) || []).length;
+  assert.ok(begins >= 4, `the switch, repaint, reload and re-baseline awaits must each be held (got ${begins})`);
+  assert.equal(begins, ends, "every held step needs its own end (balanced via finally)");
+  // THE finding's case — the destructive disk reload: begin before the await, end in a
+  // finally after it, so neither a slow load nor a throwing one can drop/strand the fence.
+  const loadAt = body.indexOf("await app.loadGraphData(diskGraph");
+  assert.notEqual(loadAt, -1);
+  const beginAt = body.lastIndexOf("beginWorkflowReloadStep(reloadGuardToken);", loadAt);
+  const endAt = body.indexOf("endWorkflowReloadStep(reloadGuardToken);", loadAt);
+  assert.ok(beginAt !== -1 && beginAt < loadAt, "the reload await must start INSIDE a held step");
+  assert.ok(loadAt < endAt, "…and the step must end only AFTER the load settles");
+  assert.match(
+    body.slice(loadAt, endAt + 60),
+    /\} finally \{\s*endWorkflowReloadStep\(reloadGuardToken\);\s*\}/,
+    "the step must end in a finally, so a throwing load cannot strand the fence",
+  );
+  // The repaint load has the same clobber shape (it overwrites the canvas with the tab's
+  // pre-edit buffer), so it must be held too.
+  const repaintAt = body.indexOf("await app.loadGraphData(JSON.parse(JSON.stringify(st))");
+  assert.notEqual(repaintAt, -1);
+  const repaintBegin = body.lastIndexOf("beginWorkflowReloadStep(reloadGuardToken);", repaintAt);
+  const repaintEnd = body.indexOf("endWorkflowReloadStep(reloadGuardToken);", repaintAt);
+  assert.ok(repaintBegin !== -1 && repaintBegin < repaintAt && repaintAt < repaintEnd, "the repaint await must be held too");
+  // The mechanism: expiry requires NO step in flight, and ending a step rearms the clock.
+  assert.match(
+    src,
+    /workflowReloadGuard\.pending === 0 &&[\s\S]{0,80}?Date\.now\(\) - workflowReloadGuard\.since > WORKFLOW_RELOAD_GUARD_MAX_MS/,
+    "the ageing ceiling must be suspended while any step is in flight",
+  );
+  assert.match(
+    src,
+    /workflowReloadGuard\.pending -= 1;[\s\S]{0,80}?workflowReloadGuard\.since = Date\.now\(\);/,
+    "ending a step must rearm the idle clock",
+  );
 });
 
 test("#442 codex P1: with NO reliable freeze available, the destructive reload is SKIPPED", () => {

@@ -338,25 +338,61 @@ const lostReplies = createLostReplyJournal();
 // overwritten by the load, or — worse — land during the tracker re-baseline and be marked
 // CLEAN, so the next out-of-band disk change silently discards it with no conflict shown.
 // While this guard is held, every graph/workflow executor is REFUSED with a retryable
-// error (nothing applied) rather than queued: refusing cannot reorder or double-apply, and
-// the window is a fraction of a second.
+// error (nothing applied) rather than queued: refusing cannot reorder or double-apply. The
+// window normally lasts a fraction of a second, but it lasts EXACTLY as long as the
+// switch/reload genuinely runs — see begin/endWorkflowReloadStep below.
 let workflowReloadGuard = null;
 let workflowReloadGuardSeq = 0;
 // Defensive ceiling: a guard can only ever be cleared by workflow_open's finally, so if
 // some pathological path ever failed to run it, an un-expiring guard would wedge every
-// command in the tab. Age it out instead.
+// command in the tab. Age it out instead — but ONLY while no step of the section is in
+// flight. The ceiling exists for a guard whose holder VANISHED; it must never cut a
+// genuinely-running step off (that expiry is precisely the DATA-LOSS window this guard
+// exists to close).
 const WORKFLOW_RELOAD_GUARD_MAX_MS = 30000;
 /** Take the section and return an OWNERSHIP TOKEN. Sections are token-scoped (codex): an
  *  expired-then-superseded holder must never release a NEWER holder's section, and a holder
  *  that has lost the section must not go on mutating as though it still had it. */
 function acquireWorkflowReloadGuard(key) {
   const token = ++workflowReloadGuardSeq;
-  workflowReloadGuard = { token, key, since: Date.now() };
+  workflowReloadGuard = { token, key, since: Date.now(), pending: 0 };
   return token;
 }
 /** Release ONLY if `token` still owns the section. */
 function releaseWorkflowReloadGuard(token) {
   if (workflowReloadGuard && workflowReloadGuard.token === token) workflowReloadGuard = null;
+}
+/** Mark one awaited step of the section (the tab switch, a loadGraphData, a tracker
+ *  re-baseline) as IN FLIGHT across its await. While any step is outstanding the guard
+ *  CANNOT age out (activeWorkflowReloadGuard below): expiring mid-await drops the fence,
+ *  a graph command then runs and is ACKNOWLEDGED, and the late-completing load overwrites
+ *  that acknowledged edit — the DATA-LOSS shape (codex). Tying the guard to the step's
+ *  settle means a slow load keeps refusing commands for as long as it genuinely runs. The
+ *  trade is deliberate: a load that NEVER settles wedges the tab with a loud, retryable
+ *  refusal (recoverable — reload the tab) instead of silently eating an edit the caller
+ *  was told succeeded (not recoverable). Returns false — and the caller must not start
+ *  the step — when `token` no longer owns the section. */
+function beginWorkflowReloadStep(token) {
+  const held = activeWorkflowReloadGuard();
+  if (!held || held.token !== token) return false;
+  held.pending += 1;
+  return true;
+}
+/** Counterpart of beginWorkflowReloadStep, called from the step's own finally so a
+ *  throwing step cannot leave the fence up forever. Also REARMS the ageing clock: between
+ *  steps the section runs synchronously (no command frame can interleave), so the idle
+ *  ceiling is measured from the last step's SETTLE — a section of many steps totalling
+ *  over WORKFLOW_RELOAD_GUARD_MAX_MS can never expire in the synchronous gap between two
+ *  of its own steps. */
+function endWorkflowReloadStep(token) {
+  if (
+    workflowReloadGuard &&
+    workflowReloadGuard.token === token &&
+    workflowReloadGuard.pending > 0
+  ) {
+    workflowReloadGuard.pending -= 1;
+    workflowReloadGuard.since = Date.now();
+  }
 }
 /** Does `token` still own the section? Re-checked after every await before any further
  *  mutation, so an operation that outlived its own section stops instead of racing the
@@ -365,10 +401,15 @@ function ownsWorkflowReloadGuard(token) {
   const held = activeWorkflowReloadGuard();
   return !!held && held.token === token;
 }
-/** The guard, or null when none is held (expiring a stuck one on the way). */
+/** The guard, or null when none is held (expiring a stuck one on the way). A guard with a
+ *  step in flight (pending > 0) is NEVER expired here — it is tied to that step's settle,
+ *  so the fence cannot drop while a switch/load is genuinely awaiting. */
 function activeWorkflowReloadGuard() {
   if (!workflowReloadGuard) return null;
-  if (Date.now() - workflowReloadGuard.since > WORKFLOW_RELOAD_GUARD_MAX_MS) {
+  if (
+    workflowReloadGuard.pending === 0 &&
+    Date.now() - workflowReloadGuard.since > WORKFLOW_RELOAD_GUARD_MAX_MS
+  ) {
     workflowReloadGuard = null;
     return null;
   }
@@ -7727,12 +7768,17 @@ const GRAPH_TOOL_EXECUTORS = {
       workflowTabId(target) || target.path || "the active workflow",
     );
     try {
+      // Hold the fence across the switch await itself: a slow switch must not let the
+      // guard age out mid-flight (see begin/endWorkflowReloadStep).
+      beginWorkflowReloadStep(reloadGuardToken);
       try {
         await s.openWorkflow(target);
       } catch (err) {
         // The native switch itself failed — nothing was applied. Recorded, then rethrown
         // through failOpen below (outside the freeze) so the negative is journaled.
         openFailed = err instanceof Error ? err : new Error(coerceMessageText(err));
+      } finally {
+        endWorkflowReloadStep(reloadGuardToken);
       }
       if (!openFailed) {
       // We deliberately do NOT auto-reload the canvas from disk here: switching to an
@@ -7769,6 +7815,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // captures members off the workflow-service alias `s` with an unanchored `s\.` pattern,
       // so `canvas.<member>` would be misread as a new workflow-SERVICE dependency. This is a
       // LiteGraph canvas flag, not a workflow-service member.
+        beginWorkflowReloadStep(reloadGuardToken);
         try {
           const st = target.changeTracker?.activeState;
           if (st && typeof app.loadGraphData === "function") {
@@ -7776,6 +7823,8 @@ const GRAPH_TOOL_EXECUTORS = {
           }
         } catch (err) {
           console.warn("[comfyui-mcp-panel] workflow_open repaint failed:", err?.message ?? err);
+        } finally {
+          endWorkflowReloadStep(reloadGuardToken);
         }
         // Opening alone must not dirty the tab (a spurious post-load change-tracker
         // diff otherwise flips it to modified:true and blocks an unforced close).
@@ -7791,9 +7840,16 @@ const GRAPH_TOOL_EXECUTORS = {
         // still held exclusivity. Leaving the tab spuriously "modified" is cosmetic; racing
         // a concurrent edit is not.
         if (!wasDirty && ownsWorkflowReloadGuard(reloadGuardToken)) {
-          await clearSpuriousOpenModified(target, {
-            stillOwns: () => ownsWorkflowReloadGuard(reloadGuardToken),
-          });
+          // The helper awaits a frame before re-baselining — hold the fence across that
+          // frame too, so the guard cannot age out inside it and let a command through.
+          beginWorkflowReloadStep(reloadGuardToken);
+          try {
+            await clearSpuriousOpenModified(target, {
+              stillOwns: () => ownsWorkflowReloadGuard(reloadGuardToken),
+            });
+          } finally {
+            endWorkflowReloadStep(reloadGuardToken);
+          }
         }
         // #433: an explicit open authoritatively re-points `active` — record it against
         // the epoch we STARTED on, but only if no reconnect intervened during the async
@@ -7889,7 +7945,20 @@ const GRAPH_TOOL_EXECUTORS = {
           // command would be refused as a "workflow instance mismatch" against the session
           // that asked for the open. The flag keeps the LIVE OBJECT's identity (the
           // non-forgeable source) and stamps it over whatever the file carried.
-          await app.loadGraphData(diskGraph, true, true, target, { __cmcpKeepInstance: true });
+          //
+          // HOLD THE SECTION ACROSS THE LOAD ITSELF (codex DATA-LOSS): this await is
+          // unbounded — a huge graph on a busy machine can take past the 30s defensive
+          // ceiling. Expiring here is exactly the reported window: the fence drops, a
+          // graph command runs and is ACKNOWLEDGED, and this late-completing load then
+          // overwrites that edit. With the step held the fence cannot drop mid-load, so
+          // no edit can be acknowledged after the reload started — and the ownership
+          // re-check below still guards the re-baseline against every other loss path.
+          beginWorkflowReloadStep(reloadGuardToken);
+          try {
+            await app.loadGraphData(diskGraph, true, true, target, { __cmcpKeepInstance: true });
+          } finally {
+            endWorkflowReloadStep(reloadGuardToken);
+          }
           // The reload HAPPENED — record that before anything else can fail. Understating a
           // completed destructive act would be its own lie.
           reloaded = true;
@@ -7905,9 +7974,14 @@ const GRAPH_TOOL_EXECUTORS = {
             // A programmatic load dirties the change tracker; clear that so the re-read does
             // not leave the tab looking edited (which would block an unforced close). Still
             // inside the freeze, and ownership-aware across its own frame.
-            await clearSpuriousOpenModified(target, {
-              stillOwns: () => ownsWorkflowReloadGuard(reloadGuardToken),
-            });
+            beginWorkflowReloadStep(reloadGuardToken);
+            try {
+              await clearSpuriousOpenModified(target, {
+                stillOwns: () => ownsWorkflowReloadGuard(reloadGuardToken),
+              });
+            } finally {
+              endWorkflowReloadStep(reloadGuardToken);
+            }
           } else {
             // Lost exclusivity while the load was in flight. The canvas IS the on-disk
             // version, but we must not re-baseline over whatever ran in the meantime.
