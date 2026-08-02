@@ -30,6 +30,7 @@ import {
   isNewWorkflowLoad,
   rawWorkflowObject,
   sameWorkflowObject,
+  shouldCarryIdentityAcrossSaveSwap,
   shouldForkEmbeddedUuidForLiveOwner,
   shouldForkEmbeddedWorkflowUuid,
   shouldForkInPlaceReload,
@@ -936,7 +937,7 @@ test("#349 P0 r3: a CREATION-minted tag is registered to the tab the load activa
   assert.equal(h.rootB.extra.comfyui_mcp.workflow_uuid, "creation-uuid-1", "the created tab's tag survives");
 });
 
-test("#557 r3 wiring: programmaticSave threads the pre-save identity across an in-place object swap", () => {
+test("#557 r3/r4 wiring: programmaticSave threads the pre-save identity across a PROVEN in-place object swap", () => {
   const src = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
   const start = src.indexOf("async function programmaticSave(name)");
   assert.notEqual(start, -1, "programmaticSave must exist");
@@ -948,8 +949,18 @@ test("#557 r3 wiring: programmaticSave threads the pre-save identity across an i
   );
   assert.match(
     body,
-    /shouldCarryIdentityAcrossSaveSwap\(\{ preWf: expectWf, postWf: postSwapWf, savedAs: outcome\.saved_as \}\)/,
-    "the carry must be gated by the pure continuous-lifetime rule (never a Save-As copy)",
+    /preWfStillOpen =\s*!Array\.isArray\(openList\) \|\| openList\.some\(\(w\) => sameWorkflowObject\(w, expectWf\)\)/,
+    "a predecessor still present in the open tabs (a mid-save switch) must be detected",
+  );
+  assert.match(
+    body,
+    /successorCarriesPreUuid =\s*successorState\?\.extra\?\.\[WORKFLOW_META_NAMESPACE\]\?\.\[WORKFLOW_UUID_FIELD\] === preSwapUuid/,
+    "the successor must prove continuity via the pre-save uuid in its serialized state",
+  );
+  assert.match(
+    body,
+    /shouldCarryIdentityAcrossSaveSwap\(\{\s*preWf: expectWf,\s*postWf: postSwapWf,\s*savedAs: outcome\.saved_as,\s*preWfStillOpen,\s*successorCarriesPreUuid,\s*successorInPreSlot,\s*\}\)/,
+    "the carry must pass ALL continuity evidence to the pure rule (never a Save-As copy, never a mid-save switch)",
   );
   assert.match(
     body,
@@ -961,6 +972,152 @@ test("#557 r3 wiring: programmaticSave threads the pre-save identity across an i
     /rememberWorkflowUuidOwner\(preSwapUuid, postSwapWf\)/,
     "the successor must be registered as the pre-save uuid's owner",
   );
+});
+
+// Drives the REAL programmaticSave source with a fake saveActiveWorkflow that
+// switches the active workflow mid-await — the r4 P0 shape (user switch or
+// reconnect during the save). onSave performs the mid-save mutation of svc.
+function buildProgrammaticSaveHarness({ onSave } = {}) {
+  const src = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
+  const start = src.indexOf("async function programmaticSave(");
+  const end = src.indexOf("async function reconcileSavedWorkflowCopy(", start);
+  assert.notEqual(start, -1, "programmaticSave must exist");
+  assert.notEqual(end, -1, "programmaticSave boundary must exist");
+  const saveSource = src.slice(start, end);
+  const ownsTagSource = panelFunctionSource(src, "workflowOwnsRootUuidTag", "assertGraphBoundToActiveWorkflow");
+  const A = { isPersisted: true, path: "workflows/a.json", changeTracker: { activeState: state(27) } };
+  const B = {
+    isPersisted: true,
+    path: "workflows/b.json",
+    isModified: true, // a DISTINCT dirty tab — the r4 switch target
+    changeTracker: { activeState: state(5) },
+  };
+  const svc = { activeWorkflow: A, openWorkflows: [A, B] };
+  const objectUuids = new WeakMap();
+  const owners = new Map();
+  const identityOf = (wf) =>
+    objectUuids.get(wf) ?? (wf === A ? "uuid-A" : wf === B ? "uuid-B" : null);
+  const ownsTag = new Function(
+    "workflowStableUuid",
+    "rawWorkflowObject",
+    "sameWorkflowObject",
+    "workflowUuidOwner",
+    "WORKFLOW_META_NAMESPACE",
+    "WORKFLOW_UUID_FIELD",
+    `${ownsTagSource}\nreturn workflowOwnsRootUuidTag;`,
+  )(identityOf, rawWorkflowObject, sameWorkflowObject, (id) => owners.get(id) ?? null, "comfyui_mcp", "workflow_uuid");
+  const save = new Function(
+    "app",
+    "saveActiveWorkflow",
+    "autoWorkflowName",
+    "workflowExistsOnDisk",
+    "workflowDiskBytes",
+    "reconcileSavedWorkflowCopy",
+    "describeSaveOutcome",
+    "classifyOriginalOnDisk",
+    "normalizePath",
+    "getWorkflowTitle",
+    "_workflowObjectUuids",
+    "workflowStableUuid",
+    "rememberWorkflowUuidOwner",
+    "sameWorkflowObject",
+    "shouldCarryIdentityAcrossSaveSwap",
+    "WORKFLOW_META_NAMESPACE",
+    "WORKFLOW_UUID_FIELD",
+    `${saveSource}\nreturn programmaticSave;`,
+  )(
+    { extensionManager: { workflow: svc } },
+    async (svcArg, _name, opts) => {
+      onSave?.({ svc: svcArg, A, B }); // the mid-await switch / swap / reconnect
+      opts.details.mode = "in-place";
+      return "a.json";
+    },
+    () => "Untitled",
+    async () => true,
+    async () => null,
+    async () => "unknown",
+    () => ({ saved_as: false }),
+    () => "unknown",
+    (p) => p,
+    () => "title",
+    objectUuids,
+    identityOf,
+    (id, owner) => owners.set(id, owner),
+    sameWorkflowObject,
+    shouldCarryIdentityAcrossSaveSwap,
+    "comfyui_mcp",
+    "workflow_uuid",
+  );
+  // The #349 fence input, computed the same way the guard does: does any OTHER
+  // live open tab claim this root tag?
+  const foreignClaimOn = (rootUuid) =>
+    svc.openWorkflows.some((w) => !sameWorkflowObject(w, svc.activeWorkflow) && ownsTag(w, rootUuid));
+  return { save, svc, A, B, objectUuids, owners, foreignClaimOn };
+}
+
+test("#349 r4 P0: a tab SWITCH during the awaited save aborts the identity carry — B is never seeded with A's uuid", async () => {
+  const { save, svc, A, B, objectUuids, owners, foreignClaimOn } = buildProgrammaticSaveHarness({
+    onSave: ({ svc }) => {
+      svc.activeWorkflow = B; // user switched to a distinct dirty B while the save awaited
+    },
+  });
+  await save();
+  assert.equal(objectUuids.get(B), undefined, "B must NOT be seeded with A's uuid");
+  assert.notEqual(owners.get("uuid-A"), B, "A's uuid must not be re-registered to B");
+  assert.equal(
+    foreignClaimOn("uuid-A"),
+    true,
+    "A is still open and claims its tag — the #349 fence input holds while B is active",
+  );
+  assert.equal(
+    resolveGraphRootUuidRebind({
+      rootGraph: { extra: { comfyui_mcp: { workflow_uuid: "uuid-A" } } },
+      activeWorkflowUuid: "uuid-B",
+      rootTagOwnedByForeignOpenWorkflow: foreignClaimOn("uuid-A"),
+    }),
+    "conflict",
+    "with the carry aborted, an A-tagged root stays foreign to B-active — writes are fenced",
+  );
+});
+
+test("#349 r4 P0: a RECONNECT-shaped mid-save switch (tab list rebuilt with new objects) aborts the carry", async () => {
+  const aRebuilt = {
+    isPersisted: true,
+    path: "workflows/a.json", // A's file, NEW object after a reconnect — NOT A
+    changeTracker: { activeState: state(27) },
+  };
+  const { save, svc, B, objectUuids, owners } = buildProgrammaticSaveHarness({
+    onSave: ({ svc }) => {
+      svc.openWorkflows = [aRebuilt, B]; // reconnect rebuilt the tab list
+      svc.activeWorkflow = B;
+    },
+  });
+  await save();
+  assert.equal(objectUuids.get(B), undefined, "B must NOT be seeded with A's uuid");
+  assert.notEqual(owners.get("uuid-A"), B, "A's uuid must not be re-registered to B");
+});
+
+test("#557 r4 control: a GENUINE save-swap successor still carries the pre-save identity", async () => {
+  const successor = {
+    isPersisted: true,
+    path: "workflows/a.json", // A's successor: same file, NEW object, predecessor GONE
+    changeTracker: {
+      activeState: { ...state(27), extra: { comfyui_mcp: { workflow_uuid: "uuid-A" } } },
+    },
+  };
+  const { save, svc, objectUuids, owners } = buildProgrammaticSaveHarness({
+    onSave: ({ svc }) => {
+      svc.openWorkflows = [successor]; // a genuine swap REMOVES the predecessor
+      svc.activeWorkflow = successor;
+    },
+  });
+  await save();
+  assert.equal(
+    objectUuids.get(successor),
+    "uuid-A",
+    "the proven successor is seeded with the pre-save uuid (#557)",
+  );
+  assert.equal(owners.get("uuid-A"), successor, "the successor becomes the uuid's registered owner");
 });
 
 // ── #557: save replaces the active workflow object — identity must follow ────

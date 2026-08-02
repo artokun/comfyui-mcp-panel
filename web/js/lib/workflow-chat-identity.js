@@ -50,18 +50,37 @@ export function sameWorkflowObject(a, b) {
   return Boolean(ctA) && ctA === ctB;
 }
 
-/** #557 r3 — should the pre-save identity be carried onto the post-save active
+/** #557 r3/r4 — should the pre-save identity be carried onto the post-save active
  *  object? True ONLY for a continuous-lifetime replacement: an in-place or
  *  first save (NOT a Save-As copy — that starts a new workflow) that swapped
  *  the active ComfyWorkflow object. The swap is provable ONLY at the
  *  replacement event, where the predecessor and successor objects are both
  *  known; static path equality cannot decide it — a closed→reopened object at
  *  the same path is a NEW workflow (r3 P0), while a swapped successor is the
- *  same tab. A proxy/raw form of the SAME object is no swap at all. */
-export function shouldCarryIdentityAcrossSaveSwap({ preWf, postWf, savedAs = false } = {}) {
+ *  same tab. A proxy/raw form of the SAME object is no swap at all.
+ *
+ *  CONTINUITY (r4 P0): "whatever is active after the awaited save" is not
+ *  enough — a user/reconnect tab switch DURING the await lands on a DISTINCT
+ *  workflow, and seeding it with the pre-save uuid would align that foreign tab
+ *  with the old root tag, bypassing the #349 wrong-canvas fence. The carry
+ *  therefore also requires the predecessor to be GONE from the open tabs (a
+ *  genuine swap removes it; a switch keeps it open) AND the successor to show
+ *  it continues the same tab lifetime: its serialized state carries the
+ *  pre-save uuid, or it occupies the predecessor's tab slot. Unknown
+ *  predecessor state defaults to still-open (fail-safe: no carry). */
+export function shouldCarryIdentityAcrossSaveSwap({
+  preWf,
+  postWf,
+  savedAs = false,
+  preWfStillOpen = true,
+  successorCarriesPreUuid = false,
+  successorInPreSlot = false,
+} = {}) {
   if (savedAs) return false;
   if (!preWf || !postWf || typeof postWf !== "object") return false;
-  return preWf !== postWf && !sameWorkflowObject(preWf, postWf);
+  if (preWf === postWf || sameWorkflowObject(preWf, postWf)) return false;
+  if (preWfStillOpen) return false;
+  return successorCarriesPreUuid || successorInPreSlot;
 }
 
 /** Return true when an embedded UUID belongs to a different workflow file.

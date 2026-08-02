@@ -258,20 +258,45 @@ test('sameWorkflowObject r3: same-path distinct objects are NOT one identity (cl
   ), false)
 })
 
-test('#557 r3: identity carries across a save object-swap ONLY as a continuous-lifetime replacement', () => {
+test('#557 r3/r4: identity carries across a save object-swap ONLY with positive continuity', () => {
   const pre = { isPersisted: true, path: 'workflows/x.json', changeTracker: {} }
   const successor = { isPersisted: true, path: 'workflows/x.json', changeTracker: {} }
-  // In-place / first save that swapped the active object → carry.
-  assert.equal(shouldCarryIdentityAcrossSaveSwap({ preWf: pre, postWf: successor, savedAs: false }), true)
+  // In-place / first save that swapped the object, predecessor GONE from the open
+  // tabs, successor showing continuity (carries the pre-save uuid, or occupies
+  // the predecessor's tab slot) → carry.
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: false, successorCarriesPreUuid: true
+  }), true)
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: false, successorInPreSlot: true
+  }), true)
+  // r4 P0: the predecessor is STILL OPEN — a user/reconnect tab switch during the
+  // awaited save lands on a DISTINCT workflow; seeding it with A's uuid would
+  // bypass the #349 wrong-canvas fence → never carry.
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: true, successorCarriesPreUuid: true
+  }), false)
+  // No continuity evidence → never carry (an unknown predecessor state defaults
+  // to still-open, fail-safe).
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({ preWf: pre, postWf: successor, savedAs: false }), false)
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: false
+  }), false)
   // A Save-As COPY starts a new workflow → never carry (#226/#570).
-  assert.equal(shouldCarryIdentityAcrossSaveSwap({ preWf: pre, postWf: successor, savedAs: true }), false)
-  // Same object (no swap) → nothing to carry.
-  assert.equal(shouldCarryIdentityAcrossSaveSwap({ preWf: pre, postWf: pre, savedAs: false }), false)
-  // A proxy/raw form of the SAME object is no swap either.
-  assert.equal(shouldCarryIdentityAcrossSaveSwap({ preWf: pre, postWf: { __v_raw: pre }, savedAs: false }), false)
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: pre, postWf: successor, savedAs: true, preWfStillOpen: false, successorCarriesPreUuid: true
+  }), false)
+  // Same object (no swap) / a proxy form of the same object → nothing to carry.
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: pre, postWf: pre, savedAs: false, preWfStillOpen: false, successorCarriesPreUuid: true
+  }), false)
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: pre, postWf: { __v_raw: pre }, savedAs: false, preWfStillOpen: false, successorCarriesPreUuid: true
+  }), false)
   // Missing sides → no carry.
-  assert.equal(shouldCarryIdentityAcrossSaveSwap({ preWf: null, postWf: successor, savedAs: false }), false)
-  assert.equal(shouldCarryIdentityAcrossSaveSwap({ preWf: pre, postWf: null, savedAs: false }), false)
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: null, postWf: successor, savedAs: false, preWfStillOpen: false, successorCarriesPreUuid: true
+  }), false)
   assert.equal(shouldCarryIdentityAcrossSaveSwap(), false)
 })
 

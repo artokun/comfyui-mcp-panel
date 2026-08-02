@@ -3260,6 +3260,11 @@ async function programmaticSave(name) {
   // closed→reopened object at the same path is a NEW workflow (r3 P0), while a
   // swapped successor is the same continuous tab and must keep its identity.
   const preSwapUuid = expectWf ? _workflowObjectUuids.get(expectWf) || workflowStableUuid(expectWf) : null;
+  // The predecessor's tab slot BEFORE the save — half of the continuity proof
+  // below (a genuine swap lands the successor in the same slot).
+  const preSwapSlotIndex = Array.isArray(svc?.openWorkflows)
+    ? svc.openWorkflows.findIndex((w) => sameWorkflowObject(w, expectWf))
+    : -1;
   // Capture POSITIVE pre-save evidence of the source file's existence: a confirmed 200
   // is the ONLY basis on which a post-save 404 may be treated as a real move/deletion
   // of a persisted original. Without it, a source that 404s afterward simply never
@@ -3288,17 +3293,38 @@ async function programmaticSave(name) {
     expect: expectWf, // #330: refuse if the user switched tabs during our pre-save HEAD
   });
   const outcome = describeSaveOutcome(details);
-  // #557 r3 — thread the identity across the swap for an in-place/first save
-  // (never a Save-As copy, which is a NEW workflow): seed the successor object
-  // with the pre-save uuid so the desync guard and the command fence keep
-  // agreeing with the root tag without waiting for the lazy resolver path.
+  // #557 r3/r4 — thread the identity across the swap ONLY with positive
+  // CONTINUITY, verified at the seed point (postWf is read from the service
+  // HERE, after the awaited save): the predecessor must be GONE from the open
+  // tabs — a user/reconnect tab switch during the await keeps it open and must
+  // abort the carry entirely, or a distinct foreign tab gets seeded with A's
+  // uuid and the #349 wrong-canvas fence aligns on the wrong identity — and
+  // the successor must show it continues the same tab lifetime (its
+  // serialized state carries the pre-save uuid, or it occupies the
+  // predecessor's slot).
   const postSwapWf = svc?.activeWorkflow;
-  if (
-    preSwapUuid &&
-    shouldCarryIdentityAcrossSaveSwap({ preWf: expectWf, postWf: postSwapWf, savedAs: outcome.saved_as })
-  ) {
-    _workflowObjectUuids.set(postSwapWf, preSwapUuid);
-    rememberWorkflowUuidOwner(preSwapUuid, postSwapWf);
+  if (preSwapUuid) {
+    const openList = svc?.openWorkflows;
+    const preWfStillOpen =
+      !Array.isArray(openList) || openList.some((w) => sameWorkflowObject(w, expectWf));
+    const successorState = postSwapWf?.changeTracker?.activeState ?? postSwapWf?.activeState;
+    const successorCarriesPreUuid =
+      successorState?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD] === preSwapUuid;
+    const successorInPreSlot =
+      Array.isArray(openList) && preSwapSlotIndex >= 0 && sameWorkflowObject(openList[preSwapSlotIndex], postSwapWf);
+    if (
+      shouldCarryIdentityAcrossSaveSwap({
+        preWf: expectWf,
+        postWf: postSwapWf,
+        savedAs: outcome.saved_as,
+        preWfStillOpen,
+        successorCarriesPreUuid,
+        successorInPreSlot,
+      })
+    ) {
+      _workflowObjectUuids.set(postSwapWf, preSwapUuid);
+      rememberWorkflowUuidOwner(preSwapUuid, postSwapWf);
+    }
   }
   // INDEPENDENT post-save verification (a second backstop, at the tool layer) for a
   // Save-As COPY: attest whether the REAL source file is still on disk. This reports
