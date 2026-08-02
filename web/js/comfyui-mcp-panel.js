@@ -138,6 +138,11 @@ import {
 } from "./lib/subgraph-scope.js";
 import { runSetWidget } from "./lib/set-widget.js";
 import {
+  splitInputAssetRef,
+  filterServerConfirmedInputSubfolderCandidates,
+  inputPathsUseWindowsSeparators,
+} from "./lib/input-asset.js";
+import {
   drivenWidgetsFor,
   drivenTag,
   capSummaryWidgets,
@@ -213,7 +218,11 @@ import {
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
 import { createRunReconcileSweep } from "./lib/run-reconcile-sweep.js";
-import { activeWorkflowNodeCount, graphReadDesynced } from "./lib/graph-binding.js";
+import {
+  activeWorkflowNodeCount,
+  graphReadDesynced,
+  graphReadBindingChanged,
+} from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
 import { queueMembership, historyEntryFor } from "./lib/history-reconcile.js";
 import {
@@ -4362,6 +4371,68 @@ function collectMissingAssets(trustComboOverride) {
   return { models, media, nodeTypes, nodeCount, any: !!(models.length || media.length || nodeTypes.length || nodeCount) };
 }
 
+// ComfyUI resolves an input-asset value on the SERVER's platform (os.path.join):
+// a backslash is a path separator ONLY on Windows; on POSIX it is a literal
+// filename character. The /view probe must split the value exactly the way the
+// server will, or an existing `dir/file.png` falsely clears a genuinely missing
+// `dir\file.png` on a POSIX server (#513 review). The verdict comes from
+// /system_stats (`system.os` is Python's sys.platform on ComfyUI ≥ 0.4.0 —
+// "win32" on Windows — os.name "nt" on older servers) and is fetched once and
+// cached — the backend's OS cannot change within a page session. An UNKNOWN
+// platform fails CLOSED: POSIX semantics keep a backslash literal, so a value
+// is never re-interpreted into a path the server would not resolve
+// (over-report, never suppress — the same fail direction as the probe itself).
+let serverInputPathsAreWindows = null;
+async function inputAssetServerUsesWindowsPaths() {
+  if (serverInputPathsAreWindows !== null) return serverInputPathsAreWindows;
+  try {
+    if (typeof api?.fetchApi !== "function") return false;
+    const res = await api.fetchApi("/system_stats", {
+      cache: "no-store",
+      signal: AbortSignal.timeout(GET_ERRORS_REFRESH_TIMEOUT_MS),
+    });
+    const stats = res && res.ok ? await res.json() : null;
+    serverInputPathsAreWindows = inputPathsUseWindowsSeparators(stats);
+  } catch {
+    return false; // unknown platform → POSIX semantics (never suppress a genuine miss)
+  }
+  return serverInputPathsAreWindows;
+}
+
+/**
+ * `/object_info` cannot list LoadImage input files below the input root, although
+ * `/view?type=input` and LoadImage's validator can resolve them. Confirm only
+ * those nested missing-media candidates against the server before telling the
+ * agent that the user must re-upload an asset (#513). A failed probe deliberately
+ * leaves the candidate in place, preserving the prior fail-closed warning. The
+ * subfolder/filename split follows the SERVER's path semantics so a backslash is
+ * treated as a separator only where ComfyUI itself would treat it as one.
+ */
+async function filterServerConfirmedInputSubfolderMedia(media) {
+  const backslashIsSeparator = await inputAssetServerUsesWindowsPaths();
+  return filterServerConfirmedInputSubfolderCandidates(
+    media,
+    async (assetValue) => {
+      try {
+        if (typeof api?.fetchApi !== "function") return false;
+        const { subfolder, filename } = splitInputAssetRef(assetValue, { backslashIsSeparator });
+        if (!subfolder || !filename) return false;
+        const qs = new URLSearchParams({ filename, subfolder, type: "input" }).toString();
+        const res = await api.fetchApi(`/view?${qs}`, {
+          method: "GET",
+          cache: "no-store",
+          headers: { Range: "bytes=0-0" },
+          signal: AbortSignal.timeout(GET_ERRORS_REFRESH_TIMEOUT_MS),
+        });
+        return !!res && (res.ok || res.status === 206);
+      } catch {
+        return false;
+      }
+    },
+    { backslashIsSeparator },
+  );
+}
+
 /** True when EITHER missing-asset store holds a RAW candidate (isMissing !== false),
  *  BEFORE the live cross-check filters it. get_errors keys its authoritative refresh
  *  on THIS, not on collectMissingAssets() — the collector already trusts a possibly-
@@ -4410,7 +4481,7 @@ function withRefreshTimeout(promise) {
   ]);
 }
 
-function validationBanner() {
+async function validationBanner() {
   let nodeErrors = null;
   try {
     nodeErrors =
@@ -4426,6 +4497,38 @@ function validationBanner() {
   // canvas is already red. Bailing on those two alone left the agent blind
   // exactly when the user could see the problem — reported from the field.
   const missing = collectMissingAssets();
+  // The probe below awaits SERVER state while everything above was captured from
+  // the PRE-await workflow. A workflow-tab switch during the await would join A's
+  // missing/validation banner onto B's turn and send it into B's session (#513
+  // review). Same correlation as graph_get_errors: snapshot the active-workflow
+  // instance and the bound root graph before the await, re-read after, discard on
+  // a provable change. The banner is best-effort, so a mismatch skips it SILENTLY
+  // (no recoverable-error retry) — B's next turn recomputes from B's own state.
+  let preProbeRootGraph = null;
+  try {
+    preProbeRootGraph = getGraphCtx().rootGraph ?? null;
+  } catch {
+    preProbeRootGraph = null; // unresolvable now → correlate on the workflow alone
+  }
+  const preProbeWorkflow = activeWorkflowRef();
+  missing.media = await filterServerConfirmedInputSubfolderMedia(missing.media);
+  let postProbeRootGraph = null;
+  try {
+    postProbeRootGraph = getGraphCtx().rootGraph ?? null;
+  } catch {
+    postProbeRootGraph = null; // binding gone mid-read → treated as changed below
+  }
+  if (
+    graphReadBindingChanged({
+      beforeWorkflow: preProbeWorkflow,
+      afterWorkflow: activeWorkflowRef(),
+      beforeRootGraph: preProbeRootGraph,
+      afterRootGraph: postProbeRootGraph,
+    })
+  ) {
+    return "";
+  }
+  missing.any = !!(missing.models.length || missing.media.length || missing.nodeTypes.length || missing.nodeCount);
   // #415: the ⚠️ MISSING ASSETS block reads as authoritative at turn start, but the
   // stores are LOAD-TIME only and the live combo can drift BOTH ways — a since-uploaded
   // asset the banner still calls missing, OR a since-deleted asset a prior-confirmed
@@ -7194,6 +7297,39 @@ const GRAPH_TOOL_EXECUTORS = {
     //    LOAD, which is why they explain a red canvas long before anything is
     //    queued (see collectMissingAssets).
     const assets = collectMissingAssets(comboTrustedForQuery);
+    // The nested-input probe AWAITS the server AFTER the graph, node map and asset
+    // snapshot above are already captured — a workflow-tab switch in that window
+    // would join the PRE-switch workflow's missing-media verdicts onto the
+    // now-active one, returning workflow A's result while B is active (#513 review).
+    // Correlate on the active-workflow INSTANCE (the identity a rename/Save-As
+    // leaves intact) and the bound root graph across the await; on a provable
+    // change, discard the mixed read with a recoverable error so the caller retries
+    // against the now-current workflow — the same fail-loudly discipline as
+    // assertGraphBoundToActiveWorkflow above, never a cross-workflow result.
+    const preProbeWorkflow = activeWorkflowRef();
+    const preProbeRootGraph = rootGraph;
+    assets.media = await filterServerConfirmedInputSubfolderMedia(assets.media);
+    let postProbeRootGraph = null;
+    try {
+      postProbeRootGraph = getGraphCtx().rootGraph ?? null;
+    } catch {
+      postProbeRootGraph = null; // binding gone mid-read → treated as changed below
+    }
+    if (
+      graphReadBindingChanged({
+        beforeWorkflow: preProbeWorkflow,
+        afterWorkflow: activeWorkflowRef(),
+        beforeRootGraph: preProbeRootGraph,
+        afterRootGraph: postProbeRootGraph,
+      })
+    ) {
+      throw new Error(
+        "The active workflow changed while panel_get_errors was verifying nested input media " +
+          "with the server, so this read's graph snapshot and asset verdicts now belong to " +
+          "DIFFERENT workflows. Retry panel_get_errors — it re-reads the now-active workflow.",
+      );
+    }
+    assets.any = !!(assets.models.length || assets.media.length || assets.nodeTypes.length || assets.nodeCount);
     const missingModels = assets.models.map((m) => ({ ...m, kind: "missing_model" }));
     const missingMedia = assets.media.map((m) => ({ ...m, kind: "missing_media" }));
     const missingNodeTypes = assets.nodeTypes;
@@ -19330,7 +19466,7 @@ function buildPanel() {
     // value_not_in_list, broken links) the instant they appear — the same data the
     // user sees in the frontend's error panel — so the agent isn't blind to a broken
     // graph until it independently re-runs. Conditional + deduped (event-driven).
-    const valBanner = validationBanner();
+    const valBanner = await validationBanner();
     if (valBanner) sendText = valBanner + sendText;
     // Track delivery: trackSend marks "Sending…", then the working ack flips it
     // to "✓ Seen" (or a timeout / closed socket flips it to "Not delivered").
