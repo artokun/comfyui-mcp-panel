@@ -252,6 +252,7 @@ import {
   graphRootMismatchesActiveWorkflow,
   graphRootWorkflowUuidMismatches,
   graphRootWorkflowUuidMatches,
+  graphCommandMayMutateWorkflow,
   graphReadBindingChanged,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
@@ -11115,11 +11116,16 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // separate app.graph. A stale nonempty app.graph can therefore pass the
             // UUID check and still edit a previous tab. Fence every graph command
             // against the active workflow's serialized root before its executor.
+            // A dirty root without its UUID is unsafe for a workflow mutation, but
+            // it is not proof that a read targets another workflow: ChangeTracker
+            // can lag ordinary unsaved canvas edits (#545).  Keep the strict
+            // positive-binding requirement for mutations only, so read tools can
+            // report the live graph and give the user a recovery path.
             if (msg.cmd.startsWith("graph_")) {
               const { graph, rootGraph } = getGraphCtx();
               assertGraphBoundToActiveWorkflow(graph, rootGraph, {
                 includeBaselineReadGuard: false,
-                requireDirtyMutationBinding: true,
+                requireDirtyMutationBinding: graphCommandMayMutateWorkflow(msg.cmd),
               });
             }
             // PINNED-TARGET GUARD (#349): a `workflow_path` on the command means the

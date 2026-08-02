@@ -21,6 +21,7 @@ import {
   graphRootMismatchesActiveWorkflow,
   graphRootWorkflowUuidMismatches,
   graphRootWorkflowUuidMatches,
+  graphCommandMayMutateWorkflow,
   graphReadBindingChanged,
 } from "../../web/js/lib/graph-binding.js";
 
@@ -460,6 +461,42 @@ test("#545 P1: an untagged stale root is refused for dirty mutations but a prove
   );
 });
 
+test("#545: read-only graph commands recover from an untagged dirty root, while workflow mutations remain fenced", () => {
+  const unbound = buildDirtyStaleRouteHarness({ rootUuid: null });
+  assert.equal(graphCommandMayMutateWorkflow("graph_outline"), false);
+  assert.equal(graphCommandMayMutateWorkflow("graph_query"), false);
+  assert.equal(graphCommandMayMutateWorkflow("graph_set_node_property"), true);
+  assert.equal(graphCommandMayMutateWorkflow("graph_future_command"), true, "unknown commands fail closed");
+
+  assert.doesNotThrow(
+    () => unbound.assertBound(unbound.rootB, unbound.rootB, {
+      includeBaselineReadGuard: false,
+      requireDirtyMutationBinding: graphCommandMayMutateWorkflow("graph_outline"),
+    }),
+    "a read must remain available when a dirty canvas lacks UUID metadata",
+  );
+  assert.throws(
+    () => unbound.assertBound(unbound.rootB, unbound.rootB, {
+      includeBaselineReadGuard: false,
+      requireDirtyMutationBinding: graphCommandMayMutateWorkflow("graph_set_node_property"),
+    }),
+    /NOT applied/,
+    "the same unproven dirty root must not accept a workflow mutation",
+  );
+});
+
+test("#545: a positively identified wrong root remains rejected even for a read", () => {
+  const stale = buildDirtyStaleRouteHarness({ rootUuid: "workflow-B" });
+  assert.throws(
+    () => stale.assertBound(stale.rootB, stale.rootB, {
+      includeBaselineReadGuard: false,
+      requireDirtyMutationBinding: graphCommandMayMutateWorkflow("graph_outline"),
+    }),
+    /NOT applied/,
+    "availability for an unproven dirty root must not turn a known wrong workflow into a read result",
+  );
+});
+
 test("#545 P1: command identity resolution cannot adopt a stale dirty root before the binding fence", () => {
   // This drives the actual panel resolver followed by the actual panel fence in
   // the same order bridge dispatch uses. It reproduces the P1: active dirty A
@@ -619,7 +656,7 @@ test("#513 review wiring: validationBanner fences its server probe against a mid
   );
 });
 
-test("#349 wiring: every graph command verifies LiteGraph is bound to the active workflow before execution", () => {
+test("#349 wiring: every graph command verifies LiteGraph is bound, with positive dirty binding limited to mutations", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const handlerStart = src.indexOf("const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];");
   assert.notEqual(handlerStart, -1, "bridge graph-command handler must exist");
@@ -627,8 +664,8 @@ test("#349 wiring: every graph command verifies LiteGraph is bound to the active
   assert.match(handler, /msg\.cmd\.startsWith\("graph_"\)/, "graph commands must have a root-binding fence");
   assert.match(
     handler,
-    /assertGraphBoundToActiveWorkflow\(graph, rootGraph, \{[\s\S]*requireDirtyMutationBinding: true[\s\S]*\}\)/,
-    "the fence must inspect the graph the executor will use",
+    /assertGraphBoundToActiveWorkflow\(graph, rootGraph, \{[\s\S]*requireDirtyMutationBinding: graphCommandMayMutateWorkflow\(msg\.cmd\)[\s\S]*\}\)/,
+    "the fence must inspect the executor graph and demand positive dirty binding only for mutations",
   );
 });
 

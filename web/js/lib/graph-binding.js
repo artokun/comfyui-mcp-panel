@@ -234,6 +234,38 @@ export function graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid } =
 }
 
 /**
+ * Whether a bridge graph command can change durable workflow state.
+ *
+ * A dirty workflow without a root UUID is not sufficiently proven for a graph
+ * mutation: ChangeTracker can lag the canvas, so a stale untagged root must
+ * stay fail-closed (#545 P1).  That proof requirement must not, however,
+ * prevent the read-only tools from inspecting the live canvas and recovering
+ * from a stale tracker snapshot.  In particular, an unsaved local edit may
+ * legitimately make the root differ from ChangeTracker until the next state
+ * capture.
+ *
+ * Keep the small read-only list explicit and default unknown/new graph commands
+ * to mutating.  Adding a graph tool therefore cannot accidentally weaken the
+ * wrong-workflow mutation fence.
+ */
+const READ_ONLY_GRAPH_COMMANDS = new Set([
+  "graph_serialize",
+  "graph_get_state",
+  "graph_view_selected",
+  "graph_view_nodes_in_viewport",
+  "graph_outline",
+  "graph_query",
+  "graph_find_nodes",
+  "graph_get_subgraph",
+  "graph_list_subgraphs",
+  "graph_screenshot",
+]);
+
+export function graphCommandMayMutateWorkflow(command) {
+  return !READ_ONLY_GRAPH_COMMANDS.has(command);
+}
+
+/**
  * True when the graph READ's binding changed across an AWAIT: the active-workflow
  * instance or the bound root-graph object captured before the await no longer
  * matches after it. Used to detect a workflow-tab SWITCH that interleaved with a
