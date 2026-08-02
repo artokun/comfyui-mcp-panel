@@ -915,11 +915,11 @@ test("#716 P1: service rebind during workflow_open omits the former target UUID"
   let currentService = { activeWorkflow: openedTarget };
   const replyUuid = new Function(
     "activeWorkflowRef",
-    "_workflowObjectUuids",
+    "workflowObjectUuid",
     `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => currentService.activeWorkflow,
-    workflowUuids,
+    (wf) => workflowUuids.get(wf),
   );
 
   assert.equal(replyUuid(openedTarget), "11111111-1111-4111-8111-111111111111", "the normal completed open reports its actual active tab");
@@ -951,11 +951,11 @@ test("#716 P1: service rebind during workflow_list reports only the current acti
   let currentService = { activeWorkflow: staleActive };
   const listActive = new Function(
     "activeWorkflowRef",
-    "_workflowObjectUuids",
+    "workflowObjectUuid",
     `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${listActiveSource}; return liveWorkflowListActive;`,
   )(
     () => currentService.activeWorkflow,
-    workflowUuids,
+    (wf) => workflowUuids.get(wf),
   );
 
   assert.equal(listActive().activeIdentity?.uuid, "11111111-1111-4111-8111-111111111111");
@@ -978,11 +978,11 @@ test("#716 P1: a malformed truthy active binding cannot mint reply identity", ()
   const workflowUuids = new WeakMap();
   const replyUuid = new Function(
     "activeWorkflowRef",
-    "_workflowObjectUuids",
+    "workflowObjectUuid",
     `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => malformedActive,
-    workflowUuids,
+    (wf) => workflowUuids.get(wf),
   );
 
   // Execute the actual shipped reply helper against a truthy but malformed
@@ -1002,11 +1002,11 @@ test("#716 P1: a temporary workflow UUID is never published as a durable refresh
   const workflowUuids = new WeakMap([[temporaryActive, "33333333-3333-4333-8333-333333333333"]]);
   const replyUuid = new Function(
     "activeWorkflowRef",
-    "_workflowObjectUuids",
+    "workflowObjectUuid",
     `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => temporaryActive,
-    workflowUuids,
+    (wf) => workflowUuids.get(wf),
   );
 
   // Even an existing object-map UUID is insufficient for a temporary tab:
@@ -1032,11 +1032,11 @@ test("#716 P1: existing mapped UUIDs still omit when noncanonical", () => {
   let active = invalidVersion;
   const replyUuid = new Function(
     "activeWorkflowRef",
-    "_workflowObjectUuids",
+    "workflowObjectUuid",
     `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => active,
-    workflowUuids,
+    (wf) => workflowUuids.get(wf),
   );
 
   for (const workflow of [invalidVersion, invalidVariant, uppercase]) {

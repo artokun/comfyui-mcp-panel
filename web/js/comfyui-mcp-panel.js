@@ -1245,6 +1245,36 @@ const _tempWorkflowInstanceIds = new WeakMap(); // wf object -> "tmp:<uuid>"
 const _priorTempWorkflowIds = new WeakMap();
 const _workflowObjectUuids = new WeakMap();
 const _workflowUuidOwners = new Map();
+
+// r11 P0 — every access to the per-object identity store keys on the RAW
+// workflow object. Service lists and reads hand out Vue proxies, and a WeakMap
+// keyed by whichever carrier arrives splits the store: a proxy-keyed write
+// would hide the raw-keyed established identity from the conflict vetoes (and
+// vice versa), and the resolver would mint over an established identity it
+// could not see. Never key by the arriving carrier.
+function workflowObjectUuid(wf) {
+  try {
+    return _workflowObjectUuids.get(rawWorkflowObject(wf));
+  } catch {
+    return undefined;
+  }
+}
+
+function setWorkflowObjectUuid(wf, uuid) {
+  try {
+    _workflowObjectUuids.set(rawWorkflowObject(wf), uuid);
+  } catch {
+    // Never let identity bookkeeping break the caller.
+  }
+}
+
+function deleteWorkflowObjectUuid(wf) {
+  try {
+    _workflowObjectUuids.delete(rawWorkflowObject(wf));
+  } catch {
+    // Never let identity bookkeeping break the caller.
+  }
+}
 const WORKFLOW_UUID_ALIASES_KEY = "comfyui-mcp.panel.workflowUuidAliases";
 const WORKFLOW_META_NAMESPACE = "comfyui_mcp";
 const WORKFLOW_UUID_FIELD = "workflow_uuid";
@@ -1430,9 +1460,9 @@ function installCreateBoundaryFork(appRef) {
           if (keepInstance && workflow && typeof workflow === "object") {
             // Authoritative identity = the live object's cached uuid (mint one only if this
             // object has never been seen). Stamp it over the incoming value; do NOT fork.
-            const cached = _workflowObjectUuids.get(workflow);
+            const cached = workflowObjectUuid(workflow);
             const authoritative = cached || crypto.randomUUID();
-            if (!cached) _workflowObjectUuids.set(workflow, authoritative);
+            if (!cached) setWorkflowObjectUuid(workflow, authoritative);
             // Record ownership too: every root tag must have a resolvable owner or
             // the desync guard's orphaned-tag rebind (#545/#557) cannot tell this
             // live tag apart from stale bookkeeping.
@@ -1447,10 +1477,10 @@ function installCreateBoundaryFork(appRef) {
           } else if (creation) {
             fork = true;
           } else if (!noFork && workflow && typeof workflow === "object") {
-            const cached = _workflowObjectUuids.get(workflow);
+            const cached = workflowObjectUuid(workflow);
             const incoming = graphData.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD];
             if (shouldForkInPlaceReload({ cachedUuid: cached, incomingUuid: incoming })) {
-              _workflowObjectUuids.delete(workflow); // content replaced in place → drop stale cache
+              deleteWorkflowObjectUuid(workflow); // content replaced in place → drop stale cache
               fork = true;
             } else if (!cached) {
               // The load call itself binds this serialized graph to `workflow`.
@@ -1478,7 +1508,7 @@ function installCreateBoundaryFork(appRef) {
               [WORKFLOW_UUID_FIELD]: freshUuid,
             };
             if (workflow && typeof workflow === "object") {
-              _workflowObjectUuids.set(workflow, freshUuid);
+              setWorkflowObjectUuid(workflow, freshUuid);
               rememberWorkflowUuidOwner(freshUuid, workflow);
             } else {
               // A creation passes no workflow object — the receiving tab only
@@ -1487,7 +1517,7 @@ function installCreateBoundaryFork(appRef) {
               ownerlessStampUuid = freshUuid;
             }
           } else if (cacheIncomingUuid) {
-            _workflowObjectUuids.set(workflow, cacheIncomingUuid);
+            setWorkflowObjectUuid(workflow, cacheIncomingUuid);
             rememberWorkflowUuidOwner(cacheIncomingUuid, workflow);
           }
         }
@@ -1534,9 +1564,9 @@ function installCreateBoundaryFork(appRef) {
             // guard's lineage check re-stamp a foreign root with this object's
             // identity — the r6 stale-lineage bypass via registration. Fail
             // closed: an established conflicting identity vetoes registration.
-            const established = _workflowObjectUuids.get(active);
+            const established = workflowObjectUuid(active);
             if (established && established !== stampUuid) return;
-            if (!established) _workflowObjectUuids.set(active, stampUuid);
+            if (!established) setWorkflowObjectUuid(active, stampUuid);
             rememberWorkflowUuidOwner(stampUuid, active);
           } catch {
             // Identity bookkeeping must never break a graph load.
@@ -1571,7 +1601,10 @@ function workflowUuidOwner(id) {
 }
 
 function rememberWorkflowUuidOwner(id, owner) {
-  _workflowUuidOwners.set(id, typeof WeakRef === "function" ? new WeakRef(owner) : owner);
+  // Owner records key on the RAW object too (r11): later sameWorkflowObject
+  // comparisons unwrap, but the store stays canonical.
+  const rawOwner = rawWorkflowObject(owner) ?? owner;
+  _workflowUuidOwners.set(id, typeof WeakRef === "function" ? new WeakRef(rawOwner) : rawOwner);
   // WeakRef is unavailable only on older embedded browsers. Keep that fallback
   // bounded rather than retaining every workflow object for the life of the page.
   if (typeof WeakRef !== "function" && _workflowUuidOwners.size > 64) {
@@ -1590,7 +1623,7 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
   const identityObject = wf || app?.graph;
   if (!identityObject || typeof identityObject !== "object") return getTabId();
   const path = savedWorkflowPath(wf);
-  const objectUuid = _workflowObjectUuids.get(identityObject);
+  const objectUuid = workflowObjectUuid(identityObject);
 
   // #570 P0/P1 — UNSAVED workflow: the per-instance identity is the in-session objectUuid
   // (the LIVE-object WeakMap — a copy/import does NOT share it), else the EMBEDDED graph.extra
@@ -1622,7 +1655,7 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
       embeddedId,
       forkActive: _loadGraphDataForkInstalled,
     });
-    _workflowObjectUuids.set(identityObject, id);
+    setWorkflowObjectUuid(identityObject, id);
     rememberWorkflowUuidOwner(id, identityObject);
     if (embeddedId !== id) {
       // Persist the identity into extra (so a reload of the SAME content keeps it, AND a later
@@ -1711,7 +1744,7 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
     id = pathAlias && pathAlias !== embedded ? pathAlias : crypto.randomUUID();
   }
 
-  _workflowObjectUuids.set(identityObject, id);
+  setWorkflowObjectUuid(identityObject, id);
   rememberWorkflowUuidOwner(id, identityObject);
   const aliasMutations = [];
   if (objectUuid && path) {
@@ -1823,7 +1856,7 @@ function isCanonicalWorkflowInstanceUuid(value) {
 // to publish as a command-fence refresh source.
 function establishedWorkflowReplyIdentity(wf) {
   if (!wf || typeof wf !== "object") return null;
-  const uuid = _workflowObjectUuids.get(wf);
+  const uuid = workflowObjectUuid(wf);
   if (!isCanonicalWorkflowInstanceUuid(uuid)) return null;
   const savedPath = savedWorkflowPath(wf);
   return savedPath ? { routingKey: `wf:${savedPath}`, uuid } : null;
@@ -3283,7 +3316,7 @@ async function programmaticSave(name) {
   // only known for certain here. Static path equality cannot decide it — a
   // closed→reopened object at the same path is a NEW workflow (r3 P0), while a
   // swapped successor is the same continuous tab and must keep its identity.
-  const preSwapUuid = expectWf ? _workflowObjectUuids.get(expectWf) || workflowStableUuid(expectWf) : null;
+  const preSwapUuid = expectWf ? workflowObjectUuid(expectWf) || workflowStableUuid(expectWf) : null;
   // Capture POSITIVE pre-save evidence of the source file's existence: a confirmed 200
   // is the ONLY basis on which a post-save 404 may be treated as a real move/deletion
   // of a persisted original. Without it, a source that 404s afterward simply never
@@ -3334,7 +3367,7 @@ async function programmaticSave(name) {
     // DIFFERENT identity on the successor: that is a conflicting tab, not A's
     // continuation, and seeding it would poison the owner map.
     const postWfHasConflictingEstablishedIdentity = Boolean(
-      postSwapWf && _workflowObjectUuids.get(postSwapWf) && _workflowObjectUuids.get(postSwapWf) !== preSwapUuid
+      postSwapWf && workflowObjectUuid(postSwapWf) && workflowObjectUuid(postSwapWf) !== preSwapUuid
     );
     // r10 P0 — the save API's own produced record is the ONLY succession proof:
     // a close→reopen of the same path is not what the save produced.
@@ -3349,7 +3382,7 @@ async function programmaticSave(name) {
         postWfIsSaveProducedRecord,
       })
     ) {
-      if (!_workflowObjectUuids.get(postSwapWf)) _workflowObjectUuids.set(postSwapWf, preSwapUuid);
+      if (!workflowObjectUuid(postSwapWf)) setWorkflowObjectUuid(postSwapWf, preSwapUuid);
       rememberWorkflowUuidOwner(preSwapUuid, postSwapWf);
     }
   }
@@ -4272,7 +4305,7 @@ function assertGraphBoundToActiveWorkflow(
   // it can use workflow-owned/load-bound metadata or mint a fresh id, but can
   // never adopt the stale app.graph.extra we are trying to detect (#545 P1).
   const activeWorkflowUuid = activeWorkflow
-    ? (_workflowObjectUuids.get(activeWorkflow) || workflowStableUuid(activeWorkflow))
+    ? (workflowObjectUuid(activeWorkflow) || workflowStableUuid(activeWorkflow))
     : null;
   // #545/#557 — a root-tag UUID conflict is not self-healing: a save or reconnect
   // can drift the root stamp from the ACTIVE workflow's resolved identity while

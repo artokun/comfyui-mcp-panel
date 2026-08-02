@@ -56,6 +56,14 @@ function panelFunctionSource(src, name, nextName) {
 // — that combination is a test artifact, not a Vue behavior (r3).
 const vueProxyOf = (raw) => new Proxy(raw, { get: (t, k) => (k === "__v_raw" ? t : t[k]) });
 
+// r11 — the panel's per-object identity store is accessed ONLY through
+// raw-keyed helpers; harnesses inject equivalents backed by their own WeakMap.
+const rawKeyedUuidStore = (map) => ({
+  workflowObjectUuid: (wf) => map.get(rawWorkflowObject(wf)),
+  setWorkflowObjectUuid: (wf, id) => map.set(rawWorkflowObject(wf), id),
+  deleteWorkflowObjectUuid: (wf) => map.delete(rawWorkflowObject(wf)),
+});
+
 // foreignClaim models WHETHER a live open tab claims the root tag when it
 // conflicts with the active workflow's identity (#349/#545/#557):
 //   "identity"              — tab B is OPEN and the root-blind resolver returns
@@ -155,12 +163,14 @@ function buildDirtyStaleRouteHarness({
           : [],
     );
   const objectUuids = objectUuidsOpt ?? new WeakMap();
+  const uuidStore = rawKeyedUuidStore(objectUuids);
   let minted = 0;
   const stableUuidA = new Function(
     "app",
     "getTabId",
     "savedWorkflowPath",
-    "_workflowObjectUuids",
+    "workflowObjectUuid",
+    "setWorkflowObjectUuid",
     "embeddedWorkflowUuid",
     "resolveUnsavedInstanceUuid",
     "_loadGraphDataForkInstalled",
@@ -173,7 +183,8 @@ function buildDirtyStaleRouteHarness({
     { graph: rootB },
     () => "fallback-tab",
     () => null,
-    objectUuids,
+    uuidStore.workflowObjectUuid,
+    uuidStore.setWorkflowObjectUuid,
     (_wf, { allowGraph }) => (allowGraph ? rootB.extra?.comfyui_mcp?.workflow_uuid : null),
     ({ objectUuid, embeddedId, forkActive }) => objectUuid || (forkActive && embeddedId) || `workflow-A-${++minted}`,
     true,
@@ -214,7 +225,7 @@ function buildDirtyStaleRouteHarness({
   );
   const assertBound = new Function(
     "activeWorkflowRef",
-    "_workflowObjectUuids",
+    "workflowObjectUuid",
     "workflowStableUuid",
     "graphRootWorkflowUuidMismatches",
     "graphRootWorkflowUuidMatches",
@@ -229,7 +240,7 @@ function buildDirtyStaleRouteHarness({
     `${fenceSource}\nreturn assertGraphBoundToActiveWorkflow;`,
   )(
     () => workflowA,
-    objectUuids,
+    uuidStore.workflowObjectUuid,
     stableUuid,
     graphRootWorkflowUuidMismatches,
     graphRootWorkflowUuidMatches,
@@ -264,6 +275,7 @@ function buildSavedSuccessorHarness({
   const replaced = { isPersisted: true, path: "workflows/x.json" };
   const successor = { isPersisted: true, path: currentPath };
   const owners = new Map([[U1, replaced]]);
+  const objectUuids = new WeakMap();
   let minted = 0;
   const openWorkflows =
     ownerOpen === true
@@ -275,7 +287,8 @@ function buildSavedSuccessorHarness({
     "app",
     "getTabId",
     "savedWorkflowPath",
-    "_workflowObjectUuids",
+    "workflowObjectUuid",
+    "setWorkflowObjectUuid",
     "embeddedWorkflowUuid",
     "embeddedWorkflowPath",
     "workflowAliasForPath",
@@ -298,7 +311,8 @@ function buildSavedSuccessorHarness({
     { extensionManager: { workflow: { openWorkflows } } },
     () => "fallback-tab",
     (wf) => (wf?.isPersisted === true && wf?.isTemporary !== true && typeof wf?.path === "string" ? wf.path : null),
-    new WeakMap(),
+    rawKeyedUuidStore(objectUuids).workflowObjectUuid,
+    rawKeyedUuidStore(objectUuids).setWorkflowObjectUuid,
     () => U1, // the just-saved file carries the pre-save embedded uuid
     () => embeddedPath,
     workflowAliasForPath,
@@ -317,7 +331,7 @@ function buildSavedSuccessorHarness({
     { randomUUID: () => `fresh-${++minted}` },
     sameWorkflowObject,
   );
-  return { stableUuid, successor, replaced, owners, U1 };
+  return { stableUuid, successor, replaced, owners, objectUuids, U1 };
 }
 
 // A ComfyUI ChangeTracker-shaped workflow: serialized graph states hang off
@@ -653,7 +667,7 @@ test("#545 wiring: dirty tracker state is inconclusive, but an established workf
   const body = src.slice(start, src.indexOf("\n}\n", start));
   assert.match(
     body,
-    /const activeWorkflowUuid = activeWorkflow\s*\? \(_workflowObjectUuids\.get\(activeWorkflow\) \|\| workflowStableUuid\(activeWorkflow\)\)\s*: null;/,
+    /const activeWorkflowUuid = activeWorkflow\s*\? \(workflowObjectUuid\(activeWorkflow\) \|\| workflowStableUuid\(activeWorkflow\)\)\s*: null;/,
     "the fence must establish a missing object UUID through the root-blind resolver, never from a stale root",
   );
   assert.match(
@@ -960,7 +974,9 @@ function buildCreationForkHarness({ onLoad } = {}) {
   };
   const install = new Function(
     "_loadGraphDataForkInstalled",
-    "_workflowObjectUuids",
+    "workflowObjectUuid",
+    "setWorkflowObjectUuid",
+    "deleteWorkflowObjectUuid",
     "rememberWorkflowUuidOwner",
     "isNewWorkflowLoad",
     "shouldForkInPlaceReload",
@@ -971,7 +987,9 @@ function buildCreationForkHarness({ onLoad } = {}) {
     `${forkSource}\nreturn installCreateBoundaryFork;`,
   )(
     false,
-    objectUuids,
+    rawKeyedUuidStore(objectUuids).workflowObjectUuid,
+    rawKeyedUuidStore(objectUuids).setWorkflowObjectUuid,
+    rawKeyedUuidStore(objectUuids).deleteWorkflowObjectUuid,
     (id, owner) => owners.set(id, owner),
     isNewWorkflowLoad,
     shouldForkInPlaceReload,
@@ -1130,7 +1148,7 @@ test("#557 r3/r4 wiring: programmaticSave threads the pre-save identity across a
   const body = src.slice(start, src.indexOf("\n}\n", start));
   assert.match(
     body,
-    /preSwapUuid = expectWf \? _workflowObjectUuids\.get\(expectWf\) \|\| workflowStableUuid\(expectWf\) : null/,
+    /preSwapUuid = expectWf \? workflowObjectUuid\(expectWf\) \|\| workflowStableUuid\(expectWf\) : null/,
     "the pre-save identity must be captured from the pre-save object BEFORE the save",
   );
   assert.match(
@@ -1160,12 +1178,12 @@ test("#557 r3/r4 wiring: programmaticSave threads the pre-save identity across a
   );
   assert.match(
     body,
-    /postWfHasConflictingEstablishedIdentity = Boolean\(\s*postSwapWf && _workflowObjectUuids\.get\(postSwapWf\) && _workflowObjectUuids\.get\(postSwapWf\) !== preSwapUuid,?\s*\)/,
+    /postWfHasConflictingEstablishedIdentity = Boolean\(\s*postSwapWf && workflowObjectUuid\(postSwapWf\) && workflowObjectUuid\(postSwapWf\) !== preSwapUuid,?\s*\)/,
     "an established conflicting WeakMap identity on the successor must veto the carry (r7 P0)",
   );
   assert.match(
     body,
-    /_workflowObjectUuids\.set\(postSwapWf, preSwapUuid\)/,
+    /setWorkflowObjectUuid\(postSwapWf, preSwapUuid\)/,
     "the successor object cache must be seeded with the pre-save uuid",
   );
   assert.match(
@@ -1218,7 +1236,8 @@ function buildProgrammaticSaveHarness({ onSave } = {}) {
     "classifyOriginalOnDisk",
     "normalizePath",
     "getWorkflowTitle",
-    "_workflowObjectUuids",
+    "workflowObjectUuid",
+    "setWorkflowObjectUuid",
     "workflowStableUuid",
     "rememberWorkflowUuidOwner",
     "sameWorkflowObject",
@@ -1244,7 +1263,8 @@ function buildProgrammaticSaveHarness({ onSave } = {}) {
     () => "unknown",
     (p) => p,
     () => "title",
-    objectUuids,
+    rawKeyedUuidStore(objectUuids).workflowObjectUuid,
+    rawKeyedUuidStore(objectUuids).setWorkflowObjectUuid,
     identityOf,
     (id, owner) => owners.set(id, owner),
     sameWorkflowObject,
@@ -1462,6 +1482,64 @@ test("#349 r7 P0: a successor with an established CONFLICTING identity is not ov
     "the carry must not overwrite an established conflicting identity",
   );
   assert.notEqual(owners.get("uuid-A"), successor, "A's uuid must not be re-registered over the conflict");
+});
+
+test("#349 r11 P0: the carry veto sees a RAW-keyed established identity when the active successor arrives as a PROXY", async () => {
+  // The r2 proxy/raw duality inside the veto itself: the established identity
+  // "uuid-X" is keyed by the RAW successor, but the post-save ACTIVE object
+  // arrives as a Vue proxy. A proxy-keyed WeakMap lookup misses the raw-keyed
+  // conflict, and the seed then writes a proxy-keyed foreign identity.
+  const successor = {
+    isPersisted: true,
+    path: "workflows/a.json",
+    changeTracker: {
+      activeState: { ...state(27), extra: { comfyui_mcp: { workflow_uuid: "uuid-A" } } },
+    },
+  };
+  const successorProxy = vueProxyOf(successor);
+  const { save, svc, objectUuids, owners } = buildProgrammaticSaveHarness({
+    onSave: ({ svc }) => {
+      svc.openWorkflows = [successorProxy];
+      svc.activeWorkflow = successorProxy;
+      return { producedRecord: successor }; // the save produced the RAW record; active holds the PROXY
+    },
+  });
+  objectUuids.set(successor, "uuid-X"); // established BEFORE the seed, keyed by the RAW object
+  await save();
+  assert.equal(objectUuids.get(successor), "uuid-X", "the veto must see the raw-keyed conflict — no overwrite");
+  assert.notEqual(owners.get("uuid-A"), successor, "no owner registration over the conflict");
+  assert.notEqual(owners.get("uuid-A"), successorProxy, "no proxy-keyed registration either");
+});
+
+test("#349 r11 P0: the creation-registration veto sees a RAW-keyed established identity when the active tab is a PROXY", async () => {
+  const foreignB = {
+    isPersisted: true,
+    path: "workflows/b.json",
+    changeTracker: { activeState: { extra: { comfyui_mcp: { workflow_uuid: "creation-uuid-1" } } } },
+  };
+  const foreignBProxy = vueProxyOf(foreignB);
+  const { fakeApp, objectUuids, owners } = buildCreationForkHarness({
+    onLoad: ({ app }) => {
+      app.extensionManager.workflow.activeWorkflow = foreignBProxy; // mid-load switch, PROXY form
+      app.extensionManager.workflow.openWorkflows.push(foreignBProxy);
+    },
+  });
+  objectUuids.set(foreignB, "uuid-B"); // established BEFORE, keyed by the RAW object
+  await fakeApp.loadGraphData({ nodes: [{ id: 1, type: "KSampler" }] });
+  assert.equal(
+    owners.get("creation-uuid-1"),
+    undefined,
+    "the veto must see the raw-keyed conflict — no owner-map registration",
+  );
+  assert.equal(objectUuids.get(foreignB), "uuid-B", "the raw-keyed identity is untouched");
+  assert.equal(objectUuids.get(foreignBProxy), undefined, "nothing was keyed by the proxy");
+});
+
+test("#557 r11: workflowStableUuid finds a RAW-keyed established identity when handed the PROXY", () => {
+  const { stableUuid, successor, objectUuids } = buildSavedSuccessorHarness({ ownerOpen: false });
+  objectUuids.set(successor, "uuid-R"); // established, keyed by the RAW object
+  const id = stableUuid(vueProxyOf(successor)); // the lookup side holds the PROXY
+  assert.equal(id, "uuid-R", "the resolver unwraps the proxy and finds the raw-keyed identity");
 });
 
 // ── #557: save replaces the active workflow object — identity must follow ────
