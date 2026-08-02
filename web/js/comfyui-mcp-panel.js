@@ -6715,7 +6715,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const node = LG.createNode(class_type);
     if (!node) {
       throw new Error(
-        `Unknown node type "${class_type}" — check the exact class_type via panel_search_nodes`,
+        `Unknown node type "${class_type}" — check the exact class_type via get_node_info`,
       );
     }
     graph.beforeChange();
