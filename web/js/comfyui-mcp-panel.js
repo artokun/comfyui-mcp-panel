@@ -10340,6 +10340,26 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // #694 — the orchestrator SESSION this socket belongs to (stamped from its models
     // handshake), so a restart at the same URL never inherits its predecessor's journal.
     const targetEpoch = target?.__cmcpBridgeEpoch;
+    // #694 — the lost-reply SUMMARIES ride THIS post-handshake frame, never the hello:
+    // the hello goes out at socket-open, BEFORE the models handshake stamps this
+    // socket's epoch, so a summary computed there is filtered with an UNKNOWN epoch
+    // and can disagree with the replay below — advertising epoch'd entries to the
+    // wrong session, or omitting same-session entries the replay is about to deliver.
+    // Computed HERE with the SAME targetUrl/targetEpoch the replay loop uses, the
+    // advertised set IS the replayable set — the two can never diverge. A legacy
+    // (epoch-less) orchestrator gets exactly the pre-epoch URL+age-filtered list,
+    // one frame later than the hello used to carry it.
+    try {
+      target.send(
+        JSON.stringify({
+          type: "lost_replies",
+          tab_id: workflowTabId(),
+          entries: lostReplies.summaries({ now: Date.now(), targetUrl, targetEpoch }),
+        }),
+      );
+    } catch {
+      // Advisory only — the replay below is the load-bearing delivery.
+    }
     let sent = 0;
     let dropped = 0;
     const keep = [];
@@ -11096,20 +11116,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // the orchestrator can resume an UNSAVED workflow's conversation without
             // cross-resuming a DIFFERENT same-title unsaved workflow.
             workflowUuid: workflowStableUuid(),
-            // #508 — command outcomes this tab produced but could NOT send back. Advertised
-            // so the other end can say "the tab answered and the reply was lost" instead of
-            // asserting the unestablished "the tab may be backgrounded or frozen".
-            // Same cross-bridge/age rule the replay uses (codex): these summaries ride the
-            // hello, so an unfiltered list would tell a bridge that never owned these
-            // commands their ids, names and outcomes even though the replies are withheld.
-            lostReplies: lostReplies.summaries({
-              now: Date.now(),
-              targetUrl: sock?.__cmcpBridgeUrl ?? url,
-              // #694 — the SAME session rule as the replay: an orchestrator that
-              // restarted (new handshake epoch) learns nothing about its
-              // predecessor's lost outcomes.
-              targetEpoch: sock?.__cmcpBridgeEpoch,
-            }),
+            // #508/#694 — NO lostReplies summaries here: the hello fires at
+            // socket-open, BEFORE the models handshake stamps this socket's session
+            // epoch, so any summary computed now is filtered with an unknown epoch
+            // and can contradict the epoch-filtered replay (the #694 divergence).
+            // The summaries ride the post-handshake `lost_replies` frame sent from
+            // replayLostReplies, computed with the SAME epoch the replay uses.
           }),
         ),
       );

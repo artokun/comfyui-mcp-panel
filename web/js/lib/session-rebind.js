@@ -333,10 +333,16 @@ export function buildHelloPayload({
     frame.workflow_uuid = workflowUuid.trim();
   }
   // #508 — command outcomes this tab COMPLETED but could not deliver (the socket closed
-  // or was superseded mid-command). Advertising them at re-registration lets the other
-  // end reconcile "the reply was lost" against its own timed-out commands instead of
-  // asserting the unestablished "the tab may be backgrounded or frozen". Omitted when
-  // empty so the common hello is unchanged.
+  // or was superseded mid-command). Advertising them lets the other end reconcile "the
+  // reply was lost" against its own timed-out commands instead of asserting the
+  // unestablished "the tab may be backgrounded or frozen". Omitted when empty so the
+  // common hello is unchanged.
+  // #694 — the panel no longer passes this on the hello: the hello fires at socket-open,
+  // BEFORE the models handshake stamps the socket's session epoch, so a hello-carried
+  // summary is filtered with an unknown epoch and can contradict the epoch-filtered
+  // replay. The summaries ride the post-handshake `lost_replies` frame (sent from
+  // replayLostReplies with the SAME epoch filter the replay uses). The field remains
+  // supported here for any caller whose timing is already post-handshake.
   if (Array.isArray(lostReplies) && lostReplies.length) {
     frame.lost_replies = lostReplies;
   }
