@@ -2,28 +2,36 @@
  * Unit tests for web/js/lib/run-scope-guard.js — run with `node --test`.
  *
  * Guards #556: a scoped panel_run (to_node_id, "run to node") must NEVER
- * silently fall through to a FULL-graph execution. The queuePrompt 3rd-argument
- * shape differs across frontend builds (positional NodeExecutionId[] vs
- * QueuePromptOptions { queueNodeIds }); a build that accepts only one shape
- * silently IGNORES the other, so the scope never reaches POST /prompt and the
- * full graph queues while panel_run reports ran_to_node. The guard inspects the
- * outgoing /prompt body and REFUSES a scopeless dispatch before it leaves —
- * these tests pin that refusal (no full-graph dispatch) and that a verifiably
- * scoped run still runs scoped on both frontend build shapes.
+ * silently fall through to a FULL-graph execution — and (codex gate) must do so
+ * without breaking the tab around it:
+ *
+ *  P0 — a busy app.queuePrompt returns early and posts the item LATER; a guard
+ *       restored at queuePrompt's return never sees that deferred dispatch. The
+ *       scoped guard stays installed until our dispatch is OBSERVED or a
+ *       bounded timeout, and a run whose dispatch never surfaces reports a
+ *       truthful "unverified — nothing confirmed queued", never queued:true.
+ *
+ *  P1 — while installed, the guard sees EVERY POST /prompt in the tab. It only
+ *       refuses a targetless body matching THIS run's prompt signature (and
+ *       only within the batch count); unrelated full runs and other scoped runs
+ *       pass through untouched and are never captured as ours.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
   queuePromptScopeArgs,
+  promptSignature,
+  promptSignatureFromBody,
   verifyScopedPromptBody,
   scopeDroppedError,
+  scopeUnverifiedError,
   createRunFetchInterceptor,
+  createScopedRunGuard,
 } from "../../web/js/lib/run-scope-guard.js";
 import { resolveRunToNodeTarget } from "../../web/js/lib/subgraph-scope.js";
 
-// A Response double with the surface the interceptor + frontend rejection path
-// use (status, clone().json(), text()).
+// A Response double with the surface the guard + frontend rejection path use.
 function jsonResponse(status, obj) {
   return {
     status,
@@ -34,8 +42,8 @@ function jsonResponse(status, obj) {
   };
 }
 
-// A recording origFetchApi double. `responder(route, options)` produces the
-// response; every call is logged so tests can prove a dispatch did/didn't happen.
+// A recording origFetchApi double; every call is logged so tests can prove a
+// dispatch did/didn't happen.
 function makeFetchSpy(responder) {
   const calls = [];
   const fetchApi = async (route, options) => {
@@ -55,8 +63,21 @@ const promptPost = (body) => [
   },
 ];
 
+// The graphToPrompt output OUR scoped run queued (two branches: a KSampler
+// trunk, a SaveImage branch, and the PreviewAny we scope to).
+const OUR_OUTPUT = {
+  "3": { class_type: "KSampler", inputs: {} },
+  "9": { class_type: "SaveImage", inputs: {} },
+  "14": { class_type: "PreviewAny", inputs: {} },
+};
+const OUR_SIGNATURE = promptSignature(OUR_OUTPUT);
+const OUR_FULL_BODY = { prompt: OUR_OUTPUT, client_id: "x" };
+const OUR_SCOPED_BODY = { prompt: OUR_OUTPUT, client_id: "x", partial_execution_targets: ["14"] };
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 // ---------------------------------------------------------------------------
-// queuePromptScopeArgs — the shapes graph_run tries, in order.
+// queuePromptScopeArgs / signatures / pure verdicts
 // ---------------------------------------------------------------------------
 
 test("#556 queuePromptScopeArgs: no scope ⇒ a single undefined arg (plain full run, historical call shape)", () => {
@@ -71,160 +92,231 @@ test("#556 queuePromptScopeArgs: a scope ⇒ positional array FIRST, then the op
   assert.deepEqual(second, { queueNodeIds: ["76:34"] });
 });
 
-// ---------------------------------------------------------------------------
-// verifyScopedPromptBody — the pure verdict.
-// ---------------------------------------------------------------------------
-
-test("#556 verify: body carrying EXACTLY the requested scope passes (incl. colon-path exec ids)", () => {
-  assert.deepEqual(verifyScopedPromptBody(JSON.stringify({ partial_execution_targets: ["14"] }), ["14"]), {
-    ok: true,
-  });
-  assert.deepEqual(
-    verifyScopedPromptBody(JSON.stringify({ partial_execution_targets: ["10:15:359"] }), ["10:15:359"]),
-    { ok: true },
-  );
+test("#556 promptSignature: node-id|class_type set, widget values excluded, order-insensitive", () => {
+  const a = promptSignature({ "9": { class_type: "B", inputs: { seed: 1 } }, "3": { class_type: "A" } });
+  const b = promptSignature({ "3": { class_type: "A" }, "9": { class_type: "B", inputs: { seed: 999 } } });
+  assert.equal(a, b, "same node set with different widget values ⇒ same signature");
+  assert.notEqual(promptSignature({ "3": { class_type: "A" } }), a, "different node set ⇒ different signature");
+  assert.equal(promptSignature(null), null);
+  assert.equal(promptSignature({}), null);
 });
 
-test("#556 verify: NO partial_execution_targets in the body ⇒ scope_missing refusal", () => {
-  const v = verifyScopedPromptBody(JSON.stringify({ prompt: {}, client_id: "x" }), ["14"]);
-  assert.equal(v.ok, false);
-  assert.equal(v.reason, "scope_missing");
-  assert.deepEqual(v.expected, ["14"]);
+test("#556 promptSignatureFromBody: reads body.prompt; unparseable ⇒ null", () => {
+  assert.equal(promptSignatureFromBody(JSON.stringify({ prompt: OUR_OUTPUT })), OUR_SIGNATURE);
+  assert.equal(promptSignatureFromBody("not-json{"), null);
+  assert.equal(promptSignatureFromBody(undefined), null);
 });
 
-test("#556 verify: an EMPTY targets list is a dropped scope, not a scoped run", () => {
-  const v = verifyScopedPromptBody(JSON.stringify({ partial_execution_targets: [] }), ["14"]);
-  assert.equal(v.ok, false);
-  assert.equal(v.reason, "scope_missing");
-});
-
-test("#556 verify: WRONG or EXTRA targets ⇒ scope_mismatch refusal", () => {
-  const wrong = verifyScopedPromptBody(JSON.stringify({ partial_execution_targets: ["9"] }), ["14"]);
-  assert.equal(wrong.ok, false);
-  assert.equal(wrong.reason, "scope_mismatch");
-  assert.deepEqual(wrong.got, ["9"]);
-  const extra = verifyScopedPromptBody(JSON.stringify({ partial_execution_targets: ["14", "9"] }), ["14"]);
-  assert.equal(extra.ok, false);
-  assert.equal(extra.reason, "scope_mismatch");
-});
-
-test("#556 verify: an unparseable body is UNVERIFIABLE ⇒ refuse (never fail open)", () => {
-  const v = verifyScopedPromptBody("not-json{", ["14"]);
-  assert.equal(v.ok, false);
-  assert.equal(v.reason, "scope_missing");
-  const u = verifyScopedPromptBody(undefined, ["14"]);
-  assert.equal(u.ok, false);
-});
-
-test("#556 verify: numeric targets normalize to strings; no scope requested ⇒ always ok", () => {
-  assert.deepEqual(verifyScopedPromptBody(JSON.stringify({ partial_execution_targets: [14] }), ["14"]), {
-    ok: true,
-  });
+test("#556 verifyScopedPromptBody: exact scope passes; missing/empty/wrong/extra/unparseable all refuse", () => {
+  assert.deepEqual(verifyScopedPromptBody(JSON.stringify({ partial_execution_targets: ["10:15:359"] }), ["10:15:359"]), { ok: true });
+  assert.equal(verifyScopedPromptBody(JSON.stringify({ prompt: {} }), ["14"]).reason, "scope_missing");
+  assert.equal(verifyScopedPromptBody(JSON.stringify({ partial_execution_targets: [] }), ["14"]).reason, "scope_missing");
+  assert.equal(verifyScopedPromptBody(JSON.stringify({ partial_execution_targets: ["9"] }), ["14"]).reason, "scope_mismatch");
+  assert.equal(verifyScopedPromptBody(JSON.stringify({ partial_execution_targets: ["14", "9"] }), ["14"]).reason, "scope_mismatch");
+  assert.equal(verifyScopedPromptBody("garbage{", ["14"]).ok, false);
   assert.deepEqual(verifyScopedPromptBody("garbage", null), { ok: true });
-  assert.deepEqual(verifyScopedPromptBody("garbage", []), { ok: true });
 });
 
 test("#556 scopeDroppedError: names the node and states NOTHING was queued", () => {
-  const msg = scopeDroppedError({
-    toNodeId: 14,
-    verdict: { ok: false, reason: "scope_missing", expected: ["14"], got: null },
-  });
+  const msg = scopeDroppedError({ toNodeId: 14, verdict: { ok: false, reason: "scope_missing", expected: ["14"], got: null } });
   assert.match(msg, /node 14/);
   assert.match(msg, /NOT applied/);
   assert.match(msg, /Nothing was queued/);
-  assert.match(msg, /full-graph/);
+});
+
+test("#556 scopeUnverifiedError: truthful — nothing CONFIRMED queued, never claims a scoped run happened", () => {
+  const msg = scopeUnverifiedError({ toNodeId: 14, timeoutMs: 5000 });
+  assert.match(msg, /node 14/);
+  assert.match(msg, /could not be verified/);
+  assert.match(msg, /CONFIRMED queued/i);
+  assert.doesNotMatch(msg, /queued:\s*true/);
+  assert.doesNotMatch(msg, /Nothing was queued/, "a deferred post may still land — must not claim otherwise");
 });
 
 // ---------------------------------------------------------------------------
-// createRunFetchInterceptor — the guard graph_run installs.
+// createRunFetchInterceptor — the UNSCOPED path (historical #358/#370 capture)
 // ---------------------------------------------------------------------------
 
-test("#556 REGRESSION: a scoped run whose scope the frontend dropped is REFUSED — origFetchApi is NEVER called (no full-graph dispatch)", async () => {
-  // Simulates the #556 frontend: queuePrompt accepted the call but the POST
-  // /prompt body carries NO partial_execution_targets.
-  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "should-never-happen" }));
-  let dropped = null;
-  const intercepted = createRunFetchInterceptor({
-    origFetchApi: spy,
-    partialTargets: ["14"],
-    toNodeId: 14,
-    onScopeDropped: (m) => (dropped = m),
-  });
-  const [route, options] = promptPost({ prompt: {}, client_id: "x" });
+test("#556 unscoped interceptor: captures top-level rejection and prompt_id, leaves the request untouched", async () => {
+  const spy = makeFetchSpy(async () => jsonResponse(400, { error: { type: "missing_node_type" } }));
+  let rejection = null;
+  const intercepted = createRunFetchInterceptor({ origFetchApi: spy, onRejection: (r) => (rejection = r) });
+  const [route, options] = promptPost({ prompt: {} });
   const res = await intercepted(route, options);
-  assert.equal(spy.calls.length, 0, "the scopeless prompt must NEVER be dispatched");
-  assert.equal(res.status, 400, "the refusal is shaped like a server rejection");
-  assert.match(dropped, /node 14/);
-  assert.match(dropped, /Nothing was queued/);
-});
+  assert.equal(spy.calls.length, 1);
+  assert.equal(spy.calls[0].options, options);
+  assert.equal(res.status, 400);
+  assert.deepEqual(rejection, { error: { type: "missing_node_type" }, node_errors: null });
 
-test("#556: a scoped run whose body carries the scope is DISPATCHED verbatim and the prompt_id captured", async () => {
-  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: 123 }));
+  const spy2 = makeFetchSpy(async () => jsonResponse(200, { prompt_id: 0 }));
   const ids = [];
-  const intercepted = createRunFetchInterceptor({
-    origFetchApi: spy,
-    partialTargets: ["76:34"],
-    toNodeId: 34,
-    onPromptId: (pid) => ids.push(pid),
+  const intercepted2 = createRunFetchInterceptor({ origFetchApi: spy2, onPromptId: (p) => ids.push(p) });
+  await intercepted2(...promptPost({ prompt: {} }));
+  assert.deepEqual(ids, ["0"], "falsy-but-valid id 0 is captured, string-normalized");
+});
+
+test("#556 unscoped interceptor: non-/prompt routes are not inspected", async () => {
+  const spy = makeFetchSpy(async () => jsonResponse(200, {}));
+  const intercepted = createRunFetchInterceptor({ origFetchApi: spy, onRejection: () => assert.fail("no capture") });
+  await intercepted("/history", { method: "GET" });
+  assert.equal(spy.calls.length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// createScopedRunGuard — the SCOPED path
+// ---------------------------------------------------------------------------
+
+test("#556 guard: OUR scoped dispatch (body carries exactly our targets) is observed, dispatched verbatim, prompt_id captured", async () => {
+  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "p1" }));
+  const ids = [];
+  const guard = createScopedRunGuard({
+    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
+    onPromptId: (p) => ids.push(p),
   });
-  const [route, options] = promptPost({ prompt: {}, partial_execution_targets: ["76:34"] });
-  const res = await intercepted(route, options);
+  const [route, options] = promptPost(OUR_SCOPED_BODY);
+  const res = await guard(route, options);
   assert.equal(spy.calls.length, 1, "scoped prompt dispatched");
   assert.equal(spy.calls[0].options, options, "request passed through untouched");
   assert.equal(res.status, 200);
-  assert.deepEqual(ids, ["123"], "prompt_id normalized to a string at capture");
+  assert.equal(guard.state.observed, 1);
+  assert.equal(guard.state.dropped, null);
+  assert.deepEqual(ids, ["p1"]);
 });
 
-test("#556: response capture preserved — a top-level server rejection (non-200) is reported (#358 channel)", async () => {
-  const rejectionBody = { error: { type: "missing_node_type", message: "no class_type" } };
-  const spy = makeFetchSpy(async () => jsonResponse(400, rejectionBody));
+test("#556 guard: a server rejection of OUR scoped dispatch is captured (#358 channel preserved)", async () => {
+  const spy = makeFetchSpy(async () => jsonResponse(400, { error: { type: "prompt_outputs_failed_validation" } }));
   let rejection = null;
-  const intercepted = createRunFetchInterceptor({
-    origFetchApi: spy,
-    partialTargets: ["14"],
-    toNodeId: 14,
+  const guard = createScopedRunGuard({
+    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
     onRejection: (r) => (rejection = r),
   });
-  const [route, options] = promptPost({ prompt: {}, partial_execution_targets: ["14"] });
-  await intercepted(route, options);
+  await guard(...promptPost(OUR_SCOPED_BODY));
   assert.equal(spy.calls.length, 1, "a verifiably scoped prompt IS dispatched (and may be refused by the server)");
-  assert.deepEqual(rejection, { error: rejectionBody.error, node_errors: null });
+  assert.equal(rejection?.error?.type, "prompt_outputs_failed_validation");
 });
 
-test("#556: non-/prompt routes and non-POST methods pass through UNINSPECTED even when scoped", async () => {
-  const spy = makeFetchSpy(async () => jsonResponse(200, {}));
+test("#556 REGRESSION: OUR dispatch gone wrong (targetless body with OUR signature) is REFUSED — origFetchApi NEVER called (no full-graph dispatch)", async () => {
+  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "must-never-happen" }));
   let dropped = null;
-  const intercepted = createRunFetchInterceptor({
-    origFetchApi: spy,
-    partialTargets: ["14"],
-    toNodeId: 14,
-    onScopeDropped: () => (dropped = true),
+  const guard = createScopedRunGuard({
+    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
+    onScopeDropped: (m) => (dropped = m),
   });
-  await intercepted("/history", { method: "GET" });
-  await intercepted("/prompt", { method: "GET" });
-  await intercepted("/upload/image", { method: "POST", body: "..." });
-  assert.equal(spy.calls.length, 3);
-  assert.equal(dropped, null);
+  const res = await guard(...promptPost(OUR_FULL_BODY));
+  assert.equal(spy.calls.length, 0, "the scopeless prompt must NEVER be dispatched");
+  assert.equal(res.status, 400, "refusal shaped like a server rejection");
+  assert.equal(guard.state.observed, 0);
+  assert.match(guard.state.dropped, /node 14/);
+  assert.match(dropped, /Nothing was queued/);
 });
 
-test("#556: an UNSCOPED run (partialTargets null) is never scope-checked — the normal full-run path is preserved", async () => {
-  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "p1" }));
-  let dropped = null;
-  const intercepted = createRunFetchInterceptor({
-    origFetchApi: spy,
-    partialTargets: null,
-    onScopeDropped: () => (dropped = true),
+test("#556 P1: an UNRELATED full run (different signature) during the window passes through untouched and is NOT captured", async () => {
+  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "user-run" }));
+  let dropped = null, captured = null;
+  const guard = createScopedRunGuard({
+    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
+    onScopeDropped: (m) => (dropped = m),
+    onPromptId: (p) => (captured = p),
   });
-  const [route, options] = promptPost({ prompt: {}, client_id: "x" });
-  const res = await intercepted(route, options);
-  assert.equal(spy.calls.length, 1, "full run dispatched");
+  const otherGraph = { prompt: { "1": { class_type: "LoadImage" }, "2": { class_type: "SaveImage" } }, client_id: "x" };
+  const [route, options] = promptPost(otherGraph);
+  const res = await guard(route, options);
+  assert.equal(spy.calls.length, 1, "the user's run is dispatched");
+  assert.equal(spy.calls[0].options, options);
   assert.equal(res.status, 200);
-  assert.equal(dropped, null);
+  assert.equal(dropped, null, "no refusal");
+  assert.equal(captured, null, "not captured as ours");
+  assert.equal(guard.state.observed, 0);
+  assert.equal(guard.state.dropped, null);
+});
+
+test("#556 P1: an unrelated SCOPED run (someone else's targets) passes through untouched", async () => {
+  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "other-scoped" }));
+  let captured = null;
+  const guard = createScopedRunGuard({
+    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
+    onPromptId: (p) => (captured = p),
+  });
+  const body = { prompt: OUR_OUTPUT, client_id: "x", partial_execution_targets: ["9"] };
+  const res = await guard(...promptPost(body));
+  assert.equal(spy.calls.length, 1);
+  assert.equal(res.status, 200);
+  assert.equal(captured, null, "another scope's prompt_id is never claimed as ours");
+  assert.equal(guard.state.observed, 0);
+});
+
+test("#556 P1: refusal is bounded by the batch — a same-signature full body BEYOND our batch count passes through", async () => {
+  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "late-run" }));
+  const guard = createScopedRunGuard({
+    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
+  });
+  const first = await guard(...promptPost(OUR_FULL_BODY));
+  assert.equal(first.status, 400, "our own dropped dispatch is refused");
+  assert.equal(spy.calls.length, 0);
+  const second = await guard(...promptPost(OUR_FULL_BODY));
+  assert.equal(second.status, 200, "a further same-signature full run is NOT ours to refuse");
+  assert.equal(spy.calls.length, 1, "it passes through");
+});
+
+test("#556 guard: an unparseable body is unattributable ⇒ passed through, never blocked (fail-safe toward strangers)", async () => {
+  const spy = makeFetchSpy(async () => jsonResponse(200, {}));
+  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14 });
+  await guard("/prompt", { method: "POST", body: "not-json{" });
+  assert.equal(spy.calls.length, 1);
+  assert.equal(guard.state.dropped, null);
+});
+
+test("#556 P0 DEFERRED RACE: queuePrompt returned early (busy) — the guard is STILL installed and refuses the deferred invalid-shape dispatch, zero real posts", async () => {
+  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "must-never-happen" }));
+  let dropped = null;
+  const guard = createScopedRunGuard({
+    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
+    onScopeDropped: (m) => (dropped = m),
+  });
+  // graph_run awaits queuePrompt (which returned early), then waits on the guard.
+  const verdict = guard.waitForVerdict(1000);
+  // …the in-flight processor serializes and posts OUR item 30ms later, through
+  // the still-installed guard, with the scope dropped (invalid shape).
+  await sleep(30);
+  const res = await guard(...promptPost(OUR_FULL_BODY));
+  assert.equal(await verdict, true, "the deferred dispatch is OBSERVED by the still-installed guard");
+  assert.equal(res.status, 400);
+  assert.equal(spy.calls.length, 0, "the deferred full-graph prompt never left the tab");
+  assert.match(dropped, /node 14/);
+});
+
+test("#556 P0 DEFERRED, correct shape: the late scoped post IS observed and its prompt_id captured", async () => {
+  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "deferred-pid" }));
+  const ids = [];
+  const guard = createScopedRunGuard({
+    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
+    onPromptId: (p) => ids.push(p),
+  });
+  const verdict = guard.waitForVerdict(1000);
+  await sleep(30);
+  await guard(...promptPost(OUR_SCOPED_BODY));
+  assert.equal(await verdict, true);
+  assert.equal(guard.state.observed, 1);
+  assert.deepEqual(ids, ["deferred-pid"]);
+});
+
+test("#556 P0 TIMEOUT: nothing surfaces within the window ⇒ waitForVerdict false, state clean ⇒ graph_run reports UNVERIFIED (never queued:true)", async () => {
+  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "nope" }));
+  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14 });
+  const seen = await guard.waitForVerdict(50);
+  assert.equal(seen, false);
+  assert.equal(guard.state.observed, 0);
+  assert.equal(guard.state.dropped, null);
+  assert.equal(spy.calls.length, 0);
+  // This is exactly the condition graph_run maps to scopeUnverifiedError:
+  // a truthful "could not verify — nothing confirmed queued", not queued:true.
+  const msg = scopeUnverifiedError({ toNodeId: 14, timeoutMs: 5000 });
+  assert.match(msg, /could not be verified/);
 });
 
 // ---------------------------------------------------------------------------
-// End-to-end across the two frontend build shapes, driving the interceptor the
-// way graph_run's retry loop does (array first, then { queueNodeIds }).
+// End-to-end across frontend build shapes, driving the guard the way
+// graph_run's loop does (try shape, observe, retry on dropped, else unverified).
 // ---------------------------------------------------------------------------
 
 // A fake app.queuePrompt for a build that ONLY honors the QueuePromptOptions
@@ -232,22 +324,7 @@ test("#556: an UNSCOPED run (partialTargets null) is never scope-checked — the
 function makeOptionsOnlyQueuePrompt(fetchApi, posted) {
   return async (number, batch, arg) => {
     const queueNodeIds = Array.isArray(arg) ? undefined : arg?.queueNodeIds;
-    const body = { prompt: {}, client_id: "x" };
-    if (queueNodeIds) body.partial_execution_targets = queueNodeIds;
-    await fetchApi("/prompt", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    posted.push(body);
-  };
-}
-
-// A fake app.queuePrompt for a build that ONLY honors the positional array.
-function makePositionalOnlyQueuePrompt(fetchApi, posted) {
-  return async (number, batch, arg) => {
-    const queueNodeIds = Array.isArray(arg) ? arg : undefined;
-    const body = { prompt: {}, client_id: "x" };
+    const body = { prompt: OUR_OUTPUT, client_id: "x" };
     if (queueNodeIds) body.partial_execution_targets = queueNodeIds;
     await fetchApi("/prompt", {
       method: "POST",
@@ -265,52 +342,23 @@ test("#556 e2e: an options-only frontend (drops the legacy array) still runs SCO
     dispatched.push(true);
     return jsonResponse(200, { prompt_id: "p1" });
   });
-  let scopeDropped = null;
+  let outcome = null;
   for (const scopeArg of queuePromptScopeArgs(["14"])) {
-    scopeDropped = null;
-    const intercepted = createRunFetchInterceptor({
-      origFetchApi,
-      partialTargets: ["14"],
-      toNodeId: 14,
-      onScopeDropped: (m) => (scopeDropped = m),
+    const guard = createScopedRunGuard({
+      origFetchApi, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
     });
-    const queuePrompt = makeOptionsOnlyQueuePrompt(intercepted, posted);
+    const queuePrompt = makeOptionsOnlyQueuePrompt(guard, posted);
     await queuePrompt(0, 1, scopeArg);
-    if (!scopeDropped) break;
+    if (guard.state.observed > 0) { outcome = "scoped"; break; }
+    if (guard.state.dropped) { outcome = "dropped"; continue; }
+    outcome = "unverified";
+    break;
   }
-  assert.equal(scopeDropped, null, "the retry shape delivered the scope");
+  assert.equal(outcome, "scoped", "the retry shape delivered the scope");
   assert.equal(dispatched.length, 1, "exactly ONE prompt actually dispatched (no double-queue)");
   assert.equal(posted.length, 2, "both shapes were attempted");
-  assert.deepEqual(posted[0].partial_execution_targets, undefined, "attempt 1 (array) dropped by this build");
+  assert.equal(posted[0].partial_execution_targets, undefined, "attempt 1 (array) dropped by this build");
   assert.deepEqual(posted[1].partial_execution_targets, ["14"], "attempt 2 (options object) delivered the scope");
-});
-
-test("#556 e2e: a positional-only frontend runs SCOPED on the FIRST shape (no retry needed)", async () => {
-  const posted = [];
-  const dispatched = [];
-  const origFetchApi = makeFetchSpy(async () => {
-    dispatched.push(true);
-    return jsonResponse(200, { prompt_id: "p1" });
-  });
-  let scopeDropped = null;
-  let attempts = 0;
-  for (const scopeArg of queuePromptScopeArgs(["14"])) {
-    attempts++;
-    scopeDropped = null;
-    const intercepted = createRunFetchInterceptor({
-      origFetchApi,
-      partialTargets: ["14"],
-      toNodeId: 14,
-      onScopeDropped: (m) => (scopeDropped = m),
-    });
-    const queuePrompt = makePositionalOnlyQueuePrompt(intercepted, posted);
-    await queuePrompt(0, 1, scopeArg);
-    if (!scopeDropped) break;
-  }
-  assert.equal(scopeDropped, null);
-  assert.equal(attempts, 1, "array first ⇒ no retry on positional builds");
-  assert.equal(dispatched.length, 1);
-  assert.deepEqual(posted[0].partial_execution_targets, ["14"]);
 });
 
 test("#556 e2e: a build that honors NEITHER shape ⇒ truthful refusal, ZERO dispatches", async () => {
@@ -319,26 +367,37 @@ test("#556 e2e: a build that honors NEITHER shape ⇒ truthful refusal, ZERO dis
     dispatched.push(true);
     return jsonResponse(200, { prompt_id: "p1" });
   });
-  let scopeDropped = null;
+  let dropped = null;
   for (const scopeArg of queuePromptScopeArgs(["14"])) {
-    scopeDropped = null;
-    const intercepted = createRunFetchInterceptor({
-      origFetchApi,
-      partialTargets: ["14"],
-      toNodeId: 14,
-      onScopeDropped: (m) => (scopeDropped = m),
+    const guard = createScopedRunGuard({
+      origFetchApi, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
+      onScopeDropped: (m) => (dropped = m),
     });
-    // This build posts a body with NO targets regardless of the arg shape.
-    await intercepted("/prompt", {
+    // This build posts OUR prompt with NO targets regardless of the arg shape.
+    await guard("/prompt", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt: {}, client_id: "x" }),
+      body: JSON.stringify(OUR_FULL_BODY),
     });
-    if (!scopeDropped) break;
+    if (guard.state.observed > 0) break;
+    if (!guard.state.dropped) break;
   }
-  assert.match(scopeDropped, /node 14/);
-  assert.match(scopeDropped, /Nothing was queued/);
+  assert.match(dropped, /node 14/);
+  assert.match(dropped, /Nothing was queued/);
   assert.equal(dispatched.length, 0, "no full-graph prompt ever left the tab");
+});
+
+test("#556 e2e: a signature-less run still verifies a post that CARRIES the scope (degraded attribution never blocks, never lies)", async () => {
+  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "p1" }));
+  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: null, batch: 1, toNodeId: 14 });
+  // Our scoped post is still observed without a signature…
+  await guard(...promptPost(OUR_SCOPED_BODY));
+  assert.equal(guard.state.observed, 1);
+  assert.equal(spy.calls.length, 1);
+  // …and a targetless body CANNOT be attributed ⇒ passed through, not blocked.
+  await guard(...promptPost(OUR_FULL_BODY));
+  assert.equal(spy.calls.length, 2);
+  assert.equal(guard.state.dropped, null);
 });
 
 // ---------------------------------------------------------------------------
@@ -353,15 +412,11 @@ const outputNode = (id) => ({
 });
 
 test("#556: a to_node_id that went STALE (graph changed after the id was captured) resolves not_found ⇒ refused before any dispatch", () => {
-  // The id was valid against the graph the agent last saw…
   const staleRoot = { _nodes: [outputNode(14)], getNodeById(id) { return this._nodes.find((n) => Number(n.id) === Number(id)) ?? null; } };
   assert.equal(resolveRunToNodeTarget(staleRoot, null, 14).ok, true);
-  // …but the live root no longer has it (node deleted / workflow reloaded).
   const liveRoot = { _nodes: [outputNode(15)], getNodeById(id) { return this._nodes.find((n) => Number(n.id) === Number(id)) ?? null; } };
   const res = resolveRunToNodeTarget(liveRoot, null, 14);
   assert.deepEqual(res, { ok: false, code: "not_found", node: null });
-  // graph_run maps this verdict to { queued:false, error: "node 14 was not found…" }
-  // and returns BEFORE queuePrompt — no full-graph dispatch is possible.
 });
 
 test("#556: a NON-output target is refused (not_output) — it can never be an execution root", () => {

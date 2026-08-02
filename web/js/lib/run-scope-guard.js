@@ -15,12 +15,33 @@
 //     silently IGNORES the other — the scope never reaches the request, the FULL
 //     graph queues, and panel_run still reports ran_to_node (#556: an unrelated
 //     SaveImage branch rendered and wrote a file nobody asked for). A minified
-//     queuePrompt signature can't be sniffed reliably, so this module enforces
-//     the guarantee at the one place every build must pass through: the POST
-//     /prompt request body. When a scope was requested, any /prompt body that
-//     doesn't carry EXACTLY that scope is REFUSED BEFORE origFetchApi runs —
-//     nothing is dispatched unscoped — and the caller retries the OTHER
-//     argument shape once, then refuses truthfully if neither shape delivers.
+//     queuePrompt signature can't be sniffed reliably, so the guarantee is
+//     enforced at the one place every build must pass through: the POST /prompt
+//     request body.
+//
+// Two dispatch realities shape the design (codex gate on the first cut):
+//
+//  - app.queuePrompt is NOT synchronous with the POST. When its processor is
+//    already busy it pushes the item and RETURNS EARLY — the prompt is
+//    serialized and posted LATER by the in-flight processor. A guard restored
+//    when queuePrompt returns never sees that deferred dispatch (P0). So the
+//    scoped guard stays installed until our dispatch is actually OBSERVED (a
+//    POST carrying exactly our targets has passed through) or a bounded
+//    timeout — and a run whose dispatch never surfaces reports a truthful
+//    "could not verify — nothing confirmed queued", never queued:true.
+//
+//  - While installed, the guard sees EVERY POST /prompt in the tab, including
+//    unrelated ones (a user queue, another processor's item). Refusing any
+//    body that merely lacks our targets would 400 a stranger's legitimate full
+//    run (P1). So the guard is SURGICAL: it only refuses a targetless body
+//    that matches THIS run's prompt signature (the sorted node-id|class_type
+//    set of the graphToPrompt output we queued — widget values excluded so
+//    beforeQueued seed randomization can't blur it), and only for as many
+//    posts as this batch still has unattributed. Everything else — unrelated
+//    full runs, other scoped runs, unparseable bodies — passes through
+//    untouched and is never captured as ours. Known limit: a concurrent full
+//    run of the byte-identical node set inside the window is indistinguishable
+//    from our own dropped dispatch and is treated as ours (bounded by batch).
 //
 // Extracted as a pure module so the SAME guard graph_run installs is drivable
 // from `node --test` (the live app.queuePrompt path can't be).
@@ -42,6 +63,52 @@ export function queuePromptScopeArgs(partialTargets) {
 }
 
 /**
+ * The prompt signature used to attribute a POST /prompt body to THIS run: the
+ * sorted node-id|class_type pairs of a graphToPrompt output (the API workflow).
+ * Widget values are EXCLUDED — queuePrompt randomizes seeds via beforeQueued
+ * between serialization calls, so a value-level fingerprint would miss our own
+ * dispatch. Two runs of the same unedited graph share a signature; the batch
+ * bound in the guard limits what that ambiguity can mis-attribute.
+ */
+export function promptSignature(output) {
+  if (!output || typeof output !== "object") return null;
+  const keys = Object.keys(output);
+  if (!keys.length) return null;
+  return keys
+    .sort()
+    .map((k) => `${k}${output[k]?.class_type ?? ""}`)
+    .join("|");
+}
+
+/** Signature of a raw POST /prompt body, or null when unparseable/odd. */
+export function promptSignatureFromBody(bodyText) {
+  let body;
+  try {
+    body = JSON.parse(bodyText);
+  } catch {
+    return null;
+  }
+  return promptSignature(body?.prompt);
+}
+
+/** The body body's partial_execution_targets as strings, or null when absent/empty/unparseable. */
+function targetsFromBody(bodyText) {
+  let body;
+  try {
+    body = JSON.parse(bodyText);
+  } catch {
+    return null;
+  }
+  const t = body?.partial_execution_targets;
+  if (!Array.isArray(t) || !t.length) return null;
+  return t.map(String);
+}
+
+function sameSet(a, b) {
+  return a.length === b.length && b.every((x) => a.includes(x));
+}
+
+/**
  * Verify a POST /prompt request body carries EXACTLY the requested
  * partial-execution scope. Compared as string sets (server exec ids are strings;
  * a colon path like "76:34" for a subgraph-nested output must survive verbatim).
@@ -55,29 +122,17 @@ export function queuePromptScopeArgs(partialTargets) {
 export function verifyScopedPromptBody(bodyText, expectedExecIds) {
   const expected = (expectedExecIds ?? []).map(String);
   if (!expected.length) return { ok: true }; // no scope requested — nothing to verify
-  let body;
-  try {
-    body = JSON.parse(bodyText);
-  } catch {
-    body = null;
-  }
-  const targets = Array.isArray(body?.partial_execution_targets)
-    ? body.partial_execution_targets.map(String)
-    : null;
-  if (!targets || !targets.length) {
-    return { ok: false, reason: "scope_missing", expected, got: targets };
-  }
-  const same =
-    targets.length === expected.length && expected.every((e) => targets.includes(e));
-  if (!same) return { ok: false, reason: "scope_mismatch", expected, got: targets };
+  const got = targetsFromBody(bodyText);
+  if (!got) return { ok: false, reason: "scope_missing", expected, got: null };
+  if (!sameSet(got, expected)) return { ok: false, reason: "scope_mismatch", expected, got };
   return { ok: true };
 }
 
 /**
- * The truthful refusal message when the scope didn't reach the request. Names
- * the node that couldn't be scoped and states plainly that NOTHING was queued —
- * never a false `queued:true`/`ran_to_node` for what would have been a
- * full-graph run.
+ * The truthful refusal message when our own dispatch surfaced WITHOUT the
+ * scope. Names the node that couldn't be scoped and states plainly that
+ * NOTHING was queued — never a false `queued:true`/`ran_to_node` for what
+ * would have been a full-graph run.
  */
 export function scopeDroppedError({ toNodeId, verdict }) {
   const detail =
@@ -93,80 +148,160 @@ export function scopeDroppedError({ toNodeId, verdict }) {
 }
 
 /**
- * The api.fetchApi replacement graph_run installs for the duration of ONE queue
- * attempt. Two jobs:
- *
- *  - SCOPE GUARD (#556, above): for a scoped run, inspect every POST /prompt
- *    body BEFORE it leaves and refuse any that dropped the scope — the blocked
- *    call NEVER reaches origFetchApi, so no unscoped prompt is dispatched. The
- *    refusal is shaped like a server 400 so the frontend walks its normal
- *    rejection path (the same dialog a real refused prompt shows), while the
- *    onScopeDropped callback hands graph_run the truthful error to return.
- *
- *  - RESPONSE CAPTURE (#358/#370, moved verbatim from graph_run): app.queuePrompt
- *    SWALLOWS a synchronous top-level rejection (dialog, then discarded — it
- *    never lands on lastNodeErrors), so the raw non-200 /prompt body is the only
- *    place that error exists; and EVERY accepted prompt_id must be captured for
- *    the recovery ledger. onPromptId receives the id NORMALIZED TO A STRING at
- *    capture (0 and "0" are the same run).
- *
- * @param {object}   args
- * @param {Function} args.origFetchApi      The real api.fetchApi (bound).
- * @param {string[]|null} [args.partialTargets]  Resolved scope, or null for a full run.
- * @param {*}        [args.toNodeId]        The requested to_node_id (for the refusal message).
- * @param {Function} [args.onRejection]     ({error, node_errors}) for a non-200 /prompt.
- * @param {Function} [args.onPromptId]      (promptId:string) for each accepted prompt.
- * @param {Function} [args.onScopeDropped]  (message:string) when the guard refuses.
+ * The truthful UNVERIFIED outcome when no scoped dispatch surfaced within the
+ * observation window (a busy queuePrompt deferred the post past its return, or
+ * the prompt build failed silently). Deliberately does NOT say "nothing was
+ * queued" — a deferred post may still land later, unverifiably — only that
+ * nothing is CONFIRMED queued, so the caller must check the ComfyUI queue
+ * rather than assume a scoped run happened.
  */
-export function createRunFetchInterceptor({
+export function scopeUnverifiedError({ toNodeId, timeoutMs }) {
+  return (
+    `run-to-node scope for node ${toNodeId} could not be verified: no scoped ` +
+    `dispatch was observed within ${Math.round(timeoutMs / 1000)}s of queueing ` +
+    `(the frontend deferred or silently dropped the request). Nothing is ` +
+    `CONFIRMED queued — check the ComfyUI queue, and retry the run; the panel ` +
+    `did not report this as a scoped execution (#556).`
+  );
+}
+
+const SCOPE_DROPPED_RESPONSE = () =>
+  new Response(
+    JSON.stringify({
+      error: {
+        type: "partial_execution_scope_dropped",
+        message: "run-to-node scope was not applied; nothing was queued",
+      },
+    }),
+    { status: 400, headers: { "Content-Type": "application/json" } },
+  );
+
+function isPromptPost(route, options) {
+  const method = String(options?.method || "GET").toUpperCase();
+  const path = typeof route === "string" ? route.split("?")[0] : "";
+  return method === "POST" && path.endsWith("/prompt");
+}
+
+// Capture the #358 top-level rejection / #370 prompt_id out of a /prompt
+// response that is ATTRIBUTED to this run. prompt_id is normalized to a string
+// at capture (0 and "0" are the same run).
+async function captureRunResponse(res, { onRejection, onPromptId }) {
+  try {
+    const body = await res.clone().json();
+    if (res.status !== 200) {
+      if (body && (body.error || body.node_errors)) {
+        onRejection?.({ error: body.error ?? null, node_errors: body.node_errors ?? null });
+      }
+    } else if (body && body.prompt_id != null) {
+      onPromptId?.(String(body.prompt_id));
+    }
+  } catch {
+    // non-JSON body / clone unsupported — the caller falls back to lastNodeErrors.
+  }
+}
+
+/**
+ * The api.fetchApi replacement graph_run installs around an UNSCOPED run — the
+ * historical #358/#370 capture wrap, byte-identical in behavior: app.queuePrompt
+ * SWALLOWS a synchronous top-level rejection (dialog, then discarded — it never
+ * lands on lastNodeErrors), so the raw non-200 /prompt body is the only place
+ * that error exists; and EVERY accepted prompt_id is captured for the recovery
+ * ledger. Installed only for the duration of the queuePrompt call.
+ */
+export function createRunFetchInterceptor({ origFetchApi, onRejection = null, onPromptId = null } = {}) {
+  return async function runFetchInterceptor(route, options) {
+    const res = await origFetchApi(route, options);
+    if (isPromptPost(route, options) && res) {
+      await captureRunResponse(res, { onRejection, onPromptId });
+    }
+    return res;
+  };
+}
+
+/**
+ * The api.fetchApi replacement graph_run installs for a SCOPED run — see the
+ * module header for the two dispatch realities this is shaped by.
+ *
+ * Attribution, per POST /prompt body:
+ *  - carries exactly our targets       → OUR scoped dispatch: pass through,
+ *    count it OBSERVED, capture its response (rejection / prompt_id).
+ *  - carries someone else's targets    → unrelated scoped run: untouched,
+ *    never captured.
+ *  - carries NO targets, matches our prompt signature, and this batch still
+ *    has unattributed posts           → OUR dispatch gone wrong (the frontend
+ *    ignored the scope argument): REFUSE before origFetchApi runs — the
+ *    unscoped prompt never leaves the tab — and record state.dropped so the
+ *    caller can retry the other argument shape.
+ *  - anything else (other signature, batch already accounted, unparseable)
+ *                                      → unrelated: untouched, never captured.
+ *
+ * The guard stays installed until the caller has observed a verdict; it does
+ * not restore itself. state = { observed, dropped } is live;
+ * waitForVerdict(ms) resolves true as soon as either is set, false on timeout.
+ */
+export function createScopedRunGuard({
   origFetchApi,
-  partialTargets = null,
+  execIds,
+  signature = null,
+  batch = 1,
   toNodeId = null,
   onRejection = null,
   onPromptId = null,
   onScopeDropped = null,
 } = {}) {
-  const scoped = Array.isArray(partialTargets) && partialTargets.length > 0;
-  return async function runFetchInterceptor(route, options) {
-    const method = String(options?.method || "GET").toUpperCase();
-    const path = typeof route === "string" ? route.split("?")[0] : "";
-    const isPromptPost = method === "POST" && path.endsWith("/prompt");
-    if (isPromptPost && scoped) {
-      const verdict = verifyScopedPromptBody(options?.body, partialTargets);
-      if (!verdict.ok) {
-        onScopeDropped?.(scopeDroppedError({ toNodeId, verdict }));
-        // Refuse WITHOUT touching origFetchApi — the unscoped prompt must never
-        // leave the tab. 400 mirrors a server-side rejection so app.queuePrompt
-        // handles it through its existing refused-prompt path.
-        return new Response(
-          JSON.stringify({
-            error: {
-              type: "partial_execution_scope_dropped",
-              message: "run-to-node scope was not applied; nothing was queued",
-            },
-          }),
-          { status: 400, headers: { "Content-Type": "application/json" } },
-        );
-      }
-    }
-    const res = await origFetchApi(route, options);
-    if (isPromptPost && res) {
-      try {
-        const body = await res.clone().json();
-        if (res.status !== 200) {
-          if (body && (body.error || body.node_errors)) {
-            onRejection?.({
-              error: body.error ?? null,
-              node_errors: body.node_errors ?? null,
-            });
-          }
-        } else if (body && body.prompt_id != null) {
-          onPromptId?.(String(body.prompt_id));
-        }
-      } catch {
-        // non-JSON body / clone unsupported — the caller falls back to lastNodeErrors.
-      }
-    }
-    return res;
+  const expected = (execIds ?? []).map(String);
+  const maxBatch = Math.max(1, Math.floor(Number(batch)) || 1);
+  let oursAccounted = 0; // verified + refused posts attributable to THIS batch
+  const state = { observed: 0, dropped: null };
+  const waiters = new Set();
+  const notify = () => {
+    for (const fire of [...waiters]) fire();
   };
+
+  const guard = async (route, options) => {
+    if (!isPromptPost(route, options)) return origFetchApi(route, options);
+    const targets = targetsFromBody(options?.body);
+    if (targets) {
+      if (!sameSet(targets, expected)) {
+        // A scoped run for SOMEONE ELSE — never touch it.
+        return origFetchApi(route, options);
+      }
+      oursAccounted++;
+      state.observed++;
+      const res = await origFetchApi(route, options);
+      if (res) await captureRunResponse(res, { onRejection, onPromptId });
+      notify();
+      return res;
+    }
+    // Targetless body. Ours-gone-wrong only while it matches our signature and
+    // we still have unattributed batch posts outstanding.
+    if (signature && promptSignatureFromBody(options?.body) === signature && oursAccounted < maxBatch) {
+      oursAccounted++;
+      state.dropped = scopeDroppedError({
+        toNodeId,
+        verdict: { ok: false, reason: "scope_missing", expected, got: null },
+      });
+      onScopeDropped?.(state.dropped);
+      notify();
+      return SCOPE_DROPPED_RESPONSE();
+    }
+    // Unrelated full run (or unattributable) — untouched, never captured.
+    return origFetchApi(route, options);
+  };
+  guard.state = state;
+  guard.waitForVerdict = (ms) =>
+    new Promise((resolve) => {
+      if (state.observed > 0 || state.dropped) return resolve(true);
+      const fire = () => {
+        clearTimeout(timer);
+        waiters.delete(fire);
+        resolve(true);
+      };
+      const timer = setTimeout(() => {
+        waiters.delete(fire);
+        resolve(false);
+      }, ms);
+      waiters.add(fire);
+    });
+  return guard;
 }
