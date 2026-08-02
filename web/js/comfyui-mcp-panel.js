@@ -205,6 +205,7 @@ import {
   activeStaleHint,
 } from "./lib/reconnect-staleness.js";
 import { pickRevertSnapshot } from "./lib/graph-revert.js";
+import { commandFingerprint, createCommandDedupeLedger } from "./lib/command-dedupe.js";
 import { decideOpenStaleness } from "./lib/workflow-open-staleness.js";
 import {
   OPEN_DISK_READ_BUDGET_MS,
@@ -10069,6 +10070,20 @@ function redactBridgeUrl(u) {
   }
 }
 
+// #517 — rid dedupe ledger for inbound agent commands. The bridge correlates
+// every command frame by `rid`, so a frame re-delivered with an ALREADY-SEEN
+// rid (a replay after reconnect, or an orchestrator retry that reuses the
+// request id) is answered with the ORIGINAL reply instead of being executed
+// again — a re-applied graph_add_node / graph_remove_node is how a timed-out
+// mutation plus its retry lands twice (duplicate / orphan nodes). Dedupe keys
+// on rid + PAYLOAD FINGERPRINT: the bridge's re-dispatch of the SAME logical
+// command reproduces the frame exactly, while a rid reused for DIFFERENT work
+// (anomalous — logged once via onRidReuse) executes fresh instead of receiving
+// the old reply. Module-scoped so the ledger survives a socket supersede: the
+// replay can arrive on the REPLACEMENT socket while the first execution was
+// still in flight on the old.
+const commandRidLedger = createCommandDedupeLedger(200, (m) => console.warn(m));
+
 function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCommandReceived, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert }) {
   let sock = null;
   let url = loadBridgeUrl();
@@ -10473,6 +10488,31 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             err?.message ?? err,
           );
         }
+        // #517 — refuse to APPLY the same command twice. Dedupe keys on rid +
+        // payload fingerprint: the bridge's re-dispatch of the SAME logical
+        // command reproduces the frame exactly, so a duplicate delivery is
+        // answered with the ORIGINAL reply (awaited first if the first
+        // execution is still in flight) on THIS socket — no second executor
+        // run, no second activity card — while a rid reused for DIFFERENT work
+        // falls through and executes fresh (logged once by the ledger).
+        const fingerprint = commandFingerprint(msg);
+        const priorRidReply = commandRidLedger.get(msg.rid, fingerprint);
+        if (priorRidReply !== undefined) {
+          let dupReply;
+          try {
+            dupReply = await priorRidReply;
+          } catch {
+            return; // ledger promises never reject — defensive only
+          }
+          if (!isActive()) return; // superseded socket — ignore its late frames
+          try {
+            if (thisSock.readyState === WebSocket.OPEN) thisSock.send(JSON.stringify(dupReply));
+          } catch {
+            // Socket died between receive and reply — agent side times out.
+          }
+          return;
+        }
+        const settleRid = commandRidLedger.begin(msg.rid, fingerprint);
         let reply;
         try {
           let result;
@@ -10694,6 +10734,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             error: coerceMessageText(err?.message ?? err),
           };
         }
+        // Settle the rid ledger BEFORE the dead-socket drop below (#517): even
+        // when this reply can no longer be delivered on THIS socket, a replay of
+        // the same rid on a fresh socket learns the true outcome instead of
+        // re-executing the command.
+        settleRid(reply);
         // A command executor can be ASYNC (ask_user/request_secret block on the user;
         // graph run/save await). If a soft-reload/restart swapped this socket out while
         // we were suspended, this reply belongs to the DEAD session A — it must NOT be
