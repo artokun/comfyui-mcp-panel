@@ -34,10 +34,10 @@
 //    was never its own. A body WITHOUT this run's mark is FOREIGN: passed
 //    through untouched, never captured, never refused, never counted as our
 //    observation — even with an identical node set and identical targets. A
-//    body WITH this run's mark is this run: signature+targets exact ⇒
-//    observed; anything else (scope missing/wrong/extra, or a graph that
-//    changed under a deferred item) ⇒ OUR corrupted dispatch, refused before
-//    it leaves (batch-bounded).
+//    body WITH this run's mark is this run: content-hash + targets exact ⇒
+//    observed; anything else (scope missing/wrong/extra, or CONTENT DRIFT —
+//    the graph changed under a deferred item) ⇒ OUR corrupted dispatch,
+//    refused before it leaves (batch-bounded).
 //
 //  - QUEUE ITEM TAG: the targets array carries a non-enumerable per-run Symbol
 //    tag. Frontend builds store the array by reference in queueItems (either
@@ -63,12 +63,18 @@
 //    our dispatch is OBSERVED or a bounded timeout — and the timeout path
 //    decides cancel-vs-sentinel BEFORE the finally restores fetchApi.
 //
-//  - The prompt SIGNATURE (sorted node-id|class_type set of the graphToPrompt
-//    output, widget values excluded so beforeQueued seed randomization can't
-//    blur it) must be computable BEFORE dispatch. If it isn't, attribution is
-//    impossible, so the run FAILS CLOSED: it refuses upfront with a truthful
-//    error and never calls queuePrompt — "cannot safely dispatch", never
-//    "dispatch and hope".
+//  - The prompt CONTENT HASH (r7) must be computable BEFORE dispatch: a
+//    stable hash of the full queued prompt — node ids, class types, links,
+//    every input/widget value — excluding ONLY the inputs of widgets that
+//    self-mutate at queue time (beforeQueued seeds and the like), which
+//    change between any two serializations of the SAME graph by design. A
+//    topology-only fingerprint is insufficient: a busy queue defers
+//    serialization to post time, and a user edit in between (a changed
+//    widget value, a rewired link) leaves node ids/types untouched while
+//    rendering a DIFFERENT workflow — the guard refuses that drifted post
+//    and the run ends with a truthful "the graph changed" error. If the
+//    hash can't be computed at all (graphToPrompt failed), the run FAILS
+//    CLOSED: it refuses upfront and never calls queuePrompt.
 //
 // Extracted as a pure module so the SAME orchestration graph_run runs is
 // drivable from `node --test` (the live app.queuePrompt path can't be).
@@ -109,33 +115,86 @@ export function queuePromptScopeArgs(partialTargets) {
   return [partialTargets, { queueNodeIds: partialTargets }];
 }
 
+// Two-seed 32-bit FNV-1a, concatenated — change-detection hashing only (no
+// security requirement): stable across key order (canonicalized before
+// hashing) and cheap enough to run once at queue time + once per observed post.
+function fnv1a32(str, seed) {
+  let h = seed >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+const fnv1aHex = (s) =>
+  fnv1a32(s, 0x811c9dc5).toString(16).padStart(8, "0") +
+  fnv1a32(s, 0x9e3779b9).toString(16).padStart(8, "0");
+
 /**
- * The prompt signature used to attribute a POST /prompt body to THIS run: the
- * sorted node-id|class_type pairs of a graphToPrompt output (the API workflow).
- * Widget values are EXCLUDED — queuePrompt randomizes seeds via beforeQueued
- * between serialization calls, so a value-level fingerprint would miss our own
- * dispatch. Two runs of the same unedited graph share a signature; the queue
- * mark (module header) is what actually separates them.
+ * The CONTENT fingerprint attributing a POST /prompt body to THIS run (r7):
+ * a stable hash of the full queued prompt — node ids, class types, links, and
+ * every input/widget value — canonicalized (sorted keys) so serialization
+ * order can't blur it. A topology-only fingerprint (node-id|class_type) is
+ * NOT enough: a busy queue defers serialization to post time, and a user edit
+ * in between (a changed widget value, a rewired link) leaves the topology
+ * untouched while rendering a DIFFERENT workflow.
+ *
+ * The ONLY values excluded are the inputs of widgets that SELF-MUTATE at
+ * queue time (a `beforeQueued` hook — stock seed widgets with
+ * control_after_generate, etc.): those change between any two serializations
+ * of the SAME graph by design, so hashing them would refuse our own dispatch.
+ * collectSelfMutatingInputNames derives the exclusion set from the live
+ * graph; name-level exclusion (not per-node) trades a little precision for
+ * not having to map flattened colon-path prompt ids back to live nodes.
  */
-export function promptSignature(output) {
+export function promptContentHash(output, excludeInputNames = null) {
   if (!output || typeof output !== "object") return null;
-  const keys = Object.keys(output);
+  const keys = Object.keys(output).sort();
   if (!keys.length) return null;
-  return keys
-    .sort()
-    .map((k) => `${k}${output[k]?.class_type ?? ""}`)
-    .join("|");
+  const canon = keys.map((k) => {
+    const node = output[k] ?? {};
+    const inputs = node.inputs && typeof node.inputs === "object" ? node.inputs : {};
+    const names = Object.keys(inputs)
+      .filter((n) => !excludeInputNames?.has(n))
+      .sort();
+    return [k, node.class_type ?? null, names.map((n) => [n, inputs[n]])];
+  });
+  return fnv1aHex(JSON.stringify(canon));
 }
 
-/** Signature of a raw POST /prompt body, or null when unparseable/odd. */
-export function promptSignatureFromBody(bodyText) {
+/** Content hash of a raw POST /prompt body, or null when unparseable/odd. */
+export function promptContentHashFromBody(bodyText, excludeInputNames = null) {
   let body;
   try {
     body = JSON.parse(bodyText);
   } catch {
     return null;
   }
-  return promptSignature(body?.prompt);
+  return promptContentHash(body?.prompt, excludeInputNames);
+}
+
+/**
+ * Names of inputs whose owning widgets SELF-MUTATE at queue time (a
+ * `beforeQueued` hook), collected from the live root graph and every nested
+ * subgraph. These are the ONLY values the content hash excludes — everything
+ * a user can edit is covered.
+ */
+export function collectSelfMutatingInputNames(rootGraph) {
+  const names = new Set();
+  const seen = new Set();
+  const walk = (g) => {
+    if (!g || seen.has(g)) return;
+    seen.add(g);
+    for (const node of g._nodes ?? []) {
+      if (!node) continue;
+      for (const w of node.widgets ?? []) {
+        if (typeof w?.beforeQueued === "function" && w.name != null) names.add(String(w.name));
+      }
+      if (node.subgraph) walk(node.subgraph);
+    }
+  };
+  walk(rootGraph);
+  return names;
 }
 
 /** The body's queue-position `number` as a Number, or null when absent/unparseable. */
@@ -195,11 +254,14 @@ export function verifyScopedPromptBody(bodyText, expectedExecIds) {
  */
 export function scopeDroppedError({ toNodeId, verdict }) {
   const detail =
-    verdict?.reason === "scope_mismatch"
-      ? `the POST /prompt body carried partial_execution_targets ` +
-        `${JSON.stringify(verdict.got)} instead of ${JSON.stringify(verdict.expected)}`
-      : `the POST /prompt body carried no partial_execution_targets — this ` +
-        `frontend build ignored the run-to-node argument`;
+    verdict?.reason === "graph_changed"
+      ? `the workflow graph CHANGED after the run was queued — the deferred ` +
+        `dispatch would render a modified workflow, not the one that was scoped`
+      : verdict?.reason === "scope_mismatch"
+        ? `the POST /prompt body carried partial_execution_targets ` +
+          `${JSON.stringify(verdict.got)} instead of ${JSON.stringify(verdict.expected)}`
+        : `the POST /prompt body carried no partial_execution_targets — this ` +
+          `frontend build ignored the run-to-node argument`;
   return (
     `run-to-node scope for node ${toNodeId} was NOT applied: ${detail}. ` +
     `Nothing was queued — refusing to fall through to a full-graph execution (#556).`
@@ -268,12 +330,15 @@ export function scopeUnverifiedError({ toNodeId, timeoutMs, cancelled = false, v
  * refusal, so the attempt is terminal: `verified` prompts are queued (scoped),
  * one was refused, and the rest never posted. Never reported as dispatched.
  */
-export function scopePartialBatchError({ toNodeId, verified, refused, batch }) {
+export function scopePartialBatchError({ toNodeId, verified, refused, batch, graphChanged = false }) {
   const unposted = Math.max(0, batch - verified - refused);
+  const cause = graphChanged
+    ? `was refused after the graph changed mid-batch`
+    : `was refused after its scope was lost mid-batch`;
   return (
     `run-to-node scope for node ${toNodeId}: batch incomplete — ${verified} of ` +
     `${batch} prompts were verified and are queued WITH the scope, ${refused} ` +
-    `was refused after its scope was lost mid-batch (it did NOT execute, and no ` +
+    `${cause} (it did NOT execute, and no ` +
     `full-graph dispatch left the tab)` +
     (unposted ? `, and ${unposted} never posted` : "") +
     `. Re-run for the remaining prompts (#556).`
@@ -379,21 +444,28 @@ export function createRunFetchInterceptor({ origFetchApi, onRejection = null, on
 /**
  * The api.fetchApi replacement dispatchScopedRun installs for a SCOPED run —
  * see the module header for the run-identity model. Per POST /prompt body:
- *  - NO queue mark           → FOREIGN: passed through untouched, never
- *                              captured, never refused, never observed — even
- *                              with our node set and our targets.
- *  - mark + signature + exact targets → OUR scoped dispatch: passed through,
- *                              counted OBSERVED, response captured.
- *  - mark + anything else    → OUR corrupted dispatch (scope dropped/mangled,
- *                              or the graph changed under a deferred item):
- *                              refused before it leaves, batch-bounded.
- * state = { observed, dropped } is live; waitForVerdict(ms) resolves true as
- * soon as either is set, false on timeout.
+ *  - NO queue mark                → FOREIGN: passed through untouched, never
+ *                                   captured, never refused, never observed —
+ *                                   even with our node set and our targets.
+ *  - mark + content hash + exact targets → OUR scoped dispatch: passed
+ *                                   through, counted OBSERVED once its fetch
+ *                                   completes (r6), response captured.
+ *  - mark + anything else         → OUR corrupted dispatch: scope missing or
+ *                                   wrong/extra/partial targets, or the
+ *                                   CONTENT HASH mismatched (r7: the graph
+ *                                   changed under a deferred item — a user
+ *                                   edit, or the deferred serialization
+ *                                   picking up a modified graph): refused
+ *                                   before it leaves, batch-bounded.
+ * state = { observed, rejected, refused, dropped, droppedReason, failed } is
+ * live; waitForVerdict(ms) resolves true at any terminal state, false on
+ * timeout.
  */
 export function createScopedRunGuard({
   origFetchApi,
   execIds,
-  signature,
+  contentHash,
+  volatileNames = null,
   batch = 1,
   toNodeId = null,
   queueMark,
@@ -403,7 +475,7 @@ export function createScopedRunGuard({
 } = {}) {
   const expected = (execIds ?? []).map(String);
   const maxBatch = Math.max(1, Math.floor(Number(batch)) || 1);
-  const state = { observed: 0, rejected: 0, refused: 0, dropped: null, failed: null };
+  const state = { observed: 0, rejected: 0, refused: 0, dropped: null, droppedReason: null, failed: null };
   const waiters = new Set();
   const notify = () => {
     for (const fire of [...waiters]) fire();
@@ -418,8 +490,9 @@ export function createScopedRunGuard({
       return origFetchApi(route, options);
     }
     const targets = targetsFromBody(options?.body);
-    const sigOk = signature && promptSignatureFromBody(options?.body) === signature;
-    if (sigOk && targets && sameSet(targets, expected)) {
+    const contentOk =
+      contentHash && promptContentHashFromBody(options?.body, volatileNames) === contentHash;
+    if (contentOk && targets && sameSet(targets, expected)) {
       // OUR scoped dispatch. It counts as VERIFIED only when the fetch itself
       // completes with a real 200 + prompt_id (r6) — a thrown fetch or a
       // malformed response is a terminal dispatch FAILURE, never a success;
@@ -455,18 +528,19 @@ export function createScopedRunGuard({
       notify();
       return res;
     }
-    // OUR dispatch CORRUPTED — scope missing, wrong/extra/partial targets
-    // (["14","9"] would run an unwanted branch), or the graph changed while
-    // our item sat deferred (scope unverifiable against the new graph).
+    // OUR dispatch CORRUPTED. Content drift (r7) takes naming precedence: a
+    // changed graph would render the wrong workflow even with the scope
+    // intact. Then the scope itself: missing, or wrong/extra/partial targets.
     if (state.refused < maxBatch) {
       state.refused++;
       if (state.dropped == null) {
-        state.dropped = scopeDroppedError({
-          toNodeId,
-          verdict: targets
+        const verdict = !contentOk
+          ? { ok: false, reason: "graph_changed" }
+          : targets
             ? { ok: false, reason: "scope_mismatch", expected, got: targets }
-            : { ok: false, reason: "scope_missing", expected, got: null },
-        });
+            : { ok: false, reason: "scope_missing", expected, got: null };
+        state.droppedReason = verdict.reason;
+        state.dropped = scopeDroppedError({ toNodeId, verdict });
         onScopeDropped?.(state.dropped);
       }
       notify();
@@ -578,17 +652,22 @@ export async function dispatchScopedRun({
         `prompt. Nothing was queued rather than risk a full-graph execution (#556).`,
     };
   }
-  // The signature that (with the queue mark) attributes a POST /prompt body to
-  // THIS run. No signature ⇒ no attribution ⇒ fail closed BEFORE dispatch.
-  let signature = null;
+  // The CONTENT HASH that (with the queue mark) attributes a POST /prompt
+  // body to THIS run: the full prompt we are about to queue — ids, class
+  // types, links, widget values — minus only the self-mutating (beforeQueued)
+  // inputs that change between any two serializations by design. No hash ⇒
+  // no attribution ⇒ fail closed BEFORE dispatch.
+  let contentHash = null;
+  let volatileNames = null;
   try {
     if (typeof app.graphToPrompt === "function") {
-      signature = promptSignature((await app.graphToPrompt())?.output);
+      volatileNames = collectSelfMutatingInputNames(app?.rootGraph);
+      contentHash = promptContentHash((await app.graphToPrompt())?.output, volatileNames);
     }
   } catch {
-    signature = null;
+    contentHash = null;
   }
-  if (!signature) {
+  if (!contentHash) {
     return { outcome: "unverifiable", queueMark: mark, error: scopeUnattributableError({ toNodeId }) };
   }
   // Ownership tag for the timeout cancellation (see QUEUE_ITEM_TAG).
@@ -605,7 +684,8 @@ export async function dispatchScopedRun({
     const guard = createScopedRunGuard({
       origFetchApi,
       execIds,
-      signature,
+      contentHash,
+      volatileNames,
       batch,
       toNodeId,
       queueMark: mark,
@@ -686,6 +766,12 @@ export async function dispatchScopedRun({
     if (guard.state.observed >= batch) {
       return { outcome: "dispatched", queueMark: mark, verified: guard.state.observed };
     }
+    // r7 CONTENT DRIFT with ZERO verified posts is NOT an argument-shape
+    // problem — retrying the other shape would produce the same drifted post.
+    // Terminal refusal naming that the graph changed under the deferred item.
+    if (guard.state.observed === 0 && guard.state.droppedReason === "graph_changed") {
+      return { outcome: "refused", queueMark: mark, verified: 0, error: guard.state.dropped };
+    }
     // A corrupted post with ZERO verified posts means this argument SHAPE was
     // dropped by the frontend — nothing was queued, so retrying the other
     // shape can never double-queue.
@@ -694,9 +780,10 @@ export async function dispatchScopedRun({
       continue;
     }
     // r5 TERMINAL PARTIAL: the shape works (≥1 verified), then a later batch
-    // post lost its scope and was refused — the frontend's batch loop breaks
-    // on that refusal, so no more posts of this attempt will come. Report the
-    // truthful counts; never "dispatched"; no shape retry (the shape works).
+    // post lost its scope (or the graph drifted) and was refused — the
+    // frontend's batch loop breaks on that refusal, so no more posts of this
+    // attempt will come. Report the truthful counts; never "dispatched"; no
+    // shape retry (the shape works).
     return {
       outcome: "refused",
       queueMark: mark,
@@ -706,6 +793,7 @@ export async function dispatchScopedRun({
         verified: guard.state.observed,
         refused: guard.state.refused,
         batch,
+        graphChanged: guard.state.droppedReason === "graph_changed",
       }),
     };
   }

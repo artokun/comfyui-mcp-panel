@@ -18,8 +18,9 @@ import {
   newScopedQueueMark,
   QUEUE_ITEM_TAG,
   queuePromptScopeArgs,
-  promptSignature,
-  promptSignatureFromBody,
+  promptContentHash,
+  promptContentHashFromBody,
+  collectSelfMutatingInputNames,
   verifyScopedPromptBody,
   scopeDroppedError,
   scopeUnverifiedError,
@@ -68,7 +69,7 @@ const OUR_OUTPUT = {
   "9": { class_type: "SaveImage", inputs: {} },
   "14": { class_type: "PreviewAny", inputs: {} },
 };
-const OUR_SIGNATURE = promptSignature(OUR_OUTPUT);
+const OUR_HASH = promptContentHash(OUR_OUTPUT);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -167,13 +168,35 @@ test("#556 queuePromptScopeArgs: no scope ⇒ [undefined]; scope ⇒ array first
   assert.deepEqual(second, { queueNodeIds: ["76:34"] });
 });
 
-test("#556 promptSignature: node-id|class_type set, widget values excluded, order-insensitive", () => {
-  const a = promptSignature({ "9": { class_type: "B", inputs: { seed: 1 } }, "3": { class_type: "A" } });
-  const b = promptSignature({ "3": { class_type: "A" }, "9": { class_type: "B", inputs: { seed: 999 } } });
-  assert.equal(a, b);
-  assert.notEqual(promptSignature({ "3": { class_type: "A" } }), a);
-  assert.equal(promptSignatureFromBody(JSON.stringify({ prompt: OUR_OUTPUT })), OUR_SIGNATURE);
-  assert.equal(promptSignatureFromBody("not-json{"), null);
+test("#556 r7 promptContentHash: full CONTENT covered (ids, class types, links, widget values), key-order-insensitive", () => {
+  const a = promptContentHash({ "9": { class_type: "B", inputs: { steps: 20, model: ["3", 0] } }, "3": { class_type: "A", inputs: {} } });
+  const b = promptContentHash({ "3": { class_type: "A", inputs: {} }, "9": { class_type: "B", inputs: { model: ["3", 0], steps: 20 } } });
+  assert.equal(a, b, "same content, any key order ⇒ same hash");
+  assert.notEqual(promptContentHash({ "9": { class_type: "B", inputs: { steps: 25, model: ["3", 0] } }, "3": { class_type: "A", inputs: {} } }), a,
+    "a changed WIDGET VALUE changes the hash");
+  assert.notEqual(promptContentHash({ "9": { class_type: "B", inputs: { steps: 20, model: ["4", 0] } }, "3": { class_type: "A", inputs: {} } }), a,
+    "a changed LINK changes the hash");
+  assert.notEqual(promptContentHash({ "3": { class_type: "A" } }), a, "a changed node set changes the hash");
+  // The ONLY tolerance: inputs whose widgets self-mutate at queue time.
+  const withSeed = (seed) => promptContentHash(
+    { "3": { class_type: "KSampler", inputs: { seed, steps: 20 } } },
+    new Set(["seed"]),
+  );
+  assert.equal(withSeed(1), withSeed(999), "a self-mutating (beforeQueued) input is excluded — our own dispatch isn't refused over a rerolled seed");
+  assert.equal(promptContentHashFromBody(JSON.stringify({ prompt: OUR_OUTPUT })), OUR_HASH);
+  assert.equal(promptContentHashFromBody("not-json{"), null);
+});
+
+test("#556 r7 collectSelfMutatingInputNames: finds beforeQueued widgets across the root graph and nested subgraphs", () => {
+  const root = {
+    _nodes: [
+      { id: 1, widgets: [{ name: "seed", beforeQueued() {} }, { name: "steps" }] },
+      { id: 2, widgets: null, subgraph: { _nodes: [{ id: 3, widgets: [{ name: "noise_seed", beforeQueued() {} }] }] } },
+    ],
+  };
+  const names = collectSelfMutatingInputNames(root);
+  assert.deepEqual([...names].sort(), ["noise_seed", "seed"]);
+  assert.equal(collectSelfMutatingInputNames(null).size, 0);
 });
 
 test("#556 verifyScopedPromptBody: exact scope passes; missing/empty/wrong/extra/unparseable all refuse", () => {
@@ -227,7 +250,7 @@ test("#556 unscoped interceptor: captures top-level rejection and prompt_id, lea
 test("#556 guard: OUR marked post with signature+exact targets ⇒ observed, dispatched verbatim, prompt_id captured", async () => {
   const spy = makeServer();
   const ids = [];
-  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14, queueMark: MARK_A, onPromptId: (p) => ids.push(p) });
+  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A, onPromptId: (p) => ids.push(p) });
   const [route, options] = promptPost(frontendBody({ targets: ["14"] }));
   const res = await guard(route, options);
   assert.equal(spy.calls.length, 1);
@@ -240,7 +263,7 @@ test("#556 guard: OUR marked post with signature+exact targets ⇒ observed, dis
 test("#556 r6: an attributed post whose fetch THROWS is a dispatch FAILURE — never counted as verified, never captured", async () => {
   const spy = makeServer(async () => { throw new Error("connection reset"); });
   let captured = null;
-  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14, queueMark: MARK_A, onPromptId: (p) => (captured = p) });
+  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A, onPromptId: (p) => (captured = p) });
   await assert.rejects(guard(...promptPost(frontendBody({ targets: ["14"] }))), /connection reset/);
   assert.equal(guard.state.observed, 0, "a thrown fetch never satisfies the batch verdict");
   assert.match(guard.state.failed, /connection reset/);
@@ -252,7 +275,7 @@ test("#556 r6: an attributed post with a MALFORMED response (200 without prompt_
   for (const bad of [jsonResponse(200, {}), jsonResponse(500, {}), jsonResponse(200, { prompt_id: null })]) {
     const spy = makeServer(async () => bad);
     let captured = null;
-    const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14, queueMark: MARK_A, onPromptId: (p) => (captured = p) });
+    const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A, onPromptId: (p) => (captured = p) });
     const res = await guard(...promptPost(frontendBody({ targets: ["14"] })));
     assert.equal(res, bad, "the real response passes back to the frontend");
     assert.equal(guard.state.observed, 0, `HTTP ${bad.status} malformed ⇒ not verified`);
@@ -265,7 +288,7 @@ test("#556 r6: a GENUINE server rejection still flows through the established #3
   const rejectionBody = { error: { type: "prompt_outputs_failed_validation", message: "bad input" } };
   const spy = makeServer(async () => jsonResponse(400, rejectionBody));
   let rejection = null;
-  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14, queueMark: MARK_A, onRejection: (r) => (rejection = r) });
+  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A, onRejection: (r) => (rejection = r) });
   await guard(...promptPost(frontendBody({ targets: ["14"] })));
   assert.equal(guard.state.rejected, 1);
   assert.equal(guard.state.failed, null, "a server rejection is NOT a dispatch failure");
@@ -277,7 +300,7 @@ test("#556 guard: OUR marked post with MISSING or WRONG/EXTRA targets ⇒ refuse
   for (const bad of [null, ["9"], ["14", "9"]]) {
     const spy = makeServer();
     let dropped = null;
-    const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14, queueMark: MARK_A, onScopeDropped: (m) => (dropped = m) });
+    const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A, onScopeDropped: (m) => (dropped = m) });
     const res = await guard(...promptPost(frontendBody({ targets: bad })));
     assert.equal(spy.calls.length, 0, `targets ${JSON.stringify(bad)} must never leave the tab`);
     assert.equal(res.status, 400);
@@ -290,7 +313,7 @@ test("#556 r3 P0-3: an UNMARKED post is FOREIGN even with our node set AND our t
   const spy = makeServer();
   let captured = null, dropped = null;
   const guard = createScopedRunGuard({
-    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14, queueMark: MARK_A,
+    origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
     onPromptId: (p) => (captured = p), onScopeDropped: (m) => (dropped = m),
   });
   // A foreign scoped run to the same node (number=0 ⇒ no body.number ⇒ unmarked).
@@ -309,7 +332,7 @@ test("#556 r3 P0-3: an UNMARKED post is FOREIGN even with our node set AND our t
 
 test("#556 guard: a marked post whose graph CHANGED under the deferred item (signature mismatch) is corrupted ⇒ refused", async () => {
   const spy = makeServer();
-  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14, queueMark: MARK_A });
+  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A });
   const changedOutput = { "3": { class_type: "KSampler" }, "20": { class_type: "SaveImage" } };
   const res = await guard(...promptPost(frontendBody({ output: changedOutput, targets: ["14"] })));
   assert.equal(res.status, 400, "scope is unverifiable against the changed graph — refuse");
@@ -483,6 +506,83 @@ test("#556 r4 P0-2 integration: two overlapping scoped runs — B's traffic pass
     const resA = await appA.postDeferred(appA.deferredItem);
     assert.equal(resA.status, 400, "A's sentinel still constrains exactly A's items");
     assert.equal(server.calls.length, 1, "A's corrupted dispatch never escapes");
+  } finally {
+    stop();
+  }
+});
+
+test("#556 r7 integration: a deferred item serialized from a DRIFTED graph (same topology + targets, changed widget value or link) is REFUSED — zero dispatch, error names the drift, no shape retry", async () => {
+  const stop = keepAlive();
+  try {
+    for (const drift of [
+      { "3": { class_type: "KSampler", inputs: { steps: 25 } } }, // widget value changed
+      { "9": { class_type: "SaveImage", inputs: { images: ["4", 0] } } }, // link rewired
+    ]) {
+      const server = makeServer();
+      const apiTarget = { fetchApi: server };
+      const driftedOutput = { ...OUR_OUTPUT, ...drift };
+      const app = makeFrontend({ shape: "shim", defer: true, apiTarget });
+      // The deferred item posts with the SAME targets but the DRIFTED content
+      // (same node ids/types — a topology-only fingerprint would accept it).
+      app.postDeferred = async (item) => {
+        const body = frontendBody({ output: driftedOutput, number: item.number, targets: ["14"] });
+        app.posted.push(body);
+        return apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+      };
+      const promise = dispatchScopedRun({
+        app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+        verifyTimeoutMs: 500,
+      });
+      await sleep(20);
+      const res = await app.postDeferred(app.deferredItem);
+      const result = await promise;
+      assert.equal(res.status, 400, `drift ${JSON.stringify(drift)} is refused`);
+      assert.equal(result.outcome, "refused");
+      assert.match(result.error, /graph CHANGED/i, "the error names the drift");
+      assert.match(result.error, /Nothing was queued/);
+      assert.equal(server.calls.length, 0, "the drifted prompt never left the tab");
+      assert.equal(app.posted.length, 1, "no shape retry — content drift is not an argument-shape problem");
+    }
+  } finally {
+    stop();
+  }
+});
+
+test("#556 r7 integration: a deferred post differing ONLY in a self-mutating (beforeQueued) input is still OUR dispatch — observed and delivered", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const outputAtQueue = {
+      "3": { class_type: "KSampler", inputs: { seed: 111, steps: 20 } },
+      "14": { class_type: "PreviewAny", inputs: {} },
+    };
+    // The live graph has a beforeQueued seed widget — its value is excluded
+    // from the content hash, so a rerolled seed can't refuse our own dispatch.
+    const app = makeFrontend({ shape: "shim", defer: true, apiTarget, output: outputAtQueue });
+    app.rootGraph = { _nodes: [{ id: 3, widgets: [{ name: "seed", beforeQueued() {} }, { name: "steps" }] }] };
+    const ids = [];
+    const promise = dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+      verifyTimeoutMs: 500,
+      onPromptId: (p) => ids.push(p),
+    });
+    await sleep(20);
+    // The deferred serialization rerolled the seed (beforeQueued) — nothing else changed.
+    app.postDeferred = async (item) => {
+      const body = frontendBody({
+        output: { ...outputAtQueue, "3": { class_type: "KSampler", inputs: { seed: 999999, steps: 20 } } },
+        number: item.number,
+        targets: ["14"],
+      });
+      app.posted.push(body);
+      return apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+    };
+    await app.postDeferred(app.deferredItem);
+    const result = await promise;
+    assert.equal(result.outcome, "dispatched", "a rerolled seed does not refuse our own dispatch");
+    assert.deepEqual(ids, ["srv-1"]);
+    assert.equal(server.calls.length, 1);
   } finally {
     stop();
   }
