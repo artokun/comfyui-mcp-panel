@@ -11265,6 +11265,19 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       if (msg && msg.type === "turn_anchor" && typeof msg.uuid === "string") {
         onTurnAnchor?.(msg.uuid);
       }
+      // #694 (epoch-first) — stamp the session epoch from ANY frame that
+      // carries it: the orchestrator now sends a tiny "session_epoch" frame
+      // the instant a hello lands (before async model discovery), so the epoch
+      // advances immediately instead of only when the `models` frame arrives.
+      // A legacy orchestrator sends no epoch on those early frames — the
+      // models-frame stamp below still covers them.
+      if (msg && typeof msg.epoch === "string") {
+        try {
+          thisSock.__cmcpBridgeEpoch = msg.epoch;
+        } catch {
+          /* exotic WebSocket impl — epoch matching stays absent/absent */
+        }
+      }
       // Live model catalog from the orchestrator (SDK-probed). This is also the
       // orchestrator HANDSHAKE — receiving it proves a real panel agent is behind
       // the socket, so it's the moment we truthfully flip to "connected".
