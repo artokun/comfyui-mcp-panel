@@ -104,6 +104,7 @@ import {
   rawWorkflowObject,
   resolveUnsavedInstanceUuid,
   sameWorkflowObject,
+  shouldCarryIdentityAcrossSaveSwap,
   shouldForkEmbeddedUuidForLiveOwner,
   shouldForkEmbeddedWorkflowUuid,
   shouldForkInPlaceReload,
@@ -1395,6 +1396,9 @@ function installCreateBoundaryFork(appRef) {
     if (_loadGraphDataForkInstalled || !appRef || typeof appRef.loadGraphData !== "function") return;
     const orig = appRef.loadGraphData.bind(appRef);
     appRef.loadGraphData = function (graphData, clean, restoreView, workflow, options = {}) {
+      // Set when a CREATION mints a stamp without a workflow object to key on —
+      // registered against the tab the load activates, after orig (below).
+      let ownerlessStampUuid = null;
       try {
         if (graphData && typeof graphData === "object" && !Array.isArray(graphData)) {
           const noFork = Boolean(options && options.__cmcpNoFork);
@@ -1475,6 +1479,11 @@ function installCreateBoundaryFork(appRef) {
             if (workflow && typeof workflow === "object") {
               _workflowObjectUuids.set(workflow, freshUuid);
               rememberWorkflowUuidOwner(freshUuid, workflow);
+            } else {
+              // A creation passes no workflow object — the receiving tab only
+              // exists AFTER the load. Register the stamp against it post-orig
+              // (below), or the tag floats ownerless (#349 r3 P0).
+              ownerlessStampUuid = freshUuid;
             }
           } else if (cacheIncomingUuid) {
             _workflowObjectUuids.set(workflow, cacheIncomingUuid);
@@ -1497,7 +1506,35 @@ function installCreateBoundaryFork(appRef) {
       } catch {
         // Never let disclosure bookkeeping break a graph load either.
       }
-      return orig(graphData, clean, restoreView, workflow, options);
+      const result = orig(graphData, clean, restoreView, workflow, options);
+      if (ownerlessStampUuid) {
+        // #349 r3 P0 — a creation-minted tag must NEVER float ownerless: with no
+        // registered claim, a live-but-never-resolved created tab looks like
+        // stale bookkeeping to the desync guard's orphaned-tag rebind and its
+        // foreign root can be re-stamped over. Creations switch to the tab they
+        // create, so register against the post-load ACTIVE workflow — verified,
+        // when its tracker already exposes the stamp, by that stamp; when the
+        // tracker is absent or lagging, register anyway: a mis-attributed claim
+        // fails CLOSED (a spurious desync refusal), where an ownerless tag fails
+        // OPEN (a wrong-canvas write).
+        const stampUuid = ownerlessStampUuid;
+        const register = () => {
+          try {
+            const active = appRef?.extensionManager?.workflow?.activeWorkflow;
+            if (!active || typeof active !== "object") return;
+            const stamped =
+              active?.changeTracker?.activeState?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD];
+            if (stamped && stamped !== stampUuid) return; // the load landed in a different tab
+            if (!_workflowObjectUuids.get(active)) _workflowObjectUuids.set(active, stampUuid);
+            rememberWorkflowUuidOwner(stampUuid, active);
+          } catch {
+            // Identity bookkeeping must never break a graph load.
+          }
+        };
+        if (result && typeof result.then === "function") result.then(register, register);
+        else register();
+      }
+      return result;
     };
     _loadGraphDataForkInstalled = true;
   } catch (err) {
@@ -3217,6 +3254,12 @@ async function programmaticSave(name) {
   // workflow changed during our pre-probe — restoring the "capture A before the first
   // await" guarantee the pre-probe would otherwise have widened into a wrong-tab window.
   const expectWf = svc?.activeWorkflow;
+  // #557 r3 — capture the pre-save identity NOW so a save's object SWAP can be
+  // threaded through the replacement event: the predecessor/successor pair is
+  // only known for certain here. Static path equality cannot decide it — a
+  // closed→reopened object at the same path is a NEW workflow (r3 P0), while a
+  // swapped successor is the same continuous tab and must keep its identity.
+  const preSwapUuid = expectWf ? _workflowObjectUuids.get(expectWf) || workflowStableUuid(expectWf) : null;
   // Capture POSITIVE pre-save evidence of the source file's existence: a confirmed 200
   // is the ONLY basis on which a post-save 404 may be treated as a real move/deletion
   // of a persisted original. Without it, a source that 404s afterward simply never
@@ -3245,6 +3288,18 @@ async function programmaticSave(name) {
     expect: expectWf, // #330: refuse if the user switched tabs during our pre-save HEAD
   });
   const outcome = describeSaveOutcome(details);
+  // #557 r3 — thread the identity across the swap for an in-place/first save
+  // (never a Save-As copy, which is a NEW workflow): seed the successor object
+  // with the pre-save uuid so the desync guard and the command fence keep
+  // agreeing with the root tag without waiting for the lazy resolver path.
+  const postSwapWf = svc?.activeWorkflow;
+  if (
+    preSwapUuid &&
+    shouldCarryIdentityAcrossSaveSwap({ preWf: expectWf, postWf: postSwapWf, savedAs: outcome.saved_as })
+  ) {
+    _workflowObjectUuids.set(postSwapWf, preSwapUuid);
+    rememberWorkflowUuidOwner(preSwapUuid, postSwapWf);
+  }
   // INDEPENDENT post-save verification (a second backstop, at the tool layer) for a
   // Save-As COPY: attest whether the REAL source file is still on disk. This reports
   // PATH PRESENCE (`original_on_disk`), not content identity — an honest, disk-checked

@@ -12,6 +12,7 @@ import {
   rawWorkflowObject,
   resolveUnsavedInstanceUuid,
   sameWorkflowObject,
+  shouldCarryIdentityAcrossSaveSwap,
   shouldForkEmbeddedUuidForLiveOwner,
   shouldForkEmbeddedWorkflowUuid,
   shouldForkInPlaceReload,
@@ -236,6 +237,42 @@ test('sameWorkflowObject: distinct workflows never match — incl. same-path uns
   assert.equal(sameWorkflowObject(null, raw), false)
   assert.equal(sameWorkflowObject(raw, null), false)
   assert.equal(sameWorkflowObject(null, null), false)
+})
+
+// #558 r3 P0 — path equality alone must NOT prove object identity: two distinct
+// objects sharing a path are the same identity ONLY across a continuous-lifetime
+// replacement (the save-swap, threaded via the replacement event). A
+// closed→reopened object at the same path is a NEW workflow.
+test('sameWorkflowObject r3: same-path distinct objects are NOT one identity (closed→reopened is new)', () => {
+  assert.equal(sameWorkflowObject(
+    { isPersisted: true, path: 'workflows/b.json', changeTracker: { activeState: null } },
+    { isPersisted: true, path: 'workflows/b.json', changeTracker: { activeState: null } }
+  ), false)
+  assert.equal(sameWorkflowObject(
+    { isPersisted: true, path: 'workflows/b.json', changeTracker: {} },
+    { isPersisted: true, path: 'workflows/b.json', changeTracker: null }
+  ), false)
+  assert.equal(sameWorkflowObject(
+    { isPersisted: true, path: 'workflows/b.json' },
+    { isPersisted: true, path: 'workflows/b.json' }
+  ), false)
+})
+
+test('#557 r3: identity carries across a save object-swap ONLY as a continuous-lifetime replacement', () => {
+  const pre = { isPersisted: true, path: 'workflows/x.json', changeTracker: {} }
+  const successor = { isPersisted: true, path: 'workflows/x.json', changeTracker: {} }
+  // In-place / first save that swapped the active object → carry.
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({ preWf: pre, postWf: successor, savedAs: false }), true)
+  // A Save-As COPY starts a new workflow → never carry (#226/#570).
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({ preWf: pre, postWf: successor, savedAs: true }), false)
+  // Same object (no swap) → nothing to carry.
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({ preWf: pre, postWf: pre, savedAs: false }), false)
+  // A proxy/raw form of the SAME object is no swap either.
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({ preWf: pre, postWf: { __v_raw: pre }, savedAs: false }), false)
+  // Missing sides → no carry.
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({ preWf: null, postWf: successor, savedAs: false }), false)
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({ preWf: pre, postWf: null, savedAs: false }), false)
+  assert.equal(shouldCarryIdentityAcrossSaveSwap(), false)
 })
 
 // Fakes for the ComfyWorkflow 4th arg: a REUSE passes a ComfyWorkflow OBJECT; a CREATION

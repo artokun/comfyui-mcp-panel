@@ -31,23 +31,37 @@ export function rawWorkflowObject(w) {
 }
 
 /** Proxy-safe identity between two workflow references. Layers, strongest first:
- *  object identity (after unwrapping Vue proxies), then a SAVED tab's unique
- *  on-disk path (reflected through any proxy), then the per-instance
- *  changeTracker OBJECT — the strongest shared identity for an UNSAVED tab,
- *  whose synthetic path is shared by every unsaved tab (#186). Two references
- *  that share NONE of these carriers can never be proven same → false. */
+ *  object identity (after unwrapping Vue proxies), then the per-instance
+ *  changeTracker OBJECT — the strongest shared identity a proxy reflects, and
+ *  the only one available for an UNSAVED tab (whose synthetic path is shared by
+ *  every unsaved tab, #186). PATH IS DELIBERATELY NOT EVIDENCE: two distinct
+ *  objects can share a path across a close→reopen, and that reopened object is
+ *  a NEW workflow — treating path as identity let a live foreign owner read as
+ *  self (#558 r3 P0). The one legitimate same-path identity continuation, a
+ *  save swapping the active object, is threaded through the replacement event
+ *  instead (shouldCarryIdentityAcrossSaveSwap). Two references that share NONE
+ *  of these carriers can never be proven same → false. */
 export function sameWorkflowObject(a, b) {
   if (!a || !b) return false;
   if (a === b) return true;
   if (rawWorkflowObject(a) === rawWorkflowObject(b)) return true;
-  const savedPath = (w) =>
-    w?.isPersisted === true && typeof w?.path === "string" && w.path ? w.path : null;
-  const pa = savedPath(a) ?? savedPath(rawWorkflowObject(a));
-  const pb = savedPath(b) ?? savedPath(rawWorkflowObject(b));
-  if (pa && pb) return pa === pb;
   const ctA = rawWorkflowObject(a)?.changeTracker ?? a?.changeTracker;
   const ctB = rawWorkflowObject(b)?.changeTracker ?? b?.changeTracker;
   return Boolean(ctA) && ctA === ctB;
+}
+
+/** #557 r3 — should the pre-save identity be carried onto the post-save active
+ *  object? True ONLY for a continuous-lifetime replacement: an in-place or
+ *  first save (NOT a Save-As copy — that starts a new workflow) that swapped
+ *  the active ComfyWorkflow object. The swap is provable ONLY at the
+ *  replacement event, where the predecessor and successor objects are both
+ *  known; static path equality cannot decide it — a closed→reopened object at
+ *  the same path is a NEW workflow (r3 P0), while a swapped successor is the
+ *  same tab. A proxy/raw form of the SAME object is no swap at all. */
+export function shouldCarryIdentityAcrossSaveSwap({ preWf, postWf, savedAs = false } = {}) {
+  if (savedAs) return false;
+  if (!preWf || !postWf || typeof postWf !== "object") return false;
+  return preWf !== postWf && !sameWorkflowObject(preWf, postWf);
 }
 
 /** Return true when an embedded UUID belongs to a different workflow file.

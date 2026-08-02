@@ -1505,7 +1505,9 @@ test("the pre-load snapshot is taken inside the app.loadGraphData fork, BEFORE t
   // its position relative to the original loadGraphData, and that it cannot break a load.
   assert.match(panelSrc, /recordPreLoadPromptRelayEditors,\n\} from "\.\/lib\/prompt-relay-timeline\.js";/);
   const callAt = panelSrc.indexOf("recordPreLoadPromptRelayEditors(appRef?.graph?._nodes");
-  const origAt = panelSrc.indexOf("return orig(graphData, clean, restoreView, workflow, options);");
+  // The delegation itself (its result may be captured so post-load identity
+  // bookkeeping can run before returning).
+  const origAt = panelSrc.indexOf("orig(graphData, clean, restoreView, workflow, options)");
   assert.ok(callAt > 0, "recorder is not called from the loadGraphData fork");
   assert.ok(origAt > 0);
   assert.ok(callAt < origAt, "the snapshot must be taken BEFORE the load is delegated");
