@@ -7324,9 +7324,9 @@ const GRAPH_TOOL_EXECUTORS = {
       })
     ) {
       throw new Error(
-        "The active workflow changed while graph_get_errors was verifying nested input media " +
+        "The active workflow changed while panel_get_errors was verifying nested input media " +
           "with the server, so this read's graph snapshot and asset verdicts now belong to " +
-          "DIFFERENT workflows. Retry graph_get_errors — it re-reads the now-active workflow.",
+          "DIFFERENT workflows. Retry panel_get_errors — it re-reads the now-active workflow.",
       );
     }
     assets.any = !!(assets.models.length || assets.media.length || assets.nodeTypes.length || assets.nodeCount);
