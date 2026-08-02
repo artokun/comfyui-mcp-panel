@@ -452,6 +452,106 @@ test("#556 r4 P0-2 integration: two overlapping scoped runs — B's traffic pass
   }
 });
 
+test("#556 r5 integration: batch=2 with the first post verified and the second scope-dropped ⇒ REFUSED with truthful counts, NO escape, never 'dispatched'", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "shim", apiTarget });
+    // The frontend's batch loop: post 1 keeps its scope, post 2 loses it, and
+    // the loop breaks on the refusal (so nothing further posts).
+    app.queuePrompt = async (number, batch, arg) => {
+      for (let i = 0; i < batch; i++) {
+        const targets = i === 0 ? ["14"] : null;
+        const body = frontendBody({ output: OUR_OUTPUT, number, targets });
+        app.posted.push(body);
+        const res = await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+        if (res.status !== 200) return true;
+      }
+      return true;
+    };
+    const ids = [];
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 2, toNodeId: 14,
+      onPromptId: (p) => ids.push(p),
+    });
+    assert.notEqual(result.outcome, "dispatched", "never dispatched on a partially-verified batch");
+    assert.equal(result.outcome, "refused");
+    assert.equal(result.verified, 1);
+    assert.match(result.error, /1 of 2/);
+    assert.match(result.error, /did NOT execute/);
+    assert.equal(server.calls.length, 1, "only the verified scoped post left the tab — the scope-dropped one was refused");
+    assert.deepEqual(ids, ["srv-1"], "the verified prompt_id was captured (ledger-eligible)");
+  } finally {
+    stop();
+  }
+});
+
+test("#556 r5 integration: batch=2 FULLY verified ⇒ dispatched (guard held until BOTH posts verify)", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const prev = apiTarget.fetchApi;
+    const app = makeFrontend({ shape: "shim", apiTarget });
+    app.queuePrompt = async (number, batch, arg) => {
+      for (let i = 0; i < batch; i++) {
+        const body = frontendBody({ output: OUR_OUTPUT, number, targets: ["14"] });
+        app.posted.push(body);
+        await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+      }
+      return true;
+    };
+    const ids = [];
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 2, toNodeId: 14,
+      onPromptId: (p) => ids.push(p),
+    });
+    assert.equal(result.outcome, "dispatched");
+    assert.equal(result.verified, 2);
+    assert.deepEqual(ids, ["srv-1", "srv-2"], "every batch prompt_id captured");
+    assert.equal(server.calls.length, 2);
+    assert.equal(apiTarget.fetchApi, prev, "guard restored once the whole batch verified");
+  } finally {
+    stop();
+  }
+});
+
+test("#556 r5 integration: batch=2 where the second post NEVER arrives ⇒ unverified naming the verified count, sentinel guards the rest", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "shim", apiTarget });
+    // Posts only the FIRST of the batch, then the processor stalls silently.
+    app.queuePrompt = async (number, batch, arg) => {
+      const body = frontendBody({ output: OUR_OUTPUT, number, targets: ["14"] });
+      app.posted.push(body);
+      await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+      return true;
+    };
+    const ids = [];
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 2, toNodeId: 14,
+      verifyTimeoutMs: 60,
+      onPromptId: (p) => ids.push(p),
+    });
+    assert.equal(result.outcome, "unverified");
+    assert.equal(result.verified, 1);
+    assert.match(result.error, /1 of 2/, "the error names how many of the batch were verified");
+    assert.match(result.error, /sentinel/);
+    // The stalled second post finally arrives, scope-dropped ⇒ sentinel refuses it.
+    const res = await apiTarget.fetchApi("/prompt", {
+      method: "POST",
+      body: JSON.stringify(frontendBody({ output: OUR_OUTPUT, number: result.queueMark, targets: null })),
+    });
+    assert.equal(res.status, 400, "the sentinel refuses the late scope-dropped batch post");
+    assert.equal(server.calls.length, 1, "only the one verified scoped post ever left the tab");
+  } finally {
+    stop();
+  }
+});
+
 test("#556 r3 P0-3 integration: timeout CANCELS our tagged pending item (assert the removal) — guard restored, no sentinel", async () => {
   const stop = keepAlive();
   try {

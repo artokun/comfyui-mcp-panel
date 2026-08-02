@@ -231,17 +231,24 @@ export function scopeUnattributableError({ toNodeId }) {
  *    for the REST OF THE PAGE SESSION (no expiry — an expiring sentinel would
  *    re-open the hole) — a late scope-dropped dispatch of THIS run is still
  *    refused whenever it posts. Only "nothing CONFIRMED queued" is claimed.
+ *  - verified/batch (r5): a partially-verified batch names its count — the
+ *    verified prompts DID queue (scoped); only the unverified remainder is
+ *    in doubt.
  */
-export function scopeUnverifiedError({ toNodeId, timeoutMs, cancelled = false }) {
+export function scopeUnverifiedError({ toNodeId, timeoutMs, cancelled = false, verified = 0, batch = 1 }) {
+  const count =
+    verified > 0
+      ? ` (${verified} of ${batch} batch prompts WERE verified and are queued with the scope)`
+      : "";
   const base =
     `run-to-node scope for node ${toNodeId} could not be verified: no scoped ` +
     `dispatch was observed within ${Math.round(timeoutMs / 1000)}s of queueing ` +
-    `(the frontend deferred or silently dropped the request). `;
+    `(the frontend deferred or silently dropped the request)${count}. `;
   if (cancelled) {
     return (
       base +
-      `The still-pending queue item was located and REMOVED, so nothing was ` +
-      `queued and no scope-dropped full-graph dispatch can execute — retry the run (#556).`
+      `The still-pending queue item was located and REMOVED, so nothing ` +
+      `${verified > 0 ? "more " : ""}was queued and no scope-dropped full-graph dispatch can execute — retry the run (#556).`
     );
   }
   return (
@@ -250,7 +257,26 @@ export function scopeUnverifiedError({ toNodeId, timeoutMs, cancelled = false })
     `guard stays installed for the rest of this page session as a sentinel — ` +
     `any late dispatch of THIS run WITHOUT the scope will still be refused (it ` +
     `cannot touch any other run's traffic). ` +
-    `Nothing is CONFIRMED queued — check the ComfyUI queue before retrying (#556).`
+    `Nothing is CONFIRMED queued beyond the verified count — check the ComfyUI queue before retrying (#556).`
+  );
+}
+
+/**
+ * The truthful PARTIAL-BATCH outcome (r5): the argument shape demonstrably
+ * works (at least one post verified), then a LATER post in the same batch lost
+ * its scope and was refused — the frontend's batch loop breaks on that first
+ * refusal, so the attempt is terminal: `verified` prompts are queued (scoped),
+ * one was refused, and the rest never posted. Never reported as dispatched.
+ */
+export function scopePartialBatchError({ toNodeId, verified, refused, batch }) {
+  const unposted = Math.max(0, batch - verified - refused);
+  return (
+    `run-to-node scope for node ${toNodeId}: batch incomplete — ${verified} of ` +
+    `${batch} prompts were verified and are queued WITH the scope, ${refused} ` +
+    `was refused after its scope was lost mid-batch (it did NOT execute, and no ` +
+    `full-graph dispatch left the tab)` +
+    (unposted ? `, and ${unposted} never posted` : "") +
+    `. Re-run for the remaining prompts (#556).`
   );
 }
 
@@ -334,8 +360,7 @@ export function createScopedRunGuard({
 } = {}) {
   const expected = (execIds ?? []).map(String);
   const maxBatch = Math.max(1, Math.floor(Number(batch)) || 1);
-  let refused = 0; // corrupted posts refused so far (batch-bounded)
-  const state = { observed: 0, dropped: null };
+  const state = { observed: 0, refused: 0, dropped: null };
   const waiters = new Set();
   const notify = () => {
     for (const fire of [...waiters]) fire();
@@ -352,7 +377,9 @@ export function createScopedRunGuard({
     const targets = targetsFromBody(options?.body);
     const sigOk = signature && promptSignatureFromBody(options?.body) === signature;
     if (sigOk && targets && sameSet(targets, expected)) {
-      // OUR scoped dispatch, verifiably delivered.
+      // OUR scoped dispatch, verifiably delivered. The run is only
+      // "dispatched" when ALL `batch` posts verify — a batch is never
+      // declared complete on a partial count (r5).
       state.observed++;
       const res = await origFetchApi(route, options);
       if (res) await captureRunResponse(res, { onRejection, onPromptId });
@@ -362,15 +389,17 @@ export function createScopedRunGuard({
     // OUR dispatch CORRUPTED — scope missing, wrong/extra/partial targets
     // (["14","9"] would run an unwanted branch), or the graph changed while
     // our item sat deferred (scope unverifiable against the new graph).
-    if (refused < maxBatch) {
-      refused++;
-      state.dropped = scopeDroppedError({
-        toNodeId,
-        verdict: targets
-          ? { ok: false, reason: "scope_mismatch", expected, got: targets }
-          : { ok: false, reason: "scope_missing", expected, got: null },
-      });
-      onScopeDropped?.(state.dropped);
+    if (state.refused < maxBatch) {
+      state.refused++;
+      if (state.dropped == null) {
+        state.dropped = scopeDroppedError({
+          toNodeId,
+          verdict: targets
+            ? { ok: false, reason: "scope_mismatch", expected, got: targets }
+            : { ok: false, reason: "scope_missing", expected, got: null },
+        });
+        onScopeDropped?.(state.dropped);
+      }
       notify();
       return SCOPE_DROPPED_RESPONSE();
     }
@@ -379,9 +408,15 @@ export function createScopedRunGuard({
     return origFetchApi(route, options);
   };
   guard.state = state;
+  // Verdict = the FULL batch verified, or ANY corrupted post (which ends the
+  // attempt: the frontend's batch loop breaks on the first refusal — the
+  // caller distinguishes shape-drop (0 verified ⇒ retry shape) from mid-batch
+  // corruption (some verified ⇒ terminal partial, r5)).
+  const verdictReached = () => state.observed >= maxBatch || state.dropped != null;
+  guard.verdictReached = verdictReached;
   guard.waitForVerdict = (ms) =>
     new Promise((resolve) => {
-      if (state.observed > 0 || state.dropped) return resolve(true);
+      if (verdictReached()) return resolve(true);
       const fire = () => {
         clearTimeout(timer);
         waiters.delete(fire);
@@ -506,14 +541,14 @@ export async function dispatchScopedRun({
     apiTarget.fetchApi = guard;
     try {
       await app.queuePrompt(mark, batch, scopeArg);
-      if (!(guard.state.observed > 0 || guard.state.dropped)) {
+      if (!guard.verdictReached()) {
         // queuePrompt returned without our dispatch surfacing — the
         // frontend's processor was busy and will serialize/post the item
-        // LATER. Keep the guard installed and wait for our scoped dispatch
-        // to be OBSERVED, or the bounded timeout.
+        // LATER. Keep the guard installed and wait for the WHOLE batch to be
+        // accounted (r5: never dispatched on a partial count), or the timeout.
         await guard.waitForVerdict(verifyTimeoutMs);
       }
-      if (!(guard.state.observed > 0 || guard.state.dropped)) {
+      if (!guard.verdictReached()) {
         // GIVE-UP — decided HERE, inside the try, so the finally below honors
         // keepGuardInstalled. The deferred item may still be live in the
         // frontend's pending queue: try to REMOVE it (ownership tag AND this
@@ -522,30 +557,53 @@ export async function dispatchScopedRun({
         // expiry timer (r4): the uncancellable item can post whenever the
         // stalled processor resumes, so the refusal must not go away. Safe by
         // construction: the sentinel only ever acts on THIS run's unique mark.
+        const verified = guard.state.observed;
         const cancel = cancelPendingScopedQueueItem(app, { runTag, queueMark: mark });
         if (cancel.removed > 0) {
           return {
             outcome: "unverified",
             queueMark: mark,
-            error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: true }),
+            verified,
+            error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: true, verified, batch }),
           };
         }
         keepGuardInstalled = true;
         return {
           outcome: "unverified",
           queueMark: mark,
-          error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: false }),
+          verified,
+          error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: false, verified, batch }),
         };
       }
     } finally {
       if (!keepGuardInstalled) apiTarget.fetchApi = prevFetchApi;
     }
-    // Verifiably dispatched with our scope.
-    if (guard.state.observed > 0) return { outcome: "dispatched", queueMark: mark };
-    // OUR dispatch surfaced WITHOUT the scope and was refused before it left
-    // the tab — nothing was queued, so retrying the other arg shape can never
-    // double-queue.
-    dropped = guard.state.dropped;
+    // The FULL batch verified — genuinely dispatched (r5: never on a partial).
+    if (guard.state.observed >= batch) {
+      return { outcome: "dispatched", queueMark: mark, verified: guard.state.observed };
+    }
+    // A corrupted post with ZERO verified posts means this argument SHAPE was
+    // dropped by the frontend — nothing was queued, so retrying the other
+    // shape can never double-queue.
+    if (guard.state.observed === 0) {
+      dropped = guard.state.dropped;
+      continue;
+    }
+    // r5 TERMINAL PARTIAL: the shape works (≥1 verified), then a later batch
+    // post lost its scope and was refused — the frontend's batch loop breaks
+    // on that refusal, so no more posts of this attempt will come. Report the
+    // truthful counts; never "dispatched"; no shape retry (the shape works).
+    return {
+      outcome: "refused",
+      queueMark: mark,
+      verified: guard.state.observed,
+      error: scopePartialBatchError({
+        toNodeId,
+        verified: guard.state.observed,
+        refused: guard.state.refused,
+        batch,
+      }),
+    };
   }
-  return { outcome: "refused", queueMark: mark, error: dropped };
+  return { outcome: "refused", queueMark: mark, verified: 0, error: dropped };
 }

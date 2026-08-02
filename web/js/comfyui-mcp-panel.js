@@ -7819,6 +7819,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // overlap another graph_run; we save + restore the exact prior api.fetchApi
     // around EACH attempt so even a hypothetical nested wrap unwinds cleanly.
     let promptRejection = null;
+    let runScopeResult = null;
     const queuedPromptIds = [];
     const prevFetchApi =
       typeof api?.fetchApi === "function" ? api.fetchApi : null;
@@ -7866,7 +7867,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // drive (#556). It marks every one of this run's posts with a queue
       // position sentinel and tags the pending queue item, so a scoped run
       // can never be confused with unrelated queue traffic.
-      const result = await dispatchScopedRun({
+      runScopeResult = await dispatchScopedRun({
         app,
         apiTarget: api,
         execIds: partialTargets,
@@ -7875,12 +7876,6 @@ const GRAPH_TOOL_EXECUTORS = {
         onRejection: captureRejection,
         onPromptId: capturePromptId,
       });
-      // "refused" / "unverified" / "unverifiable" all carry a truthful error
-      // naming what couldn't be resolved — and guarantee no scopeless
-      // full-graph dispatch left the tab.
-      if (result.outcome !== "dispatched") {
-        return { queued: false, error: result.error };
-      }
     }
     // Register EVERY accepted prompt_id for reconnect reconciliation (#370) —
     // BEFORE the rejection check. With batch>1, app.queuePrompt breaks its loop on
@@ -7901,6 +7896,14 @@ const GRAPH_TOOL_EXECUTORS = {
       try {
         armRunReconcileSweepRef?.();
       } catch {}
+    }
+    // A scoped run that did NOT fully verify (r5: refused / unverified /
+    // unverifiable) carries a truthful error naming what couldn't be resolved —
+    // and guarantees no scopeless full-graph dispatch left the tab. The return
+    // comes AFTER the ledger registration above so any partially-verified
+    // prompts (which ARE queued, scoped) stay reconcilable (#370).
+    if (runScopeResult && runScopeResult.outcome !== "dispatched") {
+      return { queued: false, error: runScopeResult.error };
     }
     // Verdict from BOTH channels: the captured top-level rejection (#358) and the
     // per-node errors the frontend stashed. null ⇒ genuinely accepted.
