@@ -16,6 +16,10 @@ const legacyMoveMatch = panelSrc.match(/graph_move_node\(\{ node_id, pos \}\) \{
 assert.ok(legacyMoveMatch, "could not locate graph_move_node in panel source");
 const legacyResizeMatch = panelSrc.match(/graph_resize_node\(\{ node_id, size \}\) \{[\s\S]*?\n  \},/);
 assert.ok(legacyResizeMatch, "could not locate graph_resize_node in panel source");
+const legacyCollapsedMatch = panelSrc.match(/graph_set_node_collapsed\(\{ node_id, collapsed \}\) \{[\s\S]*?\n  \},/);
+assert.ok(legacyCollapsedMatch, "could not locate graph_set_node_collapsed in panel source");
+const legacyModeMatch = panelSrc.match(/graph_set_node_mode\(\{ node_id, mode, force \}\) \{[\s\S]*?\n  \},/);
+assert.ok(legacyModeMatch, "could not locate graph_set_node_mode in panel source");
 
 function realGraphEditNode(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor) {
   const factory = new Function(
@@ -49,6 +53,27 @@ function realLegacyMotion(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypas
     `const GRAPH_TOOL_EXECUTORS = { ${methodMatch[0]} ${legacyMoveMatch[0]} ${legacyResizeMatch[0]} };
      return { move: GRAPH_TOOL_EXECUTORS.graph_move_node, resize: GRAPH_TOOL_EXECUTORS.graph_resize_node };`,
   )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor);
+}
+
+function realLegacyCollapsed(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor) {
+  return new Function(
+    "getGraphCtx",
+    "resolveNode",
+    "refreshNodeArea",
+    "unsafeBypassMappings",
+    "resolveRailNode",
+    "railKindFor",
+    `const GRAPH_TOOL_EXECUTORS = { ${methodMatch[0]} ${legacyCollapsedMatch[0]} }; return GRAPH_TOOL_EXECUTORS.graph_set_node_collapsed;`,
+  )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor);
+}
+
+function realLegacyMode(getGraphCtx, resolveNode, unsafeBypassMappings) {
+  return new Function(
+    "getGraphCtx",
+    "resolveNode",
+    "unsafeBypassMappings",
+    `const executors = { ${legacyModeMatch[0]} }; return executors.graph_set_node_mode;`,
+  )(getGraphCtx, resolveNode, unsafeBypassMappings);
 }
 
 function makeNode(id, { pos = [0, 0], size = [140, 60], collapsible = true } = {}) {
@@ -132,6 +157,46 @@ function setupLegacyMotion(nodes, { resolveRailNode = () => null } = {}) {
   return { ...fns, events };
 }
 
+function setupLegacyCollapsed(node) {
+  const events = [];
+  const graph = {
+    beforeChange: () => events.push("before"),
+    afterChange: () => events.push("after"),
+    setDirtyCanvas: () => events.push("dirty"),
+    getNodeById: (id) => id === node.id ? node : null,
+  };
+  const fn = realLegacyCollapsed(
+    () => ({ graph, LG: { LGraphCanvas: { node_colors: {} } } }),
+    (_graph, id) => {
+      if (id !== node.id) throw new Error(`No node with id ${id}`);
+      return node;
+    },
+    () => events.push("area"),
+    () => [],
+    () => null,
+    () => null,
+  );
+  return { fn, events };
+}
+
+function setupLegacyMode(node, unsafeBypassMappings = () => []) {
+  const events = [];
+  const graph = {
+    beforeChange: () => events.push("before"),
+    afterChange: () => events.push("after"),
+    setDirtyCanvas: () => events.push("dirty"),
+  };
+  const fn = realLegacyMode(
+    () => ({ graph }),
+    (_graph, id) => {
+      if (id !== node.id) throw new Error(`No node with id ${id}`);
+      return node;
+    },
+    unsafeBypassMappings,
+  );
+  return { fn, events };
+}
+
 test("#572 applies move, resize, title, color, shape, collapse, and pin in one undo envelope", () => {
   const node = makeNode(7, { collapsible: false });
   const { fn, events } = setup([node]);
@@ -198,6 +263,18 @@ test("#538 rejects inherited mode names without mutating the node", () => {
   assert.deepEqual(events, []);
 });
 
+test("#538 rejects inherited palettes and non-boolean presentation flags before mutation", () => {
+  const node = makeNode(1);
+  const { fn, events } = setup([node]);
+  assert.throws(() => fn({ node_id: 1, preset: "toString" }), /unknown color preset/);
+  assert.throws(() => fn({ node_id: 1, collapsed: null }), /collapsed must be a boolean/);
+  assert.throws(() => fn({ node_id: 1, pinned: "yes" }), /pinned must be a boolean/);
+  assert.equal(node.color, undefined);
+  assert.equal(node.bgcolor, undefined);
+  assert.deepEqual(node.flags, {});
+  assert.deepEqual(events, []);
+});
+
 test("#572 preserves the subgraph bypass preflight and force warning", () => {
   const node = { ...makeNode(1), subgraph: {}, inputs: [{ name: "image", type: "IMAGE" }], outputs: [{ name: "mask", type: "MASK", links: [9] }] };
   const mismatch = [{ output_name: "mask", output_type: "MASK", input_name: "image", input_type: "IMAGE" }];
@@ -211,6 +288,21 @@ test("#572 preserves the subgraph bypass preflight and force warning", () => {
   assert.equal(node.mode, 4);
   assert.equal(result.warnings[0].node_id, 1);
   assert.match(result.warnings[0].warning, /unsafe boundary mapping/);
+});
+
+test("#538 requires a real boolean force for new and legacy unsafe-bypass paths", () => {
+  const mismatch = [{ output_name: "mask", output_type: "MASK", input_name: "image", input_type: "IMAGE" }];
+  const coreNode = { ...makeNode(1), subgraph: {}, inputs: [{ name: "image", type: "IMAGE" }], outputs: [{ name: "mask", type: "MASK", links: [9] }] };
+  const { fn: edit, events: editEvents } = setup([coreNode], { unsafeBypassMappings: () => mismatch });
+  assert.throws(() => edit({ node_id: 1, mode: "bypass", force: "false" }), /force must be a boolean/);
+  assert.equal(coreNode.mode, undefined);
+  assert.deepEqual(editEvents, []);
+
+  const legacyNode = { ...makeNode(2), subgraph: {}, inputs: [{ name: "image", type: "IMAGE" }], outputs: [{ name: "mask", type: "MASK", links: [9] }] };
+  const { fn: legacyMode, events: modeEvents } = setupLegacyMode(legacyNode, () => mismatch);
+  assert.throws(() => legacyMode({ node_id: 2, mode: "bypass", force: "false" }), /force must be a boolean/);
+  assert.equal(legacyNode.mode, undefined);
+  assert.deepEqual(modeEvents, []);
 });
 
 test("#572 keeps panel_move_node compatibility for a subgraph boundary rail", () => {
@@ -287,6 +379,23 @@ test("#538 legacy colors retain preset:null no-op and permissive CSS values", ()
   assert.deepEqual(changed, { node_id: 1, color: "red", bgcolor: null });
   assert.equal(node.color, "red", "legacy callers may use non-hex CSS colors");
   assert.equal(Object.hasOwn(node, "bgcolor"), false, "null clears a legacy body color");
+});
+
+test("#538 legacy color and collapsed commands reject invalid values without mutating", () => {
+  const colorNode = makeNode(1);
+  colorNode.color = "#old";
+  colorNode.bgcolor = "#body";
+  const { fn: color, events: colorEvents } = setupLegacyColor(colorNode);
+  assert.throws(() => color({ node_id: 1, preset: "toString" }), /unknown color preset/);
+  assert.equal(colorNode.color, "#old");
+  assert.equal(colorNode.bgcolor, "#body");
+  assert.deepEqual(colorEvents, ["before", "after"]);
+
+  const collapsedNode = makeNode(2);
+  const { fn: collapsed, events: collapsedEvents } = setupLegacyCollapsed(collapsedNode);
+  assert.throws(() => collapsed({ node_id: 2, collapsed: "false" }), /collapsed must be a boolean/);
+  assert.deepEqual(collapsedNode.flags, {});
+  assert.deepEqual(collapsedEvents, []);
 });
 
 test("#538 legacy move preserves rail responses and numeric-string geometry", () => {

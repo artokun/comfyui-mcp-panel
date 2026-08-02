@@ -6926,12 +6926,15 @@ const GRAPH_TOOL_EXECUTORS = {
     if (own("shape") && !["default", "box", "round", "card"].includes(args.shape)) {
       throw new Error("shape must be default, box, round, or card");
     }
-    if (own("color") && args.color !== null && (typeof args.color !== "string" || !/^#[0-9a-fA-F]{3,8}$/.test(args.color))) {
+    if (own("color") && args.color !== null && (typeof args.color !== "string" || !/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(args.color))) {
       throw new Error("color must be a hex color or null");
     }
-    if (own("bgcolor") && args.bgcolor !== null && (typeof args.bgcolor !== "string" || !/^#[0-9a-fA-F]{3,8}$/.test(args.bgcolor))) {
+    if (own("bgcolor") && args.bgcolor !== null && (typeof args.bgcolor !== "string" || !/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(args.bgcolor))) {
       throw new Error("bgcolor must be a hex color or null");
     }
+    if (own("collapsed") && typeof args.collapsed !== "boolean") throw new Error("collapsed must be a boolean");
+    if (own("pinned") && typeof args.pinned !== "boolean") throw new Error("pinned must be a boolean");
+    if (own("force") && typeof args.force !== "boolean") throw new Error("force must be a boolean");
 
     // Keep panel_move_node's rail compatibility: graph outlines expose the two
     // subgraph boundary rails as -10/-20 aliases, although they are not ordinary
@@ -6973,7 +6976,8 @@ const GRAPH_TOOL_EXECUTORS = {
     let palette = null;
     if (own("preset")) {
       const LGC = LG?.LGraphCanvas ?? globalThis.LGraphCanvas;
-      palette = LGC?.node_colors?.[args.preset];
+      const palettes = LGC?.node_colors;
+      palette = Object.prototype.hasOwnProperty.call(palettes ?? {}, args.preset) ? palettes[args.preset] : null;
       if (!palette) throw new Error(`unknown color preset "${args.preset}"`);
     }
     const snapshot = (node) => ({
@@ -7140,6 +7144,7 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   graph_set_node_collapsed({ node_id, collapsed }) {
+    if (collapsed !== undefined && typeof collapsed !== "boolean") throw new Error("collapsed must be a boolean");
     const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id, collapsed: collapsed !== false });
     const edit = result.edited[0];
     return { node_id: edit.after.node_id, collapsed: edit.after.collapsed };
@@ -7155,7 +7160,8 @@ const GRAPH_TOOL_EXECUTORS = {
     try {
       if (preset != null) {
         const LGC = LG?.LGraphCanvas ?? globalThis.LGraphCanvas;
-        const palette = LGC?.node_colors?.[preset];
+        const palettes = LGC?.node_colors;
+        const palette = Object.prototype.hasOwnProperty.call(palettes ?? {}, preset) ? palettes[preset] : null;
         if (!palette) throw new Error(`unknown color preset "${preset}"`);
         node.color = palette.color;
         node.bgcolor = palette.bgcolor;
@@ -9323,6 +9329,7 @@ const GRAPH_TOOL_EXECUTORS = {
   // accepts the raw numeric LiteGraph modes 0/2/4 defensively. Undo-able like the
   // other graph_set_node_* edits.
   graph_set_node_mode({ node_id, mode, force }) {
+    if (force !== undefined && typeof force !== "boolean") throw new Error("force must be a boolean");
     const { graph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     const MODE_TO_NUM = Object.assign(Object.create(null), { active: 0, bypass: 4, mute: 2 });
