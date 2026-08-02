@@ -420,6 +420,119 @@ test("MID-TYPING with a REALISTIC partial editor: fields the editor does not mod
   assert.equal(res.replaced_out_of_band, undefined);
 });
 
+/**
+ * Seed a REALISTIC partial editor (the pack's parser keeps only prompt/length/color) holding
+ * `editorSegments` — the un-committed state mid-debounce — over a persisted timeline_data whose
+ * segments carry per-segment fields the editor does not model. local_prompts is refreshed to
+ * the editor's content, timeline_data lags, so the editor is authoritative on reconciliation.
+ */
+function makeMidEditNode(editorSegments, persistedSegments, extraTimelineFields = {}) {
+  const n = makeRelayNode({ timelineSegments: persistedSegments, extraTimelineFields });
+  n.editor.timeline = { segments: editorSegments };
+  n.widgets.local_prompts.value = derivePromptRelayWidgets(editorSegments).local_prompts;
+  n.widgets.segment_lengths.value = derivePromptRelayWidgets(editorSegments).segment_lengths;
+  return n;
+}
+
+test("MID-TYPING REORDER: unmodelled per-segment fields follow their PROMPT, never their old index", () => {
+  // Before the debounce commits, the user swaps the two blocks. The persisted widget still
+  // holds [A, B] with per-segment metadata; carrying BY INDEX would attach A's metadata to B
+  // and B's to A — writing fields onto segments they were never authored for.
+  const n = makeMidEditNode(
+    [
+      { prompt: "b", length: 36, color: "#222222" },
+      { prompt: "a", length: 24, color: "#111111" },
+    ],
+    [
+      seg("a", 24, { color: "#111111", legacyMeta: "keep-A" }),
+      seg("b", 36, { color: "#222222", legacyMeta: "keep-B" }),
+    ],
+    { zoom: 3 },
+  );
+
+  const res = relay(applyPromptRelayTimelineWrite(n.node, { fps: 24 }));
+
+  assert.equal(res.merge_base, "editor");
+  const written = JSON.parse(n.widgets.timeline_data.value);
+  assert.deepEqual(written.segments.map((s) => s.prompt), ["b", "a"]);
+  // Keyed by the unique prompt: each segment keeps ITS OWN metadata.
+  assert.equal(written.segments[0].legacyMeta, "keep-B");
+  assert.equal(written.segments[1].legacyMeta, "keep-A");
+  assert.equal(written.zoom, 3);
+});
+
+test("MID-TYPING SHRINK: deleting the FIRST block does not shift its metadata onto the survivor", () => {
+  // The user deletes block A; the editor now holds only [B]. Index carry would stamp A's
+  // metadata onto B (index 0) and drop B's entirely — the exact misattachment the carry keys
+  // on content to prevent.
+  const n = makeMidEditNode(
+    [{ prompt: "b", length: 36, color: "#222222" }],
+    [
+      seg("a", 24, { color: "#111111", legacyMeta: "keep-A" }),
+      seg("b", 36, { color: "#222222", legacyMeta: "keep-B" }),
+    ],
+  );
+
+  const res = relay(applyPromptRelayTimelineWrite(n.node, { fps: 24 }));
+
+  assert.equal(res.merge_base, "editor");
+  const written = JSON.parse(n.widgets.timeline_data.value);
+  assert.equal(written.segments.length, 1);
+  assert.equal(written.segments[0].prompt, "b");
+  assert.equal(written.segments[0].legacyMeta, "keep-B");
+});
+
+test("MID-TYPING with an AMBIGUOUS mapping: the carry is DROPPED, never guessed", () => {
+  // The user shrank the list AND retyped the survivor, so no prompt matches anything in the
+  // persisted record. Index carry would attach A's metadata to the retyped segment; content
+  // matching finds no pair. Ambiguous → no carry: losing an unmodelled field beats writing it
+  // onto the WRONG segment.
+  const n = makeMidEditNode(
+    [{ prompt: "retyped from scratch", length: 24, color: "#111111" }],
+    [
+      seg("a", 24, { color: "#111111", legacyMeta: "keep-A" }),
+      seg("b", 36, { color: "#222222", legacyMeta: "keep-B" }),
+    ],
+  );
+
+  const res = relay(applyPromptRelayTimelineWrite(n.node, { fps: 24 }));
+
+  const written = JSON.parse(n.widgets.timeline_data.value);
+  assert.equal(res.merge_base, "editor");
+  assert.equal(written.segments.length, 1);
+  assert.equal(written.segments[0].legacyMeta, undefined);
+  // The persisted record's own fields still survive where they belong: top level.
+  assert.equal(typeof written.segments[0].color, "string");
+});
+
+test("MID-TYPING with DUPLICATED prompts: a non-1:1 content match carries nothing", () => {
+  // The user duplicated block A while also keeping B (list grew, so positional alignment is
+  // already broken). Both editor copies of "a" match the SAME persisted segment, so neither
+  // pairing is provably the original — carrying "keep-A" onto either would be a guess. The
+  // 1:1 match for "b" is unaffected and still carries.
+  const n = makeMidEditNode(
+    [
+      { prompt: "a", length: 24, color: "#111111" },
+      { prompt: "b", length: 36, color: "#222222" },
+      { prompt: "a", length: 24, color: "#111111" },
+    ],
+    [
+      seg("a", 24, { color: "#111111", legacyMeta: "keep-A" }),
+      seg("b", 36, { color: "#222222", legacyMeta: "keep-B" }),
+    ],
+  );
+
+  const res = relay(applyPromptRelayTimelineWrite(n.node, { fps: 24 }));
+
+  const written = JSON.parse(n.widgets.timeline_data.value);
+  assert.equal(res.merge_base, "editor");
+  // "a" is not unique on the editor's side → no carry for either copy…
+  assert.equal(written.segments[0].legacyMeta, undefined);
+  assert.equal(written.segments[2].legacyMeta, undefined);
+  // …while the unique "b" still matches its own persisted segment 1:1.
+  assert.equal(written.segments[1].legacyMeta, "keep-B");
+});
+
 test("a normal (non-debounce) write never reports overwrote_uncommitted_edit", () => {
   const { node } = makeRelayNode();
   const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("totally different", 3)] }));
@@ -625,27 +738,40 @@ test("PIPE COLLISION: a metadata-only overlay on an unresolvable tie FAILS CLOSE
   assert.deepEqual(order, []);
 });
 
-test("an unresolvable tie is flagged; an ordinary write is not", () => {
+test("an unresolvable tie FAILS CLOSED even with explicit segments; an ordinary write has no tie", () => {
   // Neither record matches the derived widgets (a genuinely desynced node) and they differ
-  // structurally: unresolvable. Explicit segments replace BOTH records outright, so the write
-  // may proceed — declared ambiguous, merging onto the PERSISTED record for everything else,
-  // with the set-aside editor copy handed back rather than written.
-  const { node, widgets } = makeRelayNode({ localPrompts: "hand written | text" });
+  // structurally: unresolvable. Explicit segments used to replace BOTH records outright here —
+  // but that still permanently destroys whichever copy they do not reproduce behind a
+  // "reconciled" report, and the filter just said it cannot prove which copy is current. No
+  // resolved base, no write: refused with both copies disclosed, nothing mutated.
+  const { node, widgets, editor } = makeRelayNode({ localPrompts: "hand written | text" });
   widgets.timeline_data.value = JSON.stringify({ segments: [seg("master only", 24)] });
-  const tied = relay(
-    applyPromptRelayTimelineWrite(node, { segments: [seg("caller decides", 5)] }),
+  const timelineBefore = widgets.timeline_data.value;
+  const order = [];
+  assert.throws(
+    () =>
+      applyPromptRelayTimelineWrite(node, { segments: [seg("caller decides", 5)] }, {
+        beforeChange: () => order.push("before"),
+        afterChange: () => order.push("after"),
+        setDirty: () => order.push("dirty"),
+      }),
+    (err) => {
+      assert.ok(err instanceof PromptRelayTimelineWriteError);
+      assert.match(err.message, /CANNOT tell which is current/);
+      // BOTH copies are handed back PER SEGMENT, so the caller knows exactly what is at stake.
+      assert.ok(err.message.includes('"a","b"'), "editor copy missing from the refusal");
+      assert.ok(err.message.includes('"master only"'), "timeline_data copy missing from the refusal");
+      return true;
+    },
   );
-  assert.equal(tied.merge_base, "timeline_data");
-  assert.equal(tied.merge_base_reason, "unresolved-tie");
-  assert.equal(tied.merge_base_ambiguous, true);
-  // The out-of-band derived text is still reported before being replaced…
-  assert.equal(tied.replaced_out_of_band.local_prompts, "hand written | text");
-  // …and the ambiguous editor copy is disclosed per segment, never written back.
-  assert.deepEqual(tied.discarded_unverified_editor_copy, { prompts: ["a", "b"], lengths: [24, 36] });
-  assert.ok(tied.warnings.some((w) => w.includes("could not tell which was current")));
-  assert.equal(widgets.local_prompts.value, "caller decides");
+  // ZERO mutation — not the widgets, not the editor, not the undo history.
+  assert.equal(widgets.timeline_data.value, timelineBefore);
+  assert.equal(widgets.local_prompts.value, "hand written | text");
+  assert.deepEqual(editor.timeline.segments.map((s) => s.prompt), ["a", "b"]);
+  assert.deepEqual(order, []);
 
-  // A node whose two records agree has no tie to declare.
+  // A node whose two records agree has no tie to declare, and a successful write carries no
+  // ambiguity flag.
   const plain = relay(applyPromptRelayTimelineWrite(makeRelayNode().node, { segments: [seg("x", 3)] }));
   assert.equal(plain.merge_base, "timeline_data");
   assert.equal(plain.merge_base_ambiguous, undefined);
@@ -841,33 +967,45 @@ test("POST-LOAD TIE: a stale editor colliding on BOTH joins fails CLOSED — the
   assert.deepEqual(n.editor.timeline.segments.map((s) => s.prompt), ["x", "y | z"]);
 });
 
-test("TIE with explicit segments: the caller's list replaces BOTH copies — no ambiguous data is written", () => {
-  // The same unresolvable collision, but the write supplies the segment list outright — the one
-  // resolution that cannot resurrect ambiguous data: the segments come from the caller, and
-  // everything else from the PERSISTED widget (never the editor copy, whose unmodeled
-  // top-level fields — the old workflow's zoom here — belong to the previous workflow).
+test("TIE with explicit segments FAILS CLOSED too — no copy is destroyed behind a reconciled report", () => {
+  // The same unresolvable collision, with the write supplying the segment list outright. That
+  // used to be the escape hatch — the caller's list replaced BOTH records — but the filter
+  // just proved it cannot tell which record is current, and the supplied list still
+  // permanently destroys whichever copy it does not reproduce: exactly the live edit
+  // ["x","y | z"] here, discarded while the call reported success. No resolved base, no write.
   const { node, widgets, editor } = makeRelayNode({
     timelineSegments: [seg("x | y", 50), seg("z", 10)],
     extraTimelineFields: { zoom: 3 },
   });
   // The editor still holds the PREVIOUS workflow, colliding on both derived joins.
   editor.timeline = { zoom: 9, segments: [seg("x", 50), seg("y | z", 10)] };
+  const timelineBefore = widgets.timeline_data.value;
 
+  assert.throws(
+    () => applyPromptRelayTimelineWrite(node, { segments: [seg("caller decides", 7)] }),
+    (err) => {
+      assert.ok(err instanceof PromptRelayTimelineWriteError);
+      assert.match(err.message, /CANNOT tell which is current/);
+      // BOTH copies disclosed PER SEGMENT — the live edit and the persisted record.
+      assert.ok(err.message.includes('"x","y | z"'), "editor copy missing from the refusal");
+      assert.ok(err.message.includes('"x | y","z"'), "timeline_data copy missing from the refusal");
+      return true;
+    },
+  );
+  // NOTHING mutated: both copies survive byte-for-byte.
+  assert.equal(widgets.timeline_data.value, timelineBefore);
+  assert.equal(widgets.local_prompts.value, "x | y | z");
+  assert.equal(widgets.segment_lengths.value, "50, 10");
+  assert.deepEqual(editor.timeline.segments.map((s) => s.prompt), ["x", "y | z"]);
+
+  // The documented remedy: the tie is transient. Once the editor's pending commit lands (the
+  // records converge on the editor's copy), the very same write succeeds as an ordinary one.
+  widgets.timeline_data.value = JSON.stringify(editor.timeline);
   const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("caller decides", 7)] }));
-
   assert.equal(res.reconciled, true);
   assert.equal(res.merge_base, "timeline_data");
-  assert.equal(res.merge_base_reason, "unresolved-tie");
-  assert.equal(res.merge_base_ambiguous, true);
-  const written = JSON.parse(widgets.timeline_data.value);
-  assert.deepEqual(written.segments.map((s) => s.prompt), ["caller decides"]);
-  // The persisted record's fields — never the ambiguous editor copy's.
-  assert.equal(written.zoom, 3);
   assert.equal(widgets.local_prompts.value, "caller decides");
-  // The set-aside editor copy is disclosed per segment, with warnings — not silently kept.
-  assert.deepEqual(res.discarded_unverified_editor_copy, { prompts: ["x", "y | z"], lengths: [50, 10] });
-  assert.ok(res.warnings.some((w) => w.includes("could not tell which was current")));
-  assert.ok(res.warnings.some((w) => w.includes("could NOT be determined")));
+  assert.equal(JSON.parse(widgets.timeline_data.value).zoom, 9);
 });
 
 // ─── The filter cannot tell a stale editor from an uncommitted edit; only the load can ───

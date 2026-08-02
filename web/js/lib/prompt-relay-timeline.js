@@ -72,11 +72,13 @@
 // governs WHICH copy is authoritative: a join comparison can only ask "could this widget hold
 // this timeline's serialization?", never "which of two colliding timelines is current?" — so
 // chooseMergeBase uses it as a filter, and when the filter cannot separate the two the write
-// FAILS CLOSED rather than guess: a tie with no explicit `segments` is REFUSED with both copies
-// disclosed and nothing mutated (keeping the editor's copy could write the previous workflow's
-// timeline back over the one a load just restored; keeping the widget's could destroy text still
-// being typed — neither guess is acceptable), and only an explicit `segments` list, which
-// replaces BOTH records outright, may proceed, declared via `merge_base_ambiguous`.
+// FAILS CLOSED rather than guess: a tie is REFUSED with both copies disclosed and nothing
+// mutated. Keeping the editor's copy could write the previous workflow's timeline back over the
+// one a load just restored; keeping the widget's could destroy text still being typed — and
+// explicit `segments` are NO exception, because they still destroy whichever copy they do not
+// reproduce behind a "reconciled" report. Success requires a resolved base; a tie is usually
+// transient (the editor's commit debounce or its post-load re-parse), so the caller re-issues
+// once the records agree.
 // Anything PromptRelay's python would encode differently from
 // what the timeline shows (a blank prompt, a literal "|", padding whitespace) comes back as a
 // warning. The invariant: the panel never leaves the timeline saying A, the prompts saying B,
@@ -582,17 +584,58 @@ function derivedMatchesWidgets(timeline, widgets) {
  * widget's JSON. Instead the editor-KNOWN fields are merged ONTO the widget's timeline object:
  * the widget (the persisted record, which the editor never edits around) supplies everything
  * else, the editor stays authoritative for the segment list and the fields it actually holds.
- * Per segment the same-index widget segment is the only correspondence available (segments
- * carry no ids); a reorder inside the 120 ms debounce window could misattach an unknown field —
- * a narrower loss than dropping every such field outright, which is what replacing did.
+ *
+ * Per segment the correspondence between the two lists is the hazard: segments carry no ids,
+ * and the editor's list can differ from the widget's by MORE than the keystroke that made it
+ * authoritative — a reorder or a shrink inside the 120 ms debounce window. Carrying unmodelled
+ * fields BY INDEX would then attach a removed/old segment's metadata to a surviving prompt it
+ * was never written for. So the carry is keyed, never positional-by-default:
+ *
+ *   * ALIGNED lists — same length and AT MOST one index disagreeing on prompt — are the
+ *     in-place-typing signature: every position is provably the same segment, so the
+ *     same-index widget segment carries (this is what lets a mid-keystroke prompt edit keep
+ *     its segment's unmodelled fields).
+ *   * Anything else (reorder / shrink / grow / several edits in one window) breaks positional
+ *     proof. A segment may still carry from a widget segment with the SAME prompt — but only
+ *     when that prompt is UNIQUE on both sides, making the pairing 1:1. A duplicated prompt or
+ *     no match means the mapping is AMBIGUOUS, and ambiguous means NO carry: losing an
+ *     unmodelled extra field beats writing it onto the WRONG segment, and the write's
+ *     disclosures already hand back anything the node loses.
  */
 function editorTimelineOntoWidget(fromEditor, fromWidget) {
   const widgetSegs = Array.isArray(fromWidget?.segments) ? fromWidget.segments : [];
-  const segments = fromEditor.segments.map((seg, i) => {
+  const editorSegs = fromEditor.segments;
+  let indexAligned = widgetSegs.length === editorSegs.length;
+  if (indexAligned) {
+    let promptDiffs = 0;
+    for (let i = 0; i < editorSegs.length; i++) {
+      if (editorSegs[i]?.prompt !== widgetSegs[i]?.prompt) promptDiffs++;
+    }
+    indexAligned = promptDiffs <= 1;
+  }
+  // Prompt popularity on each side, for the 1:1 content match. Only STRING prompts participate
+  // — anything else can never prove a pairing.
+  const promptCount = (list) => {
+    const counts = new Map();
+    for (const s of list) {
+      if (typeof s?.prompt === "string") counts.set(s.prompt, (counts.get(s.prompt) ?? 0) + 1);
+    }
+    return counts;
+  };
+  const inEditor = promptCount(editorSegs);
+  const inWidget = promptCount(widgetSegs);
+  const carryFor = (seg, i) => {
+    if (indexAligned) return isPlainObject(widgetSegs[i]) ? widgetSegs[i] : {};
+    if (typeof seg.prompt !== "string") return {};
+    if (inEditor.get(seg.prompt) !== 1 || inWidget.get(seg.prompt) !== 1) return {};
+    const match = widgetSegs.find((w) => w?.prompt === seg.prompt);
+    return isPlainObject(match) ? match : {};
+  };
+  const segments = editorSegs.map((seg, i) => {
     // A malformed editor segment is passed through untouched so normalizeSegments refuses it
     // loudly, exactly as it would have on the raw editor copy.
     if (!isPlainObject(seg)) return seg;
-    const base = isPlainObject(widgetSegs[i]) ? widgetSegs[i] : {};
+    const base = carryFor(seg, i);
     // Only fields the editor actually HOLDS may override the widget's; an absent or undefined
     // one keeps the widget's value instead of clobbering it.
     const held = {};
@@ -608,8 +651,8 @@ function chooseMergeBase(editor, widgets) {
   const fromEditor = liveEditorTimeline(editor);
   const fromWidget = parsePromptRelayTimeline(widgets[PROMPT_RELAY_MASTER_WIDGET].value);
   // `reason` records WHICH branch settled authority. That matters downstream: a copy set aside
-  // by the case-3 filter was proven stale, while one set aside by a tie or by being superseded
-  // was not — and the two deserve very different disclosures.
+  // by the case-3 filter was proven stale, while one set aside by being superseded was not —
+  // and the two deserve very different disclosures.
   const pick = (base, baseSource, reason, ambiguous = false) => ({
     base,
     baseSource,
@@ -669,8 +712,9 @@ export function promptRelayDerivedRefusal(widgetName, nodeId) {
  *   3. MERGE the caller's top-level fields onto the node's CURRENT timeline — see
  *      chooseMergeBase for which of the editor / widget copies is the current one — so
  *      anything they did not mention is preserved (never defaulted away). When neither copy
- *      can be PROVEN current (an unresolved tie) this step fails closed: refused outright
- *      unless the caller supplied `segments` explicitly. Symmetrically, when the editor is
+ *      can be PROVEN current (an unresolved tie) this step fails closed: refused outright,
+ *      with or without explicit `segments` — they would still destroy whichever copy they do
+ *      not reproduce behind a "reconciled" report. Symmetrically, when the editor is
  *      PROVEN current (the mid-debounce signature) but the write's explicit `segments` would
  *      not reproduce its text, the write fails closed too — refused with both states
  *      disclosed, because applying it would destroy the in-flight edit while reporting
@@ -725,36 +769,38 @@ export function applyPromptRelayTimelineWrite(
     fromEditor,
     ambiguous: baseAmbiguous,
   } = chosen;
-  let { base, baseSource } = chosen;
+  const { base, baseSource } = chosen;
   if (baseAmbiguous) {
-    // A tie FAILS CLOSED. The filter could not prove which record is current, so reconciling
-    // FROM either copy would be a guess: keeping the editor's segments can write the PREVIOUS
-    // workflow's timeline back over the one a load just restored, keeping the widget's can
-    // destroy text still being typed. Only an explicit `segments` list may proceed — it
-    // replaces BOTH records outright, so the tie cannot resurrect anything. Anything else is
-    // refused with both copies disclosed and NOTHING mutated (a truthful failure, not a
-    // "reconciled" success built on a guess).
-    if (!Object.prototype.hasOwnProperty.call(overlay, "segments")) {
-      const editorCopy = contentSnapshot(Array.isArray(fromEditor?.segments) ? fromEditor.segments : []);
-      const widgetCopy = contentSnapshot(Array.isArray(fromWidget?.segments) ? fromWidget.segments : []);
-      throw new PromptRelayTimelineWriteError(
-        `PromptRelayEncodeTimeline node ${node?.id} holds TWO different timelines — one in its live ` +
-          `timeline editor, one in its timeline_data widget — and its derived widgets CANNOT tell ` +
-          `which is current (the " | " join is lossy, so structurally different timelines can ` +
-          `serialize identically). This write did not supply "segments", so reconciling would mean ` +
-          `GUESSING which copy to keep: one may be the timeline a workflow load just restored, the ` +
-          `other may hold prompt text that exists nowhere else. REFUSED, and nothing was written ` +
-          `(#506). The editor holds prompts ${JSON.stringify(editorCopy.prompts)} (lengths ` +
-          `${JSON.stringify(editorCopy.lengths)}); timeline_data holds prompts ` +
-          `${JSON.stringify(widgetCopy.prompts)} (lengths ${JSON.stringify(widgetCopy.lengths)}). ` +
-          `Re-issue the write with the full "segments" array you intend — explicit segments replace ` +
-          `BOTH copies outright.`,
-      );
-    }
-    // Explicit segments: merge onto the PERSISTED widget for everything else — never the
-    // ambiguous editor copy, whose unmodeled top-level fields may belong to the old workflow.
-    base = fromWidget;
-    baseSource = "timeline_data";
+    // A tie FAILS CLOSED — with or without explicit `segments`. The filter could not prove
+    // which record is current, so reconciling FROM either copy would be a guess: keeping the
+    // editor's segments can write the PREVIOUS workflow's timeline back over the one a load
+    // just restored, keeping the widget's can destroy text still being typed. Explicit
+    // segments are NO exception: they replace the record they are written onto, but the copy
+    // they do not reproduce is still permanently destroyed — and the call would report a
+    // reconciled success for it. There is no resolved base, so there is no write: refused
+    // with both copies disclosed and NOTHING mutated. The tie is usually TRANSIENT (the
+    // editor's ~120 ms commit debounce, or its ~10 ms re-parse after a workflow load), so the
+    // remedy is to re-issue once it settles and the two records agree; a PERSISTENT tie can
+    // only be converged on the canvas, where an explicit edit commits the editor's copy to
+    // timeline_data — a deliberate act, not a guess this route made.
+    const editorCopy = contentSnapshot(Array.isArray(fromEditor?.segments) ? fromEditor.segments : []);
+    const widgetCopy = contentSnapshot(Array.isArray(fromWidget?.segments) ? fromWidget.segments : []);
+    throw new PromptRelayTimelineWriteError(
+      `PromptRelayEncodeTimeline node ${node?.id} holds TWO different timelines — one in its live ` +
+        `timeline editor, one in its timeline_data widget — and its derived widgets CANNOT tell ` +
+        `which is current (the " | " join is lossy, so structurally different timelines can ` +
+        `serialize identically). Reconciling from either copy would mean GUESSING which to keep: ` +
+        `one may be the timeline a workflow load just restored, the other may hold prompt text ` +
+        `that exists nowhere else — and explicit "segments" do NOT settle that, since they would ` +
+        `still permanently destroy whichever copy they do not reproduce behind a "reconciled" ` +
+        `report. REFUSED, and nothing was written (#506). The editor holds prompts ` +
+        `${JSON.stringify(editorCopy.prompts)} (lengths ${JSON.stringify(editorCopy.lengths)}); ` +
+        `timeline_data holds prompts ${JSON.stringify(widgetCopy.prompts)} (lengths ` +
+        `${JSON.stringify(widgetCopy.lengths)}). This state is usually TRANSIENT — the editor's ` +
+        `~120 ms commit debounce or its ~10 ms re-parse after a workflow load — so re-issue once ` +
+        `it settles and the two records agree. If it PERSISTS, converge the records first by ` +
+        `committing the intended copy in the node's timeline editor on the canvas, then re-issue.`,
+    );
   }
   const merged = base ? { ...base, ...overlay } : { ...overlay };
   const segments = normalizeSegments(merged, Array.isArray(base?.segments) ? base.segments : null);
@@ -902,16 +948,6 @@ export function applyPromptRelayTimelineWrite(
     editorWasAuthority && widgetSegs && !sameSegmentContent(widgetSegs, segments)
       ? contentSnapshot(widgetSegs)
       : null;
-  if (baseAmbiguous) {
-    warnings.push(
-      `the node's two records of the timeline held DIFFERENT segments and its derived widgets ` +
-        `could not tell which was current (the " | " join is lossy, so different segment splits ` +
-        `serialize identically). Your explicit "segments" replaced BOTH records, so no ambiguous ` +
-        `copy was written back over the other; the live editor's previous segments are returned ` +
-        `per segment as "discarded_stale_editor" / "discarded_unverified_editor_copy" if this ` +
-        `write did not reproduce them.`,
-    );
-  }
   if (supersededTimelineData) {
     warnings.push(
       `the node's timeline_data widget held DIFFERENT segments from the timeline editor, and your ` +
@@ -980,7 +1016,6 @@ export function applyPromptRelayTimelineWrite(
       merged_onto_current: base != null,
       merge_base: baseSource,
       merge_base_reason: baseReason,
-      ...(baseAmbiguous ? { merge_base_ambiguous: true } : {}),
       editor_synced: editorSynced,
       local_prompts: derived.local_prompts,
       segment_lengths: derived.segment_lengths,
