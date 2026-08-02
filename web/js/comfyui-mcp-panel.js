@@ -6905,12 +6905,14 @@ const GRAPH_TOOL_EXECUTORS = {
   graph_edit_node(args = {}) {
     const { graph, LG, rootGraph } = getGraphCtx();
     const own = (key) => Object.prototype.hasOwnProperty.call(args, key);
-    const hasNodeId = own("node_id") && args.node_id != null;
-    const hasNodeIds = own("node_ids") && args.node_ids != null;
+    const hasNodeId = own("node_id");
+    const hasNodeIds = own("node_ids");
     if (hasNodeId === hasNodeIds) throw new Error("provide exactly one of node_id or node_ids");
+    if (hasNodeId && !Number.isInteger(args.node_id)) throw new Error("node_id must be an integer");
     const ids = hasNodeId ? [args.node_id] : args.node_ids;
     if (!Array.isArray(ids) || ids.length === 0) throw new Error("node_ids must be a non-empty array");
-    if (new Set(ids.map(Number)).size !== ids.length) throw new Error("node_ids must not contain duplicates");
+    if (!ids.every(Number.isInteger)) throw new Error("node_ids must contain only integers");
+    if (new Set(ids).size !== ids.length) throw new Error("node_ids must not contain duplicates");
 
     const fields = ["pos", "size", "title", "preset", "color", "bgcolor", "shape", "collapsed", "pinned", "mode"];
     if (!fields.some(own)) throw new Error("provide at least one presentation field to edit");

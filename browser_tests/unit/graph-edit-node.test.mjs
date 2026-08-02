@@ -92,7 +92,7 @@ function makeNode(id, { pos = [0, 0], size = [140, 60], collapsible = true } = {
   };
 }
 
-function setup(nodes, { palette = { blue: { color: "#123456", bgcolor: "#654321" } }, unsafeBypassMappings = () => [], resolveRailNode = () => null, railKindFor = () => null, rootGraph = false } = {}) {
+function setup(nodes, { palette = { blue: { color: "#123456", bgcolor: "#654321" } }, unsafeBypassMappings = () => [], resolveRailNode = () => null, railKindFor = () => null, rootGraph = false, onResolve = () => {} } = {}) {
   const events = [];
   const graph = {
     beforeChange: () => events.push("before"),
@@ -101,6 +101,7 @@ function setup(nodes, { palette = { blue: { color: "#123456", bgcolor: "#654321"
     getNodeById: (id) => nodes.find((candidate) => candidate.id === id) ?? null,
   };
   const resolver = (_graph, id) => {
+    onResolve(id);
     const node = nodes.find((candidate) => candidate.id === id);
     if (!node) throw new Error(`No node with id ${id}`);
     return node;
@@ -254,6 +255,25 @@ test("#572 rejects ambiguous, incomplete, and unsafe inputs before mutation", ()
   assert.throws(() => fn({ node_id: 1, title: null }), /title must be a string/);
   assert.throws(() => fn({ node_id: 1, title: { text: "x" } }), /title must be a string/);
   assert.throws(() => fn({ node_ids: [1, 1], title: "x" }), /duplicates/);
+  assert.deepEqual(events, []);
+});
+
+test("#538 rejects non-integer target IDs before resolving or mutating", () => {
+  const zero = makeNode(0);
+  const one = makeNode(1);
+  const resolved = [];
+  const { fn, events } = setup([zero, one], { onResolve: (id) => resolved.push(id) });
+
+  for (const nodeId of [true, "1", 1.5, null]) {
+    assert.throws(() => fn({ node_id: nodeId, title: "wrong target" }), /node_id must be an integer/);
+  }
+  for (const nodeIds of [[null], [true], ["1"], [1.5]]) {
+    assert.throws(() => fn({ node_ids: nodeIds, title: "wrong target" }), /node_ids must contain only integers/);
+  }
+
+  assert.equal(zero.title, "Node 0");
+  assert.equal(one.title, "Node 1");
+  assert.deepEqual(resolved, []);
   assert.deepEqual(events, []);
 });
 
