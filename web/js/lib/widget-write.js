@@ -96,6 +96,29 @@ export function isCompositeObjectWidget(widget) {
   return v != null && typeof v === "object" && !Array.isArray(v);
 }
 
+/**
+ * Resolve a widget name without silently choosing between case-colliding
+ * widgets. Exact spelling always wins; a case-insensitive fallback remains for
+ * older callers, but only when it names exactly one widget (#524).
+ */
+function resolveWidgetByName(node, widgetName) {
+  const wanted = String(widgetName);
+  const widgets = node?.widgets ?? [];
+  const exact = widgets.find((cand) => cand?.name === wanted);
+  if (exact) return exact;
+
+  const matches = widgets.filter(
+    (cand) => typeof cand?.name === "string" && cand.name.toLowerCase() === wanted.toLowerCase(),
+  );
+  if (matches.length > 1) {
+    throw new WidgetWriteError(
+      `Node ${node?.id} (${node?.type}) has ${matches.length} widgets matching "${wanted}" ` +
+        `case-insensitively (${matches.map((cand) => cand.name).join(", ")}); pass the exact widget name.`,
+    );
+  }
+  return matches[0] ?? null;
+}
+
 // DECLARED field schema for known composite widgets. Types are enforced from THIS
 // schema, never inferred from the current value — a field whose current value is `null`
 // still enforces the correct type, so a scalar of the wrong type (e.g. a number into a
@@ -779,9 +802,7 @@ export function resolveWidgetWrite(
   if (!widget) {
     // EXACT-NAME FIRST: a widget whose own name is literally `widgetName` (dots and
     // all) always wins — the split is never taken when an exact match exists.
-    widget = (targetNode.widgets ?? []).find(
-      (cand) => cand?.name?.toLowerCase() === String(widgetName).toLowerCase(),
-    );
+    widget = resolveWidgetByName(targetNode, widgetName);
   }
   if (!widget && node?.subgraph) {
     // #560 SAFETY: on a SUBGRAPH parent, a dotted name that did not resolve as a
@@ -811,9 +832,7 @@ export function resolveWidgetWrite(
     if (dot > 0) {
       const baseName = nameStr.slice(0, dot);
       const sub = nameStr.slice(dot + 1);
-      const baseWidget = (targetNode.widgets ?? []).find(
-        (cand) => cand?.name?.toLowerCase() === baseName.toLowerCase(),
-      );
+      const baseWidget = resolveWidgetByName(targetNode, baseName);
       if (baseWidget) {
         if (sub === "") {
           throw new WidgetWriteError(
