@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- `panel_set_widget` on `PromptRelayEncodeTimeline.timeline_data` no longer leaves the node rendering the PREVIOUS prompts. That node's Python `execute()` reads only `local_prompts` + `segment_lengths` — never `timeline_data` — and both are derived by the in-browser timeline editor, so a raw `timeline_data` write reported success while the render silently kept the old prompts (and was reverted on the next UI touch). The write now regenerates both derived widgets from the new timeline and applies all three atomically, re-hydrates the live editor so its next commit is a no-op, merges onto the node's current timeline so unmentioned fields are preserved, and REFUSES any value the node would silently coerce or reset to a blank default. Direct writes to the derived widgets are refused with a redirect, and a node found already out of sync returns its previous prompt text rather than dropping it silently (#506)
+
 ## [0.11.32] - 2026-08-01
 
 ### Fixed
