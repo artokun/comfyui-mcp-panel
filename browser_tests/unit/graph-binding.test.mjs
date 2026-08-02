@@ -1070,6 +1070,55 @@ test("#349 r6 P0: a mid-load switch to a tab whose tracker is unreadable registe
   assert.equal(h.rootB.extra.comfyui_mcp.workflow_uuid, "creation-uuid-1", "the ownerless tag is not rewritten");
 });
 
+test("#349 r7 P0: a positive tracker match must NOT promote the stamp over an established CONFLICTING identity", async () => {
+  // The r7 hole: the mid-load active tab B ALREADY has an established WeakMap
+  // identity "uuid-B" and its (stale) tracker happens to carry the minted
+  // stamp. Recording stampUuid → B anyway creates an owner-map claim that the
+  // guard's lineage check then accepts — re-stamping C's foreign root with B's
+  // identity. A conflicting established identity must veto the registration.
+  const foreignB = {
+    isPersisted: true,
+    path: "workflows/b.json",
+    changeTracker: { activeState: { extra: { comfyui_mcp: { workflow_uuid: "creation-uuid-1" } } } },
+  };
+  const { fakeApp, objectUuids, owners } = buildCreationForkHarness({
+    onLoad: ({ app }) => {
+      app.extensionManager.workflow.activeWorkflow = foreignB;
+      app.extensionManager.workflow.openWorkflows.push(foreignB);
+    },
+  });
+  objectUuids.set(foreignB, "uuid-B"); // B's identity is ALREADY established — and differs
+  await fakeApp.loadGraphData({ nodes: [{ id: 1, type: "KSampler" }] });
+  assert.equal(
+    owners.get("creation-uuid-1"),
+    undefined,
+    "a conflicting established identity must veto the owner-map registration",
+  );
+  assert.equal(
+    objectUuids.get(foreignB),
+    "uuid-B",
+    "B's established identity must NOT be overwritten by the creation stamp",
+  );
+
+  // …and the guard fences C's tagged canvas while B is active: with no
+  // registration, B does not claim the tag — nothing to heal, the stale
+  // canvas throws.
+  const h = buildDirtyStaleRouteHarness({
+    rootUuid: "creation-uuid-1",
+    foreignClaim: "unloaded-proxy-owner",
+    foreignTab: foreignB,
+    registeredOwners: owners,
+    objectUuids,
+  });
+  h.objectUuids.set(h.workflowA, "workflow-A");
+  assert.throws(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: false }),
+    /NOT applied/,
+    "with the registration vetoed, C's tagged canvas stays fenced (#349)",
+  );
+  assert.equal(h.rootB.extra.comfyui_mcp.workflow_uuid, "creation-uuid-1", "the foreign tag is not rewritten");
+});
+
 test("#557 r3/r4 wiring: programmaticSave threads the pre-save identity across a PROVEN in-place object swap", () => {
   const src = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
   const start = src.indexOf("async function programmaticSave(name)");
@@ -1092,13 +1141,18 @@ test("#557 r3/r4 wiring: programmaticSave threads the pre-save identity across a
   );
   assert.match(
     body,
-    /shouldCarryIdentityAcrossSaveSwap\(\{\s*preWf: expectWf,\s*postWf: postSwapWf,\s*savedAs: outcome\.saved_as,\s*preWfStillOpen,\s*successorCarriesPreUuid,\s*\}\)/,
-    "the carry must pass ALL continuity evidence to the pure rule (never a Save-As copy, never a mid-save switch)",
+    /shouldCarryIdentityAcrossSaveSwap\(\{\s*preWf: expectWf,\s*postWf: postSwapWf,\s*savedAs: outcome\.saved_as,\s*preWfStillOpen,\s*successorCarriesPreUuid,\s*postWfHasConflictingEstablishedIdentity,\s*\}\)/,
+    "the carry must pass ALL continuity evidence to the pure rule (never a Save-As copy, never a mid-save switch, never over an established conflict)",
   );
   assert.doesNotMatch(
     body,
     /successorInPreSlot|preSwapSlotIndex/,
     "tab-slot occupancy is NOT continuity evidence (r5 P0) — it must not appear in the carry",
+  );
+  assert.match(
+    body,
+    /postWfHasConflictingEstablishedIdentity = Boolean\(\s*postSwapWf && _workflowObjectUuids\.get\(postSwapWf\) && _workflowObjectUuids\.get\(postSwapWf\) !== preSwapUuid,?\s*\)/,
+    "an established conflicting WeakMap identity on the successor must veto the carry (r7 P0)",
   );
   assert.match(
     body,
@@ -1286,6 +1340,34 @@ test("#557 r4 control: a GENUINE save-swap successor still carries the pre-save 
     "the proven successor is seeded with the pre-save uuid (#557)",
   );
   assert.equal(owners.get("uuid-A"), successor, "the successor becomes the uuid's registered owner");
+});
+
+test("#349 r7 P0: a successor with an established CONFLICTING identity is not overwritten by the carry", async () => {
+  // The successor proves continuity (its tracker carries the pre-save uuid),
+  // but it ALREADY has an established, different WeakMap identity — a
+  // conflicting tab, not A's continuation. Overwriting would promote the stamp
+  // over the object's own identity and poison the owner map.
+  const successor = {
+    isPersisted: true,
+    path: "workflows/a.json",
+    changeTracker: {
+      activeState: { ...state(27), extra: { comfyui_mcp: { workflow_uuid: "uuid-A" } } },
+    },
+  };
+  const { save, svc, objectUuids, owners } = buildProgrammaticSaveHarness({
+    onSave: ({ svc }) => {
+      svc.openWorkflows = [successor];
+      svc.activeWorkflow = successor;
+    },
+  });
+  objectUuids.set(successor, "uuid-X"); // established BEFORE the seed — and conflicting
+  await save();
+  assert.equal(
+    objectUuids.get(successor),
+    "uuid-X",
+    "the carry must not overwrite an established conflicting identity",
+  );
+  assert.notEqual(owners.get("uuid-A"), successor, "A's uuid must not be re-registered over the conflict");
 });
 
 // ── #557: save replaces the active workflow object — identity must follow ────

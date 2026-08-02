@@ -271,6 +271,13 @@ test('#557 r3/r4: identity carries across a save object-swap ONLY with positive 
   assert.equal(shouldCarryIdentityAcrossSaveSwap({
     preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: false, successorInPreSlot: true
   }), false)
+  // r7 P0: an established, DIFFERENT identity on the successor vetoes the carry —
+  // overwriting it would promote the stamp over the object's own identity and
+  // poison the owner map (the r6 stale-lineage bypass via registration).
+  assert.equal(shouldCarryIdentityAcrossSaveSwap({
+    preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: false,
+    successorCarriesPreUuid: true, postWfHasConflictingEstablishedIdentity: true
+  }), false)
   // r4 P0: the predecessor is STILL OPEN — a user/reconnect tab switch during the
   // awaited save lands on a DISTINCT workflow; seeding it with A's uuid would
   // bypass the #349 wrong-canvas fence → never carry.

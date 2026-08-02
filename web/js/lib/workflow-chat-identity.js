@@ -79,11 +79,17 @@ export function shouldCarryIdentityAcrossSaveSwap({
   savedAs = false,
   preWfStillOpen = true,
   successorCarriesPreUuid = false,
+  postWfHasConflictingEstablishedIdentity = false,
 } = {}) {
   if (savedAs) return false;
   if (!preWf || !postWf || typeof postWf !== "object") return false;
   if (preWf === postWf || sameWorkflowObject(preWf, postWf)) return false;
   if (preWfStillOpen) return false;
+  // r7 P0 — an established, DIFFERENT identity on the successor is a conflict:
+  // overwriting it would promote the pre-save stamp over the object's own
+  // identity and poison the owner map (the r6 stale-lineage bypass, via
+  // registration this time). Fail closed; the proven-repaint remedy heals.
+  if (postWfHasConflictingEstablishedIdentity) return false;
   return successorCarriesPreUuid === true;
 }
 

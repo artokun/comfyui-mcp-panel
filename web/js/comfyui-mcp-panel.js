@@ -1526,7 +1526,16 @@ function installCreateBoundaryFork(appRef) {
             const stamped =
               active?.changeTracker?.activeState?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD];
             if (stamped !== stampUuid) return; // no positive match — do NOT register
-            if (!_workflowObjectUuids.get(active)) _workflowObjectUuids.set(active, stampUuid);
+            // r7 P0 — a positive tracker match is still not enough when the
+            // active object ALREADY has an established, DIFFERENT identity: the
+            // load landed on a tab with its own uuid (or the tracker is stale
+            // residue). Promoting the stamp into an owner claim would let the
+            // guard's lineage check re-stamp a foreign root with this object's
+            // identity — the r6 stale-lineage bypass via registration. Fail
+            // closed: an established conflicting identity vetoes registration.
+            const established = _workflowObjectUuids.get(active);
+            if (established && established !== stampUuid) return;
+            if (!established) _workflowObjectUuids.set(active, stampUuid);
             rememberWorkflowUuidOwner(stampUuid, active);
           } catch {
             // Identity bookkeeping must never break a graph load.
@@ -3309,6 +3318,12 @@ async function programmaticSave(name) {
     const successorState = postSwapWf?.changeTracker?.activeState ?? postSwapWf?.activeState;
     const successorCarriesPreUuid =
       successorState?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD] === preSwapUuid;
+    // r7 P0 — even with continuity proven, never overwrite an established,
+    // DIFFERENT identity on the successor: that is a conflicting tab, not A's
+    // continuation, and seeding it would poison the owner map.
+    const postWfHasConflictingEstablishedIdentity = Boolean(
+      postSwapWf && _workflowObjectUuids.get(postSwapWf) && _workflowObjectUuids.get(postSwapWf) !== preSwapUuid
+    );
     if (
       shouldCarryIdentityAcrossSaveSwap({
         preWf: expectWf,
@@ -3316,9 +3331,10 @@ async function programmaticSave(name) {
         savedAs: outcome.saved_as,
         preWfStillOpen,
         successorCarriesPreUuid,
+        postWfHasConflictingEstablishedIdentity,
       })
     ) {
-      _workflowObjectUuids.set(postSwapWf, preSwapUuid);
+      if (!_workflowObjectUuids.get(postSwapWf)) _workflowObjectUuids.set(postSwapWf, preSwapUuid);
       rememberWorkflowUuidOwner(preSwapUuid, postSwapWf);
     }
   }
