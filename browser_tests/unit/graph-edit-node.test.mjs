@@ -194,3 +194,16 @@ test("#538 retains every legacy presentation bridge command for old MCP servers"
     assert.match(panelSrc, new RegExp(`\\n  ${command}\\(`));
   }
 });
+
+test("#538 legacy title and color wrappers preserve their null compatibility behavior", () => {
+  assert.match(
+    panelSrc,
+    /graph_set_title\(\{ node_id, title \}\) \{[\s\S]*?graph_edit_node\(\{ node_id, title: title \?\? "" \}\)/,
+    "nullish legacy titles must clear to an empty title, not become literal text",
+  );
+  assert.match(
+    panelSrc,
+    /graph_set_node_color\(\{ node_id, color, bgcolor, preset \}\) \{[\s\S]*?if \(preset != null\) args\.preset = preset;[\s\S]*?else \{[\s\S]*?if \(color !== undefined\) args\.color = color;[\s\S]*?if \(bgcolor !== undefined\) args\.bgcolor = bgcolor;/,
+    "preset:null must retain the legacy explicit color/clear path",
+  );
+});

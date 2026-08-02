@@ -7118,7 +7118,9 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   graph_set_title({ node_id, title }) {
-    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id, title });
+    // Match the legacy command's nullish-title behavior: it clears the visible
+    // title rather than serializing a literal "null"/"undefined" label.
+    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id, title: title ?? "" });
     const edit = result.edited[0];
     return { node_id: edit.after.node_id, previous: edit.before.title, title: edit.after.title };
   },
@@ -7131,9 +7133,13 @@ const GRAPH_TOOL_EXECUTORS = {
 
   graph_set_node_color({ node_id, color, bgcolor, preset }) {
     const args = { node_id };
-    if (preset !== undefined) args.preset = preset;
-    if (color !== undefined) args.color = color;
-    if (bgcolor !== undefined) args.bgcolor = bgcolor;
+    // Legacy `preset:null` meant "no preset", so retain the explicit color/clear
+    // branch rather than forwarding null as a supplied palette value.
+    if (preset != null) args.preset = preset;
+    else {
+      if (color !== undefined) args.color = color;
+      if (bgcolor !== undefined) args.bgcolor = bgcolor;
+    }
     const result = GRAPH_TOOL_EXECUTORS.graph_edit_node(args);
     const edit = result.edited[0];
     return { node_id: edit.after.node_id, color: edit.after.color, bgcolor: edit.after.bgcolor };
