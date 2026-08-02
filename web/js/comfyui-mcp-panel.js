@@ -249,6 +249,7 @@ import { createRunReconcileSweep } from "./lib/run-reconcile-sweep.js";
 import {
   activeWorkflowNodeCount,
   graphReadDesynced,
+  graphRootMismatchesActiveWorkflow,
   graphReadBindingChanged,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
@@ -3944,16 +3945,19 @@ function getGraphCtx() {
 // than return empty". Fail-safe: fires ONLY when the workflow reports N>0 nodes at
 // ROOT scope while the live root graph is empty, so a genuinely-empty / brand-new
 // workflow (and any descended-into empty subgraph) reads `node_count: 0` as before.
-function assertGraphBoundToActiveWorkflow(graph, rootGraph) {
+function assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard = true } = {}) {
   const liveNodeCount = rootGraph?._nodes?.length ?? 0;
   const inSubgraph = !!rootGraph && graph !== rootGraph;
   const activeWorkflow = activeWorkflowRef();
-  if (graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph })) {
+  if (
+    graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow }) ||
+    (includeBaselineReadGuard && graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph }))
+  ) {
     const expected = activeWorkflowNodeCount(activeWorkflow);
     throw new Error(
-      `The live graph is out of sync with the active workflow: the workflow reports ${expected} node(s) ` +
-        `but the canvas graph is empty. A load, tab switch, or reconnect left this read bound to an empty ` +
-        `graph, so an empty/clean result here would be WRONG. Re-open the active workflow tab ` +
+      `The live graph is out of sync with the active workflow: the workflow reports ${expected} node(s), ` +
+        `but the canvas is bound to a different graph. A load, tab switch, or reconnect left this command ` +
+        `pointed at the wrong canvas, so it was NOT applied. Re-open the active workflow tab ` +
         `(panel_open_workflow) or reload the panel to rebind the graph, then retry.`,
     );
   }
@@ -4183,9 +4187,23 @@ const graphSnapshots = []; // [{ mid, ts, label, data }], oldest → newest
 
 function captureGraphSnapshot(mid, label) {
   try {
-    const data = getGraphCtx().rootGraph.serialize();
-    graphSnapshots.push({ mid, ts: Date.now(), label: (label || "").slice(0, 80), data });
+    const { graph, rootGraph } = getGraphCtx();
+    const workflowRef = activeWorkflowRef();
+    // A snapshot can later be restored by a local /revert path, so it must be
+    // captured only from a canvas proven to match this workflow's CURRENT state.
+    // Without this, a stale root B could be recorded under active A and later
+    // loaded into A after a rebind (cross-workflow corruption, #349).
+    // Mirror the binding helper's version-defensive resolution: a malformed
+    // tracker state must not hide a valid flat workflow.activeState.
+    const currentState = [workflowRef?.changeTracker?.activeState, workflowRef?.activeState].find(
+      (state) => state && Array.isArray(state.nodes),
+    );
+    if (!currentState) return null;
+    assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: false });
+    const data = rootGraph.serialize();
+    graphSnapshots.push({ mid, ts: Date.now(), label: (label || "").slice(0, 80), data, workflowRef });
     while (graphSnapshots.length > GRAPH_SNAPSHOTS_MAX) graphSnapshots.shift();
+    return graphSnapshots[graphSnapshots.length - 1];
   } catch {
     // graph unavailable — this turn just won't have a restore point.
   }
@@ -4195,10 +4213,18 @@ function captureGraphSnapshot(mid, label) {
 function restoreSnapshot(snap) {
   if (!snap) return null;
   try {
+    const { app, graph, rootGraph } = getGraphCtx();
+    // Snapshots are workflow-instance scoped. A snapshot captured from tab B
+    // must never become a valid load merely because the canvas later rebinds to
+    // tab A; missing provenance is rejected too (old in-memory snapshots).
+    if (!snap.workflowRef || snap.workflowRef !== activeWorkflowRef()) return null;
+    // Revert is a direct local load, not a bridge command. Do not restore a
+    // snapshot into a canvas proven to belong to a different active workflow.
+    assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: false });
     // Deep-clone so the stored snapshot isn't mutated by the live graph after load.
     // __cmcpNoFork: this reloads the SAME active workflow (a revert), so the create-
     // boundary fork must NOT re-mint its per-instance identity (#570 P0).
-    getGraphCtx().app.loadGraphData(JSON.parse(JSON.stringify(snap.data)), true, true, activeWorkflowRef(), {
+    app.loadGraphData(JSON.parse(JSON.stringify(snap.data)), true, true, activeWorkflowRef(), {
       __cmcpNoFork: true,
     });
     return snap;
@@ -4214,14 +4240,22 @@ function restoreSnapshot(snap) {
 // snapshot equals the canvas and reverting to it recovers nothing. Returns null
 // when nothing genuinely differs — the caller surfaces "nothing to revert".
 function revertGraphToLastSnapshot() {
+  const workflowRef = activeWorkflowRef();
+  if (!workflowRef) return null;
+  // The snapshot ring spans tabs, but a revert belongs only to the CURRENT
+  // workflow instance. Filter before choosing the newest differing snapshot:
+  // otherwise a newer B snapshot wins selection, is rightly rejected by
+  // restoreSnapshot, and hides an older valid A snapshot (#349).
+  const scopedSnapshots = graphSnapshots.filter((snap) => snap?.workflowRef === workflowRef);
+  if (!scopedSnapshots.length) return null;
   try {
     const current = getGraphCtx().rootGraph.serialize();
-    const snap = pickRevertSnapshot(graphSnapshots, current);
+    const snap = pickRevertSnapshot(scopedSnapshots, current);
     return snap ? restoreSnapshot(snap) : null;
   } catch {
     // graph unavailable (can't serialize current state) — fall back to the
     // legacy newest-snapshot behavior rather than silently doing nothing.
-    return restoreSnapshot(graphSnapshots[graphSnapshots.length - 1]);
+    return restoreSnapshot(scopedSnapshots[scopedSnapshots.length - 1]);
   }
 }
 
@@ -4909,8 +4943,12 @@ async function validationBanner() {
 // Restore the canvas to the snapshot captured before the message with this mid
 // (the per-message rollback). Returns the snapshot or null.
 function revertGraphSnapshotByMid(mid) {
+  const workflowRef = activeWorkflowRef();
+  if (!workflowRef) return null;
   for (let i = graphSnapshots.length - 1; i >= 0; i--) {
-    if (graphSnapshots[i].mid === mid) return restoreSnapshot(graphSnapshots[i]);
+    if (graphSnapshots[i].mid === mid && graphSnapshots[i].workflowRef === workflowRef) {
+      return restoreSnapshot(graphSnapshots[i]);
+    }
   }
   return null;
 }
@@ -6333,7 +6371,11 @@ const GRAPH_TOOL_EXECUTORS = {
   // current graph), so a ready pack/template graph lands without recreating it
   // node-by-node. Mirrors restoreSnapshot's app.loadGraphData(...) path.
   async graph_load({ graph: incoming } = {}) {
-    const { app } = getGraphCtx();
+    const { app, graph, rootGraph } = getGraphCtx();
+    // This executor is also called directly by the CivitAI workflow picker,
+    // bypassing bridge dispatch. Refuse before snapshot/load so that path cannot
+    // report a successful load into a stale prior tab (#349).
+    assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: false });
     // Accept a JSON string or an object.
     let data = incoming;
     if (typeof data === "string") {
@@ -7260,6 +7302,11 @@ const GRAPH_TOOL_EXECUTORS = {
 
   async graph_run({ batch_count, to_node_id }) {
     const { app, graph, rootGraph } = getGraphCtx();
+    // /run invokes this executor directly rather than through bridge dispatch.
+    // Queueing a stale root would render the wrong workflow even though no graph
+    // mutation occurs, so enforce the same current-state binding before prompt
+    // construction or queuePrompt can report success (#349).
+    assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: false });
     if (typeof app.queuePrompt !== "function") {
       throw new Error("app.queuePrompt is unavailable on this frontend");
     }
@@ -10721,6 +10768,15 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
                   `Re-select the intended workflow (panel_open_workflow) or re-target with ` +
                   `panel_set_workflow_target({mode:"current"}), then retry.`,
               );
+            }
+            // #349: UUID fencing proves the command was issued for the active
+            // workflow SERVICE object, but graph executors operate on LiteGraph's
+            // separate app.graph. A stale nonempty app.graph can therefore pass the
+            // UUID check and still edit a previous tab. Fence every graph command
+            // against the active workflow's serialized root before its executor.
+            if (msg.cmd.startsWith("graph_")) {
+              const { graph, rootGraph } = getGraphCtx();
+              assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: false });
             }
             // PINNED-TARGET GUARD (#349): a `workflow_path` on the command means the
             // agent's session is pinned to a SPECIFIC workflow. But every executor

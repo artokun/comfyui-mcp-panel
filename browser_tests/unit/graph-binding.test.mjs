@@ -18,6 +18,7 @@ import { dirname, join } from "node:path";
 import {
   activeWorkflowNodeCount,
   graphReadDesynced,
+  graphRootMismatchesActiveWorkflow,
   graphReadBindingChanged,
 } from "../../web/js/lib/graph-binding.js";
 
@@ -28,6 +29,12 @@ const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
 // `changeTracker.activeState` / `.initialState` (and some builds hang them flat).
 const wf = (over = {}) => ({ changeTracker: {}, ...over });
 const state = (n) => ({ nodes: Array.from({ length: n }, (_, i) => ({ id: i + 1 })) });
+const typedState = (...nodes) => ({ nodes: nodes.map(([id, type]) => ({ id, type })) });
+const liveRoot = (...nodes) => ({ _nodes: nodes.map(([id, type]) => ({ id, type })) });
+const serializedRoot = (serialized) => ({
+  _nodes: serialized.nodes.map(({ id, type }) => ({ id, type })),
+  serialize: () => serialized,
+});
 
 // ── activeWorkflowNodeCount: fail-open ground truth ──────────────────────────
 
@@ -130,6 +137,173 @@ test("graphReadDesynced: defensive — missing args never throw, default to not-
   assert.equal(graphReadDesynced({}), false);
 });
 
+test("graphRootMismatchesActiveWorkflow: TRUE - a nonempty prior tab remains on the canvas (#349)", () => {
+  const activeWorkflow = wf({ changeTracker: { activeState: typedState([1, "AnimeLoader"], [2, "KSampler"]) } });
+  const rootGraph = liveRoot([1, "FluxLoader"], [2, "KSampler"], [3, "SaveImage"]);
+  assert.equal(graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow }), true);
+});
+
+test("graphRootMismatchesActiveWorkflow: TRUE - same node count but a different graph shape", () => {
+  const activeWorkflow = wf({ changeTracker: { activeState: typedState([1, "CheckpointLoader"], [2, "KSampler"]) } });
+  const rootGraph = liveRoot([1, "FluxLoader"], [2, "KSampler"]);
+  assert.equal(graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow }), true);
+});
+
+test("graphRootMismatchesActiveWorkflow: TRUE - matching id:type nodes but different widgets or links", () => {
+  const activeState = {
+    nodes: [
+      { id: 1, type: "CheckpointLoader", widgets_values: ["anime.safetensors"] },
+      { id: 2, type: "KSampler", widgets_values: [20] },
+    ],
+    links: [[1, 1, 0, 2, 0, "MODEL"]],
+  };
+  const staleState = {
+    nodes: [
+      { id: 1, type: "CheckpointLoader", widgets_values: ["flux.safetensors"] },
+      { id: 2, type: "KSampler", widgets_values: [35] },
+    ],
+    links: [],
+  };
+  const activeWorkflow = wf({ changeTracker: { activeState } });
+  assert.equal(
+    graphRootMismatchesActiveWorkflow({ rootGraph: serializedRoot(staleState), activeWorkflow }),
+    true,
+  );
+});
+
+test("graphRootMismatchesActiveWorkflow: TRUE - ChangeTracker-relevant non-node surfaces differ", () => {
+  const activeState = {
+    nodes: [{ id: 1, type: "KSampler" }],
+    links: [],
+    floatingLinks: [{ id: "floating-a", pos: [10, 20] }],
+    reroutes: [{ id: "reroute-a", pos: [30, 40] }],
+    subgraphs: [{ id: "subgraph-a", nodes: [{ id: 9, type: "SaveImage" }] }],
+  };
+  const activeWorkflow = wf({ changeTracker: { activeState } });
+  const variants = [
+    ["floatingLinks", [{ id: "floating-b", pos: [10, 20] }]],
+    ["reroutes", [{ id: "reroute-b", pos: [30, 40] }]],
+    ["subgraphs", [{ id: "subgraph-b", nodes: [{ id: 9, type: "SaveImage" }] }]],
+  ];
+  for (const [field, replacement] of variants) {
+    const staleState = structuredClone(activeState);
+    staleState[field] = replacement;
+    assert.equal(
+      graphRootMismatchesActiveWorkflow({ rootGraph: serializedRoot(staleState), activeWorkflow }),
+      true,
+      `${field} must participate in the binding comparison`,
+    );
+  }
+});
+
+test("graphRootMismatchesActiveWorkflow: TRUE - missing and explicitly empty/null tracker surfaces differ", () => {
+  const activeState = { nodes: [{ id: 1, type: "KSampler" }] };
+  const activeWorkflow = wf({ changeTracker: { activeState } });
+  for (const [field, replacement] of [
+    ["links", []],
+    ["floatingLinks", []],
+    ["reroutes", []],
+    ["groups", []],
+    ["config", {}],
+    ["subgraphs", []],
+    ["definitions", null],
+  ]) {
+    const staleState = { ...activeState, [field]: replacement };
+    assert.equal(
+      graphRootMismatchesActiveWorkflow({ rootGraph: serializedRoot(staleState), activeWorkflow }),
+      true,
+      `${field}: missing must not collapse into an explicit value`,
+    );
+  }
+});
+
+test("graphRootMismatchesActiveWorkflow: FALSE - matching serialized semantic state is bound", () => {
+  const activeState = {
+    nodes: [{ id: 1, type: "CheckpointLoader", widgets_values: ["anime.safetensors"] }],
+    links: [],
+    extra: { ds: { scale: 1 } },
+  };
+  const activeWorkflow = wf({ changeTracker: { activeState } });
+  assert.equal(
+    graphRootMismatchesActiveWorkflow({ rootGraph: serializedRoot(structuredClone(activeState)), activeWorkflow }),
+    false,
+  );
+});
+
+test("graphRootMismatchesActiveWorkflow: FALSE - node array order and viewport drift do not invent a mismatch", () => {
+  const activeState = {
+    nodes: [
+      { id: 1, type: "CheckpointLoader", widgets_values: ["anime.safetensors"] },
+      { id: 2, type: "KSampler", widgets_values: [20] },
+    ],
+    links: [[1, 1, 0, 2, 0, "MODEL"]],
+    extra: { ds: { scale: 1, offset: [0, 0] }, workflow_meta: { owner: "artist" } },
+  };
+  const sameWorkflowDifferentViewport = {
+    ...structuredClone(activeState),
+    nodes: [...activeState.nodes].reverse(),
+    extra: { ds: { scale: 1.7, offset: [125, -40] }, workflow_meta: { owner: "artist" } },
+  };
+  const activeWorkflow = wf({ changeTracker: { activeState } });
+  assert.equal(
+    graphRootMismatchesActiveWorkflow({
+      rootGraph: serializedRoot(sameWorkflowDifferentViewport),
+      activeWorkflow,
+    }),
+    false,
+  );
+});
+
+test("graphRootMismatchesActiveWorkflow: FALSE - viewport-only extra matches an absent extra field", () => {
+  const activeState = { nodes: [{ id: 1, type: "KSampler", widgets_values: [20] }], links: [] };
+  const liveState = {
+    ...structuredClone(activeState),
+    extra: { ds: { scale: 2, offset: [33, -17] } },
+  };
+  const activeWorkflow = wf({ changeTracker: { activeState } });
+  assert.equal(
+    graphRootMismatchesActiveWorkflow({ rootGraph: serializedRoot(liveState), activeWorkflow }),
+    false,
+  );
+});
+
+test("graphRootMismatchesActiveWorkflow: FALSE - matching root shape is bound, independent of node order", () => {
+  const activeWorkflow = wf({ changeTracker: { activeState: typedState([1, "CheckpointLoader"], [2, "KSampler"]) } });
+  const rootGraph = liveRoot([2, "KSampler"], [1, "CheckpointLoader"]);
+  assert.equal(graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow }), false);
+});
+
+test("graphRootMismatchesActiveWorkflow: FALSE - absent or partial state is inconclusive, never a false refusal", () => {
+  const rootGraph = liveRoot([1, "CheckpointLoader"]);
+  assert.equal(graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow: null }), false);
+  assert.equal(
+    graphRootMismatchesActiveWorkflow({
+      rootGraph: { _nodes: [{ id: 1 }] },
+      activeWorkflow: wf({ changeTracker: { activeState: typedState([1, "CheckpointLoader"]) } }),
+    }),
+    false,
+  );
+});
+
+test("graphRootMismatchesActiveWorkflow: FALSE - initialState is a baseline, not a false stale-current comparison", () => {
+  const baseline = {
+    nodes: [{ id: 1, type: "KSampler", widgets_values: [20] }],
+    links: [],
+  };
+  const legitimateUnsavedLiveState = {
+    nodes: [{ id: 1, type: "KSampler", widgets_values: [30] }],
+    links: [],
+  };
+  const activeWorkflow = wf({ changeTracker: { initialState: baseline } });
+  assert.equal(
+    graphRootMismatchesActiveWorkflow({
+      rootGraph: serializedRoot(legitimateUnsavedLiveState),
+      activeWorkflow,
+    }),
+    false,
+  );
+});
+
 test("graphReadBindingChanged: FALSE — same workflow instance and root graph across the await", () => {
   const w = wf();
   const g = {};
@@ -217,5 +391,75 @@ test("#513 review wiring: validationBanner fences its server probe against a mid
   assert.ok(
     discardAt < sigAt,
     "the mismatch discard must precede the dedupe-sig stamp — A's state must not poison B's dedupe",
+  );
+});
+
+test("#349 wiring: every graph command verifies LiteGraph is bound to the active workflow before execution", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const handlerStart = src.indexOf("const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];");
+  assert.notEqual(handlerStart, -1, "bridge graph-command handler must exist");
+  const handler = src.slice(handlerStart, src.indexOf("result = await executor(msg);", handlerStart));
+  assert.match(handler, /msg\.cmd\.startsWith\("graph_"\)/, "graph commands must have a root-binding fence");
+  assert.match(
+    handler,
+    /assertGraphBoundToActiveWorkflow\(graph, rootGraph(?:, \{ includeBaselineReadGuard: false \})?\)/,
+    "the fence must inspect the graph the executor will use",
+  );
+});
+
+test("#349 direct paths: run, CivitAI load, and snapshot restore fence the live root before success", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const orderedFence = (startNeedle, beforeNeedle) => {
+    const start = src.indexOf(startNeedle);
+    const before = src.indexOf(beforeNeedle, start);
+    const fence = src.indexOf("assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: false })", start);
+    assert.notEqual(start, -1, `${startNeedle} must exist`);
+    assert.notEqual(before, -1, `${beforeNeedle} must follow ${startNeedle}`);
+    assert.ok(fence > start && fence < before, `${startNeedle} must fence before ${beforeNeedle}`);
+  };
+
+  orderedFence("async graph_run({ batch_count, to_node_id })", "app.queuePrompt");
+  orderedFence("async graph_load({ graph: incoming } = {})", "captureGraphSnapshot(null, \"before graph_load\")");
+  orderedFence("function restoreSnapshot(snap)", "app.loadGraphData(JSON.parse(JSON.stringify(snap.data))");
+});
+
+test("#349 snapshots: capture is bound and restore rejects a snapshot from another workflow", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const captureStart = src.indexOf("function captureGraphSnapshot(mid, label)");
+  const captureSerialize = src.indexOf("const data = rootGraph.serialize();", captureStart);
+  const captureFence = src.indexOf("assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: false });", captureStart);
+  assert.ok(captureStart >= 0 && captureFence > captureStart && captureFence < captureSerialize);
+  assert.match(
+    src.slice(captureStart, captureSerialize),
+    /\[workflowRef\?\.changeTracker\?\.activeState, workflowRef\?\.activeState\]\.find\(/,
+    "snapshot capture must fall back to a valid flat activeState when tracker state is malformed",
+  );
+  assert.match(
+    src.slice(captureStart, src.indexOf("while (graphSnapshots.length", captureStart)),
+    /graphSnapshots\.push\(\{[^}]*data, workflowRef \}\)/,
+    "a captured snapshot must retain its workflow instance",
+  );
+
+  const restoreStart = src.indexOf("function restoreSnapshot(snap)");
+  const restoreLoad = src.indexOf("app.loadGraphData(JSON.parse(JSON.stringify(snap.data))", restoreStart);
+  const restoreBody = src.slice(restoreStart, restoreLoad);
+  assert.match(
+    restoreBody,
+    /!snap\.workflowRef \|\| snap\.workflowRef !== activeWorkflowRef\(\)/,
+    "restore must reject missing or cross-workflow snapshot provenance",
+  );
+
+  const revertStart = src.indexOf("function revertGraphToLastSnapshot()");
+  const revertEnd = src.indexOf("\n}\n", revertStart);
+  const revertBody = src.slice(revertStart, revertEnd);
+  assert.match(
+    revertBody,
+    /graphSnapshots\.filter\(\(snap\) => snap\?\.workflowRef === workflowRef\)/,
+    "revert must select candidates only from the active workflow instance",
+  );
+  assert.match(
+    revertBody,
+    /pickRevertSnapshot\(scopedSnapshots, current\)/,
+    "a foreign newer snapshot must not hide an older same-workflow revert",
   );
 });
