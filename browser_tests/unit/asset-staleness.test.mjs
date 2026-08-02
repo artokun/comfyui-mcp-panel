@@ -713,3 +713,42 @@ test("collectLinkedNeighborNodeIds: defensive on missing node/links — empty se
   assert.deepEqual([...collectLinkedNeighborNodeIds({}, undefined)], []);
   assert.deepEqual([...collectLinkedNeighborNodeIds({ inputs: null, outputs: null }, {})], []);
 });
+
+test("collectLinkedNeighborNodeIds: a slot link id whose link does NOT connect to the wrapper is ignored (#516 round 2)", () => {
+  // A stale/re-slotted slot can carry a link id whose link now joins two OTHER
+  // nodes. The far node of such a link must never be re-adjudicated — an unrelated
+  // node's red mark would otherwise be cleared off a dangling slot id.
+  const links = {
+    201: { id: 201, origin_id: 7, origin_slot: 0, target_id: 42, target_slot: 0 }, // targets 42, NOT the wrapper
+    202: { id: 202, origin_id: 42, origin_slot: 0, target_id: 11, target_slot: 0 }, // originates at 42, NOT the wrapper
+  };
+  const wrapper = {
+    id: 900,
+    inputs: [{ link: 201 }],
+    outputs: [{ links: [202] }],
+  };
+  assert.deepEqual([...collectLinkedNeighborNodeIds(wrapper, links)], []);
+});
+
+test("collectLinkedNeighborNodeIds: stale slot ids are dropped while VERIFIED links still collect", () => {
+  const links = {
+    301: { id: 301, origin_id: 7, origin_slot: 0, target_id: 900, target_slot: 0 }, // valid: targets wrapper
+    302: { id: 302, origin_id: 8, origin_slot: 0, target_id: 42, target_slot: 0 }, // stale: targets 42
+    303: { id: 303, origin_id: 900, origin_slot: 0, target_id: 11, target_slot: 0 }, // valid: originates at wrapper
+    304: { id: 304, origin_id: 42, origin_slot: 0, target_id: 12, target_slot: 0 }, // stale: originates at 42
+  };
+  const wrapper = {
+    id: 900,
+    inputs: [{ link: 301 }, { link: 302 }],
+    outputs: [{ links: [303, 304] }],
+  };
+  assert.deepEqual([...collectLinkedNeighborNodeIds(wrapper, links)].sort((a, b) => a - b), [7, 11]);
+});
+
+test("collectLinkedNeighborNodeIds: near-end verification matches across id types (string node id vs numeric link id)", () => {
+  const links = {
+    401: { id: 401, origin_id: 7, origin_slot: 0, target_id: "900", target_slot: 0 },
+  };
+  const wrapper = { id: 900, inputs: [{ link: 401 }], outputs: [] };
+  assert.deepEqual([...collectLinkedNeighborNodeIds(wrapper, links)], [7]);
+});

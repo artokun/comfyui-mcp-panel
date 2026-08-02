@@ -248,12 +248,21 @@ export function nodeRedFlagIsStale(
  * convertToSubgraph (#516): conversion reroutes the SURVIVING nodes' wires onto the
  * new wrapper node without revalidating them, so these neighbours are exactly the
  * nodes whose sticky LiteGraph `has_errors` red outline must be re-adjudicated with
- * the #418 `nodeRedFlagIsStale` check. Pure + fully defensive — unknown shapes
- * contribute nothing and it never throws. Returns a Set (ids in their raw type).
+ * the #418 `nodeRedFlagIsStale` check.
+ *
+ * A slot's link id is NOT proof of connection: a stale/re-slotted slot can carry a
+ * link id whose link no longer touches this node. Each resolved link is therefore
+ * trusted only when its NEAR end is verified to be `node` itself — an input slot's
+ * link must TARGET `node`, an output slot's link must ORIGINATE at `node` — so an
+ * unrelated node's red mark is never re-adjudicated off a dangling id. Compared by
+ * String() so numeric and UUID-string node ids both match. Pure + fully defensive —
+ * unknown shapes contribute nothing and it never throws. Returns a Set (raw id type).
  */
 export function collectLinkedNeighborNodeIds(node, links) {
   const out = new Set();
   try {
+    const selfId = node?.id;
+    if (selfId == null) return out;
     const lookup = (id) => {
       if (id == null || !links) return null;
       if (typeof links.get === "function") return links.get(id) ?? null;
@@ -261,13 +270,18 @@ export function collectLinkedNeighborNodeIds(node, links) {
     };
     const originId = (l) => (l ? (l.origin_id ?? l[1]) : undefined);
     const targetId = (l) => (l ? (l.target_id ?? l[3]) : undefined);
+    const isSelf = (id) => id != null && String(id) === String(selfId);
     for (const input of node?.inputs ?? []) {
-      const id = originId(lookup(input?.link));
+      const l = lookup(input?.link);
+      if (!isSelf(targetId(l))) continue;
+      const id = originId(l);
       if (id != null) out.add(id);
     }
     for (const output of node?.outputs ?? []) {
       for (const linkId of output?.links ?? []) {
-        const id = targetId(lookup(linkId));
+        const l = lookup(linkId);
+        if (!isSelf(originId(l))) continue;
+        const id = targetId(l);
         if (id != null) out.add(id);
       }
     }
