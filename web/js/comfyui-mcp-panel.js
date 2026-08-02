@@ -207,6 +207,25 @@ import {
 import { pickRevertSnapshot } from "./lib/graph-revert.js";
 import { decideOpenStaleness } from "./lib/workflow-open-staleness.js";
 import {
+  OPEN_DISK_READ_BUDGET_MS,
+  withDeadline,
+  makeOpenReceipt,
+  recordOpenReceipt,
+  latestOpenReceipt,
+  markOpenReceiptReplySent,
+  summarizeOpenReceipt,
+  createSingleFlight,
+} from "./lib/open-outcome.js";
+import {
+  classifyUndeliveredReply,
+  describeUndeliveredReply,
+  createLostReplyJournal,
+  isReplayable,
+  pruneAttempts,
+  shouldReRegister,
+  reRegisterExhaustedHint,
+} from "./lib/command-liveness.js";
+import {
   saveActiveWorkflow,
   shouldGroundBeforeTurn,
   groundActiveWorkflow,
@@ -305,6 +324,125 @@ let backendReconnectedAt = null;
 // The reconnect epoch value at the last authoritative (re)bind by an explicit
 // open/new; when it's >= backendReconnectEpoch the active pointer is trusted again.
 let activeWorkflowResyncEpoch = 0;
+// #402 — OPEN RECEIPTS. Every workflow_open / workflow_new that RAN is journaled here
+// with the selector it was asked for, the identity it resolved to, and whether it
+// applied. When a mid-command drop loses the reply, this is the ONLY non-inferential
+// answer to "did my open actually happen?" — reading `workflow_list.active` instead is
+// not an answer, because after a backend reconnect the frontend restores a tab on its
+// own (#433), which explains a matching `active` without our command ever running.
+const openReceipts = [];
+let openReceiptSeq = 0;
+// #402 / codex P2 — at most ONE outstanding staleness disk-read per workflow path. The
+// read is bounded by a deadline, but a deadline only stops US waiting: one of the two
+// read paths takes no AbortSignal, so without this a server that accepts requests and
+// never answers would leak a live request on every open of the same workflow.
+const staleReadFlight = createSingleFlight();
+// #508 — outcomes whose reply could NOT be written back. Replayed on the next socket and
+// summarized to the user, so a command that really ran is never silently swallowed.
+const lostReplies = createLostReplyJournal();
+
+// #442 / codex — WORKFLOW SWITCH+RELOAD CRITICAL SECTION. Freezing the CANVAS keeps the
+// USER out of the window between the dirty check and the destructive re-read, but the
+// bridge is a second writer: the socket listener is async and re-entrant, so a perfectly
+// valid, correctly-stamped graph_* command can land mid-reload. It would either be
+// overwritten by the load, or — worse — land during the tracker re-baseline and be marked
+// CLEAN, so the next out-of-band disk change silently discards it with no conflict shown.
+// While this guard is held, every graph/workflow executor is REFUSED with a retryable
+// error (nothing applied) rather than queued: refusing cannot reorder or double-apply. The
+// window normally lasts a fraction of a second, but it lasts EXACTLY as long as the
+// switch/reload genuinely runs — see begin/endWorkflowReloadStep below.
+let workflowReloadGuard = null;
+let workflowReloadGuardSeq = 0;
+// Defensive ceiling: a guard can only ever be cleared by workflow_open's finally, so if
+// some pathological path ever failed to run it, an un-expiring guard would wedge every
+// command in the tab. Age it out instead — but ONLY while no step of the section is in
+// flight. The ceiling exists for a guard whose holder VANISHED; it must never cut a
+// genuinely-running step off (that expiry is precisely the DATA-LOSS window this guard
+// exists to close).
+const WORKFLOW_RELOAD_GUARD_MAX_MS = 30000;
+/** Take the section and return an OWNERSHIP TOKEN. Sections are token-scoped (codex): an
+ *  expired-then-superseded holder must never release a NEWER holder's section, and a holder
+ *  that has lost the section must not go on mutating as though it still had it. */
+function acquireWorkflowReloadGuard(key) {
+  const token = ++workflowReloadGuardSeq;
+  workflowReloadGuard = { token, key, since: Date.now(), pending: 0 };
+  return token;
+}
+/** Release ONLY if `token` still owns the section. */
+function releaseWorkflowReloadGuard(token) {
+  if (workflowReloadGuard && workflowReloadGuard.token === token) workflowReloadGuard = null;
+}
+/** Mark one awaited step of the section (the tab switch, a loadGraphData, a tracker
+ *  re-baseline) as IN FLIGHT across its await. While any step is outstanding the guard
+ *  CANNOT age out (activeWorkflowReloadGuard below): expiring mid-await drops the fence,
+ *  a graph command then runs and is ACKNOWLEDGED, and the late-completing load overwrites
+ *  that acknowledged edit — the DATA-LOSS shape (codex). Tying the guard to the step's
+ *  settle means a slow load keeps refusing commands for as long as it genuinely runs. The
+ *  trade is deliberate: a load that NEVER settles wedges the tab with a loud, retryable
+ *  refusal (recoverable — reload the tab) instead of silently eating an edit the caller
+ *  was told succeeded (not recoverable). Returns false — and the caller must not start
+ *  the step — when `token` no longer owns the section. */
+function beginWorkflowReloadStep(token) {
+  const held = activeWorkflowReloadGuard();
+  if (!held || held.token !== token) return false;
+  held.pending += 1;
+  return true;
+}
+/** Counterpart of beginWorkflowReloadStep, called from the step's own finally so a
+ *  throwing step cannot leave the fence up forever. Also REARMS the ageing clock: between
+ *  steps the section runs synchronously (no command frame can interleave), so the idle
+ *  ceiling is measured from the last step's SETTLE — a section of many steps totalling
+ *  over WORKFLOW_RELOAD_GUARD_MAX_MS can never expire in the synchronous gap between two
+ *  of its own steps. */
+function endWorkflowReloadStep(token) {
+  if (
+    workflowReloadGuard &&
+    workflowReloadGuard.token === token &&
+    workflowReloadGuard.pending > 0
+  ) {
+    workflowReloadGuard.pending -= 1;
+    workflowReloadGuard.since = Date.now();
+  }
+}
+/** Does `token` still own the section? Re-checked after every await before any further
+ *  mutation, so an operation that outlived its own section stops instead of racing the
+ *  commands that were let through when it expired. */
+function ownsWorkflowReloadGuard(token) {
+  const held = activeWorkflowReloadGuard();
+  return !!held && held.token === token;
+}
+/** The guard, or null when none is held (expiring a stuck one on the way). A guard with a
+ *  step in flight (pending > 0) is NEVER expired here — it is tied to that step's settle,
+ *  so the fence cannot drop while a switch/load is genuinely awaiting. */
+function activeWorkflowReloadGuard() {
+  if (!workflowReloadGuard) return null;
+  if (
+    workflowReloadGuard.pending === 0 &&
+    Date.now() - workflowReloadGuard.since > WORKFLOW_RELOAD_GUARD_MAX_MS
+  ) {
+    workflowReloadGuard = null;
+    return null;
+  }
+  return workflowReloadGuard;
+}
+
+/** Journal one open attempt and return its receipt. `applied:false` (with the error) is
+ *  recorded too — a genuine negative is as load-bearing as a positive here. */
+function noteOpenAttempt({ cmd, rid, requested, resolved, applied, error }) {
+  const receipt = makeOpenReceipt({
+    seq: ++openReceiptSeq,
+    cmd,
+    rid,
+    requested,
+    resolved,
+    applied,
+    error,
+    at: Date.now(),
+    reconnectEpoch: backendReconnectEpoch,
+  });
+  recordOpenReceipt(openReceipts, receipt);
+  return receipt;
+}
 // Monotonic "now" — performance.now() when available (never runs backwards),
 // falling back to Date.now() only if the environment lacks it.
 function monotonicNow() {
@@ -3024,18 +3162,22 @@ async function workflowExistsOnDisk(rawPath) {
  *  the frontend's own listing sync advances a workflow's `lastModified` without
  *  reloading its graph (which would defeat an mtime check) and timestamp-preserving
  *  writes would evade one. Fails safe (null ⇒ no false staleness). */
-async function workflowDiskContent(rawPath) {
+async function workflowDiskContent(rawPath, { signal } = {}) {
   try {
     if (!api || !rawPath) return null;
     // Prefer getUserData, but FALL BACK to fetchApi (mirrors workflowExistsOnDisk) so a
     // frontend that exposes only fetchApi — or where getUserData is momentarily absent —
     // still reads disk. Without this the read returned null and the staleness/overwrite
     // checks silently degraded (codex P2). null only for a genuinely unavailable api.
+    //
+    // `signal` (optional) lets a bounded caller CANCEL a read that outlived its deadline
+    // instead of leaving it running. It only reaches the fetchApi path — getUserData takes
+    // no options — which is why the bounded caller ALSO single-flights its reads.
     const res =
       typeof api.getUserData === "function"
         ? await api.getUserData(rawPath)
         : typeof api.fetchApi === "function"
-          ? await api.fetchApi(`/userdata/${encodeURIComponent(rawPath)}`)
+          ? await api.fetchApi(`/userdata/${encodeURIComponent(rawPath)}`, signal ? { signal } : undefined)
           : null;
     if (!res || res.status !== 200) return null;
     return await res.text();
@@ -3103,13 +3245,24 @@ function nextFrame() {
  *  open stays modified:false. This mirrors what the frontend's own save() does
  *  (changeTracker.reset(); isModified = false), minus the disk write — opening
  *  from disk means the loaded graph already IS the saved state. Best-effort +
- *  feature-detected; never throws. */
-async function clearSpuriousOpenModified(wf) {
+ *  feature-detected; never throws.
+ *
+ *  Callers must hold the canvas interaction freeze around this — the awaited
+ *  frame below is exactly the gap in which an UNPROTECTED edit would be adopted
+ *  as the new clean baseline (a silent clean-slate over real work). A first-time
+ *  open is never frozen by design, so it does not get this cleanup at all: it
+ *  keeps the spurious flag (loud, cosmetic) instead. */
+async function clearSpuriousOpenModified(wf, { stillOwns } = {}) {
   if (!wf) return;
   try {
     // Wait for the load's post-render state capture to settle, otherwise we'd
     // re-baseline before the spurious modification is recorded.
     await nextFrame();
+    // codex — the re-baseline below CAPTURES the current canvas and forces isModified=false,
+    // so it must not run once the caller has lost its exclusive window: an edit made in this
+    // very frame would be adopted as the new clean baseline and could later be discarded
+    // with no conflict shown. Checking before the await is not enough — the frame IS the gap.
+    if (typeof stillOwns === "function" && !stillOwns()) return;
     const ct = wf.changeTracker;
     // Bring activeState up to date with the loaded graph, then make that the
     // baseline so initialState === activeState (graphEqual → not modified).
@@ -7532,6 +7685,28 @@ const GRAPH_TOOL_EXECUTORS = {
       reconnectedAt: backendReconnectedAt,
       now: monotonicNow(),
     });
+    const lastOpenReceipt = summarizeOpenReceipt(latestOpenReceipt(openReceipts), { now: Date.now() });
+    // #402 — ship the READING RULE with the data. The consumer of this field lives in
+    // another process (the orchestrator's dropped-open recovery), so a receipt that merely
+    // NAMES the right workflow is the single most over-readable thing here: an earlier
+    // successful open of the same file would otherwise be taken as proof that a later,
+    // dropped open ran. Stating the rule inline means a reader cannot reach the wrong
+    // conclusion without ignoring the payload it is reading.
+    const lastOpen = lastOpenReceipt
+      ? {
+          ...lastOpenReceipt,
+          answers_only_command_rid: lastOpenReceipt.rid,
+          interpretation:
+            "This receipt is the panel's own execution record and answers ONLY for the command " +
+            "whose id equals `rid`. For any OTHER command the outcome is UNDETERMINED — do not " +
+            "infer success from it, and do not infer success from `active` matching your target " +
+            "either (after a reconnect the frontend restores a tab by itself, see " +
+            "`active_confirmed`). `applied:true` means the panel completed it; `applied:false` " +
+            "means it failed and nothing was applied; `applied:\"unknown\"` means it may have " +
+            "taken effect and must NOT be blindly retried. `reply_sent:false` means the caller " +
+            "never received the answer.",
+        }
+      : null;
     return {
       active: active
         ? {
@@ -7560,22 +7735,65 @@ const GRAPH_TOOL_EXECUTORS = {
       // for any existing reader.
       open: openList,
       workflows: openList,
+      // #433/#402 — the POSITIVE form of active_possibly_stale, so a reader never has to
+      // infer trust from the absence of a warning. False means: a backend reconnect has
+      // happened recently and no explicit open/new has re-pointed `active` since, so the
+      // frontend — not the agent — chose whatever is active.
+      active_confirmed: !activeMaybeStale,
+      // #402 — the panel's OWN record of the last workflow_open / workflow_new that ran.
+      // This is what answers "did my dropped open apply?": `applied` is the panel's
+      // execution fact, `requested`/`resolved` prove WHICH workflow it was, and
+      // `reply_sent:false` says the caller never heard the answer. A matching `active`
+      // is NOT a substitute — after a reconnect the frontend restores a tab by itself.
+      //
+      // CORRELATE BY `rid` (codex P1). The receipt's `rid` is the server-minted id of the
+      // command it belongs to; only an EXACT rid match makes it an answer about YOUR
+      // command. Selector equality is not enough — an earlier successful open of the SAME
+      // workflow would otherwise be read as proof that a LATER, dropped open ran.
+      // No correlating receipt ⇒ the honest verdict is UNDETERMINED, never "opened".
+      ...(lastOpen ? { last_open: lastOpen } : {}),
       ...(activeMaybeStale
         ? { active_possibly_stale: true, stale_hint: activeStaleHint() }
         : {}),
     };
   },
 
-  async workflow_new() {
+  async workflow_new({ rid } = {}) {
     // #433 TOCTOU: snapshot the reconnect epoch BEFORE the async native work. If a
     // reconnect lands mid-operation it advances the epoch, and stamping the NEW
     // epoch at the end would suppress the warning that reconnect must raise (codex
     // P1). We only claim authoritative below when the epoch is UNCHANGED.
     const openedForEpoch = backendReconnectEpoch;
     const mgr = app?.extensionManager;
-    if (!mgr?.command?.execute) throw new Error("command service unavailable");
+    if (!mgr?.command?.execute) {
+      // Nothing ran — a clean negative (#402): safe to retry.
+      noteOpenAttempt({
+        cmd: "workflow_new",
+        rid,
+        requested: null,
+        resolved: null,
+        applied: false,
+        error: "command service unavailable",
+      });
+      throw new Error("command service unavailable");
+    }
     // Comfy.NewBlankWorkflow opens a fresh TAB — the current workflow is untouched.
-    await mgr.command.execute("Comfy.NewBlankWorkflow");
+    try {
+      await mgr.command.execute("Comfy.NewBlankWorkflow");
+    } catch (err) {
+      // The creation command itself threw. It may have got partway, and workflow_new is
+      // NOT idempotent — a blind retry can leave a second blank tab. Journal it as
+      // UNKNOWN, never as a clean failure (#402 / codex).
+      noteOpenAttempt({
+        cmd: "workflow_new",
+        rid,
+        requested: null,
+        resolved: null,
+        applied: "unknown",
+        error: coerceMessageText(err?.message ?? err),
+      });
+      throw err instanceof Error ? err : new Error(coerceMessageText(err));
+    }
     // Bind a UNIQUE, stable routing identity to the just-created tab NOW, at
     // creation, so a session pinned to this key routes subsequent graph_* edits to
     // THIS graph and never a pre-existing "Unsaved Workflow" tab (#186). Native
@@ -7586,11 +7804,24 @@ const GRAPH_TOOL_EXECUTORS = {
     // a title alone would invite the agent to edit whatever unsaved tab is active.
     const wf = activeWorkflowRef();
     if (!wf) {
-      throw new Error(
+      // #402 / codex — the blank tab WAS created; only the routing identity is missing. If
+      // this reply is lost, "no receipt" and "applied:false" would both read as "nothing
+      // happened" and invite a retry — and workflow_new is NOT idempotent, so that retry
+      // leaves a SECOND blank workflow behind. Journal it as UNKNOWN instead.
+      const error =
         "workflow_new: created a blank workflow but the frontend did not expose it as the " +
-          "active workflow — cannot establish a unique routing target. Retry, or select the new " +
-          "tab before editing.",
-      );
+        "active workflow — cannot establish a unique routing target. Do NOT retry — " +
+        "workflow_new is not idempotent, so a retry would create a SECOND blank tab. Check " +
+        "workflow_list / the canvas state first, then select the new tab before editing.";
+      noteOpenAttempt({
+        cmd: "workflow_new",
+        rid,
+        requested: null,
+        resolved: null,
+        applied: "unknown",
+        error,
+      });
+      throw new Error(error);
     }
     // Mint the per-instance tmp: routing id (and seed the transcript uuid) eagerly so
     // the key exists BEFORE the first edit and is returned for pinning.
@@ -7600,17 +7831,42 @@ const GRAPH_TOOL_EXECUTORS = {
     // against the epoch we STARTED on, but only if no reconnect intervened during
     // the async work (else its tab-restore may have overridden us — leave armed).
     if (backendReconnectEpoch === openedForEpoch) activeWorkflowResyncEpoch = openedForEpoch;
+    // #402 — workflow_new ALSO authoritatively re-points `active`, so it gets a receipt
+    // too: a lost reply here leaves the caller unable to tell whether a blank tab was
+    // created (and re-issuing would create a SECOND one, unlike the idempotent open).
+    const receipt = noteOpenAttempt({
+      cmd: "workflow_new",
+      rid,
+      requested: null,
+      resolved: { path: wf.path ?? null, filename: wf.filename ?? null, routing_key: key },
+      applied: true,
+    });
     // `key`/`routing_key` are the unique handle the agent should pass to
     // panel_set_workflow_target so its session pins to this exact graph.
-    return { created: true, active: getWorkflowTitle(), key, routing_key: key };
+    return { created: true, active: getWorkflowTitle(), key, routing_key: key, open_seq: receipt.seq };
   },
 
-  async workflow_open({ path }) {
+  async workflow_open({ path, rid }) {
     // #433 TOCTOU: snapshot the reconnect epoch BEFORE the async open (see
     // workflow_new) so a reconnect landing mid-operation is not masked by our stamp.
     const openedForEpoch = backendReconnectEpoch;
+    // #402 — journal the FAILURE side too. Every early throw below is a real "this open
+    // did NOT apply" fact, and a caller whose reply was lost mid-command needs that
+    // negative just as much as the positive: without it the only remaining evidence is
+    // the post-reconnect `active` pointer, which proves nothing (#433).
+    const failOpen = (err) => {
+      noteOpenAttempt({
+        cmd: "workflow_open",
+        rid,
+        requested: path,
+        resolved: null,
+        applied: false,
+        error: coerceMessageText(err?.message ?? err),
+      });
+      return err;
+    };
     const s = app?.extensionManager?.workflow;
-    if (!s?.openWorkflow) throw new Error("workflow service unavailable");
+    if (!s?.openWorkflow) throw failOpen(new Error("workflow service unavailable"));
     const find = () => {
       const all = [...(s.openWorkflows ?? []), ...(s.workflows ?? [])];
       // getWorkflowByPath resolves a real disk path only (returns null for a
@@ -7637,9 +7893,11 @@ const GRAPH_TOOL_EXECUTORS = {
       target = find();
     }
     if (!target) {
-      throw new Error(
-        `no workflow matching "${path}" — it isn't among the saved/open workflows even after a refresh. ` +
-          `For a file outside the workflows folder, load it with panel_load_workflow path:<file>.`,
+      throw failOpen(
+        new Error(
+          `no workflow matching "${path}" — it isn't among the saved/open workflows even after a refresh. ` +
+            `For a file outside the workflows folder, load it with panel_load_workflow path:<file>.`,
+        ),
       );
     }
     // #442 — an ALREADY-OPEN tab is repainted from its OWN in-memory buffer below,
@@ -7655,76 +7913,345 @@ const GRAPH_TOOL_EXECUTORS = {
     // reads it fresh from disk. openWorkflow does NOT mutate originalContent for an
     // already-open tab (its load() early-returns), so the baseline stays valid.
     const wasOpen = !!target.changeTracker;
-    await s.openWorkflow(target);
-    // We deliberately do NOT auto-reload the canvas from disk here: switching to an
-    // already-open tab must not silently discard the user's in-memory graph, and a
-    // re-read could race a concurrent canvas edit and clobber it. Instead the staleness
-    // is SURFACED (below) so the caller refreshes deliberately with panel_load_workflow
-    // — exactly the recovery the issue reporter uses. The load-bearing fix is turning a
-    // SILENT stale serve into a loud, actionable signal.
-    // openWorkflow sets the tab ACTIVE but does NOT repaint the canvas for an
-    // ALREADY-OPEN instance — the graph load normally rides the frontend's
-    // workflow *service* tab-switch, which the panel can't reach (it's a Vue
-    // composable, not on the store or window). So switching to an open tab left
-    // the PREVIOUS tab's graph frozen on the canvas ("all tabs show the same
-    // graph" — issue #65), and the earlier in-place-load attempts corrupted tab
-    // buffers (#63/#64). Force the repaint the way a real tab-click does: load
-    // the target's OWN live buffer (changeTracker.activeState — preserves its
-    // unsaved edits, NOT the on-disk copy) into ITS tab. The 4th arg (the
-    // workflow) associates the load with the target so it does NOT spawn a new
-    // "Unsaved Workflow" tab. Verified live in-browser (2026-07-08): switching
-    // among 12/39-node tabs repaints to the correct graph each time, no dup
-    // tabs, no cross-tab clobber. NOTE: getWorkflowByPath returns the SAME
-    // object as the open instance (verified), so find() needs no reorder — the
-    // #63 find() patch was a no-op that only regressed things.
+    // #442 / codex — SNAPSHOT the tab's unsaved-edit state BEFORE any await. It cannot be
+    // recovered later: `clearSpuriousOpenModified` below force-clears `isModified`, so by
+    // the time the reload gate samples the flag, a tab that arrived here WITH unsaved
+    // edits (or was edited during `openWorkflow`) already reads clean. That erased signal
+    // is what would authorize the destructive re-read to discard the user's work.
+    const wasDirty = !!target.isModified;
+    // Bound to a local whose name does NOT end in "s": the #268 frontend-contract scanner
+    // captures members off the workflow-service alias `s` with an unanchored `s\.` pattern,
+    // so `canvas.<member>` would be misread as a new workflow-SERVICE dependency. This is a
+    // LiteGraph canvas flag, not a workflow-service member.
+    const canvasView = app?.canvas;
+    // FREEZE canvas interaction across the WHOLE mutating sequence — the tab switch, the
+    // repaint, the re-baseline, the bounded disk read and the reload — so no edit can land
+    // in a window whose dirty signal we are about to overwrite. Scoped to `wasOpen` (the
+    // only case that can reload) so a plain first-time open never freezes, and restored in
+    // a finally on every path.
+    const priorInteraction =
+      wasOpen && typeof canvasView?.allow_interaction === "boolean"
+        ? canvasView.allow_interaction
+        : null;
+    let onDiskContent = null;
+    let dirtyNow = false;
+    let staleInfo = { stale: false, reload: false };
+    let reloaded = false;
+    let reloadError = null;
+    let openFailed = null;
+    if (priorInteraction !== null) canvasView.allow_interaction = false;
+    // Hold the switch+reload critical section across the WHOLE mutating sequence. The canvas
+    // freeze keeps the USER out; this keeps the BRIDGE out, so a concurrent graph_* command
+    // can neither be overwritten by the reload nor be silently re-baselined as clean.
+    const reloadGuardToken = acquireWorkflowReloadGuard(
+      workflowTabId(target) || target.path || "the active workflow",
+    );
     try {
-      const st = target.changeTracker?.activeState;
-      if (st && typeof app.loadGraphData === "function") {
-        await app.loadGraphData(JSON.parse(JSON.stringify(st)), true, true, target);
+      // Hold the fence across the switch await itself: a slow switch must not let the
+      // guard age out mid-flight (see begin/endWorkflowReloadStep).
+      beginWorkflowReloadStep(reloadGuardToken);
+      try {
+        await s.openWorkflow(target);
+      } catch (err) {
+        // The native switch itself failed — nothing was applied. Recorded, then rethrown
+        // through failOpen below (outside the freeze) so the negative is journaled.
+        openFailed = err instanceof Error ? err : new Error(coerceMessageText(err));
+      } finally {
+        endWorkflowReloadStep(reloadGuardToken);
+      }
+      if (!openFailed) {
+      // We deliberately do NOT auto-reload the canvas from disk here: switching to an
+      // already-open tab must not silently discard the user's in-memory graph, and a
+      // re-read could race a concurrent canvas edit and clobber it. Instead the staleness
+      // is SURFACED (below) so the caller refreshes deliberately with panel_load_workflow
+      // — exactly the recovery the issue reporter uses. The load-bearing fix is turning a
+      // SILENT stale serve into a loud, actionable signal.
+      // openWorkflow sets the tab ACTIVE but does NOT repaint the canvas for an
+      // ALREADY-OPEN instance — the graph load normally rides the frontend's
+      // workflow *service* tab-switch, which the panel can't reach (it's a Vue
+      // composable, not on the store or window). So switching to an open tab left
+      // the PREVIOUS tab's graph frozen on the canvas ("all tabs show the same
+      // graph" — issue #65), and the earlier in-place-load attempts corrupted tab
+      // buffers (#63/#64). Force the repaint the way a real tab-click does: load
+      // the target's OWN live buffer (changeTracker.activeState — preserves its
+      // unsaved edits, NOT the on-disk copy) into ITS tab. The 4th arg (the
+      // workflow) associates the load with the target so it does NOT spawn a new
+      // "Unsaved Workflow" tab. Verified live in-browser (2026-07-08): switching
+      // among 12/39-node tabs repaints to the correct graph each time, no dup
+      // tabs, no cross-tab clobber. NOTE: getWorkflowByPath returns the SAME
+      // object as the open instance (verified), so find() needs no reorder — the
+      // #63 find() patch was a no-op that only regressed things.
+      //
+      // #442 / codex — FREEZE canvas interaction from HERE, before the repaint, and hold it
+      // through the staleness decision. `clearSpuriousOpenModified` below awaits a frame and
+      // then RE-BASELINES the change tracker (capture → reset → force isModified=false): an
+      // edit the user makes during that frame is absorbed as the new CLEAN baseline, so the
+      // later dirty gate reads false and would authorize the disk reload to overwrite that
+      // very edit. Sampling the flag later cannot fix that — the signal is already gone — so
+      // the window has to be closed instead. Scoped to `wasOpen` (the only case that can
+      // reload) so a plain first-time open never freezes, and always restored in a finally.
+      // Bound to a local whose name does NOT end in "s": the #268 frontend-contract scanner
+      // captures members off the workflow-service alias `s` with an unanchored `s\.` pattern,
+      // so `canvas.<member>` would be misread as a new workflow-SERVICE dependency. This is a
+      // LiteGraph canvas flag, not a workflow-service member.
+        beginWorkflowReloadStep(reloadGuardToken);
+        try {
+          const st = target.changeTracker?.activeState;
+          if (st && typeof app.loadGraphData === "function") {
+            await app.loadGraphData(JSON.parse(JSON.stringify(st)), true, true, target);
+          }
+        } catch (err) {
+          console.warn("[comfyui-mcp-panel] workflow_open repaint failed:", err?.message ?? err);
+        } finally {
+          endWorkflowReloadStep(reloadGuardToken);
+        }
+        // Opening alone must not dirty the tab (a spurious post-load change-tracker
+        // diff otherwise flips it to modified:true and blocks an unforced close).
+        //
+        // …but ONLY when the tab arrived here CLEAN. This helper captures the current canvas
+        // as the new baseline and forces isModified=false, so running it on a tab that
+        // already HAD unsaved edits does not clear a spurious flag — it erases a REAL one,
+        // hiding the user's work from every later check (codex). Leaving a genuinely dirty
+        // tab marked dirty is both truthful and what keeps the reload gate below closed.
+        // …and ONLY while the canvas freeze is holding (priorInteraction !== null). The
+        // helper's awaited frame is otherwise unprotected: an edit landing in it would be
+        // captured as the new CLEAN baseline, silently erasing unsaved-work protection —
+        // and a later stale open could then auto-reload the disk file over that work.
+        // That excludes BOTH the no-freeze frontend (priorInteraction === null, the same
+        // condition that skips the reload below) AND the first-time open, which is never
+        // frozen by design (the freeze stays scoped to wasOpen — see above). A spurious
+        // "modified" flag on a fresh open is cosmetic (it may block an unforced close
+        // until a save) and keeps the dirty signal alive; a silent clean-slate over a
+        // real edit is neither.
+        // Ownership re-check before EVERY re-baseline / destructive step: if this open
+        // outlived its own section (the 30s safety expiry, or a newer open taking over),
+        // other commands have been let through and we must not keep mutating as though we
+        // still held exclusivity. Leaving the tab spuriously "modified" is cosmetic; racing
+        // a concurrent edit is not.
+        if (
+          !wasDirty &&
+          priorInteraction !== null &&
+          ownsWorkflowReloadGuard(reloadGuardToken)
+        ) {
+          // The helper awaits a frame before re-baselining — hold the fence across that
+          // frame too, so the guard cannot age out inside it and let a command through.
+          beginWorkflowReloadStep(reloadGuardToken);
+          try {
+            await clearSpuriousOpenModified(target, {
+              stillOwns: () => ownsWorkflowReloadGuard(reloadGuardToken),
+            });
+          } finally {
+            endWorkflowReloadStep(reloadGuardToken);
+          }
+        }
+        // #433: an explicit open authoritatively re-points `active` — record it against
+        // the epoch we STARTED on, but only if no reconnect intervened during the async
+        // open (else its tab-restore may have overridden us — leave the window armed).
+        if (backendReconnectEpoch === openedForEpoch) activeWorkflowResyncEpoch = openedForEpoch;
+      // #442 — read the on-disk bytes AS LATE AS POSSIBLE (after openWorkflow + repaint),
+      // so an external write during those awaits is still detected. wasOpen was captured
+      // before openWorkflow; the baseline (originalContent) is unchanged by an already-open
+      // open.
+      //
+      // #402 — BOUND this read. The open has ALREADY been applied by the time we get here,
+      // so the only thing still outstanding is a staleness HINT — yet the read is an HTTP
+      // round-trip to ComfyUI, and in the exact #402 window ComfyUI's HTTP layer is what is
+      // flaky (the same report's panel_save_workflow returned "Failed to fetch"). Unbounded,
+      // a server that accepts the connection and never answers parks a known-good outcome
+      // for the whole browser timeout — which is precisely how a routine reconnect blip gets
+      // long enough to turn into "disconnected mid-command … OUTCOME UNKNOWN". withDeadline
+      // never rejects: a timeout degrades to the ALREADY-SUPPORTED honest `stale:"unknown"`,
+      // exactly like an unreadable disk, and never to a false "fresh".
+        // codex P2 — the deadline stops US waiting; it cannot stop the REQUEST. So also
+        // (a) hand the read an AbortSignal and fire it when the budget expires, and
+        // (b) SINGLE-FLIGHT per workflow path, because one of the two read paths
+        // (api.getUserData) takes no signal at all. Together these cap the outstanding
+        // reads at one per workflow instead of leaking one per open against a server that
+        // accepts requests and never answers.
+        const readAbort = typeof AbortController === "function" ? new AbortController() : null;
+        onDiskContent = wasOpen
+          ? await withDeadline(
+              staleReadFlight.run(target.path, () =>
+                workflowDiskContent(target.path, { signal: readAbort?.signal }),
+              ),
+              OPEN_DISK_READ_BUDGET_MS,
+              null,
+              { onTimeout: () => readAbort?.abort() },
+            )
+          : null;
+        // #442 defect 2 — RE-READ the file when it provably changed and nothing is at stake.
+        // Re-check `isModified` HERE, immediately before deciding, rather than trusting the
+        // value from before the disk read: reloading over unsaved edits is data-loss class —
+        // strictly worse than serving a stale graph. There is NO await between this re-check
+        // and the reload decision below. (Interaction is frozen across this whole block, so
+        // this is a belt-and-braces second line of defence, not the only one.)
+        dirtyNow = !!target.isModified;
+        staleInfo = decideOpenStaleness({
+          wasOpen,
+          // EITHER signal counts as unsaved work: the flag as it reads NOW, and the snapshot
+          // taken before any await (which clearSpuriousOpenModified can no longer erase).
+          isModified: dirtyNow || wasDirty,
+          onDiskContent,
+          baselineContent:
+            typeof target.originalContent === "string" ? target.originalContent : null,
+        });
+        // `reload` is true only for "the file changed AND this tab has nothing unsaved", so
+        // the re-read is lossless. A stale tab WITH unsaved edits is a genuine conflict: we
+        // refuse and surface both sides rather than picking for the user.
+        //
+        // The earlier no-await-before-return invariant is intact: this block runs ONLY when
+        // staleInfo.stale === true, and it never downgrades that to "fresh" — so the
+        // false-fresh window codex closed (read stale → file changes → report fresh) still
+        // cannot open. The provably-fresh and "unknown" paths reach the return with no await.
+        if (staleInfo.reload && !dirtyNow && !wasDirty && priorInteraction === null) {
+          // NO reliable freeze on this frontend ⇒ do NOT perform the automatic destructive
+          // reload at all (codex). Serving a stale graph with a loud flag is recoverable;
+          // silently eating an edit the user made during an unrequested load is not.
+          reloadError =
+            "this frontend does not expose the canvas interaction flag, so an automatic reload " +
+            "could not be protected against a concurrent edit and was skipped";
+        } else if (
+          staleInfo.reload &&
+          !dirtyNow &&
+          !wasDirty &&
+          !ownsWorkflowReloadGuard(reloadGuardToken)
+        ) {
+          // Lost the section (expired, or superseded by a newer open) — concurrent commands
+          // may already have run against this canvas, so the "nothing unsaved" evidence is
+          // no longer trustworthy. Refuse the destructive reload and say so.
+          reloadError =
+            "the panel lost its exclusive switch/reload window (it took too long, or another " +
+            "open superseded it), so the automatic reload was skipped rather than risk " +
+            "overwriting work done in the meantime";
+        } else if (staleInfo.reload && !dirtyNow && !wasDirty) {
+          const diskGraph = JSON.parse(onDiskContent);
+          // 4th arg associates the load with THIS tab (same as the repaint above), so the
+          // on-disk graph replaces the tab's buffer in place instead of spawning a new
+          // "Unsaved Workflow" tab.
+          //
+          // #570 P0b — `__cmcpKeepInstance` is MANDATORY here, exactly as on graph_load.
+          // This is an in-place reload of the SAME tab from a file that was written
+          // OUT OF BAND, so its embedded workflow uuid may be absent or belong to
+          // something else. Without the flag the create-boundary fork would see
+          // cached-uuid ≠ incoming-uuid, treat the refresh as an in-place REPLACEMENT and
+          // mint a NEW identity for this tab mid-open — after which the very next stamped
+          // command would be refused as a "workflow instance mismatch" against the session
+          // that asked for the open. The flag keeps the LIVE OBJECT's identity (the
+          // non-forgeable source) and stamps it over whatever the file carried.
+          //
+          // HOLD THE SECTION ACROSS THE LOAD ITSELF (codex DATA-LOSS): this await is
+          // unbounded — a huge graph on a busy machine can take past the 30s defensive
+          // ceiling. Expiring here is exactly the reported window: the fence drops, a
+          // graph command runs and is ACKNOWLEDGED, and this late-completing load then
+          // overwrites that edit. With the step held the fence cannot drop mid-load, so
+          // no edit can be acknowledged after the reload started — and the ownership
+          // re-check below still guards the re-baseline against every other loss path.
+          beginWorkflowReloadStep(reloadGuardToken);
+          try {
+            await app.loadGraphData(diskGraph, true, true, target, { __cmcpKeepInstance: true });
+          } finally {
+            endWorkflowReloadStep(reloadGuardToken);
+          }
+          // The reload HAPPENED — record that before anything else can fail. Understating a
+          // completed destructive act would be its own lie.
+          reloaded = true;
+          if (ownsWorkflowReloadGuard(reloadGuardToken)) {
+            // The tab now holds exactly the on-disk bytes — re-baseline so this same change
+            // isn't re-reported as stale forever. Best-effort: `originalContent` is a plain
+            // field on current builds but may be getter-only elsewhere.
+            try {
+              target.originalContent = onDiskContent;
+            } catch {
+              /* getter-only — the stale flag simply re-reports until the next save */
+            }
+            // A programmatic load dirties the change tracker; clear that so the re-read does
+            // not leave the tab looking edited (which would block an unforced close). Still
+            // inside the freeze, and ownership-aware across its own frame.
+            beginWorkflowReloadStep(reloadGuardToken);
+            try {
+              await clearSpuriousOpenModified(target, {
+                stillOwns: () => ownsWorkflowReloadGuard(reloadGuardToken),
+              });
+            } finally {
+              endWorkflowReloadStep(reloadGuardToken);
+            }
+          } else {
+            // Lost exclusivity while the load was in flight. The canvas IS the on-disk
+            // version, but we must not re-baseline over whatever ran in the meantime.
+            reloadError =
+              "the canvas was reloaded from the on-disk file, but the panel lost its exclusive " +
+              "window before it could re-baseline the tab, so the tab may still show as modified";
+          }
+        }
       }
     } catch (err) {
-      console.warn("[comfyui-mcp-panel] workflow_open repaint failed:", err?.message ?? err);
+      // NEVER claim a reload we did not complete — report the failure and leave the caller
+      // with the honest `stale:true, reloaded:false`. (The repaint and the bounded disk
+      // read swallow their own errors, so only the reload can land here.)
+      reloadError = coerceMessageText(err?.message ?? err);
+      console.warn("[comfyui-mcp-panel] workflow_open disk re-read failed:", reloadError);
+    } finally {
+      // Release BOTH on EVERY path — a throw anywhere above must never leave the user with
+      // a frozen graph or the tab refusing every command.
+      releaseWorkflowReloadGuard(reloadGuardToken);
+      if (priorInteraction !== null) canvasView.allow_interaction = priorInteraction;
     }
-    // Opening alone must not dirty the tab (a spurious post-load change-tracker
-    // diff otherwise flips it to modified:true and blocks an unforced close).
-    await clearSpuriousOpenModified(target);
-    // #433: an explicit open authoritatively re-points `active` — record it against
-    // the epoch we STARTED on, but only if no reconnect intervened during the async
-    // open (else its tab-restore may have overridden us — leave the window armed).
-    if (backendReconnectEpoch === openedForEpoch) activeWorkflowResyncEpoch = openedForEpoch;
-    // #442 — read the on-disk bytes AS LATE AS POSSIBLE (after openWorkflow + repaint),
-    // so an external write during those awaits is still detected. There is NO await
-    // between this read and the return below, so nothing can interleave and turn a
-    // freshly-read stale result into a false-fresh (codex). wasOpen was captured before
-    // openWorkflow; the baseline (originalContent) is unchanged by an already-open open.
-    const onDiskContent = wasOpen ? await workflowDiskContent(target.path) : null;
-    const staleInfo = decideOpenStaleness({
-      wasOpen,
-      isModified: !!target.isModified,
-      onDiskContent,
-      baselineContent: typeof target.originalContent === "string" ? target.originalContent : null,
+    if (openFailed) throw failOpen(openFailed);
+    const receipt = noteOpenAttempt({
+      cmd: "workflow_open",
+      rid,
+      requested: path,
+      resolved: {
+        path: target.path,
+        filename: target.filename,
+        routing_key: workflowTabId(target),
+      },
+      applied: true,
     });
     return {
       opened: { path: target.path, filename: target.filename },
+      routing_key: workflowTabId(target),
       modified: !!target.isModified,
+      // #402 — the receipt id for THIS open. Journaled in the panel, so if this reply
+      // never reaches the caller the outcome is still recoverable from workflow_list's
+      // `last_open` instead of being guessed from the `active` pointer.
+      open_seq: receipt.seq,
       // #442 — surface out-of-band staleness so a caller switching to an already-open
       // tab is never fooled by a bland success while the canvas shows a pre-edit graph.
-      // `stale:true` = the on-disk file differs from what this tab loaded; `stale:"unknown"`
-      // = we could NOT verify (disk unreadable / no baseline) and must NOT claim fresh
-      // (codex P2). The canvas always shows the LOADED version (we never auto-reload —
-      // see above); `stale_hint` says how to refresh, and whether unsaved edits are at stake.
+      // `stale:true` = the on-disk file differed from what this tab had loaded;
+      // `stale:"unknown"` = we could NOT verify (disk unreadable / read past its deadline
+      // / no baseline) and must NOT claim fresh (codex P2). `reloaded` says whether this
+      // call actually re-read the file: true = the canvas now shows the on-disk version;
+      // false = it still shows the loaded version and the caller must act.
       ...(staleInfo.stale === true
         ? {
             stale: true,
-            stale_hint: staleInfo.reload
-              ? "The file changed on disk since this tab loaded it; the canvas still shows the loaded version. Call panel_load_workflow to load the on-disk version."
-              : "The file changed on disk since this tab loaded it, AND this tab has unsaved edits. Save first (panel_save_workflow) to keep them, or call panel_load_workflow to discard them and load the on-disk version.",
+            reloaded,
+            ...(reloaded
+              ? {
+                  stale_hint:
+                    "The file had changed on disk since this tab loaded it, and this tab had no unsaved edits, so the canvas was RELOADED from the on-disk version. Re-read the graph (panel_graph_outline / panel_query_graph) — node ids and geometry may differ from before." +
+                    (reloadError ? ` NOTE: ${reloadError}.` : ""),
+                }
+              : dirtyNow || wasDirty
+                ? {
+                    conflict: true,
+                    stale_hint:
+                      "CONFLICT: the file changed on disk since this tab loaded it AND this tab has unsaved edits, so nothing was reloaded (discarding the user's in-canvas work silently would be data loss). The canvas still shows the loaded version. Ask the user: save first (panel_save_workflow) to keep the in-canvas version, or call panel_load_workflow to discard it and take the on-disk version.",
+                  }
+                : {
+                    stale_hint:
+                      "The file changed on disk since this tab loaded it and the automatic re-read did not complete" +
+                      (reloadError ? ` (${reloadError})` : "") +
+                      "; the canvas still shows the loaded version. Call panel_load_workflow to load the on-disk version.",
+                  }),
           }
         : staleInfo.stale === "unknown"
           ? {
               stale: "unknown",
+              reloaded: false,
               stale_hint:
-                "Could not verify whether the on-disk file still matches this tab (disk read unavailable). Treat the canvas as possibly stale; call panel_load_workflow to be sure you have the on-disk version.",
+                "Could not verify whether the on-disk file still matches this tab (disk read unavailable or slower than its deadline). Treat the canvas as possibly stale; call panel_load_workflow to be sure you have the on-disk version.",
             }
           : {}),
     };
@@ -9609,6 +10136,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
   // so the panel won't lie "connected" when there's no agent behind the socket.
   let handshakeTimer = null;
   let handshakeDone = false;
+  // The exact socket INSTANCE that completed a handshake (codex). A boolean cannot express
+  // this: replays are also triggered off the command path, where the current socket may be
+  // open but not yet handshaken — or may not be an orchestrator at all. Identity closes
+  // that race, because a replacement socket is a different object.
+  let handshakenSock = null;
   // Handshake (models-frame) window AFTER the WS opens. Backend-aware: Codex's
   // app-server can still be booting its agent after the bridge accepts the socket,
   // so it gets a wider window before we treat the open socket as wedged (FIX 2).
@@ -9626,6 +10158,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
   }
   function markConnected() {
     handshakeDone = true;
+    handshakenSock = sock;
     clearHandshake();
     // Remember the user wants the agent connected, so we auto-reconnect after a
     // ComfyUI reboot / panel reopen (until they explicitly Disconnect). Mirror it
@@ -9640,7 +10173,121 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     attempt = 0;
     gaveUp = false;
     loggedWaiting = false;
+    // #508/#402 — replay the outcomes the previous socket could not deliver, so a command
+    // that genuinely ran is never silently swallowed by the reconnect. Deliberately HERE,
+    // on the real handshake, and not at bare socket-open (codex): an open socket only proves
+    // something is listening on the port, while a `models` frame proves a real orchestrator
+    // is behind it. The hello already went out at open, so the tab is registered by now.
+    replayLostReplies(sock);
     emitStatus("connected");
+  }
+
+  // #508 — BOUNDED self-heal for a command whose reply could not be written back.
+  // Timestamps of re-registrations we have already performed; pruned to the rolling
+  // window so a persistently sick bridge can never become a hello storm.
+  let reRegisterAttempts = [];
+  function handleUndeliveredReply(entry) {
+    if (!entry) return;
+    // Tell the user what actually happened, in cause-specific terms.
+    onLog(describeUndeliveredReply(entry));
+    const now = Date.now();
+    const socketLive = !!sock && sock.readyState === WebSocket.OPEN;
+    if (!socketLive) {
+      // No live socket to re-register on. The normal reconnect path owns recovery, and
+      // the journaled outcome is replayed on the next hello — nothing to escalate here.
+      return;
+    }
+    reRegisterAttempts = pruneAttempts(reRegisterAttempts, now);
+    if (
+      shouldReRegister({
+        socketOpen: true,
+        lostCount: lostReplies.size(),
+        attempts: reRegisterAttempts,
+        now,
+      })
+    ) {
+      reRegisterAttempts.push(now);
+      // Re-advertise THIS tab under its CURRENT active workflow's own id — byte-for-byte
+      // the same re-registration the panel already performs on a workflow switch and
+      // after free_vram (#310). sendHello() derives the id from the live active workflow,
+      // so it can never adopt, guess, or steal a DIFFERENT workflow's tab id: retargeting
+      // to the wrong workflow is corruption-class and strictly worse than staying wedged.
+      sendHello();
+      onLog("Re-registered this ComfyUI tab with the agent so the next command reaches a live handler.");
+    } else {
+      // Budget spent with a live socket — stop retrying and hand the user a real action.
+      onLog(reRegisterExhaustedHint());
+    }
+    // codex — DELIVER IT NOW, on the live socket. The replacement socket runs its replay
+    // once, at open; a long command still running on the retired socket finishes AFTER
+    // that, so the journal was empty when the replay fired and this entry would otherwise
+    // sit there until some future reconnect that may never come — leaving the original
+    // caller with the unknown outcome this whole change exists to remove. Unconditional
+    // (not gated on the re-registration budget): telling the truth is not a retry.
+    replayLostReplies(sock);
+  }
+
+  /** #508/#402 — re-send outcomes we could not deliver, onto a freshly-opened socket.
+   *  `rid`s are random UUIDs (server-minted per command), so an orchestrator that already
+   *  gave up on the command drops the frame harmlessly, while one that still has it
+   *  pending resolves it with the command's TRUE outcome instead of an OUTCOME-UNKNOWN
+   *  guess. Only drained once every entry went out, so a partial replay is retried. */
+  function replayLostReplies(target) {
+    // ONLY onto a socket that has proven itself with a real handshake (codex). An OPEN
+    // socket merely proves something is bound to the port — it can be a different
+    // orchestrator session at the same URL, or a non-orchestrator listener, and it can be
+    // open before its `models` frame arrives. This is checked HERE rather than only at the
+    // call sites so no future caller can bypass it; anything still journaled simply waits
+    // for markConnected().
+    if (!target || target !== handshakenSock || target.readyState !== WebSocket.OPEN) return;
+    const lost = lostReplies.list();
+    if (!lost.length) return;
+    // The bridge THIS socket belongs to (stamped at creation), not the mutable current
+    // `url` — after setUrl the two can differ while the old socket is still closing.
+    const targetUrl = target?.__cmcpBridgeUrl ?? url;
+    let sent = 0;
+    let dropped = 0;
+    const keep = [];
+    for (const entry of lost) {
+      // NEVER replay across a bridge change (codex). An entry belongs to the orchestrator
+      // it was produced for; after a backend switch or a Bridge-URL edit the current socket
+      // is a DIFFERENT process, and volunteering another session's result to it is a leak,
+      // not a recovery. Such an entry is also meaningless there — its rid is unknown — so
+      // it is dropped rather than carried forever. (Sensitive results are additionally
+      // redacted at journal time and never travel at all.)
+      // Replayable = SAME bridge AND recent enough (codex). A bridge is identified by its
+      // URL, and URL equality is ENDPOINT identity, not SESSION identity — a newly started
+      // orchestrator on the same address looks exactly like the old one reconnecting, which
+      // is the very case replay exists to serve. Proving session continuity needs a
+      // server-issued connection epoch in the handshake (an orchestrator-side follow-up), so
+      // until then the exposure is bounded: sensitive results never enter the journal at
+      // all, this runs only AFTER a real handshake, and stale entries age out here.
+      if (!isReplayable(entry, { now: Date.now(), targetUrl })) {
+        dropped++;
+        continue;
+      }
+      if (!target || target.readyState !== WebSocket.OPEN) {
+        keep.push(entry);
+        continue;
+      }
+      try {
+        target.send(JSON.stringify(entry.reply));
+        sent++;
+      } catch {
+        keep.push(entry);
+      }
+    }
+    if (sent || dropped) lostReplies.replace(keep);
+    if (sent) {
+      onLog(
+        `Re-sent ${sent} command result${sent === 1 ? "" : "s"} the panel completed but could not deliver while the bridge was down.`,
+      );
+    }
+    if (dropped) {
+      onLog(
+        `Discarded ${dropped} undelivered command result${dropped === 1 ? "" : "s"} that belong to a previous bridge or are too old to replay — they are not offered to a different agent.`,
+      );
+    }
   }
 
   function connect() {
@@ -9656,9 +10303,14 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // on each background retry — that latched "disconnected" is what stops the
     // connecting↔disconnected flicker.
     if (!gaveUp) emitStatus("connecting");
+    // codex — capture the URL THIS socket dials. `url` is mutable (setUrl swaps it before
+    // the old socket closes), so a command still finishing on a retired socket would
+    // otherwise journal its result under the NEW bridge's URL and sail past the
+    // cross-bridge check that exists to stop exactly that.
+    const socketUrl = url;
     let thisSock;
     try {
-      thisSock = new WebSocket(url);
+      thisSock = new WebSocket(socketUrl);
     } catch (err) {
       // Constructor threw before a socket exists → no open/close will fire, so we
       // drive the retry directly. Keep the status steady (scheduleReconnect decides
@@ -9667,6 +10319,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       return;
     }
     sock = thisSock;
+    // Stamp the socket with the bridge it belongs to, so a replay onto it can be checked
+    // against the entry's origin rather than against the mutable current `url`.
+    try {
+      thisSock.__cmcpBridgeUrl = socketUrl;
+    } catch {
+      /* exotic WebSocket impl — replayLostReplies falls back to the current url */
+    }
 
     // INSTANCE GUARD (panel #379 race): every listener below is bound to THIS socket
     // instance and no-ops unless it is still the active `sock`. A soft-reload / restart
@@ -9726,22 +10385,94 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       }, handshakeMs());
     });
 
+    /** #508 — write `reply` back on the socket the command ARRIVED on, and if that is
+     *  impossible, journal the outcome (for replay) and run the bounded self-heal.
+     *  Returns true only when the frame was actually handed to an open socket. */
+    const deliverReply = (reply, cmd, superseded) => {
+      const socketOpen = thisSock.readyState === WebSocket.OPEN;
+      let sendThrew = false;
+      if (socketOpen) {
+        try {
+          thisSock.send(JSON.stringify(reply));
+        } catch {
+          sendThrew = true;
+        }
+      }
+      if (socketOpen && !sendThrew) return true;
+      // The command was answered and its answer has nowhere to go. Name the ACTUAL cause
+      // instead of leaving the caller with the orchestrator's guess that the tab "may be
+      // backgrounded or frozen" — it was neither; it answered and we could not send.
+      handleUndeliveredReply(
+        lostReplies.record({
+          reply,
+          cmd,
+          reason: classifyUndeliveredReply({ socketOpen, superseded, sendThrew }),
+          at: Date.now(),
+          // Stamp the bridge this outcome belongs to so a replay can never cross it. THIS
+          // socket's url, never the mutable current one (codex).
+          url: socketUrl,
+        }),
+      );
+      return false;
+    };
+
     thisSock.addEventListener("message", async (ev) => {
-      if (!isActive()) return; // superseded socket — ignore its late frames
       let msg;
       try {
         msg = JSON.parse(typeof ev.data === "string" ? ev.data : "");
       } catch {
         return;
       }
-      if (msg && typeof msg.rid === "string" && typeof msg.cmd === "string") {
+      const isCommandFrame = msg && typeof msg.rid === "string" && typeof msg.cmd === "string";
+      if (!isActive()) {
+        // Superseded socket — a soft-reload/reconnect replaced it. Its late frames must NOT
+        // be processed: this belongs to the DEAD session, and running it would drive the
+        // fresh session's canvas and paint into its chat.
+        //
+        // #508 — but SILENCE is not an option either. Dropping a command frame outright is
+        // exactly the "registered tab that never acknowledges anything" wedge: the sender
+        // waits out its whole timeout and reports an unknown outcome for a command that
+        // provably never ran. Refuse it EXPLICITLY instead — nothing was executed, so this
+        // is a clean, safe-to-retry negative — and deliver/journal that refusal like any
+        // other reply.
+        if (isCommandFrame) {
+          deliverReply(
+            {
+              rid: msg.rid,
+              ok: false,
+              error:
+                `panel tab superseded before "${msg.cmd}" ran — this browser tab reconnected ` +
+                `(reload / soft reload / restart) and this command arrived on the retired ` +
+                `connection. NOTHING was applied; it is safe to re-issue on the current connection.`,
+            },
+            msg.cmd,
+            true,
+          );
+        }
+        return;
+      }
+      if (isCommandFrame) {
         // Agent command — execute against the graph, reply with the rid.
         // Executors may be async (run, save) — await uniformly.
         // ANY command frame is real turn activity (incl. the SILENT_CMDS that
         // never reach onCommand: set_todo, show_media, ui_render/update,
         // request_secret, the drive cmds) — mark it so the silence backstop can't
         // reap a still-working turn between two silent commands.
-        onCommandReceived?.();
+        // #508 — ISOLATE the host callback. This is the turn-activity marker, and it used
+        // to run OUTSIDE the try below inside an ASYNC listener: a throw here became an
+        // unobserved rejection, so the command got NO reply — silently, deterministically,
+        // for every command — while chat kept working (chat frames never reach this
+        // callback). That is exactly the shape #508 reports, `set_todo` included: set_todo
+        // has no executor that could hang, so only a pre-reply throw explains it timing
+        // out. UI code must never be able to suppress a bridge reply.
+        try {
+          onCommandReceived?.();
+        } catch (err) {
+          console.warn(
+            "[comfyui-mcp-panel] onCommandReceived threw (reply unaffected):",
+            err?.message ?? err,
+          );
+        }
         let reply;
         try {
           let result;
@@ -9809,6 +10540,19 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           } else {
             const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];
             if (!executor) throw new Error(`Unknown command "${msg.cmd}"`);
+            // #442 / codex — the panel is mid switch-and-reload of a workflow. Running now
+            // would either be overwritten by the incoming graph, or land during the change
+            // tracker's re-baseline and be recorded as CLEAN — after which a later
+            // out-of-band disk change would discard it with no conflict reported. REFUSE
+            // (nothing applied, safe to retry) rather than queue: refusing cannot reorder
+            // or double-apply, and the section lasts a fraction of a second.
+            const reloadGuard = activeWorkflowReloadGuard();
+            if (reloadGuard) {
+              throw new Error(
+                `the panel is switching/refreshing "${reloadGuard.key}" right now, so "${msg.cmd}" ` +
+                  `was NOT applied — nothing changed. Retry in a moment.`,
+              );
+            }
             // WORKFLOW-INSTANCE FENCE (#570): the orchestrator stamps each command with the
             // trusted per-instance workflow_uuid it was ISSUED FOR. A command that runs against
             // the ACTIVE workflow but arrives AFTER the user switched or replaced it (a frame the
@@ -9954,14 +10698,21 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // graph run/save await). If a soft-reload/restart swapped this socket out while
         // we were suspended, this reply belongs to the DEAD session A — it must NOT be
         // injected into the fresh session B (whose sock the global now points at), and
-        // its activity card must not paint. Drop the whole continuation, and always send
-        // the reply on THIS socket (never the mutable global), only while it's open.
-        if (!isActive()) return;
-        try {
-          if (thisSock.readyState === WebSocket.OPEN) thisSock.send(JSON.stringify(reply));
-        } catch {
-          // Socket died between receive and reply — agent side times out.
+        // its activity card must not paint.
+        //
+        // #508 — but the REPLY itself is NOT part of that continuation. It goes to
+        // `thisSock`, the socket the command ARRIVED on: it is socket-scoped and
+        // rid-scoped, so it cannot reach session B, while withholding it leaves the
+        // sender with no outcome at all — the "registered tab that never acknowledges
+        // anything" wedge. So: always attempt the reply; gate only the UI continuation.
+        const superseded = !isActive();
+        if (deliverReply(reply, msg.cmd, superseded)) {
+          // #402 — the open receipt records that its answer was handed to a live socket.
+          // ADVISORY only: a socket can still die before the bytes land, so this never
+          // becomes a claim about what the caller received — only `applied` is that.
+          markOpenReceiptReplySent(openReceipts, msg.rid);
         }
+        if (superseded) return;
         // ask_user / request_secret paint their OWN cards and their replies carry
         // user input (a choice, or a SECRET) — never echo them as an activity card
         // (and never record them). The CivitAI/training DRIVE cmds animate the
@@ -10182,6 +10933,16 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // the orchestrator can resume an UNSAVED workflow's conversation without
             // cross-resuming a DIFFERENT same-title unsaved workflow.
             workflowUuid: workflowStableUuid(),
+            // #508 — command outcomes this tab produced but could NOT send back. Advertised
+            // so the other end can say "the tab answered and the reply was lost" instead of
+            // asserting the unestablished "the tab may be backgrounded or frozen".
+            // Same cross-bridge/age rule the replay uses (codex): these summaries ride the
+            // hello, so an unfiltered list would tell a bridge that never owned these
+            // commands their ids, names and outcomes even though the replies are withheld.
+            lostReplies: lostReplies.summaries({
+              now: Date.now(),
+              targetUrl: sock?.__cmcpBridgeUrl ?? url,
+            }),
           }),
         ),
       );
@@ -10415,6 +11176,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         sock?.close();
       } catch {}
       sock = null;
+      handshakenSock = null;
       connect();
     },
     currentUrl() {
@@ -10438,6 +11200,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         sock?.close();
       } catch {}
       sock = null;
+      handshakenSock = null;
     },
     destroy() {
       closed = true;
@@ -10450,6 +11213,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         sock?.close();
       } catch {}
       sock = null;
+      handshakenSock = null;
     },
   };
 }
