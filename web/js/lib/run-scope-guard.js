@@ -13,55 +13,66 @@
 //     { queueNodeIds } object on others (options builds carry an Array.isArray
 //     compat shim for the legacy array). A build that accepts only ONE shape
 //     silently IGNORES the other — the scope never reaches the request, the FULL
-//     graph queues, and panel_run still reports ran_to_node (#556: an unrelated
-//     SaveImage branch rendered and wrote a file nobody asked for). A minified
+//     graph queues, and panel_run still reports ran_to_node (#556). A minified
 //     queuePrompt signature can't be sniffed reliably, so the guarantee is
 //     enforced at the one place every build must pass through: the POST /prompt
 //     request body.
 //
-// Three dispatch realities shape the design (codex gate, rounds 1–2):
+// RUN IDENTITY (codex gate r3). Content alone cannot always tell our dispatch
+// from a stranger's: an identical-node-set foreign post is indistinguishable
+// from ours, and a user's full run of the same graph looks exactly like our
+// scope-dropped dispatch. So this run MARKS its own work end to end:
 //
-//  - app.queuePrompt is NOT synchronous with the POST. When its processor is
-//    already busy it pushes the item and RETURNS EARLY — the prompt is
-//    serialized and posted LATER by the in-flight processor. A guard restored
-//    when queuePrompt returns never sees that deferred dispatch. So the scoped
-//    guard stays installed until our dispatch is actually OBSERVED (a POST
-//    carrying exactly our targets, attributed to our prompt, has passed
-//    through) or a bounded timeout — and a run whose dispatch never surfaces
-//    reports a truthful "could not verify", never queued:true.
+//  - QUEUE POSITION MARK: graph_run queues with number = SCOPED_QUEUE_MARK.
+//    Every frontend build's api.queuePrompt copies a nonzero `number` into the
+//    POST body verbatim (`body.number = number` — present since at least the
+//    1.28-era frontend), and the server treats it as a priority that with
+//    2^30-1 always sorts to the END of the pending queue — the same append
+//    position today's number=0 produces. A body WITHOUT our mark is FOREIGN:
+//    passed through untouched, never captured, never refused, never counted
+//    as our observation — even with an identical node set and identical
+//    targets. A body WITH our mark is this run: signature+targets exact ⇒
+//    observed; anything else (scope missing/wrong/extra, or a graph that
+//    changed under a deferred item) ⇒ OUR corrupted dispatch, refused before
+//    it leaves (batch-bounded).
 //
-//  - While installed, the guard sees EVERY POST /prompt in the tab (a user
-//    queue, another processor's item). Attribution is by PROMPT SIGNATURE
-//    FIRST (the sorted node-id|class_type set of the graphToPrompt output we
-//    queued — widget values excluded so beforeQueued seed randomization can't
-//    blur it), targets second:
-//      · signature matches, targets exactly ours → OUR scoped dispatch:
-//        observed, passed through, response captured.
-//      · signature matches, targets MISSING/WRONG/EXTRA/PARTIAL → OUR dispatch
-//        CORRUPTED (the frontend dropped/mangled the scope argument): refused
-//        before it leaves, bounded by this batch's post count. A body with
-//        ["14","9"] is NOT "someone else's" — it's our scope with an unwanted
-//        branch attached, and letting it out would run that work.
-//      · signature does NOT match → FOREIGN: passed through untouched, never
-//        captured, never refused, and NEVER counts as our observation — even
-//        if it carries the same targets (a foreign same-targets post must not
-//        satisfy `observed` and let our own deferred corrupted post escape).
-//    Known limit: a concurrent full run of the byte-identical node set inside
-//    the window is indistinguishable from our own corrupted dispatch and is
-//    treated as ours (bounded by batch).
+//  - QUEUE ITEM TAG: the targets array carries a non-enumerable per-run Symbol
+//    tag. Frontend builds store the array by reference in queueItems (either
+//    directly or inside the options object), so on timeout the still-pending
+//    item can be found and REMOVED with exact ownership — an identical-scope
+//    item from another run is never touched. When the item can't be found
+//    (hard-private #queueItems builds, or a build that copied the array), the
+//    surgical guard stays installed as a long-bound sentinel instead, so the
+//    late corrupted dispatch is still refused whenever it posts.
 //
-//  - On timeout the deferred queue item may STILL be live in the frontend's
-//    pending list; restoring the guard then would let a scope-dropped dispatch
-//    escape later. graph_run therefore tries to REMOVE the pending item
-//    (cancelPendingScopedQueueItem — the frontend keeps its queueItems array
-//    runtime-accessible on TS-`private` builds; older builds hard-privatize it
-//    as #queueItems, and a scope-dropped item may carry no attributable
-//    targets). When removal is impossible the guard stays installed as a
-//    sentinel — still surgical, still batch-bounded — until a much longer
-//    bound expires, so the corrupted dispatch is refused whenever it posts.
+// OTHER DISPATCH REALITIES (gate rounds 1–2):
 //
-// Extracted as a pure module so the SAME guard graph_run installs is drivable
-// from `node --test` (the live app.queuePrompt path can't be).
+//  - app.queuePrompt is NOT synchronous with the POST: a busy processor makes
+//    it return early and post LATER. The guard therefore stays installed until
+//    our dispatch is OBSERVED or a bounded timeout — and the timeout path
+//    decides cancel-vs-sentinel BEFORE the finally restores fetchApi.
+//
+//  - The prompt SIGNATURE (sorted node-id|class_type set of the graphToPrompt
+//    output, widget values excluded so beforeQueued seed randomization can't
+//    blur it) must be computable BEFORE dispatch. If it isn't, attribution is
+//    impossible, so the run FAILS CLOSED: it refuses upfront with a truthful
+//    error and never calls queuePrompt — "cannot safely dispatch", never
+//    "dispatch and hope".
+//
+// Extracted as a pure module so the SAME orchestration graph_run runs is
+// drivable from `node --test` (the live app.queuePrompt path can't be).
+
+/**
+ * The queue-position number every scoped panel_run dispatches with. Copied
+ * into the POST body as `number` by every frontend build's api.queuePrompt,
+ * making OUR posts identifiable among every /prompt in the tab. 2^30-1 sorts
+ * to the END of the server's priority queue (lower number = earlier), which
+ * matches the append behavior of the historical number=0.
+ */
+export const SCOPED_QUEUE_MARK = 2 ** 30 - 1;
+
+/** Property key for the per-run ownership tag on the targets array (non-enumerable). */
+export const QUEUE_ITEM_TAG = Symbol("cmcp-scoped-run-tag");
 
 /**
  * The ordered list of 3rd-argument shapes to try for app.queuePrompt when a
@@ -84,8 +95,8 @@ export function queuePromptScopeArgs(partialTargets) {
  * sorted node-id|class_type pairs of a graphToPrompt output (the API workflow).
  * Widget values are EXCLUDED — queuePrompt randomizes seeds via beforeQueued
  * between serialization calls, so a value-level fingerprint would miss our own
- * dispatch. Two runs of the same unedited graph share a signature; the batch
- * bound in the guard limits what that ambiguity can mis-attribute.
+ * dispatch. Two runs of the same unedited graph share a signature; the queue
+ * mark (module header) is what actually separates them.
  */
 export function promptSignature(output) {
   if (!output || typeof output !== "object") return null;
@@ -106,6 +117,18 @@ export function promptSignatureFromBody(bodyText) {
     return null;
   }
   return promptSignature(body?.prompt);
+}
+
+/** The body's queue-position `number` as a Number, or null when absent/unparseable. */
+function bodyQueueMark(bodyText) {
+  let body;
+  try {
+    body = JSON.parse(bodyText);
+  } catch {
+    return null;
+  }
+  const n = Number(body?.number);
+  return Number.isFinite(n) ? n : null;
 }
 
 /** The body's partial_execution_targets as strings, or null when absent/empty/unparseable. */
@@ -165,11 +188,26 @@ export function scopeDroppedError({ toNodeId, verdict }) {
 }
 
 /**
+ * The truthful UPFRONT refusal when the prompt can't be fingerprinted
+ * (graphToPrompt failed before dispatch). Without a signature our dispatch
+ * can't be told apart from a stranger's, so a scoped run must NOT dispatch at
+ * all — fail closed, nothing queued.
+ */
+export function scopeUnattributableError({ toNodeId }) {
+  return (
+    `run-to-node scope for node ${toNodeId} cannot be dispatched safely: the ` +
+    `prompt could not be fingerprinted (graphToPrompt failed), so the panel ` +
+    `cannot distinguish its own dispatch from unrelated queue traffic. ` +
+    `Nothing was queued rather than risk a full-graph execution (#556).`
+  );
+}
+
+/**
  * The truthful UNVERIFIED outcome when no scoped dispatch surfaced within the
  * observation window (a busy queuePrompt deferred the post past its return, or
  * the prompt build failed silently).
- *  - cancelled:  the still-pending frontend queue item was located and REMOVED
- *    — "nothing was queued" is then literally true.
+ *  - cancelled:  the still-pending frontend queue item was located by its
+ *    ownership tag and REMOVED — "nothing was queued" is then literally true.
  *  - lingering:  removal was impossible, so the surgical guard stays installed
  *    for lingerMs as a sentinel — a late scope-dropped dispatch is still
  *    refused whenever it posts. Only "nothing CONFIRMED queued" is claimed.
@@ -190,7 +228,7 @@ export function scopeUnverifiedError({ toNodeId, timeoutMs, cancelled = false, l
     base +
     `The pending queue item could not be removed on this frontend, so the scope ` +
     `guard stays installed for up to ${Math.round(lingerMs / 60000)}min as a sentinel — ` +
-    `any late dispatch of this prompt WITHOUT the scope will still be refused. ` +
+    `any late dispatch of this run WITHOUT the scope will still be refused. ` +
     `Nothing is CONFIRMED queued — check the ComfyUI queue before retrying (#556).`
   );
 }
@@ -249,26 +287,26 @@ export function createRunFetchInterceptor({ origFetchApi, onRejection = null, on
 }
 
 /**
- * The api.fetchApi replacement graph_run installs for a SCOPED run — see the
- * module header for the attribution rules this enforces. The guard stays
- * installed until the caller restores it (on observation, on a successful
- * pending-item cancellation, or via the long-bound sentinel timer); it does
- * not restore itself. state = { observed, dropped } is live; waitForVerdict(ms)
- * resolves true as soon as either is set, false on timeout.
- *
- * @param {object}   args
- * @param {Function} args.origFetchApi
- * @param {string[]} args.execIds        This run's resolved partial-execution targets.
- * @param {string|null} [args.signature] promptSignature of the graphToPrompt output we queued.
- * @param {number} [args.batch]          Bound on how many corrupted posts are attributable to us.
- * @param {*}        [args.toNodeId]
+ * The api.fetchApi replacement dispatchScopedRun installs for a SCOPED run —
+ * see the module header for the run-identity model. Per POST /prompt body:
+ *  - NO queue mark           → FOREIGN: passed through untouched, never
+ *                              captured, never refused, never observed — even
+ *                              with our node set and our targets.
+ *  - mark + signature + exact targets → OUR scoped dispatch: passed through,
+ *                              counted OBSERVED, response captured.
+ *  - mark + anything else    → OUR corrupted dispatch (scope dropped/mangled,
+ *                              or the graph changed under a deferred item):
+ *                              refused before it leaves, batch-bounded.
+ * state = { observed, dropped } is live; waitForVerdict(ms) resolves true as
+ * soon as either is set, false on timeout.
  */
 export function createScopedRunGuard({
   origFetchApi,
   execIds,
-  signature = null,
+  signature,
   batch = 1,
   toNodeId = null,
+  queueMark = SCOPED_QUEUE_MARK,
   onRejection = null,
   onPromptId = null,
   onScopeDropped = null,
@@ -284,19 +322,15 @@ export function createScopedRunGuard({
 
   const guard = async (route, options) => {
     if (!isPromptPost(route, options)) return origFetchApi(route, options);
+    // RUN IDENTITY FIRST: no mark ⇒ not ours ⇒ never touch it. This is what
+    // keeps a user's full run of the SAME graph, or another scoped run with
+    // the SAME targets, safe from our refusals and our capture.
+    if (bodyQueueMark(options?.body) !== queueMark) {
+      return origFetchApi(route, options);
+    }
     const targets = targetsFromBody(options?.body);
-    // SIGNATURE FIRST: only a body whose node set is exactly the prompt we
-    // queued can be this run — matched or corrupted. Everything else is
-    // foreign: passed through untouched, never captured, never observed,
-    // never refused (even a foreign post carrying the SAME targets).
-    // Degraded mode: with NO signature (graphToPrompt failed at queue time) we
-    // can only attribute a post carrying EXACTLY our targets — enough to still
-    // verify a delivered scope, never enough to refuse (never blocks strangers).
-    const attributable = signature
-      ? promptSignatureFromBody(options?.body) === signature
-      : targets != null && sameSet(targets, expected);
-    if (!attributable) return origFetchApi(route, options);
-    if (targets && sameSet(targets, expected)) {
+    const sigOk = signature && promptSignatureFromBody(options?.body) === signature;
+    if (sigOk && targets && sameSet(targets, expected)) {
       // OUR scoped dispatch, verifiably delivered.
       state.observed++;
       const res = await origFetchApi(route, options);
@@ -304,10 +338,9 @@ export function createScopedRunGuard({
       notify();
       return res;
     }
-    // OUR dispatch CORRUPTED — scope missing, or wrong/extra/partial targets
-    // (["14","9"] would run an unwanted branch; "9" would run the wrong one).
-    // Only reachable with a signature; the batch bound caps the documented
-    // same-node-set ambiguity.
+    // OUR dispatch CORRUPTED — scope missing, wrong/extra/partial targets
+    // (["14","9"] would run an unwanted branch), or the graph changed while
+    // our item sat deferred (scope unverifiable against the new graph).
     if (refused < maxBatch) {
       refused++;
       state.dropped = scopeDroppedError({
@@ -320,8 +353,8 @@ export function createScopedRunGuard({
       notify();
       return SCOPE_DROPPED_RESPONSE();
     }
-    // Refusal budget for this batch is exhausted — beyond this point a
-    // same-signature body is not ours to judge (documented ambiguity bound).
+    // Refusal budget for this batch is exhausted (paranoia bound; normally the
+    // frontend's batch loop breaks on the first refusal).
     return origFetchApi(route, options);
   };
   guard.state = state;
@@ -337,6 +370,7 @@ export function createScopedRunGuard({
         waiters.delete(fire);
         resolve(false);
       }, ms);
+      if (typeof timer.unref === "function") timer.unref();
       waiters.add(fire);
     });
   return guard;
@@ -345,35 +379,150 @@ export function createScopedRunGuard({
 /**
  * Best-effort removal of THIS run's still-pending item(s) from the frontend's
  * in-memory queueItems (the not-yet-posted deferred dispatch — the server-side
- * /queue never saw it, so server queue control can't help). The frontend keeps
- * the array runtime-accessible as app.queueItems on TS-`private` builds; older
- * builds hard-privatize it (#queueItems) and then this is impossible — the
- * caller keeps the guard installed as a sentinel instead (module header).
- *
- * An item is only removed when its stored targets NORMALIZE to exactly this
- * run's scope (either the raw array or the {queueNodeIds} options shape a
- * positional build stored verbatim) — a user's pending full-run item carries
- * no targets and is never touched, and a scope-dropped item whose build stored
- * no attributable targets can't be identified (left for the sentinel).
+ * /queue never saw it, so server queue control can't help). Ownership is by
+ * the non-enumerable QUEUE_ITEM_TAG dispatchScopedRun stamped on the targets
+ * array (frontend builds store the array by reference, either directly or
+ * inside the options object), so an identical-scope item from ANOTHER run is
+ * never removed. The array is runtime-accessible as app.queueItems on
+ * TS-`private` builds; older builds hard-privatize it (#queueItems), and a
+ * build that COPIED the array loses the tag — then this reports 0 removed and
+ * the caller keeps the guard installed as a sentinel instead (module header).
  *
  * @returns {{accessible: boolean, removed: number}}
  */
-export function cancelPendingScopedQueueItem(app, expectedExecIds) {
+export function cancelPendingScopedQueueItem(app, runTag) {
   const items = app?.queueItems;
   if (!Array.isArray(items)) return { accessible: false, removed: 0 };
-  const expected = (expectedExecIds ?? []).map(String);
   let removed = 0;
   for (let i = items.length - 1; i >= 0; i--) {
     const raw = items[i]?.queueNodeIds;
-    const ids = Array.isArray(raw) && raw.length
-      ? raw.map(String)
-      : raw && Array.isArray(raw.queueNodeIds) && raw.queueNodeIds.length
-        ? raw.queueNodeIds.map(String)
-        : null;
-    if (ids && sameSet(ids, expected)) {
+    const arr = Array.isArray(raw) ? raw : raw && Array.isArray(raw.queueNodeIds) ? raw.queueNodeIds : null;
+    if (arr && arr[QUEUE_ITEM_TAG] === runTag) {
       items.splice(i, 1);
       removed++;
     }
   }
   return { accessible: true, removed };
+}
+
+/**
+ * The scoped-dispatch orchestration graph_run runs — extracted whole so the
+ * REAL control flow (guard install, queuePrompt, observation wait, cancel/
+ * sentinel decision, and the finally-restore) is what the unit tests drive.
+ *
+ * Returns a discriminated result (never throws for queue outcomes):
+ *  - { outcome: "dispatched" }              our scoped dispatch was OBSERVED
+ *    (prompt_ids / a server rejection captured via the callbacks);
+ *  - { outcome: "refused",   error }        every argument shape produced OUR
+ *    corrupted dispatch, all blocked — nothing was queued;
+ *  - { outcome: "unverified", error }       no scoped dispatch surfaced in
+ *    time; our pending item was cancelled, or a sentinel guard remains for
+ *    lingerMs (the error says which);
+ *  - { outcome: "unverifiable", error }     no attribution possible (no
+ *    fetchApi to observe through, or no prompt signature) — refused BEFORE
+ *    dispatch, nothing queued.
+ */
+export async function dispatchScopedRun({
+  app,
+  apiTarget,
+  execIds,
+  batch = 1,
+  toNodeId = null,
+  verifyTimeoutMs = 5000,
+  lingerMs = 10 * 60 * 1000,
+  onRejection = null,
+  onPromptId = null,
+} = {}) {
+  const prevFetchApi = typeof apiTarget?.fetchApi === "function" ? apiTarget.fetchApi : null;
+  const origFetchApi = prevFetchApi ? prevFetchApi.bind(apiTarget) : null;
+  if (!origFetchApi) {
+    return {
+      outcome: "unverifiable",
+      error:
+        `run-to-node scope for node ${toNodeId} cannot be verified — api.fetchApi is ` +
+        `unavailable on this frontend, so there is no way to confirm the scope reaches the ` +
+        `prompt. Nothing was queued rather than risk a full-graph execution (#556).`,
+    };
+  }
+  // The signature that (with the queue mark) attributes a POST /prompt body to
+  // THIS run. No signature ⇒ no attribution ⇒ fail closed BEFORE dispatch.
+  let signature = null;
+  try {
+    if (typeof app.graphToPrompt === "function") {
+      signature = promptSignature((await app.graphToPrompt())?.output);
+    }
+  } catch {
+    signature = null;
+  }
+  if (!signature) {
+    return { outcome: "unverifiable", error: scopeUnattributableError({ toNodeId }) };
+  }
+  // Ownership tag for the timeout cancellation (see QUEUE_ITEM_TAG).
+  const runTag = Symbol("cmcp-scoped-run");
+  try {
+    Object.defineProperty(execIds, QUEUE_ITEM_TAG, { value: runTag, enumerable: false, configurable: true });
+  } catch {
+    // non-extensible array — cancellation will report 0 and the sentinel covers it.
+  }
+  let dropped = null;
+  for (const scopeArg of queuePromptScopeArgs(execIds)) {
+    dropped = null;
+    let keepGuardInstalled = false;
+    const guard = createScopedRunGuard({
+      origFetchApi,
+      execIds,
+      signature,
+      batch,
+      toNodeId,
+      queueMark: SCOPED_QUEUE_MARK,
+      onRejection,
+      onPromptId,
+    });
+    apiTarget.fetchApi = guard;
+    try {
+      await app.queuePrompt(SCOPED_QUEUE_MARK, batch, scopeArg);
+      if (!(guard.state.observed > 0 || guard.state.dropped)) {
+        // queuePrompt returned without our dispatch surfacing — the
+        // frontend's processor was busy and will serialize/post the item
+        // LATER. Keep the guard installed and wait for our scoped dispatch
+        // to be OBSERVED, or the bounded timeout.
+        await guard.waitForVerdict(verifyTimeoutMs);
+      }
+      if (!(guard.state.observed > 0 || guard.state.dropped)) {
+        // GIVE-UP — decided HERE, inside the try, so the finally below honors
+        // keepGuardInstalled. The deferred item may still be live in the
+        // frontend's pending queue: try to REMOVE it (ownership-tagged), and
+        // only when that's impossible keep the surgical guard installed as a
+        // sentinel so the late scope-dropped dispatch is still refused.
+        const cancel = cancelPendingScopedQueueItem(app, runTag);
+        if (cancel.removed > 0) {
+          return {
+            outcome: "unverified",
+            error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: true }),
+          };
+        }
+        keepGuardInstalled = true;
+        const timer = setTimeout(() => {
+          // Self-remove only if nothing newer has wrapped over the sentinel —
+          // a guard left underneath a newer wrap is inert (mark-scoped +
+          // batch-bounded) and simply remains in the chain.
+          if (apiTarget.fetchApi === guard) apiTarget.fetchApi = prevFetchApi;
+        }, lingerMs);
+        if (typeof timer.unref === "function") timer.unref();
+        return {
+          outcome: "unverified",
+          error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: false, lingerMs }),
+        };
+      }
+    } finally {
+      if (!keepGuardInstalled) apiTarget.fetchApi = prevFetchApi;
+    }
+    // Verifiably dispatched with our scope.
+    if (guard.state.observed > 0) return { outcome: "dispatched" };
+    // OUR dispatch surfaced WITHOUT the scope and was refused before it left
+    // the tab — nothing was queued, so retrying the other arg shape can never
+    // double-queue.
+    dropped = guard.state.dropped;
+  }
+  return { outcome: "refused", error: dropped };
 }

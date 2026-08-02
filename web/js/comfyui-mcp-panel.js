@@ -256,7 +256,7 @@ import {
   graphReadBindingChanged,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
-import { queuePromptScopeArgs, createRunFetchInterceptor, createScopedRunGuard, promptSignature, scopeUnverifiedError, cancelPendingScopedQueueItem } from "./lib/run-scope-guard.js";
+import { createRunFetchInterceptor, dispatchScopedRun } from "./lib/run-scope-guard.js";
 import { queueMembership, historyEntryFor } from "./lib/history-reconcile.js";
 import {
   normalizeModels,
@@ -7782,18 +7782,23 @@ const GRAPH_TOOL_EXECUTORS = {
     // Array.isArray compat shim for the legacy array). A build that accepts only
     // ONE shape SILENTLY IGNORES the other — the scope never reaches the request
     // and the FULL graph queues while panel_run reports ran_to_node (#556). A
-    // scoped run must NEVER fall through to a full-graph execution, so:
-    //   1. try each arg shape in turn (queuePromptScopeArgs), and
-    //   2. a scoped fetch GUARD verifies the scope actually lands in the POST
-    //      /prompt body before that request leaves — and stays installed until
-    //      our dispatch is OBSERVED or a bounded timeout, because a busy
-    //      queuePrompt returns early and posts the item LATER (a guard restored
-    //      at return never sees the deferred dispatch). The guard is surgical:
-    //      it only refuses a targetless body matching THIS run's prompt
-    //      signature (the node-id|class_type set we queued), so an unrelated
-    //      prompt posting during the window passes through untouched. If no
-    //      scoped dispatch surfaces, the run reports "unverified — nothing
-    //      confirmed queued" rather than a lying queued:true.
+    // scoped run must NEVER fall through to a full-graph execution, so
+    // dispatchScopedRun (lib, the same code the tests drive):
+    //   1. fingerprints the prompt (node-id|class_type signature) BEFORE
+    //      dispatch — no signature ⇒ no attribution ⇒ fail closed, never queued;
+    //   2. queues with a sentinel queue-position MARK and an ownership tag on
+    //      the targets array, so this run's posts/items are distinguishable
+    //      from ALL unrelated queue traffic (a user full run of the same
+    //      graph, a foreign scoped run with the same targets);
+    //   3. tries each arg shape in turn while a surgical fetch GUARD observes
+    //      every POST /prompt: our marked post with signature+exact targets ⇒
+    //      dispatched; our marked post without them ⇒ refused before it
+    //      leaves; anything unmarked ⇒ not ours, passed through untouched;
+    //   4. stays installed until our dispatch is OBSERVED or a bounded timeout
+    //      (a busy queuePrompt returns early and posts LATER), then cancels
+    //      the still-pending tagged item — or, when cancellation is
+    //      impossible, keeps the guard as a long-bound sentinel — and reports
+    //      a truthful "unverified", never a lying queued:true.
     //
     // #358: app.queuePrompt SWALLOWS a synchronous rejection. It stores per-node
     // validation errors on `lastNodeErrors`, but a TOP-LEVEL rejection (e.g.
@@ -7855,116 +7860,27 @@ const GRAPH_TOOL_EXECUTORS = {
         if (origFetchApi) api.fetchApi = prevFetchApi;
       }
     } else {
-      if (!origFetchApi) {
-        // A scoped run we can't VERIFY (no fetchApi to inspect the outgoing prompt)
-        // is a scoped run we can't guarantee — refuse rather than risk a silent
-        // full-graph execution (#556).
-        return {
-          queued: false,
-          error:
-            `run-to-node scope for node ${to_node_id} cannot be verified — api.fetchApi is ` +
-            `unavailable on this frontend, so there is no way to confirm the scope reaches the ` +
-            `prompt. Nothing was queued rather than risk a full-graph execution (#556).`,
-        };
+      // SCOPED run — the whole dispatch (guard install, arg-shape retry,
+      // observation wait, timeout cancel/sentinel, fetchApi restore) lives in
+      // dispatchScopedRun so the REAL control flow is what the unit tests
+      // drive (#556). It marks every one of this run's posts with a queue
+      // position sentinel and tags the pending queue item, so a scoped run
+      // can never be confused with unrelated queue traffic.
+      const result = await dispatchScopedRun({
+        app,
+        apiTarget: api,
+        execIds: partialTargets,
+        batch,
+        toNodeId: to_node_id,
+        onRejection: captureRejection,
+        onPromptId: capturePromptId,
+      });
+      // "refused" / "unverified" / "unverifiable" all carry a truthful error
+      // naming what couldn't be resolved — and guarantee no scopeless
+      // full-graph dispatch left the tab.
+      if (result.outcome !== "dispatched") {
+        return { queued: false, error: result.error };
       }
-      // The signature that attributes a POST /prompt body to THIS run (see the
-      // guard). Best-effort: if graphToPrompt can't give us one, the guard
-      // still verifies posts that CARRY our targets, and anything else is
-      // reported unverified rather than blocked or lied about.
-      let signature = null;
-      try {
-        if (typeof app.graphToPrompt === "function") {
-          signature = promptSignature((await app.graphToPrompt())?.output);
-        }
-      } catch {
-        signature = null;
-      }
-      // A busy queuePrompt defers the post past its own return; bound how long
-      // we keep the guard installed waiting for OUR dispatch to surface. The
-      // pending item is popped LIFO, so it normally surfaces in well under this.
-      const SCOPED_DISPATCH_VERIFY_TIMEOUT_MS = 5000;
-      // When the pending item can't be cancelled on timeout, the guard stays
-      // installed this much longer as a sentinel — a late scope-dropped
-      // dispatch is still refused whenever it posts.
-      const SCOPED_DISPATCH_LINGER_MS = 10 * 60 * 1000;
-      let scopeDropped = null;
-      for (const scopeArg of queuePromptScopeArgs(partialTargets)) {
-        scopeDropped = null;
-        promptRejection = null;
-        queuedPromptIds.length = 0;
-        let keepGuardInstalled = false;
-        const guard = createScopedRunGuard({
-          origFetchApi,
-          execIds: partialTargets,
-          signature,
-          batch,
-          toNodeId: to_node_id,
-          onRejection: captureRejection,
-          onPromptId: capturePromptId,
-        });
-        api.fetchApi = guard;
-        try {
-          await app.queuePrompt(0, batch, scopeArg);
-          if (!(guard.state.observed > 0 || guard.state.dropped)) {
-            // queuePrompt returned without our dispatch surfacing — the
-            // frontend's processor was busy and will serialize/post the item
-            // LATER. Keep the guard installed and wait for our scoped dispatch
-            // to be OBSERVED, or the bounded timeout.
-            await guard.waitForVerdict(SCOPED_DISPATCH_VERIFY_TIMEOUT_MS);
-          }
-        } finally {
-          if (!keepGuardInstalled) api.fetchApi = prevFetchApi;
-        }
-        // Verifiably dispatched with our scope — proceed to the ledger/verdict.
-        if (guard.state.observed > 0) {
-          scopeDropped = null;
-          break;
-        }
-        // OUR dispatch surfaced WITHOUT the scope and was refused before it
-        // left the tab — nothing was queued, so retrying the other arg shape
-        // can never double-queue.
-        if (guard.state.dropped) {
-          scopeDropped = guard.state.dropped;
-          continue;
-        }
-        // Nothing surfaced — but the deferred item may STILL be live in the
-        // frontend's pending queue, and restoring the guard would let its
-        // scope-dropped dispatch escape later. Try to REMOVE the pending item
-        // (the server-side /queue never saw it — it never posted). When that's
-        // impossible (some builds hard-privatize queueItems, and a
-        // scope-dropped item may carry no attributable targets to match), keep
-        // the surgical guard installed as a sentinel until the long bound
-        // expires, then report the truthful unverified outcome — never
-        // queued:true (#556).
-        const cancel = cancelPendingScopedQueueItem(app, partialTargets);
-        if (cancel.removed > 0) {
-          return {
-            queued: false,
-            error: scopeUnverifiedError({
-              toNodeId: to_node_id,
-              timeoutMs: SCOPED_DISPATCH_VERIFY_TIMEOUT_MS,
-              cancelled: true,
-            }),
-          };
-        }
-        keepGuardInstalled = true;
-        setTimeout(() => {
-          // Self-remove only if nothing newer has wrapped over the sentinel —
-          // a guard left underneath a newer wrap is inert (surgical + budgeted)
-          // and simply remains in the chain.
-          if (api.fetchApi === guard) api.fetchApi = prevFetchApi;
-        }, SCOPED_DISPATCH_LINGER_MS);
-        return {
-          queued: false,
-          error: scopeUnverifiedError({
-            toNodeId: to_node_id,
-            timeoutMs: SCOPED_DISPATCH_VERIFY_TIMEOUT_MS,
-            cancelled: false,
-            lingerMs: SCOPED_DISPATCH_LINGER_MS,
-          }),
-        };
-      }
-      if (scopeDropped) return { queued: false, error: scopeDropped };
     }
     // Register EVERY accepted prompt_id for reconnect reconciliation (#370) —
     // BEFORE the rejection check. With batch>1, app.queuePrompt breaks its loop on

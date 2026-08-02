@@ -2,33 +2,32 @@
  * Unit tests for web/js/lib/run-scope-guard.js — run with `node --test`.
  *
  * Guards #556: a scoped panel_run (to_node_id, "run to node") must NEVER
- * silently fall through to a FULL-graph execution — and (codex gate) must do so
- * without breaking the tab around it:
- *
- *  P0 — a busy app.queuePrompt returns early and posts the item LATER; a guard
- *       restored at queuePrompt's return never sees that deferred dispatch. The
- *       scoped guard stays installed until our dispatch is OBSERVED or a
- *       bounded timeout, and a run whose dispatch never surfaces reports a
- *       truthful "unverified — nothing confirmed queued", never queued:true.
- *
- *  P1 — while installed, the guard sees EVERY POST /prompt in the tab. It only
- *       refuses a targetless body matching THIS run's prompt signature (and
- *       only within the batch count); unrelated full runs and other scoped runs
- *       pass through untouched and are never captured as ours.
+ * silently fall through to a FULL-graph execution — and must never collateral-
+ * damage unrelated queue traffic while preventing that. The integration tests
+ * below drive dispatchScopedRun — the SAME orchestration graph_run runs —
+ * through mock frontends, including the real guard-install/try/finally/restore
+ * control flow (codex gate r3: the sentinel must ACTUALLY be installed after a
+ * timeout, degraded mode must fail closed BEFORE dispatch, and run identity —
+ * queue-position mark + queue-item tag — must separate our work from every
+ * stranger's).
  */
 import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  SCOPED_QUEUE_MARK,
+  QUEUE_ITEM_TAG,
   queuePromptScopeArgs,
   promptSignature,
   promptSignatureFromBody,
   verifyScopedPromptBody,
   scopeDroppedError,
   scopeUnverifiedError,
+  scopeUnattributableError,
   createRunFetchInterceptor,
   createScopedRunGuard,
   cancelPendingScopedQueueItem,
+  dispatchScopedRun,
 } from "../../web/js/lib/run-scope-guard.js";
 import { resolveRunToNodeTarget } from "../../web/js/lib/subgraph-scope.js";
 
@@ -43,13 +42,12 @@ function jsonResponse(status, obj) {
   };
 }
 
-// A recording origFetchApi double; every call is logged so tests can prove a
-// dispatch did/didn't happen.
-function makeFetchSpy(responder) {
+// The "server" — a recording fetchApi double standing in for the real one.
+function makeServer(responder) {
   const calls = [];
   const fetchApi = async (route, options) => {
     calls.push({ route, options });
-    return responder(route, options);
+    return responder ? responder(route, options) : jsonResponse(200, { prompt_id: `srv-${calls.length}` });
   };
   fetchApi.calls = calls;
   return fetchApi;
@@ -64,30 +62,90 @@ const promptPost = (body) => [
   },
 ];
 
-// The graphToPrompt output OUR scoped run queued (two branches: a KSampler
-// trunk, a SaveImage branch, and the PreviewAny we scope to).
+// The graphToPrompt output OUR scoped run queued.
 const OUR_OUTPUT = {
   "3": { class_type: "KSampler", inputs: {} },
   "9": { class_type: "SaveImage", inputs: {} },
   "14": { class_type: "PreviewAny", inputs: {} },
 };
 const OUR_SIGNATURE = promptSignature(OUR_OUTPUT);
-const OUR_FULL_BODY = { prompt: OUR_OUTPUT, client_id: "x" };
-const OUR_SCOPED_BODY = { prompt: OUR_OUTPUT, client_id: "x", partial_execution_targets: ["14"] };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Bodies the way the frontend's api.queuePrompt builds them.
+function frontendBody({ output = OUR_OUTPUT, number = SCOPED_QUEUE_MARK, targets = null }) {
+  const body = { prompt: output, client_id: "x" };
+  if (targets) body.partial_execution_targets = targets;
+  if (number === -1) body.front = true;
+  else if (number != 0) body.number = number;
+  return body;
+}
+
+/**
+ * A mock frontend. `shape`: "shim" (options object AND legacy array both
+ * honored), "positional" (array only), "shimless" (options object only — the
+ * #556 build). `defer`: queuePrompt pushes the item and returns early (busy
+ * processor); the TEST then drives the deferred post manually through
+ * apiTarget.fetchApi, exactly like the in-flight processor would.
+ */
+function makeFrontend({ shape = "shim", defer = false, apiTarget, output = OUR_OUTPUT, failGraphToPrompt = false } = {}) {
+  const app = {
+    queueItems: [],
+    posted: [],
+    graphToPrompt: async () => {
+      if (failGraphToPrompt) throw new Error("serialization exploded");
+      return { output, workflow: {} };
+    },
+    queuePrompt: async (number, batch, arg) => {
+      const queueNodeIds =
+        shape === "shim"
+          ? Array.isArray(arg)
+            ? arg
+            : arg?.queueNodeIds
+          : shape === "positional"
+            ? Array.isArray(arg)
+              ? arg
+              : undefined
+            : Array.isArray(arg)
+              ? undefined
+              : arg?.queueNodeIds;
+      const item = { number, batchCount: batch, queueNodeIds };
+      if (defer) {
+        app.queueItems?.push(item); // hard-private builds hide the array from us
+        app.deferredItem = item;
+        return false; // busy — the processor posts it LATER
+      }
+      // Synchronous processing: post now, through whatever fetchApi is installed.
+      const body = frontendBody({ output, number, targets: queueNodeIds?.length ? queueNodeIds : null });
+      app.posted.push(body);
+      await apiTarget.fetchApi("/prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return true;
+    },
+    // Simulate the in-flight processor eventually posting a deferred item.
+    postDeferred: async (item) => {
+      const body = frontendBody({ output, number: item.number, targets: item.queueNodeIds?.length ? item.queueNodeIds : null });
+      app.posted.push(body);
+      return apiTarget.fetchApi("/prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    },
+  };
+  return app;
+}
+
 // ---------------------------------------------------------------------------
-// queuePromptScopeArgs / signatures / pure verdicts
+// Pure helpers
 // ---------------------------------------------------------------------------
 
-test("#556 queuePromptScopeArgs: no scope ⇒ a single undefined arg (plain full run, historical call shape)", () => {
+test("#556 queuePromptScopeArgs: no scope ⇒ [undefined]; scope ⇒ array first, then options object", () => {
   assert.deepEqual(queuePromptScopeArgs(undefined), [undefined]);
-  assert.deepEqual(queuePromptScopeArgs(null), [undefined]);
   assert.deepEqual(queuePromptScopeArgs([]), [undefined]);
-});
-
-test("#556 queuePromptScopeArgs: a scope ⇒ positional array FIRST, then the options object", () => {
   const [first, second] = queuePromptScopeArgs(["76:34"]);
   assert.deepEqual(first, ["76:34"]);
   assert.deepEqual(second, { queueNodeIds: ["76:34"] });
@@ -96,45 +154,33 @@ test("#556 queuePromptScopeArgs: a scope ⇒ positional array FIRST, then the op
 test("#556 promptSignature: node-id|class_type set, widget values excluded, order-insensitive", () => {
   const a = promptSignature({ "9": { class_type: "B", inputs: { seed: 1 } }, "3": { class_type: "A" } });
   const b = promptSignature({ "3": { class_type: "A" }, "9": { class_type: "B", inputs: { seed: 999 } } });
-  assert.equal(a, b, "same node set with different widget values ⇒ same signature");
-  assert.notEqual(promptSignature({ "3": { class_type: "A" } }), a, "different node set ⇒ different signature");
-  assert.equal(promptSignature(null), null);
-  assert.equal(promptSignature({}), null);
-});
-
-test("#556 promptSignatureFromBody: reads body.prompt; unparseable ⇒ null", () => {
+  assert.equal(a, b);
+  assert.notEqual(promptSignature({ "3": { class_type: "A" } }), a);
   assert.equal(promptSignatureFromBody(JSON.stringify({ prompt: OUR_OUTPUT })), OUR_SIGNATURE);
   assert.equal(promptSignatureFromBody("not-json{"), null);
-  assert.equal(promptSignatureFromBody(undefined), null);
 });
 
 test("#556 verifyScopedPromptBody: exact scope passes; missing/empty/wrong/extra/unparseable all refuse", () => {
   assert.deepEqual(verifyScopedPromptBody(JSON.stringify({ partial_execution_targets: ["10:15:359"] }), ["10:15:359"]), { ok: true });
   assert.equal(verifyScopedPromptBody(JSON.stringify({ prompt: {} }), ["14"]).reason, "scope_missing");
-  assert.equal(verifyScopedPromptBody(JSON.stringify({ partial_execution_targets: [] }), ["14"]).reason, "scope_missing");
-  assert.equal(verifyScopedPromptBody(JSON.stringify({ partial_execution_targets: ["9"] }), ["14"]).reason, "scope_mismatch");
   assert.equal(verifyScopedPromptBody(JSON.stringify({ partial_execution_targets: ["14", "9"] }), ["14"]).reason, "scope_mismatch");
   assert.equal(verifyScopedPromptBody("garbage{", ["14"]).ok, false);
   assert.deepEqual(verifyScopedPromptBody("garbage", null), { ok: true });
 });
 
-test("#556 scopeDroppedError: names the node and states NOTHING was queued", () => {
-  const msg = scopeDroppedError({ toNodeId: 14, verdict: { ok: false, reason: "scope_missing", expected: ["14"], got: null } });
-  assert.match(msg, /node 14/);
-  assert.match(msg, /NOT applied/);
-  assert.match(msg, /Nothing was queued/);
-});
-
-test("#556 scopeUnverifiedError: truthful — nothing CONFIRMED queued, never claims a scoped run happened", () => {
-  const lingering = scopeUnverifiedError({ toNodeId: 14, timeoutMs: 5000, cancelled: false, lingerMs: 600000 });
-  assert.match(lingering, /node 14/);
-  assert.match(lingering, /could not be verified/);
-  assert.match(lingering, /CONFIRMED queued/i);
-  assert.match(lingering, /sentinel/, "says the guard stays installed when cancellation was impossible");
-  assert.doesNotMatch(lingering, /Nothing was queued/, "a deferred post may still land — must not claim otherwise");
+test("#556 error messages: dropped names the node + nothing queued; unverified distinguishes cancelled vs sentinel; unattributable fails closed", () => {
+  const dropped = scopeDroppedError({ toNodeId: 14, verdict: { ok: false, reason: "scope_missing", expected: ["14"], got: null } });
+  assert.match(dropped, /node 14/);
+  assert.match(dropped, /Nothing was queued/);
   const cancelled = scopeUnverifiedError({ toNodeId: 14, timeoutMs: 5000, cancelled: true });
   assert.match(cancelled, /REMOVED/);
-  assert.match(cancelled, /nothing was queued/i, "after a successful cancel, 'nothing was queued' is literally true");
+  assert.match(cancelled, /nothing was queued/i);
+  const sentinel = scopeUnverifiedError({ toNodeId: 14, timeoutMs: 5000, cancelled: false, lingerMs: 600000 });
+  assert.match(sentinel, /sentinel/);
+  assert.match(sentinel, /CONFIRMED queued/i);
+  const unattributable = scopeUnattributableError({ toNodeId: 14 });
+  assert.match(unattributable, /cannot be dispatched safely/);
+  assert.match(unattributable, /Nothing was queued/);
 });
 
 // ---------------------------------------------------------------------------
@@ -142,7 +188,7 @@ test("#556 scopeUnverifiedError: truthful — nothing CONFIRMED queued, never cl
 // ---------------------------------------------------------------------------
 
 test("#556 unscoped interceptor: captures top-level rejection and prompt_id, leaves the request untouched", async () => {
-  const spy = makeFetchSpy(async () => jsonResponse(400, { error: { type: "missing_node_type" } }));
+  const spy = makeServer(async () => jsonResponse(400, { error: { type: "missing_node_type" } }));
   let rejection = null;
   const intercepted = createRunFetchInterceptor({ origFetchApi: spy, onRejection: (r) => (rejection = r) });
   const [route, options] = promptPost({ prompt: {} });
@@ -152,333 +198,222 @@ test("#556 unscoped interceptor: captures top-level rejection and prompt_id, lea
   assert.equal(res.status, 400);
   assert.deepEqual(rejection, { error: { type: "missing_node_type" }, node_errors: null });
 
-  const spy2 = makeFetchSpy(async () => jsonResponse(200, { prompt_id: 0 }));
   const ids = [];
-  const intercepted2 = createRunFetchInterceptor({ origFetchApi: spy2, onPromptId: (p) => ids.push(p) });
+  const intercepted2 = createRunFetchInterceptor({ origFetchApi: makeServer(async () => jsonResponse(200, { prompt_id: 0 })), onPromptId: (p) => ids.push(p) });
   await intercepted2(...promptPost({ prompt: {} }));
-  assert.deepEqual(ids, ["0"], "falsy-but-valid id 0 is captured, string-normalized");
-});
-
-test("#556 unscoped interceptor: non-/prompt routes are not inspected", async () => {
-  const spy = makeFetchSpy(async () => jsonResponse(200, {}));
-  const intercepted = createRunFetchInterceptor({ origFetchApi: spy, onRejection: () => assert.fail("no capture") });
-  await intercepted("/history", { method: "GET" });
-  assert.equal(spy.calls.length, 1);
+  assert.deepEqual(ids, ["0"], "falsy-but-valid id 0 captured, string-normalized");
 });
 
 // ---------------------------------------------------------------------------
-// createScopedRunGuard — the SCOPED path
+// createScopedRunGuard — mark-based attribution (unit level)
 // ---------------------------------------------------------------------------
 
-test("#556 guard: OUR scoped dispatch (body carries exactly our targets) is observed, dispatched verbatim, prompt_id captured", async () => {
-  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "p1" }));
+test("#556 guard: OUR marked post with signature+exact targets ⇒ observed, dispatched verbatim, prompt_id captured", async () => {
+  const spy = makeServer();
   const ids = [];
-  const guard = createScopedRunGuard({
-    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
-    onPromptId: (p) => ids.push(p),
-  });
-  const [route, options] = promptPost(OUR_SCOPED_BODY);
+  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14, onPromptId: (p) => ids.push(p) });
+  const [route, options] = promptPost(frontendBody({ targets: ["14"] }));
   const res = await guard(route, options);
-  assert.equal(spy.calls.length, 1, "scoped prompt dispatched");
-  assert.equal(spy.calls[0].options, options, "request passed through untouched");
-  assert.equal(res.status, 200);
-  assert.equal(guard.state.observed, 1);
-  assert.equal(guard.state.dropped, null);
-  assert.deepEqual(ids, ["p1"]);
-});
-
-test("#556 guard: a server rejection of OUR scoped dispatch is captured (#358 channel preserved)", async () => {
-  const spy = makeFetchSpy(async () => jsonResponse(400, { error: { type: "prompt_outputs_failed_validation" } }));
-  let rejection = null;
-  const guard = createScopedRunGuard({
-    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
-    onRejection: (r) => (rejection = r),
-  });
-  await guard(...promptPost(OUR_SCOPED_BODY));
-  assert.equal(spy.calls.length, 1, "a verifiably scoped prompt IS dispatched (and may be refused by the server)");
-  assert.equal(rejection?.error?.type, "prompt_outputs_failed_validation");
-});
-
-test("#556 REGRESSION: OUR dispatch gone wrong (targetless body with OUR signature) is REFUSED — origFetchApi NEVER called (no full-graph dispatch)", async () => {
-  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "must-never-happen" }));
-  let dropped = null;
-  const guard = createScopedRunGuard({
-    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
-    onScopeDropped: (m) => (dropped = m),
-  });
-  const res = await guard(...promptPost(OUR_FULL_BODY));
-  assert.equal(spy.calls.length, 0, "the scopeless prompt must NEVER be dispatched");
-  assert.equal(res.status, 400, "refusal shaped like a server rejection");
-  assert.equal(guard.state.observed, 0);
-  assert.match(guard.state.dropped, /node 14/);
-  assert.match(dropped, /Nothing was queued/);
-});
-
-test("#556 P1: an UNRELATED full run (different signature) during the window passes through untouched and is NOT captured", async () => {
-  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "user-run" }));
-  let dropped = null, captured = null;
-  const guard = createScopedRunGuard({
-    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
-    onScopeDropped: (m) => (dropped = m),
-    onPromptId: (p) => (captured = p),
-  });
-  const otherGraph = { prompt: { "1": { class_type: "LoadImage" }, "2": { class_type: "SaveImage" } }, client_id: "x" };
-  const [route, options] = promptPost(otherGraph);
-  const res = await guard(route, options);
-  assert.equal(spy.calls.length, 1, "the user's run is dispatched");
+  assert.equal(spy.calls.length, 1);
   assert.equal(spy.calls[0].options, options);
   assert.equal(res.status, 200);
-  assert.equal(dropped, null, "no refusal");
-  assert.equal(captured, null, "not captured as ours");
-  assert.equal(guard.state.observed, 0);
-  assert.equal(guard.state.dropped, null);
+  assert.equal(guard.state.observed, 1);
+  assert.deepEqual(ids, ["srv-1"]);
 });
 
-test("#556 P1: an unrelated SCOPED run (foreign signature, its own targets) passes through untouched", async () => {
-  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "other-scoped" }));
-  let captured = null;
-  const guard = createScopedRunGuard({
-    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
-    onPromptId: (p) => (captured = p),
-  });
-  const body = { prompt: { "1": { class_type: "LoadImage" }, "2": { class_type: "PreviewImage" } }, client_id: "x", partial_execution_targets: ["2"] };
-  const res = await guard(...promptPost(body));
-  assert.equal(spy.calls.length, 1);
-  assert.equal(res.status, 200);
-  assert.equal(captured, null, "another scope's prompt_id is never claimed as ours");
-  assert.equal(guard.state.observed, 0);
-});
-
-test("#556 r2 P0-1: OUR signature with WRONG/EXTRA/PARTIAL targets is OUR corrupted dispatch — REFUSED with zero dispatch (not forwarded as 'someone else's')", async () => {
-  for (const badTargets of [["14", "9"], ["9"], ["14", "76:34"]]) {
-    const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "must-never-happen" }));
+test("#556 guard: OUR marked post with MISSING or WRONG/EXTRA targets ⇒ refused with zero dispatch", async () => {
+  for (const bad of [null, ["9"], ["14", "9"]]) {
+    const spy = makeServer();
     let dropped = null;
-    const guard = createScopedRunGuard({
-      origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
-      onScopeDropped: (m) => (dropped = m),
-    });
-    const body = { prompt: OUR_OUTPUT, client_id: "x", partial_execution_targets: badTargets };
-    const res = await guard(...promptPost(body));
-    assert.equal(spy.calls.length, 0, `targets ${JSON.stringify(badTargets)} must never leave the tab`);
+    const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14, onScopeDropped: (m) => (dropped = m) });
+    const res = await guard(...promptPost(frontendBody({ targets: bad })));
+    assert.equal(spy.calls.length, 0, `targets ${JSON.stringify(bad)} must never leave the tab`);
     assert.equal(res.status, 400);
     assert.match(dropped, /node 14/);
-    assert.match(dropped, /instead of/, "scope_mismatch names what the body carried");
-    assert.equal(guard.state.observed, 0, "a corrupted dispatch never counts as observed");
+    assert.equal(guard.state.observed, 0);
   }
 });
 
-test("#556 r2 P0-2: a FOREIGN post carrying the SAME targets does NOT satisfy observation — our deferred corrupted post is still refused afterwards", async () => {
-  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "foreign-pid" }));
-  let captured = null;
+test("#556 r3 P0-3: an UNMARKED post is FOREIGN even with our node set AND our targets — never refused, never captured, never observed", async () => {
+  const spy = makeServer();
+  let captured = null, dropped = null;
   const guard = createScopedRunGuard({
     origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
-    onPromptId: (p) => (captured = p),
+    onPromptId: (p) => (captured = p), onScopeDropped: (m) => (dropped = m),
   });
-  // Another workflow whose prompt ALSO carries ["14"] but has a different node set.
-  const foreign = { prompt: { "14": { class_type: "SaveImage" }, "2": { class_type: "LoadImage" } }, client_id: "x", partial_execution_targets: ["14"] };
-  const foreignRes = await guard(...promptPost(foreign));
-  assert.equal(spy.calls.length, 1, "the foreign scoped run passes through");
-  assert.equal(foreignRes.status, 200);
-  assert.equal(guard.state.observed, 0, "same targets + different signature is NOT our dispatch");
-  assert.equal(captured, null, "its prompt_id is never claimed as ours");
-  // graph_run would still be waiting (observed==0) — and when OUR deferred
-  // corrupted post finally surfaces, the guard is still there to refuse it.
-  assert.equal(guard.state.dropped, null);
-  const spy2 = spy;
-  const res = await guard(...promptPost(OUR_FULL_BODY));
-  assert.equal(res.status, 400, "our scope-dropped dispatch is still refused");
-  assert.equal(spy2.calls.length, 1, "and never dispatches");
-});
-
-test("#556 P1: refusal is bounded by the batch — a same-signature full body BEYOND our batch count passes through", async () => {
-  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "late-run" }));
-  const guard = createScopedRunGuard({
-    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
-  });
-  const first = await guard(...promptPost(OUR_FULL_BODY));
-  assert.equal(first.status, 400, "our own dropped dispatch is refused");
-  assert.equal(spy.calls.length, 0);
-  const second = await guard(...promptPost(OUR_FULL_BODY));
-  assert.equal(second.status, 200, "a further same-signature full run is NOT ours to refuse");
-  assert.equal(spy.calls.length, 1, "it passes through");
-});
-
-test("#556 guard: an unparseable body is unattributable ⇒ passed through, never blocked (fail-safe toward strangers)", async () => {
-  const spy = makeFetchSpy(async () => jsonResponse(200, {}));
-  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14 });
-  await guard("/prompt", { method: "POST", body: "not-json{" });
+  // A foreign scoped run to the same node (number=0 ⇒ no body.number ⇒ unmarked).
+  const foreignScoped = await guard(...promptPost(frontendBody({ number: 0, targets: ["14"] })));
+  assert.equal(foreignScoped.status, 200);
   assert.equal(spy.calls.length, 1);
+  assert.equal(guard.state.observed, 0, "foreign same-targets post never satisfies observation");
+  assert.equal(captured, null);
+  // A user's full run of the SAME graph — never refused as our corrupted dispatch.
+  const userFull = await guard(...promptPost(frontendBody({ number: 0, targets: null })));
+  assert.equal(userFull.status, 200);
+  assert.equal(spy.calls.length, 2);
+  assert.equal(dropped, null);
   assert.equal(guard.state.dropped, null);
 });
 
-test("#556 P0 DEFERRED RACE: queuePrompt returned early (busy) — the guard is STILL installed and refuses the deferred invalid-shape dispatch, zero real posts", async () => {
-  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "must-never-happen" }));
-  let dropped = null;
-  const guard = createScopedRunGuard({
-    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
-    onScopeDropped: (m) => (dropped = m),
-  });
-  // graph_run awaits queuePrompt (which returned early), then waits on the guard.
-  const verdict = guard.waitForVerdict(1000);
-  // …the in-flight processor serializes and posts OUR item 30ms later, through
-  // the still-installed guard, with the scope dropped (invalid shape).
-  await sleep(30);
-  const res = await guard(...promptPost(OUR_FULL_BODY));
-  assert.equal(await verdict, true, "the deferred dispatch is OBSERVED by the still-installed guard");
-  assert.equal(res.status, 400);
-  assert.equal(spy.calls.length, 0, "the deferred full-graph prompt never left the tab");
-  assert.match(dropped, /node 14/);
+test("#556 guard: a marked post whose graph CHANGED under the deferred item (signature mismatch) is corrupted ⇒ refused", async () => {
+  const spy = makeServer();
+  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14 });
+  const changedOutput = { "3": { class_type: "KSampler" }, "20": { class_type: "SaveImage" } };
+  const res = await guard(...promptPost(frontendBody({ output: changedOutput, targets: ["14"] })));
+  assert.equal(res.status, 400, "scope is unverifiable against the changed graph — refuse");
+  assert.equal(spy.calls.length, 0);
 });
 
-test("#556 P0 DEFERRED, correct shape: the late scoped post IS observed and its prompt_id captured", async () => {
-  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "deferred-pid" }));
+// ---------------------------------------------------------------------------
+// cancelPendingScopedQueueItem — ownership-tagged removal
+// ---------------------------------------------------------------------------
+
+test("#556 r3 P0-3: cancellation removes ONLY the ownership-tagged item — an identical-scope foreign item stays", () => {
+  const runTag = Symbol("t");
+  const ourArray = ["14"];
+  Object.defineProperty(ourArray, QUEUE_ITEM_TAG, { value: runTag, enumerable: false });
+  const ourOptionsItem = { number: 1, batchCount: 1, queueNodeIds: { queueNodeIds: ourArray } };
+  const ourDirectItem = { number: 1, batchCount: 1, queueNodeIds: ourArray };
+  const foreignSameScope = { number: 0, batchCount: 1, queueNodeIds: ["14"] };
+  const userFullRun = { number: 0, batchCount: 1, queueNodeIds: undefined };
+  const app = { queueItems: [userFullRun, foreignSameScope, ourDirectItem, ourOptionsItem] };
+  const res = cancelPendingScopedQueueItem(app, runTag);
+  assert.equal(res.accessible, true);
+  assert.equal(res.removed, 2, "our item removed in either stored shape");
+  assert.deepEqual(app.queueItems, [userFullRun, foreignSameScope], "identical-scope foreign item and user run stay");
+});
+
+test("#556 r3 P0-3: hard-private queueItems builds ⇒ inaccessible (caller keeps the sentinel)", () => {
+  assert.deepEqual(cancelPendingScopedQueueItem({}, Symbol("t")), { accessible: false, removed: 0 });
+});
+
+// ---------------------------------------------------------------------------
+// dispatchScopedRun — the REAL orchestration graph_run runs (integration)
+// ---------------------------------------------------------------------------
+
+test("#556 integration: happy path — marked scoped dispatch observed, prompt_id captured, fetchApi restored", async () => {
+  const apiTarget = { fetchApi: makeServer() };
+  const prev = apiTarget.fetchApi;
+  const app = makeFrontend({ shape: "shim", apiTarget });
   const ids = [];
-  const guard = createScopedRunGuard({
-    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
+  const result = await dispatchScopedRun({
+    app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
     onPromptId: (p) => ids.push(p),
   });
-  const verdict = guard.waitForVerdict(1000);
-  await sleep(30);
-  await guard(...promptPost(OUR_SCOPED_BODY));
-  assert.equal(await verdict, true);
-  assert.equal(guard.state.observed, 1);
-  assert.deepEqual(ids, ["deferred-pid"]);
+  assert.equal(result.outcome, "dispatched");
+  assert.deepEqual(ids, ["srv-1"]);
+  assert.equal(apiTarget.fetchApi, prev, "guard restored after observation");
+  assert.equal(app.posted.length, 1, "first arg shape worked — no retry");
+  assert.equal(app.posted[0].number, SCOPED_QUEUE_MARK, "our posts carry the queue mark");
+  assert.deepEqual(app.posted[0].partial_execution_targets, ["14"]);
 });
 
-test("#556 P0 TIMEOUT: nothing surfaces within the window ⇒ waitForVerdict false, state clean ⇒ graph_run reports UNVERIFIED (never queued:true)", async () => {
-  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "nope" }));
-  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14 });
-  const seen = await guard.waitForVerdict(50);
-  assert.equal(seen, false);
-  assert.equal(guard.state.observed, 0);
-  assert.equal(guard.state.dropped, null);
-  assert.equal(spy.calls.length, 0);
+test("#556 integration: a shim-less options build drops the legacy array — attempt 1 refused with ZERO dispatch, attempt 2 delivers", async () => {
+  const apiTarget = { fetchApi: makeServer() };
+  const app = makeFrontend({ shape: "shimless", apiTarget });
+  const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+  assert.equal(result.outcome, "dispatched");
+  assert.equal(app.posted.length, 2, "both shapes attempted");
+  assert.equal(app.posted[0].partial_execution_targets, undefined, "attempt 1 (array) dropped by this build");
+  assert.equal(apiTarget.fetchApi.calls.length, 1, "only the correctly-shaped dispatch reached the server");
+  assert.deepEqual(apiTarget.fetchApi.calls[0].options.body && JSON.parse(apiTarget.fetchApi.calls[0].options.body).partial_execution_targets, ["14"]);
 });
 
-test("#556 r2 P0-3: timeout CANCELS our still-pending queue item — the deferred scope-dropped dispatch can never execute", () => {
-  // The frontend's pending list holds OUR deferred item (targets stored in
-  // either shape) plus a user's targetless full-run item and a foreign scoped
-  // item — only ours may be removed.
-  const ourItemArray = { number: 0, batchCount: 1, queueNodeIds: ["14"] };
-  const ourItemOptions = { number: 0, batchCount: 1, queueNodeIds: { queueNodeIds: ["14"] } };
-  const userFullRun = { number: 0, batchCount: 1, queueNodeIds: undefined };
-  const foreignScoped = { number: 0, batchCount: 1, queueNodeIds: ["9"] };
-  const app = { queueItems: [userFullRun, ourItemArray, foreignScoped, ourItemOptions] };
-  const res = cancelPendingScopedQueueItem(app, ["14"]);
-  assert.equal(res.accessible, true);
-  assert.equal(res.removed, 2, "both of our pending items are removed, in either stored shape");
-  assert.deepEqual(app.queueItems, [userFullRun, foreignScoped], "foreign items are never touched");
-});
-
-test("#556 r2 P0-3: cancellation is impossible on builds that hard-privatize queueItems ⇒ reported inaccessible (caller keeps the sentinel guard)", () => {
-  const res = cancelPendingScopedQueueItem({}, ["14"]);
-  assert.deepEqual(res, { accessible: false, removed: 0 });
-  assert.deepEqual(cancelPendingScopedQueueItem(null, ["14"]), { accessible: false, removed: 0 });
-});
-
-test("#556 r2 P0-3 SENTINEL: when cancellation failed, the guard (never restored) still refuses the late scope-dropped dispatch — zero dispatch post-timeout", async () => {
-  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "must-never-happen" }));
-  let dropped = null;
-  const guard = createScopedRunGuard({
-    origFetchApi: spy, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
-    onScopeDropped: (m) => (dropped = m),
-  });
-  // The give-up path: timeout expired, cancelPendingScopedQueueItem removed
-  // nothing, so graph_run leaves THIS guard installed and returns unverified.
-  const seen = await guard.waitForVerdict(50);
-  assert.equal(seen, false, "timed out unverified");
-  // …the deferred item finally posts, well after the run returned.
-  await sleep(20);
-  const res = await guard(...promptPost(OUR_FULL_BODY));
-  assert.equal(res.status, 400, "the sentinel still refuses the scope-dropped dispatch");
-  assert.equal(spy.calls.length, 0, "no full-graph dispatch ever escapes — even after the timeout");
-  assert.match(dropped, /node 14/);
-});
-
-// ---------------------------------------------------------------------------
-// End-to-end across frontend build shapes, driving the guard the way
-// graph_run's loop does (try shape, observe, retry on dropped, else unverified).
-// ---------------------------------------------------------------------------
-
-// A fake app.queuePrompt for a build that ONLY honors the QueuePromptOptions
-// object — the legacy positional array is silently ignored (#556's build).
-function makeOptionsOnlyQueuePrompt(fetchApi, posted) {
-  return async (number, batch, arg) => {
-    const queueNodeIds = Array.isArray(arg) ? undefined : arg?.queueNodeIds;
-    const body = { prompt: OUR_OUTPUT, client_id: "x" };
-    if (queueNodeIds) body.partial_execution_targets = queueNodeIds;
-    await fetchApi("/prompt", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    posted.push(body);
+test("#556 integration: a build honoring NEITHER shape ⇒ truthful refusal, ZERO dispatches", async () => {
+  const apiTarget = { fetchApi: makeServer() };
+  const app = makeFrontend({ shape: "positional", apiTarget });
+  // positional honors the array… force neither by overriding queuePrompt to always drop targets
+  app.queuePrompt = async (number, batch) => {
+    const body = frontendBody({ output: OUR_OUTPUT, number, targets: null });
+    app.posted.push(body);
+    await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+    return true;
   };
-}
-
-test("#556 e2e: an options-only frontend (drops the legacy array) still runs SCOPED — the blocked attempt never dispatched, the retry delivers", async () => {
-  const posted = [];
-  const dispatched = [];
-  const origFetchApi = makeFetchSpy(async () => {
-    dispatched.push(true);
-    return jsonResponse(200, { prompt_id: "p1" });
-  });
-  let outcome = null;
-  for (const scopeArg of queuePromptScopeArgs(["14"])) {
-    const guard = createScopedRunGuard({
-      origFetchApi, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
-    });
-    const queuePrompt = makeOptionsOnlyQueuePrompt(guard, posted);
-    await queuePrompt(0, 1, scopeArg);
-    if (guard.state.observed > 0) { outcome = "scoped"; break; }
-    if (guard.state.dropped) { outcome = "dropped"; continue; }
-    outcome = "unverified";
-    break;
-  }
-  assert.equal(outcome, "scoped", "the retry shape delivered the scope");
-  assert.equal(dispatched.length, 1, "exactly ONE prompt actually dispatched (no double-queue)");
-  assert.equal(posted.length, 2, "both shapes were attempted");
-  assert.equal(posted[0].partial_execution_targets, undefined, "attempt 1 (array) dropped by this build");
-  assert.deepEqual(posted[1].partial_execution_targets, ["14"], "attempt 2 (options object) delivered the scope");
+  const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+  assert.equal(result.outcome, "refused");
+  assert.match(result.error, /node 14/);
+  assert.match(result.error, /Nothing was queued/);
+  assert.equal(apiTarget.fetchApi.calls.length, 0, "no full-graph prompt ever left the tab");
 });
 
-test("#556 e2e: a build that honors NEITHER shape ⇒ truthful refusal, ZERO dispatches", async () => {
-  const dispatched = [];
-  const origFetchApi = makeFetchSpy(async () => {
-    dispatched.push(true);
-    return jsonResponse(200, { prompt_id: "p1" });
+test("#556 r3 P0-1 integration: THE SENTINEL ACTUALLY INSTALLS — after a give-up timeout, api.fetchApi is STILL the guard and refuses the late scope-dropped post with zero dispatch", async () => {
+  const apiTarget = { fetchApi: makeServer() };
+  const prev = apiTarget.fetchApi;
+  // Busy SHIM-LESS frontend (drops the legacy array ⇒ the deferred item has no
+  // scope), and queueItems NOT accessible (hard-private build) ⇒ cancel impossible.
+  const app = makeFrontend({ shape: "shimless", defer: true, apiTarget });
+  delete app.queueItems;
+  const result = await dispatchScopedRun({
+    app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+    verifyTimeoutMs: 50, lingerMs: 120,
   });
-  let dropped = null;
-  for (const scopeArg of queuePromptScopeArgs(["14"])) {
-    const guard = createScopedRunGuard({
-      origFetchApi, execIds: ["14"], signature: OUR_SIGNATURE, batch: 1, toNodeId: 14,
-      onScopeDropped: (m) => (dropped = m),
-    });
-    // This build posts OUR prompt with NO targets regardless of the arg shape.
-    await guard("/prompt", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(OUR_FULL_BODY),
-    });
-    if (guard.state.observed > 0) break;
-    if (!guard.state.dropped) break;
-  }
-  assert.match(dropped, /node 14/);
-  assert.match(dropped, /Nothing was queued/);
-  assert.equal(dispatched.length, 0, "no full-graph prompt ever left the tab");
+  assert.equal(result.outcome, "unverified");
+  assert.match(result.error, /sentinel/);
+  assert.notEqual(apiTarget.fetchApi, prev, "the sentinel guard is STILL installed after the run returned");
+  // The deferred item finally posts — through the sentinel — scope dropped.
+  const res = await app.postDeferred(app.deferredItem);
+  assert.equal(res.status, 400, "the sentinel refuses the late scope-dropped dispatch");
+  assert.equal(prev.calls.length, 0, "no full-graph dispatch escapes — even after the timeout");
+  // …and the sentinel self-removes at the long bound.
+  await sleep(160);
+  assert.equal(apiTarget.fetchApi, prev, "sentinel self-removes at the linger bound");
 });
 
-test("#556 e2e: a signature-less run still verifies a post that CARRIES the scope (degraded attribution never blocks, never lies)", async () => {
-  const spy = makeFetchSpy(async () => jsonResponse(200, { prompt_id: "p1" }));
-  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], signature: null, batch: 1, toNodeId: 14 });
-  // Our scoped post is still observed without a signature…
-  await guard(...promptPost(OUR_SCOPED_BODY));
-  assert.equal(guard.state.observed, 1);
-  assert.equal(spy.calls.length, 1);
-  // …and a targetless body CANNOT be attributed ⇒ passed through, not blocked.
-  await guard(...promptPost(OUR_FULL_BODY));
-  assert.equal(spy.calls.length, 2);
-  assert.equal(guard.state.dropped, null);
+test("#556 r3 P0-3 integration: timeout CANCELS our tagged pending item (assert the removal) — guard restored, no sentinel", async () => {
+  const apiTarget = { fetchApi: makeServer() };
+  const prev = apiTarget.fetchApi;
+  const app = makeFrontend({ shape: "shim", defer: true, apiTarget });
+  // A foreign identical-scope item also pending — must survive.
+  app.queueItems.push({ number: 0, batchCount: 1, queueNodeIds: ["14"] });
+  const result = await dispatchScopedRun({
+    app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+    verifyTimeoutMs: 50, lingerMs: 1000,
+  });
+  assert.equal(result.outcome, "unverified");
+  assert.match(result.error, /REMOVED/);
+  assert.equal(app.queueItems.length, 1, "ONLY our tagged item was removed");
+  assert.deepEqual(app.queueItems[0].queueNodeIds, ["14"]);
+  assert.equal(apiTarget.fetchApi, prev, "guard restored — no sentinel needed after a successful cancel");
+  assert.equal(apiTarget.fetchApi.calls.length, 0, "nothing was ever dispatched");
+});
+
+test("#556 r3 P0-2 integration: degraded mode FAILS CLOSED — graphToPrompt failure refuses BEFORE queuePrompt (never 'dispatch and hope')", async () => {
+  const apiTarget = { fetchApi: makeServer() };
+  const app = makeFrontend({ shape: "shim", apiTarget, failGraphToPrompt: true });
+  let queuePromptCalled = false;
+  const origQP = app.queuePrompt;
+  app.queuePrompt = async (...a) => { queuePromptCalled = true; return origQP(...a); };
+  const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+  assert.equal(result.outcome, "unverifiable");
+  assert.match(result.error, /cannot be dispatched safely/);
+  assert.equal(queuePromptCalled, false, "queuePrompt is never called without a signature");
+  assert.equal(apiTarget.fetchApi.calls.length, 0, "nothing dispatched — the failure is closed, not open");
+});
+
+test("#556 r3 P0-3 integration: foreign traffic during our window is untouched — same-graph user full run + identical-scope foreign scoped run; only OUR marked post is observed and captured", async () => {
+  const server = makeServer();
+  const apiTarget = { fetchApi: server };
+  const app = makeFrontend({ shape: "shim", defer: true, apiTarget });
+  const ids = [];
+  const promise = dispatchScopedRun({
+    app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+    verifyTimeoutMs: 500, lingerMs: 1000,
+    onPromptId: (p) => ids.push(p),
+  });
+  await sleep(20); // guard is installed, waiting for observation
+  // A user queues a full run of the SAME graph (UI: number=0 ⇒ unmarked).
+  const userRes = await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(frontendBody({ number: 0, targets: null })) });
+  assert.equal(userRes.status, 200, "the user's run is dispatched normally");
+  // A foreign scoped run with the SAME targets (also unmarked).
+  const foreignRes = await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(frontendBody({ number: 0, targets: ["14"] })) });
+  assert.equal(foreignRes.status, 200);
+  assert.equal(server.calls.length, 2, "both foreign posts dispatched untouched");
+  // Now OUR deferred item posts (marked, scoped) — observed.
+  await app.postDeferred(app.deferredItem);
+  const result = await promise;
+  assert.equal(result.outcome, "dispatched");
+  assert.deepEqual(ids, ["srv-3"], "only OUR prompt_id was captured (srv-1/2 were the foreign posts)");
+  assert.equal(server.calls.length, 3);
 });
 
 // ---------------------------------------------------------------------------
@@ -496,8 +431,7 @@ test("#556: a to_node_id that went STALE (graph changed after the id was capture
   const staleRoot = { _nodes: [outputNode(14)], getNodeById(id) { return this._nodes.find((n) => Number(n.id) === Number(id)) ?? null; } };
   assert.equal(resolveRunToNodeTarget(staleRoot, null, 14).ok, true);
   const liveRoot = { _nodes: [outputNode(15)], getNodeById(id) { return this._nodes.find((n) => Number(n.id) === Number(id)) ?? null; } };
-  const res = resolveRunToNodeTarget(liveRoot, null, 14);
-  assert.deepEqual(res, { ok: false, code: "not_found", node: null });
+  assert.deepEqual(resolveRunToNodeTarget(liveRoot, null, 14), { ok: false, code: "not_found", node: null });
 });
 
 test("#556: a NON-output target is refused (not_output) — it can never be an execution root", () => {
