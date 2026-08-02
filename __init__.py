@@ -260,15 +260,10 @@ def _provider_auth(provider):
         # without the CLI there is nothing to be signed in to.
         return None if _antigravity_installed() else False
     if provider == "pi":
-        # pi keeps provider credentials in ~/.pi/agent/auth.json (API keys +
-        # `/login` subscriptions) or provider env vars. A present auth.json is a
-        # definite login; otherwise report unknown when the CLI is installed (pi
-        # may be configured via env we can't cheaply see — the orchestrator's
-        # readiness/connect verifies), and not-signed-in when it isn't.
-        if not _pi_installed():
-            return False
-        auth_json = os.path.join(home, ".pi", "agent", "auth.json")
-        return True if os.path.isfile(auth_json) else None
+        # Do not infer a credential from auth.json: it can be empty, malformed,
+        # stale, or name a provider that cannot run. The MCP's pi probe is the
+        # sole positive readiness authority; this local check is only advisory.
+        return None if _pi_installed() else False
     if provider == "ollama":
         # No login concept — a local daemon. Installed = usable; a stopped daemon
         # surfaces at connect time (the orchestrator's model probe).
@@ -281,7 +276,8 @@ def _provider_state(provider):
     PATH AND a login exists; `cli`/`auth` are reported separately so the panel
     can tell 'install the CLI' apart from 'sign in'; `auth` is null when unknown
     (macOS Keychain). Unknown-with-cli normally counts as ready, except pi: its
-    multi-provider credential sources need the orchestrator's authoritative probe."""
+    multi-provider credential sources are ready only after the orchestrator's
+    authoritative probe."""
     if provider == "ollama":
         cli = _ollama_installed()
     elif provider == "antigravity":
@@ -291,12 +287,9 @@ def _provider_state(provider):
     else:
         cli = _provider_cli(provider)
     auth = _provider_auth(provider)
-    # Unlike Keychain-backed subscriptions, pi's local `auth is None` means no
-    # credential source was positively observed. Do not preempt the MCP's stricter
-    # auth.json/models.json/env validation with a green panel state; a later bridge
-    # readiness frame remains authoritative. A present local auth record can still
-    # provide an optimistic ready state until that frame arrives.
-    ready = bool(cli and (auth is True if provider == "pi" else auth is not False))
+    # Pi's local state intentionally has no positive-ready path. Its bridge frame
+    # applies the MCP's provider-aware credential verdict after connection.
+    ready = False if provider == "pi" else bool(cli and auth is not False)
     return {"cli": cli, "auth": auth, "ready": ready}
 
 

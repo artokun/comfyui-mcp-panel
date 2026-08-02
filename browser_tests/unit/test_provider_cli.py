@@ -127,28 +127,28 @@ class ProviderCliGuiPath(unittest.TestCase):
             else:
                 mod.environ["COMFYUI_MCP_PI_PATH"] = old_override
 
-    def test_pi_requires_positive_auth_before_reporting_ready(self):
-        # #491: a found pi binary with no locally observed credential must stay
-        # unready until the MCP's authoritative provider probe arrives. This is a
-        # state-policy test, not a duplicate parser for pi's auth/models files.
+    def test_pi_auth_json_presence_never_sets_local_ready(self):
+        # #491: auth.json may be empty, malformed, or stale. The panel does not
+        # parse it or treat its mere presence as a credential; the MCP is the only
+        # positive readiness authority after the bridge connects.
         old_pi_installed = mod._pi_installed
-        old_provider_auth = mod._provider_auth
+        old_expanduser = mod.os.path.expanduser
         mod._pi_installed = lambda: True
         try:
-            mod._provider_auth = lambda provider: None
-            self.assertEqual(
-                mod._provider_state("pi"),
-                {"cli": True, "auth": None, "ready": False},
-            )
-            # Preserve the positive path for an observed local auth record.
-            mod._provider_auth = lambda provider: True
-            self.assertEqual(
-                mod._provider_state("pi"),
-                {"cli": True, "auth": True, "ready": True},
-            )
+            with tempfile.TemporaryDirectory(prefix="cmcp-pi-home-") as home:
+                mod.os.path.expanduser = lambda p: home if p == "~" else old_expanduser(p)
+                auth_json = os.path.join(home, ".pi", "agent", "auth.json")
+                os.makedirs(os.path.dirname(auth_json), exist_ok=True)
+                for contents in ("", "{ malformed"):
+                    with open(auth_json, "w", encoding="utf-8") as fh:
+                        fh.write(contents)
+                    self.assertEqual(
+                        mod._provider_state("pi"),
+                        {"cli": True, "auth": None, "ready": False},
+                    )
         finally:
             mod._pi_installed = old_pi_installed
-            mod._provider_auth = old_provider_auth
+            mod.os.path.expanduser = old_expanduser
 
     def test_provider_state_ready_when_cli_in_fallback_and_auth_present(self):
         # End-to-end: cli found via fallback + ~/.codex/auth.json present => ready.
