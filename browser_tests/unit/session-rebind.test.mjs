@@ -268,6 +268,14 @@ test("#570 P0c: hello ALWAYS advertises enforces_workflow_stamp so the orchestra
   );
 });
 
+test("#709: hello carries the browser-tab identity separately from workflow routing", () => {
+  const frame = buildHelloPayload({ tabId: "wf:shared.json", tabSessionId: "browser-tab-a" });
+  assert.equal(frame.tab_id, "wf:shared.json");
+  assert.equal(frame.tab_session_id, "browser-tab-a");
+  assert.equal("tab_session_id" in buildHelloPayload({ tabId: "wf:shared.json" }), false);
+  assert.equal("tab_session_id" in buildHelloPayload({ tabId: "wf:shared.json", tabSessionId: "   " }), false);
+});
+
 test("#570: the durable per-instance workflow uuid rides the hello when present", () => {
   // Lets the orchestrator key an UNSAVED workflow's resume on a globally-unique id
   // that survives the tmp:<uuid> tab-id churn — so a same-title sibling can't

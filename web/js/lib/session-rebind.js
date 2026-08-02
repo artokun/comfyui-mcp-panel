@@ -295,6 +295,7 @@ export function buildHelloPayload({
   blind = false,
   comfyuiUrl,
   comfyuiPath,
+  tabSessionId,
   resume,
   workflowUuid,
   lostReplies,
@@ -319,6 +320,15 @@ export function buildHelloPayload({
     // leaks the user's own workflow into their own workflow (self-attack). No attestation.
     enforces_workflow_stamp: true,
   };
+  // #709 — a browser-tab-scoped identity, deliberately separate from the
+  // workflow routing id. `tab_id` is normally a workflow path and can therefore
+  // recur in another browser tab. The orchestrator snapshots this before a
+  // ComfyUI restart and only certifies readiness when the SAME browser tab
+  // reconnects afterwards. It is an honest-local correctness guard, not an
+  // attestation; old panels omit it and are conservatively not restart-ready.
+  if (typeof tabSessionId === "string" && tabSessionId.trim()) {
+    frame.tab_session_id = tabSessionId.trim();
+  }
   if (comfyuiUrl) frame.comfyui_url = comfyuiUrl;
   if (typeof comfyuiPath === "string" && comfyuiPath.trim()) {
     frame.comfyui_path = comfyuiPath.trim();

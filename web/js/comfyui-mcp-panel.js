@@ -271,6 +271,7 @@ import {
   resolveLoadGraphArgs,
   buildHelloPayload,
 } from "./lib/session-rebind.js";
+import { createRestartTabIdentity, sendBridgeHello } from "./lib/restart-tab-identity.js";
 
 let app = null;
 let api = null;
@@ -1190,6 +1191,8 @@ function saveBridgeUrl(url) {
 // reloads, so each ComfyUI tab keeps a stable identity on the bridge while
 // two tabs never collide. (localStorage would be shared across tabs.)
 const TAB_ID_KEY = "comfyui-mcp.panel.tabSessionId";
+let _memoryTabId;
+const memoryTabId = () => (_memoryTabId ??= crypto.randomUUID());
 function getTabId() {
   try {
     let id = window.sessionStorage.getItem(TAB_ID_KEY);
@@ -1199,9 +1202,19 @@ function getTabId() {
     }
     return id;
   } catch {
-    return crypto.randomUUID();
+    // Storage can be disabled in a browser privacy mode. Never mint a new
+    // value on each hello: preserve a stable page-lifetime routing fallback.
+    return memoryTabId();
   }
 }
+// sessionStorage is persistence, not proof: a duplicated browser tab can copy
+// it. This resolver requires an origin-wide exclusive Web Lock before hello and
+// omits its value if it cannot establish per-browser-tab uniqueness.
+const restartTabIdentity = createRestartTabIdentity({
+  storage: window.sessionStorage,
+  locks: window.navigator?.locks,
+  randomUUID: () => crypto.randomUUID(),
+});
 
 // --- Per-workflow agent identity -----------------------------------------
 // Each ComfyUI workflow gets its OWN agent session. Saved workflows key by file
@@ -11421,7 +11434,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
 
   function sendHello() {
     if (!sock || sock.readyState !== WebSocket.OPEN) return;
-    try {
+    const target = sock;
+    void sendBridgeHello({
+      socket: target,
+      isCurrent: () => sock === target && target.readyState === WebSocket.OPEN,
+      resolveTabIdentity: () => restartTabIdentity.resolve(),
+      makePayload: (tabSessionId) => {
       // Carry the last session id so the orchestrator resumes the agent's
       // memory after a panel reload (only honored before the tab's agent spawns).
       const resume = getResume?.();
@@ -11431,9 +11449,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // Auto-target: the URL the browser was served from (or the manual override),
       // so a bare `--panel-orchestrator` points the agent at whatever ComfyUI is open.
       const comfyuiUrl = comfyuiUrlForAgent();
-      sock.send(
-        JSON.stringify(
-          buildHelloPayload({
+        return buildHelloPayload({
             tabId: workflowTabId(),
             title: getWorkflowTitle(),
             // Our build version, so the orchestrator can auto-stamp it into the
@@ -11447,6 +11463,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // #296/#291 — advertise the embedded local ComfyUI path so the
             // orchestrator registers panel_* tools + local panel management.
             comfyuiPath: localComfyuiPathForAgent(),
+            // #709 — stable for this browser tab across a page reload and
+            // distinct from workflowTabId(), whose saved-workflow path can be
+            // reused by another browser tab.
+            tabSessionId,
             resume,
             // #570 — the durable per-instance workflow uuid (the SAME identity that
             // keys the durable chat transcript). Unlike workflowTabId()'s ephemeral
@@ -11460,12 +11480,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // and can contradict the epoch-filtered replay (the #694 divergence).
             // The summaries ride the post-handshake `lost_replies` frame sent from
             // replayLostReplies, computed with the SAME epoch the replay uses.
-          }),
-        ),
-      );
-    } catch {
+        });
+      },
+    }).catch(() => {
       // Reconnect path will retry.
-    }
+    });
   }
 
   // When the workflow title changes (rename / open a different file / progress
