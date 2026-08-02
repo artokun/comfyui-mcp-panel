@@ -10814,7 +10814,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         const fingerprint = commandFingerprint(msg);
         let priorRidReply = commandRidLedger.get(msg.rid, fingerprint);
         let retryOfHit = false;
-        if (priorRidReply === undefined && typeof msg.retry_of === "string") {
+        // Validate retry_of even when this retry rid is already remembered. A
+        // token may have failed open while its original was evicted, then the
+        // delayed original can re-enter the ledger before this retry is
+        // duplicated. Replaying the retry's own old reply must not bypass the
+        // newly-known cross-workflow mismatch.
+        if (typeof msg.retry_of === "string") {
           const retryLookup = commandRidLedger.lookupRetry(msg.retry_of, fingerprint);
           if (retryLookup.status === "mismatch") {
             if (!isActive()) return; // superseded socket — ignore its late frames
@@ -10831,7 +10836,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             }
             return;
           }
-          if (retryLookup.status === "match") {
+          if (priorRidReply === undefined && retryLookup.status === "match") {
             priorRidReply = retryLookup.reply;
             retryOfHit = true;
           }

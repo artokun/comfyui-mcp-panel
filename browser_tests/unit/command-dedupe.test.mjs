@@ -56,7 +56,7 @@ function makeRetryDispatch(ledger, executor) {
     const fingerprint = commandFingerprint(msg);
     let prior = ledger.get(msg.rid, fingerprint);
     let retryOfHit = false;
-    if (prior === undefined && typeof msg.retry_of === "string") {
+    if (typeof msg.retry_of === "string") {
       const retryLookup = ledger.lookupRetry(msg.retry_of, fingerprint);
       if (retryLookup.status === "mismatch") {
         return {
@@ -68,7 +68,7 @@ function makeRetryDispatch(ledger, executor) {
           executed: false,
         };
       }
-      if (retryLookup.status === "match") {
+      if (prior === undefined && retryLookup.status === "match") {
         prior = retryLookup.reply;
         retryOfHit = true;
       }
@@ -393,6 +393,37 @@ test("a retained retry_of with another workflow fingerprint is rejected before i
   assert.deepEqual(executedWorkflows, ["wfA"], "workflow B never receives r2");
 });
 
+test("a later-retained original rejects a duplicate retry that first failed open (#543 P1)", async () => {
+  const ledger = createCommandDedupeLedger(2);
+  const executions = [];
+  const deliver = makeRetryDispatch(ledger, async (msg) => {
+    executions.push(`${msg.rid}:${msg.workflow_uuid}`);
+    return { appliedTo: msg.workflow_uuid };
+  });
+  const originalA = { rid: "r1", cmd: "graph_set_title", title: "A", workflow_uuid: "wfA" };
+  const retryB = { rid: "r2", retry_of: "r1", cmd: "graph_set_title", title: "B", workflow_uuid: "wfB" };
+
+  // Evict r1/A. r2/B can then fail open, as designed, because r1 is absent.
+  await deliver(originalA);
+  await deliver({ rid: "fill-1", cmd: "graph_set_title", title: "fill", workflow_uuid: "wfA" });
+  await deliver({ rid: "fill-2", cmd: "graph_set_title", title: "fill", workflow_uuid: "wfA" });
+  const firstRetry = await deliver(retryB);
+  assert.equal(firstRetry.executed, true, "the evicted retry token fails open once");
+
+  // A delayed delivery of r1/A is now retained again while r2/B remains in the
+  // ledger. The duplicate r2/B must validate retry_of before replaying its own
+  // prior reply, otherwise it hides the now-known cross-workflow mismatch.
+  await deliver(originalA);
+  const beforeDuplicate = [...executions];
+  const duplicateRetry = await deliver(retryB);
+
+  assert.equal(duplicateRetry.executed, false);
+  assert.equal(duplicateRetry.reply.ok, false);
+  assert.match(duplicateRetry.reply.error, /retry_of.*different command or workflow/i);
+  assert.deepEqual(executions, beforeDuplicate, "the duplicate r2/B neither replays success nor executes again");
+  assert.equal(executions.filter((entry) => entry === "r2:wfB").length, 1, "workflow B ran only during the permitted fail-open delivery");
+});
+
 test("a genuinely FRESH command with identical args after a settled one EXECUTES again (#694)", async () => {
   const ledger = createCommandDedupeLedger();
   let applied = 0;
@@ -424,7 +455,7 @@ test("#694 wiring: the panel handler falls back to retry_of and REWRITES the rid
   // falling through to begin + execute.
   const fpAt = src.indexOf("const fingerprint = commandFingerprint(msg);");
   assert.notEqual(fpAt, -1, "the command handler must fingerprint the frame");
-  const block = src.slice(fpAt, fpAt + 2400);
+  const block = src.slice(fpAt, fpAt + 3600);
   assert.match(
     block,
     /let priorRidReply = commandRidLedger\.get\(msg\.rid, fingerprint\);/,
@@ -449,6 +480,8 @@ test("#694 wiring: the panel handler falls back to retry_of and REWRITES the rid
   // begin() must still key the retry's OWN rid when the token was unknown/evicted (fail-open).
   assert.match(block, /commandRidLedger\.begin\(msg\.rid, fingerprint\);/);
   const rejectAt = block.indexOf('retryLookup.status === "mismatch"');
+  const ownReplyAt = block.indexOf("if (priorRidReply !== undefined)");
   const beginAt = block.indexOf("commandRidLedger.begin(msg.rid, fingerprint)");
+  assert.ok(rejectAt !== -1 && ownReplyAt !== -1 && rejectAt < ownReplyAt, "mismatched retries return before their own-rid reply can replay");
   assert.ok(rejectAt !== -1 && beginAt !== -1 && rejectAt < beginAt, "mismatched retries return before begin + execute");
 });
