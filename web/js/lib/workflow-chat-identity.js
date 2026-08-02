@@ -59,20 +59,20 @@ export function sameWorkflowObject(a, b) {
  *  the same path is a NEW workflow (r3 P0), while a swapped successor is the
  *  same tab. A proxy/raw form of the SAME object is no swap at all.
  *
- *  CONTINUITY (r4/r5/r8 P0): "whatever is active after the awaited save" is not
- *  enough — a user/reconnect tab switch DURING the await lands on a DISTINCT
+ *  CONTINUITY (r4/r5/r8/r10 P0): "whatever is active after the awaited save" is
+ *  not enough — a user/reconnect tab switch DURING the await lands on a DISTINCT
  *  workflow, and seeding it with the pre-save uuid would align that foreign tab
  *  with the old root tag, bypassing the #349 wrong-canvas fence. The carry
  *  therefore requires the predecessor to be GONE from the open tabs (a genuine
  *  swap removes it; a switch keeps it open) AND continuity threaded from the
- *  save's own replacement EVENT: the post-save active object must be the
- *  service's current record for the file THIS save wrote. STATIC evidence is
- *  deliberately excluded: tab-slot occupancy can seat a foreign tab in the
- *  predecessor's old slot (r5), and a lagging tracker state carrying the
- *  pre-save uuid can be a closed/reopened tab's residue (r8) — neither proves
- *  succession. A successor the event thread can't prove fails SAFE (no carry);
- *  the lazy owner-not-open inheritance in workflowStableUuid heals the genuine
- *  case on next resolve. Unknown predecessor state defaults to still-open
+ *  save's own replacement EVENT: the post-save active object must be the record
+ *  the save API itself PRODUCED. STATIC evidence is deliberately excluded:
+ *  tab-slot occupancy can seat a foreign tab in the predecessor's old slot
+ *  (r5), a lagging tracker state carrying the pre-save uuid can be residue
+ *  (r8), and path occupancy is satisfied by any close→reopen of the same file —
+ *  which is a NEW identity, not a successor (r10). A successor the event thread
+ *  can't prove fails SAFE (no carry); the lazy backstop / proven repaint heals
+ *  the genuine case afterward. Unknown predecessor state defaults to still-open
  *  (fail-safe: no carry). */
 export function shouldCarryIdentityAcrossSaveSwap({
   preWf,
@@ -80,7 +80,7 @@ export function shouldCarryIdentityAcrossSaveSwap({
   savedAs = false,
   preWfStillOpen = true,
   postWfHasConflictingEstablishedIdentity = false,
-  postWfIsSaveTargetRecord = false,
+  postWfIsSaveProducedRecord = false,
 } = {}) {
   if (savedAs) return false;
   if (!preWf || !postWf || typeof postWf !== "object") return false;
@@ -91,7 +91,7 @@ export function shouldCarryIdentityAcrossSaveSwap({
   // identity and poison the owner map (the r6 stale-lineage bypass, via
   // registration this time). Fail closed; the proven-repaint remedy heals.
   if (postWfHasConflictingEstablishedIdentity) return false;
-  return postWfIsSaveTargetRecord === true;
+  return postWfIsSaveProducedRecord === true;
 }
 
 /** Return true when an embedded UUID belongs to a different workflow file.
@@ -172,25 +172,26 @@ export function shouldForkEmbeddedUuidForLiveOwner({
   return successionProven !== true;
 }
 
-/** #557 r9 — POSITIVE succession evidence for inheriting a CLOSED owner's
+/** #557 r9/r10 — POSITIVE succession evidence for inheriting a CLOSED owner's
  *  embedded uuid. "The owner is gone" alone does not make this object the
  *  successor — a different-path COPY of the file qualifies just as well, and
  *  inheriting would re-key the uuid's owner record to the copy, letting stale
  *  uuid-scoped commands for the old workflow pass the command fence against it
- *  (r9 P0). Evidence, strongest first:
+ *  (r9 P0). Evidence:
  *   1. the file's OWN recorded workflow_path ties the uuid to THIS object's file;
- *   2. the canonical path alias ties THIS object's path to the uuid;
- *   3. the closed owner's unique on-disk file IS this object's file (same
- *      lineage — the save-swap / reload successor). An UNSAVED owner has no
- *      unique path (#186), so it can never serve here.
- *  Absent ALL of these — notably a file carrying only workflow_uuid, saved from
- *  an unsaved tab whose embed omitted workflow_path — fail toward FORKING. */
+ *   2. the canonical path alias ties THIS object's path to the uuid.
+ *  The owner's file MATCHING this object's path is deliberately NOT evidence
+ *  (r10 P0): a closed→reopened object at the same path is a NEW identity, not a
+ *  successor — the resume heal for that case belongs to the
+ *  UNREGISTERED-embedded path (no owner record), never to registered-owner
+ *  inheritance. Absent both layers — notably a file carrying only
+ *  workflow_uuid, saved from an unsaved tab whose embed omitted workflow_path —
+ *  fail toward FORKING. */
 export function hasEmbeddedUuidSuccessionEvidence({
   embeddedUuid,
   embeddedPath,
   currentPath,
   pathAlias,
-  embeddedOwner,
 } = {}) {
   if (
     embeddedPath &&
@@ -200,11 +201,6 @@ export function hasEmbeddedUuidSuccessionEvidence({
     return true;
   }
   if (typeof pathAlias === "string" && pathAlias && pathAlias === embeddedUuid) return true;
-  const ownerPath =
-    embeddedOwner?.isPersisted === true && typeof embeddedOwner?.path === "string" && embeddedOwner.path
-      ? embeddedOwner.path
-      : null;
-  if (ownerPath && currentPath && ownerPath === currentPath) return true;
   return false;
 }
 

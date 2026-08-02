@@ -162,6 +162,51 @@ test('save-in-place (same name) overwrites the same file, no copy', async () => 
   assert.equal(saved, 'Foo')
 })
 
+test('r10: an in-place save threads the save API\'s returned record into details.savedRecord', async () => {
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeService({ files: [active.path], active })
+  // A frontend whose saveWorkflow re-registers and RETURNS the successor record.
+  const produced = { isPersisted: true, path: 'workflows/Foo.json', changeTracker: {} }
+  const origSave = svc.saveWorkflow.bind(svc)
+  svc.saveWorkflow = async (wf) => {
+    await origSave(wf)
+    return produced
+  }
+
+  const details = {}
+  await saveActiveWorkflow(svc, 'Foo', { details })
+
+  assert.equal(
+    details.savedRecord,
+    produced,
+    'the save API\'s own produced record is threaded through details (the r10 succession event)',
+  )
+})
+
+test('r10: a save API that returns nothing useful leaves details.savedRecord unset (fail safe)', async () => {
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeService({ files: [active.path], active }) // its saveWorkflow returns undefined
+  const details = {}
+  await saveActiveWorkflow(svc, 'Foo', { details })
+  assert.equal(
+    details.savedRecord,
+    undefined,
+    'no produced record ⇒ no thread ⇒ the identity carry must fail safe (no carry)',
+  )
+})
+
 test('#442 in-place save of a DRIFTED tab whose disk STILL matches its baseline: forces overwrite, no 409', async () => {
   const baseline = JSON.stringify({ nodes: [] })
   const active = {

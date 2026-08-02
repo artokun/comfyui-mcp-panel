@@ -3312,18 +3312,19 @@ async function programmaticSave(name) {
     expect: expectWf, // #330: refuse if the user switched tabs during our pre-save HEAD
   });
   const outcome = describeSaveOutcome(details);
-  // #557 r3/r4/r5/r7/r8 — thread the identity across the swap ONLY with
+  // #557 r3/r4/r5/r7/r8/r10 — thread the identity across the swap ONLY with
   // CONTINUITY PROVEN FROM THE SAVE'S OWN REPLACEMENT EVENT, verified at the
   // seed point (postWf is read from the service HERE, after the awaited save):
   // the predecessor must be GONE from the open tabs — a user/reconnect tab
   // switch during the await keeps it open and must abort the carry entirely —
-  // and the post-save ACTIVE object must be the service's current record for
-  // the file THIS save wrote (details.targetPath, the lib's authoritative
-  // record of what was written). STATIC evidence is never accepted: tab-slot
-  // occupancy can seat a foreign tab in the predecessor's old slot (r5), and a
-  // lagging tracker state carrying the pre-save uuid can be a closed/reopened
-  // tab's residue (r8). A successor the event thread can't prove fails SAFE
-  // (no carry); the lazy owner-not-open inheritance heals it on next resolve.
+  // and the post-save ACTIVE object must be the record the save API itself
+  // PRODUCED (details.savedRecord, threaded by the save lib). STATIC evidence
+  // is never accepted: tab-slot occupancy can seat a foreign tab in the
+  // predecessor's old slot (r5), a lagging tracker state carrying the pre-save
+  // uuid can be residue (r8), and path occupancy is satisfied by any
+  // close→reopen of the same file — which is a NEW identity, not a successor
+  // (r10). A successor the event thread can't prove fails SAFE (no carry); the
+  // lazy backstop / proven repaint heals the genuine case afterward.
   const postSwapWf = svc?.activeWorkflow;
   if (preSwapUuid) {
     const openList = svc?.openWorkflows;
@@ -3335,16 +3336,9 @@ async function programmaticSave(name) {
     const postWfHasConflictingEstablishedIdentity = Boolean(
       postSwapWf && _workflowObjectUuids.get(postSwapWf) && _workflowObjectUuids.get(postSwapWf) !== preSwapUuid
     );
-    // r8 P0 — ask the SERVICE which record now owns the file the save wrote,
-    // and require the post-save active object to BE that record.
-    const saveTargetPath =
-      typeof details?.targetPath === "string" && details.targetPath ? details.targetPath : null;
-    const targetRecord = saveTargetPath
-      ? ((typeof svc?.getWorkflowByPath === "function" && svc.getWorkflowByPath(saveTargetPath)) ||
-          (Array.isArray(openList) ? openList.find((w) => w && w.path === saveTargetPath) : null) ||
-          null)
-      : null;
-    const postWfIsSaveTargetRecord = Boolean(targetRecord) && sameWorkflowObject(targetRecord, postSwapWf);
+    // r10 P0 — the save API's own produced record is the ONLY succession proof:
+    // a close→reopen of the same path is not what the save produced.
+    const postWfIsSaveProducedRecord = Boolean(details?.savedRecord) && sameWorkflowObject(details.savedRecord, postSwapWf);
     if (
       shouldCarryIdentityAcrossSaveSwap({
         preWf: expectWf,
@@ -3352,7 +3346,7 @@ async function programmaticSave(name) {
         savedAs: outcome.saved_as,
         preWfStillOpen,
         postWfHasConflictingEstablishedIdentity,
-        postWfIsSaveTargetRecord,
+        postWfIsSaveProducedRecord,
       })
     ) {
       if (!_workflowObjectUuids.get(postSwapWf)) _workflowObjectUuids.set(postSwapWf, preSwapUuid);

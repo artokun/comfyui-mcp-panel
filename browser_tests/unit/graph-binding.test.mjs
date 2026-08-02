@@ -1140,18 +1140,18 @@ test("#557 r3/r4 wiring: programmaticSave threads the pre-save identity across a
   );
   assert.match(
     body,
-    /postWfIsSaveTargetRecord = Boolean\(targetRecord\) && sameWorkflowObject\(targetRecord, postSwapWf\)/,
-    "continuity must be threaded from the save's own replacement event — the service's record for the file this save wrote (r8 P0)",
+    /postWfIsSaveProducedRecord = Boolean\(details\?\.savedRecord\) && sameWorkflowObject\(details\.savedRecord, postSwapWf\)/,
+    "continuity must be threaded from the save API's own PRODUCED record — never path occupancy (r10 P0)",
   );
   assert.doesNotMatch(
     body,
-    /successorCarriesPreUuid/,
-    "static tracker/serialized-state evidence is NOT continuity (r8 P0) — it must not appear in the carry",
+    /successorCarriesPreUuid|postWfIsSaveTargetRecord|targetRecord/,
+    "static evidence (tracker state, path occupancy) is NOT continuity (r8/r10 P0) — it must not appear in the carry",
   );
   assert.match(
     body,
-    /shouldCarryIdentityAcrossSaveSwap\(\{\s*preWf: expectWf,\s*postWf: postSwapWf,\s*savedAs: outcome\.saved_as,\s*preWfStillOpen,\s*postWfHasConflictingEstablishedIdentity,\s*postWfIsSaveTargetRecord,\s*\}\)/,
-    "the carry must pass ALL continuity evidence to the pure rule (never a Save-As copy, never a mid-save switch, never over an established conflict, never on stale residue)",
+    /shouldCarryIdentityAcrossSaveSwap\(\{\s*preWf: expectWf,\s*postWf: postSwapWf,\s*savedAs: outcome\.saved_as,\s*preWfStillOpen,\s*postWfHasConflictingEstablishedIdentity,\s*postWfIsSaveProducedRecord,\s*\}\)/,
+    "the carry must pass ALL continuity evidence to the pure rule (never a Save-As copy, never a mid-save switch, never over an established conflict, never on static evidence)",
   );
   assert.doesNotMatch(
     body,
@@ -1229,9 +1229,11 @@ function buildProgrammaticSaveHarness({ onSave } = {}) {
   )(
     { extensionManager: { workflow: svc } },
     async (svcArg, _name, opts) => {
-      onSave?.({ svc: svcArg, A, B }); // the mid-await switch / swap / reconnect
+      const outcome = onSave?.({ svc: svcArg, A, B }) ?? {}; // the mid-await switch / swap / reconnect
       opts.details.mode = "in-place";
       opts.details.targetPath = "workflows/a.json"; // the save wrote A's file (mirrors recordOutcome)
+      // Mirrors the save lib's r10 thread: the save API's own produced record.
+      if (outcome.producedRecord) opts.details.savedRecord = outcome.producedRecord;
       return "a.json";
     },
     () => "Untitled",
@@ -1370,6 +1372,46 @@ test("#349 r8 P0: a foreign tab whose LAGGING tracker carries the pre-save uuid 
   );
 });
 
+test("#349 r10 P0: a same-path close→reopen during the awaited save aborts the carry (reopened = new identity)", async () => {
+  // The r10 hole: A's tab CLOSES while the save awaits and a DISTINCT object B
+  // reopens the SAME path. Path occupancy (r8's target record) is satisfied by
+  // B — but B is not what the save PRODUCED, so the carry must abort: a
+  // closed→reopened object is a NEW identity (r5's rule), never a successor.
+  const reopenedB = {
+    isPersisted: true,
+    path: "workflows/a.json", // SAME path — but a DISTINCT object
+    isModified: true,
+    changeTracker: {
+      activeState: { ...state(27), extra: { comfyui_mcp: { workflow_uuid: "uuid-A" } } },
+    },
+  };
+  const saveProducedRecord = {
+    isPersisted: true,
+    path: "workflows/a.json", // what the save API itself produced — NOT reopenedB
+    changeTracker: { activeState: state(27) },
+  };
+  const { save, svc, objectUuids, owners, activeClaims } = buildProgrammaticSaveHarness({
+    onSave: ({ svc }) => {
+      svc.openWorkflows = [reopenedB]; // A closed; B reopened the same path and is its record
+      svc.activeWorkflow = reopenedB;
+      return { producedRecord: saveProducedRecord };
+    },
+  });
+  await save();
+  assert.equal(objectUuids.get(reopenedB), undefined, "a reopened object must NOT be seeded — it is a NEW identity");
+  assert.notEqual(owners.get("uuid-A"), reopenedB, "A's owner record stays intact");
+  assert.equal(
+    activeClaims("uuid-A"),
+    false,
+    "the reopened object must not claim A's tag — the guard cannot heal onto it",
+  );
+  assert.equal(
+    commandWorkflowMismatch({ commandUuid: "uuid-A", activeUuid: "uuid-B" }),
+    true,
+    "stale A-scoped commands stay fenced against the reopened object (#349)",
+  );
+});
+
 test("#557 r4 control: a GENUINE save-swap successor still carries the pre-save identity", async () => {
   const successor = {
     isPersisted: true,
@@ -1382,13 +1424,14 @@ test("#557 r4 control: a GENUINE save-swap successor still carries the pre-save 
     onSave: ({ svc }) => {
       svc.openWorkflows = [successor]; // a genuine swap REMOVES the predecessor
       svc.activeWorkflow = successor;
+      return { producedRecord: successor }; // the save API's own result IS the successor
     },
   });
   await save();
   assert.equal(
     objectUuids.get(successor),
     "uuid-A",
-    "the proven successor is seeded with the pre-save uuid (#557)",
+    "the save-produced successor is seeded with the pre-save uuid (#557)",
   );
   assert.equal(owners.get("uuid-A"), successor, "the successor becomes the uuid's registered owner");
 });
@@ -1490,18 +1533,36 @@ test("#349 r9 P0: a CLOSED owner + different-path copy + no alias/embedded-path 
   );
 });
 
-test("#557 r9 control: a same-file successor still INHERITS through the closed owner's lineage", () => {
-  // The genuine continuation: the closed owner's unique on-disk file IS this
-  // object's file (save-swap / close→reopen of the same file) — positive
-  // succession evidence, so the identity (and its root tag) carries over.
-  const { stableUuid, successor, U1 } = buildSavedSuccessorHarness({
+test("#349 r10: a same-path successor of a PATH-LESS file FORKS — reopened object, new identity", () => {
+  // The file carries only workflow_uuid (no workflow_path record) and no alias
+  // exists, so the only "evidence" would be the closed owner's file matching —
+  // which r10 excludes: a closed→reopened object at the same path is a NEW
+  // identity. (The durable-resume heal belongs to the UNREGISTERED-embedded
+  // path, not to registered-owner inheritance.)
+  const { stableUuid, successor, replaced, owners, U1 } = buildSavedSuccessorHarness({
     ownerOpen: false,
-    currentPath: "workflows/x.json", // same file as the closed owner
-    embeddedPath: null, // even without a path record or…
-    aliases: {}, // …an alias — the owner's own file is the evidence
+    currentPath: "workflows/x.json", // same path as the closed owner, but a distinct object
+    embeddedPath: null,
+    aliases: {},
   });
   const id = stableUuid(successor);
-  assert.equal(id, U1, "the same-file successor inherits the closed owner's identity");
+  assert.notEqual(id, U1, "owner-file match alone is NOT succession evidence (r10)");
+  assert.match(id, /^fresh-/, "the reopened object gets a fresh per-instance identity");
+  assert.equal(owners.get(U1), replaced, "A's owner record stays intact");
+});
+
+test("#557 r9 control: a same-file successor still INHERITS via the file's own path record", () => {
+  // Positive succession evidence layer 1: the file's recorded workflow_path
+  // ties the uuid to this object's file — the genuine #557 save-swap / same-file
+  // reload of a properly-stamped file.
+  const { stableUuid, successor, U1 } = buildSavedSuccessorHarness({
+    ownerOpen: false,
+    currentPath: "workflows/x.json",
+    embeddedPath: "workflows/x.json",
+    aliases: {},
+  });
+  const id = stableUuid(successor);
+  assert.equal(id, U1, "the file's own path record proves succession — the successor inherits");
 });
 
 test("#557 regression: after the save-swap, the guard sees no mismatch (root tag and object stay aligned)", () => {
