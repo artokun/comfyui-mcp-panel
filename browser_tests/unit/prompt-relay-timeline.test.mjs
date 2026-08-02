@@ -345,6 +345,48 @@ test("MID-TYPING: a write that PRESERVES the in-flight text reports no overwrite
   assert.equal(widgets.local_prompts.value, "user was typing this | b");
 });
 
+test("MID-TYPING with a REALISTIC partial editor: fields the editor does not model are NOT dropped", () => {
+  // The shipped editor's parser retains ONLY prompt/length/color per segment and nothing
+  // top-level, so a real editor's this.timeline is NOT a full copy of timeline_data. Merging
+  // FROM it would silently drop every field the parser does not model — the fixture never
+  // caught that because it seeds the editor with the COMPLETE timeline. This seeds it the way
+  // the pack's parser actually leaves it, then proves the merge loses nothing.
+  const { node, widgets, editor } = makeRelayNode({
+    timelineSegments: [
+      seg("a", 24, { legacyMeta: "keep-0" }),
+      seg("b", 36, { legacyMeta: "keep-1" }),
+    ],
+    extraTimelineFields: { zoom: 3, note: "keep me" },
+  });
+  editor.timeline = {
+    segments: JSON.parse(widgets.timeline_data.value).segments.map(({ prompt, length, color }) => ({
+      prompt,
+      length,
+      color,
+    })),
+  };
+  // Mid-typing: the user edits segment 0; local_prompts updates immediately, timeline_data lags.
+  editor.timeline.segments[0].prompt = "typed just now";
+  widgets.local_prompts.value = derivePromptRelayWidgets(editor.timeline.segments).local_prompts;
+
+  const res = relay(applyPromptRelayTimelineWrite(node, { fps: 24 }));
+
+  assert.equal(res.merge_base, "editor");
+  const written = JSON.parse(widgets.timeline_data.value);
+  // Unmentioned TOP-LEVEL fields survive from the persisted widget, and the overlay applied.
+  assert.equal(written.zoom, 3);
+  assert.equal(written.note, "keep me");
+  assert.equal(written.fps, 24);
+  // The editor's typed text wins — it is authoritative mid-typing…
+  assert.deepEqual(written.segments.map((s) => s.prompt), ["typed just now", "b"]);
+  // …while PER-SEGMENT fields the editor does not model survive by index.
+  assert.equal(written.segments[0].legacyMeta, "keep-0");
+  assert.equal(written.segments[1].legacyMeta, "keep-1");
+  // The in-flight text is current, not a loss — no bogus disclosures.
+  assert.equal(res.overwrote_uncommitted_edit, undefined);
+  assert.equal(res.replaced_out_of_band, undefined);
+});
+
 test("a normal (non-debounce) write never reports overwrote_uncommitted_edit", () => {
   const { node } = makeRelayNode();
   const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("totally different", 3)] }));
@@ -442,13 +484,16 @@ test("PIPE COLLISION: a length-only change is disclosed despite identical prompt
   assert.deepEqual(res.overwrote_uncommitted_edit, { prompts: ["a | b", "c"], lengths: [24, 36] });
 });
 
-test("PIPE COLLISION: a metadata-only overlay must NOT rebuild from a stale master", () => {
-  // The join cannot decide AUTHORITY either. Persisted timeline_data + widgets are
+test("PIPE COLLISION: a metadata-only overlay on an unresolvable tie FAILS CLOSED", () => {
+  // The join cannot decide AUTHORITY. Persisted timeline_data + widgets are
   // ["a", "b | c"] / [24, 36]. Within one debounce interval the user edits BOTH prompt boxes,
   // leaving the live editor at ["a | b", "c"] with the same lengths — which derives the SAME
   // "a | b | c" and "24, 36", so the stale master still looks perfectly consistent. A caller
-  // then writes a metadata-only overlay that asks for no segment change at all. Choosing the
-  // master on join equality would rebuild the node from ["a", "b | c"] and destroy the edit.
+  // then writes a metadata-only overlay that asks for no segment change at all. Neither copy
+  // is provably current, so the write must REFUSE: guessing the editor could destroy the
+  // persisted timeline (the post-load wrong-workflow loss), guessing the master could destroy
+  // the in-flight edit — and a refusal mutates NOTHING, so both survive and the caller can
+  // retry once the debounce settles, or supply the segments outright.
   const { node, widgets, editor } = makeRelayNode({
     timelineSegments: [seg("a", 24), seg("b | c", 36)],
   });
@@ -464,31 +509,51 @@ test("PIPE COLLISION: a metadata-only overlay must NOT rebuild from a stale mast
     widgets.segment_lengths.value,
   );
 
-  const res = relay(applyPromptRelayTimelineWrite(node, { zoom: 4 }));
-
-  // The live edit SURVIVES — the whole point.
-  assert.deepEqual(JSON.parse(widgets.timeline_data.value).segments.map((s) => s.prompt), ["a | b", "c"]);
-  assert.deepEqual(editor.timeline.segments.map((s) => s.prompt), ["a | b", "c"]);
-  assert.equal(JSON.parse(widgets.timeline_data.value).zoom, 4);
-  // Nothing was overwritten, and the tie is declared rather than resolved silently.
-  assert.equal(res.merge_base, "editor");
-  assert.equal(res.merge_base_ambiguous, true);
-  assert.equal(res.overwrote_uncommitted_edit, undefined);
-  assert.deepEqual(res.superseded_timeline_data, { prompts: ["a", "b | c"], lengths: [24, 36] });
-  assert.ok(res.warnings.some((w) => w.includes("could not tell which is current")));
-  // The derived join is unchanged by all of this — proof it could never have detected the case.
+  const timelineBefore = widgets.timeline_data.value;
+  const order = [];
+  assert.throws(
+    () =>
+      applyPromptRelayTimelineWrite(node, { zoom: 4 }, {
+        beforeChange: () => order.push("before"),
+        afterChange: () => order.push("after"),
+        setDirty: () => order.push("dirty"),
+      }),
+    (err) => {
+      assert.ok(err instanceof PromptRelayTimelineWriteError);
+      assert.match(err.message, /CANNOT tell which is current/);
+      // Both copies are handed back PER SEGMENT, so the caller can resolve the tie explicitly.
+      assert.ok(err.message.includes('"a | b","c"'), "editor copy missing from the refusal");
+      assert.ok(err.message.includes('"a","b | c"'), "timeline_data copy missing from the refusal");
+      return true;
+    },
+  );
+  // NOTHING was mutated — not the widgets, not the editor, not the undo history. The live
+  // edit SURVIVES precisely because nothing was written over it.
+  assert.equal(widgets.timeline_data.value, timelineBefore);
   assert.equal(widgets.local_prompts.value, "a | b | c");
+  assert.deepEqual(editor.timeline.segments.map((s) => s.prompt), ["a | b", "c"]);
+  assert.deepEqual(order, []);
 });
 
 test("an unresolvable tie is flagged; an ordinary write is not", () => {
   // Neither record matches the derived widgets (a genuinely desynced node) and they differ
-  // structurally: still unresolvable, so the live editor wins and the tie is flagged.
+  // structurally: unresolvable. Explicit segments replace BOTH records outright, so the write
+  // may proceed — declared ambiguous, merging onto the PERSISTED record for everything else,
+  // with the set-aside editor copy handed back rather than written.
   const { node, widgets } = makeRelayNode({ localPrompts: "hand written | text" });
   widgets.timeline_data.value = JSON.stringify({ segments: [seg("master only", 24)] });
-  const tied = relay(applyPromptRelayTimelineWrite(node, { zoom: 1 }));
-  assert.equal(tied.merge_base, "editor");
+  const tied = relay(
+    applyPromptRelayTimelineWrite(node, { segments: [seg("caller decides", 5)] }),
+  );
+  assert.equal(tied.merge_base, "timeline_data");
+  assert.equal(tied.merge_base_reason, "unresolved-tie");
   assert.equal(tied.merge_base_ambiguous, true);
-  assert.deepEqual(tied.replaced_out_of_band, { local_prompts: "hand written | text" });
+  // The out-of-band derived text is still reported before being replaced…
+  assert.equal(tied.replaced_out_of_band.local_prompts, "hand written | text");
+  // …and the ambiguous editor copy is disclosed per segment, never written back.
+  assert.deepEqual(tied.discarded_unverified_editor_copy, { prompts: ["a", "b"], lengths: [24, 36] });
+  assert.ok(tied.warnings.some((w) => w.includes("could not tell which was current")));
+  assert.equal(widgets.local_prompts.value, "caller decides");
 
   // A node whose two records agree has no tie to declare.
   const plain = relay(applyPromptRelayTimelineWrite(makeRelayNode().node, { segments: [seg("x", 3)] }));
@@ -634,6 +699,74 @@ test("a stale editor whose content the write happens to reproduce reports nothin
   assert.equal(res.discarded_unverified_editor_copy, undefined);
 });
 
+test("POST-LOAD TIE: a stale editor colliding on BOTH joins fails CLOSED — the restored workflow is never overwritten", () => {
+  // The review's wrong-workflow loss. The load restores ["x | y", "z"] / [50, 10], but the
+  // editor still holds the PREVIOUS workflow's ["x", "y | z"] / [50, 10] — structurally
+  // different, yet byte-identical local_prompts AND segment_lengths, so the derived widgets
+  // cannot separate the two copies. Choosing the editor (the old tie behaviour) wrote the OLD
+  // workflow's timeline back over the restored one and still reported success. A tie must
+  // REFUSE instead: nothing is written, and both copies come back in the error.
+  const n = makeRelayNode({ timelineSegments: [seg("x", 50), seg("y | z", 10)] });
+  simulateWorkflowLoad(n, [seg("x | y", 50), seg("z", 10)]);
+  // The collision is exact — the filter genuinely cannot tell the copies apart.
+  assert.equal(n.widgets.local_prompts.value, "x | y | z");
+  assert.equal(
+    derivePromptRelayWidgets(n.editor.timeline.segments).local_prompts,
+    n.widgets.local_prompts.value,
+  );
+  assert.equal(
+    derivePromptRelayWidgets(n.editor.timeline.segments).segment_lengths,
+    n.widgets.segment_lengths.value,
+  );
+
+  const timelineBefore = n.widgets.timeline_data.value;
+  assert.throws(
+    () => applyPromptRelayTimelineWrite(n.node, { zoom: 4 }),
+    (err) => {
+      assert.ok(err instanceof PromptRelayTimelineWriteError);
+      assert.match(err.message, /CANNOT tell which is current/);
+      assert.ok(err.message.includes('"x","y | z"'), "old-workflow editor copy missing from the refusal");
+      assert.ok(err.message.includes('"x | y","z"'), "restored-workflow copy missing from the refusal");
+      return true;
+    },
+  );
+  // NOTHING was written: the restored workflow's timeline survives byte-for-byte, and the old
+  // workflow's editor copy is left alone too — the caller resolves the tie explicitly.
+  assert.equal(n.widgets.timeline_data.value, timelineBefore);
+  assert.equal(n.widgets.local_prompts.value, "x | y | z");
+  assert.equal(n.widgets.segment_lengths.value, "50, 10");
+  assert.deepEqual(n.editor.timeline.segments.map((s) => s.prompt), ["x", "y | z"]);
+});
+
+test("TIE with explicit segments: the caller's list replaces BOTH copies — no ambiguous data is written", () => {
+  // The same unresolvable collision, but the write supplies the segment list outright — the one
+  // resolution that cannot resurrect ambiguous data: the segments come from the caller, and
+  // everything else from the PERSISTED widget (never the editor copy, whose unmodeled
+  // top-level fields — the old workflow's zoom here — belong to the previous workflow).
+  const { node, widgets, editor } = makeRelayNode({
+    timelineSegments: [seg("x | y", 50), seg("z", 10)],
+    extraTimelineFields: { zoom: 3 },
+  });
+  // The editor still holds the PREVIOUS workflow, colliding on both derived joins.
+  editor.timeline = { zoom: 9, segments: [seg("x", 50), seg("y | z", 10)] };
+
+  const res = relay(applyPromptRelayTimelineWrite(node, { segments: [seg("caller decides", 7)] }));
+
+  assert.equal(res.reconciled, true);
+  assert.equal(res.merge_base, "timeline_data");
+  assert.equal(res.merge_base_reason, "unresolved-tie");
+  assert.equal(res.merge_base_ambiguous, true);
+  const written = JSON.parse(widgets.timeline_data.value);
+  assert.deepEqual(written.segments.map((s) => s.prompt), ["caller decides"]);
+  // The persisted record's fields — never the ambiguous editor copy's.
+  assert.equal(written.zoom, 3);
+  assert.equal(widgets.local_prompts.value, "caller decides");
+  // The set-aside editor copy is disclosed per segment, with warnings — not silently kept.
+  assert.deepEqual(res.discarded_unverified_editor_copy, { prompts: ["x", "y | z"], lengths: [50, 10] });
+  assert.ok(res.warnings.some((w) => w.includes("could not tell which was current")));
+  assert.ok(res.warnings.some((w) => w.includes("could NOT be determined")));
+});
+
 // ─── The filter cannot tell a stale editor from an uncommitted edit; only the load can ───
 
 test("UNCOMMITTED TEXT whose derived widgets were refreshed back to the master is NOT suppressed", () => {
@@ -678,16 +811,97 @@ test("recordPreLoadPromptRelayEditors only touches PromptRelay nodes, and tolera
   const { node } = makeRelayNode();
   const other = { id: 2, type: "KSampler", widgets: [], _timelineEditor: { timeline: { segments: [seg("x", 1)] } } };
   const noEditor = { id: 3, type: PROMPT_RELAY_TIMELINE_NODE_TYPE, widgets: [] };
-  assert.equal(recordPreLoadPromptRelayEditors([node, other, noEditor]), 2);
+  assert.equal(recordPreLoadPromptRelayEditors([node, other, noEditor], { now: () => 1000 }), 2);
   assert.equal(other.__cmcpPromptRelayPreLoadSegments, undefined);
   // A PromptRelay node with no live editor records an explicit "nothing was there".
-  assert.equal(noEditor.__cmcpPromptRelayPreLoadSegments, null);
-  assert.deepEqual(node.__cmcpPromptRelayPreLoadSegments, [
+  assert.deepEqual(noEditor.__cmcpPromptRelayPreLoadSegments, { at: 1000, segments: null });
+  assert.deepEqual(node.__cmcpPromptRelayPreLoadSegments, {
+    at: 1000,
+    segments: [
+      { prompt: "a", length: 24 },
+      { prompt: "b", length: 36 },
+    ],
+  });
+  assert.equal(recordPreLoadPromptRelayEditors(null), 0);
+  assert.equal(recordPreLoadPromptRelayEditors([null, undefined, 5]), 0);
+});
+
+test("recordPreLoadPromptRelayEditors descends into subgraphs and survives a cycle", () => {
+  // A write can target a node inside the viewed subgraph, so those editors need the signal too —
+  // otherwise every routine post-load write on them would warn.
+  const inner = makeRelayNode({ id: 9 }).node;
+  const container = { id: 1, type: "Subgraph", widgets: [], subgraph: { _nodes: [inner] } };
+  // A cycle: the subgraph lists a node whose own subgraph points back at the container.
+  const looper = { id: 2, type: "Subgraph", widgets: [], subgraph: { _nodes: [container] } };
+  container.subgraph._nodes.push(looper);
+  assert.equal(recordPreLoadPromptRelayEditors([container], { now: () => 5 }), 1);
+  assert.deepEqual(inner.__cmcpPromptRelayPreLoadSegments.segments, [
     { prompt: "a", length: 24 },
     { prompt: "b", length: 36 },
   ]);
-  assert.equal(recordPreLoadPromptRelayEditors(null), 0);
-  assert.equal(recordPreLoadPromptRelayEditors([null, undefined, 5]), 0);
+});
+
+test("a nested PromptRelay node gets the quiet post-load path, not a spurious warning", () => {
+  const n = makeRelayNode({ id: 9, timelineSegments: [seg("previous workflow", 99)] });
+  const container = { id: 1, type: "Subgraph", widgets: [], subgraph: { _nodes: [n.node] } };
+  recordPreLoadPromptRelayEditors([container], { now: () => 0 });
+  const timeline = { segments: [seg("restored", 50)] };
+  n.widgets.timeline_data.value = JSON.stringify(timeline);
+  const d = derivePromptRelayWidgets(timeline.segments);
+  n.widgets.local_prompts.value = d.local_prompts;
+  n.widgets.segment_lengths.value = d.segment_lengths;
+
+  const res = relay(applyPromptRelayTimelineWrite(n.node, { zoom: 4 }, { now: () => 10 }));
+  assert.deepEqual(res.discarded_stale_editor, { prompts: ["previous workflow"], lengths: [99] });
+  assert.equal(res.warnings, undefined);
+});
+
+// ─── Content equality alone is not proof of history ───
+
+test("RETYPING the exact pre-load text after the re-parse is NOT quietly discarded", () => {
+  // The collision the snapshot cannot see on its own: the editor's content equals the pre-load
+  // content, but only because the user re-authored it long after the load's re-parse. Time is
+  // what separates the two — nobody retypes a timeline within the re-parse window.
+  const n = makeRelayNode({ timelineSegments: [seg("the same text", 24)] });
+  recordPreLoadPromptRelayEditors([n.node], { now: () => 0 });
+  const timeline = { segments: [seg("restored", 50)] };
+  n.widgets.timeline_data.value = JSON.stringify(timeline);
+  const d = derivePromptRelayWidgets(timeline.segments);
+  n.widgets.local_prompts.value = d.local_prompts;
+  n.widgets.segment_lengths.value = d.segment_lengths;
+  // …the load settles, the editor re-parses, and the user types the old text back in.
+  n.editor.timeline = { segments: [seg("the same text", 24)] };
+
+  const res = relay(applyPromptRelayTimelineWrite(n.node, { zoom: 4 }, { now: () => 60_000 }));
+  assert.equal(res.discarded_stale_editor, undefined);
+  assert.deepEqual(res.discarded_unverified_editor_copy, {
+    prompts: ["the same text"],
+    lengths: [24],
+  });
+  assert.ok(res.warnings.some((w) => w.includes("could NOT be determined")));
+});
+
+test("the stale window is bounded, and a stale clock never proves staleness", () => {
+  const build = () => {
+    const n = makeRelayNode({ timelineSegments: [seg("previous workflow", 99)] });
+    recordPreLoadPromptRelayEditors([n.node], { now: () => 1_000 });
+    const timeline = { segments: [seg("restored", 50)] };
+    n.widgets.timeline_data.value = JSON.stringify(timeline);
+    const d = derivePromptRelayWidgets(timeline.segments);
+    n.widgets.local_prompts.value = d.local_prompts;
+    n.widgets.segment_lengths.value = d.segment_lengths;
+    return n;
+  };
+  const at = (t) => relay(applyPromptRelayTimelineWrite(build().node, { zoom: 4 }, { now: () => t }));
+  // Inside the re-parse window: proven stale, quiet.
+  assert.ok(at(1_000).discarded_stale_editor);
+  assert.ok(at(1_250).discarded_stale_editor);
+  // Outside it: the editor has certainly re-parsed, so equal content means re-authored → warn.
+  assert.equal(at(1_251).discarded_stale_editor, undefined);
+  assert.ok(at(1_251).discarded_unverified_editor_copy);
+  // A clock that went backwards proves nothing.
+  assert.equal(at(999).discarded_stale_editor, undefined);
+  assert.ok(at(999).discarded_unverified_editor_copy);
 });
 
 test("the live editor never has its segment objects aliased into the written timeline", () => {

@@ -62,8 +62,12 @@
 // lossy and would hide a real overwrite whenever a prompt contains a literal "|". The same limit
 // governs WHICH copy is authoritative: a join comparison can only ask "could this widget hold
 // this timeline's serialization?", never "which of two colliding timelines is current?" — so
-// chooseMergeBase uses it as a filter and, when it cannot separate the two, keeps the live
-// editor's copy (the only one that can hold unsaved text) and says so.
+// chooseMergeBase uses it as a filter, and when the filter cannot separate the two the write
+// FAILS CLOSED rather than guess: a tie with no explicit `segments` is REFUSED with both copies
+// disclosed and nothing mutated (keeping the editor's copy could write the previous workflow's
+// timeline back over the one a load just restored; keeping the widget's could destroy text still
+// being typed — neither guess is acceptable), and only an explicit `segments` list, which
+// replaces BOTH records outright, may proceed, declared via `merge_base_ambiguous`.
 // Anything PromptRelay's python would encode differently from
 // what the timeline shows (a blank prompt, a literal "|", padding whitespace) comes back as a
 // warning. The invariant: the panel never leaves the timeline saying A, the prompts saying B,
@@ -432,9 +436,19 @@ function contentSnapshot(segments) {
 // LiteGraph.serialize() writes only its known fields, so this cannot leak into a workflow).
 const PRE_LOAD_SEGMENTS_KEY = "__cmcpPromptRelayPreLoadSegments";
 
+// How long after a load the node's editor may still be holding pre-load content. The pack
+// re-parses the editor from timeline_data on a `setTimeout(…, 10)` scheduled by onConfigure, so
+// the un-reparsed window is milliseconds; this is generous slack for a loaded machine. It is
+// deliberately SHORT rather than generous, because the window is the only period in which
+// content equality is allowed to mean "stale": outside it the editor has certainly re-parsed,
+// so equal content means a user re-authored it and the write must warn. Erring short costs a
+// spurious warning on a very slow load; erring long would quietly discard authored text.
+const POST_LOAD_REPARSE_WINDOW_MS = 250;
+
 /**
  * Snapshot every PromptRelayEncodeTimeline editor's CURRENT segments just BEFORE a workflow
- * load replaces the graph. Called from the panel's app.loadGraphData fork.
+ * load replaces the graph. Called from the panel's app.loadGraphData fork. Descends into
+ * subgraphs, since a write can target a node inside one.
  *
  * WHY THIS EXISTS. The derived widgets can prove that an editor copy does not match what the
  * node executes — they can NEVER prove WHY. A stale editor left over from the previous
@@ -442,37 +456,50 @@ const PRE_LOAD_SEGMENTS_KEY = "__cmcpPromptRelayPreLoadSegments";
  * uncommitted edit whose derived values were refreshed back to the master are indistinguishable
  * from the widget values alone, yet they demand opposite disclosures: a warning on the second
  * would be noise, silence on the first would suppress real loss. No threshold between them can
- * be right, so this records an OBSERVATION instead: the content the editor held before the
- * current load began. An editor still holding exactly that content has not been re-parsed or
- * typed into since — positive evidence of staleness. Anything else changed after the load.
+ * be right, so this records an OBSERVATION instead — the content the editor held before the
+ * current load, and when that load began.
  */
-export function recordPreLoadPromptRelayEditors(nodes, { getEditor } = {}) {
-  if (!Array.isArray(nodes)) return 0;
+export function recordPreLoadPromptRelayEditors(nodes, { getEditor, now = Date.now } = {}) {
+  const at = now();
+  const seen = new Set();
+  const stack = Array.isArray(nodes) ? nodes.slice() : [];
   let stamped = 0;
-  for (const node of nodes) {
+  while (stack.length) {
+    const node = stack.pop();
+    if (!node || typeof node !== "object" || seen.has(node)) continue;
+    seen.add(node); // identity-keyed, so a cyclic subgraph cannot loop forever
+    const nested = node.subgraph?._nodes ?? node.subgraph?.nodes;
+    if (Array.isArray(nested)) stack.push(...nested);
     if (!isPromptRelayTimelineNode(node)) continue;
-    const ed = typeof getEditor === "function" ? getEditor(node) : node?._timelineEditor;
+    const ed = typeof getEditor === "function" ? getEditor(node) : node._timelineEditor;
     const tl = liveEditorTimeline(ed);
     // Store only the authored fields — the same ones sameSegmentContent compares.
-    node[PRE_LOAD_SEGMENTS_KEY] = tl
-      ? tl.segments.map((seg) => ({ prompt: seg?.prompt, length: seg?.length }))
-      : null;
+    node[PRE_LOAD_SEGMENTS_KEY] = {
+      at,
+      segments: tl ? tl.segments.map((seg) => ({ prompt: seg?.prompt, length: seg?.length })) : null,
+    };
     stamped++;
   }
   return stamped;
 }
 
 /**
- * Is this editor copy PROVEN to predate the current workflow load? True only when a pre-load
- * snapshot was actually recorded AND the editor still holds exactly that content. With no
- * snapshot (no load observed yet, a node recreated by the load, the fork not installed) the
- * answer is NOT "stale" but "unknown" — and unknown must never be treated as safe.
+ * Is this editor copy PROVEN to predate the current workflow load? Requires BOTH:
+ *   * the editor still holds exactly what it held before the load, AND
+ *   * we are still inside the window in which it can not yet have re-parsed.
+ * Content equality ALONE is not proof of history: a user who re-types exactly the pre-load text
+ * after the re-parse would otherwise have that authored text quietly discarded. Nobody re-types
+ * a timeline within a few hundred ms of a load, so the window is what makes equality meaningful.
+ * With no snapshot, a stale clock, or a delta outside the window, the answer is not "stale" but
+ * "unknown" — and unknown must never be treated as safe.
  */
-function editorProvenStale(node, editorSegs) {
-  const preLoad = node?.[PRE_LOAD_SEGMENTS_KEY];
-  return Array.isArray(preLoad) && sameSegmentContent(preLoad, editorSegs);
+function editorProvenStale(node, editorSegs, now = Date.now) {
+  const stamp = node?.[PRE_LOAD_SEGMENTS_KEY];
+  if (!stamp || !Array.isArray(stamp.segments) || !Number.isFinite(stamp.at)) return false;
+  const since = now() - stamp.at;
+  if (!(since >= 0 && since <= POST_LOAD_REPARSE_WINDOW_MS)) return false;
+  return sameSegmentContent(stamp.segments, editorSegs);
 }
-
 /** Locate a widget by name on a LiteGraph node. */
 function findWidget(node, name) {
   const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
@@ -515,10 +542,11 @@ function liveEditorTimeline(editor) {
  *   3. they differ and exactly ONE is consistent with the derived widgets → that one is
  *      current (this is what separates the debounce window from the post-load window);
  *   4. they differ and the filter CANNOT separate them (both consistent — colliding joins — or
- *      neither) → prefer the LIVE EDITOR. It is the only copy that can hold text existing
- *      nowhere else; a superseded master is still on disk, an uncommitted keystroke is not.
- *      The choice is flagged (`merge_base_ambiguous`) and the losing copy is handed back, so a
- *      tie is never resolved silently.
+ *      neither) → UNRESOLVABLE. Choosing a copy here would be a GUESS, and each guess has a
+ *      losing scenario with real loss: keeping the editor's copy can write the PREVIOUS
+ *      workflow's timeline back over the one a load just restored, keeping the widget's can
+ *      destroy text still being typed. So a tie chooses NOTHING — it is returned flagged
+ *      (`ambiguous`) with NO base, and the caller fails closed (see applyPromptRelayTimelineWrite).
  *
  * Both derived widgets are compared, not just `local_prompts`: two timelines can share a
  * prompt join while differing in segment lengths, and that difference is worth catching even
@@ -535,6 +563,36 @@ function derivedMatchesWidgets(timeline, widgets) {
     d.local_prompts === widgets.local_prompts.value &&
     d.segment_lengths === widgets.segment_lengths.value
   );
+}
+
+/**
+ * The merge base for an EDITOR-authoritative write (case 3). The shipped editor's parser
+ * retains ONLY prompt/length/color per segment and no other top-level field, so its
+ * `this.timeline` must NOT be merged from directly: spreading it would DROP every field the
+ * parser does not model (a top-level `zoom`, per-segment metadata, …) that exists only in the
+ * widget's JSON. Instead the editor-KNOWN fields are merged ONTO the widget's timeline object:
+ * the widget (the persisted record, which the editor never edits around) supplies everything
+ * else, the editor stays authoritative for the segment list and the fields it actually holds.
+ * Per segment the same-index widget segment is the only correspondence available (segments
+ * carry no ids); a reorder inside the 120 ms debounce window could misattach an unknown field —
+ * a narrower loss than dropping every such field outright, which is what replacing did.
+ */
+function editorTimelineOntoWidget(fromEditor, fromWidget) {
+  const widgetSegs = Array.isArray(fromWidget?.segments) ? fromWidget.segments : [];
+  const segments = fromEditor.segments.map((seg, i) => {
+    // A malformed editor segment is passed through untouched so normalizeSegments refuses it
+    // loudly, exactly as it would have on the raw editor copy.
+    if (!isPlainObject(seg)) return seg;
+    const base = isPlainObject(widgetSegs[i]) ? widgetSegs[i] : {};
+    // Only fields the editor actually HOLDS may override the widget's; an absent or undefined
+    // one keeps the widget's value instead of clobbering it.
+    const held = {};
+    for (const [key, v] of Object.entries(seg)) {
+      if (v !== undefined) held[key] = v;
+    }
+    return { ...base, ...held };
+  });
+  return { ...fromWidget, segments };
 }
 
 function chooseMergeBase(editor, widgets) {
@@ -566,12 +624,17 @@ function chooseMergeBase(editor, widgets) {
   const editorConsistent = derivedMatchesWidgets(fromEditor, widgets);
   const widgetConsistent = derivedMatchesWidgets(fromWidget, widgets);
   if (widgetConsistent && !editorConsistent) return pick(fromWidget, "timeline_data", "filter-rejected-editor");
-  if (editorConsistent && !widgetConsistent) return pick(fromEditor, "editor", "filter-rejected-master");
+  // The editor won authority, but its copy is PARTIAL (the parser models only
+  // prompt/length/color), so the base is its known fields merged onto the widget's timeline —
+  // never the raw editor copy, which would drop every field it does not model.
+  if (editorConsistent && !widgetConsistent) {
+    return pick(editorTimelineOntoWidget(fromEditor, fromWidget), "editor", "filter-rejected-master");
+  }
   // 4. The filter cannot separate them — either both serialize to the same derived strings
-  //    (the lossy-join collision) or neither matches at all. Prefer the LIVE EDITOR: losing a
-  //    superseded master is recoverable from the saved workflow, losing an uncommitted edit is
-  //    not. Flagged as ambiguous, and the copy that lost is returned to the caller.
-  return pick(fromEditor, "editor", "unresolved-tie", true);
+  //    (the lossy-join collision) or neither matches at all. The tie is UNRESOLVABLE, so no
+  //    copy is chosen: flagged ambiguous with a null base, and the caller fails closed —
+  //    merging onto either copy here could write ambiguous old data over the current one.
+  return pick(null, "none", "unresolved-tie", true);
 }
 
 /** The refusal message for a DERIVED-widget write — explains why + points at timeline_data. */
@@ -596,7 +659,9 @@ export function promptRelayDerivedRefusal(widgetName, nodeId) {
  *   2. resolve ALL THREE widgets (refuse if any is missing — a reconcile would be impossible),
  *   3. MERGE the caller's top-level fields onto the node's CURRENT timeline — see
  *      chooseMergeBase for which of the editor / widget copies is the current one — so
- *      anything they did not mention is preserved (never defaulted away),
+ *      anything they did not mention is preserved (never defaulted away). When neither copy
+ *      can be PROVEN current (an unresolved tie) this step fails closed: refused outright
+ *      unless the caller supplied `segments` explicitly,
  *   4. validate + normalize the merged segments (refusing every coerce/reset case),
  *   5. COMPUTE all three final widget values,
  *   6. only then MUTATE — three plain assignments that cannot throw, so there is no path that
@@ -613,7 +678,7 @@ export function promptRelayDerivedRefusal(widgetName, nodeId) {
 export function applyPromptRelayTimelineWrite(
   node,
   value,
-  { getEditor, beforeChange, afterChange, setDirty } = {},
+  { getEditor, beforeChange, afterChange, setDirty, now = Date.now } = {},
 ) {
   const overlay = normalizePromptRelayTimelineValue(value);
 
@@ -640,14 +705,44 @@ export function applyPromptRelayTimelineWrite(
   // RE-RECONCILE of the node's existing timeline — which is also the repair path for a node
   // that is already desynced — and is refused only when there is no current timeline to keep.
   const editor = typeof getEditor === "function" ? getEditor(node) : node?._timelineEditor;
+  const chosen = chooseMergeBase(editor, widgets);
   const {
-    base,
-    baseSource,
     reason: baseReason,
     fromWidget,
     fromEditor,
     ambiguous: baseAmbiguous,
-  } = chooseMergeBase(editor, widgets);
+  } = chosen;
+  let { base, baseSource } = chosen;
+  if (baseAmbiguous) {
+    // A tie FAILS CLOSED. The filter could not prove which record is current, so reconciling
+    // FROM either copy would be a guess: keeping the editor's segments can write the PREVIOUS
+    // workflow's timeline back over the one a load just restored, keeping the widget's can
+    // destroy text still being typed. Only an explicit `segments` list may proceed — it
+    // replaces BOTH records outright, so the tie cannot resurrect anything. Anything else is
+    // refused with both copies disclosed and NOTHING mutated (a truthful failure, not a
+    // "reconciled" success built on a guess).
+    if (!Object.prototype.hasOwnProperty.call(overlay, "segments")) {
+      const editorCopy = contentSnapshot(Array.isArray(fromEditor?.segments) ? fromEditor.segments : []);
+      const widgetCopy = contentSnapshot(Array.isArray(fromWidget?.segments) ? fromWidget.segments : []);
+      throw new PromptRelayTimelineWriteError(
+        `PromptRelayEncodeTimeline node ${node?.id} holds TWO different timelines — one in its live ` +
+          `timeline editor, one in its timeline_data widget — and its derived widgets CANNOT tell ` +
+          `which is current (the " | " join is lossy, so structurally different timelines can ` +
+          `serialize identically). This write did not supply "segments", so reconciling would mean ` +
+          `GUESSING which copy to keep: one may be the timeline a workflow load just restored, the ` +
+          `other may hold prompt text that exists nowhere else. REFUSED, and nothing was written ` +
+          `(#506). The editor holds prompts ${JSON.stringify(editorCopy.prompts)} (lengths ` +
+          `${JSON.stringify(editorCopy.lengths)}); timeline_data holds prompts ` +
+          `${JSON.stringify(widgetCopy.prompts)} (lengths ${JSON.stringify(widgetCopy.lengths)}). ` +
+          `Re-issue the write with the full "segments" array you intend — explicit segments replace ` +
+          `BOTH copies outright.`,
+      );
+    }
+    // Explicit segments: merge onto the PERSISTED widget for everything else — never the
+    // ambiguous editor copy, whose unmodeled top-level fields may belong to the old workflow.
+    base = fromWidget;
+    baseSource = "timeline_data";
+  }
   const merged = base ? { ...base, ...overlay } : { ...overlay };
   const segments = normalizeSegments(merged, Array.isArray(base?.segments) ? base.segments : null);
   const finalTimeline = { ...merged, segments };
@@ -715,7 +810,7 @@ export function applyPromptRelayTimelineWrite(
   // Unknown is never treated as safe: a false warning costs attention, a suppressed loss costs
   // the user's work.
   const editorSetAside = !editorWasAuthority && anomalous && editorDiscarded;
-  const staleProven = editorSetAside && editorProvenStale(node, editorSegs);
+  const staleProven = editorSetAside && editorProvenStale(node, editorSegs, now);
   const discardedStaleEditor = staleProven ? contentSnapshot(editorSegs) : null;
   const discardedUnverifiedEditor =
     editorSetAside && !staleProven ? contentSnapshot(editorSegs) : null;
@@ -748,10 +843,11 @@ export function applyPromptRelayTimelineWrite(
   if (baseAmbiguous) {
     warnings.push(
       `the node's two records of the timeline held DIFFERENT segments and its derived widgets ` +
-        `could not tell which is current (the " | " join is lossy, so different segment splits ` +
-        `serialize identically). The LIVE EDITOR's copy was used, because it is the only one that ` +
-        `can hold text not yet saved anywhere; the timeline_data copy is returned as ` +
-        `"superseded_timeline_data" if this write did not reproduce it.`,
+        `could not tell which was current (the " | " join is lossy, so different segment splits ` +
+        `serialize identically). Your explicit "segments" replaced BOTH records, so no ambiguous ` +
+        `copy was written back over the other; the live editor's previous segments are returned ` +
+        `per segment as "discarded_stale_editor" / "discarded_unverified_editor_copy" if this ` +
+        `write did not reproduce them.`,
     );
   }
   if (supersededTimelineData) {
