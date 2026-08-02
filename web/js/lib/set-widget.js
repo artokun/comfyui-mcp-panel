@@ -204,9 +204,21 @@ export async function runSetWidget(
   // mutated node: absent from fresh /object_info is permitted ONLY as a provenance-clean
   // virtual-subgraph container (or frontend-only leaf), never a removed/stale backend
   // node masquerading with a subgraph field.
+  //
+  // #512: every call below passes promotionResolvedToAuthorizedConcrete — an HONEST
+  // statement by control flow, never a guess: reaching this point means the promotion
+  // was positively resolved (isResolvedPromotion) AND followPromotionToConcrete reached
+  // a concrete backend node whose type assertTypeAgainstFreshBackend already authorized
+  // (both throw above otherwise). A genuine UUID SubgraphNode whose class carries the
+  // frontend's synthesized def markers (nodeData/comfyClass, stamped by design) is
+  // therefore authorized through that verified inner target instead of the
+  // provenance heuristic, which no longer discriminates containers; the ever-seen gate
+  // inside the guard still refuses a mid-session-removed container type first.
   if (isResolvedPromotion) {
     // The OUTER subgraph parent (its rail/proxy widgets are mutated).
-    assertMutatedNodeAuthorized(freshDefs, liveRegistry(), node, "outer subgraph", wasTypeEverDefined);
+    assertMutatedNodeAuthorized(freshDefs, liveRegistry(), node, "outer subgraph", wasTypeEverDefined, {
+      promotionResolvedToAuthorizedConcrete: true,
+    });
     // EVERY intermediate virtual container the promotion is driven THROUGH — not just
     // the immediate inner. A deeper intermediate (A→B→C→concrete's C) is otherwise
     // never authorized, so a removed-backend node forwarded-through would be trusted.
@@ -214,7 +226,9 @@ export async function runSetWidget(
     // provenance-clean virtual container; a since-removed (ever-seen) type is refused.
     for (const intermediate of collectPromotionIntermediates(promotedResolution.target, resolveSource)) {
       if (intermediate !== authTarget) {
-        assertMutatedNodeAuthorized(freshDefs, liveRegistry(), intermediate, "intermediate promoted", wasTypeEverDefined);
+        assertMutatedNodeAuthorized(freshDefs, liveRegistry(), intermediate, "intermediate promoted", wasTypeEverDefined, {
+          promotionResolvedToAuthorizedConcrete: true,
+        });
       }
     }
   }

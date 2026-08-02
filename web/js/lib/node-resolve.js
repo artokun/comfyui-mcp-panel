@@ -286,8 +286,22 @@ export function isVirtualSubgraphContainer(node) {
  * name / provenance markers cannot. The provenance + container-shape checks remain as
  * DEFENSE-IN-DEPTH for the never-seen case, never as the sole gate. A null/unavailable
  * fresh map fails closed.
+ *
+ * `opts.promotionResolvedToAuthorizedConcrete` (#512): set by the set_widget caller ONLY
+ * when this exact node's promoted widget was POSITIVELY resolved through the subgraph
+ * promotion mapping to a concrete inner node whose type the caller has ALREADY
+ * fresh-authorized (and whose instance passed the stale-placeholder check) — i.e. the
+ * verifiable oracle is the RESOLVED INNER TARGET, not the container's own markers. This
+ * matters because current ComfyUI_frontend STAMPS a synthesized def (static nodeData +
+ * comfyClass) on every subgraph node's registered class (registerSubgraphNodeDef), so a
+ * genuine outer UUID SubgraphNode carries "backend provenance" BY DESIGN and the
+ * provenance-clean check below false-fires on it, refusing a correct promoted write as
+ * an "unverifiable virtual-subgraph node". The flag relaxes ONLY the provenance signal
+ * for a container on POSITIVE never-seen history evidence — the ever-seen gate above
+ * still refuses a mid-session-removed type first, and an unwired/unseeded/pending
+ * oracle never reaches this branch.
  */
-export function assertMutatedNodeAuthorized(freshDefs, registry, node, role = "target", wasTypeEverDefined) {
+export function assertMutatedNodeAuthorized(freshDefs, registry, node, role = "target", wasTypeEverDefined, opts = {}) {
   const type = node?.type;
   const id = node?.id ?? "(unknown)";
   const label = typeof type === "string" ? ` ("${type}")` : "";
@@ -322,6 +336,18 @@ export function assertMutatedNodeAuthorized(freshDefs, registry, node, role = "t
     !hasBackendProvenance(typeof type === "string" ? registry?.[type] : undefined) &&
     !hasBackendProvenance(node?.constructor);
   if (provenanceClean && isVirtualSubgraphContainer(node)) return;
+  // #512: a genuine UUID SubgraphNode whose class carries the frontend's SYNTHESIZED
+  // def markers (so provenanceClean is false BY DESIGN, see the docblock) is authorized
+  // through its RESOLVED, already-fresh-authorized concrete inner target instead — but
+  // only on POSITIVE never-seen history evidence. An unwired oracle ("no-oracle") fails
+  // closed here exactly as before, and a "removed"/pending/unseeded verdict threw above.
+  if (
+    verdict === "never-seen" &&
+    opts?.promotionResolvedToAuthorizedConcrete === true &&
+    isVirtualSubgraphContainer(node)
+  ) {
+    return;
+  }
   // SHARED frontend-only predicate (#496) — the identical decision assertTypeAgainstFreshBackend
   // and assertAddNodeResolvableRefreshing make, so the family cannot drift apart again.
   if (isAuthorizedFrontendOnlyType(registry, type, node)) return;

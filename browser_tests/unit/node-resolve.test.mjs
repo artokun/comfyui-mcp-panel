@@ -1599,3 +1599,100 @@ test("#496 REGRESSION: the PENDING sentinel still FAILS CLOSED — it never auth
   );
   assert.equal(node.widgets[0].value, "", "no write while the baseline is pending");
 });
+
+// ---- #512: assertMutatedNodeAuthorized authorizes a genuine UUID SubgraphNode through
+//      its RESOLVED, fresh-authorized concrete inner target
+//      (opts.promotionResolvedToAuthorizedConcrete) — because current ComfyUI_frontend
+//      stamps a synthesized def (nodeData + comfyClass) on every subgraph node's class
+//      BY DESIGN, so the provenance-clean check false-fires on the genuine container.
+//      The ever-seen gate and the container-shape check are NOT relaxed. -------------
+
+const SUBGRAPH_UUID = "2454ad83-157c-40dd-9f19-5daaf4041ce0";
+
+// A SubgraphNode as current ComfyUI_frontend builds it (registerSubgraphNodeDef): type
+// is the subgraph's UUID (never in /object_info); the registered class AND the
+// instance's own constructor carry the synthesized nodeDef (nodeData + comfyClass).
+function uuidSubgraphContainer(reg) {
+  const inner = { id: 301, type: "KSampler", widgets: [{ name: "value_4", type: "INT", value: 20 }] };
+  const node = {
+    id: 320,
+    type: SUBGRAPH_UUID,
+    widgets: [{ name: "value_4", type: "INT", value: 20 }],
+    subgraph: { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) },
+    inputs: [{ name: "value_4", _subgraphSlot: { name: "value_4" } }],
+  };
+  const ctor = function ComfySubgraphNode() {};
+  ctor.nodeData = { input: { required: {} }, name: SUBGRAPH_UUID };
+  ctor.comfyClass = SUBGRAPH_UUID;
+  node.constructor = ctor;
+  reg[SUBGRAPH_UUID] = ctor;
+  return node;
+}
+const RESOLVED = { promotionResolvedToAuthorizedConcrete: true };
+
+test("#512: provenance-stamped UUID container + resolved-authorized promotion ⇒ authorized (the reported false refusal)", () => {
+  const reg = loadedRegistry();
+  const node = uuidSubgraphContainer(reg);
+  const fresh = objectInfo(); // the UUID is never in /object_info
+  assert.doesNotThrow(() =>
+    assertMutatedNodeAuthorized(fresh, reg, node, "outer subgraph", () => false, RESOLVED),
+  );
+});
+
+test("#512: the SAME container WITHOUT the resolved-promotion evidence ⇒ still refused (no general relaxation)", () => {
+  // A bare container whose class carries def markers but whose promotion was NOT
+  // positively resolved + authorized keeps the pre-#512 verdict — the flag is the only
+  // thing that changed, so this pins the exemption's scope.
+  const reg = loadedRegistry();
+  const node = uuidSubgraphContainer(reg);
+  const fresh = objectInfo();
+  assert.throws(
+    () => assertMutatedNodeAuthorized(fresh, reg, node, "outer subgraph", () => false),
+    /not a verifiable frontend-only \/ virtual-subgraph node/i,
+  );
+});
+
+test("#512: the exemption requires POSITIVE never-seen history — an UNWIRED oracle fails closed even with the flag", () => {
+  // "no-oracle" is NOT never-seen: without the observed-backend-history trust root
+  // there is no non-forgeable evidence the type was never backend-defined, so the
+  // resolved-promotion exemption must not engage (the panel always wires the oracle).
+  const reg = loadedRegistry();
+  const node = uuidSubgraphContainer(reg);
+  const fresh = objectInfo();
+  assert.throws(
+    () => assertMutatedNodeAuthorized(fresh, reg, node, "outer subgraph", undefined, RESOLVED),
+    /not a verifiable frontend-only \/ virtual-subgraph node/i,
+  );
+});
+
+test("#512: an EVER-SEEN (removed) container type is refused even with the flag — the trust root is not bypassed", () => {
+  const reg = loadedRegistry();
+  const node = uuidSubgraphContainer(reg);
+  const fresh = objectInfo(); // type ABSENT now…
+  assert.throws(
+    () =>
+      assertMutatedNodeAuthorized(fresh, reg, node, "outer subgraph", (t) => t === SUBGRAPH_UUID, RESOLVED), // …but seen EARLIER
+    /was defined by the ComfyUI backend earlier this session|since-removed/i,
+  );
+});
+
+test("#512: the flag does not authorize a provenance-bearing NON-container leaf", () => {
+  // The exemption is for virtual-subgraph CONTAINERS only: a leaf node whose class
+  // carries def markers and whose type is absent from /object_info is still refused.
+  const reg = loadedRegistry();
+  const ctor = function ComfyNode() {};
+  ctor.nodeData = { input: { required: {} } };
+  ctor.comfyClass = "SomeBackendishType";
+  reg["SomeBackendishType"] = ctor;
+  const leaf = {
+    id: 9,
+    type: "SomeBackendishType",
+    widgets: [{ name: "steps", type: "INT", value: 0 }],
+    constructor: ctor,
+  };
+  const fresh = objectInfo();
+  assert.throws(
+    () => assertMutatedNodeAuthorized(fresh, reg, leaf, "outer subgraph", () => false, RESOLVED),
+    /not a verifiable frontend-only \/ virtual-subgraph node/i,
+  );
+});
