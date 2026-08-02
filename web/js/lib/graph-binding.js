@@ -150,6 +150,23 @@ function graphShape(state) {
 }
 
 /**
+ * Strict positive proof that a root graph now represents this exact serialized
+ * state. Unlike the ordinary read guard, this does NOT treat missing serializer
+ * data or a dirty workflow as inconclusive: callers use it only after they have
+ * just asked `loadGraphData` to install `state`, so an absent proof must not turn
+ * into a fabricated success.
+ */
+export function graphRootMatchesState({ rootGraph, state } = {}) {
+  try {
+    const expected = graphShape(state);
+    const actual = graphShape(rootGraph?.serialize?.());
+    return expected != null && actual != null && expected === actual;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * True when the live ROOT graph is demonstrably a different workflow from the
  * active workflow's own serialized state. Unlike graphReadDesynced's original
  * empty-canvas check, this catches a stale *nonempty* canvas (for example an
