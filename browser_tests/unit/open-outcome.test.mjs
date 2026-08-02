@@ -110,6 +110,19 @@ function codeBlockAt(src, marker) {
   throw new Error(`unterminated block: ${marker}`);
 }
 
+/** Extract one simple top-level function for a behavioral panel-source test. */
+function namedFunctionSource(src, name) {
+  const start = src.indexOf(`function ${name}(`);
+  if (start === -1) return null;
+  const open = src.indexOf("{", start);
+  let depth = 0;
+  for (let i = open; i < src.length; i += 1) {
+    if (src[i] === "{") depth += 1;
+    if (src[i] === "}" && --depth === 0) return src.slice(start, i + 1);
+  }
+  return null;
+}
+
 const receiptFor = (requested, extra = {}) =>
   makeOpenReceipt({
     seq: 1,
@@ -865,4 +878,169 @@ test("#402 wiring: workflow_list exposes the receipt + the POSITIVE trust flag",
   assert.match(body, /interpretation:/, "last_open must state how it may be read");
   assert.match(body, /answers ONLY for the command/);
   assert.match(body, /do not infer success from `active` matching your target/);
+});
+
+test("#716 wiring: post-open and active workflow responses carry the live instance UUID", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const list = handlerBody(src, "workflow_list()");
+  const open = handlerBody(src, "async workflow_open({");
+  assert.ok(list && open, "workflow_list and workflow_open must exist");
+  // The response source must be the live workflow object, not a path alias or
+  // a stale mounted graph. The MCP only adopts a separately validated UUID.
+  assert.match(list, /const \{ active, activeIdentity \} = liveWorkflowListActive\(\);/);
+  assert.doesNotMatch(list, /const active = s\.activeWorkflow;/, "workflow_list must not publish a pre-reconnect service binding");
+  assert.match(list, /activeIdentity \? \{ workflow_uuid: activeIdentity\.uuid \} : \{\}/);
+  assert.match(open, /activeWorkflowUuidForOpenReply\(target\)/);
+  assert.doesNotMatch(open, /activeWorkflowUuidForOpenReply\(target, s\.activeWorkflow\)/);
+  assert.match(open, /activeWorkflowUuid \? \{ workflow_uuid: activeWorkflowUuid \} : \{\}/);
+});
+
+test("#716 P1: service rebind during workflow_open omits the former target UUID", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const pathSource = namedFunctionSource(src, "savedWorkflowPath");
+  const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
+  const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
+  assert.ok(pathSource && canonicalUuidSource && identitySource && helperSource, "the reply identity check must live in the shipped panel source");
+
+  const openedTarget = { isPersisted: true, isTemporary: false, path: "workflows/a.json" };
+  const otherActive = { isPersisted: true, isTemporary: false, path: "workflows/b.json" };
+  const workflowUuids = new WeakMap([
+    [openedTarget, "11111111-1111-4111-8111-111111111111"],
+    [otherActive, "22222222-2222-4222-8222-222222222222"],
+  ]);
+  // This is the actual final-reply input: activeWorkflowRef observes whatever
+  // workflow service is live at emission, not the service workflow_open held
+  // before its repaint/disk awaits.
+  let currentService = { activeWorkflow: openedTarget };
+  const replyUuid = new Function(
+    "activeWorkflowRef",
+    "_workflowObjectUuids",
+    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+  )(
+    () => currentService.activeWorkflow,
+    workflowUuids,
+  );
+
+  assert.equal(replyUuid(openedTarget), "11111111-1111-4111-8111-111111111111", "the normal completed open reports its actual active tab");
+  // workflow_open has retained its old local `s`, but a reconnect/rebind has
+  // replaced the service before the final reply. The old service could still
+  // report A; the actual binding now says B. Returning target.uuid here would
+  // stamp the NEXT graph command for the wrong live canvas.
+  const staleService = currentService;
+  currentService = { activeWorkflow: otherActive };
+  assert.equal(staleService.activeWorkflow, openedTarget, "the pre-await service still looks like the opened target");
+  assert.equal(replyUuid(openedTarget), null, "the re-bound live service omits the stale reply UUID and leaves the MCP fence unchanged");
+  assert.equal(replyUuid(otherActive), "22222222-2222-4222-8222-222222222222", "the same helper still reports the actual active tab");
+});
+
+test("#716 P1: service rebind during workflow_list reports only the current active UUID", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const pathSource = namedFunctionSource(src, "savedWorkflowPath");
+  const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
+  const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  const listActiveSource = namedFunctionSource(src, "liveWorkflowListActive");
+  assert.ok(pathSource && canonicalUuidSource && identitySource && listActiveSource, "workflow_list must obtain its active identity through the shipped live-binding helper");
+
+  const staleActive = { isPersisted: true, isTemporary: false, path: "workflows/a/foo.json" };
+  const currentActive = { isPersisted: true, isTemporary: false, path: "workflows/b/foo.json" };
+  const workflowUuids = new WeakMap([
+    [staleActive, "11111111-1111-4111-8111-111111111111"],
+    [currentActive, "22222222-2222-4222-8222-222222222222"],
+  ]);
+  let currentService = { activeWorkflow: staleActive };
+  const listActive = new Function(
+    "activeWorkflowRef",
+    "_workflowObjectUuids",
+    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${listActiveSource}; return liveWorkflowListActive;`,
+  )(
+    () => currentService.activeWorkflow,
+    workflowUuids,
+  );
+
+  assert.equal(listActive().activeIdentity?.uuid, "11111111-1111-4111-8111-111111111111");
+  const staleService = currentService;
+  currentService = { activeWorkflow: currentActive };
+  assert.equal(staleService.activeWorkflow, staleActive, "the old executor service still points at A");
+  const reply = listActive();
+  assert.equal(reply.active, currentActive, "workflow_list observes the re-bound live service, not its captured service");
+  assert.equal(reply.activeIdentity?.uuid, "22222222-2222-4222-8222-222222222222", "only B's current UUID is eligible for the list response");
+  assert.notEqual(reply.activeIdentity?.uuid, "11111111-1111-4111-8111-111111111111");
+});
+
+test("#716 P1: a malformed truthy active binding cannot mint reply identity", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const pathSource = namedFunctionSource(src, "savedWorkflowPath");
+  const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
+  const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
+  const malformedActive = {};
+  const workflowUuids = new WeakMap();
+  const replyUuid = new Function(
+    "activeWorkflowRef",
+    "_workflowObjectUuids",
+    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+  )(
+    () => malformedActive,
+    workflowUuids,
+  );
+
+  // Execute the actual shipped reply helper against a truthy but malformed
+  // binding. It must be an observation only: no tmp routing id and no UUID can
+  // be initialized while deciding whether to publish the response field.
+  assert.equal(replyUuid(malformedActive), null);
+  assert.equal(workflowUuids.has(malformedActive), false, "must not mint an ephemeral workflow UUID");
+});
+
+test("#716 P1: a temporary workflow UUID is never published as a durable refresh source", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const pathSource = namedFunctionSource(src, "savedWorkflowPath");
+  const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
+  const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
+  const temporaryActive = { isPersisted: false, isTemporary: true };
+  const workflowUuids = new WeakMap([[temporaryActive, "33333333-3333-4333-8333-333333333333"]]);
+  const replyUuid = new Function(
+    "activeWorkflowRef",
+    "_workflowObjectUuids",
+    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+  )(
+    () => temporaryActive,
+    workflowUuids,
+  );
+
+  // Even an existing object-map UUID is insufficient for a temporary tab:
+  // its tmp routing identity is ephemeral, so it cannot refresh the MCP's
+  // durable command fence.
+  assert.equal(replyUuid(temporaryActive), null);
+});
+
+test("#716 P1: existing mapped UUIDs still omit when noncanonical", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const pathSource = namedFunctionSource(src, "savedWorkflowPath");
+  const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
+  const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
+  const invalidVersion = { isPersisted: true, isTemporary: false, path: "workflows/invalid-version.json" };
+  const invalidVariant = { isPersisted: true, isTemporary: false, path: "workflows/invalid-variant.json" };
+  const uppercase = { isPersisted: true, isTemporary: false, path: "workflows/uppercase.json" };
+  const workflowUuids = new WeakMap([
+    [invalidVersion, "44444444-4444-0444-8444-444444444444"],
+    [invalidVariant, "55555555-5555-4555-7555-555555555555"],
+    [uppercase, "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"],
+  ]);
+  let active = invalidVersion;
+  const replyUuid = new Function(
+    "activeWorkflowRef",
+    "_workflowObjectUuids",
+    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+  )(
+    () => active,
+    workflowUuids,
+  );
+
+  for (const workflow of [invalidVersion, invalidVariant, uppercase]) {
+    active = workflow;
+    assert.equal(replyUuid(workflow), null, `mapped ${workflow.path} must not publish a noncanonical UUID`);
+  }
 });
