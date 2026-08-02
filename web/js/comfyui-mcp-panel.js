@@ -6791,53 +6791,10 @@ const GRAPH_TOOL_EXECUTORS = {
         }
       })();
       // Keep the conversion path and the established #418 path on the same
-      // conservative adjudicator. The legacy block below remains a harmless
-      // fallback for this direct-node path; once this helper clears the flag it
-      // naturally skips its own `has_errors` guard.
+      // conservative adjudicator. It includes missing node types as well as
+      // model/media candidates and validation errors, so there must be no
+      // second, narrower cleanup predicate after this call.
       if (stillActive) clearStaleRedFlag(node, { app, graph, rootGraph });
-      // Only clear the flag on a DIRECT (non-container) node. `node` here is what was
-      // resolved from the caller's node_id in the CURRENT graph; for a PROMOTED write it
-      // is the OUTER subgraph wrapper while the value actually changes an INNER node, so
-      // the outer's redness can't be adjudicated from the inner candidates (they resolve
-      // to the inner node, not this wrapper) — clearing it could hide a still-missing
-      // inner sibling asset (codex round-7 P1). Skip wrappers: leaving the flag is the
-      // safe over-report direction. A DIRECT write to a plain node (the #418 repro) and a
-      // write to an inner node while inside its subgraph both have no `.subgraph` here.
-      if (stillActive && node?.has_errors && !node.subgraph) {
-        // DISTRUST the live combo here (trustComboOverride=false): clearing a red flag is
-        // DESTRUCTIVE, so it must never rely on possibly-stale combo membership. #418's
-        // real signal is the still-REFERENCED check — the repointed widget no longer holds
-        // the missing filename, so the candidate drops regardless of combo. An asset that
-        // reappeared, was confirmed, then DELETED (widget value unchanged) is still
-        // referenced ⇒ candidate kept ⇒ flag KEPT, never cleared off a stale combo that
-        // still lists it (codex round-9 P0).
-        const assets = collectMissingAssets(false);
-        // Use the SAME validation surface graph_get_errors trusts: app.lastNodeErrors
-        // PLUS the execution-error Pinia store's lastNodeErrors, which outlives some
-        // app-level resets (codex #4). Only clear when NEITHER still blames this node.
-        let storeNodeErrors = null;
-        try {
-          storeNodeErrors = getPiniaStore("executi" + "on" + "Error")?.lastNodeErrors ?? null;
-        } catch {
-          /* optional */
-        }
-        // Pass both maps SEPARATELY (OR semantics) so a node blamed by EITHER source
-        // keeps its red flag — never a shallow merge, whose empty entry could shadow the
-        // other map's live error and wrongly clear it (codex round-2 P0).
-        if (
-          nodeRedFlagIsStale(node.id, {
-            missingItems: [...assets.models, ...assets.media],
-            nodeErrorsMaps: [app?.lastNodeErrors ?? null, storeNodeErrors],
-            // A nested candidate is keyed by a SCOPED locator that never string-equals
-            // this inner node's local id — resolve it and compare identity so a still-
-            // missing nested asset keeps the flag (codex round-3 P0).
-            resolvesToNode: (scopedId) => findNodeByScopedId(rootGraph, scopedId) === node,
-          })
-        ) {
-          node.has_errors = false;
-          graph.setDirtyCanvas?.(true, true);
-        }
-      }
     } catch {
       /* best-effort visual cleanup — never fail the write over it */
     }

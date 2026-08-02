@@ -21,6 +21,7 @@ function methodSource(name, args) {
 
 const createSource = methodSource("graph_create_subgraph", "\\{ node_ids \\}");
 const groupSource = methodSource("graph_subgraph_group", "\\{ group \\}");
+const setWidgetSource = methodSource("async graph_set_widget", "\\{ node_id, widget, value \\}");
 const cleanupMatch = panelSrc.match(/function clearStaleRedFlag\(node, \{ app, graph, rootGraph \}\) \{[\s\S]*?\n\}\n\n\/\*\*/);
 assert.ok(cleanupMatch, "could not locate clearStaleRedFlag in panel source");
 const cleanupSource = cleanupMatch[0].replace(/\n\/\*\*$/, "");
@@ -166,4 +167,17 @@ test("real stale-outline cleanup clears only an unblamed direct node (#516)", ()
   assert.equal(clear(node, { app: { lastNodeErrors: {} }, graph, rootGraph: graph }), true);
   assert.equal(node.has_errors, false);
   assert.equal(dirtied, 1);
+});
+
+test("graph_set_widget delegates all stale-outline clearing to the shared adjudicator (#516 P1)", () => {
+  assert.match(
+    setWidgetSource,
+    /clearStaleRedFlag\(node, \{ app, graph, rootGraph \}\)/,
+    "the direct set-widget path must execute the complete shared adjudicator",
+  );
+  assert.doesNotMatch(
+    setWidgetSource,
+    /nodeRedFlagIsStale\(/,
+    "a narrower duplicate predicate could clear a missing-node-type outline",
+  );
 });
