@@ -241,6 +241,38 @@ export function nodeRedFlagIsStale(
 }
 
 /**
+ * Return the direct graph neighbours connected to `node`. Native
+ * `convertToSubgraph()` rewires precisely these surviving root-graph nodes to
+ * the new wrapper, but does not re-adjudicate LiteGraph's sticky `has_errors`
+ * bit (#516). Supports both live `LLink` records and serialized link tuples;
+ * malformed graph shapes simply produce no candidates.
+ */
+export function collectLinkedNeighborNodeIds(node, links) {
+  const out = new Set();
+  try {
+    const lookup = (id) => {
+      if (id == null || !links) return null;
+      return typeof links.get === "function" ? links.get(id) ?? null : links[id] ?? null;
+    };
+    const originId = (link) => link?.origin_id ?? link?.[1];
+    const targetId = (link) => link?.target_id ?? link?.[3];
+    for (const input of node?.inputs ?? []) {
+      const id = originId(lookup(input?.link));
+      if (id != null) out.add(id);
+    }
+    for (const output of node?.outputs ?? []) {
+      for (const linkId of output?.links ?? []) {
+        const id = targetId(lookup(linkId));
+        if (id != null) out.add(id);
+      }
+    }
+  } catch {
+    // Best effort only: a malformed graph must never make a conversion fail.
+  }
+  return out;
+}
+
+/**
  * A missing-asset store candidate is stale (should NOT be reported) when either
  * no widget still references the file (the value was changed to a fix) OR the
  * file resolves against the node's live combo options (it appeared on disk).
