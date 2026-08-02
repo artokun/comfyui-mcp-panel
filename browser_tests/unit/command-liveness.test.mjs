@@ -121,7 +121,7 @@ test("codex R8: replay never crosses a bridge change — entries for another bri
   const body = src.slice(start, src.indexOf("\n  }", start));
   assert.match(
     body,
-    /if \(!isReplayable\(entry, \{ now: Date\.now\(\), targetUrl, targetEpoch \}\)\) \{\s*\n\s*dropped\+\+;\s*\n\s*continue;/,
+    /if \(!isReplayable\(entry, \{ now, targetUrl, targetEpoch \}\)\) \{\s*\n\s*dropped\+\+;\s*\n\s*continue;/,
     "an outcome belonging to a previous bridge, session, or too old must never be volunteered",
   );
   assert.match(body, /lostReplies\.replace\(keep\)/, "only undeliverable-but-still-ours entries are retried");
@@ -276,12 +276,14 @@ test("codex R11 / #694: summaries obey the SAME cross-bridge/session/age rule as
   assert.match(replayBody, /type: "lost_replies",/, "the summaries frame must exist");
   assert.match(
     replayBody,
-    /entries: lostReplies\.summaries\(\{ now: Date\.now\(\), targetUrl, targetEpoch \}\)/,
+    /entries: lostReplies\.summaries\(\{ now, targetUrl, targetEpoch \}\)/,
     "the summaries must be filtered with the SAME url+epoch the replay loop uses",
   );
   const epochAt = replayBody.indexOf("const targetEpoch = target?.__cmcpBridgeEpoch;");
   const summaryAt = replayBody.indexOf('type: "lost_replies"');
   const loopAt = replayBody.indexOf("for (const entry of lost) {");
+  const nowAt = replayBody.indexOf("const now = Date.now();");
+  assert.ok(nowAt !== -1 && nowAt < summaryAt, "one captured instant must serve BOTH the summary frame and the replay checks");
   assert.ok(epochAt !== -1 && summaryAt !== -1 && loopAt !== -1);
   assert.ok(
     epochAt < summaryAt && summaryAt < loopAt,
