@@ -23,13 +23,16 @@
 // it executes fresh, and the reuse is logged once via onRidReuse (the bridge
 // should only ever re-dispatch the SAME command under a reused rid).
 //
-// Bounded: oldest-first eviction of SETTLED entries keeps a long session from
-// growing it without limit. An IN-FLIGHT entry is NEVER evicted — dropping an
-// unsettled command would let its replay re-execute and double-apply a mutation
-// — so past `cap` CONCURRENT in-flight commands the ledger simply grows (bounded
-// by real concurrency, which is tiny); the settled cap still applies. Settled
-// eviction fails OPEN: a replay older than the cap re-executes, which is exactly
-// the pre-ledger behaviour — never a new failure mode.
+// Bounded: oldest-first eviction of SETTLED entries — swept on every begin AND
+// every settle (a past-cap burst of concurrent in-flight commands has nothing
+// evictable at begin; only a settle-time sweep re-applies the bound as those
+// entries complete) — keeps a long session from growing it without limit. An
+// IN-FLIGHT entry is NEVER evicted — dropping an unsettled command would let
+// its replay re-execute and double-apply a mutation — so past `cap` CONCURRENT
+// in-flight commands the ledger simply grows (bounded by real concurrency,
+// which is tiny); the settled cap still applies. Settled eviction fails OPEN: a
+// replay older than the cap re-executes, which is exactly the pre-ledger
+// behaviour — never a new failure mode.
 //
 // Dependency-free (no LiteGraph, no DOM). Unit-testable with plain fixtures.
 
@@ -55,7 +58,8 @@ export function commandFingerprint(msg) {
 }
 
 /**
- * @param {number} cap  max remembered SETTLED entries (oldest evicted first)
+ * @param {number} cap  max remembered SETTLED entries (oldest evicted first;
+ *    swept on begin and on settle)
  * @param {(message: string) => void} [onRidReuse]  called once when a rid
  *    arrives under a DIFFERENT fingerprint than a remembered entry — i.e. the
  *    bridge reused a request id for different work (anomalous; worth a log).
@@ -73,6 +77,19 @@ export function createCommandDedupeLedger(cap = 200, onRidReuse) {
   // the oldest entry is always the first key. (The \n separator is safe: rids
   // are UUIDs and canonical JSON never contains a raw newline.)
   const entries = new Map();
+
+  // Evict oldest-first while over cap, but NEVER an in-flight entry (see
+  // header): with every entry in flight this grows the ledger past cap
+  // instead of evicting, which is the safe direction. Called on begin AND on
+  // settle — a burst of >cap concurrent in-flight commands is only trimmable
+  // once its entries start settling.
+  const evictSettled = () => {
+    for (const [k, entry] of entries) {
+      if (entries.size <= cap) break;
+      if (entry.inflight) continue;
+      entries.delete(k);
+    }
+  };
 
   return {
     get(rid, fingerprint) {
@@ -102,14 +119,7 @@ export function createCommandDedupeLedger(cap = 200, onRidReuse) {
       const key = `${rid}\n${fingerprint}`;
       let settle;
       entries.set(key, { rid, inflight: true, promise: new Promise((resolve) => { settle = resolve; }) });
-      // Evict oldest-first while over cap, but NEVER an in-flight entry (see
-      // header): with every entry in flight this grows the ledger past cap
-      // instead of evicting, which is the safe direction.
-      for (const [k, entry] of entries) {
-        if (entries.size <= cap) break;
-        if (entry.inflight) continue;
-        entries.delete(k);
-      }
+      evictSettled();
       let settled = false;
       return (reply) => {
         if (settled) return; // settle exactly once — later calls can't rewrite history
@@ -124,6 +134,9 @@ export function createCommandDedupeLedger(cap = 200, onRidReuse) {
           entry.reply = reply;
           delete entry.promise;
         }
+        // A past-cap burst of concurrent in-flight commands grows the ledger
+        // (nothing evictable at begin) — re-apply the bound as entries settle.
+        evictSettled();
       };
     },
   };

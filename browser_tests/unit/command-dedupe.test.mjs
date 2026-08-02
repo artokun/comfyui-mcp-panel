@@ -217,3 +217,23 @@ test("a different bridge-stamped workflow_uuid is a DIFFERENT command even with 
   assert.equal(ran, 2);
   assert.equal(warnings.length, 1);
 });
+
+test("a past-cap in-flight burst is swept back to the cap as entries settle (#517 re-gate)", async () => {
+  const ledger = createCommandDedupeLedger(200);
+  // 202 commands concurrently in flight — nothing is evictable at begin time,
+  // so the ledger grows past cap (safe direction).
+  const settles = [];
+  for (let i = 0; i <= 200; i += 1) settles.push(ledger.begin(`r${i}`, `fp${i}`));
+  const settleLive = ledger.begin("r-live", "fp-live"); // pinned in flight
+
+  // All 201 settle: the settle-time sweep must re-apply the bound, dropping the
+  // oldest SETTLED entries while the in-flight one is never touched.
+  settles.forEach((s, i) => s({ rid: `r${i}`, ok: true, result: {} }));
+
+  assert.equal(ledger.get("r0", "fp0"), undefined, "oldest settled entry swept on settle");
+  assert.equal(ledger.get("r1", "fp1"), undefined, "swept down to the cap, not one past it");
+  assert.notEqual(ledger.get("r2", "fp2"), undefined, "settled entries within the cap are kept");
+  assert.notEqual(ledger.get("r200", "fp200"), undefined, "newest settled entry is kept");
+  assert.notEqual(ledger.get("r-live", "fp-live"), undefined, "the in-flight entry is never evicted");
+  settleLive({ rid: "r-live", ok: true, result: {} });
+});
