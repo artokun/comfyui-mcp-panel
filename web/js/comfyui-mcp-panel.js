@@ -256,6 +256,7 @@ import {
   graphReadBindingChanged,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
+import { queuePromptScopeArgs, createRunFetchInterceptor } from "./lib/run-scope-guard.js";
 import { queueMembership, historyEntryFor } from "./lib/history-reconcile.js";
 import {
   normalizeModels,
@@ -7774,8 +7775,19 @@ const GRAPH_TOOL_EXECUTORS = {
       partialTargets = [res.execId];
     }
 
-    // app.queuePrompt(number, batchCount, queueNodeIds) — the 3rd arg becomes the
-    // request's partial_execution_targets (queue-service signature; ComfyUI 0.26.2).
+    // app.queuePrompt(number, batchCount, queueNodeIds | QueuePromptOptions) —
+    // the 3rd arg becomes the request's partial_execution_targets, but its SHAPE
+    // differs across frontend builds: a positional NodeExecutionId[] on some, a
+    // { queueNodeIds } options object on others (options builds carry an
+    // Array.isArray compat shim for the legacy array). A build that accepts only
+    // ONE shape SILENTLY IGNORES the other — the scope never reaches the request
+    // and the FULL graph queues while panel_run reports ran_to_node (#556). A
+    // scoped run must NEVER fall through to a full-graph execution, so:
+    //   1. try each arg shape in turn (queuePromptScopeArgs), and
+    //   2. let the fetch interceptor VERIFY the scope actually landed in the
+    //      POST /prompt body BEFORE the request leaves — a dropped scope blocks
+    //      the dispatch (nothing is queued), and if no shape delivers, REFUSE
+    //      with a truthful error instead of lying about a scoped run.
     //
     // #358: app.queuePrompt SWALLOWS a synchronous rejection. It stores per-node
     // validation errors on `lastNodeErrors`, but a TOP-LEVEL rejection (e.g.
@@ -7783,53 +7795,24 @@ const GRAPH_TOOL_EXECUTORS = {
     // outputs failed validation") is shown in a dialog and then DISCARDED — it
     // never reaches `lastNodeErrors` (which stays `{}`). Inspecting only
     // `lastNodeErrors` therefore reports a false `queued:true` for a prompt
-    // ComfyUI refused ~1ms after "got prompt". Capture the raw non-200 /prompt
-    // body — the only place the top-level `error` exists — by wrapping fetchApi
-    // for the duration of THIS queue call, then let summarizePromptRejection turn
-    // it into a real failure. All queue paths POST /prompt through fetchApi, so
-    // this is version-robust regardless of app.queuePrompt's internal plumbing.
-    // Capture the FIRST top-level rejection (app.queuePrompt breaks its batch loop
-    // on the first rejected prompt, so there is at most one) plus EVERY accepted
-    // prompt_id — a batch>1 run queues N separate prompts, each of which needs its
-    // own #370 recovery-ledger entry. The panel dispatches agent commands serially
-    // (each command is replied to before the next tool runs), so graph_run's queue
-    // call does not overlap another graph_run; we save + restore the exact prior
-    // api.fetchApi so even a hypothetical nested wrap unwinds cleanly.
+    // ComfyUI refused ~1ms after "got prompt". The interceptor captures the raw
+    // non-200 /prompt body — the only place the top-level `error` exists — and
+    // summarizePromptRejection turns it into a real failure. All queue paths
+    // POST /prompt through fetchApi, so this is version-robust regardless of
+    // app.queuePrompt's internal plumbing. Capture the FIRST top-level rejection
+    // (app.queuePrompt breaks its batch loop on the first rejected prompt, so
+    // there is at most one) plus EVERY accepted prompt_id — a batch>1 run queues
+    // N separate prompts, each of which needs its own #370 recovery-ledger
+    // entry. The panel dispatches agent commands serially (each command is
+    // replied to before the next tool runs), so graph_run's queue call does not
+    // overlap another graph_run; we save + restore the exact prior api.fetchApi
+    // around EACH attempt so even a hypothetical nested wrap unwinds cleanly.
     let promptRejection = null;
     const queuedPromptIds = [];
+    let scopeDropped = null;
     const prevFetchApi =
       typeof api?.fetchApi === "function" ? api.fetchApi : null;
     const origFetchApi = prevFetchApi ? prevFetchApi.bind(api) : null;
-    if (origFetchApi) {
-      api.fetchApi = async (route, options) => {
-        const res = await origFetchApi(route, options);
-        try {
-          const method = String(options?.method || "GET").toUpperCase();
-          const path = typeof route === "string" ? route.split("?")[0] : "";
-          if (method === "POST" && path.endsWith("/prompt") && res) {
-            const body = await res.clone().json();
-            if (res.status !== 200) {
-              if (promptRejection == null && body && (body.error || body.node_errors)) {
-                promptRejection = { error: body.error ?? null, node_errors: body.node_errors ?? null };
-              }
-            } else if (body && body.prompt_id != null) {
-              // Accepted — remember EACH prompt_id so #370 reconcile can recover a
-              // run that starts AND finishes entirely inside a connection drop. Use a
-              // NULLISH presence check (!= null), NOT truthiness — a falsy-but-valid
-              // id like 0 must flow through ingestion, or a drop before lifecycle
-              // frames would lose the completion (#370). Normalize to a STRING AT
-              // CAPTURE so dedupe is canonical (0 and "0" are the same run) and
-              // everything downstream stays string-vs-string.
-              const pid = String(body.prompt_id);
-              if (!queuedPromptIds.includes(pid)) queuedPromptIds.push(pid);
-            }
-          }
-        } catch {
-          // non-JSON body / clone unsupported — fall back to lastNodeErrors below.
-        }
-        return res;
-      };
-    }
     // #445: guard the VHS null-widget serialization crash. ComfyUI core / node
     // extensions (notably VHS_VideoCombine) serialize EVERY node's widgets when
     // building the prompt — even unused branches, even under "run to node" — and
@@ -7842,11 +7825,52 @@ const GRAPH_TOOL_EXECUTORS = {
     // the deferred serialization queuePrompt runs when its processor is already
     // busy) without permanently altering the live workflow.
     installGraphToPromptNullSafety(app);
-    try {
-      await app.queuePrompt(0, batch, partialTargets);
-    } finally {
-      if (origFetchApi) api.fetchApi = prevFetchApi;
+    if (partialTargets && !origFetchApi) {
+      // A scoped run we can't VERIFY (no fetchApi to inspect the outgoing prompt)
+      // is a scoped run we can't guarantee — refuse rather than risk a silent
+      // full-graph execution (#556).
+      return {
+        queued: false,
+        error:
+          `run-to-node scope for node ${to_node_id} cannot be verified — api.fetchApi is ` +
+          `unavailable on this frontend, so there is no way to confirm the scope reaches the ` +
+          `prompt. Nothing was queued rather than risk a full-graph execution (#556).`,
+      };
     }
+    for (const scopeArg of queuePromptScopeArgs(partialTargets)) {
+      scopeDropped = null;
+      promptRejection = null;
+      queuedPromptIds.length = 0;
+      if (origFetchApi) {
+        api.fetchApi = createRunFetchInterceptor({
+          origFetchApi,
+          partialTargets: partialTargets ?? null,
+          toNodeId: to_node_id,
+          onRejection: (r) => {
+            // Capture the FIRST top-level rejection only (see above).
+            if (promptRejection == null) promptRejection = r;
+          },
+          onPromptId: (pid) => {
+            // EVERY accepted prompt_id, string-normalized at capture (0 and "0"
+            // are the same run) so #370 reconcile stays string-vs-string.
+            if (!queuedPromptIds.includes(pid)) queuedPromptIds.push(pid);
+          },
+          onScopeDropped: (msg) => {
+            if (scopeDropped == null) scopeDropped = msg;
+          },
+        });
+      }
+      try {
+        await app.queuePrompt(0, batch, scopeArg);
+      } finally {
+        if (origFetchApi) api.fetchApi = prevFetchApi;
+      }
+      // The scope verifiably reached /prompt (or none was requested) — proceed.
+      // A DROPPED scope means the unscoped POST was blocked BEFORE dispatch, so
+      // retrying the other arg shape can never double-queue.
+      if (!scopeDropped) break;
+    }
+    if (scopeDropped) return { queued: false, error: scopeDropped };
     // Register EVERY accepted prompt_id for reconnect reconciliation (#370) —
     // BEFORE the rejection check. With batch>1, app.queuePrompt breaks its loop on
     // the first rejection, so an EARLIER repetition can be accepted (already
