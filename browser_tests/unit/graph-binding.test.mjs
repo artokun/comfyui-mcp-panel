@@ -21,6 +21,7 @@ import {
   graphRootMismatchesActiveWorkflow,
   graphRootWorkflowUuidMismatches,
   graphRootWorkflowUuidMatches,
+  graphRootMatchesState,
   graphCommandMayMutateWorkflow,
   graphReadBindingChanged,
 } from "../../web/js/lib/graph-binding.js";
@@ -297,6 +298,18 @@ test("graphRootMismatchesActiveWorkflow: FALSE - matching serialized semantic st
     graphRootMismatchesActiveWorkflow({ rootGraph: serializedRoot(structuredClone(activeState)), activeWorkflow }),
     false,
   );
+});
+
+test("graphRootMatchesState: strict positive proof rejects a missing serializer and a same-UUID stale shape (#721)", () => {
+  const wanted = state(2);
+  wanted.extra = { comfyui_mcp: { workflow_uuid: "workflow-A" } };
+  assert.equal(graphRootMatchesState({ rootGraph: serializedRoot(structuredClone(wanted)), state: wanted }), true);
+  assert.equal(
+    graphRootMatchesState({ rootGraph: serializedRoot({ ...wanted, nodes: [{ id: 1, type: "Other" }, { id: 2, type: "Other" }] }), state: wanted }),
+    false,
+    "the target UUID alone cannot prove a stale same-workflow root was repainted",
+  );
+  assert.equal(graphRootMatchesState({ rootGraph: { _nodes: [] }, state: wanted }), false, "no serializer is no success proof");
 });
 
 test("graphRootMismatchesActiveWorkflow: FALSE - node array order and viewport drift do not invent a mismatch", () => {

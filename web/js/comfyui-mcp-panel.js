@@ -252,6 +252,7 @@ import {
   graphRootMismatchesActiveWorkflow,
   graphRootWorkflowUuidMismatches,
   graphRootWorkflowUuidMatches,
+  graphRootMatchesState,
   graphCommandMayMutateWorkflow,
   graphReadBindingChanged,
 } from "./lib/graph-binding.js";
@@ -8305,6 +8306,28 @@ const GRAPH_TOOL_EXECUTORS = {
       });
       return err;
     };
+    // An open can switch the workflow service before the panel manages to repaint
+    // LiteGraph. That is not a clean negative: retrying is not a harmless assertion
+    // that nothing happened, because the active workflow may already have changed.
+    // Journal the partial result explicitly rather than returning an `opened` receipt
+    // that tells the caller its graph-binding recovery worked when it did not (#721).
+    const failOpenRebindUnknown = (err) => {
+      noteOpenAttempt({
+        cmd: "workflow_open",
+        rid,
+        requested: path,
+        resolved: target
+          ? {
+              path: target.path,
+              filename: target.filename,
+              routing_key: workflowTabId(target),
+            }
+          : null,
+        applied: "unknown",
+        error: coerceMessageText(err?.message ?? err),
+      });
+      return err;
+    };
     const s = app?.extensionManager?.workflow;
     if (!s?.openWorkflow) throw failOpen(new Error("workflow service unavailable"));
     const find = () => {
@@ -8379,6 +8402,7 @@ const GRAPH_TOOL_EXECUTORS = {
     let reloaded = false;
     let reloadError = null;
     let openFailed = null;
+    let rebindFailed = null;
     if (priorInteraction !== null) canvasView.allow_interaction = false;
     // Hold the switch+reload critical section across the WHOLE mutating sequence. The canvas
     // freeze keeps the USER out; this keeps the BRIDGE out, so a concurrent graph_* command
@@ -8436,15 +8460,81 @@ const GRAPH_TOOL_EXECUTORS = {
       // LiteGraph canvas flag, not a workflow-service member.
         beginWorkflowReloadStep(reloadGuardToken);
         try {
-          const st = target.changeTracker?.activeState;
-          if (st && typeof app.loadGraphData === "function") {
-            await app.loadGraphData(JSON.parse(JSON.stringify(st)), true, true, target);
+          // `activeWorkflowNodeCount` deliberately accepts both tracker-owned and flat
+          // activeState shapes. Use that SAME state source here: otherwise a frontend
+          // that reports the active workflow's 15 nodes through flat `target.activeState`
+          // skips this repaint, returns `opened`, and leaves every graph tool behind the
+          // desync guard (#721).
+          const st = target.changeTracker?.activeState ?? target.activeState;
+          if (!st || !Array.isArray(st.nodes)) {
+            // A zero-node target still needs a POSITIVE binding proof. Otherwise an
+            // unsupported frontend can leave the previous nonempty canvas mounted and
+            // receive a fabricated {opened} just because the target happens to be empty.
+            rebindFailed = new Error(
+              "workflow_open could not rebind the active canvas because this frontend did not expose " +
+                "a complete workflow state for a safe repaint. The open may have switched the active " +
+                "workflow; inspect panel_list_workflows, then reload the panel before graph edits.",
+            );
+          } else if (typeof app.loadGraphData !== "function") {
+            rebindFailed = new Error(
+              "workflow_open could not rebind the active canvas because this frontend does not expose " +
+                "loadGraphData. The open may have switched the active workflow; reload the panel before graph edits.",
+            );
+          } else {
+            // A graph shape is not ownership proof: two dirty tabs can have the same
+            // nodes, and the normal read guard intentionally stays inconclusive for a
+            // dirty, un-stamped root. Stamp THIS target's live-object identity into the
+            // exact cloned state that is about to be loaded, then require that marker on
+            // the resulting root. The UUID is panel-owned metadata, not caller input;
+            // this is the same workflow identity used by the command fence.
+            const targetUuid = workflowStableUuid(target, { embed: true });
+            const repaintState = JSON.parse(JSON.stringify(st));
+            const repaintExtra =
+              repaintState.extra && typeof repaintState.extra === "object" && !Array.isArray(repaintState.extra)
+                ? repaintState.extra
+                : {};
+            const repaintMeta =
+              repaintExtra[WORKFLOW_META_NAMESPACE] &&
+              typeof repaintExtra[WORKFLOW_META_NAMESPACE] === "object" &&
+              !Array.isArray(repaintExtra[WORKFLOW_META_NAMESPACE])
+                ? repaintExtra[WORKFLOW_META_NAMESPACE]
+                : {};
+            repaintState.extra = {
+              ...repaintExtra,
+              [WORKFLOW_META_NAMESPACE]: {
+                ...repaintMeta,
+                [WORKFLOW_UUID_FIELD]: targetUuid,
+                ...(target.path ? { [WORKFLOW_PATH_FIELD]: target.path } : {}),
+              },
+            };
+            await app.loadGraphData(repaintState, true, true, target);
+            // A successful promise alone is not a binding receipt: old/partial frontend
+            // implementations can resolve while leaving app.canvas on the previous root.
+            // Demand the positive, target-specific marker even for dirty workflows —
+            // read-only graph comparisons intentionally cannot prove that case.
+            const { rootGraph } = getGraphCtx();
+            if (
+              activeWorkflowRef() !== target ||
+              !graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid: targetUuid }) ||
+              !graphRootMatchesState({ rootGraph, state: repaintState })
+            ) {
+              rebindFailed = new Error(
+                "workflow_open could not prove that the active canvas was rebound to the requested workflow. " +
+                  "The open may have switched the active workflow; reload the panel before graph edits.",
+              );
+            }
           }
         } catch (err) {
-          console.warn("[comfyui-mcp-panel] workflow_open repaint failed:", err?.message ?? err);
+          rebindFailed = err instanceof Error ? err : new Error(coerceMessageText(err));
+          console.warn("[comfyui-mcp-panel] workflow_open repaint failed:", rebindFailed.message);
         } finally {
           endWorkflowReloadStep(reloadGuardToken);
         }
+        // Do not touch the change tracker, inspect disk state, or re-baseline until
+        // the target-specific repaint proof above succeeds. In particular, capturing a
+        // still-stale root as a clean baseline after a failed repaint would corrupt the
+        // target's in-memory state and make a later save/fence believe it was trustworthy.
+        if (!rebindFailed) {
         // Opening alone must not dirty the tab (a spurious post-load change-tracker
         // diff otherwise flips it to modified:true and blocks an unforced close).
         //
@@ -8623,6 +8713,7 @@ const GRAPH_TOOL_EXECUTORS = {
               "window before it could re-baseline the tab, so the tab may still show as modified";
           }
         }
+        }
       }
     } catch (err) {
       // NEVER claim a reload we did not complete — report the failure and leave the caller
@@ -8637,6 +8728,7 @@ const GRAPH_TOOL_EXECUTORS = {
       if (priorInteraction !== null) canvasView.allow_interaction = priorInteraction;
     }
     if (openFailed) throw failOpen(openFailed);
+    if (rebindFailed) throw failOpenRebindUnknown(rebindFailed);
     const receipt = noteOpenAttempt({
       cmd: "workflow_open",
       rid,

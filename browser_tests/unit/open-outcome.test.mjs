@@ -54,6 +54,62 @@ function handlerBody(src, sig) {
   return src.slice(start, m ? after + m.index : src.length);
 }
 
+/** The balanced block starting at an `if (...) {` marker. The source contracts below
+ * need to prove a failure cannot merely skip one statement and then reach a later
+ * re-baseline/disk read. Strip comments and literals first so their prose/braces do
+ * not affect the lightweight structural scan. */
+function blockAt(src, marker) {
+  const start = src.indexOf(marker);
+  assert.notEqual(start, -1, `missing block marker: ${marker}`);
+  const brace = src.indexOf("{", start + marker.length);
+  assert.notEqual(brace, -1, `missing opening brace: ${marker}`);
+  const scan = stripComments(src).replace(/(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*")/g, "");
+  const scanBrace = scan.indexOf("{", start + marker.length);
+  let depth = 0;
+  for (let i = scanBrace; i < scan.length; i += 1) {
+    if (scan[i] === "{") depth += 1;
+    if (scan[i] === "}" && --depth === 0) return src.slice(brace, i + 1);
+  }
+  throw new Error(`unterminated block: ${marker}`);
+}
+
+/** Extract a balanced source block while ignoring braces in comments and strings. */
+function codeBlockAt(src, marker) {
+  const start = src.indexOf(marker);
+  assert.notEqual(start, -1, `missing block marker: ${marker}`);
+  const brace = src.indexOf("{", start + marker.length);
+  assert.notEqual(brace, -1, `missing opening brace: ${marker}`);
+  let depth = 0;
+  for (let i = brace; i < src.length; i += 1) {
+    const ch = src[i];
+    if (ch === "/" && src[i + 1] === "/") {
+      i = src.indexOf("\n", i + 2);
+      if (i < 0) break;
+      continue;
+    }
+    if (ch === "/" && src[i + 1] === "*") {
+      i = src.indexOf("*/", i + 2);
+      if (i < 0) break;
+      i += 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      for (i += 1; i < src.length; i += 1) {
+        if (src[i] === "\\") {
+          i += 1;
+          continue;
+        }
+        if (src[i] === quote) break;
+      }
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    if (ch === "}" && --depth === 0) return src.slice(brace, i + 1);
+  }
+  throw new Error(`unterminated block: ${marker}`);
+}
+
 const receiptFor = (requested, extra = {}) =>
   makeOpenReceipt({
     seq: 1,
@@ -367,20 +423,69 @@ test("#402 wiring: workflow_open BOUNDS the post-open disk read and never claims
   assert.ok(OPEN_DISK_READ_BUDGET_MS > 0 && OPEN_DISK_READ_BUDGET_MS <= 10000);
 });
 
-test("#402 wiring: workflow_open journals BOTH outcomes, and every early throw is a negative", () => {
+test("#402/#721 wiring: workflow_open journals clean negatives and partial rebind outcomes", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const body = handlerBody(src, "async workflow_open({");
   assert.match(body, /const failOpen = \(err\) => \{/, "there must be a single negative-journal helper");
   assert.match(body, /applied: false/, "the failure path must journal applied:false");
   assert.match(body, /noteOpenAttempt\(\{[\s\S]*?cmd: "workflow_open",[\s\S]*?applied: true,/, "the success path must journal a receipt");
-  // Every `throw` inside workflow_open must go through failOpen — an unjournaled throw
-  // leaves a lost reply with no evidence at all. Code only: the prose discusses throws.
-  const rawThrows = [...stripComments(body).matchAll(/\bthrow (?!failOpen)/g)];
+  // A failed post-switch repaint is not a clean negative: the active workflow may
+  // already have changed. It must be journaled UNKNOWN, while every other throw
+  // remains a request that definitely did not apply. Code only: prose discusses throws.
+  assert.match(body, /const failOpenRebindUnknown = \(err\) => \{/);
+  assert.match(body, /applied: "unknown"/);
+  const rawThrows = [...stripComments(body).matchAll(/\bthrow (?!failOpen|failOpenRebindUnknown)/g)];
   assert.equal(
     rawThrows.length,
     0,
-    `every throw in workflow_open must be journaled via failOpen (found ${rawThrows.length} raw throws)`,
+    `every throw in workflow_open must be journaled as a clean negative or unknown partial outcome (found ${rawThrows.length} raw throws)`,
   );
+});
+
+test("#721 P1: an already-active workflow requires state even when empty, then proves the repaint", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const body = handlerBody(src, "async workflow_open({");
+  // graph-binding accepts both shapes; repainting only the tracker form stranded a
+  // legitimate active tab whose state is exposed flat on the workflow object.
+  assert.match(body, /const st = target\.changeTracker\?\.activeState \?\? target\.activeState;/);
+  assert.match(
+    body,
+    /if \(!st \|\| !Array\.isArray\(st\.nodes\)\) \{[\s\S]{0,500}?rebindFailed = new Error\(/,
+    "a state-less EMPTY target cannot report opened against the prior canvas",
+  );
+  const repaintAt = body.indexOf("await app.loadGraphData(repaintState, true, true, target);");
+  const proofAt = body.indexOf("graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid: targetUuid })", repaintAt);
+  const openedAt = body.lastIndexOf("applied: true");
+  assert.ok(repaintAt !== -1 && proofAt > repaintAt && openedAt > proofAt, "must prove the repaint before success");
+  // A failed/missing repaint is an honest unknown after s.openWorkflow may have
+  // switched tabs, never the old fabricated {opened} receipt.
+  assert.match(body, /if \(rebindFailed\) throw failOpenRebindUnknown\(rebindFailed\);/);
+  assert.match(body, /workflow_open could not rebind the active canvas/);
+});
+
+test("#721 P1: dirty rebind success requires the target UUID, never only a read-shaped comparison", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const body = handlerBody(src, "async workflow_open({");
+  const repaintStart = body.indexOf("const targetUuid = workflowStableUuid");
+  const repaint = body.slice(repaintStart, body.indexOf("} catch (err)", repaintStart));
+  assert.match(repaint, /const targetUuid = workflowStableUuid\(target, \{ embed: true \}\);/);
+  assert.match(repaint, /\[WORKFLOW_UUID_FIELD\]: targetUuid/);
+  assert.match(repaint, /await app\.loadGraphData\(repaintState, true, true, target\);/);
+  assert.match(repaint, /activeWorkflowRef\(\) !== target/);
+  assert.match(repaint, /graphRootWorkflowUuidMatches\(\{ rootGraph, activeWorkflowUuid: targetUuid \}\)/);
+  assert.match(repaint, /graphRootMatchesState\(\{ rootGraph, state: repaintState \}\)/);
+  assert.doesNotMatch(repaint, /assertGraphBoundToActiveWorkflow\(/, "the read guard is deliberately non-strict for dirty roots");
+});
+
+test("#721 P1: a failed rebind never re-baselines, reads disk, or reloads the stale root", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const body = handlerBody(src, "async workflow_open({");
+  const successOnly = codeBlockAt(body, "if (!rebindFailed)");
+  assert.match(successOnly, /await clearSpuriousOpenModified\(target, \{/);
+  assert.match(successOnly, /await withDeadline\(/);
+  assert.match(successOnly, /await app\.loadGraphData\(diskGraph/);
+  const unknownAt = body.indexOf("if (rebindFailed) throw failOpenRebindUnknown(rebindFailed);");
+  assert.ok(unknownAt > body.indexOf("if (!rebindFailed)"), "the unknown receipt is emitted only after the guarded success-only work");
 });
 
 test("#442 defect-2 wiring: the re-read is gated on a FRESH dirty re-check (no silent data loss)", () => {
@@ -591,7 +696,7 @@ test("#442 DATA-LOSS: every mutating await of the section is held across its own
   );
   // The repaint load has the same clobber shape (it overwrites the canvas with the tab's
   // pre-edit buffer), so it must be held too.
-  const repaintAt = body.indexOf("await app.loadGraphData(JSON.parse(JSON.stringify(st))");
+  const repaintAt = body.indexOf("await app.loadGraphData(repaintState, true, true, target);");
   assert.notEqual(repaintAt, -1);
   const repaintBegin = body.lastIndexOf("beginWorkflowReloadStep(reloadGuardToken);", repaintAt);
   const repaintEnd = body.indexOf("endWorkflowReloadStep(reloadGuardToken);", repaintAt);
