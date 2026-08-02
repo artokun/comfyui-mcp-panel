@@ -117,6 +117,7 @@ import {
   collectMissingNodeTypeReasons,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
+  collectLinkedNeighborNodeIds,
   findNodeByScopedId,
   resolveMissingModelDirectory,
 } from "./lib/asset-staleness.js";
@@ -4556,6 +4557,58 @@ function collectMissingAssets(trustComboOverride) {
   return { models, media, nodeTypes, nodeCount, any: !!(models.length || media.length || nodeTypes.length || nodeCount) };
 }
 
+/**
+ * LiteGraph's `has_errors` bit is sticky: a node can retain a red outline after
+ * its cause is gone. Clear it only when the same conservative #418
+ * missing-asset and validation-map adjudication says no source still blames the
+ * direct node. Containers are deliberately excluded: an outer subgraph wrapper
+ * cannot be safely adjudicated from candidates resolving to an inner node.
+ */
+function clearStaleRedFlag(node, { app, graph, rootGraph }) {
+  try {
+    if (!node?.has_errors || node.subgraph) return false;
+    // Clearing is destructive, so do not trust a possibly stale combo list. A
+    // live missing candidate is retained whenever its widget still references it.
+    const assets = collectMissingAssets(false);
+    let storeNodeErrors = null;
+    try {
+      storeNodeErrors = getPiniaStore("executi" + "on" + "Error")?.lastNodeErrors ?? null;
+    } catch {
+      // Optional Pinia store.
+    }
+    if (
+      nodeRedFlagIsStale(node.id, {
+        missingItems: [...assets.models, ...assets.media],
+        // Keep a real error from either independent source; never shallow-merge.
+        nodeErrorsMaps: [app?.lastNodeErrors ?? null, storeNodeErrors],
+        resolvesToNode: (scopedId) => findNodeByScopedId(rootGraph, scopedId) === node,
+      })
+    ) {
+      node.has_errors = false;
+      graph?.setDirtyCanvas?.(true, true);
+      return true;
+    }
+  } catch {
+    // Visual cleanup must not turn a successful graph mutation into a failure.
+  }
+  return false;
+}
+
+/**
+ * `convertToSubgraph()` rewires surviving root-graph neighbours to its new
+ * wrapper but does not revalidate their sticky red flags. Re-adjudicate only
+ * those direct neighbours; never the wrapper or the nodes moved inside it.
+ */
+function clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph }) {
+  try {
+    for (const id of collectLinkedNeighborNodeIds(res?.node, graph?.links)) {
+      clearStaleRedFlag(graph?.getNodeById?.(id), { app, graph, rootGraph });
+    }
+  } catch {
+    // Best effort only.
+  }
+}
+
 // ComfyUI resolves an input-asset value on the SERVER's platform (os.path.join):
 // a backslash is a path separator ONLY on Windows; on POSIX it is a literal
 // filename character. The /view probe must split the value exactly the way the
@@ -6727,6 +6780,11 @@ const GRAPH_TOOL_EXECUTORS = {
           return false;
         }
       })();
+      // Keep the conversion path and the established #418 path on the same
+      // conservative adjudicator. The legacy block below remains a harmless
+      // fallback for this direct-node path; once this helper clears the flag it
+      // naturally skips its own `has_errors` guard.
+      if (stillActive) clearStaleRedFlag(node, { app, graph, rootGraph });
       // Only clear the flag on a DIRECT (non-container) node. `node` here is what was
       // resolved from the caller's node_id in the CURRENT graph; for a PROMOTED write it
       // is the OUTER subgraph wrapper while the value actually changes an INNER node, so
@@ -8355,7 +8413,7 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   graph_create_subgraph({ node_ids }) {
-    const { graph, canvas } = getGraphCtx();
+    const { app, graph, canvas, rootGraph } = getGraphCtx();
     if (typeof graph.convertToSubgraph !== "function") {
       throw new Error("convertToSubgraph unavailable on this frontend");
     }
@@ -8372,6 +8430,7 @@ const GRAPH_TOOL_EXECUTORS = {
     } finally {
       graph.afterChange?.();
     }
+    clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph });
     graph.setDirtyCanvas?.(true, true);
     return {
       subgraph: {
@@ -8387,7 +8446,7 @@ const GRAPH_TOOL_EXECUTORS = {
   // same convertToSubgraph path as graph_create_subgraph. This is how a region
   // like a "REPLACEMENT MODE" group becomes one toggleable subgraph node.
   graph_subgraph_group({ group }) {
-    const { graph, canvas } = getGraphCtx();
+    const { app, graph, canvas, rootGraph } = getGraphCtx();
     if (typeof graph.convertToSubgraph !== "function") {
       throw new Error("convertToSubgraph unavailable on this frontend");
     }
@@ -8413,6 +8472,7 @@ const GRAPH_TOOL_EXECUTORS = {
     } finally {
       graph.afterChange?.();
     }
+    clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph });
     graph.setDirtyCanvas?.(true, true);
     return {
       subgraph: {

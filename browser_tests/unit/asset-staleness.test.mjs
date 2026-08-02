@@ -23,6 +23,7 @@ import {
   collectMissingNodeTypeReasons,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
+  collectLinkedNeighborNodeIds,
   resolveMissingModelDirectory,
 } from "../../web/js/lib/asset-staleness.js";
 
@@ -623,6 +624,31 @@ test("nodeRedFlagIsStale: OR across multiple maps — an EMPTY entry in one must
     nodeRedFlagIsStale(5, { nodeErrorsMaps: [{ 5: { errors: [] } }, null] }),
     true,
   );
+});
+
+// ---- #516: native subgraph conversion rewires direct root neighbours -------
+test("collectLinkedNeighborNodeIds finds every direct neighbour after a native subgraph conversion (#516)", () => {
+  // Wrapper input link: LoadImage (7) → wrapper; wrapper output link: wrapper → SaveImage (9).
+  // A second output uses the serialized tuple shape present in some LiteGraph paths.
+  const wrapper = {
+    inputs: [{ link: 11 }],
+    outputs: [{ links: [12, 13] }],
+  };
+  const links = new Map([
+    [11, { origin_id: 7, target_id: 100 }],
+    [12, { origin_id: 100, target_id: 9 }],
+    [13, [13, 100, 1, "uuid-target", 0, "IMAGE"]],
+  ]);
+  assert.deepEqual(
+    [...collectLinkedNeighborNodeIds(wrapper, links)].sort(),
+    [7, 9, "uuid-target"].sort(),
+  );
+});
+
+test("collectLinkedNeighborNodeIds fails closed on malformed link storage (#516)", () => {
+  const wrapper = { inputs: [{ link: 1 }], outputs: [{ links: [2] }] };
+  assert.deepEqual([...collectLinkedNeighborNodeIds(wrapper, null)], []);
+  assert.deepEqual([...collectLinkedNeighborNodeIds(null, {})], []);
 });
 
 // --- resolveMissingModelDirectory (#487) — Ultralytics bbox/segm subfolder ---
