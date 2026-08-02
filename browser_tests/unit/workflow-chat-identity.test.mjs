@@ -102,11 +102,11 @@ test('#570 fence: stamped uuid but active is UNRESOLVABLE → REJECT (fail close
   assert.equal(commandWorkflowMismatch({ commandUuid: 'uuid-A', activeUuid: null }), true)
 })
 
-test('#570 fence: NO stamp (old orchestrator / identity-less tab) → never fenced', () => {
-  assert.equal(commandWorkflowMismatch({ commandUuid: undefined, activeUuid: 'uuid-B' }), false)
-  assert.equal(commandWorkflowMismatch({ commandUuid: '', activeUuid: 'uuid-B' }), false)
-  assert.equal(commandWorkflowMismatch({ commandUuid: '   ', activeUuid: 'uuid-B' }), false)
-  assert.equal(commandWorkflowMismatch({}), false)
+test('#718 fence: missing or blank stamp is a protected-command mismatch (fail closed)', () => {
+  assert.equal(commandWorkflowMismatch({ commandUuid: undefined, activeUuid: 'uuid-B' }), true)
+  assert.equal(commandWorkflowMismatch({ commandUuid: '', activeUuid: 'uuid-B' }), true)
+  assert.equal(commandWorkflowMismatch({ commandUuid: '   ', activeUuid: 'uuid-B' }), true)
+  assert.equal(commandWorkflowMismatch({}), true)
 })
 
 // #570 — FAIL-CLOSED durability carrier. The embedded graph.extra uuid is only trustworthy

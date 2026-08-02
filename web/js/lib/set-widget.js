@@ -52,6 +52,12 @@ export async function runSetWidget(
     beforeChange,
     afterChange,
     setDirty,
+    // The graph command handler captures its bridge-owned workflow stamp at
+    // dispatch. `runSetWidget` awaits fresh backend metadata before writing, so
+    // it rechecks that stamp immediately before every possible write. This is
+    // injected so the shared body stays browser-independent and its unit tests
+    // exercise the exact production write boundary.
+    assertTargetStillCurrent,
     refreshCombos,
     confirmServerAsset,
   } = {},
@@ -236,9 +242,19 @@ export async function runSetWidget(
   // (1) Preflight the OUTER node before ANY mutation; decide whether reconcile
   //     may run (never on a placeholder; skipped for subgraph parents).
   const { reconcile } = preflightSetWidgetTarget(liveRegistry(), node);
+  // Every mutation below belongs to the captured command's target. The fresh
+  // backend oracle above can yield to a workflow switch, so do not let helper
+  // repairs or recovery option changes mutate the stale graph before the main
+  // widget write gets its own fence check (#718).
+  const assertTargetStillCurrentNow = () => {
+    if (typeof assertTargetStillCurrent === "function") assertTargetStillCurrent();
+  };
   // (2) Repair positional UNKNOWN/UNKNOWN_n widget names against the live def so
   //     the caller's real widget name resolves (#199) — resolved direct node only.
-  if (reconcile) reconcileUnknownWidgetNames(node);
+  if (reconcile) {
+    assertTargetStillCurrentNow();
+    reconcileUnknownWidgetNames(node);
+  }
 
   // (3) applyWidgetWrite owns the whole write: for a PARENT SubgraphNode it
   // resolves a PROMOTED widget to its ACTUAL inner (node, widget) and writes
@@ -252,8 +268,13 @@ export async function runSetWidget(
   // resolveWidgetWrite — a real widget whose own name contains a dot still wins, and a
   // dotted form is only interpreted when no exact widget matches — so the split can
   // never silently misroute to a different widget.
-  const write = (extra = {}) =>
-    applyWidgetWrite(node, widgetName, value, {
+  const write = (extra = {}) => {
+    // No await follows this check before applyWidgetWrite, whose mutation is
+    // synchronous. A workflow switch while the fresh-object-info fetch was in
+    // flight therefore refuses before touching either canvas; retry and upload
+    // recovery use this same boundary too.
+    assertTargetStillCurrentNow();
+    return applyWidgetWrite(node, widgetName, value, {
       resolveSource,
       canvas,
       beforeChange,
@@ -263,6 +284,7 @@ export async function runSetWidget(
       promotedResolution,
       ...extra,
     });
+  };
 
   // #558: the value widget being written may be governed by a non-`fixed`
   // control_after_generate (seed randomize/increment/…), which SILENTLY overwrites
@@ -312,6 +334,9 @@ export async function runSetWidget(
       exists = false;
     }
     if (!exists) return false;
+    // confirmServerAsset may have yielded while the user changed canvases; do
+    // not add an option to the captured widget after that switch (#718).
+    assertTargetStillCurrentNow();
     return addComboOption(uploadWidget, value);
   };
 

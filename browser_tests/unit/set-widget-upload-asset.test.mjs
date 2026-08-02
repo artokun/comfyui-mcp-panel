@@ -60,6 +60,40 @@ test("nested LoadImage upload the combo never lists is accepted when the server 
   assert.ok(widget.options.values.includes("xyr_canvas/boswellia_source.png"));
 });
 
+test("#718: a workflow switch during upload confirmation cannot add an option or write", async () => {
+  const widget = { name: "image", type: "combo", options: { values: ["example.png"] }, value: "example.png" };
+  const node = { id: 191, type: "LoadImage", widgets: [widget] };
+  let current = true;
+  let releaseProbe;
+  let markProbeStarted;
+  const probeStarted = new Promise((resolve) => {
+    markProbeStarted = resolve;
+  });
+
+  const pending = runSetWidget(node, "image", "xyr_canvas/boswellia_source.png", {
+    registry: REGISTRY,
+    ...freshOracle,
+    refreshCombos: refreshFromFreshDefs,
+    confirmServerAsset: () => {
+      markProbeStarted();
+      return new Promise((resolve) => {
+        releaseProbe = () => resolve(true);
+      });
+    },
+    assertTargetStillCurrent: () => {
+      if (!current) throw new Error("workflow instance mismatch");
+    },
+  });
+
+  await probeStarted;
+  current = false;
+  releaseProbe();
+
+  await assert.rejects(pending, /workflow instance mismatch/);
+  assert.equal(widget.value, "example.png");
+  assert.deepEqual(widget.options.values, ["example.png"], "the stale command must not add its uploaded asset");
+});
+
 test("a plain model combo is NOT rescued by confirmServerAsset (gated to upload inputs)", async () => {
   const widget = {
     name: "ckpt_name",
