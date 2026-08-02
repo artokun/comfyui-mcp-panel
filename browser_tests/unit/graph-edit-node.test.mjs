@@ -36,12 +36,13 @@ function realGraphEditNode(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypa
   return factory(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor);
 }
 
-function realLegacyColor(getGraphCtx, resolveNode) {
+function realLegacyColor(getGraphCtx, resolveNode, normalizeLegacyNodeId) {
   return new Function(
     "getGraphCtx",
     "resolveNode",
+    "normalizeLegacyNodeId",
     `const executors = { ${legacyColorMatch[0]} }; return executors.graph_set_node_color;`,
-  )(getGraphCtx, resolveNode);
+  )(getGraphCtx, resolveNode, normalizeLegacyNodeId);
 }
 
 function realLegacyMotion(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId) {
@@ -84,13 +85,14 @@ function realLegacyCollapsed(getGraphCtx, resolveNode, refreshNodeArea, unsafeBy
   )(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor, normalizeLegacyNodeId);
 }
 
-function realLegacyMode(getGraphCtx, resolveNode, unsafeBypassMappings) {
+function realLegacyMode(getGraphCtx, resolveNode, unsafeBypassMappings, normalizeLegacyNodeId) {
   return new Function(
     "getGraphCtx",
     "resolveNode",
     "unsafeBypassMappings",
+    "normalizeLegacyNodeId",
     `const executors = { ${legacyModeMatch[0]} }; return executors.graph_set_node_mode;`,
-  )(getGraphCtx, resolveNode, unsafeBypassMappings);
+  )(getGraphCtx, resolveNode, unsafeBypassMappings, normalizeLegacyNodeId);
 }
 
 function makeNode(id, { pos = [0, 0], size = [140, 60], collapsible = true } = {}) {
@@ -156,6 +158,7 @@ function setupLegacyColor(node, palette = { blue: { color: "#123456", bgcolor: "
       if (id !== node.id) throw new Error(`No node with id ${id}`);
       return node;
     },
+    normalizeLegacyNodeId,
   );
   return { fn, events };
 }
@@ -245,6 +248,7 @@ function setupLegacyMode(node, unsafeBypassMappings = () => []) {
       return node;
     },
     unsafeBypassMappings,
+    normalizeLegacyNodeId,
   );
   return { fn, events };
 }
@@ -457,6 +461,28 @@ test("#538 legacy colors retain preset:null no-op and permissive CSS values", ()
   assert.deepEqual(presetWins, { node_id: 1, color: "#123456", bgcolor: "#654321" });
   assert.equal(node.color, "#123456", "legacy preset takes precedence over a supplied CSS color");
   assert.equal(node.bgcolor, "#654321");
+});
+
+test("#538 legacy color and mode normalize canonical numeric node-id strings before resolveNode", () => {
+  const colorNode = makeNode(1);
+  const { fn: color } = setupLegacyColor(colorNode);
+  assert.deepEqual(color({ node_id: "1", color: "red" }), { node_id: 1, color: "red", bgcolor: null });
+
+  const modeNode = makeNode(2);
+  const { fn: mode } = setupLegacyMode(modeNode);
+  assert.deepEqual(mode({ node_id: "2", mode: "mute" }), { node_id: 2, mode: "mute", previous_mode: "active" });
+
+  const badColorNode = makeNode(0);
+  const { fn: badColor, events: colorEvents } = setupLegacyColor(badColorNode);
+  assert.throws(() => badColor({ node_id: "01", color: "red" }), /node_id must be an integer/);
+  assert.equal(badColorNode.color, undefined);
+  assert.deepEqual(colorEvents, []);
+
+  const badModeNode = makeNode(1);
+  const { fn: badMode, events: modeEvents } = setupLegacyMode(badModeNode);
+  assert.throws(() => badMode({ node_id: true, mode: "mute" }), /node_id must be an integer/);
+  assert.equal(badModeNode.mode, undefined);
+  assert.deepEqual(modeEvents, []);
 });
 
 test("#538 legacy color and collapsed commands reject invalid values without mutating", () => {

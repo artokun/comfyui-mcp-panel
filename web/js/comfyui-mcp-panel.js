@@ -7172,7 +7172,7 @@ const GRAPH_TOOL_EXECUTORS = {
 
   graph_set_node_color({ node_id, color, bgcolor, preset }) {
     const { graph, LG } = getGraphCtx();
-    const node = resolveNode(graph, node_id);
+    const node = resolveNode(graph, normalizeLegacyNodeId(node_id));
     // This compatibility command intentionally retains its historic permissive
     // CSS-color contract. The consolidated graph_edit_node stays strict (hex only)
     // for new callers, but old MCP clients may legitimately send e.g. "red".
@@ -9351,7 +9351,7 @@ const GRAPH_TOOL_EXECUTORS = {
   graph_set_node_mode({ node_id, mode, force }) {
     if (force !== undefined && typeof force !== "boolean") throw new Error("force must be a boolean");
     const { graph } = getGraphCtx();
-    const node = resolveNode(graph, node_id);
+    const node = resolveNode(graph, normalizeLegacyNodeId(node_id));
     const MODE_TO_NUM = Object.assign(Object.create(null), { active: 0, bypass: 4, mute: 2 });
     const NUM_TO_MODE = { 0: "active", 2: "mute", 4: "bypass" };
     let target;
