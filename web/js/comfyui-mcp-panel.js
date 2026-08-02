@@ -9792,7 +9792,7 @@ const GRAPH_TOOL_EXECUTORS = {
             queue_pending: pending,
             message:
               `NOT rebooting — ComfyUI is busy (${running} generating, ${pending} queued). A reboot would ABORT the in-progress render. ` +
-              `Tell the user a generation is running and either wait for it to finish (poll get_queue / panel_node_queue_status) ` +
+              `Tell the user a generation is running and either wait for it to finish (poll queue (action:"list") / panel_node_queue_status) ` +
               `or, only if they confirm they want to kill it, call again with force:true.`,
           };
         }
