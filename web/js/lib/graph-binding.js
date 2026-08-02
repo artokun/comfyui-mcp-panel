@@ -77,6 +77,127 @@ export function graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph = 
 }
 
 /**
+ * Return the active workflow's serialized CURRENT graph state. `initialState`
+ * is deliberately excluded: it is a load/save baseline and can legitimately
+ * differ from an active canvas with unsaved edits. `null` means current state is
+ * unavailable, so callers must fail open rather than invent a binding mismatch.
+ */
+function activeWorkflowCurrentState(activeWorkflow) {
+  try {
+    if (!activeWorkflow || typeof activeWorkflow !== "object") return null;
+    const ct = activeWorkflow.changeTracker;
+    const state = (st) => (st && Array.isArray(st.nodes) ? st : null);
+    return (
+      state(ct?.activeState) ??
+      state(activeWorkflow.activeState)
+    );
+  } catch {
+    return null;
+  }
+}
+
+function graphShape(state) {
+  if (!state || !Array.isArray(state.nodes)) return null;
+  // Omit counters/version metadata that can legitimately differ after LiteGraph
+  // rebuilds; retain every serialized graph surface ChangeTracker treats as
+  // workflow state, so the binding guard cannot accept a different canvas that
+  // only differs in reroutes, floating links, or top-level subgraphs.
+  // ChangeTracker distinguishes a missing surface from an explicitly empty or
+  // null one. Preserve that distinction rather than `??`-normalizing it away.
+  const own = (key) => Object.prototype.hasOwnProperty.call(state, key);
+  const surface = (key) => ({ present: own(key), value: state[key] });
+  const extra = (() => {
+    if (!own("extra")) return { present: false };
+    if (!state.extra || typeof state.extra !== "object") return { present: true, value: state.extra };
+    const { ds: viewport, ...workflowExtra } = state.extra;
+    // A sole `extra.ds` is viewport-only, so it compares like no extra field.
+    if (viewport !== undefined && Object.keys(workflowExtra).length === 0) return { present: false };
+    return { present: true, value: workflowExtra };
+  })();
+  const shape = {
+    // LiteGraph preserves node array order opportunistically, but it does not
+    // identify a workflow: equivalent loads can emit the same nodes in a
+    // different order. Keep each node's full serialized content and normalize
+    // only their ordering by stable id.
+    nodes: [...state.nodes].sort((a, b) => String(a?.id ?? "").localeCompare(String(b?.id ?? ""))),
+    links: surface("links"),
+    floatingLinks: surface("floatingLinks"),
+    reroutes: surface("reroutes"),
+    groups: surface("groups"),
+    config: surface("config"),
+    subgraphs: surface("subgraphs"),
+    definitions: surface("definitions"),
+    // `extra.ds` is the viewport transform. Panning/zooming changes it without
+    // changing the workflow, so it must not block a valid graph command.
+    extra,
+  };
+  try {
+    const canonicalize = (value) => {
+      if (Array.isArray(value)) return value.map(canonicalize);
+      if (value && typeof value === "object") {
+        return Object.fromEntries(
+          Object.keys(value)
+            .sort()
+            .map((key) => [key, canonicalize(value[key])]),
+        );
+      }
+      return value;
+    };
+    return JSON.stringify(canonicalize(shape));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when the live ROOT graph is demonstrably a different workflow from the
+ * active workflow's own serialized state. Unlike graphReadDesynced's original
+ * empty-canvas check, this catches a stale *nonempty* canvas (for example an
+ * active nine-node tab while app.graph still holds a 63-node prior tab).
+ *
+ * Node count alone catches the common case. Where LiteGraph can serialize its
+ * root, compare the complete semantic graph state (nodes, widgets, links,
+ * groups, reroutes, floating links, top-level subgraphs, definitions, and extra)
+ * so same-sized tabs cannot be silently confused.
+ * Older/partial frontends fall back to an unordered `id` + `type` shape; if that
+ * is also unavailable, equal counts remain inconclusive and return false. The
+ * guard never manufactures a mismatch from partial state.
+ */
+export function graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow } = {}) {
+  const activeState = activeWorkflowCurrentState(activeWorkflow);
+  const expected = activeState?.nodes;
+  const live = rootGraph?._nodes;
+  if (!Array.isArray(expected) || !Array.isArray(live)) return false;
+  if (live.length !== expected.length) return true;
+
+  // Current LiteGraph can serialize its live ROOT graph. When both sides can be
+  // represented, compare the complete semantic shape so equal id:type node sets
+  // with different links, widgets, groups, or subgraphs cannot be confused.
+  // An unavailable/throwing serializer remains inconclusive and falls through to
+  // the older id:type comparison below.
+  try {
+    const liveShape = graphShape(rootGraph?.serialize?.());
+    const expectedShape = graphShape(activeState);
+    if (liveShape != null && expectedShape != null) return liveShape !== expectedShape;
+  } catch {
+    // Old/partial LiteGraph frontends: use the defensive shape fallback below.
+  }
+
+  const shape = (node) => {
+    if (!node || (typeof node.id !== "string" && typeof node.id !== "number") || typeof node.type !== "string") {
+      return null;
+    }
+    return `${typeof node.id}:${node.id}\u0000${node.type}`;
+  };
+  const expectedShapes = expected.map(shape);
+  const liveShapes = live.map(shape);
+  if (expectedShapes.includes(null) || liveShapes.includes(null)) return false;
+  const expectedSet = new Set(expectedShapes);
+  if (expectedSet.size !== expectedShapes.length) return false;
+  return liveShapes.some((entry) => !expectedSet.has(entry));
+}
+
+/**
  * True when the graph READ's binding changed across an AWAIT: the active-workflow
  * instance or the bound root-graph object captured before the await no longer
  * matches after it. Used to detect a workflow-tab SWITCH that interleaved with a
