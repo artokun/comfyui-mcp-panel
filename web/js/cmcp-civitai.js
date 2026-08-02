@@ -422,6 +422,11 @@ export class CivitaiClient {
   // pick the highest-level cover image whose level is in the selected set (mask);
   // drop the model entirely if none qualify (no NSFW cover leaking into an SFW view)
   _modelFromJson(j, levels) {
+    // #515: /v1/models gates nsfw=false loosely — entries explicitly flagged
+    // nsfw:true still come back. When the selected levels are SFW-only
+    // (mask ⊆ {PG, PG-13}), drop such models outright; cover-level filtering
+    // below alone isn't enough because a PG cover can front an NSFW model.
+    if (bitmask(levels) <= 3 && j.nsfw === true) return null;
     const mask = bitmask(levels);
     let best = null, bestLvl = -1;
     for (const v of j.modelVersions || []) {
