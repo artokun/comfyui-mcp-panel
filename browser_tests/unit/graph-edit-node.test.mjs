@@ -10,6 +10,8 @@ const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", imp
 const panelSrc = readFileSync(panelPath, "utf8");
 const methodMatch = panelSrc.match(/graph_edit_node\(args = \{\}\) \{[\s\S]*?\n  \},/);
 assert.ok(methodMatch, "could not locate graph_edit_node in panel source");
+const legacyColorMatch = panelSrc.match(/graph_set_node_color\(\{ node_id, color, bgcolor, preset \}\) \{[\s\S]*?\n  \},/);
+assert.ok(legacyColorMatch, "could not locate graph_set_node_color in panel source");
 
 function realGraphEditNode(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor) {
   const factory = new Function(
@@ -22,6 +24,14 @@ function realGraphEditNode(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypa
     `const executors = { ${methodMatch[0]} }; return executors.graph_edit_node;`,
   );
   return factory(getGraphCtx, resolveNode, refreshNodeArea, unsafeBypassMappings, resolveRailNode, railKindFor);
+}
+
+function realLegacyColor(getGraphCtx, resolveNode) {
+  return new Function(
+    "getGraphCtx",
+    "resolveNode",
+    `const executors = { ${legacyColorMatch[0]} }; return executors.graph_set_node_color;`,
+  )(getGraphCtx, resolveNode);
 }
 
 function makeNode(id, { pos = [0, 0], size = [140, 60], collapsible = true } = {}) {
@@ -60,6 +70,23 @@ function setup(nodes, { palette = { blue: { color: "#123456", bgcolor: "#654321"
     unsafeBypassMappings,
     resolveRailNode,
     railKindFor,
+  );
+  return { fn, events };
+}
+
+function setupLegacyColor(node, palette = { blue: { color: "#123456", bgcolor: "#654321" } }) {
+  const events = [];
+  const graph = {
+    beforeChange: () => events.push("before"),
+    afterChange: () => events.push("after"),
+    setDirtyCanvas: () => events.push("dirty"),
+  };
+  const fn = realLegacyColor(
+    () => ({ graph, LG: { LGraphCanvas: { node_colors: palette } } }),
+    (_graph, id) => {
+      if (id !== node.id) throw new Error(`No node with id ${id}`);
+      return node;
+    },
   );
   return { fn, events };
 }
@@ -195,15 +222,28 @@ test("#538 retains every legacy presentation bridge command for old MCP servers"
   }
 });
 
-test("#538 legacy title and color wrappers preserve their null compatibility behavior", () => {
+test("#538 legacy title wrapper preserves nullish-title compatibility", () => {
   assert.match(
     panelSrc,
     /graph_set_title\(\{ node_id, title \}\) \{[\s\S]*?graph_edit_node\(\{ node_id, title: title \?\? "" \}\)/,
     "nullish legacy titles must clear to an empty title, not become literal text",
   );
-  assert.match(
-    panelSrc,
-    /graph_set_node_color\(\{ node_id, color, bgcolor, preset \}\) \{[\s\S]*?if \(preset != null\) args\.preset = preset;[\s\S]*?else \{[\s\S]*?if \(color !== undefined\) args\.color = color;[\s\S]*?if \(bgcolor !== undefined\) args\.bgcolor = bgcolor;/,
-    "preset:null must retain the legacy explicit color/clear path",
-  );
+});
+
+test("#538 legacy colors retain preset:null no-op and permissive CSS values", () => {
+  const node = makeNode(1);
+  node.color = "#old";
+  node.bgcolor = "#body";
+  const { fn, events } = setupLegacyColor(node);
+
+  const unchanged = fn({ node_id: 1, preset: null });
+  assert.deepEqual(unchanged, { node_id: 1, color: "#old", bgcolor: "#body" });
+  assert.equal(node.color, "#old");
+  assert.equal(node.bgcolor, "#body");
+  assert.deepEqual(events, ["before", "after", "dirty"]);
+
+  const changed = fn({ node_id: 1, preset: null, color: "red", bgcolor: null });
+  assert.deepEqual(changed, { node_id: 1, color: "red", bgcolor: null });
+  assert.equal(node.color, "red", "legacy callers may use non-hex CSS colors");
+  assert.equal(Object.hasOwn(node, "bgcolor"), false, "null clears a legacy body color");
 });

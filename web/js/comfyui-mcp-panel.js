@@ -7132,17 +7132,32 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   graph_set_node_color({ node_id, color, bgcolor, preset }) {
-    const args = { node_id };
-    // Legacy `preset:null` meant "no preset", so retain the explicit color/clear
-    // branch rather than forwarding null as a supplied palette value.
-    if (preset != null) args.preset = preset;
-    else {
-      if (color !== undefined) args.color = color;
-      if (bgcolor !== undefined) args.bgcolor = bgcolor;
+    const { graph, LG } = getGraphCtx();
+    const node = resolveNode(graph, node_id);
+    // This compatibility command intentionally retains its historic permissive
+    // CSS-color contract. The consolidated graph_edit_node stays strict (hex only)
+    // for new callers, but old MCP clients may legitimately send e.g. "red".
+    graph.beforeChange?.();
+    try {
+      if (preset != null) {
+        const LGC = LG?.LGraphCanvas ?? globalThis.LGraphCanvas;
+        const palette = LGC?.node_colors?.[preset];
+        if (!palette) throw new Error(`unknown color preset "${preset}"`);
+        node.color = palette.color;
+        node.bgcolor = palette.bgcolor;
+      } else {
+        // `preset:null` was a successful no-op when no explicit field was supplied;
+        // otherwise null clears and every non-null value is string-coerced as before.
+        if (color === null) delete node.color;
+        else if (color != null) node.color = String(color);
+        if (bgcolor === null) delete node.bgcolor;
+        else if (bgcolor != null) node.bgcolor = String(bgcolor);
+      }
+    } finally {
+      graph.afterChange?.();
     }
-    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node(args);
-    const edit = result.edited[0];
-    return { node_id: edit.after.node_id, color: edit.after.color, bgcolor: edit.after.bgcolor };
+    graph.setDirtyCanvas?.(true, true);
+    return { node_id: node.id, color: node.color ?? null, bgcolor: node.bgcolor ?? null };
   },
 
   // Dependency-aware auto-layout of the active graph (or a `node_ids` subset).
