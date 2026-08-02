@@ -84,6 +84,12 @@ class ProviderCliGuiPath(unittest.TestCase):
         mod.shutil.which = lambda name: "/somewhere/on/path/" + name
         self.assertTrue(mod._provider_cli("codex"))
 
+    def test_pi_cmd_shim_is_not_reported_as_runnable(self):
+        # #491: the MCP uses shell-less spawn for pi, so `pi.cmd` cannot run.
+        # The panel must not show pi as installed from that Windows shim alone.
+        mod.shutil.which = lambda name: "C:/bin/pi.cmd" if name == "pi.cmd" else None
+        self.assertFalse(mod._provider_cli("pi"))
+
     def test_provider_state_ready_when_cli_in_fallback_and_auth_present(self):
         # End-to-end: cli found via fallback + ~/.codex/auth.json present => ready.
         self._install("codex")

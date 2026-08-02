@@ -105,7 +105,9 @@ _PROVIDER_CLIS = {
     "codex": ("codex", "codex.cmd", "codex.exe"),
     "gemini": ("gemini", "gemini.cmd", "gemini.exe"),
     "antigravity": ("agy", "agy.exe"),
-    "pi": ("pi", "pi.cmd", "pi.exe"),
+    # The MCP spawns pi without a shell, so a Windows .cmd shim is not runnable.
+    # Keep this probe aligned with its executable-only resolver (#491).
+    "pi": ("pi", "pi.exe"),
     "grok": ("grok", "grok.cmd", "grok.exe"),
     "kimi": ("kimi", "kimi.cmd", "kimi.exe"),
     "ollama": ("ollama", "ollama.exe"),
