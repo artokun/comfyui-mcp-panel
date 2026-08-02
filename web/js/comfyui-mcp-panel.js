@@ -3983,11 +3983,14 @@ function assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineRea
   const liveNodeCount = rootGraph?._nodes?.length ?? 0;
   const inSubgraph = !!rootGraph && graph !== rootGraph;
   const activeWorkflow = activeWorkflowRef();
-  // #545 — the WeakMap value is the only live-object identity we have already
-  // established for this workflow. Do NOT mint/read one here: if a stale root is
-  // currently mounted, deriving from its embedded metadata would adopt exactly
-  // the wrong graph we are trying to detect. Missing identity stays inconclusive.
-  const activeWorkflowUuid = activeWorkflow ? _workflowObjectUuids.get(activeWorkflow) : null;
+  // Every caller, including direct CivitAI graph_load and local snapshot restore,
+  // must establish the active object identity before relying on a dirty-tab
+  // relaxation. workflowStableUuid is root-blind when this object has no cache:
+  // it can use workflow-owned/load-bound metadata or mint a fresh id, but can
+  // never adopt the stale app.graph.extra we are trying to detect (#545 P1).
+  const activeWorkflowUuid = activeWorkflow
+    ? (_workflowObjectUuids.get(activeWorkflow) || workflowStableUuid(activeWorkflow))
+    : null;
   const currentStateTrustworthy = activeWorkflow?.isModified !== true;
   if (
     graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid }) ||
