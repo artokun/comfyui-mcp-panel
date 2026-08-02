@@ -3,9 +3,10 @@ import test from 'node:test'
 
 import {
   activeWorkflowFenceApplies,
+  commandWorkflowMismatch,
+  hasEmbeddedUuidSuccessionEvidence,
   selectorSearchIncludesListed,
   selectorTargetsNonActiveWorkflow,
-  commandWorkflowMismatch,
   isThreadInScope,
   isNewWorkflowLoad,
   normalizedWorkflowPath,
@@ -174,11 +175,12 @@ test('#570 P0b a fresh object (no cache) is NOT an in-place replace here → fal
 test('#557 fork away from an owned embedded uuid ONLY while the owner is still open', () => {
   const owner = { path: 'workflows/x.json' }
   const successor = { path: 'workflows/x.json' }
-  // Owner replaced (no longer an open workflow) → successor INHERITS, no fork —
-  // minting fresh here desynced the object from the root tag and blocked every
-  // graph tool until a frontend reload.
+  // Owner replaced (no longer an open workflow) AND succession proven →
+  // successor INHERITS, no fork — minting fresh here desynced the object from
+  // the root tag and blocked every graph tool until a frontend reload.
   assert.equal(shouldForkEmbeddedUuidForLiveOwner({
-    embeddedUuid: 'uuid-A', embeddedOwner: owner, identityObject: successor, ownerIsOpenWorkflow: false
+    embeddedUuid: 'uuid-A', embeddedOwner: owner, identityObject: successor,
+    ownerIsOpenWorkflow: false, successionProven: true
   }), false)
   // Owner still open alongside → a genuine co-open copy → fork (#570).
   assert.equal(shouldForkEmbeddedUuidForLiveOwner({
@@ -196,6 +198,59 @@ test('#557 fork away from an owned embedded uuid ONLY while the owner is still o
     embeddedUuid: 'uuid-A', embeddedOwner: null, identityObject: successor, ownerIsOpenWorkflow: true
   }), false)
   assert.equal(shouldForkEmbeddedUuidForLiveOwner(), false)
+})
+
+// #558 r9 P0 — a CLOSED owner is not succession: without positive evidence this
+// object continues the owner's FILE, a different-path copy must FORK, never
+// inherit (inheriting re-keys the uuid's owner record to the copy and lets
+// stale uuid-scoped commands for the old workflow pass the fence against it).
+test('#557 r9: closed-owner inheritance requires positive succession evidence', () => {
+  const owner = { isPersisted: true, path: 'workflows/x.json' }
+  const copy = { isPersisted: true, path: 'workflows/y.json' }
+  // Closed owner + NO succession evidence (default fails safe) → FORK.
+  assert.equal(shouldForkEmbeddedUuidForLiveOwner({
+    embeddedUuid: 'uuid-A', embeddedOwner: owner, identityObject: copy, ownerIsOpenWorkflow: false
+  }), true)
+  assert.equal(shouldForkEmbeddedUuidForLiveOwner({
+    embeddedUuid: 'uuid-A', embeddedOwner: owner, identityObject: copy,
+    ownerIsOpenWorkflow: false, successionProven: false
+  }), true)
+  // Closed owner + proven succession (same-file successor) → INHERIT.
+  assert.equal(shouldForkEmbeddedUuidForLiveOwner({
+    embeddedUuid: 'uuid-A', embeddedOwner: owner, identityObject: copy,
+    ownerIsOpenWorkflow: false, successionProven: true
+  }), false)
+})
+
+test('#557 r9: hasEmbeddedUuidSuccessionEvidence — file path record, alias, or owner lineage', () => {
+  const owner = { isPersisted: true, path: 'workflows/x.json' }
+  // 1. The file's own recorded workflow_path ties the uuid to this object's file.
+  assert.equal(hasEmbeddedUuidSuccessionEvidence({
+    embeddedUuid: 'uuid-A', embeddedPath: 'workflows/x.json', currentPath: 'workflows/x.json'
+  }), true)
+  assert.equal(hasEmbeddedUuidSuccessionEvidence({
+    embeddedUuid: 'uuid-A', embeddedPath: 'workflows\\x.json', currentPath: 'workflows/x.json'
+  }), true, 'separator normalization still ties the same file')
+  // 2. The canonical path alias ties this object's path to the uuid.
+  assert.equal(hasEmbeddedUuidSuccessionEvidence({
+    embeddedUuid: 'uuid-A', currentPath: 'workflows/y.json', pathAlias: 'uuid-A'
+  }), true)
+  // 3. The closed owner's unique on-disk file IS this object's file.
+  assert.equal(hasEmbeddedUuidSuccessionEvidence({
+    embeddedUuid: 'uuid-A', currentPath: 'workflows/x.json', embeddedOwner: owner
+  }), true)
+  // The r9 hole: different-path copy, file carries ONLY workflow_uuid (no
+  // workflow_path), no alias → NO evidence → fork.
+  assert.equal(hasEmbeddedUuidSuccessionEvidence({
+    embeddedUuid: 'uuid-A', embeddedPath: null, currentPath: 'workflows/y.json',
+    pathAlias: null, embeddedOwner: owner
+  }), false)
+  // An UNSAVED owner has no unique path (#186) — never evidence.
+  assert.equal(hasEmbeddedUuidSuccessionEvidence({
+    embeddedUuid: 'uuid-A', currentPath: 'workflows/Unsaved Workflow.json',
+    embeddedOwner: { isPersisted: false, path: 'workflows/Unsaved Workflow.json' }
+  }), false)
+  assert.equal(hasEmbeddedUuidSuccessionEvidence(), false)
 })
 
 // #558 r2 — openWorkflows holds Vue PROXIES while the owner/uuid WeakMaps can hold

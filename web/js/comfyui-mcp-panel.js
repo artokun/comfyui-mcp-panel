@@ -97,6 +97,7 @@ import {
 import {
   classifyPinnedTarget,
   commandTargetsActiveWorkflow,
+  hasEmbeddedUuidSuccessionEvidence,
   selectorSearchIncludesListed,
   selectorTargetsNonActiveWorkflow,
   isNewWorkflowLoad,
@@ -1677,6 +1678,19 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
       ownerIsOpenWorkflow:
         Array.isArray(openWorkflowsForOwnerCheck) &&
         openWorkflowsForOwnerCheck.some((w) => sameWorkflowObject(w, embeddedOwner)),
+      // r9 P0 — a CLOSED owner is not succession by itself: require positive
+      // evidence this object continues the owner's FILE (the file's recorded
+      // workflow_path ties the uuid here, an explicit alias, or the owner's own
+      // file matching this object's), or a different-path copy of a file that
+      // carries only workflow_uuid would inherit A's identity and re-key its
+      // owner record — letting stale A-scoped commands fence-pass against it.
+      successionProven: hasEmbeddedUuidSuccessionEvidence({
+        embeddedUuid: embedded,
+        embeddedPath,
+        currentPath: path,
+        pathAlias,
+        embeddedOwner,
+      }),
     })
   ) {
     id = crypto.randomUUID();

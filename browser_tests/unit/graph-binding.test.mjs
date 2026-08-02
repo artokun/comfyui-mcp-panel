@@ -27,6 +27,8 @@ import {
   resolveGraphRootUuidRebind,
 } from "../../web/js/lib/graph-binding.js";
 import {
+  commandWorkflowMismatch,
+  hasEmbeddedUuidSuccessionEvidence,
   isNewWorkflowLoad,
   rawWorkflowObject,
   sameWorkflowObject,
@@ -281,6 +283,7 @@ function buildSavedSuccessorHarness({
     "rememberWorkflowUuidOwner",
     "shouldForkEmbeddedWorkflowUuid",
     "shouldForkEmbeddedUuidForLiveOwner",
+    "hasEmbeddedUuidSuccessionEvidence",
     "resolveUnsavedInstanceUuid",
     "_loadGraphDataForkInstalled",
     "workflowOwnedExtra",
@@ -303,6 +306,7 @@ function buildSavedSuccessorHarness({
     (id, owner) => owners.set(id, owner),
     shouldForkEmbeddedWorkflowUuid,
     shouldForkEmbeddedUuidForLiveOwner,
+    hasEmbeddedUuidSuccessionEvidence,
     ({ objectUuid, embeddedId, forkActive }) => objectUuid || (forkActive && embeddedId) || `fresh-${++minted}`,
     true,
     () => null,
@@ -1461,6 +1465,43 @@ test("#570 r2: a co-open copy FORKS even when the live owner appears in openWork
   const id = stableUuid(successor);
   assert.notEqual(id, U1, "a proxy-wrapped live owner is still a live foreign owner — the copy must fork");
   assert.match(id, /^fresh-/);
+});
+
+test("#349 r9 P0: a CLOSED owner + different-path copy + no alias/embedded-path FORKS — never inherits", () => {
+  // The r9 hole: "the owner is closed" alone qualified as succession, so a copy
+  // of a file that carries ONLY workflow_uuid (saved from an unsaved tab, whose
+  // embed omitted workflow_path) inherited A's identity once A closed — then
+  // overwrote A's owner record, letting stale A-scoped commands pass the fence
+  // against the copy. Without positive succession evidence the copy must fork.
+  const { stableUuid, successor, replaced, owners, U1 } = buildSavedSuccessorHarness({
+    ownerOpen: false, // the owner is CLOSED
+    currentPath: "workflows/y.json", // the COPY lives at a different path
+    embeddedPath: null, // the file carries only workflow_uuid — no path record
+    aliases: {}, // and no alias exists
+  });
+  const id = stableUuid(successor);
+  assert.notEqual(id, U1, "a different-path copy with no succession evidence must FORK");
+  assert.match(id, /^fresh-/, "the copy gets a fresh per-instance identity");
+  assert.equal(owners.get(U1), replaced, "A's owner record stays intact — never re-keyed to the copy");
+  assert.equal(
+    commandWorkflowMismatch({ commandUuid: U1, activeUuid: id }),
+    true,
+    "stale A-scoped commands stay fenced against the copy (#349)",
+  );
+});
+
+test("#557 r9 control: a same-file successor still INHERITS through the closed owner's lineage", () => {
+  // The genuine continuation: the closed owner's unique on-disk file IS this
+  // object's file (save-swap / close→reopen of the same file) — positive
+  // succession evidence, so the identity (and its root tag) carries over.
+  const { stableUuid, successor, U1 } = buildSavedSuccessorHarness({
+    ownerOpen: false,
+    currentPath: "workflows/x.json", // same file as the closed owner
+    embeddedPath: null, // even without a path record or…
+    aliases: {}, // …an alias — the owner's own file is the evidence
+  });
+  const id = stableUuid(successor);
+  assert.equal(id, U1, "the same-file successor inherits the closed owner's identity");
 });
 
 test("#557 regression: after the save-swap, the guard sees no mismatch (root tag and object stay aligned)", () => {

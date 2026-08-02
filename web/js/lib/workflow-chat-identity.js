@@ -145,24 +145,67 @@ export function shouldForkEmbeddedWorkflowUuid({
  *  creation that INHERITED the source identity would be a wrong-resume (P0) — so, faced
  *  with an ambiguous arg, fork. */
 /** #557 — should a previously-unseen workflow object FORK away from an embedded
- *  UUID that is still owned by a DIFFERENT live object? Fork ONLY while that
- *  owner is still an OPEN workflow tab — the genuine co-open copy case (#570).
- *  A save re-registers/replaces the active ComfyWorkflow object: the successor
- *  parses the same embedded uuid from the just-saved file while the REPLACED
- *  object is still the registered owner. Minting a fresh identity for the
- *  successor desyncs it from the root graph tag the graph-binding guard
- *  compares against, so every panel_* graph tool hard-fails until a frontend
- *  reload (#557). An owner that is no longer an open workflow was replaced, so
- *  this object is its successor and must INHERIT the identity (and with it the
- *  root tag), keeping the object cache and the root stamp aligned. */
+ *  UUID that is still owned by a DIFFERENT live object? Fork while that owner
+ *  is still an OPEN workflow tab — the genuine co-open copy case (#570) — and
+ *  ALSO when the owner is closed but succession is NOT proven (r9 P0): "the
+ *  owner is gone" alone does not make this object the successor — a
+ *  different-path copy of the file qualifies just as well, and inheriting
+ *  re-keys the uuid's owner record to the copy so stale uuid-scoped commands
+ *  for the old workflow pass the command fence against it. Only a closed owner
+ *  WITH positive succession evidence (hasEmbeddedUuidSuccessionEvidence) lets
+ *  this object INHERIT — the save re-registers/replaces the active
+ *  ComfyWorkflow object and the successor parses the same embedded uuid from
+ *  the just-saved file while the REPLACED object is still the registered
+ *  owner; minting fresh there desyncs it from the root graph tag the
+ *  graph-binding guard compares against (#557). */
 export function shouldForkEmbeddedUuidForLiveOwner({
   embeddedUuid,
   embeddedOwner,
   identityObject,
   ownerIsOpenWorkflow = false,
+  successionProven = false,
 } = {}) {
   if (!embeddedUuid || !embeddedOwner || embeddedOwner === identityObject) return false;
-  return ownerIsOpenWorkflow === true;
+  if (ownerIsOpenWorkflow === true) return true; // a LIVE co-open owner → genuine copy
+  // r9 P0 — a CLOSED owner is not succession: without positive evidence this
+  // object continues the owner's file, fork rather than inherit.
+  return successionProven !== true;
+}
+
+/** #557 r9 — POSITIVE succession evidence for inheriting a CLOSED owner's
+ *  embedded uuid. "The owner is gone" alone does not make this object the
+ *  successor — a different-path COPY of the file qualifies just as well, and
+ *  inheriting would re-key the uuid's owner record to the copy, letting stale
+ *  uuid-scoped commands for the old workflow pass the command fence against it
+ *  (r9 P0). Evidence, strongest first:
+ *   1. the file's OWN recorded workflow_path ties the uuid to THIS object's file;
+ *   2. the canonical path alias ties THIS object's path to the uuid;
+ *   3. the closed owner's unique on-disk file IS this object's file (same
+ *      lineage — the save-swap / reload successor). An UNSAVED owner has no
+ *      unique path (#186), so it can never serve here.
+ *  Absent ALL of these — notably a file carrying only workflow_uuid, saved from
+ *  an unsaved tab whose embed omitted workflow_path — fail toward FORKING. */
+export function hasEmbeddedUuidSuccessionEvidence({
+  embeddedUuid,
+  embeddedPath,
+  currentPath,
+  pathAlias,
+  embeddedOwner,
+} = {}) {
+  if (
+    embeddedPath &&
+    currentPath &&
+    normalizedWorkflowPath(embeddedPath) === normalizedWorkflowPath(currentPath)
+  ) {
+    return true;
+  }
+  if (typeof pathAlias === "string" && pathAlias && pathAlias === embeddedUuid) return true;
+  const ownerPath =
+    embeddedOwner?.isPersisted === true && typeof embeddedOwner?.path === "string" && embeddedOwner.path
+      ? embeddedOwner.path
+      : null;
+  if (ownerPath && currentPath && ownerPath === currentPath) return true;
+  return false;
 }
 
 /** #570 P0b — should an IN-PLACE graph load (loadGraphData into an EXISTING workflow object)
