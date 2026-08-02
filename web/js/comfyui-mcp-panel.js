@@ -1703,6 +1703,61 @@ function workflowTabId(wf = activeWorkflowRef()) {
   return id;
 }
 
+// `workflow_open` does most of its work asynchronously.  Its `target` remains a
+// valid workflow object even if another tab becomes active while repainting or
+// re-reading the file, so it must never be used by itself as proof of the
+// workflow that is active when the reply leaves the panel.  The command-fence
+// UUID is useful only for that live canvas; omit it rather than hand the MCP a
+// contradictory stamp when the active routing object changed mid-open (#716).
+function isCanonicalWorkflowInstanceUuid(value) {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
+  );
+}
+
+// A reply is an observation, never an identity-initialization point. In
+// particular, workflowTabId() and workflowStableUuid() mint values for an
+// unfamiliar object; doing that after a malformed/rebound active binding would
+// manufacture a plausible stamp for something the panel has not established as
+// a real workflow. Accept only an already-established UUID on a persisted,
+// canonical workflow. A tmp: routing handle is intentionally not durable enough
+// to publish as a command-fence refresh source.
+function establishedWorkflowReplyIdentity(wf) {
+  if (!wf || typeof wf !== "object") return null;
+  const uuid = _workflowObjectUuids.get(wf);
+  if (!isCanonicalWorkflowInstanceUuid(uuid)) return null;
+  const savedPath = savedWorkflowPath(wf);
+  return savedPath ? { routingKey: `wf:${savedPath}`, uuid } : null;
+}
+
+function activeWorkflowUuidForOpenReply(target) {
+  // Do not accept a workflow-service reference captured before workflow_open's
+  // awaits: a reconnect can replace/rebind that service while the old instance
+  // still reports `target` as active. Read the panel's CURRENT binding at reply
+  // emission, then require object and routing identity to agree.
+  const active = activeWorkflowRef();
+  if (!target || active !== target) return null;
+  const activeIdentity = establishedWorkflowReplyIdentity(active);
+  const targetIdentity = establishedWorkflowReplyIdentity(target);
+  if (!activeIdentity || !targetIdentity || activeIdentity.routingKey !== targetIdentity.routingKey) return null;
+  return activeIdentity.uuid;
+}
+
+// Like the post-open reply, workflow_list must observe the CURRENT workflow
+// service at response time.  The executor's captured `s` is still useful for
+// enumerating tabs, but after a reconnect it can be an old service that points
+// at a different workflow.  Keep the object and its established identity from
+// the same live read so a list reply cannot pair a stale active tab with a UUID
+// for the panel's current canvas (#716).
+function liveWorkflowListActive() {
+  const active = activeWorkflowRef();
+  return {
+    active,
+    activeIdentity: active ? establishedWorkflowReplyIdentity(active) : null,
+  };
+}
+
 // Per-tab agent session id + which thread this tab is showing. sessionStorage
 // is tab-scoped and survives reload — exactly what "restore the last session on
 // reload" needs, without two tabs clobbering each other.
@@ -8117,8 +8172,13 @@ const GRAPH_TOOL_EXECUTORS = {
   workflow_list() {
     const s = app?.extensionManager?.workflow;
     if (!s) throw new Error("workflow service unavailable on this frontend");
-    const active = s.activeWorkflow;
-    const activeRoutingKey = active ? workflowTabId(active) : null;
+    // `s` may be a pre-reconnect service.  Read the live binding rather than
+    // publishing its stale active object/UUID pair (#716 P1).
+    const { active, activeIdentity } = liveWorkflowListActive();
+    // #716 — the `active` reply's fence identity observes an already established
+    // workflow; it must not mint a UUID merely because a malformed/rebound
+    // object is truthy.
+    const activeRoutingKey = activeIdentity?.routingKey ?? null;
     // Every tab gets its per-instance routing id ("wf:<path>" saved, "tmp:<uuid>"
     // unsaved). For an UNSAVED tab this is the ONLY unique, matchable handle —
     // native ComfyUI reuses the "Unsaved Workflow" title/key/filename across unsaved
@@ -8186,6 +8246,10 @@ const GRAPH_TOOL_EXECUTORS = {
             title: active.filename || getWorkflowTitle(),
             key: activeDiskPath ? active.key : activeRoutingKey,
             routing_key: activeRoutingKey,
+            // #716 — only a previously established live identity can re-stamp
+            // the next command. Missing proof is omitted so the MCP keeps its
+            // existing workflow fence fail-closed.
+            ...(activeIdentity ? { workflow_uuid: activeIdentity.uuid } : {}),
           }
         : null,
       // Guard against nullish entries in openWorkflows: a tab mid-open/close can
@@ -8770,9 +8834,16 @@ const GRAPH_TOOL_EXECUTORS = {
       },
       applied: true,
     });
+    // #716 — only return a command-fence UUID after a FINAL synchronous check
+    // against the actual active workflow. `target` can remain a valid object
+    // after another tab wins the active slot during any await above; publishing
+    // its UUID then would let the MCP stamp a command for a different canvas.
+    // Omission is deliberate: the MCP keeps its existing fence fail-closed.
+    const activeWorkflowUuid = activeWorkflowUuidForOpenReply(target);
     return {
       opened: { path: target.path, filename: target.filename },
       routing_key: workflowTabId(target),
+      ...(activeWorkflowUuid ? { workflow_uuid: activeWorkflowUuid } : {}),
       modified: !!target.isModified,
       // #402 — the receipt id for THIS open. Journaled in the panel, so if this reply
       // never reaches the caller the outcome is still recoverable from workflow_list's
