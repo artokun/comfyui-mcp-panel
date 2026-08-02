@@ -70,9 +70,13 @@ const vueProxyOf = (raw) => new Proxy(raw, { get: (t, k) => (k === "__v_raw" ? t
 //   "same-path-overlap"     — A and B are DISTINCT live objects at the SAME path
 //                             (a closed→reopened overlap, #558 r3): path equality
 //                             must NOT exempt B from the foreign-claim check;
-//   "active-lineage"        — the ACTIVE tab's own serialized state carries the
-//                             tag (the #545/#557 drifted-successor heal case):
-//                             the guard rebinds the root to the active identity;
+//   "active-lineage"        — the tag's REGISTERED OWNER is the active object
+//                             itself (object-keyed lineage, the #545/#557
+//                             drifted-identity heal case): the guard rebinds;
+//   "stale-lineage"         — the active object's LAGGING tracker state still
+//                             carries the tag (replaced-predecessor residue,
+//                             r6 P0): NOT object-keyed, must NOT count — the
+//                             guard must keep throwing;
 //   "none"                  — NOBODY claims the tag (a closed tab's leftover
 //                             canvas, r5): the guard must keep throwing.
 // foreignTab overrides the B object (e.g. a creation-lifecycle product), and
@@ -90,6 +94,7 @@ function buildDirtyStaleRouteHarness({
   const ownsTagSource = panelFunctionSource(src, "workflowOwnsRootUuidTag", "assertGraphBoundToActiveWorkflow");
   const overlap = foreignClaim === "same-path-overlap";
   const lineage = foreignClaim === "active-lineage";
+  const staleLineage = foreignClaim === "stale-lineage";
   const workflowA = overlap
     ? { isPersisted: true, path: "workflows/a.json", isModified: true, changeTracker: { activeState: state(27) } }
     : {
@@ -98,10 +103,11 @@ function buildDirtyStaleRouteHarness({
         changeTracker: {
           activeState: {
             ...state(27),
-            // "active-lineage": the ACTIVE tab's own serialized state carries the
-            // tag — the drifted-successor heal case (#545/#557): the tag is its
-            // own lineage, stale relative to its resolved identity.
-            ...(lineage && rootUuid ? { extra: { comfyui_mcp: { workflow_uuid: rootUuid } } } : {}),
+            // "stale-lineage" (r6 P0): the active object's tracker state is
+            // LAGGING — it still carries an OLD uuid (a replaced predecessor's
+            // residue). Serialized-state evidence is not object-keyed, so this
+            // must NOT count as an active-lineage claim.
+            ...(staleLineage && rootUuid ? { extra: { comfyui_mcp: { workflow_uuid: rootUuid } } } : {}),
           },
         },
       };
@@ -132,14 +138,20 @@ function buildDirtyStaleRouteHarness({
     ...(rootUuid ? { extra: { comfyui_mcp: { workflow_uuid: rootUuid } } } : {}),
   };
   const openWorkflows =
-    foreignClaim === "none" || foreignClaim === "active-lineage"
+    foreignClaim === "none" || foreignClaim === "active-lineage" || foreignClaim === "stale-lineage"
       ? [workflowA]
       : foreignClaim === "unloaded-proxy-owner"
         ? [workflowA, proxyB]
         : [workflowA, rawB];
   const registeredOwnersMap =
     registeredOwners ??
-    new Map(foreignClaim === "unloaded-proxy-owner" && rootUuid ? [[rootUuid, rawB]] : []);
+    new Map(
+      foreignClaim === "unloaded-proxy-owner" && rootUuid
+        ? [[rootUuid, rawB]]
+        : foreignClaim === "active-lineage" && rootUuid
+          ? [[rootUuid, workflowA]] // the tag's registered owner IS the active object
+          : [],
+    );
   const objectUuids = objectUuidsOpt ?? new WeakMap();
   let minted = 0;
   const stableUuidA = new Function(
@@ -752,12 +764,12 @@ test("resolveGraphRootUuidRebind: none without a conflict, rebind only when the 
   assert.equal(resolveGraphRootUuidRebind({ rootGraph: tagged, activeWorkflowUuid: null }), "none");
 });
 
-test("#545: a root tag the ACTIVE workflow itself claims (its own drifted lineage) rebinds instead of blocking every tool", () => {
+test("#545: a root tag whose REGISTERED OWNER is the active object itself rebinds instead of blocking every tool", () => {
   const h = buildDirtyStaleRouteHarness({ rootUuid: "workflow-B", foreignClaim: "active-lineage" });
   h.objectUuids.set(h.workflowA, "workflow-A");
   assert.doesNotThrow(
     () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: false }),
-    "a tag the active tab's own tracker state carries is its own lineage — heal, don't block",
+    "a tag registered to the active object is its own lineage — heal, don't block",
   );
   assert.equal(
     h.rootB.extra.comfyui_mcp.workflow_uuid,
@@ -771,6 +783,34 @@ test("#545: a root tag the ACTIVE workflow itself claims (its own drifted lineag
         requireDirtyMutationBinding: graphCommandMayMutateWorkflow("graph_set_node_property"),
       }),
     "after the rebind the root positively matches, so a dirty-tab mutation proceeds",
+  );
+});
+
+test("#349 r6 P0: a LAGGING tracker state carrying the tag (replaced-predecessor residue) must NOT prove active lineage", () => {
+  // The r6 spoof: the active object resolved identity B ("workflow-A" here),
+  // but its stale serialized state still carries the tag "workflow-B" — while
+  // the root is a FOREIGN canvas genuinely tagged "workflow-B". Serialized
+  // state is not object-keyed, so this must fail closed: no re-stamp, throw.
+  const h = buildDirtyStaleRouteHarness({ rootUuid: "workflow-B", foreignClaim: "stale-lineage" });
+  h.objectUuids.set(h.workflowA, "workflow-A");
+  assert.throws(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: false }),
+    /NOT applied/,
+    "a lagging tracker stamp must not re-stamp a foreign root with the active identity",
+  );
+  assert.throws(
+    () =>
+      h.assertBound(h.rootB, h.rootB, {
+        includeBaselineReadGuard: false,
+        requireDirtyMutationBinding: graphCommandMayMutateWorkflow("graph_set_node_property"),
+      }),
+    /NOT applied/,
+    "the same spoofed lineage must refuse a dirty mutation",
+  );
+  assert.equal(
+    h.rootB.extra.comfyui_mcp.workflow_uuid,
+    "workflow-B",
+    "the foreign root must NOT be rewritten on serialized-state evidence",
   );
 });
 
@@ -896,25 +936,22 @@ test("#349 P0 r3: a same-path OVERLAP (closed→reopened object) is NOT self —
   assert.equal(h.rootB.extra.comfyui_mcp.workflow_uuid, "workflow-B", "the foreign root keeps its tag");
 });
 
-test("#349 P0 r3: a CREATION-minted tag is registered to the tab the load activates (lifecycle, no manual seeding)", async () => {
-  // Drive the REAL creation path: installCreateBoundaryFork wraps
-  // app.loadGraphData; a creation (non-object workflow arg) stamps a fresh uuid
-  // and — after the load — must register it against the tab the load activated.
-  // Without that registration a live, unloaded, never-resolved creation carries
-  // a tag nothing claims, and the guard rebinds over its foreign root (r3 P0).
+// Drives the REAL installCreateBoundaryFork source against a fake app whose
+// loadGraphData simulates ComfyUI's creation behavior (the graph goes live in a
+// NEW active tab). onLoad customizes what the load leaves active — e.g. a
+// mid-load switch to an unrelated tab with an unreadable tracker (r6 P0).
+function buildCreationForkHarness({ onLoad } = {}) {
   const src = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
   const forkSource = panelFunctionSource(src, "installCreateBoundaryFork", "workflowUuidOwner");
   const objectUuids = new WeakMap();
   const owners = new Map();
-  const createdTab = { isPersisted: false, changeTracker: null }; // live, unloaded, never resolved
+  const createdTab = { isPersisted: false, changeTracker: null };
   const fakeApp = {
     graph: null,
     extensionManager: { workflow: { activeWorkflow: null, openWorkflows: [] } },
     loadGraphData(graphData) {
-      // ComfyUI's creation behavior: the graph goes live in a NEW active tab.
       this.graph = { _nodes: graphData.nodes ?? [], extra: graphData.extra };
-      this.extensionManager.workflow.activeWorkflow = createdTab;
-      this.extensionManager.workflow.openWorkflows.push(createdTab);
+      onLoad?.({ app: this, graphData, createdTab });
     },
   };
   const install = new Function(
@@ -940,6 +977,19 @@ test("#349 P0 r3: a CREATION-minted tag is registered to the tab the load activa
     "workflow_uuid",
   );
   install(fakeApp);
+  return { fakeApp, createdTab, objectUuids, owners };
+}
+
+test("#349 P0 r3: a CREATION-minted tag is registered to the tab the load activates (lifecycle, no manual seeding)", async () => {
+  const { fakeApp, createdTab, objectUuids, owners } = buildCreationForkHarness({
+    onLoad: ({ app, graphData, createdTab }) => {
+      // ComfyUI's creation behavior: the graph goes live in a NEW active tab,
+      // and the tab's tracker captures the configured state (stamp included).
+      createdTab.changeTracker = { activeState: { extra: graphData.extra } };
+      app.extensionManager.workflow.activeWorkflow = createdTab;
+      app.extensionManager.workflow.openWorkflows.push(createdTab);
+    },
+  });
   await fakeApp.loadGraphData({ nodes: [{ id: 1, type: "KSampler" }] });
   assert.equal(
     fakeApp.graph.extra.comfyui_mcp.workflow_uuid,
@@ -957,9 +1007,8 @@ test("#349 P0 r3: a CREATION-minted tag is registered to the tab the load activa
     "the receiving tab's identity cache carries its stamp",
   );
 
-  // …so the desync guard refuses to rebind over that live, unloaded,
-  // never-resolved creation while ANOTHER workflow is active: the resolver
-  // claim fires straight from the registration (no manual owner-map seeding).
+  // …so the desync guard refuses to rebind over that live creation while
+  // ANOTHER workflow is active: the active tab does not claim the tag.
   const h = buildDirtyStaleRouteHarness({
     rootUuid: "creation-uuid-1",
     foreignClaim: "unloaded-proxy-owner",
@@ -974,6 +1023,51 @@ test("#349 P0 r3: a CREATION-minted tag is registered to the tab the load activa
     "a live creation-registered tab keeps its root — never rebound (#349)",
   );
   assert.equal(h.rootB.extra.comfyui_mcp.workflow_uuid, "creation-uuid-1", "the created tab's tag survives");
+});
+
+test("#349 r6 P0: a mid-load switch to a tab whose tracker is unreadable registers NOTHING (no guessing)", async () => {
+  // The r6 hole: an async creation settles while a DIFFERENT tab B is active
+  // and B's tracker can't be read. Registering the minted uuid against B
+  // anyway would let C's tagged canvas match B through the guard's lineage
+  // claim — a fail-open misattribution. With no positive stamp match the
+  // registration must be skipped entirely (the tag floats ownerless, which can
+  // only fail CLOSED).
+  const foreignB = { isPersisted: true, path: "workflows/b.json", changeTracker: null };
+  const { fakeApp, objectUuids, owners } = buildCreationForkHarness({
+    onLoad: ({ app }) => {
+      app.extensionManager.workflow.activeWorkflow = foreignB; // mid-load switch
+      app.extensionManager.workflow.openWorkflows.push(foreignB);
+    },
+  });
+  await fakeApp.loadGraphData({ nodes: [{ id: 1, type: "KSampler" }] });
+  assert.equal(
+    fakeApp.graph.extra.comfyui_mcp.workflow_uuid,
+    "creation-uuid-1",
+    "the creation still stamps the graph before it goes live",
+  );
+  assert.equal(
+    owners.get("creation-uuid-1"),
+    undefined,
+    "no positive stamp match → NO registration (fail safe, never a guess)",
+  );
+  assert.equal(objectUuids.get(foreignB), undefined, "B's identity is untouched");
+
+  // …and the guard fences C's tagged canvas while B is active: B does not
+  // claim the tag, so there is nothing to heal — the stale canvas throws.
+  const h = buildDirtyStaleRouteHarness({
+    rootUuid: "creation-uuid-1",
+    foreignClaim: "unloaded-proxy-owner",
+    foreignTab: foreignB,
+    registeredOwners: owners,
+    objectUuids,
+  });
+  h.objectUuids.set(h.workflowA, "workflow-A");
+  assert.throws(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: false }),
+    /NOT applied/,
+    "an ownerless creation tag on a stale canvas stays fenced (#349)",
+  );
+  assert.equal(h.rootB.extra.comfyui_mcp.workflow_uuid, "creation-uuid-1", "the ownerless tag is not rewritten");
 });
 
 test("#557 r3/r4 wiring: programmaticSave threads the pre-save identity across a PROVEN in-place object swap", () => {

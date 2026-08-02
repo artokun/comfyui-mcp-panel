@@ -1508,15 +1508,16 @@ function installCreateBoundaryFork(appRef) {
       }
       const result = orig(graphData, clean, restoreView, workflow, options);
       if (ownerlessStampUuid) {
-        // #349 r3 P0 — a creation-minted tag must NEVER float ownerless: with no
-        // registered claim, a live-but-never-resolved created tab looks like
-        // stale bookkeeping to the desync guard's orphaned-tag rebind and its
-        // foreign root can be re-stamped over. Creations switch to the tab they
-        // create, so register against the post-load ACTIVE workflow — verified,
-        // when its tracker already exposes the stamp, by that stamp; when the
-        // tracker is absent or lagging, register anyway: a mis-attributed claim
-        // fails CLOSED (a spurious desync refusal), where an ownerless tag fails
-        // OPEN (a wrong-canvas write).
+        // #349 r3/r6 P0 — a creation-minted tag must NEVER float ownerless when
+        // its receiving tab can be PROVEN — but registration must never guess.
+        // Creations switch to the tab they create, so check the post-load ACTIVE
+        // workflow's tracker for the minted stamp: a positive match proves the
+        // load landed there and registration is safe. An absent, lagging, or
+        // unreadable stamp proves NOTHING (a mid-load switch would otherwise
+        // misattribute the minted uuid to a foreign tab — fail-OPEN through the
+        // guard's lineage claim), and a mismatch means the load landed
+        // elsewhere. In both cases the tag floats ownerless, which can only
+        // ever fail CLOSED.
         const stampUuid = ownerlessStampUuid;
         const register = () => {
           try {
@@ -1524,7 +1525,7 @@ function installCreateBoundaryFork(appRef) {
             if (!active || typeof active !== "object") return;
             const stamped =
               active?.changeTracker?.activeState?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD];
-            if (stamped && stamped !== stampUuid) return; // the load landed in a different tab
+            if (stamped !== stampUuid) return; // no positive match — do NOT register
             if (!_workflowObjectUuids.get(active)) _workflowObjectUuids.set(active, stampUuid);
             rememberWorkflowUuidOwner(stampUuid, active);
           } catch {
@@ -4193,17 +4194,17 @@ function getGraphCtx() {
 // than return empty". Fail-safe: fires ONLY when the workflow reports N>0 nodes at
 // ROOT scope while the live root graph is empty, so a genuinely-empty / brand-new
 // workflow (and any descended-into empty subgraph) reads `node_count: 0` as before.
-// #349 — does OPEN workflow `w` claim rootUuid as its identity? Checked three
-// ways, because the identity carriers can lag or disagree: (1) the root-blind
-// resolver — the same identity the command fence uses for that tab; (2) the
-// tab's OWN serialized state, which still carries the graph stamp a CREATION
-// made before any resolver or owner record existed for it (creation
-// loadGraphData calls pass no workflow object, so nothing is registered in
-// _workflowObjectUuids/_workflowUuidOwners at stamp time); (3) the registered
-// owner map, which still ties the tag to the tab even when its serialized state
-// is NOT loaded yet (an unloaded tab presents neither carrier). Any claim makes
-// the tag that tab's live identity — never stale bookkeeping the desync guard
-// may rebind over.
+// #349 — does OPEN workflow `w` claim rootUuid as its identity? Only OBJECT-KEYED
+// evidence counts: (1) the root-blind resolver — the same identity the command
+// fence uses for that tab (WeakMap-keyed on the object, falling back to
+// workflow-owned metadata); (2) the registered owner map — recorded, proxy-safely
+// compared, when the tag was minted for an object. A tab's SERIALIZED STATE is
+// deliberately NOT evidence (r6 P0): a lagging changeTracker.activeState can
+// carry a replaced predecessor's uuid residue, which is indistinguishable from
+// the genuine lineage stamp — accepting it let a stale-state object re-stamp a
+// foreign root with the active identity. Dropping it is fail-safe: a genuine
+// drift the object-keyed claims can't prove heals via panel_open_workflow's
+// proven repaint re-stamp instead of inline.
 //
 // The proxy/raw duality is normalized FIRST (#558 r2): openWorkflows holds Vue
 // proxies while the identity stores key on raw objects, so every lookup below
@@ -4214,17 +4215,6 @@ function workflowOwnsRootUuidTag(w, rootUuid) {
   const rawW = rawWorkflowObject(w);
   try {
     if (workflowStableUuid(rawW) === rootUuid) return true;
-  } catch {
-    // Fall through to the serialized-state claim.
-  }
-  try {
-    const state =
-      rawW?.changeTracker?.activeState ??
-      w?.changeTracker?.activeState ??
-      rawW?.activeState ??
-      w?.activeState;
-    const stamped = state?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD];
-    if (typeof stamped === "string" && stamped === rootUuid) return true;
   } catch {
     // Fall through to the registered-owner claim.
   }
