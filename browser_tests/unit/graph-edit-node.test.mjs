@@ -251,6 +251,8 @@ test("#572 rejects ambiguous, incomplete, and unsafe inputs before mutation", ()
   assert.throws(() => fn({ node_id: 1 }), /at least one/);
   assert.throws(() => fn({ node_id: 1, color: "red" }), /hex/);
   assert.throws(() => fn({ node_id: 1, preset: "blue", color: "#abc" }), /cannot be combined/);
+  assert.throws(() => fn({ node_id: 1, title: null }), /title must be a string/);
+  assert.throws(() => fn({ node_id: 1, title: { text: "x" } }), /title must be a string/);
   assert.throws(() => fn({ node_ids: [1, 1], title: "x" }), /duplicates/);
   assert.deepEqual(events, []);
 });
@@ -358,8 +360,8 @@ test("#538 retains every legacy presentation bridge command for old MCP servers"
 test("#538 legacy title wrapper preserves nullish-title compatibility", () => {
   assert.match(
     panelSrc,
-    /graph_set_title\(\{ node_id, title \}\) \{[\s\S]*?graph_edit_node\(\{ node_id, title: title \?\? "" \}\)/,
-    "nullish legacy titles must clear to an empty title, not become literal text",
+    /graph_set_title\(\{ node_id, title \}\) \{[\s\S]*?graph_edit_node\(\{ node_id, title: title == null \? "" : String\(title\) \}\)/,
+    "legacy titles must clear nullish values and retain historical coercion while direct graph_edit_node stays strict",
   );
 });
 
@@ -379,6 +381,11 @@ test("#538 legacy colors retain preset:null no-op and permissive CSS values", ()
   assert.deepEqual(changed, { node_id: 1, color: "red", bgcolor: null });
   assert.equal(node.color, "red", "legacy callers may use non-hex CSS colors");
   assert.equal(Object.hasOwn(node, "bgcolor"), false, "null clears a legacy body color");
+
+  const presetWins = fn({ node_id: 1, preset: "blue", color: "red", bgcolor: "orange" });
+  assert.deepEqual(presetWins, { node_id: 1, color: "#123456", bgcolor: "#654321" });
+  assert.equal(node.color, "#123456", "legacy preset takes precedence over a supplied CSS color");
+  assert.equal(node.bgcolor, "#654321");
 });
 
 test("#538 legacy color and collapsed commands reject invalid values without mutating", () => {

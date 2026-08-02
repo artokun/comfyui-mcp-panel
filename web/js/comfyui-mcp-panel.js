@@ -6923,6 +6923,7 @@ const GRAPH_TOOL_EXECUTORS = {
     if (own("size") && (!Array.isArray(args.size) || args.size.length !== 2 || !args.size.every((n) => Number.isFinite(n) && n > 0))) {
       throw new Error("size must be two positive numbers");
     }
+    if (own("title") && typeof args.title !== "string") throw new Error("title must be a string");
     if (own("shape") && !["default", "box", "round", "card"].includes(args.shape)) {
       throw new Error("shape must be default, box, round, or card");
     }
@@ -7055,7 +7056,7 @@ const GRAPH_TOOL_EXECUTORS = {
           if (typeof node.setSize === "function") node.setSize(size);
           else node.size = size;
         }
-        if (own("title")) node.title = String(args.title);
+        if (own("title")) node.title = args.title;
         if (palette) {
           node.color = palette.color;
           node.bgcolor = palette.bgcolor;
@@ -7137,8 +7138,9 @@ const GRAPH_TOOL_EXECUTORS = {
 
   graph_set_title({ node_id, title }) {
     // Match the legacy command's nullish-title behavior: it clears the visible
-    // title rather than serializing a literal "null"/"undefined" label.
-    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id, title: title ?? "" });
+    // title rather than serializing a literal "null"/"undefined" label; retain
+    // legacy coercion here while graph_edit_node stays strict for new callers.
+    const result = GRAPH_TOOL_EXECUTORS.graph_edit_node({ node_id, title: title == null ? "" : String(title) });
     const edit = result.edited[0];
     return { node_id: edit.after.node_id, previous: edit.before.title, title: edit.after.title };
   },
