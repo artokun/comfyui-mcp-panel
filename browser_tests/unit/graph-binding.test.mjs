@@ -27,6 +27,8 @@ import {
   resolveGraphRootUuidRebind,
 } from "../../web/js/lib/graph-binding.js";
 import {
+  rawWorkflowObject,
+  sameWorkflowObject,
   shouldForkEmbeddedUuidForLiveOwner,
   shouldForkEmbeddedWorkflowUuid,
   workflowAliasForPath,
@@ -45,40 +47,59 @@ function panelFunctionSource(src, name, nextName) {
 
 // foreignClaim models WHETHER a live open tab claims the root tag when it
 // conflicts with the active workflow's identity (#349/#545/#557):
-//   "identity"      — tab B is OPEN and the root-blind resolver returns the tag
-//                     for it: the guard must keep throwing;
-//   "tracker-stamp" — tab B is OPEN, the resolver mints a DIFFERENT identity for
-//                     it, but B's OWN serialized state still carries the tag (a
-//                     creation stamp no resolver run or owner record observed —
-//                     creation loadGraphData passes no workflow object, so the
-//                     stamp was never registered): the guard must keep throwing;
-//   "none"          — NO live open tab claims the tag (a closed/replaced tab's
-//                     leftover): genuine stale bookkeeping — the guard rebinds.
+//   "identity"              — tab B is OPEN and the root-blind resolver returns
+//                             the tag for it: the guard must keep throwing;
+//   "tracker-stamp"         — tab B is OPEN, the resolver mints a DIFFERENT
+//                             identity for it, but B's OWN serialized state still
+//                             carries the tag (an unregistered creation stamp):
+//                             the guard must keep throwing;
+//   "unloaded-proxy-owner"  — tab B is OPEN but only as a Vue-style PROXY, its
+//                             serialized state is NOT populated (unloaded), and
+//                             the resolver mints a different identity; only the
+//                             registered owner map ties it to the tag (#558 r2):
+//                             the guard must keep throwing;
+//   "none"                  — NO live open tab claims the tag (a closed/replaced
+//                             tab's leftover): genuine stale bookkeeping — the
+//                             guard rebinds.
 function buildDirtyStaleRouteHarness({ rootUuid = "workflow-B", foreignClaim = "identity" } = {}) {
   const src = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
   const stableSource = panelFunctionSource(src, "workflowStableUuid", "workflowStorageKey");
   const fenceSource = panelFunctionSource(src, "assertGraphBoundToActiveWorkflow", "getPiniaStore");
   const ownsTagSource = panelFunctionSource(src, "workflowOwnsRootUuidTag", "assertGraphBoundToActiveWorkflow");
   const workflowA = { isPersisted: false, isModified: true, changeTracker: { activeState: state(27) } };
-  const workflowB = {
+  const rawB = {
     isPersisted: true,
     path: "workflows/b.json",
-    changeTracker: {
-      activeState: {
-        ...state(30),
-        // A creation-stamped graph carries the tag in the tab's own serialized
-        // state even when no resolver/owner record ever observed it.
-        ...(foreignClaim === "tracker-stamp" && rootUuid
-          ? { extra: { comfyui_mcp: { workflow_uuid: rootUuid } } }
-          : {}),
-      },
-    },
+    changeTracker:
+      foreignClaim === "unloaded-proxy-owner"
+        ? null // a live tab whose serialized state is NOT loaded
+        : {
+            activeState: {
+              ...state(30),
+              // A creation-stamped graph carries the tag in the tab's own
+              // serialized state even when no resolver/owner record observed it.
+              ...(foreignClaim === "tracker-stamp" && rootUuid
+                ? { extra: { comfyui_mcp: { workflow_uuid: rootUuid } } }
+                : {}),
+            },
+          },
   };
+  // The repo's store-double idiom (workflow-save.test.mjs): openWorkflows holds
+  // PROXIES while the identity stores key on RAW objects.
+  const proxyB = new Proxy(rawB, {});
   const rootB = {
     _nodes: Array.from({ length: 30 }, (_, i) => ({ id: i + 1, type: "KSampler" })),
     ...(rootUuid ? { extra: { comfyui_mcp: { workflow_uuid: rootUuid } } } : {}),
   };
-  const openWorkflows = foreignClaim === "none" ? [workflowA] : [workflowA, workflowB];
+  const openWorkflows =
+    foreignClaim === "none"
+      ? [workflowA]
+      : foreignClaim === "unloaded-proxy-owner"
+        ? [workflowA, proxyB]
+        : [workflowA, rawB];
+  const registeredOwners = new Map(
+    foreignClaim === "unloaded-proxy-owner" && rootUuid ? [[rootUuid, rawB]] : [],
+  );
   const objectUuids = new WeakMap();
   let minted = 0;
   const stableUuidA = new Function(
@@ -92,6 +113,7 @@ function buildDirtyStaleRouteHarness({ rootUuid = "workflow-B", foreignClaim = "
     "rememberWorkflowUuidOwner",
     "workflowOwnedExtra",
     "crypto",
+    "sameWorkflowObject",
     `${stableSource}\nreturn workflowStableUuid;`,
   )(
     { graph: rootB },
@@ -104,19 +126,34 @@ function buildDirtyStaleRouteHarness({ rootUuid = "workflow-B", foreignClaim = "
     () => {},
     () => null,
     { randomUUID: () => `workflow-A-${++minted}` },
+    sameWorkflowObject,
   );
   // Per-tab established identities as the real resolver would produce them: A
   // through the real (unsaved-branch) source; B returns its recorded identity —
-  // under "identity" that IS the root tag; under "tracker-stamp" the resolver
-  // minted a different identity and never observed B's graph stamp.
+  // under "identity" that IS the root tag; otherwise the resolver minted a
+  // different identity and never observed B's stamp.
   const stableUuid = (wf) =>
-    wf === workflowB ? (foreignClaim === "identity" ? rootUuid : "workflow-B-minted") : stableUuidA(wf);
+    wf === rawB || wf === proxyB
+      ? foreignClaim === "identity"
+        ? rootUuid
+        : "workflow-B-minted"
+      : stableUuidA(wf);
   const ownsTag = new Function(
     "workflowStableUuid",
+    "rawWorkflowObject",
+    "sameWorkflowObject",
+    "workflowUuidOwner",
     "WORKFLOW_META_NAMESPACE",
     "WORKFLOW_UUID_FIELD",
     `${ownsTagSource}\nreturn workflowOwnsRootUuidTag;`,
-  )(stableUuid, "comfyui_mcp", "workflow_uuid");
+  )(
+    stableUuid,
+    rawWorkflowObject,
+    sameWorkflowObject,
+    (id) => registeredOwners.get(id) ?? null,
+    "comfyui_mcp",
+    "workflow_uuid",
+  );
   const assertBound = new Function(
     "activeWorkflowRef",
     "_workflowObjectUuids",
@@ -126,6 +163,7 @@ function buildDirtyStaleRouteHarness({ rootUuid = "workflow-B", foreignClaim = "
     "graphRootMismatchesActiveWorkflow",
     "graphReadDesynced",
     "activeWorkflowNodeCount",
+    "sameWorkflowObject",
     "workflowOwnsRootUuidTag",
     "rememberWorkflowUuidOwner",
     "resolveGraphRootUuidRebind",
@@ -142,6 +180,7 @@ function buildDirtyStaleRouteHarness({ rootUuid = "workflow-B", foreignClaim = "
     graphRootMismatchesActiveWorkflow,
     graphReadDesynced,
     activeWorkflowNodeCount,
+    sameWorkflowObject,
     ownsTag,
     () => {},
     resolveGraphRootUuidRebind,
@@ -149,21 +188,35 @@ function buildDirtyStaleRouteHarness({ rootUuid = "workflow-B", foreignClaim = "
     "workflow_uuid",
     { graph: rootB, extensionManager: { workflow: { openWorkflows } } },
   );
-  return { src, workflowA, workflowB, rootB, objectUuids, stableUuid, assertBound };
+  return { src, workflowA, rawB, proxyB, rootB, objectUuids, stableUuid, assertBound };
 }
 
 // #557 — the SAVED branch of workflowStableUuid after a save replaced the active
 // ComfyWorkflow object: the successor parses the pre-save embedded uuid from the
 // just-saved file while the replaced object is still its registered owner.
-function buildSavedSuccessorHarness({ ownerOpen = false } = {}) {
+// currentPath/embeddedPath/aliases are parameterizable so a genuine co-open COPY
+// (different path, same embedded uuid) can be distinguished from a same-path
+// save-swap successor. ownerOpen: false | true | "proxy" — "proxy" models the
+// live owner appearing in openWorkflows only as a Vue-style proxy (#558 r2).
+function buildSavedSuccessorHarness({
+  ownerOpen = false,
+  currentPath = "workflows/x.json",
+  embeddedPath = "workflows/x.json",
+  aliases = { "workflows/x.json": "11111111-1111-4111-8111-111111111111" },
+} = {}) {
   const src = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
   const stableSource = panelFunctionSource(src, "workflowStableUuid", "workflowStorageKey");
   const U1 = "11111111-1111-4111-8111-111111111111";
   const replaced = { isPersisted: true, path: "workflows/x.json" };
-  const successor = { isPersisted: true, path: "workflows/x.json" };
-  const aliases = { "workflows/x.json": U1 };
+  const successor = { isPersisted: true, path: currentPath };
   const owners = new Map([[U1, replaced]]);
   let minted = 0;
+  const openWorkflows =
+    ownerOpen === true
+      ? [replaced, successor]
+      : ownerOpen === "proxy"
+        ? [new Proxy(replaced, {}), successor]
+        : [successor];
   const stableUuid = new Function(
     "app",
     "getTabId",
@@ -184,14 +237,15 @@ function buildSavedSuccessorHarness({ ownerOpen = false } = {}) {
     "persistWorkflowAliases",
     "workflowAliasMutationSink",
     "crypto",
+    "sameWorkflowObject",
     `${stableSource}\nreturn workflowStableUuid;`,
   )(
-    { extensionManager: { workflow: { openWorkflows: ownerOpen ? [replaced, successor] : [successor] } } },
+    { extensionManager: { workflow: { openWorkflows } } },
     () => "fallback-tab",
     (wf) => (wf?.isPersisted === true && wf?.isTemporary !== true && typeof wf?.path === "string" ? wf.path : null),
     new WeakMap(),
     () => U1, // the just-saved file carries the pre-save embedded uuid
-    () => "workflows/x.json",
+    () => embeddedPath,
     workflowAliasForPath,
     (id) => owners.get(id) ?? null,
     (id, owner) => owners.set(id, owner),
@@ -205,6 +259,7 @@ function buildSavedSuccessorHarness({ ownerOpen = false } = {}) {
     () => {},
     null,
     { randomUUID: () => `fresh-${++minted}` },
+    sameWorkflowObject,
   );
   return { stableUuid, successor, replaced, owners, U1 };
 }
@@ -719,6 +774,36 @@ test("#349 P0: a root tag claimed ONLY by a live open tab's serialized state (un
   );
 });
 
+test("#349 P0 r2: a live UNLOADED foreign tab present only as a proxy must throw — the registered owner map still claims the tag", () => {
+  // The codex r2 hole: B is LIVE in openWorkflows but only as a Vue-style proxy
+  // (raw `!==` misses the registered raw owner), its serialized state is NOT
+  // populated (unloaded → the tracker claim can't fire), and the resolver mints
+  // a different identity for it. Only the owner map ties B to the tag — and the
+  // rebind must honor that claim rather than re-stamping B's live root as A's
+  // and permitting dirty writes to B.
+  const h = buildDirtyStaleRouteHarness({ rootUuid: "workflow-B", foreignClaim: "unloaded-proxy-owner" });
+  h.objectUuids.set(h.workflowA, "workflow-A");
+  assert.throws(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: false }),
+    /NOT applied/,
+    "a live foreign claim registered only in the owner map must stay fail-closed (#349)",
+  );
+  assert.throws(
+    () =>
+      h.assertBound(h.rootB, h.rootB, {
+        includeBaselineReadGuard: false,
+        requireDirtyMutationBinding: graphCommandMayMutateWorkflow("graph_set_node_property"),
+      }),
+    /NOT applied/,
+    "the unloaded foreign proxy root must refuse a dirty mutation",
+  );
+  assert.equal(
+    h.rootB.extra.comfyui_mcp.workflow_uuid,
+    "workflow-B",
+    "a live foreign proxy's tag must NOT be rewritten",
+  );
+});
+
 // ── #557: save replaces the active workflow object — identity must follow ────
 
 test("#557: a save's successor object INHERITS the embedded uuid when the replaced owner is gone", () => {
@@ -734,10 +819,35 @@ test("#557: a save's successor object INHERITS the embedded uuid when the replac
 });
 
 test("#557: a genuinely co-open copy still FORKS away from the live owner's embedded uuid (#570)", () => {
-  const { stableUuid, successor, U1 } = buildSavedSuccessorHarness({ ownerOpen: true });
+  // A real copy lives at a DIFFERENT path while carrying the source's embedded
+  // uuid; the source (owner) is live in openWorkflows.
+  const { stableUuid, successor, U1 } = buildSavedSuccessorHarness({
+    ownerOpen: true,
+    currentPath: "workflows/y.json",
+    embeddedPath: "workflows/x.json",
+    aliases: {},
+  });
   const id = stableUuid(successor);
   assert.notEqual(id, U1, "two simultaneously-open objects must never share one identity");
   assert.match(id, /^fresh-/, "the copy gets a fresh per-instance identity");
+});
+
+test("#570 r2: a co-open copy FORKS even when the live owner appears in openWorkflows only as a proxy", () => {
+  // The codex r2 hole: openWorkflows holds a PROXY of the raw registered owner,
+  // so a raw `includes` reads the live foreign owner as closed and the copy
+  // INHERITS the source identity (shared uuid → cross-resume, and the desync
+  // guard can no longer tell the two canvases apart). No path evidence saves us
+  // here (the file carries no embedded path and the browser has no aliases), so
+  // the proxy-safe owner check is the ONLY fork signal.
+  const { stableUuid, successor, U1 } = buildSavedSuccessorHarness({
+    ownerOpen: "proxy",
+    currentPath: "workflows/y.json",
+    embeddedPath: null,
+    aliases: {},
+  });
+  const id = stableUuid(successor);
+  assert.notEqual(id, U1, "a proxy-wrapped live owner is still a live foreign owner — the copy must fork");
+  assert.match(id, /^fresh-/);
 });
 
 test("#557 regression: after the save-swap, the guard sees no mismatch (root tag and object stay aligned)", () => {

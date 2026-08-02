@@ -14,6 +14,42 @@ export function workflowAliasForPath(aliases, path) {
   return typeof match?.[1] === "string" && match[1] ? match[1] : null;
 }
 
+/** Vue reactive proxies expose their raw target as `__v_raw`; everything else is
+ *  returned as-is. The workflow service hands out reactive PROXIES in computed
+ *  lists (openWorkflows) while RAW objects flow through other paths (store
+ *  returns, the uuid owner/object WeakMaps), so identity comparisons across
+ *  those carriers must normalize first — a raw `===`/`includes` misreads a live
+ *  proxy as a different object (#558 r2). A transparent (non-Vue) proxy has no
+ *  raw back-pointer and passes through; sameWorkflowObject's property identity
+ *  covers that form. */
+export function rawWorkflowObject(w) {
+  try {
+    return w?.__v_raw ?? w ?? null;
+  } catch {
+    return w ?? null;
+  }
+}
+
+/** Proxy-safe identity between two workflow references. Layers, strongest first:
+ *  object identity (after unwrapping Vue proxies), then a SAVED tab's unique
+ *  on-disk path (reflected through any proxy), then the per-instance
+ *  changeTracker OBJECT — the strongest shared identity for an UNSAVED tab,
+ *  whose synthetic path is shared by every unsaved tab (#186). Two references
+ *  that share NONE of these carriers can never be proven same → false. */
+export function sameWorkflowObject(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (rawWorkflowObject(a) === rawWorkflowObject(b)) return true;
+  const savedPath = (w) =>
+    w?.isPersisted === true && typeof w?.path === "string" && w.path ? w.path : null;
+  const pa = savedPath(a) ?? savedPath(rawWorkflowObject(a));
+  const pb = savedPath(b) ?? savedPath(rawWorkflowObject(b));
+  if (pa && pb) return pa === pb;
+  const ctA = rawWorkflowObject(a)?.changeTracker ?? a?.changeTracker;
+  const ctB = rawWorkflowObject(b)?.changeTracker ?? b?.changeTracker;
+  return Boolean(ctA) && ctA === ctB;
+}
+
 /** Return true when an embedded UUID belongs to a different workflow file.
  *  An existing objectUuid means ComfyUI mutated the same live workflow object
  *  during rename/Save-As, so continuity wins. Otherwise an embedded path or a

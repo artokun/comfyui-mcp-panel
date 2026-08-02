@@ -101,7 +101,9 @@ import {
   selectorTargetsNonActiveWorkflow,
   isNewWorkflowLoad,
   normalizedWorkflowPath,
+  rawWorkflowObject,
   resolveUnsavedInstanceUuid,
+  sameWorkflowObject,
   shouldForkEmbeddedUuidForLiveOwner,
   shouldForkEmbeddedWorkflowUuid,
   shouldForkInPlaceReload,
@@ -1612,14 +1614,22 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
   // replaced — this object is its successor and INHERITS the identity, which
   // keeps the WeakMap cache and the root tag aligned.
   const openWorkflowsForOwnerCheck = app?.extensionManager?.workflow?.openWorkflows;
+  // Proxy-safe owner checks (#558 r2): openWorkflows holds Vue proxies while the
+  // owner map can hold raw objects, so raw `includes`/`!==` would misread a live
+  // foreign owner as closed (fork suppressed → a co-open copy INHERITS the source
+  // identity) or this object's own predecessor as foreign. Normalize through
+  // sameWorkflowObject at the comparison boundary.
+  const embeddedOwnerIsSelf = embeddedOwner != null && sameWorkflowObject(embeddedOwner, identityObject);
   if (
     !objectUuid &&
+    !embeddedOwnerIsSelf &&
     shouldForkEmbeddedUuidForLiveOwner({
       embeddedUuid: embedded,
       embeddedOwner,
       identityObject,
       ownerIsOpenWorkflow:
-        Array.isArray(openWorkflowsForOwnerCheck) && openWorkflowsForOwnerCheck.includes(embeddedOwner),
+        Array.isArray(openWorkflowsForOwnerCheck) &&
+        openWorkflowsForOwnerCheck.some((w) => sameWorkflowObject(w, embeddedOwner)),
     })
   ) {
     id = crypto.randomUUID();
@@ -4107,28 +4117,48 @@ function getGraphCtx() {
 // than return empty". Fail-safe: fires ONLY when the workflow reports N>0 nodes at
 // ROOT scope while the live root graph is empty, so a genuinely-empty / brand-new
 // workflow (and any descended-into empty subgraph) reads `node_count: 0` as before.
-// #349 — does OPEN workflow `w` claim rootUuid as its identity? Checked two ways,
-// because the identity carriers can lag: (1) the root-blind resolver — the same
-// identity the command fence uses for that tab; (2) the tab's OWN serialized
-// state, which still carries the graph stamp a CREATION made before any resolver
-// or owner record existed for it (creation loadGraphData calls pass no workflow
-// object, so nothing is registered in _workflowObjectUuids/_workflowUuidOwners at
-// stamp time). Either claim makes the tag that tab's live identity — never stale
-// bookkeeping the desync guard may rebind over.
+// #349 — does OPEN workflow `w` claim rootUuid as its identity? Checked three
+// ways, because the identity carriers can lag or disagree: (1) the root-blind
+// resolver — the same identity the command fence uses for that tab; (2) the
+// tab's OWN serialized state, which still carries the graph stamp a CREATION
+// made before any resolver or owner record existed for it (creation
+// loadGraphData calls pass no workflow object, so nothing is registered in
+// _workflowObjectUuids/_workflowUuidOwners at stamp time); (3) the registered
+// owner map, which still ties the tag to the tab even when its serialized state
+// is NOT loaded yet (an unloaded tab presents neither carrier). Any claim makes
+// the tag that tab's live identity — never stale bookkeeping the desync guard
+// may rebind over.
+//
+// The proxy/raw duality is normalized FIRST (#558 r2): openWorkflows holds Vue
+// proxies while the identity stores key on raw objects, so every lookup below
+// must work for either form — a raw `!==` would read a live proxy owner as a
+// different object and let the guard re-stamp that tab's live root.
 function workflowOwnsRootUuidTag(w, rootUuid) {
   if (!w || typeof rootUuid !== "string" || !rootUuid) return false;
+  const rawW = rawWorkflowObject(w);
   try {
-    if (workflowStableUuid(w) === rootUuid) return true;
+    if (workflowStableUuid(rawW) === rootUuid) return true;
   } catch {
     // Fall through to the serialized-state claim.
   }
   try {
-    const state = w?.changeTracker?.activeState ?? w?.activeState;
+    const state =
+      rawW?.changeTracker?.activeState ??
+      w?.changeTracker?.activeState ??
+      rawW?.activeState ??
+      w?.activeState;
     const stamped = state?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD];
-    return typeof stamped === "string" && stamped === rootUuid;
+    if (typeof stamped === "string" && stamped === rootUuid) return true;
   } catch {
-    return false;
+    // Fall through to the registered-owner claim.
   }
+  try {
+    const owner = workflowUuidOwner(rootUuid);
+    if (owner && sameWorkflowObject(owner, w)) return true;
+  } catch {
+    // No registered claim either.
+  }
+  return false;
 }
 
 function assertGraphBoundToActiveWorkflow(
@@ -4169,7 +4199,9 @@ function assertGraphBoundToActiveWorkflow(
     const openWorkflows = app?.extensionManager?.workflow?.openWorkflows;
     const rootTagOwnedByForeignOpenWorkflow =
       !Array.isArray(openWorkflows) ||
-      openWorkflows.some((w) => w && w !== activeWorkflow && workflowOwnsRootUuidTag(w, rootUuid));
+      openWorkflows.some(
+        (w) => w && !sameWorkflowObject(w, activeWorkflow) && workflowOwnsRootUuidTag(w, rootUuid),
+      );
     if (
       resolveGraphRootUuidRebind({ rootGraph, activeWorkflowUuid, rootTagOwnedByForeignOpenWorkflow }) ===
       "rebind"

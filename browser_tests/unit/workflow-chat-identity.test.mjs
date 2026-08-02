@@ -9,7 +9,9 @@ import {
   isThreadInScope,
   isNewWorkflowLoad,
   normalizedWorkflowPath,
+  rawWorkflowObject,
   resolveUnsavedInstanceUuid,
+  sameWorkflowObject,
   shouldForkEmbeddedUuidForLiveOwner,
   shouldForkEmbeddedWorkflowUuid,
   shouldForkInPlaceReload,
@@ -193,6 +195,47 @@ test('#557 fork away from an owned embedded uuid ONLY while the owner is still o
     embeddedUuid: 'uuid-A', embeddedOwner: null, identityObject: successor, ownerIsOpenWorkflow: true
   }), false)
   assert.equal(shouldForkEmbeddedUuidForLiveOwner(), false)
+})
+
+// #558 r2 — openWorkflows holds Vue PROXIES while the owner/uuid WeakMaps can hold
+// RAW objects (the workflow-save.test.mjs store double models exactly this), so
+// identity across those carriers must be proxy-safe.
+test('rawWorkflowObject: unwraps __v_raw, passes raw objects and transparent proxies through', () => {
+  const raw = { path: 'workflows/x.json' }
+  assert.equal(rawWorkflowObject(raw), raw)
+  const proxy = new Proxy(raw, {})
+  assert.equal(rawWorkflowObject(proxy), proxy, 'a transparent proxy has no raw back-pointer')
+  assert.equal(rawWorkflowObject({ __v_raw: raw }), raw)
+  assert.equal(rawWorkflowObject(null), null)
+  assert.equal(rawWorkflowObject(undefined), null)
+})
+
+test('sameWorkflowObject: a Vue proxy and its raw target are the SAME workflow', () => {
+  const raw = { isPersisted: true, path: 'workflows/b.json', changeTracker: { activeState: null } }
+  const proxy = new Proxy(raw, {}) // transparent proxy — the repo's store-double idiom
+  assert.equal(sameWorkflowObject(raw, proxy), true)
+  assert.equal(sameWorkflowObject(proxy, raw), true)
+  assert.equal(sameWorkflowObject(proxy, proxy), true)
+  // A Vue-style proxy exposing the raw target as __v_raw.
+  const vueProxy = { __v_raw: raw }
+  assert.equal(sameWorkflowObject(vueProxy, raw), true)
+  assert.equal(sameWorkflowObject(raw, vueProxy), true)
+})
+
+test('sameWorkflowObject: distinct workflows never match — incl. same-path unsaved tabs (#186)', () => {
+  const raw = { isPersisted: true, path: 'workflows/b.json', changeTracker: {} }
+  assert.equal(sameWorkflowObject(raw, { isPersisted: true, path: 'workflows/c.json' }), false)
+  // Two UNSAVED tabs share the synthetic path; identity falls to the per-instance
+  // changeTracker object, which differs.
+  const unsavedA = { isPersisted: false, path: 'workflows/Unsaved Workflow.json', changeTracker: {} }
+  const unsavedB = { isPersisted: false, path: 'workflows/Unsaved Workflow.json', changeTracker: {} }
+  assert.equal(sameWorkflowObject(unsavedA, unsavedB), false)
+  assert.equal(sameWorkflowObject(unsavedA, new Proxy(unsavedA, {})), true)
+  // Two not-yet-loaded unsaved tabs (no tracker) can never be proven same.
+  assert.equal(sameWorkflowObject({ isPersisted: false }, { isPersisted: false }), false)
+  assert.equal(sameWorkflowObject(null, raw), false)
+  assert.equal(sameWorkflowObject(raw, null), false)
+  assert.equal(sameWorkflowObject(null, null), false)
 })
 
 // Fakes for the ComfyWorkflow 4th arg: a REUSE passes a ComfyWorkflow OBJECT; a CREATION
