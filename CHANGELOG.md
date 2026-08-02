@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.36] - 2026-08-03
+
+### Fixed
+- panel_run scoped dispatch guard: per-run queue marks, content-hash drift detection, refusal before any scope-dropped/corrupted/drifted dispatch leaves the browser (deferred posts included via cancel-or-page-lifetime-sentinel), verified = completed 200+prompt_id, terminal-truthful partial batches — never a silent full-graph run (#556) (#559)
+- graph-binding identity system rebuilt: the desync guard self-heals proven active-lineage drift and fails closed on foreign/untracked/unclaimed tags; identity transfers uniformly require object-keyed evidence (raw-canonical stores with conflict vetoes) or API/event-threaded succession proof across all four paths — carry, creation registration, guard rebind, lazy backstop (#545, #557) (#558)
+
 ## [0.11.35] - 2026-08-02
 
 ### Added
