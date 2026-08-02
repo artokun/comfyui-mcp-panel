@@ -3260,11 +3260,6 @@ async function programmaticSave(name) {
   // closed→reopened object at the same path is a NEW workflow (r3 P0), while a
   // swapped successor is the same continuous tab and must keep its identity.
   const preSwapUuid = expectWf ? _workflowObjectUuids.get(expectWf) || workflowStableUuid(expectWf) : null;
-  // The predecessor's tab slot BEFORE the save — half of the continuity proof
-  // below (a genuine swap lands the successor in the same slot).
-  const preSwapSlotIndex = Array.isArray(svc?.openWorkflows)
-    ? svc.openWorkflows.findIndex((w) => sameWorkflowObject(w, expectWf))
-    : -1;
   // Capture POSITIVE pre-save evidence of the source file's existence: a confirmed 200
   // is the ONLY basis on which a post-save 404 may be treated as a real move/deletion
   // of a persisted original. Without it, a source that 404s afterward simply never
@@ -3293,15 +3288,18 @@ async function programmaticSave(name) {
     expect: expectWf, // #330: refuse if the user switched tabs during our pre-save HEAD
   });
   const outcome = describeSaveOutcome(details);
-  // #557 r3/r4 — thread the identity across the swap ONLY with positive
+  // #557 r3/r4/r5 — thread the identity across the swap ONLY with positive
   // CONTINUITY, verified at the seed point (postWf is read from the service
   // HERE, after the awaited save): the predecessor must be GONE from the open
   // tabs — a user/reconnect tab switch during the await keeps it open and must
   // abort the carry entirely, or a distinct foreign tab gets seeded with A's
   // uuid and the #349 wrong-canvas fence aligns on the wrong identity — and
-  // the successor must show it continues the same tab lifetime (its
-  // serialized state carries the pre-save uuid, or it occupies the
-  // predecessor's slot).
+  // the successor must CARRY the pre-save uuid in its serialized state (the
+  // genuine #557 successor parses the just-saved file, which embeds it). Tab
+  // SLOT occupancy is NOT evidence: a closed-then-compacted list can seat a
+  // foreign tab in the predecessor's old slot with zero lineage (r5 P0). A
+  // successor whose tracker is lagging/unreadable fails SAFE (no carry); the
+  // lazy owner-not-open inheritance heals that case on next resolve.
   const postSwapWf = svc?.activeWorkflow;
   if (preSwapUuid) {
     const openList = svc?.openWorkflows;
@@ -3310,8 +3308,6 @@ async function programmaticSave(name) {
     const successorState = postSwapWf?.changeTracker?.activeState ?? postSwapWf?.activeState;
     const successorCarriesPreUuid =
       successorState?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD] === preSwapUuid;
-    const successorInPreSlot =
-      Array.isArray(openList) && preSwapSlotIndex >= 0 && sameWorkflowObject(openList[preSwapSlotIndex], postSwapWf);
     if (
       shouldCarryIdentityAcrossSaveSwap({
         preWf: expectWf,
@@ -3319,7 +3315,6 @@ async function programmaticSave(name) {
         savedAs: outcome.saved_as,
         preWfStillOpen,
         successorCarriesPreUuid,
-        successorInPreSlot,
       })
     ) {
       _workflowObjectUuids.set(postSwapWf, preSwapUuid);
@@ -4259,33 +4254,26 @@ function assertGraphBoundToActiveWorkflow(
     ? (_workflowObjectUuids.get(activeWorkflow) || workflowStableUuid(activeWorkflow))
     : null;
   // #545/#557 — a root-tag UUID conflict is not self-healing: a save or reconnect
-  // can REPLACE the live ComfyWorkflow object, leaving the root stamped with an
-  // identity no live open tab claims. Such an orphaned tag is stale bookkeeping
-  // rather than a foreign canvas — re-stamp the root with the active identity
-  // and proceed, instead of hard-blocking every graph tool until a frontend
-  // reload. A tag claimed by another LIVE OPEN workflow is the genuine #349
-  // wrong-canvas case: it still throws below, preserving the data-loss
-  // protection.
+  // can drift the root stamp from the ACTIVE workflow's resolved identity while
+  // the root is still that workflow's own canvas. Rebind ONLY when the active
+  // workflow ITSELF claims the tag — its own serialized state carries it, or
+  // its registered owner record ties it to the tag — because then the tag is
+  // the active tab's own lineage and the root is provably its own canvas; in
+  // that case re-stamp the root with the active identity and proceed instead of
+  // hard-blocking every graph tool until a frontend reload. A tag the active
+  // workflow does NOT claim fails closed: a FOREIGN open tab's claim is the
+  // genuine #349 wrong-canvas case, and a tag NOBODY claims may be a closed
+  // tab's stale canvas — re-stamping either would authorize writes to a graph
+  // that is not the active workflow's (r4/r5 P0). The remedy for a genuinely
+  // drifted binding the tracker cannot prove is panel_open_workflow's proven
+  // repaint re-stamp.
   let rootUuidMismatch = graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid });
   if (rootUuidMismatch) {
     const rootUuid = rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD];
-    // The tag stays a hard wrong-canvas refusal whenever ANY OTHER LIVE OPEN
-    // workflow claims it (#349). Decide by ENUMERATING the open tabs, never the
-    // owner map alone: a creation stamps the graph without any owner/uuid-cache
-    // record (creation loadGraphData passes no workflow object), and a save can
-    // leave the owner map pointing at the replaced predecessor — so a missing or
-    // stale owner record must never be what authorizes a rebind over a live
-    // tab's canvas (codex P0). Fail closed when the open-tab list itself is
-    // unavailable: an unverifiable claim is a claim.
-    const openWorkflows = app?.extensionManager?.workflow?.openWorkflows;
-    const rootTagOwnedByForeignOpenWorkflow =
-      !Array.isArray(openWorkflows) ||
-      openWorkflows.some(
-        (w) => w && !sameWorkflowObject(w, activeWorkflow) && workflowOwnsRootUuidTag(w, rootUuid),
-      );
+    const rootTagClaimedByActiveWorkflow =
+      !!activeWorkflow && workflowOwnsRootUuidTag(activeWorkflow, rootUuid);
     if (
-      resolveGraphRootUuidRebind({ rootGraph, activeWorkflowUuid, rootTagOwnedByForeignOpenWorkflow }) ===
-      "rebind"
+      resolveGraphRootUuidRebind({ rootGraph, activeWorkflowUuid, rootTagClaimedByActiveWorkflow }) === "rebind"
     ) {
       try {
         const extra =

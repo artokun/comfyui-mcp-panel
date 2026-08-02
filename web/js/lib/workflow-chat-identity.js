@@ -59,28 +59,32 @@ export function sameWorkflowObject(a, b) {
  *  the same path is a NEW workflow (r3 P0), while a swapped successor is the
  *  same tab. A proxy/raw form of the SAME object is no swap at all.
  *
- *  CONTINUITY (r4 P0): "whatever is active after the awaited save" is not
+ *  CONTINUITY (r4/r5 P0): "whatever is active after the awaited save" is not
  *  enough — a user/reconnect tab switch DURING the await lands on a DISTINCT
  *  workflow, and seeding it with the pre-save uuid would align that foreign tab
  *  with the old root tag, bypassing the #349 wrong-canvas fence. The carry
  *  therefore also requires the predecessor to be GONE from the open tabs (a
- *  genuine swap removes it; a switch keeps it open) AND the successor to show
- *  it continues the same tab lifetime: its serialized state carries the
- *  pre-save uuid, or it occupies the predecessor's tab slot. Unknown
- *  predecessor state defaults to still-open (fail-safe: no carry). */
+ *  genuine swap removes it; a switch keeps it open) AND the successor to CARRY
+ *  the pre-save uuid in its serialized state — the genuine #557 successor
+ *  parses the just-saved file, which embeds the pre-save uuid. Tab-SLOT
+ *  occupancy is deliberately NOT evidence: a closed-then-compacted list can
+ *  seat a foreign tab in the predecessor's old slot with zero lineage (r5 P0).
+ *  A successor whose tracker/state is lagging or unreadable fails SAFE (no
+ *  carry); the lazy owner-not-open inheritance in workflowStableUuid heals that
+ *  case on next resolve. Unknown predecessor state defaults to still-open
+ *  (fail-safe: no carry). */
 export function shouldCarryIdentityAcrossSaveSwap({
   preWf,
   postWf,
   savedAs = false,
   preWfStillOpen = true,
   successorCarriesPreUuid = false,
-  successorInPreSlot = false,
 } = {}) {
   if (savedAs) return false;
   if (!preWf || !postWf || typeof postWf !== "object") return false;
   if (preWf === postWf || sameWorkflowObject(preWf, postWf)) return false;
   if (preWfStillOpen) return false;
-  return successorCarriesPreUuid || successorInPreSlot;
+  return successorCarriesPreUuid === true;
 }
 
 /** Return true when an embedded UUID belongs to a different workflow file.

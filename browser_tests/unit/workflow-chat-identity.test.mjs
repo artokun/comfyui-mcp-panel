@@ -262,14 +262,15 @@ test('#557 r3/r4: identity carries across a save object-swap ONLY with positive 
   const pre = { isPersisted: true, path: 'workflows/x.json', changeTracker: {} }
   const successor = { isPersisted: true, path: 'workflows/x.json', changeTracker: {} }
   // In-place / first save that swapped the object, predecessor GONE from the open
-  // tabs, successor showing continuity (carries the pre-save uuid, or occupies
-  // the predecessor's tab slot) → carry.
+  // tabs, successor carrying the pre-save uuid in its serialized state → carry.
   assert.equal(shouldCarryIdentityAcrossSaveSwap({
     preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: false, successorCarriesPreUuid: true
   }), true)
+  // r5 P0: tab-slot occupancy is NOT continuity — a closed-then-compacted list
+  // can seat a foreign B in A's old slot with zero A lineage.
   assert.equal(shouldCarryIdentityAcrossSaveSwap({
     preWf: pre, postWf: successor, savedAs: false, preWfStillOpen: false, successorInPreSlot: true
-  }), true)
+  }), false)
   // r4 P0: the predecessor is STILL OPEN — a user/reconnect tab switch during the
   // awaited save lands on a DISTINCT workflow; seeding it with A's uuid would
   // bypass the #349 wrong-canvas fence → never carry.

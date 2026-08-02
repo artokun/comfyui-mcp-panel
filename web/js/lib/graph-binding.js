@@ -252,34 +252,34 @@ export function graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid } =
 
 /**
  * #545/#557 — a root-tag/active-identity UUID conflict is not always a wrong
- * canvas. The tag is panel-owned bookkeeping, and a save or reconnect can
- * REPLACE the live ComfyWorkflow object: the root then keeps a stamp whose
- * owning object no longer exists as an open tab, while the successor object
- * resolves a different identity. That orphan is stale bookkeeping, not a live
- * foreign canvas — and a guard that can only throw on it blocks every graph
- * tool until a frontend reload, with no working remedy.
+ * canvas. The tag is panel-owned bookkeeping, and a save or reconnect can drift
+ * it from the ACTIVE workflow's resolved identity while the root is still that
+ * workflow's own canvas. For that case the guard must be RECOVERABLE: re-stamp
+ * the root with the active identity instead of hard-blocking every graph tool
+ * until a frontend reload.
  *
  * Returns:
  *   "none"     — no UUID conflict (missing identity on either side stays
  *                inconclusive, exactly like graphRootWorkflowUuidMismatches);
- *   "conflict" — the tag is positively claimed by ANOTHER currently-open
- *                workflow: the live root may genuinely be that tab's canvas
- *                (#349), so the data-loss protection stays fail-closed. The
- *                CALLER must establish this by enumerating the live open tabs —
- *                a missing owner/uuid-cache record is NOT proof of orphanhood
- *                (a creation stamps the graph before any record exists);
- *   "rebind"   — no live open workflow claims the tag (a closed/replaced tab's
- *                leftover, or the active object's own former identity): the
- *                caller should re-stamp the root with the active workflow's
- *                uuid and proceed instead of throwing.
+ *   "rebind"   — the ACTIVE workflow ITSELF claims the tag (its resolver
+ *                identity, its own serialized state, or its registered owner
+ *                record ties it to the tag): the tag is the active tab's own
+ *                lineage, stale relative to its current identity, so the root
+ *                is provably its own canvas — re-stamp and proceed;
+ *   "conflict" — anything else. A tag claimed by a FOREIGN open workflow is the
+ *                #349 wrong-canvas case, and a tag NOBODY claims may be a
+ *                closed tab's stale canvas — re-stamping either would authorize
+ *                writes to a graph that is not the active workflow's (r4/r5
+ *                P0). Both fail closed; the remedy for a genuinely drifted
+ *                binding is panel_open_workflow's proven repaint re-stamp.
  */
 export function resolveGraphRootUuidRebind({
   rootGraph,
   activeWorkflowUuid,
-  rootTagOwnedByForeignOpenWorkflow = false,
+  rootTagClaimedByActiveWorkflow = false,
 } = {}) {
   if (!graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid })) return "none";
-  return rootTagOwnedByForeignOpenWorkflow ? "conflict" : "rebind";
+  return rootTagClaimedByActiveWorkflow ? "rebind" : "conflict";
 }
 
 /**

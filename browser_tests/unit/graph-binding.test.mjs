@@ -70,9 +70,11 @@ const vueProxyOf = (raw) => new Proxy(raw, { get: (t, k) => (k === "__v_raw" ? t
 //   "same-path-overlap"     — A and B are DISTINCT live objects at the SAME path
 //                             (a closed→reopened overlap, #558 r3): path equality
 //                             must NOT exempt B from the foreign-claim check;
-//   "none"                  — NO live open tab claims the tag (a closed/replaced
-//                             tab's leftover): genuine stale bookkeeping — the
-//                             guard rebinds.
+//   "active-lineage"        — the ACTIVE tab's own serialized state carries the
+//                             tag (the #545/#557 drifted-successor heal case):
+//                             the guard rebinds the root to the active identity;
+//   "none"                  — NOBODY claims the tag (a closed tab's leftover
+//                             canvas, r5): the guard must keep throwing.
 // foreignTab overrides the B object (e.g. a creation-lifecycle product), and
 // registeredOwners/objectUuids override the identity stores the harness wires in.
 function buildDirtyStaleRouteHarness({
@@ -87,9 +89,22 @@ function buildDirtyStaleRouteHarness({
   const fenceSource = panelFunctionSource(src, "assertGraphBoundToActiveWorkflow", "getPiniaStore");
   const ownsTagSource = panelFunctionSource(src, "workflowOwnsRootUuidTag", "assertGraphBoundToActiveWorkflow");
   const overlap = foreignClaim === "same-path-overlap";
+  const lineage = foreignClaim === "active-lineage";
   const workflowA = overlap
     ? { isPersisted: true, path: "workflows/a.json", isModified: true, changeTracker: { activeState: state(27) } }
-    : { isPersisted: false, isModified: true, changeTracker: { activeState: state(27) } };
+    : {
+        isPersisted: false,
+        isModified: true,
+        changeTracker: {
+          activeState: {
+            ...state(27),
+            // "active-lineage": the ACTIVE tab's own serialized state carries the
+            // tag — the drifted-successor heal case (#545/#557): the tag is its
+            // own lineage, stale relative to its resolved identity.
+            ...(lineage && rootUuid ? { extra: { comfyui_mcp: { workflow_uuid: rootUuid } } } : {}),
+          },
+        },
+      };
   const rawB =
     foreignTab ??
     {
@@ -117,7 +132,7 @@ function buildDirtyStaleRouteHarness({
     ...(rootUuid ? { extra: { comfyui_mcp: { workflow_uuid: rootUuid } } } : {}),
   };
   const openWorkflows =
-    foreignClaim === "none"
+    foreignClaim === "none" || foreignClaim === "active-lineage"
       ? [workflowA]
       : foreignClaim === "unloaded-proxy-owner"
         ? [workflowA, proxyB]
@@ -192,13 +207,11 @@ function buildDirtyStaleRouteHarness({
     "graphRootMismatchesActiveWorkflow",
     "graphReadDesynced",
     "activeWorkflowNodeCount",
-    "sameWorkflowObject",
     "workflowOwnsRootUuidTag",
     "rememberWorkflowUuidOwner",
     "resolveGraphRootUuidRebind",
     "WORKFLOW_META_NAMESPACE",
     "WORKFLOW_UUID_FIELD",
-    "app",
     `${fenceSource}\nreturn assertGraphBoundToActiveWorkflow;`,
   )(
     () => workflowA,
@@ -209,13 +222,11 @@ function buildDirtyStaleRouteHarness({
     graphRootMismatchesActiveWorkflow,
     graphReadDesynced,
     activeWorkflowNodeCount,
-    sameWorkflowObject,
     ownsTag,
     () => {},
     resolveGraphRootUuidRebind,
     "comfyui_mcp",
     "workflow_uuid",
-    { graph: rootB, extensionManager: { workflow: { openWorkflows } } },
   );
   return { src, workflowA, rawB, proxyB, rootB, objectUuids, stableUuid, assertBound };
 }
@@ -715,21 +726,21 @@ test("#545: a positively identified wrong root remains rejected even for a read"
 
 // ── #545/#557: recoverable desync — orphaned root tags rebind ────────────────
 
-test("resolveGraphRootUuidRebind: none without a conflict, conflict for a foreign open owner, rebind otherwise", () => {
+test("resolveGraphRootUuidRebind: none without a conflict, rebind only when the ACTIVE workflow claims the tag", () => {
   const tagged = { extra: { comfyui_mcp: { workflow_uuid: "workflow-B" } } };
-  assert.equal(
-    resolveGraphRootUuidRebind({ rootGraph: tagged, activeWorkflowUuid: "workflow-A" }),
-    "rebind",
-    "a tag no LIVE OPEN workflow claims is stale bookkeeping, not a wrong canvas",
-  );
   assert.equal(
     resolveGraphRootUuidRebind({
       rootGraph: tagged,
       activeWorkflowUuid: "workflow-A",
-      rootTagOwnedByForeignOpenWorkflow: true,
+      rootTagClaimedByActiveWorkflow: true,
     }),
+    "rebind",
+    "the active tab's own lineage tag is stale bookkeeping — heal it",
+  );
+  assert.equal(
+    resolveGraphRootUuidRebind({ rootGraph: tagged, activeWorkflowUuid: "workflow-A" }),
     "conflict",
-    "a tag owned by another LIVE OPEN workflow keeps the #349 data-loss fence",
+    "a tag the active workflow does NOT claim fails closed — foreign claim OR closed-tab leftover (r5)",
   );
   assert.equal(
     resolveGraphRootUuidRebind({ rootGraph: tagged, activeWorkflowUuid: "workflow-B" }), "none");
@@ -741,12 +752,12 @@ test("resolveGraphRootUuidRebind: none without a conflict, conflict for a foreig
   assert.equal(resolveGraphRootUuidRebind({ rootGraph: tagged, activeWorkflowUuid: null }), "none");
 });
 
-test("#545: a root tag NO LIVE OPEN workflow claims (closed/replaced tab's leftover) rebinds instead of blocking every tool", () => {
-  const h = buildDirtyStaleRouteHarness({ rootUuid: "workflow-B", foreignClaim: "none" });
+test("#545: a root tag the ACTIVE workflow itself claims (its own drifted lineage) rebinds instead of blocking every tool", () => {
+  const h = buildDirtyStaleRouteHarness({ rootUuid: "workflow-B", foreignClaim: "active-lineage" });
   h.objectUuids.set(h.workflowA, "workflow-A");
   assert.doesNotThrow(
     () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: false }),
-    "a leftover tag no open tab claims must not hard-block reads",
+    "a tag the active tab's own tracker state carries is its own lineage — heal, don't block",
   );
   assert.equal(
     h.rootB.extra.comfyui_mcp.workflow_uuid,
@@ -760,6 +771,34 @@ test("#545: a root tag NO LIVE OPEN workflow claims (closed/replaced tab's lefto
         requireDirtyMutationBinding: graphCommandMayMutateWorkflow("graph_set_node_property"),
       }),
     "after the rebind the root positively matches, so a dirty-tab mutation proceeds",
+  );
+});
+
+test("#349 r5: a root tag NOBODY claims (a closed tab's leftover canvas) must throw, never re-stamp", () => {
+  // A closed workflow's stale graph left mounted: the active tab does not claim
+  // the tag, and no live open tab does either. Re-stamping it with the active
+  // identity would authorize writes to that dead graph as if it were the active
+  // one (r5 P0) — fail closed; panel_open_workflow's proven repaint is the remedy.
+  const h = buildDirtyStaleRouteHarness({ rootUuid: "workflow-B", foreignClaim: "none" });
+  h.objectUuids.set(h.workflowA, "workflow-A");
+  assert.throws(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: false }),
+    /NOT applied/,
+    "an unclaimed tag is not proof the root belongs to the active workflow",
+  );
+  assert.throws(
+    () =>
+      h.assertBound(h.rootB, h.rootB, {
+        includeBaselineReadGuard: false,
+        requireDirtyMutationBinding: graphCommandMayMutateWorkflow("graph_set_node_property"),
+      }),
+    /NOT applied/,
+    "an unclaimed tag must refuse a dirty mutation",
+  );
+  assert.equal(
+    h.rootB.extra.comfyui_mcp.workflow_uuid,
+    "workflow-B",
+    "an unclaimed tag must NOT be rewritten",
   );
 });
 
@@ -959,8 +998,13 @@ test("#557 r3/r4 wiring: programmaticSave threads the pre-save identity across a
   );
   assert.match(
     body,
-    /shouldCarryIdentityAcrossSaveSwap\(\{\s*preWf: expectWf,\s*postWf: postSwapWf,\s*savedAs: outcome\.saved_as,\s*preWfStillOpen,\s*successorCarriesPreUuid,\s*successorInPreSlot,\s*\}\)/,
+    /shouldCarryIdentityAcrossSaveSwap\(\{\s*preWf: expectWf,\s*postWf: postSwapWf,\s*savedAs: outcome\.saved_as,\s*preWfStillOpen,\s*successorCarriesPreUuid,\s*\}\)/,
     "the carry must pass ALL continuity evidence to the pure rule (never a Save-As copy, never a mid-save switch)",
+  );
+  assert.doesNotMatch(
+    body,
+    /successorInPreSlot|preSwapSlotIndex/,
+    "tab-slot occupancy is NOT continuity evidence (r5 P0) — it must not appear in the carry",
   );
   assert.match(
     body,
@@ -1048,15 +1092,15 @@ function buildProgrammaticSaveHarness({ onSave } = {}) {
     "comfyui_mcp",
     "workflow_uuid",
   );
-  // The #349 fence input, computed the same way the guard does: does any OTHER
-  // live open tab claim this root tag?
-  const foreignClaimOn = (rootUuid) =>
-    svc.openWorkflows.some((w) => !sameWorkflowObject(w, svc.activeWorkflow) && ownsTag(w, rootUuid));
-  return { save, svc, A, B, objectUuids, owners, foreignClaimOn };
+  // The #349 fence input, computed the same way the guard does: does the ACTIVE
+  // workflow itself claim this root tag (its own lineage → heal) or not (→
+  // fail closed)?
+  const activeClaims = (rootUuid) => ownsTag(svc.activeWorkflow, rootUuid);
+  return { save, svc, A, B, objectUuids, owners, activeClaims };
 }
 
 test("#349 r4 P0: a tab SWITCH during the awaited save aborts the identity carry — B is never seeded with A's uuid", async () => {
-  const { save, svc, A, B, objectUuids, owners, foreignClaimOn } = buildProgrammaticSaveHarness({
+  const { save, svc, A, B, objectUuids, owners, activeClaims } = buildProgrammaticSaveHarness({
     onSave: ({ svc }) => {
       svc.activeWorkflow = B; // user switched to a distinct dirty B while the save awaited
     },
@@ -1065,18 +1109,18 @@ test("#349 r4 P0: a tab SWITCH during the awaited save aborts the identity carry
   assert.equal(objectUuids.get(B), undefined, "B must NOT be seeded with A's uuid");
   assert.notEqual(owners.get("uuid-A"), B, "A's uuid must not be re-registered to B");
   assert.equal(
-    foreignClaimOn("uuid-A"),
-    true,
-    "A is still open and claims its tag — the #349 fence input holds while B is active",
+    activeClaims("uuid-A"),
+    false,
+    "B must not claim A's tag — the guard cannot heal an A-tagged root onto B",
   );
   assert.equal(
     resolveGraphRootUuidRebind({
       rootGraph: { extra: { comfyui_mcp: { workflow_uuid: "uuid-A" } } },
       activeWorkflowUuid: "uuid-B",
-      rootTagOwnedByForeignOpenWorkflow: foreignClaimOn("uuid-A"),
+      rootTagClaimedByActiveWorkflow: activeClaims("uuid-A"),
     }),
     "conflict",
-    "with the carry aborted, an A-tagged root stays foreign to B-active — writes are fenced",
+    "with the carry aborted, an A-tagged root stays fenced while B is active",
   );
 });
 
@@ -1095,6 +1139,36 @@ test("#349 r4 P0: a RECONNECT-shaped mid-save switch (tab list rebuilt with new 
   await save();
   assert.equal(objectUuids.get(B), undefined, "B must NOT be seeded with A's uuid");
   assert.notEqual(owners.get("uuid-A"), B, "A's uuid must not be re-registered to B");
+});
+
+test("#349 r5 P0: a CLOSE mid-await that compacts the tab list (B lands in A's old slot) aborts the carry", async () => {
+  // The r5 hole: A is CLOSED while its save awaits and the open-tab list
+  // compacts to [B], seating B in A's former slot. Slot occupancy is NOT
+  // succession — B carries NO A lineage, so the carry must abort and B must
+  // keep its own identity.
+  const { save, svc, B, objectUuids, owners, activeClaims } = buildProgrammaticSaveHarness({
+    onSave: ({ svc }) => {
+      svc.openWorkflows = [B]; // A closed; the list compacted — B now occupies A's slot
+      svc.activeWorkflow = B;
+    },
+  });
+  await save();
+  assert.equal(objectUuids.get(B), undefined, "B must NOT be seeded with A's uuid via A's vacated slot");
+  assert.notEqual(owners.get("uuid-A"), B, "A's uuid must not be re-registered to B");
+  assert.equal(
+    activeClaims("uuid-A"),
+    false,
+    "B must not claim A's tag — the guard cannot heal an A-tagged stale canvas onto B",
+  );
+  assert.equal(
+    resolveGraphRootUuidRebind({
+      rootGraph: { extra: { comfyui_mcp: { workflow_uuid: "uuid-A" } } },
+      activeWorkflowUuid: "uuid-B",
+      rootTagClaimedByActiveWorkflow: activeClaims("uuid-A"),
+    }),
+    "conflict",
+    "with the carry aborted, writes to A's stale root stay fenced while B is active",
+  );
 });
 
 test("#557 r4 control: a GENUINE save-swap successor still carries the pre-save identity", async () => {
