@@ -250,6 +250,8 @@ import {
   activeWorkflowNodeCount,
   graphReadDesynced,
   graphRootMismatchesActiveWorkflow,
+  graphRootWorkflowUuidMismatches,
+  graphRootWorkflowUuidMatches,
   graphReadBindingChanged,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
@@ -1325,14 +1327,26 @@ function activeWorkflowExtra(wf = activeWorkflowRef(), { create = false } = {}) 
   return candidate && typeof candidate === "object" ? candidate : null;
 }
 
-function embeddedWorkflowUuid(wf = activeWorkflowRef()) {
-  const ns = activeWorkflowExtra(wf)?.[WORKFLOW_META_NAMESPACE];
+// Metadata hung directly off the ComfyWorkflow object is safe to use to identify
+// that object. `app.graph.extra` is deliberately NOT included here: during a
+// tab-switch/reconnect race it can still be the prior tab's graph, so letting it
+// establish a previously-unseen workflow object's UUID would adopt that prior
+// tab before the graph-binding fence can reject it (#545 P1).
+function workflowOwnedExtra(wf = activeWorkflowRef()) {
+  const candidate = wf?.extra || wf?.workflow?.extra || wf?.data?.extra;
+  return candidate && typeof candidate === "object" ? candidate : null;
+}
+
+function embeddedWorkflowUuid(wf = activeWorkflowRef(), { allowGraph = true } = {}) {
+  const extra = allowGraph ? activeWorkflowExtra(wf) : workflowOwnedExtra(wf);
+  const ns = extra?.[WORKFLOW_META_NAMESPACE];
   const id = ns?.[WORKFLOW_UUID_FIELD];
   return typeof id === "string" && id ? id : null;
 }
 
-function embeddedWorkflowPath(wf = activeWorkflowRef()) {
-  const ns = activeWorkflowExtra(wf)?.[WORKFLOW_META_NAMESPACE];
+function embeddedWorkflowPath(wf = activeWorkflowRef(), { allowGraph = true } = {}) {
+  const extra = allowGraph ? activeWorkflowExtra(wf) : workflowOwnedExtra(wf);
+  const ns = extra?.[WORKFLOW_META_NAMESPACE];
   const path = ns?.[WORKFLOW_PATH_FIELD];
   return typeof path === "string" && path ? path : null;
 }
@@ -1389,6 +1403,7 @@ function installCreateBoundaryFork(appRef) {
           //    the prior instance's identity. The embedded value is used ONLY to DETECT the
           //    change; the minted uuid is fresh (never adopted from graph.extra).
           let fork = false;
+          let cacheIncomingUuid = null;
           if (keepInstance && workflow && typeof workflow === "object") {
             // Authoritative identity = the live object's cached uuid (mint one only if this
             // object has never been seen). Stamp it over the incoming value; do NOT fork.
@@ -1410,16 +1425,38 @@ function installCreateBoundaryFork(appRef) {
             if (shouldForkInPlaceReload({ cachedUuid: cached, incomingUuid: incoming })) {
               _workflowObjectUuids.delete(workflow); // content replaced in place → drop stale cache
               fork = true;
+            } else if (!cached) {
+              // The load call itself binds this serialized graph to `workflow`.
+              // Seed from that authoritative pairing, never later from whichever
+              // app.graph happens to be mounted when a command arrives. Legacy
+              // graph data without an embedded UUID gets a fresh one here, while
+              // this load-to-workflow pairing is still known to be valid.
+              cacheIncomingUuid = typeof incoming === "string" && incoming ? incoming : crypto.randomUUID();
+              const extra =
+                graphData.extra && typeof graphData.extra === "object" ? graphData.extra : (graphData.extra = {});
+              const prev = extra[WORKFLOW_META_NAMESPACE];
+              extra[WORKFLOW_META_NAMESPACE] = {
+                ...(prev && typeof prev === "object" ? prev : {}),
+                [WORKFLOW_UUID_FIELD]: cacheIncomingUuid,
+              };
             }
           }
           if (fork) {
             const extra =
               graphData.extra && typeof graphData.extra === "object" ? graphData.extra : (graphData.extra = {});
             const prev = extra[WORKFLOW_META_NAMESPACE];
+            const freshUuid = crypto.randomUUID();
             extra[WORKFLOW_META_NAMESPACE] = {
               ...(prev && typeof prev === "object" ? prev : {}),
-              [WORKFLOW_UUID_FIELD]: crypto.randomUUID(),
+              [WORKFLOW_UUID_FIELD]: freshUuid,
             };
+            if (workflow && typeof workflow === "object") {
+              _workflowObjectUuids.set(workflow, freshUuid);
+              rememberWorkflowUuidOwner(freshUuid, workflow);
+            }
+          } else if (cacheIncomingUuid) {
+            _workflowObjectUuids.set(workflow, cacheIncomingUuid);
+            rememberWorkflowUuidOwner(cacheIncomingUuid, workflow);
           }
         }
       } catch {
@@ -1504,7 +1541,12 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
     // (#570). When the sanitizer is inactive we therefore ignore the embedded value entirely
     // and mint a fresh per-instance uuid — durable resume is disabled (lost-resume), never a
     // wrong-resume. The live-object WeakMap (objectUuid) is always safe: a copy never shares it.
-    const embeddedId = embeddedWorkflowUuid(wf);
+    // Do not read app.graph.extra here. Command dispatch resolves this identity
+    // before assertGraphBoundToActiveWorkflow(), so a stale root must never get
+    // a chance to define the active workflow's identity. A known loadGraphData
+    // pairing above seeds the object cache; otherwise minting loses continuity
+    // but cannot turn a foreign graph into an authorized target.
+    const embeddedId = embeddedWorkflowUuid(wf, { allowGraph: false });
     const id = resolveUnsavedInstanceUuid({
       objectUuid,
       embeddedId,
@@ -1517,7 +1559,7 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
       // SAVE carries it into the saved file across the tmp:→wf: transition). Never dirties the
       // graph. Not a KEEP authority — the wrapper's live-object invalidation is.
       try {
-        const extra = activeWorkflowExtra(wf, { create: true });
+        const extra = workflowOwnedExtra(wf);
         const previous = extra?.[WORKFLOW_META_NAMESPACE];
         if (extra) {
           extra[WORKFLOW_META_NAMESPACE] = {
@@ -1532,8 +1574,10 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
     return id;
   }
 
-  const embedded = embeddedWorkflowUuid(wf);
-  const embeddedPath = embeddedWorkflowPath(wf);
+  // Same root-blind rule for saved workflows. A path alias or a UUID recorded
+  // on the workflow object is usable; a stale mounted root is not.
+  const embedded = embeddedWorkflowUuid(wf, { allowGraph: false });
+  const embeddedPath = embeddedWorkflowPath(wf, { allowGraph: false });
   const pathAlias = workflowAliasForPath(_workflowUuidAliases, path);
   let id = objectUuid || embedded || pathAlias || crypto.randomUUID();
 
@@ -1579,7 +1623,7 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
   }
   if (embed) {
     try {
-      const extra = activeWorkflowExtra(wf, { create: true });
+      const extra = workflowOwnedExtra(wf);
       const previous = extra?.[WORKFLOW_META_NAMESPACE];
       const pathChanged = path && normalizedWorkflowPath(previous?.[WORKFLOW_PATH_FIELD]) !== normalizedWorkflowPath(path);
       if (extra && (previous?.[WORKFLOW_UUID_FIELD] !== id || pathChanged)) {
@@ -3945,13 +3989,38 @@ function getGraphCtx() {
 // than return empty". Fail-safe: fires ONLY when the workflow reports N>0 nodes at
 // ROOT scope while the live root graph is empty, so a genuinely-empty / brand-new
 // workflow (and any descended-into empty subgraph) reads `node_count: 0` as before.
-function assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard = true } = {}) {
+function assertGraphBoundToActiveWorkflow(
+  graph,
+  rootGraph,
+  { includeBaselineReadGuard = true, requireDirtyMutationBinding = false } = {},
+) {
   const liveNodeCount = rootGraph?._nodes?.length ?? 0;
   const inSubgraph = !!rootGraph && graph !== rootGraph;
   const activeWorkflow = activeWorkflowRef();
+  // Every caller, including direct CivitAI graph_load and local snapshot restore,
+  // must establish the active object identity before relying on a dirty-tab
+  // relaxation. workflowStableUuid is root-blind when this object has no cache:
+  // it can use workflow-owned/load-bound metadata or mint a fresh id, but can
+  // never adopt the stale app.graph.extra we are trying to detect (#545 P1).
+  const activeWorkflowUuid = activeWorkflow
+    ? (_workflowObjectUuids.get(activeWorkflow) || workflowStableUuid(activeWorkflow))
+    : null;
+  const currentStateTrustworthy = activeWorkflow?.isModified !== true;
+  // On a dirty tab, ChangeTracker's activeState can lag the live canvas (#545),
+  // so it cannot prove the root belongs to this workflow. Reads remain
+  // availability-oriented, but mutations need a positive UUID match: otherwise
+  // a stale, untagged root B is indistinguishable from A and could be changed.
+  const dirtyMutationBindingUnproven =
+    requireDirtyMutationBinding &&
+    activeWorkflow?.isModified === true &&
+    !graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid });
   if (
+    graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid }) ||
+    dirtyMutationBindingUnproven ||
     graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow }) ||
-    (includeBaselineReadGuard && graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph }))
+    (currentStateTrustworthy &&
+      includeBaselineReadGuard &&
+      graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph }))
   ) {
     const expected = activeWorkflowNodeCount(activeWorkflow);
     throw new Error(
@@ -4199,7 +4268,10 @@ function captureGraphSnapshot(mid, label) {
       (state) => state && Array.isArray(state.nodes),
     );
     if (!currentState) return null;
-    assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: false });
+    assertGraphBoundToActiveWorkflow(graph, rootGraph, {
+      includeBaselineReadGuard: false,
+      requireDirtyMutationBinding: true,
+    });
     const data = rootGraph.serialize();
     graphSnapshots.push({ mid, ts: Date.now(), label: (label || "").slice(0, 80), data, workflowRef });
     while (graphSnapshots.length > GRAPH_SNAPSHOTS_MAX) graphSnapshots.shift();
@@ -4220,7 +4292,10 @@ function restoreSnapshot(snap) {
     if (!snap.workflowRef || snap.workflowRef !== activeWorkflowRef()) return null;
     // Revert is a direct local load, not a bridge command. Do not restore a
     // snapshot into a canvas proven to belong to a different active workflow.
-    assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: false });
+    assertGraphBoundToActiveWorkflow(graph, rootGraph, {
+      includeBaselineReadGuard: false,
+      requireDirtyMutationBinding: true,
+    });
     // Deep-clone so the stored snapshot isn't mutated by the live graph after load.
     // __cmcpNoFork: this reloads the SAME active workflow (a revert), so the create-
     // boundary fork must NOT re-mint its per-instance identity (#570 P0).
@@ -6388,7 +6463,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // This executor is also called directly by the CivitAI workflow picker,
     // bypassing bridge dispatch. Refuse before snapshot/load so that path cannot
     // report a successful load into a stale prior tab (#349).
-    assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: false });
+    assertGraphBoundToActiveWorkflow(graph, rootGraph, {
+      includeBaselineReadGuard: false,
+      requireDirtyMutationBinding: true,
+    });
     // Accept a JSON string or an object.
     let data = incoming;
     if (typeof data === "string") {
@@ -7528,7 +7606,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // Queueing a stale root would render the wrong workflow even though no graph
     // mutation occurs, so enforce the same current-state binding before prompt
     // construction or queuePrompt can report success (#349).
-    assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: false });
+    assertGraphBoundToActiveWorkflow(graph, rootGraph, {
+      includeBaselineReadGuard: false,
+      requireDirtyMutationBinding: true,
+    });
     if (typeof app.queuePrompt !== "function") {
       throw new Error("app.queuePrompt is unavailable on this frontend");
     }
@@ -11001,7 +11082,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // against the active workflow's serialized root before its executor.
             if (msg.cmd.startsWith("graph_")) {
               const { graph, rootGraph } = getGraphCtx();
-              assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: false });
+              assertGraphBoundToActiveWorkflow(graph, rootGraph, {
+                includeBaselineReadGuard: false,
+                requireDirtyMutationBinding: true,
+              });
             }
             // PINNED-TARGET GUARD (#349): a `workflow_path` on the command means the
             // agent's session is pinned to a SPECIFIC workflow. But every executor
