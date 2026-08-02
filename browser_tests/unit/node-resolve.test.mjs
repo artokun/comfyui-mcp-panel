@@ -21,11 +21,25 @@ import {
   assertAddNodeResolvableRefreshing,
   assertResolvedTargetRegistered,
   assertTypeAgainstFreshBackend,
+  assertMutatedNodeAuthorized,
   isFrontendOnlyRegisteredType,
+  // #496: the ONE shared frontend-only allowlist + the predicates every
+  // /object_info-oracle guard decides with.
+  FRONTEND_ONLY_NODE_TYPES,
+  isAuthorizedFrontendOnlyType,
+  isRemovedBackendType,
+  HISTORY_UNSEEDED,
+  HISTORY_PENDING,
+  backendHistoryVerdict,
 } from "../../web/js/lib/node-resolve.js";
+import { createObjectInfoHistory } from "../../web/js/lib/object-info-history.js";
 // The PRODUCTION graph_set_widget handler body — the executor and these tests
 // call it verbatim, so the tested ordering IS the shipped ordering (#458).
 import { runSetWidget } from "../../web/js/lib/set-widget.js";
+// The PRODUCTION combo refresh + the authoritative "server says this combo is empty"
+// oracle that gates #507's last-resort acceptance.
+import { refreshComboOptionsFromDefs } from "../../web/js/lib/asset-staleness.js";
+import { serverDeclaresEmptyComboOptions } from "../../web/js/lib/input-asset.js";
 
 // A registry shaped like LG.registered_node_types once /object_info loaded:
 // hundreds of classes; we only need the sentinels + a couple of extras here.
@@ -896,4 +910,692 @@ test("#458 EVER-SEEN: a frontend-only rgthree node NEVER in object_info ⇒ stil
     ...HOOKS,
   });
   assert.equal(set.value, false);
+});
+
+// ---- #496: ONE shared frontend-only allowlist across the WHOLE /object_info-oracle
+//      guard family. The set_widget guards exempted genuine frontend-only types
+//      (Note/MarkdownNote/Reroute/…); assertAddNodeResolvableRefreshing did NOT, so a
+//      MarkdownNote was writable but not ADDABLE on a perfectly healthy backend — the
+//      exact drift #496 reports. All three now decide via isAuthorizedFrontendOnlyType.
+//      These lock BOTH halves: the frontend-only types succeed, and every
+//      graph-corruption case the guards reject today is still rejected. ---------------
+
+// A live registry in which the frontend-only natives are registered by LiteGraph
+// (defless / provenance-clean), exactly as ComfyUI's frontend registers them.
+function registryWithNatives(natives = ["Note", "MarkdownNote", "Reroute", "PrimitiveNode"]) {
+  return loadedRegistry([], natives);
+}
+const ADD_OPTS = (fresh, wasTypeEverDefined = () => false) => ({
+  getFreshObjectInfo: async () => fresh,
+  refresh: async () => {},
+  wasTypeEverDefined,
+});
+
+test("#496 add_node: frontend-only natives (Note/MarkdownNote/Reroute/PrimitiveNode) are ADDABLE on a healthy backend that does not list them", async () => {
+  const reg = registryWithNatives();
+  const fresh = objectInfo(); // healthy backend — genuinely never lists these types
+  for (const t of ["Note", "MarkdownNote", "Reroute", "PrimitiveNode"]) {
+    await assert.doesNotReject(
+      () => assertAddNodeResolvableRefreshing(() => reg, t, ADD_OPTS(fresh)),
+      `#496: "${t}" is frontend-only and must be addable`,
+    );
+  }
+  // The rgthree frontend control nodes are on the same shared allowlist.
+  const reg2 = loadedRegistry([], ["Fast Bypasser (rgthree)"]);
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => reg2, "Fast Bypasser (rgthree)", ADD_OPTS(fresh)),
+  );
+});
+
+test("#496 add_node: a genuinely INVALID target still fails closed (unknown type, defless husk, provenance-bearing allowlisted name)", async () => {
+  const fresh = objectInfo();
+  // (a) never installed / typo — not on the allowlist.
+  const reg = registryWithNatives();
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "TotallyMadeUpNode", ADD_OPTS(fresh)),
+    /Unknown node type|does not provide/i,
+  );
+  // (b) a REMOVED pack that left a DEFLESS husk registered: defless is NOT the signal —
+  //     it is not on the allowlist, so it stays refused (the #458 hole stays closed).
+  const reg2 = loadedRegistry([], ["RemovedBackendNode"]);
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg2, "RemovedBackendNode", ADD_OPTS(fresh)),
+    /Unknown node type|does not provide/i,
+  );
+  // (c) a class squatting an ALLOWLISTED name but carrying backend provenance
+  //     (nodeData/comfyClass) is NOT frontend-only — refuse.
+  const reg3 = loadedRegistry(["MarkdownNote"]); // registered WITH nodeData
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg3, "MarkdownNote", ADD_OPTS(fresh)),
+    /Unknown node type|does not provide/i,
+  );
+  // (d) an allowlisted name that is NOT registered in the live registry at all — the
+  //     exemption requires registry membership (which is also what createNode needs).
+  const reg4 = loadedRegistry();
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg4, "MarkdownNote", ADD_OPTS(fresh)),
+    /Unknown node type|does not provide/i,
+  );
+});
+
+test("#496 add_node: the EVER-SEEN gate still wins — an allowlisted name whose backend was REMOVED this session fails closed", async () => {
+  // A pack registered a backend node literally named "MarkdownNote" and was then
+  // uninstalled, leaving a provenance-clean husk. The observed-backend-history trust
+  // root refuses it: a client husk cannot un-see what the backend already reported.
+  const reg = registryWithNatives();
+  const fresh = objectInfo(); // current object_info no longer lists it
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(
+        () => reg,
+        "MarkdownNote",
+        ADD_OPTS(fresh, (t) => t === "MarkdownNote"),
+      ),
+    /defined this node type earlier this session|removed/i,
+  );
+  // …and the gate does NOT over-reach: a sibling native never reported stays addable.
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => reg, "Note", ADD_OPTS(fresh, (t) => t === "MarkdownNote")),
+  );
+});
+
+test("#496 add_node: object_info UNAVAILABLE still fails closed, even for a frontend-only type", async () => {
+  // The exemption is scoped to "object_info WAS fetched but lacks the type". An
+  // unverifiable backend must never authorize anything (#458).
+  const reg = registryWithNatives();
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", {
+        getFreshObjectInfo: async () => null,
+        refresh: async () => {},
+        wasTypeEverDefined: () => false,
+      }),
+    /cannot verify|object_info is unavailable/i,
+  );
+});
+
+test("#496 set_widget: MarkdownNote's text widget is writable end-to-end (the reported repro)", async () => {
+  const reg = registryWithNatives();
+  const node = {
+    id: 11,
+    type: "MarkdownNote",
+    widgets: [{ name: "text", type: "string", value: "" }],
+    constructor: reg["MarkdownNote"],
+  };
+  const { set } = await runSetWidget(node, "text", "# README", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => objectInfo(), // healthy backend, no MarkdownNote
+    wasTypeEverDefined: () => false,
+    ...HOOKS,
+  });
+  assert.equal(set.value, "# README");
+  assert.equal(node.widgets[0].value, "# README");
+});
+
+// The three guards whose oracle is /object_info. Each is reduced to a boolean
+// "would this LEAF node type be authorized?" so they can be compared directly.
+// (Container-shaped nodes are excluded on purpose: assertMutatedNodeAuthorized has an
+// ADDITIONAL virtual-subgraph-container branch the other two must not have, so parity
+// is asserted over LEAF nodes, where the frontend-only allowlist is the only exemption.)
+function guardVerdicts(reg, fresh, type, node, wasTypeEverDefined = () => false) {
+  const ok = async (fn) => {
+    try {
+      await fn();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  return Promise.all([
+    ok(() => assertAddNodeResolvableRefreshing(() => reg, type, ADD_OPTS(fresh, wasTypeEverDefined))),
+    ok(() => assertTypeAgainstFreshBackend(fresh, type, node?.id, { registry: reg, node, wasTypeEverDefined })),
+    ok(() => assertMutatedNodeAuthorized(fresh, reg, node, "target", wasTypeEverDefined)),
+  ]);
+}
+
+test("#496 PARITY: all three /object_info-oracle guards reach the SAME verdict for the same leaf node type", async () => {
+  const fresh = objectInfo();
+  const leaf = (type, ctor) => ({
+    id: 42,
+    type,
+    widgets: [{ name: "text", type: "string", value: "" }],
+    constructor: ctor,
+  });
+  const natives = registryWithNatives();
+  const husk = loadedRegistry([], ["RemovedBackendNode"]);
+  const squat = loadedRegistry(["MarkdownNote"]); // allowlisted NAME, backend provenance
+  const cases = [
+    // [label, registry, type, expected verdict, wasTypeEverDefined]
+    ["MarkdownNote (frontend-only)", natives, "MarkdownNote", true, () => false],
+    ["Note (frontend-only)", natives, "Note", true, () => false],
+    ["Reroute (frontend-only)", natives, "Reroute", true, () => false],
+    ["KSampler (live backend node)", natives, "KSampler", true, () => false],
+    ["TotallyMadeUpNode (unknown)", natives, "TotallyMadeUpNode", false, () => false],
+    ["RemovedBackendNode (defless husk, not allowlisted)", husk, "RemovedBackendNode", false, () => false],
+    ["MarkdownNote (squatted, backend provenance)", squat, "MarkdownNote", false, () => false],
+    ["MarkdownNote (backend REMOVED this session)", natives, "MarkdownNote", false, (t) => t === "MarkdownNote"],
+  ];
+  for (const [label, reg, type, expected, everSeen] of cases) {
+    const [add, freshAuth, mutated] = await guardVerdicts(reg, fresh, type, leaf(type, reg[type]), everSeen);
+    assert.deepEqual(
+      { add, freshAuth, mutated },
+      { add: expected, freshAuth: expected, mutated: expected },
+      `#496 guard drift on ${label}: all three guards must agree (expected ${expected})`,
+    );
+  }
+});
+
+test("#496 SINGLE SOURCE OF TRUTH: all three guards read the SAME allowlist Set (no second copy)", async () => {
+  // Mutating the ONE exported allowlist must move all three guards together. If a guard
+  // ever hard-codes its own copy of the list, its verdict stops tracking this Set and
+  // this test fails — which is precisely the regression #496 was.
+  const SYNTHETIC = "ZZFrontendOnlyProbe (test)";
+  const reg = loadedRegistry([], [SYNTHETIC]);
+  const fresh = objectInfo();
+  const node = {
+    id: 77,
+    type: SYNTHETIC,
+    widgets: [{ name: "text", type: "string", value: "" }],
+    constructor: reg[SYNTHETIC],
+  };
+  // Not on the allowlist yet ⇒ every guard refuses.
+  assert.deepEqual(
+    await guardVerdicts(reg, fresh, SYNTHETIC, node),
+    [false, false, false],
+    "a defless, non-allowlisted type must be refused by all three guards",
+  );
+  FRONTEND_ONLY_NODE_TYPES.add(SYNTHETIC);
+  try {
+    assert.deepEqual(
+      await guardVerdicts(reg, fresh, SYNTHETIC, node),
+      [true, true, true],
+      "adding to the ONE allowlist must authorize all three guards — they share it",
+    );
+    assert.equal(isAuthorizedFrontendOnlyType(reg, SYNTHETIC, node), true);
+  } finally {
+    FRONTEND_ONLY_NODE_TYPES.delete(SYNTHETIC);
+  }
+  // Removed again ⇒ back to refused everywhere (no guard cached the membership).
+  assert.deepEqual(await guardVerdicts(reg, fresh, SYNTHETIC, node), [false, false, false]);
+});
+
+test("#496 add_node (codex SEVERE): the frontend-only exemption REQUIRES the ever-seen oracle — without it, nothing absent from object_info is exempted", async () => {
+  // Client-side name + provenance markers are FORGEABLE: a removed pack whose frontend
+  // class had .nodeData/.comfyClass stripped and which squats a reserved allowlisted
+  // name is indistinguishable from a genuine native by those signals alone. Only the
+  // non-forgeable observed-backend-history gate can rule it out, so with NO history
+  // oracle wired there is no exemption at all — pre-#496 fail-closed behaviour.
+  const reg = registryWithNatives();
+  const fresh = objectInfo();
+  for (const t of ["Note", "MarkdownNote", "Reroute", "PrimitiveNode"]) {
+    await assert.rejects(
+      () =>
+        assertAddNodeResolvableRefreshing(() => reg, t, {
+          getFreshObjectInfo: async () => fresh,
+          refresh: async () => {},
+          // wasTypeEverDefined deliberately OMITTED
+        }),
+      /Unknown node type|does not provide/i,
+      `#496: "${t}" must NOT be exempted without the observed-backend-history oracle`,
+    );
+  }
+  // Wiring the oracle (and only then) enables the exemption.
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS(fresh)),
+  );
+});
+
+test("#496: isRemovedBackendType — the shared ever-seen gate is inert without an injected oracle and never guesses", () => {
+  assert.equal(isRemovedBackendType("KSampler", () => true), true);
+  assert.equal(isRemovedBackendType("KSampler", () => false), false);
+  assert.equal(isRemovedBackendType("KSampler", undefined), false, "no oracle wired ⇒ no removal claim");
+  assert.equal(isRemovedBackendType(undefined, () => true), false, "a non-string type is never 'removed'");
+});
+
+// ---- #507 END-TO-END through the PRODUCTION graph_set_widget body: a dynamic
+//      client-populated combo (empty server option list) must become writable, and the
+//      empty-list acceptance must be the LAST resort — the authoritative /object_info
+//      refresh gets first refusal, so a merely-STALE empty list is refreshed and then
+//      validated strictly. ------------------------------------------------------------
+
+// StarNodes' StarOllamaPromptHelper: `"model": ((), {...})` ⇒ /object_info reports
+// `[[], {...}]`, and the node's own "Refresh Models" button fills the dropdown.
+function starNodesFixture(liveOptions = []) {
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const widget = { name: "model", type: "combo", options: { values: liveOptions }, value: "" };
+  const node = { id: 9, type: "StarOllamaPromptHelper", widgets: [widget], constructor: reg["StarOllamaPromptHelper"] };
+  return { reg, node, widget };
+}
+// /object_info in which StarOllamaPromptHelper's `model` input carries `serverOptions`.
+function starObjectInfo(serverOptions = []) {
+  const info = objectInfo();
+  info["StarOllamaPromptHelper"] = { input: { required: { model: [serverOptions, {}] } } };
+  return info;
+}
+// The PRODUCTION combo refresh (the same function the panel injects as refreshCombos),
+// so these tests inherit its real semantics — notably that it deliberately NEVER clobbers
+// a dynamic (function) option source. A hand-rolled stand-in that overwrote functions
+// would hide exactly the path codex round-2 flagged.
+const refreshFromServer = (fresh, targetNode, defTypeKey, nameMap) =>
+  refreshComboOptionsFromDefs(targetNode, fresh, defTypeKey, nameMap);
+
+test("#507 e2e: a combo whose SERVER option list is empty becomes writable (the StarNodes repro)", async () => {
+  const { reg, node, widget } = starNodesFixture([]);
+  const res = await runSetWidget(node, "model", "qwen3-vl:8b", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => starObjectInfo([]), // server publishes ZERO options
+    wasTypeEverDefined: () => true, // a real backend node, present in object_info
+    refreshCombos: refreshFromServer,
+    ...HOOKS,
+  });
+  assert.equal(res.set.value, "qwen3-vl:8b");
+  assert.equal(widget.value, "qwen3-vl:8b");
+  assert.equal(res.empty_option_list, true, "reported honestly as an unvalidatable empty list");
+});
+
+test("#507 e2e: a merely-STALE empty list is REFRESHED first, then validated STRICTLY (not blindly accepted)", async () => {
+  // The live widget is empty only because the frontend combo snapshot is stale; the
+  // SERVER does publish a real list. The refresh must run and decide — a member is
+  // accepted through the normal path (no empty-list fallback), a NON-member is refused.
+  const ok = starNodesFixture([]);
+  const res = await runSetWidget(ok.node, "model", "llama3.2:3b", {
+    registry: ok.reg,
+    getRegistry: () => ok.reg,
+    getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b", "llama3.2:3b"]),
+    wasTypeEverDefined: () => true,
+    refreshCombos: refreshFromServer,
+    ...HOOKS,
+  });
+  assert.equal(res.set.value, "llama3.2:3b");
+  assert.equal(res.refreshed, true, "the authoritative refresh is what accepted it");
+  assert.equal(res.empty_option_list, undefined, "NOT the empty-list path — a real list existed");
+
+  const bad = starNodesFixture([]);
+  await assert.rejects(
+    () =>
+      runSetWidget(bad.node, "model", "not-installed:70b", {
+        registry: bad.reg,
+        getRegistry: () => bad.reg,
+        getFreshObjectInfo: async () => starObjectInfo(["qwen3-vl:8b", "llama3.2:3b"]),
+        wasTypeEverDefined: () => true,
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+    /not a valid option/i,
+    "#240: once the server publishes a real list, an off-list value is still refused",
+  );
+  assert.equal(bad.widget.value, "", "must not have mutated on reject");
+});
+
+test("#507 e2e: an object value into an empty combo still fails closed (no fabricated success)", async () => {
+  const { reg, node, widget } = starNodesFixture([]);
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "model", { model: "qwen3-vl:8b" }, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => starObjectInfo([]),
+        wasTypeEverDefined: () => true,
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+    /refused|only a scalar/i,
+  );
+  assert.equal(widget.value, "", "must not have mutated on reject");
+});
+
+test("#507 e2e: the empty-list fallback does NOT bypass the #458 type authorization", async () => {
+  // A since-REMOVED backend node that happens to expose an empty combo must still be
+  // refused BEFORE any write — the empty-list path is inside the write, downstream of
+  // the fresh-backend gate, and must not become a way around it.
+  const { reg, node, widget } = starNodesFixture([]);
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "model", "qwen3-vl:8b", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // backend no longer provides the type
+        wasTypeEverDefined: (t) => t === "StarOllamaPromptHelper", // …but it did earlier
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+    /removed|since-removed/i,
+  );
+  assert.equal(widget.value, "", "no write behind a refused authorization");
+});
+
+// ---- #507 codex round-2 (SEVERE): the last-resort acceptance is gated on the SERVER
+//      declaring the option list empty, never on the LIVE widget alone. -----------------
+
+test("#507 SEVERE: a DYNAMIC (function) source returning [] while the SERVER publishes a real list is still REFUSED", () => {
+  // The exact fail-open codex found: refreshComboOptionsFromDefs deliberately never
+  // clobbers a function option source, so a dynamic combo that currently returns []
+  // stays "empty" through the refresh. If the empty-list fallback keyed on the LIVE
+  // widget it would then write an OFF-LIST value against a real server list (#240).
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const widget = { name: "model", type: "combo", options: { values: () => [] }, value: "" };
+  const node = { id: 9, type: "StarOllamaPromptHelper", widgets: [widget], constructor: reg["StarOllamaPromptHelper"] };
+  const fresh = starObjectInfo(["allowed:1b"]); // the SERVER does publish a list
+  // Precondition: the production refresh leaves a function source alone.
+  refreshComboOptionsFromDefs(node, fresh, "StarOllamaPromptHelper");
+  assert.equal(typeof widget.options.values, "function", "production refresh must not clobber a dynamic source");
+  // And the authoritative oracle correctly says the server list is NOT empty.
+  assert.equal(serverDeclaresEmptyComboOptions(fresh, "StarOllamaPromptHelper", "model"), false);
+  return assert.rejects(
+    () =>
+      runSetWidget(node, "model", "off-list:70b", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => fresh,
+        wasTypeEverDefined: () => true,
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+    /not a valid option|EMPTY option list/i,
+  ).then(() => {
+    assert.equal(widget.value, "", "must not have mutated — the server list is real");
+  });
+});
+
+test("#507: a dynamic source returning [] AND a server-declared empty list DOES write", () => {
+  // The legitimate StarNodes shape, dynamic-source variant: both the live source and
+  // /object_info agree there is nothing to validate against.
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const widget = { name: "model", type: "combo", options: { values: () => [] }, value: "" };
+  const node = { id: 9, type: "StarOllamaPromptHelper", widgets: [widget], constructor: reg["StarOllamaPromptHelper"] };
+  return runSetWidget(node, "model", "qwen3-vl:8b", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => starObjectInfo([]),
+    wasTypeEverDefined: () => true,
+    refreshCombos: refreshFromServer,
+    ...HOOKS,
+  }).then((res) => {
+    assert.equal(res.set.value, "qwen3-vl:8b");
+    assert.equal(res.empty_option_list, true);
+  });
+});
+
+test("#507: with NO server def for the type (or a non-combo input), the empty list is NOT accepted", async () => {
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  // (a) the type IS in object_info but declares `model` as a plain STRING input.
+  const stringInput = objectInfo();
+  stringInput["StarOllamaPromptHelper"] = { input: { required: { model: ["STRING", {}] } } };
+  const a = starNodesFixture([]);
+  await assert.rejects(
+    () =>
+      runSetWidget(a.node, "model", "qwen3-vl:8b", {
+        registry: a.reg,
+        getRegistry: () => a.reg,
+        getFreshObjectInfo: async () => stringInput,
+        wasTypeEverDefined: () => true,
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+    /EMPTY option list|refused/i,
+  );
+  assert.equal(a.widget.value, "", "no write without an authoritative empty-combo declaration");
+  // (b) the def exists but has no such input at all.
+  const noInput = objectInfo();
+  noInput["StarOllamaPromptHelper"] = { input: { required: {} } };
+  const b = starNodesFixture([]);
+  await assert.rejects(
+    () =>
+      runSetWidget(b.node, "model", "qwen3-vl:8b", {
+        registry: b.reg,
+        getRegistry: () => b.reg,
+        getFreshObjectInfo: async () => noInput,
+        wasTypeEverDefined: () => true,
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+    /EMPTY option list|refused/i,
+  );
+  assert.equal(b.widget.value, "");
+  void reg;
+});
+
+test("#507: serverDeclaresEmptyComboOptions — TRUE only for an explicitly EMPTY declared combo list", () => {
+  const defs = {
+    T: {
+      input: {
+        required: { empty: [[], {}], full: [["a"], {}], str: ["STRING", {}] },
+        optional: { optEmpty: [[], {}] },
+      },
+    },
+  };
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "empty"), true);
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "optEmpty"), true, "optional inputs count too");
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "full"), false);
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "str"), false);
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "nope"), false);
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "Missing", "empty"), false);
+  assert.equal(serverDeclaresEmptyComboOptions(null, "T", "empty"), false);
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", undefined), false);
+});
+
+test("#507 codex round-2 (MODERATE): a real failure on the FINAL attempt propagates, not the earlier combo rejection", async () => {
+  // The empty-list attempt is a genuine write. If it fails for a REAL reason (here the
+  // value does not stick), that error must surface — it must not be swallowed and
+  // replaced by the stale "EMPTY option list" rejection.
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const widget = Object.defineProperty(
+    { name: "model", type: "combo", options: { values: [] } },
+    "value",
+    { get: () => "frozen", set: () => {}, enumerable: true, configurable: true },
+  );
+  const node = { id: 9, type: "StarOllamaPromptHelper", widgets: [widget], constructor: reg["StarOllamaPromptHelper"] };
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "model", "qwen3-vl:8b", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => starObjectInfo([]),
+        wasTypeEverDefined: () => true,
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+    /did not retain the requested value/i,
+  );
+});
+
+// ---- #496 / #458: an UNSEEDED history must refuse with an HONEST diagnosis. Previously
+//      every refusal in that state claimed "its backend was removed (pack uninstalled)",
+//      which for a MarkdownNote is false and misdiagnoses a transient backend problem as
+//      a broken install — the same misleading-error complaint #496 was filed about. -----
+
+// The oracle the panel injects when it has no trustworthy baseline.
+const NO_BASELINE = () => HISTORY_UNSEEDED;
+
+test("#496: all three guards refuse an unseeded history with a RELOAD-THE-TAB diagnosis, never a false 'pack removed'", async () => {
+  const reg = registryWithNatives();
+  const fresh = objectInfo();
+  const node = { id: 11, type: "MarkdownNote", widgets: [{ name: "text", type: "string", value: "" }], constructor: reg["MarkdownNote"] };
+  const honest = /no trustworthy record|Reload the ComfyUI tab/i;
+  const falseClaim = /pack uninstalled|its backend was removed/i;
+
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS(fresh, NO_BASELINE)),
+    (err) => honest.test(err.message) && !falseClaim.test(err.message),
+  );
+  assert.throws(
+    () => assertTypeAgainstFreshBackend(fresh, "MarkdownNote", 11, { registry: reg, node, wasTypeEverDefined: NO_BASELINE }),
+    (err) => honest.test(err.message) && !falseClaim.test(err.message),
+  );
+  assert.throws(
+    () => assertMutatedNodeAuthorized(fresh, reg, node, "target", NO_BASELINE),
+    (err) => honest.test(err.message) && !falseClaim.test(err.message),
+  );
+});
+
+test("#496: the unseeded sentinel still FAILS CLOSED — it is truthy and never authorizes", async () => {
+  const reg = registryWithNatives();
+  const fresh = objectInfo();
+  const node = { id: 11, type: "MarkdownNote", widgets: [{ name: "text", type: "string", value: "" }], constructor: reg["MarkdownNote"] };
+  // The SAME fixture succeeds with a real baseline — only the oracle differs, so the
+  // refusal below is attributable to the missing baseline and nothing else.
+  await assert.doesNotReject(() => assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS(fresh)));
+  assert.doesNotThrow(() =>
+    assertTypeAgainstFreshBackend(fresh, "MarkdownNote", 11, { registry: reg, node, wasTypeEverDefined: () => false }),
+  );
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "text", "# README", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => fresh,
+        wasTypeEverDefined: NO_BASELINE,
+        ...HOOKS,
+      }),
+    /no trustworthy record|Reload the ComfyUI tab/i,
+  );
+  assert.equal(node.widgets[0].value, "", "no write without a baseline");
+});
+
+test("#496: a REAL removed pack still gets the removed-pack diagnosis (the honest message did not replace it)", () => {
+  const reg = registryWithNatives();
+  const fresh = objectInfo();
+  const node = { id: 11, type: "MarkdownNote", widgets: [{ name: "text", type: "string", value: "" }], constructor: reg["MarkdownNote"] };
+  assert.throws(
+    () =>
+      assertTypeAgainstFreshBackend(fresh, "MarkdownNote", 11, {
+        registry: reg,
+        node,
+        wasTypeEverDefined: (t) => t === "MarkdownNote", // a genuine ever-seen positive
+      }),
+    /its backend was removed|pack uninstalled/i,
+  );
+});
+
+test("#496: backendHistoryVerdict — the one classifier all three guards share", () => {
+  assert.equal(backendHistoryVerdict("X", () => HISTORY_UNSEEDED), "unseeded");
+  assert.equal(backendHistoryVerdict("X", () => true), "removed");
+  assert.equal(backendHistoryVerdict("X", () => false), "never-seen");
+  assert.equal(backendHistoryVerdict("X", undefined), "no-oracle", "no oracle wired");
+  assert.equal(backendHistoryVerdict(undefined, () => true), "no-oracle", "a non-string type");
+  // isRemovedBackendType is the NARROW "REMOVED" claim only — an unseeded history is a
+  // refusal, but it is not a claim that the pack was removed.
+  assert.equal(isRemovedBackendType("X", () => HISTORY_UNSEEDED), false);
+  assert.equal(isRemovedBackendType("X", () => true), true);
+});
+
+// ---- #496 REGRESSION (coordinator review): a merely SLOW /object_info must not burn the
+//      session. A caller's bounded wait can expire while the fetch is still in flight;
+//      that is the ABSENCE of evidence, not evidence, so it yields a TEMPORARY refusal
+//      and a late-arriving seed restores normal operation with no tab reload. Latching
+//      there would make ordinary latency a permanent false refusal — the same bug class
+//      as #496 and #507 themselves. -----------------------------------------------------
+
+test("#496 REGRESSION: a seed that resolves AFTER the bound ⇒ the next MarkdownNote add SUCCEEDS", async () => {
+  // Drives the REAL history object through the real guard, so the state machine and the
+  // guard's reading of it are exercised together.
+  const history = createObjectInfoHistory();
+  const reg = registryWithNatives();
+  const fresh = objectInfo(); // healthy backend; never lists MarkdownNote (by design)
+  const opts = ADD_OPTS(fresh, (t) => history.wasTypeEverDefined(t));
+
+  // t = 0..bound — the startup getNodeDefs() is still in flight and the tool gave up
+  // waiting. Refused, but TEMPORARILY: the message must say "retry in a moment" and must
+  // NOT blame a removed pack or tell the user to reload.
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", opts),
+    (err) =>
+      /still loading|retry in a moment/i.test(err.message) &&
+      !/pack uninstalled|its backend was removed/i.test(err.message) &&
+      !/Reload the ComfyUI tab/i.test(err.message),
+  );
+  assert.equal(history.baselineLost, false, "a bounded wait must not latch the session");
+
+  // t = bound+ε — the slow response lands and seeds the baseline (this is what
+  // seedObjectInfoHistory does when its in-flight fetch finally returns).
+  history.recordTypes(fresh);
+  assert.equal(history.markSeeded(), true);
+
+  // The very SAME add now succeeds. No tab reload, nothing burned.
+  await assert.doesNotReject(
+    () => assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", opts),
+    "a late seed must restore normal operation",
+  );
+  // …and so does the write path, on the same recovered baseline.
+  const node = { id: 11, type: "MarkdownNote", widgets: [{ name: "text", type: "string", value: "" }], constructor: reg["MarkdownNote"] };
+  const { set } = await runSetWidget(node, "text", "# README", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => fresh,
+    wasTypeEverDefined: (t) => history.wasTypeEverDefined(t),
+    ...HOOKS,
+  });
+  assert.equal(set.value, "# README");
+  // The recovered baseline is a REAL one, not a blanket allow: a type it DID observe is
+  // still refused once it disappears from /object_info.
+  const gone = objectInfo(); // KSampler is in `fresh` (observed) but we drop it here
+  delete gone["KSampler"];
+  assert.throws(
+    () =>
+      assertTypeAgainstFreshBackend(gone, "KSampler", 12, {
+        registry: reg,
+        wasTypeEverDefined: (t) => history.wasTypeEverDefined(t),
+      }),
+    /its backend was removed|pack uninstalled/i,
+  );
+});
+
+test("#496 REGRESSION: PENDING and LATCHED are reported DIFFERENTLY by all three guards", async () => {
+  // "hasn't loaded yet, retry" and "never loaded, reload the tab" are different problems
+  // with different user actions. Both refuse; only the diagnosis differs.
+  const reg = registryWithNatives();
+  const fresh = objectInfo();
+  const node = { id: 11, type: "MarkdownNote", widgets: [{ name: "text", type: "string", value: "" }], constructor: reg["MarkdownNote"] };
+  const PENDING = () => HISTORY_PENDING;
+  const LATCHED = () => HISTORY_UNSEEDED;
+  const temporary = (m) => /still loading|retry in a moment/i.test(m) && !/Reload the ComfyUI tab/i.test(m);
+  const permanent = (m) => /Reload the ComfyUI tab/i.test(m) && !/retry in a moment/i.test(m);
+
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS(fresh, PENDING)),
+    (err) => temporary(err.message),
+  );
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS(fresh, LATCHED)),
+    (err) => permanent(err.message),
+  );
+  assert.throws(
+    () => assertTypeAgainstFreshBackend(fresh, "MarkdownNote", 11, { registry: reg, node, wasTypeEverDefined: PENDING }),
+    (err) => temporary(err.message),
+  );
+  assert.throws(
+    () => assertTypeAgainstFreshBackend(fresh, "MarkdownNote", 11, { registry: reg, node, wasTypeEverDefined: LATCHED }),
+    (err) => permanent(err.message),
+  );
+  assert.throws(
+    () => assertMutatedNodeAuthorized(fresh, reg, node, "target", PENDING),
+    (err) => temporary(err.message),
+  );
+  assert.throws(
+    () => assertMutatedNodeAuthorized(fresh, reg, node, "target", LATCHED),
+    (err) => permanent(err.message),
+  );
+});
+
+test("#496 REGRESSION: the PENDING sentinel still FAILS CLOSED — it never authorizes anything", async () => {
+  // The recoverable state must not become a hole: while pending, NOTHING is exempted.
+  const reg = registryWithNatives();
+  const fresh = objectInfo();
+  const node = { id: 11, type: "MarkdownNote", widgets: [{ name: "text", type: "string", value: "" }], constructor: reg["MarkdownNote"] };
+  assert.equal(backendHistoryVerdict("MarkdownNote", () => HISTORY_PENDING), "pending");
+  assert.notEqual(backendHistoryVerdict("MarkdownNote", () => HISTORY_PENDING), "never-seen");
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "text", "# README", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => fresh,
+        wasTypeEverDefined: () => HISTORY_PENDING,
+        ...HOOKS,
+      }),
+    /still loading|retry in a moment/i,
+  );
+  assert.equal(node.widgets[0].value, "", "no write while the baseline is pending");
 });

@@ -117,6 +117,129 @@ export function isFrontendOnlyRegisteredType(registry, type) {
 }
 
 /**
+ * THE single frontend-only authorization predicate for the WHOLE #458 guard family
+ * (#496). Every guard that may exempt a type from the "must be in fresh /object_info"
+ * rule calls THIS — graph_add_node's assertAddNodeResolvableRefreshing, and
+ * graph_set_widget's assertTypeAgainstFreshBackend + assertMutatedNodeAuthorized.
+ *
+ * WHY ONE HELPER: the exemption was previously spelled out inline, clause-for-clause,
+ * in each set_widget guard and OMITTED entirely from the add_node guard — so
+ * MarkdownNote/Note/Reroute were writable but NOT addable, and a future edit to one
+ * copy would silently diverge from the other. #496 is exactly that drift. A single
+ * predicate makes "which types are frontend-only" a one-place decision; a guard either
+ * consults it or does not exempt at all.
+ *
+ * The decision is UNCHANGED from the set_widget spelling — it still requires BOTH
+ * positive signals and fails closed on any doubt:
+ *   1. the type is REGISTERED in the live LiteGraph registry AND on the reserved
+ *      FRONTEND_ONLY_NODE_TYPES allowlist, with no backend provenance on the
+ *      REGISTERED class (isFrontendOnlyRegisteredType); AND
+ *   2. the write-target INSTANCE's own constructor carries no backend provenance
+ *      either — a stale backend instance must not slip through under a bare native
+ *      class of the same name. (`node` is omitted by add_node, where no instance
+ *      exists yet; the class check in (1) still applies.)
+ *
+ * This is NEVER the sole gate: every caller runs the non-forgeable
+ * OBSERVED-BACKEND-HISTORY check (isRemovedBackendType) FIRST, so a since-removed
+ * pack is refused before this predicate is ever consulted.
+ */
+export function isAuthorizedFrontendOnlyType(registry, type, node) {
+  if (!registry) return false;
+  if (!isFrontendOnlyRegisteredType(registry, type)) return false;
+  return !hasBackendProvenance(node?.constructor);
+}
+
+/**
+ * The #458 OBSERVED-BACKEND-HISTORY gate, shared by the whole guard family (#496):
+ * TRUE when the ComfyUI backend reported `type` in some /object_info EARLIER this
+ * session but the CURRENT /object_info no longer lists it — i.e. its backend was
+ * REMOVED (pack uninstalled/disabled), so any write/add must be refused.
+ *
+ * This is the NON-FORGEABLE trust root: a client-side husk cannot un-see what the
+ * backend already reported, so it catches a removed pack even when it masquerades
+ * under a reserved allowlisted name with no provenance markers. Callers apply it
+ * BEFORE the frontend-only exemption. `wasTypeEverDefined` is injected by the panel
+ * and itself fails closed while the session baseline is unseeded.
+ */
+export function isRemovedBackendType(type, wasTypeEverDefined) {
+  return backendHistoryVerdict(type, wasTypeEverDefined) === "removed";
+}
+
+/**
+ * The sentinel an injected `wasTypeEverDefined` returns instead of `true` when it has NO
+ * trustworthy session baseline at all (the panel never established one, or latched it as
+ * lost). It is TRUTHY, so any consumer that merely tests for truth still fails CLOSED —
+ * recognizing it only buys a HONEST error message. Without it every refusal in that state
+ * claims "its backend was removed (pack uninstalled/disabled)", which for a MarkdownNote
+ * is simply false and misdiagnoses a transient backend problem as a broken install —
+ * exactly the misleading-error complaint #496 was filed about.
+ */
+export const HISTORY_UNSEEDED = "history-unseeded";
+
+/**
+ * The other no-baseline sentinel: the baseline has not ARRIVED yet (the /object_info fetch
+ * is still in flight, or a caller bounded its wait on it). Also TRUTHY, so it fails closed
+ * identically — but it is TEMPORARY and RECOVERABLE, and must be reported that way.
+ *
+ * Keeping it distinct from HISTORY_UNSEEDED is not cosmetic. Treating "hasn't loaded yet"
+ * as "proven untrustworthy" turns ordinary latency into a permanent, session-long refusal
+ * of every legitimate add/write — a THIRD false refusal on top of the two (#496, #507)
+ * this guard family was fixed to stop making. A slow fetch must yield "retry in a moment",
+ * never "reload the tab".
+ */
+export const HISTORY_PENDING = "history-pending";
+
+/**
+ * Classify a type against the observed-backend-history oracle. ONE shared classifier for
+ * the whole guard family (#496), so all three guards agree on both the verdict and the
+ * diagnosis they report:
+ *   "pending"    — the baseline has not arrived YET ⇒ refuse, but say it is temporary and
+ *                  to retry; the state clears itself when the fetch lands.
+ *   "unseeded"   — the observation window closed with no data ⇒ refuse, and tell the user
+ *                  to reload the tab rather than blame a missing pack.
+ *   "removed"    — the backend reported this type earlier this session and does not now
+ *                  ⇒ its pack was uninstalled/disabled ⇒ refuse.
+ *   "never-seen" — genuinely never backend-defined this session ⇒ the frontend-only
+ *                  exemption may be considered (it has its own further requirements).
+ *   "no-oracle"  — no history oracle was injected at all. Treated as NOT never-seen, so
+ *                  callers that require positive history evidence fail closed.
+ * Every verdict except "never-seen" refuses, so a consumer that cannot tell them apart is
+ * still safe — the distinction only buys an accurate diagnosis.
+ */
+export function backendHistoryVerdict(type, wasTypeEverDefined) {
+  if (typeof wasTypeEverDefined !== "function" || typeof type !== "string") return "no-oracle";
+  const seen = wasTypeEverDefined(type);
+  if (seen === HISTORY_PENDING) return "pending";
+  if (seen === HISTORY_UNSEEDED) return "unseeded";
+  return seen ? "removed" : "never-seen";
+}
+
+/** The shared refusal for a baseline that simply has not ARRIVED yet — TEMPORARY, so it
+ *  must read as "retry in a moment", never as "this node type can't be verified" or
+ *  "reload the tab". Getting this wrong is what makes ordinary latency look like a broken
+ *  install to the user. */
+function pendingHistoryMessage(what) {
+  return (
+    `${what}: the panel is still loading this ComfyUI's node-type baseline (the ` +
+    `/object_info fetch has not come back yet), so a genuinely frontend-only node cannot ` +
+    `yet be told apart from one whose pack was removed. This is TEMPORARY — retry in a ` +
+    `moment and it will resolve itself; no reload is needed. Refusing to write until the ` +
+    `backend can be verified (#458).`
+  );
+}
+
+/** The shared, honest refusal for a baseline that was never established at all. */
+function unseededHistoryMessage(what) {
+  return (
+    `${what}: the panel has no trustworthy record of what this ComfyUI backend defined ` +
+    `earlier this session (the /object_info baseline never loaded — the backend was ` +
+    `unreachable at page load), so a genuinely frontend-only node cannot be told apart ` +
+    `from one whose pack was removed. Reload the ComfyUI tab to re-establish the ` +
+    `baseline, then retry. Refusing to write rather than guess (#458).`
+  );
+}
+
+/**
  * Positive signal that `node` is a genuine VIRTUAL SUBGRAPH CONTAINER — a litegraph
  * SubgraphNode. Prefers the UPSTREAM identity markers ComfyUI_frontend's SubgraphNode
  * exposes (`isVirtualNode === true`, `isSubgraphNode()`), falling back to a REAL nested
@@ -179,7 +302,14 @@ export function assertMutatedNodeAuthorized(freshDefs, registry, node, role = "t
   if (typeof type === "string" && Object.prototype.hasOwnProperty.call(freshDefs, type)) return;
   // ABSENT from fresh object_info. EVER-SEEN GATE: if the backend reported this type
   // earlier this session, its backend was REMOVED — refuse (non-forgeable, #458).
-  if (typeof wasTypeEverDefined === "function" && typeof type === "string" && wasTypeEverDefined(type)) {
+  const verdict = backendHistoryVerdict(type, wasTypeEverDefined);
+  if (verdict === "pending") {
+    throw new Error(pendingHistoryMessage(`Cannot set widget on node ${id}${label} (${role} node)`));
+  }
+  if (verdict === "unseeded") {
+    throw new Error(unseededHistoryMessage(`Cannot set widget on node ${id}${label} (${role} node)`));
+  }
+  if (verdict === "removed") {
     throw new Error(
       `Cannot set widget on node ${id}${label}: the ${role} node type was defined by the ComfyUI ` +
         `backend earlier this session but is ABSENT from the current /object_info — its backend was ` +
@@ -192,7 +322,9 @@ export function assertMutatedNodeAuthorized(freshDefs, registry, node, role = "t
     !hasBackendProvenance(typeof type === "string" ? registry?.[type] : undefined) &&
     !hasBackendProvenance(node?.constructor);
   if (provenanceClean && isVirtualSubgraphContainer(node)) return;
-  if (registry && isFrontendOnlyRegisteredType(registry, type) && !hasBackendProvenance(node?.constructor)) return;
+  // SHARED frontend-only predicate (#496) — the identical decision assertTypeAgainstFreshBackend
+  // and assertAddNodeResolvableRefreshing make, so the family cannot drift apart again.
+  if (isAuthorizedFrontendOnlyType(registry, type, node)) return;
   throw new Error(
     `Cannot set widget on node ${id}${label}: the ${role} node is not defined by the ComfyUI ` +
       `backend and is not a verifiable frontend-only / virtual-subgraph node (a removed or ` +
@@ -237,7 +369,11 @@ export function assertAddNodeResolvable(registry, class_type) {
  * So the AUTHORITATIVE oracle is the freshly-fetched /object_info payload:
  *   1. Fetch fresh /object_info via `getFreshObjectInfo`.
  *   2. If the backend does NOT define the type → fail closed (unknown/removed),
- *      regardless of any stale registry entry.
+ *      regardless of any stale registry entry. The ONE exemption (#496) is a genuine
+ *      FRONTEND-ONLY type (Note/MarkdownNote/Reroute/… — never in /object_info by
+ *      design), decided by the SAME shared predicate the graph_set_widget guards use
+ *      (isAuthorizedFrontendOnlyType) and only AFTER the observed-backend-history gate
+ *      (isRemovedBackendType) has ruled out a since-removed pack.
  *   3. If the backend DOES define it → ensure LiteGraph can construct it: if the
  *      page-load registry predates it, `refresh` (re-register the fresh defs) and
  *      re-check; if it still can't be registered, fail closed rather than let
@@ -254,9 +390,14 @@ export function assertAddNodeResolvable(registry, class_type) {
  *   refresh            : optional async (defs?) => re-register node defs into the
  *                        registry; receives the already-fetched defs to avoid a
  *                        second /object_info round-trip.
+ *   wasTypeEverDefined : (type) => did any /object_info this session report this type?
+ *                        The #458 observed-backend-history trust root, shared with
+ *                        graph_set_widget. REQUIRED for the frontend-only exemption:
+ *                        omit it and NOTHING absent from fresh /object_info is ever
+ *                        exempted (fail closed, pre-#496 behaviour).
  */
 export async function assertAddNodeResolvableRefreshing(getRegistry, class_type, opts = {}) {
-  const { getFreshObjectInfo, refresh } = opts;
+  const { getFreshObjectInfo, refresh, wasTypeEverDefined } = opts;
   const readRegistry = () =>
     typeof getRegistry === "function" ? getRegistry() : getRegistry;
 
@@ -281,6 +422,49 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
     }
     // AUTHORITATIVE: does the LIVE backend provide this type right now?
     if (!Object.prototype.hasOwnProperty.call(freshDefs, class_type)) {
+      // #458 EVER-SEEN GATE (the non-forgeable trust root, applied FIRST — same order
+      // as the set_widget guards): the backend reported this type earlier this session
+      // but no longer does ⇒ its pack was REMOVED. Refuse, even under a reserved
+      // allowlisted name, before the frontend-only exemption below is consulted.
+      const verdict = backendHistoryVerdict(class_type, wasTypeEverDefined);
+      if (verdict === "pending") {
+        throw new Error(pendingHistoryMessage(`Cannot add "${class_type}"`));
+      }
+      if (verdict === "unseeded") {
+        throw new Error(unseededHistoryMessage(`Cannot add "${class_type}"`));
+      }
+      if (verdict === "removed") {
+        throw new Error(
+          `Cannot add "${class_type}": the ComfyUI backend defined this node type earlier this ` +
+            `session but it is ABSENT from the current /object_info — its backend was removed ` +
+            `(pack uninstalled/disabled). Refusing to add a since-removed node type (#458).`,
+        );
+      }
+      // #496 FRONTEND-ONLY EXEMPTION: Note / MarkdownNote / Reroute / PrimitiveNode and
+      // the rgthree frontend control nodes are registered PURELY by the LiteGraph
+      // frontend and are NEVER enumerated by /object_info BY DESIGN, so the fresh-backend
+      // oracle can never authorize them and this guard failed CLOSED on a perfectly
+      // healthy backend. graph_set_widget already exempted exactly this class of node;
+      // add_node did not — the drift #496 reports. Both now call the SAME predicate
+      // (isAuthorizedFrontendOnlyType), which requires live-registry membership, reserved
+      // allowlist membership and a provenance-clean registered class. Registry membership
+      // is also precisely what LG.createNode needs, so the caller can construct it.
+      //
+      // The exemption additionally REQUIRES the observed-backend-history oracle to be
+      // WIRED (codex round-1, SEVERE): client-side name + provenance markers alone are
+      // forgeable — a removed pack whose frontend class had its .nodeData/.comfyClass
+      // stripped and which squats a reserved allowlisted name would otherwise be added
+      // as a stale/generic node and reported as success. Only the non-forgeable
+      // ever-seen gate can rule that out, so WITHOUT it there is no exemption at all
+      // and every type absent from fresh /object_info fails closed exactly as before
+      // this change. The panel always wires it; this makes add's exemption strictly
+      // stronger than a bare allowlist check.
+      if (
+        typeof wasTypeEverDefined === "function" &&
+        isAuthorizedFrontendOnlyType(readRegistry(), class_type)
+      ) {
+        return;
+      }
       // Not defined by the current backend (never installed, or its pack was
       // removed). Fail closed even if a stale registry entry survives (#458/P1-C).
       throw new Error(
@@ -364,7 +548,14 @@ export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknow
     // that carries no nodeData/comfyClass is caught here, because a client husk cannot
     // un-see what the backend already reported. This is what the client-side allowlist +
     // provenance markers CANNOT prove on their own.
-    if (typeof wasTypeEverDefined === "function" && typeof type === "string" && wasTypeEverDefined(type)) {
+    const verdict = backendHistoryVerdict(type, wasTypeEverDefined);
+    if (verdict === "pending") {
+      throw new Error(pendingHistoryMessage(`Cannot set widget on node ${nodeId}${label}`));
+    }
+    if (verdict === "unseeded") {
+      throw new Error(unseededHistoryMessage(`Cannot set widget on node ${nodeId}${label}`));
+    }
+    if (verdict === "removed") {
       throw new Error(
         `Cannot set widget on node ${nodeId}${label}: node type "${type}" was defined by the ComfyUI ` +
           `backend earlier this session but is ABSENT from the current /object_info — its backend was ` +
@@ -375,13 +566,9 @@ export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknow
     // namespace allowlisted node with NO backend provenance on the registered class OR
     // the write-target INSTANCE's own constructor (defense-in-depth on top of the
     // ever-seen gate). A removed backend node's arbitrary pack name is not allowlisted.
-    if (
-      registry &&
-      isFrontendOnlyRegisteredType(registry, type) &&
-      !hasBackendProvenance(node?.constructor)
-    ) {
-      return;
-    }
+    // SHARED predicate (#496) — the same one assertMutatedNodeAuthorized and
+    // assertAddNodeResolvableRefreshing use, so no copy can drift.
+    if (isAuthorizedFrontendOnlyType(registry, type, node)) return;
     throw new Error(
       `Cannot set widget on node ${nodeId}${label}: the ComfyUI backend does not provide node ` +
         `type "${type}" (not installed, or its pack was removed) — refusing to write to a node ` +
@@ -405,6 +592,15 @@ export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknow
  * registered". A REAL subgraph parent is exempted authentically: its promoted
  * widget resolves to a registered inner node, and THAT inner node is what gets
  * passed here and passes the registry check.
+ *
+ * #496 NOTE — this is the one member of the guard family that needs NO frontend-only
+ * allowlist, so do NOT paste one here: its oracle is the LIVE LiteGraph REGISTRY, not
+ * /object_info, and a frontend-only type IS registered there (that is what "frontend-
+ * only" means). Note/MarkdownNote/Reroute therefore pass it already, and the
+ * placeholder check below is explicitly written not to false-negative them. Only the
+ * guards whose oracle is /object_info (assertAddNodeResolvableRefreshing,
+ * assertTypeAgainstFreshBackend, assertMutatedNodeAuthorized) need the exemption, and
+ * all three take it from the single shared isAuthorizedFrontendOnlyType predicate.
  */
 export function assertResolvedTargetRegistered(registry, targetNode) {
   const type = targetNode?.type;

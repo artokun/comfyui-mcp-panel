@@ -121,6 +121,7 @@ import {
   resolveMissingModelDirectory,
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing } from "./lib/node-resolve.js";
+import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
 import { todoItemGlyph } from "./lib/plan-glyph.js";
@@ -452,36 +453,31 @@ function monotonicNow() {
 // registerComfyNodeDefs). A write to a type ABSENT from the CURRENT /object_info that
 // was EVER seen here is a REMOVED backend node (refuse, #458) — a client husk cannot
 // un-see what the backend already reported; a type NEVER seen is genuinely frontend-only.
-const seenObjectInfoTypes = new Set();
-function recordObjectInfoTypes(defs) {
-  if (defs && typeof defs === "object") {
-    for (const key of Object.keys(defs)) seenObjectInfoTypes.add(key);
-  }
-  return defs;
-}
-// True once at least ONE authoritative /object_info observation has been recorded as a
-// baseline (the startup seed, or a reconnect/refresh_nodes re-register). Until then the
-// ever-seen history is UNRELIABLE — a write must NOT decide "never seen" against it, so
-// wasTypeEverDefined below FAILS CLOSED (treats every absent-from-current type as
-// removed) while this is false. A seed FAILURE therefore never opens a hole (codex
-// round-10): it leaves this false, so absent types are refused, not allowed.
-let objectInfoHistorySeeded = false;
+// The trust root itself lives in web/js/lib/object-info-history.js so its fail-closed
+// rules (unseeded ⇒ closed; baseline LOST ⇒ latched closed for the session) are
+// unit-testable rather than loose module state in this bundle.
+const objectInfoHistory = createObjectInfoHistory();
+const recordObjectInfoTypes = (defs) => objectInfoHistory.recordTypes(defs);
+// ONLY seedObjectInfoHistory() may call this. See the RECORD ONLY note in
+// registerComfyNodeDefs: any observation taken after an unobserved window cannot support
+// the "never backend-defined this session" claim a baseline makes.
+const markObjectInfoHistorySeeded = () => objectInfoHistory.markSeeded();
 // Resolves once the STARTUP baseline seed attempt sequence has finished (success or all
-// retries exhausted). graph_set_widget AWAITS this before authorizing.
+// retries exhausted). The graph tools AWAIT this (bounded) before authorizing.
 let objectInfoHistorySeed = Promise.resolve();
 function seedObjectInfoHistory() {
   objectInfoHistorySeed = (async () => {
     // Retry a transient getNodeDefs failure a few times (short backoff) so a flaky
     // startup fetch self-heals BEFORE any pack could be removed mid-session. If the
-    // backend is genuinely down, all attempts fail and objectInfoHistorySeeded stays
-    // false → fail closed (and the write's own oracle also fails closed).
+    // backend is genuinely down, all attempts fail and the history stays UNSEEDED
+    // → fail closed (and the write's own oracle also fails closed).
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
         if (typeof api?.getNodeDefs === "function") {
           const defs = await api.getNodeDefs();
           if (defs && typeof defs === "object" && Object.keys(defs).length > 0) {
             recordObjectInfoTypes(defs);
-            objectInfoHistorySeeded = true;
+            markObjectInfoHistorySeeded();
             return;
           }
         }
@@ -490,9 +486,36 @@ function seedObjectInfoHistory() {
       }
       await new Promise((resolve) => setTimeout(resolve, 150));
     }
+    // Every attempt FINISHED and none produced definitions. That is positive EVIDENCE
+    // that the page-load-anchored observation window closed with nothing — not merely an
+    // absence of evidence — so no later fetch can serve as a baseline and the latch is
+    // correctly armed here. This is the ONLY place that arms it: a caller that merely
+    // bounded its WAIT has learned nothing and must not latch (a request still in flight
+    // may return healthy definitions a moment later).
+    objectInfoHistory.loseBaseline();
   })();
   return objectInfoHistorySeed;
 }
+
+// How long a graph tool will WAIT for the startup baseline seed before proceeding without
+// it. The seed's own retry loop only advances once each api.getNodeDefs() SETTLES, so a
+// request that never settles (a hung/half-open connection) would otherwise block the
+// awaiting tool FOREVER. Bounding the wait converts that hang into the correct outcome:
+// the history reports PENDING, and the tool refuses THIS call with "retry in a moment".
+//
+// The bound is a patience limit, NOT a verdict. The seed is untouched by it and keeps
+// running, so a response arriving after the bound still establishes the baseline and the
+// very next call succeeds — no tab reload, nothing burned. That is what makes an 8s
+// timeout safe to have at all: without a recoverable pending state it would convert
+// ordinary latency into a permanent, session-long false refusal.
+const OBJECT_INFO_SEED_WAIT_MS = 8000;
+// Delegates to the extracted, unit-tested helper, whose contract is that it NEVER mutates
+// the history: giving up on the WAIT is the absence of evidence, so it must not latch and
+// must not start a replacement seed. If the baseline has not landed the history reports
+// PENDING and the guards refuse this ONE call with "retry in a moment"; the seed keeps
+// running and a late response still seeds, so the next call succeeds with no tab reload.
+const awaitObjectInfoHistorySeed = () =>
+  awaitHistoryBaseline(objectInfoHistory, objectInfoHistorySeed, OBJECT_INFO_SEED_WAIT_MS);
 
 async function registerComfyNodeDefs(preloadedDefs) {
   // Trust the live combos for suppressing missing-asset candidates ONLY once the
@@ -512,13 +535,19 @@ async function registerComfyNodeDefs(preloadedDefs) {
       defs = await api.getNodeDefs();
     }
     // Record observed backend history (#458 trust root) — covers reconnect, the forced
-    // refresh_nodes path, add_node payloads, and download-triggered refreshes. A valid
-    // payload here also establishes a reliable baseline (marks history seeded), so a
-    // reconnect after a failed startup seed restores the ever-seen gate to normal.
+    // refresh_nodes path, add_node payloads, and download-triggered refreshes.
+    //
+    // RECORD ONLY — this must NEVER establish the baseline (codex round-4, SEVERE).
+    // Recording can only ADD evidence that a type existed, which can only make the gate
+    // refuse MORE, so it is always safe. Claiming a BASELINE is the opposite: it asserts
+    // "anything not in this map was never backend-defined this session", which this
+    // payload cannot support — it may have been fetched AFTER a pack removal we never
+    // observed (startup seed hung, pack removed, then a reconnect/refresh_nodes lands
+    // here). Marking seeded from it would make the removed type read "never seen" and
+    // let a provenance-stripped husk squatting a reserved allowlisted name through the
+    // frontend-only exemption. ONLY seedObjectInfoHistory() — the STARTUP baseline, whose
+    // observation window begins at page load — may call markObjectInfoHistorySeeded().
     recordObjectInfoTypes(defs);
-    if (defs && typeof defs === "object" && Object.keys(defs).length > 0) {
-      objectInfoHistorySeeded = true;
-    }
     // Re-register node definitions so newly installed/updated classes and their
     // current widget schemas are known to LiteGraph (#221/#171).
     if (defs && typeof a.registerNodesFromDefs === "function") {
@@ -5994,12 +6023,24 @@ const GRAPH_TOOL_EXECUTORS = {
     // installed ones (#289). When the backend defines the type but the stale
     // page-load registry lacks it, the defs are refreshed + re-registered so
     // LG.createNode works; a type the live backend does not provide fails closed.
+    //
+    // #496: genuinely FRONTEND-ONLY types (Note/MarkdownNote/Reroute/…) are never in
+    // /object_info by design, so the guard exempts them via the SAME shared predicate
+    // graph_set_widget uses — but only behind the observed-backend-history gate below,
+    // so a since-REMOVED pack is still refused. WAIT (bounded) for the startup baseline
+    // seed for the same reason set_widget does: an un-seeded history must never let a
+    // write/add decide "never seen". If it has not landed the history reports PENDING and
+    // this ONE call is refused with a retry-in-a-moment message — a late response still
+    // seeds, so the next call succeeds without a reload.
+    await awaitObjectInfoHistorySeed();
     await assertAddNodeResolvableRefreshing(() => LG?.registered_node_types ?? {}, class_type, {
       getFreshObjectInfo: async () =>
         recordObjectInfoTypes(
           typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null,
         ),
       refresh: (defs) => refreshComfyNodeDefs(defs),
+      // #458 OBSERVED-BACKEND-HISTORY trust root, identical to graph_set_widget's.
+      wasTypeEverDefined: (t) => objectInfoHistory.wasTypeEverDefined(t),
     });
     const node = LG.createNode(class_type);
     if (!node) {
@@ -6423,17 +6464,12 @@ const GRAPH_TOOL_EXECUTORS = {
     // #458: WAIT for the startup baseline history seed to land before authorizing, so a
     // write can never decide "never seen" against an un-seeded history — a pack present
     // at page load that is removed mid-session is thus recorded before its removal and
-    // refused. If the startup seed did NOT establish a baseline (transient failure), try
-    // ONCE more here; if it still can't (backend down), objectInfoHistorySeeded stays
-    // false and wasTypeEverDefined fails CLOSED (absent types refused) — never allowed
-    // against an empty history (codex round-10). A backend that is up now succeeds and
-    // establishes the baseline for all currently-present types.
-    try {
-      await objectInfoHistorySeed;
-      if (!objectInfoHistorySeeded) await seedObjectInfoHistory();
-    } catch {
-      /* seed is best-effort; an unseeded history makes wasTypeEverDefined fail closed */
-    }
+    // refused. BOUNDED, so a getNodeDefs request that never settles cannot hang the tool:
+    // if the baseline has not landed the history reports PENDING and wasTypeEverDefined
+    // fails CLOSED for this call only, with a TEMPORARY "retry in a moment" refusal. The
+    // seed keeps running, so a late response still establishes the baseline and the next
+    // call authorizes normally — ordinary latency must never burn the session.
+    await awaitObjectInfoHistorySeed();
     // Delegate to the shared handler body (web/js/lib/set-widget.js) so this
     // production path and the unit tests run the IDENTICAL ordering: preflight →
     // reconcile-only-a-resolved-node → applyWidgetWrite with the resolved-target
@@ -6462,7 +6498,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // node — refuse (non-forgeable; client shape/name/provenance can't prove this).
       // While the history is NOT reliably seeded, FAIL CLOSED (treat every absent type as
       // ever-seen) so a failed/empty baseline never opens a hole (codex round-10).
-      wasTypeEverDefined: (t) => !objectInfoHistorySeeded || seenObjectInfoTypes.has(t),
+      wasTypeEverDefined: (t) => objectInfoHistory.wasTypeEverDefined(t),
       resolveSource: sourceForSubgraphInput,
       canvas: app.canvas,
       beforeChange: () => graph.beforeChange(),
@@ -13648,7 +13684,7 @@ function buildPanel() {
       if (!bk || !Array.isArray(list)) return;
       const plabel = BACKEND_LABELS[bk] || bk;
       for (const m of list) {
-        const key = bk + "\u0000" + m.id;
+        const key = bk + "\x00" + m.id;
         if (seen.has(key)) continue;
         seen.add(key);
         rows.push({ ...m, provider: bk, providerLabel: plabel });
@@ -13699,7 +13735,7 @@ function buildPanel() {
     const out = [];
     const pushed = new Set();
     const take = (m) => {
-      const key = m.provider + "\u0000" + m.id;
+      const key = m.provider + "\x00" + m.id;
       if (pushed.has(key)) return;
       pushed.add(key);
       out.push(m);
