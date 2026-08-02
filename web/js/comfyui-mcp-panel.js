@@ -8305,6 +8305,28 @@ const GRAPH_TOOL_EXECUTORS = {
       });
       return err;
     };
+    // An open can switch the workflow service before the panel manages to repaint
+    // LiteGraph. That is not a clean negative: retrying is not a harmless assertion
+    // that nothing happened, because the active workflow may already have changed.
+    // Journal the partial result explicitly rather than returning an `opened` receipt
+    // that tells the caller its graph-binding recovery worked when it did not (#721).
+    const failOpenRebindUnknown = (err) => {
+      noteOpenAttempt({
+        cmd: "workflow_open",
+        rid,
+        requested: path,
+        resolved: target
+          ? {
+              path: target.path,
+              filename: target.filename,
+              routing_key: workflowTabId(target),
+            }
+          : null,
+        applied: "unknown",
+        error: coerceMessageText(err?.message ?? err),
+      });
+      return err;
+    };
     const s = app?.extensionManager?.workflow;
     if (!s?.openWorkflow) throw failOpen(new Error("workflow service unavailable"));
     const find = () => {
@@ -8379,6 +8401,7 @@ const GRAPH_TOOL_EXECUTORS = {
     let reloaded = false;
     let reloadError = null;
     let openFailed = null;
+    let rebindFailed = null;
     if (priorInteraction !== null) canvasView.allow_interaction = false;
     // Hold the switch+reload critical section across the WHOLE mutating sequence. The canvas
     // freeze keeps the USER out; this keeps the BRIDGE out, so a concurrent graph_* command
@@ -8436,12 +8459,37 @@ const GRAPH_TOOL_EXECUTORS = {
       // LiteGraph canvas flag, not a workflow-service member.
         beginWorkflowReloadStep(reloadGuardToken);
         try {
-          const st = target.changeTracker?.activeState;
-          if (st && typeof app.loadGraphData === "function") {
+          // `assertGraphBoundToActiveWorkflow` deliberately accepts both tracker-owned
+          // and flat activeState shapes. Use that SAME state source here: otherwise a
+          // frontend that reports the active workflow's 15 nodes through flat
+          // `target.activeState` skips this repaint, returns `opened`, and leaves every
+          // graph tool behind the desync guard (#721).
+          const st = target.changeTracker?.activeState ?? target.activeState;
+          if (!st || !Array.isArray(st.nodes)) {
+            if (activeWorkflowNodeCount(target) > 0) {
+              rebindFailed = new Error(
+                "workflow_open could not rebind the active canvas: the workflow has graph state, " +
+                  "but this frontend did not expose it for a safe repaint. The open may have switched " +
+                  "the active workflow; inspect panel_list_workflows, then reload the panel before graph edits.",
+              );
+            }
+          } else if (typeof app.loadGraphData !== "function") {
+            rebindFailed = new Error(
+              "workflow_open could not rebind the active canvas because this frontend does not expose " +
+                "loadGraphData. The open may have switched the active workflow; reload the panel before graph edits.",
+            );
+          } else {
             await app.loadGraphData(JSON.parse(JSON.stringify(st)), true, true, target);
+            // A successful promise alone is not a binding receipt: old/partial frontend
+            // implementations can resolve while leaving app.canvas on the previous root.
+            // Re-run the same fail-closed binding guard graph tools use before reporting
+            // that the recommended recovery completed.
+            const { graph, rootGraph } = getGraphCtx();
+            assertGraphBoundToActiveWorkflow(graph, rootGraph);
           }
         } catch (err) {
-          console.warn("[comfyui-mcp-panel] workflow_open repaint failed:", err?.message ?? err);
+          rebindFailed = err instanceof Error ? err : new Error(coerceMessageText(err));
+          console.warn("[comfyui-mcp-panel] workflow_open repaint failed:", rebindFailed.message);
         } finally {
           endWorkflowReloadStep(reloadGuardToken);
         }
@@ -8637,6 +8685,7 @@ const GRAPH_TOOL_EXECUTORS = {
       if (priorInteraction !== null) canvasView.allow_interaction = priorInteraction;
     }
     if (openFailed) throw failOpen(openFailed);
+    if (rebindFailed) throw failOpenRebindUnknown(rebindFailed);
     const receipt = noteOpenAttempt({
       cmd: "workflow_open",
       rid,

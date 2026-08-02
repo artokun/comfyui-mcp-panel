@@ -367,20 +367,39 @@ test("#402 wiring: workflow_open BOUNDS the post-open disk read and never claims
   assert.ok(OPEN_DISK_READ_BUDGET_MS > 0 && OPEN_DISK_READ_BUDGET_MS <= 10000);
 });
 
-test("#402 wiring: workflow_open journals BOTH outcomes, and every early throw is a negative", () => {
+test("#402/#721 wiring: workflow_open journals clean negatives and partial rebind outcomes", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const body = handlerBody(src, "async workflow_open({");
   assert.match(body, /const failOpen = \(err\) => \{/, "there must be a single negative-journal helper");
   assert.match(body, /applied: false/, "the failure path must journal applied:false");
   assert.match(body, /noteOpenAttempt\(\{[\s\S]*?cmd: "workflow_open",[\s\S]*?applied: true,/, "the success path must journal a receipt");
-  // Every `throw` inside workflow_open must go through failOpen — an unjournaled throw
-  // leaves a lost reply with no evidence at all. Code only: the prose discusses throws.
-  const rawThrows = [...stripComments(body).matchAll(/\bthrow (?!failOpen)/g)];
+  // A failed post-switch repaint is not a clean negative: the active workflow may
+  // already have changed. It must be journaled UNKNOWN, while every other throw
+  // remains a request that definitely did not apply. Code only: prose discusses throws.
+  assert.match(body, /const failOpenRebindUnknown = \(err\) => \{/);
+  assert.match(body, /applied: "unknown"/);
+  const rawThrows = [...stripComments(body).matchAll(/\bthrow (?!failOpen|failOpenRebindUnknown)/g)];
   assert.equal(
     rawThrows.length,
     0,
-    `every throw in workflow_open must be journaled via failOpen (found ${rawThrows.length} raw throws)`,
+    `every throw in workflow_open must be journaled as a clean negative or unknown partial outcome (found ${rawThrows.length} raw throws)`,
   );
+});
+
+test("#721 wiring: an already-active workflow uses every supported active-state shape and proves the repaint", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const body = handlerBody(src, "async workflow_open({");
+  // graph-binding accepts both shapes; repainting only the tracker form stranded a
+  // legitimate active tab whose state is exposed flat on the workflow object.
+  assert.match(body, /const st = target\.changeTracker\?\.activeState \?\? target\.activeState;/);
+  const repaintAt = body.indexOf("await app.loadGraphData(JSON.parse(JSON.stringify(st))");
+  const proofAt = body.indexOf("assertGraphBoundToActiveWorkflow(graph, rootGraph);", repaintAt);
+  const openedAt = body.indexOf("applied: true", proofAt);
+  assert.ok(repaintAt !== -1 && proofAt > repaintAt && openedAt > proofAt, "must prove the repaint before success");
+  // A failed/missing repaint is an honest unknown after s.openWorkflow may have
+  // switched tabs, never the old fabricated {opened} receipt.
+  assert.match(body, /if \(rebindFailed\) throw failOpenRebindUnknown\(rebindFailed\);/);
+  assert.match(body, /workflow_open could not rebind the active canvas/);
 });
 
 test("#442 defect-2 wiring: the re-read is gated on a FRESH dirty re-check (no silent data loss)", () => {
