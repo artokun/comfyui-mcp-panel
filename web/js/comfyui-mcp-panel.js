@@ -8483,7 +8483,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // downgrade an unexplained red outline.
     const staleRedFlags = collectUnexplainedRedOutlines(nodes, reasons, {
       nodeErrors,
-      lastExecutionError: execFailure,
+      lastExecFailure: execFailure,
     });
     const staleRedFlagIds = new Set(staleRedFlags.map((n) => String(n.id)));
     const flagged = new Set(

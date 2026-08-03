@@ -777,7 +777,7 @@ test("#579 source-free LiteGraph outlines are warnings, not graph errors", () =>
   const reasons = new Map([["2", [{ kind: "missing_model" }]]]);
 
   assert.deepEqual(
-    collectUnexplainedRedOutlines(nodes, reasons, { nodeErrors: null, lastExecutionError: null }).map((n) => n.id),
+    collectUnexplainedRedOutlines(nodes, reasons, { nodeErrors: null, lastExecFailure: null }).map((n) => n.id),
     [1],
     "only an unexplained red outline with no run error source is stale",
   );
@@ -787,7 +787,7 @@ test("#579 source-free LiteGraph outlines are warnings, not graph errors", () =>
     "a live validation source retains conservative error classification",
   );
   assert.deepEqual(
-    collectUnexplainedRedOutlines(nodes, reasons, { lastExecutionError: { node_id: 9 } }),
+    collectUnexplainedRedOutlines(nodes, reasons, { lastExecFailure: { node_id: 9 } }),
     [],
     "a live execution source retains conservative error classification",
   );

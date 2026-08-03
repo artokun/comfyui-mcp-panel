@@ -303,9 +303,9 @@ export function nodeRedFlagIsStale(
 export function collectUnexplainedRedOutlines(
   nodes,
   reasons,
-  { nodeErrors = null, lastExecutionError = null } = {},
+  { nodeErrors = null, lastExecFailure = null } = {},
 ) {
-  if (nodeErrors || lastExecutionError || !Array.isArray(nodes)) return [];
+  if (nodeErrors || lastExecFailure || !Array.isArray(nodes)) return [];
   const reasonsFor = (nodeId) => {
     const key = String(nodeId);
     return reasons instanceof Map ? reasons.get(key) : reasons?.[key];
