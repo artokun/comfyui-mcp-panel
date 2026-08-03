@@ -16,12 +16,14 @@ async function main() {
     await page.goto(BASE, { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForTimeout(3000);
 
-    // Panel script should be loaded with workflowTabId helpers.
+    // Extensions are ES-module imports, not document <script> elements. The
+    // cache-stable loader is therefore visible in the resource timeline.
     const hasWorkflowFns = await page.evaluate(() => {
-      const src = [...document.scripts].map((s) => s.src).join("\n");
-      return src.includes("comfyui-mcp-panel.js");
+      return performance
+        .getEntriesByType("resource")
+        .some((entry) => entry.name.includes("/extensions/comfyui-mcp-panel/js/cmcp-panel-loader.js"));
     });
-    results.push({ check: "panel script loaded", pass: hasWorkflowFns });
+    results.push({ check: "versioned panel loader loaded", pass: hasWorkflowFns });
 
     const wf = await page.evaluate(() => {
       const w =

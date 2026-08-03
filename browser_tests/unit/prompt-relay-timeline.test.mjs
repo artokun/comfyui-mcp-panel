@@ -1480,7 +1480,7 @@ test("fires NO undo hooks when a refusal happens (no empty undo step)", () => {
 
 // Normalized to LF: the working copy is checked out CRLF on Windows.
 const panelSrc = readFileSync(
-  fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
+  fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.mjs", import.meta.url)),
   "utf8",
 ).replace(/\r\n/g, "\n");
 

@@ -10,7 +10,7 @@ import {
   nodeRedFlagIsStale,
 } from "../../web/js/lib/asset-staleness.js";
 
-const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
+const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.mjs", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
 
 function methodSource(name, args) {

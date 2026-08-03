@@ -128,7 +128,7 @@ const isAllowedDead = (name, path, line) =>
 const NOT_TOOL_NAMES = [
   {
     name: "panel_version",
-    file: "web/js/comfyui-mcp-panel.js",
+    file: "web/js/comfyui-mcp-panel.mjs",
     context: "panel_version: PANEL_VERSION",
     why: "payload property key in the diagnostics blob, not a tool reference",
   },
@@ -235,12 +235,12 @@ const KNOWN_INDIRECTIONS = [
     why: "inside callJson() — its own call sites are scanned via the callJson pattern above",
   },
   {
-    file: "web/js/comfyui-mcp-panel.js",
+    file: "web/js/comfyui-mcp-panel.mjs",
     match: "callTool: (t, a, o) => liveBridgeClient?.callTool(t, a, o),",
     why: "bridge plumbing: forwards an already-supplied name, never originates one",
   },
   {
-    file: "web/js/comfyui-mcp-panel.js",
+    file: "web/js/comfyui-mcp-panel.mjs",
     match: "callTool(tool, args, opts) {",
     why: "the bridge method definition itself",
   },
@@ -255,7 +255,7 @@ const KNOWN_INDIRECTIONS = [
     why: "prose. The callee pattern allows whitespace before '(' so that `callTool /* c */ (\"x\")` and `callTool?.(\"x\")` are matched; that also matches English after the word. Registering the line beats teaching the scanner to skip comments, which would lose real findings inside them.",
   },
   {
-    file: "web/js/comfyui-mcp-panel.js",
+    file: "web/js/comfyui-mcp-panel.mjs",
     match: "// Reply to a direct callTool() request (cid-correlated).",
     why: "prose. Empty-argument callTool() is not a call site, but it IS invocation-shaped, so the coverage check below sees it.",
   },
@@ -337,7 +337,7 @@ function panelTokens(line) {
 
 const errors = [];
 const files = tracked();
-const jsFiles = files.filter((p) => p.startsWith("web/js/") && p.endsWith(".js"));
+const jsFiles = files.filter((p) => p.startsWith("web/js/") && /\.m?js$/.test(p));
 
 /**
  * Everywhere a tool name can be written in code, not just the shipped panel.
@@ -664,7 +664,7 @@ if (unclassified.length > 0) {
 // ---------------------------------------------------------------------------
 const internalNames = (() => {
   try {
-    const src = readFileSync(join(root, "web/js/comfyui-mcp-panel.js"), "utf8");
+    const src = readFileSync(join(root, "web/js/comfyui-mcp-panel.mjs"), "utf8");
     const m = src.match(/const GRAPH_TOOL_EXECUTORS\s*=\s*\{([\s\S]*?)\n\};/);
     return [...(m ? m[1] : "").matchAll(/^\s{2}(?:async\s+)?([a-z][a-z0-9_]*)\s*\(/gm)].map((x) => x[1]);
   } catch {

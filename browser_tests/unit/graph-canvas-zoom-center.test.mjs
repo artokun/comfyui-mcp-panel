@@ -5,7 +5,7 @@
 // in_view_count=0). The fix holds the graph-space viewport center constant.
 //
 // graph_canvas lives inline inside the GRAPH_TOOL_EXECUTORS object literal in
-// web/js/comfyui-mcp-panel.js (references browser globals, so it can't be
+// web/js/comfyui-mcp-panel.mjs (references browser globals, so it can't be
 // imported under plain Node). Following the same "real panel source" extraction
 // convention as graph-set-node-collapsed.test.mjs, we regex the method's source
 // out of the file and evaluate it via `new Function` with getGraphCtx /
@@ -16,7 +16,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
+const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.mjs", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
 
 const methodMatch = panelSrc.match(/graph_canvas\(\{ action, node_id, dx, dy, scale \}\) \{[\s\S]*?\n {2}\},/);

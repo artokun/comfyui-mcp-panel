@@ -37,7 +37,7 @@ import {
 } from "../../web/js/lib/open-outcome.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
+const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.mjs");
 
 /** Comments in this file DISCUSS `throw` and `await` at length, so any structural
  *  assertion about control flow must look at CODE only. */

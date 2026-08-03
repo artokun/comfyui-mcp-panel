@@ -26,7 +26,7 @@ jobs:
           set -e
           shopt -s globstar nullglob
           found=0
-          for f in web/js/**/*.js; do
+          for f in web/js/**/*.js web/js/**/*.mjs; do
             found=1
             echo "node --check $f"
             node --check "$f"
@@ -214,7 +214,8 @@ jobs:
           export GIT_INDEX_FILE="$PWD/.git/pack-contents-empty-index"
           trap 'rm -f "$GIT_INDEX_FILE"' EXIT
           for f in \
-            web/js/comfyui-mcp-panel.js \
+            web/js/cmcp-panel-loader.js \
+            web/js/comfyui-mcp-panel.mjs \
             web/js/vendor/marked.esm.js \
             web/js/vendor/purify.es.js \
             web/js/vendor/qrcode.esm.js \
@@ -247,13 +248,18 @@ jobs:
           # equals pyproject's version here — a mismatch fails CI + the publish gate
           # so a stale panel version can never ship (see scripts/set-version.mjs to
           # bump both at once).
-          js = open("web/js/comfyui-mcp-panel.js", encoding="utf-8").read()
+          js = open("web/js/comfyui-mcp-panel.mjs", encoding="utf-8").read()
           m = re.search(r'const PANEL_VERSION = "([^"]+)"', js)
-          assert m, "PANEL_VERSION constant not found in web/js/comfyui-mcp-panel.js"
+          assert m, "PANEL_VERSION constant not found in web/js/comfyui-mcp-panel.mjs"
           if m.group(1) != proj["version"]:
               sys.exit(
                   f"VERSION MISMATCH: pyproject={proj['version']} but PANEL_VERSION={m.group(1)} "
                   f"in comfyui-mcp-panel.js — run `node scripts/set-version.mjs {proj['version']}`."
               )
-          print(f"pyproject OK: {proj['name']} {proj['version']} (JS PANEL_VERSION matches)")
+          loader = open("web/js/cmcp-panel-loader.js", encoding="utf-8").read()
+          lm = re.search(r'const PANEL_BUNDLE_VERSION = "([^"]+)"', loader)
+          assert lm, "PANEL_BUNDLE_VERSION constant not found in web/js/cmcp-panel-loader.js"
+          if lm.group(1) != proj["version"]:
+              sys.exit(f"VERSION MISMATCH: pyproject={proj['version']} but loader={lm.group(1)}")
+          print(f"pyproject OK: {proj['name']} {proj['version']} (runtime + loader versions match)")
           PY

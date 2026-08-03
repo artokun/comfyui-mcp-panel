@@ -1,7 +1,7 @@
 /**
  * Tier 1 — graph_connect auto-match by type + full-slot failure diagnostics.
  *
- * Exercises the upgraded `graph_connect` executor (web/js/comfyui-mcp-panel.js:
+ * Exercises the upgraded `graph_connect` executor (web/js/comfyui-mcp-panel.mjs:
  * autoMatchSlots / slotDiagnostic) against the LIVE LiteGraph graph. The panel
  * receives { rid, cmd:"graph_connect", ... } from the MockBridge exactly as the
  * real orchestrator would, runs the executor, and replies { rid, ok, result }.

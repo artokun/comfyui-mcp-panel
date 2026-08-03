@@ -4,9 +4,9 @@
  * Mirrors comfyui_frontend's ComfyPage: it owns the panel's selectors and the
  * user-flow helpers (open the sidebar, point at a bridge, connect, send a
  * message, read replies). Selectors are centralized here so a class rename in
- * web/js/comfyui-mcp-panel.js only needs fixing in one place.
+ * web/js/comfyui-mcp-panel.mjs only needs fixing in one place.
  *
- * Selector reference (from web/js/comfyui-mcp-panel.js):
+ * Selector reference (from web/js/comfyui-mcp-panel.mjs):
  *   - sidebar tab id .............. "comfyui-mcp.agent"  (button class
  *                                    "comfyui-mcp.agent-tab-button")
  *   - panel root .................. .cmcp-root

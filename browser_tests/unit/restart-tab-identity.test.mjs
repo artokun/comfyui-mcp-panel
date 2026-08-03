@@ -123,7 +123,7 @@ test("#709: a rejected Web Locks request also omits identity instead of hanging 
 });
 
 test("#709: the live bridge sender awaits the leased identity helper, never getTabId directly", () => {
-  const source = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../../web/js/comfyui-mcp-panel.mjs", import.meta.url), "utf8");
   const start = source.indexOf("function sendHello() {");
   const body = source.slice(start, source.indexOf("\n  }", start));
   assert.match(body, /sendBridgeHello\(/);

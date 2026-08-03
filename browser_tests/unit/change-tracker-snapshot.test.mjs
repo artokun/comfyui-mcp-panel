@@ -44,7 +44,7 @@ test("#581 ignores unavailable trackers and swallows a deferred teardown failure
 
 test("#581 wires the deferred snapshot after delivering a successful command reply", () => {
   const here = dirname(fileURLToPath(import.meta.url));
-  const source = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.js"), "utf8").replace(/\r\n/g, "\n");
+  const source = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.mjs"), "utf8").replace(/\r\n/g, "\n");
   const capture = source.indexOf("changeTrackerToSnapshot =");
   const deliver = source.indexOf("if (deliverReply(reply, msg.cmd, superseded))", capture);
   const defer = source.indexOf("deferChangeTrackerSnapshot(changeTrackerToSnapshot)", deliver);

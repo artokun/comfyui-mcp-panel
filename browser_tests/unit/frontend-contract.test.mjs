@@ -38,7 +38,7 @@ import { saveActiveWorkflow } from '../../web/js/lib/workflow-save.js'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const REPO = join(__dirname, '..', '..')
 const SAVE_LIB = join(REPO, 'web', 'js', 'lib', 'workflow-save.js')
-const PANEL = join(REPO, 'web', 'js', 'comfyui-mcp-panel.js')
+const PANEL = join(REPO, 'web', 'js', 'comfyui-mcp-panel.mjs')
 
 // ---------------------------------------------------------------------------
 // The contract. Every frontend workflow-service member the panel is ALLOWED to

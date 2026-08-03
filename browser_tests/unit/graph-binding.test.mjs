@@ -44,7 +44,7 @@ import {
 } from "../../web/js/lib/workflow-chat-identity.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
+const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.mjs");
 
 function panelFunctionSource(src, name, nextName) {
   const start = src.indexOf(`function ${name}(`);

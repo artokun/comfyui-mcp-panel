@@ -2,7 +2,8 @@
 
 This pack ships **no Python nodes**. It does two things:
 
-1. Serve the sidebar panel JS (``web/js/comfyui-mcp-panel.js``) to the ComfyUI
+1. Serve the cache-stable sidebar loader (``web/js/cmcp-panel-loader.js``) and
+   its versioned runtime (``web/js/comfyui-mcp-panel.mjs``) to the ComfyUI
    frontend via ``WEB_DIRECTORY``.
 
 2. Expose a tiny **read-only** local API the panel uses to discover whether the

@@ -40,7 +40,7 @@ import { runSetWidget } from "../../web/js/lib/set-widget.js";
 import { refreshComboOptionsFromDefs } from "../../web/js/lib/asset-staleness.js";
 import { commandTargetsActiveWorkflow } from "../../web/js/lib/workflow-chat-identity.js";
 
-const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
+const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.mjs", import.meta.url));
 
 // A registry shaped like LG.registered_node_types once /object_info loaded. Each
 // entry carries a `.nodeData` def (registerNodesFromDefs stamps one per class), so

@@ -28,7 +28,7 @@ jobs:
           set -e
           shopt -s globstar nullglob
           found=0
-          for f in web/js/**/*.js; do
+          for f in web/js/**/*.js web/js/**/*.mjs; do
             found=1
             echo "node --check $f"
             node --check "$f"
@@ -50,7 +50,8 @@ jobs:
           export GIT_INDEX_FILE="$PWD/.git/pack-contents-empty-index"
           trap 'rm -f "$GIT_INDEX_FILE"' EXIT
           for f in \
-            web/js/comfyui-mcp-panel.js \
+            web/js/cmcp-panel-loader.js \
+            web/js/comfyui-mcp-panel.mjs \
             web/js/vendor/marked.esm.js \
             web/js/vendor/purify.es.js \
             web/js/vendor/qrcode.esm.js \
@@ -216,12 +217,17 @@ jobs:
           assert not missing, f"pyproject missing required fields: {missing}"
           # Block a publish whose panel JS PANEL_VERSION (shown in "Need help?"
           # diagnostics) drifted from pyproject — run scripts/set-version.mjs to sync.
-          js = open("web/js/comfyui-mcp-panel.js", encoding="utf-8").read()
+          js = open("web/js/comfyui-mcp-panel.mjs", encoding="utf-8").read()
           m = re.search(r'const PANEL_VERSION = "([^"]+)"', js)
-          assert m, "PANEL_VERSION constant not found in web/js/comfyui-mcp-panel.js"
+          assert m, "PANEL_VERSION constant not found in web/js/comfyui-mcp-panel.mjs"
           if m.group(1) != proj["version"]:
               sys.exit(f"VERSION MISMATCH: pyproject={proj['version']} PANEL_VERSION={m.group(1)} — run scripts/set-version.mjs")
-          print(f"publishing {proj['name']} {proj['version']} (JS PANEL_VERSION matches)")
+          loader = open("web/js/cmcp-panel-loader.js", encoding="utf-8").read()
+          lm = re.search(r'const PANEL_BUNDLE_VERSION = "([^"]+)"', loader)
+          assert lm, "PANEL_BUNDLE_VERSION constant not found in web/js/cmcp-panel-loader.js"
+          if lm.group(1) != proj["version"]:
+              sys.exit(f"VERSION MISMATCH: pyproject={proj['version']} loader={lm.group(1)}")
+          print(f"publishing {proj['name']} {proj['version']} (runtime + loader versions match)")
           PY
       # --------------------------------------------------------------------
 

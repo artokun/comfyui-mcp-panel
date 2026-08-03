@@ -520,7 +520,7 @@ test("a same-rid verbatim replay is still answered with the UNREWITTEN original 
 
 test("#694 wiring: the panel handler falls back to retry_of and REWRITES the rid on a retry hit", () => {
   const HERE = dirname(fileURLToPath(import.meta.url));
-  const src = readFileSync(join(HERE, "../../web/js/comfyui-mcp-panel.js"), "utf8");
+  const src = readFileSync(join(HERE, "../../web/js/comfyui-mcp-panel.mjs"), "utf8");
   // The dedupe block: a miss on the frame's own rid must consult retry_of BEFORE
   // falling through to begin + execute.
   const fpAt = src.indexOf("const fingerprint = commandFingerprint(msg);");

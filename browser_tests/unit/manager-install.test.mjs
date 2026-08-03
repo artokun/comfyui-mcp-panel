@@ -528,7 +528,7 @@ test("v2-batch: git URL, stale batch failed[] + renamed-dir present ⇒ NOT fail
 // asserts every manager-install export it CALLS is actually imported.
 test("comfyui-mcp-panel imports every manager-install export it calls (no ReferenceError)", () => {
   const panelPath = fileURLToPath(
-    new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
+    new URL("../../web/js/comfyui-mcp-panel.mjs", import.meta.url),
   );
   const src = readFileSync(panelPath, "utf8");
 
@@ -573,7 +573,7 @@ test("comfyui-mcp-panel imports every manager-install export it calls (no Refere
 // module's own dependency wiring.
 test("waitForQueueDrain (real panel source) returns a drained status without ReferenceError", async () => {
   const panelPath = fileURLToPath(
-    new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
+    new URL("../../web/js/comfyui-mcp-panel.mjs", import.meta.url),
   );
   const src = readFileSync(panelPath, "utf8");
 
@@ -617,7 +617,7 @@ test("waitForQueueDrain (real panel source) returns a drained status without Ref
 
 function readPanelSource() {
   const panelPath = fileURLToPath(
-    new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
+    new URL("../../web/js/comfyui-mcp-panel.mjs", import.meta.url),
   );
   return readFileSync(panelPath, "utf8");
 }
