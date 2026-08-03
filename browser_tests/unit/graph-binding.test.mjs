@@ -17,14 +17,17 @@ import { dirname, join } from "node:path";
 
 import {
   activeWorkflowNodeCount,
+  activeWorkflowProvenEmpty,
   graphReadDesynced,
   graphRootMismatchesActiveWorkflow,
+  graphRootProvenEmpty,
   graphRootWorkflowUuidMismatches,
   graphRootWorkflowUuidMatches,
   graphRootMatchesState,
   graphCommandMayMutateWorkflow,
   graphReadBindingChanged,
   resolveGraphRootUuidRebind,
+  serializedStateProvenEmpty,
 } from "../../web/js/lib/graph-binding.js";
 import {
   commandWorkflowMismatch,
@@ -91,12 +94,21 @@ const rawKeyedUuidStore = (map) => ({
 //                             canvas, r5): the guard must keep throwing.
 // foreignTab overrides the B object (e.g. a creation-lifecycle product), and
 // registeredOwners/objectUuids override the identity stores the harness wires in.
+// activeNodeCount/rootNodeCount/activeModified parameterize A and the root so
+// the #560 (drifted tag on a matching clean canvas) and #565 (both sides
+// empty) recurrence scenarios can reuse this wiring; defaults preserve the
+// original dirty-A (27) / foreign-root-B (30) setup exactly.
 function buildDirtyStaleRouteHarness({
   rootUuid = "workflow-B",
   foreignClaim = "identity",
   foreignTab = null,
   registeredOwners = null,
   objectUuids: objectUuidsOpt = null,
+  activeNodeCount = 27,
+  rootNodeCount = 30,
+  activeModified = true,
+  activeTracker,
+  rootSerializer = null,
 } = {}) {
   const src = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
   const stableSource = panelFunctionSource(src, "workflowStableUuid", "workflowStorageKey");
@@ -106,13 +118,16 @@ function buildDirtyStaleRouteHarness({
   const lineage = foreignClaim === "active-lineage";
   const staleLineage = foreignClaim === "stale-lineage";
   const workflowA = overlap
-    ? { isPersisted: true, path: "workflows/a.json", isModified: true, changeTracker: { activeState: state(27) } }
+    ? { isPersisted: true, path: "workflows/a.json", isModified: activeModified, changeTracker: { activeState: state(activeNodeCount) } }
     : {
         isPersisted: false,
-        isModified: true,
-        changeTracker: {
+        isModified: activeModified,
+        // activeTracker is deliberately NOT `??`-defaulted: an explicit null
+        // models a workflow whose tracker is entirely unreadable, which the
+        // proven-empty relaxation must treat as fail-closed (#565 gate).
+        changeTracker: activeTracker !== undefined ? activeTracker : {
           activeState: {
-            ...state(27),
+            ...state(activeNodeCount),
             // "stale-lineage" (r6 P0): the active object's tracker state is
             // LAGGING — it still carries an OLD uuid (a replaced predecessor's
             // residue). Serialized-state evidence is not object-keyed, so this
@@ -131,7 +146,7 @@ function buildDirtyStaleRouteHarness({
           ? null // a live tab whose serialized state is NOT loaded
           : {
               activeState: {
-                ...state(30),
+                ...state(rootNodeCount),
                 // A creation-stamped graph carries the tag in the tab's own
                 // serialized state even when no resolver/owner record observed it.
                 ...(foreignClaim === "tracker-stamp" && rootUuid
@@ -144,8 +159,12 @@ function buildDirtyStaleRouteHarness({
   // PROXIES while the identity stores key on RAW objects.
   const proxyB = vueProxyOf(rawB);
   const rootB = {
-    _nodes: Array.from({ length: 30 }, (_, i) => ({ id: i + 1, type: "KSampler" })),
+    _nodes: Array.from({ length: rootNodeCount }, (_, i) => ({ id: i + 1, type: "KSampler" })),
     ...(rootUuid ? { extra: { comfyui_mcp: { workflow_uuid: rootUuid } } } : {}),
+    // The proven-empty relaxation requires a SERIALIZABLE root whose full
+    // non-identity surfaces are all empty (#565 gate): a bare empty _nodes
+    // array is node-level evidence only and must not relax the guard.
+    ...(rootSerializer ? { serialize: rootSerializer } : {}),
   };
   const openWorkflows =
     foreignClaim === "none" || foreignClaim === "active-lineage" || foreignClaim === "stale-lineage"
@@ -232,6 +251,8 @@ function buildDirtyStaleRouteHarness({
     "graphRootMismatchesActiveWorkflow",
     "graphReadDesynced",
     "activeWorkflowNodeCount",
+    "activeWorkflowProvenEmpty",
+    "graphRootProvenEmpty",
     "workflowOwnsRootUuidTag",
     "rememberWorkflowUuidOwner",
     "resolveGraphRootUuidRebind",
@@ -247,6 +268,8 @@ function buildDirtyStaleRouteHarness({
     graphRootMismatchesActiveWorkflow,
     graphReadDesynced,
     activeWorkflowNodeCount,
+    activeWorkflowProvenEmpty,
+    graphRootProvenEmpty,
     ownsTag,
     () => {},
     resolveGraphRootUuidRebind,
@@ -505,7 +528,12 @@ test("graphRootMismatchesActiveWorkflow: TRUE - ChangeTracker-relevant non-node 
   }
 });
 
-test("graphRootMismatchesActiveWorkflow: TRUE - missing and explicitly empty/null tracker surfaces differ", () => {
+test("graphRootMismatchesActiveWorkflow: FALSE - omitted vs present-but-empty/null tracker surfaces are serializer dialect (#560/#565)", () => {
+  // ChangeTracker states routinely OMIT optional surfaces that a live
+  // graph.serialize() re-emits as present-but-empty (or null). Presence
+  // strictness turned that dialect into a false binding refusal on the
+  // legitimately-active canvas — the #560 recurrence and the #565 latent
+  // instance. Empty/null now compares EQUAL to absent…
   const activeState = { nodes: [{ id: 1, type: "KSampler" }] };
   const activeWorkflow = wf({ changeTracker: { activeState } });
   for (const [field, replacement] of [
@@ -517,11 +545,28 @@ test("graphRootMismatchesActiveWorkflow: TRUE - missing and explicitly empty/nul
     ["subgraphs", []],
     ["definitions", null],
   ]) {
+    const dialectState = { ...activeState, [field]: replacement };
+    assert.equal(
+      graphRootMismatchesActiveWorkflow({ rootGraph: serializedRoot(dialectState), activeWorkflow }),
+      false,
+      `${field}: present-but-empty must not be confused with workflow content`,
+    );
+  }
+  // …but a PRESENT, NON-empty surface remains content: a canvas that genuinely
+  // has reroutes / links / groups the workflow's state lacks still mismatches
+  // (the #349 wrong-canvas fence is not weakened).
+  for (const [field, replacement] of [
+    ["links", [[1, 1, 0, 2, 0, "MODEL"]]],
+    ["floatingLinks", [{ id: "floating-a", pos: [10, 20] }]],
+    ["reroutes", [{ id: "reroute-a", pos: [30, 40] }]],
+    ["groups", [{ id: 1, title: "group-a" }]],
+    ["subgraphs", [{ id: "subgraph-a", nodes: [{ id: 9, type: "SaveImage" }] }]],
+  ]) {
     const staleState = { ...activeState, [field]: replacement };
     assert.equal(
       graphRootMismatchesActiveWorkflow({ rootGraph: serializedRoot(staleState), activeWorkflow }),
       true,
-      `${field}: missing must not collapse into an explicit value`,
+      `${field}: a non-empty surface the state lacks remains a real mismatch`,
     );
   }
 });
@@ -1889,5 +1934,530 @@ test("#349 snapshots: capture is bound and restore rejects a snapshot from anoth
     revertBody,
     /pickRevertSnapshot\(scopedSnapshots, current\)/,
     "a foreign newer snapshot must not hide an older same-workflow revert",
+  );
+});
+
+// ── #560/#565: reconnect / multi-tab + blank-canvas binding recurrence ──────
+
+test("resolveGraphRootUuidRebind: a stale tag on a BOTH-EMPTY canvas rebinds (#565); anything else stays closed", () => {
+  const tagged = { _nodes: [], extra: { comfyui_mcp: { workflow_uuid: "workflow-prev" } } };
+  assert.equal(
+    resolveGraphRootUuidRebind({
+      rootGraph: tagged,
+      activeWorkflowUuid: "workflow-new",
+      rootTagClaimedByActiveWorkflow: false,
+      staleTagOnEmptyCanvas: true,
+    }),
+    "rebind",
+    "zero content on both sides: the leftover tag is stale metadata, not a foreign canvas",
+  );
+  assert.equal(
+    resolveGraphRootUuidRebind({ rootGraph: tagged, activeWorkflowUuid: "workflow-new", staleTagOnEmptyCanvas: false }),
+    "conflict",
+    "without the both-empty proof the same tag still fails closed (r4/r5)",
+  );
+  assert.equal(
+    resolveGraphRootUuidRebind({ rootGraph: tagged, activeWorkflowUuid: "workflow-prev", staleTagOnEmptyCanvas: true }),
+    "none",
+    "no conflict stays inconclusive, flag or not",
+  );
+});
+
+test("#565: graphRootMismatchesActiveWorkflow is inconclusive when BOTH node arrays are empty", () => {
+  const activeWorkflow = wf({ changeTracker: { activeState: { nodes: [] } } });
+  const liveState = {
+    nodes: [],
+    links: [],
+    groups: [],
+    reroutes: [],
+    config: {},
+    extra: { ds: { scale: 1 }, comfyui_mcp: { workflow_uuid: "workflow-prev" } },
+  };
+  assert.equal(
+    graphRootMismatchesActiveWorkflow({ rootGraph: serializedRoot(liveState), activeWorkflow }),
+    false,
+    "zero content on both sides can never be a confused canvas",
+  );
+});
+
+// ── #565 gate: the proven-empty evidence bar ─────────────────────────────────
+
+test("serializedStateProvenEmpty: TRUE only for a well-formed, fully content-free state", () => {
+  assert.equal(serializedStateProvenEmpty({ nodes: [] }), true, "the minimal blank state");
+  assert.equal(
+    serializedStateProvenEmpty({
+      id: "g",
+      revision: 3,
+      version: 0.4,
+      last_node_id: 12,
+      last_link_id: 8,
+      nodes: [],
+      links: [],
+      groups: [],
+      config: {},
+      extra: { ds: { scale: 2 }, comfyui_mcp: { workflow_uuid: "u" }, linkExtensions: [] },
+    }),
+    true,
+    "format metadata, viewport, the panel identity tag, and empty surfaces are not content",
+  );
+});
+
+test("serializedStateProvenEmpty: FALSE for missing/malformed nodes or ANY non-empty surface", () => {
+  for (const state of [
+    null,
+    undefined,
+    42,
+    [],
+    {},
+    { nodes: "bad" }, // malformed read — not an empty-array proof
+    { nodes: [{ id: 1 }] }, // a node is content
+    { nodes: [], subgraphs: [{ id: "s", nodes: [{ id: 9 }] }] },
+    { nodes: [], groups: [{ id: 1, title: "g" }] },
+    { nodes: [], reroutes: [{ id: "r" }] },
+    { nodes: [], links: [[1, 1, 0, 2, 0, "MODEL"]] },
+    { nodes: [], config: { setting: 1 } },
+    { nodes: [], definitions: { subgraphs: [{ id: "def" }] } },
+    { nodes: [], extra: { workflow_meta: { owner: "artist" } } }, // real extra content
+    { nodes: [], extra: 5 }, // malformed scalar extra
+    { nodes: [], unknownSurface: { nested: "content" } }, // unknown non-empty surface
+  ]) {
+    assert.equal(serializedStateProvenEmpty(state), false, JSON.stringify(state));
+  }
+});
+
+test("activeWorkflowProvenEmpty: requires a CLEAN, well-formed, zero-node CURRENT state", () => {
+  assert.equal(
+    activeWorkflowProvenEmpty(wf({ changeTracker: { activeState: { nodes: [] } } })),
+    true,
+    "the genuine #565 blank tab",
+  );
+  assert.equal(
+    activeWorkflowProvenEmpty(wf({ activeState: { nodes: [] } })),
+    true,
+    "flat activeState shapes count too",
+  );
+  // A DIRTY tab's tracker can lag the real canvas (#545) — never proof.
+  assert.equal(
+    activeWorkflowProvenEmpty(wf({ changeTracker: { activeState: { nodes: [] } }, isModified: true })),
+    false,
+  );
+  // Absent / malformed / baseline-only reads fail closed — a 0 from
+  // activeWorkflowNodeCount is not evidence.
+  assert.equal(activeWorkflowProvenEmpty(null), false);
+  assert.equal(activeWorkflowProvenEmpty(wf({ changeTracker: {} })), false);
+  assert.equal(activeWorkflowProvenEmpty(wf({ changeTracker: { activeState: { nodes: "bad" } } })), false);
+  assert.equal(activeWorkflowProvenEmpty(wf({ changeTracker: { initialState: state(0) } })), false);
+  // Surface content defeats the proof even at zero nodes.
+  assert.equal(
+    activeWorkflowProvenEmpty(wf({ changeTracker: { activeState: { nodes: [], subgraphs: [{ id: "s" }] } } })),
+    false,
+  );
+});
+
+test("graphRootProvenEmpty: requires a present empty _nodes array AND a serializable content-free state", () => {
+  assert.equal(
+    graphRootProvenEmpty(serializedRoot({ nodes: [], links: [], extra: { comfyui_mcp: { workflow_uuid: "u" } } })),
+    true,
+    "the genuine reused blank canvas (identity tag is not content)",
+  );
+  assert.equal(
+    graphRootProvenEmpty({ _nodes: [] }),
+    false,
+    "a bare empty node array without serialize() proves nothing about surfaces",
+  );
+  assert.equal(
+    graphRootProvenEmpty(serializedRoot({ nodes: [], groups: [{ id: 1, title: "g" }] })),
+    false,
+    "non-node surface content defeats the proof",
+  );
+  assert.equal(
+    graphRootProvenEmpty(serializedRoot({ nodes: [{ id: 1, type: "KSampler" }] })),
+    false,
+    "a populated root is not empty",
+  );
+  assert.equal(graphRootProvenEmpty(null), false);
+  assert.equal(graphRootProvenEmpty({}), false);
+});
+
+test("#560: a tracker state omitting optional surfaces does NOT false-mismatch the live canvas it was loaded from", () => {
+  // The reconnect / multi-tab recurrence: the canvas IS the active workflow's
+  // own graph, but ChangeTracker's state omits surfaces LiteGraph's
+  // serialize() emits present-but-empty, and the panel tag lives only on the
+  // live side. That serializer dialect is not a binding mismatch.
+  const trackerState = {
+    nodes: [
+      { id: 1, type: "CheckpointLoader", widgets_values: ["model.safetensors"] },
+      { id: 2, type: "KSampler", widgets_values: [20] },
+      { id: 3, type: "SaveImage" },
+    ],
+    links: [[1, 1, 0, 2, 0, "MODEL"]],
+  };
+  const liveState = {
+    ...structuredClone(trackerState),
+    floatingLinks: [],
+    reroutes: [],
+    groups: [],
+    config: {},
+    subgraphs: [],
+    extra: { ds: { scale: 1.4, offset: [12, -8] }, comfyui_mcp: { workflow_uuid: "drifted-tag" } },
+  };
+  const activeWorkflow = wf({ changeTracker: { activeState: trackerState } });
+  assert.equal(
+    graphRootMismatchesActiveWorkflow({ rootGraph: serializedRoot(liveState), activeWorkflow }),
+    false,
+  );
+});
+
+test("#560: the panel identity tag inside extra is NOT workflow content — tag drift alone is no shape mismatch", () => {
+  // The guard's rebind heal re-stamps the root with the active identity; if the
+  // tag participated in the shape comparison, a tracker capture holding the
+  // PRIOR tag would instantly re-throw after the heal, so a clean tab could
+  // never heal. Tag conflicts are owned by the UUID predicates, not by shape.
+  const trackerState = {
+    nodes: [{ id: 1, type: "KSampler", widgets_values: [20] }],
+    links: [],
+    extra: { comfyui_mcp: { workflow_uuid: "workflow-old" } },
+  };
+  const liveState = {
+    ...structuredClone(trackerState),
+    extra: { comfyui_mcp: { workflow_uuid: "workflow-new" } },
+  };
+  const activeWorkflow = wf({ changeTracker: { activeState: trackerState } });
+  assert.equal(
+    graphRootMismatchesActiveWorkflow({ rootGraph: serializedRoot(liveState), activeWorkflow }),
+    false,
+    "tag drift is judged by the UUID branch with claim/heal semantics, not by content shape",
+  );
+});
+
+test("#560: graphRootMatchesState proves a faithful repaint despite serializer dialect — the recovery that failed", () => {
+  // panel_open_workflow's repaint proof: the just-loaded root serializes with
+  // present-but-empty surfaces and a viewport, while the loaded state (a
+  // ChangeTracker clone) omits them. That asymmetry false-failed the proof and
+  // left a drifted binding with no recovery short of a panel reload.
+  const repaintState = {
+    nodes: [
+      { id: 1, type: "CheckpointLoader", widgets_values: ["model.safetensors"] },
+      { id: 2, type: "KSampler", widgets_values: [20] },
+    ],
+    links: [[1, 1, 0, 2, 0, "MODEL"]],
+    extra: { comfyui_mcp: { workflow_uuid: "workflow-A", workflow_path: "workflows/a.json" } },
+  };
+  const liveAfterRepaint = {
+    ...structuredClone(repaintState),
+    floatingLinks: [],
+    reroutes: [],
+    groups: [],
+    config: {},
+    extra: {
+      ds: { scale: 0.9, offset: [1, 2] },
+      comfyui_mcp: { workflow_uuid: "workflow-A", workflow_path: "workflows/a.json" },
+    },
+  };
+  assert.equal(
+    graphRootMatchesState({ rootGraph: serializedRoot(liveAfterRepaint), state: repaintState }),
+    true,
+    "the proven repaint is accepted even when serialize() re-emits omitted surfaces as empty",
+  );
+  assert.equal(
+    graphRootMatchesState({
+      rootGraph: serializedRoot({ ...structuredClone(repaintState), reroutes: [{ id: "reroute-a", pos: [1, 2] }] }),
+      state: repaintState,
+    }),
+    false,
+    "content strictness is unchanged: a genuinely different canvas still fails the proof",
+  );
+});
+
+test("#565: a NEW blank workflow after a tagged workflow heals the stale root tag instead of throwing", () => {
+  // ComfyUI reuses app.graph across tabs and its clear/configure does not
+  // reset graph.extra: a brand-new blank tab inherits the PREVIOUS workflow's
+  // root tag while minting its own identity. Both sides are PROVEN empty — a
+  // clean, well-formed zero-node active state and a serializable root whose
+  // every non-identity surface is empty — so no foreign content can be
+  // confused and the guard re-stamps instead of hard-blocking.
+  for (const foreignClaim of ["identity", "none"]) {
+    const h = buildDirtyStaleRouteHarness({
+      rootUuid: "workflow-prev",
+      foreignClaim, // previous tab still OPEN and claiming the tag / nobody claims it
+      activeNodeCount: 0,
+      rootNodeCount: 0,
+      activeModified: false,
+      rootSerializer: () => ({
+        nodes: [],
+        links: [],
+        groups: [],
+        config: {},
+        extra: { ds: { scale: 1 }, comfyui_mcp: { workflow_uuid: "workflow-prev" } },
+      }),
+    });
+    assert.doesNotThrow(
+      () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: true }),
+      `blank active tab + provably empty tagged root (${foreignClaim}) must not be rejected`,
+    );
+    assert.equal(
+      h.rootB.extra.comfyui_mcp.workflow_uuid,
+      h.stableUuid(h.workflowA),
+      "the stale tag is re-stamped with the ACTIVE blank workflow's identity",
+    );
+  }
+});
+
+test("#565 gate: counters/version metadata on a blank canvas does not defeat the proven-empty heal", () => {
+  // LiteGraph rebuilds can leave format metadata (ids/counters/version) on an
+  // otherwise content-free canvas. That metadata is not workflow content, so
+  // the relaxation still fires — real surface CONTENT (next tests) is what
+  // keeps the guard strict.
+  const h = buildDirtyStaleRouteHarness({
+    rootUuid: "workflow-prev",
+    foreignClaim: "none",
+    activeNodeCount: 0,
+    rootNodeCount: 0,
+    activeModified: false,
+    activeTracker: { activeState: { nodes: [], version: 0.4, last_node_id: 7, last_link_id: 3 } },
+    rootSerializer: () => ({
+      id: "graph-uuid",
+      revision: 12,
+      version: 0.4,
+      last_node_id: 7,
+      last_link_id: 3,
+      nodes: [],
+      links: [],
+      extra: { ds: { scale: 1 }, comfyui_mcp: { workflow_uuid: "workflow-prev" }, linkExtensions: [] },
+    }),
+  });
+  assert.doesNotThrow(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: true }),
+    "format metadata must not be mistaken for canvas content",
+  );
+  assert.equal(h.rootB.extra.comfyui_mcp.workflow_uuid, h.stableUuid(h.workflowA));
+});
+
+test("#565 gate: malformed or absent tracker state does NOT prove the active workflow empty — the relaxation fails closed", () => {
+  // activeWorkflowNodeCount() deliberately returns 0 for absent/malformed
+  // state — that is NOT proof of an empty workflow. Without an explicit clean,
+  // well-formed zero-node active state there is no relaxation: the tag
+  // conflict fails closed and the root is never re-stamped.
+  for (const activeTracker of [
+    null, // tracker entirely unreadable
+    {}, // no readable states
+    { activeState: { nodes: "bad" } }, // malformed nodes
+    { activeState: {} }, // state without a nodes array
+    { initialState: state(0) }, // load baseline only — NOT a current-state proof
+  ]) {
+    const h = buildDirtyStaleRouteHarness({
+      rootUuid: "workflow-prev",
+      foreignClaim: "none",
+      activeNodeCount: 0,
+      rootNodeCount: 0,
+      activeModified: false,
+      activeTracker,
+      rootSerializer: () => ({ nodes: [], extra: { comfyui_mcp: { workflow_uuid: "workflow-prev" } } }),
+    });
+    assert.throws(
+      () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: true }),
+      /\[root-workflow-uuid-mismatch\]/,
+      `absent/malformed current state must fail closed: ${JSON.stringify(activeTracker)}`,
+    );
+    assert.equal(
+      h.rootB.extra.comfyui_mcp.workflow_uuid,
+      "workflow-prev",
+      "no re-stamp without a proven-empty active workflow",
+    );
+  }
+});
+
+test("#565 gate: a DIRTY zero-node workflow is not proven empty — a lagging tracker is not evidence", () => {
+  // #545: a dirty workflow's ChangeTracker state can lag the user's real
+  // canvas, so a dirty tab can never prove its canvas is content-free.
+  const h = buildDirtyStaleRouteHarness({
+    rootUuid: "workflow-prev",
+    foreignClaim: "none",
+    activeNodeCount: 0,
+    rootNodeCount: 0,
+    activeModified: true,
+    rootSerializer: () => ({ nodes: [], extra: { comfyui_mcp: { workflow_uuid: "workflow-prev" } } }),
+  });
+  assert.throws(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: true }),
+    /\[root-workflow-uuid-mismatch\]/,
+    "a dirty tab's zero-node tracker read is not an empty-canvas proof",
+  );
+  assert.equal(h.rootB.extra.comfyui_mcp.workflow_uuid, "workflow-prev", "no re-stamp for a dirty tab");
+});
+
+test("#565 gate: an UNSERIALIZABLE empty root is not proven empty — node-level evidence only fails closed", () => {
+  // A bare empty `_nodes` array says nothing about non-node surfaces. Without
+  // serialize() there is no proof the root holds no subgraphs/groups/links,
+  // so the relaxation must not fire (the pre-gate harness root had exactly
+  // this shape and the guard re-stamped it).
+  const h = buildDirtyStaleRouteHarness({
+    rootUuid: "workflow-prev",
+    foreignClaim: "none",
+    activeNodeCount: 0,
+    rootNodeCount: 0,
+    activeModified: false,
+  });
+  assert.throws(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: true }),
+    /\[root-workflow-uuid-mismatch\]/,
+  );
+  assert.equal(h.rootB.extra.comfyui_mcp.workflow_uuid, "workflow-prev", "no re-stamp without full-surface proof");
+});
+
+test("#565 gate: zero nodes with NON-EMPTY surfaces is content — the shape check stays strict", () => {
+  // Removing the blanket zero-node skip: a state with zero nodes but real
+  // surface content (subgraphs, groups, reroutes, links) versus an empty
+  // canvas is a genuine desync and must still mismatch — in BOTH directions.
+  const contentByField = {
+    subgraphs: [{ id: "subgraph-a", nodes: [{ id: 9, type: "SaveImage" }] }],
+    groups: [{ id: 1, title: "kept-group" }],
+    reroutes: [{ id: "reroute-a", pos: [30, 40] }],
+    floatingLinks: [{ id: "floating-a", pos: [10, 20] }],
+    links: [[1, 1, 0, 2, 0, "MODEL"]],
+  };
+  for (const [field, content] of Object.entries(contentByField)) {
+    const activeWorkflow = wf({ changeTracker: { activeState: { nodes: [], [field]: content } } });
+    assert.equal(
+      graphRootMismatchesActiveWorkflow({ rootGraph: serializedRoot({ nodes: [] }), activeWorkflow }),
+      true,
+      `${field}: workflow content missing from the live canvas is a desync even at zero nodes`,
+    );
+    const reverseWorkflow = wf({ changeTracker: { activeState: { nodes: [] } } });
+    assert.equal(
+      graphRootMismatchesActiveWorkflow({ rootGraph: serializedRoot({ nodes: [], [field]: content }), activeWorkflow: reverseWorkflow }),
+      true,
+      `${field}: foreign content on the live canvas is a mismatch even at zero nodes`,
+    );
+  }
+});
+
+test("#565 gate: a zero-node root bearing foreign surface content is never re-stamped through the relaxation", () => {
+  const h = buildDirtyStaleRouteHarness({
+    rootUuid: "workflow-prev",
+    foreignClaim: "none",
+    activeNodeCount: 0,
+    rootNodeCount: 0,
+    activeModified: false,
+    rootSerializer: () => ({
+      nodes: [],
+      subgraphs: [{ id: "subgraph-a", nodes: [{ id: 9, type: "SaveImage" }] }],
+      extra: { comfyui_mcp: { workflow_uuid: "workflow-prev" } },
+    }),
+  });
+  assert.throws(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: true }),
+    /\[root-workflow-uuid-mismatch\]/,
+    "a content-bearing root must stay strict even at zero nodes",
+  );
+  assert.equal(h.rootB.extra.comfyui_mcp.workflow_uuid, "workflow-prev", "foreign content is never re-stamped");
+});
+
+test("#565 gate: a zero-node active STATE bearing surface content does not relax the guard", () => {
+  const h = buildDirtyStaleRouteHarness({
+    rootUuid: "workflow-prev",
+    foreignClaim: "none",
+    activeNodeCount: 0,
+    rootNodeCount: 0,
+    activeModified: false,
+    activeTracker: { activeState: { nodes: [], groups: [{ id: 1, title: "kept-group" }] } },
+    rootSerializer: () => ({ nodes: [], extra: { comfyui_mcp: { workflow_uuid: "workflow-prev" } } }),
+  });
+  assert.throws(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: true }),
+    /\[root-workflow-uuid-mismatch\]/,
+    "surface content in the active state defeats the empty-canvas relaxation",
+  );
+  assert.equal(h.rootB.extra.comfyui_mcp.workflow_uuid, "workflow-prev", "no re-stamp when the workflow still holds content");
+});
+
+test("#565 boundary: the both-empty heal never fires while content exists on EITHER side", () => {
+  // #389 preserved: an EMPTY root against a workflow that reports nodes still
+  // fails closed — the tag conflict is real and the tag is not rewritten.
+  const readDesync = buildDirtyStaleRouteHarness({
+    rootUuid: "workflow-prev",
+    foreignClaim: "identity",
+    activeNodeCount: 5,
+    rootNodeCount: 0,
+    activeModified: false,
+  });
+  assert.throws(
+    () => readDesync.assertBound(readDesync.rootB, readDesync.rootB, { includeBaselineReadGuard: true }),
+    /\[root-workflow-uuid-mismatch\]/,
+    "empty root + populated workflow still fails closed",
+  );
+  assert.equal(readDesync.rootB.extra.comfyui_mcp.workflow_uuid, "workflow-prev", "no re-stamp on a real conflict");
+
+  // #349 preserved: a FOREIGN NONEMPTY canvas is never re-stamped for a blank
+  // active tab — the wrong-canvas fence protects content exactly as before.
+  const foreignContent = buildDirtyStaleRouteHarness({
+    rootUuid: "workflow-B",
+    foreignClaim: "identity",
+    activeNodeCount: 0,
+    rootNodeCount: 30,
+    activeModified: false,
+  });
+  assert.throws(
+    () => foreignContent.assertBound(foreignContent.rootB, foreignContent.rootB, { includeBaselineReadGuard: true }),
+    /\[root-workflow-uuid-mismatch\]/,
+    "a foreign canvas with content keeps the #349 fence",
+  );
+  assert.equal(foreignContent.rootB.extra.comfyui_mcp.workflow_uuid, "workflow-B", "foreign content is never re-stamped");
+});
+
+test("#560: after reconnect + multi-tab switch the drifted-tag canvas fails closed with a reason code, and the proven re-stamp restores agreement", () => {
+  // panel_list_workflows reports X active (and active_confirmed — a reconnect
+  // -epoch concept independent of this guard) while the root tag drifted to an
+  // unclaimed pre-reconnect identity. The canvas CONTENT is X's own graph, so
+  // the shape branch stays silent; the UUID branch fails closed (the drift is
+  // unprovable inline) and now NAMES the firing predicate. The sanctioned
+  // recovery — panel_open_workflow's proven repaint re-stamp, modeled here —
+  // then restores active/binding agreement.
+  const h = buildDirtyStaleRouteHarness({
+    rootUuid: "workflow-old",
+    foreignClaim: "none", // the tag's owner record is a dead predecessor — nobody live claims it
+    activeNodeCount: 11,
+    rootNodeCount: 11,
+    activeModified: false,
+  });
+  assert.throws(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: true }),
+    /\[root-workflow-uuid-mismatch\]/,
+    "an unprovable drift still fails closed — and is now diagnosable",
+  );
+  assert.equal(h.rootB.extra.comfyui_mcp.workflow_uuid, "workflow-old", "a failed-closed root is never rewritten");
+  h.rootB.extra.comfyui_mcp.workflow_uuid = h.stableUuid(h.workflowA); // the proven repaint re-stamp
+  assert.doesNotThrow(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: true }),
+    "after the proven re-stamp the legitimately-active workflow reads normally",
+  );
+});
+
+test("#565: the guard names the root-shape-mismatch predicate when a genuinely different canvas is mounted", () => {
+  const h = buildDirtyStaleRouteHarness({
+    rootUuid: null,
+    foreignClaim: "none",
+    activeNodeCount: 27,
+    rootNodeCount: 30,
+    activeModified: false,
+  });
+  assert.throws(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: true }),
+    /\[root-shape-mismatch\]/,
+  );
+});
+
+test("#389: the guard names the root-node-count-desync predicate when the canvas reads empty against a populated workflow", () => {
+  const h = buildDirtyStaleRouteHarness({
+    rootUuid: null,
+    foreignClaim: "none",
+    rootNodeCount: 0,
+    activeModified: false,
+    activeTracker: { activeState: { nodes: "bad" }, initialState: state(5) },
+  });
+  assert.throws(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: true }),
+    /\[root-node-count-desync\]/,
+    "the #389 baseline read guard still fires, and now says so",
   );
 });

@@ -96,23 +96,151 @@ function activeWorkflowCurrentState(activeWorkflow) {
   }
 }
 
+/**
+ * A serialized-surface value holding no content: null/undefined, an empty
+ * array, or a plain object with no own keys. Scalars and non-empty values are
+ * significant (malformed or real content — never silently tolerated).
+ */
+const isEmptySurfaceValue = (value) =>
+  value == null ||
+  (Array.isArray(value) && value.length === 0) ||
+  (typeof value === "object" && Object.keys(value).length === 0);
+
+/**
+ * Serialized-graph FORMAT metadata that is not workflow content: graph ids,
+ * revision/version stamps, and the id counters LiteGraph leaves on a rebuilt
+ * or cleared canvas. Everything else a serialized state carries is compared as
+ * (potential) content by serializedStateProvenEmpty below.
+ */
+const SERIALIZED_FORMAT_METADATA_KEYS = new Set([
+  "id",
+  "revision",
+  "version",
+  "last_node_id",
+  "last_link_id",
+  "last_group_id",
+  "lastGroupId",
+  "last_reroute_id",
+]);
+
+/**
+ * POSITIVE proof that a serialized graph state holds NO workflow content at
+ * all — the empty-canvas relaxation's evidence bar (#565 gate). True only
+ * when `state` is a well-formed serialized graph whose `nodes` is a PRESENT
+ * empty array (a missing/malformed read proves nothing) AND every own
+ * surface outside the format-metadata allowlist is absent-or-empty. Inside
+ * `extra`, `ds` (viewport) and `comfyui_mcp` (the panel's own identity tag)
+ * are not content; any other key must hold an empty value. A single
+ * non-empty subgraphs/groups/reroutes/links surface — or any unknown
+ * non-empty surface — defeats the proof, so a foreign content-bearing canvas
+ * can never be re-stamped through the relaxation.
+ */
+export function serializedStateProvenEmpty(state) {
+  try {
+    if (!state || typeof state !== "object" || Array.isArray(state)) return false;
+    if (!Array.isArray(state.nodes) || state.nodes.length !== 0) return false;
+    for (const [key, value] of Object.entries(state)) {
+      if (key === "nodes" || SERIALIZED_FORMAT_METADATA_KEYS.has(key)) continue;
+      if (key === "extra") {
+        if (value == null) continue;
+        if (typeof value !== "object" || Array.isArray(value)) return false;
+        const { ds: viewport, comfyui_mcp: panelTag, ...workflowExtra } = value;
+        for (const extraValue of Object.values(workflowExtra)) {
+          if (!isEmptySurfaceValue(extraValue)) return false;
+        }
+        continue;
+      }
+      if (!isEmptySurfaceValue(value)) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * POSITIVE proof that the ACTIVE workflow's own canvas is content-free
+ * (#565 gate). Requires ALL of:
+ *   - the workflow is CLEAN — a dirty tracker state can lag the user's real
+ *     canvas (#545), so a dirty tab can never prove emptiness;
+ *   - the workflow's OWN serialized CURRENT state exists and is well-formed
+ *     (activeWorkflowCurrentState — a missing/malformed read proves nothing,
+ *     and a node COUNT of 0 from a failed read is not evidence either);
+ *   - that state holds no content on any non-identity surface.
+ * Absent or malformed state fails closed: false.
+ */
+export function activeWorkflowProvenEmpty(activeWorkflow) {
+  try {
+    if (activeWorkflow?.isModified === true) return false;
+    return serializedStateProvenEmpty(activeWorkflowCurrentState(activeWorkflow));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * POSITIVE proof that the live ROOT graph is content-free (#565 gate). A bare
+ * empty `_nodes` array is node-level evidence only: without serialize() there
+ * is no way to prove the root holds no non-node content (subgraphs, groups,
+ * links), so an unserializable root fails closed.
+ */
+export function graphRootProvenEmpty(rootGraph) {
+  try {
+    if (!Array.isArray(rootGraph?._nodes) || rootGraph._nodes.length !== 0) return false;
+    if (typeof rootGraph?.serialize !== "function") return false;
+    return serializedStateProvenEmpty(rootGraph.serialize());
+  } catch {
+    return false;
+  }
+}
+
 function graphShape(state) {
   if (!state || !Array.isArray(state.nodes)) return null;
   // Omit counters/version metadata that can legitimately differ after LiteGraph
   // rebuilds; retain every serialized graph surface ChangeTracker treats as
   // workflow state, so the binding guard cannot accept a different canvas that
   // only differs in reroutes, floating links, or top-level subgraphs.
-  // ChangeTracker distinguishes a missing surface from an explicitly empty or
-  // null one. Preserve that distinction rather than `??`-normalizing it away.
+  //
+  // #560/#565 — a surface ChangeTracker OMITS but LiteGraph's serialize() emits
+  // as present-but-empty (or null) is a serializer DIALECT, not workflow
+  // content: a ChangeTracker state routinely lacks `links`/`groups`/`config`/
+  // `reroutes`/`subgraphs`/`definitions`/`extra` keys that the live root's
+  // serialize() re-emits as `[]`/`{}`/`null`. Comparing presence strictly made
+  // a canvas false-mismatch the very state it was just loaded from — which
+  // broke the workflow_open repaint proof on a drifted binding (#560) and the
+  // empty-canvas read guard (#565). Present-empty therefore compares EQUAL to
+  // absent. NON-empty values keep the full present-vs-absent strictness, so a
+  // canvas that genuinely differs in reroutes / floating links / groups /
+  // subgraphs still mismatches (#349 unchanged).
+  const EMPTY_SURFACE = { present: false };
   const own = (key) => Object.prototype.hasOwnProperty.call(state, key);
-  const surface = (key) => ({ present: own(key), value: state[key] });
+  const surface = (key) => {
+    if (!own(key)) return EMPTY_SURFACE;
+    const value = state[key];
+    return isEmptySurfaceValue(value) ? EMPTY_SURFACE : { present: true, value };
+  };
   const extra = (() => {
-    if (!own("extra")) return { present: false };
-    if (!state.extra || typeof state.extra !== "object") return { present: true, value: state.extra };
-    const { ds: viewport, ...workflowExtra } = state.extra;
-    // A sole `extra.ds` is viewport-only, so it compares like no extra field.
-    if (viewport !== undefined && Object.keys(workflowExtra).length === 0) return { present: false };
-    return { present: true, value: workflowExtra };
+    if (!own("extra")) return EMPTY_SURFACE;
+    if (!state.extra || typeof state.extra !== "object") {
+      // A scalar extra is malformed, not a dialect — keep it significant.
+      return isEmptySurfaceValue(state.extra) ? EMPTY_SURFACE : { present: true, value: state.extra };
+    }
+    // `ds` is the viewport transform and `comfyui_mcp` is the panel's own
+    // identity tag — neither is workflow content. Panning/zooming or an
+    // identity (re)stamp must never manufacture a binding mismatch: a root
+    // re-tagged by the guard's rebind heal would otherwise instantly
+    // false-mismatch a tracker capture that still holds the prior tag (#560).
+    // Tag CONFLICTS are owned by the dedicated UUID predicates above, with
+    // their claim/heal semantics (#545/#557) — not by this content shape.
+    // The same dialect rule applies INSIDE extra: a key one side emits with an
+    // empty value (e.g. LiteGraph's linkExtensions: []) is not content, so
+    // empty-valued keys are dropped before comparing; a non-empty value stays
+    // significant, and only what remains is compared.
+    const { ds: viewport, comfyui_mcp: panelTag, ...workflowExtra } = state.extra;
+    const contentExtra = Object.fromEntries(
+      Object.entries(workflowExtra).filter(([, extraValue]) => !isEmptySurfaceValue(extraValue)),
+    );
+    return Object.keys(contentExtra).length === 0 ? EMPTY_SURFACE : { present: true, value: contentExtra };
   })();
   const shape = {
     // LiteGraph preserves node array order opportunistically, but it does not
@@ -154,7 +282,12 @@ function graphShape(state) {
  * state. Unlike the ordinary read guard, this does NOT treat missing serializer
  * data or a dirty workflow as inconclusive: callers use it only after they have
  * just asked `loadGraphData` to install `state`, so an absent proof must not turn
- * into a fabricated success.
+ * into a fabricated success. Strictness is about CONTENT: every node and every
+ * non-empty surface must match. Serializer dialect — an optional surface the
+ * state omits but LiteGraph re-emits as present-but-empty, or the panel's own
+ * `extra.comfyui_mcp` identity tag — is NOT content and can never make a
+ * faithful repaint fail this proof (#560: that false negative is what left a
+ * drifted binding with no recovery short of a panel reload).
  */
 export function graphRootMatchesState({ rootGraph, state } = {}) {
   try {
@@ -179,6 +312,11 @@ export function graphRootMatchesState({ rootGraph, state } = {}) {
  * Older/partial frontends fall back to an unordered `id` + `type` shape; if that
  * is also unavailable, equal counts remain inconclusive and return false. The
  * guard never manufactures a mismatch from partial state.
+ *
+ * #565 — there is deliberately NO blanket zero-node skip: a state with zero
+ * nodes can still carry real content (subgraphs, groups, reroutes, links), and
+ * a genuinely-empty canvas compares equal through the serializer-dialect
+ * normalization above anyway. Zero nodes relaxes nothing.
  */
 export function graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow } = {}) {
   // #545 — ChangeTracker's activeState is a useful *clean-tab* binding witness,
@@ -265,7 +403,14 @@ export function graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid } =
  *                identity, its own serialized state, or its registered owner
  *                record ties it to the tag): the tag is the active tab's own
  *                lineage, stale relative to its current identity, so the root
- *                is provably its own canvas — re-stamp and proceed;
+ *                is provably its own canvas — re-stamp and proceed. Also when
+ *                `staleTagOnEmptyCanvas` is set (#565): ComfyUI reuses the
+ *                app.graph object across tabs and its clear/configure does NOT
+ *                reset graph.extra, so a brand-new blank tab inherits the
+ *                PREVIOUS workflow's tag while minting its own identity. With
+ *                zero nodes on BOTH sides there is no workflow content that
+ *                could be confused — the #349 fence protects CONTENT — so the
+ *                leftover tag is stale metadata: re-stamp and proceed;
  *   "conflict" — anything else. A tag claimed by a FOREIGN open workflow is the
  *                #349 wrong-canvas case, and a tag NOBODY claims may be a
  *                closed tab's stale canvas — re-stamping either would authorize
@@ -277,9 +422,10 @@ export function resolveGraphRootUuidRebind({
   rootGraph,
   activeWorkflowUuid,
   rootTagClaimedByActiveWorkflow = false,
+  staleTagOnEmptyCanvas = false,
 } = {}) {
   if (!graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid })) return "none";
-  return rootTagClaimedByActiveWorkflow ? "rebind" : "conflict";
+  return rootTagClaimedByActiveWorkflow || staleTagOnEmptyCanvas ? "rebind" : "conflict";
 }
 
 /**
