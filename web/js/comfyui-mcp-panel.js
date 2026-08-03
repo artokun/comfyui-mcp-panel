@@ -178,7 +178,11 @@ import {
 import { autoMatchSlots, slotDiagnostic } from "./lib/connect-match.js";
 import { isLinkPersisted, removePhantomLink, isWidgetBackedInput } from "./lib/connect-verify.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
-import { missingRequiredWidgetMaterializations } from "./lib/node-widget-materialization.js";
+import {
+  missingRequiredWidgetMaterializations,
+  requiredWidgetInputTypes,
+  unavailableDeclaredCustomWidgetTypes,
+} from "./lib/node-widget-materialization.js";
 import { isImeComposing } from "./lib/ime.js";
 import { installGraphToPromptNullSafety } from "./lib/widget-null-safety.js";
 import {
@@ -5877,18 +5881,70 @@ function placementFor(graph, pos) {
   return [100, 100];
 }
 
-// A custom extension's getCustomWidgets hook is allowed to resolve
-// asynchronously. Node defs can therefore be available one task before the
-// corresponding widget constructors. Yield before creating a node so the
-// constructors are installed before LiteGraph runs onNodeCreated; otherwise a
-// V3 node can be added with bare required sockets that graphToPrompt omits.
-async function settleFrontendWidgetRegistry() {
-  await Promise.resolve();
-  if (typeof requestAnimationFrame === "function") {
-    await new Promise((resolve) => requestAnimationFrame(resolve));
-  } else {
-    await new Promise((resolve) => setTimeout(resolve, 0));
+// getCustomWidgets is deliberately fire-and-forget in the ComfyUI frontend.
+// The graph can therefore be ready while a V3 node's widget constructor is
+// still pending. A microtask/frame only happens to cover fast extensions; it
+// cannot prove registration. Resolve the actual extension declarations, then
+// wait for the public widget registry to contain the required constructors.
+const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = 5000;
+const CUSTOM_WIDGET_REGISTRATION_POLL_MS = 25;
+const customWidgetTypePromises = new WeakMap();
+
+function customWidgetTypesDeclaredByExtensions(comfyApp) {
+  if (!comfyApp || !Array.isArray(comfyApp.extensions)) {
+    return Promise.reject(new Error("ComfyUI extension registry is unavailable"));
   }
+  const cached = customWidgetTypePromises.get(comfyApp);
+  if (cached) return cached;
+  const pending = Promise.all(
+    comfyApp.extensions.map(async (extension) => {
+      if (typeof extension?.getCustomWidgets !== "function") return [];
+      const widgets = await extension.getCustomWidgets(comfyApp);
+      return Object.keys(widgets && typeof widgets === "object" ? widgets : {});
+    }),
+  ).then((sets) => new Set(sets.flat()));
+  customWidgetTypePromises.set(comfyApp, pending);
+  return pending;
+}
+
+function rejectAfter(ms, message) {
+  return new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms));
+}
+
+async function awaitRequiredCustomWidgetRegistration(nodeData, comfyApp) {
+  const requiredTypes = requiredWidgetInputTypes(nodeData);
+  if (!requiredTypes.length) return;
+
+  let declaredTypes;
+  try {
+    declaredTypes = await Promise.race([
+      customWidgetTypesDeclaredByExtensions(comfyApp),
+      rejectAfter(
+        CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS,
+        "ComfyUI custom-widget registry is still initializing",
+      ),
+    ]);
+  } catch (error) {
+    throw new Error(
+      `Cannot add node until ComfyUI custom widgets are available; retry shortly. ${error?.message ?? ""}`.trim(),
+    );
+  }
+
+  const expectedTypes = requiredTypes.filter((type) => declaredTypes.has(type));
+  if (!expectedTypes.length) return;
+
+  const deadline = Date.now() + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
+  let unavailable = expectedTypes;
+  while (Date.now() < deadline) {
+    unavailable = unavailableDeclaredCustomWidgetTypes(nodeData, declaredTypes, comfyApp?.widgets);
+    if (!unavailable.length) return;
+    await new Promise((resolve) => setTimeout(resolve, CUSTOM_WIDGET_REGISTRATION_POLL_MS));
+  }
+  throw new Error(
+    `Required custom widget${unavailable.length === 1 ? "" : "s"} ` +
+      `${unavailable.map((type) => `"${type}"`).join(", ")} are unavailable for this node. ` +
+      "ComfyUI is still loading its extension; retry shortly.",
+  );
 }
 
 // The currently-mounted panel root (set by buildPanel). Used by canvas "fit" to
@@ -6765,7 +6821,7 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   async graph_add_node({ class_type, pos, title }) {
-    const { graph, LG } = getGraphCtx();
+    const { app: comfyApp, graph, LG } = getGraphCtx();
     if (!class_type || typeof class_type !== "string") {
       throw new Error("class_type (string) is required");
     }
@@ -6796,16 +6852,20 @@ const GRAPH_TOOL_EXECUTORS = {
       wasTypeEverDefined: (t) => objectInfoHistory.wasTypeEverDefined(t),
     });
     // registerNodesFromDefs can expose a newly installed V3 class before its
-    // extension's asynchronous custom-widget registry settles. Do not
-    // construct in that transient state (#580).
-    await settleFrontendWidgetRegistry();
+    // extension's asynchronous custom-widget registry settles. Resolve the
+    // required constructors before creating anything, or fail retryably before
+    // mutating the graph (#580).
+    await awaitRequiredCustomWidgetRegistration(
+      LG?.registered_node_types?.[class_type]?.nodeData,
+      comfyApp,
+    );
     const node = LG.createNode(class_type);
     if (!node) {
       throw new Error(
         `Unknown node type "${class_type}" — check the exact class_type via get_node_info`,
       );
     }
-    const missingWidgets = missingRequiredWidgetMaterializations(node, app?.widgets);
+    const missingWidgets = missingRequiredWidgetMaterializations(node, comfyApp?.widgets);
     if (missingWidgets.length) {
       throw new Error(
         `Required custom widget${missingWidgets.length === 1 ? "" : "s"} ` +

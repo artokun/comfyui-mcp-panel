@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { missingRequiredWidgetMaterializations } from "../../web/js/lib/node-widget-materialization.js";
+import {
+  missingRequiredWidgetMaterializations,
+  requiredWidgetInputTypes,
+  unavailableDeclaredCustomWidgetTypes,
+} from "../../web/js/lib/node-widget-materialization.js";
 
 const widgetConstructors = { ZIPN_STYLE_GALLERY: () => {}, ZIPN_SPACER: () => {}, COMBO: () => {} };
 
@@ -36,13 +40,32 @@ test("missing V3 custom widget is reported while a socket datatype remains wirea
   assert.deepEqual(missingRequiredWidgetMaterializations(node, widgetConstructors), ["gallery", "spacer"]);
 });
 
+test("declared custom widgets stay unavailable until the frontend registry contains them", () => {
+  const node = v3Node([{ name: "style" }]);
+  const declared = new Set(["ZIPN_STYLE_GALLERY", "ZIPN_SPACER"]);
+  assert.deepEqual(unavailableDeclaredCustomWidgetTypes(node, declared, {}), [
+    "ZIPN_STYLE_GALLERY",
+    "ZIPN_SPACER",
+  ]);
+  assert.deepEqual(unavailableDeclaredCustomWidgetTypes(node, declared, widgetConstructors), []);
+});
+
 test("canvas-only control cannot satisfy a required custom input", () => {
   const node = v3Node([
-    { name: "gallery", serialize: false },
+    { name: "gallery", options: { serialize: false } },
     { name: "spacer", serialize: true },
     { name: "style" },
   ]);
   assert.deepEqual(missingRequiredWidgetMaterializations(node, widgetConstructors), ["gallery"]);
+});
+
+test("a widget serialize property does not override ComfyUI options.serialize", () => {
+  const node = v3Node([
+    { name: "gallery", serialize: false, options: { serialize: true } },
+    { name: "spacer", options: { serialize: true } },
+    { name: "style" },
+  ]);
+  assert.deepEqual(missingRequiredWidgetMaterializations(node, widgetConstructors), []);
 });
 
 test("a forceInput declaration remains a wireable socket", () => {
@@ -52,4 +75,5 @@ test("a forceInput declaration remains a wireable socket", () => {
   ]);
   node.constructor.nodeData.input.required.style = ["STRING", { forceInput: true }];
   assert.deepEqual(missingRequiredWidgetMaterializations(node, { ...widgetConstructors, STRING: () => {} }), []);
+  assert.deepEqual(requiredWidgetInputTypes(node), ["ZIPN_STYLE_GALLERY", "ZIPN_SPACER", "CLIP"]);
 });

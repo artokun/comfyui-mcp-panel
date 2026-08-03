@@ -18,14 +18,42 @@ function inputWidgetType(spec) {
   return Array.isArray(declared) ? "COMBO" : typeof declared === "string" ? declared : null;
 }
 
+function requiredInputs(nodeOrNodeData) {
+  const nodeData = nodeOrNodeData?.constructor?.nodeData ?? nodeOrNodeData;
+  const required = nodeData?.input?.required;
+  return required && typeof required === "object" ? required : null;
+}
+
+/**
+ * The distinct required input types that are eligible to be frontend widgets.
+ * `forceInput` / `widget:false` are sockets even if a custom widget constructor
+ * happens to share their declared type.
+ */
+export function requiredWidgetInputTypes(nodeOrNodeData) {
+  const required = requiredInputs(nodeOrNodeData);
+  if (!required) return [];
+  return [...new Set(Object.values(required).map(inputWidgetType).filter(Boolean))];
+}
+
+/**
+ * Custom widget hooks declare their types before ComfyUI copies them into the
+ * public widget registry. This detects that transient state without treating
+ * unrelated custom socket datatypes as widgets.
+ */
+export function unavailableDeclaredCustomWidgetTypes(nodeOrNodeData, declaredTypes, widgetConstructors) {
+  return requiredWidgetInputTypes(nodeOrNodeData).filter(
+    (type) => declaredTypes?.has(type) && typeof widgetConstructors?.[type] !== "function",
+  );
+}
+
 /**
  * Return required inputs whose registered frontend widget did not materialize
  * on `node`.  A socket-only custom datatype is deliberately not reported: it
  * has no registered widget constructor and is valid to wire later.
  */
 export function missingRequiredWidgetMaterializations(node, widgetConstructors) {
-  const required = node?.constructor?.nodeData?.input?.required;
-  if (!required || typeof required !== "object") return [];
+  const required = requiredInputs(node);
+  if (!required) return [];
 
   const widgets = Array.isArray(node.widgets) ? node.widgets : [];
   const missing = [];
@@ -33,9 +61,10 @@ export function missingRequiredWidgetMaterializations(node, widgetConstructors) 
     const type = inputWidgetType(spec);
     if (!type || typeof widgetConstructors?.[type] !== "function") continue;
     const widget = widgets.find((candidate) => candidate?.name === name);
-    // serialize:false controls must never stand in for a required prompt
-    // value: they are canvas-only and graphToPrompt omits them.
-    if (!widget || widget.serialize === false) missing.push(name);
+    // ComfyUI's prompt serializer reads the widget *options* flag. A widget
+    // property named `serialize` is not authoritative and must not allow a
+    // canvas-only control to satisfy a required prompt value.
+    if (!widget || widget.options?.serialize === false) missing.push(name);
   }
   return missing;
 }
