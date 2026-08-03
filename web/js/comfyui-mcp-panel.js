@@ -119,6 +119,7 @@ import {
   reapplyDefsToLiveNodes,
   refreshComboOptionsFromDefs,
   collectMissingNodeTypeReasons,
+  collectUnexplainedRedOutlines,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
   collectLinkedNeighborNodeIds,
@@ -8475,7 +8476,19 @@ const GRAPH_TOOL_EXECUTORS = {
 
     // Red-outlined (has_errors) UNIONed with anything a source blamed — a source
     // can name a node LiteGraph never flagged (every runtime failure is one).
-    const flagged = new Set(nodes.filter((n) => n.has_errors).map((n) => String(n.id)));
+    // A source-free red outline can survive workflow loading even though the
+    // execution and validation sources have both cleared (#579). Surface those
+    // separately as stale visual flags instead of calling them errors. When an
+    // execution source exists, retain the conservative legacy behavior: do not
+    // downgrade an unexplained red outline.
+    const staleRedFlags = collectUnexplainedRedOutlines(nodes, reasons, {
+      nodeErrors,
+      lastExecutionError: execFailure,
+    });
+    const staleRedFlagIds = new Set(staleRedFlags.map((n) => String(n.id)));
+    const flagged = new Set(
+      nodes.filter((n) => n.has_errors && !staleRedFlagIds.has(String(n.id))).map((n) => String(n.id)),
+    );
     for (const id of reasons.keys()) if (byId.has(id)) flagged.add(id);
     const erroredNodes = [...flagged]
       .map((id) => byId.get(id))
@@ -8509,6 +8522,17 @@ const GRAPH_TOOL_EXECUTORS = {
       errored_count: erroredNodes.length,
       nodes: erroredNodes.slice(0, MAX_STATE_NODES),
       ...(erroredNodes.length > MAX_STATE_NODES ? { truncated: true } : {}),
+      ...(staleRedFlags.length
+        ? {
+            stale_flags: staleRedFlags.slice(0, MAX_STATE_NODES).map((n) => ({
+              ...summarizeNode(n),
+              red_outline: true,
+              reasons: [],
+              note: "LiteGraph still shows this red outline, but no current execution, validation, or asset source confirms an error.",
+            })),
+            ...(staleRedFlags.length > MAX_STATE_NODES ? { stale_flags_truncated: true } : {}),
+          }
+        : {}),
       ...(missingModels.length ? { missing_models: missingModels } : {}),
       ...(missingMedia.length ? { missing_media: missingMedia } : {}),
       ...(missingNodeTypes.length ? { missing_node_types: missingNodeTypes } : {}),

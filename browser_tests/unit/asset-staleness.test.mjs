@@ -21,6 +21,7 @@ import {
   collectAllGraphs,
   reapplyDefsToLiveNodes,
   collectMissingNodeTypeReasons,
+  collectUnexplainedRedOutlines,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
   collectLinkedNeighborNodeIds,
@@ -674,6 +675,16 @@ test("collectMissingNodeTypeReasons: defensive against malformed inputs (never t
 
 test("graphErrorsResultIsClean: TRUE only for a truly empty result", () => {
   assert.equal(graphErrorsResultIsClean({ errored_count: 0, node_errors: null, last_execution_error: null }), true);
+  assert.equal(
+    graphErrorsResultIsClean({
+      errored_count: 0,
+      node_errors: null,
+      last_execution_error: null,
+      stale_flags: [{ id: 5, red_outline: true }],
+    }),
+    true,
+    "a source-free visual outline is an informational stale flag, not an error",
+  );
   assert.equal(graphErrorsResultIsClean({}), true);
   assert.equal(graphErrorsResultIsClean(null), true);
 });
@@ -755,6 +766,31 @@ test("nodeRedFlagIsStale: FALSE while the node still has a live validation error
 test("nodeRedFlagIsStale: fails toward KEEPING the flag on a null/absent node id", () => {
   assert.equal(nodeRedFlagIsStale(null, {}), false);
   assert.equal(nodeRedFlagIsStale(undefined, {}), false);
+});
+
+test("#579 source-free LiteGraph outlines are warnings, not graph errors", () => {
+  const nodes = [
+    { id: 1, has_errors: true, type: "FastFilmGrain" },
+    { id: 2, has_errors: true, type: "KSampler" },
+    { id: 3, has_errors: false, type: "VAEDecode" },
+  ];
+  const reasons = new Map([["2", [{ kind: "missing_model" }]]]);
+
+  assert.deepEqual(
+    collectUnexplainedRedOutlines(nodes, reasons, { nodeErrors: null, lastExecutionError: null }).map((n) => n.id),
+    [1],
+    "only an unexplained red outline with no run error source is stale",
+  );
+  assert.deepEqual(
+    collectUnexplainedRedOutlines(nodes, reasons, { nodeErrors: { 9: { errors: [{ message: "bad" }] } } }),
+    [],
+    "a live validation source retains conservative error classification",
+  );
+  assert.deepEqual(
+    collectUnexplainedRedOutlines(nodes, reasons, { lastExecutionError: { node_id: 9 } }),
+    [],
+    "a live execution source retains conservative error classification",
+  );
 });
 
 test("nodeRedFlagIsStale: a NESTED still-missing asset (scoped locator) keeps the flag via resolvesToNode (#418 codex round-3 P0)", () => {

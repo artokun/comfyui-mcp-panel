@@ -290,6 +290,30 @@ export function nodeRedFlagIsStale(
 }
 
 /**
+ * Return visual LiteGraph red outlines that have no current source-confirmed
+ * explanation. A saved workflow can retain `has_errors` from an older run even
+ * though both error sources have since been cleared. Those outlines are useful
+ * diagnostic hints, but must not inflate `graph_get_errors.errored_count`.
+ *
+ * This intentionally only classifies when BOTH raw execution sources are
+ * absent. If either source exists, keep the old conservative behavior: an
+ * unexplained outline remains an error rather than being silently downgraded.
+ * `reasons` may be the command's Map or a plain id-keyed object for tests.
+ */
+export function collectUnexplainedRedOutlines(
+  nodes,
+  reasons,
+  { nodeErrors = null, lastExecutionError = null } = {},
+) {
+  if (nodeErrors || lastExecutionError || !Array.isArray(nodes)) return [];
+  const reasonsFor = (nodeId) => {
+    const key = String(nodeId);
+    return reasons instanceof Map ? reasons.get(key) : reasons?.[key];
+  };
+  return nodes.filter((node) => node?.has_errors && !(reasonsFor(node.id)?.length));
+}
+
+/**
  * Return the direct graph neighbours connected to `node`. Native
  * `convertToSubgraph()` rewires precisely these surviving root-graph nodes to
  * the new wrapper, but does not re-adjudicate LiteGraph's sticky `has_errors`
