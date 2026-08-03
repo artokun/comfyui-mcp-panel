@@ -376,13 +376,25 @@ test("assetCandidateResolvesLive: [output]/[temp]-annotated values are NEVER com
     widgets: [{ name: "image", value: "foo.png [temp]", options: { values: ["foo.png"] } }],
   };
   assert.equal(assetCandidateResolvesLive(graphOf([temp]), 10, "foo.png [temp]", "image"), false);
-  // A file on disk LITERALLY named `foo.png [output]` is listed verbatim — an
-  // EXACT combo hit still resolves it.
+  // A combo entry that LITERALLY ends with `[output]` is just a weird input-root
+  // filename — it must NOT clear the annotated candidate: the value resolves as
+  // `foo.png` in the OUTPUT root (folder_paths.annotated_filepath), on which the
+  // input combo has no verdict. The candidate stays flagged for the /view probe.
   const literal = {
     id: 11,
     widgets: [{ name: "image", value: "foo.png [output]", options: { values: ["foo.png [output]"] } }],
   };
-  assert.equal(assetCandidateResolvesLive(graphOf([literal]), 11, "foo.png [output]", "image"), true);
+  assert.equal(assetCandidateResolvesLive(graphOf([literal]), 11, "foo.png [output]", "image"), false);
+});
+
+test("assetCandidateResolvesLive: a combo entry literally ending `[input]` is a weird filename, NOT proof the bare name exists", () => {
+  // The value resolves as `foo.png` in the input root; a combo listing only the
+  // literal `foo.png [input]` says nothing about `foo.png` — no clear.
+  const node = {
+    id: 12,
+    widgets: [{ name: "image", value: "foo.png [input]", options: { values: ["foo.png [input]"] } }],
+  };
+  assert.equal(assetCandidateResolvesLive(graphOf([node]), 12, "foo.png [input]", "image"), false);
 });
 
 test("isStaleAssetCandidate: stale once fixed by set_widget (subgraph-scoped)", () => {

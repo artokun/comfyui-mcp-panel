@@ -177,36 +177,43 @@ export function assetCandidateStillReferenced(rootGraph, nodeId, file) {
  * caller has gated as TRUSTED (fresh /object_info), and a genuinely-absent file
  * is never offered by a fresh combo, so no genuine miss can be suppressed.
  *
- * Annotated values (`file.png [input]`/`[output]`/`[temp]`, #743) are parsed with
- * parseAnnotatedFilepath: an `[input]`-annotated (or bare) value resolves against
- * the INPUT root — the same root the loader combo enumerates — so the combo can
- * also adjudicate the stripped bare name. An `[output]`/`[temp]` value resolves
- * against a DIFFERENT root the combo never lists, so the combo has no verdict on
- * it: it fails CLOSED here and is left to the #743 /view server probe.
+ * Annotated values (`file.png [input]`/`[output]`/`[temp]`, #743) are classified
+ * with parseAnnotatedFilepath BEFORE any combo probing: an `[output]`/`[temp]`
+ * value resolves against a root the input combo NEVER enumerates, so the combo
+ * has no verdict on it at all — it fails CLOSED here and is left to the #743
+ * /view server probe. Only an UNANNOTATED value (exact raw membership) or an
+ * `[input]`-annotated one (its stripped bare name) may be combo-cleared: both
+ * resolve against the very input root the combo enumerates.
  */
 export function assetCandidateResolvesLive(rootGraph, nodeId, file, widgetName) {
   try {
     if (nodeId == null || !file) return false;
     const node = findNodeByScopedId(rootGraph, nodeId);
     if (!node || !Array.isArray(node.widgets)) return false;
+    // Annotation classification comes FIRST (codex P1): a value that parses as
+    // [output]/[temp]-annotated resolves as its STRIPPED name in the output/temp
+    // root via folder_paths.annotated_filepath. A combo entry that literally
+    // ends with "[output]"/"[temp]" is just a weird input-root filename — even
+    // an EXACT-looking hit proves nothing about the annotated value, so it must
+    // never clear the candidate. Those stay flagged for the #743 /view probe.
+    const parsed = parseAnnotatedFilepath(file);
+    if (parsed.annotated && parsed.type !== "input") return false;
     // EXACT membership only. A subfolder-registered model (Impact Subpack's
     // `segm/yolov8m-seg.pt`, #407) is listed by /object_info with the SAME separator
     // the widget value carries, so an exact match resolves it once the combo is
     // trusted (the get_errors authoritative refresh) — no separator normalization,
     // which on POSIX could equate a literal-backslash filename with a distinct
-    // forward-slash one and SUPPRESS a genuine miss. The single extra relaxation:
-    // an `[input]`-annotated value's stripped BARE name (#743), which the combo
-    // enumerates from the very root the annotation resolves against.
-    const parsed = parseAnnotatedFilepath(file);
-    const comboName =
-      parsed.annotated && parsed.type !== "input" ? null : parsed.name;
+    // forward-slash one and SUPPRESS a genuine miss. For an unannotated value
+    // parsed.name === file (the raw exact match); for an [input]-annotated one
+    // the stripped bare name is adjudicable because it resolves against the very
+    // input root the combo enumerates — and the RAW annotated string is NOT
+    // checked: a literal `foo.png [input]` combo entry is a weird filename, not
+    // proof that `foo.png` exists.
     const comboHasFile = (w) => {
       if (!w) return false;
       const raw = w.options?.values;
       const list = typeof raw === "function" ? raw(w, node) : raw;
-      if (!Array.isArray(list)) return false;
-      if (list.includes(file)) return true;
-      return comboName != null && comboName !== file && list.includes(comboName);
+      return Array.isArray(list) && list.includes(parsed.name);
     };
     const named = widgetName
       ? node.widgets.find((x) => x?.name === widgetName)
