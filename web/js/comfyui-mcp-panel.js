@@ -180,9 +180,9 @@ import { isLinkPersisted, removePhantomLink, isWidgetBackedInput } from "./lib/c
 import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
 import {
   missingRequiredWidgetMaterializations,
-  requiredWidgetInputTypes,
-  unavailableDeclaredCustomWidgetTypes,
+  unavailableRequiredCustomWidgetTypes,
 } from "./lib/node-widget-materialization.js";
+import { sameGraphMutationContext } from "./lib/graph-mutation-context.js";
 import { isImeComposing } from "./lib/ime.js";
 import { installGraphToPromptNullSafety } from "./lib/widget-null-safety.js";
 import {
@@ -5882,69 +5882,46 @@ function placementFor(graph, pos) {
 }
 
 // getCustomWidgets is deliberately fire-and-forget in the ComfyUI frontend.
-// The graph can therefore be ready while a V3 node's widget constructor is
-// still pending. A microtask/frame only happens to cover fast extensions; it
-// cannot prove registration. Resolve the actual extension declarations, then
-// wait for the public widget registry to contain the required constructors.
+// An unrecognised required V3 input is therefore unsafe until the *live*
+// widget registry either contains a constructor or the type is proven to be a
+// built-in socket. Do not call extension hooks here: they are registration
+// callbacks, not repeatable queries, and ComfyUI does not expose their promise.
 const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = 5000;
 const CUSTOM_WIDGET_REGISTRATION_POLL_MS = 25;
-const customWidgetTypePromises = new WeakMap();
-
-function customWidgetTypesDeclaredByExtensions(comfyApp) {
-  if (!comfyApp || !Array.isArray(comfyApp.extensions)) {
-    return Promise.reject(new Error("ComfyUI extension registry is unavailable"));
-  }
-  const cached = customWidgetTypePromises.get(comfyApp);
-  if (cached) return cached;
-  const pending = Promise.all(
-    comfyApp.extensions.map(async (extension) => {
-      if (typeof extension?.getCustomWidgets !== "function") return [];
-      const widgets = await extension.getCustomWidgets(comfyApp);
-      return Object.keys(widgets && typeof widgets === "object" ? widgets : {});
-    }),
-  ).then((sets) => new Set(sets.flat()));
-  customWidgetTypePromises.set(comfyApp, pending);
-  return pending;
-}
-
-function rejectAfter(ms, message) {
-  return new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms));
-}
 
 async function awaitRequiredCustomWidgetRegistration(nodeData, comfyApp) {
-  const requiredTypes = requiredWidgetInputTypes(nodeData);
-  if (!requiredTypes.length) return;
-
-  let declaredTypes;
-  try {
-    declaredTypes = await Promise.race([
-      customWidgetTypesDeclaredByExtensions(comfyApp),
-      rejectAfter(
-        CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS,
-        "ComfyUI custom-widget registry is still initializing",
-      ),
-    ]);
-  } catch (error) {
-    throw new Error(
-      `Cannot add node until ComfyUI custom widgets are available; retry shortly. ${error?.message ?? ""}`.trim(),
-    );
-  }
-
-  const expectedTypes = requiredTypes.filter((type) => declaredTypes.has(type));
-  if (!expectedTypes.length) return;
-
   const deadline = Date.now() + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
-  let unavailable = expectedTypes;
+  let unavailable = unavailableRequiredCustomWidgetTypes(nodeData, comfyApp?.widgets);
   while (Date.now() < deadline) {
-    unavailable = unavailableDeclaredCustomWidgetTypes(nodeData, declaredTypes, comfyApp?.widgets);
     if (!unavailable.length) return;
     await new Promise((resolve) => setTimeout(resolve, CUSTOM_WIDGET_REGISTRATION_POLL_MS));
+    unavailable = unavailableRequiredCustomWidgetTypes(nodeData, comfyApp?.widgets);
   }
+  if (!unavailable.length) return;
   throw new Error(
     `Required custom widget${unavailable.length === 1 ? "" : "s"} ` +
-      `${unavailable.map((type) => `"${type}"`).join(", ")} are unavailable for this node. ` +
-      "ComfyUI is still loading its extension; retry shortly.",
+      `${unavailable.map((type) => `"${type}"`).join(", ")} have not registered. ` +
+      "They may be custom widgets still loading; retry shortly.",
   );
+}
+
+function captureGraphMutationContext() {
+  const context = getGraphCtx();
+  return { ...context, workflow: activeWorkflowRef() };
+}
+
+function revalidateGraphMutationContext(captured) {
+  const current = { ...getGraphCtx(), workflow: activeWorkflowRef() };
+  if (!sameGraphMutationContext(captured, current, sameWorkflowObject)) {
+    throw new Error(
+      "The active workflow or graph view changed while this node was preparing; nothing was added. Retry on the intended tab.",
+    );
+  }
+  assertGraphBoundToActiveWorkflow(current.graph, current.rootGraph, {
+    includeBaselineReadGuard: false,
+    requireDirtyMutationBinding: true,
+  });
+  return current;
 }
 
 // The currently-mounted panel root (set by buildPanel). Used by canvas "fit" to
@@ -6821,7 +6798,8 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   async graph_add_node({ class_type, pos, title }) {
-    const { app: comfyApp, graph, LG } = getGraphCtx();
+    const capturedContext = captureGraphMutationContext();
+    const { app: comfyApp, LG } = capturedContext;
     if (!class_type || typeof class_type !== "string") {
       throw new Error("class_type (string) is required");
     }
@@ -6873,6 +6851,10 @@ const GRAPH_TOOL_EXECUTORS = {
           `"${class_type}". Reload ComfyUI so its node extension can register, then retry.`,
       );
     }
+    // No await follows this validation. Re-read the graph/workflow now so a
+    // tab or subgraph switch during the async preflight cannot commit to the
+    // graph captured at command start.
+    const { graph } = revalidateGraphMutationContext(capturedContext);
     graph.beforeChange();
     try {
       node.pos = placementFor(graph, pos);

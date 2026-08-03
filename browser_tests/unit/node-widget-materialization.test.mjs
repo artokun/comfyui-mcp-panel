@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   missingRequiredWidgetMaterializations,
   requiredWidgetInputTypes,
-  unavailableDeclaredCustomWidgetTypes,
+  unavailableRequiredCustomWidgetTypes,
 } from "../../web/js/lib/node-widget-materialization.js";
 
 const widgetConstructors = { ZIPN_STYLE_GALLERY: () => {}, ZIPN_SPACER: () => {}, COMBO: () => {} };
@@ -40,14 +40,28 @@ test("missing V3 custom widget is reported while a socket datatype remains wirea
   assert.deepEqual(missingRequiredWidgetMaterializations(node, widgetConstructors), ["gallery", "spacer"]);
 });
 
-test("declared custom widgets stay unavailable until the frontend registry contains them", () => {
+test("an unknown custom type stays unavailable until the frontend registry contains it", () => {
   const node = v3Node([{ name: "style" }]);
-  const declared = new Set(["ZIPN_STYLE_GALLERY", "ZIPN_SPACER"]);
-  assert.deepEqual(unavailableDeclaredCustomWidgetTypes(node, declared, {}), [
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(node, {}), [
+    "ZIPN_STYLE_GALLERY",
+    "ZIPN_SPACER",
+    "COMBO",
+  ]);
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(node, widgetConstructors), []);
+});
+
+test("known core connections and forced inputs remain safe sockets", () => {
+  const node = v3Node([]);
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(node, {}), [
+    "ZIPN_STYLE_GALLERY",
+    "ZIPN_SPACER",
+    "COMBO",
+  ]);
+  node.constructor.nodeData.input.required.style = ["STRING", { forceInput: true }];
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(node, {}), [
     "ZIPN_STYLE_GALLERY",
     "ZIPN_SPACER",
   ]);
-  assert.deepEqual(unavailableDeclaredCustomWidgetTypes(node, declared, widgetConstructors), []);
 });
 
 test("canvas-only control cannot satisfy a required custom input", () => {

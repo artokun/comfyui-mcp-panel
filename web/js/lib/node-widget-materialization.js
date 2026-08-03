@@ -35,14 +35,26 @@ export function requiredWidgetInputTypes(nodeOrNodeData) {
   return [...new Set(Object.values(required).map(inputWidgetType).filter(Boolean))];
 }
 
+// These are ComfyUI's built-in connection datatypes. A required input carrying
+// one is safe to leave as a socket when no widget constructor exists. An
+// unrecognised type is NOT assumed safe: it may be a custom V3 widget whose
+// extension is still registering.
+const SAFE_SOCKET_TYPES = new Set([
+  "*", "ANY", "AUDIO", "BBOX", "CLIP", "CLIP_VISION", "CLIP_VISION_OUTPUT",
+  "CONDITIONING", "CONTROL_NET", "GLIGEN", "GUIDER", "IMAGE", "IPADAPTER",
+  "LATENT", "MODEL", "NOISE", "SAMPLER", "SCHEDULER", "SIGMAS", "STYLE_MODEL",
+  "UNET", "UPSCALE_MODEL", "VAE",
+]);
+
 /**
- * Custom widget hooks declare their types before ComfyUI copies them into the
- * public widget registry. This detects that transient state without treating
- * unrelated custom socket datatypes as widgets.
+ * Required input types that might be custom widgets but have not entered the
+ * live ComfyUI registry yet. Unknown custom socket types deliberately remain
+ * unavailable: their schema is indistinguishable from a widget pending its
+ * extension hook, so admitting one would reintroduce #580's bad prompt.
  */
-export function unavailableDeclaredCustomWidgetTypes(nodeOrNodeData, declaredTypes, widgetConstructors) {
-  return requiredWidgetInputTypes(nodeOrNodeData).filter(
-    (type) => declaredTypes?.has(type) && typeof widgetConstructors?.[type] !== "function",
+export function unavailableRequiredCustomWidgetTypes(nodeOrNodeData, widgetConstructors) {
+  return requiredWidgetInputTypes(nodeOrNodeData).filter((type) =>
+    typeof widgetConstructors?.[type] !== "function" && !SAFE_SOCKET_TYPES.has(type),
   );
 }
 
