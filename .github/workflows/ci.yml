@@ -199,6 +199,37 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
+      # The registry applies .comfyignore with gitignore semantics: a bare
+      # `vendor/` matches a vendor dir at ANY depth, so the exclusion meant for
+      # the root CI artefact also silently dropped web/js/vendor/ (the runtime
+      # marked/DOMPurify/qrcode/a2ui-lit imports) from the pack — the browser
+      # 404'd on import and the sidebar never registered (#749). The parity
+      # scan above reimplements the matching root-anchored and cannot see this
+      # class of loss, so assert with git's OWN ignore engine instead (empty
+      # index: check-ignore skips tracked paths).
+      - name: Pack contents — runtime assets must not be .comfyignore'd
+        shell: bash
+        run: |
+          set -e
+          export GIT_INDEX_FILE="$PWD/.git/pack-contents-empty-index"
+          trap 'rm -f "$GIT_INDEX_FILE"' EXIT
+          for f in \
+            web/js/comfyui-mcp-panel.js \
+            web/js/vendor/marked.esm.js \
+            web/js/vendor/purify.es.js \
+            web/js/vendor/qrcode.esm.js \
+            web/js/vendor/a2ui-lit.bundle.js \
+          ; do
+            if git -c core.excludesFile=.comfyignore check-ignore -q "$f"; then
+              echo "::error file=.comfyignore::$f is exclude-matched but imported at runtime — the published pack would 404 on import and the sidebar would never register (#749)"
+              exit 1
+            fi
+          done
+          # …while the CI-only vocabulary artefact MUST stay excluded.
+          if ! git -c core.excludesFile=.comfyignore check-ignore -q vendor/tool-vocabulary.json; then
+            echo "::error file=.comfyignore::vendor/tool-vocabulary.json must stay .comfyignore'd (CI-only artefact consumed by scripts/check-tool-vocabulary.mjs)"
+            exit 1
+          fi
 
       - name: pyproject.toml is valid + has registry fields + JS version matches
         run: |

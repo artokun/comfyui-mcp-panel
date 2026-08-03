@@ -21,7 +21,11 @@ scripts/
 # Build-time vocabulary artefact vendored from comfyui-mcp. Consumed only by
 # scripts/check-tool-vocabulary.mjs in CI; shipping a list of ~270 tool names in
 # the pack would add nothing for users and give the registry scanner more surface.
-vendor/
+# ROOT-ANCHORED on purpose: the registry applies .comfyignore with gitignore
+# semantics, so a bare `vendor/` matches at ANY depth — it silently dropped
+# web/js/vendor/ (the runtime marked/DOMPurify/qrcode/a2ui-lit imports) from the
+# pack, the browser 404'd on import and the sidebar never registered (#749).
+/vendor/
 .githooks/
 # The Cloudflare registry worker (deploy infra, not part of the custom-node
 # pack; its fetch/crypto calls would only manufacture scanner findings)
