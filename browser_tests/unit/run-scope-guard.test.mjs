@@ -203,6 +203,102 @@ test("#556 r8 collectVolatileInputs: per-NODE pairs (execId + input name) across
   assert.equal(collectVolatileInputs(null).size, 0);
 });
 
+test("#572 collectVolatileInputs: a linked value-control TARGET is excluded — the stock control_after_generate shape", () => {
+  // The frontend hangs beforeQueued on the UNSERIALIZED control combo and the
+  // hook mutates the LINKED, serialized seed (target.linkedWidgets = [control]).
+  // Excluding only the carrier's name covered nothing: the seed re-roll between
+  // our pre-dispatch hash and the deferred serialization false-refused every
+  // scoped run as "graph CHANGED" (WidgetControlMode "before" / pre-#8774 builds).
+  const control = { name: "control_after_generate", value: "randomize", beforeQueued() {}, afterQueued() {} };
+  const seed = { name: "seed", value: 42, linkedWidgets: [control] };
+  const root = { _nodes: [{ id: 3, widgets: [seed, control, { name: "steps", value: 20 }] }] };
+  const pairs = collectVolatileInputs(root);
+  assert.ok(pairs.has("3 seed"), "the serialized re-roll target is volatile");
+  assert.ok(pairs.has("3 control_after_generate"), "the hook carrier's own name stays excluded");
+  assert.ok(!pairs.has("3 steps"), "unrelated inputs stay covered for drift detection");
+});
+
+test("#572 collectVolatileInputs: a FIXED carrier never mutates, so NOTHING is excluded — a mid-window edit to its target refuses as drift", () => {
+  // A "fixed" value-control no-ops at queue time: its linked target's input is
+  // NOT volatile, and neither is the carrier's own. Excluding either would mask
+  // a genuine mid-window user edit (codex r2 — the fixed-ness check must GATE
+  // the exclusion, not follow it).
+  const control = { name: "control_after_generate", value: "fixed", beforeQueued() {}, afterQueued() {} };
+  const seed = { name: "seed", value: 42, linkedWidgets: [control] };
+  const graph = { _nodes: [{ id: 3, widgets: [seed, control, { name: "steps", value: 20 }] }] };
+  const pairs = collectVolatileInputs(graph);
+  assert.ok(!pairs.has("3 seed"), "fixed ⇒ the target input stays drift-covered");
+  assert.ok(!pairs.has("3 control_after_generate"), "fixed ⇒ the carrier's own input stays drift-covered too");
+  // Hash level: a user edit to the fixed target's serialized input during the
+  // deferred window MUST mismatch — exactly like any other genuine edit.
+  const volatileInputs = collectVolatileInputs(graph);
+  const atHash = promptContentHash(
+    { "3": { class_type: "KSampler", inputs: { seed: 42, steps: 20 } }, "9": { class_type: "SaveImage", inputs: {} } },
+    volatileInputs,
+  );
+  const edited = promptContentHashFromBody(
+    JSON.stringify({ prompt: { "3": { class_type: "KSampler", inputs: { seed: 777, steps: 20 } }, "9": { class_type: "SaveImage", inputs: {} } } }),
+    volatileInputs,
+  );
+  assert.notEqual(edited, atHash, "a mid-window edit to a FIXED control's target refuses as drift");
+});
+
+test("#572 collectVolatileInputs: the linked-target exclusion reaches nested subgraphs with the colon-path execId", () => {
+  const control = { name: "control_after_generate", value: "increment", beforeQueued() {} };
+  const noiseSeed = { name: "noise_seed", value: 7, linkedWidgets: [control] };
+  const root = {
+    _nodes: [
+      { id: 10, widgets: [], subgraph: { _nodes: [{ id: 15, widgets: [noiseSeed, control] }] } },
+    ],
+  };
+  const pairs = collectVolatileInputs(root);
+  assert.ok(pairs.has("10:15 noise_seed"), "nested target pairs line up with the flattened prompt keys");
+});
+
+test("#572 promptContentHash: the narrowed exclusion tolerates ONLY the hook's own input — a seed edit is the documented residual, an edit to any OTHER input of the same node refuses", () => {
+  const control = { name: "control_after_generate", value: "randomize", beforeQueued() {} };
+  const seed = { name: "seed", value: 111, linkedWidgets: [control] };
+  const graph = { _nodes: [{ id: 3, widgets: [seed, control, { name: "steps", value: 20 }] }] };
+  const volatileInputs = collectVolatileInputs(graph);
+  // Only the hook-mutated input itself is excluded — never a sibling.
+  assert.deepEqual([...volatileInputs].sort(), ["3 control_after_generate", "3 seed"]);
+  // Pre-dispatch fingerprint (seed value as serialized at hash time)…
+  const atHash = promptContentHash(
+    { "3": { class_type: "KSampler", inputs: { seed: 111, steps: 20 } }, "9": { class_type: "SaveImage", inputs: {} } },
+    volatileInputs,
+  );
+  const postBody = (inputs) =>
+    JSON.stringify({ prompt: { "3": { class_type: "KSampler", inputs }, "9": { class_type: "SaveImage", inputs: {} } } });
+  // The hook's OWN reroll between serialization and dispatch is not drift…
+  assert.equal(
+    promptContentHashFromBody(postBody({ seed: 999983, steps: 20 }), volatileInputs),
+    atHash,
+    "the queue-time reroll is the exclusion's purpose",
+  );
+  // …and a USER edit to that same excluded input is indistinguishable from it:
+  // TOLERATED — the documented accepted residual (surfaced via the run result's
+  // drift_coverage note; no hash can separate "user set 777" from "hook rerolled").
+  assert.equal(
+    promptContentHashFromBody(postBody({ seed: 777, steps: 20 }), volatileInputs),
+    atHash,
+    "accepted residual: a user edit to the hook-mutated input rides the exclusion",
+  );
+  // A user edit to ANY OTHER input of the SAME node is still caught as drift.
+  assert.notEqual(
+    promptContentHashFromBody(postBody({ seed: 999983, steps: 25 }), volatileInputs),
+    atHash,
+    "a genuine mid-window edit to a non-excluded input of the same node refuses",
+  );
+});
+
+test("#572 scopeDroppedError: graph_changed guidance names the retry safety and the queue-time hook cause", () => {
+  const msg = scopeDroppedError({ toNodeId: 116, verdict: { ok: false, reason: "graph_changed" } });
+  assert.match(msg, /node 116/);
+  assert.match(msg, /Retrying is safe \(nothing was queued\)/);
+  assert.match(msg, /queue-time widget hook/);
+  assert.match(msg, /Nothing was queued/);
+});
+
 test("#556 verifyScopedPromptBody: exact scope passes; missing/empty/wrong/extra/unparseable all refuse", () => {
   assert.deepEqual(verifyScopedPromptBody(JSON.stringify({ partial_execution_targets: ["10:15:359"] }), ["10:15:359"]), { ok: true });
   assert.equal(verifyScopedPromptBody(JSON.stringify({ prompt: {} }), ["14"]).reason, "scope_missing");
@@ -401,6 +497,43 @@ test("#556 integration: happy path — marked scoped dispatch observed, prompt_i
     assert.equal(app.posted.length, 1, "first arg shape worked — no retry");
     assert.equal(app.posted[0].number, result.queueMark, "our posts carry THIS run's queue mark");
     assert.deepEqual(app.posted[0].partial_execution_targets, ["14"]);
+  } finally {
+    stop();
+  }
+});
+
+test("#572 integration: the scoped-run result SURFACES the drift-uncovered inputs (hook-mutated inputs are not drift-covered)", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeFrontend({ shape: "shim", apiTarget });
+    // The live graph carries a seed whose linked control re-rolls it at queue time:
+    // that input (and the unserialized carrier) is excluded from the drift hash, so
+    // the run must REPORT the coverage gap rather than claim full-graph drift proof.
+    const control = { name: "control_after_generate", value: "randomize", beforeQueued() {} };
+    const seed = { name: "seed", value: 111, linkedWidgets: [control] };
+    app.graph = { _nodes: [{ id: 3, widgets: [seed, control, { name: "steps", value: 20 }] }] };
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+    assert.equal(result.outcome, "dispatched");
+    assert.deepEqual(
+      [...(result.volatileInputs ?? [])].sort(),
+      ["3 control_after_generate", "3 seed"],
+      "the run reports exactly which inputs were NOT drift-covered for this run",
+    );
+  } finally {
+    stop();
+  }
+});
+
+test("#572 integration: a graph with NO queue-time hooks reports full drift coverage (no uncovered inputs)", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeFrontend({ shape: "shim", apiTarget });
+    app.graph = { _nodes: [{ id: 3, widgets: [{ name: "seed", value: 111 }, { name: "steps", value: 20 }] }] };
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+    assert.equal(result.outcome, "dispatched");
+    assert.deepEqual(result.volatileInputs ?? [], [], "nothing excluded ⇒ the whole prompt was drift-covered");
   } finally {
     stop();
   }

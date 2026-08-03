@@ -65,16 +65,19 @@
 //
 //  - The prompt CONTENT HASH (r7) must be computable BEFORE dispatch: a
 //    stable hash of the full queued prompt — node ids, class types, links,
-//    every input/widget value — excluding ONLY the inputs of widgets that
-//    self-mutate at queue time (beforeQueued seeds and the like), which
-//    change between any two serializations of the SAME graph by design. A
-//    topology-only fingerprint is insufficient: a busy queue defers
-//    serialization to post time, and a user edit in between (a changed
-//    widget value, a rewired link) leaves node ids/types untouched while
-//    rendering a DIFFERENT workflow — the guard refuses that drifted post
-//    and the run ends with a truthful "the graph changed" error. If the
-//    hash can't be computed at all (graphToPrompt failed), the run FAILS
-//    CLOSED: it refuses upfront and never calls queuePrompt.
+//    every input/widget value — excluding ONLY the inputs that self-mutate at
+//    queue time (beforeQueued hooks: seed widgets re-rolled by their linked
+//    control_after_generate, and the hook widgets themselves), which change
+//    between any two serializations of the SAME graph by design (#572: the
+//    exclusion must reach the hook's serialized TARGET, not just the
+//    unserialized control the hook hangs on). A topology-only fingerprint is
+//    insufficient: a busy queue defers serialization to post time, and a user
+//    edit in between (a changed widget value, a rewired link) leaves node
+//    ids/types untouched while rendering a DIFFERENT workflow — the guard
+//    refuses that drifted post and the run ends with a truthful "the graph
+//    changed" error. If the hash can't be computed at all (graphToPrompt
+//    failed), the run FAILS CLOSED: it refuses upfront and never calls
+//    queuePrompt.
 //
 // Extracted as a pure module so the SAME orchestration graph_run runs is
 // drivable from `node --test` (the live app.queuePrompt path can't be).
@@ -139,14 +142,17 @@ const fnv1aHex = (s) =>
  * in between (a changed widget value, a rewired link) leaves the topology
  * untouched while rendering a DIFFERENT workflow.
  *
- * The ONLY values excluded are inputs whose OWNING widget self-mutates at
- * queue time (a `beforeQueued` hook — stock seed widgets with
- * control_after_generate, etc.): those change between any two serializations
- * of the SAME graph by design, so hashing them would refuse our own dispatch.
- * Exclusions are PER-NODE pairs (prompt node id + input name, r8): an edit to
- * a NON-hook node's same-named input is still detected as drift, and a prompt
- * node that can't be resolved to a live node carrying the hook gets NO
- * exclusions (fail toward detecting drift).
+ * The ONLY values excluded are inputs that self-mutate at queue time (a
+ * `beforeQueued` hook — stock seed widgets re-rolled by their linked
+ * control_after_generate, third-party hook widgets, etc.): those change
+ * between any two serializations of the SAME graph by design, so hashing them
+ * would refuse our own dispatch. Exclusions are PER-NODE pairs (prompt node id
+ * + input name, r8): an edit to a NON-hook node's same-named input is still
+ * detected as drift, and a prompt node that can't be resolved to a live node
+ * carrying the hook gets NO exclusions (fail toward detecting drift). #572:
+ * the stock hook rides on the unserialized control widget and mutates its
+ * LINKED target, so the exclusion follows the linkedWidgets convention to the
+ * serialized target (see collectVolatileInputs).
  */
 export function promptContentHash(output, volatileInputs = null) {
   if (!output || typeof output !== "object") return null;
@@ -182,19 +188,65 @@ export function promptContentHashFromBody(bodyText, volatileInputs = null) {
  * same path buildNodeExecutionId produces, so pairs line up with the keys of
  * the API prompt. These are the ONLY values the content hash excludes —
  * everything a user can edit, on any other node, is covered.
+ *
+ * #572 — the stock control_after_generate hook is NOT on the serialized
+ * widget: the frontend hangs `beforeQueued` on the control combo (serialize:
+ * false — it never even reaches the prompt) and the hook mutates the LINKED
+ * TARGET (the seed / noise_seed / cycled combo), which IS serialized
+ * (ComfyUI_frontend widgets.ts: `targetWidget.linkedWidgets = [controlWidget]`;
+ * the queue processor fires the hook before serializing the post body).
+ * Excluding only the carrier's own name therefore covered nothing, and any
+ * frontend/mode where the mutation lands between our pre-dispatch hash and the
+ * deferred serialization (WidgetControlMode "before"; pre-#8774 frontends on a
+ * partial execution; third-party hooks following the same linkedWidgets
+ * convention) false-refused EVERY scoped run as "graph CHANGED" — nothing
+ * queued, no concurrent edit. So for each carrier `w` we ALSO exclude every
+ * sibling target `t` with `t.linkedWidgets` containing `w`. A carrier whose
+ * value is the string "fixed" never mutates anything, so the fixed-ness check
+ * GATES the exclusion (codex r2): a fixed carrier excludes NOTHING — not its
+ * own input, not its target's — and a mid-window user edit to either still
+ * refuses as drift.
+ *
+ * ACCEPTED RESIDUAL (codex gate, documented deliberately): the exclusion is
+ * narrowed to exactly the input(s) the hook mutates — each linked target's own
+ * serialized input — but a USER edit to one of THOSE SAME inputs inside the
+ * deferred window (e.g. seed 111 → 777 while the post is pending) is
+ * inherently indistinguishable from the hook's own reroll and is therefore
+ * TOLERATED, not refused. This is the narrowest possible gap: an edit to ANY
+ * OTHER input of the same node (or any input anywhere else) still mismatches
+ * the hash and refuses the dispatch. The gap is never silent: dispatchScopedRun
+ * returns these pairs as `volatileInputs`, and graph_run surfaces them in the
+ * run result's `drift_coverage` note so the caller knows which inputs were not
+ * drift-covered for that run.
  */
 export function collectVolatileInputs(rootGraph) {
   const pairs = new Set();
   const seen = new Set();
+  const addPair = (execId, name) => {
+    if (name != null) pairs.add(`${execId} ${String(name)}`);
+  };
   const walk = (graph, prefix) => {
     if (!graph || seen.has(graph)) return;
     seen.add(graph);
     for (const node of graph._nodes ?? []) {
       if (!node || node.id == null) continue;
       const execId = prefix ? `${prefix}:${node.id}` : String(node.id);
-      for (const w of node.widgets ?? []) {
-        if (typeof w?.beforeQueued === "function" && w.name != null) {
-          pairs.add(`${execId} ${String(w.name)}`);
+      const widgets = node.widgets ?? [];
+      for (const w of widgets) {
+        if (typeof w?.beforeQueued !== "function") continue;
+        // A "fixed" value-control no-ops at queue time: NEITHER its own input
+        // NOR its linked target is volatile. The fixed-ness check must GATE the
+        // exclusion, not follow it — excluding anything for a fixed carrier
+        // would mask a genuine mid-window user edit as drift-blind (codex r2).
+        if (w.value === "fixed") continue;
+        // The carrier's own input (third-party hooks that mutate their own
+        // serialized value; a no-op for the serialize:false stock control).
+        addPair(execId, w.name);
+        // #572 — the serialized TARGET(s) of a linked value-control hook.
+        for (const t of widgets) {
+          if (Array.isArray(t?.linkedWidgets) && t.linkedWidgets.includes(w)) {
+            addPair(execId, t.name);
+          }
         }
       }
       if (node.subgraph) walk(node.subgraph, execId);
@@ -263,7 +315,11 @@ export function scopeDroppedError({ toNodeId, verdict }) {
   const detail =
     verdict?.reason === "graph_changed"
       ? `the workflow graph CHANGED after the run was queued — the deferred ` +
-        `dispatch would render a modified workflow, not the one that was scoped`
+        `dispatch would render a modified workflow, not the one that was scoped. ` +
+        `Retrying is safe (nothing was queued); if this recurs without any edit in ` +
+        `between, a queue-time widget hook is mutating values between serialization ` +
+        `and dispatch (e.g. a control_after_generate widget with WidgetControlMode ` +
+        `"before" — switch it to "after" or fix the target widget's value)`
       : verdict?.reason === "scope_mismatch"
         ? `the POST /prompt body carried partial_execution_targets ` +
           `${JSON.stringify(verdict.got)} instead of ${JSON.stringify(verdict.expected)}`
@@ -623,7 +679,10 @@ export function cancelPendingScopedQueueItem(app, { runTag, queueMark } = {}) {
  * sentinel decision, and the finally-restore) is what the unit tests drive.
  *
  * Returns a discriminated result (never throws for queue outcomes), always
- * carrying the run's unique `queueMark`:
+ * carrying the run's unique `queueMark` and — once the prompt was fingerprinted
+ * — `volatileInputs`: the sorted "execId inputName" pairs this run did NOT
+ * drift-cover (queue-time hook inputs; see collectVolatileInputs' ACCEPTED
+ * RESIDUAL note), so the caller can state the coverage gap honestly:
  *  - { outcome: "dispatched",   queueMark }  our scoped dispatch was OBSERVED
  *    (prompt_ids / a server rejection captured via the callbacks);
  *  - { outcome: "refused",      queueMark, error }  every argument shape
@@ -679,6 +738,12 @@ export async function dispatchScopedRun({
   if (!contentHash) {
     return { outcome: "unverifiable", queueMark: mark, error: scopeUnattributableError({ toNodeId }) };
   }
+  // #572 — the inputs this run does NOT drift-cover (queue-time hook inputs:
+  // hook carriers plus their linked, serialized targets). Surfaced on every
+  // post-hash outcome so the caller can report the coverage gap truthfully
+  // instead of implying full-graph drift proof (see collectVolatileInputs'
+  // ACCEPTED RESIDUAL note).
+  const volatileList = volatileInputs ? [...volatileInputs].sort() : [];
   // Ownership tag for the timeout cancellation (see QUEUE_ITEM_TAG).
   const runTag = Symbol("cmcp-scoped-run");
   try {
@@ -727,6 +792,7 @@ export async function dispatchScopedRun({
             outcome: "unverified",
             queueMark: mark,
             verified,
+            volatileInputs: volatileList,
             error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: true, verified, batch }),
           };
         }
@@ -735,6 +801,7 @@ export async function dispatchScopedRun({
           outcome: "unverified",
           queueMark: mark,
           verified,
+          volatileInputs: volatileList,
           error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: false, verified, batch }),
         };
       }
@@ -759,6 +826,7 @@ export async function dispatchScopedRun({
         outcome: "failed",
         queueMark: mark,
         verified: guard.state.observed,
+        volatileInputs: volatileList,
         error: guard.state.failed +
           (keepGuardInstalled
             ? " The scope guard stays installed as a sentinel for the rest of this page session."
@@ -769,17 +837,17 @@ export async function dispatchScopedRun({
     // established rejection channel — the run "dispatched" and ComfyUI said
     // no; graph_run's summarizePromptRejection surfaces it, never queued:true.
     if (guard.state.rejected > 0) {
-      return { outcome: "dispatched", queueMark: mark, verified: guard.state.observed };
+      return { outcome: "dispatched", queueMark: mark, verified: guard.state.observed, volatileInputs: volatileList };
     }
     // The FULL batch verified — genuinely dispatched (r5: never on a partial).
     if (guard.state.observed >= batch) {
-      return { outcome: "dispatched", queueMark: mark, verified: guard.state.observed };
+      return { outcome: "dispatched", queueMark: mark, verified: guard.state.observed, volatileInputs: volatileList };
     }
     // r7 CONTENT DRIFT with ZERO verified posts is NOT an argument-shape
     // problem — retrying the other shape would produce the same drifted post.
     // Terminal refusal naming that the graph changed under the deferred item.
     if (guard.state.observed === 0 && guard.state.droppedReason === "graph_changed") {
-      return { outcome: "refused", queueMark: mark, verified: 0, error: guard.state.dropped };
+      return { outcome: "refused", queueMark: mark, verified: 0, volatileInputs: volatileList, error: guard.state.dropped };
     }
     // A corrupted post with ZERO verified posts means this argument SHAPE was
     // dropped by the frontend — nothing was queued, so retrying the other
@@ -797,6 +865,7 @@ export async function dispatchScopedRun({
       outcome: "refused",
       queueMark: mark,
       verified: guard.state.observed,
+      volatileInputs: volatileList,
       error: scopePartialBatchError({
         toNodeId,
         verified: guard.state.observed,
@@ -806,5 +875,5 @@ export async function dispatchScopedRun({
       }),
     };
   }
-  return { outcome: "refused", queueMark: mark, verified: 0, error: dropped };
+  return { outcome: "refused", queueMark: mark, verified: 0, volatileInputs: volatileList, error: dropped };
 }
