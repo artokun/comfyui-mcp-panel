@@ -2399,6 +2399,57 @@ test('#566: the temp predecessor is NOT consumed when openWorkflow leaves the SO
   assert.equal(details.savedRecord, undefined, 'no succession proof threaded without a swap')
 })
 
+test('#566 P0: a MID-TRIO switch to a DISTINCT tab consumes NOTHING and threads NOTHING (fail safe)', async () => {
+  // Codex-gate regression: the user/reconnect switches to a distinct tab B DURING
+  // the awaited saveWorkflow(copy). The post-trio active tab is then B — NOT the
+  // copy the trio produced. "Whatever is active after the await" is not succession
+  // evidence (the #557 r4/r10 class): without PROOF the active tab IS the produced
+  // copy, the predecessor must NOT be consumed (the cosmetic ghost may stay — never
+  // the data-loss) and details.savedRecord must NOT be threaded to B. Threading B
+  // would arm the #557 carry gate: the forced removal makes the predecessor appear
+  // gone, the threaded record matches the post-save active (B), and B is seeded
+  // with A's uuid — the #349 wrong-canvas bypass the r4 round hardened against.
+  const active = {
+    path: 'workflows/Unsaved Workflow (2).json',
+    filename: 'Unsaved Workflow (2).json',
+    directory: 'workflows',
+    isPersisted: false,
+    isTemporary: true,
+    isModified: true
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ active })
+  const B = {
+    path: 'workflows/Other.json',
+    filename: 'Other.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+    isModified: true,
+    changeTracker: { activeState: { other: true }, prepareForSave() {} }
+  }
+  svc.openWorkflows.push(B) // a DISTINCT open tab the user can switch to
+  // MID-TRIO SWITCH: while the copy's persist awaits, the active tab becomes B.
+  const origSaveWorkflow = svc.saveWorkflow
+  svc.saveWorkflow = async (w) => {
+    await origSaveWorkflow(w)
+    svc.activeWorkflow = B // user/reconnect switch during the awaited persist
+  }
+
+  const details = {}
+  await saveActiveWorkflow(svc, 'XYR_SH01_v001', { existsOnDisk, details })
+
+  assert.ok(svc.disk.has('workflows/XYR_SH01_v001.json'), 'the copy itself still persisted')
+  assert.equal(svc.activeWorkflow, B, 'B is the post-save active tab')
+  assert.equal(
+    svc.getWorkflowByPath('workflows/Unsaved Workflow (2).json'),
+    active,
+    'predecessor NOT consumed on a mid-trio switch (fail safe — the cosmetic ghost stays)'
+  )
+  assert.ok(svc.openWorkflows.includes(active), 'the temp tab remains open')
+  assert.equal(details.savedRecord, undefined, 'savedRecord NOT threaded to the foreign tab B')
+  assert.ok(svc.openWorkflows.includes(B), 'B is untouched')
+})
+
 // ---------------------------------------------------------------------------
 // describeSaveOutcome — the pure mapper from saveActiveWorkflow's AUTHORITATIVE
 // `details.mode` to the tool-result fields, so panel_save_workflow reports what a

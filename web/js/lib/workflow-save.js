@@ -442,7 +442,12 @@ export async function saveActiveWorkflow(
     // touched. The residual (a concurrent save to the identical brand-new name within
     // that sub-second window, which cannot occur in a single-user session, and cannot
     // retroactively protect a victim file the server already replaced) is upstream-only.
-    const atomicCopy = resolveSaveAsCopy(svc, { reconcileSavedCopy });
+    // Out-param the adapter fills with its PROVEN produced record: the post-trio
+    // active tab, ONLY when token-proof shows it IS the copy the trio just wrote
+    // (#566 codex P0 — "whatever is active after the await" is NOT succession
+    // evidence; a mid-trio switch to a foreign tab must thread/consume NOTHING).
+    const producedRecord = {};
+    const atomicCopy = resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord });
     if (atomicCopy) {
       assertExpect(); // #330: still the workflow we probed?
       // Authoritative outcome: a "never-persisted" source (a temp / new_workflow tab
@@ -495,22 +500,26 @@ export async function saveActiveWorkflow(
       // copy's successful persist + post-write clobber check above: a failed save
       // keeps the user's unsaved tab. A PERSISTED source is never consumed — a Save-As
       // copy deliberately leaves the original tab open.
+      //
+      // PROOF GATE (codex P0): consumption requires the adapter's own PROOF that the
+      // post-trio active tab IS the copy the trio produced (producedRecord.record,
+      // token-matched — the same succession-proof class as the #557 r10 carry: the
+      // save's own produced record, never post-await active-tab occupancy). A
+      // user/reconnect switch to a DISTINCT tab during the awaited persist fails that
+      // proof ⇒ consume NOTHING and thread NOTHING (fail safe: the cosmetic ghost
+      // stays — never the #349 wrong-canvas seeding of a foreign tab).
       if (cls === "never-persisted") {
-        // Stamp BEFORE any identity comparison so the source is recognizable through
-        // the store's reactive proxies (the token reflects through a Vue proxy) —
-        // the same mechanism the copy's own cleanup relies on.
-        stampCopyToken(wf);
-        const produced = svc?.activeWorkflow;
-        // Guard: consume the predecessor ONLY when the copy actually took over the
-        // active slot. If openWorkflow left the SOURCE active (an unfaithful
-        // frontend), the swap never happened and the visible tab must stay.
-        if (produced && !isSameCopy(wf, produced)) {
+        const produced = producedRecord.record ?? null;
+        if (produced) {
+          // Stamp BEFORE the identity-safe removal so the source is recognizable
+          // through the store's reactive proxies (the token reflects through a Vue
+          // proxy) — the same mechanism the copy's own cleanup relies on.
+          stampCopyToken(wf);
           removeInMemoryWorkflow(svc, wf);
-          // r10 thread for the #557 save-swap identity carry: the post-save ACTIVE
-          // object IS the record the trio produced (saveAs built it, openWorkflow
-          // activated it, saveWorkflow persisted it) — the ONLY succession proof the
-          // carry accepts. With the predecessor gone, the temp tab's identity can now
-          // continue onto its saved successor instead of dying with the ghost.
+          // r10 thread for the #557 save-swap identity carry: the PROVEN produced
+          // record is the ONLY succession proof the carry accepts. With the
+          // predecessor gone, the temp tab's identity can now continue onto its
+          // saved successor instead of dying with the ghost.
           if (details) details.savedRecord = produced;
         }
       }
@@ -707,8 +716,17 @@ async function probeSourceOnDisk(existsOnDisk, normPath) {
  *   - POST-WRITE CLOBBER DETECTION (P0): after a "successful" persist, verify the
  *     target still holds OUR content; a concurrent save in the server's body-read
  *     window can silently overwrite it (200, not 409) → surface a detected error
- *     instead of a false success. */
-function resolveSaveAsCopy(svc, { reconcileSavedCopy } = {}) {
+ *     instead of a false success.
+ *
+ *  `producedRecord` is an OPTIONAL out-param object the adapter fills with its
+ *  PROVEN produced record (`producedRecord.record = <active tab>`) at a success
+ *  point — ONLY when token-proof shows the post-trio ACTIVE tab IS the copy this
+ *  trio just wrote (#566 codex P0). "Whatever is active after the awaited persist"
+ *  is NOT succession evidence (a user/reconnect switch during saveWorkflow lands
+ *  on a foreign tab); this is the same proof class the #557 r10 carry demands —
+ *  the save's own produced record, never post-await active-tab occupancy. A proof
+ *  failure threads NOTHING (fail safe). */
+function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord } = {}) {
   // `openWorkflow` is MANDATORY for this path, not optional. The object saveAs
   // returns is UNLOADED (no changeTracker → activeState === null), and
   // ComfyWorkflow.save() serializes `activeState ?? null` — so persisting a copy
@@ -777,6 +795,28 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy } = {}) {
       const prevActive = svc.activeWorkflow;
       const resolvedName = () =>
         baseName(svc.activeWorkflow?.filename) || baseName(copy.filename) || effectiveName;
+      // #566 codex P0 — success exit: thread the trio's PRODUCED record into the
+      // caller's out-param ONLY with PROOF the post-trio active tab IS the copy
+      // this trio just wrote (its proxy-safe token reflects through the store's
+      // reactive proxies). A user/reconnect switch to a DISTINCT tab during the
+      // awaited persist fails the token match ⇒ thread NOTHING (fail safe), so the
+      // caller consumes no predecessor and arms no identity carry for a foreign tab.
+      const finish = () => {
+        try {
+          const activeNow = svc.activeWorkflow;
+          if (
+            activeNow &&
+            isSameCopy(copy, activeNow) &&
+            producedRecord &&
+            typeof producedRecord === "object"
+          ) {
+            producedRecord.record = activeNow;
+          }
+        } catch {
+          /* active unreadable ⇒ no proof ⇒ no thread (fail safe) */
+        }
+        return resolvedName();
+      };
       try {
         await svc.openWorkflow(copy);
         copy.changeTracker?.prepareForSave?.();
@@ -806,7 +846,7 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy } = {}) {
             // saved copy). markCopyPersisted sets size + resyncs originalContent so the
             // store treats it as a normal saved, unmodified workflow. Report success.
             markCopyPersisted(copy);
-            return resolvedName();
+            return finish();
           }
           if (state === "foreign") {
             // The target holds SOMEONE ELSE's content — our write was clobbered or
@@ -870,7 +910,7 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy } = {}) {
           );
         }
       }
-      return resolvedName();
+      return finish();
     };
   }
   return null;
