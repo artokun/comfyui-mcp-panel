@@ -771,6 +771,23 @@ test("writing a RENAMED promoted widget hits the inner target + syncs the rail, 
   });
 });
 
+test("#583: promoted write reports the requested OUTER widget's previous value, not the inner implementation value", () => {
+  const { parent, inner, railWidget, resolveSource } = makeSubgraphFixture();
+  const innerWidget = inner.widgets.find((w) => w.name === "scheduler");
+  // A stale/migrated subgraph can expose a different outer rail value from its
+  // implementation widget. The tool was addressed to `sched_alias` on `parent`,
+  // so this is the value its response must call `previous`.
+  railWidget.value = "karras";
+  innerWidget.value = "simple";
+
+  const set = applyWidgetWrite(parent, "sched_alias", "simple", { resolveSource });
+
+  assert.equal(set.previous, "karras");
+  assert.equal(set.inner_previous, "simple");
+  assert.equal(set.value, "simple");
+  assert.equal(railWidget.value, "simple", "the visible outer rail is still synchronized");
+});
+
 test("promoted numeric slot REJECTS a non-numeric value (silent-corruption signature)", () => {
   const { parent, inner, resolveSource } = makeSubgraphFixture();
   // Re-point the promotion at inner numeric "steps", WITH a valid authoritative
