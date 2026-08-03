@@ -29,10 +29,12 @@ function makeHarness(opts = {}) {
   let seq = 0;
   const flushes = [];
   const errors = [];
+  const interruptions = [];
   const giveUps = [];
   const tracker = createRunCompletionTracker({
     onFlush: (p) => flushes.push(p),
     onReconcileError: (e) => errors.push(e),
+    onReconcileInterrupted: (e) => interruptions.push(e),
     onReconcileGiveUp: (e) => giveUps.push(e),
     now: () => clock,
     setTimer: (fn, ms) => {
@@ -48,6 +50,7 @@ function makeHarness(opts = {}) {
     tracker,
     flushes,
     errors,
+    interruptions,
     giveUps,
     advance: (ms) => {
       clock += ms;
@@ -95,6 +98,38 @@ test("parseHistoryEntry: terminal success classifies stills vs videos", () => {
 test("parseHistoryEntry: an errored run is terminal with status error and no batch delivered", () => {
   const parsed = parseHistoryEntry(
     { outputs: {}, status: { status_str: "error", completed: false } },
+    { isVideo },
+  );
+  assert.equal(parsed.terminal, true);
+  assert.equal(parsed.status, "error");
+});
+
+test("parseHistoryEntry: ComfyUI's raw error plus execution_interrupted is a terminal cancellation", () => {
+  const parsed = parseHistoryEntry(
+    {
+      outputs: {},
+      status: {
+        status_str: "error",
+        completed: false,
+        messages: [["execution_interrupted", { prompt_id: "cancelled" }]],
+      },
+    },
+    { isVideo },
+  );
+  assert.equal(parsed.terminal, true);
+  assert.equal(parsed.status, "interrupted");
+});
+
+test("parseHistoryEntry: a real execution_error wins over an interrupted marker", () => {
+  const parsed = parseHistoryEntry(
+    {
+      outputs: {},
+      status: {
+        status_str: "error",
+        completed: false,
+        messages: [["execution_interrupted", {}], ["execution_error", { exception_message: "boom" }]],
+      },
+    },
     { isVideo },
   );
   assert.equal(parsed.terminal, true);
@@ -235,6 +270,29 @@ test("#370 errored run recovered from history: no batch delivered, status error 
   const summary = await tracker.reconcile({ fetchHistory: async (id) => history[id] ?? null, isVideo });
   assert.equal(flushes.length, 0, "no completion batch for a failed run");
   assert.deepEqual(summary, [{ promptId: "pE", status: "error" }]);
+});
+
+test("#582 interrupted run recovered from history emits only the neutral cancellation hook", async () => {
+  const { tracker, flushes, errors, interruptions } = makeHarness();
+  tracker.onExecutionStart("pCancel");
+  tracker.onExecuted("pCancel", { images: [{ filename: "partial.png", type: "output" }] });
+  const history = {
+    pCancel: {
+      outputs: {},
+      status: {
+        status_str: "error",
+        completed: false,
+        messages: [["execution_interrupted", { prompt_id: "pCancel" }]],
+      },
+    },
+  };
+  const summary = await tracker.reconcile({ fetchHistory: async (id) => history[id] ?? null, isVideo });
+  assert.deepEqual(summary, [{ promptId: "pCancel", status: "interrupted" }]);
+  assert.equal(flushes.length, 0, "a cancelled run never delivers a partial batch");
+  assert.deepEqual(errors, [], "a cancelled run never enters the error hook");
+  assert.deepEqual(interruptions, [{ promptId: "pCancel" }], "neutral hook fires exactly once");
+  await tracker.reconcile({ fetchHistory: async (id) => history[id] ?? null, isVideo });
+  assert.deepEqual(interruptions, [{ promptId: "pCancel" }], "a second reconnect does not repeat the event");
 });
 
 test("#370 codex P1 (idempotency): a LATE executed+execution_success after reconcile does NOT double-deliver", async () => {

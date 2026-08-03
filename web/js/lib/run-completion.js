@@ -64,6 +64,7 @@ export const NO_PROMPT_KEY = "__no_prompt__";
 export function createRunCompletionTracker({
   onFlush,
   onReconcileError,
+  onReconcileInterrupted,
   onReconcileGiveUp,
   now = () => Date.now(),
   setTimer = (fn, ms) => setTimeout(fn, ms),
@@ -376,6 +377,19 @@ export function createRunCompletionTracker({
         }
       }
       return { promptId, status: "error" };
+    }
+    if (parsed.status === "interrupted") {
+      // A manual stop is terminal, but it is not a failed run. Keep it on a
+      // distinct hook so reconnect never routes it through the urgent
+      // run_error/panel_get_errors path (#582).
+      if (typeof onReconcileInterrupted === "function") {
+        try {
+          onReconcileInterrupted({ promptId });
+        } catch {
+          /* presentation error must never wedge reconciliation */
+        }
+      }
+      return { promptId, status: "interrupted" };
     }
     const hasBatch = parsed.images.length > 0 || parsed.videos.length > 0;
     if (hasBatch) {

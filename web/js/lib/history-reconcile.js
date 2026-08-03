@@ -20,7 +20,7 @@
  * @param {object}   [opts]
  * @param {(m:object)=>boolean} [opts.isVideo]  Classifies an output ref as video
  *   (else still image), matching the live path's classification.
- * @returns {null | { terminal:boolean, status:("success"|"error"|"unknown"),
+ * @returns {null | { terminal:boolean, status:("success"|"error"|"interrupted"|"unknown"),
  *   images:object[], videos:{m:object,nodeId:string}[] }}
  *   `null` when there's no usable entry.
  */
@@ -30,14 +30,25 @@ export function parseHistoryEntry(entry, { isVideo } = {}) {
   const status = entry.status && typeof entry.status === "object" ? entry.status : {};
   const statusStr = typeof status.status_str === "string" ? status.status_str : null;
   const completedFlag = status.completed === true;
+  const messages = Array.isArray(status.messages) ? status.messages : [];
+
+  // ComfyUI records a manually stopped render as status_str:"error" plus an
+  // execution_interrupted lifecycle message. That is a terminal cancellation,
+  // not an execution failure: diagnose_run makes the same distinction. An actual
+  // execution_error wins if an unusual record carries both markers.
+  const hasMessage = (name) => messages.some((message) => Array.isArray(message) && message[0] === name);
+  const hasExecutionError = hasMessage("execution_error");
+  const isInterrupted =
+    !hasExecutionError &&
+    (hasMessage("execution_interrupted") || statusStr === "interrupted" || statusStr === "cancelled" || statusStr === "canceled");
 
   // Terminal ONLY when ComfyUI marks the prompt done. `status_str:"error"` is a
   // terminal failure; `status_str:"success"` or `completed:true` is a terminal
   // success. Anything else (still running, or an entry without a terminal status)
   // is NOT reconcilable yet — leave it pending so a later reconnect retries.
-  const isError = statusStr === "error";
-  const isSuccess = !isError && (statusStr === "success" || completedFlag);
-  const terminal = isError || isSuccess;
+  const isError = !isInterrupted && statusStr === "error";
+  const isSuccess = !isError && !isInterrupted && (statusStr === "success" || completedFlag);
+  const terminal = isError || isSuccess || isInterrupted;
 
   const images = [];
   const videos = [];
@@ -58,7 +69,7 @@ export function parseHistoryEntry(entry, { isVideo } = {}) {
 
   return {
     terminal,
-    status: isError ? "error" : isSuccess ? "success" : "unknown",
+    status: isError ? "error" : isInterrupted ? "interrupted" : isSuccess ? "success" : "unknown",
     images,
     videos,
   };
