@@ -4321,14 +4321,30 @@ function assertGraphBoundToActiveWorkflow(
   // tab's stale canvas — re-stamping either would authorize writes to a graph
   // that is not the active workflow's (r4/r5 P0). The remedy for a genuinely
   // drifted binding the tracker cannot prove is panel_open_workflow's proven
-  // repaint re-stamp.
+  // repaint re-stamp. The ONE exception is the both-empty stale tag below
+  // (#565): with zero nodes on either side there is no content to protect.
   let rootUuidMismatch = graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid });
   if (rootUuidMismatch) {
     const rootUuid = rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD];
     const rootTagClaimedByActiveWorkflow =
       !!activeWorkflow && workflowOwnsRootUuidTag(activeWorkflow, rootUuid);
+    // #565 — a leftover tag on a SHARED, reused app.graph is stale metadata
+    // when NEITHER side holds any nodes: ComfyUI's clear/configure does not
+    // reset graph.extra, so a brand-new blank tab inherits the PREVIOUS
+    // workflow's root tag while minting its own identity. With zero content
+    // on both sides there is no foreign canvas to protect (the #349 fence
+    // protects CONTENT), so the tag is re-stamped with the active identity
+    // instead of hard-blocking every graph tool on an empty canvas. The
+    // root's node array must be a PRESENT empty array (a partial frontend
+    // that hides _nodes stays fail-closed), and the both-empty requirement
+    // keeps the #389 case (empty root while the workflow reports N>0 nodes)
+    // failing closed via the baseline read guard below.
+    const staleTagOnEmptyCanvas =
+      Array.isArray(rootGraph?._nodes) &&
+      rootGraph._nodes.length === 0 &&
+      activeWorkflowNodeCount(activeWorkflow) === 0;
     if (
-      resolveGraphRootUuidRebind({ rootGraph, activeWorkflowUuid, rootTagClaimedByActiveWorkflow }) === "rebind"
+      resolveGraphRootUuidRebind({ rootGraph, activeWorkflowUuid, rootTagClaimedByActiveWorkflow, staleTagOnEmptyCanvas }) === "rebind"
     ) {
       try {
         const extra =
@@ -4354,17 +4370,30 @@ function assertGraphBoundToActiveWorkflow(
     requireDirtyMutationBinding &&
     activeWorkflow?.isModified === true &&
     !graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid });
+  const rootShapeMismatch = graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow });
+  const baselineReadDesync =
+    currentStateTrustworthy &&
+    includeBaselineReadGuard &&
+    graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph });
   if (
     rootUuidMismatch ||
     dirtyMutationBindingUnproven ||
-    graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow }) ||
-    (currentStateTrustworthy &&
-      includeBaselineReadGuard &&
-      graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph }))
+    rootShapeMismatch ||
+    baselineReadDesync
   ) {
+    // #565 — name the firing predicate. All four branches used to throw the
+    // identical text, so a misfiring guard was undiagnosable and the only
+    // available response was a blind reload/re-open retry loop.
+    const reason = rootUuidMismatch
+      ? "root-workflow-uuid-mismatch"
+      : dirtyMutationBindingUnproven
+        ? "dirty-mutation-binding-unproven"
+        : rootShapeMismatch
+          ? "root-shape-mismatch"
+          : "root-node-count-desync";
     const expected = activeWorkflowNodeCount(activeWorkflow);
     throw new Error(
-      `The live graph is out of sync with the active workflow: the workflow reports ${expected} node(s), ` +
+      `[${reason}] The live graph is out of sync with the active workflow: the workflow reports ${expected} node(s), ` +
         `but the canvas is bound to a different graph. A load, tab switch, or reconnect left this command ` +
         `pointed at the wrong canvas, so it was NOT applied. Re-open the active workflow tab ` +
         `(panel_open_workflow) or reload the panel to rebind the graph, then retry.`,
