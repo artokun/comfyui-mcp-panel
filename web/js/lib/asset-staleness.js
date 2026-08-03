@@ -12,6 +12,8 @@
  *      the class def wasn't matched at load, even though the live def names them. (#199)
  */
 
+import { parseAnnotatedFilepath } from "./input-asset.js";
+
 const UNKNOWN_WIDGET_RE = /^UNKNOWN(_\d+)?$/;
 
 // A canonical RFC-4122-shaped UUID, as ComfyUI mints for subgraph ids. The strict
@@ -161,25 +163,72 @@ export function assetCandidateStillReferenced(rootGraph, nodeId, file) {
  * combo — i.e. the server already knows the file and the store entry is stale.
  * Fails CLOSED (returns false / "keep it") on any unexpected shape, so a genuinely
  * missing model is never silently swallowed.
+ *
+ * The store's `widgetName` can blame the WRONG widget: a save corrupted by a
+ * node-signature change (widget-shift) records the filename under an unrelated
+ * widget like `control_after_generate`, whose combo can never contain a filename.
+ * After the agent/user repairs the node, the file lives in a DIFFERENT widget
+ * (e.g. `upscale_model_name`) — the same widget that keeps the candidate alive
+ * via assetCandidateStillReferenced's node-wide scan. So once the named-widget
+ * check fails, every widget whose CURRENT value literally holds the file is
+ * consulted too: kept by a node-WIDE check must mean clearable by a node-wide
+ * check, or a fully-fixed node reports a phantom missing model until reload
+ * (#569). The widened clear path stays fail-closed — it reads only combos the
+ * caller has gated as TRUSTED (fresh /object_info), and a genuinely-absent file
+ * is never offered by a fresh combo, so no genuine miss can be suppressed.
+ *
+ * Annotated values (`file.png [input]`/`[output]`/`[temp]`, #743) are classified
+ * with parseAnnotatedFilepath BEFORE any combo probing: an `[output]`/`[temp]`
+ * value resolves against a root the input combo NEVER enumerates, so the combo
+ * has no verdict on it at all — it fails CLOSED here and is left to the #743
+ * /view server probe. Only an UNANNOTATED value (exact raw membership) or an
+ * `[input]`-annotated one (its stripped bare name) may be combo-cleared: both
+ * resolve against the very input root the combo enumerates.
  */
 export function assetCandidateResolvesLive(rootGraph, nodeId, file, widgetName) {
   try {
     if (nodeId == null || !file) return false;
     const node = findNodeByScopedId(rootGraph, nodeId);
     if (!node || !Array.isArray(node.widgets)) return false;
-    const w = widgetName
-      ? node.widgets.find((x) => x?.name === widgetName)
-      : node.widgets.find((x) => Array.isArray(x?.options?.values));
-    if (!w) return false;
-    const raw = w.options?.values;
-    const list = typeof raw === "function" ? raw(w, node) : raw;
+    // Annotation classification comes FIRST (codex P1): a value that parses as
+    // [output]/[temp]-annotated resolves as its STRIPPED name in the output/temp
+    // root via folder_paths.annotated_filepath. A combo entry that literally
+    // ends with "[output]"/"[temp]" is just a weird input-root filename — even
+    // an EXACT-looking hit proves nothing about the annotated value, so it must
+    // never clear the candidate. Those stay flagged for the #743 /view probe.
+    const parsed = parseAnnotatedFilepath(file);
+    if (parsed.annotated && parsed.type !== "input") return false;
     // EXACT membership only. A subfolder-registered model (Impact Subpack's
     // `segm/yolov8m-seg.pt`, #407) is listed by /object_info with the SAME separator
     // the widget value carries, so an exact match resolves it once the combo is
     // trusted (the get_errors authoritative refresh) — no separator normalization,
     // which on POSIX could equate a literal-backslash filename with a distinct
-    // forward-slash one and SUPPRESS a genuine miss.
-    return Array.isArray(list) && list.includes(file);
+    // forward-slash one and SUPPRESS a genuine miss. For an unannotated value
+    // parsed.name === file (the raw exact match); for an [input]-annotated one
+    // the stripped bare name is adjudicable because it resolves against the very
+    // input root the combo enumerates — and the RAW annotated string is NOT
+    // checked: a literal `foo.png [input]` combo entry is a weird filename, not
+    // proof that `foo.png` exists.
+    const comboHasFile = (w) => {
+      if (!w) return false;
+      const raw = w.options?.values;
+      const list = typeof raw === "function" ? raw(w, node) : raw;
+      return Array.isArray(list) && list.includes(parsed.name);
+    };
+    const named = widgetName
+      ? node.widgets.find((x) => x?.name === widgetName)
+      : node.widgets.find((x) => Array.isArray(x?.options?.values));
+    if (comboHasFile(named)) return true;
+    // Widget-shift repair (#569): the blamed widget's own combo can never hold
+    // the file, so also consult the widgets whose CURRENT value literally carries
+    // it — exactly the widgets assetCandidateStillReferenced's node-wide scan
+    // keeps this candidate alive for. A widget still referencing a genuinely
+    // missing file is NOT offered by its fresh combo, so it still flags.
+    for (const w of node.widgets) {
+      if (w === named) continue;
+      if (w?.value === file && comboHasFile(w)) return true;
+    }
+    return false;
   } catch {
     return false;
   }
