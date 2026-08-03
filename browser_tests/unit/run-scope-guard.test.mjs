@@ -218,12 +218,29 @@ test("#572 collectVolatileInputs: a linked value-control TARGET is excluded — 
   assert.ok(!pairs.has("3 steps"), "unrelated inputs stay covered for drift detection");
 });
 
-test("#572 collectVolatileInputs: a FIXED control never mutates, so its target stays drift-covered", () => {
+test("#572 collectVolatileInputs: a FIXED carrier never mutates, so NOTHING is excluded — a mid-window edit to its target refuses as drift", () => {
+  // A "fixed" value-control no-ops at queue time: its linked target's input is
+  // NOT volatile, and neither is the carrier's own. Excluding either would mask
+  // a genuine mid-window user edit (codex r2 — the fixed-ness check must GATE
+  // the exclusion, not follow it).
   const control = { name: "control_after_generate", value: "fixed", beforeQueued() {}, afterQueued() {} };
   const seed = { name: "seed", value: 42, linkedWidgets: [control] };
-  const pairs = collectVolatileInputs({ _nodes: [{ id: 3, widgets: [seed, control] }] });
-  assert.ok(!pairs.has("3 seed"), "fixed ⇒ no queue-time mutation ⇒ a mid-window edit must still read as drift");
-  assert.ok(pairs.has("3 control_after_generate"), "the carrier self-exclusion is unchanged");
+  const graph = { _nodes: [{ id: 3, widgets: [seed, control, { name: "steps", value: 20 }] }] };
+  const pairs = collectVolatileInputs(graph);
+  assert.ok(!pairs.has("3 seed"), "fixed ⇒ the target input stays drift-covered");
+  assert.ok(!pairs.has("3 control_after_generate"), "fixed ⇒ the carrier's own input stays drift-covered too");
+  // Hash level: a user edit to the fixed target's serialized input during the
+  // deferred window MUST mismatch — exactly like any other genuine edit.
+  const volatileInputs = collectVolatileInputs(graph);
+  const atHash = promptContentHash(
+    { "3": { class_type: "KSampler", inputs: { seed: 42, steps: 20 } }, "9": { class_type: "SaveImage", inputs: {} } },
+    volatileInputs,
+  );
+  const edited = promptContentHashFromBody(
+    JSON.stringify({ prompt: { "3": { class_type: "KSampler", inputs: { seed: 777, steps: 20 } }, "9": { class_type: "SaveImage", inputs: {} } } }),
+    volatileInputs,
+  );
+  assert.notEqual(edited, atHash, "a mid-window edit to a FIXED control's target refuses as drift");
 });
 
 test("#572 collectVolatileInputs: the linked-target exclusion reaches nested subgraphs with the colon-path execId", () => {

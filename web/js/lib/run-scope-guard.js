@@ -201,10 +201,11 @@ export function promptContentHashFromBody(bodyText, volatileInputs = null) {
  * partial execution; third-party hooks following the same linkedWidgets
  * convention) false-refused EVERY scoped run as "graph CHANGED" — nothing
  * queued, no concurrent edit. So for each carrier `w` we ALSO exclude every
- * sibling target `t` with `t.linkedWidgets` containing `w` — unless the
- * carrier's mode is the string "fixed", which never mutates (a fixed control
- * leaves the target fully covered, so a genuine mid-window user edit to it is
- * still detected as drift).
+ * sibling target `t` with `t.linkedWidgets` containing `w`. A carrier whose
+ * value is the string "fixed" never mutates anything, so the fixed-ness check
+ * GATES the exclusion (codex r2): a fixed carrier excludes NOTHING — not its
+ * own input, not its target's — and a mid-window user edit to either still
+ * refuses as drift.
  *
  * ACCEPTED RESIDUAL (codex gate, documented deliberately): the exclusion is
  * narrowed to exactly the input(s) the hook mutates — each linked target's own
@@ -233,11 +234,15 @@ export function collectVolatileInputs(rootGraph) {
       const widgets = node.widgets ?? [];
       for (const w of widgets) {
         if (typeof w?.beforeQueued !== "function") continue;
+        // A "fixed" value-control no-ops at queue time: NEITHER its own input
+        // NOR its linked target is volatile. The fixed-ness check must GATE the
+        // exclusion, not follow it — excluding anything for a fixed carrier
+        // would mask a genuine mid-window user edit as drift-blind (codex r2).
+        if (w.value === "fixed") continue;
         // The carrier's own input (third-party hooks that mutate their own
         // serialized value; a no-op for the serialize:false stock control).
         addPair(execId, w.name);
         // #572 — the serialized TARGET(s) of a linked value-control hook.
-        if (w.value === "fixed") continue;
         for (const t of widgets) {
           if (Array.isArray(t?.linkedWidgets) && t.linkedWidgets.includes(w)) {
             addPair(execId, t.name);
