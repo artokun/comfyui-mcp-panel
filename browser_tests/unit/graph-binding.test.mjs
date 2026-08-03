@@ -1501,6 +1501,34 @@ test("#557 r4 control: a GENUINE save-swap successor still carries the pre-save 
   assert.equal(owners.get("uuid-A"), successor, "the successor becomes the uuid's registered owner");
 });
 
+test("#566: a FIRST-SAVE swap (temp tab saved under a real name) carries the identity to the saved successor", async () => {
+  // The #566 first-save shape: a never-persisted "Unsaved Workflow" tab is saved
+  // under a real name — the successor lives at a DIFFERENT path, and the save
+  // CONSUMED the temp predecessor (no ghost tab). The temp tab's identity must
+  // continue onto the saved successor, not die with the consumed tab.
+  const successor = {
+    isPersisted: true,
+    path: "workflows/XYR_SH01_v001.json", // the first save's real file — a NEW path
+    changeTracker: {
+      activeState: { ...state(27), extra: { comfyui_mcp: { workflow_uuid: "uuid-A" } } },
+    },
+  };
+  const { save, svc, objectUuids, owners } = buildProgrammaticSaveHarness({
+    onSave: ({ svc }) => {
+      svc.openWorkflows = [successor]; // the first save CONSUMED the temp predecessor (#566)
+      svc.activeWorkflow = successor;
+      return { producedRecord: successor }; // the trio's produced record IS the successor (r10)
+    },
+  });
+  await save();
+  assert.equal(
+    objectUuids.get(successor),
+    "uuid-A",
+    "the saved successor inherits the temp tab's pre-save identity",
+  );
+  assert.equal(owners.get("uuid-A"), successor, "the successor becomes the uuid's registered owner");
+});
+
 test("#349 r7 P0: a successor with an established CONFLICTING identity is not overwritten by the carry", async () => {
   // The successor proves continuity (its tracker carries the pre-save uuid),
   // but it ALREADY has an established, different WeakMap identity — a
