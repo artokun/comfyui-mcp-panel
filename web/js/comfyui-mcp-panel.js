@@ -177,6 +177,7 @@ import {
 } from "./lib/control-after-generate.js";
 import { autoMatchSlots, slotDiagnostic } from "./lib/connect-match.js";
 import { isLinkPersisted, removePhantomLink, isWidgetBackedInput } from "./lib/connect-verify.js";
+import { deferChangeTrackerSnapshot } from "./lib/change-tracker-snapshot.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
 import { isImeComposing } from "./lib/ime.js";
 import { installGraphToPromptNullSafety } from "./lib/widget-null-safety.js";
@@ -11578,6 +11579,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         }
         const settleRid = commandRidLedger.begin(msg.rid, fingerprint, commandEpoch);
         let reply;
+        // #581 — retain the tracker belonging to the command's completed edit.
+        // We schedule its full-graph serialization only after the bridge reply
+        // has been handed to the socket below, so a large nested subgraph cannot
+        // turn an already-applied graph_connect into a false timeout.
+        let changeTrackerToSnapshot = null;
         try {
           let result;
           if (msg.cmd === "ask_user") {
@@ -11800,12 +11806,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // mutations were invisible to undo (Ctrl+Z did nothing). An explicit
             // checkState() after each successful command pushes the pre-command
             // state onto the undo queue; it diffs first, so read-only commands
-            // (get_state, screenshot, dry_run) are free no-ops.
-            try {
-              app.extensionManager?.workflow?.activeWorkflow?.changeTracker?.checkState?.();
-            } catch {
-              /* tracker unavailable (older frontend) — undo stays best-effort */
-            }
+            // (get_state, screenshot, dry_run) are free no-ops. The snapshot can
+            // serialize a whole nested graph, so capture it now but defer the work
+            // until after the correlated reply is delivered (#581).
+            changeTrackerToSnapshot = app.extensionManager?.workflow?.activeWorkflow?.changeTracker ?? null;
           }
           reply = { rid: msg.rid, ok: true, result };
         } catch (err) {
@@ -11841,6 +11845,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           // becomes a claim about what the caller received — only `applied` is that.
           markOpenReceiptReplySent(openReceipts, msg.rid);
         }
+        deferChangeTrackerSnapshot(changeTrackerToSnapshot);
         if (superseded) return;
         // ask_user / request_secret paint their OWN cards and their replies carry
         // user input (a choice, or a SECRET) — never echo them as an activity card
