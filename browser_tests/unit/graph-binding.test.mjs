@@ -18,6 +18,7 @@ import { dirname, join } from "node:path";
 import {
   activeWorkflowNodeCount,
   activeWorkflowProvenEmpty,
+  graphEmptyBindingUnproven,
   graphReadDesynced,
   graphRootMismatchesActiveWorkflow,
   graphRootProvenEmpty,
@@ -250,6 +251,7 @@ function buildDirtyStaleRouteHarness({
     "graphRootWorkflowUuidMatches",
     "graphRootMismatchesActiveWorkflow",
     "graphReadDesynced",
+    "graphEmptyBindingUnproven",
     "activeWorkflowNodeCount",
     "activeWorkflowProvenEmpty",
     "graphRootProvenEmpty",
@@ -267,6 +269,7 @@ function buildDirtyStaleRouteHarness({
     graphRootWorkflowUuidMatches,
     graphRootMismatchesActiveWorkflow,
     graphReadDesynced,
+    graphEmptyBindingUnproven,
     activeWorkflowNodeCount,
     activeWorkflowProvenEmpty,
     graphRootProvenEmpty,
@@ -2487,5 +2490,174 @@ test("#389: the guard names the root-node-count-desync predicate when the canvas
     () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: true }),
     /\[root-node-count-desync\]/,
     "the #389 baseline read guard still fires, and now says so",
+  );
+});
+
+// ── #560 (2nd reopen): the FALSE-EMPTY authoritative read ────────────────────
+// After a reconnect + tab switch (or a failed workflow_open repaint), the
+// shared app.graph object is observed MID-POPULATION: _nodes empty, no root
+// tag, and the tracker unreadable/not yet settled. Every legacy predicate is
+// inconclusive there (desync needs a POSITIVE tracker count; the shape guard
+// skips both-empty; the UUID guards skip a missing tag), so graph_outline
+// returned node_count 0 as authoritative for a canvas known to hold 10 nodes
+// — and the agent built ~70 nodes on the false reading (#349-class). An empty
+// ROOT read must distinguish PROVEN-empty from not-yet-populated.
+
+test("#560 r2 graphEmptyBindingUnproven: truth table — inconclusive only when empty + unproven + unbound", () => {
+  const bareRoot = { _nodes: [] };
+  const taggedRoot = { _nodes: [], extra: { comfyui_mcp: { workflow_uuid: "uuid-A" } } };
+  const noTracker = { isModified: false };
+  const malformedTracker = { isModified: false, changeTracker: { activeState: "garbage" } };
+  const dirtyTracker = { isModified: true, changeTracker: { activeState: { nodes: [{ id: 1 }] } } };
+  const provenEmpty = {
+    isModified: false,
+    changeTracker: { activeState: { nodes: [], links: [], groups: [], config: {} } },
+  };
+  // The mid-load / failed-repaint / post-reconnect window: INCONCLUSIVE.
+  assert.equal(
+    graphEmptyBindingUnproven({ graph: bareRoot, rootGraph: bareRoot, activeWorkflow: noTracker, activeWorkflowUuid: "uuid-A" }),
+    true,
+    "tracker entirely absent — an empty read cannot be authoritative",
+  );
+  assert.equal(
+    graphEmptyBindingUnproven({ graph: bareRoot, rootGraph: bareRoot, activeWorkflow: malformedTracker, activeWorkflowUuid: "uuid-A" }),
+    true,
+    "malformed tracker state — same blind window",
+  );
+  assert.equal(
+    graphEmptyBindingUnproven({ graph: bareRoot, rootGraph: bareRoot, activeWorkflow: dirtyTracker, activeWorkflowUuid: "uuid-A" }),
+    true,
+    "a dirty tracker cannot prove emptiness (#545 lag) and the root is unbound",
+  );
+  // PROVEN genuinely empty: node_count 0 is the TRUTH.
+  assert.equal(
+    graphEmptyBindingUnproven({ graph: bareRoot, rootGraph: bareRoot, activeWorkflow: provenEmpty, activeWorkflowUuid: "uuid-A" }),
+    false,
+    "clean + well-formed all-empty state ⇒ a truthful empty read",
+  );
+  // POSITIVELY bound (root tag matches the active identity): the known #545
+  // availability case — a manual/agent clear on a bound canvas, tracker lagging.
+  assert.equal(
+    graphEmptyBindingUnproven({ graph: taggedRoot, rootGraph: taggedRoot, activeWorkflow: dirtyTracker, activeWorkflowUuid: "uuid-A" }),
+    false,
+    "a positively-bound canvas stays availability-oriented",
+  );
+  // Populated root: self-evidently bound; other guards own it.
+  const populated = { _nodes: [{ id: 1 }] };
+  assert.equal(
+    graphEmptyBindingUnproven({ graph: populated, rootGraph: populated, activeWorkflow: noTracker, activeWorkflowUuid: "uuid-A" }),
+    false,
+    "a populated canvas can never false-read empty",
+  );
+  // Subgraph scope: a descended empty subgraph is legitimate scope content.
+  assert.equal(
+    graphEmptyBindingUnproven({ graph: { _nodes: [] }, rootGraph: bareRoot, activeWorkflow: noTracker, activeWorkflowUuid: "uuid-A" }),
+    false,
+    "descended subgraph scope is exempt (mirrors the baseline desync guard)",
+  );
+  // No workflow service at all: the legacy availability path — this frontend
+  // never had binding fences, so an empty canvas keeps reading as empty.
+  assert.equal(
+    graphEmptyBindingUnproven({ graph: bareRoot, rootGraph: bareRoot, activeWorkflow: null, activeWorkflowUuid: null }),
+    false,
+    "no workflow service ⇒ legacy behavior preserved",
+  );
+  // An UNREADABLE root (no _nodes array) stays with the legacy predicates.
+  assert.equal(
+    graphEmptyBindingUnproven({ graph: {}, rootGraph: {}, activeWorkflow: noTracker, activeWorkflowUuid: "uuid-A" }),
+    false,
+    "an unobservable root is not this predicate's case",
+  );
+});
+
+test("#560 r2: the read guard throws [empty-binding-unproven] for the mid-population window — never a false-empty read", () => {
+  for (const [label, activeTracker] of [
+    ["tracker absent", null],
+    ["tracker malformed", { activeState: "garbage" }],
+  ]) {
+    const h = buildDirtyStaleRouteHarness({
+      rootUuid: null, // no binding tag: the shared root mid-population / failed repaint
+      foreignClaim: "none",
+      activeNodeCount: 10, // (unused — the injected tracker below replaces the default)
+      rootNodeCount: 0,
+      activeModified: false,
+      activeTracker,
+    });
+    assert.throws(
+      () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: true }),
+      (err) => {
+        assert.match(err.message, /\[empty-binding-unproven\]/);
+        assert.match(err.message, /FALSE-EMPTY/i);
+        assert.match(err.message, /Retry in a moment/i);
+        assert.doesNotMatch(err.message, /out of sync/, "this is inconclusive, not a wrong-canvas verdict");
+        return true;
+      },
+      `${label}: the empty root is inconclusive, never authoritative-empty`,
+    );
+  }
+});
+
+test("#560 r2: a populated tracker verdict still wins over the empty-binding check (desync ordering)", () => {
+  // The tracker positively reports 10 nodes against an empty root: the #389
+  // desync is the louder, more specific error and must keep firing FIRST
+  // (malformed activeState so the shape guard stays inconclusive, exactly the
+  // existing #389 naming test's shape).
+  const h = buildDirtyStaleRouteHarness({
+    rootUuid: null,
+    foreignClaim: "none",
+    rootNodeCount: 0,
+    activeModified: false,
+    activeTracker: { activeState: { nodes: "bad" }, initialState: state(10) },
+  });
+  assert.throws(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: true }),
+    /\[root-node-count-desync\]/,
+  );
+});
+
+test("#560 r2: a PROVEN-empty canvas still reads truthfully (no false refusal) — and a bound empty canvas stays editable", () => {
+  const h = buildDirtyStaleRouteHarness({
+    rootUuid: null,
+    foreignClaim: "none",
+    rootNodeCount: 0,
+    activeModified: false,
+    activeTracker: { activeState: { nodes: [], links: [], groups: [], config: {} } },
+    rootSerializer: () => ({ nodes: [], links: [], groups: [], config: {} }),
+  });
+  assert.doesNotThrow(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: true }),
+    "clean tracker + well-formed all-empty state ⇒ the empty read is authoritative",
+  );
+  // The #545 availability case: the root is positively bound to the active
+  // identity (tag match), so even a dirty, lagging tracker keeps the cleared
+  // canvas readable/editable — only UNBOUND emptiness is inconclusive.
+  const bound = buildDirtyStaleRouteHarness({
+    rootUuid: "workflow-A-1", // the harness resolver's first deterministic mint
+    foreignClaim: "none",
+    rootNodeCount: 0,
+    activeModified: true, // dirty tracker — cannot prove, but the binding is positive
+  });
+  assert.doesNotThrow(
+    () => bound.assertBound(bound.rootB, bound.rootB, { includeBaselineReadGuard: true }),
+    "positively-bound empty canvas: reads stay availability-oriented (#545)",
+  );
+  assert.doesNotThrow(
+    () => bound.assertBound(bound.rootB, bound.rootB, { includeBaselineReadGuard: false, requireDirtyMutationBinding: true }),
+    "…and mutations too (the agent's clear-and-rebuild flow)",
+  );
+});
+
+test("#560 r2: mutations are fenced against the false-empty window exactly like reads", () => {
+  const h = buildDirtyStaleRouteHarness({
+    rootUuid: null,
+    foreignClaim: "none",
+    rootNodeCount: 0,
+    activeModified: false,
+    activeTracker: null,
+  });
+  assert.throws(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: false, requireDirtyMutationBinding: true }),
+    /\[empty-binding-unproven\]/,
+    "graph_add_node on a mid-population canvas is refused, not applied to a false-empty graph",
   );
 });
