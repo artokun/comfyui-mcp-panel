@@ -9,6 +9,7 @@ import {
   uploadInputConfig,
   uploadInputAccepts,
   splitInputAssetRef,
+  parseAnnotatedFilepath,
   filterServerConfirmedInputSubfolderCandidates,
   inputPathsUseWindowsSeparators,
   addComboOption,
@@ -210,6 +211,190 @@ test("#513 review: Windows server — a backslash value splits and probes as nes
   );
   assert.deepEqual(probes, ["dir\\mask.png"]);
   assert.deepEqual(result, []);
+});
+
+test("parseAnnotatedFilepath: strips [output]/[input]/[temp] and keeps the subfolder intact", () => {
+  assert.deepEqual(parseAnnotatedFilepath("detailed/Anima_00005_.png [output]"), {
+    name: "detailed/Anima_00005_.png",
+    type: "output",
+    annotated: true,
+  });
+  assert.deepEqual(parseAnnotatedFilepath("clip.mp4 [temp]"), {
+    name: "clip.mp4",
+    type: "temp",
+    annotated: true,
+  });
+  assert.deepEqual(parseAnnotatedFilepath("sub/pic.png [input]"), {
+    name: "sub/pic.png",
+    type: "input",
+    annotated: true,
+  });
+});
+
+test("parseAnnotatedFilepath: unannotated defaults to input; lookalikes are untouched", () => {
+  assert.deepEqual(parseAnnotatedFilepath("plain.png"), {
+    name: "plain.png",
+    type: "input",
+    annotated: false,
+  });
+  // An unknown root is not ComfyUI's annotation shape — treated as a literal name.
+  assert.deepEqual(parseAnnotatedFilepath("odd.png [output2]"), {
+    name: "odd.png [output2]",
+    type: "input",
+    annotated: false,
+  });
+  // Brackets mid-name are not a suffix annotation.
+  assert.deepEqual(parseAnnotatedFilepath("a [output] b.png"), {
+    name: "a [output] b.png",
+    type: "input",
+    annotated: false,
+  });
+});
+
+test("parseAnnotatedFilepath: UNSPACED suffix is still an annotation (upstream endswith + fixed slice)", () => {
+  // folder_paths.annotated_filepath recognizes the suffix with NO preceding
+  // space and slices a FIXED 9/8/7 chars — one more than the bracketed suffix —
+  // so an unspaced value loses one trailing filename char too. Quirky, but it is
+  // the exact path LoadImage resolves, so the probe must mirror it.
+  assert.deepEqual(parseAnnotatedFilepath("foo[output]"), {
+    name: "fo", // "foo[output]"[:-9]
+    type: "output",
+    annotated: true,
+  });
+  assert.deepEqual(parseAnnotatedFilepath("clip[temp]"), {
+    name: "cli", // "clip[temp]"[:-7]
+    type: "temp",
+    annotated: true,
+  });
+  assert.deepEqual(parseAnnotatedFilepath("sub/pic.png[input]"), {
+    name: "sub/pic.pn", // "sub/pic.png[input]"[:-8]
+    type: "input",
+    annotated: true,
+  });
+});
+
+test("parseAnnotatedFilepath: a bare suffix (or suffix+1 char) clamps to an empty name, like Python", () => {
+  // name[:-N] past the string start yields "" in Python; JS slice must clamp the
+  // same way rather than eat a trailing char.
+  assert.deepEqual(parseAnnotatedFilepath("[output]"), { name: "", type: "output", annotated: true });
+  assert.deepEqual(parseAnnotatedFilepath("[input]"), { name: "", type: "input", annotated: true });
+  assert.deepEqual(parseAnnotatedFilepath("[temp]"), { name: "", type: "temp", annotated: true });
+  assert.deepEqual(parseAnnotatedFilepath("x[temp]"), { name: "", type: "temp", annotated: true });
+});
+
+test("#743: [output]-annotated path with subfolder and an EXISTING file is NOT reported missing", async () => {
+  const candidate = { node_id: 1363, file: "detailed/Anima_00005_.png [output]" };
+  const probes = [];
+  const result = await filterServerConfirmedInputSubfolderCandidates(
+    [candidate],
+    async (file, ref) => {
+      probes.push({ file, ref });
+      return true; // server confirms <output>/detailed/Anima_00005_.png
+    },
+  );
+  assert.deepEqual(result, []);
+  // The probe must target the OUTPUT root with the annotation STRIPPED and the
+  // subfolder intact — not a literal "[output]"-suffixed name under input/.
+  assert.deepEqual(probes, [
+    {
+      file: "detailed/Anima_00005_.png [output]",
+      ref: { filename: "Anima_00005_.png", subfolder: "detailed", type: "output" },
+    },
+  ]);
+});
+
+test("#743: [output]-annotated path that is genuinely ABSENT is still reported", async () => {
+  const candidate = { node_id: 1363, file: "detailed/Anima_99999_.png [output]" };
+  const result = await filterServerConfirmedInputSubfolderCandidates(
+    [candidate],
+    async () => false, // /view?type=output 404s
+  );
+  assert.deepEqual(result, [candidate]);
+});
+
+test("#743: [input]-annotated nested path is probed against the input root", async () => {
+  const candidate = { node_id: 7, file: "uploads/pic.png [input]" };
+  const probes = [];
+  const result = await filterServerConfirmedInputSubfolderCandidates(
+    [candidate],
+    async (file, ref) => {
+      probes.push(ref);
+      return true;
+    },
+  );
+  assert.deepEqual(result, []);
+  assert.deepEqual(probes, [{ filename: "pic.png", subfolder: "uploads", type: "input" }]);
+});
+
+test("#743: [temp]-annotated path is probed against the temp root", async () => {
+  const candidate = { node_id: 8, file: "scratch/frame.png [temp]" };
+  const probes = [];
+  const result = await filterServerConfirmedInputSubfolderCandidates(
+    [candidate],
+    async (file, ref) => {
+      probes.push(ref);
+      return true;
+    },
+  );
+  assert.deepEqual(result, []);
+  assert.deepEqual(probes, [{ filename: "frame.png", subfolder: "scratch", type: "temp" }]);
+});
+
+test("#743: ROOT-LEVEL annotated value is probed too — the combo never lists the annotated form", async () => {
+  const candidate = { node_id: 9, file: "ComfyUI_00001_.png [output]" };
+  const probes = [];
+  const result = await filterServerConfirmedInputSubfolderCandidates(
+    [candidate],
+    async (file, ref) => {
+      probes.push(ref);
+      return true;
+    },
+  );
+  assert.deepEqual(result, []);
+  assert.deepEqual(probes, [{ filename: "ComfyUI_00001_.png", subfolder: "", type: "output" }]);
+});
+
+test("#743: a failed probe keeps an annotated candidate reported (fail-closed)", async () => {
+  const candidate = { node_id: 10, file: "detailed/Anima_00005_.png [output]" };
+  const result = await filterServerConfirmedInputSubfolderCandidates(
+    [candidate],
+    async () => {
+      throw new Error("offline");
+    },
+  );
+  assert.deepEqual(result, [candidate]);
+});
+
+test("#743: annotation is stripped BEFORE the Windows backslash split", async () => {
+  const candidate = { node_id: 11, file: "detailed\\Anima_00005_.png [output]" };
+  const probes = [];
+  const result = await filterServerConfirmedInputSubfolderCandidates(
+    [candidate],
+    async (file, ref) => {
+      probes.push(ref);
+      return true;
+    },
+    { backslashIsSeparator: true },
+  );
+  assert.deepEqual(result, []);
+  assert.deepEqual(probes, [{ filename: "Anima_00005_.png", subfolder: "detailed", type: "output" }]);
+});
+
+test("#743: UNSPACED root-level [output] value is probed against the output root, not skipped", async () => {
+  // "foo.png[output]" is an annotation to ComfyUI (bare endswith) resolving as
+  // "foo.pn" in the output root (fixed 9-char slice). A space-requiring parser
+  // would misread it as a plain input value and skip the probe entirely.
+  const candidate = { node_id: 12, file: "foo.png[output]" };
+  const probes = [];
+  const result = await filterServerConfirmedInputSubfolderCandidates(
+    [candidate],
+    async (file, ref) => {
+      probes.push(ref);
+      return true;
+    },
+  );
+  assert.deepEqual(result, []);
+  assert.deepEqual(probes, [{ filename: "foo.pn", subfolder: "", type: "output" }]);
 });
 
 test("addComboOption adds a value to an array-backed combo in place", () => {

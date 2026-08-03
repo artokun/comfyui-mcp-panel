@@ -153,6 +153,42 @@ export function splitInputAssetRef(value, { backslashIsSeparator = true } = {}) 
   return { subfolder: v.slice(0, i), filename: v.slice(i + 1) };
 }
 
+// ComfyUI's annotated-filepath suffixes, recognized EXACTLY the way
+// folder_paths.annotated_filepath does (folder_paths.py): a bare endswith()
+// check — NO preceding space required — followed by a FIXED-length slice of
+// suffix+1 chars (9/8/7 for output/input/temp, one more than
+// "[output]"/"[input]"/"[temp]" so the usual separating space goes too). The
+// extra char is sliced UNCONDITIONALLY: an unspaced `foo[output]` resolves as
+// `fo` in the output root — quirky, but it is precisely the path LoadImage will
+// resolve, so the probe must check that same file. Lookalikes (`[output2]`) and
+// mid-string brackets are not suffixes and stay unannotated.
+const ANNOTATED_SUFFIXES = [
+  ["[output]", "output", 9],
+  ["[input]", "input", 8],
+  ["[temp]", "temp", 7],
+];
+
+/**
+ * Strip ComfyUI's `[output]` / `[input]` / `[temp]` annotation off a media
+ * widget value, mirroring `folder_paths.annotated_filepath`: returns the bare
+ * `name` (any subfolder prefix INTACT — the annotation selects the ROOT, it is
+ * not part of the path) and the `type` root it resolves against. An unannotated
+ * value defaults to `input`, exactly like ComfyUI. `annotated` tells callers the
+ * suffix was really there — an annotated value can NEVER be adjudicated by the
+ * loader combo, which only lists bare input-dir filenames (#743).
+ */
+export function parseAnnotatedFilepath(value) {
+  const raw = String(value ?? "");
+  for (const [suffix, type, sliceLen] of ANNOTATED_SUFFIXES) {
+    if (raw.endsWith(suffix)) {
+      // Python's name[:-N] clamps to "" when the slice exceeds the string;
+      // Math.max keeps JS slice(0, -k) from instead eating a trailing char.
+      return { name: raw.slice(0, Math.max(raw.length - sliceLen, 0)), type, annotated: true };
+    }
+  }
+  return { name: raw, type: "input", annotated: false };
+}
+
 /**
  * Interpret a ComfyUI `/system_stats` payload for the input-path split above.
  * `system.os` is Python's `sys.platform` on ComfyUI ≥ 0.4.0 — "win32" on
@@ -176,15 +212,26 @@ export function inputPathsUseWindowsSeparators(systemStats) {
 }
 
 /**
- * Remove missing-media candidates for NESTED input files the server confirms are
- * present. ComfyUI's LoadImage combo only lists files at the input root, while
- * its validator can load `subfolder/file.png`; exact combo membership therefore
- * cannot adjudicate these candidates (#513).
+ * Remove missing-media candidates the server confirms are present. Two value
+ * shapes the live combo can NEVER adjudicate (#513, #743):
  *
- * `confirmServerAsset(value)` is injected by the panel because this pure module
- * must not own a ComfyUI API client. The helper fails CLOSED: an unavailable,
- * rejected, or throwing probe keeps the original candidate reported. Root-level
- * values are not probed because the live combo is already authoritative there.
+ *   1. NESTED input files — ComfyUI's LoadImage combo only lists files at the
+ *      input root, while its validator can load `subfolder/file.png`.
+ *   2. ANNOTATED values — `sub/file.png [output]` / `[temp]` / `[input]` carry
+ *      the root they resolve against (folder_paths.annotated_filepath); the
+ *      combo lists only bare input-dir names, so even a ROOT-LEVEL annotated
+ *      value is never a member. The annotation is stripped BEFORE the
+ *      subfolder/filename split and selects the `/view` `type` root, so an
+ *      existing `detailed/Anima_00005_.png [output]` is probed at
+ *      `<output>/detailed/Anima_00005_.png` instead of 404ing as a literal
+ *      "[output]"-suffixed name under `input/` (#743 false positive).
+ *
+ * `confirmServerAsset(value, ref)` is injected by the panel because this pure
+ * module must not own a ComfyUI API client. `value` is the RAW widget value;
+ * `ref` carries the parsed `{ filename, subfolder, type }` to probe. The helper
+ * fails CLOSED: an unavailable, rejected, or throwing probe keeps the original
+ * candidate reported. Root-level UNANNOTATED values are not probed because the
+ * live combo is already authoritative there.
  *
  * `backslashIsSeparator` must match the SERVER's platform (see splitInputAssetRef):
  * on a POSIX server a `dir\file.png` value is a literal filename, NOT a nested
@@ -203,13 +250,17 @@ export async function filterServerConfirmedInputSubfolderCandidates(
     candidates.map(async (candidate) => {
       const file = candidate?.file;
       if (typeof file !== "string") return candidate;
-      const { subfolder, filename } = splitInputAssetRef(file, { backslashIsSeparator });
-      if (!subfolder || !filename) return candidate;
-      const key = `${subfolder}/${filename}`;
+      const { name, type, annotated } = parseAnnotatedFilepath(file);
+      const { subfolder, filename } = splitInputAssetRef(name, { backslashIsSeparator });
+      if (!filename) return candidate;
+      // The combo adjudicates only bare root-level input names; anything else
+      // (nested, or root-annotated) needs the server probe.
+      if (!annotated && !subfolder) return candidate;
+      const key = `${type}:${subfolder}/${filename}`;
       let probe = probes.get(key);
       if (!probe) {
         probe = Promise.resolve()
-          .then(() => confirmServerAsset(file))
+          .then(() => confirmServerAsset(file, { filename, subfolder, type }))
           .then((present) => present === true, () => false);
         probes.set(key, probe);
       }
