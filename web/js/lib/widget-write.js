@@ -1004,6 +1004,12 @@ export function applyWidgetWrite(
   // that object IN PLACE (e.g. `inner.value.strength = …`), so an identity compare
   // (Object.is) would pass while the restored object holds corrupted fields. We
   // verify rollback STRUCTURALLY against the pre-mutation deep clone instead.
+  // `panel_set_widget` is addressed to the OUTER subgraph widget, even though a
+  // promoted write mutates its inner implementation widget too. Its result must
+  // therefore report the prior value the caller could observe on the requested
+  // outer rail, not the (potentially divergent) inner widget's prior value (#583).
+  // Keep the latter separately for diagnostics; it is not the API-level
+  // `previous` for a promoted request.
   const previous = w.value;
   const previousParent = parentWidget ? parentWidget.value : undefined;
   const deepClone = (v) => (v !== null && typeof v === "object" ? JSON.parse(JSON.stringify(v)) : v);
@@ -1383,10 +1389,11 @@ export function applyWidgetWrite(
   return {
     node_id: targetNode.id,
     widget: w.name,
-    previous,
+    previous: parentWidget ? previousParent : previous,
     value: w.value,
     ...(promotedFrom
       ? {
+          inner_previous: previous,
           promoted_from: {
             ...promotedFrom,
             parent_widget_synced: parentWidget != null,
