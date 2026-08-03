@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 
 import {
   findNodeByScopedId,
+  findVisibleNodeByScopedId,
   findSubgraphByUuid,
   assetCandidateStillReferenced,
   assetCandidateResolvesLive,
@@ -21,6 +22,8 @@ import {
   collectAllGraphs,
   reapplyDefsToLiveNodes,
   collectMissingNodeTypeReasons,
+  collectUnexplainedRedOutlines,
+  combineNodeErrorMaps,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
   collectLinkedNeighborNodeIds,
@@ -99,6 +102,27 @@ test("findNodeByScopedId resolves a REAL locator '<subgraphUuid>:<localId>' (#24
   const sub = subgraphOf(SG_UUID, [inner]);
   const root = rootWithSubgraphs([], [sub]);
   assert.equal(findNodeByScopedId(root, `${SG_UUID}:1913`), inner);
+});
+
+test("findVisibleNodeByScopedId maps a scoped missing asset only onto its displayed subgraph node (#579 P1)", () => {
+  const inner = { id: 6077, has_errors: true, widgets: [{ name: "ckpt_name", value: "gone.safetensors" }] };
+  const sameLocalIdElsewhere = { id: 6077, has_errors: true, widgets: [] };
+  const sub = subgraphOf(SG_UUID, [inner]);
+  const root = rootWithSubgraphs([{ id: 100, subgraph: sub }, sameLocalIdElsewhere], [sub]);
+  const locator = `${SG_UUID}:6077`;
+
+  assert.equal(findVisibleNodeByScopedId(root, [inner], locator), inner);
+  assert.equal(
+    findVisibleNodeByScopedId(root, [sameLocalIdElsewhere], locator),
+    null,
+    "a local-id collision in another scope must not receive the missing-asset reason",
+  );
+  const reasons = new Map([[String(inner.id), [{ kind: "missing_model", file: "gone.safetensors" }]]]);
+  assert.deepEqual(
+    collectUnexplainedRedOutlines([inner], reasons, {}).map((node) => node.id),
+    [],
+    "the real scoped missing asset stays a per-node error, never a stale outline",
+  );
 });
 
 test("findNodeByScopedId returns null when the subgraph UUID is unknown (fails open)", () => {
@@ -674,6 +698,16 @@ test("collectMissingNodeTypeReasons: defensive against malformed inputs (never t
 
 test("graphErrorsResultIsClean: TRUE only for a truly empty result", () => {
   assert.equal(graphErrorsResultIsClean({ errored_count: 0, node_errors: null, last_execution_error: null }), true);
+  assert.equal(
+    graphErrorsResultIsClean({
+      errored_count: 0,
+      node_errors: null,
+      last_execution_error: null,
+      stale_flags: [{ id: 5, red_outline: true }],
+    }),
+    true,
+    "a source-free visual outline is an informational stale flag, not an error",
+  );
   assert.equal(graphErrorsResultIsClean({}), true);
   assert.equal(graphErrorsResultIsClean(null), true);
 });
@@ -755,6 +789,50 @@ test("nodeRedFlagIsStale: FALSE while the node still has a live validation error
 test("nodeRedFlagIsStale: fails toward KEEPING the flag on a null/absent node id", () => {
   assert.equal(nodeRedFlagIsStale(null, {}), false);
   assert.equal(nodeRedFlagIsStale(undefined, {}), false);
+});
+
+test("#579 source-free LiteGraph outlines are warnings, not graph errors", () => {
+  const nodes = [
+    { id: 1, has_errors: true, type: "FastFilmGrain" },
+    { id: 2, has_errors: true, type: "KSampler" },
+    { id: 3, has_errors: false, type: "VAEDecode" },
+  ];
+  const reasons = new Map([["2", [{ kind: "missing_model" }]]]);
+
+  assert.deepEqual(
+    collectUnexplainedRedOutlines(nodes, reasons, { nodeErrors: null, lastExecFailure: null }).map((n) => n.id),
+    [1],
+    "only an unexplained red outline with no run error source is stale",
+  );
+  assert.deepEqual(
+    collectUnexplainedRedOutlines(nodes, reasons, { nodeErrors: { 9: { errors: [{ message: "bad" }] } } }),
+    [],
+    "a live validation source retains conservative error classification",
+  );
+  assert.deepEqual(
+    collectUnexplainedRedOutlines(nodes, reasons, { lastExecFailure: { node_id: 9 } }),
+    [],
+    "a live execution source retains conservative error classification",
+  );
+});
+
+test("combineNodeErrorMaps: an empty app map never masks a live execution-store validation error (#579 P1)", () => {
+  const storeError = { message: "checkpoint is not installed" };
+  const combined = combineNodeErrorMaps([
+    {}, // app.lastNodeErrors may be reset immediately after the rejection
+    { 41: { errors: [storeError] } },
+  ]);
+  assert.deepEqual(combined, { 41: { errors: [storeError] } });
+  assert.deepEqual(
+    combineNodeErrorMaps([{ 41: { errors: [] } }, { 41: { errors: [storeError] } }]),
+    { 41: { errors: [storeError] } },
+    "an empty entry for the same node also cannot overwrite the store's live error",
+  );
+  assert.deepEqual(
+    collectUnexplainedRedOutlines([{ id: 8, has_errors: true }], new Map(), { nodeErrors: combined }),
+    [],
+    "a live store validation source keeps a red outline conservatively classified as an error",
+  );
 });
 
 test("nodeRedFlagIsStale: a NESTED still-missing asset (scoped locator) keeps the flag via resolvesToNode (#418 codex round-3 P0)", () => {

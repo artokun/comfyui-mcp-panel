@@ -119,10 +119,13 @@ import {
   reapplyDefsToLiveNodes,
   refreshComboOptionsFromDefs,
   collectMissingNodeTypeReasons,
+  collectUnexplainedRedOutlines,
+  combineNodeErrorMaps,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
   collectLinkedNeighborNodeIds,
   findNodeByScopedId,
+  findVisibleNodeByScopedId,
   resolveMissingModelDirectory,
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing } from "./lib/node-resolve.js";
@@ -8384,15 +8387,21 @@ const GRAPH_TOOL_EXECUTORS = {
     const missingMedia = assets.media.map((m) => ({ ...m, kind: "missing_media" }));
     const missingNodeTypes = assets.nodeTypes;
     const missingNodeCount = assets.nodeCount;
+    // Missing-asset stores identify nested nodes with a scoped locator, while
+    // the currently viewed subgraph indexes its nodes by their local id. Resolve
+    // only to the exact visible node; otherwise retain the locator so a same-id
+    // node in another subgraph can never receive this error by accident.
+    const reasonNodeId = (locator) =>
+      findVisibleNodeByScopedId(rootGraph, nodes, locator)?.id ?? locator;
     for (const m of assets.models) {
       if (m.node_id == null) continue;
       const { node_id, ...rest } = m;
-      addReason(node_id, { kind: "missing_model", ...rest });
+      addReason(reasonNodeId(node_id), { kind: "missing_model", ...rest });
     }
     for (const m of assets.media) {
       if (m.node_id == null) continue;
       const { node_id, ...rest } = m;
-      addReason(node_id, { kind: "missing_media", ...rest });
+      addReason(reasonNodeId(node_id), { kind: "missing_media", ...rest });
     }
 
     // 2) Uninstalled node TYPES, attached PER NODE (#399). collectMissingAssets only
@@ -8422,8 +8431,10 @@ const GRAPH_TOOL_EXECUTORS = {
     } catch {
       /* optional */
     }
-    const rawNodeErrors = comfy?.lastNodeErrors ?? storeNodeErrors ?? null;
-    const nodeErrors = rawNodeErrors && Object.keys(rawNodeErrors).length ? rawNodeErrors : null;
+    // These are independent live stores. The app map can be an empty object
+    // after a reset while the execution store still retains the actual rejected
+    // prompt, so never let nullish selection make an empty app map mask it.
+    const nodeErrors = combineNodeErrorMaps([comfy?.lastNodeErrors ?? null, storeNodeErrors]);
     if (nodeErrors) {
       for (const [id, entry] of Object.entries(nodeErrors)) {
         for (const e of entry?.errors ?? []) {
@@ -8475,7 +8486,19 @@ const GRAPH_TOOL_EXECUTORS = {
 
     // Red-outlined (has_errors) UNIONed with anything a source blamed — a source
     // can name a node LiteGraph never flagged (every runtime failure is one).
-    const flagged = new Set(nodes.filter((n) => n.has_errors).map((n) => String(n.id)));
+    // A source-free red outline can survive workflow loading even though the
+    // execution and validation sources have both cleared (#579). Surface those
+    // separately as stale visual flags instead of calling them errors. When an
+    // execution source exists, retain the conservative legacy behavior: do not
+    // downgrade an unexplained red outline.
+    const staleRedFlags = collectUnexplainedRedOutlines(nodes, reasons, {
+      nodeErrors,
+      lastExecFailure: execFailure,
+    });
+    const staleRedFlagIds = new Set(staleRedFlags.map((n) => String(n.id)));
+    const flagged = new Set(
+      nodes.filter((n) => n.has_errors && !staleRedFlagIds.has(String(n.id))).map((n) => String(n.id)),
+    );
     for (const id of reasons.keys()) if (byId.has(id)) flagged.add(id);
     const erroredNodes = [...flagged]
       .map((id) => byId.get(id))
@@ -8509,6 +8532,17 @@ const GRAPH_TOOL_EXECUTORS = {
       errored_count: erroredNodes.length,
       nodes: erroredNodes.slice(0, MAX_STATE_NODES),
       ...(erroredNodes.length > MAX_STATE_NODES ? { truncated: true } : {}),
+      ...(staleRedFlags.length
+        ? {
+            stale_flags: staleRedFlags.slice(0, MAX_STATE_NODES).map((n) => ({
+              ...summarizeNode(n),
+              red_outline: true,
+              reasons: [],
+              note: "LiteGraph still shows this red outline, but no current execution, validation, or asset source confirms an error.",
+            })),
+            ...(staleRedFlags.length > MAX_STATE_NODES ? { stale_flags_truncated: true } : {}),
+          }
+        : {}),
       ...(missingModels.length ? { missing_models: missingModels } : {}),
       ...(missingMedia.length ? { missing_media: missingMedia } : {}),
       ...(missingNodeTypes.length ? { missing_node_types: missingNodeTypes } : {}),

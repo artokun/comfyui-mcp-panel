@@ -118,6 +118,22 @@ export function findNodeByScopedId(rootGraph, scopedId) {
 }
 
 /**
+ * Resolve a store locator only when its node is part of the graph currently
+ * being reported. A nested node id is local to its subgraph, so attaching a
+ * `<subgraphUuid>:<localId>` reason directly by string leaves the visible node
+ * looking source-free and can incorrectly classify its red outline as stale.
+ *
+ * Identity (rather than just a matching local id) matters here: different
+ * subgraphs may both contain node `7`. Returning null for a node outside the
+ * visible graph deliberately leaves the caller's original locator untouched,
+ * avoiding a false attribution in the wrong scope.
+ */
+export function findVisibleNodeByScopedId(rootGraph, visibleNodes, scopedId) {
+  const node = findNodeByScopedId(rootGraph, scopedId);
+  return node && Array.isArray(visibleNodes) && visibleNodes.includes(node) ? node : null;
+}
+
+/**
  * True when `scopedId` is a RECOGNIZED locator shape — exactly the shapes
  * `findNodeByScopedId` knows how to resolve:
  *   - a single non-empty segment (plain local id / UUID-like);
@@ -287,6 +303,72 @@ export function nodeRedFlagIsStale(
   } catch {
     return false;
   }
+}
+
+/**
+ * Conservatively union independent frontend validation maps. ComfyUI can clear
+ * `app.lastNodeErrors` while the execution-error store still holds the live
+ * rejection, so choosing the app map with `??` can falsely report a clean
+ * graph. Entries for the same node retain errors from both sources; malformed
+ * entries are preserved rather than used as evidence that no error exists.
+ */
+export function combineNodeErrorMaps(nodeErrorsMaps) {
+  const combined = {};
+  const maps = Array.isArray(nodeErrorsMaps) ? nodeErrorsMaps : [];
+  for (const map of maps) {
+    if (!map || typeof map !== "object" || Array.isArray(map)) continue;
+    for (const [id, entry] of Object.entries(map)) {
+      if (!Object.hasOwn(combined, id)) {
+        combined[id] = entry;
+        continue;
+      }
+      const previous = combined[id];
+      if (previous === entry) continue;
+      const previousObject = previous && typeof previous === "object" && !Array.isArray(previous);
+      const entryObject = entry && typeof entry === "object" && !Array.isArray(entry);
+      if (!previousObject || !entryObject) {
+        // An unexpected entry shape cannot prove the earlier source is clear.
+        // Keep the first one; the map remains non-empty and thus conservative.
+        continue;
+      }
+      const previousErrors = Array.isArray(previous.errors) ? previous.errors : [];
+      const entryErrors = Array.isArray(entry.errors) ? entry.errors : [];
+      const errors = [...previousErrors];
+      for (const error of entryErrors) {
+        if (!errors.includes(error)) errors.push(error);
+      }
+      combined[id] = {
+        ...previous,
+        ...entry,
+        ...(Array.isArray(previous.errors) || Array.isArray(entry.errors) ? { errors } : {}),
+      };
+    }
+  }
+  return Object.keys(combined).length ? combined : null;
+}
+
+/**
+ * Return visual LiteGraph red outlines that have no current source-confirmed
+ * explanation. A saved workflow can retain `has_errors` from an older run even
+ * though both error sources have since been cleared. Those outlines are useful
+ * diagnostic hints, but must not inflate `graph_get_errors.errored_count`.
+ *
+ * This intentionally only classifies when BOTH raw execution sources are
+ * absent. If either source exists, keep the old conservative behavior: an
+ * unexplained outline remains an error rather than being silently downgraded.
+ * `reasons` may be the command's Map or a plain id-keyed object for tests.
+ */
+export function collectUnexplainedRedOutlines(
+  nodes,
+  reasons,
+  { nodeErrors = null, lastExecFailure = null } = {},
+) {
+  if (nodeErrors || lastExecFailure || !Array.isArray(nodes)) return [];
+  const reasonsFor = (nodeId) => {
+    const key = String(nodeId);
+    return reasons instanceof Map ? reasons.get(key) : reasons?.[key];
+  };
+  return nodes.filter((node) => node?.has_errors && !(reasonsFor(node.id)?.length));
 }
 
 /**
