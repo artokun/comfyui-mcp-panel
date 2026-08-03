@@ -227,6 +227,164 @@ test("assetCandidateResolvesLive supports a function-valued combo and fails CLOS
   assert.equal(assetCandidateResolvesLive(graphOf([node]), 4, "missing", "ckpt_name"), false);
 });
 
+// ---- #569: widget-shift blame — the node's CURRENT model-carrying widget clears ----
+// A save corrupted by a node-signature change recorded the model filename under an
+// unrelated widget (`control_after_generate`, whose fixed/increment/randomize combo
+// can never contain a filename). After repair the file lives in the REAL model
+// widget (`upscale_model_name`) — the same widget that keeps the candidate alive
+// via the node-wide still-referenced scan — so the live-resolution check must
+// consult it too, or a fully-fixed node reports a phantom missing model forever.
+test("assetCandidateResolvesLive: widget-shift blamed widget — file held+resolved by a DIFFERENT widget clears the candidate (#569)", () => {
+  const node = {
+    id: 803,
+    widgets: [
+      { name: "control_after_generate", value: "fixed", options: { values: ["fixed", "increment", "randomize"] } },
+      { name: "upscale_model_name", value: "4x_foolhardy_Remacri.pth", options: { values: ["4x_foolhardy_Remacri.pth", "other.pth"] } },
+    ],
+  };
+  assert.equal(
+    assetCandidateResolvesLive(graphOf([node]), 803, "4x_foolhardy_Remacri.pth", "control_after_generate"),
+    true,
+  );
+});
+
+test("assetCandidateResolvesLive: a genuinely-missing file held by a widget but NOT offered by any fresh combo still flags (#569 fail-closed)", () => {
+  const node = {
+    id: 804,
+    widgets: [
+      { name: "control_after_generate", value: "fixed", options: { values: ["fixed", "increment", "randomize"] } },
+      { name: "upscale_model_name", value: "gone.pth", options: { values: ["other.pth"] } },
+    ],
+  };
+  assert.equal(
+    assetCandidateResolvesLive(graphOf([node]), 804, "gone.pth", "control_after_generate"),
+    false,
+  );
+});
+
+test("assetCandidateResolvesLive: blamed widget has NO usable combo but the model-carrying widget resolves (#569)", () => {
+  // The blamed widget exists but carries no option list at all (a seed/INT-style
+  // widget the shifted save blamed); the file is held + fresh-combo-listed elsewhere.
+  const node = {
+    id: 805,
+    widgets: [
+      { name: "seed", value: 42 },
+      { name: "ckpt_name", value: "model.safetensors", options: { values: ["model.safetensors"] } },
+    ],
+  };
+  assert.equal(
+    assetCandidateResolvesLive(graphOf([node]), 805, "model.safetensors", "seed"),
+    true,
+  );
+  // Same shape, but the model widget's combo does NOT offer the file → kept.
+  const missing = {
+    id: 806,
+    widgets: [
+      { name: "seed", value: 42 },
+      { name: "ckpt_name", value: "gone.safetensors", options: { values: ["model.safetensors"] } },
+    ],
+  };
+  assert.equal(
+    assetCandidateResolvesLive(graphOf([missing]), 806, "gone.safetensors", "seed"),
+    false,
+  );
+});
+
+test("assetCandidateResolvesLive: the widened clear path still needs a REAL file-carrying widget (no value, no clear)", () => {
+  // No widget literally holds the file (still-referenced would have dropped the
+  // candidate before this runs) — the fallback must not invent a clear.
+  const node = {
+    id: 807,
+    widgets: [
+      { name: "control_after_generate", value: "fixed", options: { values: ["fixed", "increment", "randomize"] } },
+      { name: "upscale_model_name", value: "other.pth", options: { values: ["4x_foolhardy_Remacri.pth", "other.pth"] } },
+    ],
+  };
+  assert.equal(
+    assetCandidateResolvesLive(graphOf([node]), 807, "4x_foolhardy_Remacri.pth", "control_after_generate"),
+    false,
+  );
+});
+
+test("isStaleAssetCandidate: the FULL #569 panel_get_errors verdict — fixed widget-shift node unflags only once the combo is trusted", () => {
+  const node = {
+    id: 803,
+    widgets: [
+      { name: "control_after_generate", value: "fixed", options: { values: ["fixed", "increment", "randomize"] } },
+      { name: "upscale_model_name", value: "4x_foolhardy_Remacri.pth", options: { values: ["4x_foolhardy_Remacri.pth", "other.pth"] } },
+    ],
+  };
+  const candidate = { nodeId: 803, name: "4x_foolhardy_Remacri.pth", widgetName: "control_after_generate" };
+  // Before the authoritative /object_info refresh the combo is NOT trusted: the
+  // candidate is kept (fail-closed) — the refresh gate is what makes the verdict.
+  assert.equal(isStaleAssetCandidate(graphOf([node]), candidate, { trustCombo: false }), false);
+  // After the confirmed refresh the node's CURRENT widgets resolve the file → stale.
+  assert.equal(isStaleAssetCandidate(graphOf([node]), candidate, { trustCombo: true }), true);
+});
+
+test("isStaleAssetCandidate: a genuinely-missing model still reports after a widget-shift repair attempt (#569 fail-closed)", () => {
+  const node = {
+    id: 804,
+    widgets: [
+      { name: "control_after_generate", value: "fixed", options: { values: ["fixed", "increment", "randomize"] } },
+      { name: "upscale_model_name", value: "gone.pth", options: { values: ["other.pth"] } },
+    ],
+  };
+  assert.equal(
+    isStaleAssetCandidate(graphOf([node]), { nodeId: 804, name: "gone.pth", widgetName: "control_after_generate" }, { trustCombo: true }),
+    false,
+  );
+});
+
+// ---- #569 × #743: annotated values in the live-resolution check ---------------
+test("assetCandidateResolvesLive: an [input]-annotated value resolves via its stripped bare name in the combo (#743 composition)", () => {
+  // `foo.png [input]` resolves against the INPUT root — exactly the root the
+  // loader combo enumerates — so the stripped bare name is combo-adjudicable.
+  const node = {
+    id: 9,
+    widgets: [
+      { name: "control_after_generate", value: "fixed", options: { values: ["fixed", "increment", "randomize"] } },
+      { name: "image", value: "foo.png [input]", options: { values: ["foo.png", "bar.png"] } },
+    ],
+  };
+  // …both via the widget that currently carries it (fallback path) …
+  assert.equal(
+    assetCandidateResolvesLive(graphOf([node]), 9, "foo.png [input]", "control_after_generate"),
+    true,
+  );
+  // …and when the blame lands on the carrying widget itself (named path).
+  assert.equal(assetCandidateResolvesLive(graphOf([node]), 9, "foo.png [input]", "image"), true);
+});
+
+test("assetCandidateResolvesLive: [output]/[temp]-annotated values are NEVER combo-resolved (left to the #743 server probe)", () => {
+  // These resolve against the OUTPUT/TEMP roots, which the input combo does not
+  // enumerate — a bare-name combo hit proves nothing, so the candidate must stay
+  // flagged for the /view probe even though the bare name IS listed.
+  const node = {
+    id: 9,
+    widgets: [
+      { name: "control_after_generate", value: "fixed", options: { values: ["fixed", "increment", "randomize"] } },
+      { name: "image", value: "foo.png [output]", options: { values: ["foo.png", "bar.png"] } },
+    ],
+  };
+  assert.equal(
+    assetCandidateResolvesLive(graphOf([node]), 9, "foo.png [output]", "control_after_generate"),
+    false,
+  );
+  const temp = {
+    id: 10,
+    widgets: [{ name: "image", value: "foo.png [temp]", options: { values: ["foo.png"] } }],
+  };
+  assert.equal(assetCandidateResolvesLive(graphOf([temp]), 10, "foo.png [temp]", "image"), false);
+  // A file on disk LITERALLY named `foo.png [output]` is listed verbatim — an
+  // EXACT combo hit still resolves it.
+  const literal = {
+    id: 11,
+    widgets: [{ name: "image", value: "foo.png [output]", options: { values: ["foo.png [output]"] } }],
+  };
+  assert.equal(assetCandidateResolvesLive(graphOf([literal]), 11, "foo.png [output]", "image"), true);
+});
+
 test("isStaleAssetCandidate: stale once fixed by set_widget (subgraph-scoped)", () => {
   const inner = { id: 6077, widgets: [{ name: "model", value: "..._fp8_scaled.safetensors" }] };
   const sub = { id: 6105, subgraph: graphOf([inner]) };
