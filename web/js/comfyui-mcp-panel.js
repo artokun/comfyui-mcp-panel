@@ -252,8 +252,10 @@ import { readyAckCanPromoteBackend } from "./lib/pi-readiness.js";
 import { createRunReconcileSweep } from "./lib/run-reconcile-sweep.js";
 import {
   activeWorkflowNodeCount,
+  activeWorkflowProvenEmpty,
   graphReadDesynced,
   graphRootMismatchesActiveWorkflow,
+  graphRootProvenEmpty,
   graphRootWorkflowUuidMismatches,
   graphRootWorkflowUuidMatches,
   graphRootMatchesState,
@@ -4329,20 +4331,26 @@ function assertGraphBoundToActiveWorkflow(
     const rootTagClaimedByActiveWorkflow =
       !!activeWorkflow && workflowOwnsRootUuidTag(activeWorkflow, rootUuid);
     // #565 — a leftover tag on a SHARED, reused app.graph is stale metadata
-    // when NEITHER side holds any nodes: ComfyUI's clear/configure does not
-    // reset graph.extra, so a brand-new blank tab inherits the PREVIOUS
-    // workflow's root tag while minting its own identity. With zero content
-    // on both sides there is no foreign canvas to protect (the #349 fence
-    // protects CONTENT), so the tag is re-stamped with the active identity
-    // instead of hard-blocking every graph tool on an empty canvas. The
-    // root's node array must be a PRESENT empty array (a partial frontend
-    // that hides _nodes stays fail-closed), and the both-empty requirement
-    // keeps the #389 case (empty root while the workflow reports N>0 nodes)
-    // failing closed via the baseline read guard below.
+    // ONLY when BOTH sides are PROVEN content-free: ComfyUI's clear/configure
+    // does not reset graph.extra, so a brand-new blank tab inherits the
+    // PREVIOUS workflow's root tag while minting its own identity. With
+    // provably zero content anywhere there is no foreign canvas to protect
+    // (the #349 fence protects CONTENT), so the tag is re-stamped with the
+    // active identity instead of hard-blocking every graph tool on an empty
+    // canvas. The proof bar is deliberately high (gate):
+    //   - the root must expose a present empty _nodes array AND serialize()
+    //     to a state whose every non-identity surface is empty (a bare empty
+    //     node array proves nothing about subgraphs/groups/links);
+    //   - the active workflow must be CLEAN (a dirty tracker can lag the
+    //     real canvas, #545) with a well-formed CURRENT serialized state
+    //     whose nodes array is present and empty and whose surfaces are all
+    //     empty — activeWorkflowNodeCount()===0 is NOT proof, since that
+    //     helper returns 0 for absent/malformed reads.
+    // Anything unprovable fails closed, and the #389 case (empty root while
+    // the workflow reports N>0 nodes) still fires via the baseline read
+    // guard below.
     const staleTagOnEmptyCanvas =
-      Array.isArray(rootGraph?._nodes) &&
-      rootGraph._nodes.length === 0 &&
-      activeWorkflowNodeCount(activeWorkflow) === 0;
+      graphRootProvenEmpty(rootGraph) && activeWorkflowProvenEmpty(activeWorkflow);
     if (
       resolveGraphRootUuidRebind({ rootGraph, activeWorkflowUuid, rootTagClaimedByActiveWorkflow, staleTagOnEmptyCanvas }) === "rebind"
     ) {
