@@ -203,6 +203,72 @@ test("#556 r8 collectVolatileInputs: per-NODE pairs (execId + input name) across
   assert.equal(collectVolatileInputs(null).size, 0);
 });
 
+test("#572 collectVolatileInputs: a linked value-control TARGET is excluded — the stock control_after_generate shape", () => {
+  // The frontend hangs beforeQueued on the UNSERIALIZED control combo and the
+  // hook mutates the LINKED, serialized seed (target.linkedWidgets = [control]).
+  // Excluding only the carrier's name covered nothing: the seed re-roll between
+  // our pre-dispatch hash and the deferred serialization false-refused every
+  // scoped run as "graph CHANGED" (WidgetControlMode "before" / pre-#8774 builds).
+  const control = { name: "control_after_generate", value: "randomize", beforeQueued() {}, afterQueued() {} };
+  const seed = { name: "seed", value: 42, linkedWidgets: [control] };
+  const root = { _nodes: [{ id: 3, widgets: [seed, control, { name: "steps", value: 20 }] }] };
+  const pairs = collectVolatileInputs(root);
+  assert.ok(pairs.has("3 seed"), "the serialized re-roll target is volatile");
+  assert.ok(pairs.has("3 control_after_generate"), "the hook carrier's own name stays excluded");
+  assert.ok(!pairs.has("3 steps"), "unrelated inputs stay covered for drift detection");
+});
+
+test("#572 collectVolatileInputs: a FIXED control never mutates, so its target stays drift-covered", () => {
+  const control = { name: "control_after_generate", value: "fixed", beforeQueued() {}, afterQueued() {} };
+  const seed = { name: "seed", value: 42, linkedWidgets: [control] };
+  const pairs = collectVolatileInputs({ _nodes: [{ id: 3, widgets: [seed, control] }] });
+  assert.ok(!pairs.has("3 seed"), "fixed ⇒ no queue-time mutation ⇒ a mid-window edit must still read as drift");
+  assert.ok(pairs.has("3 control_after_generate"), "the carrier self-exclusion is unchanged");
+});
+
+test("#572 collectVolatileInputs: the linked-target exclusion reaches nested subgraphs with the colon-path execId", () => {
+  const control = { name: "control_after_generate", value: "increment", beforeQueued() {} };
+  const noiseSeed = { name: "noise_seed", value: 7, linkedWidgets: [control] };
+  const root = {
+    _nodes: [
+      { id: 10, widgets: [], subgraph: { _nodes: [{ id: 15, widgets: [noiseSeed, control] }] } },
+    ],
+  };
+  const pairs = collectVolatileInputs(root);
+  assert.ok(pairs.has("10:15 noise_seed"), "nested target pairs line up with the flattened prompt keys");
+});
+
+test("#572 promptContentHash: a queue-time re-roll of a linked seed no longer reads as graph drift; a real edit still does", () => {
+  const control = { name: "control_after_generate", value: "randomize", beforeQueued() {} };
+  const seed = { name: "seed", value: 111, linkedWidgets: [control] };
+  const graph = { _nodes: [{ id: 3, widgets: [seed, control, { name: "steps", value: 20 }] }] };
+  const volatileInputs = collectVolatileInputs(graph);
+  // Pre-dispatch fingerprint (seed value as serialized at hash time)…
+  const atHash = promptContentHash(
+    { "3": { class_type: "KSampler", inputs: { seed: 111, steps: 20 } }, "9": { class_type: "SaveImage", inputs: {} } },
+    volatileInputs,
+  );
+  // …the deferred serialization after the queue-time hook re-rolled the seed.
+  const atPost = promptContentHashFromBody(
+    JSON.stringify({ prompt: { "3": { class_type: "KSampler", inputs: { seed: 999983, steps: 20 } }, "9": { class_type: "SaveImage", inputs: {} } } }),
+    volatileInputs,
+  );
+  assert.equal(atPost, atHash, "the hook's own mutation is not drift");
+  const userEdit = promptContentHashFromBody(
+    JSON.stringify({ prompt: { "3": { class_type: "KSampler", inputs: { seed: 999983, steps: 25 } }, "9": { class_type: "SaveImage", inputs: {} } } }),
+    volatileInputs,
+  );
+  assert.notEqual(userEdit, atHash, "a genuine mid-window edit to a non-volatile input is still caught");
+});
+
+test("#572 scopeDroppedError: graph_changed guidance names the retry safety and the queue-time hook cause", () => {
+  const msg = scopeDroppedError({ toNodeId: 116, verdict: { ok: false, reason: "graph_changed" } });
+  assert.match(msg, /node 116/);
+  assert.match(msg, /Retrying is safe \(nothing was queued\)/);
+  assert.match(msg, /queue-time widget hook/);
+  assert.match(msg, /Nothing was queued/);
+});
+
 test("#556 verifyScopedPromptBody: exact scope passes; missing/empty/wrong/extra/unparseable all refuse", () => {
   assert.deepEqual(verifyScopedPromptBody(JSON.stringify({ partial_execution_targets: ["10:15:359"] }), ["10:15:359"]), { ok: true });
   assert.equal(verifyScopedPromptBody(JSON.stringify({ prompt: {} }), ["14"]).reason, "scope_missing");

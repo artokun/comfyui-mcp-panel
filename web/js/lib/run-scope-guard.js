@@ -65,16 +65,19 @@
 //
 //  - The prompt CONTENT HASH (r7) must be computable BEFORE dispatch: a
 //    stable hash of the full queued prompt — node ids, class types, links,
-//    every input/widget value — excluding ONLY the inputs of widgets that
-//    self-mutate at queue time (beforeQueued seeds and the like), which
-//    change between any two serializations of the SAME graph by design. A
-//    topology-only fingerprint is insufficient: a busy queue defers
-//    serialization to post time, and a user edit in between (a changed
-//    widget value, a rewired link) leaves node ids/types untouched while
-//    rendering a DIFFERENT workflow — the guard refuses that drifted post
-//    and the run ends with a truthful "the graph changed" error. If the
-//    hash can't be computed at all (graphToPrompt failed), the run FAILS
-//    CLOSED: it refuses upfront and never calls queuePrompt.
+//    every input/widget value — excluding ONLY the inputs that self-mutate at
+//    queue time (beforeQueued hooks: seed widgets re-rolled by their linked
+//    control_after_generate, and the hook widgets themselves), which change
+//    between any two serializations of the SAME graph by design (#572: the
+//    exclusion must reach the hook's serialized TARGET, not just the
+//    unserialized control the hook hangs on). A topology-only fingerprint is
+//    insufficient: a busy queue defers serialization to post time, and a user
+//    edit in between (a changed widget value, a rewired link) leaves node
+//    ids/types untouched while rendering a DIFFERENT workflow — the guard
+//    refuses that drifted post and the run ends with a truthful "the graph
+//    changed" error. If the hash can't be computed at all (graphToPrompt
+//    failed), the run FAILS CLOSED: it refuses upfront and never calls
+//    queuePrompt.
 //
 // Extracted as a pure module so the SAME orchestration graph_run runs is
 // drivable from `node --test` (the live app.queuePrompt path can't be).
@@ -139,14 +142,17 @@ const fnv1aHex = (s) =>
  * in between (a changed widget value, a rewired link) leaves the topology
  * untouched while rendering a DIFFERENT workflow.
  *
- * The ONLY values excluded are inputs whose OWNING widget self-mutates at
- * queue time (a `beforeQueued` hook — stock seed widgets with
- * control_after_generate, etc.): those change between any two serializations
- * of the SAME graph by design, so hashing them would refuse our own dispatch.
- * Exclusions are PER-NODE pairs (prompt node id + input name, r8): an edit to
- * a NON-hook node's same-named input is still detected as drift, and a prompt
- * node that can't be resolved to a live node carrying the hook gets NO
- * exclusions (fail toward detecting drift).
+ * The ONLY values excluded are inputs that self-mutate at queue time (a
+ * `beforeQueued` hook — stock seed widgets re-rolled by their linked
+ * control_after_generate, third-party hook widgets, etc.): those change
+ * between any two serializations of the SAME graph by design, so hashing them
+ * would refuse our own dispatch. Exclusions are PER-NODE pairs (prompt node id
+ * + input name, r8): an edit to a NON-hook node's same-named input is still
+ * detected as drift, and a prompt node that can't be resolved to a live node
+ * carrying the hook gets NO exclusions (fail toward detecting drift). #572:
+ * the stock hook rides on the unserialized control widget and mutates its
+ * LINKED target, so the exclusion follows the linkedWidgets convention to the
+ * serialized target (see collectVolatileInputs).
  */
 export function promptContentHash(output, volatileInputs = null) {
   if (!output || typeof output !== "object") return null;
@@ -182,19 +188,48 @@ export function promptContentHashFromBody(bodyText, volatileInputs = null) {
  * same path buildNodeExecutionId produces, so pairs line up with the keys of
  * the API prompt. These are the ONLY values the content hash excludes —
  * everything a user can edit, on any other node, is covered.
+ *
+ * #572 — the stock control_after_generate hook is NOT on the serialized
+ * widget: the frontend hangs `beforeQueued` on the control combo (serialize:
+ * false — it never even reaches the prompt) and the hook mutates the LINKED
+ * TARGET (the seed / noise_seed / cycled combo), which IS serialized
+ * (ComfyUI_frontend widgets.ts: `targetWidget.linkedWidgets = [controlWidget]`;
+ * the queue processor fires the hook before serializing the post body).
+ * Excluding only the carrier's own name therefore covered nothing, and any
+ * frontend/mode where the mutation lands between our pre-dispatch hash and the
+ * deferred serialization (WidgetControlMode "before"; pre-#8774 frontends on a
+ * partial execution; third-party hooks following the same linkedWidgets
+ * convention) false-refused EVERY scoped run as "graph CHANGED" — nothing
+ * queued, no concurrent edit. So for each carrier `w` we ALSO exclude every
+ * sibling target `t` with `t.linkedWidgets` containing `w` — unless the
+ * carrier's mode is the string "fixed", which never mutates (a fixed control
+ * leaves the target fully covered, so a genuine mid-window user edit to it is
+ * still detected as drift).
  */
 export function collectVolatileInputs(rootGraph) {
   const pairs = new Set();
   const seen = new Set();
+  const addPair = (execId, name) => {
+    if (name != null) pairs.add(`${execId} ${String(name)}`);
+  };
   const walk = (graph, prefix) => {
     if (!graph || seen.has(graph)) return;
     seen.add(graph);
     for (const node of graph._nodes ?? []) {
       if (!node || node.id == null) continue;
       const execId = prefix ? `${prefix}:${node.id}` : String(node.id);
-      for (const w of node.widgets ?? []) {
-        if (typeof w?.beforeQueued === "function" && w.name != null) {
-          pairs.add(`${execId} ${String(w.name)}`);
+      const widgets = node.widgets ?? [];
+      for (const w of widgets) {
+        if (typeof w?.beforeQueued !== "function") continue;
+        // The carrier's own input (third-party hooks that mutate their own
+        // serialized value; a no-op for the serialize:false stock control).
+        addPair(execId, w.name);
+        // #572 — the serialized TARGET(s) of a linked value-control hook.
+        if (w.value === "fixed") continue;
+        for (const t of widgets) {
+          if (Array.isArray(t?.linkedWidgets) && t.linkedWidgets.includes(w)) {
+            addPair(execId, t.name);
+          }
         }
       }
       if (node.subgraph) walk(node.subgraph, execId);
@@ -263,7 +298,11 @@ export function scopeDroppedError({ toNodeId, verdict }) {
   const detail =
     verdict?.reason === "graph_changed"
       ? `the workflow graph CHANGED after the run was queued — the deferred ` +
-        `dispatch would render a modified workflow, not the one that was scoped`
+        `dispatch would render a modified workflow, not the one that was scoped. ` +
+        `Retrying is safe (nothing was queued); if this recurs without any edit in ` +
+        `between, a queue-time widget hook is mutating values between serialization ` +
+        `and dispatch (e.g. a control_after_generate widget with WidgetControlMode ` +
+        `"before" — switch it to "after" or fix the target widget's value)`
       : verdict?.reason === "scope_mismatch"
         ? `the POST /prompt body carried partial_execution_targets ` +
           `${JSON.stringify(verdict.got)} instead of ${JSON.stringify(verdict.expected)}`
