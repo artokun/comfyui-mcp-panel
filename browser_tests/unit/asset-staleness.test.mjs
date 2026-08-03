@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 
 import {
   findNodeByScopedId,
+  findVisibleNodeByScopedId,
   findSubgraphByUuid,
   assetCandidateStillReferenced,
   assetCandidateResolvesLive,
@@ -22,6 +23,7 @@ import {
   reapplyDefsToLiveNodes,
   collectMissingNodeTypeReasons,
   collectUnexplainedRedOutlines,
+  combineNodeErrorMaps,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
   collectLinkedNeighborNodeIds,
@@ -100,6 +102,27 @@ test("findNodeByScopedId resolves a REAL locator '<subgraphUuid>:<localId>' (#24
   const sub = subgraphOf(SG_UUID, [inner]);
   const root = rootWithSubgraphs([], [sub]);
   assert.equal(findNodeByScopedId(root, `${SG_UUID}:1913`), inner);
+});
+
+test("findVisibleNodeByScopedId maps a scoped missing asset only onto its displayed subgraph node (#579 P1)", () => {
+  const inner = { id: 6077, has_errors: true, widgets: [{ name: "ckpt_name", value: "gone.safetensors" }] };
+  const sameLocalIdElsewhere = { id: 6077, has_errors: true, widgets: [] };
+  const sub = subgraphOf(SG_UUID, [inner]);
+  const root = rootWithSubgraphs([{ id: 100, subgraph: sub }, sameLocalIdElsewhere], [sub]);
+  const locator = `${SG_UUID}:6077`;
+
+  assert.equal(findVisibleNodeByScopedId(root, [inner], locator), inner);
+  assert.equal(
+    findVisibleNodeByScopedId(root, [sameLocalIdElsewhere], locator),
+    null,
+    "a local-id collision in another scope must not receive the missing-asset reason",
+  );
+  const reasons = new Map([[String(inner.id), [{ kind: "missing_model", file: "gone.safetensors" }]]]);
+  assert.deepEqual(
+    collectUnexplainedRedOutlines([inner], reasons, {}).map((node) => node.id),
+    [],
+    "the real scoped missing asset stays a per-node error, never a stale outline",
+  );
 });
 
 test("findNodeByScopedId returns null when the subgraph UUID is unknown (fails open)", () => {
@@ -790,6 +813,25 @@ test("#579 source-free LiteGraph outlines are warnings, not graph errors", () =>
     collectUnexplainedRedOutlines(nodes, reasons, { lastExecFailure: { node_id: 9 } }),
     [],
     "a live execution source retains conservative error classification",
+  );
+});
+
+test("combineNodeErrorMaps: an empty app map never masks a live execution-store validation error (#579 P1)", () => {
+  const storeError = { message: "checkpoint is not installed" };
+  const combined = combineNodeErrorMaps([
+    {}, // app.lastNodeErrors may be reset immediately after the rejection
+    { 41: { errors: [storeError] } },
+  ]);
+  assert.deepEqual(combined, { 41: { errors: [storeError] } });
+  assert.deepEqual(
+    combineNodeErrorMaps([{ 41: { errors: [] } }, { 41: { errors: [storeError] } }]),
+    { 41: { errors: [storeError] } },
+    "an empty entry for the same node also cannot overwrite the store's live error",
+  );
+  assert.deepEqual(
+    collectUnexplainedRedOutlines([{ id: 8, has_errors: true }], new Map(), { nodeErrors: combined }),
+    [],
+    "a live store validation source keeps a red outline conservatively classified as an error",
   );
 });
 

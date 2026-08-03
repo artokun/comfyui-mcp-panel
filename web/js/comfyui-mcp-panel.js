@@ -120,10 +120,12 @@ import {
   refreshComboOptionsFromDefs,
   collectMissingNodeTypeReasons,
   collectUnexplainedRedOutlines,
+  combineNodeErrorMaps,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
   collectLinkedNeighborNodeIds,
   findNodeByScopedId,
+  findVisibleNodeByScopedId,
   resolveMissingModelDirectory,
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing } from "./lib/node-resolve.js";
@@ -8385,15 +8387,21 @@ const GRAPH_TOOL_EXECUTORS = {
     const missingMedia = assets.media.map((m) => ({ ...m, kind: "missing_media" }));
     const missingNodeTypes = assets.nodeTypes;
     const missingNodeCount = assets.nodeCount;
+    // Missing-asset stores identify nested nodes with a scoped locator, while
+    // the currently viewed subgraph indexes its nodes by their local id. Resolve
+    // only to the exact visible node; otherwise retain the locator so a same-id
+    // node in another subgraph can never receive this error by accident.
+    const reasonNodeId = (locator) =>
+      findVisibleNodeByScopedId(rootGraph, nodes, locator)?.id ?? locator;
     for (const m of assets.models) {
       if (m.node_id == null) continue;
       const { node_id, ...rest } = m;
-      addReason(node_id, { kind: "missing_model", ...rest });
+      addReason(reasonNodeId(node_id), { kind: "missing_model", ...rest });
     }
     for (const m of assets.media) {
       if (m.node_id == null) continue;
       const { node_id, ...rest } = m;
-      addReason(node_id, { kind: "missing_media", ...rest });
+      addReason(reasonNodeId(node_id), { kind: "missing_media", ...rest });
     }
 
     // 2) Uninstalled node TYPES, attached PER NODE (#399). collectMissingAssets only
@@ -8423,8 +8431,10 @@ const GRAPH_TOOL_EXECUTORS = {
     } catch {
       /* optional */
     }
-    const rawNodeErrors = comfy?.lastNodeErrors ?? storeNodeErrors ?? null;
-    const nodeErrors = rawNodeErrors && Object.keys(rawNodeErrors).length ? rawNodeErrors : null;
+    // These are independent live stores. The app map can be an empty object
+    // after a reset while the execution store still retains the actual rejected
+    // prompt, so never let nullish selection make an empty app map mask it.
+    const nodeErrors = combineNodeErrorMaps([comfy?.lastNodeErrors ?? null, storeNodeErrors]);
     if (nodeErrors) {
       for (const [id, entry] of Object.entries(nodeErrors)) {
         for (const e of entry?.errors ?? []) {
