@@ -143,7 +143,6 @@ import {
 } from "./lib/subgraph-scope.js";
 import { runSetWidget } from "./lib/set-widget.js";
 import {
-  splitInputAssetRef,
   filterServerConfirmedInputSubfolderCandidates,
   inputPathsUseWindowsSeparators,
 } from "./lib/input-asset.js";
@@ -5098,23 +5097,30 @@ async function inputAssetServerUsesWindowsPaths() {
 
 /**
  * `/object_info` cannot list LoadImage input files below the input root, although
- * `/view?type=input` and LoadImage's validator can resolve them. Confirm only
- * those nested missing-media candidates against the server before telling the
- * agent that the user must re-upload an asset (#513). A failed probe deliberately
- * leaves the candidate in place, preserving the prior fail-closed warning. The
- * subfolder/filename split follows the SERVER's path semantics so a backslash is
- * treated as a separator only where ComfyUI itself would treat it as one.
+ * `/view?type=input` and LoadImage's validator can resolve them — and it NEVER
+ * lists an annotated `file.png [output]`/`[temp]`/`[input]` value, which resolves
+ * against the annotation's OWN root (folder_paths.annotated_filepath). Confirm
+ * those nested/annotated missing-media candidates against the server before
+ * telling the agent that the user must re-upload an asset (#513, #743). The lib
+ * parses the annotation and splits subfolder/filename; the probe below queries
+ * `/view` with the parsed parts against the annotation's `type` root, so an
+ * existing `detailed/x.png [output]` is confirmed at `<output>/detailed/x.png`
+ * instead of 404ing as a literal "[output]"-suffixed name under `input/` (#743
+ * false positive). A failed probe deliberately leaves the candidate in place,
+ * preserving the prior fail-closed warning. The subfolder/filename split follows
+ * the SERVER's path semantics so a backslash is treated as a separator only
+ * where ComfyUI itself would treat it as one.
  */
 async function filterServerConfirmedInputSubfolderMedia(media) {
   const backslashIsSeparator = await inputAssetServerUsesWindowsPaths();
   return filterServerConfirmedInputSubfolderCandidates(
     media,
-    async (assetValue) => {
+    async (assetValue, ref) => {
       try {
         if (typeof api?.fetchApi !== "function") return false;
-        const { subfolder, filename } = splitInputAssetRef(assetValue, { backslashIsSeparator });
-        if (!subfolder || !filename) return false;
-        const qs = new URLSearchParams({ filename, subfolder, type: "input" }).toString();
+        const { subfolder, filename, type } = ref ?? {};
+        if (!filename || !type) return false;
+        const qs = new URLSearchParams({ filename, subfolder, type }).toString();
         const res = await api.fetchApi(`/view?${qs}`, {
           method: "GET",
           cache: "no-store",
