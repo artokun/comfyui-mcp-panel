@@ -19134,6 +19134,21 @@ function buildPanel() {
       // transport failure re-pends so the next reconnect/retry re-delivers it.
       else if (!AGENT_MUTED) runCompletion.markUndelivered(promptId);
     },
+    // #582: ComfyUI writes a manually stopped run to history with raw
+    // status_str:"error" plus execution_interrupted. Deliver a neutral event,
+    // not run_error: the orchestrator treats run_error as urgent and tells the
+    // agent to diagnose/panel_get_errors. `executed` with a note is the existing
+    // non-urgent event protocol, and does not claim an output was produced.
+    onReconcileInterrupted: ({ promptId }) => {
+      const note =
+        `The workflow run you queued was cancelled while the connection was down (prompt ${promptId}). ` +
+        `It did not crash; no action is required unless the cancellation was unintended.`;
+      const sent = client.sendFrame({ type: "agent_event", kind: "executed", note });
+      if (sent) appendSystem(`Queued render was cancelled while disconnected (prompt ${promptId}).`);
+      // Match terminal-error recovery: only a transport drop re-pends the
+      // cancellation notice; an intentionally muted agent stays silent.
+      else if (!AGENT_MUTED) runCompletion.markUndelivered(promptId);
+    },
     // #370 (P1 memory-leak): the tracker GAVE UP on a prompt whose outcome it
     // couldn't confirm after the bounded retries (its /history stayed absent —
     // cancelled/disconnected). It's been evicted from the ledger; surface a
