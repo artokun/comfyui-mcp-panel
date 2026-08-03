@@ -179,6 +179,11 @@ import { autoMatchSlots, slotDiagnostic } from "./lib/connect-match.js";
 import { isLinkPersisted, removePhantomLink, isWidgetBackedInput } from "./lib/connect-verify.js";
 import { deferChangeTrackerSnapshot } from "./lib/change-tracker-snapshot.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
+import {
+  missingRequiredWidgetMaterializations,
+  unavailableRequiredCustomWidgetTypes,
+} from "./lib/node-widget-materialization.js";
+import { sameGraphMutationContext } from "./lib/graph-mutation-context.js";
 import { isImeComposing } from "./lib/ime.js";
 import { installGraphToPromptNullSafety } from "./lib/widget-null-safety.js";
 import {
@@ -5877,6 +5882,49 @@ function placementFor(graph, pos) {
   return [100, 100];
 }
 
+// getCustomWidgets is deliberately fire-and-forget in the ComfyUI frontend.
+// An unrecognised required V3 input is therefore unsafe until the *live*
+// widget registry either contains a constructor or the type is proven to be a
+// built-in socket. Do not call extension hooks here: they are registration
+// callbacks, not repeatable queries, and ComfyUI does not expose their promise.
+const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = 5000;
+const CUSTOM_WIDGET_REGISTRATION_POLL_MS = 25;
+
+async function awaitRequiredCustomWidgetRegistration(nodeData, comfyApp) {
+  const deadline = Date.now() + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
+  let unavailable = unavailableRequiredCustomWidgetTypes(nodeData, comfyApp?.widgets);
+  while (Date.now() < deadline) {
+    if (!unavailable.length) return;
+    await new Promise((resolve) => setTimeout(resolve, CUSTOM_WIDGET_REGISTRATION_POLL_MS));
+    unavailable = unavailableRequiredCustomWidgetTypes(nodeData, comfyApp?.widgets);
+  }
+  if (!unavailable.length) return;
+  throw new Error(
+    `Required custom widget${unavailable.length === 1 ? "" : "s"} ` +
+      `${unavailable.map((type) => `"${type}"`).join(", ")} have not registered. ` +
+      "They may be custom widgets still loading; retry shortly.",
+  );
+}
+
+function captureGraphMutationContext() {
+  const context = getGraphCtx();
+  return { ...context, workflow: activeWorkflowRef() };
+}
+
+function revalidateGraphMutationContext(captured) {
+  const current = { ...getGraphCtx(), workflow: activeWorkflowRef() };
+  if (!sameGraphMutationContext(captured, current, sameWorkflowObject)) {
+    throw new Error(
+      "The active workflow or graph view changed while this node was preparing; nothing was added. Retry on the intended tab.",
+    );
+  }
+  assertGraphBoundToActiveWorkflow(current.graph, current.rootGraph, {
+    includeBaselineReadGuard: false,
+    requireDirtyMutationBinding: true,
+  });
+  return current;
+}
+
 // The currently-mounted panel root (set by buildPanel). Used by canvas "fit" to
 // measure how much of the canvas the open sidebar panel overlays.
 let activePanelRoot = null;
@@ -6751,7 +6799,8 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   async graph_add_node({ class_type, pos, title }) {
-    const { graph, LG } = getGraphCtx();
+    const capturedContext = captureGraphMutationContext();
+    const { app: comfyApp, LG } = capturedContext;
     if (!class_type || typeof class_type !== "string") {
       throw new Error("class_type (string) is required");
     }
@@ -6781,12 +6830,32 @@ const GRAPH_TOOL_EXECUTORS = {
       // #458 OBSERVED-BACKEND-HISTORY trust root, identical to graph_set_widget's.
       wasTypeEverDefined: (t) => objectInfoHistory.wasTypeEverDefined(t),
     });
+    // registerNodesFromDefs can expose a newly installed V3 class before its
+    // extension's asynchronous custom-widget registry settles. Resolve the
+    // required constructors before creating anything, or fail retryably before
+    // mutating the graph (#580).
+    await awaitRequiredCustomWidgetRegistration(
+      LG?.registered_node_types?.[class_type]?.nodeData,
+      comfyApp,
+    );
     const node = LG.createNode(class_type);
     if (!node) {
       throw new Error(
         `Unknown node type "${class_type}" — check the exact class_type via get_node_info`,
       );
     }
+    const missingWidgets = missingRequiredWidgetMaterializations(node, comfyApp?.widgets);
+    if (missingWidgets.length) {
+      throw new Error(
+        `Required custom widget${missingWidgets.length === 1 ? "" : "s"} ` +
+          `${missingWidgets.map((name) => `"${name}"`).join(", ")} did not initialize for ` +
+          `"${class_type}". Reload ComfyUI so its node extension can register, then retry.`,
+      );
+    }
+    // No await follows this validation. Re-read the graph/workflow now so a
+    // tab or subgraph switch during the async preflight cannot commit to the
+    // graph captured at command start.
+    const { graph } = revalidateGraphMutationContext(capturedContext);
     graph.beforeChange();
     try {
       node.pos = placementFor(graph, pos);
