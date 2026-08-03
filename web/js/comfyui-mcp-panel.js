@@ -178,6 +178,7 @@ import {
 import { autoMatchSlots, slotDiagnostic } from "./lib/connect-match.js";
 import { isLinkPersisted, removePhantomLink, isWidgetBackedInput } from "./lib/connect-verify.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
+import { missingRequiredWidgetMaterializations } from "./lib/node-widget-materialization.js";
 import { isImeComposing } from "./lib/ime.js";
 import { installGraphToPromptNullSafety } from "./lib/widget-null-safety.js";
 import {
@@ -5876,6 +5877,20 @@ function placementFor(graph, pos) {
   return [100, 100];
 }
 
+// A custom extension's getCustomWidgets hook is allowed to resolve
+// asynchronously. Node defs can therefore be available one task before the
+// corresponding widget constructors. Yield before creating a node so the
+// constructors are installed before LiteGraph runs onNodeCreated; otherwise a
+// V3 node can be added with bare required sockets that graphToPrompt omits.
+async function settleFrontendWidgetRegistry() {
+  await Promise.resolve();
+  if (typeof requestAnimationFrame === "function") {
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+  } else {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+
 // The currently-mounted panel root (set by buildPanel). Used by canvas "fit" to
 // measure how much of the canvas the open sidebar panel overlays.
 let activePanelRoot = null;
@@ -6780,10 +6795,22 @@ const GRAPH_TOOL_EXECUTORS = {
       // #458 OBSERVED-BACKEND-HISTORY trust root, identical to graph_set_widget's.
       wasTypeEverDefined: (t) => objectInfoHistory.wasTypeEverDefined(t),
     });
+    // registerNodesFromDefs can expose a newly installed V3 class before its
+    // extension's asynchronous custom-widget registry settles. Do not
+    // construct in that transient state (#580).
+    await settleFrontendWidgetRegistry();
     const node = LG.createNode(class_type);
     if (!node) {
       throw new Error(
         `Unknown node type "${class_type}" — check the exact class_type via get_node_info`,
+      );
+    }
+    const missingWidgets = missingRequiredWidgetMaterializations(node, app?.widgets);
+    if (missingWidgets.length) {
+      throw new Error(
+        `Required custom widget${missingWidgets.length === 1 ? "" : "s"} ` +
+          `${missingWidgets.map((name) => `"${name}"`).join(", ")} did not initialize for ` +
+          `"${class_type}". Reload ComfyUI so its node extension can register, then retry.`,
       );
     }
     graph.beforeChange();
