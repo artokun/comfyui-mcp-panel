@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.38] - 2026-08-03
+
+### Fixed
+- missing_media no longer false-positives on [output]/[input]/[temp]-annotated paths (annotation parsed per folder_paths.annotated_filepath exactly, unspaced and clamp cases included) (#743) (#568)
+- the binding guard heals proven drift after a reconnect/multi-tab switch and only ever re-stamps a stale root tag on a proven-clean, proven-empty canvas; non-empty surfaces stay strict both ways (#560, #565) (#570)
+- phantom missing_model clears when the node's CURRENT widgets resolve a real asset (widget-shift repair); annotated values are classified before combo membership so [output]/[temp] can never be combo-cleared (#569) (#574)
+- a first save consumes the temporary Unsaved tab via its proven produced record — no more duplicate modified Unsaved tabs, and the save-swap identity carry fires correctly (#566) (#575)
+
 ## [0.11.37] - 2026-08-03
 
 ### Fixed
