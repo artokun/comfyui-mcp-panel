@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.37] - 2026-08-03
+
+### Fixed
+- the published Registry pack ships web/js/vendor/ runtime modules again — a bare `vendor/` line in .comfyignore matched at any depth and excluded them from 0.11.33-0.11.36 packs, breaking the panel for Registry installs (#749) (#567)
+- missing_media no longer false-positives on [output]/[input]/[temp]-annotated paths with subfolders — annotation is parsed before probing, against the annotation's root (#743) (#568)
+
 ### Fixed
 - `panel_add_node` / `panel_set_widget` unknown-type errors now point at `get_node_info` (the live /object_info node-class oracle) instead of `panel_search_nodes`, which searches installable Manager packs and can never resolve an exact class_type (mcp#741)
 
