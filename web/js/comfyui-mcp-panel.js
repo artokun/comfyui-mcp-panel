@@ -286,6 +286,7 @@ import {
   buildHelloPayload,
 } from "./lib/session-rebind.js";
 import { createRestartTabIdentity, sendBridgeHello } from "./lib/restart-tab-identity.js";
+import { planRebootResume } from "./lib/restart-resume.js";
 
 let app = null;
 let api = null;
@@ -18925,7 +18926,23 @@ function buildPanel() {
       // orchestrator armed hello.resume, so resuming the agent is safe now.
       // Clear REBOOT_KEY only here (on actual send) so a drop mid-reconnect
       // retries instead of losing the resume.
-      if (ack?.kind === "ready" && ssGet(REBOOT_KEY)) {
+      const rebootResume = planRebootResume({
+        rebootPending: ack?.kind === "ready" && !!ssGet(REBOOT_KEY),
+        // A prompt recorded before the reboot may still be running when the
+        // backend returns. Its completion/reconcile event is the authoritative
+        // continuation signal; waking the agent generically here caused it to
+        // requeue the same render (#585).
+        // The callback is registered before this mount's tracker is constructed;
+        // the module ref is therefore safe even if a bridge implementation emits
+        // a synchronous initial ready frame.
+        hasPendingRun: runCompletionRef?.hasPending?.() ?? false,
+      });
+      if (rebootResume === "wait_for_run") {
+        ssSet(REBOOT_KEY, null);
+        appendSystem("Reconnected — waiting for the render that was already in flight before the restart.");
+        return;
+      }
+      if (rebootResume === "resume") {
         ssSet(REBOOT_KEY, null);
         appendSystem("Reconnected — resuming where we left off.");
         showThinking();
