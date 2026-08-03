@@ -252,6 +252,7 @@ import { createRunReconcileSweep } from "./lib/run-reconcile-sweep.js";
 import {
   activeWorkflowNodeCount,
   activeWorkflowProvenEmpty,
+  graphEmptyBindingUnproven,
   graphReadDesynced,
   graphRootMismatchesActiveWorkflow,
   graphRootProvenEmpty,
@@ -4404,6 +4405,27 @@ function assertGraphBoundToActiveWorkflow(
         `but the canvas is bound to a different graph. A load, tab switch, or reconnect left this command ` +
         `pointed at the wrong canvas, so it was NOT applied. Re-open the active workflow tab ` +
         `(panel_open_workflow) or reload the panel to rebind the graph, then retry.`,
+    );
+  }
+  // #560 (2nd reopen) — the FALSE-EMPTY read hole. Every predicate above is
+  // inconclusive in the mid-population window (empty root, no root tag,
+  // tracker unreadable/unsettled after a reconnect + tab switch or a failed
+  // repaint), so an empty ROOT read slipped through as an AUTHORITATIVE
+  // node_count 0 for a populated workflow — and the agent built on it (#349-
+  // class). An empty read is now authoritative ONLY when the empty state is
+  // PROVEN (clean, well-formed, all-empty tracker state) or the canvas is
+  // POSITIVELY bound (root tag matches). Otherwise the state is INCONCLUSIVE:
+  // refuse with a retryable error — never a false-empty read, never a build
+  // on one. Reads AND mutations are fenced alike; the legacy verdicts above
+  // stay more specific and keep winning. Gated LAST so it can never mask a
+  // positive desync/mismatch verdict.
+  if (graphEmptyBindingUnproven({ graph, rootGraph, activeWorkflow, activeWorkflowUuid })) {
+    throw new Error(
+      `[empty-binding-unproven] The live root canvas reads EMPTY, but the active workflow's own ` +
+        `state cannot prove it is genuinely empty — the tab may still be loading after a switch, ` +
+        `reconnect, or a failed open, and node_count 0 could be a FALSE-EMPTY reading, so this ` +
+        `command was NOT applied as authoritative. Retry in a moment once the tab settles; if it ` +
+        `persists, re-open the workflow tab (panel_open_workflow) or reload the panel.`,
     );
   }
 }

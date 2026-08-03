@@ -77,6 +77,49 @@ export function graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph = 
 }
 
 /**
+ * #560 (2nd reopen) — the FALSE-EMPTY authoritative read. After a reconnect +
+ * workflow-tab switch (or a failed workflow_open repaint), the shared
+ * app.graph object is observable MID-POPULATION: `_nodes` empty, no root tag,
+ * and the active workflow's tracker unreadable or not yet settled. Every other
+ * binding predicate is inconclusive in that window BY DESIGN: the baseline
+ * desync guard needs a POSITIVE tracker node count (it fails open to 0 on an
+ * absent/malformed read), the shape guard deliberately skips both-empty
+ * comparisons (#565), and the UUID guards treat a missing root tag as
+ * inconclusive. An empty root READ there returned `node_count: 0` as
+ * AUTHORITATIVE for a canvas known to hold 10 nodes — and the agent built ~70
+ * nodes on the false reading (#349-class wrong-canvas work).
+ *
+ * This predicate is the empty-read evidence bar: an empty ROOT read is
+ * authoritative ONLY when it is
+ *   - PROVEN genuinely empty — a CLEAN tracker with a well-formed, all-empty
+ *     CURRENT serialized state (activeWorkflowProvenEmpty; a node COUNT of 0
+ *     from an absent/malformed read is NOT proof), or
+ *   - POSITIVELY bound — the root tag matches the active workflow's identity
+ *     (graphRootWorkflowUuidMatches), the known #545 availability case: a
+ *     manual/agent clear on a bound canvas with the tracker legitimately
+ *     lagging.
+ *
+ * Returns true (INCONCLUSIVE — the caller must refuse rather than treat the
+ * empty read as authoritative) only when the root observably has zero nodes
+ * AND neither proof holds. Availability is preserved where it must be:
+ *   - a POPULATED root (self-evidently bound) and an unreadable root shape
+ *     stay with the legacy predicates;
+ *   - subgraph scope is exempt (a descended empty subgraph is legitimate,
+ *     mirroring graphReadDesynced);
+ *   - with NO active workflow service at all, the legacy availability path
+ *     stands (that frontend never had binding fences).
+ */
+export function graphEmptyBindingUnproven({ graph, rootGraph, activeWorkflow, activeWorkflowUuid } = {}) {
+  if (!!rootGraph && graph && graph !== rootGraph) return false; // subgraph scope
+  const live = rootGraph?._nodes;
+  if (!Array.isArray(live) || live.length !== 0) return false; // populated or unobservable
+  if (!activeWorkflow) return false; // no workflow service — legacy availability
+  if (activeWorkflowProvenEmpty(activeWorkflow)) return false; // PROVEN empty — truthful 0
+  if (graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid })) return false; // positively bound
+  return true; // empty + unproven + unbound ⇒ inconclusive, never authoritative-empty
+}
+
+/**
  * Return the active workflow's serialized CURRENT graph state. `initialState`
  * is deliberately excluded: it is a load/save baseline and can legitimately
  * differ from an active canvas with unsaved edits. `null` means current state is
