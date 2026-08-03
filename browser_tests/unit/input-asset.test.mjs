@@ -251,6 +251,37 @@ test("parseAnnotatedFilepath: unannotated defaults to input; lookalikes are unto
   });
 });
 
+test("parseAnnotatedFilepath: UNSPACED suffix is still an annotation (upstream endswith + fixed slice)", () => {
+  // folder_paths.annotated_filepath recognizes the suffix with NO preceding
+  // space and slices a FIXED 9/8/7 chars — one more than the bracketed suffix —
+  // so an unspaced value loses one trailing filename char too. Quirky, but it is
+  // the exact path LoadImage resolves, so the probe must mirror it.
+  assert.deepEqual(parseAnnotatedFilepath("foo[output]"), {
+    name: "fo", // "foo[output]"[:-9]
+    type: "output",
+    annotated: true,
+  });
+  assert.deepEqual(parseAnnotatedFilepath("clip[temp]"), {
+    name: "cli", // "clip[temp]"[:-7]
+    type: "temp",
+    annotated: true,
+  });
+  assert.deepEqual(parseAnnotatedFilepath("sub/pic.png[input]"), {
+    name: "sub/pic.pn", // "sub/pic.png[input]"[:-8]
+    type: "input",
+    annotated: true,
+  });
+});
+
+test("parseAnnotatedFilepath: a bare suffix (or suffix+1 char) clamps to an empty name, like Python", () => {
+  // name[:-N] past the string start yields "" in Python; JS slice must clamp the
+  // same way rather than eat a trailing char.
+  assert.deepEqual(parseAnnotatedFilepath("[output]"), { name: "", type: "output", annotated: true });
+  assert.deepEqual(parseAnnotatedFilepath("[input]"), { name: "", type: "input", annotated: true });
+  assert.deepEqual(parseAnnotatedFilepath("[temp]"), { name: "", type: "temp", annotated: true });
+  assert.deepEqual(parseAnnotatedFilepath("x[temp]"), { name: "", type: "temp", annotated: true });
+});
+
 test("#743: [output]-annotated path with subfolder and an EXISTING file is NOT reported missing", async () => {
   const candidate = { node_id: 1363, file: "detailed/Anima_00005_.png [output]" };
   const probes = [];
@@ -347,6 +378,23 @@ test("#743: annotation is stripped BEFORE the Windows backslash split", async ()
   );
   assert.deepEqual(result, []);
   assert.deepEqual(probes, [{ filename: "Anima_00005_.png", subfolder: "detailed", type: "output" }]);
+});
+
+test("#743: UNSPACED root-level [output] value is probed against the output root, not skipped", async () => {
+  // "foo.png[output]" is an annotation to ComfyUI (bare endswith) resolving as
+  // "foo.pn" in the output root (fixed 9-char slice). A space-requiring parser
+  // would misread it as a plain input value and skip the probe entirely.
+  const candidate = { node_id: 12, file: "foo.png[output]" };
+  const probes = [];
+  const result = await filterServerConfirmedInputSubfolderCandidates(
+    [candidate],
+    async (file, ref) => {
+      probes.push(ref);
+      return true;
+    },
+  );
+  assert.deepEqual(result, []);
+  assert.deepEqual(probes, [{ filename: "foo.pn", subfolder: "", type: "output" }]);
 });
 
 test("addComboOption adds a value to an array-backed combo in place", () => {

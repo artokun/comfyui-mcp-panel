@@ -153,16 +153,23 @@ export function splitInputAssetRef(value, { backslashIsSeparator = true } = {}) 
   return { subfolder: v.slice(0, i), filename: v.slice(i + 1) };
 }
 
-// ComfyUI's annotated-filepath suffix, parsed by folder_paths.annotated_filepath:
-// a widget value picked from a loader's combo can carry the root it belongs to as
-// a trailing " [output]" / " [input]" / " [temp]" — e.g. a SaveImage result fed
-// back into LoadImage is stored as `detailed/Anima_00005_.png [output]`, NOT as a
-// bare input-dir name. The suffix lengths ComfyUI strips (9/8/8) include the one
-// separating space, so the regex requires exactly that shape.
-const ANNOTATED_FILEPATH_RE = /\s\[(output|input|temp)\]$/;
+// ComfyUI's annotated-filepath suffixes, recognized EXACTLY the way
+// folder_paths.annotated_filepath does (folder_paths.py): a bare endswith()
+// check — NO preceding space required — followed by a FIXED-length slice of
+// suffix+1 chars (9/8/7 for output/input/temp, one more than
+// "[output]"/"[input]"/"[temp]" so the usual separating space goes too). The
+// extra char is sliced UNCONDITIONALLY: an unspaced `foo[output]` resolves as
+// `fo` in the output root — quirky, but it is precisely the path LoadImage will
+// resolve, so the probe must check that same file. Lookalikes (`[output2]`) and
+// mid-string brackets are not suffixes and stay unannotated.
+const ANNOTATED_SUFFIXES = [
+  ["[output]", "output", 9],
+  ["[input]", "input", 8],
+  ["[temp]", "temp", 7],
+];
 
 /**
- * Strip ComfyUI's ` [output]` / ` [input]` / ` [temp]` annotation off a media
+ * Strip ComfyUI's `[output]` / `[input]` / `[temp]` annotation off a media
  * widget value, mirroring `folder_paths.annotated_filepath`: returns the bare
  * `name` (any subfolder prefix INTACT — the annotation selects the ROOT, it is
  * not part of the path) and the `type` root it resolves against. An unannotated
@@ -172,9 +179,14 @@ const ANNOTATED_FILEPATH_RE = /\s\[(output|input|temp)\]$/;
  */
 export function parseAnnotatedFilepath(value) {
   const raw = String(value ?? "");
-  const m = ANNOTATED_FILEPATH_RE.exec(raw);
-  if (!m) return { name: raw, type: "input", annotated: false };
-  return { name: raw.slice(0, m.index), type: m[1], annotated: true };
+  for (const [suffix, type, sliceLen] of ANNOTATED_SUFFIXES) {
+    if (raw.endsWith(suffix)) {
+      // Python's name[:-N] clamps to "" when the slice exceeds the string;
+      // Math.max keeps JS slice(0, -k) from instead eating a trailing char.
+      return { name: raw.slice(0, Math.max(raw.length - sliceLen, 0)), type, annotated: true };
+    }
+  }
+  return { name: raw, type: "input", annotated: false };
 }
 
 /**
