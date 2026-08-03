@@ -245,8 +245,10 @@ export async function groundActiveWorkflow(svc, opts = {}) {
  *     source's containing folder, and leaves the original file on disk). NEVER
  *     renameWorkflow() here — that would move/destroy the source (issue #226).
  *   - a never-saved (temporary) workflow that needs a name → also Save-As, which
- *     for a temporary safely renames the in-memory tab to a real file (there is
- *     no source file to consume).
+ *     for a temporary copies the graph into a real file and then CONSUMES the
+ *     never-persisted source tab (its in-memory record only — there is
+ *     provably no source file to destroy), so no modified "Unsaved Workflow"
+ *     ghost tab outlives the save (issue #566).
  *   - otherwise → save in place under the current name (`svc.saveWorkflow`).
  *
  *  `autoWorkflowName` mints a grounding name for a placeholder temporary
@@ -478,6 +480,38 @@ export async function saveActiveWorkflow(
             `save moved the original workflow "${sourcePath}" instead of copying it — ` +
               `the source no longer exists on disk (issue #226)`,
           );
+        }
+      }
+      // #566 FIRST-SAVE PREDECESSOR CONSUMPTION (cls === "never-persisted"). The atomic
+      // trio saves by COPYING: saveAs builds a NEW object at the target, openWorkflow
+      // activates it, saveWorkflow persists it. ComfyUI's own temporary Save-As instead
+      // RENAMES the temp tab (one tab, rekeyed) — so our move-free copy leaves the
+      // never-persisted SOURCE tab open: a modified "Unsaved Workflow (N)" ghost that
+      // outlives both the save AND the later close of the saved tab (the exact #566
+      // repro: panel_save_workflow + panel_close_workflow left 34 modified unsaved
+      // tabs). The save conceptually CONSUMED that tab — its graph now lives in the
+      // persisted copy, and the classifier PROVED no on-disk file backs it — so purge
+      // its IN-MEMORY record (identity-safe, disk untouched). Runs ONLY after the
+      // copy's successful persist + post-write clobber check above: a failed save
+      // keeps the user's unsaved tab. A PERSISTED source is never consumed — a Save-As
+      // copy deliberately leaves the original tab open.
+      if (cls === "never-persisted") {
+        // Stamp BEFORE any identity comparison so the source is recognizable through
+        // the store's reactive proxies (the token reflects through a Vue proxy) —
+        // the same mechanism the copy's own cleanup relies on.
+        stampCopyToken(wf);
+        const produced = svc?.activeWorkflow;
+        // Guard: consume the predecessor ONLY when the copy actually took over the
+        // active slot. If openWorkflow left the SOURCE active (an unfaithful
+        // frontend), the swap never happened and the visible tab must stay.
+        if (produced && !isSameCopy(wf, produced)) {
+          removeInMemoryWorkflow(svc, wf);
+          // r10 thread for the #557 save-swap identity carry: the post-save ACTIVE
+          // object IS the record the trio produced (saveAs built it, openWorkflow
+          // activated it, saveWorkflow persisted it) — the ONLY succession proof the
+          // carry accepts. With the predecessor gone, the temp tab's identity can now
+          // continue onto its saved successor instead of dying with the ghost.
+          if (details) details.savedRecord = produced;
         }
       }
       return activeName;

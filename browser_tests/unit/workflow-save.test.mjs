@@ -788,16 +788,21 @@ function makeStore147Service({ files = [], active, graph = SAMPLE_GRAPH } = {}) 
   for (const f of files) disk.set(f, JSON.stringify({ seeded: f }))
   const calls = []
   const store = new Map() // path -> in-memory workflow object
+  const openWorkflows = [] // the open tab strip (1.47 openWorkflows)
   // The active source tab is LOADED (the user is editing it): model its live
   // graph via a changeTracker, exactly what save()/saveAs read.
   if (active && active.changeTracker === undefined) {
     active.changeTracker = { activeState: graph, prepareForSave() {} }
   }
-  if (active) store.set(active.path, active)
+  if (active) {
+    store.set(active.path, active)
+    openWorkflows.push(active)
+  }
   const svc = {
     activeWorkflow: active,
     calls,
     disk,
+    openWorkflows,
     // In-memory oracle: returns whatever object the store holds at `path`,
     // INCLUDING the open temporary tab. Never consults disk. Mirrors 1.47's
     // `getWorkflowByPath = e => n.value[e] ?? null`.
@@ -831,8 +836,20 @@ function makeStore147Service({ files = [], active, graph = SAMPLE_GRAPH } = {}) 
       if (wf.changeTracker === null) {
         wf.changeTracker = { activeState: wf._pendingState, prepareForSave() {} }
       }
+      if (!openWorkflows.includes(wf)) openWorkflows.push(wf)
       svc.activeWorkflow = wf
       return wf
+    },
+    // Mirrors 1.47 store `closeWorkflow`: the tab leaves the open strip, and the
+    // path-keyed lookup entry is deleted ONLY for a TEMPORARY workflow — a
+    // persisted one is merely unload()ed and its record STAYS in the lookup.
+    // Never touches disk.
+    async closeWorkflow(wf) {
+      calls.push(['closeWorkflow', wf.path])
+      const i = openWorkflows.indexOf(wf)
+      if (i >= 0) openWorkflows.splice(i, 1)
+      if (wf.isTemporary === true || wf.size === -1) store.delete(wf.path)
+      if (svc.activeWorkflow === wf) svc.activeWorkflow = openWorkflows[0] ?? null
     },
     async saveWorkflow(wf) {
       calls.push(['saveWorkflow', wf.path])
@@ -2249,6 +2266,137 @@ test('panel#363: naming a workflow created by panel_new_workflow (temp tab) SUCC
   assert.ok(svc.calls.some((c) => c[0] === 'saveAs'), 'used the atomic low-level saveAs copy')
   assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'no source file to move — never renamed')
   assert.equal(saved, 'Video Face Detail - Second Stage')
+})
+
+// ---------------------------------------------------------------------------
+// #566 — saving then closing a NEW (never-persisted) workflow must leave NO
+// duplicate modified "Unsaved Workflow" tab. The atomic copy trio activates the
+// saved copy; the first save must CONSUME the never-persisted predecessor tab.
+
+test("#566: a temp tab's first save CONSUMES the temp tab — save-then-close leaves NO ghost Unsaved Workflow", async () => {
+  // The exact #566 repro: a new (never-persisted) tab populated with nodes is saved
+  // under a real name (panel_save_workflow) and then closed (panel_close_workflow).
+  // The atomic copy path activates the SAVED copy but used to leave the original
+  // temporary tab open — a modified, persisted:false "Unsaved Workflow (N)" ghost
+  // that survived the close (the report accumulated 34 of them).
+  const active = {
+    path: 'workflows/Unsaved Workflow (2).json',
+    filename: 'Unsaved Workflow (2).json',
+    directory: 'workflows',
+    isPersisted: false,
+    isTemporary: true,
+    isModified: true // the user populated the canvas
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ active }) // disk EMPTY ⇒ temp 404s
+
+  const details = {}
+  const saved = await saveActiveWorkflow(svc, 'XYR_SH01_v001', { existsOnDisk, details })
+
+  assert.equal(details.mode, 'first-save', 'a never-persisted temp tab is a first save')
+  assert.ok(svc.disk.has('workflows/XYR_SH01_v001.json'), 'saved file persisted')
+  // The predecessor temp tab is CONSUMED: lookup purged and off the open-tab strip.
+  assert.equal(
+    svc.getWorkflowByPath('workflows/Unsaved Workflow (2).json'),
+    null,
+    'the consumed temp tab is purged from the store lookup'
+  )
+  assert.ok(!svc.openWorkflows.includes(active), 'the temp tab left the open-tab strip')
+  const successor = svc.activeWorkflow
+  assert.equal(successor?.path, 'workflows/XYR_SH01_v001.json', 'the saved copy is the active tab')
+  assert.deepEqual(
+    svc.openWorkflows,
+    [successor],
+    'exactly ONE tab remains — the saved successor (no duplicate unsaved tab)'
+  )
+  // r10 wiring for the #557 save-swap identity carry: the save threads its OWN
+  // produced record, so the temp tab's identity can continue onto the successor.
+  assert.equal(details.savedRecord, successor, 'save-produced record threaded for the identity carry')
+  // Closing the saved workflow (panel_close_workflow) then leaves NOTHING behind.
+  await svc.closeWorkflow(successor)
+  assert.deepEqual(svc.openWorkflows, [], 'save-then-close leaves zero tabs — no ghost unsaved tab (#566)')
+  assert.equal(saved, 'XYR_SH01_v001')
+})
+
+test('#566: an auto-named grounding first save also consumes the temp predecessor', async () => {
+  // Same consumption on the no-name grounding path (#330): the ghost must not
+  // linger there either.
+  const active = {
+    path: 'workflows/Unsaved Workflow (3).json',
+    filename: 'Unsaved Workflow (3).json',
+    directory: 'workflows',
+    isPersisted: false,
+    isTemporary: true,
+    isModified: true
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ active })
+
+  await saveActiveWorkflow(svc, undefined, {
+    autoWorkflowName: () => 'Untitled 2026-08-03',
+    existsOnDisk
+  })
+
+  assert.ok(svc.disk.has('workflows/Untitled 2026-08-03.json'), 'auto-named file persisted')
+  assert.equal(
+    svc.getWorkflowByPath('workflows/Unsaved Workflow (3).json'),
+    null,
+    'temp lookup purged after the grounding save'
+  )
+  assert.deepEqual(
+    svc.openWorkflows,
+    [svc.activeWorkflow],
+    'only the grounded successor remains open'
+  )
+})
+
+test("#566: a PERSISTED workflow's Save-As COPY keeps the source tab open (only a first save consumes)", async () => {
+  // The consumption must NEVER touch a real Save-As: copying an already-persisted
+  // workflow deliberately leaves the original tab open (standard Save-As UX).
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ files: [active.path], active })
+
+  await saveActiveWorkflow(svc, 'Bar', { existsOnDisk })
+
+  assert.ok(svc.disk.has('workflows/Foo.json'), 'source file preserved')
+  assert.equal(svc.getWorkflowByPath('workflows/Foo.json'), active, 'source lookup untouched')
+  assert.equal(svc.openWorkflows.length, 2, 'BOTH tabs remain — a Save-As copy never consumes the original tab')
+  assert.ok(svc.openWorkflows.includes(active), 'the original tab stays open')
+  assert.equal(svc.activeWorkflow?.path, 'workflows/Bar.json', 'the copy is the active tab')
+})
+
+test('#566: the temp predecessor is NOT consumed when openWorkflow leaves the SOURCE active (no swap occurred)', async () => {
+  // Guard: on an unfaithful frontend whose openWorkflow never activates the copy,
+  // the swap never happened — the visible source tab must stay (and no succession
+  // proof is threaded).
+  const active = {
+    path: 'workflows/Unsaved Workflow.json',
+    filename: 'Unsaved Workflow.json',
+    directory: 'workflows',
+    isPersisted: false,
+    isTemporary: true
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ active })
+  svc.openWorkflow = async (copy) => {
+    svc.calls.push(['openWorkflow', copy.path])
+    // UNFAITHFUL: loads nothing and never activates — the source stays active.
+  }
+
+  const details = {}
+  await saveActiveWorkflow(svc, 'Named', { existsOnDisk, details })
+
+  assert.equal(svc.activeWorkflow, active, 'the source is still the active tab')
+  assert.equal(
+    svc.getWorkflowByPath('workflows/Unsaved Workflow.json'),
+    active,
+    'the source tab was NOT consumed (the swap never happened)'
+  )
+  assert.ok(svc.openWorkflows.includes(active), 'the source tab stays open')
+  assert.equal(details.savedRecord, undefined, 'no succession proof threaded without a swap')
 })
 
 // ---------------------------------------------------------------------------
