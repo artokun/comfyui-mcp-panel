@@ -205,6 +205,18 @@ export function promptContentHashFromBody(bodyText, volatileInputs = null) {
  * carrier's mode is the string "fixed", which never mutates (a fixed control
  * leaves the target fully covered, so a genuine mid-window user edit to it is
  * still detected as drift).
+ *
+ * ACCEPTED RESIDUAL (codex gate, documented deliberately): the exclusion is
+ * narrowed to exactly the input(s) the hook mutates — each linked target's own
+ * serialized input — but a USER edit to one of THOSE SAME inputs inside the
+ * deferred window (e.g. seed 111 → 777 while the post is pending) is
+ * inherently indistinguishable from the hook's own reroll and is therefore
+ * TOLERATED, not refused. This is the narrowest possible gap: an edit to ANY
+ * OTHER input of the same node (or any input anywhere else) still mismatches
+ * the hash and refuses the dispatch. The gap is never silent: dispatchScopedRun
+ * returns these pairs as `volatileInputs`, and graph_run surfaces them in the
+ * run result's `drift_coverage` note so the caller knows which inputs were not
+ * drift-covered for that run.
  */
 export function collectVolatileInputs(rootGraph) {
   const pairs = new Set();
@@ -662,7 +674,10 @@ export function cancelPendingScopedQueueItem(app, { runTag, queueMark } = {}) {
  * sentinel decision, and the finally-restore) is what the unit tests drive.
  *
  * Returns a discriminated result (never throws for queue outcomes), always
- * carrying the run's unique `queueMark`:
+ * carrying the run's unique `queueMark` and — once the prompt was fingerprinted
+ * — `volatileInputs`: the sorted "execId inputName" pairs this run did NOT
+ * drift-cover (queue-time hook inputs; see collectVolatileInputs' ACCEPTED
+ * RESIDUAL note), so the caller can state the coverage gap honestly:
  *  - { outcome: "dispatched",   queueMark }  our scoped dispatch was OBSERVED
  *    (prompt_ids / a server rejection captured via the callbacks);
  *  - { outcome: "refused",      queueMark, error }  every argument shape
@@ -718,6 +733,12 @@ export async function dispatchScopedRun({
   if (!contentHash) {
     return { outcome: "unverifiable", queueMark: mark, error: scopeUnattributableError({ toNodeId }) };
   }
+  // #572 — the inputs this run does NOT drift-cover (queue-time hook inputs:
+  // hook carriers plus their linked, serialized targets). Surfaced on every
+  // post-hash outcome so the caller can report the coverage gap truthfully
+  // instead of implying full-graph drift proof (see collectVolatileInputs'
+  // ACCEPTED RESIDUAL note).
+  const volatileList = volatileInputs ? [...volatileInputs].sort() : [];
   // Ownership tag for the timeout cancellation (see QUEUE_ITEM_TAG).
   const runTag = Symbol("cmcp-scoped-run");
   try {
@@ -766,6 +787,7 @@ export async function dispatchScopedRun({
             outcome: "unverified",
             queueMark: mark,
             verified,
+            volatileInputs: volatileList,
             error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: true, verified, batch }),
           };
         }
@@ -774,6 +796,7 @@ export async function dispatchScopedRun({
           outcome: "unverified",
           queueMark: mark,
           verified,
+          volatileInputs: volatileList,
           error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: false, verified, batch }),
         };
       }
@@ -798,6 +821,7 @@ export async function dispatchScopedRun({
         outcome: "failed",
         queueMark: mark,
         verified: guard.state.observed,
+        volatileInputs: volatileList,
         error: guard.state.failed +
           (keepGuardInstalled
             ? " The scope guard stays installed as a sentinel for the rest of this page session."
@@ -808,17 +832,17 @@ export async function dispatchScopedRun({
     // established rejection channel — the run "dispatched" and ComfyUI said
     // no; graph_run's summarizePromptRejection surfaces it, never queued:true.
     if (guard.state.rejected > 0) {
-      return { outcome: "dispatched", queueMark: mark, verified: guard.state.observed };
+      return { outcome: "dispatched", queueMark: mark, verified: guard.state.observed, volatileInputs: volatileList };
     }
     // The FULL batch verified — genuinely dispatched (r5: never on a partial).
     if (guard.state.observed >= batch) {
-      return { outcome: "dispatched", queueMark: mark, verified: guard.state.observed };
+      return { outcome: "dispatched", queueMark: mark, verified: guard.state.observed, volatileInputs: volatileList };
     }
     // r7 CONTENT DRIFT with ZERO verified posts is NOT an argument-shape
     // problem — retrying the other shape would produce the same drifted post.
     // Terminal refusal naming that the graph changed under the deferred item.
     if (guard.state.observed === 0 && guard.state.droppedReason === "graph_changed") {
-      return { outcome: "refused", queueMark: mark, verified: 0, error: guard.state.dropped };
+      return { outcome: "refused", queueMark: mark, verified: 0, volatileInputs: volatileList, error: guard.state.dropped };
     }
     // A corrupted post with ZERO verified posts means this argument SHAPE was
     // dropped by the frontend — nothing was queued, so retrying the other
@@ -836,6 +860,7 @@ export async function dispatchScopedRun({
       outcome: "refused",
       queueMark: mark,
       verified: guard.state.observed,
+      volatileInputs: volatileList,
       error: scopePartialBatchError({
         toNodeId,
         verified: guard.state.observed,
@@ -845,5 +870,5 @@ export async function dispatchScopedRun({
       }),
     };
   }
-  return { outcome: "refused", queueMark: mark, verified: 0, error: dropped };
+  return { outcome: "refused", queueMark: mark, verified: 0, volatileInputs: volatileList, error: dropped };
 }

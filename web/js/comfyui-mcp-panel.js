@@ -8206,11 +8206,31 @@ const GRAPH_TOOL_EXECUTORS = {
     // Surface the queued prompt_id(s) so the agent can correlate/track the run —
     // #370 reconciliation and mcp#531 (panel_run must return the prompt_id even
     // when a render is already running) both depend on this being reported.
-    return buildQueueAcceptResult({
+    const accept = buildQueueAcceptResult({
       batchCount: batch,
       promptIds: queuedPromptIds,
       ranToNode: partialTargets ? Number(to_node_id) : null,
     });
+    // #572 — TRUTHFUL drift-coverage note for a scoped run: the drift hash
+    // excluded queue-time hook inputs (beforeQueued carriers + their linked,
+    // serialized targets — e.g. a control_after_generate seed reroll). A user
+    // edit to exactly THOSE inputs during the queue window is indistinguishable
+    // from the hook's own mutation (accepted residual), so the result names the
+    // uncovered inputs instead of implying full-graph drift proof. Every other
+    // input was covered.
+    const uncovered = runScopeResult?.volatileInputs;
+    if (partialTargets && Array.isArray(uncovered) && uncovered.length) {
+      accept.drift_coverage = {
+        covered: "partial",
+        uncovered_inputs: uncovered,
+        note:
+          "These queue-time hook inputs (beforeQueued, e.g. a control_after_generate seed " +
+          "reroll) were excluded from this run's graph-drift check: a user edit to exactly " +
+          "these inputs during the queue window is indistinguishable from the hook's own " +
+          "mutation and would NOT have been caught. Every other input was drift-covered.",
+      };
+    }
+    return accept;
   },
 
   // WHY IS THAT NODE RED? — the single error surface. LiteGraph only sets a
