@@ -197,6 +197,7 @@ import { isLinkPersisted, removePhantomLink, isWidgetBackedInput } from "./lib/c
 import { deferChangeTrackerSnapshot } from "./lib/change-tracker-snapshot.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
 import {
+  driftedRequiredInputNames,
   missingRequiredWidgetMaterializations,
   registeredSocketTypes,
   unavailableRequiredCustomWidgetTypes,
@@ -6480,7 +6481,7 @@ async function awaitRequiredCustomWidgetRegistration(
   nodeData,
   comfyApp,
   knownSocketTypes,
-  requiredInputNames,
+  currentDef,
 ) {
   const deadline = Date.now() + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
   const check = () =>
@@ -6488,7 +6489,7 @@ async function awaitRequiredCustomWidgetRegistration(
       nodeData,
       comfyApp?.widgets,
       knownSocketTypes,
-      requiredInputNames,
+      currentDef,
     );
   let unavailable = check();
   while (Date.now() < deadline) {
@@ -7738,11 +7739,12 @@ const GRAPH_TOOL_EXECUTORS = {
     // seeds, so the next call succeeds without a reload.
     await awaitObjectInfoHistorySeed();
     // Captured from the SAME fresh /object_info the resolvability assert just
-    // fetched, so the widget guards below can restrict themselves to the inputs
-    // the BACKEND actually requires (#620: the frontend-injected `upload` input
-    // on LoadImage & friends is never in this set and can never be a missing
-    // prompt value). `undefined` when the type is a frontend-only exemption
-    // (no backend def exists), which preserves the unfiltered guard.
+    // fetched. The widget guards below scan THIS def — the backend's current
+    // truth — not the possibly-stale registered nodeData: frontend-injected
+    // inputs (#620 LoadImage's `upload`) are absent from it and never
+    // guarded, and inputs the backend added since page load are still seen.
+    // `undefined` when the type is a frontend-only exemption (no backend def
+    // exists), which falls back to scanning the registered node data.
     let freshDefs = null;
     await assertAddNodeResolvableRefreshing(() => LG?.registered_node_types ?? {}, class_type, {
       getFreshObjectInfo: async () =>
@@ -7753,11 +7755,22 @@ const GRAPH_TOOL_EXECUTORS = {
       // #458 OBSERVED-BACKEND-HISTORY trust root, identical to graph_set_widget's.
       wasTypeEverDefined: (t) => objectInfoHistory.wasTypeEverDefined(t),
     });
-    const backendRequired = freshDefs?.[class_type]?.input?.required;
-    const backendRequiredNames =
-      backendRequired && typeof backendRequired === "object"
-        ? new Set(Object.keys(backendRequired))
-        : undefined;
+    const currentDef = freshDefs?.[class_type] ?? undefined;
+    const nodeData = LG?.registered_node_types?.[class_type]?.nodeData;
+    // A pack upgraded mid-session can add required inputs to an ALREADY
+    // registered class; the resolver only refreshes absent classes, so
+    // createNode would build the OLD shape — a new link input would not even
+    // get a slot and the node could never validate. Refuse before creating
+    // anything, with the remedy that actually updates the schema.
+    const drifted = driftedRequiredInputNames(currentDef, nodeData);
+    if (drifted.length) {
+      throw new Error(
+        `"${class_type}" gained required input${drifted.length === 1 ? "" : "s"} ` +
+          `${drifted.map((name) => `"${name}"`).join(", ")} since this page loaded its node ` +
+          "schema. Reload the ComfyUI tab so the frontend picks up the updated node " +
+          "definition, then retry.",
+      );
+    }
     // Socket proof comes from the SAME fresh defs — NOT the LiteGraph
     // registry, whose nodeData.output keeps stale positives for removed or
     // schema-changed packs and would wrongly waive the guard.
@@ -7767,10 +7780,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // required constructors before creating anything, or fail retryably before
     // mutating the graph (#580).
     await awaitRequiredCustomWidgetRegistration(
-      LG?.registered_node_types?.[class_type]?.nodeData,
+      nodeData,
       comfyApp,
       knownSocketTypes,
-      backendRequiredNames,
+      currentDef,
     );
     const node = LG.createNode(class_type);
     if (!node) {
@@ -7781,7 +7794,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const missingWidgets = missingRequiredWidgetMaterializations(
       node,
       comfyApp?.widgets,
-      backendRequiredNames,
+      currentDef,
     );
     if (missingWidgets.length) {
       throw new Error(

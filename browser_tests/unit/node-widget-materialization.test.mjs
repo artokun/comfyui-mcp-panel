@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  driftedRequiredInputNames,
   missingRequiredWidgetMaterializations,
   registeredSocketTypes,
   requiredWidgetInputTypes,
@@ -167,19 +168,20 @@ test("frontend-injected upload input is not guarded once the backend proves it n
     },
   };
   // Live /object_info for LoadImage reports required = image only: `upload`
-  // is 100% frontend-injected, so it can never be a missing prompt value and
-  // neither guard may reject over it.
-  const backendRequired = new Set(["image"]);
+  // is 100% frontend-injected, so it can never be a missing prompt value.
+  // Scanning the FRESH def instead of the frontend nodeData means neither
+  // guard ever sees it.
+  const currentDef = { input: { required: { image: [["a.png", "b.png"], {}] } } };
   assert.deepEqual(
     missingRequiredWidgetMaterializations(
       node,
       { COMBO: () => {}, IMAGEUPLOAD: () => {} },
-      backendRequired,
+      currentDef,
     ),
     [],
   );
   assert.deepEqual(
-    unavailableRequiredCustomWidgetTypes(node, { COMBO: () => {} }, undefined, backendRequired),
+    unavailableRequiredCustomWidgetTypes(node, { COMBO: () => {} }, undefined, currentDef),
     [],
   );
 });
@@ -197,9 +199,68 @@ test("a canvasOnly serialize:false widget for a BACKEND-required input is still 
       },
     },
   };
+  const currentDef = { input: { required: { gallery: ["ZIPN_STYLE_GALLERY", {}] } } };
   assert.deepEqual(
-    missingRequiredWidgetMaterializations(node, widgetConstructors, new Set(["gallery"])),
+    missingRequiredWidgetMaterializations(node, widgetConstructors, currentDef),
     ["gallery"],
+  );
+});
+
+test("a backend def present with no input requirements enforces nothing", () => {
+  // The class IS in fresh /object_info but requires no inputs — distinct from
+  // a frontend-only type (no def at all), which falls back to the node data.
+  const node = v3Node([{ name: "style" }]);
+  assert.deepEqual(missingRequiredWidgetMaterializations(node, widgetConstructors, {}), []);
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(node, {}, undefined, {}), []);
+});
+
+test("a required input added to an already-registered class is seen via the fresh def", () => {
+  // Pack upgraded mid-session: the registered nodeData predates the schema
+  // change. The guards must still catch the NEW required custom-widget input.
+  const staleNode = {
+    widgets: [],
+    constructor: {
+      nodeData: {
+        input: { required: { clip: ["CLIP", {}] } },
+      },
+    },
+  };
+  const currentDef = {
+    input: {
+      required: {
+        clip: ["CLIP", {}],
+        gallery: ["ZIPN_STYLE_GALLERY", {}],
+      },
+    },
+  };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(staleNode, {}, undefined, currentDef),
+    ["ZIPN_STYLE_GALLERY"],
+  );
+  // Constructor registered, but the stale-shaped node never built the widget.
+  assert.deepEqual(
+    missingRequiredWidgetMaterializations(staleNode, widgetConstructors, currentDef),
+    ["gallery"],
+  );
+  assert.deepEqual(driftedRequiredInputNames(currentDef, staleNode), ["gallery"]);
+  assert.deepEqual(driftedRequiredInputNames(currentDef, { input: currentDef.input }), []);
+  assert.deepEqual(driftedRequiredInputNames(undefined, staleNode), []);
+});
+
+test("raw /object_info snake_case force_input remains a wireable socket", () => {
+  const node = {
+    constructor: {
+      nodeData: {
+        input: {
+          required: { text: ["STRING", { force_input: true }] },
+        },
+      },
+    },
+  };
+  assert.deepEqual(requiredWidgetInputTypes(node), []);
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(node, {}, undefined, node.constructor.nodeData),
+    [],
   );
 });
 

@@ -8,8 +8,13 @@ function inputWidgetType(spec) {
   if (!Array.isArray(spec)) return null;
   const config = spec[1];
   // A forced socket is intentionally not materialized as a widget even when
-  // its type also has a widget constructor.
-  if (config && typeof config === "object" && (config.forceInput || config.widget === false)) {
+  // its type also has a widget constructor. The raw /object_info config keeps
+  // the snake_case spelling; the normalized frontend nodeData uses camelCase.
+  if (
+    config &&
+    typeof config === "object" &&
+    (config.forceInput || config.force_input || config.widget === false)
+  ) {
     return null;
   }
   const declared = spec[0];
@@ -28,20 +33,11 @@ function requiredInputs(nodeOrNodeData) {
  * The distinct required input types that are eligible to be frontend widgets.
  * `forceInput` / `widget:false` are sockets even if a custom widget constructor
  * happens to share their declared type.
- *
- * `requiredInputNames`, when a Set, restricts the scan to the inputs the
- * BACKEND actually requires (fresh /object_info). Frontend-injected inputs
- * (LoadImage's `upload` button, #620) are never in that set — the backend
- * never asks for them, so they can never be a missing prompt value and must
- * not be guarded.
  */
-export function requiredWidgetInputTypes(nodeOrNodeData, requiredInputNames) {
+export function requiredWidgetInputTypes(nodeOrNodeData) {
   const required = requiredInputs(nodeOrNodeData);
   if (!required) return [];
-  const entries = Object.entries(required).filter(
-    ([name]) => !(requiredInputNames instanceof Set) || requiredInputNames.has(name),
-  );
-  return [...new Set(entries.map(([, spec]) => inputWidgetType(spec)).filter(Boolean))];
+  return [...new Set(Object.values(required).map(inputWidgetType).filter(Boolean))];
 }
 
 // These are ComfyUI's built-in connection datatypes. A required input carrying
@@ -62,22 +58,30 @@ const SAFE_SOCKET_TYPES = new Set([
  * unavailable: their schema is indistinguishable from a widget pending its
  * extension hook, so admitting one would reintroduce #580's bad prompt.
  *
- * `knownSocketTypes` lifts that ambiguity where the LIVE registry already
- * proves the type is a link datatype (some registered node declares it as an
- * OUTPUT — no widget constructor will ever appear for it). Without it the
- * hardcoded allowlist above fails closed FOREVER on every third-party socket
- * datatype (#620 STITCHER) and on core types the list missed (#620 MASK,
- * #608 VIDEO), which no retry/refresh can ever clear. A still-unknown type
- * with NO registry proof continues to fail closed, so #580's protection is
- * intact.
+ * `currentDef` is the class's entry in a FRESH /object_info map. When given,
+ * it — not the possibly-stale registered nodeData — is the source of the
+ * required-input scan: frontend-injected inputs (LoadImage's `upload`
+ * button, #620) are absent from it and therefore never guarded, and inputs
+ * the backend ADDED since page load are still seen. A def present with no
+ * `input` means the backend requires nothing, so nothing is guarded. Omit
+ * it (frontend-only types have no backend def) to scan the node data.
+ *
+ * `knownSocketTypes` lifts the unknown-type ambiguity where the CURRENT
+ * backend already proves the type is a link datatype (some node in the same
+ * fresh /object_info declares it as an OUTPUT — no widget constructor will
+ * ever appear for it). Without it the hardcoded allowlist above fails closed
+ * FOREVER on every third-party socket datatype (#620 STITCHER) and on core
+ * types the list missed (#620 MASK, #608 VIDEO), which no retry/refresh can
+ * ever clear. A still-unknown type with NO proof continues to fail closed,
+ * so #580's protection is intact.
  */
 export function unavailableRequiredCustomWidgetTypes(
   nodeOrNodeData,
   widgetConstructors,
   knownSocketTypes,
-  requiredInputNames,
+  currentDef,
 ) {
-  return requiredWidgetInputTypes(nodeOrNodeData, requiredInputNames).filter(
+  return requiredWidgetInputTypes(currentDef ?? nodeOrNodeData).filter(
     (type) =>
       typeof widgetConstructors?.[type] !== "function" &&
       !SAFE_SOCKET_TYPES.has(type) &&
@@ -107,23 +111,40 @@ export function registeredSocketTypes(objectInfoDefs) {
 }
 
 /**
+ * Required input names the CURRENT backend def declares that the registered
+ * (possibly stale) node definition does not have at all. A pack upgraded
+ * mid-session can add required inputs to an ALREADY-registered class; the
+ * registry is refreshed only for absent classes, so createNode would build
+ * the OLD shape — a new link input would not even get a slot, and the node
+ * could never validate. The caller refuses with a reload remedy instead.
+ */
+export function driftedRequiredInputNames(currentDef, nodeOrNodeData) {
+  const current = currentDef?.input?.required;
+  if (!current || typeof current !== "object") return [];
+  const stale = requiredInputs(nodeOrNodeData) ?? {};
+  return Object.keys(current).filter(
+    (name) => !Object.prototype.hasOwnProperty.call(stale, name),
+  );
+}
+
+/**
  * Return required inputs whose registered frontend widget did not materialize
  * on `node`.  A socket-only custom datatype is deliberately not reported: it
  * has no registered widget constructor and is valid to wire later.
+ *
+ * `currentDef` has the same meaning as in unavailableRequiredCustomWidgetTypes:
+ * the fresh backend definition is the source of the required-input scan, so
+ * frontend-injected inputs (LoadImage's `upload`, #620) are never misread as
+ * a missing prompt value, and backend-required inputs the stale registry
+ * does not know yet are still checked.
  */
-export function missingRequiredWidgetMaterializations(node, widgetConstructors, requiredInputNames) {
-  const required = requiredInputs(node);
+export function missingRequiredWidgetMaterializations(node, widgetConstructors, currentDef) {
+  const required = requiredInputs(currentDef ?? node);
   if (!required) return [];
 
   const widgets = Array.isArray(node.widgets) ? node.widgets : [];
   const missing = [];
   for (const [name, spec] of Object.entries(required)) {
-    // Only inputs the BACKEND actually requires can fail prompt validation
-    // (#580). Frontend-injected inputs (LoadImage's `upload` button, #620 —
-    // created serialize:false/canvasOnly:true by ComfyUI's own
-    // Comfy.UploadImage extension) are never asked for by the backend, so
-    // they are skipped here instead of being misread as a missing value.
-    if (requiredInputNames instanceof Set && !requiredInputNames.has(name)) continue;
     const type = inputWidgetType(spec);
     if (!type || typeof widgetConstructors?.[type] !== "function") continue;
     const widget = widgets.find((candidate) => candidate?.name === name);
