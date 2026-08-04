@@ -265,6 +265,14 @@ export function planRebootResume(state = {}) {
  * one redundant sentence; a warning wrongly absent is an undisclosed duplicate
  * "continue", which is the hazard this whole fix exists to prevent.
  *
+ * The caller supplies `attemptRecorded`, and that evidence is MOUNT-LOCAL: a count
+ * whose write failed, whose message landed anyway, and whose storage later
+ * recovered reads back after a reload as a real — merely stale — zero, and this
+ * returns false for it. That residual is accepted and documented in the PR rather
+ * than fixed, because closing it means durably recording a failure at the moment
+ * storage refuses to record durably, and the only alternative is warning on every
+ * post-reload resume.
+ *
  * @param {{totalAttempts?:unknown, attemptRecorded?:boolean, sentThisMount?:number}} state
  * @returns {boolean}
  */
