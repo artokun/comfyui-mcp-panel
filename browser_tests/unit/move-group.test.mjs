@@ -74,6 +74,7 @@ function realMoveGroup(graph) {
     "groupBoxIsAt",
     "describeItems",
     "describeThrown",
+    "syncNodeArea",
     `"use strict";
      ${resolveGroupSrc}
      ${setGroupBoundsSrc}
@@ -95,6 +96,7 @@ function realMoveGroup(graph) {
     groupBoxIsAt,
     describeItems,
     describeThrown,
+    syncNodeArea,
   );
 }
 
@@ -1338,7 +1340,163 @@ test("#408 P0: a node list that dies MID-WALK still yields a rollback, not a raw
   assert.deepEqual(g._bounding, [0, 0, 400, 400]);
 });
 
+// ---- the transaction ends at SERIALIZATION, not at the last write ----------
+
+test("#408 P0: a title whose toJSON throws still yields the completed counts, not a lost reply", () => {
+  // summarizeGroup returns `title` UNCOERCED, so a title with a throwing toJSON
+  // lets it succeed and then makes the bridge's JSON.stringify fail — after the
+  // move, outside the guard, where the caller receives no success response at all
+  // and re-issues. That is the double move summary_unavailable exists to prevent,
+  // surviving one layer further out than the guard reached.
+  const a = node(7, [50, 50], [60, 40]);
+  const hostileTitle = {
+    toJSON() { throw new TypeError("title toJSON is a revoked proxy"); },
+    toString() { return "Hostile"; },
+  };
+  const g = { id: 1, title: hostileTitle, _bounding: [0, 0, 400, 400], recomputeInsideNodes() {} };
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  let out;
+  assert.doesNotThrow(() => { out = realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }); });
+
+  assert.deepEqual(a.pos, [1050, 1050], "the move really did complete");
+  assert.deepEqual(out.moved, { nodes: 1, groups: 0, reroutes: 0 }, "the caller still gets the counts");
+  assert.match(out.summary_unavailable, /move COMPLETED/);
+  assert.match(out.summary_unavailable, /do NOT re-issue the move/);
+  // And the whole reply must itself survive the boundary it is about to cross.
+  assert.doesNotThrow(() => JSON.stringify(out), "the reply the bridge will serialize must be serializable");
+});
+
+test("#408: an ordinary reply is plain JSON — round-tripped, not live engine references", () => {
+  const a = node(7, [50, 50], [60, 40]);
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  const out = realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
+
+  assert.deepEqual(out.group.node_ids, [7]);
+  assert.deepEqual(out.moved, { nodes: 1, groups: 0, reroutes: 0 });
+  assert.deepEqual(JSON.parse(JSON.stringify(out)), out, "already plain");
+});
+
+// ---- both undos, and only what was recorded --------------------------------
+
+test("#408 P0: the mutation-phase rollback also undoes the PRE-FLIGHT's rect writes", () => {
+  // Node A carries a stale rect the pre-flight reconciles. Node B is frozen in
+  // place so the move is refused. Rolling back only the mutation phase left A's
+  // reconciled rect in place under a reply saying NOTHING was moved.
+  const a = { id: 7, pos: [100, 100], size: [60, 40], boundingRect: [-9, -9, 1, 1] };
+  const b = { id: 8, size: [60, 40], boundingRect: [150, 120, 60, 70], get pos() { return Object.freeze([150, 150]); } };
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [a, b], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /node 8.*NOTHING was moved/s,
+  );
+  assert.deepEqual(a.pos, [100, 100], "the member is back");
+  assert.deepEqual(
+    [...a.boundingRect],
+    [-9, -9, 1, 1],
+    "and the rect the PRE-FLIGHT reconciled is back too — there are two undos and this path owns both",
+  );
+});
+
+test("#408 P0: move_nodes:false undoes the pre-flight when its box write fails", () => {
+  const a = { id: 7, pos: [100, 100], size: [60, 40], boundingRect: [-9, -9, 1, 1] };
+  const g = { id: 1, title: "Frozen", _bounding: Object.freeze([0, 0, 400, 400]) };
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000], move_nodes: false }),
+    /the group box did not accept the new position.*NOTHING was moved/s,
+  );
+  assert.deepEqual([...a.boundingRect], [-9, -9, 1, 1], "the pre-flight's write is taken back");
+});
+
+test("#408 P0: a node whose rect SNAPSHOT throws is never written to", () => {
+  // You cannot undo what you never recorded. This rect's `[1]` getter throws once
+  // — while the snapshot is being taken — and then accepts every write. Syncing it
+  // anyway would reconcile it with no undo recorded, and a later refusal would say
+  // NOTHING was moved over a node it has no way to put back.
+  let reads = 0;
+  const values = [-9, -9, 1, 1];
+  const trapRect = {
+    length: 4,
+    get 0() { return values[0]; },
+    set 0(v) { values[0] = v; },
+    get 1() {
+      reads += 1;
+      if (reads === 1) throw new TypeError("rect read is a revoked proxy");
+      return values[1];
+    },
+    set 1(v) { values[1] = v; },
+    get 2() { return values[2]; },
+    set 2(v) { values[2] = v; },
+    get 3() { return values[3]; },
+    set 3(v) { values[3] = v; },
+  };
+  const a = { id: 7, pos: [100, 100], size: [60, 40], boundingRect: trapRect };
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /node 7.*group membership cannot be determined.*NOTHING was moved/s,
+  );
+  assert.deepEqual(values, [-9, -9, 1, 1], "the rect it could not snapshot was never written");
+  assert.deepEqual(a.pos, [100, 100]);
+});
+
+test("#408 P0: the target coordinates are read ONCE, before the first write", () => {
+  // An array whose index 0 answers during validation and throws on a later read
+  // used to pass pre-flight, move the members, and then raise before writeBox —
+  // a new throwable operation performed after the first geometry write.
+  let reads = 0;
+  const hostilePos = [1000, 1000]; // a REAL array, so Array.isArray still holds
+  Object.defineProperty(hostilePos, "0", {
+    get() {
+      reads += 1;
+      if (reads > 1) throw new TypeError("pos read is a revoked proxy");
+      return 1000;
+    },
+    configurable: true,
+  });
+  const a = node(7, [50, 50], [60, 40]);
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  const out = realMoveGroup(graph)({ group_id: 1, pos: hostilePos });
+
+  assert.equal(reads, 1, "exactly one read of the target, taken before anything moved");
+  assert.deepEqual(a.pos, [1050, 1050], "and the move completed from the value read then");
+  assert.equal(out.moved.nodes, 1);
+});
+
 // ---- lib branches the handler tests above do not reach ---------------------
+
+test("describeItem / describeItems are total where they are EXPORTED, not just in the happy path", () => {
+  // The contract says total. `kind` is coerced by the template, and describeItems
+  // calls slice / destructures entries / reads length — all on caller-supplied
+  // values, all outside the original guard. A totality claim that holds for most
+  // of a function is the class of comment this codebase keeps getting burned by.
+  const hostileKind = { toString() { throw new TypeError("gone"); }, [Symbol.toPrimitive]() { throw new TypeError("gone"); } };
+  let out;
+  assert.doesNotThrow(() => { out = describeItem(hostileKind, { id: 1 }); });
+  assert.equal(typeof out, "string");
+
+  const hostilePairs = {
+    get length() { throw new TypeError("gone"); },
+    [Symbol.iterator]() { return [["node", { id: 1 }]][Symbol.iterator](); },
+  };
+  assert.doesNotThrow(() => { out = describeItems(hostilePairs); });
+  assert.match(out, /node 1/);
+
+  const noIterator = { length: 3 };
+  assert.doesNotThrow(() => { out = describeItems(noIterator); });
+  assert.equal(typeof out, "string");
+  assert.doesNotThrow(() => describeItems(null));
+});
 
 test("describeItem / describeItems never throw, and degrade to a placeholder", () => {
   assert.equal(describeItem("node", { id: 7 }), "node 7");

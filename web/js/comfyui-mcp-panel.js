@@ -10074,9 +10074,24 @@ const GRAPH_TOOL_EXECUTORS = {
     // box itself — an unrecoverable, invisible corruption of the user's layout
     // reported as a success. Every other geometry writer (graph_edit_node) already
     // validates; this one used to be the hole.
-    if (!Array.isArray(pos) || pos.length !== 2 || !pos.every((n) => Number.isFinite(Number(n)))) {
-      throw new Error("pos must be [x, y] finite numbers — pass the new top-left corner of the group box");
+    //
+    // Read the target coordinates EXACTLY ONCE, here, before anything is written.
+    // Re-reading `pos[0]` later is a new throwable operation performed after the
+    // first geometry write: an array whose index 0 returns 1000 during validation
+    // and throws on the second read would pass this check, move the members, and
+    // then raise before writeBox with nothing rolled back. Every later use is of
+    // these locals.
+    const badPos = new Error("pos must be [x, y] finite numbers — pass the new top-left corner of the group box");
+    if (!Array.isArray(pos) || pos.length !== 2) throw badPos;
+    let targetX;
+    let targetY;
+    try {
+      targetX = Number(pos[0]);
+      targetY = Number(pos[1]);
+    } catch {
+      throw badPos;
     }
+    if (!Number.isFinite(targetX) || !Number.isFinite(targetY)) throw badPos;
     // groupBoundsOf reads _bounding OR pos/size and returns null when neither is
     // usable. The old fallback invented [0, 0, 0, 0] in that case, which is not the
     // group's box — it silently relocated the group to the origin with a zero-size
@@ -10086,8 +10101,8 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!b) {
       throw new Error(`group ${group_id} has no usable bounds on this frontend — re-read it via panel_query_graph, or set its box explicitly with panel_edit_group({bounds})`);
     }
-    const dx = Number(pos[0]) - b[0];
-    const dy = Number(pos[1]) - b[1];
+    const dx = targetX - b[0];
+    const dy = targetY - b[1];
     let movedNodes = 0;
     let movedGroups = 0;
     let movedReroutes = 0;
@@ -10233,6 +10248,8 @@ const GRAPH_TOOL_EXECUTORS = {
             ...rerouteMove.undo(),
             ...memberMove.undo(),
             ...(restoreBox() ? [g] : []),
+            // …and the PRE-FLIGHT's writes, which this path also owns.
+            ...resync.undo(),
           ];
           throw new Error(
             `refusing to move group ${group_id}: the frontend raised "${describeThrown(error)}" partway through the move. ` +
@@ -10259,12 +10276,29 @@ const GRAPH_TOOL_EXECUTORS = {
         // `id` — display-only, and exactly the accessor most likely to be a proxy
         // or a throwing getter — so a name assembled while the graph is still
         // dirty can abort the very rollback it is describing.
-        const rollback = () => [
-          ...nestedMove.undo().map((c) => ["group", c]),
-          ...rerouteMove.undo().map((r) => ["reroute", r]),
-          ...memberMove.undo().map((n) => ["node", n]),
-          ...(restoreBox() ? [["group", g]] : []),
-        ];
+        //
+        // There are TWO undos, and this path owns BOTH. The pre-flight's rect
+        // reconciliation happened before any of this, so its undo runs LAST —
+        // after the member restores, whose own rect refresh would otherwise
+        // overwrite it. Rolling back only the mutation phase and then reporting
+        // "NOTHING was moved" left every reconciled rect in place.
+        const rollback = () => {
+          const stillWrong = [
+            ...nestedMove.undo().map((c) => ["group", c]),
+            ...rerouteMove.undo().map((r) => ["reroute", r]),
+          ];
+          const strandedMembers = memberMove.undo();
+          stillWrong.push(...strandedMembers.map((n) => ["node", n]));
+          if (restoreBox()) stillWrong.push(["group", g]);
+          stillWrong.push(...resync.undo().map((n) => ["node", n]));
+          // A member that could NOT be put back is somewhere else now, and the
+          // pre-flight undo has just restored its cached rect to where it used to
+          // be — which would report it as still inside the group it has actually
+          // left. This path already admits the graph is partially moved; the rect
+          // must describe where the node really IS, not resurrect a stale claim.
+          for (const n of strandedMembers) syncNodeArea(n);
+          return stillWrong;
+        };
         // `describeReason` is a THUNK: it is invoked only after the rollback has
         // run and the graph is provably back. Roll back first, format second.
         const refuse = (describeReason) => {
@@ -10290,7 +10324,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // The box write is the LAST thing that can fail. Its failure has to put the
         // children back too, or the group is left torn apart with an error saying
         // otherwise.
-        const boxError = writeBox(Number(pos[0]), Number(pos[1]));
+        const boxError = writeBox(targetX, targetY);
         if (boxError) {
           refuse(() => `the group box did not accept the new position on this frontend (${describeThrown(boxError)})`);
         }
@@ -10301,14 +10335,17 @@ const GRAPH_TOOL_EXECUTORS = {
         // Even the box-only move must be VERIFIED, not assumed: a clamping setter
         // or a proxy that ignores the write would otherwise return a confident
         // "moved the box to [x, y]" for a box that never left.
-        const boxError = writeBox(Number(pos[0]), Number(pos[1]));
+        const boxError = writeBox(targetX, targetY);
         if (boxError) {
-          const restoreFailed = restoreBox(); // rollback first…
+          // Rollback FIRST — and BOTH undos: the box, and the pre-flight's rect
+          // reconciliation, which this branch also performed.
+          const restoreFailed = restoreBox();
+          const unrestoredRects = resync.undo();
           throw new Error( // …then format
             `refusing to move group ${group_id}: the group box did not accept the new position on this frontend (${describeThrown(boxError)}). ` +
               (restoreFailed
                 ? `The box could NOT be put back at [${b[0]}, ${b[1]}] either — press Ctrl+Z on the canvas, or set it explicitly with panel_edit_group({bounds}).`
-                : "NOTHING was moved."),
+                : describePreflightUndo(unrestoredRects)),
           );
         }
         // NOTE: the resync that makes this branch's membership live already ran in
@@ -10330,12 +10367,11 @@ const GRAPH_TOOL_EXECUTORS = {
         /* the geometry is already written; the envelope is bookkeeping */
       }
     }
-    // ---- REPORTING (after the last write — it may not throw either) ----------
-    // The invariant is "after the first write, only complete or roll back", and
-    // reporting is after the first write. If summarizeGroup raises, the move HAS
+    // ---- REPORTING (still inside the transaction) ----------------------------
+    // The transaction ends when the reply is SERIALIZED and returned, not when the
+    // last geometry write completes. If summarizeGroup raises, the move HAS
     // happened: rolling back is wrong and re-raising is worse, because the caller
-    // would read a completed move as a failed one and retry it. Say what was done
-    // and that the summary is unavailable.
+    // would read a completed move as a failed one and retry it.
     try {
       graph.setDirtyCanvas(true, true);
     } catch {
@@ -10343,7 +10379,15 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     const moved = { nodes: movedNodes, groups: movedGroups, reroutes: movedReroutes };
     try {
-      return { group: summarizeGroup(graph, g), moved };
+      // summarizeGroup returns the group's own `title`/`color`/`id` and its member
+      // ids UNCOERCED, so a title with a throwing `toJSON` lets it succeed here and
+      // then makes the BRIDGE's JSON.stringify fail — after the move, outside this
+      // guard, where the caller gets no success response at all and re-issues.
+      // Proving the payload survives serialization INSIDE the guard is what pulls
+      // that last step back inside the transaction; round-tripping it also hands
+      // back a plainly-serializable object rather than live engine references.
+      const group = JSON.parse(JSON.stringify(summarizeGroup(graph, g)));
+      return { group, moved };
     } catch (error) {
       // The error path OF THE ERROR PATH. `error.message` can itself throw — a
       // group with a throwing `title` produces exactly such an error — and a throw

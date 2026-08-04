@@ -123,22 +123,51 @@ export function boundsAroundNodes(nodes, pad = 30, titlePad = 70) {
  * toString/Symbol.toPrimitive), so even the coercion is contained.
  */
 export function describeItem(kind, item) {
-  let text = "?";
+  // EVERY operation is inside the guard, including the template's coercion of
+  // `kind` and the `String(id)` call. A totality contract that holds for most of
+  // a function is the class of comment this codebase keeps getting burned by:
+  // callers guard on the promise, not on the implementation.
   try {
-    const id = item?.id;
-    if (id != null) text = String(id);
+    let text = "?";
+    try {
+      const id = item?.id;
+      if (id != null) text = String(id);
+    } catch {
+      text = "unnamed";
+    }
+    return `${String(kind)} ${text}`;
   } catch {
-    text = "unnamed";
+    return "an item that could not be named";
   }
-  return `${kind} ${text}`;
 }
 
 /** A comma-separated list of at most `max` item names, with an ellipsis when
- *  truncated. Total, for the same reason describeItem is. */
+ *  truncated. Total, for the same reason describeItem is — `slice`, the entry
+ *  destructuring and `length` are all operations on a caller-supplied value, so
+ *  they are inside the guard too. */
 export function describeItems(pairs, max = 5) {
-  const names = [];
-  for (const [kind, item] of pairs.slice(0, max)) names.push(describeItem(kind, item));
-  return names.join(", ") + (pairs.length > max ? ", …" : "");
+  try {
+    const names = [];
+    let count = 0;
+    for (const entry of pairs ?? []) {
+      if (count >= max) break;
+      count += 1;
+      try {
+        names.push(describeItem(entry?.[0], entry?.[1]));
+      } catch {
+        names.push("an item that could not be named");
+      }
+    }
+    let total = count;
+    try {
+      total = Number(pairs?.length);
+    } catch {
+      total = count;
+    }
+    return names.join(", ") + (Number.isFinite(total) && total > max ? ", …" : "");
+  } catch {
+    return "items that could not be named";
+  }
 }
 
 /**
@@ -396,12 +425,19 @@ export function syncGraphNodeAreas(graph) {
   let walkFailed = false;
   try {
     for (const n of graph?._nodes ?? []) {
+      // SNAPSHOT FIRST, and never write what the snapshot could not capture. The
+      // snapshot is itself inside the transaction: a rect whose `[1]` getter
+      // throws once and then accepts every subsequent write would otherwise be
+      // reconciled with NO undo recorded for it — and a later refusal would say
+      // "NOTHING was moved" over a node it has no way to put back. You cannot undo
+      // what you never recorded, so an uncapturable node is reported instead.
       let before = null;
       try {
         const br = n?.boundingRect;
         if (br && br.length === 4) before = [br[0], br[1], br[2], br[3]];
       } catch {
-        /* unreadable rect: syncNodeArea reports it below; nothing to capture */
+        unsynced.push(n);
+        continue; // unreadable rect ⇒ no restore point ⇒ do not touch it
       }
       if (before) attempted.push([n, before]);
       if (!syncNodeArea(n)) unsynced.push(n);
