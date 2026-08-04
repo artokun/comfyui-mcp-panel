@@ -19644,12 +19644,22 @@ function buildPanel() {
     // WRITE-AHEAD, and VERIFY. The attempt is recorded BEFORE it can happen, and the
     // write is read back. `ssSet` returning is not evidence it persisted — quota,
     // private mode and eviction all fail silently — and an increment that didn't
-    // stick reads back as "no attempt yet", so a retry after a reload would go out
-    // as a first attempt with no warning. This is the same shape as sent-vs-received
-    // one layer down: written is not persisted. A failed record therefore ALSO
-    // raises the warning, on this attempt and every later one, because if storage
-    // cannot count attempts we must assume there may have been one. A warning
-    // wrongly present is harmless; its absence is not.
+    // stick reads back as "no attempt yet", so a retry would go out as a first
+    // attempt with no warning. This is the same shape as sent-vs-received one layer
+    // down: written is not persisted. A failed record therefore ALSO raises the
+    // warning, because if storage cannot count attempts we must assume there may
+    // have been one. A warning wrongly present is harmless; its absence is not.
+    //
+    // SCOPE OF THAT GUARANTEE — it holds for the LIFE OF THIS MOUNT, not forever.
+    // If the record fails, the message nonetheless reaches the orchestrator, storage
+    // then recovers, and the frontend reloads, the new mount reads a real (merely
+    // stale) zero and cannot know a nudge already went out — so its next attempt is
+    // an undisclosed duplicate continuation. Doing better would mean durably
+    // recording "a write failed" at the exact moment storage is refusing to durably
+    // record anything; the only alternative is to warn on every post-reload resume,
+    // which trains the agent to ignore the warning. Accepted and documented in the
+    // PR as a sessionStorage-class residual — the outcome is a duplicate NUDGE, not
+    // a duplicate render.
     const retained = rebootMarkerAfterSend(step, false);
     let attemptRecorded = true;
     if (retained) {
