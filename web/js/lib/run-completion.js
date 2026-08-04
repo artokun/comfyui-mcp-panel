@@ -819,8 +819,21 @@ export function createRunCompletionTracker({
      */
     unsettledPromptIds() {
       const ids = [];
-      for (const k of pending.keys()) if (k !== NO_PROMPT_KEY) ids.push(k);
-      for (const k of awaitingDelivery.keys()) if (k !== NO_PROMPT_KEY && !pending.has(k)) ids.push(k);
+      const seen = new Set();
+      const add = (k) => {
+        if (k === NO_PROMPT_KEY || seen.has(k)) return;
+        seen.add(k);
+        ids.push(k);
+      };
+      for (const k of pending.keys()) add(k);
+      for (const k of awaitingDelivery.keys()) add(k);
+      // Runs whose delivery was never confirmed belong here too. They are "settled"
+      // only in the sense that they no longer BLOCK — we still do not know the agent
+      // was told. Omitting them would leave a reboot armed after the 120s watchdog
+      // with no id to reason about, and the resume would fall back to the plain
+      // "your result was already delivered" wording: the exact false reassurance the
+      // unconfirmed state exists to prevent.
+      for (const k of unconfirmedDelivery.keys()) add(k);
       return ids;
     },
 

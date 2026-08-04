@@ -80,7 +80,14 @@ function normalizeRunIds(runs) {
  *   after `runs` drains so the resume can say truthfully whether it waited for one.
  * @returns {string}
  */
-export function encodeRebootMarker({ at = null, runs = [], armedRunCount } = {}) {
+export function encodeRebootMarker({
+  at = null,
+  runs = [],
+  armedRunCount,
+  threadId = null,
+  sessionId = null,
+  attempts = 0,
+} = {}) {
   const ids = normalizeRunIds(runs);
   const armed = Number.isFinite(armedRunCount) ? Math.max(0, Math.trunc(armedRunCount)) : ids.length;
   return JSON.stringify({
@@ -88,6 +95,19 @@ export function encodeRebootMarker({ at = null, runs = [], armedRunCount } = {})
     at: Number.isFinite(at) ? at : null,
     runs: ids,
     n: Math.max(armed, ids.length),
+    // How many resume attempts have already gone out for this reboot. Persisted so
+    // it survives a reload: a fresh mount cannot know whether an earlier attempt
+    // was actually taken by the orchestrator, and re-sending silently would put a
+    // second identical "continue" in front of the agent. Non-zero ⇒ the resume
+    // says so, turning a possible duplicate into a disclosed one.
+    t: Number.isFinite(attempts) ? Math.max(0, Math.trunc(attempts)) : 0,
+    // WHICH CONVERSATION asked for this restart. The wait set (`runs`) is global
+    // because a reboot is global, but the resume is a message into ONE agent
+    // session — delivering it to whatever conversation happens to be on screen
+    // when the ready ack lands would nudge a workflow that never asked for a
+    // restart while stranding the one that did.
+    tid: threadId == null ? null : String(threadId),
+    sid: sessionId == null ? null : String(sessionId),
   });
 }
 
@@ -107,7 +127,7 @@ export function decodeRebootMarker(raw) {
   if (typeof raw !== "string") return null;
   const text = raw.trim();
   if (!text) return null;
-  const empty = { at: null, runs: [], armedRunCount: 0 };
+  const empty = { at: null, runs: [], armedRunCount: 0, threadId: null, sessionId: null, attempts: 0 };
   if (text[0] !== "{") return empty; // legacy "1"
   let parsed = null;
   try {
@@ -116,12 +136,25 @@ export function decodeRebootMarker(raw) {
     return empty;
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return empty;
+  // VERSION-GATE. A marker whose shape we don't understand — a future version, or
+  // a partial write that happens to still be valid JSON — must not be interpreted
+  // field by field. Its `runs` would be trusted while its `at` was absent, and an
+  // absent arm time is what makes the wait unbounded. Treat an unrecognized
+  // version exactly like the legacy marker: a reboot is pending, nothing is known
+  // to be in flight, resume immediately.
+  if (parsed.v !== REBOOT_MARKER_VERSION) return empty;
   const runs = normalizeRunIds(parsed.runs);
   const armed = Number.isFinite(parsed.n) ? Math.max(0, Math.trunc(parsed.n)) : runs.length;
   return {
+    // `null` means UNKNOWN, and stays null — it is never defaulted to a number.
+    // Reading an unknown arm time as 0 would be a definite claim that no time has
+    // passed, re-made on every tick, so the backstop would never advance.
     at: Number.isFinite(parsed.at) ? parsed.at : null,
     runs,
     armedRunCount: Math.max(armed, runs.length),
+    threadId: typeof parsed.tid === "string" && parsed.tid ? parsed.tid : null,
+    sessionId: typeof parsed.sid === "string" && parsed.sid ? parsed.sid : null,
+    attempts: Number.isFinite(parsed.t) ? Math.max(0, Math.trunc(parsed.t)) : 0,
   };
 }
 
@@ -168,7 +201,14 @@ export function planRebootResume(state = {}) {
   const unsettled = normalizeRunIds(state.unsettledRuns);
   if (!unsettled.length) return "resume";
   const maxWaitMs = Number.isFinite(state.maxWaitMs) ? state.maxWaitMs : REBOOT_RESUME_MAX_WAIT_MS;
-  const waitedMs = Number.isFinite(state.waitedMs) ? Math.max(0, state.waitedMs) : 0;
+  // "How long have we been waiting?" can be UNKNOWN — a marker with no usable arm
+  // time. Substituting 0 would be a definite claim that no time has passed, and it
+  // would be re-made on every tick, so the backstop could never advance and the
+  // wait would be unbounded and silent — the mechanism built to prevent an
+  // indefinite wait becoming the thing that guarantees one. Unknown means the wait
+  // cannot be bounded AT ALL, so take the visible, disclosed exit now.
+  if (!Number.isFinite(state.waitedMs)) return "resume_unconfirmed";
+  const waitedMs = Math.max(0, state.waitedMs);
   if (waitedMs >= maxWaitMs) return "resume_unconfirmed";
   return "wait_for_run";
 }
@@ -194,7 +234,12 @@ export function pruneRebootMarkerRaw(raw, isSettled, isDeliveryUnconfirmed) {
   const keep = new Set([...owed, ...pickUnconfirmed(marker.runs, isDeliveryUnconfirmed)]);
   const runs = marker.runs.filter((id) => keep.has(id));
   if (runs.length === marker.runs.length) return typeof raw === "string" ? raw : null;
-  return encodeRebootMarker({ at: marker.at, runs, armedRunCount: marker.armedRunCount });
+  // Re-encode through markerFields, NOT a hand-written subset. Pruning is a
+  // routine, frequently-called operation (every confirmed delivery), so a field
+  // dropped here is dropped almost immediately and permanently — and the field
+  // most easily forgotten is the delivery target, whose absence silently converts
+  // the marker back into "deliver to whoever is on screen".
+  return encodeRebootMarker({ ...markerFields(marker), runs });
 }
 
 /** Ids the caller flags as dispatched-but-never-confirmed. */
@@ -242,36 +287,107 @@ export function adoptRebootRuns(runs, tracker) {
   return adopted;
 }
 
+/** The marker's own fields, so a retained marker round-trips without losing any. */
+function markerFields(marker) {
+  return {
+    at: marker.at,
+    runs: marker.runs,
+    armedRunCount: marker.armedRunCount,
+    threadId: marker.threadId,
+    sessionId: marker.sessionId,
+    attempts: marker.attempts,
+  };
+}
+
 /**
  * One evaluation of the restart-resume state machine: decide, and produce the
  * marker value that must be persisted as a result.
  *
- * The `nextRaw` half is the whole safety property. On `wait_for_run` it is the
- * marker, RETAINED (pruned to the runs still owed) — clearing it there is what
- * loses the resume forever. It is null only when a resume is actually being sent.
+ * The `nextRaw` half is the whole safety property. On either WAIT it is the
+ * marker, RETAINED — clearing it there is what loses the resume forever. It is
+ * null only when the resume is being sent, or deliberately abandoned with a
+ * visible notice.
  *
- * @param {{raw?:unknown, isSettled?:(id:string)=>boolean, nowMs?:number, maxWaitMs?:number}} args
- * @returns {{decision:"none"|"resume"|"wait_for_run"|"resume_unconfirmed",
- *            marker:{at:number|null, runs:string[], armedRunCount:number}|null,
- *            owed:string[], nextRaw:string|null}}
+ * @param {{raw?:unknown, isSettled?:(id:string)=>boolean,
+ *          isDeliveryUnconfirmed?:(id:string)=>boolean, currentThreadId?:string|null,
+ *          nowMs?:number, maxWaitMs?:number}} args
+ * @returns {{decision:"none"|"resume"|"wait_for_run"|"resume_unconfirmed"|"wait_for_session"|"expired_wrong_session",
+ *            marker:object|null, owed:string[], unconfirmed:string[], nextRaw:string|null}}
+ *   `wait_for_session` — the conversation that armed the reboot is not the one on
+ *     screen. Hold; the marker survives so switching back delivers it.
+ *   `expired_wrong_session` — it never came back within the wait budget. Abandon
+ *     the resume with a VISIBLE notice rather than misdeliver it to whoever is on
+ *     screen, and rather than hold it silently forever.
  */
 export function stepRebootResume({
   raw,
   isSettled,
   isDeliveryUnconfirmed,
+  currentThreadId = null,
+  currentSessionId = null,
+  sessionKnown = false,
   nowMs = Date.now(),
   maxWaitMs = REBOOT_RESUME_MAX_WAIT_MS,
 } = {}) {
   const marker = decodeRebootMarker(raw);
-  if (!marker) return { decision: "none", marker: null, owed: [], nextRaw: null };
+  if (!marker) {
+    return { decision: "none", marker: null, owed: [], unconfirmed: [], sessionState: "unknown", nextRaw: null };
+  }
+  // The agent SESSION behind this conversation may have been replaced rather than
+  // resumed (a provider rejected the saved id, a reset, a fresh session hydrated
+  // with a transcript replay). Such a session never asked for this restart and may
+  // have no memory of the work, so "continue what you were doing" can send it
+  // re-reading the graph and re-queueing.
+  //
+  // This is DISCLOSED, never gated on. A session id legitimately CHANGES across a
+  // resume — that is what resuming does — so refusing to deliver on a mismatch
+  // would strand the ordinary restart, which is the worse failure.
+  //
+  // THREE states, not two. The orchestrator reports the post-resume session id in
+  // its own `session` frame, which is NOT ordered against the "ready" ack that
+  // triggers this decision: when ready lands first, the id on hand is still the one
+  // we armed with and a two-state check would confidently answer "same" for a
+  // session that is about to be replaced. That is the benign-default trap again, so
+  // "we have not been told yet" is its own answer and it discloses.
+  const sessionState = !sessionKnown
+    ? "unknown"
+    : marker.sessionId == null || currentSessionId == null
+      ? "unknown"
+      : String(currentSessionId) === marker.sessionId
+        ? "same"
+        : "replaced";
+  // Elapsed since the reboot was ARMED, read from the persisted marker so a reload
+  // cannot reset the backstop. `null` = unknown, and stays unknown.
+  const waitedMs = marker.at == null ? null : Math.max(0, nowMs - marker.at);
+  const outOfTime = waitedMs == null || waitedMs >= maxWaitMs;
+  const retain = () => encodeRebootMarker({ ...markerFields(marker) });
+
+  // DELIVERY TARGET. The wait set above is global on purpose — a reboot restarts
+  // ComfyUI globally, so every in-flight render is exposed — but the resume is a
+  // message into ONE agent session. If the conversation on screen is not the one
+  // that armed the reboot, sending now would nudge a workflow that never asked for
+  // a restart (the duplicate-render hazard, aimed at the wrong target) while the
+  // conversation that did ask gets nothing. Hold instead; the marker survives, so
+  // switching back delivers it. A marker with no recorded thread (legacy/degraded)
+  // carries no constraint and delivers to the current session as before.
+  if (marker.threadId != null && String(currentThreadId ?? "") !== marker.threadId) {
+    const decision = outOfTime ? "expired_wrong_session" : "wait_for_session";
+    return {
+      decision,
+      marker: { ...markerFields(marker), runs: marker.runs },
+      owed: unsettledRebootRuns(marker.runs, isSettled),
+      unconfirmed: pickUnconfirmed(marker.runs, isDeliveryUnconfirmed),
+      sessionState,
+      nextRaw: decision === "wait_for_session" ? retain() : null,
+    };
+  }
+
   const owed = unsettledRebootRuns(marker.runs, isSettled);
   const unconfirmed = pickUnconfirmed(marker.runs, isDeliveryUnconfirmed);
   let decision = planRebootResume({
     rebootPending: true,
     unsettledRuns: owed,
-    // Elapsed since the reboot was ARMED, read from the persisted marker, so a
-    // reload cannot reset the backstop and park the session indefinitely.
-    waitedMs: marker.at == null ? 0 : Math.max(0, nowMs - marker.at),
+    waitedMs,
     maxWaitMs,
   });
   if (unconfirmed.length && decision === "resume") {
@@ -286,11 +402,18 @@ export function stepRebootResume({
   // pruning an unconfirmed id away while still waiting on a different run would
   // erase the only evidence that the eventual resume must disclose.
   const reported = [...new Set([...owed, ...unconfirmed])];
-  const next = { at: marker.at, runs: reported, armedRunCount: marker.armedRunCount };
+  const next = { ...markerFields(marker), runs: reported };
   if (decision === "wait_for_run") {
-    return { decision, marker: next, owed: reported, unconfirmed, nextRaw: encodeRebootMarker(next) };
+    return {
+      decision,
+      marker: next,
+      owed: reported,
+      unconfirmed,
+      sessionState,
+      nextRaw: encodeRebootMarker(next),
+    };
   }
-  return { decision, marker: next, owed: reported, unconfirmed, nextRaw: null };
+  return { decision, marker: next, owed: reported, unconfirmed, sessionState, nextRaw: null };
 }
 
 /**
@@ -308,7 +431,13 @@ export function stepRebootResume({
  */
 export function rebootMarkerAfterSend(step, sent) {
   if (!step || step.decision === "none") return null;
-  if (step.decision === "wait_for_run") return step.nextRaw;
+  if (step.decision === "wait_for_run" || step.decision === "wait_for_session") return step.nextRaw;
+  if (step.decision === "expired_wrong_session") return null; // abandoned, with a notice
+  // `sent` must mean the ORCHESTRATOR TOOK IT (a receipt ack), not that the socket
+  // accepted the bytes. A WebSocket send resolves true the instant it is handed to
+  // the transport; the socket can close before the frame is ever read, and there is
+  // no way for an abandoned channel to testify that it wasn't. Retiring on that
+  // would strand the resume permanently, so an unacknowledged send RETAINS.
   if (sent) return null;
   return step.marker ? encodeRebootMarker(step.marker) : null;
 }

@@ -58,7 +58,30 @@ test("#585: a reboot with nothing owed resumes autonomously", () => {
 });
 
 test("#585: a reboot whose watched render is still owed a completion frame waits", () => {
-  assert.equal(planRebootResume({ rebootPending: true, unsettledRuns: ["p1"] }), "wait_for_run");
+  assert.equal(planRebootResume({ rebootPending: true, unsettledRuns: ["p1"], waitedMs: 0 }), "wait_for_run");
+});
+
+test("#585 P1(unknown-elapsed): an UNKNOWN wait duration must not read as zero elapsed", () => {
+  // Substituting 0 is a definite claim that no time has passed — and it is re-made
+  // on every tick, so the 15-minute backstop never advances and the wait becomes
+  // unbounded and silent. The mechanism built to prevent an indefinite wait would
+  // be the thing guaranteeing one.
+  for (const waitedMs of [undefined, null, NaN, Infinity, "0"]) {
+    assert.equal(
+      planRebootResume({ rebootPending: true, unsettledRuns: ["p1"], waitedMs }),
+      "resume_unconfirmed",
+      String(waitedMs),
+    );
+  }
+  // An explicit, known zero is a real answer and still waits.
+  assert.equal(planRebootResume({ rebootPending: true, unsettledRuns: ["p1"], waitedMs: 0 }), "wait_for_run");
+});
+
+test("#585 P1(unknown-elapsed): a marker with owed runs but NO arm time cannot park the session", () => {
+  const raw = JSON.stringify({ v: 1, at: null, runs: ["P"], n: 1 });
+  const step = stepRebootResume({ raw, isSettled: () => false, nowMs: 5000 });
+  assert.equal(step.decision, "resume_unconfirmed", "an unbounded wait is the silent strand");
+  assert.equal(step.nextRaw, null);
 });
 
 // ── P1 #1 — the guard must survive a frontend RELOAD ──────────────────────────
@@ -284,6 +307,39 @@ test("#585 P1(delivery): an unconfirmed run is kept in the persisted marker whil
   assert.equal(done.decision, "resume_unconfirmed");
 });
 
+test("#585 P1(arm): a reboot armed AFTER the delivery watchdog still records the uncertain run", () => {
+  // unsettledPromptIds is the arm-time snapshot, and the planner can only reason
+  // about ids the marker carries. If a run whose delivery was never confirmed were
+  // omitted, a reboot armed after the 120s watchdog would resume with the plain
+  // "your result was already delivered" wording — the false reassurance again.
+  const t = makeTracker();
+  t.onQueued("P");
+  t.onExecutionStart("P");
+  t.onExecuted("P", { images: [{ filename: "a.png" }] });
+  t.onExecutionSuccess("P");
+  t._fireTimers(DELIVERY_WATCHDOG_MS);
+  assert.equal(t.isSettled("P"), true, "it no longer blocks…");
+  assert.deepEqual(t.unsettledPromptIds(), ["P"], "…but it is still not known to have been delivered");
+
+  const raw = encodeRebootMarker({ at: 1000, runs: t.unsettledPromptIds() });
+  assert.equal(
+    stepRebootResume({ raw, isSettled: settledBy(t), isDeliveryUnconfirmed: unconfirmedBy(t), nowMs: 1100 })
+      .decision,
+    "resume_unconfirmed",
+  );
+});
+
+test("#585: unsettledPromptIds never reports the same id twice across its three sources", () => {
+  const t = makeTracker();
+  t.onQueued("P");
+  t.onExecutionStart("P");
+  t.onExecuted("P", { images: [{ filename: "a.png" }] });
+  t.onExecutionSuccess("P"); // pending-retired + awaitingDelivery
+  assert.deepEqual(t.unsettledPromptIds(), ["P"]);
+  t._fireTimers(DELIVERY_WATCHDOG_MS); // now unconfirmedDelivery
+  assert.deepEqual(t.unsettledPromptIds(), ["P"]);
+});
+
 test("#585 P1(delivery): a confirmed delivery clears the unconfirmed flag", () => {
   const t = makeTracker();
   t.onQueued("P");
@@ -414,6 +470,238 @@ test("#585: a corrupt marker resumes rather than parking the session in silence"
   for (const raw of ["{not json", "{}", "[]", '{"v":1,"runs":"nope"}']) {
     assert.equal(stepRebootResume({ raw, isSettled: () => false, nowMs: 5000 }).decision, "resume", raw);
   }
+});
+
+test("#585 P1(version): an UNRECOGNIZED marker version is not interpreted field by field", () => {
+  // A future version — or a partial write that happens to still be valid JSON —
+  // would otherwise have its `runs` trusted while its `at` was absent, and an
+  // absent arm time is exactly what makes the wait unbounded.
+  const future = JSON.stringify({ v: 2, runs: ["P"] });
+  assert.deepEqual(decodeRebootMarker(future).runs, [], "runs from an unknown shape are not trusted");
+  const step = stepRebootResume({ raw: future, isSettled: () => false, nowMs: 5000 });
+  assert.equal(step.decision, "resume", "…and it degrades exactly like the legacy marker");
+  assert.equal(step.nextRaw, null);
+});
+
+test("#585 P1(version): a v1 marker still round-trips every field", () => {
+  const raw = encodeRebootMarker({ at: 1000, runs: ["P"], threadId: "t-A", sessionId: "s-A" });
+  const m = decodeRebootMarker(raw);
+  assert.equal(m.at, 1000);
+  assert.deepEqual(m.runs, ["P"]);
+  assert.equal(m.threadId, "t-A");
+  assert.equal(m.sessionId, "s-A");
+});
+
+// ── the resume must reach the conversation that ASKED for the restart ─────────
+
+test("#585 P1(session): switching conversations between arm and ack must not misdeliver the resume", () => {
+  const t = makeTracker();
+  // Conversation A arms the reboot with nothing in flight — it would resume at once.
+  const raw = encodeRebootMarker({ at: 1000, runs: [], threadId: "t-A", sessionId: "s-A" });
+  assert.equal(
+    stepRebootResume({ raw, isSettled: settledBy(t), currentThreadId: "t-A", nowMs: 1100 }).decision,
+    "resume",
+    "on A, it resumes",
+  );
+
+  // …the user switches to conversation B before the ready ack lands.
+  const onB = stepRebootResume({ raw, isSettled: settledBy(t), currentThreadId: "t-B", nowMs: 1100 });
+  assert.equal(
+    onB.decision,
+    "wait_for_session",
+    "B must NOT receive A's restart nudge — that is the duplicate-render hazard aimed at the wrong workflow",
+  );
+  assert.notEqual(onB.nextRaw, null, "and A's resume must not be lost while B is on screen");
+
+  // Switching back delivers it, to A, intact.
+  const backOnA = stepRebootResume({
+    raw: onB.nextRaw,
+    isSettled: settledBy(t),
+    currentThreadId: "t-A",
+    nowMs: 1200,
+  });
+  assert.equal(backOnA.decision, "resume");
+  assert.equal(backOnA.marker.threadId, "t-A");
+});
+
+test("#585 P1(session): a resume held for an absent conversation is abandoned VISIBLY, never misdelivered", () => {
+  const raw = encodeRebootMarker({ at: 1000, runs: [], threadId: "t-A" });
+  const step = stepRebootResume({
+    raw,
+    isSettled: () => true,
+    currentThreadId: "t-B",
+    nowMs: 1000 + REBOOT_RESUME_MAX_WAIT_MS,
+  });
+  assert.equal(step.decision, "expired_wrong_session", "holding it forever would be the silent strand");
+  assert.notEqual(step.decision, "resume", "…and sending it to B would be misdelivery");
+  assert.equal(step.nextRaw, null);
+});
+
+test("#585 P1(session): the session hold outranks the run wait — a mismatch never sends, however settled", () => {
+  const t = makeTracker();
+  const raw = encodeRebootMarker({ at: 1000, runs: [], threadId: "t-A" });
+  assert.equal(
+    stepRebootResume({ raw, isSettled: settledBy(t), currentThreadId: null, nowMs: 1100 }).decision,
+    "wait_for_session",
+    "no conversation on screen is still not the ARMING conversation",
+  );
+});
+
+test("#585 P1(session): a marker with no recorded conversation carries no constraint (legacy)", () => {
+  const raw = encodeRebootMarker({ at: 1000, runs: [] });
+  assert.equal(
+    stepRebootResume({ raw, isSettled: () => true, currentThreadId: "t-anything", nowMs: 1100 }).decision,
+    "resume",
+  );
+});
+
+test("#585 P1(session): PRUNING a settled run must not drop the delivery target", () => {
+  // Pruning runs on every confirmed delivery, so a field dropped here is dropped
+  // almost immediately and permanently — and losing the arming conversation
+  // silently converts the marker back into "deliver to whoever is on screen".
+  const t = makeTracker();
+  t.onQueued("A1");
+  t.onQueued("B1");
+  const raw = encodeRebootMarker({ at: 1000, runs: ["A1", "B1"], threadId: "t-A", sessionId: "s-A" });
+  t.markDelivered("B1"); // an unrelated run settles and prunes the marker
+  const pruned = pruneRebootMarkerRaw(raw, settledBy(t), unconfirmedBy(t));
+  assert.deepEqual(decodeRebootMarker(pruned).runs, ["A1"]);
+  assert.equal(decodeRebootMarker(pruned).threadId, "t-A", "the arming conversation must survive pruning");
+
+  // …and the surviving marker still refuses to deliver to a different conversation.
+  t.markDelivered("A1");
+  assert.equal(
+    stepRebootResume({ raw: pruned, isSettled: settledBy(t), currentThreadId: "t-B", nowMs: 1200 }).decision,
+    "wait_for_session",
+  );
+});
+
+test("#585 P1(receipt): the attempt count is PERSISTED, so a retry after a reload discloses itself", () => {
+  const raw = encodeRebootMarker({ at: 1000, runs: [], threadId: "t-A", attempts: 1 });
+  assert.equal(decodeRebootMarker(raw).attempts, 1);
+  // …and it survives both round-trips the marker makes.
+  const step = stepRebootResume({ raw, isSettled: () => true, currentThreadId: "t-A", nowMs: 1100 });
+  assert.equal(step.marker.attempts, 1);
+  const held = stepRebootResume({ raw, isSettled: () => true, currentThreadId: "t-B", nowMs: 1100 });
+  assert.equal(decodeRebootMarker(held.nextRaw).attempts, 1, "a wrong-session hold keeps it too");
+});
+
+test("#585 P1(budget): the retry budget lives in the PERSISTED marker, so a reload cannot refill it", () => {
+  // An in-memory counter starts at zero on a fresh mount, so after three
+  // unacknowledged sends a reload would hand back a full budget — and repeated
+  // reloads would mint unlimited duplicate "continue" nudges.
+  const MAX = 3;
+  let raw = encodeRebootMarker({ at: 1000, runs: [], threadId: "t-A", attempts: MAX });
+  const afterReload = stepRebootResume({
+    raw,
+    isSettled: () => true,
+    currentThreadId: "t-A",
+    nowMs: 1100,
+  });
+  assert.equal(
+    afterReload.marker.attempts,
+    MAX,
+    "the count the gate reads must survive the reload that reset every in-memory counter",
+  );
+  // …and it is carried by every rewrite the marker undergoes while waiting.
+  const held = stepRebootResume({ raw, isSettled: () => true, currentThreadId: "t-B", nowMs: 1100 });
+  assert.equal(decodeRebootMarker(held.nextRaw).attempts, MAX);
+});
+
+test("#585: every marker field survives a retain/prune round-trip", () => {
+  const t = makeTracker();
+  t.onQueued("X");
+  t.onQueued("Y");
+  const raw = encodeRebootMarker({
+    at: 4242,
+    runs: ["X", "Y"],
+    armedRunCount: 2,
+    threadId: "t-A",
+    sessionId: "s-A",
+    attempts: 2,
+  });
+  t.markDelivered("Y");
+  const after = decodeRebootMarker(pruneRebootMarkerRaw(raw, settledBy(t), unconfirmedBy(t)));
+  assert.deepEqual(
+    { at: after.at, armedRunCount: after.armedRunCount, threadId: after.threadId, sessionId: after.sessionId, attempts: after.attempts },
+    { at: 4242, armedRunCount: 2, threadId: "t-A", sessionId: "s-A", attempts: 2 },
+  );
+});
+
+test("#585 P1(session): a REPLACED agent session is disclosed, never used to withhold the resume", () => {
+  const raw = encodeRebootMarker({ at: 1000, runs: [], threadId: "t-A", sessionId: "s-old" });
+  const step = stepRebootResume({
+    raw,
+    isSettled: () => true,
+    currentThreadId: "t-A",
+    currentSessionId: "s-new",
+    sessionKnown: true,
+    nowMs: 1100,
+  });
+  assert.equal(step.sessionState, "replaced", "the mismatch is reported…");
+  assert.equal(
+    step.decision,
+    "resume",
+    "…but never withheld: a session id legitimately changes across a resume, so refusing here would strand every ordinary restart",
+  );
+});
+
+test("#585 P1(session): an UNKNOWN session is its own answer — never silently 'same'", () => {
+  const withSid = encodeRebootMarker({ at: 1000, runs: [], threadId: "t-A", sessionId: "s-old" });
+  const base = { isSettled: () => true, currentThreadId: "t-A", nowMs: 1100 };
+  assert.equal(
+    stepRebootResume({ ...base, raw: withSid, currentSessionId: null, sessionKnown: true }).sessionState,
+    "unknown",
+    "no current session id ⇒ cannot compare",
+  );
+  const noSid = encodeRebootMarker({ at: 1000, runs: [], threadId: "t-A" });
+  assert.equal(
+    stepRebootResume({ ...base, raw: noSid, currentSessionId: "s-new", sessionKnown: true }).sessionState,
+    "unknown",
+    "no armed session recorded ⇒ cannot compare",
+  );
+  assert.equal(
+    stepRebootResume({ ...base, raw: withSid, currentSessionId: "s-old", sessionKnown: true }).sessionState,
+    "same",
+  );
+});
+
+test("#585 P1(session): before the orchestrator's session frame lands, the session is UNKNOWN, not 'same'", () => {
+  // The `session` frame is not ordered against the "ready" ack that drives this
+  // decision. If ready lands first, the id on hand is still the one we armed with —
+  // a two-state check would confidently answer "same" for a session about to be
+  // replaced, and send the ordinary undisclosed continuation.
+  const raw = encodeRebootMarker({ at: 1000, runs: [], threadId: "t-A", sessionId: "s-old" });
+  const step = stepRebootResume({
+    raw,
+    isSettled: () => true,
+    currentThreadId: "t-A",
+    currentSessionId: "s-old",
+    sessionKnown: false,
+    nowMs: 1100,
+  });
+  assert.equal(step.sessionState, "unknown");
+  assert.equal(step.decision, "resume", "still delivered — the uncertainty is disclosed, not withheld");
+});
+
+test("#585 P1(send): a wait_for_session step retains its marker regardless of send outcome", () => {
+  const raw = encodeRebootMarker({ at: 1000, runs: [], threadId: "t-A" });
+  const step = stepRebootResume({ raw, isSettled: () => true, currentThreadId: "t-B", nowMs: 1100 });
+  assert.equal(rebootMarkerAfterSend(step, false), step.nextRaw);
+  assert.equal(rebootMarkerAfterSend(step, true), step.nextRaw);
+});
+
+test("#585 P1(receipt): a send the orchestrator never acknowledged must NOT retire the marker", () => {
+  // sendUserMessage returns true the instant WebSocket.send() accepts the bytes;
+  // the socket can close before the orchestrator reads them, and an abandoned
+  // channel cannot testify that it wasn't. Only a receipt ack may retire it — so
+  // the panel passes `false` here for every send and clears on the ack instead.
+  const step = { decision: "resume", marker: { at: 1000, runs: [], armedRunCount: 0 }, nextRaw: null };
+  assert.notEqual(
+    rebootMarkerAfterSend(step, false),
+    null,
+    "handed-to-transport is not receipt — retiring here strands the resume permanently",
+  );
 });
 
 test("#585: no marker at all is not our ack", () => {
