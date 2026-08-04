@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import * as ManagerInstall from "../../web/js/lib/manager-install.js";
 const {
   dialectRetryTarget,
+  isManagerRouteMissing,
   isManagerUnreachable,
   isMethodNotAllowed,
   legacyUpdateBody,
@@ -23,6 +24,11 @@ const {
 
 const UNREACHABLE = "ComfyUI-Manager not reachable (is the built-in Manager enabled?)";
 const QUEUE_STATUS = { total_count: 0, done_count: 0, is_processing: false };
+
+/** The error managerCall/managerV2 throw for a PROVEN route-level rejection
+ *  (HTTP 404): the same message, tagged managerRouteMissing. Mutations may be
+ *  re-sent on this and ONLY this (codex P0). */
+const routeMissing = () => Object.assign(new Error(UNREACHABLE), { managerRouteMissing: true });
 
 function readPanelSource() {
   const panelPath = fileURLToPath(
@@ -61,6 +67,50 @@ test("dialectRetryTarget: re-probe agrees (or Manager silent) → legacy last re
 test("dialectRetryTarget: legacy-on-legacy has no fallback left (null → surface the original error)", () => {
   assert.equal(dialectRetryTarget("legacy", "legacy"), null);
   assert.equal(dialectRetryTarget("legacy", null), null);
+});
+
+test("isManagerRouteMissing: ONLY the proven-404 marker qualifies a mutation retry (codex P0)", () => {
+  assert.equal(isManagerRouteMissing(routeMissing()), true, "the tagged 404");
+  // The SAME message without the marker is the ambiguous no-response case —
+  // it must NOT authorize re-sending a mutation.
+  assert.equal(isManagerRouteMissing(new Error(UNREACHABLE)), false);
+  assert.equal(isManagerRouteMissing(new Error("Manager manager/queue/install: HTTP 404")), false);
+  assert.equal(isManagerRouteMissing(new Error("Manager x: HTTP 405")), false);
+  assert.equal(isManagerRouteMissing(null), false);
+  assert.equal(isManagerRouteMissing(undefined), false);
+  // ...while the broad GET-fallback predicate still matches the message shape.
+  assert.equal(isManagerUnreachable(new Error(UNREACHABLE)), true);
+});
+
+// The marker itself is minted by the REAL transports — extract them and prove:
+// a 404 response tags the error; a no-response (null) failure does NOT.
+test("managerV2/managerCall tag a 404 as managerRouteMissing, never the no-response case", async () => {
+  const src = readPanelSource();
+  const factory = new Function(
+    "api",
+    `${pick(src, /async function managerV2\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerV2")}
+${pick(src, /async function managerCall\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerCall")}
+return { managerV2, managerCall };`,
+  );
+  for (const res of [
+    { status: 404, ok: false }, // route not registered → proven rejection
+    null, // no response → ambiguous
+  ]) {
+    const { managerV2: mv2, managerCall: mcall } = factory({ fetchApi: async () => res });
+    for (const call of [mv2, mcall]) {
+      const err = await call("manager/queue/status").then(
+        () => null,
+        (e) => e,
+      );
+      assert.ok(err, "must throw");
+      assert.match(err.message, /not reachable/);
+      assert.equal(
+        isManagerRouteMissing(err),
+        res !== null && res.status === 404,
+        `marker only for the proven 404 (res=${JSON.stringify(res)})`,
+      );
+    }
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -294,6 +344,7 @@ function graphUpdateDeps(overrides) {
     isMethodNotAllowed,
     assertBatchOk,
     isManagerUnreachable,
+    isManagerRouteMissing,
     dialectRetryTarget,
     reProbeManagerDialect: async () => "v2",
     waitForUpdateResult: async () => ({
@@ -311,7 +362,7 @@ test("#605: graph_update_node with a stale 'legacy' cache re-probes and updates 
     graphUpdateDeps({
       managerCall: async (route) => {
         calls.push(["legacy", route]);
-        throw new Error(UNREACHABLE); // the restarted v4 backend dropped the 3.x routes
+        throw routeMissing(); // the restarted v4 backend dropped the 3.x routes (proven 404)
       },
       managerV2: async (route) => {
         calls.push(["v2", route]);
@@ -334,6 +385,29 @@ test("#605: graph_update_node with a stale 'legacy' cache re-probes and updates 
   );
 });
 
+test("codex P0: an AMBIGUOUS enqueue failure (no response) never re-sends the update", async () => {
+  const calls = [];
+  let reprobes = 0;
+  const update = buildGraphUpdateNode(
+    graphUpdateDeps({
+      detectManagerDialect: async () => "legacy",
+      managerCall: async (route) => {
+        calls.push(route);
+        // Same "not reachable" TEXT as a 404 but NO marker: a lost response
+        // says nothing about whether the POST landed.
+        throw new Error(UNREACHABLE);
+      },
+      reProbeManagerDialect: async () => {
+        reprobes += 1;
+        return "v2";
+      },
+    }),
+  );
+  await assert.rejects(() => update({ id: "some-pack" }), /not reachable/);
+  assert.deepEqual(calls, ["manager/queue/update"], "the ambiguous POST is not re-sent anywhere");
+  assert.equal(reprobes, 0, "no re-probe, no retry, no second dialect");
+});
+
 test("#605: graph_update_node never re-enqueues after the task POST landed (start failure surfaces)", async () => {
   const calls = [];
   let reprobes = 0;
@@ -342,7 +416,7 @@ test("#605: graph_update_node never re-enqueues after the task POST landed (star
       detectManagerDialect: async () => "v2",
       managerV2: async (route) => {
         calls.push(route);
-        if (route === "manager/queue/start") throw new Error(UNREACHABLE);
+        if (route === "manager/queue/start") throw routeMissing();
         return {};
       },
       reProbeManagerDialect: async () => {
@@ -364,7 +438,7 @@ test("#605: the legacy update POST landing is tracked too — a start failure af
       detectManagerDialect: async () => "legacy",
       managerCall: async (route) => {
         calls.push(route);
-        if (route === "manager/queue/start") throw new Error(UNREACHABLE);
+        if (route === "manager/queue/start") throw routeMissing();
         return {};
       },
       reProbeManagerDialect: async () => {
@@ -384,13 +458,17 @@ test("#605: the legacy update POST landing is tracked too — a start failure af
 
 test("#605: graph_update_node legacy-on-legacy unreachable surfaces the original error (no retry left)", async () => {
   const calls = [];
+  let reprobes = 0;
   const update = buildGraphUpdateNode(
     graphUpdateDeps({
       detectManagerDialect: async () => "legacy",
-      reProbeManagerDialect: async () => "legacy", // the probe AGREES
+      reProbeManagerDialect: async () => {
+        reprobes += 1;
+        return "legacy"; // the probe AGREES
+      },
       managerCall: async (route) => {
         calls.push(route);
-        throw new Error(UNREACHABLE);
+        throw routeMissing();
       },
     }),
   );
@@ -402,6 +480,7 @@ test("#605: graph_update_node legacy-on-legacy unreachable surfaces the original
     },
   );
   assert.deepEqual(calls, ["manager/queue/update"], "the rejected enqueue is not repeated");
+  assert.equal(reprobes, 1, "one re-probe, then the ladder gives up");
 });
 
 // ---------------------------------------------------------------------------
@@ -430,6 +509,7 @@ function nodesInstallDeps(overrides) {
     managerV2: async () => ({}),
     managerCall: async () => ({}),
     isManagerUnreachable,
+    isManagerRouteMissing,
     dialectRetryTarget,
     reProbeManagerDialect: async () => "v2",
     managerQueueControl: async () => {},
@@ -444,7 +524,7 @@ test("#605: nodes_install with a stale 'legacy' cache re-probes and installs thr
     nodesInstallDeps({
       managerCall: async (route) => {
         calls.push(["legacy", route]);
-        throw new Error(UNREACHABLE); // the restarted v4 backend dropped the 3.x routes
+        throw routeMissing(); // the restarted v4 backend dropped the 3.x routes (proven 404)
       },
       managerV2: async (route) => {
         calls.push(["v2", route]);
@@ -466,6 +546,27 @@ test("#605: nodes_install with a stale 'legacy' cache re-probes and installs thr
   );
 });
 
+test("codex P0: nodes_install never re-submits on an AMBIGUOUS (no-response) failure", async () => {
+  const calls = [];
+  let reprobes = 0;
+  const install = buildNodesInstall(
+    nodesInstallDeps({
+      detectManagerDialect: async () => "legacy",
+      managerCall: async (route) => {
+        calls.push(route);
+        throw new Error(UNREACHABLE); // unmarked: the POST may have landed
+      },
+      reProbeManagerDialect: async () => {
+        reprobes += 1;
+        return "v2";
+      },
+    }),
+  );
+  await assert.rejects(() => install({ id: "some-pack" }), /not reachable/);
+  assert.deepEqual(calls, ["manager/queue/install"], "the ambiguous POST is not re-sent anywhere");
+  assert.equal(reprobes, 0, "no re-probe, no retry, no second dialect");
+});
+
 test("#485 regression: a v2-batch unreachable submit still falls back to legacy when the re-probe agrees", async () => {
   const calls = [];
   const install = buildNodesInstall(
@@ -474,7 +575,7 @@ test("#485 regression: a v2-batch unreachable submit still falls back to legacy 
       reProbeManagerDialect: async () => "v2-batch", // the probe AGREES (hybrid build)
       managerV2: async (route) => {
         calls.push(["v2", route]);
-        throw new Error(UNREACHABLE); // hybrid: /v2 mutation routes not registered
+        throw routeMissing(); // hybrid: /v2 mutation routes not registered (proven 404)
       },
       managerCall: async (route) => {
         calls.push(["legacy", route]);
@@ -503,7 +604,7 @@ test("#605: nodes_install legacy-on-legacy unreachable surfaces the original err
       reProbeManagerDialect: async () => "legacy",
       managerCall: async (route) => {
         calls.push(route);
-        throw new Error(UNREACHABLE);
+        throw routeMissing();
       },
     }),
   );

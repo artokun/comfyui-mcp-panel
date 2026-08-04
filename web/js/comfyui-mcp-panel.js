@@ -74,6 +74,7 @@ import {
   dialectRetryTarget,
   installGitUrl,
   installedListRoute,
+  isManagerRouteMissing,
   isManagerUnreachable,
   isMethodNotAllowed,
   legacyUpdateBody,
@@ -3669,8 +3670,17 @@ async function managerV2(route, { method = "GET", body, signal } = {}) {
     ...(signal ? { signal } : {}),
     ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
   });
-  if (!res || res.status === 404) {
+  if (!res) {
     throw new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)");
+  }
+  if (res.status === 404) {
+    // A 404 is a PROVEN route-level rejection — no handler ran. Tag it so the
+    // #605 mutation self-heal can tell it apart from the ambiguous no-response
+    // case above (a lost response proves NOTHING about whether the request
+    // landed, so it must never authorize a mutation re-send — codex P0).
+    const err = new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)");
+    err.managerRouteMissing = true;
+    throw err;
   }
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
@@ -3695,8 +3705,15 @@ async function managerCall(route, { method = "GET", body, signal } = {}) {
     ...(signal ? { signal } : {}),
     ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
   });
-  if (!res || res.status === 404) {
+  if (!res) {
     throw new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)");
+  }
+  if (res.status === 404) {
+    // See managerV2: a 404 is the PROVEN route-level rejection the #605
+    // mutation self-heal may retry on (err.managerRouteMissing).
+    const err = new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)");
+    err.managerRouteMissing = true;
+    throw err;
   }
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
@@ -10617,7 +10634,11 @@ const GRAPH_TOOL_EXECUTORS = {
     try {
       submitted = await submitInstall(dialect);
     } catch (err) {
-      if (!isManagerUnreachable(err)) throw err;
+      // codex P0: the retry gate is the PROVEN route-level rejection (the 404
+      // marker), never the broader "not reachable" — a no-response transport
+      // failure says nothing about whether the POST landed, and re-submitting
+      // then would double-fire the install.
+      if (!isManagerRouteMissing(err)) throw err;
       const retry = dialectRetryTarget(dialect, await reProbeManagerDialect());
       if (!retry) throw err;
       dialect = retry;
@@ -10774,7 +10795,10 @@ const GRAPH_TOOL_EXECUTORS = {
             await legacyUpdate();
             return finalizeUpdate("legacy-self-update");
           }
-          if (enqueued || !isManagerUnreachable(err)) throw err;
+          // codex P0: the heal retries ONLY a PROVEN route-level rejection (the
+          // 404 marker) before the enqueue landed — never an ambiguous
+          // no-response failure, which says nothing about whether the POST ran.
+          if (enqueued || !isManagerRouteMissing(err)) throw err;
           const retry = dialectRetryTarget(dialect, await reProbeManagerDialect());
           if (!retry || dialectRetries >= 2) throw err;
           dialectRetries += 1;
@@ -10801,7 +10825,7 @@ const GRAPH_TOOL_EXECUTORS = {
             await legacyUpdate();
             return finalizeUpdate("legacy-self-update");
           }
-          if (enqueued || !isManagerUnreachable(err)) throw err;
+          if (enqueued || !isManagerRouteMissing(err)) throw err;
           const retry = dialectRetryTarget(dialect, await reProbeManagerDialect());
           if (!retry || dialectRetries >= 2) throw err;
           dialectRetries += 1;
@@ -10812,7 +10836,7 @@ const GRAPH_TOOL_EXECUTORS = {
         try {
           await legacyUpdate();
         } catch (err) {
-          if (legacyEnqueued || !isManagerUnreachable(err)) throw err;
+          if (legacyEnqueued || !isManagerRouteMissing(err)) throw err;
           const retry = dialectRetryTarget(dialect, await reProbeManagerDialect());
           if (!retry || dialectRetries >= 2) throw err;
           dialectRetries += 1;

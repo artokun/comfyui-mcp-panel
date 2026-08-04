@@ -732,8 +732,8 @@ test("#485 nodes_install falls back to the legacy dialect on an unreachable sign
   assert.match(body, /submitInstall\(dialect\)/);
   assert.match(
     body,
-    /if \(!isManagerUnreachable\(err\)\) throw err;/,
-    "only an unreachable signal triggers the re-probe/retry",
+    /if \(!isManagerRouteMissing\(err\)\) throw err;/,
+    "only a PROVEN route-level rejection (the 404 marker) triggers the re-probe/retry — an ambiguous no-response failure must never re-send a mutation (codex P0)",
   );
   assert.match(
     body,
