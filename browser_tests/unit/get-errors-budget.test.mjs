@@ -104,20 +104,28 @@ test("SEQUENTIAL consumption of the shared budget can never sum past it (#610+#5
 });
 
 // Source guard: the constants above are only meaningful while graph_get_errors
-// actually spends them. A revert to the old flat 4 s constant — or a refresh
-// call that stops passing the budget — must fail the build, not slip through
-// (a fix on one branch was once silently reverted by a later bulk rewrite).
+// actually spends them. A revert to the old flat 4 s constant — or a call site
+// that stops PASSING the budget (an unwired constant still greps) — must fail
+// the build, not slip through (a fix on one branch was once silently reverted
+// by a later bulk rewrite; codex gate: token presence ≠ wiring).
 test("graph_get_errors spends the shared budget and the old 4 s constant is gone (#610/#589)", () => {
   assert.ok(
     !PANEL_SOURCE.includes("GET_ERRORS_REFRESH_TIMEOUT_MS"),
     "the old flat GET_ERRORS_REFRESH_TIMEOUT_MS constant must not reappear",
   );
-  assert.ok(
-    PANEL_SOURCE.includes("errorsStepBudget(GET_ERRORS_REFRESH_CAP_MS)"),
-    "the forced refresh wait must be charged against the shared budget",
+  assert.match(
+    PANEL_SOURCE,
+    /errorsStepBudget\(GET_ERRORS_REFRESH_CAP_MS\)/,
+    "the refresh wait must be computed from the shared budget",
   );
-  assert.ok(
-    PANEL_SOURCE.includes("errorsStepBudget(GET_ERRORS_STEP_CAP_MS)"),
-    "the nested-media probe wait must be charged against the shared budget",
+  assert.match(
+    PANEL_SOURCE,
+    /withRefreshTimeout\(\s*refreshComfyNodeDefs\(undefined, \{ force: true \}\),\s*refreshBudgetMs,?\s*\)/,
+    "the forced refresh race must RECEIVE that budget (an unpassed budget silently reverts #610)",
+  );
+  assert.match(
+    PANEL_SOURCE,
+    /filterServerConfirmedInputSubfolderMedia\(\s*assets\.media,\s*\(\)\s*=>/,
+    "the nested-media probe must RECEIVE the remaining-budget thunk (the default thunk ignores the shared budget)",
   );
 });
