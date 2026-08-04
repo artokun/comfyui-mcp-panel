@@ -89,9 +89,11 @@ function nodes(n, offset = 0) {
 }
 
 /** A LiteGraph SUBGRAPH as this codebase already identifies one: boundary rails
- *  (the same members resolveRailNode reads). */
+ *  (the same members resolveRailNode reads). `serialize` is present so the
+ *  content-free proof can actually be evaluated — without it the graph is
+ *  unprovable and fails closed, which is asserted separately. */
 function subgraphObject({ nodes: inner = [] } = {}) {
-  return {
+  const sub = {
     name: "sub",
     inputNode: { id: SUBGRAPH_INPUT_RAIL_ID },
     outputNode: { id: SUBGRAPH_OUTPUT_RAIL_ID },
@@ -99,6 +101,8 @@ function subgraphObject({ nodes: inner = [] } = {}) {
     outputs: [],
     _nodes: inner,
   };
+  sub.serialize = () => ({ nodes: inner.map((n) => ({ ...n })) });
+  return sub;
 }
 
 /** An `app` whose canvas points at `canvasGraph`; setGraph is COUNTED because
@@ -174,15 +178,66 @@ test("#604: canvas and app.graph hold two different ROOT graphs ⇒ diverged, an
   assert.equal(scope.rootGraph, rootGraph);
 });
 
-test("#220/#308 regression fence: a ghost SUBGRAPH still reconciles to root (stale, not diverged)", () => {
-  // A subgraph the REBUILT root neither owns via an owner node nor registers.
+test("#220/#308 regression fence: a PROVABLY EMPTY ghost subgraph still reconciles to root", () => {
+  // A subgraph the REBUILT root neither owns via an owner node nor registers, and
+  // which provably holds nothing — the one case a repaint can lose nothing.
   const rootGraph = { _nodes: [{ id: 1, type: "Node" }] };
-  const ghost = subgraphObject({ nodes: nodes(2, 100) });
+  const ghost = subgraphObject();
   const scope = resolveScope(makeApp({ rootGraph, canvasGraph: ghost }));
 
-  assert.equal(scope.stale, true, "the #220/#308 ghost must still reconcile to root");
-  assert.equal(scope.diverged, false, "a ghost subgraph is NOT the #604 root divergence");
+  assert.equal(scope.stale, true, "the #220/#308 reconcile must survive for an empty ghost");
+  assert.equal(scope.diverged, false);
   assert.equal(scope.graph, rootGraph, "reads and edits both land on the live root");
+});
+
+test("#604: a ghost SUBGRAPH holding content is a divergence too — kind never overrides content", () => {
+  // The P0 the first cut of this fix missed: "unreachable from the live root"
+  // proves only that the root does not own the graph — never that it is
+  // disposable. A stranded subgraph can hold the user's unsaved work exactly like
+  // a stranded root, and repainting it away is the same unrecoverable loss.
+  const rootGraph = { _nodes: [{ id: 1, type: "Node" }] };
+  const ghost = subgraphObject({ nodes: nodes(2, 100) });
+  const app = makeApp({ rootGraph, canvasGraph: ghost });
+  const scope = resolveScope(app);
+
+  assert.equal(scope.diverged, true, "a content-bearing ghost is unresolvable, not disposable");
+  assert.equal(scope.stale, false, "the repaint trigger must stay disarmed");
+  assert.equal(scope.divergedKind, "subgraph");
+  assert.equal(scope.graph, ghost, "the graph the user is looking at is what gets reported");
+
+  assert.throws(() => buildGetGraphCtx(app)(), /\[canvas-root-divergence\]/);
+  assert.equal(app.canvas.setGraphCalls, 0, "the ghost's contents must remain reachable to the user");
+  assert.equal(app.canvas.graph, ghost);
+});
+
+test("#604: the subgraph divergence offers the escape that actually applies to it", () => {
+  const app = makeApp({
+    rootGraph: { _nodes: nodes(1) },
+    canvasGraph: subgraphObject({ nodes: nodes(2, 100) }),
+  });
+  let message = "";
+  try {
+    buildGetGraphCtx(app)();
+  } catch (err) {
+    message = err.message;
+  }
+  assert.match(message, /Leave the open subgraph/, "a stranded subgraph is escaped by leaving it");
+  assert.match(message, /reload the ComfyUI page/, "with the page reload as the fallback");
+});
+
+test("#604: an unserializable ghost is NOT proven empty — unprovable fails closed", () => {
+  const ghost = {
+    inputNode: { id: SUBGRAPH_INPUT_RAIL_ID },
+    outputNode: { id: SUBGRAPH_OUTPUT_RAIL_ID },
+    _nodes: [],
+  };
+  const scope = resolveScope(makeApp({ rootGraph: { _nodes: nodes(1) }, canvasGraph: ghost }));
+  assert.equal(
+    scope.diverged,
+    true,
+    "a bare empty _nodes array is node-level evidence only — groups/links/nested subgraphs are unproven",
+  );
+  assert.equal(scope.stale, false);
 });
 
 test("resolveScope: an EMPTY diverged canvas is still a divergence — 'no content' is not proof of a good binding", () => {
@@ -236,9 +291,9 @@ test("#604: the divergence refusal states BOTH candidate graphs and a remedy tha
   );
 });
 
-test("#220/#308 regression fence: getGraphCtx still reconciles a GHOST subgraph to root", () => {
+test("#220/#308 regression fence: getGraphCtx still reconciles a PROVABLY EMPTY ghost to root", () => {
   const rootGraph = { _nodes: [{ id: 1, type: "Node" }] };
-  const ghost = subgraphObject({ nodes: nodes(2, 100) });
+  const ghost = subgraphObject();
   const app = makeApp({ rootGraph, canvasGraph: ghost });
   const ctx = buildGetGraphCtx(app)();
 
@@ -329,16 +384,47 @@ test("#604: a mutation may never clear a LOWER binding bar than a read", () => {
   }
 });
 
-test("#604: every DIRECT mutation path (run, CivitAI load, snapshot capture/restore) uses the same full bar", () => {
-  // Paths that skip bridge dispatch must not thereby skip evidence.
+test("#604: EVERY direct mutation path clears the same full bar bridge dispatch demands", () => {
+  // The shared constant must BE the dispatch mutation bar, not a weaker copy…
   assert.deepEqual(
     { ...MUTATION_BINDING_BAR },
     graphCommandBindingBar("graph_add_node"),
-    "the shared constant must BE the dispatch mutation bar, not a weaker copy",
+    "a direct path must not get a different bar from a dispatched mutation",
   );
   const verdict = resolveGraphBindingVerdict({ ...halfRebuiltRootEvidence(3), ...MUTATION_BINDING_BAR });
-  assert.ok(verdict, "a direct mutation path must refuse the same evidence bridge dispatch refuses");
+  assert.ok(verdict, "…and it must refuse the same evidence bridge dispatch refuses");
   assert.equal(verdict.reason, "root-node-count-desync");
+
+  // …and every path that bypasses bridge dispatch must actually USE it. Each of
+  // these invokes a graph mutation without going through the dispatch fence: the
+  // panel's Run button (/run), the CivitAI workflow picker's graph_load, the
+  // per-turn snapshot capture and its revert, and the deferred add-node
+  // revalidation after an awaited node-definition fetch. Skipping dispatch must
+  // not mean skipping evidence, so each is checked at its own call site.
+  const src = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
+  const DIRECT_MUTATION_PATHS = [
+    ["async graph_run({ batch_count, to_node_id })", "app.queuePrompt"],
+    ["async graph_load({ graph: incoming } = {})", 'captureGraphSnapshot(null, "before graph_load")'],
+    ["function captureGraphSnapshot(mid, label)", "const data = rootGraph.serialize();"],
+    ["function restoreSnapshot(snap)", "app.loadGraphData(JSON.parse(JSON.stringify(snap.data))"],
+    ["function revalidateGraphMutationContext(captured)", "return current;"],
+  ];
+  for (const [startNeedle, beforeNeedle] of DIRECT_MUTATION_PATHS) {
+    const start = src.indexOf(startNeedle);
+    assert.notEqual(start, -1, `${startNeedle} must exist`);
+    const before = src.indexOf(beforeNeedle, start);
+    assert.notEqual(before, -1, `${beforeNeedle} must follow ${startNeedle}`);
+    const fence = src.indexOf("assertGraphBoundToActiveWorkflow(", start);
+    assert.ok(
+      fence > start && fence < before,
+      `${startNeedle} must assert the binding BEFORE it acts`,
+    );
+    assert.match(
+      src.slice(fence, before),
+      /\.\.\.MUTATION_BINDING_BAR/,
+      `${startNeedle} bypasses bridge dispatch, so it must name the full mutation bar itself`,
+    );
+  }
 });
 
 test("graphCommandBindingBar: reads get the reduced DISPATCH bar (they re-assert with the full one)", () => {

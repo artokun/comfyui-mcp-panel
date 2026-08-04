@@ -4242,25 +4242,27 @@ const MAX_STATE_NODES = 100;
 function getGraphCtx() {
   // app.canvas.graph is the graph the user is LOOKING at — the root graph or an
   // opened subgraph — so reads and edits target what's on screen. But after a
-  // reconnect/tab-switch the canvas can still point at a subgraph object that the
-  // REBUILT root graph no longer owns; resolveScope detects that STALE reference
-  // and reconciles to root so graph READS and graph WRITES can never diverge
-  // (#220/#308). It is the ONE authoritative viewing-scope source.
+  // reconnect/tab-switch/backend restart the canvas can point at a graph the
+  // REBUILT root no longer owns; resolveScope classifies that, reconciling to root
+  // ONLY when the stranded graph is provably content-free and otherwise reporting
+  // a divergence this function refuses (#220/#308 preserved, #604 fixed). It is the
+  // ONE authoritative viewing-scope source, and therefore the one place that can
+  // decide whether the graph a command is about to touch is knowable at all.
   const LG = window.LiteGraph ?? globalThis.LiteGraph;
   if (!app || !app.graph || !LG) {
     throw new Error("ComfyUI graph is not available (app.graph / LiteGraph missing)");
   }
   const scope = resolveScope(app);
-  // #604 — CANVAS/ROOT DIVERGENCE. `app.graph` and `app.canvas.graph` hold two
-  // different ROOT-LEVEL graphs (reported after a backend restart with no page
-  // reload: `app.graph` was empty while the canvas still held the user's unsaved
-  // 31-node workflow). This used to be lumped in with the #220/#308 stale-SUBGRAPH
-  // case and "repaired" by `canvas.setGraph(app.graph)` — which pointed the user's
-  // canvas at the empty root, left the graph they were actually editing
-  // unreferenced ("the memory-only graph was unrecoverable"), and then handed every
-  // downstream guard a self-consistent (app.graph, activeWorkflow) pair that no
-  // longer said anything about the canvas the command was issued for. The evidence
-  // of the divergence was destroyed before anything could report it.
+  // #604 — CANVAS/ROOT DIVERGENCE. The canvas holds a graph the live root neither
+  // owns nor registers, and that graph is NOT provably content-free. Reported after
+  // a backend restart with no page reload: `app.graph` was empty while the canvas
+  // still held the user's unsaved 31-node workflow. This used to be treated as the
+  // #220/#308 stale-SUBGRAPH case and "repaired" by `canvas.setGraph(app.graph)` —
+  // which pointed the user's canvas at the empty root, left the graph they were
+  // actually editing unreferenced ("the memory-only graph was unrecoverable"), and
+  // then handed every downstream guard a self-consistent (app.graph, activeWorkflow)
+  // pair that no longer said anything about the canvas the command was issued for.
+  // The evidence of the divergence was destroyed before anything could report it.
   //
   // There is no safe way to pick one: the canvas graph is what the user sees, the
   // root graph is what the workflow service and every save path use, and nothing
@@ -4269,19 +4271,32 @@ function getGraphCtx() {
   if (scope.diverged) {
     const canvasNodes = scope.graph?._nodes?.length ?? "unknown";
     const rootNodes = scope.rootGraph?._nodes?.length ?? "unknown";
+    // The remedy differs by WHERE the canvas is stranded, and only the remedy does.
+    // A canvas left inside a subgraph the rebuilt root no longer owns is escaped by
+    // leaving that subgraph in ComfyUI's own breadcrumb; two different root graphs
+    // can only be reconciled by reloading the page. Both are stated, cheapest first.
+    const remedy =
+      scope.divergedKind === "subgraph"
+        ? `Leave the open subgraph on the ComfyUI canvas (its breadcrumb, or double-click out) ` +
+          `to get back to a graph the panel can identify; if that does not clear it, save or ` +
+          `export anything you need from this view and reload the ComfyUI page.`
+        : `This usually follows a ComfyUI backend restart without a page reload. Save or export ` +
+          `the canvas you want to keep, then reload the ComfyUI page (a panel-only reload does ` +
+          `not rebuild this binding).`;
     throw new Error(
       `[canvas-root-divergence] The canvas you are looking at (${canvasNodes} node(s)) and the ` +
         `panel's bound root graph (${rootNodes} node(s)) are two DIFFERENT graphs, so this command ` +
         `was NOT applied — the panel cannot tell which one it was meant for, and picking either ` +
-        `could edit a graph you are not looking at. This usually follows a ComfyUI backend restart ` +
-        `without a page reload. Save or export the canvas you want to keep, then reload the ComfyUI ` +
-        `page (a panel-only reload does not rebuild this binding).`,
+        `could edit a graph you are not looking at. ${remedy}`,
     );
   }
-  // When the scope was a stale SUBGRAPH, rebind the CANVAS to root too, so the
-  // physical view matches the graph reads/edits now target (keeps read + edit in
-  // lockstep). Safe only because a ghost subgraph the live root neither owns nor
-  // registers holds none of the workflow — unlike the diverged root above.
+  // The canvas graph is unreachable from the live root but PROVABLY content-free, so
+  // rebind the CANVAS to root: the physical view then matches the graph reads/edits
+  // target, keeping read + edit in lockstep (#220/#308). This is the ONLY case the
+  // repaint is allowed, and it is allowed because the proof — a present-empty
+  // `_nodes` plus a serialize() with every non-identity surface empty — establishes
+  // that there is nothing in it to lose. It also keeps the binding guard's later
+  // "was NOT applied" claim honest: nothing of the workflow changed here either.
   if (scope.stale && typeof app.canvas?.setGraph === "function") {
     try {
       app.canvas.setGraph(scope.rootGraph);
