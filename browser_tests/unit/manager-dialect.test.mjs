@@ -283,15 +283,28 @@ test("#605: Manager answering NO dialect surfaces the ORIGINAL error and leaves 
   assert.equal(h.getDialectCache(), "v2");
 });
 
+// A fetch stub whose promise settles ONLY via the caller's abort signal — but
+// backed by a real (ref'd) setTimeout fallback so the test process's event loop
+// stays alive on Node versions where AbortSignal.timeout's timer is unref'd
+// (CI runs Node 22; without this, pending tests get "event loop has already
+// resolved"). If the abort wiring regresses, the 2s fallback fails the test
+// with a clear message instead of a runner-level cancellation.
+function hangingUntilAbort(opts) {
+  return new Promise((_, reject) => {
+    const hung = setTimeout(() => reject(new Error("probe never aborted (hung)")), 2000);
+    const onAbort = () => {
+      clearTimeout(hung);
+      reject(new Error("This operation was aborted"));
+    };
+    if (opts?.signal?.aborted) return onAbort();
+    opts?.signal?.addEventListener("abort", onAbort);
+  });
+}
+
 test("#605 codex r4: a cache-MISS entry detection is bounded by the caller's signal too", async () => {
   // Fresh cache: EVERY probe hangs until its signal fires. A managerGet under a
   // tight caller budget must fail fast, not stack 15s probes.
-  const fetchApi = (_route, opts) =>
-    new Promise((_, reject) => {
-      const onAbort = () => reject(new Error("This operation was aborted"));
-      if (opts?.signal?.aborted) return onAbort();
-      opts?.signal?.addEventListener("abort", onAbort);
-    });
+  const fetchApi = (_route, opts) => hangingUntilAbort(opts);
   const h = buildDialectHarness({
     fetchApi,
     managerCall: async () => ({}),
@@ -314,11 +327,7 @@ test("#605 codex r4: an aborted legacy-UI sub-probe is never pinned as a 'v2' ve
   // (which 405s on legacy-UI builds).
   const fetchApi = (route, opts) => {
     if (route === "/v2/manager/queue/status") return Promise.resolve(okJson(QUEUE_STATUS));
-    return new Promise((_, reject) => {
-      const onAbort = () => reject(new Error("This operation was aborted"));
-      if (opts?.signal?.aborted) return onAbort();
-      opts?.signal?.addEventListener("abort", onAbort);
-    });
+    return hangingUntilAbort(opts);
   };
   const h = buildDialectHarness({
     fetchApi,
@@ -374,11 +383,7 @@ test("#605 codex r3: the managerGet re-probe aborts with the CALLER's signal (wa
     if (!hanging) {
       return Promise.resolve(route === "/manager/queue/status" ? okJson(QUEUE_STATUS) : notFound());
     }
-    return new Promise((_, reject) => {
-      const onAbort = () => reject(new Error("This operation was aborted"));
-      if (opts?.signal?.aborted) return onAbort();
-      opts?.signal?.addEventListener("abort", onAbort);
-    });
+    return hangingUntilAbort(opts);
   };
   const managerCall = async (route) => {
     if (hanging) throw routeMissing();
