@@ -10126,9 +10126,27 @@ const GRAPH_TOOL_EXECUTORS = {
     // inside the box now. Reimplementing only the node half moved the outer box and
     // its nodes but stranded every inner group box over the vacated space, so nodes
     // that looked grouped silently were not any more (#408).
-    const members = move_nodes !== false ? groupMemberNodes(graph, g) : [];
-    const nested = move_nodes !== false ? nestedGroupsOf(graph, g) : [];
-    const reroutes = move_nodes !== false ? reroutesInside(graph, b) : [];
+    let members = [];
+    let nested = [];
+    let reroutes = [];
+    try {
+      if (move_nodes !== false) {
+        members = groupMemberNodes(graph, g);
+        nested = nestedGroupsOf(graph, g);
+        reroutes = reroutesInside(graph, b);
+      }
+    } catch (error) {
+      // These are reads, and the only writes before them are the pre-flight's
+      // idempotent rect reconciliation — so no position has changed and nothing
+      // needs rolling back. Still, a throw here would reach the caller as a bare
+      // TypeError from a tool that promises a stated outcome, so it is turned into
+      // one. (Reachable only by an accessor that misbehaves inconsistently between
+      // the resync and this pass; the individual readers already return "unknown"
+      // rather than raising.)
+      throw new Error(
+        `refusing to move group ${group_id}: the frontend raised "${error?.message ?? error}" while reading what the group encloses, so its contents cannot be determined. NOTHING was moved. Reload the ComfyUI tab (panel_reload) and retry.`,
+      );
+    }
     // A reroute we cannot reposition SOUNDLY is decided here, by INSPECTION, and
     // never by invoking an API to see what it does. Refusing before beforeChange()
     // also means this call leaves no empty undo step behind.

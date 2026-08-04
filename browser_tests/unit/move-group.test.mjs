@@ -952,6 +952,36 @@ test("#408: a NESTED box that throws on read is stuck, not silently left behind"
   assert.deepEqual(a.pos, [50, 50], "and the member is back");
 });
 
+test("#408: an accessor that misbehaves only AFTER the resync still yields a stated refusal", () => {
+  // The pre-flight resync reconciles rects, then membership/nesting/reroutes are
+  // read. An accessor that behaves for the first pass and throws on the second is
+  // the one way a bare TypeError could still reach the caller. Nothing has been
+  // repositioned at that point, so the honest answer is a refusal that says so.
+  let reads = 0;
+  const flaky = {
+    id: 7,
+    size: [60, 40],
+    // No cached rect, so the resync reads pos twice and returns clean, and the
+    // membership pass is the next thing to touch it.
+    _p: [50, 50],
+    get pos() {
+      reads += 1;
+      if (reads > 2) throw new TypeError("disposed mid-read");
+      return this._p;
+    },
+  };
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [flaky], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /disposed mid-read.*cannot be determined.*NOTHING was moved/s,
+  );
+  assert.deepEqual(flaky._p, [50, 50]);
+  assert.deepEqual(g._bounding, [0, 0, 400, 400]);
+  assert.equal(graph.beforeCount, undefined, "and no undo transaction was opened");
+});
+
 test("#408: a node with NO cached rect and a hostile pos is caught by the readability pre-flight", () => {
   // syncNodeArea used to return early when there was no rect to write, without
   // ever touching pos — so this node sailed through the pre-flight and raised a
