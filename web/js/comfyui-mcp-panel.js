@@ -10124,20 +10124,29 @@ const GRAPH_TOOL_EXECUTORS = {
       // — a move must not change it.
       return groupBoxIsAt(g, x, y, b[2], b[3]) ? null : new Error("the write did not land");
     };
-    // Put the box back at its ORIGINAL top-left, and report whether it is really
-    // there. A thrown write is not by itself a failed restore — a frozen quad
-    // rejects the write but was never displaced in the first place, and calling
-    // that "could not be put back" would invent a partial move that never happened.
-    // Only the box's actual position decides.
+    // Put the box back at its ORIGINAL box, and report whether it is really there.
+    //
+    // Decided on STATE, never on intent. An earlier version gated this on a
+    // "we attempted a write" flag, but "did we try" is not "did it change": a
+    // setter that REJECTS its first assignment and CLAMPS a later one leaves the
+    // box untouched, sets the flag anyway, and the restore then moves a box no
+    // forward path had moved (0 → clamped to 50) — a refusal-time geometry
+    // mutation, which is the whole family of defect this handler exists to avoid.
+    //
+    // So: read where the box actually IS and write only if it differs from what we
+    // recorded. Same shape as the stranded-member rect — reconcile against reality
+    // rather than replay a classification of what we think happened — and robust
+    // to a setter that partially applied, which no attempt-flag could classify.
+    //
+    // A thrown write is also not by itself a failed restore: a frozen quad rejects
+    // the write but was never displaced, and calling that "could not be put back"
+    // would invent a partial move that never happened. Only the box's actual
+    // position decides.
     const restoreBox = () => {
+      if (groupBoxIsAt(g, b[0], b[1], b[2], b[3])) return false; // exactly as found
       writeBox(b[0], b[1]);
       return !groupBoxIsAt(g, b[0], b[1], b[2], b[3]);
     };
-    // Has any forward path written the box yet? Restoring a box nothing displaced
-    // is not a no-op: on an effectful or clamping setter the recovery write can
-    // create a displacement of its own. A rollback must not move what no forward
-    // path moved.
-    let boxWritten = false;
     // ---- PRE-FLIGHT (no mutations past this point until it is complete) ------
     // Everything this move needs to KNOW is established here, before the first
     // byte is written. After the first write the only permitted actions are
@@ -10268,7 +10277,7 @@ const GRAPH_TOOL_EXECUTORS = {
             ...nestedMove.undo(),
             ...rerouteMove.undo(),
             ...memberMove.undo(),
-            ...(boxWritten && restoreBox() ? [g] : []),
+            ...(restoreBox() ? [g] : []),
           ];
           syncGraphNodeAreas(graph);
           throw new Error(
@@ -10313,7 +10322,7 @@ const GRAPH_TOOL_EXECUTORS = {
           // refusal fires BEFORE the box write, and restoreBox() is itself a write:
           // on an effectful or clamping setter it would displace a box nothing had
           // displaced — a rollback moving something no forward path moved.
-          if (boxWritten && restoreBox()) stillWrong.push(["group", g]);
+          if (restoreBox()) stillWrong.push(["group", g]);
           stillWrong.push(...resync.undo().map((n) => ["node", n]));
           // A member that could NOT be put back is somewhere else now, and the
           // pre-flight undo has just restored its cached rect to where it used to
@@ -10348,7 +10357,6 @@ const GRAPH_TOOL_EXECUTORS = {
         // The box write is the LAST thing that can fail. Its failure has to put the
         // children back too, or the group is left torn apart with an error saying
         // otherwise.
-        boxWritten = true;
         const boxError = writeBox(targetX, targetY);
         if (boxError) {
           refuse(() => `the group box did not accept the new position on this frontend (${describeThrown(boxError)})`);
@@ -10360,14 +10368,12 @@ const GRAPH_TOOL_EXECUTORS = {
         // Even the box-only move must be VERIFIED, not assumed: a clamping setter
         // or a proxy that ignores the write would otherwise return a confident
         // "moved the box to [x, y]" for a box that never left.
-        boxWritten = true;
         const boxError = writeBox(targetX, targetY);
         if (boxError) {
           // Rollback FIRST — and BOTH undos: the box, and the pre-flight's rect
-          // reconciliation, which this branch also performed. (The box write is
-          // unconditionally above this line, so boxWritten is true here; the guard
-          // states the rule rather than relying on the reader tracing it.)
-          const restoreFailed = boxWritten ? restoreBox() : false;
+          // reconciliation, which this branch also performed. restoreBox() decides
+          // for itself whether the box actually needs putting back.
+          const restoreFailed = restoreBox();
           const unrestoredRects = resync.undo();
           throw new Error( // …then format
             `refusing to move group ${group_id}: the group box did not accept the new position on this frontend (${describeThrown(boxError)}). ` +

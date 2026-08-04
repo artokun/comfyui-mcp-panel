@@ -1711,6 +1711,110 @@ test("#408: the STUCK-ITEMS refusal does not write a box the forward path never 
   assert.equal(quad[0], 0);
 });
 
+/** A group whose `_bounding[0]` setter REJECTS its first assignment (leaving the
+ *  box untouched) and CLAMPS every later one. "We attempted a write" is true for
+ *  it while "the box changed" is false — the exact gap between intent and state. */
+function rejectThenClampGroup(id = 1) {
+  const quad = [0, 0, 400, 400];
+  const assignments = [];
+  Object.defineProperty(quad, "0", {
+    get() { return this._x ?? 0; },
+    set(v) {
+      assignments.push(v);
+      if (assignments.length === 1) throw new TypeError("first write rejected");
+      this._x = Math.max(50, v); // clamps: any later write MOVES it
+    },
+    configurable: true,
+  });
+  return { g: { id, title: "RejectThenClamp", get _bounding() { return quad; } }, quad, assignments };
+}
+
+test("#408 P0: a box write REJECTED on its first attempt is not 'written' — the rollback must not move it", () => {
+  // The forward write throws without changing anything, so the box is exactly
+  // where it started. Gating the restore on "we attempted a write" would then
+  // fire a recovery write into a clamping setter and displace an untouched box
+  // (x: 0 → 50) — a refusal-time geometry mutation. State, not intent, decides.
+  const { g, quad, assignments } = rejectThenClampGroup();
+  const a = node(7, [100, 100], [60, 40]);
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /the group box did not accept the new position.*NOTHING was moved/s,
+  );
+  assert.deepEqual(assignments, [1000], "exactly the one forward attempt — no recovery write");
+  assert.equal(quad[0], 0, "the box is untouched; the rollback did not move it");
+  assert.deepEqual(a.pos, [100, 100], "and the members are back");
+});
+
+test("#408 P0: the same, on the move_nodes:false branch", () => {
+  const { g, quad, assignments } = rejectThenClampGroup();
+  const graph = makeGraph({ nodes: [], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000], move_nodes: false }),
+    /the group box did not accept the new position.*NOTHING was moved/s,
+  );
+  assert.deepEqual(assignments, [1000], "no recovery write on this branch either");
+  assert.equal(quad[0], 0);
+});
+
+test("#408: a box whose CORNER is unchanged but whose SIZE was mangled is not 'as found'", () => {
+  // The state check has to compare the whole quad. This build pins the corner
+  // (any x/y write clamps back to 0) but mangles the width, so after the forward
+  // write the corner matches the original while the size does not. A corner-only
+  // check would call that "exactly as found", skip the restore, and report
+  // NOTHING was moved over a group the user would find reshaped.
+  const quad = [0, 0, 400, 400];
+  Object.defineProperty(quad, "0", { get() { return 0; }, set() {}, configurable: true });
+  Object.defineProperty(quad, "1", { get() { return 0; }, set() {}, configurable: true });
+  Object.defineProperty(quad, "2", {
+    get() { return this._w ?? 400; },
+    set() { this._w = 1; },
+    configurable: true,
+  });
+  const g = { id: 1, title: "PinnedCornerMangledSize", get _bounding() { return quad; } };
+  const a = node(7, [100, 100], [60, 40]);
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  let err = null;
+  try {
+    realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
+  } catch (error) {
+    err = error;
+  }
+  assert.ok(err);
+  assert.equal(quad[2], 1, "precondition: the width really was mangled and cannot be repaired");
+  assert.match(
+    err.message,
+    /PARTIALLY moved — 1 item\(s\) could NOT be put back \(group 1\)/,
+    "the reshaped box must be reported, not waved through as 'NOTHING was moved'",
+  );
+  assert.deepEqual(a.pos, [100, 100], "the members are still back");
+});
+
+test("#408: a box that REALLY moved is still restored — the state check is not a blanket skip", () => {
+  // The mirror of the above: when the forward write did change the box, the
+  // restore must still run. Clamping to [0, 500] means the write lands somewhere
+  // other than asked, so the move is refused and the box must go back to 0.
+  const quad = [0, 0, 400, 400];
+  Object.defineProperty(quad, "0", {
+    get() { return this._x ?? 0; },
+    set(v) { this._x = Math.max(0, Math.min(500, v)); },
+    configurable: true,
+  });
+  const g = { id: 1, title: "Clamped", get _bounding() { return quad; } };
+  const a = node(7, [100, 100], [60, 40]);
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [9000, 10] }),
+    /the group box did not accept the new position.*NOTHING was moved/s,
+  );
+  assert.equal(quad[0], 0, "the box that really did move is put back");
+  assert.deepEqual(a.pos, [100, 100]);
+});
+
 test("#408: the net does NOT write the group box, which no forward path had moved", () => {
   // The box write happens strictly AFTER the movers, so when this net fires
   // nothing has displaced the box. Calling restoreBox() anyway is a WRITE, and on
