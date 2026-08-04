@@ -1636,6 +1636,15 @@ test("refreshNodeArea REPORTS an unwritable rect instead of throwing mid-move", 
   let result;
   assert.doesNotThrow(() => { result = refreshNodeArea(frozen, [100, 100]); });
   assert.equal(result, false);
+  // Its "never throws" contract has to cover the READS too — a disposed accessor
+  // raises as readily on the way in as on the way out, and this runs mid-move
+  // with the caller relying on a verdict rather than an exception.
+  const unreadableRect = { pos: [110, 110], get boundingRect() { throw new TypeError("disposed"); } };
+  assert.doesNotThrow(() => { result = refreshNodeArea(unreadableRect, [100, 100]); });
+  assert.equal(result, false);
+  const unreadablePos = { boundingRect: [100, 70, 60, 70], get pos() { throw new TypeError("disposed"); } };
+  assert.doesNotThrow(() => { result = refreshNodeArea(unreadablePos, [100, 100]); });
+  assert.equal(result, false);
   const ok = { pos: [110, 110], boundingRect: [100, 70, 60, 70] };
   assert.equal(refreshNodeArea(ok, [100, 100]), true);
   assert.deepEqual([...ok.boundingRect], [110, 80, 60, 70]);

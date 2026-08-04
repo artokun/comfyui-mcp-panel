@@ -52,35 +52,44 @@ export function nodeFocusBounds(node) {
  * Returns true when the rect is in step with the node's live position.
  */
 export function refreshNodeArea(node, prevPos) {
-  if (!node) return true;
-  const rectBefore = node.boundingRect;
-  const originBefore =
-    rectBefore && rectBefore.length === 4 ? [rectBefore[0], rectBefore[1]] : null;
+  // The whole body is contained, not just the writes: READING `boundingRect` or
+  // `pos` can throw as easily as writing them (a disposed accessor, a revoked
+  // proxy), and this function claims never to throw. A claimed contract that only
+  // holds for the write half is the kind of guard that fails exactly when it is
+  // needed — while the caller is mid-transaction and relying on a verdict.
   try {
-    node.updateArea?.();
+    if (!node) return true;
+    const rectBefore = node.boundingRect;
+    const originBefore =
+      rectBefore && rectBefore.length === 4 ? [rectBefore[0], rectBefore[1]] : null;
+    try {
+      node.updateArea?.();
+    } catch {
+      /* some builds need a canvas ctx; the delta-sync below still corrects it */
+    }
+    const br = node.boundingRect;
+    if (!br || br.length !== 4) return true; // nothing cached ⇒ reads use live pos/size
+    // Engine already moved the rect origin → trust its authoritative recompute.
+    if (originBefore && (br[0] !== originBefore[0] || br[1] !== originBefore[1])) return true;
+    if (!Array.isArray(prevPos) || prevPos.length !== 2) return true;
+    const px = Number(prevPos[0]);
+    const py = Number(prevPos[1]);
+    if (!Number.isFinite(px) || !Number.isFinite(py)) return true;
+    const dx = (node.pos?.[0] ?? 0) - px;
+    const dy = (node.pos?.[1] ?? 0) - py;
+    if (!dx && !dy) return true;
+    const wantX = br[0] + dx;
+    const wantY = br[1] + dy;
+    try {
+      br[0] = wantX;
+      br[1] = wantY;
+    } catch {
+      /* frozen/read-only rect — reported below, never thrown mid-transaction */
+    }
+    return br[0] === wantX && br[1] === wantY;
   } catch {
-    /* some builds need a canvas ctx; the delta-sync below still corrects it */
+    return false; // cannot be shown to be in step ⇒ the caller treats it as stuck
   }
-  const br = node.boundingRect;
-  if (!br || br.length !== 4) return true; // nothing cached ⇒ reads use live pos/size
-  // Engine already moved the rect origin → trust its authoritative recompute.
-  if (originBefore && (br[0] !== originBefore[0] || br[1] !== originBefore[1])) return true;
-  if (!Array.isArray(prevPos) || prevPos.length !== 2) return true;
-  const px = Number(prevPos[0]);
-  const py = Number(prevPos[1]);
-  if (!Number.isFinite(px) || !Number.isFinite(py)) return true;
-  const dx = (node.pos?.[0] ?? 0) - px;
-  const dy = (node.pos?.[1] ?? 0) - py;
-  if (!dx && !dy) return true;
-  const wantX = br[0] + dx;
-  const wantY = br[1] + dy;
-  try {
-    br[0] = wantX;
-    br[1] = wantY;
-  } catch {
-    /* frozen/read-only rect — reported below, never thrown mid-transaction */
-  }
-  return br[0] === wantX && br[1] === wantY;
 }
 
 /** [x, y, w, h] that wraps the given nodes, padded for the group + node titles. */
