@@ -223,7 +223,7 @@ import {
   activeWorkflowPossiblyStale,
   activeStaleHint,
 } from "./lib/reconnect-staleness.js";
-import { pickRevertSnapshot } from "./lib/graph-revert.js";
+import { pickRevertSnapshot, describeRevertOutcome, revertDidRestore } from "./lib/graph-revert.js";
 import { commandFingerprint, createCommandDedupeLedger } from "./lib/command-dedupe.js";
 import { decideOpenStaleness } from "./lib/workflow-open-staleness.js";
 import {
@@ -4717,54 +4717,469 @@ function captureGraphSnapshot(mid, label) {
   }
 }
 
-// Restore the canvas to a given snapshot. Returns the snapshot, or null on fail.
-function restoreSnapshot(snap) {
-  if (!snap) return null;
+// Restore the canvas to a given snapshot. Returns a REVERT_STATUS outcome, never a
+// bare snapshot-or-null: `null` used to mean all of "no snapshot", "a snapshot
+// exists but loading it was REFUSED", and "the load failed part-way", and every
+// caller rendered it as "nothing to revert". That is the wrong answer at the worst
+// moment — the binding refusal fires exactly when a backend restart has left the
+// canvas unidentifiable, which is when someone reaches for /revert, and the reason
+// it was carrying IS the remedy. Preserve the reason and let the caller show it.
+// ASYNC because `loadGraphData` is async on current frontends and the panel's own
+// creation-boundary wrapper preserves its promise (see graph_load, which awaits it
+// for the same reason). Calling it without awaiting made the "failed" branch below
+// unreachable: a load that STARTED, changed the canvas in part, and then REJECTED
+// returned `restored`, so every consumer reported success — including rewind's
+// "canvas reverted" — over a half-applied load. That is the fabricated-outcome case
+// this whole path exists to prevent, so the promise has to be awaited.
+// ---- the canvas interaction lock, as a fence with an OWNER -----------------
+//
+// `canvas.allow_interaction` is a bare boolean, so "restore the value I saved" is
+// only correct while nobody else has frozen it since. Two overlapping destructive
+// sections break that, and they overlap for a reason already established here:
+// acquireWorkflowReloadGuard OVERWRITES, so a timed-out revert can lose its section
+// to a workflow_open while its own load is still live. If that revert then settles
+// first, restoring its stale `true` UNLOCKS the canvas in the middle of
+// workflow_open's reload — a hand edit lands and the newer load overwrites it. The
+// exact clobber the freeze exists to prevent, reopened by a lock released by
+// someone who no longer owns it.
+//
+// So the lock is reference-counted with per-holder tokens: the value to restore is
+// captured when the FIRST holder freezes, a release by a non-owner is a no-op, and
+// the canvas only reopens when the LAST holder leaves. That is order-independent —
+// whichever of two overlapping sections finishes first, the canvas stays locked
+// until both are done.
+let canvasInteractionHolders = new Set();
+let canvasInteractionPrior = null;
+let canvasInteractionSeq = 0;
+
+/** Freeze `canvasView` and return an ownership token, or null when the freeze did
+ *  NOT happen — this frontend exposes no boolean lock, or the write was refused.
+ *  Callers must treat null as "no user fence available", never as "frozen". */
+function acquireCanvasInteractionLock(canvasView) {
+  if (typeof canvasView?.allow_interaction !== "boolean") return null;
+  const firstHolder = canvasInteractionHolders.size === 0;
+  const prior = firstHolder ? canvasView.allow_interaction : canvasInteractionPrior;
+  // FREEZE FIRST, register second. `allow_interaction` can be a read-only property
+  // or a throwing setter, and registering the holder before the write is a claim
+  // that the freeze happened. If the write then threw, nobody would hold the token
+  // — the caller gets null and never releases — so the orphan would sit in the set
+  // forever, keeping the count nonzero and leaving the NEXT canvas permanently
+  // locked with nothing running. A guard is itself an operation that can fail:
+  // record it only once it has.
   try {
-    const { app, graph, rootGraph } = getGraphCtx();
+    canvasView.allow_interaction = false;
+  } catch {
+    return null; // no freeze, no holder — the caller sees "no user fence available"
+  }
+  if (firstHolder) canvasInteractionPrior = prior;
+  const token = ++canvasInteractionSeq;
+  canvasInteractionHolders.add(token);
+  return token;
+}
+
+/** Drop `token`'s claim. The canvas reopens only when no holder is left, and only
+ *  to the value captured before the FIRST freeze — never to a stale snapshot a
+ *  later holder has since superseded. Returns whether the canvas was reopened. */
+function releaseCanvasInteractionLock(token, canvasView) {
+  if (token == null || !canvasInteractionHolders.delete(token)) return false;
+  if (canvasInteractionHolders.size > 0) return false; // a newer section still holds it
+  try {
+    if (canvasView && typeof canvasInteractionPrior === "boolean") {
+      canvasView.allow_interaction = canvasInteractionPrior;
+    }
+  } catch {
+    // A canvas that refuses the write is already gone. Drop the bookkeeping anyway:
+    // keeping the holder registered would leave the count nonzero forever and lock
+    // out every later canvas, which is strictly worse than a dead canvas staying
+    // frozen. The claim is released either way — only the write is best-effort.
+  }
+  canvasInteractionPrior = null;
+  return true;
+}
+
+/** How long a snapshot restore's `loadGraphData` may run before the panel gives the
+ *  user their canvas back. Generous — a large workflow legitimately takes seconds —
+ *  but finite, because the freeze around this await locks the user out of their own
+ *  graph and a hung load would do so forever, silently. */
+const RESTORE_LOAD_BUDGET_MS = 15000;
+/** Distinguishes "the deadline won" from a resolved load and from a rejection. */
+const RESTORE_LOAD_TIMED_OUT = { timedOut: true };
+
+/** A snapshot load that outran its deadline and is STILL RUNNING. Releasing the
+ *  fences on timeout hands the canvas back, but it does NOT stop that load — so it
+ *  is tracked here and no further restore may start until it settles. Without this
+ *  the deadline would trade a silent lockout for a silent overwrite: a second
+ *  restore could complete and then be clobbered by the first one landing late. It
+ *  cannot fence ordinary graph commands as well — that is precisely the wedge the
+ *  deadline exists to avoid — which is why the timeout message says outright that a
+ *  late completion may overwrite the canvas. */
+let restoreLoadStillRunning = null;
+
+/**
+ * Resolve to `{ outcome, settled }`. `outcome` is `null` (settled), an Error
+ * (rejected), or RESTORE_LOAD_TIMED_OUT. `settled` is the never-rejecting promise
+ * for the load itself, so a caller that gave up on the deadline can still observe
+ * when it finally finishes — and so a rejection arriving after the deadline is
+ * never an unhandled one.
+ * `setTimer`/`clearTimer` are injectable so tests drive the deadline deterministically
+ * instead of sleeping.
+ */
+function raceRestoreLoadDeadline(
+  load,
+  { budgetMs = RESTORE_LOAD_BUDGET_MS, setTimer = setTimeout, clearTimer = clearTimeout } = {},
+) {
+  let timer = null;
+  const settled = Promise.resolve(load).then(
+    () => null,
+    (err) => (err instanceof Error ? err : new Error(coerceMessageText(err))),
+  );
+  const deadline = new Promise((resolve) => {
+    timer = setTimer(() => resolve(RESTORE_LOAD_TIMED_OUT), budgetMs);
+  });
+  return Promise.race([settled, deadline]).then((outcome) => {
+    if (timer !== null) clearTimer(timer);
+    return { outcome, settled };
+  });
+}
+
+/** Remember an abandoned-but-live load, and forget it once it finally settles. */
+function noteRestoreLoadStillRunning(settled) {
+  restoreLoadStillRunning = settled;
+  settled.then(
+    () => {
+      if (restoreLoadStillRunning === settled) restoreLoadStillRunning = null;
+    },
+    () => {
+      if (restoreLoadStillRunning === settled) restoreLoadStillRunning = null;
+    },
+  );
+}
+
+async function restoreSnapshot(snap) {
+  if (!snap) return { status: "none" };
+  // EVERYTHING that can fail before the load starts belongs in this region, because
+  // its verdict is "refused" — nothing applied, safe to retry. Only the awaited
+  // load itself may report "failed" (may be partly applied). Leaving the clone or
+  // the loadGraphData availability check inside the load's try made those failures
+  // claim the action had STARTED, which is fabricated for a call that never
+  // happened.
+  let app;
+  let payload;
+  let token = null;
+  let restoredUuid = null;
+  // Bound to a local whose name does NOT end in "s": the #268 frontend-contract
+  // scanner captures members off the workflow-service alias `s` with an unanchored
+  // `s\.` pattern, so `canvas.<member>` would be misread as a new workflow-SERVICE
+  // dependency. This is a LiteGraph canvas flag, not a workflow-service member.
+  let canvasView = null;
+  let interactionToken = null;
+  // Set when a timed-out load has taken ownership of the fences: they must NOT be
+  // released by the finally below, only by the load settling.
+  let deferredRelease = false;
+  // Release BOTH fences on EVERY path — including the bounded-load timeout, which
+  // exists precisely so a hung load cannot hold them forever. A throw anywhere must
+  // never leave the user with a frozen canvas or a tab refusing every graph command.
+  const releaseSection = () => {
+    if (token !== null) {
+      endWorkflowReloadStep(token);
+      releaseWorkflowReloadGuard(token);
+      token = null;
+    }
+    // OWNER-CHECKED: a release by a section that has since been superseded is a
+    // no-op, so a late-settling revert cannot unlock the canvas out from under a
+    // workflow_open that is still loading.
+    if (interactionToken !== null) {
+      releaseCanvasInteractionLock(interactionToken, canvasView);
+      interactionToken = null;
+    }
+  };
+  try {
+    let graph;
+    let rootGraph;
+    ({ app, graph, rootGraph } = getGraphCtx());
     // Snapshots are workflow-instance scoped. A snapshot captured from tab B
     // must never become a valid load merely because the canvas later rebinds to
     // tab A; missing provenance is rejected too (old in-memory snapshots).
-    if (!snap.workflowRef || snap.workflowRef !== activeWorkflowRef()) return null;
+    if (!snap.workflowRef || snap.workflowRef !== activeWorkflowRef()) {
+      return {
+        status: "refused",
+        reason:
+          "That snapshot was captured from a different workflow tab (or has no recorded " +
+          "workflow), so loading it here would overwrite this canvas with another " +
+          "workflow's graph. Switch back to the tab it came from and retry.",
+      };
+    }
     // Revert is a direct local load, not a bridge command. Do not restore a
     // snapshot into a canvas proven to belong to a different active workflow.
     assertGraphBoundToActiveWorkflow(graph, rootGraph, {
       ...MUTATION_BINDING_BAR,
     });
+    if (typeof app?.loadGraphData !== "function") {
+      return {
+        status: "refused",
+        reason: "This ComfyUI frontend does not expose loadGraphData, so the panel cannot restore a snapshot.",
+      };
+    }
     // Deep-clone so the stored snapshot isn't mutated by the live graph after load.
+    payload = JSON.parse(JSON.stringify(snap.data));
+    // #442's section guard, taken for the SAME reason workflow_open takes it: the
+    // restore is now an ASYNC destructive load, and the bridge refuses graph
+    // commands while the guard is held. Without it an agent command arriving during
+    // the await is accepted and acknowledged, then silently erased when the load
+    // settles — the data-loss shape that guard exists to close. It doubles as the
+    // single-flight lock: a second /revert (or a rewind, or a rollback click)
+    // landing mid-load is refused instead of racing the first to settle out of
+    // order. A guard already held by a workflow switch/reload refuses us likewise.
+    const held = activeWorkflowReloadGuard();
+    if (held) {
+      return {
+        status: "refused",
+        reason:
+          `The panel is switching or reloading "${held.key}" right now, so restoring a snapshot ` +
+          `into that canvas would race it. Retry in a moment.`,
+      };
+    }
+    // …and the section alone is not enough once a load can outrun its deadline: an
+    // abandoned-but-live load still holds no fence, so a second restore could finish
+    // and then be overwritten by the first one landing late.
+    if (restoreLoadStillRunning) {
+      return {
+        status: "refused",
+        reason:
+          "An earlier snapshot restore passed its deadline and is STILL running, so starting " +
+          "another would race it — and the earlier one could land last. Wait for it to finish, " +
+          "or reload the ComfyUI page.",
+      };
+    }
+    token = acquireWorkflowReloadGuard("graph-revert");
+    if (!beginWorkflowReloadStep(token)) {
+      releaseWorkflowReloadGuard(token);
+      token = null;
+      return { status: "refused", reason: "The panel could not take the graph-reload section. Retry in a moment." };
+    }
+    // FREEZE canvas interaction across the destructive await, exactly as
+    // workflow_open does for its own repaint: the section above keeps the BRIDGE
+    // out, and this keeps the USER out. Without it a hand edit landing while
+    // loadGraphData is in flight is silently overwritten when the load settles —
+    // the same unsaved-work loss this whole change exists to stop, arriving through
+    // the window that making the path async opened. Restored on every path by
+    // releaseSection().
+    canvasView = app?.canvas ?? null;
+    interactionToken = acquireCanvasInteractionLock(canvasView);
+    if (interactionToken === null) {
+      // No user-side fence available on this frontend. REFUSE rather than run a
+      // destructive await unfenced and describe it as though the fence were there —
+      // the write would land on whatever the user did in the meantime, which is the
+      // loss this path exists to prevent. workflow_open sets the same precedent: it
+      // gates its destructive re-read on `priorInteraction !== null` and skips it
+      // when the canvas cannot be frozen.
+      return {
+        status: "refused",
+        reason:
+          "This ComfyUI frontend does not expose a canvas interaction lock, so the panel cannot " +
+          "stop you editing while the snapshot loads — and an edit made in that window would be " +
+          "silently overwritten when it lands. Reload the ComfyUI page and retry, or undo with " +
+          "Ctrl+Z on the canvas instead.",
+      };
+    }
+    // STAMP the target workflow's identity into the exact payload about to be
+    // loaded, so the post-load check can demand that marker back — the same
+    // technique, for the same reason, as workflow_open's repaint. Without it the
+    // post-load proof rests on the active-instance pointer plus content, and neither
+    // survives an A->B->A switch across the load: the pointer reads A again, and
+    // graphRootMatchesState deliberately ignores the identity tag, so a same-shaped
+    // B could be certified as a successful revert of A.
+    //
+    // Ask for the identity WITHOUT `{ embed: true }`: that option's job is to write
+    // the uuid (and path) into the workflow's own `extra`, and this needs no such
+    // step — only a value to stamp into its own clone and demand back.
+    //
+    // Being precise, because it is easy to overclaim here: this is NOT a claim that
+    // resolving an identity is side-effect free. `workflowStableUuid`'s UNSAVED
+    // branch persists the id into `extra` by design, so a reload of the same tab
+    // keeps its identity (#570) — and the binding assert above does not necessarily
+    // beat us to it, since it short-circuits on a cached object uuid without calling
+    // the resolver at all. What this does guarantee is narrower and is the part
+    // within this path's gift: no `{embed:true}` step of its own, and the call taken
+    // only after the section, so a refusal never reaches it.
+    //
+    // The stamp does land in the restored graph's `extra.comfyui_mcp`, which is where
+    // the panel already keeps this tag on a live root; it is panel-owned bookkeeping,
+    // excluded from every content comparison, and identical to what a normal binding
+    // stamp would have written.
+    restoredUuid = workflowStableUuid(snap.workflowRef);
+    if (restoredUuid) {
+      const priorExtra =
+        payload.extra && typeof payload.extra === "object" && !Array.isArray(payload.extra)
+          ? payload.extra
+          : {};
+      const priorMeta =
+        priorExtra[WORKFLOW_META_NAMESPACE] &&
+        typeof priorExtra[WORKFLOW_META_NAMESPACE] === "object" &&
+        !Array.isArray(priorExtra[WORKFLOW_META_NAMESPACE])
+          ? priorExtra[WORKFLOW_META_NAMESPACE]
+          : {};
+      payload.extra = {
+        ...priorExtra,
+        [WORKFLOW_META_NAMESPACE]: { ...priorMeta, [WORKFLOW_UUID_FIELD]: restoredUuid },
+      };
+    }
+  } catch (err) {
+    // No graph data has been loaded, so this is a clean REFUSAL: safe to retry once
+    // the binding is sound. Carry the panel's own text — it names the predicate
+    // that fired and the remedy that clears it.
+    releaseSection();
+    return { status: "refused", reason: coerceMessageText(err?.message ?? err) };
+  }
+  try {
     // __cmcpNoFork: this reloads the SAME active workflow (a revert), so the create-
     // boundary fork must NOT re-mint its per-instance identity (#570 P0).
-    app.loadGraphData(JSON.parse(JSON.stringify(snap.data)), true, true, activeWorkflowRef(), {
-      __cmcpNoFork: true,
-    });
-    return snap;
-  } catch {
-    return null;
+    // AWAIT: a rejection after a partial apply must reach the catch below, not
+    // escape as an unhandled rejection while we report success.
+    //
+    // …with a deadline on the REPLY, never on the fences. The panel cannot cancel a
+    // loadGraphData once it is running, so the writer stays live regardless. That
+    // leaves exactly two honest options, and releasing the fences while the writer
+    // is live is not one of them: it would hand the canvas back, let the user (or
+    // any graph_* mutation) edit, and then let the original load land on top — the
+    // silent overwrite this whole change exists to prevent, introduced by the very
+    // deadline that was meant to help.
+    //
+    // So the deadline bounds how long the CALLER waits, not how long the canvas is
+    // protected. On expiry we answer — loudly, saying the canvas stays locked and
+    // why — and the fences come off only when the load actually settles. A load that
+    // never settles therefore wedges the tab, which is the same trade
+    // beginWorkflowReloadStep already documents for the bridge: a loud, recoverable
+    // wedge beats silently eating work the user was never told about. The difference
+    // from the first cut is that it is now LOUD.
+    const { outcome: loadOutcome, settled: loadSettled } = await raceRestoreLoadDeadline(
+      app.loadGraphData(payload, true, true, activeWorkflowRef(), { __cmcpNoFork: true }),
+    );
+    if (loadOutcome === RESTORE_LOAD_TIMED_OUT) {
+      // Hand the fences to the load itself: they drop when it settles, not now.
+      // `deferredRelease` stops the finally below from releasing them early.
+      deferredRelease = true;
+      noteRestoreLoadStillRunning(loadSettled);
+      const handOff = releaseSection;
+      loadSettled.then(handOff, handOff);
+      return {
+        status: "failed",
+        reason:
+          `The graph load did not finish within ${Math.round(RESTORE_LOAD_BUDGET_MS / 1000)}s. It ` +
+          `has NOT been cancelled and the panel cannot cancel it, so the canvas stays locked and ` +
+          `graph commands stay refused until it lands — releasing them now would let an edit be ` +
+          `silently overwritten when it does. They unlock by themselves the moment it finishes; ` +
+          `if it never does, reload the ComfyUI page.`,
+      };
+    }
+    if (loadOutcome instanceof Error) throw loadOutcome;
+    // A RESOLVED PROMISE IS NOT A RECEIPT — the same thing workflow_open's repaint
+    // says about its own load: an old or partial frontend can resolve while leaving
+    // the canvas on the previous root. Treating resolution as proof would report
+    // "canvas reverted" for a canvas that never changed, and the rollback modal
+    // would then rewind the conversation and resend against it.
+    //
+    // The same three-part proof workflow_open demands of its own repaint, because
+    // no one part answers the others' question:
+    //   1. the ACTIVE INSTANCE is still the workflow this snapshot belongs to
+    //      (it was only validated before the await, and a tab switch during the
+    //      load would make everything below describe a different canvas);
+    //   2. the live root carries the identity we STAMPED into this payload — the
+    //      part that survives an A->B->A switch, which the pointer in (1) does not
+    //      and which the content check in (3) deliberately ignores;
+    //   3. the CONTENT matches the exact payload loaded.
+    let liveRoot = null;
+    try {
+      ({ rootGraph: liveRoot } = getGraphCtx());
+    } catch {
+      liveRoot = null; // binding unreadable right after the load — unverifiable
+    }
+    if (activeWorkflowRef() !== snap.workflowRef) {
+      return {
+        status: "failed",
+        reason:
+          "The active workflow changed while the snapshot was loading, so the panel cannot " +
+          "confirm which canvas it landed on. Check both tabs before editing or running them.",
+      };
+    }
+    if (restoredUuid && !graphRootWorkflowUuidMatches({ rootGraph: liveRoot, activeWorkflowUuid: restoredUuid })) {
+      return {
+        status: "failed",
+        reason:
+          "The load reported success, but the canvas is not carrying the identity this snapshot " +
+          "was loaded with, so the panel cannot confirm it landed on the right graph. Check the " +
+          "canvas before editing or running it.",
+      };
+    }
+    // (3) is a SEMANTIC match, not byte equality: graphRootMatchesState normalizes
+    // serializer dialect, node order, counters and viewport (#560), which is what
+    // keeps a faithful repaint from false-failing. It is NOT claimed to be immune:
+    // loadGraphData validates, runs extensions and normalizes widget values before
+    // it resolves, so a frontend transformation could in principle make a genuinely
+    // successful revert unverifiable. That direction is the safe one — the outcome
+    // is "started, cannot confirm", which discloses rather than fabricating and
+    // stops the modal's resend — but it is the thing to watch for in a live session.
+    if (!graphRootMatchesState({ rootGraph: liveRoot, state: payload })) {
+      return {
+        status: "failed",
+        reason:
+          "The load reported success, but the canvas does not match the snapshot that was " +
+          "loaded, so the panel cannot confirm the revert landed. Check the canvas before " +
+          "editing or running it.",
+      };
+    }
+  } catch (err) {
+    // The load was STARTED. It may have applied in part, so this is a disclosure,
+    // not a refusal — reporting "nothing happened" here would invite a retry on
+    // top of a half-changed canvas.
+    return { status: "failed", reason: coerceMessageText(err?.message ?? err) };
+  } finally {
+    // NOT when a timed-out load owns them: the writer is still live, and releasing a
+    // fence while the writer is live is the one combination that cannot be made safe.
+    if (!deferredRelease) releaseSection();
   }
+  return { status: "restored", snapshot: snap };
 }
 
 // Restore the canvas to the most recent pre-turn snapshot that ACTUALLY DIFFERS
 // from the current graph (undo the last turn's edits). Skipping an identical
 // latest snapshot fixes the no-op revert (#327): after a turn replaced/cleared
 // the graph, the next message snapshots the already-changed graph, so the newest
-// snapshot equals the canvas and reverting to it recovers nothing. Returns null
-// when nothing genuinely differs — the caller surfaces "nothing to revert".
-function revertGraphToLastSnapshot() {
+// snapshot equals the canvas and reverting to it recovers nothing. Returns a
+// REVERT_STATUS outcome; "none" only when nothing genuinely differs.
+async function revertGraphToLastSnapshot() {
   const workflowRef = activeWorkflowRef();
-  if (!workflowRef) return null;
+  // NOT "none": there may well be snapshots — the panel just cannot read the active
+  // workflow, so it cannot tell which of them belong to this canvas. Saying "no
+  // snapshot captured" would be the same could-not-determine-becomes-a-verdict
+  // defect this vocabulary exists to remove. Nothing was applied, so it is a
+  // refusal, and a transient null active workflow clears on retry.
+  if (!workflowRef) {
+    return {
+      status: "refused",
+      reason:
+        "The panel cannot read the active workflow right now, so it cannot tell which snapshots " +
+        "belong to this canvas. Retry in a moment.",
+    };
+  }
   // The snapshot ring spans tabs, but a revert belongs only to the CURRENT
   // workflow instance. Filter before choosing the newest differing snapshot:
   // otherwise a newer B snapshot wins selection, is rightly rejected by
   // restoreSnapshot, and hides an older valid A snapshot (#349).
   const scopedSnapshots = graphSnapshots.filter((snap) => snap?.workflowRef === workflowRef);
-  if (!scopedSnapshots.length) return null;
+  // The ONLY truthful "none" on this path: this workflow has no snapshot at all.
+  if (!scopedSnapshots.length) return { status: "none" };
   try {
     const current = getGraphCtx().rootGraph.serialize();
+    // Every snapshot equals the live graph ⇒ genuinely nothing to revert (#327).
     const snap = pickRevertSnapshot(scopedSnapshots, current);
-    return snap ? restoreSnapshot(snap) : null;
+    return snap ? restoreSnapshot(snap) : { status: "none" };
   } catch {
-    // graph unavailable (can't serialize current state) — fall back to the
-    // legacy newest-snapshot behavior rather than silently doing nothing.
+    // The current graph can't be serialized to compare against — which now
+    // includes the canvas/root divergence refusal. Fall back to the legacy
+    // newest-snapshot behavior rather than silently doing nothing: restoreSnapshot
+    // re-checks the binding and returns a REFUSED outcome carrying the reason, so
+    // a divergence surfaces as itself instead of as "nothing to revert".
     return restoreSnapshot(scopedSnapshots[scopedSnapshots.length - 1]);
   }
 }
@@ -5458,16 +5873,27 @@ async function validationBanner() {
 }
 
 // Restore the canvas to the snapshot captured before the message with this mid
-// (the per-message rollback). Returns the snapshot or null.
-function revertGraphSnapshotByMid(mid) {
+// (the per-message rollback). Returns a REVERT_STATUS outcome — "none" ONLY when
+// this message truly has no snapshot for the active workflow, never as a stand-in
+// for a refusal (see restoreSnapshot).
+async function revertGraphSnapshotByMid(mid) {
   const workflowRef = activeWorkflowRef();
-  if (!workflowRef) return null;
+  // Same as revertGraphToLastSnapshot: unreadable active workflow is a refusal, not
+  // a claim that this message has no snapshot.
+  if (!workflowRef) {
+    return {
+      status: "refused",
+      reason:
+        "The panel cannot read the active workflow right now, so it cannot tell which snapshots " +
+        "belong to this canvas. Retry in a moment.",
+    };
+  }
   for (let i = graphSnapshots.length - 1; i >= 0; i--) {
     if (graphSnapshots[i].mid === mid && graphSnapshots[i].workflowRef === workflowRef) {
       return restoreSnapshot(graphSnapshots[i]);
     }
   }
-  return null;
+  return { status: "none" };
 }
 
 /** Summarize one LiteGraph node for the agent — id, type, title, widget
@@ -8986,10 +9412,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // in a window whose dirty signal we are about to overwrite. Scoped to `wasOpen` (the
     // only case that can reload) so a plain first-time open never freezes, and restored in
     // a finally on every path.
-    const priorInteraction =
-      wasOpen && typeof canvasView?.allow_interaction === "boolean"
-        ? canvasView.allow_interaction
-        : null;
+    // Taken through the OWNED lock so this and a concurrent snapshot restore cannot
+    // release each other's freeze: `allow_interaction` is a bare boolean, and a
+    // section that saved `true` before the other one froze would otherwise unlock
+    // the canvas mid-load for whoever is still going. `priorInteraction` keeps its
+    // meaning here — non-null means "the freeze is holding", which the re-baseline
+    // and disk-reload steps below gate on — it is now a token rather than the saved
+    // boolean, and the saved boolean lives inside the lock.
+    const priorInteraction = wasOpen ? acquireCanvasInteractionLock(canvasView) : null;
     let onDiskContent = null;
     let dirtyNow = false;
     let staleInfo = { stale: false, reload: false };
@@ -8997,7 +9427,6 @@ const GRAPH_TOOL_EXECUTORS = {
     let reloadError = null;
     let openFailed = null;
     let rebindFailed = null;
-    if (priorInteraction !== null) canvasView.allow_interaction = false;
     // Hold the switch+reload critical section across the WHOLE mutating sequence. The canvas
     // freeze keeps the USER out; this keeps the BRIDGE out, so a concurrent graph_* command
     // can neither be overwritten by the reload nor be silently re-baselined as clean.
@@ -9317,9 +9746,11 @@ const GRAPH_TOOL_EXECUTORS = {
       console.warn("[comfyui-mcp-panel] workflow_open disk re-read failed:", reloadError);
     } finally {
       // Release BOTH on EVERY path — a throw anywhere above must never leave the user with
-      // a frozen graph or the tab refusing every command.
+      // a frozen graph or the tab refusing every command. The canvas lock is owner-checked:
+      // if a concurrent section still holds it, this release leaves it alone and the last
+      // holder reopens the canvas.
       releaseWorkflowReloadGuard(reloadGuardToken);
-      if (priorInteraction !== null) canvasView.allow_interaction = priorInteraction;
+      releaseCanvasInteractionLock(priorInteraction, canvasView);
     }
     if (openFailed) throw failOpen(openFailed);
     if (rebindFailed) throw failOpenRebindUnknown(rebindFailed);
@@ -21029,6 +21460,20 @@ function buildPanel() {
     }
   }
 
+  /** Run a slash command from a SYNCHRONOUS UI handler. Most `run()`s are sync, but
+   *  /revert now awaits an async graph load — normalizing through Promise.resolve
+   *  keeps a rejection from escaping as an unhandled promise, and surfaces it in the
+   *  transcript instead of only the console. */
+  function runSlashCommand(entry) {
+    try {
+      Promise.resolve(entry.run()).catch((err) => {
+        appendSystem(`${entry.cmd} failed: ${coerceMessageText(err?.message ?? err)}`);
+      });
+    } catch (err) {
+      appendSystem(`${entry.cmd} failed: ${coerceMessageText(err?.message ?? err)}`);
+    }
+  }
+
   const SLASH_COMMANDS = [
     { cmd: "/new", icon: "pi-plus", hint: "start a new chat", run: () => newChat() },
     {
@@ -21060,15 +21505,16 @@ function buildPanel() {
       cmd: "/revert",
       icon: "pi-undo",
       hint: "undo the last turn's graph edits — revert the canvas to before your last message",
-      run: () => {
-        const snap = revertGraphToLastSnapshot();
-        if (snap) {
-          appendSystem(
-            `↩ Reverted the canvas to before${snap.label ? ` “${snap.label}”` : " your last message"}.`,
-          );
-        } else {
-          appendSystem("Nothing to revert — no graph snapshot captured in this session yet.");
-        }
+      run: async () => {
+        const outcome = await revertGraphToLastSnapshot();
+        const label = outcome?.snapshot?.label;
+        appendSystem(
+          describeRevertOutcome(outcome, {
+            action: "revert",
+            restoredText: `↩ Reverted the canvas to before${label ? ` “${label}”` : " your last message"}.`,
+            noneText: "Nothing to revert — no graph snapshot captured in this session yet.",
+          }),
+        );
       },
     },
     {
@@ -21147,7 +21593,9 @@ function buildPanel() {
       input.value = "";
       input.style.height = "auto";
       appendUser(item.ref.cmd);
-      item.ref.run();
+      // Some slash commands (/revert) are async now. Normalize so a rejection can
+      // never surface as an unhandled promise from a sync UI handler.
+      runSlashCommand(item.ref);
       return;
     }
     const { start, end } = menuToken ?? { start: input.value.length, end: input.value.length };
@@ -21850,17 +22298,41 @@ function buildPanel() {
   // before your last message AND bring that message back into the composer to
   // edit & resend. (Graph + edit scope; conversation-fork is a follow-up.)
   let lastEscAt = 0;
-  function rewindLastTurn() {
-    const snap = revertGraphToLastSnapshot();
+  async function rewindLastTurn() {
+    // Recall FIRST and synchronously: the canvas revert now awaits an async
+    // loadGraphData, and the composer must not sit empty for the length of a graph
+    // load. The two halves are independent, so only the summary line below needs
+    // both results.
     const recalled = recallPrev(); // pulls your last message into the composer to edit
-    if (snap || recalled) {
+    if (recalled) input.focus();
+    const outcome = await revertGraphToLastSnapshot();
+    const reverted = revertDidRestore(outcome); // an outcome object is ALWAYS truthy
+    if (reverted || recalled) {
       appendSystem(
-        `↩ Rewound your last turn${snap ? " — canvas reverted" : ""}` +
+        `↩ Rewound your last turn${reverted ? " — canvas reverted" : ""}` +
           `${recalled ? "; your message is back in the composer to edit & resend" : ""}.`,
       );
       input.focus();
-    } else {
-      appendSystem("Nothing to rewind yet — no message/graph snapshot from this session.");
+    }
+    // The canvas half is ALWAYS stated when it did not happen — refused, failed, or
+    // simply no eligible snapshot. "Rewound your last turn; your message is back in
+    // the composer" is otherwise read as a completed rewind, and the user resends
+    // against a graph that still holds the very edits they meant to undo. `none` is
+    // as dangerous as a refusal here: the ring holds 25 and EVICTS, so an old turn's
+    // snapshot is simply gone. Only `restoredText` may be blank, because the line
+    // above already said "canvas reverted".
+    if (!reverted) {
+      appendSystem(
+        describeRevertOutcome(outcome, {
+          action: "rewind the canvas",
+          restoredText: "",
+          noneText: recalled
+            ? "The canvas was NOT reverted — no graph snapshot for that turn (they are kept for the " +
+              "last 25 and then evicted). Your message is back in the composer, but the canvas still " +
+              "holds that turn's edits."
+            : "Nothing to rewind yet — no message or graph snapshot from this session.",
+        }),
+      );
     }
   }
 
@@ -21915,22 +22387,77 @@ function buildPanel() {
     go.type = "button";
     go.className = "cmcp-btn cmcp-btn-primary";
     go.textContent = "Roll back & resend";
+    // The canvas rollback is an ASYNC load, so this modal outlives a single tick and
+    // needs explicit lifecycle state: `settled` makes the primary action single-shot
+    // (a double-click would otherwise start two restores and BOTH continuations
+    // would rewind the conversation and resubmit the message), and `cancelled` marks
+    // an explicit Cancel / backdrop dismissal so the continuation stops instead of
+    // acting on the user's behalf after they backed out.
+    let settled = false;
+    let cancelled = false;
+    // `close` is used BOTH for dismissal and for the handler's own teardown, so it
+    // must not itself set `cancelled` — doing that made every successful path look
+    // cancelled, which is why the gate below had to be written backwards to work at
+    // all. Dismissal is its own function.
     const close = () => overlay.remove();
-    cancel.addEventListener("click", close);
+    const dismiss = () => {
+      cancelled = true;
+      close();
+    };
+    cancel.addEventListener("click", dismiss);
     overlay.addEventListener("mousedown", (e) => {
-      if (e.target === overlay) close();
+      if (e.target === overlay) dismiss();
     });
-    go.addEventListener("click", () => {
+    go.addEventListener("click", async () => {
+      if (settled) return;
+      settled = true;
+      go.disabled = true;
       const edited = ta.value.trim();
       const wantCode = chosen === "code" || chosen === "both";
       const wantConvo = chosen === "conversation" || chosen === "both";
       if (wantCode) {
-        const snap = revertGraphSnapshotByMid(mid);
+        // AWAITED before the conversation rewind and the resend below: resending
+        // against a canvas whose load is still in flight is the race this whole
+        // path is about.
+        const outcome = await revertGraphSnapshotByMid(mid);
         appendSystem(
-          snap
-            ? "↩ Canvas reverted to before this message."
-            : "No graph snapshot for this message — canvas left as-is.",
+          describeRevertOutcome(outcome, {
+            action: "roll back the canvas",
+            restoredText: "↩ Canvas reverted to before this message.",
+            noneText: "No graph snapshot for this message — canvas left as-is.",
+          }),
         );
+        // The user asked to roll the canvas back AND resend against it. Unless the
+        // rollback is PROVEN to have happened, resending aims the next turn at a
+        // graph that is not the one they chose — the destructive retry this whole
+        // cluster is about. STOP and leave the edited text in the composer so the
+        // decision stays theirs.
+        //
+        // "none" is NOT an exemption. It means only that this message has no
+        // snapshot — the ring holds 25 and evicts, so rolling back an old message
+        // reports "canvas left as-is" while the canvas actually carries every later
+        // turn's edits. That is an unknown state being read as permission to
+        // resend, which is the same mistake one level up.
+        if (!revertDidRestore(outcome)) {
+          close();
+          if (edited) setComposerValue(edited);
+          appendSystem(
+            "Not resending — the canvas was not rolled back to the state you asked for. Your edited " +
+              "message is in the composer; send it once the canvas is what you want.",
+          );
+          return;
+        }
+      }
+      // The user hit Cancel (or the backdrop) while the rollback was still in
+      // flight. The canvas work already happened and was reported above — but
+      // rewinding the conversation and RESENDING their message afterwards is acting
+      // on their behalf after they backed out. Stop, and leave the edit with them.
+      if (cancelled) {
+        if (edited) setComposerValue(edited);
+        appendSystem(
+          "Cancelled — not rewinding the conversation or resending. Your edited message is in the composer.",
+        );
+        return;
       }
       if (wantConvo) {
         client.sendFrame?.({ type: "rewind", anchor });
@@ -22114,7 +22641,7 @@ function buildPanel() {
         appendUser(text);
         input.value = "";
         input.style.height = "auto";
-        c.run();
+        runSlashCommand(c);
         return;
       }
     }
@@ -22283,7 +22810,10 @@ function buildPanel() {
       if (now - lastEscAt < 600) {
         lastEscAt = 0;
         ev.preventDefault();
-        rewindLastTurn();
+        // Fire-and-forget from a sync key handler: rewindLastTurn resolves to an
+        // outcome rather than rejecting, but a stray throw must not surface as an
+        // unhandled rejection.
+        rewindLastTurn().catch(() => {});
         return;
       }
       lastEscAt = now;

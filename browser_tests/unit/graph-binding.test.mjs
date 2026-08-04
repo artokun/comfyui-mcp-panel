@@ -50,11 +50,20 @@ import {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
 
+/** Index of `function <name>(`, INCLUDING a preceding `async ` when present —
+ *  without it an extracted async function loses its keyword and its `await`
+ *  becomes a syntax error inside `new Function`. */
+function panelFunctionStart(src, name, from = 0) {
+  const bare = src.indexOf(`function ${name}(`, from);
+  assert.notEqual(bare, -1, `could not locate ${name} in panel source`);
+  const asyncAt = bare - "async ".length;
+  return asyncAt >= 0 && src.startsWith("async ", asyncAt) ? asyncAt : bare;
+}
+
 function panelFunctionSource(src, name, nextName) {
-  const start = src.indexOf(`function ${name}(`);
-  const end = src.indexOf(`function ${nextName}(`, start);
-  assert.notEqual(start, -1, `could not locate ${name} in panel source`);
-  assert.notEqual(end, -1, `could not locate ${nextName} after ${name}`);
+  const start = panelFunctionStart(src, name);
+  const end = panelFunctionStart(src, nextName, start + 1);
+  assert.ok(end > start, `could not locate ${nextName} after ${name}`);
   return src.slice(start, end);
 }
 
@@ -1759,27 +1768,51 @@ test("#545 P1: command identity resolution cannot adopt a stale dirty root befor
   );
 });
 
-test("#545 P1: direct snapshot restore refuses an untagged stale B for dirty A", () => {
+test("#545 P1: direct snapshot restore refuses an untagged stale B for dirty A", async () => {
   const { src, workflowA, rootB, objectUuids, assertBound } = buildDirtyStaleRouteHarness({ rootUuid: null });
   let loads = 0;
-  const restoreSource = panelFunctionSource(src, "restoreSnapshot", "revertGraphToLastSnapshot");
+  // restoreSnapshot PLUS the load-deadline machinery it closes over.
+  const restoreStart = src.indexOf("/** How long a snapshot restore's " + String.fromCharCode(96) + "loadGraphData" + String.fromCharCode(96));
+  assert.notEqual(restoreStart, -1, "could not locate the restore load budget");
+  const restoreSource = src.slice(restoreStart, panelFunctionStart(src, "revertGraphToLastSnapshot", restoreStart + 1));
   const restoreSnapshot = new Function(
     "getGraphCtx",
     "activeWorkflowRef",
     "assertGraphBoundToActiveWorkflow",
     "MUTATION_BINDING_BAR",
+    "coerceMessageText",
+    "activeWorkflowReloadGuard",
+    "acquireWorkflowReloadGuard",
+    "beginWorkflowReloadStep",
+    "endWorkflowReloadStep",
+    "releaseWorkflowReloadGuard",
     `${restoreSource}\nreturn restoreSnapshot;`,
   )(
     () => ({ app: { loadGraphData: () => { loads += 1; } }, graph: rootB, rootGraph: rootB }),
     () => workflowA,
     assertBound,
     MUTATION_BINDING_BAR,
+    (v) => String(v ?? ""),
+    () => null,
+    () => 1,
+    () => true,
+    () => {},
+    () => {},
   );
 
+  const outcome = await restoreSnapshot({ workflowRef: workflowA, data: { nodes: [] } });
   assert.equal(
-    restoreSnapshot({ workflowRef: workflowA, data: { nodes: [] } }),
-    null,
-    "the local restore path catches the binding refusal instead of loading B into A",
+    outcome.status,
+    "refused",
+    "the local restore path must REFUSE the binding rather than load B into A",
+  );
+  // …and it must PRESERVE the reason rather than collapse it to a bare null: the
+  // callers render an absent outcome as "nothing to revert", which would tell the
+  // user there was never a snapshot at the exact moment they are trying to recover.
+  assert.match(
+    outcome.reason,
+    /NOT applied/,
+    "the refusal must carry the panel's own reason for the caller to surface",
   );
   assert.ok(objectUuids.get(workflowA), "the direct guard must root-blindly establish A");
   assert.equal(rootB.extra?.comfyui_mcp?.workflow_uuid, undefined, "the untagged stale root remains untouched");
@@ -1936,7 +1969,7 @@ test("#349 direct paths: run, CivitAI load, and snapshot restore fence the live 
 
   orderedFence("async graph_run({ batch_count, to_node_id })", "app.queuePrompt");
   orderedFence("async graph_load({ graph: incoming } = {})", "captureGraphSnapshot(null, \"before graph_load\")");
-  orderedFence("function restoreSnapshot(snap)", "app.loadGraphData(JSON.parse(JSON.stringify(snap.data))");
+  orderedFence("function restoreSnapshot(snap)", "payload = JSON.parse(JSON.stringify(snap.data))");
 });
 
 test("#349 snapshots: capture is bound and restore rejects a snapshot from another workflow", () => {
@@ -1962,7 +1995,7 @@ test("#349 snapshots: capture is bound and restore rejects a snapshot from anoth
   );
 
   const restoreStart = src.indexOf("function restoreSnapshot(snap)");
-  const restoreLoad = src.indexOf("app.loadGraphData(JSON.parse(JSON.stringify(snap.data))", restoreStart);
+  const restoreLoad = src.indexOf("payload = JSON.parse(JSON.stringify(snap.data))", restoreStart);
   const restoreBody = src.slice(restoreStart, restoreLoad);
   assert.match(
     restoreBody,
