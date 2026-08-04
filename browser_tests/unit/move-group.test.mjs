@@ -43,6 +43,7 @@ const grab = (re, what) => {
 const resolveGroupSrc = grab(/\nfunction resolveGroup\(graph, groupId\) \{[\s\S]*?\n\}/, "resolveGroup");
 const setGroupBoundsSrc = grab(/\nfunction setGroupBounds\(group, \[x, y, w, h\]\) \{[\s\S]*?\n\}/, "setGroupBounds");
 const summarizeGroupSrc = grab(/\nfunction summarizeGroup\(graph, g\) \{[\s\S]*?\n\}/, "summarizeGroup");
+const preflightUndoSrc = grab(/\nfunction describePreflightUndo\(unrestored\) \{[\s\S]*?\n\}/, "describePreflightUndo");
 const moveGroupSrc = grab(/ {2}graph_move_group\(\{ group_id, pos, move_nodes \}\) \{[\s\S]*?\n {2}\},/, "graph_move_group");
 const moveGroupLabelSrc = grab(/ {4}case "graph_move_group": \{[\s\S]*?\n {4}\}/, 'the graph_move_group activity label');
 
@@ -72,6 +73,7 @@ function realMoveGroup(graph) {
      ${resolveGroupSrc}
      ${setGroupBoundsSrc}
      ${summarizeGroupSrc}
+     ${preflightUndoSrc}
      const executors = { ${moveGroupSrc} };
      return executors.graph_move_group;`,
   )(
@@ -997,6 +999,134 @@ test("#408: a node with NO cached rect and a hostile pos is caught by the readab
   assert.equal(graph.beforeCount, undefined);
 });
 
+// ---- the guards are themselves operations that can fail --------------------
+
+test("#408: a pre-flight refusal ROLLS BACK the rects it already reconciled", () => {
+  // The resync is a write. Node A's stale rect accepts the reconciliation, node
+  // B's rejects it — and the reply says NOTHING was moved. That claim is only
+  // true if A's cached geometry went back exactly as it was found.
+  const a = { id: 7, pos: [500, 500], size: [100, 100], boundingRect: [-9, -9, 1, 1] };
+  const b = { id: 8, pos: [10, 10], size: [100, 100], boundingRect: Object.freeze([-9, -9, 1, 1]) };
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [a, b], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /node 8.*group membership cannot be determined.*NOTHING was moved/s,
+  );
+  assert.deepEqual(
+    [...a.boundingRect],
+    [-9, -9, 1, 1],
+    "the rect the pre-flight had already rewritten must be back — 'NOTHING was moved' has to be true",
+  );
+  assert.deepEqual(a.pos, [500, 500]);
+  assert.deepEqual(g._bounding, [0, 0, 400, 400]);
+});
+
+test("#408: when a reconciled rect CANNOT be put back, the refusal says so instead of 'NOTHING'", () => {
+  // A rect that accepts the forward reconciliation and then refuses the restore.
+  // Claiming "NOTHING was moved" over it would be the fabrication this whole
+  // path exists to prevent.
+  const live = [-9, -9, 1, 1];
+  // The pre-flight reads this rect twice (capture, then sync) and the undo reads
+  // it a third time; from then on it is unwritable.
+  let reads = 0;
+  const oneWay = {
+    id: 7,
+    pos: [500, 500],
+    size: [100, 100],
+    get boundingRect() {
+      reads += 1;
+      return reads > 2 ? Object.freeze([...live]) : live;
+    },
+  };
+  const blocker = { id: 8, pos: [10, 10], size: [100, 100], boundingRect: Object.freeze([-9, -9, 1, 1]) };
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [oneWay, blocker], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /cached rect\(s\) could NOT be put back \(node 7\).*panel_query_graph/s,
+  );
+  assert.deepEqual(live, [500, 470, 100, 130], "it really is still holding the reconciled value");
+});
+
+test("#408: a summary that throws AFTER the move reports a COMPLETED move, not a failure", () => {
+  // Reporting happens after the last geometry write. Re-raising there would tell
+  // the caller a completed move failed — and an agent that retries would move the
+  // group twice.
+  const a = node(7, [50, 50], [60, 40]);
+  const g = group(1, [0, 0, 400, 400]);
+  let moved = false;
+  Object.defineProperty(g, "title", {
+    get() { if (moved) throw new TypeError("group detached during summary"); return "G1"; },
+    configurable: true,
+  });
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  let out;
+  assert.doesNotThrow(() => {
+    moved = true;
+    out = realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
+  });
+  assert.deepEqual(a.pos, [1050, 1050], "the move really did complete");
+  assert.equal(out.moved.nodes, 1, "and the reply still reports what it carried");
+  assert.match(out.summary_unavailable, /move COMPLETED.*do NOT re-issue the move/s);
+  assert.equal(out.group, undefined, "no fabricated summary stands in for the one that failed");
+});
+
+test("#408: a throwing afterChange cannot turn a completed move into a raw failure", () => {
+  const a = node(7, [50, 50], [60, 40]);
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+  graph.afterChange = () => { throw new TypeError("undo stack detached"); };
+  graph.setDirtyCanvas = () => { throw new TypeError("no canvas"); };
+
+  let out;
+  assert.doesNotThrow(() => { out = realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }); });
+  assert.deepEqual(a.pos, [1050, 1050]);
+  assert.equal(out.moved.nodes, 1);
+});
+
+test("#408: a nested group with a MALFORMED _bounding but valid pos/size still moves", () => {
+  // The validity rule has to reach the WRITE, not just the read. Picking
+  // `_bounding` because it merely has length 4, then writing only x/y into it,
+  // leaves it malformed — the read falls back to the untouched pos/size and a
+  // movable nested group is reported as refusing to move.
+  const inner = {
+    id: 2,
+    title: "Legacy inner",
+    _bounding: ["x", "y", "w", "h"],
+    pos: [50, 50],
+    size: [100, 100],
+  };
+  const outer = group(1, [0, 0, 400, 400], "Outer");
+  const a = node(7, [200, 200], [60, 40]);
+  const graph = makeGraph({ nodes: [a], groups: [outer, inner] });
+
+  const out = realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
+
+  assert.deepEqual(inner.pos, [1050, 1050], "written through the container the read comes back from");
+  assert.deepEqual(inner.size, [100, 100], "and the size is untouched");
+  assert.equal(out.moved.groups, 1);
+});
+
+test("#408: a reroute whose move() is a THROWING getter is refused, not raised", () => {
+  // The refuse-by-inspection path is only as safe as inspection being safe:
+  // `typeof r.move` RUNS the getter.
+  const hostile = { id: 11, pos: [100, 100], get move() { throw new TypeError("gone"); } };
+  const a = node(7, [50, 50], [60, 40]);
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [a], groups: [g], reroutes: [hostile] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /reroute 11.*does not let us determine without calling it/s,
+  );
+  assert.deepEqual(a.pos, [50, 50]);
+  assert.deepEqual([hostile.pos[0], hostile.pos[1]], [100, 100]);
+});
+
 // ---- lib branches the handler tests above do not reach ---------------------
 
 test("writePoint reports the truth for every point shape", () => {
@@ -1030,6 +1160,40 @@ test("writePoint reports the truth for every point shape", () => {
     set pos(v) { this._p = [Math.round(v[0] / 25) * 25, Math.round(v[1] / 25) * 25]; },
   };
   assert.equal(writePoint(snapping, "pos", 113, 113), false, "a snapped write is not the write we asked for");
+});
+
+test("writePoint never throws — not even for a container it cannot inspect or read", () => {
+  // hasSetter walks the prototype chain with getPrototypeOf/getOwnPropertyDescriptor,
+  // and BOTH throw on a revoked Proxy — as does reading the property itself. A
+  // write helper whose callers guard on its RETURN value must not raise instead.
+  const { proxy, revoke } = Proxy.revocable({ pos: [0, 0] }, {});
+  revoke();
+  let result;
+  assert.doesNotThrow(() => { result = writePoint(proxy, "pos", 10, 20); });
+  assert.equal(result, false, "and it reports the honest verdict: the write did not land");
+
+  const hostile = { get pos() { throw new TypeError("disposed"); } };
+  assert.doesNotThrow(() => { result = writePoint(hostile, "pos", 10, 20); });
+  assert.equal(result, false);
+});
+
+test("the caught-throw net must never claim 'NOTHING was moved'", () => {
+  // This path is unreachable while the movers are total (each contains per item
+  // and always returns its undo), so no fixture can drive it — but if it ever
+  // fires it CANNOT have undone the mover that raised, because that mover never
+  // handed back its undo. A net that asserts a restoration it could not have made
+  // is worse than no net, so the claim is pinned here at the source level.
+  const netBlock = panelSrc.match(
+    /catch \(error\) \{\s*const unrestored = \[[\s\S]*?raised "\$\{error\?\.message \?\? error\}" partway through the move[\s\S]*?\);\s*\}/,
+  );
+  assert.ok(netBlock, "could not locate the mutation-phase catch in panel source");
+  assert.doesNotMatch(
+    netBlock[0],
+    /NOTHING was moved/,
+    "the one path that cannot verify a rollback must not assert one",
+  );
+  assert.match(netBlock[0], /UNKNOWN/, "it must say the state is unknown");
+  assert.match(netBlock[0], /PARTIALLY moved/, "and that the graph may be partially moved");
 });
 
 test("samePoint is exact unless the destination really is a Float32Array", () => {

@@ -5746,7 +5746,11 @@ function nextGroupId(graph) {
   return (ids.length ? Math.max(...ids) : 0) + 1;
 }
 
-/** Set a group's box, preferring its _bounding array (most portable). */
+/** Set a group's box, preferring its _bounding array (most portable). Writing
+ *  ALL FOUR components is what makes `length >= 4` a safe test here even for a
+ *  malformed quad — nothing is left half-written, so the quad is repaired rather
+ *  than diverging from the pos/size the read would otherwise fall back to. A
+ *  PARTIAL writer must instead follow groupBoundsTarget (see placeGroupBox). */
 function setGroupBounds(group, [x, y, w, h]) {
   if (group._bounding && group._bounding.length >= 4) {
     group._bounding[0] = x;
@@ -5757,6 +5761,18 @@ function setGroupBounds(group, [x, y, w, h]) {
     group.pos = [x, y];
     group.size = [w, h];
   }
+}
+
+/** Phrase the outcome of undoing the move pre-flight's rect reconciliation. The
+ *  pre-flight WRITES, so a refusal after it may only claim "NOTHING was moved"
+ *  once those writes are provably back. */
+function describePreflightUndo(unrestored) {
+  if (!unrestored.length) return "NOTHING was moved.";
+  return (
+    `No node was repositioned, but ${unrestored.length} cached rect(s) could NOT be put back ` +
+    `(${unrestored.slice(0, 5).map((n) => `node ${n.id}`).join(", ")}${unrestored.length > 5 ? ", …" : ""}) — ` +
+    "re-read the graph with panel_query_graph before relying on group membership."
+  );
 }
 
 /** Compact JSON-friendly view of a group box. */
@@ -10112,10 +10128,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // here for BOTH branches, and a rect that will not accept the resync is a
     // refusal now rather than an exception later. Membership is rect-first, so a
     // node whose rect cannot be made live cannot be classified honestly at all.
-    const unsynced = syncGraphNodeAreas(graph);
-    if (unsynced.length) {
+    // …and the resync is TRANSACTIONAL, because it is a write. Reconciling node A's
+    // rect and then finding node B's rect unwritable used to leave A's cached
+    // geometry changed with no undo, under a reply that said NOTHING was moved.
+    const resync = syncGraphNodeAreas(graph);
+    if (resync.unsynced.length) {
+      const names = resync.unsynced.slice(0, 5).map((n) => `node ${n.id}`).join(", ");
       throw new Error(
-        `refusing to move group ${group_id}: ${unsynced.length} node(s) have a cached bounding rect that cannot be updated (${unsynced.slice(0, 5).map((n) => `node ${n.id}`).join(", ")}${unsynced.length > 5 ? ", …" : ""}), so their group membership cannot be determined. NOTHING was moved. Reload the ComfyUI tab (panel_reload) and retry.`,
+        `refusing to move group ${group_id}: ${resync.unsynced.length} node(s) have a cached bounding rect that cannot be updated (${names}${resync.unsynced.length > 5 ? ", …" : ""}), so their group membership cannot be determined. ${describePreflightUndo(resync.undo())} Reload the ComfyUI tab (panel_reload) and retry.`,
       );
     }
     // What the box encloses is captured against the PRE-move bounds — pure reads,
@@ -10136,15 +10156,14 @@ const GRAPH_TOOL_EXECUTORS = {
         reroutes = reroutesInside(graph, b);
       }
     } catch (error) {
-      // These are reads, and the only writes before them are the pre-flight's
-      // idempotent rect reconciliation — so no position has changed and nothing
-      // needs rolling back. Still, a throw here would reach the caller as a bare
-      // TypeError from a tool that promises a stated outcome, so it is turned into
-      // one. (Reachable only by an accessor that misbehaves inconsistently between
-      // the resync and this pass; the individual readers already return "unknown"
-      // rather than raising.)
+      // These are reads, but the resync BEFORE them was a write, so a refusal here
+      // has to take that back before it can claim nothing happened. A throw would
+      // otherwise reach the caller as a bare TypeError from a tool that promises a
+      // stated outcome. (Reachable only by an accessor that misbehaves
+      // inconsistently between the resync and this pass; the individual readers
+      // already return "unknown" rather than raising.)
       throw new Error(
-        `refusing to move group ${group_id}: the frontend raised "${error?.message ?? error}" while reading what the group encloses, so its contents cannot be determined. NOTHING was moved. Reload the ComfyUI tab (panel_reload) and retry.`,
+        `refusing to move group ${group_id}: the frontend raised "${error?.message ?? error}" while reading what the group encloses, so its contents cannot be determined. ${describePreflightUndo(resync.undo())} Reload the ComfyUI tab (panel_reload) and retry.`,
       );
     }
     // A reroute we cannot reposition SOUNDLY is decided here, by INSPECTION, and
@@ -10153,7 +10172,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const unsound = reroutes.filter((r) => !rerouteWriteIsSound(r));
     if (unsound.length) {
       throw new Error(
-        `refusing to move group ${group_id}: ${unsound.length} enclosed reroute point(s) (${unsound.slice(0, 5).map((r) => `reroute ${r.id ?? "?"}`).join(", ")}${unsound.length > 5 ? ", …" : ""}) expose a move() whose meaning this frontend does not let us determine without calling it, and calling it could persist the wrong coordinate. NOTHING was moved. Pass move_nodes:false to move only the box, or move the reroutes by hand.`,
+        `refusing to move group ${group_id}: ${unsound.length} enclosed reroute point(s) (${unsound.slice(0, 5).map((r) => `reroute ${r.id ?? "?"}`).join(", ")}${unsound.length > 5 ? ", …" : ""}) expose a move() whose meaning this frontend does not let us determine without calling it, and calling it could persist the wrong coordinate. ${describePreflightUndo(resync.undo())} Pass move_nodes:false to move only the box, or move the reroutes by hand.`,
       );
     }
     graph.beforeChange();
@@ -10173,10 +10192,15 @@ const GRAPH_TOOL_EXECUTORS = {
         let memberMove = { moved: [], stuck: [], undo: () => [] };
         let rerouteMove = { moved: [], stuck: [], undo: () => [] };
         let nestedMove = { moved: [], stuck: [], undo: () => [] };
-        // Belt and braces on the invariant: the movers are written not to throw,
-        // but if any of them ever does, the graph is already partly written and
-        // the error must not escape the rollback. Undo whatever was recorded, then
-        // re-raise with that fact attached.
+        // Belt and braces on the invariant: the movers are written not to throw
+        // (each contains per item and always RETURNS its undo). If one ever does
+        // throw, this catch can only undo the movers that already ASSIGNED — the
+        // one that raised never handed back its undo, so whatever it had already
+        // written is unreachable from here.
+        //
+        // Which is exactly why this path must NOT claim "NOTHING was moved". A net
+        // that lies when it catches is worse than no net: the honest report is that
+        // restoration is UNKNOWN and the graph may be partially moved.
         try {
           memberMove = moveGroupMembers(members, dx, dy);
           rerouteMove = moveReroutePoints(reroutes, dx, dy);
@@ -10190,9 +10214,12 @@ const GRAPH_TOOL_EXECUTORS = {
           ];
           throw new Error(
             `refusing to move group ${group_id}: the frontend raised "${error?.message ?? error}" partway through the move. ` +
+              "The movers that had already completed were rolled back, but the one that raised never returned its undo, " +
+              "so ITS OWN writes cannot be reversed from here: the state of this group is UNKNOWN and it may be PARTIALLY moved. " +
               (unrestored.length
-                ? `The graph is PARTIALLY moved — ${unrestored.length} item(s) could NOT be put back. Press Ctrl+Z on the canvas.`
-                : "Everything was put back; NOTHING was moved."),
+                ? `${unrestored.length} further item(s) are known to still be displaced. `
+                : "") +
+              "Press Ctrl+Z on the canvas and re-read the group with panel_query_graph.",
           );
         }
         // Undo ABSOLUTELY, over every ATTEMPTED child — not by the inverse delta
@@ -10265,13 +10292,36 @@ const GRAPH_TOOL_EXECUTORS = {
         // the pre-flight. The box is not the membership (#408).
       }
     } finally {
-      graph.afterChange();
+      // Closing the undo envelope must not be able to convert a completed move
+      // into a raw failure — a `finally` that throws REPLACES the outcome, success
+      // or refusal alike.
+      try {
+        graph.afterChange();
+      } catch {
+        /* the geometry is already written; the envelope is bookkeeping */
+      }
     }
-    graph.setDirtyCanvas(true, true);
-    return {
-      group: summarizeGroup(graph, g),
-      moved: { nodes: movedNodes, groups: movedGroups, reroutes: movedReroutes },
-    };
+    // ---- REPORTING (after the last write — it may not throw either) ----------
+    // The invariant is "after the first write, only complete or roll back", and
+    // reporting is after the first write. If summarizeGroup raises, the move HAS
+    // happened: rolling back is wrong and re-raising is worse, because the caller
+    // would read a completed move as a failed one and retry it. Say what was done
+    // and that the summary is unavailable.
+    try {
+      graph.setDirtyCanvas(true, true);
+    } catch {
+      /* a repaint failure does not un-move anything */
+    }
+    const moved = { nodes: movedNodes, groups: movedGroups, reroutes: movedReroutes };
+    try {
+      return { group: summarizeGroup(graph, g), moved };
+    } catch (error) {
+      return {
+        group_id,
+        moved,
+        summary_unavailable: `the move COMPLETED, but the group could not be summarized afterwards: ${error?.message ?? error}. Re-read it with panel_query_graph — do NOT re-issue the move.`,
+      };
+    }
   },
 
   // Edit a group's title / color / font_size / bounds — only the fields passed.

@@ -22,6 +22,7 @@ import {
   syncNodeArea,
   syncGraphNodeAreas,
   moveGroupMembers,
+  nodeAreaIsLive,
 } from "../../web/js/lib/group-geometry.js";
 
 // Minimal fixtures. No boundingRect => nodeFocusBounds falls back to pos/size
@@ -303,6 +304,39 @@ test("a collapsed node inside a group box is a MEMBER, not silently left behind 
   );
 });
 
+test("syncNodeArea rejects a non-finite or negative collapsed width (#416 area guarantee)", () => {
+  // `Number(x) || 80` accepts Infinity and -1: both are truthy. An infinite pill
+  // overstates the area without limit and makes the node a geometric member of
+  // every group — the exact guarantee the pill was chosen to preserve.
+  for (const bad of [Infinity, -Infinity, Number.NaN, -1, "wide", null, undefined, {}]) {
+    const n = {
+      id: 5,
+      pos: [10, 40],
+      size: [300, 200],
+      flags: { collapsed: true },
+      _collapsed_width: bad,
+      boundingRect: [0, 0, 1, 1],
+    };
+    syncNodeArea(n);
+    assert.deepEqual([...n.boundingRect], [10, 10, 80, 30], `_collapsed_width=${String(bad)} falls back to the pill`);
+  }
+});
+
+test("syncNodeArea rejects a non-finite node SIZE too", () => {
+  const n = { id: 5, pos: [10, 40], size: [Infinity, Number.NaN], boundingRect: [0, 0, 1, 1] };
+  syncNodeArea(n);
+  assert.deepEqual([...n.boundingRect], [10, 10, 200, 130], "an unusable extent falls back to the default");
+});
+
+test("syncNodeArea/nodeAreaIsLive refuse a node whose POSITION is not a finite point", () => {
+  // Substituting [0, 0] would put a node with no knowable position into whatever
+  // group happens to sit at the origin.
+  const n = { id: 5, pos: [Number.NaN, 10], size: [100, 100], boundingRect: [0, 0, 1, 1] };
+  assert.equal(syncNodeArea(n), false);
+  assert.deepEqual([...n.boundingRect], [0, 0, 1, 1], "and it is left alone rather than given a made-up rect");
+  assert.equal(nodeAreaIsLive(n), false);
+});
+
 test("syncNodeArea honours a node's own collapsed width when the build records one", () => {
   const collapsed = {
     id: 5,
@@ -324,7 +358,42 @@ test("syncNodeArea REPORTS an unwritable rect instead of throwing", () => {
   assert.doesNotThrow(() => { result = syncNodeArea(frozen); });
   assert.equal(result, false, "and it says so");
   const graph = { _nodes: [frozen, { id: 6, pos: [0, 0], size: [10, 10], boundingRect: [0, 0, 1, 1] }] };
-  assert.deepEqual(syncGraphNodeAreas(graph).map((n) => n.id), [5], "reported up to the caller as a pre-flight");
+  assert.deepEqual(
+    syncGraphNodeAreas(graph).unsynced.map((n) => n.id),
+    [5],
+    "reported up to the caller as a pre-flight",
+  );
+});
+
+test("syncGraphNodeAreas is TRANSACTIONAL: its undo puts every rect it touched back", () => {
+  // The resync is a WRITE. Reconciling node A and then finding node B unwritable
+  // must not leave A's cached geometry changed with no way back, under a caller
+  // that goes on to report that nothing happened.
+  const a = { id: 1, pos: [500, 500], size: [100, 100], boundingRect: [-9, -9, 1, 1] }; // stale, writable
+  const b = { id: 2, pos: [10, 10], size: [100, 100], boundingRect: Object.freeze([-9, -9, 1, 1]) };
+  const graph = { _nodes: [a, b] };
+
+  const res = syncGraphNodeAreas(graph);
+  assert.deepEqual(res.unsynced.map((n) => n.id), [2]);
+  assert.deepEqual([...a.boundingRect], [500, 470, 100, 130], "A really was rewritten");
+
+  assert.deepEqual(res.undo(), [], "and the undo reports nothing left displaced");
+  assert.deepEqual([...a.boundingRect], [-9, -9, 1, 1], "A's cached rect is exactly as it was found");
+});
+
+test("syncGraphNodeAreas.undo reports a rect it could not put back", () => {
+  let frozen = false;
+  const rect = [0, 0, 1, 1];
+  const n = {
+    id: 1,
+    pos: [500, 500],
+    size: [100, 100],
+    get boundingRect() { return frozen ? Object.freeze([...rect]) : rect; },
+  };
+  const res = syncGraphNodeAreas({ _nodes: [n] });
+  assert.deepEqual(res.unsynced, []);
+  frozen = true; // becomes unwritable between the sync and the undo
+  assert.deepEqual(res.undo().map((x) => x.id), [1], "an unrestorable rect is named, not assumed");
 });
 
 test("syncNodeArea(node, true) FORCE-syncs a REQUESTED collapsed node into its own box (#391)", () => {

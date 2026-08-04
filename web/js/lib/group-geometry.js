@@ -121,13 +121,33 @@ function finiteQuad(v) {
  */
 export function groupBoundsOf(g) {
   try {
-    return (
-      finiteQuad(g?._bounding) ??
-      finiteQuad([g?.pos?.[0], g?.pos?.[1], g?.size?.[0], g?.size?.[1]])
-    );
+    return groupBoundsTarget(g)?.bounds ?? null;
   } catch {
     return null; // a hostile/disposed accessor is "no usable bounds", not a throw
   }
+}
+
+/**
+ * WHICH container currently holds this group's box, and what it says — the ONE
+ * rule every reader and every partial writer must share.
+ *
+ * Chosen by VALIDITY, never by mere presence. A malformed `_bounding` (a
+ * half-initialised quad, a leftover from a failed deserialize) must not capture
+ * the write while the read falls through to pos/size: a translate that writes
+ * only x/y into the malformed quad leaves it malformed, the read still returns
+ * the unchanged pos/size, verification fails, and a perfectly movable group is
+ * refused. Reading and writing have to agree on the container, so they ask the
+ * same question here.
+ *
+ * Returns `{ kind: "bounding" | "possize", bounds: [x, y, w, h] }`, or null when
+ * neither form is usable.
+ */
+export function groupBoundsTarget(g) {
+  const fromQuad = finiteQuad(g?._bounding);
+  if (fromQuad) return { kind: "bounding", bounds: fromQuad };
+  const fromPosSize = finiteQuad([g?.pos?.[0], g?.pos?.[1], g?.size?.[0], g?.size?.[1]]);
+  if (fromPosSize) return { kind: "possize", bounds: fromPosSize };
+  return null;
 }
 
 /**
@@ -197,19 +217,37 @@ export function groupMemberNodes(graph, g) {
 export const COLLAPSED_TITLE_HEIGHT = 30;
 export const COLLAPSED_PILL_WIDTH = 80; // LiteGraph.NODE_COLLAPSED_WIDTH
 
-/** The rect a node's cached boundingRect SHOULD hold for its live pos/size. */
+/** A finite, POSITIVE extent, or the given default. `Number(x) || d` is not
+ *  enough: Infinity and -1 are both truthy, and an infinite (or negative) extent
+ *  written into a cached rect makes the node a geometric member of every group —
+ *  or of none — which is precisely the area overstatement the pill exists to
+ *  avoid (#416). Zero is rejected for the same reason from the other side: a
+ *  degenerate rect has no centre worth testing. `Number(null)` is 0, so a missing
+ *  value lands here rather than sneaking through as a valid extent. */
+function finiteExtent(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * The rect a node's cached boundingRect SHOULD hold for its live pos/size, or
+ * NULL when the node's position is not a finite point.
+ *
+ * Null rather than a substituted origin: a node whose position cannot be read as
+ * a number has no knowable footprint, and writing a made-up [0, 0] would place it
+ * in whatever group happens to sit at the origin. Callers turn null into "cannot
+ * be determined", which is the honest answer.
+ */
 function wantedNodeArea(node, forceCollapsed = false) {
+  const x = Number(node?.pos?.[0]);
+  const y = Number(node?.pos?.[1]);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
   const collapsed = !!node.flags?.collapsed && !forceCollapsed;
   const w = collapsed
-    ? Number(node._collapsed_width) || COLLAPSED_PILL_WIDTH
-    : node.size?.[0] ?? 200;
-  const h = collapsed ? 0 : node.size?.[1] ?? 100;
-  return [
-    node.pos?.[0] ?? 0,
-    (node.pos?.[1] ?? 0) - COLLAPSED_TITLE_HEIGHT, // title bar renders above pos
-    w,
-    h + COLLAPSED_TITLE_HEIGHT,
-  ];
+    ? finiteExtent(node._collapsed_width, COLLAPSED_PILL_WIDTH)
+    : finiteExtent(node.size?.[0], 200);
+  const h = collapsed ? 0 : finiteExtent(node.size?.[1], 100);
+  return [x, y - COLLAPSED_TITLE_HEIGHT, w, h + COLLAPSED_TITLE_HEIGHT]; // title above pos
 }
 
 /**
@@ -222,9 +260,11 @@ function wantedNodeArea(node, forceCollapsed = false) {
  */
 export function nodeAreaIsLive(node) {
   try {
+    const want = wantedNodeArea(node);
+    if (!want) return false; // no knowable footprint ⇒ cannot be shown to be live
     const br = node?.boundingRect;
     if (!br || br.length !== 4) return true;
-    return wantedNodeArea(node).every((v, i) => br[i] === v);
+    return want.every((v, i) => br[i] === v);
   } catch {
     return false; // an unreadable node cannot be shown to be live
   }
@@ -238,6 +278,7 @@ export function syncNodeArea(node, forceCollapsed = false) {
     // before groupMemberNodes touches it and raises a bare TypeError at a caller
     // who asked to move a group.
     const want = wantedNodeArea(node, forceCollapsed);
+    if (!want) return false; // no knowable footprint ⇒ cannot be made live
     const br = node?.boundingRect;
     if (!br || br.length !== 4) return true;
     try {
@@ -270,14 +311,55 @@ export function syncNodeArea(node, forceCollapsed = false) {
  * makes the membership reflect the CURRENT layout. Collapsed nodes are synced to
  * their collapsed pill rather than skipped (see syncNodeArea). Dependency-free.
  *
- * NEVER THROWS, and returns the nodes whose cached rect would not accept the
- * resync. Callers doing this as a PRE-FLIGHT before mutating can then refuse up
- * front instead of discovering an unwritable rect halfway through a transaction.
+ * NEVER THROWS. Returns `{ unsynced, undo }`: the nodes whose cached rect would
+ * not accept the resync, and an undo that puts every rect this touched back
+ * exactly as it found it (returning the ones it could not restore).
+ *
+ * The undo is not optional. Writing rects IS a mutation, and a caller that runs
+ * this as a pre-flight and then refuses because one node failed would otherwise
+ * have already changed every earlier node's cached geometry — with no way to take
+ * it back — while telling the user NOTHING was moved. Moving a mutation earlier
+ * does not stop it being a mutation: the pre-flight needs the same
+ * contain-per-item-and-return-undo contract as the movers it precedes.
  */
 export function syncGraphNodeAreas(graph) {
   const unsynced = [];
-  for (const n of graph?._nodes ?? []) if (!syncNodeArea(n)) unsynced.push(n);
-  return unsynced;
+  const attempted = [];
+  for (const n of graph?._nodes ?? []) {
+    let before = null;
+    try {
+      const br = n?.boundingRect;
+      if (br && br.length === 4) before = [br[0], br[1], br[2], br[3]];
+    } catch {
+      /* unreadable rect: syncNodeArea reports it below; nothing to capture */
+    }
+    if (before) attempted.push([n, before]);
+    if (!syncNodeArea(n)) unsynced.push(n);
+  }
+  return {
+    unsynced,
+    undo: () => {
+      const failed = [];
+      for (const [n, before] of attempted) {
+        try {
+          const br = n?.boundingRect;
+          if (!br || br.length !== 4) continue;
+          try {
+            br[0] = before[0];
+            br[1] = before[1];
+            br[2] = before[2];
+            br[3] = before[3];
+          } catch {
+            /* frozen — reported below */
+          }
+          if (!before.every((v, i) => br[i] === v)) failed.push(n);
+        } catch {
+          failed.push(n);
+        }
+      }
+      return failed;
+    },
+  };
 }
 
 /**
@@ -469,13 +551,19 @@ export function groupBoxIsAt(g, x, y, w, h) {
  * write; a getter with no setter throws on assignment in a strict-mode module).
  *
  * Returning the verdict is the point — the caller must never report a move it did
- * not make.
+ * not make. NEVER THROWS: even READING `owner[key]` can raise (a revoked Proxy,
+ * a disposed accessor), and a write helper that raises would defeat every caller
+ * that guards on its return value.
  */
 export function writePoint(owner, key, x, y) {
   const landed = () => {
-    const point = owner?.[key];
-    const f32 = isFloat32(point);
-    return samePoint(Number(point?.[0]), x, f32) && samePoint(Number(point?.[1]), y, f32);
+    try {
+      const point = owner?.[key];
+      const f32 = isFloat32(point);
+      return samePoint(Number(point?.[0]), x, f32) && samePoint(Number(point?.[1]), y, f32);
+    } catch {
+      return false; // unreadable ⇒ cannot be shown to have landed
+    }
   };
   const assign = () => {
     try {
@@ -485,13 +573,13 @@ export function writePoint(owner, key, x, y) {
     }
   };
   const inPlace = () => {
-    const point = owner?.[key];
-    if (!point || point.length < 2) return;
     try {
+      const point = owner?.[key];
+      if (!point || point.length < 2) return;
       point[0] = x;
       point[1] = y;
     } catch {
-      /* frozen/read-only point */
+      /* frozen/read-only point, or an unreadable container */
     }
   };
   const [first, second] = hasSetter(owner, key) ? [assign, inPlace] : [inPlace, assign];
@@ -503,11 +591,21 @@ export function writePoint(owner, key, x, y) {
 
 /** Does writing `owner[key]` run a SETTER (rather than replacing a data
  *  property)? Walks the prototype chain, because LiteGraph defines its geometry
- *  accessors on the class prototype, not on each instance. */
+ *  accessors on the class prototype, not on each instance.
+ *
+ *  Inspection is itself an operation that can fail: getPrototypeOf and
+ *  getOwnPropertyDescriptor both THROW on a revoked Proxy. Falling back to
+ *  "no setter" only picks the write ORDER, and writePoint tries the other way
+ *  round anyway and verifies — so a failed inspection costs nothing and must not
+ *  be allowed to raise out of a decision function. */
 function hasSetter(owner, key) {
-  for (let o = owner; o != null; o = Object.getPrototypeOf(o)) {
-    const d = Object.getOwnPropertyDescriptor(o, key);
-    if (d) return typeof d.set === "function";
+  try {
+    for (let o = owner; o != null; o = Object.getPrototypeOf(o)) {
+      const d = Object.getOwnPropertyDescriptor(o, key);
+      if (d) return typeof d.set === "function";
+    }
+  } catch {
+    /* uninspectable ⇒ treat as a data property; writePoint still tries both */
   }
   return false;
 }
@@ -585,12 +683,21 @@ export function placeGroupBox(g, x, y) {
 }
 
 function placeGroupBoxUnsafe(g, x, y) {
-  // A move must not change the SIZE. Capture it first and verify it survived, so
-  // a build that resizes on reposition is reported as not-moved instead of
+  // Write into the container the READ will come back from. Picking `_bounding`
+  // merely because it has length 4 is how a malformed quad captured the write
+  // while groupBoundsOf fell through to pos/size: this writes only x/y, so the
+  // quad stays malformed, the read still returns the unchanged pos/size, and a
+  // perfectly movable group is reported as refusing to move. groupBoundsTarget is
+  // the one rule both sides ask.
+  //
+  // A move must not change the SIZE either — captured first and verified, so a
+  // build that resizes on reposition is reported as not-moved rather than
   // silently reshaping the user's group.
-  const before = groupBoundsOf(g);
-  const b = g?._bounding;
-  if (b && b.length >= 4) {
+  const target = groupBoundsTarget(g);
+  if (!target) return false;
+  const before = target.bounds;
+  if (target.kind === "bounding") {
+    const b = g._bounding;
     try {
       b[0] = x;
       b[1] = y;
@@ -600,7 +707,7 @@ function placeGroupBoxUnsafe(g, x, y) {
   } else {
     writePoint(g, "pos", x, y);
   }
-  return groupBoxIsAt(g, x, y, before?.[2], before?.[3]);
+  return groupBoxIsAt(g, x, y, before[2], before[3]);
 }
 
 export function translateGroupBox(g, dx, dy) {
@@ -619,6 +726,10 @@ export function translateGroupBox(g, dx, dy) {
 function restoreGroupBox(g, quad) {
   const [x, y, w, h] = quad;
   try {
+    // Unlike a translate, a restore writes all four components — so it can also
+    // REPAIR a quad the forward pass left malformed. Write the quad when the
+    // build has one at all (length 4 is enough here precisely because nothing is
+    // left half-written), else the pos/size pair.
     const b = g?._bounding;
     if (b && b.length >= 4) {
       try {
@@ -740,8 +851,15 @@ export function reroutesInside(graph, bounds) {
  * than moved on a coin-flip whose failure mode only shows up at save time.
  */
 export function rerouteWriteIsSound(r) {
-  if (hasSetter(r, "pos")) return true;
-  return typeof r?.move !== "function";
+  try {
+    if (hasSetter(r, "pos")) return true;
+    // `typeof r.move` RUNS a getter, and a getter that throws would raise out of
+    // the very inspection whose whole job is to decide without side effects. A
+    // reroute we cannot even inspect is exactly the "unknown" this refuses on.
+    return typeof r?.move !== "function";
+  } catch {
+    return false;
+  }
 }
 
 /**
