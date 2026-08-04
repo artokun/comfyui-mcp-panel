@@ -84,15 +84,92 @@ test("#417: _request throws a timeout error when the proxy never settles", async
   }
 });
 
-test("#417: a non-abort fetch rejection still propagates unchanged", async () => {
+// ---- #599: browser→proxy transport failures ("Failed to fetch", no status) --
+// A bare TypeError from fetch means no HTTP response came back from the
+// ComfyUI-side proxy — CivitAI is not the cause. The proxy call is always a
+// POST, which
+// Chrome won't self-retry on a stale keep-alive connection, so the client does
+// ONE retry for idempotent (GET) specs, then throws a CLASSIFIED transport
+// error (kind:"transport", status:null) naming the real failed hop — never the
+// browser's bare "Failed to fetch" alone.
+
+test("#599: a transient transport failure on an idempotent request is retried once", async () => {
+  let calls = 0;
   const client = new CivitaiClient({
     fetchApi: async () => {
+      calls++;
+      if (calls === 1) throw new TypeError("Failed to fetch");
+      return { ok: true, status: 200, json: async () => ({ items: [1, 2, 3] }) };
+    },
+    apiURL: (p) => p,
+  });
+  const out = await client._request({ url: "https://civitai.red/api/v1/models" });
+  assert.deepEqual(out, { items: [1, 2, 3] });
+  assert.equal(calls, 2); // first attempt failed at transport, retry succeeded
+});
+
+test("#599: a persistent transport failure throws a classified transport error", async () => {
+  let calls = 0;
+  const client = new CivitaiClient({
+    fetchApi: async () => {
+      calls++;
       throw new TypeError("Failed to fetch");
     },
     apiURL: (p) => p,
   });
   await assert.rejects(
-    () => client._request({ url: "https://civitai.com/api/v1/models" }),
-    /Failed to fetch/,
+    () => client._request({ url: "https://civitai.red/api/v1/models" }),
+    (err) => {
+      assert.equal(err.kind, "transport");
+      assert.equal(err.status, null); // no HTTP response ever existed
+      // The reason, not just the state: the failed hop is browser→ComfyUI
+      // proxy, and the original browser text is preserved for diagnosis.
+      assert.match(err.message, /browser→ComfyUI hop/);
+      assert.match(err.message, /Failed to fetch/);
+      assert.match(err.message, /not an empty result/);
+      return true;
+    },
   );
+  assert.equal(calls, 2); // one bounded retry, then give up
+});
+
+test("#599: a transport failure on a non-idempotent (POST) request is NOT retried", async () => {
+  // reaction.toggle / collection writes must never be double-fired: a retry
+  // could silently apply the mutation twice.
+  let calls = 0;
+  const client = new CivitaiClient({
+    fetchApi: async () => {
+      calls++;
+      throw new TypeError("Failed to fetch");
+    },
+    apiURL: (p) => p,
+  });
+  await assert.rejects(
+    () =>
+      client._request({
+        url: "https://civitai.red/api/trpc/reaction.toggle",
+        method: "POST",
+        body: { json: { entityType: "image", entityId: 1, reaction: "Like" } },
+      }),
+    (err) => err.kind === "transport",
+  );
+  assert.equal(calls, 1);
+});
+
+test("#599: every read path routes through the same-origin proxy (no direct cross-origin fetch)", async () => {
+  // The browser must never call a CivitAI host directly (CORS + bot-gate
+  // headers) — every network call goes through /comfyui_mcp_panel/civitai/*.
+  const seen = [];
+  const client = new CivitaiClient({
+    fetchApi: async (path) => {
+      seen.push(path);
+      return { ok: true, status: 200, json: async () => ({ items: [] }) };
+    },
+    apiURL: (p) => p,
+  });
+  await client.fetchModels({ type: "Checkpoint", query: "wan" });
+  await client.fetchFeed({});
+  await client.searchMedia("wan");
+  assert.ok(seen.length >= 3);
+  for (const p of seen) assert.equal(p, "/comfyui_mcp_panel/civitai/api");
 });
