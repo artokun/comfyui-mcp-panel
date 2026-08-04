@@ -384,18 +384,14 @@ export function resolveScope(app) {
     return { graph: canvasGraph, rootGraph, scope: "subgraph", owner: null, stale: false, diverged: false };
   }
   // Unreachable from the live root. Repaint ONLY what is provably content-free.
+  // `divergedKind` rides BOTH branches: the caller's repaint can fail (setGraph is
+  // optional and can throw), and an unconfirmed repaint leaves the same divergence,
+  // so it needs the same remedy wording even on the reconcilable branch.
+  const divergedKind = graphIsSubgraphLike(canvasGraph) ? "subgraph" : "root";
   if (graphProvenContentFree(canvasGraph)) {
-    return { graph: rootGraph, rootGraph, scope: "root", owner: null, stale: true, diverged: false };
+    return { graph: rootGraph, rootGraph, scope: "root", owner: null, stale: true, diverged: false, divergedKind };
   }
-  return {
-    graph: canvasGraph,
-    rootGraph,
-    scope: "root",
-    owner: null,
-    stale: false,
-    diverged: true,
-    divergedKind: graphIsSubgraphLike(canvasGraph) ? "subgraph" : "root",
-  };
+  return { graph: canvasGraph, rootGraph, scope: "root", owner: null, stale: false, diverged: true, divergedKind };
 }
 
 /** Compact JSON scope descriptor for tool responses (the `viewing` field). Derived

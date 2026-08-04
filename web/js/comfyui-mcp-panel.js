@@ -4268,8 +4268,8 @@ function getGraphCtx() {
   // root graph is what the workflow service and every save path use, and nothing
   // here can prove which one this command names. So REFUSE, before any work and
   // before touching the view. A destroyed graph cannot be retried; a refusal can.
-  if (scope.diverged) {
-    const canvasNodes = scope.graph?._nodes?.length ?? "unknown";
+  const refuseDivergence = (canvasGraph, detail = "") => {
+    const canvasNodes = canvasGraph?._nodes?.length ?? "unknown";
     const rootNodes = scope.rootGraph?._nodes?.length ?? "unknown";
     // The remedy differs by WHERE the canvas is stranded, and only the remedy does.
     // A canvas left inside a subgraph the rebuilt root no longer owns is escaped by
@@ -4283,13 +4283,14 @@ function getGraphCtx() {
         : `This usually follows a ComfyUI backend restart without a page reload. Save or export ` +
           `the canvas you want to keep, then reload the ComfyUI page (a panel-only reload does ` +
           `not rebuild this binding).`;
-    throw new Error(
+    return new Error(
       `[canvas-root-divergence] The canvas you are looking at (${canvasNodes} node(s)) and the ` +
         `panel's bound root graph (${rootNodes} node(s)) are two DIFFERENT graphs, so this command ` +
         `was NOT applied — the panel cannot tell which one it was meant for, and picking either ` +
-        `could edit a graph you are not looking at. ${remedy}`,
+        `could edit a graph you are not looking at.${detail} ${remedy}`,
     );
-  }
+  };
+  if (scope.diverged) throw refuseDivergence(scope.graph);
   // The canvas graph is unreachable from the live root but PROVABLY content-free, so
   // rebind the CANVAS to root: the physical view then matches the graph reads/edits
   // target, keeping read + edit in lockstep (#220/#308). This is the ONLY case the
@@ -4297,12 +4298,27 @@ function getGraphCtx() {
   // `_nodes` plus a serialize() with every non-identity surface empty — establishes
   // that there is nothing in it to lose. It also keeps the binding guard's later
   // "was NOT applied" claim honest: nothing of the workflow changed here either.
-  if (scope.stale && typeof app.canvas?.setGraph === "function") {
+  //
+  // The repaint must be VERIFIED, not attempted (codex r2 P0). setGraph is optional
+  // on older frontends and can throw during a reconnect; swallowing that and
+  // returning the root anyway resolved commands onto a graph the user is provably
+  // NOT looking at — the same wrong-canvas outcome by a different route, and it
+  // would have made "the physical view matches" a claim about a best-effort call.
+  // An unconfirmed rebind leaves the divergence in place, so it is refused like one.
+  if (scope.stale) {
     try {
-      app.canvas.setGraph(scope.rootGraph);
-      app.canvas.setDirty?.(true, true);
+      if (typeof app.canvas?.setGraph === "function") {
+        app.canvas.setGraph(scope.rootGraph);
+        app.canvas.setDirty?.(true, true);
+      }
     } catch {
-      // best-effort — the resolved `graph` below is still the reconciled root
+      // fall through to the confirmation below — a throw is just one way to fail
+    }
+    if (app.canvas?.graph !== scope.rootGraph) {
+      throw refuseDivergence(
+        app.canvas?.graph,
+        ` The panel tried to move the view back to the graph it is bound to and could not confirm it.`,
+      );
     }
   }
   const graph = scope.graph ?? app.graph;

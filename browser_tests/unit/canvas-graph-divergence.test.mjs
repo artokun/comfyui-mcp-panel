@@ -106,21 +106,24 @@ function subgraphObject({ nodes: inner = [] } = {}) {
 }
 
 /** An `app` whose canvas points at `canvasGraph`; setGraph is COUNTED because
- *  calling it at all is the destructive act under test. */
-function makeApp({ rootGraph, canvasGraph }) {
-  const app = {
-    graph: rootGraph,
-    canvas: {
-      graph: canvasGraph ?? rootGraph,
-      setGraphCalls: 0,
-      setGraph(g) {
-        this.setGraphCalls += 1;
-        this.graph = g;
-      },
-      setDirty() {},
-    },
+ *  calling it at all is the destructive act under test. `setGraph` models the three
+ *  real outcomes: "ok" (rebinds), "throw" (a reconnect-time failure), "missing"
+ *  (older frontends that never exposed it), and "noop" (accepts and does nothing). */
+function makeApp({ rootGraph, canvasGraph, setGraph = "ok" }) {
+  const canvas = {
+    graph: canvasGraph ?? rootGraph,
+    setGraphCalls: 0,
+    setDirty() {},
   };
-  return app;
+  if (setGraph !== "missing") {
+    canvas.setGraph = function (g) {
+      this.setGraphCalls += 1;
+      if (setGraph === "throw") throw new Error("canvas is mid-reconnect");
+      if (setGraph === "noop") return;
+      this.graph = g;
+    };
+  }
+  return { graph: rootGraph, canvas };
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +304,30 @@ test("#220/#308 regression fence: getGraphCtx still reconciles a PROVABLY EMPTY 
   assert.equal(app.canvas.setGraphCalls, 1, "the ghost view is reconciled so reads and edits stay in lockstep");
   assert.equal(app.canvas.graph, rootGraph);
 });
+
+// An ATTEMPTED repaint is not a repaint. setGraph is optional on older frontends and
+// can throw during a reconnect; swallowing that and returning the root anyway
+// resolved commands onto a graph the user is provably NOT looking at — the same
+// wrong-canvas outcome by a different route (e.g. graph_clear emptying the bound
+// root while the user still sees the ghost).
+for (const [label, setGraph] of [
+  ["throws", "throw"],
+  ["is unavailable on this frontend", "missing"],
+  ["accepts but does not rebind", "noop"],
+]) {
+  test(`#604: an empty ghost whose canvas rebind ${label} is REFUSED, not silently resolved to root`, () => {
+    const rootGraph = { _nodes: [{ id: 1, type: "Node" }] };
+    const ghost = subgraphObject();
+    const app = makeApp({ rootGraph, canvasGraph: ghost, setGraph });
+
+    assert.throws(
+      () => buildGetGraphCtx(app)(),
+      /\[canvas-root-divergence\][\s\S]*could not confirm it/,
+      "an unconfirmed rebind leaves the divergence in place and must be refused like one",
+    );
+    assert.equal(app.canvas.graph, ghost, "the user is still looking at the ghost — say so, don't act");
+  });
+}
 
 test("getGraphCtx: an ordinary root-bound canvas is untouched (no false refusal)", () => {
   const rootGraph = { _nodes: nodes(3) };
