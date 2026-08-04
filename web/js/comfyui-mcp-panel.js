@@ -49,9 +49,9 @@
     } catch {
       // crypto is a frozen host object — leave it alone rather than re-clobber
       // it (re-binding getRandomValues / subtle by hand has already proven
-      // fragile). Behavior reverts to pre-polyfill: the panel hangs in
-      // 'waiting for the panel agent…' on a non-secure LAN host, exactly as
-      // before this fix.
+      // fragile). Behavior reverts to pre-polyfill: the panel hangs on the
+      // "connecting" pill awaiting the agent handshake on a non-secure LAN
+      // host, exactly as before this fix.
     }
   }
 })();
@@ -11169,7 +11169,6 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
   // trying underneath either way — `gaveUp` just latches the terminal display so
   // later background retries don't re-pulse the pill connecting↔disconnected.
   let gaveUp = false;
-  let loggedWaiting = false; // FIX 3 — throttle the "waiting for the panel agent" log
   function backendNow() {
     try {
       return window.localStorage.getItem(STORAGE_KEY_BACKEND) || "claude";
@@ -11233,7 +11232,6 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // "connecting" forever, masking a genuine terminal failure.
     attempt = 0;
     gaveUp = false;
-    loggedWaiting = false;
     // #508/#402 — replay the outcomes the previous socket could not deliver, so a command
     // that genuinely ran is never silently swallowed by the reconnect. Deliberately HERE,
     // on the real handshake, and not at bare socket-open (codex): an open socket only proves
@@ -11446,12 +11444,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // gaveUp is latched, a mere open must NOT clear it back to "connecting" —
       // only a real `models` handshake (markConnected) does.
       if (!gaveUp) emitStatus("connecting");
-      // FIX 3 — log the "waiting for the panel agent" line ONCE per connect
-      // sequence instead of on every (re)open during a cold-start flicker.
-      if (!loggedWaiting) {
-        loggedWaiting = true;
-        onLog(`Connected to ${redactBridgeUrl(url)} — waiting for the panel agent…`);
-      }
+      // #588 — the transient "waiting for the panel agent" state is the status
+      // pill's job (emitStatus above); it must NOT also be written into the
+      // durable chat transcript, where every reconnect cycle during a ComfyUI /
+      // orchestrator restart appended the same line again. A genuinely wedged
+      // open socket is still surfaced by the handshake-timeout warning below.
       sendHello();
       clearHandshake();
       handshakeTimer = setTimeout(() => {
@@ -12239,10 +12236,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       closed = false;
       // A fresh connect intent (user Connect / sticky reconnect / respawn handoff)
       // restarts the patient cold-start window: clear the terminal latch and the
-      // attempt count so we ride out the slow boot again as a steady "connecting"
-      // (and the "waiting for the panel agent" line logs once more). FIX 1/2/3.
+      // attempt count so we ride out the slow boot again as a steady "connecting".
       gaveUp = false;
-      loggedWaiting = false;
       attempt = 0;
       connect();
     },
@@ -12395,7 +12390,6 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       attempt = 0;
       // Pointing at a new bridge is a fresh connect → restart the patience window.
       gaveUp = false;
-      loggedWaiting = false;
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -19252,6 +19246,11 @@ function buildPanel() {
           storyboardFrameCount,
           paintImage,
           videoStoryboardEnabled: prefs.videoStoryboard !== false,
+          // #609 — Blind mode strips images at the sendFrame gate below; the
+          // storyboard note must not ask for a visual review of pixels the
+          // agent never received. A function, so the composer makes its single
+          // per-frame decision after the storyboards resolve, near send time.
+          agentReceivesImages: () => !AGENT_BLIND,
           warn: (...a) => console.warn(...a),
         },
       )
@@ -20330,8 +20329,8 @@ function buildPanel() {
   // the port yet its AGENT handshake (the `models` frame → "connected") never lands,
   // the WS is OPEN — so there's no close event to drive scheduleReconnect, and
   // tryAutoRespawn is standing down for the guard window. The panel then sits in the
-  // "Connected … waiting for the panel agent" stuck state until the user manually
-  // clicks Reconnect. So: if the handshake hasn't landed within this window,
+  // stuck open-but-unhandshook state (steady "connecting" pill) until the user
+  // manually clicks Reconnect. So: if the handshake hasn't landed within this window,
   // AUTO-ESCALATE once to exactly what Reconnect does — a single clean
   // connectAgent(). One-shot (never a loop) so it can't reintroduce the storm the
   // interlock prevents. BACKEND-AWARE: the escalation must sit BEYOND the backend's
@@ -20373,8 +20372,8 @@ function buildPanel() {
     }
   }
   // The soft-reload's WS is open (or reconnecting) but the agent handshake hasn't
-  // landed within the short window — the "connected … waiting for the panel agent"
-  // stuck state. Escalate ONCE to exactly what the user's manual Reconnect does:
+  // landed within the short window — the stuck open-but-unhandshook state.
+  // Escalate ONCE to exactly what the user's manual Reconnect does:
   // drop the stale (open-but-unhandshook) socket — necessary because connect()
   // early-returns on an already-OPEN socket, so a bare connectAgent()/client.start()
   // alone would NOT replace it — then run a single clean connectAgent(). connectAgent
@@ -20770,7 +20769,7 @@ function buildPanel() {
     // Switching to a DIFFERENT backend than we're connected to: agent sessions are
     // NOT shareable across providers, so start FRESH for the new one (fix #2).
     // Sending the saved (foreign) session id on hello makes the new orchestrator
-    // try to resume a session it doesn't own ("waiting for the panel agent…" +
+    // try to resume a session it doesn't own (stuck awaiting handshake +
     // a spurious re-send). Mirror newChat()'s session-clear so getResume() → null;
     // the visible chat log stays, only the agent session resets.
     const switching = connectedBackend !== null && connectedBackend !== id;
