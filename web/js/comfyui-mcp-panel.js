@@ -10133,6 +10133,11 @@ const GRAPH_TOOL_EXECUTORS = {
       writeBox(b[0], b[1]);
       return !groupBoxIsAt(g, b[0], b[1], b[2], b[3]);
     };
+    // Has any forward path written the box yet? Restoring a box nothing displaced
+    // is not a no-op: on an effectful or clamping setter the recovery write can
+    // create a displacement of its own. A rollback must not move what no forward
+    // path moved.
+    let boxWritten = false;
     // ---- PRE-FLIGHT (no mutations past this point until it is complete) ------
     // Everything this move needs to KNOW is established here, before the first
     // byte is written. After the first write the only permitted actions are
@@ -10243,14 +10248,29 @@ const GRAPH_TOOL_EXECUTORS = {
           rerouteMove = moveReroutePoints(reroutes, dx, dy);
           nestedMove = translateGroupBoxes(nested, dx, dy);
         } catch (error) {
+          // This net used to be an EXCEPTION to two rules the reachable paths
+          // follow, so if it ever fired it would have introduced defects of its
+          // own rather than merely failing to help:
+          //
+          //  - it called restoreBox() even though the box write happens strictly
+          //    AFTER the movers, so nothing had displaced the box yet. On an
+          //    effectful or clamping setter that recovery WRITE could create a
+          //    displacement of its own — a rollback moving something no forward
+          //    path had moved. It is now gated on the box actually having been
+          //    written, which here it never has.
+          //  - it replayed the pre-flight rect snapshot over members whose `pos`
+          //    the unreturned mover may have changed, recreating exactly the
+          //    stale-rect fabrication removed from the stranded-member path: a
+          //    rect claiming a position the node no longer holds. When the state
+          //    is UNKNOWN the truthful rect is the one that matches live geometry,
+          //    so this re-syncs instead of replaying a snapshot.
           const unrestored = [
             ...nestedMove.undo(),
             ...rerouteMove.undo(),
             ...memberMove.undo(),
-            ...(restoreBox() ? [g] : []),
-            // …and the PRE-FLIGHT's writes, which this path also owns.
-            ...resync.undo(),
+            ...(boxWritten && restoreBox() ? [g] : []),
           ];
+          syncGraphNodeAreas(graph);
           throw new Error(
             `refusing to move group ${group_id}: the frontend raised "${describeThrown(error)}" partway through the move. ` +
               "The movers that had already completed were rolled back, but the one that raised never returned its undo, " +
@@ -10289,7 +10309,11 @@ const GRAPH_TOOL_EXECUTORS = {
           ];
           const strandedMembers = memberMove.undo();
           stillWrong.push(...strandedMembers.map((n) => ["node", n]));
-          if (restoreBox()) stillWrong.push(["group", g]);
+          // Only restore a box some forward path actually WROTE. The stuck-items
+          // refusal fires BEFORE the box write, and restoreBox() is itself a write:
+          // on an effectful or clamping setter it would displace a box nothing had
+          // displaced — a rollback moving something no forward path moved.
+          if (boxWritten && restoreBox()) stillWrong.push(["group", g]);
           stillWrong.push(...resync.undo().map((n) => ["node", n]));
           // A member that could NOT be put back is somewhere else now, and the
           // pre-flight undo has just restored its cached rect to where it used to
@@ -10324,6 +10348,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // The box write is the LAST thing that can fail. Its failure has to put the
         // children back too, or the group is left torn apart with an error saying
         // otherwise.
+        boxWritten = true;
         const boxError = writeBox(targetX, targetY);
         if (boxError) {
           refuse(() => `the group box did not accept the new position on this frontend (${describeThrown(boxError)})`);
@@ -10335,11 +10360,14 @@ const GRAPH_TOOL_EXECUTORS = {
         // Even the box-only move must be VERIFIED, not assumed: a clamping setter
         // or a proxy that ignores the write would otherwise return a confident
         // "moved the box to [x, y]" for a box that never left.
+        boxWritten = true;
         const boxError = writeBox(targetX, targetY);
         if (boxError) {
           // Rollback FIRST — and BOTH undos: the box, and the pre-flight's rect
-          // reconciliation, which this branch also performed.
-          const restoreFailed = restoreBox();
+          // reconciliation, which this branch also performed. (The box write is
+          // unconditionally above this line, so boxWritten is true here; the guard
+          // states the rule rather than relying on the reader tracing it.)
+          const restoreFailed = boxWritten ? restoreBox() : false;
           const unrestoredRects = resync.undo();
           throw new Error( // …then format
             `refusing to move group ${group_id}: the group box did not accept the new position on this frontend (${describeThrown(boxError)}). ` +
@@ -10377,29 +10405,42 @@ const GRAPH_TOOL_EXECUTORS = {
     } catch {
       /* a repaint failure does not un-move anything */
     }
+    // `moved` is built only from array lengths — primitives this function owns,
+    // never caller- or graph-supplied — so it survives serialization by
+    // construction and can carry the completion signal on its own.
     const moved = { nodes: movedNodes, groups: movedGroups, reroutes: movedReroutes };
+    // Prove the reply we RETURN, not a payload inside it: the ENVELOPE is part of
+    // the reply. Round-tripping only an inner field left the outer object free to
+    // carry something the bridge's JSON.stringify chokes on (a BigInt group_id is
+    // enough), which throws AFTER the move, outside every guard — so the caller
+    // gets no completion reply at all and re-issues an already-completed move.
+    const proven = (reply) => JSON.parse(JSON.stringify(reply));
     try {
       // summarizeGroup returns the group's own `title`/`color`/`id` and its member
-      // ids UNCOERCED, so a title with a throwing `toJSON` lets it succeed here and
-      // then makes the BRIDGE's JSON.stringify fail — after the move, outside this
-      // guard, where the caller gets no success response at all and re-issues.
-      // Proving the payload survives serialization INSIDE the guard is what pulls
-      // that last step back inside the transaction; round-tripping it also hands
-      // back a plainly-serializable object rather than live engine references.
-      const group = JSON.parse(JSON.stringify(summarizeGroup(graph, g)));
-      return { group, moved };
+      // ids UNCOERCED, so a title with a throwing `toJSON` — or a BigInt node id —
+      // gets caught here rather than at the bridge.
+      return proven({ group: summarizeGroup(graph, g), moved });
     } catch (error) {
-      // The error path OF THE ERROR PATH. `error.message` can itself throw — a
-      // group with a throwing `title` produces exactly such an error — and a throw
-      // while FORMATTING this fallback would surface the completed move as a raw
-      // failure, so the caller re-issues it and the group moves twice. That double
-      // move is the whole reason summary_unavailable exists; describeThrown is
-      // total so the reason can never defeat the report.
-      return {
-        group_id,
-        moved,
-        summary_unavailable: `the move COMPLETED, but the group could not be summarized afterwards: ${describeThrown(error)}. Re-read it with panel_query_graph — do NOT re-issue the move.`,
-      };
+      // The error path OF THE ERROR PATH. `error.message` can itself throw, and
+      // `group_id` is caller-supplied, so this fallback has to be proven too.
+      try {
+        return proven({
+          group_id,
+          moved,
+          summary_unavailable: `the move COMPLETED, but the group could not be summarized afterwards: ${describeThrown(error)}. Re-read it with panel_query_graph — do NOT re-issue the move.`,
+        });
+      } catch {
+        // Even the fallback would not serialize — the caller's own `group_id` is
+        // the likeliest culprit. Degrade to a reply built ONLY from primitives we
+        // control: the verified counts and a literal string. Losing the id is a
+        // far smaller harm than losing the completion signal and being re-issued.
+        return {
+          moved,
+          summary_unavailable:
+            "the move COMPLETED, but neither the group summary nor the group id could be represented in the reply. " +
+            "Re-read the group with panel_query_graph — do NOT re-issue the move.",
+        };
+      }
     }
   },
 

@@ -58,8 +58,13 @@ const moveGroupLabelSrc = grab(/ {4}case "graph_move_group": \{[\s\S]*?\n {4}\}/
  *  sloppy by default, so without this the harness would exercise a more forgiving
  *  language than the one the panel actually runs in — and every "unwritable
  *  geometry" test below would be testing the wrong thing. */
-function realMoveGroup(graph) {
+function realMoveGroup(graph, overrides = {}) {
   const getGraphCtx = () => ({ graph });
+  // `overrides` swaps a single injected dependency for a double. It exists for
+  // ONE purpose: the mutation-phase catch is unreachable while the movers are
+  // total, so the only way to exercise what that net actually DOES — rather than
+  // assert on its source text — is to hand the real handler a mover that throws.
+  const dep = (name, real) => (name in overrides ? overrides[name] : real);
   return new Function(
     "getGraphCtx",
     "groupBoundsOf",
@@ -85,13 +90,13 @@ function realMoveGroup(graph) {
   )(
     getGraphCtx,
     groupBoundsOf,
-    syncGraphNodeAreas,
+    dep("syncGraphNodeAreas", syncGraphNodeAreas),
     groupMemberNodes,
     nestedGroupsOf,
     reroutesInside,
-    moveGroupMembers,
-    translateGroupBoxes,
-    moveReroutePoints,
+    dep("moveGroupMembers", moveGroupMembers),
+    dep("translateGroupBoxes", translateGroupBoxes),
+    dep("moveReroutePoints", moveReroutePoints),
     rerouteWriteIsSound,
     groupBoxIsAt,
     describeItems,
@@ -1367,6 +1372,50 @@ test("#408 P0: a title whose toJSON throws still yields the completed counts, no
   assert.doesNotThrow(() => JSON.stringify(out), "the reply the bridge will serialize must be serializable");
 });
 
+test("#408 P0: a BigInt group_id on the FALLBACK path still yields a serializable completion reply", () => {
+  // Prove the reply you RETURN, not a payload inside it. Round-tripping only the
+  // inner `group` left the ENVELOPE free to carry something the bridge's
+  // JSON.stringify chokes on — a caller-supplied BigInt group_id is enough. That
+  // throws AFTER the move, outside every guard, so the caller receives no
+  // completion reply at all and re-issues an already-completed move:
+  // summary_unavailable bypassed one level further out.
+  const a = node(7, [50, 50], [60, 40]);
+  const g = {
+    id: 1n, // BigInt: summarizeGroup will put it in the summary, stringify will refuse
+    title: "Big",
+    _bounding: [0, 0, 400, 400],
+    recomputeInsideNodes() {},
+  };
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  let out;
+  assert.doesNotThrow(() => { out = realMoveGroup(graph)({ group_id: 1n, pos: [1000, 1000] }); });
+
+  assert.deepEqual(a.pos, [1050, 1050], "the move really did complete");
+  assert.deepEqual(out.moved, { nodes: 1, groups: 0, reroutes: 0 }, "the verified counts survive");
+  assert.match(out.summary_unavailable, /move COMPLETED/);
+  assert.match(out.summary_unavailable, /do NOT re-issue the move/, "the do-not-re-issue signal survives");
+  assert.doesNotThrow(
+    () => JSON.stringify(out),
+    "the reply the bridge is about to serialize must itself be serializable",
+  );
+  assert.equal("group_id" in out, false, "the unserializable id is dropped rather than losing the whole reply");
+});
+
+test("#408: a serializable group_id is still reported on the fallback path", () => {
+  // The degraded reply drops the id only when it has to; an ordinary id survives.
+  const a = node(7, [50, 50], [60, 40]);
+  const hostileTitle = { toJSON() { throw new TypeError("gone"); } };
+  const g = { id: 1, title: hostileTitle, _bounding: [0, 0, 400, 400], recomputeInsideNodes() {} };
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  const out = realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
+
+  assert.equal(out.group_id, 1);
+  assert.match(out.summary_unavailable, /do NOT re-issue the move/);
+  assert.doesNotThrow(() => JSON.stringify(out));
+});
+
 test("#408: an ordinary reply is plain JSON — round-tripped, not live engine references", () => {
   const a = node(7, [50, 50], [60, 40]);
   const g = group(1, [0, 0, 400, 400]);
@@ -1600,23 +1649,145 @@ test("writePoint never throws — not even for a container it cannot inspect or 
   assert.equal(result, false);
 });
 
-test("the caught-throw net must never claim 'NOTHING was moved'", () => {
-  // This path is unreachable while the movers are total (each contains per item
-  // and always returns its undo), so no fixture can drive it — but if it ever
-  // fires it CANNOT have undone the mover that raised, because that mover never
-  // handed back its undo. A net that asserts a restoration it could not have made
-  // is worse than no net, so the claim is pinned here at the source level.
-  const netBlock = panelSrc.match(
-    /catch \(error\) \{\s*const unrestored = \[[\s\S]*?partway through the move[\s\S]*?\);\s*\}/,
+// ---- the mutation-phase net, driven for real -------------------------------
+// This path is unreachable while the movers are total, so it used to be pinned
+// only by a source-level assertion on its wording. That was not coverage of what
+// it DOES. Injecting a throwing mover into the real handler drives it properly —
+// and the behaviours below are the two ways it could have made things WORSE if it
+// ever fired, not merely failed to help.
+
+/** The real handler with a mover that mutates and then throws BEFORE returning
+ *  its undo — the exact shape the net exists for. */
+function moveGroupWithThrowingMover(graph, mutateBeforeThrowing) {
+  return realMoveGroup(graph, {
+    moveGroupMembers: (members, dx, dy) => {
+      mutateBeforeThrowing(members, dx, dy);
+      throw new TypeError("mover died before returning its undo");
+    },
+  });
+}
+
+test("#408: the net reports UNKNOWN — it never claims a restoration it could not make", () => {
+  const a = node(7, [50, 50], [60, 40]);
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  let err = null;
+  try {
+    moveGroupWithThrowingMover(graph, (members, dx, dy) => {
+      for (const n of members) n.pos = [n.pos[0] + dx, n.pos[1] + dy];
+    })({ group_id: 1, pos: [1000, 1000] });
+  } catch (error) {
+    err = error;
+  }
+  assert.ok(err, "the move must be refused");
+  assert.doesNotMatch(err.message, /NOTHING was moved/, "it cannot verify a rollback, so it must not assert one");
+  assert.match(err.message, /UNKNOWN/);
+  assert.match(err.message, /PARTIALLY moved/);
+  assert.match(err.message, /Ctrl\+Z/);
+});
+
+test("#408: the STUCK-ITEMS refusal does not write a box the forward path never wrote", () => {
+  // Same rule, reachable path. The stuck check fires BEFORE the box write, and
+  // restoreBox() is a write: on a clamping setter it would displace a box nothing
+  // had displaced. A rollback must not move what no forward path moved.
+  const writes = [];
+  const quad = [0, 0, 400, 400];
+  Object.defineProperty(quad, "0", {
+    get() { return this._x ?? 0; },
+    set(v) { writes.push(v); this._x = Math.max(50, v); }, // a write MOVES it
+    configurable: true,
+  });
+  const g = { id: 1, title: "Clamping", get _bounding() { return quad; } };
+  // A frozen member makes the move refuse at the stuck check.
+  const stuckNode = { id: 7, size: [60, 40], boundingRect: [100, 70, 60, 70], get pos() { return Object.freeze([100, 100]); } };
+  const graph = makeGraph({ nodes: [stuckNode], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /would not accept a new position \(node 7\).*NOTHING was moved/s,
   );
-  assert.ok(netBlock, "could not locate the mutation-phase catch in panel source");
-  assert.doesNotMatch(
-    netBlock[0],
-    /NOTHING was moved/,
-    "the one path that cannot verify a rollback must not assert one",
+  assert.deepEqual(writes, [], "no box write at all — neither forward nor in recovery");
+  assert.equal(quad[0], 0);
+});
+
+test("#408: the net does NOT write the group box, which no forward path had moved", () => {
+  // The box write happens strictly AFTER the movers, so when this net fires
+  // nothing has displaced the box. Calling restoreBox() anyway is a WRITE, and on
+  // an effectful or clamping setter it can create a displacement of its own — a
+  // rollback moving something no forward path moved.
+  const writes = [];
+  const quad = [0, 0, 400, 400];
+  const g = {
+    id: 1,
+    title: "Clamping",
+    get _bounding() { return quad; },
+  };
+  Object.defineProperty(quad, "0", {
+    get() { return this._x ?? 0; },
+    set(v) { writes.push(v); this._x = Math.max(50, v); }, // clamps: a write MOVES it
+    configurable: true,
+  });
+  const a = node(7, [100, 100], [60, 40]);
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  assert.throws(
+    () => moveGroupWithThrowingMover(graph, () => {})({ group_id: 1, pos: [1000, 1000] }),
+    /UNKNOWN/,
   );
-  assert.match(netBlock[0], /UNKNOWN/, "it must say the state is unknown");
-  assert.match(netBlock[0], /PARTIALLY moved/, "and that the graph may be partially moved");
+  assert.deepEqual(writes, [], "the recovery must not write a box the forward path never touched");
+  assert.equal(quad[0], 0, "so the clamping setter never got the chance to displace it");
+});
+
+test("#408: when a LATER mover throws, the net still undoes the ones that completed", () => {
+  // The nets's `unrestored` list is only meaningful for movers that already
+  // ASSIGNED. moveGroupMembers completes here and translateGroupBoxes throws, so
+  // the members' undo is real and must run — that is the half of the recovery the
+  // net can actually do.
+  const a = node(7, [50, 50], [60, 40]);
+  const inner = group(2, [20, 20, 100, 100], "Inner");
+  const outer = group(1, [0, 0, 400, 400], "Outer");
+  const graph = makeGraph({ nodes: [a], groups: [outer, inner] });
+
+  assert.throws(
+    () =>
+      realMoveGroup(graph, {
+        translateGroupBoxes: () => { throw new TypeError("box mover died"); },
+      })({ group_id: 1, pos: [1000, 1000] }),
+    /UNKNOWN/,
+  );
+  assert.deepEqual(a.pos, [50, 50], "the members that DID move are put back");
+  assert.deepEqual(outer._bounding, [0, 0, 400, 400], "and the box was never written");
+});
+
+test("#408: the net leaves rects describing where nodes ARE, not a replayed snapshot", () => {
+  // The mover that threw may have changed `pos` without returning its undo.
+  // Replaying the pre-flight rect snapshot over such a node recreates exactly the
+  // stale-rect fabrication removed from the stranded-member path: a rect claiming
+  // a position the node no longer holds, which reads as membership of a group it
+  // has left. When the state is UNKNOWN, the truthful rect is the live one.
+  const moved7 = node(7, [100, 100], [60, 40]);
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [moved7], groups: [g] });
+
+  assert.throws(
+    () =>
+      moveGroupWithThrowingMover(graph, (members) => {
+        for (const n of members) n.pos = [5000, 5000]; // relocated, undo never returned
+      })({ group_id: 1, pos: [1000, 1000] }),
+    /UNKNOWN/,
+  );
+  assert.deepEqual(moved7.pos, [5000, 5000], "precondition: the mover really did relocate it");
+  assert.deepEqual(
+    [...moved7.boundingRect],
+    [5000, 4970, 60, 70],
+    "its cached rect must describe where it IS",
+  );
+  assert.deepEqual(
+    groupMemberNodes(graph, g).map((n) => n.id),
+    [],
+    "and it must not read as a member of the group it has left",
+  );
 });
 
 test("samePoint is exact unless the destination really is a Float32Array", () => {
