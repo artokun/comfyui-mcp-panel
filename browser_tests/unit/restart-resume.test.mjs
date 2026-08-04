@@ -8,6 +8,8 @@ import {
   planRebootResume,
   pruneRebootMarkerRaw,
   rebootMarkerAfterSend,
+  rebootResumeRepeatWarning,
+  rebootWaitBudget,
   stepRebootResume,
   unsettledRebootRuns,
   REBOOT_RESUME_MAX_WAIT_MS,
@@ -522,6 +524,82 @@ test("#585 P1(session): switching conversations between arm and ack must not mis
   });
   assert.equal(backOnA.decision, "resume");
   assert.equal(backOnA.marker.threadId, "t-A");
+});
+
+test("#585 P1(unknown-elapsed): a wrong-session marker with NO arm time HOLDS, it is not expired away", () => {
+  // Substituting 0 for an unknown elapsed makes it never expire; substituting
+  // infinity makes it always expire. Both manufacture a definite answer from an
+  // absent one — and here the "always expired" direction DELETES a legitimate
+  // resume that switching back to the arming conversation would have delivered.
+  const raw = JSON.stringify({ v: 1, at: null, runs: [], n: 0, tid: "t-A", sid: null, t: 0 });
+  const step = stepRebootResume({ raw, isSettled: () => true, currentThreadId: "t-B", nowMs: 9_999_999 });
+  assert.equal(step.decision, "wait_for_session", "unknown must hold, not abandon");
+  assert.notEqual(step.nextRaw, null, "and the marker must survive");
+
+  // Switching back still delivers it.
+  assert.equal(
+    stepRebootResume({ raw: step.nextRaw, isSettled: () => true, currentThreadId: "t-A", nowMs: 9_999_999 })
+      .decision,
+    "resume",
+  );
+});
+
+test("#585 P1(persisted-write): an attempt that could not be RECORDED still warns", () => {
+  // `ssSet` returning is not evidence the write stuck — quota, private mode and
+  // eviction fail silently. An increment that didn't persist reads back as "no
+  // attempt yet", so a retry after a reload would go out as a first attempt with no
+  // warning. Written is not persisted, exactly as sent is not received.
+  assert.equal(
+    rebootResumeRepeatWarning({ attempts: 0, attemptRecorded: false }),
+    true,
+    "if storage cannot count attempts, we must assume there may have been one",
+  );
+  assert.equal(rebootResumeRepeatWarning({ attempts: 1, attemptRecorded: true }), true);
+  assert.equal(
+    rebootResumeRepeatWarning({ attempts: 0, attemptRecorded: true, sentThisMount: 1 }),
+    true,
+    "a send we made in this mount is storage-independent evidence",
+  );
+  for (const attempts of [undefined, null, NaN, "1"]) {
+    assert.equal(
+      rebootResumeRepeatWarning({ attempts, attemptRecorded: true }),
+      true,
+      `uncountable attempts (${String(attempts)}) must warn`,
+    );
+  }
+  assert.equal(
+    rebootResumeRepeatWarning({ attempts: 0, attemptRecorded: true, sentThisMount: 0 }),
+    false,
+    "a genuine, verified first attempt does not warn",
+  );
+  assert.equal(
+    rebootResumeRepeatWarning({}),
+    true,
+    "and with no information at all the safe side is to warn — no parameter default may invent one",
+  );
+});
+
+test("#585: the wait budget is a TRI-STATE — within / spent / unknown", () => {
+  assert.equal(rebootWaitBudget(0, 1000), "within");
+  assert.equal(rebootWaitBudget(999, 1000), "within");
+  assert.equal(rebootWaitBudget(1000, 1000), "spent");
+  for (const bad of [null, undefined, NaN, Infinity, -Infinity, "500"]) {
+    assert.equal(rebootWaitBudget(bad, 1000), "unknown", String(bad));
+  }
+});
+
+test("#585: a KNOWN-spent budget on a wrong-session marker still abandons it visibly", () => {
+  const raw = encodeRebootMarker({ at: 1000, runs: [], threadId: "t-A" });
+  assert.equal(
+    stepRebootResume({
+      raw,
+      isSettled: () => true,
+      currentThreadId: "t-B",
+      nowMs: 1000 + REBOOT_RESUME_MAX_WAIT_MS,
+    }).decision,
+    "expired_wrong_session",
+    "only a budget we KNOW is spent may abandon the resume",
+  );
 });
 
 test("#585 P1(session): a resume held for an absent conversation is abandoned VISIBLY, never misdelivered", () => {

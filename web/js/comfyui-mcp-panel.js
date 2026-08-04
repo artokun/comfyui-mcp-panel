@@ -292,6 +292,7 @@ import {
   encodeRebootMarker,
   pruneRebootMarkerRaw,
   rebootMarkerAfterSend,
+  rebootResumeRepeatWarning,
   stepRebootResume,
   REBOOT_RESUME_MAX_WAIT_MS,
 } from "./lib/restart-resume.js";
@@ -19397,6 +19398,7 @@ function buildPanel() {
   // delivered, and each retry is another "continue" turn in front of the agent.
   const rebootResumeMids = new Set();
   let rebootResumeStalledNoticeShown = false;
+  let rebootAttemptCountUnreliableNoticeShown = false;
   // True once the orchestrator's `session` frame has landed on THIS connection. The
   // frame is not ordered against the "ready" ack, so before it arrives the session
   // id we hold is simply the one we armed with — not evidence that the session was
@@ -19424,6 +19426,7 @@ function buildPanel() {
     forgetRebootResumeAttempt();
     rebootResumeMids.clear();
     rebootResumeSent = false;
+    rebootAttemptCountUnreliableNoticeShown = false;
     rebootResumeStalledNoticeShown = false;
     rebootWaitNoticeShown = false;
     rebootSessionNoticeShown = false;
@@ -19568,7 +19571,40 @@ function buildPanel() {
     // so it survives a reload). We cannot know whether the orchestrator took it —
     // an unacknowledged send is exactly the state we can't resolve — so say so
     // rather than let a possible second identical "continue" arrive unannounced.
-    const repeat = (marker?.attempts ?? 0) > 0;
+    //
+    // WRITE-AHEAD, and VERIFY. The attempt is recorded BEFORE it can happen, and the
+    // write is read back. `ssSet` returning is not evidence it persisted — quota,
+    // private mode and eviction all fail silently — and an increment that didn't
+    // stick reads back as "no attempt yet", so a retry after a reload would go out
+    // as a first attempt with no warning. This is the same shape as sent-vs-received
+    // one layer down: written is not persisted. A failed record therefore ALSO
+    // raises the warning, on this attempt and every later one, because if storage
+    // cannot count attempts we must assume there may have been one. A warning
+    // wrongly present is harmless; its absence is not.
+    const retained = rebootMarkerAfterSend(step, false);
+    let attemptRecorded = true;
+    if (retained) {
+      const withAttempt = encodeRebootMarker({
+        ...decodeRebootMarker(retained),
+        attempts: (marker?.attempts ?? 0) + 1,
+      });
+      ssSet(REBOOT_KEY, withAttempt);
+      attemptRecorded = ssGet(REBOOT_KEY) === withAttempt;
+      if (!attemptRecorded) {
+        ssSet(REBOOT_KEY, retained); // keep the marker itself, just without the count
+        if (!rebootAttemptCountUnreliableNoticeShown) {
+          rebootAttemptCountUnreliableNoticeShown = true;
+          appendSystem(
+            "Note: this browser wouldn't let me record the restart-nudge attempt, so I can't tell whether one already went out. I'll warn the agent about a possible duplicate.",
+          );
+        }
+      }
+    }
+    const repeat = rebootResumeRepeatWarning({
+      attempts: marker?.attempts,
+      attemptRecorded,
+      sentThisMount: rebootResumeMids.size,
+    });
     const repeatPrefix = repeat
       ? "⚠️ You may have already received this restart notice — an earlier copy was sent but never acknowledged. If you already acted on it, ignore this one and do NOT re-queue anything. "
       : "";
@@ -19598,19 +19634,13 @@ function buildPanel() {
         : "✅ ComfyUI just restarted to load newly-installed custom nodes (now available). Continue what you were doing before the restart — if you were mid-build, pick it back up.");
     const mid = newMid();
     const sent = client.sendUserMessage(text, undefined, undefined, mid);
-    // Marker policy for THIS attempt. `sent` is only "the transport took it", so
-    // rebootMarkerAfterSend is deliberately given `false` here: the marker is
-    // retained either way, and only the receipt ack retires it. The attempt count
-    // is bumped in the PERSISTED marker so a reload still knows a nudge may already
-    // be in the agent's queue.
-    const retained = rebootMarkerAfterSend(step, false);
-    ssSet(
-      REBOOT_KEY,
-      retained && sent
-        ? encodeRebootMarker({ ...decodeRebootMarker(retained), attempts: (marker?.attempts ?? 0) + 1 })
-        : retained,
-    );
-    if (!sent) return false;
+    if (!sent) {
+      // Nothing left the panel, so give the budget its attempt back — but only when
+      // we know the increment persisted. If it didn't, the count is already whatever
+      // storage decided and there is nothing to roll back.
+      if (retained && attemptRecorded) ssSet(REBOOT_KEY, retained);
+      return false;
+    }
     rebootResumeMid = mid;
     rebootResumeMidAt = Date.now();
     rebootResumeMids.add(mid);

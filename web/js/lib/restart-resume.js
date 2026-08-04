@@ -200,17 +200,58 @@ export function planRebootResume(state = {}) {
   if (!state.rebootPending) return "none";
   const unsettled = normalizeRunIds(state.unsettledRuns);
   if (!unsettled.length) return "resume";
-  const maxWaitMs = Number.isFinite(state.maxWaitMs) ? state.maxWaitMs : REBOOT_RESUME_MAX_WAIT_MS;
-  // "How long have we been waiting?" can be UNKNOWN — a marker with no usable arm
-  // time. Substituting 0 would be a definite claim that no time has passed, and it
-  // would be re-made on every tick, so the backstop could never advance and the
-  // wait would be unbounded and silent — the mechanism built to prevent an
-  // indefinite wait becoming the thing that guarantees one. Unknown means the wait
-  // cannot be bounded AT ALL, so take the visible, disclosed exit now.
-  if (!Number.isFinite(state.waitedMs)) return "resume_unconfirmed";
-  const waitedMs = Math.max(0, state.waitedMs);
-  if (waitedMs >= maxWaitMs) return "resume_unconfirmed";
+  // "Has the wait budget run out?" has THREE answers, and `unknown` is one of them.
+  // Whichever definite answer you substitute for it, you are wrong in one direction:
+  // 0 elapsed never expires (the wait becomes unbounded and silent), infinite
+  // elapsed always expires (a legitimate resume is discarded). Picking a default IS
+  // the bug — so every consumer takes the tri-state and decides deliberately.
+  const budget = rebootWaitBudget(state.waitedMs, state.maxWaitMs);
+  // Here, unknown means the wait cannot be bounded at all, so take the visible,
+  // DISCLOSED exit rather than hold the session indefinitely.
+  if (budget === "unknown" || budget === "spent") return "resume_unconfirmed";
   return "wait_for_run";
+}
+
+/**
+ * Should this resume warn the agent that it may ALREADY have received one?
+ *
+ * The attempt count is persisted so it survives a reload, but persisting it can
+ * fail silently (quota, private mode, eviction) — and `ssSet` returning is not
+ * evidence that it stuck. An increment that didn't persist reads back as "no
+ * attempt yet", so the next try would go out as a first attempt with no warning:
+ * the same shape as trusting a send to mean receipt, one layer down. Written is
+ * not persisted.
+ *
+ * So an unrecorded or uncountable attempt WARNS. A warning wrongly present costs
+ * one redundant sentence; a warning wrongly absent is an undisclosed duplicate
+ * "continue", which is the hazard this whole fix exists to prevent.
+ *
+ * @param {{attempts?:unknown, attemptRecorded?:boolean, sentThisMount?:number}} state
+ * @returns {boolean}
+ */
+export function rebootResumeRepeatWarning(state = {}) {
+  // NO parameter defaults here on purpose. A default would substitute a definite
+  // value ("0 attempts", "recorded fine") for an absent one — which is the very
+  // mistake this helper exists to prevent. Absent means unknown, and unknown warns.
+  const { attempts, attemptRecorded, sentThisMount } = state;
+  if (attemptRecorded !== true) return true; // not recorded, or not known to be
+  if (Number.isFinite(sentThisMount) && Number(sentThisMount) > 0) return true; // storage-independent
+  if (!Number.isFinite(attempts)) return true; // uncountable / absent ⇒ assume
+  return Number(attempts) > 0;
+}
+
+/**
+ * The wait budget as an explicit tri-state.
+ *
+ * @param {unknown} waitedMs  Elapsed since the reboot was armed, or a non-finite
+ *   value when the marker carries no usable arm time.
+ * @param {unknown} maxWaitMs
+ * @returns {"within"|"spent"|"unknown"}
+ */
+export function rebootWaitBudget(waitedMs, maxWaitMs) {
+  if (!Number.isFinite(waitedMs)) return "unknown";
+  const cap = Number.isFinite(maxWaitMs) ? maxWaitMs : REBOOT_RESUME_MAX_WAIT_MS;
+  return Math.max(0, /** @type {number} */ (waitedMs)) >= cap ? "spent" : "within";
 }
 
 /**
@@ -359,7 +400,7 @@ export function stepRebootResume({
   // Elapsed since the reboot was ARMED, read from the persisted marker so a reload
   // cannot reset the backstop. `null` = unknown, and stays unknown.
   const waitedMs = marker.at == null ? null : Math.max(0, nowMs - marker.at);
-  const outOfTime = waitedMs == null || waitedMs >= maxWaitMs;
+  const budget = rebootWaitBudget(waitedMs, maxWaitMs);
   const retain = () => encodeRebootMarker({ ...markerFields(marker) });
 
   // DELIVERY TARGET. The wait set above is global on purpose — a reboot restarts
@@ -371,7 +412,12 @@ export function stepRebootResume({
   // switching back delivers it. A marker with no recorded thread (legacy/degraded)
   // carries no constraint and delivers to the current session as before.
   if (marker.threadId != null && String(currentThreadId ?? "") !== marker.threadId) {
-    const decision = outOfTime ? "expired_wrong_session" : "wait_for_session";
+    // Only a budget we know to be SPENT may abandon the resume. `unknown` must
+    // hold: expiring on it deletes a legitimate resume that switching back to the
+    // arming conversation would have delivered — silently, which is the worse
+    // failure. Holding is not silent here, because the hold prints a notice naming
+    // the conversation the resume belongs to, so the user can act on it.
+    const decision = budget === "spent" ? "expired_wrong_session" : "wait_for_session";
     return {
       decision,
       marker: { ...markerFields(marker), runs: marker.runs },
