@@ -6476,13 +6476,18 @@ function placementFor(graph, pos) {
 const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = 5000;
 const CUSTOM_WIDGET_REGISTRATION_POLL_MS = 25;
 
-async function awaitRequiredCustomWidgetRegistration(nodeData, comfyApp, LG, requiredInputNames) {
+async function awaitRequiredCustomWidgetRegistration(
+  nodeData,
+  comfyApp,
+  knownSocketTypes,
+  requiredInputNames,
+) {
   const deadline = Date.now() + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
   const check = () =>
     unavailableRequiredCustomWidgetTypes(
       nodeData,
       comfyApp?.widgets,
-      registeredSocketTypes(LG?.registered_node_types),
+      knownSocketTypes,
       requiredInputNames,
     );
   let unavailable = check();
@@ -7753,6 +7758,10 @@ const GRAPH_TOOL_EXECUTORS = {
       backendRequired && typeof backendRequired === "object"
         ? new Set(Object.keys(backendRequired))
         : undefined;
+    // Socket proof comes from the SAME fresh defs — NOT the LiteGraph
+    // registry, whose nodeData.output keeps stale positives for removed or
+    // schema-changed packs and would wrongly waive the guard.
+    const knownSocketTypes = registeredSocketTypes(freshDefs);
     // registerNodesFromDefs can expose a newly installed V3 class before its
     // extension's asynchronous custom-widget registry settles. Resolve the
     // required constructors before creating anything, or fail retryably before
@@ -7760,7 +7769,7 @@ const GRAPH_TOOL_EXECUTORS = {
     await awaitRequiredCustomWidgetRegistration(
       LG?.registered_node_types?.[class_type]?.nodeData,
       comfyApp,
-      LG,
+      knownSocketTypes,
       backendRequiredNames,
     );
     const node = LG.createNode(class_type);

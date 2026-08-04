@@ -86,17 +86,18 @@ export function unavailableRequiredCustomWidgetTypes(
 }
 
 /**
- * Datatypes some REGISTERED node declares as an OUTPUT are link sockets, not
- * widgets pending registration — a widget constructor will never appear for
- * them. Derived from the live LiteGraph registry (`registered_node_types`) so
- * third-party socket types (#620 STITCHER) and core types the allowlist
- * missed (#608 VIDEO) resolve without an allowlist that can only ever be
- * incomplete.
+ * Datatypes some CURRENT backend node declares as an OUTPUT are link sockets,
+ * not widgets pending registration — a widget constructor will never appear
+ * for them. Derived from a FRESH /object_info map (NOT the LiteGraph
+ * registry, which keeps stale nodeData.output positives for removed or
+ * schema-changed packs and would wrongly waive the guard) so third-party
+ * socket types (#620 STITCHER) and core types the allowlist missed (#608
+ * VIDEO) resolve without an allowlist that can only ever be incomplete.
  */
-export function registeredSocketTypes(registeredNodeTypes) {
+export function registeredSocketTypes(objectInfoDefs) {
   const types = new Set();
-  for (const ctor of Object.values(registeredNodeTypes ?? {})) {
-    const outputs = ctor?.nodeData?.output;
+  for (const def of Object.values(objectInfoDefs ?? {})) {
+    const outputs = def?.output;
     if (!Array.isArray(outputs)) continue;
     for (const out of outputs) {
       if (typeof out === "string" && out) types.add(out);

@@ -203,14 +203,14 @@ test("a canvasOnly serialize:false widget for a BACKEND-required input is still 
   );
 });
 
-test("registeredSocketTypes derives link datatypes from registered node outputs", () => {
-  const registry = {
-    InpaintCropImproved: { nodeData: { output: ["IMAGE", "MASK", "STITCHER"] } },
-    LoadVideo: { nodeData: { output: ["VIDEO", "AUDIO"] } },
-    Broken: { nodeData: { output: "NOT_AN_ARRAY" } },
+test("registeredSocketTypes derives link datatypes from fresh /object_info outputs", () => {
+  const objectInfoDefs = {
+    InpaintCropImproved: { output: ["IMAGE", "MASK", "STITCHER"] },
+    LoadVideo: { output: ["VIDEO", "AUDIO"] },
+    Broken: { output: "NOT_AN_ARRAY" },
     Empty: {},
   };
-  const types = registeredSocketTypes(registry);
+  const types = registeredSocketTypes(objectInfoDefs);
   assert.deepEqual(registeredSocketTypes(undefined), new Set());
   assert.ok(types.has("STITCHER"));
   assert.ok(types.has("VIDEO"));
