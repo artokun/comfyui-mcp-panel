@@ -209,12 +209,16 @@ export function moveGroupMembers(members, dx, dy) {
       continue;
     }
     attempted.push([n, px, py]);
-    if (writePoint(n, "pos", px + dx, py + dy)) {
-      refreshNodeArea(n, [px, py]);
-      moved.push(n);
-    } else {
-      stuck.push(n);
-    }
+    const landedExactly = writePoint(n, "pos", px + dx, py + dy);
+    // Sync the cached rect UNCONDITIONALLY. A write can miss its target and still
+    // RELOCATE the node (a setter that snaps or clamps): refreshing only on an
+    // exact landing would leave that node's cached rect describing where it used
+    // to be, and every geometric membership read afterwards — which prefers the
+    // cached rect — would place it in the group it has actually left. The refresh
+    // is a delta from the pre-write position, so it is correct wherever the node
+    // ended up, including "did not move at all".
+    refreshNodeArea(n, [px, py]);
+    (landedExactly ? moved : stuck).push(n);
   }
   return { moved, stuck, undo: () => restoreNodePositions(attempted) };
 }
@@ -280,11 +284,26 @@ function isFloat32(container) {
   return typeof Float32Array !== "undefined" && container instanceof Float32Array;
 }
 
-/** Did the group's box actually end up with its top-left at (x, y)? */
-export function groupBoxIsAt(g, x, y) {
+/**
+ * Did the group's box actually end up as [x, y] — and, when `w`/`h` are given,
+ * with those dimensions?
+ *
+ * The size half is not decoration. A group box is written component by component
+ * (setGroupBounds assigns x, y, w AND h), so a clamping setter or a throw partway
+ * through the quad can leave the box at the right corner with the wrong size, or
+ * put the corner back while the size stays corrupted. Verifying only the top-left
+ * would call both of those a completed move — and, worse, would let a rollback
+ * report "nothing was moved" over a box whose dimensions no longer match what the
+ * user had.
+ */
+export function groupBoxIsAt(g, x, y, w, h) {
   const after = groupBoundsOf(g);
+  if (!after) return false;
   const f32 = isFloat32(g?._bounding);
-  return !!after && samePoint(after[0], x, f32) && samePoint(after[1], y, f32);
+  if (!samePoint(after[0], x, f32) || !samePoint(after[1], y, f32)) return false;
+  if (w != null && !samePoint(after[2], w, f32)) return false;
+  if (h != null && !samePoint(after[3], h, f32)) return false;
+  return true;
 }
 
 /**
@@ -384,6 +403,10 @@ export function nestedGroupsOf(graph, g) {
  * Mirrors the panel's setGroupBounds write policy.
  */
 export function placeGroupBox(g, x, y) {
+  // A move must not change the SIZE. Capture it first and verify it survived, so
+  // a build that resizes on reposition is reported as not-moved instead of
+  // silently reshaping the user's group.
+  const before = groupBoundsOf(g);
   const b = g?._bounding;
   if (b && b.length >= 4) {
     try {
@@ -395,7 +418,7 @@ export function placeGroupBox(g, x, y) {
   } else {
     writePoint(g, "pos", x, y);
   }
-  return groupBoxIsAt(g, x, y);
+  return groupBoxIsAt(g, x, y, before?.[2], before?.[3]);
 }
 
 export function translateGroupBox(g, dx, dy) {

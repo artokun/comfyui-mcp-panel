@@ -588,6 +588,93 @@ test("#408: when a child cannot be put back, the refusal says PARTIALLY moved, n
   assert.deepEqual(g._bounding, [0, 0, 400, 400], "the box itself never moved");
 });
 
+test("#408: a box write that lands the corner but mangles the SIZE is not a move", () => {
+  // This build accepts x/y but rewrites the width. Verifying only the top-left
+  // would call that a completed move and hand back a reshaped group.
+  const quad = [0, 0, 400, 400];
+  Object.defineProperty(quad, "2", {
+    get() { return this._w ?? 400; },
+    set() { this._w = 1; },
+    configurable: true,
+  });
+  const g = { id: 1, title: "Reshaper", _bounding: quad };
+  const a = node(7, [100, 100], [60, 40]);
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /the group box did not accept the new position/,
+  );
+  assert.deepEqual(a.pos, [100, 100], "the member is put back");
+  assert.deepEqual([quad[0], quad[1]], [0, 0], "and the corner is put back");
+});
+
+test("#408: a NESTED box that would be reshaped by the move counts as stuck", () => {
+  // Same hazard one level down: translating a child box must not resize it. If
+  // the size does not survive the write, the child did not move — it mutated.
+  const innerQuad = [50, 50, 100, 100];
+  Object.defineProperty(innerQuad, "3", {
+    get() { return this._h ?? 100; },
+    set() { this._h = 5; },
+    configurable: true,
+  });
+  // Nudge the height through the setter the way a reshaping build would.
+  const inner = { id: 2, title: "Reshaping inner", _bounding: innerQuad };
+  const outer = group(1, [0, 0, 400, 400], "Outer");
+  const a = node(7, [200, 200], [60, 40]);
+  const graph = makeGraph({ nodes: [a], groups: [outer, inner] });
+  // placeGroupBox writes only x/y; make the x write corrupt the height, which is
+  // exactly the "landed the corner, changed the shape" case.
+  Object.defineProperty(innerQuad, "0", {
+    get() { return this._x ?? 50; },
+    set(v) { this._x = v; this._h = 5; },
+    configurable: true,
+  });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /group 2.*(NOTHING was moved|PARTIALLY moved)/s,
+  );
+  assert.deepEqual(a.pos, [200, 200], "the member is put back");
+  assert.deepEqual(outer._bounding, [0, 0, 400, 400], "and the outer box never moved");
+});
+
+test("#408: a node that SNAPS on the way out keeps a cached rect at its REAL position", () => {
+  // The write misses its target (so the node is "stuck" and the move is refused)
+  // but the node HAS relocated, and it refuses to go home. Its cached rect must
+  // describe where it actually is — every membership read prefers that rect, so a
+  // stale one would report the node as still inside the group it has left.
+  const oneWaySnap = {
+    id: 7,
+    size: [60, 40],
+    boundingRect: [100, 70, 60, 70],
+    _p: [100, 100],
+    get pos() { return [...this._p]; },
+    set pos(v) {
+      const x = Math.round(Number(v[0]) / 25) * 25;
+      const y = Math.round(Number(v[1]) / 25) * 25;
+      if (x === 100 && y === 100) return; // refuses to go home
+      this._p = [x, y];
+    },
+  };
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [oneWaySnap], groups: [g] });
+
+  assert.throws(() => realMoveGroup(graph)({ group_id: 1, pos: [1013, 1013] }), /PARTIALLY moved/);
+
+  assert.deepEqual(oneWaySnap._p, [1125, 1125], "precondition: it really did relocate and could not return");
+  assert.deepEqual(
+    [...oneWaySnap.boundingRect],
+    [1125, 1095, 60, 70],
+    "the cached rect must have followed it, not stayed at the old spot",
+  );
+  assert.deepEqual(
+    groupMemberNodes(graph, g).map((n) => n.id),
+    [],
+    "and it must no longer read as a member of the group it left",
+  );
+});
+
 // ---- lib branches the handler tests above do not reach ---------------------
 
 test("writePoint reports the truth for every point shape", () => {

@@ -10084,7 +10084,11 @@ const GRAPH_TOOL_EXECUTORS = {
       } catch (error) {
         return error;
       }
-      return groupBoxIsAt(g, x, y) ? null : new Error("the write did not land");
+      // Verify the WHOLE quad, not just the corner: setGroupBounds assigns all
+      // four components, so a clamp or a mid-quad throw can land the corner while
+      // corrupting the size. b[2]/b[3] are the size the group had before this call
+      // — a move must not change it.
+      return groupBoxIsAt(g, x, y, b[2], b[3]) ? null : new Error("the write did not land");
     };
     // Put the box back at its ORIGINAL top-left, and report whether it is really
     // there. A thrown write is not by itself a failed restore — a frozen quad
@@ -10093,7 +10097,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // Only the box's actual position decides.
     const restoreBox = () => {
       writeBox(b[0], b[1]);
-      return !groupBoxIsAt(g, b[0], b[1]);
+      return !groupBoxIsAt(g, b[0], b[1], b[2], b[3]);
     };
     graph.beforeChange();
     try {
