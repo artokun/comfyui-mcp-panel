@@ -291,6 +291,17 @@ import {
   buildHelloPayload,
 } from "./lib/session-rebind.js";
 import { createRestartTabIdentity, sendBridgeHello } from "./lib/restart-tab-identity.js";
+import {
+  adoptRebootRuns,
+  decodeRebootMarker,
+  isRealBridgeDrop,
+  encodeRebootMarker,
+  pruneRebootMarkerRaw,
+  rebootMarkerAfterSend,
+  rebootResumeRepeatWarning,
+  stepRebootResume,
+  REBOOT_RESUME_MAX_WAIT_MS,
+} from "./lib/restart-resume.js";
 
 let app = null;
 let api = null;
@@ -18498,6 +18509,9 @@ function buildPanel() {
         // The drop may have let the backstop hide a still-live turn; repair the
         // indicator on reconnect so the resumed turn stays visible.
         if (agentWorking && !thinkingEl) showThinking();
+        // #585: this mount has now seen a LIVE bridge, so a later non-connected
+        // status is a genuine drop rather than a fresh client's opening `connecting`.
+        rebootSeenConnected = true;
       }
       // A transient drop mid-turn keeps the turn AUTHORITATIVE — the orchestrator
       // still owns it and the bridge will rebind/resume. Clearing the indicator
@@ -18507,6 +18521,18 @@ function buildPanel() {
         piBackendsReadinessReceived = false;
         // Remember the drop so the next "connected" reconciles pending runs (#370).
         bridgeWasDown = true;
+        // #585: only a REAL drop→reconnect may refresh the restart-resume retry
+        // budget — a transition out of connected, not merely "not connected". A
+        // freshly mounted client emits `connecting` before it has ever connected, so
+        // counting that would let a page RELOAD manufacture a drop and refill the
+        // budget, and repeated reloads would mint unlimited nudges: the storm the
+        // budget bounds, reached through the very event it was meant to survive.
+        if (isRealBridgeDrop({ everConnected: rebootSeenConnected, connected })) {
+          rebootBridgeDroppedSinceAttempt = true;
+        }
+        // A new connection re-opens the session question: whatever id we hold was
+        // reported by the connection that just died.
+        rebootSessionFrameSeen = false;
         if (agentWorking) {
           thinkingReconnecting = true;
           // Keep the indicator up with the reconnecting banner, but DON'T re-arm
@@ -18820,8 +18846,66 @@ function buildPanel() {
       // arming resume in those cases would leave the panel waiting for a restart
       // that never happens.
       if (cmd === "comfy_reboot" && reply.ok && reply.result?.rebooting === true) {
-        ssSet(REBOOT_KEY, "1");
+        // #585: record WHICH runs are still owed a completion frame at the moment
+        // the reboot is armed. The post-restart resume is suppressed for exactly
+        // those prompt ids — never for a global "something is pending" count,
+        // which an UNRELATED workflow's render would satisfy, swallowing this
+        // resume. The ids go in sessionStorage with the marker so the correlation
+        // survives the frontend reload a restart can cause (an in-memory ledger
+        // starts empty on the new mount and would report "nothing in flight" for
+        // a render that is still executing).
+        //
+        // DO NOT "improve" this into a per-workflow correlation. It looks like an
+        // approximation of one and it is not — arm-time IS the correct set. A
+        // reboot restarts ComfyUI GLOBALLY, so every render in flight at this
+        // instant is exposed to the same hazard: the generic "continue" nudge that
+        // makes the agent conclude its render was aborted and queue it again.
+        // Resuming while another workflow's render is still exposed to that hazard
+        // would be the wrong semantics, not a tighter one. (The tracker also has no
+        // workflow attribution on prompt ids; inventing one to reach a worse rule
+        // would be a large change to a concept this codebase doesn't have, landing
+        // inside a fix for a STRANDING bug — not a trade worth making.)
+        //
+        // The accepted consequence: two workflows rendering when a reboot fires
+        // means the resume waits for both. That is bounded — the set is fixed at
+        // arm time, drains as each run settles, and the 15-minute backstop resumes
+        // WITH a disclosure rather than holding the session in silence.
+        const armedRuns = (() => {
+          try {
+            return runCompletionRef?.unsettledPromptIds?.() ?? [];
+          } catch {
+            return [];
+          }
+        })();
+        // A NEW reboot is a NEW subject. Every piece of delivery state below belongs
+        // to the PREVIOUS one — most dangerously the outstanding message ids, whose
+        // delayed receipt would otherwise be accepted as proof that THIS reboot's
+        // resume was taken and retire its marker unsent.
+        resetRebootResumeDelivery();
+        const armedMarker = encodeRebootMarker({
+          at: Date.now(),
+          runs: armedRuns,
+          // WHICH conversation asked for the restart. The wait set above is global;
+          // the delivery target is not. Recorded here because this is the only
+          // moment we know it — by the time the ready ack lands the user may have
+          // switched workflows, and the resume must still find its way home.
+          threadId: ssGet(CURRENT_THREAD_KEY),
+          sessionId: ssGet(SESSION_KEY),
+        });
+        ssSet(REBOOT_KEY, armedMarker);
         appendSystem("Restarting ComfyUI to load new nodes — I'll reconnect and pick up automatically when it's back.");
+        // ssSet is best-effort (a full/blocked sessionStorage throws and is
+        // swallowed). Verify the EXACT value landed, not merely that some marker is
+        // present — a refused overwrite would leave a PREVIOUS reboot's marker,
+        // whose run ids don't describe this restart at all, and the resume would be
+        // decided from stale correlation. Either way, say so rather than let the
+        // user wonder why nothing picked up.
+        if (ssGet(REBOOT_KEY) !== armedMarker) {
+          ssSet(REBOOT_KEY, null); // better no marker than a stale one deciding this restart
+          appendSystem(
+            "Heads up: this browser wouldn't let me save the restart marker, so I can't auto-resume after the restart — reconnect manually if the agent goes quiet.",
+          );
+        }
       }
       // #310 — free_vram unloads models and can BOUNCE the ComfyUI connection,
       // which drops the orchestrator's tab mapping (the next graph tool then
@@ -18858,6 +18942,10 @@ function buildPanel() {
       }
     },
     onSession(sessionId) {
+      // #585: the orchestrator has now TOLD us which session this connection is on.
+      // Until this frame lands, "the id we armed with" is merely the id we have not
+      // been corrected about yet — so the restart resume treats it as unknown.
+      rebootSessionFrameSeen = true;
       bindSession(sessionId);
     },
     onTurnAnchor(uuid) {
@@ -18959,11 +19047,18 @@ function buildPanel() {
       // Receipt: orchestrator got it (not dropped) → cancel the failure timer.
       // The bubble stays QUEUED (muted) until the agent actually reads it.
       if (ack?.kind === "working" && typeof ack.mid === "string") {
+        // #585: this is the orchestrator testifying it TOOK the message. If it's the
+        // restart resume, that receipt — not our own send returning true — is what
+        // retires the reboot marker.
+        onRebootResumeReceipt(ack.mid);
         markReceived(ack.mid);
         return;
       }
       // Read: the agent dequeued this message → flip its bubble to read (normal).
       if (ack?.kind === "seen" && typeof ack.mid === "string") {
+        // A "seen" without a preceding "working" (frame coalescing / a dropped
+        // receipt) is still proof the resume was taken — stronger proof, in fact.
+        onRebootResumeReceipt(ack.mid);
         markRead(ack.mid);
         return;
       }
@@ -18992,17 +19087,11 @@ function buildPanel() {
       }
       // Post-restart auto-resume (#3): the "ready" ack is sent after the
       // orchestrator armed hello.resume, so resuming the agent is safe now.
-      // Clear REBOOT_KEY only here (on actual send) so a drop mid-reconnect
-      // retries instead of losing the resume.
-      if (ack?.kind === "ready" && ssGet(REBOOT_KEY)) {
-        ssSet(REBOOT_KEY, null);
-        appendSystem("Reconnected — resuming where we left off.");
-        showThinking();
-        client.sendUserMessage(
-          "✅ ComfyUI just restarted to load newly-installed custom nodes (now available). Continue what you were doing before the restart — if you were mid-build, pick it back up.",
-        );
-        return;
-      }
+      // #585 routes this through the correlated restart-resume flow below, which
+      // owns clearing REBOOT_KEY — it clears the marker ONLY when the resume is
+      // actually sent, so neither a drop mid-reconnect NOR a suppression while a
+      // pre-restart render finishes can lose it.
+      if (ack?.kind === "ready" && ssGet(REBOOT_KEY) && handleRebootResumeAck()) return;
       // Soft-reload resume: the fresh orchestrator is up. Resume silently for a
       // user-triggered reload; nudge to continue for an agent-triggered one
       // (it was mid-task and its tool call died with the old process).
@@ -19176,6 +19265,11 @@ function buildPanel() {
           if (frame == null || framePushed) runCompletion.markDelivered(promptId);
           else if (AGENT_MUTED) runCompletion.markDelivered(promptId);
           else runCompletion.markUndelivered(promptId);
+          // #585: this is the moment "the agent was told" becomes true (or is
+          // re-pended). Refresh the persisted reboot marker now so a reload in the
+          // gap before the next watch tick can't re-adopt an already-delivered run
+          // and have /history deliver its completion a second time.
+          pruneRebootMarker();
         })
         .catch((err) => {
           console.warn("[cmcp] composeRunCompletionFrame failed:", err);
@@ -19184,6 +19278,7 @@ function buildPanel() {
           // (but respect an intentional mute, as above).
           if (framePushed || AGENT_MUTED) runCompletion.markDelivered(promptId);
           else runCompletion.markUndelivered(promptId);
+          pruneRebootMarker(); // #585 — see the .then branch above
         });
     },
     // #370: deliver a reconcile-discovered terminal ERROR. Routed through the
@@ -19202,6 +19297,7 @@ function buildPanel() {
       // reconcileKey already marked it delivered, so leave it. Only a genuine
       // transport failure re-pends so the next reconnect/retry re-delivers it.
       else if (!AGENT_MUTED) runCompletion.markUndelivered(promptId);
+      pruneRebootMarker(); // #585 — a terminal error is also "the agent was told"
     },
     // #582: ComfyUI writes a manually stopped run to history with raw
     // status_str:"error" plus execution_interrupted. Deliver a neutral event,
@@ -19217,13 +19313,14 @@ function buildPanel() {
       // Match terminal-error recovery: only a transport drop re-pends the
       // cancellation notice; an intentionally muted agent stays silent.
       else if (!AGENT_MUTED) runCompletion.markUndelivered(promptId);
+      pruneRebootMarker(); // #585 — a cancellation notice is also "the agent was told"
     },
     // #370 (P1 memory-leak): the tracker GAVE UP on a prompt whose outcome it
     // couldn't confirm after the bounded retries (its /history stayed absent —
     // cancelled/disconnected). It's been evicted from the ledger; surface a
     // one-time "status unknown, safe to requeue" notice so the agent stops waiting.
     onReconcileGiveUp: ({ promptId }) => {
-      client.sendFrame({
+      const sent = client.sendFrame({
         type: "agent_event",
         kind: "run_error",
         error:
@@ -19231,6 +19328,17 @@ function buildPanel() {
           `(no history for it) — it was likely cancelled or interrupted. Safe to requeue.`,
       });
       appendSystem(`Render status unknown for prompt ${promptId} — safe to requeue.`);
+      // #585: give-up EVICTS the run from the recovery ledger, so unlike the
+      // error/interrupted paths there is nothing to re-pend if this notice didn't
+      // land. Flag it so the run still reads as unsettled-in-truth: a
+      // delivery-gated restart-resume must disclose rather than tell the agent its
+      // outcome "was already delivered" when the only frame about it was dropped.
+      if (!sent && !AGENT_MUTED) runCompletion.markDeliveryUnconfirmed(promptId);
+      // #585: the tracker gave up on this run, so no completion frame will ever be
+      // owed for it. Drop it from the reboot marker — otherwise a suppressed
+      // restart-resume would wait on a run that can never settle, which is the
+      // SILENT failure (the user waits forever for a turn that never starts).
+      pruneRebootMarker();
     },
   });
   runCompletionRef = runCompletion;
@@ -19322,6 +19430,614 @@ function buildPanel() {
   const armRunReconcileSweep = () => runReconcileSweep.arm();
   armRunReconcileSweepRef = armRunReconcileSweep;
 
+  // ── #585: correlated restart-resume ───────────────────────────────────────
+  // After a ComfyUI restart the panel nudges the agent to continue. If a render
+  // queued BEFORE the restart is still in flight — or finished but its completion
+  // frame has not reached the agent yet — that nudge makes the agent conclude the
+  // render was aborted and queue it again.
+  //
+  // The guard is CORRELATION, not aggression: the reboot marker carries the
+  // specific prompt ids that were still owed a completion frame when the reboot
+  // was armed (lib/restart-resume.js), and every decision below is about THOSE
+  // ids. Two rules make the two opposite failures unreachable:
+  //   • the marker is NEVER cleared while suppressing — only when a resume is
+  //     actually sent — so a suppressed resume is always reissued once the run it
+  //     waited on settles (the alternative silently strands the user forever);
+  //   • "settled" means no frame is still owed to the agent (isSettled), not
+  //     "the tracker retired it" (which fires before the async send resolves).
+  const REBOOT_WATCH_TICK_MS = 2000;
+  let rebootWatchTimer = null;
+  let rebootWaitNoticeShown = false;
+  let rebootSessionNoticeShown = false;
+  // One resume per armed reboot, latched in memory. ssSet is best-effort: if the
+  // clear-on-send silently fails (full/blocked sessionStorage) the marker would
+  // survive and every later "ready" ack would re-send the nudge — a repeated
+  // "continue" is exactly what makes the agent re-queue. Reset when a NEW reboot
+  // is armed, so a second restart still resumes.
+  let rebootResumeSent = false;
+  // The resume is retired on RECEIPT, not on send. client.sendUserMessage returns
+  // true the moment WebSocket.send() accepts the bytes — the socket can close
+  // before the orchestrator ever reads them, and an abandoned channel cannot
+  // testify that it wasn't. So each attempt carries a message id and the marker is
+  // held until a "working"/"seen" ack for THAT id comes back (the same receipt
+  // protocol every typed message uses). An attempt that isn't acked in time is
+  // retried, bounded, so a silent drop can neither strand the resume nor storm the
+  // agent with repeated nudges.
+  // Longer than the outbox's own 7s DELIVERY_TIMEOUT_MS, so anything the
+  // orchestrator was ever going to acknowledge has had more time than the panel's
+  // own standard for calling a message dropped.
+  const REBOOT_RESUME_ACK_TIMEOUT_MS = 12000;
+  const REBOOT_RESUME_MAX_ATTEMPTS = 3;
+  let rebootResumeMid = null; // outstanding attempt, awaiting receipt
+  let rebootResumeMidAt = 0;
+  // EVERY mid attempted for this reboot, not just the latest. A receipt for an
+  // earlier attempt is still proof the orchestrator took the resume — discarding it
+  // because a retry has since been issued would keep retrying something already
+  // delivered, and each retry is another "continue" turn in front of the agent.
+  const rebootResumeMids = new Set();
+  let rebootResumeStalledNoticeShown = false;
+  let rebootAttemptCountUnreliableNoticeShown = false;
+  // True once the orchestrator's `session` frame has landed on THIS connection. The
+  // frame is not ordered against the "ready" ack, so before it arrives the session
+  // id we hold is simply the one we armed with — not evidence that the session was
+  // resumed rather than replaced.
+  let rebootSessionFrameSeen = false;
+  // Set whenever the bridge is observed DOWN; consumed by the next ready ack. The
+  // retry budget may only be reset by a genuine NEW connection — "ready" repeats on
+  // a live socket (backend readiness frames), and resetting on those would let a
+  // long-lived connection mint unlimited attempts and storm the agent.
+  let rebootBridgeDroppedSinceAttempt = false;
+  // Has THIS mount ever seen a live bridge? Without it, a fresh client's opening
+  // `connecting` reads as a drop and a reload refills the retry budget.
+  let rebootSeenConnected = false;
+  let rebootPruneFailureNoticeShown = false;
+  // Set when ANY verified REBOOT_KEY write fails. Persisted counters are then
+  // untrustworthy in BOTH directions — a stale-high budget refuses forever, a
+  // stale-low one bounds nothing — so the gate falls back to an in-memory
+  // per-episode count, which is still bounded and still recoverable.
+  let rebootStoragePersistBroken = false;
+  let rebootEpisodeSends = 0;
+
+  /** Drop any outstanding attempt — its channel is gone, so it can never be acked. */
+  function forgetRebootResumeAttempt() {
+    rebootResumeMid = null;
+    rebootResumeMidAt = 0;
+  }
+
+  /**
+   * Reset ALL per-reboot delivery state. Called when a new reboot is armed: the
+   * message ids, retry budget and one-shot notices below are scoped to a SPECIFIC
+   * reboot, and carrying them across would let a late receipt for the previous
+   * one retire the new one's marker without its resume ever being sent.
+   */
+  function resetRebootResumeDelivery() {
+    forgetRebootResumeAttempt();
+    rebootResumeMids.clear();
+    rebootResumeSent = false;
+    rebootAttemptCountUnreliableNoticeShown = false;
+    rebootPruneFailureNoticeShown = false;
+    rebootStoragePersistBroken = false;
+    rebootEpisodeSends = 0;
+    rebootResumeStalledNoticeShown = false;
+    rebootWaitNoticeShown = false;
+    rebootSessionNoticeShown = false;
+    rebootBridgeDroppedSinceAttempt = false;
+  }
+
+  // The tracker is the only thing that can answer "is a frame still owed for this
+  // run?". No tracker (pre-mount / post-dispose) ⇒ undefined predicate ⇒
+  // unsettledRebootRuns reports every id as owed, so we wait (and disclose) rather
+  // than nudge on a blind guess.
+  const rebootIsSettled = () => {
+    const tracker = runCompletionRef;
+    return tracker ? (id) => tracker.isSettled(id) : undefined;
+  };
+  // …and whether a watched run's frame was dispatched but never CONFIRMED to have
+  // reached the agent. Such a run no longer blocks the resume (that would strand
+  // the session), but the resume must DISCLOSE it instead of telling the agent its
+  // result was already delivered — a false reassurance would invite the duplicate.
+  const rebootDeliveryUnconfirmed = () => {
+    const tracker = runCompletionRef;
+    return tracker ? (id) => tracker.isDeliveryUnconfirmed(id) : undefined;
+  };
+
+  /** ssSet, then read back. Returns whether the value actually persisted. */
+  function ssSetVerified(key, value) {
+    ssSet(key, value);
+    return ssGet(key) === value;
+  }
+
+  /**
+   * Can sessionStorage be written AT ALL right now?
+   *
+   * A storage failure outlives the mount that discovered it, but the in-memory
+   * fallback does not — so a reload inherits a stale-high persisted budget with no
+   * memory of why it cannot be reset, and would refuse to send forever. Rather
+   * than carry that state, re-establish it on demand with a throwaway key: it
+   * touches nothing the resume depends on and answers the only question that
+   * matters — is the persisted number something we can still manage?
+   */
+  function sessionStorageWritable() {
+    const probeKey = "comfyui-mcp.panel.storageProbe";
+    const ok = ssSetVerified(probeKey, String(Date.now()));
+    ssSet(probeKey, null);
+    return ok;
+  }
+
+  function readRebootMarker() {
+    return decodeRebootMarker(ssGet(REBOOT_KEY));
+  }
+
+  /**
+   * Drop run ids the tracker now reports as settled from the PERSISTED marker.
+   * Keeps the marker an accurate ledger across a reload: a reload that re-adopted
+   * an already-delivered id would have `/history` reconcile it and deliver its
+   * completion a SECOND time.
+   */
+  function pruneRebootMarker() {
+    const raw = ssGet(REBOOT_KEY);
+    if (raw == null) return;
+    const next = pruneRebootMarkerRaw(raw, rebootIsSettled(), rebootDeliveryUnconfirmed());
+    if (next === raw) return;
+    // VERIFIED. A prune that silently fails leaves an already-delivered run id in the
+    // marker; a reload then re-adopts it and `/history` reconciles its completion to
+    // the agent a SECOND time. Nothing further can force the write, so surface it —
+    // this path had no disclosure at all, which is what made it worse than the
+    // best-effort-storage cases that do.
+    if (!ssSetVerified(REBOOT_KEY, next)) noteRebootMarkerWriteFailed();
+  }
+
+  /**
+   * A verified marker write did not persist. Persisted counters are now untrustworthy
+   * in BOTH directions, so the budget switches to its in-memory bound, and the user is
+   * told once — this path previously had no disclosure at all, which is what set it
+   * apart from the storage cases that do.
+   */
+  function noteRebootMarkerWriteFailed() {
+    rebootStoragePersistBroken = true;
+    if (rebootPruneFailureNoticeShown) return;
+    rebootPruneFailureNoticeShown = true;
+    appendSystem(
+      "Note: this browser wouldn't let me update the restart marker. If you reload, a render result that was already delivered may be reported to the agent twice.",
+    );
+  }
+
+  /**
+   * Re-adopt the marker's runs into THIS mount's tracker (reload survival — see
+   * lib/restart-resume.js `adoptRebootRuns`), then let the existing `/history` +
+   * `/queue` reconcile decide each one's fate.
+   */
+  function adoptRebootRunsHere() {
+    const tracker = runCompletionRef;
+    if (!tracker) return;
+    const runs = readRebootMarker()?.runs ?? [];
+    if (!runs.length) return;
+    adoptRebootRuns(runs, tracker);
+    // Only start probing once the bridge is up. Reconcile's give-up path fires a
+    // one-time "safe to requeue" frame and then EVICTS the run — firing that at a
+    // disconnected agent burns the run's only outcome on a dropped frame. That
+    // applies to the periodic SWEEP as much as to the immediate call, so neither is
+    // started here while disconnected; this runs again on every "ready" ack, which
+    // by definition means the agent can receive what we find.
+    if (!client.isConnected()) return;
+    void reconcileRunsAfterReconnect();
+    armRunReconcileSweep();
+  }
+
+  function stopRebootWatch() {
+    if (rebootWatchTimer != null) {
+      clearInterval(rebootWatchTimer);
+      rebootWatchTimer = null;
+    }
+  }
+
+  /**
+   * One evaluation + the marker write it implies. `nextRaw` is null ONLY when a
+   * resume is actually being sent; on wait it is the retained (pruned) marker.
+   */
+  function stepRebootResumeHere() {
+    const step = stepRebootResume({
+      raw: ssGet(REBOOT_KEY),
+      isSettled: rebootIsSettled(),
+      isDeliveryUnconfirmed: rebootDeliveryUnconfirmed(),
+      // Which conversation is on screen right now — compared against the one that
+      // armed the reboot, so the resume can never land on a different workflow.
+      currentThreadId: ssGet(CURRENT_THREAD_KEY),
+      currentSessionId: ssGet(SESSION_KEY),
+      sessionKnown: rebootSessionFrameSeen,
+      nowMs: Date.now(),
+      maxWaitMs: REBOOT_RESUME_MAX_WAIT_MS,
+    });
+    if (step.decision === "wait_for_run" || step.decision === "wait_for_session") {
+      // Same class as the prune write: this rewrite is what drops already-settled run
+      // ids from the marker, so a silent failure leaves a delivered run in it for a
+      // reload to re-adopt and re-deliver. Verified, and disclosed once if it fails.
+      if (!ssSetVerified(REBOOT_KEY, step.nextRaw)) noteRebootMarkerWriteFailed();
+    }
+    return step;
+  }
+
+  /** Human label for the conversation that armed the reboot, for the held notice. */
+  function rebootArmingThreadLabel(marker) {
+    const tid = marker?.threadId;
+    if (!tid) return "another conversation";
+    const t = threads.find((candidate) => candidate.id === tid) || null;
+    return t?.title || t?.workflowKey || "another conversation";
+  }
+
+  /** The arming conversation isn't on screen — hold, and tell the user where it went. */
+  function holdRebootResumeForSession(step) {
+    if (!rebootSessionNoticeShown) {
+      rebootSessionNoticeShown = true;
+      appendSystem(
+        `A restart resume is waiting for ${rebootArmingThreadLabel(step.marker)} — switch back to it to pick that work up. ` +
+          `I won't send it here; it belongs to the conversation that asked for the restart.`,
+      );
+    }
+    armRebootWatch();
+  }
+
+  /** Never came back within the budget: abandon it VISIBLY rather than misdeliver. */
+  function abandonRebootResumeWrongSession(step) {
+    stopRebootWatch();
+    forgetRebootResumeAttempt();
+    rebootSessionNoticeShown = false;
+    ssSet(REBOOT_KEY, null);
+    appendSystem(
+      `The restart resume for ${rebootArmingThreadLabel(step.marker)} expired without being delivered — ` +
+        `it was never re-opened. If that conversation was mid-build, tell it to continue.`,
+    );
+  }
+
+  /**
+   * Send the restart-resume nudge. The marker is NOT retired here: a successful
+   * `sendUserMessage` only means WebSocket.send() accepted the bytes, and a socket
+   * that closes before the orchestrator reads them cannot tell us so. Retiring on
+   * that would strand the resume permanently. Instead the attempt carries a message
+   * id and the marker is held until the orchestrator's own receipt ack for that id
+   * arrives (onRebootResumeReceipt), which is the first point anything can testify
+   * the resume was actually taken.
+   *
+   * @returns {boolean} whether the attempt reached the transport at all.
+   */
+  function sendRebootResume(step) {
+    const marker = step?.marker;
+    const owed = marker?.runs ?? [];
+    const waited = (marker?.armedRunCount ?? 0) > 0;
+    const unconfirmed = step?.decision === "resume_unconfirmed";
+    // A previous attempt already went out for THIS reboot (persisted in the marker,
+    // so it survives a reload). We cannot know whether the orchestrator took it —
+    // an unacknowledged send is exactly the state we can't resolve — so say so
+    // rather than let a possible second identical "continue" arrive unannounced.
+    //
+    // WRITE-AHEAD, and VERIFY. The attempt is recorded BEFORE it can happen, and the
+    // write is read back. `ssSet` returning is not evidence it persisted — quota,
+    // private mode and eviction all fail silently — and an increment that didn't
+    // stick reads back as "no attempt yet", so a retry after a reload would go out
+    // as a first attempt with no warning. This is the same shape as sent-vs-received
+    // one layer down: written is not persisted. A failed record therefore ALSO
+    // raises the warning, on this attempt and every later one, because if storage
+    // cannot count attempts we must assume there may have been one. A warning
+    // wrongly present is harmless; its absence is not.
+    const retained = rebootMarkerAfterSend(step, false);
+    let attemptRecorded = true;
+    if (retained) {
+      const withAttempt = encodeRebootMarker({
+        ...decodeRebootMarker(retained),
+        // An unknown prior count restarts at 1 for the BUDGET (we cannot bound what
+        // we cannot count, and a real number here ends the uncertainty) but must not
+        // pretend the TOTAL was zero — so an unknown total stays unknown, and keeps
+        // forcing the duplicate warning.
+        attempts: (Number.isFinite(marker?.attempts) ? Number(marker.attempts) : 0) + 1,
+        totalAttempts: Number.isFinite(marker?.totalAttempts) ? Number(marker.totalAttempts) + 1 : null,
+      });
+      ssSet(REBOOT_KEY, withAttempt);
+      attemptRecorded = ssGet(REBOOT_KEY) === withAttempt;
+      if (!attemptRecorded) {
+        // The persisted count cannot be trusted to BOUND anything either — without
+        // this the gate would keep reading a stale 0 and re-send after every ack
+        // timeout, which is the storm the budget exists to prevent.
+        rebootStoragePersistBroken = true;
+        ssSet(REBOOT_KEY, retained); // keep the marker itself, just without the count
+        if (!rebootAttemptCountUnreliableNoticeShown) {
+          rebootAttemptCountUnreliableNoticeShown = true;
+          appendSystem(
+            "Note: this browser wouldn't let me record the restart-nudge attempt, so I can't tell whether one already went out. I'll warn the agent about a possible duplicate.",
+          );
+        }
+      }
+    }
+    const repeat = rebootResumeRepeatWarning({
+      totalAttempts: marker?.totalAttempts,
+      attemptRecorded,
+      sentThisMount: rebootResumeMids.size,
+    });
+    const repeatPrefix = repeat
+      ? "⚠️ You may have already received this restart notice — an earlier copy was sent but never acknowledged. If you already acted on it, ignore this one and do NOT re-queue anything. "
+      : "";
+    // The agent session behind this conversation looks REPLACED rather than
+    // resumed, so "continue what you were doing" may be addressed to an instance
+    // with no memory of that work — which is how a fresh session ends up re-reading
+    // the graph and re-queueing. Disclosed, never used to withhold the resume: a
+    // session id legitimately changes across a resume, so refusing on a mismatch
+    // would strand the ordinary restart.
+    const replacedPrefix =
+      step?.sessionState === "replaced"
+        ? "⚠️ Your agent session was replaced (not resumed) across this restart, so you may not have the context you had before. Check the ComfyUI queue/history before starting or re-queueing any render. "
+        : step?.sessionState === "unknown"
+          ? "⚠️ I couldn't confirm whether your agent session was resumed or replaced across this restart. Check the ComfyUI queue/history before starting or re-queueing any render. "
+          : "";
+    const text =
+      repeatPrefix +
+      replacedPrefix +
+      (unconfirmed
+      ? `✅ ComfyUI just restarted to load newly-installed custom nodes (now available). ` +
+        `⚠️ A render was already in flight when the restart was triggered${
+          owed.length ? ` (prompt ${owed.join(", ")})` : ""
+        } and I could NOT confirm whether it finished. Check the ComfyUI queue/history for it BEFORE re-queueing anything — ` +
+        `it may still be running, and re-queueing would duplicate it. Then continue what you were doing before the restart.`
+      : waited
+        ? "✅ ComfyUI just restarted to load newly-installed custom nodes (now available). The render that was already in flight before the restart has since reported back — its result (or its failure) was already delivered to you, so do NOT re-queue it. Continue what you were doing before the restart."
+        : "✅ ComfyUI just restarted to load newly-installed custom nodes (now available). Continue what you were doing before the restart — if you were mid-build, pick it back up.");
+    const mid = newMid();
+    const sent = client.sendUserMessage(text, undefined, undefined, mid);
+    if (!sent) {
+      // Nothing left the panel, so give the budget its attempt back — but only when
+      // we know the increment persisted. If it didn't, the count is already whatever
+      // storage decided and there is nothing to roll back.
+      if (retained && attemptRecorded) ssSet(REBOOT_KEY, retained);
+      return false;
+    }
+    rebootResumeMid = mid;
+    rebootResumeMidAt = Date.now();
+    rebootResumeMids.add(mid);
+    rebootEpisodeSends += 1;
+    // A continuation has now been issued for this drop, so the generic mid-task
+    // "you dropped, pick it back up" fallback must not ALSO fire. `ready` repeats on
+    // a live socket, and once the marker is retired those repeats fall through to
+    // that branch — a second, uncorrelated, undisclosed "continue", which is the
+    // duplicate-render hazard again. The soft-reload path clears this for exactly
+    // the same reason; the reboot path never did.
+    ssSet(MID_TASK_KEY, null);
+    rebootWaitNoticeShown = false;
+    rebootSessionNoticeShown = false;
+    appendSystem(
+      unconfirmed
+        ? `Reconnected — couldn't confirm the render that was in flight before the restart${
+            owed.length ? ` (prompt ${owed.join(", ")})` : ""
+          }. Resuming, and telling the agent to check the queue before re-running.`
+        : "Reconnected — resuming where we left off.",
+    );
+    showThinking();
+    armRebootWatch(); // keep watching until the orchestrator acknowledges receipt
+    return true;
+  }
+
+  /**
+   * The orchestrator acknowledged receipt of the resume ("working" = it took the
+   * message, "seen" = the agent dequeued it). THIS is the evidence that retires the
+   * marker — the first point at which anything other than our own transport can
+   * testify the resume was not dropped.
+   */
+  function onRebootResumeReceipt(mid) {
+    // Any attempt's receipt counts, not just the newest. A `working` ack for an
+    // earlier retry still proves the orchestrator took the resume; ignoring it
+    // because a newer attempt is outstanding would keep retrying an already
+    // delivered nudge, and every retry is another "continue" turn for the agent.
+    if (!mid || !rebootResumeMids.has(mid)) return false;
+    forgetRebootResumeAttempt();
+    rebootResumeMids.clear();
+    rebootResumeStalledNoticeShown = false;
+    rebootResumeSent = true;
+    stopRebootWatch();
+    ssSet(REBOOT_KEY, null); // retired on RECEIPT, the only place it is cleared
+    // A refused CLEAR (best-effort storage) would leave the marker to be re-read
+    // after a reload, where the per-mount latch is gone. Nothing can force the
+    // write, so disclose it rather than pretend the state is clean.
+    if (ssGet(REBOOT_KEY) != null) {
+      appendSystem(
+        "Note: this browser wouldn't let me clear the restart marker. If you reload, I may repeat the restart nudge — ignore the second one.",
+      );
+    }
+    return true;
+  }
+
+  /**
+   * Re-evaluate the suppressed resume on a timer. This is what makes suppression
+   * safe: the marker stays set while we wait, and the resume is reissued the
+   * moment the specific run it is waiting on is confirmed delivered (or the
+   * bounded wait expires and we resume WITH a disclosure).
+   */
+  function armRebootWatch() {
+    if (rebootWatchTimer != null) return;
+    rebootWatchTimer = setInterval(() => {
+      // Same two revocations as the ack path: an explicit Disconnect, and a resume
+      // already sent for this reboot whose marker clear didn't stick.
+      if (rebootResumeSent || lsGet(USER_DISCONNECTED_KEY)) {
+        stopRebootWatch();
+        ssSet(REBOOT_KEY, null);
+        return;
+      }
+      // An attempt is out and not yet acknowledged. Wait for the receipt rather
+      // than firing a second nudge — repeated "continue" messages are themselves
+      // the duplicate-render hazard. Past the window the attempt is presumed
+      // dropped and becomes retryable.
+      if (rebootResumeMid != null) {
+        if (Date.now() - rebootResumeMidAt < REBOOT_RESUME_ACK_TIMEOUT_MS) return;
+        forgetRebootResumeAttempt();
+      }
+      const step = stepRebootResumeHere();
+      if (step.decision === "none") {
+        stopRebootWatch(); // cleared elsewhere (explicit Disconnect) — stand down
+        rebootWaitNoticeShown = false;
+        return;
+      }
+      if (step.decision === "wait_for_run") return;
+      if (step.decision === "wait_for_session") {
+        holdRebootResumeForSession(step);
+        return;
+      }
+      if (step.decision === "expired_wrong_session") {
+        abandonRebootResumeWrongSession(step);
+        return;
+      }
+      tryRebootResume(step); // a refused send keeps the marker AND this watch
+    }, REBOOT_WATCH_TICK_MS);
+  }
+
+  /**
+   * The ONE gate every resume send passes through. Both entry points — the watch
+   * tick and the "ready" ack — must share it: a budget enforced on only one of them
+   * is not a budget, and the ack path is the easier one to trigger repeatedly
+   * (readiness frames repeat on a live socket).
+   *
+   * @returns {boolean} whether a resume was actually handed to the transport.
+   */
+  function tryRebootResume(step) {
+    // The resume is a user message on the agent session — it needs a live bridge.
+    // Not connected yet ⇒ keep the marker and keep watching; the reconnect's own
+    // "ready" ack re-enters this same decision.
+    if (!client.isConnected()) return false;
+    // Bounded retries so an orchestrator that never acks can't be nudged on a loop.
+    // Budget spent ⇒ stop RE-SENDING but KEEP the marker: only an observed drop and
+    // reconnect refreshes it, which is recovery rather than a strand.
+    //
+    // The count comes from the PERSISTED marker, not an in-memory counter. A fresh
+    // mount's counter starts at zero, so a reload would hand back a full budget and
+    // repeated reloads would mint unlimited nudges — the storm the bound exists to
+    // prevent. One source of truth, and it is the one that survives a reload.
+    // An UNKNOWN count cannot say the budget is spent. Allowing the send is the
+    // recoverable side (the unknown total already forces the duplicate warning), and
+    // the write-ahead below replaces the unknown with a real count — so this resolves
+    // after exactly one attempt instead of looping.
+    // When the persisted budget cannot be RESET (a verified-failed write), the
+    // persisted number is stale-high forever and gating on it would refuse every
+    // tick. Bound this episode in memory instead — still bounded, but recoverable.
+    let budgetUsed = step?.marker?.attempts;
+    if (rebootStoragePersistBroken) {
+      budgetUsed = rebootEpisodeSends;
+    } else if (Number.isFinite(budgetUsed) && Number(budgetUsed) >= REBOOT_RESUME_MAX_ATTEMPTS) {
+      // Spent per the marker — but a budget is only meaningful if it can be RESET.
+      // A mount that inherits a spent count from a mount whose storage was broken
+      // would otherwise refuse forever, so establish writability before refusing.
+      if (!sessionStorageWritable()) {
+        rebootStoragePersistBroken = true;
+        budgetUsed = rebootEpisodeSends;
+      }
+    }
+    if (Number.isFinite(budgetUsed) && Number(budgetUsed) >= REBOOT_RESUME_MAX_ATTEMPTS) {
+      if (!rebootResumeStalledNoticeShown) {
+        rebootResumeStalledNoticeShown = true;
+        appendSystem(
+          "Couldn't confirm the restart nudge reached the agent. Keeping it pending — it'll retry when the connection next comes back.",
+        );
+      }
+      return false;
+    }
+    return sendRebootResume(step);
+  }
+
+  /**
+   * Handle a "ready" ack while a reboot marker is set.
+   * @returns {boolean} true when this ack was consumed by the restart-resume flow.
+   */
+  function handleRebootResumeAck() {
+    if (!readRebootMarker()) return false;
+    // An explicit Disconnect revokes the resume. It clears REBOOT_KEY, but ssSet is
+    // best-effort — honour the (localStorage, durable) opt-out latch too so a
+    // marker that survived a failed clear can't resurrect a session the user
+    // deliberately walked away from.
+    if (lsGet(USER_DISCONNECTED_KEY)) {
+      stopRebootWatch();
+      ssSet(REBOOT_KEY, null);
+      return false;
+    }
+    // The resume for THIS reboot already went out; a marker still present means the
+    // clear didn't stick. Re-sending would nudge the agent to "continue" twice.
+    if (rebootResumeSent) {
+      stopRebootWatch();
+      ssSet(REBOOT_KEY, null);
+      return false;
+    }
+    // A reconnect is a FRESH delivery episode: the previous attempt's channel is
+    // gone (it can never be acked now) and the retry budget starts over, mirroring
+    // how the /history reconciler treats a reconnect edge. But ONLY a real drop
+    // counts — "ready" repeats on a live socket, and treating those as reconnects
+    // would refresh the budget indefinitely and let one connection mint unlimited
+    // nudges. Elapsed time is not evidence of a new connection; an observed drop is.
+    if (rebootBridgeDroppedSinceAttempt) {
+      rebootBridgeDroppedSinceAttempt = false;
+      forgetRebootResumeAttempt();
+      rebootResumeStalledNoticeShown = false;
+      // The budget lives in the PERSISTED marker (so a reload can't refill it), so
+      // refreshing it means rewriting the marker — not zeroing a local counter.
+      // Refresh ONLY the episode budget. `totalAttempts` is deliberately untouched:
+      // it is the evidence that a nudge may already be in the agent's queue, and a
+      // resume that reached the orchestrator but lost its receipt in this very drop
+      // is exactly the case a later undisclosed retry would duplicate.
+      const raw = ssGet(REBOOT_KEY);
+      const decoded = raw == null ? null : decodeRebootMarker(raw);
+      // `!== 0` rather than `> 0` so an UNKNOWN budget is also resolved here: after an
+      // observed drop, "this episode has made zero attempts" is a true statement we
+      // can now assert. The total is untouched and stays unknown if it was.
+      if (decoded && decoded.attempts !== 0) {
+        // VERIFIED. If the reset silently fails, the persisted budget stays spent and
+        // the send gate refuses on every tick — a confirmed reconnect turning into a
+        // permanent stall. A budget we cannot reset is a budget we cannot manage, so
+        // fall back to bounding this episode in memory instead of refusing forever.
+        if (ssSetVerified(REBOOT_KEY, encodeRebootMarker({ ...decoded, attempts: 0 }))) {
+          rebootStoragePersistBroken = false; // it wrote — storage is working again
+        } else {
+          noteRebootMarkerWriteFailed();
+        }
+      }
+      rebootEpisodeSends = 0; // the in-memory fallback bound, per delivery episode
+      // Mids from the dead socket can never be acked on the new connection, so drop
+      // them — this also bounds the set across repeated drops.
+      rebootResumeMids.clear();
+    } else if (rebootResumeMid != null) {
+      // Same connection, attempt still outstanding — let the watch and the receipt
+      // ack resolve it rather than firing a second identical "continue".
+      armRebootWatch();
+      return true;
+    }
+    adoptRebootRunsHere(); // reload survival: re-pend persisted ids into this mount
+    const step = stepRebootResumeHere();
+    if (step.decision === "none") return false;
+    if (step.decision === "wait_for_run") {
+      if (!rebootWaitNoticeShown) {
+        rebootWaitNoticeShown = true;
+        appendSystem(
+          "Reconnected — holding the restart nudge until the render that was already in flight reports back.",
+        );
+      }
+      armRebootWatch(); // marker deliberately RETAINED; the watch reissues the resume
+      return true;
+    }
+    if (step.decision === "wait_for_session") {
+      holdRebootResumeForSession(step); // belongs to a different conversation
+      return true;
+    }
+    if (step.decision === "expired_wrong_session") {
+      abandonRebootResumeWrongSession(step);
+      return true;
+    }
+    // Same gate as the watch tick — budget, connectivity, everything. A send that
+    // doesn't happen keeps the marker; arm the watch so the resume is retried rather
+    // than lost to a socket that closed between the ack and the send.
+    if (!tryRebootResume(step)) armRebootWatch();
+    return true;
+  }
+
+  // A restart that reloaded the frontend — or a plain panel remount mid-wait —
+  // lands here with an EMPTY ledger and a surviving marker: adopt its runs now so
+  // `/history` + `/queue` start deciding their fate immediately, and re-arm the
+  // watch so a suppressed resume is still reissued even if this mount never sees
+  // another "ready" ack. Neither can fire the nudge early: the watch only sends
+  // once the specific runs are settled AND the bridge is connected.
+  adoptRebootRunsHere();
+  if (readRebootMarker()?.runs.length) armRebootWatch();
+
   function onExecuted(ev) {
     const d = ev?.detail ?? {};
     const out = d.output || {};
@@ -19398,6 +20114,10 @@ function buildPanel() {
     // this frame (sendFrame also returns false then) — onExecutionFailed already
     // marked it delivered, so leaving it there keeps the mute permanent (codex P1).
     if (!runErrorSent && !AGENT_MUTED) runCompletion.markUndelivered(d.prompt_id);
+    // #585: a live failure is also a terminal outcome the agent has been told
+    // about — retire it from the reboot marker so a reload can't re-adopt it and
+    // have /history deliver the same failure a second time.
+    pruneRebootMarker();
     // 2) Render it immediately as an error widget in the chat, so the user sees it
     //    even before the agent reacts (no waiting on a check-errors call).
     paintCard({
@@ -20245,6 +20965,10 @@ function buildPanel() {
     // Also cancel any pending tool-triggered reboot resume: an explicit Disconnect
     // during a reboot window must not be overridden by a surviving REBOOT_KEY.
     ssSet(REBOOT_KEY, null);
+    // …and stop the #585 watch, or it would keep re-evaluating a marker the user
+    // just revoked (and could still fire the resume after an explicit Disconnect).
+    stopRebootWatch();
+    forgetRebootResumeAttempt();
     client.stop();
     // client.stop() sets closed=true, so the socket onclose suppresses onStatus
     // — end the turn locally so the working indicator can't spin forever against
@@ -22094,6 +22818,11 @@ function buildPanel() {
       // reconcile await (codex P1 unmount-resurrection leak). Only null the shared
       // refs if they still point at THIS instance — a newer mount may already own them.
       runReconcileSweep.dispose();
+      // #585: the restart-resume watch drives client.sendUserMessage — a torn-down
+      // panel must not keep it alive. The marker itself SURVIVES on purpose: a
+      // remount re-reads it and re-arms the watch, so unmounting never loses the
+      // suppressed resume.
+      stopRebootWatch();
       if (armRunReconcileSweepRef === armRunReconcileSweep) armRunReconcileSweepRef = null;
       if (runCompletionRef === runCompletion) runCompletionRef = null;
       // Drop the Settings→panel hooks so the dialog can't drive a torn-down panel
