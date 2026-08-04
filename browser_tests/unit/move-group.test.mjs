@@ -27,6 +27,9 @@ import {
   samePoint,
   groupBoxIsAt,
   rerouteWriteIsSound,
+  describeItems,
+  describeThrown,
+  describeItem,
   syncNodeArea,
   refreshNodeArea,
 } from "../../web/js/lib/group-geometry.js";
@@ -69,6 +72,8 @@ function realMoveGroup(graph) {
     "moveReroutePoints",
     "rerouteWriteIsSound",
     "groupBoxIsAt",
+    "describeItems",
+    "describeThrown",
     `"use strict";
      ${resolveGroupSrc}
      ${setGroupBoundsSrc}
@@ -88,6 +93,8 @@ function realMoveGroup(graph) {
     moveReroutePoints,
     rerouteWriteIsSound,
     groupBoxIsAt,
+    describeItems,
+    describeThrown,
   );
 }
 
@@ -1127,7 +1134,240 @@ test("#408: a reroute whose move() is a THROWING getter is refused, not raised",
   assert.deepEqual([hostile.pos[0], hostile.pos[1]], [100, 100]);
 });
 
+// ---- roll back FIRST, format SECOND ----------------------------------------
+// Every one of these puts a THROWING `id`/`title`/`message` on an item that the
+// refusal path wants to NAME. Ids and titles exist only for display; nothing
+// about restoring geometry needs them, so a message assembled over a dirty graph
+// must never be what aborts the rollback.
+
+/** A node whose geometry is perfectly ordinary but whose `id` cannot be read. */
+function unnameableNode(pos, size, rect) {
+  return {
+    get id() { throw new TypeError("id is a revoked proxy"); },
+    pos: [...pos],
+    size: [...size],
+    boundingRect: [...rect],
+  };
+}
+
+test("#408 P0: a pre-flight refusal rolls back BEFORE naming the node that failed", () => {
+  // A writable stale node A, then a frozen node B whose `id` getter throws.
+  // Formatting B's name first would leave A's rect reconciled and emit a raw
+  // TypeError instead of the refusal this path promises.
+  const a = { id: 7, pos: [500, 500], size: [100, 100], boundingRect: [-9, -9, 1, 1] };
+  const b = {
+    get id() { throw new TypeError("id is a revoked proxy"); },
+    pos: [10, 10],
+    size: [100, 100],
+    boundingRect: Object.freeze([-9, -9, 1, 1]),
+  };
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [a, b], groups: [g] });
+
+  let err = null;
+  try {
+    realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
+  } catch (error) {
+    err = error;
+  }
+  assert.ok(err, "the move must be refused");
+  assert.match(err.message, /refusing to move group 1/, "a stated refusal, not a raw TypeError");
+  assert.match(err.message, /node unnamed/, "the unreadable id degrades to a placeholder");
+  assert.match(err.message, /NOTHING was moved/);
+  assert.deepEqual(
+    [...a.boundingRect],
+    [-9, -9, 1, 1],
+    "and the rect the pre-flight had reconciled is back — the claim has to be true",
+  );
+});
+
+test("#408 P0: the mutation-phase refusal rolls back BEFORE naming the stuck member", () => {
+  // This member's setter CLAMPS (so it lands elsewhere and counts as stuck) and
+  // its `id` throws. Building the name first left it displaced and threw raw.
+  const clamped = {
+    get id() { throw new TypeError("id is a revoked proxy"); },
+    _p: [50, 50],
+    size: [60, 40],
+    boundingRect: [50, 20, 60, 70],
+    get pos() { return [...this._p]; },
+    set pos(v) { this._p = [Math.min(Number(v[0]), 200), Math.min(Number(v[1]), 200)]; },
+  };
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [clamped], groups: [g] });
+
+  let err = null;
+  try {
+    realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
+  } catch (error) {
+    err = error;
+  }
+  assert.ok(err);
+  assert.match(err.message, /would not accept a new position \(node unnamed\)/);
+  assert.match(err.message, /NOTHING was moved/);
+  assert.deepEqual(clamped._p, [50, 50], "the clamped member is back where it started");
+  assert.deepEqual(g._bounding, [0, 0, 400, 400]);
+});
+
+test("#408 P0: an UNRESTORABLE item with an unreadable id is named after the rollback, not during it", () => {
+  // The rollback must deal in items, never in strings. This member accepts the
+  // forward move and refuses to go home, so it lands in the UNRESTORED list — and
+  // its `id` throws. Formatting names while walking the rollback would abort the
+  // rollback itself, halfway through putting the rest of the group back.
+  const oneWay = {
+    get id() { throw new TypeError("id is a revoked proxy"); },
+    _p: [50, 50],
+    size: [60, 40],
+    boundingRect: [50, 20, 60, 70],
+    get pos() { return [...this._p]; },
+    set pos(v) {
+      if (Number(v[0]) === 50 && Number(v[1]) === 50) return; // refuses to go home
+      this._p = [Number(v[0]), Number(v[1])];
+    },
+  };
+  // A frozen sibling forces the refusal AFTER oneWay has already moved.
+  const blocker = { id: 8, size: [60, 40], boundingRect: [150, 120, 60, 70], get pos() { return Object.freeze([150, 150]); } };
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [oneWay, blocker], groups: [g] });
+
+  let err = null;
+  try {
+    realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
+  } catch (error) {
+    err = error;
+  }
+  assert.ok(err);
+  assert.match(err.message, /PARTIALLY moved — 1 item\(s\) could NOT be put back \(node unnamed\)/);
+  assert.deepEqual(g._bounding, [0, 0, 400, 400], "and the box the rollback also had to restore is back");
+});
+
+test("#408 P0: the box-write refusal names nothing until the children are back", () => {
+  const unnameable = unnameableNode([50, 50], [60, 40], [50, 20, 60, 70]);
+  const g = { id: 1, get title() { throw new TypeError("title is a revoked proxy"); }, _bounding: Object.freeze([0, 0, 400, 400]) };
+  const graph = makeGraph({ nodes: [unnameable], groups: [g] });
+
+  let err = null;
+  try {
+    realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
+  } catch (error) {
+    err = error;
+  }
+  assert.ok(err);
+  assert.match(err.message, /the group box did not accept the new position/);
+  assert.deepEqual(unnameable.pos, [50, 50], "the member is back");
+});
+
+test("#408 P0 (the nastiest): a summary error whose OWN message throws still reports a COMPLETED move", () => {
+  // The error path of the error path. summarizeGroup raises because `title`
+  // throws; the resulting error's `message` getter throws too. Formatting the
+  // fallback used to raise from inside the catch, so the caller saw a raw failure
+  // for a move that COMPLETED — and re-issued it. That double move is precisely
+  // what summary_unavailable exists to prevent.
+  const hostileError = {
+    get message() { throw new TypeError("message is a revoked proxy"); },
+    get name() { throw new TypeError("name is a revoked proxy"); },
+    toString() { throw new TypeError("toString is a revoked proxy"); },
+    [Symbol.toPrimitive]() { throw new TypeError("coercion is a revoked proxy"); },
+  };
+  const a = node(7, [50, 50], [60, 40]);
+  let movedYet = false;
+  const g = {
+    id: 1,
+    _bounding: [0, 0, 400, 400],
+    recomputeInsideNodes() {},
+    get title() { if (movedYet) throw hostileError; return "G1"; },
+  };
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  let out;
+  assert.doesNotThrow(() => {
+    movedYet = true;
+    out = realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
+  }, "the completed move must not surface as a failure");
+
+  assert.deepEqual(a.pos, [1050, 1050], "the move really did complete");
+  assert.deepEqual(out.moved, { nodes: 1, groups: 0, reroutes: 0 }, "the caller still gets the counts");
+  assert.match(out.summary_unavailable, /move COMPLETED/);
+  assert.match(out.summary_unavailable, /do NOT re-issue the move/, "and the do-not-re-issue signal survives");
+  assert.match(out.summary_unavailable, /could not be read/, "with an honest stand-in for the unreadable cause");
+});
+
+test("#408 P0: a beforeChange that throws rolls back the pre-flight's writes", () => {
+  const a = { id: 7, pos: [500, 500], size: [100, 100], boundingRect: [-9, -9, 1, 1] };
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+  graph.beforeChange = () => { throw new TypeError("undo stack detached"); };
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /opening the undo transaction.*NOTHING was moved/s,
+  );
+  assert.deepEqual([...a.boundingRect], [-9, -9, 1, 1], "the reconciled rect is back");
+  assert.deepEqual(a.pos, [500, 500]);
+  assert.deepEqual(g._bounding, [0, 0, 400, 400]);
+});
+
+test("#408 P0: a node list that dies MID-WALK still yields a rollback, not a raw throw", () => {
+  // Containing per item is not enough while the TRAVERSAL can throw: the walk can
+  // die fetching the next entry after earlier rects are already reconciled, and a
+  // sync that threw there would never return the undo those writes need.
+  const a = { id: 7, pos: [500, 500], size: [100, 100], boundingRect: [-9, -9, 1, 1] };
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [], groups: [g] });
+  graph._nodes = {
+    [Symbol.iterator]() {
+      let i = 0;
+      return {
+        next() {
+          i += 1;
+          if (i === 1) return { value: a, done: false };
+          throw new TypeError("node list detached mid-walk");
+        },
+      };
+    },
+  };
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /could not be walked to the end.*NOTHING was moved/s,
+  );
+  assert.deepEqual(
+    [...a.boundingRect],
+    [-9, -9, 1, 1],
+    "the rect reconciled before the walk died is back",
+  );
+  assert.deepEqual(g._bounding, [0, 0, 400, 400]);
+});
+
 // ---- lib branches the handler tests above do not reach ---------------------
+
+test("describeItem / describeItems never throw, and degrade to a placeholder", () => {
+  assert.equal(describeItem("node", { id: 7 }), "node 7");
+  assert.equal(describeItem("node", {}), "node ?", "a missing id is not an error");
+  assert.equal(describeItem("node", null), "node ?");
+  assert.equal(describeItem("node", { get id() { throw new TypeError("gone"); } }), "node unnamed");
+  assert.equal(
+    describeItem("node", { id: { toString() { throw new TypeError("gone"); } } }),
+    "node unnamed",
+    "even the String() coercion is contained",
+  );
+
+  const many = Array.from({ length: 8 }, (_, i) => ["node", { id: i }]);
+  assert.equal(describeItems(many), "node 0, node 1, node 2, node 3, node 4, …");
+  assert.equal(describeItems([]), "");
+  assert.doesNotThrow(() => describeItems([["node", { get id() { throw new Error("x"); } }]]));
+});
+
+test("describeThrown survives an error whose message AND coercion both throw", () => {
+  assert.equal(describeThrown(new Error("plain")), "plain");
+  assert.equal(describeThrown("a string"), "a string");
+  assert.equal(describeThrown({ message: 42 }), "[object Object]", "a non-string message falls back to coercion");
+  const hostile = {
+    get message() { throw new TypeError("gone"); },
+    toString() { throw new TypeError("gone"); },
+    [Symbol.toPrimitive]() { throw new TypeError("gone"); },
+  };
+  assert.equal(describeThrown(hostile), "an error whose message could not be read");
+});
 
 test("writePoint reports the truth for every point shape", () => {
   const plain = { pos: [1, 2] };
@@ -1209,7 +1449,7 @@ test("the caught-throw net must never claim 'NOTHING was moved'", () => {
   // handed back its undo. A net that asserts a restoration it could not have made
   // is worse than no net, so the claim is pinned here at the source level.
   const netBlock = panelSrc.match(
-    /catch \(error\) \{\s*const unrestored = \[[\s\S]*?raised "\$\{error\?\.message \?\? error\}" partway through the move[\s\S]*?\);\s*\}/,
+    /catch \(error\) \{\s*const unrestored = \[[\s\S]*?partway through the move[\s\S]*?\);\s*\}/,
   );
   assert.ok(netBlock, "could not locate the mutation-phase catch in panel source");
   assert.doesNotMatch(

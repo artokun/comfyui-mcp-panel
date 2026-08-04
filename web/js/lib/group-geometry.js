@@ -103,6 +103,58 @@ export function boundsAroundNodes(nodes, pad = 30, titlePad = 70) {
   return [minX - pad, minY - titlePad, maxX - minX + pad * 2, maxY - minY + titlePad + pad];
 }
 
+/**
+ * Name an item for a HUMAN-READABLE message, and never throw doing it.
+ *
+ * `id` and `title` are the fields most likely to be exotic — proxies, getters,
+ * reactive stores — and they are needed only for display. Nothing about restoring
+ * geometry requires knowing what a node is called, so a message that cannot be
+ * assembled must degrade to a plainer one rather than raise over a graph the
+ * caller has just been told is intact. `String(x)` throws too (a throwing
+ * toString/Symbol.toPrimitive), so even the coercion is contained.
+ */
+export function describeItem(kind, item) {
+  let text = "?";
+  try {
+    const id = item?.id;
+    if (id != null) text = String(id);
+  } catch {
+    text = "unnamed";
+  }
+  return `${kind} ${text}`;
+}
+
+/** A comma-separated list of at most `max` item names, with an ellipsis when
+ *  truncated. Total, for the same reason describeItem is. */
+export function describeItems(pairs, max = 5) {
+  const names = [];
+  for (const [kind, item] of pairs.slice(0, max)) names.push(describeItem(kind, item));
+  return names.join(", ") + (pairs.length > max ? ", …" : "");
+}
+
+/**
+ * Render a thrown value as text without throwing again.
+ *
+ * The error path of the error path: a caught error may itself be an object whose
+ * `message` getter throws (a throwing `title` on a group is enough to produce
+ * one), and `String(error)` can throw for the same reason. If reading the cause
+ * can defeat the handler that exists to report it, the caller receives a raw
+ * failure for a move that COMPLETED — and re-issues it.
+ */
+export function describeThrown(error) {
+  try {
+    const message = error?.message;
+    if (typeof message === "string") return message;
+  } catch {
+    /* fall through to the coercion attempt */
+  }
+  try {
+    return String(error);
+  } catch {
+    return "an error whose message could not be read";
+  }
+}
+
 /** [x, y, w, h] as finite numbers, or null if any component is not one. */
 function finiteQuad(v) {
   const x = Number(v?.[0]), y = Number(v?.[1]), w = Number(v?.[2]), h = Number(v?.[3]);
@@ -321,22 +373,37 @@ export function syncNodeArea(node, forceCollapsed = false) {
  * it back — while telling the user NOTHING was moved. Moving a mutation earlier
  * does not stop it being a mutation: the pre-flight needs the same
  * contain-per-item-and-return-undo contract as the movers it precedes.
+ *
+ * `walkFailed` is that contract extended to the TRAVERSAL. Containing per item is
+ * not enough while iterating `_nodes` can itself throw — a getter or a proxy can
+ * die fetching the NEXT entry, after earlier rects have already been reconciled,
+ * and a function that threw at that point would never return the undo those
+ * writes need. The accumulator therefore lives outside the loop and the whole
+ * walk is contained, so the caller always gets something it can roll back with.
  */
 export function syncGraphNodeAreas(graph) {
   const unsynced = [];
   const attempted = [];
-  for (const n of graph?._nodes ?? []) {
-    let before = null;
-    try {
-      const br = n?.boundingRect;
-      if (br && br.length === 4) before = [br[0], br[1], br[2], br[3]];
-    } catch {
-      /* unreadable rect: syncNodeArea reports it below; nothing to capture */
+  let walkFailed = false;
+  try {
+    for (const n of graph?._nodes ?? []) {
+      let before = null;
+      try {
+        const br = n?.boundingRect;
+        if (br && br.length === 4) before = [br[0], br[1], br[2], br[3]];
+      } catch {
+        /* unreadable rect: syncNodeArea reports it below; nothing to capture */
+      }
+      if (before) attempted.push([n, before]);
+      if (!syncNodeArea(n)) unsynced.push(n);
     }
-    if (before) attempted.push([n, before]);
-    if (!syncNodeArea(n)) unsynced.push(n);
+  } catch {
+    // The traversal died. Whatever was reconciled before that point is still in
+    // `attempted`, so the undo below is complete for everything actually written.
+    walkFailed = true;
   }
   return {
+    walkFailed,
     unsynced,
     undo: () => {
       const failed = [];

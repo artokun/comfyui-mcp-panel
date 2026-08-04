@@ -225,6 +225,8 @@ import {
   moveReroutePoints,
   rerouteWriteIsSound,
   groupBoxIsAt,
+  describeItems,
+  describeThrown,
 } from "./lib/group-geometry.js";
 import {
   activeWorkflowPossiblyStale,
@@ -5770,7 +5772,7 @@ function describePreflightUndo(unrestored) {
   if (!unrestored.length) return "NOTHING was moved.";
   return (
     `No node was repositioned, but ${unrestored.length} cached rect(s) could NOT be put back ` +
-    `(${unrestored.slice(0, 5).map((n) => `node ${n.id}`).join(", ")}${unrestored.length > 5 ? ", …" : ""}) — ` +
+    `(${describeItems(unrestored.map((n) => ["node", n]))}) — ` +
     "re-read the graph with panel_query_graph before relying on group membership."
   );
 }
@@ -10132,10 +10134,19 @@ const GRAPH_TOOL_EXECUTORS = {
     // rect and then finding node B's rect unwritable used to leave A's cached
     // geometry changed with no undo, under a reply that said NOTHING was moved.
     const resync = syncGraphNodeAreas(graph);
-    if (resync.unsynced.length) {
-      const names = resync.unsynced.slice(0, 5).map((n) => `node ${n.id}`).join(", ");
+    if (resync.walkFailed || resync.unsynced.length) {
+      // ROLL BACK FIRST, FORMAT SECOND. Naming the offending nodes means reading
+      // `id` — a field that exists only for display and is exactly the kind of
+      // exotic accessor (proxy, getter, reactive store) that throws. Building that
+      // string before the undo would leave the reconciled rects in place and emit a
+      // raw exception instead of the refusal this path promises. Nothing about
+      // restoring geometry requires knowing what a node is called.
+      const unrestored = resync.undo();
+      const cause = resync.walkFailed
+        ? "the graph's node list could not be walked to the end, so group membership cannot be determined"
+        : `${resync.unsynced.length} node(s) have a cached bounding rect that cannot be updated (${describeItems(resync.unsynced.map((n) => ["node", n]))}), so their group membership cannot be determined`;
       throw new Error(
-        `refusing to move group ${group_id}: ${resync.unsynced.length} node(s) have a cached bounding rect that cannot be updated (${names}${resync.unsynced.length > 5 ? ", …" : ""}), so their group membership cannot be determined. ${describePreflightUndo(resync.undo())} Reload the ComfyUI tab (panel_reload) and retry.`,
+        `refusing to move group ${group_id}: ${cause}. ${describePreflightUndo(unrestored)} Reload the ComfyUI tab (panel_reload) and retry.`,
       );
     }
     // What the box encloses is captured against the PRE-move bounds — pure reads,
@@ -10162,8 +10173,9 @@ const GRAPH_TOOL_EXECUTORS = {
       // stated outcome. (Reachable only by an accessor that misbehaves
       // inconsistently between the resync and this pass; the individual readers
       // already return "unknown" rather than raising.)
-      throw new Error(
-        `refusing to move group ${group_id}: the frontend raised "${error?.message ?? error}" while reading what the group encloses, so its contents cannot be determined. ${describePreflightUndo(resync.undo())} Reload the ComfyUI tab (panel_reload) and retry.`,
+      const unrestored = resync.undo(); // rollback first…
+      throw new Error( // …then format, over a graph that is provably back
+        `refusing to move group ${group_id}: the frontend raised "${describeThrown(error)}" while reading what the group encloses, so its contents cannot be determined. ${describePreflightUndo(unrestored)} Reload the ComfyUI tab (panel_reload) and retry.`,
       );
     }
     // A reroute we cannot reposition SOUNDLY is decided here, by INSPECTION, and
@@ -10171,11 +10183,21 @@ const GRAPH_TOOL_EXECUTORS = {
     // also means this call leaves no empty undo step behind.
     const unsound = reroutes.filter((r) => !rerouteWriteIsSound(r));
     if (unsound.length) {
+      const unrestored = resync.undo();
       throw new Error(
-        `refusing to move group ${group_id}: ${unsound.length} enclosed reroute point(s) (${unsound.slice(0, 5).map((r) => `reroute ${r.id ?? "?"}`).join(", ")}${unsound.length > 5 ? ", …" : ""}) expose a move() whose meaning this frontend does not let us determine without calling it, and calling it could persist the wrong coordinate. ${describePreflightUndo(resync.undo())} Pass move_nodes:false to move only the box, or move the reroutes by hand.`,
+        `refusing to move group ${group_id}: ${unsound.length} enclosed reroute point(s) (${describeItems(unsound.map((r) => ["reroute", r]))}) expose a move() whose meaning this frontend does not let us determine without calling it, and calling it could persist the wrong coordinate. ${describePreflightUndo(unrestored)} Pass move_nodes:false to move only the box, or move the reroutes by hand.`,
       );
     }
-    graph.beforeChange();
+    // Opening the undo envelope is the first thing after the resync WRITE, so its
+    // failure owes the same rollback as any other refusal past that point.
+    try {
+      graph.beforeChange();
+    } catch (error) {
+      const unrestored = resync.undo();
+      throw new Error(
+        `refusing to move group ${group_id}: the frontend raised "${describeThrown(error)}" opening the undo transaction, so this move could not be made undoable. ${describePreflightUndo(unrestored)} Reload the ComfyUI tab (panel_reload) and retry.`,
+      );
+    }
     try {
       if (move_nodes !== false) {
         // Move the CHILDREN first and the box LAST, as one all-or-nothing
@@ -10213,7 +10235,7 @@ const GRAPH_TOOL_EXECUTORS = {
             ...(restoreBox() ? [g] : []),
           ];
           throw new Error(
-            `refusing to move group ${group_id}: the frontend raised "${error?.message ?? error}" partway through the move. ` +
+            `refusing to move group ${group_id}: the frontend raised "${describeThrown(error)}" partway through the move. ` +
               "The movers that had already completed were rolled back, but the one that raised never returned its undo, " +
               "so ITS OWN writes cannot be reversed from here: the state of this group is UNKNOWN and it may be PARTIALLY moved. " +
               (unrestored.length
@@ -10233,29 +10255,36 @@ const GRAPH_TOOL_EXECUTORS = {
         // unverified "nothing was moved". The parent box is restored too: it is
         // written last, but setGroupBounds writes x/y/w/h one at a time, so a clamp
         // or a mid-quad throw can leave it displaced.
+        // The rollback deals in ITEMS, never in strings. Formatting reaches for
+        // `id` — display-only, and exactly the accessor most likely to be a proxy
+        // or a throwing getter — so a name assembled while the graph is still
+        // dirty can abort the very rollback it is describing.
         const rollback = () => [
-          ...nestedMove.undo().map((c) => `group ${c.id ?? "?"}`),
-          ...rerouteMove.undo().map((r) => `reroute ${r.id ?? "?"}`),
-          ...memberMove.undo().map((n) => `node ${n.id}`),
-          ...(restoreBox() ? [`group ${group_id} (its own box)`] : []),
+          ...nestedMove.undo().map((c) => ["group", c]),
+          ...rerouteMove.undo().map((r) => ["reroute", r]),
+          ...memberMove.undo().map((n) => ["node", n]),
+          ...(restoreBox() ? [["group", g]] : []),
         ];
-        const refuse = (reason) => {
+        // `describeReason` is a THUNK: it is invoked only after the rollback has
+        // run and the graph is provably back. Roll back first, format second.
+        const refuse = (describeReason) => {
           const unrestored = rollback();
           throw new Error(
-            `refusing to move group ${group_id}: ${reason}. ` +
+            `refusing to move group ${group_id}: ${describeReason()}. ` +
               (unrestored.length
-                ? `The graph is PARTIALLY moved — ${unrestored.length} item(s) could NOT be put back (${unrestored.slice(0, 5).join(", ")}${unrestored.length > 5 ? ", …" : ""}). Press Ctrl+Z on the canvas, or reposition them with panel_edit_node.`
+                ? `The graph is PARTIALLY moved — ${unrestored.length} item(s) could NOT be put back (${describeItems(unrestored)}). Press Ctrl+Z on the canvas, or reposition them with panel_edit_node.`
                 : "NOTHING was moved."),
           );
         };
         const stuck = [
-          ...memberMove.stuck.map((n) => `node ${n.id}`),
-          ...rerouteMove.stuck.map((r) => `reroute ${r.id ?? "?"}`),
-          ...nestedMove.stuck.map((c) => `group ${c.id ?? "?"}`),
+          ...memberMove.stuck.map((n) => ["node", n]),
+          ...rerouteMove.stuck.map((r) => ["reroute", r]),
+          ...nestedMove.stuck.map((c) => ["group", c]),
         ];
         if (stuck.length) {
           refuse(
-            `${stuck.length} enclosed item(s) would not accept a new position (${stuck.slice(0, 5).join(", ")}${stuck.length > 5 ? ", …" : ""}) — move them out of the group (panel_edit_node) and retry, or pass move_nodes:false to move only the box`,
+            () =>
+              `${stuck.length} enclosed item(s) would not accept a new position (${describeItems(stuck)}) — move them out of the group (panel_edit_node) and retry, or pass move_nodes:false to move only the box`,
           );
         }
         // The box write is the LAST thing that can fail. Its failure has to put the
@@ -10263,7 +10292,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // otherwise.
         const boxError = writeBox(Number(pos[0]), Number(pos[1]));
         if (boxError) {
-          refuse(`the group box did not accept the new position on this frontend (${boxError.message})`);
+          refuse(() => `the group box did not accept the new position on this frontend (${describeThrown(boxError)})`);
         }
         movedNodes = memberMove.moved.length;
         movedGroups = nestedMove.moved.length;
@@ -10274,9 +10303,9 @@ const GRAPH_TOOL_EXECUTORS = {
         // "moved the box to [x, y]" for a box that never left.
         const boxError = writeBox(Number(pos[0]), Number(pos[1]));
         if (boxError) {
-          const restoreFailed = restoreBox();
-          throw new Error(
-            `refusing to move group ${group_id}: the group box did not accept the new position on this frontend (${boxError.message}). ` +
+          const restoreFailed = restoreBox(); // rollback first…
+          throw new Error( // …then format
+            `refusing to move group ${group_id}: the group box did not accept the new position on this frontend (${describeThrown(boxError)}). ` +
               (restoreFailed
                 ? `The box could NOT be put back at [${b[0]}, ${b[1]}] either — press Ctrl+Z on the canvas, or set it explicitly with panel_edit_group({bounds}).`
                 : "NOTHING was moved."),
@@ -10316,10 +10345,16 @@ const GRAPH_TOOL_EXECUTORS = {
     try {
       return { group: summarizeGroup(graph, g), moved };
     } catch (error) {
+      // The error path OF THE ERROR PATH. `error.message` can itself throw — a
+      // group with a throwing `title` produces exactly such an error — and a throw
+      // while FORMATTING this fallback would surface the completed move as a raw
+      // failure, so the caller re-issues it and the group moves twice. That double
+      // move is the whole reason summary_unavailable exists; describeThrown is
+      // total so the reason can never defeat the report.
       return {
         group_id,
         moved,
-        summary_unavailable: `the move COMPLETED, but the group could not be summarized afterwards: ${error?.message ?? error}. Re-read it with panel_query_graph — do NOT re-issue the move.`,
+        summary_unavailable: `the move COMPLETED, but the group could not be summarized afterwards: ${describeThrown(error)}. Re-read it with panel_query_graph — do NOT re-issue the move.`,
       };
     }
   },
