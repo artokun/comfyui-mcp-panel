@@ -275,6 +275,43 @@ test("a same-name required input whose TYPE changed mid-session is drift", () =>
   assert.deepEqual(driftedRequiredInputNames(currentDef, staleNode), ["mode", "style"]);
 });
 
+test("defaultInput renders a socket, and a widget<->defaultInput flip mid-session is drift", () => {
+  // defaultInput: the input is a socket BY DEFAULT (no widget materialized),
+  // convertible back by the user — the guards must not demand a widget.
+  const socketByDefault = {
+    constructor: {
+      nodeData: {
+        input: { required: { value: ["INT", { defaultInput: true }] } },
+      },
+    },
+  };
+  assert.deepEqual(requiredWidgetInputTypes(socketByDefault), []);
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(socketByDefault, { INT: () => {} }),
+    [],
+  );
+  assert.deepEqual(
+    missingRequiredWidgetMaterializations(
+      { ...socketByDefault, widgets: [] },
+      { INT: () => {} },
+    ),
+    [],
+  );
+  // Widget -> defaultInput socket: the fresh def wants a socket, the stale
+  // constructor would build a widget — drift must refuse with a reload remedy.
+  const widgetShape = {
+    constructor: {
+      nodeData: { input: { required: { value: ["INT", {}] } } },
+    },
+  };
+  const socketDef = { input: { required: { value: ["INT", { defaultInput: true }] } } };
+  assert.deepEqual(driftedRequiredInputNames(socketDef, widgetShape), ["value"]);
+  // defaultInput socket -> widget: the reverse flip is drift too (otherwise
+  // the stale socket-shaped node would be reported as missing a widget).
+  const widgetDef = { input: { required: { value: ["INT", {}] } } };
+  assert.deepEqual(driftedRequiredInputNames(widgetDef, socketByDefault), ["value"]);
+});
+
 test("raw /object_info snake_case force_input remains a wireable socket", () => {
   const node = {
     constructor: {

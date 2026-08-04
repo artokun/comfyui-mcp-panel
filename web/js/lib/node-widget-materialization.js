@@ -7,13 +7,15 @@
 function inputWidgetType(spec) {
   if (!Array.isArray(spec)) return null;
   const config = spec[1];
-  // A forced socket is intentionally not materialized as a widget even when
-  // its type also has a widget constructor. The raw /object_info config keeps
+  // A forced or default-rendered socket is intentionally not materialized as
+  // a widget even when its type also has a widget constructor: `forceInput` /
+  // `widget:false` are socket-only, and `defaultInput` renders the socket by
+  // default (convertible back by the user). The raw /object_info config keeps
   // the snake_case spelling; the normalized frontend nodeData uses camelCase.
   if (
     config &&
     typeof config === "object" &&
-    (config.forceInput || config.force_input || config.widget === false)
+    (config.forceInput || config.force_input || config.defaultInput || config.widget === false)
   ) {
     return null;
   }
@@ -114,9 +116,9 @@ export function registeredSocketTypes(objectInfoDefs) {
  * What about a required input declaration determines the SHAPE of the node
  * createNode builds: the widget/socket type (combo choices included — a
  * widget created from the old values list can hold a value the backend no
- * longer accepts) and the forceInput/widget:false flags that decide socket
- * vs widget. Benign config (default, min/max, tooltip) is deliberately not
- * compared: a stale default still serializes a valid value.
+ * longer accepts) and the forceInput/defaultInput/widget:false flags that
+ * decide socket vs widget. Benign config (default, min/max, tooltip) is
+ * deliberately not compared: a stale default still serializes a valid value.
  */
 function inputShapeSignature(spec) {
   if (!Array.isArray(spec)) return null;
@@ -131,7 +133,7 @@ function inputShapeSignature(spec) {
   const forced =
     config &&
     typeof config === "object" &&
-    (config.forceInput || config.force_input || config.widget === false);
+    (config.forceInput || config.force_input || config.defaultInput || config.widget === false);
   return forced ? `${type}|socket` : type;
 }
 
