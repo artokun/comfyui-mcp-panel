@@ -198,6 +198,7 @@ import { deferChangeTrackerSnapshot } from "./lib/change-tracker-snapshot.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
 import {
   missingRequiredWidgetMaterializations,
+  registeredSocketTypes,
   unavailableRequiredCustomWidgetTypes,
 } from "./lib/node-widget-materialization.js";
 import { sameGraphMutationContext } from "./lib/graph-mutation-context.js";
@@ -6475,27 +6476,15 @@ function placementFor(graph, pos) {
 const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = 5000;
 const CUSTOM_WIDGET_REGISTRATION_POLL_MS = 25;
 
-/** Datatypes some REGISTERED node declares as an OUTPUT are link sockets, not
- *  widgets pending registration — a widget constructor will never appear for
- *  them. Derived from the live registry so third-party socket types (#620
- *  STITCHER) and core types the allowlist missed (#608 VIDEO) resolve without
- *  an allowlist that can only ever be incomplete. */
-function registeredSocketTypes(LG) {
-  const types = new Set();
-  for (const ctor of Object.values(LG?.registered_node_types ?? {})) {
-    const outputs = ctor?.nodeData?.output;
-    if (!Array.isArray(outputs)) continue;
-    for (const out of outputs) {
-      if (typeof out === "string" && out) types.add(out);
-    }
-  }
-  return types;
-}
-
-async function awaitRequiredCustomWidgetRegistration(nodeData, comfyApp, LG) {
+async function awaitRequiredCustomWidgetRegistration(nodeData, comfyApp, LG, requiredInputNames) {
   const deadline = Date.now() + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
   const check = () =>
-    unavailableRequiredCustomWidgetTypes(nodeData, comfyApp?.widgets, registeredSocketTypes(LG));
+    unavailableRequiredCustomWidgetTypes(
+      nodeData,
+      comfyApp?.widgets,
+      registeredSocketTypes(LG?.registered_node_types),
+      requiredInputNames,
+    );
   let unavailable = check();
   while (Date.now() < deadline) {
     if (!unavailable.length) return;
@@ -7743,15 +7732,27 @@ const GRAPH_TOOL_EXECUTORS = {
     // this ONE call is refused with a retry-in-a-moment message — a late response still
     // seeds, so the next call succeeds without a reload.
     await awaitObjectInfoHistorySeed();
+    // Captured from the SAME fresh /object_info the resolvability assert just
+    // fetched, so the widget guards below can restrict themselves to the inputs
+    // the BACKEND actually requires (#620: the frontend-injected `upload` input
+    // on LoadImage & friends is never in this set and can never be a missing
+    // prompt value). `undefined` when the type is a frontend-only exemption
+    // (no backend def exists), which preserves the unfiltered guard.
+    let freshDefs = null;
     await assertAddNodeResolvableRefreshing(() => LG?.registered_node_types ?? {}, class_type, {
       getFreshObjectInfo: async () =>
-        recordObjectInfoTypes(
+        (freshDefs = recordObjectInfoTypes(
           typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null,
-        ),
+        )),
       refresh: (defs) => refreshComfyNodeDefs(defs),
       // #458 OBSERVED-BACKEND-HISTORY trust root, identical to graph_set_widget's.
       wasTypeEverDefined: (t) => objectInfoHistory.wasTypeEverDefined(t),
     });
+    const backendRequired = freshDefs?.[class_type]?.input?.required;
+    const backendRequiredNames =
+      backendRequired && typeof backendRequired === "object"
+        ? new Set(Object.keys(backendRequired))
+        : undefined;
     // registerNodesFromDefs can expose a newly installed V3 class before its
     // extension's asynchronous custom-widget registry settles. Resolve the
     // required constructors before creating anything, or fail retryably before
@@ -7760,6 +7761,7 @@ const GRAPH_TOOL_EXECUTORS = {
       LG?.registered_node_types?.[class_type]?.nodeData,
       comfyApp,
       LG,
+      backendRequiredNames,
     );
     const node = LG.createNode(class_type);
     if (!node) {
@@ -7767,7 +7769,11 @@ const GRAPH_TOOL_EXECUTORS = {
         `Unknown node type "${class_type}" — check the exact class_type via get_node_info`,
       );
     }
-    const missingWidgets = missingRequiredWidgetMaterializations(node, comfyApp?.widgets);
+    const missingWidgets = missingRequiredWidgetMaterializations(
+      node,
+      comfyApp?.widgets,
+      backendRequiredNames,
+    );
     if (missingWidgets.length) {
       throw new Error(
         `Required custom widget${missingWidgets.length === 1 ? "" : "s"} ` +

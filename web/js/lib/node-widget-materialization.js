@@ -28,11 +28,20 @@ function requiredInputs(nodeOrNodeData) {
  * The distinct required input types that are eligible to be frontend widgets.
  * `forceInput` / `widget:false` are sockets even if a custom widget constructor
  * happens to share their declared type.
+ *
+ * `requiredInputNames`, when a Set, restricts the scan to the inputs the
+ * BACKEND actually requires (fresh /object_info). Frontend-injected inputs
+ * (LoadImage's `upload` button, #620) are never in that set — the backend
+ * never asks for them, so they can never be a missing prompt value and must
+ * not be guarded.
  */
-export function requiredWidgetInputTypes(nodeOrNodeData) {
+export function requiredWidgetInputTypes(nodeOrNodeData, requiredInputNames) {
   const required = requiredInputs(nodeOrNodeData);
   if (!required) return [];
-  return [...new Set(Object.values(required).map(inputWidgetType).filter(Boolean))];
+  const entries = Object.entries(required).filter(
+    ([name]) => !(requiredInputNames instanceof Set) || requiredInputNames.has(name),
+  );
+  return [...new Set(entries.map(([, spec]) => inputWidgetType(spec)).filter(Boolean))];
 }
 
 // These are ComfyUI's built-in connection datatypes. A required input carrying
@@ -66,8 +75,9 @@ export function unavailableRequiredCustomWidgetTypes(
   nodeOrNodeData,
   widgetConstructors,
   knownSocketTypes,
+  requiredInputNames,
 ) {
-  return requiredWidgetInputTypes(nodeOrNodeData).filter(
+  return requiredWidgetInputTypes(nodeOrNodeData, requiredInputNames).filter(
     (type) =>
       typeof widgetConstructors?.[type] !== "function" &&
       !SAFE_SOCKET_TYPES.has(type) &&
@@ -76,33 +86,50 @@ export function unavailableRequiredCustomWidgetTypes(
 }
 
 /**
+ * Datatypes some REGISTERED node declares as an OUTPUT are link sockets, not
+ * widgets pending registration — a widget constructor will never appear for
+ * them. Derived from the live LiteGraph registry (`registered_node_types`) so
+ * third-party socket types (#620 STITCHER) and core types the allowlist
+ * missed (#608 VIDEO) resolve without an allowlist that can only ever be
+ * incomplete.
+ */
+export function registeredSocketTypes(registeredNodeTypes) {
+  const types = new Set();
+  for (const ctor of Object.values(registeredNodeTypes ?? {})) {
+    const outputs = ctor?.nodeData?.output;
+    if (!Array.isArray(outputs)) continue;
+    for (const out of outputs) {
+      if (typeof out === "string" && out) types.add(out);
+    }
+  }
+  return types;
+}
+
+/**
  * Return required inputs whose registered frontend widget did not materialize
  * on `node`.  A socket-only custom datatype is deliberately not reported: it
  * has no registered widget constructor and is valid to wire later.
  */
-export function missingRequiredWidgetMaterializations(node, widgetConstructors) {
+export function missingRequiredWidgetMaterializations(node, widgetConstructors, requiredInputNames) {
   const required = requiredInputs(node);
   if (!required) return [];
 
   const widgets = Array.isArray(node.widgets) ? node.widgets : [];
   const missing = [];
   for (const [name, spec] of Object.entries(required)) {
+    // Only inputs the BACKEND actually requires can fail prompt validation
+    // (#580). Frontend-injected inputs (LoadImage's `upload` button, #620 —
+    // created serialize:false/canvasOnly:true by ComfyUI's own
+    // Comfy.UploadImage extension) are never asked for by the backend, so
+    // they are skipped here instead of being misread as a missing value.
+    if (requiredInputNames instanceof Set && !requiredInputNames.has(name)) continue;
     const type = inputWidgetType(spec);
     if (!type || typeof widgetConstructors?.[type] !== "function") continue;
     const widget = widgets.find((candidate) => candidate?.name === name);
     // ComfyUI's prompt serializer reads the widget *options* flag. A widget
     // property named `serialize` is not authoritative and must not allow a
     // canvas-only control to satisfy a required prompt value.
-    //
-    // `options.canvasOnly` is the exception ComfyUI itself declares: the
-    // IMAGEUPLOAD button (frontend-injected `upload` input on LoadImage &
-    // friends) is created as
-    //   addWidget("button", name, "image", …, { serialize: false, canvasOnly: true })
-    // — a control PAIRED with a real value widget (`image`), never a prompt
-    // value of its own. Its presence proves the registered constructor ran,
-    // which is exactly what this guard asks (#620).
-    const canvasControl = widget?.options?.canvasOnly === true;
-    if (!widget || (widget.options?.serialize === false && !canvasControl)) missing.push(name);
+    if (!widget || widget.options?.serialize === false) missing.push(name);
   }
   return missing;
 }

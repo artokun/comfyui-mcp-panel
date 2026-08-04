@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   missingRequiredWidgetMaterializations,
+  registeredSocketTypes,
   requiredWidgetInputTypes,
   unavailableRequiredCustomWidgetTypes,
 } from "../../web/js/lib/node-widget-materialization.js";
@@ -146,27 +147,73 @@ test("native VIDEO socket resolves via registry proof (#608 SaveVideo)", () => {
   );
 });
 
-test("canvasOnly upload control counts as materialized while a plain serialize:false widget stays missing (#620 LoadImage)", () => {
+test("frontend-injected upload input is not guarded once the backend proves it never requires it (#620 LoadImage)", () => {
   const node = {
     widgets: [
       // ComfyUI's own IMAGEUPLOAD button: deliberately serialize:false,
       // canvasOnly:true — a canvas control paired with the real value widget.
       { name: "upload", options: { serialize: false, canvasOnly: true } },
-      { name: "gallery", options: { serialize: false } },
+      { name: "image" },
     ],
     constructor: {
       nodeData: {
         input: {
           required: {
+            image: [["a.png", "b.png"], {}],
             upload: ["IMAGEUPLOAD", {}],
-            gallery: ["ZIPN_STYLE_GALLERY", {}],
           },
         },
       },
     },
   };
+  // Live /object_info for LoadImage reports required = image only: `upload`
+  // is 100% frontend-injected, so it can never be a missing prompt value and
+  // neither guard may reject over it.
+  const backendRequired = new Set(["image"]);
   assert.deepEqual(
-    missingRequiredWidgetMaterializations(node, { ...widgetConstructors, IMAGEUPLOAD: () => {} }),
+    missingRequiredWidgetMaterializations(
+      node,
+      { COMBO: () => {}, IMAGEUPLOAD: () => {} },
+      backendRequired,
+    ),
+    [],
+  );
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(node, { COMBO: () => {} }, undefined, backendRequired),
+    [],
+  );
+});
+
+test("a canvasOnly serialize:false widget for a BACKEND-required input is still reported missing", () => {
+  // canvasOnly is a Vue-renderer display flag, not proof of non-prompt state;
+  // only the backend not requiring the input excuses a non-serializing widget.
+  const node = {
+    widgets: [{ name: "gallery", options: { serialize: false, canvasOnly: true } }],
+    constructor: {
+      nodeData: {
+        input: {
+          required: { gallery: ["ZIPN_STYLE_GALLERY", {}] },
+        },
+      },
+    },
+  };
+  assert.deepEqual(
+    missingRequiredWidgetMaterializations(node, widgetConstructors, new Set(["gallery"])),
     ["gallery"],
   );
+});
+
+test("registeredSocketTypes derives link datatypes from registered node outputs", () => {
+  const registry = {
+    InpaintCropImproved: { nodeData: { output: ["IMAGE", "MASK", "STITCHER"] } },
+    LoadVideo: { nodeData: { output: ["VIDEO", "AUDIO"] } },
+    Broken: { nodeData: { output: "NOT_AN_ARRAY" } },
+    Empty: {},
+  };
+  const types = registeredSocketTypes(registry);
+  assert.deepEqual(registeredSocketTypes(undefined), new Set());
+  assert.ok(types.has("STITCHER"));
+  assert.ok(types.has("VIDEO"));
+  assert.ok(types.has("MASK"));
+  assert.equal(types.size, 5);
 });
