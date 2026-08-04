@@ -3769,9 +3769,7 @@ async function reProbeManagerDialect({ signal } = {}) {
   invalidateManagerDialectCache();
   try {
     return await detectManagerDialect({
-      signal: signal
-        ? AbortSignal.any([AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS), signal])
-        : AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS),
+      signal: anyAbortSignal([AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS), signal]),
     });
   } catch {
     return null;
@@ -3783,6 +3781,27 @@ async function reProbeManagerDialect({ signal } = {}) {
  *  status, list are ALL bounded). */
 const MANAGER_FETCH_TIMEOUT_MS = 15000;
 
+/** AbortSignal.any with a two-listener fallback for runtimes that predate it
+ *  (baseline 2024-03). A re-probe must stay bounded on EVERY frontend the panel
+ *  can load on: calling a missing AbortSignal.any inside managerProbe would
+ *  throw a TypeError that the probe SWALLOWS, silently disabling the #605
+ *  self-heal (codex r5). The sources here are per-call timeout/budget signals,
+ *  so the once-listeners die with them. */
+function anyAbortSignal(signals) {
+  const list = signals.filter(Boolean);
+  if (typeof AbortSignal.any === "function") return AbortSignal.any(list);
+  const ctrl = new AbortController();
+  const fire = () => ctrl.abort();
+  for (const s of list) {
+    if (s.aborted) {
+      fire();
+      break;
+    }
+    s.addEventListener("abort", fire, { once: true });
+  }
+  return ctrl.signal;
+}
+
 /** Soft GET probe: parsed JSON, or null on any non-ok / 404 / throw / stall.
  *  Never throws — a probe must not blow up detection. Bounded by an AbortSignal
  *  so a hanging probe can't wedge dialect detection; an optional caller signal
@@ -3792,9 +3811,7 @@ async function managerProbe(route, { signal } = {}) {
   try {
     const res = await api.fetchApi(route, {
       method: "GET",
-      signal: signal
-        ? AbortSignal.any([AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS), signal])
-        : AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS),
+      signal: anyAbortSignal([AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS), signal]),
     });
     if (!res || !res.ok) return null;
     const txt = await res.text();

@@ -117,7 +117,7 @@ return { managerV2, managerCall };`,
 // Real-source harness: cache + detection + re-probe + managerGet
 // ---------------------------------------------------------------------------
 
-function buildDialectHarness({ fetchApi, managerCall, managerV2 }) {
+function buildDialectHarness({ fetchApi, managerCall, managerV2, AbortSignalImpl = AbortSignal }) {
   const src = readPanelSource();
   const factory = new Function(
     "api",
@@ -129,6 +129,7 @@ function buildDialectHarness({ fetchApi, managerCall, managerV2 }) {
     "AbortSignal",
     `let managerDialectCache = null;
 ${pick(src, /function looksLikeQueueStatus\(s\) \{[\s\S]*?\n\}/, "looksLikeQueueStatus")}
+${pick(src, /function anyAbortSignal\(signals\) \{[\s\S]*?\n\}/, "anyAbortSignal")}
 ${pick(src, /async function managerProbe\(route, \{ signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerProbe")}
 ${pick(src, /async function detectManagerDialect\(\{ signal \} = \{\}\) \{[\s\S]*?\n\}/, "detectManagerDialect")}
 ${pick(src, /function invalidateManagerDialectCache\(\) \{[\s\S]*?\n\}/, "invalidateManagerDialectCache")}
@@ -143,7 +144,7 @@ return { managerGet, getDialectCache: () => managerDialectCache };`,
     isManagerUnreachable,
     dialectRetryTarget,
     15000,
-    AbortSignal,
+    AbortSignalImpl,
   );
 }
 
@@ -329,6 +330,38 @@ test("#605 codex r4: an aborted legacy-UI sub-probe is never pinned as a 'v2' ve
     /aborted mid-probe/,
   );
   assert.equal(h.getDialectCache(), null, "no verdict from a partial reading");
+});
+
+test("#605 codex r5: the heal works on a runtime WITHOUT AbortSignal.any (fallback combiner)", async () => {
+  // A frontend with AbortSignal.timeout but no AbortSignal.any: a missing API
+  // here would be swallowed inside managerProbe and silently disable the heal —
+  // the exact #605 false "not reachable". The fallback combiner must keep the
+  // whole flow working (and bounded).
+  const NoAnyAbortSignal = {
+    timeout: (ms) => AbortSignal.timeout(ms),
+    // no .any
+  };
+  const modeRef = { mode: "legacy" };
+  const { fetchApi } = fakeBackend(modeRef);
+  const managerCall = async (route) => {
+    if (modeRef.mode !== "legacy") throw routeMissing();
+    return { servedBy: "legacy", route };
+  };
+  const managerV2 = async (route) => ({ servedBy: "v4", route });
+  const h = buildDialectHarness({
+    fetchApi,
+    managerCall,
+    managerV2,
+    AbortSignalImpl: NoAnyAbortSignal,
+  });
+
+  await h.managerGet("customnode/installed?mode=default"); // seeds "legacy"
+  assert.equal(h.getDialectCache(), "legacy");
+
+  modeRef.mode = "v4"; // the restart — stale cache, 3.x routes 404
+  const healed = await h.managerGet("customnode/installed?mode=default");
+  assert.equal(healed.servedBy, "v4", "the heal works without AbortSignal.any");
+  assert.equal(h.getDialectCache(), "v2");
 });
 
 test("#605 codex r3: the managerGet re-probe aborts with the CALLER's signal (waitForUpdateResult budget)", async () => {
