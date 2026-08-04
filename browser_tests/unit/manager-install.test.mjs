@@ -723,16 +723,25 @@ test("#485 nodes_install falls back to the legacy dialect on an unreachable sign
   const fnMatch = src.match(/async nodes_install\(args\)\s*\{[\s\S]*?\n {2}\},/);
   assert.ok(fnMatch, "could not locate nodes_install in panel source");
   const body = fnMatch[0];
-  // The submit is attempted, and on an unreachable error from a non-legacy
-  // dialect, retried as legacy (mirrors nodes_list's absolute fallback).
+  // The submit is attempted, and on an unreachable error the dialect is re-probed
+  // (#605) and the retry picked by the dialectRetryTarget ladder — which still
+  // lands on the absolute legacy routes when the re-probe agrees or the Manager
+  // is silent (the #485 fallback), and gives up (null → original error) when a
+  // legacy submit itself was rejected.
   assert.match(body, /let dialect = detected;/);
   assert.match(body, /submitInstall\(dialect\)/);
-  assert.match(body, /submitInstall\("legacy"\)/);
   assert.match(
     body,
-    /dialect === "legacy" \|\| !isManagerUnreachable\(err\)/,
-    "must rethrow when already legacy or the error is not an unreachable signal",
+    /if \(!isManagerUnreachable\(err\)\) throw err;/,
+    "only an unreachable signal triggers the re-probe/retry",
   );
+  assert.match(
+    body,
+    /dialectRetryTarget\(dialect, await reProbeManagerDialect\(\)\)/,
+    "the retry dialect comes from a live re-probe via the ladder",
+  );
+  assert.match(body, /if \(!retry\) throw err;/, "legacy-on-legacy gives up with the original error");
+  assert.match(body, /submitted = await submitInstall\(retry\)/);
   // The single queue/start MUST live OUTSIDE the try/catch (after it) so a start
   // failure never re-runs the submit (codex P0 — no double-fire).
   const catchIdx = body.indexOf("catch (err)");

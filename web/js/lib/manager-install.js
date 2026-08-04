@@ -406,6 +406,29 @@ export function legacyUpdateBody({ ui_id, id, version } = {}) {
 }
 
 /**
+ * #605 — after a dialect-routed call failed "unreachable" (a route-level
+ * rejection: no handler ran, so re-issuing it cannot double-execute anything),
+ * which dialect should the retry speak? `failed` is the dialect that just
+ * 404'd; `fresh` is the result of re-probing the LIVE backend (null = the
+ * Manager currently answers no dialect at all — mid-restart or disabled).
+ *
+ *   - A fresh verdict that DIFFERS from the failed one wins: the cached dialect
+ *     outlived a backend restart that swapped Manager generations (the #605
+ *     report — a stale "legacy" cache aiming at routes a v4 backend no longer
+ *     serves), and the live probe is the ground truth.
+ *   - Otherwise (the re-probe agrees, or the Manager answers nothing right now)
+ *     the legacy absolute routes remain the last resort for a non-legacy
+ *     dialect (#485 — a hybrid build can answer the /v2 probe yet not register
+ *     the /v2 data/mutation routes).
+ *   - A legacy-on-legacy failure has no fallback left: return null so the
+ *     caller surfaces its ORIGINAL error, which carries the real context.
+ */
+export function dialectRetryTarget(failed, fresh) {
+  if (fresh && fresh !== failed) return fresh;
+  return failed === "legacy" ? null : "legacy";
+}
+
+/**
  * Normalize a ComfyUI-Manager `/customnode/getmappings` payload into the
  * nodes_search result shape `{ count, results:[{id,title,description}] }`,
  * filtered by `query` and capped at `limit` (default 15, max 40). Pure so the

@@ -71,6 +71,7 @@ import {
   classifyInstallOutcome,
   classifyUpdateOutcome,
   collectRecentTaskFailures,
+  dialectRetryTarget,
   installGitUrl,
   installedListRoute,
   isManagerUnreachable,
@@ -683,6 +684,11 @@ function setupListeners() {
       // new window (codex P1); only an open/new AFTER this reconnect will.
       backendReconnectEpoch += 1;
       backendReconnectedAt = monotonicNow();
+      // #605: this reconnect can be a backend RESTART that swapped the Manager
+      // generation (3.x ↔ pip v4) under the live tab — the cached dialect then
+      // describes a server that is gone. Drop it so the next Manager call
+      // re-probes the backend that is actually answering now.
+      invalidateManagerDialectCache();
       void refreshComfyNodeDefs();
     });
   } catch {
@@ -3720,6 +3726,32 @@ async function managerCall(route, { method = "GET", body, signal } = {}) {
 //              routes /manager/queue/{install,update,start,status,...}.
 let managerDialectCache = null;
 
+/** #605 — the dialect cache is a per-tab HYPOTHESIS about which Manager
+ *  generation the connected backend runs. A ComfyUI restart can swap Manager
+ *  3.x ↔ pip v4 under a live tab (the #605 report), and the stale cache then
+ *  routes every Manager call at routes the new backend does not serve. Dropped
+ *  on the two signals that falsify the hypothesis: the backend socket
+ *  re-establishing (setupListeners' "reconnected") and an "unreachable" verdict
+ *  from a dialect-routed call (reProbeManagerDialect below). */
+function invalidateManagerDialectCache() {
+  managerDialectCache = null;
+}
+
+/** #605 — drop the cached dialect and re-probe the LIVE backend once. Returns
+ *  the fresh dialect, or null when the Manager currently answers no dialect at
+ *  all (mid-restart / disabled) — the caller then surfaces its ORIGINAL error,
+ *  which carries the operation's real context. A failed re-probe leaves the
+ *  cache EMPTY (never the stale value), so the next call probes again instead
+ *  of wedging on a verdict from a server that is gone. */
+async function reProbeManagerDialect() {
+  invalidateManagerDialectCache();
+  try {
+    return await detectManagerDialect();
+  } catch {
+    return null;
+  }
+}
+
 /** Every Manager HTTP call is bounded by this timeout so a stalled request can
  *  never hang the install path (codex round 2 #5 — probes, install, start,
  *  status, list are ALL bounded). */
@@ -3778,11 +3810,32 @@ async function detectManagerDialect() {
 }
 
 /** GET the queue status / installed / getmappings surface for the detected
- *  dialect. Legacy has NO /v2 prefix; both pip modes serve /v2. */
+ *  dialect. Legacy has NO /v2 prefix; both pip modes serve /v2.
+ *
+ *  #605 self-heal: an "unreachable" verdict from the dialect-routed route can
+ *  mean the CACHED dialect outlived a backend restart that swapped Manager
+ *  generations — the routes it routes to no longer exist. That is a route-level
+ *  rejection (a GET ran no mutation), so invalidate + re-probe ONCE and retry
+ *  on the dialect the ladder picks: the fresh verdict when it changed, else the
+ *  legacy absolute last resort (#423 — a hybrid build can answer the /v2 probe
+ *  yet not register the /v2 data GETs). A legacy-on-legacy failure has no
+ *  fallback left and rethrows the ORIGINAL error, so the callers' own
+ *  unreachable fallbacks (#426 /object_info search) still fire exactly as
+ *  before. */
 async function managerGet(route, { signal } = {}) {
   const dialect = await detectManagerDialect();
   const opts = signal ? { signal } : {};
-  return dialect === "legacy" ? managerCall(route, opts) : managerV2(route, opts);
+  try {
+    return dialect === "legacy" ? await managerCall(route, opts) : await managerV2(route, opts);
+  } catch (err) {
+    if (!isManagerUnreachable(err)) throw err;
+    const fresh = await reProbeManagerDialect();
+    const retry = dialectRetryTarget(dialect, fresh);
+    // A same-dialect re-probe means the route genuinely does not serve — the
+    // retry would repeat the exact call that just failed, so don't.
+    if (!retry || retry === dialect) throw err;
+    return retry === "legacy" ? managerCall(route, opts) : managerV2(route, opts);
+  }
 }
 
 /** #426 — fetch the connected ComfyUI's full `/object_info` map (node CLASS →
@@ -10479,7 +10532,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // routed /v2/customnode/installed 404s ("not reachable") while the absolute
     // /customnode/installed serves fine. On that unreachable signal, fall back
     // to the absolute (no-/v2) legacy list route instead of surfacing a generic
-    // "unreachable" error.
+    // "unreachable" error. managerGet already self-heals a stale dialect and
+    // retries legacy internally (#605); this catch is the last-resort layer for
+    // when BOTH routed attempts reported unreachable.
     const route = installedListRoute();
     // #332 — immediately after panel_restart_comfyui, a Manager fetch throws a
     // bare transport error ("Failed to fetch") before any HTTP status exists, so
@@ -10547,14 +10602,26 @@ const GRAPH_TOOL_EXECUTORS = {
     // non-legacy dialect, retry the SUBMIT via the legacy dialect before
     // surfacing the error. The fallback wraps ONLY the enqueue: if the submit
     // already succeeded, a later queue/start failure must NOT re-submit.
+    //
+    // #605: the unreachable verdict can ALSO mean the CACHED dialect outlived a
+    // backend restart that swapped Manager generations (a stale "legacy" cache
+    // aims the submit at /manager/queue/install, which a restarted v4 backend
+    // does not serve — and the old legacy-only fallback then threw a false
+    // "not reachable"). A 404 is a route-level rejection — no handler ran,
+    // NOTHING was enqueued — so re-submitting on the re-probed live dialect
+    // cannot double-fire the install. Re-probe ONCE; dialectRetryTarget picks
+    // the retry: the fresh verdict when it changed, else the #485 legacy last
+    // resort (null when nothing is left — the original error then surfaces).
     let dialect = detected;
     let submitted;
     try {
       submitted = await submitInstall(dialect);
     } catch (err) {
-      if (dialect === "legacy" || !isManagerUnreachable(err)) throw err;
-      dialect = "legacy";
-      submitted = await submitInstall("legacy");
+      if (!isManagerUnreachable(err)) throw err;
+      const retry = dialectRetryTarget(dialect, await reProbeManagerDialect());
+      if (!retry) throw err;
+      dialect = retry;
+      submitted = await submitInstall(retry);
     }
     // The submission landed. NOW start the queue on the SAME (possibly
     // fallen-back) dialect. queue/start goes through managerQueueControl so a
@@ -10601,7 +10668,7 @@ const GRAPH_TOOL_EXECUTORS = {
   async graph_update_node({ id, version, channel, mode }) {
     if (!id) throw new Error("id (installed pack name/dir or registry id) is required");
     const sel = version === "nightly" ? "nightly" : "latest";
-    const dialect = await detectManagerDialect();
+    let dialect = await detectManagerDialect();
     const ui_id = crypto.randomUUID();
     const client_id = api.clientId ?? api.initialClientId ?? "comfyui-mcp-panel";
     // #424: the absolute (no-/v2) legacy self-update route. Updating the
@@ -10610,9 +10677,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // frontend catchall. The released-3.x `/manager/queue/update` handler keys
     // the update off `id` (unified_update) and DOES update the Manager itself,
     // so we retry it whenever the /v2 envelope is method-rejected.
+    // `legacyEnqueued` marks the update POST having LANDED so the #605 heal
+    // below never re-fires it on a later start failure (same submit/start
+    // split as nodes_install — codex P0, no double-fire).
+    let legacyEnqueued = false;
     const legacyUpdate = async () => {
       const body = legacyUpdateBody({ ui_id, id, version });
       await managerCall("manager/queue/update", { method: "POST", body });
+      legacyEnqueued = true;
       await managerCall("manager/queue/start", { method: "POST" });
     };
     // #364: after the task is queued+started, VERIFY its terminal per-task status
@@ -10663,49 +10735,93 @@ const GRAPH_TOOL_EXECUTORS = {
       }
       return { ...base, updated: false, verified: false, pending: true, note: outcome.message };
     };
-    if (dialect === "v2") {
-      const params = {
-        // The Manager's update task keys off node_name; include id too for
-        // correlation parity with install (harmless if the server ignores it).
-        node_name: id,
-        id,
-        selected_version: sel,
-        version: sel,
-        mode: mode || "remote",
-        channel: channel || "default",
-      };
-      try {
-        await managerV2("manager/queue/task", {
-          method: "POST",
-          body: { kind: "update", params, ui_id, client_id },
-        });
-        await managerV2("manager/queue/start", { method: "POST" });
-      } catch (err) {
-        if (!isMethodNotAllowed(err)) throw err;
-        await legacyUpdate();
-        return finalizeUpdate("legacy-self-update");
+    // #605: an "unreachable" verdict from the dialect-routed ENQUEUE can mean the
+    // cached dialect outlived a backend restart that swapped Manager generations
+    // under this live tab (a stale "legacy" cache aims the update at
+    // /manager/queue/update, which a restarted v4 backend does not serve — and
+    // without a heal here that throws a false "not reachable" forever). A 404 is
+    // a route-level rejection — no handler ran, NOTHING was queued — so
+    // re-probing ONCE and re-sending the enqueue on the live dialect cannot
+    // double-fire the update. ONLY the enqueue is retried: once the task POST
+    // has landed (`enqueued`), any later failure surfaces as-is, the same
+    // submit/start split nodes_install keeps. dialectRetries caps the ladder so
+    // a flapping backend mid-restart cannot loop it.
+    let dialectRetries = 0;
+    for (;;) {
+      if (dialect === "v2") {
+        const params = {
+          // The Manager's update task keys off node_name; include id too for
+          // correlation parity with install (harmless if the server ignores it).
+          node_name: id,
+          id,
+          selected_version: sel,
+          version: sel,
+          mode: mode || "remote",
+          channel: channel || "default",
+        };
+        let enqueued = false;
+        try {
+          await managerV2("manager/queue/task", {
+            method: "POST",
+            body: { kind: "update", params, ui_id, client_id },
+          });
+          enqueued = true;
+          await managerV2("manager/queue/start", { method: "POST" });
+        } catch (err) {
+          // The 405 legacy self-update fallback wraps ONLY the enqueue: once the
+          // task POST landed, a legacyUpdate would queue a SECOND update.
+          if (!enqueued && isMethodNotAllowed(err)) {
+            await legacyUpdate();
+            return finalizeUpdate("legacy-self-update");
+          }
+          if (enqueued || !isManagerUnreachable(err)) throw err;
+          const retry = dialectRetryTarget(dialect, await reProbeManagerDialect());
+          if (!retry || dialectRetries >= 2) throw err;
+          dialectRetries += 1;
+          dialect = retry;
+          continue;
+        }
+        return finalizeUpdate();
+      }
+      // v2-batch + legacy: 3.x update body {ui_id, id, version} (issues #187/#182).
+      const body = { ui_id, id, version: sel };
+      if (dialect === "v2-batch") {
+        let enqueued = false;
+        try {
+          const res = await managerV2("manager/queue/batch", {
+            method: "POST",
+            body: { update: [body] },
+          });
+          enqueued = true;
+          assertBatchOk(res, id, "update");
+          await managerV2("manager/queue/start", { method: "POST" });
+        } catch (err) {
+          // The 405 legacy self-update fallback wraps ONLY the enqueue (as above).
+          if (!enqueued && isMethodNotAllowed(err)) {
+            await legacyUpdate();
+            return finalizeUpdate("legacy-self-update");
+          }
+          if (enqueued || !isManagerUnreachable(err)) throw err;
+          const retry = dialectRetryTarget(dialect, await reProbeManagerDialect());
+          if (!retry || dialectRetries >= 2) throw err;
+          dialectRetries += 1;
+          dialect = retry;
+          continue;
+        }
+      } else {
+        try {
+          await legacyUpdate();
+        } catch (err) {
+          if (legacyEnqueued || !isManagerUnreachable(err)) throw err;
+          const retry = dialectRetryTarget(dialect, await reProbeManagerDialect());
+          if (!retry || dialectRetries >= 2) throw err;
+          dialectRetries += 1;
+          dialect = retry;
+          continue;
+        }
       }
       return finalizeUpdate();
     }
-    // v2-batch + legacy: 3.x update body {ui_id, id, version} (issues #187/#182).
-    const body = { ui_id, id, version: sel };
-    if (dialect === "v2-batch") {
-      try {
-        const res = await managerV2("manager/queue/batch", {
-          method: "POST",
-          body: { update: [body] },
-        });
-        assertBatchOk(res, id, "update");
-        await managerV2("manager/queue/start", { method: "POST" });
-      } catch (err) {
-        if (!isMethodNotAllowed(err)) throw err;
-        await legacyUpdate();
-        return finalizeUpdate("legacy-self-update");
-      }
-    } else {
-      await legacyUpdate();
-    }
-    return finalizeUpdate();
   },
 
   async nodes_queue_status() {
