@@ -506,6 +506,36 @@ test("#408: a snapping reroute is also restored exactly, not left where the engi
   assert.deepEqual(snapping._p, [100, 100], "restored to its original point, not to old+(-delta)");
 });
 
+test("#408: a node whose pos SETTER carries side effects has that setter run", () => {
+  // Current ComfyUI defines LGraphNode.pos as an accessor on the PROTOTYPE whose
+  // setter also commits the move to the frontend's layout store. Poking the
+  // underlying array directly would move the canvas and leave that store holding
+  // the old coordinates — a success report over a half-applied move.
+  const layoutStore = [];
+  const proto = {
+    get pos() { return this._geometry; },
+    set pos(v) {
+      this._geometry[0] = Number(v[0]);
+      this._geometry[1] = Number(v[1]);
+      layoutStore.push([Number(v[0]), Number(v[1])]);
+    },
+  };
+  const a = Object.assign(Object.create(proto), {
+    id: 7,
+    size: [100, 100],
+    boundingRect: [50, 20, 100, 130],
+    _geometry: new Float64Array([50, 50]),
+  });
+  const container = a.pos;
+  const graph = makeGraph({ nodes: [a], groups: [group(1, [0, 0, 200, 200])] });
+
+  const out = realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
+
+  assert.deepEqual(layoutStore, [[1050, 1050]], "the setter must have run exactly once, with the new position");
+  assert.equal(a.pos, container, "and it must not have replaced the geometry container");
+  assert.equal(out.moved.nodes, 1);
+});
+
 test("#408: a node whose pos is a plain PROPERTY holding a typed-array view keeps that view", () => {
   // The view is the node's live geometry container. Replacing it with a fresh
   // plain array would leave the node at the right coordinates while silently

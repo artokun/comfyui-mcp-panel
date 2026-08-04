@@ -320,13 +320,20 @@ export function groupBoxIsAt(g, x, y, w, h) {
  *     silently dropped, or a getter with NO setter, where assignment throws in a
  *     strict-mode ES module.
  *
- * IN-PLACE FIRST, then assignment. Order matters: when `pos` is a plain writable
- * property holding a typed-array VIEW into the node's bounding rect, assigning a
- * fresh plain array REPLACES the view — the node keeps the right coordinates but
- * silently loses its aliasing to the rect, and every later write through that
- * view (LiteGraph's own drag path, the layout store) stops reaching it. Mutating
- * the two slots keeps the container the engine handed us. Assignment stays as the
- * fallback for a getter that returns a COPY, where an in-place write is dropped.
+ * WHICH WRITE GOES FIRST DEPENDS ON THE PROPERTY, and both orders are wrong for
+ * the other kind:
+ *   - An ACCESSOR with a setter (current ComfyUI's LGraphNode.pos) must be
+ *     ASSIGNED. Its setter does more than store two numbers — it commits the move
+ *     to the frontend's layout store — and a setter writes into the array it
+ *     already owns, so assignment does not replace anything. Poking the array
+ *     directly moves the canvas while the layout store keeps the old coordinates.
+ *   - A plain DATA property holding a typed-array VIEW (into the node's bounding
+ *     rect) must be written IN PLACE. Assigning a fresh array there replaces the
+ *     view: right coordinates, silently severed aliasing, and every later write
+ *     through that view stops reaching the node.
+ * So the property is inspected once and the write that respects it goes first;
+ * the other stays as a fallback (a getter that returns a COPY drops an in-place
+ * write; a getter with no setter throws on assignment in a strict-mode module).
  *
  * Returning the verdict is the point — the caller must never report a move it did
  * not make.
@@ -337,22 +344,39 @@ export function writePoint(owner, key, x, y) {
     const f32 = isFloat32(point);
     return samePoint(Number(point?.[0]), x, f32) && samePoint(Number(point?.[1]), y, f32);
   };
-  const point = owner?.[key];
-  if (point && point.length >= 2) {
+  const assign = () => {
+    try {
+      owner[key] = [x, y];
+    } catch {
+      /* accessor with no setter — strict-mode assignment throws */
+    }
+  };
+  const inPlace = () => {
+    const point = owner?.[key];
+    if (!point || point.length < 2) return;
     try {
       point[0] = x;
       point[1] = y;
     } catch {
-      /* frozen/read-only point — the assignment below is the remaining hope */
+      /* frozen/read-only point */
     }
-    if (landed()) return true;
-  }
-  try {
-    owner[key] = [x, y];
-  } catch {
-    /* accessor with no setter — strict-mode assignment throws; reported below */
-  }
+  };
+  const [first, second] = hasSetter(owner, key) ? [assign, inPlace] : [inPlace, assign];
+  first();
+  if (landed()) return true;
+  second();
   return landed();
+}
+
+/** Does writing `owner[key]` run a SETTER (rather than replacing a data
+ *  property)? Walks the prototype chain, because LiteGraph defines its geometry
+ *  accessors on the class prototype, not on each instance. */
+function hasSetter(owner, key) {
+  for (let o = owner; o != null; o = Object.getPrototypeOf(o)) {
+    const d = Object.getOwnPropertyDescriptor(o, key);
+    if (d) return typeof d.set === "function";
+  }
+  return false;
 }
 
 /**
