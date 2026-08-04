@@ -157,6 +157,17 @@ import {
   fitDetailLine,
   isLineProtected,
   truncationTail,
+  // #809: remedy plumbing — every truncation must name the lever that applies.
+  clipCompactValue,
+  compactClipNote,
+  LIMIT_CEILING,
+  MAX_CHARS_CEILING,
+  OUTLINE_DETAIL_LEVELS,
+  clampOutlineMaxChars,
+  outlineDegradeBanner,
+  outlineFloorRefusal,
+  outlineValueClipNote,
+  clipOutlineTitle,
 } from "./lib/graph-read.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
 import { safeRemoveNode } from "./lib/safe-remove-node.js";
@@ -4248,6 +4259,32 @@ function getWorkflowTitle() {
 
 const MAX_STATE_NODES = 100;
 
+// #809 (codex gate): `groups` (and `rails`) ride ALONGSIDE the bounded `text` and are not
+// counted against `max_chars` — that accounting is artokun/comfyui-mcp#807. Until it
+// lands they must at least be BOUNDED, or a heavily-grouped graph makes the reply exceed
+// the budget the tool advertises no matter what the caller sets. Both cuts are marked
+// in-band, because a silently short list reads as the whole list.
+const GROUPS_RIDER_CAP = 200;
+const GROUP_NODE_IDS_CAP = 200;
+
+/**
+ * #809: the MAX_STATE_NODES views used to report only `truncated: true`. A boolean is
+ * the WORST truncation signal there is — it is a field, not prose, so a model reading
+ * the result gets no instruction from it at all, concludes the TOOL cannot do the thing,
+ * and escalates to the human.
+ *
+ * This cap is deliberately FIXED (no parameter raises it), so the honest remedy is to
+ * say exactly that and name the tool that CAN target the rest. Inventing a lever these
+ * views do not have would be the same defect pointing the other way.
+ */
+function fixedCapNote(what, shown, total, targeted) {
+  const of = Number.isFinite(total) ? `${shown} of ${total}` : `${shown}`;
+  return (
+    `Showing ${of} ${what} — this view has a FIXED cap of ${MAX_STATE_NODES} and no parameter raises it. ` +
+    targeted
+  );
+}
+
 function getGraphCtx() {
   // app.canvas.graph is the graph the user is LOOKING at — the root graph or an
   // opened subgraph — so reads and edits target what's on screen. But after a
@@ -6224,13 +6261,28 @@ function describePreflightUndo(unrestored) {
 function summarizeGroup(graph, g) {
   const b = g._bounding ?? [g.pos?.[0] ?? 0, g.pos?.[1] ?? 0, g.size?.[0] ?? 0, g.size?.[1] ?? 0];
   const memberIds = groupMemberNodes(graph, g).map((n) => n.id);
+  // #809 (codex gate): a group TITLE is user-controlled and `node_ids` grows with the
+  // graph, so this summary could be arbitrarily large — and it rides outside the
+  // `max_chars` accounting (#807). Bound both, and MARK each cut: `node_count` is always
+  // the true total, so a clipped `node_ids` can never be read as the whole membership.
+  const clippedTitle = clipOutlineTitle(g.title);
+  const idsFit = memberIds.length <= GROUP_NODE_IDS_CAP;
   return {
     id: g.id != null ? g.id : (graph._groups ?? []).indexOf(g),
-    title: g.title ?? "",
+    title: clippedTitle.text,
+    ...(clippedTitle.clipped ? { title_clipped: true } : {}),
     color: g.color ?? null,
     bounding: [Math.round(b[0]), Math.round(b[1]), Math.round(b[2]), Math.round(b[3])],
     node_count: memberIds.length,
-    node_ids: memberIds,
+    node_ids: idsFit ? memberIds : memberIds.slice(0, GROUP_NODE_IDS_CAP),
+    ...(idsFit
+      ? {}
+      : {
+          // NOT "panel_graph_outline lists every member" flatly (codex gate): its own
+          // budget can degrade it to the group-SUMMARY rung, which emits counts and no
+          // ids at all — and a big group is exactly when that happens. Name the condition.
+          node_ids_truncated: `Showing ${GROUP_NODE_IDS_CAP} of ${memberIds.length} member id(s) — a fixed cap that no parameter raises. panel_graph_outline's GROUPS index lists every member id, but only while its own max_chars affords a node-level rung; if it reports detail_level:"groups" it shows counts, not ids, so raise its max_chars.`,
+        }),
   };
 }
 
@@ -6481,7 +6533,17 @@ const GRAPH_TOOL_EXECUTORS = {
       selected_count: picked.length,
       node_count: graph._nodes?.length ?? 0,
       nodes: picked.slice(0, MAX_STATE_NODES).map(summarizeNode),
-      ...(picked.length > MAX_STATE_NODES ? { truncated: true } : {}),
+      ...(picked.length > MAX_STATE_NODES
+        ? {
+            truncated: true,
+            truncation_hint: fixedCapNote(
+              "selected node(s)",
+              MAX_STATE_NODES,
+              picked.length,
+              "Ask the user to select fewer nodes, or read the ones you need by id with panel_query_graph {ids:[…], fields:'detail'}, which DOES take limit and max_chars.",
+            ),
+          }
+        : {}),
       // Groups/reroutes can be selected too — report them so "nothing selected"
       // is never misreported when the user actually has a group highlighted.
       ...(others.length ? { other_selected_items: others } : {}),
@@ -6556,6 +6618,16 @@ const GRAPH_TOOL_EXECUTORS = {
       node_count: all.length,
       in_view_count: visible.length,
       truncated: visible.length > MAX_STATE_NODES,
+      ...(visible.length > MAX_STATE_NODES
+        ? {
+            truncation_hint: fixedCapNote(
+              "visible node(s)",
+              MAX_STATE_NODES,
+              visible.length,
+              "Ask the user to zoom in so fewer nodes are on screen, or read the region with panel_query_graph (which DOES take limit and max_chars) / panel_graph_outline for the whole graph.",
+            ),
+          }
+        : {}),
       nodes: visible.slice(0, MAX_STATE_NODES).map(summarizeNode),
     };
   },
@@ -6567,7 +6639,7 @@ const GRAPH_TOOL_EXECUTORS = {
   //      → outputs as target_node.input_name
   // Far cheaper to read than the full JSON state, and shows the WIRING (which the
   // raw node dump makes you reconstruct). Read-only.
-  graph_outline() {
+  graph_outline({ max_chars } = {}) {
     const { graph, rootGraph } = getGraphCtx();
     // panel#389: refuse a false-clean empty read when the live graph is desynced
     // from the active workflow (empty canvas graph while the workflow reports nodes).
@@ -6584,77 +6656,157 @@ const GRAPH_TOOL_EXECUTORS = {
     // Geometric group membership → node id → group titles, plus a title→ids index.
     const groups = graph._groups ?? [];
     const groupOf = new Map();
-    const groupLines = [];
+    const groupMembers = new Map();
     for (const g of groups) {
       const ids = groupMemberNodes(graph, g).map((n) => n.id);
-      const tag = { 2: " [mute]", 4: " [bypass]" }[g.mode] ?? "";
-      groupLines.push(`  "${g.title ?? ""}"${tag} → ${ids.join(",") || "(empty)"}`);
+      groupMembers.set(g, ids);
       for (const id of ids) {
         if (!groupOf.has(id)) groupOf.set(id, []);
+        // Clipped for display only — MEMBERSHIP is keyed by node id above and is
+        // unaffected, and the GROUPS index still lists ids per group, so nothing
+        // downstream resolves a group by this label (codex gate).
         groupOf.get(id).push(g.title ?? "");
       }
     }
 
+    // #809 (codex gate): even the "full" rung clips each widget value at a FIXED 60
+    // chars, and TITLES (group, subgraph, node) are user-controlled and unbounded. A bare
+    // "…" on either quietly contradicts the outline's own coverage claim, so count both
+    // and raise ONE footer naming the tool that carries fuller values. No parameter
+    // raises these clips, so the footer must not pretend one does.
+    let outlineClipped = 0;
+    let outlineTitlesClipped = 0;
+    /** clipOutlineTitle, counting — every title in the outline goes through here. */
+    const title_ = (t) => {
+      const c = clipOutlineTitle(t);
+      if (c.clipped) outlineTitlesClipped++;
+      return c.text;
+    };
+    // Rebuilt per rung (not hoisted) so its title clips are counted against the rung that
+    // actually emits them — a count carried in from outside would claim clips the
+    // rendered text does not contain.
+    const renderGroupLines = () =>
+      groups.map((g) => {
+        const ids = groupMembers.get(g) ?? [];
+        const tag = { 2: " [mute]", 4: " [bypass]" }[g.mode] ?? "";
+        // A user-controlled group title is unbounded, so an un-clipped one would breach
+        // max_chars at EVERY rung — the ladder can shed detail but cannot shorten a
+        // single title.
+        return `  "${title_(g.title)}"${tag} → ${ids.join(",") || "(empty)"}`;
+      });
     const fmtVal = (v) => {
       const s = String(typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ");
-      return s.length > 60 ? s.slice(0, 57) + "…" : s;
+      if (s.length <= 60) return s;
+      outlineClipped++;
+      return s.slice(0, 57) + "…";
     };
     const modeTag = (n) => ({ 2: " [mute]", 4: " [bypass]" }[n.mode] ?? "");
     const outTag = (n) => (n.constructor?.nodeData?.output_node ? " [OUTPUT]" : "");
 
-    const lines = [];
-    for (const n of topoSortNodes(nodes, links)) {
-      const title = n.title && n.title !== n.type ? ` "${n.title}"` : "";
-      const grps = groupOf.get(n.id);
-      const groupTag = grps?.length ? ` · group:${grps.join("/")}` : "";
-      // #558: MARK the seed/value widget with its control_after_generate mode
-      // (`seed=… [after_gen=randomize]`) — visible like [bypass]/[mute] so a silently-
-      // rewritten value is obvious. The control combo token is NOT hidden (folding could
-      // hide a real combo that merely shares the mode option set), only annotated.
-      const cagMode = new Map(
-        controlAfterGenerateEntries(n)
-          .filter((e) => e.widget !== e.control)
-          .map((e) => [e.widget, e.mode]),
-      );
-      // #607: flag widgets overridden by a link so the stored value isn't read as effective.
-      const driven = drivenWidgetsFor(n, (n.widgets ?? []).map((w) => w?.name).filter(Boolean));
-      const widgets = (n.widgets ?? [])
-        .filter((w) => w && typeof w.name === "string")
-        .map((w) => {
-          const base = `${w.name}=${fmtVal(w.value)}`;
-          const mode = cagMode.get(w.name);
-          const withMode = mode ? `${base} [after_gen=${mode}]` : base;
-          return driven[w.name] ? `${withMode}${drivenTag(driven[w.name])}` : withMode;
-        })
-        .join(" ");
-      lines.push(
-        `${n.id}  ${n.type}${title}${modeTag(n)}${outTag(n)}${groupTag}${widgets ? "  " + widgets : ""}`,
-      );
-      const ins = (n.inputs ?? [])
-        .map((inp) => {
-          if (inp.link == null) return null;
-          const l = links[inp.link];
-          if (!l) return null;
-          const src = byId.get(l.origin_id);
-          return `${l.origin_id}.${src?.outputs?.[l.origin_slot]?.name ?? l.origin_slot}`;
-        })
-        .filter(Boolean);
-      if (ins.length) lines.push(`     ← ${ins.join(", ")}`);
-      const outs = [];
-      for (const out of n.outputs ?? []) {
-        for (const lid of out.links ?? []) {
-          const l = links[lid];
-          if (!l) continue;
-          const tgt = byId.get(l.target_id);
-          outs.push(`${l.target_id}.${tgt?.inputs?.[l.target_slot]?.name ?? l.target_slot}`);
+    // #809: render the node block at ONE rung of the detail ladder. Every rung emits a
+    // row for EVERY node — the ladder trades RESOLUTION, never coverage, because half a
+    // map is not a smaller map: an agent handed the first 200 of 690 nodes cannot tell
+    // what it is missing and will reason confidently about a graph it has barely seen.
+    const sorted = topoSortNodes(nodes, links);
+    const renderNodeLines = (level) => {
+      const out = [];
+      for (const n of sorted) {
+        // #809 (codex gate): NODE titles are user-controlled too — an unbounded one
+        // would breach max_chars at every rung, which the ladder cannot fix by shedding
+        // detail elsewhere.
+        const title = level === "ids_only" || !(n.title && n.title !== n.type) ? "" : ` "${title_(n.title)}"`;
+        const grps = groupOf.get(n.id);
+        // #809 (codex gate): groupOf holds RAW titles (membership must not depend on a
+        // display clip), so the per-node `group:` tag has to clip HERE — otherwise one
+        // long group title rides on every member node's row and blows max_chars at every
+        // rung, forcing needless degradation.
+        const groupTag =
+          level === "ids_only" || !grps?.length ? "" : ` · group:${grps.map(title_).join("/")}`;
+        let widgets = "";
+        if (level === "full" || level === "no_values") {
+          // #558: MARK the seed/value widget with its control_after_generate mode
+          // (`seed=… [after_gen=randomize]`) — visible like [bypass]/[mute] so a silently-
+          // rewritten value is obvious. The control combo token is NOT hidden (folding could
+          // hide a real combo that merely shares the mode option set), only annotated.
+          const cagMode = new Map(
+            controlAfterGenerateEntries(n)
+              .filter((e) => e.widget !== e.control)
+              .map((e) => [e.widget, e.mode]),
+          );
+          // #607: flag widgets overridden by a link so the stored value isn't read as effective.
+          const driven = drivenWidgetsFor(n, (n.widgets ?? []).map((w) => w?.name).filter(Boolean));
+          widgets = (n.widgets ?? [])
+            .filter((w) => w && typeof w.name === "string")
+            .map((w) => {
+              // At "no_values" the widget NAMES still tell an agent what is configurable;
+              // the VALUES are the bulk of the bytes, so they go first.
+              const base = level === "full" ? `${w.name}=${fmtVal(w.value)}` : w.name;
+              const mode = cagMode.get(w.name);
+              const withMode = mode ? `${base} [after_gen=${mode}]` : base;
+              return driven[w.name] ? `${withMode}${drivenTag(driven[w.name])}` : withMode;
+            })
+            .join(" ");
         }
+        const modes = level === "ids_only" ? "" : `${modeTag(n)}${outTag(n)}`;
+        out.push(
+          `${n.id}  ${n.type}${title}${modes}${groupTag}${widgets ? "  " + widgets : ""}`,
+        );
+        if (level === "ids_only") continue;
+        const ins = (n.inputs ?? [])
+          .map((inp) => {
+            if (inp.link == null) return null;
+            const l = links[inp.link];
+            if (!l) return null;
+            const src = byId.get(l.origin_id);
+            return `${l.origin_id}.${src?.outputs?.[l.origin_slot]?.name ?? l.origin_slot}`;
+          })
+          .filter(Boolean);
+        if (ins.length) out.push(`     ← ${ins.join(", ")}`);
+        const outs = [];
+        for (const out2 of n.outputs ?? []) {
+          for (const lid of out2.links ?? []) {
+            const l = links[lid];
+            if (!l) continue;
+            const tgt = byId.get(l.target_id);
+            outs.push(`${l.target_id}.${tgt?.inputs?.[l.target_slot]?.name ?? l.target_slot}`);
+          }
+        }
+        if (outs.length) out.push(`     → ${outs.join(", ")}`);
       }
-      if (outs.length) lines.push(`     → ${outs.join(", ")}`);
-    }
+      return out;
+    };
+
+    // The FLOOR rung: per-group counts + the types that actually occur there, plus the
+    // ungrouped remainder. Still answers "how big is this and what's in it" for the
+    // WHOLE graph, which is the one question the outline must never fail to answer.
+    const renderGroupSummary = () => {
+      const out = [];
+      const counted = new Set();
+      const typeHist = (ns) => {
+        const h = new Map();
+        for (const n of ns) h.set(n.type ?? "?", (h.get(n.type ?? "?") ?? 0) + 1);
+        return [...h.entries()].sort((a, b) => b[1] - a[1]).map(([t, c]) => `${c}× ${t}`);
+      };
+      for (const g of groups) {
+        const members = groupMemberNodes(graph, g);
+        for (const n of members) counted.add(n.id);
+        const tag = { 2: " [mute]", 4: " [bypass]" }[g.mode] ?? "";
+        out.push(`  "${title_(g.title)}"${tag} — ${members.length} node(s): ${typeHist(members).join(", ") || "(empty)"}`);
+      }
+      const rest = sorted.filter((n) => !counted.has(n.id));
+      if (rest.length) out.push(`  (ungrouped) — ${rest.length} node(s): ${typeHist(rest).join(", ")}`);
+      return out;
+    };
 
     const va = describeActiveGraph(graph);
-    const viewingStr = va && va.scope === "subgraph" ? `subgraph "${va.title ?? ""}"` : (va?.scope ?? "root");
-    const header = `${nodes.length} nodes · ${groups.length} group(s) · viewing: ${viewingStr}`;
+    // #809: the subgraph title is user-controlled too, and it rides in the header that
+    // even the REFUSAL path emits — so it must be bounded there as well (codex gate).
+    // Built PER RUNG so its clip is counted against the rung that actually emits it.
+    const renderHeader = () => {
+      const viewingStr =
+        va && va.scope === "subgraph" ? `subgraph "${title_(va.title)}"` : (va?.scope ?? "root");
+      return `${nodes.length} nodes · ${groups.length} group(s) · viewing: ${viewingStr}`;
+    };
     // #433: warn if ComfyUI reconnected recently — `viewing`/`active` may point at a
     // tab the frontend restored rather than the one the user was last looking at.
     const activeMaybeStale = activeWorkflowPossiblyStale({
@@ -6664,17 +6816,103 @@ const GRAPH_TOOL_EXECUTORS = {
       now: monotonicNow(),
     });
     const staleBanner = activeMaybeStale ? `⚠ ${activeStaleHint()}\n\n` : "";
-    const outline =
-      staleBanner +
-      header +
-      (groupLines.length ? `\n\nGROUPS (title → member node ids):\n${groupLines.join("\n")}` : "") +
-      `\n\nNODES (data flows top→down; ← inputs from, → outputs to):\n${lines.join("\n")}`;
+
+    const maxChars = clampOutlineMaxChars(max_chars);
+    // #809 (codex gate): the clip footer is PART of the rung, so it must be inside the
+    // measured string. Appending it after the fit test could tip a rung over budget and
+    // trigger the floor refusal while lower rungs were never tried — which then reported
+    // that oversized full-detail size as the "smallest whole-graph form".
+    const assemble = (level) => {
+      outlineClipped = 0;
+      outlineTitlesClipped = 0;
+      const banner = outlineDegradeBanner({
+        level,
+        nodeCount: nodes.length,
+        groupCount: groups.length,
+        maxChars,
+      });
+      // Render BEFORE building the note: rendering is what increments the counters, and
+      // rungs below "no_values" emit no values at all, so a carried-over count would
+      // claim clips this outline does not contain.
+      const head = renderHeader();
+      let bodyText;
+      if (level === "groups") {
+        bodyText = `\n\nGROUP SUMMARY (every node is counted here; per-node detail did not fit):\n${renderGroupSummary().join("\n")}`;
+      } else {
+        // The GROUPS index is membership, not detail — it stays on every node-level rung
+        // so the reader keeps the graph's structure even at "ids_only".
+        const gl = renderGroupLines();
+        bodyText =
+          (gl.length ? `\n\nGROUPS (title → member node ids):\n${gl.join("\n")}` : "") +
+          `\n\nNODES (data flows top→down; ← inputs from, → outputs to):\n${renderNodeLines(level).join("\n")}`;
+      }
+      return (
+        staleBanner +
+        (banner ? `${banner}\n\n` : "") +
+        head +
+        bodyText +
+        outlineValueClipNote(outlineClipped, outlineTitlesClipped)
+      );
+    };
+
+    // Walk DOWN the ladder until one fits. The floor is emitted even when it overflows —
+    // but then it is replaced by an explicit refusal that still states the true shape,
+    // because a partial outline that reads as complete is the failure we are avoiding.
+    let level = OUTLINE_DETAIL_LEVELS[0];
+    let outline = assemble(level);
+    for (const next of OUTLINE_DETAIL_LEVELS.slice(1)) {
+      if (outline.length <= maxChars) break;
+      level = next;
+      outline = assemble(level);
+    }
+    let refused = false;
+    let floorChars = 0;
+    if (outline.length > maxChars) {
+      refused = true;
+      floorChars = outline.length;
+      const refusal = outlineFloorRefusal({
+        nodeCount: nodes.length,
+        groupCount: groups.length,
+        maxChars,
+        floorChars: outline.length,
+      });
+      // #809 (codex gate): the refusal was assembled AFTER the ladder's fit test, so at a
+      // small budget the stale banner + header pushed it back over the bound it was
+      // explaining. Shed the OPTIONAL parts in order of expendability — the header, then
+      // the reconnect banner (both are also returned as structured fields, so nothing is
+      // lost) — and never the refusal sentence itself: truncating the message that says
+      // "I refused to hand you a partial graph" would be self-defeating. That last
+      // resort is the only text allowed past the budget, and it is bounded and fixed.
+      const candidates = [
+        staleBanner + refusal + `\n\n${renderHeader()}`,
+        staleBanner + refusal,
+        refusal,
+      ];
+      outline = candidates.find((c) => c.length <= maxChars) ?? refusal;
+    }
+    const degraded = refused || level !== OUTLINE_DETAIL_LEVELS[0];
 
     return {
       node_count: nodes.length,
       group_count: groups.length,
       viewing: describeActiveGraph(graph),
       outline,
+      // #809: the budget, the rung, and WHY — a caller that reads fields rather than
+      // prose must still learn that detail was traded away and which lever restores it.
+      max_chars: maxChars,
+      detail_level: refused ? "refused" : level,
+      // #809 (codex gate): the size the smallest whole-graph form would need. The
+      // orchestrator rider cannot otherwise tell "raise max_chars and it will fit" from
+      // "no budget this tool accepts can hold it", and would repeat the dead retry.
+      ...(refused ? { floor_chars: floorChars } : {}),
+      ...(degraded
+        ? {
+            degraded: true,
+            degraded_reason: refused
+              ? `Not even a per-group summary fits max_chars=${maxChars}; a partial outline is deliberately not returned.`
+              : `Per-node detail reduced to "${level}" to fit max_chars=${maxChars}; coverage is complete (all ${nodes.length} node(s) represented).`,
+          }
+        : {}),
       ...(activeMaybeStale
         ? { active_possibly_stale: true, stale_hint: activeStaleHint() }
         : {}),
@@ -6742,7 +6980,12 @@ const GRAPH_TOOL_EXECUTORS = {
     const maxDepth = depth != null && depth >= 0 ? Number(depth) : Infinity;
     // #609: clip caller-supplied values echoed in diagnostics so an oversized seed /
     // predicate can't flood the read.
-    const clipDiag = (s) => { const x = String(s); return x.length > 120 ? x.slice(0, 120) + "…" : x; };
+    // #809: SAY when it was clipped — echoing back a shortened value with a bare "…"
+    // reads as "that is what I looked for", so the caller cannot tell a typo from a clip.
+    const clipDiag = (s) => {
+      const x = String(s);
+      return x.length > 120 ? `${x.slice(0, 120)}… (shown clipped to 120 of ${x.length} chars)` : x;
+    };
     if (upstream_of != null) {
       const seed = String(upstream_of);
       if (!byId.has(seed)) return { total, candidates: 0, matched: 0, shown: 0, truncated: false, text: `upstream_of node ${clipDiag(seed)} not found (${total} nodes in view).` };
@@ -6810,10 +7053,27 @@ const GRAPH_TOOL_EXECUTORS = {
 
     // Groups + rails ride on every result (they replaced graph_get_state's role
     // as the structured source of group membership / subgraph boundary slots).
-    const groups = (graph._groups ?? []).map((g) => summarizeGroup(graph, g));
+    // #809 (codex gate): the `groups` rider rides ALONGSIDE `text` and is not counted
+    // against `max_chars` (that accounting is #807). Until #807 lands it must at least be
+    // BOUNDED, or the reply can exceed the very budget this tool advertises no matter
+    // what the caller sets. Cap it, and say so in-band — a silently short groups list
+    // would be read as "this graph has N groups", which is the defect this issue removes.
+    const allGroups = (graph._groups ?? []).map((g) => summarizeGroup(graph, g));
+    const groupsOverCap = allGroups.length > GROUPS_RIDER_CAP;
+    const groups = groupsOverCap ? allGroups.slice(0, GROUPS_RIDER_CAP) : allGroups;
+    // The marker is a SIBLING field, not an extra element (codex gate): injecting a
+    // {truncated,hint} object into `groups[]` would make the array heterogeneous and
+    // break any client that expects every element to carry id/title.
+    const groupsCut = groupsOverCap
+      ? {
+          groups_truncated: true,
+          groups_truncation_hint: `Showing ${GROUPS_RIDER_CAP} of ${allGroups.length} group(s) — a fixed cap on this rider, which \`max_chars\` does not govern (it bounds \`text\`; see artokun/comfyui-mcp#807). panel_graph_outline's GROUPS index covers every group.`,
+        }
+      : {};
     const inSubgraph = graph !== rootGraph;
     const meta = {
       viewing: describeActiveGraph(graph),
+      ...groupsCut,
       ...(groups.length ? { groups } : {}),
       ...(inSubgraph ? { rails: describeRails(graph) } : {}),
     };
@@ -6835,11 +7095,32 @@ const GRAPH_TOOL_EXECUTORS = {
         kept.push(l);
         used += l.length + 1;
       }
-      const aggTail = aggTruncated ? `\n…(${allLines.length - kept.length} more type(s) omitted; raise max_chars)` : "";
+      // #809: the aggregate can ONLY be cut by the char budget (limit is ignored here),
+      // so name that one lever and its real ceiling. The tail is part of the RESULT, so
+      // it is fitted afterwards — the loop above fills the budget with rows and appending
+      // past that breached the bound on exactly the path the row projection already fixed
+      // (codex gate).
+      const aggAssemble = () => {
+        const aggTail = aggTruncated
+          ? `\n…(${allLines.length - kept.length} more type(s) cut by \`max_chars\`=${maxChars}; ${
+              maxChars >= MAX_CHARS_CEILING
+                ? `\`max_chars\` is already at its ceiling of ${MAX_CHARS_CEILING} — narrow the matched set with \`types\`/\`where\`/\`upstream_of\` instead`
+                : `raise \`max_chars\` up to ${MAX_CHARS_CEILING}`
+            })`
+          : "";
+        return `${head}\n${kept.join("\n")}${aggTail}`;
+      };
+      let aggText = aggAssemble();
+      while (aggText.length > maxChars && kept.length > 0) {
+        kept.pop();
+        aggTruncated = true;
+        aggText = aggAssemble();
+      }
       return {
         ...meta, total, candidates: candidates.length, matched: matched.length,
         shown: matched.length, truncated: aggTruncated,
-        text: `${head}\n${kept.join("\n")}${aggTail}`,
+        truncated_by: aggTruncated ? "max_chars" : null,
+        text: aggText,
       };
     }
 
@@ -6857,9 +7138,23 @@ const GRAPH_TOOL_EXECUTORS = {
     const lines = [];
     let shown = 0;
     let truncated = false;
+    // #809: WHICH cap fired. `limit` and `max_chars` are different levers with opposite
+    // remedies — a tail that names the wrong one costs the caller a retry and then reads
+    // to them as proof the tool cannot do the job.
+    let truncatedBy = null;
+    // #809: compact rows clip widget values at a FIXED 60 chars, which no parameter
+    // raises — so ONE footer points at `fields`:"detail" rather than at a dead lever.
+    //
+    // Counted PER ROW and summed over the rows actually RETURNED (codex gate). A running
+    // total would include rows the budget rejected and rows the post-fit loop popped, so
+    // the footer would claim clips the reader cannot see — a false claim inside the very
+    // note that has to be trustworthy.
+    const lineClips = [];
+    let rowClips = 0;
     let chars = header.length;
     for (const n of matched) {
-      if (shown >= lim) { truncated = true; break; }
+      rowClips = 0;
+      if (shown >= lim) { truncated = true; truncatedBy = "limit"; break; }
       let line;
       if (proj === "ids") {
         line = clipLine(String(n.id), maxChars); // #609: bound even a pathological long id
@@ -6878,7 +7173,11 @@ const GRAPH_TOOL_EXECUTORS = {
         // #607: flag link-driven widgets in the compact line too.
         const driven = drivenWidgetsFor(n, (n.widgets ?? []).map((w) => w?.name).filter(Boolean));
         const w = Object.entries(widgetsOf(n))
-          .map(([k, v]) => `${k}=${clip(v)}${driven[k] ? drivenTag(driven[k]) : ""}`)
+          .map(([k, v]) => {
+            const c = clipCompactValue(v);
+            if (c.clipped) rowClips++;
+            return `${k}=${c.text}${driven[k] ? drivenTag(driven[k]) : ""}`;
+          })
           .join(" ");
         const ins = [...(up.get(String(n.id)) ?? [])].join(",");
         const outs = [...(down.get(String(n.id)) ?? [])].join(",");
@@ -6891,16 +7190,46 @@ const GRAPH_TOOL_EXECUTORS = {
       }
       // #609: protect ONLY the first match from the char budget so a single-id query
       // never returns shown:0. Later lines stay budget-governed (output stays bounded).
-      if (!isLineProtected(shown) && chars + line.length + 1 > maxChars) { truncated = true; break; }
+      if (!isLineProtected(shown) && chars + line.length + 1 > maxChars) {
+        truncated = true;
+        truncatedBy = "max_chars";
+        break;
+      }
       chars += line.length + 1;
       lines.push(line);
+      lineClips.push(rowClips);
       shown++;
     }
-    const tail = truncated ? truncationTail(shown, matched.length, !!(wantIds && wantIds.length)) : "";
-    const body = proj === "ids" ? lines.join(",") : lines.join("\n");
+    // #809 (codex gate): the tail and the clip footer are PART of the result and must fit
+    // inside `max_chars`, not be appended past it. Fit afterwards by dropping only as
+    // many rows as needed — reserving their worst case up front would manufacture a
+    // truncation on a result that fitted, which is the false-truncation defect this
+    // issue also exists to remove. The first row is never dropped (#609 protection).
+    const assemble = () => {
+      const tail = truncated
+        ? truncationTail(shown, matched.length, !!(wantIds && wantIds.length), truncatedBy, {
+            limit: lim,
+            maxChars,
+          })
+        : "";
+      const body = proj === "ids" ? lines.join(",") : lines.join("\n");
+      return `${header}\n${body}${tail}${compactClipNote(lineClips.reduce((x, y) => x + y, 0))}`;
+    };
+    let text = assemble();
+    while (text.length > maxChars && lines.length > 1) {
+      lines.pop();
+      lineClips.pop();
+      shown--;
+      truncated = true;
+      truncatedBy = "max_chars";
+      text = assemble();
+    }
     return {
       ...meta, total, candidates: candidates.length, matched: matched.length, shown, truncated,
-      text: `${header}\n${body}${tail}`,
+      // #809: expose the CAUSE structurally too, so a caller that reads fields rather
+      // than prose still learns which lever applies.
+      truncated_by: truncatedBy,
+      text,
     };
   },
 
@@ -7163,7 +7492,9 @@ const GRAPH_TOOL_EXECUTORS = {
     limit,
   } = {}) {
     const { graph } = getGraphCtx();
-    const cap = Math.min(Math.max(Number(limit ?? 40), 1), 200);
+    // #809: the clamp and the remedy's stated ceiling come from ONE constant, so a hint
+    // can never quote a ceiling the runtime does not enforce.
+    const cap = Math.min(Math.max(Number(limit ?? 40), 1), LIMIT_CEILING);
     const lc = (s) => String(s ?? "").toLowerCase();
     // Safe stringify for widget values — a BigInt or circular/custom value would
     // throw in JSON.stringify and fail the whole find call; fall back to String().
@@ -7180,6 +7511,8 @@ const GRAPH_TOOL_EXECUTORS = {
 
     const nodes = graph._nodes ?? [];
     const matches = [];
+    /** #809: true only when a (cap+1)-th match was actually found — the proof of a cut. */
+    let overCap = false;
     for (const node of nodes) {
       const summary = summarizeNode(node);
       const desc = nodeDescription(node);
@@ -7245,19 +7578,44 @@ const GRAPH_TOOL_EXECUTORS = {
         matchedOn.push(...hits);
       }
 
+      // #809 (codex gate): stopping AT the cap cannot distinguish "exactly `limit`
+      // matches" from "capped", so a graph with exactly 40 hits was told there "may be
+      // MORE" — a false instruction in the other direction. Take ONE past the cap and
+      // drop it: the extra match is the proof, and its absence is proof of completeness.
       matches.push({
         ...summary,
         ...(desc ? { description: desc.slice(0, 240) } : {}),
         ...(matchedOn.length ? { matched_on: matchedOn } : {}),
       });
-      if (matches.length >= cap) break;
+      if (matches.length > cap) {
+        matches.pop();
+        overCap = true;
+        break;
+      }
     }
 
     return {
       viewing: describeActiveGraph(graph),
       total: nodes.length,
       count: matches.length,
-      truncated: matches.length >= cap,
+      truncated: overCap,
+      // #809: the scan STOPS once it knows there is more, so `count` is not a match total
+      // and the absent matches are not "no more matches". Say both, and name the real
+      // lever + ceiling — a bare boolean here is what let panel_find_nodes' description
+      // claim it never truncated in the first place.
+      ...(overCap
+        ? {
+            truncation_hint:
+              `The scan stopped at \`limit\`=${cap} after ${matches.length} match(es); ` +
+              `there may be MORE matches it never reached, so this is not evidence a node is absent. ` +
+              // #809 (codex gate): at the ceiling, "raise limit" is itself a dead retry.
+              `${
+                cap >= LIMIT_CEILING
+                  ? `\`limit\` is already at its ceiling of ${LIMIT_CEILING}, so narrow with \`type\`/\`title\`/\`widget_value\` instead`
+                  : `Raise \`limit\` up to ${LIMIT_CEILING}, or narrow with \`type\`/\`title\`/\`widget_value\``
+              }.`,
+          }
+        : {}),
       matches,
     };
   },
@@ -7272,6 +7630,19 @@ const GRAPH_TOOL_EXECUTORS = {
       subgraph_of: { node_id: node.id, title: node.title },
       node_count: inner.length,
       truncated: inner.length > MAX_STATE_NODES,
+      ...(inner.length > MAX_STATE_NODES
+        ? {
+            truncation_hint: fixedCapNote(
+              "inner node(s)",
+              MAX_STATE_NODES,
+              inner.length,
+              // Honest about the follow-up's OWN ceiling (codex gate): panel_query_graph
+              // clamps limit at 200 and has no cursor, so on a >200-node subgraph it is a
+              // way to read MORE, not a way to read all.
+              "panel_enter_subgraph into it, then panel_query_graph — which takes limit (max 200) and max_chars. It has no cursor, so beyond 200 inner nodes use its types/where filters to work through them.",
+            ),
+          }
+        : {}),
       nodes: inner.slice(0, MAX_STATE_NODES).map(summarizeNode),
     };
   },
@@ -9077,7 +9448,17 @@ const GRAPH_TOOL_EXECUTORS = {
       node_count: nodes.length,
       errored_count: erroredNodes.length,
       nodes: erroredNodes.slice(0, MAX_STATE_NODES),
-      ...(erroredNodes.length > MAX_STATE_NODES ? { truncated: true } : {}),
+      ...(erroredNodes.length > MAX_STATE_NODES
+        ? {
+            truncated: true,
+            truncation_hint: fixedCapNote(
+              "errored node(s)",
+              MAX_STATE_NODES,
+              erroredNodes.length,
+              "Fix these first and re-check, or inspect specific ids with panel_query_graph {ids:[…], fields:'detail'}.",
+            ),
+          }
+        : {}),
       ...(staleRedFlags.length
         ? {
             stale_flags: staleRedFlags.slice(0, MAX_STATE_NODES).map((n) => ({
@@ -9086,7 +9467,17 @@ const GRAPH_TOOL_EXECUTORS = {
               reasons: [],
               note: "LiteGraph still shows this red outline, but no current execution, validation, or asset source confirms an error.",
             })),
-            ...(staleRedFlags.length > MAX_STATE_NODES ? { stale_flags_truncated: true } : {}),
+            ...(staleRedFlags.length > MAX_STATE_NODES
+              ? {
+                  stale_flags_truncated: true,
+                  stale_flags_truncation_hint: fixedCapNote(
+                    "stale red-outline node(s)",
+                    MAX_STATE_NODES,
+                    staleRedFlags.length,
+                    "These are cosmetic leftovers, not errors; there is no parameter to page them.",
+                  ),
+                }
+              : {}),
           }
         : {}),
       ...(missingModels.length ? { missing_models: missingModels } : {}),

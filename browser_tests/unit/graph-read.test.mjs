@@ -19,6 +19,20 @@ import {
   fitDetailLine,
   isLineProtected,
   truncationTail,
+  // #809
+  clipCompactValue,
+  compactClipNote,
+  OUTLINE_DETAIL_LEVELS,
+  OUTLINE_MAX_CHARS_DEFAULT,
+  OUTLINE_MAX_CHARS_FLOOR,
+  OUTLINE_MAX_CHARS_CEILING,
+  clampOutlineMaxChars,
+  outlineDegradeBanner,
+  outlineFloorRefusal,
+  outlineValueClipNote,
+  clipOutlineTitle,
+  OUTLINE_TITLE_CAP,
+  MAX_CHARS_CEILING,
 } from "../../web/js/lib/graph-read.js";
 
 // ---- #607: link-driven widget detection -----------------------------------
@@ -100,7 +114,7 @@ test("capWidgetValue clips an oversized string and reports the drop (#609)", () 
   const out = capWidgetValue(blob);
   assert.ok(out.length < blob.length, "clipped shorter than original");
   assert.ok(out.startsWith("x".repeat(1000)), "keeps the head");
-  assert.match(out, /…\(\+\d+ chars, truncated\)$/, "reports how much was dropped");
+  assert.match(out, /…\(\+\d+ chars cut at the 2048-char per-widget cap, which `max_chars` does not raise\)$/, "#809: reports how much was dropped AND that max_chars cannot raise this cap");
   assert.ok(JSON.stringify(out).length <= WIDGET_VALUE_CAP, "ESCAPED size within the cap");
 });
 
@@ -109,7 +123,8 @@ test("capWidgetValue bounds by ESCAPED size for control chars / surrogates (#609
   const nuls = String.fromCharCode(0).repeat(5000);
   const out = capWidgetValue(nuls, 600);
   assert.ok(JSON.stringify(out).length <= 600, `escaped size within cap, got ${JSON.stringify(out).length}`);
-  assert.match(out, /truncated\)$/);
+  // #809: the marker names the CAUSE and the lever, not just "truncated".
+  assert.match(out, /chars cut (over the `max_chars` budget|at the \d+-char per-widget cap)/);
 });
 
 test("capWidgetValue clips oversized serialized objects (ResolutionMaster presets)", () => {
@@ -117,7 +132,8 @@ test("capWidgetValue clips oversized serialized objects (ResolutionMaster preset
   const out = capWidgetValue(bigObj);
   assert.equal(typeof out, "string");
   assert.ok(JSON.stringify(out).length <= WIDGET_VALUE_CAP, "escaped size within the cap");
-  assert.match(out, /truncated\)$/);
+  // #809: the marker names the CAUSE and the lever, not just "truncated".
+  assert.match(out, /chars cut (over the `max_chars` budget|at the \d+-char per-widget cap)/);
 });
 
 test("capSummaryWidgets bounds every widget value without mutating the input (#609)", () => {
@@ -145,7 +161,11 @@ test("capSummaryWidgets bounds the TOTAL widgets size, keeping valid JSON (#609)
 test("capSummaryWidgets keeps at least one widget even if it alone exceeds the total cap", () => {
   const capped = capSummaryWidgets({ id: 1, widgets: { blob: "x".repeat(20000), extra: 1 } }, WIDGET_VALUE_CAP, 500);
   assert.ok("blob" in capped.widgets, "the single huge widget still renders (per-value capped)");
-  assert.match(capped.widgets.blob, /truncated\)$/);
+  // #809: these are BUDGET-driven cuts (totalCap < WIDGET_VALUE_CAP), so the marker must
+  // name `max_chars` — the lever that genuinely lifts them.
+  // #809 (codex gate): the raise must state HOW FAR. "raise `max_chars`" with no ceiling
+  // leaves a caller unable to tell whether the retry is even possible.
+  assert.match(capped.widgets.blob, /over the `max_chars` budget; raise `max_chars` \(up to 60000\)\)$/);
 });
 
 test("capSummaryWidgets tightens the per-value cap to a SMALL total budget (#609)", () => {
@@ -153,7 +173,11 @@ test("capSummaryWidgets tightens the per-value cap to a SMALL total budget (#609
   // budget, so the serialized line stays near totalCap, not ~2KB.
   const capped = capSummaryWidgets({ id: 1, widgets: { blob: "q".repeat(5000) } }, WIDGET_VALUE_CAP, 600);
   assert.ok(JSON.stringify(capped).length < 600 * 2, "line bounded near the small budget");
-  assert.match(capped.widgets.blob, /truncated\)$/);
+  // #809: these are BUDGET-driven cuts (totalCap < WIDGET_VALUE_CAP), so the marker must
+  // name `max_chars` — the lever that genuinely lifts them.
+  // #809 (codex gate): the raise must state HOW FAR. "raise `max_chars`" with no ceiling
+  // leaves a caller unable to tell whether the retry is even possible.
+  assert.match(capped.widgets.blob, /over the `max_chars` budget; raise `max_chars` \(up to 60000\)\)$/);
 });
 
 test("capSummaryWidgets stays bounded on ESCAPE-HEAVY content at a small budget (#609)", () => {
@@ -192,7 +216,9 @@ test("clipLine bounds a plain compact line by length, leaving short lines intact
   const huge = "#1 Wide · " + "k=v ".repeat(5000);
   const out = clipLine(huge, 2000);
   assert.ok(out.length <= 2000, `clipped to <= maxChars, got ${out.length}`);
-  assert.ok(out.endsWith("…"), "carries an ellipsis marker");
+  // #809: a bare "…" said only "something was here". The marker now says how much was
+  // cut and which parameter lifts the cut, and STILL fits inside maxChars.
+  assert.match(out, /…\(\+\d+ chars over `max_chars`; raise `max_chars` \(up to 60000\)\)$/);
   assert.equal(clipLine(huge, Infinity), huge, "no cap ⇒ unchanged");
 });
 
@@ -219,12 +245,226 @@ test("isLineProtected protects ONLY the first match (never shown:0), keeping the
 });
 
 test("truncationTail advises raising max_chars when ids were explicit (#609)", () => {
-  const withIds = truncationTail(1, 3, true);
-  assert.match(withIds, /raise max_chars/);
+  const withIds = truncationTail(1, 3, true, "max_chars", { limit: 40, maxChars: 600 });
+  assert.match(withIds, /raise `max_chars`/);
   assert.doesNotMatch(withIds, /narrow with/, "no dead-end 'narrow with ids' advice");
 
-  const noIds = truncationTail(5, 40, false);
-  assert.match(noIds, /narrow with types\/where\/ids\/depth/);
+  const noIds = truncationTail(5, 40, false, "max_chars", { limit: 40, maxChars: 600 });
+  assert.match(noIds, /narrow with `types`\/`where`\/`ids`\/`depth`/);
+});
+
+// #809 — the defect this issue was filed for: the tail used to name ONE remedy for BOTH
+// cuts. `limit` and `max_chars` have opposite fixes, so a tail that names the wrong one
+// costs the caller a retry and then reads to them as proof the tool cannot do the job.
+test("#809 truncationTail names the cap that ACTUALLY fired, and disowns the other", () => {
+  const byChars = truncationTail(5, 690, false, "max_chars", { limit: 200, maxChars: 12000 });
+  assert.match(byChars, /raise `max_chars` up to 60000/, "names the real lever and its real ceiling");
+  assert.doesNotMatch(byChars, /raise `limit`/, "must NOT tell the caller to raise the useless lever");
+  assert.match(byChars, /Raising `limit` will not help/);
+
+  const byLimit = truncationTail(40, 690, false, "limit", { limit: 40, maxChars: 60000 });
+  assert.match(byLimit, /raise `limit` up to 200/);
+  assert.doesNotMatch(byLimit, /raise `max_chars`/);
+  assert.match(byLimit, /`max_chars` is not the constraint here/);
+
+  // Explicit ids get the same split — "request fewer ids" is wrong advice for a limit cut
+  // in exactly the way "raise limit" is wrong advice for a budget cut.
+  const idsByLimit = truncationTail(3, 60, true, "limit", { limit: 3, maxChars: 60000 });
+  assert.match(idsByLimit, /raise `limit` up to 200/);
+  assert.doesNotMatch(idsByLimit, /raise `max_chars`/);
+});
+
+// codex gate: "raise `X` up to N" is ITSELF a dead retry at N. A wasted retry is exactly
+// what teaches an agent the tool cannot do the job, so at the ceiling the remedy must
+// switch to something that can still work.
+test("#809 truncationTail stops offering a raise the caller has already maxed out", () => {
+  const maxedLimit = truncationTail(200, 690, false, "limit", { limit: 200, maxChars: 12000 });
+  assert.match(maxedLimit, /`limit` is already at its ceiling of 200/);
+  assert.doesNotMatch(maxedLimit, /raise `limit` up to/);
+  assert.match(maxedLimit, /narrow with `types`/, "still names what IS left");
+
+  const maxedChars = truncationTail(5, 690, false, "max_chars", { limit: 40, maxChars: 60000 });
+  assert.match(maxedChars, /`max_chars` is already at its ceiling of 60000/);
+  assert.doesNotMatch(maxedChars, /raise `max_chars` up to/);
+
+  // Below the ceiling the raise is still the right first move.
+  const room = truncationTail(40, 690, false, "limit", { limit: 40, maxChars: 12000 });
+  assert.match(room, /raise `limit` up to 200/);
+  assert.doesNotMatch(room, /already at its ceiling/);
+});
+
+// The stronger bar (codex gate): naming a real parameter is necessary and NOT
+// sufficient. A raise with no ceiling leaves the caller unable to tell whether the retry
+// is possible at all; a raise they have already maxed out is a guaranteed wasted round
+// trip. Every marker this module emits is swept for both.
+test("#809 no marker ever says 'raise X' without saying how far", () => {
+  const emitted = [
+    capWidgetValue("z".repeat(20000)),
+    capWidgetValue("z".repeat(20000), 600),
+    capSummaryWidgets({ id: 1, widgets: { blob: "q".repeat(5000) } }, WIDGET_VALUE_CAP, 600).widgets["…"],
+    capSummaryWidgets({ id: 1, widgets: Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`w${i}`, "z".repeat(500)])) }, WIDGET_VALUE_CAP, 3000).widgets["…"],
+    clipLine("#1 Wide · " + "k=v ".repeat(5000), 2000),
+    fitDetailLine("y".repeat(20000), { id: 1, type: "T" }, 800),
+    truncationTail(5, 690, false, "max_chars", { limit: 40, maxChars: 12000 }),
+    truncationTail(40, 690, false, "limit", { limit: 40, maxChars: 12000 }),
+    outlineDegradeBanner({ level: "groups", nodeCount: 690, groupCount: 3, maxChars: 4000 }),
+    outlineFloorRefusal({ nodeCount: 690, groupCount: 3, maxChars: 500, floorChars: 3000 }),
+    outlineValueClipNote(3, 2),
+    compactClipNote(3),
+  ].filter((v) => typeof v === "string");
+
+  assert.ok(emitted.length >= 10, "the sweep must actually cover the markers");
+  for (const text of emitted) {
+    for (const m of text.matchAll(/\braise\s+`([A-Za-z_][A-Za-z0-9_]*)`/gi)) {
+      const name = m[1];
+      const stated = new RegExp(`\`${name}\`[^.]{0,40}?\\(?up to \\d+|\`${name}\` is already at its ceiling`);
+      assert.ok(
+        stated.test(text),
+        `remedy says "raise \`${name}\`" without a ceiling: ${JSON.stringify(text)}`,
+      );
+    }
+  }
+});
+
+test("#809 every marker switches away from a raise the caller has already maxed out", () => {
+  // Same code paths, caller at the ceiling.
+  const atCeiling = [
+    capSummaryWidgets({ id: 1, widgets: { blob: "q".repeat(5000) } }, WIDGET_VALUE_CAP, MAX_CHARS_CEILING).widgets.blob,
+    clipLine("#1 Wide · " + "k=v ".repeat(50000), MAX_CHARS_CEILING),
+    truncationTail(5, 690, false, "max_chars", { limit: 40, maxChars: MAX_CHARS_CEILING }),
+    truncationTail(200, 690, false, "limit", { limit: 200, maxChars: 12000 }),
+  ].filter((v) => typeof v === "string");
+  for (const text of atCeiling) {
+    if (!/already at its ceiling/.test(text)) continue; // marker may not fire at this size
+    assert.doesNotMatch(text, /raise `max_chars` \(up to/, `dead raise alongside the ceiling note: ${text}`);
+  }
+  // And at least one of them must actually have taken the ceiling branch, or this test
+  // is asserting nothing.
+  assert.ok(atCeiling.some((t) => /already at its ceiling/.test(t)), "no ceiling branch exercised");
+});
+
+test("#809 a user-controlled title can never blow the outline budget", () => {
+  const long = "T".repeat(5000);
+  const out = clipOutlineTitle(long);
+  assert.ok(out.text.length <= OUTLINE_TITLE_CAP + 1, `clipped title, got ${out.text.length}`);
+  assert.match(out.text, /…$/);
+  // It REPORTS the clip rather than leaving a bare "…" — the caller counts these and
+  // raises ONE footer, instead of scattering signal-free ellipses through the outline.
+  assert.equal(out.clipped, true);
+  // Short titles pass through untouched — this is a bound, not a reformat.
+  assert.deepEqual(clipOutlineTitle("REPLACEMENT MODE"), { text: "REPLACEMENT MODE", clipped: false });
+  assert.deepEqual(clipOutlineTitle(undefined), { text: "", clipped: false });
+  // Newlines in a title would break the one-line-per-group layout.
+  assert.equal(clipOutlineTitle("a\n\nb").text, "a b");
+});
+
+test("#809 the outline footer covers title clips as well as value clips", () => {
+  assert.equal(outlineValueClipNote(0, 0), "", "silent when nothing was clipped");
+  const titlesOnly = outlineValueClipNote(0, 3);
+  assert.match(titlesOnly, /3 title\(s\) clipped to 120 chars/);
+  assert.doesNotMatch(titlesOnly, /widget value/);
+  const both = outlineValueClipNote(2, 3);
+  assert.match(both, /2 widget value\(s\) clipped to 60 chars and 3 title\(s\) clipped to 120 chars/);
+  assert.match(both, /`max_chars` does not raise/);
+});
+
+test("#809 shown-of-matched is always stated, so 'how much is left' is never guesswork", () => {
+  for (const by of ["limit", "max_chars"]) {
+    for (const ids of [true, false]) {
+      const t = truncationTail(7, 690, ids, by, { limit: 40, maxChars: 12000 });
+      assert.match(t, /truncated at 7 of 690/, `${by}/ids=${ids} must state shown of matched`);
+    }
+  }
+});
+
+test("#809 the compact 60-char clip points at fields:'detail', not at a dead lever", () => {
+  const short = clipCompactValue("hello");
+  assert.equal(short.clipped, false);
+  assert.equal(short.text, "hello");
+
+  const long = clipCompactValue("z".repeat(400));
+  assert.equal(long.clipped, true);
+  assert.ok(long.text.length <= 60);
+
+  const note = compactClipNote(3);
+  assert.match(note, /3 widget value\(s\) clipped to 60 chars/);
+  assert.match(note, /`fields`:"detail"/);
+  // Raising max_chars does NOT lift this clip, so the note must not suggest it.
+  assert.doesNotMatch(note, /raise `max_chars`/);
+  assert.equal(compactClipNote(0), "", "silent when nothing was clipped");
+});
+
+// #809 — panel_graph_outline's budget. The ruling on this tool: degrade by RESOLUTION,
+// never by coverage. Half a map is not a smaller map — an agent handed the first 200 of
+// 690 nodes cannot tell what it is missing and will reason confidently about a graph it
+// has seen a third of.
+test("#809 outline ladder shrinks detail, never coverage", () => {
+  assert.deepEqual(OUTLINE_DETAIL_LEVELS, ["full", "no_values", "no_widgets", "ids_only", "groups"]);
+
+  // The same clamp window as panel_query_graph's max_chars — one budget concept, one
+  // spelling, so a lever learned on one graph read is already known on the other.
+  assert.equal(clampOutlineMaxChars(undefined), OUTLINE_MAX_CHARS_DEFAULT);
+  assert.equal(clampOutlineMaxChars(1), OUTLINE_MAX_CHARS_FLOOR);
+  assert.equal(clampOutlineMaxChars(1e9), OUTLINE_MAX_CHARS_CEILING);
+  assert.equal(clampOutlineMaxChars("nonsense"), OUTLINE_MAX_CHARS_DEFAULT);
+  assert.equal(clampOutlineMaxChars(4000), 4000);
+});
+
+test("#809 every degraded outline still states the TRUE shape and the lever", () => {
+  for (const level of ["no_values", "no_widgets", "ids_only", "groups"]) {
+    const b = outlineDegradeBanner({ level, nodeCount: 690, groupCount: 12, maxChars: 4000 });
+    assert.match(b, /COVERAGE IS COMPLETE/, `${level} must not read as a partial graph`);
+    assert.match(b, /all 690 node\(s\) and 12 group\(s\)/, `${level} must state the real totals`);
+    assert.match(b, /raise `max_chars` up to 60000/i, `${level} must name the lever and its ceiling`);
+  }
+  // "full" is not a degradation, so it must be silent — a banner on an undegraded read
+  // would train the caller to ignore banners.
+  assert.equal(outlineDegradeBanner({ level: "full", nodeCount: 1, groupCount: 0, maxChars: 60000 }), "");
+});
+
+test("#809 the outline's fixed 60-char value clip names a tool, not a dead lever", () => {
+  const note = outlineValueClipNote(7, 0);
+  assert.match(note, /7 widget value\(s\) clipped to 60 chars/);
+  // The clip is fixed. Suggesting max_chars here would be defect 1 in miniature.
+  assert.match(note, /`max_chars` does not raise/);
+  assert.match(note, /panel_query_graph/);
+  // "Read FULL values" would over-promise: detail rows carry their own 2048-char
+  // per-widget cap (codex gate). The note must state that downstream bound.
+  assert.doesNotMatch(note, /full values/);
+  assert.match(note, /caps each value at 2048 chars/);
+});
+
+test("#809 the outline floor REFUSES rather than emitting a partial graph", () => {
+  const r = outlineFloorRefusal({ nodeCount: 690, groupCount: 12, maxChars: 500, floorChars: 3200 });
+  assert.match(r, /CANNOT RENDER/);
+  assert.match(r, /690 node\(s\)/, "a refusal still tells you how big the graph is");
+  assert.match(r, /PARTIAL outline is deliberately NOT returned/);
+  assert.match(r, /raise `max_chars` \(up to 60000\)/i);
+});
+
+test("#809 the refusal stops offering a raise that could never hold the outline", () => {
+  // A graph whose group-level floor exceeds the CEILING cannot be outlined at any budget
+  // this tool accepts, so "raise max_chars up to 60000" is a guaranteed second refusal —
+  // a dead retry inside the message explaining the first one (codex gate).
+  const r = outlineFloorRefusal({
+    nodeCount: 20000,
+    groupCount: 300,
+    maxChars: 500,
+    floorChars: 100_000,
+  });
+  assert.match(r, /Even `max_chars`'s ceiling of 60000 could not hold it/);
+  assert.match(r, /raising it will NOT produce an outline/);
+  assert.doesNotMatch(r, /Raise `max_chars` \(up to/);
+  assert.match(r, /panel_query_graph/);
+
+  // Below the ceiling the raise is still the right first move.
+  const reachable = outlineFloorRefusal({
+    nodeCount: 690,
+    groupCount: 12,
+    maxChars: 500,
+    floorChars: 32_000,
+  });
+  assert.match(reachable, /Raise `max_chars` \(up to 60000\)/);
 });
 
 // End-to-end shape: mirror the graph_query budget loop with the helpers to prove a
