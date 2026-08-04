@@ -10072,6 +10072,29 @@ const GRAPH_TOOL_EXECUTORS = {
     let movedNodes = 0;
     let movedGroups = 0;
     let movedReroutes = 0;
+    // Write the box to a top-left and say whether it is REALLY there afterwards.
+    // setGroupBounds can fail two ways — by throwing (a frozen quad rejects the
+    // write outright in a strict-mode module) and by quietly not landing (a
+    // clamping setter or a proxy) — and it writes x, y, w, h one at a time, so a
+    // throw partway leaves the quad half-written. Both branches below route every
+    // box write through here so neither can report a position the box is not at.
+    const writeBox = (x, y) => {
+      try {
+        setGroupBounds(g, [x, y, b[2], b[3]]);
+      } catch (error) {
+        return error;
+      }
+      return groupBoxIsAt(g, x, y) ? null : new Error("the write did not land");
+    };
+    // Put the box back at its ORIGINAL top-left, and report whether it is really
+    // there. A thrown write is not by itself a failed restore — a frozen quad
+    // rejects the write but was never displaced in the first place, and calling
+    // that "could not be put back" would invent a partial move that never happened.
+    // Only the box's actual position decides.
+    const restoreBox = () => {
+      writeBox(b[0], b[1]);
+      return !groupBoxIsAt(g, b[0], b[1]);
+    };
     graph.beforeChange();
     try {
       if (move_nodes !== false) {
@@ -10109,10 +10132,26 @@ const GRAPH_TOOL_EXECUTORS = {
         // child at a third position that counts as stuck; an inverse-delta undo of
         // only the `moved` list would strand it there while this reply claimed
         // nothing had moved.
-        const rollback = () => {
-          nestedMove.undo();
-          rerouteMove.undo();
-          memberMove.undo();
+        // The undo is BEST-EFFORT — a constrained setter can accept the new
+        // coordinates and refuse the old ones — so it reports what it could not put
+        // back, and the refusal says "PARTIALLY moved" with a remedy rather than an
+        // unverified "nothing was moved". The parent box is restored too: it is
+        // written last, but setGroupBounds writes x/y/w/h one at a time, so a clamp
+        // or a mid-quad throw can leave it displaced.
+        const rollback = () => [
+          ...nestedMove.undo().map((c) => `group ${c.id ?? "?"}`),
+          ...rerouteMove.undo().map((r) => `reroute ${r.id ?? "?"}`),
+          ...memberMove.undo().map((n) => `node ${n.id}`),
+          ...(restoreBox() ? [`group ${group_id} (its own box)`] : []),
+        ];
+        const refuse = (reason) => {
+          const unrestored = rollback();
+          throw new Error(
+            `refusing to move group ${group_id}: ${reason}. ` +
+              (unrestored.length
+                ? `The graph is PARTIALLY moved — ${unrestored.length} item(s) could NOT be put back (${unrestored.slice(0, 5).join(", ")}${unrestored.length > 5 ? ", …" : ""}). Press Ctrl+Z on the canvas, or reposition them with panel_edit_node.`
+                : "NOTHING was moved."),
+          );
         };
         const stuck = [
           ...memberMove.stuck.map((n) => `node ${n.id}`),
@@ -10120,32 +10159,34 @@ const GRAPH_TOOL_EXECUTORS = {
           ...nestedMove.stuck.map((c) => `group ${c.id ?? "?"}`),
         ];
         if (stuck.length) {
-          rollback();
-          throw new Error(
-            `refusing to move group ${group_id}: ${stuck.length} enclosed item(s) would not accept a new position (${stuck.slice(0, 5).join(", ")}${stuck.length > 5 ? ", …" : ""}). NOTHING was moved. Move those items out of the group (panel_edit_node) and retry, or pass move_nodes:false to move only the box.`,
+          refuse(
+            `${stuck.length} enclosed item(s) would not accept a new position (${stuck.slice(0, 5).join(", ")}${stuck.length > 5 ? ", …" : ""}) — move them out of the group (panel_edit_node) and retry, or pass move_nodes:false to move only the box`,
           );
         }
-        // The box write is the LAST thing that can fail, and it can fail by
-        // THROWING (a frozen quad rejects the write outright in a strict-mode
-        // module) as well as by quietly not landing. Both have to put the children
-        // back, or the group is left torn apart with an error that says otherwise.
-        let boxError = null;
-        try {
-          setGroupBounds(g, [Number(pos[0]), Number(pos[1]), b[2], b[3]]);
-        } catch (error) {
-          boxError = error;
-        }
-        if (boxError || !groupBoxIsAt(g, Number(pos[0]), Number(pos[1]))) {
-          rollback();
-          throw new Error(
-            `refusing to move group ${group_id}: the group box did not accept the new position on this frontend${boxError ? ` (${boxError.message})` : ""}. NOTHING was moved.`,
-          );
+        // The box write is the LAST thing that can fail. Its failure has to put the
+        // children back too, or the group is left torn apart with an error saying
+        // otherwise.
+        const boxError = writeBox(Number(pos[0]), Number(pos[1]));
+        if (boxError) {
+          refuse(`the group box did not accept the new position on this frontend (${boxError.message})`);
         }
         movedNodes = memberMove.moved.length;
         movedGroups = nestedMove.moved.length;
         movedReroutes = rerouteMove.moved.length;
       } else {
-        setGroupBounds(g, [Number(pos[0]), Number(pos[1]), b[2], b[3]]);
+        // Even the box-only move must be VERIFIED, not assumed: a clamping setter
+        // or a proxy that ignores the write would otherwise return a confident
+        // "moved the box to [x, y]" for a box that never left.
+        const boxError = writeBox(Number(pos[0]), Number(pos[1]));
+        if (boxError) {
+          const restoreFailed = restoreBox();
+          throw new Error(
+            `refusing to move group ${group_id}: the group box did not accept the new position on this frontend (${boxError.message}). ` +
+              (restoreFailed
+                ? `The box could NOT be put back at [${b[0]}, ${b[1]}] either — press Ctrl+Z on the canvas, or set it explicitly with panel_edit_group({bounds}).`
+                : "NOTHING was moved."),
+          );
+        }
         // The box moved and NOTHING else did, so the group now encloses a DIFFERENT
         // set of nodes. Membership is read boundingRect-first, so resync every
         // cached rect to live pos/size before summarizing — otherwise this reply

@@ -352,7 +352,7 @@ test("#408: a member that CANNOT be repositioned aborts the whole move and rolls
 
   assert.throws(
     () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
-    /refusing to move group 1: 1 enclosed item\(s\) would not accept a new position \(node 8\)\. NOTHING was moved/,
+    /refusing to move group 1: 1 enclosed item\(s\) would not accept a new position \(node 8\).*NOTHING was moved/s,
   );
 
   assert.deepEqual(outer._bounding, [0, 0, 400, 400], "the group box must be exactly where it was");
@@ -442,13 +442,23 @@ test("#408: a group box that refuses the write is a refusal, not a reported succ
   const reroute = { id: 11, pos: [200, 200] };
   const graph = makeGraph({ nodes: [a], groups: [g, inner], reroutes: [reroute] });
 
-  assert.throws(
-    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
-    // The parenthetical carries the THROWN write error. Its presence is also the
-    // proof that this harness compiled the handler strict, the way the shipped ES
-    // module runs it — in sloppy mode the same write would silently no-op and this
-    // path would be reached by luck rather than by the catch that handles it.
-    /the group box did not accept the new position[^(]*\(.+\)\. NOTHING was moved/s,
+  let err = null;
+  try {
+    realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
+  } catch (error) {
+    err = error;
+  }
+  assert.ok(err, "the move must be refused");
+  assert.match(err.message, /the group box did not accept the new position[^(]*\(.+\)\. NOTHING was moved/s);
+  // The parenthetical must carry a THROWN write error, not the "did not land"
+  // verdict. That is the proof this harness compiled the handler STRICT, the way
+  // the shipped ES module runs it: in sloppy mode the same write to a frozen array
+  // silently no-ops and this refusal would be reached by luck rather than by the
+  // catch that exists to handle it.
+  assert.doesNotMatch(
+    err.message,
+    /the write did not land/,
+    "under strict mode the frozen-quad write THROWS; a 'did not land' verdict means the harness ran sloppy",
   );
   assert.deepEqual(a.pos, [100, 100], "the members must be put back when the box write fails");
   assert.deepEqual([...a.boundingRect], [100, 70, 60, 70], "and their cached rects with them");
@@ -494,6 +504,88 @@ test("#408: a snapping reroute is also restored exactly, not left where the engi
 
   assert.throws(() => realMoveGroup(graph)({ group_id: 1, pos: [1013, 1013] }), /NOTHING was moved/);
   assert.deepEqual(snapping._p, [100, 100], "restored to its original point, not to old+(-delta)");
+});
+
+test("#408: a node whose pos is a plain PROPERTY holding a typed-array view keeps that view", () => {
+  // The view is the node's live geometry container. Replacing it with a fresh
+  // plain array would leave the node at the right coordinates while silently
+  // disconnecting it from whatever else writes through that view.
+  const geometry = new Float64Array([50, 50, 0, 0]);
+  const a = { id: 7, size: [100, 100], boundingRect: [50, 20, 100, 130], pos: geometry.subarray(0, 2) };
+  const view = a.pos;
+  const graph = makeGraph({ nodes: [a], groups: [group(1, [0, 0, 200, 200])] });
+
+  const out = realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
+
+  assert.equal(a.pos, view, "the node must still hold the SAME container it started with");
+  assert.deepEqual([geometry[0], geometry[1]], [1050, 1050], "and the write went through it");
+  assert.equal(out.moved.nodes, 1);
+});
+
+test("#408: a group box that CLAMPS the write is refused, and the box is put back", () => {
+  // A frontend whose quad clamps to the positive quadrant: the write does not
+  // throw, it just does not land where we asked.
+  const quad = [0, 0, 400, 400];
+  const clamping = {
+    id: 1,
+    title: "Clamped",
+    get _bounding() { return quad; },
+    set _bounding(v) { quad[0] = Math.max(0, v[0]); quad[1] = Math.max(0, v[1]); },
+  };
+  const a = node(7, [100, 100], [60, 40]);
+  const graph = makeGraph({ nodes: [a], groups: [clamping] });
+  // setGroupBounds mutates _bounding IN PLACE, so emulate the clamp on the quad.
+  Object.defineProperty(quad, "0", {
+    get() { return this._x ?? 0; },
+    set(v) { this._x = Math.max(0, Math.min(500, v)); },
+    configurable: true,
+  });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [9000, 10] }),
+    /the group box did not accept the new position .*NOTHING was moved/s,
+  );
+  assert.equal(quad[0], 0, "the box is back at its original x");
+  assert.deepEqual(a.pos, [100, 100], "and the member is back too");
+});
+
+test("#408: move_nodes:false VERIFIES the box write instead of assuming it", () => {
+  const g = { id: 1, title: "Frozen", _bounding: Object.freeze([0, 0, 400, 400]) };
+  const graph = makeGraph({ nodes: [], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000], move_nodes: false }),
+    /the group box did not accept the new position/,
+  );
+  assert.deepEqual([...g._bounding], [0, 0, 400, 400]);
+});
+
+test("#408: when a child cannot be put back, the refusal says PARTIALLY moved, not 'nothing'", () => {
+  // This node accepts any position except its original one — so the forward move
+  // succeeds and the rollback cannot undo it. Announcing "nothing was moved"
+  // there would be the exact fabrication this whole path exists to prevent.
+  const oneWay = {
+    id: 7,
+    size: [60, 40],
+    boundingRect: [100, 70, 60, 70],
+    _p: [100, 100],
+    get pos() { return [...this._p]; },
+    set pos(v) {
+      if (Number(v[0]) === 100 && Number(v[1]) === 100) return; // refuses to go home
+      this._p = [Number(v[0]), Number(v[1])];
+    },
+  };
+  // A frozen sibling forces the refusal AFTER oneWay has already moved.
+  const stuckNode = { id: 8, size: [60, 40], boundingRect: [150, 120, 60, 70], get pos() { return Object.freeze([150, 150]); } };
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [oneWay, stuckNode], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /The graph is PARTIALLY moved — 1 item\(s\) could NOT be put back \(node 7\)\. Press Ctrl\+Z/s,
+  );
+  assert.deepEqual(oneWay._p, [1100, 1100], "it really is still displaced — the message must not deny it");
+  assert.deepEqual(g._bounding, [0, 0, 400, 400], "the box itself never moved");
 });
 
 // ---- lib branches the handler tests above do not reach ---------------------

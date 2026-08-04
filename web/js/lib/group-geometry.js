@@ -219,6 +219,15 @@ export function moveGroupMembers(members, dx, dy) {
   return { moved, stuck, undo: () => restoreNodePositions(attempted) };
 }
 
+/** Keep a node's cached rect in step with a restore, then say whether the node
+ *  is back where it started. */
+function restoreNodePosition(n, px, py) {
+  const cur = [Number(n?.pos?.[0]), Number(n?.pos?.[1])];
+  const ok = writePoint(n, "pos", px, py);
+  refreshNodeArea(n, cur);
+  return ok;
+}
+
 /**
  * Put every ATTEMPTED node back at the exact coordinates it had before the move,
  * whether its write landed, landed somewhere else, or did not land at all.
@@ -228,13 +237,19 @@ export function moveGroupMembers(members, dx, dy) {
  * as not-landed — and an undo that only walked the `moved` list would leave that
  * node displaced while the caller announced that nothing had moved. Restoring
  * absolutely, over the whole attempted set, is what makes that announcement true.
+ *
+ * Returns the nodes that could NOT be put back. A restore can fail for the same
+ * reasons a move can (a constrained setter may accept the new coordinates and
+ * refuse the old ones), and a caller that announces "nothing was moved" without
+ * looking at this list is making exactly the unverified claim this whole change
+ * exists to stop.
  */
 function restoreNodePositions(attempted) {
+  const failed = [];
   for (const [n, px, py] of attempted ?? []) {
-    const cur = [Number(n?.pos?.[0]), Number(n?.pos?.[1])];
-    writePoint(n, "pos", px, py);
-    refreshNodeArea(n, cur);
+    if (!restoreNodePosition(n, px, py)) failed.push(n);
   }
+  return failed;
 }
 
 /**
@@ -286,9 +301,16 @@ export function groupBoxIsAt(g, x, y) {
  *     silently dropped, or a getter with NO setter, where assignment throws in a
  *     strict-mode ES module.
  *
- * So: assign (the proven path, and the one that runs any setter bookkeeping),
- * verify, then fall back to an in-place write, then verify again. Returning the
- * verdict is the point — the caller must never report a move it did not make.
+ * IN-PLACE FIRST, then assignment. Order matters: when `pos` is a plain writable
+ * property holding a typed-array VIEW into the node's bounding rect, assigning a
+ * fresh plain array REPLACES the view — the node keeps the right coordinates but
+ * silently loses its aliasing to the rect, and every later write through that
+ * view (LiteGraph's own drag path, the layout store) stops reaching it. Mutating
+ * the two slots keeps the container the engine handed us. Assignment stays as the
+ * fallback for a getter that returns a COPY, where an in-place write is dropped.
+ *
+ * Returning the verdict is the point — the caller must never report a move it did
+ * not make.
  */
 export function writePoint(owner, key, x, y) {
   const landed = () => {
@@ -296,20 +318,20 @@ export function writePoint(owner, key, x, y) {
     const f32 = isFloat32(point);
     return samePoint(Number(point?.[0]), x, f32) && samePoint(Number(point?.[1]), y, f32);
   };
-  try {
-    owner[key] = [x, y];
-  } catch {
-    /* accessor with no setter — strict-mode assignment throws; try in place */
-  }
-  if (landed()) return true;
   const point = owner?.[key];
   if (point && point.length >= 2) {
     try {
       point[0] = x;
       point[1] = y;
     } catch {
-      /* frozen/read-only point — reported as stuck below */
+      /* frozen/read-only point — the assignment below is the remaining hope */
     }
+    if (landed()) return true;
+  }
+  try {
+    owner[key] = [x, y];
+  } catch {
+    /* accessor with no setter — strict-mode assignment throws; reported below */
   }
   return landed();
 }
@@ -401,9 +423,8 @@ export function translateGroupBoxes(groups, dx, dy) {
   return {
     moved,
     stuck,
-    undo: () => {
-      for (const [g, x, y] of attempted) placeGroupBox(g, x, y);
-    },
+    /** Returns the boxes that could NOT be put back. */
+    undo: () => attempted.filter(([g, x, y]) => !placeGroupBox(g, x, y)).map(([g]) => g),
   };
 }
 
@@ -479,9 +500,8 @@ export function moveReroutePoints(reroutes, dx, dy) {
   return {
     moved,
     stuck,
-    undo: () => {
-      for (const [r, px, py] of attempted) placeReroute(r, px, py);
-    },
+    /** Returns the reroutes that could NOT be put back. */
+    undo: () => attempted.filter(([r, px, py]) => !placeReroute(r, px, py)).map(([r]) => r),
   };
 }
 
