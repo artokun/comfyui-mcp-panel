@@ -656,6 +656,31 @@ test("#585: the wait budget is a TRI-STATE — within / spent / unknown", () => 
   }
 });
 
+test("#585 P1(clock): a NEGATIVE elapsed is an unusable clock, not 'no time has passed'", () => {
+  // A clock rollback (NTP correction, resume from suspend, the user changing the
+  // system time) puts `at` and `now` on different timelines, so their difference
+  // measures nothing. Clamping it to 0 would make the backstop wait for the wall
+  // clock to catch up before it could ever fire — an unbounded, silent hold.
+  assert.equal(rebootWaitBudget(-1, 900000), "unknown");
+  assert.equal(rebootWaitBudget(-900000, 900000), "unknown");
+  assert.equal(rebootWaitBudget(0, 900000), "within", "a real zero is still a real answer");
+
+  // End to end: a marker armed "in the future" relative to now.
+  const raw = encodeRebootMarker({ at: 5000, runs: ["P"] });
+  assert.equal(
+    stepRebootResume({ raw, isSettled: () => false, nowMs: 1000 }).decision,
+    "resume_unconfirmed",
+    "the disclosed exit, not an indefinite wait",
+  );
+});
+
+test("#585 P1(clock): an unusable clock HOLDS a wrong-session marker rather than expiring it", () => {
+  const raw = encodeRebootMarker({ at: 5000, runs: [], threadId: "t-A" });
+  const step = stepRebootResume({ raw, isSettled: () => true, currentThreadId: "t-B", nowMs: 1000 });
+  assert.equal(step.decision, "wait_for_session", "unknown holds on this path — never discards");
+  assert.notEqual(step.nextRaw, null);
+});
+
 test("#585: a KNOWN-spent budget on a wrong-session marker still abandons it visibly", () => {
   const raw = encodeRebootMarker({ at: 1000, runs: [], threadId: "t-A" });
   assert.equal(

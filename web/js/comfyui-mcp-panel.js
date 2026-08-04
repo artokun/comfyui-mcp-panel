@@ -19649,6 +19649,13 @@ function buildPanel() {
     rebootResumeMid = mid;
     rebootResumeMidAt = Date.now();
     rebootResumeMids.add(mid);
+    // A continuation has now been issued for this drop, so the generic mid-task
+    // "you dropped, pick it back up" fallback must not ALSO fire. `ready` repeats on
+    // a live socket, and once the marker is retired those repeats fall through to
+    // that branch — a second, uncorrelated, undisclosed "continue", which is the
+    // duplicate-render hazard again. The soft-reload path clears this for exactly
+    // the same reason; the reboot path never did.
+    ssSet(MID_TASK_KEY, null);
     rebootWaitNoticeShown = false;
     rebootSessionNoticeShown = false;
     appendSystem(

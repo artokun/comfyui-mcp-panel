@@ -247,6 +247,8 @@ export function planRebootResume(state = {}) {
   // DISCLOSED exit rather than hold the session indefinitely.
   if (budget === "unknown" || budget === "spent") return "resume_unconfirmed";
   return "wait_for_run";
+  // NB: `waitedMs` is intentionally not normalized before the helper — clamping a
+  // negative elapsed here would hide the unusable-clock case from it.
 }
 
 /**
@@ -290,8 +292,15 @@ export function rebootResumeRepeatWarning(state = {}) {
  */
 export function rebootWaitBudget(waitedMs, maxWaitMs) {
   if (!Number.isFinite(waitedMs)) return "unknown";
+  // NEGATIVE elapsed means the clock moved backwards (NTP correction, a suspended
+  // laptop, a user changing the system time) — so the arm time and "now" are not on
+  // the same timeline and the difference measures nothing. Clamping it to 0 would
+  // launder that into "no time has passed yet", and the backstop would then wait for
+  // the wall clock to catch up before it could ever fire: an unbounded, silent hold.
+  // An unusable measurement is an unknown one.
+  if (Number(waitedMs) < 0) return "unknown";
   const cap = Number.isFinite(maxWaitMs) ? maxWaitMs : REBOOT_RESUME_MAX_WAIT_MS;
-  return Math.max(0, /** @type {number} */ (waitedMs)) >= cap ? "spent" : "within";
+  return Number(waitedMs) >= cap ? "spent" : "within";
 }
 
 /**
@@ -440,7 +449,9 @@ export function stepRebootResume({
         : "replaced";
   // Elapsed since the reboot was ARMED, read from the persisted marker so a reload
   // cannot reset the backstop. `null` = unknown, and stays unknown.
-  const waitedMs = marker.at == null ? null : Math.max(0, nowMs - marker.at);
+  // Deliberately NOT clamped to 0 — a negative difference is evidence the clock is
+  // not usable here, and rebootWaitBudget must see it to report "unknown".
+  const waitedMs = marker.at == null ? null : nowMs - marker.at;
   const budget = rebootWaitBudget(waitedMs, maxWaitMs);
   const retain = () => encodeRebootMarker({ ...markerFields(marker) });
 
