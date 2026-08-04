@@ -19421,6 +19421,12 @@ function buildPanel() {
   // Has THIS mount ever seen a live bridge? Without it, a fresh client's opening
   // `connecting` reads as a drop and a reload refills the retry budget.
   let rebootSeenConnected = false;
+  let rebootPruneFailureNoticeShown = false;
+  // Set when a budget RESET write is verified to have failed. The persisted count
+  // is then stale-high forever, so the gate falls back to this in-memory per-episode
+  // count — still bounded, but not a permanent refusal.
+  let rebootBudgetPersistBroken = false;
+  let rebootEpisodeSends = 0;
 
   /** Drop any outstanding attempt — its channel is gone, so it can never be acked. */
   function forgetRebootResumeAttempt() {
@@ -19439,6 +19445,9 @@ function buildPanel() {
     rebootResumeMids.clear();
     rebootResumeSent = false;
     rebootAttemptCountUnreliableNoticeShown = false;
+    rebootPruneFailureNoticeShown = false;
+    rebootBudgetPersistBroken = false;
+    rebootEpisodeSends = 0;
     rebootResumeStalledNoticeShown = false;
     rebootWaitNoticeShown = false;
     rebootSessionNoticeShown = false;
@@ -19462,6 +19471,12 @@ function buildPanel() {
     return tracker ? (id) => tracker.isDeliveryUnconfirmed(id) : undefined;
   };
 
+  /** ssSet, then read back. Returns whether the value actually persisted. */
+  function ssSetVerified(key, value) {
+    ssSet(key, value);
+    return ssGet(key) === value;
+  }
+
   function readRebootMarker() {
     return decodeRebootMarker(ssGet(REBOOT_KEY));
   }
@@ -19476,7 +19491,18 @@ function buildPanel() {
     const raw = ssGet(REBOOT_KEY);
     if (raw == null) return;
     const next = pruneRebootMarkerRaw(raw, rebootIsSettled(), rebootDeliveryUnconfirmed());
-    if (next !== raw) ssSet(REBOOT_KEY, next);
+    if (next === raw) return;
+    // VERIFIED. A prune that silently fails leaves an already-delivered run id in the
+    // marker; a reload then re-adopts it and `/history` reconciles its completion to
+    // the agent a SECOND time. Nothing further can force the write, so surface it —
+    // this path had no disclosure at all, which is what made it worse than the
+    // best-effort-storage cases that do.
+    if (!ssSetVerified(REBOOT_KEY, next) && !rebootPruneFailureNoticeShown) {
+      rebootPruneFailureNoticeShown = true;
+      appendSystem(
+        "Note: this browser wouldn't let me update the restart marker. If you reload, a render result that was already delivered may be reported to the agent twice.",
+      );
+    }
   }
 
   /**
@@ -19526,7 +19552,15 @@ function buildPanel() {
       maxWaitMs: REBOOT_RESUME_MAX_WAIT_MS,
     });
     if (step.decision === "wait_for_run" || step.decision === "wait_for_session") {
-      ssSet(REBOOT_KEY, step.nextRaw);
+      // Same class as the prune write: this rewrite is what drops already-settled run
+      // ids from the marker, so a silent failure leaves a delivered run in it for a
+      // reload to re-adopt and re-deliver. Verified, and disclosed once if it fails.
+      if (!ssSetVerified(REBOOT_KEY, step.nextRaw) && !rebootPruneFailureNoticeShown) {
+        rebootPruneFailureNoticeShown = true;
+        appendSystem(
+          "Note: this browser wouldn't let me update the restart marker. If you reload, a render result that was already delivered may be reported to the agent twice.",
+        );
+      }
     }
     return step;
   }
@@ -19661,6 +19695,7 @@ function buildPanel() {
     rebootResumeMid = mid;
     rebootResumeMidAt = Date.now();
     rebootResumeMids.add(mid);
+    rebootEpisodeSends += 1;
     // A continuation has now been issued for this drop, so the generic mid-task
     // "you dropped, pick it back up" fallback must not ALSO fire. `ready` repeats on
     // a live socket, and once the marker is retired those repeats fall through to
@@ -19779,7 +19814,10 @@ function buildPanel() {
     // recoverable side (the unknown total already forces the duplicate warning), and
     // the write-ahead below replaces the unknown with a real count — so this resolves
     // after exactly one attempt instead of looping.
-    const budgetUsed = step?.marker?.attempts;
+    // When the persisted budget cannot be RESET (a verified-failed write), the
+    // persisted number is stale-high forever and gating on it would refuse every
+    // tick. Bound this episode in memory instead — still bounded, but recoverable.
+    const budgetUsed = rebootBudgetPersistBroken ? rebootEpisodeSends : step?.marker?.attempts;
     if (Number.isFinite(budgetUsed) && Number(budgetUsed) >= REBOOT_RESUME_MAX_ATTEMPTS) {
       if (!rebootResumeStalledNoticeShown) {
         rebootResumeStalledNoticeShown = true;
@@ -19836,8 +19874,15 @@ function buildPanel() {
       // observed drop, "this episode has made zero attempts" is a true statement we
       // can now assert. The total is untouched and stays unknown if it was.
       if (decoded && decoded.attempts !== 0) {
-        ssSet(REBOOT_KEY, encodeRebootMarker({ ...decoded, attempts: 0 }));
+        // VERIFIED. If the reset silently fails, the persisted budget stays spent and
+        // the send gate refuses on every tick — a confirmed reconnect turning into a
+        // permanent stall. A budget we cannot reset is a budget we cannot manage, so
+        // fall back to bounding this episode in memory instead of refusing forever.
+        rebootBudgetPersistBroken = !ssSetVerified(REBOOT_KEY, encodeRebootMarker({ ...decoded, attempts: 0 }));
+      } else {
+        rebootBudgetPersistBroken = false;
       }
+      rebootEpisodeSends = 0; // the in-memory fallback bound, per delivery episode
       // Mids from the dead socket can never be acked on the new connection, so drop
       // them — this also bounds the set across repeated drops.
       rebootResumeMids.clear();
