@@ -91,3 +91,82 @@ test("a forceInput declaration remains a wireable socket", () => {
   assert.deepEqual(missingRequiredWidgetMaterializations(node, { ...widgetConstructors, STRING: () => {} }), []);
   assert.deepEqual(requiredWidgetInputTypes(node), ["ZIPN_STYLE_GALLERY", "ZIPN_SPACER", "CLIP"]);
 });
+
+test("core MASK required input is a safe socket (#620 SetLatentNoiseMask)", () => {
+  const node = {
+    constructor: {
+      nodeData: {
+        input: {
+          required: {
+            samples: ["LATENT", {}],
+            mask: ["MASK", {}],
+          },
+        },
+      },
+    },
+  };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(node, {}), []);
+});
+
+test("third-party socket type is available only once the live registry proves it (#620 STITCHER)", () => {
+  const node = {
+    constructor: {
+      nodeData: {
+        input: {
+          required: { stitcher: ["STITCHER", {}] },
+        },
+      },
+    },
+  };
+  // No registry proof: indistinguishable from a widget pending its extension
+  // hook — still fails closed, exactly as #580 requires.
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(node, {}), ["STITCHER"]);
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(node, {}, new Set()), ["STITCHER"]);
+  // Some registered node declaring STITCHER as an OUTPUT proves it is a link
+  // datatype no widget constructor will ever appear for.
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(node, {}, new Set(["STITCHER"])), []);
+});
+
+test("native VIDEO socket resolves via registry proof (#608 SaveVideo)", () => {
+  const node = {
+    constructor: {
+      nodeData: {
+        input: {
+          required: {
+            video: ["VIDEO", {}],
+            filename_prefix: ["STRING", {}],
+          },
+        },
+      },
+    },
+  };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(node, { STRING: () => {} }, new Set(["VIDEO"])),
+    [],
+  );
+});
+
+test("canvasOnly upload control counts as materialized while a plain serialize:false widget stays missing (#620 LoadImage)", () => {
+  const node = {
+    widgets: [
+      // ComfyUI's own IMAGEUPLOAD button: deliberately serialize:false,
+      // canvasOnly:true — a canvas control paired with the real value widget.
+      { name: "upload", options: { serialize: false, canvasOnly: true } },
+      { name: "gallery", options: { serialize: false } },
+    ],
+    constructor: {
+      nodeData: {
+        input: {
+          required: {
+            upload: ["IMAGEUPLOAD", {}],
+            gallery: ["ZIPN_STYLE_GALLERY", {}],
+          },
+        },
+      },
+    },
+  };
+  assert.deepEqual(
+    missingRequiredWidgetMaterializations(node, { ...widgetConstructors, IMAGEUPLOAD: () => {} }),
+    ["gallery"],
+  );
+});

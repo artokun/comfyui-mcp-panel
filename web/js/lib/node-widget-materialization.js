@@ -41,9 +41,10 @@ export function requiredWidgetInputTypes(nodeOrNodeData) {
 // extension is still registering.
 const SAFE_SOCKET_TYPES = new Set([
   "*", "ANY", "AUDIO", "BBOX", "CLIP", "CLIP_VISION", "CLIP_VISION_OUTPUT",
-  "CONDITIONING", "CONTROL_NET", "GLIGEN", "GUIDER", "IMAGE", "IPADAPTER",
-  "LATENT", "MODEL", "NOISE", "SAMPLER", "SCHEDULER", "SIGMAS", "STYLE_MODEL",
-  "UNET", "UPSCALE_MODEL", "VAE",
+  "CONDITIONING", "CONTROL_NET", "GLIGEN", "GUIDER", "HOOKS", "IMAGE",
+  "IPADAPTER", "LATENT", "LATENT_OPERATION", "MASK", "MESH", "MODEL", "NOISE",
+  "SAMPLER", "SCHEDULER", "SIGMAS", "STYLE_MODEL", "UNET", "UPSCALE_MODEL",
+  "VAE", "VOXEL",
 ]);
 
 /**
@@ -51,10 +52,26 @@ const SAFE_SOCKET_TYPES = new Set([
  * live ComfyUI registry yet. Unknown custom socket types deliberately remain
  * unavailable: their schema is indistinguishable from a widget pending its
  * extension hook, so admitting one would reintroduce #580's bad prompt.
+ *
+ * `knownSocketTypes` lifts that ambiguity where the LIVE registry already
+ * proves the type is a link datatype (some registered node declares it as an
+ * OUTPUT — no widget constructor will ever appear for it). Without it the
+ * hardcoded allowlist above fails closed FOREVER on every third-party socket
+ * datatype (#620 STITCHER) and on core types the list missed (#620 MASK,
+ * #608 VIDEO), which no retry/refresh can ever clear. A still-unknown type
+ * with NO registry proof continues to fail closed, so #580's protection is
+ * intact.
  */
-export function unavailableRequiredCustomWidgetTypes(nodeOrNodeData, widgetConstructors) {
-  return requiredWidgetInputTypes(nodeOrNodeData).filter((type) =>
-    typeof widgetConstructors?.[type] !== "function" && !SAFE_SOCKET_TYPES.has(type),
+export function unavailableRequiredCustomWidgetTypes(
+  nodeOrNodeData,
+  widgetConstructors,
+  knownSocketTypes,
+) {
+  return requiredWidgetInputTypes(nodeOrNodeData).filter(
+    (type) =>
+      typeof widgetConstructors?.[type] !== "function" &&
+      !SAFE_SOCKET_TYPES.has(type) &&
+      knownSocketTypes?.has?.(type) !== true,
   );
 }
 
@@ -76,7 +93,16 @@ export function missingRequiredWidgetMaterializations(node, widgetConstructors) 
     // ComfyUI's prompt serializer reads the widget *options* flag. A widget
     // property named `serialize` is not authoritative and must not allow a
     // canvas-only control to satisfy a required prompt value.
-    if (!widget || widget.options?.serialize === false) missing.push(name);
+    //
+    // `options.canvasOnly` is the exception ComfyUI itself declares: the
+    // IMAGEUPLOAD button (frontend-injected `upload` input on LoadImage &
+    // friends) is created as
+    //   addWidget("button", name, "image", …, { serialize: false, canvasOnly: true })
+    // — a control PAIRED with a real value widget (`image`), never a prompt
+    // value of its own. Its presence proves the registered constructor ran,
+    // which is exactly what this guard asks (#620).
+    const canvasControl = widget?.options?.canvasOnly === true;
+    if (!widget || (widget.options?.serialize === false && !canvasControl)) missing.push(name);
   }
   return missing;
 }

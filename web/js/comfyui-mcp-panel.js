@@ -6475,13 +6475,32 @@ function placementFor(graph, pos) {
 const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = 5000;
 const CUSTOM_WIDGET_REGISTRATION_POLL_MS = 25;
 
-async function awaitRequiredCustomWidgetRegistration(nodeData, comfyApp) {
+/** Datatypes some REGISTERED node declares as an OUTPUT are link sockets, not
+ *  widgets pending registration — a widget constructor will never appear for
+ *  them. Derived from the live registry so third-party socket types (#620
+ *  STITCHER) and core types the allowlist missed (#608 VIDEO) resolve without
+ *  an allowlist that can only ever be incomplete. */
+function registeredSocketTypes(LG) {
+  const types = new Set();
+  for (const ctor of Object.values(LG?.registered_node_types ?? {})) {
+    const outputs = ctor?.nodeData?.output;
+    if (!Array.isArray(outputs)) continue;
+    for (const out of outputs) {
+      if (typeof out === "string" && out) types.add(out);
+    }
+  }
+  return types;
+}
+
+async function awaitRequiredCustomWidgetRegistration(nodeData, comfyApp, LG) {
   const deadline = Date.now() + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
-  let unavailable = unavailableRequiredCustomWidgetTypes(nodeData, comfyApp?.widgets);
+  const check = () =>
+    unavailableRequiredCustomWidgetTypes(nodeData, comfyApp?.widgets, registeredSocketTypes(LG));
+  let unavailable = check();
   while (Date.now() < deadline) {
     if (!unavailable.length) return;
     await new Promise((resolve) => setTimeout(resolve, CUSTOM_WIDGET_REGISTRATION_POLL_MS));
-    unavailable = unavailableRequiredCustomWidgetTypes(nodeData, comfyApp?.widgets);
+    unavailable = check();
   }
   if (!unavailable.length) return;
   throw new Error(
@@ -7740,6 +7759,7 @@ const GRAPH_TOOL_EXECUTORS = {
     await awaitRequiredCustomWidgetRegistration(
       LG?.registered_node_types?.[class_type]?.nodeData,
       comfyApp,
+      LG,
     );
     const node = LG.createNode(class_type);
     if (!node) {
