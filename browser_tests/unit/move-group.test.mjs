@@ -1162,6 +1162,31 @@ test("writePoint reports the truth for every point shape", () => {
   assert.equal(writePoint(snapping, "pos", 113, 113), false, "a snapped write is not the write we asked for");
 });
 
+test("groupBoxIsAt is total even when the accessor throws on its SECOND read", () => {
+  // groupBoxIsAt reads the box twice: once through groupBoundsOf (already safe)
+  // and once directly, for the Float32 check. It is the verification step of the
+  // box write — running after the children have moved and before the rollback —
+  // so a throw from that second read would escape the transaction through the
+  // very check that exists to keep it honest. A first-read-throws fixture cannot
+  // reach it: groupBoundsOf swallows that one and returns early.
+  let reads = 0;
+  const flaky = {
+    get _bounding() {
+      reads += 1;
+      if (reads > 1) throw new TypeError("group detached mid-verification");
+      return [0, 0, 10, 10];
+    },
+  };
+  let result;
+  assert.doesNotThrow(() => { result = groupBoxIsAt(flaky, 0, 0, 10, 10); });
+  assert.equal(reads > 1, true, "precondition: the second read really was attempted");
+  assert.equal(result, false, "cannot be shown to be there ⇒ treated as not there");
+
+  const deadOnArrival = { get _bounding() { throw new TypeError("gone"); } };
+  assert.doesNotThrow(() => { result = groupBoxIsAt(deadOnArrival, 0, 0, 10, 10); });
+  assert.equal(result, false);
+});
+
 test("writePoint never throws — not even for a container it cannot inspect or read", () => {
   // hasSetter walks the prototype chain with getPrototypeOf/getOwnPropertyDescriptor,
   // and BOTH throw on a revoked Proxy — as does reading the property itself. A

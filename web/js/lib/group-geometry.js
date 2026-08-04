@@ -512,13 +512,22 @@ function isFloat32(container) {
  * user had.
  */
 export function groupBoxIsAt(g, x, y, w, h) {
-  const after = groupBoundsOf(g);
-  if (!after) return false;
-  const f32 = isFloat32(g?._bounding);
-  if (!samePoint(after[0], x, f32) || !samePoint(after[1], y, f32)) return false;
-  if (w != null && !samePoint(after[2], w, f32)) return false;
-  if (h != null && !samePoint(after[3], h, f32)) return false;
-  return true;
+  // Total, like every other guard here. groupBoundsOf is safe, but the follow-up
+  // `g._bounding` read is a second touch of the same accessor — and this runs as
+  // the verification step of a box write, AFTER the children have moved and
+  // BEFORE the rollback. A throw there would escape the transaction through the
+  // very check that exists to keep it honest.
+  try {
+    const after = groupBoundsOf(g);
+    if (!after) return false;
+    const f32 = isFloat32(g?._bounding);
+    if (!samePoint(after[0], x, f32) || !samePoint(after[1], y, f32)) return false;
+    if (w != null && !samePoint(after[2], w, f32)) return false;
+    if (h != null && !samePoint(after[3], h, f32)) return false;
+    return true;
+  } catch {
+    return false; // cannot be shown to be there ⇒ treated as not there
+  }
 }
 
 /**
