@@ -550,25 +550,25 @@ test("#585 P1(persisted-write): an attempt that could not be RECORDED still warn
   // attempt yet", so a retry after a reload would go out as a first attempt with no
   // warning. Written is not persisted, exactly as sent is not received.
   assert.equal(
-    rebootResumeRepeatWarning({ attempts: 0, attemptRecorded: false }),
+    rebootResumeRepeatWarning({ totalAttempts: 0, attemptRecorded: false }),
     true,
     "if storage cannot count attempts, we must assume there may have been one",
   );
-  assert.equal(rebootResumeRepeatWarning({ attempts: 1, attemptRecorded: true }), true);
+  assert.equal(rebootResumeRepeatWarning({ totalAttempts: 1, attemptRecorded: true }), true);
   assert.equal(
-    rebootResumeRepeatWarning({ attempts: 0, attemptRecorded: true, sentThisMount: 1 }),
+    rebootResumeRepeatWarning({ totalAttempts: 0, attemptRecorded: true, sentThisMount: 1 }),
     true,
     "a send we made in this mount is storage-independent evidence",
   );
-  for (const attempts of [undefined, null, NaN, "1"]) {
+  for (const totalAttempts of [undefined, null, NaN, "1"]) {
     assert.equal(
-      rebootResumeRepeatWarning({ attempts, attemptRecorded: true }),
+      rebootResumeRepeatWarning({ totalAttempts, attemptRecorded: true }),
       true,
-      `uncountable attempts (${String(attempts)}) must warn`,
+      `uncountable attempts (${String(totalAttempts)}) must warn`,
     );
   }
   assert.equal(
-    rebootResumeRepeatWarning({ attempts: 0, attemptRecorded: true, sentThisMount: 0 }),
+    rebootResumeRepeatWarning({ totalAttempts: 0, attemptRecorded: true, sentThisMount: 0 }),
     false,
     "a genuine, verified first attempt does not warn",
   );
@@ -577,6 +577,41 @@ test("#585 P1(persisted-write): an attempt that could not be RECORDED still warn
     true,
     "and with no information at all the safe side is to warn — no parameter default may invent one",
   );
+});
+
+test("#585 P1(budget-vs-evidence): a bridge drop refreshes the BUDGET without erasing the duplicate evidence", () => {
+  // These are two different facts and were one field. The retry budget is per
+  // delivery episode and an observed drop legitimately refreshes it; "a nudge may
+  // already be in the agent's queue" is monotonic and must survive every episode.
+  // Conflated, a drop erased the evidence — and a resume that reached the
+  // orchestrator but lost its receipt IN THAT DROP is exactly the case a later
+  // undisclosed retry would duplicate.
+  const afterTwoSends = decodeRebootMarker(
+    encodeRebootMarker({ at: 1000, runs: [], threadId: "t-A", attempts: 2, totalAttempts: 2 }),
+  );
+  assert.equal(afterTwoSends.attempts, 2);
+  assert.equal(afterTwoSends.totalAttempts, 2);
+
+  // The drop-gated refresh zeroes the episode budget only.
+  const afterDrop = decodeRebootMarker(encodeRebootMarker({ ...afterTwoSends, attempts: 0 }));
+  assert.equal(afterDrop.attempts, 0, "the budget is refreshed…");
+  assert.equal(afterDrop.totalAttempts, 2, "…but the evidence is not erased");
+  assert.equal(
+    rebootResumeRepeatWarning({
+      totalAttempts: afterDrop.totalAttempts,
+      attemptRecorded: true,
+      sentThisMount: 0, // a remount cleared the in-memory supplement
+    }),
+    true,
+    "so the next attempt still discloses the possible duplicate",
+  );
+});
+
+test("#585: a legacy marker with only the per-episode count still reports it as evidence", () => {
+  // `ts` absent ⇒ fall back to `t` rather than to zero: an older marker that
+  // recorded one attempt must not read as "never attempted".
+  const m = decodeRebootMarker(JSON.stringify({ v: 1, at: 1000, runs: [], n: 0, t: 2 }));
+  assert.equal(m.totalAttempts, 2);
 });
 
 test("#585: the wait budget is a TRI-STATE — within / spent / unknown", () => {

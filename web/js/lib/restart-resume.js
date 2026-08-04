@@ -87,6 +87,7 @@ export function encodeRebootMarker({
   threadId = null,
   sessionId = null,
   attempts = 0,
+  totalAttempts,
 } = {}) {
   const ids = normalizeRunIds(runs);
   const armed = Number.isFinite(armedRunCount) ? Math.max(0, Math.trunc(armedRunCount)) : ids.length;
@@ -95,12 +96,21 @@ export function encodeRebootMarker({
     at: Number.isFinite(at) ? at : null,
     runs: ids,
     n: Math.max(armed, ids.length),
-    // How many resume attempts have already gone out for this reboot. Persisted so
-    // it survives a reload: a fresh mount cannot know whether an earlier attempt
-    // was actually taken by the orchestrator, and re-sending silently would put a
-    // second identical "continue" in front of the agent. Non-zero ⇒ the resume
-    // says so, turning a possible duplicate into a disclosed one.
+    // TWO different facts, deliberately two fields — conflating them let a bridge
+    // drop erase the duplicate evidence while refreshing the budget.
+    //
+    // `t` — attempts in the CURRENT delivery episode. This is the retry BUDGET, and
+    // an observed drop legitimately refreshes it (a new connection is a new chance).
     t: Number.isFinite(attempts) ? Math.max(0, Math.trunc(attempts)) : 0,
+    // `ts` — attempts EVER made for this reboot. Monotonic: nothing but retiring the
+    // reboot resets it. This is the cross-mount evidence for "the agent may already
+    // have received a nudge", and it must survive every episode boundary, because a
+    // resume that reached the orchestrator and lost only its receipt is exactly the
+    // case a later undisclosed retry would duplicate.
+    ts: Math.max(
+      Number.isFinite(totalAttempts) ? Math.max(0, Math.trunc(totalAttempts)) : 0,
+      Number.isFinite(attempts) ? Math.max(0, Math.trunc(attempts)) : 0,
+    ),
     // WHICH CONVERSATION asked for this restart. The wait set (`runs`) is global
     // because a reboot is global, but the resume is a message into ONE agent
     // session — delivering it to whatever conversation happens to be on screen
@@ -127,7 +137,15 @@ export function decodeRebootMarker(raw) {
   if (typeof raw !== "string") return null;
   const text = raw.trim();
   if (!text) return null;
-  const empty = { at: null, runs: [], armedRunCount: 0, threadId: null, sessionId: null, attempts: 0 };
+  const empty = {
+    at: null,
+    runs: [],
+    armedRunCount: 0,
+    threadId: null,
+    sessionId: null,
+    attempts: 0,
+    totalAttempts: 0,
+  };
   if (text[0] !== "{") return empty; // legacy "1"
   let parsed = null;
   try {
@@ -155,6 +173,11 @@ export function decodeRebootMarker(raw) {
     threadId: typeof parsed.tid === "string" && parsed.tid ? parsed.tid : null,
     sessionId: typeof parsed.sid === "string" && parsed.sid ? parsed.sid : null,
     attempts: Number.isFinite(parsed.t) ? Math.max(0, Math.trunc(parsed.t)) : 0,
+    totalAttempts: Number.isFinite(parsed.ts)
+      ? Math.max(0, Math.trunc(parsed.ts))
+      : Number.isFinite(parsed.t)
+        ? Math.max(0, Math.trunc(parsed.t))
+        : 0,
   };
 }
 
@@ -226,18 +249,21 @@ export function planRebootResume(state = {}) {
  * one redundant sentence; a warning wrongly absent is an undisclosed duplicate
  * "continue", which is the hazard this whole fix exists to prevent.
  *
- * @param {{attempts?:unknown, attemptRecorded?:boolean, sentThisMount?:number}} state
+ * @param {{totalAttempts?:unknown, attemptRecorded?:boolean, sentThisMount?:number}} state
  * @returns {boolean}
  */
 export function rebootResumeRepeatWarning(state = {}) {
   // NO parameter defaults here on purpose. A default would substitute a definite
   // value ("0 attempts", "recorded fine") for an absent one — which is the very
   // mistake this helper exists to prevent. Absent means unknown, and unknown warns.
-  const { attempts, attemptRecorded, sentThisMount } = state;
+  const { totalAttempts, attemptRecorded, sentThisMount } = state;
   if (attemptRecorded !== true) return true; // not recorded, or not known to be
   if (Number.isFinite(sentThisMount) && Number(sentThisMount) > 0) return true; // storage-independent
-  if (!Number.isFinite(attempts)) return true; // uncountable / absent ⇒ assume
-  return Number(attempts) > 0;
+  // The MONOTONIC total, never the per-episode budget: a bridge drop refreshes the
+  // budget, and reading the budget here would let a drop erase the evidence that an
+  // earlier attempt may already be sitting in the agent's queue.
+  if (!Number.isFinite(totalAttempts)) return true; // uncountable / absent ⇒ assume
+  return Number(totalAttempts) > 0;
 }
 
 /**
@@ -337,6 +363,7 @@ function markerFields(marker) {
     threadId: marker.threadId,
     sessionId: marker.sessionId,
     attempts: marker.attempts,
+    totalAttempts: marker.totalAttempts,
   };
 }
 

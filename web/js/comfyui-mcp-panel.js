@@ -19586,7 +19586,8 @@ function buildPanel() {
     if (retained) {
       const withAttempt = encodeRebootMarker({
         ...decodeRebootMarker(retained),
-        attempts: (marker?.attempts ?? 0) + 1,
+        attempts: (marker?.attempts ?? 0) + 1, // episode budget
+        totalAttempts: (marker?.totalAttempts ?? 0) + 1, // monotonic evidence
       });
       ssSet(REBOOT_KEY, withAttempt);
       attemptRecorded = ssGet(REBOOT_KEY) === withAttempt;
@@ -19601,7 +19602,7 @@ function buildPanel() {
       }
     }
     const repeat = rebootResumeRepeatWarning({
-      attempts: marker?.attempts,
+      totalAttempts: marker?.totalAttempts,
       attemptRecorded,
       sentThisMount: rebootResumeMids.size,
     });
@@ -19797,11 +19798,18 @@ function buildPanel() {
       rebootResumeStalledNoticeShown = false;
       // The budget lives in the PERSISTED marker (so a reload can't refill it), so
       // refreshing it means rewriting the marker — not zeroing a local counter.
+      // Refresh ONLY the episode budget. `totalAttempts` is deliberately untouched:
+      // it is the evidence that a nudge may already be in the agent's queue, and a
+      // resume that reached the orchestrator but lost its receipt in this very drop
+      // is exactly the case a later undisclosed retry would duplicate.
       const raw = ssGet(REBOOT_KEY);
       const decoded = raw == null ? null : decodeRebootMarker(raw);
       if (decoded && decoded.attempts > 0) {
         ssSet(REBOOT_KEY, encodeRebootMarker({ ...decoded, attempts: 0 }));
       }
+      // Mids from the dead socket can never be acked on the new connection, so drop
+      // them — this also bounds the set across repeated drops.
+      rebootResumeMids.clear();
     } else if (rebootResumeMid != null) {
       // Same connection, attempt still outstanding — let the watch and the receipt
       // ack resolve it rather than firing a second identical "continue".
