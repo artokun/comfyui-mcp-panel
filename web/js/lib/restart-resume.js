@@ -28,6 +28,10 @@
 //     runs still owed a completion frame at the moment the reboot was armed. The
 //     marker is retained while waiting and cleared only when the resume is
 //     actually sent.
+//     ARM-TIME is the correct set, not an approximation of a per-workflow one — a
+//     reboot restarts ComfyUI globally, so every render in flight at that instant
+//     is exposed to the same nudge. See the comment at the arm site in
+//     comfyui-mcp-panel.js (`cmd === "comfy_reboot"`) before narrowing this.
 //
 //  3. It completes ASYNCHRONOUSLY. "The tracker retired the run" is not "the agent
 //     was told" — the run tracker retires a run optimistically, before the caller's

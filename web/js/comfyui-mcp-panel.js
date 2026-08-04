@@ -18768,6 +18768,22 @@ function buildPanel() {
         // survives the frontend reload a restart can cause (an in-memory ledger
         // starts empty on the new mount and would report "nothing in flight" for
         // a render that is still executing).
+        //
+        // DO NOT "improve" this into a per-workflow correlation. It looks like an
+        // approximation of one and it is not — arm-time IS the correct set. A
+        // reboot restarts ComfyUI GLOBALLY, so every render in flight at this
+        // instant is exposed to the same hazard: the generic "continue" nudge that
+        // makes the agent conclude its render was aborted and queue it again.
+        // Resuming while another workflow's render is still exposed to that hazard
+        // would be the wrong semantics, not a tighter one. (The tracker also has no
+        // workflow attribution on prompt ids; inventing one to reach a worse rule
+        // would be a large change to a concept this codebase doesn't have, landing
+        // inside a fix for a STRANDING bug — not a trade worth making.)
+        //
+        // The accepted consequence: two workflows rendering when a reboot fires
+        // means the resume waits for both. That is bounded — the set is fixed at
+        // arm time, drains as each run settles, and the 15-minute backstop resumes
+        // WITH a disclosure rather than holding the session in silence.
         const armedRuns = (() => {
           try {
             return runCompletionRef?.unsettledPromptIds?.() ?? [];
