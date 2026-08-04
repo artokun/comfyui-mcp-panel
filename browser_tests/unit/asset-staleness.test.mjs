@@ -229,6 +229,61 @@ test("assetCandidateStillReferenced fails OPEN when the node is gone", () => {
   assert.equal(assetCandidateStillReferenced(graphOf([]), 99, "x.safetensors"), true);
 });
 
+// ---- #586: stale missing_media after a LoadImage widget change ----
+// The missingMedia Pinia store is populated at workflow LOAD; after the user
+// repoints the node's image widget to a different file, the load-time candidate
+// for the OLD value must no longer be reported. The drop must come from the
+// WIDGET-REFERENCE cross-check — so pin it with trustCombo:false (the combo
+// clear path inert) and a node that provably still exists (the scope-drop path
+// inert). Mirroring the issue's repro: node 2129, load-time value
+// 20260707_130607992_iOS.jpg, widget changed to helloe.png.
+test("isStaleAssetCandidate drops a missing-MEDIA candidate whose LoadImage widget moved to a new file (#586)", () => {
+  const node = {
+    id: 2129,
+    type: "LoadImage",
+    widgets: [{ name: "image", value: "helloe.png", options: { values: ["helloe.png"] } }],
+  };
+  const candidate = {
+    nodeId: "2129",
+    name: "20260707_130607992_iOS.jpg",
+    widgetName: "image",
+    mediaType: "image",
+    isMissing: true,
+  };
+  // Assert the REASON, not just the verdict: with no combo trust and the node
+  // present, only the still-referenced check can drop it.
+  assert.equal(
+    assetCandidateStillReferenced(graphOf([node]), "2129", "20260707_130607992_iOS.jpg"),
+    false,
+    "no widget still holds the old file",
+  );
+  assert.equal(
+    isStaleAssetCandidate(graphOf([node]), candidate, { trustCombo: false }),
+    true,
+  );
+});
+
+test("isStaleAssetCandidate KEEPS the media candidate while the widget still holds the missing file (#586 control)", () => {
+  const node = {
+    id: 2129,
+    type: "LoadImage",
+    widgets: [{ name: "image", value: "helloe.png", options: { values: ["helloe.png"] } }],
+  };
+  const candidate = {
+    nodeId: "2129",
+    name: "helloe.png",
+    widgetName: "image",
+    mediaType: "image",
+    isMissing: true,
+  };
+  // trustCombo stays false: a genuinely missing current value must survive even
+  // though the combo lists it (an untrusted combo may be a stale snapshot).
+  assert.equal(
+    isStaleAssetCandidate(graphOf([node]), candidate, { trustCombo: false }),
+    false,
+  );
+});
+
 test("assetCandidateResolvesLive: true when the file is now a live combo value (#223/#185)", () => {
   const node = {
     id: 4,

@@ -150,6 +150,12 @@ import {
   inputPathsUseWindowsSeparators,
 } from "./lib/input-asset.js";
 import {
+  GET_ERRORS_TOTAL_BUDGET_MS,
+  GET_ERRORS_REFRESH_CAP_MS,
+  GET_ERRORS_STEP_CAP_MS,
+  getErrorsStepBudgetMs,
+} from "./lib/get-errors-budget.js";
+import {
   drivenWidgetsFor,
   drivenTag,
   capSummaryWidgets,
@@ -5158,13 +5164,17 @@ function clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph 
 // is never re-interpreted into a path the server would not resolve
 // (over-report, never suppress — the same fail direction as the probe itself).
 let serverInputPathsAreWindows = null;
-async function inputAssetServerUsesWindowsPaths() {
+// `budgetMs` caps the /system_stats wait (see get-errors-budget.js). A call with
+// no budget left returns UNKNOWN (false → POSIX semantics, fail closed) WITHOUT
+// caching — a budget skip must not poison the session-long platform verdict.
+async function inputAssetServerUsesWindowsPaths(budgetMs = GET_ERRORS_STEP_CAP_MS) {
   if (serverInputPathsAreWindows !== null) return serverInputPathsAreWindows;
+  if (!(budgetMs > 0)) return false;
   try {
     if (typeof api?.fetchApi !== "function") return false;
     const res = await api.fetchApi("/system_stats", {
       cache: "no-store",
-      signal: AbortSignal.timeout(GET_ERRORS_REFRESH_TIMEOUT_MS),
+      signal: AbortSignal.timeout(budgetMs),
     });
     const stats = res && res.ok ? await res.json() : null;
     serverInputPathsAreWindows = inputPathsUseWindowsSeparators(stats);
@@ -5189,9 +5199,22 @@ async function inputAssetServerUsesWindowsPaths() {
  * preserving the prior fail-closed warning. The subfolder/filename split follows
  * the SERVER's path semantics so a backslash is treated as a separator only
  * where ComfyUI itself would treat it as one.
+ *
+ * `remainingBudgetMs` (a thunk read between steps, so an earlier step's spend
+ * shrinks the next step's cap) bounds each await; the default keeps the
+ * historical per-step cap for the best-effort validationBanner caller. When no
+ * budget remains, probing is skipped entirely and every candidate stays
+ * reported — the same fail-closed direction as a failed probe (#589).
  */
-async function filterServerConfirmedInputSubfolderMedia(media) {
-  const backslashIsSeparator = await inputAssetServerUsesWindowsPaths();
+async function filterServerConfirmedInputSubfolderMedia(
+  media,
+  remainingBudgetMs = () => GET_ERRORS_STEP_CAP_MS,
+) {
+  const statsBudget = remainingBudgetMs();
+  if (!(statsBudget > 0)) return media;
+  const backslashIsSeparator = await inputAssetServerUsesWindowsPaths(statsBudget);
+  const probeBudget = remainingBudgetMs();
+  if (!(probeBudget > 0)) return media;
   return filterServerConfirmedInputSubfolderCandidates(
     media,
     async (assetValue, ref) => {
@@ -5204,7 +5227,7 @@ async function filterServerConfirmedInputSubfolderMedia(media) {
           method: "GET",
           cache: "no-store",
           headers: { Range: "bytes=0-0" },
-          signal: AbortSignal.timeout(GET_ERRORS_REFRESH_TIMEOUT_MS),
+          signal: AbortSignal.timeout(probeBudget),
         });
         return !!res && (res.ok || res.status === 206);
       } catch {
@@ -5241,25 +5264,31 @@ function hasRawMissingAssetCandidates() {
   return false;
 }
 
-// Upper bound on the authoritative /object_info refresh get_errors awaits: a stalled
-// or backgrounded ComfyUI must never wedge the error query. On timeout we resolve (not
-// reject) and fall through to the load-time snapshot — worst case is today's staleness,
-// never a hung tool call (codex #5). The refresh promise itself keeps running (the
-// coalescer owns it) and benefits a later call.
-const GET_ERRORS_REFRESH_TIMEOUT_MS = 4000;
+// The elective server-verification waits inside one graph_get_errors call share
+// ONE total budget (GET_ERRORS_TOTAL_BUDGET_MS, see lib/get-errors-budget.js):
+// the orchestrator answers panel_get_errors through the ui-bridge 20 s read
+// default, so the SUM of the refresh race + /system_stats + /view probes must
+// stay under it or the reply loses to a "tab did not reply" timeout on a live
+// tab (#589). The refresh cap itself is 15 s because a real slow-install
+// /object_info runs ~14.5 s (#610) — the old flat 4 s cap fired first and kept
+// verified-on-disk models reporting missing. A step that finds no budget left
+// is SKIPPED and fails closed (distrust the combo / keep the candidate): worst
+// case is today's staleness, never a hung tool call (codex #5). The refresh
+// promise itself keeps running (the coalescer owns it) and benefits a later
+// call.
 // Resolves to the refresh's OWN freshness verdict (registerComfyNodeDefs returns TRUE
 // only when it authoritatively fetched /object_info AND refreshed combos), or FALSE if
 // the refresh errored or the timeout wins first. get_errors trusts the combo on this
 // returned value — NOT the shared nodeDefsRefreshConfirmed global, which a concurrent
 // refresh can overwrite mid-await against a stale combo (codex round-5/6 P0). Never
 // rejects; a timeout or failure falls to FALSE ⇒ distrust ⇒ over-report.
-function withRefreshTimeout(promise) {
+function withRefreshTimeout(promise, timeoutMs) {
   return Promise.race([
     Promise.resolve(promise).then(
       (v) => v === true,
       () => false,
     ),
-    new Promise((resolve) => setTimeout(() => resolve(false), GET_ERRORS_REFRESH_TIMEOUT_MS)),
+    new Promise((resolve) => setTimeout(() => resolve(false), timeoutMs)),
   ]);
 }
 
@@ -8378,9 +8407,22 @@ const GRAPH_TOOL_EXECUTORS = {
     // nodeDefsRefreshConfirmed global, which a concurrent refresh (reconnect / add_node
     // payload / download) can overwrite against a stale combo mid-await (codex round-6
     // P0). Defaults to FALSE (distrust ⇒ over-report) unless MY refresh proves freshness.
+    // One SHARED budget for every elective server wait below (refresh race,
+    // /system_stats, /view probes): the orchestrator's ui-bridge read default is
+    // 20 s, and the sum of these waits must never outlive it — a "did not reply"
+    // timeout on a live tab strands the agent with no error surface at all (#589).
+    // A step that finds no budget left is skipped and fails CLOSED (distrust the
+    // combo / keep the raw candidate), never a hung call. The refresh cap is 15 s
+    // because a slow-install /object_info runs ~14.5 s (#610).
+    const errorsBudgetStart = monotonicNow();
+    const errorsStepBudget = (capMs) =>
+      getErrorsStepBudgetMs(monotonicNow() - errorsBudgetStart, capMs);
     let comboTrustedForQuery = false;
     try {
-      if (hasRawMissingAssetCandidates()) {
+      const refreshBudgetMs = hasRawMissingAssetCandidates()
+        ? errorsStepBudget(GET_ERRORS_REFRESH_CAP_MS)
+        : 0;
+      if (refreshBudgetMs > 0) {
         // force:true so we never JOIN an /object_info fetch that began BEFORE the current
         // asset state (a joined stale run would trust a combo snapshot predating a just-
         // deleted asset and suppress the now-genuine miss). The coalescer guarantees a
@@ -8390,6 +8432,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // triggered, not any concurrent run's global write.
         comboTrustedForQuery = await withRefreshTimeout(
           refreshComfyNodeDefs(undefined, { force: true }),
+          refreshBudgetMs,
         );
         // …AND only if no OTHER refresh is still in flight at this synchronous point. The
         // shared coalescer lets a concurrent PAYLOAD refresh (graph_add_node) run its own
@@ -8442,7 +8485,16 @@ const GRAPH_TOOL_EXECUTORS = {
     // assertGraphBoundToActiveWorkflow above, never a cross-workflow result.
     const preProbeWorkflow = activeWorkflowRef();
     const preProbeRootGraph = rootGraph;
-    assets.media = await filterServerConfirmedInputSubfolderMedia(assets.media);
+    // Skip the probe when the shared budget is already spent (e.g. a slow
+    // /object_info refresh consumed it): every candidate stays reported — the
+    // same fail-closed direction as a failed probe — and the reply still beats
+    // the bridge's 20 s read timeout (#589). No await happened in that case, so
+    // the cross-workflow correlation below trivially holds.
+    if (errorsStepBudget(GET_ERRORS_STEP_CAP_MS) > 0) {
+      assets.media = await filterServerConfirmedInputSubfolderMedia(assets.media, () =>
+        errorsStepBudget(GET_ERRORS_STEP_CAP_MS),
+      );
+    }
     let postProbeRootGraph = null;
     try {
       postProbeRootGraph = getGraphCtx().rootGraph ?? null;
