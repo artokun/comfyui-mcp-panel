@@ -42,9 +42,17 @@ export function nodeFocusBounds(node) {
  * shifts the bounding-box origin by the same amount, so this correction is exact
  * and build-independent. Dependency-free (no LiteGraph, no DOM) so it is
  * unit-testable with plain object fixtures.
+ *
+ * NEVER THROWS. This runs AFTER a node's position has already been written, so a
+ * throw here would escape from the middle of a group move — past the caller's
+ * rollback, which only runs once the mover returns — and leak a moved node out
+ * under an unrelated TypeError. A cached rect that will not accept the correction
+ * is reported by the return value (false) instead, so the caller can treat that
+ * node as stuck and refuse the whole move rather than discovering it mid-flight.
+ * Returns true when the rect is in step with the node's live position.
  */
 export function refreshNodeArea(node, prevPos) {
-  if (!node) return;
+  if (!node) return true;
   const rectBefore = node.boundingRect;
   const originBefore =
     rectBefore && rectBefore.length === 4 ? [rectBefore[0], rectBefore[1]] : null;
@@ -54,19 +62,25 @@ export function refreshNodeArea(node, prevPos) {
     /* some builds need a canvas ctx; the delta-sync below still corrects it */
   }
   const br = node.boundingRect;
-  if (!br || br.length !== 4) return;
+  if (!br || br.length !== 4) return true; // nothing cached ⇒ reads use live pos/size
   // Engine already moved the rect origin → trust its authoritative recompute.
-  if (originBefore && (br[0] !== originBefore[0] || br[1] !== originBefore[1])) return;
-  if (!Array.isArray(prevPos) || prevPos.length !== 2) return;
+  if (originBefore && (br[0] !== originBefore[0] || br[1] !== originBefore[1])) return true;
+  if (!Array.isArray(prevPos) || prevPos.length !== 2) return true;
   const px = Number(prevPos[0]);
   const py = Number(prevPos[1]);
-  if (!Number.isFinite(px) || !Number.isFinite(py)) return;
+  if (!Number.isFinite(px) || !Number.isFinite(py)) return true;
   const dx = (node.pos?.[0] ?? 0) - px;
   const dy = (node.pos?.[1] ?? 0) - py;
-  if (dx || dy) {
-    br[0] += dx;
-    br[1] += dy;
+  if (!dx && !dy) return true;
+  const wantX = br[0] + dx;
+  const wantY = br[1] + dy;
+  try {
+    br[0] = wantX;
+    br[1] = wantY;
+  } catch {
+    /* frozen/read-only rect — reported below, never thrown mid-transaction */
   }
+  return br[0] === wantX && br[1] === wantY;
 }
 
 /** [x, y, w, h] that wraps the given nodes, padded for the group + node titles. */
@@ -89,11 +103,31 @@ export function boundsAroundNodes(nodes, pad = 30, titlePad = 70) {
   return [minX - pad, minY - titlePad, maxX - minX + pad * 2, maxY - minY + titlePad + pad];
 }
 
-/** Current [x,y,w,h] of a group box, or null if not finite. */
-export function groupBoundsOf(g) {
-  const b = g?._bounding ?? [g?.pos?.[0], g?.pos?.[1], g?.size?.[0], g?.size?.[1]];
-  const x = Number(b?.[0]), y = Number(b?.[1]), w = Number(b?.[2]), h = Number(b?.[3]);
+/** [x, y, w, h] as finite numbers, or null if any component is not one. */
+function finiteQuad(v) {
+  const x = Number(v?.[0]), y = Number(v?.[1]), w = Number(v?.[2]), h = Number(v?.[3]);
   return [x, y, w, h].every(Number.isFinite) ? [x, y, w, h] : null;
+}
+
+/**
+ * Current [x, y, w, h] of a group box, or null when the build exposes neither
+ * usable form.
+ *
+ * The fallback to pos/size is on VALIDITY, not on `_bounding` being nullish. A
+ * present-but-malformed `_bounding` (a half-initialised quad, a leftover from a
+ * failed deserialize) used to short-circuit the `??` and make the whole group
+ * read as unbounded — so a group carrying perfectly good finite pos/size was
+ * refused as having no usable bounds. "Present" is not "usable".
+ */
+export function groupBoundsOf(g) {
+  try {
+    return (
+      finiteQuad(g?._bounding) ??
+      finiteQuad([g?.pos?.[0], g?.pos?.[1], g?.size?.[0], g?.size?.[1]])
+    );
+  } catch {
+    return null; // a hostile/disposed accessor is "no usable bounds", not a throw
+  }
 }
 
 /**
@@ -144,26 +178,83 @@ export function groupMemberNodes(graph, g) {
  * is no cached rect — nodeFocusBounds already uses live pos/size in that case.
  * Mutates in place so it works on plain arrays AND typed-array rects (ComfyUI
  * Rectangle). Dependency-free for unit testing with plain object fixtures.
+ *
+ * A COLLAPSED node is synced to its COLLAPSED footprint — the title pill LiteGraph
+ * actually draws — not skipped and not given the full pos/size box. Skipping it
+ * (the original #416 guard) kept its area from being overstated but left the rect
+ * STALE, and membership is boundingRect-first: a collapsed node sitting inside a
+ * group box while its cached rect claimed somewhere else was silently omitted from
+ * the group (left behind by a move, reported as zero moved) or reported as newly
+ * enclosed when it was not. Writing the pill keeps #416's guarantee — the area is
+ * never overstated — while making the rect live. `forceCollapsed` still writes the
+ * FULL footprint, which create-by-node_ids needs because it builds the box around
+ * the node's full pos/size (#391).
+ *
+ * NEVER THROWS: this is called from read paths and from inside a group move, so a
+ * frozen rect must be reported (false), never raised. Returns whether the cached
+ * rect now matches the footprint it was asked to describe.
  */
+export const COLLAPSED_TITLE_HEIGHT = 30;
+export const COLLAPSED_PILL_WIDTH = 80; // LiteGraph.NODE_COLLAPSED_WIDTH
+
+/** The rect a node's cached boundingRect SHOULD hold for its live pos/size. */
+function wantedNodeArea(node, forceCollapsed = false) {
+  const collapsed = !!node.flags?.collapsed && !forceCollapsed;
+  const w = collapsed
+    ? Number(node._collapsed_width) || COLLAPSED_PILL_WIDTH
+    : node.size?.[0] ?? 200;
+  const h = collapsed ? 0 : node.size?.[1] ?? 100;
+  return [
+    node.pos?.[0] ?? 0,
+    (node.pos?.[1] ?? 0) - COLLAPSED_TITLE_HEIGHT, // title bar renders above pos
+    w,
+    h + COLLAPSED_TITLE_HEIGHT,
+  ];
+}
+
+/**
+ * Does this node's cached rect describe where the node ACTUALLY is? A pure read.
+ *
+ * This, not "did my delta-write succeed", is the property that matters: a rect
+ * that never had to move is already live, and reporting it as stuck would refuse
+ * a perfectly good move (or invent a partial one during a rollback). True when
+ * there is no cached rect at all, since reads then use live pos/size.
+ */
+export function nodeAreaIsLive(node) {
+  try {
+    const br = node?.boundingRect;
+    if (!br || br.length !== 4) return true;
+    return wantedNodeArea(node).every((v, i) => br[i] === v);
+  } catch {
+    return false; // an unreadable node cannot be shown to be live
+  }
+}
+
 export function syncNodeArea(node, forceCollapsed = false) {
-  const br = node?.boundingRect;
-  if (!br || br.length !== 4) return;
-  // A COLLAPSED node's real footprint is just its title band (a small pill), not
-  // its full pos/size. When syncing UNREQUESTED nodes in bulk (syncGraphNodeAreas,
-  // used before a bounds/query membership read) overwriting a collapsed node's
-  // cached rect with the full footprint would OVERSTATE its area and could wrongly
-  // pull it into a nearby group box — so skip it and leave its (already-small)
-  // rect to the engine (#416). But when the caller explicitly REQUESTED this node
-  // (create-by-node_ids), force the sync: the group box is built around the node's
-  // full pos/size (boundsAroundNodes), so its rect must match to be a member of its
-  // own box — otherwise a requested collapsed node with a stale rect is dropped (#391).
-  if (node.flags?.collapsed && !forceCollapsed) return;
-  const w = node.size?.[0] ?? 200;
-  const h = node.size?.[1] ?? 100;
-  br[0] = node.pos?.[0] ?? 0;
-  br[1] = (node.pos?.[1] ?? 0) - 30; // title bar renders above pos
-  br[2] = w;
-  br[3] = h + 30;
+  try {
+    // Read the live geometry FIRST, even when there is no cached rect to write.
+    // This is what makes the bulk sync a genuine readability pre-flight: a node
+    // whose pos/size/flags accessors are hostile or disposed is reported here,
+    // before groupMemberNodes touches it and raises a bare TypeError at a caller
+    // who asked to move a group.
+    const want = wantedNodeArea(node, forceCollapsed);
+    const br = node?.boundingRect;
+    if (!br || br.length !== 4) return true;
+    try {
+      br[0] = want[0];
+      br[1] = want[1];
+      br[2] = want[2];
+      br[3] = want[3];
+    } catch {
+      /* frozen/read-only rect — reported below, never thrown into a caller */
+    }
+    return want.every((v, i) => br[i] === v);
+  } catch {
+    // A hostile/disposed accessor (pos, size, flags, boundingRect) must be
+    // REPORTED — this runs in read paths and in a move's pre-flight, where a raw
+    // TypeError would replace a clean refusal.
+    return false;
+  }
 }
 
 /**
@@ -176,11 +267,17 @@ export function syncNodeArea(node, forceCollapsed = false) {
  * boundingRect-first footprint (nodeFocusBounds), a single stale rect makes the
  * box wrap a node the geometry misses — or capture one that has moved away —
  * yielding the wrong node_ids (#416). Syncing all rects to live geometry first
- * makes the membership reflect the CURRENT layout. Collapsed nodes are left
- * untouched by syncNodeArea (see above). Dependency-free for unit testing.
+ * makes the membership reflect the CURRENT layout. Collapsed nodes are synced to
+ * their collapsed pill rather than skipped (see syncNodeArea). Dependency-free.
+ *
+ * NEVER THROWS, and returns the nodes whose cached rect would not accept the
+ * resync. Callers doing this as a PRE-FLIGHT before mutating can then refuse up
+ * front instead of discovering an unwritable rect halfway through a transaction.
  */
 export function syncGraphNodeAreas(graph) {
-  for (const n of graph?._nodes ?? []) syncNodeArea(n);
+  const unsynced = [];
+  for (const n of graph?._nodes ?? []) if (!syncNodeArea(n)) unsynced.push(n);
+  return unsynced;
 }
 
 /**
@@ -202,14 +299,27 @@ export function moveGroupMembers(members, dx, dy) {
   const stuck = [];
   const attempted = [];
   for (const n of members ?? []) {
-    const px = Number(n?.pos?.[0]);
-    const py = Number(n?.pos?.[1]);
+    // Per-item containment. If this loop threw partway it would never RETURN its
+    // undo, so everything it had already moved would be unrecoverable — the
+    // caller's rollback cannot undo what it was never handed. Reading `pos` can
+    // itself throw (a getter over a disposed/revoked proxy), so the read is inside
+    // the guard too. A throwing item is stuck, exactly like an unwritable one.
+    let px = Number.NaN;
+    let py = Number.NaN;
+    try {
+      px = Number(n?.pos?.[0]);
+      py = Number(n?.pos?.[1]);
+    } catch {
+      /* unreadable position ⇒ stuck below */
+    }
     if (!Number.isFinite(px) || !Number.isFinite(py)) {
       if (n) stuck.push(n);
       continue;
     }
     attempted.push([n, px, py]);
-    const landedExactly = writePoint(n, "pos", px + dx, py + dy);
+    let landedExactly = false;
+    try {
+      landedExactly = writePoint(n, "pos", px + dx, py + dy);
     // Sync the cached rect UNCONDITIONALLY. A write can miss its target and still
     // RELOCATE the node (a setter that snaps or clamps): refreshing only on an
     // exact landing would leave that node's cached rect describing where it used
@@ -217,7 +327,18 @@ export function moveGroupMembers(members, dx, dy) {
     // cached rect — would place it in the group it has actually left. The refresh
     // is a delta from the pre-write position, so it is correct wherever the node
     // ended up, including "did not move at all".
-    refreshNodeArea(n, [px, py]);
+      // A rect that will not accept the correction makes the node STUCK, not an
+      // exception: its live position and its cached rect would disagree, and
+      // membership is rect-first, so leaving it "moved" would report it in a group
+      // it is no longer in. refreshNodeArea never throws precisely so this decision
+      // is made here rather than escaping past the caller's rollback. The verdict
+      // is whether the rect ends up LIVE, not whether the delta-write happened: a
+      // rect that was already right needs no write and is not stuck.
+      refreshNodeArea(n, [px, py]);
+      if (!nodeAreaIsLive(n)) landedExactly = false;
+    } catch {
+      landedExactly = false;
+    }
     (landedExactly ? moved : stuck).push(n);
   }
   return { moved, stuck, undo: () => restoreNodePositions(attempted) };
@@ -229,7 +350,10 @@ function restoreNodePosition(n, px, py) {
   const cur = [Number(n?.pos?.[0]), Number(n?.pos?.[1])];
   const ok = writePoint(n, "pos", px, py);
   refreshNodeArea(n, cur);
-  return ok;
+  // "Back where it started" means the position is restored AND the cached rect
+  // describes it — a rect that never moved is already live and must not be
+  // reported as an unrestorable item, which would invent a partial move.
+  return ok && nodeAreaIsLive(n);
 }
 
 /**
@@ -251,7 +375,16 @@ function restoreNodePosition(n, px, py) {
 function restoreNodePositions(attempted) {
   const failed = [];
   for (const [n, px, py] of attempted ?? []) {
-    if (!restoreNodePosition(n, px, py)) failed.push(n);
+    // Per-item containment again: one unrestorable node must not stop the rest of
+    // the rollback, and must be REPORTED rather than raised — a throw here would
+    // replace the caller's carefully-worded refusal with a raw TypeError.
+    let ok = false;
+    try {
+      ok = restoreNodePosition(n, px, py);
+    } catch {
+      ok = false;
+    }
+    if (!ok) failed.push(n);
   }
   return failed;
 }
@@ -416,8 +549,25 @@ export function nestedGroupsOf(graph, g) {
   return (graph?._groups ?? []).filter((other) => {
     if (!other || other === g) return false;
     const inner = groupBoundsOf(other);
-    return !!inner && containsBounds(outer, inner);
+    // Same rule as reroutesInside: a box we cannot read is UNKNOWN, not "outside".
+    // It rides along so it is classified stuck and the move is refused, rather
+    // than being quietly left behind by a move that reports success.
+    if (!inner) return !groupHasReadableBounds(other);
+    return containsBounds(outer, inner);
   });
+}
+
+/** Could we read this group's geometry at all? Distinguishes "no usable bounds"
+ *  (a well-formed object we can inspect) from "unreadable" (a hostile accessor). */
+function groupHasReadableBounds(g) {
+  try {
+    void g?._bounding;
+    void g?.pos?.[0];
+    void g?.size?.[0];
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -427,6 +577,14 @@ export function nestedGroupsOf(graph, g) {
  * Mirrors the panel's setGroupBounds write policy.
  */
 export function placeGroupBox(g, x, y) {
+  try {
+    return placeGroupBoxUnsafe(g, x, y);
+  } catch {
+    return false; // never raised out of a move or its rollback
+  }
+}
+
+function placeGroupBoxUnsafe(g, x, y) {
   // A move must not change the SIZE. Capture it first and verify it survived, so
   // a build that resizes on reposition is reported as not-moved instead of
   // silently reshaping the user's group.
@@ -460,21 +618,25 @@ export function translateGroupBox(g, dx, dy) {
  */
 function restoreGroupBox(g, quad) {
   const [x, y, w, h] = quad;
-  const b = g?._bounding;
-  if (b && b.length >= 4) {
-    try {
-      b[0] = x;
-      b[1] = y;
-      b[2] = w;
-      b[3] = h;
-    } catch {
-      /* frozen quad — verified below */
+  try {
+    const b = g?._bounding;
+    if (b && b.length >= 4) {
+      try {
+        b[0] = x;
+        b[1] = y;
+        b[2] = w;
+        b[3] = h;
+      } catch {
+        /* frozen quad — verified below */
+      }
+    } else {
+      writePoint(g, "pos", x, y);
+      writePoint(g, "size", w, h);
     }
-  } else {
-    writePoint(g, "pos", x, y);
-    writePoint(g, "size", w, h);
+    return groupBoxIsAt(g, x, y, w, h);
+  } catch {
+    return false; // a rollback reports, it never raises
   }
-  return groupBoxIsAt(g, x, y, w, h);
 }
 
 /** Translate several group boxes, reporting which ones actually moved and
@@ -485,7 +647,12 @@ export function translateGroupBoxes(groups, dx, dy) {
   const stuck = [];
   const attempted = [];
   for (const g of groups ?? []) {
-    const before = groupBoundsOf(g);
+    let before = null;
+    try {
+      before = groupBoundsOf(g);
+    } catch {
+      /* unreadable bounds ⇒ stuck below */
+    }
     if (!before) {
       if (g) stuck.push(g);
       continue;
@@ -521,48 +688,95 @@ export function reroutesInside(graph, bounds) {
   if (!bounds) return [];
   const [x, y, w, h] = bounds;
   return allReroutes(graph).filter((r) => {
-    const px = Number(r?.pos?.[0]);
-    const py = Number(r?.pos?.[1]);
-    if (!Number.isFinite(px) || !Number.isFinite(py)) return false;
+    // Three cases, and only one of them is "outside":
+    //  - the position cannot be READ at all (hostile/disposed accessor), or it is
+    //    present but not finite ⇒ UNKNOWN. Unknown is not "outside": include it so
+    //    it goes down the same path as any other item that will not accept a new
+    //    position — reported stuck, whole move refused — rather than being quietly
+    //    dropped while the group moves away from it.
+    //  - no `pos` at all ⇒ not a positioned item; there is nothing to move and
+    //    nothing to be wrong about.
+    let pos;
+    try {
+      pos = r?.pos;
+    } catch {
+      return true;
+    }
+    if (pos == null || pos.length < 2) return false;
+    let px;
+    let py;
+    try {
+      px = Number(pos[0]);
+      py = Number(pos[1]);
+    } catch {
+      return true;
+    }
+    if (!Number.isFinite(px) || !Number.isFinite(py)) return true;
     return px >= x && px < x + w && py >= y && py < y + h;
   });
 }
 
 /**
- * Translate reroute points by (dx, dy), reporting which ones actually moved.
- * Without this a moved group leaves its wire elbows behind and the links
- * visibly snake back to where the group used to be.
+ * Can this reroute be repositioned SOUNDLY? A pure read — safe to call as a
+ * pre-flight, before anything has been mutated.
  *
- * Prefers the engine's OWN `Reroute.move(dx, dy)` when the build exposes it, so
- * the frontend's reactive layout store records the change rather than only the
- * canvas seeing a mutated point — the same "use the engine primitive, then
- * verify" policy the panel already applies to node.setSize / graph.removeGroup.
- * The result is verified either way, so a build whose `move` has a different
- * signature (or none) is corrected by the direct point write, and a frozen point
- * is reported as stuck instead of throwing halfway through a group move.
+ * We must never learn what a build's `Reroute.move()` means by CALLING it. An
+ * earlier version invoked `move(x - cx, y - cy)` assuming a relative API and then
+ * "corrected" `r.pos` if the point ended up somewhere else. On a build where
+ * `move(x, y)` is ABSOLUTE and also writes a reactive/persisted store, that
+ * sequence is silent corruption: a reroute at [100,100] targeting [200,200] gets
+ * move(100,100), the STORE records [100,100], the fallback fixes only the in-place
+ * `pos` array to [200,200], verification passes, success is reported — and the
+ * next render or save resurrects the wrong coordinate. Arity cannot tell the two
+ * signatures apart, and a "no-op probe" of move(0,0) is a teleport on the absolute
+ * build. There is no non-destructive way to find out, so we do not try.
+ *
+ * What IS sound is writing `pos` when that is an accessor: the setter is the
+ * engine's own write path (current @comfyorg/litegraph defines `Reroute.pos` as a
+ * get/set pair over its own Float64Array), so any store bookkeeping runs, with no
+ * guess about anyone's signature. When `pos` is a plain slot AND the build also
+ * exposes a `move()` we cannot characterise, the honest answer is "unknown": the
+ * reroute is reported stuck and the whole move is refused with a remedy, rather
+ * than moved on a coin-flip whose failure mode only shows up at save time.
  */
-export function placeReroute(r, x, y) {
-  const cx = Number(r?.pos?.[0]);
-  const cy = Number(r?.pos?.[1]);
-  if (typeof r?.move === "function" && Number.isFinite(cx) && Number.isFinite(cy)) {
-    try {
-      r.move(x - cx, y - cy);
-    } catch {
-      /* build-specific; the direct write below still gets it there */
-    }
-    const f32 = isFloat32(r?.pos);
-    if (samePoint(Number(r?.pos?.[0]), x, f32) && samePoint(Number(r?.pos?.[1]), y, f32)) return true;
-  }
-  return writePoint(r, "pos", x, y);
+export function rerouteWriteIsSound(r) {
+  if (hasSetter(r, "pos")) return true;
+  return typeof r?.move !== "function";
 }
 
+/**
+ * Put a reroute point at (x, y) and report whether it is really there. Only ever
+ * writes `pos` — see rerouteWriteIsSound for why `move()` is never invoked.
+ */
+export function placeReroute(r, x, y) {
+  // Never throws: it runs inside a group move (and inside that move's rollback),
+  // so a hostile accessor must be reported as "did not move", not raised.
+  try {
+    if (!rerouteWriteIsSound(r)) return false;
+    return writePoint(r, "pos", x, y);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Translate reroute points by (dx, dy), reporting which ones actually moved.
+ * Without this a moved group leaves its wire elbows behind and the links visibly
+ * snake back to where the group used to be.
+ */
 export function moveReroutePoints(reroutes, dx, dy) {
   const moved = [];
   const stuck = [];
   const attempted = [];
   for (const r of reroutes ?? []) {
-    const px = Number(r?.pos?.[0]);
-    const py = Number(r?.pos?.[1]);
+    let px = Number.NaN;
+    let py = Number.NaN;
+    try {
+      px = Number(r?.pos?.[0]);
+      py = Number(r?.pos?.[1]);
+    } catch {
+      /* unreadable point ⇒ stuck below */
+    }
     if (!Number.isFinite(px) || !Number.isFinite(py)) {
       if (r) stuck.push(r);
       continue;

@@ -223,6 +223,7 @@ import {
   translateGroupBoxes,
   reroutesInside,
   moveReroutePoints,
+  rerouteWriteIsSound,
   groupBoxIsAt,
 } from "./lib/group-geometry.js";
 import {
@@ -10099,24 +10100,47 @@ const GRAPH_TOOL_EXECUTORS = {
       writeBox(b[0], b[1]);
       return !groupBoxIsAt(g, b[0], b[1], b[2], b[3]);
     };
+    // ---- PRE-FLIGHT (no mutations past this point until it is complete) ------
+    // Everything this move needs to KNOW is established here, before the first
+    // byte is written. After the first write the only permitted actions are
+    // completing the transaction or rolling it back — never discovering something
+    // new that can throw, because a throw from the middle of the mutation phase
+    // escapes past the rollback and leaks a half-moved graph out under an
+    // unrelated TypeError.
+    //
+    // Resyncing cached rects is itself a WRITE (to boundingRect), so it happens
+    // here for BOTH branches, and a rect that will not accept the resync is a
+    // refusal now rather than an exception later. Membership is rect-first, so a
+    // node whose rect cannot be made live cannot be classified honestly at all.
+    const unsynced = syncGraphNodeAreas(graph);
+    if (unsynced.length) {
+      throw new Error(
+        `refusing to move group ${group_id}: ${unsynced.length} node(s) have a cached bounding rect that cannot be updated (${unsynced.slice(0, 5).map((n) => `node ${n.id}`).join(", ")}${unsynced.length > 5 ? ", …" : ""}), so their group membership cannot be determined. NOTHING was moved. Reload the ComfyUI tab (panel_reload) and retry.`,
+      );
+    }
+    // What the box encloses is captured against the PRE-move bounds — pure reads,
+    // so they belong out here with the rest of the discovery. We don't rely on
+    // g.move(), which shifts LiteGraph's cached child set: that cache is stale or
+    // empty on affected builds (#287/#311/#312), so it would move the wrong
+    // children or none. The resync above means what we capture is what is ACTUALLY
+    // inside the box now. Reimplementing only the node half moved the outer box and
+    // its nodes but stranded every inner group box over the vacated space, so nodes
+    // that looked grouped silently were not any more (#408).
+    const members = move_nodes !== false ? groupMemberNodes(graph, g) : [];
+    const nested = move_nodes !== false ? nestedGroupsOf(graph, g) : [];
+    const reroutes = move_nodes !== false ? reroutesInside(graph, b) : [];
+    // A reroute we cannot reposition SOUNDLY is decided here, by INSPECTION, and
+    // never by invoking an API to see what it does. Refusing before beforeChange()
+    // also means this call leaves no empty undo step behind.
+    const unsound = reroutes.filter((r) => !rerouteWriteIsSound(r));
+    if (unsound.length) {
+      throw new Error(
+        `refusing to move group ${group_id}: ${unsound.length} enclosed reroute point(s) (${unsound.slice(0, 5).map((r) => `reroute ${r.id ?? "?"}`).join(", ")}${unsound.length > 5 ? ", …" : ""}) expose a move() whose meaning this frontend does not let us determine without calling it, and calling it could persist the wrong coordinate. NOTHING was moved. Pass move_nodes:false to move only the box, or move the reroutes by hand.`,
+      );
+    }
     graph.beforeChange();
     try {
       if (move_nodes !== false) {
-        // Move the box AND everything it encloses together. We don't rely on
-        // g.move(), which shifts LiteGraph's cached child set — that cache is stale
-        // or empty on affected builds (#287/#311/#312), so it would move the wrong
-        // children or none. Resync live geometry first so we capture what is
-        // ACTUALLY inside the box now (not a stale cache), then translate the box
-        // and every captured child by the same delta.
-        syncGraphNodeAreas(graph);
-        const members = groupMemberNodes(graph, g);
-        // Nested group boxes and reroute points are captured against the PRE-move
-        // bounds, before the box is written, so containment is judged where the
-        // children actually are. Reimplementing only the node half moved the outer
-        // box and its nodes but stranded every inner group box over the vacated
-        // space, so nodes that looked grouped silently were not any more (#408).
-        const nested = nestedGroupsOf(graph, g);
-        const reroutes = reroutesInside(graph, b);
         // Move the CHILDREN first and the box LAST, as one all-or-nothing
         // transaction. Every child write is verified and reports whether it
         // landed — a point can be a plain array, a typed-array view, an accessor
@@ -10128,9 +10152,31 @@ const GRAPH_TOOL_EXECUTORS = {
         // Member rects are refreshed by the same delta inside moveGroupMembers,
         // without which the members "stay behind" for the summarizeGroup below and
         // any later panel_query_graph read (mirrors the move_node path, #355).
-        const memberMove = moveGroupMembers(members, dx, dy);
-        const rerouteMove = moveReroutePoints(reroutes, dx, dy);
-        const nestedMove = translateGroupBoxes(nested, dx, dy);
+        let memberMove = { moved: [], stuck: [], undo: () => [] };
+        let rerouteMove = { moved: [], stuck: [], undo: () => [] };
+        let nestedMove = { moved: [], stuck: [], undo: () => [] };
+        // Belt and braces on the invariant: the movers are written not to throw,
+        // but if any of them ever does, the graph is already partly written and
+        // the error must not escape the rollback. Undo whatever was recorded, then
+        // re-raise with that fact attached.
+        try {
+          memberMove = moveGroupMembers(members, dx, dy);
+          rerouteMove = moveReroutePoints(reroutes, dx, dy);
+          nestedMove = translateGroupBoxes(nested, dx, dy);
+        } catch (error) {
+          const unrestored = [
+            ...nestedMove.undo(),
+            ...rerouteMove.undo(),
+            ...memberMove.undo(),
+            ...(restoreBox() ? [g] : []),
+          ];
+          throw new Error(
+            `refusing to move group ${group_id}: the frontend raised "${error?.message ?? error}" partway through the move. ` +
+              (unrestored.length
+                ? `The graph is PARTIALLY moved — ${unrestored.length} item(s) could NOT be put back. Press Ctrl+Z on the canvas.`
+                : "Everything was put back; NOTHING was moved."),
+          );
+        }
         // Undo ABSOLUTELY, over every ATTEMPTED child — not by the inverse delta
         // over the ones that landed. A build whose setter clamps or snaps leaves a
         // child at a third position that counts as stuck; an inverse-delta undo of
@@ -10191,14 +10237,14 @@ const GRAPH_TOOL_EXECUTORS = {
                 : "NOTHING was moved."),
           );
         }
-        // The box moved and NOTHING else did, so the group now encloses a DIFFERENT
-        // set of nodes. Membership is read boundingRect-first, so resync every
-        // cached rect to live pos/size before summarizing — otherwise this reply
-        // answers "which nodes are in the box now?" with rects left over from a
-        // paste / load / manual drag the panel never saw. The box is not the
-        // membership (#408); every other group path already resyncs before it
-        // reports, and this branch was the last one that did not.
-        syncGraphNodeAreas(graph);
+        // NOTE: the resync that makes this branch's membership live already ran in
+        // the pre-flight, BEFORE the box write. It used to run here, after it — and
+        // a node with an unwritable cached rect then threw out of syncNodeArea with
+        // the box already sitting at the requested position: not a success, not
+        // "NOTHING was moved", not even a stated partial. The box moved and nothing
+        // else did, so the group now encloses a DIFFERENT set of nodes, and
+        // summarizeGroup below reads that membership from rects that are live as of
+        // the pre-flight. The box is not the membership (#408).
       }
     } finally {
       graph.afterChange();

@@ -259,19 +259,72 @@ test("refreshNodeArea supports a typed-array boundingRect (ComfyUI Rectangle)", 
 
 // ---- syncNodeArea collapse guard + syncGraphNodeAreas: bounds-create live geometry (#416) ----
 
-test("syncNodeArea leaves an UNREQUESTED collapsed node's cached rect untouched (#416)", () => {
-  // A collapsed node's real footprint is a small title pill; overwriting it with
-  // the full pos/size footprint would overstate its area and risk pulling it into
-  // a nearby group box on a bulk (sync-all) bounds/query read. Default = skip it.
+test("syncNodeArea gives an UNREQUESTED collapsed node its PILL footprint, never the full box (#416)", () => {
+  // #416's guarantee is that a collapsed node's area is never OVERSTATED: its real
+  // footprint is a small title pill, and writing the full pos/size box could pull
+  // it into a nearby group on a bulk bounds/query read. The original guard bought
+  // that by SKIPPING the node — which left the rect stale, and membership is
+  // rect-first, so a collapsed node could be omitted from the group it is sitting
+  // in (left behind by a move, reported as zero moved) or reported as enclosed
+  // when it is not. Writing the PILL keeps #416's guarantee and makes the rect live.
   const collapsed = {
     id: 5,
     pos: [1000, 1000],
     size: [300, 200],
     flags: { collapsed: true },
-    boundingRect: [1000, 970, 120, 30], // small title-only pill
+    boundingRect: [-9999, -9999, 120, 30], // stale pill, nowhere near the live pos
+  };
+  assert.equal(syncNodeArea(collapsed), true);
+  assert.deepEqual([...collapsed.boundingRect], [1000, 970, 80, 30], "pill, tracking the LIVE pos");
+  assert.notDeepEqual(
+    [...collapsed.boundingRect],
+    [1000, 970, 300, 230],
+    "#416: never the full pos/size footprint",
+  );
+});
+
+test("a collapsed node inside a group box is a MEMBER, not silently left behind (#416/#408)", () => {
+  // The stale-rect case that used to be unreachable because the sync skipped it.
+  const collapsed = {
+    id: 5,
+    pos: [120, 120],
+    size: [300, 200],
+    flags: { collapsed: true },
+    boundingRect: [-9999, -9999, 80, 30], // stale: claims to be far outside the box
+  };
+  const graph = graphOf(collapsed);
+  const g = groupBox([100, 60, 200, 200]);
+  assert.deepEqual(groupMemberNodes(graph, g).map((n) => n.id), [], "stale rect hides it");
+  syncGraphNodeAreas(graph);
+  assert.deepEqual(
+    groupMemberNodes(graph, g).map((n) => n.id),
+    [5],
+    "after the resync it reads as the member it visibly is",
+  );
+});
+
+test("syncNodeArea honours a node's own collapsed width when the build records one", () => {
+  const collapsed = {
+    id: 5,
+    pos: [10, 40],
+    size: [300, 200],
+    flags: { collapsed: true },
+    _collapsed_width: 142,
+    boundingRect: [0, 0, 1, 1],
   };
   syncNodeArea(collapsed);
-  assert.deepEqual([...collapsed.boundingRect], [1000, 970, 120, 30], "collapsed rect preserved by default");
+  assert.deepEqual([...collapsed.boundingRect], [10, 10, 142, 30]);
+});
+
+test("syncNodeArea REPORTS an unwritable rect instead of throwing", () => {
+  // It runs inside a group move, after positions have been written. A throw here
+  // would escape past the caller's rollback and leak a half-moved graph.
+  const frozen = { id: 5, pos: [10, 10], size: [100, 100], boundingRect: Object.freeze([0, 0, 1, 1]) };
+  let result;
+  assert.doesNotThrow(() => { result = syncNodeArea(frozen); });
+  assert.equal(result, false, "and it says so");
+  const graph = { _nodes: [frozen, { id: 6, pos: [0, 0], size: [10, 10], boundingRect: [0, 0, 1, 1] }] };
+  assert.deepEqual(syncGraphNodeAreas(graph).map((n) => n.id), [5], "reported up to the caller as a pre-flight");
 });
 
 test("syncNodeArea(node, true) FORCE-syncs a REQUESTED collapsed node into its own box (#391)", () => {

@@ -26,6 +26,9 @@ import {
   writePoint,
   samePoint,
   groupBoxIsAt,
+  rerouteWriteIsSound,
+  syncNodeArea,
+  refreshNodeArea,
 } from "../../web/js/lib/group-geometry.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
@@ -63,6 +66,7 @@ function realMoveGroup(graph) {
     "moveGroupMembers",
     "translateGroupBoxes",
     "moveReroutePoints",
+    "rerouteWriteIsSound",
     "groupBoxIsAt",
     `"use strict";
      ${resolveGroupSrc}
@@ -80,6 +84,7 @@ function realMoveGroup(graph) {
     moveGroupMembers,
     translateGroupBoxes,
     moveReroutePoints,
+    rerouteWriteIsSound,
     groupBoxIsAt,
   );
 }
@@ -108,6 +113,30 @@ function node(id, pos, size = [100, 100], rect = null) {
 
 function group(id, bounding, title = `G${id}`) {
   return { id, title, _bounding: [...bounding], recomputeInsideNodes() {} };
+}
+
+/** A reroute shaped like @comfyorg/litegraph's: `pos` is a get/set pair on the
+ *  PROTOTYPE over the reroute's own Float64Array, and the setter is where the
+ *  build's layout/persistence bookkeeping lives. `store` records every write the
+ *  engine's own path would persist. */
+function reroutePrototype(store) {
+  return {
+    get pos() { return this._p; },
+    set pos(v) {
+      this._p[0] = Number(v[0]);
+      this._p[1] = Number(v[1]);
+      store.push([Number(v[0]), Number(v[1])]);
+    },
+  };
+}
+
+function reroute(id, [x, y], { store = [], extra = {} } = {}) {
+  const r = Object.assign(Object.create(reroutePrototype(store)), {
+    id,
+    _p: new Float64Array([x, y]),
+    ...extra,
+  });
+  return { r, store };
 }
 
 function makeGraph({ nodes = [], groups = [], reroutes = null } = {}) {
@@ -363,42 +392,88 @@ test("#408: a member that CANNOT be repositioned aborts the whole move and rolls
   assert.deepEqual([...frozenPoint], [80, 100], "the stuck node never moved");
 });
 
-test("#408: a reroute is moved through the engine's own move() when the build has one", () => {
+test("#408: an ABSOLUTE reroute move() is never called, and the STORE ends correct", () => {
+  // THE probe hazard. If move(x, y) is ABSOLUTE on this build and also writes the
+  // persisted/reactive store, then "call move(dx, dy) and correct pos afterwards"
+  // records the WRONG coordinate in the store, patches only the in-place array,
+  // reports success — and the next render or save resurrects the wrong point.
+  // You cannot learn an API's semantics by invoking it destructively, so we never
+  // invoke it: the pos SETTER is the engine's own write path and needs no guess.
   const calls = [];
-  const reroute = {
-    id: 11,
-    pos: [100, 100],
-    move(dx, dy) { calls.push([dx, dy]); this.pos = [this.pos[0] + dx, this.pos[1] + dy]; },
-  };
-  const graph = makeGraph({ groups: [group(1, [0, 0, 400, 400])], reroutes: [reroute] });
+  const { r, store } = reroute(11, [100, 100], {
+    extra: { move(x, y) { calls.push([x, y]); this._p[0] = Number(x); this._p[1] = Number(y); } },
+  });
+  const graph = makeGraph({ groups: [group(1, [0, 0, 400, 400])], reroutes: [r] });
 
   const out = realMoveGroup(graph)({ group_id: 1, pos: [100, 100] });
 
-  assert.deepEqual(calls, [[100, 100]], "the engine primitive was used, so the layout store sees the change");
-  assert.deepEqual([reroute.pos[0], reroute.pos[1]], [200, 200]);
+  assert.deepEqual(calls, [], "move() must never be invoked to discover what it means");
+  assert.deepEqual([r.pos[0], r.pos[1]], [200, 200], "the point is where it should be");
+  assert.deepEqual(
+    store,
+    [[200, 200]],
+    "and the STORE — not just pos — recorded exactly the correct coordinate, once",
+  );
   assert.equal(out.moved.reroutes, 1);
 });
 
-test("#408: a build whose reroute move() has the wrong signature is corrected, not trusted", () => {
-  // move(x, y) treated as ABSOLUTE by this build. The verified fallback must put
-  // the point where the delta says, not where the primitive left it.
-  const reroute = { id: 11, pos: [100, 100], move(x, y) { this.pos = [x, y]; } };
-  const graph = makeGraph({ groups: [group(1, [0, 0, 400, 400])], reroutes: [reroute] });
+test("#408: an ABSOLUTE move() with a rollback still leaves the store correct, never a stale coordinate", () => {
+  const calls = [];
+  const { r, store } = reroute(11, [100, 100], {
+    extra: { move(x, y) { calls.push([x, y]); this._p[0] = Number(x); this._p[1] = Number(y); } },
+  });
+  // A frozen member forces the refusal AFTER the reroute has moved.
+  const stuckNode = { id: 8, size: [60, 40], boundingRect: [150, 120, 60, 70], get pos() { return Object.freeze([150, 150]); } };
+  const graph = makeGraph({ nodes: [stuckNode], groups: [group(1, [0, 0, 400, 400])], reroutes: [r] });
+
+  assert.throws(() => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }), /NOTHING was moved/);
+
+  assert.deepEqual(calls, [], "not during the move, and not during the rollback either");
+  assert.deepEqual([r.pos[0], r.pos[1]], [100, 100]);
+  assert.deepEqual(
+    store.at(-1),
+    [100, 100],
+    "the LAST thing the store recorded is the original coordinate — nothing stale survives a save",
+  );
+});
+
+test("#408: a reroute we cannot reposition soundly is REFUSED up front, before anything moves", () => {
+  // `pos` is a plain slot (no setter to carry the build's bookkeeping) and the
+  // build exposes a move() whose meaning we cannot determine without calling it.
+  // That is genuinely unknown, and the honest answer is a refusal — not a
+  // coin-flip whose failure mode is a wrong coordinate at save time.
+  const unsound = { id: 11, pos: [100, 100], move() { throw new Error("must never be called"); } };
+  const a = node(7, [200, 200], [60, 40]);
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [a], groups: [g], reroutes: [unsound] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /reroute 11.*does not let us determine without calling it.*NOTHING was moved.*move_nodes:false/s,
+  );
+  assert.deepEqual(a.pos, [200, 200], "and it is a PRE-FLIGHT refusal: not one node moved first");
+  assert.deepEqual([unsound.pos[0], unsound.pos[1]], [100, 100]);
+  assert.deepEqual(g._bounding, [0, 0, 400, 400]);
+  assert.equal(graph.beforeCount, undefined, "no undo transaction was even opened");
+});
+
+test("#408: a plain-slot reroute with NO move() is still moved — the refusal is scoped to the unknown", () => {
+  const plain = { id: 11, pos: [100, 100] };
+  const graph = makeGraph({ groups: [group(1, [0, 0, 400, 400])], reroutes: [plain] });
 
   const out = realMoveGroup(graph)({ group_id: 1, pos: [100, 100] });
 
-  assert.deepEqual([reroute.pos[0], reroute.pos[1]], [200, 200], "corrected to old + delta");
+  assert.deepEqual([plain.pos[0], plain.pos[1]], [200, 200]);
   assert.equal(out.moved.reroutes, 1);
 });
 
-test("#408: a reroute whose move() throws does not abort the move; the direct write still lands", () => {
-  const reroute = { id: 11, pos: [100, 100], move() { throw new Error("not on this build"); } };
-  const graph = makeGraph({ groups: [group(1, [0, 0, 400, 400])], reroutes: [reroute] });
-
-  const out = realMoveGroup(graph)({ group_id: 1, pos: [100, 100] });
-
-  assert.deepEqual([reroute.pos[0], reroute.pos[1]], [200, 200]);
-  assert.equal(out.moved.reroutes, 1);
+test("rerouteWriteIsSound: a pos setter is sound; a plain slot plus an uncharacterisable move() is not", () => {
+  const { r } = reroute(11, [0, 0]);
+  assert.equal(rerouteWriteIsSound(r), true, "accessor with a setter — the engine's own write path");
+  const { r: withMove } = reroute(12, [0, 0], { extra: { move() {} } });
+  assert.equal(rerouteWriteIsSound(withMove), true, "a setter wins even when move() also exists");
+  assert.equal(rerouteWriteIsSound({ pos: [0, 0] }), true, "a plain slot with no move() is unambiguous");
+  assert.equal(rerouteWriteIsSound({ pos: [0, 0], move() {} }), false, "plain slot + move() is UNKNOWN");
 });
 
 test("#408: a FROZEN reroute point aborts and rolls back rather than half-moving the group", () => {
@@ -705,6 +780,193 @@ test("#408: a node that SNAPS on the way out keeps a cached rect at its REAL pos
   );
 });
 
+// ---- collapsed members and the pre-flight invariant ------------------------
+
+test("#408: a COLLAPSED member with a stale rect is moved, not silently left behind", () => {
+  // Membership is rect-first and the bulk sync used to SKIP collapsed nodes, so a
+  // collapsed node sitting inside the box while its cached rect claimed otherwise
+  // was omitted from the move entirely — left behind, with the reply reporting it
+  // had carried zero nodes.
+  const collapsed = {
+    id: 7,
+    pos: [120, 120],
+    size: [300, 200],
+    flags: { collapsed: true },
+    boundingRect: [-9999, -9999, 80, 30],
+  };
+  const graph = makeGraph({ nodes: [collapsed], groups: [group(1, [100, 60, 200, 200])] });
+
+  const out = realMoveGroup(graph)({ group_id: 1, pos: [1100, 1060] });
+
+  assert.deepEqual(collapsed.pos, [1120, 1120], "the collapsed member travelled with the box");
+  assert.equal(out.moved.nodes, 1, "and the reply says so instead of reporting an empty group");
+  assert.deepEqual(out.group.node_ids, [7]);
+});
+
+test("#408: move_nodes:false does not report a STALE collapsed node as newly enclosed", () => {
+  // The mirror image: its live position is far outside the box the caller is
+  // moving to, but its cached rect claims it is inside.
+  const collapsed = {
+    id: 7,
+    pos: [9000, 9000],
+    size: [300, 200],
+    flags: { collapsed: true },
+    boundingRect: [1150, 1090, 80, 30], // stale: inside the DESTINATION box
+  };
+  const graph = makeGraph({ nodes: [collapsed], groups: [group(1, [0, 0, 200, 200])] });
+
+  const out = realMoveGroup(graph)({ group_id: 1, pos: [1100, 1060], move_nodes: false });
+
+  assert.deepEqual(out.group.node_ids, [], "a node that is not there must not be reported as enclosed");
+  assert.deepEqual(collapsed.pos, [9000, 9000]);
+});
+
+test("#408: a node whose cached rect cannot be resynced is refused BEFORE the box is written", () => {
+  // The pre-flight resync is itself a write. It used to run in move_nodes:false
+  // AFTER the box had already been moved: syncNodeArea threw on the frozen rect,
+  // the box stayed at the requested position, and the caller got an unrelated
+  // TypeError — not success, not "NOTHING was moved", not a stated partial.
+  const frozenRect = {
+    id: 7,
+    pos: [50, 50],
+    size: [100, 100],
+    boundingRect: Object.freeze([0, 0, 1, 1]),
+  };
+  const g = group(1, [0, 0, 200, 200]);
+  const graph = makeGraph({ nodes: [frozenRect], groups: [g] });
+
+  for (const moveNodes of [true, false]) {
+    assert.throws(
+      () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000], move_nodes: moveNodes }),
+      /node 7.*group membership cannot be determined.*NOTHING was moved/s,
+      `move_nodes:${moveNodes}`,
+    );
+    assert.deepEqual(g._bounding, [0, 0, 200, 200], `the box must not have moved (move_nodes:${moveNodes})`);
+    assert.deepEqual(frozenRect.pos, [50, 50]);
+  }
+  assert.equal(graph.beforeCount, undefined, "a pre-flight refusal opens no undo transaction");
+});
+
+test("#408: a COLLAPSED member with a frozen rect is refused up front, not moved-then-thrown", () => {
+  // The precise leak: this node has a MUTABLE pos and a FROZEN boundingRect, and
+  // being collapsed it used to slip past the bulk sync entirely. Its position
+  // would be written successfully and refreshNodeArea would then throw on the
+  // rect — from inside moveGroupMembers, before it returned, so the handler's
+  // rollback never ran and the moved node leaked out under a raw TypeError.
+  const collapsed = {
+    id: 7,
+    pos: [120, 120],
+    size: [300, 200],
+    flags: { collapsed: true },
+    // Frozen AND stale, so the pre-flight resync cannot make it live.
+    boundingRect: Object.freeze([-9999, -9999, 80, 30]),
+  };
+  const g = group(1, [100, 60, 200, 200]);
+  const graph = makeGraph({ nodes: [collapsed], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1100, 1060] }),
+    /node 7.*group membership cannot be determined.*NOTHING was moved/s,
+  );
+  assert.deepEqual(collapsed.pos, [120, 120], "the node must not have moved at all");
+  assert.deepEqual(g._bounding, [100, 60, 200, 200]);
+  assert.equal(graph.beforeCount, undefined, "and it is caught in pre-flight, before the transaction");
+});
+
+test("#408: a member that THROWS on read does not strand the ones already moved", () => {
+  // If a mover threw partway it would never RETURN its undo, so everything it had
+  // already moved would be unrecoverable — the handler's rollback cannot undo what
+  // it was never handed. Containment is per item: a hostile accessor makes that
+  // node stuck, and the whole move is refused with the others put back.
+  const first = node(7, [50, 50], [60, 40]);
+  const hostile = {
+    id: 8,
+    size: [60, 40],
+    boundingRect: [100, 70, 60, 70],
+    get pos() { throw new TypeError("node has been disposed"); },
+  };
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [first, hostile], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /node 8.*NOTHING was moved/s,
+    "a raw TypeError must never be what the caller sees",
+  );
+  assert.deepEqual(first.pos, [50, 50], "the member moved before the hostile one must be back");
+  assert.deepEqual([...first.boundingRect], [50, 20, 60, 70], "rect too");
+  assert.deepEqual(g._bounding, [0, 0, 400, 400]);
+});
+
+test("#408: a member whose rect is already correct is NOT reported as unrestorable", () => {
+  // A frozen rect that happens to describe the node exactly. The forward move
+  // cannot take the rect along, so the node is stuck and the move is refused —
+  // but the ROLLBACK puts the position back and the frozen rect is live again, so
+  // this must read "NOTHING was moved", not an invented partial. The verdict is
+  // whether the rect matches the node, not whether a delta-write happened.
+  const collapsed = {
+    id: 7,
+    pos: [120, 120],
+    size: [300, 200],
+    flags: { collapsed: true },
+    boundingRect: Object.freeze([120, 90, 80, 30]), // exactly the live pill
+  };
+  const g = group(1, [100, 60, 200, 200]);
+  const graph = makeGraph({ nodes: [collapsed], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1100, 1060] }),
+    /node 7.*NOTHING was moved/s,
+  );
+  assert.deepEqual(collapsed.pos, [120, 120]);
+  assert.deepEqual(g._bounding, [100, 60, 200, 200]);
+});
+
+test("#408: a reroute that throws on read is stuck, not raised, and not silently skipped", () => {
+  const hostileReroute = { id: 11, get pos() { throw new TypeError("gone"); } };
+  const g = group(1, [0, 0, 400, 400]);
+  const a = node(7, [50, 50], [60, 40]);
+  const graph = makeGraph({ nodes: [a], groups: [g], reroutes: [hostileReroute] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /would not accept a new position \(reroute 11\).*NOTHING was moved/s,
+  );
+  assert.deepEqual(g._bounding, [0, 0, 400, 400]);
+  assert.deepEqual(a.pos, [50, 50]);
+});
+
+test("#408: a NESTED box that throws on read is stuck, not silently left behind", () => {
+  // Unknown is not "outside". A box we cannot read might be inside this one, and
+  // moving the group away from it while reporting success is the #408 shape.
+  const hostileGroup = { id: 2, get _bounding() { throw new TypeError("gone"); } };
+  const g = group(1, [0, 0, 400, 400]);
+  const a = node(7, [50, 50], [60, 40]);
+  const graph = makeGraph({ nodes: [a], groups: [g, hostileGroup] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /would not accept a new position \(group 2\).*NOTHING was moved/s,
+  );
+  assert.deepEqual(g._bounding, [0, 0, 400, 400]);
+  assert.deepEqual(a.pos, [50, 50], "and the member is back");
+});
+
+test("#408: a node with NO cached rect and a hostile pos is caught by the readability pre-flight", () => {
+  // syncNodeArea used to return early when there was no rect to write, without
+  // ever touching pos — so this node sailed through the pre-flight and raised a
+  // bare TypeError out of groupMemberNodes instead of a stated refusal.
+  const hostile = { id: 7, size: [60, 40], get pos() { throw new TypeError("disposed"); } };
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [hostile], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /node 7.*group membership cannot be determined.*NOTHING was moved/s,
+  );
+  assert.equal(graph.beforeCount, undefined);
+});
+
 // ---- lib branches the handler tests above do not reach ---------------------
 
 test("writePoint reports the truth for every point shape", () => {
@@ -773,6 +1035,69 @@ test("a Float32Array-backed group box (older LiteGraph) still moves and reports 
   assert.deepEqual(a.pos, [1100.1, 2100.2], "the member moved by the exact delta");
 });
 
+test("a mover NEVER throws out of its loop, so its undo is always returned", () => {
+  // The contract the handler's rollback depends on. If a mover threw partway it
+  // would never RETURN its undo, and everything it had already moved would be
+  // unrecoverable — the caller cannot undo what it was never handed. (The handler
+  // also gates hostile nodes in its pre-flight, so this exercises the mover's own
+  // guarantee directly rather than through a path that shadows it.)
+  const first = { id: 1, pos: [10, 10], size: [60, 40], boundingRect: [10, -20, 60, 70] };
+  const hostile = { id: 2, get pos() { throw new TypeError("disposed"); } };
+  const last = { id: 3, pos: [50, 50], size: [60, 40], boundingRect: [50, 20, 60, 70] };
+
+  let res;
+  assert.doesNotThrow(() => { res = moveGroupMembers([first, hostile, last], 100, 100); });
+  assert.deepEqual(res.stuck.map((n) => n.id), [2], "the hostile member is stuck, not an exception");
+  assert.deepEqual(res.moved.map((n) => n.id), [1, 3], "the others still moved");
+  assert.deepEqual(first.pos, [110, 110]);
+  assert.deepEqual(res.undo(), [], "and the undo it returned puts them all back");
+  assert.deepEqual(first.pos, [10, 10]);
+  assert.deepEqual(last.pos, [50, 50]);
+});
+
+test("moveReroutePoints and translateGroupBoxes never throw on a hostile item either", () => {
+  const hostileReroute = { id: 1, get pos() { throw new TypeError("gone"); } };
+  const okReroute = { id: 2, pos: [10, 10] };
+  let rr;
+  assert.doesNotThrow(() => { rr = moveReroutePoints([hostileReroute, okReroute], 5, 5); });
+  assert.deepEqual(rr.stuck.map((r) => r.id), [1]);
+  assert.deepEqual([okReroute.pos[0], okReroute.pos[1]], [15, 15]);
+  assert.deepEqual(rr.undo(), []);
+  assert.deepEqual([okReroute.pos[0], okReroute.pos[1]], [10, 10]);
+
+  const hostileGroup = { id: 1, get _bounding() { throw new TypeError("gone"); } };
+  const okGroup = group(2, [0, 0, 100, 100]);
+  let gr;
+  assert.doesNotThrow(() => { gr = translateGroupBoxes([hostileGroup, okGroup], 5, 5); });
+  assert.deepEqual(gr.stuck.map((x) => x.id), [1]);
+  assert.deepEqual(okGroup._bounding, [5, 5, 100, 100]);
+  assert.deepEqual(gr.undo(), []);
+  assert.deepEqual(okGroup._bounding, [0, 0, 100, 100]);
+});
+
+test("a rollback reports an unrestorable item rather than throwing over the refusal", () => {
+  // restoreNodePositions runs while the caller is already composing an error. A
+  // throw here would replace that carefully-worded refusal with a raw TypeError.
+  let armed = false;
+  const trap = {
+    id: 1,
+    _p: [10, 10],
+    size: [60, 40],
+    boundingRect: [10, -20, 60, 70],
+    get pos() {
+      if (armed) throw new TypeError("disposed between the move and the undo");
+      return this._p;
+    },
+    set pos(v) { this._p = [Number(v[0]), Number(v[1])]; },
+  };
+  const res = moveGroupMembers([trap], 100, 100);
+  assert.deepEqual(res.moved.map((n) => n.id), [1]);
+  armed = true;
+  let failures;
+  assert.doesNotThrow(() => { failures = res.undo(); });
+  assert.deepEqual(failures.map((n) => n.id), [1], "reported as unrestorable, which is the honest answer");
+});
+
 test("moveGroupMembers reports moved vs stuck instead of silently skipping", () => {
   const ok = { id: 1, pos: [10, 10], size: [200, 100] };
   const noPos = { id: 2 };
@@ -816,6 +1141,48 @@ test("translateGroupBoxes.undo restores the SIZE too, not just the corner", () =
 });
 
 
+test("groupBoundsOf falls back on VALIDITY, not on _bounding being nullish", () => {
+  // A present-but-malformed _bounding used to short-circuit the ?? and make a
+  // group with perfectly good pos/size read as having no usable bounds — refused
+  // as unmovable when it was nothing of the sort.
+  assert.deepEqual(
+    groupBoundsOf({ _bounding: ["x", "y", "w", "h"], pos: [10, 20], size: [300, 200] }),
+    [10, 20, 300, 200],
+    "malformed _bounding must not veto valid pos/size",
+  );
+  assert.deepEqual(
+    groupBoundsOf({ _bounding: [1, 2], pos: [10, 20], size: [300, 200] }),
+    [10, 20, 300, 200],
+    "a half-length quad is not usable either",
+  );
+  assert.deepEqual(groupBoundsOf({ _bounding: [1, 2, 3, 4], pos: [9, 9], size: [9, 9] }), [1, 2, 3, 4],
+    "a VALID _bounding still wins");
+  assert.equal(groupBoundsOf({ _bounding: [NaN, 0, 0, 0] }), null, "and neither form usable ⇒ null");
+  assert.equal(groupBoundsOf(null), null);
+});
+
+test("#408: a group whose _bounding is malformed but whose pos/size is valid still moves", () => {
+  const g = { id: 1, title: "Legacy", _bounding: ["x", "y", "w", "h"], pos: [0, 0], size: [200, 200] };
+  const a = node(7, [50, 50], [100, 100]);
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  const out = realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
+
+  assert.deepEqual(a.pos, [1050, 1050], "the member moved by the delta from the usable bounds");
+  assert.equal(out.moved.nodes, 1);
+});
+
+test("refreshNodeArea REPORTS an unwritable rect instead of throwing mid-move", () => {
+  const frozen = { pos: [110, 110], boundingRect: Object.freeze([100, 70, 60, 70]) };
+  let result;
+  assert.doesNotThrow(() => { result = refreshNodeArea(frozen, [100, 100]); });
+  assert.equal(result, false);
+  const ok = { pos: [110, 110], boundingRect: [100, 70, 60, 70] };
+  assert.equal(refreshNodeArea(ok, [100, 100]), true);
+  assert.deepEqual([...ok.boundingRect], [110, 80, 60, 70]);
+  assert.equal(refreshNodeArea({ pos: [1, 1] }, [0, 0]), true, "no cached rect ⇒ nothing to keep in step");
+});
+
 test("containsBounds: strict containment, identical rects excluded (litegraph containsRect)", () => {
   assert.equal(containsBounds([0, 0, 100, 100], [10, 10, 50, 50]), true);
   assert.equal(containsBounds([0, 0, 100, 100], [0, 0, 100, 100]), false, "identical rects are peers");
@@ -841,8 +1208,20 @@ test("reroutesInside reads the Map, array and plain-object shapes of graph.rerou
   assert.deepEqual(reroutesInside({ reroutes: [hit, miss] }, bounds).map((r) => r.id), [1]);
   assert.deepEqual(reroutesInside({ reroutes: { a: hit, b: miss } }, bounds).map((r) => r.id), [1]);
   assert.deepEqual(reroutesInside({}, bounds), [], "no reroutes on this build → nothing to move");
-  assert.deepEqual(reroutesInside({ reroutes: [{ id: 3 }, { id: 4, pos: [Number.NaN, 0] }] }, bounds), []);
   assert.deepEqual(reroutesInside({ reroutes: [hit] }, null), []);
+  // A reroute with NO pos is not a positioned item — nothing to move, nothing to
+  // be wrong about. A reroute WITH a pos that is not finite, or that cannot be
+  // read at all, is INDETERMINATE: it must ride along so the move refuses rather
+  // than quietly leaving it behind. "Could not determine" is not "outside".
+  assert.deepEqual(reroutesInside({ reroutes: [{ id: 3 }] }, bounds), []);
+  assert.deepEqual(
+    reroutesInside({ reroutes: [{ id: 4, pos: [Number.NaN, 0] }] }, bounds).map((r) => r.id),
+    [4],
+  );
+  assert.deepEqual(
+    reroutesInside({ reroutes: [{ id: 5, get pos() { throw new TypeError("gone"); } }] }, bounds).map((r) => r.id),
+    [5],
+  );
 });
 
 test("nestedGroupsOf tolerates a group with no usable bounds on either side", () => {
