@@ -451,6 +451,32 @@ export function translateGroupBox(g, dx, dy) {
   return placeGroupBox(g, before[0] + dx, before[1] + dy);
 }
 
+/**
+ * Restore a group's FULL box — corner and size — and report whether it is really
+ * back. placeGroupBox writes only the corner, which is right for a move but wrong
+ * for an undo: if the forward write reshaped the box on the way through, putting
+ * the corner back leaves the wrong size behind while the caller announces that
+ * nothing was moved.
+ */
+function restoreGroupBox(g, quad) {
+  const [x, y, w, h] = quad;
+  const b = g?._bounding;
+  if (b && b.length >= 4) {
+    try {
+      b[0] = x;
+      b[1] = y;
+      b[2] = w;
+      b[3] = h;
+    } catch {
+      /* frozen quad — verified below */
+    }
+  } else {
+    writePoint(g, "pos", x, y);
+    writePoint(g, "size", w, h);
+  }
+  return groupBoxIsAt(g, x, y, w, h);
+}
+
 /** Translate several group boxes, reporting which ones actually moved and
  *  handing back an ABSOLUTE undo (see restoreNodePositions for why the inverse
  *  delta is not good enough). */
@@ -464,14 +490,14 @@ export function translateGroupBoxes(groups, dx, dy) {
       if (g) stuck.push(g);
       continue;
     }
-    attempted.push([g, before[0], before[1]]);
+    attempted.push([g, before]);
     (placeGroupBox(g, before[0] + dx, before[1] + dy) ? moved : stuck).push(g);
   }
   return {
     moved,
     stuck,
     /** Returns the boxes that could NOT be put back. */
-    undo: () => attempted.filter(([g, x, y]) => !placeGroupBox(g, x, y)).map(([g]) => g),
+    undo: () => attempted.filter(([g, quad]) => !restoreGroupBox(g, quad)).map(([g]) => g),
   };
 }
 

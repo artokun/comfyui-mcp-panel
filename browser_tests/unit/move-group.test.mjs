@@ -793,6 +793,28 @@ test("translateGroupBoxes reports a box that would not move", () => {
   assert.equal(translateGroupBox({ nonsense: true }, 1, 1), false, "a group with no bounds cannot be moved");
 });
 
+test("translateGroupBoxes.undo restores the SIZE too, not just the corner", () => {
+  // A build that reshapes on reposition: putting only the corner back would leave
+  // the box the wrong shape while the undo reported success.
+  const quad = [0, 0, 100, 100];
+  Object.defineProperty(quad, "0", {
+    get() { return this._x ?? 0; },
+    set(v) { this._x = v; this._h = 5; },
+    configurable: true,
+  });
+  Object.defineProperty(quad, "3", {
+    get() { return this._h ?? 100; },
+    set(v) { this._h = v; },
+    configurable: true,
+  });
+  const g = { id: 1, _bounding: quad };
+
+  const res = translateGroupBoxes([g], 10, 10);
+  assert.deepEqual(res.stuck.map((x) => x.id), [1], "reshaping the box is not moving it");
+  assert.deepEqual(res.undo(), [], "and the undo puts the whole quad back");
+  assert.deepEqual([quad[0], quad[1], quad[2], quad[3]], [0, 0, 100, 100]);
+});
+
 
 test("containsBounds: strict containment, identical rects excluded (litegraph containsRect)", () => {
   assert.equal(containsBounds([0, 0, 100, 100], [10, 10, 50, 50]), true);
