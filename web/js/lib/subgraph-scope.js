@@ -297,38 +297,82 @@ export function isSubgraphInRoot(rootGraph, subgraph) {
   return false;
 }
 
+/** POSITIVE structural evidence that a graph object is a SUBGRAPH rather than a
+ *  root-level graph (#604 family). A LiteGraph subgraph is defined by its boundary
+ *  rails (`inputNode`/`outputNode`, or the private `_inputNode`/`_outputNode` this
+ *  file's resolveRailNode already reads) and by a `rootGraph` back-pointer that
+ *  names a DIFFERENT graph; a root graph has no rails and is its own root.
+ *
+ *  This exists because "the canvas graph is not reachable from app.graph" answers
+ *  TWO different questions, and resolveScope used to read one as the other:
+ *    (a) "the canvas still points at a subgraph the REBUILT root no longer owns"
+ *        (#220/#308) — a ghost with no workflow standing; reconciling the view to
+ *        root loses nothing, and
+ *    (b) "app.graph and the canvas hold two different ROOT graphs" (#604) — the
+ *        canvas is the user's real, live workflow and `app.graph` is the stale or
+ *        half-rebuilt one. Treating (b) as (a) repainted the user's canvas away
+ *        and left the graph they were editing unreferenced and unrecoverable.
+ *
+ *  Fail-safe direction: only POSITIVE subgraph evidence returns true. A graph with
+ *  no rails and no foreign root back-pointer is treated as root-level, so an
+ *  unrecognized divergence is refused (loudly) instead of silently "healed". */
+export function graphIsSubgraphLike(graph) {
+  if (!graph || typeof graph !== "object") return false;
+  if (graph.inputNode ?? graph._inputNode ?? graph.outputNode ?? graph._outputNode) return true;
+  // LiteGraph's `rootGraph` is the graph itself on a root LGraph and the enclosing
+  // root on a Subgraph — a back-pointer to a DIFFERENT graph is subgraph evidence.
+  const claimedRoot = graph.rootGraph;
+  if (claimedRoot && typeof claimedRoot === "object" && claimedRoot !== graph) return true;
+  return false;
+}
+
 /** THE authoritative viewing-scope resolver. Both graph reads and graph mutations
  *  derive their target graph from this, so they can never diverge (#220 / #308).
  *
- *  Returns { graph, rootGraph, scope, owner, stale }:
+ *  Returns { graph, rootGraph, scope, owner, stale, diverged }:
  *   - root             → { graph: root,     scope: "root" }
  *   - a valid subgraph → { graph: subgraph, scope: "subgraph", owner? } — valid when
  *     the live root reaches it via an owner NODE or its `subgraphs` registry.
- *   - a STALE subgraph (the canvas still points at a subgraph the rebuilt root
+ *   - a STALE subgraph (the canvas still points at a SUBGRAPH the rebuilt root
  *     neither owns nor registers — e.g. after a reconnect) → reconcile to root:
  *     { graph: root, scope: "root", stale: true }. The caller rebinds the canvas
- *     so the physical view matches, keeping read + edit in lockstep. */
+ *     so the physical view matches, keeping read + edit in lockstep.
+ *   - a DIVERGED root (the canvas holds a ROOT-LEVEL graph that is not `app.graph`
+ *     — #604: after a backend restart `app.graph` was empty while the canvas still
+ *     held the user's unsaved 31-node workflow) → { graph: canvasGraph, scope:
+ *     "root", stale: FALSE, diverged: true }. `stale` stays false ON PURPOSE: it is
+ *     the caller's repaint trigger, and repainting here is what discarded the
+ *     user's live graph. The caller must REFUSE the command instead — the panel
+ *     cannot prove which of the two graphs the command was issued for, and
+ *     "could not determine" must not become a verdict in either direction. */
 export function resolveScope(app) {
   const rootGraph = app?.graph ?? null;
   const canvasGraph = app?.canvas?.graph ?? null;
   if (!rootGraph) {
-    return { graph: canvasGraph ?? null, rootGraph: null, scope: "root", owner: null, stale: false };
+    return { graph: canvasGraph ?? null, rootGraph: null, scope: "root", owner: null, stale: false, diverged: false };
   }
   if (!canvasGraph || canvasGraph === rootGraph) {
-    return { graph: rootGraph, rootGraph, scope: "root", owner: null, stale: false };
+    return { graph: rootGraph, rootGraph, scope: "root", owner: null, stale: false, diverged: false };
   }
   const owner = findSubgraphOwner(rootGraph, canvasGraph);
   if (owner) {
-    return { graph: canvasGraph, rootGraph, scope: "subgraph", owner, stale: false };
+    return { graph: canvasGraph, rootGraph, scope: "subgraph", owner, stale: false, diverged: false };
   }
   // No presentation-owner node — but the subgraph may still be authoritative via the
   // root's uuid→Subgraph registry (a registered definition without a live instance
   // node). Only when it is NEITHER owned NOR registered is it a genuine post-reconnect
   // ghost; then fall back to root so reads AND writes agree rather than target a ghost.
   if (isSubgraphInRoot(rootGraph, canvasGraph)) {
-    return { graph: canvasGraph, rootGraph, scope: "subgraph", owner: null, stale: false };
+    return { graph: canvasGraph, rootGraph, scope: "subgraph", owner: null, stale: false, diverged: false };
   }
-  return { graph: rootGraph, rootGraph, scope: "root", owner: null, stale: true };
+  // Unreachable from the live root. A SUBGRAPH here is the #220/#308 ghost —
+  // reconcile to root (nothing of the workflow lives in it). Anything ROOT-LEVEL is
+  // the #604 divergence: two candidate workflows, no proof of which one the command
+  // names, and the canvas one is the user's. Report it; never resolve it silently.
+  if (graphIsSubgraphLike(canvasGraph)) {
+    return { graph: rootGraph, rootGraph, scope: "root", owner: null, stale: true, diverged: false };
+  }
+  return { graph: canvasGraph, rootGraph, scope: "root", owner: null, stale: false, diverged: true };
 }
 
 /** Compact JSON scope descriptor for tool responses (the `viewing` field). Derived

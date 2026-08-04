@@ -26,6 +26,10 @@ import {
   graphRootWorkflowUuidMatches,
   graphRootMatchesState,
   graphCommandMayMutateWorkflow,
+  graphCommandBindingBar,
+  graphBindingRefusalMessage,
+  resolveGraphBindingVerdict,
+  MUTATION_BINDING_BAR,
   graphReadBindingChanged,
   resolveGraphRootUuidRebind,
   serializedStateProvenEmpty,
@@ -248,11 +252,8 @@ function buildDirtyStaleRouteHarness({
     "workflowObjectUuid",
     "workflowStableUuid",
     "graphRootWorkflowUuidMismatches",
-    "graphRootWorkflowUuidMatches",
-    "graphRootMismatchesActiveWorkflow",
-    "graphReadDesynced",
-    "graphEmptyBindingUnproven",
-    "activeWorkflowNodeCount",
+    "resolveGraphBindingVerdict",
+    "graphBindingRefusalMessage",
     "activeWorkflowProvenEmpty",
     "graphRootProvenEmpty",
     "workflowOwnsRootUuidTag",
@@ -266,11 +267,8 @@ function buildDirtyStaleRouteHarness({
     uuidStore.workflowObjectUuid,
     stableUuid,
     graphRootWorkflowUuidMismatches,
-    graphRootWorkflowUuidMatches,
-    graphRootMismatchesActiveWorkflow,
-    graphReadDesynced,
-    graphEmptyBindingUnproven,
-    activeWorkflowNodeCount,
+    resolveGraphBindingVerdict,
+    graphBindingRefusalMessage,
     activeWorkflowProvenEmpty,
     graphRootProvenEmpty,
     ownsTag,
@@ -723,18 +721,33 @@ test("#545 wiring: dirty tracker state is inconclusive, but an established workf
     /graphRootWorkflowUuidMismatches\(\{ rootGraph, activeWorkflowUuid \}\)/,
     "a dirty tab retains the positive foreign-root identity fence",
   );
+  // The predicate composition itself now lives in lib/graph-binding.js
+  // (resolveGraphBindingVerdict) so the read-vs-mutation bar is observable in
+  // tests; the panel fence only resolves the evidence and delegates the verdict.
   assert.match(
     body,
+    /const verdict = resolveGraphBindingVerdict\(\{/,
+    "the fence must delegate its verdict to the pure resolver",
+  );
+  const bindingSrc = readFileSync(
+    join(HERE, "../../web/js/lib/graph-binding.js"),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  const verdictStart = bindingSrc.indexOf("export function resolveGraphBindingVerdict(");
+  assert.notEqual(verdictStart, -1);
+  const verdictBody = bindingSrc.slice(verdictStart, bindingSrc.indexOf("\n}\n", verdictStart));
+  assert.match(
+    verdictBody,
     /requireDirtyMutationBinding[\s\S]*!graphRootWorkflowUuidMatches\(\{ rootGraph, activeWorkflowUuid \}\)/,
     "a dirty mutation must require a positive root-to-active UUID match, not merely no mismatch",
   );
   assert.match(
-    body,
+    verdictBody,
     /const currentStateTrustworthy = activeWorkflow\?\.isModified !== true;/,
     "a dirty ChangeTracker snapshot is not trustworthy as a binding proof",
   );
   assert.match(
-    body,
+    verdictBody,
     /currentStateTrustworthy &&\s*includeBaselineReadGuard &&\s*graphReadDesynced/,
     "the old node-count baseline guard must not reject a dirty canvas from stale tracker state",
   );
@@ -1754,11 +1767,13 @@ test("#545 P1: direct snapshot restore refuses an untagged stale B for dirty A",
     "getGraphCtx",
     "activeWorkflowRef",
     "assertGraphBoundToActiveWorkflow",
+    "MUTATION_BINDING_BAR",
     `${restoreSource}\nreturn restoreSnapshot;`,
   )(
     () => ({ app: { loadGraphData: () => { loads += 1; } }, graph: rootB, rootGraph: rootB }),
     () => workflowA,
     assertBound,
+    MUTATION_BINDING_BAR,
   );
 
   assert.equal(
@@ -1782,10 +1797,12 @@ test("#545 P1: direct CivitAI graph_load refuses an untagged stale B for dirty A
   const graphLoad = new Function(
     "getGraphCtx",
     "assertGraphBoundToActiveWorkflow",
+    "MUTATION_BINDING_BAR",
     `const GRAPH_TOOL_EXECUTORS = {${graphLoadSource}\n}; return GRAPH_TOOL_EXECUTORS.graph_load;`,
   )(
     () => ({ app: { loadGraphData: async () => { loads += 1; } }, graph: rootB, rootGraph: rootB }),
     assertBound,
+    MUTATION_BINDING_BAR,
   );
 
   await assert.rejects(
@@ -1896,8 +1913,8 @@ test("#349 wiring: every graph command verifies LiteGraph is bound, with positiv
   assert.match(handler, /msg\.cmd\.startsWith\("graph_"\)/, "graph commands must have a root-binding fence");
   assert.match(
     handler,
-    /assertGraphBoundToActiveWorkflow\(graph, rootGraph, \{[\s\S]*requireDirtyMutationBinding: graphCommandMayMutateWorkflow\(msg\.cmd\)[\s\S]*\}\)/,
-    "the fence must inspect the executor graph and demand positive dirty binding only for mutations",
+    /assertGraphBoundToActiveWorkflow\(graph, rootGraph, graphCommandBindingBar\(msg\.cmd\)\)/,
+    "the fence must inspect the executor graph and derive its bar from the command's mutability",
   );
 });
 
@@ -1912,8 +1929,8 @@ test("#349 direct paths: run, CivitAI load, and snapshot restore fence the live 
     assert.ok(fence > start && fence < before, `${startNeedle} must fence before ${beforeNeedle}`);
     assert.match(
       src.slice(fence, before),
-      /requireDirtyMutationBinding: true/,
-      `${startNeedle} must require a positive binding for dirty mutation`,
+      /\.\.\.MUTATION_BINDING_BAR/,
+      `${startNeedle} must clear the full MUTATION binding bar, not a reduced one`,
     );
   };
 
@@ -1930,7 +1947,7 @@ test("#349 snapshots: capture is bound and restore rejects a snapshot from anoth
   assert.ok(captureStart >= 0 && captureFence > captureStart && captureFence < captureSerialize);
   assert.match(
     src.slice(captureFence, captureSerialize),
-    /requireDirtyMutationBinding: true/,
+    /\.\.\.MUTATION_BINDING_BAR/,
     "snapshot capture must not record an unbound dirty root for later restore",
   );
   assert.match(

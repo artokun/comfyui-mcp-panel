@@ -259,16 +259,15 @@ import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
 import { readyAckCanPromoteBackend } from "./lib/pi-readiness.js";
 import { createRunReconcileSweep } from "./lib/run-reconcile-sweep.js";
 import {
-  activeWorkflowNodeCount,
   activeWorkflowProvenEmpty,
-  graphEmptyBindingUnproven,
-  graphReadDesynced,
-  graphRootMismatchesActiveWorkflow,
   graphRootProvenEmpty,
   graphRootWorkflowUuidMismatches,
   graphRootWorkflowUuidMatches,
   graphRootMatchesState,
-  graphCommandMayMutateWorkflow,
+  graphCommandBindingBar,
+  MUTATION_BINDING_BAR,
+  graphBindingRefusalMessage,
+  resolveGraphBindingVerdict,
   graphReadBindingChanged,
   resolveGraphRootUuidRebind,
 } from "./lib/graph-binding.js";
@@ -4252,8 +4251,37 @@ function getGraphCtx() {
     throw new Error("ComfyUI graph is not available (app.graph / LiteGraph missing)");
   }
   const scope = resolveScope(app);
-  // When the scope was stale, rebind the CANVAS to root too, so the physical view
-  // matches the graph reads/edits now target (keeps read + edit in lockstep).
+  // #604 — CANVAS/ROOT DIVERGENCE. `app.graph` and `app.canvas.graph` hold two
+  // different ROOT-LEVEL graphs (reported after a backend restart with no page
+  // reload: `app.graph` was empty while the canvas still held the user's unsaved
+  // 31-node workflow). This used to be lumped in with the #220/#308 stale-SUBGRAPH
+  // case and "repaired" by `canvas.setGraph(app.graph)` — which pointed the user's
+  // canvas at the empty root, left the graph they were actually editing
+  // unreferenced ("the memory-only graph was unrecoverable"), and then handed every
+  // downstream guard a self-consistent (app.graph, activeWorkflow) pair that no
+  // longer said anything about the canvas the command was issued for. The evidence
+  // of the divergence was destroyed before anything could report it.
+  //
+  // There is no safe way to pick one: the canvas graph is what the user sees, the
+  // root graph is what the workflow service and every save path use, and nothing
+  // here can prove which one this command names. So REFUSE, before any work and
+  // before touching the view. A destroyed graph cannot be retried; a refusal can.
+  if (scope.diverged) {
+    const canvasNodes = scope.graph?._nodes?.length ?? "unknown";
+    const rootNodes = scope.rootGraph?._nodes?.length ?? "unknown";
+    throw new Error(
+      `[canvas-root-divergence] The canvas you are looking at (${canvasNodes} node(s)) and the ` +
+        `panel's bound root graph (${rootNodes} node(s)) are two DIFFERENT graphs, so this command ` +
+        `was NOT applied — the panel cannot tell which one it was meant for, and picking either ` +
+        `could edit a graph you are not looking at. This usually follows a ComfyUI backend restart ` +
+        `without a page reload. Save or export the canvas you want to keep, then reload the ComfyUI ` +
+        `page (a panel-only reload does not rebuild this binding).`,
+    );
+  }
+  // When the scope was a stale SUBGRAPH, rebind the CANVAS to root too, so the
+  // physical view matches the graph reads/edits now target (keeps read + edit in
+  // lockstep). Safe only because a ghost subgraph the live root neither owns nor
+  // registers holds none of the workflow — unlike the diverged root above.
   if (scope.stale && typeof app.canvas?.setGraph === "function") {
     try {
       app.canvas.setGraph(scope.rootGraph);
@@ -4389,65 +4417,25 @@ function assertGraphBoundToActiveWorkflow(
       }
     }
   }
-  const currentStateTrustworthy = activeWorkflow?.isModified !== true;
-  // On a dirty tab, ChangeTracker's activeState can lag the live canvas (#545),
-  // so it cannot prove the root belongs to this workflow. Reads remain
-  // availability-oriented, but mutations need a positive UUID match: otherwise
-  // a stale, untagged root B is indistinguishable from A and could be changed.
-  const dirtyMutationBindingUnproven =
-    requireDirtyMutationBinding &&
-    activeWorkflow?.isModified === true &&
-    !graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid });
-  const rootShapeMismatch = graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow });
-  const baselineReadDesync =
-    currentStateTrustworthy &&
-    includeBaselineReadGuard &&
-    graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph });
-  if (
-    rootUuidMismatch ||
-    dirtyMutationBindingUnproven ||
-    rootShapeMismatch ||
-    baselineReadDesync
-  ) {
-    // #565 — name the firing predicate. All four branches used to throw the
-    // identical text, so a misfiring guard was undiagnosable and the only
-    // available response was a blind reload/re-open retry loop.
-    const reason = rootUuidMismatch
-      ? "root-workflow-uuid-mismatch"
-      : dirtyMutationBindingUnproven
-        ? "dirty-mutation-binding-unproven"
-        : rootShapeMismatch
-          ? "root-shape-mismatch"
-          : "root-node-count-desync";
-    const expected = activeWorkflowNodeCount(activeWorkflow);
-    throw new Error(
-      `[${reason}] The live graph is out of sync with the active workflow: the workflow reports ${expected} node(s), ` +
-        `but the canvas is bound to a different graph. A load, tab switch, or reconnect left this command ` +
-        `pointed at the wrong canvas, so it was NOT applied. Re-open the active workflow tab ` +
-        `(panel_open_workflow) or reload the panel to rebind the graph, then retry.`,
-    );
-  }
-  // #560 (2nd reopen) — the FALSE-EMPTY read hole. Every predicate above is
-  // inconclusive in the mid-population window (empty root, no root tag,
-  // tracker unreadable/unsettled after a reconnect + tab switch or a failed
-  // repaint), so an empty ROOT read slipped through as an AUTHORITATIVE
-  // node_count 0 for a populated workflow — and the agent built on it (#349-
-  // class). An empty read is now authoritative ONLY when the empty state is
-  // PROVEN (clean, well-formed, all-empty tracker state) or the canvas is
-  // POSITIVELY bound (root tag matches). Otherwise the state is INCONCLUSIVE:
-  // refuse with a retryable error — never a false-empty read, never a build
-  // on one. Reads AND mutations are fenced alike; the legacy verdicts above
-  // stay more specific and keep winning. Gated LAST so it can never mask a
-  // positive desync/mismatch verdict.
-  if (graphEmptyBindingUnproven({ graph, rootGraph, activeWorkflow, activeWorkflowUuid })) {
-    throw new Error(
-      `[empty-binding-unproven] The live root canvas reads EMPTY, but the active workflow's own ` +
-        `state cannot prove it is genuinely empty — the tab may still be loading after a switch, ` +
-        `reconnect, or a failed open, and node_count 0 could be a FALSE-EMPTY reading, so this ` +
-        `command was NOT applied as authoritative. Retry in a moment once the tab settles; if it ` +
-        `persists, re-open the workflow tab (panel_open_workflow) or reload the panel.`,
-    );
-  }
+  // The verdict itself is a PURE function of the resolved evidence, lifted into
+  // lib/graph-binding.js (#604) so the read-vs-mutation evidence bar is observable
+  // in unit tests. It names the firing predicate (#565) — all branches used to
+  // throw the identical text, so a misfiring guard was undiagnosable and the only
+  // available response was a blind reload/re-open retry loop. Every caller runs
+  // this BEFORE doing any work, which is what makes its "was NOT applied" claim
+  // true rather than a fabrication.
+  const verdict = resolveGraphBindingVerdict({
+    graph,
+    rootGraph,
+    activeWorkflow,
+    activeWorkflowUuid,
+    liveNodeCount,
+    inSubgraph,
+    rootUuidMismatch,
+    includeBaselineReadGuard,
+    requireDirtyMutationBinding,
+  });
+  if (verdict) throw new Error(graphBindingRefusalMessage(verdict));
 }
 
 /** Reach a Pinia store by id. Pinia attaches itself as `$pinia` on the Vue app's
@@ -4687,8 +4675,7 @@ function captureGraphSnapshot(mid, label) {
     );
     if (!currentState) return null;
     assertGraphBoundToActiveWorkflow(graph, rootGraph, {
-      includeBaselineReadGuard: false,
-      requireDirtyMutationBinding: true,
+      ...MUTATION_BINDING_BAR,
     });
     const data = rootGraph.serialize();
     graphSnapshots.push({ mid, ts: Date.now(), label: (label || "").slice(0, 80), data, workflowRef });
@@ -4711,8 +4698,7 @@ function restoreSnapshot(snap) {
     // Revert is a direct local load, not a bridge command. Do not restore a
     // snapshot into a canvas proven to belong to a different active workflow.
     assertGraphBoundToActiveWorkflow(graph, rootGraph, {
-      includeBaselineReadGuard: false,
-      requireDirtyMutationBinding: true,
+      ...MUTATION_BINDING_BAR,
     });
     // Deep-clone so the stored snapshot isn't mutated by the live graph after load.
     // __cmcpNoFork: this reloads the SAME active workflow (a revert), so the create-
@@ -5930,8 +5916,7 @@ function revalidateGraphMutationContext(captured) {
     );
   }
   assertGraphBoundToActiveWorkflow(current.graph, current.rootGraph, {
-    includeBaselineReadGuard: false,
-    requireDirtyMutationBinding: true,
+    ...MUTATION_BINDING_BAR,
   });
   return current;
 }
@@ -6953,8 +6938,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // bypassing bridge dispatch. Refuse before snapshot/load so that path cannot
     // report a successful load into a stale prior tab (#349).
     assertGraphBoundToActiveWorkflow(graph, rootGraph, {
-      includeBaselineReadGuard: false,
-      requireDirtyMutationBinding: true,
+      ...MUTATION_BINDING_BAR,
     });
     // Accept a JSON string or an object.
     let data = incoming;
@@ -8105,8 +8089,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // mutation occurs, so enforce the same current-state binding before prompt
     // construction or queuePrompt can report success (#349).
     assertGraphBoundToActiveWorkflow(graph, rootGraph, {
-      includeBaselineReadGuard: false,
-      requireDirtyMutationBinding: true,
+      ...MUTATION_BINDING_BAR,
     });
     if (typeof app.queuePrompt !== "function") {
       throw new Error("app.queuePrompt is unavailable on this frontend");
@@ -11808,12 +11791,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // can lag ordinary unsaved canvas edits (#545).  Keep the strict
             // positive-binding requirement for mutations only, so read tools can
             // report the live graph and give the user a recovery path.
+            //
+            // #604 — the bar comes from graphCommandBindingBar so a MUTATION can
+            // never clear a LOWER bar than a READ. This line used to hard-code
+            // `includeBaselineReadGuard: false` for EVERY command, and only the read
+            // executors re-asserted with it on: the very evidence that made
+            // graph_outline refuse ("the workflow reports N>0 nodes but the live root
+            // reads empty") let graph_remove_node through and delete nodes from the
+            // wrong canvas. Reads still get the lower bar HERE — they re-assert with
+            // the full one inside their own executors.
             if (msg.cmd.startsWith("graph_")) {
               const { graph, rootGraph } = getGraphCtx();
-              assertGraphBoundToActiveWorkflow(graph, rootGraph, {
-                includeBaselineReadGuard: false,
-                requireDirtyMutationBinding: graphCommandMayMutateWorkflow(msg.cmd),
-              });
+              assertGraphBoundToActiveWorkflow(graph, rootGraph, graphCommandBindingBar(msg.cmd));
             }
             // PINNED-TARGET GUARD (#349): a `workflow_path` on the command means the
             // agent's session is pinned to a SPECIFIC workflow. But every executor
