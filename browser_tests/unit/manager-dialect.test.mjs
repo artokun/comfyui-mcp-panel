@@ -483,6 +483,72 @@ test("#605: graph_update_node legacy-on-legacy unreachable surfaces the original
   assert.equal(reprobes, 1, "one re-probe, then the ladder gives up");
 });
 
+test("#424: a 405 on the /v2 envelope still lands on the legacy self-update route (via marker)", async () => {
+  const calls = [];
+  const update = buildGraphUpdateNode(
+    graphUpdateDeps({
+      detectManagerDialect: async () => "v2",
+      managerV2: async (route) => {
+        calls.push(["v2", route]);
+        throw new Error(`Manager ${route}: HTTP 405`); // frontend catchall
+      },
+      managerCall: async (route) => {
+        calls.push(["legacy", route]);
+        return {};
+      },
+    }),
+  );
+  const res = await update({ id: "comfyui-manager" });
+  assert.equal(res.via, "legacy-self-update", "the 405 fallback is named");
+  assert.equal(res.dialect, "legacy", "the result names the dialect the update ACTUALLY used");
+  assert.equal(res.pending, true, "a legacy update reports honest pending (no per-task history)");
+  assert.deepEqual(
+    calls,
+    [
+      ["v2", "manager/queue/task"], // method-rejected — nothing landed
+      ["legacy", "manager/queue/update"],
+      ["legacy", "manager/queue/start"],
+    ],
+  );
+});
+
+test("codex r2: a route-404 from the 405-fallback's legacy POST heals through the ladder", async () => {
+  const calls = [];
+  let mode = "legacy-ui-v4"; // 405s the /v2 task POST; serves legacy routes…
+  const update = buildGraphUpdateNode(
+    graphUpdateDeps({
+      detectManagerDialect: async () => "v2",
+      reProbeManagerDialect: async () => "v2", // …until the restart lands normal v4
+      managerV2: async (route) => {
+        calls.push(["v2", route]);
+        if (mode === "legacy-ui-v4") throw new Error(`Manager ${route}: HTTP 405`);
+        return {};
+      },
+      managerCall: async (route) => {
+        calls.push(["legacy", route]);
+        // The restart to normal v4 lands BEFORE the legacy fallback POST: the
+        // 3.x routes are gone (proven 404, nothing ran).
+        mode = "v4";
+        throw routeMissing();
+      },
+    }),
+  );
+  const res = await update({ id: "comfyui-manager" });
+  assert.equal(res.updated, true, "the healed v4 update is verified");
+  assert.equal(res.dialect, "v2", "the result names the live dialect");
+  assert.equal(res.via, undefined, "the legacy via marker is cleared after the heal");
+  assert.deepEqual(
+    calls,
+    [
+      ["v2", "manager/queue/task"], // 405 — nothing landed
+      ["legacy", "manager/queue/update"], // 404 after the restart — nothing landed
+      ["v2", "manager/queue/task"], // healed re-enqueue on the live v4
+      ["v2", "manager/queue/start"],
+    ],
+    "exactly one update lands, on the live dialect",
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Real-source harness: nodes_install (the mutation path)
 // ---------------------------------------------------------------------------

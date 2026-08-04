@@ -10767,7 +10767,16 @@ const GRAPH_TOOL_EXECUTORS = {
     // has landed (`enqueued`), any later failure surfaces as-is, the same
     // submit/start split nodes_install keeps. dialectRetries caps the ladder so
     // a flapping backend mid-restart cannot loop it.
+    //
+    // The #424 405 fallback does NOT call legacyUpdate directly (codex r2): it
+    // routes through this loop as dialect="legacy", so a route-level rejection
+    // of the legacy POST (a backend that swapped generation between the 405 and
+    // the fallback) heals through the same ladder instead of falsely failing.
+    // `methodRejected` records that the via marker applies only when the update
+    // actually LANDS on the legacy route — a later heal to a pip dialect clears
+    // it (the result must name the route the update really took).
     let dialectRetries = 0;
+    let methodRejected = false;
     for (;;) {
       if (dialect === "v2") {
         const params = {
@@ -10792,8 +10801,9 @@ const GRAPH_TOOL_EXECUTORS = {
           // The 405 legacy self-update fallback wraps ONLY the enqueue: once the
           // task POST landed, a legacyUpdate would queue a SECOND update.
           if (!enqueued && isMethodNotAllowed(err)) {
-            await legacyUpdate();
-            return finalizeUpdate("legacy-self-update");
+            methodRejected = true;
+            dialect = "legacy";
+            continue;
           }
           // codex P0: the heal retries ONLY a PROVEN route-level rejection (the
           // 404 marker) before the enqueue landed — never an ambiguous
@@ -10822,8 +10832,9 @@ const GRAPH_TOOL_EXECUTORS = {
         } catch (err) {
           // The 405 legacy self-update fallback wraps ONLY the enqueue (as above).
           if (!enqueued && isMethodNotAllowed(err)) {
-            await legacyUpdate();
-            return finalizeUpdate("legacy-self-update");
+            methodRejected = true;
+            dialect = "legacy";
+            continue;
           }
           if (enqueued || !isManagerRouteMissing(err)) throw err;
           const retry = dialectRetryTarget(dialect, await reProbeManagerDialect());
@@ -10832,6 +10843,7 @@ const GRAPH_TOOL_EXECUTORS = {
           dialect = retry;
           continue;
         }
+        return finalizeUpdate();
       } else {
         try {
           await legacyUpdate();
@@ -10843,8 +10855,10 @@ const GRAPH_TOOL_EXECUTORS = {
           dialect = retry;
           continue;
         }
+        // The via marker names the legacy SELF-UPDATE route only when the update
+        // actually landed there after a /v2 method rejection (#424).
+        return finalizeUpdate(methodRejected ? "legacy-self-update" : undefined);
       }
-      return finalizeUpdate();
     }
   },
 
