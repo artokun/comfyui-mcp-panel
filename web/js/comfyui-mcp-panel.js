@@ -3759,11 +3759,20 @@ function invalidateManagerDialectCache() {
  *  all (mid-restart / disabled) — the caller then surfaces its ORIGINAL error,
  *  which carries the operation's real context. A failed re-probe leaves the
  *  cache EMPTY (never the stale value), so the next call probes again instead
- *  of wedging on a verdict from a server that is gone. */
-async function reProbeManagerDialect() {
+ *  of wedging on a verdict from a server that is gone.
+ *
+ *  The WHOLE re-probe shares ONE budget (codex r3): the caller's signal when it
+ *  carries one (waitForUpdateResult's 15s envelope must not be outlived by
+ *  stacked 15s probes after its routed call already failed), always capped by
+ *  the shared Manager timeout. */
+async function reProbeManagerDialect({ signal } = {}) {
   invalidateManagerDialectCache();
   try {
-    return await detectManagerDialect();
+    return await detectManagerDialect({
+      signal: signal
+        ? AbortSignal.any([AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS), signal])
+        : AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS),
+    });
   } catch {
     return null;
   }
@@ -3776,12 +3785,16 @@ const MANAGER_FETCH_TIMEOUT_MS = 15000;
 
 /** Soft GET probe: parsed JSON, or null on any non-ok / 404 / throw / stall.
  *  Never throws — a probe must not blow up detection. Bounded by an AbortSignal
- *  so a hanging probe can't wedge dialect detection. */
-async function managerProbe(route) {
+ *  so a hanging probe can't wedge dialect detection; an optional caller signal
+ *  is combined in (#605 codex r3 — a re-probe must not outlive the budget that
+ *  paid for the failed routed call). */
+async function managerProbe(route, { signal } = {}) {
   try {
     const res = await api.fetchApi(route, {
       method: "GET",
-      signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS),
+      signal: signal
+        ? AbortSignal.any([AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS), signal])
+        : AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS),
     });
     if (!res || !res.ok) return null;
     const txt = await res.text();
@@ -3802,19 +3815,22 @@ function looksLikeQueueStatus(s) {
 }
 
 /** Detect (and cache per session) which Manager generation the connected
- *  ComfyUI runs. See the dialect comment above. */
-async function detectManagerDialect() {
+ *  ComfyUI runs. See the dialect comment above. An optional `signal` bounds the
+ *  probes (a re-probe inherits the caller's remaining budget — #605 codex r3);
+ *  an aborted probe reads as "no answer", never as a dialect verdict. */
+async function detectManagerDialect({ signal } = {}) {
   if (managerDialectCache) return managerDialectCache;
-  const v2 = await managerProbe("/v2/manager/queue/status");
+  const opts = signal ? { signal } : {};
+  const v2 = await managerProbe("/v2/manager/queue/status", opts);
   if (looksLikeQueueStatus(v2)) {
-    const legacyUi = await managerProbe("/v2/manager/is_legacy_manager_ui");
+    const legacyUi = await managerProbe("/v2/manager/is_legacy_manager_ui", opts);
     managerDialectCache =
       legacyUi && typeof legacyUi === "object" && legacyUi.is_legacy_manager_ui === true
         ? "v2-batch"
         : "v2";
     return managerDialectCache;
   }
-  const legacy = await managerProbe("/manager/queue/status");
+  const legacy = await managerProbe("/manager/queue/status", opts);
   if (looksLikeQueueStatus(legacy)) {
     managerDialectCache = "legacy";
     return managerDialectCache;
@@ -3846,7 +3862,7 @@ async function managerGet(route, { signal } = {}) {
     return dialect === "legacy" ? await managerCall(route, opts) : await managerV2(route, opts);
   } catch (err) {
     if (!isManagerUnreachable(err)) throw err;
-    const fresh = await reProbeManagerDialect();
+    const fresh = await reProbeManagerDialect({ signal });
     const retry = dialectRetryTarget(dialect, fresh);
     // A same-dialect re-probe means the route genuinely does not serve — the
     // retry would repeat the exact call that just failed, so don't.

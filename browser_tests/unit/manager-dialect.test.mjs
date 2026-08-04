@@ -129,10 +129,10 @@ function buildDialectHarness({ fetchApi, managerCall, managerV2 }) {
     "AbortSignal",
     `let managerDialectCache = null;
 ${pick(src, /function looksLikeQueueStatus\(s\) \{[\s\S]*?\n\}/, "looksLikeQueueStatus")}
-${pick(src, /async function managerProbe\(route\) \{[\s\S]*?\n\}/, "managerProbe")}
-${pick(src, /async function detectManagerDialect\(\) \{[\s\S]*?\n\}/, "detectManagerDialect")}
+${pick(src, /async function managerProbe\(route, \{ signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerProbe")}
+${pick(src, /async function detectManagerDialect\(\{ signal \} = \{\}\) \{[\s\S]*?\n\}/, "detectManagerDialect")}
 ${pick(src, /function invalidateManagerDialectCache\(\) \{[\s\S]*?\n\}/, "invalidateManagerDialectCache")}
-${pick(src, /async function reProbeManagerDialect\(\) \{[\s\S]*?\n\}/, "reProbeManagerDialect")}
+${pick(src, /async function reProbeManagerDialect\(\{ signal \} = \{\}\) \{[\s\S]*?\n\}/, "reProbeManagerDialect")}
 ${pick(src, /async function managerGet\(route, \{ signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerGet")}
 return { managerGet, getDialectCache: () => managerDialectCache };`,
   );
@@ -280,6 +280,46 @@ test("#605: Manager answering NO dialect surfaces the ORIGINAL error and leaves 
   const healed = await h.managerGet("manager/queue/status");
   assert.equal(healed.servedBy, "v4");
   assert.equal(h.getDialectCache(), "v2");
+});
+
+test("#605 codex r3: the managerGet re-probe aborts with the CALLER's signal (waitForUpdateResult budget)", async () => {
+  // Phase 1 seeds a cached dialect with answering probes; phase 2's probes HANG
+  // until their signal fires. The routed GET 404s fast (a proven route-level
+  // rejection mid-restart) — the heal's re-probe must abort with the caller's
+  // remaining budget, not stack 15s probes past it.
+  let hanging = false;
+  const fetchApi = (route, opts) => {
+    if (!hanging) {
+      return Promise.resolve(route === "/manager/queue/status" ? okJson(QUEUE_STATUS) : notFound());
+    }
+    return new Promise((_, reject) => {
+      const onAbort = () => reject(new Error("This operation was aborted"));
+      if (opts?.signal?.aborted) return onAbort();
+      opts?.signal?.addEventListener("abort", onAbort);
+    });
+  };
+  const managerCall = async (route) => {
+    if (hanging) throw routeMissing();
+    return { servedBy: "legacy", route };
+  };
+  const managerV2 = async () => {
+    throw routeMissing();
+  };
+  const h = buildDialectHarness({ fetchApi, managerCall, managerV2 });
+  await h.managerGet("manager/queue/status"); // seeds cache "legacy"
+  assert.equal(h.getDialectCache(), "legacy");
+
+  hanging = true;
+  const start = Date.now();
+  await assert.rejects(
+    () => h.managerGet("manager/queue/history?ui_id=x", { signal: AbortSignal.timeout(150) }),
+    /not reachable/i,
+  );
+  const elapsed = Date.now() - start;
+  assert.ok(
+    elapsed < 5000,
+    `the re-probe must abort with the caller's signal, not stack 15s probes (took ${elapsed}ms)`,
+  );
 });
 
 // ---------------------------------------------------------------------------
