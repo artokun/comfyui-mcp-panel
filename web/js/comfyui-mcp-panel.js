@@ -19422,10 +19422,11 @@ function buildPanel() {
   // `connecting` reads as a drop and a reload refills the retry budget.
   let rebootSeenConnected = false;
   let rebootPruneFailureNoticeShown = false;
-  // Set when a budget RESET write is verified to have failed. The persisted count
-  // is then stale-high forever, so the gate falls back to this in-memory per-episode
-  // count — still bounded, but not a permanent refusal.
-  let rebootBudgetPersistBroken = false;
+  // Set when ANY verified REBOOT_KEY write fails. Persisted counters are then
+  // untrustworthy in BOTH directions — a stale-high budget refuses forever, a
+  // stale-low one bounds nothing — so the gate falls back to an in-memory
+  // per-episode count, which is still bounded and still recoverable.
+  let rebootStoragePersistBroken = false;
   let rebootEpisodeSends = 0;
 
   /** Drop any outstanding attempt — its channel is gone, so it can never be acked. */
@@ -19446,7 +19447,7 @@ function buildPanel() {
     rebootResumeSent = false;
     rebootAttemptCountUnreliableNoticeShown = false;
     rebootPruneFailureNoticeShown = false;
-    rebootBudgetPersistBroken = false;
+    rebootStoragePersistBroken = false;
     rebootEpisodeSends = 0;
     rebootResumeStalledNoticeShown = false;
     rebootWaitNoticeShown = false;
@@ -19477,6 +19478,23 @@ function buildPanel() {
     return ssGet(key) === value;
   }
 
+  /**
+   * Can sessionStorage be written AT ALL right now?
+   *
+   * A storage failure outlives the mount that discovered it, but the in-memory
+   * fallback does not — so a reload inherits a stale-high persisted budget with no
+   * memory of why it cannot be reset, and would refuse to send forever. Rather
+   * than carry that state, re-establish it on demand with a throwaway key: it
+   * touches nothing the resume depends on and answers the only question that
+   * matters — is the persisted number something we can still manage?
+   */
+  function sessionStorageWritable() {
+    const probeKey = "comfyui-mcp.panel.storageProbe";
+    const ok = ssSetVerified(probeKey, String(Date.now()));
+    ssSet(probeKey, null);
+    return ok;
+  }
+
   function readRebootMarker() {
     return decodeRebootMarker(ssGet(REBOOT_KEY));
   }
@@ -19497,12 +19515,22 @@ function buildPanel() {
     // the agent a SECOND time. Nothing further can force the write, so surface it —
     // this path had no disclosure at all, which is what made it worse than the
     // best-effort-storage cases that do.
-    if (!ssSetVerified(REBOOT_KEY, next) && !rebootPruneFailureNoticeShown) {
-      rebootPruneFailureNoticeShown = true;
-      appendSystem(
-        "Note: this browser wouldn't let me update the restart marker. If you reload, a render result that was already delivered may be reported to the agent twice.",
-      );
-    }
+    if (!ssSetVerified(REBOOT_KEY, next)) noteRebootMarkerWriteFailed();
+  }
+
+  /**
+   * A verified marker write did not persist. Persisted counters are now untrustworthy
+   * in BOTH directions, so the budget switches to its in-memory bound, and the user is
+   * told once — this path previously had no disclosure at all, which is what set it
+   * apart from the storage cases that do.
+   */
+  function noteRebootMarkerWriteFailed() {
+    rebootStoragePersistBroken = true;
+    if (rebootPruneFailureNoticeShown) return;
+    rebootPruneFailureNoticeShown = true;
+    appendSystem(
+      "Note: this browser wouldn't let me update the restart marker. If you reload, a render result that was already delivered may be reported to the agent twice.",
+    );
   }
 
   /**
@@ -19555,12 +19583,7 @@ function buildPanel() {
       // Same class as the prune write: this rewrite is what drops already-settled run
       // ids from the marker, so a silent failure leaves a delivered run in it for a
       // reload to re-adopt and re-deliver. Verified, and disclosed once if it fails.
-      if (!ssSetVerified(REBOOT_KEY, step.nextRaw) && !rebootPruneFailureNoticeShown) {
-        rebootPruneFailureNoticeShown = true;
-        appendSystem(
-          "Note: this browser wouldn't let me update the restart marker. If you reload, a render result that was already delivered may be reported to the agent twice.",
-        );
-      }
+      if (!ssSetVerified(REBOOT_KEY, step.nextRaw)) noteRebootMarkerWriteFailed();
     }
     return step;
   }
@@ -19642,6 +19665,10 @@ function buildPanel() {
       ssSet(REBOOT_KEY, withAttempt);
       attemptRecorded = ssGet(REBOOT_KEY) === withAttempt;
       if (!attemptRecorded) {
+        // The persisted count cannot be trusted to BOUND anything either — without
+        // this the gate would keep reading a stale 0 and re-send after every ack
+        // timeout, which is the storm the budget exists to prevent.
+        rebootStoragePersistBroken = true;
         ssSet(REBOOT_KEY, retained); // keep the marker itself, just without the count
         if (!rebootAttemptCountUnreliableNoticeShown) {
           rebootAttemptCountUnreliableNoticeShown = true;
@@ -19817,7 +19844,18 @@ function buildPanel() {
     // When the persisted budget cannot be RESET (a verified-failed write), the
     // persisted number is stale-high forever and gating on it would refuse every
     // tick. Bound this episode in memory instead — still bounded, but recoverable.
-    const budgetUsed = rebootBudgetPersistBroken ? rebootEpisodeSends : step?.marker?.attempts;
+    let budgetUsed = step?.marker?.attempts;
+    if (rebootStoragePersistBroken) {
+      budgetUsed = rebootEpisodeSends;
+    } else if (Number.isFinite(budgetUsed) && Number(budgetUsed) >= REBOOT_RESUME_MAX_ATTEMPTS) {
+      // Spent per the marker — but a budget is only meaningful if it can be RESET.
+      // A mount that inherits a spent count from a mount whose storage was broken
+      // would otherwise refuse forever, so establish writability before refusing.
+      if (!sessionStorageWritable()) {
+        rebootStoragePersistBroken = true;
+        budgetUsed = rebootEpisodeSends;
+      }
+    }
     if (Number.isFinite(budgetUsed) && Number(budgetUsed) >= REBOOT_RESUME_MAX_ATTEMPTS) {
       if (!rebootResumeStalledNoticeShown) {
         rebootResumeStalledNoticeShown = true;
@@ -19878,9 +19916,11 @@ function buildPanel() {
         // the send gate refuses on every tick — a confirmed reconnect turning into a
         // permanent stall. A budget we cannot reset is a budget we cannot manage, so
         // fall back to bounding this episode in memory instead of refusing forever.
-        rebootBudgetPersistBroken = !ssSetVerified(REBOOT_KEY, encodeRebootMarker({ ...decoded, attempts: 0 }));
-      } else {
-        rebootBudgetPersistBroken = false;
+        if (ssSetVerified(REBOOT_KEY, encodeRebootMarker({ ...decoded, attempts: 0 }))) {
+          rebootStoragePersistBroken = false; // it wrote — storage is working again
+        } else {
+          noteRebootMarkerWriteFailed();
+        }
       }
       rebootEpisodeSends = 0; // the in-memory fallback bound, per delivery episode
       // Mids from the dead socket can never be acked on the new connection, so drop
