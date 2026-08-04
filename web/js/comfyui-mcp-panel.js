@@ -220,7 +220,7 @@ import {
   moveGroupMembers,
   groupBoundsOf,
   nestedGroupsOf,
-  translateGroupBox,
+  translateGroupBoxes,
   reroutesInside,
   moveReroutePoints,
 } from "./lib/group-geometry.js";
@@ -10089,17 +10089,47 @@ const GRAPH_TOOL_EXECUTORS = {
         // space, so nodes that looked grouped silently were not any more (#408).
         const nested = nestedGroupsOf(graph, g);
         const reroutes = reroutesInside(graph, b);
+        // Move the CHILDREN first and the box LAST, as one all-or-nothing
+        // transaction. Every child write is verified and reports whether it
+        // landed — a point can be a plain array, a typed-array view, an accessor
+        // pair, or frozen, and a write that quietly did nothing is how "the box
+        // moved but the nodes stayed" happened in the first place (#408). If ANY
+        // child could not be moved we put the moved ones back and refuse, so the
+        // caller never gets a success for a half-applied move; the box has not
+        // been touched at that point, so the rollback is exact.
+        // Member rects are refreshed by the same delta inside moveGroupMembers,
+        // without which the members "stay behind" for the summarizeGroup below and
+        // any later panel_query_graph read (mirrors the move_node path, #355).
+        const memberMove = moveGroupMembers(members, dx, dy);
+        const rerouteMove = moveReroutePoints(reroutes, dx, dy);
+        const nestedMove = translateGroupBoxes(nested, dx, dy);
+        const rollback = () => {
+          translateGroupBoxes(nestedMove.moved, -dx, -dy);
+          moveReroutePoints(rerouteMove.moved, -dx, -dy);
+          moveGroupMembers(memberMove.moved, -dx, -dy);
+        };
+        const stuck = [
+          ...memberMove.stuck.map((n) => `node ${n.id}`),
+          ...rerouteMove.stuck.map((r) => `reroute ${r.id ?? "?"}`),
+          ...nestedMove.stuck.map((c) => `group ${c.id ?? "?"}`),
+        ];
+        if (stuck.length) {
+          rollback();
+          throw new Error(
+            `refusing to move group ${group_id}: ${stuck.length} enclosed item(s) would not accept a new position (${stuck.slice(0, 5).join(", ")}${stuck.length > 5 ? ", …" : ""}). NOTHING was moved. Move those items out of the group (panel_edit_node) and retry, or pass move_nodes:false to move only the box.`,
+          );
+        }
         setGroupBounds(g, [Number(pos[0]), Number(pos[1]), b[2], b[3]]);
-        // Move each member AND refresh its cached boundingRect by the same delta.
-        // Without the rect refresh the box moves but the members "stay behind" for
-        // the immediate summarizeGroup below and any later panel_query_graph read,
-        // which then reports stale node_ids (#408); mirrors the move_node path (#355).
-        moveGroupMembers(members, dx, dy);
-        for (const child of nested) translateGroupBox(child, dx, dy);
-        moveReroutePoints(reroutes, dx, dy);
-        movedNodes = members.length;
-        movedGroups = nested.length;
-        movedReroutes = reroutes.length;
+        const landed = groupBoundsOf(g);
+        if (!landed || Math.abs(landed[0] - Number(pos[0])) > 0.5 || Math.abs(landed[1] - Number(pos[1])) > 0.5) {
+          rollback();
+          throw new Error(
+            `refusing to move group ${group_id}: the group box did not accept the new position on this frontend. NOTHING was moved.`,
+          );
+        }
+        movedNodes = memberMove.moved.length;
+        movedGroups = nestedMove.moved.length;
+        movedReroutes = rerouteMove.moved.length;
       } else {
         setGroupBounds(g, [Number(pos[0]), Number(pos[1]), b[2], b[3]]);
         // The box moved and NOTHING else did, so the group now encloses a DIFFERENT

@@ -198,12 +198,69 @@ export function syncGraphNodeAreas(graph) {
  * the delta correction is exact and build-independent. Dependency-free.
  */
 export function moveGroupMembers(members, dx, dy) {
+  const moved = [];
+  const stuck = [];
   for (const n of members ?? []) {
-    if (!n || !Array.isArray(n.pos)) continue;
-    const prev = [n.pos[0], n.pos[1]];
-    n.pos = [(n.pos[0] ?? 0) + dx, (n.pos[1] ?? 0) + dy];
-    refreshNodeArea(n, prev);
+    const px = Number(n?.pos?.[0]);
+    const py = Number(n?.pos?.[1]);
+    if (!Number.isFinite(px) || !Number.isFinite(py)) {
+      if (n) stuck.push(n);
+      continue;
+    }
+    if (writePoint(n, "pos", px + dx, py + dy)) {
+      refreshNodeArea(n, [px, py]);
+      moved.push(n);
+    } else {
+      stuck.push(n);
+    }
   }
+  return { moved, stuck };
+}
+
+/** Two coordinates are the same point for our purposes. A Float32-backed pos
+ *  (older LiteGraph builds) cannot store an arbitrary double exactly, so an
+ *  `===` read-back would report a perfectly good write as a failed one. */
+function closeEnough(a, b) {
+  return Math.abs(a - b) <= Math.max(1e-3, Math.abs(b) * 1e-6);
+}
+
+/**
+ * Write an [x, y] point property and REPORT whether the write actually landed.
+ *
+ * Frontends back these points with three different shapes and a single write
+ * strategy silently loses on at least one of them:
+ *   - a plain array (assignment and in-place both work);
+ *   - a typed-array VIEW (current builds expose LGraphNode.pos as a Float64Array
+ *     subarray of the node's boundingRect) — `Array.isArray` is FALSE for it, so
+ *     a guard written for plain arrays skipped every node on those builds and the
+ *     group box moved alone: exactly the #408 symptom the move was meant to fix;
+ *   - an accessor pair whose getter returns a COPY, where an in-place write is
+ *     silently dropped, or a getter with NO setter, where assignment throws in a
+ *     strict-mode ES module.
+ *
+ * So: assign (the proven path, and the one that runs any setter bookkeeping),
+ * verify, then fall back to an in-place write, then verify again. Returning the
+ * verdict is the point — the caller must never report a move it did not make.
+ */
+export function writePoint(owner, key, x, y) {
+  const landed = () =>
+    closeEnough(Number(owner?.[key]?.[0]), x) && closeEnough(Number(owner?.[key]?.[1]), y);
+  try {
+    owner[key] = [x, y];
+  } catch {
+    /* accessor with no setter — strict-mode assignment throws; try in place */
+  }
+  if (landed()) return true;
+  const point = owner?.[key];
+  if (point && point.length >= 2) {
+    try {
+      point[0] = x;
+      point[1] = y;
+    } catch {
+      /* frozen/read-only point — reported as stuck below */
+    }
+  }
+  return landed();
 }
 
 /**
@@ -250,19 +307,34 @@ export function nestedGroupsOf(graph, g) {
 /**
  * Translate a group's box by (dx, dy), writing through whichever geometry the
  * build exposes — the `_bounding` quad (plain OR typed array, mutated in place)
- * or the pos/size pair. Mirrors the panel's setGroupBounds write policy.
+ * or the pos/size pair — and REPORT whether the box actually ended up there.
+ * Mirrors the panel's setGroupBounds write policy.
  */
 export function translateGroupBox(g, dx, dy) {
+  const before = groupBoundsOf(g);
+  if (!before) return false;
+  const [x, y] = before;
   const b = g?._bounding;
   if (b && b.length >= 4) {
-    b[0] += dx;
-    b[1] += dy;
-    return;
+    try {
+      b[0] = x + dx;
+      b[1] = y + dy;
+    } catch {
+      /* frozen quad — verified below */
+    }
+  } else {
+    writePoint(g, "pos", x + dx, y + dy);
   }
-  if (!g) return;
-  const x = Number(g.pos?.[0] ?? 0);
-  const y = Number(g.pos?.[1] ?? 0);
-  g.pos = [x + dx, y + dy];
+  const after = groupBoundsOf(g);
+  return !!after && closeEnough(after[0], x + dx) && closeEnough(after[1], y + dy);
+}
+
+/** Translate several group boxes, reporting which ones actually moved. */
+export function translateGroupBoxes(groups, dx, dy) {
+  const moved = [];
+  const stuck = [];
+  for (const g of groups ?? []) (translateGroupBox(g, dx, dy) ? moved : stuck).push(g);
+  return { moved, stuck };
 }
 
 /** Every reroute point of a graph, across the Map / array / plain-object shapes
@@ -293,23 +365,42 @@ export function reroutesInside(graph, bounds) {
 }
 
 /**
- * Translate reroute points by (dx, dy). Writes IN PLACE first because current
- * builds back `Reroute.pos` with a typed array behind a getter (an assignment
- * would be dropped by a getter-only property); if the in-place write did not
- * take, fall back to assigning a fresh pair. Without this a moved group leaves
- * its wire elbows behind and the links visibly snake back to the old box.
+ * Translate reroute points by (dx, dy), reporting which ones actually moved.
+ * Without this a moved group leaves its wire elbows behind and the links
+ * visibly snake back to where the group used to be.
+ *
+ * Prefers the engine's OWN `Reroute.move(dx, dy)` when the build exposes it, so
+ * the frontend's reactive layout store records the change rather than only the
+ * canvas seeing a mutated point — the same "use the engine primitive, then
+ * verify" policy the panel already applies to node.setSize / graph.removeGroup.
+ * The result is verified either way, so a build whose `move` has a different
+ * signature (or none) is corrected by the direct point write, and a frozen point
+ * is reported as stuck instead of throwing halfway through a group move.
  */
 export function moveReroutePoints(reroutes, dx, dy) {
+  const moved = [];
+  const stuck = [];
   for (const r of reroutes ?? []) {
-    const pos = r?.pos;
-    if (!pos || pos.length < 2) continue;
-    const px = Number(pos[0]);
-    const py = Number(pos[1]);
-    if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
-    pos[0] = px + dx;
-    pos[1] = py + dy;
-    if (r.pos?.[0] !== px + dx || r.pos?.[1] !== py + dy) r.pos = [px + dx, py + dy];
+    const px = Number(r?.pos?.[0]);
+    const py = Number(r?.pos?.[1]);
+    if (!Number.isFinite(px) || !Number.isFinite(py)) {
+      if (r) stuck.push(r);
+      continue;
+    }
+    const wantX = px + dx;
+    const wantY = py + dy;
+    const landed = () =>
+      closeEnough(Number(r?.pos?.[0]), wantX) && closeEnough(Number(r?.pos?.[1]), wantY);
+    if (typeof r.move === "function") {
+      try {
+        r.move(dx, dy);
+      } catch {
+        /* build-specific; the direct write below still gets it there */
+      }
+    }
+    (landed() || writePoint(r, "pos", wantX, wantY) ? moved : stuck).push(r);
   }
+  return { moved, stuck };
 }
 
 /**

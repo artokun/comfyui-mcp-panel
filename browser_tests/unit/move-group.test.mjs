@@ -19,9 +19,11 @@ import {
   groupBoundsOf,
   nestedGroupsOf,
   translateGroupBox,
+  translateGroupBoxes,
   reroutesInside,
   moveReroutePoints,
   containsBounds,
+  writePoint,
 } from "../../web/js/lib/group-geometry.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
@@ -50,7 +52,7 @@ function realMoveGroup(graph) {
     "nestedGroupsOf",
     "reroutesInside",
     "moveGroupMembers",
-    "translateGroupBox",
+    "translateGroupBoxes",
     "moveReroutePoints",
     `${resolveGroupSrc}
      ${setGroupBoundsSrc}
@@ -65,7 +67,7 @@ function realMoveGroup(graph) {
     nestedGroupsOf,
     reroutesInside,
     moveGroupMembers,
-    translateGroupBox,
+    translateGroupBoxes,
     moveReroutePoints,
   );
 }
@@ -262,7 +264,219 @@ test("the activity card names what came with the box, and says so when nothing d
   );
 });
 
+// ---- point shapes: the write must land on every frontend, or say it didn't --
+
+test("#408: a node whose pos is a TYPED-ARRAY VIEW into its boundingRect is moved", () => {
+  // Current ComfyUI frontends expose LGraphNode.pos as a Float64Array subarray of
+  // the node's bounding Rectangle — Array.isArray(pos) is FALSE. A member loop
+  // written for plain arrays skips every node on those builds: the box moves
+  // alone, which is the exact #408 report.
+  const backing = new Float64Array([50, 50]);
+  const a = {
+    id: 7,
+    size: [100, 100],
+    boundingRect: [50, 20, 100, 130],
+    get pos() { return backing.subarray(0, 2); },
+    set pos(v) { backing[0] = Number(v[0]); backing[1] = Number(v[1]); },
+  };
+  assert.equal(Array.isArray(a.pos), false, "precondition: this is exactly the shape a plain-array guard skips");
+  const graph = makeGraph({ nodes: [a], groups: [group(1, [0, 0, 200, 200])] });
+
+  const out = realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
+
+  assert.deepEqual([a.pos[0], a.pos[1]], [1050, 1050], "the typed-array-backed node moved with the box");
+  assert.equal(out.moved.nodes, 1);
+  assert.deepEqual(out.group.node_ids, [7], "and it is still a member at the new box");
+});
+
+test("#408: a typed-array pos with NO setter is moved in place (assignment would throw)", () => {
+  const backing = new Float64Array([50, 50]);
+  const a = { id: 7, size: [100, 100], boundingRect: [50, 20, 100, 130], get pos() { return backing; } };
+  const graph = makeGraph({ nodes: [a], groups: [group(1, [0, 0, 200, 200])] });
+
+  const out = realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
+
+  assert.deepEqual([...backing], [1050, 1050]);
+  assert.equal(out.moved.nodes, 1);
+});
+
+test("#408: a node whose pos getter returns a COPY is still moved (assignment path)", () => {
+  const a = {
+    id: 7,
+    size: [100, 100],
+    boundingRect: [50, 20, 100, 130],
+    _p: [50, 50],
+    get pos() { return [...this._p]; },
+    set pos(v) { this._p = [Number(v[0]), Number(v[1])]; },
+  };
+  const graph = makeGraph({ nodes: [a], groups: [group(1, [0, 0, 200, 200])] });
+
+  const out = realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
+
+  assert.deepEqual(a._p, [1050, 1050]);
+  assert.equal(out.moved.nodes, 1);
+});
+
+test("#408: a member that CANNOT be repositioned aborts the whole move and rolls it back", () => {
+  const outer = group(1, [0, 0, 400, 400], "Outer");
+  const inner = group(2, [50, 50, 100, 100], "Inner");
+  const movable = node(7, [200, 200], [60, 40]);
+  // A read-only point: assignment throws (strict mode) and the in-place write is
+  // rejected, so nothing can put this node anywhere.
+  const frozenPoint = Object.freeze([80, 100]);
+  const stuck = {
+    id: 8,
+    size: [60, 40],
+    boundingRect: [80, 70, 60, 70],
+    get pos() { return frozenPoint; },
+  };
+  const reroute = { id: 11, pos: [300, 300] };
+  const graph = makeGraph({
+    nodes: [movable, stuck],
+    groups: [outer, inner],
+    reroutes: new Map([[11, reroute]]),
+  });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /refusing to move group 1: 1 enclosed item\(s\) would not accept a new position \(node 8\)\. NOTHING was moved/,
+  );
+
+  assert.deepEqual(outer._bounding, [0, 0, 400, 400], "the group box must be exactly where it was");
+  assert.deepEqual(inner._bounding, [50, 50, 100, 100], "the nested box must be rolled back");
+  assert.deepEqual(movable.pos, [200, 200], "the movable member must be rolled back");
+  assert.deepEqual([...movable.boundingRect], [200, 170, 60, 70], "its cached rect must be rolled back too");
+  assert.deepEqual([reroute.pos[0], reroute.pos[1]], [300, 300], "the reroute must be rolled back");
+  assert.deepEqual([...frozenPoint], [80, 100], "the stuck node never moved");
+});
+
+test("#408: a reroute is moved through the engine's own move() when the build has one", () => {
+  const calls = [];
+  const reroute = {
+    id: 11,
+    pos: [100, 100],
+    move(dx, dy) { calls.push([dx, dy]); this.pos = [this.pos[0] + dx, this.pos[1] + dy]; },
+  };
+  const graph = makeGraph({ groups: [group(1, [0, 0, 400, 400])], reroutes: [reroute] });
+
+  const out = realMoveGroup(graph)({ group_id: 1, pos: [100, 100] });
+
+  assert.deepEqual(calls, [[100, 100]], "the engine primitive was used, so the layout store sees the change");
+  assert.deepEqual([reroute.pos[0], reroute.pos[1]], [200, 200]);
+  assert.equal(out.moved.reroutes, 1);
+});
+
+test("#408: a build whose reroute move() has the wrong signature is corrected, not trusted", () => {
+  // move(x, y) treated as ABSOLUTE by this build. The verified fallback must put
+  // the point where the delta says, not where the primitive left it.
+  const reroute = { id: 11, pos: [100, 100], move(x, y) { this.pos = [x, y]; } };
+  const graph = makeGraph({ groups: [group(1, [0, 0, 400, 400])], reroutes: [reroute] });
+
+  const out = realMoveGroup(graph)({ group_id: 1, pos: [100, 100] });
+
+  assert.deepEqual([reroute.pos[0], reroute.pos[1]], [200, 200], "corrected to old + delta");
+  assert.equal(out.moved.reroutes, 1);
+});
+
+test("#408: a reroute whose move() throws does not abort the move; the direct write still lands", () => {
+  const reroute = { id: 11, pos: [100, 100], move() { throw new Error("not on this build"); } };
+  const graph = makeGraph({ groups: [group(1, [0, 0, 400, 400])], reroutes: [reroute] });
+
+  const out = realMoveGroup(graph)({ group_id: 1, pos: [100, 100] });
+
+  assert.deepEqual([reroute.pos[0], reroute.pos[1]], [200, 200]);
+  assert.equal(out.moved.reroutes, 1);
+});
+
+test("#408: a FROZEN reroute point aborts and rolls back rather than half-moving the group", () => {
+  const g = group(1, [0, 0, 400, 400]);
+  const a = node(7, [100, 100], [60, 40]);
+  const frozen = Object.freeze([200, 200]);
+  const reroute = { id: 11, get pos() { return frozen; } };
+  const graph = makeGraph({ nodes: [a], groups: [g], reroutes: [reroute] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /reroute 11.*NOTHING was moved/s,
+  );
+  assert.deepEqual(a.pos, [100, 100]);
+  assert.deepEqual(g._bounding, [0, 0, 400, 400]);
+});
+
+test("#408: a nested box that will not move aborts and rolls back the members", () => {
+  const outer = group(1, [0, 0, 400, 400], "Outer");
+  const inner = { id: 2, title: "Frozen inner", _bounding: Object.freeze([50, 50, 100, 100]) };
+  const a = node(7, [200, 200], [60, 40]);
+  const graph = makeGraph({ nodes: [a], groups: [outer, inner] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /group 2.*NOTHING was moved/s,
+  );
+  assert.deepEqual(a.pos, [200, 200], "the member must be back where it started");
+  assert.deepEqual(outer._bounding, [0, 0, 400, 400]);
+});
+
+test("#408: a group box that refuses the write is a refusal, not a reported success", () => {
+  // _bounding is frozen AND there is no pos/size pair to fall back to, so
+  // setGroupBounds cannot put the box anywhere.
+  const g = { id: 1, title: "Frozen", _bounding: Object.freeze([0, 0, 400, 400]) };
+  const a = node(7, [100, 100], [60, 40]);
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
+    /the group box did not accept the new position .* NOTHING was moved/s,
+  );
+  assert.deepEqual(a.pos, [100, 100], "the members must be put back when the box write fails");
+});
+
 // ---- lib branches the handler tests above do not reach ---------------------
+
+test("writePoint reports the truth for every point shape", () => {
+  const plain = { pos: [1, 2] };
+  assert.equal(writePoint(plain, "pos", 10, 20), true);
+  assert.deepEqual([plain.pos[0], plain.pos[1]], [10, 20]);
+
+  const typed = { pos: new Float64Array([1, 2]) };
+  assert.equal(writePoint(typed, "pos", 10, 20), true);
+  assert.deepEqual([typed.pos[0], typed.pos[1]], [10, 20]);
+
+  // A Float32-backed point (older LiteGraph) cannot store an arbitrary double
+  // exactly, so the value read back differs from the value written. A strict
+  // read-back would call this perfectly good write a FAILURE — and since an
+  // unmovable child now aborts the whole group move, that would turn every group
+  // move on those builds into a refusal.
+  const f32backing = new Float32Array([0, 0]);
+  const f32 = { get pos() { return f32backing; } };
+  assert.equal(writePoint(f32, "pos", 1234.1, 5678.2), true);
+  assert.notEqual(f32backing[0], 1234.1, "precondition: the read-back is genuinely not equal");
+  assert.ok(Math.abs(f32backing[0] - 1234.1) < 0.01, "but it is the same point");
+
+  const readOnly = { get pos() { return Object.freeze([1, 2]); } };
+  assert.equal(writePoint(readOnly, "pos", 10, 20), false, "an unwritable point must report false");
+});
+
+test("moveGroupMembers reports moved vs stuck instead of silently skipping", () => {
+  const ok = { id: 1, pos: [10, 10], size: [200, 100] };
+  const noPos = { id: 2 };
+  const res = moveGroupMembers([ok, null, noPos, { id: 3, pos: null }], 5, 7);
+  assert.deepEqual(ok.pos, [15, 17]);
+  assert.deepEqual(res.moved.map((n) => n.id), [1]);
+  assert.deepEqual(res.stuck.map((n) => n.id), [2, 3], "an unmovable member is reported, never dropped silently");
+  assert.doesNotThrow(() => moveGroupMembers(null, 1, 1));
+});
+
+test("translateGroupBoxes reports a box that would not move", () => {
+  const ok = group(1, [0, 0, 100, 100]);
+  const frozen = { id: 2, _bounding: Object.freeze([0, 0, 100, 100]) };
+  const res = translateGroupBoxes([ok, frozen], 10, 10);
+  assert.deepEqual(ok._bounding, [10, 10, 100, 100]);
+  assert.deepEqual(res.moved.map((g) => g.id), [1]);
+  assert.deepEqual(res.stuck.map((g) => g.id), [2]);
+  assert.equal(translateGroupBox({ nonsense: true }, 1, 1), false, "a group with no bounds cannot be moved");
+});
+
 
 test("containsBounds: strict containment, identical rects excluded (litegraph containsRect)", () => {
   assert.equal(containsBounds([0, 0, 100, 100], [10, 10, 50, 50]), true);
