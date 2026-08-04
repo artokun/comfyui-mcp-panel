@@ -289,6 +289,7 @@ import { createRestartTabIdentity, sendBridgeHello } from "./lib/restart-tab-ide
 import {
   adoptRebootRuns,
   decodeRebootMarker,
+  isRealBridgeDrop,
   encodeRebootMarker,
   pruneRebootMarkerRaw,
   rebootMarkerAfterSend,
@@ -18439,6 +18440,9 @@ function buildPanel() {
         // The drop may have let the backstop hide a still-live turn; repair the
         // indicator on reconnect so the resumed turn stays visible.
         if (agentWorking && !thinkingEl) showThinking();
+        // #585: this mount has now seen a LIVE bridge, so a later non-connected
+        // status is a genuine drop rather than a fresh client's opening `connecting`.
+        rebootSeenConnected = true;
       }
       // A transient drop mid-turn keeps the turn AUTHORITATIVE — the orchestrator
       // still owns it and the bridge will rebind/resume. Clearing the indicator
@@ -18448,10 +18452,15 @@ function buildPanel() {
         piBackendsReadinessReceived = false;
         // Remember the drop so the next "connected" reconciles pending runs (#370).
         bridgeWasDown = true;
-        // #585: only a real drop→reconnect may refresh the restart-resume retry
-        // budget. Without this, a repeated "ready" on a still-live socket would
-        // reset it forever and turn a bounded retry into an unbounded nudge storm.
-        rebootBridgeDroppedSinceAttempt = true;
+        // #585: only a REAL drop→reconnect may refresh the restart-resume retry
+        // budget — a transition out of connected, not merely "not connected". A
+        // freshly mounted client emits `connecting` before it has ever connected, so
+        // counting that would let a page RELOAD manufacture a drop and refill the
+        // budget, and repeated reloads would mint unlimited nudges: the storm the
+        // budget bounds, reached through the very event it was meant to survive.
+        if (isRealBridgeDrop({ everConnected: rebootSeenConnected, connected })) {
+          rebootBridgeDroppedSinceAttempt = true;
+        }
         // A new connection re-opens the session question: whatever id we hold was
         // reported by the connection that just died.
         rebootSessionFrameSeen = false;
@@ -19409,6 +19418,9 @@ function buildPanel() {
   // a live socket (backend readiness frames), and resetting on those would let a
   // long-lived connection mint unlimited attempts and storm the agent.
   let rebootBridgeDroppedSinceAttempt = false;
+  // Has THIS mount ever seen a live bridge? Without it, a fresh client's opening
+  // `connecting` reads as a drop and a reload refills the retry budget.
+  let rebootSeenConnected = false;
 
   /** Drop any outstanding attempt — its channel is gone, so it can never be acked. */
   function forgetRebootResumeAttempt() {

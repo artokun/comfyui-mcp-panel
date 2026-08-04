@@ -5,6 +5,7 @@ import {
   adoptRebootRuns,
   decodeRebootMarker,
   encodeRebootMarker,
+  isRealBridgeDrop,
   planRebootResume,
   pruneRebootMarkerRaw,
   rebootMarkerAfterSend,
@@ -645,6 +646,18 @@ test("#585: a legacy marker with only the per-episode count still reports it as 
   // recorded one attempt must not read as "never attempted".
   const m = decodeRebootMarker(JSON.stringify({ v: 1, at: 1000, runs: [], n: 0, t: 2 }));
   assert.equal(m.totalAttempts, 2);
+});
+
+test("#585 P1(budget): only a real drop refreshes the budget — a fresh mount's 'connecting' is not one", () => {
+  // A freshly mounted client emits `connecting` before it has ever connected. If
+  // that counted as a drop, a page RELOAD would manufacture one and refill the
+  // persisted budget — so repeated reloads would mint unlimited nudges, defeating
+  // the bound through the very event the persisted budget was meant to survive.
+  assert.equal(isRealBridgeDrop({ everConnected: false, connected: false }), false, "never connected");
+  assert.equal(isRealBridgeDrop({ everConnected: true, connected: false }), true, "a genuine transition");
+  assert.equal(isRealBridgeDrop({ everConnected: true, connected: true }), false, "still up");
+  assert.equal(isRealBridgeDrop({}), false, "absent evidence is not a drop");
+  assert.equal(isRealBridgeDrop(), false);
 });
 
 test("#585: the wait budget is a TRI-STATE — within / spent / unknown", () => {

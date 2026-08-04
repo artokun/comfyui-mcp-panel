@@ -283,6 +283,26 @@ export function rebootResumeRepeatWarning(state = {}) {
 }
 
 /**
+ * Was this a REAL bridge drop — a live connection that went away?
+ *
+ * Only a real drop may refresh the restart-resume retry budget, and "not connected"
+ * is not the same statement. A freshly mounted client emits an initial
+ * `connecting` status before it has ever been connected, so treating every
+ * non-connected status as a drop lets a page RELOAD manufacture one: reload after
+ * the budget is spent, the budget resets, and repeated reloads mint unlimited
+ * nudges — the storm the budget exists to bound, reached through the one event the
+ * persisted budget was supposed to survive.
+ *
+ * A drop is a TRANSITION out of connected, so it requires having been connected.
+ *
+ * @param {{everConnected?:boolean, connected?:boolean}} state
+ * @returns {boolean}
+ */
+export function isRealBridgeDrop({ everConnected, connected } = {}) {
+  return everConnected === true && connected === false;
+}
+
+/**
  * The wait budget as an explicit tri-state.
  *
  * @param {unknown} waitedMs  Elapsed since the reboot was armed, or a non-finite
