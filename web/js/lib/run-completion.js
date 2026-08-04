@@ -173,6 +173,9 @@ export function createRunCompletionTracker({
     // normally; a `delivered` entry is never in `pending`, so it needs no guard.
     pruneFence(terminal, cutoff, (k) => pending.has(k));
     pruneFence(delivered, cutoff);
+    // `unconfirmedDelivery` is deliberately NOT pruned here — see its declaration:
+    // ageing the flag out would turn "we don't know whether the agent was told"
+    // back into a claim that it was. It is size-capped instead.
   }
 
   // Age fences out even when NO further completion arrives (idle): a single
@@ -218,6 +221,74 @@ export function createRunCompletionTracker({
     touchFence(delivered, k);
     pending.delete(k);
     clearReconcileRetry(k); // a delivery (any path) cancels a scheduled /history retry
+    // NB: this deliberately does NOT clear the delivery hold below. It is called
+    // from the tracker's own lifecycle (flush, execution_success, reconcile) where
+    // "delivered" is OPTIMISTIC — only the caller can confirm the frame actually
+    // reached the agent, so only the PUBLIC markDelivered/markUndelivered release
+    // the hold.
+  }
+
+  // ── "Has the agent actually been told?" (#585) ────────────────────────────
+  // `pending` answers "not yet confirmed delivered" ONLY in the reconcile sense:
+  // flush() calls markDelivered OPTIMISTICALLY, *before* the caller's async
+  // compose+send resolves, purely so a racing reconcile can't double-deliver. So
+  // there is a real window in which a run is out of `pending` while no frame has
+  // reached the agent yet — and a restart-resume nudge sent in that window arrives
+  // BEFORE the completion, which is precisely what makes the agent re-queue the
+  // render (#585). Track the dispatched-but-unconfirmed runs separately so
+  // `isSettled()` can answer the delivery question honestly.
+  const awaitingDelivery = new Map(); // key -> self-clear timer
+  // …and the runs whose delivery was never confirmed at all: the caller's
+  // compose/send promise never settled within the watchdog below. Keeping them
+  // pinned as "in flight" forever would suppress a restart-resume for good — the
+  // SILENT failure. But quietly reclassifying them as DELIVERED would be a lie
+  // that reopens the duplicate render (the resume would tell the agent its result
+  // "was already delivered" when no frame ever reached it). So they graduate to an
+  // explicit third state: settled enough not to block, flagged so the caller can
+  // resume with a DISCLOSURE instead of a false reassurance.
+  //
+  // This map is deliberately NOT aged out on the fence TTL. The flag is EVIDENCE
+  // that a consumer uses to choose an honest message, and its consumers hold open
+  // decision windows longer than that TTL (the restart-resume backstop is 15
+  // minutes vs. the 10-minute fence TTL) — expiring it would silently convert
+  // "we don't know whether the agent was told" back into "it was delivered",
+  // which is the false reassurance that invites the duplicate render (codex P1).
+  // It is not size-capped either, for the same reason: evicting the oldest entry
+  // to save bytes would silently restore the false "it was delivered" answer for
+  // exactly the run whose evidence is oldest, i.e. the one most likely to still be
+  // under a consumer's decision window (codex R3-P1). An entry is created ONLY by
+  // an abandoned compose/send promise — a leak orders of magnitude larger than the
+  // ~40-byte record of it — and is removed the moment the caller confirms, denies,
+  // or re-dispatches. So the map's growth is bounded by the same pathology that
+  // would already be the real problem, and trading a correctness property for that
+  // is a bad trade.
+  const unconfirmedDelivery = new Map(); // key -> ts
+  // Bound the in-flight window well past any realistic compose (metadata HEADs +
+  // video storyboard sampling).
+  const deliveryConfirmTimeoutMs = 120000;
+  function clearAwaitingDelivery(k) {
+    const t = awaitingDelivery.get(k);
+    if (t != null) clearTimer(t);
+    awaitingDelivery.delete(k);
+    unconfirmedDelivery.delete(k);
+  }
+  function flagUnconfirmedDelivery(k) {
+    if (k === NO_PROMPT_KEY) return;
+    unconfirmedDelivery.delete(k);
+    unconfirmedDelivery.set(k, now());
+  }
+  /** A completion frame for `k` has been handed to the caller; delivery unconfirmed. */
+  function markDispatched(k) {
+    if (k === NO_PROMPT_KEY) return; // id-less runs are never gated on
+    clearAwaitingDelivery(k);
+    awaitingDelivery.set(
+      k,
+      setTimer(() => {
+        awaitingDelivery.delete(k);
+        // Never confirmed, never re-pended ⇒ we do NOT know the agent was told.
+        flagUnconfirmedDelivery(k);
+      }, deliveryConfirmTimeoutMs),
+    );
   }
 
   function clearReconcileRetry(k) {
@@ -279,6 +350,12 @@ export function createRunCompletionTracker({
     // this flush can't double-deliver the same prompt. If the caller reports the
     // send FAILED (bridge down), it calls markUndelivered() to re-pend it (#370).
     markDelivered(k);
+    // …but that optimism is NOT proof the agent was told: the caller composes and
+    // sends asynchronously. Hold the run as "delivery in flight" until the caller
+    // confirms via markDelivered()/markUndelivered(), so isSettled() can't report
+    // it settled mid-window (#585). Set synchronously, before onFlush, so no
+    // observer can sample the gap.
+    markDispatched(k);
     onFlush({
       key: k,
       promptId: promptIdOf(k),
@@ -394,6 +471,9 @@ export function createRunCompletionTracker({
     const hasBatch = parsed.images.length > 0 || parsed.videos.length > 0;
     if (hasBatch) {
       const durationMs = startTs != null ? now() - startTs : null;
+      // Same async-delivery hold as flush(): the reconciled batch is composed and
+      // sent by the caller, so it is not "delivered" until the caller says so.
+      markDispatched(k);
       onFlush({
         key: k,
         promptId,
@@ -646,6 +726,10 @@ export function createRunCompletionTracker({
      * agent (sendFrame succeeded / batch was empty). Retires it from pending.
      */
     markDelivered(id) {
+      // The CALLER confirming delivery is the only proof the agent was told, so
+      // this — not the tracker's own optimistic retire — is what releases the
+      // delivery hold isSettled() reports on (#585).
+      clearAwaitingDelivery(key(id));
       markDelivered(id);
     },
 
@@ -665,7 +749,79 @@ export function createRunCompletionTracker({
       // cancel any in-flight retry so the re-pend restarts cleanly on the next edge.
       delivered.delete(k);
       clearReconcileRetry(k);
+      // It is back to being OWED, not in-flight — drop the delivery hold so the
+      // 120s backstop can't be what decides isSettled() for it (#585).
+      clearAwaitingDelivery(k);
       if (!pending.has(k)) pending.set(k, { promptId: k, at: now() }); // normalized string id
+    },
+
+    /**
+     * True when NO completion frame is still owed to the agent for `id` — the run
+     * is neither pending recovery NOR mid-delivery. This is the honest answer to
+     * "has the agent been told?", as opposed to `hasPending()`/`_pending`, which
+     * go false the instant flush() optimistically retires a run, before the
+     * caller's async compose+send has resolved. #585 gates the post-restart resume
+     * nudge on this so the nudge can never overtake the completion it is waiting
+     * for. An id the tracker has never heard of is settled (nothing is owed).
+     */
+    isSettled(id) {
+      const k = key(id);
+      return !pending.has(k) && !awaitingDelivery.has(k);
+    },
+
+    /**
+     * True when this run's completion frame was dispatched to the caller and the
+     * caller NEVER confirmed (or denied) delivery within the watchdog window. The
+     * run no longer blocks — isSettled() is true for it, so it can't strand a
+     * restart-resume — but the agent may never have been told, so a caller that
+     * gates on delivery must DISCLOSE the uncertainty rather than assert that the
+     * result was delivered (#585).
+     */
+    isDeliveryUnconfirmed(id) {
+      return unconfirmedDelivery.has(key(id));
+    },
+
+    /**
+     * Caller reports that a run's ONLY agent-facing outcome could not be sent, and
+     * there is nothing left to re-pend — the give-up path, which evicts the run
+     * from the recovery ledger before firing its one-time notice. Without this the
+     * run would read as cleanly settled and a delivery-gated caller would assert
+     * the agent had been told (#585). Flagging it keeps it non-blocking but makes
+     * the uncertainty visible.
+     */
+    markDeliveryUnconfirmed(id) {
+      if (id == null) return;
+      flagUnconfirmedDelivery(key(id));
+    },
+
+    /**
+     * True when this tracker has any record of `id` — pending, mid-delivery, or
+     * already terminal. Lets a caller re-adopt a run id recovered from persistent
+     * state (e.g. the #585 reboot marker after a frontend reload) WITHOUT
+     * resurrecting one this mount has already resolved.
+     */
+    isKnown(id) {
+      const k = key(id);
+      // `unconfirmedDelivery` is included deliberately: the `terminal` replay fence
+      // ages out after its TTL, and without this a still-flagged run could be
+      // re-adopted later in the SAME mount and have its completion dispatched a
+      // second time. A new mount (fresh tracker) knows none of these and re-adopts
+      // it — which is the intended RECOVERY of an unconfirmed frame.
+      return pending.has(k) || awaitingDelivery.has(k) || unconfirmedDelivery.has(k) || terminal.has(k);
+    },
+
+    /**
+     * Every real prompt_id that is still owed a completion frame. Snapshotted when
+     * a reboot is armed so the post-restart resume can be correlated to THOSE runs
+     * specifically, never to a global "is anything pending" count — which an
+     * unrelated workflow's render would make true, swallowing a legitimate resume
+     * (#585).
+     */
+    unsettledPromptIds() {
+      const ids = [];
+      for (const k of pending.keys()) if (k !== NO_PROMPT_KEY) ids.push(k);
+      for (const k of awaitingDelivery.keys()) if (k !== NO_PROMPT_KEY && !pending.has(k)) ids.push(k);
+      return ids;
     },
 
     /**
@@ -737,5 +893,7 @@ export function createRunCompletionTracker({
     _pending: pending,
     _delivered: delivered,
     _terminal: terminal,
+    _awaitingDelivery: awaitingDelivery,
+    _unconfirmedDelivery: unconfirmedDelivery,
   };
 }
