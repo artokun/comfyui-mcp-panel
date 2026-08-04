@@ -207,6 +207,112 @@ export function moveGroupMembers(members, dx, dy) {
 }
 
 /**
+ * Does box `outer` fully enclose box `inner`? Mirrors @comfyorg/litegraph's
+ * `containsRect`, INCLUDING its deliberate exclusion of two identical rects:
+ * coincident boxes are peers, not parent/child, so neither one drags the other.
+ */
+export function containsBounds(outer, inner) {
+  if (!outer || !inner) return false;
+  const [ax, ay, aw, ah] = outer;
+  const [bx, by, bw, bh] = inner;
+  const aRight = ax + aw;
+  const aBottom = ay + ah;
+  const bRight = bx + bw;
+  const bBottom = by + bh;
+  if (ax === bx && ay === by && aRight === bRight && aBottom === bBottom) return false;
+  return ax <= bx && ay <= by && aRight >= bRight && aBottom >= bBottom;
+}
+
+/**
+ * Groups NESTED inside `g` — every OTHER group whose box is fully contained in
+ * g's box. This mirrors LiteGraph's own child-group rule (containsRect in
+ * LGraphGroup.recomputeInsideNodes), which is FULL containment for groups even
+ * though membership for NODES is centre-in-rect: a merely overlapping neighbour
+ * is not a child and must not be dragged along.
+ *
+ * Needed because the panel reimplements the group move instead of calling
+ * g.move() (whose cached children are stale/empty on affected builds, #287/#311/
+ * #312). Reimplementing only the NODE half moved the outer box and its nodes but
+ * stranded every inner group box over the space the nodes just vacated — the
+ * "nodes that looked grouped no longer are" half of #408, and a divergence from
+ * the documented "like dragging the group header" contract.
+ */
+export function nestedGroupsOf(graph, g) {
+  const outer = groupBoundsOf(g);
+  if (!outer) return [];
+  return (graph?._groups ?? []).filter((other) => {
+    if (!other || other === g) return false;
+    const inner = groupBoundsOf(other);
+    return !!inner && containsBounds(outer, inner);
+  });
+}
+
+/**
+ * Translate a group's box by (dx, dy), writing through whichever geometry the
+ * build exposes — the `_bounding` quad (plain OR typed array, mutated in place)
+ * or the pos/size pair. Mirrors the panel's setGroupBounds write policy.
+ */
+export function translateGroupBox(g, dx, dy) {
+  const b = g?._bounding;
+  if (b && b.length >= 4) {
+    b[0] += dx;
+    b[1] += dy;
+    return;
+  }
+  if (!g) return;
+  const x = Number(g.pos?.[0] ?? 0);
+  const y = Number(g.pos?.[1] ?? 0);
+  g.pos = [x + dx, y + dy];
+}
+
+/** Every reroute point of a graph, across the Map / array / plain-object shapes
+ *  different frontend builds expose on `graph.reroutes`. */
+function allReroutes(graph) {
+  const r = graph?.reroutes;
+  if (!r) return [];
+  if (typeof r.values === "function") return [...r.values()];
+  if (Array.isArray(r)) return r;
+  if (typeof r === "object") return Object.values(r);
+  return [];
+}
+
+/**
+ * Link reroute points whose position falls inside `bounds` — LiteGraph's own
+ * rule for reroute children of a group (isPointInRect on the reroute position,
+ * NOT a centre-of-box test, because a reroute IS a point).
+ */
+export function reroutesInside(graph, bounds) {
+  if (!bounds) return [];
+  const [x, y, w, h] = bounds;
+  return allReroutes(graph).filter((r) => {
+    const px = Number(r?.pos?.[0]);
+    const py = Number(r?.pos?.[1]);
+    if (!Number.isFinite(px) || !Number.isFinite(py)) return false;
+    return px >= x && px < x + w && py >= y && py < y + h;
+  });
+}
+
+/**
+ * Translate reroute points by (dx, dy). Writes IN PLACE first because current
+ * builds back `Reroute.pos` with a typed array behind a getter (an assignment
+ * would be dropped by a getter-only property); if the in-place write did not
+ * take, fall back to assigning a fresh pair. Without this a moved group leaves
+ * its wire elbows behind and the links visibly snake back to the old box.
+ */
+export function moveReroutePoints(reroutes, dx, dy) {
+  for (const r of reroutes ?? []) {
+    const pos = r?.pos;
+    if (!pos || pos.length < 2) continue;
+    const px = Number(pos[0]);
+    const py = Number(pos[1]);
+    if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
+    pos[0] = px + dx;
+    pos[1] = py + dy;
+    if (r.pos?.[0] !== px + dx || r.pos?.[1] !== py + dy) r.pos = [px + dx, py + dy];
+  }
+}
+
+/**
  * Compare the node ids actually enclosed (geometric) against the ids the caller
  * asked to group. Returns { requested, members, extra, missing } so a create
  * handler can warn honestly in dense layouts (#297) instead of reporting a

@@ -218,6 +218,11 @@ import {
   syncNodeArea,
   syncGraphNodeAreas,
   moveGroupMembers,
+  groupBoundsOf,
+  nestedGroupsOf,
+  translateGroupBox,
+  reroutesInside,
+  moveReroutePoints,
 } from "./lib/group-geometry.js";
 import {
   activeWorkflowPossiblyStale,
@@ -10037,39 +10042,83 @@ const GRAPH_TOOL_EXECUTORS = {
     return { group: summary };
   },
 
-  // Move a group's box to [x,y]; by default the contained nodes move with it
-  // (move_nodes:false moves only the box).
+  // Move a group's box to [x,y]; by default everything the box encloses moves
+  // with it — nodes, NESTED group boxes and link reroute points, i.e. exactly
+  // what a canvas drag of the group header moves (move_nodes:false moves only
+  // the box, deliberately re-cutting which nodes the group encloses).
   graph_move_group({ group_id, pos, move_nodes }) {
     const { graph } = getGraphCtx();
     const g = resolveGroup(graph, group_id);
-    const b = g._bounding ?? [g.pos?.[0] ?? 0, g.pos?.[1] ?? 0, 0, 0];
+    // Refuse a non-finite target LOUDLY. `Number(undefined)` is NaN, and a NaN
+    // delta silently propagates into every member node's pos and into the group
+    // box itself — an unrecoverable, invisible corruption of the user's layout
+    // reported as a success. Every other geometry writer (graph_edit_node) already
+    // validates; this one used to be the hole.
+    if (!Array.isArray(pos) || pos.length !== 2 || !pos.every((n) => Number.isFinite(Number(n)))) {
+      throw new Error("pos must be [x, y] finite numbers — pass the new top-left corner of the group box");
+    }
+    // groupBoundsOf reads _bounding OR pos/size and returns null when neither is
+    // usable. The old fallback invented [0, 0, 0, 0] in that case, which is not the
+    // group's box — it silently relocated the group to the origin with a zero-size
+    // box that encloses nothing. Refuse instead: "could not determine" is not an
+    // answer in either direction.
+    const b = groupBoundsOf(g);
+    if (!b) {
+      throw new Error(`group ${group_id} has no usable bounds on this frontend — re-read it via panel_query_graph, or set its box explicitly with panel_edit_group({bounds})`);
+    }
     const dx = Number(pos[0]) - b[0];
     const dy = Number(pos[1]) - b[1];
+    let movedNodes = 0;
+    let movedGroups = 0;
+    let movedReroutes = 0;
     graph.beforeChange();
     try {
       if (move_nodes !== false) {
-        // Move the box AND the LIVE geometric members together. We don't rely on
-        // g.move(), which shifts LiteGraph's cached g._nodes — that cache is stale
+        // Move the box AND everything it encloses together. We don't rely on
+        // g.move(), which shifts LiteGraph's cached child set — that cache is stale
         // or empty on affected builds (#287/#311/#312), so it would move the wrong
-        // nodes or none. Resync live geometry first so we capture the members that
-        // are ACTUALLY inside the box now (not a stale cache), recompute membership,
-        // then translate each member plus the box by the same delta.
+        // children or none. Resync live geometry first so we capture what is
+        // ACTUALLY inside the box now (not a stale cache), then translate the box
+        // and every captured child by the same delta.
         syncGraphNodeAreas(graph);
         const members = groupMemberNodes(graph, g);
+        // Nested group boxes and reroute points are captured against the PRE-move
+        // bounds, before the box is written, so containment is judged where the
+        // children actually are. Reimplementing only the node half moved the outer
+        // box and its nodes but stranded every inner group box over the vacated
+        // space, so nodes that looked grouped silently were not any more (#408).
+        const nested = nestedGroupsOf(graph, g);
+        const reroutes = reroutesInside(graph, b);
         setGroupBounds(g, [Number(pos[0]), Number(pos[1]), b[2], b[3]]);
         // Move each member AND refresh its cached boundingRect by the same delta.
         // Without the rect refresh the box moves but the members "stay behind" for
         // the immediate summarizeGroup below and any later panel_query_graph read,
         // which then reports stale node_ids (#408); mirrors the move_node path (#355).
         moveGroupMembers(members, dx, dy);
+        for (const child of nested) translateGroupBox(child, dx, dy);
+        moveReroutePoints(reroutes, dx, dy);
+        movedNodes = members.length;
+        movedGroups = nested.length;
+        movedReroutes = reroutes.length;
       } else {
         setGroupBounds(g, [Number(pos[0]), Number(pos[1]), b[2], b[3]]);
+        // The box moved and NOTHING else did, so the group now encloses a DIFFERENT
+        // set of nodes. Membership is read boundingRect-first, so resync every
+        // cached rect to live pos/size before summarizing — otherwise this reply
+        // answers "which nodes are in the box now?" with rects left over from a
+        // paste / load / manual drag the panel never saw. The box is not the
+        // membership (#408); every other group path already resyncs before it
+        // reports, and this branch was the last one that did not.
+        syncGraphNodeAreas(graph);
       }
     } finally {
       graph.afterChange();
     }
     graph.setDirtyCanvas(true, true);
-    return { group: summarizeGroup(graph, g) };
+    return {
+      group: summarizeGroup(graph, g),
+      moved: { nodes: movedNodes, groups: movedGroups, reroutes: movedReroutes },
+    };
   },
 
   // Edit a group's title / color / font_size / bounds — only the fields passed.
@@ -13401,8 +13450,21 @@ function describeCommand(cmd, msg, reply) {
         : "";
       return { icon: "pi-clone", text: `Created group “${r.group?.title}” (id ${r.group?.id})${suffix}` };
     }
-    case "graph_move_group":
-      return { icon: "pi-arrows-alt", text: `Moved group ${r.group?.id} (“${r.group?.title}”)` };
+    case "graph_move_group": {
+      // Say what came WITH the box. A move that carried nothing is exactly the
+      // "only the box moved" symptom (#408), so it must be visible on the card
+      // rather than hidden behind an unqualified "Moved group".
+      const m = r.moved;
+      const carried = [
+        ...(m?.nodes ? [`${m.nodes} node${m.nodes === 1 ? "" : "s"}`] : []),
+        ...(m?.groups ? [`${m.groups} nested group${m.groups === 1 ? "" : "s"}`] : []),
+        ...(m?.reroutes ? [`${m.reroutes} reroute${m.reroutes === 1 ? "" : "s"}`] : []),
+      ].join(", ");
+      return {
+        icon: "pi-arrows-alt",
+        text: `Moved group ${r.group?.id} (“${r.group?.title}”)${carried ? ` with ${carried}` : " — box only"}`,
+      };
+    }
     case "graph_edit_group":
       return { icon: "pi-pencil", text: `Edited group ${r.group?.id} (“${r.group?.title}”)` };
     case "graph_remove_group":
