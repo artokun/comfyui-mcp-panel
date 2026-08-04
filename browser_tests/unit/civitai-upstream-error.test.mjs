@@ -87,11 +87,11 @@ test("#417: _request throws a timeout error when the proxy never settles", async
 // ---- #599: browser→proxy transport failures ("Failed to fetch", no status) --
 // A bare TypeError from fetch means no HTTP response came back from the
 // ComfyUI-side proxy — CivitAI is not the cause. The proxy call is always a
-// POST, which
-// Chrome won't self-retry on a stale keep-alive connection, so the client does
-// ONE retry for idempotent (GET) specs, then throws a CLASSIFIED transport
-// error (kind:"transport", status:null) naming the real failed hop — never the
-// browser's bare "Failed to fetch" alone.
+// POST, which Chrome won't self-retry on a stale keep-alive connection, so the
+// client does ONE retry for idempotent specs (GETs, plus the read-only Meili
+// multi-search POST, which is flagged idempotent at the call site), then throws
+// a CLASSIFIED transport error (kind:"transport", status:null) naming the real
+// failed hop — never the browser's bare "Failed to fetch" alone.
 
 test("#599: a transient transport failure on an idempotent request is retried once", async () => {
   let calls = 0;
@@ -154,6 +154,23 @@ test("#599: a transport failure on a non-idempotent (POST) request is NOT retrie
     (err) => err.kind === "transport",
   );
   assert.equal(calls, 1);
+});
+
+test("#599: a READ issued as a POST (Meili multi-search) IS retried when flagged idempotent", async () => {
+  // Idempotency is a property of the operation, not the HTTP method: keyword
+  // media search goes through MeiliSearch's multi-search, a read-only POST.
+  let calls = 0;
+  const client = new CivitaiClient({
+    fetchApi: async () => {
+      calls++;
+      if (calls === 1) throw new TypeError("Failed to fetch");
+      return { ok: true, status: 200, json: async () => ({ results: [{ hits: [] }] }) };
+    },
+    apiURL: (p) => p,
+  });
+  const out = await client.searchMedia("wan");
+  assert.deepEqual(out, []);
+  assert.equal(calls, 2, "the flagged read-only POST must get the same one retry as a GET");
 });
 
 test("#599: every read path routes through the same-origin proxy (no direct cross-origin fetch)", async () => {
