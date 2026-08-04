@@ -3817,13 +3817,26 @@ function looksLikeQueueStatus(s) {
 /** Detect (and cache per session) which Manager generation the connected
  *  ComfyUI runs. See the dialect comment above. An optional `signal` bounds the
  *  probes (a re-probe inherits the caller's remaining budget — #605 codex r3);
- *  an aborted probe reads as "no answer", never as a dialect verdict. */
+ *  an aborted probe reads as "no answer", never as a dialect verdict — and when
+ *  the signal HAS fired, detection bails WITHOUT caching: a partial reading
+ *  (e.g. the legacy-UI probe dying to the deadline right after the status
+ *  probe answered) must never be pinned as a wrong sub-dialect (codex r4). */
 async function detectManagerDialect({ signal } = {}) {
   if (managerDialectCache) return managerDialectCache;
   const opts = signal ? { signal } : {};
+  const assertNotAborted = () => {
+    if (signal?.aborted) {
+      throw new Error(
+        "ComfyUI-Manager dialect detection was aborted mid-probe (the caller's " +
+          "budget ran out) — no verdict was cached. Retry the operation.",
+      );
+    }
+  };
   const v2 = await managerProbe("/v2/manager/queue/status", opts);
+  assertNotAborted();
   if (looksLikeQueueStatus(v2)) {
     const legacyUi = await managerProbe("/v2/manager/is_legacy_manager_ui", opts);
+    assertNotAborted();
     managerDialectCache =
       legacyUi && typeof legacyUi === "object" && legacyUi.is_legacy_manager_ui === true
         ? "v2-batch"
@@ -3831,6 +3844,7 @@ async function detectManagerDialect({ signal } = {}) {
     return managerDialectCache;
   }
   const legacy = await managerProbe("/manager/queue/status", opts);
+  assertNotAborted();
   if (looksLikeQueueStatus(legacy)) {
     managerDialectCache = "legacy";
     return managerDialectCache;
@@ -3856,7 +3870,7 @@ async function detectManagerDialect({ signal } = {}) {
  *  unreachable fallbacks (#426 /object_info search) still fire exactly as
  *  before. */
 async function managerGet(route, { signal } = {}) {
-  const dialect = await detectManagerDialect();
+  const dialect = await detectManagerDialect({ signal });
   const opts = signal ? { signal } : {};
   try {
     return dialect === "legacy" ? await managerCall(route, opts) : await managerV2(route, opts);

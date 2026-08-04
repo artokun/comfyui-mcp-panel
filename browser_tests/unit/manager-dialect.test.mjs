@@ -282,6 +282,55 @@ test("#605: Manager answering NO dialect surfaces the ORIGINAL error and leaves 
   assert.equal(h.getDialectCache(), "v2");
 });
 
+test("#605 codex r4: a cache-MISS entry detection is bounded by the caller's signal too", async () => {
+  // Fresh cache: EVERY probe hangs until its signal fires. A managerGet under a
+  // tight caller budget must fail fast, not stack 15s probes.
+  const fetchApi = (_route, opts) =>
+    new Promise((_, reject) => {
+      const onAbort = () => reject(new Error("This operation was aborted"));
+      if (opts?.signal?.aborted) return onAbort();
+      opts?.signal?.addEventListener("abort", onAbort);
+    });
+  const h = buildDialectHarness({
+    fetchApi,
+    managerCall: async () => ({}),
+    managerV2: async () => ({}),
+  });
+  const start = Date.now();
+  await assert.rejects(
+    () => h.managerGet("manager/queue/history?ui_id=x", { signal: AbortSignal.timeout(150) }),
+    /aborted mid-probe/,
+  );
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed < 5000, `entry detection must abort with the caller's signal (took ${elapsed}ms)`);
+  assert.equal(h.getDialectCache(), null, "an aborted detection caches nothing");
+});
+
+test("#605 codex r4: an aborted legacy-UI sub-probe is never pinned as a 'v2' verdict", async () => {
+  // The /v2 status probe answers, but the is_legacy_manager_ui probe hangs
+  // until the caller's signal fires. Detection must bail WITHOUT caching —
+  // committing "v2" here would misroute v2-batch mutations to the task route
+  // (which 405s on legacy-UI builds).
+  const fetchApi = (route, opts) => {
+    if (route === "/v2/manager/queue/status") return Promise.resolve(okJson(QUEUE_STATUS));
+    return new Promise((_, reject) => {
+      const onAbort = () => reject(new Error("This operation was aborted"));
+      if (opts?.signal?.aborted) return onAbort();
+      opts?.signal?.addEventListener("abort", onAbort);
+    });
+  };
+  const h = buildDialectHarness({
+    fetchApi,
+    managerCall: async () => ({}),
+    managerV2: async () => ({}),
+  });
+  await assert.rejects(
+    () => h.managerGet("manager/queue/status", { signal: AbortSignal.timeout(150) }),
+    /aborted mid-probe/,
+  );
+  assert.equal(h.getDialectCache(), null, "no verdict from a partial reading");
+});
+
 test("#605 codex r3: the managerGet re-probe aborts with the CALLER's signal (waitForUpdateResult budget)", async () => {
   // Phase 1 seeds a cached dialect with answering probes; phase 2's probes HANG
   // until their signal fires. The routed GET 404s fast (a proven route-level
