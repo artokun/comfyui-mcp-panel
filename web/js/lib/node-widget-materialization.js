@@ -111,19 +111,48 @@ export function registeredSocketTypes(objectInfoDefs) {
 }
 
 /**
- * Required input names the CURRENT backend def declares that the registered
- * (possibly stale) node definition does not have at all. A pack upgraded
- * mid-session can add required inputs to an ALREADY-registered class; the
- * registry is refreshed only for absent classes, so createNode would build
- * the OLD shape — a new link input would not even get a slot, and the node
- * could never validate. The caller refuses with a reload remedy instead.
+ * What about a required input declaration determines the SHAPE of the node
+ * createNode builds: the widget/socket type (combo choices included — a
+ * widget created from the old values list can hold a value the backend no
+ * longer accepts) and the forceInput/widget:false flags that decide socket
+ * vs widget. Benign config (default, min/max, tooltip) is deliberately not
+ * compared: a stale default still serializes a valid value.
+ */
+function inputShapeSignature(spec) {
+  if (!Array.isArray(spec)) return null;
+  const declared = spec[0];
+  const type = Array.isArray(declared)
+    ? `COMBO:${JSON.stringify(declared)}`
+    : typeof declared === "string"
+      ? declared
+      : null;
+  if (type === null) return null;
+  const config = spec[1];
+  const forced =
+    config &&
+    typeof config === "object" &&
+    (config.forceInput || config.force_input || config.widget === false);
+  return forced ? `${type}|socket` : type;
+}
+
+/**
+ * Required input names whose declaration in the CURRENT backend def the
+ * registered (possibly stale) node definition does not match. A pack
+ * upgraded mid-session can add required inputs — or CHANGE an existing
+ * one's type — on an ALREADY-registered class; the registry is refreshed
+ * only for absent classes, so createNode would build the OLD shape — a new
+ * link input would not even get a slot, and a retyped widget would hold a
+ * value the backend rejects. The caller refuses with a reload remedy
+ * instead.
  */
 export function driftedRequiredInputNames(currentDef, nodeOrNodeData) {
   const current = currentDef?.input?.required;
   if (!current || typeof current !== "object") return [];
   const stale = requiredInputs(nodeOrNodeData) ?? {};
   return Object.keys(current).filter(
-    (name) => !Object.prototype.hasOwnProperty.call(stale, name),
+    (name) =>
+      !Object.prototype.hasOwnProperty.call(stale, name) ||
+      inputShapeSignature(stale[name]) !== inputShapeSignature(current[name]),
   );
 }
 

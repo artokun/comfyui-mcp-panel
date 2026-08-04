@@ -7765,10 +7765,10 @@ const GRAPH_TOOL_EXECUTORS = {
     const drifted = driftedRequiredInputNames(currentDef, nodeData);
     if (drifted.length) {
       throw new Error(
-        `"${class_type}" gained required input${drifted.length === 1 ? "" : "s"} ` +
-          `${drifted.map((name) => `"${name}"`).join(", ")} since this page loaded its node ` +
-          "schema. Reload the ComfyUI tab so the frontend picks up the updated node " +
-          "definition, then retry.",
+        `"${class_type}" required input${drifted.length === 1 ? "" : "s"} ` +
+          `${drifted.map((name) => `"${name}"`).join(", ")} ${drifted.length === 1 ? "was" : "were"} ` +
+          "added or retyped since this page loaded its node schema. Reload the ComfyUI tab so " +
+          "the frontend picks up the updated node definition, then retry.",
       );
     }
     // Socket proof comes from the SAME fresh defs — NOT the LiteGraph

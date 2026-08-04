@@ -247,6 +247,34 @@ test("a required input added to an already-registered class is seen via the fres
   assert.deepEqual(driftedRequiredInputNames(undefined, staleNode), []);
 });
 
+test("a same-name required input whose TYPE changed mid-session is drift", () => {
+  const staleNode = {
+    constructor: {
+      nodeData: {
+        input: {
+          required: {
+            mode: ["STRING", { default: "legacy" }],
+            style: [["none", "film"], {}],
+            quality: ["INT", { default: 5 }],
+          },
+        },
+      },
+    },
+  };
+  // mode retyped STRING -> COMBO, style's combo VALUES changed, quality only
+  // gained a benign default change.
+  const currentDef = {
+    input: {
+      required: {
+        mode: [["modern"], {}],
+        style: [["noir", "film"], {}],
+        quality: ["INT", { default: 7 }],
+      },
+    },
+  };
+  assert.deepEqual(driftedRequiredInputNames(currentDef, staleNode), ["mode", "style"]);
+});
+
 test("raw /object_info snake_case force_input remains a wireable socket", () => {
   const node = {
     constructor: {
