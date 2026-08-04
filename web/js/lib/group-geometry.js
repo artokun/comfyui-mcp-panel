@@ -200,6 +200,7 @@ export function syncGraphNodeAreas(graph) {
 export function moveGroupMembers(members, dx, dy) {
   const moved = [];
   const stuck = [];
+  const attempted = [];
   for (const n of members ?? []) {
     const px = Number(n?.pos?.[0]);
     const py = Number(n?.pos?.[1]);
@@ -207,6 +208,7 @@ export function moveGroupMembers(members, dx, dy) {
       if (n) stuck.push(n);
       continue;
     }
+    attempted.push([n, px, py]);
     if (writePoint(n, "pos", px + dx, py + dy)) {
       refreshNodeArea(n, [px, py]);
       moved.push(n);
@@ -214,14 +216,60 @@ export function moveGroupMembers(members, dx, dy) {
       stuck.push(n);
     }
   }
-  return { moved, stuck };
+  return { moved, stuck, undo: () => restoreNodePositions(attempted) };
 }
 
-/** Two coordinates are the same point for our purposes. A Float32-backed pos
- *  (older LiteGraph builds) cannot store an arbitrary double exactly, so an
- *  `===` read-back would report a perfectly good write as a failed one. */
-function closeEnough(a, b) {
-  return Math.abs(a - b) <= Math.max(1e-3, Math.abs(b) * 1e-6);
+/**
+ * Put every ATTEMPTED node back at the exact coordinates it had before the move,
+ * whether its write landed, landed somewhere else, or did not land at all.
+ *
+ * Undoing by the inverse delta is not good enough: a build whose setter clamps or
+ * snaps leaves the node at a THIRD position, which writePoint correctly reports
+ * as not-landed — and an undo that only walked the `moved` list would leave that
+ * node displaced while the caller announced that nothing had moved. Restoring
+ * absolutely, over the whole attempted set, is what makes that announcement true.
+ */
+function restoreNodePositions(attempted) {
+  for (const [n, px, py] of attempted ?? []) {
+    const cur = [Number(n?.pos?.[0]), Number(n?.pos?.[1])];
+    writePoint(n, "pos", px, py);
+    refreshNodeArea(n, cur);
+  }
+}
+
+/**
+ * Is `actual` the value a write of `want` was supposed to leave behind?
+ *
+ * EXACT equality — with one narrowly scoped exception: when the destination is
+ * literally a Float32Array (older LiteGraph builds back node positions and group
+ * bounds with one), it physically cannot hold an arbitrary double, so the value
+ * it does hold, `Math.fround(want)`, is the write succeeding. Pass float32 only
+ * after checking the actual container.
+ *
+ * Deliberately NOT a relative tolerance. Slack proportional to the coordinate
+ * accepts an arbitrarily large error at a large coordinate — which means
+ * reporting a write that did nothing, or that a build snapped/clamped somewhere
+ * else, as a completed move. Now that an unmovable child aborts the whole group
+ * move, this predicate decides between a truthful refusal and a fabricated
+ * success, so it gets no free slack.
+ */
+export function samePoint(actual, want, float32 = false) {
+  if (!Number.isFinite(actual) || !Number.isFinite(want)) return false;
+  if (actual === want) return true;
+  return float32 && actual === Math.fround(want);
+}
+
+/** Is this point/quad container a 32-bit float array (which cannot hold an
+ *  arbitrary double)? */
+function isFloat32(container) {
+  return typeof Float32Array !== "undefined" && container instanceof Float32Array;
+}
+
+/** Did the group's box actually end up with its top-left at (x, y)? */
+export function groupBoxIsAt(g, x, y) {
+  const after = groupBoundsOf(g);
+  const f32 = isFloat32(g?._bounding);
+  return !!after && samePoint(after[0], x, f32) && samePoint(after[1], y, f32);
 }
 
 /**
@@ -243,8 +291,11 @@ function closeEnough(a, b) {
  * verdict is the point — the caller must never report a move it did not make.
  */
 export function writePoint(owner, key, x, y) {
-  const landed = () =>
-    closeEnough(Number(owner?.[key]?.[0]), x) && closeEnough(Number(owner?.[key]?.[1]), y);
+  const landed = () => {
+    const point = owner?.[key];
+    const f32 = isFloat32(point);
+    return samePoint(Number(point?.[0]), x, f32) && samePoint(Number(point?.[1]), y, f32);
+  };
   try {
     owner[key] = [x, y];
   } catch {
@@ -310,31 +361,50 @@ export function nestedGroupsOf(graph, g) {
  * or the pos/size pair — and REPORT whether the box actually ended up there.
  * Mirrors the panel's setGroupBounds write policy.
  */
-export function translateGroupBox(g, dx, dy) {
-  const before = groupBoundsOf(g);
-  if (!before) return false;
-  const [x, y] = before;
+export function placeGroupBox(g, x, y) {
   const b = g?._bounding;
   if (b && b.length >= 4) {
     try {
-      b[0] = x + dx;
-      b[1] = y + dy;
+      b[0] = x;
+      b[1] = y;
     } catch {
       /* frozen quad — verified below */
     }
   } else {
-    writePoint(g, "pos", x + dx, y + dy);
+    writePoint(g, "pos", x, y);
   }
-  const after = groupBoundsOf(g);
-  return !!after && closeEnough(after[0], x + dx) && closeEnough(after[1], y + dy);
+  return groupBoxIsAt(g, x, y);
 }
 
-/** Translate several group boxes, reporting which ones actually moved. */
+export function translateGroupBox(g, dx, dy) {
+  const before = groupBoundsOf(g);
+  if (!before) return false;
+  return placeGroupBox(g, before[0] + dx, before[1] + dy);
+}
+
+/** Translate several group boxes, reporting which ones actually moved and
+ *  handing back an ABSOLUTE undo (see restoreNodePositions for why the inverse
+ *  delta is not good enough). */
 export function translateGroupBoxes(groups, dx, dy) {
   const moved = [];
   const stuck = [];
-  for (const g of groups ?? []) (translateGroupBox(g, dx, dy) ? moved : stuck).push(g);
-  return { moved, stuck };
+  const attempted = [];
+  for (const g of groups ?? []) {
+    const before = groupBoundsOf(g);
+    if (!before) {
+      if (g) stuck.push(g);
+      continue;
+    }
+    attempted.push([g, before[0], before[1]]);
+    (placeGroupBox(g, before[0] + dx, before[1] + dy) ? moved : stuck).push(g);
+  }
+  return {
+    moved,
+    stuck,
+    undo: () => {
+      for (const [g, x, y] of attempted) placeGroupBox(g, x, y);
+    },
+  };
 }
 
 /** Every reroute point of a graph, across the Map / array / plain-object shapes
@@ -377,9 +447,25 @@ export function reroutesInside(graph, bounds) {
  * signature (or none) is corrected by the direct point write, and a frozen point
  * is reported as stuck instead of throwing halfway through a group move.
  */
+export function placeReroute(r, x, y) {
+  const cx = Number(r?.pos?.[0]);
+  const cy = Number(r?.pos?.[1]);
+  if (typeof r?.move === "function" && Number.isFinite(cx) && Number.isFinite(cy)) {
+    try {
+      r.move(x - cx, y - cy);
+    } catch {
+      /* build-specific; the direct write below still gets it there */
+    }
+    const f32 = isFloat32(r?.pos);
+    if (samePoint(Number(r?.pos?.[0]), x, f32) && samePoint(Number(r?.pos?.[1]), y, f32)) return true;
+  }
+  return writePoint(r, "pos", x, y);
+}
+
 export function moveReroutePoints(reroutes, dx, dy) {
   const moved = [];
   const stuck = [];
+  const attempted = [];
   for (const r of reroutes ?? []) {
     const px = Number(r?.pos?.[0]);
     const py = Number(r?.pos?.[1]);
@@ -387,20 +473,16 @@ export function moveReroutePoints(reroutes, dx, dy) {
       if (r) stuck.push(r);
       continue;
     }
-    const wantX = px + dx;
-    const wantY = py + dy;
-    const landed = () =>
-      closeEnough(Number(r?.pos?.[0]), wantX) && closeEnough(Number(r?.pos?.[1]), wantY);
-    if (typeof r.move === "function") {
-      try {
-        r.move(dx, dy);
-      } catch {
-        /* build-specific; the direct write below still gets it there */
-      }
-    }
-    (landed() || writePoint(r, "pos", wantX, wantY) ? moved : stuck).push(r);
+    attempted.push([r, px, py]);
+    (placeReroute(r, px + dx, py + dy) ? moved : stuck).push(r);
   }
-  return { moved, stuck };
+  return {
+    moved,
+    stuck,
+    undo: () => {
+      for (const [r, px, py] of attempted) placeReroute(r, px, py);
+    },
+  };
 }
 
 /**

@@ -223,6 +223,7 @@ import {
   translateGroupBoxes,
   reroutesInside,
   moveReroutePoints,
+  groupBoxIsAt,
 } from "./lib/group-geometry.js";
 import {
   activeWorkflowPossiblyStale,
@@ -10103,10 +10104,15 @@ const GRAPH_TOOL_EXECUTORS = {
         const memberMove = moveGroupMembers(members, dx, dy);
         const rerouteMove = moveReroutePoints(reroutes, dx, dy);
         const nestedMove = translateGroupBoxes(nested, dx, dy);
+        // Undo ABSOLUTELY, over every ATTEMPTED child — not by the inverse delta
+        // over the ones that landed. A build whose setter clamps or snaps leaves a
+        // child at a third position that counts as stuck; an inverse-delta undo of
+        // only the `moved` list would strand it there while this reply claimed
+        // nothing had moved.
         const rollback = () => {
-          translateGroupBoxes(nestedMove.moved, -dx, -dy);
-          moveReroutePoints(rerouteMove.moved, -dx, -dy);
-          moveGroupMembers(memberMove.moved, -dx, -dy);
+          nestedMove.undo();
+          rerouteMove.undo();
+          memberMove.undo();
         };
         const stuck = [
           ...memberMove.stuck.map((n) => `node ${n.id}`),
@@ -10119,12 +10125,20 @@ const GRAPH_TOOL_EXECUTORS = {
             `refusing to move group ${group_id}: ${stuck.length} enclosed item(s) would not accept a new position (${stuck.slice(0, 5).join(", ")}${stuck.length > 5 ? ", …" : ""}). NOTHING was moved. Move those items out of the group (panel_edit_node) and retry, or pass move_nodes:false to move only the box.`,
           );
         }
-        setGroupBounds(g, [Number(pos[0]), Number(pos[1]), b[2], b[3]]);
-        const landed = groupBoundsOf(g);
-        if (!landed || Math.abs(landed[0] - Number(pos[0])) > 0.5 || Math.abs(landed[1] - Number(pos[1])) > 0.5) {
+        // The box write is the LAST thing that can fail, and it can fail by
+        // THROWING (a frozen quad rejects the write outright in a strict-mode
+        // module) as well as by quietly not landing. Both have to put the children
+        // back, or the group is left torn apart with an error that says otherwise.
+        let boxError = null;
+        try {
+          setGroupBounds(g, [Number(pos[0]), Number(pos[1]), b[2], b[3]]);
+        } catch (error) {
+          boxError = error;
+        }
+        if (boxError || !groupBoxIsAt(g, Number(pos[0]), Number(pos[1]))) {
           rollback();
           throw new Error(
-            `refusing to move group ${group_id}: the group box did not accept the new position on this frontend. NOTHING was moved.`,
+            `refusing to move group ${group_id}: the group box did not accept the new position on this frontend${boxError ? ` (${boxError.message})` : ""}. NOTHING was moved.`,
           );
         }
         movedNodes = memberMove.moved.length;

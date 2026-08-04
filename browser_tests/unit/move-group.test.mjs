@@ -24,6 +24,8 @@ import {
   moveReroutePoints,
   containsBounds,
   writePoint,
+  samePoint,
+  groupBoxIsAt,
 } from "../../web/js/lib/group-geometry.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
@@ -41,7 +43,14 @@ const summarizeGroupSrc = grab(/\nfunction summarizeGroup\(graph, g\) \{[\s\S]*?
 const moveGroupSrc = grab(/ {2}graph_move_group\(\{ group_id, pos, move_nodes \}\) \{[\s\S]*?\n {2}\},/, "graph_move_group");
 const moveGroupLabelSrc = grab(/ {4}case "graph_move_group": \{[\s\S]*?\n {4}\}/, 'the graph_move_group activity label');
 
-/** The real shipped handler, wired to the real shipped geometry lib. */
+/** The real shipped handler, wired to the real shipped geometry lib.
+ *
+ *  `"use strict"` is NOT decoration: comfyui-mcp-panel.js is an ES module, so the
+ *  shipped code runs strict, where a write to a frozen array or a setter-less
+ *  accessor THROWS instead of silently doing nothing. A `new Function` body is
+ *  sloppy by default, so without this the harness would exercise a more forgiving
+ *  language than the one the panel actually runs in — and every "unwritable
+ *  geometry" test below would be testing the wrong thing. */
 function realMoveGroup(graph) {
   const getGraphCtx = () => ({ graph });
   return new Function(
@@ -54,7 +63,9 @@ function realMoveGroup(graph) {
     "moveGroupMembers",
     "translateGroupBoxes",
     "moveReroutePoints",
-    `${resolveGroupSrc}
+    "groupBoxIsAt",
+    `"use strict";
+     ${resolveGroupSrc}
      ${setGroupBoundsSrc}
      ${summarizeGroupSrc}
      const executors = { ${moveGroupSrc} };
@@ -69,13 +80,15 @@ function realMoveGroup(graph) {
     moveGroupMembers,
     translateGroupBoxes,
     moveReroutePoints,
+    groupBoxIsAt,
   );
 }
 
 /** The real shipped activity-card label for a graph_move_group reply. */
 const realMoveGroupLabel = new Function(
   "r",
-  `switch ("graph_move_group") { ${moveGroupLabelSrc} }
+  `"use strict";
+   switch ("graph_move_group") { ${moveGroupLabelSrc} }
    return null;`,
 );
 
@@ -418,17 +431,69 @@ test("#408: a nested box that will not move aborts and rolls back the members", 
 });
 
 test("#408: a group box that refuses the write is a refusal, not a reported success", () => {
-  // _bounding is frozen AND there is no pos/size pair to fall back to, so
-  // setGroupBounds cannot put the box anywhere.
+  // _bounding is frozen, so setGroupBounds cannot put the box anywhere. Under the
+  // strict-mode semantics the shipped module actually runs under, that write
+  // THROWS — after the children have already moved. The throw must not escape
+  // past the rollback, or the graph is torn apart by an error that says nothing
+  // was moved.
   const g = { id: 1, title: "Frozen", _bounding: Object.freeze([0, 0, 400, 400]) };
   const a = node(7, [100, 100], [60, 40]);
-  const graph = makeGraph({ nodes: [a], groups: [g] });
+  const inner = group(2, [50, 50, 100, 100], "Inner");
+  const reroute = { id: 11, pos: [200, 200] };
+  const graph = makeGraph({ nodes: [a], groups: [g, inner], reroutes: [reroute] });
 
   assert.throws(
     () => realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] }),
-    /the group box did not accept the new position .* NOTHING was moved/s,
+    // The parenthetical carries the THROWN write error. Its presence is also the
+    // proof that this harness compiled the handler strict, the way the shipped ES
+    // module runs it — in sloppy mode the same write would silently no-op and this
+    // path would be reached by luck rather than by the catch that handles it.
+    /the group box did not accept the new position[^(]*\(.+\)\. NOTHING was moved/s,
   );
   assert.deepEqual(a.pos, [100, 100], "the members must be put back when the box write fails");
+  assert.deepEqual([...a.boundingRect], [100, 70, 60, 70], "and their cached rects with them");
+  assert.deepEqual(inner._bounding, [50, 50, 100, 100], "the nested box must be put back too");
+  assert.deepEqual([reroute.pos[0], reroute.pos[1]], [200, 200], "and the reroute");
+  assert.deepEqual(g._bounding, [0, 0, 400, 400]);
+});
+
+test("#408: a child that lands SOMEWHERE ELSE is rolled back too, not just the ones that landed", () => {
+  // This build's pos setter snaps to a 25px grid, so the requested position is
+  // never reached and the node counts as stuck — but it HAS moved. An undo that
+  // only walked the successful moves would strand it there while the error says
+  // nothing moved.
+  const snapping = {
+    id: 7,
+    size: [60, 40],
+    boundingRect: [100, 70, 60, 70],
+    _p: [100, 100],
+    get pos() { return [...this._p]; },
+    set pos(v) { this._p = [Math.round(Number(v[0]) / 25) * 25, Math.round(Number(v[1]) / 25) * 25]; },
+  };
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [snapping], groups: [g] });
+
+  assert.throws(
+    () => realMoveGroup(graph)({ group_id: 1, pos: [1013, 1013] }),
+    /node 7.*NOTHING was moved/s,
+  );
+  assert.deepEqual(snapping._p, [100, 100], "the snapped node must be restored to its ORIGINAL position");
+  assert.deepEqual(g._bounding, [0, 0, 400, 400]);
+});
+
+test("#408: a snapping reroute is also restored exactly, not left where the engine put it", () => {
+  const snapping = {
+    id: 11,
+    _p: [100, 100],
+    get pos() { return [...this._p]; },
+    set pos(v) { this._p = [Math.round(Number(v[0]) / 25) * 25, Math.round(Number(v[1]) / 25) * 25]; },
+  };
+  const frozenNode = { id: 7, size: [60, 40], boundingRect: [50, 20, 60, 70], get pos() { return Object.freeze([50, 50]); } };
+  const g = group(1, [0, 0, 400, 400]);
+  const graph = makeGraph({ nodes: [frozenNode], groups: [g], reroutes: [snapping] });
+
+  assert.throws(() => realMoveGroup(graph)({ group_id: 1, pos: [1013, 1013] }), /NOTHING was moved/);
+  assert.deepEqual(snapping._p, [100, 100], "restored to its original point, not to old+(-delta)");
 });
 
 // ---- lib branches the handler tests above do not reach ---------------------
@@ -451,10 +516,52 @@ test("writePoint reports the truth for every point shape", () => {
   const f32 = { get pos() { return f32backing; } };
   assert.equal(writePoint(f32, "pos", 1234.1, 5678.2), true);
   assert.notEqual(f32backing[0], 1234.1, "precondition: the read-back is genuinely not equal");
-  assert.ok(Math.abs(f32backing[0] - 1234.1) < 0.01, "but it is the same point");
+  assert.equal(f32backing[0], Math.fround(1234.1), "but it is exactly what Float32 storage can hold");
 
   const readOnly = { get pos() { return Object.freeze([1, 2]); } };
   assert.equal(writePoint(readOnly, "pos", 10, 20), false, "an unwritable point must report false");
+
+  // A build that SNAPS the write to a grid did not put the point where we asked.
+  // Accepting that would be reporting a move to coordinates the node is not at.
+  const snapping = {
+    _p: [0, 0],
+    get pos() { return [...this._p]; },
+    set pos(v) { this._p = [Math.round(v[0] / 25) * 25, Math.round(v[1] / 25) * 25]; },
+  };
+  assert.equal(writePoint(snapping, "pos", 113, 113), false, "a snapped write is not the write we asked for");
+});
+
+test("samePoint is exact unless the destination really is a Float32Array", () => {
+  assert.equal(samePoint(10, 10), true);
+  assert.equal(samePoint(1234.2, 1234.1), false, "0.1px of slack is already a different point");
+  assert.equal(
+    samePoint(Math.fround(1234.1), 1234.1),
+    false,
+    "Float32 rounding is only forgiven for a Float32 container, not by default",
+  );
+  assert.equal(samePoint(Math.fround(1234.1), 1234.1, true), true, "…and it IS forgiven for one");
+  // The failure mode a RELATIVE tolerance has: at a large coordinate it accepts a
+  // huge error, so a write that did nothing at all reads as a completed move.
+  assert.equal(samePoint(1e9, 1e9 + 1), false, "a no-op at a large coordinate is NOT a move");
+  assert.equal(samePoint(1e9, 1e9 + 1000), false);
+  assert.equal(samePoint(1e9, 1e9 + 1000, true), false, "not even for a Float32 container");
+  assert.equal(samePoint(Number.NaN, 10), false);
+  assert.equal(samePoint(10, Number.NaN), false);
+  assert.equal(samePoint(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY), false);
+});
+
+test("a Float32Array-backed group box (older LiteGraph) still moves and reports honestly", () => {
+  // _bounding is a Float32Array on those builds. An EXACT read-back would reject
+  // every write to it and turn every group move into a refusal.
+  const g = { id: 1, title: "F32", _bounding: new Float32Array([0, 0, 400, 400]) };
+  const a = node(7, [100, 100], [60, 40]);
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  const out = realMoveGroup(graph)({ group_id: 1, pos: [1000.1, 2000.2] });
+
+  assert.equal(groupBoxIsAt(g, 1000.1, 2000.2), true, "the box is where Float32 storage can put it");
+  assert.equal(out.moved.nodes, 1);
+  assert.deepEqual(a.pos, [1100.1, 2100.2], "the member moved by the exact delta");
 });
 
 test("moveGroupMembers reports moved vs stuck instead of silently skipping", () => {
