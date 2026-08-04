@@ -91,26 +91,32 @@ export function encodeRebootMarker({
 } = {}) {
   const ids = normalizeRunIds(runs);
   const armed = Number.isFinite(armedRunCount) ? Math.max(0, Math.trunc(armedRunCount)) : ids.length;
-  return JSON.stringify({
+  // TWO different facts, deliberately two fields — conflating them let a bridge drop
+  // erase the duplicate evidence while refreshing the budget.
+  //
+  // `t`  — attempts in the CURRENT delivery episode: the retry BUDGET, which an
+  //        observed drop legitimately refreshes (a new connection is a new chance).
+  // `ts` — attempts EVER made for this reboot: monotonic, and the cross-mount
+  //        evidence for "the agent may already have received a nudge". A resume that
+  //        reached the orchestrator and lost only its receipt is exactly the case a
+  //        later undisclosed retry would duplicate.
+  //
+  // Either may be UNKNOWN, and unknown is written by OMITTING the field, never by
+  // writing 0. A zero would launder "we have no idea" into "verified none" — and
+  // since a retained marker is re-encoded on every wait tick, that laundering would
+  // happen within seconds of the uncertainty arising.
+  const t = Number.isFinite(attempts) ? Math.max(0, Math.trunc(Number(attempts))) : null;
+  const ts =
+    totalAttempts === undefined
+      ? t // not supplied ⇒ mirrors the episode count (the fresh-arm case)
+      : Number.isFinite(totalAttempts)
+        ? Math.max(0, Math.trunc(Number(totalAttempts)), t ?? 0)
+        : null; // explicitly unknown
+  const out = {
     v: REBOOT_MARKER_VERSION,
     at: Number.isFinite(at) ? at : null,
     runs: ids,
     n: Math.max(armed, ids.length),
-    // TWO different facts, deliberately two fields — conflating them let a bridge
-    // drop erase the duplicate evidence while refreshing the budget.
-    //
-    // `t` — attempts in the CURRENT delivery episode. This is the retry BUDGET, and
-    // an observed drop legitimately refreshes it (a new connection is a new chance).
-    t: Number.isFinite(attempts) ? Math.max(0, Math.trunc(attempts)) : 0,
-    // `ts` — attempts EVER made for this reboot. Monotonic: nothing but retiring the
-    // reboot resets it. This is the cross-mount evidence for "the agent may already
-    // have received a nudge", and it must survive every episode boundary, because a
-    // resume that reached the orchestrator and lost only its receipt is exactly the
-    // case a later undisclosed retry would duplicate.
-    ts: Math.max(
-      Number.isFinite(totalAttempts) ? Math.max(0, Math.trunc(totalAttempts)) : 0,
-      Number.isFinite(attempts) ? Math.max(0, Math.trunc(attempts)) : 0,
-    ),
     // WHICH CONVERSATION asked for this restart. The wait set (`runs`) is global
     // because a reboot is global, but the resume is a message into ONE agent
     // session — delivering it to whatever conversation happens to be on screen
@@ -118,7 +124,10 @@ export function encodeRebootMarker({
     // restart while stranding the one that did.
     tid: threadId == null ? null : String(threadId),
     sid: sessionId == null ? null : String(sessionId),
-  });
+  };
+  if (t != null) out.t = t;
+  if (ts != null) out.ts = ts;
+  return JSON.stringify(out);
 }
 
 /**
@@ -143,8 +152,10 @@ export function decodeRebootMarker(raw) {
     armedRunCount: 0,
     threadId: null,
     sessionId: null,
-    attempts: 0,
-    totalAttempts: 0,
+    // Unknown, not zero: a legacy/corrupt marker carries no attempt history, and
+    // claiming "none were made" would suppress the duplicate warning on a guess.
+    attempts: null,
+    totalAttempts: null,
   };
   if (text[0] !== "{") return empty; // legacy "1"
   let parsed = null;
@@ -172,12 +183,15 @@ export function decodeRebootMarker(raw) {
     armedRunCount: Math.max(armed, runs.length),
     threadId: typeof parsed.tid === "string" && parsed.tid ? parsed.tid : null,
     sessionId: typeof parsed.sid === "string" && parsed.sid ? parsed.sid : null,
-    attempts: Number.isFinite(parsed.t) ? Math.max(0, Math.trunc(parsed.t)) : 0,
+    // `null` = UNKNOWN, never 0. An absent or malformed count is not evidence that
+    // no attempt was made, and coercing it to a verified zero is exactly what lets
+    // an undisclosed duplicate nudge through.
+    attempts: Number.isFinite(parsed.t) ? Math.max(0, Math.trunc(parsed.t)) : null,
     totalAttempts: Number.isFinite(parsed.ts)
       ? Math.max(0, Math.trunc(parsed.ts))
       : Number.isFinite(parsed.t)
-        ? Math.max(0, Math.trunc(parsed.t))
-        : 0,
+        ? Math.max(0, Math.trunc(parsed.t)) // older marker: the episode count is all we have
+        : null,
   };
 }
 

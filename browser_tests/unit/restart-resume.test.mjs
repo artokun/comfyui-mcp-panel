@@ -607,6 +607,39 @@ test("#585 P1(budget-vs-evidence): a bridge drop refreshes the BUDGET without er
   );
 });
 
+test("#585 P1(unknown-count): an absent or malformed attempt count is UNKNOWN, not a verified zero", () => {
+  // Coercing it to 0 says "no attempt was ever made" on no evidence, and that is
+  // precisely what suppresses the duplicate warning.
+  for (const bad of [{}, { t: "2" }, { t: null }, { ts: {} }, { t: NaN, ts: NaN }]) {
+    const m = decodeRebootMarker(JSON.stringify({ v: 1, at: 1000, runs: [], n: 0, ...bad }));
+    assert.equal(m.totalAttempts, null, JSON.stringify(bad));
+    assert.equal(
+      rebootResumeRepeatWarning({ totalAttempts: m.totalAttempts, attemptRecorded: true, sentThisMount: 0 }),
+      true,
+      `an unknown count must warn (${JSON.stringify(bad)})`,
+    );
+  }
+});
+
+test("#585 P1(unknown-count): re-encoding an unknown count must not launder it into a zero", () => {
+  // A retained marker is re-encoded on every wait tick, so a lossy round-trip would
+  // convert "unknown" to "verified none" within seconds of the uncertainty arising.
+  const unknown = decodeRebootMarker(JSON.stringify({ v: 1, at: 1000, runs: ["P"], n: 1 }));
+  assert.equal(unknown.totalAttempts, null);
+  const round = decodeRebootMarker(encodeRebootMarker({ ...unknown }));
+  assert.equal(round.totalAttempts, null, "still unknown after a round-trip");
+  assert.equal(round.attempts, null);
+
+  // …and the wait path, which rewrites the marker, preserves it too.
+  const held = stepRebootResume({
+    raw: encodeRebootMarker({ ...unknown }),
+    isSettled: () => false,
+    nowMs: 1100,
+  });
+  assert.equal(held.decision, "wait_for_run");
+  assert.equal(decodeRebootMarker(held.nextRaw).totalAttempts, null);
+});
+
 test("#585: a legacy marker with only the per-episode count still reports it as evidence", () => {
   // `ts` absent ⇒ fall back to `t` rather than to zero: an older marker that
   // recorded one attempt must not read as "never attempted".

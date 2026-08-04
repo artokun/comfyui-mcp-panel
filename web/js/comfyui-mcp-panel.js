@@ -19586,8 +19586,12 @@ function buildPanel() {
     if (retained) {
       const withAttempt = encodeRebootMarker({
         ...decodeRebootMarker(retained),
-        attempts: (marker?.attempts ?? 0) + 1, // episode budget
-        totalAttempts: (marker?.totalAttempts ?? 0) + 1, // monotonic evidence
+        // An unknown prior count restarts at 1 for the BUDGET (we cannot bound what
+        // we cannot count, and a real number here ends the uncertainty) but must not
+        // pretend the TOTAL was zero — so an unknown total stays unknown, and keeps
+        // forcing the duplicate warning.
+        attempts: (Number.isFinite(marker?.attempts) ? Number(marker.attempts) : 0) + 1,
+        totalAttempts: Number.isFinite(marker?.totalAttempts) ? Number(marker.totalAttempts) + 1 : null,
       });
       ssSet(REBOOT_KEY, withAttempt);
       attemptRecorded = ssGet(REBOOT_KEY) === withAttempt;
@@ -19752,7 +19756,12 @@ function buildPanel() {
     // mount's counter starts at zero, so a reload would hand back a full budget and
     // repeated reloads would mint unlimited nudges — the storm the bound exists to
     // prevent. One source of truth, and it is the one that survives a reload.
-    if ((step?.marker?.attempts ?? 0) >= REBOOT_RESUME_MAX_ATTEMPTS) {
+    // An UNKNOWN count cannot say the budget is spent. Allowing the send is the
+    // recoverable side (the unknown total already forces the duplicate warning), and
+    // the write-ahead below replaces the unknown with a real count — so this resolves
+    // after exactly one attempt instead of looping.
+    const budgetUsed = step?.marker?.attempts;
+    if (Number.isFinite(budgetUsed) && Number(budgetUsed) >= REBOOT_RESUME_MAX_ATTEMPTS) {
       if (!rebootResumeStalledNoticeShown) {
         rebootResumeStalledNoticeShown = true;
         appendSystem(
@@ -19804,7 +19813,10 @@ function buildPanel() {
       // is exactly the case a later undisclosed retry would duplicate.
       const raw = ssGet(REBOOT_KEY);
       const decoded = raw == null ? null : decodeRebootMarker(raw);
-      if (decoded && decoded.attempts > 0) {
+      // `!== 0` rather than `> 0` so an UNKNOWN budget is also resolved here: after an
+      // observed drop, "this episode has made zero attempts" is a true statement we
+      // can now assert. The total is untouched and stays unknown if it was.
+      if (decoded && decoded.attempts !== 0) {
         ssSet(REBOOT_KEY, encodeRebootMarker({ ...decoded, attempts: 0 }));
       }
       // Mids from the dead socket can never be acked on the new connection, so drop
