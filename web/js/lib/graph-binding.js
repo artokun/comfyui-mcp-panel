@@ -504,6 +504,123 @@ export function graphCommandMayMutateWorkflow(command) {
 }
 
 /**
+ * THE binding evidence bar a bridge graph command must clear (#604 family).
+ *
+ * The invariant this encodes: **a MUTATION may never run on binding evidence that
+ * a READ would refuse.** It was the other way round. The bridge dispatch fence
+ * asked for `includeBaselineReadGuard: false` for EVERY command, and only the
+ * read executors (graph_outline, graph_get_errors) re-asserted with it switched
+ * on. So the exact evidence that made `graph_outline` refuse — "the active
+ * workflow reports N>0 nodes but the live root reads empty" — let
+ * `graph_remove_node` through, which is #604's title verbatim: reads blocked,
+ * mutations still routed to the wrong canvas and deleted nodes from it.
+ *
+ * The hole is not hypothetical-only in the both-empty case: when the live root
+ * exposes no `_nodes` ARRAY at all (a half-rebuilt root after a backend restart),
+ * `graphRootMismatchesActiveWorkflow` and `graphEmptyBindingUnproven` BOTH bail
+ * out as inconclusive by design, and `graphReadDesynced` is the only predicate
+ * that still fires. Gating it off for mutations left them with no fence at all.
+ *
+ * Reads keep the LOWER bar at dispatch on purpose (they re-assert with the full
+ * bar inside their own executors, where they can also offer a recovery path);
+ * mutations get the full bar here, before their executor ever runs.
+ */
+export const MUTATION_BINDING_BAR = Object.freeze({
+  includeBaselineReadGuard: true,
+  requireDirtyMutationBinding: true,
+});
+
+export function graphCommandBindingBar(command) {
+  return graphCommandMayMutateWorkflow(command)
+    ? { ...MUTATION_BINDING_BAR }
+    : { includeBaselineReadGuard: false, requireDirtyMutationBinding: false };
+}
+
+/**
+ * The binding refusal VERDICT for a graph command, or `null` when the binding
+ * clears the bar. Pure — every input is passed in — so the read/mutation symmetry
+ * above is unit-testable without a browser (it previously lived inline in the
+ * panel monolith, where nothing could observe it).
+ *
+ * Returns `{ reason, expected }`; `reason` names the firing predicate so a
+ * misfiring guard is diagnosable instead of driving a blind reload/retry loop
+ * (#565). Order is significant: the first four verdicts are POSITIVE mismatches
+ * and stay more specific than the inconclusive-empty verdict, which is evaluated
+ * LAST so it can never mask them.
+ */
+export function resolveGraphBindingVerdict({
+  graph,
+  rootGraph,
+  activeWorkflow,
+  activeWorkflowUuid,
+  liveNodeCount,
+  inSubgraph = false,
+  rootUuidMismatch = false,
+  includeBaselineReadGuard = true,
+  requireDirtyMutationBinding = false,
+} = {}) {
+  const nodeCount = Number.isFinite(Number(liveNodeCount))
+    ? Number(liveNodeCount)
+    : (rootGraph?._nodes?.length ?? 0);
+  // On a dirty tab, ChangeTracker's activeState can lag the live canvas (#545),
+  // so it cannot prove the root belongs to this workflow. Reads remain
+  // availability-oriented, but mutations need a positive UUID match: otherwise
+  // a stale, untagged root B is indistinguishable from A and could be changed.
+  const dirtyMutationBindingUnproven =
+    requireDirtyMutationBinding &&
+    activeWorkflow?.isModified === true &&
+    !graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid });
+  const rootShapeMismatch = graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow });
+  const currentStateTrustworthy = activeWorkflow?.isModified !== true;
+  const baselineReadDesync =
+    currentStateTrustworthy &&
+    includeBaselineReadGuard &&
+    graphReadDesynced({ liveNodeCount: nodeCount, activeWorkflow, inSubgraph });
+  if (rootUuidMismatch || dirtyMutationBindingUnproven || rootShapeMismatch || baselineReadDesync) {
+    const reason = rootUuidMismatch
+      ? "root-workflow-uuid-mismatch"
+      : dirtyMutationBindingUnproven
+        ? "dirty-mutation-binding-unproven"
+        : rootShapeMismatch
+          ? "root-shape-mismatch"
+          : "root-node-count-desync";
+    return { reason, expected: activeWorkflowNodeCount(activeWorkflow) };
+  }
+  if (graphEmptyBindingUnproven({ graph, rootGraph, activeWorkflow, activeWorkflowUuid })) {
+    return { reason: "empty-binding-unproven", expected: activeWorkflowNodeCount(activeWorkflow) };
+  }
+  return null;
+}
+
+/**
+ * The caller-facing refusal text for a `resolveGraphBindingVerdict` result. Kept
+ * next to the predicates so the claim and the evidence cannot drift apart.
+ *
+ * Both messages state that the command was NOT applied. That claim is only ever
+ * TRUE because every caller asserts BEFORE doing any work — a caller that has
+ * already mutated something must disclose, not refuse (a refusal for work that
+ * landed invites a destructive retry, which is #603's duplicate-node cascade).
+ */
+export function graphBindingRefusalMessage(verdict) {
+  if (!verdict) return null;
+  if (verdict.reason === "empty-binding-unproven") {
+    return (
+      `[empty-binding-unproven] The live root canvas reads EMPTY, but the active workflow's own ` +
+      `state cannot prove it is genuinely empty — the tab may still be loading after a switch, ` +
+      `reconnect, or a failed open, and node_count 0 could be a FALSE-EMPTY reading, so this ` +
+      `command was NOT applied as authoritative. Retry in a moment once the tab settles; if it ` +
+      `persists, re-open the workflow tab (panel_open_workflow) or reload the panel.`
+    );
+  }
+  return (
+    `[${verdict.reason}] The live graph is out of sync with the active workflow: the workflow reports ` +
+    `${verdict.expected} node(s), but the canvas is bound to a different graph. A load, tab switch, ` +
+    `or reconnect left this command pointed at the wrong canvas, so it was NOT applied. Re-open the ` +
+    `active workflow tab (panel_open_workflow) or reload the panel to rebind the graph, then retry.`
+  );
+}
+
+/**
  * True when the graph READ's binding changed across an AWAIT: the active-workflow
  * instance or the bound root-graph object captured before the await no longer
  * matches after it. Used to detect a workflow-tab SWITCH that interleaved with a
