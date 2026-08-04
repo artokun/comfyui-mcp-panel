@@ -29,6 +29,8 @@ import {
   assertResolvedTargetRegistered,
   assertTypeAgainstFreshBackend,
   assertMutatedNodeAuthorized,
+  isVirtualSubgraphContainer,
+  backendHistoryVerdict,
 } from "./node-resolve.js";
 import { controlAfterGenerateWarning } from "./control-after-generate.js";
 import {
@@ -106,6 +108,12 @@ export async function runSetWidget(
   //         exempted just because it carries a `subgraph` field (#458 subgraph-shaped
   //         bypass): otherwise a removed GoneNode with `subgraph:{}` + its own widget
   //         would skip fresh-auth and the stale registry guard would fabricate success.
+  //         One exception, still fail-closed: a GENUINE virtual subgraph container
+  //         (never-seen history) with no promoted match is refused UP FRONT with the
+  //         honest "not a promoted widget on this subgraph" diagnosis (#612) — its
+  //         UUID type is never in /object_info, so the generic fresh-auth message
+  //         ("backend does not provide node type <uuid>") misreports a benign
+  //         not-promoted case as a removed pack.
   let freshDefs = null;
   try {
     freshDefs = await getFreshObjectInfo();
@@ -166,6 +174,36 @@ export async function runSetWidget(
       );
     }
   } else {
+    // #612: a GENUINE virtual subgraph container whose requested widget matched NO
+    // promoted alias is a distinct, benign branch — the widget simply is not exposed
+    // on the subgraph boundary (an inner node's widget that was never promoted; the
+    // #512 recurrence is exactly this: a legacy proxyWidgets promotion of
+    // control_after_generate that the current frontend QUARANTINED on load because a
+    // canvas-only control widget has no connectable slot). Falling through to the
+    // fresh-backend type check below would misdiagnose it as "the ComfyUI backend
+    // does not provide node type <uuid>" — a subgraph node's type is its subgraph
+    // UUID, NEVER in /object_info by design — sending the agent hunting a phantom
+    // uninstalled pack. The refusal itself is unchanged (fail closed); only the
+    // diagnosis is corrected, and it is a graph-local fact that needs no backend
+    // oracle. The observed-history verdict is consulted FIRST: a container-shaped
+    // node whose type the backend reported earlier this session is a REMOVED backend
+    // node masquerading as a container and keeps the removed-type diagnosis below,
+    // as does a bare `subgraph:{}` marker that is not a real container.
+    if (node?.subgraph && isVirtualSubgraphContainer(node)) {
+      const containerVerdict = backendHistoryVerdict(node?.type, wasTypeEverDefined);
+      if (containerVerdict === "never-seen" || containerVerdict === "no-oracle") {
+        const promoted = (node.widgets ?? [])
+          .map((w) => w?.name)
+          .filter((n) => typeof n === "string");
+        throw new Error(
+          `Cannot set widget on subgraph node ${node.id}: "${widgetName}" is not a promoted ` +
+            `widget on this subgraph (promoted: ${promoted.length ? promoted.join(", ") : "none"}). ` +
+            `Only promoted widgets are settable from outside a subgraph — panel_enter_subgraph ` +
+            `and set it on the inner node directly, or promote it from inside the subgraph with ` +
+            `panel_promote_widget first.`,
+        );
+      }
+    }
     authTarget = node;
   }
 

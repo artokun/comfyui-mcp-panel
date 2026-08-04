@@ -1418,3 +1418,150 @@ test("#512: NESTED promotion through a provenance-stamped UUID intermediate ⇒ 
   assert.equal(b.widgets.find((w) => w.name === "steps").value, 30, "the intermediate forwarded the write");
   assert.equal(aRail.value, 30, "#366: authoritative outer rail synced");
 });
+
+// ---- #612: a widget that is NOT promoted on a GENUINE subgraph container must be
+//      refused with the HONEST diagnosis — "not a promoted widget on this subgraph",
+//      naming what IS promoted and the actionable remedy — never the generic #458
+//      "the ComfyUI backend does not provide node type <uuid>" message, which
+//      misreports a benign not-promoted case as an uninstalled/removed pack and
+//      sends the agent reinstalling packs or restarting ComfyUI. This is also the
+//      #512 recurrence: the krea2 pack's legacy proxyWidgets promotion of
+//      control_after_generate is QUARANTINED on load by the current frontend (a
+//      canvas-only control widget has no connectable slot), so the outer node has
+//      no such promotion and the refusal is correct — only its message was wrong. ----
+
+test("#612: non-promoted widget on a genuine UUID subgraph node ⇒ honest 'not a promoted widget' refusal", async () => {
+  // The exact reported shape (#612 node 105 / #512-recurrence node 78): a genuine
+  // subgraph container with one promoted widget (value_4), asked to write a widget
+  // that is NOT promoted (control_after_generate — it exists on an inner node but
+  // is not exposed on the boundary).
+  const reg = loadedRegistry();
+  const { parent, inner, railWidget, resolveSource } = makeUuidSubgraphFixture(reg, "KSampler");
+  await assert.rejects(
+    () =>
+      runSetWidget(parent, "control_after_generate", "fixed", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // healthy backend
+        wasTypeEverDefined: () => false, // the UUID was never backend-defined
+        resolveSource,
+        ...HOOKS,
+      }),
+    (err) => {
+      assert.match(err.message, /Cannot set widget on subgraph node 320/);
+      assert.match(err.message, /"control_after_generate" is not a promoted widget on this subgraph/);
+      // The reason must name what IS promoted so the caller can self-correct…
+      assert.match(err.message, /promoted: value_4/);
+      // …and point at the actionable remedy…
+      assert.match(err.message, /panel_enter_subgraph/);
+      assert.match(err.message, /panel_promote_widget/);
+      // …and NEVER blame a removed/uninstalled pack — nothing was uninstalled.
+      assert.doesNotMatch(err.message, /backend does not provide/i);
+      assert.doesNotMatch(err.message, /not installed, or its pack was removed/i);
+      return true;
+    },
+  );
+  assert.equal(inner.widgets.find((w) => w.name === "value_4").value, 20, "inner untouched");
+  assert.equal(railWidget.value, 20, "rail untouched");
+});
+
+test("#612: the honest diagnosis is graph-local — it fires even when the backend is UNREACHABLE", async () => {
+  // "This widget is not promoted on this node" needs no /object_info oracle. With the
+  // backend down, the old path reported "cannot verify the node type … reconnect and
+  // retry", which reads as transient — but no retry can ever make an unpromoted widget
+  // settable from outside. The refusal is identical; only the reason is honest.
+  const reg = loadedRegistry();
+  const { parent, railWidget, resolveSource } = makeUuidSubgraphFixture(reg, "KSampler");
+  await assert.rejects(
+    () =>
+      runSetWidget(parent, "control_after_generate", "fixed", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => null, // backend unreachable
+        wasTypeEverDefined: () => false,
+        resolveSource,
+        ...HOOKS,
+      }),
+    (err) => {
+      assert.match(err.message, /is not a promoted widget on this subgraph/);
+      assert.doesNotMatch(err.message, /cannot verify|object_info is unavailable/i);
+      return true;
+    },
+  );
+  assert.equal(railWidget.value, 20, "no mutation");
+});
+
+test("#612: an EVER-SEEN container type keeps the removed-type diagnosis (the trust root wins)", async () => {
+  // The honest "not a promoted widget" branch is only for a container whose type the
+  // backend NEVER reported. A container-shaped node whose type was in an earlier
+  // /object_info this session is a removed backend node masquerading as a container —
+  // the #458 removed-type diagnosis is the accurate one and must not be masked.
+  const reg = loadedRegistry();
+  const { parent, railWidget, resolveSource } = makeUuidSubgraphFixture(reg, "KSampler");
+  await assert.rejects(
+    () =>
+      runSetWidget(parent, "control_after_generate", "fixed", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // the type is ABSENT now…
+        wasTypeEverDefined: (t) => t === SUBGRAPH_UUID, // …but was reported EARLIER
+        resolveSource,
+        ...HOOKS,
+      }),
+    (err) => {
+      assert.match(err.message, /was defined by the ComfyUI backend earlier this session|since-removed/i);
+      assert.doesNotMatch(err.message, /not a promoted widget/i);
+      return true;
+    },
+  );
+  assert.equal(railWidget.value, 20, "no mutation");
+});
+
+test("#612: a bare `subgraph:{}` marker that is NOT a real container keeps the #458 fresh-auth diagnosis", async () => {
+  // The subgraph-shaped bypass fixture: a stale type carrying a truthy `subgraph`
+  // field that fails the virtual-container shape check. It must NOT get the benign
+  // "not a promoted widget" message — the backend-type diagnosis stands.
+  const reg = loadedRegistry();
+  const node = regNode("SubgraphNode", [{ name: "steps", type: "INT", value: 20 }], { subgraph: {} });
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "steps", 7, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // backend provides no "SubgraphNode"
+        wasTypeEverDefined: () => false,
+        ...HOOKS,
+      }),
+    (err) => {
+      assert.match(err.message, /backend does not provide/i);
+      assert.doesNotMatch(err.message, /not a promoted widget/i);
+      return true;
+    },
+  );
+  assert.equal(node.widgets[0].value, 20, "no mutation");
+});
+
+test("#612: an UNWIRED history oracle still gets the honest diagnosis (the 'no-oracle' arm)", async () => {
+  // "X is not a promoted widget on this node" is graph-locally TRUE whether or not the
+  // history oracle is wired, so the honest refusal does not depend on it. (The panel
+  // always wires the oracle; this pins the branch's behaviour if a caller does not.)
+  const reg = loadedRegistry();
+  const { parent, railWidget, resolveSource } = makeUuidSubgraphFixture(reg, "KSampler");
+  await assert.rejects(
+    () =>
+      runSetWidget(parent, "control_after_generate", "fixed", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(),
+        // wasTypeEverDefined deliberately OMITTED
+        resolveSource,
+        ...HOOKS,
+      }),
+    (err) => {
+      assert.match(err.message, /is not a promoted widget on this subgraph/);
+      assert.doesNotMatch(err.message, /backend does not provide/i);
+      return true;
+    },
+  );
+  assert.equal(railWidget.value, 20, "no mutation");
+});

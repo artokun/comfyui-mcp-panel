@@ -1063,6 +1063,65 @@ test("#496 set_widget: MarkdownNote's text widget is writable end-to-end (the re
   assert.equal(node.widgets[0].value, "# README");
 });
 
+test("#496 recurrence: KJNodes' frontend-only SetNode/GetNode are ADDABLE on a healthy backend that never lists them", async () => {
+  // The reported recurrence (also seen with rgthree installed): SetNode/GetNode are
+  // registered purely by the pack's frontend JS — absent from /object_info BY DESIGN —
+  // and both panel_add_node and panel_set_widget refused them as a missing pack.
+  // They are on the shared allowlist now; the ever-seen gate + provenance checks
+  // below pin that this does not reopen the #458 hole.
+  const reg = loadedRegistry([], ["SetNode", "GetNode"]); // registered by pack JS, defless
+  const fresh = objectInfo(); // healthy backend — genuinely never lists these types
+  for (const t of ["SetNode", "GetNode"]) {
+    await assert.doesNotReject(
+      () => assertAddNodeResolvableRefreshing(() => reg, t, ADD_OPTS(fresh)),
+      `#496: "${t}" is frontend-only and must be addable`,
+    );
+  }
+});
+
+test("#496 recurrence: SetNode's widget is WRITABLE end-to-end via runSetWidget", async () => {
+  const reg = loadedRegistry([], ["SetNode"]);
+  const node = {
+    id: 32,
+    type: "SetNode",
+    widgets: [{ name: "Constant", type: "string", value: "" }],
+    constructor: reg["SetNode"],
+  };
+  const { set } = await runSetWidget(node, "Constant", "model", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => objectInfo(), // healthy backend, no SetNode
+    wasTypeEverDefined: () => false,
+    ...HOOKS,
+  });
+  assert.equal(set.value, "model");
+  assert.equal(node.widgets[0].value, "model");
+});
+
+test("#496 recurrence: the SetNode/GetNode allowlist entries do NOT weaken the guards", async () => {
+  const fresh = objectInfo();
+  // (a) A class SQUATTING the allowlisted name but carrying backend provenance
+  //     (a real backend def, or a removed pack's unpurged class) is NOT frontend-only.
+  const squat = loadedRegistry(["SetNode"]); // registered WITH nodeData
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => squat, "SetNode", ADD_OPTS(fresh)),
+    /Unknown node type|does not provide/i,
+  );
+  // (b) The EVER-SEEN gate still wins: a "GetNode" the backend reported EARLIER this
+  //     session and no longer lists is a removed backend node — refused.
+  const reg = loadedRegistry([], ["GetNode"]);
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "GetNode", ADD_OPTS(fresh, (t) => t === "GetNode")),
+    /defined this node type earlier this session|removed/i,
+  );
+  // (c) An allowlisted name that is NOT registered in the live registry at all stays
+  //     refused (registry membership is also what createNode needs).
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => loadedRegistry(), "SetNode", ADD_OPTS(fresh)),
+    /Unknown node type|does not provide/i,
+  );
+});
+
 // The three guards whose oracle is /object_info. Each is reduced to a boolean
 // "would this LEAF node type be authorized?" so they can be compared directly.
 // (Container-shaped nodes are excluded on purpose: assertMutatedNodeAuthorized has an

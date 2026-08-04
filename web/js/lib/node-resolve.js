@@ -73,6 +73,14 @@ export const FRONTEND_ONLY_NODE_TYPES = new Set([
   "Label (rgthree)",
   "Reroute (rgthree)",
   "Node Collector (rgthree)",
+  // KJNodes' frontend-only Get/Set bus nodes (also reported with rgthree installed):
+  // registered purely by the pack's JS, absent from /object_info BY DESIGN (#496
+  // recurrence). These are GENERIC names a backend pack could also use — a live
+  // backend registration carries nodeData/comfyClass provenance and never reaches
+  // this allowlist (hasBackendProvenance), and a mid-session removal is caught by
+  // the ever-seen gate BEFORE the exemption is consulted.
+  "SetNode",
+  "GetNode",
 ]);
 
 /**
