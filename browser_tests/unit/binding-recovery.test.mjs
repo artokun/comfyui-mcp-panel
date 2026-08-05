@@ -7,9 +7,10 @@
  *     reset graph.extra, so the new tab inherited the PREVIOUS workflow's root tag;
  *     with its ChangeTracker not yet PROVEN empty the both-empty heal could not fire,
  *     and nothing re-stamped the root. workflow_new now stamps the root at creation
- *     (only when the root is PROVEN content-free), and workflow_open's repaint proof
- *     re-stamps the tag directly once the content is proven (the tag riding
- *     loadGraphData/configure is a serializer DIALECT, not workflow content).
+ *     (only when the root is PROVEN content-free). workflow_open's side of the
+ *     cluster is covered by open-rebind-proof.test.mjs (the #623 attempt-scoped
+ *     open_proof marker, which superseded this file's earlier re-stamp tests when
+ *     the two integrated).
  *
  *   #607 — a fence refusal ("workflow instance mismatch") meant the orchestrator's
  *     cached stamp was stale relative to the panel's LIVE identity, yet the advertised
@@ -18,7 +19,7 @@
  *
  * The harnesses extract the SHIPPING code from the panel monolith and drive it with
  * injected doubles, so the tests are about the code that actually runs (delete the
- * stamp / the re-stamp / the hook call and the matching test fails).
+ * stamp / the hook call and the matching test fails).
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -26,11 +27,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import {
-  graphRootProvenEmpty,
-  graphRootWorkflowUuidMatches,
-  graphRootMatchesState,
-} from "../../web/js/lib/graph-binding.js";
+import { graphRootProvenEmpty } from "../../web/js/lib/graph-binding.js";
 import { commandTargetsActiveWorkflow } from "../../web/js/lib/workflow-chat-identity.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -184,236 +181,6 @@ test("#606 workflow_new does NOT stamp an unserializable root, and a throwing st
     },
   });
   assert.equal((await workflow_new_throwing({ rid: "r2" })).created, true);
-});
-
-// ---------------------------------------------------------------------------
-// #606/#560 fix 2 — workflow_open's repaint proof: content first, then the tag.
-// A tag that did not ride loadGraphData/configure is re-stamped directly ONLY
-// under BOTH positive proofs: the load observably TRANSITIONED the root into the
-// loaded state (it did not match before), and no foreign tag is present.
-// ---------------------------------------------------------------------------
-
-/**
- * Drive the SHIPPING repaint-proof block (from the pre-load transition capture
- * through the proof chain, verbatim from the monolith) with a fake `app` whose
- * loadGraphData either applies the state to the live root or leaves a stale root
- * mounted. `preState` is what the root serializes to BEFORE the load; `postState`
- * what it serializes to after (when the load applies); `postTag` the identity tag
- * the root carries afterwards (absent / foreign / the target's own).
- */
-function buildOpenProofBlock({ preState, postState, postTag, loadApplies = true, active, target, targetUuid, repaintState, onStamp }) {
-  const marker = "const rootMatchedBeforeLoad = (() => {";
-  const start = SRC.indexOf(marker);
-  assert.notEqual(start, -1, "pre-load transition capture not found");
-  const endMarker = "\n          }\n        } catch (err) {";
-  const end = SRC.indexOf(endMarker, start);
-  assert.notEqual(end, -1, "repaint proof block end not found");
-  const block = SRC.slice(start, end);
-  const rootGraph = {
-    _nodes: [],
-    extra: {},
-    serialize: () => preState,
-  };
-  const app = {
-    graph: rootGraph,
-    loadGraphData: async () => {
-      if (!loadApplies) return; // stale root stays mounted (old/partial frontend)
-      rootGraph.serialize = () => postState;
-      rootGraph.extra = postTag ? { comfyui_mcp: { workflow_uuid: postTag } } : {};
-    },
-  };
-  const factory = new Function(
-    "app",
-    "getGraphCtx",
-    "activeWorkflowRef",
-    "graphRootMatchesState",
-    "graphRootWorkflowUuidMatches",
-    "stampGraphRootWorkflowUuid",
-    "WORKFLOW_META_NAMESPACE",
-    "WORKFLOW_UUID_FIELD",
-    "target",
-    "targetUuid",
-    "repaintState",
-    `let rebindFailed = null;\nreturn (async () => {\n${block}\nreturn { rebindFailed, rootGraph };\n})();`,
-  );
-  return factory(
-    app,
-    () => ({ rootGraph: app.graph }),
-    () => active,
-    graphRootMatchesState,
-    graphRootWorkflowUuidMatches,
-    onStamp,
-    "comfyui_mcp",
-    "workflow_uuid",
-    target,
-    targetUuid,
-    repaintState,
-  );
-}
-
-const TARGET_UUID = "22222222-2222-4222-8222-222222222222";
-// The state workflow_open loads (tag stamped into extra, as the monolith does).
-const REPAINT_STATE = {
-  nodes: [{ id: 1, type: "KSampler" }],
-  extra: { comfyui_mcp: { workflow_uuid: TARGET_UUID } },
-};
-// What the root serializes to after a faithful load: the repaint CONTENT (the
-// shape comparison excludes the tag, so this carries just the nodes).
-const LOADED_STATE = { nodes: [{ id: 1, type: "KSampler" }] };
-// A genuinely different prior canvas (the drifted-binding case).
-const STALE_STATE = { nodes: [{ id: 7, type: "VAELoader" }, { id: 8, type: "KSampler" }] };
-
-test("#606 workflow_open: load transitioned the root, tag did not ride, none present → direct re-stamp heals", async () => {
-  // The dialect this fixes: loadGraphData installed the exact repaint content
-  // (a PROVEN transition — the root held a different canvas before), but this
-  // frontend left the root's extra without the tag. Before the fix this was an
-  // unrecoverable "could not prove that the active canvas was rebound" — the
-  // dead-end remedy of #606.
-  const target = { path: "workflows/a.json" };
-  const stamps = [];
-  const { rebindFailed, rootGraph } = await buildOpenProofBlock({
-    preState: STALE_STATE,
-    postState: LOADED_STATE,
-    postTag: null,
-    active: target,
-    target,
-    targetUuid: TARGET_UUID,
-    repaintState: REPAINT_STATE,
-    onStamp: (root, uuid, owner) => {
-      stamps.push([root, uuid, owner]);
-      root.extra = { comfyui_mcp: { workflow_uuid: uuid } };
-    },
-  });
-  assert.equal(rebindFailed, null, "the rebind must succeed on a proven transition");
-  assert.equal(stamps.length, 1, "exactly one direct re-stamp");
-  assert.equal(stamps[0][1], TARGET_UUID);
-  assert.equal(stamps[0][2], target);
-  assert.equal(rootGraph.extra.comfyui_mcp.workflow_uuid, TARGET_UUID);
-});
-
-test("#606 workflow_open: tag already present after a faithful repaint → no extra stamp", async () => {
-  const target = { path: "workflows/a.json" };
-  const stamps = [];
-  const { rebindFailed } = await buildOpenProofBlock({
-    preState: STALE_STATE,
-    postState: LOADED_STATE,
-    postTag: TARGET_UUID,
-    active: target,
-    target,
-    targetUuid: TARGET_UUID,
-    repaintState: REPAINT_STATE,
-    onStamp: (...args) => stamps.push(args),
-  });
-  assert.equal(rebindFailed, null);
-  assert.equal(stamps.length, 0, "a tag that rode through needs no repair");
-});
-
-test("#606 workflow_open: a content mismatch NEVER reaches the re-stamp (the #349 fence stands)", async () => {
-  // The root holds a DIFFERENT graph than the state we loaded — the wrong-canvas
-  // case. The stamp must not fire: re-tagging a foreign canvas is exactly what
-  // the binding guard exists to prevent.
-  const target = { path: "workflows/a.json" };
-  const stamps = [];
-  const { rebindFailed, rootGraph } = await buildOpenProofBlock({
-    preState: STALE_STATE,
-    postState: STALE_STATE, // the load left the different-content root mounted
-    postTag: "uuid-foreign",
-    active: target,
-    target,
-    targetUuid: TARGET_UUID,
-    repaintState: REPAINT_STATE,
-    onStamp: (...args) => stamps.push(args),
-  });
-  assert.ok(rebindFailed instanceof Error, "content mismatch still refuses");
-  assert.match(rebindFailed.message, /could not prove that the active canvas was rebound/);
-  assert.equal(stamps.length, 0, "no re-stamp on unproven content");
-  assert.equal(rootGraph.extra.comfyui_mcp.workflow_uuid, "uuid-foreign", "the foreign tag is untouched");
-});
-
-test("#606 workflow_open: another tab winning the active slot refuses WITHOUT a stamp", async () => {
-  const target = { path: "workflows/a.json" };
-  const usurper = { path: "workflows/b.json" };
-  const stamps = [];
-  const { rebindFailed } = await buildOpenProofBlock({
-    preState: STALE_STATE,
-    postState: LOADED_STATE,
-    postTag: null,
-    active: usurper, // a switch interleaved with the open's awaits (#716)
-    target,
-    targetUuid: TARGET_UUID,
-    repaintState: REPAINT_STATE,
-    onStamp: (...args) => stamps.push(args),
-  });
-  assert.ok(rebindFailed instanceof Error);
-  assert.equal(stamps.length, 0);
-});
-
-test("#606 workflow_open: a root that will not hold the tag fails with the honest reason", async () => {
-  const target = { path: "workflows/a.json" };
-  const { rebindFailed } = await buildOpenProofBlock({
-    preState: STALE_STATE,
-    postState: LOADED_STATE,
-    postTag: null,
-    active: target,
-    target,
-    targetUuid: TARGET_UUID,
-    repaintState: REPAINT_STATE,
-    // Real-stamp semantics against a refusing root: the write throws in the
-    // browser's strict mode; model it as a throw here.
-    onStamp: () => {
-      throw new TypeError("Cannot add property, object is not extensible");
-    },
-  });
-  assert.ok(rebindFailed instanceof Error);
-  assert.match(rebindFailed.message, /would not take the workflow's identity tag/);
-});
-
-test("#606 workflow_open: a PRESENT foreign tag is NEVER re-stamped, even on a proven transition (codex P0)", async () => {
-  // The load applied, but the root carries a DIFFERENT workflow's tag. Claims
-  // cannot distinguish an open identical-content copy whose registration is
-  // missing from a closed tab's residue, and the binding guard's own doctrine
-  // refuses unclaimed tags — so any present foreign tag fails closed.
-  const target = { path: "workflows/a.json" };
-  const stamps = [];
-  const { rebindFailed, rootGraph } = await buildOpenProofBlock({
-    preState: STALE_STATE,
-    postState: LOADED_STATE,
-    postTag: "uuid-copy",
-    active: target,
-    target,
-    targetUuid: TARGET_UUID,
-    repaintState: REPAINT_STATE,
-    onStamp: (...args) => stamps.push(args),
-  });
-  assert.ok(rebindFailed instanceof Error, "a present foreign tag must fail closed");
-  assert.match(rebindFailed.message, /carries a different workflow's identity tag/);
-  assert.match(rebindFailed.message, /Reload the panel/);
-  assert.equal(stamps.length, 0, "no re-stamp over a foreign tag");
-  assert.equal(rootGraph.extra.comfyui_mcp.workflow_uuid, "uuid-copy", "the foreign tag survives");
-});
-
-test("#606 workflow_open: tag absent but NO transition (identical copy still mounted) fails closed (codex P0)", async () => {
-  // The root already matched the target's content BEFORE the load and the load
-  // left it untouched: no observable transition, so "our load applied" cannot be
-  // told apart from "a stale root holding an identical copy's canvas". Even with
-  // no tag present, the re-stamp must not fire.
-  const target = { path: "workflows/a.json" };
-  const stamps = [];
-  const { rebindFailed } = await buildOpenProofBlock({
-    preState: LOADED_STATE, // already identical BEFORE the load
-    postState: LOADED_STATE,
-    postTag: null,
-    loadApplies: false, // old/partial frontend: the load resolved but did nothing
-    active: target,
-    target,
-    targetUuid: TARGET_UUID,
-    repaintState: REPAINT_STATE,
-    onStamp: (...args) => stamps.push(args),
-  });
-  assert.ok(rebindFailed instanceof Error, "no transition ⇒ no proof the rebind happened");
-  assert.match(rebindFailed.message, /already held content identical/);
-  assert.match(rebindFailed.message, /Reload the panel/);
-  assert.equal(stamps.length, 0, "no re-stamp without a proven transition");
 });
 
 // ---------------------------------------------------------------------------

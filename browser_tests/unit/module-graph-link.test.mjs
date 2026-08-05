@@ -22,6 +22,14 @@ import {
 } from "../../web/js/lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing } from "../../web/js/lib/node-resolve.js";
 import { runSetWidget } from "../../web/js/lib/set-widget.js";
+import { composeShowMediaReply } from "../../web/js/lib/media-preview.js";
+import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame.js";
+
+// --- Mirror the shared bounded-step edge (#648) --------------------------------------
+// run-completion-frame.js and media-preview.js BOTH import withTimeout from here. If
+// that export is renamed or dropped, the completion frame and every video preview stop
+// linking — and neither has a syntax error to catch it.
+import { withTimeout } from "../../web/js/lib/bounded-step.js";
 
 // --- Mirror set-widget.js imports (the fix's internal module edges) -----------------
 import {
@@ -45,6 +53,12 @@ test("panel ↔ asset-staleness.js module edge links (incl. refreshComboOptionsF
 test("panel ↔ node-resolve.js / set-widget.js module edges link", () => {
   assert.equal(typeof assertAddNodeResolvableRefreshing, "function");
   assert.equal(typeof runSetWidget, "function");
+});
+
+test("panel ↔ media-preview.js / run-completion-frame.js ↔ bounded-step.js edges link (#648)", () => {
+  assert.equal(typeof composeShowMediaReply, "function");
+  assert.equal(typeof composeRunCompletionFrame, "function");
+  assert.equal(typeof withTimeout, "function");
 });
 
 test("set-widget.js ↔ widget-write.js / node-resolve.js module edges link", () => {

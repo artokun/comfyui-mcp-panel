@@ -118,6 +118,35 @@ export function queuePromptScopeArgs(partialTargets) {
   return [partialTargets, { queueNodeIds: partialTargets }];
 }
 
+/**
+ * The ordered DELIVERY ATTEMPTS for a run-to-node scope. The first two hand the
+ * scope to `app.queuePrompt` in each of its two documented third-argument
+ * shapes. The LAST one hands over the positional array again but also licenses
+ * the guard to write `partial_execution_targets` straight into this run's own
+ * /prompt body (repairScopeInBody) if it still has not arrived.
+ *
+ * The final attempt exists because refusing is the SAFE outcome for #556, not
+ * the CORRECT one: the caller asked for a subset and is entitled to get it. The
+ * request body is the one interface every frontend build shares, so repairing
+ * it there honours the request on builds whose `app.queuePrompt` wrapper drops
+ * the argument for any reason — including reasons this panel cannot see. It is
+ * ordered LAST so a frontend that delivers the scope natively always wins, and
+ * the panel only reaches for the body when the supported routes have failed.
+ *
+ * @param {string[]|undefined} partialTargets
+ * @returns {{arg: string[]|{queueNodeIds:string[]}|undefined, repair: boolean}[]}
+ */
+export function queuePromptScopeAttempts(partialTargets) {
+  if (!Array.isArray(partialTargets) || !partialTargets.length) {
+    return [{ arg: undefined, repair: false }];
+  }
+  return [
+    { arg: partialTargets, repair: false },
+    { arg: { queueNodeIds: partialTargets }, repair: false },
+    { arg: partialTargets, repair: true },
+  ];
+}
+
 // Two-seed 32-bit FNV-1a, concatenated — change-detection hashing only (no
 // security requirement): stable across key order (canonicalized before
 // hashing) and cheap enough to run once at queue time + once per observed post.
@@ -268,17 +297,73 @@ function bodyQueueMark(bodyText) {
   return Number.isFinite(n) ? n : null;
 }
 
-/** The body's partial_execution_targets as strings, or null when absent/empty/unparseable. */
-function targetsFromBody(bodyText) {
+/**
+ * WHY a POST /prompt body carries no usable scope — the OBSERVATION, kept
+ * distinct instead of folded into one verdict.
+ *
+ * The previous single "scope_missing" verdict covered FOUR different states
+ * and its message asserted one specific cause for all of them ("this frontend
+ * build ignored the run-to-node argument"). That assertion is a BUCKET
+ * narrated as a CAUSE, and the evidence says it is usually the wrong cause:
+ * every ComfyUI_frontend build from 1.42 through 1.50 demonstrably accepts
+ * BOTH `app.queuePrompt` third-argument shapes (the positional
+ * `NodeExecutionId[]` natively on older builds, and on newer builds through an
+ * `Array.isArray(optionsOrQueueNodeIds)` normalisation into
+ * `{ queueNodeIds }`), and both funnel into `api.queuePrompt`'s
+ * `options.partialExecutionTargets` → `body.partial_execution_targets`. Three
+ * separate field reports on #556 pasted that asserted cause verbatim into the
+ * tracker, which is precisely why the real cause is still unknown.
+ *
+ * So the states are now reported separately, the message states only what was
+ * OBSERVED, and the body's top-level keys ride along as evidence.
+ *
+ * `body_unreadable` and `body_not_an_object` are deliberately separate (codex
+ * gate r2): a JSON scalar, `null`, or an array PARSES fine — saying it "could
+ * not be parsed" would report a definite negative about an operation that
+ * actually succeeded, which is the same collapse this split exists to remove.
+ *
+ * REACHABILITY, stated plainly rather than implied: neither of those two states
+ * can reach the guard's refusal path today, and that is by construction, not by
+ * luck. The guard's FIRST test is run identity — this run's unique queue mark,
+ * read from the body's top-level `number`. A body that will not parse, or that
+ * parses to a scalar/array, cannot carry that mark, so it is FOREIGN traffic:
+ * passed through untouched, never refused, never repaired, never observed. The
+ * two states therefore exist for correctness of the classification itself (and
+ * for any future caller that reads a body it has already attributed some other
+ * way), and the tests pin BOTH the classification and the pass-through.
+ *
+ * @typedef {"present"|"absent"|"empty"|"not_a_list"|"body_unreadable"|"body_not_an_object"} ScopeReadState
+ * @returns {{state: ScopeReadState, targets: string[]|null, bodyKeys: string[]|null, raw: unknown}}
+ */
+export function readScopeFromBody(bodyText) {
   let body;
   try {
     body = JSON.parse(bodyText);
   } catch {
-    return null;
+    return { state: "body_unreadable", targets: null, bodyKeys: null, raw: undefined };
   }
-  const t = body?.partial_execution_targets;
-  if (!Array.isArray(t) || !t.length) return null;
-  return t.map(String);
+  // An array parses and has keys, but it is not a prompt request; treat it with
+  // the scalars rather than letting Object.keys present indices as body keys.
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { state: "body_not_an_object", targets: null, bodyKeys: null, raw: body };
+  }
+  const bodyKeys = Object.keys(body).sort();
+  const t = body.partial_execution_targets;
+  // "absent" means the key is genuinely not there. JSON cannot encode
+  // `undefined`, so after a parse `undefined` is exactly "no such key". An
+  // explicit `null` is a key that IS present carrying an unusable value —
+  // reporting that as "no partial_execution_targets key at all" would
+  // contradict the body keys printed alongside it, and would be this module's
+  // own defect class (an observation collapsed into a definite negative).
+  if (t === undefined) return { state: "absent", targets: null, bodyKeys, raw: t };
+  if (!Array.isArray(t)) return { state: "not_a_list", targets: null, bodyKeys, raw: t };
+  if (!t.length) return { state: "empty", targets: null, bodyKeys, raw: t };
+  return { state: "present", targets: t.map(String), bodyKeys, raw: t };
+}
+
+/** The body's partial_execution_targets as strings, or null when absent/empty/not-a-list/unparseable. */
+function targetsFromBody(bodyText) {
+  return readScopeFromBody(bodyText).targets;
 }
 
 function sameSet(a, b) {
@@ -306,28 +391,164 @@ export function verifyScopedPromptBody(bodyText, expectedExecIds) {
 }
 
 /**
+ * REPAIR the scope into a POST /prompt body we have already ATTRIBUTED to this
+ * run (its unique queue mark AND its content hash both match), when the body
+ * reached the wire without a usable `partial_execution_targets`.
+ *
+ * This is what turns #556's outcome from "refuse and explain" into "honour the
+ * request". `partial_execution_targets` is a plain top-level key of the /prompt
+ * body — the one place every ComfyUI_frontend build must put the scope,
+ * whatever shape its `app.queuePrompt` wrapper takes — so writing it here works
+ * on any build, present or future, including one whose wrapper drops the
+ * argument entirely. The alternative at this point is NOT a full-graph run (the
+ * guard blocks that unconditionally); it is a refusal. So repair can only ever
+ * improve the outcome, and never widens what executes: the targets written are
+ * exactly the ones graph_run resolved.
+ *
+ * The repair is ITSELF an operation that can fail, so it verifies its own
+ * output: the rewritten text is re-parsed and re-checked, and anything short of
+ * a clean pass returns null so the caller refuses instead of forwarding an
+ * unverified body. `prompt` is untouched, so the content hash still matches.
+ *
+ * @param {string|undefined} bodyText
+ * @param {string[]} expectedExecIds
+ * @returns {string|null} the repaired body text, or null when repair is impossible
+ */
+export function repairScopeInBody(bodyText, expectedExecIds) {
+  const expected = (expectedExecIds ?? []).map(String);
+  if (!expected.length) return null;
+  let body;
+  try {
+    body = JSON.parse(bodyText);
+  } catch {
+    return null;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  let text;
+  try {
+    text = JSON.stringify({ ...body, partial_execution_targets: expected.slice() });
+  } catch {
+    return null;
+  }
+  // Re-read what we just produced: a repair that cannot be verified is not a
+  // repair. Never hand on a body we have not confirmed carries the scope.
+  if (!verifyScopedPromptBody(text, expected).ok) return null;
+  return text;
+}
+
+/**
+ * Render an arbitrary observed value for a human-readable message WITHOUT ever
+ * throwing (codex gate r2, P1).
+ *
+ * `JSON.stringify` is not a safe formatter for a value that came off the wire:
+ * a deeply nested object throws RangeError, a BigInt throws TypeError, a
+ * circular structure throws. This function sat between the guard's decision to
+ * refuse and the recording of that refusal, so a throw here escaped the guard
+ * with the refusal budget already spent — and on the next attributed scopeless
+ * post the exhausted-budget path forwarded it UNCHANGED, i.e. a full-graph run.
+ * A guard that can throw is not a guard.
+ *
+ * Bounded in length too: this string goes into an error a caller reads.
+ *
+ * NOTE on reproducibility (be honest about what is proven): the depth-based
+ * trigger codex found is engine- and stack-dependent. `JSON.stringify` DOES
+ * throw RangeError on a ~5000-deep value when called from a shallow stack on
+ * this Node, but from inside the guard's async call chain it survived 150k
+ * levels — V8's stringify is iterative there. So the exploit is real but not
+ * deterministically reproducible from the guard's entry point on this engine.
+ * The contract enforced by the tests is therefore the one that matters and can
+ * be proven: this function NEVER throws, for any input. Exported for that test.
+ */
+export function describeObserved(value) {
+  try {
+    const text = JSON.stringify(value);
+    if (typeof text === "string") return text.length > 200 ? `${text.slice(0, 200)}…` : text;
+    return String(typeof value); // undefined / function / symbol — stringify returns undefined
+  } catch {
+    // Unserializable (too deep, circular, BigInt). Say what it was, not what it said.
+    try {
+      return Array.isArray(value) ? `an unserializable array` : `an unserializable ${typeof value} value`;
+    } catch {
+      return "an unserializable value";
+    }
+  }
+}
+
+/**
+ * What was OBSERVED about the scope in our own dispatch — one clause per
+ * distinct state, asserting nothing beyond the observation. See
+ * readScopeFromBody for why these are no longer one bucket.
+ *
+ * Every interpolation goes through describeObserved: this runs on the refusal
+ * path, and the refusal path must not be able to fail.
+ */
+function scopeObservation(verdict) {
+  switch (verdict?.reason) {
+    case "scope_mismatch":
+      return (
+        `the POST /prompt body carried partial_execution_targets ` +
+        `${describeObserved(verdict.got)} instead of ${describeObserved(verdict.expected)}`
+      );
+    case "scope_not_a_list":
+      return (
+        `the POST /prompt body's partial_execution_targets was not a list ` +
+        `(${describeObserved(verdict.raw)}) — the requested scope did not survive ` +
+        `the trip through app.queuePrompt in a usable shape`
+      );
+    case "scope_empty":
+      return `the POST /prompt body carried an EMPTY partial_execution_targets list`;
+    case "body_unreadable":
+      return `the POST /prompt body could not be parsed, so the scope could not be read from it`;
+    case "body_not_an_object":
+      return (
+        `the POST /prompt body parsed, but it was not a request object ` +
+        `(${describeObserved(verdict.raw)}), so it carries no scope to read`
+      );
+    default:
+      return (
+        `the POST /prompt body carried no partial_execution_targets key at all` +
+        (verdict?.bodyKeys?.length ? ` (body keys: ${verdict.bodyKeys.join(", ")})` : "")
+      );
+  }
+}
+
+/**
  * The truthful refusal message when our own dispatch surfaced WITHOUT the
  * scope. Names the node that couldn't be scoped and states plainly that
  * NOTHING was queued — never a false `queued:true`/`ran_to_node` for what
  * would have been a full-graph run.
+ *
+ * It reports the OBSERVATION and, where the cause is not observable from here,
+ * enumerates the candidates rather than asserting whichever one it happened to
+ * name. It also gives a remedy that works from where the caller is standing:
+ * the scope is what could not be delivered, so the run that CAN still be made
+ * is the unscoped one — stated as a choice with its cost, never taken silently.
  */
 export function scopeDroppedError({ toNodeId, verdict }) {
-  const detail =
-    verdict?.reason === "graph_changed"
-      ? `the workflow graph CHANGED after the run was queued — the deferred ` +
-        `dispatch would render a modified workflow, not the one that was scoped. ` +
-        `Retrying is safe (nothing was queued); if this recurs without any edit in ` +
-        `between, a queue-time widget hook is mutating values between serialization ` +
-        `and dispatch (e.g. a control_after_generate widget with WidgetControlMode ` +
-        `"before" — switch it to "after" or fix the target widget's value)`
-      : verdict?.reason === "scope_mismatch"
-        ? `the POST /prompt body carried partial_execution_targets ` +
-          `${JSON.stringify(verdict.got)} instead of ${JSON.stringify(verdict.expected)}`
-        : `the POST /prompt body carried no partial_execution_targets — this ` +
-          `frontend build ignored the run-to-node argument`;
+  if (verdict?.reason === "graph_changed") {
+    return (
+      `run-to-node scope for node ${toNodeId} was NOT applied: the workflow graph ` +
+      `CHANGED after the run was queued — the deferred dispatch would render a ` +
+      `modified workflow, not the one that was scoped. Retrying is safe (nothing ` +
+      `was queued); if this recurs without any edit in between, a queue-time widget ` +
+      `hook is mutating values between serialization and dispatch (e.g. a ` +
+      `control_after_generate widget with WidgetControlMode "before" — switch it to ` +
+      `"after" or fix the target widget's value). ` +
+      `Nothing was queued — refusing to fall through to a full-graph execution (#556).`
+    );
+  }
   return (
-    `run-to-node scope for node ${toNodeId} was NOT applied: ${detail}. ` +
-    `Nothing was queued — refusing to fall through to a full-graph execution (#556).`
+    `run-to-node scope for node ${toNodeId} was NOT applied: ${scopeObservation(verdict)}. ` +
+    `Every delivery route was tried — the positional NodeExecutionId[] argument, the ` +
+    `QueuePromptOptions { queueNodeIds } argument, and writing partial_execution_targets ` +
+    `directly into this run's own /prompt body — and the scope still did not reach the ` +
+    `request, so the panel cannot say which layer dropped it from here. ` +
+    `Nothing was queued — refusing to fall through to a full-graph execution (#556). ` +
+    `To render this branch now, either run it unscoped (panel_run without to_node_id, ` +
+    `which executes the WHOLE graph — every other output branch included, at full GPU/API ` +
+    `cost) or delete/bypass the output nodes you do not want and run unscoped. ` +
+    `Please report this with the body keys above — this path is not reproducible against ` +
+    `ComfyUI_frontend 1.42–1.50, where both argument shapes are honoured.`
   );
 }
 
@@ -360,7 +581,7 @@ export function scopeUnattributableError({ toNodeId }) {
  *    verified prompts DID queue (scoped); only the unverified remainder is
  *    in doubt.
  */
-export function scopeUnverifiedError({ toNodeId, timeoutMs, cancelled = false, verified = 0, batch = 1 }) {
+export function scopeUnverifiedError({ toNodeId, timeoutMs, cancelled = false, verified = 0, batch = 1, inFlight = 0 }) {
   const count =
     verified > 0
       ? ` (${verified} of ${batch} batch prompts WERE verified and are queued with the scope)`
@@ -369,13 +590,29 @@ export function scopeUnverifiedError({ toNodeId, timeoutMs, cancelled = false, v
     `run-to-node scope for node ${toNodeId} could not be verified: no scoped ` +
     `dispatch was observed within ${Math.round(timeoutMs / 1000)}s of queueing ` +
     `(the frontend deferred or silently dropped the request)${count}. `;
+  // IN FLIGHT ≠ NEVER SENT (codex gate r9). A correctly-scoped request that has
+  // already left the panel but whose response has not come back yet is neither
+  // verified nor absent — it may be accepted a moment from now. Saying "nothing
+  // was queued" about it is a definite negative we cannot observe, and the
+  // caller acting on it re-renders a branch that is already running.
+  const inFlightNote =
+    inFlight > 0
+      ? `${inFlight} correctly-scoped request(s) had ALREADY LEFT the panel and were ` +
+        `still awaiting a response when the wait expired — those may yet be accepted by ` +
+        `ComfyUI, so this is NOT a report that nothing was queued. Check the ComfyUI ` +
+        `queue before retrying. `
+      : "";
   if (cancelled) {
     return (
       base +
+      inFlightNote +
       `The still-pending queue item was located and REMOVED, so nothing ` +
-      `${verified > 0 ? "more " : ""}was queued and no scope-dropped full-graph dispatch can execute — retry the run (#556).`
+      `${verified > 0 || inFlight > 0 ? "more " : ""}was queued from the pending item and no ` +
+      `scope-dropped full-graph dispatch can execute` +
+      (inFlight > 0 ? ` (#556).` : ` — retry the run (#556).`)
     );
   }
+  if (inFlightNote) return base + inFlightNote + `The scope guard stays installed as a sentinel (#556).`;
   return (
     base +
     `The pending queue item could not be removed on this frontend, so the scope ` +
@@ -431,13 +668,28 @@ function isPromptPost(route, options) {
  * was malformed (no parseable prompt_id, no rejection body). That post is NOT
  * verified and NOT a server rejection — the run must never report queued:true
  * for it. Names what failed and how much of the batch was confirmed first.
+ *
+ * DISCLOSURE, NOT A DENIAL (codex gate r7, P0-4). This message used to end
+ * "this prompt did not reach ComfyUI" — a definite negative the panel cannot
+ * observe, and one that now contradicts the module's own handling: a thrown
+ * fetch is recorded as INDETERMINATE precisely because the throw can happen
+ * AFTER ComfyUI received and queued the prompt (a reset while reading the
+ * response is indistinguishable from one before the request left). Telling the
+ * caller it did not run makes them do the reasonable thing — resubmit — and
+ * pay twice in GPU time or API credits for a render that may already be
+ * running. Refuse vs disclose: once the request may have left, the only honest
+ * answer is what is known and what is not, plus where to look.
  */
 export function scopeDispatchError({ toNodeId, detail, verified, batch }) {
   return (
     `run-to-node scope for node ${toNodeId}: a verified-scoped /prompt request ` +
     `FAILED to complete — ${detail}. ${verified} of ${batch} batch prompts were ` +
-    `confirmed queued before the failure. The run is NOT reported as queued: ` +
-    `this prompt did not reach ComfyUI, and no full-graph dispatch occurred (#556).`
+    `confirmed queued before the failure. This one is NOT confirmed queued — but ` +
+    `it had already left the panel, so whether ComfyUI accepted it CANNOT be ` +
+    `determined from here: it may be queued or running right now. Check the ` +
+    `ComfyUI queue before resubmitting, or a retry may render the branch twice. ` +
+    `What IS certain: the request carried the run-to-node scope, so no full-graph ` +
+    `dispatch occurred (#556).`
   );
 }
 
@@ -520,9 +772,19 @@ export function createRunFetchInterceptor({ origFetchApi, onRejection = null, on
  *                                   edit, or the deferred serialization
  *                                   picking up a modified graph): refused
  *                                   before it leaves, batch-bounded.
- * state = { observed, rejected, refused, dropped, droppedReason, failed } is
- * live; waitForVerdict(ms) resolves true at any terminal state, false on
- * timeout.
+ *
+ * REPAIR (`repairScope`, the final dispatch attempt): when the body is OURS
+ * (mark AND content hash both match) and carries no usable scope, the guard
+ * WRITES the resolved targets into the body and forwards it, instead of
+ * refusing — see repairScopeInBody. This is what lets #556 end in the
+ * PREFERRED outcome (the requested subset actually runs) rather than the
+ * merely-safe one (a refusal). It is never a widening: a scope MISMATCH — a
+ * body carrying targets we did not ask for — is never overwritten, and an
+ * unreadable body is never repaired; both still refuse.
+ *
+ * state = { observed, repaired, rejected, refused, dropped, droppedReason,
+ * failed } is live; waitForVerdict(ms) resolves true at any terminal state,
+ * false on timeout.
  */
 export function createScopedRunGuard({
   origFetchApi,
@@ -532,19 +794,26 @@ export function createScopedRunGuard({
   batch = 1,
   toNodeId = null,
   queueMark,
+  repairScope = false,
   onRejection = null,
   onPromptId = null,
   onScopeDropped = null,
 } = {}) {
   const expected = (execIds ?? []).map(String);
   const maxBatch = Math.max(1, Math.floor(Number(batch)) || 1);
-  const state = { observed: 0, rejected: 0, refused: 0, dropped: null, droppedReason: null, failed: null };
+  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, inFlight: 0, indeterminate: 0, closed: false, retired: false, dropped: null, droppedReason: null, failed: null };
   const waiters = new Set();
   const notify = () => {
     for (const fire of [...waiters]) fire();
   };
 
   const guard = async (route, options) => {
+    // RETIRED (codex gate r8): this attempt has handed over to a LATER attempt
+    // of the same run, which is now installed above us in the chain and owns
+    // this mark. We must not also act on it — two live guards for one mark
+    // would double-count a forwarded post, or refuse our own successor's
+    // repaired body. Retired means fully transparent, forever.
+    if (state.retired) return origFetchApi(route, options);
     if (!isPromptPost(route, options)) return origFetchApi(route, options);
     // RUN IDENTITY FIRST: no mark ⇒ not ours ⇒ never touch it. This is what
     // keeps a user's full run of the SAME graph, or another scoped run with
@@ -552,18 +821,102 @@ export function createScopedRunGuard({
     if (bodyQueueMark(options?.body) !== queueMark) {
       return origFetchApi(route, options);
     }
-    const targets = targetsFromBody(options?.body);
+    // BATCH QUOTA (codex gate r3). This run asked for `maxBatch` prompts. An
+    // attributed post BEYOND that is work nobody requested — the requested
+    // branch executed again, at real GPU/API cost, while graph_run still
+    // reports batch_count as what was asked for. The old batch bound was purely
+    // OBSERVATIONAL: it stopped the orchestration waiting, but never stopped a
+    // post leaving. That was already true for a natively-scoped duplicate, and
+    // the repair would have widened it — turning a duplicate that used to be
+    // refused (its scope was dropped) into one that dispatches. So the bound is
+    // now a FENCE on dispatch, checked before the repair and before any
+    // forwarding.
+    //
+    // Only completed work counts toward the quota: `observed` (queued) and
+    // `rejected` (ComfyUI said no — that prompt is spent). A `failed` post never
+    // reached ComfyUI, so a later post of the same batch is legitimately still
+    // owed and must not be fenced out.
+    // CLOSED (codex gate r5): the orchestration has already RETURNED and told
+    // the caller what happened. The report is itself a fence — a post that
+    // dispatches after it contradicts what the caller was told, and a caller
+    // instructed to "re-run only the remaining N" would then get those N twice.
+    // So a closed guard refuses every attributed post, whatever the quota says.
+    if (state.closed || state.observed + state.rejected + state.indeterminate + state.inFlight >= maxBatch) {
+      state.overrun++;
+      if (state.overrunError == null) {
+        state.overrunError = state.closed
+          ? `run-to-node scope for node ${toNodeId}: a /prompt post carrying this run's ` +
+            `identity arrived AFTER the run's outcome had already been reported. It was ` +
+            `refused rather than dispatched — executing it would contradict the result the ` +
+            `caller was given, and could double-render the branch alongside their retry (#556).`
+          : `run-to-node scope for node ${toNodeId}: an EXTRA /prompt post carrying this ` +
+            `run's identity arrived after all ${maxBatch} requested prompt(s) were already ` +
+            `accounted for. It was refused rather than dispatched — queueing it would have ` +
+            `executed the requested branch more times than asked, at real GPU/API cost. ` +
+            `The requested prompts are queued and unaffected (#556).`;
+      }
+      notify();
+      return SCOPE_DROPPED_RESPONSE();
+    }
+    const scopeRead = readScopeFromBody(options?.body);
+    let targets = scopeRead.targets;
     const contentOk =
       contentHash && promptContentHashFromBody(options?.body, volatileInputs) === contentHash;
+    // SCOPE REPAIR — only for a body already attributed to THIS run (mark +
+    // content hash), only when no usable scope is present (absent / empty /
+    // not-a-list), and only on the attempt that asked for it. A body carrying
+    // DIFFERENT targets is a mismatch we do not understand and must not
+    // overwrite; an unparseable body cannot be repaired. Both fall through to
+    // the refusal below, exactly as before.
+    let forwardOptions = options;
+    if (
+      repairScope &&
+      contentOk &&
+      !targets &&
+      // ONLY a genuinely ABSENT key (codex gate r7, P0-1). Previously `empty`
+      // and `not_a_list` were repaired too, which broke this module's own rule
+      // that a scope we did not put there is never overwritten. `[]`, `null`,
+      // `"14"`, and especially `{ queueNodeIds: [...] }` are PRESENT values in
+      // a shape we did not expect — the last looks like another layer's scope
+      // convention, not an absence. Absence is ours to fill; a present value we
+      // cannot interpret is someone else's data, and rewriting it would be
+      // executing our intent over a request that said something different.
+      // Those states now fall through to the refusal, which names what it saw.
+      scopeRead.state === "absent"
+    ) {
+      const repairedBody = repairScopeInBody(options?.body, expected);
+      if (repairedBody != null) {
+        forwardOptions = { ...options, body: repairedBody };
+        targets = expected.slice();
+        state.repaired++;
+      }
+    }
     if (contentOk && targets && sameSet(targets, expected)) {
       // OUR scoped dispatch. It counts as VERIFIED only when the fetch itself
       // completes with a real 200 + prompt_id (r6) — a thrown fetch or a
       // malformed response is a terminal dispatch FAILURE, never a success;
       // a genuine server rejection flows through the established #358 channel.
+      //
+      // RESERVE THE QUOTA SLOT BEFORE FORWARDING (codex gate r4). Counting only
+      // COMPLETED requests left the fence racy: two same-mark posts issued
+      // concurrently both read observed=0, both passed the quota, and both were
+      // forwarded — executing the requested branch twice while reporting no
+      // overrun. The reservation is taken here, synchronously, before the await,
+      // so a second concurrent post sees the slot already taken.
+      state.inFlight++;
       let res;
       try {
-        res = await origFetchApi(route, options);
+        res = await origFetchApi(route, forwardOptions);
       } catch (err) {
+        // INDETERMINATE, not "never arrived" (codex gate r6). A fetch can throw
+        // after ComfyUI already received and queued the prompt — a reset while
+        // reading the response looks identical to one before the request left.
+        // Treating the throw as proof of non-arrival is this cluster's defect
+        // class exactly, and acting on it re-dispatches a branch that may
+        // already be rendering. So the slot stays CONSUMED and the outcome is
+        // recorded as unknown, which is what it is.
+        state.inFlight--;
+        state.indeterminate++;
         if (state.failed == null) {
           state.failed = scopeDispatchError({
             toNodeId,
@@ -576,17 +929,26 @@ export function createScopedRunGuard({
         throw err; // the frontend sees exactly the failure it would have seen
       }
       const verdict = await classifyRunResponse(res, { onRejection, onPromptId });
+      // The request DID leave, so the reservation is now settled into a
+      // definite outcome. A malformed response keeps the slot consumed on
+      // purpose: the post reached ComfyUI and MAY have queued, and re-forwarding
+      // on that uncertainty is how a branch gets rendered twice. "Could not
+      // determine whether it queued" is not "determined it did not".
+      state.inFlight--;
       if (verdict === "accepted") {
         state.observed++;
       } else if (verdict === "rejected") {
         state.rejected++;
-      } else if (state.failed == null) {
-        state.failed = scopeDispatchError({
-          toNodeId,
-          detail: `the /prompt response was malformed (HTTP ${res?.status ?? "?"}, no prompt_id and no rejection body)`,
-          verified: state.observed,
-          batch: maxBatch,
-        });
+      } else {
+        state.indeterminate++;
+        if (state.failed == null) {
+          state.failed = scopeDispatchError({
+            toNodeId,
+            detail: `the /prompt response was malformed (HTTP ${res?.status ?? "?"}, no prompt_id and no rejection body)`,
+            verified: state.observed,
+            batch: maxBatch,
+          });
+        }
       }
       notify();
       return res;
@@ -594,26 +956,83 @@ export function createScopedRunGuard({
     // OUR dispatch CORRUPTED. Content drift (r7) takes naming precedence: a
     // changed graph would render the wrong workflow even with the scope
     // intact. Then the scope itself: missing, or wrong/extra/partial targets.
-    if (state.refused < maxBatch) {
-      state.refused++;
-      if (state.dropped == null) {
-        const verdict = !contentOk
-          ? { ok: false, reason: "graph_changed" }
-          : targets
-            ? { ok: false, reason: "scope_mismatch", expected, got: targets }
-            : { ok: false, reason: "scope_missing", expected, got: null };
-        state.droppedReason = verdict.reason;
+    //
+    // REFUSE FIRST, DESCRIBE AFTER (codex gate r2, P1). The refusal is the
+    // thing that makes this post safe; the message is only its description.
+    // Recording the message used to sit BETWEEN spending the refusal budget
+    // and returning the refusal, so a throw while formatting an observed value
+    // escaped the guard with the budget already spent — and the next
+    // attributed post then took the exhausted-budget path and was FORWARDED,
+    // scopeless, as a full graph. The budget is now spent only alongside a
+    // recorded message, and the description is fenced so it cannot throw at
+    // all (describeObserved) AND cannot escape if a future edit reintroduces a
+    // throw (the catch below).
+    if (state.dropped == null) {
+      // Report the OBSERVATION, not a bucket: which of the distinct
+      // no-usable-scope states actually occurred (readScopeFromBody), with
+      // the body's top-level keys as evidence for the next report.
+      const verdict = !contentOk
+        ? { ok: false, reason: "graph_changed" }
+        : targets
+          ? { ok: false, reason: "scope_mismatch", expected, got: targets }
+          : {
+              ok: false,
+              reason:
+                scopeRead.state === "not_a_list"
+                  ? "scope_not_a_list"
+                  : scopeRead.state === "empty"
+                    ? "scope_empty"
+                    : scopeRead.state === "body_unreadable"
+                      ? "body_unreadable"
+                      : scopeRead.state === "body_not_an_object"
+                        ? "body_not_an_object"
+                        : "scope_missing",
+              expected,
+              got: null,
+              raw: scopeRead.raw,
+              bodyKeys: scopeRead.bodyKeys,
+            };
+      state.droppedReason = verdict.reason;
+      try {
         state.dropped = scopeDroppedError({ toNodeId, verdict });
+      } catch {
+        // The description failed; the REFUSAL must not. Never leave
+        // state.dropped null here — a null would re-enter this branch on the
+        // next post and could spend the whole batch's budget describing.
+        state.dropped =
+          `run-to-node scope for node ${toNodeId} was NOT applied and the reason could ` +
+          `not be described. Nothing was queued — refusing to fall through to a ` +
+          `full-graph execution (#556).`;
+      }
+      state.refused++;
+      try {
         onScopeDropped?.(state.dropped);
+      } catch {
+        // A caller's notification failure must not turn a refusal into a forward.
       }
       notify();
       return SCOPE_DROPPED_RESPONSE();
     }
-    // Refusal budget for this batch is exhausted (paranoia bound; normally the
-    // frontend's batch loop breaks on the first refusal).
-    return origFetchApi(route, options);
+    // Already refused once in this batch: still OUR corrupted post, so it is
+    // still refused. Only the RECORDING is bounded (one message per attempt) —
+    // the budget never licensed dispatching a scopeless full graph, and letting
+    // it do so is the #556 harm itself.
+    if (state.refused < maxBatch) state.refused++;
+    notify();
+    return SCOPE_DROPPED_RESPONSE();
   };
   guard.state = state;
+  // Called by the orchestration when it RETURNS: from here on this run has an
+  // answer, and no further post of it may execute.
+  guard.close = () => {
+    state.closed = true;
+  };
+  // Called when a LATER attempt of the SAME run takes over: this guard becomes
+  // permanently transparent instead of being unhooked, so the chain below it
+  // (which may include ANOTHER run's live sentinel) is never disturbed.
+  guard.retire = () => {
+    state.retired = true;
+  };
   // Verdict = the run reached a TERMINAL state: the whole batch verified, a
   // genuine server rejection arrived, a dispatch failure occurred (r6), or a
   // corrupted post ended the attempt (the frontend's batch loop breaks on the
@@ -706,8 +1125,26 @@ export async function dispatchScopedRun({
   onPromptId = null,
 } = {}) {
   const mark = queueMark ?? newScopedQueueMark();
-  const prevFetchApi = typeof apiTarget?.fetchApi === "function" ? apiTarget.fetchApi : null;
-  const origFetchApi = prevFetchApi ? prevFetchApi.bind(apiTarget) : null;
+  // CHAIN COMPOSITION (codex gate r8). Both the entry-time capture below and
+  // the per-attempt restore used to be WRONG in the presence of a concurrent
+  // run:
+  //
+  //   A installs GA1 over raw fetch and waits for its deferred first attempt.
+  //   B starts, captures GA1 as its chain, succeeds, and retains GB as the
+  //   current sentinel. A's deferred post arrives scopeless, GA1 refuses it,
+  //   and A retries — whereupon A's `finally` restored A's ENTRY-TIME
+  //   fetchApi (raw), CLOBBERING GB, and A's next guard also delegated to A's
+  //   entry-time raw fetch, bypassing B entirely. A late B post then passed
+  //   through as foreign and reached raw fetch scopeless: full graph.
+  //
+  // Two rules fix it, and both are needed:
+  //   1. A guard delegates to whatever was CURRENT when it was installed, not
+  //      to what was current when the run began (captured per attempt below).
+  //   2. A superseded attempt is RETIRED — made permanently transparent — and
+  //      never unhooked. Nothing in this module writes apiTarget.fetchApi back
+  //      to an older value any more, so no run can displace another's guard.
+  const entryFetchApi = typeof apiTarget?.fetchApi === "function" ? apiTarget.fetchApi : null;
+  const origFetchApi = entryFetchApi ? entryFetchApi.bind(apiTarget) : null;
   if (!origFetchApi) {
     return {
       outcome: "unverifiable",
@@ -752,17 +1189,42 @@ export async function dispatchScopedRun({
     // non-extensible array — cancellation will report 0 and the sentinel covers it.
   }
   let dropped = null;
-  for (const scopeArg of queuePromptScopeArgs(execIds)) {
+  const attempts = queuePromptScopeAttempts(execIds);
+  for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex++) {
+    const { arg: scopeArg, repair } = attempts[attemptIndex];
+    const isLastAttempt = attemptIndex === attempts.length - 1;
     dropped = null;
-    let keepGuardInstalled = false;
+    // DEFAULT TO KEEPING THE FENCE (codex gate r7, P0-2). This used to start
+    // false, so any exit that did not reach the terminal-path logic — most
+    // importantly `app.queuePrompt` THROWING partway through, after it had
+    // already emitted a scoped post — unwound through the `finally` and
+    // RESTORED raw fetchApi. A deferred duplicate carrying this run's mark
+    // could then post with no scope and run the full graph.
+    //
+    // The ordering rule, in its teardown direction: a fence must not be
+    // removed before something has decided it is no longer needed. The
+    // `finally` always runs; the decision may never. So the decision is now
+    // the one that has to fire — `retireGuard` is set explicitly on the only
+    // exit where this attempt's guard may stand down (handing over to another
+    // attempt of this same run, which installs its own guard on the same mark
+    // immediately). Standing down means RETIRING (transparent), never
+    // unhooking: see the chain-composition note at the top of this function.
+    let retireGuard = false;
+    // The chain this guard delegates to is whatever is installed RIGHT NOW —
+    // which may be another run's live sentinel, or our own previous attempt.
+    // Capturing the run's entry-time fetchApi here instead would bypass a
+    // newer run's guard entirely (r8 P0).
+    const chainBelow =
+      typeof apiTarget.fetchApi === "function" ? apiTarget.fetchApi.bind(apiTarget) : origFetchApi;
     const guard = createScopedRunGuard({
-      origFetchApi,
+      origFetchApi: chainBelow,
       execIds,
       contentHash,
       volatileInputs,
       batch,
       toNodeId,
       queueMark: mark,
+      repairScope: repair,
       onRejection,
       onPromptId,
     });
@@ -777,32 +1239,54 @@ export async function dispatchScopedRun({
         await guard.waitForVerdict(verifyTimeoutMs);
       }
       if (!guard.verdictReached()) {
-        // GIVE-UP — decided HERE, inside the try, so the finally below honors
-        // keepGuardInstalled. The deferred item may still be live in the
+        // GIVE-UP. The guard stays (that is now the default — the finally only
+        // ever stands it down when handing over to another attempt of this same
+        // run, which this is not). The deferred item may still be live in the
         // frontend's pending queue: try to REMOVE it (ownership tag AND this
         // run's mark both checked), and only when that's impossible keep the
         // surgical guard installed for the PAGE SESSION as a sentinel — NO
         // expiry timer (r4): the uncancellable item can post whenever the
         // stalled processor resumes, so the refusal must not go away. Safe by
         // construction: the sentinel only ever acts on THIS run's unique mark.
+        //
+        // P0-3 (codex gate r7): a successful cancel is NOT grounds to tear the
+        // fence down. `removed > 0` proves only that tagged entries STILL IN
+        // app.queueItems were spliced. It says nothing about an item the
+        // frontend has already copied, popped, or scheduled — and if such a
+        // same-mark item exists alongside one that was still removable,
+        // restoring raw fetchApi lets that copy post scopeless later. Positive
+        // evidence about the items we COULD see is not evidence about the ones
+        // we could not. So the sentinel stays either way; the cancel result
+        // only changes what we can honestly CLAIM about what was queued.
         const verified = guard.state.observed;
+        // STILL IN FLIGHT is its own state (codex gate r9). A busy frontend can
+        // fire-and-forget a correctly-scoped POST and return; if the server has
+        // not answered by the time the wait expires, that request HAS left the
+        // panel and may still be accepted. Reporting the run as "nothing
+        // queued" then is a definite negative about something unobserved, and a
+        // caller acting on it re-renders a branch that is already running. It is
+        // surfaced so graph_run can omit `queued` rather than assert it false.
+        const inFlight = guard.state.inFlight;
         const cancel = cancelPendingScopedQueueItem(app, { runTag, queueMark: mark });
         if (cancel.removed > 0) {
           return {
             outcome: "unverified",
             queueMark: mark,
             verified,
+            indeterminate: guard.state.indeterminate,
+            inFlight,
             volatileInputs: volatileList,
-            error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: true, verified, batch }),
+            error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: true, verified, batch, inFlight }),
           };
         }
-        keepGuardInstalled = true;
         return {
           outcome: "unverified",
           queueMark: mark,
           verified,
+          indeterminate: guard.state.indeterminate,
+          inFlight,
           volatileInputs: volatileList,
-          error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: false, verified, batch }),
+          error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: false, verified, batch, inFlight }),
         };
       }
       // r6: a dispatch FAILURE with the batch not fully accounted — the
@@ -810,14 +1294,61 @@ export async function dispatchScopedRun({
       // later posts of this batch can still come. Keep the guard installed as
       // a page-session sentinel so a later CORRUPTED post is still refused
       // (decided HERE so the finally below honors it).
-      if (
-        guard.state.failed != null &&
-        guard.state.observed + guard.state.rejected + guard.state.refused < batch
-      ) {
-        keepGuardInstalled = true;
-      }
+      // SUCCESS IS ALSO A SENTINEL CASE (codex gate r4). Completing the batch
+      // used to RESTORE fetchApi — which uninstalled the quota fence, so a LATE
+      // same-mark post (a deferred duplicate the processor emits after
+      // queuePrompt returned) bypassed the guard entirely. On a build that
+      // drops the scope that post goes out UNSCOPED: the full-graph execution
+      // this whole module exists to prevent, arriving after we already reported
+      // success. Verdict-reached is not the same as no-more-traffic.
+      //
+      // So a completed scoped run keeps its guard installed for the page
+      // session, exactly as the timeout and dispatch-failure paths already do,
+      // and on the same by-construction safety argument: the guard only ever
+      // acts on THIS run's unique mark, which no future run, user action, or UI
+      // will ever carry, so every other post passes through untouched forever.
+      //
+      // COST, stated rather than hidden: this makes the sentinel the common
+      // case rather than the exception, so a long session chains one wrapper
+      // per scoped run. Each is a single number comparison before delegating,
+      // and chaining is already the documented behaviour for the other terminal
+      // paths — a real but small price for the guarantee that no late post of a
+      // finished run can run the full graph.
+      // EVERY TERMINAL OUTCOME IS A SENTINEL CASE (codex gate r5, P0). Success
+      // was not the only path that restored fetchApi and reopened the hole:
+      //  - a TERMINAL PARTIAL batch (one post repaired and queued, a later one
+      //    refused for drift/mismatch) restored it too;
+      //  - so did a graph_changed refusal;
+      //  - and so did the LAST attempt's all-refused return, after the loop.
+      // In each case a late same-mark scopeless post then bypassed both the
+      // quota fence and the repair and reached ComfyUI as a full graph.
+      //
+      // The only attempt that may safely restore is one that is about to hand
+      // over to ANOTHER attempt of this same run (the shape retry), because
+      // that attempt immediately installs its own guard on the same mark. So
+      // the rule is: restore ONLY when we are continuing. `continuing` is
+      // exactly the post-loop `observed === 0 && droppedReason !== "graph_changed"`
+      // condition, computed HERE so this finally can honor it.
+      //
+      // Note this also bounds the chaining: within a run each attempt
+      // overwrites the previous attempt's guard, so at most ONE guard per run
+      // ever persists.
+      const continuing =
+        !isLastAttempt &&
+        guard.state.failed == null &&
+        guard.state.rejected === 0 &&
+        guard.state.observed === 0 &&
+        guard.state.droppedReason !== "graph_changed";
+      // The ONLY place the fence may be torn down. Reached only when
+      // app.queuePrompt returned normally AND this attempt is handing over to
+      // another attempt of the same run; a throw skips this line entirely and
+      // the fence stays up (P0-2).
+      retireGuard = continuing;
     } finally {
-      if (!keepGuardInstalled) apiTarget.fetchApi = prevFetchApi;
+      // Stand down ONLY by retiring; never by writing apiTarget.fetchApi back
+      // to an older value, which would displace a concurrent run's guard (r8).
+      if (retireGuard) guard.retire();
+      else guard.close();
     }
     // r6: the dispatch itself failed (fetch threw / malformed response) —
     // terminal, truthful, NEVER queued:true.
@@ -826,9 +1357,10 @@ export async function dispatchScopedRun({
         outcome: "failed",
         queueMark: mark,
         verified: guard.state.observed,
-        volatileInputs: volatileList,
+        indeterminate: guard.state.indeterminate,
+      volatileInputs: volatileList,
         error: guard.state.failed +
-          (keepGuardInstalled
+          (!retireGuard
             ? " The scope guard stays installed as a sentinel for the rest of this page session."
             : ""),
       };
@@ -837,11 +1369,40 @@ export async function dispatchScopedRun({
     // established rejection channel — the run "dispatched" and ComfyUI said
     // no; graph_run's summarizePromptRejection surfaces it, never queued:true.
     if (guard.state.rejected > 0) {
-      return { outcome: "dispatched", queueMark: mark, verified: guard.state.observed, volatileInputs: volatileList };
+      return {
+        outcome: "dispatched",
+        queueMark: mark,
+        verified: guard.state.observed,
+        repaired: guard.state.repaired,
+        scopeAppliedBy: guard.state.repaired > 0 ? "request_body_repair" : "frontend",
+        indeterminate: guard.state.indeterminate,
+      volatileInputs: volatileList,
+      };
     }
     // The FULL batch verified — genuinely dispatched (r5: never on a partial).
     if (guard.state.observed >= batch) {
-      return { outcome: "dispatched", queueMark: mark, verified: guard.state.observed, volatileInputs: volatileList };
+      return {
+        outcome: "dispatched",
+        queueMark: mark,
+        verified: guard.state.observed,
+        repaired: guard.state.repaired,
+        // DISCLOSURE, not a footnote: on this path the scope reached ComfyUI
+        // because the panel wrote it into the request body, NOT because the
+        // frontend delivered it. The run IS correctly scoped (the guard
+        // re-verified the repaired body before it left), but the frontend
+        // believed it was queueing a full run — so its queue-time widget hooks
+        // ran with isPartialExecution=false. graph_run states this in the
+        // result rather than letting the caller infer a native scoped run.
+        scopeAppliedBy: guard.state.repaired > 0 ? "request_body_repair" : "frontend",
+        // DISCLOSE a fenced overrun (r3). The requested prompts DID queue, so
+        // this is not a failure and must not be reported as one — but an extra
+        // identical-identity post was blocked, and the caller should know their
+        // frontend produced one rather than be left to wonder at the queue.
+        overrunBlocked: guard.state.overrun,
+        overrunNote: guard.state.overrunError,
+        indeterminate: guard.state.indeterminate,
+      volatileInputs: volatileList,
+      };
     }
     // r7 CONTENT DRIFT with ZERO verified posts is NOT an argument-shape
     // problem — retrying the other shape would produce the same drifted post.
@@ -865,6 +1426,7 @@ export async function dispatchScopedRun({
       outcome: "refused",
       queueMark: mark,
       verified: guard.state.observed,
+      indeterminate: guard.state.indeterminate,
       volatileInputs: volatileList,
       error: scopePartialBatchError({
         toNodeId,

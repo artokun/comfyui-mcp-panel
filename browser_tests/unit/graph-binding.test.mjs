@@ -17,9 +17,11 @@ import { dirname, join } from "node:path";
 
 import {
   activeWorkflowNodeCount,
+  activeWorkflowCurrentNodeCount,
   activeWorkflowProvenEmpty,
   graphEmptyBindingUnproven,
   graphReadDesynced,
+  graphRootMidPopulation,
   graphRootMismatchesActiveWorkflow,
   graphRootProvenEmpty,
   graphRootWorkflowUuidMismatches,
@@ -123,6 +125,7 @@ function buildDirtyStaleRouteHarness({
   activeModified = true,
   activeTracker,
   rootSerializer = null,
+  postReconnectWindow = false,
 } = {}) {
   const src = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
   const stableSource = panelFunctionSource(src, "workflowStableUuid", "workflowStorageKey");
@@ -268,6 +271,7 @@ function buildDirtyStaleRouteHarness({
     "workflowOwnsRootUuidTag",
     "rememberWorkflowUuidOwner",
     "resolveGraphRootUuidRebind",
+    "postReconnectSettleWindow",
     "WORKFLOW_META_NAMESPACE",
     "WORKFLOW_UUID_FIELD",
     `${fenceSource}\nreturn assertGraphBoundToActiveWorkflow;`,
@@ -283,6 +287,9 @@ function buildDirtyStaleRouteHarness({
     ownsTag,
     () => {},
     resolveGraphRootUuidRebind,
+    // #618 — the extracted fence reads the reconnect window through this hook;
+    // harnesses default to OUTSIDE the window and opt in explicitly.
+    () => postReconnectWindow === true,
     "comfyui_mcp",
     "workflow_uuid",
   );
@@ -2753,4 +2760,243 @@ test("#606 refusal message: empty-binding-unproven keeps its false-empty warning
   assert.match(msg, /^\[empty-binding-unproven\]/);
   assert.match(msg, /FALSE-EMPTY/);
   assert.match(msg, /NOT applied/);
+});
+
+// ---------------------------------------------------------------------------
+// #618 — the MID-POPULATION fence. After a ComfyUI reconnect the frontend
+// restores the active tab's graph incrementally; for a window the live root
+// observably reads FEWER nodes than the active workflow's own current state
+// (the restore source). On a DIRTY tab every pre-existing predicate was blind
+// to that signature (shape guard inconclusive while dirty, #545; baseline
+// desync guard gated on a clean tracker; empty-read guard needs ZERO nodes),
+// so an 8-of-31 restoring canvas was served as an authoritative outline and
+// the agent duplicated nodes it could not see. The fence closes that window —
+// and ONLY that window: outside it the #545 dirty-tab availability stands.
+// ---------------------------------------------------------------------------
+
+// A workflow whose CURRENT serialized state reports `n` nodes (the restore
+// source). `withState:false` models an absent/unreadable tracker — no evidence.
+const midPopWorkflow = (n, { modified = true, withState = true } = {}) => ({
+  isModified: modified,
+  ...(withState ? { changeTracker: { activeState: state(n) } } : {}),
+});
+const midPopRoot = (n, extra) => ({
+  _nodes: state(n).nodes,
+  ...(extra ? { extra } : {}),
+});
+
+test("#618: dirty tab in the reconnect window — a live root BEHIND the workflow's own state refuses as root-mid-population", () => {
+  const verdict = resolveGraphBindingVerdict({
+    graph: midPopRoot(8),
+    rootGraph: midPopRoot(8),
+    activeWorkflow: midPopWorkflow(31),
+    liveNodeCount: 8,
+    postReconnectWindow: true,
+  });
+  assert.equal(verdict?.reason, "root-mid-population");
+  // Assert the EVIDENCE, not just the state: the verdict quotes the current-state
+  // count (31), never a load baseline, and the observed live count (8).
+  assert.equal(verdict?.expected, 31);
+  assert.equal(verdict?.live, 8);
+});
+
+test("#618: the SAME evidence outside the reconnect window stays available (the #545 dirty-tab relaxation is untouched)", () => {
+  const verdict = resolveGraphBindingVerdict({
+    graph: midPopRoot(8),
+    rootGraph: midPopRoot(8),
+    activeWorkflow: midPopWorkflow(31),
+    liveNodeCount: 8,
+    postReconnectWindow: false,
+  });
+  assert.equal(verdict, null, "a dirty tab's live-behind-tracker read is legitimate manual-edit lag outside the window");
+});
+
+test("#618: clean tab in the window — the count-short canvas reads as mid-population, not the heavier wrong-canvas verdict", () => {
+  const verdict = resolveGraphBindingVerdict({
+    graph: midPopRoot(8),
+    rootGraph: midPopRoot(8),
+    activeWorkflow: midPopWorkflow(31, { modified: false }),
+    liveNodeCount: 8,
+    postReconnectWindow: true,
+  });
+  assert.equal(verdict?.reason, "root-mid-population");
+  // Outside the window the same clean-tab evidence keeps its pre-#618 verdict.
+  const settled = resolveGraphBindingVerdict({
+    graph: midPopRoot(8),
+    rootGraph: midPopRoot(8),
+    activeWorkflow: midPopWorkflow(31, { modified: false }),
+    liveNodeCount: 8,
+    postReconnectWindow: false,
+  });
+  assert.equal(settled?.reason, "root-shape-mismatch");
+});
+
+test("#618: a descended SUBGRAPH is exempt — an entered subgraph legitimately reads smaller than the root state", () => {
+  const verdict = resolveGraphBindingVerdict({
+    graph: { _nodes: state(4).nodes },
+    rootGraph: midPopRoot(8),
+    activeWorkflow: midPopWorkflow(31),
+    liveNodeCount: 4,
+    inSubgraph: true,
+    postReconnectWindow: true,
+  });
+  assert.equal(verdict, null);
+});
+
+test("#618: no current-state evidence fails OPEN — an absent/malformed tracker read proves nothing", () => {
+  for (const wf of [midPopWorkflow(31, { withState: false }), null, undefined]) {
+    const verdict = resolveGraphBindingVerdict({
+      graph: midPopRoot(8),
+      rootGraph: midPopRoot(8),
+      activeWorkflow: wf,
+      liveNodeCount: 8,
+      postReconnectWindow: true,
+    });
+    assert.equal(verdict, null, "unreadable current state must never manufacture a mid-population verdict");
+  }
+});
+
+test("#618: equal or AHEAD live counts do not fire — only a canvas BEHIND the workflow's own state is mid-restore evidence", () => {
+  for (const live of [31, 40]) {
+    const verdict = resolveGraphBindingVerdict({
+      graph: midPopRoot(live),
+      rootGraph: midPopRoot(live),
+      activeWorkflow: midPopWorkflow(31),
+      liveNodeCount: live,
+      postReconnectWindow: true,
+    });
+    assert.equal(verdict, null, `live=${live} against a 31-node state is not mid-population evidence`);
+  }
+});
+
+test("#618: a current state of ZERO nodes does not fire — an empty restore target is the empty-read guards' case, not this one's", () => {
+  const verdict = resolveGraphBindingVerdict({
+    graph: midPopRoot(0),
+    rootGraph: midPopRoot(0),
+    activeWorkflow: midPopWorkflow(0),
+    liveNodeCount: 0,
+    postReconnectWindow: true,
+  });
+  assert.equal(verdict, null);
+});
+
+test("#618: reads keep their LOWER bar at dispatch — the fence re-asserts in the read executor, like the baseline desync guard", () => {
+  const verdict = resolveGraphBindingVerdict({
+    graph: midPopRoot(8),
+    rootGraph: midPopRoot(8),
+    activeWorkflow: midPopWorkflow(31),
+    liveNodeCount: 8,
+    postReconnectWindow: true,
+    ...graphCommandBindingBar("graph_outline"),
+  });
+  assert.equal(verdict, null, "dispatch does not refuse reads early; the executor's full bar is where the fence lives");
+});
+
+test("#618: MUTATIONS are fenced in the window too — a proven-bound dirty root still refuses while the canvas is mid-restore", () => {
+  const uuid = "wf-uuid-A";
+  const verdict = resolveGraphBindingVerdict({
+    graph: midPopRoot(8),
+    rootGraph: midPopRoot(8, { comfyui_mcp: { workflow_uuid: uuid } }),
+    activeWorkflow: midPopWorkflow(31),
+    activeWorkflowUuid: uuid,
+    liveNodeCount: 8,
+    postReconnectWindow: true,
+    ...graphCommandBindingBar("graph_remove_node"),
+  });
+  assert.equal(verdict?.reason, "root-mid-population");
+});
+
+test("#618: a positive UUID conflict outranks the mid-population verdict — identity evidence stays first", () => {
+  const verdict = resolveGraphBindingVerdict({
+    graph: midPopRoot(8),
+    rootGraph: midPopRoot(8, { comfyui_mcp: { workflow_uuid: "foreign-tab-B" } }),
+    activeWorkflow: midPopWorkflow(31),
+    activeWorkflowUuid: "wf-uuid-A",
+    liveNodeCount: 8,
+    // rootUuidMismatch is computed by the caller (the monolith fence) from the
+    // tag/identity conflict above; passed in here exactly as it would be live.
+    rootUuidMismatch: true,
+    postReconnectWindow: true,
+    ...MUTATION_BINDING_BAR,
+  });
+  assert.equal(verdict?.reason, "root-workflow-uuid-mismatch");
+});
+
+test("#618: the refusal message discloses the uncertainty and names a remedy that works from where the caller is", () => {
+  const message = graphBindingRefusalMessage({
+    reason: "root-mid-population",
+    expected: 31,
+    live: 8,
+  });
+  assert.match(message, /\[root-mid-population\]/);
+  assert.match(message, /shows 8 node\(s\)/, "the live count is quoted");
+  assert.match(message, /reports 31/, "the workflow's own count is quoted");
+  assert.match(message, /NOT applied/, "the refusal never reads as a partial success");
+  assert.match(message, /Retry in a moment/, "the cheap remedy comes first");
+  assert.match(message, /panel_open_workflow/, "the persistent-case remedy is actionable from here");
+  assert.doesNotMatch(message, /did NOT land|not installed/, "no stale-install blame leaks into a binding verdict");
+});
+
+test("#618: the monolith's fence feeds the verdict the live reconnect window (extracted source, window ON and OFF)", () => {
+  const inWindow = buildDirtyStaleRouteHarness({
+    rootUuid: null,
+    foreignClaim: "none",
+    activeNodeCount: 31,
+    rootNodeCount: 8,
+    postReconnectWindow: true,
+  });
+  assert.throws(
+    () => inWindow.assertBound(inWindow.rootB, inWindow.rootB),
+    /\[root-mid-population\]/,
+    "the real assertGraphBoundToActiveWorkflow refuses the 8-of-31 restoring canvas inside the window",
+  );
+  const settled = buildDirtyStaleRouteHarness({
+    rootUuid: null,
+    foreignClaim: "none",
+    activeNodeCount: 31,
+    rootNodeCount: 8,
+  });
+  assert.doesNotThrow(
+    () => settled.assertBound(settled.rootB, settled.rootB),
+    "the same canvas stays available once the window has closed",
+  );
+});
+
+test("#618: the panel source wires the window from the #433 epoch/monotonic machinery, not a wall-clock guess", () => {
+  const src = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
+  const helper = panelFunctionSource(src, "postReconnectSettleWindow", "assertGraphBoundToActiveWorkflow");
+  assert.match(helper, /activeWorkflowPossiblyStale\(\{/, "the window decision is the shared #433 predicate");
+  assert.match(helper, /reconnectEpoch: backendReconnectEpoch/);
+  assert.match(helper, /resyncEpoch: activeWorkflowResyncEpoch/);
+  assert.match(helper, /reconnectedAt: backendReconnectedAt/);
+  assert.match(helper, /now: monotonicNow\(\)/, "the window reads a monotonic clock");
+  const fence = panelFunctionSource(src, "assertGraphBoundToActiveWorkflow", "getPiniaStore");
+  assert.match(
+    fence,
+    /postReconnectWindow: postReconnectSettleWindow\(\)/,
+    "the binding verdict receives the live window on every fenced command",
+  );
+});
+
+test("#618: graphRootMidPopulation unit edges — NaN/negative live counts and subgraph scope never fire", () => {
+  const wf = midPopWorkflow(31);
+  assert.equal(graphRootMidPopulation({ liveNodeCount: NaN, activeWorkflow: wf, postReconnectWindow: true }), false);
+  assert.equal(graphRootMidPopulation({ liveNodeCount: -1, activeWorkflow: wf, postReconnectWindow: true }), false);
+  assert.equal(graphRootMidPopulation({ liveNodeCount: 8, activeWorkflow: wf, inSubgraph: true, postReconnectWindow: true }), false);
+  assert.equal(graphRootMidPopulation({ liveNodeCount: 8, activeWorkflow: wf }), false, "window defaults closed");
+});
+
+test("#618: activeWorkflowCurrentNodeCount reads ONLY the current state — the load baseline is not mid-population evidence", () => {
+  // initialState says 31 (the load baseline) but the current state has legitimately
+  // shrunk to 8: the baseline must NOT accuse the canvas.
+  const wf = {
+    changeTracker: { activeState: state(8), initialState: state(31) },
+  };
+  assert.equal(activeWorkflowCurrentNodeCount(wf), 8);
+  assert.equal(
+    graphRootMidPopulation({ liveNodeCount: 8, activeWorkflow: wf, postReconnectWindow: true }),
+    false,
+    "a canvas matching the CURRENT state is not mid-population, whatever the baseline held",
+  );
+  assert.equal(activeWorkflowCurrentNodeCount({}), null, "no current state → no evidence");
 });

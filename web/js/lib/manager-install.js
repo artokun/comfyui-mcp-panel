@@ -382,10 +382,24 @@ export function installedListRoute() {
  *  (a 404 / the panel's "not reachable" throw), i.e. we should retry the
  *  absolute (no-/v2) legacy route? A legacy-UI pip build can answer the queue
  *  probe on /v2 yet NOT register the /v2 data GETs, so the dialect-routed
- *  /v2/customnode/installed 404s while /customnode/installed serves fine. */
+ *  /v2/customnode/installed 404s while /customnode/installed serves fine.
+ *  Broad on purpose: it gates IDEMPOTENT GET fallbacks, where re-issuing the
+ *  request after even an ambiguous transport failure is safe. Mutations must
+ *  use the stricter isManagerRouteMissing instead (codex P0). */
 export function isManagerUnreachable(err) {
   const msg = String(err?.message ?? err ?? "");
   return /not reachable/i.test(msg) || /HTTP\s*404\b/.test(msg);
+}
+
+/** #605 / codex P0 — is this error a PROVEN route-level rejection (an HTTP 404
+ *  surfaced by managerCall/managerV2, tagged with `managerRouteMissing`)? Only
+ *  a 404 proves no handler ran, so ONLY this predicate may authorize re-sending
+ *  a MUTATION on another dialect. The broader isManagerUnreachable also matches
+ *  the transports' no-response "not reachable" throw — a lost response says
+ *  nothing about whether the POST landed, so gating a mutation retry on it
+ *  could double-fire the install/update. */
+export function isManagerRouteMissing(err) {
+  return !!err && err.managerRouteMissing === true;
 }
 
 /** #424 — did the Manager reject the method (HTTP 405)? Updating ComfyUI-Manager
@@ -403,6 +417,29 @@ export function isMethodNotAllowed(err) {
  *  resolves via unified_update. Mirrors graph_update_node's legacy body. */
 export function legacyUpdateBody({ ui_id, id, version } = {}) {
   return { ui_id, id, version: version === "nightly" ? "nightly" : "latest" };
+}
+
+/**
+ * #605 — after a dialect-routed call failed "unreachable" (a route-level
+ * rejection: no handler ran, so re-issuing it cannot double-execute anything),
+ * which dialect should the retry speak? `failed` is the dialect that just
+ * 404'd; `fresh` is the result of re-probing the LIVE backend (null = the
+ * Manager currently answers no dialect at all — mid-restart or disabled).
+ *
+ *   - A fresh verdict that DIFFERS from the failed one wins: the cached dialect
+ *     outlived a backend restart that swapped Manager generations (the #605
+ *     report — a stale "legacy" cache aiming at routes a v4 backend no longer
+ *     serves), and the live probe is the ground truth.
+ *   - Otherwise (the re-probe agrees, or the Manager answers nothing right now)
+ *     the legacy absolute routes remain the last resort for a non-legacy
+ *     dialect (#485 — a hybrid build can answer the /v2 probe yet not register
+ *     the /v2 data/mutation routes).
+ *   - A legacy-on-legacy failure has no fallback left: return null so the
+ *     caller surfaces its ORIGINAL error, which carries the real context.
+ */
+export function dialectRetryTarget(failed, fresh) {
+  if (fresh && fresh !== failed) return fresh;
+  return failed === "legacy" ? null : "legacy";
 }
 
 /**
