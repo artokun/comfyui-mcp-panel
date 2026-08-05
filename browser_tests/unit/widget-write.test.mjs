@@ -2448,7 +2448,7 @@ test("#639: a throwing callback on a verified write is DISCLOSED (write_warning)
   assert.ok(typeof set.write_warning === "string", "the throw is disclosed, never hidden");
   assert.match(set.write_warning, /thrown while applying the write/, "the throw is disclosed, not hidden");
   assert.match(set.write_warning, /reading 'options'/, "carries the original error message");
-  assert.match(set.write_warning, /DID take effect/, "says the write applied — never a clean-failure report");
+  assert.match(set.write_warning, /IS in effect/, "says the requested value is present — never a clean-failure report");
 });
 
 test("#639: a promoted write whose inner callback throws still discloses success when inner + rail both verify", () => {
@@ -2544,7 +2544,7 @@ test("#639: a throwing value SETTER on a verified write is disclosed without une
   assert.equal(node.widgets[0].value, 5, "the setter applied before throwing — the write is in effect");
   assert.match(set.write_warning ?? "", /thrown while applying the write/);
   assert.match(set.write_warning ?? "", /setter boom/);
-  assert.match(set.write_warning ?? "", /DID take effect/);
+  assert.match(set.write_warning ?? "", /IS in effect/);
   assert.doesNotMatch(
     set.write_warning ?? "",
     /never ran|after applying|callback threw|setter threw/,
@@ -2670,4 +2670,58 @@ test("#667×#507 (delta-gate): sibling lists that DISAGREE on a numeric label's 
   assert.equal(inner.widgets[0].value, "", "inner untouched");
   assert.equal(railWidget.value, "", "rail untouched — never holds a value its list does not contain");
   assert.equal(proxyWidget.value, "", "proxy untouched");
+});
+
+test("#639 (delta-gate 2): a FROZEN widget already holding the requested value reports 'IS in effect', never that this write caused it", () => {
+  // Assigning to a frozen widget's `value` throws in strict mode with NO user
+  // code involved; read-back then finds the requested value already present.
+  // The disclosure must claim presence, not causation.
+  const w = Object.freeze({ name: "n", type: "INT", value: 10 });
+  const node = { id: 1, type: "N", widgets: [w] };
+  const set = applyWidgetWrite(node, "n", 10, HOOKS);
+  assert.equal(node.widgets[0].value, 10);
+  assert.match(set.write_warning ?? "", /thrown while applying the write/);
+  assert.match(set.write_warning ?? "", /IS in effect/);
+  assert.doesNotMatch(set.write_warning ?? "", /DID take effect/);
+});
+
+test("#667×#507 (delta-gate 2): re-validation checks the SAME list snapshot as admission — a stateful non-function source cannot cause a false DISAGREE", () => {
+  // A buggy-but-in-scope accessor answers differently per read. Admission reads
+  // the list exactly once per sibling (isComboWidget, the function-type probe,
+  // then comboOptions); a FOURTH read only happens if re-validation re-reads the
+  // source instead of checking the admission snapshot — which must not happen.
+  let reads = 0;
+  const railWidget = {
+    name: "model_alias",
+    type: "combo",
+    value: "",
+    options: {
+      get values() {
+        reads += 1;
+        return reads <= 3 ? ["lt", "4444"] : ["changed-after-admission"];
+      },
+    },
+  };
+  const inner = {
+    id: 301,
+    type: "StarOllamaPromptHelper",
+    widgets: [{ name: "model", type: "combo", options: { values: [] }, value: "" }],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) };
+  const parent = {
+    id: 320,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [{ name: "model_alias", _widget: railWidget, widget: { name: "model_alias" }, _subgraphSlot: { name: "model_alias" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "model_alias" ? { sourceNodeId: "301", sourceWidgetName: "model" } : null;
+  const set = applyWidgetWrite(parent, "model_alias", 4444, {
+    ...HOOKS,
+    resolveSource,
+    acceptEmptyComboOptions: true,
+  });
+  assert.equal(set.value, "4444");
+  assert.equal(railWidget.value, "4444", "admitted against the admission-time list, not a later answer");
 });

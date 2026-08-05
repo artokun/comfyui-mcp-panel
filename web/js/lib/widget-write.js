@@ -991,6 +991,13 @@ export function applyWidgetWrite(
   // hatch around this very check (codex confirmation round).
   if (coerceOutcome.emptyAcceptanceUsed) {
     let adoptedOption = false;
+    // Each sibling's option list AS READ during admission. A STATEFUL non-function
+    // source (an accessor/proxy answering differently per read) must not be read a
+    // second time: the post-adoption re-validation below checks the SAME snapshots
+    // admission was decided against — a fresh read could produce a false DISAGREE
+    // or pass against a list that has since changed (codex delta-gate 2), the same
+    // never-read-twice rule `emptyAcceptanceUsed` itself follows (above).
+    const siblingSnapshots = [];
     for (const other of [parentWidget, ...displayWidgets]) {
       if (!other || !isComboWidget(other)) continue;
       // A DYNAMIC (function) sibling list is UNVERIFIABLE from here (codex round-5): it
@@ -1008,6 +1015,7 @@ export function applyWidgetWrite(
       }
       const otherOptions = comboOptions(other);
       if (!Array.isArray(otherOptions) || otherOptions.length === 0) continue;
+      siblingSnapshots.push({ name: other.name, options: otherOptions.slice() });
       if (otherOptions.includes(coerced)) continue;
       // #667 (codex round-3): the SAME numeric-labelled-option rule applies here —
       // a numeric request (4444) against a rail list holding the string "4444" must
@@ -1032,19 +1040,17 @@ export function applyWidgetWrite(
     // can adopt a DIFFERENTLY-TYPED original of the same label (rail lists "4444",
     // a display proxy lists 4444) — the final write would then land a value an
     // earlier-validated sibling's list does not contain. When any adoption
-    // happened, re-validate the FINAL value against every sibling: a sibling that
-    // does not strictly contain it conflicts (same label, different type — or the
-    // value absent there), so no single value satisfies every list; fail closed.
+    // happened, re-validate the FINAL value against every sibling's SNAPSHOT: a
+    // sibling that does not strictly contain it conflicts (same label, different
+    // type — or the value absent there), so no single value satisfies every list;
+    // fail closed.
     if (adoptedOption) {
-      for (const other of [parentWidget, ...displayWidgets]) {
-        if (!other || !isComboWidget(other) || typeof other.options?.values === "function") continue;
-        const otherOptions = comboOptions(other);
-        if (!Array.isArray(otherOptions) || otherOptions.length === 0) continue;
-        if (otherOptions.includes(coerced)) continue;
+      for (const snap of siblingSnapshots) {
+        if (snap.options.includes(coerced)) continue;
         throw new WidgetWriteError(
           `The sibling combo widgets this promoted write mutates DISAGREE about option ` +
-            `${JSON.stringify(coerced)}: after matching it by label, "${other.name}"'s list ` +
-            `(${otherOptions.length} options) does not contain the resulting value — the lists ` +
+            `${JSON.stringify(coerced)}: after matching it by label, "${snap.name}"'s list ` +
+            `(${snap.options.length} options) does not contain the resulting value — the lists ` +
             `hold the same label with different types (or not at all), so no single value ` +
             `satisfies every list. Refusing to write.`,
         );
@@ -1268,23 +1274,25 @@ export function applyWidgetWrite(
   // detail), keeping the error's retry flags (combo/emptyOptions) through the
   // composition.
   //
-  // Attribution (codex rounds 2-3 + delta-gate): only what the mechanism can
+  // Attribution (codex rounds 2-3 + delta-gates): only what the mechanism can
   // ESTABLISH is claimed. The write envelope evaluates value setters on the inner,
   // rail, and display proxies, property reads (`w.callback` may be a throwing
   // accessor, `targetNode.pos` a getter), and the callback invocation — and a
   // plain write to a frozen widget throws with NO user code involved. So the
   // message does not name ANY construct: only that an exception was thrown while
-  // applying the write. What IS established and claimed: the value was verified
-  // written by read-back, and the write's side effects may not have run or
-  // completed.
+  // applying the write. And read-back verifies only that the requested value IS
+  // present — not that THIS write put it there (a frozen widget may already have
+  // held it), so the disclosure claims "IS in effect", never "DID take effect".
+  // What IS established and claimed: the requested value is present by read-back,
+  // and the write's side effects may not have run or completed.
   if (threw) {
     const threwLabel = "an exception was thrown while applying the write";
     if (!failure) {
       writeWarning =
-        `${threwLabel} (${threw?.message ?? threw}), but the value was verified written ` +
-        `by read-back — the write DID take effect and was NOT rolled back. Side effects ` +
-        `the write would normally trigger (refreshing dependent widgets, previews, ` +
-        `thumbnails) may not have run or completed; inspect the node if dependents look stale.`;
+        `${threwLabel} (${threw?.message ?? threw}); the requested value IS in effect — ` +
+        `verified present by read-back — and was NOT rolled back. Side effects the write ` +
+        `would normally trigger (refreshing dependent widgets, previews, thumbnails) may ` +
+        `not have run or completed; inspect the node if dependents look stale.`;
     } else {
       failure = `${threwLabel} (${threw?.message ?? threw}); ${failure}`;
       if (threw instanceof WidgetWriteError) {
