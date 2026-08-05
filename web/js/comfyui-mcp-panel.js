@@ -159,6 +159,7 @@ import {
   GET_ERRORS_STEP_CAP_MS,
   getErrorsStepBudgetMs,
 } from "./lib/get-errors-budget.js";
+import { boundExecFailurePayload } from "./lib/exec-error-bounds.js";
 import {
   drivenWidgetsFor,
   drivenTag,
@@ -9806,9 +9807,13 @@ const GRAPH_TOOL_EXECUTORS = {
   //   - lastNodeErrors      → per-input validation errors from the last queue
   //   - lastExecFailure     → the last runtime failure (live execution_error event)
   //
-  // `node_errors` and `last_execution_error` are kept VERBATIM for backwards
-  // compatibility — the turn-start validation block, the tool-call label and the
-  // console action all read them.
+  // `node_errors` and `last_execution_error` are kept for backwards compatibility
+  // — the turn-start validation block, the tool-call label and the console action
+  // all read them (presence / scalar fields). `last_execution_error` is BOUNDED at
+  // emission (#664): the raw event detail carries tensor-sized current_inputs /
+  // current_outputs and traceback lines with huge tensor reprs, which shipped a
+  // 41k+ token tool result. Same keys, capped values, every cut disclosed in-band
+  // (see web/js/lib/exec-error-bounds.js).
   //
   // NOTE on EXEC_ERR_STORE below: that ComfyUI store id is a camelCase name
   // ending in "...executi" + "on" + "Error". Lowercased, that tail collides with
@@ -10016,8 +10021,8 @@ const GRAPH_TOOL_EXECUTORS = {
     //    LiteGraph does NOT set has_errors for a runtime failure, so the throwing
     //    node is never painted red and reaches the output ONLY via the union
     //    below. `exception_type` is carried because "PIL.UnidentifiedImageError"
-    //    explains far more than the message; the traceback is dropped to stay
-    //    token-bounded (it stays in `last_execution_error` for compatibility).
+    //    explains far more than the message; the traceback is dropped HERE to stay
+    //    token-bounded (a capped traceback ships in `last_execution_error`, #664).
     let execFailure = null;
     try {
       let e = lastExecFailure;
@@ -10130,8 +10135,10 @@ const GRAPH_TOOL_EXECUTORS = {
       ...(missingNodeCount && !missingNodeTypes.length
         ? { missing_node_count: missingNodeCount }
         : {}),
-      // --- backwards-compatible raw payloads (existing consumers read these) ---
-      last_execution_error: lastExecFailure,
+      // --- backwards-compatible payloads (existing consumers read these) ---
+      // Bounded at emission (#664): verbatim, this carried tensor-sized
+      // current_inputs/current_outputs and huge traceback lines (41k+ tokens).
+      last_execution_error: boundExecFailurePayload(lastExecFailure),
       node_errors: nodeErrors,
       ...(clean ? { note: "no errors recorded since the last execution start" } : {}),
     };
