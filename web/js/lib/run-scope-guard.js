@@ -1144,6 +1144,29 @@ export async function dispatchScopedRun({
       ) {
         keepGuardInstalled = true;
       }
+      // SUCCESS IS ALSO A SENTINEL CASE (codex gate r4). Completing the batch
+      // used to RESTORE fetchApi — which uninstalled the quota fence, so a LATE
+      // same-mark post (a deferred duplicate the processor emits after
+      // queuePrompt returned) bypassed the guard entirely. On a build that
+      // drops the scope that post goes out UNSCOPED: the full-graph execution
+      // this whole module exists to prevent, arriving after we already reported
+      // success. Verdict-reached is not the same as no-more-traffic.
+      //
+      // So a completed scoped run keeps its guard installed for the page
+      // session, exactly as the timeout and dispatch-failure paths already do,
+      // and on the same by-construction safety argument: the guard only ever
+      // acts on THIS run's unique mark, which no future run, user action, or UI
+      // will ever carry, so every other post passes through untouched forever.
+      //
+      // COST, stated rather than hidden: this makes the sentinel the common
+      // case rather than the exception, so a long session chains one wrapper
+      // per scoped run. Each is a single number comparison before delegating,
+      // and chaining is already the documented behaviour for the other terminal
+      // paths — a real but small price for the guarantee that no late post of a
+      // finished run can run the full graph.
+      if (guard.state.observed >= batch || guard.state.rejected > 0) {
+        keepGuardInstalled = true;
+      }
     } finally {
       if (!keepGuardInstalled) apiTarget.fetchApi = prevFetchApi;
     }

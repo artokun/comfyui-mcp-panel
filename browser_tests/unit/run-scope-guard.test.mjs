@@ -631,7 +631,7 @@ test("#556 r4 P0-2: newScopedQueueMark is unique per run, nonzero, a safe intege
 // dispatchScopedRun — the REAL orchestration graph_run runs (integration)
 // ---------------------------------------------------------------------------
 
-test("#556 integration: happy path — marked scoped dispatch observed, prompt_id captured, fetchApi restored", async () => {
+test("#556 integration: happy path — marked scoped dispatch observed, prompt_id captured, sentinel RETAINED (#630 r4)", async () => {
   const stop = keepAlive();
   try {
     const apiTarget = { fetchApi: makeServer() };
@@ -644,7 +644,12 @@ test("#556 integration: happy path — marked scoped dispatch observed, prompt_i
     });
     assert.equal(result.outcome, "dispatched");
     assert.deepEqual(ids, ["srv-1"]);
-    assert.equal(apiTarget.fetchApi, prev, "guard restored after observation");
+    // #630 r4 — DELIBERATE CHANGE. This used to assert restoration. Restoring
+    // on success uninstalled the quota fence, so a LATE same-mark post (a
+    // deferred duplicate emitted after queuePrompt returned) bypassed the guard
+    // and, on a scope-dropping build, left the tab UNSCOPED — a full-graph run
+    // arriving after a scoped success was already reported.
+    assert.notEqual(apiTarget.fetchApi, prev, "the sentinel is retained so a late post of THIS run is still fenced");
     assert.equal(app.posted.length, 1, "first arg shape worked — no retry");
     assert.equal(app.posted[0].number, result.queueMark, "our posts carry THIS run's queue mark");
     assert.deepEqual(app.posted[0].partial_execution_targets, ["14"]);
@@ -693,14 +698,17 @@ test("#572 integration: a graph with NO queue-time hooks reports full drift cove
 test("#556 integration: a shim-less options build drops the legacy array — attempt 1 refused with ZERO dispatch, attempt 2 delivers", async () => {
   const stop = keepAlive();
   try {
-    const apiTarget = { fetchApi: makeServer() };
+    // Hold the SERVER double directly: since #630 r4 a successful run retains
+    // its sentinel, so apiTarget.fetchApi is the guard afterwards, not this.
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
     const app = makeFrontend({ shape: "shimless", apiTarget });
     const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
     assert.equal(result.outcome, "dispatched");
     assert.equal(app.posted.length, 2, "both shapes attempted");
     assert.equal(app.posted[0].partial_execution_targets, undefined, "attempt 1 (array) dropped by this build");
-    assert.equal(apiTarget.fetchApi.calls.length, 1, "only the correctly-shaped dispatch reached the server");
-    assert.deepEqual(apiTarget.fetchApi.calls[0].options.body && JSON.parse(apiTarget.fetchApi.calls[0].options.body).partial_execution_targets, ["14"]);
+    assert.equal(server.calls.length, 1, "only the correctly-shaped dispatch reached the server");
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
   } finally {
     stop();
   }
@@ -713,7 +721,9 @@ test("#630 integration: a build honoring NEITHER shape is now HONOURED, not refu
   // run completed" — it is WHICH nodes ComfyUI was told to execute.
   const stop = keepAlive();
   try {
-    const apiTarget = { fetchApi: makeServer() };
+    // Hold the SERVER double directly (see #630 r4: success retains the sentinel).
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
     const app = makeFrontend({ shape: "dropping", apiTarget });
     const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
     assert.equal(result.outcome, "dispatched");
@@ -724,8 +734,8 @@ test("#630 integration: a build honoring NEITHER shape is now HONOURED, not refu
     assert.equal(app.posted[0].partial_execution_targets, undefined);
     assert.equal(app.posted[1].partial_execution_targets, undefined);
     // …and exactly ONE request reached ComfyUI, carrying exactly node 14.
-    assert.equal(apiTarget.fetchApi.calls.length, 1, "the two unrepaired attempts were blocked, not forwarded");
-    const sent = JSON.parse(apiTarget.fetchApi.calls[0].options.body);
+    assert.equal(server.calls.length, 1, "the two unrepaired attempts were blocked, not forwarded");
+    const sent = JSON.parse(server.calls[0].options.body);
     assert.deepEqual(
       sent.partial_execution_targets,
       ["14"],
@@ -911,6 +921,54 @@ test("#630 gate r3: an EXTRA post beyond the requested batch is FENCED, not disp
     assert.match(result.overrunNote, /refused rather than dispatched/);
     assert.match(result.overrunNote, /requested prompts are queued and unaffected/,
       "a disclosure about work that succeeded — never a failure that invites a retry");
+  } finally {
+    stop();
+  }
+});
+
+test("#630 gate r4: a LATE extra post, arriving AFTER the run reported success, still cannot run the full graph", async () => {
+  // The deferred race the r3 fence alone did not cover. Completing the batch
+  // used to restore fetchApi, uninstalling the quota fence — so a duplicate the
+  // frontend's processor emits after queuePrompt returned bypassed the guard
+  // entirely and, on a scope-dropping build, went out UNSCOPED. A full-graph
+  // execution arriving after we already reported a scoped success is the worst
+  // shape of #556: nothing in the reply hints at it.
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const prev = apiTarget.fetchApi;
+    const app = makeFrontend({ shape: "dropping", apiTarget });
+    let lateNumber = null;
+    app.queuePrompt = async (number, batch) => {
+      lateNumber = number;
+      for (let i = 0; i < batch; i++) {
+        const body = frontendBody({ output: OUR_OUTPUT, number, targets: null });
+        app.posted.push(body);
+        await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+      }
+      return true;
+    };
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+    assert.equal(result.outcome, "dispatched");
+    assert.equal(server.calls.length, 1);
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
+    // The guard must NOT have been uninstalled by success.
+    assert.notEqual(apiTarget.fetchApi, prev, "a completed scoped run keeps its sentinel for the page session");
+    // NOW the late duplicate, exactly as a stalled processor would emit it.
+    const late = frontendBody({ output: OUR_OUTPUT, number: lateNumber, targets: null });
+    const res = await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(late) });
+    assert.equal(res.status, 400, "the late duplicate is refused");
+    assert.equal(server.calls.length, 1, "and it NEVER reached ComfyUI — no unscoped full-graph post, ever");
+    // A stranger's traffic still passes through the lingering sentinel.
+    const foreign = frontendBody({ output: OUR_OUTPUT, number: 0, targets: null });
+    await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(foreign) });
+    assert.equal(server.calls.length, 2, "the sentinel only ever constrains its own run");
+    assert.equal(
+      JSON.parse(server.calls[1].options.body).partial_execution_targets,
+      undefined,
+      "and it does not narrow a stranger's full run either",
+    );
   } finally {
     stop();
   }
@@ -1254,8 +1312,12 @@ test("#556 r4 P0-2 integration: two overlapping scoped runs — B's traffic pass
     assert.deepEqual(idsB, ["srv-1"], "B's prompt_id captured by B's guard, never by A's sentinel");
     assert.equal(server.calls.length, 1, "B's scoped dispatch reached the server THROUGH A's sentinel, untouched");
     assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["15"]);
-    // Chaining: B restored the wrap that was current when IT installed — A's sentinel.
-    assert.equal(apiTarget.fetchApi, sentinelA, "B's cleanup did not clobber A's sentinel");
+    // Chaining (#630 r4): B SUCCEEDED, so B now keeps its own sentinel too and
+    // it is the current wrap. What must hold is not "A's sentinel is current"
+    // but that the chain is intact — A's sentinel is still reachable THROUGH
+    // B's, and neither run's guard clobbered the other's.
+    assert.notEqual(apiTarget.fetchApi, sentinelA, "B retains its own sentinel on success");
+    assert.notEqual(apiTarget.fetchApi, prev, "and the chain never unwinds back to the raw fetchApi");
     // A's late scope-dropped post is STILL refused by A's sentinel.
     const resA = await appA.postDeferred(appA.deferredItem);
     assert.equal(resA.status, 400, "A's sentinel still constrains exactly A's items");
@@ -1452,7 +1514,9 @@ test("#556 r5 integration: batch=2 FULLY verified ⇒ dispatched (guard held unt
     assert.equal(result.verified, 2);
     assert.deepEqual(ids, ["srv-1", "srv-2"], "every batch prompt_id captured");
     assert.equal(server.calls.length, 2);
-    assert.equal(apiTarget.fetchApi, prev, "guard restored once the whole batch verified");
+    // #630 r4 — see the happy-path note: success retains the sentinel so a late
+    // duplicate of this run cannot post the full graph after we reported done.
+    assert.notEqual(apiTarget.fetchApi, prev, "sentinel retained once the whole batch verified");
   } finally {
     stop();
   }
