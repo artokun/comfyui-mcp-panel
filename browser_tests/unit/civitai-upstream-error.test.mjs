@@ -225,6 +225,7 @@ test("#599: an upstream status on the RETRY still reports the first attempt's tr
 
 test("#599: an unparseable body on the RETRY still reports the first attempt's transport error", async () => {
   let calls = 0;
+  const parseError = new SyntaxError("Unexpected token < in JSON");
   const client = new CivitaiClient({
     fetchApi: async () => {
       calls++;
@@ -233,7 +234,7 @@ test("#599: an unparseable body on the RETRY still reports the first attempt's t
         ok: true,
         status: 200,
         json: async () => {
-          throw new SyntaxError("Unexpected token < in JSON");
+          throw parseError;
         },
       };
     },
@@ -247,6 +248,37 @@ test("#599: an unparseable body on the RETRY still reports the first attempt's t
       assert.equal(err.cause?.message, "blocked by a browser extension");
       // res was ok, so there is no upstream error status to claim.
       assert.equal(err.status, undefined);
+      // Attaching attempt 1's evidence must not destroy the RETRY's evidence:
+      // the parse error keeps its identity, its class and its stack. Rebuilding
+      // it as a plain Error would be the same evidence loss in the other
+      // direction.
+      assert.equal(err, parseError, "the original parse error object is thrown, not a copy");
+      assert.ok(err instanceof SyntaxError);
+      assert.equal(err.name, "SyntaxError");
+      assert.ok(err.stack, "the parse error's own stack survives");
+      return true;
+    },
+  );
+});
+
+test("#599: an existing cause on the retry's error is never overwritten", async () => {
+  let calls = 0;
+  const inner = new Error("the real underlying parse problem");
+  const parseError = new SyntaxError("bad body", { cause: inner });
+  const client = new CivitaiClient({
+    fetchApi: async () => {
+      calls++;
+      if (calls === 1) throw new TypeError("blocked by a browser extension");
+      return { ok: true, status: 200, json: async () => { throw parseError; } };
+    },
+    apiURL: (p) => p,
+  });
+  await assert.rejects(
+    () => client._request({ url: "https://civitai.red/api/v1/models" }),
+    (err) => {
+      assert.equal(err.cause, inner, "a pre-existing cause is evidence too");
+      // …and attempt 1 is still reported, via the message.
+      assert.match(err.message, /blocked by a browser extension/);
       return true;
     },
   );

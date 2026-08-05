@@ -429,7 +429,19 @@ export class CivitaiClient {
       // Do NOT stamp an HTTP status here: res was ok, so there is no upstream
       // error status to report, and inventing one would read to
       // civitaiErrorState as "CivitAI returned an error" — a different claim.
+      //
+      // AUGMENT the parse error in place; never rebuild it. Wrapping it in a
+      // fresh Error would drop its class (SyntaxError) and its stack — losing
+      // the retry's evidence in the very act of preserving attempt 1's, which
+      // is the same defect this whole change exists to remove.
       if (!firstTransportError) throw e;
+      if (e instanceof Error) {
+        e.message = withFirstAttempt(e.message);
+        // Only fill an EMPTY cause — an existing one is itself evidence and
+        // must not be overwritten. The trail is in the message either way.
+        if (e.cause === undefined) e.cause = firstTransportError;
+        throw e;
+      }
       throw Object.assign(new Error(withFirstAttempt(errText(e))), {
         cause: firstTransportError,
       });
