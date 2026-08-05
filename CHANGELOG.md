@@ -6,6 +6,34 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.39] - 2026-08-04
+
+### Fixed
+- **CRITICAL: mutations could reach the WRONG graph** — nodes deleted from another
+  workflow, and writes reported not-applied that were in fact applied (#621).
+  After a ComfyUI restart with no page reload, the panel could point the canvas at an
+  empty root while the user's unsaved graph was still on screen; every downstream guard
+  was then handed a self-consistent pair that no longer described the canvas the command
+  was issued for. The divergence is now detected and refused instead of silently
+  repointing, the dispatch fence no longer exempts mutations from the baseline read
+  guard, and the destructive revert path awaits its load, fences both the bridge and the
+  user, and reports a discriminated outcome rather than a null that meant two different
+  things. Fixes #545, #442, #308, #220; partially addresses #604, #603, #616, #374.
+- repair main — #614's title coercion broke #631's move-group harness (#643)
+- truncated results name their own remedy — and one that works from where the caller is (#614)
+- make panel_move_group a verified transaction that never reports a move it did not make (#408) (#631)
+- prevent restart resume from duplicating an active render (#585) (#597)
+- materialize V3 custom widgets before add (#593)
+- label cancelled reconnect runs truthfully (#582) (#595)
+- reply before expensive graph snapshot (#581) (#594)
+- separate stale red outlines from errors (#579) (#592)
+- report outer previous value for promoted widgets (#591)
+- the fixed-ness check must GATE the volatile exclusion (codex r2)
+- refuse the false-empty authoritative read (empty-binding-unproven)
+- narrow + surface the volatile-input exclusion (codex gate)
+- exclude linked value-control targets from the scoped-run drift hash
+
+
 ## [0.11.38] - 2026-08-03
 
 ### Fixed
