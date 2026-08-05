@@ -9229,24 +9229,33 @@ const GRAPH_TOOL_EXECUTORS = {
     // #556 — DISCLOSE how the scope actually reached ComfyUI. When both
     // app.queuePrompt argument shapes failed to carry it, the panel wrote
     // partial_execution_targets into this run's own /prompt body and
-    // re-verified it before it left. The run IS scoped to the requested
-    // branch — but the frontend queued it believing it was a full run, so its
-    // queue-time widget hooks ran with isPartialExecution=false (a
-    // control_after_generate seed may have advanced as it would for a full
-    // run). That difference is stated here rather than left for the caller to
-    // discover; ran_to_node alone would imply a native scoped run.
+    // re-verified it before it left. The run IS scoped to the requested branch
+    // — that much was observed on the outgoing request.
+    //
+    // What is NOT observed, and must therefore not be asserted: whether the
+    // frontend treated this as a partial execution INTERNALLY. The panel sees
+    // the request body, not the queue loop. The frontend may have accepted the
+    // positional argument and run its queue-time widget hooks with
+    // isPartialExecution=true, only for a later layer to drop the field from
+    // the body; or it may have ignored the argument and run them as a full
+    // run. Both produce exactly the observation the panel made. Claiming the
+    // second would be asserting a cause from a bucket — the very defect this
+    // change exists to stop — so the note states the uncertainty instead.
     if (partialTargets && runScopeResult?.scopeAppliedBy === "request_body_repair") {
       accept.scope_applied_by = "request_body_repair";
       accept.scope_note =
-        `This frontend build did not carry the run-to-node scope through ` +
+        `The run-to-node scope did not reach the /prompt request through ` +
         `app.queuePrompt in either supported argument shape, so the panel wrote ` +
-        `partial_execution_targets into this run's own /prompt request and confirmed ` +
-        `it before dispatch. ONLY node ${to_node_id}'s branch was queued for execution. ` +
-        `One difference from a natively scoped run: the frontend ran its queue-time ` +
-        `widget hooks as if this were a full run (isPartialExecution=false), so a ` +
-        `control_after_generate widget may have advanced its value the way a full run ` +
-        `would. Please report this build (#556) — it is not reproducible against ` +
-        `ComfyUI_frontend 1.42-1.50.`;
+        `partial_execution_targets into this run's own request and confirmed it was ` +
+        `there before dispatch. OBSERVED: the request ComfyUI received names ONLY ` +
+        `node ${to_node_id} as an execution root, so only that branch executes. ` +
+        `NOT OBSERVED: whether the frontend also treated this as a partial execution ` +
+        `internally — the panel can see the request body but not the frontend's queue ` +
+        `loop. If it did not, its queue-time widget hooks ran as they would for a full ` +
+        `run, so a control_after_generate widget may have advanced its value ` +
+        `differently than a natively scoped run would. This does not change which ` +
+        `nodes execute. Please report this build (#556) — this path is not ` +
+        `reproducible against ComfyUI_frontend 1.42-1.50.`;
     }
     return accept;
   },

@@ -332,7 +332,13 @@ function readScopeFromBody(bodyText) {
     return { state: "body_unreadable", targets: null, bodyKeys, raw: undefined };
   }
   const t = body.partial_execution_targets;
-  if (t === undefined || t === null) return { state: "absent", targets: null, bodyKeys, raw: t };
+  // "absent" means the key is genuinely not there. JSON cannot encode
+  // `undefined`, so after a parse `undefined` is exactly "no such key". An
+  // explicit `null` is a key that IS present carrying an unusable value —
+  // reporting that as "no partial_execution_targets key at all" would
+  // contradict the body keys printed alongside it, and would be this module's
+  // own defect class (an observation collapsed into a definite negative).
+  if (t === undefined) return { state: "absent", targets: null, bodyKeys, raw: t };
   if (!Array.isArray(t)) return { state: "not_a_list", targets: null, bodyKeys, raw: t };
   if (!t.length) return { state: "empty", targets: null, bodyKeys, raw: t };
   return { state: "present", targets: t.map(String), bodyKeys, raw: t };

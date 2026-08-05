@@ -13,6 +13,9 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
 import {
   newScopedQueueMark,
@@ -729,6 +732,142 @@ test("#630 integration: a build honoring NEITHER shape is now HONOURED, not refu
     assert.ok(!sent.partial_execution_targets.includes("9"), "the unrelated SaveImage branch is not a root (#556)");
     assert.deepEqual(sent.prompt, OUR_OUTPUT, "the prompt itself is untouched by the repair");
     assert.equal(sent.number, result.queueMark, "the repaired body keeps this run's identity mark");
+  } finally {
+    stop();
+  }
+});
+
+test("#630 gate r1: batch=2 through the REPAIR path — EVERY post is repaired and EVERY body that reaches ComfyUI names only node 14", async () => {
+  // Repair must survive the batch accounting, not just the single-post case:
+  // a batch is N separate /prompt posts, and a scope that reached only the
+  // first would leave the rest running the full graph.
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "dropping", apiTarget });
+    app.queuePrompt = async (number, batch) => {
+      for (let i = 0; i < batch; i++) {
+        const body = frontendBody({ output: OUR_OUTPUT, number, targets: null }); // scope dropped every time
+        app.posted.push(body);
+        await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+      }
+      return true;
+    };
+    const ids = [];
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 2, toNodeId: 14,
+      onPromptId: (p) => ids.push(p),
+    });
+    assert.equal(result.outcome, "dispatched");
+    assert.equal(result.verified, 2, "the WHOLE batch verified — never dispatched on a partial");
+    assert.equal(result.repaired, 2, "both posts needed the repair, both got it");
+    assert.equal(result.scopeAppliedBy, "request_body_repair");
+    assert.deepEqual(ids, ["srv-1", "srv-2"], "every repaired prompt_id still reaches the recovery ledger");
+    // The assertion that matters: what ComfyUI was told to execute, per post.
+    assert.equal(server.calls.length, 2);
+    for (const call of server.calls) {
+      assert.deepEqual(
+        JSON.parse(call.options.body).partial_execution_targets,
+        ["14"],
+        "every post in the batch is scoped — not just the first",
+      );
+    }
+  } finally {
+    stop();
+  }
+});
+
+test("#630 gate r1: a batch where a LATER post drifts is still a truthful partial — repair never rescues a changed graph into a full-batch claim", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "dropping", apiTarget });
+    app.queuePrompt = async (number, batch) => {
+      for (let i = 0; i < batch; i++) {
+        // Post 2 of EACH attempt serializes a DRIFTED graph (a widget value
+        // changed under the deferred item). Per-attempt, not cumulative: the
+        // earlier argument-shape attempts must present the same situation.
+        const output = i === 0 ? OUR_OUTPUT : { ...OUR_OUTPUT, "3": { class_type: "KSampler", inputs: { steps: 99 } } };
+        const body = frontendBody({ output, number, targets: null });
+        app.posted.push(body);
+        const res = await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+        if (res.status !== 200) break; // the frontend's batch loop breaks on a refusal
+      }
+      return true;
+    };
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 2, toNodeId: 14 });
+    assert.equal(result.outcome, "refused", "never 'dispatched' on a partial batch");
+    assert.equal(result.verified, 1, "the truthful count of what IS queued");
+    assert.match(result.error, /1 of 2/);
+    assert.match(result.error, /graph changed/i, "the drift is named, not repaired away");
+    assert.equal(server.calls.length, 1, "only the undrifted post reached ComfyUI");
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
+  } finally {
+    stop();
+  }
+});
+
+test("#630 gate r1: graph_run's repair disclosure separates what was OBSERVED from what was not — it never asserts the frontend's internal hook mode", () => {
+  // The panel sees the outgoing request body, not the frontend's queue loop.
+  // Two different frontend behaviours produce the identical observation: the
+  // positional argument accepted (hooks ran partial) with the field dropped
+  // later, or the argument ignored outright (hooks ran full). Naming the
+  // second as fact would be asserting a cause from a bucket — the exact defect
+  // this change exists to remove — so the note must state the uncertainty.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const source = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.js"), "utf8").replace(/\r\n/g, "\n");
+  const start = source.indexOf('accept.scope_applied_by = "request_body_repair"');
+  assert.ok(start > 0, "graph_run discloses a body-repaired scope rather than reporting it as a native scoped run");
+  // Rebuild the message the caller actually receives: the source spells it as
+  // adjacent template chunks joined with `+`, so strip the concatenation
+  // scaffolding and assert against the prose itself, not its line breaks.
+  const note = source
+    .slice(start, start + 1800)
+    .replace(/`\s*\+\s*\n\s*`/g, "")
+    .replace(/\s+/g, " ");
+  assert.match(note, /OBSERVED: the request ComfyUI received names ONLY node \$\{to_node_id\} as an execution root/,
+    "what the panel actually saw is labelled as such, and it is which nodes execute");
+  assert.match(note, /NOT OBSERVED: whether the frontend also treated this as a partial execution internally/,
+    "and what it could not see is labelled too");
+  // The discredited definite claim must be gone, not softened around.
+  assert.doesNotMatch(
+    note,
+    /the frontend ran its queue-time widget hooks as if this were a full run/,
+    "the unobserved hook mode must never be stated as fact",
+  );
+  assert.match(note, /If it did not, its queue-time widget hooks ran/,
+    "the hook consequence is conditional on the unobserved branch");
+  assert.match(note, /does not change which nodes execute/, "and its blast radius is bounded honestly");
+});
+
+test("#630 gate r2: an explicit partial_execution_targets:null is a PRESENT key, never reported as 'no key at all'", async () => {
+  // The body keys printed as evidence would show the key present. Saying the
+  // key was absent would contradict the panel's own evidence — the observed-
+  // state-collapsed-into-a-definite-negative defect this split exists to stop.
+  const stop = keepAlive();
+  try {
+    const orig = makeServer();
+    const guard = createScopedRunGuard({
+      origFetchApi: orig,
+      execIds: ["14"],
+      contentHash: OUR_HASH,
+      batch: 1,
+      toNodeId: 14,
+      queueMark: MARK_A,
+    });
+    await guard(...promptPost({ prompt: OUR_OUTPUT, client_id: "x", number: MARK_A, partial_execution_targets: null }));
+    assert.equal(guard.state.droppedReason, "scope_not_a_list", "a present-but-unusable value is not an absent key");
+    assert.doesNotMatch(guard.state.dropped, /no partial_execution_targets key at all/);
+    assert.match(guard.state.dropped, /was not a list \(null\)/);
+    // …while a genuinely absent key still reads as absent.
+    const g2 = createScopedRunGuard({
+      origFetchApi: makeServer(), execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
+    });
+    await g2(...promptPost({ prompt: OUR_OUTPUT, client_id: "x", number: MARK_A }));
+    assert.equal(g2.state.droppedReason, "scope_missing");
+    assert.match(g2.state.dropped, /no partial_execution_targets key at all/);
   } finally {
     stop();
   }
