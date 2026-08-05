@@ -188,7 +188,7 @@ test("#433 wiring: reconnect bumps the epoch on a MONOTONIC clock; open/new/read
   }
 
   // BOTH readers must consult the helper — checked in their OWN bodies, not globally.
-  for (const sig of ["workflow_list()", "graph_outline()"]) {
+  for (const sig of ["workflow_list()", "graph_outline({"]) {
     const body = handlerBody(src, sig);
     assert.ok(body, `${sig} must exist`);
     assert.match(body, /activeWorkflowPossiblyStale\(\{/, `${sig} must check post-reconnect staleness`);
@@ -201,7 +201,7 @@ test("#429 wiring: every group-membership READ handler resyncs live rects BEFORE
   const src = readFileSync(PANEL_JS, "utf8");
   const handlers = [
     "graph_get_state()",
-    "graph_outline()",
+    "graph_outline({",
     "graph_query({",
     "graph_auto_layout({",
     "graph_subgraph_group({",

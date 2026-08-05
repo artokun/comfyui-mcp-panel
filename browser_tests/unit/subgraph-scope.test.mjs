@@ -424,18 +424,26 @@ test("resolveScope: at root ⇒ scope 'root'", () => {
 
 // THE #220 lockstep test: after a reconnect the root graph is REBUILT (new owner
 // instance whose .subgraph is a NEW object), but the canvas still references the OLD
-// subgraph. The old canvas subgraph is unreachable from the live root ⇒ STALE.
-test("#220/#308: stale canvas subgraph (rebuilt root) ⇒ reconcile to root, read+edit in lockstep", () => {
-  const staleSub = makeSubgraph({ name: "old", nodes: [{ id: 87 }, { id: 88 }] });
-  // Rebuilt root: a fresh owner node whose subgraph is a DIFFERENT object.
+// subgraph. The old canvas subgraph is unreachable from the live root.
+//
+// #604 UPDATE — what happens next is decided by CONTENT, not by the graph's kind.
+// A PROVABLY content-free ghost is reconciled to root exactly as before (nothing can
+// be lost). A ghost that still HOLDS nodes is NOT reconciled: "unreachable" proves
+// only that the rebuilt root does not own it, never that it is disposable, and
+// repainting it away destroyed a user's unsaved graph in the root-level form of this
+// same bug. Both branches keep #220's actual guarantee — a read and an edit issued
+// back-to-back can never target two different graphs — the second by refusing both.
+test("#220/#308: a PROVABLY EMPTY ghost subgraph still reconciles to root, read+edit in lockstep", () => {
+  const emptyGhost = makeSubgraph({ name: "old" });
+  emptyGhost.serialize = () => ({ nodes: [] });
   const freshSub = makeSubgraph({ name: "new", nodes: [{ id: 87 }, { id: 88 }] });
-  const freshOwner = { id: 128, subgraph: freshSub };
-  const app = makeApp({ rootNodes: [freshOwner], canvasGraph: staleSub });
+  const app = makeApp({ rootNodes: [{ id: 128, subgraph: freshSub }], canvasGraph: emptyGhost });
 
   const scope = resolveScope(app);
-  // The read scope resolves to ROOT (not a phantom subgraph) because staleSub is
+  // The read scope resolves to ROOT (not a phantom subgraph) because emptyGhost is
   // unreachable from the rebuilt root — so it AGREES with where writes would land.
-  assert.equal(scope.stale, true, "unreachable canvas subgraph must be flagged stale");
+  assert.equal(scope.stale, true, "an unreachable, provably-empty canvas subgraph is reconcilable");
+  assert.equal(scope.diverged, false);
   assert.equal(scope.scope, "root");
   assert.equal(scope.graph, app.graph, "reads reconcile to the live root");
   assert.equal(scope.rootGraph, app.graph);
@@ -450,6 +458,37 @@ test("#220/#308: stale canvas subgraph (rebuilt root) ⇒ reconcile to root, rea
   assert.equal(app.canvas.graph, app.graph);
   // Re-resolving is now cleanly at root (no residual subgraph claim).
   assert.equal(resolveScope(app).scope, "root");
+});
+
+test("#604: a ghost subgraph that still HOLDS NODES is a divergence — never repainted away", () => {
+  const staleSub = makeSubgraph({ name: "old", nodes: [{ id: 87 }, { id: 88 }] });
+  staleSub.serialize = () => ({ nodes: [{ id: 87 }, { id: 88 }] });
+  const freshSub = makeSubgraph({ name: "new", nodes: [{ id: 87 }, { id: 88 }] });
+  const app = makeApp({ rootNodes: [{ id: 128, subgraph: freshSub }], canvasGraph: staleSub });
+
+  const scope = resolveScope(app);
+  assert.equal(scope.diverged, true, "a content-bearing unreachable canvas graph is unresolvable");
+  assert.equal(
+    scope.stale,
+    false,
+    "stale is the caller's REPAINT trigger — arming it would discard whatever the ghost holds",
+  );
+  assert.equal(scope.divergedKind, "subgraph", "the kind only selects the remedy wording");
+  assert.equal(scope.graph, staleSub, "the reported graph is the one the user is looking at");
+
+  // The caller's repaint is keyed on `stale`, so it cannot fire here.
+  if (scope.stale) app.canvas.setGraph(scope.rootGraph);
+  assert.equal(app.canvas.graph, staleSub, "the ghost's contents are still reachable to the user");
+});
+
+test("#604: an UNSERIALIZABLE empty ghost is not PROVEN empty — it fails closed to a divergence", () => {
+  // A bare empty `_nodes` array is node-level evidence only: without serialize()
+  // there is no way to prove the ghost holds no groups/links/nested subgraphs.
+  const ghost = makeSubgraph({ name: "unprovable" });
+  const app = makeApp({ rootNodes: [], canvasGraph: ghost });
+  const scope = resolveScope(app);
+  assert.equal(scope.diverged, true);
+  assert.equal(scope.stale, false);
 });
 
 // #308 specifically: query and exit must AGREE. A valid subgraph → both see it; a
@@ -489,10 +528,22 @@ test("#308: query scope and exit scope derive from the SAME resolver (cannot dis
   assert.equal(q.scope, "subgraph");
   assert.notEqual(q.graph, q.rootGraph, "exit_subgraph would proceed, not report 'already at root'");
 
-  // Stale subgraph: query reconciles to root, so a following exit reporting root is
-  // consistent — no 'subgraph then already-at-root' contradiction.
-  const app2 = makeApp({ rootNodes: [{ id: 130, subgraph: makeSubgraph({ name: "fresh" }) }], canvasGraph: makeSubgraph({ name: "stale" }) });
+  // Provably-empty stale subgraph: query reconciles to root, so a following exit
+  // reporting root is consistent — no 'subgraph then already-at-root' contradiction.
+  const emptyStale = makeSubgraph({ name: "stale" });
+  emptyStale.serialize = () => ({ nodes: [] });
+  const app2 = makeApp({ rootNodes: [{ id: 130, subgraph: makeSubgraph({ name: "fresh" }) }], canvasGraph: emptyStale });
   const q2 = resolveScope(app2);
   assert.equal(q2.scope, "root");
   assert.equal(q2.graph, q2.rootGraph, "exit truthfully reports root; query already said root too");
+
+  // #604 — a stale subgraph the resolver CANNOT resolve (content-bearing) is reported
+  // as diverged to BOTH tools from the same resolver, so query and exit still cannot
+  // disagree: neither proceeds, and neither claims a scope it did not verify.
+  const heldStale = makeSubgraph({ name: "held", nodes: [{ id: 5 }] });
+  heldStale.serialize = () => ({ nodes: [{ id: 5 }] });
+  const app3 = makeApp({ rootNodes: [{ id: 130, subgraph: makeSubgraph({ name: "fresh" }) }], canvasGraph: heldStale });
+  const q3 = resolveScope(app3);
+  assert.equal(q3.diverged, true, "query refuses");
+  assert.equal(resolveScope(app3).diverged, true, "exit, deriving from the same resolver, refuses identically");
 });
