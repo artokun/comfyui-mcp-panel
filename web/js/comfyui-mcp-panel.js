@@ -15737,6 +15737,12 @@ function describeCommand(cmd, msg, reply) {
       // but guard defensively — never render an un-synced promoted write as a plain
       // "Set …" success, or the summary would repeat the exact #366 lie.
       const railStale = r.set?.promoted_from && r.set.promoted_from.parent_widget_synced === false;
+      // #639: a write whose widget write-path (value setter or callback) threw
+      // AFTER the value verified is APPLIED (not refused) — the summary must carry
+      // the disclosure, never a plain "Set …" success that hides the uncertainty
+      // about side effects. The wording stays neutral: `write_warning` covers a
+      // throwing SETTER too, so it must not assert the callback was the thrower.
+      const writeDisclosed = typeof r.set?.write_warning === "string";
       return railStale
         ? {
             icon: "pi-exclamation-triangle",
@@ -15744,8 +15750,12 @@ function describeCommand(cmd, msg, reply) {
             detail: `was ${JSON.stringify(r.set?.previous)}`,
           }
         : {
-            icon: "pi-sliders-h",
-            text: `Set ${r.set?.widget} = ${JSON.stringify(r.set?.value)} on node ${r.set?.node_id}`,
+            icon: writeDisclosed ? "pi-exclamation-triangle" : "pi-sliders-h",
+            text:
+              `Set ${r.set?.widget} = ${JSON.stringify(r.set?.value)} on node ${r.set?.node_id}` +
+              (writeDisclosed
+                ? ` — value applied and verified, but the widget's setter or callback threw; side effects may not have run or completed`
+                : ""),
             detail: `was ${JSON.stringify(r.set?.previous)}`,
           };
     }

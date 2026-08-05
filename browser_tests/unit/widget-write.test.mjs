@@ -583,10 +583,16 @@ test("combo: a numeric index is NOT reinterpreted as a dropdown position", () =>
   assert.equal(node.widgets[0].value, "alpha");
 });
 
-test("combo: numeric-STRING options reject the number 1 (strict, no coercion) but accept \"1\"", () => {
+test("combo: numeric-STRING options accept the number 1 via a LABEL match and write back the original string (#667)", () => {
+  // The old strict rule refused the number 1 against ["0","1","2"] so a number
+  // could never be reinterpreted as an index. The #667 fallback keeps that
+  // guarantee differently: it matches the option's LABEL stringified and writes
+  // back the list's ORIGINAL value, so the number itself never lands on the widget.
   const mk = () => ({ id: 1, type: "N", widgets: [{ name: "c", options: { values: ["0", "1", "2"] }, value: "0" }] });
   const nNum = mk();
-  assert.throws(() => applyWidgetWrite(nNum, "c", 1, HOOKS), WidgetWriteError);
+  const set = applyWidgetWrite(nNum, "c", 1, HOOKS);
+  assert.equal(set.value, "1");
+  assert.equal(typeof set.value, "string", "the original string option is written, never the incoming number");
   const nStr = mk();
   assert.equal(applyWidgetWrite(nStr, "c", "1", HOOKS).value, "1");
 });
@@ -1184,26 +1190,28 @@ test("#366: the rail write lands INSIDE the undo envelope (before afterChange fi
   assert.equal(parentValueAtAfterChange, 704, "parent must be written before afterChange (single undo op)");
 });
 
-test("#366 ATOMIC: an INNER callback that throws rolls BOTH back — no partial write, surfaced as failure", () => {
+test("#366×#639: an INNER callback that throws AFTER the value landed is DISCLOSED, not rolled back — the write already took effect", () => {
+  // #639 changed the contract this test pinned: a throw from the callback fires
+  // AFTER both values are assigned, so inner=new / parent=stale — the partial
+  // state #366's atomicity guards — cannot arise from the throw. Rolling a
+  // verified write back and refusing would report failure for work that succeeded
+  // and invite a destructive retry, so the result is success + write_warning.
   const { parent, inner, resolveSource } = makePromotedMirrorFixture();
   // Inner widget callback throws AFTER the inner value is assigned.
   inner.widgets[0].callback = () => {
     throw new Error("inner boom");
   };
   let afterChangeRan = false;
-  assert.throws(
-    () =>
-      applyWidgetWrite(parent, "value_2", 704, {
-        resolveSource,
-        afterChange: () => {
-          afterChangeRan = true;
-        },
-      }),
-    (err) => err instanceof WidgetWriteError && /callback threw|inner boom/.test(err.message),
-  );
-  // ROLLED BACK: neither inner nor parent rail left at the new value.
-  assert.equal(inner.widgets[0].value, 1280, "inner rolled back");
-  assert.equal(parent.widgets[0].value, 1280, "parent rolled back — never inner=new/parent=stale");
+  const set = applyWidgetWrite(parent, "value_2", 704, {
+    resolveSource,
+    afterChange: () => {
+      afterChangeRan = true;
+    },
+  });
+  // NOT rolled back: both inner and parent rail hold the new value (verified).
+  assert.equal(inner.widgets[0].value, 704, "inner write stays — it took effect before the throw");
+  assert.equal(parent.widgets[0].value, 704, "rail synced — never reported failed while applied");
+  assert.match(set.write_warning ?? "", /callback threw \(inner boom\)/, "the throw is disclosed, not hidden");
   assert.equal(afterChangeRan, true, "afterChange still closes the envelope");
 });
 
@@ -1273,7 +1281,10 @@ test("#366: a value setter that REJECTS the rollback surfaces an HONEST partial-
       this._touched = true;
     },
     callback() {
-      throw new Error("inner boom");
+      // #639: a callback THROW no longer forces rollback (a verified write is
+      // disclosed, not refused) — drift the value so verification fails and the
+      // rollback path under test actually runs.
+      this._v = 999;
     },
   };
   inner.widgets.push(w);
@@ -1307,11 +1318,14 @@ test("#366: a value setter that SILENTLY IGNORES the rollback (keeps the new val
     },
     set value(x) {
       // Ignore any attempt to restore the old value (silent no-op rollback).
-      if (x === 1280 && this._v === 704) return;
+      if (x === 1280 && this._v !== 1280) return;
       this._v = x;
     },
     callback() {
-      throw new Error("inner boom");
+      // #639: a callback THROW no longer forces rollback (a verified write is
+      // disclosed, not refused) — drift the value so verification fails and the
+      // rollback path under test actually runs.
+      this._v = 999;
     },
   };
   inner.widgets.push(w);
@@ -1334,7 +1348,7 @@ test("#366: a value setter that SILENTLY IGNORES the rollback (keeps the new val
   );
 });
 
-test("#366 ATOMIC: a THROWING afterChange hook does not bypass rollback", () => {
+test("#366×#639: a THROWING afterChange hook does not bypass verification — a verified write is still disclosed, not refused", () => {
   const { parent, inner, resolveSource } = makePromotedMirrorFixture();
   inner.widgets[0].callback = () => {
     throw new Error("inner boom");
@@ -1342,12 +1356,12 @@ test("#366 ATOMIC: a THROWING afterChange hook does not bypass rollback", () => 
   const afterChange = () => {
     throw new Error("afterChange boom");
   };
-  assert.throws(
-    () => applyWidgetWrite(parent, "value_2", 704, { resolveSource, afterChange }),
-    (err) => err instanceof WidgetWriteError && /callback threw|inner boom/.test(err.message),
-  );
-  assert.equal(inner.widgets[0].value, 1280, "inner rolled back despite a throwing afterChange hook");
-  assert.equal(parent.widgets[0].value, 1280, "rail untouched / rolled back");
+  const set = applyWidgetWrite(parent, "value_2", 704, { resolveSource, afterChange });
+  // Verification ran to completion despite BOTH hooks throwing: the write took
+  // effect and is disclosed, never reported as a clean failure (#639).
+  assert.equal(inner.widgets[0].value, 704, "inner write stays");
+  assert.equal(parent.widgets[0].value, 704, "rail synced");
+  assert.match(set.write_warning ?? "", /callback threw \(inner boom\)/);
 });
 
 test("#366 HARD FAIL: an afterChange HOOK that re-stales the rail (after all callbacks) is still caught + rolled back", () => {
@@ -1483,7 +1497,10 @@ test("#366 HARD FAIL: a rollback afterChange that mutates the RESTORED composite
     name: "value",
     value: { on: true, lora: "a.safetensors", strength: 1 },
     callback() {
-      throw new Error("inner boom"); // force entry into rollback
+      // #639: a callback THROW no longer forces rollback (a verified write is
+      // disclosed, not refused) — drift the written composite in place so
+      // verification fails and the rollback path under test actually runs.
+      this.value.strength = 12345;
     },
   };
   const inner = { id: 300, type: "Power Lora Loader (rgthree)", widgets: [innerW] };
@@ -1909,9 +1926,11 @@ test("#477 P1: a STATEFUL afterChange that RE-ADDS a replacement proxy every fir
   const newProxy = { name: "value_2", type: "INT", value: 1280 };
   const hostInput = { name: "value_2", _widget: railWidget, widget: oldProxy, _subgraphSlot: { name: "value_2" } };
   const parent = { id: 267, type: "SubgraphNode", subgraph, inputs: [hostInput], widgets: [railWidget, oldProxy] };
-  // Inner callback throws → forces rollback.
-  inner.widgets[0].callback = () => {
-    throw new Error("inner callback boom");
+  // Inner callback DRIFTS the value → verification fails → forces rollback. (#639:
+  // a callback THROW no longer forces rollback — a verified write is disclosed,
+  // not refused — so this fixture drives the rollback path with a real failure.)
+  inner.widgets[0].callback = function () {
+    this.value = 999;
   };
   const resolveSource = (_n, si) =>
     si?.name === "value_2" ? { sourceNodeId: "257", sourceWidgetName: "value" } : null;
@@ -2327,4 +2346,265 @@ test("#507 confirmation round: coerceWidgetValue reports empty-list acceptance O
     (err) => err instanceof WidgetWriteError && err.emptyOptions === true && err.combo === true,
   );
   assert.equal(outOff.emptyAcceptanceUsed, undefined);
+});
+
+// ---- #667: combo options whose LABEL is numeric (VHS ProRes profile "4444",
+//      ffv1 level ["0","1","3"]). The tool's value param is string|number|boolean,
+//      so a numeric-looking label can arrive as the NUMBER 4444 after upstream JSON
+//      coercion; strict typed membership then refused it even though the label sits
+//      right there in the option list — the option was unreachable via the panel.
+//      The fallback matches the option's LABEL stringified and writes back the
+//      option's ORIGINAL value from the list — never the incoming scalar — so no
+//      mistyped value lands on the widget and no number is ever reinterpreted as
+//      an INDEX (#240 intact). -----------------------------------------------
+
+test("#667: a numeric-labelled combo option is reachable when the value arrives as a NUMBER (VHS ProRes '4444')", () => {
+  const mk = () => ({
+    id: 226,
+    type: "VHS_VideoCombine",
+    widgets: [
+      {
+        name: "profile",
+        type: "combo",
+        options: { values: ["lt", "standard", "hq", "4444", "4444xq"] },
+        value: "hq",
+      },
+    ],
+  });
+  const node = mk();
+  const set = applyWidgetWrite(node, "profile", 4444, HOOKS);
+  assert.equal(set.value, "4444");
+  assert.equal(typeof set.value, "string", "the list's ORIGINAL string option is written, not the incoming number");
+  assert.equal(node.widgets[0].value, "4444");
+  // The exact string still takes the strict-membership path (unchanged).
+  assert.equal(applyWidgetWrite(mk(), "profile", "4444", HOOKS).value, "4444");
+  // A non-numeric label is untouched by the fallback.
+  assert.equal(applyWidgetWrite(mk(), "profile", "4444xq", HOOKS).value, "4444xq");
+});
+
+test("#667: string-valued numeric enum labels (ffv1 level ['0','1','3']) accept the number, write back the string", () => {
+  const node = { id: 1, type: "N", widgets: [{ name: "level", options: { values: ["0", "1", "3"] }, value: "0" }] };
+  const set = applyWidgetWrite(node, "level", 3, HOOKS);
+  assert.equal(set.value, "3");
+  assert.equal(typeof set.value, "string");
+  assert.equal(node.widgets[0].value, "3");
+});
+
+test("#667: the fallback writes back the ORIGINAL option — string '1' into numeric options [0,1,2] writes the NUMBER 1", () => {
+  const node = { id: 1, type: "N", widgets: [{ name: "c", options: { values: [0, 1, 2] }, value: 0 }] };
+  const set = applyWidgetWrite(node, "c", "1", HOOKS);
+  assert.equal(set.value, 1);
+  assert.equal(typeof set.value, "number", "the list's original numeric option, not the incoming string");
+});
+
+test("#667: an OFF-list numeric value is still refused — no label match, no index semantics (#240)", () => {
+  const mk = () => ({
+    id: 1,
+    type: "N",
+    widgets: [{ name: "c", options: { values: ["lt", "standard", "hq", "4444", "4444xq"] }, value: "hq" }],
+  });
+  // 1 is not a LABEL in this list — it must NOT be read as a dropdown position.
+  assert.throws(
+    () => applyWidgetWrite(mk(), "c", 1, HOOKS),
+    (err) => err instanceof WidgetWriteError && /not a valid option/.test(err.message),
+  );
+  assert.throws(
+    () => applyWidgetWrite(mk(), "c", 9999, HOOKS),
+    (err) => err instanceof WidgetWriteError && /not a valid option/.test(err.message),
+  );
+  const untouched = mk();
+  assert.throws(() => applyWidgetWrite(untouched, "c", 1, HOOKS), WidgetWriteError);
+  assert.equal(untouched.widgets[0].value, "hq", "must not have mutated on reject");
+});
+
+// ---- #639: a throwing widget callback does NOT void a write that already took
+//      effect. The value assignments run BEFORE the callback fires, so when the
+//      callback throws (MiniMaxH3Director's `duration`: the DaSiWa extension's
+//      lengthWidget callback throws on `options` of undefined on ANY programmatic
+//      invocation) the write may ALREADY be in effect. Rolling it back and
+//      refusing would report failure for work that succeeded and invite a
+//      destructive retry — so a VERIFIED write is reported as applied with a
+//      `write_warning` disclosure; only a write that ALSO fails verification
+//      fails + rolls back. ---------------------------------------------------
+
+test("#639: a throwing callback on a verified write is DISCLOSED (write_warning), not refused — the value stays", () => {
+  const node = {
+    id: 2693,
+    type: "MiniMaxH3Director",
+    widgets: [
+      {
+        name: "duration",
+        type: "INT",
+        value: 5,
+        callback() {
+          throw new TypeError("Cannot read properties of undefined (reading 'options')");
+        },
+      },
+    ],
+  };
+  const set = applyWidgetWrite(node, "duration", 10, HOOKS);
+  assert.equal(node.widgets[0].value, 10, "the write took effect and is NOT rolled back");
+  assert.equal(set.value, 10);
+  assert.ok(typeof set.write_warning === "string", "the throw is disclosed, never hidden");
+  assert.match(set.write_warning, /callback threw/, "names what threw");
+  assert.match(set.write_warning, /reading 'options'/, "carries the original error message");
+  assert.match(set.write_warning, /DID take effect/, "says the write applied — never a clean-failure report");
+});
+
+test("#639: a promoted write whose inner callback throws still discloses success when inner + rail both verify", () => {
+  const { parent, inner, resolveSource } = makePromotedMirrorFixture();
+  inner.widgets[0].callback = () => {
+    throw new Error("inner boom");
+  };
+  const set = applyWidgetWrite(parent, "value_2", 704, { resolveSource });
+  assert.equal(inner.widgets[0].value, 704);
+  assert.equal(parent.widgets[0].value, 704, "rail synced — the write genuinely took effect");
+  assert.equal(set.promoted_from.parent_widget_synced, true);
+  assert.match(set.write_warning ?? "", /inner boom/);
+});
+
+test("#639: a callback that throws AND leaves the write unverified still FAILS + rolls back, naming the throw", () => {
+  // Three DISTINCT values so each leg is proven independently (codex round-1):
+  // seenAtCallback==="a" proves the assignment ran BEFORE the callback; the drift
+  // to "c" is what verification rejects; the final "b" proves rollback restored
+  // the ORIGINAL — not the drifted value, not the requested one.
+  let seenAtCallback;
+  const node = {
+    id: 1,
+    type: "N",
+    widgets: [
+      {
+        name: "c",
+        options: { values: ["a", "b", "c"] },
+        value: "b",
+        callback() {
+          seenAtCallback = this.value;
+          this.value = "c"; // drift to a THIRD value, THEN throw
+          throw new Error("combo boom");
+        },
+      },
+    ],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "c", "a", HOOKS),
+    (err) =>
+      err instanceof WidgetWriteError &&
+      /callback threw \(combo boom\)/.test(err.message) &&
+      /did not retain the requested value/.test(err.message),
+  );
+  assert.equal(seenAtCallback, "a", "the requested value WAS assigned before the callback fired");
+  assert.equal(node.widgets[0].value, "b", "rolled back to the ORIGINAL — not the drift, not the request");
+});
+
+test("#639: a thrown WidgetWriteError on an unverified write keeps BOTH causes and its retry flags", () => {
+  const node = {
+    id: 1,
+    type: "N",
+    widgets: [
+      {
+        name: "c",
+        options: { values: ["a", "b", "c"] },
+        value: "b",
+        callback() {
+          this.value = "c"; // drift so verification fails
+          throw new WidgetWriteError("combo list went stale", { combo: true });
+        },
+      },
+    ],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "c", "a", HOOKS),
+    (err) =>
+      err instanceof WidgetWriteError &&
+      err.combo === true && // the refresh-retry signal survives the composition
+      /callback threw \(combo list went stale\)/.test(err.message) &&
+      /did not retain the requested value/.test(err.message),
+  );
+  assert.equal(node.widgets[0].value, "b", "rolled back");
+});
+
+test("#639: a throwing value SETTER on a verified write is disclosed with union wording (no unestablishable attribution)", () => {
+  const w = {
+    name: "n",
+    type: "INT",
+    _v: 1,
+    get value() {
+      return this._v;
+    },
+    set value(x) {
+      this._v = x; // applies FIRST…
+      throw new Error("setter boom"); // …then throws
+    },
+    callback() {
+      throw new Error("must not be blamed — this never fired");
+    },
+  };
+  const node = { id: 1, type: "N", widgets: [w] };
+  const set = applyWidgetWrite(node, "n", 5, HOOKS);
+  assert.equal(node.widgets[0].value, 5, "the setter applied before throwing — the write is in effect");
+  assert.match(set.write_warning ?? "", /setter or callback threw/);
+  assert.match(set.write_warning ?? "", /setter boom/);
+  assert.match(set.write_warning ?? "", /DID take effect/);
+  assert.doesNotMatch(
+    set.write_warning ?? "",
+    /never ran|after applying|the widget's own callback threw/,
+    "claims nothing the mechanism cannot establish (codex round-3)",
+  );
+});
+
+test("#639: a REENTRANT setter (one that invokes the callback, which throws) gets the same honest union wording", () => {
+  // codex round-2/3: a value setter can invoke `this.callback()` itself and let
+  // its exception propagate — then the callback DID run and threw, but the throw
+  // surfaced from the ASSIGNMENT. The disclosure names only the union and never
+  // asserts which one threw or whether the callback ran.
+  const w = {
+    name: "n",
+    type: "INT",
+    _v: 1,
+    get value() {
+      return this._v;
+    },
+    set value(x) {
+      this._v = x;
+      this.callback(); // reentrant: the callback runs INSIDE the setter and throws
+    },
+    callback() {
+      throw new Error("reentrant boom");
+    },
+  };
+  const node = { id: 1, type: "N", widgets: [w] };
+  const set = applyWidgetWrite(node, "n", 5, HOOKS);
+  assert.equal(node.widgets[0].value, 5, "the write is in effect");
+  assert.match(set.write_warning ?? "", /setter or callback threw/);
+  assert.match(set.write_warning ?? "", /reentrant boom/);
+  assert.doesNotMatch(set.write_warning ?? "", /callback never ran|after applying/);
+});
+
+test("#667×#507: a numeric request against a numeric-LABELLED rail option is ADOPTED on the empty-inner-list path (codex round-3)", () => {
+  // The promoted empty-list acceptance writes a value nothing validated; the
+  // sibling rail cross-check is the only validator — and it applied STRICT typed
+  // membership, so a numeric 4444 against the rail's string "4444" was refused
+  // even though the rail itself publishes that option (#667 on the #507 path).
+  const { parent, inner, railWidget, resolveSource } = makeEmptyInnerPromotedFixture({
+    values: ["lt", "standard", "hq", "4444", "4444xq"],
+  });
+  const set = applyWidgetWrite(parent, "model_alias", 4444, {
+    ...HOOKS,
+    resolveSource,
+    acceptEmptyComboOptions: true,
+  });
+  assert.equal(set.value, "4444");
+  assert.equal(typeof set.value, "string", "the rail list's ORIGINAL option is written, not the incoming number");
+  assert.equal(inner.widgets[0].value, "4444");
+  assert.equal(railWidget.value, "4444", "the rail is synced with its own original option");
+});
+
+test("#667×#507: a numeric request matching NO rail label is still refused on the empty-inner-list path", () => {
+  const { parent, inner, railWidget, resolveSource } = makeEmptyInnerPromotedFixture({ values: ["lt", "hq"] });
+  assert.throws(
+    () => applyWidgetWrite(parent, "model_alias", 4444, { ...HOOKS, resolveSource, acceptEmptyComboOptions: true }),
+    (err) => err instanceof WidgetWriteError && /not a valid option for the parent subgraph/.test(err.message),
+  );
+  assert.equal(inner.widgets[0].value, "", "untouched — refused before any mutation");
+  assert.equal(railWidget.value, "", "rail untouched");
 });

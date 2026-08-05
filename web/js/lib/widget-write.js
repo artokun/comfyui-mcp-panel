@@ -73,6 +73,25 @@ export function isComboWidget(widget) {
   return String(widget?.type ?? "").toLowerCase() === "combo";
 }
 
+/**
+ * #667: the index of the option whose stringified LABEL equals the stringified
+ * scalar `value`, or -1. Scalars only (string/number/boolean) on both sides.
+ * Used by the combo coercion fallback AND by the #507 empty-list sibling rail
+ * cross-check, so both apply the SAME matching rule; callers always write back
+ * the list's ORIGINAL option, never the incoming scalar, so no number is ever
+ * reinterpreted as an index and no mistyped value lands (#240 intact).
+ */
+function optionLabelIndex(options, value) {
+  if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
+    return -1;
+  }
+  return options.findIndex(
+    (o) =>
+      (typeof o === "string" || typeof o === "number" || typeof o === "boolean") &&
+      String(o) === String(value),
+  );
+}
+
 // litegraph "number"/"slider" and Comfy "INT"/"FLOAT" all render numeric.
 export function isNumericWidget(widget) {
   const t = String(widget?.type ?? "").toLowerCase();
@@ -378,10 +397,20 @@ export function coerceWidgetValue(
         { combo: true, emptyOptions: true },
       );
     }
-    // STRICT typed membership: no numeric<->string coercion. Numeric options
-    // [0,1,2] accept numeric 1; string options ["0","1","2"] require "1", never
-    // the number 1 (which would otherwise behave like an index).
+    // STRICT typed membership first: an exact-typed option is always writable.
     if (options.includes(value)) return value;
+    // #667: NUMERIC-LABELLED options (VHS ProRes profile ["lt",…,"4444",…], ffv1
+    // level ["0","1","3"]). The tool's `value` param is string|number|boolean, so a
+    // numeric-looking label can arrive as the NUMBER 4444 after upstream JSON
+    // coercion, and strict membership then refused it even though the label sits in
+    // the list — the option was unreachable via the panel. Fall back to matching the
+    // option's LABEL stringified, and on a match return the option's ORIGINAL value
+    // from the list — NEVER the incoming scalar — so no mistyped value lands on the
+    // widget and no number is ever reinterpreted as an INDEX: the #240 concern was
+    // a number silently read as a dropdown position, and that stays refused below
+    // (options ["alpha","beta","gamma"] with value 1 matches no label).
+    const labelIdx = optionLabelIndex(options, value);
+    if (labelIdx >= 0) return options[labelIdx];
     const preview = options.slice(0, 40).map((o) => JSON.stringify(o)).join(", ");
     throw new WidgetWriteError(
       `Value ${JSON.stringify(value)} is not a valid option for combo widget ` +
@@ -909,7 +938,11 @@ export function applyWidgetWrite(
   // /object_info gate authorized (#458), and resolveWidgetWrite also fails closed if
   // the AUTHORITATIVE parent rail widget can't be identified (#366).
   const coerceOutcome = {};
-  const { targetNode, widget: w, coerced, promotedFrom, promotedParentWidget, promotedParentWidgets, promotedHostInput } =
+  // `coerced` is mutable: the #507 empty-list sibling cross-check below may ADOPT a
+  // rail option's original value when the numeric-labelled fallback matches there
+  // (#667 codex round-3) — the write then lands the list's own value, not the
+  // caller's coerced scalar.
+  let { targetNode, widget: w, coerced, promotedFrom, promotedParentWidget, promotedParentWidgets, promotedHostInput } =
     resolveWidgetWrite(node, widgetName, value, resolveSource, assertTargetWritable, promotedResolution, {
       acceptEmptyComboOptions,
       // Filled in by coerceWidgetValue when the EMPTY-LIST acceptance (not ordinary
@@ -975,6 +1008,17 @@ export function applyWidgetWrite(
       const otherOptions = comboOptions(other);
       if (!Array.isArray(otherOptions) || otherOptions.length === 0) continue;
       if (otherOptions.includes(coerced)) continue;
+      // #667 (codex round-3): the SAME numeric-labelled-option rule applies here —
+      // a numeric request (4444) against a rail list holding the string "4444" must
+      // not refuse an option the rail itself publishes. On a label match ADOPT the
+      // rail list's ORIGINAL value for the whole write (the inner's empty list
+      // accepted any scalar, so writing the rail's own option there is at least as
+      // valid), never the incoming scalar — the #240 no-index guarantee holds.
+      const siblingLabelIdx = optionLabelIndex(otherOptions, coerced);
+      if (siblingLabelIdx >= 0) {
+        coerced = otherOptions[siblingLabelIdx];
+        continue;
+      }
       throw new WidgetWriteError(
         `Value ${JSON.stringify(coerced)} is not a valid option for the parent subgraph's ` +
           `combo widget "${other.name}" (${otherOptions.length} options), which this promoted ` +
@@ -1090,26 +1134,37 @@ export function applyWidgetWrite(
     // same single invocation a manual UI edit of the promoted control performs.
     w.callback?.(coerced, canvas, targetNode, targetNode.pos, undefined);
   } catch (err) {
+    // #639 (codex round-3): WHICH statement threw is NOT recorded — a value setter
+    // can invoke the callback itself, the callback property can be a throwing
+    // accessor, and a setter can throw before OR after applying — so no
+    // attribution the mechanism cannot establish is ever reported. The disclosure
+    // below names the union ("the widget's setter or callback") only.
     threw = err;
   } finally {
     safeAfter();
   }
 
   // VERIFY AFTER afterChange. Compute the failure reason (if any) WITHOUT mutating,
-  // so rollback happens in its own envelope below. Order: a thrown callback; then a
-  // value that did not stick on the inner (#240) or the authoritative rail (#366);
-  // then a promotion-relationship change (re-resolved from the LIVE graph, catching
-  // an outer link, a replaced/detached host input, or a re-pointed slot→widget map).
+  // so rollback happens in its own envelope below. Order: a value that did not stick
+  // on the inner (#240) or the authoritative rail (#366); then a promotion-
+  // relationship change (re-resolved from the LIVE graph, catching an outer link, a
+  // replaced/detached host input, or a re-pointed slot→widget map).
+  //
+  // #639: a THROWN callback is deliberately NOT a verdict in this chain. The value
+  // assignments above run BEFORE the callback fires, so when the callback throws the
+  // write may ALREADY be in effect (MiniMaxH3Director's `duration`: the extension's
+  // own callback throws on `options` of undefined on ANY programmatic invocation,
+  // which made the widget permanently unwritable when any throw forced a refusal).
+  // Rolling a VERIFIED write back and refusing would report failure for work that
+  // succeeded and invite a destructive retry — so the structural checks below
+  // decide. A throw on a verified write is DISCLOSED on the success result
+  // (`write_warning`); only a write that ALSO fails verification fails + rolls
+  // back, with the throw named as the likely cause.
   let failure = null;
   let originalErr = null;
   let driftFailure = false;
-  if (threw) {
-    originalErr = threw instanceof WidgetWriteError ? threw : null;
-    failure =
-      threw instanceof WidgetWriteError
-        ? threw.message
-        : `a widget callback threw (${threw?.message ?? threw})`;
-  } else if (!matchesExpected(w.value)) {
+  let writeWarning = null;
+  if (!matchesExpected(w.value)) {
     failure =
       `Widget "${w.name}" on node ${targetNode.id} (${targetNode.type}) did not retain the ` +
       `requested value: wrote ${JSON.stringify(expected)} but it became ${JSON.stringify(w.value)}.`;
@@ -1176,6 +1231,43 @@ export function applyWidgetWrite(
           recheckThrew ? "; re-resolving the promotion threw" : ""
         }), so the rail that was synced is no longer the value that serializes at queue time. Rolled ` +
         `back to avoid a silently-stale render (#366).`;
+    }
+  }
+
+  // #639: reconcile a captured throw with the verification verdict. The write
+  // VERIFIED (value + rail + proxies retained, promotion topology intact) — the
+  // throw came from the widget's own write path: DISCLOSE it on the success
+  // result, never report a clean failure for an applied write. The write did NOT
+  // verify — the throw is the likely cause: compose BOTH causes into the failure
+  // (codex round-1: a thrown WidgetWriteError saved un-composed discarded the
+  // structural detail), keeping the error's retry flags (combo/emptyOptions)
+  // through the composition.
+  //
+  // Attribution (codex rounds 2-3): only what the mechanism can ESTABLISH is
+  // claimed. An exception caught above came from evaluating the value assignments
+  // or the callback read/invocation — but a value setter can itself invoke the
+  // callback, the callback property can be a throwing accessor, and a setter can
+  // throw before OR after applying — so the message names the UNION ("the
+  // widget's setter or callback") and never asserts which one threw, whether the
+  // callback ran, or whether a setter applied first. What IS established and
+  // claimed: the value was verified written by read-back, and the write's side
+  // effects may not have run or completed.
+  if (threw) {
+    const threwLabel = "the widget's setter or callback threw";
+    if (!failure) {
+      writeWarning =
+        `${threwLabel} (${threw?.message ?? threw}), but the value was verified written ` +
+        `by read-back — the write DID take effect and was NOT rolled back. Side effects ` +
+        `the write would normally trigger (refreshing dependent widgets, previews, ` +
+        `thumbnails) may not have run or completed; inspect the node if dependents look stale.`;
+    } else {
+      failure = `${threwLabel} (${threw?.message ?? threw}); ${failure}`;
+      if (threw instanceof WidgetWriteError) {
+        originalErr = new WidgetWriteError(failure, {
+          combo: threw.combo,
+          emptyOptions: threw.emptyOptions,
+        });
+      }
     }
   }
 
@@ -1386,11 +1478,14 @@ export function applyWidgetWrite(
   // parent_widget_synced is reported for observability / defense-in-depth in the
   // panel summary. display_widgets_synced counts the additional parent-facing display
   // proxies also synced so the outer node no longer shows a stale value (#477).
+  // #639: write_warning discloses a widget callback that threw AFTER the verified
+  // write landed — the value IS in effect, its side effects are uncertain.
   return {
     node_id: targetNode.id,
     widget: w.name,
     previous: parentWidget ? previousParent : previous,
     value: w.value,
+    ...(writeWarning ? { write_warning: writeWarning } : {}),
     ...(promotedFrom
       ? {
           inner_previous: previous,
