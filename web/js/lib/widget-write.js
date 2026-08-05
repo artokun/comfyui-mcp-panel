@@ -1015,7 +1015,22 @@ export function applyWidgetWrite(
       }
       const otherOptions = comboOptions(other);
       if (!Array.isArray(otherOptions) || otherOptions.length === 0) continue;
-      siblingSnapshots.push({ name: other.name, options: otherOptions.slice() });
+      // Snapshot the list AS READ (a stateful non-function source can answer
+      // differently per read — the re-validation below must check the SAME list
+      // admission was decided against, codex delta-gate 2). The copy itself can
+      // throw: a buggy-but-in-scope array with a THROWING later-index getter must
+      // not crash a write `includes()` would admit from an early member (codex
+      // final gate) — so a failed copy records a NULL snapshot and admission
+      // proceeds exactly as before. Only if an adoption later REPLACES the value
+      // does the missing snapshot matter, and then the write fails closed (below)
+      // rather than skip re-validation.
+      let snapshot = null;
+      try {
+        snapshot = otherOptions.slice();
+      } catch {
+        snapshot = null;
+      }
+      siblingSnapshots.push({ name: other.name, options: snapshot });
       if (otherOptions.includes(coerced)) continue;
       // #667 (codex round-3): the SAME numeric-labelled-option rule applies here —
       // a numeric request (4444) against a rail list holding the string "4444" must
@@ -1046,13 +1061,21 @@ export function applyWidgetWrite(
     // fail closed.
     if (adoptedOption) {
       for (const snap of siblingSnapshots) {
-        if (snap.options.includes(coerced)) continue;
+        // A NULL snapshot (the list could not be fully copied — a member access
+        // threw) means the adopted value cannot be re-validated against this
+        // sibling at all: fail closed rather than skip the check. A snapshot's
+        // elements are plain copies, so `includes` here cannot throw.
+        if (snap.options && snap.options.includes(coerced)) continue;
         throw new WidgetWriteError(
-          `The sibling combo widgets this promoted write mutates DISAGREE about option ` +
-            `${JSON.stringify(coerced)}: after matching it by label, "${snap.name}"'s list ` +
-            `(${snap.options.length} options) does not contain the resulting value — the lists ` +
-            `hold the same label with different types (or not at all), so no single value ` +
-            `satisfies every list. Refusing to write.`,
+          snap.options
+            ? `The sibling combo widgets this promoted write mutates DISAGREE about option ` +
+              `${JSON.stringify(coerced)}: after matching it by label, "${snap.name}"'s list ` +
+              `(${snap.options.length} options) does not contain the resulting value — the lists ` +
+              `hold the same label with different types (or not at all), so no single value ` +
+              `satisfies every list. Refusing to write.`
+            : `The sibling combo widget "${snap.name}"'s option list could not be fully read ` +
+              `(a member access threw), so the label-adopted value ${JSON.stringify(coerced)} ` +
+              `cannot be re-validated against it. Refusing to write.`,
         );
       }
     }

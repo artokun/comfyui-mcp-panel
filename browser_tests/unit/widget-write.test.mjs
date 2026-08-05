@@ -2725,3 +2725,50 @@ test("#667×#507 (delta-gate 2): re-validation checks the SAME list snapshot as 
   assert.equal(set.value, "4444");
   assert.equal(railWidget.value, "4444", "admitted against the admission-time list, not a later answer");
 });
+
+test("#667×#507 (final gate): a sibling list with a THROWING later-index getter still admits an exact early member (no-adoption path unchanged)", () => {
+  // includes() finds the exact match at index 0 and never touches the throwing
+  // getter at index 1 — but a full-array snapshot copy WOULD. The snapshot must
+  // be exception-safe so this legitimate write behaves exactly as before.
+  const tricky = ["llama3.2:3b"];
+  Object.defineProperty(tricky, "1", {
+    get() {
+      throw new Error("late getter boom");
+    },
+  });
+  const { parent, inner, railWidget, resolveSource } = makeEmptyInnerPromotedFixture({ values: tricky });
+  const set = applyWidgetWrite(parent, "model_alias", "llama3.2:3b", {
+    ...HOOKS,
+    resolveSource,
+    acceptEmptyComboOptions: true,
+  });
+  assert.equal(set.value, "llama3.2:3b");
+  assert.equal(railWidget.value, "llama3.2:3b");
+  assert.equal(inner.widgets[0].value, "llama3.2:3b");
+});
+
+test("#667×#507 (final gate): an adoption that cannot be re-validated against a sibling (unreadable tail) fails closed — no false success", () => {
+  // The rail strictly contains the requested "4444" at index 0, but its list
+  // cannot be fully copied (throwing getter at index 1). The proxy then label-
+  // adopts the NUMBER 4444, changing the write value — and the rail can no
+  // longer be re-validated against it. Refuse, mutating nothing.
+  const trickyRail = ["4444"];
+  Object.defineProperty(trickyRail, "1", {
+    get() {
+      throw new Error("late getter boom");
+    },
+  });
+  const { parent, inner, railWidget, proxyWidget, resolveSource } = makeEmptyInnerRailProxyFixture(trickyRail, [4444]);
+  assert.throws(
+    () =>
+      applyWidgetWrite(parent, "model_alias", "4444", {
+        ...HOOKS,
+        resolveSource,
+        acceptEmptyComboOptions: true,
+      }),
+    (err) => err instanceof WidgetWriteError && /could not be fully read/.test(err.message),
+  );
+  assert.equal(inner.widgets[0].value, "", "inner untouched");
+  assert.equal(railWidget.value, "", "rail untouched");
+  assert.equal(proxyWidget.value, "", "proxy untouched");
+});
