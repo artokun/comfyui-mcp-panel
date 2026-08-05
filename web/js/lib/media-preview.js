@@ -82,9 +82,16 @@ export function isVideoShowMediaItem(item, coerce = defaultCoerce) {
 }
 
 /**
- * Exact byte length of a base64 data URL payload, or null when it is not one.
- * Computed rather than probed — the bytes are already in hand, so there is no
- * reason to report this size as unknown.
+ * Exact byte length of a base64 data URL payload, or null when the payload is
+ * not one this function can measure EXACTLY. Computed rather than probed — the
+ * bytes are already in hand, so there is no reason to call this size unknown.
+ *
+ * The payload is validated before it is measured, because the arithmetic is
+ * happy to measure nonsense: `…;base64,A` is not a legal base64 body but
+ * `floor(1*3/4)` is 0, and `…;base64,!!!!` is not base64 at all but measures 3.
+ * Both would have told the agent the source file was a few bytes — an invented
+ * size, and precisely the "unknown reported as a value" failure this module
+ * exists to avoid. Anything that does not decode cleanly is null, i.e. unknown.
  */
 export function dataUrlByteLength(dataUrl) {
   if (typeof dataUrl !== "string") return null;
@@ -94,10 +101,13 @@ export function dataUrlByteLength(dataUrl) {
   if (!/^data:/i.test(head) || !/;base64$/i.test(head)) return null;
   const body = dataUrl.slice(comma + 1).replace(/\s+/g, "");
   if (!body) return 0;
-  let pad = 0;
-  if (body.endsWith("==")) pad = 2;
-  else if (body.endsWith("=")) pad = 1;
-  const n = Math.floor((body.length * 3) / 4) - pad;
+  // Standard base64 only: 4-character groups, the alphabet, and padding that
+  // appears only at the end. base64url (-_) deliberately measures as unknown
+  // rather than being decoded by a rule this function has not verified.
+  if (body.length % 4 !== 0) return null;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(body)) return null;
+  const pad = body.endsWith("==") ? 2 : body.endsWith("=") ? 1 : 0;
+  const n = (body.length / 4) * 3 - pad;
   return n >= 0 ? n : null;
 }
 
@@ -106,8 +116,32 @@ function sizeClause(sizeBytes, humanizeBytes) {
   if (!Number.isFinite(sizeBytes) || sizeBytes < 0) {
     return "source file size UNKNOWN (it could not be read — that is not the same as knowing it is small)";
   }
-  const human = humanizeBytes(sizeBytes);
+  let human = null;
+  try {
+    human = humanizeBytes(sizeBytes);
+  } catch {
+    human = null;
+  }
   return `source file ${human || `${sizeBytes} bytes`}`;
+}
+
+/**
+ * How to describe the sheet's cells truthfully.
+ *
+ * `cells` is the grid's capacity; `frames` is how many of them a frame was
+ * actually drawn into. They differ whenever a seek failed, and reporting the
+ * capacity as the sample count is a fabricated observation of exactly the kind
+ * this module exists to prevent — so when they differ, both are stated.
+ */
+function sheetClause(frames, cells) {
+  if (Number.isFinite(cells) && cells > frames) {
+    const blank = cells - frames;
+    return (
+      `a contact sheet of ${cells} cells, ${frames} of which hold a sampled frame ` +
+      `(the other ${blank} could not be seeked and are blank — judge nothing from them)`
+    );
+  }
+  return `a ${frames}-frame contact sheet`;
 }
 
 /** A ComfyUI ref written the way `get_image` takes its arguments. */
@@ -150,29 +184,49 @@ export async function composeShowMediaReply(items, deps = {}) {
     clearTimer,
   } = deps;
 
+  // EVERY injected helper is an operation that can fail, including the trivial
+  // ones. A throwing `coerceMessageText` or `warn` used to reject this function
+  // before it composed anything — i.e. the agent got a transport error instead
+  // of a reply, which is the dead end this module exists to remove. Text
+  // helpers are wrapped once here; the I/O helpers are guarded at their sites.
+  const text = (v) => {
+    try {
+      return coerceMessageText(v) ?? "";
+    } catch {
+      return "";
+    }
+  };
+  const note = (...a) => {
+    try {
+      warn(...a);
+    } catch {
+      /* a logger that throws must not become the failure it was logging */
+    }
+  };
+
   const list = Array.isArray(items) ? items : [];
   const jobs = [];
   let painted = 0;
   let unrendered = 0;
+  let unconfirmed = 0;
 
   // ── Paint pass ──────────────────────────────────────────────────────────
   // One item's painter throwing must not cost the whole batch its reply, and
   // must not be counted as painted — an item silently dropped is exactly the
   // kind of thing the reply has to be honest about.
   for (const item of list) {
-    const caption =
-      coerceMessageText(item?.caption) || coerceMessageText(item?.filename) || "";
-    const isVideo = isVideoShowMediaItem(item, coerceMessageText);
+    const caption = text(item?.caption) || text(item?.filename) || "";
+    const isVideo = isVideoShowMediaItem(item, text);
     let url = null;
     let ref = null;
-    let name = coerceMessageText(item?.filename);
+    let name = text(item?.filename);
     if (item?.kind === "viewRef" && item?.viewRef) {
       ref = item.viewRef;
-      name = coerceMessageText(ref.filename) || name;
+      name = text(ref.filename) || name;
       try {
         url = imageViewUrl(ref);
       } catch (err) {
-        warn("[cmcp] show_media: could not build a view URL for", name, err);
+        note("[cmcp] show_media: could not build a view URL for", name, err);
         url = null;
       }
     } else if (typeof item?.dataUrl === "string" && item.dataUrl) {
@@ -182,14 +236,23 @@ export async function composeShowMediaReply(items, deps = {}) {
       unrendered += 1;
       continue;
     }
+    let outcome;
     try {
-      if (isVideo) paintVideo(url, caption);
-      else paintImage(url, caption);
-      painted += 1;
+      outcome = isVideo ? paintVideo(url, caption) : paintImage(url, caption);
     } catch (err) {
-      warn("[cmcp] show_media: painting failed for", name, err);
+      note("[cmcp] show_media: painting failed for", name, err);
       unrendered += 1;
       continue;
+    }
+    if (outcome && typeof outcome.then === "function") {
+      // A painter that settles LATER cannot be confirmed from here, and an
+      // unconfirmed paint is not a paint. Swallow its rejection so it cannot
+      // surface as an unhandled rejection, and report it as unconfirmed rather
+      // than counting it as shown. The panel's own painters are synchronous.
+      outcome.then(null, (err) => note("[cmcp] show_media: async painter rejected for", name, err));
+      unconfirmed += 1;
+    } else {
+      painted += 1;
     }
     if (isVideo) {
       jobs.push({
@@ -197,6 +260,7 @@ export async function composeShowMediaReply(items, deps = {}) {
         name: name || "video",
         ref,
         // A data URL carries its own exact length; a /view ref has to be probed.
+        inline: !ref,
         knownBytes: ref ? null : dataUrlByteLength(url),
       });
     }
@@ -215,9 +279,9 @@ export async function composeShowMediaReply(items, deps = {}) {
         paintImage,
         humanizeBytes,
         fetchMediaBytes,
-        coerceMessageText,
+        coerceMessageText: text,
         videoStoryboardEnabled,
-        warn,
+        warn: note,
         timeoutMs,
         sizeProbeTimeoutMs,
         setTimer,
@@ -225,7 +289,7 @@ export async function composeShowMediaReply(items, deps = {}) {
       }).catch((err) => {
         // buildSampledPreview swallows its own failures; this is the last guard
         // so one video can never reject the batch.
-        warn("[cmcp] show_media preview segment failed:", err);
+        note("[cmcp] show_media preview segment failed:", err);
         return {
           note: `${job.name} — no sampled preview could be built and the panel could not say why. Ask the user how the video looks; they can see it playing in the chat.`,
           preview: null,
@@ -256,6 +320,15 @@ export async function composeShowMediaReply(items, deps = {}) {
     );
   }
 
+  if (unconfirmed > 0) {
+    noteSections.push(
+      `${unconfirmed} of the ${list.length} requested item(s) were handed to a painter that had not ` +
+        `finished when this reply was composed, so whether the user can see ` +
+        `${unconfirmed === 1 ? "it" : "them"} is UNKNOWN — do not assume ` +
+        `${unconfirmed === 1 ? "it was" : "they were"} displayed.`,
+    );
+  }
+
   for (const seg of segments) {
     if (!seg) continue;
     if (seg.preview) previews.push(seg.preview);
@@ -266,6 +339,7 @@ export async function composeShowMediaReply(items, deps = {}) {
     ok: true,
     count: list.length,
     painted,
+    unconfirmed,
     previews,
     note: noteSections.join("\n\n"),
   };
@@ -326,6 +400,7 @@ async function buildSampledPreview(job, deps) {
           return {
             ref: null,
             frames: null,
+            cells: null,
             why: `sampling it took longer than ${Math.round(timeoutMs / 1000)}s and was abandoned`,
           };
         },
@@ -334,6 +409,7 @@ async function buildSampledPreview(job, deps) {
     : Promise.resolve({
         ref: null,
         frames: null,
+        cells: null,
         why: videoStoryboardEnabled
           ? "this panel build cannot sample video frames"
           : "storyboard previews are turned off in the panel's settings",
@@ -341,7 +417,12 @@ async function buildSampledPreview(job, deps) {
 
   const [sizeBytes, sheet] = await Promise.all([sizePromise, sheetPromise]);
   const size = sizeClause(sizeBytes, humanizeBytes);
-  const outcome = sheet ?? { ref: null, frames: null, why: "the panel could not say why" };
+  const outcome = sheet ?? {
+    ref: null,
+    frames: null,
+    cells: null,
+    why: "the panel could not say why",
+  };
 
   if (!outcome.ref) {
     return {
@@ -353,11 +434,16 @@ async function buildSampledPreview(job, deps) {
     };
   }
 
+  // `frames` is how many cells actually hold a sampled frame; `cells` is the
+  // grid's capacity. They are the same for a healthy video and differ when a
+  // seek failed — and the note must never quote the capacity as the sample
+  // count, which would invent observations out of blank cells.
   const n = outcome.frames;
+  const cells = outcome.cells;
   // Show the human the same sheet the agent is being pointed at, so what the
   // agent is judging from is visible in the chat next to the player.
   try {
-    paintImage(imageViewUrl(outcome.ref), `Storyboard · ${n} frames`);
+    paintImage(imageViewUrl(outcome.ref), `Storyboard · ${n} sampled frames`);
   } catch (err) {
     warn("[cmcp] show_media: could not paint the storyboard sheet", err);
   }
@@ -366,6 +452,7 @@ async function buildSampledPreview(job, deps) {
     preview: {
       of: job.name,
       frames: n,
+      cells: Number.isFinite(cells) ? cells : null,
       sourceBytes: Number.isFinite(sizeBytes) ? sizeBytes : null,
       filename: coerceMessageText(outcome.ref.filename),
       subfolder: coerceMessageText(outcome.ref.subfolder),
@@ -374,7 +461,7 @@ async function buildSampledPreview(job, deps) {
     },
     note:
       `📽️ ${job.name} — you were NOT shown this video. What exists for you is a SAMPLED PREVIEW of it: ` +
-      `a ${n}-frame contact sheet built in the browser (its ${size}). ` +
+      `${sheetClause(n, cells)}, built in the browser (its ${size}). ` +
       `Those ${n} frames are evenly-spaced SAMPLES across the video — they are NOT its frame count, ` +
       `its duration, or its frame rate, so do not describe the video as ${n} frames long, and do not ` +
       `report anything about it that a ${n}-frame sample cannot show (audio, timing, brief events). ` +
@@ -383,7 +470,7 @@ async function buildSampledPreview(job, deps) {
   };
 }
 
-/** Sample + upload. Resolves `{ref, frames, why}`; never throws. */
+/** Sample + upload. Resolves `{ref, frames, cells, why}`; never throws. */
 async function produceSheet(job, deps) {
   const { buildVideoStoryboard, uploadBlobToInput, storyboardFrameCount, warn } = deps;
   try {
@@ -393,6 +480,7 @@ async function produceSheet(job, deps) {
       return {
         ref: null,
         frames: null,
+        cells: null,
         why: "its frames could not be decoded or seeked in this browser",
       };
     }
@@ -402,33 +490,49 @@ async function produceSheet(job, deps) {
     const ref = await uploadBlobToInput(blob, `storyboard_${base}.png`, { type: "temp" });
     if (!ref) {
       warn("[cmcp] show_media: storyboard upload failed for", job.name);
-      return { ref: null, frames: null, why: "its contact sheet could not be uploaded to ComfyUI" };
-    }
-    let frames = null;
-    try {
-      frames = storyboardFrameCount();
-    } catch {
-      frames = null;
-    }
-    if (!Number.isFinite(frames) || frames <= 0) {
-      // A sheet whose cell count is unknown cannot be described honestly, and
-      // "some frames" is not a disclosure. Degrade rather than hand-wave.
       return {
         ref: null,
         frames: null,
-        why: "its contact sheet was built but the panel could not say how many frames it holds",
+        cells: null,
+        why: "its contact sheet could not be uploaded to ComfyUI",
       };
     }
-    return { ref, frames, why: null };
+    // The GRID's capacity. It is NOT the number of frames sampled: a video whose
+    // seeks fail leaves cells blank, and the builder still returns a sheet.
+    let cells = null;
+    try {
+      const c = storyboardFrameCount();
+      cells = Number.isFinite(c) && c > 0 ? c : null;
+    } catch {
+      cells = null;
+    }
+    // The count actually DRAWN, carried on the blob by buildVideoStoryboard.
+    const drawn = blob.paintedFrames;
+    const frames = Number.isFinite(drawn) && drawn > 0 ? Math.min(drawn, cells ?? drawn) : null;
+    if (frames == null) {
+      // A sheet whose sample count is unknown cannot be described honestly, and
+      // "some frames" is not a disclosure. Quoting the grid capacity instead
+      // would invent observations out of blank cells. Degrade rather than guess.
+      return {
+        ref: null,
+        frames: null,
+        cells,
+        why: "its contact sheet was built but the panel could not say how many frames it actually sampled",
+      };
+    }
+    return { ref, frames, cells, why: null };
   } catch (err) {
     warn("[cmcp] show_media: sampled preview pipeline failed:", err);
-    return { ref: null, frames: null, why: "the sampling pipeline failed" };
+    return { ref: null, frames: null, cells: null, why: "the sampling pipeline failed" };
   }
 }
 
 /** Exact length for an inlined data URL, a bounded HEAD for a /view ref. */
 async function resolveSourceBytes(job, fetchMediaBytes, warn) {
   if (Number.isFinite(job.knownBytes)) return job.knownBytes;
+  // An inline payload whose length could not be computed stays UNKNOWN: there
+  // is no origin to probe, and a HEAD against a data: URL would answer nothing.
+  if (job.inline) return null;
   if (typeof fetchMediaBytes !== "function") return null;
   try {
     const n = await fetchMediaBytes(job.url);

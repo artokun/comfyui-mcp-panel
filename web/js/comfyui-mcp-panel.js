@@ -4237,7 +4237,20 @@ async function buildVideoStoryboard(url) {
     if (!painted) return null;
 
     const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
-    return blob || null;
+    if (!blob) return null;
+    // #648 — the grid has COLS*ROWS CELLS, but a video with unseekable frames
+    // paints fewer and leaves the rest blank. storyboardFrameCount() reports the
+    // capacity, not the sample count, so a caller reading only that would tell
+    // the agent it is looking at 20 samples when it is looking at 1 sample and
+    // 19 empty cells. Carry the count that was actually drawn; callers that
+    // describe the sheet must use THIS.
+    try {
+      blob.paintedFrames = painted;
+    } catch {
+      // A Blob implementation that refuses extra properties leaves the count
+      // absent, which callers must treat as unknown — never as the capacity.
+    }
+    return blob;
   } catch {
     return null; // decode/seek/metadata failure → caller falls back to video-only
   } finally {

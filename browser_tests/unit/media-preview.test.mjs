@@ -52,9 +52,11 @@ function harness(over = {}) {
     imageViewUrl: (ref) =>
       `/view?filename=${ref.filename}&subfolder=${ref.subfolder ?? ""}&type=${ref.type ?? "output"}`,
     coerceMessageText: (v) => (typeof v === "string" ? v : v == null ? "" : String(v)),
+    // The real builder returns a PNG Blob carrying `paintedFrames` — the number
+    // of cells it actually drew into, which is NOT the grid capacity.
     buildVideoStoryboard: async (url) => {
       calls.storyboardsFor.push(url);
-      return { size: 4096 };
+      return { size: 4096, paintedFrames: 20 };
     },
     uploadBlobToInput: async (blob, name, opts) => {
       calls.uploads.push({ blob, name, opts });
@@ -267,14 +269,39 @@ test("a failed sheet upload degrades with a reason and a remedy", async () => {
   assert.match(reply.note, /call get_image with filename "reference_clip\.mp4"/);
 });
 
-test("a sheet whose frame count is unknown is NOT offered as an N-frame sample", async () => {
-  // A sheet exists, but nothing can say how many cells it holds. "Some frames"
-  // is not a disclosure, so the preview is withheld rather than described vaguely.
-  const h = harness({ storyboardFrameCount: () => 0 });
+test("a sheet whose SAMPLE count is unknown is NOT offered as an N-frame sample", async () => {
+  // A sheet exists, but the builder did not say how many cells it drew into.
+  // Quoting the grid capacity instead would invent observations from blank
+  // cells, so the preview is withheld rather than described vaguely.
+  const h = harness({ buildVideoStoryboard: async () => ({ size: 1 }) });
   const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
   assert.equal(reply.previews.length, 0);
-  assert.match(reply.note, /could not say how many frames it holds/);
-  assert.doesNotMatch(reply.note, /contact sheet built in the browser/);
+  assert.match(reply.note, /could not say how many frames it actually sampled/);
+  assert.doesNotMatch(reply.note, /SAMPLED PREVIEW/);
+  assert.doesNotMatch(reply.note, /20/, "the grid capacity must never stand in for the sample count");
+});
+
+test("a PARTIALLY sampled sheet reports what was sampled, not the grid capacity", async () => {
+  // 20 cells, 3 seeks succeeded. Describing this as "20 evenly-spaced samples"
+  // is a fabricated observation about 17 blank cells.
+  const h = harness({ buildVideoStoryboard: async () => ({ size: 1, paintedFrames: 3 }) });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+  assert.equal(reply.previews.length, 1);
+  assert.equal(reply.previews[0].frames, 3);
+  assert.equal(reply.previews[0].cells, 20);
+  assert.match(reply.note, /contact sheet of 20 cells, 3 of which hold a sampled frame/);
+  assert.match(reply.note, /the other 17 could not be seeked and are blank/);
+  assert.match(reply.note, /do not describe the video as 3 frames long/);
+  assert.doesNotMatch(reply.note, /a 20-frame contact sheet/);
+});
+
+test("an unknown grid capacity still allows an honest N-sample description", async () => {
+  const h = harness({ storyboardFrameCount: () => 0 });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+  assert.equal(reply.previews.length, 1);
+  assert.equal(reply.previews[0].frames, 20);
+  assert.equal(reply.previews[0].cells, null);
+  assert.match(reply.note, /a 20-frame contact sheet/);
 });
 
 test("a storyboard pipeline that THROWS degrades instead of failing the reply", async () => {
@@ -322,10 +349,51 @@ test("one painter throwing costs that item only, and the reply says so", async (
   assert.match(reply.note, /1 of the 2 requested item\(s\) could not be rendered at all/);
 });
 
+test("a throwing text coercer does not cost the agent its reply", async () => {
+  // The trivial helpers are operations that can fail too. A throwing coercer
+  // used to reject before anything was composed — a transport error instead of
+  // a reply is exactly the dead end this module removes.
+  const h = harness({
+    coerceMessageText: () => {
+      throw new Error("coercion exploded");
+    },
+  });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+  assert.equal(reply.ok, true);
+  assert.match(reply.note, /You were NOT sent/);
+});
+
+test("a throwing logger does not become the failure it was logging", async () => {
+  const h = harness({
+    warn: () => {
+      throw new Error("logger exploded");
+    },
+    buildVideoStoryboard: async () => null,
+  });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+  assert.equal(reply.ok, true);
+  assert.match(reply.note, /could not be decoded or seeked/);
+});
+
+test("a painter that settles LATER is reported unconfirmed, not counted as shown", async () => {
+  // A promise-returning painter cannot be confirmed from here, and its rejection
+  // must not surface as an unhandled rejection either.
+  const h = harness({ paintImage: () => Promise.reject(new Error("late failure")) });
+  const reply = await composeShowMediaReply(
+    [{ kind: "image", dataUrl: "data:image/png;base64,AAAA", filename: "a.png" }],
+    h.deps,
+  );
+  assert.equal(reply.painted, 0, "an unconfirmed paint is not a paint");
+  assert.equal(reply.unconfirmed, 1);
+  assert.match(reply.note, /whether the user can see it is UNKNOWN/);
+  await new Promise((r) => setImmediate(r));
+});
+
 test("two videos are previewed independently — one wedged does not suppress the other", async () => {
   const second = { ...VIDEO_REF, viewRef: { ...VIDEO_REF.viewRef, filename: "other.mp4" } };
   const h = harness({
-    buildVideoStoryboard: async (url) => (url.includes("other") ? { size: 1 } : new Promise(() => {})),
+    buildVideoStoryboard: async (url) =>
+      url.includes("other") ? { size: 1, paintedFrames: 20 } : new Promise(() => {}),
   });
   const p = composeShowMediaReply([VIDEO_REF, second], h.deps);
   await h.elapse(MEDIA_PREVIEW_TIMEOUT_MS);
@@ -369,6 +437,26 @@ test("dataUrlByteLength reads the payload exactly, and refuses to guess otherwis
   assert.equal(dataUrlByteLength("/view?filename=a.mp4"), null, "not a data URL ⇒ unknown");
   assert.equal(dataUrlByteLength("data:video/mp4,raw"), null, "not base64 ⇒ unknown");
   assert.equal(dataUrlByteLength(null), null);
+  // MALFORMED payloads must be unknown, not measured. The arithmetic is happy
+  // to measure nonsense, and a measured nonsense payload told the agent the
+  // source video was a few bytes — an invented size.
+  assert.equal(dataUrlByteLength("data:video/mp4;base64,A"), null, "1 char is not a base64 group");
+  assert.equal(dataUrlByteLength("data:video/mp4;base64,AAA"), null, "3 chars is not a base64 group");
+  assert.equal(dataUrlByteLength("data:video/mp4;base64,!!!!"), null, "not the base64 alphabet");
+  assert.equal(dataUrlByteLength("data:video/mp4;base64,A==="), null, "3 pad chars is not base64");
+  assert.equal(dataUrlByteLength("data:video/mp4;base64,AA=A"), null, "padding is trailing-only");
+  assert.equal(dataUrlByteLength("data:video/mp4;base64,ab-_"), null, "base64url is not decoded here");
+});
+
+test("a video whose inline payload is malformed reports its size UNKNOWN, never a tiny one", async () => {
+  const h = harness();
+  const reply = await composeShowMediaReply(
+    [{ kind: "video", dataUrl: "data:video/mp4;base64,!!!!", filename: "broken.mp4" }],
+    h.deps,
+  );
+  assert.match(reply.note, /size UNKNOWN/);
+  assert.doesNotMatch(reply.note, /source file \d/, "a size that could not be read must not be stated");
+  assert.equal(reply.previews[0].sourceBytes, null);
 });
 
 // ── the SHIPPED panel is actually wired to this module ─────────────────────
@@ -397,6 +485,18 @@ test("the show_media dispatcher answers with the handler's reply, not a fixed ac
     /result = \(await onShowMedia\?\.\(mediaItems\)\)/,
     "the reply must be AWAITED from the handler — a preview is real work",
   );
+});
+
+test("the panel's storyboard builder carries the count it ACTUALLY drew", () => {
+  // Without this, media-preview has only the grid capacity to go on and every
+  // partially-sampled sheet is described as a full one — 19 blank cells
+  // presented to the agent as 19 observations.
+  const src = panelSource();
+  const i = src.indexOf("async function buildVideoStoryboard(");
+  assert.ok(i > 0, "could not locate buildVideoStoryboard");
+  const fn = src.slice(i, i + 4000);
+  assert.match(fn, /blob\.paintedFrames = painted;/);
+  assert.match(fn, /if \(!blob\) return null;/);
 });
 
 test("onShowMedia routes through composeShowMediaReply with the storyboard pipeline wired", () => {
@@ -480,7 +580,7 @@ test("withTimeout still settles when clearTimer THROWS", async () => {
   assert.equal(v, "ok");
 });
 
-test("withTimeout still settles when setTimer THROWS (unbounded, but never rejecting)", async () => {
+test("withTimeout still settles when setTimer THROWS", async () => {
   const v = await withTimeout(Promise.resolve("ok"), 1000, () => "late", {
     setTimer: () => {
       throw new Error("no timers available");
@@ -488,6 +588,19 @@ test("withTimeout still settles when setTimer THROWS (unbounded, but never rejec
     clearTimer: () => {},
   });
   assert.equal(v, "ok");
+});
+
+test("a THROWING setTimer must not silently REMOVE the bound", async () => {
+  // Falling through to "unbounded" turns "bounded, degrades" into "pending
+  // forever" — the one outcome this helper exists to prevent. It falls back to
+  // the platform timer instead, so a never-settling step still degrades.
+  const v = await withTimeout(new Promise(() => {}), 5, () => "fallback", {
+    setTimer: () => {
+      throw new Error("no timers available");
+    },
+    clearTimer: () => {},
+  });
+  assert.equal(v, "fallback");
 });
 
 test("withTimeout with a non-positive bound is a passthrough", async () => {

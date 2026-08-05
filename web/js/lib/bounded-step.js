@@ -62,26 +62,37 @@ export function withTimeout(promise, ms, onTimeout, timers = {}) {
       }
     };
     let t;
+    let clear = clearTimer;
     const done = (v) => {
       if (settled) return;
       settled = true;
       try {
-        clearTimer(t);
+        clear(t);
       } catch {
         // A leaked timer is a leak; a throw here would be a wedge. Prefer the leak.
       }
       resolve(v);
     };
+    const fire = () => {
+      if (settled) return;
+      settled = true;
+      resolve(fallback());
+    };
     try {
-      t = setTimer(() => {
-        if (settled) return;
-        settled = true;
-        resolve(fallback());
-      }, ms);
+      t = setTimer(fire, ms);
     } catch {
-      // No timer could be armed, so this step is UNBOUNDED — but a throw out of
-      // the executor would reject, and this helper's whole contract is that it
-      // does not. Fall through: the result still arrives via the chain below.
+      // An injected timer that cannot arm must not silently REMOVE the bound —
+      // that turns "bounded, degrades" into "pending forever", which is the one
+      // outcome this helper exists to prevent. Fall back to the platform timer
+      // (and its matching clear, since the injected pair no longer owns it).
+      try {
+        t = setTimeout(fire, ms);
+        clear = (h) => clearTimeout(h);
+      } catch {
+        // No timer source at all. This step is genuinely UNBOUNDED — stated
+        // rather than papered over — but the helper still never rejects: the
+        // result arrives via the chain below if it ever arrives.
+      }
     }
     promise.then(done, () => done(fallback()));
   });
