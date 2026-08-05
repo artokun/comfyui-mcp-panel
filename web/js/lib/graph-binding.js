@@ -860,6 +860,70 @@ export function graphCommandMayMutateWorkflow(command) {
 }
 
 /**
+ * #601 — seal a PROVEN binding onto the live root while the tab is still CLEAN.
+ *
+ * The dirty-mutation fence (#545 P1) requires a POSITIVE uuid match on the live
+ * root once the tab is dirty. But the first successful mutation is itself what
+ * dirties the tab, and a page reload rebuilds `app.graph` from saved JSON with
+ * NO stamp on the live root (the stamp lives on the workflow's saved state, not
+ * the rebuilt canvas). So after each reload exactly ONE mutation passed and
+ * every later one was refused as `dirty-mutation-binding-unproven` — one
+ * mutation per page load, with reloads as the only recovery.
+ *
+ * The seal closes that: while the workflow is CLEAN, its tracker's current state
+ * is trustworthy (#545's caveat is dirty-lag only), so a root that serializes
+ * EQUAL to that state (graphRootMatchesState — a strict full-surface proof that
+ * never passes on a partial/unavailable serializer) is provably this workflow's
+ * own canvas, and stamping it with the active uuid is a statement of fact, not
+ * an authorization guess. Strictly additive and fail-closed:
+ *   - subgraph scope, missing identity, or a DIRTY tab → no stamp;
+ *   - an EXISTING stamp (matching or conflicting) is never touched here — a
+ *     conflict is the rebind path's decision (#545/#557), with its claim
+ *     analysis this proof deliberately does not redo;
+ *   - a stale or foreign root fails graphRootMatchesState and stays unstamped,
+ *     so the fence below still refuses exactly as before;
+ *   - content equality proves BINDING only when it is EXCLUSIVE: two clean,
+ *     separately open DUPLICATE workflows can carry byte-identical state, and
+ *     equality alone cannot tell the active tab's canvas from its twin's
+ *     (codex gate). `proofExclusive: false` (the caller found another open
+ *     workflow provably carrying the same state, or could not prove
+ *     exclusivity at all) therefore also refuses the stamp and the command
+ *     keeps the pre-seal fail-closed behaviour.
+ * Returns true only when it actually wrote the stamp.
+ */
+export function sealProvenRootBinding({
+  rootGraph,
+  activeWorkflow,
+  activeWorkflowUuid,
+  inSubgraph = false,
+  proofExclusive = true,
+} = {}) {
+  try {
+    if (inSubgraph) return false;
+    if (proofExclusive !== true) return false;
+    if (!rootGraph || !activeWorkflow) return false;
+    if (typeof activeWorkflowUuid !== "string" || !activeWorkflowUuid) return false;
+    if (activeWorkflow.isModified === true) return false;
+    const existing = rootGraph?.extra?.comfyui_mcp?.workflow_uuid;
+    if (typeof existing === "string" && existing) return false;
+    if (!graphRootMatchesState({ rootGraph, state: activeWorkflowCurrentState(activeWorkflow) })) {
+      return false;
+    }
+    const extra =
+      rootGraph.extra && typeof rootGraph.extra === "object" ? rootGraph.extra : (rootGraph.extra = {});
+    const prior = extra.comfyui_mcp;
+    extra.comfyui_mcp = {
+      ...(prior && typeof prior === "object" ? prior : {}),
+      workflow_uuid: activeWorkflowUuid,
+    };
+    return true;
+  } catch {
+    // A root that refuses the stamp keeps the pre-seal fail-closed behaviour.
+    return false;
+  }
+}
+
+/**
  * THE binding evidence bar a bridge graph command must clear (#604 family).
  *
  * The invariant this encodes: **a MUTATION may never run on binding evidence that
@@ -1010,6 +1074,26 @@ export function graphBindingRefusalMessage(verdict) {
       `reconnect, or a failed open, and node_count 0 could be a FALSE-EMPTY reading, so this ` +
       `command was NOT applied as authoritative. Retry in a moment once the tab settles; if it ` +
       `persists, re-open the workflow tab (panel_open_workflow) or reload the panel.`
+    );
+  }
+  // #601 — name the ACTUAL failing predicate. This verdict is not a node-count
+  // or wrong-canvas finding: the tab is dirty and the live canvas carries no
+  // identity stamp (a page reload rebuilds the canvas WITHOUT the stamp the
+  // saved file carries), so binding is UNPROVEN, not disproven. Reporting the
+  // generic "reports N node(s)" text here sent two real diagnoses down wrong
+  // paths. The remedy that works from here: reload the tab / re-open the
+  // workflow — while the tab is CLEAN the panel now seals the proven binding
+  // onto the canvas (sealProvenRootBinding), so the retried mutation clears.
+  if (verdict.reason === "dirty-mutation-binding-unproven") {
+    return (
+      `[dirty-mutation-binding-unproven] The active tab has unsaved changes and the live canvas ` +
+      `carries no identity stamp proving it belongs to this workflow (a page reload rebuilds the ` +
+      `canvas without the stamp the saved file carries), so the canvas COULD be a stale graph from ` +
+      `another tab and this mutation was NOT applied. Reload the ComfyUI browser tab or re-open the ` +
+      `workflow (panel_open_workflow) — while the tab is clean the panel re-seals the proven ` +
+      `binding onto the canvas — then retry. If the refusal instead says "multiple_active_tabs", ` +
+      `that is a different guard (two browser tabs share one agent session) with a different ` +
+      `remedy: close the extra tab.`
     );
   }
   return (

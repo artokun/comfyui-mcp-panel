@@ -493,6 +493,26 @@ def _register_routes():
     except Exception as _e:  # pragma: no cover - never block panel load
         _log("apps routes not registered: {}".format(_e))
 
+    @routes.get("/comfyui_mcp_panel/version")
+    async def _pack_version(_request):
+        # #584/#611 — the INSTALLED pack version, read from pyproject.toml at
+        # request time. The panel JS compares this against its running
+        # PANEL_VERSION: a mismatch proves the browser is running a CACHED stale
+        # bundle (a restart reconnects the tab but never re-downloads the
+        # extension JS), which is what leaves the tab advertising old/unknown
+        # capabilities to the orchestrator's write fence. no-store so the probe
+        # itself can never be served stale.
+        try:
+            from .py.pack_version import installed_pack_version
+
+            version = installed_pack_version()
+        except Exception:
+            version = None
+        return web.json_response(
+            {"version": version},
+            headers={"Cache-Control": "no-store"},
+        )
+
     @routes.get("/comfyui_mcp_panel/status")
     async def _status(_request):
         detected = _detect_comfyui_url()

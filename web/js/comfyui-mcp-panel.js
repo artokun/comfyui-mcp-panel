@@ -98,6 +98,7 @@ import {
 } from "./lib/chat-history-store.js";
 import {
   classifyPinnedTarget,
+  commandIsCanvasIndependent,
   commandTargetsActiveWorkflow,
   hasEmbeddedUuidSuccessionEvidence,
   selectorSearchIncludesListed,
@@ -315,6 +316,7 @@ import {
   describeOpenRebindOutcome,
   OPEN_REBIND_STATUS,
   OPEN_PROOF_FIELD,
+  sealProvenRootBinding,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
 import { createRunFetchInterceptor, dispatchScopedRun } from "./lib/run-scope-guard.js";
@@ -335,6 +337,7 @@ import {
   buildHelloPayload,
 } from "./lib/session-rebind.js";
 import { createRestartTabIdentity, sendBridgeHello } from "./lib/restart-tab-identity.js";
+import { primeModuleCache, resolveBundleStaleness } from "./lib/bundle-version.js";
 import {
   adoptRebootRuns,
   decodeRebootMarker,
@@ -1883,7 +1886,7 @@ function assertActiveWorkflowCommandTarget(msg, targetsNonActive = false) {
   ) {
     throw new Error(
       `workflow instance mismatch: this command targets a different workflow than the ` +
-        `active canvas â€” the workflow was switched or replaced after it was issued. ` +
+        `active canvas — the workflow was switched or replaced after it was issued. ` +
         `Re-select the intended workflow (panel_open_workflow) or re-target with ` +
         `panel_set_workflow_target({mode:"current"}), then retry.`,
     );
@@ -4701,6 +4704,50 @@ function assertGraphBoundToActiveWorkflow(
       }
     }
   }
+  // #601 — SEAL A PROVEN-CLEAN BINDING ONTO THE UNSTAMPED ROOT. After a page
+  // reload rebuilds app.graph from saved JSON, the live root carries no identity
+  // stamp, and the FIRST mutation is itself what dirties the tab — so every
+  // mutation after the first hit dirty-mutation-binding-unproven: one mutation
+  // per page load. Seal the active workflow's uuid onto the root at the one
+  // moment it is provably correct (clean tab + the root serializes EQUAL to the
+  // workflow's own current state) so the first mutation no longer strands the
+  // rest. Strictly additive: a stale or foreign root fails the content proof,
+  // stays unstamped, and still fails closed exactly as #545 P1 intends; a
+  // CONFLICTING stamp is the rebind path's decision above, never overwritten
+  // here.
+  //
+  // The content proof must also be EXCLUSIVE (codex gate): two clean, separately
+  // open DUPLICATE tabs can carry byte-identical state, and equality alone cannot
+  // tell the active tab's canvas from its twin's. If any OTHER open workflow
+  // provably (clean, well-formed state) matches this same root — or the
+  // exclusivity check itself cannot run — the seal stays off and the command
+  // keeps the pre-seal fail-closed behaviour. A DIRTY twin cannot prove a match
+  // (its tracker may lag) and does not block the seal.
+  let sealProofExclusive = false;
+  try {
+    const others = app?.extensionManager?.workflow?.openWorkflows;
+    if (Array.isArray(others)) {
+      sealProofExclusive = true;
+      for (const other of others) {
+        if (!other || sameWorkflowObject(other, activeWorkflow)) continue;
+        if (other.isModified === true) continue; // unprovable — not evidence of ambiguity
+        const otherState = other.changeTracker?.activeState ?? other.activeState;
+        if (graphRootMatchesState({ rootGraph, state: otherState })) {
+          sealProofExclusive = false; // a proven identical twin — binding is ambiguous
+          break;
+        }
+      }
+    }
+  } catch {
+    sealProofExclusive = false; // enumeration failed → exclusivity unproven → no seal
+  }
+  sealProvenRootBinding({
+    rootGraph,
+    activeWorkflow,
+    activeWorkflowUuid,
+    inSubgraph,
+    proofExclusive: sealProofExclusive,
+  });
   // The verdict itself is a PURE function of the resolved evidence, lifted into
   // lib/graph-binding.js (#604) so the read-vs-mutation evidence bar is observable
   // in unit tests. It names the firing predicate (#565) — all branches used to
@@ -13772,7 +13819,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // reads empty") let graph_remove_node through and delete nodes from the
             // wrong canvas. Reads still get the lower bar HERE — they re-assert with
             // the full one inside their own executors.
-            if (msg.cmd.startsWith("graph_")) {
+            //
+            // #602 — a command that never touches a canvas (graph_update_node is a
+            // Manager PACK update misnamed with a graph_ prefix) clears no canvas
+            // fence at all: requiring a binding proof for it only false-blocks a
+            // server-side operation when the canvas binding is broken.
+            if (msg.cmd.startsWith("graph_") && !commandIsCanvasIndependent(msg.cmd)) {
               const { graph, rootGraph } = getGraphCtx();
               assertGraphBoundToActiveWorkflow(graph, rootGraph, graphCommandBindingBar(msg.cmd));
             }
@@ -13788,7 +13840,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // #186). Current-mode sessions never carry workflow_path, so they never
             // reach this branch.
             const pinnedPath = msg?.[WORKFLOW_PATH_FIELD];
-            if (typeof pinnedPath === "string" && pinnedPath.trim()) {
+            // #602 (codex gate round 2) — a canvas-independent command (nodes_search
+            // and family) is also exempt from the PIN guard: the pin exists to stop
+            // a CANVAS write landing on the wrong workflow, and these commands write
+            // to no canvas. Fencing them anyway re-creates the false refusal one
+            // guard further down whenever a pinned session's active tab changed.
+            if (typeof pinnedPath === "string" && pinnedPath.trim() && !commandIsCanvasIndependent(msg.cmd)) {
               const wf = activeWorkflowRef();
               // A pin identifier from panel_list_workflows / panel_new_workflow /
               // panel_set_workflow_target may be a path, a native key, a filename, OR
@@ -22968,6 +23025,23 @@ function buildPanel() {
       // (ComfyUI won't, since our tab isn't registered yet when it restores).
       ssSet(SIDEBAR_REOPEN_KEY, "1");
       appendSystem("Reloading the panel UI (new frontend code)…");
+      // #584 — the cmcpReload page-URL param busts only the top document; the
+      // panel's JS MODULES can still come straight out of heuristic cache,
+      // which is exactly how a stale bundle survived this very reload. Prime
+      // the pack's module graph with cache:"reload" first. Best-effort and
+      // time-bounded: a commanded reload must never hang on a slow server,
+      // and a failed prime must not cancel it.
+      try {
+        await Promise.race([
+          primeModuleCache({
+            entryUrl: import.meta.url,
+            fetchImpl: (url, opts) => fetch(url, { credentials: "same-origin", ...opts }),
+          }),
+          new Promise((resolve) => setTimeout(resolve, 5000)),
+        ]);
+      } catch {
+        /* reload regardless — worst case is the pre-#584 behaviour */
+      }
       try {
         const u = new URL(window.location.href);
         u.searchParams.set("cmcpReload", String(Date.now()));
@@ -25166,6 +25240,118 @@ function installSidebarTabGuard(tabId, getRoot) {
   start();
 }
 
+// #584/#611 — STALE BUNDLE SELF-HEAL. The pack on disk can be current while
+// this tab keeps running a CACHED older bundle: ComfyUI serves the extension
+// web dir as plain static files, so heuristic freshness lets old module JS
+// survive a backend restart, a reconnect, AND a plain page reload. The stale
+// bundle then advertises old/unknown capabilities in its hello and the
+// orchestrator's write fence refuses every mutation ("does not enforce
+// per-command workflow targeting … version unknown"). Only the running bundle
+// can fix its own cache, so on startup we compare PANEL_VERSION against the
+// INSTALLED pack version the backend reads off pyproject.toml; on a provable
+// mismatch we force-revalidate the pack's module graph (cache:"reload") and
+// reload ONCE. The sessionStorage marker is armed BEFORE the reload so a heal
+// that didn't take can never loop; an unreadable probe is "unknown" and never
+// reloads at all (fail-open, no evidence no action).
+//
+// SCOPE LIMIT (codex gate): this heals upgrades FROM a bundle that contains
+// this code. A bundle OLDER than this change runs no probe and cannot heal
+// itself — for those tabs the remedy remains a hard refresh, which the
+// orchestrator's fence message (#709) already names. There is no panel-side
+// channel that can retrofit self-healing into already-shipped JS.
+const BUNDLE_HEAL_KEY = "comfyui-mcp.panel.bundleHealAttempted";
+
+async function healStaleBundleIfNeeded() {
+  try {
+    if (typeof api?.fetchApi !== "function") return;
+    // Bounded (codex gate round 4): setup() AWAITS this probe so a stale bundle
+    // is reloaded BEFORE it can register/connect and advertise its stale
+    // capabilities — but a hung local server must not delay a healthy panel's
+    // startup, so the WHOLE probe (headers AND body — a response whose json()
+    // never settles must not wedge registration either, codex gate round 5) is
+    // raced against one deadline, and a timeout is simply "unknown" (fail-open
+    // to registration, no reload).
+    const probe = (async () => {
+      const res = await api.fetchApi("/comfyui_mcp_panel/version", { cache: "no-store" });
+      if (!res || !res.ok) return null;
+      return await res.json().catch(() => null);
+    })();
+    const body = await Promise.race([
+      probe,
+      new Promise((resolve) => setTimeout(() => resolve(null), 2000)),
+    ]);
+    const installed = body?.version;
+    const staleness = resolveBundleStaleness({ running: PANEL_VERSION, installed });
+    if (staleness === "current") {
+      // A previous heal took — clear the marker so the NEXT update heals too.
+      if (ssGet(BUNDLE_HEAL_KEY)) ssSet(BUNDLE_HEAL_KEY, null);
+      return;
+    }
+    if (staleness !== "stale") return;
+    const marker = `${PANEL_VERSION}->${String(installed)}`;
+    if (ssGet(BUNDLE_HEAL_KEY) === marker) {
+      // We already reloaded for exactly this version pair and the bundle is
+      // STILL the old one — another reload would loop without fixing it. The
+      // one remedy left bypasses the cache entirely, and only the user can do
+      // it. (The orchestrator's fence message names the same remedy to the
+      // agent, so this console line is for the human reading DevTools.)
+      console.warn(
+        `[comfyui-mcp-panel] this tab is running a STALE panel bundle (running ${PANEL_VERSION}, ` +
+          `installed ${installed}) and an automatic cache refresh did not pick up the new one. ` +
+          `Hard-refresh this tab (Ctrl+Shift+R) to load panel ${installed}.`,
+      );
+      return;
+    }
+    ssSet(BUNDLE_HEAL_KEY, marker);
+    if (ssGet(BUNDLE_HEAL_KEY) !== marker) {
+      // codex gate round 3 — the loop guard is itself an operation that can
+      // fail: sessionStorage can be unavailable or full, and ssSet swallows
+      // that silently. Reloading WITHOUT the marker would loop this heal
+      // forever, so a guard that did not persist means no automatic reload —
+      // name the manual remedy instead.
+      console.warn(
+        `[comfyui-mcp-panel] this tab is running a STALE panel bundle (running ${PANEL_VERSION}, ` +
+          `installed ${installed}) but sessionStorage is unavailable, so the panel cannot reload ` +
+          `itself safely (the reload-loop guard cannot persist). Hard-refresh this tab ` +
+          `(Ctrl+Shift+R) to load panel ${installed}.`,
+      );
+      return;
+    }
+    console.warn(
+      `[comfyui-mcp-panel] this tab is running a STALE panel bundle (running ${PANEL_VERSION}, ` +
+        `installed ${installed}) — refreshing the cached module graph and reloading once.`,
+    );
+    // Bound the prime (codex gate round 2): a module fetch that never settles
+    // must not strand the guarded reload — worst case the reload serves the
+    // stale bundle again and the marker above prevents a loop.
+    const { failed } = await Promise.race([
+      primeModuleCache({
+        entryUrl: import.meta.url,
+        fetchImpl: (url, opts) => fetch(url, { credentials: "same-origin", ...opts }),
+      }),
+      new Promise((resolve) => setTimeout(() => resolve({ failed: [] }), 5000)),
+    ]);
+    if (failed.length) {
+      console.warn(
+        `[comfyui-mcp-panel] could not refresh ${failed.length} module(s); reloading anyway — if the ` +
+          `panel still reports ${PANEL_VERSION} afterwards, hard-refresh (Ctrl+Shift+R).`,
+      );
+    }
+    // Arm the sidebar reopen exactly like the frontend soft reload, then swap
+    // the page URL so the reload also re-fetches the document itself.
+    ssSet(SIDEBAR_REOPEN_KEY, "1");
+    try {
+      const u = new URL(window.location.href);
+      u.searchParams.set("cmcpReload", String(Date.now()));
+      window.location.replace(u.toString());
+    } catch {
+      window.location.reload();
+    }
+  } catch (err) {
+    console.warn("[comfyui-mcp-panel] bundle staleness check failed (non-fatal):", err);
+  }
+}
+
 function registerExtensionWhenReady(tries = 0) {
   const comfyApp = window.comfyAPI?.app?.app || window.app;
   if (!comfyApp || typeof comfyApp.registerExtension !== "function") {
@@ -25202,6 +25388,13 @@ function registerExtensionWhenReady(tries = 0) {
       // and its since-removed node could be written. graph_set_widget AWAITS the seed
       // (objectInfoHistorySeed) before authorizing, so no write decides against an empty
       // history; the reconnect / refresh_nodes / fresh-oracle paths keep it current after.
+      //
+      // #584/#611 — but FIRST: if this tab is running a cached STALE bundle, heal
+      // it BEFORE anything here registers/connects and advertises the stale
+      // bundle's capabilities to the orchestrator (codex gate round 4). The probe
+      // is bounded (2s) and every failure mode fails OPEN to a normal startup, so
+      // a healthy panel pays at most one fast loopback fetch.
+      await healStaleBundleIfNeeded();
       seedObjectInfoHistory();
       const tabId = "comfyui-mcp.agent";
       let mounted = null; // { root, destroy }
