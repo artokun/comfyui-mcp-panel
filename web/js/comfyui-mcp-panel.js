@@ -11034,7 +11034,12 @@ const GRAPH_TOOL_EXECUTORS = {
     // clear error instead. The remedy must be actionable from where the caller IS:
     // there is no programmatic delete, so name both real options explicitly rather than
     // leaving "overwrite isn't supported" as a dead end (#636).
-    const collision = blueprintList().find(matchesRequested);
+    // ONE snapshot backs BOTH the collision preflight and the before/after comparison, so
+    // the entry this call ultimately attributes to itself is one this call PROVED was
+    // absent beforehand — not one that merely happens to match the name now.
+    const before = blueprintList();
+    const beforeKeys = new Set(before.map((d) => d?.name));
+    const collision = before.find(matchesRequested);
     if (collision) {
       throw new Error(
         `a subgraph blueprint named "${finalName}" already exists (type "${collision.name}") and this ` +
@@ -11043,41 +11048,51 @@ const GRAPH_TOOL_EXECUTORS = {
           `"${finalName}" from the subgraph library in the ComfyUI UI first and then retry this call.`,
       );
     }
-    const before = blueprintList();
-    const beforeKeys = new Set(before.map((d) => d?.name));
     await store.publishSubgraph(finalName);
     // #636 / rule: never report a save we did not OBSERVE. publishSubgraph resolving is
     // not evidence the blueprint exists — a dismissed dialog, a rejected name, or a
     // frontend that sanitizes the name all resolve without publishing what we asked for.
-    // Read the library BACK and report what is actually there.
-    const after = blueprintList();
-    const published = after.find(matchesRequested) ?? null;
-    if (!published) {
-      // Something may still have been added under a name the frontend chose. Say so
-      // precisely rather than claim the requested save, or claim nothing happened.
-      const added = after.filter((d) => !beforeKeys.has(d?.name));
-      if (added.length === 1) {
-        return {
-          saved: {
-            name: bareName(added[0]),
-            from_node_id: target.id,
-            type: added[0]?.name ?? null,
-            requested_name: finalName,
-            note:
-              `ComfyUI published this blueprint under "${bareName(added[0])}", not the requested ` +
-              `"${finalName}" (it sanitizes or de-duplicates names). Use the reported name with ` +
-              `panel_add_subgraph.`,
-          },
-        };
+    // Read the library BACK and attribute ONLY what this call can bind to itself: an
+    // entry that was ABSENT in `before` and is PRESENT now. A pre-existing entry that
+    // merely matches the name is NOT evidence this publish did anything, and reporting
+    // it would claim a save this call never made.
+    const added = blueprintList().filter((d) => !beforeKeys.has(d?.name));
+    if (added.length === 1) {
+      const entry = added[0];
+      if (matchesRequested(entry)) {
+        return { saved: { name: finalName, from_node_id: target.id, type: entry?.name ?? fullType } };
       }
+      // Published, but under a name the frontend chose (it sanitizes / de-duplicates).
+      // Report the name that actually exists — the requested one would not resolve.
+      return {
+        saved: {
+          name: bareName(entry),
+          from_node_id: target.id,
+          type: entry?.name ?? null,
+          requested_name: finalName,
+          note:
+            `ComfyUI published this blueprint under "${bareName(entry)}", not the requested ` +
+            `"${finalName}" (it sanitizes or de-duplicates names). Use the REPORTED name with ` +
+            `panel_add_subgraph — the requested one will not resolve.`,
+        },
+      };
+    }
+    if (added.length > 1) {
+      // More than one entry appeared while this call was awaiting, so no single entry can
+      // be attributed to this publish. Something WAS added — say exactly that rather than
+      // pick one and call it ours, or claim nothing happened.
       throw new Error(
-        `panel_save_subgraph could not confirm the blueprint "${finalName}" was published: the ` +
-          `subgraph library does not contain it after the publish call` +
-          `${added.length > 1 ? ` (${added.length} entries appeared, none matching the requested name)` : ""}. ` +
-          `Nothing is being reported as saved. Check the ComfyUI subgraph library, then retry.`,
+        `panel_save_subgraph cannot confirm which blueprint this call published: ${added.length} new ` +
+          `entries (${added.map((d) => `"${bareName(d)}"`).join(", ")}) appeared in the subgraph ` +
+          `library while it was saving, so none can be attributed to node ${target.id}. Nothing is ` +
+          `being reported as saved — check the library with panel_list_subgraphs before retrying.`,
       );
     }
-    return { saved: { name: finalName, from_node_id: target.id, type: published.name ?? fullType } };
+    throw new Error(
+      `panel_save_subgraph could not confirm the blueprint "${finalName}" was published: no new entry ` +
+        `appeared in the subgraph library after the publish call. Nothing is being reported as saved. ` +
+        `Check the ComfyUI subgraph library (panel_list_subgraphs), then retry.`,
+    );
   },
 
   // List saved subgraph blueprints. Each is addable via graph_add_subgraph(name)

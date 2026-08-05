@@ -41,6 +41,18 @@ import {
   serverDeclaresEmptyComboOptions,
 } from "./input-asset.js";
 
+/** A never-throwing rendering of an advisory failure. Used on the POST-WRITE path, where
+ *  a second exception (a getter on `message`, a null throw) must not escape either. */
+function coerceAdvisoryMessage(err) {
+  try {
+    const msg = err?.message;
+    if (typeof msg === "string" && msg) return msg;
+    return String(err);
+  } catch {
+    return "the reason could not be rendered";
+  }
+}
+
 export async function runSetWidget(
   node,
   widgetName,
@@ -198,12 +210,16 @@ export async function runSetWidget(
     // container — and getting that wrong refuses a legitimate write while handing the
     // caller a remedy that is actionable and WRONG (worse than a bare refusal):
     //
-    //   1. The CURRENT /object_info does NOT define this type. A backend-defined,
-    //      subgraph-capable node ADDED AFTER the startup baseline is `never-seen` on its
-    //      first observation, yet its type IS in the fresh defs this call already
-    //      fetched — it is a real backend node writing its OWN widget directly, and the
-    //      fresh-type authorization below is entitled to PERMIT it. Short-circuiting on
-    //      history alone would refuse that valid direct write as "unpromoted".
+    //   1. The CURRENT /object_info was FETCHED and does NOT define this type. Two
+    //      distinct facts, and both are needed. A backend-defined, subgraph-capable node
+    //      ADDED AFTER the startup baseline is `never-seen` on its first observation, yet
+    //      its type IS in the fresh defs this call already fetched — it is a real backend
+    //      node writing its OWN widget directly, and the fresh-type authorization below
+    //      is entitled to PERMIT it. And when the fetch FAILED there are no fresh defs at
+    //      all: an unavailable map is not evidence the backend lacks the type, so the
+    //      current-absence fact is simply not established and this diagnosis may not be
+    //      asserted. That case falls through to the fresh-auth guard, which refuses with
+    //      the accurate "object_info is unavailable — reconnect and retry".
     //   2. The history oracle POSITIVELY reports never-seen. `no-oracle` is the
     //      could-not-determine case BY DEFINITION — it establishes neither "never
     //      backend-defined" nor safe container identity (backendHistoryVerdict's own
@@ -216,8 +232,13 @@ export async function runSetWidget(
     // "determined it is not" — the same fold this cluster exists to correct.
     if (node?.subgraph && isVirtualSubgraphContainer(node)) {
       const containerVerdict = backendHistoryVerdict(node?.type, wasTypeEverDefined);
-      const liveBackendType = freshBackendDefinesType(freshDefs, node?.type);
-      if (containerVerdict === "never-seen" && !liveBackendType) {
+      // An UNAVAILABLE map is could-not-determine, NOT "the backend lacks this type" —
+      // freshBackendDefinesType returns false for both, so the two must be told apart
+      // here or an unreachable backend silently becomes positive evidence.
+      const freshDefsUsable = !!freshDefs && typeof freshDefs === "object";
+      const absentFromFreshBackend =
+        freshDefsUsable && !freshBackendDefinesType(freshDefs, node?.type);
+      if (containerVerdict === "never-seen" && absentFromFreshBackend) {
         const promoted = (node.widgets ?? [])
           .map((w) => w?.name)
           .filter((n) => typeof n === "string");
@@ -392,13 +413,33 @@ export async function runSetWidget(
     ];
     return { outerNodeId, enterPath };
   };
+  // The write has ALREADY LANDED and been verified by the time this runs. Everything
+  // here is ADVISORY, and advisory work is still work that can fail: controlScopeFor
+  // re-enters resolvePromotedInnerTarget / collectPromotionIntermediates, which call the
+  // injected `resolveSource` — a malformed or control-only promotion link can throw
+  // there. Letting that escape would report a COMPLETED, verified write as a failure,
+  // and the caller would then "retry" a write that already happened. Refuse before the
+  // action; DISCLOSE after it. So the advisory is computed inside a guard, and its
+  // failure downgrades to a disclosed gap, never to a failed write.
   const withWarning = (result) => {
-    const warnNode = authTarget ?? resolvedTargetNode;
-    const warnWidget = concreteWidgetName ?? writeTargetWidgetName ?? widgetName;
-    const entry = controlEntryForWidget(warnNode, warnWidget);
-    if (!entry || entry.mode === "fixed") return result;
-    const warning = controlAfterGenerateWarning(warnNode, warnWidget, controlScopeFor(entry));
-    return warning ? { ...result, warning } : result;
+    try {
+      const warnNode = authTarget ?? resolvedTargetNode;
+      const warnWidget = concreteWidgetName ?? writeTargetWidgetName ?? widgetName;
+      const entry = controlEntryForWidget(warnNode, warnWidget);
+      if (!entry || entry.mode === "fixed") return result;
+      const warning = controlAfterGenerateWarning(warnNode, warnWidget, controlScopeFor(entry));
+      return warning ? { ...result, warning } : result;
+    } catch (advisoryErr) {
+      return {
+        ...result,
+        warning:
+          `The write SUCCEEDED and was verified. The panel could not finish checking whether a ` +
+          `control_after_generate governs this widget (${coerceAdvisoryMessage(advisoryErr)}), so ` +
+          `treat that as UNKNOWN, not as "no control": if this is a seed or similar, read the node ` +
+          `with panel_query_graph(fields:'detail') and check its control_after_generate before ` +
+          `relying on the value holding across runs.`,
+      };
+    }
   };
 
   // #387 UPLOAD-ASSET fallback: a value rejected by the combo list even AFTER the

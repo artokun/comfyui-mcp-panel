@@ -29,8 +29,21 @@ const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", impo
 test("#636: a renamed entry reports its display label", () => {
   assert.equal(displayLabel({ name: "value", label: "Filename" }), "Filename");
   assert.equal(displayLabel({ name: "value_1", label: "project" }), "project");
-  // Punctuation the user actually used — no normalization, the label is reported verbatim.
+  // Punctuation the user actually used is preserved — only surrounding whitespace is
+  // trimmed (see below), never the label's own characters.
   assert.equal(displayLabel({ name: "boolean", label: "project?" }), "project?");
+});
+
+test("#636: surrounding whitespace is trimmed, and is not by itself a rename", () => {
+  // Trimming is deliberate and stated in the helper's contract. A caller cannot match
+  // " Filename " against anything, and " seed " is not a rename of `seed` — reporting it
+  // as one would be a rename that never happened, which is this bug inverted.
+  assert.equal(displayLabel({ name: "value", label: "  Filename  " }), "Filename");
+  assert.equal(displayLabel({ name: "seed", label: "  seed  " }), null);
+  assert.equal(
+    boundaryInputLabel({ name: "value", _subgraphSlot: { name: "value", label: " Filename " } }),
+    "Filename",
+  );
 });
 
 test("#636: NOTHING is invented — no label, an empty label, or a non-string is null", () => {

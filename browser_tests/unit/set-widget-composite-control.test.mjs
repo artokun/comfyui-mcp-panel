@@ -308,6 +308,39 @@ test("#650 NESTED: the remedy enters EVERY container the promotion is driven thr
   assert.match(res.warning, /panel_exit_subgraph\(\) 2 times/);
 });
 
+test("#650 guard: a THROWING resolver while composing the warning never turns a COMPLETED write into a failure", async () => {
+  // The warning is advisory and runs AFTER the write has landed and been verified. It
+  // re-enters the promotion resolver to work out the caller's scope, and that resolver
+  // is injected — a malformed or control-only promotion link can throw there. Refuse
+  // before the action; disclose after it: an advisory failure must downgrade to a
+  // disclosed gap, never to a reported failure for a write that already happened (the
+  // caller would then "retry" a mutation it already made).
+  const r = reg();
+  const { outer, inner, resolveSource } = promotedSeedFixture(r, "randomize", { promoteControl: true });
+  const seedWidget = inner.widgets.find((w) => w.name === "seed");
+  // The SEED slot resolves normally, so the write itself runs its whole real path and
+  // succeeds. The CONTROL slot — which only the advisory's scope walk ever looks up —
+  // throws, standing in for the malformed/legacy promotion link that can do this live.
+  const exploding = (sn, si) => {
+    if (si?.name === "control_after_generate") throw new Error("promotion link is malformed");
+    return resolveSource(sn, si);
+  };
+  const res = await runSetWidget(outer, "seed", 777777, {
+    registry: r,
+    getRegistry: () => r,
+    getFreshObjectInfo: async () => ({ KSampler: {} }),
+    resolveSource: exploding,
+    ...HOOKS,
+  });
+  // The write is reported as the success it was, and the mutation is real.
+  assert.equal(res.set.value, 777777);
+  assert.equal(seedWidget.value, 777777, "the write landed on the inner node");
+  // …and the gap is DISCLOSED as unknown, not silently swallowed into "no control".
+  assert.match(res.warning, /The write SUCCEEDED and was verified/);
+  assert.match(res.warning, /UNKNOWN, not as "no control"/);
+  assert.match(res.warning, /promotion link is malformed/);
+});
+
 test("#650: when the CONTROL widget is itself promoted, the remedy sets it on the OUTER node with no entering", async () => {
   // The best remedy available: a legacy proxyWidgets promotion exposes the control on
   // the boundary, so it IS settable from the caller's scope. Asserted as an OBSERVED

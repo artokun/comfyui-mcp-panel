@@ -1465,11 +1465,16 @@ test("#612: non-promoted widget on a genuine UUID subgraph node ⇒ honest 'not 
   assert.equal(railWidget.value, 20, "rail untouched");
 });
 
-test("#612: the honest diagnosis is graph-local — it fires even when the backend is UNREACHABLE", async () => {
-  // "This widget is not promoted on this node" needs no /object_info oracle. With the
-  // backend down, the old path reported "cannot verify the node type … reconnect and
-  // retry", which reads as transient — but no retry can ever make an unpromoted widget
-  // settable from outside. The refusal is identical; only the reason is honest.
+test("#612: an UNREACHABLE backend does NOT establish the not-promoted diagnosis — it reports the honest 'could not verify' instead", async () => {
+  // The definite "this is an unpromoted widget on a subgraph" finding claims the node is
+  // a virtual-only container, and that claim rests on the type being ABSENT from the
+  // CURRENT /object_info. When the fetch FAILED there is no current /object_info at all:
+  // an unavailable map is could-not-determine, not "the backend lacks this type". Both
+  // read as "no entry" to a membership test, so they must be told apart here or an
+  // unreachable backend silently becomes positive evidence for a definite verdict.
+  //
+  // The refusal is unchanged (fail closed). Only the diagnosis differs, and "reconnect
+  // and retry" is the accurate one: it IS a transient verification failure.
   const reg = loadedRegistry();
   const { parent, railWidget, resolveSource } = makeUuidSubgraphFixture(reg, "KSampler");
   await assert.rejects(
@@ -1483,8 +1488,33 @@ test("#612: the honest diagnosis is graph-local — it fires even when the backe
         ...HOOKS,
       }),
     (err) => {
-      assert.match(err.message, /is not a promoted widget on this subgraph/);
-      assert.doesNotMatch(err.message, /cannot verify|object_info is unavailable/i);
+      assert.match(err.message, /object_info is unavailable|cannot verify the node type/i);
+      assert.doesNotMatch(err.message, /is not a promoted widget on this subgraph/);
+      return true;
+    },
+  );
+  assert.equal(railWidget.value, 20, "no mutation");
+});
+
+test("#612: a REJECTED /object_info fetch is treated the same as an unavailable one", async () => {
+  // The fetch is wrapped in a catch that sets freshDefs = null, so a throwing oracle and
+  // a null-returning one arrive at the identical state. Both must be could-not-determine.
+  const reg = loadedRegistry();
+  const { parent, railWidget, resolveSource } = makeUuidSubgraphFixture(reg, "KSampler");
+  await assert.rejects(
+    () =>
+      runSetWidget(parent, "control_after_generate", "fixed", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => {
+          throw new Error("network down");
+        },
+        wasTypeEverDefined: () => false,
+        resolveSource,
+        ...HOOKS,
+      }),
+    (err) => {
+      assert.doesNotMatch(err.message, /is not a promoted widget on this subgraph/);
       return true;
     },
   );

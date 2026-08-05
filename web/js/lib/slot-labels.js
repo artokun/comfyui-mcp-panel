@@ -25,6 +25,12 @@
  * `nameOverride` lets a caller supply the name the entry is REPORTED under when that
  * differs from the entry's own `name` (a subgraph boundary slot is reported under the
  * host input's name, while its label may live on the backing slot object).
+ *
+ * The label is TRIMMED before reporting, and the rename test is made on the trimmed
+ * form. Surrounding whitespace is not something a user can see on the canvas or type
+ * into a rename dialog deliberately, so treating " seed " as a rename of `seed` would
+ * report a rename that did not happen — and reporting the untrimmed string would hand
+ * the caller a label it cannot match against anything.
  */
 export function displayLabel(entry, nameOverride) {
   const raw = entry?.label;
