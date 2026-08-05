@@ -2343,6 +2343,26 @@ test("#659 scopeDroppedError: a malformed drift list can never throw out of the 
   assert.match(long, /3 x+/);
 });
 
+test("#659 promptContentHash: the probe uses the REAL input name and its parsed wire value — a key-sensitive toJSON cannot split the channels (codex gate r2)", () => {
+  // toJSON(key) receives the property name: probing under a fixed key would
+  // misjudge a key-sensitive toJSON (drop decision and value both), and
+  // double-invoking a stateful toJSON could flip between probe and canon.
+  // The probe therefore uses the real input name and the canon stores the
+  // probe's PARSED value, so toJSON fires exactly once with the wire's key.
+  const keySensitive = { toJSON: (key) => (key === "model" ? "llama3" : undefined) };
+  const inMemory = { "3": { class_type: "X", inputs: { model: keySensitive } }, "9": { class_type: "Y", inputs: {} } };
+  const wireBody = JSON.stringify({ prompt: { "3": { class_type: "X", inputs: { model: keySensitive } }, "9": { class_type: "Y", inputs: {} } } });
+  assert.equal(
+    promptContentHash(inMemory),
+    promptContentHashFromBody(wireBody),
+    'toJSON("model") on both channels ⇒ the same value, the same hash',
+  );
+  let calls = 0;
+  const counting = { toJSON: () => (++calls, 1) };
+  promptContentHash({ "3": { class_type: "X", inputs: { a: counting } } });
+  assert.equal(calls, 1, "toJSON fires exactly once per input per canonicalization");
+});
+
 test("#659 diffPromptCanons: names input-level changes, node add/remove, and class_type changes — and never throws on odd input", () => {
   const a = canonicalizePrompt({
     "3": { class_type: "KSampler", inputs: { steps: 20, model: ["4", 0] } },

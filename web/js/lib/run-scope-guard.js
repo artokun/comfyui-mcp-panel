@@ -204,13 +204,19 @@ const fnv1aHex = (s) =>
  *     `"model": ((), {})` — an empty-options combo with no default, left
  *     `undefined` when the Ollama server is unreachable), and the shim
  *     widgets a multi-spec COMFY_AUTOGROW_V3 group creates with no value at
- *     all. The check is an exact emulation of the wire — `JSON.stringify`
- *     of a one-key probe object — not a type guess, so it cannot drift from
- *     what the body actually carries (codex gate r1: a `toJSON()` returning
- *     `undefined` is dropped on the wire but would have read as `null` in
- *     the canonical pair). A value that THROWS on stringify (BigInt,
- *     circular) is KEPT — fail toward detecting drift; the hash itself then
- *     fails closed exactly as before.
+ *     all.
+ *
+ *     The check is an exact emulation of the wire, not a type guess: each
+ *     input is serialized once in a one-key probe object UNDER ITS REAL NAME
+ *     (codex gate r2: `toJSON(key)` receives the property name, so probing
+ *     under a fixed key misjudges a key-sensitive `toJSON`), a dropped key
+ *     yields exactly `"{}"`, and the probe's PARSED value is what the canon
+ *     stores — so `toJSON` fires exactly once per input, with the same key
+ *     the POST body would use, and the canon holds the same wire-normalized
+ *     value the parsed body will (dates, toJSON results, -0, NaN→null all
+ *     land identically on both channels). A value that THROWS on stringify
+ *     (BigInt, circular) is KEPT raw — fail toward detecting drift; the hash
+ *     itself then fails closed exactly as before.
  *
  *     This is NOT a drift-detection loosening: the guard's invariant is that
  *     the workflow that WOULD EXECUTE is unchanged, and a value JSON cannot
@@ -230,19 +236,29 @@ export function canonicalizePrompt(output, volatileInputs = null) {
   return keys.map((k) => {
     const node = output[k] ?? {};
     const inputs = node.inputs && typeof node.inputs === "object" ? node.inputs : {};
-    const names = Object.keys(inputs)
-      .filter((n) => !volatileInputs?.has(`${k} ${n}`))
-      .filter((n) => {
-        // Would this key survive JSON.stringify as an object property? Only
-        // then can it reach the server — and only then can it drift.
-        try {
-          return JSON.stringify({ v: inputs[n] }) !== "{}";
-        } catch {
-          return true; // unstringifyable (BigInt/circular) — keep it covered
-        }
-      })
-      .sort();
-    return [k, node.class_type ?? null, names.map((n) => [n, inputs[n]])];
+    const names = [];
+    const wireValues = new Map();
+    for (const n of Object.keys(inputs)) {
+      if (volatileInputs?.has(`${k} ${n}`)) continue;
+      let probe;
+      try {
+        probe = JSON.stringify({ [n]: inputs[n] });
+      } catch {
+        // Unstringifyable (BigInt/circular): keep the RAW value — the hash
+        // then fails closed exactly as before #659, never dropping coverage.
+        names.push(n);
+        continue;
+      }
+      // A one-key object renders as exactly "{}" when the key is dropped —
+      // that value cannot reach the server, so it cannot drift.
+      if (probe === "{}") continue;
+      names.push(n);
+      // The canon stores the WIRE form of the value (toJSON applied once,
+      // under the real key) so both channels compare the same thing.
+      wireValues.set(n, JSON.parse(probe)[n]);
+    }
+    names.sort();
+    return [k, node.class_type ?? null, names.map((n) => [n, wireValues.has(n) ? wireValues.get(n) : inputs[n]])];
   });
 }
 
@@ -677,20 +693,22 @@ export function scopeDroppedError({ toNodeId, verdict }) {
         (drift.length > MAX_DRIFT_TOKENS ? `; …and ${drift.length - MAX_DRIFT_TOKENS} more` : "") +
         `. `
       : "";
-    // Enumerate CANDIDATES, never assert one (codex gate r1): the guard
-    // observed two differing serializations, nothing more. A nondeterministic
-    // widget serializer (a serializeValue emitting a timestamp) produces this
-    // same refusal with no hook and no dynamic-input node involved.
+    // Enumerate CANDIDATES, never assert one (codex gate r1/r2): the guard
+    // observed two differing serializations, nothing more — it cannot see
+    // WHAT rewrote the value, or even that a "rewrite" happened at all (a
+    // nondeterministic widget serializer — a serializeValue emitting a
+    // timestamp — produces this same refusal on an untouched graph).
     const causeText = drift
       ? `If you did not edit ${drift.length === 1 ? "it" : "these"} between queueing and ` +
-        `dispatch, something rewrote ${drift.length === 1 ? "it" : "them"} between serialization ` +
-        `and dispatch that the panel cannot identify from here — candidates: a queue-time ` +
-        `widget hook (e.g. control_after_generate), a dynamic-input node reshaping its slots, ` +
-        `or a nondeterministic widget serializer. Please report this with the differing list above. `
-      : `If this recurs without any edit in between, ` +
-        `a queue-time widget hook is mutating values between serialization and dispatch (e.g. a ` +
-        `control_after_generate widget with WidgetControlMode "before" — switch it to ` +
-        `"after" or fix the target widget's value). `;
+        `dispatch, the two serializations differ for a reason the panel cannot identify from ` +
+        `here — candidates: a queue-time widget hook (e.g. control_after_generate), a ` +
+        `dynamic-input node reshaping its slots, or a nondeterministic widget serializer. ` +
+        `Please report this with the differing list above. `
+      : `If this recurs without any edit in between, the two serializations differ for a ` +
+        `reason the panel cannot identify from here — candidates: a queue-time widget hook ` +
+        `mutating values between serialization and dispatch (e.g. a control_after_generate ` +
+        `widget with WidgetControlMode "before" — switch it to "after" or fix the target ` +
+        `widget's value), or a nondeterministic widget serializer. `;
     return (
       `run-to-node scope for node ${toNodeId} was NOT applied: the workflow graph ` +
       `CHANGED after the run was queued — the deferred dispatch would render a ` +
