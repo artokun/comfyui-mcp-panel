@@ -422,6 +422,107 @@ test("one painter throwing costs that item only, and the reply names the REAL re
     /no usable source/,
     "the file resolved fine — telling the caller to re-send it is a wrong remedy",
   );
+  // "Re-sending will not help" is true and is NOT a next step. Every drop must
+  // carry one, or the reply is a dead end with a better explanation.
+  assert.match(reply.note, /ask them to reload the panel and try again/);
+  assert.match(reply.note, /call get_image on it if you need to look at it/);
+});
+
+test("a non-video DROP with a ComfyUI ref is pointed at get_image, not just told to give up", async () => {
+  const h = harness({
+    paintImage: () => {
+      throw new Error("DOM exploded");
+    },
+  });
+  const reply = await composeShowMediaReply(
+    [
+      {
+        kind: "viewRef",
+        viewRef: { filename: "sheet.png", subfolder: "sub", type: "output" },
+        filename: "sheet.png",
+      },
+    ],
+    h.deps,
+  );
+  assert.match(reply.note, /• sheet\.png — the panel's own painter failed/);
+  assert.match(
+    reply.note,
+    /call get_image with filename "sheet\.png", type "output", subfolder "sub" — it returns the image inline/,
+  );
+});
+
+test("a viewRef whose URL cannot be built is handed the ref, not a dead end", async () => {
+  // The reference is right there; get_image resolves it without the panel's URL
+  // builder, which is the very step that failed.
+  const h = harness({
+    imageViewUrl: () => {
+      throw new Error("apiURL exploded");
+    },
+  });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+  assert.match(reply.note, /could not build a view URL for its ComfyUI reference/);
+  assert.match(reply.note, /The reference itself is intact/);
+  assert.match(
+    reply.note,
+    /call get_image with filename "reference_clip\.mp4", type "input"/,
+    "the URL-build failure must still name a next step — no preview job exists to carry one",
+  );
+});
+
+test("EVERY drop carries a next step, whatever the cause", async () => {
+  // The discrimination the reasons provide is worthless if one of the branches
+  // still ends in "you cannot".
+  const cases = [
+    // no usable source
+    { deps: {}, items: [{ kind: "image", filename: "nothing.png" }] },
+    // URL build failed
+    {
+      deps: {
+        imageViewUrl: () => {
+          throw new Error("no url");
+        },
+      },
+      items: [VIDEO_REF],
+    },
+    // painter failed, image with a ref
+    {
+      deps: {
+        paintImage: () => {
+          throw new Error("dom");
+        },
+      },
+      items: [{ kind: "viewRef", viewRef: { filename: "a.png", type: "output" }, filename: "a.png" }],
+    },
+    // painter failed, inline image with no ref
+    {
+      deps: {
+        paintImage: () => {
+          throw new Error("dom");
+        },
+      },
+      items: [{ kind: "image", dataUrl: "data:image/png;base64,AAAA", filename: "a.png" }],
+    },
+    // painter failed, video
+    {
+      deps: {
+        paintVideo: () => {
+          throw new Error("dom");
+        },
+      },
+      items: [VIDEO_REF],
+    },
+  ];
+  for (const c of cases) {
+    const h = harness(c.deps);
+    const reply = await composeShowMediaReply(c.items, h.deps);
+    const line = reply.note.split("\n").find((l) => l.startsWith("• "));
+    assert.ok(line, `no drop line for ${JSON.stringify(c.items[0].filename)}`);
+    assert.match(
+      line,
+      /(call get_image|Re-send it as an absolute path|reload the panel|sampled-preview note below)/,
+      `drop line names no next step: ${line}`,
+    );
+  }
 });
 
 test("a VIDEO whose player fails to paint still gets its sampled preview", async () => {
@@ -450,6 +551,18 @@ test("a viewRef whose URL cannot be built says THAT, not 'no usable source'", as
   const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
   assert.match(reply.note, /could not build a view URL for its ComfyUI reference/);
   assert.doesNotMatch(reply.note, /no usable source/);
+});
+
+test("a VIDEO drop points at its own sampled-preview note rather than repeating a remedy", async () => {
+  const h = harness({
+    paintVideo: () => {
+      throw new Error("player exploded");
+    },
+  });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+  assert.match(reply.note, /see this video's sampled-preview note below/);
+  assert.match(reply.note, /tell the user their player did not appear/);
+  assert.match(reply.note, /SAMPLED PREVIEW/, "…and that note must actually be there");
 });
 
 test("a painter whose returned object has a THROWING then getter still yields a reply", async () => {
@@ -606,6 +719,33 @@ test("video classification does not treat an arbitrary character as a dot", () =
   );
   assert.equal(isVideoShowMediaItem({ kind: "video", dataUrl: "data:video/mp4;base64,AA==" }), true);
   assert.equal(isVideoShowMediaItem(null), false);
+  // A query string or fragment on the filename must not demote a real video to
+  // an image — that skips the storyboard AND the whole sampled-preview
+  // disclosure, which is this module's entire job.
+  assert.equal(isVideoShowMediaItem(ref("clip.mp4?download=1")), true);
+  assert.equal(isVideoShowMediaItem(ref("clip.MP4?t=3")), true);
+  assert.equal(isVideoShowMediaItem(ref("clip.webm#t=10")), true);
+  assert.equal(isVideoShowMediaItem(ref("clip.mp4?a=1#b")), true);
+  assert.equal(isVideoShowMediaItem(ref("sheet.png?v=2")), false);
+  assert.equal(isVideoShowMediaItem(ref("xmp4?v=2")), false);
+});
+
+test("a video ref carrying a query string still gets a full sampled preview", async () => {
+  const h = harness({ fetchMediaBytes: async () => OVERSIZED_BYTES });
+  const reply = await composeShowMediaReply(
+    [
+      {
+        kind: "viewRef",
+        viewRef: { filename: "reference_clip.mp4?download=1", type: "input" },
+        filename: "reference_clip.mp4?download=1",
+      },
+    ],
+    h.deps,
+  );
+  assert.equal(h.calls.paintedVideos.length, 1, "it must be played, not painted as an image");
+  assert.equal(reply.previews.length, 1);
+  assert.match(reply.note, /SAMPLED PREVIEW/);
+  assert.match(reply.note, /72\.1 MB/);
 });
 
 test("dataUrlByteLength reads the payload exactly, and refuses to guess otherwise", () => {
@@ -640,6 +780,36 @@ test("dataUrlByteLength reads the payload exactly, and refuses to guess otherwis
   assert.equal(dataUrlByteLength("data:video/mp4;base64,AAAA="), null, "padding must complete a group");
   assert.equal(dataUrlByteLength("data:video/mp4;base64,AAAA=="), null, "a full group needs no padding");
   assert.equal(dataUrlByteLength("data:video/mp4;base64,ab-_"), null, "base64url is not decoded here");
+  // Only the five ASCII whitespace characters the decoder itself ignores may be
+  // removed. Stripping JavaScript's \s scrubbed U+00A0 / U+2028 out of a payload
+  // no browser will decode, and then reported a byte count for it.
+  assert.equal(dataUrlByteLength("data:video/mp4;base64,AA ==\t\r\n"), 1, "ASCII whitespace is ignored");
+  // Written as \u escapes on purpose: these characters are invisible, and a
+  // reviewer has to be able to see WHICH codepoint each case is about.
+  for (const cp of ["\u00A0", "\u2028", "\u2029", "\uFEFF", "\u3000", "\u000B", "\u2003"]) {
+    const u = `U+${cp.codePointAt(0).toString(16).toUpperCase().padStart(4, "0")}`;
+    assert.equal(
+      dataUrlByteLength(`data:video/mp4;base64,AA==${cp}`),
+      null,
+      `${u} is not base64 and must not be scrubbed away`,
+    );
+    assert.equal(
+      dataUrlByteLength(`data:video/mp4;base64,A${cp}A==`),
+      null,
+      `${u} is not base64 anywhere in the body either`,
+    );
+  }
+});
+
+test("a payload padded with non-ASCII whitespace reports UNKNOWN, not a byte count", async () => {
+  const h = harness();
+  const reply = await composeShowMediaReply(
+    [{ kind: "video", dataUrl: "data:video/mp4;base64,AA==\u00A0", filename: "sneaky.mp4" }],
+    h.deps,
+  );
+  assert.equal(reply.previews[0].sourceBytes, null);
+  assert.match(reply.note, /size UNKNOWN/);
+  assert.doesNotMatch(reply.note, /source file \d/);
 });
 
 test("a video whose inline payload is malformed reports its size UNKNOWN, never a tiny one", async () => {
@@ -673,11 +843,39 @@ test("the show_media dispatcher answers with the handler's reply, not a fixed ac
   );
   const i = src.indexOf('msg.cmd === "show_media"');
   assert.ok(i > 0, "could not locate the show_media dispatcher branch");
-  const branch = src.slice(i, i + 1600);
+  // Bound the slice to THIS branch — a fixed window ran into the next one and
+  // asserted against its code.
+  const j = src.indexOf('} else if (msg.cmd === "open_civitai")', i);
+  assert.ok(j > i, "could not find the end of the show_media branch");
+  const branch = src.slice(i, j);
   assert.match(
     branch,
-    /result = \(await onShowMedia\?\.\(mediaItems\)\)/,
+    /const mediaReply = await onShowMedia\(mediaItems\);/,
     "the reply must be AWAITED from the handler — a preview is real work",
+  );
+  // The handler is what paints and what composes the disclosure, so its absence
+  // cannot be success. An optional call with an {ok:true} fallback reproduces
+  // the exact dead-end acknowledgement this whole PR removes, on the branch
+  // nobody re-reads.
+  assert.match(
+    branch,
+    /if \(!onShowMedia\) throw new Error\(/,
+    "an absent handler must fail loudly, not succeed quietly",
+  );
+  assert.doesNotMatch(
+    branch,
+    /onShowMedia\?\./,
+    "the optional call is the tell — it makes 'no handler' indistinguishable from 'delivered'",
+  );
+  assert.doesNotMatch(
+    branch,
+    /ok: true/,
+    "no branch of show_media may report success the panel did not observe",
+  );
+  assert.match(
+    branch,
+    /delivered: "unknown"/,
+    "a handler that returns nothing leaves the delivery UNKNOWN, not done",
   );
 });
 

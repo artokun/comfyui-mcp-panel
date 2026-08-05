@@ -66,8 +66,20 @@ export const MEDIA_SIZE_PROBE_TIMEOUT_MS = 8000;
  * video. Widened past mp4/webm because a ComfyUI /view ref can name anything on
  * disk; the orchestrator's own inline path is stricter, which is fine, this only
  * has to decide "try to sample frames from it".
+ *
+ * Anchored at the end, so it is applied to the filename with any query string or
+ * fragment removed FIRST (see videoFilenameStem). A ref whose filename arrives
+ * as `clip.mp4?download=1` is a video; classifying it as an image skips the
+ * storyboard and the whole sampled-preview disclosure for a legitimate video,
+ * which is the failure this module exists to prevent, reached by a different
+ * route than the unescaped dot.
  */
 const VIDEO_FILENAME = /\.(?:mp4|webm|mov|m4v|mkv|avi)$/i;
+
+/** The filename with a `?query` / `#fragment` tail removed. */
+function videoFilenameStem(filename) {
+  return String(filename).split("#")[0].split("?")[0];
+}
 
 const defaultCoerce = (v) => (typeof v === "string" ? v : v == null ? "" : String(v));
 
@@ -76,7 +88,7 @@ export function isVideoShowMediaItem(item, coerce = defaultCoerce) {
   if (!item) return false;
   if (item.kind === "video") return true;
   if (item.kind === "viewRef" && item.viewRef) {
-    return VIDEO_FILENAME.test(coerce(item.viewRef.filename));
+    return VIDEO_FILENAME.test(videoFilenameStem(coerce(item.viewRef.filename)));
   }
   return false;
 }
@@ -92,14 +104,25 @@ export function isVideoShowMediaItem(item, coerce = defaultCoerce) {
  * Both would have told the agent the source file was a few bytes — an invented
  * size, and precisely the "unknown reported as a value" failure this module
  * exists to avoid. Anything that does not decode cleanly is null, i.e. unknown.
+ *
+ * NOTHING IS NORMALISED THAT THE DECODER WOULD NOT NORMALISE. An earlier version
+ * stripped `\s+`, which in JavaScript includes U+00A0, U+2028 and friends — so
+ * `…;base64,AA==<NBSP>` was scrubbed until it parsed and reported ONE BYTE for a
+ * payload no browser will decode. A validator that cleans its input until it
+ * passes certifies something the real consumer rejects. Only the five ASCII
+ * whitespace characters are removed, which is exactly what the forgiving-base64
+ * algorithm behind `atob`/`data:` ignores; every other character has to be in
+ * the alphabet or the answer is unknown.
  */
+const BASE64_ASCII_WHITESPACE = /[\t\n\f\r ]/g;
+
 export function dataUrlByteLength(dataUrl) {
   if (typeof dataUrl !== "string") return null;
   const comma = dataUrl.indexOf(",");
   if (comma < 0) return null;
   const head = dataUrl.slice(0, comma);
   if (!/^data:/i.test(head) || !/;base64$/i.test(head)) return null;
-  const body = dataUrl.slice(comma + 1).replace(/\s+/g, "");
+  const body = dataUrl.slice(comma + 1).replace(BASE64_ASCII_WHITESPACE, "");
   if (!body) return 0;
   // Standard base64: the alphabet, and padding only at the end. Padding is
   // OPTIONAL — browsers decode an unpadded data URL body happily, so requiring
@@ -312,7 +335,16 @@ export async function composeShowMediaReply(items, deps = {}) {
         name,
         why:
           why ??
-          "no usable source — it carried neither inline data nor a ComfyUI reference with a filename; re-send it as an absolute path or as such a reference",
+          "no usable source — it carried neither inline data nor a ComfyUI reference with a filename",
+        // A failed URL build is NOT a dead end: the reference itself is right
+        // here, and get_image resolves it without going through the panel's URL
+        // builder at all.
+        remedy: ref
+          ? `The reference itself is intact — call get_image with ${refClause(ref, text)}, ` +
+            `which fetches it without the panel's URL builder (an image comes back inline; a video is ` +
+            `saved to disk and you get a path).`
+          : `Re-send it as an absolute path on the orchestrator host, or as a ComfyUI reference with a ` +
+            `filename.`,
       });
       continue;
     }
@@ -320,8 +352,22 @@ export async function composeShowMediaReply(items, deps = {}) {
     if (shownState === "failed") {
       dropped.push({
         name,
-        why:
-          "the panel's own painter failed while putting it in the chat (the file itself resolved fine, so re-sending it unchanged will not help)",
+        why: "the panel's own painter failed while putting it in the chat",
+        // "Re-sending will not help" is true and is not a next step. What the
+        // caller can still do depends on what it has: a video always gets its
+        // own sampled-preview note below, and anything with a ComfyUI reference
+        // can be fetched directly.
+        remedy: isVideo
+          ? `The file itself resolved fine, so re-sending it unchanged will not help — see this video's ` +
+            `sampled-preview note below for what you can still do with it, and tell the user their ` +
+            `player did not appear.`
+          : (ref
+              ? `The file itself resolved fine, so re-sending it unchanged will not help. To see it ` +
+                `YOURSELF, call get_image with ${refClause(ref, text)} — it returns the image inline. `
+              : `The file itself resolved fine, so re-sending it unchanged will not help; this tool never ` +
+                `sends it to you either. Put it somewhere ComfyUI serves and call get_image on it if you ` +
+                `need to look at it. `) +
+            `To get it in front of the USER, ask them to reload the panel and try again.`,
       });
     } else if (shownState === "unconfirmed") {
       unconfirmed += 1;
@@ -399,7 +445,9 @@ export async function composeShowMediaReply(items, deps = {}) {
     noteSections.push(
       `${dropped.length} of the ${list.length} requested item(s) were NOT displayed, so the user ` +
         `cannot see ${dropped.length === 1 ? "it" : "them"} either:\n` +
-        dropped.map((d) => `• ${d.name || "(unnamed item)"} — ${d.why}`).join("\n"),
+        dropped
+          .map((d) => `• ${d.name || "(unnamed item)"} — ${d.why}. ${d.remedy}`)
+          .join("\n"),
     );
   }
 

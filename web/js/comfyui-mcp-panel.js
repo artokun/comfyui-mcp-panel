@@ -13003,17 +13003,33 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // Render agent-requested media (images/videos) into the chat.
             // items: [{ kind: "image"|"video"|"viewRef", dataUrl?, viewRef?, filename, caption? }]
             //
-            // #648 — the reply is now the handler's, not a fixed {ok,count}. It
+            // #648 — the reply is the handler's, not a fixed {ok,count}. It
             // paints for the user AND tells the AGENT what it did not receive:
             // a video is answered with a bounded sampled contact sheet plus the
             // disclosure that the sheet is samples, not the video. Awaited,
-            // because that preview is real work; a handler that returns nothing
-            // (or is absent) still gets the original acknowledgement, so an older
-            // wiring degrades to exactly the previous behaviour.
+            // because that preview is real work.
+            //
+            // The absent/empty cases are NOT success. The handler is the thing
+            // that paints and that composes the disclosure, so without it
+            // nothing was displayed and nothing was sampled — and the old
+            // `{ok:true, count: msg.items.length}` fallback would hand the agent
+            // the exact dead-end acknowledgement this fix exists to remove,
+            // counting the REQUEST as though it were the delivery. An absent
+            // handler throws (the same shape every other unwireable command in
+            // this dispatcher uses); a handler that returns nothing reports the
+            // delivery as UNKNOWN rather than as done.
+            if (!onShowMedia) throw new Error("This panel build can't display media.");
             const mediaItems = Array.isArray(msg.items) ? msg.items : [];
-            result = (await onShowMedia?.(mediaItems)) ?? {
-              ok: true,
-              count: mediaItems.length,
+            const mediaReply = await onShowMedia(mediaItems);
+            result = mediaReply ?? {
+              ok: false,
+              requested: mediaItems.length,
+              delivered: "unknown",
+              note:
+                `The panel's media handler returned nothing, so what reached the chat is UNKNOWN. ` +
+                `Do not assume the user saw ${mediaItems.length === 1 ? "this file" : "these files"}, ` +
+                `and do not assume you were shown anything — this tool never sends media to you. ` +
+                `If you need to see a file yourself, call get_image with its ComfyUI filename/type/subfolder.`,
             };
           } else if (msg.cmd === "open_civitai") {
             // Agent opens the CivitAI browser pre-seeded with a query + filters so
