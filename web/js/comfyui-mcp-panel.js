@@ -198,7 +198,10 @@ import { isLinkPersisted, removePhantomLink, isWidgetBackedInput } from "./lib/c
 import { deferChangeTrackerSnapshot } from "./lib/change-tracker-snapshot.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
 import {
+  applyCurrentDefWidgetValues,
+  driftedRequiredInputNames,
   missingRequiredWidgetMaterializations,
+  registeredSocketTypes,
   unavailableRequiredCustomWidgetTypes,
 } from "./lib/node-widget-materialization.js";
 import { sameGraphMutationContext } from "./lib/graph-mutation-context.js";
@@ -6549,13 +6552,25 @@ function placementFor(graph, pos) {
 const CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS = 5000;
 const CUSTOM_WIDGET_REGISTRATION_POLL_MS = 25;
 
-async function awaitRequiredCustomWidgetRegistration(nodeData, comfyApp) {
+async function awaitRequiredCustomWidgetRegistration(
+  nodeData,
+  comfyApp,
+  knownSocketTypes,
+  currentDef,
+) {
   const deadline = Date.now() + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
-  let unavailable = unavailableRequiredCustomWidgetTypes(nodeData, comfyApp?.widgets);
+  const check = () =>
+    unavailableRequiredCustomWidgetTypes(
+      nodeData,
+      comfyApp?.widgets,
+      knownSocketTypes,
+      currentDef,
+    );
+  let unavailable = check();
   while (Date.now() < deadline) {
     if (!unavailable.length) return;
     await new Promise((resolve) => setTimeout(resolve, CUSTOM_WIDGET_REGISTRATION_POLL_MS));
-    unavailable = unavailableRequiredCustomWidgetTypes(nodeData, comfyApp?.widgets);
+    unavailable = check();
   }
   if (!unavailable.length) return;
   throw new Error(
@@ -7798,22 +7813,52 @@ const GRAPH_TOOL_EXECUTORS = {
     // this ONE call is refused with a retry-in-a-moment message — a late response still
     // seeds, so the next call succeeds without a reload.
     await awaitObjectInfoHistorySeed();
+    // Captured from the SAME fresh /object_info the resolvability assert just
+    // fetched. The widget guards below scan THIS def — the backend's current
+    // truth — not the possibly-stale registered nodeData: frontend-injected
+    // inputs (#620 LoadImage's `upload`) are absent from it and never
+    // guarded, and inputs the backend added since page load are still seen.
+    // `undefined` when the type is a frontend-only exemption (no backend def
+    // exists), which falls back to scanning the registered node data.
+    let freshDefs = null;
     await assertAddNodeResolvableRefreshing(() => LG?.registered_node_types ?? {}, class_type, {
       getFreshObjectInfo: async () =>
-        recordObjectInfoTypes(
+        (freshDefs = recordObjectInfoTypes(
           typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null,
-        ),
+        )),
       refresh: (defs) => refreshComfyNodeDefs(defs),
       // #458 OBSERVED-BACKEND-HISTORY trust root, identical to graph_set_widget's.
       wasTypeEverDefined: (t) => objectInfoHistory.wasTypeEverDefined(t),
     });
+    const currentDef = freshDefs?.[class_type] ?? undefined;
+    const nodeData = LG?.registered_node_types?.[class_type]?.nodeData;
+    // A pack upgraded mid-session can add required inputs to an ALREADY
+    // registered class; the resolver only refreshes absent classes, so
+    // createNode would build the OLD shape — a new link input would not even
+    // get a slot and the node could never validate. Refuse before creating
+    // anything, with the remedy that actually updates the schema.
+    const drifted = driftedRequiredInputNames(currentDef, nodeData);
+    if (drifted.length) {
+      throw new Error(
+        `"${class_type}" required input${drifted.length === 1 ? "" : "s"} ` +
+          `${drifted.map((name) => `"${name}"`).join(", ")} ${drifted.length === 1 ? "was" : "were"} ` +
+          "added or retyped since this page loaded its node schema. Reload the ComfyUI tab so " +
+          "the frontend picks up the updated node definition, then retry.",
+      );
+    }
+    // Socket proof comes from the SAME fresh defs — NOT the LiteGraph
+    // registry, whose nodeData.output keeps stale positives for removed or
+    // schema-changed packs and would wrongly waive the guard.
+    const knownSocketTypes = registeredSocketTypes(freshDefs);
     // registerNodesFromDefs can expose a newly installed V3 class before its
     // extension's asynchronous custom-widget registry settles. Resolve the
     // required constructors before creating anything, or fail retryably before
     // mutating the graph (#580).
     await awaitRequiredCustomWidgetRegistration(
-      LG?.registered_node_types?.[class_type]?.nodeData,
+      nodeData,
       comfyApp,
+      knownSocketTypes,
+      currentDef,
     );
     const node = LG.createNode(class_type);
     if (!node) {
@@ -7821,7 +7866,11 @@ const GRAPH_TOOL_EXECUTORS = {
         `Unknown node type "${class_type}" — check the exact class_type via get_node_info`,
       );
     }
-    const missingWidgets = missingRequiredWidgetMaterializations(node, comfyApp?.widgets);
+    const missingWidgets = missingRequiredWidgetMaterializations(
+      node,
+      comfyApp?.widgets,
+      currentDef,
+    );
     if (missingWidgets.length) {
       throw new Error(
         `Required custom widget${missingWidgets.length === 1 ? "" : "s"} ` +
@@ -7829,6 +7878,15 @@ const GRAPH_TOOL_EXECUTORS = {
           `"${class_type}". Reload ComfyUI so its node extension can register, then retry.`,
       );
     }
+    // LG.createNode built this from the REGISTERED nodeData, which is refreshed only for
+    // ABSENT classes — so a pack upgraded mid-session leaves the node holding the OLD
+    // defaults and bounds. Drift refuses a changed SHAPE above; a changed default/min/max
+    // keeps the same shape signature and would sail through, planting a value the current
+    // backend rejects at QUEUE time (or, when it happens to remain valid, an invented
+    // value that is not the current definition's). Reconcile against currentDef BEFORE
+    // the node reaches the graph, and DISCLOSE every correction — a silent fix is still
+    // a value the caller did not ask for.
+    const valueCorrections = applyCurrentDefWidgetValues(node, currentDef);
     // No await follows this validation. Re-read the graph/workflow now so a
     // tab or subgraph switch during the async preflight cannot commit to the
     // graph captured at command start.
@@ -7842,7 +7900,18 @@ const GRAPH_TOOL_EXECUTORS = {
       graph.afterChange();
     }
     graph.setDirtyCanvas(true, true);
-    return { added: summarizeNode(node) };
+    const added = summarizeNode(node);
+    if (valueCorrections.length) {
+      added.schema_value_corrections = valueCorrections;
+      added.warning =
+        `This ComfyUI's registered node schema for "${class_type}" is STALE (its pack changed since ` +
+        `this tab loaded). ${valueCorrections.length} widget value${valueCorrections.length === 1 ? " was" : "s were"} ` +
+        `taken from the backend's CURRENT definition instead of the stale one: ` +
+        `${valueCorrections.map((c) => `"${c.name}" ${JSON.stringify(c.from)} → ${JSON.stringify(c.to)}`).join(", ")}. ` +
+        `The node is valid to queue, but reload the ComfyUI tab to pick up the updated definition ` +
+        `before editing it further.`;
+    }
+    return { added };
   },
 
   graph_remove_node({ node_id }) {

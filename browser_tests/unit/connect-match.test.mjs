@@ -280,3 +280,105 @@ test("#406: a slot literally NAMED like a type still wins by name first", () => 
   const m = autoMatchSlots(origin, target, "IMAGE", "mask");
   assert.equal(m.outIdx, 0); // resolved by NAME to the MASK slot, not by type
 });
+
+// ---- #651: a WILDCARD socket accepts the type it is addressed by ------------
+//
+// Reported: `panel_connect(ImageCrop.IMAGE -> SetNode."IMAGE")` was refused with
+// "No input on node 225 accepts type IMAGE", while node 225's only input was a
+// wildcard `*` — a socket whose declaration is a POSITIVE statement that it accepts
+// anything, and which had carried an IMAGE from VHS_LoadVideo moments earlier.
+// The type-ref resolver compared type strings naively while the auto-matcher scored
+// with isTypeCompatible, so the two answered "does this slot accept IMAGE?"
+// differently. Reading `*` as "not IMAGE" is reading an unknown as a definite
+// negative — the mirror of the add path's over-permissive output-side inference,
+// and the reason both now go through ONE predicate.
+
+// Set/Get bus node: a single wildcard input, named "*" and typed "*".
+function setNodeWildcard() {
+  return { id: 225, type: "SetNode", inputs: [{ name: "*", type: "*", link: null }] };
+}
+function imageCrop() {
+  return { id: 324, type: "ImageCrop", outputs: [{ name: "IMAGE", type: "IMAGE" }] };
+}
+
+test("#651: a wildcard input is matched when addressed by a concrete TYPE name", () => {
+  assert.deepEqual(typeMatchedIndices(setNodeWildcard().inputs, "IMAGE"), [0]);
+  assert.deepEqual(typeMatchedIndices(setNodeWildcard().inputs, "LATENT"), [0]);
+});
+
+test("#651: the reported call now connects (IMAGE output -> existing SetNode wildcard)", () => {
+  const m = autoMatchSlots(imageCrop(), setNodeWildcard(), "IMAGE", "IMAGE");
+  assert.equal(m.outIdx, 0);
+  assert.equal(m.inIdx, 0);
+});
+
+test("#651: an EXACT type match still outranks a wildcard — the tiers never mix", () => {
+  // The wildcard tier exists to stop a false refusal, not to start a wrong guess.
+  // With both an IMAGE input and a `*` input present, "IMAGE" must land on IMAGE.
+  const target = {
+    id: 2,
+    inputs: [
+      { name: "*", type: "*", link: null },
+      { name: "image", type: "IMAGE", link: null },
+    ],
+  };
+  const m = autoMatchSlots(imageCrop(), target, "IMAGE", "IMAGE");
+  assert.equal(m.inIdx, 1, "the concrete IMAGE input wins outright");
+});
+
+test('#651: addressing "*" literally still lands on the wildcard, not on every slot', () => {
+  // isTypeCompatible ranks `*` against anything as a WILDCARD match, so a purely
+  // rank-based resolver would make `to_input:"*"` tie with every string-typed slot
+  // and refuse as ambiguous. Literal identity of the addressed name is checked first.
+  const target = {
+    id: 2,
+    inputs: [
+      { name: "image", type: "IMAGE", link: null },
+      { name: "any", type: "*", link: null },
+    ],
+  };
+  const m = autoMatchSlots(imageCrop(), target, "IMAGE", "*");
+  assert.equal(m.inIdx, 1);
+});
+
+test("#651: TWO wildcard inputs stay AMBIGUOUS — a wildcard does not license guessing", () => {
+  // The whole point of matching `*` is that it accepts anything; that says nothing
+  // about WHICH of two it should be. Silently picking one is the wrong-negative bug
+  // this cluster's other half is about, inverted.
+  const target = {
+    id: 2,
+    inputs: [
+      { name: "a", type: "*", link: null },
+      { name: "b", type: "*", link: null },
+    ],
+  };
+  assert.throws(() => autoMatchSlots(imageCrop(), target, "IMAGE", "IMAGE"), /ambiguous/i);
+});
+
+test("#651: a node with NO wildcard still refuses an unmatched type — the refusal is not blanket-loosened", () => {
+  const target = { id: 2, inputs: [{ name: "samples", type: "LATENT", link: null }] };
+  assert.throws(() => autoMatchSlots(imageCrop(), target, "IMAGE", "IMAGE"), /No input|accepts type/i);
+});
+
+test("#651: a COMBO input is never matched by a type name, wildcard tier or not", () => {
+  // isTypeCompatible refuses combo/non-combo pairings outright, and the resolver only
+  // considers string-typed slots — so an enum cannot be addressed as "IMAGE".
+  const target = {
+    id: 2,
+    inputs: [{ name: "mode", type: ["a", "b"], link: null }],
+  };
+  assert.deepEqual(typeMatchedIndices(target.inputs, "IMAGE"), []);
+});
+
+test("#651: a comma multi-type input is matched by ANY of its declared segments (exact tier)", () => {
+  const target = {
+    id: 2,
+    inputs: [
+      { name: "either", type: "IMAGE,MASK", link: null },
+      { name: "any", type: "*", link: null },
+    ],
+  };
+  // Exact-tier hit on the multi-type slot means the wildcard is never consulted.
+  assert.deepEqual(typeMatchedIndices(target.inputs, "MASK"), [0]);
+  assert.deepEqual(typeMatchedIndices(target.inputs, "IMAGE"), [0]);
+});
