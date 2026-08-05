@@ -159,6 +159,7 @@ import {
   GET_ERRORS_STEP_CAP_MS,
   getErrorsStepBudgetMs,
 } from "./lib/get-errors-budget.js";
+import { boundExecFailurePayload } from "./lib/exec-error-bounds.js";
 import {
   drivenWidgetsFor,
   drivenTag,
@@ -204,6 +205,11 @@ import {
 } from "./lib/control-after-generate.js";
 import { autoMatchSlots, slotDiagnostic } from "./lib/connect-match.js";
 import { isLinkPersisted, removePhantomLink, isWidgetBackedInput } from "./lib/connect-verify.js";
+import {
+  snapshotGraphState,
+  describeInputLink,
+  verifyDisconnect,
+} from "./lib/disconnect-verify.js";
 import { deferChangeTrackerSnapshot } from "./lib/change-tracker-snapshot.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
 import {
@@ -8602,15 +8608,126 @@ const GRAPH_TOOL_EXECUTORS = {
     const { graph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     const inIdx = resolveSlot(node.inputs, input ?? 0, "input");
+    // #668 DISCONNECT HONESTY: capture the intent BEFORE the mutation. On a
+    // SubgraphNode, disconnectInput can cascade beyond dropping the wire — #668
+    // observed it DELETE unrelated nodes (a LoadImage two hops upstream, a
+    // downstream SaveVideo) while reporting plain success, and boundary-slot
+    // removal can shift the inputs array so any slot read AFTER the call may
+    // describe a different input. Snapshot first; verify after; never report a
+    // bare success for a change the graph does not actually show.
+    const inputName = node.inputs?.[inIdx]?.name ?? inIdx;
+    const inputNamesBefore = (node.inputs ?? []).map((s) => s?.name ?? null);
+    const removedLink = describeInputLink(graph, node, inIdx);
+    if (!removedLink) {
+      // Nothing to remove: reporting `disconnected` here would fabricate a
+      // mutation that never happened. REFUSE (the graph is untouched).
+      throw new Error(
+        `panel_disconnect: node ${node.id} input "${inputName}" is not connected — ` +
+          `there is no link to remove. Check the live wiring with panel_graph_outline; ` +
+          `if a previous disconnect already removed it, no retry is needed (#668).`,
+      );
+    }
+    const before = snapshotGraphState(graph);
+    // The mutation can throw AFTER partially applying (a node hook or the
+    // cascade failing midway). Capture the error and STILL verify the
+    // post-state — a raw throw would read as "nothing changed" and invite a
+    // destructive retry of a disconnect that may have landed.
+    let mutationErr = null;
     graph.beforeChange();
     try {
       node.disconnectInput(inIdx);
-    } finally {
+    } catch (err) {
+      mutationErr = err;
+    }
+    let envelopeErr = null;
+    try {
       graph.afterChange();
+    } catch (err) {
+      envelopeErr = err;
     }
     graph.setDirtyCanvas(true, true);
+    const verdict = verifyDisconnect(graph, node, before, removedLink.linkId);
+    // Shared disclosure bullets: observed post-state facts ONLY — the verifier
+    // proves what changed, never why, so no bucket is narrated as a cause.
+    const disclosureBullets = () => {
+      const lines = [
+        verdict.intendedRemoved
+          ? `- the intended link (from node ${removedLink.node_id} output "${removedLink.output}") WAS removed`
+          : `- the intended link (from node ${removedLink.node_id} output "${removedLink.output}") is STILL PRESENT on the live graph`,
+      ];
+      if (verdict.missingNodes.length) {
+        lines.push(
+          `- node(s) ${verdict.missingNodes.join(", ")} were REMOVED from the graph during this disconnect`,
+        );
+        if (verdict.missingNodes.includes(String(node.id))) {
+          lines.push(`- the removed nodes INCLUDE the disconnect target (node ${node.id}) itself`);
+        }
+      }
+      if (verdict.addedNodes.length) {
+        lines.push(`- node(s) ${verdict.addedNodes.join(", ")} APPEARED that were not there before`);
+      }
+      for (const l of verdict.collateralRemovedLinks) {
+        lines.push(
+          `- a link that was NOT the target was removed: node ${l.origin_id} output ${l.origin_slot} → node ${l.target_id} input ${l.target_slot}`,
+        );
+      }
+      for (const l of verdict.addedLinks) {
+        lines.push(
+          `- a link APPEARED that this disconnect did not create: node ${l.origin_id} output ${l.origin_slot} → node ${l.target_id} input ${l.target_slot}`,
+        );
+      }
+      return lines;
+    };
+    const undoRemedy =
+      `The state above is what the live graph ACTUALLY shows; the panel did not fabricate a ` +
+      `success. Press Ctrl+Z in the ComfyUI tab to undo, then re-check the graph with ` +
+      `panel_graph_outline BEFORE queueing anything — a silently deleted output node runs ` +
+      `to completion and saves nothing.`;
+    if (mutationErr || envelopeErr) {
+      throw new Error(
+        [
+          `panel_disconnect on node ${node.id} input "${inputName}" threw (#668): ` +
+            `${mutationErr?.message ?? mutationErr ?? ""}` +
+            (envelopeErr ? ` (afterChange also threw: ${envelopeErr?.message ?? envelopeErr})` : ""),
+          `Post-state check of the live graph:`,
+          ...disclosureBullets(),
+          undoRemedy,
+        ].join("\n"),
+      );
+    }
+    if (!verdict.ok) {
+      // The mutation ALREADY happened — disclose exactly what was observed
+      // (never refuse after the fact: that reports failure for a disconnect
+      // that may have landed and invites a destructive retry). The panel
+      // cannot safely restore deleted nodes itself; the change is inside one
+      // beforeChange/afterChange envelope, so a single Ctrl+Z reverts it.
+      throw new Error(
+        [
+          `panel_disconnect on node ${node.id} input "${inputName}" did not complete cleanly (#668):`,
+          ...disclosureBullets(),
+          undoRemedy,
+        ].join("\n"),
+      );
+    }
+    // Boundary-slot disclosure: a subgraph (or dynamic) node may change its
+    // input slots on disconnect. That is a legitimate cascade, but it shifts
+    // slot indices — a follow-up disconnect by NAME is safe, by INDEX is not,
+    // unless the caller re-resolves first.
+    const inputNamesAfter = (node.inputs ?? []).map((s) => s?.name ?? null);
+    const slotsShifted =
+      inputNamesBefore.length !== inputNamesAfter.length ||
+      inputNamesBefore.some((n, i) => n !== inputNamesAfter[i]);
     return {
-      disconnected: { node_id: node.id, input: node.inputs?.[inIdx]?.name ?? inIdx },
+      disconnected: { node_id: node.id, input: inputName },
+      removed_link: { node_id: removedLink.node_id, output: removedLink.output },
+      ...(slotsShifted
+        ? {
+            warning:
+              `the node's input slots changed during the disconnect (count, order, or names ` +
+              `differ) — re-resolve input names with panel_graph_outline before any further ` +
+              `disconnect by index`,
+          }
+        : {}),
     };
   },
 
@@ -9806,9 +9923,13 @@ const GRAPH_TOOL_EXECUTORS = {
   //   - lastNodeErrors      → per-input validation errors from the last queue
   //   - lastExecFailure     → the last runtime failure (live execution_error event)
   //
-  // `node_errors` and `last_execution_error` are kept VERBATIM for backwards
-  // compatibility — the turn-start validation block, the tool-call label and the
-  // console action all read them.
+  // `node_errors` and `last_execution_error` are kept for backwards compatibility
+  // — the turn-start validation block, the tool-call label and the console action
+  // all read them (presence / scalar fields). `last_execution_error` is BOUNDED at
+  // emission (#664): the raw event detail carries tensor-sized current_inputs /
+  // current_outputs and traceback lines with huge tensor reprs, which shipped a
+  // 41k+ token tool result. Same keys, capped values, every cut disclosed in-band
+  // (see web/js/lib/exec-error-bounds.js).
   //
   // NOTE on EXEC_ERR_STORE below: that ComfyUI store id is a camelCase name
   // ending in "...executi" + "on" + "Error". Lowercased, that tail collides with
@@ -10016,8 +10137,8 @@ const GRAPH_TOOL_EXECUTORS = {
     //    LiteGraph does NOT set has_errors for a runtime failure, so the throwing
     //    node is never painted red and reaches the output ONLY via the union
     //    below. `exception_type` is carried because "PIL.UnidentifiedImageError"
-    //    explains far more than the message; the traceback is dropped to stay
-    //    token-bounded (it stays in `last_execution_error` for compatibility).
+    //    explains far more than the message; the traceback is dropped HERE to stay
+    //    token-bounded (a capped traceback ships in `last_execution_error`, #664).
     let execFailure = null;
     try {
       let e = lastExecFailure;
@@ -10130,8 +10251,10 @@ const GRAPH_TOOL_EXECUTORS = {
       ...(missingNodeCount && !missingNodeTypes.length
         ? { missing_node_count: missingNodeCount }
         : {}),
-      // --- backwards-compatible raw payloads (existing consumers read these) ---
-      last_execution_error: lastExecFailure,
+      // --- backwards-compatible payloads (existing consumers read these) ---
+      // Bounded at emission (#664): verbatim, this carried tensor-sized
+      // current_inputs/current_outputs and huge traceback lines (41k+ tokens).
+      last_execution_error: boundExecFailurePayload(lastExecFailure),
       node_errors: nodeErrors,
       ...(clean ? { note: "no errors recorded since the last execution start" } : {}),
     };
