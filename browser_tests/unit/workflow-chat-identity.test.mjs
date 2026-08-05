@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
 
 import {
   activeWorkflowFenceApplies,
+  commandIsCanvasIndependent,
   commandWorkflowMismatch,
   hasEmbeddedUuidSuccessionEvidence,
   selectorSearchIncludesListed,
@@ -81,6 +85,71 @@ test('#570 fence does NOT apply to navigation / resolved-non-active workflow ops
   // Selector RESOLVED to a genuinely non-active open workflow → deterministic target → runs.
   assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_close', targetsNonActive: true }), false)
   assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_rename', targetsNonActive: true }), false)
+})
+
+// #602 — a command whose execution AND reply never reference the active canvas
+// (Manager registry/server ops, ComfyUI server controls) must not be fenced to the
+// active workflow's uuid: a tab switch after issue manufactured a false refusal for
+// panel_search_nodes before it ever reached the registry search.
+test('#602 fence does NOT apply to canvas-independent Manager/server commands', () => {
+  for (const cmd of [
+    'nodes_search',
+    'nodes_list',
+    'nodes_install',
+    'nodes_queue_status',
+    'graph_update_node', // a Manager PACK update misnamed with a graph_ prefix
+    'comfy_reboot',
+    'free_vram',
+  ]) {
+    assert.equal(activeWorkflowFenceApplies({ cmd }), false, `${cmd} never touches a canvas`)
+    assert.equal(commandIsCanvasIndependent(cmd), true, `${cmd} is canvas-independent`)
+  }
+  // codex gate round 5 — refresh_nodes is NOT canvas-independent: its executor
+  // re-applies fresh defs to LIVE node objects and renames UNKNOWN widget
+  // placeholders on the active canvas, so a stale-stamped call must stay fenced.
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'refresh_nodes' }), true)
+  assert.equal(commandIsCanvasIndependent('refresh_nodes'), false)
+})
+
+test('#602 the exemption stays EXPLICIT — canvas ops, workflow mutators, and unknown commands stay fenced (fail closed)', () => {
+  // Canvas mutators and reads.
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'graph_add_node' }), true)
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'graph_get_state' }), true)
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'graph_run' }), true)
+  // Active-workflow mutators.
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_save' }), true)
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_close' }), true)
+  // workflow_list's reply DESCRIBES the active workflow — a stale-stamped call
+  // must not answer for the wrong tab, so it is NOT canvas-independent.
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'workflow_list' }), true)
+  assert.equal(commandIsCanvasIndependent('workflow_list'), false)
+  // An unknown/new command fails closed: coverage is lost only by an explicit opt-out.
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'graph_future_command' }), true)
+  assert.equal(commandIsCanvasIndependent('graph_future_command'), false)
+})
+
+test('#602 wiring: dispatch skips the graph-binding assert for canvas-independent graph_ commands, and the fence message is clean UTF-8', () => {
+  const HERE = dirname(fileURLToPath(import.meta.url))
+  const src = readFileSync(join(HERE, '../../web/js/comfyui-mcp-panel.js'), 'utf8')
+  // graph_update_node is canvas-independent but named graph_*: the dispatch-time
+  // binding assert (which requires a canvas binding proof) must not gate it.
+  assert.match(
+    src,
+    /msg\.cmd\.startsWith\("graph_"\)\s*&&\s*!commandIsCanvasIndependent\(msg\.cmd\)/,
+    'the dispatch binding assert must skip commands that never touch a canvas',
+  )
+  // Same for the PIN guard (codex gate round 2): a pin exists to stop a CANVAS
+  // write landing on the wrong workflow — canvas-independent commands must not
+  // be refused by it either.
+  assert.match(
+    src,
+    /pinnedPath\.trim\(\)\s*&&\s*!commandIsCanvasIndependent\(msg\.cmd\)/,
+    'the pinned-target guard must skip commands that never touch a canvas',
+  )
+  // The workflow-instance-mismatch refusal renders for real users; it once shipped
+  // with a mojibake em dash ("â€”"). Pin the clean form.
+  assert.ok(src.includes('active canvas — the workflow was switched or replaced'), 'fence message keeps its em dash')
+  assert.ok(!src.includes('â€'), 'no mojibake anywhere in the panel source')
 })
 
 test('#570 pinned command after in-place replacement at the same path: uuid mismatch ⇒ REFUSED', () => {
@@ -479,6 +548,9 @@ test('scope guard authorizes only an exact workflow UUID key', () => {
 // wedged panel_restart_comfyui itself behind "workflow instance mismatch" — the very
 // command the mismatch error's situation calls for — leaving no in-band recovery.
 test('#607 non-canvas commands are exempt from the workflow-instance fence', () => {
+  // The exemption set is #624's CANVAS_INDEPENDENT_COMMANDS (adopted in the merge
+  // integration — same #607 deadlock it fixes, with a sharper membership
+  // criterion: the command neither touches a canvas NOR answers for the active one).
   for (const cmd of [
     'comfy_reboot',
     'free_vram',
@@ -486,7 +558,8 @@ test('#607 non-canvas commands are exempt from the workflow-instance fence', () 
     'nodes_list',
     'nodes_install',
     'nodes_queue_status',
-    'workflow_list'
+    // graph_update_node: a Manager PACK update misnamed with a graph_ prefix (#624).
+    'graph_update_node'
   ]) {
     assert.equal(activeWorkflowFenceApplies({ cmd }), false, `${cmd} must not be fenced`)
   }
@@ -502,6 +575,9 @@ test('#607 canvas and workflow commands stay fenced; unknown commands fail close
     // lists on the active graph (refreshComfyNodeDefs → reapplyDefsToLiveNodes) —
     // a canvas mutation, so the stamp must be proven before it runs (codex gate).
     'refresh_nodes',
+    // workflow_list's reply DESCRIBES the active workflow, so a stale-stamped
+    // call would answer for the wrong tab — fenced by #624's criterion.
+    'workflow_list',
     'workflow_save',
     'workflow_save_as',
     'workflow_rename',
