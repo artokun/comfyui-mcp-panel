@@ -17,6 +17,13 @@
 // pure, testable function — and so a failure inside any single output can never
 // wedge the one send.
 
+// #648 — the per-segment bound below used to be a private helper in this file.
+// The oversized-media preview path runs the SAME storyboard pipeline and needs
+// the SAME bound, so it now lives in one place both import. Behaviour is
+// unchanged except that a throwing `onTimeout`/`clearTimer` degrades instead of
+// leaving the segment pending forever.
+import { withTimeout } from "./bounded-step.js";
+
 /**
  * Build and send the single consolidated completion frame for one finished
  * prompt. Resolves to the frame that was sent (for tests), or null when the
@@ -373,29 +380,4 @@ async function buildVideoSegment(v, deps) {
     },
     { setTimer, clearTimer },
   );
-}
-
-/**
- * Resolve `promise`, but if it hasn't settled within `ms`, resolve with
- * `onTimeout()` instead. Never rejects (a rejected `promise` also falls back).
- * A non-positive `ms` disables the bound. The timer is cleared on settle so it
- * can't leak.
- */
-function withTimeout(promise, ms, onTimeout, { setTimer, clearTimer }) {
-  if (!(ms > 0)) return promise;
-  return new Promise((resolve) => {
-    let settled = false;
-    const done = (v) => {
-      if (settled) return;
-      settled = true;
-      clearTimer(t);
-      resolve(v);
-    };
-    const t = setTimer(() => {
-      if (settled) return;
-      settled = true;
-      resolve(onTimeout());
-    }, ms);
-    promise.then(done, () => done(onTimeout()));
-  });
 }

@@ -1,0 +1,88 @@
+// ONE bounded-step primitive, shared by every panel path that must not be
+// suspended by an I/O step that can fail to settle.
+//
+// Extracted (not re-written) from run-completion-frame.js, where it was private.
+// The oversized-media preview path (#648) runs the SAME storyboard pipeline —
+// sample frames, upload the sheet, HEAD its size — and therefore needs the SAME
+// bound. A second timeout helper written alongside the first is how this repo
+// keeps producing near-duplicate bugs, so there is one here and both callers
+// import it.
+//
+// WHAT IT GUARANTEES
+//
+//   - The returned promise ALWAYS settles, and always fulfils: it never rejects.
+//     A rejected `promise` degrades through `onTimeout()` exactly as a timeout
+//     does, because both mean "the bounded step did not produce a result".
+//   - It settles at most once. A late fulfilment after the bound has fired is
+//     dropped, not raced against the fallback.
+//   - The timer is cleared on settle, so a long-lived page cannot accumulate
+//     pending timers per bounded step.
+//   - A non-positive `ms` disables the bound and returns `promise` unchanged.
+//
+// WHAT IT DELIBERATELY DOES NOT DO
+//
+//   It does not CANCEL the work it bounds. `buildVideoStoryboard` keeps decoding
+//   and `uploadBlobToInput` keeps fetching after the bound fires; the bound only
+//   stops the caller waiting on them. That is the intended contract — the caller
+//   is composing a reply, not managing the pipeline's lifetime.
+//
+// EVERY GUARD IS ITSELF AN OPERATION THAT CAN FAIL
+//
+// `onTimeout()` and `clearTimer()` are injected, so both can throw. In the
+// original private version a throw from either left the outer promise pending
+// FOREVER — the exact failure the bound exists to prevent, reintroduced by the
+// bound itself. Both are therefore called inside a catch here. When `onTimeout`
+// throws there is no fallback value to report, so the step resolves `undefined`
+// and the caller's own "no segment" branch handles it; that is strictly better
+// than never resolving. This is the ONLY behavioural difference from the
+// extracted original, and it cannot change any case where neither throws.
+
+/**
+ * Resolve `promise`, but if it has not settled within `ms`, resolve with
+ * `onTimeout()` instead.
+ *
+ * @param {Promise<any>} promise      the bounded step
+ * @param {number} ms                 wall-clock bound; <= 0 disables it
+ * @param {() => any} onTimeout       fallback value factory (must be cheap + sync)
+ * @param {{setTimer?:Function, clearTimer?:Function}} [timers] injectable for tests
+ * @returns {Promise<any>} never rejects
+ */
+export function withTimeout(promise, ms, onTimeout, timers = {}) {
+  const setTimer = timers.setTimer ?? ((fn, delay) => setTimeout(fn, delay));
+  const clearTimer = timers.clearTimer ?? ((t) => clearTimeout(t));
+  if (!(ms > 0)) return promise;
+  return new Promise((resolve) => {
+    let settled = false;
+    // Never let the fallback factory's own failure become "hangs forever".
+    const fallback = () => {
+      try {
+        return onTimeout();
+      } catch {
+        return undefined;
+      }
+    };
+    let t;
+    const done = (v) => {
+      if (settled) return;
+      settled = true;
+      try {
+        clearTimer(t);
+      } catch {
+        // A leaked timer is a leak; a throw here would be a wedge. Prefer the leak.
+      }
+      resolve(v);
+    };
+    try {
+      t = setTimer(() => {
+        if (settled) return;
+        settled = true;
+        resolve(fallback());
+      }, ms);
+    } catch {
+      // No timer could be armed, so this step is UNBOUNDED — but a throw out of
+      // the executor would reject, and this helper's whole contract is that it
+      // does not. Fall through: the result still arrives via the chain below.
+    }
+    promise.then(done, () => done(fallback()));
+  });
+}

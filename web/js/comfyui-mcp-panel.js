@@ -276,6 +276,7 @@ import {
 } from "./lib/workflow-save.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
+import { composeShowMediaReply } from "./lib/media-preview.js";
 import { readyAckCanPromoteBackend } from "./lib/pi-readiness.js";
 import { createRunReconcileSweep } from "./lib/run-reconcile-sweep.js";
 import {
@@ -12988,9 +12989,19 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           } else if (msg.cmd === "show_media") {
             // Render agent-requested media (images/videos) into the chat.
             // items: [{ kind: "image"|"video"|"viewRef", dataUrl?, viewRef?, filename, caption? }]
+            //
+            // #648 — the reply is now the handler's, not a fixed {ok,count}. It
+            // paints for the user AND tells the AGENT what it did not receive:
+            // a video is answered with a bounded sampled contact sheet plus the
+            // disclosure that the sheet is samples, not the video. Awaited,
+            // because that preview is real work; a handler that returns nothing
+            // (or is absent) still gets the original acknowledgement, so an older
+            // wiring degrades to exactly the previous behaviour.
             const mediaItems = Array.isArray(msg.items) ? msg.items : [];
-            onShowMedia?.(mediaItems);
-            result = { ok: true, count: mediaItems.length };
+            result = (await onShowMedia?.(mediaItems)) ?? {
+              ok: true,
+              count: mediaItems.length,
+            };
           } else if (msg.cmd === "open_civitai") {
             // Agent opens the CivitAI browser pre-seeded with a query + filters so
             // the user can visually pick a resource.
@@ -19905,22 +19916,29 @@ function buildPanel() {
     onTodo(items) {
       renderTodo(items);
     },
-    // The agent called panel_show_media — render images/videos directly in the chat.
+    // The agent called panel_show_media — render images/videos directly in the
+    // chat AND answer the agent honestly about what it was handed (#648).
+    //
+    // This used to paint and return nothing, so the tool replied {ok:true} to an
+    // agent that had been shown nothing. For a video that reads as "I have seen
+    // it"; over the orchestrator's inline ceiling it reads as "this is
+    // impossible". composeShowMediaReply paints exactly as before and then routes
+    // every video through the panel's EXISTING storyboard pipeline — bounded, and
+    // disclosed as a sample rather than as the video.
     onShowMedia(items) {
-      for (const item of items) {
-        const caption = coerceMessageText(item.caption) || coerceMessageText(item.filename) || "";
-        if (item.kind === "viewRef" && item.viewRef) {
-          const url = imageViewUrl(item.viewRef);
-          // Determine if ComfyUI ref is a video by extension
-          const isVid = /.(mp4|webm)$/i.test(item.viewRef.filename || "");
-          if (isVid) paintVideo(url, caption);
-          else paintImage(url, caption);
-        } else if (item.kind === "video" && item.dataUrl) {
-          paintVideo(item.dataUrl, caption);
-        } else if (item.dataUrl) {
-          paintImage(item.dataUrl, caption);
-        }
-      }
+      return composeShowMediaReply(items, {
+        paintImage,
+        paintVideo,
+        imageViewUrl,
+        coerceMessageText,
+        buildVideoStoryboard,
+        uploadBlobToInput,
+        storyboardFrameCount,
+        humanizeBytes,
+        fetchMediaBytes: fetchImageBytes,
+        videoStoryboardEnabled: prefs.videoStoryboard !== false,
+        warn: (...a) => console.warn(...a),
+      });
     },
     // The agent called panel_open_civitai — open the CivitAI browser pre-seeded
     // with a query + suggested filters so the user can visually pick a resource.
