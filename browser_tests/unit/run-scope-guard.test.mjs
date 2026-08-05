@@ -980,6 +980,62 @@ test("#630 gate r4: a LATE extra post, arriving AFTER the run reported success, 
   }
 });
 
+test("#630 gate r9 P1: a request STILL IN FLIGHT at timeout is not reported as 'nothing queued'", async () => {
+  // A busy frontend can fire-and-forget a correctly-scoped POST and return. If
+  // the server has not answered by the time the wait expires, that request HAS
+  // left the panel and may still be accepted — reporting the run as
+  // queued:false then is a definite negative about something unobserved, and
+  // the caller acting on it re-renders a branch that is already running.
+  const stop = keepAlive();
+  try {
+    let releaseResponse;
+    const held = new Promise((r) => { releaseResponse = r; });
+    const server = makeServer(async () => {
+      await held;
+      return jsonResponse(200, { prompt_id: "srv-late" });
+    });
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "shim", apiTarget });
+    // Fire-and-forget: post WITHOUT awaiting, then return — the request is in
+    // flight when dispatchScopedRun starts waiting.
+    app.queuePrompt = async (number) => {
+      const body = frontendBody({ output: OUR_OUTPUT, number, targets: ["14"] });
+      app.posted.push(body);
+      void apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+      return true;
+    };
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14, verifyTimeoutMs: 25,
+    });
+    assert.equal(result.outcome, "unverified");
+    assert.equal(result.verified, 0, "it was genuinely not confirmed");
+    assert.equal(result.inFlight, 1, "but one correctly-scoped request had already left the panel");
+    assert.match(result.error, /ALREADY LEFT the panel/);
+    assert.match(result.error, /NOT a report that nothing was queued/);
+    assert.match(result.error, /Check the ComfyUI queue before retrying/);
+    // And it really can be accepted afterwards — which is why the claim matters.
+    releaseResponse();
+    await sleep(5);
+    assert.equal(server.calls.length, 1, "the scoped request did leave, exactly once");
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
+  } finally {
+    stop();
+  }
+});
+
+test("#630 gate r9 P1: graph_run counts in-flight requests as unresolved, so `queued` is omitted rather than asserted false", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const source = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.js"), "utf8").replace(/\r\n/g, "\n");
+  const start = source.indexOf('if (runScopeResult && runScopeResult.outcome !== "dispatched")');
+  const block = source.slice(start, start + 6000).replace(/`\s*\+\s*\n\s*`/g, "").replace(/\s+/g, " ");
+  assert.match(
+    block,
+    /const unresolved = \(runScopeResult\.indeterminate \?\? 0\) \+ \(runScopeResult\.inFlight \?\? 0\);/,
+    "an in-flight request has the same epistemic status as an indeterminate one",
+  );
+  assert.match(block, /if \(unresolved > 0\)/, "and it gates the queued-unknown shape");
+});
+
 test("#630 gate r8 P0: a RETRYING run never displaces a concurrent run's sentinel — B's late post is still fenced", async () => {
   // A installs GA1 and waits on a deferred first attempt. B starts, captures
   // GA1 as its chain, succeeds, and retains GB. A's deferred post arrives
@@ -1059,7 +1115,7 @@ test("#630 gate r8 P1: an INDETERMINATE dispatch omits `queued` — neither true
   assert.ok(start > 0);
   const block = source.slice(start, start + 6000).replace(/`\s*\+\s*\n\s*`/g, "").replace(/\s+/g, " ");
   // The indeterminate branch must NOT assert queued:false…
-  const indetStart = block.indexOf("if (runScopeResult.indeterminate > 0)");
+  const indetStart = block.indexOf("if (unresolved > 0)");
   assert.ok(indetStart > 0, "the indeterminate case is handled separately");
   // Bound the slice to THIS branch's return, or it runs on into the
   // nothing-dispatched `queued: false` below and the assertion means nothing.

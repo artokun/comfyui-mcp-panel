@@ -9239,13 +9239,17 @@ const GRAPH_TOOL_EXECUTORS = {
       // the field that only has two honest values simply is not present, and
       // `queued_unknown` says why. Only a run where nothing left the panel gets
       // the definite `queued: false`.
-      if (runScopeResult.indeterminate > 0) {
+      // `inFlight` counts requests that HAD LEFT the panel and were still
+      // awaiting a response when the wait expired (gate r9) — same epistemic
+      // status as an indeterminate one: it may be accepted a moment from now.
+      const unresolved = (runScopeResult.indeterminate ?? 0) + (runScopeResult.inFlight ?? 0);
+      if (unresolved > 0) {
         return {
           queued_unknown: true,
           error: runScopeResult.error,
-          indeterminate_count: runScopeResult.indeterminate,
+          indeterminate_count: unresolved,
           retry_guidance:
-            `No prompt was CONFIRMED queued, but ${runScopeResult.indeterminate} request(s) ` +
+            `No prompt was CONFIRMED queued, but ${unresolved} request(s) ` +
             `DID leave the panel and their outcome could not be determined — ComfyUI may have ` +
             `queued them, and they carried the run-to-node scope. Check the ComfyUI queue ` +
             `before retrying rather than assuming nothing ran; a blind retry can render the ` +

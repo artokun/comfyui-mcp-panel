@@ -581,7 +581,7 @@ export function scopeUnattributableError({ toNodeId }) {
  *    verified prompts DID queue (scoped); only the unverified remainder is
  *    in doubt.
  */
-export function scopeUnverifiedError({ toNodeId, timeoutMs, cancelled = false, verified = 0, batch = 1 }) {
+export function scopeUnverifiedError({ toNodeId, timeoutMs, cancelled = false, verified = 0, batch = 1, inFlight = 0 }) {
   const count =
     verified > 0
       ? ` (${verified} of ${batch} batch prompts WERE verified and are queued with the scope)`
@@ -590,13 +590,29 @@ export function scopeUnverifiedError({ toNodeId, timeoutMs, cancelled = false, v
     `run-to-node scope for node ${toNodeId} could not be verified: no scoped ` +
     `dispatch was observed within ${Math.round(timeoutMs / 1000)}s of queueing ` +
     `(the frontend deferred or silently dropped the request)${count}. `;
+  // IN FLIGHT ≠ NEVER SENT (codex gate r9). A correctly-scoped request that has
+  // already left the panel but whose response has not come back yet is neither
+  // verified nor absent — it may be accepted a moment from now. Saying "nothing
+  // was queued" about it is a definite negative we cannot observe, and the
+  // caller acting on it re-renders a branch that is already running.
+  const inFlightNote =
+    inFlight > 0
+      ? `${inFlight} correctly-scoped request(s) had ALREADY LEFT the panel and were ` +
+        `still awaiting a response when the wait expired — those may yet be accepted by ` +
+        `ComfyUI, so this is NOT a report that nothing was queued. Check the ComfyUI ` +
+        `queue before retrying. `
+      : "";
   if (cancelled) {
     return (
       base +
+      inFlightNote +
       `The still-pending queue item was located and REMOVED, so nothing ` +
-      `${verified > 0 ? "more " : ""}was queued and no scope-dropped full-graph dispatch can execute — retry the run (#556).`
+      `${verified > 0 || inFlight > 0 ? "more " : ""}was queued from the pending item and no ` +
+      `scope-dropped full-graph dispatch can execute` +
+      (inFlight > 0 ? ` (#556).` : ` — retry the run (#556).`)
     );
   }
+  if (inFlightNote) return base + inFlightNote + `The scope guard stays installed as a sentinel (#556).`;
   return (
     base +
     `The pending queue item could not be removed on this frontend, so the scope ` +
@@ -1243,6 +1259,14 @@ export async function dispatchScopedRun({
         // we could not. So the sentinel stays either way; the cancel result
         // only changes what we can honestly CLAIM about what was queued.
         const verified = guard.state.observed;
+        // STILL IN FLIGHT is its own state (codex gate r9). A busy frontend can
+        // fire-and-forget a correctly-scoped POST and return; if the server has
+        // not answered by the time the wait expires, that request HAS left the
+        // panel and may still be accepted. Reporting the run as "nothing
+        // queued" then is a definite negative about something unobserved, and a
+        // caller acting on it re-renders a branch that is already running. It is
+        // surfaced so graph_run can omit `queued` rather than assert it false.
+        const inFlight = guard.state.inFlight;
         const cancel = cancelPendingScopedQueueItem(app, { runTag, queueMark: mark });
         if (cancel.removed > 0) {
           return {
@@ -1250,8 +1274,9 @@ export async function dispatchScopedRun({
             queueMark: mark,
             verified,
             indeterminate: guard.state.indeterminate,
+            inFlight,
             volatileInputs: volatileList,
-            error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: true, verified, batch }),
+            error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: true, verified, batch, inFlight }),
           };
         }
         return {
@@ -1259,8 +1284,9 @@ export async function dispatchScopedRun({
           queueMark: mark,
           verified,
           indeterminate: guard.state.indeterminate,
-      volatileInputs: volatileList,
-          error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: false, verified, batch }),
+          inFlight,
+          volatileInputs: volatileList,
+          error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: false, verified, batch, inFlight }),
         };
       }
       // r6: a dispatch FAILURE with the batch not fully accounted — the
