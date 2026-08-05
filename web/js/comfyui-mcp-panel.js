@@ -162,6 +162,7 @@ import {
   GET_ERRORS_STEP_CAP_MS,
   getErrorsStepBudgetMs,
 } from "./lib/get-errors-budget.js";
+import { boundExecFailurePayload } from "./lib/exec-error-bounds.js";
 import {
   drivenWidgetsFor,
   drivenTag,
@@ -207,6 +208,11 @@ import {
 } from "./lib/control-after-generate.js";
 import { autoMatchSlots, slotDiagnostic } from "./lib/connect-match.js";
 import { isLinkPersisted, removePhantomLink, isWidgetBackedInput } from "./lib/connect-verify.js";
+import {
+  snapshotGraphState,
+  describeInputLink,
+  verifyDisconnect,
+} from "./lib/disconnect-verify.js";
 import { deferChangeTrackerSnapshot } from "./lib/change-tracker-snapshot.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
 import {
@@ -4017,6 +4023,36 @@ async function reProbeManagerDialect({ signal } = {}) {
  *  status, list are ALL bounded). */
 const MANAGER_FETCH_TIMEOUT_MS = 15000;
 
+/** #671 — ONE budget for the WHOLE nodes_install command (dialect detect →
+ *  submit → queue/start → verify). The orchestrator relays nodes_install with a
+ *  30s reply timeout; per-call 15s caps alone can STACK past that on a
+ *  slow-but-alive Manager (two stalled calls = 30s before verification even
+ *  starts), so the tab never replied and the relay reported a wedged canvas
+ *  (`did not reply to "nodes_install" within 30000 ms`) while the install was
+ *  proceeding. 25s leaves the relay 5s of slack. Mirrors the reasoning of
+ *  UPDATE_VERIFY_BUDGET_MS (#364), lifted from the verify phase to the command. */
+const NODES_INSTALL_COMMAND_BUDGET_MS = 25000;
+
+/** #671 — did this error come from a request that never got an answer (one of
+ *  OUR AbortSignals firing), as opposed to a REAL response with a real verdict?
+ *  Only stall errors may be reworded as a budget exhaustion — rewording a
+ *  genuine Manager verdict would destroy its evidence (codex r2 P1: a server
+ *  message like "install timed out" arrives as a plain Error from
+ *  managerV2/managerCall's HTTP handling — NEVER an AbortError/TimeoutError,
+ *  which only the fetch/abort primitives produce). detectManagerDialect's own
+ *  budget abort is a plain Error by design, matched by its exact full-sentence
+ *  PREFIX (anchored — codex r3 P2: a substring match could swallow a real
+ *  verdict that merely QUOTES the phrase). */
+function isStallError(err) {
+  return (
+    err?.name === "AbortError" ||
+    err?.name === "TimeoutError" ||
+    String(err?.message ?? "").startsWith(
+      "ComfyUI-Manager dialect detection was aborted mid-probe",
+    )
+  );
+}
+
 /** AbortSignal.any with a two-listener fallback for runtimes that predate it
  *  (baseline 2024-03). A re-probe must stay bounded on EVERY frontend the panel
  *  can load on: calling a missing AbortSignal.any inside managerProbe would
@@ -4164,17 +4200,19 @@ async function fetchObjectInfo() {
  *  answering it (no 405, no GET retry); a GET-only build then starts its queue
  *  instead of failing the whole install. Mirrors the orchestrator's
  *  managerQueueControl (src/services/node-management.ts, #551). `call` is
- *  managerV2 (adds the /v2 prefix) or managerCall (absolute legacy route). */
-async function managerQueueControl(call, route) {
+ *  managerV2 (adds the /v2 prefix) or managerCall (absolute legacy route).
+ *  `signal` is an optional caller budget (#671) composed with the per-fetch
+ *  cap so a stalled start cannot outlive the command's reply window. */
+async function managerQueueControl(call, route, { signal } = {}) {
   try {
-    await call(route, { method: "POST", signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS) });
+    await call(route, { method: "POST", signal: anyAbortSignal([AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS), signal]) });
   } catch (err) {
     // Only a 405 is a method signal we can negotiate; a 404 ("not reachable") or
     // any other error means the route/POST genuinely failed — surface it. A 405
     // leaves the route REGISTERED, so the GET retry hits the real GET handler
     // (not ComfyUI's frontend catchall, which only serves UNREGISTERED GETs).
     if (!isMethodNotAllowed(err)) throw err;
-    await call(route, { signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS) });
+    await call(route, { signal: anyAbortSignal([AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS), signal]) });
   }
 }
 
@@ -4229,6 +4267,22 @@ async function waitForQueueDrain({ timeoutMs = 120000, intervalMs = 1500, get = 
   return status; // deadline hit
 }
 
+/** Default budget for the post-enqueue install verification (#671), used only
+ *  when the caller does not thread a command budget through. Bounded well under
+ *  the orchestrator's per-command reply timeout (panel_install_node relays
+ *  nodes_install with 30s) so a genuine, slow install — cloning a pack and
+ *  installing its pip deps routinely outlives 30s — reports an honest
+ *  "unverified/pending" with the ui_id to poll (panel_node_queue_status)
+ *  instead of the reply never leaving the tab: the orchestrator then reported
+ *  `did not reply to "nodes_install" within 30000 ms` on a LIVE, responsive
+ *  canvas while the install was proceeding fine. nodes_install passes its
+ *  REMAINING command budget (NODES_INSTALL_COMMAND_BUDGET_MS) as `budgetMs`, so
+ *  the whole command — not just this phase — fits the relay window. A bounded
+ *  verify can only degrade a verified success to "pending" —
+ *  classifyInstallOutcome asserts failure ONLY on a positively-drained queue,
+ *  so the budget can never manufacture a false failure. */
+const INSTALL_VERIFY_BUDGET_MS = 15000;
+
 /**
  * After an install is queued+started, resolve the TRUE outcome (#232 / codex
  * rounds 1-2). Waits for the queue to drain (bounded), reads the installed-nodes
@@ -4237,8 +4291,13 @@ async function waitForQueueDrain({ timeoutMs = 120000, intervalMs = 1500, get = 
  * the raw values — no false drain, no false-readable). `batchFailed` carries the
  * synchronous v2-batch `failed[]` as failure EVIDENCE (still gated by the
  * tri-state — never an early throw). Returns { state, status, message }.
+ *
+ * ONE shared deadline covers the drain wait AND the list read (#671): the whole
+ * verification must fit inside `budgetMs` (the caller's remaining reply budget,
+ * defaulting to INSTALL_VERIFY_BUDGET_MS), or the reply — success or honest
+ * "pending" — never reaches the caller.
  */
-async function verifyInstalled(target, dialect, { batchFailed, renameProne } = {}) {
+async function verifyInstalled(target, dialect, { batchFailed, renameProne, budgetMs } = {}) {
   // Pin the status/list reads to the dialect the install ACTUALLY landed on. In
   // the normal case this equals managerGet's cached detection; after the #485
   // legacy fallback the cache still holds the detected v2 dialect, so re-deriving
@@ -4247,12 +4306,16 @@ async function verifyInstalled(target, dialect, { batchFailed, renameProne } = {
   // (codex P1).
   const get = (route, opts) =>
     dialect === "legacy" ? managerCall(route, opts) : managerV2(route, opts);
-  const status = await waitForQueueDrain({ get });
+  const budget = Math.max(0, budgetMs ?? INSTALL_VERIFY_BUDGET_MS);
+  const deadline = Date.now() + budget;
+  const status = await waitForQueueDrain({ timeoutMs: budget, get });
   let installed = null;
   let listError = false;
   try {
     installed = await get("customnode/installed", {
-      signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS),
+      signal: AbortSignal.timeout(
+        Math.max(1000, Math.min(MANAGER_FETCH_TIMEOUT_MS, deadline - Date.now())),
+      ),
     });
   } catch {
     listError = true;
@@ -8732,15 +8795,126 @@ const GRAPH_TOOL_EXECUTORS = {
     const { graph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     const inIdx = resolveSlot(node.inputs, input ?? 0, "input");
+    // #668 DISCONNECT HONESTY: capture the intent BEFORE the mutation. On a
+    // SubgraphNode, disconnectInput can cascade beyond dropping the wire — #668
+    // observed it DELETE unrelated nodes (a LoadImage two hops upstream, a
+    // downstream SaveVideo) while reporting plain success, and boundary-slot
+    // removal can shift the inputs array so any slot read AFTER the call may
+    // describe a different input. Snapshot first; verify after; never report a
+    // bare success for a change the graph does not actually show.
+    const inputName = node.inputs?.[inIdx]?.name ?? inIdx;
+    const inputNamesBefore = (node.inputs ?? []).map((s) => s?.name ?? null);
+    const removedLink = describeInputLink(graph, node, inIdx);
+    if (!removedLink) {
+      // Nothing to remove: reporting `disconnected` here would fabricate a
+      // mutation that never happened. REFUSE (the graph is untouched).
+      throw new Error(
+        `panel_disconnect: node ${node.id} input "${inputName}" is not connected — ` +
+          `there is no link to remove. Check the live wiring with panel_graph_outline; ` +
+          `if a previous disconnect already removed it, no retry is needed (#668).`,
+      );
+    }
+    const before = snapshotGraphState(graph);
+    // The mutation can throw AFTER partially applying (a node hook or the
+    // cascade failing midway). Capture the error and STILL verify the
+    // post-state — a raw throw would read as "nothing changed" and invite a
+    // destructive retry of a disconnect that may have landed.
+    let mutationErr = null;
     graph.beforeChange();
     try {
       node.disconnectInput(inIdx);
-    } finally {
+    } catch (err) {
+      mutationErr = err;
+    }
+    let envelopeErr = null;
+    try {
       graph.afterChange();
+    } catch (err) {
+      envelopeErr = err;
     }
     graph.setDirtyCanvas(true, true);
+    const verdict = verifyDisconnect(graph, node, before, removedLink.linkId);
+    // Shared disclosure bullets: observed post-state facts ONLY — the verifier
+    // proves what changed, never why, so no bucket is narrated as a cause.
+    const disclosureBullets = () => {
+      const lines = [
+        verdict.intendedRemoved
+          ? `- the intended link (from node ${removedLink.node_id} output "${removedLink.output}") WAS removed`
+          : `- the intended link (from node ${removedLink.node_id} output "${removedLink.output}") is STILL PRESENT on the live graph`,
+      ];
+      if (verdict.missingNodes.length) {
+        lines.push(
+          `- node(s) ${verdict.missingNodes.join(", ")} were REMOVED from the graph during this disconnect`,
+        );
+        if (verdict.missingNodes.includes(String(node.id))) {
+          lines.push(`- the removed nodes INCLUDE the disconnect target (node ${node.id}) itself`);
+        }
+      }
+      if (verdict.addedNodes.length) {
+        lines.push(`- node(s) ${verdict.addedNodes.join(", ")} APPEARED that were not there before`);
+      }
+      for (const l of verdict.collateralRemovedLinks) {
+        lines.push(
+          `- a link that was NOT the target was removed: node ${l.origin_id} output ${l.origin_slot} → node ${l.target_id} input ${l.target_slot}`,
+        );
+      }
+      for (const l of verdict.addedLinks) {
+        lines.push(
+          `- a link APPEARED that this disconnect did not create: node ${l.origin_id} output ${l.origin_slot} → node ${l.target_id} input ${l.target_slot}`,
+        );
+      }
+      return lines;
+    };
+    const undoRemedy =
+      `The state above is what the live graph ACTUALLY shows; the panel did not fabricate a ` +
+      `success. Press Ctrl+Z in the ComfyUI tab to undo, then re-check the graph with ` +
+      `panel_graph_outline BEFORE queueing anything — a silently deleted output node runs ` +
+      `to completion and saves nothing.`;
+    if (mutationErr || envelopeErr) {
+      throw new Error(
+        [
+          `panel_disconnect on node ${node.id} input "${inputName}" threw (#668): ` +
+            `${mutationErr?.message ?? mutationErr ?? ""}` +
+            (envelopeErr ? ` (afterChange also threw: ${envelopeErr?.message ?? envelopeErr})` : ""),
+          `Post-state check of the live graph:`,
+          ...disclosureBullets(),
+          undoRemedy,
+        ].join("\n"),
+      );
+    }
+    if (!verdict.ok) {
+      // The mutation ALREADY happened — disclose exactly what was observed
+      // (never refuse after the fact: that reports failure for a disconnect
+      // that may have landed and invites a destructive retry). The panel
+      // cannot safely restore deleted nodes itself; the change is inside one
+      // beforeChange/afterChange envelope, so a single Ctrl+Z reverts it.
+      throw new Error(
+        [
+          `panel_disconnect on node ${node.id} input "${inputName}" did not complete cleanly (#668):`,
+          ...disclosureBullets(),
+          undoRemedy,
+        ].join("\n"),
+      );
+    }
+    // Boundary-slot disclosure: a subgraph (or dynamic) node may change its
+    // input slots on disconnect. That is a legitimate cascade, but it shifts
+    // slot indices — a follow-up disconnect by NAME is safe, by INDEX is not,
+    // unless the caller re-resolves first.
+    const inputNamesAfter = (node.inputs ?? []).map((s) => s?.name ?? null);
+    const slotsShifted =
+      inputNamesBefore.length !== inputNamesAfter.length ||
+      inputNamesBefore.some((n, i) => n !== inputNamesAfter[i]);
     return {
-      disconnected: { node_id: node.id, input: node.inputs?.[inIdx]?.name ?? inIdx },
+      disconnected: { node_id: node.id, input: inputName },
+      removed_link: { node_id: removedLink.node_id, output: removedLink.output },
+      ...(slotsShifted
+        ? {
+            warning:
+              `the node's input slots changed during the disconnect (count, order, or names ` +
+              `differ) — re-resolve input names with panel_graph_outline before any further ` +
+              `disconnect by index`,
+          }
+        : {}),
     };
   },
 
@@ -9936,9 +10110,13 @@ const GRAPH_TOOL_EXECUTORS = {
   //   - lastNodeErrors      → per-input validation errors from the last queue
   //   - lastExecFailure     → the last runtime failure (live execution_error event)
   //
-  // `node_errors` and `last_execution_error` are kept VERBATIM for backwards
-  // compatibility — the turn-start validation block, the tool-call label and the
-  // console action all read them.
+  // `node_errors` and `last_execution_error` are kept for backwards compatibility
+  // — the turn-start validation block, the tool-call label and the console action
+  // all read them (presence / scalar fields). `last_execution_error` is BOUNDED at
+  // emission (#664): the raw event detail carries tensor-sized current_inputs /
+  // current_outputs and traceback lines with huge tensor reprs, which shipped a
+  // 41k+ token tool result. Same keys, capped values, every cut disclosed in-band
+  // (see web/js/lib/exec-error-bounds.js).
   //
   // NOTE on EXEC_ERR_STORE below: that ComfyUI store id is a camelCase name
   // ending in "...executi" + "on" + "Error". Lowercased, that tail collides with
@@ -10146,8 +10324,8 @@ const GRAPH_TOOL_EXECUTORS = {
     //    LiteGraph does NOT set has_errors for a runtime failure, so the throwing
     //    node is never painted red and reaches the output ONLY via the union
     //    below. `exception_type` is carried because "PIL.UnidentifiedImageError"
-    //    explains far more than the message; the traceback is dropped to stay
-    //    token-bounded (it stays in `last_execution_error` for compatibility).
+    //    explains far more than the message; the traceback is dropped HERE to stay
+    //    token-bounded (a capped traceback ships in `last_execution_error`, #664).
     let execFailure = null;
     try {
       let e = lastExecFailure;
@@ -10260,8 +10438,10 @@ const GRAPH_TOOL_EXECUTORS = {
       ...(missingNodeCount && !missingNodeTypes.length
         ? { missing_node_count: missingNodeCount }
         : {}),
-      // --- backwards-compatible raw payloads (existing consumers read these) ---
-      last_execution_error: lastExecFailure,
+      // --- backwards-compatible payloads (existing consumers read these) ---
+      // Bounded at emission (#664): verbatim, this carried tensor-sized
+      // current_inputs/current_outputs and huge traceback lines (41k+ tokens).
+      last_execution_error: boundExecFailurePayload(lastExecFailure),
       node_errors: nodeErrors,
       ...(clean ? { note: "no errors recorded since the last execution start" } : {}),
     };
@@ -12891,112 +13071,208 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!id && !repository) {
       throw new Error("id (registry id or author/repo) or repository (git URL) is required");
     }
-    const detected = await detectManagerDialect();
-    const ui_id = crypto.randomUUID();
-    const client_id = api.clientId ?? api.initialClientId ?? "comfyui-mcp-panel";
-    // A git URL or an owner/repo id can install under a directory name that
-    // differs from the repo name (e.g. TenStrip/10S-Comfy-nodes → 10S_Nodes), so
-    // its on-disk presence can't be confirmed OR ruled out by name — absence is
-    // NOT proof of failure for such targets (codex round 3). A claimed registry
-    // id is identifiable (matched via cnr_id/aux_id), so its absence IS proof.
-    const renameProne = !!installGitUrl(args) || String(id ?? "").includes("/");
-    // Every Manager mutation is bounded (codex round 2 #5).
-    const post = (body) => ({ method: "POST", body, signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS) });
-    // SUBMIT the install (enqueue only — NOT start) for a given dialect. Kept
-    // separate from queue/start so the #485 unreachable-fallback below can never
-    // re-run a submission that already landed (a start failure must not double-
-    // fire the install — codex P0). Returns the on-disk `target` (already the
-    // repo NAME for a git URL — #232 verifies against it) plus the v2-batch
-    // synchronous `failed[]` (FEEDS the tri-state gate as EVIDENCE — never an
-    // early throw, codex round 2 #4).
-    const submitInstall = async (dialect) => {
-      // buildInstallRequest (./lib/manager-install.js) derives the repo NAME for
-      // a git URL (arriving via id OR repository, any protocol) and picks the
-      // right per-dialect payload — issues #187/#182/#184. A full URL is never
-      // sent as `id` (v4 would silently mark it "done"; 3.x fails late).
-      const req = buildInstallRequest(dialect, args, ui_id);
-      const target = dialect === "v2" ? req.params.id : req.body.id;
-      let batchFailed;
-      if (dialect === "v2") {
-        await managerV2("manager/queue/task", post({ kind: "install", params: req.params, ui_id, client_id }));
-      } else if (dialect === "v2-batch") {
-        const res = await managerV2("manager/queue/batch", post({ install: [req.body] }));
-        batchFailed = Array.isArray(res?.failed) ? res.failed : undefined;
-      } else {
-        await managerCall("manager/queue/install", post(req.body));
+    // #671: ONE budget for the WHOLE command. The orchestrator relays
+    // nodes_install with a 30s reply timeout; per-call 15s caps can STACK past
+    // that on a slow-but-alive Manager (a stalled submit + a stalled start =
+    // 30s before verification even starts), and the 120s drain wait made it
+    // certain — the tab never replied and the relay reported a wedged canvas
+    // (`did not reply to "nodes_install" within 30000 ms`) while the install
+    // was proceeding. Every phase below draws on this single deadline, so the
+    // reply — success, honest pending, or an honest error — ALWAYS leaves the
+    // tab inside the window.
+    const commandDeadline = Date.now() + NODES_INSTALL_COMMAND_BUDGET_MS;
+    const remaining = () => Math.max(0, commandDeadline - Date.now());
+    // A per-call cap that also respects what the command budget has left.
+    const bounded = (ms) => Math.max(1, Math.min(ms, remaining()));
+    // A stall caught once the command budget HAS run out is reworded as what
+    // it is — the Manager stopped answering in time — claiming only the state
+    // the phase can honestly claim (never a false failure, never a false
+    // "nothing happened"). Any non-stall error, or a stall surfaced BEFORE the
+    // deadline (the per-fetch cap fired first — budget remains), passes
+    // through unchanged with its real evidence.
+    const translateStall = (err, phase) => {
+      if (commandDeadline - Date.now() > 0 || !isStallError(err)) return err;
+      const budget = `${Math.round(NODES_INSTALL_COMMAND_BUDGET_MS / 1000)}s`;
+      const what = String(id ?? repository);
+      if (phase === "detect" || phase === "reprobe") {
+        // Detection — and the #605 RE-PROBE, which only runs after a PROVEN
+        // 404 (no handler ran, so no mutation was ever in flight) — never
+        // reached a mutation: nothing was queued, and a retry is safe.
+        return new Error(
+          `the ComfyUI-Manager did not answer dialect detection within the ${budget} ` +
+            `command budget — NOTHING was queued. The Manager is answering slowly or ` +
+            `not at all; retry shortly, or check the ComfyUI server log.`,
+        );
       }
-      return { target, batchFailed };
+      if (phase === "submit") {
+        return new Error(
+          `the ComfyUI-Manager did not answer the install request for "${what}" within ` +
+            `the ${budget} command budget. Whether the install was QUEUED is UNKNOWN — ` +
+            `the request may have landed before the abort. Check panel_node_queue_status ` +
+            `and panel_list_nodes BEFORE retrying, or a blind retry can queue the install ` +
+            `twice.`,
+        );
+      }
+      if (phase === "verify") {
+        // Submit AND start returned — the install is queued and the start was
+        // acknowledged; only the outcome check ran out of time. (Today's
+        // verifyInstalled is internally bounded and never throws a stall — this
+        // branch guards the claim IF that ever changes. #671 codex r3.)
+        return new Error(
+          `the install of "${what}" was QUEUED and the queue start was acknowledged, ` +
+            `but the outcome could not be VERIFIED within the ${budget} command budget. ` +
+            `This is NOT a failure — poll panel_node_queue_status and VERIFY with ` +
+            `panel_list_nodes.`,
+        );
+      }
+      // "start": the submit LANDED — the install is queued; only the queue
+      // start is unconfirmed. Never claim failure here.
+      return new Error(
+        `the install of "${what}" was QUEUED, but the ComfyUI-Manager did not answer ` +
+          `queue/start within the ${budget} command budget, so the queue may not be ` +
+          `running. Poll panel_node_queue_status; if the task stays pending with the ` +
+          `queue idle, the start did not land — check the ComfyUI server log before ` +
+          `retrying.`,
+      );
     };
-    // #485: a dialect-routed SUBMIT that reports the Manager "unreachable" (a /v2
-    // mutation 404s) can still succeed on the ABSOLUTE released-3.x routes — a
-    // build can answer the /v2 queue-status probe (so detection picks v2 /
-    // v2-batch) yet 404 the /v2 MUTATION routes while /manager/queue/install
-    // serves fine. nodes_list already degrades this way for the installed-node
-    // list; without the same fallback here, install threw a false "not reachable"
-    // even though panel_list_nodes worked. So on an unreachable signal from a
-    // non-legacy dialect, retry the SUBMIT via the legacy dialect before
-    // surfacing the error. The fallback wraps ONLY the enqueue: if the submit
-    // already succeeded, a later queue/start failure must NOT re-submit.
-    //
-    // #605: the unreachable verdict can ALSO mean the CACHED dialect outlived a
-    // backend restart that swapped Manager generations (a stale "legacy" cache
-    // aims the submit at /manager/queue/install, which a restarted v4 backend
-    // does not serve — and the old legacy-only fallback then threw a false
-    // "not reachable"). A 404 is a route-level rejection — no handler ran,
-    // NOTHING was enqueued — so re-submitting on the re-probed live dialect
-    // cannot double-fire the install. Re-probe ONCE; dialectRetryTarget picks
-    // the retry: the fresh verdict when it changed, else the #485 legacy last
-    // resort (null when nothing is left — the original error then surfaces).
-    let dialect = detected;
-    let submitted;
+    // Tracks how far the command got so a budget-exhausted stall can claim
+    // exactly the state that phase can vouch for (#671). Declared OUTSIDE the
+    // try so the catch can read it.
+    let phase = "detect";
     try {
-      submitted = await submitInstall(dialect);
-    } catch (err) {
-      // codex P0: the retry gate is the PROVEN route-level rejection (the 404
-      // marker), never the broader "not reachable" — a no-response transport
-      // failure says nothing about whether the POST landed, and re-submitting
-      // then would double-fire the install.
-      if (!isManagerRouteMissing(err)) throw err;
-      const retry = dialectRetryTarget(dialect, await reProbeManagerDialect());
-      if (!retry) throw err;
-      dialect = retry;
-      submitted = await submitInstall(retry);
-    }
-    // The submission landed. NOW start the queue on the SAME (possibly
-    // fallen-back) dialect. queue/start goes through managerQueueControl so a
-    // GET-only 3.x build negotiates POST→GET on HTTP 405 instead of failing the
-    // install (#486). A start failure here is surfaced as-is — the install is
-    // already queued, so re-running the submit would double-fire it.
-    await managerQueueControl(dialect === "legacy" ? managerCall : managerV2, "manager/queue/start");
-    const { target, batchFailed } = submitted;
-    // Resolve the true outcome. Throw ONLY on positive failure evidence; an
-    // inconclusive result returns an honest unverified status (never a silent
-    // success, never a false failure). #232 + codex rounds 1-2.
-    const outcome = await verifyInstalled(target, dialect, { batchFailed, renameProne });
-    if (outcome.state === "failed") throw new Error(outcome.message);
-    if (outcome.state === "installed") {
+      const detected = await detectManagerDialect({
+        signal: AbortSignal.timeout(bounded(MANAGER_FETCH_TIMEOUT_MS)),
+      });
+      const ui_id = crypto.randomUUID();
+      const client_id = api.clientId ?? api.initialClientId ?? "comfyui-mcp-panel";
+      // A git URL or an owner/repo id can install under a directory name that
+      // differs from the repo name (e.g. TenStrip/10S-Comfy-nodes → 10S_Nodes), so
+      // its on-disk presence can't be confirmed OR ruled out by name — absence is
+      // NOT proof of failure for such targets (codex round 3). A claimed registry
+      // id is identifiable (matched via cnr_id/aux_id), so its absence IS proof.
+      const renameProne = !!installGitUrl(args) || String(id ?? "").includes("/");
+      // Every Manager mutation is bounded (codex round 2 #5) — and now also by
+      // the remaining command budget (#671).
+      const post = (body) => ({
+        method: "POST",
+        body,
+        signal: AbortSignal.timeout(bounded(MANAGER_FETCH_TIMEOUT_MS)),
+      });
+      // SUBMIT the install (enqueue only — NOT start) for a given dialect. Kept
+      // separate from queue/start so the #485 unreachable-fallback below can never
+      // re-run a submission that already landed (a start failure must not double-
+      // fire the install — codex P0). Returns the on-disk `target` (already the
+      // repo NAME for a git URL — #232 verifies against it) plus the v2-batch
+      // synchronous `failed[]` (FEEDS the tri-state gate as EVIDENCE — never an
+      // early throw, codex round 2 #4).
+      const submitInstall = async (dialect) => {
+        // buildInstallRequest (./lib/manager-install.js) derives the repo NAME for
+        // a git URL (arriving via id OR repository, any protocol) and picks the
+        // right per-dialect payload — issues #187/#182/#184. A full URL is never
+        // sent as `id` (v4 would silently mark it "done"; 3.x fails late).
+        const req = buildInstallRequest(dialect, args, ui_id);
+        const target = dialect === "v2" ? req.params.id : req.body.id;
+        let batchFailed;
+        if (dialect === "v2") {
+          await managerV2("manager/queue/task", post({ kind: "install", params: req.params, ui_id, client_id }));
+        } else if (dialect === "v2-batch") {
+          const res = await managerV2("manager/queue/batch", post({ install: [req.body] }));
+          batchFailed = Array.isArray(res?.failed) ? res.failed : undefined;
+        } else {
+          await managerCall("manager/queue/install", post(req.body));
+        }
+        return { target, batchFailed };
+      };
+      // #485: a dialect-routed SUBMIT that reports the Manager "unreachable" (a /v2
+      // mutation 404s) can still succeed on the ABSOLUTE released-3.x routes — a
+      // build can answer the /v2 queue-status probe (so detection picks v2 /
+      // v2-batch) yet 404 the /v2 MUTATION routes while /manager/queue/install
+      // serves fine. nodes_list already degrades this way for the installed-node
+      // list; without the same fallback here, install threw a false "not reachable"
+      // even though panel_list_nodes worked. So on an unreachable signal from a
+      // non-legacy dialect, retry the SUBMIT via the legacy dialect before
+      // surfacing the error. The fallback wraps ONLY the enqueue: if the submit
+      // already succeeded, a later queue/start failure must NOT re-submit.
+      //
+      // #605: the unreachable verdict can ALSO mean the CACHED dialect outlived a
+      // backend restart that swapped Manager generations (a stale "legacy" cache
+      // aims the submit at /manager/queue/install, which a restarted v4 backend
+      // does not serve — and the old legacy-only fallback then threw a false
+      // "not reachable"). A 404 is a route-level rejection — no handler ran,
+      // NOTHING was enqueued — so re-submitting on the re-probed live dialect
+      // cannot double-fire the install. Re-probe ONCE; dialectRetryTarget picks
+      // the retry: the fresh verdict when it changed, else the #485 legacy last
+      // resort (null when nothing is left — the original error then surfaces).
+      phase = "submit";
+      let dialect = detected;
+      let submitted;
+      try {
+        submitted = await submitInstall(dialect);
+      } catch (err) {
+        // codex P0: the retry gate is the PROVEN route-level rejection (the 404
+        // marker), never the broader "not reachable" — a no-response transport
+        // failure says nothing about whether the POST landed, and re-submitting
+        // then would double-fire the install.
+        if (!isManagerRouteMissing(err)) throw err;
+        // The submit 404'd — PROVEN route-level rejection, no handler ran, so
+        // NOTHING is queued: a stall in the re-probe keeps the "nothing was
+        // queued" claim honest (#671 codex r2), and the retry submit below
+        // re-marks the phase before any mutation is in flight again.
+        phase = "reprobe";
+        const retry = dialectRetryTarget(
+          dialect,
+          await reProbeManagerDialect({ signal: AbortSignal.timeout(bounded(MANAGER_FETCH_TIMEOUT_MS)) }),
+        );
+        if (!retry) throw err;
+        dialect = retry;
+        phase = "submit";
+        submitted = await submitInstall(retry);
+      }
+      // The submission landed. NOW start the queue on the SAME (possibly
+      // fallen-back) dialect. queue/start goes through managerQueueControl so a
+      // GET-only 3.x build negotiates POST→GET on HTTP 405 instead of failing the
+      // install (#486). A start failure here is surfaced as-is — the install is
+      // already queued, so re-running the submit would double-fire it.
+      phase = "start";
+      await managerQueueControl(
+        dialect === "legacy" ? managerCall : managerV2,
+        "manager/queue/start",
+        { signal: AbortSignal.timeout(bounded(MANAGER_FETCH_TIMEOUT_MS)) },
+      );
+      const { target, batchFailed } = submitted;
+      // Resolve the true outcome. Throw ONLY on positive failure evidence; an
+      // inconclusive result returns an honest unverified status (never a silent
+      // success, never a false failure). #232 + codex rounds 1-2. The verify
+      // draws on whatever the command budget has LEFT (#671).
+      phase = "verify";
+      const outcome = await verifyInstalled(target, dialect, { batchFailed, renameProne, budgetMs: remaining() });
+      if (outcome.state === "failed") throw new Error(outcome.message);
+      if (outcome.state === "installed") {
+        return {
+          queued: true,
+          installed: true,
+          verified: true,
+          ui_id,
+          id: target,
+          dialect,
+          note:
+            "Installed and VERIFIED present in custom_nodes. A ComfyUI restart " +
+            "(panel_restart_comfyui) is usually required to load new nodes.",
+        };
+      }
       return {
         queued: true,
-        installed: true,
-        verified: true,
+        installed: false,
+        verified: false,
+        pending: outcome.state === "unverified",
         ui_id,
         id: target,
         dialect,
-        note:
-          "Installed and VERIFIED present in custom_nodes. A ComfyUI restart " +
-          "(panel_restart_comfyui) is usually required to load new nodes.",
+        note: outcome.message,
       };
+    } catch (err) {
+      throw translateStall(err, phase);
     }
-    return {
-      queued: true,
-      installed: false,
-      verified: false,
-      pending: outcome.state === "unverified",
-      ui_id,
-      id: target,
-      dialect,
-      note: outcome.message,
-    };
   },
 
   // Update an ALREADY-INSTALLED pack to latest/nightly via the built-in Manager.
@@ -16148,6 +16424,13 @@ function describeCommand(cmd, msg, reply) {
       // but guard defensively — never render an un-synced promoted write as a plain
       // "Set …" success, or the summary would repeat the exact #366 lie.
       const railStale = r.set?.promoted_from && r.set.promoted_from.parent_widget_synced === false;
+      // #639: a write whose apply path threw AFTER the value verified is APPLIED
+      // (not refused) — the summary must carry the disclosure, never a plain
+      // "Set …" success that hides the uncertainty about side effects. The wording
+      // names NO construct: `write_warning` covers a throwing setter, accessor, or
+      // callback on any of the widgets the write touches, so it must not assert
+      // which one threw (codex delta-gate).
+      const writeDisclosed = typeof r.set?.write_warning === "string";
       return railStale
         ? {
             icon: "pi-exclamation-triangle",
@@ -16155,8 +16438,12 @@ function describeCommand(cmd, msg, reply) {
             detail: `was ${JSON.stringify(r.set?.previous)}`,
           }
         : {
-            icon: "pi-sliders-h",
-            text: `Set ${r.set?.widget} = ${JSON.stringify(r.set?.value)} on node ${r.set?.node_id}`,
+            icon: writeDisclosed ? "pi-exclamation-triangle" : "pi-sliders-h",
+            text:
+              `Set ${r.set?.widget} = ${JSON.stringify(r.set?.value)} on node ${r.set?.node_id}` +
+              (writeDisclosed
+                ? ` — requested value verified in effect, but an exception was thrown while applying it; side effects may not have run or completed`
+                : ""),
             detail: `was ${JSON.stringify(r.set?.previous)}`,
           };
     }

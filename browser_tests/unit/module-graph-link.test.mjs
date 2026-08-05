@@ -37,6 +37,11 @@ import {
   watchPostReconnectSettle,
   graphMutationReconnectGate,
 } from "../../web/js/lib/reconnect-recovery.js";
+import {
+  snapshotGraphState,
+  describeInputLink,
+  verifyDisconnect,
+} from "../../web/js/lib/disconnect-verify.js";
 
 // --- Mirror the shared bounded-step edge (#648) --------------------------------------
 // run-completion-frame.js and media-preview.js BOTH import withTimeout from here. If
@@ -90,6 +95,12 @@ test("panel ↔ node-def-refresh.js / canvas-navigation.js / reconnect-recovery.
   assert.equal(typeof confirmCanvasNavigation, "function");
   assert.equal(typeof watchPostReconnectSettle, "function");
   assert.equal(typeof graphMutationReconnectGate, "function");
+});
+
+test("panel ↔ disconnect-verify.js module edge links (#668)", () => {
+  assert.equal(typeof snapshotGraphState, "function");
+  assert.equal(typeof describeInputLink, "function");
+  assert.equal(typeof verifyDisconnect, "function");
 });
 
 test("set-widget.js ↔ widget-write.js / node-resolve.js module edges link", () => {

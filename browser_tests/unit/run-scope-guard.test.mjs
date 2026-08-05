@@ -25,6 +25,8 @@ import {
   repairScopeInBody,
   promptContentHash,
   promptContentHashFromBody,
+  canonicalizePrompt,
+  diffPromptCanons,
   collectVolatileInputs,
   verifyScopedPromptBody,
   scopeDroppedError,
@@ -2194,4 +2196,336 @@ test("#556: a NON-output target is refused (not_output) — it can never be an e
   const res = resolveRunToNodeTarget(root, null, 3);
   assert.equal(res.ok, false);
   assert.equal(res.code, "not_output");
+});
+
+// ---------------------------------------------------------------------------
+// #659 — JSON-invisible widget values (undefined / function / symbol) must not
+// false-positive the #556 drift guard, and a graph_changed refusal must say
+// WHAT differed instead of asserting a cause.
+// ---------------------------------------------------------------------------
+
+test("#659 promptContentHash: an input whose value JSON cannot transmit is absent on BOTH channels — in-memory output and wire body hash identically", () => {
+  // graphToPrompt assigns inputs[name] = widget.value unconditionally for
+  // serialized widgets, so an async-populated combo that never got a value
+  // (the issue's OllamaConnectivityV2 "model": ((), {}) — empty options, no
+  // default) or a multi-spec COMFY_AUTOGROW_V3 shim widget lands in the
+  // in-memory output as a key with an undefined value. JSON.stringify DROPS
+  // that key from the POST body, so the parsed body never has it — and the
+  // two hashes of the SAME untouched graph used to differ deterministically.
+  const inMemory = {
+    "3": { class_type: "KSampler", inputs: { steps: 20, model: undefined } },
+    "9": { class_type: "SaveImage", inputs: {} },
+  };
+  const wireBody = (inputs3) =>
+    JSON.stringify({ prompt: { "3": { class_type: "KSampler", inputs: inputs3 }, "9": { class_type: "SaveImage", inputs: {} } } });
+  assert.equal(
+    promptContentHash(inMemory),
+    promptContentHashFromBody(wireBody({ steps: 20 })),
+    "undefined-valued key in memory, key absent on the wire ⇒ SAME hash",
+  );
+  // Functions/symbols are dropped from the wire body exactly like undefined.
+  const withFn = {
+    "3": { class_type: "KSampler", inputs: { steps: 20, cb: () => {} } },
+    "9": { class_type: "SaveImage", inputs: {} },
+  };
+  assert.equal(promptContentHash(withFn), promptContentHashFromBody(wireBody({ steps: 20 })),
+    "a function-valued input is equally invisible to the wire");
+  // null IS wire-representable — kept on both channels, so it hashes fine…
+  const withNull = {
+    "3": { class_type: "KSampler", inputs: { steps: 20, model: null } },
+    "9": { class_type: "SaveImage", inputs: {} },
+  };
+  assert.equal(promptContentHash(withNull), promptContentHashFromBody(wireBody({ steps: 20, model: null })),
+    "an explicit null survives the wire and stays covered");
+  // …and undefined → null is a change the wire CARRIES: it must mismatch.
+  assert.notEqual(
+    promptContentHash(inMemory),
+    promptContentHashFromBody(wireBody({ steps: 20, model: null })),
+    "a key that APPEARS on the wire (undefined → null/value) is genuine drift, still detected",
+  );
+  // value → absent is equally a wire-carried change: still detected.
+  assert.notEqual(
+    promptContentHash(withNull),
+    promptContentHashFromBody(wireBody({ steps: 20 })),
+    "a key that VANISHES from the wire (value → undefined) is genuine drift, still detected",
+  );
+});
+
+test("#659 guard: OUR marked post whose body lacks only a JSON-invisible input is OBSERVED, not refused as graph_changed", async () => {
+  const spy = makeServer();
+  const outputAtQueue = {
+    "3": { class_type: "KSampler", inputs: { steps: 20, model: undefined } },
+    "14": { class_type: "PreviewAny", inputs: {} },
+  };
+  const guard = createScopedRunGuard({
+    origFetchApi: spy,
+    execIds: ["14"],
+    contentHash: promptContentHash(outputAtQueue),
+    contentCanon: canonicalizePrompt(outputAtQueue),
+    batch: 1,
+    toNodeId: 14,
+    queueMark: MARK_A,
+  });
+  // The frontend's body: JSON.stringify dropped the undefined-valued key.
+  const wireOutput = JSON.parse(JSON.stringify(outputAtQueue));
+  const res = await guard(...promptPost(frontendBody({ output: wireOutput, targets: ["14"] })));
+  assert.equal(res.status, 200, "the same graph through the wire is OUR dispatch");
+  assert.equal(guard.state.observed, 1);
+  assert.equal(spy.calls.length, 1, "dispatched, not refused");
+});
+
+test("#659 guard: normalization is NOT tolerance — the previously-undefined input materializing in the body is genuine drift ⇒ refused, and the refusal NAMES the input", async () => {
+  const spy = makeServer();
+  const outputAtQueue = {
+    "3": { class_type: "KSampler", inputs: { steps: 20, model: undefined } },
+    "14": { class_type: "PreviewAny", inputs: {} },
+  };
+  const guard = createScopedRunGuard({
+    origFetchApi: spy,
+    execIds: ["14"],
+    contentHash: promptContentHash(outputAtQueue),
+    contentCanon: canonicalizePrompt(outputAtQueue),
+    batch: 1,
+    toNodeId: 14,
+    queueMark: MARK_A,
+  });
+  const drifted = {
+    "3": { class_type: "KSampler", inputs: { steps: 20, model: "llama3" } },
+    "14": { class_type: "PreviewAny", inputs: {} },
+  };
+  const res = await guard(...promptPost(frontendBody({ output: drifted, targets: ["14"] })));
+  assert.equal(res.status, 400, "a mid-window edit into the same input still refuses");
+  assert.equal(spy.calls.length, 0, "the drifted prompt never left the tab");
+  assert.equal(guard.state.droppedReason, "graph_changed");
+  assert.match(guard.state.dropped, /3 model/, "the refusal names the differing execId inputName pair");
+  assert.match(guard.state.dropped, /Nothing was queued/);
+});
+
+test("#659 promptContentHash: the JSON-survival probe covers toJSON() returning undefined, and unstringifyable values stay drift-covered (fail closed)", () => {
+  const wireBody = (inputs3) =>
+    JSON.stringify({ prompt: { "3": { class_type: "KSampler", inputs: inputs3 }, "9": { class_type: "SaveImage", inputs: {} } } });
+  // codex gate r1: an object whose toJSON() yields undefined is dropped from
+  // the wire body exactly like a bare undefined — a type-based filter would
+  // have kept it and hashed it as [name, null], false-refusing again.
+  const withToJsonUndefined = {
+    "3": { class_type: "KSampler", inputs: { steps: 20, odd: { toJSON: () => undefined } } },
+    "9": { class_type: "SaveImage", inputs: {} },
+  };
+  assert.equal(
+    promptContentHash(withToJsonUndefined),
+    promptContentHashFromBody(wireBody({ steps: 20 })),
+    "a toJSON()-drops-it value is invisible on both channels",
+  );
+  // A value that THROWS on stringify (BigInt) can never be compared against
+  // the wire — fail toward detecting drift: the hash itself refuses to
+  // compute, and dispatchScopedRun's catch turns that into the upfront
+  // fail-closed refusal (unchanged from before #659).
+  assert.throws(
+    () => promptContentHash({ "3": { class_type: "X", inputs: { n: 1n } } }),
+    TypeError,
+    "an unstringifyable value stays covered — the hash fails closed rather than dropping it",
+  );
+});
+
+test("#659 scopeDroppedError: a malformed drift list can never throw out of the refusal's description (codex gate r1)", () => {
+  // verdict.drift is module-internal today, but scopeDroppedError is exported
+  // and runs on the refusal path: odd caller-supplied tokens degrade to the
+  // no-diff guidance, they never escape as a throw.
+  let msg;
+  assert.doesNotThrow(() => {
+    msg = scopeDroppedError({ toNodeId: 5, verdict: { ok: false, reason: "graph_changed", drift: [Symbol("x"), 42, null] } });
+  });
+  assert.match(msg, /queue-time widget hook/, "non-string tokens degrade to the no-diff guidance");
+  assert.match(msg, /Nothing was queued/);
+  // An over-long token is bounded before it reaches a caller-readable error.
+  const long = scopeDroppedError({ toNodeId: 5, verdict: { ok: false, reason: "graph_changed", drift: [`3 ${"x".repeat(500)}`] } });
+  assert.ok(long.length < 1200, "the drift list is length-bounded");
+  assert.match(long, /3 x+/);
+});
+
+test("#659 promptContentHash: the probe uses the REAL input name and its parsed wire value — a key-sensitive toJSON cannot split the channels (codex gate r2)", () => {
+  // toJSON(key) receives the property name: probing under a fixed key would
+  // misjudge a key-sensitive toJSON (drop decision and value both), and
+  // double-invoking a stateful toJSON could flip between probe and canon.
+  // The probe therefore uses the real input name and the canon stores the
+  // probe's PARSED value, so toJSON fires exactly once with the wire's key.
+  const keySensitive = { toJSON: (key) => (key === "model" ? "llama3" : undefined) };
+  const inMemory = { "3": { class_type: "X", inputs: { model: keySensitive } }, "9": { class_type: "Y", inputs: {} } };
+  const wireBody = JSON.stringify({ prompt: { "3": { class_type: "X", inputs: { model: keySensitive } }, "9": { class_type: "Y", inputs: {} } } });
+  assert.equal(
+    promptContentHash(inMemory),
+    promptContentHashFromBody(wireBody),
+    'toJSON("model") on both channels ⇒ the same value, the same hash',
+  );
+  let calls = 0;
+  const counting = { toJSON: () => (++calls, 1) };
+  promptContentHash({ "3": { class_type: "X", inputs: { a: counting } } });
+  assert.equal(calls, 1, "toJSON fires exactly once per input per canonicalization");
+});
+
+test("#659 promptContentHash: an own toJSON FUNCTION on the inputs object fails CLOSED, never a false graph_changed (codex gate r3)", () => {
+  // inputs: { steps: 20, toJSON: () => undefined } — the hook protocol makes
+  // the WIRE carry whatever toJSON returns instead of the keys, so no
+  // per-input canonicalization can predict the body's shape. The hash must
+  // refuse to compute (dispatchScopedRun's catch ⇒ the upfront unverifiable
+  // refusal) rather than false-refuse a drift that never happened.
+  const colliding = { "3": { class_type: "X", inputs: { steps: 20, toJSON: () => undefined } } };
+  assert.throws(() => promptContentHash(colliding), TypeError, "unpredictable wire form ⇒ fail closed");
+  // A NON-function toJSON-named input does not trip the hook protocol and
+  // stays fully drift-covered.
+  const harmless = { "3": { class_type: "X", inputs: { steps: 20, toJSON: false } } };
+  assert.equal(
+    promptContentHash(harmless),
+    promptContentHashFromBody(JSON.stringify({ prompt: { "3": { class_type: "X", inputs: { steps: 20, toJSON: false } } } })),
+    "a data-valued toJSON key serializes normally on both channels",
+  );
+});
+
+test("#659 integration: a graph with a toJSON-function inputs collision is refused UPFRONT (unverifiable), queuePrompt never called", async () => {
+  // Pins the end-to-end OUTCOME contract (upfront fail-closed, nothing
+  // queued). The deliberate-throw MECHANISM is pinned by the hash-level test
+  // above: without the canonicalizePrompt guard the probe's own toJSON
+  // hijack still throws by accident, reaching the same outcome by another
+  // path — the hash test is the one that fails there.
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const output = {
+      "3": { class_type: "KSampler", inputs: { steps: 20, toJSON: () => undefined } },
+      "14": { class_type: "PreviewAny", inputs: {} },
+    };
+    const app = makeFrontend({ shape: "shim", apiTarget, output });
+    let queuePromptCalled = false;
+    const origQP = app.queuePrompt;
+    app.queuePrompt = async (...a) => { queuePromptCalled = true; return origQP(...a); };
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+    assert.equal(result.outcome, "unverifiable", "fails closed BEFORE dispatch — never a false drift refusal");
+    assert.match(result.error, /cannot be dispatched safely/);
+    assert.equal(queuePromptCalled, false);
+    assert.equal(server.calls.length, 0, "nothing left the tab");
+  } finally {
+    stop();
+  }
+});
+
+test("#659 diffPromptCanons: names input-level changes, node add/remove, and class_type changes — and never throws on odd input", () => {
+  const a = canonicalizePrompt({
+    "3": { class_type: "KSampler", inputs: { steps: 20, model: ["4", 0] } },
+    "9": { class_type: "SaveImage", inputs: {} },
+  });
+  const b = canonicalizePrompt({
+    "3": { class_type: "KSampler", inputs: { steps: 25 } },
+    "10": { class_type: "PreviewAny", inputs: {} },
+  });
+  const tokens = diffPromptCanons(a, b);
+  assert.ok(tokens.includes("3 steps"), "a changed value names the pair");
+  assert.ok(tokens.includes("3 model"), "an input present on only one side names the pair");
+  assert.ok(tokens.includes("9 (node only in queued prompt)"), "a removed node is named");
+  assert.ok(tokens.includes("10 (node only in dispatch body)"), "an added node is named");
+  const c = canonicalizePrompt({ "3": { class_type: "OTHER", inputs: {} } });
+  assert.ok(diffPromptCanons(a, c).includes("3 (class_type changed)"), "a replaced node is named");
+  assert.deepEqual(diffPromptCanons(a, a), [], "identical canons have no drift");
+  assert.equal(diffPromptCanons(null, b), null, "an unusable canon degrades to null");
+  assert.equal(diffPromptCanons("junk", b), null);
+  assert.equal(diffPromptCanons(a, undefined), null);
+});
+
+test("#659 scopeDroppedError: a graph_changed refusal with drift tokens leads with the differing pairs; without them the hook guidance remains", () => {
+  const withDrift = scopeDroppedError({
+    toNodeId: 143,
+    verdict: { ok: false, reason: "graph_changed", drift: ["42 model", "7 (node only in dispatch body)"] },
+  });
+  assert.match(withDrift, /node 143/);
+  assert.match(withDrift, /42 model/);
+  assert.match(withDrift, /7 \(node only in dispatch body\)/);
+  assert.match(withDrift, /Retrying is safe/);
+  assert.match(withDrift, /Nothing was queued/);
+  const bare = scopeDroppedError({ toNodeId: 116, verdict: { ok: false, reason: "graph_changed", drift: null } });
+  assert.match(bare, /queue-time widget hook/, "no diff available ⇒ the candidate-cause guidance stays");
+  assert.match(bare, /Retrying is safe \(nothing was queued\)/);
+});
+
+test("#659 integration: a graph whose serialized widget value is undefined (the issue's OllamaConnectivityV2 shape) no longer false-refuses — the scoped run DISPATCHES", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    // Reproduced live against ComfyUI_frontend 1.47.12 (#659): graphToPrompt's
+    // in-memory output carries `model: undefined` for the empty-options combo;
+    // the POST body drops the key — the old hash pair differed 5/5 with zero
+    // edits and every scoped run was refused as "graph CHANGED".
+    const output = {
+      "3": { class_type: "KSampler", inputs: { steps: 20 } },
+      "7": { class_type: "OllamaConnectivityV2", inputs: { url: "http://127.0.0.1:11434", model: undefined } },
+      "14": { class_type: "PreviewAny", inputs: {} },
+    };
+    const app = makeFrontend({ shape: "shim", apiTarget, output });
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+      verifyTimeoutMs: 500,
+    });
+    assert.equal(result.outcome, "dispatched", "no user edit ⇒ no drift ⇒ the scoped run goes out");
+    assert.equal(server.calls.length, 1);
+    const posted = JSON.parse(server.calls[0].options.body);
+    assert.deepEqual(posted.partial_execution_targets, ["14"]);
+    assert.ok(!("model" in posted.prompt["7"].inputs), "the wire body never carried the JSON-invisible key");
+  } finally {
+    stop();
+  }
+});
+
+test("#659 integration: a graph_changed refusal through dispatchScopedRun NAMES what differed — value edits, rewired links, added/removed nodes", async () => {
+  const stop = keepAlive();
+  try {
+    for (const { drift, token } of [
+      { drift: { "3": { class_type: "KSampler", inputs: { steps: 25 } } }, token: /3 steps/ },
+      { drift: { "9": { class_type: "SaveImage", inputs: { images: ["4", 0] } } }, token: /9 images/ },
+      { drift: { "20": { class_type: "SaveImage", inputs: {} } }, token: /20 \(node only in dispatch body\)/ },
+    ]) {
+      const server = makeServer();
+      const apiTarget = { fetchApi: server };
+      const driftedOutput = { ...OUR_OUTPUT, ...drift };
+      const app = makeFrontend({ shape: "shim", defer: true, apiTarget });
+      app.postDeferred = async (item) => {
+        const body = frontendBody({ output: driftedOutput, number: item.number, targets: ["14"] });
+        app.posted.push(body);
+        return apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+      };
+      const promise = dispatchScopedRun({
+        app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+        verifyTimeoutMs: 500,
+      });
+      await sleep(20);
+      const res = await app.postDeferred(app.deferredItem);
+      const result = await promise;
+      assert.equal(res.status, 400);
+      assert.equal(result.outcome, "refused");
+      assert.match(result.error, /graph CHANGED/i);
+      assert.match(result.error, token, `the refusal names the drift: ${token}`);
+      assert.equal(server.calls.length, 0, "the drifted prompt never left the tab");
+    }
+    // A node REMOVED mid-window is named from the other side.
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const { "9": _dropped, ...shrunkOutput } = OUR_OUTPUT;
+    const app = makeFrontend({ shape: "shim", defer: true, apiTarget });
+    app.postDeferred = async (item) => {
+      const body = frontendBody({ output: shrunkOutput, number: item.number, targets: ["14"] });
+      app.posted.push(body);
+      return apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+    };
+    const promise = dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+      verifyTimeoutMs: 500,
+    });
+    await sleep(20);
+    await app.postDeferred(app.deferredItem);
+    const result = await promise;
+    assert.equal(result.outcome, "refused");
+    assert.match(result.error, /9 \(node only in queued prompt\)/, "a removed node is named");
+    assert.equal(server.calls.length, 0);
+  } finally {
+    stop();
+  }
 });
