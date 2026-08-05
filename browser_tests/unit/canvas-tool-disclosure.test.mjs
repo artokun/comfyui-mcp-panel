@@ -435,14 +435,15 @@ test("wiring: the generation advances only once the hello is ON THE WIRE", () =>
   // does. Same rule as #621 and #836: do not record that you did something before
   // you did it.
   const body = sendHelloBody(panelSource());
-  assert.match(
-    body,
-    /if \(sent\) agentSessionEpoch\+\+/,
-    "the advance must be conditional on the hello having actually been sent",
-  );
+  // The guard, whichever form it takes (`if (sent) …` on one line, or a block that
+  // also publishes what the hello advertised — #607). What matters is that the
+  // advance is INSIDE it and after the send, not the punctuation.
+  const guard = body.search(/if \(sent\)[ ]*\{?/);
+  assert.notEqual(guard, -1, "the advance must be conditional on the hello having actually been sent");
   const call = body.indexOf("sendBridgeHello({");
   const bump = body.indexOf("agentSessionEpoch++");
   assert.ok(call >= 0 && bump > call, "the advance must FOLLOW the send, not precede it");
+  assert.ok(bump > guard, "the advance must sit INSIDE the sent-guard, not beside it");
   // …and there must be no second, unconditional one left behind in front of it.
   assert.equal(
     (body.match(/agentSessionEpoch\+\+/g) ?? []).length,

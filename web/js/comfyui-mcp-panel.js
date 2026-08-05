@@ -4856,9 +4856,16 @@ function assertGraphBoundToActiveWorkflow(
  * Write the panel-owned workflow-identity tag onto a root graph and record its
  * owner. One shared writer so the binding guard's rebind heal (#545/#557/#565)
  * and the workflow_new creation stamp (#606) can never drift into two different
- * tag shapes. Callers decide the EVIDENCE that justifies the stamp (a
- * proven-empty canvas, an ownership claim); this only performs the write they
+ * tag shapes. Callers decide the EVIDENCE that justifies the stamp (an ownership
+ * claim, or both sides proven content-free); this only performs the write they
  * settled on.
+ *
+ * workflow_open is deliberately NOT a caller. Its post-load proof cannot license
+ * a stamp: every observation available there is also consistent with a stale root
+ * that already held identical content, so the repair it would perform is exactly
+ * the wrong-canvas write the guard exists to refuse. It proves the load landed
+ * with a single-use marker carried in the SAME payload `extra` as the uuid
+ * instead, which makes any repair unnecessary — see binding-recovery.test.mjs.
  */
 function stampGraphRootWorkflowUuid(rootGraph, uuid, ownerWorkflow) {
   const extra =
@@ -10349,15 +10356,36 @@ const GRAPH_TOOL_EXECUTORS = {
     // guard reads the leftover tag as a foreign-canvas conflict and nothing in
     // the normal command path re-stamps the root — the tab wedges behind the
     // guard until a frontend reload. The panel itself just created this tab and
-    // its canvas, so stamp the tag at the source instead. Evidence bar: only
-    // when the root is PROVEN content-free on every serialized surface — if the
-    // frontend did not actually hand the new tab an empty canvas, the stamp is
-    // skipped (fail closed) rather than re-tagging a root that still holds the
-    // previous workflow's content. Best-effort: a stamp failure leaves the
-    // pre-existing guard behavior, never a broken creation.
+    // its canvas, so stamp the tag at the source — at the one moment the proof
+    // IS available — instead of waiting for a heal that will no longer be able
+    // to prove anything.
+    //
+    // The evidence bar is EXACTLY #565's, not a weaker one (codex gate P0). The
+    // guard's own `staleTagOnEmptyCanvas` rebind performs this identical write,
+    // and it requires BOTH sides proven content-free:
+    //   - the live root serializes empty on every surface, AND
+    //   - the workflow this tag will name is itself provably empty and clean.
+    // Dropping the second half is what makes it unsafe: a content-empty root is
+    // not proof that the root BELONGS to `wf`. If the frontend surfaced the new
+    // workflow as active while `app.graph` still held a DIFFERENT, also-empty
+    // blank tab, a root-only bar would stamp the new uuid onto that other tab's
+    // canvas — overwriting a correct binding and pointing the next mutation at
+    // the wrong workflow, which this whole family exists to prevent. With both
+    // sides proven empty there is no workflow CONTENT that could be confused,
+    // which is the same trade #565 already reasoned through and accepted.
+    //
+    // What this adds over #565 is TIMING, not permission: #565 heals lazily, on
+    // the next graph command, and #606's wedge is precisely a reconnect landing
+    // before the new tab's ChangeTracker can be proven empty — at which point
+    // the lazy heal can no longer fire and nothing re-stamps the root. Stamping
+    // eagerly, while the proof still exists, closes that window without
+    // widening what may be stamped.
+    //
+    // Best-effort: a stamp failure leaves the pre-existing guard behavior, never
+    // a broken creation.
     try {
       const rootGraph = app?.graph;
-      if (rootGraph && graphRootProvenEmpty(rootGraph)) {
+      if (rootGraph && graphRootProvenEmpty(rootGraph) && activeWorkflowProvenEmpty(wf)) {
         stampGraphRootWorkflowUuid(rootGraph, newWorkflowUuid, wf);
       }
     } catch {
@@ -14280,8 +14308,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     });
   }
 
+  /** Returns a promise resolving to whether the hello actually REACHED THE WIRE.
+   *  Every existing caller ignores it; the #607 re-hello does not, because a
+   *  recovery that throttles itself on the strength of a send that never happened
+   *  stays wedged while believing it is being polite. */
   function sendHello() {
-    if (!sock || sock.readyState !== WebSocket.OPEN) return;
+    if (!sock || sock.readyState !== WebSocket.OPEN) return Promise.resolve(false);
     // #291 — a hello BINDS this socket to an agent session, and not always the one
     // it was bound to a moment ago. Besides the socket-open hello, the panel
     // re-hellos the LIVE socket to follow the user's workflow tabs, and with the
@@ -14293,7 +14325,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // dispatches it. This also covers the socket-open hello, so no separate bump is
     // needed in the open handler.
     const target = sock;
-    void sendBridgeHello({
+    // The identity this hello ACTUALLY carries, read where the payload is built
+    // rather than where the send was decided — the two can differ, because
+    // makePayload runs after an awaited tab-identity resolve. Published to
+    // `lastAdvertisedWorkflowUuid` only on the success path below: the #607
+    // budget counts what reached the orchestrator, not what we meant to send.
+    let advertisedWorkflowUuid = null;
+    return sendBridgeHello({
       socket: target,
       isCurrent: () => sock === target && target.readyState === WebSocket.OPEN,
       resolveTabIdentity: () => restartTabIdentity.resolve(),
@@ -14348,7 +14386,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // tmp:<uuid> and the non-unique default title, it survives a reload, so
             // the orchestrator can resume an UNSAVED workflow's conversation without
             // cross-resuming a DIFFERENT same-title unsaved workflow.
-            workflowUuid: workflowStableUuid(),
+            workflowUuid: (advertisedWorkflowUuid = workflowStableUuid()),
             // #508/#694 — NO lostReplies summaries here: the hello fires at
             // socket-open, BEFORE the models handshake stamps this socket's session
             // epoch, so any summary computed now is filtered with an unknown epoch
@@ -14378,10 +14416,17 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // ordered anyway, so a message sent while this hello is still awaiting
         // identity is written BEFORE the hello. Either way it is handled by the
         // pre-hello agent, which is exactly the generation it was stamped with.
-        if (sent) agentSessionEpoch++;
+        if (sent) {
+          agentSessionEpoch++;
+          // Published only now, for the same reason the epoch advances only now:
+          // a hello that never reached the wire advertised nothing.
+          lastAdvertisedWorkflowUuid = advertisedWorkflowUuid;
+        }
+        return sent === true;
       })
       .catch(() => {
         // Reconnect path will retry. No hello landed, so no generation advance.
+        return false;
       });
   }
 
@@ -14389,15 +14434,84 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
   // when it refuses a command whose stamp no longer names the active canvas: the
   // panel's live identity is authoritative, so re-hello to push it to the
   // orchestrator (which re-stamps from hello.workflow_uuid), making the refusal's
-  // advertised recovery (re-target, then retry) able to succeed. Throttled: a
-  // retry loop against a genuinely-switched canvas must not become a greeting
-  // storm — a full hello re-greets the user ("agent ready").
-  let lastMismatchRehelloAt = 0;
+  // advertised recovery (re-target, then retry) able to succeed.
+  //
+  // BOUNDED PER IDENTITY (codex gate). A persistent mismatch produces
+  // refusal → hello → same refusal → hello forever, and an unbounded retry is a
+  // NEW wedge rather than a fix — it churns instead of sitting still, and a full
+  // hello re-greets the user ("agent ready"). The evidence a re-hello carries is
+  // the panel's live workflow uuid, so the budget is keyed to THAT: a few attempts
+  // per distinct identity (a lost or ignored hello is worth retrying; the tenth is
+  // not), reset the moment the live identity actually changes — which is new
+  // evidence and deserves a fresh advertisement. Nothing here bounds a genuine tab
+  // switch, which re-hellos through `rehello` on its own path anyway.
+  //
+  // Only re-hellos that PROVABLY reached the wire are counted, and the backoff
+  // clock is stamped only AFTER an attempt has concluded and only when it did NOT
+  // land. Stamping either before the send is the recurring "recorded before it
+  // happened" defect (#621's canvas lock holder, #836's panel-op release,
+  // agentSessionEpoch in #633): a budget spent on, or a throttle claimed for, a
+  // hello that never left the tab suppresses the one attempt that could have
+  // cleared the wedge.
+  const MISMATCH_REHELLO_MAX_PER_IDENTITY = 3;
+  const MISMATCH_REHELLO_BACKOFF_MS = 5000;
+  /** The workflow identity the most recent LANDED hello actually carried (set by
+   *  sendHello on its success path). The budget below is spent against THIS, not
+   *  against the identity that was live when the send was decided: makePayload
+   *  reads the uuid after an awaited identity resolve, so a tab switch that
+   *  interleaves the send makes the hello advertise a different workflow than the
+   *  refusal that triggered it. Counting the intended one would let the switched-to
+   *  identity collect an uncounted hello on top of its own budget. */
+  let lastAdvertisedWorkflowUuid = null;
+  let mismatchRehelloIdentity = null;
+  let mismatchRehelloLandedCount = 0;
+  let mismatchRehelloInFlight = false;
+  let lastFailedMismatchRehelloAt = 0;
   workflowInstanceMismatchRehello = () => {
-    const now = Date.now();
-    if (now - lastMismatchRehelloAt < 5000) return;
-    lastMismatchRehelloAt = now;
-    sendHello();
+    // An identity we cannot READ is not an identity we know to be new. Fall
+    // through to no re-hello rather than resetting the budget on an unknown —
+    // the refusal (with its own remedy) stands either way.
+    let liveUuid = null;
+    try {
+      const read = workflowStableUuid();
+      liveUuid = typeof read === "string" && read ? read : null;
+    } catch {
+      liveUuid = null;
+    }
+    if (!liveUuid) return;
+    if (liveUuid !== mismatchRehelloIdentity) {
+      mismatchRehelloIdentity = liveUuid;
+      mismatchRehelloLandedCount = 0;
+      lastFailedMismatchRehelloAt = 0;
+    }
+    if (mismatchRehelloLandedCount >= MISMATCH_REHELLO_MAX_PER_IDENTITY) return;
+    if (mismatchRehelloInFlight) return;
+    if (
+      lastFailedMismatchRehelloAt &&
+      Date.now() - lastFailedMismatchRehelloAt < MISMATCH_REHELLO_BACKOFF_MS
+    )
+      return;
+    mismatchRehelloInFlight = true;
+    void Promise.resolve()
+      .then(() => sendHello())
+      .then((sent) => sent === true)
+      .catch(() => false)
+      .then((landed) => {
+        mismatchRehelloInFlight = false;
+        if (landed) {
+          // Charge the budget of whichever identity the hello ACTUALLY carried,
+          // and only when that is still the identity being budgeted. The bound
+          // for a landed hello is that budget, not a clock: a later genuine
+          // switch must be re-advertised at once, and it resets the count above.
+          if (lastAdvertisedWorkflowUuid === mismatchRehelloIdentity) {
+            mismatchRehelloLandedCount += 1;
+          }
+        } else {
+          // It did not reach the orchestrator. Back off before trying again, but
+          // do NOT spend the budget on it — nothing was advertised.
+          lastFailedMismatchRehelloAt = Date.now();
+        }
+      });
   };
 
   // When the workflow title changes (rename / open a different file / progress
