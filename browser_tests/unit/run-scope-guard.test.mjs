@@ -32,6 +32,8 @@ import {
   scopeUnattributableError,
   createRunFetchInterceptor,
   createScopedRunGuard,
+  describeObserved,
+  readScopeFromBody,
   cancelPendingScopedQueueItem,
   dispatchScopedRun,
 } from "../../web/js/lib/run-scope-guard.js";
@@ -868,6 +870,168 @@ test("#630 gate r2: an explicit partial_execution_targets:null is a PRESENT key,
     await g2(...promptPost({ prompt: OUR_OUTPUT, client_id: "x", number: MARK_A }));
     assert.equal(g2.state.droppedReason, "scope_missing");
     assert.match(g2.state.dropped, /no partial_execution_targets key at all/);
+  } finally {
+    stop();
+  }
+});
+
+test("#630 gate r2 P1: describeObserved NEVER throws — the refusal path's own formatting cannot be what fails", () => {
+  // JSON.stringify is not a safe formatter for a value off the wire: circular
+  // structures and BigInt throw outright, and a deeply nested value throws
+  // RangeError from a shallow stack. This function sits on the refusal path,
+  // between deciding to refuse and recording it, so a throw here escaped the
+  // guard mid-decision. A guard that can throw is not a guard. The contract is
+  // total: any input, no throw, bounded output.
+  const circular = { a: 1 };
+  circular.self = circular;
+  let deep = { end: true };
+  for (let i = 0; i < 60000; i++) deep = { a: deep };
+  const cases = [
+    circular,
+    { big: 1n },
+    1n,
+    deep,
+    undefined,
+    Symbol("s"),
+    () => {},
+    { toJSON() { throw new Error("hostile toJSON"); } },
+    null,
+    42,
+    "plain",
+    ["a", "b"],
+  ];
+  for (const value of cases) {
+    let out;
+    assert.doesNotThrow(() => {
+      out = describeObserved(value);
+    }, `describeObserved must not throw for ${String(value?.constructor?.name ?? typeof value)}`);
+    assert.equal(typeof out, "string", "and it always yields a string the message can interpolate");
+    assert.ok(out.length <= 220, "bounded — this lands in an error a human reads");
+  }
+  // It still says something useful for ordinary values.
+  assert.equal(describeObserved(["14"]), '["14"]');
+  assert.match(describeObserved(circular), /unserializable/);
+});
+
+test("#630 gate r2 P1: a refusal is ALWAYS recorded, so a description failure can never leave the next post unguarded", async () => {
+  const stop = keepAlive();
+  try {
+    const orig = makeServer();
+    const guard = createScopedRunGuard({
+      origFetchApi: orig, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
+    });
+    // A body whose partial_execution_targets is valid JSON but pathological to
+    // re-render. Whatever happens while describing it, the post must be refused
+    // and the refusal recorded.
+    let deep = "null";
+    for (let i = 0; i < 5000; i++) deep = `{"a":${deep}}`;
+    const nested = `{"prompt":${JSON.stringify(OUR_OUTPUT)},"client_id":"x","number":${MARK_A},"partial_execution_targets":${deep}}`;
+    let threw = null;
+    let first;
+    try {
+      first = await guard("/prompt", { method: "POST", body: nested });
+    } catch (err) {
+      threw = err;
+    }
+    assert.equal(threw, null, "the guard must not throw out of the refusal path");
+    assert.equal(first.status, 400, "the corrupted post is refused");
+    assert.equal(orig.calls.length, 0, "and nothing left the tab");
+    assert.ok(guard.state.dropped, "a refusal is always recorded, even when the value cannot be rendered");
+  } finally {
+    stop();
+  }
+});
+
+test("#630 gate r2 P1: describeObserved never throws — and beyond the batch budget our corrupted post is refused, not forwarded", async () => {
+  const stop = keepAlive();
+  try {
+    const orig = makeServer();
+    const guard = createScopedRunGuard({
+      origFetchApi: orig, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
+    });
+    // Three attributed scopeless posts against a batch budget of 1.
+    for (let i = 0; i < 3; i++) {
+      const res = await guard(...promptPost({ prompt: OUR_OUTPUT, client_id: "x", number: MARK_A }));
+      assert.equal(res.status, 400, `post ${i + 1} refused`);
+    }
+    assert.equal(orig.calls.length, 0, "not one of them was ever forwarded unscoped");
+    assert.equal(guard.state.refused, 1, "the RECORDING stays bounded — only the forwarding was the bug");
+  } finally {
+    stop();
+  }
+});
+
+test("#630 gate r2 P2: readScopeFromBody classifies every body shape as ITSELF — a successful parse is never reported as a failed one", () => {
+  const state = (b) => readScopeFromBody(typeof b === "string" ? b : JSON.stringify(b)).state;
+  // A genuine parse failure.
+  assert.equal(state("not-json{"), "body_unreadable");
+  assert.equal(state(undefined), "body_unreadable");
+  // Parsed fine, but not a prompt request object. Reporting these as
+  // "could not be parsed" would be a definite negative about an operation that
+  // SUCCEEDED — the collapse this whole split exists to remove.
+  assert.equal(state("null"), "body_not_an_object");
+  assert.equal(state("42"), "body_not_an_object");
+  assert.equal(state('"a string"'), "body_not_an_object");
+  assert.equal(state([1, 2, 3]), "body_not_an_object");
+  // A real request object, per scope shape.
+  assert.equal(state({ prompt: {} }), "absent");
+  assert.equal(state({ prompt: {}, partial_execution_targets: null }), "not_a_list");
+  assert.equal(state({ prompt: {}, partial_execution_targets: "14" }), "not_a_list");
+  assert.equal(state({ prompt: {}, partial_execution_targets: { queueNodeIds: ["14"] } }), "not_a_list");
+  assert.equal(state({ prompt: {}, partial_execution_targets: [] }), "empty");
+  assert.equal(state({ prompt: {}, partial_execution_targets: ["14"] }), "present");
+  // Body keys are evidence, and only exist where there is an object to read.
+  assert.deepEqual(readScopeFromBody(JSON.stringify({ b: 1, a: 2 })).bodyKeys, ["a", "b"]);
+  assert.equal(readScopeFromBody(JSON.stringify([1, 2])).bodyKeys, null, "array indices are not body keys");
+  assert.equal(readScopeFromBody("not-json{").bodyKeys, null);
+});
+
+test("#630 gate r2 P2: an unparseable or non-object body is FOREIGN by identity — it can carry no mark, so it is passed through, never refused", async () => {
+  // Why the two body-shape states cannot reach the refusal path: run identity
+  // is tested first, and it is read from a top-level `number`. This pins the
+  // reasoning rather than leaving it as an unstated assumption.
+  const stop = keepAlive();
+  try {
+    for (const body of ["not-json{", JSON.stringify([1, 2, 3]), JSON.stringify(42), "null"]) {
+      const orig = makeServer();
+      const guard = createScopedRunGuard({
+        origFetchApi: orig, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
+        repairScope: true,
+      });
+      await guard("/prompt", { method: "POST", body });
+      assert.equal(orig.calls.length, 1, `passed through untouched: ${body.slice(0, 12)}`);
+      assert.equal(orig.calls[0].options.body, body, "and byte-identical — never rewritten by the repair");
+      assert.equal(guard.state.refused, 0);
+      assert.equal(guard.state.repaired, 0);
+      assert.equal(guard.state.observed, 0, "never counted as our own dispatch either");
+    }
+  } finally {
+    stop();
+  }
+});
+
+test("#630 gate r2 P2: a body that PARSED but is not a request object is not reported as unparseable", async () => {
+  // JSON.parse succeeded. Saying "could not be parsed" would be a definite
+  // negative about an operation that worked — the collapse this split removes.
+  const stop = keepAlive();
+  try {
+    const scalar = scopeDroppedError({ toNodeId: 7, verdict: { ok: false, reason: "body_not_an_object", expected: ["7"], got: null, raw: 42 } });
+    assert.match(scalar, /body parsed, but it was not a request object \(42\)/);
+    assert.doesNotMatch(scalar, /could not be parsed/, "a successful parse is never reported as a failed one");
+    const unreadable = scopeDroppedError({ toNodeId: 7, verdict: { ok: false, reason: "body_unreadable", expected: ["7"], got: null } });
+    assert.match(unreadable, /could not be parsed/, "and a genuine parse failure still says so");
+    assert.notEqual(scalar, unreadable);
+    // End to end through the guard: an array body parses, and is classified as
+    // a shape problem, not a parse problem and not an absent key.
+    const orig = makeServer();
+    const guard = createScopedRunGuard({
+      origFetchApi: orig, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
+    });
+    // Marked via a top-level `number`… an array cannot carry one, so it is
+    // foreign by identity and must simply pass through untouched.
+    await guard("/prompt", { method: "POST", body: JSON.stringify([1, 2, 3]) });
+    assert.equal(orig.calls.length, 1, "an unattributable body is foreign traffic, passed through");
+    assert.equal(guard.state.refused, 0);
   } finally {
     stop();
   }

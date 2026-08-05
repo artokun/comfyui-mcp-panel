@@ -317,20 +317,37 @@ function bodyQueueMark(bodyText) {
  * So the states are now reported separately, the message states only what was
  * OBSERVED, and the body's top-level keys ride along as evidence.
  *
- * @typedef {"present"|"absent"|"empty"|"not_a_list"|"body_unreadable"} ScopeReadState
+ * `body_unreadable` and `body_not_an_object` are deliberately separate (codex
+ * gate r2): a JSON scalar, `null`, or an array PARSES fine — saying it "could
+ * not be parsed" would report a definite negative about an operation that
+ * actually succeeded, which is the same collapse this split exists to remove.
+ *
+ * REACHABILITY, stated plainly rather than implied: neither of those two states
+ * can reach the guard's refusal path today, and that is by construction, not by
+ * luck. The guard's FIRST test is run identity — this run's unique queue mark,
+ * read from the body's top-level `number`. A body that will not parse, or that
+ * parses to a scalar/array, cannot carry that mark, so it is FOREIGN traffic:
+ * passed through untouched, never refused, never repaired, never observed. The
+ * two states therefore exist for correctness of the classification itself (and
+ * for any future caller that reads a body it has already attributed some other
+ * way), and the tests pin BOTH the classification and the pass-through.
+ *
+ * @typedef {"present"|"absent"|"empty"|"not_a_list"|"body_unreadable"|"body_not_an_object"} ScopeReadState
  * @returns {{state: ScopeReadState, targets: string[]|null, bodyKeys: string[]|null, raw: unknown}}
  */
-function readScopeFromBody(bodyText) {
+export function readScopeFromBody(bodyText) {
   let body;
   try {
     body = JSON.parse(bodyText);
   } catch {
     return { state: "body_unreadable", targets: null, bodyKeys: null, raw: undefined };
   }
-  const bodyKeys = body && typeof body === "object" ? Object.keys(body).sort() : null;
-  if (!body || typeof body !== "object") {
-    return { state: "body_unreadable", targets: null, bodyKeys, raw: undefined };
+  // An array parses and has keys, but it is not a prompt request; treat it with
+  // the scalars rather than letting Object.keys present indices as body keys.
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { state: "body_not_an_object", targets: null, bodyKeys: null, raw: body };
   }
+  const bodyKeys = Object.keys(body).sort();
   const t = body.partial_execution_targets;
   // "absent" means the key is genuinely not there. JSON cannot encode
   // `undefined`, so after a parse `undefined` is exactly "no such key". An
@@ -420,27 +437,73 @@ export function repairScopeInBody(bodyText, expectedExecIds) {
 }
 
 /**
+ * Render an arbitrary observed value for a human-readable message WITHOUT ever
+ * throwing (codex gate r2, P1).
+ *
+ * `JSON.stringify` is not a safe formatter for a value that came off the wire:
+ * a deeply nested object throws RangeError, a BigInt throws TypeError, a
+ * circular structure throws. This function sat between the guard's decision to
+ * refuse and the recording of that refusal, so a throw here escaped the guard
+ * with the refusal budget already spent — and on the next attributed scopeless
+ * post the exhausted-budget path forwarded it UNCHANGED, i.e. a full-graph run.
+ * A guard that can throw is not a guard.
+ *
+ * Bounded in length too: this string goes into an error a caller reads.
+ *
+ * NOTE on reproducibility (be honest about what is proven): the depth-based
+ * trigger codex found is engine- and stack-dependent. `JSON.stringify` DOES
+ * throw RangeError on a ~5000-deep value when called from a shallow stack on
+ * this Node, but from inside the guard's async call chain it survived 150k
+ * levels — V8's stringify is iterative there. So the exploit is real but not
+ * deterministically reproducible from the guard's entry point on this engine.
+ * The contract enforced by the tests is therefore the one that matters and can
+ * be proven: this function NEVER throws, for any input. Exported for that test.
+ */
+export function describeObserved(value) {
+  try {
+    const text = JSON.stringify(value);
+    if (typeof text === "string") return text.length > 200 ? `${text.slice(0, 200)}…` : text;
+    return String(typeof value); // undefined / function / symbol — stringify returns undefined
+  } catch {
+    // Unserializable (too deep, circular, BigInt). Say what it was, not what it said.
+    try {
+      return Array.isArray(value) ? `an unserializable array` : `an unserializable ${typeof value} value`;
+    } catch {
+      return "an unserializable value";
+    }
+  }
+}
+
+/**
  * What was OBSERVED about the scope in our own dispatch — one clause per
  * distinct state, asserting nothing beyond the observation. See
  * readScopeFromBody for why these are no longer one bucket.
+ *
+ * Every interpolation goes through describeObserved: this runs on the refusal
+ * path, and the refusal path must not be able to fail.
  */
 function scopeObservation(verdict) {
   switch (verdict?.reason) {
     case "scope_mismatch":
       return (
         `the POST /prompt body carried partial_execution_targets ` +
-        `${JSON.stringify(verdict.got)} instead of ${JSON.stringify(verdict.expected)}`
+        `${describeObserved(verdict.got)} instead of ${describeObserved(verdict.expected)}`
       );
     case "scope_not_a_list":
       return (
         `the POST /prompt body's partial_execution_targets was not a list ` +
-        `(${JSON.stringify(verdict.raw)}) — the requested scope did not survive ` +
+        `(${describeObserved(verdict.raw)}) — the requested scope did not survive ` +
         `the trip through app.queuePrompt in a usable shape`
       );
     case "scope_empty":
       return `the POST /prompt body carried an EMPTY partial_execution_targets list`;
     case "body_unreadable":
       return `the POST /prompt body could not be parsed, so the scope could not be read from it`;
+    case "body_not_an_object":
+      return (
+        `the POST /prompt body parsed, but it was not a request object ` +
+        `(${describeObserved(verdict.raw)}), so it carries no scope to read`
+      );
     default:
       return (
         `the POST /prompt body carried no partial_execution_targets key at all` +
@@ -784,41 +847,70 @@ export function createScopedRunGuard({
     // OUR dispatch CORRUPTED. Content drift (r7) takes naming precedence: a
     // changed graph would render the wrong workflow even with the scope
     // intact. Then the scope itself: missing, or wrong/extra/partial targets.
-    if (state.refused < maxBatch) {
-      state.refused++;
-      if (state.dropped == null) {
-        // Report the OBSERVATION, not a bucket: which of the distinct
-        // no-usable-scope states actually occurred (readScopeFromBody), with
-        // the body's top-level keys as evidence for the next report.
-        const verdict = !contentOk
-          ? { ok: false, reason: "graph_changed" }
-          : targets
-            ? { ok: false, reason: "scope_mismatch", expected, got: targets }
-            : {
-                ok: false,
-                reason:
-                  scopeRead.state === "not_a_list"
-                    ? "scope_not_a_list"
-                    : scopeRead.state === "empty"
-                      ? "scope_empty"
-                      : scopeRead.state === "body_unreadable"
-                        ? "body_unreadable"
+    //
+    // REFUSE FIRST, DESCRIBE AFTER (codex gate r2, P1). The refusal is the
+    // thing that makes this post safe; the message is only its description.
+    // Recording the message used to sit BETWEEN spending the refusal budget
+    // and returning the refusal, so a throw while formatting an observed value
+    // escaped the guard with the budget already spent — and the next
+    // attributed post then took the exhausted-budget path and was FORWARDED,
+    // scopeless, as a full graph. The budget is now spent only alongside a
+    // recorded message, and the description is fenced so it cannot throw at
+    // all (describeObserved) AND cannot escape if a future edit reintroduces a
+    // throw (the catch below).
+    if (state.dropped == null) {
+      // Report the OBSERVATION, not a bucket: which of the distinct
+      // no-usable-scope states actually occurred (readScopeFromBody), with
+      // the body's top-level keys as evidence for the next report.
+      const verdict = !contentOk
+        ? { ok: false, reason: "graph_changed" }
+        : targets
+          ? { ok: false, reason: "scope_mismatch", expected, got: targets }
+          : {
+              ok: false,
+              reason:
+                scopeRead.state === "not_a_list"
+                  ? "scope_not_a_list"
+                  : scopeRead.state === "empty"
+                    ? "scope_empty"
+                    : scopeRead.state === "body_unreadable"
+                      ? "body_unreadable"
+                      : scopeRead.state === "body_not_an_object"
+                        ? "body_not_an_object"
                         : "scope_missing",
-                expected,
-                got: null,
-                raw: scopeRead.raw,
-                bodyKeys: scopeRead.bodyKeys,
-              };
-        state.droppedReason = verdict.reason;
+              expected,
+              got: null,
+              raw: scopeRead.raw,
+              bodyKeys: scopeRead.bodyKeys,
+            };
+      state.droppedReason = verdict.reason;
+      try {
         state.dropped = scopeDroppedError({ toNodeId, verdict });
+      } catch {
+        // The description failed; the REFUSAL must not. Never leave
+        // state.dropped null here — a null would re-enter this branch on the
+        // next post and could spend the whole batch's budget describing.
+        state.dropped =
+          `run-to-node scope for node ${toNodeId} was NOT applied and the reason could ` +
+          `not be described. Nothing was queued — refusing to fall through to a ` +
+          `full-graph execution (#556).`;
+      }
+      state.refused++;
+      try {
         onScopeDropped?.(state.dropped);
+      } catch {
+        // A caller's notification failure must not turn a refusal into a forward.
       }
       notify();
       return SCOPE_DROPPED_RESPONSE();
     }
-    // Refusal budget for this batch is exhausted (paranoia bound; normally the
-    // frontend's batch loop breaks on the first refusal).
-    return origFetchApi(route, options);
+    // Already refused once in this batch: still OUR corrupted post, so it is
+    // still refused. Only the RECORDING is bounded (one message per attempt) —
+    // the budget never licensed dispatching a scopeless full graph, and letting
+    // it do so is the #556 harm itself.
+    if (state.refused < maxBatch) state.refused++;
+    notify();
+    return SCOPE_DROPPED_RESPONSE();
   };
   guard.state = state;
   // Verdict = the run reached a TERMINAL state: the whole batch verified, a
