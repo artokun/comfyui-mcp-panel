@@ -14294,19 +14294,20 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // fence at all: requiring a binding proof for it only false-blocks a
             // server-side operation when the canvas binding is broken.
             if (msg.cmd.startsWith("graph_") && !commandIsCanvasIndependent(msg.cmd)) {
-              const { graph, rootGraph } = getGraphCtx();
-              assertGraphBoundToActiveWorkflow(graph, rootGraph, graphCommandBindingBar(msg.cmd));
               // #646 — the post-reconnect MUTATION gate. A graph mutation that
               // arrives while ComfyUI's backend socket is down, or inside the
               // settle window before the restored canvas binding has been
               // re-proven, can land on a canvas the restore is about to rebuild
               // (applied-then-wiped) or die with the socket mid-command
               // (OUTCOME UNKNOWN). Reads are exempt — they stay available on
-              // their own evidence bars; the gate refuses BEFORE the executor,
-              // so its "NOT applied" claim is true and the retry is safe. The
-              // settle watch (#663) closes the binding window as soon as the
-              // binding observably re-proves, so the healthy case waits ~1s,
-              // not the full 30s.
+              // their own evidence bars. The gate runs BEFORE getGraphCtx and
+              // the binding assert: those probes can themselves change the
+              // canvas (the verified content-free rebind heal), which would
+              // falsify this refusal's "nothing changed" claim (codex gate r6),
+              // and it refuses BEFORE the executor, so "NOT applied" is true
+              // and the retry is safe. The settle watch (#663) closes the
+              // binding window as soon as the binding observably re-proves, so
+              // the healthy case waits ~1s, not the full 30s.
               if (graphCommandMayMutateWorkflow(msg.cmd)) {
                 const reconnectGate = graphMutationReconnectGate({
                   cmd: msg.cmd,
@@ -14315,6 +14316,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
                 });
                 if (reconnectGate) throw new Error(reconnectGate);
               }
+              const { graph, rootGraph } = getGraphCtx();
+              assertGraphBoundToActiveWorkflow(graph, rootGraph, graphCommandBindingBar(msg.cmd));
             }
             // PINNED-TARGET GUARD (#349): a `workflow_path` on the command means the
             // agent's session is pinned to a SPECIFIC workflow. But every executor

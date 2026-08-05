@@ -219,6 +219,10 @@ test("#646 wiring: the dispatch fence gates MUTATING graph commands through the 
     /graphMutationReconnectGate\(\{[\s\S]*?backendDown: comfyBackendSocketDown,[\s\S]*?bindingSettleWindow: postReconnectBindingSettleWindow\(\)/,
     "the gate reads both live signals",
   );
+  assert.ok(
+    fence.indexOf("graphMutationReconnectGate({") < fence.indexOf("getGraphCtx()"),
+    "the gate fires BEFORE getGraphCtx — the probes can change the canvas (the rebind heal), which would falsify 'nothing changed' (codex r6)",
+  );
 });
 
 test("#663 wiring: BOTH resync sites (open + new) stamp the binding proof, TOCTOU-guarded", () => {
