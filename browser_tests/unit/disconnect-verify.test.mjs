@@ -19,13 +19,15 @@ import {
   verifyDisconnect,
 } from "../../web/js/lib/disconnect-verify.js";
 
-/** Minimal mock graph: nodes by id, links as a legacy record store. */
+/** Minimal mock graph: nodes by id, links as a legacy record store. getNodeById
+ *  reads the LIVE _nodes array, like litegraph's _nodes_by_id lookup. */
 function mockGraph(nodes, links) {
-  return {
+  const g = {
     _nodes: nodes,
     links,
-    getNodeById: (id) => nodes.find((n) => n.id === id) ?? null,
+    getNodeById: (id) => g._nodes.find((n) => n.id === id) ?? null,
   };
+  return g;
 }
 
 function node(id, inputs = [], outputs = []) {
@@ -90,13 +92,22 @@ test("describeInputLink: unlinked input → null (caller refuses the no-op)", ()
   assert.equal(describeInputLink(g, n105, 1), null);
 });
 
-test("describeInputLink: falls back to origin_slot number when the origin node is gone", () => {
+test("describeInputLink: dangling slot ref (no link record) → null, like unlinked", () => {
   const g = reproGraph();
   const n105 = g.getNodeById(105);
-  n105.inputs[0].link = 99; // dangling id, no record
+  n105.inputs[0].link = 99; // dangling id, no record in the store
+  assert.equal(describeInputLink(g, n105, 0), null);
+});
+
+test("describeInputLink: origin node gone but record present → slot-index fallback", () => {
+  const g = reproGraph();
+  const n105 = g.getNodeById(105);
+  g._nodes = g._nodes.filter((n) => n.id !== 121); // origin deleted, record survives
   const d = describeInputLink(g, n105, 0);
-  assert.equal(d.linkId, 99);
-  assert.equal(d.node_id, undefined);
+  assert.equal(d.linkId, 2);
+  assert.equal(d.node_id, 121);
+  assert.equal(d.output, 0); // no origin outputs to name — the slot index
+  assert.equal(d.output_index, 0);
 });
 
 test("clean disconnect: intended link gone, nothing else changed → ok", () => {
@@ -217,6 +228,39 @@ test("floating-link churn alone does not fail the verdict", () => {
   g.getNodeById(105).inputs[0].link = null;
   delete g.links[50]; // mid-drag stub discarded during the disconnect — not a wire
   const v = verifyDisconnect(g, g.getNodeById(105), before, 2);
+  assert.equal(v.ok, true);
+});
+
+test("interior node deletion inside the target's subgraph is detected (path-qualified)", () => {
+  const g = reproGraph();
+  const n105 = g.getNodeById(105);
+  n105.subgraph = { _nodes: [node(12), node(13)] };
+  const before = snapshotGraphState(g);
+  assert.ok(before.nodeIds.has("105>12"), "interior nodes are in the snapshot");
+  delete g.links[2];
+  n105.inputs[0].link = null;
+  n105.subgraph._nodes = [node(13)]; // inner node 12 deleted by the cascade
+  const v = verifyDisconnect(g, n105, before, 2);
+  assert.equal(v.ok, false);
+  assert.deepEqual(v.missingNodes, ["105>12"]);
+});
+
+test("interior LINK pruning (boundary-slot cascade) does NOT fail — documented asymmetry", () => {
+  const g = reproGraph();
+  const n105 = g.getNodeById(105);
+  n105.subgraph = {
+    _nodes: [node(12)],
+    links: { 1: { id: 1, origin_id: -10, origin_slot: 0, target_id: 12, target_slot: 0 } },
+  };
+  const before = snapshotGraphState(g);
+  delete g.links[2];
+  n105.inputs[0].link = null;
+  // The boundary slot was pruned: its interior rail link went with it. Interior
+  // link stores are deliberately NOT diffed (legitimate cascade) — only the
+  // interior NODE set is. The panel's slotsShifted warning covers the shape.
+  n105.subgraph.links = {};
+  n105.inputs = [];
+  const v = verifyDisconnect(g, n105, before, 2);
   assert.equal(v.ok, true);
 });
 

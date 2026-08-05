@@ -8656,9 +8656,11 @@ const GRAPH_TOOL_EXECUTORS = {
       ];
       if (verdict.missingNodes.length) {
         lines.push(
-          `- node(s) ${verdict.missingNodes.join(", ")} were REMOVED from the graph during this ` +
-            `disconnect — they were not the disconnect target`,
+          `- node(s) ${verdict.missingNodes.join(", ")} were REMOVED from the graph during this disconnect`,
         );
+        if (verdict.missingNodes.includes(String(node.id))) {
+          lines.push(`- the removed nodes INCLUDE the disconnect target (node ${node.id}) itself`);
+        }
       }
       if (verdict.addedNodes.length) {
         lines.push(`- node(s) ${verdict.addedNodes.join(", ")} APPEARED that were not there before`);

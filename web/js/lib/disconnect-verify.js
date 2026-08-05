@@ -18,6 +18,18 @@
 // fact would report failure for a disconnect that may have landed and invite a
 // destructive retry.
 //
+// Scope of the snapshot, deliberately asymmetric:
+//   - NODE SETS are tracked RECURSIVELY into descendant subgraphs (ids qualified
+//     by the subgraph-node path, "105>12"): a disconnect can never legitimately
+//     delete a node anywhere, interior or not, so every deletion is reported.
+//   - LINK SETS are tracked for the CURRENT graph only. A disconnect of the
+//     last external wire to a subgraph boundary slot may legitimately prune that
+//     slot and its INTERIOR rail links — flagging those would fail ordinary,
+//     correct use. Collateral link loss in the graph the caller is looking at
+//     is never legitimate, so there it fails. The panel discloses a changed
+//     boundary-slot shape via its own warning, which covers the legitimate
+//     interior case.
+//
 // Pure (no DOM / no ComfyUI globals — graph + nodes are passed in) so the unit
 // tests drive the SAME check production runs.
 
@@ -60,19 +72,22 @@ function linkIsFloating(link) {
 
 /**
  * Snapshot the parts of `graph` a disconnect must never change beyond the one
- * intended link: the node id set and the set of real (non-floating) links.
- * Ids are string-normalized — subgraph node ids can be strings while link
- * endpoints may carry them as numbers, and Map keys / legacy record keys
- * differ in type across litegraph builds.
+ * intended link: the node id set (RECURSIVELY into descendant subgraphs — a
+ * node deletion is never a legitimate disconnect side effect anywhere) and the
+ * set of real (non-floating) links OF THIS GRAPH (interior link pruning by a
+ * boundary-slot cascade is legitimate; see the module header). Ids are
+ * string-normalized — subgraph node ids can be strings while link endpoints
+ * may carry them as numbers, and Map keys / legacy record keys differ in type
+ * across litegraph builds. Interior node ids are qualified by the subgraph-node
+ * path ("105>12") so rail ids (-10/-20) and local id collisions across nested
+ * graphs can never alias each other.
  *
  * Returns `{ nodeIds: Set<string>, links: Map<string, linkView> }` where
  * linkView is `{ id, origin_id, origin_slot, target_id, target_slot }`.
  */
 export function snapshotGraphState(graph) {
   const nodeIds = new Set();
-  for (const n of graph?._nodes ?? []) {
-    if (n?.id != null) nodeIds.add(String(n.id));
-  }
+  collectNodeIds(graph, "", nodeIds);
   const links = new Map();
   for (const [id, link] of linkEntries(graph)) {
     if (!link || id == null || linkIsFloating(link)) continue;
@@ -87,23 +102,43 @@ export function snapshotGraphState(graph) {
   return { nodeIds, links };
 }
 
+/** Recursively add "path-qualified" node ids: top-level ids plain, interior
+ *  ids as "<subgraphNodeId>><innerId>" (deeper nesting extends the path). */
+function collectNodeIds(graph, prefix, out) {
+  for (const n of graph?._nodes ?? []) {
+    if (n?.id == null) continue;
+    const path = prefix + String(n.id);
+    out.add(path);
+    const inner = n?.subgraph;
+    if (inner && Array.isArray(inner._nodes)) collectNodeIds(inner, `${path}>`, out);
+  }
+}
+
 /**
  * Describe the link currently feeding `node`'s input `inIdx`, or null when the
  * input is not connected. Captured BEFORE the mutation: on a SubgraphNode the
  * disconnect can remove the boundary slot and shift the inputs array, so any
  * slot read taken afterwards may describe a DIFFERENT input. `node_id`/`output`
  * name the wire's former source (symmetric with graph_connect's replaced_link).
+ *
+ * A slot whose `link` id has NO record in the graph's link store is a DANGLING
+ * reference, not a connection — null is returned so the caller's not-connected
+ * refusal covers it (reporting a "removed" wire that never existed would
+ * fabricate a mutation). The inverse is fine: the ORIGIN NODE may be gone while
+ * its link record still exists, in which case the description falls back to the
+ * origin slot index.
  */
 export function describeInputLink(graph, node, inIdx) {
   const linkId = node?.inputs?.[inIdx]?.link;
   if (linkId == null) return null;
   const link = getLinkRecord(graph, linkId);
-  const origin = link ? graph?.getNodeById?.(link.origin_id) : null;
+  if (!link) return null;
+  const origin = graph?.getNodeById?.(link.origin_id);
   return {
     linkId,
-    node_id: link?.origin_id,
-    output: origin?.outputs?.[link?.origin_slot]?.name ?? link?.origin_slot,
-    output_index: link?.origin_slot,
+    node_id: link.origin_id,
+    output: origin?.outputs?.[link.origin_slot]?.name ?? link.origin_slot,
+    output_index: link.origin_slot,
   };
 }
 
