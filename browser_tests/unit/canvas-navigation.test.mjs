@@ -84,6 +84,26 @@ test("#619: a probe that MOVES the canvas off the target cannot produce a settle
   assert.equal(r.landed, false);
 });
 
+test("#619: a probe that THROWS after moving the canvas still updates the terminal landed (codex r3)", async () => {
+  const target = { name: "sub" };
+  const root = { name: "root" };
+  let current = target;
+  const r = await confirmCanvasNavigation({
+    readCanvasGraph: () => current,
+    target,
+    assertBound: () => {
+      current = root;
+      throw new Error("probe failed after the heal moved the canvas");
+    },
+    tries: 3,
+    sleep: instantSleep,
+  });
+  assert.equal(r.landed, false, "the terminal verdict describes the LAST observation, not the pre-probe one");
+  assert.equal(r.everLanded, true);
+  assert.equal(r.bound, false);
+  assert.match(String(r.lastError?.message), /probe failed/);
+});
+
 test("#619: a navigation that lands a few polls later is still confirmed", async () => {
   const target = { name: "sub" };
   let current = { name: "root" };

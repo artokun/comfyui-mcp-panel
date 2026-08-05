@@ -6232,8 +6232,9 @@ function hasRawMissingAssetCandidates() {
 // promise itself keeps running (the coalescer owns it) and benefits a later
 // call.
 // Resolves to the refresh's OWN freshness verdict (registerComfyNodeDefs' verdict
-// is refreshed:true only when it authoritatively fetched /object_info AND refreshed
-// combos), or FALSE if the refresh errored or the timeout wins first. get_errors
+// is refreshed:true only when it authoritatively fetched /object_info, registered
+// the defs, AND refreshed combos), or FALSE if the refresh errored or the timeout
+// wins first. get_errors
 // trusts the combo on this returned value — NOT the shared nodeDefsRefreshConfirmed
 // global, which a concurrent refresh can overwrite mid-await against a stale combo
 // (codex round-5/6 P0). Never rejects; a timeout or failure falls to FALSE ⇒

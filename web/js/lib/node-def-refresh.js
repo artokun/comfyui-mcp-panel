@@ -20,6 +20,7 @@ export const NODE_DEF_REFRESH_REASONS = Object.freeze({
   OBJECT_INFO_UNAVAILABLE: "object_info_unavailable",
   OBJECT_INFO_FETCH_FAILED: "object_info_fetch_failed",
   REGISTER_FAILED: "register_failed",
+  REGISTER_API_ABSENT: "register_api_absent",
   COMBO_API_ABSENT: "combo_api_absent",
   COMBO_REFRESH_FAILED: "combo_refresh_failed",
 });
@@ -103,17 +104,32 @@ export function describeNodeDefRefresh({
         "ComfyUI tab.",
     };
   }
+  if (!defsRegistered) {
+    // Registration never RAN (a frontend without registerNodesFromDefs) — the
+    // whole point of the tool for a pack install is defeated, so this is its own
+    // reason, never a silent refreshed:true (codex gate r3). Combos may still
+    // have refreshed; say so when they did.
+    return {
+      refreshed: false,
+      reason: NODE_DEF_REFRESH_REASONS.REGISTER_API_ABSENT,
+      remedy:
+        "A fresh /object_info was fetched, but this frontend exposes no registerNodesFromDefs, " +
+        "so the new/updated node definitions were NOT registered in place." +
+        (comboRan ? " The combo dropdown lists WERE refreshed from it." : "") +
+        " Reload the ComfyUI tab so the frontend picks up the new definitions; if they are " +
+        "still missing after a reload, this frontend build predates the registration API and " +
+        "ComfyUI needs an update.",
+    };
+  }
   if (!comboApiPresent) {
     return {
       refreshed: false,
       reason: NODE_DEF_REFRESH_REASONS.COMBO_API_ABSENT,
       remedy:
         "This ComfyUI frontend build has no refreshComboInNodes API, so combo lists cannot be " +
-        `rebuilt in place. ${registrationClause}` +
-        (defsRegistered
-          ? " — only the combo dropdowns may be stale, and those refresh on a tab reload (reload " +
-            "the ComfyUI page or press R in it)."
-          : ". Reload the ComfyUI tab so both rebuild."),
+        "rebuilt in place. Node definitions WERE re-registered from a fresh /object_info — only " +
+        "the combo dropdowns may be stale, and those refresh on a tab reload (reload the ComfyUI " +
+        "page or press R in it).",
     };
   }
   if (!comboRan) {

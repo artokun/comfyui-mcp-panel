@@ -62,17 +62,24 @@ export async function confirmCanvasNavigation({
     }
     if (landed) {
       everLanded = true;
+      let probePassed = false;
       try {
         assertBound();
-        // The probe can itself MOVE the canvas — getGraphCtx's verified rebind
-        // heal repaints a provably content-free ghost to root — so a landing
-        // only counts as settled if the canvas is STILL on the target after
-        // the probe (codex gate r2 P1). Otherwise keep polling: it may re-land.
-        if (readCanvasGraph() === target) {
-          return { landed: true, everLanded: true, bound: true, lastError: null };
-        }
+        probePassed = true;
       } catch (e) {
         lastError = e;
+      }
+      // Re-read after EVERY probe, pass or throw: the probe can MOVE the canvas
+      // (getGraphCtx's verified rebind heal repaints a provably content-free
+      // ghost to root) on either outcome, and the terminal verdict must
+      // describe the LAST observation, not the pre-probe one (codex r2/r3).
+      try {
+        landed = readCanvasGraph() === target;
+      } catch {
+        landed = false;
+      }
+      if (probePassed && landed) {
+        return { landed: true, everLanded: true, bound: true, lastError: null };
       }
     }
     if (attempt + 1 < tries) await sleep(intervalMs);

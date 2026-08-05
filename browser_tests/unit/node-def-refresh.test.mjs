@@ -32,6 +32,7 @@ test("#635: a fully successful run is refreshed with no failure fields", () => {
   const v = describeNodeDefRefresh({
     appAvailable: true,
     defsObtained: true,
+    defsRegistered: true,
     comboApiPresent: true,
     comboRan: true,
   });
@@ -104,6 +105,8 @@ test("#635: the stuck case from the issue — combo API absent — says defs DID
 });
 
 test("#635: registration is claimed ONLY when the call observably ran (codex r2 P1)", () => {
+  // No registration API at all → its own reason, never a silent refreshed:true
+  // (codex r3), and never a fabricated "WERE re-registered".
   const v = describeNodeDefRefresh({
     appAvailable: true,
     defsObtained: true,
@@ -112,9 +115,20 @@ test("#635: registration is claimed ONLY when the call observably ran (codex r2 
     comboRan: false,
   });
   assert.equal(v.refreshed, false);
+  assert.equal(v.reason, NODE_DEF_REFRESH_REASONS.REGISTER_API_ABSENT);
   assert.doesNotMatch(v.remedy, /WERE re-registered/, "no fabricated registration claim");
   assert.match(v.remedy, /NOT registered/);
   assert.match(v.remedy, /reload the ComfyUI tab/i);
+
+  const combosRan = describeNodeDefRefresh({
+    appAvailable: true,
+    defsObtained: true,
+    defsRegistered: false,
+    comboApiPresent: true,
+    comboRan: true,
+  });
+  assert.equal(combosRan.reason, NODE_DEF_REFRESH_REASONS.REGISTER_API_ABSENT);
+  assert.match(combosRan.remedy, /combo dropdown lists WERE refreshed/, "a true partial success is still said");
 
   const thrown = describeNodeDefRefresh({
     appAvailable: true,
@@ -149,6 +163,7 @@ test("#635: a present-but-not-run combo API with no throw fails closed, never cl
   const v = describeNodeDefRefresh({
     appAvailable: true,
     defsObtained: true,
+    defsRegistered: true,
     comboApiPresent: true,
     comboRan: false,
   });
@@ -280,4 +295,133 @@ test("#635: the shipping registerComfyNodeDefs returns its verdict through the p
     /nodeDefsRefreshConfirmed = !thrown && !!defs && comboRan;/,
     "the shared global stays a strict boolean (concurrent-run trust gate unchanged)",
   );
+});
+
+// ---------------------------------------------------------------------------
+// The SHIPPING registerComfyNodeDefs, extracted and driven end-to-end with
+// doubles (codex gate r3: the verdict unit tests + executor extraction alone
+// did not prove the real registration function produces those verdicts)
+// ---------------------------------------------------------------------------
+
+/** Balanced-brace extraction of a top-level function by its declaration marker. */
+function extractFunction(marker) {
+  const start = SRC.indexOf(marker);
+  assert.notEqual(start, -1, `${marker} not found`);
+  const open = SRC.indexOf("{", start);
+  let depth = 0;
+  for (let i = open; i < SRC.length; i += 1) {
+    const ch = SRC[i];
+    if (ch === "/" && SRC[i + 1] === "/") {
+      i = SRC.indexOf("\n", i + 2);
+      if (i < 0) break;
+      continue;
+    }
+    if (ch === "/" && SRC[i + 1] === "*") {
+      i = SRC.indexOf("*/", i + 2);
+      if (i < 0) break;
+      i += 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      for (i += 1; i < SRC.length; i += 1) {
+        if (SRC[i] === "\\") {
+          i += 1;
+          continue;
+        }
+        if (SRC[i] === quote) break;
+      }
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    if (ch === "}" && --depth === 0) return SRC.slice(start, i + 1);
+  }
+  throw new Error(`unterminated function: ${marker}`);
+}
+
+function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
+  const body = extractFunction("async function registerComfyNodeDefs(");
+  const factory = new Function(
+    "app",
+    "api",
+    "recordObjectInfoTypes",
+    "reapplyDefsToLiveNodes",
+    "describeNodeDefRefresh",
+    `let nodeDefsRefreshConfirmed = false;
+     ${body}
+     return { registerComfyNodeDefs, getConfirmed: () => nodeDefsRefreshConfirmed };`,
+  );
+  return factory(
+    appValue,
+    apiValue,
+    () => ({}),
+    () => {},
+    describeNodeDefRefresh,
+  );
+}
+
+const FULL_APP = {
+  graph: null,
+  registerNodesFromDefs: async () => {},
+  refreshComboInNodes: async () => {},
+};
+
+test("#635: the shipping register run with no obtainable /object_info reports object_info_unavailable", async () => {
+  const { registerComfyNodeDefs, getConfirmed } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: { getNodeDefs: async () => null },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.refreshed, false);
+  assert.equal(verdict.reason, "object_info_unavailable", "the common no-defs case names its cause");
+  assert.match(verdict.remedy, /retry/i);
+  assert.equal(getConfirmed(), false, "the shared trust global stays false");
+});
+
+test("#635: the shipping register run end-to-end success reports refreshed", async () => {
+  const { registerComfyNodeDefs, getConfirmed } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.deepEqual(verdict, { refreshed: true, reason: "refreshed" });
+  assert.equal(getConfirmed(), true);
+});
+
+test("#635: the shipping run on a combo-API-absent frontend claims registration only because it RAN", async () => {
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: { graph: null, registerNodesFromDefs: async () => {} }, // no refreshComboInNodes
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.reason, "combo_api_absent");
+  assert.match(verdict.remedy, /WERE re-registered/, "registration did run here, so the claim is true");
+});
+
+test("#635: the shipping run on a registerNodesFromDefs-absent frontend does NOT claim registration", async () => {
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: { graph: null, refreshComboInNodes: async () => {} }, // no registerNodesFromDefs
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.refreshed, false);
+  assert.equal(verdict.reason, "register_api_absent");
+  assert.doesNotMatch(verdict.remedy, /WERE re-registered/, "no fabricated registration claim");
+  assert.match(verdict.remedy, /NOT registered/);
+  assert.match(verdict.remedy, /combo dropdown lists WERE refreshed/, "the combo half did run — disclosed");
+});
+
+test("#635: the shipping run attributes a getNodeDefs throw to the fetch, with detail", async () => {
+  const { registerComfyNodeDefs, getConfirmed } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: {
+      getNodeDefs: async () => {
+        throw new Error("fetch failed");
+      },
+    },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.reason, "object_info_fetch_failed");
+  assert.match(verdict.detail, /fetch failed/);
+  assert.equal(getConfirmed(), false);
 });
