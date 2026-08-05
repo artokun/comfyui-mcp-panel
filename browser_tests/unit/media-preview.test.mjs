@@ -257,7 +257,7 @@ test("a video the browser cannot decode degrades with a reason and a remedy", as
   const h = harness({ buildVideoStoryboard: async () => null });
   const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
   assert.equal(reply.previews.length, 0);
-  assert.match(reply.note, /could not be decoded or seeked/);
+  assert.match(reply.note, /could be decoded, seeked and painted/);
   assert.match(reply.note, /call get_image with filename "reference_clip\.mp4"/);
 });
 
@@ -290,7 +290,11 @@ test("a PARTIALLY sampled sheet reports what was sampled, not the grid capacity"
   assert.equal(reply.previews[0].frames, 3);
   assert.equal(reply.previews[0].cells, 20);
   assert.match(reply.note, /contact sheet of 20 cells, 3 of which hold a sampled frame/);
-  assert.match(reply.note, /the other 17 could not be seeked and are blank/);
+  // The builder blanks a cell when the SEEK fails and when the DRAW fails after
+  // a successful seek, and it does not distinguish them — so naming a cause
+  // would hand the agent a diagnosis nothing observed.
+  assert.match(reply.note, /the other 17 could not be captured and are blank/);
+  assert.doesNotMatch(reply.note, /could not be seeked/);
   assert.match(reply.note, /do not describe the video as 3 frames long/);
   assert.doesNotMatch(reply.note, /a 20-frame contact sheet/);
   // The builder aims at even spacing but SKIPS unseekable positions, so the
@@ -470,7 +474,7 @@ test("a throwing logger does not become the failure it was logging", async () =>
   });
   const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
   assert.equal(reply.ok, true);
-  assert.match(reply.note, /could not be decoded or seeked/);
+  assert.match(reply.note, /could be decoded, seeked and painted/);
 });
 
 test("a painter that settles LATER is reported unconfirmed, not counted as shown", async () => {

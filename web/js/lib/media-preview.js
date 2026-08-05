@@ -135,16 +135,23 @@ function sizeClause(sizeBytes, humanizeBytes) {
  * How to describe the sheet's cells truthfully.
  *
  * `cells` is the grid's capacity; `frames` is how many of them a frame was
- * actually drawn into. They differ whenever a seek failed, and reporting the
- * capacity as the sample count is a fabricated observation of exactly the kind
- * this module exists to prevent — so when they differ, both are stated.
+ * actually drawn into. They differ whenever a cell could not be filled, and
+ * reporting the capacity as the sample count is a fabricated observation of
+ * exactly the kind this module exists to prevent — so when they differ, both
+ * are stated.
+ *
+ * The REASON a cell is blank is deliberately not named. The builder skips a
+ * cell when a seek fails AND when the draw fails after a successful seek, and
+ * it does not distinguish the two — so "could not be seeked" would be a
+ * fabricated diagnosis in the second case, handed to an agent that will repeat
+ * it. "Could not be captured" is what is actually known.
  */
 function sheetClause(frames, cells) {
   if (Number.isFinite(cells) && cells > frames) {
     const blank = cells - frames;
     return (
       `a contact sheet of ${cells} cells, ${frames} of which hold a sampled frame ` +
-      `(the other ${blank} could not be seeked and are blank — judge nothing from them)`
+      `(the other ${blank} could not be captured and are blank — judge nothing from them)`
     );
   }
   return `a ${frames}-frame contact sheet`;
@@ -166,7 +173,7 @@ function spacingClause(frames, cells) {
   }
   return (
     `Those ${frames} frames are SAMPLES taken at whichever of the planned, evenly-spaced ` +
-    `positions could be seeked — the ones that survived may be CLUSTERED rather than spread ` +
+    `positions could be captured — the ones that survived may be CLUSTERED rather than spread ` +
     `across the video, so do not assume they cover it`
   );
 }
@@ -568,7 +575,7 @@ async function produceSheet(job, deps) {
         ref: null,
         frames: null,
         cells: null,
-        why: "its frames could not be decoded or seeked in this browser",
+        why: "not one of its frames could be decoded, seeked and painted in this browser",
       };
     }
     const base = job.name.replace(/\.[^.]+$/, "") || "video";
