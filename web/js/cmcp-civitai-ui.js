@@ -287,8 +287,9 @@ export function serializeCivitaiResults(source, { model = false, limit = 20, loa
 
 /** Build the `state.error` object reported by panel_civitai_results (#190).
  *  The client throws Errors carrying an HTTP `status` for upstream CivitAI
- *  failures; a browser→proxy transport failure (#599) carries `kind:"transport"`
- *  and status null (no HTTP response came back); a true empty result sets NO
+ *  failures; a transport failure (#599) carries `kind:"transport"` and status
+ *  null, meaning NO HTTP response was received and the failing hop is
+ *  UNDETERMINED (it does not rule CivitAI out); a true empty result sets NO
  *  error at all. Pure and exported for unit tests. */
 export function civitaiErrorState(e) {
   const status = e && typeof e.status === "number" ? e.status : null;
@@ -701,8 +702,8 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         sentinel.textContent = "CivitAI error: " + (e.message || e);
         // Record the failure so the agent-facing panel_civitai_results can report
         // a distinct error state instead of an indistinguishable total:0 (#190);
-        // kind:"transport" marks a browser→proxy failure — no HTTP response
-        // came back (#599, see civitaiErrorState).
+        // kind:"transport" marks a failure where no HTTP response was received
+        // at all; which hop failed is undetermined (#599, civitaiErrorState).
         state.error = civitaiErrorState(e);
       }
     } finally {

@@ -84,14 +84,17 @@ test("#417: _request throws a timeout error when the proxy never settles", async
   }
 });
 
-// ---- #599: browser→proxy transport failures ("Failed to fetch", no status) --
-// A bare TypeError from fetch means no HTTP response came back from the
-// ComfyUI-side proxy — CivitAI is not the cause. The proxy call is always a
-// POST, which Chrome won't self-retry on a stale keep-alive connection, so the
-// client does ONE retry for idempotent specs (GETs, plus the read-only Meili
-// multi-search POST, which is flagged idempotent at the call site), then throws
-// a CLASSIFIED transport error (kind:"transport", status:null) naming the real
-// failed hop — never the browser's bare "Failed to fetch" alone.
+// ---- #599: transport failures ("Failed to fetch", no HTTP status) -----------
+// A bare TypeError from fetch establishes exactly one thing: the browser
+// obtained NO HTTP response. It does not identify which leg failed and it does
+// NOT rule CivitAI out — a request that reached ComfyUI whose own upstream
+// CivitAI call then failed rejects identically. So the thrown error must report
+// the cause as UNDETERMINED and list candidates, never assert one hop.
+// The proxy call is always a POST, which Chrome won't self-retry on a stale
+// keep-alive connection, so the client does ONE retry for idempotent specs
+// (GETs, plus the read-only Meili multi-search POST, which is flagged
+// idempotent at the call site), then throws a CLASSIFIED transport error
+// (kind:"transport", status:null) carrying the FULL attempt trail.
 
 test("#599: a transient transport failure on an idempotent request is retried once", async () => {
   let calls = 0;
@@ -122,15 +125,111 @@ test("#599: a persistent transport failure throws a classified transport error",
     (err) => {
       assert.equal(err.kind, "transport");
       assert.equal(err.status, null); // no HTTP response ever existed
-      // The reason, not just the state: the failed hop is browser→ComfyUI
-      // proxy, and the original browser text is preserved for diagnosis.
-      assert.match(err.message, /browser→ComfyUI hop/);
+      // The observation is preserved…
       assert.match(err.message, /Failed to fetch/);
-      assert.match(err.message, /not an empty result/);
+      // …and the one thing that IS established: no HTTP status came back, so
+      // this cannot be read as a confirmed empty result.
+      assert.match(err.message, /not a confirmed empty result/);
       return true;
     },
   );
   assert.equal(calls, 2); // one bounded retry, then give up
+});
+
+// The defect this repo keeps re-growing: an opaque bucket narrated as a CAUSE.
+// "Failed to fetch" is the browser's single bucket for network failure, CORS,
+// a blocked request, DNS, offline and abort. The rejection below happens AFTER
+// the request reached ComfyUI — ComfyUI's own upstream CivitAI call failed and
+// no response made it back — and it is byte-identical to a ComfyUI-unreachable
+// rejection. The error must therefore say the hop is UNDETERMINED and must NOT
+// tell the user CivitAI has been excluded, or they rule out the actual cause.
+test("#599: a rejection that occurred AFTER reaching ComfyUI is reported as undetermined, not as 'not a CivitAI error'", async () => {
+  const client = new CivitaiClient({
+    fetchApi: async () => {
+      // ComfyUI accepted the request and its OWN upstream CivitAI call failed;
+      // the response connection dropped before any status reached the browser.
+      throw new TypeError("Failed to fetch");
+    },
+    apiURL: (p) => p,
+  });
+  await assert.rejects(
+    () => client._request({ url: "https://civitai.red/api/v1/models" }),
+    (err) => {
+      // States the cause is not established…
+      assert.match(err.message, /could NOT be determined/);
+      // …explicitly does not exclude CivitAI, and names it as a live candidate.
+      assert.match(err.message, /does not rule CivitAI out/);
+      assert.match(err.message, /ComfyUI did reach CivitAI/);
+      // …and never asserts a single hop as the diagnosis.
+      assert.doesNotMatch(err.message, /not a CivitAI error/i);
+      assert.doesNotMatch(err.message, /failed at the browser→ComfyUI hop/i);
+      return true;
+    },
+  );
+});
+
+// Never destroy evidence before it can be reported: attempt 1 can carry the
+// actionable error and attempt 2 an unrelated one. If only the retry's message
+// survives, the diagnosis of an intermittent failure is lost.
+test("#599: the retry does not discard the first attempt's error", async () => {
+  let calls = 0;
+  const client = new CivitaiClient({
+    fetchApi: async () => {
+      calls++;
+      if (calls === 1) throw new TypeError("blocked by a browser extension");
+      throw new TypeError("NetworkError when attempting to fetch resource");
+    },
+    apiURL: (p) => p,
+  });
+  await assert.rejects(
+    () => client._request({ url: "https://civitai.red/api/v1/models" }),
+    (err) => {
+      // BOTH failures are reported, and which is which is unambiguous.
+      assert.match(err.message, /attempt 1 failed with: blocked by a browser extension/);
+      assert.match(err.message, /the retry then failed with: NetworkError when attempting to fetch resource/);
+      // The original error object itself survives for programmatic callers.
+      assert.equal(err.cause?.message, "blocked by a browser extension");
+      return true;
+    },
+  );
+  assert.equal(calls, 2);
+});
+
+// Same evidence rule when the retry is cut short by the #417 abort budget
+// rather than by another transport rejection.
+test("#599: a timeout after a failed first attempt still reports that first error", async () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    let calls = 0;
+    const client = new CivitaiClient({
+      fetchApi: (_path, opts) => {
+        calls++;
+        if (calls === 1) return Promise.reject(new TypeError("blocked by a browser extension"));
+        return new Promise((_resolve, reject) => {
+          opts.signal.addEventListener("abort", () => {
+            const e = new Error("The operation was aborted");
+            e.name = "AbortError";
+            reject(e);
+          });
+        });
+      },
+      apiURL: (p) => p,
+    });
+    const pending = client._request({ url: "https://civitai.red/api/v1/models" });
+    await Promise.resolve(); // let attempt 1 reject and attempt 2 start
+    mock.timers.tick(CIVITAI_REQUEST_TIMEOUT_MS + 1);
+    await assert.rejects(
+      () => pending,
+      (err) => {
+        assert.match(err.message, /timed out after \d+ seconds/i);
+        assert.match(err.message, /blocked by a browser extension/);
+        assert.equal(err.cause?.message, "blocked by a browser extension");
+        return true;
+      },
+    );
+  } finally {
+    mock.timers.reset();
+  }
 });
 
 test("#599: a transport failure on a non-idempotent (POST) request is NOT retried", async () => {
