@@ -22748,15 +22748,15 @@ function buildPanel() {
       // openExternalUrl, not window.location: in the ComfyUI desktop app an in-frame
       // navigation hijacks the whole window with no way back.
       //
-      // The note does NOT say the docs opened. Opening happens in a desktop bridge
-      // or a popup, and neither reports back — a popup blocker or a refusing bridge
-      // is invisible from here, so "Opening the docs…" would be a state we never
-      // observed. It states the URL instead, which is both true and the remedy: if
-      // nothing appeared, the address the user needs is right there in the
-      // transcript to copy.
+      // The note claims NOTHING about what happened. Neither destination reports
+      // back — the desktop bridge hands off to the system browser, the web build
+      // opens a popup — so "opening" and "in a new tab" would both be states we
+      // never observed, and the second is simply wrong on desktop. What is left is
+      // the URL (true unconditionally) and a conditional remedy that costs nothing
+      // if it did open and rescues the user if it did not.
       run: () => {
         openExternalUrl(DOCS_URL);
-        appendSystem(`Docs: ${DOCS_URL} — opening in a new tab; if nothing opened, copy that address.`);
+        appendSystem(`Docs: ${DOCS_URL} — if nothing opened, copy that address.`);
       },
     },
     {
