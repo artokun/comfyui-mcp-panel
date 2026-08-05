@@ -642,6 +642,134 @@ test("waitForQueueDrain (real panel source) returns a drained status without Ref
 });
 
 // ---------------------------------------------------------------------------
+// #671 — the install verification must fit inside the orchestrator's reply
+// window. panel_install_node relays nodes_install with a 30s timeout, but
+// verifyInstalled waited on waitForQueueDrain's 120s default: any install whose
+// Manager queue had not drained within ~30s (a real clone + pip-deps install
+// routinely takes longer) never replied, and the orchestrator reported
+// `did not reply to "nodes_install" within 30000 ms` on a LIVE canvas while the
+// install was proceeding. The fix bounds the whole verification (drain wait +
+// installed-list read) by INSTALL_VERIFY_BUDGET_MS and lets the honest
+// "unverified/pending" result (with ui_id, pollable via panel_node_queue_status)
+// reach the caller in time.
+// ---------------------------------------------------------------------------
+
+// Compose the REAL boundedDelay + waitForQueueDrain + verifyInstalled sources
+// with injected Manager clients, mirroring the extraction style above. The
+// injected budget keeps the test fast WITHOUT touching the timing assertions:
+// verifyInstalled closes over INSTALL_VERIFY_BUDGET_MS, so the factory passes a
+// small stand-in — the drain-loop arithmetic under test is the panel's own.
+function loadVerifyInstalled({ budgetMs, get }) {
+  const src = readFileSync(
+    fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
+    "utf8",
+  );
+  const delayMatch = src.match(/function boundedDelay\([\s\S]*?\n\}/);
+  const waitMatch = src.match(/async function waitForQueueDrain\([\s\S]*?\n\}/);
+  const verifyMatch = src.match(/async function verifyInstalled\([\s\S]*?\n\}/);
+  assert.ok(delayMatch && waitMatch && verifyMatch,
+    "could not locate boundedDelay / waitForQueueDrain / verifyInstalled in panel source");
+  const managerGet = async () => { throw new Error("managerGet must not be called (get is always passed)"); };
+  const factory = new Function(
+    "queueDrained",
+    "classifyInstallOutcome",
+    "managerGet",
+    "managerV2",
+    "managerCall",
+    "MANAGER_FETCH_TIMEOUT_MS",
+    "INSTALL_VERIFY_BUDGET_MS",
+    "AbortSignal",
+    `${delayMatch[0]}\n${waitMatch[0]}\n${verifyMatch[0]}\nreturn verifyInstalled;`,
+  );
+  return factory(
+    queueDrained,
+    classifyInstallOutcome,
+    managerGet,
+    get, // dialect "v2" routes through managerV2
+    async () => { throw new Error("managerCall must not be called on the v2 dialect"); },
+    15000,
+    budgetMs,
+    AbortSignal,
+  );
+}
+
+test("#671 verifyInstalled (real panel source) answers 'unverified' inside the reply window when the queue never drains", async () => {
+  // A Manager that is alive but whose queue stays busy — the issue's exact
+  // scenario: the canvas is responsive, the install is genuinely still running.
+  // The installed-list read HANGS (signal-aware): the ONE shared deadline must
+  // cap it at whatever budget the drain wait left, not at a fresh 15s.
+  const get = (route, opts) => {
+    if (route === "manager/queue/status") {
+      return Promise.resolve({ is_processing: true, done_count: 0, total_count: 1 });
+    }
+    if (route === "customnode/installed") {
+      return new Promise((_, reject) => {
+        opts?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+    }
+    return Promise.reject(new Error(`unexpected route ${route}`));
+  };
+  const verifyInstalled = loadVerifyInstalled({ budgetMs: 2500, get });
+  const started = Date.now();
+  const outcome = await verifyInstalled("ComfyUI-MelBandRoFormer", "v2", {});
+  const elapsed = Date.now() - started;
+
+  // The reply must leave the tab WELL inside the orchestrator's 30s window.
+  // Expected ~budget + the ≤1s capped list read. A missing drain budget waits
+  // 120s; a list read on its own fresh 15s timeout (no shared deadline) waits
+  // ~17.5s — both mutants blow this bound. (10s, not tighter: loaded machines
+  // overrun timers — the suite has seen a 5s budget take 10.4s.)
+  assert.ok(elapsed < 10000, `verification outlived its budget (${elapsed} ms)`);
+  // Assert the REASON, not just the state: not-drained is an honest
+  // "still in progress", never a fabricated success or failure.
+  assert.equal(outcome.state, "unverified");
+  assert.match(outcome.message, /still in progress/);
+  assert.match(outcome.message, /panel_node_queue_status/);
+});
+
+test("#671 verifyInstalled (real panel source) still verifies a fast-draining install", async () => {
+  // Positive control: a queue that drains immediately and a list that contains
+  // the pack must still reach "installed" — the budget only converts SLOW
+  // verifications to "pending", it must not degrade the fast path.
+  const get = async (route) => {
+    if (route === "manager/queue/status") {
+      return { is_processing: false, done_count: 1, total_count: 1 };
+    }
+    if (route === "customnode/installed") {
+      return { "ComfyUI-MelBandRoFormer": { ver: "1.0.0", cnr_id: "ComfyUI-MelBandRoFormer" } };
+    }
+    throw new Error(`unexpected route ${route}`);
+  };
+  const verifyInstalled = loadVerifyInstalled({ budgetMs: 3000, get });
+  const outcome = await verifyInstalled("ComfyUI-MelBandRoFormer", "v2", {});
+  assert.equal(outcome.state, "installed");
+});
+
+// Fast wiring guard: the behavioral test above catches a reverted budget only
+// after waiting out the mutant's 120s drain. Pin the budget pass-through at
+// source level too, so a regression fails in milliseconds — the same style as
+// the #486/#485 wiring guards below.
+test("#671 verifyInstalled passes a sub-30s budget to waitForQueueDrain (wiring)", () => {
+  const src = readFileSync(
+    fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
+    "utf8",
+  );
+  const constMatch = src.match(/const INSTALL_VERIFY_BUDGET_MS = (\d+);/);
+  assert.ok(constMatch, "INSTALL_VERIFY_BUDGET_MS must be defined");
+  assert.ok(
+    Number(constMatch[1]) < 30000,
+    `verify budget (${constMatch[1]} ms) must fit inside the orchestrator's 30s reply window`,
+  );
+  const verifyMatch = src.match(/async function verifyInstalled\([\s\S]*?\n\}/);
+  assert.ok(verifyMatch, "could not locate verifyInstalled in panel source");
+  assert.match(
+    verifyMatch[0],
+    /waitForQueueDrain\(\{\s*timeoutMs: INSTALL_VERIFY_BUDGET_MS/,
+    "verifyInstalled must bound the drain wait by INSTALL_VERIFY_BUDGET_MS",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // #486 / #485 — legacy Manager 3.x install dialect. The install runtime lives in
 // comfyui-mcp-panel.js (managerQueueControl + nodes_install); we extract the real
 // source and assert its wiring so the fixes can't silently regress.

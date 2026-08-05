@@ -4166,6 +4166,19 @@ async function waitForQueueDrain({ timeoutMs = 120000, intervalMs = 1500, get = 
   return status; // deadline hit
 }
 
+/** Budget for the post-enqueue install verification (#671). Bounded well under
+ *  the orchestrator's per-command reply timeout (panel_install_node relays
+ *  nodes_install with 30s) so a genuine, slow install — cloning a pack and
+ *  installing its pip deps routinely outlives 30s — reports an honest
+ *  "unverified/pending" with the ui_id to poll (panel_node_queue_status)
+ *  instead of the reply never leaving the tab: the orchestrator then reported
+ *  `did not reply to "nodes_install" within 30000 ms` on a LIVE, responsive
+ *  canvas while the install was proceeding fine. A bounded verify can only
+ *  degrade a verified success to "pending" — classifyInstallOutcome asserts
+ *  failure ONLY on a positively-drained queue, so the budget can never
+ *  manufacture a false failure. Mirrors UPDATE_VERIFY_BUDGET_MS (#364). */
+const INSTALL_VERIFY_BUDGET_MS = 15000;
+
 /**
  * After an install is queued+started, resolve the TRUE outcome (#232 / codex
  * rounds 1-2). Waits for the queue to drain (bounded), reads the installed-nodes
@@ -4174,6 +4187,10 @@ async function waitForQueueDrain({ timeoutMs = 120000, intervalMs = 1500, get = 
  * the raw values — no false drain, no false-readable). `batchFailed` carries the
  * synchronous v2-batch `failed[]` as failure EVIDENCE (still gated by the
  * tri-state — never an early throw). Returns { state, status, message }.
+ *
+ * ONE shared deadline covers the drain wait AND the list read (#671): the whole
+ * verification must fit inside the orchestrator's reply window, or the reply —
+ * success or honest "pending" — never reaches the caller.
  */
 async function verifyInstalled(target, dialect, { batchFailed, renameProne } = {}) {
   // Pin the status/list reads to the dialect the install ACTUALLY landed on. In
@@ -4184,12 +4201,15 @@ async function verifyInstalled(target, dialect, { batchFailed, renameProne } = {
   // (codex P1).
   const get = (route, opts) =>
     dialect === "legacy" ? managerCall(route, opts) : managerV2(route, opts);
-  const status = await waitForQueueDrain({ get });
+  const deadline = Date.now() + INSTALL_VERIFY_BUDGET_MS;
+  const status = await waitForQueueDrain({ timeoutMs: INSTALL_VERIFY_BUDGET_MS, get });
   let installed = null;
   let listError = false;
   try {
     installed = await get("customnode/installed", {
-      signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS),
+      signal: AbortSignal.timeout(
+        Math.max(1000, Math.min(MANAGER_FETCH_TIMEOUT_MS, deadline - Date.now())),
+      ),
     });
   } catch {
     listError = true;
