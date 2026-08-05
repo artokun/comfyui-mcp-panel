@@ -389,6 +389,44 @@ test("a painter that settles LATER is reported unconfirmed, not counted as shown
   await new Promise((r) => setImmediate(r));
 });
 
+test("the STORYBOARD SHEET's painter is guarded exactly like the batch pass's", async () => {
+  // A second, hand-rolled painter call is how this one ended up unguarded: it
+  // could reject after the fact, producing an unhandled rejection and a reply
+  // that quietly implied the user could see the sheet.
+  const rejections = [];
+  const onUnhandled = (err) => rejections.push(err);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const h = harness({ paintImage: () => Promise.reject(new Error("sheet DOM failure")) });
+    const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+    assert.equal(reply.previews.length, 1, "the agent's own copy is unaffected");
+    assert.match(reply.note, /could not be confirmed as shown/);
+    assert.match(reply.note, /Your own copy, below, is unaffected/);
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(rejections, [], "a deferred painter must not surface as an unhandled rejection");
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
+test("a sheet painter that THROWS is disclosed and still leaves the agent its copy", async () => {
+  const h = harness({
+    paintImage: () => {
+      throw new Error("DOM exploded");
+    },
+  });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+  assert.equal(reply.previews.length, 1);
+  assert.match(reply.note, /could not be shown\s+in the chat/);
+  assert.match(reply.note, /call get_image with filename "storyboard_reference_clip\.png"/);
+});
+
+test("a sheet that IS painted carries no visibility caveat", async () => {
+  const h = harness({ fetchMediaBytes: async () => OVERSIZED_BYTES });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+  assert.doesNotMatch(reply.note, /could not be (shown|confirmed as shown)/);
+});
+
 test("two videos are previewed independently — one wedged does not suppress the other", async () => {
   const second = { ...VIDEO_REF, viewRef: { ...VIDEO_REF.viewRef, filename: "other.mp4" } };
   const h = harness({
@@ -437,14 +475,29 @@ test("dataUrlByteLength reads the payload exactly, and refuses to guess otherwis
   assert.equal(dataUrlByteLength("/view?filename=a.mp4"), null, "not a data URL ⇒ unknown");
   assert.equal(dataUrlByteLength("data:video/mp4,raw"), null, "not base64 ⇒ unknown");
   assert.equal(dataUrlByteLength(null), null);
+  // UNPADDED bodies are legal in a data URL and the browser decodes them, so
+  // calling them unknown would be its own dishonesty in the other direction.
+  assert.equal(dataUrlByteLength("data:video/mp4;base64,AAA"), 2);
+  assert.equal(dataUrlByteLength("data:video/mp4;base64,AA"), 1);
+  assert.equal(dataUrlByteLength("data:video/mp4;base64,AAAAAA"), 4);
+  assert.equal(dataUrlByteLength("data:video/mp4;base64,AAAAA"), null, "trailing 1-char group");
+  // Cross-check the whole table against a real base64 decoder.
+  for (const body of ["AAAA", "AAA=", "AA==", "AAA", "AA", "AAAAAA"]) {
+    assert.equal(
+      dataUrlByteLength(`data:video/mp4;base64,${body}`),
+      Buffer.from(body, "base64").length,
+      `payload "${body}" must measure what it actually decodes to`,
+    );
+  }
   // MALFORMED payloads must be unknown, not measured. The arithmetic is happy
   // to measure nonsense, and a measured nonsense payload told the agent the
   // source video was a few bytes — an invented size.
-  assert.equal(dataUrlByteLength("data:video/mp4;base64,A"), null, "1 char is not a base64 group");
-  assert.equal(dataUrlByteLength("data:video/mp4;base64,AAA"), null, "3 chars is not a base64 group");
+  assert.equal(dataUrlByteLength("data:video/mp4;base64,A"), null, "1 char encodes nothing");
   assert.equal(dataUrlByteLength("data:video/mp4;base64,!!!!"), null, "not the base64 alphabet");
   assert.equal(dataUrlByteLength("data:video/mp4;base64,A==="), null, "3 pad chars is not base64");
   assert.equal(dataUrlByteLength("data:video/mp4;base64,AA=A"), null, "padding is trailing-only");
+  assert.equal(dataUrlByteLength("data:video/mp4;base64,AAAA="), null, "padding must complete a group");
+  assert.equal(dataUrlByteLength("data:video/mp4;base64,AAAA=="), null, "a full group needs no padding");
   assert.equal(dataUrlByteLength("data:video/mp4;base64,ab-_"), null, "base64url is not decoded here");
 });
 

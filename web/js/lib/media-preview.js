@@ -101,14 +101,20 @@ export function dataUrlByteLength(dataUrl) {
   if (!/^data:/i.test(head) || !/;base64$/i.test(head)) return null;
   const body = dataUrl.slice(comma + 1).replace(/\s+/g, "");
   if (!body) return 0;
-  // Standard base64 only: 4-character groups, the alphabet, and padding that
-  // appears only at the end. base64url (-_) deliberately measures as unknown
-  // rather than being decoded by a rule this function has not verified.
-  if (body.length % 4 !== 0) return null;
-  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(body)) return null;
-  const pad = body.endsWith("==") ? 2 : body.endsWith("=") ? 1 : 0;
-  const n = (body.length / 4) * 3 - pad;
-  return n >= 0 ? n : null;
+  // Standard base64: the alphabet, and padding only at the end. Padding is
+  // OPTIONAL — browsers decode an unpadded data URL body happily, so requiring
+  // a multiple of four would call a perfectly measurable payload unknown.
+  // base64url (-_) is deliberately unknown rather than decoded by a rule this
+  // function has not verified.
+  const m = /^([A-Za-z0-9+/]*)(={0,2})$/.exec(body);
+  if (!m) return null;
+  const chars = m[1].length;
+  const pad = m[2].length;
+  // A trailing group of one character encodes nothing; padding must complete a
+  // group, and a complete group needs none.
+  if (chars % 4 === 1) return null;
+  if (pad > 0 && ((chars + pad) % 4 !== 0 || chars % 4 === 0)) return null;
+  return Math.floor((chars * 3) / 4);
 }
 
 /** "72.1 MB" when known; an explicit statement of ignorance when not. */
@@ -142,6 +148,32 @@ function sheetClause(frames, cells) {
     );
   }
   return `a ${frames}-frame contact sheet`;
+}
+
+/**
+ * Call a painter without letting it throw OR reject.
+ *
+ * Returns "shown", "failed", or "unconfirmed". A painter that settles later
+ * cannot be confirmed from here, so it is neither counted as shown nor left to
+ * surface as an unhandled rejection. Both painting sites go through this — the
+ * batch pass and the storyboard sheet — because a second, hand-rolled copy is
+ * how the sheet's painter ended up unguarded in the first place.
+ */
+function safePaint(paint, url, caption, warn, what) {
+  let outcome;
+  try {
+    outcome = paint(url, caption);
+  } catch (err) {
+    warn("[cmcp] show_media: painting failed for", what, err);
+    return "failed";
+  }
+  if (outcome && typeof outcome.then === "function") {
+    outcome.then(null, (err) =>
+      warn("[cmcp] show_media: a deferred painter rejected for", what, err),
+    );
+    return "unconfirmed";
+  }
+  return "shown";
 }
 
 /** A ComfyUI ref written the way `get_image` takes its arguments. */
@@ -236,24 +268,13 @@ export async function composeShowMediaReply(items, deps = {}) {
       unrendered += 1;
       continue;
     }
-    let outcome;
-    try {
-      outcome = isVideo ? paintVideo(url, caption) : paintImage(url, caption);
-    } catch (err) {
-      note("[cmcp] show_media: painting failed for", name, err);
+    const shownState = safePaint(isVideo ? paintVideo : paintImage, url, caption, note, name);
+    if (shownState === "failed") {
       unrendered += 1;
       continue;
     }
-    if (outcome && typeof outcome.then === "function") {
-      // A painter that settles LATER cannot be confirmed from here, and an
-      // unconfirmed paint is not a paint. Swallow its rejection so it cannot
-      // surface as an unhandled rejection, and report it as unconfirmed rather
-      // than counting it as shown. The panel's own painters are synchronous.
-      outcome.then(null, (err) => note("[cmcp] show_media: async painter rejected for", name, err));
-      unconfirmed += 1;
-    } else {
-      painted += 1;
-    }
+    if (shownState === "unconfirmed") unconfirmed += 1;
+    else painted += 1;
     if (isVideo) {
       jobs.push({
         url,
@@ -441,12 +462,29 @@ async function buildSampledPreview(job, deps) {
   const n = outcome.frames;
   const cells = outcome.cells;
   // Show the human the same sheet the agent is being pointed at, so what the
-  // agent is judging from is visible in the chat next to the player.
+  // agent is judging from is visible in the chat next to the player. This
+  // painter is guarded exactly like the batch pass's: it can throw, and it can
+  // return a promise that rejects later.
+  let sheetShown;
   try {
-    paintImage(imageViewUrl(outcome.ref), `Storyboard · ${n} sampled frames`);
+    sheetShown = safePaint(
+      paintImage,
+      imageViewUrl(outcome.ref),
+      `Storyboard · ${n} sampled frames`,
+      warn,
+      `the storyboard sheet for ${job.name}`,
+    );
   } catch (err) {
-    warn("[cmcp] show_media: could not paint the storyboard sheet", err);
+    // imageViewUrl itself can throw; the sheet is still reachable via get_image.
+    warn("[cmcp] show_media: could not build a view URL for the storyboard sheet", err);
+    sheetShown = "failed";
   }
+  const sheetVisibility =
+    sheetShown === "shown"
+      ? ""
+      : ` (The sheet could not be ${sheetShown === "failed" ? "shown" : "confirmed as shown"} ` +
+        `in the chat, so the user may not be able to see what you are judging from — say so if you ` +
+        `discuss it. Your own copy, below, is unaffected.)`;
 
   return {
     preview: {
@@ -466,7 +504,8 @@ async function buildSampledPreview(job, deps) {
       `its duration, or its frame rate, so do not describe the video as ${n} frames long, and do not ` +
       `report anything about it that a ${n}-frame sample cannot show (audio, timing, brief events). ` +
       `Cells read left to right, top to bottom = start to end. ` +
-      `To actually look at the sheet, call get_image with ${refClause(outcome.ref, coerceMessageText)}.`,
+      `To actually look at the sheet, call get_image with ${refClause(outcome.ref, coerceMessageText)}.` +
+      sheetVisibility,
   };
 }
 

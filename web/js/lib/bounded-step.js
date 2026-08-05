@@ -85,6 +85,12 @@ export function withTimeout(promise, ms, onTimeout, timers = {}) {
       // that turns "bounded, degrades" into "pending forever", which is the one
       // outcome this helper exists to prevent. Fall back to the platform timer
       // (and its matching clear, since the injected pair no longer owns it).
+      //
+      // Stated plainly: if `setTimer` ARMED a timer and then threw, that timer
+      // is leaked — its handle was never returned, so nothing can clear it. The
+      // result is still correct (`fire` is idempotent via `settled`, so the late
+      // timer resolves nothing), and the cost is one stray timer. There is no
+      // way to recover a handle a thrower never yielded.
       try {
         t = setTimeout(fire, ms);
         clear = (h) => clearTimeout(h);
