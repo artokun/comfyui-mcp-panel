@@ -151,6 +151,27 @@ function sheetClause(frames, cells) {
 }
 
 /**
+ * Whether the surviving frames are actually spread across the video.
+ *
+ * The builder aims at evenly-spaced timestamps but SKIPS the ones it cannot
+ * seek, so a sheet missing cells is not a sample of the whole video — the
+ * frames it does hold may all sit near the start. Calling those "evenly-spaced
+ * samples across the video" claims coverage that was not observed, which is the
+ * same fabrication as calling the sheet the video, one level down. Only a sheet
+ * whose every planned cell was filled may claim even spacing.
+ */
+function spacingClause(frames, cells) {
+  if (Number.isFinite(cells) && frames === cells) {
+    return `Those ${frames} frames are evenly-spaced SAMPLES across the video`;
+  }
+  return (
+    `Those ${frames} frames are SAMPLES taken at whichever of the planned, evenly-spaced ` +
+    `positions could be seeked — the ones that survived may be CLUSTERED rather than spread ` +
+    `across the video, so do not assume they cover it`
+  );
+}
+
+/**
  * Call a painter without letting it throw OR reject.
  *
  * Returns "shown", "failed", or "unconfirmed". A painter that settles later
@@ -167,13 +188,23 @@ function safePaint(paint, url, caption, warn, what) {
     warn("[cmcp] show_media: painting failed for", what, err);
     return "failed";
   }
-  if (outcome && typeof outcome.then === "function") {
-    outcome.then(null, (err) =>
-      warn("[cmcp] show_media: a deferred painter rejected for", what, err),
-    );
+  // Reading and calling `.then` are themselves operations that can fail — a
+  // getter that throws, or a thenable whose `then` throws — and doing either
+  // outside the guard rejected the whole reply, which is the failure this
+  // helper exists to prevent.
+  let deferred = false;
+  try {
+    deferred = !!outcome && typeof outcome.then === "function";
+    if (deferred) {
+      outcome.then(null, (err) =>
+        warn("[cmcp] show_media: a deferred painter rejected for", what, err),
+      );
+    }
+  } catch (err) {
+    warn("[cmcp] show_media: a painter's own thenable threw for", what, err);
     return "unconfirmed";
   }
-  return "shown";
+  return deferred ? "unconfirmed" : "shown";
 }
 
 /** A ComfyUI ref written the way `get_image` takes its arguments. */
@@ -239,18 +270,22 @@ export async function composeShowMediaReply(items, deps = {}) {
   const list = Array.isArray(items) ? items : [];
   const jobs = [];
   let painted = 0;
-  let unrendered = 0;
   let unconfirmed = 0;
+  /** Items the user cannot see, each with the REASON it is missing. */
+  const dropped = [];
 
   // ── Paint pass ──────────────────────────────────────────────────────────
   // One item's painter throwing must not cost the whole batch its reply, and
   // must not be counted as painted — an item silently dropped is exactly the
-  // kind of thing the reply has to be honest about.
+  // kind of thing the reply has to be honest about. Each drop carries its own
+  // reason: "no usable source" is one specific cause, and using it for every
+  // cause sends the caller to re-send a file that was perfectly resolvable.
   for (const item of list) {
     const caption = text(item?.caption) || text(item?.filename) || "";
     const isVideo = isVideoShowMediaItem(item, text);
     let url = null;
     let ref = null;
+    let why = null;
     let name = text(item?.filename);
     if (item?.kind === "viewRef" && item?.viewRef) {
       ref = item.viewRef;
@@ -260,21 +295,34 @@ export async function composeShowMediaReply(items, deps = {}) {
       } catch (err) {
         note("[cmcp] show_media: could not build a view URL for", name, err);
         url = null;
+        why = "the panel could not build a view URL for its ComfyUI reference";
       }
     } else if (typeof item?.dataUrl === "string" && item.dataUrl) {
       url = item.dataUrl;
     }
     if (!url) {
-      unrendered += 1;
+      dropped.push({
+        name,
+        why:
+          why ??
+          "no usable source — it carried neither inline data nor a ComfyUI reference with a filename; re-send it as an absolute path or as such a reference",
+      });
       continue;
     }
     const shownState = safePaint(isVideo ? paintVideo : paintImage, url, caption, note, name);
     if (shownState === "failed") {
-      unrendered += 1;
-      continue;
+      dropped.push({
+        name,
+        why:
+          "the panel's own painter failed while putting it in the chat (the file itself resolved fine, so re-sending it unchanged will not help)",
+      });
+    } else if (shownState === "unconfirmed") {
+      unconfirmed += 1;
+    } else {
+      painted += 1;
     }
-    if (shownState === "unconfirmed") unconfirmed += 1;
-    else painted += 1;
+    // A video's sampled preview needs only the URL — not the chat player — so a
+    // painter failure must NOT also cost the agent its preview.
     if (isVideo) {
       jobs.push({
         url,
@@ -333,11 +381,11 @@ export async function composeShowMediaReply(items, deps = {}) {
     ` — this tool renders media for the person, not for you.`;
   noteSections.push(headline);
 
-  if (unrendered > 0) {
+  if (dropped.length > 0) {
     noteSections.push(
-      `${unrendered} of the ${list.length} requested item(s) could not be rendered at all ` +
-        `(no usable source), so the user did not see ${unrendered === 1 ? "it" : "them"} either. ` +
-        `Re-send ${unrendered === 1 ? "it" : "them"} as an absolute path or as a ComfyUI reference with a filename.`,
+      `${dropped.length} of the ${list.length} requested item(s) were NOT displayed, so the user ` +
+        `cannot see ${dropped.length === 1 ? "it" : "them"} either:\n` +
+        dropped.map((d) => `• ${d.name || "(unnamed item)"} — ${d.why}`).join("\n"),
     );
   }
 
@@ -500,7 +548,7 @@ async function buildSampledPreview(job, deps) {
     note:
       `📽️ ${job.name} — you were NOT shown this video. What exists for you is a SAMPLED PREVIEW of it: ` +
       `${sheetClause(n, cells)}, built in the browser (its ${size}). ` +
-      `Those ${n} frames are evenly-spaced SAMPLES across the video — they are NOT its frame count, ` +
+      `${spacingClause(n, cells)} — they are NOT its frame count, ` +
       `its duration, or its frame rate, so do not describe the video as ${n} frames long, and do not ` +
       `report anything about it that a ${n}-frame sample cannot show (audio, timing, brief events). ` +
       `Cells read left to right, top to bottom = start to end. ` +

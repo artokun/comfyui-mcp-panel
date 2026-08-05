@@ -293,6 +293,33 @@ test("a PARTIALLY sampled sheet reports what was sampled, not the grid capacity"
   assert.match(reply.note, /the other 17 could not be seeked and are blank/);
   assert.match(reply.note, /do not describe the video as 3 frames long/);
   assert.doesNotMatch(reply.note, /a 20-frame contact sheet/);
+  // The builder aims at even spacing but SKIPS unseekable positions, so the
+  // three that survived may all sit near the start. Claiming coverage that was
+  // not observed is the same fabrication one level down.
+  assert.doesNotMatch(reply.note, /evenly-spaced SAMPLES across the video/);
+  assert.match(reply.note, /may be CLUSTERED rather than spread/);
+});
+
+test("a COMPLETE sheet may claim even spacing; a partial one may not", async () => {
+  const complete = harness({ storyboardFrameCount: () => 20 });
+  const a = await composeShowMediaReply([VIDEO_REF], complete.deps);
+  assert.match(a.note, /Those 20 frames are evenly-spaced SAMPLES across the video/);
+
+  const partial = harness({ buildVideoStoryboard: async () => ({ size: 1, paintedFrames: 19 }) });
+  const b = await composeShowMediaReply([VIDEO_REF], partial.deps);
+  assert.doesNotMatch(b.note, /evenly-spaced SAMPLES across the video/);
+});
+
+test("an unknown grid capacity may not claim even spacing either", async () => {
+  const h = harness({ storyboardFrameCount: () => 0 });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+  assert.equal(reply.previews[0].cells, null);
+  assert.doesNotMatch(
+    reply.note,
+    /evenly-spaced SAMPLES across the video/,
+    "with no plan size, nothing establishes that no positions were skipped",
+  );
+  assert.match(reply.note, /may be CLUSTERED rather than spread/);
 });
 
 test("an unknown grid capacity still allows an honest N-sample description", async () => {
@@ -327,7 +354,7 @@ test("storyboard previews turned off is stated as the reason, not silently skipp
 
 // ── one item's failure must not eat the batch ──────────────────────────────
 
-test("one painter throwing costs that item only, and the reply says so", async () => {
+test("one painter throwing costs that item only, and the reply names the REAL reason", async () => {
   const h = harness();
   const boom = h.deps.paintImage;
   let n = 0;
@@ -346,7 +373,78 @@ test("one painter throwing costs that item only, and the reply says so", async (
   assert.equal(reply.ok, true);
   assert.equal(reply.painted, 1);
   assert.equal(reply.count, 2);
-  assert.match(reply.note, /1 of the 2 requested item\(s\) could not be rendered at all/);
+  assert.match(reply.note, /1 of the 2 requested item\(s\) were NOT displayed/);
+  assert.match(reply.note, /• bad\.png — the panel's own painter failed/);
+  assert.doesNotMatch(
+    reply.note,
+    /no usable source/,
+    "the file resolved fine — telling the caller to re-send it is a wrong remedy",
+  );
+});
+
+test("a VIDEO whose player fails to paint still gets its sampled preview", async () => {
+  // The storyboard needs the URL, not the chat player. Dropping the preview
+  // because the DOM failed would deny the agent the only thing it can see.
+  const h = harness({
+    paintVideo: () => {
+      throw new Error("video element exploded");
+    },
+    fetchMediaBytes: async () => OVERSIZED_BYTES,
+  });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+  assert.equal(reply.previews.length, 1, "a painter failure must not cost the preview");
+  assert.match(reply.note, /• reference_clip\.mp4 — the panel's own painter failed/);
+  assert.doesNotMatch(reply.note, /no usable source/);
+  assert.match(reply.note, /SAMPLED PREVIEW/);
+  assert.match(reply.note, /72\.1 MB/);
+});
+
+test("a viewRef whose URL cannot be built says THAT, not 'no usable source'", async () => {
+  const h = harness({
+    imageViewUrl: () => {
+      throw new Error("apiURL exploded");
+    },
+  });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+  assert.match(reply.note, /could not build a view URL for its ComfyUI reference/);
+  assert.doesNotMatch(reply.note, /no usable source/);
+});
+
+test("a painter whose returned object has a THROWING then getter still yields a reply", async () => {
+  // Merely READING `.then` is an operation that can fail. Doing it outside the
+  // guard rejected the whole reply.
+  const h = harness({
+    paintImage: () => ({
+      get then() {
+        throw new Error("then getter threw");
+      },
+    }),
+  });
+  const reply = await composeShowMediaReply(
+    [{ kind: "image", dataUrl: "data:image/png;base64,AAAA", filename: "a.png" }],
+    h.deps,
+  );
+  assert.equal(reply.ok, true);
+  assert.equal(reply.unconfirmed, 1);
+  assert.match(reply.note, /whether the user can see it is UNKNOWN/);
+});
+
+test("a painter that returns a thenable whose then() THROWS still yields a reply", async () => {
+  const h = harness({
+    paintImage: () => ({
+      then() {
+        throw new Error("then threw");
+      },
+    }),
+  });
+  const reply = await composeShowMediaReply(
+    [{ kind: "image", dataUrl: "data:image/png;base64,AAAA", filename: "a.png" }],
+    h.deps,
+  );
+  assert.equal(reply.ok, true);
+  assert.equal(reply.painted, 0);
+  assert.equal(reply.unconfirmed, 1);
+  assert.match(reply.note, /whether the user can see it is UNKNOWN/);
 });
 
 test("a throwing text coercer does not cost the agent its reply", async () => {
@@ -447,7 +545,8 @@ test("an item with no usable source is reported unrendered, not counted as shown
   const reply = await composeShowMediaReply([{ kind: "image", filename: "nothing.png" }], h.deps);
   assert.equal(reply.painted, 0);
   assert.equal(h.calls.paintedImages.length, 0);
-  assert.match(reply.note, /1 of the 1 requested item\(s\) could not be rendered at all/);
+  assert.match(reply.note, /1 of the 1 requested item\(s\) were NOT displayed/);
+  assert.match(reply.note, /• nothing\.png — no usable source/);
 });
 
 // ── classification + byte accounting ───────────────────────────────────────
