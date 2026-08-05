@@ -502,6 +502,15 @@ export const OPEN_PROOF_FIELD = "open_proof";
  * `extra` does: ComfyUI's `configure()` replaces `graph.extra` wholesale from the
  * data it is given, so nothing but that payload can put this value on the root.
  *
+ * ADDITIONAL evidence, NOT a replacement — and specifically NOT a superset of the
+ * uuid predicate, which is easy to assume and false: a root carrying
+ * `{ open_proof: M, workflow_uuid: "B" }` PASSES this for marker M while
+ * `graphRootWorkflowUuidMatches` correctly FAILS it for workflow A. The two answer
+ * different questions — this one "was the root configured by this attempt", that
+ * one "whose workflow is this" — and `resolveOpenRebindVerdict` requires BOTH.
+ * Reading this as the stronger check would licence dropping the identity one, which
+ * is how an overclaiming comment turns into a real hole several refactors later.
+ *
  * Absent or non-matching is NOT proof of a wrong canvas — it is absence of
  * proof. The caller must disclose it as such and must never widen it into a
  * claim about which workflow the canvas holds.
@@ -537,13 +546,18 @@ export const OPEN_REBIND_STATUS = Object.freeze({
  *   instance — the active workflow is still the tab we were asked to open. A tab
  *              switch during the load makes every other part describe a DIFFERENT
  *              canvas, so nothing else is meaningful without it.
- *   marker   — the live root was configured from THIS attempt's payload. Strictly
- *              stronger than the workflow uuid it supplements: the uuid can already
- *              be on the root from a previous load of the same tab or from the
- *              guard's own rebind heal (#545/#557/#565), so it cannot establish
- *              that this load landed. A single-use marker can.
+ *   marker   — the live root was configured from THIS attempt's payload. It answers
+ *              FRESHNESS, which the workflow uuid cannot: the uuid can already be on
+ *              the root from a previous load of the same tab or from the guard's own
+ *              rebind heal (#545/#557/#565), so it never established that this load
+ *              landed. It is NOT a superset of `identity` and must never be treated
+ *              as one — a root carrying this attempt's marker alongside a DIFFERENT
+ *              workflow's uuid passes here and fails `identity`, which is the whole
+ *              reason both are ANDed. Dropping either in a later refactor reopens a
+ *              hole the other does not cover.
  *   identity — the root carries the workflow uuid the command fence will compare,
- *              i.e. the desync fence is actually healed by this open.
+ *              i.e. the desync fence is actually healed by this open. Answers WHICH
+ *              WORKFLOW, which the marker does not.
  *   content  — the graph on the canvas reproduces the payload exactly.
  *
  * WHY `content` STILL BLOCKS SUCCESS, even though it is a FIDELITY question and the
@@ -656,12 +670,27 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
     // workflow's, and what is unknown is narrower than "which workflow is this".
     // The open still reports `unknown`, because the panel cannot tell the frontend
     // NORMALIZING the graph apart from the load only partly applying it.
+    //
+    // "does not match" is stated ONLY when a comparison actually happened.
+    // `graphRootMatchesState` returns false for BOTH "compared and differed" and
+    // "could not read the root at all" — one return value doing two jobs, the same
+    // fold this whole change exists to remove, hiding one level down in the wording.
+    // An unreadable post-load root would otherwise be disclosed as a definite
+    // mismatch: telling the user their canvas holds something different when the
+    // truth is that we could not look. `describeGraphStateDifference` keeps the two
+    // apart and the caller passes that through as `contentComparable`; anything but
+    // an explicit `true` takes the non-asserting wording.
+    const compared = observed.contentComparable === true;
     return (
-      `workflow_open RAN and the canvas IS bound to ${workflow} — that much was proven — but the graph ` +
-      `on it does not match the state that was loaded, and the panel cannot tell whether the ComfyUI ` +
-      `frontend merely normalized it (node sizes, widget values) or the load only partly applied. Treat ` +
-      `the canvas as UNKNOWN and re-read it (panel_graph_outline) before editing.${because} You are NOT ` +
-      `on the wrong workflow: ${workflow} IS the active one.`
+      `workflow_open RAN and the canvas IS bound to ${workflow} — that much was proven — but ` +
+      (compared
+        ? `the graph on it does not match the state that was loaded, and the panel cannot tell whether ` +
+          `the ComfyUI frontend merely normalized it (node sizes, widget values) or the load only ` +
+          `partly applied. `
+        : `the panel could not READ the graph on it to compare against the state that was loaded, so ` +
+          `whether the whole graph landed is unestablished — NOT established as wrong. `) +
+      `Treat the canvas as UNKNOWN and re-read it (panel_graph_outline) before editing.${because} ` +
+      `You are NOT on the wrong workflow: ${workflow} IS the active one.`
     );
   }
   if (verdict?.status === OPEN_REBIND_STATUS.UNPROVEN) {

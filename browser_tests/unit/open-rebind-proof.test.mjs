@@ -419,7 +419,76 @@ test("an UNCOMPARABLE content check is disclosed as unknown, not as a difference
     contentSurfaces: [],
   });
   assert.match(text, /UNKNOWN/, "an absent comparison must be stated as unknown");
-  assert.doesNotMatch(text, /differs from what was loaded on/, "it must not claim a difference it never observed");
+  assert.doesNotMatch(text, /differs from what was loaded on/, "the CLAUSE must not claim a difference it never observed");
+  // ...and neither may the SENTENCE IN FRONT of it. `graphRootMatchesState` returns
+  // false for both "compared and differed" and "could not read the root", so the
+  // headline used to report a definite mismatch for a canvas nobody could look at —
+  // the could-not-determine/determined-not fold, inside the fix meant to remove it.
+  assert.doesNotMatch(text, /does not match the state that was loaded/, "the headline must not assert it either");
+  assert.match(text, /could not READ the graph on it/, "it must say what actually happened");
+  assert.match(text, /NOT established as wrong/);
+  // The binding half is still stated as settled — that part WAS observed.
+  assert.match(text, /canvas IS bound to a\.json/);
+});
+
+test("a COMPARED content mismatch still says so plainly — the fix must not blunt the real case", () => {
+  const verdict = resolveOpenRebindVerdict({
+    instanceStillTarget: true,
+    markerMatches: true,
+    identityMatches: true,
+    contentMatches: false,
+  });
+  const text = describeOpenRebindOutcome(verdict, {
+    targetLabel: "a.json",
+    contentComparable: true,
+    contentSurfaces: ["nodes"],
+  });
+  assert.match(text, /does not match the state that was loaded/);
+  assert.doesNotMatch(text, /could not READ the graph on it/);
+});
+
+test("an ABSENT contentComparable takes the non-asserting wording, never the mismatch claim", () => {
+  // A caller that reports nothing about comparability has not established one, and
+  // the safe direction for an unstated observation is the one that claims less.
+  const verdict = resolveOpenRebindVerdict({
+    instanceStillTarget: true,
+    markerMatches: true,
+    identityMatches: true,
+    contentMatches: false,
+  });
+  for (const unstated of [undefined, null, "true", 1]) {
+    const text = describeOpenRebindOutcome(verdict, { targetLabel: "a.json", contentComparable: unstated });
+    assert.doesNotMatch(
+      text,
+      /does not match the state that was loaded/,
+      `an unstated comparability (${JSON.stringify(unstated)}) must not license a mismatch claim`,
+    );
+  }
+});
+
+test("the marker is NOT a superset of the uuid check — both are required", () => {
+  // The overclaim an independent gate caught: a root carrying THIS attempt's marker
+  // alongside a DIFFERENT workflow's uuid passes the marker and fails the identity
+  // check. They answer different questions ("did this attempt configure it" vs "whose
+  // workflow is it"), so treating the marker as the stronger check would licence
+  // dropping the identity one in a later refactor — a real hole from a comment.
+  const foreign = liveRoot({
+    nodes: [],
+    extra: { [PANEL_GRAPH_META_KEY]: { workflow_uuid: "workflow-B", [OPEN_PROOF_FIELD]: MARKER } },
+  });
+  assert.equal(graphRootCarriesOpenProof({ rootGraph: foreign, proofMarker: MARKER }), true, "marker passes");
+  assert.equal(graphRootWorkflowUuidMatches({ rootGraph: foreign, activeWorkflowUuid: UUID_A }), false, "identity fails");
+  // ...and the verdict ANDs them, so the combination is still refused.
+  assert.equal(
+    resolveOpenRebindVerdict({
+      instanceStillTarget: true,
+      markerMatches: true,
+      identityMatches: false,
+      contentMatches: true,
+    }).bindingProven,
+    false,
+    "the AND is what makes the pair safe — neither predicate covers the other",
+  );
 });
 
 test("only the parts that actually failed are narrated", () => {
