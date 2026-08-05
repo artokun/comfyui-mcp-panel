@@ -12577,17 +12577,26 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     // The reply must describe the canvas as it is NOW, not as the receipt left
     // it: this post-receipt read is a fresh terminal observation (codex gate
-    // r8). A canvas no longer on the target gets the displacement disclosure,
-    // never settled:true / "in effect" for a scope it has already left.
-    const stillOnTarget = (() => {
+    // r8), and it is THREE-state (r9): a read that throws proves neither "still
+    // on the target" nor "moved elsewhere", so it gets an uncertainty
+    // disclosure, not the displacement one.
+    const terminalState = (() => {
       try {
-        return comfyApp?.canvas?.graph === sub;
+        return comfyApp?.canvas?.graph === sub ? "target" : "elsewhere";
       } catch {
-        return false;
+        return "unreadable";
       }
     })();
+    const unreadableNote =
+      `The canvas DID enter the subgraph, but the panel can no longer read where the canvas is ` +
+      `right now — the navigation may be in effect or the view may have moved; the panel could ` +
+      `not determine which. Read the current scope (panel_graph_outline) before editing, and ` +
+      `re-enter the subgraph if that is still where you mean to work.`;
     if (!receipt.bound) {
-      if (!receipt.landed || !stillOnTarget) {
+      if (terminalState === "unreadable") {
+        return { entered: node.id, ...(viewing ? { viewing } : {}), settled: false, note: unreadableNote };
+      }
+      if (!receipt.landed || terminalState === "elsewhere") {
         // The canvas WAS observed inside the subgraph, then moved elsewhere
         // before the binding settled — the navigation happened, so this is a
         // disclosure, never a "nothing was applied" refusal.
@@ -12614,7 +12623,10 @@ const GRAPH_TOOL_EXECUTORS = {
           `retry the read in a moment.`,
       };
     }
-    if (!stillOnTarget) {
+    if (terminalState === "unreadable") {
+      return { entered: node.id, ...(viewing ? { viewing } : {}), settled: false, note: unreadableNote };
+    }
+    if (terminalState === "elsewhere") {
       return {
         entered: node.id,
         ...(viewing ? { viewing } : {}),
@@ -12679,18 +12691,26 @@ const GRAPH_TOOL_EXECUTORS = {
       // than fabricate one; the note below already discloses the uncertainty.
       viewing = null;
     }
-    // Same fresh terminal observation as graph_enter_subgraph (codex gate r8):
-    // a canvas no longer on the parent gets the displacement disclosure, never
-    // settled:true / "in effect" for a scope it has already left.
-    const stillOnTarget = (() => {
+    // Same fresh terminal observation as graph_enter_subgraph (codex gate r8),
+    // and equally THREE-state (r9): a read that throws proves neither "still on
+    // the parent" nor "moved elsewhere", so it gets an uncertainty disclosure,
+    // not the displacement one.
+    const terminalState = (() => {
       try {
-        return comfyApp?.canvas?.graph === parentGraph;
+        return comfyApp?.canvas?.graph === parentGraph ? "target" : "elsewhere";
       } catch {
-        return false;
+        return "unreadable";
       }
     })();
+    const unreadableNote =
+      `The canvas DID return to the parent graph, but the panel can no longer read where the ` +
+      `canvas is right now — the navigation may be in effect or the view may have moved; the ` +
+      `panel could not determine which. Read the current scope (panel_graph_outline) before editing.`;
     if (!receipt.bound) {
-      if (!receipt.landed || !stillOnTarget) {
+      if (terminalState === "unreadable") {
+        return { ...(viewing ? { viewing } : {}), settled: false, note: unreadableNote };
+      }
+      if (!receipt.landed || terminalState === "elsewhere") {
         // The canvas WAS observed back at the parent, then moved elsewhere
         // before the binding settled — the navigation happened, so this is a
         // disclosure, never a "nothing was applied" refusal.
@@ -12715,7 +12735,10 @@ const GRAPH_TOOL_EXECUTORS = {
           `retry the read in a moment.`,
       };
     }
-    if (!stillOnTarget) {
+    if (terminalState === "unreadable") {
+      return { ...(viewing ? { viewing } : {}), settled: false, note: unreadableNote };
+    }
+    if (terminalState === "elsewhere") {
       return {
         ...(viewing ? { viewing } : {}),
         settled: false,

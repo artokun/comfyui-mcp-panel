@@ -416,10 +416,125 @@ test("#619: the shipping enter does not claim settled when the canvas moved afte
   assert.match(reply.note, /binding check passed, but the view has already moved elsewhere/);
 });
 
-test("#619: the shipping exit carries the same receipt wiring", () => {
-  // Source-level pin: exit must run the same confirmCanvasNavigation receipt
+test("#619: the shipping exit carries the same receipt wiring", () => {  // Source-level pin: exit must run the same confirmCanvasNavigation receipt
   // (delete it and this fails) and must keep the immediate-parent resolution.
   const body = extractMethod("async graph_exit_subgraph()");
   assert.match(body, /await confirmCanvasNavigation\(\{/, "exit runs the receipt");
   assert.match(body, /findSubgraphOwner\(rootGraph, graph\)\?\.parentGraph/, "exit keeps the immediate-parent walk (#412)");
+});
+
+// ---------------------------------------------------------------------------
+// r9: the terminal observation is three-state — an UNREADABLE canvas read is
+// neither "still on target" nor "moved elsewhere"
+// ---------------------------------------------------------------------------
+
+function buildExitSubgraph(doubles) {
+  const body = extractMethod("async graph_exit_subgraph()").replace(
+    /^async graph_exit_subgraph\(/,
+    "async function graph_exit_subgraph(",
+  );
+  const factory = new Function(
+    "getGraphCtx",
+    "findSubgraphOwner",
+    "confirmCanvasNavigation",
+    "describeActiveGraph",
+    "assertGraphBoundToActiveWorkflow",
+    "coerceMessageText",
+    `return (${body});`,
+  );
+  return factory(
+    doubles.getGraphCtx,
+    doubles.findSubgraphOwner,
+    doubles.confirmCanvasNavigation ?? confirmCanvasNavigation,
+    doubles.describeActiveGraph,
+    doubles.assertGraphBoundToActiveWorkflow,
+    doubles.coerceMessageText ?? ((v) => String(v)),
+  );
+}
+
+test("#619: an UNREADABLE terminal canvas read discloses uncertainty, not displacement (codex r9, enter)", async () => {
+  const rootGraph = { _nodes: [], name: "root" };
+  const sub = { _nodes: [], name: "sub", rootGraph };
+  const node = { id: 105, type: "SubgraphNode", subgraph: sub };
+  let reads = 0;
+  const canvas = {
+    _g: rootGraph,
+    // Reads 1-4 complete the receipt (landing, assert's ctx read, survival
+    // re-read); the reply's own reads throw.
+    get graph() {
+      reads += 1;
+      if (reads >= 5) throw new Error("canvas getter exploded");
+      return this._g;
+    },
+    openSubgraph(s) {
+      this._g = s;
+    },
+    setDirty() {},
+  };
+  const app = { graph: rootGraph, canvas };
+  const enter = buildEnterSubgraph({
+    getGraphCtx: () => ({ app, graph: canvas.graph, rootGraph, canvas }),
+    resolveNode: () => node,
+    describeActiveGraph: (g) => ({ scope: g === rootGraph ? "root" : "subgraph" }),
+    assertGraphBoundToActiveWorkflow: () => {},
+  });
+  const reply = await enter({ node_id: 105 });
+  assert.equal(reply.settled, false);
+  assert.match(reply.note, /could not determine which/, "uncertainty is disclosed");
+  assert.doesNotMatch(reply.note, /navigated away|moved elsewhere/, "no displacement claim without an observation");
+  assert.match(reply.note, /panel_graph_outline/, "the remedy is a scope read");
+});
+
+test("#619: the shipping exit settles at root on a clean navigation (driven, not just source-pinned)", async () => {
+  const rootGraph = { _nodes: [], name: "root" };
+  const sub = { _nodes: [], name: "sub", rootGraph };
+  const canvas = {
+    _g: sub,
+    get graph() {
+      return this._g;
+    },
+    setGraph(g) {
+      this._g = g;
+    },
+    setDirty() {},
+  };
+  const app = { graph: rootGraph, canvas };
+  const exit = buildExitSubgraph({
+    getGraphCtx: () => ({ app, graph: canvas.graph, rootGraph, canvas }),
+    findSubgraphOwner: () => ({ id: 105, parentGraph: rootGraph }),
+    describeActiveGraph: (g) => ({ scope: g === rootGraph ? "root" : "subgraph" }),
+    assertGraphBoundToActiveWorkflow: () => {},
+  });
+  const reply = await exit();
+  assert.equal(reply.settled, true);
+  assert.equal(reply.viewing.scope, "root");
+});
+
+test("#619: an UNREADABLE terminal canvas read discloses uncertainty, not displacement (codex r9, exit)", async () => {
+  const rootGraph = { _nodes: [], name: "root" };
+  const sub = { _nodes: [], name: "sub", rootGraph };
+  let reads = 0;
+  const canvas = {
+    _g: sub,
+    get graph() {
+      reads += 1;
+      if (reads >= 5) throw new Error("canvas getter exploded");
+      return this._g;
+    },
+    setGraph(g) {
+      this._g = g;
+    },
+    setDirty() {},
+  };
+  const app = { graph: rootGraph, canvas };
+  const exit = buildExitSubgraph({
+    getGraphCtx: () => ({ app, graph: canvas.graph, rootGraph, canvas }),
+    findSubgraphOwner: () => ({ id: 105, parentGraph: rootGraph }),
+    describeActiveGraph: (g) => ({ scope: g === rootGraph ? "root" : "subgraph" }),
+    assertGraphBoundToActiveWorkflow: () => {},
+  });
+  const reply = await exit();
+  assert.equal(reply.settled, false);
+  assert.match(reply.note, /could not determine which/);
+  assert.doesNotMatch(reply.note, /navigated away|moved elsewhere/);
 });
