@@ -1903,6 +1903,25 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
 /** Refuse a command whose bridge-owned stamp no longer names this active canvas.
  * This runs at dispatch and can be injected into an async graph executor's
  * mutation boundary after that executor has awaited external state (#718). */
+// #607 — a refusal here means the orchestrator's cached stamp and the panel's
+// LIVE identity disagree, and the panel's side is computed fresh at refusal
+// time, so the stale half is the orchestrator's cache. The documented recovery
+// (re-target with panel_set_workflow_target({mode:"current"}), then retry) only
+// works if the panel's current identity actually REACHES the orchestrator —
+// which re-stamps from the hello's workflow_uuid on every (re)hello. The bridge
+// client registers its re-hello below so a refusal re-advertises the current
+// identity instead of leaving the advertised recovery a no-op (#607's wedge:
+// every command refused, the recovery command returning success while changing
+// nothing). Best-effort and edge-triggered (only on an actual refusal): a hook
+// throw must never mask or replace the refusal itself.
+let workflowInstanceMismatchRehello = null;
+function noteWorkflowInstanceMismatch() {
+  try {
+    workflowInstanceMismatchRehello?.();
+  } catch {
+    // best-effort — the refusal stands regardless
+  }
+}
 function assertActiveWorkflowCommandTarget(msg, targetsNonActive = false) {
   const commandUuid = msg?.[WORKFLOW_UUID_FIELD];
   if (
@@ -1913,6 +1932,7 @@ function assertActiveWorkflowCommandTarget(msg, targetsNonActive = false) {
       targetsNonActive,
     })
   ) {
+    noteWorkflowInstanceMismatch();
     throw new Error(
       `workflow instance mismatch: this command targets a different workflow than the ` +
         `active canvas — the workflow was switched or replaced after it was issued. ` +
@@ -4759,14 +4779,7 @@ function assertGraphBoundToActiveWorkflow(
       resolveGraphRootUuidRebind({ rootGraph, activeWorkflowUuid, rootTagClaimedByActiveWorkflow, staleTagOnEmptyCanvas }) === "rebind"
     ) {
       try {
-        const extra =
-          rootGraph.extra && typeof rootGraph.extra === "object" ? rootGraph.extra : (rootGraph.extra = {});
-        const priorMeta = extra[WORKFLOW_META_NAMESPACE];
-        extra[WORKFLOW_META_NAMESPACE] = {
-          ...(priorMeta && typeof priorMeta === "object" ? priorMeta : {}),
-          [WORKFLOW_UUID_FIELD]: activeWorkflowUuid,
-        };
-        rememberWorkflowUuidOwner(activeWorkflowUuid, activeWorkflow);
+        stampGraphRootWorkflowUuid(rootGraph, activeWorkflowUuid, activeWorkflow);
         rootUuidMismatch = false;
       } catch {
         // A root that refuses the re-stamp stays mismatched and throws below.
@@ -4837,6 +4850,25 @@ function assertGraphBoundToActiveWorkflow(
     postReconnectWindow: postReconnectSettleWindow(),
   });
   if (verdict) throw new Error(graphBindingRefusalMessage(verdict));
+}
+
+/**
+ * Write the panel-owned workflow-identity tag onto a root graph and record its
+ * owner. One shared writer so the binding guard's rebind heal (#545/#557/#565)
+ * and the workflow_new creation stamp (#606) can never drift into two different
+ * tag shapes. Callers decide the EVIDENCE that justifies the stamp (a
+ * proven-empty canvas, an ownership claim); this only performs the write they
+ * settled on.
+ */
+function stampGraphRootWorkflowUuid(rootGraph, uuid, ownerWorkflow) {
+  const extra =
+    rootGraph.extra && typeof rootGraph.extra === "object" ? rootGraph.extra : (rootGraph.extra = {});
+  const priorMeta = extra[WORKFLOW_META_NAMESPACE];
+  extra[WORKFLOW_META_NAMESPACE] = {
+    ...(priorMeta && typeof priorMeta === "object" ? priorMeta : {}),
+    [WORKFLOW_UUID_FIELD]: uuid,
+  };
+  if (ownerWorkflow) rememberWorkflowUuidOwner(uuid, ownerWorkflow);
 }
 
 /** Reach a Pinia store by id. Pinia attaches itself as `$pinia` on the Vue app's
@@ -10308,7 +10340,29 @@ const GRAPH_TOOL_EXECUTORS = {
     // Mint the per-instance tmp: routing id (and seed the transcript uuid) eagerly so
     // the key exists BEFORE the first edit and is returned for pinning.
     const key = workflowTabId(wf);
-    workflowStableUuid(wf);
+    const newWorkflowUuid = workflowStableUuid(wf);
+    // #606 — stamp the live root with the NEW tab's identity NOW, at creation.
+    // ComfyUI reuses the app.graph object across tabs and its clear/configure does
+    // NOT reset graph.extra, so a brand-new blank tab can inherit the PREVIOUS
+    // workflow's root tag while minting its own identity. If a reconnect then
+    // lands before the new tab's ChangeTracker is PROVEN empty, the binding
+    // guard reads the leftover tag as a foreign-canvas conflict and nothing in
+    // the normal command path re-stamps the root — the tab wedges behind the
+    // guard until a frontend reload. The panel itself just created this tab and
+    // its canvas, so stamp the tag at the source instead. Evidence bar: only
+    // when the root is PROVEN content-free on every serialized surface — if the
+    // frontend did not actually hand the new tab an empty canvas, the stamp is
+    // skipped (fail closed) rather than re-tagging a root that still holds the
+    // previous workflow's content. Best-effort: a stamp failure leaves the
+    // pre-existing guard behavior, never a broken creation.
+    try {
+      const rootGraph = app?.graph;
+      if (rootGraph && graphRootProvenEmpty(rootGraph)) {
+        stampGraphRootWorkflowUuid(rootGraph, newWorkflowUuid, wf);
+      }
+    } catch {
+      // Identity bookkeeping must never break workflow creation.
+    }
     // #433: an explicit new-tab authoritatively re-points `active` — record it
     // against the epoch we STARTED on, but only if no reconnect intervened during
     // the async work (else its tab-restore may have overridden us — leave armed).
@@ -13840,8 +13894,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // does not, and only this uuid fence catches it. The pin guard stays as an ADDITIONAL
             // check (it catches a switch to a different PATH); both must pass.
             //
-            // activeWorkflowFenceApplies() exempts only the genuinely-non-active ops: navigation/
-            // creation (workflow_open/new) and a path-selectored workflow_rename/close whose
+            // activeWorkflowFenceApplies() exempts only the genuinely-non-active ops: server/
+            // Manager-scoped commands that never touch app.graph and never answer for it
+            // (commandIsCanvasIndependent, #602/#607), navigation/creation (workflow_open/new)
+            // and a path-selectored workflow_rename/close whose
             // selector RESOLVES to a non-active OPEN workflow. Decide that by the RESOLVED TARGET,
             // never raw path presence: resolve the selector the same way the executor will
             // (openWorkflows.find) and exempt ONLY when it lands on a real open workflow that is
@@ -13871,6 +13927,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
                 targetsNonActive,
               })
             ) {
+              // #607 — re-advertise the panel's CURRENT identity (re-hello) so the
+              // recovery this message advertises actually reaches the orchestrator's
+              // cached stamp; see noteWorkflowInstanceMismatch.
+              noteWorkflowInstanceMismatch();
               throw new Error(
                 `workflow instance mismatch: this command targets a different workflow than the ` +
                   `active canvas — the workflow was switched or replaced after it was issued. ` +
@@ -14324,6 +14384,21 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // Reconnect path will retry. No hello landed, so no generation advance.
       });
   }
+
+  // #607 — the workflow-instance fence fires this (via noteWorkflowInstanceMismatch)
+  // when it refuses a command whose stamp no longer names the active canvas: the
+  // panel's live identity is authoritative, so re-hello to push it to the
+  // orchestrator (which re-stamps from hello.workflow_uuid), making the refusal's
+  // advertised recovery (re-target, then retry) able to succeed. Throttled: a
+  // retry loop against a genuinely-switched canvas must not become a greeting
+  // storm — a full hello re-greets the user ("agent ready").
+  let lastMismatchRehelloAt = 0;
+  workflowInstanceMismatchRehello = () => {
+    const now = Date.now();
+    if (now - lastMismatchRehelloAt < 5000) return;
+    lastMismatchRehelloAt = now;
+    sendHello();
+  };
 
   // When the workflow title changes (rename / open a different file / progress
   // ticks during a run / each graph edit toggling the modified "*"), send a

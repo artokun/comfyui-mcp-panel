@@ -2914,6 +2914,53 @@ test("#560 r2: mutations are fenced against the false-empty window exactly like 
   );
 });
 
+// #606 — the refusal text must name the firing predicate honestly: a 0-node
+// expectation phrased as "the workflow reports 0 node(s), but the canvas is bound to
+// a different graph" reads as nonsense on a genuinely-empty tab, and the remedy must
+// name the reload as the certain fallback rather than sending the agent to
+// panel_open_workflow with no hint about which recovery actually works.
+test("#606 refusal message: uuid-mismatch names the identity tag, not a 0-node different-graph claim", () => {
+  const msg = graphBindingRefusalMessage({ reason: "root-workflow-uuid-mismatch", expected: 0 });
+  assert.match(msg, /^\[root-workflow-uuid-mismatch\]/);
+  assert.match(msg, /identity tag/);
+  assert.ok(!msg.includes("reports 0 node(s)"), "no nonsense 0-node clause");
+  assert.match(msg, /NOT applied/);
+  assert.match(msg, /panel_open_workflow/);
+  assert.match(msg, /panel_reload/);
+});
+
+test("#606 refusal message: a 0-expected shape mismatch drops the node-count clause", () => {
+  const msg = graphBindingRefusalMessage({ reason: "root-shape-mismatch", expected: 0 });
+  assert.match(msg, /^\[root-shape-mismatch\]/);
+  assert.ok(!msg.includes("reports 0 node(s)"));
+  assert.match(msg, /NOT applied/);
+});
+
+test("#606 refusal message: a positive-count desync keeps the count", () => {
+  const msg = graphBindingRefusalMessage({ reason: "root-node-count-desync", expected: 164 });
+  assert.match(msg, /^\[root-node-count-desync\]/);
+  assert.match(msg, /reports 164 node\(s\)/);
+  assert.match(msg, /NOT applied/);
+});
+
+test("#606 refusal message: dirty-mutation-binding-unproven names the unproven binding", () => {
+  // Message wording is #624's (#601): names the unstamped-canvas cause and the
+  // reload/re-open remedy; this locks that the #606 reason tag and NOT-applied
+  // claims survived the integration.
+  const msg = graphBindingRefusalMessage({ reason: "dirty-mutation-binding-unproven", expected: 0 });
+  assert.match(msg, /^\[dirty-mutation-binding-unproven\]/);
+  assert.match(msg, /NOT applied/);
+  assert.match(msg, /identity stamp/);
+  assert.match(msg, /panel_open_workflow/);
+});
+
+test("#606 refusal message: empty-binding-unproven keeps its false-empty warning", () => {
+  const msg = graphBindingRefusalMessage({ reason: "empty-binding-unproven", expected: 0 });
+  assert.match(msg, /^\[empty-binding-unproven\]/);
+  assert.match(msg, /FALSE-EMPTY/);
+  assert.match(msg, /NOT applied/);
+});
+
 // ---------------------------------------------------------------------------
 // #618 — the MID-POPULATION fence. After a ComfyUI reconnect the frontend
 // restores the active tab's graph incrementally; for a window the live root
