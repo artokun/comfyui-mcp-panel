@@ -725,8 +725,10 @@ function setupListeners() {
 // Community + support. The Discord is the one-tap "I'm stuck" channel surfaced
 // in Settings → About (Join + Need help buttons) and linked from the README.
 const DISCORD_INVITE_URL = "https://discord.gg/cW9arBhzCu";
-// The docs site — every published guide lives here, and until now NOTHING in this
-// panel linked to it. That is a measured cost, not a hypothetical one: community
+// The docs site. Not the only place things are written down — the README and the
+// `setup` command's own output cover some of the same ground — but it is the one a
+// panel user can actually reach, and until now NOTHING in this panel linked to it.
+// That is a measured cost, not a hypothetical one: community
 // users have asked for features that already shipped and were documented (#111),
 // because a panel user's entire discovery path was an empty-state sentence, four
 // prompt chips, a nine-item slash list and a Discord invite. A link is not a
@@ -15101,7 +15103,25 @@ function openExternalUrl(href) {
       window.comfyAPI?.electron?.openExternal ||
       window.api?.openExternal;
     if (typeof ext === "function") {
-      ext(href);
+      // The bridge opener is usually ASYNC (Electron's shell.openExternal returns
+      // a Promise). The try/catch above only guards a SYNCHRONOUS throw, so a
+      // rejected promise escaped it entirely: nothing opened, nothing fell back,
+      // and the rejection surfaced only as an unhandled-rejection in the console.
+      // A guard that covers one of the two failure shapes is not a guard.
+      // Promise.resolve() normalizes both a promise and a plain return value, and
+      // is itself inside the try — so a non-thenable that throws on access still
+      // reaches the window.open fallback below.
+      const opened = Promise.resolve(ext(href));
+      opened.catch(() => {
+        // Bridge refused. Honor the documented contract — "else a new browser
+        // tab" — rather than leaving the caller with nothing.
+        try {
+          window.open(href, "_blank", "noopener,noreferrer");
+        } catch {
+          // Nothing left to try; the caller's message names the URL so the user
+          // can still open it by hand.
+        }
+      });
       return;
     }
   } catch {
@@ -22727,9 +22747,16 @@ function buildPanel() {
       hint: "open the docs — guides for the panel, tools, local LLMs and troubleshooting",
       // openExternalUrl, not window.location: in the ComfyUI desktop app an in-frame
       // navigation hijacks the whole window with no way back.
+      //
+      // The note does NOT say the docs opened. Opening happens in a desktop bridge
+      // or a popup, and neither reports back — a popup blocker or a refusing bridge
+      // is invisible from here, so "Opening the docs…" would be a state we never
+      // observed. It states the URL instead, which is both true and the remedy: if
+      // nothing appeared, the address the user needs is right there in the
+      // transcript to copy.
       run: () => {
         openExternalUrl(DOCS_URL);
-        appendSystem(`Opening the docs — ${DOCS_URL}`);
+        appendSystem(`Docs: ${DOCS_URL} — opening in a new tab; if nothing opened, copy that address.`);
       },
     },
     {

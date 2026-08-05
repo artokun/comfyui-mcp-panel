@@ -64,6 +64,12 @@ test("#111 /docs is a LOCAL command — it opens externally, never in-frame", ()
   // window.location/window.open would navigate the ComfyUI app itself in the
   // desktop build — no back button, hard-reload to escape.
   assert.doesNotMatch(code, /window\.location|window\.open/, "must not navigate the app frame");
+  // …and it must not CLAIM the docs opened. Opening happens in a desktop bridge or
+  // a popup and neither reports back, so a popup blocker or a refusing bridge is
+  // invisible from here — "Opening the docs…" would assert a state never observed.
+  // The note names the URL, which is both true and the remedy.
+  assert.match(code, /DOCS_URL\} — opening in a new tab; if nothing opened/, "states the URL as the fallback");
+  assert.doesNotMatch(code, /appendSystem\(`Opening the docs/, "must not report an outcome it cannot see");
 });
 
 test("#111 /help says its list is only panel shortcuts, and names where the rest is", () => {
