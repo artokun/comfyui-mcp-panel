@@ -9190,7 +9190,27 @@ const GRAPH_TOOL_EXECUTORS = {
     // comes AFTER the ledger registration above so any partially-verified
     // prompts (which ARE queued, scoped) stay reconcilable (#370).
     if (runScopeResult && runScopeResult.outcome !== "dispatched") {
-      return { queued: false, error: runScopeResult.error };
+      const failed = { queued: false, error: runScopeResult.error };
+      // #556 (codex gate r5, P1) — DISCLOSE the work that DID happen. A partial
+      // batch (one or more prompts verified and queued WITH the scope, a later
+      // one refused) is not a run that failed; it is a run that partly
+      // succeeded. Returning a bare queued:false for it reports failure for
+      // work that is at this moment executing on the GPU, and the obvious
+      // reaction — re-run the whole batch — queues the verified prompts a
+      // SECOND time. Refuse-vs-disclose: the refusal covers only what did not
+      // happen, and what did happen is named, with its prompt_ids, so the
+      // caller can track it and re-run only the remainder.
+      if (runScopeResult.verified > 0) {
+        failed.partially_queued = true;
+        failed.queued_count = runScopeResult.verified;
+        failed.queued_prompt_ids = queuedPromptIds.slice();
+        failed.retry_guidance =
+          `${runScopeResult.verified} of ${batch} prompt(s) ARE queued and scoped to node ` +
+          `${to_node_id}; they are running and are tracked by the prompt_ids above. ` +
+          `Re-run only the remaining ${Math.max(0, batch - runScopeResult.verified)} — ` +
+          `re-running the full batch would queue the already-running prompt(s) again.`;
+      }
+      return failed;
     }
     // Verdict from BOTH channels: the captured top-level rejection (#358) and the
     // per-node errors the frontend stashed. null ⇒ genuinely accepted.

@@ -770,7 +770,7 @@ export function createScopedRunGuard({
 } = {}) {
   const expected = (execIds ?? []).map(String);
   const maxBatch = Math.max(1, Math.floor(Number(batch)) || 1);
-  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, inFlight: 0, indeterminate: 0, dropped: null, droppedReason: null, failed: null };
+  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, inFlight: 0, indeterminate: 0, closed: false, dropped: null, droppedReason: null, failed: null };
   const waiters = new Set();
   const notify = () => {
     for (const fire of [...waiters]) fire();
@@ -799,15 +799,24 @@ export function createScopedRunGuard({
     // `rejected` (ComfyUI said no — that prompt is spent). A `failed` post never
     // reached ComfyUI, so a later post of the same batch is legitimately still
     // owed and must not be fenced out.
-    if (state.observed + state.rejected + state.indeterminate + state.inFlight >= maxBatch) {
+    // CLOSED (codex gate r5): the orchestration has already RETURNED and told
+    // the caller what happened. The report is itself a fence — a post that
+    // dispatches after it contradicts what the caller was told, and a caller
+    // instructed to "re-run only the remaining N" would then get those N twice.
+    // So a closed guard refuses every attributed post, whatever the quota says.
+    if (state.closed || state.observed + state.rejected + state.indeterminate + state.inFlight >= maxBatch) {
       state.overrun++;
       if (state.overrunError == null) {
-        state.overrunError =
-          `run-to-node scope for node ${toNodeId}: an EXTRA /prompt post carrying this ` +
-          `run's identity arrived after all ${maxBatch} requested prompt(s) were already ` +
-          `accounted for. It was refused rather than dispatched — queueing it would have ` +
-          `executed the requested branch more times than asked, at real GPU/API cost. ` +
-          `The requested prompts are queued and unaffected (#556).`;
+        state.overrunError = state.closed
+          ? `run-to-node scope for node ${toNodeId}: a /prompt post carrying this run's ` +
+            `identity arrived AFTER the run's outcome had already been reported. It was ` +
+            `refused rather than dispatched — executing it would contradict the result the ` +
+            `caller was given, and could double-render the branch alongside their retry (#556).`
+          : `run-to-node scope for node ${toNodeId}: an EXTRA /prompt post carrying this ` +
+            `run's identity arrived after all ${maxBatch} requested prompt(s) were already ` +
+            `accounted for. It was refused rather than dispatched — queueing it would have ` +
+            `executed the requested branch more times than asked, at real GPU/API cost. ` +
+            `The requested prompts are queued and unaffected (#556).`;
       }
       notify();
       return SCOPE_DROPPED_RESPONSE();
@@ -962,6 +971,11 @@ export function createScopedRunGuard({
     return SCOPE_DROPPED_RESPONSE();
   };
   guard.state = state;
+  // Called by the orchestration when it RETURNS: from here on this run has an
+  // answer, and no further post of it may execute.
+  guard.close = () => {
+    state.closed = true;
+  };
   // Verdict = the run reached a TERMINAL state: the whole batch verified, a
   // genuine server rejection arrived, a dispatch failure occurred (r6), or a
   // corrupted post ended the attempt (the frontend's batch loop breaks on the
@@ -1100,7 +1114,10 @@ export async function dispatchScopedRun({
     // non-extensible array — cancellation will report 0 and the sentinel covers it.
   }
   let dropped = null;
-  for (const { arg: scopeArg, repair } of queuePromptScopeAttempts(execIds)) {
+  const attempts = queuePromptScopeAttempts(execIds);
+  for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex++) {
+    const { arg: scopeArg, repair } = attempts[attemptIndex];
+    const isLastAttempt = attemptIndex === attempts.length - 1;
     dropped = null;
     let keepGuardInstalled = false;
     const guard = createScopedRunGuard({
@@ -1185,11 +1202,35 @@ export async function dispatchScopedRun({
       // and chaining is already the documented behaviour for the other terminal
       // paths — a real but small price for the guarantee that no late post of a
       // finished run can run the full graph.
-      if (guard.state.observed >= batch || guard.state.rejected > 0) {
-        keepGuardInstalled = true;
-      }
+      // EVERY TERMINAL OUTCOME IS A SENTINEL CASE (codex gate r5, P0). Success
+      // was not the only path that restored fetchApi and reopened the hole:
+      //  - a TERMINAL PARTIAL batch (one post repaired and queued, a later one
+      //    refused for drift/mismatch) restored it too;
+      //  - so did a graph_changed refusal;
+      //  - and so did the LAST attempt's all-refused return, after the loop.
+      // In each case a late same-mark scopeless post then bypassed both the
+      // quota fence and the repair and reached ComfyUI as a full graph.
+      //
+      // The only attempt that may safely restore is one that is about to hand
+      // over to ANOTHER attempt of this same run (the shape retry), because
+      // that attempt immediately installs its own guard on the same mark. So
+      // the rule is: restore ONLY when we are continuing. `continuing` is
+      // exactly the post-loop `observed === 0 && droppedReason !== "graph_changed"`
+      // condition, computed HERE so this finally can honor it.
+      //
+      // Note this also bounds the chaining: within a run each attempt
+      // overwrites the previous attempt's guard, so at most ONE guard per run
+      // ever persists.
+      const continuing =
+        !isLastAttempt &&
+        guard.state.failed == null &&
+        guard.state.rejected === 0 &&
+        guard.state.observed === 0 &&
+        guard.state.droppedReason !== "graph_changed";
+      if (!continuing) keepGuardInstalled = true;
     } finally {
-      if (!keepGuardInstalled) apiTarget.fetchApi = prevFetchApi;
+      if (keepGuardInstalled) guard.close();
+      else apiTarget.fetchApi = prevFetchApi;
     }
     // r6: the dispatch itself failed (fetch threw / malformed response) —
     // terminal, truthful, NEVER queued:true.

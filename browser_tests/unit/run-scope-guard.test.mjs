@@ -974,6 +974,88 @@ test("#630 gate r4: a LATE extra post, arriving AFTER the run reported success, 
   }
 });
 
+test("#630 gate r5 P0: a TERMINAL PARTIAL batch keeps its sentinel — a late post cannot escape after a half-succeeded run", async () => {
+  // Success and dispatch-failure kept the sentinel; the terminal partial did
+  // not. One post repaired and queued, a later one refused for drift, then
+  // fetchApi restored — and a late same-mark scopeless post bypassed both the
+  // quota fence and the repair to reach ComfyUI as a full graph.
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const prev = apiTarget.fetchApi;
+    const app = makeFrontend({ shape: "dropping", apiTarget });
+    let lateNumber = null;
+    app.queuePrompt = async (number, batch) => {
+      lateNumber = number;
+      for (let i = 0; i < batch; i++) {
+        const output = i === 0 ? OUR_OUTPUT : { ...OUR_OUTPUT, "3": { class_type: "KSampler", inputs: { steps: 99 } } };
+        const body = frontendBody({ output, number, targets: null });
+        app.posted.push(body);
+        const res = await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+        if (res.status !== 200) break;
+      }
+      return true;
+    };
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 2, toNodeId: 14 });
+    assert.equal(result.outcome, "refused", "a partial batch is never claimed as dispatched");
+    assert.equal(result.verified, 1);
+    assert.notEqual(apiTarget.fetchApi, prev, "the sentinel is retained on the PARTIAL path too");
+    // The late post that used to escape.
+    const late = frontendBody({ output: OUR_OUTPUT, number: lateNumber, targets: null });
+    const res = await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(late) });
+    assert.equal(res.status, 400);
+    assert.equal(server.calls.length, 1, "no unscoped full-graph post ever left the tab");
+  } finally {
+    stop();
+  }
+});
+
+test("#630 gate r5 P0: an ALL-REFUSED run keeps its sentinel too — the last attempt's return is terminal, not a handover", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const prev = apiTarget.fetchApi;
+    const app = makeFrontend({ shape: "shim", apiTarget });
+    let lateNumber = null;
+    app.queuePrompt = async (number) => {
+      lateNumber = number;
+      const body = frontendBody({ output: OUR_OUTPUT, number, targets: ["9"] }); // mismatch: never repaired
+      app.posted.push(body);
+      await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+      return true;
+    };
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+    assert.equal(result.outcome, "refused");
+    assert.equal(server.calls.length, 0, "nothing was queued");
+    assert.notEqual(apiTarget.fetchApi, prev, "and the sentinel remains for a late post of this run");
+    const late = frontendBody({ output: OUR_OUTPUT, number: lateNumber, targets: null });
+    const res = await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(late) });
+    assert.equal(res.status, 400);
+    assert.equal(server.calls.length, 0, "STILL nothing — a late scopeless post is refused, not run as a full graph");
+  } finally {
+    stop();
+  }
+});
+
+test("#630 gate r5 P1: graph_run discloses a PARTIAL batch's queued work instead of reporting a bare failure", () => {
+  // A partial batch is not a run that failed; it is one that partly succeeded.
+  // A bare queued:false reports failure for prompts that are executing right
+  // now, and the obvious reaction — re-run the batch — queues them a second
+  // time. Refuse-vs-disclose: refuse only what did not happen.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const source = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.js"), "utf8").replace(/\r\n/g, "\n");
+  const start = source.indexOf("if (runScopeResult && runScopeResult.outcome !== \"dispatched\")");
+  assert.ok(start > 0);
+  const block = source.slice(start, start + 2200).replace(/`\s*\+\s*\n\s*`/g, "").replace(/\s+/g, " ");
+  assert.match(block, /if \(runScopeResult\.verified > 0\)/, "the partial case is distinguished from a total failure");
+  assert.match(block, /partially_queued = true/);
+  assert.match(block, /queued_prompt_ids = queuedPromptIds/, "the caller can TRACK what is already running");
+  assert.match(block, /Re-run only the remaining/, "and is told not to re-run the whole batch");
+  assert.match(block, /would queue the already-running prompt\(s\) again/, "with the reason stated");
+});
+
 test("#630 gate r4: two CONCURRENT same-mark posts — the quota is a reservation, so the branch still runs exactly once", async () => {
   // The sequential fence was racy: counting only COMPLETED requests let two
   // in-flight posts both read observed=0, both clear the quota, and both be
@@ -1235,7 +1317,8 @@ test("#630 integration: repair NEVER overwrites a scope MISMATCH — a body carr
   // body says while claiming to have fixed it.
   const stop = keepAlive();
   try {
-    const apiTarget = { fetchApi: makeServer() };
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
     const app = makeFrontend({ shape: "shim", apiTarget });
     app.queuePrompt = async (number) => {
       const body = frontendBody({ output: OUR_OUTPUT, number, targets: ["9"] }); // WRONG branch
@@ -1246,7 +1329,7 @@ test("#630 integration: repair NEVER overwrites a scope MISMATCH — a body carr
     const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
     assert.equal(result.outcome, "refused");
     assert.match(result.error, /instead of \["14"\]/, "the observed mismatch is named, not overwritten");
-    assert.equal(apiTarget.fetchApi.calls.length, 0, "nothing reached ComfyUI — not the wrong scope, not a repaired one");
+    assert.equal(server.calls.length, 0, "nothing reached ComfyUI — not the wrong scope, not a repaired one");
   } finally {
     stop();
   }
