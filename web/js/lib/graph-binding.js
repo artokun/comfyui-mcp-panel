@@ -1076,18 +1076,27 @@ export function graphBindingRefusalMessage(verdict) {
       `persists, re-open the workflow tab (panel_open_workflow) or reload the panel.`
     );
   }
-  // #606 — name the firing predicate honestly and order the remedies by what
-  // actually recovers. panel_open_workflow rebinds in place (its repaint proof
-  // re-stamps the root's identity tag from the workflow's own state); a panel
-  // reload ALWAYS re-establishes the binding from scratch, so it is the certain
-  // fallback — earlier text sent the agent to open_workflow with no hint that
-  // reload is the reliable one, and phrased a 0-node expectation as "the
-  // workflow reports 0 node(s), but the canvas is bound to a different graph",
-  // which reads as nonsense for a genuinely-empty tab.
+  // #606 — name the firing predicate honestly, and order the remedies by which
+  // one to try first. panel_open_workflow rebinds in place; a panel reload is the
+  // broader fallback when re-opening does not clear it — earlier text sent the
+  // agent to open_workflow with no hint that the reload exists, and phrased a
+  // 0-node expectation as "the workflow reports 0 node(s), but the canvas is bound
+  // to a different graph", which reads as nonsense for a genuinely-empty tab.
+  //
+  // NEITHER remedy is promised to SUCCEED, and the text must not imply one (codex
+  // gate, two rounds). It first said a reload "always re-establishes the binding",
+  // then "rebuilds the binding from scratch" — both unconditional claims about an
+  // outcome nothing here observes. panel_reload asks the browser to navigate and
+  // returns; there is no post-reload binding receipt anywhere, and a reload that
+  // never happens, or that restores the same stale state, would leave the agent
+  // retrying on the strength of a repair it was told had already occurred. So the
+  // remedy names the ACTION and says plainly that it is unconfirmed — the caller
+  // learns whether it worked from the retry, the only thing that can tell.
   const remedy =
     `Re-open the active workflow tab (panel_open_workflow) to rebind the graph in place; if that ` +
-    `does not clear it, reload the panel (panel_reload scope:frontend) — a reload always ` +
-    `re-establishes the binding — then retry.`;
+    `does not clear it, reload the panel (panel_reload scope:frontend), then retry. The reload is ` +
+    `REQUESTED, NOT CONFIRMED — the panel cannot observe whether it rebound the canvas, so treat ` +
+    `the retry's own result as the answer rather than assuming the binding was repaired.`;
   if (verdict.reason === "root-workflow-uuid-mismatch") {
     return (
       `[root-workflow-uuid-mismatch] The live canvas carries a different workflow's identity tag ` +
