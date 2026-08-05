@@ -85,7 +85,7 @@ function handles(mountEl) {
   return { podSelect, refreshBtn, connectBtn, startBtn, stopBtn, localBtn, deployBtn, linkBtn: linkRow.children[0] };
 }
 
-async function mount(opts) {
+async function mount(t, opts) {
   const restore = installDom();
   const { createLocalContent } = await import("../../web/js/cmcp-runpod-ui.js");
   const calls = [];
@@ -110,60 +110,57 @@ async function mount(opts) {
   const root = new El("div");
   view.mount(root);
   const el = handles(root.children[0]);
-  return { calls, view, el, restore };
+  // Registered, not left to the end of the test body: a FAILING assertion throws
+  // past any trailing teardown, and the 1s countdown interval then keeps the
+  // event loop alive forever — so the suite hangs instead of reporting which
+  // assertion failed. Found by mutating the deploy-arming guard.
+  t.after(() => { view.teardown(); restore(); });
+  return { calls, view, el };
 }
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
-test("the pod dropdown lists via runpod action:list", async () => {
-  const { calls, view, restore } = await mount();
+test("the pod dropdown lists via runpod action:list", async (t) => {
+  const { calls, view } = await mount(t);
   view.onActivate();
   await flush();
-  view.teardown();
-  restore();
   const list = calls.filter((c) => c.args?.action === "list");
   assert.equal(list.length, 1, "activating the tab loads the pod list once");
   assert.equal(list[0].tool, "runpod");
   assert.deepEqual(list[0].args, { action: "list" });
 });
 
-test("Connect sends runpod action:connect with the selected pod id", async () => {
-  const { calls, view, el, restore } = await mount();
+test("Connect sends runpod action:connect with the selected pod id", async (t) => {
+  const { calls, view, el } = await mount(t);
   view.onActivate();
   await flush();
   el.connectBtn.click();
   await flush();
-  view.teardown();
-  restore();
   const c = calls.find((x) => x.args?.action === "connect");
   assert.ok(c, "Connect must issue a connect action");
   assert.equal(c.tool, "runpod");
   assert.equal(c.args.pod_id, "abc123", "the pod id from the dropdown must be forwarded");
 });
 
-test("Start sends runpod action:start, Stop sends action:stop — not transposed", async () => {
+test("Start sends runpod action:start, Stop sends action:stop — not transposed", async (t) => {
   const status = { watching: true, pod_id: "abc123", status: "RUNNING" };
   {
-    const { calls, view, el, restore } = await mount({ status });
+    const { calls, view, el } = await mount(t, { status });
     view.onActivate();
     await flush();
     el.startBtn.click();
     await flush();
-    view.teardown();
-    restore();
     const c = calls.find((x) => x.args?.action && x.args.action !== "list");
     assert.equal(c.tool, "runpod");
     assert.equal(c.args.action, "start", "Start must not send stop");
     assert.equal(c.args.pod_id, "abc123");
   }
   {
-    const { calls, view, el, restore } = await mount({ status });
+    const { calls, view, el } = await mount(t, { status });
     view.onActivate();
     await flush();
     el.stopBtn.click();
     await flush();
-    view.teardown();
-    restore();
     const c = calls.find((x) => x.args?.action && x.args.action !== "list");
     assert.equal(c.tool, "runpod");
     assert.equal(c.args.action, "stop", "Stop must not send start — start RESUMES billing");
@@ -171,8 +168,8 @@ test("Start sends runpod action:start, Stop sends action:stop — not transposed
   }
 });
 
-test("Use Local sends runpod action:use_local", async () => {
-  const { calls, view, el, restore } = await mount({
+test("Use Local sends runpod action:use_local", async (t) => {
+  const { calls, view, el } = await mount(t, {
     status: { watching: true, pod_id: "abc123", status: "RUNNING" },
     target: { is_local: false },
   });
@@ -180,15 +177,13 @@ test("Use Local sends runpod action:use_local", async () => {
   await flush();
   el.localBtn.click();
   await flush();
-  view.teardown();
-  restore();
   const c = calls.find((x) => x.args?.action === "use_local");
   assert.ok(c, "Use Local must issue use_local");
   assert.equal(c.tool, "runpod");
 });
 
-test("Deploy sends runpod action:create only after the second, confirming click", async () => {
-  const { calls, view, el, restore } = await mount();
+test("Deploy sends runpod action:create only after the second, confirming click", async (t) => {
+  const { calls, view, el } = await mount(t);
   view.onActivate();
   await flush();
   el.deployBtn.click(); // arms
@@ -202,30 +197,26 @@ test("Deploy sends runpod action:create only after the second, confirming click"
   await new Promise((r) => setTimeout(r, 700));
   el.deployBtn.click(); // confirms
   await flush();
-  view.teardown();
-  restore();
   const c = calls.find((x) => x.args?.action === "create");
   assert.ok(c, "the confirming click must deploy");
   assert.equal(c.tool, "runpod");
   assert.equal(c.opts?.timeout, 120000, "deploy keeps its long timeout");
 });
 
-test("the referral link sends runpod action:deploy_link", async () => {
-  const { calls, view, el, restore } = await mount();
+test("the referral link sends runpod action:deploy_link", async (t) => {
+  const { calls, view, el } = await mount(t);
   view.onActivate();
   await flush();
   el.linkBtn.dispatch("click");
   await flush();
-  view.teardown();
-  restore();
   const c = calls.find((x) => x.args?.action === "deploy_link");
   assert.ok(c, "the referral link must issue deploy_link");
   assert.equal(c.tool, "runpod");
 });
 
-test("every runpod call carries a non-empty action — a bare name is refused server-side", async () => {
+test("every runpod call carries a non-empty action — a bare name is refused server-side", async (t) => {
   const status = { watching: true, pod_id: "abc123", status: "RUNNING" };
-  const { calls, view, el, restore } = await mount({ status, target: { is_local: false } });
+  const { calls, view, el } = await mount(t, { status, target: { is_local: false } });
   view.onActivate();
   await flush();
   for (const b of [el.connectBtn, el.startBtn, el.stopBtn, el.localBtn, el.refreshBtn]) {
@@ -234,8 +225,6 @@ test("every runpod call carries a non-empty action — a bare name is refused se
   }
   el.linkBtn.dispatch("click");
   await flush();
-  view.teardown();
-  restore();
   assert.ok(calls.length >= 6, `expected several calls, got ${calls.length}`);
   for (const c of calls) {
     assert.equal(c.tool, "runpod", `unexpected tool ${c.tool} — slice 8 folded them all into runpod`);
