@@ -308,23 +308,49 @@ export class CivitaiClient {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), CIVITAI_REQUEST_TIMEOUT_MS);
     // #599: a bare transport rejection (TypeError "Failed to fetch", NO HTTP
-    // status) means the browser→ComfyUI leg failed — no response came back, so
-    // CivitAI is not the cause. The proxy call is always a POST, which Chrome
-    // will NOT self-retry when a pooled keep-alive connection turns out to be
-    // stale, so do ONE bounded retry here — but only for an idempotent spec: a
-    // mutation (reaction.toggle, collection writes) must never be double-fired.
-    // The retry shares the #417 abort budget above, so the worst case is
-    // unchanged. A failure that survives the retry is rethrown CLASSIFIED
-    // (kind:"transport") so the UI / panel_civitai_results can tell "the panel
-    // couldn't reach its own proxy" apart from an upstream CivitAI error
-    // (always carries an HTTP status) and from a true empty result (error is
-    // null).
+    // status) establishes exactly ONE thing — the browser obtained no HTTP
+    // response. It does NOT identify which leg failed, and it does NOT rule
+    // CivitAI out: a request that reached ComfyUI, whose own upstream CivitAI
+    // call then failed or whose response connection dropped on the way back,
+    // rejects identically. So `kind:"transport"` means "no HTTP response was
+    // received; the failing hop is UNDETERMINED" — never "the browser→ComfyUI
+    // hop is the cause". Naming one candidate as the cause is the very defect
+    // #599 exists to remove (the opaque bucket narrated as a diagnosis): it
+    // sends the user to rule out a component that may be perfectly healthy.
+    // The marker is still worth carrying, because it distinguishes "no HTTP
+    // response at all" from an upstream CivitAI error (which ALWAYS carries an
+    // HTTP status) and from a true empty result (error is null) — those three
+    // really are different, and only the hop is unknown.
+    //
+    // The proxy call is always a POST, which Chrome will NOT self-retry when a
+    // pooled keep-alive connection turns out to be stale, so do ONE bounded
+    // retry here — but only for an idempotent spec: a mutation
+    // (reaction.toggle, collection writes) must never be double-fired. The
+    // retry shares the #417 abort budget above, so the worst case is unchanged.
     //
     // Idempotency is a property of the OPERATION, not the HTTP method: CivitAI
     // reads are GETs EXCEPT MeiliSearch multi-search, which is a read-only
     // POST — callers pass `idempotent: true` for that one. Anything else POST
     // (reaction.toggle, collection writes) is a mutation and is never retried.
     const idempotent = idem ?? ((method || "GET").toUpperCase() === "GET");
+    // The FIRST attempt's rejection, retained so the retry can never destroy
+    // it: attempt 1 can fail with the actionable error and attempt 2 with an
+    // unrelated one, and showing only the second loses the diagnosis. Every
+    // throw below reports the whole trail and attaches the original as `cause`.
+    let firstTransportError = null;
+    const errText = (e) => coerceMessageText(e?.message ?? e);
+    const attemptTrail = (last) =>
+      firstTransportError
+        ? `attempt 1 failed with: ${errText(firstTransportError)}; the retry then failed with: ${errText(last)}`
+        : `browser transport error: ${errText(last)}`;
+    // Append attempt 1's rejection to a failure raised AFTER a retry actually
+    // got a response (an upstream status, or a body that won't parse). Those
+    // throws are outside the retry catch, so without this the first attempt's
+    // evidence is dropped exactly as it was before this fix.
+    const withFirstAttempt = (msg) =>
+      firstTransportError
+        ? `${msg} (a first attempt had already failed at transport with: ${errText(firstTransportError)})`
+        : msg;
     let res;
     try {
       for (let attempt = 0; ; attempt++) {
@@ -338,22 +364,38 @@ export class CivitaiClient {
           break;
         } catch (e) {
           if (e?.name === "AbortError") {
-            throw new Error(
-              `CivitAI request timed out after ${Math.round(CIVITAI_REQUEST_TIMEOUT_MS / 1000)} seconds`,
-            );
-          }
-          if (idempotent && attempt < 1 && typeof e?.status !== "number") continue;
-          if (typeof e?.status !== "number") {
             throw Object.assign(
               new Error(
-                `The CivitAI request failed at the browser→ComfyUI hop: no HTTP response came ` +
-                `back (browser transport error: ${coerceMessageText(e?.message ?? e)}). This is a ` +
-                `connection-level failure — not a CivitAI error, and not an empty result. The ` +
-                `ComfyUI server may be restarting, the connection may have dropped, or a browser ` +
-                `extension/policy may have blocked the request. Retry the search; if it persists, ` +
-                `check that ComfyUI is running and reachable.`,
+                `CivitAI request timed out after ${Math.round(CIVITAI_REQUEST_TIMEOUT_MS / 1000)} seconds` +
+                (firstTransportError
+                  ? ` (a first attempt had already failed with: ${errText(firstTransportError)})`
+                  : ""),
               ),
-              { status: null, kind: "transport" },
+              firstTransportError ? { cause: firstTransportError } : {},
+            );
+          }
+          if (typeof e?.status !== "number") {
+            if (idempotent && attempt < 1) {
+              firstTransportError = e;
+              continue;
+            }
+            throw Object.assign(
+              new Error(
+                `The CivitAI request produced no HTTP response, so the failing hop could NOT be ` +
+                `determined (${attemptTrail(e)}). A rejected fetch carrying no HTTP status does not ` +
+                `say which leg failed and does not rule CivitAI out — every one of these produces ` +
+                `the identical error: ComfyUI is not running, is restarting or is unreachable; the ` +
+                `connection to ComfyUI dropped; a browser extension, proxy or policy blocked the ` +
+                `request; or ComfyUI did reach CivitAI, CivitAI failed, and no response made it ` +
+                `back. What IS certain is that no HTTP status was received, so this is not a ` +
+                `confirmed empty result — no result arrived at all. Start by checking that ComfyUI ` +
+                `is running and reachable, then retry.`,
+              ),
+              {
+                status: null,
+                kind: "transport",
+                ...(firstTransportError ? { cause: firstTransportError } : {}),
+              },
             );
           }
           throw e;
@@ -367,11 +409,43 @@ export class CivitaiClient {
       // catch) can surface a distinct error state instead of an empty grid
       // (#190). The proxy forwards CivitAI's status, so res.status is the real
       // upstream code (e.g. 503 when model search is overloaded).
-      throw Object.assign(new Error(`CivitAI API ${res.status}: ${res.statusText || "request failed"}`), {
+      //
+      // If attempt 1 died at transport and the RETRY is what produced this
+      // status, that first rejection is still evidence and must survive here
+      // too — otherwise the failure that only shows up on the first attempt
+      // (an extension blocking the request, a dropped connection) is silently
+      // replaced by an unrelated upstream status. Same rule as the transport
+      // and timeout throws above: report the whole trail, never just the last.
+      throw Object.assign(new Error(withFirstAttempt(`CivitAI API ${res.status}: ${res.statusText || "request failed"}`)), {
         status: res.status,
+        ...(firstTransportError ? { cause: firstTransportError } : {}),
       });
     }
-    return normalizeTrpcResponse(await res.json());
+    try {
+      return normalizeTrpcResponse(await res.json());
+    } catch (e) {
+      // A body that will not parse is a real failure, and if attempt 1 had
+      // already failed at transport that first error is part of the diagnosis.
+      // Do NOT stamp an HTTP status here: res was ok, so there is no upstream
+      // error status to report, and inventing one would read to
+      // civitaiErrorState as "CivitAI returned an error" — a different claim.
+      //
+      // AUGMENT the parse error in place; never rebuild it. Wrapping it in a
+      // fresh Error would drop its class (SyntaxError) and its stack — losing
+      // the retry's evidence in the very act of preserving attempt 1's, which
+      // is the same defect this whole change exists to remove.
+      if (!firstTransportError) throw e;
+      if (e instanceof Error) {
+        e.message = withFirstAttempt(e.message);
+        // Only fill an EMPTY cause — an existing one is itself evidence and
+        // must not be overwritten. The trail is in the message either way.
+        if (e.cause === undefined) e.cause = firstTransportError;
+        throw e;
+      }
+      throw Object.assign(new Error(withFirstAttempt(errText(e))), {
+        cause: firstTransportError,
+      });
+    }
   }
 
   /** Same-origin CDN media URL (usable as <img>/<video> src AND fetchable as a Blob). */

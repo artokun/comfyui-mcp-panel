@@ -119,17 +119,17 @@ test("non-array source is tolerated", () => {
 });
 
 // ---- #599: the agent-facing error must distinguish the failure CAUSE ----
-// transport (browser→ComfyUI proxy hop failed, no HTTP response came back) vs
-// an upstream CivitAI error (HTTP status present) vs a true empty result (no
-// error object at all).
+// transport (NO HTTP response was received; which hop failed is undetermined,
+// and CivitAI is NOT excluded) vs an upstream CivitAI error (HTTP status
+// present) vs a true empty result (no error object at all).
 
 test("#599: a transport failure keeps status null and carries kind", () => {
-  const err = Object.assign(new Error("…browser→ComfyUI hop…"), {
+  const err = Object.assign(new Error("…no HTTP response; hop undetermined…"), {
     status: null, kind: "transport",
   });
   assert.deepEqual(civitaiErrorState(err), {
     status: null,
-    message: "…browser→ComfyUI hop…",
+    message: "…no HTTP response; hop undetermined…",
     kind: "transport",
   });
 });
