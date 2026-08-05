@@ -683,13 +683,15 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // let a provenance-stripped husk squatting a reserved allowlisted name through the
     // frontend-only exemption. ONLY seedObjectInfoHistory() — the STARTUP baseline, whose
     // observation window begins at page load — may call markObjectInfoHistorySeeded().
-    // (A throw here is attributed to "register": the fetch itself already succeeded.)
-    phase = "register";
+    // (A throw here is attributed to "record": the fetch itself already succeeded,
+    // and registration has not been attempted yet — the verdict must not claim it.)
+    phase = "record";
     recordObjectInfoTypes(defs);
     // Re-register node definitions so newly installed/updated classes and their
     // current widget schemas are known to LiteGraph (#221/#171). defsRegistered
     // is set ONLY when the registration call actually ran — a frontend without
     // registerNodesFromDefs must not let the verdict claim it (codex gate r2 P1).
+    phase = "register";
     if (defs && typeof a.registerNodesFromDefs === "function") {
       await a.registerNodesFromDefs(defs);
       defsRegistered = true;
@@ -697,6 +699,7 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // registerNodesFromDefs mints NEW classes; already-loaded node INSTANCES keep
     // their old constructor and would never see the fresh schema. Stamp the fresh
     // def onto existing instances + repair UNKNOWN widgets (finding #3).
+    phase = "reapply";
     if (defs) {
       const rootGraph = a.graph ?? a.canvas?.graph;
       if (rootGraph) reapplyDefsToLiveNodes(rootGraph, defs);

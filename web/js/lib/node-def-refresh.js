@@ -41,7 +41,7 @@ function detailSuffix(thrown) {
  *                              // remedy claim registration happened (codex r2 P1)
  *   comboApiPresent: boolean,  // app.refreshComboInNodes exists on this build
  *   comboRan: boolean,         // refreshComboInNodes completed this run
- *   phase?: string,            // "fetch" | "register" | "combo" | "done" — where a throw happened
+ *   phase?: string,            // "fetch" | "record" | "register" | "reapply" | "combo" | "done" — where a throw happened
  *   thrown?: any,              // the error a phase threw, if any
  * }} o
  * @returns {{ refreshed: boolean, reason: string, remedy?: string, detail?: string }}
@@ -79,6 +79,20 @@ export function describeNodeDefRefresh({
         : phase === "combo"
           ? NODE_DEF_REFRESH_REASONS.COMBO_REFRESH_FAILED
           : NODE_DEF_REFRESH_REASONS.REGISTER_FAILED;
+    // The register_failed remedy must describe what ACTUALLY threw (codex r3/r4):
+    // "register" is the registerNodesFromDefs call itself, "reapply" runs after
+    // registration succeeded, and "record" fails BEFORE registration was ever
+    // attempted — claiming a registration attempt in the last case is a lie.
+    const registerRemedy =
+      phase === "reapply"
+        ? `${registrationClause}, but applying the fresh definitions to the live canvas ` +
+          "nodes failed, so the refresh is NOT confirmed. Reload the ComfyUI tab, then retry."
+        : phase === "record"
+          ? "A fresh /object_info was obtained, but the refresh failed while recording it, " +
+            "BEFORE registration was attempted, so nothing was refreshed. Retry; if it " +
+            "persists, reload the ComfyUI tab."
+          : "A fresh /object_info was obtained but re-registering the node definitions failed, " +
+            "so the refresh is NOT confirmed. Reload the ComfyUI tab, then retry.";
     const remedy =
       reason === NODE_DEF_REFRESH_REASONS.OBJECT_INFO_FETCH_FAILED
         ? "The /object_info fetch failed, so nothing was refreshed. The backend may still be " +
@@ -89,8 +103,7 @@ export function describeNodeDefRefresh({
             "combo lists failed, so dropdown options may still be stale. Retry; if it keeps " +
             "failing, reload the ComfyUI tab to rebuild the combo lists." +
             registrationRemedy
-          : "A fresh /object_info was obtained but re-registering the node definitions failed, " +
-            "so the refresh is NOT confirmed. Reload the ComfyUI tab, then retry.";
+          : registerRemedy;
     return { refreshed: false, reason, detail: detailSuffix(thrown) || undefined, remedy };
   }
   if (!defsObtained) {

@@ -425,3 +425,65 @@ test("#635: the shipping run attributes a getNodeDefs throw to the fetch, with d
   assert.match(verdict.detail, /fetch failed/);
   assert.equal(getConfirmed(), false);
 });
+
+test("#635: a pre-registration throw must not claim registration was attempted (codex r4)", () => {
+  const recordThrew = describeNodeDefRefresh({
+    appAvailable: true,
+    defsObtained: true,
+    defsRegistered: false,
+    comboApiPresent: true,
+    comboRan: false,
+    phase: "record",
+    thrown: new Error("history exploded"),
+  });
+  assert.equal(recordThrew.reason, NODE_DEF_REFRESH_REASONS.REGISTER_FAILED);
+  assert.match(recordThrew.remedy, /BEFORE registration was attempted/);
+  assert.doesNotMatch(recordThrew.remedy, /re-registering the node definitions failed/);
+
+  const reapplyThrew = describeNodeDefRefresh({
+    appAvailable: true,
+    defsObtained: true,
+    defsRegistered: true, // registration DID run — reapply failed after it
+    comboApiPresent: true,
+    comboRan: false,
+    phase: "reapply",
+    thrown: new Error("live node rejected the def"),
+  });
+  assert.equal(reapplyThrew.reason, NODE_DEF_REFRESH_REASONS.REGISTER_FAILED);
+  assert.match(reapplyThrew.remedy, /WERE re-registered/, "true here — registration ran before the throw");
+  assert.match(reapplyThrew.remedy, /live canvas nodes failed/);
+});
+
+test("#635: the shipping run attributes a history-recording throw to BEFORE registration", async () => {
+  let registerCalls = 0;
+  const body = extractFunction("async function registerComfyNodeDefs(");
+  const factory = new Function(
+    "app",
+    "api",
+    "recordObjectInfoTypes",
+    "reapplyDefsToLiveNodes",
+    "describeNodeDefRefresh",
+    `let nodeDefsRefreshConfirmed = false;
+     ${body}
+     return { registerComfyNodeDefs };`,
+  );
+  const { registerComfyNodeDefs: registerWithThrowingRecorder } = factory(
+    {
+      graph: null,
+      registerNodesFromDefs: async () => {
+        registerCalls += 1;
+      },
+      refreshComboInNodes: async () => {},
+    },
+    { getNodeDefs: async () => ({ SomeNode: {} }) },
+    () => {
+      throw new Error("history exploded");
+    },
+    () => {},
+    describeNodeDefRefresh,
+  );
+  const verdict = await registerWithThrowingRecorder(undefined);
+  assert.equal(verdict.reason, "register_failed");
+  assert.match(verdict.remedy, /BEFORE registration was attempted/);
+  assert.equal(registerCalls, 0, "registerNodesFromDefs was never reached");
+});
