@@ -6,6 +6,32 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.41] - 2026-08-05
+
+### Fixed
+- the changelog generator silently dropped the entries that mattered most (#657)
+
+### Changed
+- **`to_node_id` is honoured instead of only refused (#556).** Running "up to node N"
+  used to run the WHOLE graph — a different request executed successfully, spending real
+  GPU time or API-node credits on work nobody asked for. An earlier fix made the panel
+  refuse instead, which was safe but refused every time, so the feature was unusable.
+  A last-resort delivery attempt now writes the scope into the run's own `/prompt` body —
+  the one interface every frontend build shares — identity-gated on the run's mark and
+  content hash, never overwriting a value it cannot interpret, and disclosed via
+  `scope_applied_by`.
+
+  Reading the real frontend sources (1.42.15, 1.47.11, 1.50.1) showed that **every one
+  accepts both `app.queuePrompt` argument shapes**, so the old refusal's assertion that
+  "this frontend build ignored the run-to-node argument" was almost certainly wrong — and
+  three field reports pasted it verbatim into the tracker. The root cause is still unknown;
+  the outcome is now correct regardless of which layer drops the scope, and the next report
+  will be diagnosable. Ten adversarial rounds found ten distinct paths by which a request
+  could still reach the network unscoped — including a retrying run restoring its
+  entry-time `fetchApi` over a concurrent run's guard. #581 needed no code: already fixed
+  on main by #594 and #621.
+
+
 ## [0.11.40] - 2026-08-05
 
 ### Fixed
