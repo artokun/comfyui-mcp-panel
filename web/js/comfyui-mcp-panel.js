@@ -18631,15 +18631,33 @@ function buildPanel() {
     let resolveFn;
     const promise = new Promise((res) => { resolveFn = res; });
 
+    // #8 SIZING. The field is the whole point of this card, and it used to be the
+    // first thing squeezed: on one unwrapped line the two buttons cannot shrink
+    // (their min-content IS the word), so every pixel of loss landed on the input
+    // until it hit a hard `min-width:7rem` — after which the row simply overflowed
+    // the card and forced a horizontal scrollbar across the entire log. Measured on
+    // the shipped declarations: Skip spills past the card edge below ~296px of log
+    // width, and the log h-scrolls below ~264px. A floor the layout then breaks in
+    // order to honor is not a floor.
+    //
+    // So the row WRAPS instead, and each declaration below carries a failure of its
+    // own (each verified by mutating it alone and re-measuring):
+    //   flex-wrap:wrap  — without it nothing wraps and the input shrinks to 18–67px.
+    //   flex:1 1 10rem  — a NON-ZERO basis is what decides the wrap point; `flex:1`
+    //                     (basis 0) also never wraps and shrinks to the same 18–67px.
+    //   min-width:0     — an input's default `min-width:auto` resolves to its
+    //                     intrinsic ~174px, which h-scrolls the log below ~190px.
+    //   flex:none       — see the buttons; declared, not left to min-content.
+    // Wrapping gives the field a whole card-width line rather than a 7rem stub.
     const row = document.createElement("div");
-    row.style.cssText = "display:flex;gap:0.3rem;";
+    row.style.cssText = "display:flex;flex-wrap:wrap;gap:0.3rem;";
     const input = document.createElement("input");
     input.type = "password";
     input.autocomplete = "off";
     input.spellcheck = false;
     input.placeholder = "Paste token…";
     input.style.cssText =
-      "flex:1;min-width:7rem;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
+      "flex:1 1 10rem;min-width:0;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
       "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:0.8rem;";
 
     // Show/record only a masked preview (first 4 … last 4) so the user can
@@ -18669,23 +18687,33 @@ function buildPanel() {
     });
     row.appendChild(input);
 
+    // Save and Skip travel together as ONE flex item, so the row has exactly two
+    // layouts — [field | buttons] or field-on-top / buttons-below — instead of a
+    // third, ragged one where only Skip wrapped and Save stayed marooned beside a
+    // half-width field.
+    const btns = document.createElement("div");
+    btns.style.cssText = "display:flex;gap:0.3rem;flex:none;";
+
     const submit = document.createElement("button");
     submit.type = "button";
+    // flex:none is DECLARED, not inherited from min-content: a later `min-width:0`
+    // here (the usual flexbox reflex) would let the label clip to "Sav".
     submit.style.cssText =
-      "padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:0.8rem;" +
+      "flex:none;padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:0.8rem;" +
       "background:var(--p-primary-color,#3a7bd5);color:#fff;";
     submit.textContent = "Save";
     submit.addEventListener("click", () => finish(input.value.trim()));
-    row.appendChild(submit);
+    btns.appendChild(submit);
 
     const skip = document.createElement("button");
     skip.type = "button";
     skip.style.cssText =
-      "padding:0.35rem 0.6rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
+      "flex:none;padding:0.35rem 0.6rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
       "background:transparent;color:inherit;cursor:pointer;font-size:0.8rem;";
     skip.textContent = "Skip";
     skip.addEventListener("click", () => finish(""));
-    row.appendChild(skip);
+    btns.appendChild(skip);
+    row.appendChild(btns);
 
     card.appendChild(row);
     log.appendChild(card);
