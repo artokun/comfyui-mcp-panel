@@ -1541,10 +1541,123 @@ test("#612: a bare `subgraph:{}` marker that is NOT a real container keeps the #
   assert.equal(node.widgets[0].value, 20, "no mutation");
 });
 
-test("#612: an UNWIRED history oracle still gets the honest diagnosis (the 'no-oracle' arm)", async () => {
-  // "X is not a promoted widget on this node" is graph-locally TRUE whether or not the
-  // history oracle is wired, so the honest refusal does not depend on it. (The panel
-  // always wires the oracle; this pins the branch's behaviour if a caller does not.)
+// ---- The #612 diagnosis must NOT be asserted from an absence of evidence. It claims
+//      the node is a virtual-only container, and that claim needs TWO positive facts:
+//      the current /object_info does NOT define the type, AND the history oracle
+//      positively reports never-seen. Getting either wrong refuses a LEGITIMATE write
+//      and hands the caller a remedy that is actionable but WRONG — worse than a bare
+//      refusal, because it sends them to promote a widget on a node that is not a
+//      subgraph at all. These tests pin both directions: the honest refusal survives,
+//      and the valid direct write is permitted FOR THE FRESH-TYPE REASON. ----
+
+// A backend-defined, subgraph-SHAPED node installed AFTER the startup baseline: the
+// pack's class builds an inner graph (so isVirtualSubgraphContainer says "container"),
+// but the backend genuinely defines the type and it carries a direct OWN widget with no
+// promoted inputs. On its FIRST observation the history oracle honestly reports
+// never-seen — it was not in the baseline — while the fresh /object_info this very call
+// fetched positively defines it.
+const LATE_INSTALLED_TYPE = "AcmeVirtualCompositor";
+function makeLateInstalledContainerNode() {
+  const own = { name: "strength", type: "INT", value: 20 };
+  const ctor = function AcmeVirtualCompositor() {};
+  ctor.nodeData = { input: { required: {} } };
+  return {
+    node: {
+      id: 412,
+      type: LATE_INSTALLED_TYPE,
+      // Container SHAPE — a real nested graph, not a bare `subgraph:{}` marker.
+      subgraph: { _nodes: [], getNodeById: () => null },
+      inputs: [], // nothing promoted onto the boundary
+      widgets: [own],
+      constructor: ctor,
+    },
+    own,
+    ctor,
+  };
+}
+function registryWithLateInstalled() {
+  const reg = loadedRegistry();
+  const { ctor } = makeLateInstalledContainerNode();
+  reg[LATE_INSTALLED_TYPE] = ctor;
+  return reg;
+}
+
+test("#612 regression: a backend-defined container-shaped node added AFTER the baseline ⇒ its direct own-widget write is PERMITTED by fresh-type authorization", async () => {
+  // never-seen history is "the startup baseline did not list it", NOT "the backend does
+  // not define it". The fresh /object_info this call already fetched settles it, and the
+  // fresh-type authorization is entitled to permit the write. Short-circuiting to the
+  // not-promoted diagnosis on history alone refuses a write that worked yesterday.
+  const reg = registryWithLateInstalled();
+  const { node, own } = makeLateInstalledContainerNode();
+  reg[LATE_INSTALLED_TYPE] = node.constructor;
+  let fetches = 0;
+  const { set } = await runSetWidget(node, "strength", 42, {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => {
+      fetches += 1;
+      return objectInfo([LATE_INSTALLED_TYPE]); // the backend DOES define it now
+    },
+    wasTypeEverDefined: () => false, // absent from the startup baseline ⇒ never-seen
+    ...HOOKS,
+  });
+  assert.equal(set.value, 42);
+  assert.equal(own.value, 42, "the write landed on the node's OWN widget");
+  // THE REASON, not just the outcome: the permission came from the FRESH backend
+  // definition. The oracle was actually consulted…
+  assert.equal(fetches, 1, "the fresh /object_info oracle was consulted");
+});
+
+test("#612 regression, the discriminating half: the SAME node with the type ABSENT from fresh /object_info is still REFUSED as not-promoted", async () => {
+  // Paired with the test above, this is what makes "permitted for the fresh-type reason"
+  // an assertion rather than a hope: the ONLY difference between the two is whether the
+  // current /object_info defines the type. Nothing else about the node changed. If the
+  // loosened branch permitted on some other ground, this one would pass too.
+  const reg = registryWithLateInstalled();
+  const { node, own } = makeLateInstalledContainerNode();
+  reg[LATE_INSTALLED_TYPE] = node.constructor;
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "strength", 42, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // the type is NOT defined
+        wasTypeEverDefined: () => false,
+        ...HOOKS,
+      }),
+    (err) => {
+      assert.match(err.message, /is not a promoted widget on this subgraph/);
+      return true;
+    },
+  );
+  assert.equal(own.value, 20, "no mutation");
+});
+
+test("#612: an UNWIRED history oracle falls THROUGH to fresh-type authorization — a live type is PERMITTED", async () => {
+  // `no-oracle` is the could-not-determine case BY DEFINITION: it establishes neither
+  // "never backend-defined" nor safe container identity (backendHistoryVerdict's own
+  // fail-closed contract). It must therefore not short-circuit to the definite "this is
+  // an unpromoted widget on a subgraph" negative — it must defer to the fresh result the
+  // call already fetched, which here positively defines the type.
+  const reg = registryWithLateInstalled();
+  const { node, own } = makeLateInstalledContainerNode();
+  reg[LATE_INSTALLED_TYPE] = node.constructor;
+  const { set } = await runSetWidget(node, "strength", 7, {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => objectInfo([LATE_INSTALLED_TYPE]),
+    // wasTypeEverDefined deliberately OMITTED ⇒ "no-oracle"
+    ...HOOKS,
+  });
+  assert.equal(set.value, 7);
+  assert.equal(own.value, 7, "the valid direct write was not refused for a missing oracle");
+});
+
+test("#612: an UNWIRED history oracle still FAILS CLOSED when the fresh backend does not define the type", async () => {
+  // Falling through is not loosening the refusal — only the diagnosis. With no history
+  // oracle we cannot establish that this UUID node is a genuine container rather than a
+  // removed backend node, so we must not assert the container diagnosis; the fresh-auth
+  // refusal stands and nothing is mutated.
   const reg = loadedRegistry();
   const { parent, railWidget, resolveSource } = makeUuidSubgraphFixture(reg, "KSampler");
   await assert.rejects(
@@ -1558,8 +1671,10 @@ test("#612: an UNWIRED history oracle still gets the honest diagnosis (the 'no-o
         ...HOOKS,
       }),
     (err) => {
-      assert.match(err.message, /is not a promoted widget on this subgraph/);
-      assert.doesNotMatch(err.message, /backend does not provide/i);
+      // Refused — and the message does NOT claim the not-promoted finding, which no
+      // oracle established here.
+      assert.doesNotMatch(err.message, /is not a promoted widget on this subgraph/);
+      assert.match(err.message, /backend does not provide/i);
       return true;
     },
   );

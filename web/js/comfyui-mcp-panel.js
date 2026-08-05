@@ -129,6 +129,7 @@ import {
   resolveMissingModelDirectory,
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing } from "./lib/node-resolve.js";
+import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-labels.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
@@ -6004,20 +6005,40 @@ function summarizeNode(node) {
   for (const w of node.widgets ?? []) {
     if (w && typeof w.name === "string") widgets[w.name] = w.value;
   }
+  // #636: a user-RENAMED slot/widget keeps its programmatic NAME (what panel_set_widget
+  // and panel_connect address) and gains a DISPLAY LABEL. Reporting only the name made
+  // renames invisible, so the agent told the user their renames had not stuck when the
+  // canvas showed them. `label` rides ALONGSIDE `name` and is emitted ONLY when one is
+  // actually carried AND differs — never inferred, never replacing the addressable name.
   const inputs = (node.inputs ?? []).map((inp, i) => {
     let from = null;
     if (inp.link != null) {
       const link = node.graph?.links?.[inp.link];
       if (link) from = { node_id: link.origin_id, output_slot: link.origin_slot };
     }
-    return { slot: i, name: inp.name, type: inp.type, connected_from: from };
+    const label = boundaryInputLabel(inp);
+    return {
+      slot: i,
+      name: inp.name,
+      ...(label != null ? { label } : {}),
+      type: inp.type,
+      connected_from: from,
+    };
   });
-  const outputs = (node.outputs ?? []).map((out, i) => ({
-    slot: i,
-    name: out.name,
-    type: out.type,
-    links: out.links?.length ?? 0,
-  }));
+  const outputs = (node.outputs ?? []).map((out, i) => {
+    const label = displayLabel(out);
+    return {
+      slot: i,
+      name: out.name,
+      ...(label != null ? { label } : {}),
+      type: out.type,
+      links: out.links?.length ?? 0,
+    };
+  });
+  // Renamed widgets only. Keyed by the addressable NAME so the caller can see BOTH the
+  // label the user sees and the name it must use; absent entirely when nothing is
+  // renamed, so an unrenamed node's payload is byte-identical to before.
+  const widgetLabels = widgetLabelMap(node);
   // True RENDERED footprint height for layout. node.size[1] is the BODY only
   // (slots + widgets); the title BAR renders ~30px ABOVE node.pos and isn't in it,
   // so stacking by size[1] overlaps each node by a header. litegraph's getBounding
@@ -6067,6 +6088,10 @@ function summarizeNode(node) {
       ? { control_after_generate: controlAfterGenerate }
       : {}),
     widgets,
+    // #636: widget NAME → the DISPLAY LABEL the user renamed it to, for renamed
+    // widgets only. Address widgets by the KEY (the name); `widget_labels` exists so a
+    // rename is visible instead of looking like it did not stick.
+    ...(Object.keys(widgetLabels).length ? { widget_labels: widgetLabels } : {}),
     // #607: names here are OVERRIDDEN by a link at run time — the value in `widgets`
     // is the stale stored value, NOT what executes. Each entry names the source.
     ...(Object.keys(drivenByLink).length ? { driven_by_link: drivenByLink } : {}),
@@ -6406,8 +6431,18 @@ function describeRails(sub) {
   const wh = (n) => (n?.size ? [Math.round(n.size[0]), Math.round(n.size[1])] : null);
   const inNode = sub.inputNode ?? sub._inputNode ?? null;
   const outNode = sub.outputNode ?? sub._outputNode ?? null;
+  // #636: a RENAMED boundary slot keeps its addressable `name` and reports its display
+  // `label` alongside — only when one is carried and differs (never inferred).
   const slotList = (slots) =>
-    (slots ?? []).map((s, i) => ({ index: i, name: s?.name ?? null, type: s?.type ?? null }));
+    (slots ?? []).map((s, i) => {
+      const label = displayLabel(s);
+      return {
+        index: i,
+        name: s?.name ?? null,
+        ...(label != null ? { label } : {}),
+        type: s?.type ?? null,
+      };
+    });
   return {
     input: inNode
       ? {
@@ -10979,17 +11014,70 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     const finalName =
       typeof name === "string" && name.trim() ? name.trim() : target.title || "Subgraph";
-    const fullType = `${store.typePrefix ?? "SubgraphBlueprint."}${finalName}`;
+    const prefix = store.typePrefix ?? "SubgraphBlueprint.";
+    const fullType = `${prefix}${finalName}`;
+    // #636: the collision preflight must not depend on reconstructing the store's own
+    // key. `typePrefix` is probed with a FALLBACK, so on a frontend that names
+    // blueprints differently the `=== fullType` test silently misses a real collision —
+    // and publishSubgraph() then pops its confirmOverwrite() dialog, which either hangs
+    // this programmatic call on UI or replaces a blueprint the caller never named.
+    // Match on EITHER the full stored key OR its prefix-stripped name, so a collision is
+    // caught whichever way the frontend keys it.
+    const bareName = (d) => {
+      const t = typeof d?.name === "string" ? d.name : "";
+      return t.startsWith(prefix) ? t.slice(prefix.length) : t;
+    };
+    const blueprintList = () => [...(store.subgraphBlueprints ?? [])];
+    const matchesRequested = (d) => d?.name === fullType || bareName(d) === finalName;
     // publishSubgraph() pops a confirmOverwrite() dialog on a name COLLISION — which
     // would hang this programmatic call waiting for UI. Preflight and refuse with a
-    // clear error instead (the agent picks a new name).
-    if ((store.subgraphBlueprints ?? []).some((d) => d?.name === fullType)) {
+    // clear error instead. The remedy must be actionable from where the caller IS:
+    // there is no programmatic delete, so name both real options explicitly rather than
+    // leaving "overwrite isn't supported" as a dead end (#636).
+    const collision = blueprintList().find(matchesRequested);
+    if (collision) {
       throw new Error(
-        `a subgraph blueprint named "${finalName}" already exists — choose a different name (programmatic overwrite isn't supported)`,
+        `a subgraph blueprint named "${finalName}" already exists (type "${collision.name}") and this ` +
+          `tool will not replace it — replacing one programmatically would need ComfyUI's overwrite ` +
+          `dialog, which cannot be answered from here. Either save under a different name, or delete ` +
+          `"${finalName}" from the subgraph library in the ComfyUI UI first and then retry this call.`,
       );
     }
+    const before = blueprintList();
+    const beforeKeys = new Set(before.map((d) => d?.name));
     await store.publishSubgraph(finalName);
-    return { saved: { name: finalName, from_node_id: target.id, type: fullType } };
+    // #636 / rule: never report a save we did not OBSERVE. publishSubgraph resolving is
+    // not evidence the blueprint exists — a dismissed dialog, a rejected name, or a
+    // frontend that sanitizes the name all resolve without publishing what we asked for.
+    // Read the library BACK and report what is actually there.
+    const after = blueprintList();
+    const published = after.find(matchesRequested) ?? null;
+    if (!published) {
+      // Something may still have been added under a name the frontend chose. Say so
+      // precisely rather than claim the requested save, or claim nothing happened.
+      const added = after.filter((d) => !beforeKeys.has(d?.name));
+      if (added.length === 1) {
+        return {
+          saved: {
+            name: bareName(added[0]),
+            from_node_id: target.id,
+            type: added[0]?.name ?? null,
+            requested_name: finalName,
+            note:
+              `ComfyUI published this blueprint under "${bareName(added[0])}", not the requested ` +
+              `"${finalName}" (it sanitizes or de-duplicates names). Use the reported name with ` +
+              `panel_add_subgraph.`,
+          },
+        };
+      }
+      throw new Error(
+        `panel_save_subgraph could not confirm the blueprint "${finalName}" was published: the ` +
+          `subgraph library does not contain it after the publish call` +
+          `${added.length > 1 ? ` (${added.length} entries appeared, none matching the requested name)` : ""}. ` +
+          `Nothing is being reported as saved. Check the ComfyUI subgraph library, then retry.`,
+      );
+    }
+    return { saved: { name: finalName, from_node_id: target.id, type: published.name ?? fullType } };
   },
 
   // List saved subgraph blueprints. Each is addable via graph_add_subgraph(name)

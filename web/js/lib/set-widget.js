@@ -31,8 +31,9 @@ import {
   assertMutatedNodeAuthorized,
   isVirtualSubgraphContainer,
   backendHistoryVerdict,
+  freshBackendDefinesType,
 } from "./node-resolve.js";
-import { controlAfterGenerateWarning } from "./control-after-generate.js";
+import { controlAfterGenerateWarning, controlEntryForWidget } from "./control-after-generate.js";
 import {
   uploadInputConfig,
   uploadInputAccepts,
@@ -109,11 +110,13 @@ export async function runSetWidget(
   //         bypass): otherwise a removed GoneNode with `subgraph:{}` + its own widget
   //         would skip fresh-auth and the stale registry guard would fabricate success.
   //         One exception, still fail-closed: a GENUINE virtual subgraph container
-  //         (never-seen history) with no promoted match is refused UP FRONT with the
-  //         honest "not a promoted widget on this subgraph" diagnosis (#612) — its
-  //         UUID type is never in /object_info, so the generic fresh-auth message
-  //         ("backend does not provide node type <uuid>") misreports a benign
-  //         not-promoted case as a removed pack.
+  //         (POSITIVELY never-seen history AND absent from the fresh /object_info)
+  //         with no promoted match is refused UP FRONT with the honest "not a promoted
+  //         widget on this subgraph" diagnosis (#612) — its UUID type is never in
+  //         /object_info, so the generic fresh-auth message ("backend does not provide
+  //         node type <uuid>") misreports a benign not-promoted case as a removed pack.
+  //         Both facts must be POSITIVE; see the branch below for why neither may be
+  //         inferred from an absence of evidence.
   let freshDefs = null;
   try {
     freshDefs = await getFreshObjectInfo();
@@ -189,9 +192,32 @@ export async function runSetWidget(
     // node whose type the backend reported earlier this session is a REMOVED backend
     // node masquerading as a container and keeps the removed-type diagnosis below,
     // as does a bare `subgraph:{}` marker that is not a real container.
+    //
+    // TWO POSITIVE facts are required before this definite diagnosis may be asserted,
+    // because "not a promoted widget on this SUBGRAPH" claims the node is a virtual-only
+    // container — and getting that wrong refuses a legitimate write while handing the
+    // caller a remedy that is actionable and WRONG (worse than a bare refusal):
+    //
+    //   1. The CURRENT /object_info does NOT define this type. A backend-defined,
+    //      subgraph-capable node ADDED AFTER the startup baseline is `never-seen` on its
+    //      first observation, yet its type IS in the fresh defs this call already
+    //      fetched — it is a real backend node writing its OWN widget directly, and the
+    //      fresh-type authorization below is entitled to PERMIT it. Short-circuiting on
+    //      history alone would refuse that valid direct write as "unpromoted".
+    //   2. The history oracle POSITIVELY reports never-seen. `no-oracle` is the
+    //      could-not-determine case BY DEFINITION — it establishes neither "never
+    //      backend-defined" nor safe container identity (backendHistoryVerdict's own
+    //      fail-closed contract) — so it must FALL THROUGH to the fresh-type
+    //      authorization rather than short-circuit to a definite negative. That path
+    //      still fails closed for a type the backend does not provide; it just stops
+    //      asserting a container diagnosis nothing established.
+    //
+    // "Could not determine whether this is a promoted widget on a subgraph" is not
+    // "determined it is not" — the same fold this cluster exists to correct.
     if (node?.subgraph && isVirtualSubgraphContainer(node)) {
       const containerVerdict = backendHistoryVerdict(node?.type, wasTypeEverDefined);
-      if (containerVerdict === "never-seen" || containerVerdict === "no-oracle") {
+      const liveBackendType = freshBackendDefinesType(freshDefs, node?.type);
+      if (containerVerdict === "never-seen" && !liveBackendType) {
         const promoted = (node.widgets ?? [])
           .map((w) => w?.name)
           .filter((n) => typeof n === "string");
@@ -332,10 +358,46 @@ export async function runSetWidget(
   // actually lives): a nested promotion A→B→KSampler exposes `seed` on B virtually, but
   // the control combo is on KSampler — `authTarget`/`concreteWidgetName` follow the
   // promotion chain to it (both are the node itself for a direct write).
+  //
+  // #650 SCOPE: the remedy has to be executable from the scope the CALLER is in. When
+  // the write went through a promotion, that concrete node is INSIDE the subgraph and
+  // its id does not exist in the caller's graph — following the old unconditional
+  // `panel_set_widget(node_id=<inner id>, …)` returned "No node with id 75 in the
+  // current graph". The reachability below is not a guess: it is read off the SAME
+  // resolution the write itself was driven through.
+  const controlScopeFor = (entry) => {
+    const warnNode = authTarget ?? resolvedTargetNode;
+    // Direct write (or the concrete node IS the node the caller addressed): the control
+    // widget is right there, and the plain form is already actionable.
+    if (!isResolvedPromotion || warnNode === node) return {};
+    const outerNodeId = node?.id;
+    // Is the CONTROL widget itself promoted onto the outer node? Then it is settable
+    // from this scope with no entering at all. Asked of the same resolver the write
+    // used, so a positive answer is an observed promotion, never an assumption.
+    // (Usually NO: ComfyUI marks control_after_generate canvasOnly, so it has no
+    // connectable slot to promote — but a legacy proxyWidgets promotion can exist.)
+    const controlPromotion = resolvePromotedInnerTarget(node, entry.control, resolveSource);
+    if (controlPromotion?.promoted && controlPromotion.target) {
+      const reached = followPromotionToConcrete(controlPromotion.target, resolveSource);
+      if (reached?.node === warnNode && reached?.widget?.name === entry.control) {
+        return { outerNodeId, promotedAs: entry.control };
+      }
+    }
+    // Otherwise it is only reachable from INSIDE: enter the outer container, then every
+    // nested container the promotion is driven through, in that order. The concrete
+    // terminal is never an entry step (collectPromotionIntermediates excludes it).
+    const enterPath = [
+      outerNodeId,
+      ...collectPromotionIntermediates(promotedResolution.target, resolveSource).map((n) => n?.id),
+    ];
+    return { outerNodeId, enterPath };
+  };
   const withWarning = (result) => {
     const warnNode = authTarget ?? resolvedTargetNode;
     const warnWidget = concreteWidgetName ?? writeTargetWidgetName ?? widgetName;
-    const warning = controlAfterGenerateWarning(warnNode, warnWidget);
+    const entry = controlEntryForWidget(warnNode, warnWidget);
+    if (!entry || entry.mode === "fixed") return result;
+    const warning = controlAfterGenerateWarning(warnNode, warnWidget, controlScopeFor(entry));
     return warning ? { ...result, warning } : result;
   };
 

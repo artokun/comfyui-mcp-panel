@@ -187,3 +187,141 @@ test("#558 e2e NESTED: a 'fixed' concrete control yields NO warning", async () =
   assert.equal(res.set.value, 777777);
   assert.equal(res.warning, undefined);
 });
+
+// ---- #650: the warning's REMEDY must be executable from the CALLER'S scope ----
+//
+// Reported: setting a promoted seed on root node 78 returned
+// `panel_set_widget(node_id=75, widget='control_after_generate', value='fixed')`.
+// Node 75 is INSIDE the subgraph; following that at root returns "No node with id 75
+// in the current graph". A remedy the caller cannot follow is worse than none — it
+// reads as a working instruction and costs a round trip to discover otherwise.
+//
+// The reachability below is not inferred from names or shapes: it is read off the SAME
+// promotion resolution the write was driven through.
+
+// The reported shape: outer subgraph node 78 promotes `seed` from inner KSampler 75,
+// whose control_after_generate is NOT promoted (ComfyUI marks it canvasOnly, so it has
+// no connectable slot). `promoteControl` adds a legacy proxyWidgets-style promotion of
+// the control widget itself, which makes it settable from the outer scope directly.
+function promotedSeedFixture(r, mode, { promoteControl = false } = {}) {
+  const seedW = { name: "seed", type: "INT", value: 111 };
+  const controlW = {
+    name: "control_after_generate",
+    type: "combo",
+    value: mode,
+    options: { values: [...CONTROL_AFTER_GENERATE_MODES], serialize: false, canvasOnly: true },
+  };
+  seedW.linkedWidgets = [controlW];
+  const inner = {
+    id: 75,
+    type: "KSampler",
+    widgets: [seedW, controlW],
+    constructor: { nodeData: { input: { required: {} } } },
+  };
+  const rail = { name: "seed", type: "INT", value: 111 };
+  const inputs = [{ name: "seed", _widget: rail, widget: { name: "seed" }, _subgraphSlot: { name: "seed" } }];
+  const widgets = [rail];
+  if (promoteControl) {
+    const controlRail = { name: "control_after_generate", type: "combo", value: mode };
+    inputs.push({
+      name: "control_after_generate",
+      _widget: controlRail,
+      widget: { name: "control_after_generate" },
+      _subgraphSlot: { name: "control_after_generate" },
+    });
+    widgets.push(controlRail);
+  }
+  const outer = {
+    id: 78,
+    type: "SubgraphOuter",
+    widgets,
+    subgraph: { _nodes: [inner], getNodeById: (id) => (String(id) === "75" ? inner : null) },
+    inputs,
+  };
+  r.SubgraphOuter = function SubgraphOuter() {};
+  const resolveSource = (sn, si) => {
+    if (sn !== outer) return null;
+    if (si?.name === "seed") return { sourceNodeId: "75", sourceWidgetName: "seed" };
+    if (si?.name === "control_after_generate") {
+      return { sourceNodeId: "75", sourceWidgetName: "control_after_generate" };
+    }
+    return null;
+  };
+  return { outer, inner, resolveSource };
+}
+
+test("#650: a PROMOTED seed write's remedy enters the owning subgraph — it never hands back a bare inner node id", async () => {
+  const r = reg();
+  const { outer, resolveSource } = promotedSeedFixture(r, "randomize");
+  const res = await runSetWidget(outer, "seed", 777777, {
+    registry: r,
+    getRegistry: () => r,
+    getFreshObjectInfo: async () => ({ KSampler: {} }),
+    resolveSource,
+    ...HOOKS,
+  });
+  assert.equal(res.set.value, 777777, "the write itself still succeeds");
+  assert.match(res.warning, /control_after_generate='randomize'/);
+  // The remedy must START by entering the owning subgraph…
+  assert.match(res.warning, /panel_enter_subgraph\(node_id=78\)/);
+  // …and it must say WHY the plain call would fail, so the caller is not left to
+  // discover "No node with id 75 in the current graph" by running it.
+  assert.match(res.warning, /node 75 does not exist in the graph you are addressing/);
+  assert.match(res.warning, /panel_exit_subgraph\(\)/);
+  // THE REASON, not the shape: the enter step must come BEFORE the inner-node write.
+  assert.ok(
+    res.warning.indexOf("panel_enter_subgraph(node_id=78)") <
+      res.warning.indexOf("panel_set_widget(node_id=75"),
+    "the enter step must precede the inner-node write, or the remedy is still unexecutable",
+  );
+});
+
+test("#650: a DIRECT write's remedy is unchanged — no spurious enter step", async () => {
+  // The scope correction must not add ceremony where the control widget is already
+  // addressable. Deleting the scope logic would make this pass and the one above fail;
+  // hard-coding the enter form would do the reverse. Both directions are pinned.
+  const node = ksamplerWithSeedControl("randomize");
+  const res = await runSetWidget(node, "seed", 777777, wired());
+  assert.match(res.warning, /panel_set_widget\(node_id=3, widget='control_after_generate', value='fixed'\)/);
+  assert.doesNotMatch(res.warning, /panel_enter_subgraph/);
+  assert.doesNotMatch(res.warning, /does not exist in the graph you are addressing/);
+});
+
+test("#650 NESTED: the remedy enters EVERY container the promotion is driven through, in order", async () => {
+  // A→B→KSampler. Entering A alone lands in A's subgraph, where node 90 still does not
+  // exist — the remedy has to name B too, or it is unexecutable one level deeper.
+  const r = reg();
+  const { a, resolveSource } = nestedSeedControl(r, "randomize");
+  const res = await runSetWidget(a, "seed", 777777, {
+    registry: r,
+    getRegistry: () => r,
+    getFreshObjectInfo: async () => ({ KSampler: {} }),
+    resolveSource,
+    ...HOOKS,
+  });
+  assert.match(res.warning, /panel_enter_subgraph\(node_id=70\).*panel_enter_subgraph\(node_id=80\)/s);
+  assert.ok(
+    res.warning.indexOf("panel_enter_subgraph(node_id=80)") <
+      res.warning.indexOf("panel_set_widget(node_id=90"),
+    "both enters must precede the inner-node write",
+  );
+  assert.match(res.warning, /panel_exit_subgraph\(\) 2 times/);
+});
+
+test("#650: when the CONTROL widget is itself promoted, the remedy sets it on the OUTER node with no entering", async () => {
+  // The best remedy available: a legacy proxyWidgets promotion exposes the control on
+  // the boundary, so it IS settable from the caller's scope. Asserted as an OBSERVED
+  // promotion — resolved through the same resolver the write used — never assumed.
+  const r = reg();
+  const { outer, resolveSource } = promotedSeedFixture(r, "randomize", { promoteControl: true });
+  const res = await runSetWidget(outer, "seed", 777777, {
+    registry: r,
+    getRegistry: () => r,
+    getFreshObjectInfo: async () => ({ KSampler: {} }),
+    resolveSource,
+    ...HOOKS,
+  });
+  assert.match(res.warning, /is promoted onto subgraph node 78 as "control_after_generate"/);
+  assert.match(res.warning, /panel_set_widget\(node_id=78, widget='control_after_generate', value='fixed'\)/);
+  assert.doesNotMatch(res.warning, /panel_enter_subgraph/);
+});
