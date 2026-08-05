@@ -33,6 +33,7 @@ import {
   syncNodeArea,
   refreshNodeArea,
 } from "../../web/js/lib/group-geometry.js";
+import { clipOutlineTitle } from "../../web/js/lib/graph-read.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
@@ -48,6 +49,16 @@ const setGroupBoundsSrc = grab(/\nfunction setGroupBounds\(group, \[x, y, w, h\]
 const summarizeGroupSrc = grab(/\nfunction summarizeGroup\(graph, g\) \{[\s\S]*?\n\}/, "summarizeGroup");
 const preflightUndoSrc = grab(/\nfunction describePreflightUndo\(unrestored\) \{[\s\S]*?\n\}/, "describePreflightUndo");
 const moveGroupSrc = grab(/ {2}graph_move_group\(\{ group_id, pos, move_nodes \}\) \{[\s\S]*?\n {2}\},/, "graph_move_group");
+// #614 gave summarizeGroup two new module-scope dependencies (the title clip and the
+// member-id cap). The harness rebuilds that scope by hand, so anything summarizeGroup
+// closes over has to be handed in explicitly — otherwise the extracted source throws
+// ReferenceError, the handler's own error net swallows it, and every assertion here
+// fails against an error reply instead of the behaviour it means to pin. Read the cap
+// OUT of the shipped source rather than restating it, so a change to the shipped value
+// cannot leave these tests passing against a number the panel no longer uses.
+const GROUP_NODE_IDS_CAP = Number(
+  grab(/\nconst GROUP_NODE_IDS_CAP = (\d+);/, "GROUP_NODE_IDS_CAP").match(/(\d+)/)[1],
+);
 const moveGroupLabelSrc = grab(/ {4}case "graph_move_group": \{[\s\S]*?\n {4}\}/, 'the graph_move_group activity label');
 
 /** The real shipped handler, wired to the real shipped geometry lib.
@@ -80,6 +91,8 @@ function realMoveGroup(graph, overrides = {}) {
     "describeItems",
     "describeThrown",
     "syncNodeArea",
+    "clipOutlineTitle",
+    "GROUP_NODE_IDS_CAP",
     `"use strict";
      ${resolveGroupSrc}
      ${setGroupBoundsSrc}
@@ -102,6 +115,8 @@ function realMoveGroup(graph, overrides = {}) {
     describeItems,
     describeThrown,
     syncNodeArea,
+    clipOutlineTitle,
+    GROUP_NODE_IDS_CAP,
   );
 }
 
@@ -1347,18 +1362,32 @@ test("#408 P0: a node list that dies MID-WALK still yields a rollback, not a raw
 
 // ---- the transaction ends at SERIALIZATION, not at the last write ----------
 
-test("#408 P0: a title whose toJSON throws still yields the completed counts, not a lost reply", () => {
-  // summarizeGroup returns `title` UNCOERCED, so a title with a throwing toJSON
+test("#408 P0: a summary field whose toJSON throws still yields the completed counts, not a lost reply", () => {
+  // summarizeGroup returns `color` UNCOERCED, so a value with a throwing toJSON
   // lets it succeed and then makes the bridge's JSON.stringify fail — after the
   // move, outside the guard, where the caller receives no success response at all
   // and re-issues. That is the double move summary_unavailable exists to prevent,
   // surviving one layer further out than the guard reached.
+  //
+  // This test used to aim at `title`. #614 put every title through
+  // clipOutlineTitle, which does String(title ?? "") and so COERCES it long before
+  // serialization — closing that particular hole as a side effect (pinned by the
+  // next test). `color` is the field that is still handed through untouched, so the
+  // invariant is re-aimed at it rather than retired: the point was never "titles
+  // are dangerous", it is that the transaction is not over until the reply
+  // serializes, and ANY uncoerced field can end it late.
   const a = node(7, [50, 50], [60, 40]);
-  const hostileTitle = {
-    toJSON() { throw new TypeError("title toJSON is a revoked proxy"); },
-    toString() { return "Hostile"; },
+  const hostileColor = {
+    toJSON() { throw new TypeError("color toJSON is a revoked proxy"); },
+    toString() { return "#333"; },
   };
-  const g = { id: 1, title: hostileTitle, _bounding: [0, 0, 400, 400], recomputeInsideNodes() {} };
+  const g = {
+    id: 1,
+    title: "Fine",
+    color: hostileColor,
+    _bounding: [0, 0, 400, 400],
+    recomputeInsideNodes() {},
+  };
   const graph = makeGraph({ nodes: [a], groups: [g] });
 
   let out;
@@ -1370,6 +1399,29 @@ test("#408 P0: a title whose toJSON throws still yields the completed counts, no
   assert.match(out.summary_unavailable, /do NOT re-issue the move/);
   // And the whole reply must itself survive the boundary it is about to cross.
   assert.doesNotThrow(() => JSON.stringify(out), "the reply the bridge will serialize must be serializable");
+});
+
+test("#614: a title whose toJSON throws is COERCED, so it never degrades the reply", () => {
+  // The guarantee #614 added, pinned so that removing the coercion is caught here
+  // and not by a lost reply in production. A throwing toJSON on the title must not
+  // reach JSON.stringify at all: clipOutlineTitle stringifies via toString first,
+  // so this move keeps its FULL summary rather than falling back to
+  // summary_unavailable. Asserting the degraded path is absent is the point — a
+  // bare "the reply serializes" would pass either way.
+  const a = node(7, [50, 50], [60, 40]);
+  const hostileTitle = {
+    toJSON() { throw new TypeError("title toJSON is a revoked proxy"); },
+    toString() { return "Hostile"; },
+  };
+  const g = { id: 1, title: hostileTitle, _bounding: [0, 0, 400, 400], recomputeInsideNodes() {} };
+  const graph = makeGraph({ nodes: [a], groups: [g] });
+
+  const out = realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
+
+  assert.equal(out.summary_unavailable, undefined, "the title no longer costs the caller its summary");
+  assert.equal(out.group.title, "Hostile", "coerced through toString, not through toJSON");
+  assert.deepEqual(out.moved, { nodes: 1, groups: 0, reroutes: 0 });
+  assert.doesNotThrow(() => JSON.stringify(out));
 });
 
 test("#408 P0: a BigInt group_id on the FALLBACK path still yields a serializable completion reply", () => {
@@ -1404,9 +1456,17 @@ test("#408 P0: a BigInt group_id on the FALLBACK path still yields a serializabl
 
 test("#408: a serializable group_id is still reported on the fallback path", () => {
   // The degraded reply drops the id only when it has to; an ordinary id survives.
+  // Aimed at `color` for the same reason as above: #614 coerces titles, so a hostile
+  // title no longer reaches the fallback path this test is about.
+  const hostileColor = { toJSON() { throw new TypeError("gone"); } };
   const a = node(7, [50, 50], [60, 40]);
-  const hostileTitle = { toJSON() { throw new TypeError("gone"); } };
-  const g = { id: 1, title: hostileTitle, _bounding: [0, 0, 400, 400], recomputeInsideNodes() {} };
+  const g = {
+    id: 1,
+    title: "Fine",
+    color: hostileColor,
+    _bounding: [0, 0, 400, 400],
+    recomputeInsideNodes() {},
+  };
   const graph = makeGraph({ nodes: [a], groups: [g] });
 
   const out = realMoveGroup(graph)({ group_id: 1, pos: [1000, 1000] });
