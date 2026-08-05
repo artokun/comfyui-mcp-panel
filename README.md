@@ -13,9 +13,13 @@ Claude or ChatGPT (your own subscription, no API key).**
 **Stuck or have a question? [Join the Discord](https://discord.gg/cW9arBhzCu)** — or hit **🆘 Need help?** in the panel's Settings → About (it copies a diagnostics summary and opens the Discord for you).
 
 Pick a provider — **Claude** or **ChatGPT** — and the matching agent runs in the background on
-*your* subscription, sees the graph you're looking at, and edits it live. Both providers reach
-**full feature parity**: the same live-canvas tools, the same model knowledge, the same one-shot
-workflow loads, the same cost guardrail.
+*your* subscription, sees the graph you're looking at, and edits it live. Every provider is
+**offered the same surface**: the same live-canvas tools, the same model knowledge, the same
+one-shot workflow loads, the same cost guardrail. Offered, not guaranteed received — a provider
+applies its own tool budget to what we hand it, and Codex was seen dropping the live-canvas tools
+silently ([#291](https://github.com/artokun/comfyui-mcp-panel/issues/291)). That is fixed upstream,
+and the panel now asks the agent to say so rather than improvise if it ever recurs — see
+[What the agent can do](#what-the-agent-can-do).
 
 Part of the **[comfyui-mcp](https://github.com/artokun/comfyui-mcp)** project — the local-first,
 agent-native control plane for ComfyUI (MCP server + agent orchestrator). Full documentation at
@@ -117,10 +121,28 @@ backend, provider slash commands (`/compact`, `/loop`, …) are available too.
 The agent drives the workflow you're viewing through a **fixed allowlist** of
 `panel_*` commands (no arbitrary JavaScript). Every graph mutation goes through
 LiteGraph's change tracking, so ComfyUI's native **Ctrl+Z** reverts an agent
-edit exactly like your own. **Both providers expose this identical surface** —
-the `panel_*` tools live in one shared definition list, registered onto the
-in-process Claude Agent SDK server *and* a loopback HTTP MCP the orchestrator
-hosts for the ChatGPT/Codex backend, so feature parity is automatic.
+edit exactly like your own. The `panel_*` tools live in one shared definition
+list, registered onto the in-process Claude Agent SDK server *and* a loopback
+HTTP MCP the orchestrator hosts for the ChatGPT/Codex and other CLI backends, so
+both surfaces are identical **as served**.
+
+They are not automatically identical **as received**, and this page used to claim
+they were. A backend applies its own tool budget to everything it is handed, and
+Codex was observed silently dropping the entire panel MCP server once the ~250
+headless comfyui tools saturated that budget — the tools were advertised, the
+model never got them, and it improvised (saving a workflow file instead of
+editing the canvas) rather than saying it could not
+([#291](https://github.com/artokun/comfyui-mcp-panel/issues/291)). The cause is
+fixed upstream in comfyui-mcp — the non-Claude lane now spawns comfyui in compact
+mode, leaving budget for `panel_*` — so keep comfyui-mcp current.
+
+Because the panel cannot see the agent's toolset, it does not pretend to check.
+It asks the agent once per session to look, and to say so plainly instead of
+improvising — both when the canvas tools are absent and when one is listed but
+its call fails. If you ever see that message: update comfyui-mcp; unset
+`COMFYUI_MCP_TOOL_MODE=full` and drop MCP servers you don't need from that
+backend's own config; then `/restart`, or switch the chat to the Claude backend,
+which receives `panel_*` by a different route.
 
 **Read**
 

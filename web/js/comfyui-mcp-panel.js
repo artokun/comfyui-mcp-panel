@@ -170,6 +170,12 @@ import {
   clipOutlineTitle,
 } from "./lib/graph-read.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
+import {
+  CANVAS_TOOL_DISCLOSURE,
+  commandProvesExposure,
+  planCanvasToolDisclosure,
+  startsNewAgentSession,
+} from "./lib/canvas-tool-disclosure.js";
 import { safeRemoveNode } from "./lib/safe-remove-node.js";
 import {
   classifyLtxTimelineWrite,
@@ -5279,6 +5285,34 @@ let lastAgentGraphKey = null;
 // "100+ nodes removed" notice that the very next live graph read contradicted.
 let lastAgentGraphEpoch = -1;
 let sessionEpoch = 0;
+
+// #291 — live-canvas tool exposure.
+//
+// agentSessionEpoch counts AGENT-session generations, which is NOT sessionEpoch
+// above. sessionEpoch tracks the SOCKET binding; a toolset belongs to the agent,
+// and `/new`, closing a thread, and picking a chat out of history all hand the
+// next turn to a fresh agent over the SAME live socket. Scoping to sessionEpoch
+// carried the old agent's proof and old disclosure onto that new model, which
+// received neither. So this bumps on a socket (re)connect AND on every
+// AGENT_SESSION_RESET_FRAMES frame.
+let agentSessionEpoch = 0;
+// canvasToolsProvenEpoch is the ONLY evidence the panel has about the agent's
+// toolset, and it is one-directional: a `cmd` frame reaches this panel solely
+// because the model invoked a panel_* tool (panel-tools.ts is the only caller of
+// the bridge's command send), so receiving one PROVES the tools are exposed in
+// that generation. Not receiving one proves nothing — a session with no canvas
+// work to do looks identical from here — so this is never read as "unavailable".
+// See lib/canvas-tool-disclosure.js for why the panel discloses rather than checks.
+// …with one qualification, which is why commandProvesExposure() exists: a command
+// is a response to a TURN, so a command arriving in a generation this panel has not
+// yet prompted is a straggler from the outgoing agent, not evidence about the new
+// one. canvasToolMessagedEpoch is the generation of the last user_message that
+// actually reached the wire, and gates that.
+let canvasToolsProvenEpoch = null;
+let canvasToolMessagedEpoch = null;
+// The generation CANVAS_TOOL_DISCLOSURE was last prepended in — once per agent
+// session, not once per turn.
+let canvasToolDisclosedEpoch = null;
 
 const MODE_NAME = { 0: "active", 2: "mute", 4: "bypass" };
 const modeName = (m) => MODE_NAME[m] ?? `mode${m ?? 0}`;
@@ -12747,6 +12781,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // baseline captured before this boundary instead of diffing it against a
       // possibly rebound / mid-reload canvas (a false "manual edits" delta).
       sessionEpoch++;
+      // (#291's agent-session generation advances in sendHello() below, which this
+      // handler always reaches — a new socket is a new agent session, and so is
+      // every later re-hello on this one.)
       // A bare WS open is NOT progress — the orchestrator handshake (`models`)
       // hasn't arrived yet. Do NOT reset attempt/gaveUp here (only markConnected
       // does), so an open-then-close-before-`models` cycle still INCREMENTS toward
@@ -13466,6 +13503,16 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
 
   function sendHello() {
     if (!sock || sock.readyState !== WebSocket.OPEN) return;
+    // #291 — a hello BINDS this socket to an agent session, and not always the one
+    // it was bound to a moment ago. Besides the socket-open hello, the panel
+    // re-hellos the LIVE socket to follow the user's workflow tabs, and with the
+    // session key cleared that hello spawns a clean agent outright — no
+    // `new_session` frame is sent, so `sendFrame`'s reset never fires and the
+    // previous agent's proof and disclosure would carry onto a model that received
+    // neither. `hello` is in AGENT_SESSION_RESET_FRAMES for that reason; it is
+    // bumped below rather than in sendFrame only because sendHello, not sendFrame,
+    // dispatches it. This also covers the socket-open hello, so no separate bump is
+    // needed in the open handler.
     const target = sock;
     void sendBridgeHello({
       socket: target,
@@ -13514,9 +13561,32 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // replayLostReplies, computed with the SAME epoch the replay uses.
         });
       },
-    }).catch(() => {
-      // Reconnect path will retry.
-    });
+    })
+      .then((sent) => {
+        // #291 — advance the agent-session generation ONLY once the hello is
+        // actually ON THE WIRE. sendBridgeHello resolves false when identity
+        // resolution outlived this socket (superseded / closed), and rejects when
+        // the send throws; in both cases NO hello reached the orchestrator, so no
+        // new agent exists and the current generation is still the right one.
+        //
+        // Advancing before the send was the inverse of the bug this whole module
+        // exists to fix: it invalidated a WORKING agent's proof and re-asked a
+        // session that demonstrably had the tools whether it had them. "Recorded
+        // before it happened" is the same defect as #621's interaction lock
+        // registering its holder before the freeze write landed and #836's
+        // panel-op lock releasing a claim it no longer owned.
+        //
+        // The in-flight window needs no extra state. A `user_message` frame carries
+        // NO tab id (only sendFrame stamps one), so the orchestrator can route it
+        // only by the binding this socket already has — and frames on one socket are
+        // ordered anyway, so a message sent while this hello is still awaiting
+        // identity is written BEFORE the hello. Either way it is handled by the
+        // pre-hello agent, which is exactly the generation it was stamped with.
+        if (sent) agentSessionEpoch++;
+      })
+      .catch(() => {
+        // Reconnect path will retry. No hello landed, so no generation advance.
+      });
   }
 
   // When the workflow title changes (rename / open a different file / progress
@@ -13608,11 +13678,35 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       const mergedContext =
         [pendingContext, serializeContext(context)].filter(Boolean).join("\n\n") || undefined;
       pendingContext = null;
+      // #291 — ask the agent, ONCE per session generation, to check whether the
+      // panel_* live-canvas tools actually reached its toolset, and tell it what to
+      // do if they did not. The panel never asserts they are missing; it cannot
+      // know that (see lib/canvas-tool-disclosure.js).
+      //
+      // THIS is the choke point, deliberately — not the composer. The composer is
+      // only one of the paths that opens a turn; the post-restart and soft-reload
+      // RESUME nudges are others, and they are the worst ones to miss. They fire
+      // on a brand-new socket (a fresh session generation, whose toolset is exactly
+      // what is in question) and they say "continue exactly what you were doing" —
+      // an instruction a model with no canvas tools cannot follow and, per #291,
+      // will improvise around instead of refusing. Every user_message on the wire
+      // goes through here, so the once-per-generation scope is real rather than
+      // once-per-generation-if-the-user-happened-to-type-first.
+      //
+      // Prepended, so it reads before the message it rides on: a model with no
+      // canvas tools must decide before it starts, not after it has improvised.
+      const disclosure = planCanvasToolDisclosure({
+        agentEpoch: agentSessionEpoch,
+        provenEpoch: canvasToolsProvenEpoch,
+        disclosedEpoch: canvasToolDisclosedEpoch,
+      });
+      const disclosed = disclosure.disclose && typeof text === "string";
+      const outText = disclosed ? CANVAS_TOOL_DISCLOSURE + text : text;
       try {
         sock.send(
           JSON.stringify({
             type: "user_message",
-            text,
+            text: outText,
             ...(mergedContext ? { context: mergedContext } : {}),
             ...(images?.length ? { images: normalizeImageList(images) } : {}),
             // Client message id — the orchestrator echoes it in the "working"
@@ -13620,6 +13714,19 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             ...(mid ? { mid } : {}),
           }),
         );
+        // Mark it sent only AFTER the send returned. sock.send() throws on a socket
+        // that closed between the readyState check above and here, and stamping
+        // before it would spend the one disclosure this generation gets on a frame
+        // that never left — leaving the retry, which is exactly the turn that needs
+        // it, silent. (Bytes accepted is still not bytes received; that residual is
+        // the same one every frame on this socket has, and a redundant disclosure
+        // on the next turn is the harmless direction.)
+        if (disclosed) canvasToolDisclosedEpoch = agentSessionEpoch;
+        // This generation has now been PROMPTED, so a command arriving from here on
+        // can plausibly be its answer. Until this point any command belongs to the
+        // agent this one replaced (see commandProvesExposure). Also after the send,
+        // for the same reason: a message that never left prompted nothing.
+        canvasToolMessagedEpoch = agentSessionEpoch;
         return true;
       } catch {
         return false;
@@ -13643,6 +13750,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       }
       try {
         sock.send(JSON.stringify({ tab_id: workflowTabId(), ...frame }));
+        // #291 — `new_session` / `resume_session` hand the next turn to a different
+        // agent over THIS same socket (/new, closing a thread, opening one from
+        // history), so the socket generation does not move and, without this, the
+        // outgoing agent's proof and disclosure would suppress the paragraph for a
+        // fresh model that got neither. Bumped AFTER the send for the same reason
+        // the disclosure stamp is: a frame that threw never reset anything.
+        if (startsNewAgentSession(frame?.type)) agentSessionEpoch++;
         return true;
       } catch {
         return false;
@@ -20186,6 +20300,16 @@ function buildPanel() {
     // via onCommand; the activity marking lives here so silent commands count too.
     onCommandReceived() {
       noteActivity();
+      // #291 — this frame is proof the model HAS the panel_* tools in this session
+      // generation: nothing but a panel_* tool invocation produces a command frame.
+      // Stamping it here (not in onCommand) covers SILENT commands too, and covers
+      // a command that goes on to FAIL — a tool that errors is still a tool the
+      // model was given, which is the only thing this stamp claims. Whether it is
+      // THIS generation's evidence at all is the module's call, not a check written
+      // out here (see commandProvesExposure — an in-flight command from an agent
+      // the user just replaced must not vouch for its successor).
+      if (commandProvesExposure({ agentEpoch: agentSessionEpoch, messagedEpoch: canvasToolMessagedEpoch }))
+        canvasToolsProvenEpoch = agentSessionEpoch;
     },
     onCommand(cmd, msg, reply) {
       appendActivity(cmd, msg, reply);
