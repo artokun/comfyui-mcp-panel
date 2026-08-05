@@ -352,6 +352,14 @@ export function createLocalContent(ctx, shell, opts = {}) {
       setLog("No pod selected — paste a pod ID, or Deploy a new one.", "err");
       return;
     }
+    // PRE-EXISTING, not a consolidation regression: the orchestrator's direct-call
+    // admission refuses `start` (and `create` below) because both put a pod into a
+    // BILLING state, and a confirmation-less mirrored/foreign tab must not be able
+    // to spend money. Both names were dropped from the whitelist in core #278, long
+    // before slice 8 — so these two buttons already returned "not permitted"; only
+    // the wording of the refusal changes here. Making them work again is a product
+    // decision (route through an agent turn, or scope admission to a confirmed
+    // click), deliberately NOT taken in this migration step.
     run("Starting " + id, () => callTool("runpod", { action: "start", pod_id: id }));
   });
   stopBtn.addEventListener("click", () => {
