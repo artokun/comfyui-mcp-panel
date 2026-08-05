@@ -8627,32 +8627,37 @@ const GRAPH_TOOL_EXECUTORS = {
       );
     }
     const before = snapshotGraphState(graph);
+    // The mutation can throw AFTER partially applying (a node hook or the
+    // cascade failing midway). Capture the error and STILL verify the
+    // post-state — a raw throw would read as "nothing changed" and invite a
+    // destructive retry of a disconnect that may have landed.
+    let mutationError = null;
     graph.beforeChange();
     try {
       node.disconnectInput(inIdx);
-    } finally {
+    } catch (err) {
+      mutationError = err;
+    }
+    let envelopeError = null;
+    try {
       graph.afterChange();
+    } catch (err) {
+      envelopeError = err;
     }
     graph.setDirtyCanvas(true, true);
     const verdict = verifyDisconnect(graph, node, before, removedLink.linkId);
-    if (!verdict.ok) {
-      // The mutation ALREADY happened — disclose exactly what was observed
-      // (never refuse after the fact: that reports failure for a disconnect
-      // that may have landed and invites a destructive retry). The panel
-      // cannot safely restore deleted nodes itself; the change is inside one
-      // beforeChange/afterChange envelope, so a single Ctrl+Z reverts it.
+    // Shared disclosure bullets: observed post-state facts ONLY — the verifier
+    // proves what changed, never why, so no bucket is narrated as a cause.
+    const disclosureBullets = () => {
       const lines = [
-        `panel_disconnect on node ${node.id} input "${inputName}" did not complete cleanly (#668):`,
-      ];
-      lines.push(
         verdict.intendedRemoved
           ? `- the intended link (from node ${removedLink.node_id} output "${removedLink.output}") WAS removed`
-          : `- the intended link (from node ${removedLink.node_id} output "${removedLink.output}") is STILL PRESENT — the disconnect did not take effect`,
-      );
+          : `- the intended link (from node ${removedLink.node_id} output "${removedLink.output}") is STILL PRESENT on the live graph`,
+      ];
       if (verdict.missingNodes.length) {
         lines.push(
-          `- node(s) ${verdict.missingNodes.join(", ")} were REMOVED from the graph — ` +
-            `this is the #668 cascade: unrelated nodes deleted by a disconnect`,
+          `- node(s) ${verdict.missingNodes.join(", ")} were REMOVED from the graph during this ` +
+            `disconnect — they were not the disconnect target`,
         );
       }
       if (verdict.addedNodes.length) {
@@ -8668,18 +8673,43 @@ const GRAPH_TOOL_EXECUTORS = {
           `- a link APPEARED that this disconnect did not create: node ${l.origin_id} output ${l.origin_slot} → node ${l.target_id} input ${l.target_slot}`,
         );
       }
-      lines.push(
-        `The change already happened and the panel did not fabricate a success. ` +
-          `Press Ctrl+Z in the ComfyUI tab to undo, then re-check the graph with ` +
-          `panel_graph_outline BEFORE queueing anything — a silently deleted output ` +
-          `node runs to completion and saves nothing.`,
+      return lines;
+    };
+    const undoRemedy =
+      `The state above is what the live graph ACTUALLY shows; the panel did not fabricate a ` +
+      `success. Press Ctrl+Z in the ComfyUI tab to undo, then re-check the graph with ` +
+      `panel_graph_outline BEFORE queueing anything — a silently deleted output node runs ` +
+      `to completion and saves nothing.`;
+    if (mutationError || envelopeError) {
+      throw new Error(
+        [
+          `panel_disconnect on node ${node.id} input "${inputName}" threw (#668): ` +
+            `${mutationError?.message ?? mutationError ?? ""}` +
+            (envelopeError ? ` (afterChange also threw: ${envelopeError?.message ?? envelopeError})` : ""),
+          `Post-state check of the live graph:`,
+          ...disclosureBullets(),
+          undoRemedy,
+        ].join("\n"),
       );
-      throw new Error(lines.join("\n"));
     }
-    // Boundary-slot disclosure: a subgraph (or dynamic) node may drop the
-    // now-unlinked input slot itself. That is a legitimate cascade, but it
-    // shifts slot indices — a follow-up disconnect by NAME is safe, by INDEX
-    // is not, unless the caller re-resolves first.
+    if (!verdict.ok) {
+      // The mutation ALREADY happened — disclose exactly what was observed
+      // (never refuse after the fact: that reports failure for a disconnect
+      // that may have landed and invites a destructive retry). The panel
+      // cannot safely restore deleted nodes itself; the change is inside one
+      // beforeChange/afterChange envelope, so a single Ctrl+Z reverts it.
+      throw new Error(
+        [
+          `panel_disconnect on node ${node.id} input "${inputName}" did not complete cleanly (#668):`,
+          ...disclosureBullets(),
+          undoRemedy,
+        ].join("\n"),
+      );
+    }
+    // Boundary-slot disclosure: a subgraph (or dynamic) node may change its
+    // input slots on disconnect. That is a legitimate cascade, but it shifts
+    // slot indices — a follow-up disconnect by NAME is safe, by INDEX is not,
+    // unless the caller re-resolves first.
     const inputNamesAfter = (node.inputs ?? []).map((s) => s?.name ?? null);
     const slotsShifted =
       inputNamesBefore.length !== inputNamesAfter.length ||
@@ -8690,9 +8720,9 @@ const GRAPH_TOOL_EXECUTORS = {
       ...(slotsShifted
         ? {
             warning:
-              `the node's input slots changed during the disconnect (a now-unlinked ` +
-              `slot was removed, shifting indices) — re-resolve input names with ` +
-              `panel_graph_outline before any further disconnect by index`,
+              `the node's input slots changed during the disconnect (count, order, or names ` +
+              `differ) — re-resolve input names with panel_graph_outline before any further ` +
+              `disconnect by index`,
           }
         : {}),
     };
