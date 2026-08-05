@@ -256,6 +256,10 @@ test("#646 wiring: the async write boundary re-checks the gate (a dispatch can s
     "the pre-write revalidation consults the same live signals",
   );
   assert.ok(
+    body.indexOf("graphMutationReconnectGate({") < body.indexOf("getGraphCtx()"),
+    "the gate fires BEFORE getGraphCtx — the probe can change the canvas (the rebind heal), which would falsify 'nothing changed' (codex r7)",
+  );
+  assert.ok(
     body.indexOf("graphMutationReconnectGate({") < body.indexOf("assertGraphBoundToActiveWorkflow("),
     "the gate fires BEFORE the write-boundary binding assert",
   );

@@ -7007,23 +7007,25 @@ function captureGraphMutationContext() {
 }
 
 function revalidateGraphMutationContext(captured) {
-  const current = { ...getGraphCtx(), workflow: activeWorkflowRef() };
-  if (!sameGraphMutationContext(captured, current, sameWorkflowObject)) {
-    throw new Error(
-      "The active workflow or graph view changed while this node was preparing; nothing was added. Retry on the intended tab.",
-    );
-  }
   // #646: the dispatch-time gate can go stale DURING an async preflight — a
   // backend reconnect that starts while /object_info is being awaited would let
-  // the write below land on a canvas the restore is about to rebuild. Re-check
-  // the same gate at the write boundary; nothing has been written yet, so its
-  // "NOT applied" claim stays true here.
+  // the write below land on a canvas the restore is about to rebuild. The gate
+  // runs FIRST, before getGraphCtx and the context comparison: those probes can
+  // themselves change the canvas (the verified rebind heal), which would falsify
+  // the refusal's "NOT applied — nothing changed" claim (codex gate r6/r7).
+  // Nothing has been written to the graph yet, so the claim is true here.
   const reconnectGate = graphMutationReconnectGate({
     cmd: "graph_add_node",
     backendDown: comfyBackendSocketDown,
     bindingSettleWindow: postReconnectBindingSettleWindow(),
   });
   if (reconnectGate) throw new Error(reconnectGate);
+  const current = { ...getGraphCtx(), workflow: activeWorkflowRef() };
+  if (!sameGraphMutationContext(captured, current, sameWorkflowObject)) {
+    throw new Error(
+      "The active workflow or graph view changed while this node was preparing; nothing was added. Retry on the intended tab.",
+    );
+  }
   assertGraphBoundToActiveWorkflow(current.graph, current.rootGraph, {
     ...MUTATION_BINDING_BAR,
   });
