@@ -2595,12 +2595,15 @@ function getSetting(id) {
     return undefined;
   }
 }
-/** Conversation ownership. The legacy boolean remains a read-only migration
- *  source so existing users keep their chosen behavior. */
+/** Conversation ownership (mcp#884 — owner-stated invariant): the conversation
+ *  ALWAYS belongs to the panel. One agent session spans every workflow and every
+ *  tab; the orchestrator keys and persists it (in ~/.comfyui-mcp/sessions), so a
+ *  workflow-scoped chat is a bug, never a mode. The old "workflow"/"ask" scopes
+ *  are retired — their stored setting values are ignored (not migrated), and
+ *  per-workflow threads created under them remain in history, reachable through
+ *  the history picker like any archived conversation. */
 function chatScopeMode() {
-  const mode = getSetting(SETTING_CHAT_SCOPE);
-  if (mode === "panel" || mode === "workflow" || mode === "ask") return mode;
-  return getSetting(SETTING_SESSION_FOLLOWS_PANEL) === false ? "workflow" : "panel";
+  return "panel";
 }
 function setSetting(id, value) {
   try {
@@ -3036,27 +3039,10 @@ function panelSettingsList() {
         panelHooks.applyBackend?.(v);
       },
     },
-    {
-      id: SETTING_CHAT_SCOPE,
-      name: "Chat conversation scope",
-      category: cat("General", "Chat conversation scope"),
-      sortOrder: 146,
-      tooltip:
-        "Panel: one conversation follows every canvas. Workflow: each saved workflow has its own persistent set of chats, " +
-        "identified by an embedded UUID so renames keep history and copies separate. Ask: choose whether to carry the " +
-        "current conversation whenever you switch workflows. All modes survive full ComfyUI/MCP restarts.",
-      type: "combo",
-      options: [
-        { value: "panel", text: "Panel — one chat across workflows" },
-        { value: "workflow", text: "Workflow — separate chat histories" },
-        { value: "ask", text: "Ask whenever the workflow changes" },
-      ],
-      defaultValue: getSetting(SETTING_SESSION_FOLLOWS_PANEL) === false ? "workflow" : "panel",
-      onChange: (v) => {
-        if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyChatScope?.(v);
-      },
-    },
+    // mcp#884 — the "Chat conversation scope" combo is retired: the conversation
+    // is ALWAYS panel-owned (one session across every workflow and tab, keyed and
+    // persisted by the orchestrator). chatScopeMode() is hard-wired to "panel";
+    // a stored "workflow"/"ask" value from an older build is simply ignored.
     {
       id: SETTING_AUTOCONNECT,
       name: "Auto-connect on load",
