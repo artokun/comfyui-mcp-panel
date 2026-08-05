@@ -725,6 +725,15 @@ function setupListeners() {
 // Community + support. The Discord is the one-tap "I'm stuck" channel surfaced
 // in Settings → About (Join + Need help buttons) and linked from the README.
 const DISCORD_INVITE_URL = "https://discord.gg/cW9arBhzCu";
+// The docs site. Not the only place things are written down — the README and the
+// `setup` command's own output cover some of the same ground — but it is the one a
+// panel user can actually reach, and until now NOTHING in this panel linked to it.
+// That is a measured cost, not a hypothetical one: community
+// users have asked for features that already shipped and were documented (#111),
+// because a panel user's entire discovery path was an empty-state sentence, four
+// prompt chips, a nine-item slash list and a Discord invite. A link is not a
+// capability index and does not pretend to be one — it is the missing signpost.
+const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
@@ -2778,6 +2787,36 @@ function panelSettingsList() {
         a.target = "_blank";
         a.rel = "noopener noreferrer";
         a.textContent = "⭐ Star comfyui-mcp-panel on GitHub";
+        a.style.cssText =
+          "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
+          "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
+          "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:0.8rem;white-space:nowrap;";
+        return a;
+      },
+    },
+    {
+      // A link row — "📖 Read the docs". Sits ABOVE Discord deliberately: asking a
+      // human was previously the ONLY exit from the panel, so the community carried
+      // questions the docs already answered (#111).
+      id: "comfyui-mcp.readDocs",
+      name: "Documentation",
+      category: cat("About", "Documentation"),
+      sortOrder: 199.5,
+      // Names the DESTINATION, not the mechanism. This row renders into ComfyUI's
+      // own Settings dialog, which is OUTSIDE the sidebar root that wireExternalLinks
+      // delegates on — so unlike /docs there is no openExternalUrl in the path at
+      // all, just the anchor's native target=_blank. Where that lands (a tab, the
+      // desktop build's system browser, or nowhere if a popup blocker eats it) is
+      // neither chosen nor observed here. A link tooltip's job is to say where the
+      // link goes.
+      tooltip:
+        "Guides for the panel, tools, local LLMs and troubleshooting — comfyui-mcp.artokun.io/docs",
+      type: () => {
+        const a = document.createElement("a");
+        a.href = DOCS_URL;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.textContent = "📖 Read the docs";
         a.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
@@ -15062,7 +15101,16 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
 });
 
 /** Open a URL outside the panel frame — never navigate the app/webview itself.
- *  Prefers a desktop external-open bridge if present, else a new browser tab. */
+ *  Prefers a desktop external-open bridge if present, else a new browser tab.
+ *
+ *  BEST-EFFORT AND NEVER THROWS. Callers use this fire-and-forget, often after
+ *  something has already suppressed the anchor's native navigation (the delegated
+ *  link handler) — so an exception escaping here does not fall back to anything, it
+ *  just aborts whatever the caller was doing next. /docs hit exactly that: a
+ *  throwing window.open killed the statement that puts the URL in the transcript,
+ *  and the user was left with "/docs failed: …" and no address to copy. Every exit
+ *  is guarded; a caller that needs the user to have the URL must print it
+ *  regardless, not conditionally on this returning. */
 function openExternalUrl(href) {
   if (!href) return;
   try {
@@ -15071,13 +15119,36 @@ function openExternalUrl(href) {
       window.comfyAPI?.electron?.openExternal ||
       window.api?.openExternal;
     if (typeof ext === "function") {
-      ext(href);
+      // The bridge opener is usually ASYNC (Electron's shell.openExternal returns
+      // a Promise). The try/catch above only guards a SYNCHRONOUS throw, so a
+      // rejected promise escaped it entirely: nothing opened, nothing fell back,
+      // and the rejection surfaced only as an unhandled-rejection in the console.
+      // A guard that covers one of the two failure shapes is not a guard.
+      // Promise.resolve() normalizes both a promise and a plain return value, and
+      // is itself inside the try — so a non-thenable that throws on access still
+      // reaches the window.open fallback below.
+      const opened = Promise.resolve(ext(href));
+      opened.catch(() => {
+        // Bridge refused. Honor the documented contract — "else a new browser
+        // tab" — rather than leaving the caller with nothing.
+        try {
+          window.open(href, "_blank", "noopener,noreferrer");
+        } catch {
+          // Nothing left to try; the caller's message names the URL so the user
+          // can still open it by hand.
+        }
+      });
       return;
     }
   } catch {
     // fall through to window.open
   }
-  window.open(href, "_blank", "noopener,noreferrer");
+  try {
+    window.open(href, "_blank", "noopener,noreferrer");
+  } catch {
+    // Popup blocked / window.open unavailable. There is nothing further to try,
+    // and throwing would only take the caller down with it (see the header note).
+  }
 }
 
 /** Open a chat media URL in a new tab. Bridge-delivered images on remote pods
@@ -18631,15 +18702,33 @@ function buildPanel() {
     let resolveFn;
     const promise = new Promise((res) => { resolveFn = res; });
 
+    // #8 SIZING. The field is the whole point of this card, and it used to be the
+    // first thing squeezed: on one unwrapped line the two buttons cannot shrink
+    // (their min-content IS the word), so every pixel of loss landed on the input
+    // until it hit a hard `min-width:7rem` — after which the row simply overflowed
+    // the card and forced a horizontal scrollbar across the entire log. Measured on
+    // the shipped declarations: Skip spills past the card edge below ~296px of log
+    // width, and the log h-scrolls below ~264px. A floor the layout then breaks in
+    // order to honor is not a floor.
+    //
+    // So the row WRAPS instead, and each declaration below carries a failure of its
+    // own (each verified by mutating it alone and re-measuring):
+    //   flex-wrap:wrap  — without it nothing wraps and the input shrinks to 18–67px.
+    //   flex:1 1 10rem  — a NON-ZERO basis is what decides the wrap point; `flex:1`
+    //                     (basis 0) also never wraps and shrinks to the same 18–67px.
+    //   min-width:0     — an input's default `min-width:auto` resolves to its
+    //                     intrinsic ~174px, which h-scrolls the log below ~190px.
+    //   flex:none       — see the buttons; declared, not left to min-content.
+    // Wrapping gives the field a whole card-width line rather than a 7rem stub.
     const row = document.createElement("div");
-    row.style.cssText = "display:flex;gap:0.3rem;";
+    row.style.cssText = "display:flex;flex-wrap:wrap;gap:0.3rem;";
     const input = document.createElement("input");
     input.type = "password";
     input.autocomplete = "off";
     input.spellcheck = false;
     input.placeholder = "Paste token…";
     input.style.cssText =
-      "flex:1;min-width:7rem;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
+      "flex:1 1 10rem;min-width:0;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
       "background:var(--p-surface-900,#1e1e1e);color:inherit;font-size:0.8rem;";
 
     // Show/record only a masked preview (first 4 … last 4) so the user can
@@ -18669,23 +18758,38 @@ function buildPanel() {
     });
     row.appendChild(input);
 
+    // Save and Skip travel together as ONE flex item, so the row has exactly two
+    // layouts — [field | buttons] or field-on-top / buttons-below — instead of a
+    // third, ragged one where only Skip wrapped and Save stayed marooned beside a
+    // half-width field.
+    const btns = document.createElement("div");
+    btns.style.cssText = "display:flex;gap:0.3rem;flex:none;";
+
     const submit = document.createElement("button");
     submit.type = "button";
+    // flex:none is DECLARED rather than left to min-content. On its own that is
+    // belt-and-braces — with flex:none in place, adding `min-width:0` here changes
+    // nothing, because a non-shrinking item never consults its minimum. What it
+    // guards against is the PAIR: the measured mutant made the buttons shrinkable
+    // AND gave them min-width:0, and only then did the label clip to "Sav" and the
+    // group spill the card at 320/280px. Stating the intent stops a future
+    // "everything gets min-width:0" sweep from supplying the missing half.
     submit.style.cssText =
-      "padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:0.8rem;" +
+      "flex:none;padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:0.8rem;" +
       "background:var(--p-primary-color,#3a7bd5);color:#fff;";
     submit.textContent = "Save";
     submit.addEventListener("click", () => finish(input.value.trim()));
-    row.appendChild(submit);
+    btns.appendChild(submit);
 
     const skip = document.createElement("button");
     skip.type = "button";
     skip.style.cssText =
-      "padding:0.35rem 0.6rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
+      "flex:none;padding:0.35rem 0.6rem;border-radius:6px;border:1px solid var(--p-surface-500,#555);" +
       "background:transparent;color:inherit;cursor:pointer;font-size:0.8rem;";
     skip.textContent = "Skip";
     skip.addEventListener("click", () => finish(""));
-    row.appendChild(skip);
+    btns.appendChild(skip);
+    row.appendChild(btns);
 
     card.appendChild(row);
     log.appendChild(card);
@@ -22664,10 +22768,47 @@ function buildPanel() {
       run: () => runLocalCommand("graph_get_errors", {}),
     },
     {
+      cmd: "/docs",
+      icon: "pi-book",
+      hint: "open the docs — guides for the panel, tools, local LLMs and troubleshooting",
+      // openExternalUrl, not window.location: in the ComfyUI desktop app an in-frame
+      // navigation hijacks the whole window with no way back.
+      //
+      // The note claims NOTHING about what happened. Neither destination reports
+      // back — the desktop bridge hands off to the system browser, the web build
+      // opens a popup — so "opening" and "in a new tab" would both be states we
+      // never observed, and the second is simply wrong on desktop. What is left is
+      // the URL (true unconditionally) and a conditional remedy that costs nothing
+      // if it did open and rescues the user if it did not.
+      //
+      // The note goes in FIRST. It is the remedy for the open having failed, so
+      // sequencing it after the attempt made it conditional on that attempt not
+      // throwing — precisely backwards. openExternalUrl is guarded and should not
+      // throw, but a remedy that depends on its own failure path staying healthy is
+      // not a remedy.
+      run: () => {
+        appendSystem(`Docs: ${DOCS_URL} — if nothing opened, copy that address.`);
+        openExternalUrl(DOCS_URL);
+      },
+    },
+    {
       cmd: "/help",
       icon: "pi-question-circle",
       hint: "list commands",
-      run: () => appendSystem(SLASH_COMMANDS.map((c) => `${c.cmd} — ${c.hint}`).join(" · ")),
+      // These are PANEL SHORTCUTS, not a list of what the agent can do — so /help
+      // says where the rest lives rather than leaving the reader to conclude this is
+      // everything (#111). Joined with the same " · " as the rest of the line, NOT
+      // newlines: .cmcp-sys has no white-space:pre-wrap, so a "\n" here would
+      // silently collapse to a space. Deliberately no tool names or counts either —
+      // the tool surface is being consolidated (mcp RFC #726) and a number baked
+      // into this string would start rotting the day it was written.
+      run: () =>
+        appendSystem(
+          [
+            ...SLASH_COMMANDS.map((c) => `${c.cmd} — ${c.hint}`),
+            `these are panel shortcuts; for what the agent itself can do, see the docs: ${DOCS_URL}`,
+          ].join(" · "),
+        ),
     },
   ];
 
