@@ -704,6 +704,17 @@ function nodesInstallDeps(overrides) {
     isManagerUnreachable,
     isManagerRouteMissing,
     dialectRetryTarget,
+    // #671: the command budget + stall classifier the extracted nodes_install
+    // now closes over. A generous budget keeps these tests on their original
+    // code paths (no stall translation); the budget behavior itself is covered
+    // in manager-install.test.mjs. The classifier mirrors the production
+    // isStallError: abort-primitive names + detect's own mid-probe abort ONLY —
+    // never a message-regex that would swallow a real Manager verdict.
+    NODES_INSTALL_COMMAND_BUDGET_MS: 25000,
+    isStallError: (err) =>
+      err?.name === "AbortError" ||
+      err?.name === "TimeoutError" ||
+      String(err?.message ?? "").startsWith("ComfyUI-Manager dialect detection was aborted mid-probe"),
     reProbeManagerDialect: async () => "v2",
     managerQueueControl: async () => {},
     verifyInstalled: async () => ({ state: "installed", status: QUEUE_STATUS }),
