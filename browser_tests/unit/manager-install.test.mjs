@@ -703,9 +703,7 @@ test("#671 verifyInstalled (real panel source) answers 'unverified' inside the r
       return Promise.resolve({ is_processing: true, done_count: 0, total_count: 1 });
     }
     if (route === "customnode/installed") {
-      return new Promise((_, reject) => {
-        opts?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
-      });
+      return hangUntilAbort(opts);
     }
     return Promise.reject(new Error(`unexpected route ${route}`));
   };
@@ -857,17 +855,28 @@ function loadNodesInstall({ budgetMs, detect, reProbe, managerV2, managerCall, m
 }
 
 // A request that never answers, failing ONLY when its abort signal fires — the
-// shape of a stalled Manager call under api.fetchApi. The 30s fallback keeps a
-// mutant that DROPS the budget signal from hanging the suite: the test then
-// fails its elapsed bound instead of never returning.
+// shape of a stalled Manager call under api.fetchApi. The ref'd fallback timer
+// is load-bearing TWICE: (1) a mutant that DROPS the budget signal fails the
+// test's elapsed bound instead of hanging the suite; (2) AbortSignal.timeout's
+// timer is UNREF'D in Node, so a promise that waits only on "abort" can leave
+// the event loop EMPTY — the runner then cancels the test with "Promise
+// resolution is still pending but the event loop has already resolved" (CI run
+// 31050277380). The fallback keeps the loop alive and is cleared when the abort
+// fires, so it never delays a passing suite.
 function hangUntilAbort(opts, fallbackMs = 30000) {
   return new Promise((_, reject) => {
     const fail = () =>
       reject(Object.assign(new Error("The operation timed out"), { name: "TimeoutError" }));
+    const fallback = setTimeout(fail, fallbackMs);
     if (opts?.signal) {
-      opts.signal.addEventListener("abort", fail, { once: true });
-    } else {
-      setTimeout(fail, fallbackMs);
+      opts.signal.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(fallback);
+          fail();
+        },
+        { once: true },
+      );
     }
   });
 }
@@ -904,13 +913,7 @@ test("#671 nodes_install (real panel source) answers inside the reply window whe
   // The install POST hangs forever (signal-aware); every other call answers.
   const managerV2 = (route, opts) => {
     if (route === "manager/queue/task") {
-      return new Promise((_, reject) => {
-        opts?.signal?.addEventListener(
-          "abort",
-          () => reject(Object.assign(new Error("The operation timed out"), { name: "TimeoutError" })),
-          { once: true },
-        );
-      });
+      return hangUntilAbort(opts);
     }
     return Promise.reject(new Error(`unexpected route ${route}`));
   };
