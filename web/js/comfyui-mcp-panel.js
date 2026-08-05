@@ -135,6 +135,9 @@ import { assertAddNodeResolvableRefreshing } from "./lib/node-resolve.js";
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-labels.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer } from "./lib/refresh-coalesce.js";
+import { describeNodeDefRefresh } from "./lib/node-def-refresh.js";
+import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
+import { watchPostReconnectSettle, graphMutationReconnectGate } from "./lib/reconnect-recovery.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
 import { todoItemGlyph } from "./lib/plan-glyph.js";
 import {
@@ -311,6 +314,7 @@ import {
   graphRootWorkflowUuidMatches,
   graphRootMatchesState,
   graphCommandBindingBar,
+  graphCommandMayMutateWorkflow,
   MUTATION_BINDING_BAR,
   graphBindingRefusalMessage,
   resolveGraphBindingVerdict,
@@ -426,6 +430,21 @@ let backendReconnectedAt = null;
 // The reconnect epoch value at the last authoritative (re)bind by an explicit
 // open/new; when it's >= backendReconnectEpoch the active pointer is trusted again.
 let activeWorkflowResyncEpoch = 0;
+// #663/#646: the reconnect epoch whose CANVAS BINDING has been re-proven since the
+// reconnect — by the proactive settle watch (kickPostReconnectSettleWatch) running
+// the same evidence bar a graph read runs, or by an explicit workflow_open/new,
+// whose receipts are stronger proof. Until proofEpoch >= backendReconnectEpoch,
+// graph MUTATIONS are gated (graphMutationReconnectGate): a mutation dispatched
+// before the restored binding is proven can land on a canvas the restore is about
+// to rebuild. Reads keep their own evidence bars and are not gated.
+let postReconnectBindingProofEpoch = 0;
+// Supersede token for the settle watch — a newer reconnect retires the older watch.
+let postReconnectWatchToken = 0;
+// #646: ComfyUI's own backend socket is DOWN between its "reconnecting" and
+// "reconnected" events (a null "status" payload is the same lost-connection
+// signal). A graph mutation dispatched in that gap can be applied and then wiped
+// by the incoming restore — so mutations are refused while this holds.
+let comfyBackendSocketDown = false;
 // #402 — OPEN RECEIPTS. Every workflow_open / workflow_new that RAN is journaled here
 // with the selector it was asked for, the identity it resolved to, and whether it
 // applied. When a mid-command drop loses the reply, this is the ONLY non-inferential
@@ -633,15 +652,32 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // combo refresh has ACTUALLY RUN and succeeded. If refreshComboInNodes is absent on
   // this ComfyUI build (or throws), the combos are still whatever page-load left them
   // — possibly stale — so we must stay in over-report-safe mode (finding #4).
-  let comboRefreshed = false;
+  //
+  // #635: the run's outcome is a VERDICT (lib/node-def-refresh.js), not a bare
+  // boolean — {refreshed:false} alone was indistinguishable from a no-op, so the
+  // verdict carries the reason (which step did not complete) and an actionable
+  // remedy. Each phase is tracked so a throw is attributed to the step that
+  // actually failed instead of being bucketed as a generic failure.
+  let appAvailable = false;
+  let defs = preloadedDefs ?? null;
+  let defsRegistered = false;
+  let comboApiPresent = false;
+  let comboRan = false;
+  let phase = "fetch";
+  let thrown = null;
+  // Tracked separately from the caught VALUE: a library can throw a FALSY value
+  // (throw null / 0 / "") and `if (thrown)` would then read a failed run as a
+  // clean one — misattributing the verdict and, worse, setting the shared
+  // confirmed flag after a throw (codex gate r5).
+  let didThrow = false;
   try {
     const a = typeof app !== "undefined" && app ? app : window.comfyAPI?.app?.app;
-    if (!a) return false;
+    if (!a) return describeNodeDefRefresh({ appAvailable: false, defsObtained: false, defsRegistered: false, comboApiPresent: false, comboRan: false });
+    appAvailable = true;
     // Obtain an AUTHORITATIVE /object_info payload up front (preloaded, or a fresh
     // getNodeDefs) — this is the OBSERVABLE proof of a real server fetch that gates
     // combo trust below. Decoupled from registerNodesFromDefs so the trust signal
     // doesn't hinge on that method existing (codex #2).
-    let defs = preloadedDefs ?? null;
     if (!defs && typeof api?.getNodeDefs === "function") {
       defs = await api.getNodeDefs();
     }
@@ -658,37 +694,50 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // let a provenance-stripped husk squatting a reserved allowlisted name through the
     // frontend-only exemption. ONLY seedObjectInfoHistory() — the STARTUP baseline, whose
     // observation window begins at page load — may call markObjectInfoHistorySeeded().
+    // (A throw here is attributed to "record": the fetch itself already succeeded,
+    // and registration has not been attempted yet — the verdict must not claim it.)
+    phase = "record";
     recordObjectInfoTypes(defs);
     // Re-register node definitions so newly installed/updated classes and their
-    // current widget schemas are known to LiteGraph (#221/#171).
+    // current widget schemas are known to LiteGraph (#221/#171). defsRegistered
+    // is set ONLY when the registration call actually ran — a frontend without
+    // registerNodesFromDefs must not let the verdict claim it (codex gate r2 P1).
+    phase = "register";
     if (defs && typeof a.registerNodesFromDefs === "function") {
       await a.registerNodesFromDefs(defs);
+      defsRegistered = true;
     }
     // registerNodesFromDefs mints NEW classes; already-loaded node INSTANCES keep
     // their old constructor and would never see the fresh schema. Stamp the fresh
     // def onto existing instances + repair UNKNOWN widgets (finding #3).
+    phase = "reapply";
     if (defs) {
       const rootGraph = a.graph ?? a.canvas?.graph;
       if (rootGraph) reapplyDefsToLiveNodes(rootGraph, defs);
     }
     // Refresh combo widget option lists (model dropdowns etc.) so freshly installed
     // models resolve and stale entries clear (#185/#181/#223).
-    let comboRan = false;
-    if (typeof a.refreshComboInNodes === "function") {
+    phase = "combo";
+    comboApiPresent = typeof a.refreshComboInNodes === "function";
+    if (comboApiPresent) {
       await a.refreshComboInNodes();
       comboRan = true;
     }
+    phase = "done";
+  } catch (e) {
+    thrown = e;
+    didThrow = true;
+    console.warn("[comfyui-mcp-panel] node-def refresh after reconnect failed:", e);
+  } finally {
     // Trust the live combos for suppressing missing-asset candidates ONLY when BOTH an
     // authoritative /object_info payload was actually obtained this call AND the combo
     // lists were refreshed from it. refreshComboInNodes resolving alone is not proof —
     // without a fetched `defs`, combos may still be the stale page-load snapshot, and
     // trusting them could suppress a genuine miss (finding #4 / codex #2). Failing to
-    // the FALSE side keeps us in over-report-safe mode.
-    comboRefreshed = !!defs && comboRan;
-  } catch (e) {
-    console.warn("[comfyui-mcp-panel] node-def refresh after reconnect failed:", e);
-  } finally {
-    nodeDefsRefreshConfirmed = comboRefreshed;
+    // the FALSE side keeps us in over-report-safe mode. The shared global keeps the
+    // pre-#635 semantics exactly: true only when this run completed with an
+    // authoritative payload AND a completed combo refresh.
+    nodeDefsRefreshConfirmed = !didThrow && !!defs && comboRan;
   }
   // RETURN this run's own verdict so a caller can trust the combo based on the result
   // of ITS refresh, independent of the shared nodeDefsRefreshConfirmed global — which a
@@ -696,7 +745,7 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // coalescer forwards this through a forced trailing run, so get_errors' awaited
   // `force:true` refresh resolves to the freshness verdict of the fetch IT triggered
   // (codex round-6 P0).
-  return comboRefreshed;
+  return describeNodeDefRefresh({ appAvailable, defsObtained: !!defs, defsRegistered, comboApiPresent, comboRan, phase, didThrow, thrown });
 }
 
 // Single-flight refresh that never drops a caller-supplied fresh payload (#289 P2).
@@ -725,17 +774,25 @@ function setupListeners() {
     });
     // While the backend socket is down, distrust the combos (they may be about
     // to change) so a stale combo can't suppress a genuine miss (finding #4).
+    // #646: the same down-signal gates graph MUTATIONS — a mutation dispatched
+    // while the backend is away can be applied and then wiped by the incoming
+    // restore.
     api.addEventListener("reconnecting", () => {
       nodeDefsRefreshConfirmed = false;
+      comfyBackendSocketDown = true;
     });
     api.addEventListener("status", (ev) => {
       // A null status payload is ComfyUI's "backend connection lost" signal.
-      if (ev?.detail == null) nodeDefsRefreshConfirmed = false;
+      if (ev?.detail == null) {
+        nodeDefsRefreshConfirmed = false;
+        comfyBackendSocketDown = true;
+      }
     });
     // ComfyUI's own socket to its backend re-establishing is the reliable
     // in-tab signal that the server came back after a restart — refresh the
     // stale node registry + combos then (#221/#171/#185/#181).
     api.addEventListener("reconnected", () => {
+      comfyBackendSocketDown = false;
       // #433: the frontend may now restore a stale/wrong active tab — bump the
       // epoch and arm the monotonic possibly-stale window. Bumping the epoch
       // invalidates any EARLIER resync so a pre-reconnect open can't clear this
@@ -748,6 +805,12 @@ function setupListeners() {
       // re-probes the backend that is actually answering now.
       invalidateManagerDialectCache();
       void refreshComfyNodeDefs();
+      // #663: PROACTIVELY re-prove the canvas binding instead of leaving the
+      // settle window to run its full 30s (or, for a restore that never
+      // settles, to hard-refuse until a manual panel_open_workflow/reload).
+      // The watch runs only the same safe heals a graph command runs lazily;
+      // it never repaints the canvas from serialized state (#604).
+      kickPostReconnectSettleWatch(backendReconnectEpoch);
     });
   } catch {
     // api unavailable — graph_get_errors reports null.
@@ -4781,6 +4844,44 @@ function postReconnectSettleWindow() {
   });
 }
 
+// #663/#646 — the BINDING-side view of the settle window: open while the #433
+// window is armed AND the canvas binding has not been re-proven for the current
+// epoch. This is the one invariant the #646 mutation gate consults; reads and
+// the #618 mid-population verdict keep consulting postReconnectSettleWindow()
+// directly, unchanged.
+function postReconnectBindingSettleWindow() {
+  return (
+    postReconnectSettleWindow() &&
+    postReconnectBindingProofEpoch < backendReconnectEpoch
+  );
+}
+
+// #663 — kick the proactive post-reconnect settle watch for THIS reconnect epoch.
+// The proof is the SAME evidence bar a graph read runs (getGraphCtx performs its
+// verified scope reconcile; the assert applies the full read bar and its
+// rebind/seal heals), so "proven" here means the next command's fence has already
+// been observed to pass — never a weaker proxy. The watch performs no canvas
+// repaint and no workflow mutation; when the restore never settles it simply
+// stops, and the binding refusals keep their existing remedies.
+function kickPostReconnectSettleWatch(epoch) {
+  const token = ++postReconnectWatchToken;
+  void watchPostReconnectSettle({
+    isCurrent: () => token === postReconnectWatchToken && epoch === backendReconnectEpoch,
+    windowOpen: () => postReconnectBindingSettleWindow(),
+    proveBinding: () => {
+      const { graph, rootGraph } = getGraphCtx();
+      assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: true });
+      return true;
+    },
+    markProven: () => {
+      if (epoch === backendReconnectEpoch) postReconnectBindingProofEpoch = epoch;
+    },
+  }).catch(() => {
+    // Best-effort: the watch must never surface an unhandled rejection, and a
+    // failed watch leaves the pre-#663 behavior (window runs to expiry).
+  });
+}
+
 function assertGraphBoundToActiveWorkflow(
   graph,
   rootGraph,
@@ -6202,16 +6303,19 @@ function hasRawMissingAssetCandidates() {
 // case is today's staleness, never a hung tool call (codex #5). The refresh
 // promise itself keeps running (the coalescer owns it) and benefits a later
 // call.
-// Resolves to the refresh's OWN freshness verdict (registerComfyNodeDefs returns TRUE
-// only when it authoritatively fetched /object_info AND refreshed combos), or FALSE if
-// the refresh errored or the timeout wins first. get_errors trusts the combo on this
-// returned value — NOT the shared nodeDefsRefreshConfirmed global, which a concurrent
-// refresh can overwrite mid-await against a stale combo (codex round-5/6 P0). Never
-// rejects; a timeout or failure falls to FALSE ⇒ distrust ⇒ over-report.
+// Resolves to the refresh's OWN freshness verdict (registerComfyNodeDefs' verdict
+// is refreshed:true only when it authoritatively fetched /object_info, registered
+// the defs, AND refreshed combos), or FALSE if the refresh errored or the timeout
+// wins first. get_errors
+// trusts the combo on this returned value — NOT the shared nodeDefsRefreshConfirmed
+// global, which a concurrent refresh can overwrite mid-await against a stale combo
+// (codex round-5/6 P0). Never rejects; a timeout or failure falls to FALSE ⇒
+// distrust ⇒ over-report. The verdict became an OBJECT in #635; the boolean arm is
+// kept so a stale shape can never read as fresh.
 function withRefreshTimeout(promise, timeoutMs) {
   return Promise.race([
     Promise.resolve(promise).then(
-      (v) => v === true,
+      (v) => v === true || (v != null && typeof v === "object" && v.refreshed === true),
       () => false,
     ),
     new Promise((resolve) => setTimeout(() => resolve(false), timeoutMs)),
@@ -6966,6 +7070,19 @@ function captureGraphMutationContext() {
 }
 
 function revalidateGraphMutationContext(captured) {
+  // #646: the dispatch-time gate can go stale DURING an async preflight — a
+  // backend reconnect that starts while /object_info is being awaited would let
+  // the write below land on a canvas the restore is about to rebuild. The gate
+  // runs FIRST, before getGraphCtx and the context comparison: those probes can
+  // themselves change the canvas (the verified rebind heal), which would falsify
+  // the refusal's "NOT applied — nothing changed" claim (codex gate r6/r7).
+  // Nothing has been written to the graph yet, so the claim is true here.
+  const reconnectGate = graphMutationReconnectGate({
+    cmd: "graph_add_node",
+    backendDown: comfyBackendSocketDown,
+    bindingSettleWindow: postReconnectBindingSettleWindow(),
+  });
+  if (reconnectGate) throw new Error(reconnectGate);
   const current = { ...getGraphCtx(), workflow: activeWorkflowRef() };
   if (!sameGraphMutationContext(captured, current, sameWorkflowObject)) {
     throw new Error(
@@ -6991,11 +7108,24 @@ const GRAPH_TOOL_EXECUTORS = {
   // completed download already triggers automatically. GLOBAL (not tied to the active
   // graph, so it carries no workflow_path and skips the pinned-target guard),
   // undo-neutral, idempotent. Resolves to the refresh's OWN freshness verdict —
-  // refreshComfyNodeDefs returns true only when it authoritatively fetched /object_info
-  // AND refreshed combos — so the tool reply reflects a real fetch, not just a no-op.
+  // refreshed:true only when it authoritatively fetched /object_info AND refreshed
+  // combos — so the tool reply reflects a real fetch, not just a no-op.
+  // #635: a non-fresh verdict now says WHY (reason) and what to do about it
+  // (remedy) — a bare {ok:true, refreshed:false} was indistinguishable from a
+  // no-op and left the caller guessing whether the call did anything.
   async refresh_nodes() {
-    const refreshed = await refreshComfyNodeDefs(undefined, { force: true });
-    return { ok: true, refreshed: !!refreshed };
+    const verdict = await refreshComfyNodeDefs(undefined, { force: true });
+    const refreshed = verdict === true || (verdict != null && typeof verdict === "object" && verdict.refreshed === true);
+    if (refreshed) return { ok: true, refreshed: true };
+    return {
+      ok: true,
+      refreshed: false,
+      reason: verdict?.reason ?? "unknown",
+      ...(verdict?.detail ? { detail: verdict.detail } : {}),
+      remedy:
+        verdict?.remedy ??
+        "The refresh did not complete and the panel could not determine why. Retry; if it persists, reload the ComfyUI tab.",
+    };
   },
   // Full-fidelity capture of the live canvas — the ROOT graph's serialized UI
   // JSON (the same shape ComfyUI writes to disk on save), so the orchestrator
@@ -10575,6 +10705,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // against the epoch we STARTED on, but only if no reconnect intervened during
     // the async work (else its tab-restore may have overridden us — leave armed).
     if (backendReconnectEpoch === openedForEpoch) activeWorkflowResyncEpoch = openedForEpoch;
+    // #663/#646: a created tab's binding is proven by creation — stamp the binding
+    // proof too so the post-reconnect mutation gate opens for this epoch.
+    if (backendReconnectEpoch === openedForEpoch) postReconnectBindingProofEpoch = openedForEpoch;
     // #402 — workflow_new ALSO authoritatively re-points `active`, so it gets a receipt
     // too: a lost reply here leaves the caller unable to tell whether a blank tab was
     // created (and re-issuing would create a SECOND one, unlike the idempotent open).
@@ -10958,6 +11091,10 @@ const GRAPH_TOOL_EXECUTORS = {
         // the epoch we STARTED on, but only if no reconnect intervened during the async
         // open (else its tab-restore may have overridden us — leave the window armed).
         if (backendReconnectEpoch === openedForEpoch) activeWorkflowResyncEpoch = openedForEpoch;
+        // #663/#646: this open only reaches here with a PROVEN rebind receipt, which is
+        // stronger proof than the settle watch's — stamp the binding proof so the
+        // post-reconnect mutation gate opens for this epoch.
+        if (backendReconnectEpoch === openedForEpoch) postReconnectBindingProofEpoch = openedForEpoch;
       // #442 — read the on-disk bytes AS LATE AS POSSIBLE (after openWorkflow + repaint),
       // so an external write during those awaits is still detected. wasOpen was captured
       // before openWorkflow; the baseline (originalContent) is unchanged by an already-open
@@ -12561,8 +12698,20 @@ const GRAPH_TOOL_EXECUTORS = {
   // Navigate INTO a subgraph node so the canvas (and therefore every graph_*
   // editor) targets its inner graph — the way to read/edit nodes inside a
   // subgraph. Pair with graph_exit_subgraph to return to the root.
-  graph_enter_subgraph({ node_id }) {
-    const { graph, canvas } = getGraphCtx();
+  //
+  // #619: the navigation is not complete when openSubgraph returns — the canvas
+  // can land on the subgraph a beat later and the workflow tracker can still be
+  // mid-capture, so a bare call let the IMMEDIATELY following graph read refuse
+  // with [root-shape-mismatch] on a valid navigation, and a silent no-op would
+  // have reported `entered` for a canvas that never moved. The receipt below
+  // polls (bounded) until the canvas observably shows the subgraph AND the
+  // binding guard a read would run clears — so `settled:true` means the next
+  // read has already been proven to pass. Refuse when the navigation did not
+  // take effect; DISCLOSE (settled:false) when it did but the binding has not
+  // caught up — the act already happened, so reporting failure would invite a
+  // pointless re-navigation.
+  async graph_enter_subgraph({ node_id }) {
+    const { app: comfyApp, graph, canvas } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     const sub = node.subgraph;
     if (!sub) throw new Error(`Node ${node.id} (${node.type}) is not a subgraph`);
@@ -12571,7 +12720,109 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     canvas.openSubgraph(sub, node);
     canvas.setDirty?.(true, true);
-    return { entered: node.id, viewing: describeActiveGraph(getGraphCtx().graph) };
+    const receipt = await confirmCanvasNavigation({
+      readCanvasGraph: () => comfyApp?.canvas?.graph ?? null,
+      target: sub,
+      // The SAME evidence bar a following read runs (getGraphCtx performs its
+      // verified scope reconcile; the assert applies the full read bar), so a
+      // passed receipt is a proven pass for the next graph_* read — not a
+      // weaker proxy for one.
+      assertBound: () => {
+        const ctx = getGraphCtx();
+        assertGraphBoundToActiveWorkflow(ctx.graph, ctx.rootGraph, {
+          includeBaselineReadGuard: true,
+        });
+      },
+    });
+    if (!receipt.landed && !receipt.everLanded) {
+      // Never OBSERVED on the target is not proof the navigation never happened
+      // — a landing displaced between two polls is invisible to a sampler
+      // (codex gate r5). Say what is known (no observation) and make the next
+      // step a scope READ, not a blind retry of a possibly-applied navigation.
+      throw new Error(
+        `panel_enter_subgraph could not confirm that the canvas moved into node ${node.id}'s ` +
+          `subgraph: no observation ever saw the canvas inside it. The navigation may not have ` +
+          `taken effect — or it may have landed and been displaced between checks, so do NOT ` +
+          `assume nothing happened. Read the current scope (panel_graph_outline); if it is not ` +
+          `the subgraph, retry, or open it on the ComfyUI canvas (double-click the node).`,
+      );
+    }
+    let viewing = null;
+    try {
+      viewing = describeActiveGraph(getGraphCtx().graph);
+    } catch {
+      // The current scope is unresolvable right now — omit `viewing` rather
+      // than fabricate one; the note below already discloses the uncertainty.
+      viewing = null;
+    }
+    // The reply must describe the canvas as it is NOW, not as the receipt left
+    // it: this post-receipt read is a fresh terminal observation (codex gate
+    // r8), and it is THREE-state (r9): a read that throws proves neither "still
+    // on the target" nor "moved elsewhere", so it gets an uncertainty
+    // disclosure, not the displacement one.
+    const terminalState = (() => {
+      try {
+        const g = comfyApp?.canvas?.graph;
+        // A MISSING canvas/graph is unreadable, not displacement evidence
+        // (codex gate r10): null/undefined proves nothing about where the view is.
+        if (g == null) return "unreadable";
+        return g === sub ? "target" : "elsewhere";
+      } catch {
+        return "unreadable";
+      }
+    })();
+    const unreadableNote =
+      `The canvas DID enter the subgraph, but the panel can no longer read where the canvas is ` +
+      `right now — the navigation may be in effect or the view may have moved; the panel could ` +
+      `not determine which. Read the current scope (panel_graph_outline) before editing, and ` +
+      `re-enter the subgraph if that is still where you mean to work.`;
+    if (!receipt.bound) {
+      if (terminalState === "unreadable") {
+        return { entered: node.id, ...(viewing ? { viewing } : {}), settled: false, note: unreadableNote };
+      }
+      if (!receipt.landed || terminalState === "elsewhere") {
+        // The canvas WAS observed inside the subgraph, then moved elsewhere
+        // before the binding settled — the navigation happened, so this is a
+        // disclosure, never a "nothing was applied" refusal.
+        return {
+          entered: node.id,
+          ...(viewing ? { viewing } : {}),
+          settled: false,
+          note:
+            `The canvas DID enter the subgraph, but it has since navigated away before the panel ` +
+            `could confirm the binding — the view moved again first (a user navigation, a ` +
+            `tab restore, or the panel's own canvas reconcile). Re-read the current scope (panel_graph_outline) before editing, and ` +
+            `re-enter the subgraph if that is still where you mean to work.`,
+        };
+      }
+      return {
+        entered: node.id,
+        ...(viewing ? { viewing } : {}),
+        settled: false,
+        note:
+          `The canvas DID enter the subgraph (the navigation is in effect), but the ` +
+          `post-navigation binding check has not passed yet (${coerceMessageText(
+            receipt.lastError?.message ?? receipt.lastError ?? "unknown",
+          )}). A graph read issued this instant may still refuse while the tracker catches up — ` +
+          `retry the read in a moment.`,
+      };
+    }
+    if (terminalState === "unreadable") {
+      return { entered: node.id, ...(viewing ? { viewing } : {}), settled: false, note: unreadableNote };
+    }
+    if (terminalState === "elsewhere") {
+      return {
+        entered: node.id,
+        ...(viewing ? { viewing } : {}),
+        settled: false,
+        note:
+          `The canvas DID enter the subgraph and the binding check passed, but the view has ` +
+          `already moved elsewhere (a user navigation, a tab restore, or the panel's own canvas ` +
+          `reconcile). Re-read the current scope (panel_graph_outline) before editing, and ` +
+          `re-enter the subgraph if that is still where you mean to work.`,
+      };
+    }
+    return { entered: node.id, viewing, settled: true };
   },
 
   // Leave the current subgraph and return to its IMMEDIATE parent graph. For a
@@ -12579,8 +12830,8 @@ const GRAPH_TOOL_EXECUTORS = {
   // enclosing subgraph, NOT the root — jumping straight to root (graph.rootGraph)
   // skipped the parent, so the next graph_enter_subgraph targeted a node id that
   // only exists inside the skipped parent and navigated nowhere useful (#412).
-  graph_exit_subgraph() {
-    const { graph, canvas, rootGraph } = getGraphCtx();
+  async graph_exit_subgraph() {
+    const { app: comfyApp, graph, canvas, rootGraph } = getGraphCtx();
     if (graph === rootGraph) return { viewing: { scope: "root" }, note: "already at root" };
     if (typeof canvas.setGraph !== "function") {
       throw new Error("subgraph navigation unavailable on this frontend");
@@ -12591,7 +12842,101 @@ const GRAPH_TOOL_EXECUTORS = {
     const parentGraph = findSubgraphOwner(rootGraph, graph)?.parentGraph ?? graph.rootGraph ?? rootGraph;
     canvas.setGraph(parentGraph);
     canvas.setDirty?.(true, true);
-    return { viewing: describeActiveGraph(getGraphCtx().graph) };
+    // #619: same post-navigation receipt as graph_enter_subgraph — a bare setGraph
+    // that did not observably land must not report a scope the canvas is not in.
+    const receipt = await confirmCanvasNavigation({
+      readCanvasGraph: () => comfyApp?.canvas?.graph ?? null,
+      target: parentGraph,
+      assertBound: () => {
+        const ctx = getGraphCtx();
+        assertGraphBoundToActiveWorkflow(ctx.graph, ctx.rootGraph, {
+          includeBaselineReadGuard: true,
+        });
+      },
+    });
+    if (!receipt.landed && !receipt.everLanded) {
+      // Never OBSERVED at the parent is not proof the navigation never happened
+      // — a landing displaced between two polls is invisible to a sampler
+      // (codex gate r5). Say what is known (no observation) and make the next
+      // step a scope READ, not a blind retry of a possibly-applied navigation.
+      throw new Error(
+        `panel_exit_subgraph could not confirm that the canvas returned to the parent graph: no ` +
+          `observation ever saw the canvas there. The navigation may not have taken effect — or ` +
+          `it may have landed and been displaced between checks, so do NOT assume nothing ` +
+          `happened. Read the current scope (panel_graph_outline); if it is still inside the ` +
+          `subgraph, retry, or leave it on the ComfyUI canvas (its breadcrumb, or double-click out).`,
+      );
+    }
+    let viewing = null;
+    try {
+      viewing = describeActiveGraph(getGraphCtx().graph);
+    } catch {
+      // The current scope is unresolvable right now — omit `viewing` rather
+      // than fabricate one; the note below already discloses the uncertainty.
+      viewing = null;
+    }
+    // Same fresh terminal observation as graph_enter_subgraph (codex gate r8),
+    // and equally THREE-state (r9): a read that throws proves neither "still on
+    // the parent" nor "moved elsewhere", so it gets an uncertainty disclosure,
+    // not the displacement one.
+    const terminalState = (() => {
+      try {
+        const g = comfyApp?.canvas?.graph;
+        // A MISSING canvas/graph is unreadable, not displacement evidence
+        // (codex gate r10): null/undefined proves nothing about where the view is.
+        if (g == null) return "unreadable";
+        return g === parentGraph ? "target" : "elsewhere";
+      } catch {
+        return "unreadable";
+      }
+    })();
+    const unreadableNote =
+      `The canvas DID return to the parent graph, but the panel can no longer read where the ` +
+      `canvas is right now — the navigation may be in effect or the view may have moved; the ` +
+      `panel could not determine which. Read the current scope (panel_graph_outline) before editing.`;
+    if (!receipt.bound) {
+      if (terminalState === "unreadable") {
+        return { ...(viewing ? { viewing } : {}), settled: false, note: unreadableNote };
+      }
+      if (!receipt.landed || terminalState === "elsewhere") {
+        // The canvas WAS observed back at the parent, then moved elsewhere
+        // before the binding settled — the navigation happened, so this is a
+        // disclosure, never a "nothing was applied" refusal.
+        return {
+          ...(viewing ? { viewing } : {}),
+          settled: false,
+          note:
+            `The canvas DID return to the parent graph, but it has since navigated away before ` +
+            `the panel could confirm the binding — the view moved again first (a user ` +
+            `navigation, a tab restore, or the panel's own canvas reconcile). Re-read the current scope (panel_graph_outline) ` +
+            `before editing.`,
+        };
+      }
+      return {
+        ...(viewing ? { viewing } : {}),
+        settled: false,
+        note:
+          `The canvas DID return to the parent graph (the navigation is in effect), but the ` +
+          `post-navigation binding check has not passed yet (${coerceMessageText(
+            receipt.lastError?.message ?? receipt.lastError ?? "unknown",
+          )}). A graph read issued this instant may still refuse while the tracker catches up — ` +
+          `retry the read in a moment.`,
+      };
+    }
+    if (terminalState === "unreadable") {
+      return { ...(viewing ? { viewing } : {}), settled: false, note: unreadableNote };
+    }
+    if (terminalState === "elsewhere") {
+      return {
+        ...(viewing ? { viewing } : {}),
+        settled: false,
+        note:
+          `The canvas DID return to the parent graph and the binding check passed, but the view ` +
+          `has already moved elsewhere (a user navigation, a tab restore, or the panel's own ` +
+          `canvas reconcile). Re-read the current scope (panel_graph_outline) before editing.`,
+      };
+    }
+    return { viewing, settled: true };
   },
 
   // Reposition a subgraph's input/output RAIL (the boundary I/O node). Must run
@@ -13556,9 +13901,38 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
   // effects (budget reset, soft-reload interlock release).
   let lastStatus = null;
   // #640 — say the route refusal ONCE. The reconnect loop retries the hello
-  // forever and the refusal is sticky (the identity is frozen for the page), so
-  // an unthrottled notice would bury the panel in the same paragraph.
+  // forever and the refusal used to be sticky (the identity was frozen for the
+  // page), so an unthrottled notice would bury the panel in the same paragraph.
   let routeRefusalDisclosed = false;
+  // #654 — a hello REFUSED for want of an established route is no longer the end
+  // of registration: the lease can become acquirable later (the contending tab
+  // closed) while THIS socket stays open, and nothing would otherwise re-hello
+  // until the next socket event — the tab sat unregistered until a manual
+  // browser refresh. Retry the hello a bounded number of times with backoff; a
+  // landed hello or a new socket resets the budget (a new socket is new
+  // evidence: its own open-hello is another attempt).
+  let routeRefusalRetryTimer = null;
+  let routeRefusalRetries = 0;
+  const ROUTE_REFUSAL_RETRY_MAX = 6;
+  const ROUTE_REFUSAL_RETRY_MS = 5000;
+  function clearRouteRefusalRetry() {
+    if (routeRefusalRetryTimer) {
+      clearTimeout(routeRefusalRetryTimer);
+      routeRefusalRetryTimer = null;
+    }
+  }
+  function scheduleRouteRefusalRetry() {
+    if (closed || routeRefusalRetryTimer) return;
+    if (routeRefusalRetries >= ROUTE_REFUSAL_RETRY_MAX) return;
+    routeRefusalRetryTimer = setTimeout(() => {
+      routeRefusalRetryTimer = null;
+      routeRefusalRetries += 1;
+      // sendHello re-runs the identity resolve, which is itself retryable past
+      // its backoff (#654) — so this is a genuine fresh attempt, not a replay
+      // of the cached failure.
+      void sendHello();
+    }, ROUTE_REFUSAL_RETRY_MS);
+  }
   function emitStatus(s) {
     if (s === lastStatus && s !== "connected") return;
     lastStatus = s;
@@ -13844,6 +14218,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     thisSock.addEventListener("open", () => {
       if (!isActive()) return; // superseded socket — ignore its late open
       handshakeDone = false;
+      // #654 — a fresh socket is a fresh registration attempt: replenish the
+      // refused-hello retry budget and drop any retry still pending from the
+      // previous socket (its sendHello below is that attempt).
+      routeRefusalRetries = 0;
+      clearRouteRefusalRetry();
       // #369: a new orchestrator socket is a (re)connect / session-resume boundary.
       // Bump the session generation so the manual-change tracker discards any
       // baseline captured before this boundary instead of diffing it against a
@@ -14267,6 +14646,28 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // fence at all: requiring a binding proof for it only false-blocks a
             // server-side operation when the canvas binding is broken.
             if (msg.cmd.startsWith("graph_") && !commandIsCanvasIndependent(msg.cmd)) {
+              // #646 — the post-reconnect MUTATION gate. A graph mutation that
+              // arrives while ComfyUI's backend socket is down, or inside the
+              // settle window before the restored canvas binding has been
+              // re-proven, can land on a canvas the restore is about to rebuild
+              // (applied-then-wiped) or die with the socket mid-command
+              // (OUTCOME UNKNOWN). Reads are exempt — they stay available on
+              // their own evidence bars. The gate runs BEFORE getGraphCtx and
+              // the binding assert: those probes can themselves change the
+              // canvas (the verified content-free rebind heal), which would
+              // falsify this refusal's "nothing changed" claim (codex gate r6),
+              // and it refuses BEFORE the executor, so "NOT applied" is true
+              // and the retry is safe. The settle watch (#663) closes the
+              // binding window as soon as the binding observably re-proves, so
+              // the healthy case waits ~1s, not the full 30s.
+              if (graphCommandMayMutateWorkflow(msg.cmd)) {
+                const reconnectGate = graphMutationReconnectGate({
+                  cmd: msg.cmd,
+                  backendDown: comfyBackendSocketDown,
+                  bindingSettleWindow: postReconnectBindingSettleWindow(),
+                });
+                if (reconnectGate) throw new Error(reconnectGate);
+              }
               const { graph, rootGraph } = getGraphCtx();
               assertGraphBoundToActiveWorkflow(graph, rootGraph, graphCommandBindingBar(msg.cmd));
             }
@@ -14563,6 +14964,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       if (!isActive()) return;
       sock = null;
       handshakeDone = false;
+      // #654 — a pending refused-hello retry belongs to the dead socket; the
+      // reconnect loop's next open-hello takes over (and resets the budget).
+      clearRouteRefusalRetry();
       // Fail any in-flight direct tool calls — the reply can never arrive now.
       for (const [, pend] of pendingCalls) {
         clearTimeout(pend.timer);
@@ -14627,6 +15031,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           routeRefusalDisclosed = true;
           onLog?.(describeRefusedRoute({ settled: tabRouteIdentity.settled() }));
         }
+        // #654 — and TRY AGAIN: the lease can free up while this socket stays
+        // open. Bounded; a landed hello or a fresh socket resets the budget.
+        scheduleRouteRefusalRetry();
         return null;
       }
       // Carry the last session id so the orchestrator resumes the agent's
@@ -14697,6 +15104,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           // Published only now, for the same reason the epoch advances only now:
           // a hello that never reached the wire advertised nothing.
           lastAdvertisedWorkflowUuid = advertisedWorkflowUuid;
+          // #654 — registration succeeded: the refused-hello retry budget is
+          // replenished and any pending retry is moot.
+          routeRefusalRetries = 0;
+          clearRouteRefusalRetry();
         }
         return sent === true;
       })
