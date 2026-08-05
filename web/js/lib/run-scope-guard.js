@@ -236,6 +236,16 @@ export function canonicalizePrompt(output, volatileInputs = null) {
   return keys.map((k) => {
     const node = output[k] ?? {};
     const inputs = node.inputs && typeof node.inputs === "object" ? node.inputs : {};
+    // An own `toJSON` FUNCTION on the inputs object hijacks JSON.stringify's
+    // hook protocol for the WHOLE object (codex gate r3): on the wire the
+    // body carries whatever `inputs.toJSON("inputs")` returns instead of
+    // these keys, and the same name would hijack the one-key probe below.
+    // The wire form of such a node cannot be predicted faithfully from here,
+    // so fail CLOSED — dispatchScopedRun's catch turns this throw into the
+    // upfront "cannot fingerprint" refusal, never a false "graph CHANGED".
+    if (typeof inputs.toJSON === "function") {
+      throw new TypeError(`prompt node ${k} carries an own toJSON function — its wire form is not predictable`);
+    }
     const names = [];
     const wireValues = new Map();
     for (const n of Object.keys(inputs)) {

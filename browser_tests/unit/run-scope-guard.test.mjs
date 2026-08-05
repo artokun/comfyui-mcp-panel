@@ -2363,6 +2363,52 @@ test("#659 promptContentHash: the probe uses the REAL input name and its parsed 
   assert.equal(calls, 1, "toJSON fires exactly once per input per canonicalization");
 });
 
+test("#659 promptContentHash: an own toJSON FUNCTION on the inputs object fails CLOSED, never a false graph_changed (codex gate r3)", () => {
+  // inputs: { steps: 20, toJSON: () => undefined } — the hook protocol makes
+  // the WIRE carry whatever toJSON returns instead of the keys, so no
+  // per-input canonicalization can predict the body's shape. The hash must
+  // refuse to compute (dispatchScopedRun's catch ⇒ the upfront unverifiable
+  // refusal) rather than false-refuse a drift that never happened.
+  const colliding = { "3": { class_type: "X", inputs: { steps: 20, toJSON: () => undefined } } };
+  assert.throws(() => promptContentHash(colliding), TypeError, "unpredictable wire form ⇒ fail closed");
+  // A NON-function toJSON-named input does not trip the hook protocol and
+  // stays fully drift-covered.
+  const harmless = { "3": { class_type: "X", inputs: { steps: 20, toJSON: false } } };
+  assert.equal(
+    promptContentHash(harmless),
+    promptContentHashFromBody(JSON.stringify({ prompt: { "3": { class_type: "X", inputs: { steps: 20, toJSON: false } } } })),
+    "a data-valued toJSON key serializes normally on both channels",
+  );
+});
+
+test("#659 integration: a graph with a toJSON-function inputs collision is refused UPFRONT (unverifiable), queuePrompt never called", async () => {
+  // Pins the end-to-end OUTCOME contract (upfront fail-closed, nothing
+  // queued). The deliberate-throw MECHANISM is pinned by the hash-level test
+  // above: without the canonicalizePrompt guard the probe's own toJSON
+  // hijack still throws by accident, reaching the same outcome by another
+  // path — the hash test is the one that fails there.
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const output = {
+      "3": { class_type: "KSampler", inputs: { steps: 20, toJSON: () => undefined } },
+      "14": { class_type: "PreviewAny", inputs: {} },
+    };
+    const app = makeFrontend({ shape: "shim", apiTarget, output });
+    let queuePromptCalled = false;
+    const origQP = app.queuePrompt;
+    app.queuePrompt = async (...a) => { queuePromptCalled = true; return origQP(...a); };
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+    assert.equal(result.outcome, "unverifiable", "fails closed BEFORE dispatch — never a false drift refusal");
+    assert.match(result.error, /cannot be dispatched safely/);
+    assert.equal(queuePromptCalled, false);
+    assert.equal(server.calls.length, 0, "nothing left the tab");
+  } finally {
+    stop();
+  }
+});
+
 test("#659 diffPromptCanons: names input-level changes, node add/remove, and class_type changes — and never throws on odd input", () => {
   const a = canonicalizePrompt({
     "3": { class_type: "KSampler", inputs: { steps: 20, model: ["4", 0] } },
