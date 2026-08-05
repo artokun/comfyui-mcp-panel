@@ -26,7 +26,7 @@ export const NODE_DEF_REFRESH_REASONS = Object.freeze({
 
 function detailSuffix(thrown) {
   const text = String(thrown?.message ?? thrown ?? "").trim();
-  return text ? ` (${text})` : "";
+  return text ? `(${text})` : "";
 }
 
 /**

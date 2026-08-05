@@ -31,6 +31,12 @@ import { commandIsCanvasIndependent } from "../../web/js/lib/workflow-chat-ident
 import { sealProvenRootBinding } from "../../web/js/lib/graph-binding.js";
 import { composeShowMediaReply } from "../../web/js/lib/media-preview.js";
 import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame.js";
+import { describeNodeDefRefresh } from "../../web/js/lib/node-def-refresh.js";
+import { confirmCanvasNavigation } from "../../web/js/lib/canvas-navigation.js";
+import {
+  watchPostReconnectSettle,
+  graphMutationReconnectGate,
+} from "../../web/js/lib/reconnect-recovery.js";
 
 // --- Mirror the shared bounded-step edge (#648) --------------------------------------
 // run-completion-frame.js and media-preview.js BOTH import withTimeout from here. If
@@ -77,6 +83,13 @@ test("panel ↔ media-preview.js / run-completion-frame.js ↔ bounded-step.js e
   assert.equal(typeof composeShowMediaReply, "function");
   assert.equal(typeof composeRunCompletionFrame, "function");
   assert.equal(typeof withTimeout, "function");
+});
+
+test("panel ↔ node-def-refresh.js / canvas-navigation.js / reconnect-recovery.js edges link (#635/#619/#663/#646)", () => {
+  assert.equal(typeof describeNodeDefRefresh, "function");
+  assert.equal(typeof confirmCanvasNavigation, "function");
+  assert.equal(typeof watchPostReconnectSettle, "function");
+  assert.equal(typeof graphMutationReconnectGate, "function");
 });
 
 test("set-widget.js ↔ widget-write.js / node-resolve.js module edges link", () => {

@@ -6999,6 +6999,17 @@ function revalidateGraphMutationContext(captured) {
       "The active workflow or graph view changed while this node was preparing; nothing was added. Retry on the intended tab.",
     );
   }
+  // #646: the dispatch-time gate can go stale DURING an async preflight — a
+  // backend reconnect that starts while /object_info is being awaited would let
+  // the write below land on a canvas the restore is about to rebuild. Re-check
+  // the same gate at the write boundary; nothing has been written yet, so its
+  // "NOT applied" claim stays true here.
+  const reconnectGate = graphMutationReconnectGate({
+    cmd: "graph_add_node",
+    backendDown: comfyBackendSocketDown,
+    bindingSettleWindow: postReconnectBindingSettleWindow(),
+  });
+  if (reconnectGate) throw new Error(reconnectGate);
   assertGraphBoundToActiveWorkflow(current.graph, current.rootGraph, {
     ...MUTATION_BINDING_BAR,
   });
