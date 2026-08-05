@@ -35,6 +35,9 @@ function detailSuffix(thrown) {
  * @param {{
  *   appAvailable: boolean,     // the ComfyUI frontend app object was reachable
  *   defsObtained: boolean,     // an /object_info payload was actually obtained
+ *   defsRegistered: boolean,   // registerNodesFromDefs actually RAN this run —
+ *                              // a frontend without that API must never let the
+ *                              // remedy claim registration happened (codex r2 P1)
  *   comboApiPresent: boolean,  // app.refreshComboInNodes exists on this build
  *   comboRan: boolean,         // refreshComboInNodes completed this run
  *   phase?: string,            // "fetch" | "register" | "combo" | "done" — where a throw happened
@@ -45,11 +48,20 @@ function detailSuffix(thrown) {
 export function describeNodeDefRefresh({
   appAvailable,
   defsObtained,
+  defsRegistered = false,
   comboApiPresent,
   comboRan,
   phase = "done",
   thrown = null,
 } = {}) {
+  // The registration clause the combo-failure remedies are allowed to make:
+  // "WERE re-registered" only when the registration call observably ran.
+  const registrationClause = defsRegistered
+    ? "Node definitions WERE re-registered from a fresh /object_info"
+    : "Node definitions were fetched but this frontend exposes no registerNodesFromDefs, so they were NOT registered";
+  const registrationRemedy = defsRegistered
+    ? ""
+    : " Reload the ComfyUI tab so the frontend picks up the new definitions.";
   if (!appAvailable) {
     return {
       refreshed: false,
@@ -72,9 +84,10 @@ export function describeNodeDefRefresh({
           "restarting — retry once it answers, and if it never does, check that the ComfyUI " +
           "server process is still running."
         : reason === NODE_DEF_REFRESH_REASONS.COMBO_REFRESH_FAILED
-          ? "Node definitions WERE re-registered from a fresh /object_info, but refreshing the " +
+          ? `${registrationClause}, but refreshing the ` +
             "combo lists failed, so dropdown options may still be stale. Retry; if it keeps " +
-            "failing, reload the ComfyUI tab to rebuild the combo lists."
+            "failing, reload the ComfyUI tab to rebuild the combo lists." +
+            registrationRemedy
           : "A fresh /object_info was obtained but re-registering the node definitions failed, " +
             "so the refresh is NOT confirmed. Reload the ComfyUI tab, then retry.";
     return { refreshed: false, reason, detail: detailSuffix(thrown) || undefined, remedy };
@@ -96,9 +109,11 @@ export function describeNodeDefRefresh({
       reason: NODE_DEF_REFRESH_REASONS.COMBO_API_ABSENT,
       remedy:
         "This ComfyUI frontend build has no refreshComboInNodes API, so combo lists cannot be " +
-        "rebuilt in place. Node definitions WERE re-registered from a fresh /object_info — only " +
-        "the combo dropdowns may be stale, and those refresh on a tab reload (reload the ComfyUI " +
-        "page or press R in it).",
+        `rebuilt in place. ${registrationClause}` +
+        (defsRegistered
+          ? " — only the combo dropdowns may be stale, and those refresh on a tab reload (reload " +
+            "the ComfyUI page or press R in it)."
+          : ". Reload the ComfyUI tab so both rebuild."),
     };
   }
   if (!comboRan) {
@@ -109,9 +124,10 @@ export function describeNodeDefRefresh({
       refreshed: false,
       reason: NODE_DEF_REFRESH_REASONS.COMBO_REFRESH_FAILED,
       remedy:
-        "Node definitions WERE re-registered from a fresh /object_info, but the combo refresh " +
+        `${registrationClause}, but the combo refresh ` +
         "did not complete, so dropdown options may still be stale. Retry; if it keeps " +
-        "happening, reload the ComfyUI tab to rebuild the combo lists.",
+        "happening, reload the ComfyUI tab to rebuild the combo lists." +
+        registrationRemedy,
     };
   }
   return { refreshed: true, reason: "refreshed" };

@@ -654,13 +654,14 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // actually failed instead of being bucketed as a generic failure.
   let appAvailable = false;
   let defs = preloadedDefs ?? null;
+  let defsRegistered = false;
   let comboApiPresent = false;
   let comboRan = false;
   let phase = "fetch";
   let thrown = null;
   try {
     const a = typeof app !== "undefined" && app ? app : window.comfyAPI?.app?.app;
-    if (!a) return describeNodeDefRefresh({ appAvailable: false, defsObtained: false, comboApiPresent: false, comboRan: false });
+    if (!a) return describeNodeDefRefresh({ appAvailable: false, defsObtained: false, defsRegistered: false, comboApiPresent: false, comboRan: false });
     appAvailable = true;
     // Obtain an AUTHORITATIVE /object_info payload up front (preloaded, or a fresh
     // getNodeDefs) — this is the OBSERVABLE proof of a real server fetch that gates
@@ -686,9 +687,12 @@ async function registerComfyNodeDefs(preloadedDefs) {
     phase = "register";
     recordObjectInfoTypes(defs);
     // Re-register node definitions so newly installed/updated classes and their
-    // current widget schemas are known to LiteGraph (#221/#171).
+    // current widget schemas are known to LiteGraph (#221/#171). defsRegistered
+    // is set ONLY when the registration call actually ran — a frontend without
+    // registerNodesFromDefs must not let the verdict claim it (codex gate r2 P1).
     if (defs && typeof a.registerNodesFromDefs === "function") {
       await a.registerNodesFromDefs(defs);
+      defsRegistered = true;
     }
     // registerNodesFromDefs mints NEW classes; already-loaded node INSTANCES keep
     // their old constructor and would never see the fresh schema. Stamp the fresh
@@ -726,7 +730,7 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // coalescer forwards this through a forced trailing run, so get_errors' awaited
   // `force:true` refresh resolves to the freshness verdict of the fetch IT triggered
   // (codex round-6 P0).
-  return describeNodeDefRefresh({ appAvailable, defsObtained: !!defs, comboApiPresent, comboRan, phase, thrown });
+  return describeNodeDefRefresh({ appAvailable, defsObtained: !!defs, defsRegistered, comboApiPresent, comboRan, phase, thrown });
 }
 
 // Single-flight refresh that never drops a caller-supplied fresh payload (#289 P2).
@@ -12564,8 +12568,8 @@ const GRAPH_TOOL_EXECUTORS = {
           settled: false,
           note:
             `The canvas DID enter the subgraph, but it has since navigated away before the panel ` +
-            `could confirm the binding — something else moved the view (a user navigation or a ` +
-            `tab restore). Re-read the current scope (panel_graph_outline) before editing, and ` +
+            `could confirm the binding — the view moved again first (a user navigation, a ` +
+            `tab restore, or the panel's own canvas reconcile). Re-read the current scope (panel_graph_outline) before editing, and ` +
             `re-enter the subgraph if that is still where you mean to work.`,
         };
       }
@@ -12638,8 +12642,8 @@ const GRAPH_TOOL_EXECUTORS = {
           settled: false,
           note:
             `The canvas DID return to the parent graph, but it has since navigated away before ` +
-            `the panel could confirm the binding — something else moved the view (a user ` +
-            `navigation or a tab restore). Re-read the current scope (panel_graph_outline) ` +
+            `the panel could confirm the binding — the view moved again first (a user ` +
+            `navigation, a tab restore, or the panel's own canvas reconcile). Re-read the current scope (panel_graph_outline) ` +
             `before editing.`,
         };
       }

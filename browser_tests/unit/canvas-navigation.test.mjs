@@ -63,6 +63,27 @@ test("#619: a canvas observed landed then displaced is everLanded:true, landed:f
   assert.match(String(r.lastError?.message), /still settling/);
 });
 
+test("#619: a probe that MOVES the canvas off the target cannot produce a settled receipt (codex r2 P1)", async () => {
+  // getGraphCtx's verified rebind heal repaints a provably content-free ghost
+  // canvas to root — the probe itself can change what the canvas shows. Only a
+  // landing that SURVIVES the probe is settled.
+  const target = { name: "sub" };
+  const root = { name: "root" };
+  let current = target;
+  const r = await confirmCanvasNavigation({
+    readCanvasGraph: () => current,
+    target,
+    assertBound: () => {
+      current = root; // the probe's side effect: the canvas is healed to root
+    },
+    tries: 3,
+    sleep: instantSleep,
+  });
+  assert.equal(r.bound, false, "no settled receipt for a canvas the probe moved away");
+  assert.equal(r.everLanded, true);
+  assert.equal(r.landed, false);
+});
+
 test("#619: a navigation that lands a few polls later is still confirmed", async () => {
   const target = { name: "sub" };
   let current = { name: "root" };
@@ -79,7 +100,7 @@ test("#619: a navigation that lands a few polls later is still confirmed", async
   });
   assert.equal(r.landed, true);
   assert.equal(r.bound, true);
-  assert.equal(reads, 3, "it polled until the canvas observably moved");
+  assert.equal(reads, 4, "3 polls to land + the post-probe survival re-read (codex r2)");
 });
 
 test("#619: a canvas that never moves is landed:false, bound:false", async () => {

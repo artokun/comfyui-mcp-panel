@@ -170,8 +170,7 @@ test("#654: a lock manager whose request REJECTS degrades to the same retryable 
   assert.equal(locks.calls, 6, "past the backoff: a genuine fresh attempt");
 });
 
-test("#654: a THROWING resolver step fails closed and stays retryable — the rejection is never cached", async () => {
-  // The IIFE rejects only when a step OUTSIDE acquire's own try/catch throws
+test("#654: a THROWING resolver step fails closed and stays retryable — the rejection is never cached", async () => {  // The IIFE rejects only when a step OUTSIDE acquire's own try/catch throws
   // (randomUUID is the reachable one). Without the rejection→undefined degrade
   // the first resolve re-throws here; without the slot clear, the third call
   // returns the stale settled promise and no fresh lease attempt runs.
@@ -200,6 +199,22 @@ test("#654: a THROWING resolver step fails closed and stays retryable — the re
 // Panel wiring: the refused-hello re-registration path (source scans —
 // deleting the wiring fails these)
 // ---------------------------------------------------------------------------
+
+test("#654: a failure recorded at timestamp 0 still counts as a failure (null sentinel, codex r2)", async () => {
+  const locks = new ContendedLocks();
+  locks.blocked = true;
+  const identity = createRestartTabIdentity({
+    storage: fakeStorage("candidate-a"),
+    locks,
+    randomUUID: () => "rotated",
+    now: () => 0, // a legitimate clock reading — must not read as "never failed"
+    retryBackoffMs: 5000,
+  });
+  assert.equal(await identity.resolve(), undefined);
+  assert.equal(locks.calls, 3);
+  assert.equal(await identity.resolve(), undefined);
+  assert.equal(locks.calls, 3, "a failure at t=0 still arms the backoff");
+});
 
 test("#654 wiring: a hello refused for want of a route schedules a bounded re-hello", () => {
   // The refusal site inside sendHello's makePayload: describeRefusedRoute is

@@ -92,6 +92,7 @@ test("#635: the stuck case from the issue — combo API absent — says defs DID
   const v = describeNodeDefRefresh({
     appAvailable: true,
     defsObtained: true,
+    defsRegistered: true,
     comboApiPresent: false,
     comboRan: false,
   });
@@ -102,10 +103,37 @@ test("#635: the stuck case from the issue — combo API absent — says defs DID
   assert.match(v.remedy, /reload/i);
 });
 
+test("#635: registration is claimed ONLY when the call observably ran (codex r2 P1)", () => {
+  const v = describeNodeDefRefresh({
+    appAvailable: true,
+    defsObtained: true,
+    defsRegistered: false, // registerNodesFromDefs absent on this frontend
+    comboApiPresent: false,
+    comboRan: false,
+  });
+  assert.equal(v.refreshed, false);
+  assert.doesNotMatch(v.remedy, /WERE re-registered/, "no fabricated registration claim");
+  assert.match(v.remedy, /NOT registered/);
+  assert.match(v.remedy, /reload the ComfyUI tab/i);
+
+  const thrown = describeNodeDefRefresh({
+    appAvailable: true,
+    defsObtained: true,
+    defsRegistered: false,
+    comboApiPresent: true,
+    comboRan: false,
+    phase: "combo",
+    thrown: new Error("boom"),
+  });
+  assert.doesNotMatch(thrown.remedy, /WERE re-registered/);
+  assert.match(thrown.remedy, /NOT registered/);
+});
+
 test("#635: a throwing combo refresh is distinguished from an absent combo API", () => {
   const v = describeNodeDefRefresh({
     appAvailable: true,
     defsObtained: true,
+    defsRegistered: true,
     comboApiPresent: true,
     comboRan: false,
     phase: "combo",

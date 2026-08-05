@@ -37,7 +37,9 @@ export function createRestartTabIdentity({
   // cleared), so one contested lease window wedged the tab's registration until a
   // manual browser refresh — even after the contending tab closed and the lease
   // became acquirable. A failure is now retryable once per backoff window.
-  let lastFailureAt = 0;
+  // `null` (not 0) is the never-failed sentinel: a failure recorded at timestamp
+  // 0 must still count as a failure (codex gate r2).
+  let lastFailureAt = null;
 
   const fallback = () => (memoryFallback ??= randomUUID());
   const read = () => {
@@ -92,7 +94,7 @@ export function createRestartTabIdentity({
     // re-runs this resolver, so refusing to retry here is what forced the manual
     // browser refresh. Re-attempt at most once per backoff window; inside the
     // window, fail closed with the same undefined the first failure returned.
-    if (lastFailureAt && now() - lastFailureAt < retryBackoffMs) return undefined;
+    if (lastFailureAt != null && now() - lastFailureAt < retryBackoffMs) return undefined;
     resolving = (async () => {
       let candidate = read() ?? fallback();
       write(candidate);
@@ -114,14 +116,19 @@ export function createRestartTabIdentity({
       // refused lease — never a cached rejection every later caller re-throws
       // (that was the page-lifetime wedge all over again, codex gate P1).
       .catch(() => undefined)
+      // Stamp the failure INSIDE the chain, BEFORE the slot is cleared: a caller
+      // arriving between the clear and the stamp would otherwise see neither
+      // and start a fresh attempt, bypassing the backoff (codex gate r2).
+      .then((outcome) => {
+        if (outcome === undefined) lastFailureAt = now();
+        return outcome;
+      })
       // Clear the in-flight slot so a LATER call may retry after a failure (a
       // success is cached in `resolved`, which short-circuits above).
       .finally(() => {
         resolving = null;
       });
-    const outcome = await resolving;
-    if (outcome === undefined) lastFailureAt = now();
-    return outcome;
+    return resolving;
   }
 
   return { resolve, fallback, releaseForTests: () => releaseLease?.() };
