@@ -26,6 +26,10 @@ import {
   graphRootWorkflowUuidMatches,
   graphRootMatchesState,
   graphCommandMayMutateWorkflow,
+  graphCommandBindingBar,
+  graphBindingRefusalMessage,
+  resolveGraphBindingVerdict,
+  MUTATION_BINDING_BAR,
   graphReadBindingChanged,
   resolveGraphRootUuidRebind,
   serializedStateProvenEmpty,
@@ -46,11 +50,20 @@ import {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
 
+/** Index of `function <name>(`, INCLUDING a preceding `async ` when present —
+ *  without it an extracted async function loses its keyword and its `await`
+ *  becomes a syntax error inside `new Function`. */
+function panelFunctionStart(src, name, from = 0) {
+  const bare = src.indexOf(`function ${name}(`, from);
+  assert.notEqual(bare, -1, `could not locate ${name} in panel source`);
+  const asyncAt = bare - "async ".length;
+  return asyncAt >= 0 && src.startsWith("async ", asyncAt) ? asyncAt : bare;
+}
+
 function panelFunctionSource(src, name, nextName) {
-  const start = src.indexOf(`function ${name}(`);
-  const end = src.indexOf(`function ${nextName}(`, start);
-  assert.notEqual(start, -1, `could not locate ${name} in panel source`);
-  assert.notEqual(end, -1, `could not locate ${nextName} after ${name}`);
+  const start = panelFunctionStart(src, name);
+  const end = panelFunctionStart(src, nextName, start + 1);
+  assert.ok(end > start, `could not locate ${nextName} after ${name}`);
   return src.slice(start, end);
 }
 
@@ -248,11 +261,8 @@ function buildDirtyStaleRouteHarness({
     "workflowObjectUuid",
     "workflowStableUuid",
     "graphRootWorkflowUuidMismatches",
-    "graphRootWorkflowUuidMatches",
-    "graphRootMismatchesActiveWorkflow",
-    "graphReadDesynced",
-    "graphEmptyBindingUnproven",
-    "activeWorkflowNodeCount",
+    "resolveGraphBindingVerdict",
+    "graphBindingRefusalMessage",
     "activeWorkflowProvenEmpty",
     "graphRootProvenEmpty",
     "workflowOwnsRootUuidTag",
@@ -266,11 +276,8 @@ function buildDirtyStaleRouteHarness({
     uuidStore.workflowObjectUuid,
     stableUuid,
     graphRootWorkflowUuidMismatches,
-    graphRootWorkflowUuidMatches,
-    graphRootMismatchesActiveWorkflow,
-    graphReadDesynced,
-    graphEmptyBindingUnproven,
-    activeWorkflowNodeCount,
+    resolveGraphBindingVerdict,
+    graphBindingRefusalMessage,
     activeWorkflowProvenEmpty,
     graphRootProvenEmpty,
     ownsTag,
@@ -723,18 +730,33 @@ test("#545 wiring: dirty tracker state is inconclusive, but an established workf
     /graphRootWorkflowUuidMismatches\(\{ rootGraph, activeWorkflowUuid \}\)/,
     "a dirty tab retains the positive foreign-root identity fence",
   );
+  // The predicate composition itself now lives in lib/graph-binding.js
+  // (resolveGraphBindingVerdict) so the read-vs-mutation bar is observable in
+  // tests; the panel fence only resolves the evidence and delegates the verdict.
   assert.match(
     body,
+    /const verdict = resolveGraphBindingVerdict\(\{/,
+    "the fence must delegate its verdict to the pure resolver",
+  );
+  const bindingSrc = readFileSync(
+    join(HERE, "../../web/js/lib/graph-binding.js"),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  const verdictStart = bindingSrc.indexOf("export function resolveGraphBindingVerdict(");
+  assert.notEqual(verdictStart, -1);
+  const verdictBody = bindingSrc.slice(verdictStart, bindingSrc.indexOf("\n}\n", verdictStart));
+  assert.match(
+    verdictBody,
     /requireDirtyMutationBinding[\s\S]*!graphRootWorkflowUuidMatches\(\{ rootGraph, activeWorkflowUuid \}\)/,
     "a dirty mutation must require a positive root-to-active UUID match, not merely no mismatch",
   );
   assert.match(
-    body,
+    verdictBody,
     /const currentStateTrustworthy = activeWorkflow\?\.isModified !== true;/,
     "a dirty ChangeTracker snapshot is not trustworthy as a binding proof",
   );
   assert.match(
-    body,
+    verdictBody,
     /currentStateTrustworthy &&\s*includeBaselineReadGuard &&\s*graphReadDesynced/,
     "the old node-count baseline guard must not reject a dirty canvas from stale tracker state",
   );
@@ -1746,25 +1768,51 @@ test("#545 P1: command identity resolution cannot adopt a stale dirty root befor
   );
 });
 
-test("#545 P1: direct snapshot restore refuses an untagged stale B for dirty A", () => {
+test("#545 P1: direct snapshot restore refuses an untagged stale B for dirty A", async () => {
   const { src, workflowA, rootB, objectUuids, assertBound } = buildDirtyStaleRouteHarness({ rootUuid: null });
   let loads = 0;
-  const restoreSource = panelFunctionSource(src, "restoreSnapshot", "revertGraphToLastSnapshot");
+  // restoreSnapshot PLUS the load-deadline machinery it closes over.
+  const restoreStart = src.indexOf("/** How long a snapshot restore's " + String.fromCharCode(96) + "loadGraphData" + String.fromCharCode(96));
+  assert.notEqual(restoreStart, -1, "could not locate the restore load budget");
+  const restoreSource = src.slice(restoreStart, panelFunctionStart(src, "revertGraphToLastSnapshot", restoreStart + 1));
   const restoreSnapshot = new Function(
     "getGraphCtx",
     "activeWorkflowRef",
     "assertGraphBoundToActiveWorkflow",
+    "MUTATION_BINDING_BAR",
+    "coerceMessageText",
+    "activeWorkflowReloadGuard",
+    "acquireWorkflowReloadGuard",
+    "beginWorkflowReloadStep",
+    "endWorkflowReloadStep",
+    "releaseWorkflowReloadGuard",
     `${restoreSource}\nreturn restoreSnapshot;`,
   )(
     () => ({ app: { loadGraphData: () => { loads += 1; } }, graph: rootB, rootGraph: rootB }),
     () => workflowA,
     assertBound,
+    MUTATION_BINDING_BAR,
+    (v) => String(v ?? ""),
+    () => null,
+    () => 1,
+    () => true,
+    () => {},
+    () => {},
   );
 
+  const outcome = await restoreSnapshot({ workflowRef: workflowA, data: { nodes: [] } });
   assert.equal(
-    restoreSnapshot({ workflowRef: workflowA, data: { nodes: [] } }),
-    null,
-    "the local restore path catches the binding refusal instead of loading B into A",
+    outcome.status,
+    "refused",
+    "the local restore path must REFUSE the binding rather than load B into A",
+  );
+  // …and it must PRESERVE the reason rather than collapse it to a bare null: the
+  // callers render an absent outcome as "nothing to revert", which would tell the
+  // user there was never a snapshot at the exact moment they are trying to recover.
+  assert.match(
+    outcome.reason,
+    /NOT applied/,
+    "the refusal must carry the panel's own reason for the caller to surface",
   );
   assert.ok(objectUuids.get(workflowA), "the direct guard must root-blindly establish A");
   assert.equal(rootB.extra?.comfyui_mcp?.workflow_uuid, undefined, "the untagged stale root remains untouched");
@@ -1782,10 +1830,12 @@ test("#545 P1: direct CivitAI graph_load refuses an untagged stale B for dirty A
   const graphLoad = new Function(
     "getGraphCtx",
     "assertGraphBoundToActiveWorkflow",
+    "MUTATION_BINDING_BAR",
     `const GRAPH_TOOL_EXECUTORS = {${graphLoadSource}\n}; return GRAPH_TOOL_EXECUTORS.graph_load;`,
   )(
     () => ({ app: { loadGraphData: async () => { loads += 1; } }, graph: rootB, rootGraph: rootB }),
     assertBound,
+    MUTATION_BINDING_BAR,
   );
 
   await assert.rejects(
@@ -1896,8 +1946,8 @@ test("#349 wiring: every graph command verifies LiteGraph is bound, with positiv
   assert.match(handler, /msg\.cmd\.startsWith\("graph_"\)/, "graph commands must have a root-binding fence");
   assert.match(
     handler,
-    /assertGraphBoundToActiveWorkflow\(graph, rootGraph, \{[\s\S]*requireDirtyMutationBinding: graphCommandMayMutateWorkflow\(msg\.cmd\)[\s\S]*\}\)/,
-    "the fence must inspect the executor graph and demand positive dirty binding only for mutations",
+    /assertGraphBoundToActiveWorkflow\(graph, rootGraph, graphCommandBindingBar\(msg\.cmd\)\)/,
+    "the fence must inspect the executor graph and derive its bar from the command's mutability",
   );
 });
 
@@ -1912,14 +1962,14 @@ test("#349 direct paths: run, CivitAI load, and snapshot restore fence the live 
     assert.ok(fence > start && fence < before, `${startNeedle} must fence before ${beforeNeedle}`);
     assert.match(
       src.slice(fence, before),
-      /requireDirtyMutationBinding: true/,
-      `${startNeedle} must require a positive binding for dirty mutation`,
+      /\.\.\.MUTATION_BINDING_BAR/,
+      `${startNeedle} must clear the full MUTATION binding bar, not a reduced one`,
     );
   };
 
   orderedFence("async graph_run({ batch_count, to_node_id })", "app.queuePrompt");
   orderedFence("async graph_load({ graph: incoming } = {})", "captureGraphSnapshot(null, \"before graph_load\")");
-  orderedFence("function restoreSnapshot(snap)", "app.loadGraphData(JSON.parse(JSON.stringify(snap.data))");
+  orderedFence("function restoreSnapshot(snap)", "payload = JSON.parse(JSON.stringify(snap.data))");
 });
 
 test("#349 snapshots: capture is bound and restore rejects a snapshot from another workflow", () => {
@@ -1930,7 +1980,7 @@ test("#349 snapshots: capture is bound and restore rejects a snapshot from anoth
   assert.ok(captureStart >= 0 && captureFence > captureStart && captureFence < captureSerialize);
   assert.match(
     src.slice(captureFence, captureSerialize),
-    /requireDirtyMutationBinding: true/,
+    /\.\.\.MUTATION_BINDING_BAR/,
     "snapshot capture must not record an unbound dirty root for later restore",
   );
   assert.match(
@@ -1945,7 +1995,7 @@ test("#349 snapshots: capture is bound and restore rejects a snapshot from anoth
   );
 
   const restoreStart = src.indexOf("function restoreSnapshot(snap)");
-  const restoreLoad = src.indexOf("app.loadGraphData(JSON.parse(JSON.stringify(snap.data))", restoreStart);
+  const restoreLoad = src.indexOf("payload = JSON.parse(JSON.stringify(snap.data))", restoreStart);
   const restoreBody = src.slice(restoreStart, restoreLoad);
   assert.match(
     restoreBody,
