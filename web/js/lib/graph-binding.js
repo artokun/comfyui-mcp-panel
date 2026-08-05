@@ -596,7 +596,7 @@ export function resolveGraphBindingVerdict({
  * The caller-facing refusal text for a `resolveGraphBindingVerdict` result. Kept
  * next to the predicates so the claim and the evidence cannot drift apart.
  *
- * Both messages state that the command was NOT applied. That claim is only ever
+ * Every message states that the command was NOT applied. That claim is only ever
  * TRUE because every caller asserts BEFORE doing any work — a caller that has
  * already mutated something must disclose, not refuse (a refusal for work that
  * landed invites a destructive retry, which is #603's duplicate-node cascade).
@@ -612,11 +612,40 @@ export function graphBindingRefusalMessage(verdict) {
       `persists, re-open the workflow tab (panel_open_workflow) or reload the panel.`
     );
   }
+  // #606 — name the firing predicate honestly and order the remedies by what
+  // actually recovers. panel_open_workflow rebinds in place (its repaint proof
+  // re-stamps the root's identity tag from the workflow's own state); a panel
+  // reload ALWAYS re-establishes the binding from scratch, so it is the certain
+  // fallback — earlier text sent the agent to open_workflow with no hint that
+  // reload is the reliable one, and phrased a 0-node expectation as "the
+  // workflow reports 0 node(s), but the canvas is bound to a different graph",
+  // which reads as nonsense for a genuinely-empty tab.
+  const remedy =
+    `Re-open the active workflow tab (panel_open_workflow) to rebind the graph in place; if that ` +
+    `does not clear it, reload the panel (panel_reload scope:frontend) — a reload always ` +
+    `re-establishes the binding — then retry.`;
+  if (verdict.reason === "root-workflow-uuid-mismatch") {
+    return (
+      `[root-workflow-uuid-mismatch] The live canvas carries a different workflow's identity tag ` +
+      `than the active workflow — a load, tab switch, or reconnect left a stale tag behind, so ` +
+      `this command was NOT applied. ${remedy}`
+    );
+  }
+  if (verdict.reason === "dirty-mutation-binding-unproven") {
+    return (
+      `[dirty-mutation-binding-unproven] The active workflow has unsaved edits and the live canvas ` +
+      `carries no identity tag proving it belongs to that workflow, so this mutation was NOT ` +
+      `applied — a change-tracker lag cannot be told apart from a wrong canvas here. ${remedy}`
+    );
+  }
+  const expectation =
+    Number(verdict.expected) > 0
+      ? `the workflow reports ${verdict.expected} node(s), but the canvas is bound to a different graph`
+      : `the canvas's content does not match the active workflow's own state`;
   return (
-    `[${verdict.reason}] The live graph is out of sync with the active workflow: the workflow reports ` +
-    `${verdict.expected} node(s), but the canvas is bound to a different graph. A load, tab switch, ` +
-    `or reconnect left this command pointed at the wrong canvas, so it was NOT applied. Re-open the ` +
-    `active workflow tab (panel_open_workflow) or reload the panel to rebind the graph, then retry.`
+    `[${verdict.reason}] The live graph is out of sync with the active workflow: ${expectation}. ` +
+    `A load, tab switch, or reconnect left this command pointed at the wrong canvas, so it was ` +
+    `NOT applied. ${remedy}`
   );
 }
 

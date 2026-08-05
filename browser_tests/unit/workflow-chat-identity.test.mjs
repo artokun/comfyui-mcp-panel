@@ -473,3 +473,44 @@ test('scope guard authorizes only an exact workflow UUID key', () => {
   assert.equal(isThreadInScope(thread, 'workflow:abc-123-copy'), false)
   assert.equal(isThreadInScope(thread, ''), false)
 })
+
+// #607 — server/Manager-scoped commands never read or mutate app.graph, so the
+// per-instance workflow stamp says nothing about whether they may run. Fencing them
+// wedged panel_restart_comfyui itself behind "workflow instance mismatch" — the very
+// command the mismatch error's situation calls for — leaving no in-band recovery.
+test('#607 non-canvas commands are exempt from the workflow-instance fence', () => {
+  for (const cmd of [
+    'comfy_reboot',
+    'free_vram',
+    'nodes_search',
+    'nodes_list',
+    'nodes_install',
+    'nodes_queue_status',
+    'workflow_list'
+  ]) {
+    assert.equal(activeWorkflowFenceApplies({ cmd }), false, `${cmd} must not be fenced`)
+  }
+})
+
+test('#607 canvas and workflow commands stay fenced; unknown commands fail closed', () => {
+  for (const cmd of [
+    'graph_add_node',
+    'graph_outline',
+    'graph_run',
+    'graph_set_widget',
+    // refresh_nodes re-applies defs to LIVE node instances and rewrites combo
+    // lists on the active graph (refreshComfyNodeDefs → reapplyDefsToLiveNodes) —
+    // a canvas mutation, so the stamp must be proven before it runs (codex gate).
+    'refresh_nodes',
+    'workflow_save',
+    'workflow_save_as',
+    'workflow_rename',
+    'workflow_close'
+  ]) {
+    assert.equal(activeWorkflowFenceApplies({ cmd }), true, `${cmd} must stay fenced`)
+  }
+  // Fail closed: a command nobody classified is treated as canvas-bound.
+  assert.equal(activeWorkflowFenceApplies({ cmd: 'some_future_command' }), true)
+  assert.equal(activeWorkflowFenceApplies({ cmd: undefined }), true)
+  assert.equal(activeWorkflowFenceApplies({}), true)
+})
