@@ -16,9 +16,22 @@
 //    the now-orphaned slot behind on the parent SubgraphNode.
 //
 // The unifying idea is ONE authoritative scope resolver (`resolveScope`) that BOTH
-// reads and writes derive their target graph from, and that treats a canvas graph
-// unreachable from the LIVE root as stale — reconciling to root so a read and an
-// edit issued back-to-back can never target two different graphs.
+// reads and writes derive their target graph from, so a read and an edit issued
+// back-to-back can never target two different graphs.
+//
+//  - #604: a canvas graph unreachable from the LIVE root used to be reconciled to
+//    root unconditionally, by REPAINTING the canvas. "Unreachable" proves only that
+//    the live root does not own that graph, never that it is disposable — and the
+//    repaint destroyed a user's unsaved 31-node workflow after a backend restart.
+//    The reconcile is now gated on POSITIVE proof that the graph holds no content;
+//    everything else is reported as a divergence for the caller to refuse.
+
+// The SAME content-free proof the binding guard uses (#565): a present-empty
+// `_nodes` array is node-level evidence only, so a graph that cannot serialize —
+// and therefore cannot prove it holds no subgraphs / groups / links — fails
+// closed. resolveScope needs exactly that bar before it may repaint a canvas
+// away, so it borrows the proof rather than inventing a weaker one.
+import { graphRootProvenEmpty as graphProvenContentFree } from "./graph-binding.js";
 
 export const SUBGRAPH_INPUT_RAIL_ID = -10;
 export const SUBGRAPH_OUTPUT_RAIL_ID = -20;
@@ -297,38 +310,88 @@ export function isSubgraphInRoot(rootGraph, subgraph) {
   return false;
 }
 
+/** POSITIVE structural evidence that a graph object is a SUBGRAPH rather than a
+ *  root-level graph (#604 family). A LiteGraph subgraph is defined by its boundary
+ *  rails (`inputNode`/`outputNode`, or the private `_inputNode`/`_outputNode` this
+ *  file's resolveRailNode already reads) and by a `rootGraph` back-pointer that
+ *  names a DIFFERENT graph; a root graph has no rails and is its own root.
+ *
+ *  This does NOT decide whether the view may be repainted — CONTENT does (see
+ *  resolveScope). It only names WHICH divergence happened, so the refusal can
+ *  state a remedy the user can actually act on: a canvas stranded inside a ghost
+ *  SUBGRAPH is escaped by leaving the subgraph, whereas two different ROOT graphs
+ *  can only be reconciled by reloading the page.
+ *
+ *  Fail-safe direction: only POSITIVE subgraph evidence returns true, so an
+ *  unrecognized shape is described as the root-level divergence, whose remedy
+ *  (a full page reload) also resolves the subgraph case. */
+export function graphIsSubgraphLike(graph) {
+  if (!graph || typeof graph !== "object") return false;
+  if (graph.inputNode ?? graph._inputNode ?? graph.outputNode ?? graph._outputNode) return true;
+  // LiteGraph's `rootGraph` is the graph itself on a root LGraph and the enclosing
+  // root on a Subgraph — a back-pointer to a DIFFERENT graph is subgraph evidence.
+  const claimedRoot = graph.rootGraph;
+  if (claimedRoot && typeof claimedRoot === "object" && claimedRoot !== graph) return true;
+  return false;
+}
+
 /** THE authoritative viewing-scope resolver. Both graph reads and graph mutations
  *  derive their target graph from this, so they can never diverge (#220 / #308).
  *
- *  Returns { graph, rootGraph, scope, owner, stale }:
+ *  Returns { graph, rootGraph, scope, owner, stale, diverged }:
  *   - root             → { graph: root,     scope: "root" }
  *   - a valid subgraph → { graph: subgraph, scope: "subgraph", owner? } — valid when
  *     the live root reaches it via an owner NODE or its `subgraphs` registry.
- *   - a STALE subgraph (the canvas still points at a subgraph the rebuilt root
- *     neither owns nor registers — e.g. after a reconnect) → reconcile to root:
- *     { graph: root, scope: "root", stale: true }. The caller rebinds the canvas
- *     so the physical view matches, keeping read + edit in lockstep. */
+ *   - an UNREACHABLE canvas graph (the canvas points at a graph the live root
+ *     neither owns nor registers — after a reconnect, a rebuild, or a backend
+ *     restart). CONTENT decides what happens, never the graph's KIND:
+ *       · PROVABLY content-free (graphRootProvenEmpty: a present-empty `_nodes`
+ *         AND a serialize() whose every non-identity surface is empty) → reconcile
+ *         to root: { graph: root, scope: "root", stale: true }. The caller rebinds
+ *         the canvas so the physical view matches, keeping read + edit in lockstep
+ *         (#220/#308). Nothing can be lost: there is provably nothing in it.
+ *       · anything else → { graph: canvasGraph, scope: "root", stale: FALSE,
+ *         diverged: true, divergedKind }. `stale` stays false ON PURPOSE: it is the
+ *         caller's REPAINT trigger, and repainting is what destroyed work. The
+ *         caller must REFUSE.
+ *
+ *  The kind-blind content rule is the point. This used to reconcile ANY unreachable
+ *  canvas graph by repainting it away, on the premise that an unreachable graph
+ *  "holds none of the workflow". That premise is not proven by unreachability — it
+ *  is proven by CONTENT — and acting on it destroyed a user's unsaved 31-node graph
+ *  (#604) and would equally destroy unsaved work inside a stranded subgraph. Where
+ *  the panel cannot prove which graph a command names, "could not determine" must
+ *  not become a verdict in either direction: refuse, and say which two graphs are
+ *  in play. `divergedKind` ("subgraph" | "root") only selects the remedy wording. */
 export function resolveScope(app) {
   const rootGraph = app?.graph ?? null;
   const canvasGraph = app?.canvas?.graph ?? null;
   if (!rootGraph) {
-    return { graph: canvasGraph ?? null, rootGraph: null, scope: "root", owner: null, stale: false };
+    return { graph: canvasGraph ?? null, rootGraph: null, scope: "root", owner: null, stale: false, diverged: false };
   }
   if (!canvasGraph || canvasGraph === rootGraph) {
-    return { graph: rootGraph, rootGraph, scope: "root", owner: null, stale: false };
+    return { graph: rootGraph, rootGraph, scope: "root", owner: null, stale: false, diverged: false };
   }
   const owner = findSubgraphOwner(rootGraph, canvasGraph);
   if (owner) {
-    return { graph: canvasGraph, rootGraph, scope: "subgraph", owner, stale: false };
+    return { graph: canvasGraph, rootGraph, scope: "subgraph", owner, stale: false, diverged: false };
   }
   // No presentation-owner node — but the subgraph may still be authoritative via the
   // root's uuid→Subgraph registry (a registered definition without a live instance
   // node). Only when it is NEITHER owned NOR registered is it a genuine post-reconnect
   // ghost; then fall back to root so reads AND writes agree rather than target a ghost.
   if (isSubgraphInRoot(rootGraph, canvasGraph)) {
-    return { graph: canvasGraph, rootGraph, scope: "subgraph", owner: null, stale: false };
+    return { graph: canvasGraph, rootGraph, scope: "subgraph", owner: null, stale: false, diverged: false };
   }
-  return { graph: rootGraph, rootGraph, scope: "root", owner: null, stale: true };
+  // Unreachable from the live root. Repaint ONLY what is provably content-free.
+  // `divergedKind` rides BOTH branches: the caller's repaint can fail (setGraph is
+  // optional and can throw), and an unconfirmed repaint leaves the same divergence,
+  // so it needs the same remedy wording even on the reconcilable branch.
+  const divergedKind = graphIsSubgraphLike(canvasGraph) ? "subgraph" : "root";
+  if (graphProvenContentFree(canvasGraph)) {
+    return { graph: rootGraph, rootGraph, scope: "root", owner: null, stale: true, diverged: false, divergedKind };
+  }
+  return { graph: canvasGraph, rootGraph, scope: "root", owner: null, stale: false, diverged: true, divergedKind };
 }
 
 /** Compact JSON scope descriptor for tool responses (the `viewing` field). Derived

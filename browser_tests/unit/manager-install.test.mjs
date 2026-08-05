@@ -584,8 +584,27 @@ test("waitForQueueDrain (real panel source) returns a drained status without Ref
 
   // Provide the exact free identifiers the function closes over at module scope.
   const MANAGER_FETCH_TIMEOUT_MS = 15000;
-  const boundedDelay = (ms, deadline) =>
-    new Promise((r) => setTimeout(r, Math.max(0, Math.min(ms, deadline - Date.now()))));
+  // The injected delay resolves IMMEDIATELY, and that is the point of injecting it.
+  // What this test pins is the drain loop's identifier bindings and its use of
+  // queueDrained — a missing binding throws a ReferenceError right here. It is not
+  // a timing test, so it must not depend on a real timer winning a race.
+  //
+  // A sleeping stub made it FLAKY: waitForQueueDrain opens with a fixed
+  // boundedDelay(1000, deadline) warm-up, and under load (a loaded machine, the
+  // suite's own parallelism) that timer plus scheduling can consume the whole
+  // 5000ms budget before two polls complete. The loop then exits on its deadline
+  // with status still null, queueDrained(null) is false, and the assertion fails
+  // for a reason that has nothing to do with the code under test. Observed at
+  // 3.4s / 10.4s / 10.5s across consecutive runs on the same commit.
+  //
+  // Resolving instantly keeps every assertion meaningful: Date.now() barely moves,
+  // so the deadline is still in the future, both polls still run in order, and the
+  // drained status is still reached through the real loop.
+  const delays = [];
+  const boundedDelay = (ms, deadline) => {
+    delays.push({ ms, remaining: deadline - Date.now() });
+    return Promise.resolve();
+  };
   let polls = 0;
   const managerGet = async () => {
     // First poll: still processing; second: positively drained.
@@ -607,6 +626,19 @@ test("waitForQueueDrain (real panel source) returns a drained status without Ref
   const status = await realWait({ timeoutMs: 5000, intervalMs: 10 });
   assert.equal(queueDrained(status), true, "should return a positively-drained status");
   assert.ok(polls >= 2, "should have polled until drained");
+  // The delays are now observable rather than merely endured, so the loop's own
+  // pacing is asserted instead of being taken on trust: a warm-up before the first
+  // poll, then the caller's interval between polls. Each is bounded by the budget
+  // that remains, which is what stops a long interval from overrunning the deadline.
+  assert.deepEqual(
+    delays.map((d) => d.ms),
+    [1000, 10],
+    "one warm-up before the first poll, then the caller's intervalMs between polls",
+  );
+  assert.ok(
+    delays.every((d) => d.remaining > 0),
+    "every delay is handed the remaining budget, so it can be capped by the deadline",
+  );
 });
 
 // ---------------------------------------------------------------------------
