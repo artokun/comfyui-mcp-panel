@@ -32,6 +32,7 @@ import {
   MUTATION_BINDING_BAR,
   graphReadBindingChanged,
   resolveGraphRootUuidRebind,
+  sealProvenRootBinding,
   serializedStateProvenEmpty,
 } from "../../web/js/lib/graph-binding.js";
 import {
@@ -268,6 +269,10 @@ function buildDirtyStaleRouteHarness({
     "workflowOwnsRootUuidTag",
     "rememberWorkflowUuidOwner",
     "resolveGraphRootUuidRebind",
+    "sealProvenRootBinding",
+    "graphRootMatchesState",
+    "sameWorkflowObject",
+    "app",
     "WORKFLOW_META_NAMESPACE",
     "WORKFLOW_UUID_FIELD",
     `${fenceSource}\nreturn assertGraphBoundToActiveWorkflow;`,
@@ -283,6 +288,10 @@ function buildDirtyStaleRouteHarness({
     ownsTag,
     () => {},
     resolveGraphRootUuidRebind,
+    sealProvenRootBinding,
+    graphRootMatchesState,
+    sameWorkflowObject,
+    { graph: rootB, extensionManager: { workflow: { openWorkflows } } },
     "comfyui_mcp",
     "workflow_uuid",
   );
@@ -781,6 +790,192 @@ test("#545 P1: an untagged stale root is refused for dirty mutations but a prove
     }),
     "the #545 dirty-edit case remains available once the live root positively matches A",
   );
+});
+
+// ── #601: the seal — a proven-CLEAN binding is stamped onto the root ─────────
+//
+// The one-mutation-per-page-load deadlock: a reload rebuilds app.graph from
+// saved JSON with NO root stamp, and the first mutation is itself what dirties
+// the tab — so every mutation after the first hit dirty-mutation-binding-
+// unproven. The seal stamps the active workflow's uuid onto the root at the one
+// moment it is provably correct: clean tab + root serializes EQUAL to the
+// workflow's own current state.
+
+test("sealProvenRootBinding: clean tab + proven-equal root gets stamped (and preserves other extra keys)", () => {
+  const workflow = { isModified: false, changeTracker: { activeState: state(5) } };
+  const root = { _nodes: [], extra: { ds: { scale: 1 } }, serialize: () => state(5) };
+  assert.equal(
+    sealProvenRootBinding({ rootGraph: root, activeWorkflow: workflow, activeWorkflowUuid: "uuid-A" }),
+    true,
+  );
+  assert.equal(root.extra.comfyui_mcp.workflow_uuid, "uuid-A");
+  assert.deepEqual(root.extra.ds, { scale: 1 }, "the stamp must not clobber unrelated extra keys");
+});
+
+test("sealProvenRootBinding: fails CLOSED — dirty tab, subgraph scope, foreign stamp, unproven root, missing identity", () => {
+  const clean = { isModified: false, changeTracker: { activeState: state(5) } };
+  const dirty = { isModified: true, changeTracker: { activeState: state(5) } };
+  const root = () => ({ _nodes: [], serialize: () => state(5) });
+  // Dirty tab: the tracker can lag the real canvas (#545) — no seal.
+  {
+    const r = root();
+    assert.equal(sealProvenRootBinding({ rootGraph: r, activeWorkflow: dirty, activeWorkflowUuid: "uuid-A" }), false);
+    assert.equal(r.extra, undefined);
+  }
+  // Subgraph scope: the stamp belongs on the root only — the caller passes the root, but the flag is defense in depth.
+  {
+    const r = root();
+    assert.equal(
+      sealProvenRootBinding({ rootGraph: r, activeWorkflow: clean, activeWorkflowUuid: "uuid-A", inSubgraph: true }),
+      false,
+    );
+    assert.equal(r.extra, undefined);
+  }
+  // An EXISTING stamp — even a conflicting one — is the rebind path's decision, never overwritten here.
+  {
+    const r = { _nodes: [], extra: { comfyui_mcp: { workflow_uuid: "uuid-B" } }, serialize: () => state(5) };
+    assert.equal(sealProvenRootBinding({ rootGraph: r, activeWorkflow: clean, activeWorkflowUuid: "uuid-A" }), false);
+    assert.equal(r.extra.comfyui_mcp.workflow_uuid, "uuid-B");
+  }
+  // A root that does NOT serialize equal to the workflow's current state stays unstamped (stale/foreign canvas).
+  {
+    const r = { _nodes: [], serialize: () => state(9) };
+    assert.equal(sealProvenRootBinding({ rootGraph: r, activeWorkflow: clean, activeWorkflowUuid: "uuid-A" }), false);
+    assert.equal(r.extra, undefined);
+  }
+  // An unserializable root / missing identity / missing sides: no stamp, no throw.
+  {
+    const r = { _nodes: [] };
+    assert.equal(sealProvenRootBinding({ rootGraph: r, activeWorkflow: clean, activeWorkflowUuid: "uuid-A" }), false);
+    assert.equal(sealProvenRootBinding({ rootGraph: root(), activeWorkflow: clean, activeWorkflowUuid: "" }), false);
+    assert.equal(sealProvenRootBinding({ rootGraph: root(), activeWorkflow: clean, activeWorkflowUuid: null }), false);
+    assert.equal(sealProvenRootBinding({}), false);
+  }
+  // A NON-EXCLUSIVE content proof (an identical-twin open tab, or an
+  // exclusivity check that could not run) never seals (codex gate).
+  {
+    const r = root();
+    assert.equal(
+      sealProvenRootBinding({ rootGraph: r, activeWorkflow: clean, activeWorkflowUuid: "uuid-A", proofExclusive: false }),
+      false,
+    );
+    assert.equal(r.extra, undefined);
+  }
+});
+
+test("#601: the FIRST post-reload mutation seals the proven-clean root, so the SECOND (dirty-tab) mutation passes", () => {
+  // Post-reload state: CLEAN tab, unstamped root that provably carries the
+  // workflow's own content (rootSerializer emits exactly the tracker state).
+  const h = buildDirtyStaleRouteHarness({
+    rootUuid: null,
+    foreignClaim: "none",
+    activeNodeCount: 5,
+    rootNodeCount: 5,
+    activeModified: false,
+    rootSerializer: () => state(5),
+  });
+  // First mutation on the clean tab: passes AND seals the root with A's identity.
+  assert.doesNotThrow(() =>
+    h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: true, requireDirtyMutationBinding: true }),
+  );
+  assert.equal(
+    h.rootB.extra?.comfyui_mcp?.workflow_uuid,
+    "workflow-A-1",
+    "the seal stamps the active workflow's own resolved identity onto the proven root",
+  );
+  // That first mutation is what dirties the tab. Before the seal, every
+  // mutation from here was refused (one mutation per page load); now the
+  // stamped root positively matches A, so the mutation bar clears.
+  h.workflowA.isModified = true;
+  assert.doesNotThrow(
+    () => h.assertBound(h.rootB, h.rootB, { includeBaselineReadGuard: true, requireDirtyMutationBinding: true }),
+    "a dirty tab whose root carries its own sealed identity must stay editable",
+  );
+});
+
+test("#601: without a clean proof the seal does not fire — the #545 P1 fence semantics are unchanged", () => {
+  // Dirty tab + unstamped root: refused as before, and the root stays UNSTAMPED
+  // (a refused command must leave no authorization residue behind).
+  const dirty = buildDirtyStaleRouteHarness({ rootUuid: null });
+  assert.throws(
+    () =>
+      dirty.assertBound(dirty.rootB, dirty.rootB, {
+        includeBaselineReadGuard: false,
+        requireDirtyMutationBinding: true,
+      }),
+    /NOT applied/,
+  );
+  assert.equal(dirty.rootB.extra, undefined, "a dirty unproven root must never receive the stamp");
+  // Clean tab whose root does NOT carry the workflow's content: refused, unstamped.
+  const diverged = buildDirtyStaleRouteHarness({
+    rootUuid: null,
+    foreignClaim: "none",
+    activeNodeCount: 5,
+    rootNodeCount: 5,
+    activeModified: false,
+    rootSerializer: () => state(9), // root content ≠ tracker state — a genuinely diverged canvas
+  });
+  assert.throws(
+    () =>
+      diverged.assertBound(diverged.rootB, diverged.rootB, {
+        includeBaselineReadGuard: true,
+        requireDirtyMutationBinding: true,
+      }),
+    /NOT applied/,
+  );
+  assert.equal(diverged.rootB.extra, undefined, "a diverged root must never receive the stamp");
+});
+
+test("#601 (codex gate): an identical-TWIN open tab makes the content proof ambiguous — no seal, fail closed", () => {
+  // Two clean, separately open DUPLICATE workflows carry byte-identical state, so
+  // content equality cannot tell the active tab's canvas from its twin's. The seal
+  // must stay off: stamping here could authorize later dirty writes to the wrong
+  // canvas.
+  const twin = buildDirtyStaleRouteHarness({
+    rootUuid: null,
+    foreignClaim: "identity", // B sits in openWorkflows alongside A
+    foreignTab: {
+      isPersisted: true,
+      path: "workflows/twin.json",
+      changeTracker: { activeState: state(5) }, // the twin's OWN copy of the identical content
+    },
+    activeNodeCount: 5,
+    rootNodeCount: 5,
+    activeModified: false,
+    rootSerializer: () => state(5),
+  });
+  // The clean-tab command itself still passes (the binding verdict is null either
+  // way) — but it must NOT leave a stamp behind.
+  assert.doesNotThrow(() =>
+    twin.assertBound(twin.rootB, twin.rootB, { includeBaselineReadGuard: true, requireDirtyMutationBinding: true }),
+  );
+  assert.equal(twin.rootB.extra, undefined, "an ambiguous (twin) content proof must never seal the root");
+  // …and once the tab is dirty, the ambiguous binding still refuses mutations,
+  // exactly as before the seal existed.
+  twin.workflowA.isModified = true;
+  assert.throws(
+    () =>
+      twin.assertBound(twin.rootB, twin.rootB, { includeBaselineReadGuard: true, requireDirtyMutationBinding: true }),
+    /NOT applied/,
+    "a dirty tab with an ambiguous binding stays fenced (#545 P1)",
+  );
+});
+
+test("#601: the dirty-mutation-binding-unproven refusal names the real cause and remedy — not a node count", () => {
+  const msg = graphBindingRefusalMessage({ reason: "dirty-mutation-binding-unproven", expected: 339 });
+  assert.match(msg, /\[dirty-mutation-binding-unproven\]/, "the reason tag stays observable");
+  assert.match(msg, /NOT applied/, "the refusal claim stays truthful");
+  assert.doesNotMatch(
+    msg,
+    /reports 339 node\(s\)/,
+    "reporting a node count for a UUID-binding failure is what sent two real diagnoses down wrong paths",
+  );
+  assert.match(msg, /identity stamp/, "names the actual failing predicate (no proven stamp on a dirty tab)");
+  assert.match(msg, /panel_open_workflow/, "names a working remedy");
+  assert.match(msg, /multiple_active_tabs/, "disambiguates the confusable sibling guard");
+  // The other verdicts keep their existing wording.
+  const generic = graphBindingRefusalMessage({ reason: "root-shape-mismatch", expected: 27 });
+  assert.match(generic, /reports 27 node\(s\)/);
 });
 
 test("#545: read-only graph commands recover from an untagged dirty root, while workflow mutations remain fenced", () => {

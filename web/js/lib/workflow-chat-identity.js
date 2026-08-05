@@ -237,6 +237,44 @@ export function selectorTargetsNonActiveWorkflow({ resolved, active } = {}) {
   return Boolean(resolved) && resolved !== active;
 }
 
+/** #602 — commands whose execution AND result never reference the active canvas:
+ *  Manager registry/server operations (node-pack discovery, install/update, queue
+ *  status) and ComfyUI-server controls (reboot, VRAM free). Fencing these to the
+ *  active workflow's uuid only manufactures false refusals when the user switches
+ *  or replaces a tab after the command was issued — a Manager registry search was
+ *  refused before it ever reached searchNodesVia because the stamped uuid no
+ *  longer matched the now-active canvas.
+ *
+ *  refresh_nodes is deliberately NOT here (codex gate round 5): its executor
+ *  re-applies fresh defs to LIVE node objects and renames UNKNOWN widget
+ *  placeholders on the ACTIVE canvas — a real mutation of whichever workflow is
+ *  mounted, so a stale-stamped call must stay fenced.
+ *
+ *  The set is EXPLICIT and everything unlisted stays fenced (fail closed): a new
+ *  command must opt out here on purpose, so the #570 fence cannot silently lose
+ *  coverage of a future canvas op. Membership criterion: the command neither
+ *  reads nor mutates any workflow canvas and its reply does not describe the
+ *  active one (workflow_list, by contrast, reports the ACTIVE workflow — a
+ *  stale-stamped call must not answer for the wrong tab, so it stays fenced).
+ *  graph_update_node is a Manager PACK update misnamed with a graph_ prefix; it
+ *  touches no graph. */
+const CANVAS_INDEPENDENT_COMMANDS = new Set([
+  'nodes_search',
+  'nodes_list',
+  'nodes_install',
+  'nodes_queue_status',
+  'graph_update_node',
+  'comfy_reboot',
+  'free_vram',
+]);
+
+/** #602 — true when a command never reads or mutates a canvas (see the set above).
+ *  Callers use this to skip canvas-targeting fences that would otherwise refuse a
+ *  server-side operation for an irrelevant workflow-binding reason. */
+export function commandIsCanvasIndependent(cmd) {
+  return CANVAS_INDEPENDENT_COMMANDS.has(cmd);
+}
+
 /** #570 — does the per-command workflow-instance uuid fence APPLY to this command? The fence
  *  refuses a command whose stamped workflow_uuid ≠ the ACTIVE workflow's uuid, so it must cover
  *  everything that runs against the active canvas — every graph_* op AND the active-workflow
@@ -251,6 +289,8 @@ export function selectorTargetsNonActiveWorkflow({ resolved, active } = {}) {
  *  can't); both must pass. The fence fires for pinned ops too.
  *
  *  It must NOT fire only for:
+ *   • canvas-independent Manager/server commands (CANVAS_INDEPENDENT_COMMANDS, #602): their
+ *     execution and reply never reference the active canvas, so a stale stamp is irrelevant;
  *   • workflow_open / workflow_new: navigation/creation with their own explicit/new target;
  *   • workflow_rename / workflow_close whose selector resolves to a genuinely NON-active open
  *     workflow (`targetsNonActive` — via selectorTargetsNonActiveWorkflow): a deterministic
@@ -259,6 +299,7 @@ export function selectorTargetsNonActiveWorkflow({ resolved, active } = {}) {
  *  Reads (graph_get_state, …) still return true here — harmlessly fenced (fail-closed); their
  *  reply is server-fenced anyway, and a read can only run against the active canvas regardless. */
 export function activeWorkflowFenceApplies({ cmd, targetsNonActive = false } = {}) {
+  if (commandIsCanvasIndependent(cmd)) return false;
   if (cmd === 'workflow_open' || cmd === 'workflow_new') return false;
   if ((cmd === 'workflow_rename' || cmd === 'workflow_close') && targetsNonActive) return false;
   return true;

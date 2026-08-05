@@ -22,6 +22,24 @@ import {
 } from "../../web/js/lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing } from "../../web/js/lib/node-resolve.js";
 import { runSetWidget } from "../../web/js/lib/set-widget.js";
+import {
+  primeModuleCache,
+  resolveBundleStaleness,
+  collectRelativeImportSpecifiers,
+} from "../../web/js/lib/bundle-version.js";
+import { commandIsCanvasIndependent } from "../../web/js/lib/workflow-chat-identity.js";
+import { sealProvenRootBinding } from "../../web/js/lib/graph-binding.js";
+
+test("panel ↔ bundle-version.js module edge links (#584/#611)", () => {
+  assert.equal(typeof resolveBundleStaleness, "function");
+  assert.equal(typeof primeModuleCache, "function");
+  assert.equal(typeof collectRelativeImportSpecifiers, "function");
+});
+
+test("panel ↔ workflow-chat-identity.js / graph-binding.js new edges link (#601/#602)", () => {
+  assert.equal(typeof commandIsCanvasIndependent, "function");
+  assert.equal(typeof sealProvenRootBinding, "function");
+});
 
 // --- Mirror set-widget.js imports (the fix's internal module edges) -----------------
 import {
