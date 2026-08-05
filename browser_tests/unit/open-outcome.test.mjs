@@ -35,6 +35,7 @@ import {
   receiptAnswersCommand,
   classifyOpenOutcome,
 } from "../../web/js/lib/open-outcome.js";
+import { savedWorkflowHandle } from "../../web/js/lib/bridge-route.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
@@ -939,10 +940,15 @@ test("#716 P1: service rebind during workflow_open omits the former target UUID"
   const replyUuid = new Function(
     "activeWorkflowRef",
     "workflowObjectUuid",
+    "savedWorkflowHandle",
     `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => currentService.activeWorkflow,
     (wf) => workflowUuids.get(wf),
+    // #640 — the REAL shared handle helper the panel imports, not a stub: these
+    // sandboxes exist to run the shipped reply-identity code, and a hand-rolled
+    // `wf:` + path here would be the second spelling the shared helper removed.
+    savedWorkflowHandle,
   );
 
   assert.equal(replyUuid(openedTarget), "11111111-1111-4111-8111-111111111111", "the normal completed open reports its actual active tab");
@@ -975,10 +981,15 @@ test("#716 P1: service rebind during workflow_list reports only the current acti
   const listActive = new Function(
     "activeWorkflowRef",
     "workflowObjectUuid",
+    "savedWorkflowHandle",
     `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${listActiveSource}; return liveWorkflowListActive;`,
   )(
     () => currentService.activeWorkflow,
     (wf) => workflowUuids.get(wf),
+    // #640 — the REAL shared handle helper the panel imports, not a stub: these
+    // sandboxes exist to run the shipped reply-identity code, and a hand-rolled
+    // `wf:` + path here would be the second spelling the shared helper removed.
+    savedWorkflowHandle,
   );
 
   assert.equal(listActive().activeIdentity?.uuid, "11111111-1111-4111-8111-111111111111");
@@ -1002,10 +1013,15 @@ test("#716 P1: a malformed truthy active binding cannot mint reply identity", ()
   const replyUuid = new Function(
     "activeWorkflowRef",
     "workflowObjectUuid",
+    "savedWorkflowHandle",
     `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => malformedActive,
     (wf) => workflowUuids.get(wf),
+    // #640 — the REAL shared handle helper the panel imports, not a stub: these
+    // sandboxes exist to run the shipped reply-identity code, and a hand-rolled
+    // `wf:` + path here would be the second spelling the shared helper removed.
+    savedWorkflowHandle,
   );
 
   // Execute the actual shipped reply helper against a truthy but malformed
@@ -1026,10 +1042,15 @@ test("#716 P1: a temporary workflow UUID is never published as a durable refresh
   const replyUuid = new Function(
     "activeWorkflowRef",
     "workflowObjectUuid",
+    "savedWorkflowHandle",
     `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => temporaryActive,
     (wf) => workflowUuids.get(wf),
+    // #640 — the REAL shared handle helper the panel imports, not a stub: these
+    // sandboxes exist to run the shipped reply-identity code, and a hand-rolled
+    // `wf:` + path here would be the second spelling the shared helper removed.
+    savedWorkflowHandle,
   );
 
   // Even an existing object-map UUID is insufficient for a temporary tab:
@@ -1056,10 +1077,15 @@ test("#716 P1: existing mapped UUIDs still omit when noncanonical", () => {
   const replyUuid = new Function(
     "activeWorkflowRef",
     "workflowObjectUuid",
+    "savedWorkflowHandle",
     `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => active,
     (wf) => workflowUuids.get(wf),
+    // #640 — the REAL shared handle helper the panel imports, not a stub: these
+    // sandboxes exist to run the shipped reply-identity code, and a hand-rolled
+    // `wf:` + path here would be the second spelling the shared helper removed.
+    savedWorkflowHandle,
   );
 
   for (const workflow of [invalidVersion, invalidVariant, uppercase]) {

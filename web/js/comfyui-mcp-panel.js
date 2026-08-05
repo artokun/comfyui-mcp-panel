@@ -324,6 +324,12 @@ import {
 } from "./lib/session-rebind.js";
 import { createRestartTabIdentity, sendBridgeHello } from "./lib/restart-tab-identity.js";
 import {
+  createTabRouteIdentity,
+  describeRefusedRoute,
+  savedWorkflowHandle,
+  savedWorkflowRoute,
+} from "./lib/bridge-route.js";
+import {
   adoptRebootRuns,
   decodeRebootMarker,
   isRealBridgeDrop,
@@ -1277,6 +1283,25 @@ const restartTabIdentity = createRestartTabIdentity({
   locks: window.navigator?.locks,
   randomUUID: () => crypto.randomUUID(),
 });
+// #640 — this browser tab's BRIDGE ROUTE identity, adopted from the very lease
+// the hello already awaits. Distinct from workflowTabId(): that is the workflow
+// HANDLE the agent selects with, and for a saved workflow it is path-only, so
+// two tabs on one file registered the same route and the later hello stole it.
+const tabRouteIdentity = createTabRouteIdentity({
+  locksAvailable: () => typeof window.navigator?.locks?.request === "function",
+  tabStorageId: () => getTabId(),
+});
+// Start establishing the identity at LOAD, not at the first hello. The lease is
+// async, and every frame sent in that window is refused for want of an identity
+// that was already on its way — a self-inflicted outage, not a real collision.
+// This changes only WHEN we ask: adopt() still records nothing but a COMPLETED
+// lease, and the resolver caches, so the hello below adopts the same value.
+void restartTabIdentity
+  .resolve()
+  .then((leasedId) => tabRouteIdentity.adopt(leasedId))
+  .catch(() => {
+    // The hello's own adopt() applies the same rule against the same resolver.
+  });
 
 // --- Per-workflow agent identity -----------------------------------------
 // Each ComfyUI workflow gets its OWN agent session. Saved workflows key by file
@@ -1871,7 +1896,10 @@ function workflowStorageKey({ embed = false } = {}) {
 function workflowTabId(wf = activeWorkflowRef()) {
   if (!wf) return getTabId();
   const saved = savedWorkflowPath(wf);
-  if (saved) return "wf:" + wf.path;
+  // The saved HANDLE, not a bridge route — two tabs on this file share it, which
+  // is fine for a selector resolved inside one tab and is why bridgeRouteId()
+  // exists for the wire (#640).
+  if (saved) return savedWorkflowHandle(saved);
   // Key on the STABLE object instance, not the mutable wf.key (see the note at
   // _tempWorkflowInstanceIds): the same unsaved workflow must keep ONE tmp: id for
   // its lifetime, or the 600ms poll churns it into a re-hello storm.
@@ -1887,6 +1915,35 @@ function workflowTabId(wf = activeWorkflowRef()) {
     if (!_priorTempWorkflowIds.has(wf)) _priorTempWorkflowIds.set(wf, id);
   }
   return id;
+}
+
+// #640 — the BRIDGE ROUTE for a workflow: the `tab_id` this panel puts on the
+// wire, and the key ui-bridge keeps exactly ONE connection under.
+//
+// workflowTabId() is NOT usable as that route. Its saved-workflow form is
+// `wf:<path>`, which names the FILE, so two browser tabs showing the same saved
+// workflow helloed with the same id; the bridge's second registration took the
+// route over and the agent's commands were delivered to the other tab's canvas
+// (the workflow-UUID fence refused the ones that carry a UUID — the last line,
+// and only for commands that carry one). The route composes the tab's own
+// established identity in front of the path, so the same file open in two tabs,
+// the same file after a rename, and two unsaved tabs all route separately.
+//
+// Returns null to REFUSE when this tab's identity is not established. Callers
+// must not send. Never falls back to the path: that fallback would re-merge the
+// two tabs precisely when the identity is hardest to determine, which is the
+// defect, not a degradation of it.
+function bridgeRouteId(wf = activeWorkflowRef()) {
+  const tabRoute = tabRouteIdentity.established()?.id ?? null;
+  // No workflow service at all (headless / odd frontend): the tab IS the route.
+  if (!wf) return tabRoute;
+  const saved = savedWorkflowPath(wf);
+  if (saved) return savedWorkflowRoute(tabRoute, saved);
+  // Unsaved: `tmp:<uuid>` is minted per workflow OBJECT with crypto.randomUUID,
+  // and a workflow object never leaves the page that created it, so it is
+  // already unique per browser tab. It also has to keep its `tmp:` prefix — the
+  // orchestrator gates its durable stable-resume index on exactly that prefix.
+  return workflowTabId(wf);
 }
 
 // `workflow_open` does most of its work asynchronously.  Its `target` remains a
@@ -1914,7 +1971,15 @@ function establishedWorkflowReplyIdentity(wf) {
   const uuid = workflowObjectUuid(wf);
   if (!isCanonicalWorkflowInstanceUuid(uuid)) return null;
   const savedPath = savedWorkflowPath(wf);
-  return savedPath ? { routingKey: `wf:${savedPath}`, uuid } : null;
+  if (!savedPath) return null;
+  // #640 — the SHARED spelling of the handle format, not a second local one.
+  // This value is compared against workflowTabId()'s elsewhere in the same reply
+  // (each workflow_list record's `active` flag is `routingKey === activeRoutingKey`),
+  // so two independent spellings are a silent divergence waiting to happen:
+  // whichever changed first, every record would report active:false and the agent
+  // would be told no tab is active.
+  const routingKey = savedWorkflowHandle(savedPath);
+  return routingKey ? { routingKey, uuid } : null;
 }
 
 function activeWorkflowUuidForOpenReply(target) {
@@ -12601,6 +12666,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
   // "connected" is never swallowed — a re-handshake must still re-run its side
   // effects (budget reset, soft-reload interlock release).
   let lastStatus = null;
+  // #640 — say the route refusal ONCE. The reconnect loop retries the hello
+  // forever and the refusal is sticky (the identity is frozen for the page), so
+  // an unthrottled notice would bury the panel in the same paragraph.
+  let routeRefusalDisclosed = false;
   function emitStatus(s) {
     if (s === lastStatus && s !== "connected") return;
     lastStatus = s;
@@ -12772,11 +12841,16 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // then dropped (or vice versa) — the advertised set and the delivered set
     // must be computed against the SAME instant (codex).
     const now = Date.now();
+    // #640 — advisory frame; an unestablished route omits the field rather than
+    // naming a route this tab has not established. Read ONCE: two reads could
+    // straddle the hello that establishes the identity. The replay below is the
+    // load-bearing delivery and is socket-scoped either way.
+    const lostRepliesRouteId = bridgeRouteId();
     try {
       target.send(
         JSON.stringify({
           type: "lost_replies",
-          tab_id: workflowTabId(),
+          ...(lostRepliesRouteId ? { tab_id: lostRepliesRouteId } : {}),
           entries: lostReplies.summaries({ now, targetUrl, targetEpoch }),
         }),
       );
@@ -13626,6 +13700,23 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       isCurrent: () => sock === target && target.readyState === WebSocket.OPEN,
       resolveTabIdentity: () => restartTabIdentity.resolve(),
       makePayload: (tabSessionId) => {
+      // #640 — the hello is what REGISTERS this tab's bridge route, so establish
+      // the route identity here, from the lease that has just completed, and
+      // refuse the hello outright if it could not be established. Adopting the
+      // COMPLETED lease (never a value we hope to get) is the same ordering rule
+      // as the epoch bump below: nothing is recorded before it is true.
+      tabRouteIdentity.adopt(tabSessionId);
+      const routeId = bridgeRouteId();
+      if (!routeId) {
+        // Nothing has been dispatched, so this is a refusal, not a disclosure of
+        // something already done — but say so, or the panel just sits on a
+        // "connecting" pill it will never leave.
+        if (!routeRefusalDisclosed) {
+          routeRefusalDisclosed = true;
+          onLog?.(describeRefusedRoute({ settled: tabRouteIdentity.settled() }));
+        }
+        return null;
+      }
       // Carry the last session id so the orchestrator resumes the agent's
       // memory after a panel reload (only honored before the tab's agent spawns).
       const resume = getResume?.();
@@ -13636,7 +13727,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // so a bare `--panel-orchestrator` points the agent at whatever ComfyUI is open.
       const comfyuiUrl = comfyuiUrlForAgent();
         return buildHelloPayload({
-            tabId: workflowTabId(),
+            tabId: routeId,
             title: getWorkflowTitle(),
             // Our build version, so the orchestrator can auto-stamp it into the
             // agent's ENV block (bug reports get version-pinned without digging).
@@ -13707,9 +13798,14 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     if (!sock || sock.readyState !== WebSocket.OPEN) return;
     const t = getWorkflowTitle();
     if (t === lastSentTitle) return;
+    // #640 — resolve the route BEFORE marking the title as sent. A refused route
+    // means this frame never leaves, and recording it as sent would suppress
+    // every later attempt for a title the orchestrator never received.
+    const routeId = bridgeRouteId();
+    if (!routeId) return;
     lastSentTitle = t;
     try {
-      sock.send(JSON.stringify({ type: "title", tab_id: workflowTabId(), title: t }));
+      sock.send(JSON.stringify({ type: "title", tab_id: routeId, title: t }));
     } catch {
       // dropped — next mutation retries
     }
@@ -13855,8 +13951,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           frame = { ...frame, images: normalizeImageList(frame.images) };
         }
       }
+      // #640 — refuse rather than emit a frame with no established route.
+      const routeId = bridgeRouteId();
+      if (!routeId) return false;
       try {
-        sock.send(JSON.stringify({ tab_id: workflowTabId(), ...frame }));
+        sock.send(JSON.stringify({ tab_id: routeId, ...frame }));
         // #291 — `new_session` / `resume_session` hand the next turn to a different
         // agent over THIS same socket (/new, closing a thread, opening one from
         // history), so the socket generation does not move and, without this, the
@@ -13878,6 +13977,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       if (!sock || sock.readyState !== WebSocket.OPEN) {
         return Promise.reject(new Error("bridge not connected"));
       }
+      // #640 — refuse before dispatch. Nothing has been sent yet, so this is a
+      // clean refusal; routing it on an unestablished route could run the tool
+      // for, and return its reply to, a different browser tab.
+      const callRouteId = bridgeRouteId();
+      if (!callRouteId) {
+        return Promise.reject(new Error(describeRefusedRoute({ settled: tabRouteIdentity.settled() })));
+      }
       const cid = `ct-${Date.now()}-${cidSeq++}`;
       const timeoutMs = (opts && opts.timeout) || 60000;
       return new Promise((resolve, reject) => {
@@ -13890,7 +13996,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           sock.send(
             JSON.stringify({
               type: "call_tool",
-              tab_id: workflowTabId(),
+              tab_id: callRouteId,
               cid,
               tool,
               args: args || {},
@@ -13913,6 +14019,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       if (!sock || sock.readyState !== WebSocket.OPEN) {
         throw new Error("bridge not connected");
       }
+      // #640 — refuse before dispatch (see callTool).
+      const uploadRouteId = bridgeRouteId();
+      if (!uploadRouteId) throw new Error(describeRefusedRoute({ settled: tabRouteIdentity.settled() }));
       const cid = `um-${Date.now()}-${cidSeq++}`;
       const buf = new Uint8Array(await blob.arrayBuffer());
       let bin = "";
@@ -13933,7 +14042,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           sock.send(
             JSON.stringify({
               type: "upload_media",
-              tab_id: workflowTabId(),
+              tab_id: uploadRouteId,
               cid,
               filename: name || "upload.png",
               mime: blob.type || "image/png",
@@ -17308,7 +17417,10 @@ function buildPanel() {
     // blind and respawns on change.
     if (_blindAckPending) { clearTimeout(_blindAckPending); _blindAckPending = null; }
     let sent = false;
-    try { sent = client?.sendFrame?.({ type: "set_content_mode", tab_id: workflowTabId(), blind: AGENT_BLIND }) !== false; } catch {}
+    // #640 — no explicit tab_id: sendFrame stamps the established BRIDGE ROUTE
+    // (and refuses when there is none). An explicit one here would have won the
+    // spread and put the path-only workflow handle back on the wire.
+    try { sent = client?.sendFrame?.({ type: "set_content_mode", blind: AGENT_BLIND }) !== false; } catch {}
     if (sent) {
       _blindAckPending = setTimeout(() => {
         _blindAckPending = null;
