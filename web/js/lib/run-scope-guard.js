@@ -770,7 +770,7 @@ export function createScopedRunGuard({
 } = {}) {
   const expected = (execIds ?? []).map(String);
   const maxBatch = Math.max(1, Math.floor(Number(batch)) || 1);
-  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, dropped: null, droppedReason: null, failed: null };
+  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, inFlight: 0, indeterminate: 0, dropped: null, droppedReason: null, failed: null };
   const waiters = new Set();
   const notify = () => {
     for (const fire of [...waiters]) fire();
@@ -799,7 +799,7 @@ export function createScopedRunGuard({
     // `rejected` (ComfyUI said no — that prompt is spent). A `failed` post never
     // reached ComfyUI, so a later post of the same batch is legitimately still
     // owed and must not be fenced out.
-    if (state.observed + state.rejected >= maxBatch) {
+    if (state.observed + state.rejected + state.indeterminate + state.inFlight >= maxBatch) {
       state.overrun++;
       if (state.overrunError == null) {
         state.overrunError =
@@ -841,10 +841,22 @@ export function createScopedRunGuard({
       // completes with a real 200 + prompt_id (r6) — a thrown fetch or a
       // malformed response is a terminal dispatch FAILURE, never a success;
       // a genuine server rejection flows through the established #358 channel.
+      //
+      // RESERVE THE QUOTA SLOT BEFORE FORWARDING (codex gate r4). Counting only
+      // COMPLETED requests left the fence racy: two same-mark posts issued
+      // concurrently both read observed=0, both passed the quota, and both were
+      // forwarded — executing the requested branch twice while reporting no
+      // overrun. The reservation is taken here, synchronously, before the await,
+      // so a second concurrent post sees the slot already taken.
+      state.inFlight++;
       let res;
       try {
         res = await origFetchApi(route, forwardOptions);
       } catch (err) {
+        // The request never reached ComfyUI, so this slot was NOT consumed —
+        // release it, or the retry that is still owed would be fenced out as an
+        // overrun. Only work that actually left counts against the quota.
+        state.inFlight--;
         if (state.failed == null) {
           state.failed = scopeDispatchError({
             toNodeId,
@@ -857,17 +869,26 @@ export function createScopedRunGuard({
         throw err; // the frontend sees exactly the failure it would have seen
       }
       const verdict = await classifyRunResponse(res, { onRejection, onPromptId });
+      // The request DID leave, so the reservation is now settled into a
+      // definite outcome. A malformed response keeps the slot consumed on
+      // purpose: the post reached ComfyUI and MAY have queued, and re-forwarding
+      // on that uncertainty is how a branch gets rendered twice. "Could not
+      // determine whether it queued" is not "determined it did not".
+      state.inFlight--;
       if (verdict === "accepted") {
         state.observed++;
       } else if (verdict === "rejected") {
         state.rejected++;
-      } else if (state.failed == null) {
-        state.failed = scopeDispatchError({
-          toNodeId,
-          detail: `the /prompt response was malformed (HTTP ${res?.status ?? "?"}, no prompt_id and no rejection body)`,
-          verified: state.observed,
-          batch: maxBatch,
-        });
+      } else {
+        state.indeterminate++;
+        if (state.failed == null) {
+          state.failed = scopeDispatchError({
+            toNodeId,
+            detail: `the /prompt response was malformed (HTTP ${res?.status ?? "?"}, no prompt_id and no rejection body)`,
+            verified: state.observed,
+            batch: maxBatch,
+          });
+        }
       }
       notify();
       return res;

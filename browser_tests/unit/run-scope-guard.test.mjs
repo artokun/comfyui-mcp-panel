@@ -974,6 +974,66 @@ test("#630 gate r4: a LATE extra post, arriving AFTER the run reported success, 
   }
 });
 
+test("#630 gate r4: two CONCURRENT same-mark posts — the quota is a reservation, so the branch still runs exactly once", async () => {
+  // The sequential fence was racy: counting only COMPLETED requests let two
+  // in-flight posts both read observed=0, both clear the quota, and both be
+  // forwarded — rendering the requested branch twice, at real GPU/API cost,
+  // while the result reported no overrun at all. The slot must be reserved
+  // BEFORE the await, not counted after it.
+  const stop = keepAlive();
+  try {
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    let n = 0;
+    const server = makeServer(async () => {
+      // Hold the FIRST request open so the second arrives while it is in flight.
+      if (n++ === 0) await gate;
+      return jsonResponse(200, { prompt_id: `srv-${n}` });
+    });
+    const guard = createScopedRunGuard({
+      origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
+      repairScope: true,
+    });
+    const post = () => guard(...promptPost(frontendBody({ number: MARK_A, targets: null })));
+    const first = post();
+    const second = await post(); // arrives while `first` is still awaiting the server
+    assert.equal(second.status, 400, "the concurrent duplicate is fenced by the RESERVED slot");
+    assert.equal(guard.state.overrun, 1, "and it is counted as an overrun, not silently allowed");
+    release();
+    await first;
+    assert.equal(guard.state.observed, 1);
+    assert.equal(server.calls.length, 1, "EXACTLY one request reached ComfyUI — the branch runs once");
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
+  } finally {
+    stop();
+  }
+});
+
+test("#630 gate r4: a MALFORMED response keeps its slot — 'could not tell whether it queued' is not 'it did not queue'", async () => {
+  // The post reached ComfyUI and MAY have queued. Releasing the slot on that
+  // uncertainty would let a retry render the branch a second time. A throw is
+  // different — it never left — and that slot IS released (covered above).
+  const stop = keepAlive();
+  try {
+    const server = makeServer(() => jsonResponse(200, { no_prompt_id: true }));
+    const guard = createScopedRunGuard({
+      origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
+      repairScope: true,
+    });
+    const post = () => guard(...promptPost(frontendBody({ number: MARK_A, targets: null })));
+    await post();
+    assert.ok(guard.state.failed, "a malformed response is a dispatch failure, never a success");
+    assert.equal(guard.state.observed, 0, "and never counted as verified");
+    // The slot stays consumed, so a retry cannot double-render the branch.
+    const retry = await post();
+    assert.equal(retry.status, 400);
+    assert.equal(guard.state.overrun, 1);
+    assert.equal(server.calls.length, 1, "the branch was never dispatched a second time on an unknown outcome");
+  } finally {
+    stop();
+  }
+});
+
 test("#630 gate r3: the quota counts only COMPLETED work — a failed post does not fence out the retry that is still owed", async () => {
   // A post whose fetch threw never reached ComfyUI, so a later post of the same
   // batch is legitimately still owed. Counting it toward the quota would fence
