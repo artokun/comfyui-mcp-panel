@@ -13390,17 +13390,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // `new_session` frame is sent, so `sendFrame`'s reset never fires and the
     // previous agent's proof and disclosure would carry onto a model that received
     // neither. `hello` is in AGENT_SESSION_RESET_FRAMES for that reason; it is
-    // bumped here rather than there only because sendHello, not sendFrame,
+    // bumped below rather than in sendFrame only because sendHello, not sendFrame,
     // dispatches it. This also covers the socket-open hello, so no separate bump is
     // needed in the open handler.
-    //
-    // Bumped EAGERLY, unlike sendFrame's reset, which waits for its send to return.
-    // That asymmetry is deliberate and both halves fail the same way: the hello goes
-    // out through an async helper with no synchronous success to hook, and a hello
-    // that never lands leaves the generation merely over-advanced — one extra
-    // disclosure. A new_session that never lands, by contrast, spawns no new agent,
-    // so NOT bumping there is the accurate answer, not a cautious one.
-    agentSessionEpoch++;
     const target = sock;
     void sendBridgeHello({
       socket: target,
@@ -13449,9 +13441,32 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // replayLostReplies, computed with the SAME epoch the replay uses.
         });
       },
-    }).catch(() => {
-      // Reconnect path will retry.
-    });
+    })
+      .then((sent) => {
+        // #291 — advance the agent-session generation ONLY once the hello is
+        // actually ON THE WIRE. sendBridgeHello resolves false when identity
+        // resolution outlived this socket (superseded / closed), and rejects when
+        // the send throws; in both cases NO hello reached the orchestrator, so no
+        // new agent exists and the current generation is still the right one.
+        //
+        // Advancing before the send was the inverse of the bug this whole module
+        // exists to fix: it invalidated a WORKING agent's proof and re-asked a
+        // session that demonstrably had the tools whether it had them. "Recorded
+        // before it happened" is the same defect as #621's interaction lock
+        // registering its holder before the freeze write landed and #836's
+        // panel-op lock releasing a claim it no longer owned.
+        //
+        // The in-flight window needs no extra state. A `user_message` frame carries
+        // NO tab id (only sendFrame stamps one), so the orchestrator can route it
+        // only by the binding this socket already has — and frames on one socket are
+        // ordered anyway, so a message sent while this hello is still awaiting
+        // identity is written BEFORE the hello. Either way it is handled by the
+        // pre-hello agent, which is exactly the generation it was stamped with.
+        if (sent) agentSessionEpoch++;
+      })
+      .catch(() => {
+        // Reconnect path will retry. No hello landed, so no generation advance.
+      });
   }
 
   // When the workflow title changes (rename / open a different file / progress

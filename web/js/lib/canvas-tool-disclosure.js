@@ -100,6 +100,13 @@ export const CANVAS_TOOL_DISCLOSURE =
  *     dispatches it — so it is listed here for the rule, and the bump lives in
  *     `sendHello`.
  *
+ * EVERY ONE OF THESE ADVANCES THE GENERATION ONLY ONCE ITS FRAME IS ON THE WIRE.
+ * A frame that was never sent bound nothing, so advancing for it would invalidate a
+ * working agent's proof and re-ask a session that demonstrably had the tools whether
+ * it had them — the inverse of the bug this module exists to fix. The hello case is
+ * the subtle one, because its send is asynchronous (it waits on restart-identity
+ * exclusivity) and can be abandoned mid-flight when the socket is superseded.
+ *
  * THE TRADE, named rather than left as a surprise: this list is deliberately coarse.
  * A re-hello (plus its `resume_session`) also fires for events that keep the SAME
  * conversation — a save migrating a tab from `tmp:` to `wf:`, a rename — so those

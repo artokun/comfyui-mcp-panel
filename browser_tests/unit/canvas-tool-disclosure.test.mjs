@@ -29,6 +29,7 @@ import {
   planCanvasToolDisclosure,
   startsNewAgentSession,
 } from "../../web/js/lib/canvas-tool-disclosure.js";
+import { sendBridgeHello } from "../../web/js/lib/restart-tab-identity.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSource = () => readFileSync(panelPath, "utf8").replace(/\r\n/g, "\n");
@@ -364,22 +365,102 @@ test("wiring: the disclosure is marked sent only AFTER the frame actually went o
   );
 });
 
-test("wiring: every hello advances the generation — including a re-hello on a live socket", () => {
-  const source = panelSource();
-  const start = source.indexOf("  function sendHello() {");
-  const end = source.indexOf("    void sendBridgeHello({", start);
-  assert.ok(start >= 0 && end > start, "could not locate sendHello");
-  assert.match(
-    source.slice(start, end),
-    /agentSessionEpoch\+\+/,
-    "a hello binds this socket to an agent session, and a re-hello can bind it to a NEW one",
+test("sendBridgeHello reports whether the hello reached the wire — the contract the epoch rides on", async () => {
+  // Executable, because the panel's generation advance is now gated on this return
+  // value. If it ever became void, the panel would stop advancing the generation
+  // ENTIRELY and silently — the original #291 direction — and a purely static
+  // wiring test would still be green.
+  const sent = [];
+  const socket = { send: (s) => sent.push(s) };
+  const ok = await sendBridgeHello({
+    socket,
+    isCurrent: () => true,
+    resolveTabIdentity: async () => "tab-1",
+    makePayload: (id) => ({ type: "hello", tabSessionId: id }),
+  });
+  assert.equal(ok, true, "a hello that was written to the socket must report true");
+  assert.equal(sent.length, 1);
+
+  const superseded = await sendBridgeHello({
+    socket,
+    isCurrent: () => false, // this socket was replaced while identity resolved
+    resolveTabIdentity: async () => "tab-2",
+    makePayload: (id) => ({ type: "hello", tabSessionId: id }),
+  });
+  assert.equal(superseded, false, "a hello abandoned mid-flight must report false");
+  assert.equal(sent.length, 1, "and must not have written anything");
+});
+
+test("the README does not promise parity it cannot guarantee — anywhere in the file", () => {
+  // Normally prose is not worth a test. This is, because the claim is the reason
+  // #291 stayed invisible: "both providers expose this identical surface … feature
+  // parity is automatic" told every reader there was nothing to check. The first
+  // retraction fixed the body and left the SAME claim standing in the introduction,
+  // which a reader hits first — so the file contradicted itself and the retraction
+  // was largely undone. Scanning the whole file is what catches that.
+  //
+  // CHANGELOG.md is deliberately NOT scanned. It records what was claimed at the
+  // time of each release, and rewriting that is falsifying history, not correcting
+  // a claim — the same reason the repo's tool-vocabulary gate exempts it.
+  const readme = readFileSync(
+    fileURLToPath(new URL("../../README.md", import.meta.url)),
+    "utf8",
   );
-  // The socket-open path must actually reach it, since the explicit bump that used
-  // to sit in the open handler was removed in favour of this one.
+  for (const claim of ["full feature parity", "feature parity is automatic", "identical surface"]) {
+    assert.equal(
+      readme.includes(claim),
+      false,
+      `README still promises "${claim}" — parity is offered, not guaranteed received`,
+    );
+  }
+  // …and the qualification is actually there, not merely the absence of the boast.
+  assert.match(readme, /Offered, not guaranteed received/);
+  assert.match(readme, /identical \*\*as served\*\*/);
+});
+
+/** The whole body of the bridge client's sendHello(). */
+function sendHelloBody(source) {
+  const start = source.indexOf("  function sendHello() {");
+  const end = source.indexOf("  // When the workflow title changes", start);
+  assert.ok(start >= 0 && end > start, "could not locate sendHello");
+  return source.slice(start, end);
+}
+
+test("wiring: the generation advances only once the hello is ON THE WIRE", () => {
+  // The independent gate's P0. Advancing before `sendBridgeHello` resolves means a
+  // hello that never reached the orchestrator — identity still resolving when the
+  // socket was superseded or closed — still burned a generation. Nothing new was
+  // bound, so the consequence is the INVERSE of #291: a working agent's proof is
+  // invalidated and a session that demonstrably had the tools is asked whether it
+  // does. Same rule as #621 and #836: do not record that you did something before
+  // you did it.
+  const body = sendHelloBody(panelSource());
+  assert.match(
+    body,
+    /if \(sent\) agentSessionEpoch\+\+/,
+    "the advance must be conditional on the hello having actually been sent",
+  );
+  const call = body.indexOf("sendBridgeHello({");
+  const bump = body.indexOf("agentSessionEpoch++");
+  assert.ok(call >= 0 && bump > call, "the advance must FOLLOW the send, not precede it");
+  // …and there must be no second, unconditional one left behind in front of it.
+  assert.equal(
+    (body.match(/agentSessionEpoch\+\+/g) ?? []).length,
+    1,
+    "exactly one advance — a stray eager one would reintroduce the P0",
+  );
+});
+
+test("wiring: the socket-open path still reaches the hello that advances the generation", () => {
+  // The explicit bump that used to sit in the open handler was removed in favour of
+  // sendHello's. That is only sound while the open handler actually calls it.
+  const source = panelSource();
   const openStart = source.indexOf('    thisSock.addEventListener("open", () => {');
   const openEnd = source.indexOf("      clearHandshake();", openStart);
   assert.ok(openStart >= 0 && openEnd > openStart, "could not locate the socket open handler");
-  assert.match(source.slice(openStart, openEnd), /sendHello\(\);/);
+  const open = source.slice(openStart, openEnd);
+  assert.match(open, /sendHello\(\);/);
+  assert.doesNotMatch(open, /agentSessionEpoch/, "the open handler must not advance it a second time");
 });
 
 test("wiring: a same-socket session reset frame advances the generation, after it is sent", () => {

@@ -13,9 +13,13 @@ Claude or ChatGPT (your own subscription, no API key).**
 **Stuck or have a question? [Join the Discord](https://discord.gg/cW9arBhzCu)** — or hit **🆘 Need help?** in the panel's Settings → About (it copies a diagnostics summary and opens the Discord for you).
 
 Pick a provider — **Claude** or **ChatGPT** — and the matching agent runs in the background on
-*your* subscription, sees the graph you're looking at, and edits it live. Both providers reach
-**full feature parity**: the same live-canvas tools, the same model knowledge, the same one-shot
-workflow loads, the same cost guardrail.
+*your* subscription, sees the graph you're looking at, and edits it live. Every provider is
+**offered the same surface**: the same live-canvas tools, the same model knowledge, the same
+one-shot workflow loads, the same cost guardrail. Offered, not guaranteed received — a provider
+applies its own tool budget to what we hand it, and Codex was seen dropping the live-canvas tools
+silently ([#291](https://github.com/artokun/comfyui-mcp-panel/issues/291)). That is fixed upstream,
+and the panel now asks the agent to say so rather than improvise if it ever recurs — see
+[What the agent can do](#what-the-agent-can-do).
 
 Part of the **[comfyui-mcp](https://github.com/artokun/comfyui-mcp)** project — the local-first,
 agent-native control plane for ComfyUI (MCP server + agent orchestrator). Full documentation at
