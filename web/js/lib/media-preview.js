@@ -335,6 +335,10 @@ export async function composeShowMediaReply(items, deps = {}) {
         url,
         name: name || "video",
         ref,
+        // Whether the USER got a player. The no-preview remedy leans on "ask
+        // the user"; telling the agent to ask about something the user cannot
+        // see is a remedy that does not work from where the caller is.
+        shown: shownState,
         // A data URL carries its own exact length; a /view ref has to be probed.
         inline: !ref,
         knownBytes: ref ? null : dataUrlByteLength(url),
@@ -367,7 +371,10 @@ export async function composeShowMediaReply(items, deps = {}) {
         // so one video can never reject the batch.
         note("[cmcp] show_media preview segment failed:", err);
         return {
-          note: `${job.name} — no sampled preview could be built and the panel could not say why. Ask the user how the video looks; they can see it playing in the chat.`,
+          note:
+            `${job.name} — you were NOT shown this video, no sampled preview could be built, and the ` +
+            `panel could not say why. ` +
+            remedyWithoutPreview(job, text),
           preview: null,
         };
       }),
@@ -575,7 +582,12 @@ async function produceSheet(job, deps) {
         ref: null,
         frames: null,
         cells: null,
-        why: "not one of its frames could be decoded, seeked and painted in this browser",
+        // Deliberately non-diagnostic. The builder returns nothing when the
+        // metadata never arrives, when the dimensions are unusable, when no
+        // frame could be captured, AND when the finished sheet fails to encode
+        // — and it does not report which. Naming one of them would hand the
+        // agent a cause nothing observed.
+        why: "the sampler returned no contact sheet (its metadata, its frames or the sheet's own encoding failed — the panel is not told which)",
       };
     }
     const base = job.name.replace(/\.[^.]+$/, "") || "video";
@@ -642,8 +654,23 @@ async function resolveSourceBytes(job, fetchMediaBytes, warn) {
  * a refusal that names no next step is the defect this whole module is fixing.
  */
 function remedyWithoutPreview(job, coerce) {
-  const human =
-    "Ask the user how it looks — they can see it playing in the chat and can answer for the parts you cannot.";
+  // "Ask the user" is only a remedy when the user has something to look at.
+  // Asserting they can see it playing when its player never made it into the
+  // chat sends the caller to a person who is as blind to it as they are.
+  let human;
+  if (job.shown === "failed") {
+    human =
+      "The user cannot see it either — its player could not be put in the chat — so asking them how it " +
+      "looks will not help; say plainly that the video could not be inspected.";
+  } else if (job.shown === "unconfirmed") {
+    human =
+      "Whether the user can see it in the chat is UNKNOWN, so ask whether they can see it before asking " +
+      "them to describe it.";
+  } else {
+    human =
+      "Its player is in the chat, so ask the user how it looks — they can answer for the parts you cannot " +
+      "(and will tell you if it does not play).";
+  }
   if (job.ref) {
     return (
       `The video is still reachable: call get_image with ${refClause(job.ref, coerce)} to save it to disk ` +

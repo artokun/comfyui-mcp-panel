@@ -246,19 +246,57 @@ test("a storyboard step that never settles is bounded, degrades, and names a nex
   );
   // Still actionable: the file itself, plus the human who can see it.
   assert.match(reply.note, /call get_image with filename "reference_clip\.mp4", type "input"/);
-  assert.match(reply.note, /Ask the user how it looks/);
+  assert.match(reply.note, /ask the user how it looks/);
   // …and the size it DID manage to read is still reported.
   assert.match(reply.note, /72\.1 MB/);
   // The user still got the player.
   assert.equal(h.calls.paintedVideos.length, 1);
 });
 
-test("a video the browser cannot decode degrades with a reason and a remedy", async () => {
+test("a sampler that returns nothing degrades with a remedy and NO invented cause", async () => {
   const h = harness({ buildVideoStoryboard: async () => null });
   const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
   assert.equal(reply.previews.length, 0);
-  assert.match(reply.note, /could be decoded, seeked and painted/);
+  assert.match(reply.note, /the sampler returned no contact sheet/);
+  assert.match(reply.note, /the panel is not told which/);
+  // The builder returns nothing for a metadata failure, an unusable frame, AND
+  // a sheet that will not encode. Naming one of them is a diagnosis nothing made.
+  assert.doesNotMatch(reply.note, /could not be seeked/);
+  assert.doesNotMatch(reply.note, /not one of its frames/);
   assert.match(reply.note, /call get_image with filename "reference_clip\.mp4"/);
+});
+
+test("the 'ask the user' remedy is withheld when the user cannot see it either", async () => {
+  // Telling the caller to ask a person who was never shown the video sends it
+  // somewhere that does not work from where it is.
+  const h = harness({
+    paintVideo: () => {
+      throw new Error("player exploded");
+    },
+    buildVideoStoryboard: async () => null,
+  });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+  assert.match(reply.note, /The user cannot see it either/);
+  assert.match(reply.note, /asking them how it looks will not help/);
+  assert.doesNotMatch(reply.note, /they can answer for the parts you cannot/);
+  // …and the reachable-file remedy is still offered.
+  assert.match(reply.note, /call get_image with filename "reference_clip\.mp4"/);
+});
+
+test("an UNCONFIRMED player makes the 'ask the user' remedy conditional, not confident", async () => {
+  const h = harness({
+    paintVideo: () => Promise.resolve(),
+    buildVideoStoryboard: async () => null,
+  });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+  assert.match(reply.note, /Whether the user can see it in the chat is UNKNOWN/);
+  assert.match(reply.note, /ask whether they can see it before asking them to describe it/);
+});
+
+test("a player that WAS put in the chat gets the confident remedy", async () => {
+  const h = harness({ buildVideoStoryboard: async () => null });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+  assert.match(reply.note, /Its player is in the chat, so ask the user how it looks/);
 });
 
 test("a failed sheet upload degrades with a reason and a remedy", async () => {
@@ -345,7 +383,7 @@ test("a storyboard pipeline that THROWS degrades instead of failing the reply", 
   assert.equal(reply.ok, true);
   assert.equal(reply.previews.length, 0);
   assert.match(reply.note, /sampling pipeline failed/);
-  assert.match(reply.note, /Ask the user how it looks/);
+  assert.match(reply.note, /ask the user how it looks/);
 });
 
 test("storyboard previews turned off is stated as the reason, not silently skipped", async () => {
@@ -474,7 +512,7 @@ test("a throwing logger does not become the failure it was logging", async () =>
   });
   const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
   assert.equal(reply.ok, true);
-  assert.match(reply.note, /could be decoded, seeked and painted/);
+  assert.match(reply.note, /the sampler returned no contact sheet/);
 });
 
 test("a painter that settles LATER is reported unconfirmed, not counted as shown", async () => {
