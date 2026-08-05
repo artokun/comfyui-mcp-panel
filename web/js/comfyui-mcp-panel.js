@@ -3971,13 +3971,16 @@ const NODES_INSTALL_COMMAND_BUDGET_MS = 25000;
  *  message like "install timed out" arrives as a plain Error from
  *  managerV2/managerCall's HTTP handling — NEVER an AbortError/TimeoutError,
  *  which only the fetch/abort primitives produce). detectManagerDialect's own
- *  budget abort is a plain Error by design, so it is matched by its exact
- *  message. */
+ *  budget abort is a plain Error by design, matched by its exact full-sentence
+ *  PREFIX (anchored — codex r3 P2: a substring match could swallow a real
+ *  verdict that merely QUOTES the phrase). */
 function isStallError(err) {
   return (
     err?.name === "AbortError" ||
     err?.name === "TimeoutError" ||
-    /aborted mid-probe/.test(String(err?.message ?? ""))
+    String(err?.message ?? "").startsWith(
+      "ComfyUI-Manager dialect detection was aborted mid-probe",
+    )
   );
 }
 
@@ -12613,13 +12616,14 @@ const GRAPH_TOOL_EXECUTORS = {
     const remaining = () => Math.max(0, commandDeadline - Date.now());
     // A per-call cap that also respects what the command budget has left.
     const bounded = (ms) => Math.max(1, Math.min(ms, remaining()));
-    // A stall caught AFTER the command budget ran out is reworded as what it
-    // is — the Manager stopped answering in time — claiming only the state the
-    // phase can honestly claim (never a false failure, never a false "nothing
-    // happened"). Any non-stall error, or a stall with budget left (the per-
-    // fetch cap fired first), surfaces unchanged with its real evidence.
+    // A stall caught once the command budget HAS run out is reworded as what
+    // it is — the Manager stopped answering in time — claiming only the state
+    // the phase can honestly claim (never a false failure, never a false
+    // "nothing happened"). Any non-stall error, or a stall surfaced BEFORE the
+    // deadline (the per-fetch cap fired first — budget remains), passes
+    // through unchanged with its real evidence.
     const translateStall = (err, phase) => {
-      if (commandDeadline - Date.now() > 50 || !isStallError(err)) return err;
+      if (commandDeadline - Date.now() > 0 || !isStallError(err)) return err;
       const budget = `${Math.round(NODES_INSTALL_COMMAND_BUDGET_MS / 1000)}s`;
       const what = String(id ?? repository);
       if (phase === "detect" || phase === "reprobe") {
@@ -12639,6 +12643,18 @@ const GRAPH_TOOL_EXECUTORS = {
             `the request may have landed before the abort. Check panel_node_queue_status ` +
             `and panel_list_nodes BEFORE retrying, or a blind retry can queue the install ` +
             `twice.`,
+        );
+      }
+      if (phase === "verify") {
+        // Submit AND start returned — the install is queued and the start was
+        // acknowledged; only the outcome check ran out of time. (Today's
+        // verifyInstalled is internally bounded and never throws a stall — this
+        // branch guards the claim IF that ever changes. #671 codex r3.)
+        return new Error(
+          `the install of "${what}" was QUEUED and the queue start was acknowledged, ` +
+            `but the outcome could not be VERIFIED within the ${budget} command budget. ` +
+            `This is NOT a failure — poll panel_node_queue_status and VERIFY with ` +
+            `panel_list_nodes.`,
         );
       }
       // "start": the submit LANDED — the install is queued; only the queue
@@ -12760,6 +12776,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // inconclusive result returns an honest unverified status (never a silent
       // success, never a false failure). #232 + codex rounds 1-2. The verify
       // draws on whatever the command budget has LEFT (#671).
+      phase = "verify";
       const outcome = await verifyInstalled(target, dialect, { batchFailed, renameProne, budgetMs: remaining() });
       if (outcome.state === "failed") throw new Error(outcome.message);
       if (outcome.state === "installed") {

@@ -714,7 +714,7 @@ function nodesInstallDeps(overrides) {
     isStallError: (err) =>
       err?.name === "AbortError" ||
       err?.name === "TimeoutError" ||
-      /aborted mid-probe/.test(String(err?.message ?? "")),
+      String(err?.message ?? "").startsWith("ComfyUI-Manager dialect detection was aborted mid-probe"),
     reProbeManagerDialect: async () => "v2",
     managerQueueControl: async () => {},
     verifyInstalled: async () => ({ state: "installed", status: QUEUE_STATUS }),

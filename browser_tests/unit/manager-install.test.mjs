@@ -885,11 +885,17 @@ test("#671 isStallError (real panel source) classifies aborts as stalls and real
   assert.equal(
     isStallError(new Error("ComfyUI-Manager dialect detection was aborted mid-probe (the caller's budget ran out)")),
     true,
-    "detectManagerDialect's own budget abort is a plain Error — matched by its exact message",
+    "detectManagerDialect's own budget abort is a plain Error — matched by its exact prefix",
   );
   // codex r2 P1: a REAL Manager verdict whose message happens to contain
   // "timed out" is EVIDENCE, not a stall — it must surface verbatim.
   assert.equal(isStallError(new Error("Manager manager/queue/task: install timed out")), false);
+  // codex r3 P2: a verdict that merely QUOTES the detect-abort phrase is not
+  // the detect abort — the match is anchored at the message start.
+  assert.equal(
+    isStallError(new Error("Manager manager/queue/task: server aborted mid-probe recovery")),
+    false,
+  );
   assert.equal(isStallError(new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)")), false);
   assert.equal(isStallError(new Error("Manager manager/queue/task: HTTP 500")), false);
 });
@@ -1015,6 +1021,51 @@ test("#671 a REAL Manager verdict is never reworded as a budget stall (codex r2 
   const err = await nodes_install({ id: "ComfyUI-MelBandRoFormer" }).then(() => null, (e) => e);
   assert.ok(err, "a failed submit must surface an error");
   assert.equal(err.message, "Manager manager/queue/task: install timed out", "the real verdict survives verbatim");
+});
+
+test("#671 nodes_install a stall in the VERIFY phase claims queued+started, never an unconfirmed start (codex r3 P1)", async () => {
+  // Submit and start BOTH returned; the verify step is where the budget runs
+  // out. (Production verifyInstalled is internally bounded and never throws a
+  // stall — this drives the translateStall branch that guards the claim if
+  // that ever changes.) The message must NOT downgrade the acknowledged start.
+  const nodes_install = loadNodesInstall({
+    budgetMs: 2500,
+    managerV2: async () => null, // submit lands
+    managerCall: async () => { throw new Error("managerCall must not run on the v2 dialect"); },
+    managerQueueControl: async () => {}, // start acknowledged
+    verifyInstalled: () =>
+      new Promise((_, reject) =>
+        setTimeout(
+          () => reject(Object.assign(new Error("The operation timed out"), { name: "TimeoutError" })),
+          2600, // past the 2500 budget
+        ),
+      ),
+  });
+  const err = await nodes_install({ id: "ComfyUI-MelBandRoFormer" }).then(() => null, (e) => e);
+  assert.ok(err, "a verify-phase stall must surface an error");
+  assert.match(err.message, /was QUEUED and the queue start was acknowledged/);
+  assert.match(err.message, /could not be VERIFIED/);
+  assert.match(err.message, /panel_node_queue_status/);
+  assert.ok(!/did not answer queue\/start/.test(err.message), "must not claim the start went unanswered");
+  assert.ok(!/FAILED/.test(err.message), "must never claim failure");
+});
+
+test("#671 nodes_install a stall BEFORE the deadline is NOT claimed as budget exhaustion (codex r3 P2)", async () => {
+  // The per-call cap fires while command budget remains: the error is real but
+  // it is NOT the command budget — it must pass through untranslated. (The raw
+  // surfacing of a per-call stall is pre-existing behavior; only the false
+  // budget attribution is the bug guarded here.)
+  const stall = Object.assign(new Error("The operation timed out"), { name: "TimeoutError" });
+  const nodes_install = loadNodesInstall({
+    budgetMs: 2500,
+    managerV2: () => new Promise((_, reject) => setTimeout(() => reject(stall), 500)),
+    managerCall: async () => { throw new Error("managerCall must not run on the v2 dialect"); },
+    managerQueueControl: async () => { throw new Error("start must not run — the submit failed"); },
+    verifyInstalled: async () => { throw new Error("verify must not run — the submit failed"); },
+  });
+  const err = await nodes_install({ id: "ComfyUI-MelBandRoFormer" }).then(() => null, (e) => e);
+  assert.ok(err, "a stalled submit must surface an error");
+  assert.equal(err, stall, "a pre-deadline stall surfaces as itself, not reworded as budget exhaustion");
 });
 
 // ---------------------------------------------------------------------------
