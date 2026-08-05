@@ -725,6 +725,13 @@ function setupListeners() {
 // Community + support. The Discord is the one-tap "I'm stuck" channel surfaced
 // in Settings → About (Join + Need help buttons) and linked from the README.
 const DISCORD_INVITE_URL = "https://discord.gg/cW9arBhzCu";
+// The docs site — every published guide lives here, and until now NOTHING in this
+// panel linked to it. That is a measured cost, not a hypothetical one: community
+// users have asked for features that already shipped and were documented (#111),
+// because a panel user's entire discovery path was an empty-state sentence, four
+// prompt chips, a nine-item slash list and a Discord invite. A link is not a
+// capability index and does not pretend to be one — it is the missing signpost.
+const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
 // `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
 // and the publish gate FAIL if the two ever drift, so this can't go stale.
@@ -2778,6 +2785,29 @@ function panelSettingsList() {
         a.target = "_blank";
         a.rel = "noopener noreferrer";
         a.textContent = "⭐ Star comfyui-mcp-panel on GitHub";
+        a.style.cssText =
+          "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
+          "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
+          "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:0.8rem;white-space:nowrap;";
+        return a;
+      },
+    },
+    {
+      // A link row — "📖 Read the docs". Sits ABOVE Discord deliberately: asking a
+      // human was previously the ONLY exit from the panel, so the community carried
+      // questions the docs already answered (#111).
+      id: "comfyui-mcp.readDocs",
+      name: "Documentation",
+      category: cat("About", "Documentation"),
+      sortOrder: 199.5,
+      tooltip:
+        "Guides for the panel, tools, local LLMs and troubleshooting. Opens comfyui-mcp.artokun.io/docs in a new tab.",
+      type: () => {
+        const a = document.createElement("a");
+        a.href = DOCS_URL;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.textContent = "📖 Read the docs";
         a.style.cssText =
           "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
           "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
@@ -22692,10 +22722,34 @@ function buildPanel() {
       run: () => runLocalCommand("graph_get_errors", {}),
     },
     {
+      cmd: "/docs",
+      icon: "pi-book",
+      hint: "open the docs — guides for the panel, tools, local LLMs and troubleshooting",
+      // openExternalUrl, not window.location: in the ComfyUI desktop app an in-frame
+      // navigation hijacks the whole window with no way back.
+      run: () => {
+        openExternalUrl(DOCS_URL);
+        appendSystem(`Opening the docs — ${DOCS_URL}`);
+      },
+    },
+    {
       cmd: "/help",
       icon: "pi-question-circle",
       hint: "list commands",
-      run: () => appendSystem(SLASH_COMMANDS.map((c) => `${c.cmd} — ${c.hint}`).join(" · ")),
+      // These are PANEL SHORTCUTS, not a list of what the agent can do — so /help
+      // says where the rest lives rather than leaving the reader to conclude this is
+      // everything (#111). Joined with the same " · " as the rest of the line, NOT
+      // newlines: .cmcp-sys has no white-space:pre-wrap, so a "\n" here would
+      // silently collapse to a space. Deliberately no tool names or counts either —
+      // the tool surface is being consolidated (mcp RFC #726) and a number baked
+      // into this string would start rotting the day it was written.
+      run: () =>
+        appendSystem(
+          [
+            ...SLASH_COMMANDS.map((c) => `${c.cmd} — ${c.hint}`),
+            `these are panel shortcuts; for what the agent itself can do, see the docs: ${DOCS_URL}`,
+          ].join(" · "),
+        ),
     },
   ];
 
