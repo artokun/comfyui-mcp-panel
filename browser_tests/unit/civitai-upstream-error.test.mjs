@@ -195,6 +195,80 @@ test("#599: the retry does not discard the first attempt's error", async () => {
   assert.equal(calls, 2);
 });
 
+// The evidence rule holds on EVERY final throw, not just the transport one.
+// If attempt 1 dies at transport and the retry comes back with an upstream
+// status, the throw happens outside the retry catch — the first rejection (an
+// extension blocking the request, a dropped connection) must not be silently
+// replaced by an unrelated 503.
+test("#599: an upstream status on the RETRY still reports the first attempt's transport error", async () => {
+  let calls = 0;
+  const client = new CivitaiClient({
+    fetchApi: async () => {
+      calls++;
+      if (calls === 1) throw new TypeError("blocked by a browser extension");
+      return { ok: false, status: 503, statusText: "Service Unavailable", json: async () => ({}) };
+    },
+    apiURL: (p) => p,
+  });
+  await assert.rejects(
+    () => client._request({ url: "https://civitai.red/api/v1/models" }),
+    (err) => {
+      assert.equal(err.status, 503); // the upstream status is still classified correctly
+      assert.match(err.message, /503/);
+      assert.match(err.message, /blocked by a browser extension/);
+      assert.equal(err.cause?.message, "blocked by a browser extension");
+      return true;
+    },
+  );
+  assert.equal(calls, 2);
+});
+
+test("#599: an unparseable body on the RETRY still reports the first attempt's transport error", async () => {
+  let calls = 0;
+  const client = new CivitaiClient({
+    fetchApi: async () => {
+      calls++;
+      if (calls === 1) throw new TypeError("blocked by a browser extension");
+      return {
+        ok: true,
+        status: 200,
+        json: async () => {
+          throw new SyntaxError("Unexpected token < in JSON");
+        },
+      };
+    },
+    apiURL: (p) => p,
+  });
+  await assert.rejects(
+    () => client._request({ url: "https://civitai.red/api/v1/models" }),
+    (err) => {
+      assert.match(err.message, /Unexpected token/);
+      assert.match(err.message, /blocked by a browser extension/);
+      assert.equal(err.cause?.message, "blocked by a browser extension");
+      // res was ok, so there is no upstream error status to claim.
+      assert.equal(err.status, undefined);
+      return true;
+    },
+  );
+});
+
+// A first-attempt-free failure must be left exactly as it was — no invented
+// trail, no invented cause (guards the fix against overshooting).
+test("#599: a plain upstream error with no prior attempt is unchanged", async () => {
+  const client = new CivitaiClient({
+    fetchApi: async () => ({ ok: false, status: 503, statusText: "Service Unavailable", json: async () => ({}) }),
+    apiURL: (p) => p,
+  });
+  await assert.rejects(
+    () => client._request({ url: "https://civitai.red/api/v1/models" }),
+    (err) => {
+      assert.equal(err.message, "CivitAI API 503: Service Unavailable");
+      assert.equal(err.cause, undefined);
+      return true;
+    },
+  );
+});
+
 // Same evidence rule when the retry is cut short by the #417 abort budget
 // rather than by another transport rejection.
 test("#599: a timeout after a failed first attempt still reports that first error", async () => {

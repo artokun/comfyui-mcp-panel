@@ -343,6 +343,14 @@ export class CivitaiClient {
       firstTransportError
         ? `attempt 1 failed with: ${errText(firstTransportError)}; the retry then failed with: ${errText(last)}`
         : `browser transport error: ${errText(last)}`;
+    // Append attempt 1's rejection to a failure raised AFTER a retry actually
+    // got a response (an upstream status, or a body that won't parse). Those
+    // throws are outside the retry catch, so without this the first attempt's
+    // evidence is dropped exactly as it was before this fix.
+    const withFirstAttempt = (msg) =>
+      firstTransportError
+        ? `${msg} (a first attempt had already failed at transport with: ${errText(firstTransportError)})`
+        : msg;
     let res;
     try {
       for (let attempt = 0; ; attempt++) {
@@ -401,11 +409,31 @@ export class CivitaiClient {
       // catch) can surface a distinct error state instead of an empty grid
       // (#190). The proxy forwards CivitAI's status, so res.status is the real
       // upstream code (e.g. 503 when model search is overloaded).
-      throw Object.assign(new Error(`CivitAI API ${res.status}: ${res.statusText || "request failed"}`), {
+      //
+      // If attempt 1 died at transport and the RETRY is what produced this
+      // status, that first rejection is still evidence and must survive here
+      // too — otherwise the failure that only shows up on the first attempt
+      // (an extension blocking the request, a dropped connection) is silently
+      // replaced by an unrelated upstream status. Same rule as the transport
+      // and timeout throws above: report the whole trail, never just the last.
+      throw Object.assign(new Error(withFirstAttempt(`CivitAI API ${res.status}: ${res.statusText || "request failed"}`)), {
         status: res.status,
+        ...(firstTransportError ? { cause: firstTransportError } : {}),
       });
     }
-    return normalizeTrpcResponse(await res.json());
+    try {
+      return normalizeTrpcResponse(await res.json());
+    } catch (e) {
+      // A body that will not parse is a real failure, and if attempt 1 had
+      // already failed at transport that first error is part of the diagnosis.
+      // Do NOT stamp an HTTP status here: res was ok, so there is no upstream
+      // error status to report, and inventing one would read to
+      // civitaiErrorState as "CivitAI returned an error" — a different claim.
+      if (!firstTransportError) throw e;
+      throw Object.assign(new Error(withFirstAttempt(errText(e))), {
+        cause: firstTransportError,
+      });
+    }
   }
 
   /** Same-origin CDN media URL (usable as <img>/<video> src AND fetchable as a Blob). */
