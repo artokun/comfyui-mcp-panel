@@ -9190,6 +9190,73 @@ const GRAPH_TOOL_EXECUTORS = {
     // comes AFTER the ledger registration above so any partially-verified
     // prompts (which ARE queued, scoped) stay reconcilable (#370).
     if (runScopeResult && runScopeResult.outcome !== "dispatched") {
+      // #556 (codex gate r5/r6, P1) — a PARTIAL batch is not a failed run.
+      // One or more prompts were verified and queued WITH the scope; a later
+      // one was not. `queued:false` asserts that nothing was queued, which is
+      // FALSE while those prompts are executing on the GPU — and a caller
+      // branching on that flag re-runs the batch and pays for them twice.
+      // Between the two possible misreadings, "nothing happened" is the
+      // destructive one; "everything happened" merely leaves a visible,
+      // recoverable gap. So a partial reports queued:true with complete:false,
+      // and the reason moves out of `error` (which reads as "this did not
+      // happen") into `incomplete_reason`.
+      if (runScopeResult.verified > 0) {
+        const unknown = runScopeResult.indeterminate > 0;
+        return {
+          queued: true,
+          complete: false,
+          partially_queued: true,
+          queued_count: runScopeResult.verified,
+          queued_prompt_ids: queuedPromptIds.slice(),
+          ran_to_node: Number(to_node_id),
+          incomplete_reason: runScopeResult.error,
+          // RETRY GUIDANCE MUST NOT ASSERT A REMAINDER IT CANNOT COUNT
+          // (gate r6). When a prompt's outcome is INDETERMINATE — its fetch
+          // threw, or its response was unparseable — ComfyUI may or may not
+          // have queued it. Naming a precise remainder there would send the
+          // caller to re-run something that could already be rendering.
+          retry_guidance: unknown
+            ? `${runScopeResult.verified} of ${batch} prompt(s) ARE queued and scoped to ` +
+              `node ${to_node_id} (prompt_ids above). ${runScopeResult.indeterminate} more ` +
+              `left the panel but their outcome could NOT be determined — ComfyUI may or ` +
+              `may not have queued them. Check the ComfyUI queue before re-running anything: ` +
+              `the remaining count cannot be stated from here without risking a duplicate render.`
+            : `${runScopeResult.verified} of ${batch} prompt(s) ARE queued and scoped to ` +
+              `node ${to_node_id}; they are running and are tracked by the prompt_ids above. ` +
+              `Re-run only the remaining ${Math.max(0, batch - runScopeResult.verified)} — ` +
+              `re-running the full batch would queue the already-running prompt(s) again.`,
+        };
+      }
+      // Nothing verified. But "nothing verified" is still not always "nothing
+      // queued": an indeterminate dispatch left the panel and may have been
+      // accepted.
+      //
+      // codex gate r8, P1 — so `queued` is OMITTED entirely in that case rather
+      // than set false. `queued: false` is a definite negative on the field
+      // callers branch on, and asserting it about a request whose fate we
+      // explicitly say we cannot determine is the same contradiction this
+      // cluster keeps producing. There is no boolean that means "unknown", so
+      // the field that only has two honest values simply is not present, and
+      // `queued_unknown` says why. Only a run where nothing left the panel gets
+      // the definite `queued: false`.
+      // `inFlight` counts requests that HAD LEFT the panel and were still
+      // awaiting a response when the wait expired (gate r9) — same epistemic
+      // status as an indeterminate one: it may be accepted a moment from now.
+      const unresolved = (runScopeResult.indeterminate ?? 0) + (runScopeResult.inFlight ?? 0);
+      if (unresolved > 0) {
+        return {
+          queued_unknown: true,
+          error: runScopeResult.error,
+          indeterminate_count: unresolved,
+          retry_guidance:
+            `No prompt was CONFIRMED queued, but ${unresolved} request(s) ` +
+            `DID leave the panel and their outcome could not be determined — ComfyUI may have ` +
+            `queued them, and they carried the run-to-node scope. Check the ComfyUI queue ` +
+            `before retrying rather than assuming nothing ran; a blind retry can render the ` +
+            `branch twice. This result deliberately omits "queued" because neither true nor ` +
+            `false is an honest answer here.`,
+        };
+      }
       return { queued: false, error: runScopeResult.error };
     }
     // Verdict from BOTH channels: the captured top-level rejection (#358) and the
@@ -9225,6 +9292,46 @@ const GRAPH_TOOL_EXECUTORS = {
           "these inputs during the queue window is indistinguishable from the hook's own " +
           "mutation and would NOT have been caught. Every other input was drift-covered.",
       };
+    }
+    // #556 — DISCLOSE how the scope actually reached ComfyUI. When both
+    // app.queuePrompt argument shapes failed to carry it, the panel wrote
+    // partial_execution_targets into this run's own /prompt body and
+    // re-verified it before it left. The run IS scoped to the requested branch
+    // — that much was observed on the outgoing request.
+    //
+    // What is NOT observed, and must therefore not be asserted: whether the
+    // frontend treated this as a partial execution INTERNALLY. The panel sees
+    // the request body, not the queue loop. The frontend may have accepted the
+    // positional argument and run its queue-time widget hooks with
+    // isPartialExecution=true, only for a later layer to drop the field from
+    // the body; or it may have ignored the argument and run them as a full
+    // run. Both produce exactly the observation the panel made. Claiming the
+    // second would be asserting a cause from a bucket — the very defect this
+    // change exists to stop — so the note states the uncertainty instead.
+    if (partialTargets && runScopeResult?.scopeAppliedBy === "request_body_repair") {
+      accept.scope_applied_by = "request_body_repair";
+      accept.scope_note =
+        `The run-to-node scope did not reach the /prompt request through ` +
+        `app.queuePrompt in either supported argument shape, so the panel wrote ` +
+        `partial_execution_targets into this run's own request and confirmed it was ` +
+        `there before dispatch. OBSERVED: the request ComfyUI received names ONLY ` +
+        `node ${to_node_id} as an execution root, so only that branch executes. ` +
+        `NOT OBSERVED: whether the frontend also treated this as a partial execution ` +
+        `internally — the panel can see the request body but not the frontend's queue ` +
+        `loop. If it did not, its queue-time widget hooks ran as they would for a full ` +
+        `run, so a control_after_generate widget may have advanced its value ` +
+        `differently than a natively scoped run would. This does not change which ` +
+        `nodes execute. Please report this build (#556) — this path is not ` +
+        `reproducible against ComfyUI_frontend 1.42-1.50.`;
+    }
+    // #556 (codex gate r3) — an EXTRA /prompt post carrying this run's identity
+    // was fenced out. The requested prompts queued, so this is a DISCLOSURE and
+    // not a failure: reporting it as one would invite a retry that re-queues
+    // work already running. But it is never silent — the caller asked for
+    // batch_count prompts and their frontend tried to send more.
+    if (partialTargets && runScopeResult?.overrunBlocked > 0) {
+      accept.extra_dispatch_blocked = runScopeResult.overrunBlocked;
+      accept.extra_dispatch_note = runScopeResult.overrunNote;
     }
     return accept;
   },
