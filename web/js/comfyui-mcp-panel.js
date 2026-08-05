@@ -9257,6 +9257,15 @@ const GRAPH_TOOL_EXECUTORS = {
         `nodes execute. Please report this build (#556) — this path is not ` +
         `reproducible against ComfyUI_frontend 1.42-1.50.`;
     }
+    // #556 (codex gate r3) — an EXTRA /prompt post carrying this run's identity
+    // was fenced out. The requested prompts queued, so this is a DISCLOSURE and
+    // not a failure: reporting it as one would invite a retry that re-queues
+    // work already running. But it is never silent — the caller asked for
+    // batch_count prompts and their frontend tried to send more.
+    if (partialTargets && runScopeResult?.overrunBlocked > 0) {
+      accept.extra_dispatch_blocked = runScopeResult.overrunBlocked;
+      accept.extra_dispatch_note = runScopeResult.overrunNote;
+    }
     return accept;
   },
 

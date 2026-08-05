@@ -770,7 +770,7 @@ export function createScopedRunGuard({
 } = {}) {
   const expected = (execIds ?? []).map(String);
   const maxBatch = Math.max(1, Math.floor(Number(batch)) || 1);
-  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, dropped: null, droppedReason: null, failed: null };
+  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, dropped: null, droppedReason: null, failed: null };
   const waiters = new Set();
   const notify = () => {
     for (const fire of [...waiters]) fire();
@@ -783,6 +783,34 @@ export function createScopedRunGuard({
     // the SAME targets, safe from our refusals and our capture.
     if (bodyQueueMark(options?.body) !== queueMark) {
       return origFetchApi(route, options);
+    }
+    // BATCH QUOTA (codex gate r3). This run asked for `maxBatch` prompts. An
+    // attributed post BEYOND that is work nobody requested — the requested
+    // branch executed again, at real GPU/API cost, while graph_run still
+    // reports batch_count as what was asked for. The old batch bound was purely
+    // OBSERVATIONAL: it stopped the orchestration waiting, but never stopped a
+    // post leaving. That was already true for a natively-scoped duplicate, and
+    // the repair would have widened it — turning a duplicate that used to be
+    // refused (its scope was dropped) into one that dispatches. So the bound is
+    // now a FENCE on dispatch, checked before the repair and before any
+    // forwarding.
+    //
+    // Only completed work counts toward the quota: `observed` (queued) and
+    // `rejected` (ComfyUI said no — that prompt is spent). A `failed` post never
+    // reached ComfyUI, so a later post of the same batch is legitimately still
+    // owed and must not be fenced out.
+    if (state.observed + state.rejected >= maxBatch) {
+      state.overrun++;
+      if (state.overrunError == null) {
+        state.overrunError =
+          `run-to-node scope for node ${toNodeId}: an EXTRA /prompt post carrying this ` +
+          `run's identity arrived after all ${maxBatch} requested prompt(s) were already ` +
+          `accounted for. It was refused rather than dispatched — queueing it would have ` +
+          `executed the requested branch more times than asked, at real GPU/API cost. ` +
+          `The requested prompts are queued and unaffected (#556).`;
+      }
+      notify();
+      return SCOPE_DROPPED_RESPONSE();
     }
     const scopeRead = readScopeFromBody(options?.body);
     let targets = scopeRead.targets;
@@ -1161,6 +1189,12 @@ export async function dispatchScopedRun({
         // ran with isPartialExecution=false. graph_run states this in the
         // result rather than letting the caller infer a native scoped run.
         scopeAppliedBy: guard.state.repaired > 0 ? "request_body_repair" : "frontend",
+        // DISCLOSE a fenced overrun (r3). The requested prompts DID queue, so
+        // this is not a failure and must not be reported as one — but an extra
+        // identical-identity post was blocked, and the caller should know their
+        // frontend produced one rather than be left to wonder at the queue.
+        overrunBlocked: guard.state.overrun,
+        overrunNote: guard.state.overrunError,
         volatileInputs: volatileList,
       };
     }

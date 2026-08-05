@@ -875,6 +875,79 @@ test("#630 gate r2: an explicit partial_execution_targets:null is a PRESENT key,
   }
 });
 
+test("#630 gate r3: an EXTRA post beyond the requested batch is FENCED, not dispatched — the branch never runs more times than asked", async () => {
+  // The old batch bound was observational: it stopped the orchestration
+  // waiting, but never stopped a post leaving. A duplicate/stale same-identity
+  // post therefore executed the requested branch AGAIN — real GPU/API cost —
+  // while graph_run still reported batch_count as what was asked for. The
+  // repair would have widened this: a duplicate whose scope was dropped used
+  // to be refused, and would now have been repaired into a dispatch.
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "dropping", apiTarget });
+    app.queuePrompt = async (number, batch) => {
+      // The defect mode: batch+1 posts for a batch of `batch`.
+      for (let i = 0; i < batch + 1; i++) {
+        const body = frontendBody({ output: OUR_OUTPUT, number, targets: null });
+        app.posted.push(body);
+        await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+      }
+      return true;
+    };
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+    assert.equal(result.outcome, "dispatched", "the prompt that WAS asked for is queued — not a failure");
+    assert.equal(result.verified, 1);
+    assert.equal(
+      server.calls.length,
+      1,
+      "EXACTLY the requested number of prompts reached ComfyUI — the extra was fenced, not forwarded",
+    );
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
+    // Disclosed, never silent: the caller learns their frontend produced an extra.
+    assert.equal(result.overrunBlocked, 1);
+    assert.match(result.overrunNote, /EXTRA \/prompt post/);
+    assert.match(result.overrunNote, /refused rather than dispatched/);
+    assert.match(result.overrunNote, /requested prompts are queued and unaffected/,
+      "a disclosure about work that succeeded — never a failure that invites a retry");
+  } finally {
+    stop();
+  }
+});
+
+test("#630 gate r3: the quota counts only COMPLETED work — a failed post does not fence out the retry that is still owed", async () => {
+  // A post whose fetch threw never reached ComfyUI, so a later post of the same
+  // batch is legitimately still owed. Counting it toward the quota would fence
+  // out real requested work.
+  const stop = keepAlive();
+  try {
+    let n = 0;
+    const server = makeServer(() => {
+      if (n++ === 0) throw new Error("network blip");
+      return jsonResponse(200, { prompt_id: "srv-late" });
+    });
+    const guard = createScopedRunGuard({
+      origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
+      repairScope: true,
+    });
+    const post = () => guard(...promptPost(frontendBody({ number: MARK_A, targets: null })));
+    await assert.rejects(post, /network blip/, "the frontend sees the failure it would have seen");
+    assert.ok(guard.state.failed, "recorded as a dispatch FAILURE, never a success");
+    assert.equal(guard.state.observed, 0);
+    // The retry is still owed — it must not be fenced as an overrun.
+    await post();
+    assert.equal(guard.state.observed, 1, "the owed prompt still dispatches");
+    assert.equal(guard.state.overrun, 0, "a failed post never consumed the quota");
+    // …and NOW the quota is spent, so a third post is fenced.
+    await post();
+    assert.equal(guard.state.overrun, 1);
+    assert.equal(guard.state.observed, 1, "no extra execution of the branch");
+  } finally {
+    stop();
+  }
+});
+
 test("#630 gate r2 P1: describeObserved NEVER throws — the refusal path's own formatting cannot be what fails", () => {
   // JSON.stringify is not a safe formatter for a value off the wire: circular
   // structures and BigInt throw outright, and a deeply nested value throws
