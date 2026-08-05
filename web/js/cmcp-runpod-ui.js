@@ -3,8 +3,14 @@
 // Renders the live pod status (broadcast by the orchestrator's runpod-watch as
 // `runpod_status` frames) and the honest host indicator (`comfyui_target`), and
 // drives the pod lifecycle + the local⇄pod switch through the whitelisted
-// runpod_* tools over the bridge's callTool (no agent turn needed):
+// `runpod` tool over the bridge's callTool, with no agent turn needed:
 //   deploy → connect → render on the pod → stop → back to local → reconnect.
+//
+// 0.50.0 slice 8 folded eleven runpod_* tools into two action-parameterized
+// names: `runpod` (create/start/stop/status/list/connect/use_local/deploy_link)
+// and `runpod_watch` (watch/unwatch/troubleshoot). Every call below therefore
+// passes an `action` — the tool name alone no longer says what it does, and a
+// call with the name but no action is refused server-side rather than defaulted.
 //
 // The pod runs OUR template, so once connected the agent installs the user's
 // exact custom nodes / LoRAs and downloads models → full canvas parity remotely.
@@ -122,7 +128,7 @@ export function createLocalContent(ctx, shell, opts = {}) {
   card.className = "cmcp-rp-card";
 
   // Pod picker row: a dropdown of the account's pods (humans pick by name, not id),
-  // with a manual-ID fallback + a refresh. Populated from runpod_list_pods.
+  // with a manual-ID fallback + a refresh. Populated from `runpod` action:"list".
   const connectRow = document.createElement("div");
   connectRow.className = "cmcp-rp-connect";
   const podSelect = document.createElement("select");
@@ -210,10 +216,10 @@ export function createLocalContent(ctx, shell, opts = {}) {
     return (s && s.watching && s.pod_id) || null;
   }
 
-  // Populate the dropdown from runpod_list_pods (humans pick by name, not id).
+  // Populate the dropdown from `runpod` action:"list" (humans pick by name, not id).
   async function loadPods(preselect) {
     try {
-      const res = await callTool("runpod_list_pods", {});
+      const res = await callTool("runpod", { action: "list" });
       const txt = toolText(res);
       const rows = [];
       const re = /\*\*(.+?)\*\*\s*`([a-z0-9]+)`\s*—\s*(\S+)([^\n]*)/gi;
@@ -338,7 +344,7 @@ export function createLocalContent(ctx, shell, opts = {}) {
       setLog("Pick a pod from the list first (or deploy a new one).", "err");
       return;
     }
-    run("Connecting to " + id, () => callTool("runpod_pod_connect", { pod_id: id }));
+    run("Connecting to " + id, () => callTool("runpod", { action: "connect", pod_id: id }));
   });
   startBtn.addEventListener("click", () => {
     const id = currentPodId();
@@ -346,15 +352,15 @@ export function createLocalContent(ctx, shell, opts = {}) {
       setLog("No pod selected — paste a pod ID, or Deploy a new one.", "err");
       return;
     }
-    run("Starting " + id, () => callTool("runpod_pod_start", { pod_id: id }));
+    run("Starting " + id, () => callTool("runpod", { action: "start", pod_id: id }));
   });
   stopBtn.addEventListener("click", () => {
     const id = watchedPodId();
     if (!id) return;
-    run("Stopping " + id, () => callTool("runpod_pod_stop", { pod_id: id }));
+    run("Stopping " + id, () => callTool("runpod", { action: "stop", pod_id: id }));
   });
   localBtn.addEventListener("click", () => {
-    run("Switching to local ComfyUI", () => callTool("runpod_use_local", {}));
+    run("Switching to local ComfyUI", () => callTool("runpod", { action: "use_local" }));
   });
   // Confirm must be two DISTINCT human decisions, not one gesture. Arming opens
   // a short cool-down that ignores confirm clicks (rapid double-click), and a
@@ -396,14 +402,14 @@ export function createLocalContent(ctx, shell, opts = {}) {
     deployArmGen++; // invalidate the pending disarm timer for this arming
     deployBtn.dataset.armed = "0";
     deployBtn.textContent = "Deploy new pod";
-    run("Deploying a new pod", () => callTool("runpod_pod_create", {}, { timeout: 120000 })).then((ok) => {
+    run("Deploying a new pod", () => callTool("runpod", { action: "create" }, { timeout: 120000 })).then((ok) => {
       if (ok) loadPods(); // show the new pod in the dropdown
     });
   });
   linkBtn.addEventListener("click", async (e) => {
     e.preventDefault();
     try {
-      const res = await callTool("runpod_deploy_link", {});
+      const res = await callTool("runpod", { action: "deploy_link" });
       const txt = toolText(res);
       const m = txt.match(/https?:\/\/console\.runpod\.io\/deploy\S+/);
       if (m && openUrl) openUrl(m[0]);

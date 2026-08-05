@@ -250,11 +250,6 @@ const KNOWN_INDIRECTIONS = [
     why: "documentation comment describing the bridge",
   },
   {
-    file: "web/js/cmcp-runpod-ui.js",
-    match: "// runpod_* tools over the bridge's callTool (no agent turn needed):",
-    why: "prose. The callee pattern allows whitespace before '(' so that `callTool /* c */ (\"x\")` and `callTool?.(\"x\")` are matched; that also matches English after the word. Registering the line beats teaching the scanner to skip comments, which would lose real findings inside them.",
-  },
-  {
     file: "web/js/comfyui-mcp-panel.js",
     match: "// Reply to a direct callTool() request (cid-correlated).",
     why: "prose. Empty-argument callTool() is not a call site, but it IS invocation-shaped, so the coverage check below sees it.",
