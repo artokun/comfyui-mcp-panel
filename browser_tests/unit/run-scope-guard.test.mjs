@@ -18,6 +18,8 @@ import {
   newScopedQueueMark,
   QUEUE_ITEM_TAG,
   queuePromptScopeArgs,
+  queuePromptScopeAttempts,
+  repairScopeInBody,
   promptContentHash,
   promptContentHashFromBody,
   collectVolatileInputs,
@@ -101,9 +103,12 @@ function frontendBody({ output = OUR_OUTPUT, number = MARK_A, targets = null }) 
 /**
  * A mock frontend. `shape`: "shim" (options object AND legacy array both
  * honored), "positional" (array only), "shimless" (options object only — the
- * #556 build). `defer`: queuePrompt pushes the item and returns early (busy
- * processor); the TEST then drives the deferred post manually through
- * apiTarget.fetchApi, exactly like the in-flight processor would.
+ * #556 build), "dropping" (BOTH shapes ignored — the build the three #556
+ * field recurrences describe, where the /prompt body arrived with no
+ * partial_execution_targets whichever argument was passed).
+ * `defer`: queuePrompt pushes the item and returns early (busy processor); the
+ * TEST then drives the deferred post manually through apiTarget.fetchApi,
+ * exactly like the in-flight processor would.
  */
 function makeFrontend({ shape = "shim", defer = false, apiTarget, output = OUR_OUTPUT, failGraphToPrompt = false } = {}) {
   const app = {
@@ -115,17 +120,19 @@ function makeFrontend({ shape = "shim", defer = false, apiTarget, output = OUR_O
     },
     queuePrompt: async (number, batch, arg) => {
       const queueNodeIds =
-        shape === "shim"
-          ? Array.isArray(arg)
-            ? arg
-            : arg?.queueNodeIds
-          : shape === "positional"
+        shape === "dropping"
+          ? undefined
+          : shape === "shim"
             ? Array.isArray(arg)
               ? arg
-              : undefined
-            : Array.isArray(arg)
-              ? undefined
-              : arg?.queueNodeIds;
+              : arg?.queueNodeIds
+            : shape === "positional"
+              ? Array.isArray(arg)
+                ? arg
+                : undefined
+              : Array.isArray(arg)
+                ? undefined
+                : arg?.queueNodeIds;
       const item = { number, batchCount: batch, queueNodeIds };
       if (defer) {
         app.queueItems?.push(item); // hard-private builds hide the array from us
@@ -166,6 +173,68 @@ test("#556 queuePromptScopeArgs: no scope ⇒ [undefined]; scope ⇒ array first
   const [first, second] = queuePromptScopeArgs(["76:34"]);
   assert.deepEqual(first, ["76:34"]);
   assert.deepEqual(second, { queueNodeIds: ["76:34"] });
+});
+
+// ---------------------------------------------------------------------------
+// #630 — HONOURING the scope, not merely refusing to violate it.
+//
+// Refusing a scoped run is the SAFE outcome for #556; running the requested
+// subset is the CORRECT one. These cover the last-resort delivery route: when
+// neither app.queuePrompt argument shape carries the scope, the panel writes
+// partial_execution_targets into this run's own /prompt body and re-verifies
+// it before it leaves.
+// ---------------------------------------------------------------------------
+
+test("#630 queuePromptScopeAttempts: both argument shapes are tried BEFORE the body repair, and repair is licensed only on the last attempt", () => {
+  assert.deepEqual(queuePromptScopeAttempts(undefined), [{ arg: undefined, repair: false }]);
+  assert.deepEqual(queuePromptScopeAttempts([]), [{ arg: undefined, repair: false }]);
+  const attempts = queuePromptScopeAttempts(["76:34"]);
+  assert.equal(attempts.length, 3);
+  assert.deepEqual(attempts[0], { arg: ["76:34"], repair: false });
+  assert.deepEqual(attempts[1], { arg: { queueNodeIds: ["76:34"] }, repair: false });
+  assert.deepEqual(attempts[2], { arg: ["76:34"], repair: true });
+  assert.equal(
+    attempts.filter((a) => a.repair).length,
+    1,
+    "a frontend that delivers the scope natively must always win — repair is the last resort only",
+  );
+});
+
+test("#630 repairScopeInBody: writes EXACTLY the resolved targets, leaves the prompt (and therefore the content hash) untouched", () => {
+  const body = JSON.stringify(frontendBody({ number: MARK_A, targets: null }));
+  const repaired = repairScopeInBody(body, ["14"]);
+  assert.notEqual(repaired, null);
+  const parsed = JSON.parse(repaired);
+  assert.deepEqual(parsed.partial_execution_targets, ["14"], "exactly the resolved scope, nothing widened");
+  assert.deepEqual(parsed.prompt, OUR_OUTPUT, "the prompt is not rewritten");
+  assert.equal(parsed.number, MARK_A, "the run identity mark survives the repair");
+  assert.equal(
+    promptContentHashFromBody(repaired),
+    OUR_HASH,
+    "repair must not invalidate this run's own content attribution",
+  );
+  // The repair verifies its own output: it is itself an operation that can
+  // fail, and a repair that cannot be confirmed is not handed on.
+  assert.equal(verifyScopedPromptBody(repaired, ["14"]).ok, true);
+});
+
+test("#630 repairScopeInBody: refuses what it cannot safely rewrite — unparseable, non-object, or no scope to write", () => {
+  assert.equal(repairScopeInBody("not-json{", ["14"]), null, "an unreadable body is never repaired");
+  assert.equal(repairScopeInBody(JSON.stringify([1, 2]), ["14"]), null, "an array body is not a prompt request");
+  assert.equal(repairScopeInBody(JSON.stringify("scalar"), ["14"]), null);
+  assert.equal(repairScopeInBody(undefined, ["14"]), null);
+  assert.equal(
+    repairScopeInBody(JSON.stringify(frontendBody({})), []),
+    null,
+    "no resolved scope ⇒ nothing to write; never an empty partial_execution_targets",
+  );
+  // A wrong/foreign value IS overwritten by the primitive — the CALLER is what
+  // withholds repair from a genuine mismatch (asserted in the guard tests).
+  const overwritten = repairScopeInBody(
+    JSON.stringify(frontendBody({ number: MARK_A, targets: ["999"] })),
+    ["14"],
+  );
+  assert.deepEqual(JSON.parse(overwritten).partial_execution_targets, ["14"]);
 });
 
 test("#556 r7 promptContentHash: full CONTENT covered (ids, class types, links, widget values), key-order-insensitive", () => {
@@ -289,6 +358,83 @@ test("#572 promptContentHash: the narrowed exclusion tolerates ONLY the hook's o
     atHash,
     "a genuine mid-window edit to a non-excluded input of the same node refuses",
   );
+});
+
+test("#630 scopeDroppedError: the no-scope refusal states the OBSERVATION and no longer asserts a cause it cannot see", () => {
+  // The pre-#630 message asserted "this frontend build ignored the run-to-node
+  // argument" for every no-usable-scope state. That is a bucket narrated as a
+  // cause, and the evidence contradicts it: ComfyUI_frontend 1.42 through 1.50
+  // all accept BOTH app.queuePrompt third-argument shapes and funnel them into
+  // api.queuePrompt's options.partialExecutionTargets. Three #556 field reports
+  // pasted that asserted cause into the tracker, which is why the real cause is
+  // still unknown. The message must survive that lesson.
+  const msg = scopeDroppedError({
+    toNodeId: 4995,
+    verdict: { ok: false, reason: "scope_missing", expected: ["4995"], got: null, bodyKeys: ["client_id", "extra_data", "number", "prompt"] },
+  });
+  assert.match(msg, /node 4995/);
+  assert.match(msg, /no partial_execution_targets key at all/, "says what was seen");
+  assert.doesNotMatch(
+    msg,
+    /this frontend build ignored the run-to-node argument/,
+    "the discredited single-cause assertion must be gone, not merely reworded around",
+  );
+  // Evidence survives to the report instead of being thrown away.
+  assert.match(msg, /body keys: client_id, extra_data, number, prompt/);
+  // Refusal, not a silent fallback.
+  assert.match(msg, /Nothing was queued/);
+  assert.match(msg, /refusing to fall through to a full-graph execution/);
+  // A remedy that works from where the caller is standing — and the full-graph
+  // cost is stated, never taken silently on their behalf.
+  assert.match(msg, /panel_run without to_node_id/);
+  assert.match(msg, /WHOLE graph/);
+});
+
+test("#630 scopeDroppedError: the four distinct no-usable-scope states read differently — a timed-out/unreadable observation is not a definite 'the key was absent'", () => {
+  const of = (reason, extra = {}) =>
+    scopeDroppedError({ toNodeId: 7, verdict: { ok: false, reason, expected: ["7"], got: null, ...extra } });
+  const absent = of("scope_missing");
+  const empty = of("scope_empty");
+  const notList = of("scope_not_a_list", { raw: { queueNodeIds: ["7"] } });
+  const unreadable = of("body_unreadable");
+  assert.match(absent, /no partial_execution_targets key at all/);
+  assert.match(empty, /EMPTY partial_execution_targets list/);
+  assert.match(notList, /was not a list/);
+  assert.match(notList, /queueNodeIds/, "the actual value is evidence for the next report");
+  assert.match(unreadable, /could not be parsed/);
+  const all = [absent, empty, notList, unreadable];
+  assert.equal(new Set(all).size, 4, "four observations, four messages — never one verdict standing in for all of them");
+  // None of them may claim the key was absent when that is not what happened.
+  assert.doesNotMatch(empty, /no partial_execution_targets key at all/);
+  assert.doesNotMatch(notList, /no partial_execution_targets key at all/);
+  assert.doesNotMatch(unreadable, /no partial_execution_targets key at all/);
+});
+
+test("#630 guard: each distinct no-usable-scope state is reported as ITSELF, not folded into scope_missing", async () => {
+  const stop = keepAlive();
+  try {
+    const run = async (targetsValue) => {
+      const orig = makeServer();
+      const guard = createScopedRunGuard({
+        origFetchApi: orig,
+        execIds: ["14"],
+        contentHash: OUR_HASH,
+        batch: 1,
+        toNodeId: 14,
+        queueMark: MARK_A,
+      });
+      const body = { prompt: OUR_OUTPUT, client_id: "x", number: MARK_A };
+      if (targetsValue !== undefined) body.partial_execution_targets = targetsValue;
+      await guard(...promptPost(body));
+      return guard.state.droppedReason;
+    };
+    assert.equal(await run(undefined), "scope_missing");
+    assert.equal(await run([]), "scope_empty");
+    assert.equal(await run({ queueNodeIds: ["14"] }), "scope_not_a_list");
+    assert.equal(await run("14"), "scope_not_a_list");
+  } finally {
+    stop();
+  }
 });
 
 test("#572 scopeDroppedError: graph_changed guidance names the retry safety and the queue-time hook cause", () => {
@@ -555,23 +701,118 @@ test("#556 integration: a shim-less options build drops the legacy array — att
   }
 });
 
-test("#556 integration: a build honoring NEITHER shape ⇒ truthful refusal, ZERO dispatches", async () => {
+test("#630 integration: a build honoring NEITHER shape is now HONOURED, not refused — and the request that reaches ComfyUI names ONLY node 14's branch", async () => {
+  // Supersedes the pre-#630 expectation ("truthful refusal, zero dispatches").
+  // Refusing was safe but was not what the caller asked for; the requested
+  // subset is now actually executed. The assertion that matters is not "the
+  // run completed" — it is WHICH nodes ComfyUI was told to execute.
   const stop = keepAlive();
   try {
     const apiTarget = { fetchApi: makeServer() };
-    const app = makeFrontend({ shape: "positional", apiTarget });
-    // positional honors the array… force neither by overriding queuePrompt to always drop targets
-    app.queuePrompt = async (number, batch) => {
-      const body = frontendBody({ output: OUR_OUTPUT, number, targets: null });
+    const app = makeFrontend({ shape: "dropping", apiTarget });
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+    assert.equal(result.outcome, "dispatched");
+    assert.equal(result.scopeAppliedBy, "request_body_repair", "the caller can tell HOW the scope was delivered");
+    assert.equal(result.repaired, 1);
+    // Both native shapes were tried first and both dropped the scope…
+    assert.equal(app.posted.length, 3, "array shape, options shape, then the repair attempt");
+    assert.equal(app.posted[0].partial_execution_targets, undefined);
+    assert.equal(app.posted[1].partial_execution_targets, undefined);
+    // …and exactly ONE request reached ComfyUI, carrying exactly node 14.
+    assert.equal(apiTarget.fetchApi.calls.length, 1, "the two unrepaired attempts were blocked, not forwarded");
+    const sent = JSON.parse(apiTarget.fetchApi.calls[0].options.body);
+    assert.deepEqual(
+      sent.partial_execution_targets,
+      ["14"],
+      "ONLY the requested branch is an execution root — SaveImage (9) is never named",
+    );
+    assert.ok(!sent.partial_execution_targets.includes("9"), "the unrelated SaveImage branch is not a root (#556)");
+    assert.deepEqual(sent.prompt, OUR_OUTPUT, "the prompt itself is untouched by the repair");
+    assert.equal(sent.number, result.queueMark, "the repaired body keeps this run's identity mark");
+  } finally {
+    stop();
+  }
+});
+
+test("#630 integration: repair NEVER overwrites a scope MISMATCH — a body carrying targets we did not ask for is still refused, zero dispatches", async () => {
+  // The repair widens nothing. When our own attributed post carries DIFFERENT
+  // targets, the panel does not understand why and must not paper over it by
+  // writing its own — that would be executing something other than what the
+  // body says while claiming to have fixed it.
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeFrontend({ shape: "shim", apiTarget });
+    app.queuePrompt = async (number) => {
+      const body = frontendBody({ output: OUR_OUTPUT, number, targets: ["9"] }); // WRONG branch
       app.posted.push(body);
       await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
       return true;
     };
     const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
     assert.equal(result.outcome, "refused");
-    assert.match(result.error, /node 14/);
-    assert.match(result.error, /Nothing was queued/);
-    assert.equal(apiTarget.fetchApi.calls.length, 0, "no full-graph prompt ever left the tab");
+    assert.match(result.error, /instead of \["14"\]/, "the observed mismatch is named, not overwritten");
+    assert.equal(apiTarget.fetchApi.calls.length, 0, "nothing reached ComfyUI — not the wrong scope, not a repaired one");
+  } finally {
+    stop();
+  }
+});
+
+test("#630 integration: repair is scoped to OUR OWN post — a stranger's scopeless /prompt is passed through untouched, never rewritten", async () => {
+  // The repair rides on the same run-identity gate as every other guard
+  // action. A foreign full run of the same graph must leave the tab exactly as
+  // the user queued it: unscoped, unmodified.
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const orig = apiTarget.fetchApi;
+    const guard = createScopedRunGuard({
+      origFetchApi: orig,
+      execIds: ["14"],
+      contentHash: OUR_HASH,
+      batch: 1,
+      toNodeId: 14,
+      queueMark: MARK_A,
+      repairScope: true,
+    });
+    // Someone else's full run: same graph, same node set, NO mark of ours.
+    const foreign = frontendBody({ number: 0, targets: null });
+    await guard(...promptPost(foreign));
+    assert.equal(orig.calls.length, 1);
+    const forwarded = JSON.parse(orig.calls[0].options.body);
+    assert.equal(
+      forwarded.partial_execution_targets,
+      undefined,
+      "a stranger's full run is never silently narrowed to our scope",
+    );
+    assert.equal(guard.state.repaired, 0);
+    assert.equal(guard.state.refused, 0, "and it is never refused either");
+  } finally {
+    stop();
+  }
+});
+
+test("#630 integration: an UNPARSEABLE own-post body is refused, not 'repaired' — a repair that cannot be verified is not a repair", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const orig = apiTarget.fetchApi;
+    const guard = createScopedRunGuard({
+      origFetchApi: orig,
+      execIds: ["14"],
+      contentHash: OUR_HASH,
+      batch: 1,
+      toNodeId: 14,
+      queueMark: MARK_A,
+      repairScope: true,
+    });
+    // Our mark is readable but the content hash cannot be computed ⇒ not
+    // attributable as our unmodified prompt ⇒ never repaired.
+    const drifted = frontendBody({ output: { "3": { class_type: "KSampler", inputs: { steps: 99 } } }, number: MARK_A, targets: null });
+    await guard(...promptPost(drifted));
+    assert.equal(guard.state.repaired, 0, "content drift is never repaired into a dispatch");
+    assert.equal(orig.calls.length, 0, "nothing left the tab");
+    assert.equal(guard.state.droppedReason, "graph_changed");
   } finally {
     stop();
   }

@@ -9226,6 +9226,28 @@ const GRAPH_TOOL_EXECUTORS = {
           "mutation and would NOT have been caught. Every other input was drift-covered.",
       };
     }
+    // #556 — DISCLOSE how the scope actually reached ComfyUI. When both
+    // app.queuePrompt argument shapes failed to carry it, the panel wrote
+    // partial_execution_targets into this run's own /prompt body and
+    // re-verified it before it left. The run IS scoped to the requested
+    // branch — but the frontend queued it believing it was a full run, so its
+    // queue-time widget hooks ran with isPartialExecution=false (a
+    // control_after_generate seed may have advanced as it would for a full
+    // run). That difference is stated here rather than left for the caller to
+    // discover; ran_to_node alone would imply a native scoped run.
+    if (partialTargets && runScopeResult?.scopeAppliedBy === "request_body_repair") {
+      accept.scope_applied_by = "request_body_repair";
+      accept.scope_note =
+        `This frontend build did not carry the run-to-node scope through ` +
+        `app.queuePrompt in either supported argument shape, so the panel wrote ` +
+        `partial_execution_targets into this run's own /prompt request and confirmed ` +
+        `it before dispatch. ONLY node ${to_node_id}'s branch was queued for execution. ` +
+        `One difference from a natively scoped run: the frontend ran its queue-time ` +
+        `widget hooks as if this were a full run (isPartialExecution=false), so a ` +
+        `control_after_generate widget may have advanced its value the way a full run ` +
+        `would. Please report this build (#556) — it is not reproducible against ` +
+        `ComfyUI_frontend 1.42-1.50.`;
+    }
     return accept;
   },
 

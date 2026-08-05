@@ -118,6 +118,35 @@ export function queuePromptScopeArgs(partialTargets) {
   return [partialTargets, { queueNodeIds: partialTargets }];
 }
 
+/**
+ * The ordered DELIVERY ATTEMPTS for a run-to-node scope. The first two hand the
+ * scope to `app.queuePrompt` in each of its two documented third-argument
+ * shapes. The LAST one hands over the positional array again but also licenses
+ * the guard to write `partial_execution_targets` straight into this run's own
+ * /prompt body (repairScopeInBody) if it still has not arrived.
+ *
+ * The final attempt exists because refusing is the SAFE outcome for #556, not
+ * the CORRECT one: the caller asked for a subset and is entitled to get it. The
+ * request body is the one interface every frontend build shares, so repairing
+ * it there honours the request on builds whose `app.queuePrompt` wrapper drops
+ * the argument for any reason — including reasons this panel cannot see. It is
+ * ordered LAST so a frontend that delivers the scope natively always wins, and
+ * the panel only reaches for the body when the supported routes have failed.
+ *
+ * @param {string[]|undefined} partialTargets
+ * @returns {{arg: string[]|{queueNodeIds:string[]}|undefined, repair: boolean}[]}
+ */
+export function queuePromptScopeAttempts(partialTargets) {
+  if (!Array.isArray(partialTargets) || !partialTargets.length) {
+    return [{ arg: undefined, repair: false }];
+  }
+  return [
+    { arg: partialTargets, repair: false },
+    { arg: { queueNodeIds: partialTargets }, repair: false },
+    { arg: partialTargets, repair: true },
+  ];
+}
+
 // Two-seed 32-bit FNV-1a, concatenated — change-detection hashing only (no
 // security requirement): stable across key order (canonicalized before
 // hashing) and cheap enough to run once at queue time + once per observed post.
@@ -268,17 +297,50 @@ function bodyQueueMark(bodyText) {
   return Number.isFinite(n) ? n : null;
 }
 
-/** The body's partial_execution_targets as strings, or null when absent/empty/unparseable. */
-function targetsFromBody(bodyText) {
+/**
+ * WHY a POST /prompt body carries no usable scope — the OBSERVATION, kept
+ * distinct instead of folded into one verdict.
+ *
+ * The previous single "scope_missing" verdict covered FOUR different states
+ * and its message asserted one specific cause for all of them ("this frontend
+ * build ignored the run-to-node argument"). That assertion is a BUCKET
+ * narrated as a CAUSE, and the evidence says it is usually the wrong cause:
+ * every ComfyUI_frontend build from 1.42 through 1.50 demonstrably accepts
+ * BOTH `app.queuePrompt` third-argument shapes (the positional
+ * `NodeExecutionId[]` natively on older builds, and on newer builds through an
+ * `Array.isArray(optionsOrQueueNodeIds)` normalisation into
+ * `{ queueNodeIds }`), and both funnel into `api.queuePrompt`'s
+ * `options.partialExecutionTargets` → `body.partial_execution_targets`. Three
+ * separate field reports on #556 pasted that asserted cause verbatim into the
+ * tracker, which is precisely why the real cause is still unknown.
+ *
+ * So the states are now reported separately, the message states only what was
+ * OBSERVED, and the body's top-level keys ride along as evidence.
+ *
+ * @typedef {"present"|"absent"|"empty"|"not_a_list"|"body_unreadable"} ScopeReadState
+ * @returns {{state: ScopeReadState, targets: string[]|null, bodyKeys: string[]|null, raw: unknown}}
+ */
+function readScopeFromBody(bodyText) {
   let body;
   try {
     body = JSON.parse(bodyText);
   } catch {
-    return null;
+    return { state: "body_unreadable", targets: null, bodyKeys: null, raw: undefined };
   }
-  const t = body?.partial_execution_targets;
-  if (!Array.isArray(t) || !t.length) return null;
-  return t.map(String);
+  const bodyKeys = body && typeof body === "object" ? Object.keys(body).sort() : null;
+  if (!body || typeof body !== "object") {
+    return { state: "body_unreadable", targets: null, bodyKeys, raw: undefined };
+  }
+  const t = body.partial_execution_targets;
+  if (t === undefined || t === null) return { state: "absent", targets: null, bodyKeys, raw: t };
+  if (!Array.isArray(t)) return { state: "not_a_list", targets: null, bodyKeys, raw: t };
+  if (!t.length) return { state: "empty", targets: null, bodyKeys, raw: t };
+  return { state: "present", targets: t.map(String), bodyKeys, raw: t };
+}
+
+/** The body's partial_execution_targets as strings, or null when absent/empty/not-a-list/unparseable. */
+function targetsFromBody(bodyText) {
+  return readScopeFromBody(bodyText).targets;
 }
 
 function sameSet(a, b) {
@@ -306,28 +368,118 @@ export function verifyScopedPromptBody(bodyText, expectedExecIds) {
 }
 
 /**
+ * REPAIR the scope into a POST /prompt body we have already ATTRIBUTED to this
+ * run (its unique queue mark AND its content hash both match), when the body
+ * reached the wire without a usable `partial_execution_targets`.
+ *
+ * This is what turns #556's outcome from "refuse and explain" into "honour the
+ * request". `partial_execution_targets` is a plain top-level key of the /prompt
+ * body — the one place every ComfyUI_frontend build must put the scope,
+ * whatever shape its `app.queuePrompt` wrapper takes — so writing it here works
+ * on any build, present or future, including one whose wrapper drops the
+ * argument entirely. The alternative at this point is NOT a full-graph run (the
+ * guard blocks that unconditionally); it is a refusal. So repair can only ever
+ * improve the outcome, and never widens what executes: the targets written are
+ * exactly the ones graph_run resolved.
+ *
+ * The repair is ITSELF an operation that can fail, so it verifies its own
+ * output: the rewritten text is re-parsed and re-checked, and anything short of
+ * a clean pass returns null so the caller refuses instead of forwarding an
+ * unverified body. `prompt` is untouched, so the content hash still matches.
+ *
+ * @param {string|undefined} bodyText
+ * @param {string[]} expectedExecIds
+ * @returns {string|null} the repaired body text, or null when repair is impossible
+ */
+export function repairScopeInBody(bodyText, expectedExecIds) {
+  const expected = (expectedExecIds ?? []).map(String);
+  if (!expected.length) return null;
+  let body;
+  try {
+    body = JSON.parse(bodyText);
+  } catch {
+    return null;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  let text;
+  try {
+    text = JSON.stringify({ ...body, partial_execution_targets: expected.slice() });
+  } catch {
+    return null;
+  }
+  // Re-read what we just produced: a repair that cannot be verified is not a
+  // repair. Never hand on a body we have not confirmed carries the scope.
+  if (!verifyScopedPromptBody(text, expected).ok) return null;
+  return text;
+}
+
+/**
+ * What was OBSERVED about the scope in our own dispatch — one clause per
+ * distinct state, asserting nothing beyond the observation. See
+ * readScopeFromBody for why these are no longer one bucket.
+ */
+function scopeObservation(verdict) {
+  switch (verdict?.reason) {
+    case "scope_mismatch":
+      return (
+        `the POST /prompt body carried partial_execution_targets ` +
+        `${JSON.stringify(verdict.got)} instead of ${JSON.stringify(verdict.expected)}`
+      );
+    case "scope_not_a_list":
+      return (
+        `the POST /prompt body's partial_execution_targets was not a list ` +
+        `(${JSON.stringify(verdict.raw)}) — the requested scope did not survive ` +
+        `the trip through app.queuePrompt in a usable shape`
+      );
+    case "scope_empty":
+      return `the POST /prompt body carried an EMPTY partial_execution_targets list`;
+    case "body_unreadable":
+      return `the POST /prompt body could not be parsed, so the scope could not be read from it`;
+    default:
+      return (
+        `the POST /prompt body carried no partial_execution_targets key at all` +
+        (verdict?.bodyKeys?.length ? ` (body keys: ${verdict.bodyKeys.join(", ")})` : "")
+      );
+  }
+}
+
+/**
  * The truthful refusal message when our own dispatch surfaced WITHOUT the
  * scope. Names the node that couldn't be scoped and states plainly that
  * NOTHING was queued — never a false `queued:true`/`ran_to_node` for what
  * would have been a full-graph run.
+ *
+ * It reports the OBSERVATION and, where the cause is not observable from here,
+ * enumerates the candidates rather than asserting whichever one it happened to
+ * name. It also gives a remedy that works from where the caller is standing:
+ * the scope is what could not be delivered, so the run that CAN still be made
+ * is the unscoped one — stated as a choice with its cost, never taken silently.
  */
 export function scopeDroppedError({ toNodeId, verdict }) {
-  const detail =
-    verdict?.reason === "graph_changed"
-      ? `the workflow graph CHANGED after the run was queued — the deferred ` +
-        `dispatch would render a modified workflow, not the one that was scoped. ` +
-        `Retrying is safe (nothing was queued); if this recurs without any edit in ` +
-        `between, a queue-time widget hook is mutating values between serialization ` +
-        `and dispatch (e.g. a control_after_generate widget with WidgetControlMode ` +
-        `"before" — switch it to "after" or fix the target widget's value)`
-      : verdict?.reason === "scope_mismatch"
-        ? `the POST /prompt body carried partial_execution_targets ` +
-          `${JSON.stringify(verdict.got)} instead of ${JSON.stringify(verdict.expected)}`
-        : `the POST /prompt body carried no partial_execution_targets — this ` +
-          `frontend build ignored the run-to-node argument`;
+  if (verdict?.reason === "graph_changed") {
+    return (
+      `run-to-node scope for node ${toNodeId} was NOT applied: the workflow graph ` +
+      `CHANGED after the run was queued — the deferred dispatch would render a ` +
+      `modified workflow, not the one that was scoped. Retrying is safe (nothing ` +
+      `was queued); if this recurs without any edit in between, a queue-time widget ` +
+      `hook is mutating values between serialization and dispatch (e.g. a ` +
+      `control_after_generate widget with WidgetControlMode "before" — switch it to ` +
+      `"after" or fix the target widget's value). ` +
+      `Nothing was queued — refusing to fall through to a full-graph execution (#556).`
+    );
+  }
   return (
-    `run-to-node scope for node ${toNodeId} was NOT applied: ${detail}. ` +
-    `Nothing was queued — refusing to fall through to a full-graph execution (#556).`
+    `run-to-node scope for node ${toNodeId} was NOT applied: ${scopeObservation(verdict)}. ` +
+    `Every delivery route was tried — the positional NodeExecutionId[] argument, the ` +
+    `QueuePromptOptions { queueNodeIds } argument, and writing partial_execution_targets ` +
+    `directly into this run's own /prompt body — and the scope still did not reach the ` +
+    `request, so the panel cannot say which layer dropped it from here. ` +
+    `Nothing was queued — refusing to fall through to a full-graph execution (#556). ` +
+    `To render this branch now, either run it unscoped (panel_run without to_node_id, ` +
+    `which executes the WHOLE graph — every other output branch included, at full GPU/API ` +
+    `cost) or delete/bypass the output nodes you do not want and run unscoped. ` +
+    `Please report this with the body keys above — this path is not reproducible against ` +
+    `ComfyUI_frontend 1.42–1.50, where both argument shapes are honoured.`
   );
 }
 
@@ -520,9 +672,19 @@ export function createRunFetchInterceptor({ origFetchApi, onRejection = null, on
  *                                   edit, or the deferred serialization
  *                                   picking up a modified graph): refused
  *                                   before it leaves, batch-bounded.
- * state = { observed, rejected, refused, dropped, droppedReason, failed } is
- * live; waitForVerdict(ms) resolves true at any terminal state, false on
- * timeout.
+ *
+ * REPAIR (`repairScope`, the final dispatch attempt): when the body is OURS
+ * (mark AND content hash both match) and carries no usable scope, the guard
+ * WRITES the resolved targets into the body and forwards it, instead of
+ * refusing — see repairScopeInBody. This is what lets #556 end in the
+ * PREFERRED outcome (the requested subset actually runs) rather than the
+ * merely-safe one (a refusal). It is never a widening: a scope MISMATCH — a
+ * body carrying targets we did not ask for — is never overwritten, and an
+ * unreadable body is never repaired; both still refuse.
+ *
+ * state = { observed, repaired, rejected, refused, dropped, droppedReason,
+ * failed } is live; waitForVerdict(ms) resolves true at any terminal state,
+ * false on timeout.
  */
 export function createScopedRunGuard({
   origFetchApi,
@@ -532,13 +694,14 @@ export function createScopedRunGuard({
   batch = 1,
   toNodeId = null,
   queueMark,
+  repairScope = false,
   onRejection = null,
   onPromptId = null,
   onScopeDropped = null,
 } = {}) {
   const expected = (execIds ?? []).map(String);
   const maxBatch = Math.max(1, Math.floor(Number(batch)) || 1);
-  const state = { observed: 0, rejected: 0, refused: 0, dropped: null, droppedReason: null, failed: null };
+  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, dropped: null, droppedReason: null, failed: null };
   const waiters = new Set();
   const notify = () => {
     for (const fire of [...waiters]) fire();
@@ -552,9 +715,30 @@ export function createScopedRunGuard({
     if (bodyQueueMark(options?.body) !== queueMark) {
       return origFetchApi(route, options);
     }
-    const targets = targetsFromBody(options?.body);
+    const scopeRead = readScopeFromBody(options?.body);
+    let targets = scopeRead.targets;
     const contentOk =
       contentHash && promptContentHashFromBody(options?.body, volatileInputs) === contentHash;
+    // SCOPE REPAIR — only for a body already attributed to THIS run (mark +
+    // content hash), only when no usable scope is present (absent / empty /
+    // not-a-list), and only on the attempt that asked for it. A body carrying
+    // DIFFERENT targets is a mismatch we do not understand and must not
+    // overwrite; an unparseable body cannot be repaired. Both fall through to
+    // the refusal below, exactly as before.
+    let forwardOptions = options;
+    if (
+      repairScope &&
+      contentOk &&
+      !targets &&
+      (scopeRead.state === "absent" || scopeRead.state === "empty" || scopeRead.state === "not_a_list")
+    ) {
+      const repairedBody = repairScopeInBody(options?.body, expected);
+      if (repairedBody != null) {
+        forwardOptions = { ...options, body: repairedBody };
+        targets = expected.slice();
+        state.repaired++;
+      }
+    }
     if (contentOk && targets && sameSet(targets, expected)) {
       // OUR scoped dispatch. It counts as VERIFIED only when the fetch itself
       // completes with a real 200 + prompt_id (r6) — a thrown fetch or a
@@ -562,7 +746,7 @@ export function createScopedRunGuard({
       // a genuine server rejection flows through the established #358 channel.
       let res;
       try {
-        res = await origFetchApi(route, options);
+        res = await origFetchApi(route, forwardOptions);
       } catch (err) {
         if (state.failed == null) {
           state.failed = scopeDispatchError({
@@ -597,11 +781,28 @@ export function createScopedRunGuard({
     if (state.refused < maxBatch) {
       state.refused++;
       if (state.dropped == null) {
+        // Report the OBSERVATION, not a bucket: which of the distinct
+        // no-usable-scope states actually occurred (readScopeFromBody), with
+        // the body's top-level keys as evidence for the next report.
         const verdict = !contentOk
           ? { ok: false, reason: "graph_changed" }
           : targets
             ? { ok: false, reason: "scope_mismatch", expected, got: targets }
-            : { ok: false, reason: "scope_missing", expected, got: null };
+            : {
+                ok: false,
+                reason:
+                  scopeRead.state === "not_a_list"
+                    ? "scope_not_a_list"
+                    : scopeRead.state === "empty"
+                      ? "scope_empty"
+                      : scopeRead.state === "body_unreadable"
+                        ? "body_unreadable"
+                        : "scope_missing",
+                expected,
+                got: null,
+                raw: scopeRead.raw,
+                bodyKeys: scopeRead.bodyKeys,
+              };
         state.droppedReason = verdict.reason;
         state.dropped = scopeDroppedError({ toNodeId, verdict });
         onScopeDropped?.(state.dropped);
@@ -752,7 +953,7 @@ export async function dispatchScopedRun({
     // non-extensible array — cancellation will report 0 and the sentinel covers it.
   }
   let dropped = null;
-  for (const scopeArg of queuePromptScopeArgs(execIds)) {
+  for (const { arg: scopeArg, repair } of queuePromptScopeAttempts(execIds)) {
     dropped = null;
     let keepGuardInstalled = false;
     const guard = createScopedRunGuard({
@@ -763,6 +964,7 @@ export async function dispatchScopedRun({
       batch,
       toNodeId,
       queueMark: mark,
+      repairScope: repair,
       onRejection,
       onPromptId,
     });
@@ -837,11 +1039,32 @@ export async function dispatchScopedRun({
     // established rejection channel — the run "dispatched" and ComfyUI said
     // no; graph_run's summarizePromptRejection surfaces it, never queued:true.
     if (guard.state.rejected > 0) {
-      return { outcome: "dispatched", queueMark: mark, verified: guard.state.observed, volatileInputs: volatileList };
+      return {
+        outcome: "dispatched",
+        queueMark: mark,
+        verified: guard.state.observed,
+        repaired: guard.state.repaired,
+        scopeAppliedBy: guard.state.repaired > 0 ? "request_body_repair" : "frontend",
+        volatileInputs: volatileList,
+      };
     }
     // The FULL batch verified — genuinely dispatched (r5: never on a partial).
     if (guard.state.observed >= batch) {
-      return { outcome: "dispatched", queueMark: mark, verified: guard.state.observed, volatileInputs: volatileList };
+      return {
+        outcome: "dispatched",
+        queueMark: mark,
+        verified: guard.state.observed,
+        repaired: guard.state.repaired,
+        // DISCLOSURE, not a footnote: on this path the scope reached ComfyUI
+        // because the panel wrote it into the request body, NOT because the
+        // frontend delivered it. The run IS correctly scoped (the guard
+        // re-verified the repaired body before it left), but the frontend
+        // believed it was queueing a full run — so its queue-time widget hooks
+        // ran with isPartialExecution=false. graph_run states this in the
+        // result rather than letting the caller infer a native scoped run.
+        scopeAppliedBy: guard.state.repaired > 0 ? "request_body_repair" : "frontend",
+        volatileInputs: volatileList,
+      };
     }
     // r7 CONTENT DRIFT with ZERO verified posts is NOT an argument-shape
     // problem — retrying the other shape would produce the same drifted post.
