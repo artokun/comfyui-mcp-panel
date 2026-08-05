@@ -76,6 +76,14 @@ test("#111 /docs is a LOCAL command — it opens externally, never in-frame", ()
   // tab", is a state never observed (and the tab wording is simply wrong on
   // desktop). What survives is the URL plus a conditional remedy.
   assert.match(code, /Docs: \$\{DOCS_URL\} — if nothing opened, copy that address\./);
+  // ORDER MATTERS. The note is the remedy for the open having failed, so emitting it
+  // after the attempt made it conditional on that attempt not throwing — backwards.
+  // openExternalUrl is guarded and should not throw, but a remedy that relies on its
+  // own failure path staying healthy is not a remedy.
+  assert.ok(
+    code.indexOf("appendSystem(") < code.indexOf("openExternalUrl("),
+    "the URL must reach the transcript BEFORE the open is attempted",
+  );
   assert.doesNotMatch(code, /appendSystem\(`Opening\b/, "must not report an outcome it cannot see");
   assert.doesNotMatch(code, /appendSystem\([^)]*new tab/, "must not name a mechanism it does not control");
 });

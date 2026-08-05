@@ -15099,7 +15099,16 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
 });
 
 /** Open a URL outside the panel frame — never navigate the app/webview itself.
- *  Prefers a desktop external-open bridge if present, else a new browser tab. */
+ *  Prefers a desktop external-open bridge if present, else a new browser tab.
+ *
+ *  BEST-EFFORT AND NEVER THROWS. Callers use this fire-and-forget, often after
+ *  something has already suppressed the anchor's native navigation (the delegated
+ *  link handler) — so an exception escaping here does not fall back to anything, it
+ *  just aborts whatever the caller was doing next. /docs hit exactly that: a
+ *  throwing window.open killed the statement that puts the URL in the transcript,
+ *  and the user was left with "/docs failed: …" and no address to copy. Every exit
+ *  is guarded; a caller that needs the user to have the URL must print it
+ *  regardless, not conditionally on this returning. */
 function openExternalUrl(href) {
   if (!href) return;
   try {
@@ -15132,7 +15141,12 @@ function openExternalUrl(href) {
   } catch {
     // fall through to window.open
   }
-  window.open(href, "_blank", "noopener,noreferrer");
+  try {
+    window.open(href, "_blank", "noopener,noreferrer");
+  } catch {
+    // Popup blocked / window.open unavailable. There is nothing further to try,
+    // and throwing would only take the caller down with it (see the header note).
+  }
 }
 
 /** Open a chat media URL in a new tab. Bridge-delivered images on remote pods
@@ -18751,8 +18765,13 @@ function buildPanel() {
 
     const submit = document.createElement("button");
     submit.type = "button";
-    // flex:none is DECLARED, not inherited from min-content: a later `min-width:0`
-    // here (the usual flexbox reflex) would let the label clip to "Sav".
+    // flex:none is DECLARED rather than left to min-content. On its own that is
+    // belt-and-braces — with flex:none in place, adding `min-width:0` here changes
+    // nothing, because a non-shrinking item never consults its minimum. What it
+    // guards against is the PAIR: the measured mutant made the buttons shrinkable
+    // AND gave them min-width:0, and only then did the label clip to "Sav" and the
+    // group spill the card at 320/280px. Stating the intent stops a future
+    // "everything gets min-width:0" sweep from supplying the missing half.
     submit.style.cssText =
       "flex:none;padding:0.35rem 0.7rem;border-radius:6px;border:none;cursor:pointer;font-size:0.8rem;" +
       "background:var(--p-primary-color,#3a7bd5);color:#fff;";
@@ -22759,9 +22778,15 @@ function buildPanel() {
       // never observed, and the second is simply wrong on desktop. What is left is
       // the URL (true unconditionally) and a conditional remedy that costs nothing
       // if it did open and rescues the user if it did not.
+      //
+      // The note goes in FIRST. It is the remedy for the open having failed, so
+      // sequencing it after the attempt made it conditional on that attempt not
+      // throwing — precisely backwards. openExternalUrl is guarded and should not
+      // throw, but a remedy that depends on its own failure path staying healthy is
+      // not a remedy.
       run: () => {
-        openExternalUrl(DOCS_URL);
         appendSystem(`Docs: ${DOCS_URL} — if nothing opened, copy that address.`);
+        openExternalUrl(DOCS_URL);
       },
     },
     {

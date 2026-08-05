@@ -139,6 +139,40 @@ test("the fallback's own failure cannot throw out of openExternalUrl", async () 
   assert.deepEqual(unhandled, []);
 });
 
+// The three ways out of this function all end in window.open, and only ONE of them
+// was guarded. Callers use openExternalUrl fire-and-forget, usually after something
+// has already suppressed the anchor's native navigation, so an exception escaping
+// here aborts whatever the caller meant to do next instead of falling back to
+// anything. /docs hit exactly that: a throwing window.open killed the statement that
+// puts the URL in the transcript, leaving "/docs failed: …" and no address to copy.
+test("NO-BRIDGE path: a throwing window.open does not escape", () => {
+  const win = {
+    electronAPI: undefined,
+    open: () => {
+      throw new Error("popup blocked");
+    },
+  };
+  assert.doesNotThrow(() => make(win)("https://example.test/docs"));
+});
+
+test("SYNC-THROW path: a throwing window.open does not escape either", () => {
+  const win = {
+    electronAPI: {
+      get openExternal() {
+        throw new Error("bridge getter exploded");
+      },
+    },
+    open: () => {
+      throw new Error("popup blocked");
+    },
+  };
+  assert.doesNotThrow(() => make(win)("https://example.test/docs"));
+});
+
+test("a window with no open() at all is survivable", () => {
+  assert.doesNotThrow(() => make({})("https://example.test/docs"));
+});
+
 test("an empty href is a no-op — no tab, no bridge call", () => {
   const calls = [];
   const { win, opened } = fakeWindow((href) => calls.push(href));
