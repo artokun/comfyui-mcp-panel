@@ -1,12 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
+  applyCurrentDefWidgetValues,
   driftedRequiredInputNames,
   missingRequiredWidgetMaterializations,
   registeredSocketTypes,
   requiredWidgetInputTypes,
   unavailableRequiredCustomWidgetTypes,
 } from "../../web/js/lib/node-widget-materialization.js";
+
+const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 
 const widgetConstructors = { ZIPN_STYLE_GALLERY: () => {}, ZIPN_SPACER: () => {}, COMBO: () => {} };
 
@@ -342,4 +347,188 @@ test("registeredSocketTypes derives link datatypes from fresh /object_info outpu
   assert.ok(types.has("VIDEO"));
   assert.ok(types.has("MASK"));
   assert.equal(types.size, 5);
+});
+
+// ---- #626 P0-1: output-type compatibility is not proof an input is LINK-ONLY -------
+//
+// `knownSocketTypes` waived registration for any input whose type appears as SOME fresh
+// definition's OUTPUT. That is evidence about the TYPE; the question is about the INPUT.
+// ComfyUI's frontend supports converting widget inputs to links, so widget-bearing
+// inputs are link-compatible too — a custom ACME_VALUE can be a widget on one node and
+// an output on another. Waiving on the output side alone meant a required custom widget
+// whose constructor NEVER registers passed the guard, and `panel_add_node` added a node
+// with NEITHER the required widget value NOR a link — invalid, and rejected only later
+// at queue time. The later materialization guard could not report it either: with no
+// constructor there is nothing for it to look for.
+
+const ACME_OUTPUT_PROOF = new Set(["ACME_VALUE"]);
+
+test("#626: a required input that DECLARES a value is not waived just because some node OUTPUTS its type", () => {
+  // The V3 custom-widget shape: the input declares a `default`, which only a widget can
+  // carry. Another node outputs ACME_VALUE, so the type IS a proven link datatype — and
+  // that still does not make THIS input link-only.
+  const node = {
+    constructor: {
+      nodeData: { input: { required: { amount: ["ACME_VALUE", { default: 3, min: 0, max: 10 }] } } },
+    },
+  };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(node, {}, ACME_OUTPUT_PROOF),
+    ["ACME_VALUE"],
+    "output-side proof alone must not waive a value-declaring input",
+  );
+  // …and it clears the moment the widget constructor actually registers, which is the
+  // only thing that makes the node valid.
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(node, { ACME_VALUE: () => {} }, ACME_OUTPUT_PROOF),
+    [],
+  );
+});
+
+test("#626: a socket-SHAPED input of a proven link type is still waived (#620/#608 preserved)", () => {
+  // The discriminating half. Identical type, identical output-side proof — the ONLY
+  // difference is that this input declares no value config, i.e. it is asking for a
+  // link. Without this the guard would fail closed forever on third-party socket
+  // datatypes again, which is the regression #620/#608 were about.
+  const node = {
+    constructor: { nodeData: { input: { required: { thing: ["ACME_VALUE", {}] } } } },
+  };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(node, {}, ACME_OUTPUT_PROOF), []);
+  // A null/absent config is the same statement.
+  const bare = {
+    constructor: { nodeData: { input: { required: { thing: ["ACME_VALUE"] } } } },
+  };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(bare, {}, ACME_OUTPUT_PROOF), []);
+  // `tooltip` and `lazy` say nothing about widget-vs-socket and must not flip it.
+  const annotated = {
+    constructor: {
+      nodeData: { input: { required: { thing: ["ACME_VALUE", { tooltip: "hi", lazy: true }] } } },
+    },
+  };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(annotated, {}, ACME_OUTPUT_PROOF), []);
+});
+
+test("#626: one socket-shaped input does NOT waive a SIBLING of the same type that declares a value", () => {
+  // A def can require the same datatype twice, once as a link and once as a widget.
+  // Waiving the widget one because its sibling is a socket reproduces the same error a
+  // level down, so the waiver needs EVERY required input of the type to be socket-shaped.
+  const node = {
+    constructor: {
+      nodeData: {
+        input: {
+          required: {
+            wired: ["ACME_VALUE", {}],
+            typed: ["ACME_VALUE", { default: 1 }],
+          },
+        },
+      },
+    },
+  };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(node, {}, ACME_OUTPUT_PROOF), ["ACME_VALUE"]);
+});
+
+test("#626: an explicit forceInput/widget:false still reads as a socket even with value config", () => {
+  // An explicit socket flag is the strongest input-level statement there is and settles
+  // it outright — inputWidgetType already drops these, so they never reach the guard.
+  const node = {
+    constructor: {
+      nodeData: {
+        input: { required: { amount: ["ACME_VALUE", { default: 3, forceInput: true }] } },
+      },
+    },
+  };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(node, {}, new Set()), []);
+});
+
+// ---- #626 P0-2: the node is built from STALE nodeData, not the current definition ----
+
+function intWidget(value, options) {
+  return { name: "steps", type: "number", value, options: { ...options } };
+}
+
+test("#626: a required INT whose range moved takes the CURRENT default, not the stale one", () => {
+  // The reported fold: {default:1,min:0,max:10} -> {default:20,min:20,max:100}. Both
+  // signatures are `INT`, so drift does not fire, and LG.createNode builds from the
+  // registered nodeData — producing `1`, which the backend rejects at QUEUE time, far
+  // from its cause.
+  const node = { widgets: [intWidget(1, { min: 0, max: 10 })] };
+  const currentDef = { input: { required: { steps: ["INT", { default: 20, min: 20, max: 100 }] } } };
+  const corrections = applyCurrentDefWidgetValues(node, currentDef);
+  assert.equal(node.widgets[0].value, 20, "the value comes from the CURRENT definition");
+  assert.equal(node.widgets[0].options.min, 20, "bounds come from the current definition too");
+  assert.equal(node.widgets[0].options.max, 100);
+  // The correction is DISCLOSED, not applied silently — it is a value the caller did
+  // not ask for, even though it is the right one.
+  assert.deepEqual(corrections, [{ name: "steps", from: 1, to: 20 }]);
+});
+
+test("#626: bounds are written BEFORE the value, so a raised default is not clamped by the stale max", () => {
+  // Order is load-bearing: applying the value first against a stale max of 10 would
+  // clamp 20 back to 10 and ship an out-of-range value while reporting a correction.
+  const node = { widgets: [intWidget(1, { min: 0, max: 10 })] };
+  applyCurrentDefWidgetValues(node, {
+    input: { required: { steps: ["INT", { default: 20, min: 20, max: 100 }] } },
+  });
+  assert.equal(node.widgets[0].value, 20);
+});
+
+test("#626: a value outside the CURRENT range with no declared default is clamped and reported", () => {
+  const node = { widgets: [intWidget(1, { min: 0, max: 10 })] };
+  const corrections = applyCurrentDefWidgetValues(node, {
+    input: { required: { steps: ["INT", { min: 20, max: 100 }] } },
+  });
+  assert.equal(node.widgets[0].value, 20, "clamped up to the current minimum");
+  assert.deepEqual(corrections, [{ name: "steps", from: 1, to: 20 }]);
+});
+
+test("#626: an UNCHANGED definition produces NO corrections, so nothing is disclosed", () => {
+  // Keeps the ordinary add byte-identical to before: an empty list means the payload
+  // carries no correction key and no warning at all.
+  const node = { widgets: [intWidget(20, { min: 20, max: 100 })] };
+  assert.deepEqual(
+    applyCurrentDefWidgetValues(node, {
+      input: { required: { steps: ["INT", { default: 20, min: 20, max: 100 }] } },
+    }),
+    [],
+  );
+  assert.equal(node.widgets[0].value, 20);
+});
+
+test("#626: no current definition (a frontend-only type) leaves the node untouched", () => {
+  const node = { widgets: [intWidget(1, { min: 0, max: 10 })] };
+  assert.deepEqual(applyCurrentDefWidgetValues(node, undefined), []);
+  assert.deepEqual(applyCurrentDefWidgetValues(node, {}), []);
+  assert.equal(node.widgets[0].value, 1);
+});
+
+test("#626: an input with NO materialized widget is not invented into one", () => {
+  // A socket input has no widget, and reconciliation must not create one — that would
+  // put a value on a slot the user is expected to wire.
+  const node = { widgets: [] };
+  assert.deepEqual(
+    applyCurrentDefWidgetValues(node, {
+      input: { required: { model: ["MODEL", {}], steps: ["INT", { default: 20 }] } },
+    }),
+    [],
+  );
+  assert.equal(node.widgets.length, 0);
+});
+
+test("#626: graph_add_node actually CONSUMES the reconciliation and discloses it", () => {
+  // Without this the helper could be perfectly correct and entirely unwired.
+  const src = readFileSync(PANEL_JS, "utf8");
+  assert.match(src, /applyCurrentDefWidgetValues,/, "imported");
+  assert.match(
+    src,
+    /const valueCorrections = applyCurrentDefWidgetValues\(node, currentDef\);/,
+    "called on the created node with the CURRENT def",
+  );
+  assert.match(src, /added\.schema_value_corrections = valueCorrections;/, "disclosed on the result");
+  // …and it must run BEFORE the node is added to the graph, or the graph briefly holds
+  // the stale value and an undo step captures it.
+  assert.ok(
+    src.indexOf("const valueCorrections = applyCurrentDefWidgetValues(node, currentDef);") <
+      src.indexOf("      graph.add(node);"),
+    "reconciliation must precede graph.add",
+  );
 });

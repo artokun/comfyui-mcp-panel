@@ -197,6 +197,7 @@ import { isLinkPersisted, removePhantomLink, isWidgetBackedInput } from "./lib/c
 import { deferChangeTrackerSnapshot } from "./lib/change-tracker-snapshot.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext } from "./lib/chat-serialize.js";
 import {
+  applyCurrentDefWidgetValues,
   driftedRequiredInputNames,
   missingRequiredWidgetMaterializations,
   registeredSocketTypes,
@@ -7803,6 +7804,15 @@ const GRAPH_TOOL_EXECUTORS = {
           `"${class_type}". Reload ComfyUI so its node extension can register, then retry.`,
       );
     }
+    // LG.createNode built this from the REGISTERED nodeData, which is refreshed only for
+    // ABSENT classes — so a pack upgraded mid-session leaves the node holding the OLD
+    // defaults and bounds. Drift refuses a changed SHAPE above; a changed default/min/max
+    // keeps the same shape signature and would sail through, planting a value the current
+    // backend rejects at QUEUE time (or, when it happens to remain valid, an invented
+    // value that is not the current definition's). Reconcile against currentDef BEFORE
+    // the node reaches the graph, and DISCLOSE every correction — a silent fix is still
+    // a value the caller did not ask for.
+    const valueCorrections = applyCurrentDefWidgetValues(node, currentDef);
     // No await follows this validation. Re-read the graph/workflow now so a
     // tab or subgraph switch during the async preflight cannot commit to the
     // graph captured at command start.
@@ -7816,7 +7826,18 @@ const GRAPH_TOOL_EXECUTORS = {
       graph.afterChange();
     }
     graph.setDirtyCanvas(true, true);
-    return { added: summarizeNode(node) };
+    const added = summarizeNode(node);
+    if (valueCorrections.length) {
+      added.schema_value_corrections = valueCorrections;
+      added.warning =
+        `This ComfyUI's registered node schema for "${class_type}" is STALE (its pack changed since ` +
+        `this tab loaded). ${valueCorrections.length} widget value${valueCorrections.length === 1 ? " was" : "s were"} ` +
+        `taken from the backend's CURRENT definition instead of the stale one: ` +
+        `${valueCorrections.map((c) => `"${c.name}" ${JSON.stringify(c.from)} → ${JSON.stringify(c.to)}`).join(", ")}. ` +
+        `The node is valid to queue, but reload the ComfyUI tab to pick up the updated definition ` +
+        `before editing it further.`;
+    }
+    return { added };
   },
 
   graph_remove_node({ node_id }) {

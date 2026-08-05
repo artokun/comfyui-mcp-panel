@@ -83,13 +83,84 @@ export function unavailableRequiredCustomWidgetTypes(
   knownSocketTypes,
   currentDef,
 ) {
-  return requiredWidgetInputTypes(currentDef ?? nodeOrNodeData).filter(
+  const source = currentDef ?? nodeOrNodeData;
+  const required = requiredInputs(source) ?? {};
+  // Types for which EVERY required input carrying them declares itself socket-shaped.
+  // "Every", not "some": a def can require the same datatype twice, once as a link and
+  // once as a widget, and waiving the widget one because its sibling is a socket would
+  // reproduce the very error this fixes one level down.
+  const socketDeclared = new Set();
+  const widgetDeclared = new Set();
+  for (const spec of Object.values(required)) {
+    const type = inputWidgetType(spec);
+    if (!type) continue;
+    (inputDeclaredAsSocket(spec) ? socketDeclared : widgetDeclared).add(type);
+  }
+  for (const type of widgetDeclared) socketDeclared.delete(type);
+  return requiredWidgetInputTypes(source).filter(
     (type) =>
       typeof widgetConstructors?.[type] !== "function" &&
       !SAFE_SOCKET_TYPES.has(type) &&
-      knownSocketTypes?.has?.(type) !== true,
+      // #626 P0: "some node OUTPUTS this type" does NOT establish that THIS input is
+      // link-only. ComfyUI's frontend supports converting widget inputs to links, so a
+      // widget-bearing input is link-compatible too — INT and a custom ACME_VALUE are
+      // both output by some node somewhere. The output side is evidence about the TYPE;
+      // the question asked here is about the INPUT. So the waiver now needs the
+      // input-level socket declaration as well: the type must be proven a link datatype
+      // AND every required input carrying it must declare itself socket-shaped.
+      !(knownSocketTypes?.has?.(type) === true && socketDeclared.has(type)),
   );
 }
+
+/**
+ * Whether a required input DECLARES itself as a link socket rather than a prompt value.
+ *
+ * This is the input-level half of the #626 waiver, and it is a POSITIVE reading of the
+ * declaration, not an absence: a widget input exists to carry a VALUE, and ComfyUI's
+ * input config is where that value's presence is declared — `default`, and the numeric/
+ * text/combo shaping (`min`/`max`/`step`/`multiline`/`options`/`control_after_generate`)
+ * that only a widget can honour. An input declaring none of them is asking for a link.
+ *
+ * Deliberately NOT inferred from the type: the same datatype can be a widget on one node
+ * and a socket on another, which is exactly why the output-side evidence was insufficient.
+ */
+export function inputDeclaredAsSocket(spec) {
+  if (!Array.isArray(spec)) return false;
+  // A legacy combo (choices as the first tuple item) is always a widget — it exists to
+  // select one of those choices, and nothing can link a choice in.
+  if (Array.isArray(spec[0])) return false;
+  const config = spec[1];
+  if (config == null) return true;
+  if (typeof config !== "object") return true;
+  // An explicit socket flag settles it outright.
+  if (config.forceInput || config.force_input || config.defaultInput || config.widget === false) {
+    return true;
+  }
+  return !WIDGET_VALUE_CONFIG_KEYS.some((key) =>
+    Object.prototype.hasOwnProperty.call(config, key),
+  );
+}
+
+// Config keys that only a WIDGET can honour — their presence is the input declaring it
+// carries a value. `tooltip`, `lazy`, `rawLink` and friends are deliberately absent:
+// they say nothing about widget-vs-socket and a socket input commonly carries them.
+const WIDGET_VALUE_CONFIG_KEYS = [
+  "default",
+  "min",
+  "max",
+  "step",
+  "round",
+  "precision",
+  "multiline",
+  "dynamicPrompts",
+  "dynamic_prompts",
+  "options",
+  "control_after_generate",
+  "image_upload",
+  "video_upload",
+  "audio_upload",
+  "placeholder",
+];
 
 /**
  * Datatypes some CURRENT backend node declares as an OUTPUT are link sockets,
@@ -156,6 +227,72 @@ export function driftedRequiredInputNames(currentDef, nodeOrNodeData) {
       !Object.prototype.hasOwnProperty.call(stale, name) ||
       inputShapeSignature(stale[name]) !== inputShapeSignature(current[name]),
   );
+}
+
+/** The numeric constraint / default a required input's CURRENT declaration carries. */
+function inputValueConfig(spec) {
+  const config = Array.isArray(spec) ? spec[1] : null;
+  return config && typeof config === "object" ? config : null;
+}
+
+/**
+ * Reconcile a JUST-CREATED node's widget values and numeric bounds against the CURRENT
+ * backend definition, returning the corrections that were applied.
+ *
+ * Why this exists (#626 P0): `LG.createNode` builds from the REGISTERED `nodeData`, and
+ * the registry is only refreshed for classes that are ABSENT. A pack upgraded mid-session
+ * keeps its stale entry, so a required INT that moved from
+ * `{default: 1, min: 0, max: 10}` to `{default: 20, min: 20, max: 100}` still matches on
+ * shape signature — both are `INT` — and the node is created holding `1`. That is out of
+ * range: the backend rejects it at QUEUE time, far from its cause, which is exactly the
+ * confusing-failure outcome an add-time check exists to prevent. And even when the stale
+ * value happens to remain valid it is an INVENTED value in the user's graph rather than
+ * the current definition's.
+ *
+ * Applied to a node the caller has just created and not yet placed, so every widget still
+ * holds the stale DEFAULT — there is no user intent here to overwrite. Bounds are written
+ * BEFORE the value, so a new default outside the old range is not clamped back out by a
+ * stale min/max. A value that is still outside the current range after both (a def that
+ * declares no default) is CLAMPED, and the clamp is reported like any other correction —
+ * silently shipping an out-of-range value is the defect, and silently fixing one without
+ * saying so is the fabrication.
+ *
+ * Pure apart from the node it is handed; returns [] when there is nothing current to
+ * compare against, so a frontend-only type is untouched.
+ */
+export function applyCurrentDefWidgetValues(node, currentDef) {
+  const required = currentDef?.input?.required;
+  if (!required || typeof required !== "object") return [];
+  const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
+  const corrections = [];
+  for (const [name, spec] of Object.entries(required)) {
+    const widget = widgets.find((w) => w?.name === name);
+    if (!widget) continue; // a socket, or a widget that never materialized — not ours
+    const config = inputValueConfig(spec);
+    if (!config) continue;
+    const before = widget.value;
+    // 1) BOUNDS first, so a raised default is not clamped by a stale max.
+    const options = widget.options && typeof widget.options === "object" ? widget.options : null;
+    if (options) {
+      for (const key of ["min", "max", "step", "round", "precision"]) {
+        if (Object.prototype.hasOwnProperty.call(config, key) && options[key] !== config[key]) {
+          options[key] = config[key];
+        }
+      }
+    }
+    // 2) The VALUE comes from the CURRENT definition, never the stale registered one.
+    if (Object.prototype.hasOwnProperty.call(config, "default") && widget.value !== config.default) {
+      widget.value = config.default;
+    }
+    // 3) A numeric value still outside the CURRENT range (no default declared, or a
+    //    default the def itself contradicts) is clamped rather than shipped invalid.
+    if (typeof widget.value === "number" && Number.isFinite(widget.value)) {
+      if (typeof config.min === "number" && widget.value < config.min) widget.value = config.min;
+      if (typeof config.max === "number" && widget.value > config.max) widget.value = config.max;
+    }
+    if (widget.value !== before) corrections.push({ name, from: before, to: widget.value });
+  }
+  return corrections;
 }
 
 /**
