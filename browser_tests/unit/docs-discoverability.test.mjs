@@ -54,6 +54,22 @@ test("#111 Settings → About has a docs row that opens the docs site", () => {
   // Opening in-frame hijacks the whole window in the ComfyUI desktop app.
   assert.match(row, /a\.target = "_blank"/);
   assert.match(row, /a\.rel = "noopener noreferrer"/);
+
+  // THE VISIBLE LABEL. Everything above this verifies the link exists and where it
+  // points — none of it notices if the control renders BLANK. Deleting the
+  // textContent line left every other assertion in this file green while shipping an
+  // unlabeled link, which is functionally the same absence this whole change set out
+  // to remove: a signpost nobody can read is not a signpost.
+  const label = row.match(/a\.textContent = "([^"]*)"/);
+  assert.ok(label, "the docs link must set a visible label");
+  const text = label[1].trim();
+  assert.notEqual(text, "", "an empty label renders a blank control");
+  // Words, not just an emoji: a bare 📖 is unreadable to a screen reader and
+  // ambiguous to everyone else.
+  assert.match(text, /[A-Za-z]{2,}/, `the label needs words, not only an icon (got ${JSON.stringify(text)})`);
+  // And it must name what it points at — "Click here" would pass every check above
+  // while telling a lost user nothing, which is the exact failure mode of #111.
+  assert.match(text, /docs|documentation/i, `the label must say it leads to the docs (got ${JSON.stringify(text)})`);
   // It must sort ABOVE the Discord row: asking a human was previously the only exit.
   const docsOrder = Number(row.match(/sortOrder: ([\d.]+)/)[1]);
   const discord = SRC.slice(SRC.indexOf('id: "comfyui-mcp.joinDiscord"'), SRC.indexOf('id: "comfyui-mcp.joinDiscord"') + 400);
