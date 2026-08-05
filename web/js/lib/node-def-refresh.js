@@ -42,6 +42,8 @@ function detailSuffix(thrown) {
  *   comboApiPresent: boolean,  // app.refreshComboInNodes exists on this build
  *   comboRan: boolean,         // refreshComboInNodes completed this run
  *   phase?: string,            // "fetch" | "record" | "register" | "reapply" | "combo" | "done" — where a throw happened
+ *   didThrow?: boolean,        // a throw happened at all — tracked independently of
+ *                              // the caught VALUE, which can be falsy (throw null)
  *   thrown?: any,              // the error a phase threw, if any
  * }} o
  * @returns {{ refreshed: boolean, reason: string, remedy?: string, detail?: string }}
@@ -53,8 +55,11 @@ export function describeNodeDefRefresh({
   comboApiPresent,
   comboRan,
   phase = "done",
+  didThrow,
   thrown = null,
 } = {}) {
+  // Backstop for a caller that predates didThrow: a truthy caught value implies it.
+  const failed = didThrow === true || !!thrown;
   // The registration clause the combo-failure remedies are allowed to make:
   // "WERE re-registered" only when the registration call observably ran.
   const registrationClause = defsRegistered
@@ -72,7 +77,7 @@ export function describeNodeDefRefresh({
         "refreshed. Reload the ComfyUI tab, then retry.",
     };
   }
-  if (thrown) {
+  if (failed) {
     const reason =
       phase === "fetch"
         ? NODE_DEF_REFRESH_REASONS.OBJECT_INFO_FETCH_FAILED

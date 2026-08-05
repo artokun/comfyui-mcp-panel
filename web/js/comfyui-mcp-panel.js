@@ -659,6 +659,11 @@ async function registerComfyNodeDefs(preloadedDefs) {
   let comboRan = false;
   let phase = "fetch";
   let thrown = null;
+  // Tracked separately from the caught VALUE: a library can throw a FALSY value
+  // (throw null / 0 / "") and `if (thrown)` would then read a failed run as a
+  // clean one — misattributing the verdict and, worse, setting the shared
+  // confirmed flag after a throw (codex gate r5).
+  let didThrow = false;
   try {
     const a = typeof app !== "undefined" && app ? app : window.comfyAPI?.app?.app;
     if (!a) return describeNodeDefRefresh({ appAvailable: false, defsObtained: false, defsRegistered: false, comboApiPresent: false, comboRan: false });
@@ -715,6 +720,7 @@ async function registerComfyNodeDefs(preloadedDefs) {
     phase = "done";
   } catch (e) {
     thrown = e;
+    didThrow = true;
     console.warn("[comfyui-mcp-panel] node-def refresh after reconnect failed:", e);
   } finally {
     // Trust the live combos for suppressing missing-asset candidates ONLY when BOTH an
@@ -725,7 +731,7 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // the FALSE side keeps us in over-report-safe mode. The shared global keeps the
     // pre-#635 semantics exactly: true only when this run completed with an
     // authoritative payload AND a completed combo refresh.
-    nodeDefsRefreshConfirmed = !thrown && !!defs && comboRan;
+    nodeDefsRefreshConfirmed = !didThrow && !!defs && comboRan;
   }
   // RETURN this run's own verdict so a caller can trust the combo based on the result
   // of ITS refresh, independent of the shared nodeDefsRefreshConfirmed global — which a
@@ -733,7 +739,7 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // coalescer forwards this through a forced trailing run, so get_errors' awaited
   // `force:true` refresh resolves to the freshness verdict of the fetch IT triggered
   // (codex round-6 P0).
-  return describeNodeDefRefresh({ appAvailable, defsObtained: !!defs, defsRegistered, comboApiPresent, comboRan, phase, thrown });
+  return describeNodeDefRefresh({ appAvailable, defsObtained: !!defs, defsRegistered, comboApiPresent, comboRan, phase, didThrow, thrown });
 }
 
 // Single-flight refresh that never drops a caller-supplied fresh payload (#289 P2).
@@ -12547,10 +12553,16 @@ const GRAPH_TOOL_EXECUTORS = {
       },
     });
     if (!receipt.landed && !receipt.everLanded) {
+      // Never OBSERVED on the target is not proof the navigation never happened
+      // — a landing displaced between two polls is invisible to a sampler
+      // (codex gate r5). Say what is known (no observation) and make the next
+      // step a scope READ, not a blind retry of a possibly-applied navigation.
       throw new Error(
         `panel_enter_subgraph could not confirm that the canvas moved into node ${node.id}'s ` +
-          `subgraph — the navigation did NOT take effect and nothing was applied. Retry, or open ` +
-          `the subgraph on the ComfyUI canvas (double-click the node) and read it from there.`,
+          `subgraph: no observation ever saw the canvas inside it. The navigation may not have ` +
+          `taken effect — or it may have landed and been displaced between checks, so do NOT ` +
+          `assume nothing happened. Read the current scope (panel_graph_outline); if it is not ` +
+          `the subgraph, retry, or open it on the ComfyUI canvas (double-click the node).`,
       );
     }
     let viewing = null;
@@ -12622,10 +12634,16 @@ const GRAPH_TOOL_EXECUTORS = {
       },
     });
     if (!receipt.landed && !receipt.everLanded) {
+      // Never OBSERVED at the parent is not proof the navigation never happened
+      // — a landing displaced between two polls is invisible to a sampler
+      // (codex gate r5). Say what is known (no observation) and make the next
+      // step a scope READ, not a blind retry of a possibly-applied navigation.
       throw new Error(
-        `panel_exit_subgraph could not confirm that the canvas returned to the parent graph — ` +
-          `the navigation did NOT take effect and nothing was applied. Retry, or leave the ` +
-          `subgraph on the ComfyUI canvas (its breadcrumb, or double-click out).`,
+        `panel_exit_subgraph could not confirm that the canvas returned to the parent graph: no ` +
+          `observation ever saw the canvas there. The navigation may not have taken effect — or ` +
+          `it may have landed and been displaced between checks, so do NOT assume nothing ` +
+          `happened. Read the current scope (panel_graph_outline); if it is still inside the ` +
+          `subgraph, retry, or leave it on the ComfyUI canvas (its breadcrumb, or double-click out).`,
       );
     }
     let viewing = null;

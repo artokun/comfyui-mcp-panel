@@ -306,7 +306,7 @@ test("#619: the shipping enter reports settled:true when the canvas lands and th
   assert.equal(reply.settled, true);
 });
 
-test("#619: the shipping enter REFUSES when openSubgraph never moves the canvas (nothing applied)", async () => {
+test("#619: the shipping enter REFUSES when the canvas was never observed inside the subgraph — without claiming non-occurrence", async () => {
   const scope = fakeScope({ land: false });
   const enter = buildEnterSubgraph({
     ...scope,
@@ -314,8 +314,13 @@ test("#619: the shipping enter REFUSES when openSubgraph never moves the canvas 
   });
   await assert.rejects(
     () => enter({ node_id: 105 }),
-    /could not confirm[\s\S]*did NOT take effect/,
-    "a no-op navigation must not report `entered`",
+    /could not confirm[\s\S]*do NOT assume nothing happened/,
+    "an unconfirmed navigation is an uncertainty, not a proven no-op (codex r5)",
+  );
+  await assert.rejects(
+    () => enter({ node_id: 105 }),
+    /panel_graph_outline/,
+    "the next step it names is a scope READ, not a blind retry",
   );
 });
 

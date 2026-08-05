@@ -292,7 +292,7 @@ test("#635: the shipping registerComfyNodeDefs returns its verdict through the p
   assert.match(body, /return describeNodeDefRefresh\(\{/, "the run verdict is returned");
   assert.match(
     body,
-    /nodeDefsRefreshConfirmed = !thrown && !!defs && comboRan;/,
+    /nodeDefsRefreshConfirmed = !didThrow && !!defs && comboRan;/,
     "the shared global stays a strict boolean (concurrent-run trust gate unchanged)",
   );
 });
@@ -486,4 +486,52 @@ test("#635: the shipping run attributes a history-recording throw to BEFORE regi
   assert.equal(verdict.reason, "register_failed");
   assert.match(verdict.remedy, /BEFORE registration was attempted/);
   assert.equal(registerCalls, 0, "registerNodesFromDefs was never reached");
+});
+
+test("#635: a FALSY thrown value still counts as a failure (codex r5)", () => {
+  const v = describeNodeDefRefresh({
+    appAvailable: true,
+    defsObtained: true,
+    defsRegistered: false,
+    comboApiPresent: true,
+    comboRan: false,
+    phase: "record",
+    didThrow: true,
+    thrown: null, // `throw null` — the value carries nothing, the fact matters
+  });
+  assert.equal(v.refreshed, false);
+  assert.equal(v.reason, NODE_DEF_REFRESH_REASONS.REGISTER_FAILED, "not misattributed to a missing API");
+  assert.match(v.remedy, /BEFORE registration was attempted/);
+  assert.equal(v.detail, undefined, "no detail to invent from a null throw");
+});
+
+test("#635: the shipping register run treats a falsy throw as a failure everywhere", async () => {
+  const body = extractFunction("async function registerComfyNodeDefs(");
+  const factory = new Function(
+    "app",
+    "api",
+    "recordObjectInfoTypes",
+    "reapplyDefsToLiveNodes",
+    "describeNodeDefRefresh",
+    `let nodeDefsRefreshConfirmed = false;
+     ${body}
+     return { registerComfyNodeDefs, getConfirmed: () => nodeDefsRefreshConfirmed };`,
+  );
+  const { registerComfyNodeDefs, getConfirmed } = factory(
+    {
+      graph: null,
+      registerNodesFromDefs: async () => {},
+      refreshComboInNodes: async () => {},
+    },
+    { getNodeDefs: async () => ({ SomeNode: {} }) },
+    () => {
+      throw null; // a falsy throw — must still read as a failed run
+    },
+    () => {},
+    describeNodeDefRefresh,
+  );
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.refreshed, false);
+  assert.equal(verdict.reason, "register_failed");
+  assert.equal(getConfirmed(), false, "the shared trust flag must not latch true after a falsy throw");
 });
