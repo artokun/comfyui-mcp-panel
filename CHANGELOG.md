@@ -6,6 +6,61 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.11.41] - 2026-08-05
+
+### Fixed
+- the changelog generator silently dropped the entries that mattered most (#657)
+
+### Changed
+- **`to_node_id` is honoured instead of only refused (#556).** Running "up to node N"
+  used to run the WHOLE graph — a different request executed successfully, spending real
+  GPU time or API-node credits on work nobody asked for. An earlier fix made the panel
+  refuse instead, which was safe but refused every time, so the feature was unusable.
+  A last-resort delivery attempt now writes the scope into the run's own `/prompt` body —
+  the one interface every frontend build shares — identity-gated on the run's mark and
+  content hash, never overwriting a value it cannot interpret, and disclosed via
+  `scope_applied_by`.
+
+  Reading the real frontend sources (1.42.15, 1.47.11, 1.50.1) showed that **every one
+  accepts both `app.queuePrompt` argument shapes**, so the old refusal's assertion that
+  "this frontend build ignored the run-to-node argument" was almost certainly wrong — and
+  three field reports pasted it verbatim into the tracker. The root cause is still unknown;
+  the outcome is now correct regardless of which layer drops the scope, and the next report
+  will be diagnosable. Ten adversarial rounds found ten distinct paths by which a request
+  could still reach the network unscoped — including a retrying run restoring its
+  entry-time `fetchApi` over a concurrent run's guard. #581 needed no code: already fixed
+  on main by #594 and #621.
+
+
+## [0.11.40] - 2026-08-05
+
+### Fixed
+- **`panel_show_media` no longer dead-ends on video, and no longer acknowledges a delivery
+  it did not make (#649).** Under the size ceiling the panel painted a player for the *user*
+  and returned `{ok:true,count:1}` to an agent that had been shown nothing. An absent handler
+  now fails loudly, and a handler that returns nothing reports the delivery as UNKNOWN.
+  Oversized video routes through the existing storyboard pipeline with an explicit disclosure —
+  the video was **not** sent, the sheet is N *sampled* frames, and `get_image` is the way to
+  actually look at it. A partial sheet withholds the "evenly-spaced" claim. Also fixed:
+  `clip.mp4?download=1` classified as an image, `/.(mp4|webm)$/` matching `xmp4`, and a
+  truthy-but-unusable upload reference producing a `get_image` remedy with an empty filename.
+  The 20 MB refusal itself is orchestrator-side and still open (artokun/comfyui-mcp#854).
+- **`workflow_open` now says which check it could not prove (#653).** The verdict is split and
+  named (`instance` / `marker` / `identity` / `content`), so a failure states which observation
+  failed and which two values disagreed, instead of four distinct causes collapsing into one
+  message that asserted whichever it happened to name. An attempt-scoped single-use marker
+  proves the rebind with evidence a stale tag cannot fake. The long-standing "two dialects"
+  hypothesis was tested and **refuted**; whether the whole graph *landed* is still reported as
+  unknown, deliberately — a `configure()` failure that silently drops widget values is
+  byte-identical to the loader normalizing them. Partially addresses #604, #603, #616, #374;
+  closes #641.
+- say when the live-canvas tools may not have reached the agent (#291) (#633)
+- the `waitForQueueDrain` test was flaky under load — it stubbed a bounded delay with a real
+  `setTimeout` against a 5s budget, so a loaded machine consumed the whole budget before the
+  polls completed. The injected delay now resolves instantly, and the test additionally asserts
+  the loop's pacing, which it had been taking on trust (#652)
+
+
 ## [0.11.39] - 2026-08-04
 
 ### Fixed

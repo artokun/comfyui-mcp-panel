@@ -130,11 +130,61 @@ export function controlEntryForWidget(node, widgetName) {
 }
 
 /**
+ * The REMEDY half of the #558 warning, expressed in the CALLER'S OWN SCOPE (#650).
+ *
+ * A remedy must be actionable from where the caller actually is. The control widget
+ * lives on the node that is ULTIMATELY governed — for a PROMOTED subgraph write that is
+ * an INNER node, whose id does not exist in the caller's (root) graph at all. The old
+ * unconditional `panel_set_widget(node_id=<inner id>, …)` therefore returned
+ * "No node with id 75 in the current graph" when followed: a remedy the caller cannot
+ * follow is not better than none, it is worse — it reads as a working instruction.
+ *
+ * `scope` states, as OBSERVED FACT by the caller that resolved the write, how the
+ * control widget is reachable from the addressed scope:
+ *   {}                              — DIRECT write: the control is on the very node the
+ *                                     caller addressed; address it there.
+ *   { outerNodeId, promotedAs }     — the control is ITSELF promoted onto the outer
+ *                                     subgraph node under `promotedAs`; set it there,
+ *                                     without entering anything.
+ *   { outerNodeId, enterPath: [id…] } — the control is only reachable INSIDE; enter each
+ *                                     container in order (each id is addressable in the
+ *                                     scope the previous enter lands in), set it on the
+ *                                     inner node, then exit.
+ * An unrecognised/empty scope falls back to the direct form — the shape it had before —
+ * so a caller that cannot describe the scope is no worse off than today.
+ */
+export function controlAfterGenerateRemedy(entry, node, scope = {}) {
+  const control = entry?.control;
+  const outerId = scope?.outerNodeId;
+  if (outerId != null && typeof scope?.promotedAs === "string") {
+    return (
+      `"${control}" is promoted onto subgraph node ${outerId} as "${scope.promotedAs}", so set it ` +
+      `from here: panel_set_widget(node_id=${outerId}, widget='${scope.promotedAs}', value='fixed').`
+    );
+  }
+  const path = Array.isArray(scope?.enterPath) ? scope.enterPath.filter((id) => id != null) : [];
+  if (outerId != null && path.length) {
+    const enters = path.map((id) => `panel_enter_subgraph(node_id=${id})`).join(", then ");
+    return (
+      `"${control}" is NOT promoted onto subgraph node ${outerId}, so it is not settable from this ` +
+      `scope — node ${node?.id} does not exist in the graph you are addressing. Enter the owning ` +
+      `subgraph first: ${enters}, then ` +
+      `panel_set_widget(node_id=${node?.id}, widget='${control}', value='fixed'), then ` +
+      `panel_exit_subgraph()${path.length > 1 ? ` ${path.length} times` : ""}.`
+    );
+  }
+  return `panel_set_widget(node_id=${node?.id}, widget='${control}', value='fixed').`;
+}
+
+/**
  * A warning string when writing `widgetName` on `node` targets a value governed by a
  * NON-fixed control_after_generate (the write will not hold), else null. Points at
  * the exact control widget + value to make it stick, so the agent can self-correct.
+ *
+ * `scope` (#650) is passed straight to controlAfterGenerateRemedy — see there. Omit it
+ * for a direct read/write where the control widget is on the node the caller addressed.
  */
-export function controlAfterGenerateWarning(node, widgetName) {
+export function controlAfterGenerateWarning(node, widgetName, scope = {}) {
   const entry = controlEntryForWidget(node, widgetName);
   if (!entry || entry.mode === "fixed") return null;
   const behavior = {
@@ -145,7 +195,7 @@ export function controlAfterGenerateWarning(node, widgetName) {
   return (
     `control_after_generate='${entry.mode}' governs widget "${entry.widget}" on node ${node?.id}: ` +
     `ComfyUI automatically CHANGES this value on subsequent runs (${behavior}), so the value you set ` +
-    `will NOT persist. Set "${entry.control}" to 'fixed' to hold it — e.g. ` +
-    `panel_set_widget(node_id=${node?.id}, widget='${entry.control}', value='fixed').`
+    `will NOT persist. Set "${entry.control}" to 'fixed' to hold it — ` +
+    `${controlAfterGenerateRemedy(entry, node, scope)}`
   );
 }

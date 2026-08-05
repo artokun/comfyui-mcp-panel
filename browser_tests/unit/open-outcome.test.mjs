@@ -467,7 +467,7 @@ test("#721 P1: an already-active workflow requires state even when empty, then p
     "a state-less EMPTY target cannot report opened against the prior canvas",
   );
   const repaintAt = body.indexOf("await app.loadGraphData(repaintState, true, true, target);");
-  const proofAt = body.indexOf("graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid: targetUuid })", repaintAt);
+  const proofAt = body.indexOf("const verdict = resolveOpenRebindVerdict({", repaintAt);
   const openedAt = body.lastIndexOf("applied: true");
   assert.ok(repaintAt !== -1 && proofAt > repaintAt && openedAt > proofAt, "must prove the repaint before success");
   // A failed/missing repaint is an honest unknown after s.openWorkflow may have
@@ -484,9 +484,17 @@ test("#721 P1: dirty rebind success requires the target UUID, never only a read-
   assert.match(repaint, /const targetUuid = workflowStableUuid\(target, \{ embed: true \}\);/);
   assert.match(repaint, /\[WORKFLOW_UUID_FIELD\]: targetUuid/);
   assert.match(repaint, /await app\.loadGraphData\(repaintState, true, true, target\);/);
-  assert.match(repaint, /activeWorkflowRef\(\) !== target/);
+  // The instance check is PROXY-SAFE. A bare `!==` compares a Vue proxy against a raw
+  // lookup result and can report a tab switch that never happened (#558 r2) — a false
+  // negative on the one part that makes every other part meaningless.
+  assert.match(repaint, /const instanceStillTarget = sameWorkflowObject\(activeNow, target\);/);
+  assert.doesNotMatch(repaint, /activeWorkflowRef\(\) !== target/, "the raw-identity comparison must be gone");
   assert.match(repaint, /graphRootWorkflowUuidMatches\(\{ rootGraph, activeWorkflowUuid: targetUuid \}\)/);
   assert.match(repaint, /graphRootMatchesState\(\{ rootGraph, state: repaintState \}\)/);
+  // The ATTEMPT-scoped marker: a workflow uuid can be on the root from a previous load
+  // or a rebind heal, so it cannot say that THIS load landed.
+  assert.match(repaint, /\[OPEN_PROOF_FIELD\]: openProofMarker/, "the payload must carry a single-use marker");
+  assert.match(repaint, /graphRootCarriesOpenProof\(\{ rootGraph, proofMarker: openProofMarker \}\)/);
   assert.doesNotMatch(repaint, /assertGraphBoundToActiveWorkflow\(/, "the read guard is deliberately non-strict for dirty roots");
 });
 

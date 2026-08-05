@@ -73,6 +73,14 @@ export const FRONTEND_ONLY_NODE_TYPES = new Set([
   "Label (rgthree)",
   "Reroute (rgthree)",
   "Node Collector (rgthree)",
+  // KJNodes' frontend-only Get/Set bus nodes (also reported with rgthree installed):
+  // registered purely by the pack's JS, absent from /object_info BY DESIGN (#496
+  // recurrence). These are GENERIC names a backend pack could also use — a live
+  // backend registration carries nodeData/comfyClass provenance and never reaches
+  // this allowlist (hasBackendProvenance), and a mid-session removal is caught by
+  // the ever-seen gate BEFORE the exemption is consulted.
+  "SetNode",
+  "GetNode",
 ]);
 
 /**
@@ -206,6 +214,20 @@ export const HISTORY_PENDING = "history-pending";
  * Every verdict except "never-seen" refuses, so a consumer that cannot tell them apart is
  * still safe — the distinction only buys an accurate diagnosis.
  */
+/**
+ * The single membership predicate for "the CURRENT /object_info positively defines this
+ * type". ONE definition so every consumer agrees on what a live backend type is: the two
+ * fresh-auth guards below, and the #612 not-promoted diagnosis in runSetWidget, which must
+ * NOT claim a node is a virtual-only container when the fresh backend positively defines
+ * its type. Returns false for an unavailable/unfetched `freshDefs` — absence of the map is
+ * "could not determine", and every caller already fails closed on that separately.
+ */
+export function freshBackendDefinesType(freshDefs, type) {
+  if (!freshDefs || typeof freshDefs !== "object") return false;
+  if (typeof type !== "string") return false;
+  return Object.prototype.hasOwnProperty.call(freshDefs, type);
+}
+
 export function backendHistoryVerdict(type, wasTypeEverDefined) {
   if (typeof wasTypeEverDefined !== "function" || typeof type !== "string") return "no-oracle";
   const seen = wasTypeEverDefined(type);
@@ -313,7 +335,7 @@ export function assertMutatedNodeAuthorized(freshDefs, registry, node, role = "t
     );
   }
   // PRESENT in the fresh backend → a live node, authorized by presence.
-  if (typeof type === "string" && Object.prototype.hasOwnProperty.call(freshDefs, type)) return;
+  if (freshBackendDefinesType(freshDefs, type)) return;
   // ABSENT from fresh object_info. EVER-SEEN GATE: if the backend reported this type
   // earlier this session, its backend was REMOVED — refuse (non-forgeable, #458).
   const verdict = backendHistoryVerdict(type, wasTypeEverDefined);
@@ -571,7 +593,7 @@ export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknow
         `Reconnect ComfyUI and retry.`,
     );
   }
-  if (typeof type !== "string" || !Object.prototype.hasOwnProperty.call(freshDefs, type)) {
+  if (!freshBackendDefinesType(freshDefs, type)) {
     // #458 EVER-SEEN GATE (the non-forgeable trust root): object_info WAS fetched but
     // lacks this type. If the backend reported this type EARLIER this session, its
     // backend was REMOVED (pack uninstalled) → refuse — even a pure-JS frontend class

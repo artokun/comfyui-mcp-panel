@@ -1418,3 +1418,295 @@ test("#512: NESTED promotion through a provenance-stamped UUID intermediate ⇒ 
   assert.equal(b.widgets.find((w) => w.name === "steps").value, 30, "the intermediate forwarded the write");
   assert.equal(aRail.value, 30, "#366: authoritative outer rail synced");
 });
+
+// ---- #612: a widget that is NOT promoted on a GENUINE subgraph container must be
+//      refused with the HONEST diagnosis — "not a promoted widget on this subgraph",
+//      naming what IS promoted and the actionable remedy — never the generic #458
+//      "the ComfyUI backend does not provide node type <uuid>" message, which
+//      misreports a benign not-promoted case as an uninstalled/removed pack and
+//      sends the agent reinstalling packs or restarting ComfyUI. This is also the
+//      #512 recurrence: the krea2 pack's legacy proxyWidgets promotion of
+//      control_after_generate is QUARANTINED on load by the current frontend (a
+//      canvas-only control widget has no connectable slot), so the outer node has
+//      no such promotion and the refusal is correct — only its message was wrong. ----
+
+test("#612: non-promoted widget on a genuine UUID subgraph node ⇒ honest 'not a promoted widget' refusal", async () => {
+  // The exact reported shape (#612 node 105 / #512-recurrence node 78): a genuine
+  // subgraph container with one promoted widget (value_4), asked to write a widget
+  // that is NOT promoted (control_after_generate — it exists on an inner node but
+  // is not exposed on the boundary).
+  const reg = loadedRegistry();
+  const { parent, inner, railWidget, resolveSource } = makeUuidSubgraphFixture(reg, "KSampler");
+  await assert.rejects(
+    () =>
+      runSetWidget(parent, "control_after_generate", "fixed", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // healthy backend
+        wasTypeEverDefined: () => false, // the UUID was never backend-defined
+        resolveSource,
+        ...HOOKS,
+      }),
+    (err) => {
+      assert.match(err.message, /Cannot set widget on subgraph node 320/);
+      assert.match(err.message, /"control_after_generate" is not a promoted widget on this subgraph/);
+      // The reason must name what IS promoted so the caller can self-correct…
+      assert.match(err.message, /promoted: value_4/);
+      // …and point at the actionable remedy…
+      assert.match(err.message, /panel_enter_subgraph/);
+      assert.match(err.message, /panel_promote_widget/);
+      // …and NEVER blame a removed/uninstalled pack — nothing was uninstalled.
+      assert.doesNotMatch(err.message, /backend does not provide/i);
+      assert.doesNotMatch(err.message, /not installed, or its pack was removed/i);
+      return true;
+    },
+  );
+  assert.equal(inner.widgets.find((w) => w.name === "value_4").value, 20, "inner untouched");
+  assert.equal(railWidget.value, 20, "rail untouched");
+});
+
+test("#612: an UNREACHABLE backend does NOT establish the not-promoted diagnosis — it reports the honest 'could not verify' instead", async () => {
+  // The definite "this is an unpromoted widget on a subgraph" finding claims the node is
+  // a virtual-only container, and that claim rests on the type being ABSENT from the
+  // CURRENT /object_info. When the fetch FAILED there is no current /object_info at all:
+  // an unavailable map is could-not-determine, not "the backend lacks this type". Both
+  // read as "no entry" to a membership test, so they must be told apart here or an
+  // unreachable backend silently becomes positive evidence for a definite verdict.
+  //
+  // The refusal is unchanged (fail closed). Only the diagnosis differs, and "reconnect
+  // and retry" is the accurate one: it IS a transient verification failure.
+  const reg = loadedRegistry();
+  const { parent, railWidget, resolveSource } = makeUuidSubgraphFixture(reg, "KSampler");
+  await assert.rejects(
+    () =>
+      runSetWidget(parent, "control_after_generate", "fixed", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => null, // backend unreachable
+        wasTypeEverDefined: () => false,
+        resolveSource,
+        ...HOOKS,
+      }),
+    (err) => {
+      assert.match(err.message, /object_info is unavailable|cannot verify the node type/i);
+      assert.doesNotMatch(err.message, /is not a promoted widget on this subgraph/);
+      return true;
+    },
+  );
+  assert.equal(railWidget.value, 20, "no mutation");
+});
+
+test("#612: a REJECTED /object_info fetch is treated the same as an unavailable one", async () => {
+  // The fetch is wrapped in a catch that sets freshDefs = null, so a throwing oracle and
+  // a null-returning one arrive at the identical state. Both must be could-not-determine.
+  const reg = loadedRegistry();
+  const { parent, railWidget, resolveSource } = makeUuidSubgraphFixture(reg, "KSampler");
+  await assert.rejects(
+    () =>
+      runSetWidget(parent, "control_after_generate", "fixed", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => {
+          throw new Error("network down");
+        },
+        wasTypeEverDefined: () => false,
+        resolveSource,
+        ...HOOKS,
+      }),
+    (err) => {
+      assert.doesNotMatch(err.message, /is not a promoted widget on this subgraph/);
+      return true;
+    },
+  );
+  assert.equal(railWidget.value, 20, "no mutation");
+});
+
+test("#612: an EVER-SEEN container type keeps the removed-type diagnosis (the trust root wins)", async () => {
+  // The honest "not a promoted widget" branch is only for a container whose type the
+  // backend NEVER reported. A container-shaped node whose type was in an earlier
+  // /object_info this session is a removed backend node masquerading as a container —
+  // the #458 removed-type diagnosis is the accurate one and must not be masked.
+  const reg = loadedRegistry();
+  const { parent, railWidget, resolveSource } = makeUuidSubgraphFixture(reg, "KSampler");
+  await assert.rejects(
+    () =>
+      runSetWidget(parent, "control_after_generate", "fixed", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // the type is ABSENT now…
+        wasTypeEverDefined: (t) => t === SUBGRAPH_UUID, // …but was reported EARLIER
+        resolveSource,
+        ...HOOKS,
+      }),
+    (err) => {
+      assert.match(err.message, /was defined by the ComfyUI backend earlier this session|since-removed/i);
+      assert.doesNotMatch(err.message, /not a promoted widget/i);
+      return true;
+    },
+  );
+  assert.equal(railWidget.value, 20, "no mutation");
+});
+
+test("#612: a bare `subgraph:{}` marker that is NOT a real container keeps the #458 fresh-auth diagnosis", async () => {
+  // The subgraph-shaped bypass fixture: a stale type carrying a truthy `subgraph`
+  // field that fails the virtual-container shape check. It must NOT get the benign
+  // "not a promoted widget" message — the backend-type diagnosis stands.
+  const reg = loadedRegistry();
+  const node = regNode("SubgraphNode", [{ name: "steps", type: "INT", value: 20 }], { subgraph: {} });
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "steps", 7, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // backend provides no "SubgraphNode"
+        wasTypeEverDefined: () => false,
+        ...HOOKS,
+      }),
+    (err) => {
+      assert.match(err.message, /backend does not provide/i);
+      assert.doesNotMatch(err.message, /not a promoted widget/i);
+      return true;
+    },
+  );
+  assert.equal(node.widgets[0].value, 20, "no mutation");
+});
+
+// ---- The #612 diagnosis must NOT be asserted from an absence of evidence. It claims
+//      the node is a virtual-only container, and that claim needs TWO positive facts:
+//      the current /object_info does NOT define the type, AND the history oracle
+//      positively reports never-seen. Getting either wrong refuses a LEGITIMATE write
+//      and hands the caller a remedy that is actionable but WRONG — worse than a bare
+//      refusal, because it sends them to promote a widget on a node that is not a
+//      subgraph at all. These tests pin both directions: the honest refusal survives,
+//      and the valid direct write is permitted FOR THE FRESH-TYPE REASON. ----
+
+// A backend-defined, subgraph-SHAPED node installed AFTER the startup baseline: the
+// pack's class builds an inner graph (so isVirtualSubgraphContainer says "container"),
+// but the backend genuinely defines the type and it carries a direct OWN widget with no
+// promoted inputs. On its FIRST observation the history oracle honestly reports
+// never-seen — it was not in the baseline — while the fresh /object_info this very call
+// fetched positively defines it.
+const LATE_INSTALLED_TYPE = "AcmeVirtualCompositor";
+function makeLateInstalledContainerNode() {
+  const own = { name: "strength", type: "INT", value: 20 };
+  const ctor = function AcmeVirtualCompositor() {};
+  ctor.nodeData = { input: { required: {} } };
+  return {
+    node: {
+      id: 412,
+      type: LATE_INSTALLED_TYPE,
+      // Container SHAPE — a real nested graph, not a bare `subgraph:{}` marker.
+      subgraph: { _nodes: [], getNodeById: () => null },
+      inputs: [], // nothing promoted onto the boundary
+      widgets: [own],
+      constructor: ctor,
+    },
+    own,
+    ctor,
+  };
+}
+function registryWithLateInstalled() {
+  const reg = loadedRegistry();
+  const { ctor } = makeLateInstalledContainerNode();
+  reg[LATE_INSTALLED_TYPE] = ctor;
+  return reg;
+}
+
+test("#612 regression: a backend-defined container-shaped node added AFTER the baseline ⇒ its direct own-widget write is PERMITTED by fresh-type authorization", async () => {
+  // never-seen history is "the startup baseline did not list it", NOT "the backend does
+  // not define it". The fresh /object_info this call already fetched settles it, and the
+  // fresh-type authorization is entitled to permit the write. Short-circuiting to the
+  // not-promoted diagnosis on history alone refuses a write that worked yesterday.
+  const reg = registryWithLateInstalled();
+  const { node, own } = makeLateInstalledContainerNode();
+  reg[LATE_INSTALLED_TYPE] = node.constructor;
+  let fetches = 0;
+  const { set } = await runSetWidget(node, "strength", 42, {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => {
+      fetches += 1;
+      return objectInfo([LATE_INSTALLED_TYPE]); // the backend DOES define it now
+    },
+    wasTypeEverDefined: () => false, // absent from the startup baseline ⇒ never-seen
+    ...HOOKS,
+  });
+  assert.equal(set.value, 42);
+  assert.equal(own.value, 42, "the write landed on the node's OWN widget");
+  // THE REASON, not just the outcome: the permission came from the FRESH backend
+  // definition. The oracle was actually consulted…
+  assert.equal(fetches, 1, "the fresh /object_info oracle was consulted");
+});
+
+test("#612 regression, the discriminating half: the SAME node with the type ABSENT from fresh /object_info is still REFUSED as not-promoted", async () => {
+  // Paired with the test above, this is what makes "permitted for the fresh-type reason"
+  // an assertion rather than a hope: the ONLY difference between the two is whether the
+  // current /object_info defines the type. Nothing else about the node changed. If the
+  // loosened branch permitted on some other ground, this one would pass too.
+  const reg = registryWithLateInstalled();
+  const { node, own } = makeLateInstalledContainerNode();
+  reg[LATE_INSTALLED_TYPE] = node.constructor;
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "strength", 42, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(), // the type is NOT defined
+        wasTypeEverDefined: () => false,
+        ...HOOKS,
+      }),
+    (err) => {
+      assert.match(err.message, /is not a promoted widget on this subgraph/);
+      return true;
+    },
+  );
+  assert.equal(own.value, 20, "no mutation");
+});
+
+test("#612: an UNWIRED history oracle falls THROUGH to fresh-type authorization — a live type is PERMITTED", async () => {
+  // `no-oracle` is the could-not-determine case BY DEFINITION: it establishes neither
+  // "never backend-defined" nor safe container identity (backendHistoryVerdict's own
+  // fail-closed contract). It must therefore not short-circuit to the definite "this is
+  // an unpromoted widget on a subgraph" negative — it must defer to the fresh result the
+  // call already fetched, which here positively defines the type.
+  const reg = registryWithLateInstalled();
+  const { node, own } = makeLateInstalledContainerNode();
+  reg[LATE_INSTALLED_TYPE] = node.constructor;
+  const { set } = await runSetWidget(node, "strength", 7, {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => objectInfo([LATE_INSTALLED_TYPE]),
+    // wasTypeEverDefined deliberately OMITTED ⇒ "no-oracle"
+    ...HOOKS,
+  });
+  assert.equal(set.value, 7);
+  assert.equal(own.value, 7, "the valid direct write was not refused for a missing oracle");
+});
+
+test("#612: an UNWIRED history oracle still FAILS CLOSED when the fresh backend does not define the type", async () => {
+  // Falling through is not loosening the refusal — only the diagnosis. With no history
+  // oracle we cannot establish that this UUID node is a genuine container rather than a
+  // removed backend node, so we must not assert the container diagnosis; the fresh-auth
+  // refusal stands and nothing is mutated.
+  const reg = loadedRegistry();
+  const { parent, railWidget, resolveSource } = makeUuidSubgraphFixture(reg, "KSampler");
+  await assert.rejects(
+    () =>
+      runSetWidget(parent, "control_after_generate", "fixed", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => objectInfo(),
+        // wasTypeEverDefined deliberately OMITTED
+        resolveSource,
+        ...HOOKS,
+      }),
+    (err) => {
+      // Refused — and the message does NOT claim the not-promoted finding, which no
+      // oracle established here.
+      assert.doesNotMatch(err.message, /is not a promoted widget on this subgraph/);
+      assert.match(err.message, /backend does not provide/i);
+      return true;
+    },
+  );
+  assert.equal(railWidget.value, 20, "no mutation");
+});
