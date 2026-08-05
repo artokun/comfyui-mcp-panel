@@ -12538,18 +12538,40 @@ const GRAPH_TOOL_EXECUTORS = {
         });
       },
     });
-    if (!receipt.landed) {
+    if (!receipt.landed && !receipt.everLanded) {
       throw new Error(
         `panel_enter_subgraph could not confirm that the canvas moved into node ${node.id}'s ` +
           `subgraph — the navigation did NOT take effect and nothing was applied. Retry, or open ` +
           `the subgraph on the ComfyUI canvas (double-click the node) and read it from there.`,
       );
     }
-    const viewing = describeActiveGraph(getGraphCtx().graph);
+    let viewing = null;
+    try {
+      viewing = describeActiveGraph(getGraphCtx().graph);
+    } catch {
+      // The current scope is unresolvable right now — omit `viewing` rather
+      // than fabricate one; the note below already discloses the uncertainty.
+      viewing = null;
+    }
     if (!receipt.bound) {
+      if (!receipt.landed) {
+        // The canvas WAS observed inside the subgraph, then moved elsewhere
+        // before the binding settled — the navigation happened, so this is a
+        // disclosure, never a "nothing was applied" refusal.
+        return {
+          entered: node.id,
+          ...(viewing ? { viewing } : {}),
+          settled: false,
+          note:
+            `The canvas DID enter the subgraph, but it has since navigated away before the panel ` +
+            `could confirm the binding — something else moved the view (a user navigation or a ` +
+            `tab restore). Re-read the current scope (panel_graph_outline) before editing, and ` +
+            `re-enter the subgraph if that is still where you mean to work.`,
+        };
+      }
       return {
         entered: node.id,
-        viewing,
+        ...(viewing ? { viewing } : {}),
         settled: false,
         note:
           `The canvas DID enter the subgraph (the navigation is in effect), but the ` +
@@ -12591,17 +12613,38 @@ const GRAPH_TOOL_EXECUTORS = {
         });
       },
     });
-    if (!receipt.landed) {
+    if (!receipt.landed && !receipt.everLanded) {
       throw new Error(
         `panel_exit_subgraph could not confirm that the canvas returned to the parent graph — ` +
           `the navigation did NOT take effect and nothing was applied. Retry, or leave the ` +
           `subgraph on the ComfyUI canvas (its breadcrumb, or double-click out).`,
       );
     }
-    const viewing = describeActiveGraph(getGraphCtx().graph);
+    let viewing = null;
+    try {
+      viewing = describeActiveGraph(getGraphCtx().graph);
+    } catch {
+      // The current scope is unresolvable right now — omit `viewing` rather
+      // than fabricate one; the note below already discloses the uncertainty.
+      viewing = null;
+    }
     if (!receipt.bound) {
+      if (!receipt.landed) {
+        // The canvas WAS observed back at the parent, then moved elsewhere
+        // before the binding settled — the navigation happened, so this is a
+        // disclosure, never a "nothing was applied" refusal.
+        return {
+          ...(viewing ? { viewing } : {}),
+          settled: false,
+          note:
+            `The canvas DID return to the parent graph, but it has since navigated away before ` +
+            `the panel could confirm the binding — something else moved the view (a user ` +
+            `navigation or a tab restore). Re-read the current scope (panel_graph_outline) ` +
+            `before editing.`,
+        };
+      }
       return {
-        viewing,
+        ...(viewing ? { viewing } : {}),
         settled: false,
         note:
           `The canvas DID return to the parent graph (the navigation is in effect), but the ` +

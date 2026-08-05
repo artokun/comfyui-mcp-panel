@@ -122,7 +122,7 @@ test("#654: concurrent callers share one in-flight resolution", async () => {
 });
 
 test("#654: with no lock manager at all, resolve fails closed (and stays retryable)", async () => {
-  let clock = 0;
+  let clock = 1000;
   const identity = createRestartTabIdentity({
     storage: fakeStorage("candidate-a"),
     // `{}` — not undefined: undefined would fall back to the DEFAULT
@@ -137,6 +137,63 @@ test("#654: with no lock manager at all, resolve fails closed (and stays retryab
   assert.equal(await identity.resolve(), undefined, "no lock manager → no identity claim");
   clock += 5001;
   assert.equal(await identity.resolve(), undefined, "a retry still fails closed without locks");
+});
+
+test("#654: a lock manager whose request REJECTS degrades to the same retryable failure, not a cached rejection", async () => {
+  // codex gate: the rejected-promise path used to skip the failure bookkeeping
+  // entirely, leaving every later caller to re-throw the SAME cached rejection —
+  // the page-lifetime wedge wearing a different hat.
+  const locks = {
+    calls: 0,
+    request() {
+      this.calls += 1;
+      return Promise.reject(new Error("lock manager exploded"));
+    },
+  };
+  let clock = 1000;
+  const identity = createRestartTabIdentity({
+    storage: fakeStorage("candidate-a"),
+    locks,
+    randomUUID: () => "rotated",
+    now: () => clock,
+    retryBackoffMs: 5000,
+  });
+  assert.equal(await identity.resolve(), undefined, "a rejecting lock request fails closed");
+  assert.equal(locks.calls, 3, "the three bounded attempts ran");
+  // The rejection is NOT cached: inside the backoff the answer is a quiet
+  // undefined; past it, a fresh attempt runs (and can succeed once the manager
+  // recovers).
+  assert.equal(await identity.resolve(), undefined);
+  assert.equal(locks.calls, 3, "inside the backoff: no new attempt, no re-thrown rejection");
+  clock += 5001;
+  assert.equal(await identity.resolve(), undefined);
+  assert.equal(locks.calls, 6, "past the backoff: a genuine fresh attempt");
+});
+
+test("#654: a THROWING resolver step fails closed and stays retryable — the rejection is never cached", async () => {
+  // The IIFE rejects only when a step OUTSIDE acquire's own try/catch throws
+  // (randomUUID is the reachable one). Without the rejection→undefined degrade
+  // the first resolve re-throws here; without the slot clear, the third call
+  // returns the stale settled promise and no fresh lease attempt runs.
+  const locks = new ContendedLocks();
+  locks.blocked = true;
+  let clock = 1000;
+  const identity = createRestartTabIdentity({
+    storage: fakeStorage("candidate-a"),
+    locks,
+    randomUUID: () => {
+      throw new Error("no entropy");
+    },
+    now: () => clock,
+    retryBackoffMs: 5000,
+  });
+  assert.equal(await identity.resolve(), undefined, "a throwing randomUUID fails closed");
+  assert.equal(locks.calls, 1, "one refused lease attempt before the throw");
+  assert.equal(await identity.resolve(), undefined, "the failure is served quietly, not re-thrown");
+  assert.equal(locks.calls, 1, "no new attempt inside the backoff");
+  clock += 5001;
+  assert.equal(await identity.resolve(), undefined);
+  assert.equal(locks.calls, 2, "a FRESH attempt runs after the backoff — the slot was cleared");
 });
 
 // ---------------------------------------------------------------------------

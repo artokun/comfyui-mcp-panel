@@ -37,7 +37,30 @@ test("#619: landed + bound on the first poll resolves immediately", async () => 
     assertBound: () => {},
     sleep: instantSleep,
   });
-  assert.deepEqual(r, { landed: true, bound: true, lastError: null });
+  assert.deepEqual(r, { landed: true, everLanded: true, bound: true, lastError: null });
+});
+
+test("#619: a canvas observed landed then displaced is everLanded:true, landed:false — disclose, not refuse", async () => {
+  const target = { name: "sub" };
+  const elsewhere = { name: "other" };
+  let reads = 0;
+  const r = await confirmCanvasNavigation({
+    readCanvasGraph: () => {
+      reads += 1;
+      // Lands on the target once, then something else moves the canvas away.
+      return reads === 1 ? target : elsewhere;
+    },
+    target,
+    assertBound: () => {
+      throw new Error("[root-shape-mismatch] still settling");
+    },
+    tries: 4,
+    sleep: instantSleep,
+  });
+  assert.equal(r.landed, false, "the LAST observation is not the target");
+  assert.equal(r.everLanded, true, "but the navigation WAS observed — a refusal would be a lie");
+  assert.equal(r.bound, false);
+  assert.match(String(r.lastError?.message), /still settling/);
 });
 
 test("#619: a navigation that lands a few polls later is still confirmed", async () => {
@@ -279,6 +302,40 @@ test("#619: the shipping enter waits out a slow landing instead of racing it", a
   const reply = await enter({ node_id: 105 });
   assert.equal(reply.settled, true);
   assert.equal(reply.viewing.scope, "subgraph");
+});
+
+test("#619: the shipping enter DISCLOSES (never refuses) when the canvas landed then navigated away", async () => {
+  const rootGraph = { _nodes: [], name: "root" };
+  const sub = { _nodes: [], name: "sub", rootGraph };
+  const elsewhere = { _nodes: [], name: "elsewhere", rootGraph };
+  const node = { id: 105, type: "SubgraphNode", subgraph: sub };
+  let reads = 0;
+  const canvas = {
+    _g: rootGraph,
+    // The first post-navigation read sees the target; every later one sees the
+    // canvas somewhere else (a user navigation landed in between).
+    get graph() {
+      reads += 1;
+      return reads <= 2 ? this._g : elsewhere;
+    },
+    openSubgraph(s) {
+      this._g = s;
+    },
+    setDirty() {},
+  };
+  const app = { graph: rootGraph, canvas };
+  const enter = buildEnterSubgraph({
+    getGraphCtx: () => ({ app, graph: canvas.graph, rootGraph, canvas }),
+    resolveNode: () => node,
+    describeActiveGraph: (g) => ({ scope: g === rootGraph ? "root" : "subgraph" }),
+    assertGraphBoundToActiveWorkflow: () => {
+      throw new Error("[root-shape-mismatch] still settling");
+    },
+  });
+  const reply = await enter({ node_id: 105 });
+  assert.equal(reply.entered, 105, "the navigation happened — the reply must not claim otherwise");
+  assert.equal(reply.settled, false);
+  assert.match(reply.note, /navigated away/, "the displacement is disclosed, not a false refusal");
 });
 
 test("#619: the shipping exit carries the same receipt wiring", () => {
