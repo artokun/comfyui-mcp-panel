@@ -290,6 +290,12 @@ import {
   resolveGraphBindingVerdict,
   graphReadBindingChanged,
   resolveGraphRootUuidRebind,
+  graphRootCarriesOpenProof,
+  describeGraphStateDifference,
+  resolveOpenRebindVerdict,
+  describeOpenRebindOutcome,
+  OPEN_REBIND_STATUS,
+  OPEN_PROOF_FIELD,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
 import { createRunFetchInterceptor, dispatchScopedRun } from "./lib/run-scope-guard.js";
@@ -9927,6 +9933,17 @@ const GRAPH_TOOL_EXECUTORS = {
             // the resulting root. The UUID is panel-owned metadata, not caller input;
             // this is the same workflow identity used by the command fence.
             const targetUuid = workflowStableUuid(target, { embed: true });
+            // ...and a SINGLE-USE marker for THIS attempt. The uuid alone cannot
+            // separate "this load landed" from "the root already carried this
+            // workflow's tag" — a previous load of the same tab leaves it there, and
+            // the guard's own rebind heal (#545/#557/#565) can stamp it onto a root
+            // deliberately. `configure()` replaces `graph.extra` wholesale from the
+            // data it is handed, so a value minted here and written into THIS payload
+            // can only reach the live root by way of this load.
+            const openProofMarker =
+              typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+                ? crypto.randomUUID()
+                : `open-${Date.now()}-${Math.random().toString(36).slice(2)}`;
             const repaintState = JSON.parse(JSON.stringify(st));
             const repaintExtra =
               repaintState.extra && typeof repaintState.extra === "object" && !Array.isArray(repaintState.extra)
@@ -9943,24 +9960,86 @@ const GRAPH_TOOL_EXECUTORS = {
               [WORKFLOW_META_NAMESPACE]: {
                 ...repaintMeta,
                 [WORKFLOW_UUID_FIELD]: targetUuid,
+                [OPEN_PROOF_FIELD]: openProofMarker,
                 ...(target.path ? { [WORKFLOW_PATH_FIELD]: target.path } : {}),
               },
             };
-            await app.loadGraphData(repaintState, true, true, target);
-            // A successful promise alone is not a binding receipt: old/partial frontend
-            // implementations can resolve while leaving app.canvas on the previous root.
-            // Demand the positive, target-specific marker even for dirty workflows —
-            // read-only graph comparisons intentionally cannot prove that case.
-            const { rootGraph } = getGraphCtx();
-            if (
-              activeWorkflowRef() !== target ||
-              !graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid: targetUuid }) ||
-              !graphRootMatchesState({ rootGraph, state: repaintState })
-            ) {
-              rebindFailed = new Error(
-                "workflow_open could not prove that the active canvas was rebound to the requested workflow. " +
-                  "The open may have switched the active workflow; reload the panel before graph edits.",
-              );
+            // The load is INSIDE the try whose finally strips the marker: the payload
+            // carrying the marker is handed over the moment this call starts, so a
+            // REJECTION leaves it on a partially-mutated live graph. A cleanup that
+            // begins after the await never runs for exactly that case.
+            try {
+              await app.loadGraphData(repaintState, true, true, target);
+              // A successful promise alone is not a binding receipt: old/partial frontend
+              // implementations can resolve while leaving app.canvas on the previous root.
+              // Demand the positive, attempt-specific marker even for dirty workflows —
+              // read-only graph comparisons intentionally cannot prove that case.
+              //
+              // Each part is captured SEPARATELY and kept. They answer different
+              // questions, and OR-ing them into one boolean threw away the only thing
+              // that could say why an open failed — which is why #604/#603/#616 could
+              // report "could not prove rebound" on every call with no way to learn
+              // which check fired. Evidence first, verdict second.
+              const { rootGraph } = getGraphCtx();
+              const activeNow = activeWorkflowRef();
+              // Proxy-safe, like every other workflow-object comparison in this file:
+              // the store hands out Vue proxies while lookups can yield raw objects, so
+              // a bare `!==` can report a tab switch that never happened (#558 r2).
+              const instanceStillTarget = sameWorkflowObject(activeNow, target);
+              const markerMatches = graphRootCarriesOpenProof({ rootGraph, proofMarker: openProofMarker });
+              const identityMatches = graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid: targetUuid });
+              const contentMatches = graphRootMatchesState({ rootGraph, state: repaintState });
+              const verdict = resolveOpenRebindVerdict({
+                instanceStillTarget,
+                markerMatches,
+                identityMatches,
+                contentMatches,
+              });
+              if (verdict.status !== OPEN_REBIND_STATUS.PROVEN) {
+                // Only once something has already failed: this re-serializes the root,
+                // which is the expensive part of the whole proof. It feeds the MESSAGE
+                // only — it decides nothing.
+                const contentDiff = contentMatches
+                  ? { comparable: true, surfaces: [] }
+                  : describeGraphStateDifference({ rootGraph, state: repaintState });
+                rebindFailed = new Error(
+                  describeOpenRebindOutcome(verdict, {
+                    targetLabel: target.filename || target.path || "the requested workflow",
+                    activeLabel: activeNow ? activeNow.filename || activeNow.path || "another tab" : "no active tab",
+                    expectedMarker: openProofMarker,
+                    observedMarker: rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[OPEN_PROOF_FIELD] ?? null,
+                    expectedUuid: targetUuid,
+                    observedUuid: rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD] ?? null,
+                    contentComparable: contentDiff.comparable,
+                    contentSurfaces: contentDiff.surfaces,
+                  }),
+                );
+              }
+            } finally {
+              // Strip the marker so it does not ride the user's next save. In a FINALLY,
+              // because the observations above can throw — `getGraphCtx()` refuses a
+              // canvas/root divergence by design — and a cleanup that only runs when the
+              // proof succeeded leaves the marker behind on exactly the failure paths.
+              // It runs AFTER the verdict, so it never destroys evidence before it is read.
+              //
+              // Resolved from the live app rather than the (possibly unreachable) `rootGraph`
+              // local, and it deletes ONLY a value equal to the marker THIS attempt minted:
+              // an unconditional delete could remove a concurrent open's live evidence.
+              try {
+                // `canvasView` (not `app.canvas`) for the #268 contract scanner's sake: it
+                // captures members off the workflow-service alias `s` with an unanchored
+                // `s\.` pattern, so `canvas.graph` reads to it as a new workflow-SERVICE
+                // dependency. This is a LiteGraph canvas, not the workflow service.
+                for (const graph of [app?.rootGraph, app?.graph, canvasView?.graph]) {
+                  const meta = graph?.extra?.[WORKFLOW_META_NAMESPACE];
+                  if (meta && typeof meta === "object" && meta[OPEN_PROOF_FIELD] === openProofMarker) {
+                    delete meta[OPEN_PROOF_FIELD];
+                  }
+                }
+              } catch {
+                /* cosmetic only — a leftover marker cannot make a later proof pass, because
+                   every attempt mints a fresh one and requires an exact match */
+              }
             }
           }
         } catch (err) {
@@ -9973,6 +10052,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // the target-specific repaint proof above succeeds. In particular, capturing a
         // still-stale root as a clean baseline after a failed repaint would corrupt the
         // target's in-memory state and make a later save/fence believe it was trustworthy.
+        //
         if (!rebindFailed) {
         // Opening alone must not dirty the tab (a spurious post-load change-tracker
         // diff otherwise flips it to modified:true and blocks an unforced close).

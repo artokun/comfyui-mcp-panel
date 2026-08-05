@@ -237,7 +237,14 @@ export function graphRootProvenEmpty(rootGraph) {
   }
 }
 
-function graphShape(state) {
+/**
+ * The ONE normalization. `graphShape` (whole-graph equality) and
+ * `graphShapeSurfaces` (which surface disagreed) are both derived from this, so
+ * the answer to "do these match?" and the answer to "what differs?" can never
+ * drift apart — a second, subtly-different comparator is how this family of bugs
+ * keeps recurring.
+ */
+function buildGraphShape(state) {
   if (!state || !Array.isArray(state.nodes)) return null;
   // Omit counters/version metadata that can legitimately differ after LiteGraph
   // rebuilds; retain every serialized graph surface ChangeTracker treats as
@@ -302,21 +309,66 @@ function graphShape(state) {
     // changing the workflow, so it must not block a valid graph command.
     extra,
   };
+  return shape;
+}
+
+const canonicalizeShapeValue = (value) => {
+  if (Array.isArray(value)) return value.map(canonicalizeShapeValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, canonicalizeShapeValue(value[key])]),
+    );
+  }
+  return value;
+};
+
+function graphShape(state) {
+  const shape = buildGraphShape(state);
+  if (shape == null) return null;
   try {
-    const canonicalize = (value) => {
-      if (Array.isArray(value)) return value.map(canonicalize);
-      if (value && typeof value === "object") {
-        return Object.fromEntries(
-          Object.keys(value)
-            .sort()
-            .map((key) => [key, canonicalize(value[key])]),
-        );
-      }
-      return value;
-    };
-    return JSON.stringify(canonicalize(shape));
+    return JSON.stringify(canonicalizeShapeValue(shape));
   } catch {
     return null;
+  }
+}
+
+/**
+ * WHICH surfaces of a just-loaded state the live root does not reproduce.
+ *
+ * This exists for the DISCLOSURE only — it names what disagreed so the answer is
+ * actionable ("nodes differ" and "groups differ" send a reader to different
+ * places). It deliberately decides NOTHING: see the note on
+ * `resolveOpenRebindVerdict` for why no classification of a content mismatch is
+ * currently trustworthy enough to soften a verdict.
+ *
+ * "The panel could not compare" and "the panel compared and they differ" are
+ * different answers, and collapsing the first into the second is the defect this
+ * whole cluster is about. `comparable:false` means exactly that no comparison
+ * happened — it is never evidence of a mismatch.
+ */
+export function describeGraphStateDifference({ rootGraph, state } = {}) {
+  const NOT_COMPARABLE = { comparable: false, surfaces: [] };
+  try {
+    const expectedShape = buildGraphShape(state);
+    let actualShape = null;
+    try {
+      actualShape = buildGraphShape(rootGraph?.serialize?.());
+    } catch {
+      actualShape = null;
+    }
+    if (!expectedShape || !actualShape) return NOT_COMPARABLE;
+    const canon = (shape) => {
+      const out = {};
+      for (const key of Object.keys(shape)) out[key] = JSON.stringify(canonicalizeShapeValue(shape[key]));
+      return out;
+    };
+    const expected = canon(expectedShape);
+    const actual = canon(actualShape);
+    return { comparable: true, surfaces: Object.keys(expected).filter((key) => expected[key] !== actual[key]) };
+  } catch {
+    return NOT_COMPARABLE;
   }
 }
 
@@ -429,6 +481,202 @@ export function graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid } =
   if (typeof activeWorkflowUuid !== "string" || !activeWorkflowUuid) return false;
   const rootUuid = rootGraph?.extra?.comfyui_mcp?.workflow_uuid;
   return typeof rootUuid === "string" && rootUuid === activeWorkflowUuid;
+}
+
+/** The panel's own namespace inside a serialized graph's `extra`. Not workflow
+ *  content — `buildGraphShape` strips it from every content comparison. */
+export const PANEL_GRAPH_META_KEY = "comfyui_mcp";
+/** Where workflow_open records the single-use marker for THIS repaint attempt. */
+export const OPEN_PROOF_FIELD = "open_proof";
+
+/**
+ * ATTEMPT-scoped proof that the live root was configured from the exact payload
+ * this call just handed `loadGraphData` (#604/#603/#616 residue).
+ *
+ * `graphRootWorkflowUuidMatches` proves the root carries a WORKFLOW's durable
+ * identity. That is weaker than it looks for a post-load receipt: the tag is
+ * panel-owned bookkeeping that a rebind HEAL (#545/#557/#565) can legitimately
+ * stamp onto a root, and a previous load of the same workflow leaves it there
+ * too — so "the root carries A's uuid" does not establish that THIS load landed.
+ * A single-use marker minted per attempt and written into the payload's own
+ * `extra` does: ComfyUI's `configure()` replaces `graph.extra` wholesale from the
+ * data it is given, so nothing but that payload can put this value on the root.
+ *
+ * Absent or non-matching is NOT proof of a wrong canvas — it is absence of
+ * proof. The caller must disclose it as such and must never widen it into a
+ * claim about which workflow the canvas holds.
+ */
+export function graphRootCarriesOpenProof({ rootGraph, proofMarker } = {}) {
+  if (typeof proofMarker !== "string" || !proofMarker) return false;
+  const seen = rootGraph?.extra?.[PANEL_GRAPH_META_KEY]?.[OPEN_PROOF_FIELD];
+  return typeof seen === "string" && seen === proofMarker;
+}
+
+export const OPEN_REBIND_STATUS = Object.freeze({
+  /** The canvas is provably the requested workflow AND holds what was loaded. */
+  PROVEN: "proven",
+  /** The BINDING is proven — the canvas is this workflow's canvas — but the graph
+   *  on it could not be confirmed to be what was loaded. Still not a success:
+   *  `workflow_open` answers `unknown` for this exactly as it does for a wholly
+   *  unproven rebind. It is a distinct STATUS so the disclosure can say which half
+   *  is settled, which is the difference between an actionable answer and a bare
+   *  "the fence rejected". */
+  CONTENT_UNVERIFIED: "content-unverified",
+  /** Nothing here says the canvas is wrong — only that this call cannot show it is
+   *  right. */
+  UNPROVEN: "unproven",
+});
+
+/**
+ * workflow_open's post-repaint verdict, as a NAMED answer per part rather than one
+ * boolean.
+ *
+ * The parts answer different questions and no one of them answers another's (#621
+ * established the shape; this names them so a failure can say which one fired):
+ *
+ *   instance — the active workflow is still the tab we were asked to open. A tab
+ *              switch during the load makes every other part describe a DIFFERENT
+ *              canvas, so nothing else is meaningful without it.
+ *   marker   — the live root was configured from THIS attempt's payload. Strictly
+ *              stronger than the workflow uuid it supplements: the uuid can already
+ *              be on the root from a previous load of the same tab or from the
+ *              guard's own rebind heal (#545/#557/#565), so it cannot establish
+ *              that this load landed. A single-use marker can.
+ *   identity — the root carries the workflow uuid the command fence will compare,
+ *              i.e. the desync fence is actually healed by this open.
+ *   content  — the graph on the canvas reproduces the payload exactly.
+ *
+ * WHY `content` STILL BLOCKS SUCCESS, even though it is a FIDELITY question and the
+ * binding is separately proven. `loadGraphData` transforms the payload it is given
+ * before the root serializes again — it grows every node to at least
+ * `computeSize()`, normalizes combo and `control_after_generate` widget values, may
+ * substitute a schema-validated copy, and runs every installed extension's
+ * `loadedGraphNode` hook on every node — so a perfectly rebound canvas can differ
+ * from the bytes handed in. It is therefore genuinely a false negative to deny the
+ * OPEN for it, and softening it was tried here.
+ *
+ * It was reverted, because the two cases cannot currently be told apart. LiteGraph
+ * creates every node (with its id and type) and THEN configures each one, and
+ * `loadGraphData` catches a `configure()` failure and returns. A throw in that
+ * second pass leaves the complete node id/type set, the links, and the panel's
+ * marker — written by `_configureBase` before any node is built — over nodes that
+ * silently LOST their widget values and properties. That is byte-for-byte the same
+ * observation as "the loader normalized the widget values", and no discriminator
+ * available to the panel separates them. Reporting it as a completed open would
+ * fabricate a success over data loss, which is worse than the false negative.
+ *
+ * So `unknown` stays `unknown` here — deliberately, and it is the honest answer to a
+ * question this code cannot settle. What the status split buys is that the
+ * DISCLOSURE can now say the binding IS proven and only the content is unconfirmed,
+ * instead of implying the canvas may be the wrong workflow.
+ *
+ * Every part is compared against `true` explicitly: an unreadable observation
+ * arrives as null/undefined and must count as NOT proven, never as proven.
+ */
+export function resolveOpenRebindVerdict({
+  instanceStillTarget,
+  markerMatches,
+  identityMatches,
+  contentMatches,
+} = {}) {
+  const unproven = [];
+  if (instanceStillTarget !== true) unproven.push("instance");
+  if (markerMatches !== true) unproven.push("marker");
+  if (identityMatches !== true) unproven.push("identity");
+  if (unproven.length) {
+    return { status: OPEN_REBIND_STATUS.UNPROVEN, bindingProven: false, unproven };
+  }
+  if (contentMatches !== true) {
+    // Binding proven, content not. NOT a success — see above — but the disclosure
+    // gets to say which half is settled.
+    return { status: OPEN_REBIND_STATUS.CONTENT_UNVERIFIED, bindingProven: true, unproven: ["content"] };
+  }
+  return { status: OPEN_REBIND_STATUS.PROVEN, bindingProven: true, unproven: [] };
+}
+
+/** One clause per failed part, naming the TWO VALUES that disagreed. A refusal
+ *  that says only "the fence rejected" is not actionable; one that says which
+ *  observation failed and what was seen instead is. */
+function openRebindPartClause(part, observed = {}) {
+  switch (part) {
+    case "instance":
+      // "could not confirm", NOT "changed". The observation is `!== true`, which an
+      // UNREADABLE active-workflow pointer produces just as a genuine tab switch does.
+      // Asserting the switch would state a cause for a reading that was never taken.
+      return (
+        `the panel could not confirm the active workflow is still ${observed.targetLabel ?? "the requested tab"} ` +
+        `(it now reads ${observed.activeLabel ?? "something else"}), so nothing else observed here is known ` +
+        `to describe the tab you asked for`
+      );
+    case "marker":
+      return (
+        `the live canvas does not carry this open's one-time marker ` +
+        `(expected ${observed.expectedMarker ?? "a marker"}, found ${observed.observedMarker ?? "none"}), ` +
+        `so the panel cannot show that the graph it loaded is the one now on screen`
+      );
+    case "identity":
+      return (
+        `the live canvas does not carry this workflow's identity ` +
+        `(expected ${observed.expectedUuid ?? "its uuid"}, found ${observed.observedUuid ?? "none"}), ` +
+        `so the graph-command fence would still treat it as a different canvas`
+      );
+    case "content":
+      return observed.contentComparable === false
+        ? `the panel could not compare the loaded graph with the canvas at all, so it is UNKNOWN — ` +
+            `not established — whether the whole graph landed`
+        : `the graph on the canvas differs from what was loaded on: ` +
+            `${(observed.contentSurfaces ?? []).join(", ") || "an unnamed surface"}`;
+    default:
+      return `an unrecognized check (${part}) did not pass`;
+  }
+}
+
+/**
+ * What workflow_open tells the caller about its own repaint.
+ *
+ * DISCLOSURE, never refusal: by the time this runs the destructive load has
+ * ALREADY executed. Wording that invites a clean retry ("nothing happened")
+ * would be false, and wording that asserts a cause the panel did not observe
+ * ("the open may have switched the active workflow") narrates a bucket as if it
+ * were the diagnosis. Each clause states only what was actually observed.
+ */
+export function describeOpenRebindOutcome(verdict, observed = {}) {
+  const workflow = observed.targetLabel ?? "the requested workflow";
+  const clauses = (verdict?.unproven ?? []).map((part) => openRebindPartClause(part, observed));
+  const because = clauses.length ? ` Specifically: ${clauses.join("; ")}.` : "";
+  // Every sentence below states an OBSERVATION, never the event that produced it. The
+  // instance check reads "is the active workflow this target now" — it does not watch a
+  // switch happen, and the target may already have been active — so "the tab switched"
+  // would narrate an event nobody saw. Its failure is likewise `!== true`, which an
+  // unreadable pointer produces just as a real switch does, so that direction can only
+  // say the panel could not confirm which workflow is active.
+  const activeIsTarget = !(verdict?.unproven ?? []).includes("instance");
+  if (verdict?.status === OPEN_REBIND_STATUS.CONTENT_UNVERIFIED) {
+    // The precise answer, and precisely as far as it goes: the canvas IS this
+    // workflow's, and what is unknown is narrower than "which workflow is this".
+    // The open still reports `unknown`, because the panel cannot tell the frontend
+    // NORMALIZING the graph apart from the load only partly applying it.
+    return (
+      `workflow_open RAN and the canvas IS bound to ${workflow} — that much was proven — but the graph ` +
+      `on it does not match the state that was loaded, and the panel cannot tell whether the ComfyUI ` +
+      `frontend merely normalized it (node sizes, widget values) or the load only partly applied. Treat ` +
+      `the canvas as UNKNOWN and re-read it (panel_graph_outline) before editing.${because} You are NOT ` +
+      `on the wrong workflow: ${workflow} IS the active one.`
+    );
+  }
+  if (verdict?.status === OPEN_REBIND_STATUS.UNPROVEN) {
+    return (
+      `workflow_open RAN but could not prove that the active canvas was rebound to ${workflow}, so ` +
+      `treat the canvas as unknown rather than unchanged. ` +
+      (activeIsTarget
+        ? `${workflow} IS the active workflow — what could not be established is the state of the ` +
+          `canvas under it.`
+        : `The panel could not confirm which workflow is active, so the open may have left a ` +
+          `different one active.`) +
+      `${because} Check panel_list_workflows, then reload the panel before graph edits.`
+    );
+  }
+  return "";
 }
 
 /**
