@@ -12575,8 +12575,19 @@ const GRAPH_TOOL_EXECUTORS = {
       // than fabricate one; the note below already discloses the uncertainty.
       viewing = null;
     }
+    // The reply must describe the canvas as it is NOW, not as the receipt left
+    // it: this post-receipt read is a fresh terminal observation (codex gate
+    // r8). A canvas no longer on the target gets the displacement disclosure,
+    // never settled:true / "in effect" for a scope it has already left.
+    const stillOnTarget = (() => {
+      try {
+        return comfyApp?.canvas?.graph === sub;
+      } catch {
+        return false;
+      }
+    })();
     if (!receipt.bound) {
-      if (!receipt.landed) {
+      if (!receipt.landed || !stillOnTarget) {
         // The canvas WAS observed inside the subgraph, then moved elsewhere
         // before the binding settled — the navigation happened, so this is a
         // disclosure, never a "nothing was applied" refusal.
@@ -12601,6 +12612,18 @@ const GRAPH_TOOL_EXECUTORS = {
             receipt.lastError?.message ?? receipt.lastError ?? "unknown",
           )}). A graph read issued this instant may still refuse while the tracker catches up — ` +
           `retry the read in a moment.`,
+      };
+    }
+    if (!stillOnTarget) {
+      return {
+        entered: node.id,
+        ...(viewing ? { viewing } : {}),
+        settled: false,
+        note:
+          `The canvas DID enter the subgraph and the binding check passed, but the view has ` +
+          `already moved elsewhere (a user navigation, a tab restore, or the panel's own canvas ` +
+          `reconcile). Re-read the current scope (panel_graph_outline) before editing, and ` +
+          `re-enter the subgraph if that is still where you mean to work.`,
       };
     }
     return { entered: node.id, viewing, settled: true };
@@ -12656,8 +12679,18 @@ const GRAPH_TOOL_EXECUTORS = {
       // than fabricate one; the note below already discloses the uncertainty.
       viewing = null;
     }
+    // Same fresh terminal observation as graph_enter_subgraph (codex gate r8):
+    // a canvas no longer on the parent gets the displacement disclosure, never
+    // settled:true / "in effect" for a scope it has already left.
+    const stillOnTarget = (() => {
+      try {
+        return comfyApp?.canvas?.graph === parentGraph;
+      } catch {
+        return false;
+      }
+    })();
     if (!receipt.bound) {
-      if (!receipt.landed) {
+      if (!receipt.landed || !stillOnTarget) {
         // The canvas WAS observed back at the parent, then moved elsewhere
         // before the binding settled — the navigation happened, so this is a
         // disclosure, never a "nothing was applied" refusal.
@@ -12680,6 +12713,16 @@ const GRAPH_TOOL_EXECUTORS = {
             receipt.lastError?.message ?? receipt.lastError ?? "unknown",
           )}). A graph read issued this instant may still refuse while the tracker catches up — ` +
           `retry the read in a moment.`,
+      };
+    }
+    if (!stillOnTarget) {
+      return {
+        ...(viewing ? { viewing } : {}),
+        settled: false,
+        note:
+          `The canvas DID return to the parent graph and the binding check passed, but the view ` +
+          `has already moved elsewhere (a user navigation, a tab restore, or the panel's own ` +
+          `canvas reconcile). Re-read the current scope (panel_graph_outline) before editing.`,
       };
     }
     return { viewing, settled: true };

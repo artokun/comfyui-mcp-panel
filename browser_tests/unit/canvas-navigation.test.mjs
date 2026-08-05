@@ -384,6 +384,38 @@ test("#619: the shipping enter DISCLOSES (never refuses) when the canvas landed 
   assert.match(reply.note, /navigated away/, "the displacement is disclosed, not a false refusal");
 });
 
+test("#619: the shipping enter does not claim settled when the canvas moved after the receipt (codex r8)", async () => {
+  const rootGraph = { _nodes: [], name: "root" };
+  const sub = { _nodes: [], name: "sub", rootGraph };
+  const elsewhere = { _nodes: [], name: "elsewhere", rootGraph };
+  const node = { id: 105, type: "SubgraphNode", subgraph: sub };
+  let reads = 0;
+  const canvas = {
+    _g: rootGraph,
+    // Reads: 1 = enter's own getGraphCtx, 2 = the receipt's landing read,
+    // 3 = the receipt assert's getGraphCtx, 4 = the post-probe survival
+    // re-read, 5+ = the reply's fresh observation (viewing + stillOnTarget).
+    get graph() {
+      reads += 1;
+      return reads <= 4 ? this._g : elsewhere;
+    },
+    openSubgraph(s) {
+      this._g = s;
+    },
+    setDirty() {},
+  };
+  const app = { graph: rootGraph, canvas };
+  const enter = buildEnterSubgraph({
+    getGraphCtx: () => ({ app, graph: canvas.graph, rootGraph, canvas }),
+    resolveNode: () => node,
+    describeActiveGraph: (g) => ({ scope: g === rootGraph ? "root" : "subgraph" }),
+    assertGraphBoundToActiveWorkflow: () => {},
+  });
+  const reply = await enter({ node_id: 105 });
+  assert.equal(reply.settled, false, "no settled receipt for a scope the canvas has already left");
+  assert.match(reply.note, /binding check passed, but the view has already moved elsewhere/);
+});
+
 test("#619: the shipping exit carries the same receipt wiring", () => {
   // Source-level pin: exit must run the same confirmCanvasNavigation receipt
   // (delete it and this fails) and must keep the immediate-parent resolution.
