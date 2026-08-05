@@ -204,13 +204,21 @@ test("Deploy sends runpod action:create only after the second, confirming click"
   // The arming cool-down ignores a confirm that lands too soon; wait it out.
   await new Promise((r) => setTimeout(r, 700));
   const produced = await gesture(calls, () => el.deployBtn.click());
-  // The deploy re-lists to show the new pod, so the create must be first and the
-  // only lifecycle action in the slice.
+  // Deploy legitimately re-lists afterwards to show the new pod, so this cannot
+  // use onlyCall(). It is still pinned exactly: the create must come first, must
+  // happen EXACTLY ONCE (two creates = two pods = double billing, which an
+  // allowed-set check alone would wave through), and every remaining call in the
+  // slice must be the follow-up list and nothing else.
   assert.equal(produced[0].tool, "runpod");
   assert.deepEqual(produced[0].args, { action: "create" });
   assert.equal(produced[0].opts?.timeout, 120000, "deploy keeps its long timeout");
+  assert.equal(
+    produced.filter((c) => c.args.action === "create").length,
+    1,
+    "a confirmed deploy must create exactly one pod",
+  );
   assert.deepEqual(
-    produced.filter((c) => c.args.action !== "create" && c.args.action !== "list"),
+    produced.slice(1).filter((c) => c.tool !== "runpod" || c.args.action !== "list"),
     [],
     "confirming a deploy must not also start/stop/connect anything",
   );
