@@ -100,6 +100,15 @@ export function createRestartTabIdentity({
 export async function sendBridgeHello({ socket, isCurrent, resolveTabIdentity, makePayload }) {
   const tabSessionId = await resolveTabIdentity();
   if (!isCurrent()) return false;
-  socket.send(JSON.stringify(makePayload(tabSessionId)));
+  // #640 — makePayload REFUSES (returns null) when this browser tab's bridge
+  // route could not be established. A hello is what REGISTERS the route, and
+  // registering one this tab cannot claim exclusively is the whole defect: the
+  // bridge keeps one connection per tab id, so the second hello takes the route
+  // over and the agent's commands land on the other tab's canvas. Refuse before
+  // dispatch rather than disclose after it. Returning false also keeps the
+  // caller from advancing the agent-session epoch for a hello that never left.
+  const payload = makePayload(tabSessionId);
+  if (!payload) return false;
+  socket.send(JSON.stringify(payload));
   return true;
 }
