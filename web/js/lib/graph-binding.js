@@ -77,6 +77,66 @@ export function graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph = 
 }
 
 /**
+ * The active workflow's OWN current-state node count, or `null` when that state
+ * is absent/malformed. Unlike activeWorkflowNodeCount this NEVER falls back to
+ * the load/save baseline (`initialState`): a baseline legitimately differs from
+ * an edited canvas, so it is not evidence the live canvas is behind. `null`
+ * lets callers fail OPEN — an unreadable current state proves nothing.
+ */
+export function activeWorkflowCurrentNodeCount(activeWorkflow) {
+  const state = activeWorkflowCurrentState(activeWorkflow);
+  return state ? state.nodes.length : null;
+}
+
+/**
+ * #618 — the MID-POPULATION read. After a ComfyUI backend reconnect the frontend
+ * RESTORES the active tab's graph incrementally, and for a window the live root
+ * canvas observably holds FEWER nodes than the active workflow's own current
+ * serialized state (the restore source). Every pre-existing predicate is blind
+ * to exactly this signature on a DIRTY tab — and the reported tabs are dirty
+ * (the unsaved edits are what the restore re-applies): the shape guard treats a
+ * dirty tracker's state as inconclusive (#545: it can lag manual edits), the
+ * baseline desync guard requires a trustworthy (clean) current state, and the
+ * empty-read guard needs ZERO nodes, not a partial count. So an 8-of-31-node
+ * restoring canvas was returned as an AUTHORITATIVE 8-node outline — and the
+ * agent that trusted it duplicated a node it could not see and ran a
+ * whole-graph layout against an under-reported graph (#618's follow-up; the
+ * first report lost a single LoadImage the same way).
+ *
+ * This predicate is the evidence bar for that window, fired only when ALL of:
+ *   - `postReconnectWindow`: the caller's monotonic/epoch machinery says a
+ *     reconnect just happened and no explicit open/new has re-proven the tab
+ *     since (outside the window the #545 dirty-tab availability is untouched);
+ *   - ROOT scope (a descended subgraph is exempt, mirroring graphReadDesynced);
+ *   - the workflow's CURRENT state is a well-formed read reporting N > 0 nodes
+ *     (an absent/malformed read proves nothing — fail open);
+ *   - the live root reads strictly FEWER nodes than N.
+ *
+ * The one signature it cannot distinguish is a manual node DELETION on a dirty
+ * tab whose tracker has not captured yet, inside the same window. That refusal
+ * is safe and self-clearing: the tracker's event-driven capture closes the gap
+ * and the retry the message names succeeds — whereas a mid-population canvas
+ * returned as authoritative is the fabricated-success outcome this repo treats
+ * as the worst case. Reads and mutations alike are fenced: a mutation on a
+ * canvas that is still being restored is #604's wrong-canvas family wearing a
+ * milder hat.
+ */
+export function graphRootMidPopulation({
+  liveNodeCount,
+  activeWorkflow,
+  inSubgraph = false,
+  postReconnectWindow = false,
+} = {}) {
+  if (!postReconnectWindow) return false;
+  if (inSubgraph) return false;
+  const live = Number(liveNodeCount);
+  if (!Number.isFinite(live) || live < 0) return false;
+  const expected = activeWorkflowCurrentNodeCount(activeWorkflow);
+  if (expected == null || expected <= 0) return false;
+  return live < expected;
+}
+
+/**
  * #560 (2nd reopen) — the FALSE-EMPTY authoritative read. After a reconnect +
  * workflow-tab switch (or a failed workflow_open repaint), the shared
  * app.graph object is observable MID-POPULATION: `_nodes` empty, no root tag,
@@ -542,11 +602,11 @@ export function graphCommandBindingBar(command) {
  * above is unit-testable without a browser (it previously lived inline in the
  * panel monolith, where nothing could observe it).
  *
- * Returns `{ reason, expected }`; `reason` names the firing predicate so a
+ * Returns `{ reason, expected, live }`; `reason` names the firing predicate so a
  * misfiring guard is diagnosable instead of driving a blind reload/retry loop
- * (#565). Order is significant: the first four verdicts are POSITIVE mismatches
- * and stay more specific than the inconclusive-empty verdict, which is evaluated
- * LAST so it can never mask them.
+ * (#565). Order is significant: the positive-mismatch verdicts (identity first,
+ * then the #618 mid-population window, then shape) stay more specific than the
+ * inconclusive-empty verdict, which is evaluated LAST so it can never mask them.
  */
 export function resolveGraphBindingVerdict({
   graph,
@@ -558,6 +618,7 @@ export function resolveGraphBindingVerdict({
   rootUuidMismatch = false,
   includeBaselineReadGuard = true,
   requireDirtyMutationBinding = false,
+  postReconnectWindow = false,
 } = {}) {
   const nodeCount = Number.isFinite(Number(liveNodeCount))
     ? Number(liveNodeCount)
@@ -570,21 +631,49 @@ export function resolveGraphBindingVerdict({
     requireDirtyMutationBinding &&
     activeWorkflow?.isModified === true &&
     !graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid });
+  // #618 — inside the post-reconnect window a live root reading BEHIND the
+  // active workflow's own current state is mid-restore evidence, and it is the
+  // ONLY mismatch a dirty tab can surface (the shape guard below is deliberately
+  // inconclusive while dirty). Ordered ahead of rootShapeMismatch: in the window
+  // a count-short canvas is far more often a still-restoring tab than a wrong
+  // one, and this verdict's remedy (settle, then re-open if it persists)
+  // resolves both — while a genuine wrong canvas still refuses, just with the
+  // cheaper remedy first. Gated on includeBaselineReadGuard so reads keep their
+  // lower bar at dispatch and re-assert here in their executors, exactly like
+  // the baseline desync guard.
+  const midPopulation =
+    includeBaselineReadGuard &&
+    graphRootMidPopulation({
+      liveNodeCount: nodeCount,
+      activeWorkflow,
+      inSubgraph,
+      postReconnectWindow,
+    });
   const rootShapeMismatch = graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow });
   const currentStateTrustworthy = activeWorkflow?.isModified !== true;
   const baselineReadDesync =
     currentStateTrustworthy &&
     includeBaselineReadGuard &&
     graphReadDesynced({ liveNodeCount: nodeCount, activeWorkflow, inSubgraph });
-  if (rootUuidMismatch || dirtyMutationBindingUnproven || rootShapeMismatch || baselineReadDesync) {
+  if (rootUuidMismatch || dirtyMutationBindingUnproven || midPopulation || rootShapeMismatch || baselineReadDesync) {
     const reason = rootUuidMismatch
       ? "root-workflow-uuid-mismatch"
       : dirtyMutationBindingUnproven
         ? "dirty-mutation-binding-unproven"
-        : rootShapeMismatch
-          ? "root-shape-mismatch"
-          : "root-node-count-desync";
-    return { reason, expected: activeWorkflowNodeCount(activeWorkflow) };
+        : midPopulation
+          ? "root-mid-population"
+          : rootShapeMismatch
+            ? "root-shape-mismatch"
+            : "root-node-count-desync";
+    return {
+      reason,
+      // The mid-population count must come from the CURRENT state alone — the
+      // load baseline is not evidence the canvas is behind (#618).
+      expected: midPopulation
+        ? activeWorkflowCurrentNodeCount(activeWorkflow)
+        : activeWorkflowNodeCount(activeWorkflow),
+      live: nodeCount,
+    };
   }
   if (graphEmptyBindingUnproven({ graph, rootGraph, activeWorkflow, activeWorkflowUuid })) {
     return { reason: "empty-binding-unproven", expected: activeWorkflowNodeCount(activeWorkflow) };
@@ -600,9 +689,24 @@ export function resolveGraphBindingVerdict({
  * TRUE because every caller asserts BEFORE doing any work — a caller that has
  * already mutated something must disclose, not refuse (a refusal for work that
  * landed invites a destructive retry, which is #603's duplicate-node cascade).
+ * (#618 later added a third, mid-population, verdict on the same terms.)
  */
 export function graphBindingRefusalMessage(verdict) {
   if (!verdict) return null;
+  if (verdict.reason === "root-mid-population") {
+    // #618 — disclose the uncertainty, don't narrate the bucket as a cause: a
+    // count-short canvas in the reconnect window is USUALLY a tab still
+    // restoring, but it can also be a genuine wrong canvas, so the message
+    // names the settle-and-recheck path that resolves both.
+    return (
+      `[root-mid-population] The live root canvas shows ${verdict.live} node(s), but the active workflow's ` +
+      `own current state reports ${verdict.expected} node(s). ComfyUI reconnected moments ago, so the canvas ` +
+      `may still be restoring the tab — a partial canvas read as complete is how duplicate nodes and ` +
+      `wrong-graph edits happen — so this command was NOT applied as authoritative. Retry in a moment once ` +
+      `the tab finishes settling; if the count never catches up, re-open the active workflow tab ` +
+      `(panel_open_workflow) or reload the panel to rebind the graph, then retry.`
+    );
+  }
   if (verdict.reason === "empty-binding-unproven") {
     return (
       `[empty-binding-unproven] The live root canvas reads EMPTY, but the active workflow's own ` +

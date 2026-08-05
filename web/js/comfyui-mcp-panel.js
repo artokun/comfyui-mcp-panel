@@ -4419,6 +4419,21 @@ function workflowOwnsRootUuidTag(w, rootUuid) {
   return false;
 }
 
+// #618 — is the panel inside the post-reconnect settling window RIGHT NOW?
+// Reuses the #433 epoch/monotonic machinery verbatim: the window opens on every
+// ComfyUI "reconnected" and closes when an explicit open/new re-proves the tab
+// (or the monotonic window expires). The binding verdict uses it to read a live
+// root that is BEHIND the active workflow's own current state as a tab still
+// restoring — not as an authoritative graph (the mid-population fence).
+function postReconnectSettleWindow() {
+  return activeWorkflowPossiblyStale({
+    reconnectEpoch: backendReconnectEpoch,
+    resyncEpoch: activeWorkflowResyncEpoch,
+    reconnectedAt: backendReconnectedAt,
+    now: monotonicNow(),
+  });
+}
+
 function assertGraphBoundToActiveWorkflow(
   graph,
   rootGraph,
@@ -4511,6 +4526,7 @@ function assertGraphBoundToActiveWorkflow(
     rootUuidMismatch,
     includeBaselineReadGuard,
     requireDirtyMutationBinding,
+    postReconnectWindow: postReconnectSettleWindow(),
   });
   if (verdict) throw new Error(graphBindingRefusalMessage(verdict));
 }
