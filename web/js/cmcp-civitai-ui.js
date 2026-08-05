@@ -285,6 +285,20 @@ export function serializeCivitaiResults(source, { model = false, limit = 20, loa
   return { items, total: rows.length, loading: !!loading };
 }
 
+/** Build the `state.error` object reported by panel_civitai_results (#190).
+ *  The client throws Errors carrying an HTTP `status` for upstream CivitAI
+ *  failures; a browser→proxy transport failure (#599) carries `kind:"transport"`
+ *  and status null (no HTTP response came back); a true empty result sets NO
+ *  error at all. Pure and exported for unit tests. */
+export function civitaiErrorState(e) {
+  const status = e && typeof e.status === "number" ? e.status : null;
+  return {
+    status,
+    message: coerceMessageText(e?.message ?? e),
+    ...(typeof e?.kind === "string" ? { kind: e.kind } : {}),
+  };
+}
+
 /** Content-provider factory for the CivitAI browser tab of the unified side
  *  panel. Builds the grid/lightbox/filter body + the agent-drive surface; the
  *  shell (cmcp-sidepanel-ui.js) owns the overlay, header, tab bar, single search
@@ -686,11 +700,10 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       if (req === state.reqId) {
         sentinel.textContent = "CivitAI error: " + (e.message || e);
         // Record the failure so the agent-facing panel_civitai_results can report
-        // a distinct error state instead of an indistinguishable total:0 (#190).
-        // The client throws Errors carrying an HTTP `status` (see CivitaiClient);
-        // fall back to the message alone when it doesn't.
-        const status = e && typeof e.status === "number" ? e.status : null;
-        state.error = { status, message: coerceMessageText(e?.message ?? e) };
+        // a distinct error state instead of an indistinguishable total:0 (#190);
+        // kind:"transport" marks a browser→proxy failure — no HTTP response
+        // came back (#599, see civitaiErrorState).
+        state.error = civitaiErrorState(e);
       }
     } finally {
       if (req === state.reqId) setLoading(false);

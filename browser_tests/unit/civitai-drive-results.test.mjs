@@ -7,7 +7,7 @@
 // returns METADATA + URLs ONLY, never image bytes, and clamps `limit`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { serializeCivitaiResults, CIVITAI_PROMPT_CAP } from "../../web/js/cmcp-civitai-ui.js";
+import { serializeCivitaiResults, CIVITAI_PROMPT_CAP, civitaiErrorState } from "../../web/js/cmcp-civitai-ui.js";
 
 // Media rows as produced by CivitaiClient._fromRest / _fromMeili.
 const mediaRows = [
@@ -116,6 +116,34 @@ test("missing/empty urls are dropped, not emitted as null/undefined", () => {
 test("non-array source is tolerated", () => {
   const out = serializeCivitaiResults(null, { model: false });
   assert.deepEqual(out, { items: [], total: 0, loading: false });
+});
+
+// ---- #599: the agent-facing error must distinguish the failure CAUSE ----
+// transport (browser→ComfyUI proxy hop failed, no HTTP response came back) vs
+// an upstream CivitAI error (HTTP status present) vs a true empty result (no
+// error object at all).
+
+test("#599: a transport failure keeps status null and carries kind", () => {
+  const err = Object.assign(new Error("…browser→ComfyUI hop…"), {
+    status: null, kind: "transport",
+  });
+  assert.deepEqual(civitaiErrorState(err), {
+    status: null,
+    message: "…browser→ComfyUI hop…",
+    kind: "transport",
+  });
+});
+
+test("#599: an upstream CivitAI error carries its HTTP status and no kind", () => {
+  const err = Object.assign(new Error("CivitAI API 503: Service Unavailable"), { status: 503 });
+  assert.deepEqual(civitaiErrorState(err), {
+    status: 503,
+    message: "CivitAI API 503: Service Unavailable",
+  });
+});
+
+test("#599: a plain error without a status is recorded without kind", () => {
+  assert.deepEqual(civitaiErrorState(new Error("boom")), { status: null, message: "boom" });
 });
 
 test("long prompts are capped to the token budget with an ellipsis", () => {
