@@ -8631,18 +8631,18 @@ const GRAPH_TOOL_EXECUTORS = {
     // cascade failing midway). Capture the error and STILL verify the
     // post-state — a raw throw would read as "nothing changed" and invite a
     // destructive retry of a disconnect that may have landed.
-    let mutationError = null;
+    let mutationErr = null;
     graph.beforeChange();
     try {
       node.disconnectInput(inIdx);
     } catch (err) {
-      mutationError = err;
+      mutationErr = err;
     }
-    let envelopeError = null;
+    let envelopeErr = null;
     try {
       graph.afterChange();
     } catch (err) {
-      envelopeError = err;
+      envelopeErr = err;
     }
     graph.setDirtyCanvas(true, true);
     const verdict = verifyDisconnect(graph, node, before, removedLink.linkId);
@@ -8682,12 +8682,12 @@ const GRAPH_TOOL_EXECUTORS = {
       `success. Press Ctrl+Z in the ComfyUI tab to undo, then re-check the graph with ` +
       `panel_graph_outline BEFORE queueing anything — a silently deleted output node runs ` +
       `to completion and saves nothing.`;
-    if (mutationError || envelopeError) {
+    if (mutationErr || envelopeErr) {
       throw new Error(
         [
           `panel_disconnect on node ${node.id} input "${inputName}" threw (#668): ` +
-            `${mutationError?.message ?? mutationError ?? ""}` +
-            (envelopeError ? ` (afterChange also threw: ${envelopeError?.message ?? envelopeError})` : ""),
+            `${mutationErr?.message ?? mutationErr ?? ""}` +
+            (envelopeErr ? ` (afterChange also threw: ${envelopeErr?.message ?? envelopeErr})` : ""),
           `Post-state check of the live graph:`,
           ...disclosureBullets(),
           undoRemedy,
