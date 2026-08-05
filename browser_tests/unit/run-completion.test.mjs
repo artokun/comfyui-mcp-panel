@@ -12,6 +12,8 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import {
   createRunCompletionTracker,
@@ -467,4 +469,167 @@ test("presentation: a STALLED storyboard upload still yields ONE frame (never we
   assert.match(frame.note, /timed out/, "each stalled video degrades to a note-only fallback");
   assert.match(frame.note, /a\.mp4/);
   assert.match(frame.note, /b\.mp4/);
+});
+
+// ── #609: blind mode must not be asked for a visual verdict ────────────────
+// With Blind ON, the sendFrame gate strips `images` from the agent_event — but
+// the storyboard note still ordered the agent to "Review motion, sharpness, and
+// temporal consistency", and the (vision-capable) agent confabulated a verdict
+// on a sheet it never received. The review request is lawful ONLY when the
+// pixels actually ride the frame; when withheld, the note must say so
+// AFFIRMATIVELY (an explicit prohibition — a merely-absent request is not
+// reliable) and name blind mode as the cause.
+
+test("#609: blind mode (images withheld) — no review request, an explicit prohibition instead", async () => {
+  const { deps, frames } = makeFrameDeps({ agentReceivesImages: () => false });
+  const frame = await composeRunCompletionFrame(
+    {
+      promptId: "p-blind",
+      images: [],
+      videos: [{ m: { filename: "clip.mp4", type: "output" }, nodeId: "7" }],
+      durationMs: 5000,
+    },
+    deps,
+  );
+  assert.equal(frames.length, 1);
+  assert.doesNotMatch(
+    frame.note,
+    /Review motion, sharpness/,
+    "must not order a visual review of a storyboard the agent never received",
+  );
+  // Assert the REASON, not just the absence: the note names blind mode as the
+  // cause and prohibits the visual verdict outright.
+  assert.match(frame.note, /Blind mode is ON/, "the withhold is disclosed, naming the cause");
+  assert.match(frame.note, /NOT sent to you/, "the withhold itself is stated");
+  assert.match(frame.note, /Do not comment on motion, sharpness, or visual quality/);
+  // The factual half survives: the agent can still name the file and metadata.
+  assert.match(frame.note, /clip\.mp4/, "the factual summary (file, metadata) still reaches the agent");
+  // The storyboard is still produced for the USER (blind blinds the agent, not
+  // the panel) — the ref rides the frame; the sendFrame gate strips it.
+  assert.ok(
+    frame.images.some((m) => m.filename === "storyboard_clip.png"),
+    "the storyboard is still built for the user; only the agent-facing pixels are gated",
+  );
+});
+
+test("#609: sighted mode (default) — the review request is unchanged", async () => {
+  const { deps, frames } = makeFrameDeps();
+  const frame = await composeRunCompletionFrame(
+    {
+      promptId: "p-sighted",
+      images: [],
+      videos: [{ m: { filename: "clip.mp4", type: "output" }, nodeId: "7" }],
+      durationMs: 5000,
+    },
+    deps,
+  );
+  assert.match(
+    frames[0].note,
+    /frames run top-left→bottom-right = start→end\. Review motion, sharpness, and temporal consistency\./,
+    "when the pixels DO reach the agent, the review request must survive verbatim",
+  );
+  assert.doesNotMatch(frame.note, /Blind mode is ON/);
+});
+
+test("#609: the sighted/blind decision is made NEAR SEND TIME (a mid-flush toggle is honored)", async () => {
+  let sighted = true;
+  const { deps, frames } = makeFrameDeps({
+    agentReceivesImages: () => sighted,
+    // Flip blind ON only once the storyboard upload is in flight — the decision
+    // is made after every segment resolves, so a flush-start snapshot would
+    // read the stale value.
+    uploadBlobToInput: async (_blob, name, opts) => {
+      sighted = false;
+      return { filename: name, type: opts?.type || "input" };
+    },
+  });
+  const frame = await composeRunCompletionFrame(
+    {
+      promptId: "p-toggle",
+      images: [],
+      videos: [{ m: { filename: "t.mp4", type: "output" }, nodeId: "7" }],
+      durationMs: 5000,
+    },
+    deps,
+  );
+  assert.equal(frames.length, 1);
+  assert.doesNotMatch(
+    frame.note,
+    /Review motion, sharpness/,
+    "a flush-start snapshot would still ask for the review — the decision must be made after the segments resolve",
+  );
+  assert.match(frame.note, /Blind mode is ON/);
+});
+
+test("#609: ONE decision per frame — parallel segments can never disagree with each other or the gate", async () => {
+  // codex gate finding: with a PER-SEGMENT read, a fast storyboard whose note
+  // was already composed stays "Review…" while a slow one, still in flight when
+  // Blind flips ON, says "NOT sent" — two segments of the SAME frame
+  // contradicting each other, and the fast one contradicting the sendFrame gate
+  // (which strips BOTH images at send time). The decision must be single and
+  // made after the slowest segment, immediately before send.
+  let sighted = true;
+  const { deps, frames } = makeFrameDeps({
+    agentReceivesImages: () => sighted,
+    // fast.mp4's storyboard resolves immediately; slow.mp4's takes a real 20ms.
+    buildVideoStoryboard: async (url) => {
+      if (/slow/.test(url)) await new Promise((r) => setTimeout(r, 20));
+      return { fake: "blob" };
+    },
+    // Blind flips ON during slow.mp4's upload — AFTER fast.mp4's whole segment
+    // (including its note) was already built.
+    uploadBlobToInput: async (_blob, name, opts) => {
+      if (/slow/.test(name)) sighted = false;
+      return { filename: name, type: opts?.type || "input" };
+    },
+  });
+  const frame = await composeRunCompletionFrame(
+    {
+      promptId: "p-interleave",
+      images: [],
+      videos: [
+        { m: { filename: "fast.mp4", type: "output" }, nodeId: "1" },
+        { m: { filename: "slow.mp4", type: "output" }, nodeId: "2" },
+      ],
+      durationMs: 5000,
+    },
+    deps,
+  );
+  assert.equal(frames.length, 1);
+  // The single decision was made after slow.mp4 resolved — Blind was ON by
+  // then, so BOTH segments disclose, and NEITHER requests a review.
+  assert.equal(
+    frame.note.match(/Blind mode is ON/g)?.length,
+    2,
+    "both video segments must follow the SAME per-frame decision",
+  );
+  assert.doesNotMatch(
+    frame.note,
+    /Review motion, sharpness/,
+    "the fast segment's pre-flip composition must not survive into the sent note",
+  );
+  assert.match(frame.note, /fast\.mp4/);
+  assert.match(frame.note, /slow\.mp4/);
+});
+
+// #609 wiring: the behavioral tests above inject `agentReceivesImages` by hand,
+// so they cannot catch the panel's REAL call site dropping the dep (the composer
+// then defaults to always-sighted while the sendFrame gate still strips the
+// pixels — the exact #609 hole). Pin the wiring by source inspection, the
+// panel's established pattern for the giant module (cf. bridge-disconnect).
+test("#609 wiring: the panel call site feeds the composer the gate's own blind predicate", () => {
+  const src = readFileSync(
+    fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  const start = src.indexOf("composeRunCompletionFrame(");
+  assert.notEqual(start, -1, "could not locate the composeRunCompletionFrame call site");
+  const end = src.indexOf(".then((frame)", start);
+  assert.notEqual(end, -1, "could not locate the end of the call site");
+  const callSite = src.slice(start, end);
+  assert.match(
+    callSite,
+    /agentReceivesImages:\s*\(\)\s*=>\s*!AGENT_BLIND/,
+    "the note's review request must be conditioned on the SAME blind flag the sendFrame gate strips by",
+  );
 });

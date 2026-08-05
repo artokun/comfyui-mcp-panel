@@ -51,6 +51,15 @@ export async function composeRunCompletionFrame(
     storyboardFrameCount,
     paintImage,
     videoStoryboardEnabled = true,
+    // Will the agent actually RECEIVE the pixels on this frame? Blind mode
+    // (#90/#174) strips `images` at the sendFrame gate — the note must not
+    // request a visual review of a storyboard that was withheld, or a
+    // vision-capable agent will confabulate a verdict (#609). Evaluated ONCE,
+    // after every segment has resolved (see the video fold below): a per-segment
+    // read would let two videos of the SAME frame disagree when the toggle
+    // flips mid-composition, and a flush-start snapshot would decide on a stale
+    // flag. One decision per frame, taken at the last moment before send.
+    agentReceivesImages = () => true,
     now = () => new Date(),
     warn = () => {},
     // Per-video wall-clock cap. The single completion frame awaits every video
@@ -125,10 +134,17 @@ export async function composeRunCompletionFrame(
       }),
     ),
   );
+  // #609 — ONE sighted/blind decision for the whole frame, made HERE: after the
+  // slowest segment resolved and immediately before send (nothing below awaits
+  // until sendFrame, so the toggle cannot interleave). A per-segment read would
+  // let a fast storyboard say "Review…" while a slow one says "NOT sent" when
+  // Blind flips mid-composition — and both could contradict the sendFrame gate.
+  const sighted = agentReceivesImages();
   for (const seg of videoSegs) {
     if (!seg) continue;
     if (seg.ref) outImages.push(seg.ref);
-    if (seg.note) noteSections.push(seg.note);
+    const note = sighted ? seg.note : (seg.noteWhenBlind ?? seg.note);
+    if (note) noteSections.push(note);
   }
 
   if (!outImages.length && !noteSections.length) return null;
@@ -273,8 +289,11 @@ async function buildStillsSegment(bufImages, deps) {
 
 /**
  * One video's portion: build a storyboard contact sheet (or a note-only fallback
- * when the storyboard can't be produced) and return { ref, note }. `ref` is the
- * uploaded storyboard ImageRef (or null); it never sends a frame itself.
+ * when the storyboard can't be produced) and return { ref, note, noteWhenBlind? }.
+ * `ref` is the uploaded storyboard ImageRef (or null); it never sends a frame
+ * itself. `noteWhenBlind` is set only on the storyboard-success path (#609): the
+ * sighted note requests a visual review, which is lawful only if the pixels ride
+ * the frame — the composer picks the variant ONCE per frame, right before send.
  */
 async function buildVideoSegment(v, deps) {
   const {
@@ -360,12 +379,27 @@ async function buildVideoSegment(v, deps) {
       const sizeStr = humanizeBytes(await fetchImageBytes(imageViewUrl(m)));
       // Show the user the contact sheet next to the <video> player.
       paintImage(imageViewUrl(ref), `Storyboard · ${n} frames`);
+      // #609 — the review request is lawful ONLY when the storyboard pixels
+      // actually reach the agent. Blind mode strips them at the sendFrame gate;
+      // asking for a visual verdict on a withheld sheet makes a vision-capable
+      // agent confabulate one. Both note variants are built here; the COMPOSER
+      // picks one per FRAME (never per segment) right before send, so parallel
+      // segments can never disagree with each other or with the gate. The blind
+      // variant says so AFFIRMATIVELY (an explicit prohibition is reliable; a
+      // merely-absent request is not) — the sheet is still painted for the user
+      // above, so only the agent is blind.
+      const header = `📽️ ${n}-frame storyboard (contact sheet) of ${videoKind} — `;
       const note =
-        `📽️ ${n}-frame storyboard (contact sheet) of ${videoKind} — ` +
+        header +
         `frames run top-left→bottom-right = start→end. ` +
         `Review motion, sharpness, and temporal consistency.` +
         metaSuffix(sizeStr, n);
-      return { ref, note };
+      const noteWhenBlind =
+        header +
+        `Blind mode is ON, so the storyboard was NOT sent to you (it is shown to the user). ` +
+        `Do not comment on motion, sharpness, or visual quality — acknowledge completion and the metadata below only.` +
+        metaSuffix(sizeStr, n);
+      return { ref, note, noteWhenBlind };
     } catch (err) {
       warn("[cmcp] storyboard pipeline failed:", err);
       return { ref: null, note: noteOnly("its storyboard preview failed to build") };
