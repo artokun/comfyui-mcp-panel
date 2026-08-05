@@ -2301,6 +2301,48 @@ test("#659 guard: normalization is NOT tolerance — the previously-undefined in
   assert.match(guard.state.dropped, /Nothing was queued/);
 });
 
+test("#659 promptContentHash: the JSON-survival probe covers toJSON() returning undefined, and unstringifyable values stay drift-covered (fail closed)", () => {
+  const wireBody = (inputs3) =>
+    JSON.stringify({ prompt: { "3": { class_type: "KSampler", inputs: inputs3 }, "9": { class_type: "SaveImage", inputs: {} } } });
+  // codex gate r1: an object whose toJSON() yields undefined is dropped from
+  // the wire body exactly like a bare undefined — a type-based filter would
+  // have kept it and hashed it as [name, null], false-refusing again.
+  const withToJsonUndefined = {
+    "3": { class_type: "KSampler", inputs: { steps: 20, odd: { toJSON: () => undefined } } },
+    "9": { class_type: "SaveImage", inputs: {} },
+  };
+  assert.equal(
+    promptContentHash(withToJsonUndefined),
+    promptContentHashFromBody(wireBody({ steps: 20 })),
+    "a toJSON()-drops-it value is invisible on both channels",
+  );
+  // A value that THROWS on stringify (BigInt) can never be compared against
+  // the wire — fail toward detecting drift: the hash itself refuses to
+  // compute, and dispatchScopedRun's catch turns that into the upfront
+  // fail-closed refusal (unchanged from before #659).
+  assert.throws(
+    () => promptContentHash({ "3": { class_type: "X", inputs: { n: 1n } } }),
+    TypeError,
+    "an unstringifyable value stays covered — the hash fails closed rather than dropping it",
+  );
+});
+
+test("#659 scopeDroppedError: a malformed drift list can never throw out of the refusal's description (codex gate r1)", () => {
+  // verdict.drift is module-internal today, but scopeDroppedError is exported
+  // and runs on the refusal path: odd caller-supplied tokens degrade to the
+  // no-diff guidance, they never escape as a throw.
+  let msg;
+  assert.doesNotThrow(() => {
+    msg = scopeDroppedError({ toNodeId: 5, verdict: { ok: false, reason: "graph_changed", drift: [Symbol("x"), 42, null] } });
+  });
+  assert.match(msg, /queue-time widget hook/, "non-string tokens degrade to the no-diff guidance");
+  assert.match(msg, /Nothing was queued/);
+  // An over-long token is bounded before it reaches a caller-readable error.
+  const long = scopeDroppedError({ toNodeId: 5, verdict: { ok: false, reason: "graph_changed", drift: [`3 ${"x".repeat(500)}`] } });
+  assert.ok(long.length < 1200, "the drift list is length-bounded");
+  assert.match(long, /3 x+/);
+});
+
 test("#659 diffPromptCanons: names input-level changes, node add/remove, and class_type changes — and never throws on odd input", () => {
   const a = canonicalizePrompt({
     "3": { class_type: "KSampler", inputs: { steps: 20, model: ["4", 0] } },

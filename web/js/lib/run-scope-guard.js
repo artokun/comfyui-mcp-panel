@@ -70,9 +70,10 @@
 //    control_after_generate, and the hook widgets themselves), which change
 //    between any two serializations of the SAME graph by design (#572: the
 //    exclusion must reach the hook's serialized TARGET, not just the
-//    unserialized control the hook hangs on), and (b) inputs whose value JSON
-//    cannot transmit (undefined/function/symbol), which the in-memory
-//    graphToPrompt output carries but the POST body always drops — hashing
+//    unserialized control the hook hangs on), and (b) inputs whose value the
+//    POST body's JSON cannot carry (undefined/function/symbol, or a toJSON
+//    that yields one), which the in-memory graphToPrompt output carries but
+//    the wire always drops — hashing
 //    those refused every scoped run on such a graph as a false "graph
 //    CHANGED" (#659). A topology-only fingerprint is
 //    insufficient: a busy queue defers serialization to post time, and a user
@@ -190,18 +191,26 @@ const fnv1aHex = (s) =>
  *     exclusion follows the linkedWidgets convention to the serialized
  *     target (see collectVolatileInputs).
  *
- *  2. JSON-INVISIBLE VALUES (#659) — an input whose value is `undefined`
- *     (or a function/symbol): the in-memory output object CARRIES the key
- *     (graphToPrompt assigns `inputs[name] = widget.value` unconditionally
- *     for serialized widgets), but `JSON.stringify` DROPS the key from the
- *     POST body, so the parsed body never has it. Without this filter the
- *     pre-dispatch hash and the post-body hash of an untouched graph differ
- *     deterministically and every scoped run is refused as "graph CHANGED".
- *     Live-observed shape: an async-populated combo whose fetch produced no
- *     value (e.g. OllamaConnectivityV2's `"model": ((), {})` — an
- *     empty-options combo with no default, left `undefined` when the Ollama
- *     server is unreachable), and the shim widgets a multi-spec
- *     COMFY_AUTOGROW_V3 group creates with no value at all.
+ *  2. JSON-INVISIBLE VALUES (#659) — an input whose value JSON.stringify
+ *     would DROP from the inputs object: `undefined`, functions, symbols,
+ *     and object values whose own `toJSON()` returns one of those. The
+ *     in-memory output object CARRIES the key (graphToPrompt assigns
+ *     `inputs[name] = widget.value` unconditionally for serialized widgets),
+ *     but the key never reaches the POST body, so the parsed body never has
+ *     it. Without this filter the pre-dispatch hash and the post-body hash
+ *     of an untouched graph differ deterministically and every scoped run is
+ *     refused as "graph CHANGED". Live-observed shape: an async-populated
+ *     combo whose fetch produced no value (e.g. OllamaConnectivityV2's
+ *     `"model": ((), {})` — an empty-options combo with no default, left
+ *     `undefined` when the Ollama server is unreachable), and the shim
+ *     widgets a multi-spec COMFY_AUTOGROW_V3 group creates with no value at
+ *     all. The check is an exact emulation of the wire — `JSON.stringify`
+ *     of a one-key probe object — not a type guess, so it cannot drift from
+ *     what the body actually carries (codex gate r1: a `toJSON()` returning
+ *     `undefined` is dropped on the wire but would have read as `null` in
+ *     the canonical pair). A value that THROWS on stringify (BigInt,
+ *     circular) is KEPT — fail toward detecting drift; the hash itself then
+ *     fails closed exactly as before.
  *
  *     This is NOT a drift-detection loosening: the guard's invariant is that
  *     the workflow that WOULD EXECUTE is unchanged, and a value JSON cannot
@@ -224,8 +233,13 @@ export function canonicalizePrompt(output, volatileInputs = null) {
     const names = Object.keys(inputs)
       .filter((n) => !volatileInputs?.has(`${k} ${n}`))
       .filter((n) => {
-        const v = inputs[n];
-        return v !== undefined && typeof v !== "function" && typeof v !== "symbol";
+        // Would this key survive JSON.stringify as an object property? Only
+        // then can it reach the server — and only then can it drift.
+        try {
+          return JSON.stringify({ v: inputs[n] }) !== "{}";
+        } catch {
+          return true; // unstringifyable (BigInt/circular) — keep it covered
+        }
       })
       .sort();
     return [k, node.class_type ?? null, names.map((n) => [n, inputs[n]])];
@@ -639,7 +653,23 @@ export function scopeDroppedError({ toNodeId, verdict }) {
     // reporter chasing the wrong layer for five runs. When the drift diff is
     // available, the differing "execId inputName" pairs lead; the hook
     // guidance stays as a fallback for when the diff could not be computed.
-    const drift = Array.isArray(verdict.drift) && verdict.drift.length ? verdict.drift : null;
+    //
+    // The tokens are normalized defensively (codex gate r1): verdict.drift is
+    // module-internal today (diffPromptCanons only ever emits bounded
+    // strings), but this function is exported and runs on the refusal path —
+    // a malformed caller-supplied drift must degrade to the no-diff message,
+    // never throw out of the refusal's description.
+    const drift = (() => {
+      try {
+        if (!Array.isArray(verdict.drift) || !verdict.drift.length) return null;
+        const tokens = verdict.drift
+          .filter((t) => typeof t === "string" && t.length)
+          .map((t) => (t.length > 120 ? `${t.slice(0, 120)}…` : t));
+        return tokens.length ? tokens : null;
+      } catch {
+        return null;
+      }
+    })();
     const MAX_DRIFT_TOKENS = 12;
     const driftText = drift
       ? `The differing entr${drift.length === 1 ? "y" : "ies"}: ` +
@@ -647,10 +677,16 @@ export function scopeDroppedError({ toNodeId, verdict }) {
         (drift.length > MAX_DRIFT_TOKENS ? `; …and ${drift.length - MAX_DRIFT_TOKENS} more` : "") +
         `. `
       : "";
+    // Enumerate CANDIDATES, never assert one (codex gate r1): the guard
+    // observed two differing serializations, nothing more. A nondeterministic
+    // widget serializer (a serializeValue emitting a timestamp) produces this
+    // same refusal with no hook and no dynamic-input node involved.
     const causeText = drift
       ? `If you did not edit ${drift.length === 1 ? "it" : "these"} between queueing and ` +
-        `dispatch, a queue-time widget hook or a dynamic-input node rewrote ${drift.length === 1 ? "it" : "them"} ` +
-        `between serialization and dispatch — please report this with the differing list above. `
+        `dispatch, something rewrote ${drift.length === 1 ? "it" : "them"} between serialization ` +
+        `and dispatch that the panel cannot identify from here — candidates: a queue-time ` +
+        `widget hook (e.g. control_after_generate), a dynamic-input node reshaping its slots, ` +
+        `or a nondeterministic widget serializer. Please report this with the differing list above. `
       : `If this recurs without any edit in between, ` +
         `a queue-time widget hook is mutating values between serialization and dispatch (e.g. a ` +
         `control_after_generate widget with WidgetControlMode "before" — switch it to ` +
