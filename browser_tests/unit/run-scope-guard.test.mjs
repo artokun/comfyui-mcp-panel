@@ -980,6 +980,101 @@ test("#630 gate r4: a LATE extra post, arriving AFTER the run reported success, 
   }
 });
 
+test("#630 gate r8 P0: a RETRYING run never displaces a concurrent run's sentinel — B's late post is still fenced", async () => {
+  // A installs GA1 and waits on a deferred first attempt. B starts, captures
+  // GA1 as its chain, succeeds, and retains GB. A's deferred post arrives
+  // scopeless, GA1 refuses it, and A retries. A's finally used to restore A's
+  // ENTRY-TIME fetchApi (raw), CLOBBERING GB — and A's next guard also
+  // delegated to A's entry-time raw fetch, bypassing B. A late B post then
+  // passed through as foreign and reached raw fetch scopeless: full graph.
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    // A: shim-less (drops the positional array) and DEFERRED, so attempt 1's
+    // post is driven manually below — the interleaving the old overlap test
+    // never produced, because it only started B after A had already returned.
+    const appA = makeFrontend({ shape: "shimless", defer: true, apiTarget });
+    const runA = dispatchScopedRun({
+      app: appA, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14, verifyTimeoutMs: 1500,
+    });
+    await sleep(15); // A has installed GA1 and is waiting on its deferred post
+    const attempt1Item = appA.deferredItem;
+    // B runs to completion WHILE A is mid-flight, and retains GB as current.
+    const appB = makeFrontend({ shape: "shim", apiTarget });
+    const resultB = await dispatchScopedRun({
+      app: appB, apiTarget, execIds: ["15"], batch: 1, toNodeId: 15,
+    });
+    assert.equal(resultB.outcome, "dispatched");
+    const callsAfterB = server.calls.length;
+    // A's deferred attempt-1 post lands SCOPELESS (shim-less dropped the array)
+    // and is refused — which is what makes A RETRY the next shape. That retry
+    // is the moment the old code restored A's entry-time fetchApi over GB.
+    await appA.postDeferred(attempt1Item);
+    await runA;
+    // THE REGRESSION: B's late scopeless post must still be fenced. If A's
+    // retry clobbered GB, or A's next guard delegated to A's entry-time raw
+    // fetch instead of the current chain, this reaches the server unscoped.
+    const lateB = frontendBody({ output: OUR_OUTPUT, number: resultB.queueMark, targets: null });
+    await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(lateB) });
+    assert.equal(
+      server.calls.length,
+      callsAfterB,
+      "B's late scopeless post never reached ComfyUI — A's retry did not displace or bypass B's fence",
+    );
+  } finally {
+    stop();
+  }
+});
+
+test("#630 gate r8 P0: a superseded attempt RETIRES rather than unhooking — it never double-handles its successor's post", async () => {
+  // Standing down by writing fetchApi back to an older value is what displaced
+  // other runs. Retiring keeps the chain intact; the retired guard must then be
+  // fully transparent, or it would refuse its own successor's repaired body.
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const raw = apiTarget.fetchApi;
+    const app = makeFrontend({ shape: "dropping", apiTarget });
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+    // The repair attempt is attempt 3; attempts 1 and 2 were superseded. If a
+    // retired guard still acted on the mark, the repaired body would have been
+    // refused on its way down the chain instead of reaching the server.
+    assert.equal(result.outcome, "dispatched");
+    assert.equal(result.scopeAppliedBy, "request_body_repair");
+    assert.equal(server.calls.length, 1);
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
+    // The chain was never unwound back to raw.
+    assert.notEqual(apiTarget.fetchApi, raw, "the terminal sentinel is current, and raw fetch was never restored");
+  } finally {
+    stop();
+  }
+});
+
+test("#630 gate r8 P1: an INDETERMINATE dispatch omits `queued` — neither true nor false is honest", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const source = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.js"), "utf8").replace(/\r\n/g, "\n");
+  const start = source.indexOf('if (runScopeResult && runScopeResult.outcome !== "dispatched")');
+  assert.ok(start > 0);
+  const block = source.slice(start, start + 6000).replace(/`\s*\+\s*\n\s*`/g, "").replace(/\s+/g, " ");
+  // The indeterminate branch must NOT assert queued:false…
+  const indetStart = block.indexOf("if (runScopeResult.indeterminate > 0)");
+  assert.ok(indetStart > 0, "the indeterminate case is handled separately");
+  // Bound the slice to THIS branch's return, or it runs on into the
+  // nothing-dispatched `queued: false` below and the assertion means nothing.
+  const indetBlock = block.slice(indetStart, block.indexOf("}; }", indetStart) + 4);
+  assert.ok(indetBlock.length > 100 && indetBlock.length < 900, "the branch was isolated, not the whole tail");
+  assert.doesNotMatch(indetBlock, /queued: false/,
+    "a definite negative about a request whose fate we say we cannot determine");
+  assert.match(indetBlock, /queued_unknown: true/);
+  assert.match(indetBlock, /deliberately omits "queued"/, "and the omission is explained, not silent");
+  assert.match(indetBlock, /a blind retry can render the branch twice/);
+  // …while a run where nothing left the panel still gets the definite answer.
+  assert.match(block, /return \{ queued: false, error: runScopeResult\.error \};/,
+    "nothing dispatched ⇒ queued:false is observable and still stated plainly");
+});
+
 test("#630 gate r7 P0-1: only a genuinely ABSENT key is repaired — a PRESENT value we cannot interpret is refused, never overwritten", async () => {
   // Absence is ours to fill. `[]`, `null`, `"14"` and especially
   // `{ queueNodeIds: [...] }` are PRESENT values in a shape we did not expect —
@@ -1300,7 +1395,10 @@ test("#630 gate r6: graph_run never states a remainder it cannot count, and neve
   assert.match(block, /the remaining count cannot be stated from here without risking a duplicate render/);
   assert.match(block, /Check the ComfyUI queue before re-running anything/);
   // Zero verified + an indeterminate dispatch is still not "nothing ran".
-  assert.match(block, /outcome_unknown = true/);
+  // #630 r8 — this used to be `outcome_unknown` beside a `queued: false`. The
+  // flag is now `queued_unknown` and `queued` is omitted entirely, because no
+  // boolean is an honest answer for a request whose fate we cannot determine.
+  assert.match(block, /queued_unknown: true/);
   assert.match(block, /rather than assuming nothing ran/);
 });
 

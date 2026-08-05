@@ -9229,16 +9229,31 @@ const GRAPH_TOOL_EXECUTORS = {
       }
       // Nothing verified. But "nothing verified" is still not always "nothing
       // queued": an indeterminate dispatch left the panel and may have been
-      // accepted. Refuse — but never claim more certainty than was observed.
-      const failed = { queued: false, error: runScopeResult.error };
+      // accepted.
+      //
+      // codex gate r8, P1 — so `queued` is OMITTED entirely in that case rather
+      // than set false. `queued: false` is a definite negative on the field
+      // callers branch on, and asserting it about a request whose fate we
+      // explicitly say we cannot determine is the same contradiction this
+      // cluster keeps producing. There is no boolean that means "unknown", so
+      // the field that only has two honest values simply is not present, and
+      // `queued_unknown` says why. Only a run where nothing left the panel gets
+      // the definite `queued: false`.
       if (runScopeResult.indeterminate > 0) {
-        failed.outcome_unknown = true;
-        failed.retry_guidance =
-          `No prompt was confirmed queued, but ${runScopeResult.indeterminate} request(s) ` +
-          `DID leave the panel and their outcome could not be determined — ComfyUI may have ` +
-          `queued them. Check the ComfyUI queue before retrying rather than assuming nothing ran.`;
+        return {
+          queued_unknown: true,
+          error: runScopeResult.error,
+          indeterminate_count: runScopeResult.indeterminate,
+          retry_guidance:
+            `No prompt was CONFIRMED queued, but ${runScopeResult.indeterminate} request(s) ` +
+            `DID leave the panel and their outcome could not be determined — ComfyUI may have ` +
+            `queued them, and they carried the run-to-node scope. Check the ComfyUI queue ` +
+            `before retrying rather than assuming nothing ran; a blind retry can render the ` +
+            `branch twice. This result deliberately omits "queued" because neither true nor ` +
+            `false is an honest answer here.`,
+        };
       }
-      return failed;
+      return { queued: false, error: runScopeResult.error };
     }
     // Verdict from BOTH channels: the captured top-level rejection (#358) and the
     // per-node errors the frontend stashed. null ⇒ genuinely accepted.

@@ -785,13 +785,19 @@ export function createScopedRunGuard({
 } = {}) {
   const expected = (execIds ?? []).map(String);
   const maxBatch = Math.max(1, Math.floor(Number(batch)) || 1);
-  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, inFlight: 0, indeterminate: 0, closed: false, dropped: null, droppedReason: null, failed: null };
+  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, inFlight: 0, indeterminate: 0, closed: false, retired: false, dropped: null, droppedReason: null, failed: null };
   const waiters = new Set();
   const notify = () => {
     for (const fire of [...waiters]) fire();
   };
 
   const guard = async (route, options) => {
+    // RETIRED (codex gate r8): this attempt has handed over to a LATER attempt
+    // of the same run, which is now installed above us in the chain and owns
+    // this mark. We must not also act on it — two live guards for one mark
+    // would double-count a forwarded post, or refuse our own successor's
+    // repaired body. Retired means fully transparent, forever.
+    if (state.retired) return origFetchApi(route, options);
     if (!isPromptPost(route, options)) return origFetchApi(route, options);
     // RUN IDENTITY FIRST: no mark ⇒ not ours ⇒ never touch it. This is what
     // keeps a user's full run of the SAME graph, or another scoped run with
@@ -1005,6 +1011,12 @@ export function createScopedRunGuard({
   guard.close = () => {
     state.closed = true;
   };
+  // Called when a LATER attempt of the SAME run takes over: this guard becomes
+  // permanently transparent instead of being unhooked, so the chain below it
+  // (which may include ANOTHER run's live sentinel) is never disturbed.
+  guard.retire = () => {
+    state.retired = true;
+  };
   // Verdict = the run reached a TERMINAL state: the whole batch verified, a
   // genuine server rejection arrived, a dispatch failure occurred (r6), or a
   // corrupted post ended the attempt (the frontend's batch loop breaks on the
@@ -1097,8 +1109,26 @@ export async function dispatchScopedRun({
   onPromptId = null,
 } = {}) {
   const mark = queueMark ?? newScopedQueueMark();
-  const prevFetchApi = typeof apiTarget?.fetchApi === "function" ? apiTarget.fetchApi : null;
-  const origFetchApi = prevFetchApi ? prevFetchApi.bind(apiTarget) : null;
+  // CHAIN COMPOSITION (codex gate r8). Both the entry-time capture below and
+  // the per-attempt restore used to be WRONG in the presence of a concurrent
+  // run:
+  //
+  //   A installs GA1 over raw fetch and waits for its deferred first attempt.
+  //   B starts, captures GA1 as its chain, succeeds, and retains GB as the
+  //   current sentinel. A's deferred post arrives scopeless, GA1 refuses it,
+  //   and A retries — whereupon A's `finally` restored A's ENTRY-TIME
+  //   fetchApi (raw), CLOBBERING GB, and A's next guard also delegated to A's
+  //   entry-time raw fetch, bypassing B entirely. A late B post then passed
+  //   through as foreign and reached raw fetch scopeless: full graph.
+  //
+  // Two rules fix it, and both are needed:
+  //   1. A guard delegates to whatever was CURRENT when it was installed, not
+  //      to what was current when the run began (captured per attempt below).
+  //   2. A superseded attempt is RETIRED — made permanently transparent — and
+  //      never unhooked. Nothing in this module writes apiTarget.fetchApi back
+  //      to an older value any more, so no run can displace another's guard.
+  const entryFetchApi = typeof apiTarget?.fetchApi === "function" ? apiTarget.fetchApi : null;
+  const origFetchApi = entryFetchApi ? entryFetchApi.bind(apiTarget) : null;
   if (!origFetchApi) {
     return {
       outcome: "unverifiable",
@@ -1158,12 +1188,20 @@ export async function dispatchScopedRun({
     // The ordering rule, in its teardown direction: a fence must not be
     // removed before something has decided it is no longer needed. The
     // `finally` always runs; the decision may never. So the decision is now
-    // the one that has to fire — `continuing` is set explicitly on the only
-    // exit that is safe to restore on (handing over to another attempt of this
-    // same run, which installs its own guard on the same mark immediately).
-    let keepGuardInstalled = true;
+    // the one that has to fire — `retireGuard` is set explicitly on the only
+    // exit where this attempt's guard may stand down (handing over to another
+    // attempt of this same run, which installs its own guard on the same mark
+    // immediately). Standing down means RETIRING (transparent), never
+    // unhooking: see the chain-composition note at the top of this function.
+    let retireGuard = false;
+    // The chain this guard delegates to is whatever is installed RIGHT NOW —
+    // which may be another run's live sentinel, or our own previous attempt.
+    // Capturing the run's entry-time fetchApi here instead would bypass a
+    // newer run's guard entirely (r8 P0).
+    const chainBelow =
+      typeof apiTarget.fetchApi === "function" ? apiTarget.fetchApi.bind(apiTarget) : origFetchApi;
     const guard = createScopedRunGuard({
-      origFetchApi,
+      origFetchApi: chainBelow,
       execIds,
       contentHash,
       volatileInputs,
@@ -1185,8 +1223,9 @@ export async function dispatchScopedRun({
         await guard.waitForVerdict(verifyTimeoutMs);
       }
       if (!guard.verdictReached()) {
-        // GIVE-UP — decided HERE, inside the try, so the finally below honors
-        // keepGuardInstalled. The deferred item may still be live in the
+        // GIVE-UP. The guard stays (that is now the default — the finally only
+        // ever stands it down when handing over to another attempt of this same
+        // run, which this is not). The deferred item may still be live in the
         // frontend's pending queue: try to REMOVE it (ownership tag AND this
         // run's mark both checked), and only when that's impossible keep the
         // surgical guard installed for the PAGE SESSION as a sentinel — NO
@@ -1229,12 +1268,6 @@ export async function dispatchScopedRun({
       // later posts of this batch can still come. Keep the guard installed as
       // a page-session sentinel so a later CORRUPTED post is still refused
       // (decided HERE so the finally below honors it).
-      if (
-        guard.state.failed != null &&
-        guard.state.observed + guard.state.rejected + guard.state.refused < batch
-      ) {
-        keepGuardInstalled = true;
-      }
       // SUCCESS IS ALSO A SENTINEL CASE (codex gate r4). Completing the batch
       // used to RESTORE fetchApi — which uninstalled the quota fence, so a LATE
       // same-mark post (a deferred duplicate the processor emits after
@@ -1284,10 +1317,12 @@ export async function dispatchScopedRun({
       // app.queuePrompt returned normally AND this attempt is handing over to
       // another attempt of the same run; a throw skips this line entirely and
       // the fence stays up (P0-2).
-      keepGuardInstalled = !continuing;
+      retireGuard = continuing;
     } finally {
-      if (keepGuardInstalled) guard.close();
-      else apiTarget.fetchApi = prevFetchApi;
+      // Stand down ONLY by retiring; never by writing apiTarget.fetchApi back
+      // to an older value, which would displace a concurrent run's guard (r8).
+      if (retireGuard) guard.retire();
+      else guard.close();
     }
     // r6: the dispatch itself failed (fetch threw / malformed response) —
     // terminal, truthful, NEVER queued:true.
@@ -1299,7 +1334,7 @@ export async function dispatchScopedRun({
         indeterminate: guard.state.indeterminate,
       volatileInputs: volatileList,
         error: guard.state.failed +
-          (keepGuardInstalled
+          (!retireGuard
             ? " The scope guard stays installed as a sentinel for the rest of this page session."
             : ""),
       };
