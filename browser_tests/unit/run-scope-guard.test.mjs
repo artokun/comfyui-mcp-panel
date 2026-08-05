@@ -30,6 +30,7 @@ import {
   scopeDroppedError,
   scopeUnverifiedError,
   scopeUnattributableError,
+  scopeDispatchError,
   createRunFetchInterceptor,
   createScopedRunGuard,
   describeObserved,
@@ -233,8 +234,10 @@ test("#630 repairScopeInBody: refuses what it cannot safely rewrite — unparsea
     null,
     "no resolved scope ⇒ nothing to write; never an empty partial_execution_targets",
   );
-  // A wrong/foreign value IS overwritten by the primitive — the CALLER is what
-  // withholds repair from a genuine mismatch (asserted in the guard tests).
+  // The PRIMITIVE will rewrite whatever it is handed — it is the caller that
+  // decides what may be repaired, and the guard now hands it ONLY a genuinely
+  // absent key (asserted in the guard tests below). This documents the split of
+  // responsibility; it is not a licence to overwrite a present value.
   const overwritten = repairScopeInBody(
     JSON.stringify(frontendBody({ number: MARK_A, targets: ["999"] })),
     ["14"],
@@ -518,7 +521,10 @@ test("#556 r6: an attributed post whose fetch THROWS is a dispatch FAILURE — n
   await assert.rejects(guard(...promptPost(frontendBody({ targets: ["14"] }))), /connection reset/);
   assert.equal(guard.state.observed, 0, "a thrown fetch never satisfies the batch verdict");
   assert.match(guard.state.failed, /connection reset/);
-  assert.match(guard.state.failed, /NOT reported as queued/);
+  // #630 r7 P0-4 — the message is now a DISCLOSURE, not a denial: the request
+  // had already left, so whether ComfyUI accepted it is not observable.
+  assert.match(guard.state.failed, /NOT confirmed queued/);
+  assert.match(guard.state.failed, /CANNOT be determined from here/);
   assert.equal(captured, null, "no prompt_id claimed");
 });
 
@@ -972,6 +978,131 @@ test("#630 gate r4: a LATE extra post, arriving AFTER the run reported success, 
   } finally {
     stop();
   }
+});
+
+test("#630 gate r7 P0-1: only a genuinely ABSENT key is repaired — a PRESENT value we cannot interpret is refused, never overwritten", async () => {
+  // Absence is ours to fill. `[]`, `null`, `"14"` and especially
+  // `{ queueNodeIds: [...] }` are PRESENT values in a shape we did not expect —
+  // the last looks like another layer's scope convention. Rewriting one would
+  // be executing our intent over a request that said something different, which
+  // is the same violation as overwriting a mismatch.
+  const stop = keepAlive();
+  try {
+    const cases = [
+      { targets: [], label: "empty list" },
+      { targets: null, label: "explicit null" },
+      { targets: "14", label: "bare string" },
+      { targets: { queueNodeIds: ["9"] }, label: "another layer's convention" },
+    ];
+    for (const { targets, label } of cases) {
+      const server = makeServer();
+      const guard = createScopedRunGuard({
+        origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
+        repairScope: true,
+      });
+      const body = { prompt: OUR_OUTPUT, client_id: "x", number: MARK_A, partial_execution_targets: targets };
+      const res = await guard(...promptPost(body));
+      assert.equal(res.status, 400, `${label}: refused, not repaired`);
+      assert.equal(guard.state.repaired, 0, `${label}: never rewritten`);
+      assert.equal(server.calls.length, 0, `${label}: nothing left the tab`);
+      // …and the refusal names what it actually saw, so the next report is diagnosable.
+      assert.match(guard.state.dropped, /was not a list|EMPTY partial_execution_targets/, `${label}: observation named`);
+    }
+    // The one case that IS repaired: the key genuinely absent.
+    const server = makeServer();
+    const guard = createScopedRunGuard({
+      origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
+      repairScope: true,
+    });
+    await guard(...promptPost({ prompt: OUR_OUTPUT, client_id: "x", number: MARK_A }));
+    assert.equal(guard.state.repaired, 1, "an absent key is ours to fill");
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
+  } finally {
+    stop();
+  }
+});
+
+test("#630 gate r7 P0-2: app.queuePrompt THROWING mid-run leaves the fence UP — a deferred duplicate cannot post scopeless", async () => {
+  // The `finally` always runs; the terminal-path decision may never. A throw
+  // from queuePrompt after it had already emitted a scoped post used to unwind
+  // through the finally with keepGuardInstalled still false, restoring raw
+  // fetchApi — and a deferred same-mark duplicate then ran the full graph.
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const prev = apiTarget.fetchApi;
+    const app = makeFrontend({ shape: "dropping", apiTarget });
+    let runMark = null;
+    app.queuePrompt = async (number) => {
+      runMark = number; // the run's real mark — a module counter, not a fixed value
+      const body = frontendBody({ output: OUR_OUTPUT, number, targets: null });
+      app.posted.push(body);
+      await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+      throw new Error("frontend blew up after posting");
+    };
+    await assert.rejects(
+      () => dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 }),
+      /frontend blew up/,
+    );
+    assert.notEqual(apiTarget.fetchApi, prev, "the fence is NOT torn down by an exception unwinding the finally");
+    // The deferred duplicate that used to escape.
+    const late = frontendBody({ output: OUR_OUTPUT, number: runMark, targets: null });
+    const before = server.calls.length;
+    await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(late) });
+    assert.equal(server.calls.length, before, "a late scopeless duplicate never reached ComfyUI");
+  } finally {
+    stop();
+  }
+});
+
+test("#630 gate r7 P0-3: a SUCCESSFUL cancel still keeps the sentinel — removing what we could see proves nothing about what we could not", async () => {
+  // `removed > 0` proves only that tagged entries still in app.queueItems were
+  // spliced. A copy the frontend already took, popped, or scheduled is
+  // invisible to that check, and restoring raw fetchApi lets it post scopeless.
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const prev = apiTarget.fetchApi;
+    // "shim" so the TAGGED targets array is what the queue item holds — that is
+    // what makes the cancel succeed, which is the precondition under test.
+    const app = makeFrontend({ shape: "shim", defer: true, apiTarget });
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14, verifyTimeoutMs: 40,
+    });
+    assert.equal(result.outcome, "unverified");
+    assert.match(result.error, /located and REMOVED/, "the cancel did succeed — that part is unchanged");
+    assert.notEqual(apiTarget.fetchApi, prev, "and the sentinel STAYS, because the cancel is not proof about unseen copies");
+    // A retained same-mark copy posting later is still fenced.
+    const late = frontendBody({ output: OUR_OUTPUT, number: result.queueMark, targets: null });
+    await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(late) });
+    assert.equal(server.calls.length, 0, "no scopeless full-graph post ever left the tab");
+  } finally {
+    stop();
+  }
+});
+
+test("#630 gate r7 P0-4: the dispatch-failure message DISCLOSES an unknown outcome instead of denying arrival", () => {
+  // It used to end "this prompt did not reach ComfyUI" — a definite negative
+  // the panel cannot observe, contradicting the module's own INDETERMINATE
+  // handling, and one that makes the caller resubmit a render that may already
+  // be running.
+  const msg = scopeDispatchError({
+    toNodeId: 14,
+    detail: "the /prompt request itself threw (connection reset)",
+    verified: 0,
+    batch: 1,
+  });
+  assert.doesNotMatch(msg, /this prompt did not reach ComfyUI/,
+    "the unobservable denial must be gone, not reworded around");
+  assert.match(msg, /CANNOT be determined from here/, "the uncertainty is named as uncertainty");
+  assert.match(msg, /may be queued or running right now/);
+  assert.match(msg, /Check the ComfyUI queue before resubmitting/, "with an action that works from where the caller is");
+  assert.match(msg, /a retry may render the branch twice/, "and the cost of getting it wrong");
+  // What IS observable is still asserted plainly.
+  assert.match(msg, /no full-graph dispatch occurred/);
+  assert.match(msg, /NOT confirmed queued/);
 });
 
 test("#630 gate r5 P0: a TERMINAL PARTIAL batch keeps its sentinel — a late post cannot escape after a half-succeeded run", async () => {
@@ -1750,7 +1881,8 @@ test("#556 r6 integration: batch=1 whose /prompt fetch THROWS ⇒ 'failed' outco
     assert.notEqual(result.outcome, "dispatched");
     assert.equal(result.verified, 0);
     assert.match(result.error, /connection reset/);
-    assert.match(result.error, /NOT reported as queued/);
+    assert.match(result.error, /NOT confirmed queued/);
+    assert.match(result.error, /CANNOT be determined from here/, "#630 r7 P0-4: never a definite non-arrival claim");
     assert.deepEqual(ids, [], "no prompt_id claimed");
     assert.notEqual(apiTarget.fetchApi, prev, "batch unaccounted ⇒ sentinel stays (the frontend may keep looping)");
     // A late CORRUPTED post of this run is still refused by the sentinel.
@@ -1804,10 +1936,11 @@ test("#556 r6 integration: batch=2 where post 1's fetch throws and post 2 verifi
   }
 });
 
-test("#556 r3 P0-3 integration: timeout CANCELS our tagged pending item (assert the removal) — guard restored, no sentinel", async () => {
+test("#556 r3 P0-3 integration: timeout CANCELS our tagged pending item (assert the removal) — and the sentinel STAYS (#630 r7)", async () => {
   const stop = keepAlive();
   try {
-    const apiTarget = { fetchApi: makeServer() };
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
     const prev = apiTarget.fetchApi;
     const app = makeFrontend({ shape: "shim", defer: true, apiTarget });
     // A foreign identical-scope item also pending — must survive.
@@ -1820,8 +1953,15 @@ test("#556 r3 P0-3 integration: timeout CANCELS our tagged pending item (assert 
     assert.match(result.error, /REMOVED/);
     assert.equal(app.queueItems.length, 1, "ONLY our tagged item was removed");
     assert.deepEqual(app.queueItems[0].queueNodeIds, ["14"]);
-    assert.equal(apiTarget.fetchApi, prev, "guard restored — no sentinel needed after a successful cancel");
-    assert.equal(apiTarget.fetchApi.calls.length, 0, "nothing was ever dispatched");
+    // #630 r7 P0-3 — DELIBERATE CHANGE. This asserted "guard restored — no
+    // sentinel needed after a successful cancel". A successful cancel proves
+    // only that tagged entries STILL IN app.queueItems were spliced; it says
+    // nothing about a copy the frontend already took, popped, or scheduled.
+    // Positive evidence about what we could see is not evidence about what we
+    // could not, and restoring on it let an unseen same-mark copy post
+    // scopeless later.
+    assert.notEqual(apiTarget.fetchApi, prev, "the sentinel stays — the cancel is not proof about unseen copies");
+    assert.equal(server.calls.length, 0, "nothing was ever dispatched");
   } finally {
     stop();
   }

@@ -652,13 +652,28 @@ function isPromptPost(route, options) {
  * was malformed (no parseable prompt_id, no rejection body). That post is NOT
  * verified and NOT a server rejection — the run must never report queued:true
  * for it. Names what failed and how much of the batch was confirmed first.
+ *
+ * DISCLOSURE, NOT A DENIAL (codex gate r7, P0-4). This message used to end
+ * "this prompt did not reach ComfyUI" — a definite negative the panel cannot
+ * observe, and one that now contradicts the module's own handling: a thrown
+ * fetch is recorded as INDETERMINATE precisely because the throw can happen
+ * AFTER ComfyUI received and queued the prompt (a reset while reading the
+ * response is indistinguishable from one before the request left). Telling the
+ * caller it did not run makes them do the reasonable thing — resubmit — and
+ * pay twice in GPU time or API credits for a render that may already be
+ * running. Refuse vs disclose: once the request may have left, the only honest
+ * answer is what is known and what is not, plus where to look.
  */
 export function scopeDispatchError({ toNodeId, detail, verified, batch }) {
   return (
     `run-to-node scope for node ${toNodeId}: a verified-scoped /prompt request ` +
     `FAILED to complete — ${detail}. ${verified} of ${batch} batch prompts were ` +
-    `confirmed queued before the failure. The run is NOT reported as queued: ` +
-    `this prompt did not reach ComfyUI, and no full-graph dispatch occurred (#556).`
+    `confirmed queued before the failure. This one is NOT confirmed queued — but ` +
+    `it had already left the panel, so whether ComfyUI accepted it CANNOT be ` +
+    `determined from here: it may be queued or running right now. Check the ` +
+    `ComfyUI queue before resubmitting, or a retry may render the branch twice. ` +
+    `What IS certain: the request carried the run-to-node scope, so no full-graph ` +
+    `dispatch occurred (#556).`
   );
 }
 
@@ -836,7 +851,16 @@ export function createScopedRunGuard({
       repairScope &&
       contentOk &&
       !targets &&
-      (scopeRead.state === "absent" || scopeRead.state === "empty" || scopeRead.state === "not_a_list")
+      // ONLY a genuinely ABSENT key (codex gate r7, P0-1). Previously `empty`
+      // and `not_a_list` were repaired too, which broke this module's own rule
+      // that a scope we did not put there is never overwritten. `[]`, `null`,
+      // `"14"`, and especially `{ queueNodeIds: [...] }` are PRESENT values in
+      // a shape we did not expect — the last looks like another layer's scope
+      // convention, not an absence. Absence is ours to fill; a present value we
+      // cannot interpret is someone else's data, and rewriting it would be
+      // executing our intent over a request that said something different.
+      // Those states now fall through to the refusal, which names what it saw.
+      scopeRead.state === "absent"
     ) {
       const repairedBody = repairScopeInBody(options?.body, expected);
       if (repairedBody != null) {
@@ -1124,7 +1148,20 @@ export async function dispatchScopedRun({
     const { arg: scopeArg, repair } = attempts[attemptIndex];
     const isLastAttempt = attemptIndex === attempts.length - 1;
     dropped = null;
-    let keepGuardInstalled = false;
+    // DEFAULT TO KEEPING THE FENCE (codex gate r7, P0-2). This used to start
+    // false, so any exit that did not reach the terminal-path logic — most
+    // importantly `app.queuePrompt` THROWING partway through, after it had
+    // already emitted a scoped post — unwound through the `finally` and
+    // RESTORED raw fetchApi. A deferred duplicate carrying this run's mark
+    // could then post with no scope and run the full graph.
+    //
+    // The ordering rule, in its teardown direction: a fence must not be
+    // removed before something has decided it is no longer needed. The
+    // `finally` always runs; the decision may never. So the decision is now
+    // the one that has to fire — `continuing` is set explicitly on the only
+    // exit that is safe to restore on (handing over to another attempt of this
+    // same run, which installs its own guard on the same mark immediately).
+    let keepGuardInstalled = true;
     const guard = createScopedRunGuard({
       origFetchApi,
       execIds,
@@ -1156,6 +1193,16 @@ export async function dispatchScopedRun({
         // expiry timer (r4): the uncancellable item can post whenever the
         // stalled processor resumes, so the refusal must not go away. Safe by
         // construction: the sentinel only ever acts on THIS run's unique mark.
+        //
+        // P0-3 (codex gate r7): a successful cancel is NOT grounds to tear the
+        // fence down. `removed > 0` proves only that tagged entries STILL IN
+        // app.queueItems were spliced. It says nothing about an item the
+        // frontend has already copied, popped, or scheduled — and if such a
+        // same-mark item exists alongside one that was still removable,
+        // restoring raw fetchApi lets that copy post scopeless later. Positive
+        // evidence about the items we COULD see is not evidence about the ones
+        // we could not. So the sentinel stays either way; the cancel result
+        // only changes what we can honestly CLAIM about what was queued.
         const verified = guard.state.observed;
         const cancel = cancelPendingScopedQueueItem(app, { runTag, queueMark: mark });
         if (cancel.removed > 0) {
@@ -1164,11 +1211,10 @@ export async function dispatchScopedRun({
             queueMark: mark,
             verified,
             indeterminate: guard.state.indeterminate,
-      volatileInputs: volatileList,
+            volatileInputs: volatileList,
             error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: true, verified, batch }),
           };
         }
-        keepGuardInstalled = true;
         return {
           outcome: "unverified",
           queueMark: mark,
@@ -1234,7 +1280,11 @@ export async function dispatchScopedRun({
         guard.state.rejected === 0 &&
         guard.state.observed === 0 &&
         guard.state.droppedReason !== "graph_changed";
-      if (!continuing) keepGuardInstalled = true;
+      // The ONLY place the fence may be torn down. Reached only when
+      // app.queuePrompt returned normally AND this attempt is handing over to
+      // another attempt of the same run; a throw skips this line entirely and
+      // the fence stays up (P0-2).
+      keepGuardInstalled = !continuing;
     } finally {
       if (keepGuardInstalled) guard.close();
       else apiTarget.fetchApi = prevFetchApi;
