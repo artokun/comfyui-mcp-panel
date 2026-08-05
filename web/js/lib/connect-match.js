@@ -215,20 +215,50 @@ export function resolveExplicitSlot(slots, ref) {
   return { error: "name" };
 }
 
-/** #406 — indices of the slots whose TYPE (not name) equals the string `ref`,
- *  case-insensitively/trimmed. Lets a caller address a port by its displayed type
- *  ("IMAGE", "LATENT") when no slot bears that literal name. Only string-typed
- *  slots participate (a combo/enum whose `type` is an array or number is never a
- *  type-name target). Returns [] when `ref` is not a usable string. */
+/** #406 — indices of the slots that ACCEPT the type named by the string `ref`, so a
+ *  caller can address a port by its displayed type ("IMAGE", "LATENT") when no slot
+ *  bears that literal name. Only string-typed slots participate (a combo/enum whose
+ *  `type` is an array or number is never a type-name target). Returns [] when `ref` is
+ *  not a usable string.
+ *
+ *  #651 — "accepts" is decided by the SAME isTypeCompatible predicate the auto-matcher
+ *  scores pairings with, NOT by naive string equality. Naive equality made the two
+ *  paths disagree: `panel_connect(ImageCrop.IMAGE -> SetNode."IMAGE")` was refused with
+ *  "No input on node 225 accepts type IMAGE" while the node's only input was a wildcard
+ *  `*` — a socket whose whole declaration is a POSITIVE statement that it accepts any
+ *  type. Reading `*` as "not IMAGE" is reading an unknown as a definite negative, and
+ *  it refused a connection the graph plainly supports (the same SetNode had carried an
+ *  IMAGE moments earlier). Two separate checks answering "does this slot accept IMAGE?"
+ *  will keep drifting apart; there is now one.
+ *
+ *  Ranked, and the tiers never mix: a slot whose declared type LITERALLY names `ref`
+ *  wins outright, and the wildcard tier is consulted ONLY when no such slot exists — so
+ *  a node with both an `IMAGE` and a `*` input still resolves "IMAGE" to the IMAGE
+ *  input, and addressing `"*"` literally still lands on the wildcard rather than tying
+ *  with every other slot. Several slots in the winning tier stay AMBIGUOUS and are
+ *  refused upstream; a wildcard does not license guessing between two of them. */
 export function typeMatchedIndices(slots, ref) {
   if (ref == null || typeof ref === "number") return [];
-  const want = String(ref).trim().toLowerCase();
+  const want = String(ref).trim();
   if (!want) return [];
-  const hits = [];
+  const wantLower = want.toLowerCase();
+  const literal = [];
+  const wildcard = [];
   (slots ?? []).forEach((s, i) => {
-    if (typeof s?.type === "string" && s.type.trim().toLowerCase() === want) hits.push(i);
+    const type = s?.type;
+    if (typeof type !== "string") return;
+    // Literal identity of the addressed name — this is what makes `"*"` address the
+    // wildcard slot itself instead of matching everything, and it covers a comma
+    // multi-type ("IMAGE,MASK") naming the requested type as one of its segments.
+    if (typeSegments(type).some((seg) => seg.toLowerCase() === wantLower)) {
+      literal.push(i);
+      return;
+    }
+    // Not literally this type — but the shared predicate may still say it accepts it,
+    // which for a non-combo slot means exactly one thing: it is a wildcard.
+    if (isTypeCompatible(want, type)) wildcard.push(i);
   });
-  return hits;
+  return literal.length ? literal : wildcard;
 }
 
 /** #406 — resolve a slot ref that matched no NAME against slot TYPES. EXACTLY one
