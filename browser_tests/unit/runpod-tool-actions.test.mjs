@@ -120,6 +120,32 @@ async function mount(t, opts) {
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
+/**
+ * Every call a single gesture produced — not merely the one we hoped for.
+ *
+ * `calls.find(a => a.action === "stop")` proves the expected frame EXISTS; it
+ * cannot prove no OTHER frame went with it. A Stop handler that emitted stop and
+ * then a spurious start would satisfy it while leaving the pod running and
+ * billing, which is the exact outcome the user pressed Stop to avoid. So each
+ * gesture is measured against a snapshot taken immediately before it, and the
+ * whole slice is asserted.
+ */
+async function gesture(calls, act) {
+  const before = calls.length;
+  await act();
+  await flush();
+  return calls.slice(before);
+}
+
+/** The one call a gesture must produce, asserted exactly. */
+function onlyCall(produced, args, opts) {
+  assert.equal(produced.length, 1, `expected exactly one call, got ${JSON.stringify(produced)}`);
+  assert.equal(produced[0].tool, "runpod", "slice 8 folded every runpod_* name into `runpod`");
+  assert.deepEqual(produced[0].args, args);
+  if (opts !== undefined) assert.deepEqual(produced[0].opts, opts);
+  return produced[0];
+}
+
 test("the pod dropdown lists via runpod action:list", async (t) => {
   const { calls, view } = await mount(t);
   view.onActivate();
@@ -134,12 +160,8 @@ test("Connect sends runpod action:connect with the selected pod id", async (t) =
   const { calls, view, el } = await mount(t);
   view.onActivate();
   await flush();
-  el.connectBtn.click();
-  await flush();
-  const c = calls.find((x) => x.args?.action === "connect");
-  assert.ok(c, "Connect must issue a connect action");
-  assert.equal(c.tool, "runpod");
-  assert.equal(c.args.pod_id, "abc123", "the pod id from the dropdown must be forwarded");
+  const produced = await gesture(calls, () => el.connectBtn.click());
+  onlyCall(produced, { action: "connect", pod_id: "abc123" });
 });
 
 test("Start sends runpod action:start, Stop sends action:stop — not transposed", async (t) => {
@@ -148,23 +170,17 @@ test("Start sends runpod action:start, Stop sends action:stop — not transposed
     const { calls, view, el } = await mount(t, { status });
     view.onActivate();
     await flush();
-    el.startBtn.click();
-    await flush();
-    const c = calls.find((x) => x.args?.action && x.args.action !== "list");
-    assert.equal(c.tool, "runpod");
-    assert.equal(c.args.action, "start", "Start must not send stop");
-    assert.equal(c.args.pod_id, "abc123");
+    const produced = await gesture(calls, () => el.startBtn.click());
+    onlyCall(produced, { action: "start", pod_id: "abc123" });
   }
   {
     const { calls, view, el } = await mount(t, { status });
     view.onActivate();
     await flush();
-    el.stopBtn.click();
-    await flush();
-    const c = calls.find((x) => x.args?.action && x.args.action !== "list");
-    assert.equal(c.tool, "runpod");
-    assert.equal(c.args.action, "stop", "Stop must not send start — start RESUMES billing");
-    assert.equal(c.args.pod_id, "abc123");
+    const produced = await gesture(calls, () => el.stopBtn.click());
+    // Exactly one call: a trailing spurious `start` here would resume billing on
+    // the pod the user just asked to stop.
+    onlyCall(produced, { action: "stop", pod_id: "abc123" });
   }
 });
 
@@ -175,43 +191,37 @@ test("Use Local sends runpod action:use_local", async (t) => {
   });
   view.onActivate();
   await flush();
-  el.localBtn.click();
-  await flush();
-  const c = calls.find((x) => x.args?.action === "use_local");
-  assert.ok(c, "Use Local must issue use_local");
-  assert.equal(c.tool, "runpod");
+  const produced = await gesture(calls, () => el.localBtn.click());
+  onlyCall(produced, { action: "use_local" });
 });
 
 test("Deploy sends runpod action:create only after the second, confirming click", async (t) => {
   const { calls, view, el } = await mount(t);
   view.onActivate();
   await flush();
-  el.deployBtn.click(); // arms
-  await flush();
-  assert.equal(
-    calls.filter((x) => x.args?.action === "create").length,
-    0,
-    "arming must not deploy — a deploy bills GPU-time",
-  );
+  const arming = await gesture(calls, () => el.deployBtn.click());
+  assert.deepEqual(arming, [], "arming must issue NO call — a deploy bills GPU-time");
   // The arming cool-down ignores a confirm that lands too soon; wait it out.
   await new Promise((r) => setTimeout(r, 700));
-  el.deployBtn.click(); // confirms
-  await flush();
-  const c = calls.find((x) => x.args?.action === "create");
-  assert.ok(c, "the confirming click must deploy");
-  assert.equal(c.tool, "runpod");
-  assert.equal(c.opts?.timeout, 120000, "deploy keeps its long timeout");
+  const produced = await gesture(calls, () => el.deployBtn.click());
+  // The deploy re-lists to show the new pod, so the create must be first and the
+  // only lifecycle action in the slice.
+  assert.equal(produced[0].tool, "runpod");
+  assert.deepEqual(produced[0].args, { action: "create" });
+  assert.equal(produced[0].opts?.timeout, 120000, "deploy keeps its long timeout");
+  assert.deepEqual(
+    produced.filter((c) => c.args.action !== "create" && c.args.action !== "list"),
+    [],
+    "confirming a deploy must not also start/stop/connect anything",
+  );
 });
 
 test("the referral link sends runpod action:deploy_link", async (t) => {
   const { calls, view, el } = await mount(t);
   view.onActivate();
   await flush();
-  el.linkBtn.dispatch("click");
-  await flush();
-  const c = calls.find((x) => x.args?.action === "deploy_link");
-  assert.ok(c, "the referral link must issue deploy_link");
-  assert.equal(c.tool, "runpod");
+  const produced = await gesture(calls, () => el.linkBtn.dispatch("click"));
+  onlyCall(produced, { action: "deploy_link" });
 });
 
 test("every runpod call carries a non-empty action — a bare name is refused server-side", async (t) => {
