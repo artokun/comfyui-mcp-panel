@@ -704,6 +704,15 @@ function nodesInstallDeps(overrides) {
     isManagerUnreachable,
     isManagerRouteMissing,
     dialectRetryTarget,
+    // #671: the command budget + stall classifier the extracted nodes_install
+    // now closes over. A generous budget keeps these tests on their original
+    // code paths (no stall translation); the budget behavior itself is covered
+    // in manager-install.test.mjs.
+    NODES_INSTALL_COMMAND_BUDGET_MS: 25000,
+    isStallError: (err) => {
+      const msg = String(err?.message ?? err ?? "");
+      return err?.name === "AbortError" || err?.name === "TimeoutError" || /aborted|timed?\s*out/i.test(msg);
+    },
     reProbeManagerDialect: async () => "v2",
     managerQueueControl: async () => {},
     verifyInstalled: async () => ({ state: "installed", status: QUEUE_STATUS }),

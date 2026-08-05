@@ -711,7 +711,7 @@ test("#671 verifyInstalled (real panel source) answers 'unverified' inside the r
   };
   const verifyInstalled = loadVerifyInstalled({ budgetMs: 2500, get });
   const started = Date.now();
-  const outcome = await verifyInstalled("ComfyUI-MelBandRoFormer", "v2", {});
+  const outcome = await verifyInstalled("ComfyUI-MelBandRoFormer", "v2", { budgetMs: 2500 });
   const elapsed = Date.now() - started;
 
   // The reply must leave the tab WELL inside the orchestrator's 30s window.
@@ -741,32 +741,169 @@ test("#671 verifyInstalled (real panel source) still verifies a fast-draining in
     throw new Error(`unexpected route ${route}`);
   };
   const verifyInstalled = loadVerifyInstalled({ budgetMs: 3000, get });
-  const outcome = await verifyInstalled("ComfyUI-MelBandRoFormer", "v2", {});
+  const outcome = await verifyInstalled("ComfyUI-MelBandRoFormer", "v2", { budgetMs: 3000 });
   assert.equal(outcome.state, "installed");
 });
 
-// Fast wiring guard: the behavioral test above catches a reverted budget only
-// after waiting out the mutant's 120s drain. Pin the budget pass-through at
-// source level too, so a regression fails in milliseconds — the same style as
-// the #486/#485 wiring guards below.
-test("#671 verifyInstalled passes a sub-30s budget to waitForQueueDrain (wiring)", () => {
+// Fast wiring guard: the behavioral tests catch a reverted budget only after
+// waiting out the mutant's stall. Pin the budget threading at source level too,
+// so a regression fails in milliseconds — the same style as the #486/#485
+// wiring guards below.
+test("#671 nodes_install threads ONE sub-30s command budget through every phase (wiring)", () => {
   const src = readFileSync(
     fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
     "utf8",
   );
-  const constMatch = src.match(/const INSTALL_VERIFY_BUDGET_MS = (\d+);/);
-  assert.ok(constMatch, "INSTALL_VERIFY_BUDGET_MS must be defined");
+  const constMatch = src.match(/const NODES_INSTALL_COMMAND_BUDGET_MS = (\d+);/);
+  assert.ok(constMatch, "NODES_INSTALL_COMMAND_BUDGET_MS must be defined");
   assert.ok(
     Number(constMatch[1]) < 30000,
-    `verify budget (${constMatch[1]} ms) must fit inside the orchestrator's 30s reply window`,
+    `command budget (${constMatch[1]} ms) must fit inside the orchestrator's 30s reply window`,
   );
+  const fnMatch = src.match(/async nodes_install\(args\)\s*\{[\s\S]*?\n {2}\},/);
+  assert.ok(fnMatch, "could not locate nodes_install in panel source");
+  const body = fnMatch[0];
+  // The verify phase draws on what the command budget has LEFT — not a fresh
+  // fixed budget that could stack past the relay window on top of slow calls.
+  assert.match(
+    body,
+    /verifyInstalled\(target, dialect, \{\s*batchFailed, renameProne, budgetMs: remaining\(\)\s*\}\)/,
+    "verifyInstalled must receive the remaining command budget",
+  );
+  // A budget-exhausted stall is reworded per phase, never reported raw.
+  assert.match(body, /translateStall\(err, phase\)/, "stalls past the budget must be translated");
+  // The verify wait is bounded by the threaded budget.
   const verifyMatch = src.match(/async function verifyInstalled\([\s\S]*?\n\}/);
   assert.ok(verifyMatch, "could not locate verifyInstalled in panel source");
   assert.match(
     verifyMatch[0],
-    /waitForQueueDrain\(\{\s*timeoutMs: INSTALL_VERIFY_BUDGET_MS/,
-    "verifyInstalled must bound the drain wait by INSTALL_VERIFY_BUDGET_MS",
+    /waitForQueueDrain\(\{\s*timeoutMs: budget/,
+    "verifyInstalled must bound the drain wait by its budget",
   );
+});
+
+// The codex-round-1 P1/P2: bounding ONLY the verify phase still let the reply
+// miss the 30s window when pre-verify Manager calls each ate their 15s cap.
+// Drive the REAL extracted nodes_install end-to-end against a Manager that
+// accepts the dialect probe but HANGS the install POST: the command must throw
+// an honest, phase-truthful budget error inside the window — never sit silent
+// until the relay reports a wedged tab.
+function loadNodesInstall({ budgetMs, managerV2, managerCall, managerQueueControl, verifyInstalled }) {
+  const src = readFileSync(
+    fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
+    "utf8",
+  );
+  const fnMatch = src.match(/async nodes_install\(args\)\s*\{[\s\S]*?\n {2}\},/);
+  assert.ok(fnMatch, "could not locate nodes_install in panel source");
+  const body = fnMatch[0].replace(/,\s*$/, "");
+  const factory = new Function(
+    "detectManagerDialect",
+    "crypto",
+    "api",
+    "installGitUrl",
+    "buildInstallRequest",
+    "isManagerRouteMissing",
+    "dialectRetryTarget",
+    "reProbeManagerDialect",
+    "managerV2",
+    "managerCall",
+    "managerQueueControl",
+    "verifyInstalled",
+    "isStallError",
+    "MANAGER_FETCH_TIMEOUT_MS",
+    "NODES_INSTALL_COMMAND_BUDGET_MS",
+    "AbortSignal",
+    `const handler = { ${body} };\nreturn handler.nodes_install;`,
+  );
+  return factory(
+    async () => "v2", // dialect probe answers instantly — the Manager is ALIVE
+    { randomUUID: () => "ui-test-1" },
+    { clientId: "test-client" },
+    installGitUrl,
+    buildInstallRequest,
+    ManagerInstall.isManagerRouteMissing,
+    ManagerInstall.dialectRetryTarget,
+    async () => { throw new Error("reProbeManagerDialect must not run (no 404 here)"); },
+    managerV2,
+    managerCall,
+    managerQueueControl,
+    verifyInstalled,
+    isStallErrorShim,
+    15000,
+    budgetMs,
+    AbortSignal,
+  );
+}
+
+// Faithful stand-in for the panel's isStallError (a plain predicate, not the
+// unit under test): AbortError / TimeoutError / an aborted-or-timed-out message.
+function isStallErrorShim(err) {
+  const msg = String(err?.message ?? err ?? "");
+  return err?.name === "AbortError" || err?.name === "TimeoutError" || /aborted|timed?\s*out/i.test(msg);
+}
+
+test("#671 nodes_install (real panel source) answers inside the reply window when the Manager stalls the install POST", async () => {
+  // The install POST hangs forever (signal-aware); every other call answers.
+  const managerV2 = (route, opts) => {
+    if (route === "manager/queue/task") {
+      return new Promise((_, reject) => {
+        opts?.signal?.addEventListener(
+          "abort",
+          () => reject(Object.assign(new Error("The operation timed out"), { name: "TimeoutError" })),
+          { once: true },
+        );
+      });
+    }
+    return Promise.reject(new Error(`unexpected route ${route}`));
+  };
+  const nodes_install = loadNodesInstall({
+    budgetMs: 2500,
+    managerV2,
+    managerCall: async () => { throw new Error("managerCall must not run on the v2 dialect"); },
+    managerQueueControl: async () => { throw new Error("start must not run — the submit never landed"); },
+    verifyInstalled: async () => { throw new Error("verify must not run — the submit never landed"); },
+  });
+  const started = Date.now();
+  const err = await nodes_install({ id: "ComfyUI-MelBandRoFormer" }).then(
+    () => null,
+    (e) => e,
+  );
+  const elapsed = Date.now() - started;
+
+  assert.ok(err, "a stalled submit must surface an error, never a silent success");
+  // The reply leaves the tab WELL inside the 30s relay window. A missing
+  // command budget waits out the 15s per-fetch cap — caught by this bound.
+  assert.ok(elapsed < 10000, `the command outlived its budget (${elapsed} ms)`);
+  // Assert the REASON and the honest state claim: queued-state UNKNOWN, never
+  // a fabricated failure — and an actionable next step (a blind retry can
+  // double-queue the install).
+  assert.match(err.message, /command budget/);
+  assert.match(err.message, /UNKNOWN/);
+  assert.match(err.message, /panel_node_queue_status/);
+});
+
+test("#671 nodes_install (real panel source) happy path still verifies inside the window", async () => {
+  // Positive control: a fast Manager must still reach the verified reply.
+  const calls = [];
+  const managerV2 = async (route) => {
+    calls.push(route);
+    return null;
+  };
+  const nodes_install = loadNodesInstall({
+    budgetMs: 2500,
+    managerV2,
+    managerCall: async () => { throw new Error("managerCall must not run on the v2 dialect"); },
+    managerQueueControl: async () => {},
+    verifyInstalled: async () => ({ state: "installed", status: null }),
+  });
+  const started = Date.now();
+  const result = await nodes_install({ id: "ComfyUI-MelBandRoFormer" });
+  const elapsed = Date.now() - started;
+  assert.equal(result.installed, true);
+  assert.equal(result.verified, true);
+  assert.equal(result.ui_id, "ui-test-1");
+  assert.ok(elapsed < 2500, `the happy path must not wait out the budget (${elapsed} ms)`);
+  assert.deepEqual(calls, ["manager/queue/task"], "exactly one submit, on the v2 task route");
 });
 
 // ---------------------------------------------------------------------------
@@ -794,13 +931,18 @@ test("#486 managerQueueControl (real panel source): POST, then GET-retry ONLY on
 
   const isMethodNotAllowed = (err) => /HTTP\s*405\b/.test(String(err?.message ?? err ?? ""));
   const MANAGER_FETCH_TIMEOUT_MS = 15000;
+  // The real source composes the per-fetch cap with an optional caller budget
+  // signal (#671) via anyAbortSignal; inject a faithful stand-in (the helper is
+  // not the unit under test here).
+  const anyAbortSignal = (signals) => AbortSignal.any(signals.filter(Boolean));
   const factory = new Function(
     "isMethodNotAllowed",
     "MANAGER_FETCH_TIMEOUT_MS",
+    "anyAbortSignal",
     "AbortSignal",
     `${fnMatch[0]}\nreturn managerQueueControl;`,
   );
-  const managerQueueControl = factory(isMethodNotAllowed, MANAGER_FETCH_TIMEOUT_MS, AbortSignal);
+  const managerQueueControl = factory(isMethodNotAllowed, MANAGER_FETCH_TIMEOUT_MS, anyAbortSignal, AbortSignal);
 
   // (a) POST succeeds ⇒ exactly one POST, no GET retry.
   {
@@ -860,7 +1002,7 @@ test("#486 nodes_install starts the queue via managerQueueControl, never a raw P
   // The start goes through the negotiator, routed to the effective dialect's caller.
   assert.match(
     body,
-    /managerQueueControl\(\s*dialect === "legacy" \? managerCall : managerV2,\s*"manager\/queue\/start"\s*\)/,
+    /managerQueueControl\(\s*dialect === "legacy" \? managerCall : managerV2,\s*"manager\/queue\/start"/,
   );
   // No raw start POST survives in the install path (the #486 regression).
   assert.ok(
@@ -897,15 +1039,17 @@ test("#485 nodes_install falls back to the legacy dialect on an unreachable sign
   );
   assert.match(
     body,
-    /dialectRetryTarget\(dialect, await reProbeManagerDialect\(\)\)/,
+    /dialectRetryTarget\(\s*dialect,\s*await reProbeManagerDialect\(/,
     "the retry dialect comes from a live re-probe via the ladder",
   );
   assert.match(body, /if \(!retry\) throw err;/, "legacy-on-legacy gives up with the original error");
   assert.match(body, /submitted = await submitInstall\(retry\)/);
-  // The single queue/start MUST live OUTSIDE the try/catch (after it) so a start
-  // failure never re-runs the submit (codex P0 — no double-fire).
+  // The single queue/start MUST live OUTSIDE the submit try/catch (after it) so
+  // a start failure never re-runs the submit (codex P0 — no double-fire). The
+  // call is multiline (it takes a budget signal, #671) — anchor on its name,
+  // which occurs only at that one call site in this body.
   const catchIdx = body.indexOf("catch (err)");
-  const startIdx = body.indexOf('managerQueueControl(dialect === "legacy"');
+  const startIdx = body.indexOf("managerQueueControl(");
   assert.ok(catchIdx >= 0 && startIdx > catchIdx, "queue/start must run after the submit try/catch");
 });
 
