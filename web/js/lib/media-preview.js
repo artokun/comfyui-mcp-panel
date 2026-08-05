@@ -325,8 +325,13 @@ export async function composeShowMediaReply(items, deps = {}) {
       } catch (err) {
         note("[cmcp] show_media: could not build a view URL for", name, err);
         url = null;
-        why = "the panel could not build a view URL for its ComfyUI reference";
       }
+      // Keyed on the OUTCOME, not on whether it threw. A URL builder that
+      // returns null instead of throwing is the same failure, and reporting it
+      // as "carried neither inline data nor a ComfyUI reference" is false — the
+      // reference is right there, and the caller would be told to re-send
+      // something it already sent correctly.
+      if (!url) why = "the panel could not build a view URL for its ComfyUI reference";
     } else if (typeof item?.dataUrl === "string" && item.dataUrl) {
       url = item.dataUrl;
     }
@@ -649,6 +654,22 @@ async function produceSheet(job, deps) {
         frames: null,
         cells: null,
         why: "its contact sheet could not be uploaded to ComfyUI",
+      };
+    }
+    // A truthy ref is not a RETRIEVABLE ref. `uploadBlobToInput` builds
+    // `{filename: info.name, …}` from whatever `/upload/image` returned, so a
+    // response without `name` yields a perfectly truthy object whose filename is
+    // undefined — and the reply would then announce that a sampled preview
+    // exists and tell the agent to fetch `filename ""`, which resolves to
+    // nothing. A remedy that cannot be followed is the defect this module
+    // exists to remove, so an unusable ref degrades like any other failure.
+    if (!String(ref.filename ?? "").trim()) {
+      warn("[cmcp] show_media: storyboard upload returned no filename for", job.name);
+      return {
+        ref: null,
+        frames: null,
+        cells: null,
+        why: "its contact sheet uploaded but came back with no filename, so nothing can point you at it",
       };
     }
     // The GRID's capacity. It is NOT the number of frames sampled: a video whose

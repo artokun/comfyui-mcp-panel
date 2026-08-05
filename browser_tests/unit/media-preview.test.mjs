@@ -307,6 +307,34 @@ test("a failed sheet upload degrades with a reason and a remedy", async () => {
   assert.match(reply.note, /call get_image with filename "reference_clip\.mp4"/);
 });
 
+test("a truthy-but-UNRETRIEVABLE sheet ref is not announced as a preview", async () => {
+  // uploadBlobToInput builds {filename: info.name, …}, so an /upload/image
+  // response without `name` yields a truthy object with no filename. Announcing
+  // a preview and telling the agent to fetch `filename ""` is a remedy that
+  // cannot be followed — worse than saying the preview failed.
+  for (const bad of [{}, { filename: "" }, { filename: "   " }, { filename: null }]) {
+    const h = harness({ uploadBlobToInput: async () => bad });
+    const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+    assert.equal(reply.previews.length, 0, `announced a preview for ${JSON.stringify(bad)}`);
+    assert.match(reply.note, /came back with no filename/);
+    assert.doesNotMatch(reply.note, /SAMPLED PREVIEW/);
+    assert.doesNotMatch(reply.note, /filename ""/);
+    // …and it still ends somewhere the caller can go.
+    assert.match(reply.note, /call get_image with filename "reference_clip\.mp4"/);
+  }
+});
+
+test("a URL builder that RETURNS nothing is the same failure as one that throws", async () => {
+  // Keyed on the outcome, not on whether it threw: "carried neither inline data
+  // nor a ComfyUI reference" is false when the reference is right there, and it
+  // tells the caller to re-send something it already sent correctly.
+  const h = harness({ imageViewUrl: () => null });
+  const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
+  assert.match(reply.note, /could not build a view URL for its ComfyUI reference/);
+  assert.doesNotMatch(reply.note, /carried neither inline data/);
+  assert.match(reply.note, /call get_image with filename "reference_clip\.mp4", type "input"/);
+});
+
 test("a sheet whose SAMPLE count is unknown is NOT offered as an N-frame sample", async () => {
   // A sheet exists, but the builder did not say how many cells it drew into.
   // Quoting the grid capacity instead would invent observations from blank
@@ -997,6 +1025,29 @@ test("a THROWING setTimer must not silently REMOVE the bound", async () => {
 
 test("withTimeout with a non-positive bound is a passthrough", async () => {
   assert.equal(await withTimeout(Promise.resolve(7), 0, () => 8, {}), 7);
+});
+
+test("firing the bound clears the timer it holds, so two timers are never left pending", async () => {
+  // The arm-then-throw case leaks the injected timer irrecoverably (its handle
+  // was never returned). Whichever timer fires first must at least clear the
+  // other, or the leak is two rather than one.
+  let injected;
+  let cleared = 0;
+  const v = await withTimeout(new Promise(() => {}), 1000, () => "fallback", {
+    setTimer: (fn) => {
+      injected = fn;
+      throw new Error("armed, then threw");
+    },
+    clearTimer: () => {
+      cleared += 1;
+    },
+  });
+  assert.equal(v, "fallback");
+  assert.equal(typeof injected, "function", "the thrower still captured the callback");
+  // The platform fallback is what resolved; firing the leaked injected timer now
+  // must be a no-op rather than a second resolution.
+  injected();
+  assert.equal(await withTimeout(Promise.resolve("x"), 0, () => "y", {}), "x");
 });
 
 test("a late fulfilment after the bound fired does not overwrite the fallback", async () => {

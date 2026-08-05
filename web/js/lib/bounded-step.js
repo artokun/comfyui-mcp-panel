@@ -76,6 +76,14 @@ export function withTimeout(promise, ms, onTimeout, timers = {}) {
     const fire = () => {
       if (settled) return;
       settled = true;
+      // Clear whichever timer we hold a handle for. In the arm-then-throw case
+      // below this is the FALLBACK timer, fired by the leaked one — without this
+      // both were left pending.
+      try {
+        clear(t);
+      } catch {
+        /* see done(): a leaked timer beats a wedge */
+      }
       resolve(fallback());
     };
     try {
@@ -86,11 +94,12 @@ export function withTimeout(promise, ms, onTimeout, timers = {}) {
       // outcome this helper exists to prevent. Fall back to the platform timer
       // (and its matching clear, since the injected pair no longer owns it).
       //
-      // Stated plainly: if `setTimer` ARMED a timer and then threw, that timer
-      // is leaked — its handle was never returned, so nothing can clear it. The
-      // result is still correct (`fire` is idempotent via `settled`, so the late
-      // timer resolves nothing), and the cost is one stray timer. There is no
-      // way to recover a handle a thrower never yielded.
+      // Stated plainly: if `setTimer` ARMED a timer and then threw, THAT timer
+      // is leaked — its handle was never returned, so nothing can clear it, and
+      // there is no way to recover a handle a thrower never yielded. The result
+      // is still correct (`fire` and `done` are both idempotent via `settled`),
+      // and whichever of the two fires first now clears the other, so the cost
+      // is exactly one stray timer rather than two.
       try {
         t = setTimeout(fire, ms);
         clear = (h) => clearTimeout(h);
