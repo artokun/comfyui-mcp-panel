@@ -608,6 +608,19 @@ export function resolveOpenRebindVerdict({
   return { status: OPEN_REBIND_STATUS.PROVEN, bindingProven: true, unproven: [] };
 }
 
+/** Did a content comparison actually HAPPEN? The single rule every sentence about
+ *  content asks, so the headline and the per-part clause cannot disagree with each
+ *  other — which they did, because one tested `=== true` and the other `=== false`
+ *  and an absent value fell down opposite branches.
+ *
+ *  Only an explicit `true` counts. `graphRootMatchesState` returns false for BOTH
+ *  "compared and differed" and "could not read the root", so a caller that says
+ *  nothing about comparability has not established one — and an unestablished
+ *  observation must never license the definite claim. */
+function contentWasCompared(observed) {
+  return observed?.contentComparable === true;
+}
+
 /** One clause per failed part, naming the TWO VALUES that disagreed. A refusal
  *  that says only "the fence rejected" is not actionable; one that says which
  *  observation failed and what was seen instead is. */
@@ -635,11 +648,17 @@ function openRebindPartClause(part, observed = {}) {
         `so the graph-command fence would still treat it as a different canvas`
       );
     case "content":
-      return observed.contentComparable === false
-        ? `the panel could not compare the loaded graph with the canvas at all, so it is UNKNOWN — ` +
-            `not established — whether the whole graph landed`
-        : `the graph on the canvas differs from what was loaded on: ` +
-            `${(observed.contentSurfaces ?? []).join(", ") || "an unnamed surface"}`;
+      // `contentWasCompared`, NOT `=== false`. Testing only the literal false let an
+      // ABSENT or non-boolean comparability fall through to the definite-difference
+      // wording — so this clause asserted a measured mismatch while the headline
+      // (which tests `=== true`) correctly said the panel could not read the graph,
+      // and one disclosure contradicted itself. Both now ask the same question, and
+      // the burden sits on the CLAIM: only a positive "yes, compared" licenses it.
+      return contentWasCompared(observed)
+        ? `the graph on the canvas differs from what was loaded on: ` +
+            `${(observed.contentSurfaces ?? []).join(", ") || "an unnamed surface"}`
+        : `the panel could not compare the loaded graph with the canvas at all, so it is UNKNOWN — ` +
+            `not established — whether the whole graph landed`;
     default:
       return `an unrecognized check (${part}) did not pass`;
   }
@@ -680,7 +699,7 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
     // truth is that we could not look. `describeGraphStateDifference` keeps the two
     // apart and the caller passes that through as `contentComparable`; anything but
     // an explicit `true` takes the non-asserting wording.
-    const compared = observed.contentComparable === true;
+    const compared = contentWasCompared(observed);
     return (
       `workflow_open RAN and the canvas IS bound to ${workflow} — that much was proven — but ` +
       (compared

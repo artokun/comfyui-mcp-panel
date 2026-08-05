@@ -458,11 +458,42 @@ test("an ABSENT contentComparable takes the non-asserting wording, never the mis
   });
   for (const unstated of [undefined, null, "true", 1]) {
     const text = describeOpenRebindOutcome(verdict, { targetLabel: "a.json", contentComparable: unstated });
-    assert.doesNotMatch(
-      text,
-      /does not match the state that was loaded/,
-      `an unstated comparability (${JSON.stringify(unstated)}) must not license a mismatch claim`,
+    const why = `an unstated comparability (${JSON.stringify(unstated)})`;
+    assert.doesNotMatch(text, /does not match the state that was loaded/, `${why} must not license a HEADLINE mismatch claim`);
+    // ...and the per-part CLAUSE must not smuggle the same claim back in. The first cut
+    // fixed only the headline: the clause tested `=== false`, so an absent value fell
+    // down the opposite branch and the one disclosure contradicted itself — it said
+    // "could not READ … NOT established as wrong" and then "the graph … differs".
+    assert.doesNotMatch(text, /differs from what was loaded/, `${why} must not license a CLAUSE mismatch claim either`);
+    assert.match(text, /could not compare the loaded graph/, `${why} must say a comparison did not happen`);
+  }
+});
+
+test("the headline and the content clause always agree about whether a comparison happened", () => {
+  // They are two sentences in ONE disclosure and were derived from opposite tests
+  // (`=== true` vs `=== false`). Whatever the input, they must never state both
+  // "could not read it" and "it differs".
+  const verdict = resolveOpenRebindVerdict({
+    instanceStillTarget: true,
+    markerMatches: true,
+    identityMatches: true,
+    contentMatches: false,
+  });
+  for (const value of [true, false, undefined, null, "true", 1, 0, {}]) {
+    const text = describeOpenRebindOutcome(verdict, {
+      targetLabel: "a.json",
+      contentComparable: value,
+      contentSurfaces: ["nodes"],
+    });
+    const claimsDifference = /differs from what was loaded/.test(text) || /does not match the state that was loaded/.test(text);
+    const claimsUnreadable = /could not compare the loaded graph/.test(text) || /could not READ the graph on it/.test(text);
+    assert.notEqual(
+      claimsDifference && claimsUnreadable,
+      true,
+      `contentComparable=${JSON.stringify(value)} produced a self-contradicting disclosure`,
     );
+    assert.equal(claimsDifference || claimsUnreadable, true, "it must say one or the other");
+    assert.equal(claimsDifference, value === true, "only an explicit `true` may license the difference claim");
   }
 });
 
