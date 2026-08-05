@@ -9190,25 +9190,53 @@ const GRAPH_TOOL_EXECUTORS = {
     // comes AFTER the ledger registration above so any partially-verified
     // prompts (which ARE queued, scoped) stay reconcilable (#370).
     if (runScopeResult && runScopeResult.outcome !== "dispatched") {
-      const failed = { queued: false, error: runScopeResult.error };
-      // #556 (codex gate r5, P1) — DISCLOSE the work that DID happen. A partial
-      // batch (one or more prompts verified and queued WITH the scope, a later
-      // one refused) is not a run that failed; it is a run that partly
-      // succeeded. Returning a bare queued:false for it reports failure for
-      // work that is at this moment executing on the GPU, and the obvious
-      // reaction — re-run the whole batch — queues the verified prompts a
-      // SECOND time. Refuse-vs-disclose: the refusal covers only what did not
-      // happen, and what did happen is named, with its prompt_ids, so the
-      // caller can track it and re-run only the remainder.
+      // #556 (codex gate r5/r6, P1) — a PARTIAL batch is not a failed run.
+      // One or more prompts were verified and queued WITH the scope; a later
+      // one was not. `queued:false` asserts that nothing was queued, which is
+      // FALSE while those prompts are executing on the GPU — and a caller
+      // branching on that flag re-runs the batch and pays for them twice.
+      // Between the two possible misreadings, "nothing happened" is the
+      // destructive one; "everything happened" merely leaves a visible,
+      // recoverable gap. So a partial reports queued:true with complete:false,
+      // and the reason moves out of `error` (which reads as "this did not
+      // happen") into `incomplete_reason`.
       if (runScopeResult.verified > 0) {
-        failed.partially_queued = true;
-        failed.queued_count = runScopeResult.verified;
-        failed.queued_prompt_ids = queuedPromptIds.slice();
+        const unknown = runScopeResult.indeterminate > 0;
+        return {
+          queued: true,
+          complete: false,
+          partially_queued: true,
+          queued_count: runScopeResult.verified,
+          queued_prompt_ids: queuedPromptIds.slice(),
+          ran_to_node: Number(to_node_id),
+          incomplete_reason: runScopeResult.error,
+          // RETRY GUIDANCE MUST NOT ASSERT A REMAINDER IT CANNOT COUNT
+          // (gate r6). When a prompt's outcome is INDETERMINATE — its fetch
+          // threw, or its response was unparseable — ComfyUI may or may not
+          // have queued it. Naming a precise remainder there would send the
+          // caller to re-run something that could already be rendering.
+          retry_guidance: unknown
+            ? `${runScopeResult.verified} of ${batch} prompt(s) ARE queued and scoped to ` +
+              `node ${to_node_id} (prompt_ids above). ${runScopeResult.indeterminate} more ` +
+              `left the panel but their outcome could NOT be determined — ComfyUI may or ` +
+              `may not have queued them. Check the ComfyUI queue before re-running anything: ` +
+              `the remaining count cannot be stated from here without risking a duplicate render.`
+            : `${runScopeResult.verified} of ${batch} prompt(s) ARE queued and scoped to ` +
+              `node ${to_node_id}; they are running and are tracked by the prompt_ids above. ` +
+              `Re-run only the remaining ${Math.max(0, batch - runScopeResult.verified)} — ` +
+              `re-running the full batch would queue the already-running prompt(s) again.`,
+        };
+      }
+      // Nothing verified. But "nothing verified" is still not always "nothing
+      // queued": an indeterminate dispatch left the panel and may have been
+      // accepted. Refuse — but never claim more certainty than was observed.
+      const failed = { queued: false, error: runScopeResult.error };
+      if (runScopeResult.indeterminate > 0) {
+        failed.outcome_unknown = true;
         failed.retry_guidance =
-          `${runScopeResult.verified} of ${batch} prompt(s) ARE queued and scoped to node ` +
-          `${to_node_id}; they are running and are tracked by the prompt_ids above. ` +
-          `Re-run only the remaining ${Math.max(0, batch - runScopeResult.verified)} — ` +
-          `re-running the full batch would queue the already-running prompt(s) again.`;
+          `No prompt was confirmed queued, but ${runScopeResult.indeterminate} request(s) ` +
+          `DID leave the panel and their outcome could not be determined — ComfyUI may have ` +
+          `queued them. Check the ComfyUI queue before retrying rather than assuming nothing ran.`;
       }
       return failed;
     }

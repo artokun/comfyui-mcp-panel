@@ -1048,10 +1048,10 @@ test("#630 gate r5 P1: graph_run discloses a PARTIAL batch's queued work instead
   const source = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.js"), "utf8").replace(/\r\n/g, "\n");
   const start = source.indexOf("if (runScopeResult && runScopeResult.outcome !== \"dispatched\")");
   assert.ok(start > 0);
-  const block = source.slice(start, start + 2200).replace(/`\s*\+\s*\n\s*`/g, "").replace(/\s+/g, " ");
+  const block = source.slice(start, start + 4600).replace(/`\s*\+\s*\n\s*`/g, "").replace(/\s+/g, " ");
   assert.match(block, /if \(runScopeResult\.verified > 0\)/, "the partial case is distinguished from a total failure");
-  assert.match(block, /partially_queued = true/);
-  assert.match(block, /queued_prompt_ids = queuedPromptIds/, "the caller can TRACK what is already running");
+  assert.match(block, /partially_queued: true/);
+  assert.match(block, /queued_prompt_ids: queuedPromptIds\.slice\(\)/, "the caller can TRACK what is already running");
   assert.match(block, /Re-run only the remaining/, "and is told not to re-run the whole batch");
   assert.match(block, /would queue the already-running prompt\(s\) again/, "with the reason stated");
 });
@@ -1116,36 +1116,61 @@ test("#630 gate r4: a MALFORMED response keeps its slot — 'could not tell whet
   }
 });
 
-test("#630 gate r3: the quota counts only COMPLETED work — a failed post does not fence out the retry that is still owed", async () => {
-  // A post whose fetch threw never reached ComfyUI, so a later post of the same
-  // batch is legitimately still owed. Counting it toward the quota would fence
-  // out real requested work.
+test("#630 gate r6: a THROWN fetch is INDETERMINATE, not proof of non-arrival — its slot stays consumed", async () => {
+  // This test previously asserted the opposite: that a throw means the request
+  // never reached ComfyUI, so its quota slot was released and a retry could
+  // dispatch. That premise is wrong and is this cluster's defect class exactly.
+  // A fetch can throw AFTER ComfyUI received and queued the prompt — a reset
+  // while reading the response is indistinguishable from one before the request
+  // left. Releasing the slot on that basis re-dispatches a branch that may
+  // already be rendering.
   const stop = keepAlive();
   try {
-    let n = 0;
     const server = makeServer(() => {
-      if (n++ === 0) throw new Error("network blip");
-      return jsonResponse(200, { prompt_id: "srv-late" });
+      throw new Error("connection reset");
     });
     const guard = createScopedRunGuard({
       origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
       repairScope: true,
     });
     const post = () => guard(...promptPost(frontendBody({ number: MARK_A, targets: null })));
-    await assert.rejects(post, /network blip/, "the frontend sees the failure it would have seen");
+    await assert.rejects(post, /connection reset/, "the frontend still sees the failure it would have seen");
     assert.ok(guard.state.failed, "recorded as a dispatch FAILURE, never a success");
-    assert.equal(guard.state.observed, 0);
-    // The retry is still owed — it must not be fenced as an overrun.
-    await post();
-    assert.equal(guard.state.observed, 1, "the owed prompt still dispatches");
-    assert.equal(guard.state.overrun, 0, "a failed post never consumed the quota");
-    // …and NOW the quota is spent, so a third post is fenced.
-    await post();
+    assert.equal(guard.state.observed, 0, "and never counted as verified");
+    assert.equal(guard.state.indeterminate, 1, "its outcome is recorded as UNKNOWN, which is what it is");
+    // The slot is spent: a second post cannot double-render a branch that may
+    // already be queued.
+    const again = await post();
+    assert.equal(again.status, 400);
     assert.equal(guard.state.overrun, 1);
-    assert.equal(guard.state.observed, 1, "no extra execution of the branch");
+    assert.equal(server.calls.length, 1, "exactly one request ever left the panel");
   } finally {
     stop();
   }
+});
+
+test("#630 gate r6: graph_run never states a remainder it cannot count, and never claims 'nothing queued' after an indeterminate dispatch", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const source = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.js"), "utf8").replace(/\r\n/g, "\n");
+  const start = source.indexOf('if (runScopeResult && runScopeResult.outcome !== "dispatched")');
+  assert.ok(start > 0);
+  const block = source.slice(start, start + 4200).replace(/`\s*\+\s*\n\s*`/g, "").replace(/\s+/g, " ");
+  // A partial no longer asserts "not queued" for prompts that are executing.
+  assert.match(block, /queued: true, complete: false, partially_queued: true/,
+    "a partial batch is queued-but-incomplete, never a flat failure");
+  assert.match(block, /incomplete_reason: runScopeResult\.error/,
+    "and its reason does not masquerade as an error about work that did happen");
+  // The remainder is only named when it is actually knowable.
+  assert.match(block, /const unknown = runScopeResult\.indeterminate > 0;/);
+  // …and that flag must actually SELECT the guidance. Asserting only that both
+  // strings exist would pass a version that always names a remainder.
+  assert.match(block, /retry_guidance: unknown \?/,
+    "the indeterminate flag gates which guidance is given, it is not merely computed");
+  assert.match(block, /the remaining count cannot be stated from here without risking a duplicate render/);
+  assert.match(block, /Check the ComfyUI queue before re-running anything/);
+  // Zero verified + an indeterminate dispatch is still not "nothing ran".
+  assert.match(block, /outcome_unknown = true/);
+  assert.match(block, /rather than assuming nothing ran/);
 });
 
 test("#630 gate r2 P1: describeObserved NEVER throws — the refusal path's own formatting cannot be what fails", () => {

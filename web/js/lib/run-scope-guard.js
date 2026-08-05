@@ -862,10 +862,15 @@ export function createScopedRunGuard({
       try {
         res = await origFetchApi(route, forwardOptions);
       } catch (err) {
-        // The request never reached ComfyUI, so this slot was NOT consumed —
-        // release it, or the retry that is still owed would be fenced out as an
-        // overrun. Only work that actually left counts against the quota.
+        // INDETERMINATE, not "never arrived" (codex gate r6). A fetch can throw
+        // after ComfyUI already received and queued the prompt — a reset while
+        // reading the response looks identical to one before the request left.
+        // Treating the throw as proof of non-arrival is this cluster's defect
+        // class exactly, and acting on it re-dispatches a branch that may
+        // already be rendering. So the slot stays CONSUMED and the outcome is
+        // recorded as unknown, which is what it is.
         state.inFlight--;
+        state.indeterminate++;
         if (state.failed == null) {
           state.failed = scopeDispatchError({
             toNodeId,
@@ -1158,7 +1163,8 @@ export async function dispatchScopedRun({
             outcome: "unverified",
             queueMark: mark,
             verified,
-            volatileInputs: volatileList,
+            indeterminate: guard.state.indeterminate,
+      volatileInputs: volatileList,
             error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: true, verified, batch }),
           };
         }
@@ -1167,7 +1173,8 @@ export async function dispatchScopedRun({
           outcome: "unverified",
           queueMark: mark,
           verified,
-          volatileInputs: volatileList,
+          indeterminate: guard.state.indeterminate,
+      volatileInputs: volatileList,
           error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: false, verified, batch }),
         };
       }
@@ -1239,7 +1246,8 @@ export async function dispatchScopedRun({
         outcome: "failed",
         queueMark: mark,
         verified: guard.state.observed,
-        volatileInputs: volatileList,
+        indeterminate: guard.state.indeterminate,
+      volatileInputs: volatileList,
         error: guard.state.failed +
           (keepGuardInstalled
             ? " The scope guard stays installed as a sentinel for the rest of this page session."
@@ -1256,7 +1264,8 @@ export async function dispatchScopedRun({
         verified: guard.state.observed,
         repaired: guard.state.repaired,
         scopeAppliedBy: guard.state.repaired > 0 ? "request_body_repair" : "frontend",
-        volatileInputs: volatileList,
+        indeterminate: guard.state.indeterminate,
+      volatileInputs: volatileList,
       };
     }
     // The FULL batch verified — genuinely dispatched (r5: never on a partial).
@@ -1280,7 +1289,8 @@ export async function dispatchScopedRun({
         // frontend produced one rather than be left to wonder at the queue.
         overrunBlocked: guard.state.overrun,
         overrunNote: guard.state.overrunError,
-        volatileInputs: volatileList,
+        indeterminate: guard.state.indeterminate,
+      volatileInputs: volatileList,
       };
     }
     // r7 CONTENT DRIFT with ZERO verified posts is NOT an argument-shape
@@ -1305,6 +1315,7 @@ export async function dispatchScopedRun({
       outcome: "refused",
       queueMark: mark,
       verified: guard.state.observed,
+      indeterminate: guard.state.indeterminate,
       volatileInputs: volatileList,
       error: scopePartialBatchError({
         toNodeId,
