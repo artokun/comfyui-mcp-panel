@@ -772,6 +772,26 @@ test("#671 nodes_install threads ONE sub-30s command budget through every phase 
   );
   // A budget-exhausted stall is reworded per phase, never reported raw.
   assert.match(body, /translateStall\(err, phase\)/, "stalls past the budget must be translated");
+  // EVERY phase draws on the SAME remaining budget (codex r2 P2 — a phase
+  // without the cap can stack past the relay window ahead of verification).
+  assert.match(
+    body,
+    /detectManagerDialect\(\{\s*signal: AbortSignal\.timeout\(bounded\(/,
+    "dialect detection must be budget-bounded",
+  );
+  assert.match(
+    body,
+    /reProbeManagerDialect\(\{ signal: AbortSignal\.timeout\(bounded\(/,
+    "the #605 re-probe must be budget-bounded",
+  );
+  assert.match(
+    body,
+    /"manager\/queue\/start",\s*\{ signal: AbortSignal\.timeout\(bounded\(/,
+    "queue/start must be budget-bounded",
+  );
+  // The re-probe is its own phase: it only runs after a PROVEN 404, so a stall
+  // there can honestly claim NOTHING was queued (codex r2 P2).
+  assert.match(body, /phase = "reprobe";/, "the re-probe must be its own phase");
   // The verify wait is bounded by the threaded budget.
   const verifyMatch = src.match(/async function verifyInstalled\([\s\S]*?\n\}/);
   assert.ok(verifyMatch, "could not locate verifyInstalled in panel source");
@@ -788,13 +808,16 @@ test("#671 nodes_install threads ONE sub-30s command budget through every phase 
 // accepts the dialect probe but HANGS the install POST: the command must throw
 // an honest, phase-truthful budget error inside the window — never sit silent
 // until the relay reports a wedged tab.
-function loadNodesInstall({ budgetMs, managerV2, managerCall, managerQueueControl, verifyInstalled }) {
+function loadNodesInstall({ budgetMs, detect, reProbe, managerV2, managerCall, managerQueueControl, verifyInstalled }) {
   const src = readFileSync(
     fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
     "utf8",
   );
   const fnMatch = src.match(/async nodes_install\(args\)\s*\{[\s\S]*?\n {2}\},/);
-  assert.ok(fnMatch, "could not locate nodes_install in panel source");
+  // The REAL isStallError is compiled in with the handler (codex r2 P2 — a shim
+  // would let the production classifier regress unnoticed).
+  const stallMatch = src.match(/function isStallError\([\s\S]*?\n\}/);
+  assert.ok(fnMatch && stallMatch, "could not locate nodes_install / isStallError in panel source");
   const body = fnMatch[0].replace(/,\s*$/, "");
   const factory = new Function(
     "detectManagerDialect",
@@ -809,38 +832,67 @@ function loadNodesInstall({ budgetMs, managerV2, managerCall, managerQueueContro
     "managerCall",
     "managerQueueControl",
     "verifyInstalled",
-    "isStallError",
     "MANAGER_FETCH_TIMEOUT_MS",
     "NODES_INSTALL_COMMAND_BUDGET_MS",
     "AbortSignal",
-    `const handler = { ${body} };\nreturn handler.nodes_install;`,
+    `${stallMatch[0]}\nconst handler = { ${body} };\nreturn handler.nodes_install;`,
   );
   return factory(
-    async () => "v2", // dialect probe answers instantly — the Manager is ALIVE
+    detect ?? (async () => "v2"), // dialect probe answers instantly — the Manager is ALIVE
     { randomUUID: () => "ui-test-1" },
     { clientId: "test-client" },
     installGitUrl,
     buildInstallRequest,
     ManagerInstall.isManagerRouteMissing,
     ManagerInstall.dialectRetryTarget,
-    async () => { throw new Error("reProbeManagerDialect must not run (no 404 here)"); },
+    reProbe ?? (async () => { throw new Error("reProbeManagerDialect must not run (no 404 here)"); }),
     managerV2,
     managerCall,
     managerQueueControl,
     verifyInstalled,
-    isStallErrorShim,
     15000,
     budgetMs,
     AbortSignal,
   );
 }
 
-// Faithful stand-in for the panel's isStallError (a plain predicate, not the
-// unit under test): AbortError / TimeoutError / an aborted-or-timed-out message.
-function isStallErrorShim(err) {
-  const msg = String(err?.message ?? err ?? "");
-  return err?.name === "AbortError" || err?.name === "TimeoutError" || /aborted|timed?\s*out/i.test(msg);
+// A request that never answers, failing ONLY when its abort signal fires — the
+// shape of a stalled Manager call under api.fetchApi. The 30s fallback keeps a
+// mutant that DROPS the budget signal from hanging the suite: the test then
+// fails its elapsed bound instead of never returning.
+function hangUntilAbort(opts, fallbackMs = 30000) {
+  return new Promise((_, reject) => {
+    const fail = () =>
+      reject(Object.assign(new Error("The operation timed out"), { name: "TimeoutError" }));
+    if (opts?.signal) {
+      opts.signal.addEventListener("abort", fail, { once: true });
+    } else {
+      setTimeout(fail, fallbackMs);
+    }
+  });
 }
+
+test("#671 isStallError (real panel source) classifies aborts as stalls and real verdicts as NOT stalls", () => {
+  const src = readFileSync(
+    fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
+    "utf8",
+  );
+  const m = src.match(/function isStallError\([\s\S]*?\n\}/);
+  assert.ok(m, "could not locate isStallError in panel source");
+  const isStallError = new Function(`${m[0]}\nreturn isStallError;`)();
+  assert.equal(isStallError(Object.assign(new Error("x"), { name: "AbortError" })), true);
+  assert.equal(isStallError(Object.assign(new Error("The operation timed out"), { name: "TimeoutError" })), true);
+  assert.equal(
+    isStallError(new Error("ComfyUI-Manager dialect detection was aborted mid-probe (the caller's budget ran out)")),
+    true,
+    "detectManagerDialect's own budget abort is a plain Error — matched by its exact message",
+  );
+  // codex r2 P1: a REAL Manager verdict whose message happens to contain
+  // "timed out" is EVIDENCE, not a stall — it must surface verbatim.
+  assert.equal(isStallError(new Error("Manager manager/queue/task: install timed out")), false);
+  assert.equal(isStallError(new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)")), false);
+  assert.equal(isStallError(new Error("Manager manager/queue/task: HTTP 500")), false);
+});
 
 test("#671 nodes_install (real panel source) answers inside the reply window when the Manager stalls the install POST", async () => {
   // The install POST hangs forever (signal-aware); every other call answers.
@@ -904,6 +956,65 @@ test("#671 nodes_install (real panel source) happy path still verifies inside th
   assert.equal(result.ui_id, "ui-test-1");
   assert.ok(elapsed < 2500, `the happy path must not wait out the budget (${elapsed} ms)`);
   assert.deepEqual(calls, ["manager/queue/task"], "exactly one submit, on the v2 task route");
+});
+
+test("#671 nodes_install a stalled dialect detection reports NOTHING queued (a retry is safe)", async () => {
+  // Detection hangs (signal-aware); NO mutation may run. The budget error must
+  // say so — this phase can vouch for it (codex r2 P2).
+  const nodes_install = loadNodesInstall({
+    budgetMs: 2500,
+    detect: (opts) => hangUntilAbort(opts),
+    managerV2: async () => { throw new Error("no mutation may run — detection never answered"); },
+    managerCall: async () => { throw new Error("no mutation may run — detection never answered"); },
+    managerQueueControl: async () => { throw new Error("start must not run"); },
+    verifyInstalled: async () => { throw new Error("verify must not run"); },
+  });
+  const started = Date.now();
+  const err = await nodes_install({ id: "ComfyUI-MelBandRoFormer" }).then(() => null, (e) => e);
+  const elapsed = Date.now() - started;
+  assert.ok(err, "a stalled detection must surface an error, never hang the reply");
+  assert.ok(elapsed < 10000, `the command outlived its budget (${elapsed} ms)`);
+  assert.match(err.message, /command budget/);
+  assert.match(err.message, /NOTHING was queued/);
+});
+
+test("#671 nodes_install a stalled queue/start after a LANDED submit says QUEUED, never failed", async () => {
+  // The submit answers (the install IS queued); the start hangs. The budget
+  // error must claim exactly that — not failure, not "nothing happened".
+  const nodes_install = loadNodesInstall({
+    budgetMs: 2500,
+    managerV2: async () => null, // the submit lands
+    managerCall: async () => { throw new Error("managerCall must not run on the v2 dialect"); },
+    managerQueueControl: (_call, _route, opts) => hangUntilAbort(opts),
+    verifyInstalled: async () => { throw new Error("verify must not run — the start never answered"); },
+  });
+  const started = Date.now();
+  const err = await nodes_install({ id: "ComfyUI-MelBandRoFormer" }).then(() => null, (e) => e);
+  const elapsed = Date.now() - started;
+  assert.ok(err, "a stalled start must surface an error, never hang the reply");
+  assert.ok(elapsed < 10000, `the command outlived its budget (${elapsed} ms)`);
+  assert.match(err.message, /was QUEUED/);
+  assert.match(err.message, /panel_node_queue_status/);
+  assert.ok(!/FAILED/.test(err.message), "a landed install must never be reported as failed");
+});
+
+test("#671 a REAL Manager verdict is never reworded as a budget stall (codex r2 P1)", async () => {
+  // The submit answers LATE — past the command budget — with a real HTTP
+  // verdict whose message happens to contain "timed out". That is EVIDENCE,
+  // not a transport stall: it must surface verbatim, not be reworded into a
+  // phase claim.
+  const verdict = new Error("Manager manager/queue/task: install timed out");
+  const nodes_install = loadNodesInstall({
+    budgetMs: 2500,
+    managerV2: (route) =>
+      new Promise((_, reject) => setTimeout(() => reject(verdict), 2700)),
+    managerCall: async () => { throw new Error("managerCall must not run on the v2 dialect"); },
+    managerQueueControl: async () => { throw new Error("start must not run — the submit failed"); },
+    verifyInstalled: async () => { throw new Error("verify must not run — the submit failed"); },
+  });
+  const err = await nodes_install({ id: "ComfyUI-MelBandRoFormer" }).then(() => null, (e) => e);
+  assert.ok(err, "a failed submit must surface an error");
+  assert.equal(err.message, "Manager manager/queue/task: install timed out", "the real verdict survives verbatim");
 });
 
 // ---------------------------------------------------------------------------

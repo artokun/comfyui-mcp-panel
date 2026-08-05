@@ -3964,16 +3964,20 @@ const MANAGER_FETCH_TIMEOUT_MS = 15000;
  *  UPDATE_VERIFY_BUDGET_MS (#364), lifted from the verify phase to the command. */
 const NODES_INSTALL_COMMAND_BUDGET_MS = 25000;
 
-/** #671 — did this error come from a request that never got an answer (our
- *  AbortSignal firing, or a fetch stall), as opposed to a REAL response with a
- *  real verdict? Only stall errors may be reworded as a budget exhaustion —
- *  rewording a genuine HTTP/error verdict would destroy its evidence. */
+/** #671 — did this error come from a request that never got an answer (one of
+ *  OUR AbortSignals firing), as opposed to a REAL response with a real verdict?
+ *  Only stall errors may be reworded as a budget exhaustion — rewording a
+ *  genuine Manager verdict would destroy its evidence (codex r2 P1: a server
+ *  message like "install timed out" arrives as a plain Error from
+ *  managerV2/managerCall's HTTP handling — NEVER an AbortError/TimeoutError,
+ *  which only the fetch/abort primitives produce). detectManagerDialect's own
+ *  budget abort is a plain Error by design, so it is matched by its exact
+ *  message. */
 function isStallError(err) {
-  const msg = String(err?.message ?? err ?? "");
   return (
     err?.name === "AbortError" ||
     err?.name === "TimeoutError" ||
-    /aborted|timed?\s*out/i.test(msg)
+    /aborted mid-probe/.test(String(err?.message ?? ""))
   );
 }
 
@@ -12618,7 +12622,10 @@ const GRAPH_TOOL_EXECUTORS = {
       if (commandDeadline - Date.now() > 50 || !isStallError(err)) return err;
       const budget = `${Math.round(NODES_INSTALL_COMMAND_BUDGET_MS / 1000)}s`;
       const what = String(id ?? repository);
-      if (phase === "detect") {
+      if (phase === "detect" || phase === "reprobe") {
+        // Detection — and the #605 RE-PROBE, which only runs after a PROVEN
+        // 404 (no handler ran, so no mutation was ever in flight) — never
+        // reached a mutation: nothing was queued, and a retry is safe.
         return new Error(
           `the ComfyUI-Manager did not answer dialect detection within the ${budget} ` +
             `command budget — NOTHING was queued. The Manager is answering slowly or ` +
@@ -12723,12 +12730,18 @@ const GRAPH_TOOL_EXECUTORS = {
         // failure says nothing about whether the POST landed, and re-submitting
         // then would double-fire the install.
         if (!isManagerRouteMissing(err)) throw err;
+        // The submit 404'd — PROVEN route-level rejection, no handler ran, so
+        // NOTHING is queued: a stall in the re-probe keeps the "nothing was
+        // queued" claim honest (#671 codex r2), and the retry submit below
+        // re-marks the phase before any mutation is in flight again.
+        phase = "reprobe";
         const retry = dialectRetryTarget(
           dialect,
           await reProbeManagerDialect({ signal: AbortSignal.timeout(bounded(MANAGER_FETCH_TIMEOUT_MS)) }),
         );
         if (!retry) throw err;
         dialect = retry;
+        phase = "submit";
         submitted = await submitInstall(retry);
       }
       // The submission landed. NOW start the queue on the SAME (possibly
