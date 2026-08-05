@@ -65,20 +65,75 @@ function prevTag() {
   return git("rev-list --max-parents=0 HEAD").split(/\s+/)[0]; // first commit
 }
 
-/** Parsed conventional commits since `range`, newest-first, minus noise. */
+/** A release commit, in either shape we actually produce: `release: 0.11.40`, or the
+ *  squash-merge form GitHub writes from a PR titled with the bare version — `0.11.40 (#656)`.
+ *  Only the first was recognised. */
+const isReleaseSubject = (s) => /^release:/i.test(s) || /^v?\d+\.\d+\.\d+\s*(\(#\d+\))?$/.test(s);
+
+/** Parsed commits since `range`, newest-first, minus noise.
+ *
+ *  A NON-CONVENTIONAL subject that carries a PR number is INCLUDED, not skipped. The old
+ *  code dropped it on the assumption it was "usually already covered by a PR merge" — but
+ *  a squash merge's subject IS the PR title, and this project's PR titles are descriptive
+ *  prose, not `fix(scope):`. The rule therefore selected against exactly the wrong commits:
+ *  a large PR gets a written title and is dropped; a small one gets a prefix and is kept.
+ *
+ *  That silently omitted the headline entry from three consecutive releases — 0.11.39 lost
+ *  #621 (a CRITICAL wrong-graph fix), and 0.11.40 lost three of its four, including the
+ *  de-flake that landed as `test:` and was discarded as housekeeping when it was a shipped
+ *  change. Each was caught by hand only because someone read the output against the log.
+ *
+ *  Two rules now, the second mattering as much as the first:
+ *   1. anything with a PR number is emitted (defaulting to "Changed" when the type is
+ *      unstated) — editing a slightly noisy line is cheap; a missing headline fix is not;
+ *   2. NOTHING is dropped silently. Whatever is still skipped is reported on stderr, so a
+ *      release always shows what it chose to leave out. A generator whose output looks
+ *      complete when it is not is worse than no generator. */
 function parseCommits(range) {
   const raw = git(`log ${range} --no-merges --pretty=format:%s`);
   if (!raw) return [];
   const out = [];
+  const skipped = [];
   for (const subject of raw.split("\n")) {
-    if (/^release:/i.test(subject)) continue; // release commits describe themselves
+    if (isReleaseSubject(subject)) continue; // release commits describe themselves
     const m = subject.match(/^(\w+)(?:\(([^)]+)\))?(!)?:\s*(.+)$/);
-    if (!m) continue; // non-conventional → skip (usually already covered by a PR merge)
+    // The LAST `(#N)`, not the first: GitHub appends the PR reference at the end of a
+    // squash subject, so anything earlier is an ISSUE the author cited. Both shapes occur —
+    // `fix(#584): … (#596)` puts the issue in the scope, and
+    // `fix(panel): … (#291) (#633)` puts it inline — and taking the first match attributes
+    // the entry to the issue. That also breaks the dedupe against hand-written highlights,
+    // which is keyed on the PR number, so a hand-written entry would be duplicated by the
+    // auto-generated one instead of suppressed.
+    const prIn = (s) => {
+      const all = [...s.matchAll(/\(#(\d+)\)/g)];
+      return all.length ? all[all.length - 1][1] : null;
+    };
+    if (!m) {
+      const pr = prIn(subject);
+      if (pr) {
+        out.push({ type: "", scope: "", desc: subject.trim(), section: "Changed", pr });
+      } else {
+        skipped.push(subject); // a local commit with no PR; a squash supersedes it
+      }
+      continue;
+    }
     const [, type, scope, , desc] = m;
-    const section = TYPE_SECTION[type.toLowerCase()];
-    if (!section) continue;
-    const pr = (desc.match(/\(#(\d+)\)/) || [])[1] || null;
+    const pr = prIn(desc);
+    // An unmapped type (chore/ci/test/build/style/docs) is housekeeping and stays out — but
+    // only when it has no PR number. A `test(…)` or `docs(…)` PR is a real shipped change.
+    const section = TYPE_SECTION[type.toLowerCase()] ?? (pr ? "Changed" : null);
+    if (!section) {
+      skipped.push(subject);
+      continue;
+    }
     out.push({ type, scope: scope || "", desc: desc.trim(), section, pr });
+  }
+  if (skipped.length) {
+    process.stderr.write(
+      `changelog: left out ${skipped.length} commit(s) with no PR number — check none belong:\n` +
+        skipped.map((s) => `  · ${s}`).join("\n") +
+        "\n",
+    );
   }
   return out;
 }
