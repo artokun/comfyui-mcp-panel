@@ -12582,7 +12582,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // disclosure, not the displacement one.
     const terminalState = (() => {
       try {
-        return comfyApp?.canvas?.graph === sub ? "target" : "elsewhere";
+        const g = comfyApp?.canvas?.graph;
+        // A MISSING canvas/graph is unreadable, not displacement evidence
+        // (codex gate r10): null/undefined proves nothing about where the view is.
+        if (g == null) return "unreadable";
+        return g === sub ? "target" : "elsewhere";
       } catch {
         return "unreadable";
       }
@@ -12697,7 +12701,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // not the displacement one.
     const terminalState = (() => {
       try {
-        return comfyApp?.canvas?.graph === parentGraph ? "target" : "elsewhere";
+        const g = comfyApp?.canvas?.graph;
+        // A MISSING canvas/graph is unreadable, not displacement evidence
+        // (codex gate r10): null/undefined proves nothing about where the view is.
+        if (g == null) return "unreadable";
+        return g === parentGraph ? "target" : "elsewhere";
       } catch {
         return "unreadable";
       }

@@ -538,3 +538,62 @@ test("#619: an UNREADABLE terminal canvas read discloses uncertainty, not displa
   assert.match(reply.note, /could not determine which/);
   assert.doesNotMatch(reply.note, /navigated away|moved elsewhere/);
 });
+
+test("#619: a MISSING post-receipt canvas is unreadable, not 'moved elsewhere' (codex r10, enter)", async () => {
+  const rootGraph = { _nodes: [], name: "root" };
+  const sub = { _nodes: [], name: "sub", rootGraph };
+  const node = { id: 105, type: "SubgraphNode", subgraph: sub };
+  let reads = 0;
+  const canvas = {
+    _g: rootGraph,
+    get graph() {
+      reads += 1;
+      if (reads >= 5) return null; // canvas/graph gone during teardown
+      return this._g;
+    },
+    openSubgraph(s) {
+      this._g = s;
+    },
+    setDirty() {},
+  };
+  const app = { graph: rootGraph, canvas };
+  const enter = buildEnterSubgraph({
+    getGraphCtx: () => ({ app, graph: canvas.graph, rootGraph, canvas }),
+    resolveNode: () => node,
+    describeActiveGraph: (g) => ({ scope: g === rootGraph ? "root" : "subgraph" }),
+    assertGraphBoundToActiveWorkflow: () => {},
+  });
+  const reply = await enter({ node_id: 105 });
+  assert.equal(reply.settled, false);
+  assert.match(reply.note, /could not determine which/);
+  assert.doesNotMatch(reply.note, /navigated away|moved elsewhere/);
+});
+
+test("#619: a MISSING post-receipt canvas is unreadable, not 'moved elsewhere' (codex r10, exit)", async () => {
+  const rootGraph = { _nodes: [], name: "root" };
+  const sub = { _nodes: [], name: "sub", rootGraph };
+  let reads = 0;
+  const canvas = {
+    _g: sub,
+    get graph() {
+      reads += 1;
+      if (reads >= 5) return null;
+      return this._g;
+    },
+    setGraph(g) {
+      this._g = g;
+    },
+    setDirty() {},
+  };
+  const app = { graph: rootGraph, canvas };
+  const exit = buildExitSubgraph({
+    getGraphCtx: () => ({ app, graph: canvas.graph, rootGraph, canvas }),
+    findSubgraphOwner: () => ({ id: 105, parentGraph: rootGraph }),
+    describeActiveGraph: (g) => ({ scope: g === rootGraph ? "root" : "subgraph" }),
+    assertGraphBoundToActiveWorkflow: () => {},
+  });
+  const reply = await exit();
+  assert.equal(reply.settled, false);
+  assert.match(reply.note, /could not determine which/);
+  assert.doesNotMatch(reply.note, /navigated away|moved elsewhere/);
+});
