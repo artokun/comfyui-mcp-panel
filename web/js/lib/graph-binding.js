@@ -1096,7 +1096,13 @@ export function graphBindingRefusalMessage(verdict) {
     `Re-open the active workflow tab (panel_open_workflow) to rebind the graph in place; if that ` +
     `does not clear it, reload the panel (panel_reload scope:frontend), then retry. The reload is ` +
     `REQUESTED, NOT CONFIRMED — the panel cannot observe whether it rebound the canvas, so treat ` +
-    `the retry's own result as the answer rather than assuming the binding was repaired.`;
+    `the retry's own result as the answer rather than assuming the binding was repaired. ` +
+    // #663 — agents burned retries on the WRONG recovery signal: panel_set_workflow_target
+    // only re-points which workflow the agent session follows; it never touches the
+    // canvas binding this guard checks, so its success response does not mean the
+    // desync is resolved. Say so, so the retry budget goes to the remedies that can work.
+    `Re-targeting with panel_set_workflow_target is NOT a remedy for this — it re-points the ` +
+    `session, it does not rebind the canvas.`;
   if (verdict.reason === "root-workflow-uuid-mismatch") {
     return (
       `[root-workflow-uuid-mismatch] The live canvas carries a different workflow's identity tag ` +

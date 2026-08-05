@@ -15,16 +15,29 @@ function nonBlank(value) {
  * an exclusive Web Locks lease held for this page's lifetime. If that cannot be
  * acquired, return undefined so the hello omits the identity and MCP readiness
  * fails closed. There is intentionally no timeout-as-proof fallback.
+ *
+ * A SUCCESS is cached for the life of the page. A FAILURE is retryable (#654):
+ * once `retryBackoffMs` has elapsed, the next resolve() runs a fresh lease
+ * attempt, so a tab that lost a transient contention window re-registers
+ * without a manual browser refresh once the lease becomes acquirable.
  */
 export function createRestartTabIdentity({
   storage = globalThis.sessionStorage,
   locks = globalThis.navigator?.locks,
   randomUUID = () => globalThis.crypto.randomUUID(),
+  now = () => Date.now(),
+  retryBackoffMs = 5000,
 } = {}) {
   let memoryFallback;
   let resolved;
   let resolving;
   let releaseLease;
+  // #654 — the timestamp of the last FAILED resolution. A failed resolve used to
+  // be cached for the LIFE of the page (the settled `resolving` promise was never
+  // cleared), so one contested lease window wedged the tab's registration until a
+  // manual browser refresh — even after the contending tab closed and the lease
+  // became acquirable. A failure is now retryable once per backoff window.
+  let lastFailureAt = 0;
 
   const fallback = () => (memoryFallback ??= randomUUID());
   const read = () => {
@@ -74,6 +87,12 @@ export function createRestartTabIdentity({
   async function resolve() {
     if (resolved) return resolved;
     if (resolving) return resolving;
+    // #654 — a FAILED resolution is not a life sentence: the lease may become
+    // acquirable later (the contending duplicate tab closed), and nothing else
+    // re-runs this resolver, so refusing to retry here is what forced the manual
+    // browser refresh. Re-attempt at most once per backoff window; inside the
+    // window, fail closed with the same undefined the first failure returned.
+    if (lastFailureAt && now() - lastFailureAt < retryBackoffMs) return undefined;
     resolving = (async () => {
       let candidate = read() ?? fallback();
       write(candidate);
@@ -90,7 +109,13 @@ export function createRestartTabIdentity({
       }
       return undefined;
     })();
-    return resolving;
+    const outcome = await resolving;
+    // Clear the in-flight slot so a LATER call may retry after a failure (a
+    // success is cached in `resolved`, which short-circuits above). Concurrent
+    // callers awaiting this same run repeat the clear harmlessly.
+    resolving = null;
+    if (outcome === undefined) lastFailureAt = now();
+    return outcome;
   }
 
   return { resolve, fallback, releaseForTests: () => releaseLease?.() };
