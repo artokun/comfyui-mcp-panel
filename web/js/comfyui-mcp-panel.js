@@ -2802,11 +2802,13 @@ function panelSettingsList() {
       name: "Documentation",
       category: cat("About", "Documentation"),
       sortOrder: 199.5,
-      // Names the DESTINATION, not the mechanism. "Opens in a new tab" would be a
-      // claim about something nothing here observes: the panel-wide click delegate
-      // routes this through openExternalUrl, whose desktop path hands off to the
-      // system browser (not a tab) and reports nothing back either way. A link
-      // tooltip's job is to say where the link goes.
+      // Names the DESTINATION, not the mechanism. This row renders into ComfyUI's
+      // own Settings dialog, which is OUTSIDE the sidebar root that wireExternalLinks
+      // delegates on — so unlike /docs there is no openExternalUrl in the path at
+      // all, just the anchor's native target=_blank. Where that lands (a tab, the
+      // desktop build's system browser, or nowhere if a popup blocker eats it) is
+      // neither chosen nor observed here. A link tooltip's job is to say where the
+      // link goes.
       tooltip:
         "Guides for the panel, tools, local LLMs and troubleshooting — comfyui-mcp.artokun.io/docs",
       type: () => {
