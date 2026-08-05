@@ -17,8 +17,9 @@ export, and merge-import controls.
 
 ## Identity
 
-Bridge routing still uses `wf:<path>`/`tmp:<uuid>` because the orchestrator binds
-agents to the current tab. Transcript identity is separate:
+Bridge routing uses `wf:<tab>:<path>`/`tmp:<uuid>` (the saved form is tab-scoped
+since #640, so two browser tabs on one file register distinct routes) because the
+orchestrator binds agents to the current tab. Transcript identity is separate:
 `workflow:<embedded UUID>`. The UUID is stored in
 `workflow.extra.comfyui_mcp.workflow_uuid` on the first per-workflow chat.
 
