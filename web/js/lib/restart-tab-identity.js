@@ -108,12 +108,18 @@ export function createRestartTabIdentity({
         write(candidate);
       }
       return undefined;
-    })();
+    })()
+      // A REJECTED attempt (a lock manager whose request promise rejects, a
+      // throwing randomUUID) must degrade to the same retryable failure as a
+      // refused lease — never a cached rejection every later caller re-throws
+      // (that was the page-lifetime wedge all over again, codex gate P1).
+      .catch(() => undefined)
+      // Clear the in-flight slot so a LATER call may retry after a failure (a
+      // success is cached in `resolved`, which short-circuits above).
+      .finally(() => {
+        resolving = null;
+      });
     const outcome = await resolving;
-    // Clear the in-flight slot so a LATER call may retry after a failure (a
-    // success is cached in `resolved`, which short-circuits above). Concurrent
-    // callers awaiting this same run repeat the clear harmlessly.
-    resolving = null;
     if (outcome === undefined) lastFailureAt = now();
     return outcome;
   }
