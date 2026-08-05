@@ -42,6 +42,12 @@ test("#111 Settings → About has a docs row that opens the docs site", () => {
   assert.notEqual(at, -1, "the About section must have a docs row");
   const row = SRC.slice(at, at + 1200);
   assert.match(row, /category: cat\("About"/, "it belongs to About, beside Star/Discord/Need-help");
+  // The tooltip names the DESTINATION, never the mechanism: the panel-wide click
+  // delegate routes this through openExternalUrl, whose desktop path hands off to
+  // the system browser rather than a tab, and reports nothing back either way.
+  const tooltip = row.match(/tooltip:\s*\n?\s*"([^"]+)"/)[1];
+  assert.match(tooltip, /comfyui-mcp\.artokun\.io\/docs/, "the tooltip says where the link goes");
+  assert.doesNotMatch(tooltip, /new tab|opens\b/i, "no claim about how or whether it opens");
   assert.match(row, /a\.href = DOCS_URL/, "the anchor points at the docs constant");
   // Opening in-frame hijacks the whole window in the ComfyUI desktop app.
   assert.match(row, /a\.target = "_blank"/);

@@ -2802,8 +2802,13 @@ function panelSettingsList() {
       name: "Documentation",
       category: cat("About", "Documentation"),
       sortOrder: 199.5,
+      // Names the DESTINATION, not the mechanism. "Opens in a new tab" would be a
+      // claim about something nothing here observes: the panel-wide click delegate
+      // routes this through openExternalUrl, whose desktop path hands off to the
+      // system browser (not a tab) and reports nothing back either way. A link
+      // tooltip's job is to say where the link goes.
       tooltip:
-        "Guides for the panel, tools, local LLMs and troubleshooting. Opens comfyui-mcp.artokun.io/docs in a new tab.",
+        "Guides for the panel, tools, local LLMs and troubleshooting — comfyui-mcp.artokun.io/docs",
       type: () => {
         const a = document.createElement("a");
         a.href = DOCS_URL;
