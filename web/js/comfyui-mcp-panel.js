@@ -1289,7 +1289,11 @@ const restartTabIdentity = createRestartTabIdentity({
 // two tabs on one file registered the same route and the later hello stole it.
 const tabRouteIdentity = createTabRouteIdentity({
   locksAvailable: () => typeof window.navigator?.locks?.request === "function",
-  tabStorageId: () => getTabId(),
+  // Deliberately NOT getTabId(): that value lives in sessionStorage, which
+  // browser tab duplication copies verbatim, so two duplicated tabs would share
+  // it — the #640 collision again, in the one mode that cannot detect it. Mint
+  // per page load and persist nowhere.
+  mintPageInstanceId: () => crypto.randomUUID(),
 });
 // Start establishing the identity at LOAD, not at the first hello. The lease is
 // async, and every frame sent in that window is refused for want of an identity
@@ -13798,16 +13802,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     if (!sock || sock.readyState !== WebSocket.OPEN) return;
     const t = getWorkflowTitle();
     if (t === lastSentTitle) return;
-    // #640 — resolve the route BEFORE marking the title as sent. A refused route
-    // means this frame never leaves, and recording it as sent would suppress
-    // every later attempt for a title the orchestrator never received.
+    // #640 — record the title as sent only once it ACTUALLY was. A refused route
+    // and a throwing send both mean this frame never left, and the dedupe would
+    // otherwise suppress every later attempt for a title the orchestrator never
+    // received: the comment below promised a retry the assignment had already
+    // made impossible (pre-existing; fixed here because this is the same line).
     const routeId = bridgeRouteId();
     if (!routeId) return;
-    lastSentTitle = t;
     try {
       sock.send(JSON.stringify({ type: "title", tab_id: routeId, title: t }));
+      lastSentTitle = t;
     } catch {
-      // dropped — next mutation retries
+      // dropped — the next title mutation retries, now that it can.
     }
   }
   const titleObserver = titleEl ? new MutationObserver(() => sendTitle()) : null;

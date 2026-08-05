@@ -74,15 +74,26 @@ export function savedWorkflowRoute(tabRouteId, savedPath) {
  *    origin holds it, which is the only thing that also covers a DUPLICATED tab
  *    (browser tab duplication copies sessionStorage verbatim).
  *
- *  - the tab's sessionStorage id ("tab-storage"), used ONLY when Web Locks does
- *    not exist in this context at all. The panel deliberately supports ComfyUI
- *    served over plain http:// on a LAN, where `navigator.locks` is undefined
- *    because the API is secure-context-only — the same reason the panel ships a
- *    crypto.randomUUID polyfill. sessionStorage is scoped to one browser tab
- *    (localStorage is not), so two tabs that each OPENED the same URL still get
- *    distinct routes; only a duplicated tab can be carrying a copy. That is a
- *    narrower guarantee than a lease and is reported as such — but it is still
- *    an identity of the TAB, never of the file.
+ *  - a freshly minted, NEVER-PERSISTED id ("page-instance"), used only when Web
+ *    Locks does not exist in this context at all. The panel deliberately
+ *    supports ComfyUI served over plain http:// on a LAN, where
+ *    `navigator.locks` is undefined because the API is secure-context-only —
+ *    the same reason the panel ships a crypto.randomUUID polyfill (itself
+ *    backed by crypto.getRandomValues, which is not secure-context gated).
+ *    Refusing outright here would take every LAN panel offline.
+ *
+ *    It is minted per PAGE LOAD and written nowhere. That is what makes it
+ *    safe: browser tab duplication copies sessionStorage verbatim, so the
+ *    stored per-tab id is exactly the value two duplicated tabs would share —
+ *    reading it here would have re-created the #640 collision in the one mode
+ *    that cannot detect it. A value that has never left this page's heap cannot
+ *    be copied into another tab.
+ *
+ *    The cost is route stability, not uniqueness: a reload mints a new id, so
+ *    the orchestrator's tab-id-keyed session index misses and the conversation
+ *    is restored by the panel's own `hello.resume` (sessionStorage) instead.
+ *    Losing a resume is recoverable; delivering a command to the wrong canvas
+ *    is not.
  *
  *  - no id: Web Locks IS present and refused every candidate. That is live
  *    contention — another tab in this origin holds the identity — so nothing is
@@ -92,14 +103,14 @@ export function savedWorkflowRoute(tabRouteId, savedPath) {
  * tab's agent session on the orchestrator, and silently re-keying it mid-session
  * would strand that session behind a route nothing answers on.
  */
-export function createTabRouteIdentity({ locksAvailable, tabStorageId } = {}) {
+export function createTabRouteIdentity({ locksAvailable, mintPageInstanceId } = {}) {
   let established = null;
   let settled = false;
 
   return {
     /** Synchronous read. Null until an identity has ACTUALLY been established. */
     established: () => established,
-    /** "exclusive" | "tab-storage" | null — what the id above is backed by. */
+    /** "exclusive" | "page-instance" | null — what the id above is backed by. */
     proof: () => established?.proof ?? null,
     /**
      * Has a lease attempt COMPLETED? Distinguishes "no identity yet, resolution
@@ -127,12 +138,12 @@ export function createTabRouteIdentity({ locksAvailable, tabStorageId } = {}) {
         return established;
       }
 
-      // No lease. Distinguish "the lock manager said no" (contention — another
-      // live tab holds this identity) from "this context has no lock manager"
-      // (capability absent). Only the second may use the narrower tab-storage
-      // identity. A probe that throws is NOT evidence the API is missing:
-      // "could not determine" is not "determined it is absent", so an
-      // unreadable probe is treated as present and refuses.
+      // No lease. Distinguish "the lock manager said no or could not answer"
+      // from "this context has no lock manager at all" (capability absent).
+      // Only the second may mint a page-instance id; the first is a failure to
+      // establish and must refuse. A probe that throws is NOT evidence the API
+      // is missing — "could not determine" is not "determined it is absent" —
+      // so an unreadable probe is treated as present and refuses.
       let available = true;
       try {
         available = !!locksAvailable?.();
@@ -141,15 +152,15 @@ export function createTabRouteIdentity({ locksAvailable, tabStorageId } = {}) {
       }
       if (available) return null;
 
-      let stored = null;
+      let minted = null;
       try {
-        stored = trimmed(tabStorageId?.());
+        minted = trimmed(mintPageInstanceId?.());
       } catch {
-        stored = null;
+        minted = null;
       }
-      if (!stored) return null;
+      if (!minted) return null;
 
-      established = { id: stored, proof: "tab-storage" };
+      established = { id: minted, proof: "page-instance" };
       return established;
     },
   };
@@ -171,11 +182,16 @@ export function describeRefusedRoute({ settled = true } = {}) {
       "yet could reach another browser tab's canvas."
     );
   }
+  // What IS determined is that the lock manager did not grant this page an
+  // exclusive identity. WHY it did not is not determined: contention with
+  // another tab is the usual cause, but a lock request that rejects or throws
+  // lands here identically. Report the outcome, offer the cause as the likely
+  // one, and do not assert it.
   return (
     "This ComfyUI tab could not establish its own bridge route, so the panel did NOT register " +
-    "with the agent. Another browser tab in this origin is holding this tab's identity. " +
-    "Close the duplicate tab (or reload this one) and reconnect — registering anyway would " +
-    "share one route between two tabs, and the agent's commands could run against the other " +
-    "tab's canvas."
+    "with the agent and nothing has run. Most often another browser tab in this origin is " +
+    "holding this tab's identity — close the duplicate tab, then reload this one and " +
+    "reconnect. Registering anyway would share one route between two tabs, and the agent's " +
+    "commands could run against the other tab's canvas."
   );
 }

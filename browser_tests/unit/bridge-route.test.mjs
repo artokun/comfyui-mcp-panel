@@ -58,7 +58,7 @@ function copiedStorage(value) {
 }
 
 /** One browser tab: its own lease resolver + its own route identity holder. */
-function fakeTab({ locks, storageSeed, rotation, storageId = storageSeed }) {
+function fakeTab({ locks, storageSeed, rotation }) {
   const restart = createRestartTabIdentity({
     storage: copiedStorage(storageSeed),
     locks,
@@ -66,7 +66,9 @@ function fakeTab({ locks, storageSeed, rotation, storageId = storageSeed }) {
   });
   const route = createTabRouteIdentity({
     locksAvailable: () => typeof locks?.request === "function",
-    tabStorageId: () => storageId,
+    // Unreached whenever `locks` is present, which is the case in every test
+    // using this helper — the lockless branch has its own tests below.
+    mintPageInstanceId: () => `page-instance-of-${storageSeed}`,
   });
   return { restart, route };
 }
@@ -150,7 +152,7 @@ test("#640: an UNIDENTIFIABLE tab is REFUSED, never merged onto the path", () =>
 test("#640: live lock CONTENTION establishes nothing — 'could not determine' is not 'no other tab'", () => {
   const identity = createTabRouteIdentity({
     locksAvailable: () => true,
-    tabStorageId: () => "possibly-copied",
+    mintPageInstanceId: () => "never-reached",
   });
   // The lease resolver returned undefined WITH a lock manager present: another
   // live tab in this origin holds every candidate. The copyable sessionStorage
@@ -163,33 +165,55 @@ test("#640: live lock CONTENTION establishes nothing — 'could not determine' i
 test("#640: a THROWING capability probe refuses too — an unreadable probe is not an absent API", () => {
   const identity = createTabRouteIdentity({
     locksAvailable: () => { throw new Error("probe exploded"); },
-    tabStorageId: () => "possibly-copied",
+    mintPageInstanceId: () => "never-reached",
   });
   assert.equal(identity.adopt(undefined), null);
   assert.equal(identity.established(), null);
 });
 
-test("#640: Web Locks ABSENT (plain-http LAN) uses the per-tab storage id and says so", () => {
+test("#640: Web Locks ABSENT (plain-http LAN) mints a PAGE-INSTANCE id and says so", () => {
   const identity = createTabRouteIdentity({
     locksAvailable: () => false,
-    tabStorageId: () => "session-storage-tab",
+    mintPageInstanceId: () => "page-instance-1",
   });
-  assert.deepEqual(identity.adopt(undefined), { id: "session-storage-tab", proof: "tab-storage" });
-  assert.equal(identity.proof(), "tab-storage", "the narrower backing must be reported, not hidden");
-  // Still a TAB identity: two tabs that each opened the URL have distinct
-  // sessionStorage, so the routes still separate.
-  const other = createTabRouteIdentity({ locksAvailable: () => false, tabStorageId: () => "other-tab" });
-  other.adopt(undefined);
-  assert.notEqual(
-    savedWorkflowRoute(identity.established().id, "workflows/a.json"),
-    savedWorkflowRoute(other.established().id, "workflows/a.json"),
-  );
+  assert.deepEqual(identity.adopt(undefined), { id: "page-instance-1", proof: "page-instance" });
+  assert.equal(identity.proof(), "page-instance", "the narrower backing must be reported, not hidden");
+});
+
+test("#640 REGRESSION: the lockless fallback must NOT read copyable per-tab storage", () => {
+  // Browser tab duplication copies sessionStorage verbatim, so the stored
+  // per-tab id is precisely the value two duplicated tabs would SHARE. Reading
+  // it in the lockless branch re-created the #640 collision in the one mode
+  // that has no lock manager to detect it. Model the duplicate: identical
+  // storage, no locks — the two routes must still differ.
+  const copiedStorageId = "copied-per-tab-id";
+  const mint = (() => { let n = 0; return () => `page-instance-${++n}`; })();
+  const original = createTabRouteIdentity({ locksAvailable: () => false, mintPageInstanceId: mint });
+  const duplicate = createTabRouteIdentity({ locksAvailable: () => false, mintPageInstanceId: mint });
+  original.adopt(undefined);
+  duplicate.adopt(undefined);
+
+  const path = "workflows/shared.json";
+  const routeA = savedWorkflowRoute(original.established().id, path);
+  const routeB = savedWorkflowRoute(duplicate.established().id, path);
+  assert.notEqual(routeA, routeB, "two duplicated tabs must not share one lockless route");
+  for (const route of [routeA, routeB]) {
+    assert.ok(
+      !route.includes(copiedStorageId),
+      "the lockless id must never be sourced from storage a duplicate can copy",
+    );
+  }
+
+  // ...and the shipped panel must not wire storage in either.
+  const src = readFileSync(PANEL_JS, "utf8");
+  assert.match(src, /mintPageInstanceId: \(\) => crypto\.randomUUID\(\)/);
+  assert.doesNotMatch(src, /tabStorageId:/, "getTabId() is copyable and must not back the route");
 });
 
 test("#640: a lease wins over the storage fallback, and the established id is then FROZEN", () => {
   const identity = createTabRouteIdentity({
     locksAvailable: () => true,
-    tabStorageId: () => "storage-id",
+    mintPageInstanceId: () => "never-reached",
   });
   assert.deepEqual(identity.adopt("leased-id"), { id: "leased-id", proof: "exclusive" });
   // A later re-hello must not re-key the route: the route is this tab's agent
@@ -245,7 +269,7 @@ test("#640: the refusal is DISCLOSED in terms of the harm, not as a generic fail
 });
 
 test("#640: a refusal while the lease is STILL PENDING does not claim contention", () => {
-  const identity = createTabRouteIdentity({ locksAvailable: () => true, tabStorageId: () => "x" });
+  const identity = createTabRouteIdentity({ locksAvailable: () => true, mintPageInstanceId: () => "x" });
   assert.equal(identity.settled(), false, "no lease attempt has completed yet");
   const pending = describeRefusedRoute({ settled: identity.settled() });
   // "Could not determine which tab holds this" is not "another tab holds this".
@@ -253,10 +277,11 @@ test("#640: a refusal while the lease is STILL PENDING does not claim contention
   assert.match(pending, /still establishing/i);
   assert.match(pending, /nothing ran/i, "a pre-dispatch refusal must say nothing ran");
 
-  // Once an attempt completes, the settled wording is the contention one.
+  // Once an attempt completes, the settled wording names the likely cause —
+  // "most often" another tab — without asserting it as determined.
   identity.adopt(undefined);
   assert.equal(identity.settled(), true);
-  assert.match(describeRefusedRoute({ settled: identity.settled() }), /Another browser tab/);
+  assert.match(describeRefusedRoute({ settled: identity.settled() }), /Most often another browser tab/);
 });
 
 test("#640 wiring: every refusal message is told whether the lease has settled", () => {
@@ -427,11 +452,13 @@ test("#640 wiring: every outbound frame site reads bridgeRouteId() and refuses o
   assert.match(src, /const uploadRouteId = bridgeRouteId\(\);\s*\n\s*if \(!uploadRouteId\) throw new Error\(describeRefusedRoute\(/);
   assert.match(src, /tab_id: callRouteId,/);
   assert.match(src, /tab_id: uploadRouteId,/);
-  // title — must resolve the route BEFORE recording the title as sent.
+  // title — recorded as sent only once it ACTUALLY was: the assignment stands
+  // AFTER the send inside the try, so a refused route AND a throwing send both
+  // leave it unrecorded and the next title mutation retries.
   assert.match(
     src,
-    /const routeId = bridgeRouteId\(\);\s*\n\s*if \(!routeId\) return;\s*\n\s*lastSentTitle = t;/,
-    "a refused title frame must not be recorded as sent — the retry is the next title change",
+    /const routeId = bridgeRouteId\(\);\s*\n\s*if \(!routeId\) return;\s*\n\s*try \{\s*\n\s*sock\.send\(JSON\.stringify\(\{ type: "title", tab_id: routeId, title: t \}\)\);\s*\n\s*lastSentTitle = t;/,
+    "a title frame must be recorded as sent only once it actually left — recording earlier suppresses the retry",
   );
   // lost_replies — advisory: omit the field rather than name an unestablished route.
   assert.match(src, /const lostRepliesRouteId = bridgeRouteId\(\);/);
