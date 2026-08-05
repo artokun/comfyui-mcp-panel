@@ -1211,7 +1211,7 @@ test("#366×#639: an INNER callback that throws AFTER the value landed is DISCLO
   // NOT rolled back: both inner and parent rail hold the new value (verified).
   assert.equal(inner.widgets[0].value, 704, "inner write stays — it took effect before the throw");
   assert.equal(parent.widgets[0].value, 704, "rail synced — never reported failed while applied");
-  assert.match(set.write_warning ?? "", /callback threw \(inner boom\)/, "the throw is disclosed, not hidden");
+  assert.match(set.write_warning ?? "", /thrown while applying the write \(inner boom\)/, "the throw is disclosed, not hidden");
   assert.equal(afterChangeRan, true, "afterChange still closes the envelope");
 });
 
@@ -1361,7 +1361,7 @@ test("#366×#639: a THROWING afterChange hook does not bypass verification — a
   // effect and is disclosed, never reported as a clean failure (#639).
   assert.equal(inner.widgets[0].value, 704, "inner write stays");
   assert.equal(parent.widgets[0].value, 704, "rail synced");
-  assert.match(set.write_warning ?? "", /callback threw \(inner boom\)/);
+  assert.match(set.write_warning ?? "", /thrown while applying the write \(inner boom\)/);
 });
 
 test("#366 HARD FAIL: an afterChange HOOK that re-stales the rail (after all callbacks) is still caught + rolled back", () => {
@@ -2446,7 +2446,7 @@ test("#639: a throwing callback on a verified write is DISCLOSED (write_warning)
   assert.equal(node.widgets[0].value, 10, "the write took effect and is NOT rolled back");
   assert.equal(set.value, 10);
   assert.ok(typeof set.write_warning === "string", "the throw is disclosed, never hidden");
-  assert.match(set.write_warning, /callback threw/, "names what threw");
+  assert.match(set.write_warning, /thrown while applying the write/, "the throw is disclosed, not hidden");
   assert.match(set.write_warning, /reading 'options'/, "carries the original error message");
   assert.match(set.write_warning, /DID take effect/, "says the write applied — never a clean-failure report");
 });
@@ -2489,7 +2489,7 @@ test("#639: a callback that throws AND leaves the write unverified still FAILS +
     () => applyWidgetWrite(node, "c", "a", HOOKS),
     (err) =>
       err instanceof WidgetWriteError &&
-      /callback threw \(combo boom\)/.test(err.message) &&
+      /thrown while applying the write \(combo boom\)/.test(err.message) &&
       /did not retain the requested value/.test(err.message),
   );
   assert.equal(seenAtCallback, "a", "the requested value WAS assigned before the callback fired");
@@ -2517,13 +2517,13 @@ test("#639: a thrown WidgetWriteError on an unverified write keeps BOTH causes a
     (err) =>
       err instanceof WidgetWriteError &&
       err.combo === true && // the refresh-retry signal survives the composition
-      /callback threw \(combo list went stale\)/.test(err.message) &&
+      /thrown while applying the write \(combo list went stale\)/.test(err.message) &&
       /did not retain the requested value/.test(err.message),
   );
   assert.equal(node.widgets[0].value, "b", "rolled back");
 });
 
-test("#639: a throwing value SETTER on a verified write is disclosed with union wording (no unestablishable attribution)", () => {
+test("#639: a throwing value SETTER on a verified write is disclosed without unestablishable attribution", () => {
   const w = {
     name: "n",
     type: "INT",
@@ -2542,21 +2542,21 @@ test("#639: a throwing value SETTER on a verified write is disclosed with union 
   const node = { id: 1, type: "N", widgets: [w] };
   const set = applyWidgetWrite(node, "n", 5, HOOKS);
   assert.equal(node.widgets[0].value, 5, "the setter applied before throwing — the write is in effect");
-  assert.match(set.write_warning ?? "", /setter or callback threw/);
+  assert.match(set.write_warning ?? "", /thrown while applying the write/);
   assert.match(set.write_warning ?? "", /setter boom/);
   assert.match(set.write_warning ?? "", /DID take effect/);
   assert.doesNotMatch(
     set.write_warning ?? "",
-    /never ran|after applying|the widget's own callback threw/,
-    "claims nothing the mechanism cannot establish (codex round-3)",
+    /never ran|after applying|callback threw|setter threw/,
+    "names NO construct — the mechanism cannot establish which one threw (codex delta-gate)",
   );
 });
 
-test("#639: a REENTRANT setter (one that invokes the callback, which throws) gets the same honest union wording", () => {
+test("#639: a REENTRANT setter (one that invokes the callback, which throws) gets the same attribution-free wording", () => {
   // codex round-2/3: a value setter can invoke `this.callback()` itself and let
   // its exception propagate — then the callback DID run and threw, but the throw
-  // surfaced from the ASSIGNMENT. The disclosure names only the union and never
-  // asserts which one threw or whether the callback ran.
+  // surfaced from the ASSIGNMENT. The disclosure never asserts which construct
+  // threw or whether the callback ran.
   const w = {
     name: "n",
     type: "INT",
@@ -2575,9 +2575,9 @@ test("#639: a REENTRANT setter (one that invokes the callback, which throws) get
   const node = { id: 1, type: "N", widgets: [w] };
   const set = applyWidgetWrite(node, "n", 5, HOOKS);
   assert.equal(node.widgets[0].value, 5, "the write is in effect");
-  assert.match(set.write_warning ?? "", /setter or callback threw/);
+  assert.match(set.write_warning ?? "", /thrown while applying the write/);
   assert.match(set.write_warning ?? "", /reentrant boom/);
-  assert.doesNotMatch(set.write_warning ?? "", /callback never ran|after applying/);
+  assert.doesNotMatch(set.write_warning ?? "", /callback never ran|after applying|callback threw|setter threw/);
 });
 
 test("#667×#507: a numeric request against a numeric-LABELLED rail option is ADOPTED on the empty-inner-list path (codex round-3)", () => {
@@ -2607,4 +2607,67 @@ test("#667×#507: a numeric request matching NO rail label is still refused on t
   );
   assert.equal(inner.widgets[0].value, "", "untouched — refused before any mutation");
   assert.equal(railWidget.value, "", "rail untouched");
+});
+
+// A promoted EMPTY-inner combo whose rail AND a parent-facing display proxy both
+// carry option lists — the multi-sibling shape the delta-gate finding exercised.
+const makeEmptyInnerRailProxyFixture = (railValues, proxyValues) => {
+  const inner = {
+    id: 301,
+    type: "StarOllamaPromptHelper",
+    widgets: [{ name: "model", type: "combo", options: { values: [] }, value: "" }],
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "301" ? inner : null) };
+  const railWidget = { name: "model_alias", type: "combo", options: { values: railValues }, value: "" };
+  const proxyWidget = { name: "model_alias", type: "combo", options: { values: proxyValues }, value: "" };
+  const parent = {
+    id: 320,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [
+      { name: "model_alias", _widget: railWidget, widget: proxyWidget, _subgraphSlot: { name: "model_alias" } },
+    ],
+    widgets: [railWidget, proxyWidget],
+  };
+  const resolveSource = (_node, subgraphInput) =>
+    subgraphInput?.name === "model_alias" ? { sourceNodeId: "301", sourceWidgetName: "model" } : null;
+  return { parent, inner, railWidget, proxyWidget, resolveSource };
+};
+
+test("#667×#507: sibling lists that AGREE on the label's type adopt once and write the original everywhere", () => {
+  const { parent, inner, railWidget, proxyWidget, resolveSource } = makeEmptyInnerRailProxyFixture(
+    ["lt", "4444"],
+    ["4444", "hq"],
+  );
+  const set = applyWidgetWrite(parent, "model_alias", 4444, {
+    ...HOOKS,
+    resolveSource,
+    acceptEmptyComboOptions: true,
+  });
+  assert.equal(set.value, "4444");
+  assert.equal(typeof set.value, "string");
+  assert.equal(inner.widgets[0].value, "4444");
+  assert.equal(railWidget.value, "4444");
+  assert.equal(proxyWidget.value, "4444", "every mutated sibling holds the SAME original option");
+});
+
+test("#667×#507 (delta-gate): sibling lists that DISAGREE on a numeric label's type fail closed — never a flip-flopped write", () => {
+  // Rail lists the label as the STRING "4444"; the display proxy lists the NUMBER
+  // 4444. Adopting the rail's original and then the proxy's would end with the
+  // numeric value written into the rail whose list only holds the string — the
+  // final value must be re-validated against EVERY sibling, and here no single
+  // value satisfies both lists, so the write refuses without mutating anything.
+  const { parent, inner, railWidget, proxyWidget, resolveSource } = makeEmptyInnerRailProxyFixture(["4444"], [4444]);
+  assert.throws(
+    () =>
+      applyWidgetWrite(parent, "model_alias", 4444, {
+        ...HOOKS,
+        resolveSource,
+        acceptEmptyComboOptions: true,
+      }),
+    (err) => err instanceof WidgetWriteError && /DISAGREE/.test(err.message),
+  );
+  assert.equal(inner.widgets[0].value, "", "inner untouched");
+  assert.equal(railWidget.value, "", "rail untouched — never holds a value its list does not contain");
+  assert.equal(proxyWidget.value, "", "proxy untouched");
 });

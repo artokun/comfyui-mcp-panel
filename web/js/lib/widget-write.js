@@ -990,6 +990,7 @@ export function applyWidgetWrite(
   // source can disagree with the first, which would turn the narrowing into an escape
   // hatch around this very check (codex confirmation round).
   if (coerceOutcome.emptyAcceptanceUsed) {
+    let adoptedOption = false;
     for (const other of [parentWidget, ...displayWidgets]) {
       if (!other || !isComboWidget(other)) continue;
       // A DYNAMIC (function) sibling list is UNVERIFIABLE from here (codex round-5): it
@@ -1016,6 +1017,7 @@ export function applyWidgetWrite(
       // valid), never the incoming scalar — the #240 no-index guarantee holds.
       const siblingLabelIdx = optionLabelIndex(otherOptions, coerced);
       if (siblingLabelIdx >= 0) {
+        adoptedOption = true;
         coerced = otherOptions[siblingLabelIdx];
         continue;
       }
@@ -1025,6 +1027,28 @@ export function applyWidgetWrite(
           `write also mutates — the inner widget's option list is empty, but this one is not. ` +
           `Refusing to write.`,
       );
+    }
+    // Codex delta-gate: an adoption REPLACES the value mid-loop, and a later sibling
+    // can adopt a DIFFERENTLY-TYPED original of the same label (rail lists "4444",
+    // a display proxy lists 4444) — the final write would then land a value an
+    // earlier-validated sibling's list does not contain. When any adoption
+    // happened, re-validate the FINAL value against every sibling: a sibling that
+    // does not strictly contain it conflicts (same label, different type — or the
+    // value absent there), so no single value satisfies every list; fail closed.
+    if (adoptedOption) {
+      for (const other of [parentWidget, ...displayWidgets]) {
+        if (!other || !isComboWidget(other) || typeof other.options?.values === "function") continue;
+        const otherOptions = comboOptions(other);
+        if (!Array.isArray(otherOptions) || otherOptions.length === 0) continue;
+        if (otherOptions.includes(coerced)) continue;
+        throw new WidgetWriteError(
+          `The sibling combo widgets this promoted write mutates DISAGREE about option ` +
+            `${JSON.stringify(coerced)}: after matching it by label, "${other.name}"'s list ` +
+            `(${otherOptions.length} options) does not contain the resulting value — the lists ` +
+            `hold the same label with different types (or not at all), so no single value ` +
+            `satisfies every list. Refusing to write.`,
+        );
+      }
     }
   }
 
@@ -1134,11 +1158,12 @@ export function applyWidgetWrite(
     // same single invocation a manual UI edit of the promoted control performs.
     w.callback?.(coerced, canvas, targetNode, targetNode.pos, undefined);
   } catch (err) {
-    // #639 (codex round-3): WHICH statement threw is NOT recorded — a value setter
-    // can invoke the callback itself, the callback property can be a throwing
-    // accessor, and a setter can throw before OR after applying — so no
-    // attribution the mechanism cannot establish is ever reported. The disclosure
-    // below names the union ("the widget's setter or callback") only.
+    // #639 (codex round-3 + delta-gate): WHICH construct threw is NOT recorded — a
+    // value setter can invoke the callback itself, `w.callback` can be a throwing
+    // accessor, a setter can throw before OR after applying, a rail/proxy setter
+    // or a `targetNode.pos` getter can throw, and a write to a frozen widget
+    // throws with no user code at all — so no attribution the mechanism cannot
+    // establish is ever reported. The disclosure below names none of them.
     threw = err;
   } finally {
     safeAfter();
@@ -1236,24 +1261,24 @@ export function applyWidgetWrite(
 
   // #639: reconcile a captured throw with the verification verdict. The write
   // VERIFIED (value + rail + proxies retained, promotion topology intact) — the
-  // throw came from the widget's own write path: DISCLOSE it on the success
-  // result, never report a clean failure for an applied write. The write did NOT
-  // verify — the throw is the likely cause: compose BOTH causes into the failure
-  // (codex round-1: a thrown WidgetWriteError saved un-composed discarded the
-  // structural detail), keeping the error's retry flags (combo/emptyOptions)
-  // through the composition.
+  // throw came from applying the write: DISCLOSE it on the success result, never
+  // report a clean failure for an applied write. The write did NOT verify — the
+  // throw is the likely cause: compose BOTH causes into the failure (codex
+  // round-1: a thrown WidgetWriteError saved un-composed discarded the structural
+  // detail), keeping the error's retry flags (combo/emptyOptions) through the
+  // composition.
   //
-  // Attribution (codex rounds 2-3): only what the mechanism can ESTABLISH is
-  // claimed. An exception caught above came from evaluating the value assignments
-  // or the callback read/invocation — but a value setter can itself invoke the
-  // callback, the callback property can be a throwing accessor, and a setter can
-  // throw before OR after applying — so the message names the UNION ("the
-  // widget's setter or callback") and never asserts which one threw, whether the
-  // callback ran, or whether a setter applied first. What IS established and
-  // claimed: the value was verified written by read-back, and the write's side
-  // effects may not have run or completed.
+  // Attribution (codex rounds 2-3 + delta-gate): only what the mechanism can
+  // ESTABLISH is claimed. The write envelope evaluates value setters on the inner,
+  // rail, and display proxies, property reads (`w.callback` may be a throwing
+  // accessor, `targetNode.pos` a getter), and the callback invocation — and a
+  // plain write to a frozen widget throws with NO user code involved. So the
+  // message does not name ANY construct: only that an exception was thrown while
+  // applying the write. What IS established and claimed: the value was verified
+  // written by read-back, and the write's side effects may not have run or
+  // completed.
   if (threw) {
-    const threwLabel = "the widget's setter or callback threw";
+    const threwLabel = "an exception was thrown while applying the write";
     if (!failure) {
       writeWarning =
         `${threwLabel} (${threw?.message ?? threw}), but the value was verified written ` +
