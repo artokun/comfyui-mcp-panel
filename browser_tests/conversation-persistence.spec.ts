@@ -445,7 +445,9 @@ test('reload keeps the pointed conversation and live tab session during durable 
   // so this is a deterministic completion signal for the final binding.
   await expect.poll(() => page.evaluate(() => {
     const meta = JSON.parse(localStorage.getItem('comfyui-mcp.panel.historyMeta') || '{}')
-    return meta.activeByScope?.['panel:global'] || null
+    // mcp#884 P0-2: the selection pointer is backend-scoped now; the legacy
+    // shared key remains only as a pre-migration fallback.
+    return meta.activeByScope?.['panel:backend:claude'] || meta.activeByScope?.['panel:global'] || null
   })).toBe(currentThreadId)
   await expect(panel.userBubble('conversation selected by this tab')).toBeVisible()
   await expect(panel.userBubble('newer background transcript')).toHaveCount(0)

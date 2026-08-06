@@ -596,65 +596,98 @@ export function selectThreadForScope(threads, meta, scopeKey) {
   return candidates.find((thread) => thread.id === activeId) || candidates[0] || null;
 }
 
-/** The newest CONVERSATION activity in a thread: the creation time of its most
- *  recent message. Deliberately not thread.updatedAt — rename/pin/todo edits
- *  bump that, and grooming an archived chat must never hijack the shared panel
- *  selection. Imported archives keep their original message createdAt, so an
- *  import cannot hijack it either. */
-function lastConversationAt(thread) {
-  let latest = 0;
-  for (const message of Array.isArray(thread?.msgs) ? thread.msgs : []) {
-    const at = finiteTs(message?.createdAt) || finiteTs(message?.ts);
-    if (at > latest) latest = at;
-  }
-  return latest;
-}
+/** The legacy shared selection key. Rounds 1-2 of mcp#884 kept ONE pointer for
+ *  every backend under this key; the orchestrator keys its session per backend
+ *  (orchestrator::<backend>, mcp#897), so the panel pointer now carries the
+ *  same axis ("panel:backend:<id>") and this key remains a read-only migration
+ *  fallback. */
+export const LEGACY_PANEL_SCOPE = "panel:global";
 
-/** Select the panel-owned conversation without changing its workflowKey. The
- *  global id lives only in metadata; each thread keeps its ride-along workflow
- *  provenance for archive grouping. Legacy snapshots without that pointer
- *  recover the most recently updated conversation.
+/** Resolve the panel-owned selection pointer for one backend scope.
  *
- *  This is the ONE definition of "the conversation" (mcp#884/#897): the agent
- *  session is orchestrator-global, so every tab — cold restore and cross-tab
- *  sync alike — must resolve the same thread from the same shared state.
+ *  Returns { key, activeId, revision, cleared }:
+ *  - key: the scope key the pointer was found under (backend key, or the
+ *    legacy shared key when the backend key has never been written),
+ *  - activeId: the selected thread id, or null,
+ *  - revision: the causal revision of the selection op (null when the op was
+ *    compacted into the checkpoint baseline),
+ *  - cleared: true when the pointer was DELIBERATELY cleared (new chat) — an
+ *    absent pointer is not a clear.
  *
- *  Stale-pointer guard (the mcp#884 upgrade path): builds that still had the
- *  workflow/ask scopes could leave a panel:global pointer behind and then keep
- *  conversing in per-workflow threads, so on upgrade the pointer may name a
- *  conversation weeks older than the one the user is actually in. The pointer
- *  therefore only pins a conversation over newer activity elsewhere when the
- *  pointer write itself is the most recent action (opening a chat from the
- *  archive stamps a fresh revision, so deliberate selections still stick). */
-export function selectPanelThread(threads, meta) {
-  const candidates = [...(Array.isArray(threads) ? threads : [])]
-    .sort((a, b) => finiteTs(b?.updatedAt || b?.ts) - finiteTs(a?.updatedAt || a?.ts));
-  const activeId = meta?.activeByScope?.["panel:global"];
-  if (!activeId && meta?.activeOps?.["panel:global"]?.deleted === true) return null;
-  const pointed = candidates.find((thread) => thread?.id === activeId) || null;
-  if (!pointed) return candidates[0] || null;
-  // The pointer op can be compacted into the checkpoint baseline (no revision
-  // survives); 0 then degrades the comparison to pure conversation recency,
-  // which still keeps the pointed thread in continuous panel-mode use.
-  const pointerAt = finiteTs(operationRevision(meta?.activeOps?.["panel:global"])?.updatedAt);
-  let selected = pointed;
-  let selectedAt = Math.max(pointerAt, lastConversationAt(pointed));
-  for (const candidate of candidates) {
-    if (!candidate || candidate.id === pointed.id) continue;
-    const at = lastConversationAt(candidate);
-    if (at > selectedAt) {
-      selected = candidate;
-      selectedAt = at;
+ *  A backend key that has been written (value or clear) never falls back to
+ *  the legacy key: migration is one-way per backend. */
+export function resolvePanelPointer(meta, scopeKey = LEGACY_PANEL_SCOPE) {
+  const keys = scopeKey === LEGACY_PANEL_SCOPE ? [scopeKey] : [scopeKey, LEGACY_PANEL_SCOPE];
+  for (const key of keys) {
+    const values = meta?.activeByScope;
+    const operation = meta?.activeOps?.[key];
+    const hasValue = values != null && typeof values === "object" && Object.hasOwn(values, key) &&
+      values[key] != null;
+    if (hasValue) {
+      return { key, activeId: values[key], revision: operationRevision(operation), cleared: false };
+    }
+    if (operation) {
+      return {
+        key,
+        activeId: operation.deleted === true ? null : (operation.value ?? null),
+        revision: operationRevision(operation),
+        cleared: operation.deleted === true || operation.value == null,
+      };
     }
   }
-  return selected;
+  return { key: scopeKey, activeId: null, revision: null, cleared: false };
+}
+
+/** Select the panel-owned conversation for one backend without changing any
+ *  thread's workflowKey. The selection id lives only in metadata; each thread
+ *  keeps its ride-along workflow provenance for archive grouping. Legacy
+ *  snapshots without any pointer recover the most recently updated
+ *  conversation.
+ *
+ *  This is the ONE definition of "the conversation" per backend (mcp#884/#897):
+ *  the agent session is orchestrator-scoped per backend, so every tab — cold
+ *  restore and cross-tab sync alike — must resolve the same thread from the
+ *  same shared state, under the same backend key.
+ *
+ *  Stale-pointer guard (the mcp#884 upgrade path) — SELECTION evidence only:
+ *  the retired per-workflow mode recorded every selection as a workflow-scoped
+ *  active op, so a pre-upgrade snapshot where the user kept conversing in
+ *  workflow mode carries workflow:* ops NEWER than the abandoned panel
+ *  pointer. The newest selection op that still resolves to a live thread wins.
+ *  Message timestamps are deliberately NOT evidence: an imported archive, a
+ *  straggler write, or a skewed clock can carry newer messages without any
+ *  user selection, and must not move the shared conversation (gate P0-3).
+ *  Other backends' panel keys are not evidence either — their selection is
+ *  their own conversation, not this backend's. */
+export function selectPanelThread(threads, meta, { scopeKey = LEGACY_PANEL_SCOPE } = {}) {
+  const candidates = [...(Array.isArray(threads) ? threads : [])]
+    .sort((a, b) => finiteTs(b?.updatedAt || b?.ts) - finiteTs(a?.updatedAt || a?.ts));
+  const pointer = resolvePanelPointer(meta, scopeKey);
+  if (pointer.cleared && pointer.activeId == null) return null;
+  const pointed = candidates.find((thread) => thread?.id === pointer.activeId) || null;
+  if (!pointed) return candidates[0] || null;
+  let latest = { revision: pointer.revision, threadId: pointed.id };
+  for (const [key, operation] of Object.entries(meta?.activeOps || {})) {
+    // Only RETIRED-mode (workflow/path/tmp scoped) selection ops compete; every
+    // panel:* key is either this pointer or another backend's conversation.
+    if (typeof key !== "string" || key.startsWith("panel:")) continue;
+    if (!operation || operation.deleted === true || operation.value == null) continue;
+    const target = candidates.find((thread) => thread?.id === operation.value);
+    if (!target) continue;
+    const revision = operationRevision(operation);
+    if (compareRevisions(revision, latest.revision) > 0) {
+      latest = { revision, threadId: target.id };
+    }
+  }
+  return candidates.find((thread) => thread.id === latest.threadId) || pointed;
 }
 
 /** Choose the durable conversation for reload. Panel-owned (the only shipping
- * mode since mcp#884): the SHARED selection is authoritative for every tab —
- * honoring a tab-local preference over it would let a reloading tab render a
- * conversation the orchestrator's single global session (mcp#897) is no longer
- * in. The tab pointer only bridges legacy snapshots that predate the shared
+ * mode since mcp#884): the SHARED per-backend selection is authoritative for
+ * every tab — honoring a tab-local preference over it would let a reloading
+ * tab render a conversation the backend's single session (mcp#897) is no
+ * longer in. `scopeKey` is the backend selection key ("panel:backend:<id>");
+ * the tab pointer only bridges legacy snapshots that predate the shared
  * pointer, where nothing else records what this tab had open. In per-workflow
  * mode the preferred pointer is still subject to the strict scope guard. */
 export function selectRestoreThread(
@@ -666,15 +699,19 @@ export function selectRestoreThread(
     ? (Array.isArray(threads) ? threads : []).find((candidate) => candidate?.id === preferredThreadId)
     : null;
   if (panelOwned) {
-    const activeId = meta?.activeByScope?.["panel:global"];
-    const pointerResolves = activeId != null &&
-      (Array.isArray(threads) ? threads : []).some((candidate) => candidate?.id === activeId);
-    const deliberateClear = !activeId && meta?.activeOps?.["panel:global"]?.deleted === true;
+    const panelScope = scopeKey || LEGACY_PANEL_SCOPE;
+    const pointer = resolvePanelPointer(meta, panelScope);
+    const pointerResolves = pointer.activeId != null &&
+      (Array.isArray(threads) ? threads : []).some((candidate) => candidate?.id === pointer.activeId);
+    const deliberateClear = pointer.cleared && pointer.activeId == null;
     // A DANGLING pointer (names a thread that no longer exists — eviction race,
-    // partial merge) carries no information about which conversation the global
-    // session is in; the tab that was just using one is better evidence there.
-    if (pointerResolves || deliberateClear) return selectPanelThread(threads, meta);
-    return preferred || selectPanelThread(threads, meta);
+    // partial merge) carries no information about which conversation the
+    // backend session is in; the tab that was just using one is better
+    // evidence there.
+    if (pointerResolves || deliberateClear) {
+      return selectPanelThread(threads, meta, { scopeKey: panelScope });
+    }
+    return preferred || selectPanelThread(threads, meta, { scopeKey: panelScope });
   }
   if (preferred && isThreadInScope(preferred, scopeKey)) return preferred;
   return selectThreadForScope(threads, meta, scopeKey);

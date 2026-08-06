@@ -1,4 +1,5 @@
 import { test, expect } from './fixtures/panelTest'
+import { PanelPage } from './fixtures/PanelPage'
 import { resolveHistoryStoreModuleUrl } from './fixtures/historyStoreModule'
 import { routeWorktreeSource } from './fixtures/worktreeSource'
 
@@ -126,11 +127,48 @@ test('default mode opens pre-upgrade history without re-keying it', async ({
   ])
 })
 
-// mcp#884/#897 (P0-1): the agent session is orchestrator-global — ONE
-// conversation per backend across every tab and workflow. When another tab
-// moves the shared selection (its loadThread writes the panel:global pointer),
-// this tab must follow it, and the next message typed here must be recorded
-// into the adopted conversation — never into the thread this tab used to show.
+/** Seed an archived cross-workflow conversation's CONTENT into the shared
+ *  canonical store. Deliberately content-only: the SELECTION must travel
+ *  through the real actor (a panel's loadThread), never a direct meta write
+ *  (gate P2-6). */
+async function seedCrossWorkflowThread(page: import('@playwright/test').Page) {
+  const storeModuleUrl = await resolveHistoryStoreModuleUrl(page)
+  await page.evaluate(async ({ storeModuleUrl }) => {
+    const { ChatHistoryStore } = await import(storeModuleUrl)
+    const seedStore = new ChatHistoryStore({ writerId: 'content-seed-test' })
+    const canonical = await seedStore.readCanonical()
+    const at = Date.now() - 60_000
+    seedStore.persist([
+      ...(canonical.threads || []),
+      {
+        id: 'cross-workflow-thread',
+        createdAt: at,
+        updatedAt: at,
+        ts: at,
+        workflowKey: 'workflow:definitely-another-workflow',
+        workflowTitle: 'Workflow B',
+        msgs: [{
+          id: 'cross-msg-1',
+          role: 'user',
+          text: 'archived cross-workflow conversation',
+          createdAt: at
+        }]
+      }
+    ], canonical.meta || {})
+    const result = await seedStore.flush()
+    if (result !== true && (result as any)?.ok !== true) {
+      throw new Error(`content seed failed: ${JSON.stringify(result)}`)
+    }
+    await seedStore.close?.()
+  }, { storeModuleUrl })
+}
+
+// mcp#884/#897 (P0-1): the agent session is orchestrator-scoped per backend —
+// ONE conversation across every tab and workflow. The selection moves through
+// the REAL actor seam: a second panel's loadThread (history click) dispatches
+// the session frame and only then publishes the shared pointer; this tab
+// passively adopts it, and the next message typed here is recorded into the
+// adopted conversation — never into the thread this tab used to show.
 test('adopts the shared conversation another tab selected, across workflows', async ({
   page,
   context,
@@ -145,77 +183,33 @@ test('adopts the shared conversation another tab selected, across workflows', as
   const received = mockBridge.waitForUserMessage()
   await panel.sendMessage('conversation A marker')
   await received
-  // Conversation A's turn is IN FLIGHT when the selection moves: the panel
-  // pins the turn's owner (liveTurnThreadId) at turn:working, which the
-  // straggler assertions below rely on.
-  mockBridge.emitWorking()
-  await expect(panel.root.locator('.cmcp-thinking')).toBeVisible()
 
-  // Another tab archives a thread from a DIFFERENT workflow and moves the
-  // shared panel selection to it — exactly what loadThread writes there.
-  const storeModuleUrl = await resolveHistoryStoreModuleUrl(page)
+  await seedCrossWorkflowThread(page)
+
+  // A second REAL panel is the actor: it connects, opens its history picker,
+  // and clicks the archived row — driving loadThread (dispatch + publish).
   const otherTab = await context.newPage()
+  const otherPanel = new PanelPage(otherTab)
   await otherTab.goto(page.url())
-  await otherTab.evaluate(async ({ storeModuleUrl }) => {
-    const { ChatHistoryStore, updateMetadataEntry } = await import(storeModuleUrl)
-    const otherStore = new ChatHistoryStore({ writerId: 'other-tab-test' })
-    const canonical = await otherStore.readCanonical()
-    const now = Date.now() + 50
-    const meta = updateMetadataEntry(
-      canonical.meta || {},
-      'activeByScope',
-      'panel:global',
-      'cross-workflow-thread',
-      { updatedAt: now, writerId: 'other-tab-test', sequence: 1 }
-    )
-    otherStore.persist([
-      ...(canonical.threads || []),
-      {
-        id: 'cross-workflow-thread',
-        createdAt: now,
-        updatedAt: now,
-        ts: now,
-        workflowKey: 'workflow:definitely-another-workflow',
-        workflowTitle: 'Workflow B',
-        msgs: [{
-          id: 'cross-msg-1',
-          role: 'user',
-          text: 'moved here from another tab',
-          createdAt: now
-        }]
-      }
-    ], meta)
-    const result = await otherStore.flush()
-    if (result !== true && (result as any)?.ok !== true) {
-      throw new Error(`shared-selection seed failed: ${JSON.stringify(result)}`)
-    }
-    await otherStore.close?.()
-  }, { storeModuleUrl })
-  await otherTab.close()
+  await otherPanel.openSidebar()
+  await otherPanel.setBridgeUrl(mockBridge.url)
+  await otherPanel.connect()
+  await otherPanel.root.locator('button[title="Chat history"]').click()
+  const archivedRow = otherPanel.root
+    .locator('.cmcp-hist-row')
+    .filter({ hasText: 'archived cross-workflow conversation' })
+  await expect(archivedRow.locator('.cmcp-hist-open')).toBeEnabled()
+  await archivedRow.locator('.cmcp-hist-open').click()
+  await expect(otherPanel.userBubble('archived cross-workflow conversation')).toBeVisible()
 
   // This tab follows the shared selection without a reload...
-  await expect(panel.userBubble('moved here from another tab')).toBeVisible()
+  await expect(panel.userBubble('archived cross-workflow conversation')).toBeVisible()
   await expect
     .poll(() => page.evaluate((key) => sessionStorage.getItem(key), CURRENT_THREAD_KEY))
     .toBe('cross-workflow-thread')
 
-  // A straggler from conversation A's abandoned in-flight turn must neither
-  // paint into nor be recorded under the adopted conversation (codex P0: the
-  // turn's owner is pinned at turn:working; its late output is dropped, like
-  // an interrupt, once the shown conversation changed).
-  mockBridge.say('late straggler from the abandoned turn')
-  await page.waitForTimeout(600)
-  await expect(
-    panel.agentBubbles.filter({ hasText: 'late straggler from the abandoned turn' })
-  ).toHaveCount(0)
-  expect(await page.evaluate((threadsKey) => {
-    const threads = JSON.parse(localStorage.getItem(threadsKey) || '[]')
-    return threads.some((t: any) =>
-      t.msgs?.some((m: any) => String(m.text || '').includes('late straggler')))
-  }, THREADS_KEY)).toBe(false)
-
   // ...and the next message typed HERE is recorded into the adopted
-  // conversation (the one the orchestrator's global session is in).
+  // conversation (the one the backend's session is in).
   const next = mockBridge.waitForUserMessage()
   await panel.sendMessage('recorded into the adopted conversation')
   await next
@@ -232,4 +226,107 @@ test('adopts the shared conversation another tab selected, across workflows', as
   const previousRow = panel.root.locator('.cmcp-hist-row').filter({ hasText: 'conversation A marker' })
   await expect(previousRow).toBeVisible()
   await expect(previousRow.locator('.cmcp-hist-open')).toBeEnabled()
+  await otherTab.close()
+})
+
+// Gate P0-1: THE COMMIT IS THE TRANSITION. A tab that cannot reach the
+// orchestrator can still open an archive for READING, but it must not publish
+// the shared selection — the backend never entered that conversation, so no
+// connected tab may be moved onto it.
+test('a disconnected tab cannot move the shared conversation', async ({
+  page,
+  context,
+  panel,
+  mockBridge
+}) => {
+  await panel.goto()
+  await panel.setBridgeUrl(mockBridge.url)
+  await panel.openSidebar()
+  await panel.connect()
+
+  const received = mockBridge.waitForUserMessage()
+  await panel.sendMessage('conversation A marker')
+  await received
+  const threadA = await page.evaluate((key) => sessionStorage.getItem(key), CURRENT_THREAD_KEY)
+  expect(threadA).not.toBeNull()
+
+  await seedCrossWorkflowThread(page)
+
+  // A second panel that is NOT connected opens the archived conversation.
+  const otherTab = await context.newPage()
+  const otherPanel = new PanelPage(otherTab)
+  await otherTab.goto(page.url())
+  await otherPanel.openSidebar()
+  await otherPanel.root.locator('button[title="Chat history"]').click()
+  const archivedRow = otherPanel.root
+    .locator('.cmcp-hist-row')
+    .filter({ hasText: 'archived cross-workflow conversation' })
+  await archivedRow.locator('.cmcp-hist-open').click()
+  // The disconnected tab gets its own local view of the archive...
+  await expect(otherPanel.userBubble('archived cross-workflow conversation')).toBeVisible()
+
+  // ...but the connected tab is NOT moved: no session transition was
+  // dispatched, so no selection was published.
+  await page.waitForTimeout(800)
+  await expect(panel.userBubble('conversation A marker')).toBeVisible()
+  expect(await page.evaluate((key) => sessionStorage.getItem(key), CURRENT_THREAD_KEY)).toBe(threadA)
+  await otherTab.close()
+})
+
+// Gate P0-4: output of an abandoned turn must not reach the conversation the
+// user opened mid-turn — including BEFORE any turn:working frame arrived (the
+// owner is pinned at user_message dispatch, not at turn:working, because an
+// adoption/switch's endTurnLocally discards a working frame landing inside the
+// stale-working window). Covers the say/record fence AND the card paths the
+// first round left open (ask_user, set_todo).
+test('an abandoned turn cannot leak output into a conversation opened mid-turn', async ({
+  page,
+  panel,
+  mockBridge
+}) => {
+  await panel.goto()
+  await panel.setBridgeUrl(mockBridge.url)
+  await panel.openSidebar()
+  await panel.connect()
+
+  await seedCrossWorkflowThread(page)
+
+  const received = mockBridge.waitForUserMessage()
+  await panel.sendMessage('turn A prompt')
+  await received
+  // Deliberately NO turn:working yet — the pre-working hole the gate flagged.
+
+  // The user opens the archived conversation mid-flight (the real actor:
+  // loadThread ends the local turn, dispatches the session frame, publishes).
+  await panel.root.locator('button[title="Chat history"]').click()
+  const archivedRow = panel.root
+    .locator('.cmcp-hist-row')
+    .filter({ hasText: 'archived cross-workflow conversation' })
+  await archivedRow.locator('.cmcp-hist-open').click()
+  await expect(panel.userBubble('archived cross-workflow conversation')).toBeVisible()
+
+  // Turn A's late output arrives: a committed say, a plan update, and an
+  // interactive question card. None of it may reach the opened conversation.
+  mockBridge.say('late straggler from the abandoned turn')
+  mockBridge.send({ rid: 'gate-todo-1', cmd: 'set_todo', items: [{ text: 'abandoned todo', status: 'active' }] })
+  mockBridge.send({ rid: 'gate-ask-1', cmd: 'ask_user', question: 'abandoned question?', options: [{ label: 'yes' }] })
+  await page.waitForTimeout(600)
+  await expect(
+    panel.agentBubbles.filter({ hasText: 'late straggler from the abandoned turn' })
+  ).toHaveCount(0)
+  await expect(panel.root.locator('.cmcp-question')).toHaveCount(0)
+  await expect(panel.root.locator('.cmcp-todo-item').filter({ hasText: 'abandoned todo' })).toHaveCount(0)
+  expect(await page.evaluate((threadsKey) => {
+    const threads = JSON.parse(localStorage.getItem(threadsKey) || '[]')
+    return threads.some((t: any) =>
+      t.msgs?.some((m: any) => String(m.text || '').includes('late straggler')))
+  }, THREADS_KEY)).toBe(false)
+
+  // The abandoned conversation still holds the user's own prompt — user
+  // records are never fenced.
+  expect(await page.evaluate((threadsKey) => {
+    const threads = JSON.parse(localStorage.getItem(threadsKey) || '[]')
+    return threads.some((t: any) =>
+      t.msgs?.some((m: any) => m.text === 'turn A prompt'))
+  }, THREADS_KEY)).toBe(true)
 })

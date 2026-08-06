@@ -91,6 +91,7 @@ import {
   ChatHistoryStore,
   isThreadInScope,
   mergeHistorySnapshots,
+  resolvePanelPointer,
   retainBoundedThreads,
   selectPanelThread,
   selectRestoreThread,
@@ -16942,6 +16943,7 @@ function buildPanel() {
       `Walk me through it for my OS: install the CLI (\`${meta.install}\`), sign in (\`${meta.login}\`), ` +
       `then in this panel pick ${meta.label} in the provider picker and click Connect. Give exact terminal commands.`;
     if (client.isConnected() && client.sendUserMessage(prompt)) {
+      pinTurnOwnerAtDispatch();
       appendSystem(`Asked the agent to help you set up ${meta.label}.`);
     } else {
       input.value = prompt;
@@ -18638,7 +18640,14 @@ function buildPanel() {
   }
 
   function currentHistoryScopeKey({ embed = false } = {}) {
-    return historyScopeFollowsPanel() ? "panel:global" : workflowStorageKey({ embed });
+    if (!historyScopeFollowsPanel()) return workflowStorageKey({ embed });
+    // One conversation PER BACKEND (gate P0-2): the orchestrator keys its
+    // session orchestrator::<backend> (mcp#897), so the shared selection
+    // pointer carries the same axis — a Claude tab's selection must never move
+    // a Codex tab's conversation. The legacy shared "panel:global" key remains
+    // a read fallback inside resolvePanelPointer until this backend's key is
+    // first written.
+    return `panel:backend:${connectedBackend || selectedBackend || "claude"}`;
   }
 
   function setActiveThread(scopeKey, threadId, updatedAt = nextHistoryRevision()) {
@@ -18758,6 +18767,17 @@ function buildPanel() {
     return true;
   }
 
+  /** True when a live (or just-abandoned) turn belongs to a conversation other
+   *  than the one on screen. Every user-visible transcript output — says,
+   *  stream deltas, todo/plan updates, question cards, media, A2UI cards,
+   *  command activity — must consult this before painting or recording (gate
+   *  P0-4): an abandoned turn's card left interactive in the adopted
+   *  conversation is not "transient", it is a control the user can act on in
+   *  the wrong session. */
+  function turnOutputFenced() {
+    return Boolean(liveTurnThreadId) && (thread?.id ?? null) !== liveTurnThreadId;
+  }
+
   /** Did another tab's write change what THIS tab has painted for the same
    *  conversation? Length + tail id is deliberately coarse: it catches appended
    *  turns (the cross-tab case that matters) without repainting on pure
@@ -18781,18 +18801,21 @@ function buildPanel() {
    *  after one delete would reset (and could race) the single global session. */
   function adoptSharedPanelSelection(currentThreadId) {
     // Same dangling-pointer rule as selectRestoreThread: a pointer naming a
-    // thread that no longer exists says nothing about where the global session
-    // is, so a tab that still has its conversation keeps it instead of jumping
-    // to whatever merge recency would guess.
-    const activeId = historyMeta?.activeByScope?.["panel:global"];
+    // thread that no longer exists says nothing about where the backend's
+    // session is, so a tab that still has its conversation keeps it instead of
+    // jumping to whatever merge recency would guess. The pointer is resolved
+    // under THIS tab's backend key (gate P0-2) — another backend's selection
+    // is that backend's conversation and never moves this tab.
+    const scopeKey = currentHistoryScopeKey();
+    const pointer = resolvePanelPointer(historyMeta, scopeKey);
     const current = currentThreadId
       ? threads.find((candidate) => candidate.id === currentThreadId)
       : null;
-    const pointerDangling = activeId != null &&
-      !threads.some((candidate) => candidate.id === activeId);
+    const pointerDangling = pointer.activeId != null &&
+      !threads.some((candidate) => candidate.id === pointer.activeId);
     const target = pointerDangling && current
       ? current
-      : selectPanelThread(threads, historyMeta);
+      : selectPanelThread(threads, historyMeta, { scopeKey });
     if (target && target.id === currentThreadId) {
       const before = thread;
       rebindCurrentThreadRecord(target);
@@ -18901,11 +18924,7 @@ function buildPanel() {
     // activity and yank the shared selection straight back (selectPanelThread
     // recency). User-authored entries are exempt — they belong to the view
     // the user typed into, by definition.
-    if (
-      entry?.role !== "user" &&
-      liveTurnThreadId &&
-      (thread?.id ?? null) !== liveTurnThreadId
-    ) {
+    if (entry?.role !== "user" && turnOutputFenced()) {
       return entry;
     }
     const followsPanel = historyScopeFollowsPanel();
@@ -18950,7 +18969,7 @@ function buildPanel() {
       threads.push(thread);
       if (threads.length > MAX_THREADS) threads = capHistoryThreads(threads, thread.id);
       ssSet(CURRENT_THREAD_KEY, thread.id);
-      setActiveThread(followsPanel ? "panel:global" : workflowKey, thread.id);
+      setActiveThread(currentHistoryScopeKey(), thread.id);
     }
     if (entry.role === "user") {
       const version = workflowVersionSnapshot();
@@ -19470,7 +19489,8 @@ function buildPanel() {
     const reply = coerceMessageText(text);
     appendUser(reply, {});
     const ok = client?.sendUserMessage?.(reply);
-    if (!ok) appendSystem("Card reply couldn't be sent — agent disconnected.");
+    if (ok) pinTurnOwnerAtDispatch();
+    else appendSystem("Card reply couldn't be sent — agent disconnected.");
   }
 
   /** Paint + record + register one live A2UI card. Returns its card_id. */
@@ -19890,6 +19910,17 @@ function buildPanel() {
     }, DELIVERY_TIMEOUT_MS);
   }
 
+  /** Pin the coming turn's owner at DISPATCH time (gate P0-4). Waiting for
+   *  turn:working leaves a hole: an adoption's endTurnLocally() discards a
+   *  working frame that lands inside the stale-working window, so ownership
+   *  would stay null exactly when the transcript fences need it — and the
+   *  abandoned turn's output would flow into the adopted conversation. Any
+   *  successful user_message starts (or continues) a turn whose output belongs
+   *  to the conversation on screen at the moment of dispatch. */
+  function pinTurnOwnerAtDispatch() {
+    liveTurnThreadId = thread?.id ?? null;
+  }
+
   function trackSend(mid, statusEl, payload, raw, materialize) {
     // A `materialize` fn means this is a QUEUED send: nothing is painted inline yet;
     // it waits in the pending tray and `materialize()` paints it at the END of the
@@ -19905,7 +19936,12 @@ function buildPanel() {
     });
     const ok = client.sendUserMessage(payload.text, payload.context, payload.images, mid);
     if (!ok) setMsgStatus(mid, "failed"); // socket wasn't open — instant fail
-    else armDeliveryTimeout(mid);
+    else {
+      armDeliveryTimeout(mid);
+      // A queued send joins the turn that already owns the pin; only an idle
+      // send opens the next turn.
+      if (!materialize) pinTurnOwnerAtDispatch();
+    }
     renderTray(); // surface it in the pending tray (not inline)
   }
 
@@ -19918,7 +19954,10 @@ function buildPanel() {
       setMsgStatus(mid, "queued");
       const ok = client.sendUserMessage(entry.payload.text, entry.payload.context, entry.payload.images, mid);
       if (!ok) setMsgStatus(mid, "failed");
-      else armDeliveryTimeout(mid);
+      else {
+        armDeliveryTimeout(mid);
+        if (!entry.materialize) pinTurnOwnerAtDispatch();
+      }
     } else {
       // requeue:true — this is SEND NOW, not a plain Stop: re-queue the turn the
       // agent was interrupted on so BOTH it and this queued message get answered.
@@ -20230,7 +20269,16 @@ function buildPanel() {
     // tab's point of view — clear agentWorking first so resetFeed() below won't
     // rebuild a working indicator onto the fresh, empty chat.
     endTurnLocally();
-    setActiveThread(currentHistoryScopeKey(), null);
+    // THE COMMIT IS THE TRANSITION (gate P0-1, same rule as loadThread): tell
+    // the orchestrator to forget the session FIRST, and publish the shared
+    // pointer clear only when that frame actually left. A disconnected tab
+    // still gets its fresh local view, but the backend's conversation — and
+    // therefore every other tab's — is unchanged until a transition really
+    // happens (the next recorded message republishes the selection).
+    const dispatched = notifyBackend
+      ? client?.sendFrame?.({ type: "new_session" }) === true
+      : false;
+    if (dispatched || !notifyBackend) setActiveThread(currentHistoryScopeKey(), null);
     thread = null;
     turnAnchors = []; // fresh conversation → no rewind anchors
     ssSet(CURRENT_THREAD_KEY, null);
@@ -20244,9 +20292,6 @@ function buildPanel() {
     setContextPct(0);
     ctxLabel.textContent = "—";
     persistThreads();
-    // Tell the orchestrator to forget this tab's session so the NEXT message
-    // starts a genuinely fresh agent (no memory of the prior conversation).
-    if (notifyBackend) client?.sendFrame?.({ type: "new_session" });
   }
 
   function paintThread(t) {
@@ -20307,23 +20352,35 @@ function buildPanel() {
       // with a bounded visible-transcript replay below.
       historyStore.reviseThread(t, { sessionId: null });
     }
+    // THE COMMIT IS THE TRANSITION (gate P0-1): dispatch the session frame
+    // FIRST, and publish the shared selection only when the frame actually
+    // left this socket. A disconnected tab still switches its OWN view —
+    // reading an archive offline is legitimate — but it must not move every
+    // other tab onto a conversation the backend never entered. (Two connected
+    // actors can still interleave: pointer revisions and socket delivery are
+    // ordered independently, and reconciling that needs the orchestrator to
+    // confirm transitions — mcp#897's side. This closes every panel-local
+    // failure mode: closed socket, missing route, send throw.)
+    const dispatched = sessionId
+      ? client?.sendFrame?.({ type: "resume_session", session_id: sessionId }) === true
+      : client?.sendFrame?.({ type: "new_session" }) === true;
     ssSet(CURRENT_THREAD_KEY, t.id);
-    setActiveThread(followsPanel ? "panel:global" : (t.workflowKey || scopeKey), t.id);
+    // Resume this conversation's agent session (or start fresh if it has none),
+    // so typing continues THIS chat rather than whatever was last active.
+    ssSet(SESSION_KEY, sessionId);
+    if (dispatched) setActiveThread(currentHistoryScopeKey(), t.id);
     persistThreads();
     paintThread(t);
     // #381/codex-P2: `thread` is now `t`, so repaint the ring from THIS
     // conversation's own last-known fill (blank if none) — selecting an older
     // history entry in the same workflow must not keep the prior chat's usage.
     refreshContextRingForScope();
-    // Resume this conversation's agent session (or start fresh if it has none),
-    // so typing continues THIS chat rather than whatever was last active.
-    ssSet(SESSION_KEY, sessionId);
-    if (sessionId) client?.sendFrame?.({ type: "resume_session", session_id: sessionId });
-    else {
-      client?.sendFrame?.({ type: "new_session" });
+    if (!sessionId) {
       // Provider sessions can expire or be intentionally removed. A new backend
       // session receives a compact replay once, so continuing an archived chat
       // still has useful memory instead of only repainting bubbles locally.
+      // Armed even when the frame could not be sent: the replay context rides
+      // the next user message on whatever socket delivers it.
       armVisibleTranscriptReplay();
     }
     return true;
@@ -20373,7 +20430,7 @@ function buildPanel() {
           workflowKey: workflowStorageKey(),
           workflowTitle: getWorkflowTitle(),
         }); // archive provenance
-        setActiveThread("panel:global", thread.id);
+        setActiveThread(currentHistoryScopeKey(), thread.id);
         persistThreads();
       }
       currentWorkflowId = wfid;
@@ -21213,7 +21270,7 @@ function buildPanel() {
       // tab's shared selection — mcp#884/#897) the straggler must neither
       // paint into nor be recorded under the conversation now on screen
       // (record() enforces the recording half at its choke point).
-      if (liveTurnThreadId && (thread?.id ?? null) !== liveTurnThreadId) return;
+      if (turnOutputFenced()) return;
       // Message COMMIT time — the one place fenced ```a2ui blocks are detected
       // (backends without panel tools, e.g. Ollama family, can only emit cards
       // this way). Malformed JSON is left in `stripped` as a normal code block.
@@ -21237,13 +21294,19 @@ function buildPanel() {
     onStream(msg) {
       // Same ownership fence as onSay: a delta from an abandoned turn must not
       // open a fresh preview bubble inside the newly adopted conversation.
-      if (liveTurnThreadId && (thread?.id ?? null) !== liveTurnThreadId) return;
+      if (turnOutputFenced()) return;
       onStreamDelta(msg);
       noteActivity(); // streaming output is real turn activity → reset the clock
     },
     // The agent called panel_ask — render a question card and resolve with the
     // user's pick. Keep the working indicator pinned below it while we wait.
     onAsk(msg) {
+      // Ownership fence: a question card from an abandoned turn would sit
+      // INTERACTIVE in the adopted conversation — the user's answer would act
+      // on the wrong session. Refuse honestly instead (tool error).
+      if (turnOutputFenced()) {
+        throw new Error("The conversation changed while this question was in flight — it was not shown.");
+      }
       const p = paintQuestion(msg);
       bumpThinking();
       noteActivity(); // a panel_ask frame is real turn activity → reset the clock
@@ -21253,7 +21316,7 @@ function buildPanel() {
     onTodo(items) {
       // Ownership fence (same rule as onSay): an abandoned turn's plan update
       // must not repaint the tray or persist todos into the adopted thread.
-      if (liveTurnThreadId && (thread?.id ?? null) !== liveTurnThreadId) return;
+      if (turnOutputFenced()) return;
       renderTodo(items);
     },
     // The agent called panel_show_media — render images/videos directly in the
@@ -21266,6 +21329,12 @@ function buildPanel() {
     // every video through the panel's EXISTING storyboard pipeline — bounded, and
     // disclosed as a sample rather than as the video.
     onShowMedia(items) {
+      // Ownership fence: media from an abandoned turn must not paint into the
+      // adopted conversation. Refuse honestly (tool error) — the record choke
+      // point would drop the persistence half anyway.
+      if (turnOutputFenced()) {
+        throw new Error("The conversation changed while this media was in flight — it was not shown.");
+      }
       return composeShowMediaReply(items, {
         paintImage,
         paintVideo,
@@ -21330,6 +21399,11 @@ function buildPanel() {
     },
     // The agent called panel_ui_render / panel_ui_update — A2UI cards in the chat.
     onUiRender(msg) {
+      // Ownership fence: an A2UI card from an abandoned turn would sit
+      // interactive in the adopted conversation. Refuse honestly (tool error).
+      if (turnOutputFenced()) {
+        throw new Error("The conversation changed while this card was in flight — it was not rendered.");
+      }
       const v = validateA2UISpec(msg.spec);
       if (!v.ok) {
         // Client-side wall (fence path has no server check; tool path double-checks).
@@ -21509,7 +21583,11 @@ function buildPanel() {
         canvasToolsProvenEpoch = agentSessionEpoch;
     },
     onCommand(cmd, msg, reply) {
-      appendActivity(cmd, msg, reply);
+      // Ownership fence for the transcript half only: the command already
+      // executed against the canvas (canvas targeting is governed by the
+      // workflow-UUID fences), but its activity card belongs to the turn's
+      // owning conversation, not the one now on screen.
+      if (!turnOutputFenced()) appendActivity(cmd, msg, reply);
       bumpThinking();
       // After an edit, follow the action: dart to the edited NODE (25% pad) so
       // the user watches the change land, then zoom back out to a full fit once
@@ -21783,9 +21861,9 @@ function buildPanel() {
         appendSystem("Agent reloaded — session resumed.");
         if (origin === "agent") {
           showThinking();
-          client.sendUserMessage(
+          if (client.sendUserMessage(
             "✅ You were just soft-reloaded to pick up code changes (no ComfyUI restart) — your tools and system prompt are now the latest build. Continue exactly what you were doing before the reload.",
-          );
+          )) pinTurnOwnerAtDispatch();
         }
         return;
       }
@@ -21802,9 +21880,9 @@ function buildPanel() {
         if (Date.now() - lastBridgeDownAt < 6000) return;
         appendSystem("Reconnected — picking up where we left off.");
         showThinking();
-        client.sendUserMessage(
+        if (client.sendUserMessage(
           "✅ Your connection dropped mid-task (e.g. ComfyUI was restarted, possibly by another agent installing nodes). The session resumed with full context — continue exactly what you were doing before the drop; if you were mid-build or mid-edit, pick it right back up.",
-        );
+        )) pinTurnOwnerAtDispatch();
       }
     },
     getResume: () => ssGet(SESSION_KEY),
@@ -22477,6 +22555,7 @@ function buildPanel() {
         : "✅ ComfyUI just restarted to load newly-installed custom nodes (now available). Continue what you were doing before the restart — if you were mid-build, pick it back up.");
     const mid = newMid();
     const sent = client.sendUserMessage(text, undefined, undefined, mid);
+    if (sent) pinTurnOwnerAtDispatch();
     if (!sent) {
       // Nothing left the panel, so give the budget its attempt back — but only when
       // we know the increment persisted. If it didn't, the count is already whatever
@@ -24960,7 +25039,12 @@ function buildPanel() {
           ? { id: a.id, content: full.slice(0, PASTED_DISPLAY_CAP), truncated: true }
           : { id: a.id, content: full };
       });
-    const painted = isQueued ? null : appendUser(text, { mid, attachments: pastedTexts });
+    let painted = isQueued ? null : appendUser(text, { mid, attachments: pastedTexts });
+    // The conversation the optimistic record above was filed under. The awaits
+    // below (attachment uploads, grounding, validation) can span a cross-tab
+    // adoption, and the DISPATCH decides which conversation consumes the
+    // prompt — re-checked just before trackSend (gate P0-5).
+    const recordedThreadId = thread?.id ?? null;
     // Capture the pre-turn graph so /revert can undo this turn's edits in one step.
     captureGraphSnapshot(mid, text);
     showThinking();
@@ -25048,6 +25132,32 @@ function buildPanel() {
     // graph until it independently re-runs. Conditional + deduped (event-driven).
     const valBanner = await validationBanner();
     if (valBanner) sendText = valBanner + sendText;
+    // The target conversation is decided at DISPATCH, not at type time (gate
+    // P0-5): if the shared selection moved while we awaited above, relocate the
+    // optimistically recorded prompt into the conversation the backend will
+    // actually consume it in — remove + tombstone the old copy (so a merge
+    // cannot resurrect it), then re-record and repaint in the current view.
+    // Queued sends are exempt: they record at MATERIALIZE time (dequeue),
+    // which is already dispatch-side of any adoption.
+    if (!isQueued && (thread?.id ?? null) !== recordedThreadId) {
+      const source = threads.find((candidate) => candidate.id === recordedThreadId);
+      const msgs = source?.msgs;
+      if (msgs) {
+        const i = msgs.findIndex((m) => m.role === "user" && m.mid === mid);
+        if (i >= 0) {
+          const [removed] = msgs.splice(i, 1);
+          const now = Math.max(Date.now(), Number(source.updatedAt) + 1 || 0);
+          if (removed?.id) {
+            source.deletedMessages = source.deletedMessages || {};
+            source.deletedMessages[removed.id] = now;
+          }
+          source.updatedAt = now;
+          source.ts = now;
+        }
+      }
+      painted = appendUser(text, { mid, attachments: pastedTexts });
+      paintMedia();
+    }
     // Track delivery: trackSend marks "Sending…", then the working ack flips it
     // to "✓ Seen" (or a timeout / closed socket flips it to "Not delivered").
     // `text` (the raw composer text) is kept so ✎ can restore it for editing.

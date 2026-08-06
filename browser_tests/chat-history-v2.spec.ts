@@ -328,15 +328,27 @@ test('a stale pre-upgrade panel pointer never restores over the current conversa
         }]
       }
     ]))
+    // The retired workflow mode stamped a workflow-scoped selection op on
+    // every thread creation/open, so a real pre-upgrade snapshot carries the
+    // newer workflow selection alongside the abandoned panel pointer.
     localStorage.setItem(metaKey, JSON.stringify({
-      updatedAt: staleAt + 1,
-      activeByScope: { 'panel:global': 'stale-panel-thread' },
+      updatedAt: freshAt,
+      activeByScope: {
+        'panel:global': 'stale-panel-thread',
+        'workflow:wf-current': 'current-workflow-thread'
+      },
       activeOps: {
         'panel:global': {
           value: 'stale-panel-thread',
           deleted: false,
           updatedAt: staleAt + 1,
           revision: { updatedAt: staleAt + 1, writerId: 'old-build', sequence: 1 }
+        },
+        'workflow:wf-current': {
+          value: 'current-workflow-thread',
+          deleted: false,
+          updatedAt: freshAt,
+          revision: { updatedAt: freshAt, writerId: 'old-build', sequence: 2 }
         }
       }
     }))

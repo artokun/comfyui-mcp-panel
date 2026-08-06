@@ -19,13 +19,34 @@ the retired modes remain in history as ordinary archive entries, openable from
 any workflow.
 
 Which conversation is *the* conversation is shared state, not tab state: the
-`panel:global` active pointer in history metadata. Every tab resolves it through
-one selector (`selectPanelThread`) — on cold restore and on cross-tab sync alike
-— and a tab whose selection moved adopts the new thread passively (it repaints;
-only the tab the user acted in sends `resume_session`/`new_session`). A pointer
-left stale by a pre-#884 build loses to newer conversation activity (message
-recency, not metadata edits), so an upgrade never restores a months-old chat
-over the one the user is actually in.
+**backend-scoped** active pointer `panel:backend:<id>` in history metadata
+(one conversation per backend, mirroring the orchestrator's
+`orchestrator::<backend>` session key; the pre-existing shared `panel:global`
+key remains a one-way read fallback until a backend's key is first written).
+Every tab resolves its own backend's pointer through one selector
+(`selectPanelThread`/`resolvePanelPointer`) — on cold restore and on cross-tab
+sync alike — and a tab whose selection moved adopts the new thread passively
+(it repaints; only the tab the user acted in sends
+`resume_session`/`new_session`).
+
+**The commit is the transition:** an acting tab dispatches the session frame
+first and publishes the pointer only when the frame actually left its socket —
+a disconnected tab can still read an archive locally, but cannot move the
+other tabs onto a conversation the backend never entered.
+
+**Selection evidence only:** a pointer left stale by a pre-#884 build loses to
+a *newer selection* (the retired workflow mode stamped workflow-scoped active
+ops on every thread creation/open), never to mere message timestamps — an
+imported archive, a straggler write, or a skewed clock carries newer messages
+without any user selection and must not move the shared conversation.
+
+**Turn ownership:** a turn's owner is pinned when its `user_message` is
+dispatched (not at `turn:working`), and every transcript output — says, stream
+deltas, plan updates, question cards, media, A2UI cards, command activity —
+is fenced against a conversation the turn does not own. The prompt itself is
+filed at dispatch time too: if the selection moves while attachments upload or
+grounding runs, the recorded prompt is relocated (tombstoned + re-recorded)
+into the conversation that will actually consume it.
 
 The plus button starts a new conversation without deleting older chats. The
 history button opens search, current-workflow filtering, rename, pin, delete,
