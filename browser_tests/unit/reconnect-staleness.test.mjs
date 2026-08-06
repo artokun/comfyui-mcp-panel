@@ -1,4 +1,4 @@
-// Unit tests for web/js/lib/reconnect-staleness.js — run with `node --test`.
+// Unit tests for web/v0.11.38/js/lib/reconnect-staleness.js — run with `node --test`.
 //
 // Regression coverage for #433: after a ComfyUI BACKEND restart the frontend can
 // restore a DIFFERENT active tab than the user was last viewing, so workflow_list /
@@ -19,10 +19,10 @@ import {
   ACTIVE_STALE_WINDOW_MS,
   activeWorkflowPossiblyStale,
   activeStaleHint,
-} from "../../web/js/lib/reconnect-staleness.js";
+} from "../../web/v0.11.38/js/lib/reconnect-staleness.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.mjs");
+const PANEL_JS = join(HERE, "../../web/v0.11.38/js/comfyui-mcp-panel.mjs");
 
 test("no reconnect yet (epoch 0) → never stale", () => {
   assert.equal(

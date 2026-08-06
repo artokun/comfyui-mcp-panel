@@ -7,7 +7,7 @@
 // empty grid (total:0).
 import { test, mock } from "node:test";
 import assert from "node:assert/strict";
-import { CivitaiClient, CIVITAI_REQUEST_TIMEOUT_MS } from "../../web/js/cmcp-civitai.js";
+import { CivitaiClient, CIVITAI_REQUEST_TIMEOUT_MS } from "../../web/v0.11.38/js/cmcp-civitai.js";
 
 function clientWith(response) {
   return new CivitaiClient({

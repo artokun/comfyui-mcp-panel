@@ -24,7 +24,7 @@ import {
   promptRelayDerivedRefusal,
   applyPromptRelayTimelineWrite,
   PromptRelayTimelineWriteError,
-} from "../../web/js/lib/prompt-relay-timeline.js";
+} from "../../web/v0.11.38/js/lib/prompt-relay-timeline.js";
 
 const seg = (prompt, length = 24, extra = {}) => ({ prompt, length, color: "#4f8edc", ...extra });
 
@@ -1480,7 +1480,7 @@ test("fires NO undo hooks when a refusal happens (no empty undo step)", () => {
 
 // Normalized to LF: the working copy is checked out CRLF on Windows.
 const panelSrc = readFileSync(
-  fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.mjs", import.meta.url)),
+  fileURLToPath(new URL("../../web/v0.11.38/js/comfyui-mcp-panel.mjs", import.meta.url)),
   "utf8",
 ).replace(/\r\n/g, "\n");
 

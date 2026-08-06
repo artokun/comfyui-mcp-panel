@@ -5,8 +5,8 @@ import {
   ChatHistoryStore,
   normalizeThread,
   mergeHistorySnapshots,
-} from "../../web/js/lib/chat-history-store.js";
-import { mediaRecordFor, isDurableMediaUrl, createMediaRecorder } from "../../web/js/lib/chat-media.js";
+} from "../../web/v0.11.38/js/lib/chat-history-store.js";
+import { mediaRecordFor, isDurableMediaUrl, createMediaRecorder } from "../../web/v0.11.38/js/lib/chat-media.js";
 
 // Media persistence (#177): image/video cards are recorded as role:"media"
 // messages carrying a SERVABLE url + caption. These tests assert the durable

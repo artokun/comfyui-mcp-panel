@@ -1,5 +1,5 @@
 /**
- * Unit tests for web/js/lib/asset-staleness.js — run with `node --test`.
+ * Unit tests for web/v0.11.38/js/lib/asset-staleness.js — run with `node --test`.
  *
  * Covers the WS-3 stale-snapshot fixes: subgraph-scoped id resolution, the
  * missing-asset live-graph cross-check (fixed-by-set_widget and appeared-on-disk),
@@ -28,7 +28,7 @@ import {
   nodeRedFlagIsStale,
   collectLinkedNeighborNodeIds,
   resolveMissingModelDirectory,
-} from "../../web/js/lib/asset-staleness.js";
+} from "../../web/v0.11.38/js/lib/asset-staleness.js";
 
 /** The REAL LTXICLoRALoaderModelOnly schema: a `model` CONNECTION input plus two
  *  WIDGET inputs. Connection inputs must not be counted as widgets (finding #3). */

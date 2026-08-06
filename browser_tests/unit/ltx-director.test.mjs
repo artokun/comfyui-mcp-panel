@@ -17,7 +17,7 @@ import {
   derivedTimelineRefusal,
   applyLtxTimelineWrite,
   LtxTimelineWriteError,
-} from "../../web/js/lib/ltx-director.js";
+} from "../../web/v0.11.38/js/lib/ltx-director.js";
 
 /** A fake node whose _timelineEditor records the _applyLoadedTimeline call. */
 function makeLtxNode({

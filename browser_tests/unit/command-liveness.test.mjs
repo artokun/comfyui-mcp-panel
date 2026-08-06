@@ -1,4 +1,4 @@
-// Unit tests for web/js/lib/command-liveness.js — run with `node --test`.
+// Unit tests for web/v0.11.38/js/lib/command-liveness.js — run with `node --test`.
 //
 // #508: the sidebar chat stayed CONNECTED and accepted the user's request, yet EVERY
 // frontend command timed out with no reply from the registered tab — set_todo (5000 ms),
@@ -34,10 +34,10 @@ import {
   pruneAttempts,
   shouldReRegister,
   reRegisterExhaustedHint,
-} from "../../web/js/lib/command-liveness.js";
+} from "../../web/v0.11.38/js/lib/command-liveness.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.mjs");
+const PANEL_JS = join(HERE, "../../web/v0.11.38/js/comfyui-mcp-panel.mjs");
 
 // --- honest cause reporting ----------------------------------------------
 

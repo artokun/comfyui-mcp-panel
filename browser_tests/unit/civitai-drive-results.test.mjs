@@ -7,7 +7,7 @@
 // returns METADATA + URLs ONLY, never image bytes, and clamps `limit`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { serializeCivitaiResults, CIVITAI_PROMPT_CAP } from "../../web/js/cmcp-civitai-ui.js";
+import { serializeCivitaiResults, CIVITAI_PROMPT_CAP } from "../../web/v0.11.38/js/cmcp-civitai-ui.js";
 
 // Media rows as produced by CivitaiClient._fromRest / _fromMeili.
 const mediaRows = [

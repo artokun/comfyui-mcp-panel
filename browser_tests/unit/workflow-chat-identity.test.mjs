@@ -18,7 +18,7 @@ import {
   shouldForkEmbeddedWorkflowUuid,
   shouldForkInPlaceReload,
   workflowAliasForPath
-} from '../../web/js/lib/workflow-chat-identity.js'
+} from '../../web/v0.11.38/js/lib/workflow-chat-identity.js'
 
 // #570 P0c — the exemption is decided by the RESOLVED TARGET, not raw path presence.
 test('#570 selectorTargetsNonActiveWorkflow: exempt ONLY when the selector resolves to a NON-active open workflow', () => {

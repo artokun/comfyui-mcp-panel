@@ -6,7 +6,7 @@ import {
   mediaKindFromUrl,
   normalizeMediaItem,
   createLightboxModel,
-} from "../../web/js/lib/lightbox-gallery.js";
+} from "../../web/v0.11.38/js/lib/lightbox-gallery.js";
 
 // In-panel media lightbox (#163). The overlay DOM lives in the main panel and
 // is covered by e2e; these tests pin the pure core it drives: index math,

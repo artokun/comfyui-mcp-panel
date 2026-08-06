@@ -29,7 +29,7 @@ import {
   graphReadBindingChanged,
   resolveGraphRootUuidRebind,
   serializedStateProvenEmpty,
-} from "../../web/js/lib/graph-binding.js";
+} from "../../web/v0.11.38/js/lib/graph-binding.js";
 import {
   commandWorkflowMismatch,
   hasEmbeddedUuidSuccessionEvidence,
@@ -41,10 +41,10 @@ import {
   shouldForkEmbeddedWorkflowUuid,
   shouldForkInPlaceReload,
   workflowAliasForPath,
-} from "../../web/js/lib/workflow-chat-identity.js";
+} from "../../web/v0.11.38/js/lib/workflow-chat-identity.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.mjs");
+const PANEL_JS = join(HERE, "../../web/v0.11.38/js/comfyui-mcp-panel.mjs");
 
 function panelFunctionSource(src, name, nextName) {
   const start = src.indexOf(`function ${name}(`);

@@ -6,7 +6,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { reconcileCompletedDownloads } from "../../web/js/lib/download-refresh.js";
+import { reconcileCompletedDownloads } from "../../web/v0.11.38/js/lib/download-refresh.js";
 
 test("a download reaching done fires exactly once", () => {
   let seen = new Set();

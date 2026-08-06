@@ -1,4 +1,4 @@
-// Unit tests for per-turn revert snapshot selection (web/js/lib/graph-revert.js).
+// Unit tests for per-turn revert snapshot selection (web/v0.11.38/js/lib/graph-revert.js).
 //
 // Regression coverage for #327: /revert restored graphSnapshots[last]
 // unconditionally, so after a turn cleared/replaced the graph — and the next
@@ -7,7 +7,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { pickRevertSnapshot } from "../../web/js/lib/graph-revert.js";
+import { pickRevertSnapshot } from "../../web/v0.11.38/js/lib/graph-revert.js";
 
 const snap = (data) => ({ mid: null, ts: 0, data });
 // Distinct serialized-graph shapes standing in for rootGraph.serialize() output.

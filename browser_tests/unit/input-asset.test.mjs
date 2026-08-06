@@ -1,6 +1,6 @@
 /**
  * Unit tests for the UPLOAD-input recognition helpers (#387) —
- * web/js/lib/input-asset.js. Run with `node --test`.
+ * web/v0.11.38/js/lib/input-asset.js. Run with `node --test`.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -13,7 +13,7 @@ import {
   filterServerConfirmedInputSubfolderCandidates,
   inputPathsUseWindowsSeparators,
   addComboOption,
-} from "../../web/js/lib/input-asset.js";
+} from "../../web/v0.11.38/js/lib/input-asset.js";
 
 const DEFS = {
   LoadImage: {

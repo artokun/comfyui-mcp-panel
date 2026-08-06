@@ -1,5 +1,5 @@
 /**
- * Unit tests for web/js/lib/model-catalog.js — run with `node --test`.
+ * Unit tests for web/v0.11.38/js/lib/model-catalog.js — run with `node --test`.
  *
  * Guards #377: the model picker must track the AUTHORITATIVE advertised model
  * ids, not assume a stale `opus` alias is the current Opus.
@@ -28,7 +28,7 @@ import {
   presentableModels,
   pickDefaultModel,
   modelLabel,
-} from "../../web/js/lib/model-catalog.js";
+} from "../../web/v0.11.38/js/lib/model-catalog.js";
 
 // The exact list the issue reports the running orchestrator advertising.
 function advertisedStaleOpus() {

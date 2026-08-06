@@ -1,4 +1,4 @@
-// Rebuild the vendored A2UI Lit renderer bundle (web/js/vendor/a2ui-lit.bundle.js)
+// Rebuild the vendored A2UI Lit renderer bundle (web/v0.11.38/js/vendor/a2ui-lit.bundle.js)
 // from the pinned packages in vendor-spike/. For deliberate upgrades only.
 //
 // Usage (from anywhere — the script derives all paths from its own location):

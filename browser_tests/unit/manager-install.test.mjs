@@ -1,5 +1,5 @@
 // Unit tests for the per-dialect custom-node install routing
-// (web/js/lib/manager-install.js). Regression coverage for issues #187/#182/#184
+// (web/v0.11.38/js/lib/manager-install.js). Regression coverage for issues #187/#182/#184
 // and the codex round-2 finding: ssh:// and git:// URLs (via id OR repository)
 // must resolve to the repo NAME and the correct per-dialect payload.
 import test from "node:test";
@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import * as ManagerInstall from "../../web/js/lib/manager-install.js";
+import * as ManagerInstall from "../../web/v0.11.38/js/lib/manager-install.js";
 const {
   looksLikeGitUrl,
   looksLikeOwnerRepoShorthand,
@@ -528,7 +528,7 @@ test("v2-batch: git URL, stale batch failed[] + renamed-dir present ⇒ NOT fail
 // asserts every manager-install export it CALLS is actually imported.
 test("comfyui-mcp-panel imports every manager-install export it calls (no ReferenceError)", () => {
   const panelPath = fileURLToPath(
-    new URL("../../web/js/comfyui-mcp-panel.mjs", import.meta.url),
+    new URL("../../web/v0.11.38/js/comfyui-mcp-panel.mjs", import.meta.url),
   );
   const src = readFileSync(panelPath, "utf8");
 
@@ -573,7 +573,7 @@ test("comfyui-mcp-panel imports every manager-install export it calls (no Refere
 // module's own dependency wiring.
 test("waitForQueueDrain (real panel source) returns a drained status without ReferenceError", async () => {
   const panelPath = fileURLToPath(
-    new URL("../../web/js/comfyui-mcp-panel.mjs", import.meta.url),
+    new URL("../../web/v0.11.38/js/comfyui-mcp-panel.mjs", import.meta.url),
   );
   const src = readFileSync(panelPath, "utf8");
 
@@ -617,7 +617,7 @@ test("waitForQueueDrain (real panel source) returns a drained status without Ref
 
 function readPanelSource() {
   const panelPath = fileURLToPath(
-    new URL("../../web/js/comfyui-mcp-panel.mjs", import.meta.url),
+    new URL("../../web/v0.11.38/js/comfyui-mcp-panel.mjs", import.meta.url),
   );
   return readFileSync(panelPath, "utf8");
 }

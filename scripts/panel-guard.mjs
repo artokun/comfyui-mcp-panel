@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // panel-guard.mjs — dev-time guardian for the live-served panel bundle.
 //
-// web/js/*.js is served LIVE to ComfyUI through the custom_nodes junction, so a
+// web/v0.11.38/js/*.js is served LIVE to ComfyUI through the custom_nodes junction, so a
 // single syntactically-broken save (a stray ``` fence, a bad optional-chaining
 // assignment, a half-finished edit) doesn't just break this panel — it throws
 // in ComfyUI's extension loader and blacks out the ENTIRE frontend (no sidebar).

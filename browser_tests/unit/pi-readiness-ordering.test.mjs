@@ -5,9 +5,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { readyAckCanPromoteBackend } from "../../web/js/lib/pi-readiness.js";
+import { readyAckCanPromoteBackend } from "../../web/v0.11.38/js/lib/pi-readiness.js";
 
-const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.mjs", import.meta.url));
+const panelPath = fileURLToPath(new URL("../../web/v0.11.38/js/comfyui-mcp-panel.mjs", import.meta.url));
 
 test("#505 Pi ready ack before backends stays unready; authoritative frame unlocks promotion", () => {
   let piBackendsReadinessReceived = false;

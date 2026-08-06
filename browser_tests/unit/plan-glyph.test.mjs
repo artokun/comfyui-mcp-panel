@@ -10,7 +10,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { todoItemGlyph } from "../../web/js/lib/plan-glyph.js";
+import { todoItemGlyph } from "../../web/v0.11.38/js/lib/plan-glyph.js";
 
 const SPINNER = "pi-spin pi-spinner";
 const IDLE_ACTIVE = "pi-circle-fill";

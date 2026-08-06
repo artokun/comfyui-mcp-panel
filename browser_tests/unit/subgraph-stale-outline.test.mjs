@@ -8,9 +8,9 @@ import { fileURLToPath } from "node:url";
 import {
   collectMissingNodeTypeReasons,
   nodeRedFlagIsStale,
-} from "../../web/js/lib/asset-staleness.js";
+} from "../../web/v0.11.38/js/lib/asset-staleness.js";
 
-const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.mjs", import.meta.url));
+const panelPath = fileURLToPath(new URL("../../web/v0.11.38/js/comfyui-mcp-panel.mjs", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
 
 function methodSource(name, args) {

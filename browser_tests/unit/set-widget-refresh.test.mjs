@@ -1,6 +1,6 @@
 /**
  * Unit tests for the STALE-COMBO refresh-before-validate recovery in
- * web/js/lib/set-widget.js — run with `node --test`.
+ * web/v0.11.38/js/lib/set-widget.js — run with `node --test`.
  *
  * These drive runSetWidget(), the SAME async unit graph_set_widget delegates to,
  * so the production path is exercised (not a parallel reimplementation). The
@@ -23,7 +23,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { runSetWidget } from "../../web/js/lib/set-widget.js";
+import { runSetWidget } from "../../web/v0.11.38/js/lib/set-widget.js";
 
 // A registry whose entries have no `nodeData` so the placeholder cross-check in
 // assertResolvedTargetRegistered is skipped (registeredDef undefined) while the

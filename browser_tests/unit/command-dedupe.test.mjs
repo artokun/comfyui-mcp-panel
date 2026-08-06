@@ -1,4 +1,4 @@
-// Unit tests for the bridge-command rid dedupe ledger (web/js/lib/command-dedupe.js).
+// Unit tests for the bridge-command rid dedupe ledger (web/v0.11.38/js/lib/command-dedupe.js).
 //
 // Regression coverage for #517: a graph mutation that timed out bridge-side can
 // still apply panel-side, and re-delivering the SAME command frame (a replay
@@ -25,7 +25,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { commandFingerprint, createCommandDedupeLedger } from "../../web/js/lib/command-dedupe.js";
+import { commandFingerprint, createCommandDedupeLedger } from "../../web/v0.11.38/js/lib/command-dedupe.js";
 
 // Minimal stand-in for the panel's bridge message handler: the same
 // get → (replay | begin → execute → settle) flow the real dispatch runs.
@@ -520,7 +520,7 @@ test("a same-rid verbatim replay is still answered with the UNREWITTEN original 
 
 test("#694 wiring: the panel handler falls back to retry_of and REWRITES the rid on a retry hit", () => {
   const HERE = dirname(fileURLToPath(import.meta.url));
-  const src = readFileSync(join(HERE, "../../web/js/comfyui-mcp-panel.mjs"), "utf8");
+  const src = readFileSync(join(HERE, "../../web/v0.11.38/js/comfyui-mcp-panel.mjs"), "utf8");
   // The dedupe block: a miss on the frame's own rid must consult retry_of BEFORE
   // falling through to begin + execute.
   const fpAt = src.indexOf("const fingerprint = commandFingerprint(msg);");

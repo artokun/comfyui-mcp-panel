@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { deferChangeTrackerSnapshot } from "../../web/js/lib/change-tracker-snapshot.js";
+import { deferChangeTrackerSnapshot } from "../../web/v0.11.38/js/lib/change-tracker-snapshot.js";
 
 test("#581 defers the captured tracker snapshot and preserves its receiver", () => {
   let queued = null;
@@ -44,7 +44,7 @@ test("#581 ignores unavailable trackers and swallows a deferred teardown failure
 
 test("#581 wires the deferred snapshot after delivering a successful command reply", () => {
   const here = dirname(fileURLToPath(import.meta.url));
-  const source = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.mjs"), "utf8").replace(/\r\n/g, "\n");
+  const source = readFileSync(join(here, "../../web/v0.11.38/js/comfyui-mcp-panel.mjs"), "utf8").replace(/\r\n/g, "\n");
   const capture = source.indexOf("changeTrackerToSnapshot =");
   const deliver = source.indexOf("if (deliverReply(reply, msg.cmd, superseded))", capture);
   const defer = source.indexOf("deferChangeTrackerSnapshot(changeTrackerToSnapshot)", deliver);

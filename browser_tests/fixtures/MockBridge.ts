@@ -5,7 +5,7 @@
  * agent. Those backends need auth, cost money, and are non-deterministic, so the
  * Tier 1 suite points the panel at THIS instead. It speaks exactly the frame
  * shapes the panel's `createBridgeClient` expects (see
- * web/js/comfyui-mcp-panel.mjs ~line 3412 onward).
+ * web/v0.11.38/js/comfyui-mcp-panel.mjs ~line 3412 onward).
  *
  * Frames the panel RECEIVES (server -> client) that we emit:
  *   - { type: "models", models: [{id,label,small?}], current?, backend? }

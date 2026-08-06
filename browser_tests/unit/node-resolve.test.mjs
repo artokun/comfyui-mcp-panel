@@ -1,5 +1,5 @@
 /**
- * Unit tests for web/js/lib/node-resolve.js — run with `node --test`.
+ * Unit tests for web/v0.11.38/js/lib/node-resolve.js — run with `node --test`.
  *
  * Models the REAL bug from #458: with ComfyUI's backend unreachable the node
  * definitions never load, so graph_add_node let LiteGraph mint a generic
@@ -31,15 +31,15 @@ import {
   HISTORY_UNSEEDED,
   HISTORY_PENDING,
   backendHistoryVerdict,
-} from "../../web/js/lib/node-resolve.js";
-import { createObjectInfoHistory } from "../../web/js/lib/object-info-history.js";
+} from "../../web/v0.11.38/js/lib/node-resolve.js";
+import { createObjectInfoHistory } from "../../web/v0.11.38/js/lib/object-info-history.js";
 // The PRODUCTION graph_set_widget handler body — the executor and these tests
 // call it verbatim, so the tested ordering IS the shipped ordering (#458).
-import { runSetWidget } from "../../web/js/lib/set-widget.js";
+import { runSetWidget } from "../../web/v0.11.38/js/lib/set-widget.js";
 // The PRODUCTION combo refresh + the authoritative "server says this combo is empty"
 // oracle that gates #507's last-resort acceptance.
-import { refreshComboOptionsFromDefs } from "../../web/js/lib/asset-staleness.js";
-import { serverDeclaresEmptyComboOptions } from "../../web/js/lib/input-asset.js";
+import { refreshComboOptionsFromDefs } from "../../web/v0.11.38/js/lib/asset-staleness.js";
+import { serverDeclaresEmptyComboOptions } from "../../web/v0.11.38/js/lib/input-asset.js";
 
 // A registry shaped like LG.registered_node_types once /object_info loaded:
 // hundreds of classes; we only need the sentinels + a couple of extras here.

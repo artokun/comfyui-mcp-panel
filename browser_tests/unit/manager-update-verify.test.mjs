@@ -3,7 +3,7 @@
 // The aggregate /v2/manager/queue/status endpoint marks a CRASHED do_update
 // "done" (it still counts toward done_count), so the authoritative verdict lives
 // in the per-task history (/v2/manager/queue/history). These tests exercise the
-// pure interpretation helpers (web/js/lib/manager-install.js) against the exact
+// pure interpretation helpers (web/v0.11.38/js/lib/manager-install.js) against the exact
 // wire shapes the live Manager v4 emits (data_models: OperationResult =
 // success|failed|skipped|error|skip; TaskExecutionStatus = {status_str, completed,
 // messages}; the worker records status_str="error" + messages=[exc] on a crash).
@@ -16,7 +16,7 @@ import {
   parseTaskHistoryItem,
   collectRecentTaskFailures,
   classifyUpdateOutcome,
-} from "../../web/js/lib/manager-install.js";
+} from "../../web/v0.11.38/js/lib/manager-install.js";
 
 // The exact record the worker writes on the #364 crash: do_update raised
 // AttributeError, so the worker's except-branch calls task_done with

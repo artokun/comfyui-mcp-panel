@@ -1,10 +1,10 @@
-// Unit tests for the Micro-Apps service (web/js/cmcp-apps.js): APP-mode
+// Unit tests for the Micro-Apps service (web/v0.11.38/js/cmcp-apps.js): APP-mode
 // config import (defensive key probing), heuristic input/output selection,
 // widget classification, dependency scanning, manifest assembly, and the
 // AppsClient HTTP surface (mocked fetch).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { AppBuilder, AppsClient } from "../../web/js/cmcp-apps.js";
+import { AppBuilder, AppsClient } from "../../web/v0.11.38/js/cmcp-apps.js";
 
 // ── APP-mode config import ──────────────────────────────────────────────────
 

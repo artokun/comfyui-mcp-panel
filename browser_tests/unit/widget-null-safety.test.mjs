@@ -1,4 +1,4 @@
-// Unit tests for web/js/lib/widget-null-safety.js — run with `node --test`.
+// Unit tests for web/v0.11.38/js/lib/widget-null-safety.js — run with `node --test`.
 //
 // Guards the #445 crash: a workflow with null VHS_VideoCombine widget values
 // (frame_rate:null, filename_prefix:null, pingpong:null, save_output:null) threw
@@ -14,7 +14,7 @@ import {
   sanitizeNullWidgetValues,
   restoreWidgetValues,
   installGraphToPromptNullSafety,
-} from "../../web/js/lib/widget-null-safety.js";
+} from "../../web/v0.11.38/js/lib/widget-null-safety.js";
 
 test("safeWidgetDefault prefers the widget's declared default", () => {
   assert.equal(safeWidgetDefault({ type: "text", options: { default: "AnimateDiff" } }), "AnimateDiff");

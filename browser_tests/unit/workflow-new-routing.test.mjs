@@ -21,11 +21,11 @@ import test from 'node:test'
 import {
   classifyPinnedTarget,
   workflowIdentityForms
-} from '../../web/js/lib/workflow-chat-identity.js'
+} from '../../web/v0.11.38/js/lib/workflow-chat-identity.js'
 import {
   dedupeWorkflowTabRecords,
   workflowTabKey
-} from '../../web/js/lib/session-rebind.js'
+} from '../../web/v0.11.38/js/lib/session-rebind.js'
 
 // Native ComfyUI shape for an UNSAVED tab: shared title/key, no disk path, and the
 // isTemporary/isPersisted flags that mark it never-saved.

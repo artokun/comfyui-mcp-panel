@@ -18,7 +18,7 @@ import assert from "node:assert/strict";
 import {
   classifyInPlaceOverwrite,
   markPersistedForOverwrite,
-} from "../../web/js/lib/workflow-save.js";
+} from "../../web/v0.11.38/js/lib/workflow-save.js";
 
 const A = JSON.stringify({ nodes: [{ id: 1, pos: [0, 0] }] }); // what the tab loaded
 const B = JSON.stringify({ nodes: [{ id: 1, pos: [500, 300] }] }); // changed on disk

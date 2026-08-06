@@ -6,7 +6,7 @@ import {
   buttonReplyText,
   isDroppedAgentReplay,
   serializeContext,
-} from "../../web/js/lib/chat-serialize.js";
+} from "../../web/v0.11.38/js/lib/chat-serialize.js";
 
 test("strings pass through unchanged", () => {
   assert.equal(coerceMessageText("hello"), "hello");

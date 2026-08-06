@@ -1,4 +1,4 @@
-// Unit tests for the manual-canvas-change baseline gate (web/js/lib/manual-change-gate.js).
+// Unit tests for the manual-canvas-change baseline gate (web/v0.11.38/js/lib/manual-change-gate.js).
 //
 // Regression coverage for #369: after a session reload/resume the tracker injected a
 // "MANUAL CANVAS CHANGES … 100+ nodes removed" notice that the very next live graph
@@ -8,7 +8,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { classifyManualChangeBaseline } from "../../web/js/lib/manual-change-gate.js";
+import { classifyManualChangeBaseline } from "../../web/v0.11.38/js/lib/manual-change-gate.js";
 
 const KEY_A = "uuid-A";
 const KEY_B = "uuid-B";

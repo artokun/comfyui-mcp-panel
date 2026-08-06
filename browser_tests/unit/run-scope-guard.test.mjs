@@ -1,5 +1,5 @@
 /**
- * Unit tests for web/js/lib/run-scope-guard.js — run with `node --test`.
+ * Unit tests for web/v0.11.38/js/lib/run-scope-guard.js — run with `node --test`.
  *
  * Guards #556: a scoped panel_run (to_node_id, "run to node") must NEVER
  * silently fall through to a FULL-graph execution — and must never collateral-
@@ -29,8 +29,8 @@ import {
   createScopedRunGuard,
   cancelPendingScopedQueueItem,
   dispatchScopedRun,
-} from "../../web/js/lib/run-scope-guard.js";
-import { resolveRunToNodeTarget } from "../../web/js/lib/subgraph-scope.js";
+} from "../../web/v0.11.38/js/lib/run-scope-guard.js";
+import { resolveRunToNodeTarget } from "../../web/v0.11.38/js/lib/subgraph-scope.js";
 
 // A Response double with the surface the guard + frontend rejection path use.
 function jsonResponse(status, obj) {

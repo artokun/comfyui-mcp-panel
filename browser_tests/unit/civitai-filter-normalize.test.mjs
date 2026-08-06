@@ -1,4 +1,4 @@
-// Unit tests for the #459 sort/period enum clamp in web/js/cmcp-civitai.js.
+// Unit tests for the #459 sort/period enum clamp in web/v0.11.38/js/cmcp-civitai.js.
 //
 // CivitAI's REST list endpoints ZodError-reject any sort/period value outside
 // their enum with a hard `400 Bad Request` that dead-ended the docked browser
@@ -19,7 +19,7 @@ import {
   MODEL_SORTS,
   IMAGE_SORTS,
   PERIODS,
-} from "../../web/js/cmcp-civitai.js";
+} from "../../web/v0.11.38/js/cmcp-civitai.js";
 
 test("normalizeModelSort clamps out-of-vocab / cross-tab values to the default", () => {
   // Cross-tab: an IMAGE sort is NOT a valid model sort → 400 on /v1/models.

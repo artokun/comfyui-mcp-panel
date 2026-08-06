@@ -6,7 +6,7 @@ import {
   shouldGroundBeforeTurn,
   groundingIsSafe,
   groundActiveWorkflow
-} from '../../web/js/lib/workflow-save.js'
+} from '../../web/v0.11.38/js/lib/workflow-save.js'
 
 // #330 — unsaved workflows were grounded ONLY on a brand-new chat (the freshChat
 // gate). Continuing an existing chat inside an unsaved tab left the user's edits

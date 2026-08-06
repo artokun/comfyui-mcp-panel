@@ -1,5 +1,5 @@
 /**
- * Unit tests for web/js/lib/object-info-history.js — run with `node --test`.
+ * Unit tests for web/v0.11.38/js/lib/object-info-history.js — run with `node --test`.
  *
  * This is the OBSERVED-BACKEND-HISTORY trust root the whole #458 guard family rests on
  * (node-resolve.js's backendHistoryVerdict / the frontend-only exemption). It has THREE
@@ -23,12 +23,12 @@
  * residual race in which a pack is removed inside the window between page load and the
  * panel's first successful /object_info response, since the baseline can only ever come
  * from an asynchronous fetch. See the KNOWN, ACCEPTED RESIDUAL note in
- * web/js/lib/object-info-history.js for why that is bounded and out of scope.
+ * web/v0.11.38/js/lib/object-info-history.js for why that is bounded and out of scope.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { createObjectInfoHistory, awaitHistoryBaseline } from "../../web/js/lib/object-info-history.js";
+import { createObjectInfoHistory, awaitHistoryBaseline } from "../../web/v0.11.38/js/lib/object-info-history.js";
 // The guard-side contract this oracle feeds: both no-baseline states return a TRUTHY
 // sentinel (so a truth-testing consumer still fails closed) and the shared classifier
 // turns them into distinct, honest diagnoses.
@@ -37,7 +37,7 @@ import {
   HISTORY_UNSEEDED,
   backendHistoryVerdict,
   isRemovedBackendType,
-} from "../../web/js/lib/node-resolve.js";
+} from "../../web/v0.11.38/js/lib/node-resolve.js";
 
 const defs = (...types) => Object.fromEntries(types.map((t) => [t, { input: { required: {} } }]));
 const oracle = (h) => (t) => h.wasTypeEverDefined(t);

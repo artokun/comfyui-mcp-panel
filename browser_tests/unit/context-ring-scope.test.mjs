@@ -10,7 +10,7 @@
 // no stored fill.
 //
 // ctxScopeKey / refreshContextRingForScope / clearAllCtxScopes live inside the
-// panel-builder closure in web/js/comfyui-mcp-panel.mjs (they close over browser
+// panel-builder closure in web/v0.11.38/js/comfyui-mcp-panel.mjs (they close over browser
 // globals + the closure's `thread`), so we follow the established "real panel
 // source" extraction convention (see graph-set-node-collapsed.test.mjs): regex
 // the three function declarations out of the file and evaluate them via
@@ -21,7 +21,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.mjs", import.meta.url));
+const panelPath = fileURLToPath(new URL("../../web/v0.11.38/js/comfyui-mcp-panel.mjs", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
 
 const CTX_KEY = "comfyui-mcp.panel.ctxPct";

@@ -4,7 +4,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { isCoreNodeModule } from '../../web/js/cmcp-apps-ui.js'
+import { isCoreNodeModule } from '../../web/v0.11.38/js/cmcp-apps-ui.js'
 
 test('core ComfyUI modules are recognized as core', () => {
   assert.equal(isCoreNodeModule('nodes'), true)

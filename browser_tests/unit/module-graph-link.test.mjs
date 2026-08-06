@@ -19,9 +19,9 @@ import {
   isStaleAssetCandidate,
   reapplyDefsToLiveNodes,
   refreshComboOptionsFromDefs,
-} from "../../web/js/lib/asset-staleness.js";
-import { assertAddNodeResolvableRefreshing } from "../../web/js/lib/node-resolve.js";
-import { runSetWidget } from "../../web/js/lib/set-widget.js";
+} from "../../web/v0.11.38/js/lib/asset-staleness.js";
+import { assertAddNodeResolvableRefreshing } from "../../web/v0.11.38/js/lib/node-resolve.js";
+import { runSetWidget } from "../../web/v0.11.38/js/lib/set-widget.js";
 
 // --- Mirror set-widget.js imports (the fix's internal module edges) -----------------
 import {
@@ -29,12 +29,12 @@ import {
   WidgetWriteError,
   resolvePromotedInnerTarget,
   followPromotionToConcrete,
-} from "../../web/js/lib/widget-write.js";
+} from "../../web/v0.11.38/js/lib/widget-write.js";
 import {
   preflightSetWidgetTarget,
   assertResolvedTargetRegistered,
   assertTypeAgainstFreshBackend,
-} from "../../web/js/lib/node-resolve.js";
+} from "../../web/v0.11.38/js/lib/node-resolve.js";
 
 test("panel ↔ asset-staleness.js module edge links (incl. refreshComboOptionsFromDefs — P0)", () => {
   assert.equal(typeof isStaleAssetCandidate, "function");

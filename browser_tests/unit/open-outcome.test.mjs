@@ -1,4 +1,4 @@
-// Unit tests for web/js/lib/open-outcome.js — run with `node --test`.
+// Unit tests for web/v0.11.38/js/lib/open-outcome.js — run with `node --test`.
 //
 // #402: `panel_open_workflow` came back "disconnected mid-command … OUTCOME UNKNOWN".
 // Two properties are locked here, because getting either wrong produces the worst
@@ -34,10 +34,10 @@ import {
   createSingleFlight,
   receiptAnswersCommand,
   classifyOpenOutcome,
-} from "../../web/js/lib/open-outcome.js";
+} from "../../web/v0.11.38/js/lib/open-outcome.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.mjs");
+const PANEL_JS = join(HERE, "../../web/v0.11.38/js/comfyui-mcp-panel.mjs");
 
 /** Comments in this file DISCUSS `throw` and `await` at length, so any structural
  *  assertion about control flow must look at CODE only. */

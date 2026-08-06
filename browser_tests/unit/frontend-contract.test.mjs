@@ -33,7 +33,7 @@ import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
-import { saveActiveWorkflow } from '../../web/js/lib/workflow-save.js'
+import { saveActiveWorkflow } from '../../web/v0.11.38/js/lib/workflow-save.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const REPO = join(__dirname, '..', '..')

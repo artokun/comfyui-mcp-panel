@@ -15,7 +15,7 @@ import {
   selectRestoreThread,
   selectThreadForScope,
   updateMetadataEntry
-} from '../../web/js/lib/chat-history-store.js'
+} from '../../web/v0.11.38/js/lib/chat-history-store.js'
 
 function createMemoryStorage({ throwOnSet = null } = {}) {
   const values = new Map()

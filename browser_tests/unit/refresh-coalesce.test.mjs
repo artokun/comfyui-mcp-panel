@@ -1,10 +1,10 @@
-// Unit tests for web/js/lib/refresh-coalesce.js — the node-def refresh coalescer.
+// Unit tests for web/v0.11.38/js/lib/refresh-coalesce.js — the node-def refresh coalescer.
 // The load-bearing property (#289 P2): a caller-supplied FRESH payload must NEVER be
 // dropped by joining an OLDER in-flight refresh.
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { makeRefreshCoalescer } from "../../web/js/lib/refresh-coalesce.js";
+import { makeRefreshCoalescer } from "../../web/v0.11.38/js/lib/refresh-coalesce.js";
 
 // A tiny deferred so a test can hold a refresh "in flight" until it chooses.
 function deferred() {

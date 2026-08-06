@@ -7,7 +7,7 @@ import {
   computeFitTransform,
   cssViewport,
   scopeChanged,
-} from "../../web/js/lib/screenshot-capture.js";
+} from "../../web/v0.11.38/js/lib/screenshot-capture.js";
 
 // ---- isVueNodesEnabled (#335/#329/#189 renderer detection) -----------------
 

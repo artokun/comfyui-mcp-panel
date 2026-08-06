@@ -12,9 +12,9 @@ import { resolve } from 'node:path'
 const SESSION_KEY = 'comfyui-mcp.panel.sessionId'
 const CURRENT_THREAD_KEY = 'comfyui-mcp.panel.currentThreadId'
 const LOCAL_HISTORY_SNAPSHOT_KEY = 'comfyui-mcp.panel.historySnapshot'
-const PANEL_SOURCE = readFileSync(resolve('web/js/comfyui-mcp-panel.mjs'), 'utf8')
+const PANEL_SOURCE = readFileSync(resolve('web/v0.11.38/js/comfyui-mcp-panel.mjs'), 'utf8')
 const HISTORY_STORE_SOURCE = readFileSync(
-  resolve('web/js/lib/chat-history-store.js'),
+  resolve('web/v0.11.38/js/lib/chat-history-store.js'),
   'utf8'
 )
 

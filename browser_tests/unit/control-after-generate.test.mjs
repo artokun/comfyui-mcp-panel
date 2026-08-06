@@ -1,5 +1,5 @@
 /**
- * Unit tests for web/js/lib/control-after-generate.js (#558) — run with `node --test`.
+ * Unit tests for web/v0.11.38/js/lib/control-after-generate.js (#558) — run with `node --test`.
  *
  * control_after_generate SILENTLY rewrites a seed/INT/COMBO value after each
  * generation, and the ComfyUI frontend adds it as a serialize:false/canvasOnly
@@ -17,7 +17,7 @@ import {
   controlAfterGenerateModes,
   controlEntryForWidget,
   controlAfterGenerateWarning,
-} from "../../web/js/lib/control-after-generate.js";
+} from "../../web/v0.11.38/js/lib/control-after-generate.js";
 
 // A KSampler-shaped node: seed value widget followed by its control combo, exactly
 // as the ComfyUI frontend builds it (control widget serialize:false/canvasOnly).

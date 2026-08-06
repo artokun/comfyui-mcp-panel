@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { isImeComposing } from "../../web/js/lib/ime.js";
+import { isImeComposing } from "../../web/v0.11.38/js/lib/ime.js";
 
 // isImeComposing is the guard every chat/menu keydown handler calls FIRST so a
 // CJK IME's commit keystroke (Enter) doesn't submit early and leak the trailing

@@ -1,5 +1,5 @@
 /**
- * Unit tests for web/js/lib/connect-match.js — run with `node --test`.
+ * Unit tests for web/v0.11.38/js/lib/connect-match.js — run with `node --test`.
  *
  * These drive autoMatchSlots() / resolveExplicitSlot(), the SAME functions
  * graph_connect delegates to, so the handler's real slot-resolution path is
@@ -24,7 +24,7 @@ import {
   isTypeCompatible,
   isWildcardSlotType,
   slotDiagnostic,
-} from "../../web/js/lib/connect-match.js";
+} from "../../web/v0.11.38/js/lib/connect-match.js";
 
 // VHS_LoadVideo-shaped origin: IMAGE output at index 0, plus non-IMAGE outputs.
 function loadVideoNode() {

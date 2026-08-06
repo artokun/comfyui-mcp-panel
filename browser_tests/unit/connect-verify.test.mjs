@@ -1,6 +1,6 @@
 /**
  * Unit tests for the graph_connect link-persistence verification (#397) —
- * web/js/lib/connect-verify.js. Run with `node --test`.
+ * web/v0.11.38/js/lib/connect-verify.js. Run with `node --test`.
  *
  * Bug: LiteGraph's origin.connect() returns a TRUTHY link object even when the
  * target input is a widget-backed pseudo-input (ImpactSwitch "select") that the node
@@ -14,7 +14,7 @@ import {
   isLinkPersisted,
   removePhantomLink,
   isWidgetBackedInput,
-} from "../../web/js/lib/connect-verify.js";
+} from "../../web/v0.11.38/js/lib/connect-verify.js";
 
 test("persisted link (LatentSwitch real socket): stored + input references it → true", () => {
   const link = { id: 7 };

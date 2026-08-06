@@ -7,8 +7,8 @@ import assert from "node:assert/strict";
 import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const loaderPath = fileURLToPath(new URL("../../web/js/cmcp-panel-loader.js", import.meta.url));
-const runtimePath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.mjs", import.meta.url));
+const loaderPath = fileURLToPath(new URL("../../web/v0.11.38/js/cmcp-panel-loader.js", import.meta.url));
+const runtimePath = fileURLToPath(new URL("../../web/v0.11.38/js/comfyui-mcp-panel.mjs", import.meta.url));
 
 test("#584: discovered loader imports the runtime at a versioned, fresh URL", () => {
   assert.ok(existsSync(loaderPath), "the only panel discovery entry must exist as .js");

@@ -1,5 +1,5 @@
 /**
- * Unit tests for web/js/lib/paste-report.js — run with `node --test`.
+ * Unit tests for web/v0.11.38/js/lib/paste-report.js — run with `node --test`.
  *
  * Models the REAL bug from #261: copying all 21 nodes of the wan-multitalk pack
  * and pasting into another workflow silently landed only 19 because AudioCrop
@@ -24,7 +24,7 @@ import {
   unregisteredCopiedTypes,
   registryTypePredicate,
   formatUnpasteableCopyWarning,
-} from "../../web/js/lib/paste-report.js";
+} from "../../web/v0.11.38/js/lib/paste-report.js";
 
 // A trimmed but realistic slice of the wan-multitalk clipboard: live LiteGraph
 // node objects carry many fields; copy only needs {id, type}.

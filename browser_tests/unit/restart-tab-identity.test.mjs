@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
-import { buildHelloPayload } from "../../web/js/lib/session-rebind.js";
-import { createRestartTabIdentity, sendBridgeHello } from "../../web/js/lib/restart-tab-identity.js";
+import { buildHelloPayload } from "../../web/v0.11.38/js/lib/session-rebind.js";
+import { createRestartTabIdentity, sendBridgeHello } from "../../web/v0.11.38/js/lib/restart-tab-identity.js";
 
 class FakeLocks {
   held = new Set();
@@ -123,7 +123,7 @@ test("#709: a rejected Web Locks request also omits identity instead of hanging 
 });
 
 test("#709: the live bridge sender awaits the leased identity helper, never getTabId directly", () => {
-  const source = readFileSync(new URL("../../web/js/comfyui-mcp-panel.mjs", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../../web/v0.11.38/js/comfyui-mcp-panel.mjs", import.meta.url), "utf8");
   const start = source.indexOf("function sendHello() {");
   const body = source.slice(start, source.indexOf("\n  }", start));
   assert.match(body, /sendBridgeHello\(/);

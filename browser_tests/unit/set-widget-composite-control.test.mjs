@@ -1,5 +1,5 @@
 /**
- * End-to-end unit tests for runSetWidget (web/js/lib/set-widget.js), the SAME async
+ * End-to-end unit tests for runSetWidget (web/v0.11.38/js/lib/set-widget.js), the SAME async
  * unit GRAPH_TOOL_EXECUTORS.graph_set_widget delegates to — run with `node --test`.
  *
  * Covers the two set_widget honesty fixes wired at the runSetWidget layer:
@@ -15,8 +15,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { runSetWidget } from "../../web/js/lib/set-widget.js";
-import { CONTROL_AFTER_GENERATE_MODES } from "../../web/js/lib/control-after-generate.js";
+import { runSetWidget } from "../../web/v0.11.38/js/lib/set-widget.js";
+import { CONTROL_AFTER_GENERATE_MODES } from "../../web/v0.11.38/js/lib/control-after-generate.js";
 
 const HOOKS = { beforeChange() {}, afterChange() {}, setDirty() {} };
 

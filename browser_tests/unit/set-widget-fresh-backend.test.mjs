@@ -1,5 +1,5 @@
 /**
- * Unit tests for the FRESH-BACKEND type authorization in web/js/lib/set-widget.js
+ * Unit tests for the FRESH-BACKEND type authorization in web/v0.11.38/js/lib/set-widget.js
  * — run with `node --test`.
  *
  * The #458 set_widget gap (found in review of #375): graph_set_widget authorized
@@ -36,11 +36,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { runSetWidget } from "../../web/js/lib/set-widget.js";
-import { refreshComboOptionsFromDefs } from "../../web/js/lib/asset-staleness.js";
-import { commandTargetsActiveWorkflow } from "../../web/js/lib/workflow-chat-identity.js";
+import { runSetWidget } from "../../web/v0.11.38/js/lib/set-widget.js";
+import { refreshComboOptionsFromDefs } from "../../web/v0.11.38/js/lib/asset-staleness.js";
+import { commandTargetsActiveWorkflow } from "../../web/v0.11.38/js/lib/workflow-chat-identity.js";
 
-const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.mjs", import.meta.url));
+const PANEL_JS = fileURLToPath(new URL("../../web/v0.11.38/js/comfyui-mcp-panel.mjs", import.meta.url));
 
 // A registry shaped like LG.registered_node_types once /object_info loaded. Each
 // entry carries a `.nodeData` def (registerNodesFromDefs stamps one per class), so

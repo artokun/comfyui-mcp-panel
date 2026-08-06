@@ -1,5 +1,5 @@
 /**
- * Unit tests for web/js/lib/clipboard-store.js — run with `node --test`.
+ * Unit tests for web/v0.11.38/js/lib/clipboard-store.js — run with `node --test`.
  *
  * Reproduces panel#500: `panel_copy_nodes` copying 8 nodes (each carrying a
  * large widget payload) from a 38-node workflow threw
@@ -20,7 +20,7 @@ import {
   getEffectiveClipboard,
   resolveClipboardPayload,
   clearInMemoryClipboard,
-} from "../../web/js/lib/clipboard-store.js";
+} from "../../web/v0.11.38/js/lib/clipboard-store.js";
 
 // A localStorage-like mock. `quotaBytes` bounds the TOTAL stored size; a write
 // that would exceed it throws the exact DOMException message browsers use, so

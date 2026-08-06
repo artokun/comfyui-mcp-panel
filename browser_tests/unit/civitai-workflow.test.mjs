@@ -6,8 +6,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { deflateRawSync } from "node:zlib";
-import { CivitaiClient } from "../../web/js/cmcp-civitai.js";
-import { graphDirtyForConfirm } from "../../web/js/cmcp-civitai-ui.js";
+import { CivitaiClient } from "../../web/v0.11.38/js/cmcp-civitai.js";
+import { graphDirtyForConfirm } from "../../web/v0.11.38/js/cmcp-civitai-ui.js";
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 const UI_GRAPH = {

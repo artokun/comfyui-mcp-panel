@@ -9,7 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   BASE_MODELS, ACTIVE_BASE_MODELS, tokenizeQuery, prepareQuery, matchesBaseModel,
-} from "../../web/js/cmcp-civitai.js";
+} from "../../web/v0.11.38/js/cmcp-civitai.js";
 
 const search = (q) => BASE_MODELS.filter((m) => matchesBaseModel(m, prepareQuery(q)));
 

@@ -12,7 +12,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { createRunReconcileSweep } from "../../web/js/lib/run-reconcile-sweep.js";
+import { createRunReconcileSweep } from "../../web/v0.11.38/js/lib/run-reconcile-sweep.js";
 
 // A controllable fake scheduler: timers fire only when we advance() past them.
 function harness({ hasPending, reconcile, intervalMs = 100 } = {}) {

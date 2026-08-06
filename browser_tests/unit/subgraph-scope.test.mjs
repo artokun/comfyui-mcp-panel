@@ -1,5 +1,5 @@
 /**
- * Unit tests for web/js/lib/subgraph-scope.js — run with `node --test`.
+ * Unit tests for web/v0.11.38/js/lib/subgraph-scope.js — run with `node --test`.
  *
  * These drive the SAME pure helpers the panel's graph_* tools call, modelling the
  * subgraph scope/cleanup bug cluster:
@@ -34,7 +34,7 @@ import {
   findNodeInScopes,
   resolveRunToNodeTarget,
   unsafeBypassMappings,
-} from "../../web/js/lib/subgraph-scope.js";
+} from "../../web/v0.11.38/js/lib/subgraph-scope.js";
 
 // ---- Fixtures --------------------------------------------------------------
 

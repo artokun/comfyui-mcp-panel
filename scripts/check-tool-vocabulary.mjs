@@ -39,6 +39,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const panelProject = readFileSync(join(root, "pyproject.toml"), "utf8");
+const panelVersion = panelProject.match(/^version = "([^"]+)"/m)?.[1];
+if (!panelVersion) throw new Error("could not determine panel version from pyproject.toml");
+const PANEL_WEB_JS = `web/v${panelVersion}/js`;
 const vocab = JSON.parse(readFileSync(join(root, "vendor", "tool-vocabulary.json"), "utf8"));
 
 /**
@@ -128,13 +132,13 @@ const isAllowedDead = (name, path, line) =>
 const NOT_TOOL_NAMES = [
   {
     name: "panel_version",
-    file: "web/js/comfyui-mcp-panel.mjs",
+    file: `${PANEL_WEB_JS}/comfyui-mcp-panel.mjs`,
     context: "panel_version: PANEL_VERSION",
     why: "payload property key in the diagnostics blob, not a tool reference",
   },
   {
     name: "panel_version",
-    file: "web/js/lib/session-rebind.js",
+    file: `${PANEL_WEB_JS}/lib/session-rebind.js`,
     context: "panel_version: panelVersion",
     why: "same payload property key in the session-rebind frame, not a tool reference",
   },
@@ -230,37 +234,37 @@ const PLAIN_LITERAL = /^(["'`])([A-Za-z0-9_]+)\1$/;
  */
 const KNOWN_INDIRECTIONS = [
   {
-    file: "web/js/cmcp-training-ui.js",
+    file: `${PANEL_WEB_JS}/cmcp-training-ui.js`,
     match: "const res = await ctx.callTool(tool, args, opts);",
     why: "inside callJson() — its own call sites are scanned via the callJson pattern above",
   },
   {
-    file: "web/js/comfyui-mcp-panel.mjs",
+    file: `${PANEL_WEB_JS}/comfyui-mcp-panel.mjs`,
     match: "callTool: (t, a, o) => liveBridgeClient?.callTool(t, a, o),",
     why: "bridge plumbing: forwards an already-supplied name, never originates one",
   },
   {
-    file: "web/js/comfyui-mcp-panel.mjs",
+    file: `${PANEL_WEB_JS}/comfyui-mcp-panel.mjs`,
     match: "callTool(tool, args, opts) {",
     why: "the bridge method definition itself",
   },
   {
-    file: "web/js/cmcp-training-ui.js",
+    file: `${PANEL_WEB_JS}/cmcp-training-ui.js`,
     match: "//  - ctx.callTool(tool, args, {timeout}) — cid-correlated call_tool over the",
     why: "documentation comment describing the bridge",
   },
   {
-    file: "web/js/cmcp-runpod-ui.js",
+    file: `${PANEL_WEB_JS}/cmcp-runpod-ui.js`,
     match: "// runpod_* tools over the bridge's callTool (no agent turn needed):",
     why: "prose. The callee pattern allows whitespace before '(' so that `callTool /* c */ (\"x\")` and `callTool?.(\"x\")` are matched; that also matches English after the word. Registering the line beats teaching the scanner to skip comments, which would lose real findings inside them.",
   },
   {
-    file: "web/js/comfyui-mcp-panel.mjs",
+    file: `${PANEL_WEB_JS}/comfyui-mcp-panel.mjs`,
     match: "// Reply to a direct callTool() request (cid-correlated).",
     why: "prose. Empty-argument callTool() is not a call site, but it IS invocation-shaped, so the coverage check below sees it.",
   },
   {
-    file: "web/js/cmcp-training-ui.js",
+    file: `${PANEL_WEB_JS}/cmcp-training-ui.js`,
     match: "async function callJson(ctx, tool, args, opts) {",
     why: "the callJson() definition — its call sites are scanned by the callJson CALL_SITES pattern",
   },
@@ -337,7 +341,7 @@ function panelTokens(line) {
 
 const errors = [];
 const files = tracked();
-const jsFiles = files.filter((p) => p.startsWith("web/js/") && /\.m?js$/.test(p));
+const jsFiles = files.filter((p) => p.startsWith(`${PANEL_WEB_JS}/`) && /\.m?js$/.test(p));
 
 /**
  * Everywhere a tool name can be written in code, not just the shipped panel.
@@ -516,7 +520,7 @@ const obfuscated = [];
 // Third-party bundles are excluded: they are minified, not ours to fix, and cannot
 // contain a reference to one of OUR tools. Without this the widened concatenation
 // pattern matches minified output by chance.
-const ourCode = codeFiles.filter((p) => !p.startsWith("web/js/vendor/"));
+const ourCode = codeFiles.filter((p) => !p.startsWith(`${PANEL_WEB_JS}/vendor/`));
 for (const path of ourCode) {
   const content = readFileSync(join(root, path), "utf8");
   const lines = content.split("\n");
@@ -664,7 +668,7 @@ if (unclassified.length > 0) {
 // ---------------------------------------------------------------------------
 const internalNames = (() => {
   try {
-    const src = readFileSync(join(root, "web/js/comfyui-mcp-panel.mjs"), "utf8");
+    const src = readFileSync(join(root, PANEL_WEB_JS, "comfyui-mcp-panel.mjs"), "utf8");
     const m = src.match(/const GRAPH_TOOL_EXECUTORS\s*=\s*\{([\s\S]*?)\n\};/);
     return [...(m ? m[1] : "").matchAll(/^\s{2}(?:async\s+)?([a-z][a-z0-9_]*)\s*\(/gm)].map((x) => x[1]);
   } catch {

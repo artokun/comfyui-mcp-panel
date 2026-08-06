@@ -4,7 +4,7 @@
 // query the explorer makes.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CivitaiClient, DEFAULT_FILTERS, filtersDirty, parseCreatorQuery } from "../../web/js/cmcp-civitai.js";
+import { CivitaiClient, DEFAULT_FILTERS, filtersDirty, parseCreatorQuery } from "../../web/v0.11.38/js/cmcp-civitai.js";
 
 /** Client whose proxy calls are captured. `payload` may be a single response
  *  (every call resolves it) or an array consumed one per call (last repeats). */

@@ -1,5 +1,5 @@
 /**
- * Unit tests for web/js/lib/queue-rejection.js — run with `node --test`.
+ * Unit tests for web/v0.11.38/js/lib/queue-rejection.js — run with `node --test`.
  *
  * Guards #358: graph_run must NEVER report `queued:true` when ComfyUI refused the
  * prompt synchronously. ComfyUI rejects on two channels — per-node `node_errors`
@@ -16,7 +16,7 @@ import {
   summarizePromptRejection,
   formatTopError,
   buildQueueAcceptResult,
-} from "../../web/js/lib/queue-rejection.js";
+} from "../../web/v0.11.38/js/lib/queue-rejection.js";
 
 // The exact top-level rejection body from issue #358.
 const MISSING_NODE_TYPE = {

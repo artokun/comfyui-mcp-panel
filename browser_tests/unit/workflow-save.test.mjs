@@ -7,7 +7,7 @@ import {
   describeSaveOutcome,
   classifyOriginalOnDisk,
   diskExistenceFromStatus
-} from '../../web/js/lib/workflow-save.js'
+} from '../../web/v0.11.38/js/lib/workflow-save.js'
 
 // A minimal ComfyUI workflow-service double that records what was called and
 // simulates the on-disk file set, so we can prove Save-As never consumes the

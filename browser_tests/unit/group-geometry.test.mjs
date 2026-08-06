@@ -1,4 +1,4 @@
-// Unit tests for LIVE geometric group membership (web/js/lib/group-geometry.js).
+// Unit tests for LIVE geometric group membership (web/v0.11.38/js/lib/group-geometry.js).
 //
 // Regression coverage for the group-membership bug cluster:
 //   #312 pasted-then-grouped nodes report zero members (stale/empty _nodes)
@@ -22,7 +22,7 @@ import {
   syncNodeArea,
   syncGraphNodeAreas,
   moveGroupMembers,
-} from "../../web/js/lib/group-geometry.js";
+} from "../../web/v0.11.38/js/lib/group-geometry.js";
 
 // Minimal fixtures. No boundingRect => nodeFocusBounds falls back to pos/size
 // (with the title band), exactly like a fresh node on the live graph.

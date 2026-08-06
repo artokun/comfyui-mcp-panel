@@ -1,5 +1,5 @@
 /**
- * Unit tests for web/js/lib/run-completion.js — run with `node --test`.
+ * Unit tests for web/v0.11.38/js/lib/run-completion.js — run with `node --test`.
  *
  * Guards the run-completion cluster (#293, #224, #200, #269, #468): completion
  * must fire on the AUTHORITATIVE ComfyUI lifecycle for the CURRENT prompt_id,
@@ -16,8 +16,8 @@ import assert from "node:assert/strict";
 import {
   createRunCompletionTracker,
   NO_PROMPT_KEY,
-} from "../../web/js/lib/run-completion.js";
-import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame.js";
+} from "../../web/v0.11.38/js/lib/run-completion.js";
+import { composeRunCompletionFrame } from "../../web/v0.11.38/js/lib/run-completion-frame.js";
 
 /** Deterministic scheduler: timers are held until tick() fires the due ones. */
 function makeHarness({ debounceMs = 1500, maxRearms = 40 } = {}) {
@@ -291,7 +291,7 @@ test("execution_success + executing:null ordering yields exactly one event", () 
 
 // ── Presentation layer: ONE combined agent_event per completed prompt ────────
 // The tracker delivers ONE flush per prompt (asserted above). composeRunCompletionFrame
-// (web/js/lib/run-completion-frame.js) turns that flush into the SINGLE outbound
+// (web/v0.11.38/js/lib/run-completion-frame.js) turns that flush into the SINGLE outbound
 // agent_event. This guards the #269/#468 blocker: a mixed / multi-video run must
 // emit EXACTLY ONE completion frame carrying stills AND every video's storyboard,
 // never a stills frame plus one frame per video.

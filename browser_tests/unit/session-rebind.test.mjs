@@ -1,4 +1,4 @@
-// Unit tests for web/js/lib/session-rebind.js — the frontend half of the
+// Unit tests for web/v0.11.38/js/lib/session-rebind.js — the frontend half of the
 // session/tab-rebind cluster (#278, #334, #296, #291, #207, #332, #310).
 // Run with `node --test browser_tests/unit/*.mjs`.
 
@@ -16,7 +16,7 @@ import {
   dedupeWorkflowTabRecords,
   resolveLoadGraphArgs,
   buildHelloPayload,
-} from "../../web/js/lib/session-rebind.js";
+} from "../../web/v0.11.38/js/lib/session-rebind.js";
 
 // ---- #278 post-reboot resume guard ----------------------------------------
 

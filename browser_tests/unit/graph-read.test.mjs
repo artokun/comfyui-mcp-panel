@@ -1,4 +1,4 @@
-// Unit tests for the graph read helpers (web/js/lib/graph-read.js) backing
+// Unit tests for the graph read helpers (web/v0.11.38/js/lib/graph-read.js) backing
 // panel_query_graph / panel_graph_outline.
 //
 //   #607 — link-driven widgets must be flagged so a read never reports a stale
@@ -19,7 +19,7 @@ import {
   fitDetailLine,
   isLineProtected,
   truncationTail,
-} from "../../web/js/lib/graph-read.js";
+} from "../../web/v0.11.38/js/lib/graph-read.js";
 
 // ---- #607: link-driven widget detection -----------------------------------
 

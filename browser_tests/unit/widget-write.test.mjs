@@ -1,5 +1,5 @@
 /**
- * Unit tests for web/js/lib/widget-write.js — run with `node --test`.
+ * Unit tests for web/v0.11.38/js/lib/widget-write.js — run with `node --test`.
  *
  * These drive applyWidgetWrite(), the SAME function graph_set_widget delegates
  * to (resolve target → validate/coerce → write + callback → verify stuck), so
@@ -25,7 +25,7 @@ import {
   isNumericWidget,
   resolvePromotedInnerTarget,
   WidgetWriteError,
-} from "../../web/js/lib/widget-write.js";
+} from "../../web/v0.11.38/js/lib/widget-write.js";
 
 // No-op graph hooks so applyWidgetWrite exercises the full write path.
 const HOOKS = {};

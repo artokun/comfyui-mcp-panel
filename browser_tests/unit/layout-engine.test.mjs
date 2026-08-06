@@ -1,5 +1,5 @@
 /**
- * Unit tests for web/js/lib/layout-engine.js — run with `node --test`.
+ * Unit tests for web/v0.11.38/js/lib/layout-engine.js — run with `node --test`.
  *
  * Pure-module coverage (no browser, no ComfyUI): column assignment, cycle
  * safety, reroute half-columns, barycenter ordering, cluster rigidity, the
@@ -9,7 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { computeLayout, BASE_GAP } from "../../web/js/lib/layout-engine.js";
+import { computeLayout, BASE_GAP } from "../../web/v0.11.38/js/lib/layout-engine.js";
 
 const N = (id, over = {}) => ({
   id,

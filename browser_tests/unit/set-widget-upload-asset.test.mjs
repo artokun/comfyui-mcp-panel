@@ -1,5 +1,5 @@
 /**
- * Unit tests for the #387 UPLOAD-ASSET fallback in web/js/lib/set-widget.js —
+ * Unit tests for the #387 UPLOAD-ASSET fallback in web/v0.11.38/js/lib/set-widget.js —
  * run with `node --test`. These drive runSetWidget(), the SAME async unit
  * graph_set_widget delegates to, so the production ordering is exercised.
  *
@@ -19,7 +19,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { runSetWidget } from "../../web/js/lib/set-widget.js";
+import { runSetWidget } from "../../web/v0.11.38/js/lib/set-widget.js";
 
 const REGISTRY = { LoadImage: {}, CheckpointLoaderSimple: {} };
 

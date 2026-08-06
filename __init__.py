@@ -2,8 +2,9 @@
 
 This pack ships **no Python nodes**. It does two things:
 
-1. Serve the cache-stable sidebar loader (``web/js/cmcp-panel-loader.js``) and
-   its versioned runtime (``web/js/comfyui-mcp-panel.mjs``) to the ComfyUI
+1. Serve the version-addressed sidebar bundle to the ComfyUI frontend. Each
+   release lives under ``web/v<panel-version>/`` so the discovery URL and every
+   relative JavaScript dependency change together on update.
    frontend via ``WEB_DIRECTORY``.
 
 2. Expose a tiny **read-only** local API the panel uses to discover whether the
@@ -55,8 +56,11 @@ from socket import AF_INET, SOCK_STREAM, socket
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 
-# Serve the bundled JS extension(s) from ./web to the ComfyUI frontend.
-WEB_DIRECTORY = "./web"
+# Serve each release from its own immutable URL tree. ComfyUI discovers every
+# JavaScript file below this directory; after an update, it therefore imports a
+# new path instead of reviving an old cached entry or dependency.
+_PANEL_WEB_VERSION = "0.11.38"
+WEB_DIRECTORY = "./web/v" + _PANEL_WEB_VERSION
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
 

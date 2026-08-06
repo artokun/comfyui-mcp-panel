@@ -1,4 +1,4 @@
-// Unit tests for the robust node-removal wrapper (web/js/lib/safe-remove-node.js).
+// Unit tests for the robust node-removal wrapper (web/v0.11.38/js/lib/safe-remove-node.js).
 //
 // Regression coverage for #420: on rapid batched removals litegraph intermittently
 // throws "t.findInputSlot is not a function" while disconnecting a link whose far end
@@ -12,7 +12,7 @@ import {
   safeRemoveNode,
   severNodeLinks,
   isLinkDisconnectCrash,
-} from "../../web/js/lib/safe-remove-node.js";
+} from "../../web/v0.11.38/js/lib/safe-remove-node.js";
 
 // Minimal litegraph-shaped mock. `_links` is a Map<id, {id,origin_id,origin_slot,
 // target_id,target_slot}>. graph.remove(node) reproduces litegraph: walk this node's

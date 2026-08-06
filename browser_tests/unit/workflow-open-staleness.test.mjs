@@ -5,7 +5,7 @@
 // is CONTENT-based so it survives the frontend's mtime-only listing sync.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { decideOpenStaleness, diskBytesEqualText } from "../../web/js/lib/workflow-open-staleness.js";
+import { decideOpenStaleness, diskBytesEqualText } from "../../web/v0.11.38/js/lib/workflow-open-staleness.js";
 
 const enc = new TextEncoder();
 const withBom = (text) => {

@@ -14,12 +14,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { createRunCompletionTracker } from "../../web/js/lib/run-completion.js";
+import { createRunCompletionTracker } from "../../web/v0.11.38/js/lib/run-completion.js";
 import {
   parseHistoryEntry,
   queueMembership,
   historyEntryFor,
-} from "../../web/js/lib/history-reconcile.js";
+} from "../../web/v0.11.38/js/lib/history-reconcile.js";
 
 const isVideo = (m) => /\.(mp4|webm|mov)$/i.test(String(m?.filename || ""));
 
