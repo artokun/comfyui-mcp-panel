@@ -21796,23 +21796,20 @@ function buildPanel() {
         const nextScopeKey = currentHistoryScopeKey();
         if (previousScopeKey !== nextScopeKey) {
           const target = selectPanelThread(threads, historyMeta, { scopeKey: nextScopeKey });
-          if (target && target.id !== (thread?.id ?? null)) {
-            if (switched) {
-              appendSystem(
-                `Switched to ${BACKEND_LABELS[backend]} — continuing its own conversation (sessions aren't shared across providers).`,
-              );
-            }
-            loadThread(target);
-          } else if (!target && thread) {
-            if (switched) {
-              appendSystem(
-                `Switched to ${BACKEND_LABELS[backend]} — it has no conversation yet, so this starts a fresh chat.`,
-              );
-            }
-            newChat();
-          } else if (switched) {
-            appendSystem(`Switched to ${BACKEND_LABELS[backend]}.`);
+          if (switched) {
+            appendSystem(target
+              ? `Switched to ${BACKEND_LABELS[backend]} — continuing its own conversation (sessions aren't shared across providers).`
+              : `Switched to ${BACKEND_LABELS[backend]} — it has no conversation yet, so this starts a fresh chat.`);
           }
+          // Run the transition even when the target is the thread ALREADY on
+          // screen (codex round-4: first connect can land on a different
+          // backend than the restored default while the new scope resolves the
+          // same legacy thread) — the new backend's session still needs the
+          // resume/new_session + replay alignment and the publish under ITS
+          // key, all of which loadThread owns (its provider check scrubs a
+          // foreign session id and arms the transcript replay).
+          if (target) loadThread(target);
+          else if (thread) newChat();
         } else if (switched) {
           appendSystem(
             `Switched to ${BACKEND_LABELS[backend]} — sessions aren't shared across providers, so this starts a fresh chat.`,
