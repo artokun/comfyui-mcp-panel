@@ -58,6 +58,11 @@ class El {
   get innerHTML() { return this._text; }
   append(...kids) { this.children.push(...kids); }
   appendChild(k) { this.children.push(k); return k; }
+  insertBefore(node, ref) {
+    const at = this.children.indexOf(ref);
+    this.children.splice(at === -1 ? this.children.length : at, 0, node);
+    return node;
+  }
   addEventListener(type, fn) {
     if (!this._listeners.has(type)) this._listeners.set(type, []);
     this._listeners.get(type).push(fn);
@@ -159,6 +164,23 @@ const REPLIES = new Map(
   }),
 );
 
+/** 1x1 transparent GIF — enough to be recognisable in a data: URL. */
+const PIXEL_B64 = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+
+/**
+ * Actions whose result is NOT a text-wrapped JSON envelope.
+ *
+ * `train_prepare_dataset action:"file"` returns an MCP IMAGE content block, and
+ * the thumbnail path reads `.type`/`.mimeType`/`.data` off it directly rather
+ * than through callJson. Modelling it as JSON would let a caller that never
+ * finds an image block still look healthy — the thumb loader swallows its own
+ * failure and renders nothing, so an unmodelled reply certifies a broken
+ * thumbnail path as working.
+ */
+const RAW_REPLIES = new Map([
+  ["train_prepare_dataset:file", [{ type: "image", mimeType: "image/gif", data: PIXEL_B64 }]],
+]);
+
 async function mount(t) {
   const restore = installDom();
   const { createTrainingContent } = await import("../../web/js/cmcp-training-ui.js");
@@ -166,6 +188,8 @@ async function mount(t) {
   const callTool = (tool, args, opts) => {
     calls.push({ tool, args, opts });
     const key = `${tool}:${args?.action}`;
+    const raw = RAW_REPLIES.get(key);
+    if (raw) return Promise.resolve({ ok: true, result: raw });
     const payload = REPLIES.get(args?.id ? `${key}#id` : key) ?? REPLIES.get(key);
     // An UNSCRIPTED pair rejects rather than returning a plausible envelope.
     // Returning `{ok:true}` for anything unrecognised is how a fixture certifies
@@ -237,6 +261,13 @@ test("Datasets lists via train_prepare_dataset action:list, and a row opens acti
     action: "file",
     path: "C:/rig/training/datasets/test_char/a.png",
   });
+  // The RESPONSE must land, not merely the request. The thumb loader swallows
+  // its own failure and renders nothing, so asserting only that the frame was
+  // sent would stay green with every thumbnail broken — including under a
+  // content-block regression, which is exactly what a fold could cause.
+  const img = [...root.walk()].find((e) => e.tagName === "IMG");
+  assert.ok(img, "the dataset detail view must render a thumb from the inlined bytes");
+  assert.equal(img.src, `data:image/gif;base64,${PIXEL_B64}`);
 });
 
 test("the capability probe is train_start action:list_flows", async (t) => {

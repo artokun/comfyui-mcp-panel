@@ -568,10 +568,18 @@ const actionFindings = [];
 for (const h of coreHits) {
   if (!CORE.has(h.name)) continue; // section 1 already failed this one
   if (NO_ACTION_CORE_TOOLS.has(h.name)) continue;
-  // `.bind` produces a new callee whose eventual arguments are elsewhere; the
-  // bind site itself carries none, so an action cannot be read here. Section 1's
-  // unverifiable report already covers bind's real hazard.
-  if (h.what === "callTool.bind") continue;
+  // `.bind` produces a NEW callee whose eventual call sites this scanner cannot
+  // follow, so the args — and the action in them — may be supplied anywhere.
+  // Reported rather than skipped: an earlier version of this loop `continue`d
+  // here, which meant a bind whose name argument DID parse as a live core tool
+  // landed in coreHits, passed section 1, and was then excluded from this check
+  // — the one direction a gate must not fail in. Nothing binds a tool name
+  // today, so failing closed costs nothing and the exemption would have been a
+  // standing pre-approval for a shape nobody has reviewed.
+  if (h.what === "callTool.bind") {
+    actionFindings.push({ ...h, read: { kind: "bind" } });
+    continue;
+  }
   const read = readAction(h.after ?? "");
   if (read.kind === "action") continue;
   actionFindings.push({ ...h, read });
@@ -588,8 +596,10 @@ if (actionFindings.length > 0) {
             : h.read.kind === "missing"
               ? "args object does not open with `action:`"
               : h.read.kind === "empty"
-                ? 'the action is the empty string — a key, but not a dispatchable action'
-                : `args are not an object literal — ${JSON.stringify(h.read.text)}`;
+                ? "the action is the empty string — a key, but not a dispatchable action"
+                : h.read.kind === "bind"
+                  ? "bound with .bind(), so the action is supplied at a call site this gate cannot follow"
+                  : `args are not an object literal — ${JSON.stringify(h.read.text)}`;
         return `  ${h.path}:${h.line}  ${h.name}  (${why})`;
       }),
       "",
