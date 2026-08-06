@@ -546,6 +546,7 @@ const firstLine = (s) => s.split("\n")[0].trim();
  *   { kind: "missing" }         args are a brace literal that does not
  *   { kind: "no-args" }         the call ends after the name
  *   { kind: "opaque", text }    the args are not a brace literal at all
+ *   { kind: "expr", text }      the action's VALUE is not a bare string literal
  */
 function readAction(after) {
   let i = skipWs(after, 0);
@@ -554,8 +555,18 @@ function readAction(after) {
   i = skipWs(after, i + 1);
   if (after[i] !== "{") return { kind: "opaque", text: firstLine(after.slice(i, i + 60)) };
   i = skipWs(after, i + 1);
-  const m = /^(?:"action"|'action'|action)\s*:\s*(?:"([^"]*)"|'([^']*)')/.exec(after.slice(i));
+  const rest = after.slice(i);
+  const m = /^(?:"action"|'action'|action)\s*:\s*(?:"([^"]*)"|'([^']*)')/.exec(rest);
   if (!m) return { kind: "missing" };
+  // The literal must be the WHOLE value expression, not a prefix of one.
+  // `{ action: "enqueue" && undefined, … }` and `{ action: "enq" + suffix }`
+  // both START with a matching string and both send something else — the first
+  // sends `undefined`. Requiring the property to END here is what makes the
+  // read a fact about the value rather than about its first token.
+  const end = skipWs(rest, m[0].length);
+  if (rest[end] !== "," && rest[end] !== "}") {
+    return { kind: "expr", text: firstLine(rest.slice(0, 60)) };
+  }
   const value = m[1] ?? m[2];
   // `{ action: "" }` satisfies "the key is present" and dispatches to nothing.
   // Reported separately because the fix is different: the key is already there,
@@ -599,7 +610,9 @@ if (actionFindings.length > 0) {
                 ? "the action is the empty string — a key, but not a dispatchable action"
                 : h.read.kind === "bind"
                   ? "bound with .bind(), so the action is supplied at a call site this gate cannot follow"
-                  : `args are not an object literal — ${JSON.stringify(h.read.text)}`;
+                  : h.read.kind === "expr"
+                    ? `the action's value is an expression, not a bare string literal — ${JSON.stringify(h.read.text)}`
+                    : `args are not an object literal — ${JSON.stringify(h.read.text)}`;
         return `  ${h.path}:${h.line}  ${h.name}  (${why})`;
       }),
       "",
