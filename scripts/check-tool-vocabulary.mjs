@@ -480,6 +480,26 @@ if (unverifiable.length > 0) {
 // cannot be checked and is reported, not waved through. `{ action: "list",
 // ...(dir ? { model_type: dir } : {}) }` is the shape that satisfies it; hoisting
 // the ternary outside the braces does not.
+//
+// WHAT THIS DELIBERATELY DOES NOT CHECK, so it is not over-trusted:
+//
+//   The action's VALUE. `{ action: "delete" }` where "cancel" was meant passes
+//   here — and on `train_start` that is the difference between stopping a run
+//   and destroying its record. Checking it needs the per-tool action ENUM, and
+//   the vendored artefact does not carry one: it is a flat list of names plus a
+//   dead-name ledger. Hardcoding the enums HERE would rebuild, by hand, exactly
+//   the drifting copy of an upstream vocabulary that vendoring exists to
+//   prevent — and it would rot silently, which is worse than not having it.
+//   Until the exporter emits actions, VALUES are proven behaviourally, by tests
+//   that drive the real handlers and read the frame:
+//   browser_tests/unit/training-tool-actions.test.mjs and
+//   browser_tests/unit/runpod-tool-actions.test.mjs.
+//
+//   A LATER override — a duplicate `action:` key, or a spread after the first
+//   key that carries its own action. Detecting either means the nesting
+//   analysis first-key was chosen to avoid, and a naive "any spread is
+//   suspicious" rule would flag the two legitimate `...(cond ? {…} : {})` call
+//   sites in this repo. Recorded rather than half-solved.
 // ---------------------------------------------------------------------------
 /**
  * Core tools that take NO `action` — exempt from the rule above.
@@ -521,7 +541,8 @@ const firstLine = (s) => s.split("\n")[0].trim();
  * Read the action out of the source that FOLLOWS a tool-name literal.
  *
  * Returns one of:
- *   { kind: "action", value }   the args object literal opens with `action:`
+ *   { kind: "action", value }   the args object literal opens with `action:"…"`
+ *   { kind: "empty" }           it opens with `action:""` — a key, not an action
  *   { kind: "missing" }         args are a brace literal that does not
  *   { kind: "no-args" }         the call ends after the name
  *   { kind: "opaque", text }    the args are not a brace literal at all
@@ -535,7 +556,12 @@ function readAction(after) {
   i = skipWs(after, i + 1);
   const m = /^(?:"action"|'action'|action)\s*:\s*(?:"([^"]*)"|'([^']*)')/.exec(after.slice(i));
   if (!m) return { kind: "missing" };
-  return { kind: "action", value: m[1] ?? m[2] };
+  const value = m[1] ?? m[2];
+  // `{ action: "" }` satisfies "the key is present" and dispatches to nothing.
+  // Reported separately because the fix is different: the key is already there,
+  // so "add an action" would read as already done.
+  if (value === "") return { kind: "empty" };
+  return { kind: "action", value };
 }
 
 const actionFindings = [];
@@ -561,7 +587,9 @@ if (actionFindings.length > 0) {
             ? "no arguments at all"
             : h.read.kind === "missing"
               ? "args object does not open with `action:`"
-              : `args are not an object literal — ${JSON.stringify(h.read.text)}`;
+              : h.read.kind === "empty"
+                ? 'the action is the empty string — a key, but not a dispatchable action'
+                : `args are not an object literal — ${JSON.stringify(h.read.text)}`;
         return `  ${h.path}:${h.line}  ${h.name}  (${why})`;
       }),
       "",

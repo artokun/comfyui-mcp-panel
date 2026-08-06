@@ -88,12 +88,23 @@ function installDom() {
   globalThis.Option = class { constructor(label, value) { this.label = label; this.value = value ?? ""; } };
   // Thumbnails construct an Image and never await it here.
   globalThis.Image = class { constructor() { this.style = {}; } };
+  // Cancel is confirm-gated. Answering YES is the hostile setting for this
+  // suite: a NO would make the destructive-frame assertions vacuous.
+  globalThis.confirm = () => true;
+  globalThis.alert = () => {};
   return () => {
     delete globalThis.document;
     delete globalThis.Option;
     delete globalThis.Image;
+    delete globalThis.confirm;
+    delete globalThis.alert;
   };
 }
+
+/** The first descendant whose class list contains `cls`. */
+const byClass = (root, cls) => [...root.walk()].find((e) => e.className.split(/\s+/).includes(cls));
+/** The first descendant whose own text is exactly `text`. */
+const byText = (root, text) => [...root.walk()].find((e) => e.textContent === text);
 
 /** Every train_* envelope the tab reads, keyed by the (tool, action) PAIR.
  *
@@ -104,11 +115,31 @@ function installDom() {
 const REPLIES = new Map(
   Object.entries({
     "train_start:list_flows": { ok: true, flows: [{ id: "character" }], defaultParams: {} },
+    // Both forms of action:"status". With an `id` core returns the ONE job;
+    // without, every job. The fixture must honour that split or the monitor
+    // reads a jobs array where it expects a job.
     "train_start:status": {
       ok: true,
       count: 1,
-      jobs: [{ id: "tjob1", name: "test_char", status: "completed", updatedAt: new Date().toISOString() }],
+      jobs: [{ id: "tjob1", name: "test_char", model: "flux1-dev", status: "running", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }],
     },
+    "train_start:status#id": {
+      ok: true,
+      job: {
+        id: "tjob1", name: "test_char", model: "flux1-dev", status: "running",
+        progress: { samples: [], step: 40, totalSteps: 200, loss: 0.42 },
+        log: ["40/200"], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      },
+    },
+    "train_start:job_config": {
+      ok: true,
+      params: { steps: 2000 },
+      flow: "character",
+      model: "flux1-dev",
+      trigger: "ohwx",
+      datasetPath: "C:/rig/training/datasets/test_char",
+    },
+    "train_start:cancel": { ok: true },
     "train_prepare_dataset:list": {
       ok: true,
       datasets: [{ name: "test_char", imageCount: 2, captionedCount: 2, modified: new Date().toISOString() }],
@@ -134,7 +165,8 @@ async function mount(t) {
   const calls = [];
   const callTool = (tool, args, opts) => {
     calls.push({ tool, args, opts });
-    const payload = REPLIES.get(`${tool}:${args?.action}`);
+    const key = `${tool}:${args?.action}`;
+    const payload = REPLIES.get(args?.id ? `${key}#id` : key) ?? REPLIES.get(key);
     // An UNSCRIPTED pair rejects rather than returning a plausible envelope.
     // Returning `{ok:true}` for anything unrecognised is how a fixture certifies
     // a call it never actually modelled.
@@ -170,7 +202,7 @@ async function gesture(calls, act) {
 
 const pairs = (produced) => produced.map((c) => `${c.tool}:${String(c.args?.action)}`);
 
-test("Jobs lists via train_start action:status — not the retired train_status", async (t) => {
+test("Jobs lists via train_start action:status — the retired standalone status tool is gone", async (t) => {
   const { calls, subnav } = await mount(t);
   const [jobsBtn] = subnav;
   const produced = await gesture(calls, () => jobsBtn.click());
@@ -240,6 +272,44 @@ test("the pod preflight is train_doctor action:doctor — bootstrap and build_im
     produced.filter((c) => c.args.action === "bootstrap" || c.args.action === "build_image"),
     [],
   );
+});
+
+test("Cancel run sends train_start action:cancel — NOT action:delete, which destroys the job", async (t) => {
+  const { calls, subnav, root, view } = await mount(t);
+  const [jobsBtn] = subnav;
+  await gesture(calls, () => jobsBtn.click());
+  // Open the running job's monitor by clicking its real row in the jobs list.
+  const jobRow = byClass(root, "cmcp-tr-jobrow");
+  assert.ok(jobRow, "the jobs view must render a row per job");
+  const opened = await gesture(calls, () => jobRow.click());
+  // Entering the monitor reads the settings the job ran with and polls it.
+  assert.deepEqual(
+    [...new Set(pairs(opened))].sort(),
+    ["train_start:job_config", "train_start:status"],
+  );
+  assert.deepEqual(
+    opened.find((c) => c.args.action === "job_config").args,
+    { action: "job_config", id: "tjob1" },
+  );
+  // The id-scoped status form — omitting the id here would poll EVERY job and
+  // render the wrong one's progress.
+  assert.deepEqual(
+    opened.find((c) => c.args.action === "status").args,
+    { action: "status", id: "tjob1" },
+  );
+
+  const cancelBtn = byText(root, "Cancel run");
+  assert.ok(cancelBtn, "the monitor must offer a Cancel control");
+  // Stop the poll first so the slice this gesture produces is the cancel alone
+  // and a timer tick cannot smuggle a frame into it.
+  view.onDeactivate();
+  const produced = await gesture(calls, () => cancelBtn.click());
+  assert.equal(produced.length, 1, `Cancel must send exactly one frame, got ${JSON.stringify(pairs(produced))}`);
+  assert.equal(produced[0].tool, "train_start");
+  // The whole args object, not just the action: `delete` is one word away on
+  // the same tool with the same `id`, and it destroys the job's record and
+  // outputs instead of stopping the run.
+  assert.deepEqual(produced[0].args, { action: "cancel", id: "tjob1" });
 });
 
 test("every train_* call carries a non-empty action, and names only the three survivors", async (t) => {
