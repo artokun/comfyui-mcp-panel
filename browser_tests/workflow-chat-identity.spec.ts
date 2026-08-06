@@ -1,36 +1,20 @@
 import { test, expect } from './fixtures/panelTest'
 import { resolveHistoryStoreModuleUrl } from './fixtures/historyStoreModule'
+import { routeWorktreeSource } from './fixtures/worktreeSource'
 
 const THREADS_KEY = 'comfyui-mcp.panel.threads'
 const CURRENT_THREAD_KEY = 'comfyui-mcp.panel.currentThreadId'
-const SESSION_KEY = 'comfyui-mcp.panel.sessionId'
 
-async function setWorkflowScope(page: import('@playwright/test').Page) {
-  await page.waitForFunction(() => {
-    const w = window as any
-    const app = w.comfyAPI?.app?.app || w.app
-    return typeof app?.ui?.settings?.setSettingValue === 'function'
-  })
-  await page.evaluate(() => {
-    const w = window as any
-    const app = w.comfyAPI?.app?.app || w.app
-    const settings = app.ui.settings
-    if (!w.__cmcpOriginalGetSettingValue) {
-      w.__cmcpOriginalGetSettingValue = settings.getSettingValue.bind(settings)
-    }
-    settings.getSettingValue = (id: string) =>
-      id === 'comfyui-mcp.chatScope'
-        ? 'workflow'
-        : w.__cmcpOriginalGetSettingValue(id)
-  })
-  await expect.poll(() => page.evaluate(() => {
-    const w = window as any
-    const app = w.comfyAPI?.app?.app || w.app
-    return app?.ui?.settings?.getSettingValue?.('comfyui-mcp.chatScope')
-  })).toBe('workflow')
-}
+test.beforeEach(async ({ context }) => {
+  await routeWorktreeSource(context)
+})
 
-test('opening a workflow does not dirty it and first record embeds silently', async ({
+// mcp#884: the workflow/ask chat scopes are retired — chatScopeMode() is
+// hard-wired to "panel", so these specs exercise the one shipping mode. The
+// retired workflow scope used to embed a UUID into graph.extra on first
+// record; panel scope resolves workflow PROVENANCE for the thread without
+// writing to the graph at all — and, as before, without ever dirtying it.
+test('opening a workflow does not dirty it and first record keeps provenance off-graph', async ({
   page,
   panel,
   mockBridge
@@ -41,7 +25,6 @@ test('opening a workflow does not dirty it and first record embeds silently', as
     const app = w.comfyAPI?.app?.app || w.app
     return !!app?.graph && !!app?.extensionManager?.workflow?.activeWorkflow
   })
-  await setWorkflowScope(page)
   const before = await page.evaluate(() => {
     const w = window as any
     const app = w.comfyAPI?.app?.app || w.app
@@ -83,15 +66,21 @@ test('opening a workflow does not dirty it and first record embeds silently', as
 
   await panel.setBridgeUrl(mockBridge.url)
   await panel.connect()
+  // The greeting record resolves this workflow's identity as thread
+  // provenance (history metadata) without re-stamping the deleted graph tag.
+  await expect.poll(() => page.evaluate((threadsKey) => {
+    const threads = JSON.parse(localStorage.getItem(threadsKey) || '[]')
+    return threads.find((t: any) => t.msgs?.length)?.workflowKey ?? null
+  }, THREADS_KEY)).toMatch(/^workflow:/)
   const recorded = await page.evaluate(() => {
     const w = window as any
     const app = w.comfyAPI?.app?.app || w.app
     return {
-      uuid: app.graph?.extra?.comfyui_mcp?.workflow_uuid,
+      embedded: app.graph?.extra?.comfyui_mcp?.workflow_uuid ?? null,
       calls: w.__cmcpIdentityMutationCalls
     }
   })
-  expect(recorded.uuid).toMatch(/^[0-9a-f-]{36}$/i)
+  expect(recorded.embedded).toBeNull()
   expect(recorded.calls).toEqual({ before: 0, after: 0, dirty: 0 })
 })
 
@@ -137,135 +126,90 @@ test('default mode opens pre-upgrade history without re-keying it', async ({
   ])
 })
 
-test('settings hydration never adopts a loose session into a workflow thread', async ({
-  page,
-  panel,
-  mockBridge
-}) => {
-  await panel.goto()
-  await page.evaluate(({ threadsKey, currentThreadKey }) => {
-    const w = window as any
-    const app = w.comfyAPI?.app?.app || w.app
-    const settings = app.ui.settings
-    const originalGet = settings.getSettingValue.bind(settings)
-    w.__cmcpPerWorkflowHydrated = false
-    settings.getSettingValue = (id: string) =>
-      id === 'comfyui-mcp.chatScope'
-        ? (w.__cmcpPerWorkflowHydrated ? 'workflow' : 'panel')
-        : originalGet(id)
-    localStorage.setItem(threadsKey, JSON.stringify([{
-      id: 'workflow-before-hydration',
-      ts: Date.now(),
-      workflowKey: 'workflow:existing-scope',
-      msgs: [{ role: 'user', text: 'workflow thread before hydration' }]
-    }]))
-    sessionStorage.setItem(currentThreadKey, 'workflow-before-hydration')
-  }, { threadsKey: THREADS_KEY, currentThreadKey: CURRENT_THREAD_KEY })
-
-  await panel.openSidebar()
-  await expect(panel.userBubble('workflow thread before hydration')).toBeVisible()
-  await page.evaluate((sessionKey) => {
-    const w = window as any
-    w.__cmcpPerWorkflowHydrated = true
-    sessionStorage.setItem(sessionKey, 'live-tab-session')
-  }, SESSION_KEY)
-
-  await panel.setBridgeUrl(mockBridge.url)
-  await panel.connect()
-
-  // #106's contract: a workflow-scoped conversation NEVER adopts a loose tab
-  // session — its session must arrive through a thread selected for its exact
-  // scope. Hydration clears the loose key instead of binding it to the wrong
-  // conversation, and the new greeting thread starts fresh without it.
-  await expect
-    .poll(async () => {
-      const state = await page.evaluate(({ threadsKey, sessionKey }) => ({
-        sessionId: sessionStorage.getItem(sessionKey),
-        threads: JSON.parse(localStorage.getItem(threadsKey) || '[]')
-      }), { threadsKey: THREADS_KEY, sessionKey: SESSION_KEY })
-      const greeting = state.threads.find((t: any) =>
-        t.msgs?.some((m: any) => m.text === 'Panel agent ready.'))
-      return {
-        sessionId: state.sessionId,
-        beforeScope: state.threads.find((t: any) => t.id === 'workflow-before-hydration')?.workflowKey,
-        greetingScope: greeting?.workflowKey ?? null,
-        greetingSession: greeting?.sessionId ?? null
-      }
-    }, { timeout: 15_000 })
-    .toEqual({
-      sessionId: null,
-      beforeScope: 'workflow:existing-scope',
-      greetingScope: expect.stringMatching(/^workflow:/) as unknown as string,
-      greetingSession: null
-    })
-})
-
-test('embeds a workflow UUID and blocks a foreign transcript pointer', async ({
+// mcp#884/#897 (P0-1): the agent session is orchestrator-global — ONE
+// conversation per backend across every tab and workflow. When another tab
+// moves the shared selection (its loadThread writes the panel:global pointer),
+// this tab must follow it, and the next message typed here must be recorded
+// into the adopted conversation — never into the thread this tab used to show.
+test('adopts the shared conversation another tab selected, across workflows', async ({
   page,
   context,
   panel,
   mockBridge
 }) => {
   await panel.goto()
-  // Make the per-workflow setting available before the panel mounts; the
-  // shared fixture intentionally strips real user settings.
-  await setWorkflowScope(page)
   await panel.setBridgeUrl(mockBridge.url)
   await panel.openSidebar()
   await panel.connect()
 
   const received = mockBridge.waitForUserMessage()
-  await panel.sendMessage('workflow identity marker')
+  await panel.sendMessage('conversation A marker')
   await received
 
-  const current = await page.evaluate((threadsKey) => {
-    const w = window as any
-    const app = w.comfyAPI?.app?.app || w.app
-    const threads = JSON.parse(localStorage.getItem(threadsKey) || '[]')
-    return {
-      uuid: app?.graph?.extra?.comfyui_mcp?.workflow_uuid,
-      thread: threads.find((t: any) => t.msgs?.some((m: any) => m.text === 'workflow identity marker'))
-    }
-  }, THREADS_KEY)
-
-  expect(current.uuid).toMatch(/^[0-9a-f-]{36}$/i)
-  expect(current.thread?.workflowKey).toBe(`workflow:${current.uuid}`)
-
-  // A foreign (other-workflow) thread arrives the way foreign threads really
-  // do in this architecture: another tab writes it through the store, landing
-  // in the shared canonical. (Direct localStorage writes are just this tab's
-  // own cache and are legitimately overwritten by the owning panel's flush.)
+  // Another tab archives a thread from a DIFFERENT workflow and moves the
+  // shared panel selection to it — exactly what loadThread writes there.
   const storeModuleUrl = await resolveHistoryStoreModuleUrl(page)
   const otherTab = await context.newPage()
   await otherTab.goto(page.url())
-  await otherTab.evaluate(async ({ threadsKey, currentThreadKey, storeModuleUrl }) => {
-    const { ChatHistoryStore } = await import(storeModuleUrl)
-    const foreignStore = new ChatHistoryStore({ writerId: 'foreign-tab-test' })
-    const existing = JSON.parse(localStorage.getItem(threadsKey) || '[]')
-    foreignStore.persist([
-      ...existing,
+  await otherTab.evaluate(async ({ storeModuleUrl }) => {
+    const { ChatHistoryStore, updateMetadataEntry } = await import(storeModuleUrl)
+    const otherStore = new ChatHistoryStore({ writerId: 'other-tab-test' })
+    const canonical = await otherStore.readCanonical()
+    const now = Date.now() + 50
+    const meta = updateMetadataEntry(
+      canonical.meta || {},
+      'activeByScope',
+      'panel:global',
+      'cross-workflow-thread',
+      { updatedAt: now, writerId: 'other-tab-test', sequence: 1 }
+    )
+    otherStore.persist([
+      ...(canonical.threads || []),
       {
-        id: 'foreign-thread',
-        ts: Date.now() + 10,
+        id: 'cross-workflow-thread',
+        createdAt: now,
+        updatedAt: now,
+        ts: now,
         workflowKey: 'workflow:definitely-another-workflow',
-        msgs: [{ id: 'foreign-msg-1', role: 'user', text: 'must never restore on this workflow' }]
+        workflowTitle: 'Workflow B',
+        msgs: [{
+          id: 'cross-msg-1',
+          role: 'user',
+          text: 'moved here from another tab',
+          createdAt: now
+        }]
       }
-    ], {})
-    await foreignStore.flush()
-    await foreignStore.close?.()
-  }, { threadsKey: THREADS_KEY, currentThreadKey: CURRENT_THREAD_KEY, storeModuleUrl })
+    ], meta)
+    const result = await otherStore.flush()
+    if (result !== true && (result as any)?.ok !== true) {
+      throw new Error(`shared-selection seed failed: ${JSON.stringify(result)}`)
+    }
+    await otherStore.close?.()
+  }, { storeModuleUrl })
   await otherTab.close()
 
-  await page.reload()
-  await setWorkflowScope(page)
-  await panel.openSidebar()
-  await expect(panel.userBubble('must never restore on this workflow')).toHaveCount(0)
+  // This tab follows the shared selection without a reload...
+  await expect(panel.userBubble('moved here from another tab')).toBeVisible()
+  await expect
+    .poll(() => page.evaluate((key) => sessionStorage.getItem(key), CURRENT_THREAD_KEY))
+    .toBe('cross-workflow-thread')
 
+  // ...and the next message typed HERE is recorded into the adopted
+  // conversation (the one the orchestrator's global session is in).
+  const next = mockBridge.waitForUserMessage()
+  await panel.sendMessage('recorded into the adopted conversation')
+  await next
+  await expect.poll(() => page.evaluate((threadsKey) => {
+    const threads = JSON.parse(localStorage.getItem(threadsKey) || '[]')
+    const adopted = threads.find((t: any) => t.id === 'cross-workflow-thread')
+    return adopted?.msgs?.some((m: any) => m.text === 'recorded into the adopted conversation') ?? false
+  }, THREADS_KEY)).toBe(true)
+
+  // Panel scope has no foreign-workflow lockout: the conversation this tab
+  // showed before remains an openable archive entry, workflow provenance and
+  // all (one conversation spans workflows — mcp#884's invariant).
   await panel.root.locator('button[title="Chat history"]').click()
-  const currentOnly = panel.root.getByTestId('history-current-workflow')
-  if (await currentOnly.isVisible()) await currentOnly.uncheck()
-  const foreign = panel.root.locator('.cmcp-hist-row').filter({ hasText: 'must never restore on this workflow' })
-  await expect(foreign).toBeVisible()
-  await expect(foreign.locator('.cmcp-hist-open')).toBeDisabled()
-  await expect(foreign).toHaveCSS('opacity', '0.48')
+  const previousRow = panel.root.locator('.cmcp-hist-row').filter({ hasText: 'conversation A marker' })
+  await expect(previousRow).toBeVisible()
+  await expect(previousRow.locator('.cmcp-hist-open')).toBeEnabled()
 })

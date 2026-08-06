@@ -596,21 +596,67 @@ export function selectThreadForScope(threads, meta, scopeKey) {
   return candidates.find((thread) => thread.id === activeId) || candidates[0] || null;
 }
 
+/** The newest CONVERSATION activity in a thread: the creation time of its most
+ *  recent message. Deliberately not thread.updatedAt — rename/pin/todo edits
+ *  bump that, and grooming an archived chat must never hijack the shared panel
+ *  selection. Imported archives keep their original message createdAt, so an
+ *  import cannot hijack it either. */
+function lastConversationAt(thread) {
+  let latest = 0;
+  for (const message of Array.isArray(thread?.msgs) ? thread.msgs : []) {
+    const at = finiteTs(message?.createdAt) || finiteTs(message?.ts);
+    if (at > latest) latest = at;
+  }
+  return latest;
+}
+
 /** Select the panel-owned conversation without changing its workflowKey. The
  *  global id lives only in metadata; each thread keeps its ride-along workflow
  *  provenance for archive grouping. Legacy snapshots without that pointer
- *  recover the most recently updated conversation. */
+ *  recover the most recently updated conversation.
+ *
+ *  This is the ONE definition of "the conversation" (mcp#884/#897): the agent
+ *  session is orchestrator-global, so every tab — cold restore and cross-tab
+ *  sync alike — must resolve the same thread from the same shared state.
+ *
+ *  Stale-pointer guard (the mcp#884 upgrade path): builds that still had the
+ *  workflow/ask scopes could leave a panel:global pointer behind and then keep
+ *  conversing in per-workflow threads, so on upgrade the pointer may name a
+ *  conversation weeks older than the one the user is actually in. The pointer
+ *  therefore only pins a conversation over newer activity elsewhere when the
+ *  pointer write itself is the most recent action (opening a chat from the
+ *  archive stamps a fresh revision, so deliberate selections still stick). */
 export function selectPanelThread(threads, meta) {
   const candidates = [...(Array.isArray(threads) ? threads : [])]
     .sort((a, b) => finiteTs(b?.updatedAt || b?.ts) - finiteTs(a?.updatedAt || a?.ts));
   const activeId = meta?.activeByScope?.["panel:global"];
   if (!activeId && meta?.activeOps?.["panel:global"]?.deleted === true) return null;
-  return candidates.find((thread) => thread?.id === activeId) || candidates[0] || null;
+  const pointed = candidates.find((thread) => thread?.id === activeId) || null;
+  if (!pointed) return candidates[0] || null;
+  // The pointer op can be compacted into the checkpoint baseline (no revision
+  // survives); 0 then degrades the comparison to pure conversation recency,
+  // which still keeps the pointed thread in continuous panel-mode use.
+  const pointerAt = finiteTs(operationRevision(meta?.activeOps?.["panel:global"])?.updatedAt);
+  let selected = pointed;
+  let selectedAt = Math.max(pointerAt, lastConversationAt(pointed));
+  for (const candidate of candidates) {
+    if (!candidate || candidate.id === pointed.id) continue;
+    const at = lastConversationAt(candidate);
+    if (at > selectedAt) {
+      selected = candidate;
+      selectedAt = at;
+    }
+  }
+  return selected;
 }
 
-/** Choose the durable conversation for reload without replacing a conversation
- * already selected by this browser tab. In per-workflow mode that preferred
- * pointer is still subject to the strict workflow scope guard. */
+/** Choose the durable conversation for reload. Panel-owned (the only shipping
+ * mode since mcp#884): the SHARED selection is authoritative for every tab —
+ * honoring a tab-local preference over it would let a reloading tab render a
+ * conversation the orchestrator's single global session (mcp#897) is no longer
+ * in. The tab pointer only bridges legacy snapshots that predate the shared
+ * pointer, where nothing else records what this tab had open. In per-workflow
+ * mode the preferred pointer is still subject to the strict scope guard. */
 export function selectRestoreThread(
   threads,
   meta,
@@ -619,10 +665,19 @@ export function selectRestoreThread(
   const preferred = preferredThreadId
     ? (Array.isArray(threads) ? threads : []).find((candidate) => candidate?.id === preferredThreadId)
     : null;
-  if (preferred && (panelOwned || isThreadInScope(preferred, scopeKey))) return preferred;
-  return panelOwned
-    ? selectPanelThread(threads, meta)
-    : selectThreadForScope(threads, meta, scopeKey);
+  if (panelOwned) {
+    const activeId = meta?.activeByScope?.["panel:global"];
+    const pointerResolves = activeId != null &&
+      (Array.isArray(threads) ? threads : []).some((candidate) => candidate?.id === activeId);
+    const deliberateClear = !activeId && meta?.activeOps?.["panel:global"]?.deleted === true;
+    // A DANGLING pointer (names a thread that no longer exists — eviction race,
+    // partial merge) carries no information about which conversation the global
+    // session is in; the tab that was just using one is better evidence there.
+    if (pointerResolves || deliberateClear) return selectPanelThread(threads, meta);
+    return preferred || selectPanelThread(threads, meta);
+  }
+  if (preferred && isThreadInScope(preferred, scopeKey)) return preferred;
+  return selectThreadForScope(threads, meta, scopeKey);
 }
 
 /** Apply a strict recency cap without evicting conversations that are still

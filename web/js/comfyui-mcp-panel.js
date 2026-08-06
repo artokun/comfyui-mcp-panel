@@ -92,6 +92,7 @@ import {
   isThreadInScope,
   mergeHistorySnapshots,
   retainBoundedThreads,
+  selectPanelThread,
   selectRestoreThread,
   selectThreadForScope,
   updateMetadataEntry,
@@ -2412,13 +2413,10 @@ const SETTING_MOBILE_BETA = "comfyui-mcp.mobileAppBeta";
 const SETTING_FLAG_APPS = "comfyui-mcp.featureFlag.apps";
 const SETTING_FLAG_TRAINING = "comfyui-mcp.featureFlag.training";
 const SETTING_FLAG_RUNPOD = "comfyui-mcp.featureFlag.runpod";
-// Session ownership: when TRUE (default), the conversation belongs to the PANEL
-// — switching/saving/renaming/creating workflows never swaps or resets the chat;
-// the agent just gets told (mechanically, on the next message) which canvas it's
-// now operating on. When FALSE, the legacy per-workflow behavior: each workflow
-// keeps its own thread + agent session and switching tabs switches conversations.
-const SETTING_SESSION_FOLLOWS_PANEL = "comfyui-mcp.sessionFollowsPanel";
-const SETTING_CHAT_SCOPE = "comfyui-mcp.chatScope";
+// RETIRED setting ids (mcp#884): "comfyui-mcp.sessionFollowsPanel" (legacy
+// boolean) and "comfyui-mcp.chatScope" (panel/workflow/ask combo). The
+// conversation is always panel-owned now; stored values under these ids are
+// ignored and must never be re-minted for anything else.
 const MOBILE_IOS_TESTFLIGHT_URL = "https://testflight.apple.com/join/ws65s4a2"; // beta-testers external group
 const MOBILE_ANDROID_FIREBASE_URL = "https://appdistribution.firebase.dev/i/27a5cccde72ffb42"; // beta testers group
 const SETTING_EXTERNAL_ORCH = "comfyui-mcp.externalOrchestrator";
@@ -2462,7 +2460,6 @@ const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
 // (no-ops when the value already matches) so a setSetting→onChange echo can't loop.
 const panelHooks = {
   applyBackend: null, // (id)
-  applyChatScope: null, // ("panel"|"workflow"|"ask")
   applyModel: null, // (id)
   applyEffort: null, // (id|"")
   applyBridgeUrl: null, // (url)
@@ -18611,9 +18608,6 @@ function buildPanel() {
   let threads = localHistory.threads;
   let historyMeta = localHistory.meta;
   let thread = null; // created lazily on first recorded message
-  // In "ask" mode this is chosen at each workflow switch. The initial canvas
-  // behaves as per-workflow until there is actually a switch to ask about.
-  let askModeFollowsPanel = false;
 
   function nextHistoryRevision() {
     return historyStore.nextRevision(Math.max(Date.now(), Number(historyMeta?.updatedAt) + 1 || 0));
@@ -18637,8 +18631,10 @@ function buildPanel() {
   applyWorkflowAliasesFromHistory();
 
   function historyScopeFollowsPanel() {
-    const mode = chatScopeMode();
-    return mode === "panel" || (mode === "ask" && askModeFollowsPanel);
+    // Constant since mcp#884 (chatScopeMode() is hard-wired to "panel"). Kept as
+    // the named seam the remaining scope guards read, so they stay honest
+    // defense-in-depth instead of silently deleted invariants.
+    return chatScopeMode() === "panel";
   }
 
   function currentHistoryScopeKey({ embed = false } = {}) {
@@ -18762,6 +18758,73 @@ function buildPanel() {
     return true;
   }
 
+  /** Did another tab's write change what THIS tab has painted for the same
+   *  conversation? Length + tail id is deliberately coarse: it catches appended
+   *  turns (the cross-tab case that matters) without repainting on pure
+   *  metadata edits (rename/pin/todo). */
+  function transcriptChangedRemotely(before, after) {
+    const beforeMsgs = Array.isArray(before?.msgs) ? before.msgs : [];
+    const afterMsgs = Array.isArray(after?.msgs) ? after.msgs : [];
+    if (beforeMsgs.length !== afterMsgs.length) return true;
+    if (!beforeMsgs.length) return false;
+    return beforeMsgs[beforeMsgs.length - 1]?.id !== afterMsgs[afterMsgs.length - 1]?.id;
+  }
+
+  /** mcp#884/#897 — the agent session is orchestrator-global, so which
+   *  conversation a tab renders and records into is SHARED state, resolved by
+   *  selectPanelThread from the synced snapshot. A tab that kept its own thread
+   *  after the shared selection moved would file the user's next message under
+   *  a transcript the agent is no longer in (wrong-conversation rendering +
+   *  transcript mis-attribution). Adoption is deliberately PASSIVE: the tab the
+   *  user acted in already told the orchestrator (resume_session/new_session),
+   *  so a passive tab never sends session frames — N tabs echoing new_session
+   *  after one delete would reset (and could race) the single global session. */
+  function adoptSharedPanelSelection(currentThreadId) {
+    // Same dangling-pointer rule as selectRestoreThread: a pointer naming a
+    // thread that no longer exists says nothing about where the global session
+    // is, so a tab that still has its conversation keeps it instead of jumping
+    // to whatever merge recency would guess.
+    const activeId = historyMeta?.activeByScope?.["panel:global"];
+    const current = currentThreadId
+      ? threads.find((candidate) => candidate.id === currentThreadId)
+      : null;
+    const pointerDangling = activeId != null &&
+      !threads.some((candidate) => candidate.id === activeId);
+    const target = pointerDangling && current
+      ? current
+      : selectPanelThread(threads, historyMeta);
+    if (target && target.id === currentThreadId) {
+      const before = thread;
+      rebindCurrentThreadRecord(target);
+      // Mirror remotely appended turns onto this tab's idle view. Never mid
+      // paint: a live local turn (streaming bubbles) or an unresolved live A2UI
+      // card would be orphaned by resetFeed, so those keep the rebind only.
+      if (!agentWorking && liveA2uiCards.size === 0 && transcriptChangedRemotely(before, target)) {
+        paintThread(target);
+        refreshContextRingForScope();
+      }
+      return;
+    }
+    if (!target && !currentThreadId) return; // nothing rendered, nothing selected
+    // The shared selection moved (or was cleared) in another tab — follow it.
+    endTurnLocally();
+    if (target) {
+      ssSet(CURRENT_THREAD_KEY, target.id);
+      // Provider-local ids only: never stage another provider's session for a
+      // later reload-resume (same rule as loadThread).
+      ssSet(SESSION_KEY, resumableSessionId(target));
+      paintThread(target);
+    } else {
+      thread = null;
+      ssSet(CURRENT_THREAD_KEY, null);
+      ssSet(SESSION_KEY, null);
+      turnAnchors = []; // fresh conversation view → no rewind anchors
+      resetFeed();
+      renderTodo([], { persist: false });
+    }
+    refreshContextRingForScope();
+  }
+
   const unsubscribeHistorySync = historyStore.subscribe((incoming) => {
     const currentThreadId = thread?.id;
     const merged = mergeHistorySnapshots({ threads, meta: historyMeta }, incoming);
@@ -18770,16 +18833,7 @@ function buildPanel() {
     // any local-diff pass so a received tombstone cannot be echoed as a new set.
     applyWorkflowAliasesFromHistory();
     threads = capHistoryThreads(merged.threads, currentThreadId);
-    if (currentThreadId) {
-      const refreshed = threads.find((candidate) => candidate.id === currentThreadId);
-      const followsPanel = historyScopeFollowsPanel();
-      if (refreshed && (followsPanel || isThreadInScope(refreshed, currentHistoryScopeKey()))) {
-        rebindCurrentThreadRecord(refreshed);
-      } else {
-        const scopeKey = followsPanel ? null : currentHistoryScopeKey();
-        detachInvalidCurrentThread({ scopeKey, rebind: !followsPanel });
-      }
-    }
+    adoptSharedPanelSelection(currentThreadId);
     if (!histPop.hidden) renderHistory();
   });
 
@@ -20280,13 +20334,6 @@ function buildPanel() {
     if (wfid === currentWorkflowId) return; // case 1: no change
 
     const initial = currentWorkflowId == null;
-    if (!initial && chatScopeMode() === "ask") {
-      const name = wf?.filename || wfkey || wfid;
-      askModeFollowsPanel = window.confirm(
-        `Continue the current Agent Panel conversation on "${name}"?\n\n` +
-          "OK: carry this chat to the new canvas.\nCancel: open this workflow's separate chat history.",
-      );
-    }
     const followsPanel = historyScopeFollowsPanel();
 
     // PANEL-OWNED SESSION (default): the conversation is the unit of continuity
@@ -25363,34 +25410,11 @@ function buildPanel() {
     // push carries the new backend's values. No set_options is sent here.
     connectBackend(id);
   };
-  panelHooks.applyChatScope = (mode) => {
-    if (!['panel', 'workflow', 'ask'].includes(mode)) return;
-    askModeFollowsPanel = mode === "panel";
-    const targetKey = mode === "panel" ? "panel:global" : workflowStorageKey();
-    const panelTargetId = mode === "panel" ? historyMeta.activeByScope?.[targetKey] : null;
-    let target = mode === "panel"
-      ? threads.find((candidate) => candidate.id === panelTargetId)
-      : threadForWorkflow(targetKey);
-    if (!target && mode === "panel" && thread) {
-      // First switch to panel-owned mode: carry the visible conversation into
-      // the global selection slot without discarding its workflow provenance.
-      target = thread;
-      setActiveThread(targetKey, target.id);
-      persistThreads();
-    }
-    if (target) loadThread(target);
-    else newChat({ notifyBackend: false });
-    currentWorkflowId = null;
-    onWorkflowMaybeChanged();
-    refreshContextRingForScope(); // #381: the scope mode changed — reflect the target scope's fill
-    appendSystem(
-      mode === "panel"
-        ? "Chat scope → panel-wide conversation."
-        : mode === "workflow"
-          ? "Chat scope → separate histories for each workflow."
-          : "Chat scope → ask whenever the workflow changes.",
-    );
-  };
+  // mcp#884 — panelHooks.applyChatScope is gone with the retired scope setting:
+  // its only caller was the removed combo's onChange, and keeping a live scope
+  // switcher around would be a ready-made way to reintroduce per-workflow
+  // sessions behind the orchestrator's back (the invariant is ONE conversation
+  // per backend across every tab and workflow).
   panelHooks.applyModel = (id) => {
     const next = (id || "").trim();
     // Blank = "Auto (let the agent pick)" → CLEAR the forced model live: un-pin so a
@@ -25599,7 +25623,6 @@ function buildPanel() {
       // Drop the Settings→panel hooks so the dialog can't drive a torn-down panel
       // (a freshly-mounted panel re-registers them).
       panelHooks.applyBackend = null;
-      panelHooks.applyChatScope = null;
       panelHooks.applyModel = null;
       panelHooks.applyEffort = null;
       panelHooks.applyBridgeUrl = null;

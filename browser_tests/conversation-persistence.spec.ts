@@ -6,51 +6,14 @@
 import { test, expect } from './fixtures/panelTest'
 import { PanelPage } from './fixtures/PanelPage'
 import { resolveHistoryStoreModuleUrl } from './fixtures/historyStoreModule'
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { routeWorktreeSource } from './fixtures/worktreeSource'
 
 const SESSION_KEY = 'comfyui-mcp.panel.sessionId'
 const CURRENT_THREAD_KEY = 'comfyui-mcp.panel.currentThreadId'
 const LOCAL_HISTORY_SNAPSHOT_KEY = 'comfyui-mcp.panel.historySnapshot'
-const PANEL_SOURCE = readFileSync(resolve('web/js/comfyui-mcp-panel.js'), 'utf8')
-const HISTORY_STORE_SOURCE = readFileSync(
-  resolve('web/js/lib/chat-history-store.js'),
-  'utf8'
-)
-
-async function forcePerWorkflowSettings(route: import('@playwright/test').Route) {
-  if (route.request().method() !== 'GET') return route.continue()
-  const response = await route.fetch()
-  const raw = await response.text()
-  let settings: Record<string, unknown> = {}
-  if (raw.trim()) {
-    try {
-      const parsed = JSON.parse(raw)
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) settings = parsed
-    } catch {
-      // Some live ComfyUI builds transiently return an empty/truncated settings
-      // body during startup. The test only needs a deterministic scope setting.
-    }
-  }
-  settings['comfyui-mcp.sessionFollowsPanel'] = false
-  const headers = response.headers()
-  delete headers['content-length']
-  delete headers['content-encoding']
-  await route.fulfill({
-    status: 200,
-    headers: { ...headers, 'content-type': 'application/json' },
-    body: JSON.stringify(settings)
-  })
-}
 
 test.beforeEach(async ({ context }) => {
-  // The target ComfyUI server may have been started before this worktree was
-  // created. Route the two reviewed modules from the checked-out source so the
-  // browser gate always exercises this commit rather than a stale server copy.
-  await context.route(/\/extensions\/[^/]+\/js\/comfyui-mcp-panel\.js(?:\?.*)?$/, (route) =>
-    route.fulfill({ contentType: 'text/javascript', body: PANEL_SOURCE }))
-  await context.route(/\/extensions\/[^/]+\/js\/lib\/chat-history-store\.js(?:\?.*)?$/, (route) =>
-    route.fulfill({ contentType: 'text/javascript', body: HISTORY_STORE_SOURCE }))
+  await routeWorktreeSource(context)
 })
 
 async function indexedThreadCount(page: import('@playwright/test').Page): Promise<number> {
@@ -499,16 +462,17 @@ test('reload keeps the pointed conversation and live tab session during durable 
   expect(await page.evaluate((key) => localStorage.getItem(key), LOCAL_HISTORY_SNAPSHOT_KEY)).not.toBeNull()
 })
 
-test('strict workflow storage sync detaches transcript todos and session before the next record', async ({
+// mcp#884/#897: workflow provenance is archive grouping, not conversation
+// identity. The retired workflow scope used to DETACH the conversation when
+// another tab re-keyed its provenance; panel-owned continuity must instead
+// survive it — the session is orchestrator-global and one conversation spans
+// every workflow, so a provenance edit can never cost the user their chat.
+test('panel-owned continuity survives a remote provenance re-key', async ({
   page,
   context,
   panel,
   mockBridge
 }) => {
-  await page.route(
-    (url) => /\/(api\/)?settings\/?$/.test(url.pathname),
-    forcePerWorkflowSettings
-  )
   await panel.goto()
   await panel.setBridgeUrl(mockBridge.url)
   await panel.openSidebar()
@@ -536,7 +500,6 @@ test('strict workflow storage sync detaches transcript todos and session before 
     const updatedAt = Date.now() + 10_000
     const revision = { updatedAt, writerId: 'tab-b', sequence: 1 }
     thread.workflowKey = 'workflow:foreign-provenance'
-    thread.todos = [{ text: 'foreign todo', status: 'active' }]
     thread.updatedAt = updatedAt
     thread.ts = updatedAt
     thread.fieldOps = {
@@ -546,41 +509,39 @@ test('strict workflow storage sync detaches transcript todos and session before 
         deleted: false,
         updatedAt,
         revision
-      },
-      todos: {
-        value: [{ text: 'foreign todo', status: 'active' }],
-        deleted: false,
-        updatedAt,
-        revision: { ...revision, sequence: 2 }
       }
     }
     localStorage.setItem(snapshotKey, JSON.stringify(snapshot))
   }, { snapshotKey: LOCAL_HISTORY_SNAPSHOT_KEY, threadId: currentThreadId })
 
-  await expect.poll(
-    () => page.evaluate((key) => sessionStorage.getItem(key), SESSION_KEY)
-  ).toBeNull()
-  await expect.poll(
-    () => page.evaluate((key) => sessionStorage.getItem(key), CURRENT_THREAD_KEY)
-  ).toBeNull()
-  await expect(panel.userBubble('workflow A visible transcript')).toHaveCount(0)
-  await expect(panel.root.locator('.cmcp-todo-item')).toHaveCount(0)
-
-  const next = mockBridge.waitForUserMessage()
-  await panel.sendMessage('fresh workflow A transcript')
-  await next
-  const rebound = await page.evaluate(({ snapshotKey, sessionKey }) => {
-    const w = window as any
-    const app = w.comfyAPI?.app?.app || w.app
-    const workflowUuid = app.graph?.extra?.comfyui_mcp?.workflow_uuid
+  // The re-key propagates into this tab's merged record without detaching
+  // anything: same conversation, same live session, transcript still painted.
+  await expect.poll(() => page.evaluate(({ snapshotKey, threadId }) => {
     const snapshot = JSON.parse(localStorage.getItem(snapshotKey) || '{}')
-    const thread = snapshot.threads?.find((candidate: any) =>
-      candidate.msgs?.some((message: any) => message.text === 'fresh workflow A transcript'))
-    return { workflowUuid, thread, sessionId: sessionStorage.getItem(sessionKey) }
-  }, { snapshotKey: LOCAL_HISTORY_SNAPSHOT_KEY, sessionKey: SESSION_KEY })
-  expect(rebound.thread?.workflowKey).toBe(`workflow:${rebound.workflowUuid}`)
-  expect(rebound.thread?.sessionId).toBeUndefined()
-  expect(rebound.sessionId).toBeNull()
+    const thread = snapshot.threads?.find((candidate: any) => candidate.id === threadId)
+    return thread?.workflowKey || null
+  }, { snapshotKey: LOCAL_HISTORY_SNAPSHOT_KEY, threadId: currentThreadId }))
+    .toBe('workflow:foreign-provenance')
+  await expect(panel.userBubble('workflow A visible transcript')).toBeVisible()
+  expect(await page.evaluate((key) => sessionStorage.getItem(key), SESSION_KEY))
+    .toBe('workflow-a-session')
+  expect(await page.evaluate((key) => sessionStorage.getItem(key), CURRENT_THREAD_KEY))
+    .toBe(currentThreadId)
+
+  // The next message continues the SAME conversation record.
+  const next = mockBridge.waitForUserMessage()
+  await panel.sendMessage('continued after the provenance re-key')
+  await next
+  await expect.poll(() => page.evaluate(({ snapshotKey, threadId }) => {
+    const snapshot = JSON.parse(localStorage.getItem(snapshotKey) || '{}')
+    const thread = snapshot.threads?.find((candidate: any) => candidate.id === threadId)
+    return {
+      hasOriginal: thread?.msgs?.some((m: any) => m.text === 'workflow A visible transcript') ?? false,
+      hasContinued: thread?.msgs?.some((m: any) => m.text === 'continued after the provenance re-key') ?? false,
+      sessionId: thread?.sessionId ?? null
+    }
+  }, { snapshotKey: LOCAL_HISTORY_SNAPSHOT_KEY, threadId: currentThreadId }))
+    .toEqual({ hasOriginal: true, hasContinued: true, sessionId: 'workflow-a-session' })
   await otherTab.close()
 })
 
@@ -590,10 +551,6 @@ test('workflow rename publishes alias tombstones and a stale tab cannot echo the
   panel,
   mockBridge
 }) => {
-  await page.route(
-    (url) => /\/(api\/)?settings\/?$/.test(url.pathname),
-    forcePerWorkflowSettings
-  )
   await panel.goto()
   await panel.openSidebar()
   await page.evaluate(() => {
