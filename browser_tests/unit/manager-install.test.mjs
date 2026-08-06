@@ -854,6 +854,41 @@ function loadNodesInstall({ budgetMs, detect, reProbe, managerV2, managerCall, m
   );
 }
 
+// #681: the budget tests straddle TWO clocks — AbortSignal.timeout rides the
+// MONOTONIC clock (libuv timers) while translateStall's deadline check reads
+// the WALL clock (Date.now()). On a loaded runner the abort can fire while
+// Date.now() still reads a beat BEFORE commandDeadline; translateStall then
+// sees "budget remains" and passes the raw stall through, and the test gets
+// "The operation timed out" instead of the translated budget claim (the CI
+// flake). Gate the rejection on the WALL clock: after the abort fires,
+// re-check Date.now() until it has passed the budget the mock was invoked
+// under. Every mock below runs synchronously AFTER nodes_install fixes
+// commandDeadline = Date.now() + budgetMs, so invocation-time + budgetMs is
+// never EARLIER than the deadline — once the wall clock passes it, the
+// translation MUST fire, whatever the monotonic/wall skew. The re-check loop
+// (not a bare setTimeout) is what makes this immune to skew in EITHER
+// direction: the wait timer is monotonic too, so only the Date.now() gate
+// decides.
+function stallError() {
+  return Object.assign(new Error("The operation timed out"), { name: "TimeoutError" });
+}
+
+function rejectOnceWallClockPast(reject, notBefore) {
+  const wait = notBefore - Date.now();
+  if (wait <= 0) {
+    reject(stallError());
+  } else {
+    setTimeout(() => rejectOnceWallClockPast(reject, notBefore), wait + 1);
+  }
+}
+
+// A stall that surfaces only once the wall clock has passed now + budgetMs —
+// the deterministic shape of "the phase ran the command budget out" (#681),
+// for mocks whose stall is SCHEDULED rather than abort-driven.
+function stallPastBudget(budgetMs) {
+  return new Promise((_, reject) => rejectOnceWallClockPast(reject, Date.now() + budgetMs));
+}
+
 // A request that never answers, failing ONLY when its abort signal fires — the
 // shape of a stalled Manager call under api.fetchApi. The ref'd fallback timer
 // is load-bearing TWICE: (1) a mutant that DROPS the budget signal fails the
@@ -862,11 +897,13 @@ function loadNodesInstall({ budgetMs, detect, reProbe, managerV2, managerCall, m
 // the event loop EMPTY — the runner then cancels the test with "Promise
 // resolution is still pending but the event loop has already resolved" (CI run
 // 31050277380). The fallback keeps the loop alive and is cleared when the abort
-// fires, so it never delays a passing suite.
-function hangUntilAbort(opts, fallbackMs = 30000) {
+// fires, so it never delays a passing suite. `budgetMs` (the command budget the
+// test injected) arms the #681 wall-clock gate above; omit it for hangs whose
+// classification does not depend on a deadline.
+function hangUntilAbort(opts, { fallbackMs = 30000, budgetMs = 0 } = {}) {
   return new Promise((_, reject) => {
-    const fail = () =>
-      reject(Object.assign(new Error("The operation timed out"), { name: "TimeoutError" }));
+    const notBefore = Date.now() + budgetMs;
+    const fail = () => rejectOnceWallClockPast(reject, notBefore);
     const fallback = setTimeout(fail, fallbackMs);
     if (opts?.signal) {
       opts.signal.addEventListener(
@@ -913,7 +950,7 @@ test("#671 nodes_install (real panel source) answers inside the reply window whe
   // The install POST hangs forever (signal-aware); every other call answers.
   const managerV2 = (route, opts) => {
     if (route === "manager/queue/task") {
-      return hangUntilAbort(opts);
+      return hangUntilAbort(opts, { budgetMs: 2500 });
     }
     return Promise.reject(new Error(`unexpected route ${route}`));
   };
@@ -972,7 +1009,7 @@ test("#671 nodes_install a stalled dialect detection reports NOTHING queued (a r
   // say so — this phase can vouch for it (codex r2 P2).
   const nodes_install = loadNodesInstall({
     budgetMs: 2500,
-    detect: (opts) => hangUntilAbort(opts),
+    detect: (opts) => hangUntilAbort(opts, { budgetMs: 2500 }),
     managerV2: async () => { throw new Error("no mutation may run — detection never answered"); },
     managerCall: async () => { throw new Error("no mutation may run — detection never answered"); },
     managerQueueControl: async () => { throw new Error("start must not run"); },
@@ -994,7 +1031,7 @@ test("#671 nodes_install a stalled queue/start after a LANDED submit says QUEUED
     budgetMs: 2500,
     managerV2: async () => null, // the submit lands
     managerCall: async () => { throw new Error("managerCall must not run on the v2 dialect"); },
-    managerQueueControl: (_call, _route, opts) => hangUntilAbort(opts),
+    managerQueueControl: (_call, _route, opts) => hangUntilAbort(opts, { budgetMs: 2500 }),
     verifyInstalled: async () => { throw new Error("verify must not run — the start never answered"); },
   });
   const started = Date.now();
@@ -1036,13 +1073,10 @@ test("#671 nodes_install a stall in the VERIFY phase claims queued+started, neve
     managerV2: async () => null, // submit lands
     managerCall: async () => { throw new Error("managerCall must not run on the v2 dialect"); },
     managerQueueControl: async () => {}, // start acknowledged
-    verifyInstalled: () =>
-      new Promise((_, reject) =>
-        setTimeout(
-          () => reject(Object.assign(new Error("The operation timed out"), { name: "TimeoutError" })),
-          2600, // past the 2500 budget
-        ),
-      ),
+    // The stall surfaces only once the WALL clock has passed the command
+    // budget — the #681 gate, so the translateStall branch below is driven
+    // deterministically regardless of monotonic/wall skew.
+    verifyInstalled: () => stallPastBudget(2500),
   });
   const err = await nodes_install({ id: "ComfyUI-MelBandRoFormer" }).then(() => null, (e) => e);
   assert.ok(err, "a verify-phase stall must surface an error");
