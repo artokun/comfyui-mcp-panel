@@ -18889,6 +18889,25 @@ function buildPanel() {
   }
 
   function record(entry) {
+    // #381's turn-ownership rule, extended from usage frames to ALL agent-side
+    // records (codex P0 on mcp#884/#897): a live turn's output belongs to the
+    // conversation that OWNS the turn (liveTurnThreadId, pinned at
+    // turn:working). If the shown conversation changed mid-turn — a history
+    // switch in this tab, or this tab passively adopting another tab's shared
+    // selection — agent output must not be filed under the conversation now on
+    // screen. It is DROPPED, not re-routed to its owner: the turn was
+    // abandoned exactly like an interrupt, and stamping its output into the
+    // owner thread NOW would hand that thread the newest conversation
+    // activity and yank the shared selection straight back (selectPanelThread
+    // recency). User-authored entries are exempt — they belong to the view
+    // the user typed into, by definition.
+    if (
+      entry?.role !== "user" &&
+      liveTurnThreadId &&
+      (thread?.id ?? null) !== liveTurnThreadId
+    ) {
+      return entry;
+    }
     const followsPanel = historyScopeFollowsPanel();
     // Panel-owned continuity uses a global active-thread pointer, but the thread
     // keeps the stable workflow UUID as provenance for archive grouping. Panel
@@ -21189,6 +21208,12 @@ function buildPanel() {
       // can't out-race the session resume.)
     },
     onSay(text, meta) {
+      // A committed reply belongs to the turn's owning conversation. After a
+      // mid-turn switch (history switch here, or passive adoption of another
+      // tab's shared selection — mcp#884/#897) the straggler must neither
+      // paint into nor be recorded under the conversation now on screen
+      // (record() enforces the recording half at its choke point).
+      if (liveTurnThreadId && (thread?.id ?? null) !== liveTurnThreadId) return;
       // Message COMMIT time — the one place fenced ```a2ui blocks are detected
       // (backends without panel tools, e.g. Ollama family, can only emit cards
       // this way). Malformed JSON is left in `stripped` as a normal code block.
@@ -21210,6 +21235,9 @@ function buildPanel() {
     },
     // Live streaming deltas (thinking + reply text) before the committed say.
     onStream(msg) {
+      // Same ownership fence as onSay: a delta from an abandoned turn must not
+      // open a fresh preview bubble inside the newly adopted conversation.
+      if (liveTurnThreadId && (thread?.id ?? null) !== liveTurnThreadId) return;
       onStreamDelta(msg);
       noteActivity(); // streaming output is real turn activity → reset the clock
     },
@@ -21223,6 +21251,9 @@ function buildPanel() {
     },
     // The agent called panel_set_todo — render/update the live plan tray.
     onTodo(items) {
+      // Ownership fence (same rule as onSay): an abandoned turn's plan update
+      // must not repaint the tray or persist todos into the adopted thread.
+      if (liveTurnThreadId && (thread?.id ?? null) !== liveTurnThreadId) return;
       renderTodo(items);
     },
     // The agent called panel_show_media — render images/videos directly in the

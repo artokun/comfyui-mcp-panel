@@ -145,6 +145,11 @@ test('adopts the shared conversation another tab selected, across workflows', as
   const received = mockBridge.waitForUserMessage()
   await panel.sendMessage('conversation A marker')
   await received
+  // Conversation A's turn is IN FLIGHT when the selection moves: the panel
+  // pins the turn's owner (liveTurnThreadId) at turn:working, which the
+  // straggler assertions below rely on.
+  mockBridge.emitWorking()
+  await expect(panel.root.locator('.cmcp-thinking')).toBeVisible()
 
   // Another tab archives a thread from a DIFFERENT workflow and moves the
   // shared panel selection to it — exactly what loadThread writes there.
@@ -193,6 +198,21 @@ test('adopts the shared conversation another tab selected, across workflows', as
   await expect
     .poll(() => page.evaluate((key) => sessionStorage.getItem(key), CURRENT_THREAD_KEY))
     .toBe('cross-workflow-thread')
+
+  // A straggler from conversation A's abandoned in-flight turn must neither
+  // paint into nor be recorded under the adopted conversation (codex P0: the
+  // turn's owner is pinned at turn:working; its late output is dropped, like
+  // an interrupt, once the shown conversation changed).
+  mockBridge.say('late straggler from the abandoned turn')
+  await page.waitForTimeout(600)
+  await expect(
+    panel.agentBubbles.filter({ hasText: 'late straggler from the abandoned turn' })
+  ).toHaveCount(0)
+  expect(await page.evaluate((threadsKey) => {
+    const threads = JSON.parse(localStorage.getItem(threadsKey) || '[]')
+    return threads.some((t: any) =>
+      t.msgs?.some((m: any) => String(m.text || '').includes('late straggler')))
+  }, THREADS_KEY)).toBe(false)
 
   // ...and the next message typed HERE is recorded into the adopted
   // conversation (the one the orchestrator's global session is in).
