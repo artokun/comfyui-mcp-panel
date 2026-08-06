@@ -2095,6 +2095,13 @@ const RELOAD_POST_TIMEOUT_MS = 10000;
 // resumed session to continue where it left off. The REBOOT/SOFT_RELOAD cases
 // (deliberate, agent-known) are handled first and clear this so we don't double-nudge.
 const MID_TASK_KEY = "comfyui-mcp.panel.midTaskResume";
+// A session reset (new_session) this tab OWED but could not dispatch — the user
+// deleted the active conversation while disconnected (gate round-3 finding 2:
+// the tombstone + pointer clear must propagate, but the backend would otherwise
+// stay in the deleted session). Stores the backend scope key the reset applies
+// to; fired on the next ready ack, and ONLY while the shared pointer is still
+// in the cleared state this tab left — any newer act supersedes and drops it.
+const PENDING_SESSION_RESET_KEY = "comfyui-mcp.panel.pendingSessionReset";
 // Wall-clock (ms) of the last bridge drop — module-scoped so it survives panel
 // remounts. A FAST reconnect (panel swap / WS blip; orchestrator alive) vs a
 // SLOW one (real ComfyUI restart; orchestrator died + respawned) is how we tell
@@ -20278,6 +20285,14 @@ function buildPanel() {
     const dispatched = notifyBackend
       ? client?.sendFrame?.({ type: "new_session" }) === true
       : false;
+    if (dispatched) ssSet(PENDING_SESSION_RESET_KEY, null); // transition delivered
+    else if (notifyBackend) {
+      // Couldn't reach the orchestrator: this tab still OWES the reset (it may
+      // have just deleted the active conversation — the tombstone and pointer
+      // clear propagate regardless). Queue it for the next ready ack; the
+      // pointer-state guard there drops it if anything newer happened first.
+      ssSet(PENDING_SESSION_RESET_KEY, currentHistoryScopeKey());
+    }
     if (dispatched || !notifyBackend) setActiveThread(currentHistoryScopeKey(), null);
     thread = null;
     turnAnchors = []; // fresh conversation → no rewind anchors
@@ -20364,6 +20379,8 @@ function buildPanel() {
     const dispatched = sessionId
       ? client?.sendFrame?.({ type: "resume_session", session_id: sessionId }) === true
       : client?.sendFrame?.({ type: "new_session" }) === true;
+    // A delivered transition supersedes any reset this tab still owed.
+    if (dispatched) ssSet(PENDING_SESSION_RESET_KEY, null);
     ssSet(CURRENT_THREAD_KEY, t.id);
     // Resume this conversation's agent session (or start fresh if it has none),
     // so typing continues THIS chat rather than whatever was last active.
@@ -21750,11 +21767,9 @@ function buildPanel() {
         // A real provider switch = the connected backend changed AND we were
         // already connected to something (not the first connect, not a re-pick).
         const switched = connectedBackend !== null && connectedBackend !== backend;
-        if (switched) {
-          appendSystem(
-            `Switched to ${BACKEND_LABELS[backend]} — sessions aren't shared across providers, so this starts a fresh chat.`,
-          );
-        }
+        // The backend selection key can change on a real switch AND on a first
+        // connect that lands on a different backend than the restored default.
+        const previousScopeKey = currentHistoryScopeKey();
         selectedBackend = backend;
         connectedBackend = backend; // authoritative: update from the handshake (fix #4)
         setAskPlaceholder(backend); // authoritative placeholder per backend (fix #3)
@@ -21769,6 +21784,40 @@ function buildPanel() {
             running: el.title === "Running",
           })),
         );
+        // ONE CONVERSATION PER BACKEND (gate round-3 finding 1): entering a
+        // backend adopts THAT backend's own conversation — the session the
+        // orchestrator runs for it is keyed orchestrator::<backend>, so keeping
+        // the previous backend's thread on screen would run the new session
+        // against a conversation this backend does not own, while reloads and
+        // other tabs resolve its real one. loadThread is the normal actor path
+        // (dispatch + publish under the NEW key); with no conversation yet,
+        // newChat gives the fresh view. A reconnect to the SAME backend leaves
+        // the view untouched (keys equal).
+        const nextScopeKey = currentHistoryScopeKey();
+        if (previousScopeKey !== nextScopeKey) {
+          const target = selectPanelThread(threads, historyMeta, { scopeKey: nextScopeKey });
+          if (target && target.id !== (thread?.id ?? null)) {
+            if (switched) {
+              appendSystem(
+                `Switched to ${BACKEND_LABELS[backend]} — continuing its own conversation (sessions aren't shared across providers).`,
+              );
+            }
+            loadThread(target);
+          } else if (!target && thread) {
+            if (switched) {
+              appendSystem(
+                `Switched to ${BACKEND_LABELS[backend]} — it has no conversation yet, so this starts a fresh chat.`,
+              );
+            }
+            newChat();
+          } else if (switched) {
+            appendSystem(`Switched to ${BACKEND_LABELS[backend]}.`);
+          }
+        } else if (switched) {
+          appendSystem(
+            `Switched to ${BACKEND_LABELS[backend]} — sessions aren't shared across providers, so this starts a fresh chat.`,
+          );
+        }
       }
       // Apply the catalog AFTER the backend is known so effort mapping is correct.
       applyModelCatalog(list);
@@ -21842,6 +21891,27 @@ function buildPanel() {
           anyReady = true;
           onboard.hidden = true;
           renderBackendChips(knownBackends);
+        }
+      }
+      // Gate round-3 finding 2: fire a session reset this tab still OWES from
+      // deleting the active conversation while disconnected. The tombstone and
+      // pointer clear already propagated; without this the backend would keep
+      // the deleted conversation's session alive. Guarded three ways: same
+      // backend scope as when it was queued, the shared pointer is still in
+      // the cleared state this tab left (any newer act — here or in another
+      // tab — supersedes and drops the reset), and the frame actually sends.
+      if (ack?.kind === "ready") {
+        const owedScope = ssGet(PENDING_SESSION_RESET_KEY);
+        if (owedScope) {
+          ssSet(PENDING_SESSION_RESET_KEY, null);
+          const pointer = resolvePanelPointer(historyMeta, owedScope);
+          if (
+            owedScope === currentHistoryScopeKey() &&
+            pointer.activeId == null &&
+            pointer.cleared
+          ) {
+            client?.sendFrame?.({ type: "new_session" });
+          }
         }
       }
       // Post-restart auto-resume (#3): the "ready" ack is sent after the

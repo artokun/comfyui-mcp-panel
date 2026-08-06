@@ -1,4 +1,5 @@
 import { test, expect } from './fixtures/panelTest'
+import { MockBridge } from './fixtures/MockBridge'
 import { PanelPage } from './fixtures/PanelPage'
 import { resolveHistoryStoreModuleUrl } from './fixtures/historyStoreModule'
 import { routeWorktreeSource } from './fixtures/worktreeSource'
@@ -227,6 +228,89 @@ test('adopts the shared conversation another tab selected, across workflows', as
   await expect(previousRow).toBeVisible()
   await expect(previousRow.locator('.cmcp-hist-open')).toBeEnabled()
   await otherTab.close()
+})
+
+// Gate round-3 finding 1 (one conversation PER BACKEND, the switch flow):
+// entering a backend must adopt THAT backend's own conversation — the
+// orchestrator keys its session orchestrator::<backend>, so keeping the
+// previous provider's thread on screen would run the new session against a
+// conversation this backend does not own.
+test('switching backends adopts that backend\'s own conversation', async ({
+  page,
+  panel,
+  mockBridge
+}) => {
+  await panel.goto()
+  await panel.setBridgeUrl(mockBridge.url)
+  await panel.openSidebar()
+  await panel.connect()
+
+  const received = mockBridge.waitForUserMessage()
+  await panel.sendMessage('claude conversation marker')
+  await received
+  const claudeThreadId = await page.evaluate((key) => sessionStorage.getItem(key), CURRENT_THREAD_KEY)
+  expect(claudeThreadId).not.toBeNull()
+
+  // PRE-EXISTING state an earlier Codex session left behind: its conversation
+  // and its backend-scoped selection. (Setup data, not the behavior under
+  // test — the seam under test is the handshake's switch adoption below.)
+  const storeModuleUrl = await resolveHistoryStoreModuleUrl(page)
+  await page.evaluate(async ({ storeModuleUrl }) => {
+    const { ChatHistoryStore, updateMetadataEntry } = await import(storeModuleUrl)
+    const seedStore = new ChatHistoryStore({ writerId: 'codex-prior-session' })
+    const canonical = await seedStore.readCanonical()
+    const at = Date.now() - 120_000
+    const meta = updateMetadataEntry(
+      canonical.meta || {},
+      'activeByScope',
+      'panel:backend:codex',
+      'codex-own-thread',
+      { updatedAt: at + 1, writerId: 'codex-prior-session', sequence: 1 }
+    )
+    seedStore.persist([
+      ...(canonical.threads || []),
+      {
+        id: 'codex-own-thread',
+        createdAt: at,
+        updatedAt: at,
+        ts: at,
+        provider: 'codex',
+        workflowKey: 'workflow:codex-earlier-workflow',
+        msgs: [{
+          id: 'codex-msg-1',
+          role: 'user',
+          text: 'codex conversation from before',
+          createdAt: at
+        }]
+      }
+    ], meta)
+    const result = await seedStore.flush()
+    if (result !== true && (result as any)?.ok !== true) {
+      throw new Error(`codex state seed failed: ${JSON.stringify(result)}`)
+    }
+    await seedStore.close?.()
+  }, { storeModuleUrl })
+
+  // Reconnect to an orchestrator that reports the CODEX backend.
+  const codexBridge = new MockBridge({ port: 0, backend: 'codex' })
+  await codexBridge.start()
+  try {
+    await panel.setBridgeUrl(codexBridge.url)
+    await panel.connect()
+
+    // The handshake adopts codex's own conversation...
+    await expect(panel.userBubble('codex conversation from before')).toBeVisible()
+    await expect
+      .poll(() => page.evaluate((key) => sessionStorage.getItem(key), CURRENT_THREAD_KEY))
+      .toBe('codex-own-thread')
+    // ...and claude's selection still names claude's conversation.
+    expect(await page.evaluate(() => {
+      const meta = JSON.parse(localStorage.getItem('comfyui-mcp.panel.historyMeta') || '{}')
+      return meta.activeByScope?.['panel:backend:claude'] || null
+    })).toBe(claudeThreadId)
+  } finally {
+    await codexBridge.close()
+  }
 })
 
 // Gate P0-1: THE COMMIT IS THE TRANSITION. A tab that cannot reach the
