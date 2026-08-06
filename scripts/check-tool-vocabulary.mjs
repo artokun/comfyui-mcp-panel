@@ -382,7 +382,15 @@ for (const path of codeFiles) {
         const line = lines[i] ?? "";
         const lit = PLAIN_LITERAL.exec(arg);
         if (lit) {
-          coreHits.push({ path, line: i + 1, name: lit[2], what });
+          // `after` is the source from the end of the captured name onward — the
+          // comma and the args expression. Section 1b reads the action out of it.
+          coreHits.push({
+            path,
+            line: i + 1,
+            name: lit[2],
+            what,
+            after: content.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 400),
+          });
           continue;
         }
         // Not a plain literal: a template with ${}, a concatenation, or an
@@ -440,6 +448,129 @@ if (unverifiable.length > 0) {
       `Registering is not a rubber stamp: a wrapper's OWN call sites must then be`,
       `scanned by a CALL_SITES pattern, or its names go unchecked — which is exactly`,
       `how callJson() hid nine core tool names.`,
+    ].join("\n"),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 1b. A LIVE name is not enough: every core call must pass an `action`.
+//
+// THE BLIND SPOT THIS CLOSES. Everything above hunts names, and a name-hunting
+// gate is structurally incapable of seeing the 0.50.0 migration's other half.
+// The consolidation folded 160 tools into 37 by moving the old tool's identity
+// into a REQUIRED `action` argument — and it did that on names that SURVIVED.
+// `install_custom_node`, `download_model`, `train_start`, `train_prepare_dataset`,
+// `list_local_models`, `save_workflow` and `enqueue_workflow` are all still real
+// tools, so `callTool("download_model", { url })` passes section 1 unchallenged
+// and then fails core's schema validation at the moment the user clicks. 33 of
+// the 37 core tools require an action; a call that omits one is dead code that
+// every gate in this file certifies as healthy.
+//
+// THE RULE: `action` is the FIRST key of the args object literal. Not "appears
+// somewhere in the args" — locating a key at the object's top level means
+// tracking brace, bracket, paren, string and template nesting, and a scanner
+// that gets that wrong reports a phantom or, far worse, accepts an `action:`
+// buried inside a nested object where it means nothing. First-key is decidable
+// by looking at the characters immediately after `{`, so there is no nesting to
+// get wrong, and it reads at a glance in review — which is the same reason the
+// call sites were written that way.
+//
+// The cost is a real constraint on how args are written: an args expression that
+// is not a brace literal (a ternary, a spread of a variable, a prebuilt object)
+// cannot be checked and is reported, not waved through. `{ action: "list",
+// ...(dir ? { model_type: dir } : {}) }` is the shape that satisfies it; hoisting
+// the ternary outside the braces does not.
+// ---------------------------------------------------------------------------
+/**
+ * Core tools that take NO `action` — exempt from the rule above.
+ *
+ * EMPTY, and that is the finding rather than an oversight: the four action-less
+ * core tools (apply_manifest, calculate, clear_vram, report_issue) are not called
+ * from this panel. They are deliberately NOT pre-listed — a name sitting here
+ * before anything calls it is a standing pre-approval nobody would re-review, the
+ * same defect KNOWN_INDIRECTIONS' staleness check exists to prevent. Add one with
+ * a reason WHEN a call site needs it.
+ */
+const NO_ACTION_CORE_TOOLS = new Set([]);
+
+/** Skip whitespace and block comments from `i`; returns the next code offset. */
+const skipWs = (s, i) => {
+  for (;;) {
+    while (i < s.length && /\s/.test(s[i])) i++;
+    if (s.startsWith("/*", i)) {
+      const end = s.indexOf("*/", i + 2);
+      if (end === -1) return s.length;
+      i = end + 2;
+      continue;
+    }
+    if (s.startsWith("//", i)) {
+      const end = s.indexOf("\n", i);
+      if (end === -1) return s.length;
+      i = end + 1;
+      continue;
+    }
+    return i;
+  }
+};
+
+/** First line only — an args expression spanning lines would otherwise drag the
+ *  rest of the statement into the error message. */
+const firstLine = (s) => s.split("\n")[0].trim();
+
+/**
+ * Read the action out of the source that FOLLOWS a tool-name literal.
+ *
+ * Returns one of:
+ *   { kind: "action", value }   the args object literal opens with `action:`
+ *   { kind: "missing" }         args are a brace literal that does not
+ *   { kind: "no-args" }         the call ends after the name
+ *   { kind: "opaque", text }    the args are not a brace literal at all
+ */
+function readAction(after) {
+  let i = skipWs(after, 0);
+  if (after[i] === ")") return { kind: "no-args" };
+  if (after[i] !== ",") return { kind: "opaque", text: firstLine(after.slice(0, 60)) };
+  i = skipWs(after, i + 1);
+  if (after[i] !== "{") return { kind: "opaque", text: firstLine(after.slice(i, i + 60)) };
+  i = skipWs(after, i + 1);
+  const m = /^(?:"action"|'action'|action)\s*:\s*(?:"([^"]*)"|'([^']*)')/.exec(after.slice(i));
+  if (!m) return { kind: "missing" };
+  return { kind: "action", value: m[1] ?? m[2] };
+}
+
+const actionFindings = [];
+for (const h of coreHits) {
+  if (!CORE.has(h.name)) continue; // section 1 already failed this one
+  if (NO_ACTION_CORE_TOOLS.has(h.name)) continue;
+  // `.bind` produces a new callee whose eventual arguments are elsewhere; the
+  // bind site itself carries none, so an action cannot be read here. Section 1's
+  // unverifiable report already covers bind's real hazard.
+  if (h.what === "callTool.bind") continue;
+  const read = readAction(h.after ?? "");
+  if (read.kind === "action") continue;
+  actionFindings.push({ ...h, read });
+}
+if (actionFindings.length > 0) {
+  errors.push(
+    [
+      `${actionFindings.length} core tool call(s) do not pass an \`action\` as the first argument key:`,
+      "",
+      ...actionFindings.map((h) => {
+        const why =
+          h.read.kind === "no-args"
+            ? "no arguments at all"
+            : h.read.kind === "missing"
+              ? "args object does not open with `action:`"
+              : `args are not an object literal — ${JSON.stringify(h.read.text)}`;
+        return `  ${h.path}:${h.line}  ${h.name}  (${why})`;
+      }),
+      "",
+      `33 of the ${vocab.counts.core} core tools REQUIRE an action: the 0.50.0 consolidation moved the`,
+      `retired tool's identity into that argument. The NAME staying valid is exactly why`,
+      `this needs its own check — sections 1-3 hunt dead names and see nothing wrong here,`,
+      `while the call fails schema validation the moment a user clicks.`,
+      `Write it as \`{ action: "…", …rest }\`. If the tool genuinely takes no action, add it`,
+      `to NO_ACTION_CORE_TOOLS with the reason.`,
     ].join("\n"),
   );
 }

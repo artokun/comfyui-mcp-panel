@@ -7101,7 +7101,7 @@ let activePanelRoot = null;
 
 const GRAPH_TOOL_EXECUTORS = {
   // #608: force a fresh /object_info re-register + combo refresh so an asset that
-  // appeared server-side AFTER page-load — a stage_output_as_input input, a freshly
+  // appeared server-side AFTER page-load — an upload_image action:"stage" input, a freshly
   // downloaded model/LoRA/VAE, a newly installed node pack — becomes selectable in
   // loaders/combos WITHOUT a manual reload (press-R) or restart. Reuses the #396
   // forced re-register (refreshComfyNodeDefs force), the SAME non-destructive path a
@@ -8373,7 +8373,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const node = LG.createNode(class_type);
     if (!node) {
       throw new Error(
-        `Unknown node type "${class_type}" — check the exact class_type via get_node_info`,
+        `Unknown node type "${class_type}" — check the exact class_type via create_workflow (action:"node_info")`,
       );
     }
     const missingWidgets = missingRequiredWidgetMaterializations(
@@ -13889,7 +13889,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
   // conversation. Cleared the moment it's consumed.
   let pendingContext = null;
   // Direct call_tool requests, cid-correlated. The CivitAI modal uses these to run
-  // whitelisted backend tools (download_civitai_model, save_workflow) synchronously
+  // whitelisted backend tools (download_model action:"download_civitai", save_workflow) synchronously
   // without an agent turn — mirrors the mobile bridge_client.callTool. The
   // orchestrator's call_tool handler + whitelist already exist server-side.
   const pendingCalls = new Map(); // cid -> { resolve, reject, timer }
@@ -15385,8 +15385,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     /** Run a whitelisted backend tool directly (no agent turn), cid-correlated.
      *  Resolves { ok, result, error } where result is the MCP content array
      *  ([{type:"text",text}], flatten by joining .text). Rejects on timeout or
-     *  socket close. Used by the CivitAI modal for download_civitai_model /
-     *  save_workflow. */
+     *  socket close. Used by the CivitAI modal for download_model
+     *  (action:"download_civitai") / save_workflow. */
     callTool(tool, args, opts) {
       if (!sock || sock.readyState !== WebSocket.OPEN) {
         return Promise.reject(new Error("bridge not connected"));
@@ -18864,7 +18864,7 @@ function buildPanel() {
     try { localStorage.setItem("cmcp.blindAgents", AGENT_BLIND ? "1" : "0"); } catch {}
     reflectFeedGates();
     // Issue #90: Blind must also gate the comfyui MCP's image tools
-    // (get_image/view_image return pixels straight from /view). Tell the
+    // (get_image action:"get"/"view" return pixels straight from /view). Tell the
     // orchestrator so it respawns this tab's tool server with the blind env —
     // without this the toggle only covered the panel's own image channel.
     // An OLD orchestrator has no handler and never acks — warn so the user

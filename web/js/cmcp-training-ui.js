@@ -328,7 +328,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
    *  basename). Bumps -rN past every existing job sharing the base name. */
   async function uniqueRerunName(base) {
     try {
-      const d = await callJson(ctx, "train_status", {}, { timeout: 30000 });
+      const d = await callJson(ctx, "train_start", { action: "status" }, { timeout: 30000 });
       const esc = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const re = new RegExp(`^${esc}-r(\\d+)$`);
       let max = 1;
@@ -449,7 +449,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
   async function checkBackendCapable() {
     if (backendChecked) return backendCapable;
     try {
-      await callJson(ctx, "train_list_flows", {}, { timeout: 15000 });
+      await callJson(ctx, "train_start", { action: "list_flows" }, { timeout: 15000 });
       backendCapable = true;
     } catch {
       backendCapable = false;
@@ -537,8 +537,8 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     }
 
     function syncNext() {
-      // Also gated on the backend capability check: until train_list_flows
-      // resolves, advancing is blocked (codex finding: the gate was bypassable
+      // Also gated on the backend capability check: until train_start
+      // (action:"list_flows") resolves, advancing is blocked (codex finding: the gate was bypassable
       // while pending).
       next.disabled = !backendCapable || wiz.uploadsPending > 0 || !(wiz.images.length >= 1 && sanitizeNameClient(wiz.datasetName));
       next.title = !backendCapable && !backendChecked ? "Checking trainer backend…"
@@ -904,7 +904,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     sec.append(gpuLine);
     fetchGpuLabel(ctx.api).then((gpu) => { if (gpu) gpuLine.textContent = `Local GPU: ${gpu}`; });
     const myDoctorGen = ++doctorGen;
-    callJson(ctx, "train_doctor", {}, { timeout: 180000 }).then((d) => {
+    callJson(ctx, "train_doctor", { action: "doctor" }, { timeout: 180000 }).then((d) => {
       // A newer doctor (e.g. driveSetTarget's preflight) superseded this one —
       // don't let a stale completion overwrite wiz.podInfo or rebuild the switch.
       if (myDoctorGen !== doctorGen) return;
@@ -940,7 +940,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
         if (wiz.launching) targetBtns.forEach((b) => { b.disabled = true; });
         pre.before(targetSeg);
         const podNote = el("p", "cmcp-tr-hint",
-          `Pod training runs ai-toolkit natively ON the pod (no docker there). Fresh pods need a one-time bootstrap (~10 min) — run train_bootstrap (or ask the agent) once; it persists on the pod's volume. The pod bills GPU-time while it's up.`);
+          `Pod training runs ai-toolkit natively ON the pod (no docker there). Fresh pods need a one-time bootstrap (~10 min) — run train_doctor (action:"bootstrap") (or ask the agent) once; it persists on the pod's volume. The pod bills GPU-time while it's up.`);
         pre.after(podNote);
       }
       pre.textContent = "";
@@ -1084,12 +1084,13 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
           if (bad.length) throw new Error(`${bad.length} image(s) could not be resolved: ${bad[0].error}`);
           // 2) Stage dataset.
           const items = resolved.map((r, i) => ({ path: r.path, caption: snap.images[i].caption }));
-          const prep = await callJson(ctx, "train_prepare_dataset", { name: snap.name, items, defaultCaption: snap.trigger }, { timeout: 60000 });
+          const prep = await callJson(ctx, "train_prepare_dataset", { action: "prepare", name: snap.name, items, defaultCaption: snap.trigger }, { timeout: 60000 });
           if (gen !== wiz.launchGen) return; // superseded after staging, before launch
           datasetPath = prep.datasetPath;
         }
         // 3) Launch.
         const started = await callJson(ctx, "train_start", {
+          action: "start",
           name: snap.name, flow: "character", model: "flux1-dev",
           datasetPath, trigger: snap.trigger, params: snap.params,
           target: snap.target,
@@ -1159,7 +1160,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     const resultBox = el("div", "cmcp-tr-section");
     resultBox.style.padding = "0";
     // Settings used + the dataset this job trained on (and a one-tap rerun) —
-    // loaded once from train_job_config (the ai-toolkit config it consumed).
+    // loaded once from train_start (action:"job_config") (the ai-toolkit config it consumed).
     const metaBox = el("div", "cmcp-tr-section");
     metaBox.style.padding = "0";
     const nav = el("div", "cmcp-tr-row");
@@ -1173,7 +1174,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     (async () => {
       if (!wiz.jobId) return;
       try {
-        const cfg = await callJson(ctx, "train_job_config", { id: wiz.jobId }, { timeout: 30000 });
+        const cfg = await callJson(ctx, "train_start", { action: "job_config", id: wiz.jobId }, { timeout: 30000 });
         // Do NOT gate on pollGen: a terminal status stopPolling()s (bumping the
         // generation) and would discard a perfectly good config response —
         // settings/dataset/train-again must still render for completed jobs
@@ -1225,7 +1226,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
       if (!confirm("Cancel this training run? Saved checkpoints stay in the job's output dir; no LoRA is handed off.")) return;
       cancelBtn.disabled = true;
       try {
-        await callJson(ctx, "train_cancel", { id: wiz.jobId }, { timeout: 60000 });
+        await callJson(ctx, "train_start", { action: "cancel", id: wiz.jobId }, { timeout: 60000 });
       } catch (e) {
         alert(e.message || String(e));
       } finally {
@@ -1236,7 +1237,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     async function poll() {
       if (!wiz.jobId || myGen !== pollGen) return;
       try {
-        const d = await callJson(ctx, "train_status", { id: wiz.jobId }, { timeout: 30000 });
+        const d = await callJson(ctx, "train_start", { action: "status", id: wiz.jobId }, { timeout: 30000 });
         if (myGen !== pollGen) return; // view changed while the request was out
         const job = d.job;
         wiz.job = job;
@@ -1317,7 +1318,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     body.appendChild(sec);
     let datasets = [];
     try {
-      const d = await callJson(ctx, "train_list_datasets", {}, { timeout: 30000 });
+      const d = await callJson(ctx, "train_prepare_dataset", { action: "list" }, { timeout: 30000 });
       datasets = d.datasets || [];
     } catch (e) {
       list.textContent = "";
@@ -1358,20 +1359,20 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     body.appendChild(sec);
     let d;
     try {
-      d = await callJson(ctx, "train_dataset_detail", { name }, { timeout: 30000 });
+      d = await callJson(ctx, "train_prepare_dataset", { action: "detail", name }, { timeout: 30000 });
     } catch (e) {
       sub.textContent = `Could not load dataset: ${e.message || e}`;
       return;
     }
     sub.textContent = `${d.imageCount} images · ${d.captionedCount} captioned · ${d.datasetPath}`;
     grid.textContent = "";
-    // Thumbs ride train_file (inline bytes) — NOT the /training/file py route:
-    // that route only serves files under the PANEL's own training roots, so an
-    // orchestrator-side dataset path 403/404s there (codex finding). Bounded
-    // and tunnel-safe by design.
+    // Thumbs ride train_prepare_dataset (action:"file") for inline bytes — NOT
+    // the /training/file py route: that route only serves files under the
+    // PANEL's own training roots, so an orchestrator-side dataset path 403/404s
+    // there (codex finding). Bounded and tunnel-safe by design.
     const imgUrl = async (file) => {
       try {
-        const res = await ctx.callTool("train_file", { path: `${d.datasetPath}/${file}` }, { timeout: 30000 });
+        const res = await ctx.callTool("train_prepare_dataset", { action: "file", path: `${d.datasetPath}/${file}` }, { timeout: 30000 });
         const img = (res?.result || []).find((c) => c?.type === "image" && c.data && c.mimeType);
         return img ? `data:${img.mimeType};base64,${img.data}` : null;
       } catch {
@@ -1427,7 +1428,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     body.appendChild(sec);
     let jobs = [];
     try {
-      const d = await callJson(ctx, "train_status", {}, { timeout: 30000 });
+      const d = await callJson(ctx, "train_start", { action: "status" }, { timeout: 30000 });
       jobs = d.jobs || [];
     } catch (e) {
       list.textContent = "";
@@ -1533,7 +1534,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
       // versioned doctor means only the newest completion may decide (codex).
       const myDoctorGen = ++doctorGen;
       let dd;
-      try { dd = (await callJson(ctx, "train_doctor", {}, { timeout: 180000 })).data || {}; }
+      try { dd = (await callJson(ctx, "train_doctor", { action: "doctor" }, { timeout: 180000 })).data || {}; }
       catch (e) { throw new Error("pod preflight failed: " + (e.message || e)); }
       _assertOpen();
       // If a NEWER doctor superseded ours mid-flight, our result is stale and
