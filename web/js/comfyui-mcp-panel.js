@@ -184,6 +184,7 @@ import {
   clipOutlineTitle,
 } from "./lib/graph-read.js";
 import { slotRenameLines } from "./lib/slot-rename-diff.js";
+import { describeRenameFailure } from "./lib/workflow-rename-error.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
 import {
   CANVAS_TOOL_DISCLOSURE,
@@ -9218,12 +9219,19 @@ const GRAPH_TOOL_EXECUTORS = {
     // key — refuse it loudly rather than silently corrupt the object (codex P1).
     if (name === "__proto__") throw new Error('property name "__proto__" is not allowed');
     let from;
+    let existed = false;
     let liveEffectError = null;
     graph.beforeChange();
     try {
       // Create the properties bag INSIDE the undo envelope so a Ctrl+Z restores the node's
       // prior "no properties bag" state, not an already-created empty one (codex P1).
       if (!node.properties || typeof node.properties !== "object") node.properties = {};
+      // #690(2) — ABSENCE, not falsiness. `from` is `undefined` for a property that
+      // never existed, and JSON drops an undefined field, so a misspelled name
+      // returned a payload with no `from` at all and read as a successful edit while
+      // creating a dead property nobody reads. hasOwnProperty distinguishes "absent"
+      // from "present and undefined", which a falsy check cannot.
+      existed = Object.prototype.hasOwnProperty.call(node.properties, name);
       from = node.properties[name];
       node.properties[name] = value;
       if (typeof node.onPropertyChanged === "function") {
@@ -9246,6 +9254,17 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     graph.setDirtyCanvas(true, true);
     const set = { node_id: node.id, name, from, to: node.properties[name] };
+    // Creating a property is legitimate (LiteGraph nodes and packs both add them), so
+    // this REPORTS rather than refuses — a refusal would break every valid new-property
+    // write. But the caller must be able to tell it from an edit: a typo and a real
+    // change are otherwise the same payload.
+    if (!existed) {
+      set.created = true;
+      set.note =
+        `"${name}" did not exist on this node and was CREATED (no previous value). If you ` +
+        `meant to change an existing property, check the spelling against panel_query_graph — ` +
+        `a mistyped name creates a new property that nothing reads.`;
+    }
     return liveEffectError ? { set, live_effect_error: liveEffectError } : { set };
   },
 
@@ -11483,7 +11502,14 @@ const GRAPH_TOOL_EXECUTORS = {
     const clean = name.replace(/\.json$/i, "");
     const slash = target.path ? target.path.lastIndexOf("/") : -1;
     const dir = slash >= 0 ? target.path.slice(0, slash + 1) : "workflows/";
-    await s.renameWorkflow(target, `${dir}${clean}.json`);
+    try {
+      await s.renameWorkflow(target, `${dir}${clean}.json`);
+    } catch (err) {
+      // #690(6) — a raw "409 Conflict" is a status, not a reason. See
+      // describeRenameFailure: only an unambiguous conflict is rewritten, every other
+      // failure keeps its original text.
+      throw new Error(describeRenameFailure(err, clean));
+    }
     return { renamed: { to: `${clean}.json` } };
   },
 
