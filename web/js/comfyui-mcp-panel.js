@@ -186,6 +186,7 @@ import {
 import { slotRenameLines } from "./lib/slot-rename-diff.js";
 import { describeRenameFailure } from "./lib/workflow-rename-error.js";
 import { boundSubgraphList } from "./lib/subgraph-list-bound.js";
+import { threadMatchesCurrentWorkflow } from "./lib/thread-workflow-match.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
 import {
   CANVAS_TOOL_DISCLOSURE,
@@ -19687,6 +19688,10 @@ function buildPanel() {
         ts: now,
         msgs: [],
         workflowKey,
+        // #694 — the ROUTE stamp. Secondary to workflowKey (which is durable across a
+        // reload); this one is stable across an unsaved workflow's uuid RE-MINT, which is
+        // what made two conversations on one canvas look like two workflows.
+        workflowRouteKey: workflowTabId(),
         workflowTitle: getWorkflowTitle(),
         provider: connectedBackend || selectedBackend,
         model: prefs.model || orchestratorCurrentModel || pickDefaultModel(modelCatalog),
@@ -19695,6 +19700,7 @@ function buildPanel() {
       };
       historyStore.reviseThread(thread, {
         workflowKey,
+        workflowRouteKey: workflowTabId(),
         workflowTitle: getWorkflowTitle(),
         provider: connectedBackend || selectedBackend,
         model: prefs.model || orchestratorCurrentModel || pickDefaultModel(modelCatalog),
@@ -21431,7 +21437,7 @@ function buildPanel() {
       const currentWorkflowKeys = new Set([workflowStorageKey(), workflowTabId()]);
       const visible = threads
         .filter((candidate) =>
-          !currentOnly.checked || currentWorkflowKeys.has(candidate.workflowKey))
+          !currentOnly.checked || threadMatchesCurrentWorkflow(candidate, currentWorkflowKeys))
         .filter((candidate) => {
           if (!q) return true;
           const haystack = [
