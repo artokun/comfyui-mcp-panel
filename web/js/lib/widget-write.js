@@ -1221,7 +1221,14 @@ export function applyWidgetWrite(
   if (!matchesExpected(w.value)) {
     failure =
       `Widget "${w.name}" on node ${targetNode.id} (${targetNode.type}) did not retain the ` +
-      `requested value: wrote ${JSON.stringify(expected)} but it became ${JSON.stringify(w.value)}.`;
+      `requested value: wrote ${JSON.stringify(expected)} but it became ${JSON.stringify(w.value)}.` +
+      // #698 — "did not retain" reads as a transient failure worth retrying. For a
+      // non-value-bearing DOM widget it is STRUCTURAL: the widget is a view, its
+      // real state lives on the node, and no number of retries will change that.
+      // Appended ONLY here, in the branch where the revert has already been
+      // OBSERVED — so this can never turn into a pre-emptive refusal of a widget
+      // that would have worked. Diagnosis, never a gate.
+      describeNonValueBearingWidget(w);
   } else if (parentWidget && !matchesExpected(parentWidget.value)) {
     failure =
       `Promoted rail widget "${parentWidget.name}" on subgraph node ${node.id} did not retain ` +
@@ -1553,4 +1560,47 @@ export function applyWidgetWrite(
         }
       : {}),
   };
+}
+
+/**
+ * #698 — explain a write that reverted, when the widget structurally cannot hold
+ * a value.
+ *
+ * Custom packs register DOM widgets that are pure VIEWS: ComfyUI's `addDOMWidget`
+ * gives them an `element`, and the pack supplies `getValue`/`setValue` that read
+ * and write the node's own state instead of the widget's `.value`. Pixaroma's
+ * `PixaromaPrompt` is the reported case — `pix_prompt_ui` returns null from
+ * `getValue`, `setValue` is a no-op, and the prompt actually lives in
+ * `node.properties.promptState.text`.
+ *
+ * Assigning `.value` on one of those appears to work and then reverts, so the
+ * caller was told the widget "did not retain the requested value" — indistinguishable
+ * from a transient failure, and the reporter reasonably retried before working
+ * around it. This makes the structural case say so.
+ *
+ * DELIBERATELY DIAGNOSIS-ONLY. It is called from the failure branch, after the
+ * revert has been observed, and never decides whether a write may proceed. A
+ * pre-emptive version would have to guess "this widget cannot hold a value" from
+ * `serialize === false` — and #715 established that `serialize:false` is normal
+ * for perfectly healthy widgets (LoadImage's `upload` button is one), so gating on
+ * it would manufacture exactly the kind of false refusal this file exists to avoid.
+ */
+export function describeNonValueBearingWidget(w) {
+  if (!w || typeof w !== "object") return "";
+  const hasElement = !!w.element;
+  const opts = w.options && typeof w.options === "object" ? w.options : null;
+  const hasAccessors = !!(opts && (typeof opts.getValue === "function" || typeof opts.setValue === "function"));
+  if (!hasElement && !hasAccessors) return "";
+  const where = hasAccessors
+    ? "its owning node's own state (commonly `node.properties`), reached through the widget's getValue/setValue"
+    : "its owning node's own state (commonly `node.properties`)";
+  return (
+    ` This looks like a DOM-backed display widget rather than a value widget` +
+    `${hasElement ? " (it owns a DOM element" : " (it defines getValue/setValue"}` +
+    `${hasElement && hasAccessors ? " and defines getValue/setValue" : ""}), so its` +
+    ` real value is held in ${where} — assigning the widget does not reach it.` +
+    ` Retrying will not help. Drive the node another way (an equivalent serialized` +
+    ` input, or a node whose value is a plain widget), or ask the pack's author to` +
+    ` expose a settable value.`
+  );
 }
