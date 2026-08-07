@@ -875,14 +875,42 @@ test("#686 does NOT weaken #580: an unregistered custom widget still fails close
   );
 });
 
-test("#686 the input-level bar still applies — a COMFY_*_V3 input declaring WIDGET keys keeps waiting", () => {
-  // The waiver is namespace AND socket-shaped declaration, not namespace alone.
-  // An input that declares default/min/max is asking to carry a value, so it still
-  // needs a constructor — admitting it would be a #580 false accept.
-  const def = { input: { required: { v: [AUTOGROW, { default: 5, min: 0, max: 9 }] } } };
+test("#686 the REAL per-type config shapes are all addable (from ComfyUI's own as_dict)", () => {
+  // These are the exact config keys each family member emits in comfy_api/latest/_io.py,
+  // not an invented shape. The first version of this fix additionally required the input
+  // to be "socket-shaped", which silently excluded DynamicCombo — its `options` key is in
+  // WIDGET_VALUE_CONFIG_KEYS — and so left SaveVideo (#636) exactly as unaddable as before.
+  const REAL_SHAPES = {
+    COMFY_AUTOGROW_V3: { template: { input: ["STRING", {}], prefix: "v", min: 1, max: 10 } },
+    COMFY_DYNAMICCOMBO_V3: { options: [{ key: "auto", inputs: {} }, { key: "h264", inputs: {} }] },
+    COMFY_DYNAMICSLOT_V3: { inputs: {} },
+    COMFY_MATCHTYPE_V3: { template: {}, template_id: "t", allowed_types: ["IMAGE"] },
+    COMFY_MULTITYPED_V3: { template: {}, template_id: "t", allowed_types: ["IMAGE", "MASK"] },
+  };
+  for (const [type, config] of Object.entries(REAL_SHAPES)) {
+    const def = { input: { required: { v: [type, config] } } };
+    assert.deepEqual(
+      unavailableRequiredCustomWidgetTypes(def, REGISTERED, undefined, def),
+      [],
+      `${type} must be addable with its REAL emitted config`,
+    );
+  }
+});
+
+test("#636 SaveVideo is addable — the node the DynamicCombo gap actually blocked", () => {
+  // comfy_extras/nodes_video.py: video is a link input, codec is a DynamicCombo.
+  // VIDEO clears via knownSocketTypes (CreateVideo/LoadVideo output it); codec needs
+  // the reserved-namespace waiver. Both halves have to hold or the node stays unaddable.
+  const saveVideo = { input: { required: {
+    video: ["VIDEO", { tooltip: "The video to save." }],
+    filename_prefix: ["STRING", { default: "video/ComfyUI" }],
+    format: [["auto", "mp4", "webm"], { default: "auto" }],
+    codec: ["COMFY_DYNAMICCOMBO_V3", { options: [{ key: "auto", inputs: {} }] }],
+  } } };
+  const known = new Set(["VIDEO", "IMAGE", "LATENT"]);
   assert.deepEqual(
-    unavailableRequiredCustomWidgetTypes(def, REGISTERED, undefined, def),
-    [AUTOGROW],
+    unavailableRequiredCustomWidgetTypes(saveVideo, { STRING: () => {}, COMBO: () => {} }, known, saveVideo),
+    [],
   );
 });
 
