@@ -183,6 +183,7 @@ import {
   outlineValueClipNote,
   clipOutlineTitle,
 } from "./lib/graph-read.js";
+import { slotRenameLines } from "./lib/slot-rename-diff.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
 import {
   CANVAS_TOOL_DISCLOSURE,
@@ -5940,6 +5941,11 @@ function diffGraphsForAgent(prev, curr, liveGraph) {
       lines.push(`• ${label(c)}: mode ${modeName(p.mode)} → ${modeName(c.mode)}`);
     if ((p.title || "") !== (c.title || ""))
       lines.push(`• ${id}: title "${p.title ?? ""}" → "${c.title ?? ""}"`);
+    // #636 — a slot/promoted-widget RENAME is a real user edit that the readers
+    // already surface as `label`, but this diff used to ignore, so a session that
+    // renamed a subgraph's promoted widgets saw only an unrelated widget VALUE
+    // change and read the silence as "the renames did not stick". They had.
+    lines.push(...slotRenameLines(p, c, label(c)));
     const pv = p.widgets_values, cv = c.widgets_values;
     if (JSON.stringify(pv) !== JSON.stringify(cv)) {
       if (Array.isArray(pv) && Array.isArray(cv)) {
