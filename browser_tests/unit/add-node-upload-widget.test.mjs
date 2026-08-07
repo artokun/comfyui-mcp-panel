@@ -43,7 +43,8 @@ import {
   driftedRequiredInputNames,
   missingRequiredWidgetMaterializations,
   registeredSocketTypes,
-  unavailableRequiredCustomWidgetTypes,
+  unavailableRequiredWidgetMessage,
+  unavailableRequiredWidgetReport,
 } from "../../web/js/lib/node-widget-materialization.js";
 import { assertAddNodeResolvableRefreshing } from "../../web/js/lib/node-resolve.js";
 import {
@@ -210,7 +211,8 @@ function realGraphAddNode(comfy, overrides = {}) {
     registeredSocketTypes,
     missingRequiredWidgetMaterializations,
     applyCurrentDefWidgetValues,
-    unavailableRequiredCustomWidgetTypes,
+    unavailableRequiredWidgetReport,
+    unavailableRequiredWidgetMessage,
     snapshotBackendDef,
     describeUnmaterializedRequiredWidgets,
     ...overrides,
