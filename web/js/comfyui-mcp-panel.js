@@ -20870,7 +20870,26 @@ function buildPanel() {
     record({ role: "card", ...card });
   }
 
+  // Detaching a PLAYING <audio> does NOT stop it — the element goes on playing
+  // with its controls gone, so a thread/workflow switch mid-voice-line leaves
+  // sound the user has no way to pause (#710). Chat VIDEOS are spared this by
+  // their IntersectionObserver, which unmounts them when they leave the DOM;
+  // audio cards have no observer (pausing audio because it scrolled off screen
+  // would be its own bug), so they are released explicitly at every teardown.
+  function releaseChatAudio() {
+    try {
+      for (const a of log.querySelectorAll("audio")) {
+        try {
+          a.pause();
+          a.removeAttribute("src");
+          a.load(); // drop the decoded buffers, same as the lightbox's releaseVideo
+        } catch { /* best-effort */ }
+      }
+    } catch { /* the log itself is already gone */ }
+  }
+
   function resetFeed() {
+    releaseChatAudio();
     for (const el of [...log.children]) el.remove();
     streamBubbles.clear(); // drop any in-flight streaming previews (DOM is gone)
     // Drop live A2UI card handles — their DOM was just removed. Without this,
@@ -26346,6 +26365,10 @@ function buildPanel() {
       if (workWordTimer) { clearInterval(workWordTimer); workWordTimer = null; }
       if (thinkingSafety) { clearTimeout(thinkingSafety); thinkingSafety = null; }
       document.removeEventListener("keydown", onInterruptKeydown, true);
+      // Stop any chat audio before the panel's DOM goes away — a detached
+      // <audio> keeps playing, and after an unmount there is no card left to
+      // pause it with (#710). resetFeed() covers the in-panel teardowns.
+      releaseChatAudio();
       // Tear down a live media lightbox (#163): it's body-mounted with its own
       // window keydown listener, so without this an unmount/remount would strand
       // the overlay + listener (and a remount's fresh _activeLightboxClose tracker

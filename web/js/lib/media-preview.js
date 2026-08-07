@@ -655,12 +655,24 @@ export async function composeShowMediaReply(items, deps = {}) {
   // One disclosure per audio file. The video branch already learned this lesson
   // the expensive way (#648): the agent must be told, in the same breath as the
   // good news, exactly which observations it is NOT entitled to make.
+  //
+  // WHAT `painted` CLAIMS, EXACTLY. Every painter here is synchronous: it puts
+  // an element in the chat, and returns before the browser has fetched or
+  // decoded a single byte. So `painted` means "a player for it is in the chat",
+  // never "the bytes decoded" — the same limit the image and video branches have
+  // always had. Rather than pretend otherwise (a `canPlayType` probe answers
+  // about the TYPE, not about this file, and would still miss a corrupt or
+  // missing one), the disclosure says what was observed and hands the one check
+  // that actually settles it to the person who can hear the result. The video
+  // branch's remedy already ends the same way, deliberately.
   for (const a of audible) {
     const human =
       a.shown === "unconfirmed"
         ? `Whether its player reached the chat is UNKNOWN, so ask the user whether they can play it before ` +
           `asking them about it.`
-        : `Its player is in the chat, so the USER can play it — ask them how it sounds if you need to know.`;
+        : `Its player is in the chat — that is a player, NOT proof the browser could decode the file, so ` +
+          `ask the user whether it actually plays before you rely on it (and how it sounds, if you need ` +
+          `to know).`;
     const fetchIt = a.ref
       ? `To get the file itself, call get_image with ${refClause(a.ref, text)} — audio is SAVED TO DISK ` +
         `rather than returned to you inline, so what you get is a path a local tool can open (you still ` +

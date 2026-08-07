@@ -906,6 +906,12 @@ test("an audio item's reply says the user can HEAR it and that the agent cannot 
     reply.note,
     /call get_image with filename "vo_sophie_00001\.mp3", type "output", subfolder "synlara"/,
   );
+  // …and `painted` must not be oversold. The painter is synchronous: it returns
+  // before a byte is fetched, so a player in the chat is not evidence the file
+  // decoded. Claiming "the user can play it" full stop is the same overclaim as
+  // the success this fix removes, one layer down.
+  assert.match(reply.note, /NOT proof the browser could decode the file/);
+  assert.match(reply.note, /ask the user whether it actually plays/);
 });
 
 test("an audio file whose player could not be painted is not counted as painted (#710)", async () => {
@@ -1192,6 +1198,31 @@ test("paintFileLink gives the user an openable link for a kind the panel cannot 
   assert.match(fn, /\.href = url/);
   assert.doesNotMatch(fn, /createElement\("img"\)/);
   assert.doesNotMatch(fn, /cmcp-imgcard/);
+});
+
+test("chat audio is STOPPED at every teardown — a detached <audio> keeps playing (#710)", () => {
+  // Removing a playing <audio> from the DOM does not pause it, and once the card
+  // is gone there are no controls left to stop it with. Videos are covered by
+  // their IntersectionObserver; audio needs an explicit release.
+  const src = panelSource();
+  const fn = panelFunctionBody(src, "function releaseChatAudio(");
+  assert.match(fn, /querySelectorAll\("audio"\)/);
+  assert.match(fn, /\.pause\(\)/);
+  assert.match(fn, /removeAttribute\("src"\)/);
+  const reset = panelFunctionBody(src, "function resetFeed(");
+  assert.match(reset, /releaseChatAudio\(\);/, "a thread/workflow switch must not leave sound playing");
+  assert.ok(
+    reset.indexOf("releaseChatAudio()") < reset.indexOf("el.remove()"),
+    "release BEFORE detaching — a detached element is no longer reachable from `log`",
+  );
+  // The panel's own unmount is the other teardown: after it there is no card at
+  // all, so nothing else could ever stop the sound. Several objects in this file
+  // have a destroy(); the panel's is the one that unsubscribes history sync.
+  const destroys = [...src.matchAll(/\n {4}destroy\(\) \{/g)]
+    .map((m) => src.slice(m.index, m.index + 4000))
+    .filter((body) => body.includes("unsubscribeHistorySync()"));
+  assert.equal(destroys.length, 1, "could not locate the panel's own destroy()");
+  assert.match(destroys[0], /releaseChatAudio\(\);/);
 });
 
 test("a persisted audio card REPLAYS as audio, not as a broken image (#710)", () => {
