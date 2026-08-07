@@ -294,6 +294,10 @@ import {
   reRegisterExhaustedHint,
 } from "./lib/command-liveness.js";
 import {
+  classifyInteractiveCard,
+  refusedInteractiveCardError,
+} from "./lib/interactive-card-fence.js";
+import {
   saveActiveWorkflow,
   shouldGroundBeforeTurn,
   groundActiveWorkflow,
@@ -21635,6 +21639,24 @@ function buildPanel() {
     });
   }
 
+  // An interactive card (`ask_user` / `request_secret`) may only be painted into
+  // the conversation whose turn asked for it — see lib/interactive-card-fence.js
+  // for the whole argument and for why neither half of the pair is sufficient
+  // alone. Throws on refusal, which the bridge's command handler turns into an
+  // honest ok:false reply for the agent; nothing is painted, nothing is collected.
+  function fenceInteractiveCard(cmd) {
+    const verdict = classifyInteractiveCard({
+      agentWorking,
+      turnThreadId: liveTurnThreadId,
+      shownThreadId: thread?.id ?? null,
+    });
+    if (verdict.paint) return;
+    // Safe to log: this runs BEFORE any card exists, so there is no user value
+    // in scope — only the command name and the observed reason.
+    console.warn(`[comfyui-mcp-panel] refused a "${cmd}" card: ${verdict.reason}`);
+    throw new Error(refusedInteractiveCardError(cmd, verdict.reason));
+  }
+
   // In-flight Remote-control pairing request: the open modal registers a handler
   // here; the `pair_url`/`pair_error` reply consumes it (mirrors pendingSetSecret).
   let pendingPair = null;
@@ -21758,6 +21780,9 @@ function buildPanel() {
     // The agent called panel_ask — render a question card and resolve with the
     // user's pick. Keep the working indicator pinned below it while we wait.
     onAsk(msg) {
+      // Fence FIRST: a card from a turn this tab no longer owns must not paint,
+      // and must not revive the working indicator on its way past either.
+      fenceInteractiveCard("ask_user");
       const p = paintQuestion(msg);
       bumpThinking();
       noteActivity(); // a panel_ask frame is real turn activity → reset the clock
@@ -21909,13 +21934,21 @@ function buildPanel() {
     },
     // The agent called panel_request_secret — collect a token securely.
     onSecret(msg) {
-      const p = paintSecret(msg);
-      bumpThinking();
       // If this secure request was kicked off from a Settings "Set … token" button,
       // record a (non-secret) "set at" marker once a non-empty value is submitted so
       // the Settings indicator can show set/not-set. Only the timestamp is stored.
+      // Consumed BEFORE the fence so a REFUSED request also clears the marker —
+      // leaving it armed would attach this button's slot to whatever unrelated
+      // secret the agent collects next. (paintSecret never touches it, so reading
+      // it one step earlier is otherwise behaviour-neutral.)
       const req = pendingSecretRequest;
       pendingSecretRequest = null;
+      // Fence FIRST: this is the card whose payload is a secret. A turn this tab
+      // no longer owns must not get a masked input painted into the conversation
+      // that happens to be on screen — see lib/interactive-card-fence.js.
+      fenceInteractiveCard("request_secret");
+      const p = paintSecret(msg);
+      bumpThinking();
       if (req) {
         p.then((value) => {
           if (value) lsSet(SECRET_SET_AT_PREFIX + req.key, String(Date.now()));
