@@ -187,6 +187,7 @@ import { slotRenameLines } from "./lib/slot-rename-diff.js";
 import { describeRenameFailure } from "./lib/workflow-rename-error.js";
 import { boundSubgraphList } from "./lib/subgraph-list-bound.js";
 import { threadMatchesCurrentWorkflow } from "./lib/thread-workflow-match.js";
+import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
 import {
   CANVAS_TOOL_DISCLOSURE,
@@ -8380,6 +8381,10 @@ const GRAPH_TOOL_EXECUTORS = {
     const inner = [...(sub._nodes ?? sub.nodes ?? [])];
     return {
       subgraph_of: { node_id: node.id, title: node.title },
+      // #636 — the inner nodes below are the DEFINITION's; the parent instance's
+      // promoted widgets can override them. Carry both, labelled, so a legitimate
+      // per-instance override cannot be misread as stale data.
+      ...subgraphValueProvenance(node),
       node_count: inner.length,
       truncated: inner.length > MAX_STATE_NODES,
       ...(inner.length > MAX_STATE_NODES
