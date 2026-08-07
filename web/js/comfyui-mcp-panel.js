@@ -188,6 +188,7 @@ import { describeRenameFailure } from "./lib/workflow-rename-error.js";
 import { boundSubgraphList } from "./lib/subgraph-list-bound.js";
 import { threadMatchesCurrentWorkflow } from "./lib/thread-workflow-match.js";
 import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
+import { describeMissingNode } from "./lib/node-scope-locator.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
 import {
   CANVAS_TOOL_DISCLOSURE,
@@ -6743,7 +6744,22 @@ function nodeDescription(node) {
 
 function resolveNode(graph, nodeId) {
   const node = graph.getNodeById(Number(nodeId));
-  if (!node) throw new Error(`No node with id ${nodeId} in the current graph`);
+  // #697 — a node the READS just listed can be unresolvable here: reads span every
+  // scope, while a write applies to the graph being VIEWED. Say WHERE it actually is
+  // instead of only that it is not here. Diagnostic-only: runs on the failure path,
+  // never throws, and degrades to the original message when the root is unreadable.
+  if (!node) {
+    let rootGraph = null;
+    let viewingRoot = true;
+    try {
+      const ctx = getGraphCtx();
+      rootGraph = ctx.rootGraph ?? null;
+      viewingRoot = ctx.graph === rootGraph;
+    } catch {
+      rootGraph = null;
+    }
+    throw new Error(describeMissingNode(nodeId, rootGraph, viewingRoot));
+  }
   return node;
 }
 
