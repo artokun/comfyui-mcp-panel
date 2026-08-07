@@ -15869,6 +15869,19 @@ const PANEL_CSS = `
 }
 .cmcp-imgcard:hover .cmcp-media-expand, .cmcp-media-expand:focus-visible { opacity: 1; }
 .cmcp-media-expand:hover { background: var(--p-primary-color, #3a7bd5); }
+/* Audio cards (#710) — a real <audio controls> player, and a link card for a
+   kind the panel can neither draw nor play. Neither is a .cmcp-imgcard: the
+   lightbox gallery collects those and renders every member as image/video. */
+.cmcp-audiocard audio { width: 100%; display: block; }
+.cmcp-filecard {
+  border: 1px solid var(--p-content-border-color, #3f3f46); border-radius: 6px;
+  padding: 0.5rem 0.6rem; background: var(--p-surface-800, #27272a);
+}
+.cmcp-file-open {
+  color: var(--p-primary-color, #60a5fa); text-decoration: none; font-size: 0.8rem;
+  word-break: break-all;
+}
+.cmcp-file-open:hover { text-decoration: underline; }
 /* Agent text flows freely — no card/bubble. Only user messages are boxed. */
 .cmcp-bubble.agent {
   align-self: stretch; max-width: 100%;
@@ -20027,6 +20040,75 @@ function buildPanel() {
     recordMedia("video", url, name);
   }
 
+  // An audio card is a real PLAYER, not a picture (#710). Audio used to fall
+  // through to paintImage — a ComfyUI /view ref can name anything on disk, so a
+  // .mp3 became an <img src="…mp3">, i.e. a broken-image icon with a caption
+  // under it, while panel_show_media still reported a full success.
+  //
+  // TWO THINGS THIS CARD DELIBERATELY DOES NOT DO:
+  //  - it is NOT a .cmcp-imgcard and carries NO _cmcpMedia. The chat lightbox
+  //    gathers every .cmcp-imgcard and renders each as an image or a video, so
+  //    an audio card in that gallery is the same broken <img> arriving by a
+  //    different route.
+  //  - it does not autoplay. A picture appearing is silent; sound starting on
+  //    its own is not, and the user asked to be shown a file, not played at.
+  function paintAudio(url, name) {
+    // Coerce the caption at the painter boundary — see paintImage (#276).
+    name = name == null ? name : coerceMessageText(name);
+    clearEmpty();
+    const card = document.createElement("div");
+    card.className = "cmcp-bubble agent cmcp-audiocard";
+    const audio = document.createElement("audio");
+    audio.controls = true;
+    audio.preload = "metadata";
+    audio.src = url;
+    audio.style.cssText = "width:100%;display:block;";
+    card.appendChild(audio);
+    if (name) {
+      const cap = document.createElement("div");
+      cap.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
+      cap.textContent = name;
+      card.appendChild(cap);
+    }
+    log.appendChild(card);
+    scrollLog();
+    // Persist servable audio so it survives reload / thread switch, AS AUDIO —
+    // a card stored as an image replays through paintImage next reload (#710).
+    recordMedia("audio", url, name);
+  }
+
+  // The last resort for a kind this panel can neither draw nor play (#710): a
+  // link the person can actually open. It is deliberately NOT a media card —
+  // no .cmcp-imgcard, no <img> — because the point is that nothing was
+  // rendered. panel_show_media reports these separately from `painted`, so the
+  // agent never learns that the user saw or heard something they did not.
+  function paintFileLink(url, name) {
+    // Coerce the caption at the painter boundary — see paintImage (#276).
+    name = name == null ? name : coerceMessageText(name);
+    clearEmpty();
+    const card = document.createElement("div");
+    card.className = "cmcp-bubble agent cmcp-filecard";
+    const a = document.createElement("a");
+    a.href = url;
+    a.className = "cmcp-file-open";
+    // A new tab, so a click never navigates the panel (and ComfyUI) away. The
+    // download hint makes the browser save rather than try to display a file it
+    // has no viewer for; a cross-origin URL ignores it and simply opens, which
+    // is the same outcome from the user's side.
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    if (name) a.download = name;
+    a.textContent = name || "Open file";
+    card.appendChild(a);
+    const hint = document.createElement("div");
+    hint.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
+    hint.textContent = "The panel can't preview this file type — open or download it.";
+    card.appendChild(hint);
+    log.appendChild(card);
+    scrollLog();
+    recordMedia("file", url, name);
+  }
+
   /** Decide whether a ComfyUI output descriptor is a VIDEO (render <video>) vs an
    *  image (<img>). ComfyUI groups video outputs under `gifs`/`videos` and tags
    *  them with a `format` like "video/h264-mp4" (vs "image/gif" for animated gifs,
@@ -20036,6 +20118,28 @@ function buildPanel() {
     if (fmt.startsWith("video/")) return true;
     if (fmt.startsWith("image/")) return false; // incl. image/gif → animate in <img>
     return /\.(mp4|webm|mov|mkv|m4v|avi)$/i.test(String(m?.filename || ""));
+  }
+
+  /** The same question for AUDIO. The run-completion path had only the
+   *  image-vs-video split, so an audio descriptor arriving there was painted as
+   *  an <img> — the #710 defect on a second surface. The point is that ONE kind
+   *  decision now answers for every surface rather than two that can drift.
+   *  Audio is also kept out of the agent's inline delivery: an audio file handed
+   *  over as an inline IMAGE is a perception nobody had.
+   *
+   *  DELIBERATELY NOT DONE HERE: collecting ComfyUI's own `audio` output key.
+   *  onExecuted reads images/gifs/videos only, so a SaveAudio render paints
+   *  nothing in chat today and reports nothing to the agent — that is silence,
+   *  not a false claim, so it is a missing feature on this surface rather than
+   *  the #710 honesty defect. Adding it changes what appears in chat after every
+   *  audio render and touches the completion-delivery lifecycle (#269/#468), so
+   *  it belongs in its own change. Until then this branch covers a descriptor
+   *  that arrives misfiled under one of the three collected keys. */
+  function isAudioOutput(m) {
+    const fmt = String(m?.format || "").toLowerCase();
+    if (fmt.startsWith("audio/")) return true;
+    if (fmt.startsWith("image/") || fmt.startsWith("video/")) return false;
+    return /\.(mp3|wav|flac|ogg|oga|opus|m4a|aac)$/i.test(String(m?.filename || ""));
   }
 
   // ---- A2UI cards ------------------------------------------------------------
@@ -20788,7 +20892,37 @@ function buildPanel() {
     record({ role: "card", ...card });
   }
 
+  // Detaching a PLAYING <audio> does NOT stop it — the element goes on playing
+  // with its controls gone, so a thread/workflow switch mid-voice-line leaves
+  // sound the user has no way to pause (#710). Chat VIDEOS are spared this by
+  // their IntersectionObserver, which unmounts them when they leave the DOM;
+  // audio cards have no observer (pausing audio because it scrolled off screen
+  // would be its own bug), so they are stopped explicitly whenever they leave.
+  //
+  // TWO KINDS OF LEAVING, and they must not be treated alike:
+  //  - PERMANENT (resetFeed, the panel's own destroy): the card is never coming
+  //    back, so release the source too and drop the decoded buffers.
+  //  - KEEP-ALIVE (a sidebar-tab switch, which only DETACHES this root and
+  //    re-attaches the same DOM on re-entry): pause ONLY. Dropping `src` here
+  //    would hand the returning user a dead player — trading one bug for
+  //    another — whereas a pause preserves the position they were at.
+  function stopChatAudio({ release = false } = {}) {
+    try {
+      for (const a of log.querySelectorAll("audio")) {
+        try {
+          a.pause();
+          if (release) {
+            a.removeAttribute("src");
+            a.load(); // drop the decoded buffers, same as the lightbox's releaseVideo
+          }
+        } catch { /* best-effort */ }
+      }
+    } catch { /* the log itself is already gone */ }
+  }
+  const releaseChatAudio = () => stopChatAudio({ release: true });
+
   function resetFeed() {
+    releaseChatAudio();
     for (const el of [...log.children]) el.remove();
     streamBubbles.clear(); // drop any in-flight streaming previews (DOM is gone)
     // Drop live A2UI card handles — their DOM was just removed. Without this,
@@ -20845,7 +20979,13 @@ function buildPanel() {
         if (m.role === "user") paintUser(m.text, { attachments: m.attachments, workflowVersion: m.workflowVersion });
         else if (m.role === "agent") paintAgent(m.text);
         else if (m.role === "media") {
+          // The kind decision has to be repeated here, or a reload replays an
+          // audio card through paintImage and the broken <img> is back (#710).
+          // Unrecognized kinds stay images: every record written before audio
+          // existed is one.
           if (m.mkind === "video") paintVideo(m.url, m.caption);
+          else if (m.mkind === "audio") paintAudio(m.url, m.caption);
+          else if (m.mkind === "file") paintFileLink(m.url, m.caption);
           else paintImage(m.url, m.caption);
         } else if (m.role === "card") {
           if (m.kind === "a2ui") paintA2UIRecord(m);
@@ -21858,8 +21998,8 @@ function buildPanel() {
     onTodo(items) {
       renderTodo(items);
     },
-    // The agent called panel_show_media — render images/videos directly in the
-    // chat AND answer the agent honestly about what it was handed (#648).
+    // The agent called panel_show_media — render images/videos/audio directly in
+    // the chat AND answer the agent honestly about what it was handed (#648).
     //
     // This used to paint and return nothing, so the tool replied {ok:true} to an
     // agent that had been shown nothing. For a video that reads as "I have seen
@@ -21867,10 +22007,16 @@ function buildPanel() {
     // impossible". composeShowMediaReply paints exactly as before and then routes
     // every video through the panel's EXISTING storyboard pipeline — bounded, and
     // disclosed as a sample rather than as the video.
+    //
+    // #710 widened the same principle to KIND: a painter per kind (audio plays,
+    // an unpresentable kind gets a link), and an item the panel cannot present
+    // is reported apart from `painted` instead of counted as a success.
     onShowMedia(items) {
       return composeShowMediaReply(items, {
         paintImage,
         paintVideo,
+        paintAudio,
+        paintFileLink,
         imageViewUrl,
         coerceMessageText,
         buildVideoStoryboard,
@@ -23370,6 +23516,12 @@ function buildPanel() {
         paintVideo(url, m.filename);
         // Carry the node id so the deferred storyboard event can name its node.
         videos.push({ m, nodeId });
+      } else if (isAudioOutput(m)) {
+        // Played, never painted as an image — and deliberately NOT added to
+        // inlineImages: that list is delivered to the agent as inline image
+        // blocks, so audio there would be both a broken picture and a claim of
+        // something the agent cannot perceive (#710).
+        paintAudio(url, m.filename);
       } else {
         paintImage(url, m.filename);
         inlineImages.push(m);
@@ -26234,6 +26386,15 @@ function buildPanel() {
       markAgentSeen();
       scrollLog();
     },
+    /** Called when the tab is left with the panel kept ALIVE (the root is
+     *  detached, not destroyed). A detached <audio> keeps playing and its
+     *  controls went with the root, so pause it — the chat's videos are already
+     *  paused here by their IntersectionObserver, and audio that kept going
+     *  while the panel was gone would be sound the user cannot reach (#710).
+     *  Pause only: the same element is re-attached on re-entry. */
+    onHide() {
+      stopChatAudio();
+    },
     setChatSurface: cmcpSetChatSurface, // A2UI seam: widen/restore the chat surface
     destroy() {
       try {
@@ -26252,6 +26413,10 @@ function buildPanel() {
       if (workWordTimer) { clearInterval(workWordTimer); workWordTimer = null; }
       if (thinkingSafety) { clearTimeout(thinkingSafety); thinkingSafety = null; }
       document.removeEventListener("keydown", onInterruptKeydown, true);
+      // Stop any chat audio before the panel's DOM goes away — a detached
+      // <audio> keeps playing, and after an unmount there is no card left to
+      // pause it with (#710). resetFeed() covers the in-panel teardowns.
+      releaseChatAudio();
       // Tear down a live media lightbox (#163): it's body-mounted with its own
       // window keydown listener, so without this an unmount/remount would strand
       // the overlay + listener (and a remount's fresh _activeLightboxClose tracker
@@ -26328,7 +26493,7 @@ function buildPanel() {
 // `side-bar-button-selected` plus a unique `<tabId>-tab-button` class. When our tab
 // isn't selected we remove our own root; render() rebuilds it on re-entry. We guard
 // only OUR root, never another tab's.
-function installSidebarTabGuard(tabId, getRoot) {
+function installSidebarTabGuard(tabId, getRoot, onDetach) {
   const activeTabId = () => {
     const b = document.querySelector(".side-bar-button-selected");
     if (!b) return null;
@@ -26338,7 +26503,13 @@ function installSidebarTabGuard(tabId, getRoot) {
   const enforce = () => {
     if (activeTabId() === tabId) return;             // our tab active → keep content
     const r = getRoot();                              // inactive → drop our stray content
-    if (r && r.isConnected) r.remove();
+    if (r && r.isConnected) {
+      // This is the OTHER path that detaches a live panel (the tab's own
+      // destroy() is the first), so audio has to be paused here too — a
+      // detached <audio> keeps playing and its controls just left (#710).
+      try { onDetach?.(); } catch { /* a pause that fails must not strand the stray root */ }
+      r.remove();
+    }
   };
   const start = (tries = 0) => {
     const toolbar = document.querySelector(".side-tool-bar-container");
@@ -26538,6 +26709,9 @@ function registerExtensionWhenReady(tries = 0) {
         destroy: () => {
           // Detach only — never mounted.destroy(). Tearing down here is what used
           // to kill the live agent whenever the user peeked at another tab.
+          // onHide() first: a detached <audio> keeps playing and its controls
+          // leave with the root, so it must be paused BEFORE the root goes (#710).
+          mounted?.onHide?.();
           mounted?.root?.remove();
         },
       };
@@ -26550,7 +26724,11 @@ function registerExtensionWhenReady(tries = 0) {
         // the panel stylesheet only loads on first render (codex-review F1).
         ensureTabIconStyle();
         mgr.registerSidebarTab(tabSpec);
-        installSidebarTabGuard(tabId, () => document.querySelector(".cmcp-root"));
+        installSidebarTabGuard(
+          tabId,
+          () => document.querySelector(".cmcp-root"),
+          () => mounted?.onHide?.(),
+        );
       } else {
         console.error(
           "[comfyui-mcp-panel] app.extensionManager.registerSidebarTab is unavailable; " +

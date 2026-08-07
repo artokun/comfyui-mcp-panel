@@ -59,38 +59,114 @@ export const MEDIA_PREVIEW_TIMEOUT_MS = 20000;
 export const MEDIA_SIZE_PROBE_TIMEOUT_MS = 8000;
 
 /**
- * Filenames the panel plays as video.
+ * WHAT THE PANEL CAN ACTUALLY PRESENT (#710).
  *
- * The dot is escaped, unlike the inline test this replaces (`/.(mp4|webm)$/i`),
- * where `.` matched any character — so a file ending `xmp4` was painted as a
- * video. Widened past mp4/webm because a ComfyUI /view ref can name anything on
- * disk; the orchestrator's own inline path is stricter, which is fine, this only
- * has to decide "try to sample frames from it".
+ * The panel knew exactly two kinds, and everything that was not a video was
+ * painted with `<img>`. A ComfyUI /view ref can name ANYTHING on disk, so an
+ * audio output reached the image branch: the user got a broken-image icon with
+ * a caption under it, and the reply still said `painted:N, unconfirmed:0`. The
+ * agent then told them to listen to something nobody could hear.
  *
- * Anchored at the end, so it is applied to the filename with any query string or
- * fragment removed FIRST (see videoFilenameStem). A ref whose filename arrives
- * as `clip.mp4?download=1` is a video; classifying it as an image skips the
- * storyboard and the whole sampled-preview disclosure for a legitimate video,
- * which is the failure this module exists to prevent, reached by a different
- * route than the unescaped dot.
+ * So the kinds are an ALLOWLIST per element, and "not video" is no longer a
+ * synonym for "image". Each set is what that HTML element can actually play or
+ * draw — the question being answered is "can the person perceive this in the
+ * chat", which is a browser-decoding question, not a ComfyUI one:
+ *
+ *  - IMAGE  — deliberately generous, because this is the common path and a
+ *             legitimate image demoted to a link card is a regression a user
+ *             feels immediately. `gif` stays here (animated gifs render in
+ *             `<img>`), matching the panel's own isVideoOutput.
+ *  - VIDEO  — unchanged from the set this module already sampled frames from.
+ *  - AUDIO  — the suite's `upload_image action:"stage"` kind:"audio" set
+ *             (wav/mp3/flac/ogg/m4a/aac), PLUS oga/opus: that set governs what
+ *             ComfyUI's loaders accept, whereas this one governs what an
+ *             `<audio>` element decodes, and the Ogg family plays fine.
+ *
+ * Anything else is UNKNOWN, which is a decision and not a fallback: an unknown
+ * kind is never handed to a painter that will render it wrong, and never
+ * counted as painted.
  */
-const VIDEO_FILENAME = /\.(?:mp4|webm|mov|m4v|mkv|avi)$/i;
+const IMAGE_EXTENSIONS = new Set([
+  ".png", ".jpg", ".jpeg", ".jfif", ".webp", ".gif", ".apng", ".bmp", ".tif", ".tiff",
+  ".avif", ".ico", ".ppm", ".heic", ".heif", ".svg",
+]);
+const VIDEO_EXTENSIONS = new Set([".mp4", ".webm", ".mov", ".m4v", ".mkv", ".avi"]);
+const AUDIO_EXTENSIONS = new Set([
+  ".wav", ".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".aac",
+]);
 
 /** The filename with a `?query` / `#fragment` tail removed. */
-function videoFilenameStem(filename) {
+function filenameStem(filename) {
   return String(filename).split("#")[0].split("?")[0];
+}
+
+/**
+ * The filename's extension, lowercased, WITH its dot — or "" when it has none.
+ *
+ * Read off the stem, so `clip.mp4?download=1` is still `.mp4`: a ref whose
+ * filename arrives with a query string must not be demoted to another kind,
+ * which for a video would skip the storyboard and the whole sampled-preview
+ * disclosure this module exists to produce.
+ *
+ * The dot is REQUIRED rather than implied, which is the structural version of
+ * the fix that escaped it in the old `/.(mp4|webm)$/i` (where `.` matched any
+ * character, so a file ending `xmp4` was painted as a video). A name with no dot
+ * has no extension here, and no set can match "".
+ */
+function extensionOf(filename) {
+  const m = /\.([A-Za-z0-9]+)$/.exec(filenameStem(filename));
+  return m ? `.${m[1].toLowerCase()}` : "";
 }
 
 const defaultCoerce = (v) => (typeof v === "string" ? v : v == null ? "" : String(v));
 
+function kindForExtension(ext) {
+  if (VIDEO_EXTENSIONS.has(ext)) return "video";
+  if (AUDIO_EXTENSIONS.has(ext)) return "audio";
+  if (IMAGE_EXTENSIONS.has(ext)) return "image";
+  return "unknown";
+}
+
+/**
+ * What kind of media one resolved show_media item is: `{ kind, ext }` where
+ * kind is "image" | "video" | "audio" | "unknown".
+ *
+ * THREE SOURCES OF TRUTH, IN THIS ORDER, because they are not equally informed:
+ *
+ *  1. The orchestrator's OWN `kind`. It set it from the file's extension and
+ *     built the data URL's MIME from the same decision, so second-guessing it
+ *     here would put two disagreeing classifiers on one item.
+ *  2. A /view ref's FILENAME. The orchestrator forwards these unclassified
+ *     (it never reads the bytes), so the panel is the first place that can
+ *     decide — this is the path the audio in #710 arrived on.
+ *  3. A data URL's declared MIME, for an item carrying neither. Nothing the
+ *     orchestrator sends today lands here; it is the honest answer for a
+ *     caller that hands over bytes without saying what they are.
+ *
+ * An item with no signal at all is UNKNOWN, never "probably an image".
+ */
+export function classifyShowMediaItem(item, coerce = defaultCoerce) {
+  if (!item) return { kind: "unknown", ext: "" };
+  const refName = item.kind === "viewRef" ? coerce(item.viewRef?.filename) : "";
+  const name = refName || coerce(item.filename);
+  const ext = extensionOf(name);
+  if (item.kind === "image" || item.kind === "video" || item.kind === "audio") {
+    return { kind: item.kind, ext };
+  }
+  if (name) {
+    const byName = kindForExtension(ext);
+    if (byName !== "unknown") return { kind: byName, ext };
+  }
+  if (typeof item.dataUrl === "string") {
+    const m = /^data:(image|video|audio)\//i.exec(item.dataUrl);
+    if (m) return { kind: m[1].toLowerCase(), ext };
+  }
+  return { kind: "unknown", ext };
+}
+
 /** True when a resolved show_media item should be treated as a video. */
 export function isVideoShowMediaItem(item, coerce = defaultCoerce) {
-  if (!item) return false;
-  if (item.kind === "video") return true;
-  if (item.kind === "viewRef" && item.viewRef) {
-    return VIDEO_FILENAME.test(videoFilenameStem(coerce(item.viewRef.filename)));
-  }
-  return false;
+  return classifyShowMediaItem(item, coerce).kind === "video";
 }
 
 /**
@@ -248,12 +324,20 @@ function refClause(ref, coerce) {
 }
 
 /**
- * Compose the panel's reply to one `show_media` command: paint every item for
- * the user, build a bounded sampled preview of every video, and return a reply
- * that states what the agent was and was not given.
+ * Compose the panel's reply to one `show_media` command: present every item to
+ * the user with the element its KIND actually needs, build a bounded sampled
+ * preview of every video, and return a reply that states what the agent was and
+ * was not given.
  *
- * Resolves to `{ ok, count, painted, previews, note }`. Never rejects — a reply
- * the agent cannot read is the failure this exists to remove.
+ * Resolves to `{ ok, count, painted, unconfirmed, unrenderable, previews, note }`.
+ * Never rejects — a reply the agent cannot read is the failure this exists to
+ * remove.
+ *
+ * `painted` counts ONLY items the person can now see or hear. An item whose kind
+ * the panel cannot present is reported in `unrenderable` instead (#710): it is
+ * the difference between "the user can hear this" and "I was handed something I
+ * could not present", and an agent that cannot tell them apart will confidently
+ * ask about a file nobody perceived.
  *
  * @param {Array<object>} items resolved show_media items from the orchestrator
  * @param {object} deps injected panel helpers (see the call site)
@@ -262,6 +346,8 @@ export async function composeShowMediaReply(items, deps = {}) {
   const {
     paintImage,
     paintVideo,
+    paintAudio,
+    paintFileLink,
     imageViewUrl,
     coerceMessageText = defaultCoerce,
     buildVideoStoryboard,
@@ -301,8 +387,22 @@ export async function composeShowMediaReply(items, deps = {}) {
   const jobs = [];
   let painted = 0;
   let unconfirmed = 0;
+  /** How many of `painted` the user can SEE vs HEAR — the headline must not
+   *  call an audio player a display, and must not leave the agent to guess
+   *  which sense it is talking about. */
+  const paintedByKind = { image: 0, video: 0, audio: 0 };
   /** Items the user cannot see, each with the REASON it is missing. */
   const dropped = [];
+  /** Items of a kind the panel cannot present at all (#710). Reported apart
+   *  from `painted` because a link the user has to open is not a rendering,
+   *  and apart from `dropped` because the user was still given SOMETHING. */
+  const unrenderable = [];
+  /** Audio the user can play. Each gets its own disclosure below, because an
+   *  audio card is the one thing here an agent is most likely to narrate
+   *  without having heard it. */
+  const audible = [];
+
+  const painterFor = { image: paintImage, video: paintVideo, audio: paintAudio };
 
   // ── Paint pass ──────────────────────────────────────────────────────────
   // One item's painter throwing must not cost the whole batch its reply, and
@@ -312,7 +412,8 @@ export async function composeShowMediaReply(items, deps = {}) {
   // cause sends the caller to re-send a file that was perfectly resolvable.
   for (const item of list) {
     const caption = text(item?.caption) || text(item?.filename) || "";
-    const isVideo = isVideoShowMediaItem(item, text);
+    const { kind, ext } = classifyShowMediaItem(item, text);
+    const isVideo = kind === "video";
     let url = null;
     let ref = null;
     let why = null;
@@ -353,7 +454,48 @@ export async function composeShowMediaReply(items, deps = {}) {
       });
       continue;
     }
-    const shownState = safePaint(isVideo ? paintVideo : paintImage, url, caption, note, name);
+    // A kind with no painter here is NOT painted as an image. That fallback is
+    // the whole of #710: an `<img>` pointed at an audio file is a broken-image
+    // icon, and the reply counted it as a success. The user still gets a link
+    // card — the person can open the file themselves, which is exactly the
+    // workaround the reporter ended up performing by hand — but a link is not a
+    // rendering, so it is reported as unrenderable rather than as painted.
+    const painter = painterFor[kind];
+    if (typeof painter !== "function") {
+      const linkState =
+        typeof paintFileLink === "function"
+          ? safePaint(paintFileLink, url, caption, note, name)
+          : "failed";
+      unrenderable.push({
+        name,
+        ext,
+        kind,
+        shown: linkState === "shown" ? "link" : linkState === "unconfirmed" ? "unconfirmed" : "nothing",
+        // The two ways to land here are genuinely different diagnoses, and one
+        // of them is a panel wiring bug the agent should not describe as a
+        // property of the user's file.
+        why:
+          kind === "unknown"
+            ? `the panel has no viewer or player for ${ext ? `"${ext}" files` : "a file with no extension"}`
+            : `this panel build has no ${kind} player wired, so it could not present a ${kind} file`,
+        // get_image is only a remedy when it will actually answer. It returns
+        // image/video/audio payloads and REFUSES anything else, so offering it
+        // for an unknown kind would be a next step that cannot be taken — the
+        // exact defect the rest of this module exists to remove.
+        remedy:
+          kind === "unknown"
+            ? `get_image returns only image/video/audio payloads and refuses anything else, so do not ` +
+              `assume you can fetch it either. Ask the user what they need from the file, or re-send it ` +
+              `as an image, video or audio file.`
+            : ref
+              ? `The file itself is fine — call get_image with ${refClause(ref, text)} to save it to disk ` +
+                `and get a path a local tool can open, and tell the user their player did not appear.`
+              : `The file itself is fine; this tool never sends it to you either. Tell the user their ` +
+                `player did not appear.`,
+      });
+      continue;
+    }
+    const shownState = safePaint(painter, url, caption, note, name);
     if (shownState === "failed") {
       dropped.push({
         name,
@@ -367,8 +509,15 @@ export async function composeShowMediaReply(items, deps = {}) {
             `sampled-preview note below for what you can still do with it, and tell the user their ` +
             `player did not appear.`
           : (ref
-              ? `The file itself resolved fine, so re-sending it unchanged will not help. To see it ` +
-                `YOURSELF, call get_image with ${refClause(ref, text)} — it returns the image inline. `
+              ? `The file itself resolved fine, so re-sending it unchanged will not help. To ` +
+                (kind === "audio"
+                  ? // An audio file is NOT returned inline, so "it returns the
+                    // image inline" would promise the agent a perception it
+                    // cannot have.
+                    `get the file YOURSELF, call get_image with ${refClause(ref, text)} — audio is saved ` +
+                    `to disk rather than returned to you, so you get a path a local tool can open, and ` +
+                    `you still cannot hear it. `
+                  : `see it YOURSELF, call get_image with ${refClause(ref, text)} — it returns the image inline. `)
               : `The file itself resolved fine, so re-sending it unchanged will not help; this tool never ` +
                 `sends it to you either. Put it somewhere ComfyUI serves and call get_image on it if you ` +
                 `need to look at it. `) +
@@ -378,6 +527,13 @@ export async function composeShowMediaReply(items, deps = {}) {
       unconfirmed += 1;
     } else {
       painted += 1;
+      paintedByKind[kind] += 1;
+    }
+    // Audio that reached a painter — confirmed or not — gets its own disclosure.
+    // A player in the chat is the user's to hear and NOT the agent's, and that
+    // asymmetry is what an agent narrating a voice line gets wrong.
+    if (kind === "audio" && shownState !== "failed") {
+      audible.push({ name: name || "audio", ref, shown: shownState });
     }
     // A video's sampled preview needs only the URL — not the chat player — so a
     // painter failure must NOT also cost the agent its preview.
@@ -438,30 +594,107 @@ export async function composeShowMediaReply(items, deps = {}) {
   // The batch headline. It leads with the thing an agent most easily gets wrong
   // about this tool: panel_show_media paints for the HUMAN and returns text, so
   // nothing here was shown to the caller.
-  const shown =
-    painted === 1 ? "1 item was displayed" : `${painted} items were displayed`;
+  //
+  // Seen and heard are counted APART. "3 items were displayed" over a batch that
+  // was two pictures and a voice line is the same class of error as the broken
+  // <img> it replaces: it tells the agent something about the user's senses that
+  // did not happen.
+  const seen = paintedByKind.image + paintedByKind.video;
+  const heard = paintedByKind.audio;
+  const shown = seen === 1 ? "1 item was displayed" : `${seen} items were displayed`;
+  const players =
+    heard === 1 ? "1 audio player was placed" : `${heard} audio players were placed`;
+  const clauses = [];
+  // A batch that presented nothing still needs the "0 items were displayed"
+  // clause — the reply must state the outcome, not omit it.
+  if (seen > 0 || heard === 0) clauses.push(`${shown} to the USER in the panel chat`);
+  if (heard > 0) {
+    clauses.push(seen > 0 ? `${players} there too` : `${players} in the panel chat for the USER`);
+  }
   const headline =
-    `${shown} to the USER in the panel chat. You were NOT sent ` +
+    `${clauses.join(", and ")}. You were NOT sent ` +
     (painted === 1 ? "this file" : "these files") +
-    ` — this tool renders media for the person, not for you.`;
+    ` — this tool renders media for the person, not for you.` +
+    (heard > 0 ? ` You cannot hear the audio.` : "");
   noteSections.push(headline);
 
   if (dropped.length > 0) {
     noteSections.push(
       `${dropped.length} of the ${list.length} requested item(s) were NOT displayed, so the user ` +
-        `cannot see ${dropped.length === 1 ? "it" : "them"} either:\n` +
+        `cannot see or hear ${dropped.length === 1 ? "it" : "them"} either:\n` +
         dropped
           .map((d) => `• ${d.name || "(unnamed item)"} — ${d.why}. ${d.remedy}`)
           .join("\n"),
     );
   }
 
+  // Items of a kind this panel cannot present. Kept SEPARATE from both painted
+  // and dropped: the user got a link, which is real and actionable, and is also
+  // not a rendering. An agent that reads this must come away unable to say the
+  // person saw or heard the content.
+  if (unrenderable.length > 0) {
+    const kinds = [...new Set(unrenderable.map((u) => u.ext || "no extension"))].join(", ");
+    noteSections.push(
+      `${unrenderable.length} of the ${list.length} requested item(s) are of a kind the panel cannot ` +
+        `present (${kinds}) — the USER has NOT seen or heard the content, so do not tell them to look ` +
+        `at or listen to ${unrenderable.length === 1 ? "it" : "them"}:\n` +
+        unrenderable
+          .map((u) => {
+            const got =
+              u.shown === "link"
+                ? `An open/download LINK is in the chat, so the user can open it themselves.`
+                : u.shown === "unconfirmed"
+                  ? `Whether even a link reached the chat is UNKNOWN.`
+                  : `The panel could not put even a link in the chat, so the user got nothing at all.`;
+            return `• ${u.name || "(unnamed item)"} — ${u.why}. ${got} ${u.remedy}`;
+          })
+          .join("\n"),
+    );
+  }
+
+  // One disclosure per audio file. The video branch already learned this lesson
+  // the expensive way (#648): the agent must be told, in the same breath as the
+  // good news, exactly which observations it is NOT entitled to make.
+  //
+  // WHAT `painted` CLAIMS, EXACTLY. Every painter here is synchronous: it puts
+  // an element in the chat, and returns before the browser has fetched or
+  // decoded a single byte. So `painted` means "a player for it is in the chat",
+  // never "the bytes decoded" — the same limit the image and video branches have
+  // always had. Rather than pretend otherwise (a `canPlayType` probe answers
+  // about the TYPE, not about this file, and would still miss a corrupt or
+  // missing one), the disclosure says what was observed and hands the one check
+  // that actually settles it to the person who can hear the result. The video
+  // branch's remedy already ends the same way, deliberately.
+  for (const a of audible) {
+    const human =
+      a.shown === "unconfirmed"
+        ? `Whether its player reached the chat is UNKNOWN, so ask the user whether they can play it before ` +
+          `asking them about it.`
+        : `Its player is in the chat — that is a player, NOT proof the browser could decode the file, so ` +
+          `ask the user whether it actually plays before you rely on it (and how it sounds, if you need ` +
+          `to know).`;
+    const fetchIt = a.ref
+      ? `To get the file itself, call get_image with ${refClause(a.ref, text)} — audio is SAVED TO DISK ` +
+        `rather than returned to you inline, so what you get is a path a local tool can open (you still ` +
+        `cannot hear it). `
+      : `The panel has no ComfyUI reference for it, so there is nothing for you to re-fetch. `;
+    noteSections.push(
+      `🔊 ${a.name} — you were NOT sent this audio and there is no way for you to hear it, so do not ` +
+        `describe how it sounds, how long it is, or what is said in it. ` +
+        fetchIt +
+        human,
+    );
+  }
+
   if (unconfirmed > 0) {
     noteSections.push(
+      // "see or hear", because this count spans kinds: an audio player that did
+      // not settle is not something the user can SEE, and describing it that way
+      // is the same conflation the kind split exists to end (#710).
       `${unconfirmed} of the ${list.length} requested item(s) were handed to a painter that had not ` +
-        `finished when this reply was composed, so whether the user can see ` +
+        `finished when this reply was composed, so whether the user can see or hear ` +
         `${unconfirmed === 1 ? "it" : "them"} is UNKNOWN — do not assume ` +
-        `${unconfirmed === 1 ? "it was" : "they were"} displayed.`,
+        `${unconfirmed === 1 ? "it was" : "they were"} presented.`,
     );
   }
 
@@ -474,8 +707,19 @@ export async function composeShowMediaReply(items, deps = {}) {
   return {
     ok: true,
     count: list.length,
+    // Only what the person can SEE or HEAR. painted + unconfirmed +
+    // unrenderable.length + (dropped) === count, so a caller that reads nothing
+    // but the numbers still cannot mistake a link card for a rendering.
     painted,
     unconfirmed,
+    /** Structured twin of the note's unrenderable section, so the honesty does
+     *  not depend on an agent parsing prose (#710). */
+    unrenderable: unrenderable.map((u) => ({
+      name: u.name,
+      ext: u.ext,
+      kind: u.kind,
+      shown: u.shown,
+    })),
     previews,
     note: noteSections.join("\n\n"),
   };
