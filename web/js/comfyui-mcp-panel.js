@@ -20122,12 +20122,19 @@ function buildPanel() {
 
   /** The same question for AUDIO. The run-completion path had only the
    *  image-vs-video split, so an audio descriptor arriving there was painted as
-   *  an <img> — the #710 defect on a second surface. ComfyUI files audio under
-   *  its own `audio` output key, which this panel does not collect, so this is
-   *  reachable only when a node files audio under images/gifs/videos; the point
-   *  is that ONE kind decision now answers for every surface rather than two
-   *  that can drift. Audio is also kept out of the agent's inline delivery: an
-   *  audio file handed over as an inline IMAGE is a perception nobody had. */
+   *  an <img> — the #710 defect on a second surface. The point is that ONE kind
+   *  decision now answers for every surface rather than two that can drift.
+   *  Audio is also kept out of the agent's inline delivery: an audio file handed
+   *  over as an inline IMAGE is a perception nobody had.
+   *
+   *  DELIBERATELY NOT DONE HERE: collecting ComfyUI's own `audio` output key.
+   *  onExecuted reads images/gifs/videos only, so a SaveAudio render paints
+   *  nothing in chat today and reports nothing to the agent — that is silence,
+   *  not a false claim, so it is a missing feature on this surface rather than
+   *  the #710 honesty defect. Adding it changes what appears in chat after every
+   *  audio render and touches the completion-delivery lifecycle (#269/#468), so
+   *  it belongs in its own change. Until then this branch covers a descriptor
+   *  that arrives misfiled under one of the three collected keys. */
   function isAudioOutput(m) {
     const fmt = String(m?.format || "").toLowerCase();
     if (fmt.startsWith("audio/")) return true;
