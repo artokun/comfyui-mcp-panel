@@ -3624,6 +3624,9 @@ async function programmaticSave(name) {
     // — including a BOM a decoded-string compare would miss, codex P0).
     readDiskBytes: workflowDiskBytes,
     reconcileSavedCopy: reconcileSavedWorkflowCopy,
+    // #708 — the LIVE-CANVAS identity oracle. It licenses the pre-copy canvas flush
+    // and refuses a first save whose canvas provably belongs to another workflow.
+    canvasBinding: describeLiveCanvasBinding,
     details,
     expect: expectWf, // #330: refuse if the user switched tabs during our pre-save HEAD
   });
@@ -3838,6 +3841,55 @@ async function workflowDiskBytes(rawPath) {
   }
 }
 
+/** #708 — does the LIVE root canvas positively belong to `wf`?
+ *
+ *  ComfyUI keeps ONE root graph and ONE activeWorkflow pointer, and a reconnect's
+ *  own tab-restore can leave them disagreeing: the canvas holds workflow W while the
+ *  active tab is a different, brand-new N. ChangeTracker then serializes that canvas
+ *  into N's state, and a save that reads "the current canvas" writes W's graph into
+ *  N's brand-new file and reports success (the reported symptom: a `panel_new_workflow`
+ *  tab persisted as "Untitled …" holding the previous workflow's 12 nodes / 4 groups).
+ *
+ *  Answers with the SAME durable-identity pair the graph fences use — never a content
+ *  comparison, which cannot separate two tabs holding one workflow from a bound canvas
+ *  whose widgets drifted (#696/#701/#702/#663). The identity is resolved exactly as
+ *  assertGraphBoundToActiveWorkflow resolves it: the live object's own uuid first, and
+ *  `workflowStableUuid` (root-blind for an unseen object) only as the fallback — so the
+ *  stale `app.graph.extra` this is trying to DETECT can never supply the answer.
+ *
+ *  A bare tag MISMATCH is deliberately NOT enough to say "foreign". #545/#557 record
+ *  that a save-swap or a reconnect can drift the root stamp away from the active
+ *  workflow's currently-resolved identity while the root is still that workflow's OWN
+ *  canvas, which is why assertGraphBoundToActiveWorkflow does not hard-refuse on the
+ *  mismatch either — it asks whether the ACTIVE workflow ITSELF claims the tag (its own
+ *  serialized state carries it, or the owner registry ties it to that object) and
+ *  rebinds when it does. This borrows the guard's EVIDENCE RULE, not its remedy: it
+ *  performs no rebind, so a self-claimed drifted stamp stays on the root until a later
+ *  graph command heals it. That is the right split — a save has no business re-stamping
+ *  a canvas, and a tag the tab's own lineage claims is not a wrong-canvas condition in
+ *  the first place. Only a tag the workflow does NOT claim — a FOREIGN tab's, or a
+ *  closed tab's stranded canvas — is "foreign", which is the #349/#708 case.
+ *
+ *  "unknown" on every inconclusive read (no root/workflow, no resolvable identity, an
+ *  untagged root, or a throw): absence of a tag is not evidence, and every consumer
+ *  treats unknown as "change nothing". */
+function describeLiveCanvasBinding(wf) {
+  try {
+    const rootGraph = app?.graph;
+    if (!rootGraph || !wf || typeof wf !== "object") return "unknown";
+    const activeWorkflowUuid = workflowObjectUuid(wf) || workflowStableUuid(wf);
+    if (!activeWorkflowUuid) return "unknown";
+    if (graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid })) return "bound";
+    if (!graphRootWorkflowUuidMismatches({ rootGraph, activeWorkflowUuid })) return "unknown";
+    // A conflicting tag the workflow's own lineage CLAIMS is its own drifted stamp
+    // (#545/#557), not another tab's canvas — inconclusive, never a refusal.
+    const rootUuid = rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD];
+    return workflowOwnsRootUuidTag(wf, rootUuid) ? "unknown" : "foreign";
+  } catch {
+    return "unknown";
+  }
+}
+
 /** If the open workflow was never saved to disk, save it (no dialog) so the
  *  agent works from a grounded file. Best-effort. Returns the saved name or null. */
 async function groundUnsavedWorkflow() {
@@ -3851,6 +3903,9 @@ async function groundUnsavedWorkflow() {
       existsOnDisk: workflowExistsOnDisk,
       autoWorkflowName,
       reconcileSavedCopy: reconcileSavedWorkflowCopy,
+      // #708 — grounding is the save that CREATES the "Untitled …" file, so it is the
+      // one that must not write a canvas belonging to a different workflow into it.
+      canvasBinding: describeLiveCanvasBinding,
     });
   } catch {
     return null; // best-effort — never block the chat on a save hiccup
@@ -10741,13 +10796,26 @@ const GRAPH_TOOL_EXECUTORS = {
     //
     // Best-effort: a stamp failure leaves the pre-existing guard behavior, never
     // a broken creation.
+    //
+    // #708 — ONE proof, TWO consequences. The same both-sides-proven-empty test that
+    // licenses the stamp is also the only evidence this command has that the tab it is
+    // about to call "a brand-new BLANK workflow" is actually blank, so it decides the
+    // ACKNOWLEDGEMENT too (below) rather than being computed twice and drifting apart.
+    // Evaluated BEFORE the stamp and in its own try/catch: a stamp that throws is
+    // identity bookkeeping failing, not evidence that the tab has content.
+    let provenEmpty = false;
     try {
       const rootGraph = app?.graph;
-      if (rootGraph && graphRootProvenEmpty(rootGraph) && activeWorkflowProvenEmpty(wf)) {
-        stampGraphRootWorkflowUuid(rootGraph, newWorkflowUuid, wf);
-      }
+      provenEmpty = !!rootGraph && graphRootProvenEmpty(rootGraph) && activeWorkflowProvenEmpty(wf);
     } catch {
-      // Identity bookkeeping must never break workflow creation.
+      provenEmpty = false; // an unreadable proof is not a proof
+    }
+    if (provenEmpty) {
+      try {
+        stampGraphRootWorkflowUuid(app?.graph, newWorkflowUuid, wf);
+      } catch {
+        // Identity bookkeeping must never break workflow creation.
+      }
     }
     // #433: an explicit new-tab authoritatively re-points `active` — record it
     // against the epoch we STARTED on, but only if no reconnect intervened during
@@ -10768,7 +10836,37 @@ const GRAPH_TOOL_EXECUTORS = {
     });
     // `key`/`routing_key` are the unique handle the agent should pass to
     // panel_set_workflow_target so its session pins to this exact graph.
-    return { created: true, active: getWorkflowTitle(), key, routing_key: key, open_seq: receipt.seq };
+    const identity = { active: getWorkflowTitle(), key, routing_key: key, open_seq: receipt.seq };
+    // #708 — DO NOT CLAIM "blank" WITHOUT PROVING IT. The tab and its routing identity
+    // are real either way (the receipt above records that), but `created:true` on a tool
+    // whose whole contract is "a brand-new BLANK workflow" is read as "you have an empty
+    // canvas" — and the agent's next move is to BUILD on it. The reported failure is
+    // exactly that: the acknowledgement said blank, a reconnect's tab-restore left the
+    // previous dirty workflow's graph in the new tab, and the agent went on adding nodes
+    // to a copy of someone else's 12-node work with nothing to warn it.
+    //
+    // So when the frontend cannot PROVE zero content on both sides, report the outcome as
+    // UNKNOWN rather than success. "I could not confirm this tab is empty" costs one
+    // panel_graph_outline; "created:true" costs the user's workflow. This is the same
+    // never-fabricate-a-success rule the open receipts (#402) already follow, and the
+    // note carries the two facts an agent needs to act correctly: VERIFY before building,
+    // and do NOT retry (workflow_new is not idempotent — a retry adds a second blank tab).
+    if (!provenEmpty) {
+      return {
+        created: "unknown",
+        empty: "unknown",
+        ...identity,
+        note:
+          "workflow_new: the new tab was created and is ACTIVE, but the frontend could not prove " +
+          "it holds zero nodes — so this is NOT a confirmed blank canvas. Call panel_graph_outline " +
+          "on this tab BEFORE adding anything; if it already has nodes they belong to another " +
+          "workflow (a reconnect/tab-restore can leave the previously active graph on the shared " +
+          "canvas — issue #708), so open the workflow you actually want instead of building here. " +
+          "Do NOT call panel_new_workflow again — it is not idempotent, and a second call leaves a " +
+          "SECOND blank tab behind.",
+      };
+    }
+    return { created: true, empty: true, ...identity };
   },
 
   async workflow_open({ path, rid }) {
