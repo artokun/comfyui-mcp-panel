@@ -223,6 +223,10 @@ import {
   unavailableRequiredWidgetMessage,
   unavailableRequiredWidgetReport,
 } from "./lib/node-widget-materialization.js";
+import {
+  describeUnmaterializedRequiredWidgets,
+  snapshotBackendDef,
+} from "./lib/add-node-widget-guard.js";
 import { sameGraphMutationContext } from "./lib/graph-mutation-context.js";
 import { isImeComposing } from "./lib/ime.js";
 import { installGraphToPromptNullSafety } from "./lib/widget-null-safety.js";
@@ -8335,17 +8339,29 @@ const GRAPH_TOOL_EXECUTORS = {
     // guarded, and inputs the backend added since page load are still seen.
     // `undefined` when the type is a frontend-only exemption (no backend def
     // exists), which falls back to scanning the registered node data.
+    //
+    // #700: it is a SNAPSHOT, taken the instant the payload lands, and NOT a reference
+    // into freshDefs. `refresh` below hands that same map to app.registerNodesFromDefs,
+    // which passes every def STRAIGHT to the extensions' beforeRegisterNodeDef — and
+    // ComfyUI's own Comfy.UploadImage hook mutates it in place, adding an `upload` input
+    // the backend never declared whose only possible widget is canvas-only. Read back
+    // afterwards, "the backend's current truth" would require a prompt value that no
+    // backend ever asked for, and the guard below would refuse every image/video/audio
+    // upload loader whose class the refresh had just registered.
     let freshDefs = null;
+    let currentDef;
     await assertAddNodeResolvableRefreshing(() => LG?.registered_node_types ?? {}, class_type, {
-      getFreshObjectInfo: async () =>
-        (freshDefs = recordObjectInfoTypes(
+      getFreshObjectInfo: async () => {
+        freshDefs = recordObjectInfoTypes(
           typeof api?.getNodeDefs === "function" ? await api.getNodeDefs() : null,
-        )),
+        );
+        currentDef = snapshotBackendDef(freshDefs, class_type);
+        return freshDefs;
+      },
       refresh: (defs) => refreshComfyNodeDefs(defs),
       // #458 OBSERVED-BACKEND-HISTORY trust root, identical to graph_set_widget's.
       wasTypeEverDefined: (t) => objectInfoHistory.wasTypeEverDefined(t),
     });
-    const currentDef = freshDefs?.[class_type] ?? undefined;
     const nodeData = LG?.registered_node_types?.[class_type]?.nodeData;
     // A pack upgraded mid-session can add required inputs to an ALREADY
     // registered class; the resolver only refreshes absent classes, so
@@ -8388,11 +8404,11 @@ const GRAPH_TOOL_EXECUTORS = {
       currentDef,
     );
     if (missingWidgets.length) {
-      throw new Error(
-        `Required custom widget${missingWidgets.length === 1 ? "" : "s"} ` +
-          `${missingWidgets.map((name) => `"${name}"`).join(", ")} did not initialize for ` +
-          `"${class_type}". Reload ComfyUI so its node extension can register, then retry.`,
-      );
+      // #700: report the condition that ACTUALLY held. The old wording asserted the
+      // extension had failed to register — which awaitRequiredCustomWidgetRegistration
+      // above had just disproven — and sent the reporter looking there for ~90 tool
+      // calls while the widget in question was sitting on the node the whole time.
+      throw new Error(describeUnmaterializedRequiredWidgets(class_type, node, missingWidgets));
     }
     // LG.createNode built this from the REGISTERED nodeData, which is refreshed only for
     // ABSENT classes — so a pack upgraded mid-session leaves the node holding the OLD
