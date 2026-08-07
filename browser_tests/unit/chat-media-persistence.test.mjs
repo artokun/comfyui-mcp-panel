@@ -102,6 +102,20 @@ test("data: / blob: / whitespace-prefixed data: urls are NEVER persisted (#177 P
   assert.equal(mediaRecordFor("image", "file:///etc/passwd", "x"), null, "file: rejected");
 });
 
+test("audio and unpresentable-file cards keep their own kind across a reload (#710)", () => {
+  // A card that persists under the wrong kind replays under the wrong painter,
+  // which is the broken-<img> defect reappearing one refresh later.
+  const audio = mediaRecordFor("audio", "/view?filename=vo.mp3&type=output", "line 1");
+  assert.ok(audio);
+  assert.equal(audio.mkind, "audio");
+  const file = mediaRecordFor("file", "/view?filename=scene.blend&type=output", "scene");
+  assert.ok(file);
+  assert.equal(file.mkind, "file");
+  // Anything this panel does not know stays an image — the only kind every
+  // already-stored record can be.
+  assert.equal(mediaRecordFor("hologram", "/view?filename=x.png", "x").mkind, "image");
+});
+
 test("replay never re-records -> reload preserves media count (#177)", () => {
   // The replay guard: paintThread() repaints stored media with replaying=true,
   // which must yield NO new record (otherwise every reload would duplicate it).

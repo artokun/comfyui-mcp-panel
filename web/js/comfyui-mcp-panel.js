@@ -15869,6 +15869,19 @@ const PANEL_CSS = `
 }
 .cmcp-imgcard:hover .cmcp-media-expand, .cmcp-media-expand:focus-visible { opacity: 1; }
 .cmcp-media-expand:hover { background: var(--p-primary-color, #3a7bd5); }
+/* Audio cards (#710) — a real <audio controls> player, and a link card for a
+   kind the panel can neither draw nor play. Neither is a .cmcp-imgcard: the
+   lightbox gallery collects those and renders every member as image/video. */
+.cmcp-audiocard audio { width: 100%; display: block; }
+.cmcp-filecard {
+  border: 1px solid var(--p-content-border-color, #3f3f46); border-radius: 6px;
+  padding: 0.5rem 0.6rem; background: var(--p-surface-800, #27272a);
+}
+.cmcp-file-open {
+  color: var(--p-primary-color, #60a5fa); text-decoration: none; font-size: 0.8rem;
+  word-break: break-all;
+}
+.cmcp-file-open:hover { text-decoration: underline; }
 /* Agent text flows freely — no card/bubble. Only user messages are boxed. */
 .cmcp-bubble.agent {
   align-self: stretch; max-width: 100%;
@@ -20027,6 +20040,75 @@ function buildPanel() {
     recordMedia("video", url, name);
   }
 
+  // An audio card is a real PLAYER, not a picture (#710). Audio used to fall
+  // through to paintImage — a ComfyUI /view ref can name anything on disk, so a
+  // .mp3 became an <img src="…mp3">, i.e. a broken-image icon with a caption
+  // under it, while panel_show_media still reported a full success.
+  //
+  // TWO THINGS THIS CARD DELIBERATELY DOES NOT DO:
+  //  - it is NOT a .cmcp-imgcard and carries NO _cmcpMedia. The chat lightbox
+  //    gathers every .cmcp-imgcard and renders each as an image or a video, so
+  //    an audio card in that gallery is the same broken <img> arriving by a
+  //    different route.
+  //  - it does not autoplay. A picture appearing is silent; sound starting on
+  //    its own is not, and the user asked to be shown a file, not played at.
+  function paintAudio(url, name) {
+    // Coerce the caption at the painter boundary — see paintImage (#276).
+    name = name == null ? name : coerceMessageText(name);
+    clearEmpty();
+    const card = document.createElement("div");
+    card.className = "cmcp-bubble agent cmcp-audiocard";
+    const audio = document.createElement("audio");
+    audio.controls = true;
+    audio.preload = "metadata";
+    audio.src = url;
+    audio.style.cssText = "width:100%;display:block;";
+    card.appendChild(audio);
+    if (name) {
+      const cap = document.createElement("div");
+      cap.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
+      cap.textContent = name;
+      card.appendChild(cap);
+    }
+    log.appendChild(card);
+    scrollLog();
+    // Persist servable audio so it survives reload / thread switch, AS AUDIO —
+    // a card stored as an image replays through paintImage next reload (#710).
+    recordMedia("audio", url, name);
+  }
+
+  // The last resort for a kind this panel can neither draw nor play (#710): a
+  // link the person can actually open. It is deliberately NOT a media card —
+  // no .cmcp-imgcard, no <img> — because the point is that nothing was
+  // rendered. panel_show_media reports these separately from `painted`, so the
+  // agent never learns that the user saw or heard something they did not.
+  function paintFileLink(url, name) {
+    // Coerce the caption at the painter boundary — see paintImage (#276).
+    name = name == null ? name : coerceMessageText(name);
+    clearEmpty();
+    const card = document.createElement("div");
+    card.className = "cmcp-bubble agent cmcp-filecard";
+    const a = document.createElement("a");
+    a.href = url;
+    a.className = "cmcp-file-open";
+    // A new tab, so a click never navigates the panel (and ComfyUI) away. The
+    // download hint makes the browser save rather than try to display a file it
+    // has no viewer for; a cross-origin URL ignores it and simply opens, which
+    // is the same outcome from the user's side.
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    if (name) a.download = name;
+    a.textContent = name || "Open file";
+    card.appendChild(a);
+    const hint = document.createElement("div");
+    hint.style.cssText = "font-size:0.625rem;color:var(--p-text-muted-color,#a1a1aa);margin-top:0.25rem;";
+    hint.textContent = "The panel can't preview this file type — open or download it.";
+    card.appendChild(hint);
+    log.appendChild(card);
+    scrollLog();
+    recordMedia("file", url, name);
+  }
+
   /** Decide whether a ComfyUI output descriptor is a VIDEO (render <video>) vs an
    *  image (<img>). ComfyUI groups video outputs under `gifs`/`videos` and tags
    *  them with a `format` like "video/h264-mp4" (vs "image/gif" for animated gifs,
@@ -20845,7 +20927,13 @@ function buildPanel() {
         if (m.role === "user") paintUser(m.text, { attachments: m.attachments, workflowVersion: m.workflowVersion });
         else if (m.role === "agent") paintAgent(m.text);
         else if (m.role === "media") {
+          // The kind decision has to be repeated here, or a reload replays an
+          // audio card through paintImage and the broken <img> is back (#710).
+          // Unrecognized kinds stay images: every record written before audio
+          // existed is one.
           if (m.mkind === "video") paintVideo(m.url, m.caption);
+          else if (m.mkind === "audio") paintAudio(m.url, m.caption);
+          else if (m.mkind === "file") paintFileLink(m.url, m.caption);
           else paintImage(m.url, m.caption);
         } else if (m.role === "card") {
           if (m.kind === "a2ui") paintA2UIRecord(m);
@@ -21858,8 +21946,8 @@ function buildPanel() {
     onTodo(items) {
       renderTodo(items);
     },
-    // The agent called panel_show_media — render images/videos directly in the
-    // chat AND answer the agent honestly about what it was handed (#648).
+    // The agent called panel_show_media — render images/videos/audio directly in
+    // the chat AND answer the agent honestly about what it was handed (#648).
     //
     // This used to paint and return nothing, so the tool replied {ok:true} to an
     // agent that had been shown nothing. For a video that reads as "I have seen
@@ -21867,10 +21955,16 @@ function buildPanel() {
     // impossible". composeShowMediaReply paints exactly as before and then routes
     // every video through the panel's EXISTING storyboard pipeline — bounded, and
     // disclosed as a sample rather than as the video.
+    //
+    // #710 widened the same principle to KIND: a painter per kind (audio plays,
+    // an unpresentable kind gets a link), and an item the panel cannot present
+    // is reported apart from `painted` instead of counted as a success.
     onShowMedia(items) {
       return composeShowMediaReply(items, {
         paintImage,
         paintVideo,
+        paintAudio,
+        paintFileLink,
         imageViewUrl,
         coerceMessageText,
         buildVideoStoryboard,
