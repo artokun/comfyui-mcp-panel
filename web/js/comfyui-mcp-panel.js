@@ -6979,6 +6979,15 @@ function describePreflightUndo(unrestored) {
 }
 
 /** Compact JSON-friendly view of a group box. */
+/** Is `g` still one of this graph's groups? The removal APIs differ across frontend
+ *  builds (`removeGroup`, the node-oriented `remove`, or a raw list), so a removal is
+ *  only ever confirmed by looking. Identity comparison, not a title/id match: two
+ *  groups can share a title, and a stale id would resolve to whatever took its place. */
+function groupStillPresent(graph, g) {
+  const list = Array.isArray(graph?._groups) ? graph._groups : graph?.groups;
+  return Array.isArray(list) ? list.includes(g) : false;
+}
+
 function summarizeGroup(graph, g) {
   const b = g._bounding ?? [g.pos?.[0] ?? 0, g.pos?.[1] ?? 0, g.size?.[0] ?? 0, g.size?.[1] ?? 0];
   const memberIds = groupMemberNodes(graph, g).map((n) => n.id);
@@ -12672,16 +12681,35 @@ const GRAPH_TOOL_EXECUTORS = {
     // were ACTUALLY inside the box, not a stale cached set.
     syncGraphNodeAreas(graph);
     const summary = summarizeGroup(graph, g);
+    // Try each removal path and VERIFY after each, rather than assuming the first
+    // available one worked. The chain used to be `else if`: on a frontend without
+    // `removeGroup` — but with the standard `graph.remove`, which LiteGraph defines
+    // for NODES — it called `remove(g)`, never reached the splice, and reported the
+    // group removed while it was still on the canvas. Reporting a removal that did
+    // not happen is the same class as #232/#635/#710: a result the caller cannot
+    // distinguish from success.
     graph.beforeChange();
     try {
       if (typeof graph.removeGroup === "function") graph.removeGroup(g);
-      else if (typeof graph.remove === "function") graph.remove(g);
-      else {
-        const i = (graph._groups ?? []).indexOf(g);
-        if (i >= 0) graph._groups.splice(i, 1);
+      if (groupStillPresent(graph, g) && typeof graph.remove === "function") graph.remove(g);
+      if (groupStillPresent(graph, g)) {
+        const list = Array.isArray(graph._groups) ? graph._groups : graph.groups;
+        const i = Array.isArray(list) ? list.indexOf(g) : -1;
+        if (i >= 0) list.splice(i, 1);
       }
     } finally {
       graph.afterChange();
+    }
+    // Never report a removal that cannot be observed. A group the panel could not
+    // remove stays on the user's canvas, and a caller told otherwise will build on
+    // a layout that does not exist.
+    if (groupStillPresent(graph, g)) {
+      throw new Error(
+        `Group ${group_id} ("${summary?.title ?? ""}") is STILL on the canvas after every ` +
+          `removal path this frontend exposes was tried. Nothing is being reported as removed. ` +
+          `Delete it from the ComfyUI canvas directly, or report the frontend version — the ` +
+          `panel could not find a working group-removal API.`,
+      );
     }
     graph.setDirtyCanvas(true, true);
     return { removed: summary };
