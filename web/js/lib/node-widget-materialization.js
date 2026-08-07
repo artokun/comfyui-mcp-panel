@@ -164,12 +164,24 @@ export function unavailableRequiredWidgetReport(
     if (typeof widgetConstructors?.[type] === "function") continue;
     const members = declaredTypeMembers(type);
     if (!members.length) continue;
-    if (members.every((member) => SAFE_SOCKET_TYPES.has(member))) continue;
-    // Every member is a datatype the CURRENT backend declares as some node's output (or
-    // is a built-in socket), so no widget constructor is ever going to appear for it.
+    // Every member is a datatype no widget constructor will ever appear for: a built-in
+    // connection type, or one the CURRENT backend declares as some node's output.
     const linkProven = members.every(
       (member) => SAFE_SOCKET_TYPES.has(member) || knownSocketTypes?.has?.(member) === true,
     );
+    // A SINGLE built-in connection datatype is waived on the type alone. Unchanged from
+    // before this fix, and sound for the same reason it was then: ComfyUI registers no
+    // widget constructor for any of them, so there is nothing an input-level declaration
+    // could be asking this to wait for.
+    if (members.length === 1 && SAFE_SOCKET_TYPES.has(type)) continue;
+    // A UNION does NOT get that shortcut, even when every member is a built-in. Members
+    // being link datatypes is not the input being a link: a pack can declare
+    // ("IMAGE,MASK", {widgetType: "IMAGE", default: …}) — the exact shape LTXV already
+    // uses for ("FLOAT,INT", {widgetType: "FLOAT", default, min, max}) — and that is a
+    // widget which ACCEPTS those links, not a socket. Only the input's own declaration
+    // settles it, so a union must clear the input-level bar below as well. (Found by the
+    // codex gate: waiving an all-built-in union on the type alone was a #580 false
+    // accept, adding a node with neither a widget value nor a link.)
     // #626 P0: "some node OUTPUTS this type" does NOT establish that THIS input is
     // link-only. ComfyUI's frontend supports converting widget inputs to links, so a
     // widget-bearing input is link-compatible too — INT and a custom ACME_VALUE are

@@ -755,3 +755,47 @@ test("#695: graph_add_node consumes the report and message, and names the class"
     "the class_type reaches the message",
   );
 });
+
+test("#695 gate r1: an all-built-in UNION that declares a widget value still fails closed", () => {
+  // Members being built-in link datatypes is not the INPUT being a link. A pack can
+  // declare ("IMAGE,MASK", {widgetType, default}) — the shape LTXV already uses for
+  // ("FLOAT,INT", …) — which is a widget that ACCEPTS those links. Waiving it on the
+  // member types alone added a node with neither a widget value nor a link (#580).
+  const def = {
+    input: { required: { source: ["IMAGE,MASK", { widgetType: "IMAGE", default: "none" }] } },
+  };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(def, {}, new Set(), def), ["IMAGE,MASK"]);
+  // It is reported as the link-proven case, because that is what it is: the datatypes are
+  // real link types, and the INPUT is nonetheless asking for a value.
+  assert.deepEqual(unavailableRequiredWidgetReport(def, {}, new Set(), def), [
+    { type: "IMAGE,MASK", inputs: ["source"], linkProven: true },
+  ]);
+  // …and it clears once the constructor registers under the union's own key.
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(def, { "IMAGE,MASK": () => {} }, new Set(), def),
+    [],
+  );
+  // A SINGLE built-in keeps its type-only shortcut, exactly as before this fix: no widget
+  // constructor exists for MASK, so there is nothing for the input to be waiting on.
+  const single = { input: { required: { mask: ["MASK", { default: "none" }] } } };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(single, {}, new Set(), single), []);
+});
+
+test("#695 gate r1: the type list is deduped and first-seen ordered, as it always was", () => {
+  // requiredWidgetInputTypes has always returned [...new Set(...)], so the Map-based
+  // rewrite must not start emitting one entry per input.
+  const def = {
+    input: {
+      required: {
+        first: ["ACME", { default: 1 }],
+        other: ["ZED", { default: 2 }],
+        second: ["ACME", { default: 3 }],
+      },
+    },
+  };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(def, {}, new Set(), def), ["ACME", "ZED"]);
+  assert.deepEqual(unavailableRequiredWidgetReport(def, {}, new Set(), def), [
+    { type: "ACME", inputs: ["first", "second"], linkProven: false },
+    { type: "ZED", inputs: ["other"], linkProven: false },
+  ]);
+});
