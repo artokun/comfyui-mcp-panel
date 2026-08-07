@@ -282,11 +282,16 @@ test("the owner-less rule is PROVENANCE: record()'s mint is lastMintedThreadId's
   //   1. every assignment to it is either record()'s mint or onTurn's reset;
   //   2. the mint assignment really is inside record(), in the branch that creates
   //      the thread.
-  const writes = [...panelSrc.matchAll(/lastMintedThreadId = ([^;]+);/g)].map((m) => m[1].trim());
+  // Match ANY assignment form, not just `=` — a later `lastMintedThreadId ||=
+  // replacement.id` in a rebind path would otherwise slip past this enumeration
+  // and let a conversation nobody minted vouch for itself. `(?!=)` keeps `==`,
+  // `===` and `!==` comparisons out.
+  const writes = [...panelSrc.matchAll(/lastMintedThreadId\s*(?:\|\||\?\?|&&|[+\-*/%])?=(?!=)([^;]*);/g)]
+    .map((m) => m[1].trim());
   assert.deepEqual(
     writes.sort(),
     ["null", "null", "thread.id"],
-    "exactly one mint write plus the declaration and the turn-start reset",
+    "exactly one mint write plus the declaration and the turn-start reset — in any assignment form",
   );
 
   const record = panelFunctionBody("record");
@@ -315,10 +320,16 @@ test("the owner-less rule is PROVENANCE: record()'s mint is lastMintedThreadId's
     "record() assigns lastMintedThreadId exactly once",
   );
 
-  const onTurnWorking = onTurnSrc.slice(0, onTurnSrc.indexOf('state === "done"'));
+  // Scope the reset pin to the INSIDE of the "working" branch — a reset hoisted
+  // above the branch would also fire on `done`, which is a different (and weaker)
+  // meaning for the marker than "since this turn began".
+  const workingOpen = onTurnSrc.indexOf('if (state === "working") {');
+  const workingClose = onTurnSrc.indexOf('} else if (state === "done")');
+  assert.ok(workingOpen > -1 && workingClose > workingOpen, "onTurn's working branch is where expected");
+  const workingBranch = onTurnSrc.slice(workingOpen, workingClose);
   assert.ok(
-    /lastMintedThreadId = null;/.test(onTurnWorking),
-    "onTurn('working') resets it, so it always describes the turn now running",
+    /lastMintedThreadId = null;/.test(workingBranch),
+    "onTurn('working') resets it INSIDE its own branch, so it always describes the turn now running",
   );
   // record() must NOT retroactively adopt the minted thread as the turn OWNER —
   // if it did, #381's liveTurnThreadId semantics would change under it and this
