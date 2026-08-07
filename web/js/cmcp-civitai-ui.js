@@ -297,6 +297,14 @@ export function civitaiErrorState(e) {
     status,
     message: coerceMessageText(e?.message ?? e),
     ...(typeof e?.kind === "string" ? { kind: e.kind } : {}),
+    // #705: the upstream body's OWN words (already bounded, flattened and
+    // credential-redacted by describeUpstreamFailure) and whether retrying can
+    // help. The agent being able to report "CivitAI's model search is
+    // overloaded — retry shortly" instead of "503" is the point of the issue;
+    // both keys are omitted when absent so a transport/empty failure keeps its
+    // existing shape and cannot be read as a claim about the upstream.
+    ...(typeof e?.detail === "string" && e.detail ? { detail: e.detail } : {}),
+    ...(typeof e?.retryable === "boolean" ? { retryable: e.retryable } : {}),
   };
 }
 
