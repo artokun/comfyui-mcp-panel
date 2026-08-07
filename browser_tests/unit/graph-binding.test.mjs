@@ -23,6 +23,7 @@ import {
   graphReadDesynced,
   graphRootMidPopulation,
   graphRootMismatchesActiveWorkflow,
+  graphRootContentDriftOnBoundCanvas,
   graphRootProvenEmpty,
   graphRootWorkflowUuidMismatches,
   graphRootWorkflowUuidMatches,
@@ -694,6 +695,322 @@ test("graphRootMismatchesActiveWorkflow: FALSE - initialState is a baseline, not
     }),
     false,
   );
+});
+
+// ── #696/#663/#701/#702 — CONTENT DRIFT ON A POSITIVELY-BOUND CANVAS ─────────
+//
+// The shape guard compares the live root's FULL serialized node content against
+// ChangeTracker's `activeState` and treats ANY difference as "the canvas is bound
+// to a different graph". That inference does not hold, and the panel's own source
+// says why: ComfyUI's ChangeTracker "snapshots on USER input events only" (the
+// comment on the post-command `deferChangeTrackerSnapshot` wiring). So a widget a
+// node rewrites WITHOUT user input — Impact-Pack's ImpactWildcardEncode in
+// `populate` mode, `control_after_generate`, an rgthree mode toggle, any
+// `loadedGraphNode` hook — drifts the live root away from `activeState` while the
+// tab still reads `isModified: false`. The tab is clean, the canvas is the right
+// canvas, and every graph read and write is refused.
+//
+// It is also SELF-REINFORCING, which is what turned it into "the remedy does not
+// remedy" (#701/#702): the tracker is only re-captured after a command SUCCEEDS,
+// and `workflow_open`'s repaint re-runs the very hook that rewrites the widget, so
+// its own content proof fails, its tracker re-baseline is skipped, and the next
+// read fails identically. Nothing short of a page reload breaks the loop.
+//
+// The fix is the EVIDENCE, not the verdict: a content difference is only proof of
+// a WRONG CANVAS when it is STRUCTURAL. A difference confined to per-node mutable
+// content, on a root that POSITIVELY carries this workflow's identity, is drift on
+// the right canvas.
+const driftFixture = ({
+  uuid = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
+  rootUuid = uuid,
+  drift = (nodes) => {
+    nodes[1].widgets_values[1] = "a sorceress"; // the populate rewrite
+    nodes[2].widgets_values[0] = 124; // control_after_generate bumped the seed
+  },
+  mutateLive = () => {},
+} = {}) => {
+  const trackerState = {
+    nodes: [
+      { id: 1, type: "CheckpointLoaderSimple", widgets_values: ["anime.safetensors"] },
+      { id: 2, type: "ImpactWildcardEncode", widgets_values: ["__character__", "a knight"] },
+      { id: 3, type: "KSampler", widgets_values: [123, "fixed", 20] },
+    ],
+    links: [[1, 1, 0, 3, 0, "MODEL"]],
+    groups: [{ title: "sampling", bounding: [0, 0, 10, 10] }],
+  };
+  const liveSerialized = structuredClone(trackerState);
+  drift(liveSerialized.nodes, liveSerialized);
+  mutateLive(liveSerialized);
+  const rootGraph = {
+    _nodes: liveSerialized.nodes.map(({ id, type }) => ({ id, type })),
+    serialize: () => liveSerialized,
+    ...(rootUuid ? { extra: { comfyui_mcp: { workflow_uuid: rootUuid } } } : {}),
+  };
+  return {
+    rootGraph,
+    activeWorkflowUuid: uuid,
+    activeWorkflow: wf({ isModified: false, changeTracker: { activeState: trackerState } }),
+  };
+};
+
+const driftVerdict = (fixture, over = {}) =>
+  resolveGraphBindingVerdict({
+    graph: fixture.rootGraph,
+    rootGraph: fixture.rootGraph,
+    activeWorkflow: fixture.activeWorkflow,
+    activeWorkflowUuid: fixture.activeWorkflowUuid,
+    liveNodeCount: fixture.rootGraph._nodes.length,
+    includeBaselineReadGuard: true,
+    requireDirtyMutationBinding: true,
+    ...over,
+  });
+
+test("#696: a widget a node rewrote itself is NOT a wrong canvas — the bound root is permitted", () => {
+  const fixture = driftFixture();
+  assert.equal(
+    graphRootMismatchesActiveWorkflow({ rootGraph: fixture.rootGraph, activeWorkflow: fixture.activeWorkflow }),
+    true,
+    "the raw content comparator still reports the difference — that is its job",
+  );
+  assert.equal(
+    graphRootContentDriftOnBoundCanvas(fixture),
+    true,
+    "…but with the workflow's identity on the root and every structural surface equal, " +
+      "the difference is drift on the RIGHT canvas, not evidence of another one",
+  );
+  assert.equal(
+    driftVerdict(fixture),
+    null,
+    "a read AND a mutation on a positively-identified canvas whose only drift is widget " +
+      "content must not be refused (#696)",
+  );
+});
+
+test("#696: the relaxation needs POSITIVE identity — an untagged root is still refused", () => {
+  // Absence of the tag is absence of proof, and the whole relaxation rests on it:
+  // without the tag, byte-identical structure cannot tell the active tab's canvas
+  // from a duplicate tab's. Fail closed, exactly as before.
+  const fixture = driftFixture({ rootUuid: null });
+  assert.equal(graphRootContentDriftOnBoundCanvas(fixture), false);
+  assert.equal(driftVerdict(fixture)?.reason, "root-shape-mismatch");
+});
+
+test("#696: a STRUCTURAL difference on a tagged root is still a refusal, in every surface", () => {
+  // The direction that must NOT be softened. Each of these is a real wrong-canvas
+  // signature; the identity tag is present in all of them, so only the structural
+  // comparison can hold the line.
+  const cases = {
+    "a node type changed": (nodes) => {
+      nodes[0].type = "UNETLoader";
+    },
+    "a node id changed": (nodes) => {
+      nodes[0].id = 99;
+    },
+    "a node was removed": (nodes, state) => {
+      state.nodes = nodes.slice(1);
+    },
+    "the links differ": (nodes, state) => {
+      state.links = [];
+    },
+    "a group differs": (nodes, state) => {
+      state.groups = [{ title: "OTHER", bounding: [0, 0, 10, 10] }];
+    },
+    "a reroute appeared": (nodes, state) => {
+      state.reroutes = [{ id: "r1", pos: [1, 2] }];
+    },
+    "a top-level subgraph appeared": (nodes, state) => {
+      state.subgraphs = [{ id: "s1", nodes: [{ id: 7, type: "SaveImage" }] }];
+    },
+  };
+  for (const [label, drift] of Object.entries(cases)) {
+    const fixture = driftFixture({ drift });
+    assert.equal(
+      graphRootContentDriftOnBoundCanvas(fixture),
+      false,
+      `${label} is STRUCTURAL — it must never be waved through as content drift`,
+    );
+    assert.ok(driftVerdict(fixture), `${label} must still be refused`);
+  }
+});
+
+test("#696: a CONFLICTING identity tag still refuses ahead of any content reasoning", () => {
+  const fixture = driftFixture({ rootUuid: "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb" });
+  assert.equal(
+    graphRootContentDriftOnBoundCanvas(fixture),
+    false,
+    "the relaxation demands a MATCH, and a foreign tag is the #349 wrong-canvas case",
+  );
+  assert.equal(driftVerdict(fixture, { rootUuidMismatch: true })?.reason, "root-workflow-uuid-mismatch");
+});
+
+test("#618: a mid-restore canvas is count-short, so the relaxation cannot mask it", () => {
+  const fixture = driftFixture({
+    drift: (nodes, state) => {
+      state.nodes = nodes.slice(0, 1); // still restoring: 1 of 3
+    },
+  });
+  fixture.rootGraph._nodes = [{ id: 1, type: "CheckpointLoaderSimple" }];
+  assert.equal(graphRootContentDriftOnBoundCanvas(fixture), false);
+  assert.equal(driftVerdict(fixture, { postReconnectWindow: true })?.reason, "root-mid-population");
+});
+
+test("#696: an unreadable root serializer stays inconclusive rather than relaxing", () => {
+  const fixture = driftFixture();
+  const blind = {
+    ...fixture,
+    rootGraph: {
+      _nodes: fixture.rootGraph._nodes,
+      extra: fixture.rootGraph.extra,
+      serialize: () => {
+        throw new Error("serializer unavailable");
+      },
+    },
+  };
+  assert.equal(
+    graphRootContentDriftOnBoundCanvas(blind),
+    false,
+    "a structural comparison that could not RUN is not a structural match",
+  );
+
+  // The subtler direction: BOTH sides unreadable. Two failed reads must not
+  // collapse into "equal" — that is `graphRootMatchesState`'s original sin
+  // (one return value doing two jobs) reappearing inside the relaxation, and it
+  // would permit on a canvas nothing ever managed to look at.
+  const uuid = fixture.activeWorkflowUuid;
+  const tagged = (serialize) => ({
+    _nodes: [{ id: 1, type: "KSampler" }],
+    extra: { comfyui_mcp: { workflow_uuid: uuid } },
+    serialize,
+  });
+  assert.equal(
+    graphRootContentDriftOnBoundCanvas({
+      rootGraph: tagged(() => ({})),
+      activeWorkflow: wf({ isModified: false, changeTracker: {} }),
+      activeWorkflowUuid: uuid,
+    }),
+    false,
+    "no tracker state and no serialized nodes is two absences, not a match",
+  );
+  assert.equal(
+    graphRootContentDriftOnBoundCanvas({
+      rootGraph: tagged(() => ({ nodes: [{ id: 1 }] })),
+      activeWorkflow: wf({ isModified: false, changeTracker: { activeState: { nodes: [{ id: 1 }] } } }),
+      activeWorkflowUuid: uuid,
+    }),
+    false,
+    "nodes with no usable type cannot be structurally compared on EITHER side (older frontends), " +
+      "and an uncomparable pair must not read as identical",
+  );
+
+  assert.equal(graphRootContentDriftOnBoundCanvas(), false, "no arguments ⇒ no relaxation");
+  assert.equal(graphRootContentDriftOnBoundCanvas({}), false);
+});
+
+test("#701/#702: the refusal reports the LIVE count and only claims 'a different graph' when it is one", () => {
+  // Three reports read "the workflow reports N node(s), but the canvas is bound to
+  // a different graph" / "left this command pointed at the wrong canvas" and went
+  // hunting a wrong-tab bug. The counts were EQUAL in all of them — the message
+  // never printed the live one, and asserted a conclusion the evidence (one widget
+  // value) did not support. BOTH claims are unmeasured, so both must go.
+  const contentOnly = graphBindingRefusalMessage({ reason: "root-shape-mismatch", expected: 23, live: 23 });
+  assert.match(contentOnly, /^\[root-shape-mismatch\]/);
+  assert.match(contentOnly, /23/, "the counts the verdict measured must appear");
+  assert.doesNotMatch(
+    contentOnly,
+    /bound to a different graph/,
+    "equal counts + a content difference is NOT proof of a different graph",
+  );
+  assert.doesNotMatch(
+    contentOnly,
+    /pointed at the wrong canvas/,
+    "…and neither is it proof that a load/switch/reconnect mis-pointed the command",
+  );
+  assert.match(contentOnly, /cannot tell/, "an unresolved ambiguity must be disclosed as one");
+
+  const reallyDifferent = graphBindingRefusalMessage({ reason: "root-shape-mismatch", expected: 23, live: 4 });
+  assert.match(reallyDifferent, /23/);
+  assert.match(reallyDifferent, /\b4\b/, "the LIVE count is the reader's only way to tell the two apart");
+  assert.match(reallyDifferent, /holds a graph other than/, "a real size disagreement may still say so");
+  // …but even THERE the event is offered as an explanation, never asserted: the
+  // predicate measured a mismatch, it did not watch a load/switch/reconnect happen.
+  assert.match(reallyDifferent, /observed the mismatch, not the event/);
+  assert.doesNotMatch(reallyDifferent, /reconnect left this command pointed at the wrong canvas, so/);
+
+  // An absent live count is an UNMEASURED one: it must not become a claim either way.
+  const unmeasured = graphBindingRefusalMessage({ reason: "root-node-count-desync", expected: 3 });
+  assert.match(unmeasured, /the workflow reports 3 node\(s\)/);
+  assert.doesNotMatch(
+    unmeasured,
+    /bound to a different graph|pointed at the wrong canvas/,
+    "a live count nobody measured cannot support a different-graph claim",
+  );
+});
+
+test("#701: a structure-matching refusal names the remedy that actually supplies the missing proof", () => {
+  // The one refusal whose remedy is guaranteed to help, and the reason to
+  // distinguish it: the canvas IS structurally this workflow and the only thing
+  // absent is the identity stamp — which panel_open_workflow writes. Saying so is
+  // the difference between an actionable refusal and the one the reporters got,
+  // whose named remedy re-created the same drift and failed identically forever.
+  const msg = graphBindingRefusalMessage({
+    reason: "root-shape-mismatch",
+    expected: 23,
+    live: 23,
+    structureMatches: true,
+  });
+  assert.match(msg, /^\[root-shape-mismatch\]/);
+  assert.match(msg, /STRUCTURE/, "the disclosure must say what DID match");
+  assert.match(msg, /panel_open_workflow/);
+  assert.match(msg, /identity/, "…and why that remedy is the one that can clear it");
+  assert.doesNotMatch(msg, /pointed at the wrong canvas/);
+  assert.match(msg, /NOT applied/);
+  // The #606 promises survive the new branch — and extend to the OPEN, which is
+  // no more observable than the reload: workflow_open can run and still fail to
+  // prove its rebind, so neither "it will clear this" nor its contrapositive
+  // ("still refusing ⇒ the difference is more than content") may be stated.
+  assert.match(msg, /panel_reload/);
+  assert.match(msg, /REQUESTED, NOT CONFIRMED/);
+  assert.match(msg, /cannot observe/);
+  assert.doesNotMatch(msg, /which (restores|rebinds|re-?establishes|rebuilds)|reload always/i);
+  assert.doesNotMatch(
+    msg,
+    /after that a content-only difference no longer refuses|the difference is NOT content-only/,
+    "an unprovable rebind must not be reported as a completed one, in either direction",
+  );
+  assert.match(msg, /do NOT read that as proof/, "the invalid inference is named and refused");
+  assert.match(msg, /panel_set_workflow_target is NOT a remedy/);
+
+  // A structure match is NOT claimable when the sizes disagree — the two cannot
+  // both be true, and the size evidence is the stronger one.
+  const conflicting = graphBindingRefusalMessage({
+    reason: "root-shape-mismatch",
+    expected: 23,
+    live: 4,
+    structureMatches: true,
+  });
+  assert.match(conflicting, /different graph/);
+  assert.doesNotMatch(conflicting, /reproduces this workflow's STRUCTURE/);
+});
+
+test("#701: the verdict carries the structural answer, positively — never from an unread comparison", () => {
+  const fixture = driftFixture({ rootUuid: null }); // structure equal, identity unproven
+  const verdict = driftVerdict(fixture);
+  assert.equal(verdict.reason, "root-shape-mismatch");
+  assert.equal(verdict.structureMatches, true, "the structural comparison RAN and matched");
+
+  const structural = driftFixture({ rootUuid: null, drift: (nodes) => void (nodes[0].type = "UNETLoader") });
+  assert.equal(driftVerdict(structural).structureMatches, false);
+
+  // Unreadable ⇒ false ("unestablished"), never true.
+  const blind = driftFixture({ rootUuid: null });
+  blind.rootGraph = {
+    _nodes: blind.rootGraph._nodes,
+    serialize: () => {
+      throw new Error("serializer unavailable");
+    },
+  };
+  const blindVerdict = driftVerdict(blind);
+  if (blindVerdict) assert.equal(blindVerdict.structureMatches, false);
 });
 
 test("#545: a DIRTY workflow's tracker state may lag legitimate canvas edits, so it is never a binding refusal", () => {
@@ -2927,6 +3244,16 @@ test("#606 refusal message: uuid-mismatch names the identity tag, not a 0-node d
   assert.match(msg, /NOT applied/);
   assert.match(msg, /panel_open_workflow/);
   assert.match(msg, /panel_reload/);
+  // …and it states the OBSERVATION, not a cause nobody watched happen. The
+  // predicate saw two tags disagree; "a load, tab switch, or reconnect left a
+  // stale tag behind" was one guess presented as the finding — the same defect
+  // the shape branch's wrong-canvas sentence had (codex gate, r2 P2).
+  assert.match(msg, /observed is the disagreement itself, not what produced it/);
+  assert.doesNotMatch(
+    msg,
+    /reconnect left a stale tag behind, so/,
+    "the usual explanation may be offered as one — never asserted as what happened",
+  );
 });
 
 test("#606 refusal message: a 0-expected shape mismatch drops the node-count clause", () => {
