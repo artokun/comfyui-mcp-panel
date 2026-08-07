@@ -175,3 +175,80 @@ test("mixed-representation ids (0 and '0') dedupe to one after normalization (#3
   const b = buildQueueAcceptResult({ batchCount: 3, promptIds: [7, "7", 8] });
   assert.deepEqual(b.prompt_ids, ["7", "8"]);
 });
+
+// ── #699: "Prompt has no outputs" on a run-to-node ────────────────────────
+//
+// panel_run({to_node_id:30}) was refused with a bare "Prompt has no outputs"
+// for a node panel_query_graph reported as is_output:true. Passing that string
+// through reads as "your output node is not an output node" and gives an agent
+// nothing to act on — the reporter's only way forward was to guess.
+//
+// The disagreement is real and lives in ComfyUI: /object_info sets output_node
+// with `OUTPUT_NODE == True` (equality) while execution.py selects outputs with
+// `OUTPUT_NODE is True` (identity). `1 == True` but `1 is not True`, so a pack
+// setting OUTPUT_NODE = 1 is advertised as an output and refused at execution.
+// The panel cannot see that in advance — the JSON is already a boolean — so the
+// only honest place to say it is after the backend has disagreed.
+
+const NO_OUTPUTS = { error: { type: "prompt_no_outputs", message: "Prompt has no outputs" } };
+
+test("#699 a run-to-node no-outputs refusal explains the disagreement", () => {
+  const r = summarizePromptRejection({
+    rejection: NO_OUTPUTS,
+    runToNode: { nodeId: 30, nodeType: "PixaromaSaveImage" },
+  });
+  assert.equal(r.queued, false);
+  assert.equal(r.error_type, "prompt_no_outputs");
+  // The backend's own words are preserved, not replaced.
+  assert.match(r.error, /Prompt has no outputs/);
+  // …and the target is named, so it is clearly not a bad node id.
+  assert.match(r.error, /node 30 \(PixaromaSaveImage\)/);
+  assert.match(r.error, /DISAGREEMENT/);
+  // Both known causes, neither asserted as the verdict.
+  assert.match(r.error, /muted or bypassed/);
+  assert.match(r.error, /EQUALS True without BEING True/);
+  // The remedy the reporter actually found working.
+  assert.match(r.error, /omit to_node_id/);
+});
+
+test("#699 a FULL run's no-outputs message is left alone", () => {
+  // Without a target, "no outputs" is simply true — the workflow has none — and
+  // appending a run-to-node explanation would be noise on a correct message.
+  const r = summarizePromptRejection({ rejection: NO_OUTPUTS });
+  assert.equal(r.error, "Prompt has no outputs");
+});
+
+test("#699 other rejection types are never annotated, even under run-to-node", () => {
+  // The hint is specific to an outputs disagreement. Attaching it to an unrelated
+  // failure would mislead in a new direction.
+  const r = summarizePromptRejection({
+    rejection: { error: { type: "missing_node_type", message: "Node 'X' not found." } },
+    runToNode: { nodeId: 30, nodeType: "PixaromaSaveImage" },
+  });
+  assert.equal(r.error, "Node 'X' not found.");
+  assert.ok(!/DISAGREEMENT/.test(r.error));
+});
+
+test("#699 an accepted prompt stays accepted with a run-to-node target", () => {
+  assert.equal(summarizePromptRejection({ rejection: null, runToNode: { nodeId: 30 } }), null);
+});
+
+test("#699 a missing node TYPE still produces a usable hint", () => {
+  const r = summarizePromptRejection({ rejection: NO_OUTPUTS, runToNode: { nodeId: "7:2" } });
+  assert.match(r.error, /node 7:2, which ComfyUI/);
+});
+
+test("WIRING: graph_run passes the run-to-node target into the summary", async () => {
+  // The tests above prove the hint is right; none prove it is REACHED. graph_run
+  // is a method on a module-private handler map in the monolith and the queue path
+  // needs a live app, so the callable seam does not exist — pin the wiring.
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  // Captured out of the resolve block…
+  assert.ok(src.includes("runToNodeInfo = { nodeId: to_node_id, nodeType: res.node?.type };"),
+    "the resolved target must be captured for the rejection summary");
+  // …and actually handed to the summary. Without this line #699 reports the bare
+  // backend string again with every test above still green.
+  assert.ok(src.includes("runToNode: runToNodeInfo,"),
+    "summarizePromptRejection must receive the run-to-node target");
+});

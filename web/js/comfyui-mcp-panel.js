@@ -9896,6 +9896,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // Stays undefined for a normal full run (byte-identical to the prior behaviour;
     // a root-level target yields String(id), the same value as before).
     let partialTargets;
+    // #699 — carried out of the resolve block so the queue-rejection summary can
+    // explain a `prompt_no_outputs` refusal of a target the panel already verified
+    // advertises output_node:true. Null for a full run.
+    let runToNodeInfo = null;
     if (to_node_id != null) {
       // Resolve the run-to-node target in the CURRENT viewing scope first (the reporter
       // added / is targeting the output node INSIDE the subgraph they are viewing —
@@ -9933,6 +9937,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // Colon path for a nested node ("10:15:359") / first-level ("76:34"), or
       // String(id) at root.
       partialTargets = [res.execId];
+      runToNodeInfo = { nodeId: to_node_id, nodeType: res.node?.type };
     }
 
     // app.queuePrompt(number, batchCount, queueNodeIds | QueuePromptOptions) —
@@ -10137,6 +10142,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const rejection = summarizePromptRejection({
       rejection: promptRejection,
       lastNodeErrors: app.lastNodeErrors,
+      runToNode: runToNodeInfo,
     });
     if (rejection) return rejection;
     // Surface the queued prompt_id(s) so the agent can correlate/track the run —
