@@ -1,23 +1,16 @@
 import { test, expect } from './fixtures/panelTest'
 import { resolveHistoryStoreModuleUrl } from './fixtures/historyStoreModule'
+import { routeWorktreeSource } from './fixtures/worktreeSource'
 
 const THREADS_KEY = 'comfyui-mcp.panel.threads'
 const META_KEY = 'comfyui-mcp.panel.historyMeta'
 
-async function forceWorkflowScope(page: import('@playwright/test').Page) {
-  await page.evaluate(() => {
-    const w = window as any
-    const app = w.comfyAPI?.app?.app || w.app
-    const settings = app.ui.settings
-    if (!w.__cmcpOriginalGetSettingValue) {
-      w.__cmcpOriginalGetSettingValue = settings.getSettingValue.bind(settings)
-    }
-    settings.getSettingValue = (id: string) =>
-      id === 'comfyui-mcp.chatScope'
-        ? 'workflow'
-        : w.__cmcpOriginalGetSettingValue(id)
-  })
-}
+test.beforeEach(async ({ context }) => {
+  await routeWorktreeSource(context)
+})
+
+// mcp#884: the workflow/ask chat scopes are retired — chatScopeMode() is
+// hard-wired to "panel". Every spec here runs the one shipping mode.
 
 async function indexedThreadCount(page: import('@playwright/test').Page): Promise<number> {
   return page.evaluate(async () => {
@@ -242,6 +235,9 @@ test('groups duplicate workflow titles by UUID and never resumes a foreign provi
   stopCapture()
 })
 
+// Panel scope keeps workflow PROVENANCE on every thread (archive grouping),
+// and the unsaved-workflow durability path (#570) still stamps the stable
+// per-instance UUID into graph.extra — silently, never via a dirty flag.
 test('embeds a stable workflow UUID and records provider/model workflow snapshots', async ({
   page,
   panel,
@@ -251,8 +247,6 @@ test('embeds a stable workflow UUID and records provider/model workflow snapshot
   await panel.setBridgeUrl(mockBridge.url)
   await panel.openSidebar()
   await panel.connect()
-
-  await forceWorkflowScope(page)
 
   const received = mockBridge.waitForUserMessage()
   await panel.sendMessage('workflow identity test')
@@ -289,98 +283,93 @@ test('embeds a stable workflow UUID and records provider/model workflow snapshot
   expect(state.versions?.[state.messageVersion]?.nodeCount).toBeGreaterThanOrEqual(0)
 })
 
-test('workflow scope disables foreign chats and never restores a stale foreign pointer', async ({
+// mcp#884 (P0-2): a cold upgrade from a build that still had the workflow/ask
+// scopes can leave a STALE panel:global pointer behind — the user switched to
+// workflow mode long ago and kept conversing in per-workflow threads. With the
+// tab-local pointer gone (browser restart) the hard-wired panel restoration
+// must recover the conversation the user is actually in, not repaint the
+// months-old pointer target over it.
+test('a stale pre-upgrade panel pointer never restores over the current conversation', async ({
   page,
-  panel,
-  mockBridge
+  panel
 }) => {
+  const staleAt = Date.now() - 45 * 24 * 60 * 60 * 1000
+  const freshAt = Date.now() - 60 * 1000
+  await page.addInitScript(({ threadsKey, metaKey, staleAt, freshAt }) => {
+    // Pre-#884 storage shape: an old panel-mode thread whose panel:global
+    // pointer was last stamped months ago, plus the per-workflow conversation
+    // the user actually kept using after switching the (now removed) setting.
+    localStorage.setItem(threadsKey, JSON.stringify([
+      {
+        id: 'stale-panel-thread',
+        createdAt: staleAt,
+        updatedAt: staleAt,
+        ts: staleAt,
+        workflowKey: 'panel:global',
+        msgs: [{
+          id: 'stale-panel-message',
+          role: 'user',
+          text: 'an old conversation from months ago',
+          createdAt: staleAt
+        }]
+      },
+      {
+        id: 'current-workflow-thread',
+        createdAt: freshAt,
+        updatedAt: freshAt,
+        ts: freshAt,
+        workflowKey: 'workflow:wf-current',
+        workflowTitle: 'Current Workflow',
+        msgs: [{
+          id: 'current-workflow-message',
+          role: 'user',
+          text: 'the conversation I am actually in',
+          createdAt: freshAt
+        }]
+      }
+    ]))
+    // The retired workflow mode stamped a workflow-scoped selection op on
+    // every thread creation/open, so a real pre-upgrade snapshot carries the
+    // newer workflow selection alongside the abandoned panel pointer.
+    localStorage.setItem(metaKey, JSON.stringify({
+      updatedAt: freshAt,
+      activeByScope: {
+        'panel:global': 'stale-panel-thread',
+        'workflow:wf-current': 'current-workflow-thread'
+      },
+      activeOps: {
+        'panel:global': {
+          value: 'stale-panel-thread',
+          deleted: false,
+          updatedAt: staleAt + 1,
+          revision: { updatedAt: staleAt + 1, writerId: 'old-build', sequence: 1 }
+        },
+        'workflow:wf-current': {
+          value: 'current-workflow-thread',
+          deleted: false,
+          updatedAt: freshAt,
+          revision: { updatedAt: freshAt, writerId: 'old-build', sequence: 2 }
+        }
+      }
+    }))
+  }, { threadsKey: THREADS_KEY, metaKey: META_KEY, staleAt, freshAt })
+
   await panel.goto()
-  await panel.setBridgeUrl(mockBridge.url)
   await panel.openSidebar()
-  await panel.connect()
 
-  await forceWorkflowScope(page)
+  // The stale pointer loses to the newer conversation activity.
+  await expect(panel.userBubble('the conversation I am actually in')).toBeVisible()
+  await expect(panel.userBubble('an old conversation from months ago')).toHaveCount(0)
 
-  const received = mockBridge.waitForUserMessage()
-  await panel.sendMessage('belongs only to workflow A')
-  await received
-
-  await expect.poll(() => page.evaluate((key) => {
-    const threads = JSON.parse(localStorage.getItem(key) || '[]')
-    return threads.find((thread: any) =>
-      thread.msgs?.some((m: any) => m.text === 'belongs only to workflow A'))?.workflowKey
-  }, THREADS_KEY)).toMatch(/^workflow:/)
-  const current = await page.evaluate((key) => {
-    const threads = JSON.parse(localStorage.getItem(key) || '[]')
-    return threads.find((thread: any) =>
-      thread.msgs?.some((m: any) => m.text === 'belongs only to workflow A'))
-  }, THREADS_KEY)
-  expect(current?.workflowKey).toMatch(/^workflow:/)
-
-  const storeModuleUrl = await resolveHistoryStoreModuleUrl(page)
-  await page.evaluate(async ({
-    currentThread,
-    currentWorkflowKey,
-    storeModuleUrl
-  }) => {
-    const { ChatHistoryStore } = await import(storeModuleUrl)
-    const foreignStore = new ChatHistoryStore({ writerId: 'foreign-archive-test' })
-    const canonical = await foreignStore.readCanonical()
-    const foreignThread = {
-      id: 'foreign-thread',
-      schemaVersion: 2,
-      createdAt: Date.now() + 10,
-      updatedAt: Date.now() + 10,
-      ts: Date.now() + 10,
-      workflowKey: 'workflow:definitely-another-workflow',
-      workflowTitle: 'Workflow B',
-      msgs: [{ id: 'foreign-message', role: 'user', text: 'must never appear on workflow A', createdAt: Date.now() + 10 }]
-    }
-    const meta = canonical.meta || {}
-    meta.activeByScope = {
-      ...(meta.activeByScope || {}),
-      [currentWorkflowKey]: currentThread,
-      'workflow:definitely-another-workflow': 'foreign-thread'
-    }
-    foreignStore.persist([...(canonical.threads || []), foreignThread], meta)
-    const result = await foreignStore.flush()
-    if (result !== true && result?.ok !== true) {
-      throw new Error(`foreign archive seed failed: ${JSON.stringify(result)}`)
-    }
-    foreignStore.close()
-    sessionStorage.setItem('comfyui-mcp.panel.currentThreadId', 'foreign-thread')
-  }, {
-    currentThread: current.id,
-    currentWorkflowKey: current.workflowKey,
-    storeModuleUrl
-  })
-
+  // The old panel-era chat is still an ordinary archive entry — visible and
+  // OPENABLE (panel scope has no foreign-workflow lockout), and opening it is
+  // a deliberate selection that repaints it.
   await panel.root.locator('button[title="Chat history"]').click()
-  let currentOnly = panel.root.getByTestId('history-current-workflow')
-  await currentOnly.uncheck()
-  let foreignRow = panel.root.locator('.cmcp-hist-row').filter({ hasText: 'must never appear on workflow A' })
-  await expect(foreignRow).toBeVisible()
-  await expect(foreignRow.locator('.cmcp-hist-open')).toBeDisabled()
-  await expect(foreignRow.locator('.cmcp-hist-open')).toHaveAttribute('title', /open workflow b/i)
-  await panel.root.locator('button[title="Chat history"]').click()
-
-  await page.evaluate(() => sessionStorage.clear())
-
-  await page.reload()
-  await panel.openSidebar()
-  // The hermetic fixture intentionally discards panel-setting writes at the
-  // HTTP boundary, so re-apply the user's persisted workflow mode after reload.
-  await forceWorkflowScope(page)
-  // The fixture's canvas is intentionally unsaved, so a full browser restart
-  // creates a fresh workflow UUID and a clean view. Crucially, the stale pointer
-  // from Workflow B is never used as a fallback.
-  await expect(panel.userBubble('must never appear on workflow A')).toHaveCount(0)
-
-  await panel.root.locator('button[title="Chat history"]').click()
-  currentOnly = panel.root.getByTestId('history-current-workflow')
-  await currentOnly.uncheck()
-  foreignRow = panel.root.locator('.cmcp-hist-row').filter({ hasText: 'must never appear on workflow A' })
-  await expect(foreignRow).toBeVisible()
-  await expect(foreignRow.locator('.cmcp-hist-open')).toBeDisabled()
-  await expect(foreignRow.locator('.cmcp-hist-open')).toHaveAttribute('title', /open workflow b/i)
+  const staleRow = panel.root
+    .locator('.cmcp-hist-row')
+    .filter({ hasText: 'an old conversation from months ago' })
+  await expect(staleRow).toBeVisible()
+  await expect(staleRow.locator('.cmcp-hist-open')).toBeEnabled()
+  await staleRow.locator('.cmcp-hist-open').click()
+  await expect(panel.userBubble('an old conversation from months ago')).toBeVisible()
 })

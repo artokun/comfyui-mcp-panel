@@ -5,11 +5,48 @@ messages each) with a versioned, workflow-aware history system.
 
 ## Conversation scope
 
-Settings → ComfyUI MCP Agent → General → **Chat conversation scope**:
+The conversation is always **panel-owned**: one conversation per backend that
+spans every browser tab and every workflow. The agent session behind it is
+orchestrator-scoped (comfyui-mcp#897) and persists in `~/.comfyui-mcp/sessions`,
+so switching, saving, renaming, or creating workflows — or moving between tabs —
+never swaps or resets the chat.
 
-- **Panel** keeps one conversation while canvases change.
-- **Workflow** keeps an independent collection of conversations for every graph.
-- **Ask** chooses between those behaviors whenever the active workflow changes.
+The former "Chat conversation scope" setting (**Panel** / **Workflow** / **Ask**)
+was removed in comfyui-mcp#884: the workflow and ask modes were per-workflow
+sessions under another name, which contradicts the orchestrator-global session.
+Stored values of the old setting are ignored, and conversations created under
+the retired modes remain in history as ordinary archive entries, openable from
+any workflow.
+
+Which conversation is *the* conversation is shared state, not tab state: the
+**backend-scoped** active pointer `panel:backend:<id>` in history metadata
+(one conversation per backend, mirroring the orchestrator's
+`orchestrator::<backend>` session key; the pre-existing shared `panel:global`
+key remains a one-way read fallback until a backend's key is first written).
+Every tab resolves its own backend's pointer through one selector
+(`selectPanelThread`/`resolvePanelPointer`) — on cold restore and on cross-tab
+sync alike — and a tab whose selection moved adopts the new thread passively
+(it repaints; only the tab the user acted in sends
+`resume_session`/`new_session`).
+
+**The commit is the transition:** an acting tab dispatches the session frame
+first and publishes the pointer only when the frame actually left its socket —
+a disconnected tab can still read an archive locally, but cannot move the
+other tabs onto a conversation the backend never entered.
+
+**Selection evidence only:** a pointer left stale by a pre-#884 build loses to
+a *newer selection* (the retired workflow mode stamped workflow-scoped active
+ops on every thread creation/open), never to mere message timestamps — an
+imported archive, a straggler write, or a skewed clock carries newer messages
+without any user selection and must not move the shared conversation.
+
+**Turn ownership:** a turn's owner is pinned when its `user_message` is
+dispatched (not at `turn:working`), and every transcript output — says, stream
+deltas, plan updates, question cards, media, A2UI cards, command activity —
+is fenced against a conversation the turn does not own. The prompt itself is
+filed at dispatch time too: if the selection moves while attachments upload or
+grounding runs, the recorded prompt is relocated (tombstoned + re-recorded)
+into the conversation that will actually consume it.
 
 The plus button starts a new conversation without deleting older chats. The
 history button opens search, current-workflow filtering, rename, pin, delete,
@@ -19,9 +56,10 @@ export, and merge-import controls.
 
 Bridge routing uses `wf:<tab>:<path>`/`tmp:<uuid>` (the saved form is tab-scoped
 since #640, so two browser tabs on one file register distinct routes) because the
-orchestrator binds agents to the current tab. Transcript identity is separate:
-`workflow:<embedded UUID>`. The UUID is stored in
-`workflow.extra.comfyui_mcp.workflow_uuid` on the first per-workflow chat.
+orchestrator binds agents to the current tab. Workflow identity is separate:
+`workflow:<UUID>`, stored in `workflow.extra.comfyui_mcp.workflow_uuid` by the
+unsaved-workflow durability path (#570). Threads carry that key as ride-along
+**provenance** for archive grouping — it does not scope the conversation.
 
 Renaming therefore preserves history. Opening a copied graph as another workflow
 detects the repeated UUID and gives the copy a fresh identity. A path→UUID alias

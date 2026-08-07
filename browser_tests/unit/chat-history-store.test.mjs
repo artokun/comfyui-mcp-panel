@@ -9,6 +9,7 @@ import {
   isThreadInScope,
   mergeHistorySnapshots,
   normalizeThread,
+  resolvePanelPointer,
   retainBoundedThreads,
   selectPanelThread,
   parseHistoryImport,
@@ -1074,13 +1075,240 @@ test('panel selection preserves provenance and recovers when its tab pointer is 
   assert.equal(threads[0].workflowKey, 'wf:workflows/a.json')
 })
 
-test('reload keeps the tab-pointed panel conversation instead of switching to a newer thread', () => {
+// mcp#884 upgrade guard: a build that still had the workflow/ask scopes could
+// leave the panel:global pointer behind and keep SELECTING per-workflow
+// threads (the retired mode stamped a workflow-scoped active op on every
+// thread creation and open). On upgrade the newest SELECTION wins — message
+// timestamps are deliberately not evidence (gate P0-3: imports, straggler
+// writes, and skewed clocks carry newer messages without any user selection).
+test('a stale panel pointer loses to a newer retired-mode selection, never to mere messages', () => {
+  const threads = [
+    {
+      id: 'stale-panel-thread',
+      workflowKey: 'panel:global',
+      updatedAt: 1_000,
+      msgs: [{ id: 'old-msg', role: 'user', text: 'months ago', createdAt: 1_000 }]
+    },
+    {
+      id: 'current-workflow-thread',
+      workflowKey: 'workflow:wf-current',
+      updatedAt: 9_000,
+      msgs: [{ id: 'new-msg', role: 'user', text: 'this week', createdAt: 9_000 }]
+    }
+  ]
+  const stalePanelPointer = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:global',
+    'stale-panel-thread',
+    { updatedAt: 1_001, writerId: 'old-build', sequence: 1 }
+  )
+
+  // The retired workflow mode recorded its selection as a workflow-scoped op —
+  // newer than the abandoned panel pointer, so it wins.
+  const withWorkflowSelection = updateMetadataEntry(
+    stalePanelPointer,
+    'activeByScope',
+    'workflow:wf-current',
+    'current-workflow-thread',
+    { updatedAt: 8_000, writerId: 'old-build', sequence: 2 }
+  )
+  assert.equal(selectPanelThread(threads, withWorkflowSelection)?.id, 'current-workflow-thread')
+
+  // Same result when the panel op was compacted into the checkpoint baseline
+  // (value survives, its revision does not).
+  const compactedPanelValue = {
+    activeByScope: {
+      'panel:global': 'stale-panel-thread',
+      'workflow:wf-current': 'current-workflow-thread'
+    },
+    activeOps: withWorkflowSelection.activeOps && Object.fromEntries(
+      Object.entries(withWorkflowSelection.activeOps)
+        .filter(([key]) => key !== 'panel:global')
+    )
+  }
+  assert.equal(selectPanelThread(threads, compactedPanelValue)?.id, 'current-workflow-thread')
+
+  // A panel pointer stamped AFTER the workflow selection (the user returned to
+  // panel mode / opened a chat from the archive) is the latest selection and
+  // sticks.
+  const returnedToPanel = updateMetadataEntry(
+    withWorkflowSelection,
+    'activeByScope',
+    'panel:global',
+    'stale-panel-thread',
+    { updatedAt: 9_500, writerId: 'archive-open', sequence: 3 }
+  )
+  assert.equal(selectPanelThread(threads, returnedToPanel)?.id, 'stale-panel-thread')
+
+  // Gate P0-3: newer MESSAGES without any selection op (an imported archive
+  // keeps its original createdAt; a straggler write lands without a pointer
+  // move) never steal the selection.
+  assert.equal(selectPanelThread(threads, stalePanelPointer)?.id, 'stale-panel-thread')
+
+  // A retired-mode op whose target no longer exists is not evidence either.
+  const danglingWorkflowSelection = updateMetadataEntry(
+    stalePanelPointer,
+    'activeByScope',
+    'workflow:wf-gone',
+    'deleted-thread',
+    { updatedAt: 8_000, writerId: 'old-build', sequence: 2 }
+  )
+  assert.equal(selectPanelThread(threads, danglingWorkflowSelection)?.id, 'stale-panel-thread')
+})
+
+// Gate P0-2: the selection pointer is BACKEND-scoped (one conversation per
+// backend, mirroring the orchestrator's orchestrator::<backend> session key).
+test('panel selection is backend-scoped with a one-way legacy fallback', () => {
+  const threads = [
+    { id: 'claude-thread', updatedAt: 100, msgs: [] },
+    { id: 'codex-thread', updatedAt: 200, msgs: [] },
+    { id: 'legacy-thread', updatedAt: 50, msgs: [] }
+  ]
+  let meta = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:backend:claude',
+    'claude-thread',
+    { updatedAt: 1_000, writerId: 'claude-tab', sequence: 1 }
+  )
+  meta = updateMetadataEntry(
+    meta,
+    'activeByScope',
+    'panel:backend:codex',
+    'codex-thread',
+    { updatedAt: 2_000, writerId: 'codex-tab', sequence: 1 }
+  )
+
+  // Each backend resolves its own conversation; the other backend's newer
+  // selection is not evidence for this one.
+  assert.equal(
+    selectPanelThread(threads, meta, { scopeKey: 'panel:backend:claude' })?.id,
+    'claude-thread'
+  )
+  assert.equal(
+    selectPanelThread(threads, meta, { scopeKey: 'panel:backend:codex' })?.id,
+    'codex-thread'
+  )
+
+  // A backend key never written falls back to the legacy shared pointer...
+  const legacyOnly = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:global',
+    'legacy-thread',
+    { updatedAt: 500, writerId: 'pre-upgrade', sequence: 1 }
+  )
+  assert.equal(resolvePanelPointer(legacyOnly, 'panel:backend:claude').activeId, 'legacy-thread')
+  assert.equal(
+    selectPanelThread(threads, legacyOnly, { scopeKey: 'panel:backend:claude' })?.id,
+    'legacy-thread'
+  )
+
+  // ...but a written backend key (including a deliberate CLEAR) never falls
+  // back: migration is one-way per backend.
+  const cleared = updateMetadataEntry(
+    legacyOnly,
+    'activeByScope',
+    'panel:backend:claude',
+    null,
+    { updatedAt: 1_500, writerId: 'claude-tab', sequence: 2 }
+  )
+  const clearedPointer = resolvePanelPointer(cleared, 'panel:backend:claude')
+  assert.equal(clearedPointer.activeId, null)
+  assert.equal(clearedPointer.cleared, true)
+  assert.equal(selectPanelThread(threads, cleared, { scopeKey: 'panel:backend:claude' }), null)
+  // The legacy pointer still serves OTHER backends that never migrated.
+  assert.equal(
+    selectPanelThread(threads, cleared, { scopeKey: 'panel:backend:codex' })?.id,
+    'legacy-thread'
+  )
+})
+
+test('metadata-only edits on an archived chat never steal the panel selection', () => {
+  // Rename/pin bump thread.updatedAt without new messages; grooming the archive
+  // must not hijack the conversation every tab is in.
+  const threads = [
+    {
+      id: 'active-conversation',
+      workflowKey: 'workflow:wf-a',
+      updatedAt: 5_000,
+      msgs: [{ id: 'live-msg', role: 'user', text: 'live', createdAt: 5_000 }]
+    },
+    {
+      id: 'renamed-archive',
+      workflowKey: 'workflow:wf-b',
+      updatedAt: 9_999,
+      title: 'freshly renamed',
+      msgs: [{ id: 'archived-msg', role: 'user', text: 'archived', createdAt: 100 }]
+    }
+  ]
+  const meta = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:global',
+    'active-conversation',
+    { updatedAt: 4_000, writerId: 'writer', sequence: 1 }
+  )
+
+  assert.equal(selectPanelThread(threads, meta)?.id, 'active-conversation')
+})
+
+// mcp#884/#897: with the agent session orchestrator-global, the SHARED pointer
+// is authoritative on reload — a tab preference only bridges legacy snapshots
+// that predate the shared pointer.
+test('reload keeps the tab-pointed panel conversation only until a shared pointer exists', () => {
   const threads = [
     { id: 'visible', workflowKey: 'workflow:wf-a', updatedAt: 100, msgs: [] },
     { id: 'newer-background', workflowKey: 'workflow:wf-b', updatedAt: 999, msgs: [] }
   ]
 
+  // Legacy snapshot (no panel:global pointer): the tab pointer is the only
+  // record of what this tab had open, so honor it.
   assert.equal(selectRestoreThread(threads, {}, {
+    panelOwned: true,
+    preferredThreadId: 'visible'
+  })?.id, 'visible')
+
+  // Shared pointer present: every tab must restore the same conversation the
+  // orchestrator's single session is in, tab preference notwithstanding.
+  const shared = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:global',
+    'newer-background',
+    { updatedAt: 2_000, writerId: 'other-tab', sequence: 1 }
+  )
+  assert.equal(selectRestoreThread(threads, shared, {
+    panelOwned: true,
+    preferredThreadId: 'visible'
+  })?.id, 'newer-background')
+
+  // A deliberately cleared pointer (new chat elsewhere) restores the empty
+  // view, not the tab's old conversation.
+  const cleared = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:global',
+    null,
+    { updatedAt: 2_000, writerId: 'other-tab', sequence: 1 }
+  )
+  assert.equal(selectRestoreThread(threads, cleared, {
+    panelOwned: true,
+    preferredThreadId: 'visible'
+  }), null)
+
+  // A DANGLING pointer (its thread was evicted or lost in a partial merge)
+  // says nothing about which conversation the global session is in — the tab
+  // that was just using one is better evidence than guessing by recency.
+  const dangling = updateMetadataEntry(
+    {},
+    'activeByScope',
+    'panel:global',
+    'evicted-thread',
+    { updatedAt: 2_000, writerId: 'other-tab', sequence: 1 }
+  )
+  assert.equal(selectRestoreThread(threads, dangling, {
     panelOwned: true,
     preferredThreadId: 'visible'
   })?.id, 'visible')
