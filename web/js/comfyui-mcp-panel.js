@@ -20120,6 +20120,21 @@ function buildPanel() {
     return /\.(mp4|webm|mov|mkv|m4v|avi)$/i.test(String(m?.filename || ""));
   }
 
+  /** The same question for AUDIO. The run-completion path had only the
+   *  image-vs-video split, so an audio descriptor arriving there was painted as
+   *  an <img> — the #710 defect on a second surface. ComfyUI files audio under
+   *  its own `audio` output key, which this panel does not collect, so this is
+   *  reachable only when a node files audio under images/gifs/videos; the point
+   *  is that ONE kind decision now answers for every surface rather than two
+   *  that can drift. Audio is also kept out of the agent's inline delivery: an
+   *  audio file handed over as an inline IMAGE is a perception nobody had. */
+  function isAudioOutput(m) {
+    const fmt = String(m?.format || "").toLowerCase();
+    if (fmt.startsWith("audio/")) return true;
+    if (fmt.startsWith("image/") || fmt.startsWith("video/")) return false;
+    return /\.(mp3|wav|flac|ogg|oga|opus|m4a|aac)$/i.test(String(m?.filename || ""));
+  }
+
   // ---- A2UI cards ------------------------------------------------------------
   // Live interactive cards by card_id (for panel_ui_update). Entries also point
   // at their thread record so resolve/update persist. Cards are per-mount DOM;
@@ -20875,18 +20890,29 @@ function buildPanel() {
   // sound the user has no way to pause (#710). Chat VIDEOS are spared this by
   // their IntersectionObserver, which unmounts them when they leave the DOM;
   // audio cards have no observer (pausing audio because it scrolled off screen
-  // would be its own bug), so they are released explicitly at every teardown.
-  function releaseChatAudio() {
+  // would be its own bug), so they are stopped explicitly whenever they leave.
+  //
+  // TWO KINDS OF LEAVING, and they must not be treated alike:
+  //  - PERMANENT (resetFeed, the panel's own destroy): the card is never coming
+  //    back, so release the source too and drop the decoded buffers.
+  //  - KEEP-ALIVE (a sidebar-tab switch, which only DETACHES this root and
+  //    re-attaches the same DOM on re-entry): pause ONLY. Dropping `src` here
+  //    would hand the returning user a dead player — trading one bug for
+  //    another — whereas a pause preserves the position they were at.
+  function stopChatAudio({ release = false } = {}) {
     try {
       for (const a of log.querySelectorAll("audio")) {
         try {
           a.pause();
-          a.removeAttribute("src");
-          a.load(); // drop the decoded buffers, same as the lightbox's releaseVideo
+          if (release) {
+            a.removeAttribute("src");
+            a.load(); // drop the decoded buffers, same as the lightbox's releaseVideo
+          }
         } catch { /* best-effort */ }
       }
     } catch { /* the log itself is already gone */ }
   }
+  const releaseChatAudio = () => stopChatAudio({ release: true });
 
   function resetFeed() {
     releaseChatAudio();
@@ -23483,6 +23509,12 @@ function buildPanel() {
         paintVideo(url, m.filename);
         // Carry the node id so the deferred storyboard event can name its node.
         videos.push({ m, nodeId });
+      } else if (isAudioOutput(m)) {
+        // Played, never painted as an image — and deliberately NOT added to
+        // inlineImages: that list is delivered to the agent as inline image
+        // blocks, so audio there would be both a broken picture and a claim of
+        // something the agent cannot perceive (#710).
+        paintAudio(url, m.filename);
       } else {
         paintImage(url, m.filename);
         inlineImages.push(m);
@@ -26347,6 +26379,15 @@ function buildPanel() {
       markAgentSeen();
       scrollLog();
     },
+    /** Called when the tab is left with the panel kept ALIVE (the root is
+     *  detached, not destroyed). A detached <audio> keeps playing and its
+     *  controls went with the root, so pause it — the chat's videos are already
+     *  paused here by their IntersectionObserver, and audio that kept going
+     *  while the panel was gone would be sound the user cannot reach (#710).
+     *  Pause only: the same element is re-attached on re-entry. */
+    onHide() {
+      stopChatAudio();
+    },
     setChatSurface: cmcpSetChatSurface, // A2UI seam: widen/restore the chat surface
     destroy() {
       try {
@@ -26445,7 +26486,7 @@ function buildPanel() {
 // `side-bar-button-selected` plus a unique `<tabId>-tab-button` class. When our tab
 // isn't selected we remove our own root; render() rebuilds it on re-entry. We guard
 // only OUR root, never another tab's.
-function installSidebarTabGuard(tabId, getRoot) {
+function installSidebarTabGuard(tabId, getRoot, onDetach) {
   const activeTabId = () => {
     const b = document.querySelector(".side-bar-button-selected");
     if (!b) return null;
@@ -26455,7 +26496,13 @@ function installSidebarTabGuard(tabId, getRoot) {
   const enforce = () => {
     if (activeTabId() === tabId) return;             // our tab active → keep content
     const r = getRoot();                              // inactive → drop our stray content
-    if (r && r.isConnected) r.remove();
+    if (r && r.isConnected) {
+      // This is the OTHER path that detaches a live panel (the tab's own
+      // destroy() is the first), so audio has to be paused here too — a
+      // detached <audio> keeps playing and its controls just left (#710).
+      try { onDetach?.(); } catch { /* a pause that fails must not strand the stray root */ }
+      r.remove();
+    }
   };
   const start = (tries = 0) => {
     const toolbar = document.querySelector(".side-tool-bar-container");
@@ -26655,6 +26702,9 @@ function registerExtensionWhenReady(tries = 0) {
         destroy: () => {
           // Detach only — never mounted.destroy(). Tearing down here is what used
           // to kill the live agent whenever the user peeked at another tab.
+          // onHide() first: a detached <audio> keeps playing and its controls
+          // leave with the root, so it must be paused BEFORE the root goes (#710).
+          mounted?.onHide?.();
           mounted?.root?.remove();
         },
       };
@@ -26667,7 +26717,11 @@ function registerExtensionWhenReady(tries = 0) {
         // the panel stylesheet only loads on first render (codex-review F1).
         ensureTabIconStyle();
         mgr.registerSidebarTab(tabSpec);
-        installSidebarTabGuard(tabId, () => document.querySelector(".cmcp-root"));
+        installSidebarTabGuard(
+          tabId,
+          () => document.querySelector(".cmcp-root"),
+          () => mounted?.onHide?.(),
+        );
       } else {
         console.error(
           "[comfyui-mcp-panel] app.extensionManager.registerSidebarTab is unavailable; " +

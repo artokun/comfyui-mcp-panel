@@ -1203,12 +1203,14 @@ test("paintFileLink gives the user an openable link for a kind the panel cannot 
 test("chat audio is STOPPED at every teardown — a detached <audio> keeps playing (#710)", () => {
   // Removing a playing <audio> from the DOM does not pause it, and once the card
   // is gone there are no controls left to stop it with. Videos are covered by
-  // their IntersectionObserver; audio needs an explicit release.
+  // their IntersectionObserver; audio needs an explicit stop.
   const src = panelSource();
-  const fn = panelFunctionBody(src, "function releaseChatAudio(");
+  const fn = panelFunctionBody(src, "function stopChatAudio(");
   assert.match(fn, /querySelectorAll\("audio"\)/);
   assert.match(fn, /\.pause\(\)/);
-  assert.match(fn, /removeAttribute\("src"\)/);
+  // A permanent teardown drops the source too; a keep-alive detach must NOT —
+  // the same element is re-attached, and a player with no src is a new bug.
+  assert.match(fn, /if \(release\)[\s\S]{0,120}removeAttribute\("src"\)/);
   const reset = panelFunctionBody(src, "function resetFeed(");
   assert.match(reset, /releaseChatAudio\(\);/, "a thread/workflow switch must not leave sound playing");
   assert.ok(
@@ -1223,6 +1225,60 @@ test("chat audio is STOPPED at every teardown — a detached <audio> keeps playi
     .filter((body) => body.includes("unsubscribeHistorySync()"));
   assert.equal(destroys.length, 1, "could not locate the panel's own destroy()");
   assert.match(destroys[0], /releaseChatAudio\(\);/);
+});
+
+test("a KEEP-ALIVE sidebar detach pauses chat audio without destroying the player (#710)", () => {
+  // A sidebar-tab switch does not tear the panel down — it detaches the root and
+  // re-attaches the same DOM on re-entry. The audio still has to stop (its
+  // controls just left with the root, and the chat's videos are already paused
+  // here by their IntersectionObserver), but only by PAUSING: dropping `src`
+  // would hand the returning user a dead player.
+  const src = panelSource();
+  const onHide = src.match(/onHide\(\) \{[\s\S]*?\n {4}\},/);
+  assert.ok(onHide, "the panel handle must expose onHide for the keep-alive detach");
+  assert.match(onHide[0], /stopChatAudio\(\);/);
+  assert.doesNotMatch(onHide[0], /release/, "a keep-alive detach must not drop the source");
+  // BOTH detach paths must call it: the tab's own destroy(), and the
+  // sidebar-overlap guard that removes a stray root when another tab is active.
+  const tabDestroy = src.match(/destroy: \(\) => \{[\s\S]*?\n {8}\},/);
+  assert.ok(tabDestroy, "could not locate the sidebar tab's destroy()");
+  assert.match(tabDestroy[0], /mounted\?\.onHide\?\.\(\);/);
+  assert.ok(
+    tabDestroy[0].indexOf("onHide") < tabDestroy[0].indexOf("root?.remove()"),
+    "pause BEFORE the root is detached",
+  );
+  const guard = src.match(/function installSidebarTabGuard\([\s\S]*?\n {2}const start =/);
+  assert.ok(guard, "could not locate installSidebarTabGuard");
+  assert.match(guard[0], /onDetach\?\.\(\)/);
+  assert.match(
+    src,
+    /installSidebarTabGuard\(\s*tabId,[\s\S]{0,160}mounted\?\.onHide\?\.\(\)/,
+    "the guard must actually be given the panel's onHide",
+  );
+});
+
+test("run completion PLAYS an audio output instead of painting it as an image (#710)", () => {
+  // The second copy of the kind decision. The completion path knew only
+  // image-vs-video, so an audio descriptor arriving there was painted as an
+  // <img> AND handed to the agent as an inline image — a picture nobody has.
+  const src = panelSource();
+  const fn = panelFunctionBody(src, "function isAudioOutput(");
+  assert.match(fn, /fmt\.startsWith\("audio\/"\)/);
+  assert.match(fn, /mp3\|wav\|flac/);
+  const onExecuted = panelFunctionBody(src, "function onExecuted(");
+  // The exact branch, not merely a mention of the predicate: `false &&
+  // isAudioOutput(m)` still "mentions" it while routing every audio file back
+  // through paintImage, and a test that passes on that is testing nothing.
+  assert.match(onExecuted, /\} else if \(isAudioOutput\(m\)\) \{/);
+  assert.match(onExecuted, /isAudioOutput\(m\)\) \{[\s\S]{0,600}paintAudio\(url, m\.filename\)/);
+  const audioBranch = onExecuted.slice(onExecuted.indexOf("isAudioOutput(m)"));
+  const branchEnd = audioBranch.indexOf("} else {");
+  assert.ok(branchEnd > 0);
+  assert.doesNotMatch(
+    audioBranch.slice(0, branchEnd),
+    /inlineImages\.push/,
+    "audio must never join the agent's inline-IMAGE delivery",
+  );
 });
 
 test("a persisted audio card REPLAYS as audio, not as a broken image (#710)", () => {
