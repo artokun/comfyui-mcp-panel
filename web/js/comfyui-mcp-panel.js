@@ -220,7 +220,8 @@ import {
   driftedRequiredInputNames,
   missingRequiredWidgetMaterializations,
   registeredSocketTypes,
-  unavailableRequiredCustomWidgetTypes,
+  unavailableRequiredWidgetMessage,
+  unavailableRequiredWidgetReport,
 } from "./lib/node-widget-materialization.js";
 import { sameGraphMutationContext } from "./lib/graph-mutation-context.js";
 import { isImeComposing } from "./lib/ime.js";
@@ -7045,15 +7046,12 @@ async function awaitRequiredCustomWidgetRegistration(
   comfyApp,
   knownSocketTypes,
   currentDef,
+  classType,
 ) {
-  const deadline = Date.now() + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
+  const startedAt = Date.now();
+  const deadline = startedAt + CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
   const check = () =>
-    unavailableRequiredCustomWidgetTypes(
-      nodeData,
-      comfyApp?.widgets,
-      knownSocketTypes,
-      currentDef,
-    );
+    unavailableRequiredWidgetReport(nodeData, comfyApp?.widgets, knownSocketTypes, currentDef);
   let unavailable = check();
   while (Date.now() < deadline) {
     if (!unavailable.length) return;
@@ -7061,10 +7059,13 @@ async function awaitRequiredCustomWidgetRegistration(
     unavailable = check();
   }
   if (!unavailable.length) return;
+  // #695: the poll is the ONLY thing here a retry can change (nodeData, currentDef and
+  // knownSocketTypes are all snapshots), so a type that is structurally a socket must be
+  // waived by the check rather than waited out — and whatever is left after the wait gets
+  // a message that says which input is stuck and which of the two causes it is, instead of
+  // asserting the single cause that sent #695's reporter to the wrong place.
   throw new Error(
-    `Required custom widget${unavailable.length === 1 ? "" : "s"} ` +
-      `${unavailable.map((type) => `"${type}"`).join(", ")} have not registered. ` +
-      "They may be custom widgets still loading; retry shortly.",
+    unavailableRequiredWidgetMessage(unavailable, classType, Date.now() - startedAt),
   );
 }
 
@@ -8373,6 +8374,7 @@ const GRAPH_TOOL_EXECUTORS = {
       comfyApp,
       knownSocketTypes,
       currentDef,
+      class_type,
     );
     const node = LG.createNode(class_type);
     if (!node) {

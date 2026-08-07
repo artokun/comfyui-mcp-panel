@@ -6,9 +6,12 @@ import {
   applyCurrentDefWidgetValues,
   driftedRequiredInputNames,
   missingRequiredWidgetMaterializations,
+  declaredTypeMembers,
   registeredSocketTypes,
   requiredWidgetInputTypes,
   unavailableRequiredCustomWidgetTypes,
+  unavailableRequiredWidgetMessage,
+  unavailableRequiredWidgetReport,
 } from "../../web/js/lib/node-widget-materialization.js";
 
 const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
@@ -531,4 +534,268 @@ test("#626: graph_add_node actually CONSUMES the reconciliation and discloses it
       src.indexOf("      graph.add(node);"),
     "reconciliation must precede graph.add",
   );
+});
+// ---- #695: socket-vs-widget classification must be STRUCTURAL, not a name list ------
+//
+// Reported as "MASK is missing from SAFE_SOCKET_TYPES". MASK/MESH/VOXEL were added by
+// the #620/#608 work, but the same failure class survives in two places, both verified
+// against a live /object_info (2887 classes):
+//   * PHOTOMAKER — a stock core datatype the list still omits.
+//   * COMMA-JOINED UNION types. ComfyUI declares a link-compatible union of datatypes as
+//     ONE string: core `PreviewImageOrMask` requires ("IMAGE,MASK"), `ImageUncropByMask`
+//     requires ("BBOX,BOUNDING_BOX"), `LoraExtractKJ` requires ("MODEL,CLIP"). The guard
+//     compared the WHOLE string against the allowlist and against the output-proof set
+//     (which only ever holds single type names), so every union failed closed — a 5s
+//     poll for a widget constructor that can never appear, reported as "custom widgets
+//     still loading".
+
+const CORE_SOCKET_DATATYPES = ["MASK", "MESH", "VOXEL", "PHOTOMAKER"];
+
+function requiring(required) {
+  return { constructor: { nodeData: { input: { required } } } };
+}
+
+test("#695: the core connection datatypes named in the report are all safe sockets", () => {
+  // Pinned by name so a future edit cannot quietly drop one again. No output proof and
+  // no fresh def is supplied: this is the allowlist half on its own.
+  for (const type of CORE_SOCKET_DATATYPES) {
+    assert.deepEqual(
+      unavailableRequiredCustomWidgetTypes(requiring({ thing: [type, {}] }), {}),
+      [],
+      `${type} must not be treated as a possibly-registering custom widget`,
+    );
+  }
+});
+
+test("#695: core PhotoMakerEncode adds without waiting for a widget", () => {
+  // Verbatim from live /object_info.
+  const def = {
+    input: {
+      required: {
+        photomaker: ["PHOTOMAKER", {}],
+        image: ["IMAGE", {}],
+        clip: ["CLIP", {}],
+        text: ["STRING", { default: "photograph of photomaker", multiline: true, dynamicPrompts: true }],
+      },
+    },
+  };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(def, { STRING: () => {} }, new Set(), def),
+    [],
+  );
+});
+
+test("#695: a comma-joined union of core link datatypes is a socket (core PreviewImageOrMask)", () => {
+  // Verbatim from live /object_info: required.input = ["IMAGE,MASK", {tooltip}].
+  const def = { input: { required: { input: ["IMAGE,MASK", { tooltip: "The image or mask to preview." }] } } };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(def, {}, new Set(), def), []);
+  // …and the same union with no config at all (ImageConcanate.image2).
+  const bare = { input: { required: { image2: ["IMAGE,MASK", {}] } } };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(bare, {}, new Set(), bare), []);
+});
+
+test("#695: a union whose members are only proven by /object_info outputs resolves too", () => {
+  // ImageUncropByMask.bbox = ["BBOX,BOUNDING_BOX"]. BBOX is allowlisted; BOUNDING_BOX is
+  // not, and is proven a link datatype only because some installed node outputs it.
+  const def = { input: { required: { mask: ["MASK"], bbox: ["BBOX,BOUNDING_BOX"] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(def, {}, new Set(["BOUNDING_BOX"]), def),
+    [],
+  );
+  // Without that proof it still fails closed — an unproven member is still unknown.
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(def, {}, new Set(), def),
+    ["BBOX,BOUNDING_BOX"],
+  );
+});
+
+test("#695: a union input that DECLARES a widget value still fails closed (#580/#626 intact)", () => {
+  // LTXVEmptyLatentAudio.frame_rate = ["FLOAT,INT", {widgetType:"FLOAT", default:25, min, max, step}].
+  // Both members are output by some node, so the type half passes — but the input half
+  // says this carries a VALUE, so the wait for its widget constructor must survive.
+  const def = {
+    input: {
+      required: {
+        frame_rate: ["FLOAT,INT", { widgetType: "FLOAT", default: 25, min: 1, max: 1000, step: 0.01 }],
+      },
+    },
+  };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(def, {}, new Set(["FLOAT", "INT"]), def),
+    ["FLOAT,INT"],
+  );
+  // …and it clears the instant the constructor registers under the union's own key.
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(def, { "FLOAT,INT": () => {} }, new Set(["FLOAT", "INT"]), def),
+    [],
+  );
+});
+
+test("#695: a genuinely-still-registering custom widget is still waited for", () => {
+  // The legitimate #580 case must be untouched by any of the above: an unknown type that
+  // is not a union, has no output proof, and declares a value.
+  const def = { input: { required: { gallery: ["ZIPN_STYLE_GALLERY", { default: "none" }] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(def, {}, new Set(), def),
+    ["ZIPN_STYLE_GALLERY"],
+  );
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(def, { ZIPN_STYLE_GALLERY: () => {} }, new Set(), def),
+    [],
+  );
+});
+
+test("#695: declaredTypeMembers splits a union and leaves a single type alone", () => {
+  assert.deepEqual(declaredTypeMembers("MASK"), ["MASK"]);
+  assert.deepEqual(declaredTypeMembers("IMAGE,MASK"), ["IMAGE", "MASK"]);
+  assert.deepEqual(declaredTypeMembers("BBOX, BOUNDING_BOX"), ["BBOX", "BOUNDING_BOX"]);
+  // ComfyUI's own `INT:seed` / `INT:noise_seed` registry keys carry no comma and must
+  // survive intact — they ARE registered widget constructors, not unions.
+  assert.deepEqual(declaredTypeMembers("INT:seed"), ["INT:seed"]);
+  assert.deepEqual(declaredTypeMembers(""), []);
+  assert.deepEqual(declaredTypeMembers(",,"), []);
+  assert.deepEqual(declaredTypeMembers(undefined), []);
+});
+
+test("#695: a union registered under its own key in the widget registry is a widget", () => {
+  // The whole declared string is looked up before it is decomposed, so a pack that
+  // registers a constructor for the union itself keeps it.
+  const def = { input: { required: { value: ["IMAGE,MASK", {}] } } };
+  assert.deepEqual(unavailableRequiredWidgetReport(def, { "IMAGE,MASK": () => {} }, new Set(), def), []);
+});
+
+test("#695: a union with ONE unproven member still fails closed", () => {
+  // SaveGaussianSplat.model_3d = FILE_3D_SPLAT_ANY,FILE_3D_PLY,… — proving some members
+  // is not proving the type, so the guard is not weakened into "any member counts".
+  const def = { input: { required: { model_3d: ["FILE_3D_SPLAT_ANY,FILE_3D_PLY", {}] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(def, {}, new Set(["FILE_3D_SPLAT_ANY"]), def),
+    ["FILE_3D_SPLAT_ANY,FILE_3D_PLY"],
+  );
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(
+      def,
+      {},
+      new Set(["FILE_3D_SPLAT_ANY", "FILE_3D_PLY"]),
+      def,
+    ),
+    [],
+  );
+});
+
+test("#695: the report names the stuck INPUT and which of the two causes it is", () => {
+  const def = {
+    input: {
+      required: {
+        // Proven a link datatype by the backend, but declares a widget value.
+        amount: ["ACME_VALUE", { default: 3 }],
+        // Nothing outputs this and nothing registers a widget for it.
+        gallery: ["ZIPN_STYLE_GALLERY", { default: "none" }],
+        also_gallery: ["ZIPN_STYLE_GALLERY", { default: "none" }],
+      },
+    },
+  };
+  assert.deepEqual(unavailableRequiredWidgetReport(def, {}, new Set(["ACME_VALUE"]), def), [
+    { type: "ACME_VALUE", inputs: ["amount"], linkProven: true },
+    { type: "ZIPN_STYLE_GALLERY", inputs: ["gallery", "also_gallery"], linkProven: false },
+  ]);
+});
+
+test("#695: the refusal message stops asserting one cause for two situations", () => {
+  const message = unavailableRequiredWidgetMessage(
+    [{ type: "ZIPN_STYLE_GALLERY", inputs: ["gallery"], linkProven: false }],
+    "ZipnStyler",
+    5000,
+  );
+  // Before: `Required custom widget "MASK" have not registered. They may be custom
+  // widgets still loading; retry shortly.` — no node, no input, one asserted cause, and
+  // a remedy ("retry shortly") that cannot work for a datatype with no widget.
+  assert.match(message, /Cannot add "ZipnStyler"/);
+  assert.match(message, /input "gallery"/, "names the input, not just the datatype");
+  assert.match(message, /no installed node outputs "ZIPN_STYLE_GALLERY"/);
+  assert.match(message, /5\.0s/, "discloses what the wait cost");
+  assert.match(message, /Reload the ComfyUI browser tab/, "gives the remedy that can work");
+  assert.match(message, /retrying alone will not fix it/);
+  assert.doesNotMatch(message, /retry shortly/, "no longer promises a retry will help");
+
+  const linkProven = unavailableRequiredWidgetMessage(
+    [{ type: "ACME_VALUE", inputs: ["amount", "other"], linkProven: true }],
+    "AcmeNode",
+    5000,
+  );
+  assert.match(linkProven, /input "amount", "other"/);
+  assert.match(linkProven, /declares "ACME_VALUE" as a link datatype, but this input also declares a widget value/);
+  // The line #695's reporter needed: this is not the socket-allowlist bug again.
+  assert.match(linkProven, /added immediately, without any wait/);
+});
+
+test("#695: graph_add_node consumes the report and message, and names the class", () => {
+  // Without this the classification could be perfect and entirely unwired.
+  const src = readFileSync(PANEL_JS, "utf8");
+  assert.match(src, /unavailableRequiredWidgetReport,/, "imported");
+  assert.match(src, /unavailableRequiredWidgetMessage,/, "imported");
+  assert.doesNotMatch(
+    src,
+    /They may be custom widgets still loading; retry shortly/,
+    "the single-cause message is gone from the add path",
+  );
+  assert.match(
+    src,
+    /unavailableRequiredWidgetReport\(nodeData, comfyApp\?\.widgets, knownSocketTypes, currentDef\)/,
+    "the poll checks the report",
+  );
+  assert.match(
+    src,
+    /unavailableRequiredWidgetMessage\(unavailable, classType, Date\.now\(\) - startedAt\)/,
+    "the refusal is built from the report, with the elapsed wait",
+  );
+  assert.match(
+    src,
+    /await awaitRequiredCustomWidgetRegistration\(\s*nodeData,\s*comfyApp,\s*knownSocketTypes,\s*currentDef,\s*class_type,\s*\)/,
+    "the class_type reaches the message",
+  );
+});
+
+test("#695 gate r1: an all-built-in UNION that declares a widget value still fails closed", () => {
+  // Members being built-in link datatypes is not the INPUT being a link. A pack can
+  // declare ("IMAGE,MASK", {widgetType, default}) — the shape LTXV already uses for
+  // ("FLOAT,INT", …) — which is a widget that ACCEPTS those links. Waiving it on the
+  // member types alone added a node with neither a widget value nor a link (#580).
+  const def = {
+    input: { required: { source: ["IMAGE,MASK", { widgetType: "IMAGE", default: "none" }] } },
+  };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(def, {}, new Set(), def), ["IMAGE,MASK"]);
+  // It is reported as the link-proven case, because that is what it is: the datatypes are
+  // real link types, and the INPUT is nonetheless asking for a value.
+  assert.deepEqual(unavailableRequiredWidgetReport(def, {}, new Set(), def), [
+    { type: "IMAGE,MASK", inputs: ["source"], linkProven: true },
+  ]);
+  // …and it clears once the constructor registers under the union's own key.
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(def, { "IMAGE,MASK": () => {} }, new Set(), def),
+    [],
+  );
+  // A SINGLE built-in keeps its type-only shortcut, exactly as before this fix: no widget
+  // constructor exists for MASK, so there is nothing for the input to be waiting on.
+  const single = { input: { required: { mask: ["MASK", { default: "none" }] } } };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(single, {}, new Set(), single), []);
+});
+
+test("#695 gate r1: the type list is deduped and first-seen ordered, as it always was", () => {
+  // requiredWidgetInputTypes has always returned [...new Set(...)], so the Map-based
+  // rewrite must not start emitting one entry per input.
+  const def = {
+    input: {
+      required: {
+        first: ["ACME", { default: 1 }],
+        other: ["ZED", { default: 2 }],
+        second: ["ACME", { default: 3 }],
+      },
+    },
+  };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(def, {}, new Set(), def), ["ACME", "ZED"]);
+  assert.deepEqual(unavailableRequiredWidgetReport(def, {}, new Set(), def), [
+    { type: "ACME", inputs: ["first", "second"], linkProven: false },
+    { type: "ZED", inputs: ["other"], linkProven: false },
+  ]);
 });
