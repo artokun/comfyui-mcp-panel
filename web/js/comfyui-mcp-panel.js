@@ -189,6 +189,7 @@ import { boundSubgraphList } from "./lib/subgraph-list-bound.js";
 import { threadMatchesCurrentWorkflow } from "./lib/thread-workflow-match.js";
 import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode } from "./lib/node-scope-locator.js";
+import { boundByChars, normalizeViewportMaxChars, viewportTruncation, VIEWPORT_DEFAULT_MAX_CHARS } from "./lib/viewport-char-bound.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
 import {
   CANVAS_TOOL_DISCLOSURE,
@@ -7364,7 +7365,7 @@ const GRAPH_TOOL_EXECUTORS = {
   // visible when its full rendered box (getBounding — title bar included)
   // INTERSECTS that rect, so half-on-screen nodes are included rather than
   // dropped. Read-only.
-  graph_view_nodes_in_viewport() {
+  graph_view_nodes_in_viewport({ max_chars } = {}) {
     const { graph, canvas } = getGraphCtx();
     // DERIVE the rect rather than trusting `canvas.visible_area`: LiteGraph only
     // refreshes visible_area when it DRAWS, and it sizes it from the canvas
@@ -7420,18 +7421,24 @@ const GRAPH_TOOL_EXECUTORS = {
       },
       node_count: all.length,
       in_view_count: visible.length,
-      truncated: visible.length > MAX_STATE_NODES,
-      ...(visible.length > MAX_STATE_NODES
-        ? {
-            truncation_hint: fixedCapNote(
-              "visible node(s)",
-              MAX_STATE_NODES,
-              visible.length,
-              "Ask the user to zoom in so fewer nodes are on screen, or read the region with panel_query_graph (which DOES take limit and max_chars) / panel_graph_outline for the whole graph.",
-            ),
-          }
-        : {}),
-      nodes: visible.slice(0, MAX_STATE_NODES).map(summarizeNode),
+      // #845 — the node cap alone bounded the WRONG UNIT: 100 nodes honoured exactly
+      // still emitted 135k characters for a caller inspecting one node. Apply the node
+      // cap first, then a CHARACTER budget, and keep in_view_count describing the
+      // SCREEN so a caller comparing it to nodes.length always sees what was withheld.
+      ...(() => {
+        const cap = visible.slice(0, MAX_STATE_NODES).map(summarizeNode);
+        const budget = normalizeViewportMaxChars(max_chars);
+        const { kept } = boundByChars(cap, budget);
+        return {
+          ...viewportTruncation({
+            inViewCount: visible.length,
+            keptCount: kept.length,
+            nodeCap: MAX_STATE_NODES,
+            maxChars: budget,
+          }),
+          nodes: kept,
+        };
+      })(),
     };
   },
 

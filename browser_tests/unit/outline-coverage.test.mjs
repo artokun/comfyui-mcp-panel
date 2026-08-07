@@ -170,16 +170,26 @@ test("#809 the refusal itself fits the smallest budget the tool accepts", async 
 test("#809 the MAX_STATE_NODES views state their cap instead of a bare boolean", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   // Each capped view must carry prose the model actually reads, not just `truncated:true`.
-  for (const sig of [
-    "graph_view_selected()",
-    "graph_view_nodes_in_viewport()",
-    "graph_get_subgraph({",
-  ]) {
+  // Views whose cap is FIXED and has no lever: they must say so, using the shared
+  // wording that is honest about there being nothing to raise.
+  for (const sig of ["graph_view_selected()", "graph_get_subgraph({"]) {
     const body = handlerBody(src, sig);
     assert.ok(body, `${sig} must exist`);
     assert.match(body, /truncation_hint:/, `${sig} must emit a remedy, not only a boolean`);
     assert.match(body, /fixedCapNote\(/, `${sig} must use the shared fixed-cap wording`);
   }
+
+  // #845 — the viewport view now HAS a lever (`max_chars`), because a 100-node cap
+  // bounded the wrong unit and still emitted 135k characters. It must therefore NOT
+  // use the fixed-cap wording, which would tell a caller no parameter raises it when
+  // one does — the same defect (naming a lever that does not match reality) pointed
+  // the other way. It still owes a remedy, and that remedy must carry a ceiling.
+  const viewport = handlerBody(src, "graph_view_nodes_in_viewport({ max_chars } = {})");
+  assert.ok(viewport, "graph_view_nodes_in_viewport must exist");
+  assert.ok(!/fixedCapNote\(/.test(viewport),
+    "a view WITH a lever must not claim the fixed-cap 'no parameter raises it' wording");
+  assert.ok(/viewportTruncation\(/.test(viewport),
+    "it must emit the lever-aware truncation instead");
   // And the shared wording must be honest about there being no lever — inventing one
   // would be the same defect as naming the wrong one.
   assert.match(src, /FIXED cap of \$\{MAX_STATE_NODES\} and no parameter raises it/);
