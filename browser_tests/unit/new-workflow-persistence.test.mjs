@@ -657,8 +657,16 @@ function balancedFrom(src, marker, openAt = null) {
   throw new Error(`unterminated block: ${marker}`);
 }
 
-/** The REAL `workflow_new` body, with its globals injected. */
-function buildWorkflowNew({ rootGraph, activeWorkflow }) {
+/** The REAL canonical-uuid gate from the shipped source — never a second spelling
+ *  of the regex here (#640: two spellings of one rule diverge silently). */
+const realIsCanonicalWorkflowInstanceUuid = new Function(
+  `${balancedFrom(SRC, "function isCanonicalWorkflowInstanceUuid(value)")}\nreturn isCanonicalWorkflowInstanceUuid;`,
+)();
+
+/** The REAL `workflow_new` body, with its globals injected.
+ *  `uuid` is what workflowStableUuid() returns for the created tab — default is the
+ *  deliberately NON-canonical placeholder the existing tests were written against. */
+function buildWorkflowNew({ rootGraph, activeWorkflow, uuid = "uuid-new-tab" }) {
   const sigStart = SRC.indexOf("async workflow_new({");
   assert.notEqual(sigStart, -1, "workflow_new not found");
   const bodyBrace = SRC.indexOf(") {", sigStart) + 1;
@@ -679,12 +687,13 @@ function buildWorkflowNew({ rootGraph, activeWorkflow }) {
     "stampGraphRootWorkflowUuid",
     "backendReconnectEpoch",
     "activeWorkflowResyncEpoch",
+    "isCanonicalWorkflowInstanceUuid",
     `${methodSource}\nreturn workflow_new;`,
   )(
     { graph: rootGraph, extensionManager: { command: { execute: async () => {} } } },
     () => activeWorkflow,
     () => "tmp:new-tab",
-    () => "uuid-new-tab",
+    () => uuid,
     () => ({ seq: 7 }),
     (e) => String(e),
     () => "Unsaved Workflow",
@@ -693,6 +702,7 @@ function buildWorkflowNew({ rootGraph, activeWorkflow }) {
     () => {},
     1,
     0,
+    realIsCanonicalWorkflowInstanceUuid,
   );
 }
 
@@ -715,6 +725,61 @@ test("#708 ack: a PROVEN-empty new tab reports created:true — the honest succe
   assert.equal(out.empty, true);
   assert.equal(out.routing_key, "tmp:new-tab");
   assert.equal(out.note, undefined, "a proven blank tab needs no caveat");
+});
+
+// #755 — workflow_new already MINTS the new canvas's fence identity, then dropped it
+// from the reply, so the orchestrator had to make a second workflow_list round trip to
+// re-learn a fact this command was holding. That round trip is where the wedge in
+// artokun/comfyui-mcp#932 lived: it could be refused, it could fail corroboration, and
+// the canvas could change underneath it in between.
+const CANONICAL = "c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95";
+
+test("#755: workflow_new returns the workflow_uuid it just minted", async () => {
+  const workflow_new = buildWorkflowNew({
+    rootGraph: liveRoot(BLANK_GRAPH()),
+    activeWorkflow: { isPersisted: false, isModified: false, changeTracker: { activeState: BLANK_GRAPH() } },
+    uuid: CANONICAL,
+  });
+
+  const out = await workflow_new({ rid: "r1" });
+
+  assert.equal(out.workflow_uuid, CANONICAL);
+  // …alongside, and describing the SAME graph as, the routing handle.
+  assert.equal(out.routing_key, "tmp:new-tab");
+  assert.equal(out.created, true);
+});
+
+test("#755: the UNKNOWN-outcome reply carries it too — the tab is real either way", async () => {
+  // #708 withholds `created:true` when emptiness is unproven, but the tab and its
+  // identity ARE real (the receipt records that). Withholding the uuid here would send
+  // exactly the caller who most needs to re-target back through the round trip this
+  // change exists to remove.
+  const workflow_new = buildWorkflowNew({
+    rootGraph: liveRoot(PREVIOUS_WORKFLOW_GRAPH()),
+    activeWorkflow: { isPersisted: false, isModified: false, changeTracker: { activeState: BLANK_GRAPH() } },
+    uuid: CANONICAL,
+  });
+
+  const out = await workflow_new({ rid: "r1" });
+
+  assert.equal(out.created, "unknown", "the #708 honesty rule is untouched");
+  assert.equal(out.workflow_uuid, CANONICAL, "but the identity is still reported");
+});
+
+test("#755: a NON-canonical value is omitted, never published as an identity", async () => {
+  // The shape gate is the #716 rule carried over: publish a real per-instance uuid or
+  // nothing. A routing handle offered in its place must not be echoed as one.
+  for (const bogus of ["tmp:new-tab", "uuid-new-tab", "", null, undefined]) {
+    const workflow_new = buildWorkflowNew({
+      rootGraph: liveRoot(BLANK_GRAPH()),
+      activeWorkflow: { isPersisted: false, isModified: false, changeTracker: { activeState: BLANK_GRAPH() } },
+      uuid: bogus,
+    });
+    const out = await workflow_new({ rid: "r1" });
+    assert.equal("workflow_uuid" in out, false, `${JSON.stringify(bogus)} must be omitted, not echoed`);
+    // The reply is still fully usable — omission costs a round trip, nothing more.
+    assert.equal(out.routing_key, "tmp:new-tab");
+  }
 });
 
 test("#708 ack: the reported reconnect shape reports outcome-UNKNOWN, never created:true", async () => {

@@ -10980,7 +10980,30 @@ const GRAPH_TOOL_EXECUTORS = {
     });
     // `key`/`routing_key` are the unique handle the agent should pass to
     // panel_set_workflow_target so its session pins to this exact graph.
-    const identity = { active: getWorkflowTitle(), key, routing_key: key, open_seq: receipt.seq };
+    //
+    // #755 — and `workflow_uuid` is the FENCE identity for that same graph, already
+    // minted above as `newWorkflowUuid`. Omitting it forced the orchestrator into a
+    // second `workflow_list` round trip to learn the identity of a canvas this
+    // command had just created and already knew. That round trip is where the wedge
+    // in artokun/comfyui-mcp#932 lived: it can be refused, it can fail
+    // corroboration, and the canvas can change underneath it in between — three ways
+    // to fail at re-reading a fact we are holding right here.
+    //
+    // Reported for the workflow this command CREATED, which is exactly what
+    // `key`/`routing_key` above already describe, so the three stay coherent even if
+    // a reconnect re-points `active` before the reply lands.
+    //
+    // Shape-gated (#716's rule, unchanged): publish only a canonical uuid, never a
+    // routing handle or a half-established value. The orchestrator keeps its
+    // workflow_list fallback for older panels, so a missing field costs a round trip
+    // rather than breaking anything.
+    const identity = {
+      active: getWorkflowTitle(),
+      key,
+      routing_key: key,
+      open_seq: receipt.seq,
+      ...(isCanonicalWorkflowInstanceUuid(newWorkflowUuid) ? { workflow_uuid: newWorkflowUuid } : {}),
+    };
     // #708 — DO NOT CLAIM "blank" WITHOUT PROVING IT. The tab and its routing identity
     // are real either way (the receipt above records that), but `created:true` on a tool
     // whose whole contract is "a brand-new BLANK workflow" is read as "you have an empty

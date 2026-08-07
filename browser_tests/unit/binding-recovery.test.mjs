@@ -113,6 +113,7 @@ function buildWorkflowNew({
     "stampGraphRootWorkflowUuid",
     "backendReconnectEpoch",
     "activeWorkflowResyncEpoch",
+    "isCanonicalWorkflowInstanceUuid",
     `${methodSource}\nreturn workflow_new;`,
   );
   return factory(
@@ -128,8 +129,16 @@ function buildWorkflowNew({
     onStamp,
     1,
     0,
+    realIsCanonicalWorkflowInstanceUuid,
   );
 }
+
+/** The REAL canonical-uuid gate from the shipped source — never a second spelling
+ *  of the regex here (#640). */
+const realIsCanonicalWorkflowInstanceUuid = new Function(
+  `${balancedFrom(SRC, "function isCanonicalWorkflowInstanceUuid(value)")}
+return isCanonicalWorkflowInstanceUuid;`,
+)();
 
 const EMPTY_SERIALIZE = () => ({ nodes: [], links: [], extra: { ds: { offset: [0, 0], scale: 1 } } });
 
