@@ -111,8 +111,16 @@ function quoteNames(names) {
  * the guard was recommending a reload to fix something it knew was not broken. #700 was
  * filed after ~90 tool calls spent investigating extension registration on that advice.
  *
- * So: say which condition held, say that nothing was added, and only recommend a reload
- * where a reload is the thing that could plausibly change the outcome.
+ * So: say which condition held, say that nothing was added, and let the remedy assert
+ * nothing about WHY beyond what was observed.
+ *
+ * The remedy is deliberately mechanism-free (codex gate r2 P2). Two earlier drafts named
+ * a cause and both were falsifiable: "reload so the node's extension re-runs" misdescribes
+ * a core/built-in widget that has no node extension behind it, and "reloading helps only
+ * if the pack's frontend changed on disk" is wrong for a constructor that reads a mutable
+ * setting, where changing the setting and reloading does fix it. The one causal claim left
+ * is the one the caller PROVED — the constructor is registered — and it is made only in
+ * the branch where the widget was also observed on the node.
  */
 export function describeUnmaterializedRequiredWidgets(classType, node, names) {
   const list = Array.isArray(names) ? names : [];
@@ -143,23 +151,20 @@ export function describeUnmaterializedRequiredWidgets(classType, node, names) {
     );
   }
 
-  let remedy;
-  if (absent.length && nonSerializing.length) {
-    remedy =
-      "Reload the ComfyUI tab so the node's extension re-runs against the current definition; " +
-      "if that does not clear it, this node's frontend and backend definitions disagree and its " +
-      "pack needs updating.";
-  } else if (nonSerializing.length) {
-    remedy =
-      "The widget constructor IS registered, so this is the node's frontend definition " +
-      "disagreeing with the backend definition that requires the input, not a registration " +
-      "failure. Reloading the ComfyUI tab helps only if the pack's frontend changed on disk " +
-      "since this tab loaded; otherwise update the node's pack or report it to its author.";
-  } else {
-    remedy =
-      "Reload the ComfyUI tab so the node's extension re-runs against the current definition, " +
-      "then retry.";
-  }
+  // Stated only where the widget was actually SEEN on the node, which is exactly where it
+  // is provable — and it is the correction #700 needs, because the old message asserted
+  // the opposite of it.
+  const notARegistrationFailure = nonSerializing.length
+    ? "The widget constructor is registered and the widget was built, so this is not a " +
+      "widget-registration failure. "
+    : "";
+  const remedy =
+    "Reload the ComfyUI tab so this node type is registered again from the current " +
+    "definition, then retry. If it still fails, this node's frontend and backend " +
+    "definitions disagree and its pack needs updating (or its author needs to hear about it).";
 
-  return `Cannot add "${classType}": ${findings.join("; and ")}. Nothing was added. ${remedy}`;
+  return (
+    `Cannot add "${classType}": ${findings.join("; and ")}. Nothing was added. ` +
+    `${notARegistrationFailure}${remedy}`
+  );
 }

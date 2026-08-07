@@ -433,8 +433,8 @@ test("#700: the refusal names the condition that held and never claims a registr
     ["gallery"],
   );
   assert.match(nonSerializing, /required input "gallery" is present but does not serialize a value/);
-  assert.match(nonSerializing, /widget constructor IS registered/);
-  assert.match(nonSerializing, /update the node's pack/);
+  assert.match(nonSerializing, /not a widget-registration failure/);
+  assert.match(nonSerializing, /its pack needs updating/);
 
   const mixed = describeUnmaterializedRequiredWidgets(
     "HalfBroken",
@@ -443,7 +443,7 @@ test("#700: the refusal names the condition that held and never claims a registr
   );
   assert.match(mixed, /"amount" was not built onto the node/);
   assert.match(mixed, /"gallery" is present but does not serialize a value/);
-  assert.match(mixed, /if that does not clear it/);
+  assert.match(mixed, /If it still fails/);
 
   // The claim that misdirected #700 for ~90 tool calls must not survive anywhere.
   for (const message of [absentOnly, nonSerializing, mixed]) {
@@ -451,6 +451,31 @@ test("#700: the refusal names the condition that held and never claims a registr
     assert.doesNotMatch(message, /so its node extension can register/);
     assert.match(message, /Nothing was added\./);
   }
+});
+
+test("#700: the remedy asserts no mechanism the guard cannot see", () => {
+  // codex gate r2 P2. Two drafts named a cause and both were falsifiable:
+  //  - "reload so the node's EXTENSION re-runs" is wrong for a core/built-in widget,
+  //    which has no node extension behind it; and
+  //  - "reloading helps ONLY IF the pack's frontend changed on disk" is wrong for a
+  //    constructor that reads a mutable setting, where changing it and reloading works.
+  // The only causal claim left is the one the caller proved, and only where it applies.
+  const absentOnly = describeUnmaterializedRequiredWidgets("N", { widgets: [] }, ["amount"]);
+  const present = describeUnmaterializedRequiredWidgets(
+    "N",
+    { widgets: [{ name: "amount", options: { serialize: false } }] },
+    ["amount"],
+  );
+
+  for (const message of [absentOnly, present]) {
+    assert.doesNotMatch(message, /extension re-runs/);
+    assert.doesNotMatch(message, /on disk/);
+    assert.doesNotMatch(message, /only if/i);
+    assert.match(message, /Reload the ComfyUI tab so this node type is registered again/);
+  }
+  // The registration claim is made ONLY where the widget was observed on the node.
+  assert.doesNotMatch(absentOnly, /not a widget-registration failure/);
+  assert.match(present, /not a widget-registration failure/);
 });
 
 test("#700: the refusal describes only the flag the guard actually reads", () => {
