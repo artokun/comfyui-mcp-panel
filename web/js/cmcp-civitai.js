@@ -323,9 +323,17 @@ export const CIVITAI_DETAIL_MAX = 240;
 // Two rules: a LABELLED secret (Authorization: Bearer …, api_key=…), and a bare
 // JWT, which is the shape of CivitAI's OAuth access tokens. The 20-char floor on
 // the value keeps ordinary prose intact ("Invalid API key provided" survives).
+// The optional scheme token matters: "Authorization: Basic <base64>" puts a word
+// between the label and the secret, and without it the credential walks straight
+// through (codex gate finding — Bearer and JWT were covered, Basic was not).
 const _LABELLED_SECRET_RE =
-  /\b(bearer|authorization|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|token)\b[\s:=]*["']?[A-Za-z0-9._~+/-]{20,}={0,2}["']?/gi;
+  /\b(bearer|authorization|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|token)\b[\s:=]*(?:basic|bearer|digest|negotiate|token)?[\s:=]*["']?[A-Za-z0-9._~+/-]{20,}={0,2}["']?/gi;
 const _JWT_RE = /\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}/g;
+
+// Redaction runs over a WINDOW, never the whole body. The patterns are cheap on a
+// sentence and needlessly expensive on the megabytes /api will now carry, and
+// everything past the window is discarded by the cap anyway.
+const _REDACT_WINDOW = CIVITAI_DETAIL_MAX * 8;
 
 /** Replace credential-shaped runs with a visible marker. Never silently drop:
  *  the reader should be able to tell that something was withheld. */
@@ -346,7 +354,13 @@ function _cleanUpstreamText(raw) {
     .replace(/[\u0000-\u001f\u007f]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  const safe = redactCredentials(flat).replace(/\s+/g, " ").trim();
+  // Narrow to the redaction window BEFORE running the credential patterns: those
+  // have adjacent overlapping quantifiers (polynomial, not exponential, but
+  // still wasted work on a multi-megabyte body), and nothing past the window can
+  // reach the user anyway. Flattening above is a linear character-class pass, so
+  // it is safe to do on the whole string.
+  const windowed = flat.length > _REDACT_WINDOW ? flat.slice(0, _REDACT_WINDOW) : flat;
+  const safe = redactCredentials(windowed).replace(/\s+/g, " ").trim();
   return safe.length > CIVITAI_DETAIL_MAX
     ? `${safe.slice(0, CIVITAI_DETAIL_MAX - 1).trimEnd()}…`
     : safe;
@@ -393,7 +407,7 @@ const PANEL_PROXY_SOURCE = "comfyui-mcp-panel";
  *  honest instead of silent; `fromProxy` says who to attribute it to. */
 export function extractUpstreamDetail(bodyText) {
   const raw = typeof bodyText === "string" ? bodyText.trim() : "";
-  if (!raw) return { text: "", shape: "empty", fromProxy: false };
+  if (!raw) return { text: "", shape: "empty", fromProxy: false, proxyRetryable: null };
   let parsed;
   try {
     parsed = JSON.parse(raw);
@@ -402,16 +416,23 @@ export function extractUpstreamDetail(bodyText) {
     // returned, so the header is not evidence — only the body is. A leading "<"
     // is an HTML/XML error page (a CDN or edge 5xx): reporting its shape is
     // honest; pasting its markup into a sentence would be misleading noise.
-    if (raw.startsWith("<")) return { text: "", shape: "html", fromProxy: false };
+    if (raw.startsWith("<")) return { text: "", shape: "html", fromProxy: false, proxyRetryable: null };
     // Everything else is plain text. The panel's own proxy always answers in
     // JSON on the routes this client reads, so unmarked text is CivitAI's.
-    return { text: _cleanUpstreamText(raw), shape: "text", fromProxy: false };
+    return { text: _cleanUpstreamText(raw), shape: "text", fromProxy: false, proxyRetryable: null };
   }
   const fromProxy = parsed?.source === PANEL_PROXY_SOURCE;
+  // When the panel's own proxy authored the body, IT decides whether retrying
+  // helps: the status on such a reply is ours, and says nothing useful. Its 502
+  // covers both "could not reach CivitAI" (worth retrying) and the redirect
+  // allow-list refusal (deterministic — it will fail identically forever), and
+  // inferring "transient" from the number would advise a retry that cannot work.
+  const proxyRetryable =
+    fromProxy && typeof parsed?.retryable === "boolean" ? parsed.retryable : null;
   const msg = _cleanUpstreamText(_messageFromJson(parsed));
   return msg
-    ? { text: msg, shape: "json", fromProxy }
-    : { text: "", shape: "json-nomessage", fromProxy };
+    ? { text: msg, shape: "json", fromProxy, proxyRetryable }
+    : { text: "", shape: "json-nomessage", fromProxy, proxyRetryable };
 }
 
 /** How an upstream HTTP status should steer the user:
@@ -448,6 +469,12 @@ const _ADVICE = {
   auth:
     "CivitAI wants a signed-in account for this — use the account button in the " +
     "CivitAI browser to sign in (or sign out and back in if you already are).",
+  // The panel's own proxy stopped the request. Neither sentence may claim
+  // anything about what CivitAI did — the request may never have reached it.
+  "transient-proxy":
+    "The panel's CivitAI proxy could not complete the request, so retrying " +
+    "shortly may succeed.",
+  "terminal-proxy": "The panel's CivitAI proxy refused this outright, so repeating it will not help.",
 };
 
 /** Build the user-facing description of a non-2xx proxy reply.
@@ -456,8 +483,19 @@ const _ADVICE = {
  *  agent-facing error state can use it without re-parsing prose), and `retryable`
  *  is true / false / null. Pure, and exported for unit tests. */
 export function describeUpstreamFailure({ status, statusText, bodyText, label = "CivitAI API" }) {
-  const { text, shape, fromProxy } = extractUpstreamDetail(bodyText);
-  const cls = upstreamFailureClass(status);
+  const { text, shape, fromProxy, proxyRetryable } = extractUpstreamDetail(bodyText);
+  // A proxy-authored reply carries OUR status, so upstreamFailureClass would be
+  // reading a number that says nothing about CivitAI. Honour what the proxy
+  // declared instead — except for 401/403, where "sign in" is the action either
+  // way. (Codex gate: a 502 from the redirect allow-list guard was being sold to
+  // the user as a transient CivitAI outage worth retrying. It never succeeds.)
+  const statusCls = upstreamFailureClass(status);
+  const cls =
+    proxyRetryable === null || statusCls === "auth"
+      ? statusCls
+      : proxyRetryable
+        ? "transient-proxy"
+        : "terminal-proxy";
   const head = `${label} ${status}: ${statusText || "request failed"}`;
   // Quote and attribute, always: the reader must be able to tell borrowed words
   // from ours, and WHOSE they are. A trailing stop is added when the quote
@@ -469,7 +507,12 @@ export function describeUpstreamFailure({ status, statusText, bodyText, label = 
   return {
     message: [head, "—", said, _ADVICE[cls]].filter(Boolean).join(" "),
     detail: text,
-    retryable: cls === "transient" ? true : cls === "unknown" ? null : false,
+    retryable:
+      cls === "transient" || cls === "transient-proxy"
+        ? true
+        : cls === "unknown"
+          ? null
+          : false,
   };
 }
 
@@ -550,6 +593,7 @@ export class CivitaiClient {
         ? `${msg} (a first attempt had already failed at transport with: ${errText(firstTransportError)})`
         : msg;
     let res;
+    let errorBody = "";
     try {
       for (let attempt = 0; ; attempt++) {
         try {
@@ -599,6 +643,15 @@ export class CivitaiClient {
           throw e;
         }
       }
+      // #705 + #417: read a FAILED response's body while the abort budget above
+      // is still ARMED. Headers can arrive and the body then never finish, and a
+      // body read placed after clearTimeout would turn a perfectly known 503
+      // into the exact hang #417 exists to prevent — _loadMore never reaching
+      // its catch/finally, the grid stuck on {loading:true, total:0}. Inside the
+      // budget, an unfinished body aborts, _readErrorBody swallows it, and the
+      // status is still reported. Only ever entered on the !ok path, so it can
+      // never consume a success body.
+      if (!res.ok) errorBody = await _readErrorBody(res);
     } finally {
       clearTimeout(timeout);
     }
@@ -623,7 +676,7 @@ export class CivitaiClient {
       const upstream = describeUpstreamFailure({
         status: res.status,
         statusText: res.statusText,
-        bodyText: await _readErrorBody(res),
+        bodyText: errorBody,
       });
       throw Object.assign(new Error(withFirstAttempt(upstream.message)), {
         status: res.status,

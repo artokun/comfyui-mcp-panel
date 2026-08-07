@@ -67,10 +67,21 @@ _API_CAP = 16 * 1024 * 1024
 _PROXY_SOURCE = "comfyui-mcp-panel"
 
 
-def _proxy_error(web, message, status):
+def _proxy_error(web, message, status, retryable=False):
     """A JSON error THIS proxy authored, tagged so the panel attributes it to the
-    panel rather than to CivitAI."""
-    return web.json_response({"error": message, "source": _PROXY_SOURCE}, status=status)
+    panel rather than to CivitAI.
+
+    ``retryable`` is declared here rather than inferred from the status, because
+    the status belongs to US and says nothing about whether trying again helps: a
+    502 from the "could not reach CivitAI" path is worth retrying, and a 502 from
+    the redirect allow-list guard is a deterministic refusal that will fail
+    identically forever. Guessing from the number would tell the user to retry a
+    request that cannot succeed — the wrong-advice half of #705.
+    """
+    return web.json_response(
+        {"error": message, "source": _PROXY_SOURCE, "retryable": bool(retryable)},
+        status=status,
+    )
 
 
 # Only these hosts may be proxied (SSRF guard).
@@ -320,14 +331,11 @@ def register(routes, web):
                                 over = True
                                 break
                         if over:
-                            return web.json_response(
-                                {
-                                    "error": "CivitAI's response exceeded the {} MB proxy limit "
-                                    "and was discarded rather than truncated".format(
-                                        _API_CAP // (1024 * 1024)
-                                    )
-                                },
-                                status=502,
+                            return _proxy_error(
+                                web,
+                                "CivitAI's response exceeded the {} MB proxy limit and was "
+                                "discarded rather than truncated".format(_API_CAP // (1024 * 1024)),
+                                502,
                             )
                         try:
                             text = buf.decode(resp.charset or "utf-8", errors="replace")
@@ -348,8 +356,8 @@ def register(routes, web):
                         )
                 except Exception as e:  # network flake
                     if attempt == 2:
-                        return _proxy_error(web, "could not reach CivitAI: " + str(e), 502)
-        return _proxy_error(web, "could not reach CivitAI", 502)
+                        return _proxy_error(web, "could not reach CivitAI: " + str(e), 502, retryable=True)
+        return _proxy_error(web, "could not reach CivitAI", 502, retryable=True)
 
     # Upper bound on a single proxied media body (thumbs + full images). Generous
     # for any real CivitAI asset; caps memory for a hostile/oversize upstream.
@@ -423,7 +431,7 @@ def register(routes, web):
                         if resp.status in _REDIRECTS:
                             loc = resp.headers.get("Location")
                             if not loc:
-                                return _proxy_error(web, "CivitAI sent a redirect with no Location header", 502)
+                                return _proxy_error(web, "CivitAI sent a redirect with no Location header", 502, retryable=True)
                             u = resp.url.join(URL(loc))
                             # A redirect to civitai's own /login (live: 307 →
                             # /login?returnUrl=…&reason=download-auth) means the
@@ -475,7 +483,7 @@ def register(routes, web):
                             await out.write(chunk)
                         await out.write_eof()
                         return out
-                return _proxy_error(web, "CivitAI redirected the download too many times", 502)
+                return _proxy_error(web, "CivitAI redirected the download too many times", 502, retryable=True)
             except Exception as e:
                 # Surface the traceback to ComfyUI's log — a swallowed handler
                 # exception here reads as an opaque 502 to the panel.
@@ -486,7 +494,7 @@ def register(routes, web):
                     if request.transport is not None:
                         request.transport.close()
                     raise
-                return _proxy_error(web, "the download failed: " + str(e), 502)
+                return _proxy_error(web, "the download failed: " + str(e), 502, retryable=True)
 
     @routes.get("/comfyui_mcp_panel/civitai/oauth/start")
     async def _oauth_start(request):

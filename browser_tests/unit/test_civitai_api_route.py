@@ -148,6 +148,41 @@ class ApiPassthrough(unittest.IsolatedAsyncioTestCase):
         # The defining property: nothing partial is handed onward.
         self.assertNotIn("xxxx", body["error"])
         self.assertLess(len(await resp.text()), 1024)
+        # This refusal is OURS, so it must be attributed to us and must not be
+        # advertised as worth retrying — the panel would otherwise narrate the
+        # proxy's own limit as a transient CivitAI outage.
+        self.assertEqual(body["source"], cp._PROXY_SOURCE)
+        self.assertIs(body["retryable"], False)
+
+    # --- proxy-authored errors declare who spoke and whether to retry ---------
+
+    async def test_proxy_authored_errors_are_tagged_and_classified(self):
+        """`source` keeps the panel from quoting our guard rails as CivitAI's
+        words; `retryable` keeps it from advising a retry that cannot work. The
+        status alone carries neither fact — our 502 covers both a transient
+        "could not reach CivitAI" and a permanent allow-list refusal."""
+        cp._host_ok = self._host_ok  # this test wants the REAL allow-list
+        resp = await self.client.post(
+            "/comfyui_mcp_panel/civitai/api", json={"url": "not-a-url"}
+        )
+        self.assertEqual(resp.status, 400)
+        body = await resp.json()
+        self.assertEqual(body["source"], cp._PROXY_SOURCE)
+        self.assertIs(body["retryable"], False)
+        self.assertIn("allow-list", body["error"])
+
+    async def test_an_unreachable_upstream_is_marked_retryable(self):
+        # Point the route at a port nothing is listening on: the request fails at
+        # the socket, which IS worth retrying, and must say so.
+        resp = await self.client.post(
+            "/comfyui_mcp_panel/civitai/api",
+            json={"url": "http://127.0.0.1:1/api/v1/models"},
+        )
+        self.assertEqual(resp.status, 502)
+        body = await resp.json()
+        self.assertEqual(body["source"], cp._PROXY_SOURCE)
+        self.assertIs(body["retryable"], True)
+        self.assertIn("could not reach CivitAI", body["error"])
 
     # --- where redaction lives, pinned on purpose ----------------------------
 

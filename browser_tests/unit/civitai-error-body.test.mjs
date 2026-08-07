@@ -13,9 +13,9 @@
 // The bar these tests hold: the user must be able to tell an outage on the OTHER
 // side of the wire from a bug on ours — without the message ever pretending to a
 // cause it does not have.
-import { test } from "node:test";
+import { test, mock } from "node:test";
 import assert from "node:assert/strict";
-import { CivitaiClient } from "../../web/js/cmcp-civitai.js";
+import { CivitaiClient, CIVITAI_REQUEST_TIMEOUT_MS } from "../../web/js/cmcp-civitai.js";
 
 // Control characters, written as escapes on purpose: a literal control byte in
 // a source file makes it git-BINARY and unreviewable.
@@ -124,12 +124,56 @@ test("#705: a body the panel's OWN proxy authored is not narrated as CivitAI's w
     clientReturning(
       errorResponse(502, "Bad Gateway",
         '{"error":"CivitAI redirected the download to a host this proxy will not follow",' +
-        '"source":"comfyui-mcp-panel"}'),
+        '"source":"comfyui-mcp-panel","retryable":false}'),
     ),
   );
   assert.match(err.message, /panel's CivitAI proxy said/);
   assert.doesNotMatch(err.message, /CivitAI said/);
   assert.equal(err.detail, "CivitAI redirected the download to a host this proxy will not follow");
+});
+
+test("#705: a proxy guard's PERMANENT refusal is never sold as a transient outage", async () => {
+  // Codex gate P2. upstreamFailureClass(502) says "transient", but the 502 here
+  // is OURS: the redirect allow-list refused, and it will refuse identically
+  // forever. Advising a retry would be the wrong-advice half of this very issue.
+  const err = await rejectionFrom(
+    clientReturning(
+      errorResponse(502, "Bad Gateway",
+        '{"error":"CivitAI redirected the download to a host this proxy will not follow",' +
+        '"source":"comfyui-mcp-panel","retryable":false}'),
+    ),
+  );
+  assert.equal(err.retryable, false);
+  assert.doesNotMatch(err.message, /retrying shortly may succeed/i);
+  assert.match(err.message, /will not help/i);
+  // And it must not put words in CivitAI's mouth about what CivitAI did.
+  assert.doesNotMatch(err.message, /CivitAI failed this request on its own side/);
+});
+
+test("#705: a proxy failure the proxy calls RETRYABLE keeps the retry advice", async () => {
+  const err = await rejectionFrom(
+    clientReturning(
+      errorResponse(502, "Bad Gateway",
+        '{"error":"could not reach CivitAI: connection reset",' +
+        '"source":"comfyui-mcp-panel","retryable":true}'),
+    ),
+  );
+  assert.equal(err.retryable, true);
+  assert.match(err.message, /retrying shortly may succeed/i);
+  assert.match(err.message, /panel's CivitAI proxy/);
+});
+
+test("#705: a proxy-authored 401 still points at sign-in, not at the proxy", async () => {
+  // Whoever produced the body, the ACTION for a 401 is the same.
+  const err = await rejectionFrom(
+    clientReturning(
+      errorResponse(401, "Unauthorized",
+        '{"error":"sign-in required to download this file",' +
+        '"source":"comfyui-mcp-panel","retryable":false}'),
+    ),
+  );
+  assert.match(err.message, /sign in|sign-in|signed-in/i);
+  assert.equal(err.retryable, false);
 });
 
 test("#705: a quote without terminal punctuation does not run into the advice", async () => {
@@ -225,6 +269,47 @@ test("#705: a credential echoed back by the upstream is never re-displayed", asy
   assert.match(err.detail, /redacted/i);
 });
 
+test("#705: a Basic credential is redacted too — the scheme must not smuggle it through", async () => {
+  // Codex gate P2: the labelled-secret pattern could not step over an auth
+  // SCHEME, so "Authorization: Basic <base64>" walked straight through while
+  // Bearer was caught. Value below is base64 of a well-known RFC example pair.
+  const body = JSON.stringify({
+    error: "rejected: Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+  });
+  const err = await rejectionFrom(clientReturning(errorResponse(401, "Unauthorized", body)));
+  assert.doesNotMatch(err.message, /QWxhZGRpbjpvcGVu/);
+  assert.doesNotMatch(err.detail, /QWxhZGRpbjpvcGVu/);
+  assert.match(err.detail, /redacted/i);
+});
+
+test("#705: ordinary prose containing 'token' or 'API key' is NOT redacted away", async () => {
+  // Over-redaction destroys the actionable message — the failure mode this whole
+  // change exists to remove. Short, wordy values must survive untouched.
+  for (const msg of [
+    "Your token expired, please sign in again",
+    "Invalid API key provided",
+    "authorization required for this endpoint",
+  ]) {
+    const err = await rejectionFrom(
+      clientReturning(errorResponse(401, "Unauthorized", JSON.stringify({ error: msg }))),
+    );
+    assert.equal(err.detail, msg);
+  }
+});
+
+test("#705: redaction of a huge hostile body stays fast (bounded window)", async () => {
+  // The /api cap allows megabytes through, and the credential patterns have
+  // adjacent overlapping quantifiers. Redacting the whole body would be wasted
+  // polynomial work on text that is discarded by the cap regardless.
+  const hostile = "token" + " ".repeat(200000) + "=".repeat(200000);
+  const started = Date.now();
+  const err = await rejectionFrom(
+    clientReturning(errorResponse(500, "Internal Server Error", JSON.stringify({ error: hostile }))),
+  );
+  assert.ok(Date.now() - started < 2000, "redaction must not blow up on a large body");
+  assert.ok(err.detail.length <= 240);
+});
+
 test("#705: a JWT-shaped string in the body is redacted even without a label", async () => {
   const jwtish = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJub3RyZWFsIn0.notarealsignaturehere";
   const err = await rejectionFrom(
@@ -252,6 +337,46 @@ test("#705: a body that cannot be read still yields the status message", async (
   assert.equal(err.detail, "");
   // The read failure is OUR problem, not something to narrate as CivitAI's.
   assert.doesNotMatch(err.message, /body stream already read/);
+});
+
+test("#705: a body that NEVER SETTLES must not turn a known 503 into a hang", async () => {
+  // Codex gate P1. Headers can arrive and the body then never finish. Reading it
+  // after the #417 abort budget was cleared would leave _request pending
+  // forever — _loadMore never reaching its catch/finally, the grid frozen on
+  // {loading:true, total:0, error:null}: the exact defect #417 removed,
+  // reintroduced by the fix for #705. The read happens INSIDE the budget, so the
+  // abort fires, the body read is abandoned, and the status is still reported.
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const client = new CivitaiClient({
+      fetchApi: async (_path, opts) => ({
+        ok: false,
+        status: 503,
+        statusText: "Service Unavailable",
+        // Real fetch errors a pending body read when its signal aborts.
+        text: () =>
+          new Promise((_resolve, reject) => {
+            opts.signal.addEventListener("abort", () => {
+              const e = new Error("The operation was aborted");
+              e.name = "AbortError";
+              reject(e);
+            });
+          }),
+      }),
+      apiURL: (p) => p,
+    });
+    const pending = client._request({ url: "https://civitai.red/api/v1/models" });
+    await Promise.resolve(); // let the fetch resolve and the body read start
+    mock.timers.tick(CIVITAI_REQUEST_TIMEOUT_MS + 1);
+    await assert.rejects(pending, (e) => {
+      assert.equal(e.status, 503);
+      assert.match(e.message, /CivitAI API 503: Service Unavailable/);
+      assert.equal(e.detail, "");
+      return true;
+    });
+  } finally {
+    mock.timers.reset();
+  }
 });
 
 test("#705: a response with no text() at all degrades to the status message", async () => {
@@ -289,7 +414,7 @@ test("#705: downloadVersionFile carries the upstream reason and status", async (
   const client = new CivitaiClient({
     fetchApi: async () =>
       errorResponse(401, "Unauthorized",
-        '{"error":"sign-in required to download this file","source":"comfyui-mcp-panel"}'),
+        '{"error":"sign-in required to download this file","source":"comfyui-mcp-panel","retryable":false}'),
     apiURL: (p) => p,
   });
   await assert.rejects(
@@ -309,7 +434,7 @@ test("#705: a download blocked by the proxy's own guard names the guard, and nam
     fetchApi: async () =>
       errorResponse(502, "Bad Gateway",
         '{"error":"CivitAI redirected the download to a host this proxy will not follow",' +
-        '"source":"comfyui-mcp-panel"}'),
+        '"source":"comfyui-mcp-panel","retryable":false}'),
     apiURL: (p) => p,
   });
   await assert.rejects(
@@ -317,7 +442,8 @@ test("#705: a download blocked by the proxy's own guard names the guard, and nam
     (e) => {
       assert.ok(e.message.includes("this proxy will not follow"));
       assert.match(e.message, /panel's CivitAI proxy said/);
-      assert.equal(e.retryable, true); // 502 is an upstream failure, not a rejection
+      // The guard is deterministic: retrying it unchanged can never work.
+      assert.equal(e.retryable, false);
       return true;
     },
   );
