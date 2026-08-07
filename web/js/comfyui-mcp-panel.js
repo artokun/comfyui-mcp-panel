@@ -6270,6 +6270,31 @@ function clearStaleRedFlag(node, { app, graph, rootGraph }) {
  * wrapper but does not revalidate their sticky red flags. Re-adjudicate only
  * those direct neighbours; never the wrapper or the nodes moved inside it.
  */
+/** Confirm `convertToSubgraph` actually produced a subgraph NODE on this graph.
+ *
+ *  Both conversion tools reported `node_id: res?.node?.id ?? null` — so a conversion
+ *  that produced nothing returned `{subgraph: {node_id: null, name: null, …}}` with no
+ *  error, which reads as "a subgraph was created". The sibling graph_add_subgraph
+ *  already guards this ("don't report a fake success if deserialize produced
+ *  nothing"); this is the same rule applied to the two paths that were missing it.
+ *
+ *  Presence is checked on the LIVE graph, not just on the returned object: a result
+ *  carrying a node that never landed is exactly the case a truthful report must catch. */
+function assertSubgraphNodeLanded(res, graph, what) {
+  const node = res?.node;
+  const id = node?.id;
+  const list = Array.isArray(graph?._nodes) ? graph._nodes : null;
+  if (id == null || (list && !list.includes(node))) {
+    throw new Error(
+      `${what} did not produce a subgraph node on the canvas — the frontend's ` +
+        `convertToSubgraph returned no usable node. Nothing is being reported as created; ` +
+        `the selected nodes are left as they are. Re-read the graph (panel_graph_outline) ` +
+        `before retrying.`,
+    );
+  }
+  return node;
+}
+
 function clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph }) {
   try {
     for (const id of collectLinkedNeighborNodeIds(res?.node, graph?.links)) {
@@ -11615,9 +11640,12 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph });
     graph.setDirtyCanvas?.(true, true);
+    // `node_id: null` inside a `subgraph:` payload reads as a success with a missing
+    // field, not as a failure. Refuse instead — see assertSubgraphNodeLanded.
+    const created = assertSubgraphNodeLanded(res, graph, "panel_create_subgraph");
     return {
       subgraph: {
-        node_id: res?.node?.id ?? null,
+        node_id: created.id,
         name: res?.subgraph?.name ?? null,
         from_nodes: ns.map((n) => n.id),
       },
@@ -11657,9 +11685,12 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph });
     graph.setDirtyCanvas?.(true, true);
+    // Same guard as panel_create_subgraph: a conversion that produced no node must
+    // not report a subgraph with a null id.
+    const grouped = assertSubgraphNodeLanded(res, graph, "panel_subgraph_group");
     return {
       subgraph: {
-        node_id: res?.node?.id ?? null,
+        node_id: grouped.id,
         name: res?.subgraph?.name ?? null,
         from_group: g.title ?? null,
         from_nodes: ns.map((n) => n.id),
