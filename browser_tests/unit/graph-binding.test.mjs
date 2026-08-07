@@ -1821,6 +1821,7 @@ function buildProgrammaticSaveHarness({ onSave } = {}) {
     "workflowExistsOnDisk",
     "workflowDiskBytes",
     "reconcileSavedWorkflowCopy",
+    "describeLiveCanvasBinding",
     "describeSaveOutcome",
     "classifyOriginalOnDisk",
     "normalizePath",
@@ -1848,6 +1849,7 @@ function buildProgrammaticSaveHarness({ onSave } = {}) {
     async () => true,
     async () => null,
     async () => "unknown",
+    () => "unknown", // describeLiveCanvasBinding — no durable tag in this harness (#708)
     () => ({ saved_as: false }),
     () => "unknown",
     (p) => p,
