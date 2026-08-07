@@ -297,6 +297,49 @@ test("#705: ordinary prose containing 'token' or 'API key' is NOT redacted away"
   }
 });
 
+test("#705: a proxy body that does NOT declare retryability claims neither outcome", async () => {
+  // Codex gate round 2. A proxy older than this panel JS sends `source` without
+  // `retryable`. Falling back to the status would read OUR 502 as CivitAI's and
+  // print "the panel's proxy said …" immediately followed by "CivitAI failed
+  // this on its own side" — two contradictory claims in one sentence.
+  const err = await rejectionFrom(
+    clientReturning(
+      errorResponse(502, "Bad Gateway", '{"error":"redirect blocked","source":"comfyui-mcp-panel"}'),
+    ),
+  );
+  assert.equal(err.retryable, null);
+  assert.doesNotMatch(err.message, /CivitAI failed this request on its own side/);
+  assert.doesNotMatch(err.message, /retrying shortly may succeed/i);
+  assert.doesNotMatch(err.message, /will not help/i);
+  assert.match(err.message, /came from the panel's CivitAI proxy/);
+});
+
+test("#705: a `retryable` field on a body we did NOT author is ignored", async () => {
+  // Only the panel's own proxy gets to declare this; an upstream body claiming
+  // `retryable` must not steer our advice.
+  const err = await rejectionFrom(
+    clientReturning(errorResponse(400, "Bad Request", '{"error":"nope","retryable":true}')),
+  );
+  assert.equal(err.retryable, false);
+  assert.match(err.message, /CivitAI said/);
+  assert.match(err.message, /will not help/i);
+});
+
+test("#705: content dropped by the redaction window is never silently lost", async () => {
+  // Codex gate round 2: redaction SHRINKS text, so a body that overflowed the
+  // window can land back under the cap and skip the truncation marker — the
+  // reader sees a message that looks whole while the real cause sat past the
+  // window. Three long token runs, then the actual reason.
+  const raw =
+    `token=${"A".repeat(900)} token=${"B".repeat(900)} token=${"C".repeat(900)} ` +
+    "the actual cause was a schema migration";
+  const err = await rejectionFrom(
+    clientReturning(errorResponse(500, "Internal Server Error", JSON.stringify({ error: raw }))),
+  );
+  assert.doesNotMatch(err.detail, /AAAA|BBBB|CCCC/, "the credential runs are still redacted");
+  assert.ok(err.detail.endsWith("…"), `truncation must stay visible: ${err.detail}`);
+});
+
 test("#705: redaction of a huge hostile body stays fast (bounded window)", async () => {
   // The /api cap allows megabytes through, and the credential patterns have
   // adjacent overlapping quantifiers. Redacting the whole body would be wasted

@@ -360,10 +360,17 @@ function _cleanUpstreamText(raw) {
   // reach the user anyway. Flattening above is a linear character-class pass, so
   // it is safe to do on the whole string.
   const windowed = flat.length > _REDACT_WINDOW ? flat.slice(0, _REDACT_WINDOW) : flat;
+  const clipped = windowed.length < flat.length;
   const safe = redactCredentials(windowed).replace(/\s+/g, " ").trim();
-  return safe.length > CIVITAI_DETAIL_MAX
-    ? `${safe.slice(0, CIVITAI_DETAIL_MAX - 1).trimEnd()}…`
-    : safe;
+  if (safe.length > CIVITAI_DETAIL_MAX) {
+    return `${safe.slice(0, CIVITAI_DETAIL_MAX - 1).trimEnd()}…`;
+  }
+  // Redaction SHRINKS text, so a body that overflowed the window can come back
+  // under the cap and skip the marker above — the reader would then see a
+  // message that looks whole while the real cause sat past the window. If
+  // anything was dropped, say so. (Codex gate: three long `token=…` runs
+  // followed by the actual reason rendered as "token [redacted]" ×3, full stop.)
+  return clipped ? `${safe}…` : safe;
 }
 
 const _firstString = (...vals) => {
@@ -475,6 +482,8 @@ const _ADVICE = {
     "The panel's CivitAI proxy could not complete the request, so retrying " +
     "shortly may succeed.",
   "terminal-proxy": "The panel's CivitAI proxy refused this outright, so repeating it will not help.",
+  // Ours, but we don't know whether retrying helps — so claim neither.
+  "unknown-proxy": "This failure came from the panel's CivitAI proxy rather than from a CivitAI response.",
 };
 
 /** Build the user-facing description of a non-2xx proxy reply.
@@ -490,12 +499,22 @@ export function describeUpstreamFailure({ status, statusText, bodyText, label = 
   // way. (Codex gate: a 502 from the redirect allow-list guard was being sold to
   // the user as a transient CivitAI outage worth retrying. It never succeeds.)
   const statusCls = upstreamFailureClass(status);
-  const cls =
-    proxyRetryable === null || statusCls === "auth"
-      ? statusCls
-      : proxyRetryable
-        ? "transient-proxy"
-        : "terminal-proxy";
+  let cls;
+  if (statusCls === "auth") {
+    cls = "auth"; // whoever spoke, signing in is the action
+  } else if (!fromProxy) {
+    cls = statusCls;
+  } else if (proxyRetryable === true) {
+    cls = "transient-proxy";
+  } else if (proxyRetryable === false) {
+    cls = "terminal-proxy";
+  } else {
+    // Proxy-authored but silent about retryability (an older proxy than this
+    // panel JS). Falling back to the status would read the number as CivitAI's
+    // and tell the user "CivitAI failed this on its own side" directly after
+    // saying the PANEL's proxy spoke — two contradictory claims in one message.
+    cls = "unknown-proxy";
+  }
   const head = `${label} ${status}: ${statusText || "request failed"}`;
   // Quote and attribute, always: the reader must be able to tell borrowed words
   // from ours, and WHOSE they are. A trailing stop is added when the quote
@@ -510,7 +529,7 @@ export function describeUpstreamFailure({ status, statusText, bodyText, label = 
     retryable:
       cls === "transient" || cls === "transient-proxy"
         ? true
-        : cls === "unknown"
+        : cls === "unknown" || cls === "unknown-proxy"
           ? null
           : false,
   };
