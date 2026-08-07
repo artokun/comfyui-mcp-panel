@@ -358,6 +358,7 @@ import {
 import { createRestartTabIdentity, sendBridgeHello } from "./lib/restart-tab-identity.js";
 import { primeModuleCache, resolveBundleStaleness } from "./lib/bundle-version.js";
 import { classifyManager404 } from "./lib/manager-404.js";
+import { probeConsoleRoute, UNBUILT_ROUTE_TITLE } from "./lib/console-route-probe.js";
 import {
   createTabRouteIdentity,
   describeRefusedRoute,
@@ -17259,6 +17260,28 @@ function buildPanel() {
     }
     window.open(`${cmcpConsoleUrl}/prompts?token=${encodeURIComponent(cmcpConsoleToken)}`, "_blank", "noopener");
   });
+  // #703 — the console page this opens was never built: the orchestrator serves
+  // neither /prompts nor /api/prompts, so clicking used to open a tab showing
+  // {"ok":false,"error":"not_found"} — which reads like the running server is
+  // broken rather than like an unbuilt feature.
+  //
+  // Probe HERE, while the popover is being built, rather than on click: an async
+  // window.open after an awaited fetch loses the user-gesture and gets caught by
+  // popup blockers. Only a definitive 404 disables the button (see the probe's
+  // header) — a flaky or unreachable console leaves it enabled, because removing
+  // a working button on a failed probe is the worse error. When the console
+  // starts serving the page, this re-enables itself with no further change.
+  if (cmcpConsoleUrl && cmcpConsoleToken) {
+    void probeConsoleRoute(
+      `${cmcpConsoleUrl}/prompts?token=${encodeURIComponent(cmcpConsoleToken)}`,
+    ).then(({ available }) => {
+      if (available) return;
+      promptsBtn.disabled = true;
+      promptsBtn.style.opacity = "0.4";
+      promptsBtn.style.cursor = "not-allowed";
+      promptsBtn.title = UNBUILT_ROUTE_TITLE;
+    });
+  }
 
   const btnRow = document.createElement("div");
   btnRow.style.cssText = "display:flex;gap:0.375rem;align-items:center;flex-wrap:wrap;";
