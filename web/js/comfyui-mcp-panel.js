@@ -8628,7 +8628,25 @@ const GRAPH_TOOL_EXECUTORS = {
       graph.afterChange();
     }
     graph.setDirtyCanvas(true, true);
-    return { cleared: nodes.length };
+    // Report what LEFT the graph, not what was attempted. `nodes.length` is the count
+    // present when the sweep started; safeRemoveNode reports success when
+    // `graph.remove` did not throw, which is not the same as the node being gone —
+    // exactly the gap that let panel_remove_group report a group still on the canvas.
+    // A survivor here is worse: the caller believes the canvas is empty and starts
+    // building on top of nodes that are still wired.
+    const remaining = Array.isArray(graph._nodes) ? graph._nodes.length : 0;
+    const cleared = nodes.length - remaining;
+    if (remaining > 0) {
+      return {
+        cleared,
+        remaining,
+        warning:
+          `${remaining} of ${nodes.length} node(s) are STILL on the canvas — the graph is ` +
+          `NOT empty. Re-read it (panel_graph_outline) before adding anything: building on ` +
+          `an assumed-empty canvas is how nodes end up wired to leftovers.`,
+      };
+    }
+    return { cleared };
   },
 
   // Load a COMPLETE workflow onto the live canvas in one shot (replaces the
