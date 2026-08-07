@@ -135,7 +135,12 @@ class DownloadRouteIntegration(unittest.TestCase):
             try:
                 resp = await client.get("/comfyui_mcp_panel/civitai/download?versionId=2")
                 self.assertEqual(resp.status, 502)
-                self.assertIn("redirect target not allowed", await resp.text())
+                # #705: the guard's reason is now a JSON body the panel can quote,
+                # tagged with `source` so it is attributed to THIS proxy and not
+                # narrated to the user as something CivitAI said.
+                body = await resp.json()
+                self.assertIn("will not follow", body["error"])
+                self.assertEqual(body["source"], cp._PROXY_SOURCE)
             finally:
                 await client.close()
         self._run(go())

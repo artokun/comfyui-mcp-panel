@@ -287,6 +287,204 @@ export function normalizeTrpcResponse(data) {
   return data;
 }
 
+// ── upstream failure description (#705) ─────────────────────────────────────
+// A bare "CivitAI API 503: Service Unavailable" is a MISLEADING error, not just
+// a terse one: it reads as QUERY-SPECIFIC ("my search for 'min' is broken") and
+// sent the reporter of #705 hunting through our code, while the actual cause was
+// sitting in the response body the Python proxy already forwards verbatim —
+//   {"error":"Model search is temporarily overloaded — please retry."}
+// The user has to be able to tell an outage on CivitAI's side of the wire from a
+// bug on ours, and the body is the only place that distinction exists.
+//
+// Three rules hold everything below together:
+//   1. NEVER pretend to a cause. An empty body, an HTML edge-cache page and a
+//      JSON blob with no message field each get a description of what ACTUALLY
+//      came back; none of them get a fabricated reason. "503, no detail from
+//      CivitAI" beats a bare status, and beats an invented explanation by more.
+//   2. NEVER dump the body. It is untrusted, arbitrary-length text heading for a
+//      UI string and the ComfyUI console: bounded, flattened to one line, control
+//      bytes stripped, credential-shaped runs redacted, and always QUOTED and
+//      ATTRIBUTED so CivitAI's words can never be mistaken for ours. (The error
+//      card renders via textContent, so markup can't execute — but pasting a CDN
+//      error page into a sentence is its own misleading-error bug.)
+//   3. Advice follows the STATUS, not the body. "Retry shortly" is right for a
+//      503 and actively wrong for a 400 that will never succeed however often
+//      it is repeated.
+
+/** Longest run of upstream text quoted into a user-facing message. Generous
+ *  enough for a real API sentence, small enough that a hostile or accidental
+ *  megabyte-long body cannot BECOME the error card. */
+export const CIVITAI_DETAIL_MAX = 240;
+
+// Credential-shaped runs, redacted before any upstream text is displayed or
+// logged. The proxy injects the CivitAI OAuth bearer (and the MeiliSearch key)
+// into the REQUEST, server-side; an upstream that echoes a request header back
+// inside its error body must not turn our own error card into a token leak.
+// Two rules: a LABELLED secret (Authorization: Bearer …, api_key=…), and a bare
+// JWT, which is the shape of CivitAI's OAuth access tokens. The 20-char floor on
+// the value keeps ordinary prose intact ("Invalid API key provided" survives).
+const _LABELLED_SECRET_RE =
+  /\b(bearer|authorization|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|token)\b[\s:=]*["']?[A-Za-z0-9._~+/-]{20,}={0,2}["']?/gi;
+const _JWT_RE = /\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}/g;
+
+/** Replace credential-shaped runs with a visible marker. Never silently drop:
+ *  the reader should be able to tell that something was withheld. */
+export function redactCredentials(text) {
+  return String(text)
+    .replace(_JWT_RE, "[redacted]")
+    .replace(_LABELLED_SECRET_RE, (_m, label) => `${label} [redacted]`);
+}
+
+/** One-line, control-byte-free, credential-free, bounded rendering of untrusted
+ *  upstream text. Truncation is MARKED (…), never silent — a message that was
+ *  quietly cut in half is a new way to mislead. */
+function _cleanUpstreamText(raw) {
+  const flat = String(raw ?? "")
+    // Newlines, tabs, ANSI escapes and stray NULs all become spaces: a one-line
+    // error card must stay one line, and no control byte may ride an untrusted
+    // body into the DOM or the console.
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const safe = redactCredentials(flat).replace(/\s+/g, " ").trim();
+  return safe.length > CIVITAI_DETAIL_MAX
+    ? `${safe.slice(0, CIVITAI_DETAIL_MAX - 1).trimEnd()}…`
+    : safe;
+}
+
+const _firstString = (...vals) => {
+  for (const v of vals) if (typeof v === "string" && v.trim()) return v;
+  return "";
+};
+
+/** Pull the human sentence out of a parsed error body. The shapes are the ones
+ *  CivitAI and this proxy actually produce: REST {"error":"…"}, the panel proxy's
+ *  own {"error":"…"} guards, tRPC {"error":{"json":{"message":…}}}, and Zod's
+ *  {"error":{"issues":[{"message":…}]}} (which is what a #459-class 400 looks
+ *  like). A deliberately SHALLOW, ordered lookup — a generic deep search would
+ *  happily surface some unrelated nested string as "the reason". */
+function _messageFromJson(j) {
+  if (typeof j === "string") return j;
+  if (Array.isArray(j)) return j.length ? _messageFromJson(j[0]) : ""; // tRPC batch
+  if (!j || typeof j !== "object") return "";
+  const e = j.error;
+  return _firstString(
+    typeof e === "string" ? e : "",
+    e?.message,
+    e?.json?.message,
+    j.message,
+    j.detail,
+    j.error_description,
+    e?.issues?.[0]?.message,
+    j.issues?.[0]?.message,
+  );
+}
+
+/** Marker py/civitai_proxy.py stamps on error bodies IT authored. Its absence
+ *  means the body came from CivitAI. Quoting our own guard rails back at the
+ *  user as "CivitAI said: …" would be the same misattribution #705 is about,
+ *  only pointed the other way — the whole bar here is that the user can tell an
+ *  outage on CivitAI's side of the wire from a problem on ours. */
+const PANEL_PROXY_SOURCE = "comfyui-mcp-panel";
+
+/** Turn a raw upstream body into `{ text, shape, fromProxy }`. `text` is the
+ *  quotable sentence — already flattened, redacted and bounded — or "" when
+ *  there isn't one; `shape` says what actually came back so the caller can be
+ *  honest instead of silent; `fromProxy` says who to attribute it to. */
+export function extractUpstreamDetail(bodyText) {
+  const raw = typeof bodyText === "string" ? bodyText.trim() : "";
+  if (!raw) return { text: "", shape: "empty", fromProxy: false };
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // The proxy stamps content_type:"application/json" on WHATEVER CivitAI
+    // returned, so the header is not evidence — only the body is. A leading "<"
+    // is an HTML/XML error page (a CDN or edge 5xx): reporting its shape is
+    // honest; pasting its markup into a sentence would be misleading noise.
+    if (raw.startsWith("<")) return { text: "", shape: "html", fromProxy: false };
+    // Everything else is plain text. The panel's own proxy always answers in
+    // JSON on the routes this client reads, so unmarked text is CivitAI's.
+    return { text: _cleanUpstreamText(raw), shape: "text", fromProxy: false };
+  }
+  const fromProxy = parsed?.source === PANEL_PROXY_SOURCE;
+  const msg = _cleanUpstreamText(_messageFromJson(parsed));
+  return msg
+    ? { text: msg, shape: "json", fromProxy }
+    : { text: "", shape: "json-nomessage", fromProxy };
+}
+
+/** How an upstream HTTP status should steer the user:
+ *   transient — CivitAI failed the request on its own side; retrying may work.
+ *   terminal  — CivitAI REJECTED the request; repeating it unchanged cannot work.
+ *   auth      — it needs a signed-in account.
+ *   unknown   — claim neither.
+ *  Status-driven on purpose: the body says what went wrong, the status says
+ *  whether doing the same thing again is worth the user's time. */
+export function upstreamFailureClass(status) {
+  const s = Number(status);
+  if (s === 401 || s === 403) return "auth";
+  if (s === 408 || s === 425 || s === 429) return "transient";
+  // 501/505 are 5xx the server will never satisfy, however long you wait.
+  if (s === 501 || s === 505) return "terminal";
+  if (s >= 500 && s <= 599) return "transient";
+  if (s >= 400 && s <= 499) return "terminal";
+  return "unknown";
+}
+
+const _SHAPE_NOTE = {
+  empty: "There was no detail in CivitAI's response body.",
+  html:
+    "CivitAI returned an HTML error page instead of JSON (typically a CDN or edge " +
+    "failure in front of the API), so it gave no machine-readable reason.",
+  "json-nomessage": "CivitAI's response body was JSON with no error message in it.",
+};
+
+const _ADVICE = {
+  transient:
+    "CivitAI failed this request on its own side rather than rejecting it, so " +
+    "retrying shortly may succeed.",
+  terminal: "CivitAI rejected the request itself, so repeating it unchanged will not help.",
+  auth:
+    "CivitAI wants a signed-in account for this — use the account button in the " +
+    "CivitAI browser to sign in (or sign out and back in if you already are).",
+};
+
+/** Build the user-facing description of a non-2xx proxy reply.
+ *  Returns `{ message, detail, retryable }`: `message` is the whole sentence for
+ *  the error card, `detail` is the bounded upstream text ALONE (so the UI and the
+ *  agent-facing error state can use it without re-parsing prose), and `retryable`
+ *  is true / false / null. Pure, and exported for unit tests. */
+export function describeUpstreamFailure({ status, statusText, bodyText, label = "CivitAI API" }) {
+  const { text, shape, fromProxy } = extractUpstreamDetail(bodyText);
+  const cls = upstreamFailureClass(status);
+  const head = `${label} ${status}: ${statusText || "request failed"}`;
+  // Quote and attribute, always: the reader must be able to tell borrowed words
+  // from ours, and WHOSE they are. A trailing stop is added when the quote
+  // doesn't carry one, so the advice that follows doesn't run into it.
+  const who = fromProxy ? "The panel's CivitAI proxy said" : "CivitAI said";
+  const said = text
+    ? `${who}: “${text}”${/[.!?…]$/.test(text) ? "" : "."}`
+    : _SHAPE_NOTE[shape] || _SHAPE_NOTE.empty;
+  return {
+    message: [head, "—", said, _ADVICE[cls]].filter(Boolean).join(" "),
+    detail: text,
+    retryable: cls === "transient" ? true : cls === "unknown" ? null : false,
+  };
+}
+
+/** Best-effort read of a FAILED response's body. A body we cannot read is our
+ *  problem, not CivitAI's: it degrades to the status description and must never
+ *  mask, replace or narrate over the failure it was meant to explain. Only ever
+ *  called on the !res.ok path, so it can never consume a success body. */
+async function _readErrorBody(res) {
+  try {
+    return typeof res?.text === "function" ? await res.text() : "";
+  } catch {
+    return ""; // e.g. an already-consumed stream — say nothing rather than lie
+  }
+}
+
 export class CivitaiClient {
   /** @param {object} api ComfyUI api ({fetchApi, apiURL}) injected by the monolith. */
   constructor(api) {
@@ -416,8 +614,21 @@ export class CivitaiClient {
       // (an extension blocking the request, a dropped connection) is silently
       // replaced by an unrelated upstream status. Same rule as the transport
       // and timeout throws above: report the whole trail, never just the last.
-      throw Object.assign(new Error(withFirstAttempt(`CivitAI API ${res.status}: ${res.statusText || "request failed"}`)), {
+      //
+      // #705: read the forwarded BODY too. The proxy hands CivitAI's own bytes
+      // back with the upstream status, and that is where the actionable text
+      // lives ("Model search is temporarily overloaded — please retry."); a
+      // message built from status/statusText alone throws all of it away and
+      // reads as though the user's own query were at fault.
+      const upstream = describeUpstreamFailure({
         status: res.status,
+        statusText: res.statusText,
+        bodyText: await _readErrorBody(res),
+      });
+      throw Object.assign(new Error(withFirstAttempt(upstream.message)), {
+        status: res.status,
+        detail: upstream.detail,
+        retryable: upstream.retryable,
         ...(firstTransportError ? { cause: firstTransportError } : {}),
       });
     }
@@ -901,9 +1112,22 @@ export class CivitaiClient {
     if (format) q.set("format", format);
     const res = await this.api.fetchApi(`/comfyui_mcp_panel/civitai/download?${q.toString()}`);
     if (!res.ok) {
-      const err = new Error(`civitai download ${res.status}`);
-      err.status = res.status;
-      throw err;
+      // #705, second call site with the same swallow: `civitai download 502` told
+      // the user nothing, while the proxy's reply says exactly what happened —
+      // {"error":"sign-in required to download this file"} for a gated file, and
+      // text/plain reasons from its own guards ("redirect target not allowed",
+      // "file too large"). Same bounded, attributed treatment as _request.
+      const upstream = describeUpstreamFailure({
+        status: res.status,
+        statusText: res.statusText,
+        bodyText: await _readErrorBody(res),
+        label: "CivitAI download",
+      });
+      throw Object.assign(new Error(upstream.message), {
+        status: res.status,
+        detail: upstream.detail,
+        retryable: upstream.retryable,
+      });
     }
     return new Uint8Array(await res.arrayBuffer());
   }
