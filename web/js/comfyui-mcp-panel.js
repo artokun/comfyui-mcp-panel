@@ -357,6 +357,7 @@ import {
 } from "./lib/session-rebind.js";
 import { createRestartTabIdentity, sendBridgeHello } from "./lib/restart-tab-identity.js";
 import { primeModuleCache, resolveBundleStaleness } from "./lib/bundle-version.js";
+import { classifyManager404 } from "./lib/manager-404.js";
 import {
   createTabRouteIdentity,
   describeRefusedRoute,
@@ -3929,8 +3930,22 @@ async function managerV2(route, { method = "GET", body, signal } = {}) {
     // #605 mutation self-heal can tell it apart from the ambiguous no-response
     // case above (a lost response proves NOTHING about whether the request
     // landed, so it must never authorize a mutation re-send — codex P0).
-    const err = new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)");
-    err.managerRouteMissing = true;
+    //
+    // …EXCEPT legacy Manager 3.x answers a SECURITY-GATED operation with 404 +
+    // an "A security error has occurred" body, where the route exists and its
+    // handler REFUSED (#706). That is not route-missing and must NOT authorize
+    // a re-send. Read the body before deciding; an unreadable body falls back
+    // to route-missing, which is the pre-#706 behaviour.
+    let body = "";
+    try {
+      body = await res.text();
+    } catch {
+      /* body unreadable — classifyManager404 treats that as route-missing */
+    }
+    const { routeMissing, message } = classifyManager404(body);
+    const err = new Error(message);
+    if (routeMissing) err.managerRouteMissing = true;
+    else err.managerSecurityRefusal = true;
     throw err;
   }
   if (!res.ok) {
@@ -3961,9 +3976,19 @@ async function managerCall(route, { method = "GET", body, signal } = {}) {
   }
   if (res.status === 404) {
     // See managerV2: a 404 is the PROVEN route-level rejection the #605
-    // mutation self-heal may retry on (err.managerRouteMissing).
-    const err = new Error("ComfyUI-Manager not reachable (is the built-in Manager enabled?)");
-    err.managerRouteMissing = true;
+    // mutation self-heal may retry on (err.managerRouteMissing) — unless the
+    // body says the Manager's SECURITY GATE refused it (#706), in which case a
+    // handler ran and a re-send must not be authorized.
+    let body = "";
+    try {
+      body = await res.text();
+    } catch {
+      /* body unreadable — classifyManager404 treats that as route-missing */
+    }
+    const { routeMissing, message } = classifyManager404(body);
+    const err = new Error(message);
+    if (routeMissing) err.managerRouteMissing = true;
+    else err.managerSecurityRefusal = true;
     throw err;
   }
   if (!res.ok) {

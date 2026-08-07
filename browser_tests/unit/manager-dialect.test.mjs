@@ -10,6 +10,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { classifyManager404 } from "../../web/js/lib/manager-404.js";
 
 import * as ManagerInstall from "../../web/js/lib/manager-install.js";
 const {
@@ -86,17 +87,24 @@ test("isManagerRouteMissing: ONLY the proven-404 marker qualifies a mutation ret
 // a 404 response tags the error; a no-response (null) failure does NOT.
 test("managerV2/managerCall tag a 404 as managerRouteMissing, never the no-response case", async () => {
   const src = readPanelSource();
+  // #706 — the extracted functions now depend on the classifyManager404 helper,
+  // so it is injected the same way `api` is. Injecting the REAL implementation
+  // (not a stub) keeps this a real-source harness.
   const factory = new Function(
     "api",
+    "classifyManager404",
     `${pick(src, /async function managerV2\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerV2")}
 ${pick(src, /async function managerCall\(route, \{ method = "GET", body, signal \} = \{\}\) \{[\s\S]*?\n\}/, "managerCall")}
 return { managerV2, managerCall };`,
   );
   for (const res of [
-    { status: 404, ok: false }, // route not registered → proven rejection
+    { status: 404, ok: false, text: async () => "" }, // route not registered → proven rejection
     null, // no response → ambiguous
   ]) {
-    const { managerV2: mv2, managerCall: mcall } = factory({ fetchApi: async () => res });
+    const { managerV2: mv2, managerCall: mcall } = factory(
+      { fetchApi: async () => res },
+      classifyManager404,
+    );
     for (const call of [mv2, mcall]) {
       const err = await call("manager/queue/status").then(
         () => null,
@@ -110,6 +118,51 @@ return { managerV2, managerCall };`,
         `marker only for the proven 404 (res=${JSON.stringify(res)})`,
       );
     }
+  }
+
+  // #706 — the ONE 404 that must NOT carry the marker: legacy Manager 3.x
+  // answers a security-gated operation with 404 + a refusal body. A handler ran
+  // and said no, so authorizing a #605 mutation re-send would re-submit an
+  // install the Manager already rejected.
+  {
+    const secRes = {
+      status: 404,
+      ok: false,
+      text: async () => "A security error has occurred. Please check the terminal logs",
+    };
+    const { managerV2: mv2, managerCall: mcall } = factory(
+      { fetchApi: async () => secRes },
+      classifyManager404,
+    );
+    for (const call of [mv2, mcall]) {
+      const err = await call("manager/queue/install").then(
+        () => null,
+        (e) => e,
+      );
+      assert.ok(err, "must throw");
+      assert.equal(isManagerRouteMissing(err), false, "a security refusal must not authorize a re-send");
+      assert.ok(!/not reachable/i.test(err.message), "must not claim the Manager is unreachable");
+      assert.match(err.message, /security gate/i);
+    }
+  }
+
+  // A 404 whose body cannot be read stays route-missing (pre-#706 behaviour) —
+  // we may not claim a refusal we cannot evidence.
+  {
+    const brokenBody = {
+      status: 404,
+      ok: false,
+      text: async () => {
+        throw new Error("stream already consumed");
+      },
+    };
+    const { managerV2: mv2 } = factory({ fetchApi: async () => brokenBody }, classifyManager404);
+    const err = await mv2("manager/queue/status").then(
+      () => null,
+      (e) => e,
+    );
+    assert.ok(err, "must throw");
+    assert.equal(isManagerRouteMissing(err), true, "unreadable body falls back to route-missing");
   }
 });
 
