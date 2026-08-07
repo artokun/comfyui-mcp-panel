@@ -516,6 +516,158 @@ export function graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow } 
 }
 
 /**
+ * The STRUCTURE of a serialized graph — everything that says WHICH workflow a
+ * canvas holds — with the per-node content that can legitimately drift on a
+ * correctly-bound canvas removed.
+ *
+ * Derived from `buildGraphShape` so it can never disagree with the full
+ * comparison about what a surface even IS (the one-normalization rule above);
+ * the ONLY difference is that each node collapses to its `id` and `type`. Every
+ * non-node surface — links, floating links, reroutes, groups, config, top-level
+ * subgraphs, definitions, extra — is compared in FULL, unchanged, because those
+ * are where a genuinely different workflow shows itself.
+ *
+ * `null` when no structural read is possible (no serialized state, or any node
+ * without a usable id/type): callers must treat that as NOT a match, never as
+ * one — "could not compare" is not "compared and equal".
+ */
+function buildGraphStructureShape(state) {
+  const shape = buildGraphShape(state);
+  if (shape == null) return null;
+  const nodes = [];
+  for (const node of shape.nodes) {
+    const id = node?.id;
+    const type = node?.type;
+    if ((typeof id !== "string" && typeof id !== "number") || typeof type !== "string") return null;
+    // Type-qualified, exactly like the legacy id:type fallback: numeric 1 and
+    // string "1" are different ids and must not collide.
+    nodes.push({ id: `${typeof id}:${id}`, type });
+  }
+  return { ...shape, nodes };
+}
+
+function graphStructureShape(state) {
+  const shape = buildGraphStructureShape(state);
+  if (shape == null) return null;
+  try {
+    return JSON.stringify(canonicalizeShapeValue(shape));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * #696/#663/#701/#702 — the live root differs from the active workflow's own
+ * current state ONLY in per-node mutable content, on a canvas that POSITIVELY
+ * carries this workflow's identity. That is drift on the RIGHT canvas, not
+ * evidence of a different one, and it must not refuse a graph command.
+ *
+ * WHY the plain content comparison is the wrong evidence. `graphRootMismatches-
+ * ActiveWorkflow` reads a difference between `rootGraph.serialize()` and
+ * ChangeTracker's `activeState` as "bound to a different graph". That inference
+ * needs `activeState` to be a faithful mirror of the live root whenever the tab
+ * is clean — and it is not. ComfyUI's ChangeTracker captures on USER INPUT
+ * events (see the panel's post-command `deferChangeTrackerSnapshot` wiring, which
+ * exists precisely because bridge-driven edits are otherwise invisible to it), so
+ * a widget a NODE rewrites without user input drifts the root while the tab still
+ * reports `isModified: false`: Impact-Pack's ImpactWildcardEncode re-resolving
+ * `populated_text` on every execution, `control_after_generate` advancing a seed,
+ * an rgthree mode toggle, any extension's `loadedGraphNode` hook. Every reported
+ * instance of this cluster carried the RIGHT node count on the RIGHT tab.
+ *
+ * It is self-reinforcing, which is what made "the remedy does not remedy" (#701):
+ * the tracker is re-captured only after a command SUCCEEDS, and `workflow_open`'s
+ * repaint re-runs the same hook that rewrote the widget, so its own content proof
+ * fails, its tracker re-baseline is skipped, and the retried read fails
+ * identically. Only a page reload broke the loop.
+ *
+ * The relaxation is deliberately NARROW, and both conjuncts are load-bearing:
+ *
+ *   IDENTITY — `graphRootWorkflowUuidMatches`. Structural equality alone cannot
+ *     tell the active tab's canvas from a DUPLICATE tab's: two copies of one
+ *     workflow are structurally identical and differ only in widget values, which
+ *     is exactly the difference this would wave through. The same exclusivity
+ *     problem already blocks `sealProvenRootBinding`, and the answer is the same
+ *     one — require the canvas to positively claim THIS workflow. An untagged
+ *     root is absence of proof and stays refused; a foreign tag is the #349
+ *     wrong-canvas case and is refused earlier still.
+ *
+ *   STRUCTURE — every surface that identifies a workflow must be EQUAL, read
+ *     through the shared normalization. A different node set, a different id or
+ *     type, different links, groups, reroutes, floating links, top-level
+ *     subgraphs, definitions or content-bearing extra all remain refusals, so
+ *     #349 is untouched. A count-short mid-restore canvas (#618) differs in its
+ *     node set and cannot reach this at all.
+ *
+ * An unreadable structural comparison on EITHER side returns false: the relaxation
+ * only ever fires on a positive, completed match.
+ *
+ * KNOWN, DELIBERATE GAPS — both pre-existing, neither opened here:
+ *
+ *   drift INSIDE a `subgraphs`/`definitions` payload still refuses, because that
+ *   surface is compared whole. Narrowing it would mean recursing a nested
+ *   serializer dialect, and the fail-closed direction is the right one to leave
+ *   standing.
+ *
+ *   a BYTE-IDENTICAL duplicate whose canvas got the active workflow's tag, and
+ *   this one IS widened here — stated plainly rather than argued away (codex
+ *   gate, two rounds). The only writer that can put A's tag on a root without A's
+ *   own claim is `sealProvenRootBinding`, and it fires only on an UNTAGGED root
+ *   that already serializes EQUAL to A's current state with no other OPEN
+ *   workflow matching it — which a CLOSED duplicate's stranded canvas can satisfy,
+ *   since the exclusivity sweep can only see open tabs (its own comment says so).
+ *   From the seal onward that canvas is content-equal to A, so reads AND
+ *   mutations alike were already permitted on it; what the old shape guard added
+ *   was that the permission ENDED whenever the stranded canvas happened to drift.
+ *   This removes that late stop. It is accepted knowingly: the stop was
+ *   timing-dependent (it arrived only after arbitrary work had already landed on
+ *   that same canvas), the ambiguity it half-covered is `proofExclusive`'s
+ *   documented limit, and in the one construction that reaches it the stranded
+ *   root is also the object the active workflow would itself serialize on save.
+ *   Buying back that fraction of a case by refusing the four reported ones — the
+ *   right canvas, permanently locked, with no working remedy — is the worse trade.
+ */
+export function graphRootContentDriftOnBoundCanvas({
+  rootGraph,
+  activeWorkflow,
+  activeWorkflowUuid,
+} = {}) {
+  if (!graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid })) return false;
+  return graphRootStructureMatchesActiveWorkflow({ rootGraph, activeWorkflow });
+}
+
+/**
+ * Does the live root reproduce the active workflow's STRUCTURE — its node set
+ * (ids and types), links, floating links, reroutes, groups, config, top-level
+ * subgraphs, definitions and content-bearing extra?
+ *
+ * Exported separately from the relaxation above because the answer is also what
+ * makes a REFUSAL truthful. "The counts agree but the contents differ" leaves the
+ * reader unable to tell a genuinely different graph from the right one whose
+ * widgets drifted — and the old message resolved that ambiguity by asserting the
+ * worse reading ("a load, tab switch, or reconnect left this command pointed at
+ * the wrong canvas"), which is the sentence three reports in this cluster were
+ * derailed by. With this the disclosure states which of the two was measured.
+ *
+ * False when either side cannot be read: an uncompleted comparison is not a match.
+ */
+export function graphRootStructureMatchesActiveWorkflow({ rootGraph, activeWorkflow } = {}) {
+  try {
+    const expected = graphStructureShape(activeWorkflowCurrentState(activeWorkflow));
+    if (expected == null) return false;
+    let actual = null;
+    try {
+      actual = graphStructureShape(rootGraph?.serialize?.());
+    } catch {
+      return false;
+    }
+    return actual != null && actual === expected;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * True only when a root graph carries a durable workflow UUID that conflicts
  * with the active workflow object's already-established UUID. Missing identity
  * on either side is inconclusive: older frontends and first observation must
@@ -1009,7 +1161,24 @@ export function resolveGraphBindingVerdict({
       inSubgraph,
       postReconnectWindow,
     });
-  const rootShapeMismatch = graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow });
+  // #696/#663/#701/#702 — a content difference is only WRONG-CANVAS evidence when
+  // it is STRUCTURAL. On a root that positively carries this workflow's identity
+  // and reproduces every structural surface, the residue is a widget the canvas
+  // rewrote itself between ChangeTracker captures (see
+  // graphRootContentDriftOnBoundCanvas): the right canvas, drifted — and refusing
+  // it blocked every read and write with no recovery, because the remedy's own
+  // repaint re-created the same drift.
+  //
+  // The structural answer is computed ONCE and kept, because it is also what the
+  // refusal has to say when it does fire: without it a shape refusal cannot tell
+  // "a different graph" from "this graph, drifted, with no identity stamp", and
+  // the old message resolved that ambiguity by asserting the worse one.
+  const contentDiffers = graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow });
+  const structureMatches =
+    contentDiffers && graphRootStructureMatchesActiveWorkflow({ rootGraph, activeWorkflow });
+  const rootShapeMismatch =
+    contentDiffers &&
+    !(structureMatches && graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid }));
   const currentStateTrustworthy = activeWorkflow?.isModified !== true;
   const baselineReadDesync =
     currentStateTrustworthy &&
@@ -1033,6 +1202,10 @@ export function resolveGraphBindingVerdict({
         ? activeWorkflowCurrentNodeCount(activeWorkflow)
         : activeWorkflowNodeCount(activeWorkflow),
       live: nodeCount,
+      // Only meaningful for the shape verdict, and only ever a POSITIVE `true`:
+      // a comparison that could not run leaves it false, which the message reads
+      // as "unestablished", never as "they differ".
+      ...(reason === "root-shape-mismatch" ? { structureMatches: structureMatches === true } : {}),
     };
   }
   if (graphEmptyBindingUnproven({ graph, rootGraph, activeWorkflow, activeWorkflowUuid })) {
@@ -1104,10 +1277,17 @@ export function graphBindingRefusalMessage(verdict) {
     `Re-targeting with panel_set_workflow_target is NOT a remedy for this — it re-points the ` +
     `session, it does not rebind the canvas.`;
   if (verdict.reason === "root-workflow-uuid-mismatch") {
+    // The predicate observed TWO TAGS THAT DISAGREE and nothing else. The earlier
+    // text went on to narrate "a load, tab switch, or reconnect left a stale tag
+    // behind" — a cause nobody watched happen, and one of several (a stranded
+    // canvas from a closed tab reads identically). Same defect as the shape
+    // message's wrong-canvas sentence, one branch over: state the observation,
+    // offer the usual causes as possibilities rather than as the finding.
     return (
       `[root-workflow-uuid-mismatch] The live canvas carries a different workflow's identity tag ` +
-      `than the active workflow — a load, tab switch, or reconnect left a stale tag behind, so ` +
-      `this command was NOT applied. ${remedy}`
+      `than the active workflow, so this command was NOT applied. What the panel observed is the ` +
+      `disagreement itself, not what produced it — a load, tab switch or reconnect leaving a stale ` +
+      `tag behind is the usual explanation, but none of them was witnessed here. ${remedy}`
     );
   }
   // #601 — name the ACTUAL failing predicate. This verdict is not a node-count
@@ -1130,15 +1310,70 @@ export function graphBindingRefusalMessage(verdict) {
       `remedy: close the extra tab.`
     );
   }
-  const expectation =
-    Number(verdict.expected) > 0
-      ? `the workflow reports ${verdict.expected} node(s), but the canvas is bound to a different graph`
-      : `the canvas's content does not match the active workflow's own state`;
-  return (
-    `[${verdict.reason}] The live graph is out of sync with the active workflow: ${expectation}. ` +
-    `A load, tab switch, or reconnect left this command pointed at the wrong canvas, so it was ` +
-    `NOT applied. ${remedy}`
-  );
+  // #701/#702 — SAY WHAT WAS MEASURED, AND ONLY THAT.
+  //
+  // The verdict already carried the LIVE count and the message threw it away, then
+  // asserted "a load, tab switch, or reconnect left this command pointed at the
+  // wrong canvas" from the half it kept. In every report in this cluster the two
+  // counts were EQUAL and the difference was a widget the canvas rewrote itself,
+  // so that sentence narrated a cause nobody observed — and three diagnoses went
+  // hunting a wrong-tab bug that was not there.
+  //
+  // Three distinct observations now get three distinct sentences:
+  //   sizes DISAGREE          → the canvas provably holds a different graph;
+  //   structure MATCHES       → the canvas reproduces this workflow's node set,
+  //                             links and groups exactly, and only its content and
+  //                             its identity stamp are unestablished. That is the
+  //                             one case where the ONLY thing missing is proof,
+  //                             and it names the remedy that supplies it;
+  //   anything else           → the contents disagree and the panel does not know
+  //                             which of the two it is looking at. Say that.
+  const expected = Number(verdict.expected);
+  const live = Number(verdict.live);
+  const measured = Number.isFinite(live) && Number.isFinite(expected);
+  const sizesDisagree = measured && expected > 0 && live !== expected;
+  if (verdict.reason === "root-shape-mismatch" && verdict.structureMatches === true && !sizesDisagree) {
+    return (
+      `[root-shape-mismatch] The live canvas reproduces this workflow's STRUCTURE exactly — same ` +
+      `node ids and types${measured ? ` (${expected})` : ""}, same links, groups and subgraphs — but its ` +
+      `CONTENT differs from the state the workflow last captured, and the canvas carries no identity ` +
+      `stamp proving it is this workflow's. A canvas whose widgets a node rewrote itself (a populate/ ` +
+      `wildcard node, control_after_generate, a bypass toggle) looks exactly like a DUPLICATE tab's ` +
+      `canvas from here, and the panel cannot tell them apart, so this command was NOT applied. ` +
+      `Re-open the active workflow tab (panel_open_workflow): its repaint is the one path that can ` +
+      `put this workflow's identity on the canvas, which is the proof this refusal is missing. ` +
+      `Whether it lands is REQUESTED, NOT CONFIRMED — the open reports its own rebind verdict and the ` +
+      `panel cannot observe the outcome otherwise, so treat the retry's own result as the answer. If ` +
+      `it still refuses, do NOT read that as proof the difference is more than content: an open that ` +
+      `could not prove its rebind leaves this refusal exactly where it was. A panel reload ` +
+      `(panel_reload scope:frontend) is the next step, and it is unconfirmed on the same terms. ` +
+      `Re-targeting with panel_set_workflow_target is NOT a remedy for this — it re-points the ` +
+      `session, it does not rebind the canvas.`
+    );
+  }
+  const expectation = sizesDisagree
+    ? `the workflow reports ${expected} node(s) but the live canvas holds ${live} — it is bound to a ` +
+      `different graph`
+    : measured && expected > 0
+      ? `both the workflow and the live canvas report ${expected} node(s), but the canvas does not ` +
+        `reproduce the workflow's own state — the difference is in the graph's CONTENT, not its size`
+      : expected > 0
+        ? `the workflow reports ${expected} node(s) and the live count was not measured here`
+        : `the canvas's content does not match the active workflow's own state`;
+  // Neither branch narrates an EVENT. A size disagreement establishes the canvas
+  // holds a different graph — it does not establish what put it there, and the
+  // load/switch/reconnect list is a set of usual explanations, not the finding
+  // (codex gate r3; the same defect the uuid-mismatch branch had). A content
+  // disagreement at equal size does not even establish that much: it is exactly
+  // the ambiguity above, and resolving it in the text is how this message misled
+  // three readers.
+  const cause = sizesDisagree
+    ? `The canvas therefore holds a graph other than the one the workflow describes, so this ` +
+      `command was NOT applied. A load, tab switch or reconnect leaving the command on the wrong ` +
+      `canvas is the usual explanation — the panel observed the mismatch, not the event.`
+    : `The panel cannot tell whether this is a DIFFERENT workflow's canvas or this workflow's own ` +
+      `canvas drifted from the state it last captured, so it was NOT applied.`;
+  return `[${verdict.reason}] The live graph is out of sync with the active workflow: ${expectation}. ${cause} ${remedy}`;
 }
 
 /**
