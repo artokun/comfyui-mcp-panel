@@ -185,6 +185,7 @@ import {
 } from "./lib/graph-read.js";
 import { slotRenameLines } from "./lib/slot-rename-diff.js";
 import { describeRenameFailure } from "./lib/workflow-rename-error.js";
+import { boundSubgraphList } from "./lib/subgraph-list-bound.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
 import {
   CANVAS_TOOL_DISCLOSURE,
@@ -12089,7 +12090,7 @@ const GRAPH_TOOL_EXECUTORS = {
 
   // List saved subgraph blueprints. Each is addable via graph_add_subgraph(name)
   // or graph_add_node(type). Read-only.
-  graph_list_subgraphs() {
+  graph_list_subgraphs({ filter, limit } = {}) {
     const store = getSubgraphStore();
     const prefix = store.typePrefix ?? "SubgraphBlueprint.";
     const defs = store.subgraphBlueprints ?? [];
@@ -12103,7 +12104,10 @@ const GRAPH_TOOL_EXECUTORS = {
         is_global: d?.isGlobal === true,
       };
     });
-    return { count: blueprints.length, blueprints };
+    // #690(5) — bounded like every other panel read. `count` stays the LIBRARY
+    // TOTAL and truncation is explicit, so a bounded list can never be misread as
+    // "that blueprint does not exist" (see boundSubgraphList).
+    return boundSubgraphList(blueprints, { filter, limit });
   },
 
   // Add a saved subgraph blueprint to the current graph by name (or full type).
