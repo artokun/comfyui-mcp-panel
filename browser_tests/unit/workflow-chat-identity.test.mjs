@@ -246,9 +246,89 @@ test('#602 wiring: dispatch skips the graph-binding assert for canvas-independen
     'the pin guard must not fall back to the narrow canvas-independent test',
   )
   // The workflow-instance-mismatch refusal renders for real users; it once shipped
-  // with a mojibake em dash ("â€”"). Pin the clean form.
-  assert.ok(src.includes('active canvas — the workflow was switched or replaced'), 'fence message keeps its em dash')
+  // with a mojibake em dash ("â€”"). Pin the clean form. #750 rewrote the sentence
+  // that used to carry the dash (it asserted a cause the panel never observed), so
+  // the guard now pins the em dash in its replacement.
+  assert.ok(
+    src.includes('That is the comparison, not the cause — the panel observed only that the two'),
+    'fence message keeps its em dash',
+  )
   assert.ok(!src.includes('â€'), 'no mojibake anywhere in the panel source')
+  // …and the refusal is built in exactly ONE place now, so the two dispatch sites
+  // cannot drift apart the way they did while each carried its own copy.
+  assert.equal(
+    (src.match(/workflow instance mismatch: /g) || []).length,
+    1,
+    'the refusal text must have a single spelling',
+  )
+})
+
+// #750 — the refusal must report the COMPARISON it made, not a cause it did not
+// observe. The old text committed to "the workflow was switched or replaced after it
+// was issued"; in the report behind #750 no tab was connected at all, and in the wedge
+// behind artokun/comfyui-mcp#932 nothing had been switched — the fence simply could
+// never be rebound. Both diagnoses were sent down the wrong path by this sentence.
+function loadMismatchMessage() {
+  const HERE = dirname(fileURLToPath(import.meta.url))
+  const src = readFileSync(join(HERE, '../../web/js/comfyui-mcp-panel.js'), 'utf8')
+  const start = src.indexOf('function workflowInstanceMismatchMessage(')
+  assert.notEqual(start, -1, 'the shared refusal builder must exist in the shipped source')
+  const end = src.indexOf('\n}', start)
+  assert.notEqual(end, -1)
+  const body = src.slice(start, end + 2)
+  return new Function(`${body}\nreturn workflowInstanceMismatchMessage;`)()
+}
+
+test('#750 the refusal states the two identities it compared', () => {
+  const msg = loadMismatchMessage()({ commandUuid: 'uuid-issued-for', activeUuid: 'uuid-on-screen' })
+  assert.match(msg, /uuid-issued-for/, 'names the instance the command was issued for')
+  assert.match(msg, /uuid-on-screen/, 'and what the canvas actually reports')
+  assert.match(msg, /Nothing was applied/, 'and that it did not partially run')
+})
+
+test('#750 it does NOT assert a cause it never observed', () => {
+  const msg = loadMismatchMessage()({ commandUuid: 'a', activeUuid: 'b' })
+  // The old sentence, as a bare claim, must be gone.
+  assert.doesNotMatch(
+    msg,
+    /the workflow was switched or replaced after it was issued\./,
+    'the single-cause assertion must not return',
+  )
+  // The switch is still OFFERED as one possibility among several — removing it
+  // entirely would be the opposite error, hiding the most common cause.
+  assert.match(msg, /can mean the workflow was switched or replaced/)
+  assert.match(msg, /never established or could not\s+be refreshed/, 'the #932 cause is listed')
+  assert.match(msg, /identity could not be read/, 'and the unreadable case')
+  assert.match(msg, /comparison, not the cause/, 'and it says which of the two this is')
+})
+
+test('#750 an UNSTAMPED command says so, rather than claiming a different workflow', () => {
+  // #718 refuses unstamped commands too. "your command carried no stamp" and "your
+  // stamp names another workflow" need different fixes; the old text described only
+  // the second, for both.
+  for (const commandUuid of [undefined, null, '', '   ']) {
+    const msg = loadMismatchMessage()({ commandUuid, activeUuid: 'uuid-on-screen' })
+    assert.match(msg, /carries no workflow-instance stamp/)
+    assert.doesNotMatch(msg, /issued for workflow instance/)
+  }
+})
+
+test('#750 an UNRESOLVABLE active identity is reported as unresolvable, not as a value', () => {
+  for (const activeUuid of [undefined, null, '']) {
+    const msg = loadMismatchMessage()({ commandUuid: 'uuid-issued-for', activeUuid })
+    assert.match(msg, /reports no resolvable identity/)
+    assert.doesNotMatch(msg, /reports undefined|reports null|reports \./)
+  }
+})
+
+test('#750 the remedy covers the disconnected case the old text stranded', () => {
+  // The #750 reporter had NO tab connected; the advertised remedies cannot help
+  // there, and it took six tool calls to find that out.
+  const msg = loadMismatchMessage()({ commandUuid: 'a', activeUuid: 'b' })
+  assert.match(msg, /panel_set_workflow_target/)
+  assert.match(msg, /panel_open_workflow/)
+  assert.match(msg, /If NO panel tab is\s+connected, neither will help/)
+  assert.match(msg, /panel_graph_outline reports connectivity/)
 })
 
 test('#570 pinned command after in-place replacement at the same path: uuid mismatch ⇒ REFUSED', () => {
