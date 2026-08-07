@@ -666,6 +666,12 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         });
         if (req !== state.reqId) return;
         state.cursor = page.nextCursor; state.done = !page.nextCursor;
+        // #712 — accumulate what the BROWSING LEVEL removed, so an empty model
+        // grid is attributable the way an empty favorites feed already is
+        // (#190/#375). Without this, a level that hid every result looked
+        // identical to "nothing matched your search", and the docked browser
+        // read as broken.
+        state.hiddenByLevel = (state.hiddenByLevel || 0) + (page.hiddenByLevel || 0);
         appendModels(page.models);
         stalled = !page.models.length && !state.done;
       } else if (state.query) {
@@ -2009,6 +2015,21 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       error: state.error || null,
       authenticated: !!state.signedIn,
       ...(tabDef().fav ? { favoritesStatus: state.favoritesStatus || "ok" } : {}),
+      // #712 — the model tabs' half of the same rule. An empty model grid was
+      // reported as `error: null, done: true`, indistinguishable from "nothing
+      // matched" even when the browsing level had removed every result — which
+      // is what made "0 results for any search" read as a broken browser.
+      // Emitted only when the level actually removed something, so a genuine
+      // no-match stays a clean empty result.
+      ...(isModelTab() && state.hiddenByLevel
+        ? {
+            hiddenByBrowsingLevel: state.hiddenByLevel,
+            levelFilterNote:
+              `${state.hiddenByLevel} result(s) were removed by the current browsing level ` +
+              `(${(state.filters?.browsingLevels || []).join(", ") || "default"}). ` +
+              `They are not missing from CivitAI — widen browsingLevels to see them.`,
+          }
+        : {}),
     };
   }
   /** Highlight a set of ids (REPLACEMENT semantics). Awaits the in-flight

@@ -1029,6 +1029,9 @@ export class CivitaiClient {
     const kw = clientFilter ? String(query).toLowerCase() : null;
     let next = cursor || null;
     let models = [];
+    // Accumulated across hops, so a search that chased several thin pages
+    // reports everything the level filter removed, not just the last page's.
+    let hiddenByLevel = 0;
     // An empty page with a cursor is not the end of a search: /v1/models can
     // thin pages server-side, and keyword×creator additionally filters them
     // client-side. Chase a bounded number of continuable empty pages.
@@ -1036,14 +1039,22 @@ export class CivitaiClient {
       const q = new URLSearchParams(base);
       if (next) q.set("cursor", next);
       const data = await this._get(`${API}/v1/models?${q.toString()}`);
-      models = (data.items || [])
-        .map((x) => this._modelFromJson(x, levels))
-        .filter(Boolean);
+      const raw = data.items || [];
+      models = raw.map((x) => this._modelFromJson(x, levels)).filter(Boolean);
+      // #712 — how many CivitAI returned that the BROWSING LEVEL removed.
+      // Counted HERE, before the keyword filter below: a keyword miss is "no
+      // match", not "hidden by your level", and conflating them would tell the
+      // user to widen a filter that was never the reason.
+      hiddenByLevel += raw.length - models.length;
       if (kw) models = models.filter((m) => (m.name || "").toLowerCase().includes(kw));
       next = data.metadata?.nextCursor || null;
       if (models.length || !next || hop >= 4) break;
     }
-    return { models, nextCursor: next };
+    // hiddenByLevel is what makes an empty grid ATTRIBUTABLE (#190/#375): the
+    // favorites tab already distinguishes "filtered out" from "genuinely empty";
+    // the model tabs reported neither, so a browsing level that removed every
+    // result was indistinguishable from "nothing matched your search".
+    return { models, nextCursor: next, hiddenByLevel };
   }
 
   async fetchModelDetail(modelId, { levels = [1] } = {}) {
