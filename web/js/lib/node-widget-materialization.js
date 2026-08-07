@@ -197,11 +197,25 @@ export function unavailableRequiredWidgetReport(
     // isCoreDynamicV3Type: it is not a link datatype (nothing outputs it, so
     // knownSocketTypes can never contain it and `linkProven` is unreachable), and it is
     // not a value widget (no constructor is ever registered for it — the frontend
-    // implements it natively). The input-level bar still applies: the declaration must
-    // itself be socket-shaped, so a COMFY_*_V3 input that declares widget-value keys is
-    // still held for its constructor. Single-member only — a union naming a dynamic
-    // declaration is not a shape ComfyUI emits, and admitting one would be guessing.
-    if (members.length === 1 && isCoreDynamicV3Type(type) && socketDeclared.has(type)) continue;
+    // implements it natively).
+    //
+    // The input-level socket-shaped bar is deliberately NOT applied here, and that is a
+    // correction to this fix's first version. `inputDeclaredAsSocket` asks whether an
+    // input declares config keys that only a widget can honour — a sound question for an
+    // ordinary datatype, and a meaningless one for this namespace, because the keys these
+    // types carry are the dynamic-io SCHEMA's own structure rather than a widget value:
+    // `template` (Autogrow, MatchType, MultiTyped), `inputs` (DynamicSlot) and — the one
+    // that broke it — `options` (DynamicCombo). `options` is in WIDGET_VALUE_CONFIG_KEYS
+    // because for a normal input it means a combo's choice list; for COMFY_DYNAMICCOMBO_V3
+    // it is the list of dynamic OPTION BRANCHES, each with its own nested inputs. Requiring
+    // socket-shapedness therefore left `SaveVideo` (whose `codec` is a DynamicCombo) exactly
+    // as unaddable as before, which is #636's first defect.
+    //
+    // #580 is still respected: this waives ONLY ComfyUI's reserved namespace, for which no
+    // widget constructor can ever appear, so there is nothing here that a retry could be
+    // waiting for. Single-member only — a union naming a dynamic declaration is not a shape
+    // ComfyUI emits, and admitting one would be guessing.
+    if (members.length === 1 && isCoreDynamicV3Type(type)) continue;
     report.push({ type, inputs, linkProven });
   }
   return report;
