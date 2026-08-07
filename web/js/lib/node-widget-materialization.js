@@ -46,13 +46,44 @@ export function requiredWidgetInputTypes(nodeOrNodeData) {
 // one is safe to leave as a socket when no widget constructor exists. An
 // unrecognised type is NOT assumed safe: it may be a custom V3 widget whose
 // extension is still registering.
+//
+// This list is a FALLBACK, not the discriminator. It exists only for the case
+// where no fresh /object_info is available to prove link-ness structurally
+// (see registeredSocketTypes + inputDeclaredAsSocket below, which is what the
+// add path actually relies on). Growing it is not how a new core datatype gets
+// fixed — #695 was filed after MASK, and would have been filed again after the
+// next one.
 const SAFE_SOCKET_TYPES = new Set([
   "*", "ANY", "AUDIO", "BBOX", "CLIP", "CLIP_VISION", "CLIP_VISION_OUTPUT",
   "CONDITIONING", "CONTROL_NET", "GLIGEN", "GUIDER", "HOOKS", "IMAGE",
   "IPADAPTER", "LATENT", "LATENT_OPERATION", "MASK", "MESH", "MODEL", "NOISE",
-  "SAMPLER", "SCHEDULER", "SIGMAS", "STYLE_MODEL", "UNET", "UPSCALE_MODEL",
-  "VAE", "VOXEL",
+  "PHOTOMAKER", "SAMPLER", "SCHEDULER", "SIGMAS", "STYLE_MODEL", "UNET",
+  "UPSCALE_MODEL", "VAE", "VOXEL",
 ]);
+
+/**
+ * The individual datatypes a declared input type names.
+ *
+ * ComfyUI declares a link-compatible UNION of datatypes as ONE COMMA-JOINED string:
+ * core `PreviewImageOrMask` requires `("IMAGE,MASK")`, `SaveGLB` requires
+ * `("MESH,FILE_3D_GLB,…")`, `ImageUncropByMask` requires `("BBOX,BOUNDING_BOX")`,
+ * `LoraExtractKJ` requires `("MODEL,CLIP")`. LiteGraph splits on the comma to decide
+ * link compatibility; every guard here must split it too. Comparing the whole string
+ * against a set of single type names can only ever miss — the union is not the name of
+ * any datatype, so it matched neither the allowlist nor the /object_info output proof,
+ * and EVERY union input failed closed. That is #695's defect surviving the addition of
+ * MASK to the allowlist: `PreviewImageOrMask` is still a mask node that cannot be added.
+ *
+ * A single (comma-free) type yields itself, so the single-type path is unchanged.
+ */
+export function declaredTypeMembers(type) {
+  if (typeof type !== "string" || !type) return [];
+  if (!type.includes(",")) return [type];
+  return type
+    .split(",")
+    .map((member) => member.trim())
+    .filter(Boolean);
+}
 
 /**
  * Required input types that might be custom widgets but have not entered the
@@ -83,6 +114,30 @@ export function unavailableRequiredCustomWidgetTypes(
   knownSocketTypes,
   currentDef,
 ) {
+  return unavailableRequiredWidgetReport(
+    nodeOrNodeData,
+    widgetConstructors,
+    knownSocketTypes,
+    currentDef,
+  ).map((entry) => entry.type);
+}
+
+/**
+ * The same verdict as unavailableRequiredCustomWidgetTypes, with what the caller needs
+ * to say something TRUE about it: which required INPUTS carry each unavailable type, and
+ * whether the current backend proves the type is a link datatype.
+ *
+ * #695 was reported against a message that blamed one cause — "may be custom widgets
+ * still loading; retry shortly" — for two situations with opposite remedies, which is
+ * what sent the reporter looking at a widget registry for a datatype that has no widget.
+ * The two are distinguishable here, so they are distinguished here.
+ */
+export function unavailableRequiredWidgetReport(
+  nodeOrNodeData,
+  widgetConstructors,
+  knownSocketTypes,
+  currentDef,
+) {
   const source = currentDef ?? nodeOrNodeData;
   const required = requiredInputs(source) ?? {};
   // Types for which EVERY required input carrying them declares itself socket-shaped.
@@ -91,24 +146,71 @@ export function unavailableRequiredCustomWidgetTypes(
   // reproduce the very error this fixes one level down.
   const socketDeclared = new Set();
   const widgetDeclared = new Set();
-  for (const spec of Object.values(required)) {
+  const inputsByType = new Map();
+  for (const [name, spec] of Object.entries(required)) {
     const type = inputWidgetType(spec);
     if (!type) continue;
     (inputDeclaredAsSocket(spec) ? socketDeclared : widgetDeclared).add(type);
+    if (!inputsByType.has(type)) inputsByType.set(type, []);
+    inputsByType.get(type).push(name);
   }
   for (const type of widgetDeclared) socketDeclared.delete(type);
-  return requiredWidgetInputTypes(source).filter(
-    (type) =>
-      typeof widgetConstructors?.[type] !== "function" &&
-      !SAFE_SOCKET_TYPES.has(type) &&
-      // #626 P0: "some node OUTPUTS this type" does NOT establish that THIS input is
-      // link-only. ComfyUI's frontend supports converting widget inputs to links, so a
-      // widget-bearing input is link-compatible too — INT and a custom ACME_VALUE are
-      // both output by some node somewhere. The output side is evidence about the TYPE;
-      // the question asked here is about the INPUT. So the waiver now needs the
-      // input-level socket declaration as well: the type must be proven a link datatype
-      // AND every required input carrying it must declare itself socket-shaped.
-      !(knownSocketTypes?.has?.(type) === true && socketDeclared.has(type)),
+
+  const report = [];
+  for (const [type, inputs] of inputsByType) {
+    // The registry is keyed by the DECLARED type exactly as written — including
+    // ComfyUI's own `INT:seed` / `INT:noise_seed` keys and any union a pack chooses to
+    // register — so the whole string is checked first, before it is decomposed.
+    if (typeof widgetConstructors?.[type] === "function") continue;
+    const members = declaredTypeMembers(type);
+    if (!members.length) continue;
+    if (members.every((member) => SAFE_SOCKET_TYPES.has(member))) continue;
+    // Every member is a datatype the CURRENT backend declares as some node's output (or
+    // is a built-in socket), so no widget constructor is ever going to appear for it.
+    const linkProven = members.every(
+      (member) => SAFE_SOCKET_TYPES.has(member) || knownSocketTypes?.has?.(member) === true,
+    );
+    // #626 P0: "some node OUTPUTS this type" does NOT establish that THIS input is
+    // link-only. ComfyUI's frontend supports converting widget inputs to links, so a
+    // widget-bearing input is link-compatible too — INT and a custom ACME_VALUE are
+    // both output by some node somewhere. The output side is evidence about the TYPE;
+    // the question asked here is about the INPUT. So the waiver needs the input-level
+    // socket declaration as well: the type must be proven a link datatype AND every
+    // required input carrying it must declare itself socket-shaped. A union is held to
+    // exactly the same bar — LTXV's `("FLOAT,INT", {default, min, max, step})` is a
+    // widget that ACCEPTS an int link, not a socket, and still waits for its constructor.
+    if (linkProven && socketDeclared.has(type)) continue;
+    report.push({ type, inputs, linkProven });
+  }
+  return report;
+}
+
+/**
+ * The refusal text for a report that never cleared. Says which INPUT is unsatisfiable
+ * (not just its datatype), which of the two situations it is, and what actually fixes
+ * each — the previous single-cause message named a remedy ("retry shortly") that cannot
+ * work for a datatype no widget will ever back, and named none for the case that does.
+ */
+export function unavailableRequiredWidgetMessage(report, classType, waitedMs) {
+  const target = classType ? `"${classType}"` : "this node";
+  const lines = report.map((entry) => {
+    const inputs = entry.inputs.map((name) => `"${name}"`).join(", ");
+    const cause = entry.linkProven
+      ? `the backend declares "${entry.type}" as a link datatype, but this input also declares a ` +
+        `widget value (default/min/max/options), so it needs a registered widget and none appeared`
+      : `no installed node outputs "${entry.type}" and no frontend widget is registered for it`;
+    return `  - input ${inputs} (declared type "${entry.type}"): ${cause}.`;
+  });
+  const waited = Number.isFinite(waitedMs) ? `${(waitedMs / 1000).toFixed(1)}s` : "the wait window";
+  return (
+    `Cannot add ${target}: ${report.length} required input type${report.length === 1 ? "" : "s"} ` +
+    `had no widget after ${waited} waiting for node extensions to register.\n` +
+    `${lines.join("\n")}\n` +
+    "Reload the ComfyUI browser tab so node packs can re-register their frontend widgets, then " +
+    "retry. If it fails again the pack's frontend extension is not loading and retrying alone " +
+    "will not fix it. This is NOT a link datatype being misread: an input the backend proves is " +
+    "a socket (MASK, IMAGE, LATENT, a comma-joined union of them) is added immediately, without " +
+    "any wait."
   );
 }
 
