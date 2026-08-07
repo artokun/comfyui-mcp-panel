@@ -55,6 +55,29 @@
 // So the fence is the PAIR: a turn must be in flight in this tab, AND the
 // conversation that turn was captured under must be the conversation on screen.
 //
+// WHAT THIS DOES NOT REACH (my own adversarial gate, round 1 — recorded here so
+// the next reader does not have to rediscover it). Both residuals have the SAME
+// single root cause: the `turn` frame carries a STATE ("working"/"done") and no
+// turn identity, so `agentWorking` / `liveTurnThreadId` are the panel's best
+// available proxy for "which turn", not the thing itself.
+//
+//   * A straggler `turn:working` belonging to an already-ended turn, arriving
+//     more than STALE_WORKING_GUARD_MS after the local end, is indistinguishable
+//     from a fresh turn's. onTurn accepts it and captures the conversation THEN
+//     on screen as its owner — after which that turn's card passes this fence.
+//     Narrower than the defect being fixed (which needed nothing at all), but
+//     not zero.
+//   * The mirror image: a genuinely fresh turn whose `turn:working` lands INSIDE
+//     the guard window is discarded, so `agentWorking` stays false and a
+//     legitimate card is refused. Reachable when the orchestrator releases a
+//     queued message immediately after an interrupt. The cost is bounded — the
+//     agent gets an explicit, honest failure (below) rather than a card in the
+//     wrong place — which is the direction this must fail in.
+//
+// Closing either one means putting a turn/conversation id ON THE WIRE and having
+// the fence compare against THAT. It is a protocol change in comfyui-mcp, not a
+// panel change, and it subsumes both. It is deliberately not attempted here.
+//
 // Dependency-free (no DOM, no sockets, no timers) so it is unit-testable with
 // plain values.
 //
@@ -122,12 +145,21 @@ const WHY_FENCED = {
     "the user never chose to answer in",
 };
 
-/** What we OBSERVED, never a guess (the house style from command-liveness.js). */
+/**
+ * What we OBSERVED, never a guess (the house style from command-liveness.js).
+ *
+ * `no_live_turn` deliberately does NOT assert that the turn ended. That is the
+ * usual cause but not the only one — a fresh turn's `turn:working` discarded by
+ * onTurn's straggler guard produces the identical observation — and the panel
+ * knows only what it saw. Stating the observation and offering the likely causes
+ * as examples keeps it true in every case.
+ */
 const CAUSE = {
   no_live_turn:
-    "that ComfyUI tab has no turn in flight, so the turn this card belongs to has already ended " +
-    "there — interrupted, or left behind by a new chat, an older conversation being reopened, a " +
-    "workflow switch, a backend switch, or a disconnect",
+    "that ComfyUI tab has no turn in flight, so nothing there owns this card. That is what the " +
+    "panel OBSERVED, not a diagnosis — the usual cause is that the turn was ended in that tab " +
+    "(an interrupt, a new chat, an older conversation reopened, a workflow or backend switch, a " +
+    "disconnect), but a turn start the panel has not registered yet looks the same",
   other_conversation:
     "the turn in flight in that ComfyUI tab belongs to a different conversation than the one on " +
     "screen — the visible conversation was replaced mid-turn",
@@ -137,8 +169,13 @@ const CAUSE = {
  * The error the AGENT receives for a refused card. It must be a clear failure:
  * not silence, not a fabricated success, and not a card painted somewhere else.
  * Tone matches command-liveness.js's redactSensitiveReply — say what happened,
- * say plainly that nothing was collected or stored, and give the ONE next step
- * that actually works.
+ * say plainly that nothing was collected or stored, and give a next step.
+ *
+ * The next step is deliberately "say what you need in plain text, and ask again
+ * after the user's next message" rather than "retry". A tight retry loop is the
+ * failure mode to avoid: it burns the turn against a refusal that will not
+ * change until the user acts, and for the transient case (a turn start the panel
+ * has not registered yet) plain text reaches the user anyway.
  */
 export function refusedInteractiveCardError(cmd, reason) {
   const noun = CARD_NOUN[cmd] ?? "the interactive card";
@@ -146,7 +183,8 @@ export function refusedInteractiveCardError(cmd, reason) {
   const cause = CAUSE[reason] ?? CAUSE.no_live_turn;
   return (
     `the panel did not show ${noun} for "${cmd}": ${cause}. Nothing was shown, nothing was ` +
-    `collected and nothing was stored — ${why}. Retrying right now gets the same refusal; ask ` +
-    `again after the user sends a message in the tab you want to ask in.`
+    `collected and nothing was stored — ${why}. Do not retry this in a loop: say in plain text ` +
+    `what you need and why, and ask again after the user's next message in the tab you want to ` +
+    `ask in.`
   );
 }

@@ -124,17 +124,31 @@ for (const cmd of ["request_secret", "ask_user"]) {
         "states plainly that no value was taken — not silence, not a fabricated success",
       );
       assert.ok(
-        /ask again after the user sends a message/i.test(text),
-        "gives the one next step that actually works",
+        /ask again after the user's next message/i.test(text),
+        "gives a next step that actually works",
       );
       assert.ok(
-        /retrying right now gets the same refusal/i.test(text),
+        /do not retry this in a loop/i.test(text),
         "tells the agent not to spin on an immediate retry",
       );
       assert.ok(!/\bok\b|succe/i.test(text.split(":")[0]), "the opening clause never reads as success");
     });
   }
 }
+
+test("the no-live-turn refusal states an OBSERVATION, never an unobserved cause", () => {
+  // Gate round 1: the wording used to assert the turn "has already ended", which
+  // is the usual cause but not the only one — a turn start the panel has not
+  // registered yet produces the identical observation. command-liveness.js's rule
+  // is "reports what we OBSERVED, never a guess"; this must follow it.
+  const text = refusedInteractiveCardError("request_secret", "no_live_turn");
+  assert.ok(/has no turn in flight/.test(text), "states what was observed");
+  assert.ok(/not a diagnosis/i.test(text), "explicitly disclaims the cause");
+  assert.ok(
+    !/\bhas already ended\b/.test(text),
+    "must not assert a cause the panel did not observe",
+  );
+});
 
 test("the secret refusal names the actual harm (a token in a conversation the user did not choose)", () => {
   const text = refusedInteractiveCardError("request_secret", "no_live_turn");
@@ -346,6 +360,201 @@ test("LOAD-BEARING: the same fence applies to the question card", async () => {
   assert.equal(reply.ok, false);
   assert.match(reply.error, /ask_user/);
   assert.deepEqual(h.painted, [], "no question card, and no revived working indicator");
+});
+
+// ---------------------------------------------------------------------------
+// 4. the REAL lifecycle → the REAL fence
+//
+// Gate round 1 (MINOR) was right that section 3 injects idealised state and so
+// proves the predicate rather than shipped lifecycle behaviour. This section
+// wires the ACTUAL `onTurn` and `endTurnLocally` bodies to the ACTUAL fence and
+// handlers, so the chain that decides `agentWorking` / `liveTurnThreadId` is the
+// shipped one — including the straggler guard, whose two edges are pinned below
+// as KNOWN, documented outcomes rather than accidents.
+// ---------------------------------------------------------------------------
+
+const endTurnLocallyMatch = panelSrc.match(/\n {2}function endTurnLocally\(\) \{[\s\S]*?\n {2}\}/);
+assert.ok(endTurnLocallyMatch, "could not locate endTurnLocally in the panel source");
+const onTurnSrc = (() => {
+  const m = panelSrc.match(/\n {4}onTurn\(state\) \{[\s\S]*?\n {4}\},/);
+  assert.ok(m, "could not locate onTurn in the panel source");
+  return m[0];
+})();
+const guardMs = Number(panelSrc.match(/const STALE_WORKING_GUARD_MS = (\d+);/)?.[1]);
+assert.ok(Number.isFinite(guardMs) && guardMs > 0, "could not read STALE_WORKING_GUARD_MS");
+
+/** The real endTurnLocally + onTurn + fence + handlers over one shared closure. */
+function buildLifecycle() {
+  const painted = [];
+  const factory = new Function(
+    "deps",
+    `
+    const { classifyInteractiveCard, refusedInteractiveCardError, paintQuestion, paintSecret,
+            bumpThinking, noteActivity, lsSet, SECRET_SET_AT_PREFIX, console,
+            showThinking, hideThinking, ssSet, MID_TASK_KEY, getGraphCtx, workflowStableUuid,
+            STALE_WORKING_GUARD_MS, now } = deps;
+    let agentWorking = false;
+    let liveTurnThreadId = null;
+    let thread = null;
+    let localEndAt = 0;
+    let pendingSecretRequest = null;
+    let lastAgentGraph = null, lastAgentGraphKey = null, lastAgentGraphEpoch = null, sessionEpoch = 0;
+    const Date = { now };
+    ${endTurnLocallyMatch[0]}
+    ${fenceMatch[0]}
+    const host = {
+      ${onTurnSrc}
+      ${onAskSrc}
+      ${onSecretSrc}
+    };
+    return {
+      host,
+      endTurnLocally,
+      showConversation(id) { thread = id ? { id } : null; },
+      state: () => ({ agentWorking, liveTurnThreadId, shown: thread?.id ?? null }),
+    };
+  `,
+  );
+  let clock = 100000;
+  const built = factory({
+    classifyInteractiveCard,
+    refusedInteractiveCardError,
+    paintQuestion: (msg) => {
+      painted.push({ card: "question", question: msg.question });
+      return Promise.resolve("typed-answer");
+    },
+    paintSecret: (msg) => {
+      painted.push({ card: "secret", label: msg.label });
+      return Promise.resolve("typed-answer");
+    },
+    bumpThinking: () => {},
+    noteActivity: () => {},
+    lsSet: () => {},
+    SECRET_SET_AT_PREFIX: "cmcp.secretSetAt.",
+    console: { warn: () => {} },
+    showThinking: () => {},
+    hideThinking: () => {},
+    ssSet: () => {},
+    MID_TASK_KEY: "cmcp.midTask",
+    getGraphCtx: () => ({ rootGraph: { serialize: () => ({}) } }),
+    workflowStableUuid: () => "wf-1",
+    STALE_WORKING_GUARD_MS: guardMs,
+    now: () => clock,
+  });
+  return { ...built, painted, tick: (ms) => { clock += ms; }, at: () => clock };
+}
+
+test("LIFECYCLE: a real turn start in the shown conversation lets the real handlers paint", async () => {
+  const h = buildLifecycle();
+  h.showConversation("t-A");
+  h.host.onTurn("working");
+  assert.deepEqual(h.state(), { agentWorking: true, liveTurnThreadId: "t-A", shown: "t-A" });
+
+  assert.equal(await h.host.onSecret({ label: "Paste your API token" }), "typed-answer");
+  assert.equal(await h.host.onAsk({ question: "Which sampler?" }), "typed-answer");
+  assert.deepEqual(h.painted.map((p) => p.card), ["secret", "question"]);
+});
+
+test("LIFECYCLE: the real interrupt path (endTurnLocally) makes the real handlers refuse", async () => {
+  // The reported defect, end to end through shipped code: turn starts in A, the
+  // user interrupts (Esc / Disconnect / cancel all route here), the user opens
+  // conversation B, and A's superseded request_secret lands.
+  const h = buildLifecycle();
+  h.showConversation("t-A");
+  h.host.onTurn("working");
+  h.endTurnLocally();
+  h.showConversation("t-B");
+
+  const reply = await dispatch(() => h.host.onSecret({ label: "Paste your API token" }));
+  assert.equal(reply.ok, false);
+  assert.match(reply.error, /request_secret/);
+  assert.deepEqual(h.painted, [], "the secure input never reached conversation B");
+});
+
+test("LIFECYCLE: an interrupted turn cannot resurrect a secure input in its OWN conversation", async () => {
+  // The purest statement of the `agentWorking` half, and the same class onThinking
+  // already guards: the user dismissed this turn, so its trailing card must not
+  // come back — even though the conversation on screen never changed.
+  const h = buildLifecycle();
+  h.showConversation("t-A");
+  h.host.onTurn("working");
+  h.endTurnLocally();
+
+  const reply = await dispatch(() => h.host.onSecret({ label: "Paste your API token" }));
+  assert.equal(reply.ok, false);
+  assert.deepEqual(h.painted, []);
+});
+
+test("LIFECYCLE: a real turn:done makes the real handlers refuse a trailing card", async () => {
+  const h = buildLifecycle();
+  h.showConversation("t-A");
+  h.host.onTurn("working");
+  h.host.onTurn("done");
+  assert.deepEqual(h.state(), { agentWorking: false, liveTurnThreadId: null, shown: "t-A" });
+
+  assert.equal((await dispatch(() => h.host.onAsk({ question: "Which sampler?" }))).ok, false);
+  assert.deepEqual(h.painted, []);
+});
+
+test("LIFECYCLE: a fresh turn AFTER the straggler-guard window paints normally", async () => {
+  // The common interrupt-then-send-again shape: past the guard, onTurn accepts
+  // the new turn and the fence follows it.
+  const h = buildLifecycle();
+  h.showConversation("t-A");
+  h.host.onTurn("working");
+  h.endTurnLocally();
+  h.tick(guardMs + 1);
+  h.host.onTurn("working");
+  assert.equal(await h.host.onSecret({ label: "Paste your API token" }), "typed-answer");
+  assert.deepEqual(h.painted.map((p) => p.card), ["secret"]);
+});
+
+test("KNOWN RESIDUAL: a turn start swallowed by the straggler guard is refused, not misrouted", async () => {
+  // Gate round 1 (IMPORTANT). onTurn discards ANY turn:working inside
+  // STALE_WORKING_GUARD_MS of a local end — including a genuinely fresh turn the
+  // orchestrator released from the queue right after an interrupt. `agentWorking`
+  // therefore stays false and the card is refused.
+  //
+  // This is pinned, not fixed: closing it needs a turn id on the wire (see the
+  // header of interactive-card-fence.js). What IS asserted is the direction of
+  // the failure — an explicit, honest error, never a card painted into the wrong
+  // conversation, and never a fabricated success.
+  const h = buildLifecycle();
+  h.showConversation("t-A");
+  h.host.onTurn("working");
+  h.endTurnLocally();
+  h.tick(Math.max(1, guardMs - 1));
+  h.host.onTurn("working"); // the queued turn's real start — swallowed by the guard
+  assert.equal(h.state().agentWorking, false, "shipped onTurn drops it; the fence only reads the result");
+
+  const reply = await dispatch(() => h.host.onSecret({ label: "Paste your API token" }));
+  assert.equal(reply.ok, false, "fails closed");
+  assert.match(reply.error, /nothing was collected/i, "and says so honestly");
+  assert.ok(
+    !/has already ended/.test(reply.error),
+    "and does NOT claim a cause that is wrong in exactly this case",
+  );
+  assert.deepEqual(h.painted, []);
+});
+
+test("KNOWN RESIDUAL: a straggler turn:working past the guard re-authorizes the shown conversation", async () => {
+  // Gate round 1 (SEVERE). The mirror image, pinned for the same reason: the
+  // `turn` frame carries no turn identity, so a late working frame from an ENDED
+  // turn is indistinguishable from a fresh one and onTurn adopts the conversation
+  // then on screen. The fence cannot see behind that.
+  //
+  // Recorded so the residual is visible and so a future turn-id on the wire has a
+  // test to flip. Note the pre-fix behaviour was strictly worse: on origin/main
+  // the card painted with NO precondition at all.
+  const h = buildLifecycle();
+  h.showConversation("t-A");
+  h.host.onTurn("working");
+  h.endTurnLocally();
+  h.showConversation("t-B");
+  h.tick(guardMs + 1);
+  h.host.onTurn("working"); // indistinguishable from a fresh turn in B
+  assert.equal(h.state().liveTurnThreadId, "t-B");
+  assert.equal(await h.host.onSecret({ label: "Paste your API token" }), "typed-answer");
 });
 
 test("a refused secret clears the Settings marker instead of arming it for the next one", async () => {
