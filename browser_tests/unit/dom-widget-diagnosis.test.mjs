@@ -60,3 +60,83 @@ test("the diagnosis is a suffix — it never replaces the observed wrote/became 
   assert.ok(d.startsWith(" "), "must append cleanly after the observed-facts sentence");
   assert.ok(!/did not retain/.test(d), "must not restate the observation");
 });
+
+// ── #698: the refusal must be a ROUTE, not just a diagnosis ───────────────
+//
+// The message already said the real value lives on the node ("commonly
+// node.properties") and that retrying will not help. What the reporter still had
+// nothing to act on was WHICH properties this node has, or which tool writes them —
+// they worked around it with a different node type instead.
+//
+// PixaromaPrompt keeps its prompt in `properties.promptState.text`, reachable with
+// panel_set_property. So the refusal now names the properties that exist.
+
+const domWidget = { name: "pix_prompt_ui", element: {}, options: {} };
+
+test("#698 names the node's actual properties and the tool that writes them", () => {
+  const node = { id: 44, properties: { promptState: { text: "" }, mode: "a" } };
+  const msg = describeNonValueBearingWidget(domWidget, node);
+  assert.match(msg, /"promptState"/);
+  assert.match(msg, /"mode"/);
+  assert.match(msg, /panel_set_property/);
+  assert.match(msg, /panel_query_graph/);
+});
+
+test("#698 refuses to say WHICH property backs the widget", () => {
+  // Load-bearing. A heuristic pairing would eventually point an agent at an
+  // unrelated property and have it overwrite real node state — a destructive wrong
+  // answer in place of an honest dead end.
+  const node = { id: 44, properties: { promptState: { text: "" } } };
+  const msg = describeNonValueBearingWidget(domWidget, node);
+  // The exact clause, not a substring of it: changing "WHICH property" to "The first
+  // property" leaves "cannot be determined from here" intact while inverting the claim.
+  assert.match(msg, /WHICH property backs this widget cannot be determined from here/);
+  assert.ok(!/first property/i.test(msg), "must not point at a specific property");
+  assert.match(msg, /verify against the canvas/i);
+});
+
+test("#698 the structural diagnosis survives — this is additive", () => {
+  const msg = describeNonValueBearingWidget(domWidget, { id: 1, properties: { a: 1 } });
+  assert.match(msg, /DOM-backed display widget/);
+  assert.match(msg, /Retrying will not help/);
+});
+
+test("#698 a node with NO properties adds nothing — no empty route", () => {
+  for (const node of [undefined, null, { id: 1 }, { id: 1, properties: {} }, { id: 1, properties: [] }]) {
+    const msg = describeNonValueBearingWidget(domWidget, node);
+    assert.match(msg, /DOM-backed display widget/, "the structural half still fires");
+    assert.ok(!/panel_set_property/.test(msg), `must not offer a route for ${JSON.stringify(node)}`);
+  }
+});
+
+test("#698 a healthy value widget still gets NOTHING, node or no node", () => {
+  // The #715 line: serialize:false is normal on working widgets, so this must never
+  // become a pre-emptive verdict.
+  const node = { id: 2, properties: { anything: 1 } };
+  assert.equal(describeNonValueBearingWidget({ name: "seed", value: 5 }, node), "");
+  assert.equal(describeNonValueBearingWidget({ name: "t", value: "", options: {} }, node), "");
+});
+
+test("#698 a property-heavy node is capped but reports the true count", () => {
+  const properties = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`p${i}`, i]));
+  const msg = describeNonValueBearingWidget(domWidget, { id: 3, properties });
+  assert.match(msg, /30 properties/);
+  assert.match(msg, /… and 18 more/);
+  assert.ok(!/"p29"/.test(msg));
+});
+
+// ── WIRING ────────────────────────────────────────────────────────────────
+test("WIRING: the failure branch passes the NODE, or the route can never appear", async () => {
+  // Every test above calls the helper directly, so dropping `targetNode` at the call
+  // site leaves them all green while the property names silently vanish from the real
+  // message. widget-write's failure path needs a live graph to drive, so pin it here.
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(new URL("../../web/js/lib/widget-write.js", import.meta.url), "utf8");
+  assert.ok(src.includes("describeNonValueBearingWidget(w, targetNode);"),
+    "the observed-revert branch must pass the node");
+  // And it must stay in the OBSERVED-failure branch — never a pre-emptive gate (#715).
+  const idx = src.indexOf("describeNonValueBearingWidget(w, targetNode);");
+  const before = src.slice(Math.max(0, idx - 1200), idx);
+  assert.ok(before.includes("did not retain the"),
+    "must remain attached to the observed-revert failure, not a preflight");
+});

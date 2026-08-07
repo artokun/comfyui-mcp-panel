@@ -1228,7 +1228,7 @@ export function applyWidgetWrite(
       // Appended ONLY here, in the branch where the revert has already been
       // OBSERVED — so this can never turn into a pre-emptive refusal of a widget
       // that would have worked. Diagnosis, never a gate.
-      describeNonValueBearingWidget(w);
+      describeNonValueBearingWidget(w, targetNode);
   } else if (parentWidget && !matchesExpected(parentWidget.value)) {
     failure =
       `Promoted rail widget "${parentWidget.name}" on subgraph node ${node.id} did not retain ` +
@@ -1585,7 +1585,7 @@ export function applyWidgetWrite(
  * for perfectly healthy widgets (LoadImage's `upload` button is one), so gating on
  * it would manufacture exactly the kind of false refusal this file exists to avoid.
  */
-export function describeNonValueBearingWidget(w) {
+export function describeNonValueBearingWidget(w, node) {
   if (!w || typeof w !== "object") return "";
   const hasElement = !!w.element;
   const opts = w.options && typeof w.options === "object" ? w.options : null;
@@ -1599,8 +1599,42 @@ export function describeNonValueBearingWidget(w) {
     `${hasElement ? " (it owns a DOM element" : " (it defines getValue/setValue"}` +
     `${hasElement && hasAccessors ? " and defines getValue/setValue" : ""}), so its` +
     ` real value is held in ${where} — assigning the widget does not reach it.` +
-    ` Retrying will not help. Drive the node another way (an equivalent serialized` +
-    ` input, or a node whose value is a plain widget), or ask the pack's author to` +
-    ` expose a settable value.`
+    ` Retrying will not help.` +
+    describeNodeStateProperties(node) +
+    ` Otherwise drive the node another way (an equivalent serialized input, or a node` +
+    ` whose value is a plain widget), or ask the pack's author to expose a settable value.`
+  );
+}
+
+
+/** Cap the enumeration so a property-heavy node cannot turn one refusal into a wall
+ *  of text. The count is exact, so a truncated list still says how much it hid. */
+const MAX_STATE_KEYS = 12;
+
+/**
+ * #698 — name the properties this node actually carries, so the refusal above is a
+ * ROUTE rather than a dead end. The reporter was told the value did not stick and had
+ * nothing to try; PixaromaPrompt keeps its prompt in `properties.promptState.text`,
+ * which is reachable with panel_set_property.
+ *
+ * NAMES ONLY, NO PAIRING. Which property backs a given DOM widget is not something
+ * this can determine, and a heuristic guess (name similarity, "looks texty") would
+ * eventually point an agent at an unrelated property and have it overwrite real node
+ * state — a destructive wrong answer in place of an honest dead end. So it lists what
+ * exists and says to verify after writing.
+ */
+function describeNodeStateProperties(node) {
+  const props = node?.properties;
+  if (!props || typeof props !== "object" || Array.isArray(props)) return "";
+  const keys = Object.keys(props);
+  if (!keys.length) return "";
+  const shown = keys.slice(0, MAX_STATE_KEYS).map((k) => `"${k}"`).join(", ");
+  const more = keys.length > MAX_STATE_KEYS ? ` … and ${keys.length - MAX_STATE_KEYS} more` : "";
+  return (
+    ` This node carries ${keys.length} propert${keys.length === 1 ? "y" : "ies"}` +
+    ` (${shown}${more}) — for this kind of widget the live value is commonly one of them.` +
+    ` Read them with panel_query_graph and write with panel_set_property. WHICH property` +
+    ` backs this widget cannot be determined from here, so verify against the canvas` +
+    ` (panel_screenshot) after writing instead of assuming.`
   );
 }
