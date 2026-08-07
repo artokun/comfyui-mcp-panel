@@ -275,6 +275,27 @@ export function commandIsCanvasIndependent(cmd) {
   return CANVAS_INDEPENDENT_COMMANDS.has(cmd);
 }
 
+/** #932 — commands that NO canvas-targeting guard may refuse, because they name no
+ *  canvas to get wrong. Strictly wider than commandIsCanvasIndependent: it adds
+ *  `workflow_list`, which DOES observe the canvas (it reports which tab is active)
+ *  and so cannot honestly join that set, but which targets none.
+ *
+ *  Both guards this feeds exist to stop an operation landing on the WRONG workflow —
+ *  the uuid fence (#570) and the pinned-target guard (#349/#186). `workflow_list`
+ *  lands on nothing: it mutates no graph, selects no target (it enumerates every open
+ *  tab), and returns tab metadata rather than graph content.
+ *
+ *  It is also the ONLY probe the recovery path has. `rebindWorkflowFence()` re-derives
+ *  a session's target from `workflow_list`'s active record, so gating it behind either
+ *  guard makes the repair require the thing it repairs to be already-correct. That
+ *  circularity is what made #932/#607/#688 permanent: every command refused, and the
+ *  refusal text advertising a recovery that was itself refused for the same reason.
+ *  Both guards must consult THIS predicate, or the wedge simply moves to whichever one
+ *  was left behind. */
+export function commandIsCanvasTargetless(cmd) {
+  return commandIsCanvasIndependent(cmd) || cmd === 'workflow_list';
+}
+
 /** #570 — does the per-command workflow-instance uuid fence APPLY to this command? The fence
  *  refuses a command whose stamped workflow_uuid ≠ the ACTIVE workflow's uuid, so it must cover
  *  everything that runs against the active canvas — every graph_* op AND the active-workflow
@@ -292,14 +313,37 @@ export function commandIsCanvasIndependent(cmd) {
  *   • canvas-independent Manager/server commands (CANVAS_INDEPENDENT_COMMANDS, #602): their
  *     execution and reply never reference the active canvas, so a stale stamp is irrelevant;
  *   • workflow_open / workflow_new: navigation/creation with their own explicit/new target;
+ *   • workflow_list: the RECOVERY PROBE — see below;
  *   • workflow_rename / workflow_close whose selector resolves to a genuinely NON-active open
  *     workflow (`targetsNonActive` — via selectorTargetsNonActiveWorkflow): a deterministic
  *     close/rename of a DIFFERENT workflow must run. A path that resolves to the ACTIVE workflow
  *     (incl. after an in-place replacement) is NOT exempt — it is fenced.
- *  Reads (graph_get_state, …) still return true here — harmlessly fenced (fail-closed); their
- *  reply is server-fenced anyway, and a read can only run against the active canvas regardless. */
+ *  Other reads (graph_get_state, …) still return true here — harmlessly fenced (fail-closed);
+ *  their reply is server-fenced anyway, and a read can only run against the active canvas
+ *  regardless.
+ *
+ *  #932/#607/#688 — `workflow_list` is the ONE read for which "harmlessly fenced" was FALSE,
+ *  and fencing it is what made the wedge PERMANENT rather than merely annoying. The
+ *  orchestrator repairs a stale fence exactly one way: `rebindWorkflowFence()` probes with
+ *  `workflow_list` and re-derives the stamp from the active record it returns. Fencing that
+ *  probe makes the repair depend on the fence being already-correct — so a stale stamp refuses
+ *  the only command that could refresh it, `panel_set_workflow_target({mode:"current"})` comes
+ *  back "could not read the live canvas identity", and NOTHING inside the protocol can clear
+ *  it. That circularity, not the refusal itself, is what those reports describe as "the
+ *  documented recovery paths do not clear the guard"; the advertised remedy was a no-op and a
+ *  browser reload was the only exit.
+ *
+ *  Exempting it does not weaken the guard the fence exists to be. The fence stops a command
+ *  from being APPLIED to a canvas it was not issued for. `workflow_list` applies nothing: it
+ *  mutates no graph, names no target (it enumerates every open tab rather than selecting one),
+ *  and its reply carries tab METADATA only — path, title, routing key, active/modified flags —
+ *  never graph content. Decisively, its handler reads the LIVE binding at execution time
+ *  (`liveWorkflowListActive()`), so a stale stamp cannot make it report a stale answer: the
+ *  reply describes the canvas that is actually active, which is precisely the fact the caller
+ *  needs in order to stop being wrong. A read that cannot be misapplied has nothing to fence,
+ *  and this one is the way back. */
 export function activeWorkflowFenceApplies({ cmd, targetsNonActive = false } = {}) {
-  if (commandIsCanvasIndependent(cmd)) return false;
+  if (commandIsCanvasTargetless(cmd)) return false;
   if (cmd === 'workflow_open' || cmd === 'workflow_new') return false;
   if ((cmd === 'workflow_rename' || cmd === 'workflow_close') && targetsNonActive) return false;
   return true;
