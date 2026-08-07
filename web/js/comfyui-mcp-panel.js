@@ -16810,6 +16810,24 @@ function setBackendDisabled(id, off) {
 }
 function backendEnabled(id) { return !disabledBackends().has(id); }
 
+// The conversation THIS TAB MINTED since the live turn began — record()'s mint
+// branch is the sole writer, and onTurn("working") resets it, so a non-null value
+// means exactly "record() created this conversation during the turn now running".
+//
+// The interactive-card fence needs that, and nothing weaker will do. A turn that
+// starts before this view has a conversation captures a null owner and then mints
+// its own; but a conversation can ALSO appear on screen mid-turn without being
+// this turn's — a cross-tab history sync followed by detachInvalidCurrentThread()
+// rebinding, or loadThread()'s blocked cross-workflow branch — and such a
+// conversation can be NEWER than the turn, so "created after the turn started"
+// cannot tell the two apart. Being minted right here can.
+//
+// Module-scoped ON PURPOSE: record() runs from many points inside the panel
+// builder closure, and a `let` declared partway down that 4000-line closure would
+// be in its temporal dead zone for any call that reaches record() earlier. A
+// module binding is initialized before buildPanel() can run at all. Only one
+// panel is mounted at a time (see liveBridgeClient), so a single slot is enough.
+let lastMintedThreadId = null;
 
 function buildPanel() {
   ensureStyles();
@@ -19471,6 +19489,10 @@ function buildPanel() {
       if (threads.length > MAX_THREADS) threads = capHistoryThreads(threads, thread.id);
       ssSet(CURRENT_THREAD_KEY, thread.id);
       setActiveThread(followsPanel ? "panel:global" : workflowKey, thread.id);
+      // THIS is the only place a conversation is created. Record it so the
+      // interactive-card fence can recognise the conversation an owner-less turn
+      // minted for itself, and only that one (see lastMintedThreadId).
+      lastMintedThreadId = thread.id;
     }
     if (entry.role === "user") {
       const version = workflowVersionSnapshot();
@@ -21584,12 +21606,6 @@ function buildPanel() {
   // codex-P2). Null between turns; a page reload resets it. Set on onTurn
   // "working", overwritten by the next turn's owner.
   let liveTurnThreadId = null;
-  // When that turn started. A turn that began on a view with no conversation yet
-  // has a null owner above, and the conversation it goes on to MINT (record()
-  // stamps `createdAt` off the same clock) is the one it owns — the
-  // interactive-card fence compares against this to tell that conversation apart
-  // from an older one that something else put on screen. 0 between turns.
-  let liveTurnStartedAt = 0;
 
   // Set by a Settings "Set … token" button just before it asks the agent to open
   // the secure input, so the resolved value can be marked set/not-set (timestamp
@@ -21655,8 +21671,7 @@ function buildPanel() {
       agentWorking,
       turnThreadId: liveTurnThreadId,
       shownThreadId: thread?.id ?? null,
-      turnStartedAt: liveTurnStartedAt,
-      shownThreadCreatedAt: thread?.createdAt ?? null,
+      mintedThreadId: lastMintedThreadId,
     });
     if (verdict.paint) return;
     // Safe to log: this runs BEFORE any card exists, so there is no user value
@@ -22011,7 +22026,11 @@ function buildPanel() {
         // Pin the turn's owner so its usage frames persist under THIS
         // conversation even if the user switches history before it ends (#381).
         liveTurnThreadId = thread?.id ?? null;
-        liveTurnStartedAt = Date.now(); // owner-less turns are identified by this
+        // Nothing has been minted DURING this turn yet. Reset here (not on `done`)
+        // so the marker always describes the turn now running (see
+        // lastMintedThreadId): it is what lets an owner-less turn claim the
+        // conversation it creates, and only that one.
+        lastMintedThreadId = null;
         showThinking();
         noteActivity(); // turn start = real activity → seed the silence clock
         ssSet(MID_TASK_KEY, "1"); // a turn is in flight — arm the resume nudge
@@ -22022,7 +22041,6 @@ function buildPanel() {
         // completed one (#381 codex-P2). `done` is terminal — no more usage
         // frames trail it — so clearing here cannot orphan a late frame.
         liveTurnThreadId = null;
-        liveTurnStartedAt = 0;
         hideThinking(); // authoritative terminal frame — clears the action label too
         ssSet(MID_TASK_KEY, null); // turn finished cleanly — nothing to resume
         // Snapshot the graph the agent is leaving behind; the next user turn diffs

@@ -71,51 +71,57 @@ test("an owner-less turn paints into the conversation IT minted", () => {
       agentWorking: true,
       turnThreadId: null,
       shownThreadId: "t-new",
-      turnStartedAt: 1000,
-      shownThreadCreatedAt: 1000, // minted in the same tick as the turn start
+      mintedThreadId: "t-new",
     }),
     { paint: true, reason: null },
   );
-  assert.equal(
-    classifyInteractiveCard({
-      agentWorking: true,
-      turnThreadId: null,
-      shownThreadId: "t-new",
-      turnStartedAt: 1000,
-      shownThreadCreatedAt: 4000,
-    }).paint,
-    true,
-    "minted later in the same turn is still this turn's conversation",
-  );
 });
 
-test("an owner-less turn does NOT paint into a conversation that predates it", () => {
+test("an owner-less turn does NOT paint into a conversation it merely FOUND on screen", () => {
   // The hole the other direction would open: loadThread()'s cross-workflow
   // BLOCKED branch calls detachInvalidCurrentThread({rebind:true}) and returns
-  // WITHOUT endTurnLocally(), so an OLD conversation can land on screen under a
-  // thread-less live turn.
+  // WITHOUT endTurnLocally(), so a conversation this turn never created can land
+  // on screen under a thread-less live turn.
   assert.deepEqual(
     classifyInteractiveCard({
       agentWorking: true,
       turnThreadId: null,
-      shownThreadId: "t-old",
-      turnStartedAt: 5000,
-      shownThreadCreatedAt: 4999,
+      shownThreadId: "t-other",
+      mintedThreadId: null,
     }),
     { paint: false, reason: "other_conversation" },
   );
 });
 
-test("an owner-less turn fails CLOSED when the timestamps cannot decide", () => {
+test("gate round 3: a NEWER conversation from another tab is still not this turn's", () => {
+  // Age is not provenance. Tab B creates a conversation AFTER this turn began; it
+  // syncs into this tab's history and detachInvalidCurrentThread() rebinds it onto
+  // the screen. A "created after the turn started" rule would have painted a
+  // secure input into the other tab's conversation. Provenance does not.
+  assert.deepEqual(
+    classifyInteractiveCard({
+      agentWorking: true,
+      turnThreadId: null,
+      shownThreadId: "t-from-other-tab",
+      mintedThreadId: null, // this tab minted nothing during this turn
+    }),
+    { paint: false, reason: "other_conversation" },
+  );
+  // And even when this turn HAS minted one, only that exact one qualifies.
+  assert.deepEqual(
+    classifyInteractiveCard({
+      agentWorking: true,
+      turnThreadId: null,
+      shownThreadId: "t-from-other-tab",
+      mintedThreadId: "t-mine",
+    }),
+    { paint: false, reason: "other_conversation" },
+  );
+});
+
+test("an owner-less turn fails CLOSED when there is no mint to point at", () => {
   const base = { agentWorking: true, turnThreadId: null, shownThreadId: "t-x" };
-  for (const extra of [
-    {}, // no timestamps at all
-    { turnStartedAt: 0, shownThreadCreatedAt: 1000 }, // no turn start recorded
-    { turnStartedAt: 1000 }, // legacy thread with no createdAt
-    { turnStartedAt: 1000, shownThreadCreatedAt: null },
-    { turnStartedAt: 1000, shownThreadCreatedAt: "yesterday" },
-    { turnStartedAt: Number.NaN, shownThreadCreatedAt: 2000 },
-  ]) {
+  for (const extra of [{}, { mintedThreadId: null }, { mintedThreadId: undefined }, { mintedThreadId: "t-y" }]) {
     assert.deepEqual(
       classifyInteractiveCard({ ...base, ...extra }),
       { paint: false, reason: "other_conversation" },
@@ -256,44 +262,76 @@ test("the fence reads every input from live panel state", () => {
   assert.ok(/agentWorking,/.test(src), "reads the live-turn flag");
   assert.ok(/turnThreadId: liveTurnThreadId/.test(src), "reads the live turn's owner");
   assert.ok(/shownThreadId: thread\?\.id \?\? null/.test(src), "reads the conversation on screen");
-  assert.ok(/turnStartedAt: liveTurnStartedAt/.test(src), "reads when the live turn started");
-  assert.ok(
-    /shownThreadCreatedAt: thread\?\.createdAt \?\? null/.test(src),
-    "reads when the shown conversation was created",
-  );
+  assert.ok(/mintedThreadId: lastMintedThreadId/.test(src), "reads what this turn minted");
 });
 
-test("the owner-less discriminator is anchored to the SAME clock record() mints with", () => {
-  // The null-owner rule compares `thread.createdAt` against `liveTurnStartedAt`.
-  // That only means anything if the mint stamps createdAt from Date.now() and the
-  // turn start is stamped from Date.now() too. Pin both, so a future change to
-  // either (e.g. a monotonic counter, or a server-supplied createdAt) fails here
-  // rather than silently turning the comparison into nonsense.
-  const mint = panelSrc.match(/if \(!thread\) \{\n\s*const now = Date\.now\(\);[\s\S]*?createdAt: now,/);
-  assert.ok(mint, "record()'s mint must stamp createdAt from Date.now()");
-  assert.ok(
-    /liveTurnStartedAt = Date\.now\(\); \/\/ owner-less turns are identified by this/.test(panelSrc),
-    "onTurn('working') must stamp liveTurnStartedAt from Date.now()",
+/** The body of a top-level `function <name>(` in the panel, to its closing brace. */
+function panelFunctionBody(name) {
+  const start = panelSrc.indexOf(`\n  function ${name}(`);
+  assert.notEqual(start, -1, `could not locate function ${name}`);
+  const end = panelSrc.indexOf("\n  }\n", start);
+  assert.ok(end > start, `could not find the end of ${name}`);
+  return panelSrc.slice(start, end);
+}
+
+test("the owner-less rule is PROVENANCE: record()'s mint is lastMintedThreadId's only writer", () => {
+  // The whole rule rests on lastMintedThreadId meaning "record() created this
+  // conversation during the turn now running". Two things make that true, and both
+  // are pinned here so a future edit fails loudly instead of quietly turning the
+  // check into a rubber stamp:
+  //   1. every assignment to it is either record()'s mint or onTurn's reset;
+  //   2. the mint assignment really is inside record(), in the branch that creates
+  //      the thread.
+  const writes = [...panelSrc.matchAll(/lastMintedThreadId = ([^;]+);/g)].map((m) => m[1].trim());
+  assert.deepEqual(
+    writes.sort(),
+    ["null", "null", "thread.id"],
+    "exactly one mint write plus the declaration and the turn-start reset",
   );
+
+  const record = panelFunctionBody("record");
+  // Sanity-check the slice really spans record(), so the assertions below are not
+  // quietly passing against a truncated body.
+  assert.ok(record.includes("if (!thread) {"), "slice covers record()'s mint branch");
+  assert.ok(record.includes('if (entry.role === "user") {'), "slice reaches past the mint branch");
+  // Bound the mint branch to ITS OWN block (from `if (!thread) {` to that block's
+  // own 4-space closing brace) rather than letting a lazy `[\s\S]*?` wander past
+  // it — an assignment moved into a SIBLING branch must fail this, not slip
+  // through because the regex spanned the brace.
+  const branchStart = record.indexOf("    if (!thread) {");
+  assert.notEqual(branchStart, -1, "record()'s mint branch starts at a 4-space `if (!thread) {`");
+  const branchEnd = record.indexOf("\n    }\n", branchStart);
+  assert.ok(branchEnd > branchStart, "the mint branch closes at its own 4-space brace");
+  const mintBranch = record.slice(branchStart, branchEnd);
   assert.ok(
-    /liveTurnThreadId = null;\n\s*liveTurnStartedAt = 0;/.test(panelSrc),
-    "onTurn('done') must clear liveTurnStartedAt alongside the owner",
+    mintBranch.includes("lastMintedThreadId = thread.id;"),
+    "the mint write lives inside record()'s thread-creation branch, not a sibling one",
   );
-  // record() must NOT retroactively adopt the minted thread as the turn owner —
-  // if it ever did, the timestamp rule would be dead code pretending to guard.
-  const recordFn = panelSrc.slice(panelSrc.indexOf("if (!thread) {"), panelSrc.indexOf("if (!thread) {") + 2500);
+  // …and nowhere else in record(), so a later branch can't claim a conversation
+  // record() merely rebound.
+  assert.equal(
+    (record.match(/lastMintedThreadId = /g) || []).length,
+    1,
+    "record() assigns lastMintedThreadId exactly once",
+  );
+
+  const onTurnWorking = onTurnSrc.slice(0, onTurnSrc.indexOf('state === "done"'));
   assert.ok(
-    !recordFn.includes("liveTurnThreadId"),
-    "record() does not touch liveTurnThreadId — the timestamp rule is what covers the mint",
+    /lastMintedThreadId = null;/.test(onTurnWorking),
+    "onTurn('working') resets it, so it always describes the turn now running",
   );
+  // record() must NOT retroactively adopt the minted thread as the turn OWNER —
+  // if it did, #381's liveTurnThreadId semantics would change under it and this
+  // rule would be dead code pretending to guard.
+  assert.ok(!record.includes("liveTurnThreadId"), "record() does not write the turn owner");
 });
 
-test("loadThread's BLOCKED cross-workflow branch is the reason the mint rule is timestamped", () => {
+test("loadThread's BLOCKED cross-workflow branch is why the owner-less rule needs provenance", () => {
   // It calls detachInvalidCurrentThread({rebind:true}) and RETURNS without
-  // endTurnLocally(), so an OLD conversation can appear under a thread-less live
-  // turn. Pin the shape — if this branch ever starts ending the turn, the
-  // timestamp rule becomes belt-and-braces rather than load-bearing, and whoever
-  // relaxes it should see this test.
+  // endTurnLocally(), so a conversation this turn never created can appear under a
+  // thread-less live turn. Pin the shape — if this branch ever starts ending the
+  // turn, the mint rule becomes belt-and-braces rather than load-bearing, and
+  // whoever relaxes it should see this test.
   const start = panelSrc.indexOf("function loadThread(t) {");
   const blocked = panelSrc.slice(start, panelSrc.indexOf("endTurnLocally();", start));
   assert.ok(
@@ -354,7 +392,7 @@ function buildHandlers() {
             bumpThinking, noteActivity, lsSet, SECRET_SET_AT_PREFIX, console } = deps;
     let agentWorking = false;
     let liveTurnThreadId = null;
-    let liveTurnStartedAt = 0;
+    let lastMintedThreadId = null;
     let thread = null;
     let pendingSecretRequest = null;
     ${fenceMatch[0]}
@@ -367,10 +405,8 @@ function buildHandlers() {
       setState(s) {
         agentWorking = s.agentWorking;
         liveTurnThreadId = s.turnThreadId ?? null;
-        liveTurnStartedAt = s.turnStartedAt ?? 1000;
-        thread = s.shownThreadId
-          ? { id: s.shownThreadId, createdAt: s.shownThreadCreatedAt ?? 0 }
-          : null;
+        lastMintedThreadId = s.mintedThreadId ?? null;
+        thread = s.shownThreadId ? { id: s.shownThreadId } : null;
       },
       armSettingsRequest(req) { pendingSecretRequest = req; },
       pendingSecretRequest: () => pendingSecretRequest,
@@ -504,7 +540,7 @@ function buildLifecycle() {
             STALE_WORKING_GUARD_MS, now } = deps;
     let agentWorking = false;
     let liveTurnThreadId = null;
-    let liveTurnStartedAt = 0;
+    let lastMintedThreadId = null;
     let thread = null;
     let localEndAt = 0;
     let pendingSecretRequest = null;
@@ -520,11 +556,13 @@ function buildLifecycle() {
     return {
       host,
       endTurnLocally,
-      // Selecting an EXISTING conversation: createdAt is whatever it already had.
-      showConversation(id, createdAt) { thread = id ? { id, createdAt: createdAt ?? 0 } : null; },
-      // What record()'s mint branch does: id + createdAt stamped from the SAME
-      // Date.now() the rest of this closure reads.
-      mintConversation(id) { thread = { id, createdAt: Date.now() }; },
+      // A conversation that merely APPEARS on screen: paintThread() /
+      // detachInvalidCurrentThread()'s rebind / the restore path. record() was
+      // never involved, so the mint marker is untouched.
+      showConversation(id) { thread = id ? { id } : null; },
+      // What record()'s mint branch does: create the conversation AND stamp it as
+      // the one minted here.
+      mintConversation(id) { thread = { id }; lastMintedThreadId = id; },
       state: () => ({ agentWorking, liveTurnThreadId, shown: thread?.id ?? null }),
     };
   `,
@@ -599,18 +637,37 @@ test("LIFECYCLE: a turn that starts blank and MINTS its conversation still paint
   assert.deepEqual(h.painted.map((p) => p.card), ["secret"]);
 });
 
-test("LIFECYCLE: a blank-start turn is still refused against a PRE-EXISTING conversation", async () => {
-  // loadThread()'s blocked cross-workflow branch: detach rebinds an OLD
-  // conversation onto the screen without ending the turn.
+test("LIFECYCLE: a blank-start turn is refused against a conversation it did not mint", async () => {
+  // loadThread()'s blocked cross-workflow branch: detach rebinds a conversation
+  // onto the screen without ending the turn. Gate round 3: this covers the
+  // cross-tab case too — that conversation may be NEWER than the turn and is
+  // still not the turn's, because record() never ran for it here.
   const h = buildLifecycle();
   h.showConversation(null);
-  h.tick(5000);
   h.host.onTurn("working");
-  h.showConversation("t-old", h.at() - 60000); // created long before this turn
+  h.tick(50);
+  h.showConversation("t-from-elsewhere"); // appeared; not minted here
 
   const reply = await dispatch(() => h.host.onSecret({ label: "Paste your API token" }));
   assert.equal(reply.ok, false);
   assert.match(reply.error, /different conversation/i);
+  assert.deepEqual(h.painted, []);
+});
+
+test("LIFECYCLE: the mint marker does not survive into the NEXT turn", async () => {
+  // onTurn('working') resets it, so a conversation minted by an earlier turn
+  // cannot vouch for a later owner-less one that merely finds it on screen.
+  const h = buildLifecycle();
+  h.showConversation(null);
+  h.host.onTurn("working");
+  h.mintConversation("t-1");
+  h.host.onTurn("done");
+
+  // A later turn starts while nothing is shown, then t-1 is rebound onto screen.
+  h.showConversation(null);
+  h.host.onTurn("working");
+  h.showConversation("t-1");
+  assert.equal((await dispatch(() => h.host.onSecret({ label: "Paste your API token" }))).ok, false);
   assert.deepEqual(h.painted, []);
 });
 

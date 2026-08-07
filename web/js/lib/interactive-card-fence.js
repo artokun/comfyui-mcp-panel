@@ -106,40 +106,43 @@ export const INTERACTIVE_CARD_CMDS = new Set(["request_secret", "ask_user"]);
  *  - `shownThreadId`  — the conversation currently on screen (`thread?.id`), or
  *                       null for the pre-first-message view.
  *
- *  - `turnStartedAt`  — when that turn started (`liveTurnStartedAt`), 0 when none.
- *  - `shownThreadCreatedAt` — the shown conversation's `createdAt`, or null.
+ *  - `mintedThreadId` — the conversation record() MINTED since this turn started
+ *                      (`lastMintedThreadId`), or null if it has minted none.
  *
  * Returns `{ paint, reason }`; `reason` is null when painting.
  *
- * THE NULL-OWNER CASE (`turnThreadId === null` while a turn is in flight) needs
- * the last two arguments and is the subtlest part of this (my own gate, round 2 —
- * an earlier version got it wrong in BOTH directions, so both are spelled out).
+ * THE NULL-OWNER CASE (`turnThreadId === null` while a turn is in flight) is the
+ * subtlest part of this. My own gate got it wrong twice, so both wrong answers are
+ * written down:
  *
  * `liveTurnThreadId` is captured in onTurn("working") as `thread?.id ?? null`, so
- * it is null for a turn that began on a view with no conversation yet. Such a
- * turn is not owner-less — it owns the conversation IT creates. record() mints
- * that conversation from the turn's own first message/output, stamping
- * `createdAt` with the same clock, and does NOT retroactively update
- * liveTurnThreadId. So:
+ * it is null for a turn that began on a view with no conversation yet. Such a turn
+ * is not owner-less — it owns the conversation IT creates. record() mints that
+ * conversation from the turn's own first message/output and does NOT retroactively
+ * update liveTurnThreadId. So:
  *
- *   * Refusing whenever `owner !== shown` false-refuses that legitimate card: the
- *     agent emits a progress `say` (which mints the thread) and then asks.
- *   * Painting whenever `owner === null` re-opens a hole: loadThread()'s
+ *   * Refusing whenever `owner !== shown` (round 2) false-refuses that legitimate
+ *     card: the agent emits a progress `say`, which mints the conversation, then
+ *     asks — in the conversation the user is looking at.
+ *   * Painting whenever `owner === null` opens a hole the other way: loadThread()'s
  *     cross-workflow BLOCKED branch calls detachInvalidCurrentThread({rebind}) and
- *     returns WITHOUT endTurnLocally(), so a thread-less live turn can find an
- *     OLD conversation on screen that it does not own.
+ *     returns WITHOUT endTurnLocally(), so a thread-less live turn can find a
+ *     conversation on screen that it does not own.
+ *   * "Created after the turn started" (round 3) is not enough either: a
+ *     conversation created in ANOTHER TAB after this turn began can sync into this
+ *     tab's history and be rebound onto the screen by that same detach path. It is
+ *     newer than the turn and still not the turn's.
  *
- * The discriminator is therefore whether the shown conversation came into
- * existence DURING this turn: `createdAt >= turnStartedAt` means record() minted
- * it here; anything older was put on screen by something else. Missing/unusable
- * timestamps fail CLOSED.
+ * The discriminator has to be provenance, not age: was this exact conversation
+ * MINTED by record() during this turn? `lastMintedThreadId` answers that directly
+ * — record()'s mint is its only writer and onTurn("working") resets it — so no
+ * conversation that merely APPEARED on screen can satisfy it.
  */
 export function classifyInteractiveCard({
   agentWorking,
   turnThreadId,
   shownThreadId,
-  turnStartedAt,
-  shownThreadCreatedAt,
+  mintedThreadId,
 } = {}) {
   if (!agentWorking) return { paint: false, reason: "no_live_turn" };
   const owner = turnThreadId ?? null;
@@ -148,11 +151,8 @@ export function classifyInteractiveCard({
     // Nothing on screen either: the turn began on an empty view and it is still
     // empty. There is no other conversation for the card to land in.
     if (shown === null) return { paint: true, reason: null };
-    const created = Number(shownThreadCreatedAt);
-    const started = Number(turnStartedAt);
-    if (Number.isFinite(created) && Number.isFinite(started) && started > 0 && created >= started) {
-      return { paint: true, reason: null };
-    }
+    const minted = mintedThreadId ?? null;
+    if (minted !== null && shown === minted) return { paint: true, reason: null };
     return { paint: false, reason: "other_conversation" };
   }
   if (owner !== shown) return { paint: false, reason: "other_conversation" };
