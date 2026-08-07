@@ -12755,9 +12755,26 @@ const GRAPH_TOOL_EXECUTORS = {
       graph.afterChange?.();
     }
     graph.setDirtyCanvas?.(true, true);
+    // Report what the node HOLDS, not what was asked for. `node.mode = target` is a
+    // plain assignment on a stock LGraphNode, but a pack is free to define a `mode`
+    // accessor that clamps, ignores, or rewrites the value — and this is not a
+    // cosmetic field: bypass and mute decide whether the node EXECUTES, so echoing
+    // the request would tell an agent it had disabled a node that is still running.
+    // Same rule as the widget write (#240) and the restart/media reports: read back
+    // and refuse rather than assert an effect that was never observed.
+    const actualNum = typeof node.mode === "number" ? node.mode : 0;
+    if (actualNum !== target) {
+      throw new Error(
+        `Node ${node.id} (${node.title ?? node.type}) did not accept mode ` +
+          `"${NUM_TO_MODE[target]}": after the write it reads ` +
+          `"${NUM_TO_MODE[actualNum] ?? actualNum}". Nothing is being reported as changed. ` +
+          `Some node packs override \`mode\` to refuse or rewrite it — check the node on the ` +
+          `canvas (panel_screenshot) and set the mode from ComfyUI's own menu if it must hold.`,
+      );
+    }
     return {
       node_id: node.id,
-      mode: NUM_TO_MODE[target],
+      mode: NUM_TO_MODE[actualNum],
       previous_mode,
       ...(bypassWarning ? { warning: bypassWarning } : {}),
     };
