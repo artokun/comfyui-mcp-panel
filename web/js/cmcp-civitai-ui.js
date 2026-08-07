@@ -15,6 +15,7 @@ import {
   BASE_MODELS, ACTIVE_BASE_MODELS, prepareQuery, matchesBaseModel,
   filtersDirty, bitmask, parseCreatorQuery, levelLabel,
 } from "./cmcp-civitai.js";
+import { summarizeSearchFilters } from "./lib/civitai-search-echo.js";
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import { openSubModal as openSubModalBase, toast } from "./cmcp-modal.js";
 import { chipRow as filterChipRow, makeFilterButton } from "./cmcp-filter.js";
@@ -1995,7 +1996,23 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     // generation. The agent reads the data via panel_civitai_results
     // (loading/done flags) — the metadata-poll design.
     void reload({ searching: true });
-    return { tab: state.tab, query: state.query, creator: state.filters.username || null, renderRev: state.renderRev, dispatched: true };
+    // #691 — echo `filters` the way `tab`/`query`/`creator` are already echoed, so
+    // the caller can tell "applied" from "silently dropped" instead of reading
+    // `dispatched:true` as proof. summarizeSearchFilters also reports when a
+    // requested modelSort is inert because CivitAI relevance-ranks keyword
+    // searches — measured, not assumed; see that module for the evidence.
+    return {
+      tab: state.tab,
+      query: state.query,
+      creator: state.filters.username || null,
+      ...summarizeSearchFilters({
+        filters: state.filters,
+        query: state.query,
+        modelTab: !!tabDef().model,
+      }),
+      renderRev: state.renderRev,
+      dispatched: true,
+    };
   }
   function driveGetResults({ limit = 20 } = {}) {
     _assertOpen();
