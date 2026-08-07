@@ -260,7 +260,7 @@ function presentModelBasenames(res) {
   return set;
 }
 
-/** Parse list_installed_nodes TEXT (formatInstalledNodes shape:
+/** Parse install_custom_node (action:"list") TEXT (formatInstalledNodes shape:
  *    "1. <module> [cnr:<id>, git:<aux>]\n   version: … | enabled")
  *  into a lower-cased Set of every identifier we can match a declared pack
  *  against — the module name plus any cnr / git ids. */
@@ -286,7 +286,7 @@ function parseInstalledNodeSet(text) {
   return set;
 }
 
-/** Parse extract_workflow_dependencies TEXT — the "Required custom node packs"
+/** Parse list_packs (action:"extract_deps") TEXT — the "Required custom node packs"
  *  section only — into [{ pack, installed }]. Each line there is
  *  "- <pack>  — installed" or "- <pack>  — **NOT INSTALLED**" (em-dash U+2014).
  *  Returns { corePacksOnly: true } style via an empty array + a flag when the
@@ -712,7 +712,8 @@ export function createAppsContent(ctx, shell, opts = {}) {
    *                  { fileName, directory, source, sourceUrl, civitaiVersionId, … })
    *    customNodes — manifest.deps.customNodes[]  (class_type string | { pack })
    *    getWorkflow — () => Promise<apiPrompt|null>; the API-format prompt handed to
-   *                  extract_workflow_dependencies / resolve_missing_models. Invoked
+   *                  list_packs (action:"extract_deps") / download_model
+   *                  (action:"resolve_missing"). Invoked
    *                  lazily, memoised — at most one bundle fetch even if both
    *                  sections need it.
    *
@@ -785,7 +786,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
         for (const r of rows) { r.status.append(spinning("checking…")); }
         (async () => {
           let present = new Set();
-          try { present = presentModelBasenames(await callTool("list_local_models", {})); }
+          try { present = presentModelBasenames(await callTool("list_local_models", { action: "list" })); }
           catch { /* offline / older bridge — treat as unknown */ }
           if (!alive()) return;
           for (const r of rows) {
@@ -896,7 +897,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
           btn.disabled = true;
           show(spinning("installing…"));
           try {
-            const res = await callTool("install_custom_node", { id: r.pack });
+            const res = await callTool("install_custom_node", { action: "install", id: r.pack });
             if (!alive()) return;
             if (res && res.ok === false) throw new Error(toolText(res) || "install failed");
             r.installed = true;
@@ -933,30 +934,31 @@ export function createAppsContent(ctx, shell, opts = {}) {
       return false;
 
       async function civitai(versionId, subfolder) {
-        const res = await callTool("download_civitai_model", { model_version_id: versionId, target_subfolder: subfolder });
+        const res = await callTool("download_model", { action: "download_civitai", model_version_id: versionId, target_subfolder: subfolder });
         if (res && res.ok === false) throw new Error(toolText(res) || "CivitAI download failed");
         return true;
       }
       async function direct(u, subfolder, filename) {
-        const res = await callTool("download_model", { url: u, target_subfolder: subfolder, ...(filename ? { filename } : {}) });
+        const res = await callTool("download_model", { action: "download", url: u, target_subfolder: subfolder, ...(filename ? { filename } : {}) });
         if (res && res.ok === false) throw new Error(toolText(res) || "download failed");
         return true;
       }
     }
 
-    /** Re-query list_local_models and report whether `fname` has landed. */
+    /** Re-query list_local_models (action:"list") and report whether `fname` has landed. */
     async function recheckModel(fname) {
       if (!fname) return false;
-      try { return presentModelBasenames(await callTool("list_local_models", {})).has(depBasename(fname)); }
+      try { return presentModelBasenames(await callTool("list_local_models", { action: "list" })).has(depBasename(fname)); }
       catch { return false; }
     }
 
-    /** Best-effort candidate parse from resolve_missing_models markdown. Finds
-     *  the `### \`<name>\`` section for this file, then the first CivitAI version
-     *  id (→ download_civitai_model) or an http(s) URL (→ download_model). */
+    /** Best-effort candidate parse from download_model (action:"resolve_missing")
+     *  markdown. Finds the `### \`<name>\`` section for this file, then the first
+     *  CivitAI version id (→ action:"download_civitai") or an http(s) URL
+     *  (→ action:"download"). */
     async function resolveModelCandidate(wf, fname) {
       let text = "";
-      try { text = toolText(await callTool("resolve_missing_models", { workflow: wf })); }
+      try { text = toolText(await callTool("download_model", { action: "resolve_missing", workflow: wf })); }
       catch { return null; }
       if (!text) return null;
       const base = depBasename(fname);
@@ -965,7 +967,11 @@ export function createAppsContent(ctx, shell, opts = {}) {
         const hdr = line.match(/^###\s+`([^`]+)`/);
         if (hdr) { inMatch = depBasename(hdr[1]) === base; continue; }
         if (!inMatch) continue;
-        const ver = line.match(/\(version\s+(\d{2,})\)/i) || line.match(/version\s+(\d{2,})\)?\s*(?:→|->)?\s*download_civitai_model/i);
+        // Second alternative tracks the tool's OWN prose, which 0.50.0 rewrote
+        // from the retired standalone CivitAI-download name to `download_model
+        // action:"download_civitai"`. It is a fallback for a line the first
+        // pattern misses, so it stays keyed on whatever the tool emits today.
+        const ver = line.match(/\(version\s+(\d{2,})\)/i) || line.match(/version\s+(\d{2,})\)?\s*(?:→|->)?\s*download_model\s+action:"download_civitai"/i);
         if (ver) return { versionId: Number(ver[1]) };
         const url = line.match(/https?:\/\/\S+/);
         if (url) return { url: url[0].replace(/[)\].,]+$/, "") };
@@ -974,18 +980,19 @@ export function createAppsContent(ctx, shell, opts = {}) {
     }
 
     /** Resolve the declared node deps to [{pack, installed}]. Preferred path:
-     *  extract_workflow_dependencies (maps class_type→pack + reports installed vs
-     *  missing authoritatively). Fallback when the prompt is unavailable (e.g.
-     *  hidden-workflow apps): the connected frontend's live node defs first —
-     *  a registered core class_type (EmptyImage, PreviewImage, …) is not a
-     *  custom pack at all and a registered custom one is already installed —
-     *  then declared class_types vs list_installed_nodes (loose — see
-     *  nodeInstalled) for whatever the live defs can't answer. */
+     *  list_packs (action:"extract_deps") (maps class_type→pack + reports
+     *  installed vs missing authoritatively). Fallback when the prompt is
+     *  unavailable (e.g. hidden-workflow apps): the connected frontend's live
+     *  node defs first — a registered core class_type (EmptyImage,
+     *  PreviewImage, …) is not a custom pack at all and a registered custom one
+     *  is already installed — then declared class_types vs install_custom_node
+     *  (action:"list") (loose — see nodeInstalled) for whatever the live defs
+     *  can't answer. */
     async function resolveNodePacks(declared) {
       const wf = await workflow();
       if (wf) {
         try {
-          const { packs: parsed, coreOnly } = parseRequiredPacks(toolText(await callTool("extract_workflow_dependencies", { workflow: wf })));
+          const { packs: parsed, coreOnly } = parseRequiredPacks(toolText(await callTool("list_packs", { action: "extract_deps", workflow: wf })));
           if (parsed.length) return dedupePacks(parsed);
           if (coreOnly) return [];
         } catch { /* fall through to the declared-list heuristic */ }
@@ -1000,7 +1007,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
       }
       if (unknown.length) {
         let installed = new Set();
-        try { installed = parseInstalledNodeSet(toolText(await callTool("list_installed_nodes", {}))); }
+        try { installed = parseInstalledNodeSet(toolText(await callTool("install_custom_node", { action: "list" }))); }
         catch { /* older/offline bridge — everything reads as unknown */ }
         for (const c of unknown) resolved.push({ pack: c, installed: installed.size ? nodeInstalled(installed, c) : false });
       }
@@ -1354,7 +1361,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
         // undefined and this is a no-op).
         if (typeof callTool === "function") {
           const dir = modelDirForWidget(input.widget);
-          Promise.resolve(callTool("list_local_models", dir ? { model_type: dir } : {}))
+          Promise.resolve(callTool("list_local_models", { action: "list", ...(dir ? { model_type: dir } : {}) }))
             .then((res) => {
               const more = parseModelList(res, dir);
               if (more.length) known = applyOptions([...known, ...more]);
@@ -1749,8 +1756,8 @@ export function createAppsContent(ctx, shell, opts = {}) {
      *  bridge's upload_media handler FIRST (it writes to the connected target),
      *  then the LOCAL apps route dry-patches the snapshot and the
      *  orchestrator's enqueue_workflow sends it to the pod. Deps pinned to a
-     *  CivitAI version are pushed first (download_civitai_model is
-     *  whitelisted); anything unpinned is reported, not silently skipped. */
+     *  CivitAI version are pushed first (download_model action:"download_civitai"
+     *  is whitelisted); anything unpinned is reported, not silently skipped. */
     async function runOnPod() {
       status.classList.remove("err");
       if (!callTool) throw new Error("Orchestrator not connected — pod runs go through the bridge.");
@@ -1774,7 +1781,8 @@ export function createAppsContent(ctx, shell, opts = {}) {
         const custom = Array.isArray(app.deps?.customNodes) ? app.deps.customNodes : [];
         for (const m of pinned) {
           status.textContent = `Pushing model to pod: ${m.name}…`;
-          const res = await callTool("download_civitai_model", {
+          const res = await callTool("download_model", {
+            action: "download_civitai",
             model_version_id: m.civitaiVersionId,
             target_subfolder: m.targetSubfolder || "checkpoints",
           });
@@ -1784,6 +1792,7 @@ export function createAppsContent(ctx, shell, opts = {}) {
 
         status.textContent = "Queueing on pod…";
         const res = await callTool("enqueue_workflow", {
+          action: "enqueue",
           workflow: patched,
           // The app's inputs ARE the user's choices — never re-roll their seed.
           disable_random_seed: true,

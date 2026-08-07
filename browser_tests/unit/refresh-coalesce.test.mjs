@@ -148,7 +148,7 @@ test("a payload call still runs even if the in-flight refresh REJECTS", async ()
 // OWN return value (registerComfyNodeDefs returns true only when it authoritatively
 // fetched /object_info AND refreshed combos). If the coalescer swallowed that
 // value, panel_refresh_nodes would always report refreshed:false and an agent
-// couldn't tell a real refresh from a no-op after stage_output_as_input.
+// couldn't tell a real refresh from a no-op after upload_image action:"stage".
 test("#608: a forced (no-payload) refresh resolves to runRegister's freshness verdict", async () => {
   let verdict = true;
   const { coalescer } = makeHarnessReturning(() => verdict);

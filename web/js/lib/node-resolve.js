@@ -398,9 +398,10 @@ export function assertAddNodeResolvable(registry, class_type) {
     );
   }
   throw new Error(
-    // get_node_info queries the live /object_info (node CLASSES); panel_search_nodes
-    // searches installable Manager PACKS and can never answer this (#741).
-    `Unknown node type "${class_type}" — check the exact class_type via get_node_info`,
+    // create_workflow (action:"node_info") queries the live /object_info (node
+    // CLASSES); panel_search_nodes searches installable Manager PACKS and can
+    // never answer this (#741).
+    `Unknown node type "${class_type}" — check the exact class_type via create_workflow (action:"node_info")`,
   );
 }
 
@@ -517,12 +518,13 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
       }
       // Not defined by the current backend (never installed, or its pack was
       // removed). Fail closed even if a stale registry entry survives (#458/P1-C).
-      // #741: the pointer must be a tool that searches node CLASSES (get_node_info,
-      // the live /object_info) — panel_search_nodes searches Manager PACKS, which
-      // structurally cannot resolve an exact class_type.
+      // #741: the pointer must be a tool that searches node CLASSES
+      // (create_workflow action:"node_info", the live /object_info) —
+      // panel_search_nodes searches Manager PACKS, which structurally cannot
+      // resolve an exact class_type.
       throw new Error(
         `Unknown node type "${class_type}" — the ComfyUI backend does not provide it ` +
-          `(not installed, or its pack was removed). Check the exact class_type via get_node_info`,
+          `(not installed, or its pack was removed). Check the exact class_type via create_workflow (action:"node_info")`,
       );
     }
     // Backend HAS it. Make sure LiteGraph can construct it — refresh to register the
@@ -625,7 +627,7 @@ export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknow
     throw new Error(
       `Cannot set widget on node ${nodeId}${label}: the ComfyUI backend does not provide node ` +
         `type "${type}" (not installed, or its pack was removed) — refusing to write to a node ` +
-        `the live backend no longer defines (#458). Check the exact class_type via get_node_info.`,
+        `the live backend no longer defines (#458). Check the exact class_type via create_workflow (action:"node_info").`,
     );
   }
 }

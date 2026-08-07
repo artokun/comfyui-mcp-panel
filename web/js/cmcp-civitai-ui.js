@@ -1131,7 +1131,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   async function saveWorkflow(it, graph) {
     try {
       const res = await ctx.callTool("save_workflow",
-        { filename: `civitai_${it.id}.json`, workflow: graph }, { timeout: 60000 });
+        { action: "save", filename: `civitai_${it.id}.json`, workflow: graph }, { timeout: 60000 });
       toast(res.ok ? "Workflow saved to your machine." : "Save failed: " + (res.error || "?"));
     } catch (e) { toast("Save failed: " + e.message); }
   }
@@ -1404,8 +1404,8 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     if (ctx.isMuted()) {
       toast("Downloading…");
       try {
-        const res = await ctx.callTool("download_civitai_model",
-          { model_id: detail.id, model_version_id: version.id, target_subfolder: subfolder },
+        const res = await ctx.callTool("download_model",
+          { action: "download_civitai", model_id: detail.id, model_version_id: version.id, target_subfolder: subfolder },
           { timeout: 20 * 60000 });
         toast(res.ok ? "Downloaded to your machine." : "Download failed: " + (res.error || "?"));
       } catch (e) { toast("Download error: " + e.message); }
@@ -1785,7 +1785,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   // ── local model index ("in library" marks) ──────────────────────────
   async function refreshLocalModels() {
     try {
-      const res = await ctx.callTool("list_local_models", {}, { timeout: 15000 });
+      const res = await ctx.callTool("list_local_models", { action: "list" }, { timeout: 15000 });
       const text = (res.result || []).map((b) => (b && b.text) || "").join("\n");
       state.localNames = CivitaiClient.parseLocalNames(text);
     } catch { /* no marks if the call fails */ }
