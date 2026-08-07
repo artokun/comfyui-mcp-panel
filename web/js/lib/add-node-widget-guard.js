@@ -31,7 +31,19 @@ function cloneDefValue(value) {
     const proto = Object.getPrototypeOf(value);
     if (proto !== Object.prototype && proto !== null) return value;
     const copy = {};
-    for (const [key, inner] of Object.entries(value)) copy[key] = cloneDefValue(inner);
+    for (const [key, inner] of Object.entries(value)) {
+      // defineProperty, not `copy[key] = …`: JSON.parse gives `__proto__` as an OWN data
+      // property, and a plain assignment to that name runs Object.prototype's setter — it
+      // would silently DROP the entry from the snapshot (and re-parent the clone). A
+      // required input the snapshot loses is a required input the guards stop checking,
+      // which is the one direction this module must never fail in.
+      Object.defineProperty(copy, key, {
+        value: cloneDefValue(inner),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    }
     return copy;
   }
   return value;
@@ -66,7 +78,7 @@ export function snapshotBackendDef(defs, classType) {
 
 /** The required input was never built onto the node at all. */
 export const WIDGET_ABSENT = "absent";
-/** The widget IS on the node, but it is canvas-only: it serializes no prompt value. */
+/** The widget IS on the node, but it serializes no prompt value (options.serialize:false). */
 export const WIDGET_NON_SERIALIZING = "non-serializing";
 
 /**
@@ -105,7 +117,7 @@ function quoteNames(names) {
 export function describeUnmaterializedRequiredWidgets(classType, node, names) {
   const list = Array.isArray(names) ? names : [];
   const absent = list.filter((name) => classifyUnmaterializedWidget(node, name) === WIDGET_ABSENT);
-  const canvasOnly = list.filter(
+  const nonSerializing = list.filter(
     (name) => classifyUnmaterializedWidget(node, name) === WIDGET_NON_SERIALIZING,
   );
 
@@ -117,25 +129,32 @@ export function describeUnmaterializedRequiredWidgets(classType, node, names) {
         `constructor for ${absent.length === 1 ? "its" : "their"} type is registered`,
     );
   }
-  if (canvasOnly.length) {
+  if (nonSerializing.length) {
+    // State the flag that was actually read (options.serialize === false) and nothing
+    // more. An earlier draft called these widgets "canvas-only", which the guard never
+    // checks — a widget can carry serialize:false without canvasOnly, and describing a
+    // state the code did not observe is the same fault this message exists to correct.
     findings.push(
-      `required input${canvasOnly.length === 1 ? "" : "s"} ${quoteNames(canvasOnly)} ` +
-        `${canvasOnly.length === 1 ? "is" : "are"} present but canvas-only (serialize:false), ` +
-        `so a queued prompt would omit ${canvasOnly.length === 1 ? "it" : "them"}`,
+      `required input${nonSerializing.length === 1 ? "" : "s"} ${quoteNames(nonSerializing)} ` +
+        `${nonSerializing.length === 1 ? "is" : "are"} present but ` +
+        `${nonSerializing.length === 1 ? "does" : "do"} not serialize a value ` +
+        `(serialize:false), so a queued prompt would omit ` +
+        `${nonSerializing.length === 1 ? "it" : "them"}`,
     );
   }
 
   let remedy;
-  if (absent.length && canvasOnly.length) {
+  if (absent.length && nonSerializing.length) {
     remedy =
       "Reload the ComfyUI tab so the node's extension re-runs against the current definition; " +
       "if that does not clear it, this node's frontend and backend definitions disagree and its " +
       "pack needs updating.";
-  } else if (canvasOnly.length) {
+  } else if (nonSerializing.length) {
     remedy =
-      "The node's extension IS registered, so reloading is unlikely to help: its frontend " +
-      "definition disagrees with the backend definition that requires the input. Update the " +
-      "node's pack (or report it to the pack author), then retry.";
+      "The widget constructor IS registered, so this is the node's frontend definition " +
+      "disagreeing with the backend definition that requires the input, not a registration " +
+      "failure. Reloading the ComfyUI tab helps only if the pack's frontend changed on disk " +
+      "since this tab loaded; otherwise update the node's pack or report it to its author.";
   } else {
     remedy =
       "Reload the ComfyUI tab so the node's extension re-runs against the current definition, " +

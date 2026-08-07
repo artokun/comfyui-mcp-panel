@@ -382,6 +382,27 @@ test("snapshotBackendDef survives an in-place rewrite of the map it came from", 
   assert.deepEqual(snapshot.input.required.image[0], ["a.png", "b.png"]);
 });
 
+test("snapshotBackendDef keeps a required input literally named __proto__", () => {
+  // JSON.parse hands `__proto__` back as an OWN data property, so /object_info can carry
+  // one. A plain `copy[key] = …` would run Object.prototype's setter: the entry vanishes
+  // from the snapshot and the guards silently stop checking that required input — a
+  // fail-OPEN, the one direction this must never break in (codex gate r1 P1).
+  const defs = JSON.parse('{"Odd":{"input":{"required":{"__proto__":["INT",{"default":3}]}}}}');
+  const snapshot = snapshotBackendDef(defs, "Odd");
+
+  const required = snapshot.input.required;
+  assert.ok(Object.prototype.hasOwnProperty.call(required, "__proto__"));
+  assert.deepEqual(Object.keys(required), ["__proto__"]);
+  assert.deepEqual(Object.entries(required)[0][1], ["INT", { default: 3 }]);
+  assert.equal(Object.getPrototypeOf(required), Object.prototype, "must not be re-parented");
+
+  // …and the guard therefore still sees it as a required input to check.
+  assert.deepEqual(
+    missingRequiredWidgetMaterializations({ widgets: [] }, { INT: () => {} }, snapshot),
+    ["__proto__"],
+  );
+});
+
 test("snapshotBackendDef reports no def for a type the backend does not define", () => {
   // The frontend-only exemption (Note / Reroute / …). `undefined` is what makes the
   // guards fall back to scanning the registered node data, so it must not become {}.
@@ -404,14 +425,14 @@ test("#700: the refusal names the condition that held and never claims a registr
   assert.match(absentOnly, /required input "amount" was not built onto the node/);
   assert.match(absentOnly, /Reload the ComfyUI tab/);
 
-  const canvasOnly = describeUnmaterializedRequiredWidgets(
+  const nonSerializing = describeUnmaterializedRequiredWidgets(
     "ZipnStyler",
     { widgets: [{ name: "gallery", options: { serialize: false, canvasOnly: true } }] },
     ["gallery"],
   );
-  assert.match(canvasOnly, /required input "gallery" is present but canvas-only/);
-  assert.match(canvasOnly, /extension IS registered, so reloading is unlikely to help/);
-  assert.match(canvasOnly, /Update the node's pack/);
+  assert.match(nonSerializing, /required input "gallery" is present but does not serialize a value/);
+  assert.match(nonSerializing, /widget constructor IS registered/);
+  assert.match(nonSerializing, /update the node's pack/);
 
   const mixed = describeUnmaterializedRequiredWidgets(
     "HalfBroken",
@@ -419,15 +440,30 @@ test("#700: the refusal names the condition that held and never claims a registr
     ["amount", "gallery"],
   );
   assert.match(mixed, /"amount" was not built onto the node/);
-  assert.match(mixed, /"gallery" is present but canvas-only/);
+  assert.match(mixed, /"gallery" is present but does not serialize a value/);
   assert.match(mixed, /if that does not clear it/);
 
   // The claim that misdirected #700 for ~90 tool calls must not survive anywhere.
-  for (const message of [absentOnly, canvasOnly, mixed]) {
+  for (const message of [absentOnly, nonSerializing, mixed]) {
     assert.doesNotMatch(message, /did not initialize/);
     assert.doesNotMatch(message, /so its node extension can register/);
     assert.match(message, /Nothing was added\./);
   }
+});
+
+test("#700: the refusal describes only the flag the guard actually reads", () => {
+  // The guard's condition is `widget.options?.serialize === false` — it never consults
+  // `canvasOnly`. A widget carrying serialize:false WITHOUT canvasOnly is a reachable
+  // refusal, so the message must not assert a canvas-only state it did not observe
+  // (codex gate r1 P2).
+  const message = describeUnmaterializedRequiredWidgets(
+    "SomePack",
+    { widgets: [{ name: "gallery", options: { serialize: false } }] },
+    ["gallery"],
+  );
+  assert.match(message, /does not serialize a value \(serialize:false\)/);
+  assert.doesNotMatch(message, /canvas-only/);
+  assert.doesNotMatch(message, /canvasOnly/);
 });
 
 test("#700: the refusal pluralizes without lying about how many inputs it saw", () => {
@@ -435,13 +471,13 @@ test("#700: the refusal pluralizes without lying about how many inputs it saw", 
   assert.match(two, /required inputs "a", "b" were not built onto the node/);
   assert.match(two, /constructor for their type is registered/);
 
-  const twoCanvas = describeUnmaterializedRequiredWidgets(
+  const twoPresent = describeUnmaterializedRequiredWidgets(
     "N",
     { widgets: [{ name: "a" }, { name: "b" }] },
     ["a", "b"],
   );
-  assert.match(twoCanvas, /required inputs "a", "b" are present but canvas-only/);
-  assert.match(twoCanvas, /would omit them/);
+  assert.match(twoPresent, /required inputs "a", "b" are present but do not serialize a value/);
+  assert.match(twoPresent, /would omit them/);
 });
 
 test("classifyUnmaterializedWidget distinguishes the two faults", () => {
