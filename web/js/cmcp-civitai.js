@@ -466,6 +466,12 @@ const _SHAPE_NOTE = {
     "CivitAI returned an HTML error page instead of JSON (typically a CDN or edge " +
     "failure in front of the API), so it gave no machine-readable reason.",
   "json-nomessage": "CivitAI's response body was JSON with no error message in it.",
+  // Same shape, ours: the note must not name CivitAI when the marker says the
+  // panel's own proxy wrote the body. (`empty` and `html` need no such variant —
+  // a body with no readable JSON carries no marker to read, so it is CivitAI's
+  // by construction.)
+  "json-nomessage-proxy":
+    "The panel's CivitAI proxy returned JSON with no error message in it.",
 };
 
 const _ADVICE = {
@@ -520,9 +526,10 @@ export function describeUpstreamFailure({ status, statusText, bodyText, label = 
   // from ours, and WHOSE they are. A trailing stop is added when the quote
   // doesn't carry one, so the advice that follows doesn't run into it.
   const who = fromProxy ? "The panel's CivitAI proxy said" : "CivitAI said";
+  const noteKey = fromProxy && _SHAPE_NOTE[`${shape}-proxy`] ? `${shape}-proxy` : shape;
   const said = text
     ? `${who}: “${text}”${/[.!?…]$/.test(text) ? "" : "."}`
-    : _SHAPE_NOTE[shape] || _SHAPE_NOTE.empty;
+    : _SHAPE_NOTE[noteKey] || _SHAPE_NOTE.empty;
   return {
     message: [head, "—", said, _ADVICE[cls]].filter(Boolean).join(" "),
     detail: text,

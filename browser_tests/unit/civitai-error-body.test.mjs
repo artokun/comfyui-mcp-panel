@@ -176,6 +176,25 @@ test("#705: a proxy-authored 401 still points at sign-in, not at the proxy", asy
   assert.equal(err.retryable, false);
 });
 
+test("#705: a proxy body with no readable message is not attributed to CivitAI either", async () => {
+  // Codex gate round 3: the "JSON with no error message" note hardcoded CivitAI,
+  // so a marked body that carried no readable message described OUR reply as
+  // CivitAI's while the advice beside it named the proxy.
+  const err = await rejectionFrom(
+    clientReturning(
+      errorResponse(502, "Bad Gateway", '{"source":"comfyui-mcp-panel","retryable":false}'),
+    ),
+  );
+  assert.doesNotMatch(err.message, /CivitAI's response body/);
+  assert.match(err.message, /panel's CivitAI proxy returned JSON with no error message/);
+  assert.equal(err.retryable, false);
+});
+
+test("#705: an UNMARKED body with no readable message is still attributed to CivitAI", async () => {
+  const err = await rejectionFrom(clientReturning(errorResponse(502, "Bad Gateway", '{"traceId":"x"}')));
+  assert.match(err.message, /CivitAI's response body was JSON with no error message/);
+});
+
 test("#705: a quote without terminal punctuation does not run into the advice", async () => {
   const err = await rejectionFrom(clientReturning(errorResponse(429, "Too Many Requests", '{"error":"slow down"}')));
   assert.ok(err.message.includes("“slow down”."), err.message);
